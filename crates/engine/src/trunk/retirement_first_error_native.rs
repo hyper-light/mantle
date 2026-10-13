@@ -135,23 +135,16 @@ fn a_physical_job_failure_stays_first_after_native_worker_join_failure() {
     let mut rt = runtime();
     let mut leases = rt.prepare_retirement(&[1]).unwrap();
     pool.adopt_retirement(leases.pop().unwrap()).unwrap();
-    let (full, received) = mpsc::sync_channel(1);
-    let mut bytes = Vec::new();
-    let key = b"written";
-    encode(
-        &mut bytes,
-        key,
-        crate::branch::Op::Put,
-        b"value",
-        crate::branch::filter::hash32(crate::branch::filter::hash(key)),
-    )
-    .unwrap();
-    full.try_send(bytes).unwrap();
-    drop(full);
+    let mut mem = crate::memtable::hashed::HashMem::new(1 << 16).unwrap();
+    mem.mirror_into(Vec::new()).unwrap();
+    mem.insert(b"written", crate::branch::Op::Put, b"value")
+        .unwrap();
     let job = Box::new(Job {
-        work: Work::Pack(Stream {
+        work: Work::Sort(SortPack {
             entries: 1,
-            full: received,
+            skip: mem.skip(),
+            arena: mem.take_mirror().unwrap(),
+            sorter: crate::memtable::hashed::Sorter::default(),
         }),
         grant: store
             .grant(usize::try_from(CONFIG.extent_pages).unwrap())

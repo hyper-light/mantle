@@ -144,13 +144,15 @@ impl<F: BlockFile + 'static> Inline for ShardDb<F> {
 }
 
 /// A range's engine its task lends to its shard while it awaits with nothing of the engine
-/// borrowed, the slice budget its puts pace their paid work by, and whether a client left it
-/// maintenance owed: its task, woken when the client yields, takes the engine back to do it.
+/// borrowed, the slice budget its puts pace their paid work by, whether a client left it
+/// maintenance owed (its task, woken when the client yields, takes the engine back to do it),
+/// and whether a client made an operation on it.
 struct Lending {
     task: TaskId,
     db: Box<dyn Inline>,
     keys: u64,
     owed: bool,
+    used: bool,
 }
 
 thread_local! {
@@ -185,6 +187,7 @@ impl<F: BlockFile + 'static> Lend<F> {
                     db,
                     keys,
                     owed: false,
+                    used: false,
                 });
             }
             cell.set(lent);
@@ -199,9 +202,10 @@ impl<F: BlockFile + 'static> Lend<F> {
         }
     }
 
-    /// The engine back, and whether a client left it maintenance owed. None only if no lending
-    /// of `task` is found, which nothing but a reclaim removes.
-    fn reclaim(&mut self) -> Option<(Box<ShardDb<F>>, bool)> {
+    /// The engine back, whether a client left it maintenance owed, and whether a client made an
+    /// operation on it. None only if no lending of `task` is found, which nothing but a reclaim
+    /// removes.
+    fn reclaim(&mut self) -> Option<(Box<ShardDb<F>>, bool, bool)> {
         if !std::mem::take(&mut self.held) {
             return None;
         }
@@ -217,8 +221,9 @@ impl<F: BlockFile + 'static> Drop for Lend<F> {
     }
 }
 
-/// Removes `task`'s lending, its engine and whether it was left maintenance owed.
-fn take_lent<F: BlockFile + 'static>(task: TaskId) -> Option<(Box<ShardDb<F>>, bool)> {
+/// Removes `task`'s lending: its engine, whether it was left maintenance owed, and whether a
+/// client made an operation on it.
+fn take_lent<F: BlockFile + 'static>(task: TaskId) -> Option<(Box<ShardDb<F>>, bool, bool)> {
     let lending = LENT
         .try_with(|cell| {
             let mut lent = cell.take();
@@ -231,13 +236,13 @@ fn take_lent<F: BlockFile + 'static>(task: TaskId) -> Option<(Box<ShardDb<F>>, b
         })
         .ok()
         .flatten()?;
-    let owed = lending.owed;
+    let (owed, used) = (lending.owed, lending.used);
     lending
         .db
         .into_any()
         .downcast::<ShardDb<F>>()
         .ok()
-        .map(|db| (db, owed))
+        .map(|db| (db, owed, used))
 }
 
 /// Whether `task`'s lent engine was left maintenance owed by a client.
@@ -260,6 +265,7 @@ fn with_lent<R>(task: TaskId, op: impl FnOnce(&mut dyn Inline, u64) -> R) -> Opt
             let mut lent = cell.take();
             let done = lent.iter_mut().find(|l| l.task == task).map(|l| {
                 let result = op(&mut *l.db, l.keys);
+                l.used = true;
                 let woke = !l.owed && l.db.owed();
                 l.owed |= woke;
                 (result, woke)
@@ -332,6 +338,29 @@ async fn serve<F: BlockFile + 'static>(
                 range.maintain(&mut db);
             }
             if range.fault.is_none() && db.waiting_for_io() {
+                // A wait for a worker or the device needs nothing of a client on this shard: the
+                // engine is lent for its turn first, and the wait is made only once a turn passes
+                // with no operation made on it. A client making operations then makes them
+                // inline, its puts taking the workers' results as they pace, rather than each
+                // crossing the request channel while the range waits.
+                if let Some(task) = task.filter(|_| range.lends()) {
+                    match Lend::new(task, db, range.slice.keys()) {
+                        Ok(mut lend) => {
+                            hyper_rt::futures::yield_now().await;
+                            let Some((back, _, used)) = lend.reclaim() else {
+                                return;
+                            };
+                            db = back;
+                            if used {
+                                continue;
+                            }
+                        }
+                        Err(back) => db = back,
+                    }
+                    if !db.waiting_for_io() {
+                        continue;
+                    }
+                }
                 // Only borrowed waits are raced. Range retains every active/pending
                 // Request, its buffers, reply and admission lease until physical finish.
                 let ready = race2(
@@ -357,7 +386,7 @@ async fn serve<F: BlockFile + 'static>(
                     Some(task) => match Lend::new(task, db, range.slice.keys()) {
                         Ok(mut lend) => {
                             hyper_rt::futures::yield_now().await;
-                            let Some((back, _)) = lend.reclaim() else {
+                            let Some((back, _, _)) = lend.reclaim() else {
                                 return;
                             };
                             db = back;
@@ -386,7 +415,7 @@ async fn serve<F: BlockFile + 'static>(
                         });
                         race2(hyper_rt::futures::cancelled(), woken).await
                     };
-                    let Some((back, _)) = lend.reclaim() else {
+                    let Some((back, _, _)) = lend.reclaim() else {
                         return;
                     };
                     db = back;

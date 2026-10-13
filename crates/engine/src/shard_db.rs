@@ -5,9 +5,11 @@
 //! Maintenance runs on the shard's own worker, a slice at a time, never all at once on the put
 //! that fills a memtable (SILK, Balmau et al., USENIX ATC 2019: flushes first, compaction spread
 //! so no put waits on it; SplinterDB, Conway et al., USENIX ATC 2020: incorporation and bundle
-//! compactions as separate tasks). A full memtable becomes the packing one, readable, and a
-//! cleared one takes the puts. Each put then does its share of two debts, each over the room it
-//! must be paid within:
+//! compactions as separate tasks). A full memtable goes to a maintenance worker that sorts the
+//! copy of its arena it kept and builds its branch, frozen and read until the branch is back
+//! (research/40 §4); with no worker, or none free when one must finish, the shard packs it
+//! itself as the packing memtable. A cleared one takes the puts. Each put then does its share of
+//! two debts, each over the room it must be paid within:
 //! - the packing memtable's entries, before the new one fills (`room`, its arena bytes left);
 //! - the trunk's maintenance, before `fanout` packed memtables wait on it (`room` and a memtable
 //!   for each further one that may wait).
@@ -28,14 +30,11 @@ use crate::memtable::hashed::{HashMem, Walk};
 use crate::rows::Rows;
 use crate::scan::{BorrowedScanMerge, ScanMerge};
 use crate::store::{Config, IntoFile, Store};
-use crate::trunk::pool::{
-    self, Back, FEED_BUFFERS, Growth, Job, Owner, Pool, Spawn, Stream, Ticket, Work,
-};
+use crate::trunk::pool::{self, Back, Growth, Job, Owner, Pool, SortPack, Spawn, Ticket, Work};
 use crate::trunk::{Source, Trunk, TrunkConfig};
 use crate::util::reuse;
 use hyper_block::block::BlockFile;
 use std::collections::VecDeque;
-use std::sync::mpsc::{SyncSender, sync_channel};
 
 /// The time maintenance took on the put path: packing memtables into branches, the trunk's
 /// steps, and the stalls, a put paying a debt whole because its room ran out; in total and at the
@@ -77,6 +76,12 @@ pub struct FlushStats {
     /// only as the rest are.
     pub order_ns: u64,
     pub retire_ns: u64,
+    /// Entries the active memtables' paced order work moved inside puts, counted always: none
+    /// while workers sort the memtables and no scan reads them (research/40 §4).
+    pub order_moves: u64,
+    /// A runtime task's idle slices ([`ShardDb::idle_paced_step`]) and the work units they did.
+    pub idle_slices: u64,
+    pub idle_units: u64,
     /// Puts whose trunk share waited for its input reads: the last memtable before a rotation
     /// would stall ([`ShardDb::put`]'s pacing).
     pub waited_steps: u64,
@@ -142,41 +147,29 @@ impl MemCursor {
     }
 }
 
-/// A full memtable packed into a branch a slice at a time, read until it is packed. The shard
-/// pays its order and walks it; the branch is built by the shard's own `builder`, or, with
-/// maintenance workers, by a worker the walked entries are fed to (`feed`), the shard keeping the
-/// memtable to read meanwhile.
+/// A full memtable being packed, read until it is: one whose arena copy waits for a worker to
+/// sort and pack it (`sort`), handed to the first free; or one the shard packs itself a slice at
+/// a time, its order paid and walked into its own `builder`, when the shard has no workers, the
+/// memtable kept no copy, or it must be finished with no worker free.
 #[derive(Debug)]
 struct Packing {
     mem: HashMem,
+    sort: Option<SortPack>,
     /// The walk in key order, opened once the memtable's order work is paid: its runs do not
     /// change after.
     walk: Option<Walk>,
     builder: Option<Builder>,
-    feed: Option<Feed>,
     packed: usize,
     /// When it began packing: its rotation.
     since: std::time::Instant,
 }
 
-/// A packing fed to the worker its ticket names: the channel its full buffers go out on, closed
-/// once every entry is sent; the buffers the shard holds, the one it fills and those spare (the
-/// worker gives the others back through the pool, [`Pool::buffer`]); and the extents granted
-/// the job.
-#[derive(Debug)]
-struct Feed {
-    ticket: Ticket,
-    full: Option<SyncSender<Vec<u8>>>,
-    filling: Option<Vec<u8>>,
-    spare: Vec<Vec<u8>>,
-    grant: Vec<u64>,
-}
-
-/// A full memtable handed to its packing worker, its entries fed to it by later puts: still
-/// read until the worker's branch is back and every older memtable's branch has gone to the trunk before it,
-/// since pending branches are read newest first. Its job's ticket, the extents granted the job,
-/// the worker's result once back, when it began packing, and its first failure. A failed input
-/// stays readable and never retires past its older predecessors ([`ShardDb::retire`]).
+/// A full memtable handed to the worker that sorts and packs it: still read until the worker's
+/// branch is back and every older memtable's branch has gone to the trunk before it, since
+/// pending branches are read newest first. Its job's ticket, the extents granted the job, the
+/// worker's result once back, when it began packing, its first failure, and the bytes of its
+/// sorted packing's buffers, out with the worker. A failed input stays readable and never
+/// retires past its older predecessors ([`ShardDb::retire`]).
 #[derive(Debug)]
 struct Frozen {
     mem: HashMem,
@@ -185,11 +178,7 @@ struct Frozen {
     back: Option<Back>,
     since: std::time::Instant,
     error: Option<Error>,
-    /// Its walk and feed while entries are still to send: puts go on feeding it after its
-    /// rotation, oldest first, so a rotation never feeds a memtable whole ([`ShardDb::feed`]).
-    walk: Option<Walk>,
-    feed: Option<Feed>,
-    packed: usize,
+    sorting: usize,
 }
 
 impl Frozen {
@@ -201,75 +190,20 @@ impl Frozen {
 
 impl Packing {
     /// The keys' worth of packing left: entries to pack, then the branch's filter pages, each at
-    /// its worth in keys; one more while a worker's branch is still to come back.
+    /// its worth in keys, for one the shard packs; one, the hand-off a put's share tries, for one
+    /// waiting for a worker.
     fn left(&self) -> u64 {
+        if self.sort.is_some() {
+            return 1;
+        }
         let entries = u64::try_from(self.mem.len().saturating_sub(self.packed)).unwrap_or(u64::MAX);
         let order = u64::try_from(self.mem.debt()).unwrap_or(u64::MAX);
         let filter = self
             .builder
             .as_ref()
             .map_or(0, |b| b.filter_pages_left().saturating_mul(b.page_keys()));
-        let back = u64::from(self.feed.is_some());
-        filter
-            .saturating_add(entries)
-            .saturating_add(order)
-            .saturating_add(back)
+        filter.saturating_add(entries).saturating_add(order)
     }
-}
-
-/// Walks up to `w` of a frozen or packing memtable's entries into its feed's buffers, each
-/// sent to the worker once it holds a run's bytes (`run`); with every entry sent, the feed
-/// closes. Without a buffer to fill it stops: the wait for its worker to give one back is the
-/// caller's ([`ShardDb::feed_from`]). The entries walked.
-#[allow(clippy::too_many_arguments)]
-fn feed_one<F: BlockFile>(
-    store: &mut Store<F>,
-    pool: &mut Pool,
-    mem: &HashMem,
-    walk: &mut Walk,
-    f: &mut Feed,
-    packed: &mut usize,
-    w: u64,
-    run: usize,
-) -> Result<u64, Error> {
-    // The mean entry's bytes in the arena: how many entries a buffer's room takes.
-    let mean = mem.bytes().checked_div(mem.len()).unwrap_or(1).max(1);
-    let mut budget = w;
-    while *packed < mem.len() && budget > 0 && f.full.is_some() {
-        if f.filling.is_none() {
-            f.filling = match f.spare.pop() {
-                Some(b) => Some(b),
-                None => pool.buffer(store, f.ticket, false)?,
-            };
-        }
-        let Some(buf) = f.filling.as_mut() else {
-            break;
-        };
-        let room = run.saturating_sub(buf.len());
-        let fit = u64::try_from(room.checked_div(mean).unwrap_or(0).max(1)).unwrap_or(u64::MAX);
-        let limit = usize::try_from(budget.min(fit)).unwrap_or(usize::MAX);
-        let visited =
-            mem.walk_some_hashed(walk, limit, |k, op, v, h| pool::encode(buf, k, op, v, h))?;
-        *packed = packed.saturating_add(visited);
-        budget = budget.saturating_sub(u64::try_from(visited).unwrap_or(u64::MAX));
-        let last = *packed >= mem.len();
-        if (buf.len() >= run || last || visited == 0)
-            && let Some(buf) = f.filling.take()
-            && let Some(full) = f.full.as_ref()
-            && let Err(back) = full.send(buf)
-        {
-            // The worker is gone, its failure on its way back: the buffer stays.
-            f.spare.push(back.0);
-            f.full = None;
-        }
-        if visited == 0 {
-            break;
-        }
-    }
-    if *packed >= mem.len() {
-        f.full = None;
-    }
-    Ok(w.saturating_sub(budget))
 }
 
 /// The batches a device's issuer of `depth` is started for (`Issuer::start_for`) to hold a
@@ -328,9 +262,15 @@ pub struct ShardDb<F: BlockFile> {
     pack_ns: u64,
     /// A cleared memtable for the next fill, its arena kept.
     spare: Option<HashMem>,
-    /// Packing buffers back from the last packing fed to a worker, for the next: at most
-    /// [`FEED_BUFFERS`].
-    feed_buffers: Vec<Vec<u8>>,
+    /// Sorted packings back from their workers, their buffers for the next memtables' mirrors
+    /// and sorts: no more than were ever out at once with the active memtable's, and at most a
+    /// worker's packing each beside it ([`Self::keep_sort_pack`]).
+    sort_spares: Vec<SortPack>,
+    /// Whether the active memtable orders itself as it fills: only for scans, which read its
+    /// order, since a worker sorts its mirror for its packing. A scan into it, or since the last
+    /// rotation, has it ordered (research/40 §4).
+    order_paced: bool,
+    scans_at_rotation: u64,
     mem_limit: usize,
     trunk: Trunk,
     /// Work owed but not yet whole, in work·bytes over the room: the remainder of each debt's
@@ -654,7 +594,9 @@ impl<F: BlockFile> ShardDb<F> {
             fill_ns: 0,
             pack_ns: 0,
             spare: None,
-            feed_buffers: Vec::new(),
+            sort_spares: Vec::new(),
+            order_paced: false,
+            scans_at_rotation: 0,
             mem_limit,
             trunk,
             pack_carry: 0,
@@ -1063,6 +1005,13 @@ impl<F: BlockFile> ShardDb<F> {
         self.trunk.set_pool(pool);
         self.write_reserved = reserved;
         self.partition_memory();
+        // The active memtable, still empty, keeps a copy for the worker that will sort it.
+        if self.mem.is_empty() && !self.mem.mirrored() {
+            let buf = self.mirror_buffer();
+            if let Err(buf) = self.mem.mirror_into(buf) {
+                self.spare_mirror(buf);
+            }
+        }
         Ok(())
     }
 
@@ -1253,7 +1202,8 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     /// The bytes the memtables hold: the active one, the one packing and the spare kept for
-    /// the next rotation, each as [`HashMem::memory`] counts it. They sit beside the budget
+    /// the next rotation, each as [`HashMem::memory`] counts it, with their mirrors, and the
+    /// sorted packings' buffers, out with workers or kept for the next. They sit beside the budget
     /// [`Self::set_memory`] divides, as RocksDB's write buffers sit beside its block cache.
     pub fn memtable_bytes(&self) -> usize {
         self.mem
@@ -1262,10 +1212,16 @@ impl<F: BlockFile> ShardDb<F> {
             .saturating_add(
                 self.frozen
                     .iter()
-                    .map(|f| f.mem.memory())
+                    .map(|f| f.mem.memory().saturating_add(f.sorting))
                     .fold(0, usize::saturating_add),
             )
             .saturating_add(self.spare.as_ref().map_or(0, HashMem::memory))
+            .saturating_add(
+                self.sort_spares
+                    .iter()
+                    .map(|p| p.memory())
+                    .fold(0, usize::saturating_add),
+            )
     }
 
     /// The cache capacity, scoped write reservation and record capacity, in bytes. Writes
@@ -1608,12 +1564,6 @@ impl<F: BlockFile> ShardDb<F> {
         }
         if !self.stopping {
             self.stopping = true;
-            if let Some(feed) = self.packing.as_mut().and_then(|p| p.feed.as_mut()) {
-                feed.full = None;
-            }
-            for feed in self.frozen.iter_mut().filter_map(|f| f.feed.as_mut()) {
-                feed.full = None;
-            }
             if let Some(pool) = self.trunk.pool_mut() {
                 for back in self.frozen.iter_mut().filter_map(|f| f.back.as_mut()) {
                     if let Some(error) = back.physical_error.take() {
@@ -2043,6 +1993,13 @@ impl<F: BlockFile> ShardDb<F> {
         if let Some(p) = self.packing.as_mut() {
             p.mem.seal();
         }
+        // A frozen memtable a worker sorts kept no order of its own: its first scan sorts it,
+        // once, as nothing writes it after. Scans from here have the active memtable ordered
+        // as it fills, so the next seals sort little.
+        for f in &mut self.frozen {
+            f.mem.seal();
+        }
+        self.order_paced = true;
         let mut active = std::mem::replace(&mut self.scan_active, MemCursor::empty());
         // A seek of the runs is timed when they are many: the price of the comparisons they add.
         let (many, one) = self.mem.seek_comparisons();
@@ -2059,8 +2016,8 @@ impl<F: BlockFile> ShardDb<F> {
             }
             None => None,
         };
-        // A cursor a frozen memtable, newest first; their order work is paid, so none changes
-        // under the scan.
+        // A cursor a frozen memtable, newest first; each sealed above, so none changes under the
+        // scan.
         let mut frozen = std::mem::take(&mut self.scan_frozen);
         frozen.resize_with(self.frozen.len(), MemCursor::empty);
         for (c, f) in frozen.iter_mut().zip(self.frozen.iter().rev()) {
@@ -2252,6 +2209,13 @@ impl<F: BlockFile> ShardDb<F> {
         if let Some(p) = self.packing.as_mut() {
             p.mem.seal();
         }
+        // A frozen memtable a worker sorts kept no order of its own: its first scan sorts it,
+        // once, as nothing writes it after. Scans from here have the active memtable ordered
+        // as it fills, so the next seals sort little.
+        for f in &mut self.frozen {
+            f.mem.seal();
+        }
+        self.order_paced = true;
         let mut active = std::mem::replace(&mut self.scan_active, MemCursor::empty());
         // A seek of the runs is timed when they are many: the price of the comparisons they add.
         let (many, one) = self.mem.seek_comparisons();
@@ -2268,8 +2232,8 @@ impl<F: BlockFile> ShardDb<F> {
             }
             None => None,
         };
-        // A cursor a frozen memtable, newest first; their order work is paid, so none changes
-        // under the scan.
+        // A cursor a frozen memtable, newest first; each sealed above, so none changes under the
+        // scan.
         let mut frozen = std::mem::take(&mut self.scan_frozen);
         frozen.resize_with(self.frozen.len(), MemCursor::empty);
         for (c, f) in frozen.iter_mut().zip(self.frozen.iter().rev()) {
@@ -2600,14 +2564,20 @@ impl<F: BlockFile> ShardDb<F> {
     fn pace(&mut self, bytes: usize, paced: bool) -> Result<(), Error> {
         self.grow(false)?;
         let room = self.mem.room();
-        // The active memtable sorts its own entries as it fills, in chunks of at most
-        // `order_bound` entries paid by the puts that write them, so the one it rotates to is
-        // nearly in order and its packing owes the walk alone, and a scan after any burst of
-        // puts sorts at most two chunks (HashMem::order_put).
-        let t = self.timed.then(std::time::Instant::now);
-        self.mem.order_put(1, self.order_bound, room);
-        let ns = ns_since(t);
-        self.flush_stats.order_ns = self.flush_stats.order_ns.saturating_add(ns);
+        // A memtable a worker will sort orders itself only for scans (research/40 §4); one the
+        // shard packs sorts its own entries as it fills, in chunks of at most `order_bound`
+        // entries paid by the puts that write them, so its packing owes the walk alone, and a
+        // scan after any burst of puts sorts at most two chunks (HashMem::order_put).
+        if self.order_paced || !self.mem.mirrored() {
+            let t = self.timed.then(std::time::Instant::now);
+            let moved = self.mem.order_put(1, self.order_bound, room);
+            let ns = ns_since(t);
+            let f = &mut self.flush_stats;
+            f.order_ns = f.order_ns.saturating_add(ns);
+            f.order_moves = f
+                .order_moves
+                .saturating_add(u64::try_from(moved).unwrap_or(u64::MAX));
+        }
         let left = self.pack_left();
         if left > 0 {
             // The memtable rotates when a put no longer fits, before its room reaches nothing:
@@ -2667,28 +2637,24 @@ impl<F: BlockFile> ShardDb<F> {
         Ok(())
     }
 
-    /// Packs `w` keys' worth of the packing memtable: its order, then entries, then its filter
-    /// pages at their worth in keys; the branch goes to the trunk once whole. With workers, the
-    /// entries are fed to one and its branch taken once it comes back, waited for when `wait`.
+    /// Packs `w` keys' worth of the packing memtable: one waiting for a worker is handed to the
+    /// first free; one the shard packs pays its order, then entries, then its filter pages at
+    /// their worth in keys, its branch going to the trunk once whole. Workers' branches back are
+    /// taken.
     fn pack_some(&mut self, w: u64, wait: bool) -> Result<(), Error> {
-        if w == 0 {
-            // No share this put: a worker's branch is taken if it is back, nothing else.
-            return self.take_packs(false);
+        if self.packing.as_ref().is_some_and(|p| p.sort.is_some()) {
+            self.hand_off_sorted()?;
         }
-        // The frozen memtables still feeding come first, oldest first.
-        let mut w = w;
-        if self.frozen.iter().any(|f| f.feed.is_some()) {
-            let used = self.feed_from(w, wait, false)?;
-            w = w.saturating_sub(used);
-            self.take_packs(false)?;
+        if w == 0 || self.packing.as_ref().is_none_or(|p| p.sort.is_some()) {
+            // No share this put, or nothing the shard packs: a worker's branch is taken if it
+            // is back, waited for when `wait`.
+            return self.take_packs(wait);
         }
         let Some(p) = &mut self.packing else {
             return Ok(());
         };
-        if w == 0 {
-            return Ok(());
-        }
         let t = self.timed.then(std::time::Instant::now);
+        let mut w = w;
         // The memtable's order first: its sort and merges, a slice of the budget.
         if p.mem.debt() > 0 {
             let paid = p.mem.pay(usize::try_from(w).unwrap_or(usize::MAX));
@@ -2697,29 +2663,9 @@ impl<F: BlockFile> ShardDb<F> {
         if p.mem.debt() == 0 && p.walk.is_none() {
             p.walk = Some(p.mem.walk_start());
         }
-        if p.walk.is_some() && p.builder.is_none() && p.feed.is_none() {
-            self.start_packing(false)?;
-        }
-        let fed = self.packing.as_ref().is_some_and(|p| p.feed.is_some());
-        if fed {
-            self.feed(w, wait)?;
-            let whole = self
-                .packing
-                .as_ref()
-                .and_then(|p| p.feed.as_ref())
-                .is_some_and(|f| f.full.is_none());
-            if whole {
-                self.freeze();
-            }
-            self.note_pack(ns_since(t));
-            return self.take_packs(wait && !self.frozen.is_empty());
-        }
         if w == 0 {
             return Ok(());
         }
-        let Some(p) = &mut self.packing else {
-            return Ok(());
-        };
         let Packing {
             mem,
             walk,
@@ -2760,273 +2706,41 @@ impl<F: BlockFile> ShardDb<F> {
         Ok(())
     }
 
-    /// The packing memtable's order is paid: its branch goes to a worker, the walked entries fed
-    /// to it. A packing not started is a stall the next rotation would take, so it may start a
-    /// worker past the measured need, within the cores ([`Pool::can_take`]). With every core's
-    /// worker busy a later put tries again, or, when the packing must end now (`now`), the
-    /// shard builds it.
-    fn start_packing(&mut self, now: bool) -> Result<(), Error> {
-        let Some(p) = &mut self.packing else {
-            return Ok(());
+    /// The packing memtable waiting for a worker goes to one free now, frozen and read until its
+    /// branch is back: whether one took it.
+    fn hand_off_sorted(&mut self) -> Result<bool, Error> {
+        let Some(mut p) = self.packing.take() else {
+            return Ok(false);
         };
-        let entries = u64::try_from(p.mem.len()).unwrap_or(u64::MAX);
-        // The grant: the memtable's bytes in extents, and one for the last partial one; a branch
-        // that needs more asks for it.
-        let run = self.store.run_bytes().max(1);
-        let extents = crate::util::div_ceil_usize(p.mem.bytes(), run)
-            .unwrap_or(0)
-            .saturating_add(1);
-        let asked = u64::try_from(extents).unwrap_or(u64::MAX);
-        // A file kept as segments whose admitted extents cannot hold it yet: the packing starts
-        // once the file has grown ([`Self::grow`]), as one no worker took does; one that must
-        // end now is built here, the file grown first.
-        let short = self.store.segments().is_some() && self.store.capacity() < asked;
-        if short {
-            self.packing_wanted = self.packing_wanted.max(asked);
-        }
-        if !short && let Some(pool) = self.trunk.pool_mut().filter(|pool| pool.can_take(true)) {
-            let grant = self.store.grant(extents)?;
-            let (full, full_rx) = sync_channel(FEED_BUFFERS);
-            let job = Box::new(Job {
-                work: Work::Pack(Stream {
-                    entries,
-                    full: full_rx,
-                }),
-                grant: grant.clone(),
-                file_end: self.store.end(),
-                generation: self.store.generation(),
-                keep: None,
-            });
-            let sent = match pool.send(job, Owner::Pack, true) {
-                Ok(sent) => sent,
-                Err((error, job)) => {
-                    self.store.grant_back(&job.grant)?;
-                    return Err(error);
-                }
-            };
-            match sent {
-                Ok(ticket) => {
-                    let mut spare = std::mem::take(&mut self.feed_buffers);
-                    spare.resize_with(FEED_BUFFERS, Vec::new);
-                    p.feed = Some(Feed {
-                        ticket,
-                        full: Some(full),
-                        filling: spare.pop(),
-                        spare,
-                        grant,
-                    });
-                    return Ok(());
-                }
-                Err(job) => self.store.grant_back(&job.grant)?,
-            }
-        }
-        if now || !self.trunk.has_pool() {
-            self.grow_for(asked)?;
-            let Some(p) = &mut self.packing else {
-                return Ok(());
-            };
-            p.builder = Some(Builder::new(&mut self.store, Keys::Exactly(entries))?);
-        } else if let Some(pool) = self.trunk.pool_mut() {
-            // Every worker is occupied, or the file has yet to grow: a completion, or the
-            // growth's, frees what this packing needs.
-            pool.want_message();
-        }
-        Ok(())
-    }
-
-    /// Feeds `w` entries of the frozen memtables still feeding and the packing one: see
-    /// [`Self::feed_from`].
-    fn feed(&mut self, w: u64, wait: bool) -> Result<u64, Error> {
-        self.feed_from(w, wait, true)
-    }
-
-    /// Feeds up to `w` entries, the packing memtable too only when `packing_too`: the entries
-    /// fed. Every feed whose worker has a buffer free takes entries, the oldest first, so the
-    /// workers build at once; one starved never holds the newer back. With `wait`, it feeds
-    /// until `w` are fed or none is left to feed, and waits for a worker's message only after a
-    /// pass that fed nothing with no message taken since it began: a message may bring back a
-    /// buffer of a feed the pass found starved, whose worker, waiting for its feed, sends
-    /// nothing more ([`Pool::wait_any`] refuses that wait). A worker's result, a failure's when
-    /// it ends before its feed, closes that feed ([`Self::take_packs`]).
-    fn feed_from(&mut self, w: u64, wait: bool, packing_too: bool) -> Result<u64, Error> {
-        let mut fed = 0u64;
-        loop {
-            let seen = self.trunk.pool_mut().map(|p| p.accepted());
-            let (used, open) = self.feed_pass(w.saturating_sub(fed), packing_too)?;
-            fed = fed.saturating_add(used);
-            if !wait || !open || fed >= w {
-                return Ok(fed);
-            }
-            if used == 0 {
-                self.take_packs(false)?;
-                let Self {
-                    frozen,
-                    packing,
-                    trunk,
-                    store,
-                    ..
-                } = self;
-                let Some(pool) = trunk.pool_mut() else {
-                    return Ok(fed);
-                };
-                // A message taken since the pass began, by the pass or by the take after it, may
-                // have brought a feed's buffer back after the pass found that feed starved: its
-                // worker, waiting for the feed, sends nothing more. So the wait is only for a pass
-                // that fed nothing with no message since: every open feed's buffers are then out
-                // with its worker, which sends one back, or its result, without the shard.
-                if Some(pool.accepted()) != seen {
-                    continue;
-                }
-                let open = frozen
-                    .iter()
-                    .filter_map(|f| f.feed.as_ref().map(|feed| feed.ticket.worker))
-                    .chain(
-                        packing
-                            .as_ref()
-                            .filter(|_| packing_too)
-                            .and_then(|p| p.feed.as_ref().map(|feed| feed.ticket.worker)),
-                    );
-                if !pool.wait_any(store, open)? {
-                    return Ok(fed);
-                }
+        let Some(pack) = p.sort.take() else {
+            self.packing = Some(p);
+            return Ok(false);
+        };
+        match self.sort_off(p.mem, pack, p.since)? {
+            None => Ok(true),
+            Some((mem, pack)) => {
+                p.mem = mem;
+                p.sort = Some(pack);
+                self.packing = Some(p);
+                Ok(false)
             }
         }
     }
 
-    /// One pass over the feeds, oldest first, none waited for: the entries fed, and whether a
-    /// feed is still open.
-    fn feed_pass(&mut self, w: u64, packing_too: bool) -> Result<(u64, bool), Error> {
-        let run = self.store.run_bytes().max(1);
-        let mut left = w;
-        let mut open = false;
-        let Self {
-            frozen,
-            packing,
-            trunk,
-            store,
-            feed_buffers,
-            ..
-        } = self;
-        let pool = trunk.pool_mut().ok_or(Error::InvalidArgument {
-            what: "a packing fed to workers the shard no longer has",
-        })?;
-        for fz in frozen.iter_mut() {
-            if left == 0 {
-                return Ok((w, true));
-            }
-            let (Some(walk), Some(f)) = (fz.walk.as_mut(), fz.feed.as_mut()) else {
-                continue;
-            };
-            let used = feed_one(store, pool, &fz.mem, walk, f, &mut fz.packed, left, run)?;
-            left = left.saturating_sub(used);
-            if f.full.is_none() {
-                // Fed whole: its spare buffers for the next packing; the worker gives back
-                // the rest with its result.
-                f.spare.extend(f.filling.take());
-                feed_buffers.append(&mut f.spare);
-                feed_buffers.truncate(FEED_BUFFERS);
-                fz.feed = None;
-                fz.walk = None;
-            } else {
-                open = true;
-            }
-        }
-        if left == 0 || !packing_too {
-            return Ok((w.saturating_sub(left), open || left == 0));
-        }
-        let Some(p) = packing.as_mut() else {
-            return Ok((w.saturating_sub(left), open));
-        };
-        let Packing {
-            mem,
-            walk,
-            feed,
-            packed,
-            ..
-        } = p;
-        let (Some(walk), Some(f)) = (walk.as_mut(), feed.as_mut()) else {
-            return Ok((w.saturating_sub(left), open));
-        };
-        let used = feed_one(store, pool, mem, walk, f, packed, left, run)?;
-        Ok((
-            w.saturating_sub(left).saturating_add(used),
-            open || f.full.is_some(),
-        ))
-    }
-
-    /// The packing memtable, handed to its worker, becomes a frozen memtable: read until its
-    /// branch is back, fed by later puts if entries are left, while the next memtable's packing
-    /// starts.
-    fn freeze(&mut self) {
-        if !self.packing.as_ref().is_some_and(|p| p.feed.is_some()) {
-            return;
-        }
-        let Some(Packing {
-            mem,
-            walk,
-            feed,
-            packed,
-            since,
-            ..
-        }) = self.packing.take()
-        else {
-            return;
-        };
-        let Some(mut f) = feed else {
-            return;
-        };
-        let ticket = f.ticket;
-        let grant = std::mem::take(&mut f.grant);
-        let (walk, feed) = if f.full.is_none() {
-            f.spare.extend(f.filling.take());
-            self.feed_buffers.append(&mut f.spare);
-            self.feed_buffers.truncate(FEED_BUFFERS);
-            (None, None)
-        } else {
-            (walk, Some(f))
-        };
-        self.frozen.push_back(Frozen {
-            mem,
-            ticket,
-            grant,
-            back: None,
-            since,
-            error: None,
-            walk,
-            feed,
-            packed,
-        });
-        let held = u64::try_from(self.frozen.len()).unwrap_or(u64::MAX);
-        self.flush_stats.frozen_most = self.flush_stats.frozen_most.max(held);
-        self.pack_carry = 0;
-    }
-
-    /// The entries still to feed: the frozen memtables' and the packing one's, with its order
-    /// and filter pages ([`Packing::left`]).
+    /// The packing still to do: the packing memtable's ([`Packing::left`]).
     fn pack_left(&self) -> u64 {
-        let frozen = self
-            .frozen
-            .iter()
-            .filter(|f| f.feed.is_some())
-            .map(|f| u64::try_from(f.mem.len().saturating_sub(f.packed)).unwrap_or(u64::MAX))
-            .fold(0u64, u64::saturating_add);
-        self.packing
-            .as_ref()
-            .map_or(0, Packing::left)
-            .saturating_add(frozen)
+        self.packing.as_ref().map_or(0, Packing::left)
     }
 
     /// Takes the packing workers' branches that are back, waiting for one when `wait` and a
     /// memtable is frozen: each goes to its memtable, and those whose older memtables' are all
     /// in go to the trunk as pending, oldest first ([`Self::retire`]).
     fn take_packs(&mut self, wait: bool) -> Result<(), Error> {
-        // A wait needs a result on its way: a frozen memtable fed whole whose worker is still
-        // building. One still feeding waits on the shard, not the shard on it.
         let mut wait = wait
             && self
                 .frozen
                 .iter()
-                .any(|f| f.feed.is_none() && f.back.is_none() && f.error.is_none());
+                .any(|f| f.back.is_none() && f.error.is_none());
         loop {
             // Results already in are retired whether or not another comes.
             self.retire_ready()?;
@@ -3038,41 +2752,19 @@ impl<F: BlockFile> ShardDb<F> {
                     && self
                         .frozen
                         .iter()
-                        .any(|f| f.feed.is_none() && f.back.is_none() && f.error.is_none())
+                        .any(|f| f.back.is_none() && f.error.is_none())
                 {
                     pool.want_message();
                 }
                 return Ok(());
             };
             wait = false;
-            match self.frozen.iter_mut().find(|f| f.ticket == back.ticket) {
-                Some(f) => {
-                    // A worker ends before its feed does only by a failure: the feed closes.
-                    f.back = Some(back);
-                    f.feed = None;
-                    f.walk = None;
-                }
-                None => {
-                    // A worker ended before its feed did: only by a failure, which the packing
-                    // still feeding owns.
-                    let feeding = self
-                        .packing
-                        .as_ref()
-                        .and_then(|p| p.feed.as_ref())
-                        .is_some_and(|f| f.ticket == back.ticket);
-                    if !feeding {
-                        return Err(Error::InvalidArgument {
-                            what: "a packed branch for no packing memtable",
-                        });
-                    }
-                    self.freeze();
-                    if let Some(f) = self.frozen.back_mut() {
-                        f.back = Some(back);
-                        f.feed = None;
-                        f.walk = None;
-                    }
-                }
-            }
+            let Some(f) = self.frozen.iter_mut().find(|f| f.ticket == back.ticket) else {
+                return Err(Error::InvalidArgument {
+                    what: "a packed branch for no frozen memtable",
+                });
+            };
+            f.back = Some(back);
         }
     }
 
@@ -3099,8 +2791,10 @@ impl<F: BlockFile> ShardDb<F> {
             let back = f.back.as_mut().ok_or(Error::InvalidArgument {
                 what: "a frozen input with no worker result",
             })?;
-            self.feed_buffers.append(&mut back.buffers);
-            self.feed_buffers.truncate(FEED_BUFFERS);
+            if let Some(pack) = back.sorted.take() {
+                f.sorting = 0;
+                self.keep_sort_pack(pack);
+            }
             let failed = back
                 .physical_error
                 .as_ref()
@@ -3211,25 +2905,9 @@ impl<F: BlockFile> ShardDb<F> {
             if self.frozen.is_empty() {
                 return Ok(());
             }
-            self.wait_oldest(self.frozen.len())?;
+            // The frozen memtables pack in parallel on their workers: a wait is the slowest's.
+            self.take_packs(true)?;
         }
-    }
-
-    /// Waits for a frozen memtable's branch, the oldest `n`'s entries fed first, all at once:
-    /// a worker builds only what it has been sent, and fed together they build in parallel, so
-    /// the wait is the slowest packing's, not their sum.
-    fn wait_oldest(&mut self, n: usize) -> Result<(), Error> {
-        let left = self
-            .frozen
-            .iter()
-            .take(n)
-            .filter(|f| f.feed.is_some())
-            .map(|f| u64::try_from(f.mem.len().saturating_sub(f.packed)).unwrap_or(u64::MAX))
-            .fold(0u64, u64::saturating_add);
-        if left > 0 {
-            self.feed_from(left, true, false)?;
-        }
-        self.take_packs(true)
     }
 
     /// Charges a scan's `run_seeks` seeks of the runs, each `many` comparisons where one run would
@@ -3347,7 +3025,11 @@ impl<F: BlockFile> ShardDb<F> {
             return Ok(0);
         }
         self.trunk.clear_io_wait();
-        self.idle_step_with(keys, true)
+        let done = self.idle_step_with(keys, true)?;
+        let f = &mut self.flush_stats;
+        f.idle_slices = f.idle_slices.saturating_add(1);
+        f.idle_units = f.idle_units.saturating_add(done);
+        Ok(done)
     }
 
     pub(crate) fn waiting_for_io(&self) -> bool {
@@ -3414,11 +3096,7 @@ impl<F: BlockFile> ShardDb<F> {
         }
         if !self.frozen.is_empty() {
             // Only workers' branches owed: an idle shard that may wait waits for the oldest.
-            if paced {
-                self.take_packs(false)?;
-            } else {
-                self.wait_oldest(1)?;
-            }
+            self.take_packs(!paced)?;
             return Ok(1);
         }
         if self.trunk.debt() > 0 || !self.trunk.is_idle() {
@@ -3492,55 +3170,40 @@ impl<F: BlockFile> ShardDb<F> {
         f.incorporate_max_ns = f.incorporate_max_ns.max(ns);
     }
 
-    /// The packing memtable no worker took during its fill, at the rotation that needs its
-    /// place: its order paid, a worker free now takes it, to be frozen as any packing a worker
-    /// has, the measured overlap deciding what the rotation waits for. Results already in are
-    /// taken first, freeing their workers. True when one took it; false with every worker busy,
-    /// or with none, when the shard must build it.
-    fn hand_off_packing(&mut self) -> Result<bool, Error> {
-        if self.packing.as_ref().is_none_or(|p| p.builder.is_some()) {
-            return Ok(false);
-        }
-        self.take_packs(false)?;
-        let Some(p) = self.packing.as_mut() else {
-            return Ok(false);
-        };
-        p.mem.pay(usize::MAX);
-        if p.walk.is_none() {
-            p.walk = Some(p.mem.walk_start());
-        }
-        self.start_packing(false)?;
-        Ok(self.packing.as_ref().is_some_and(|p| p.feed.is_some()))
-    }
-
     /// Packs the rest of the packing memtable and takes every frozen one's branch, all going to
     /// the trunk as pending in age order, and keeps a memtable, cleared, for the next fill.
     fn finish_packing(&mut self) -> Result<(), Error> {
+        // One waiting for a worker goes to one free now; with none free, the shard packs it.
+        if self.packing.as_ref().is_some_and(|p| p.sort.is_some()) && self.hand_off_sorted()? {
+            return self.drain_frozen();
+        }
         let Some(p) = self.packing.as_mut() else {
             return self.drain_frozen();
         };
         let t = self.timed.then(std::time::Instant::now);
+        if let Some(pack) = p.sort.take() {
+            p.mem.close();
+            let entries = u64::try_from(p.mem.len()).unwrap_or(u64::MAX);
+            // The memtable's bytes in extents, and one for the last partial one: a file kept as
+            // segments grows first, waited for, as the shard's own allocations may.
+            let run = self.store.run_bytes().max(1);
+            let extents = crate::util::div_ceil_usize(p.mem.bytes(), run)
+                .unwrap_or(0)
+                .saturating_add(1);
+            self.keep_sort_pack(pack);
+            self.grow_for(u64::try_from(extents).unwrap_or(u64::MAX))?;
+            let builder = Builder::new(&mut self.store, Keys::Exactly(entries))?;
+            if let Some(p) = self.packing.as_mut() {
+                p.builder = Some(builder);
+            }
+        }
+        let Some(p) = self.packing.as_mut() else {
+            return self.drain_frozen();
+        };
         // The order work left, whole, then the walk from where packing left it.
         p.mem.pay(usize::MAX);
         if p.walk.is_none() {
             p.walk = Some(p.mem.walk_start());
-        }
-        if p.builder.is_none() && p.feed.is_none() {
-            self.start_packing(true)?;
-        }
-        if self.packing.as_ref().is_some_and(|p| p.feed.is_some()) {
-            self.freeze();
-            self.drain_frozen()?;
-            let ns = ns_since(t);
-            self.note_pack(ns);
-            self.flush_stats.pack_finish_ns = self.flush_stats.pack_finish_ns.saturating_add(ns);
-            return if self.packing.is_some() {
-                Err(Error::InvalidArgument {
-                    what: "a packing worker that never gave its branch back",
-                })
-            } else {
-                Ok(())
-            };
         }
         // Built here: after every older memtable's branch, pending in age order.
         self.drain_frozen()?;
@@ -3552,10 +3215,10 @@ impl<F: BlockFile> ShardDb<F> {
                 ..
             }) => (mem, walk, builder),
             Some(other) => {
-                // Neither handed to a worker nor built: kept, never dropped with its entries.
+                // No builder: kept, never dropped with its entries.
                 self.packing = Some(other);
                 return Err(Error::InvalidArgument {
-                    what: "a packing finished that was neither handed to a worker nor built",
+                    what: "a packing finished with no builder",
                 });
             }
             None => return Ok(()),
@@ -3583,22 +3246,196 @@ impl<F: BlockFile> ShardDb<F> {
         Ok(())
     }
 
-    /// A full memtable as the packing one: its builder now when the shard packs it, or once its
-    /// order is paid when a worker may ([`Self::start_packing`]).
-    fn packing_of(&mut self, mem: HashMem) -> Result<Packing, Error> {
-        let builder = if self.trunk.has_pool() {
-            None
-        } else {
-            Some(Builder::new(
-                &mut self.store,
-                Keys::Exactly(u64::try_from(mem.len()).unwrap_or(u64::MAX)),
-            )?)
+    /// The memtable the next fill takes: the spare one, else a new one, given a mirror when
+    /// workers will pack it ([`Self::give_mirror`]).
+    fn fresh_mem(&mut self) -> Result<HashMem, Error> {
+        let mut fresh = match self.spare.take() {
+            Some(m) => m,
+            None => HashMem::new(self.mem_limit)?,
         };
+        self.give_mirror(&mut fresh);
+        Ok(fresh)
+    }
+
+    /// Gives an empty memtable a copy of its arena to keep for the worker that will sort and
+    /// pack it (research/40 §4), when the shard has workers: a spare packing's buffer, else a new
+    /// one. Refused its room, the memtable fills without one and the shard packs it.
+    fn give_mirror(&mut self, mem: &mut HashMem) {
+        if mem.mirrored() || !self.trunk.has_pool() {
+            return;
+        }
+        let buf = self.mirror_buffer();
+        if let Err(buf) = mem.mirror_into(buf) {
+            self.spare_mirror(buf);
+        }
+    }
+
+    /// A spare packing's arena buffer, else a new one.
+    fn mirror_buffer(&mut self) -> Vec<u8> {
+        self.sort_spares
+            .iter_mut()
+            .find(|p| p.arena.capacity() > 0)
+            .map(|p| std::mem::take(&mut p.arena))
+            .unwrap_or_default()
+    }
+
+    /// Keeps an arena buffer a memtable did not take in a spare packing that has none.
+    fn spare_mirror(&mut self, buf: Vec<u8>) {
+        if let Some(p) = self
+            .sort_spares
+            .iter_mut()
+            .find(|p| p.arena.capacity() == 0)
+        {
+            p.arena = buf;
+        }
+    }
+
+    /// Keeps a sorted packing back from its worker for the next, emptied: no more spares than a
+    /// worker's packing each, and the active memtable's.
+    fn keep_sort_pack(&mut self, mut pack: SortPack) {
+        let most = self
+            .trunk
+            .pool_workers()
+            .map_or(0, |(held, _)| held)
+            .saturating_add(1);
+        if self.sort_spares.len() < most {
+            pack.arena.clear();
+            pack.entries = 0;
+            self.sort_spares.push(pack);
+        }
+    }
+
+    /// A full memtable goes to its packing: to a worker that sorts the copy of its arena it kept
+    /// (or one made now, for a memtable filled before the shard had workers), frozen at once and
+    /// read until its branch is back; with none free now, it waits as the packing memtable for
+    /// the first free ([`Self::hand_off_sorted`]). Without workers, or with the copy's memory
+    /// refused, the shard packs it, its order a debt paid a slice at a time. Scans since the last rotation have the next memtable ordered as it fills.
+    fn pack_full(&mut self, mut full: HashMem) -> Result<(), Error> {
+        // Rent paid on one memtable's runs buys no merge of the next's.
+        self.tidy_rent_ns = 0;
+        self.order_paced = self.scans != self.scans_at_rotation;
+        self.scans_at_rotation = self.scans;
+        let since = std::time::Instant::now();
+        let arena = match full.take_mirror() {
+            Some(arena) => Some(arena),
+            // Filled before the shard had workers, or its copy's room refused as it began: its
+            // arena copied now, once, so a worker still sorts it; the shard packs a memtable
+            // only without workers, or with this copy's memory refused too.
+            None if self.trunk.has_pool() => {
+                let mut buf = self.mirror_buffer();
+                match full.copy_arena(&mut buf) {
+                    Ok(()) => Some(buf),
+                    Err(_) => {
+                        self.spare_mirror(buf);
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        if let Some(arena) = arena {
+            let mut pack = self.sort_spares.pop().unwrap_or_default();
+            pack.entries = u64::try_from(full.len()).unwrap_or(u64::MAX);
+            pack.skip = full.skip();
+            pack.arena = arena;
+            if let Some((mem, pack)) = self.sort_off(full, pack, since)? {
+                self.packing = Some(Packing {
+                    mem,
+                    sort: Some(pack),
+                    walk: None,
+                    builder: None,
+                    packed: 0,
+                    since,
+                });
+            }
+            return Ok(());
+        }
+        full.close();
+        self.packing = Some(self.packing_of(full)?);
+        Ok(())
+    }
+
+    /// Hands `full` and its arena's copy in `pack` to a worker that sorts and packs it, the
+    /// memtable frozen at once, read until its branch is back: None. Both back when no worker
+    /// takes it now, or the file must grow first.
+    fn sort_off(
+        &mut self,
+        full: HashMem,
+        pack: SortPack,
+        since: std::time::Instant,
+    ) -> Result<Option<(HashMem, SortPack)>, Error> {
+        let run = self.store.run_bytes().max(1);
+        let extents = crate::util::div_ceil_usize(full.bytes(), run)
+            .unwrap_or(0)
+            .saturating_add(1);
+        let asked = u64::try_from(extents).unwrap_or(u64::MAX);
+        if self.store.segments().is_some() && self.store.capacity() < asked {
+            self.packing_wanted = self.packing_wanted.max(asked);
+            return Ok(Some((full, pack)));
+        }
+        let Some(pool) = self.trunk.pool_mut().filter(|pool| pool.can_take(true)) else {
+            if let Some(pool) = self.trunk.pool_mut() {
+                // Every worker busy: a completion frees the one this packing needs.
+                pool.want_message();
+            }
+            return Ok(Some((full, pack)));
+        };
+        let grant = self.store.grant(extents)?;
+        let sorting = pack.memory();
+        let job = Box::new(Job {
+            work: Work::Sort(pack),
+            grant: grant.clone(),
+            file_end: self.store.end(),
+            generation: self.store.generation(),
+            keep: None,
+        });
+        let sent = match pool.send(job, Owner::Pack, true) {
+            Ok(sent) => sent,
+            Err((error, job)) => {
+                self.store.grant_back(&job.grant)?;
+                return Err(error);
+            }
+        };
+        let ticket = match sent {
+            Ok(ticket) => ticket,
+            Err(job) => {
+                self.store.grant_back(&job.grant)?;
+                let Job { work, .. } = *job;
+                let Work::Sort(pack) = work else {
+                    return Err(Error::InvalidArgument {
+                        what: "a sorted packing's job came back as other work",
+                    });
+                };
+                return Ok(Some((full, pack)));
+            }
+        };
+        self.frozen.push_back(Frozen {
+            mem: full,
+            ticket,
+            grant,
+            back: None,
+            since,
+            error: None,
+            sorting,
+        });
+        let held = u64::try_from(self.frozen.len()).unwrap_or(u64::MAX);
+        self.flush_stats.frozen_most = self.flush_stats.frozen_most.max(held);
+        self.pack_carry = 0;
+        Ok(None)
+    }
+
+    /// A full memtable as the packing one the shard packs itself: its builder now, its order a
+    /// debt paid a slice at a time.
+    fn packing_of(&mut self, mem: HashMem) -> Result<Packing, Error> {
+        let builder = Builder::new(
+            &mut self.store,
+            Keys::Exactly(u64::try_from(mem.len()).unwrap_or(u64::MAX)),
+        )?;
         Ok(Packing {
             mem,
+            sort: None,
             walk: None,
-            builder,
-            feed: None,
+            builder: Some(builder),
             packed: 0,
             since: std::time::Instant::now(),
         })
@@ -3617,10 +3454,7 @@ impl<F: BlockFile> ShardDb<F> {
                 self.fill_ns =
                     u64::try_from(now.saturating_duration_since(r).as_nanos()).unwrap_or(u64::MAX);
             }
-            let finish_packing = self.packing.as_ref().is_some_and(|p| p.feed.is_none());
-            if self.packing.as_ref().is_some_and(|p| p.feed.is_some()) {
-                self.freeze();
-            }
+            let finish_packing = self.packing.is_some();
             self.rotation = Some(Rotation {
                 started: now,
                 finish_packing,
@@ -3630,16 +3464,12 @@ impl<F: BlockFile> ShardDb<F> {
         }
         if self.rotation.as_ref().is_some_and(|r| r.finish_packing) {
             if self.packing.is_some() {
-                // No worker took it during its fill: its order paid a slice at a time, the first
-                // worker free takes it, and it freezes as any packing a worker has, later puts
-                // feeding what is left; the measured overlap below decides what else is waited
-                // for. Its own packing is not: a worker holds it. Results already in are taken
-                // first, freeing their workers.
+                // Still packing at the rotation that needs its place: one waiting for a worker
+                // goes to the first free, results already in taken first to free theirs; one the
+                // shard packs pays its slices. The measured overlap below decides what else is
+                // waited for.
                 self.take_packs(false)?;
                 self.pack_some(keys.max(1), false)?;
-                if self.packing.as_ref().is_some_and(|p| p.feed.is_some()) {
-                    self.freeze();
-                }
                 if self.packing.is_some() {
                     return Ok(false);
                 }
@@ -3662,17 +3492,6 @@ impl<F: BlockFile> ShardDb<F> {
             if let Some(r) = self.rotation.as_mut() {
                 r.stalled = true;
             }
-            let n = self.frozen.len().saturating_sub(most);
-            let left = self
-                .frozen
-                .iter()
-                .take(n)
-                .filter(|f| f.feed.is_some())
-                .map(|f| u64::try_from(f.mem.len().saturating_sub(f.packed)).unwrap_or(u64::MAX))
-                .fold(0u64, u64::saturating_add);
-            if left > 0 {
-                self.feed_from(left.min(keys.max(1)), false, false)?;
-            }
             self.take_packs(false)?;
             if self.frozen.len() > most {
                 return Ok(false);
@@ -3683,8 +3502,8 @@ impl<F: BlockFile> ShardDb<F> {
                 r.stalled = true;
             }
             if self.trunk.packing_blocks_dispatch() {
-                // A packing holds every seat and can still need owner-fed input. Pay its
-                // bounded slice before waiting on maintenance's worker capacity.
+                // Packings hold every seat: their results free them. Take any back before
+                // waiting on maintenance's worker capacity.
                 self.pack_some(keys.max(1), false)?;
                 self.take_packs(false)?;
                 if self.trunk.packing_blocks_dispatch() {
@@ -3695,14 +3514,9 @@ impl<F: BlockFile> ShardDb<F> {
                 return Ok(false);
             }
         }
-        let fresh = match self.spare.take() {
-            Some(m) => m,
-            None => HashMem::new(self.mem_limit)?,
-        };
-        let mut full = std::mem::replace(&mut self.mem, fresh);
-        self.tidy_rent_ns = 0;
-        full.close();
-        self.packing = Some(self.packing_of(full)?);
+        let fresh = self.fresh_mem()?;
+        let full = std::mem::replace(&mut self.mem, fresh);
+        self.pack_full(full)?;
         let r = self.rotation.take().ok_or(Error::InvalidArgument {
             what: "a resumed rotation with no initial state",
         })?;
@@ -3739,14 +3553,9 @@ impl<F: BlockFile> ShardDb<F> {
             return Ok(false);
         }
         if !self.mem.is_empty() {
-            let fresh = match self.spare.take() {
-                Some(m) => m,
-                None => HashMem::new(self.mem_limit)?,
-            };
-            let mut full = std::mem::replace(&mut self.mem, fresh);
-            self.tidy_rent_ns = 0;
-            full.close();
-            self.packing = Some(self.packing_of(full)?);
+            let fresh = self.fresh_mem()?;
+            let full = std::mem::replace(&mut self.mem, fresh);
+            self.pack_full(full)?;
             return Ok(false);
         }
         if !self.trunk.is_idle() {
@@ -3772,28 +3581,24 @@ impl<F: BlockFile> ShardDb<F> {
         }
         let t = if self.timed { Some(now) } else { None };
         let mut stalled = false;
-        if self.packing.as_ref().is_some_and(|p| p.feed.is_none()) && !self.hand_off_packing()? {
-            // Every worker busy: the shard builds it, its branch after the older ones'.
+        if self.packing.is_some() && !self.hand_off_sorted()? {
+            // No worker free for it, or one the shard packs: built here, its branch after the
+            // older ones'.
             self.finish_packing()?;
             stalled = true;
-        }
-        if self.packing.as_ref().is_some_and(|p| p.feed.is_some()) {
-            // Handed to a worker: frozen as it is, later puts feeding what is left, while the
-            // next memtable fills.
-            self.freeze();
         }
         // Whatever froze them (this rotation, or a put's share that fed one whole), no more stay
         // frozen than the measure says overlap: the oldest are waited for.
         let most = self.frozen_most();
         while self.frozen.len() > most {
-            self.wait_oldest(self.frozen.len().saturating_sub(most))?;
+            self.take_packs(true)?;
             stalled = true;
         }
         if !self.trunk.has_room() {
             if self.trunk.packing_blocks_dispatch() {
-                // The root's compactions cannot admit a job until a packing seat is free; feed
-                // the oldest packing before any wait that would depend on its owner.
-                self.wait_oldest(1)?;
+                // The root's compactions cannot admit a job until a packing seat is free: the
+                // oldest packing's result frees one.
+                self.take_packs(true)?;
             }
             self.trunk.make_room(&mut self.store)?;
             stalled = true;
@@ -3805,16 +3610,9 @@ impl<F: BlockFile> ShardDb<F> {
             f.stall_ns = f.stall_ns.saturating_add(ns);
             f.stall_max_ns = f.stall_max_ns.max(ns);
         }
-        let fresh = match self.spare.take() {
-            Some(m) => m,
-            None => HashMem::new(self.mem_limit)?,
-        };
-        let mut full = std::mem::replace(&mut self.mem, fresh);
-        // Rent paid on one memtable's runs buys no merge of the next's.
-        self.tidy_rent_ns = 0;
-        // Its order, a debt its packing pays a slice at a time.
-        full.close();
-        self.packing = Some(self.packing_of(full)?);
+        let fresh = self.fresh_mem()?;
+        let full = std::mem::replace(&mut self.mem, fresh);
+        self.pack_full(full)?;
         self.rotated = Some(std::time::Instant::now());
         Ok(())
     }
@@ -3870,15 +3668,9 @@ impl<F: BlockFile> ShardDb<F> {
         self.no_checkpoint_mutation()?;
         self.finish_packing()?;
         if !self.mem.is_empty() {
-            let fresh = match self.spare.take() {
-                Some(m) => m,
-                None => HashMem::new(self.mem_limit)?,
-            };
-            let mut full = std::mem::replace(&mut self.mem, fresh);
-            // Rent paid on one memtable's runs buys no merge of the next's.
-            self.tidy_rent_ns = 0;
-            full.close();
-            self.packing = Some(self.packing_of(full)?);
+            let fresh = self.fresh_mem()?;
+            let full = std::mem::replace(&mut self.mem, fresh);
+            self.pack_full(full)?;
             self.finish_packing()?;
         }
         let t = self.timed.then(std::time::Instant::now);
@@ -4093,9 +3885,9 @@ mod frozen_tests {
     //! overlap the shard measures, a stall or a failure armed on the worker a packing went to.
     //! The packing whose writes stall stays frozen and every read stays exact; a younger packing
     //! another worker takes comes back behind it, and on a host whose one worker is the stalled
-    //! one it waits for that worker; a starved feed holds no younger one back; released, the
-    //! branches enter the trunk oldest first; a worker's failure is kept, typed and fenced,
-    //! never dropping what the memtables hold; and the store reopens at its last checkpoint.
+    //! one it waits for that worker; released, the branches enter the trunk oldest first; a
+    //! worker's failure is kept, typed and fenced, never dropping what the memtables hold; and
+    //! the store reopens at its last checkpoint.
     use super::*;
     use hyper_block::DiskError;
     use hyper_block::buf::Alignment;
@@ -4317,15 +4109,6 @@ mod frozen_tests {
         }
     }
 
-    /// A put of a key no earlier put wrote, so a memtable fills with as many entries as it
-    /// holds.
-    fn put_new(db: &mut ShardDb<Held>, oracle: &mut BTreeMap<Vec<u8>, Vec<u8>>, i: u64) {
-        let k = format!("k{i:06}").into_bytes();
-        let v = format!("v{i}").into_bytes();
-        db.put(&k, &v).unwrap();
-        oracle.insert(k, v);
-    }
-
     type Put = fn(&mut ShardDb<Held>, &mut BTreeMap<Vec<u8>, Vec<u8>>, u64);
 
     /// Puts until the shard has measured a fill and a packing, so the overlap it lets stay
@@ -4348,27 +4131,10 @@ mod frozen_tests {
         }
     }
 
-    /// Waits for a message from a worker out on a job, which frees it ([`Pool::wait_any`]), the
-    /// frozen memtables' feeds given their buffers first, since a worker waiting for its feed
-    /// sends nothing.
-    fn until_a_worker_is_free(db: &mut ShardDb<Held>) {
-        db.feed_from(u64::MAX, false, false).unwrap();
-        let open: Vec<usize> = db
-            .frozen
-            .iter()
-            .filter_map(|f| f.feed.as_ref().map(|feed| feed.ticket.worker))
-            .collect();
-        let ShardDb { trunk, store, .. } = db;
-        assert!(
-            trunk.pool_mut().unwrap().wait_any(store, open).unwrap(),
-            "every worker is out, and none has a job to answer"
-        );
-    }
-
-    /// Puts until the packing memtable is out on a worker that has none of its entries yet (its
-    /// feed's buffers all still in hand), then stalls that worker's writes, failing the first
-    /// after the stall when `fail`; puts through the rotation that freezes it, feeds it what its
-    /// buffers take, and waits until its worker waits in a write. Returns that worker.
+    /// Drains every packing and the trunk's maintenance, so every worker is free and the next
+    /// packing goes to the first seat; stalls that seat's writes, failing the first after the
+    /// stall when `fail`; puts through the rotation that hands it the next memtable, and waits
+    /// until it waits in a write. Returns that worker.
     fn stall_oldest(
         db: &mut ShardDb<Held>,
         oracle: &mut BTreeMap<Vec<u8>, Vec<u8>>,
@@ -4377,41 +4143,15 @@ mod frozen_tests {
         gates: &'static Gates,
         fail: bool,
     ) -> usize {
-        let rotations = db.flush_stats.rotations;
-        let worker = loop {
-            if let Some(f) = db.packing.as_ref().and_then(|p| p.feed.as_ref()) {
-                assert_eq!(
-                    f.spare.len() + usize::from(f.filling.is_some()),
-                    FEED_BUFFERS,
-                    "a buffer reached the worker before its stall was armed"
-                );
-                break f.ticket.worker;
-            }
-            // Its order paid and every worker out on another job, as on a host of few cores
-            // while the trunk compacts: a put would only fill the next memtable, so the shard
-            // waits, putting nothing, for a worker's message, which frees that worker for it.
-            if db
-                .packing
-                .as_ref()
-                .is_some_and(|p| p.walk.is_some() && p.feed.is_none() && p.builder.is_none())
-                && !db.trunk.pool_mut().unwrap().can_take(true)
-            {
-                until_a_worker_is_free(db);
-                continue;
-            }
-            assert_eq!(
-                db.flush_stats.rotations, rotations,
-                "a fill passed with no worker taking its packing"
-            );
-            put(db, oracle, *i);
-            *i += 1;
-        };
+        db.flush().unwrap();
+        assert!(db.frozen.is_empty() && db.packing.is_none());
+        let worker = 0;
         gates.arm(worker, fail);
+        let rotations = db.flush_stats.rotations;
         while db.flush_stats.rotations == rotations {
             put(db, oracle, *i);
             *i += 1;
         }
-        db.feed_from(u64::MAX, false, false).unwrap();
         gates.until_waiting();
         assert!(
             db.frozen
@@ -4422,11 +4162,23 @@ mod frozen_tests {
         worker
     }
 
-    /// The younger packing's share, all of it, waited for: a free worker, when the host has
-    /// one, takes it and its result comes back behind the stalled one; on a host whose workers
-    /// are all busy, the stalled one's among them, it waits for a worker.
-    fn younger_beside(db: &mut ShardDb<Held>) {
-        db.pack_some(u64::MAX, true).unwrap();
+    /// Puts through the next rotation: a free worker, when the host has one, takes the younger
+    /// memtable and its result comes back behind the stalled one's, waited for; on a host whose
+    /// workers are all busy, the stalled one's among them, it waits for a worker.
+    fn younger_beside(
+        db: &mut ShardDb<Held>,
+        oracle: &mut BTreeMap<Vec<u8>, Vec<u8>>,
+        i: &mut u64,
+        put: Put,
+    ) {
+        let rotations = db.flush_stats.rotations;
+        while db.flush_stats.rotations == rotations {
+            put(db, oracle, *i);
+            *i += 1;
+        }
+        if db.frozen.len() > 1 {
+            db.take_packs(true).unwrap();
+        }
         match db.frozen.get(1) {
             Some(younger) => assert!(
                 younger.back.is_some(),
@@ -4434,7 +4186,7 @@ mod frozen_tests {
             ),
             None => {
                 assert!(
-                    db.packing.as_ref().is_some_and(|p| p.feed.is_none()),
+                    db.packing.as_ref().is_some_and(|p| p.sort.is_some()),
                     "a younger packing neither came back nor waits for a worker"
                 );
                 assert!(
@@ -4459,7 +4211,7 @@ mod frozen_tests {
         warm(&mut db, &mut oracle, &mut i, put_or_delete);
         check(&mut db, &oracle);
         stall_oldest(&mut db, &mut oracle, &mut i, put_or_delete, &GATES_A, false);
-        younger_beside(&mut db);
+        younger_beside(&mut db, &mut oracle, &mut i, put_or_delete);
         check(&mut db, &oracle);
         // Released: every frozen branch enters the trunk, oldest first.
         GATES_A.release();
@@ -4504,7 +4256,7 @@ mod frozen_tests {
         warm(&mut db, &mut oracle, &mut i, put_or_delete);
         // A real worker failure is retained, with no owner-thread repacking.
         stall_oldest(&mut db, &mut oracle, &mut i, put_or_delete, &GATES_B, true);
-        younger_beside(&mut db);
+        younger_beside(&mut db, &mut oracle, &mut i, put_or_delete);
         GATES_B.release();
         assert!(matches!(db.drain_frozen(), Err(Error::Io { .. })));
         assert!(matches!(db.drain_frozen(), Err(Error::Io { .. })));
@@ -4555,85 +4307,5 @@ mod frozen_tests {
         db.fill_ns = 0;
         db.pack_ns = 5_000;
         assert_eq!(db.frozen_most(), 0, "no fill measured, none");
-    }
-
-    static GATES_C: Gates = Gates::new();
-
-    /// A run two pages, the fewest an extent holds, so a memtable takes many of a feed's buffers
-    /// and its feed starves while its worker stalls.
-    const STORE_RUN_PAGE: Config = Config {
-        page_size: 4096,
-        extent_pages: 2,
-        max_extents: 1 << 16,
-    };
-    const MEM_RUNS: usize = 128 * 1024;
-
-    #[test]
-    fn a_starved_oldest_feed_never_holds_a_younger_packing_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("store");
-        let mut db = ShardDb::create(plain(&path, true), STORE_RUN_PAGE, MEM_RUNS, TRUNK).unwrap();
-        let _open = Open(&GATES_C);
-        db.set_workers(gated(&path, &GATES_C)).unwrap();
-        let mut oracle = BTreeMap::new();
-        let mut i = 0u64;
-        warm(&mut db, &mut oracle, &mut i, put_new);
-        stall_oldest(&mut db, &mut oracle, &mut i, put_new, &GATES_C, false);
-        assert!(
-            db.frozen.front().is_some_and(|f| f.feed.is_some()),
-            "the stalled packing's feed did not starve"
-        );
-        // Puts until the younger packing is out on another worker with a buffer in hand and
-        // entries left, or, on a host whose workers are all busy, the stalled one's among them,
-        // its order paid with no worker free to take it; within the fill, so no rotation waits
-        // on the stalled one.
-        let rotations = db.flush_stats.rotations;
-        let in_hand = loop {
-            let p = db.packing.as_ref().unwrap();
-            if p.packed < p.mem.len() && p.feed.as_ref().is_some_and(|f| f.filling.is_some()) {
-                break true;
-            }
-            if p.walk.is_some() && p.feed.is_none() && !db.trunk.pool_mut().unwrap().can_take(true)
-            {
-                break false;
-            }
-            assert_eq!(
-                db.flush_stats.rotations, rotations,
-                "a fill passed with the younger packing neither out nor waiting for a worker"
-            );
-            put_new(&mut db, &mut oracle, i);
-            i += 1;
-        };
-        if in_hand {
-            // One pass, waiting for none: the younger packing takes entries though the oldest
-            // starves.
-            let before = db.packing.as_ref().map_or(0, |p| p.packed);
-            db.feed(u64::MAX, false).unwrap();
-            let after = db.packing.as_ref().map_or(0, |p| p.packed);
-            assert!(
-                after > before,
-                "the starved oldest held the younger feed back"
-            );
-        }
-        assert!(db.frozen.front().is_some_and(|f| !f.ready()));
-        scan_exact(&mut db, &oracle);
-        // Released: every branch enters the trunk, oldest first, reads exact.
-        GATES_C.release();
-        db.drain_frozen().unwrap();
-        db.maintain(u64::MAX).unwrap();
-        assert!(db.frozen.is_empty());
-        let mut v = Vec::new();
-        for (k, want) in &oracle {
-            assert!(db.get(k, &mut v).unwrap() && &v == want);
-        }
-        db.checkpoint(i).unwrap();
-        let (file, landed) = crate::store::cold_file(db.into_file());
-        landed.unwrap();
-        drop(file);
-        let (mut db, applied) =
-            ShardDb::open(plain(&path, false), STORE_RUN_PAGE, MEM_RUNS, TRUNK).unwrap();
-        assert_eq!(applied, i);
-        scan_exact(&mut db, &oracle);
-        db.check_references().unwrap();
     }
 }

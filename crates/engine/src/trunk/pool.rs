@@ -8,8 +8,8 @@
 //! returned ([`Ticket`]): a worker freed while its result waits for its owner can take that
 //! owner's next job, so the worker alone does not say which job a result answers. Nothing is
 //! shared between threads: the shard keeps its memtables and trunk, a job owns its inputs'
-//! descriptors, and a packing's entries reach the worker as buffers moved through a channel and
-//! moved back for reuse. The trunk and the memtables change only on the shard's thread, when a
+//! descriptors, and a packing owns the copy of its memtable's arena, which the worker sorts
+//! itself and gives back with the result for reuse ([`SortPack`]; research/40 §4). The trunk and the memtables change only on the shard's thread, when a
 //! result is taken, so a read between never sees one half changed.
 //!
 //! How many workers: Little's law, L = λW (Little, Operations Research 9(3), 1961). Between one
@@ -34,8 +34,9 @@ use hyper_rt::sync::{ChannelReceiver, Sender};
 
 use crate::branch::filter::Keys;
 use crate::branch::merge::Compaction;
-use crate::branch::{Branch, Builder, Op};
+use crate::branch::{Branch, Builder};
 use crate::error::Error;
+use crate::memtable::hashed::Sorter;
 use crate::store::cache::Kept;
 use crate::store::{Config, IntoFile, Refill, Store};
 use hyper_block::block::BlockFile;
@@ -52,12 +53,32 @@ pub struct Task {
     pub per: u64,
 }
 
-/// A worker's work: a compaction, or a full memtable's entries to pack into one branch.
+/// A worker's work: a compaction, a full memtable to sort and pack into one branch, or a growth
+/// of the shard's file.
 #[derive(Debug)]
 pub enum Work {
     Compact(Task),
-    Pack(Stream),
+    Sort(SortPack),
     Grow(Growth),
+}
+
+/// A full memtable packed by a worker that sorts it (research/40 §4): the copy of its arena it
+/// kept as it was written ([`crate::memtable::hashed::HashMem::take_mirror`]), the first bytes
+/// every key shares, the entries it holds (each key once), and the sorter's buffers. It comes
+/// back with the result, its buffers kept for the next.
+#[derive(Debug, Default)]
+pub struct SortPack {
+    pub entries: u64,
+    pub skip: usize,
+    pub arena: Vec<u8>,
+    pub sorter: Sorter,
+}
+
+impl SortPack {
+    /// The bytes its buffers hold, at their capacities.
+    pub fn memory(&self) -> usize {
+        self.arena.capacity().saturating_add(self.sorter.memory())
+    }
 }
 
 /// A segment of the shard's file to add, when `add`, and write whole, so its extents may be
@@ -67,87 +88,6 @@ pub struct Growth {
     pub start: u64,
     pub extents: u64,
     pub add: bool,
-}
-
-/// A packing's entries as the worker takes them: `entries` in all, in key order, in buffers
-/// the shard fills from its memtable as it walks it ([`encode`]) and sends on `full`; each
-/// buffer, emptied, goes back on the workers' one channel to the shard, so a shard waiting for
-/// one also answers a worker's ask for extents ([`Pool::buffer`]). The shard's end of `full`
-/// closing ends the entries.
-#[derive(Debug)]
-pub struct Stream {
-    pub entries: u64,
-    pub full: Receiver<Vec<u8>>,
-}
-
-/// The buffers a packing's entries reach its worker in: two, so the shard fills one while the
-/// worker builds from the other (double buffering, the least that overlaps a producer with its
-/// consumer), each the bytes of a run, the store's unit of write (`Store::run_bytes`).
-pub const FEED_BUFFERS: usize = 2;
-
-/// An entry's fixed bytes in a packing buffer: key length, value length, operation, hash.
-const ENTRY_FIXED: usize = 4 + 4 + 1 + 4;
-
-/// Appends an entry to a packing buffer: its key's and value's lengths, its operation and its
-/// key's 32-bit hash, then the key and the value. Refused as too large past 4 GiB a field, and
-/// when the buffer's memory cannot grow.
-pub fn encode(buf: &mut Vec<u8>, key: &[u8], op: Op, value: &[u8], hash: u32) -> Result<(), Error> {
-    let too_large = || Error::LimitExceeded {
-        what: "bytes of a packed entry's key or value",
-        limit: u64::from(u32::MAX),
-    };
-    let k = u32::try_from(key.len()).map_err(|_| too_large())?;
-    let v = u32::try_from(value.len()).map_err(|_| too_large())?;
-    let len = ENTRY_FIXED
-        .saturating_add(key.len())
-        .saturating_add(value.len());
-    buf.try_reserve(len).map_err(|_| Error::LimitExceeded {
-        what: "bytes of a packing buffer",
-        limit: u64::try_from(buf.len().saturating_add(len)).unwrap_or(u64::MAX),
-    })?;
-    buf.extend_from_slice(&k.to_le_bytes());
-    buf.extend_from_slice(&v.to_le_bytes());
-    buf.push(op.byte());
-    buf.extend_from_slice(&hash.to_le_bytes());
-    buf.extend_from_slice(key);
-    buf.extend_from_slice(value);
-    Ok(())
-}
-
-/// Each entry of a packing buffer, in order: `each(key, op, value, hash)`. A buffer not made of
-/// whole entries is a typed corruption.
-fn decode(
-    buf: &[u8],
-    mut each: impl FnMut(&[u8], Op, &[u8], u32) -> Result<(), Error>,
-) -> Result<(), Error> {
-    let bad = || Error::Corruption {
-        what: "a packing buffer",
-        why: crate::error::Malformed::OutOfRange,
-    };
-    let u32_at = |b: &[u8], at: usize| -> Result<u32, Error> {
-        let bytes = b.get(at..at.saturating_add(4)).ok_or(bad())?;
-        let a: [u8; 4] = bytes.try_into().map_err(|_| bad())?;
-        Ok(u32::from_le_bytes(a))
-    };
-    let mut at = 0usize;
-    while at < buf.len() {
-        let k = usize::try_from(u32_at(buf, at)?).map_err(|_| bad())?;
-        let v = usize::try_from(u32_at(buf, at.saturating_add(4))?).map_err(|_| bad())?;
-        let op = buf
-            .get(at.saturating_add(8))
-            .copied()
-            .and_then(Op::from_byte)
-            .ok_or(bad())?;
-        let hash = u32_at(buf, at.saturating_add(9))?;
-        let key_at = at.saturating_add(ENTRY_FIXED);
-        let value_at = key_at.checked_add(k).ok_or(bad())?;
-        let end = value_at.checked_add(v).ok_or(bad())?;
-        let key = buf.get(key_at..value_at).ok_or(bad())?;
-        let value = buf.get(value_at..end).ok_or(bad())?;
-        each(key, op, value, hash)?;
-        at = end;
-    }
-    Ok(())
 }
 
 /// A job: its work, written into `grant`, with reads up to `file_end`, its pages sealed for the
@@ -188,8 +128,8 @@ pub enum Owner {
     Grow,
 }
 
-/// A job handed to a worker: the worker, whose buffers a packing's feed takes back, and the
-/// job's number among every job the pool has handed out. A worker freed while its result waits
+/// A job handed to a worker: the worker, and the job's number among every job the pool has
+/// handed out. A worker freed while its result waits
 /// for its owner can take that owner's next job, so only the number tells two of an owner's jobs
 /// apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -199,9 +139,8 @@ pub struct Ticket {
 }
 
 /// A job back, as the ticket its send returned names it: its result; the extents granted it
-/// beyond its job's grant (its top-ups), which are the owner's to release if it failed; and the
-/// packing buffers the job gave back, the job's own, since the worker sends every one before
-/// its result.
+/// beyond its job's grant (its top-ups), which are the owner's to release if it failed; and a
+/// sorted packing's buffers.
 #[derive(Debug)]
 pub struct Back {
     pub ticket: Ticket,
@@ -212,7 +151,8 @@ pub struct Back {
     /// An issued-write failure or worker unwind remains visible when input was abandoned.
     pub physical_error: Option<Error>,
     pub topped: Vec<u64>,
-    pub buffers: Vec<Vec<u8>>,
+    /// A sorted packing's buffers, back for the next.
+    pub sorted: Option<SortPack>,
 }
 
 /// What a worker tells the shard: its grant is spent and it waits for `n` more extents, or its
@@ -228,15 +168,12 @@ pub(crate) enum Message {
         worker: usize,
         n: usize,
     },
-    Spent {
-        worker: usize,
-        buf: Vec<u8>,
-    },
     Done {
         worker: usize,
         result: Result<Output, Error>,
         physical_error: Option<Error>,
         kept: Option<Box<Kept>>,
+        sorted: Option<SortPack>,
     },
     /// Terminal native attachment result, after the owner's last Done was consumed.
     Retired {
@@ -245,9 +182,17 @@ pub(crate) enum Message {
     },
 }
 
+/// The most messages one worker sends before the shard must take one, counted from [`serve`]:
+/// an ask for extents waits for its answer before anything else is sent ([`Message::Need`]);
+/// readiness goes before the first job ([`Message::Ready`]); a result is followed by a wait for
+/// the next job, which the pool hands only once it has taken that result ([`Message::Done`]);
+/// and a worker that unwound sends its result and at once its retirement's report
+/// ([`Message::Retired`]), before the shard takes either. Two. The channel back holds this many
+/// for every worker, so no send can wait on a shard that waits on that worker.
+const MESSAGES_A_WORKER: usize = 2;
+
 /// A worker's ends of its channels: its jobs, its grants' top-ups, and the shard's one channel
-/// back, which holds at most a worker's packing buffers and one message more each (a worker
-/// waits for its answer after an ask, and sends its result last).
+/// back, which holds [`MESSAGES_A_WORKER`] for each worker.
 #[derive(Debug)]
 pub struct Seat {
     pub id: usize,
@@ -295,6 +240,7 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
                     result: Err(error),
                     physical_error: None,
                     kept: None,
+                    sorted: None,
                 }
             };
             drop(back.blocking_send(message));
@@ -321,7 +267,7 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
     while let Ok(mut job) = jobs.recv() {
         let t = Instant::now();
         store.keep_pages(job.keep.take());
-        let (ran, unwound) = run_guarded(&mut store, &job, &back, id);
+        let (ran, unwound) = run_guarded(&mut store, &mut job);
         // Whatever the job's end, every run it handed the device is answered before its result
         // goes back: the shard releases a failed job's extents once it has the result, and the
         // next job starts the allocator over, so none of this job's writes may land after. The
@@ -338,26 +284,28 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
                 None
             }
         });
-        // A job's time less its waits for a packing's entries: the work it did, which the pool
-        // sizes itself by, not the shard's pace.
-        let result = ran.and_then(|(parts, waited, units)| {
+        // A job's time: the work it did, which the pool sizes itself by.
+        let result = ran.and_then(|(parts, units)| {
             drained.map(|()| Output {
                 parts,
                 unused: store.unused_grant(),
                 end: store.end(),
-                ns: ns(Instant::now().saturating_duration_since(t)).saturating_sub(waited),
+                ns: ns(Instant::now().saturating_duration_since(t)),
                 units,
                 kept: None,
             })
         });
-        // A packing's channels close before the result is sent, so every buffer still held is
-        // back on the shard's side when it takes the result.
-        drop(job);
+        // A sorted packing's buffers go back with its result.
+        let sorted = match job.work {
+            Work::Sort(pack) => Some(pack),
+            _ => None,
+        };
         let done = Message::Done {
             worker: id,
             result,
             physical_error,
             kept,
+            sorted,
         };
         if unwound {
             // Close admission before Done: its owner can immediately try this same seat.
@@ -403,11 +351,9 @@ type Parts = Vec<(Vec<u8>, Branch)>;
 /// Only this job's nested cursor/Builder stack unwinds; its Store is then drained and retired.
 fn run_guarded<F: BlockFile>(
     store: &mut Store<F>,
-    job: &Job,
-    back: &Sender<Message>,
-    id: usize,
-) -> (Result<(Parts, u64, u64), Error>, bool) {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(store, job, back, id))) {
+    job: &mut Job,
+) -> (Result<(Parts, u64), Error>, bool) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(store, job))) {
         Ok(result) => (result, false),
         Err(payload) => {
             let reason = payload
@@ -426,18 +372,11 @@ fn run_guarded<F: BlockFile>(
     }
 }
 
-/// Runs `job`: the branches made, the nanoseconds it waited for a packing's entries, and the
-/// work units a compaction merged (none for a packing).
-fn run<F: BlockFile>(
-    store: &mut Store<F>,
-    job: &Job,
-    back: &Sender<Message>,
-    id: usize,
-) -> Result<(Parts, u64, u64), Error> {
+/// Runs `job`: the branches made, and the work units a compaction merged (none for a packing).
+fn run<F: BlockFile>(store: &mut Store<F>, job: &mut Job) -> Result<(Parts, u64), Error> {
     store.begin_job(&job.grant, job.file_end, job.generation)?;
-    let mut waited = 0u64;
     let mut units = 0u64;
-    let parts = match &job.work {
+    let parts = match &mut job.work {
         Work::Compact(t) => {
             let mut c = Compaction::new(
                 store,
@@ -450,19 +389,23 @@ fn run<F: BlockFile>(
             units = c.step(store, &t.inputs, u64::MAX)?;
             c.finish(store)?
         }
-        Work::Pack(s) => {
-            let mut b = Builder::new(store, Keys::Exactly(s.entries))?;
-            loop {
-                let t = Instant::now();
-                let Ok(mut buf) = s.full.recv() else {
-                    break;
-                };
-                waited = waited.saturating_add(ns(Instant::now().saturating_duration_since(t)));
-                decode(&buf, |k, op, v, h| b.add_hashed(store, k, op, v, h))?;
-                buf.clear();
-                back.blocking_send(Message::Spent { worker: id, buf })
-                    .map_err(|_| gone("give the shard a packing buffer back"))?;
+        Work::Sort(pack) => {
+            let SortPack {
+                entries,
+                skip,
+                arena,
+                sorter,
+            } = pack;
+            let kept = sorter.sort(arena, *skip)?;
+            // The memtable counted each key once as it took it: the sort keeps as many.
+            if u64::try_from(kept).ok() != Some(*entries) {
+                return Err(Error::Corruption {
+                    what: "a memtable's sorted entries",
+                    why: crate::error::Malformed::CountMismatch,
+                });
             }
+            let mut b = Builder::new(store, Keys::Exactly(*entries))?;
+            sorter.each(arena, |k, op, v, h| b.add_hashed(store, k, op, v, h))?;
             vec![(Vec::new(), b.finish(store)?)]
         }
         Work::Grow(g) => {
@@ -470,7 +413,7 @@ fn run<F: BlockFile>(
             Vec::new()
         }
     };
-    Ok((parts, waited, units))
+    Ok((parts, units))
 }
 
 fn gone(what: &'static str) -> Error {
@@ -490,8 +433,6 @@ struct Worker {
     owner: Option<Owner>,
     job: u64,
     topped: Vec<u64>,
-    /// Packing buffers it gave back, not yet taken: at most [`FEED_BUFFERS`].
-    spent: Vec<Vec<u8>>,
 }
 
 /// The shard's workers.
@@ -570,13 +511,11 @@ impl Pool {
     /// Refused when the runtime has no synchronization cell left for its channel back.
     pub fn new(spawn: Spawn, most: usize) -> Result<Self, Error> {
         let most = most.max(1);
-        let (back, messages) = hyper_rt::sync::channel(
-            most.saturating_mul(FEED_BUFFERS.saturating_add(1)),
-        )
-        .map_err(|error| Error::Io {
-            op: "make the maintenance workers' channel back",
-            detail: error.to_string(),
-        })?;
+        let (back, messages) = hyper_rt::sync::channel(most.saturating_mul(MESSAGES_A_WORKER))
+            .map_err(|error| Error::Io {
+                op: "make the maintenance workers' channel back",
+                detail: error.to_string(),
+            })?;
         Ok(Self {
             spawn,
             workers: Vec::new(),
@@ -1017,7 +956,6 @@ impl Pool {
         w.owner = Some(owner);
         w.job = self.handed;
         w.topped.clear();
-        w.spent.clear();
         let ticket = Ticket {
             worker: at,
             job: self.handed,
@@ -1057,7 +995,6 @@ impl Pool {
             owner: None,
             job: 0,
             topped: Vec::new(),
-            spent: Vec::new(),
         };
         match self.workers.get_mut(at) {
             Some(slot) => *slot = Some(w),
@@ -1093,38 +1030,8 @@ impl Pool {
         }
     }
 
-    /// A packing buffer the job `ticket` names gave back: waiting for one when `wait`. None once
-    /// that job is back, its result held or taken, since its worker may then hold another
-    /// job's buffers; or, without `wait`, when none has come.
-    pub fn buffer<F: BlockFile>(
-        &mut self,
-        store: &mut Store<F>,
-        ticket: Ticket,
-        wait: bool,
-    ) -> Result<Option<Vec<u8>>, Error> {
-        blocking_wait_allowed(wait)?;
-        loop {
-            let w = self
-                .workers
-                .get_mut(ticket.worker)
-                .and_then(Option::as_mut)
-                .ok_or(gone("take a packing buffer"))?;
-            if w.owner.is_none() || w.job != ticket.job {
-                return Ok(None);
-            }
-            if let Some(b) = w.spent.pop() {
-                return Ok(Some(b));
-            }
-            if !self.next(store, wait)? {
-                self.waiting = true;
-                return Ok(None);
-            }
-        }
-    }
-
     /// Takes one message from the workers, waiting for one when `wait`: an ask for extents is
-    /// answered from `store`, a buffer kept for its worker's packing, a result kept for its
-    /// owner. Whether one was taken.
+    /// answered from `store`, a result kept for its owner. Whether one was taken.
     fn next<F: BlockFile>(&mut self, store: &mut Store<F>, wait: bool) -> Result<bool, Error> {
         let message = match self.messages.try_recv() {
             Ok(Some(m)) => m,
@@ -1217,21 +1124,12 @@ impl Pool {
                     }
                 }
             }
-            Message::Spent { worker, buf } => {
-                let w = self
-                    .workers
-                    .get_mut(worker)
-                    .and_then(Option::as_mut)
-                    .ok_or(gone("take a packing buffer"))?;
-                if w.spent.len() < FEED_BUFFERS {
-                    w.spent.push(buf);
-                }
-            }
             Message::Done {
                 worker,
                 result,
                 physical_error,
                 kept,
+                sorted,
             } => {
                 // A canceled request can consume Done before closing starts. Physical
                 // failures and worker unwinds stay terminal even after that Back is taken.
@@ -1248,9 +1146,6 @@ impl Pool {
                 })?;
                 let ticket = Ticket { worker, job: w.job };
                 let topped = std::mem::take(&mut w.topped);
-                // The job's buffers, all back before its result on this channel: taken with it
-                // now, before the worker can start another job whose buffers would mix in.
-                let buffers = std::mem::take(&mut w.spent);
                 if let Ok(out) = &result {
                     self.busy_ns = self.busy_ns.saturating_add(out.ns);
                 }
@@ -1262,7 +1157,7 @@ impl Pool {
                         kept,
                         physical_error,
                         topped,
-                        buffers,
+                        sorted,
                     },
                 ));
             }
@@ -1271,28 +1166,11 @@ impl Pool {
     }
 
     /// Waits for one message from the workers, answered or kept as [`Self::take`] does: false,
-    /// with nothing taken, when no worker has a job out to send one. `open` names the workers
-    /// whose packing feeds are still open. Refused while one of them has a buffer back in hand:
-    /// a packing worker sends nothing while it waits for its feed, so the wait could end only by
-    /// its caller feeding it with that buffer.
-    pub fn wait_any<F: BlockFile>(
-        &mut self,
-        store: &mut Store<F>,
-        open: impl IntoIterator<Item = usize>,
-    ) -> Result<bool, Error> {
+    /// with nothing taken, when no worker has a job out to send one.
+    pub fn wait_any<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<bool, Error> {
         blocking_wait_allowed(true)?;
         if !self.workers.iter().flatten().any(|w| w.owner.is_some()) {
             return Ok(false);
-        }
-        if open.into_iter().any(|worker| {
-            self.workers
-                .get(worker)
-                .and_then(Option::as_ref)
-                .is_some_and(|w| w.owner.is_some() && !w.spent.is_empty())
-        }) {
-            return Err(Error::InvalidArgument {
-                what: "a wait for a packing worker's message while its buffer is back in hand",
-            });
         }
         self.next(store, true)
     }
@@ -1300,14 +1178,6 @@ impl Pool {
     /// Messages taken from the workers since the pool began, wrapping: only its change is read.
     pub fn accepted(&self) -> u64 {
         self.accepted
-    }
-
-    /// The packing buffers worker `worker` gave back that are held here, not yet taken.
-    pub fn spent(&self, worker: usize) -> usize {
-        self.workers
-            .get(worker)
-            .and_then(Option::as_ref)
-            .map_or(0, |w| w.spent.len())
     }
 
     /// Whether a job of `owner`'s is out, or back and not yet taken.

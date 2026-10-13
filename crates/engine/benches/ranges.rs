@@ -476,6 +476,7 @@ impl Workload {
             found += u64::from(hit);
         }
         println!("phase {name} end");
+        println!("{name} inline {} of {n}", client.inlined());
         // Match the threaded driver's joined histogram aggregation.
         let mut all = Histogram::new();
         all.merge(&lat);
@@ -490,6 +491,12 @@ impl Workload {
 }
 
 fn stats(name: &str, counters: &[RangeStats]) {
+    for (range, (f, _, _)) in counters.iter().enumerate() {
+        println!(
+            "{name}_shard range {range} rotations {} fed {} frozen_most {} order_moves {} idle_slices {} idle_units {}",
+            f.rotations, f.fed, f.frozen_most, f.order_moves, f.idle_slices, f.idle_units
+        );
+    }
     for (range, (f, t, io)) in counters.iter().enumerate() {
         println!(
             "{name} range {range} flushes {} stalls {} waited_steps {} pivot_compactions {} leaf_compactions {} splits {} entries_written {} consolidations {} merge_units {} merge_ns {} io reads {} pages_read {} submitted {} pages_written {} syncs {} queued {} queued_most {} write_waits {} prefetches {} prefetch_waits {} cache_hits {} span_cache_hits {} device_reads {} resident_reads {} device_read_ns {} resident_probes {} resident_skips {} residency_epochs {} residency_changes {} residency_wrong {} scans {} scan_segments {} scan_sources {} scan_skipped {} scan_opened {} pivot_entries {} settle_entries_seeks {} settle_entries_branches {} settle_entries_size {} charged_leaf_sources {} charged_index_sources {} paid_leaves {} paid_index {} paid_below {} consolidations_started {} fullest_flushes {}",

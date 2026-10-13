@@ -27,6 +27,11 @@
 //! A key written again leaves its older entry in the arena and in whatever run holds it; the
 //! arena is only appended to, so a larger offset is a newer entry, and merges and walks keep the
 //! newest of equal keys.
+//!
+//! A memtable a worker will pack keeps a copy of its arena as it is written (its mirror,
+//! [`HashMem::mirror_into`]), which the worker sorts itself by the same radix sort of prefixes
+//! ([`Sorter`]): the shard then orders a memtable only for the scans that read it (research/40
+//! §4), as RocksDB's vector memtable sorts only when first iterated (`memtable/vectorrep.cc`).
 
 use crate::branch::Op;
 use crate::branch::filter::hash;
@@ -202,6 +207,29 @@ fn parse(arena: &[u8], entry: u32) -> Option<(u8, usize, usize, usize)> {
     ))
 }
 
+/// An entry's key, operation and value, and where the next entry starts.
+type EntryAt<'a> = (&'a [u8], Op, &'a [u8], usize);
+
+/// An entry's key, operation and value in `arena`, and where the next entry starts.
+fn read_at(arena: &[u8], entry: u32) -> Result<EntryAt<'_>, Error> {
+    let (op, klen, vlen, start) = parse(arena, entry).ok_or(corrupt())?;
+    let op = match op {
+        1 => Op::Put,
+        2 => Op::Delete,
+        _ => return Err(corrupt()),
+    };
+    let mid = start.checked_add(klen).ok_or(corrupt())?;
+    let end = mid.checked_add(vlen).ok_or(corrupt())?;
+    let key = arena.get(start..mid).ok_or(corrupt())?;
+    let value = arena.get(mid..end).ok_or(corrupt())?;
+    Ok((key, op, value, end))
+}
+
+/// An entry's key, operation and value in `arena`.
+fn read(arena: &[u8], entry: u32) -> Result<(&[u8], Op, &[u8]), Error> {
+    read_at(arena, entry).map(|(key, op, value, _)| (key, op, value))
+}
+
 /// An entry's key in `arena`.
 fn key(arena: &[u8], entry: u32) -> &[u8] {
     parse(arena, entry)
@@ -229,6 +257,111 @@ fn order(arena: &[u8], a: Keyed, b: Keyed, skip: usize) -> Ordering {
 /// Byte `byte` of a prefix, the most significant first.
 fn digit(prefix: u64, byte: usize) -> usize {
     usize::from(prefix.to_be_bytes().get(byte).copied().unwrap_or(0))
+}
+
+/// A memtable's copied arena sorted where it is packed (research/40 §4): every entry keyed by
+/// eight bytes of its key past the bytes every key shares and by its filter hash, as the
+/// memtable keys its tail, then put in order by the memtable's own sort ([`Sort`]: a radix sort
+/// of the prefixes, ties by key, the newest of each key kept), and walked in key order. Its
+/// buffers are kept for the next arena it sorts.
+#[derive(Debug, Default)]
+pub struct Sorter {
+    keyed: Vec<Keyed>,
+    dst: Vec<Keyed>,
+    counts: Option<Box<[[u32; 256]; 8]>>,
+}
+
+impl Sorter {
+    /// Sorts the entries of `arena`, a memtable's arena as written, every key of which shares its
+    /// first `skip` bytes with the first: the entries left once the newest of each key is kept.
+    pub fn sort(&mut self, arena: &[u8], skip: usize) -> Result<usize, Error> {
+        let too_large = || Error::LimitExceeded {
+            what: "entries of a memtable's sort",
+            limit: u64::try_from(arena.len()).unwrap_or(u64::MAX),
+        };
+        let mut src = std::mem::take(&mut self.keyed);
+        src.clear();
+        let mut at = 0usize;
+        while at < arena.len() {
+            let entry = u32::try_from(at).map_err(|_| corrupt())?;
+            let (key, _, _, end) = read_at(arena, entry)?;
+            src.try_reserve(1).map_err(|_| too_large())?;
+            src.push(Keyed {
+                prefix: prefix(key, skip),
+                entry,
+                hash32: crate::branch::filter::hash32(hash(key)),
+            });
+            at = end;
+        }
+        let n = src.len();
+        let mut dst = std::mem::take(&mut self.dst);
+        dst.clear();
+        dst.try_reserve_exact(n).map_err(|_| too_large())?;
+        // The scatter's scratch, written in full before it is read.
+        dst.resize(n, Keyed::default());
+        let counts = match self.counts.take() {
+            Some(mut c) => {
+                for byte in c.iter_mut() {
+                    byte.fill(0);
+                }
+                c
+            }
+            None => Box::new([[0; 256]; 8]),
+        };
+        let mut s = Sort {
+            src,
+            dst,
+            skip,
+            stage: Stage::Rekey,
+            at: 0,
+            stale: 0,
+            counts,
+            passes: [0; 8],
+            npass: 0,
+            pass: 0,
+            next: [0; 256],
+            lo: 0,
+            group: None,
+            kept: 0,
+            rate: 0,
+        };
+        // An unbounded budget ends the sort in one call: each stage reads every entry once.
+        let (done, _) = sort_step(arena, &mut s, usize::MAX);
+        self.keyed = s.src;
+        self.dst = s.dst;
+        self.counts = Some(s.counts);
+        if !done {
+            return Err(corrupt());
+        }
+        Ok(self.keyed.len())
+    }
+
+    /// Each entry the last sort kept, in key order: `each(key, op, value, hash)`, the hash the
+    /// key's 32-bit filter hash.
+    pub fn each(
+        &self,
+        arena: &[u8],
+        mut each: impl FnMut(&[u8], Op, &[u8], u32) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        for k in &self.keyed {
+            let (key, op, value) = read(arena, k.entry)?;
+            each(key, op, value, k.hash32)?;
+        }
+        Ok(())
+    }
+
+    /// The bytes its buffers hold, at their capacities.
+    pub fn memory(&self) -> usize {
+        self.keyed
+            .capacity()
+            .saturating_add(self.dst.capacity())
+            .saturating_mul(size_of::<Keyed>())
+            .saturating_add(if self.counts.is_some() {
+                size_of::<[[u32; 256]; 8]>()
+            } else {
+                0
+            })
+    }
 }
 
 /// A memtable: the arena, its bound, the index of newest entries, the collisions the index
@@ -265,6 +398,11 @@ pub struct HashMem {
     bufs: Vec<Vec<Keyed>>,
     /// The longest the tail has grown: what the next fill's tail is given room for.
     tail_high: usize,
+    /// A copy of the arena, written with it, for a worker to sort and pack ([`Sorter`]); whole
+    /// while `mirrored`, which it is only if given before the first entry and never short of
+    /// room, as it is reserved to the arena's bound.
+    mirror: Vec<u8>,
+    mirrored: bool,
     /// A finished sort's histogram, for the next.
     counts: Option<Box<[[u32; 256]; 8]>>,
     /// Closed to writes for packing: every entry is to be sorted, the tail as soon as the sort in
@@ -468,6 +606,8 @@ impl HashMem {
             sort: None,
             bufs: Vec::new(),
             tail_high: 0,
+            mirror: Vec::new(),
+            mirrored: false,
             counts: None,
             closed: false,
             hot: Vec::new(),
@@ -486,6 +626,8 @@ impl HashMem {
         self.drop_hot();
         self.touched = self.touched.max(self.arena.len());
         self.arena.clear();
+        self.mirror.clear();
+        self.mirrored = self.mirror.capacity() >= self.limit;
         self.index.clear();
         self.len = 0;
         self.first.clear();
@@ -561,6 +703,60 @@ impl HashMem {
         self.bufs.push(buf);
     }
 
+    /// Keeps a copy of the arena in `buf` as entries are written, for a worker to sort and pack
+    /// ([`Sorter`]): taken only while the memtable is empty, with room for its whole bound
+    /// reserved, so the copy holds every entry and never reallocates. The buffer comes back
+    /// when it cannot be: entries already written, or its room refused.
+    pub fn mirror_into(&mut self, mut buf: Vec<u8>) -> Result<(), Vec<u8>> {
+        if self.mirrored {
+            return Err(buf);
+        }
+        if !self.arena.is_empty() {
+            return Err(buf);
+        }
+        buf.clear();
+        if buf.capacity() < self.limit && buf.try_reserve_exact(self.limit).is_err() {
+            return Err(buf);
+        }
+        self.mirror = buf;
+        self.mirrored = true;
+        Ok(())
+    }
+
+    /// Whether the memtable keeps a whole copy of its arena for a worker.
+    pub fn mirrored(&self) -> bool {
+        self.mirrored
+    }
+
+    /// The copy of the arena, every entry in it, for a worker to sort: none if the memtable kept
+    /// none. The memtable keeps no copy after.
+    pub fn take_mirror(&mut self) -> Option<Vec<u8>> {
+        if !self.mirrored || self.mirror.len() != self.arena.len() {
+            return None;
+        }
+        self.mirrored = false;
+        Some(std::mem::take(&mut self.mirror))
+    }
+
+    /// A copy of the arena as it stands into `buf`, for a memtable that kept none as it was
+    /// written: refused, typed, when its room cannot be had.
+    pub fn copy_arena(&self, buf: &mut Vec<u8>) -> Result<(), Error> {
+        buf.clear();
+        buf.try_reserve_exact(self.arena.len())
+            .map_err(|_| Error::LimitExceeded {
+                what: "memory for a copy of a memtable's arena",
+                limit: u64::try_from(self.arena.len()).unwrap_or(u64::MAX),
+            })?;
+        buf.extend_from_slice(&self.arena);
+        Ok(())
+    }
+
+    /// How many first bytes every key written shares with the first: where its keys' prefixes
+    /// start ([`Sorter::sort`]).
+    pub fn skip(&self) -> usize {
+        self.skip
+    }
+
     /// Entries the memtable holds, each key once.
     pub fn len(&self) -> usize {
         self.len
@@ -607,6 +803,11 @@ impl HashMem {
             .saturating_add(self.hot_pool.capacity())
             .saturating_mul(size_of::<Keyed>());
         page(self.touched.max(self.arena.len()))
+            .saturating_add(page(
+                self.mirror
+                    .capacity()
+                    .min(self.touched.max(self.mirror.len())),
+            ))
             .saturating_add(self.index.bytes())
             .saturating_add(keyed)
             .saturating_add(counts)
@@ -631,17 +832,7 @@ impl HashMem {
 
     /// An entry's key, operation and value.
     fn read(&self, entry: u32) -> Result<(&[u8], Op, &[u8]), Error> {
-        let (op, klen, vlen, start) = parse(&self.arena, entry).ok_or(corrupt())?;
-        let op = match op {
-            1 => Op::Put,
-            2 => Op::Delete,
-            _ => return Err(corrupt()),
-        };
-        let mid = start.checked_add(klen).ok_or(corrupt())?;
-        let end = mid.checked_add(vlen).ok_or(corrupt())?;
-        let key = self.arena.get(start..mid).ok_or(corrupt())?;
-        let value = self.arena.get(mid..end).ok_or(corrupt())?;
-        Ok((key, op, value))
+        read(&self.arena, entry)
     }
 
     fn cmp(&self, a: Keyed, sa: usize, b: Keyed, sb: usize) -> Ordering {
@@ -738,6 +929,19 @@ impl HashMem {
         put_varint32(&mut self.arena, vlen);
         self.arena.extend_from_slice(key);
         self.arena.extend_from_slice(value);
+        if self.mirrored {
+            // Within the room reserved, so the copy never reallocates; past it (never, as the
+            // arena's bound is the room) the mirror is no longer whole.
+            let bytes = usize::try_from(entry)
+                .ok()
+                .and_then(|at| self.arena.get(at..))
+                .unwrap_or(&[]);
+            if self.mirror.len().saturating_add(bytes.len()) <= self.mirror.capacity() {
+                self.mirror.extend_from_slice(bytes);
+            } else {
+                self.mirrored = false;
+            }
+        }
         let arena = &self.arena;
         let replaced = self.index.put(
             h,
@@ -2393,5 +2597,78 @@ mod tests {
             want.insert(k.to_vec(), u32::try_from(i).unwrap().to_le_bytes().to_vec());
         }
         assert_eq!(walked, want.into_iter().collect::<Vec<_>>());
+    }
+
+    proptest::proptest! {
+        /// A memtable's mirror sorted on its own gives exactly the memtable's walk: puts, deletes
+        /// and keys written again, keys sharing fewer first bytes as the fill goes on and tying
+        /// past their eight-byte prefixes, every key's newest entry once, in key order, with its
+        /// filter hash.
+        #[test]
+        fn a_mirror_sorted_apart_gives_the_memtable_s_own_walk(
+            shared in 0usize..12,
+            ops in proptest::collection::vec(
+                (proptest::collection::vec(0u8..6, 0..6), proptest::prelude::any::<bool>(), proptest::collection::vec(proptest::prelude::any::<u8>(), 0..20), 0usize..64),
+                1..1500,
+            ),
+        ) {
+            let mut m = HashMem::new(1 << 24).unwrap();
+            m.mirror_into(Vec::new()).unwrap();
+            for (suffix, put, v, cut) in &ops {
+                let mut k = vec![9u8; if *cut < 12 { shared.min(*cut) } else { shared }];
+                k.extend_from_slice(suffix);
+                let op = if *put { Op::Put } else { Op::Delete };
+                let v = if *put { v.clone() } else { Vec::new() };
+                m.insert(&k, op, &v).unwrap();
+            }
+            let skip = m.skip();
+            let arena = m.take_mirror().unwrap();
+            proptest::prop_assert_eq!(&arena, &m.arena);
+            proptest::prop_assert!(!m.mirrored());
+            let mut sorter = Sorter::default();
+            proptest::prop_assert_eq!(sorter.sort(&arena, skip).unwrap(), m.len());
+            let mut sorted = Vec::new();
+            sorter.each(&arena, |k, op, v, h| {
+                sorted.push((k.to_vec(), op, v.to_vec(), h));
+                Ok(())
+            }).unwrap();
+            m.seal();
+            let mut walked = Vec::new();
+            let mut walk = m.walk_start();
+            m.walk_some_hashed(&mut walk, usize::MAX, |k, op, v, h| {
+                walked.push((k.to_vec(), op, v.to_vec(), h));
+                Ok(())
+            }).unwrap();
+            proptest::prop_assert_eq!(&sorted, &walked);
+            for (k, _, _, h) in &sorted {
+                proptest::prop_assert_eq!(*h, crate::branch::filter::hash32(hash(k)));
+            }
+            // The sorter's buffers serve the next arena as they are.
+            proptest::prop_assert_eq!(sorter.sort(&arena, skip).unwrap(), m.len());
+        }
+    }
+
+    #[test]
+    fn a_mirror_is_taken_only_whole_and_kept_through_a_clear() {
+        let mut m = HashMem::new(4096).unwrap();
+        m.insert(b"a", Op::Put, b"1").unwrap();
+        // Given after an entry, it would miss that entry: refused.
+        assert!(m.mirror_into(Vec::new()).is_err());
+        assert!(m.take_mirror().is_none());
+        m.clear();
+        m.mirror_into(Vec::new()).unwrap();
+        assert!(m.mirror_into(Vec::new()).is_err(), "a second mirror");
+        m.insert(b"b", Op::Put, b"2").unwrap();
+        // A clear keeps the mirror, emptied, whole for the next fill.
+        m.clear();
+        assert!(m.mirrored());
+        m.insert(b"c", Op::Delete, b"").unwrap();
+        let arena = m.take_mirror().unwrap();
+        assert_eq!(arena, m.arena);
+        assert!(arena.capacity() >= 4096);
+        assert!(m.take_mirror().is_none());
+        // Taken, it is gone past a clear too.
+        m.clear();
+        assert!(!m.mirrored());
     }
 }

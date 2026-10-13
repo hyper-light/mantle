@@ -18,12 +18,13 @@ use hyper_block::issuer::Issuer;
 use hyper_rt::runtime::{LocalRuntime, Runtime, RuntimeConfig};
 use hyper_rt::sync::{Sender, channel};
 use mantle_engine::Error;
-use mantle_engine::branch::{Op, filter};
+use mantle_engine::branch::Op;
+use mantle_engine::memtable::hashed::{HashMem, Sorter};
 use mantle_engine::ranges::{Ranges, RangesConfig};
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::{Config, Store};
 use mantle_engine::trunk::TrunkConfig;
-use mantle_engine::trunk::pool::{self, Job, Owner, Pool, Spawn, Stream, Ticket, Work};
+use mantle_engine::trunk::pool::{self, Job, Owner, Pool, SortPack, Spawn, Ticket, Work};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -199,23 +200,8 @@ fn post_poll_pool_startup_refuses_and_returns_the_exact_job() {
             })
     });
     let pool = Pool::new(spawn, 1).unwrap();
-    let (full, input) = mpsc::sync_channel(1);
-    let mut bytes = Vec::new();
-    pool::encode(
-        &mut bytes,
-        KEY,
-        Op::Put,
-        VALUE,
-        filter::hash32(filter::hash(KEY)),
-    )
-    .unwrap();
-    full.try_send(bytes).unwrap();
-    drop(full);
     let job = Box::new(Job {
-        work: Work::Pack(Stream {
-            entries: 1,
-            full: input,
-        }),
+        work: Work::Sort(sort_pack(KEY, VALUE)),
         grant: store
             .grant(usize::try_from(CONFIG.extent_pages).unwrap())
             .unwrap(),
@@ -418,4 +404,18 @@ fn post_poll_client_prepare_refuses_before_request_publication() {
         "post-poll synchronous Client prepare accepted publication"
     );
     assert!(!present, "refused post-poll Client mutated the range");
+}
+
+/// A memtable of the one entry `key` holding `value`, as the copy of its arena goes to a worker
+/// that sorts and packs it.
+fn sort_pack(key: &[u8], value: &[u8]) -> SortPack {
+    let mut mem = HashMem::new(1 << 16).unwrap();
+    mem.mirror_into(Vec::new()).unwrap();
+    mem.insert(key, Op::Put, value).unwrap();
+    SortPack {
+        entries: 1,
+        skip: mem.skip(),
+        arena: mem.take_mirror().unwrap(),
+        sorter: Sorter::default(),
+    }
 }

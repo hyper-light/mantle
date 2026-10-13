@@ -26,9 +26,10 @@ use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_rt::runtime::interests_for;
 use hyper_rt::{Runtime, RuntimeConfig};
 use mantle_engine::Error;
-use mantle_engine::branch::{Op, filter};
+use mantle_engine::branch::Op;
+use mantle_engine::memtable::hashed::{HashMem, Sorter};
 use mantle_engine::store::{Config, Store};
-use mantle_engine::trunk::pool::{self, Back, Job, Owner, Pool, Spawn, Stream, Work};
+use mantle_engine::trunk::pool::{self, Back, Job, Owner, Pool, SortPack, Spawn, Work};
 
 /// Reuse the existing native Pool startup fixture's page/extent shape.
 const CONFIG: Config = Config {
@@ -154,20 +155,17 @@ fn runtime() -> Runtime {
 #[derive(Clone, Copy)]
 enum Call {
     Take,
-    Buffer,
     Any,
 }
 #[derive(Debug)]
 enum ResultOf {
     Take(Box<Result<Option<Back>, Error>>),
-    Buffer(Result<Option<Vec<u8>>, Error>),
     Any(Result<bool, Error>),
 }
 impl ResultOf {
     fn refused(&self) -> bool {
         match self {
             Self::Take(r) => matches!(**r, Err(Error::InvalidArgument { .. })),
-            Self::Buffer(r) => matches!(r, Err(Error::InvalidArgument { .. })),
             Self::Any(r) => matches!(r, Err(Error::InvalidArgument { .. })),
         }
     }
@@ -201,23 +199,8 @@ fn run(call: Call) {
     let mut pool = Pool::new(spawn, 1).unwrap();
     // No worker has a job yet. Once it may hold writes, release precedes Pool/Runtime Drop.
     let _guard = OpenOnDrop(Arc::clone(&gate));
-    let (full, input) = mpsc::sync_channel(1);
-    let mut bytes = Vec::new();
-    pool::encode(
-        &mut bytes,
-        KEY,
-        Op::Put,
-        VALUE,
-        filter::hash32(filter::hash(KEY)),
-    )
-    .unwrap();
-    full.try_send(bytes).unwrap();
-    drop(full);
     let job = Box::new(Job {
-        work: Work::Pack(Stream {
-            entries: 1,
-            full: input,
-        }),
+        work: Work::Sort(sort_pack(KEY, VALUE)),
         grant: store
             .grant(usize::try_from(CONFIG.extent_pages).unwrap())
             .unwrap(),
@@ -225,7 +208,7 @@ fn run(call: Call) {
         generation: store.generation(),
         keep: None,
     });
-    let ticket = pool.send(job, Owner::Pack, true).unwrap().unwrap();
+    pool.send(job, Owner::Pack, true).unwrap().unwrap();
     held.recv().unwrap(); // An actual worker write is now held before the runtime call.
     let (attempted, attempt) = mpsc::sync_channel(1);
     let (back, returned) = mpsc::sync_channel(1);
@@ -242,8 +225,7 @@ fn run(call: Call) {
                 Owner::Pack,
                 true,
             ))),
-            Call::Buffer => ResultOf::Buffer(owned.pool.buffer(&mut owned.store, ticket, true)),
-            Call::Any => ResultOf::Any(owned.pool.wait_any(&mut owned.store, std::iter::empty())),
+            Call::Any => ResultOf::Any(owned.pool.wait_any(&mut owned.store)),
         };
         let still_owned = owned.pool.out_for(Owner::Pack);
         back.try_send((owned, result, still_owned)).unwrap();
@@ -314,10 +296,20 @@ fn runtime_take_refuses_before_consuming_a_job_result() {
     run(Call::Take);
 }
 #[test]
-fn runtime_buffer_refuses_before_consuming_a_returned_buffer() {
-    run(Call::Buffer);
-}
-#[test]
 fn runtime_wait_any_refuses_before_consuming_a_worker_message() {
     run(Call::Any);
+}
+
+/// A memtable of the one entry `key` holding `value`, as the copy of its arena goes to a worker
+/// that sorts and packs it.
+fn sort_pack(key: &[u8], value: &[u8]) -> SortPack {
+    let mut mem = HashMem::new(1 << 16).unwrap();
+    mem.mirror_into(Vec::new()).unwrap();
+    mem.insert(key, Op::Put, value).unwrap();
+    SortPack {
+        entries: 1,
+        skip: mem.skip(),
+        arena: mem.take_mirror().unwrap(),
+        sorter: Sorter::default(),
+    }
 }

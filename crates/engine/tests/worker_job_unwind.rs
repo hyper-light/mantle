@@ -16,12 +16,13 @@ use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::issuer::Issuer;
 use mantle_engine::Error;
-use mantle_engine::branch::{Branch, Op, filter};
+use mantle_engine::branch::{Branch, Op};
+use mantle_engine::memtable::hashed::{HashMem, Sorter};
 use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::{Config, IntoFile, Store};
 use mantle_engine::trunk::TrunkConfig;
-use mantle_engine::trunk::pool::{self, Job, Owner, Pool, Spawn, Stream, Task, Work};
+use mantle_engine::trunk::pool::{self, Job, Owner, Pool, SortPack, Spawn, Task, Work};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -188,20 +189,8 @@ fn take_file<O>(outcome: IntoFile<O, File>) -> File {
     }
 }
 fn packed(store: &mut Store<File>, key: &[u8], value: &[u8]) -> Box<Job> {
-    let (send, full) = mpsc::sync_channel(1);
-    let mut bytes = Vec::new();
-    pool::encode(
-        &mut bytes,
-        key,
-        Op::Put,
-        value,
-        filter::hash32(filter::hash(key)),
-    )
-    .unwrap();
-    send.try_send(bytes).unwrap();
-    drop(send);
     Box::new(Job {
-        work: Work::Pack(Stream { entries: 1, full }),
+        work: Work::Sort(sort_pack(key, value)),
         grant: store
             .grant(usize::try_from(CONFIG.extent_pages).unwrap())
             .unwrap(),
@@ -561,4 +550,18 @@ fn same_shard_stop_keeps_held_job_ownership_and_reports_its_read_panic_after_ret
     saved.check_references().unwrap();
     drop(take_file(saved.into_file()));
     assert_eq!(facts.files.load(Ordering::SeqCst), 0);
+}
+
+/// A memtable of the one entry `key` holding `value`, as the copy of its arena goes to a worker
+/// that sorts and packs it.
+fn sort_pack(key: &[u8], value: &[u8]) -> SortPack {
+    let mut mem = HashMem::new(1 << 16).unwrap();
+    mem.mirror_into(Vec::new()).unwrap();
+    mem.insert(key, Op::Put, value).unwrap();
+    SortPack {
+        entries: 1,
+        skip: mem.skip(),
+        arena: mem.take_mirror().unwrap(),
+        sorter: Sorter::default(),
+    }
 }

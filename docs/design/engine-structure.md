@@ -116,7 +116,11 @@ a client on its range's shard makes a put, deletion or get inline when the range
 operation finishes without waiting, as an event loop runs a call made on its own thread at once
 (trantor's `EventLoop::runInLoop`):
 - the range's task lends its engine (`Lend`) at the awaits that borrow none of it: its idle wait
-  for a request and the yields between maintenance slices. The engine is boxed once and moves
+  for a request, the yields between maintenance slices, and a client's turn before it waits for
+  its workers or the device, the wait made only once a turn passes with no operation made on
+  the engine (a full memtable is out on a worker for most of a fill, and a range that held its
+  engine through that wait sent 57% of a same-shard client's puts through its channel, each
+  with a timed maintenance slice). The engine is boxed once and moves
   into a slot on its shard's thread and back, so ownership moves and no reference is shared (no
   Arc, no RefCell); a lend dropped mid-await (the task's future dropped) takes the engine back
   and drops it there, as the task's local would have been;
@@ -133,6 +137,12 @@ operation finishes without waiting, as an event loop runs a call made on its own
   about the shard's quantum of them, at the rate measured over its last turn (two clock reads a
   turn), and the first operation to leave the range maintenance owed wakes the range's task once,
   which runs when the client yields.
+
+Lending the engine for a client's turn before a wait on the workers, measured in a 10M fill with
+memtables sorted on workers (benches/ranges.rs, `rangesmcpdiag-bin` against `rangesmcqdiag-bin`):
+puts made inline went from 4.34 to 10 million of 10 million, and the range's timed maintenance
+slices from 0.57 to 0.06 a put; puts a second, three interleaved rounds, from 2.84 to 4.93
+million at 10M and from 2.39 to 4.38 million at 100M (research/40 §4).
 
 Measured with one binary, inline against `--no-inline` (every operation through the range's
 channel), three interleaved rounds, 1M fills, 1M gets and 100K seeks of 10, seed 301
@@ -404,8 +414,12 @@ A shard's flush and compaction ran inline on the put that filled the memtable: a
 put waited up to 6.0 s (uncached) or 2.9 s (buffered) while every compaction the flush set off
 ran. The shard now does that work a slice at a time on its own worker
 (`crates/engine/src/shard_db.rs`, `trunk/mod.rs`):
-- **Two memtables.** A full one becomes the packing one, still read, and a cleared one takes
-  the puts (RocksDB's `max_write_buffer_number` of 2 by default).
+- **Two memtables.** A full one goes to packing, still read, and a cleared one takes the puts
+  (RocksDB's `max_write_buffer_number` of 2 by default). With maintenance workers, the memtable
+  kept a copy of its arena as it was written, and a worker sorts that copy and builds the branch
+  (research/40 §4); the shard orders a memtable only for the scans that read it. Without
+  workers, or with none free when a rotation must finish it, the shard packs it itself, its
+  order and walk paid a slice at a time.
 - **Pending branches.** A packed memtable waits as pending, read before the tree. The next
   cascade takes every pending branch into the root together, so `k` waiting memtables are
   merged in one compaction instead of `k`.
@@ -437,7 +451,7 @@ ran. The shard now does that work a slice at a time on its own worker
   detach a Store and reuse its seat before the old Store has finished retirement.
   `memory_held` reports this reservation alongside the caches, whose existing gradual trim
   remains visible. This is not RSS: additional Builder working runs, input spans, point/page
-  buffers, memtables, branch metadata, packing feeds, channel metadata and thread stacks are
+  buffers, memtables and their arena copies, branch metadata, channel metadata and thread stacks are
   separate. Only the remainder moves by the marginal-gain rule (research/36).
 - **Filters as keys arrive.** A builder adds each key to its filter as it adds the entry, so
   finishing a branch no longer builds a filter over millions of keys in one slice. A

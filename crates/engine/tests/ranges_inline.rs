@@ -1,7 +1,7 @@
 //! A client on its range's own shard makes a put or a get inline on the range's lent engine when
-//! it needs no wait (docs/design/engine-structure.md, "Same-shard clients"); one that would wait
-//! takes the request path, and a client that makes nothing but inline operations still yields
-//! its shard.
+//! it needs no wait (docs/design/engine-structure.md, "Same-shard clients"), the range waiting on
+//! its workers meanwhile included; one that would wait takes the request path, and a client that
+//! makes nothing but inline operations still yields its shard.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::{Condvar, Mutex, mpsc};
 
 use hyper_block::DiskError;
 use hyper_block::block::BlockFile;
@@ -40,12 +40,59 @@ const TRUNK: TrunkConfig = TrunkConfig {
 const ROWS: usize = 2049;
 const SLICE_NS: u64 = 50_000;
 
-/// A file on disk whose every page read made through the issuer is counted, and that reads from
-/// memory what the OS holds when `resident`, or says it holds nothing.
+/// A file on disk whose every page read made through the issuer is counted, that reads from
+/// memory what the OS holds when `resident`, or says it holds nothing, and whose writes wait
+/// while its `stall` holds them.
 struct Counted {
     file: DeviceFile,
     reads: &'static AtomicUsize,
     resident: bool,
+    stall: Option<&'static Stall>,
+}
+
+/// Writes held until let go: a worker's packing waits in its first write meanwhile.
+struct Stall {
+    held: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl Stall {
+    const fn new() -> Self {
+        Self {
+            held: Mutex::new(true),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) {
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *held {
+            held = self
+                .changed
+                .wait(held)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn release(&self) {
+        *self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        self.changed.notify_all();
+    }
+}
+
+/// Lets its stall's writes go when dropped, so a failed assertion leaves no worker waiting.
+struct Release(&'static Stall);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        self.0.release();
+    }
 }
 
 impl BlockFile for Counted {
@@ -70,6 +117,9 @@ impl BlockFile for Counted {
         }
     }
     fn write_all_at(&self, bytes: &[u8], offset: u64) -> Result<(), DiskError> {
+        if let Some(stall) = self.stall {
+            stall.wait();
+        }
         self.file.write_all_at(bytes, offset)
     }
     fn sync_data(&self) -> Result<(), DiskError> {
@@ -80,6 +130,7 @@ impl BlockFile for Counted {
             file: self.file.try_clone()?,
             reads: self.reads,
             resident: self.resident,
+            stall: self.stall,
         })
     }
 }
@@ -87,6 +138,7 @@ impl BlockFile for Counted {
 fn open(path: &Path, create: bool, reads: &'static AtomicUsize, resident: bool) -> Counted {
     Counted {
         resident,
+        stall: None,
         file: DeviceFile::open(
             path,
             create,
@@ -313,4 +365,78 @@ fn a_loop_of_inline_operations_yields_its_shard() {
     assert!(gets >= 16 * ROWS);
     // Every put and every get completed inline: no request ever yielded for the client.
     assert_eq!(inlined, (ROWS + gets) as u64);
+}
+
+/// Do: from a client on the range's shard, with every worker's writes held, put rows until a
+/// memtable rotates and its packing goes to a worker that waits in its first write, the range
+/// waiting on that worker from then on; put rows on into the next memtable, which holds them;
+/// let the writes go; flush, checkpoint and reopen. Expect: every put was made inline, those
+/// made while the range waited on its worker included, and the reopened range holds every row.
+#[test]
+fn puts_stay_inline_while_the_range_waits_on_a_packing_worker() {
+    static STALL: Stall = Stall::new();
+    let release = Release(&STALL);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("range");
+    let reads: &'static AtomicUsize = Box::leak(Box::default());
+    let issuer = Issuer::start_for(dir.path(), 2, 2).unwrap();
+    let mut runtime = runtime();
+    // A memtable of 64 rows' bytes: the 100 rows rotate it once, the next holding the rest.
+    let entry = 1 + 1 + 1 + key(0).len() + value(0).len();
+    let rows = 100;
+    let mut db = ShardDb::create(open(&path, true, reads, true), STORE, 64 * entry, TRUNK).unwrap();
+    db.set_cache(0);
+    db.attach(&issuer, issuer.depth()).unwrap();
+    let worker_path = path.to_path_buf();
+    db.set_workers(move || {
+        let mut file = open(&worker_path, false, reads, true);
+        file.stall = Some(&STALL);
+        Ok(file)
+    })
+    .unwrap();
+    let ranges = Ranges::start(
+        &mut runtime,
+        vec![(Vec::new(), db)],
+        RangesConfig {
+            clients: 3,
+            slice_ns: SLICE_NS,
+            spin_ns: 0,
+            inline: true,
+        },
+    )
+    .unwrap();
+    let (done, finished) = mpsc::sync_channel(1);
+    runtime
+        .spawn_on(runtime.shard_ids()[0], async move {
+            let mut client = ranges.client().unwrap();
+            for i in 0..rows {
+                client.put_async(&key(i), &value(i)).await.unwrap();
+            }
+            let inlined = client.inlined();
+            STALL.release();
+            client.flush_async().await.unwrap();
+            client.checkpoint_async(1).await.unwrap();
+            drop(client);
+            ranges.stop_async().await.unwrap();
+            done.send(inlined).unwrap();
+        })
+        .unwrap();
+    let inlined = finished.recv().unwrap();
+    runtime.shutdown().unwrap();
+    drop(issuer);
+    drop(release);
+    assert_eq!(inlined, rows as u64);
+    let (mut db, applied) = ShardDb::open(
+        open(&path, false, reads, true),
+        STORE,
+        STORE.page_size,
+        TRUNK,
+    )
+    .unwrap();
+    assert_eq!(applied, 1);
+    let mut out = Vec::new();
+    for i in 0..rows {
+        assert!(db.get(&key(i), &mut out).unwrap());
+        assert_eq!(out, value(i));
+    }
 }

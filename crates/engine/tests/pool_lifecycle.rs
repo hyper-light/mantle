@@ -20,9 +20,10 @@ use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::issuer::Issuer;
 use mantle_engine::Error;
-use mantle_engine::branch::{Op, filter};
+use mantle_engine::branch::Op;
+use mantle_engine::memtable::hashed::{HashMem, Sorter};
 use mantle_engine::store::{Config, Store};
-use mantle_engine::trunk::pool::{self, Back, Job, Owner, Pool, Spawn, Stream, Work};
+use mantle_engine::trunk::pool::{self, Back, Job, Owner, Pool, SortPack, Spawn, Work};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -178,24 +179,8 @@ impl Drop for OpenOnDrop {
     }
 }
 fn job(store: &mut Store<File>, number: u8) -> Box<Job> {
-    let (full, received) = mpsc::sync_channel(1);
-    let mut bytes = Vec::new();
-    let key = [number];
-    pool::encode(
-        &mut bytes,
-        &key,
-        Op::Put,
-        &[number; 100],
-        filter::hash32(filter::hash(&key)),
-    )
-    .unwrap();
-    full.send(bytes).unwrap();
-    drop(full);
     Box::new(Job {
-        work: Work::Pack(Stream {
-            entries: 1,
-            full: received,
-        }),
+        work: Work::Sort(sort_pack(&[number], &[number; 100])),
         grant: store
             .grant(usize::try_from(CONFIG.extent_pages).unwrap())
             .unwrap(),
@@ -293,4 +278,18 @@ fn less_demand_does_not_overlap_replaced_worker_file_lifetimes() {
     landed.unwrap();
     drop(file);
     drop(issuer);
+}
+
+/// A memtable of the one entry `key` holding `value`, as the copy of its arena goes to a worker
+/// that sorts and packs it.
+fn sort_pack(key: &[u8], value: &[u8]) -> SortPack {
+    let mut mem = HashMem::new(1 << 16).unwrap();
+    mem.mirror_into(Vec::new()).unwrap();
+    mem.insert(key, Op::Put, value).unwrap();
+    SortPack {
+        entries: 1,
+        skip: mem.skip(),
+        arena: mem.take_mirror().unwrap(),
+        sorter: Sorter::default(),
+    }
 }

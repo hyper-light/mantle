@@ -21,12 +21,13 @@ use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::issuer::Issuer;
 use hyper_rt::{Runtime, RuntimeConfig};
 use mantle_engine::Error;
-use mantle_engine::branch::{Op, filter};
+use mantle_engine::branch::Op;
+use mantle_engine::memtable::hashed::{HashMem, Sorter};
 use mantle_engine::ranges::{Ranges, RangesConfig};
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::{Config, Store};
 use mantle_engine::trunk::TrunkConfig;
-use mantle_engine::trunk::pool::{self, Job, Owner, Pool, Spawn, Stream, Work};
+use mantle_engine::trunk::pool::{self, Job, Owner, Pool, SortPack, Spawn, Work};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
@@ -69,20 +70,8 @@ fn runtime() -> Runtime {
     .unwrap()
 }
 fn job(store: &mut Store<DeviceFile>) -> Box<Job> {
-    let (send, full) = mpsc::sync_channel(1);
-    let mut buf = Vec::new();
-    pool::encode(
-        &mut buf,
-        b"returned-job",
-        Op::Put,
-        b"input still owned",
-        filter::hash32(filter::hash(b"returned-job")),
-    )
-    .unwrap();
-    send.send(buf).unwrap();
-    drop(send);
     Box::new(Job {
-        work: Work::Pack(Stream { entries: 1, full }),
+        work: Work::Sort(sort_pack(b"returned-job", b"input still owned")),
         grant: store
             .grant(usize::try_from(CONFIG.extent_pages).unwrap())
             .unwrap(),
@@ -345,4 +334,18 @@ fn late_attachment_refuses_before_cloning_or_changing_a_warm_engine() {
     assert!(reopened.get(b"kept", &mut out).unwrap());
     assert_eq!(out, b"before warm attachment refusal");
     reopened.check_references().unwrap();
+}
+
+/// A memtable of the one entry `key` holding `value`, as the copy of its arena goes to a worker
+/// that sorts and packs it.
+fn sort_pack(key: &[u8], value: &[u8]) -> SortPack {
+    let mut mem = HashMem::new(1 << 16).unwrap();
+    mem.mirror_into(Vec::new()).unwrap();
+    mem.insert(key, Op::Put, value).unwrap();
+    SortPack {
+        entries: 1,
+        skip: mem.skip(),
+        arena: mem.take_mirror().unwrap(),
+        sorter: Sorter::default(),
+    }
 }

@@ -543,8 +543,12 @@ fn stats(name: &str, counters: &[RangeStats]) {
         }
         println!("{name}_shape range {range}{shape}");
         println!(
-            "{name}_waits range {range} demand_waits {} demand_wait_ns {}",
-            io.demand_waits, io.demand_wait_ns
+            "{name}_waits range {range} demand_waits {} demand_wait_ns {} cache_bytes {} cache_limit_pages {} cache_refused {}",
+            io.demand_waits,
+            io.demand_wait_ns,
+            io.cache_bytes,
+            io.cache_limit_pages,
+            io.cache_refused
         );
     }
 }
@@ -666,6 +670,10 @@ fn main() -> Result<(), BenchError> {
     // `--consolidation=never|measured|always`: when seeks' rent buys a pivot's consolidation
     // (`Trunk::set_consolidation`; measured by default), for arms that isolate what it costs.
     let mut consolidation = mantle_engine::trunk::Consolidation::Measured;
+    // `--machine-memory`: each range sized to its share of the host's memory
+    // (`ShardDb::follow_machine`), its cache, write memory and records divided by measured
+    // gains, in place of the fixed cache and write budget given on the command line.
+    let mut machine_memory = false;
     let mut args = Vec::new();
     for arg in std::env::args().skip(1) {
         if arg == "--shard-client" {
@@ -676,6 +684,8 @@ fn main() -> Result<(), BenchError> {
             shadow_probe = true;
         } else if arg == "--segments" {
             segments = true;
+        } else if arg == "--machine-memory" {
+            machine_memory = true;
         } else if let Some(value) = arg.strip_prefix("--consolidation=") {
             consolidation = match value {
                 "never" => mantle_engine::trunk::Consolidation::Never,
@@ -854,8 +864,12 @@ fn main() -> Result<(), BenchError> {
                 leaf_entries,
             },
         )?;
-        db.set_cache(cache_bytes / 4096 / threads as usize);
-        db.set_write_budget(write_bytes / threads as usize)?;
+        if machine_memory {
+            db.follow_machine(threads as usize)?;
+        } else {
+            db.set_cache(cache_bytes / 4096 / threads as usize);
+            db.set_write_budget(write_bytes / threads as usize)?;
+        }
         db.attach(&issuer, issuer_depth)?;
         db.set_residency_shadow(shadow_probe);
         db.set_consolidation(consolidation);

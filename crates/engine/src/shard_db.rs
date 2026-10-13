@@ -1128,6 +1128,25 @@ impl<F: BlockFile> ShardDb<F> {
         self.store.write_budget()
     }
 
+    /// Sizes the shard to the machine it runs on: one of `shares` of the host's effective
+    /// capacity (its physical memory, clamped to the tightest OS, job or cgroup bound; hyper-rt
+    /// `machine::facts`, §4.2) for its page cache, write memory and records together, divided
+    /// between them by measured gains ([`Self::set_memory`]), and the cache taking memory only
+    /// as reads want it and only while the machine has it free, asked before each chunk. The
+    /// capacity is the stable bound; free memory, a fluctuating snapshot, gates each growth.
+    pub fn follow_machine(&mut self, shares: usize) -> Result<(), Error> {
+        let facts = hyper_rt::machine::facts::Facts::query();
+        let capacity =
+            hyper_rt::machine::facts::effective_capacity(facts.memory.total, facts.memory.limit);
+        let budget = usize::try_from(capacity)
+            .unwrap_or(usize::MAX)
+            .checked_div(shares.max(1))
+            .unwrap_or(0);
+        self.store
+            .follow_machine(hyper_rt::machine::facts::Facts::memory_available_now);
+        self.set_memory(budget)
+    }
+
     /// Gives the shard `bytes` of memory for its page cache and its write memory together,
     /// fixed output reservations charged first, then divided between cache, queued writes and
     /// records by measured marginal gains ([`tune`]; research/36). Refused unchanged when the

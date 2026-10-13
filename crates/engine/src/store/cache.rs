@@ -120,6 +120,11 @@ pub struct Cache {
     free: Vec<usize>,
     /// Pages inserted since `reserve` last caught up: the free slots it keeps ready.
     wanted: usize,
+    /// The memory the machine has free for a new allocation, asked before each chunk
+    /// (hyper-rt's `Facts::memory_available_now`, §4.2's rule for growth), when the owner gives
+    /// one; chunks the machine could not spare.
+    available: Option<fn() -> Option<u64>>,
+    refused: u64,
     /// Slots a read made itself because idle time had not made one.
     grown: u64,
     /// While the chunks have room for more pages than the limit: the last chunk's first slot,
@@ -156,6 +161,8 @@ impl Cache {
             ghost_seq: 0,
             free: Vec::new(),
             wanted: 0,
+            available: None,
+            refused: 0,
             grown: 0,
             retiring: None,
             retire_at: 0,
@@ -404,6 +411,19 @@ impl Cache {
         let Some(bytes) = pages.checked_mul(self.page) else {
             return false;
         };
+        // The machine keeps a chunk's room free after the cache takes one: what a tuning step
+        // moves, so the next step finds memory to move. No reading sets no bound.
+        if let Some(read) = self.available
+            && read().is_some_and(|free| {
+                u64::try_from(bytes)
+                    .ok()
+                    .and_then(|b| b.checked_mul(2))
+                    .is_none_or(|need| free < need)
+            })
+        {
+            self.refused = self.refused.saturating_add(1);
+            return false;
+        }
         let mut chunk = Vec::new();
         if chunk.try_reserve_exact(bytes).is_err()
             || self.slots.try_reserve_exact(pages).is_err()
@@ -761,6 +781,16 @@ impl Cache {
     /// Slots reads made themselves, in a chunk's room, when idle time had not made one.
     pub fn grown(&self) -> u64 {
         self.grown
+    }
+
+    /// Asks `read` for the memory the machine has free before each chunk is taken.
+    pub fn set_available(&mut self, read: fn() -> Option<u64>) {
+        self.available = Some(read);
+    }
+
+    /// Chunks the machine had no memory free for.
+    pub fn refused(&self) -> u64 {
+        self.refused
     }
 
     /// The cache's bytes in memory: its slots' pages, holding a page or not.

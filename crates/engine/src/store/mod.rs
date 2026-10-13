@@ -135,6 +135,11 @@ pub struct IoStats {
     /// wait to the page landing: what a page from the device costs the reader that asked.
     pub demand_waits: u64,
     pub demand_wait_ns: u64,
+    /// The page cache's bytes now, its page limit, and the chunks the machine had no memory
+    /// free for.
+    pub cache_bytes: u64,
+    pub cache_limit_pages: u64,
+    pub cache_refused: u64,
     /// What those reads asked the OS: probes made, reads made on a probe's kept answer instead,
     /// epochs read and changed, and in shadow mode the kept answers found wrong (hyper-block
     /// `resident`; docs/research/46-reclaim-epochs.md).
@@ -198,6 +203,9 @@ pub struct Store<F: BlockFile> {
     io: IoStats,
     /// The page cache for point reads, when the owner gives one ([`Store::set_cache`]).
     cache: Option<cache::Cache>,
+    /// What the machine has free, asked before the cache takes more memory
+    /// ([`Store::follow_machine`]).
+    machine_free: Option<fn() -> Option<u64>>,
     /// Suffix bits a branch's range filter keeps a key ([`Self::set_range_filter`]).
     range_filter_bits: u32,
     /// The device's issuer, when the owner attaches the store to one ([`Store::attach`]).
@@ -680,6 +688,7 @@ impl<F: BlockFile> Store<F> {
             end: 0,
             io: IoStats::default(),
             cache: None,
+            machine_free: None,
             range_filter_bits: RANGE_FILTER_BITS,
             writer: None,
             write_budget_runs: 0,
@@ -761,6 +770,7 @@ impl<F: BlockFile> Store<F> {
             end: 0,
             io: IoStats::default(),
             cache: None,
+            machine_free: None,
             range_filter_bits: RANGE_FILTER_BITS,
             writer: None,
             write_budget_runs: 0,
@@ -888,6 +898,7 @@ impl<F: BlockFile> Store<F> {
                 end,
                 io: IoStats::default(),
                 cache: None,
+                machine_free: None,
                 range_filter_bits: RANGE_FILTER_BITS,
                 writer: None,
                 write_budget_runs: 0,
@@ -993,9 +1004,20 @@ impl<F: BlockFile> Store<F> {
     /// The store's I/O since it was opened.
     pub fn io_stats(&self) -> IoStats {
         let (cache_hits, cache_misses) = self.cache.as_ref().map_or((0, 0), cache::Cache::stats);
+        let (cache_bytes, cache_limit_pages, cache_refused) =
+            self.cache.as_ref().map_or((0, 0, 0), |c| {
+                (
+                    u64::try_from(c.bytes()).unwrap_or(u64::MAX),
+                    u64::try_from(c.pages()).unwrap_or(u64::MAX),
+                    c.refused(),
+                )
+            });
         IoStats {
             cache_hits,
             cache_misses,
+            cache_bytes,
+            cache_limit_pages,
+            cache_refused,
             cache_evict_steps_most: self
                 .cache
                 .as_ref()
@@ -1026,7 +1048,22 @@ impl<F: BlockFile> Store<F> {
     /// Gives point reads a page cache of `pages` pages (none at 0), replacing any it had. Its
     /// memory is `pages` times the page size, taken now.
     pub fn set_cache(&mut self, pages: usize) {
-        self.cache = (pages > 0).then(|| cache::Cache::new(pages, self.config.page_size));
+        self.cache = (pages > 0).then(|| {
+            let mut c = cache::Cache::new(pages, self.config.page_size);
+            if let Some(read) = self.machine_free {
+                c.set_available(read);
+            }
+            c
+        });
+    }
+
+    /// Asks `read` for the memory the machine has free before the page cache takes more, now
+    /// and for any cache given later.
+    pub fn follow_machine(&mut self, read: fn() -> Option<u64>) {
+        self.machine_free = Some(read);
+        if let Some(c) = self.cache.as_mut() {
+            c.set_available(read);
+        }
     }
 
     /// Resizes the page cache to `pages` in place, keeping what it holds (`Cache::resize`); a

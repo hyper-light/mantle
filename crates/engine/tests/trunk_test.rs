@@ -207,6 +207,47 @@ fn reads_are_exact_after_every_single_key_step_through_splits() {
     assert!(trunk.stats().splits > 4, "{:?}", trunk.stats());
 }
 
+/// A pivot holding `fanout` branches when in-flight branches reach it flushes them down with its
+/// bundle uncompacted, both nodes' lists naming them until each lets them go: every key reads
+/// its newest operation after every step, and the store holds exactly the extents the trunk
+/// names, each once.
+#[test]
+fn full_pivots_carry_in_flight_branches_down_uncompacted() {
+    let align = Alignment::new(4096).unwrap();
+    let file = SimFile::new(align, Alignment::new(512).unwrap(), 31).unwrap();
+    let mut store = Store::create(file, CONFIG).unwrap();
+    let mut trunk = Trunk::new(TrunkConfig {
+        fanout: 2,
+        leaf_entries: 16,
+    })
+    .unwrap();
+    let mut oracle: BTreeMap<Vec<u8>, (Op, Vec<u8>)> = BTreeMap::new();
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    for batch in 0..60u32 {
+        let mut mem: BTreeMap<Vec<u8>, (Op, Vec<u8>)> = BTreeMap::new();
+        for _ in 0..30 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let k = (x % 600) as u32;
+            let op = if x % 5 == 0 { Op::Delete } else { Op::Put };
+            mem.insert(key(k), (op, format!("v{batch}-{k}").into_bytes()));
+        }
+        let mut b = Builder::new(&mut store, Keys::Exactly(mem.len() as u64)).unwrap();
+        for (k, (op, v)) in &mem {
+            b.add(&mut store, k, *op, v).unwrap();
+        }
+        trunk.add(b.finish(&mut store).unwrap());
+        oracle.extend(mem);
+        while !trunk.is_idle() {
+            trunk.step(&mut store, 7).unwrap();
+            check_reads(&mut store, &mut trunk, &oracle).unwrap();
+        }
+        check_refs(&store, &trunk);
+    }
+    assert!(trunk.stats().carried > 0, "{:?}", trunk.stats());
+}
+
 /// A heavier deterministic workload: the tree must deepen and split, and read right after
 /// every batch.
 #[test]

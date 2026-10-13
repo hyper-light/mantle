@@ -289,7 +289,8 @@ impl Trunk {
         }
         let root = self.root;
         for b in std::mem::take(&mut self.pending) {
-            self.node_mut(root)?.inflight.push(vec![b]);
+            let f = self.flights.add(b);
+            self.node_mut(root)?.inflight.push(f);
         }
         self.queue(root);
         Ok(())
@@ -405,9 +406,29 @@ impl Trunk {
     fn compaction_due(&self, n: usize, i: usize) -> Result<bool, Error> {
         let node = self.node(n)?;
         let pivot = node.pivots.get(i).ok_or(corrupt())?;
+        if node.inflight.len() <= pivot.start
+            || self.compacting(n, &pivot.key)
+            || self.held(pivot)?
+        {
+            return Ok(false);
+        }
+        // A flush due now carries them down instead, to be merged where they stop.
+        Ok(!(self.flush_due(n, i)? && self.carries(n, i)?))
+    }
+
+    /// Whether pivot `i` of node `n`, flushed now, carries its live in-flight branches down with
+    /// its bundle, uncompacted: it has some, no compaction of theirs is planned or out (its
+    /// output, older than any branch after them, would land above them), and its child wants no
+    /// change (a change waits for the child's in-flight list to be compacted).
+    fn carries(&self, n: usize, i: usize) -> Result<bool, Error> {
+        let node = self.node(n)?;
+        let pivot = node.pivots.get(i).ok_or(corrupt())?;
+        let Some(child) = pivot.child else {
+            return Ok(false);
+        };
         Ok(node.inflight.len() > pivot.start
             && !self.compacting(n, &pivot.key)
-            && !self.held(pivot)?)
+            && self.node(child)?.wants.is_none())
     }
 
     /// Whether a compaction of node `n`'s pivot keyed `key` is planned or out.
@@ -455,11 +476,15 @@ impl Trunk {
         if self.consolidating && (pivot.seek.paid || (self.full && pivot.seek.below)) {
             return Ok(node.inflight.len() <= pivot.start && !self.compacting(n, &pivot.key));
         }
-        // Past `fanout` runs, or past a memtable's entries: an index pivot's buffer stays small
-        // against the leaves below it, as a Bε-tree's buffers do, so the data lives in the leaves
-        // and a key range lies in one run there (research/50 §11; SplinterDB's fullest-child
-        // flush past one incorporation's bytes, trunk.c restore_balance_index).
+        // Past `fanout` runs; at `fanout` with live in-flight branches to carry, whose compaction
+        // here would write the run that fills the bundle, for the flush that follows to carry
+        // down whole and merge again below (SplinterDB flushes a pivot whose eventual branch
+        // count passes F, trunk.c restore_balance_index); or past a memtable's entries: an index
+        // pivot's buffer stays small against the leaves below it, as a Bε-tree's buffers do, so
+        // the data lives in the leaves and a key range lies in one run there (research/50 §11;
+        // SplinterDB's fullest-child flush past one incorporation's bytes).
         Ok(held > self.config.fanout
+            || (held == self.config.fanout && self.carries(n, i)?)
             || (self.balance && entries(pivot.bundle.branches()) > self.config.leaf_entries))
     }
 
@@ -472,9 +497,9 @@ impl Trunk {
         let (start, covered) = (pivot.start, node.inflight.len());
         let live = node.inflight.get(start..covered).ok_or(corrupt())?;
         let (from, end) = (pivot.key.clone(), Self::pivot_end(node, i));
-        let units = live
-            .iter()
-            .flatten()
+        let units = self
+            .flights
+            .newest_first(live)?
             .map(|b| b.count)
             .fold(0u64, u64::saturating_add);
         let passes = !node.leaf && pivot.bundle.branches().len() == self.config.fanout;
@@ -483,7 +508,11 @@ impl Trunk {
             Running::Remote {
                 grant: Vec::new(),
                 state: State::Ready(Box::new(Task {
-                    inputs: live.iter().rev().flatten().map(Branch::for_merge).collect(),
+                    inputs: self
+                        .flights
+                        .newest_first(live)?
+                        .map(Branch::for_merge)
+                        .collect(),
                     from,
                     end,
                     drop_tombstones: false,
@@ -492,7 +521,7 @@ impl Trunk {
             }
         } else {
             Running::Inline(Box::new(Compaction::prepare(
-                live.iter().rev().flatten(),
+                self.flights.newest_first(live)?,
                 from,
                 end,
                 false,
@@ -520,6 +549,7 @@ impl Trunk {
     /// Flushes pivot `i` of node `n`: its branches go to the child's in-flight list by
     /// reference, oldest first, and the child is looked at.
     fn flush_pivot(&mut self, n: usize, i: usize) -> Result<(), Error> {
+        let carries = self.carries(n, i)?;
         let cascades = self.consolidating && self.full;
         let limit = self.config.leaf_entries;
         let pivot = self.node_mut(n)?.pivots.get_mut(i).ok_or(corrupt())?;
@@ -553,7 +583,25 @@ impl Trunk {
         }
         // Oldest first into the child's in-flight list: the bundle is newest first.
         for b in bundle.into_iter().rev() {
-            self.node_mut(child)?.inflight.push(vec![b]);
+            let f = self.flights.add(b);
+            self.node_mut(child)?.inflight.push(f);
+        }
+        // Then the live in-flight branches, newer than the bundle, uncompacted: named by the
+        // child's list too, and merged where they stop rather than here as well. The pivot reads
+        // past them; once every pivot does, this node lets them go ([`Self::drop_dead`]).
+        if carries {
+            let node = self.node_mut(n)?;
+            let to = node.inflight.len();
+            let pivot = node.pivots.get_mut(i).ok_or(corrupt())?;
+            let from = std::mem::replace(&mut pivot.start, to);
+            for k in from..to {
+                let f = *self.node(n)?.inflight.get(k).ok_or(corrupt())?;
+                self.flights.hold(f)?;
+                self.node_mut(child)?.inflight.push(f);
+            }
+            let carried = u64::try_from(to.saturating_sub(from)).unwrap_or(u64::MAX);
+            self.stats.carried = self.stats.carried.saturating_add(carried);
+            self.queue(n);
         }
         self.queue(child);
         Ok(())
@@ -803,12 +851,9 @@ impl Trunk {
                 // the task stepped once it has grown.
                 if c.opening() && store.segments().is_some() {
                     let inputs: Vec<&Branch> = match &task.what {
-                        What::Compact { start, covered, .. } => node
-                            .inflight
-                            .get(*start..*covered)
-                            .ok_or(corrupt())?
-                            .iter()
-                            .flatten()
+                        What::Compact { start, covered, .. } => self
+                            .flights
+                            .newest_first(node.inflight.get(*start..*covered).ok_or(corrupt())?)?
                             .collect(),
                         What::Settle { .. } => node
                             .pivots
@@ -851,7 +896,7 @@ impl Trunk {
                 let step = match &task.what {
                     What::Compact { start, covered, .. } => {
                         let live = node.inflight.get(*start..*covered).ok_or(corrupt())?;
-                        c.step(store, live.iter().rev().flatten(), left)
+                        c.step(store, self.flights.newest_first(live)?, left)
                     }
                     What::Settle { .. } => {
                         let bundle = node.pivots.first().ok_or(corrupt())?.bundle.branches();

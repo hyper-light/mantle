@@ -447,7 +447,7 @@ impl Trunk {
         if held > 0 && wants.is_some_and(Change::splits) {
             return Ok(true);
         }
-        if self.consolidating && (pivot.seek.paid || pivot.seek.below) {
+        if self.consolidating && (pivot.seek.paid || (self.full && pivot.seek.below)) {
             return Ok(node.inflight.len() <= pivot.start && !self.compacting(n, &pivot.key));
         }
         Ok(held > self.config.fanout)
@@ -506,10 +506,10 @@ impl Trunk {
     /// Flushes pivot `i` of node `n`: its branches go to the child's in-flight list by
     /// reference, oldest first, and the child is looked at.
     fn flush_pivot(&mut self, n: usize, i: usize) -> Result<(), Error> {
-        let consolidating = self.consolidating;
+        let cascades = self.consolidating && self.full;
         let pivot = self.node_mut(n)?.pivots.get_mut(i).ok_or(corrupt())?;
         let child = pivot.child.ok_or(corrupt())?;
-        let paid = consolidating && pivot.seek.paid;
+        let paid = cascades && pivot.seek.paid;
         let bundle = pivot.bundle.take();
         self.spend(n, i)?;
         if !bundle.is_empty() {

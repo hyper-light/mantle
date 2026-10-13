@@ -242,3 +242,39 @@ write-optimization", ;login: 40(5), 2015). Carried uncompacted to where they res
 branches would either stay as sources at every pivot until enough of a pivot's range arrived, or
 reach the leaves in small batches that rewrite each leaf more often. The merge a carry can skip
 is the one before a flush, and a pivot reaches it only when nothing else flushes it first.
+
+## 12. What a merge costs
+
+Sources. **[merge]** `benches/compaction.rs`: a leaf's settle (one branch, and a newer one of an
+eighth its entries, half of them overwriting) and a pivot's compaction (four branches of a quarter
+each, interleaved), merged whole on one thread as a worker merges a job, each warmed first;
+instructions an input entry, exact under the host's load, and macOS `sample` profiles of the 10M
+settle. Three invocations of three rounds an arm, alternating.
+
+A merged entry cost about 2,200 instructions: 2,190 a settled one and 2,280 a compacted one at 10M,
+2,240 and 2,390 at 100M, where the merge also waited on its input reads (wall time twice CPU time).
+The settle's profile:
+
+| share of the merge's samples | what |
+|---|---|
+| 33% | the range filter's build: its trie's insert (24.5% with what it calls) and each key copied into its builder (10.4%) |
+| ~40% under load | byte copies: the cursor decoding input pages, the page builder's push and encode, the cache's copy of each written page, the kernel's on pread and pwrite |
+| 9.8% | pwrite, an extent's run of pages a call |
+| 8.8% | the merge's own step |
+
+The range filter serves bounded scans, an S3 LIST by prefix (§1's seeks have no end key: of 3M
+sources at 1M and 100M they skipped none, the filter never asked [contig]). Every branch keeps it;
+its build was three layers each checking a key's order against its own copy of the key before, each
+finding their shared prefix, each copying the key. The branch builder's order check now finds the
+shared prefix once, and the filter and its trie are told it: no key is copied but by the builder.
+Instructions an entry fell 12% for a settle (2,195 to 1,932) and 9% for a compaction (2,280 to
+2,080), the filter's bytes the same (`a_filter_pushed_with_shared_prefixes_encodes_as_one_cut_from_whole_keys`).
+The merge also keeps the least key of its other inputs: while the current key is below it, a step
+moves the current input alone, one comparison where it compared every input twice and copied the
+key. Alone it saved 2.3% a settled entry and cost 0.5% a compacted one, whose four interleaved
+inputs change the least nearly every entry, and the pick now finds two.
+
+Direct I/O (`CachingRequest::PreferDirect`; `F_NOCACHE` on this Mac's APFS) doubled the merge's
+wall time (settle 352 to 401 ns an entry against 151 to 205 buffered), its CPU time the same or more
+(177 to 199 against 150 to 187 ns) and 5% more instructions: no read-ahead or write-behind serves a
+merge reading and writing in turn, and the kernel's copies it avoids did not show as CPU saved.

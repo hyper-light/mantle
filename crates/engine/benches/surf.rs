@@ -153,12 +153,16 @@ fn main() {
         for suffix in [0u32, 4, 8, 12, 16, 24, 32] {
             let mut b = SurfBuilder::new(suffix).unwrap();
             let t = Instant::now();
+            let mut before: Option<&Vec<u8>> = None;
             for k in &set {
-                b.add(k).unwrap();
+                let shared =
+                    before.map_or(0, |p| p.iter().zip(k).take_while(|(x, y)| x == y).count());
+                b.push(before.map(Vec::as_slice), shared).unwrap();
+                before = Some(k);
             }
             let added = t.elapsed().as_secs_f64();
             let t = Instant::now();
-            let f = b.finish().unwrap();
+            let f = b.finish(before.map(Vec::as_slice)).unwrap();
             let finish = t.elapsed().as_secs_f64();
             let build = added + finish;
             let mut scratch = Vec::with_capacity(64);

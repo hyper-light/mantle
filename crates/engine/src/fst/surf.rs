@@ -154,8 +154,7 @@ impl Surf {
 pub struct SurfBuilder {
     trie: TrieBuilder,
     suffix: u32,
-    /// The key not yet added, and the bytes it shares with the key before it.
-    last: Vec<u8>,
+    /// The bytes the key not yet added shares with the key before it, and whether there is one.
     shared_before: usize,
     pending: bool,
 }
@@ -172,53 +171,59 @@ impl SurfBuilder {
     pub fn reset(&mut self, suffix: u32) -> Result<(), Error> {
         self.trie.reset(Width::Bits(suffix))?;
         self.suffix = suffix;
-        self.last.clear();
         self.shared_before = 0;
         self.pending = false;
         Ok(())
     }
 
-    /// Adds `key`, greater than every key added.
-    pub fn add(&mut self, key: &[u8]) -> Result<(), Error> {
-        let mut shared = 0usize;
-        if self.pending {
-            if key <= self.last.as_slice() {
+    /// Takes the next key, given the key before it (`before`, none for the first) and the
+    /// bytes the two share (`shared`): the caller holds both, and has checked the next is the
+    /// greater, as the branch builder does as it adds an entry, so the filter keeps no copy of
+    /// a key. A key goes into the trie once the next is known, cut one byte past what it shares
+    /// with either neighbour: here `before`, and the last at [`Self::finish`].
+    pub fn push(&mut self, before: Option<&[u8]>, shared: usize) -> Result<(), Error> {
+        match (before, self.pending) {
+            (Some(key), true) => self.cut(key, shared)?,
+            (None, false) => {}
+            _ => {
                 return Err(Error::InvalidArgument {
-                    what: "a range filter's keys not strictly ascending",
+                    what: "a range filter given a key without the one before it",
                 });
             }
-            shared = self
-                .last
-                .iter()
-                .zip(key)
-                .take_while(|(a, b)| a == b)
-                .count();
-            self.cut_last(shared)?;
         }
-        self.last.clear();
-        self.last.extend_from_slice(key);
         self.shared_before = shared;
         self.pending = true;
         Ok(())
     }
 
-    /// Adds the held key to the trie, cut one byte past what it shares with either neighbour
-    /// (`shared_after` with the next).
-    fn cut_last(&mut self, shared_after: usize) -> Result<(), Error> {
+    /// Adds `key`, the held one, to the trie, cut one byte past what it shares with either
+    /// neighbour (`shared_after` with the next). Two neighbours cut so differ at the byte the
+    /// whole keys first differ at, `shared_before`, which is so what the trie is told they
+    /// share.
+    fn cut(&mut self, key: &[u8], shared_after: usize) -> Result<(), Error> {
         let len = self
             .shared_before
             .max(shared_after)
             .saturating_add(1)
-            .min(self.last.len());
-        let s = suffix_of(&self.last, len, self.suffix);
-        self.trie.add(self.last.get(..len).unwrap_or(&[]), s)
+            .min(key.len());
+        let s = suffix_of(key, len, self.suffix);
+        self.trie
+            .add_after(key.get(..len).unwrap_or(&[]), self.shared_before, s)
     }
 
-    /// The filter of the keys added.
-    pub fn finish(&mut self) -> Result<Surf, Error> {
-        if self.pending {
-            self.cut_last(0)?;
-            self.pending = false;
+    /// The filter of the keys pushed, `last` the last of them (none when there was none).
+    pub fn finish(&mut self, last: Option<&[u8]>) -> Result<Surf, Error> {
+        match (last, self.pending) {
+            (Some(key), true) => {
+                self.cut(key, 0)?;
+                self.pending = false;
+            }
+            (None, false) => {}
+            _ => {
+                return Err(Error::InvalidArgument {
+                    what: "a range filter finished without its last key",
+                });
+            }
         }
         Ok(Surf {
             trie: self.trie.finish()?,
@@ -249,10 +254,49 @@ mod tests {
 
     fn surf(set: &BTreeSet<Vec<u8>>, suffix: u32) -> Surf {
         let mut b = SurfBuilder::new(suffix).unwrap();
+        let mut before: Option<&Vec<u8>> = None;
         for k in set {
-            b.add(k).unwrap();
+            let shared = before.map_or(0, |p| p.iter().zip(k).take_while(|(x, y)| x == y).count());
+            b.push(before.map(Vec::as_slice), shared).unwrap();
+            before = Some(k);
         }
-        b.finish().unwrap()
+        b.finish(before.map(Vec::as_slice)).unwrap()
+    }
+
+    /// The filter a stream of keys and shared prefixes builds is byte for byte the one cut from
+    /// the whole keys: each cut one byte past its longest prefix shared with a neighbour, added
+    /// to a trie that holds them.
+    #[test]
+    fn a_filter_pushed_with_shared_prefixes_encodes_as_one_cut_from_whole_keys() {
+        let mut x = 0x5bd1_e995_9e37_79b9u64;
+        for case in 0..200u32 {
+            let mut set = BTreeSet::new();
+            for _ in 0..(rng(&mut x) % 300) {
+                set.insert(key(&mut x));
+            }
+            let keys: Vec<&Vec<u8>> = set.iter().collect();
+            let lcp = |a: &[u8], b: &[u8]| a.iter().zip(b).take_while(|(x, y)| x == y).count();
+            for suffix in [0u32, 5, 8, 13] {
+                let mut whole = TrieBuilder::new(Width::Bits(suffix)).unwrap();
+                for (i, k) in keys.iter().enumerate() {
+                    let before = i
+                        .checked_sub(1)
+                        .and_then(|j| keys.get(j))
+                        .map_or(0, |p| lcp(p, k));
+                    let after = keys.get(i + 1).map_or(0, |n| lcp(k, n));
+                    let len = before.max(after).saturating_add(1).min(k.len());
+                    whole.add(&k[..len], suffix_of(k, len, suffix)).unwrap();
+                }
+                let expected = Surf {
+                    trie: whole.finish().unwrap(),
+                    suffix,
+                };
+                let (mut want, mut got) = (Vec::new(), Vec::new());
+                expected.encode(&mut want);
+                surf(&set, suffix).encode(&mut got);
+                assert_eq!(got, want, "case {case} suffix {suffix} keys {}", keys.len());
+            }
+        }
     }
 
     #[test]

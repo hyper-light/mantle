@@ -16,6 +16,10 @@ pub struct Merge {
     end: Option<Vec<u8>>,
     /// The cursor whose entry is current, if any.
     current: Option<usize>,
+    /// The cursor at the least key of the others, as [`Self::pick`] left it: while the current
+    /// key stays below its key, no other cursor holds the current key, so a step moves the
+    /// current cursor alone and compares its next key with this one only.
+    second: Option<usize>,
     /// The key `next` moves past, its buffer reused so a step allocates nothing.
     past: Vec<u8>,
     /// While opening, `current` is the next input and `past` holds its from-key.
@@ -72,6 +76,7 @@ impl Merge {
             cursors,
             end: end.map(<[u8]>::to_vec),
             current: None,
+            second: None,
             past: Vec::new(),
             opening: false,
         };
@@ -84,6 +89,7 @@ impl Merge {
             cursors: Vec::new(),
             end,
             current: Some(0),
+            second: None,
             past: from,
             opening: true,
         }
@@ -148,27 +154,45 @@ impl Merge {
         }
     }
 
-    /// The cursor at the smallest key, the newest of those tied; none past the end.
+    /// The cursor at the smallest key, the newest of those tied; none past the end. Notes the
+    /// least of the others too ([`Self::second`]).
     fn pick(&mut self) {
         let mut best: Option<usize> = None;
+        let mut second: Option<usize> = None;
         for (i, c) in self.cursors.iter().enumerate() {
             if !c.valid() {
                 continue;
             }
-            let better = match best.and_then(|b| self.cursors.get(b)) {
-                None => true,
+            match best.and_then(|b| self.cursors.get(b)) {
+                None => best = Some(i),
                 // Strictly smaller only: an equal key keeps the earlier, newer cursor.
-                Some(b) => c.key() < b.key(),
-            };
-            if better {
-                best = Some(i);
+                Some(b) if c.key() < b.key() => {
+                    second = best;
+                    best = Some(i);
+                }
+                Some(_) => {
+                    if second
+                        .and_then(|s| self.cursors.get(s))
+                        .is_none_or(|s| c.key() < s.key())
+                    {
+                        second = Some(i);
+                    }
+                }
             }
         }
+        self.second = second;
         self.current = best.filter(|&b| {
             self.cursors
                 .get(b)
                 .is_some_and(|c| self.end.as_deref().is_none_or(|end| c.key() < end))
         });
+    }
+
+    /// Whether the current key is below every other cursor's: no other cursor holds it.
+    fn alone(&self, at: &RunCursor) -> bool {
+        self.second
+            .and_then(|s| self.cursors.get(s))
+            .is_none_or(|s| !s.valid() || at.key() < s.key())
     }
 
     /// Whether moving past the current key reads no page that has not landed: every cursor
@@ -178,9 +202,24 @@ impl Merge {
         store: &mut Store<F>,
         branches: impl IntoIterator<Item = &'a Branch>,
     ) -> Result<bool, Error> {
-        let Some(at) = self.current.and_then(|i| self.cursors.get(i)) else {
+        if self.opening {
+            return Ok(true);
+        }
+        let Some(i) = self.current else {
             return Ok(true);
         };
+        let Some(at) = self.cursors.get(i) else {
+            return Ok(true);
+        };
+        if self.alone(at) {
+            let b = branches.into_iter().nth(i).ok_or(Error::InvalidArgument {
+                what: "a merge stepped over inputs it was not opened on",
+            })?;
+            return match self.cursors.get_mut(i) {
+                Some(c) => c.next_ready(b, store),
+                None => Ok(true),
+            };
+        }
         self.past.clear();
         self.past.extend_from_slice(at.key());
         for (c, b) in self.cursors.iter_mut().zip(branches) {
@@ -209,9 +248,33 @@ impl Merge {
         store: &mut Store<F>,
         branches: impl IntoIterator<Item = &'a Branch>,
     ) -> Result<u64, Error> {
-        let Some(at) = self.current.and_then(|i| self.cursors.get(i)) else {
+        if self.opening {
+            return Ok(0);
+        }
+        let Some(i) = self.current else {
             return Ok(0);
         };
+        let Some(at) = self.cursors.get(i) else {
+            return Ok(0);
+        };
+        if self.alone(at) {
+            // Only this cursor holds the key: it moves alone, and stays current while its next
+            // key is below the others' and the end.
+            let b = branches.into_iter().nth(i).ok_or(Error::InvalidArgument {
+                what: "a merge stepped over inputs it was not opened on",
+            })?;
+            let c = self.cursors.get_mut(i).ok_or(Error::InvalidArgument {
+                what: "a merge stepped over inputs it was not opened on",
+            })?;
+            c.next(b, store)?;
+            let stays = self.cursors.get(i).is_some_and(|c| {
+                c.valid() && self.alone(c) && self.end.as_deref().is_none_or(|end| c.key() < end)
+            });
+            if !stays {
+                self.pick();
+            }
+            return Ok(1);
+        }
         self.past.clear();
         self.past.extend_from_slice(at.key());
         let mut moved = 0u64;

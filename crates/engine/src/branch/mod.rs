@@ -468,9 +468,22 @@ impl Builder {
                 what: "an entry added to a sealed branch",
             });
         }
-        if self.count > 0 && key.cmp(&self.last) != Ordering::Greater {
-            return Err(corrupt(Malformed::OutOfOrder));
-        }
+        // The bytes the key shares with the one before it: where the order check looks, and
+        // what the range filter cuts keys by.
+        let common = if self.count > 0 {
+            let common = shared(&self.last, key);
+            let greater = match (self.last.get(common), key.get(common)) {
+                (None, Some(_)) => true,
+                (Some(a), Some(b)) => b > a,
+                _ => false,
+            };
+            if !greater {
+                return Err(corrupt(Malformed::OutOfOrder));
+            }
+            common
+        } else {
+            0
+        };
         if !self.fits(key.len(), value.len()) {
             return Err(Error::LimitExceeded {
                 what: "an entry's bytes in a branch page",
@@ -481,13 +494,20 @@ impl Builder {
         let head = [op.byte(), low, high];
         // Append the entry to its page directly, without staging the value in another buffer.
         self.insert(store, 0, key, &head, value, 1)?;
+        self.keys.push(
+            if self.count > 0 {
+                Some(self.last.as_slice())
+            } else {
+                None
+            },
+            common,
+        )?;
         self.last.clear();
         self.last.extend_from_slice(key);
         self.count = self.count.saturating_add(1);
         let h32 = hash32.unwrap_or_else(|| filter::hash32(filter::hash(key)));
         // The filter's block and probes use these high bits alone.
         self.filter.insert(u64::from(h32) << u32::BITS);
-        self.keys.add(key)?;
         self.entry_bytes = self.entry_bytes.saturating_add(
             u64::try_from(key.len().saturating_add(value.len())).unwrap_or(u64::MAX),
         );
@@ -811,7 +831,11 @@ impl Builder {
         self.index.clear();
         trie.encode(&mut self.index);
         self.index_trie = Some(trie);
-        let range = self.keys.finish()?;
+        let range = self.keys.finish(if self.count > 0 {
+            Some(self.last.as_slice())
+        } else {
+            None
+        })?;
         self.range.clear();
         range.encode(&mut self.range);
         self.range_filter = Some(range);

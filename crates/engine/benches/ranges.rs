@@ -674,6 +674,10 @@ fn main() -> Result<(), BenchError> {
     // (`ShardDb::follow_machine`), its cache, write memory and records divided by measured
     // gains, in place of the fixed cache and write budget given on the command line.
     let mut machine_memory = false;
+    // `--direct`: each range's files opened for direct I/O where the file system takes it
+    // (hyper-block `CachingRequest::PreferDirect`), past the OS page cache, for an A/B against
+    // buffered I/O.
+    let mut caching = CachingRequest::Buffered;
     let mut args = Vec::new();
     for arg in std::env::args().skip(1) {
         if arg == "--shard-client" {
@@ -686,6 +690,8 @@ fn main() -> Result<(), BenchError> {
             segments = true;
         } else if arg == "--machine-memory" {
             machine_memory = true;
+        } else if arg == "--direct" {
+            caching = CachingRequest::PreferDirect;
         } else if let Some(value) = arg.strip_prefix("--consolidation=") {
             consolidation = match value {
                 "never" => mantle_engine::trunk::Consolidation::Never,
@@ -841,19 +847,9 @@ fn main() -> Result<(), BenchError> {
         require(!path.exists(), "benchmark requires a fresh directory")?;
         let bound = segment_bound(issuer_depth);
         let file = if segments {
-            BenchFile::Segments(SegmentedFile::create(
-                &path,
-                CachingRequest::Buffered,
-                align,
-                bound,
-            )?)
+            BenchFile::Segments(SegmentedFile::create(&path, caching, align, bound)?)
         } else {
-            BenchFile::One(DeviceFile::open(
-                &path,
-                true,
-                CachingRequest::Buffered,
-                align,
-            )?)
+            BenchFile::One(DeviceFile::open(&path, true, caching, align)?)
         };
         let mut db = ShardDb::create(
             file,
@@ -876,11 +872,9 @@ fn main() -> Result<(), BenchError> {
         let worker_path = path.clone();
         db.set_workers(move || {
             let file = if segments {
-                SegmentedFile::open(&worker_path, CachingRequest::Buffered, align, bound)
-                    .map(BenchFile::Segments)
+                SegmentedFile::open(&worker_path, caching, align, bound).map(BenchFile::Segments)
             } else {
-                DeviceFile::open(&worker_path, false, CachingRequest::Buffered, align)
-                    .map(BenchFile::One)
+                DeviceFile::open(&worker_path, false, caching, align).map(BenchFile::One)
             };
             file.map_err(|error| mantle_engine::Error::Io {
                 op: "open a range benchmark worker",
@@ -1034,17 +1028,12 @@ fn main() -> Result<(), BenchError> {
         let file = if segments {
             BenchFile::Segments(SegmentedFile::open(
                 path,
-                CachingRequest::Buffered,
+                caching,
                 align,
                 segment_bound(issuer_depth),
             )?)
         } else {
-            BenchFile::One(DeviceFile::open(
-                path,
-                false,
-                CachingRequest::Buffered,
-                align,
-            )?)
+            BenchFile::One(DeviceFile::open(path, false, caching, align)?)
         };
         let (mut db, applied) = ShardDb::open(
             file,

@@ -142,6 +142,10 @@ pub struct TrieBuilder {
     depth: usize,
     width: u32,
     prev: Vec<u8>,
+    /// The last key's length: all [`Self::add_after`] keeps of it.
+    prev_len: usize,
+    /// Whether the keys come by [`Self::add_after`]: a builder takes them one way only.
+    after: bool,
     keys: usize,
     /// The largest value given, and whether the trie's values take only the bits it needs.
     max: u32,
@@ -183,6 +187,8 @@ impl TrieBuilder {
         self.width = width;
         self.depth = 0;
         self.prev.clear();
+        self.prev_len = 0;
+        self.after = false;
         self.keys = 0;
         self.max = 0;
         // The root: a node with no labels yet.
@@ -218,11 +224,54 @@ impl TrieBuilder {
 
     /// Adds `key`, greater than every key added, with `value`.
     pub fn add(&mut self, key: &[u8], value: u32) -> Result<(), Error> {
+        if self.after {
+            return Err(Error::InvalidArgument {
+                what: "a trie's keys given both with and without their shared prefixes",
+            });
+        }
         if self.keys > 0 && key <= self.prev.as_slice() {
             return Err(Error::InvalidArgument {
                 what: "a trie's keys not strictly ascending",
             });
         }
+        let lcp = if self.keys == 0 {
+            0
+        } else {
+            self.prev
+                .iter()
+                .zip(key)
+                .take_while(|(a, b)| a == b)
+                .count()
+        };
+        self.push_key(key, lcp, value)?;
+        self.prev.clear();
+        self.prev.extend_from_slice(key);
+        Ok(())
+    }
+
+    /// [`Self::add`] for a caller that holds the keys: `key` shares its first `lcp` bytes with
+    /// the key added before it, and the caller has checked it is the greater. The builder keeps
+    /// no copy of it, so a range filter's keys are copied once, by the branch builder that holds
+    /// them ([`super::surf::SurfBuilder::push`]).
+    pub fn add_after(&mut self, key: &[u8], lcp: usize, value: u32) -> Result<(), Error> {
+        if self.keys > 0 && !self.after {
+            return Err(Error::InvalidArgument {
+                what: "a trie's keys given both with and without their shared prefixes",
+            });
+        }
+        // Greater than a key of `prev_len` bytes it shares `lcp` with: past it when it extends
+        // it, so never a prefix of it.
+        if self.keys > 0 && (lcp > self.prev_len || lcp >= key.len()) {
+            return Err(Error::InvalidArgument {
+                what: "a trie's keys not strictly ascending",
+            });
+        }
+        self.after = true;
+        self.push_key(key, lcp, value)
+    }
+
+    /// Adds `key`, sharing `lcp` bytes with the key before it, to the levels it reaches.
+    fn push_key(&mut self, key: &[u8], lcp: usize, value: u32) -> Result<(), Error> {
         if width_of(value) > self.width {
             return Err(Error::InvalidArgument {
                 what: "a trie value wider than its width",
@@ -233,23 +282,15 @@ impl TrieBuilder {
         self.max = self.max.max(value);
         if key.is_empty() {
             // The empty key sorts first: the root's own.
+            self.prev_len = 0;
             let root = self.level(0)?;
             root.prefix.set(0, true);
             return root.values.push(value);
         }
-        let lcp = if first_key {
-            0
-        } else {
-            self.prev
-                .iter()
-                .zip(key)
-                .take_while(|(a, b)| a == b)
-                .count()
-        };
-        if !first_key && lcp == self.prev.len() && !self.prev.is_empty() {
+        if !first_key && lcp == self.prev_len && self.prev_len > 0 {
             // The previous key is a prefix of this one: its last label goes on, and the node
             // it now leads to holds it as its own key, its value the level's last.
-            let d = self.prev.len().saturating_sub(1);
+            let d = self.prev_len.saturating_sub(1);
             let l = self.level(d)?;
             l.has_child.set_last(true);
             let ended = l.values.pop().ok_or(corrupt())?;
@@ -269,8 +310,7 @@ impl TrieBuilder {
             l.prefix.push(false);
             l.push(key, d, true, value)?;
         }
-        self.prev.clear();
-        self.prev.extend_from_slice(key);
+        self.prev_len = key.len();
         Ok(())
     }
 

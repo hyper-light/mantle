@@ -606,6 +606,19 @@ impl Trunk {
                 pivots, inflight, ..
             } = node;
             let pivot = pivots.get_mut(p).ok_or(corrupt())?;
+            // Every candidate's filter block read first, their misses overlapping; the probes in
+            // order then find them cached.
+            let mut touched = 0u64;
+            for b in inflight
+                .get(pivot.start..)
+                .unwrap_or_default()
+                .iter()
+                .flatten()
+                .chain(pivot.bundle.branches.iter())
+            {
+                touched ^= b.filter.touch(hash);
+            }
+            std::hint::black_box(touched);
             for bundle in inflight
                 .get_mut(pivot.start..)
                 .unwrap_or_default()
@@ -657,6 +670,19 @@ impl Trunk {
                 pivots, inflight, ..
             } = node;
             let pivot = pivots.get_mut(p).ok_or(corrupt())?;
+            // Every candidate's filter block read first, their misses overlapping; the probes in
+            // order then find them cached.
+            let mut touched = 0u64;
+            for b in inflight
+                .get(pivot.start..)
+                .unwrap_or_default()
+                .iter()
+                .flatten()
+                .chain(pivot.bundle.branches.iter())
+            {
+                touched ^= b.filter.touch(hash);
+            }
+            std::hint::black_box(touched);
             for bundle in inflight
                 .get_mut(pivot.start..)
                 .unwrap_or_default()

@@ -191,6 +191,16 @@ impl Filter {
     }
 
     /// Whether a key of hash `h` may be in the branch: false only when it is not.
+    /// The first word of the block `h` falls in, read and nothing decided: a lookup reads every
+    /// branch's block on its path before it asks any, so their cache misses overlap rather than
+    /// follow one another (the loads are independent; the asks then find them in the cache).
+    pub fn touch(&self, h: u64) -> u64 {
+        self.blocks
+            .get(block_of(h, self.blocks.len()))
+            .and_then(|b| b.first().copied())
+            .unwrap_or(0)
+    }
+
     pub fn may_contain(&self, h: u64) -> bool {
         let Some(block) = self.blocks.get(block_of(h, self.blocks.len())) else {
             return true;

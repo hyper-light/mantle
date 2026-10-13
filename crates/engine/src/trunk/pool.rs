@@ -36,6 +36,7 @@ use crate::branch::filter::Keys;
 use crate::branch::merge::Compaction;
 use crate::branch::{Branch, Builder, Op};
 use crate::error::Error;
+use crate::store::cache::Kept;
 use crate::store::{Config, IntoFile, Refill, Store};
 use hyper_block::block::BlockFile;
 
@@ -150,13 +151,15 @@ fn decode(
 }
 
 /// A job: its work, written into `grant`, with reads up to `file_end`, its pages sealed for the
-/// checkpoint after `generation`.
+/// checkpoint after `generation`; and the shard's cache's memory lent for the pages it writes
+/// (`Kept`), which comes back with its result whatever the result.
 #[derive(Debug)]
 pub struct Job {
     pub work: Work,
     pub grant: Vec<u64>,
     pub file_end: u64,
     pub generation: u64,
+    pub keep: Option<Kept>,
 }
 
 /// A job's result: the branches made, each with its first key, in key order; the granted
@@ -171,6 +174,9 @@ pub struct Output {
     pub end: u64,
     pub ns: u64,
     pub units: u64,
+    /// The pages kept in the cache's loan, held with the result until its branches are applied:
+    /// set by the owner from the job's [`Back`].
+    pub kept: Option<Kept>,
 }
 
 /// Who a job's result goes back to: the trunk's maintenance, the shard's packing, or the shard's
@@ -200,6 +206,9 @@ pub struct Ticket {
 pub struct Back {
     pub ticket: Ticket,
     pub result: Result<Output, Error>,
+    /// The cache's memory the job was lent, its written pages in it: the owner's to adopt with
+    /// the result, or to give back unread.
+    pub kept: Option<Kept>,
     /// An issued-write failure or worker unwind remains visible when input was abandoned.
     pub physical_error: Option<Error>,
     pub topped: Vec<u64>,
@@ -227,6 +236,7 @@ pub(crate) enum Message {
         worker: usize,
         result: Result<Output, Error>,
         physical_error: Option<Error>,
+        kept: Option<Kept>,
     },
     /// Terminal native attachment result, after the owner's last Done was consumed.
     Retired {
@@ -284,6 +294,7 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
                     worker: id,
                     result: Err(error),
                     physical_error: None,
+                    kept: None,
                 }
             };
             drop(back.blocking_send(message));
@@ -307,14 +318,17 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
         more.recv()
             .map_err(|_| gone("take extents from the shard"))?
     })));
-    while let Ok(job) = jobs.recv() {
+    while let Ok(mut job) = jobs.recv() {
         let t = Instant::now();
+        store.keep_pages(job.keep.take());
         let (ran, unwound) = run_guarded(&mut store, &job, &back, id);
         // Whatever the job's end, every run it handed the device is answered before its result
         // goes back: the shard releases a failed job's extents once it has the result, and the
         // next job starts the allocator over, so none of this job's writes may land after. The
         // job's own failure is the one reported.
         let drained = store.drain();
+        // The pages kept go back however the job ended: the shard's cache lent their room.
+        let kept = store.take_kept();
         // An issued failure precedes the unwind. A worker unwind is non-abandonable too,
         // so terminal cleanup must retain it even when a partial input was canceled.
         let physical_error = drained.as_ref().err().cloned().or_else(|| {
@@ -333,6 +347,7 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
                 end: store.end(),
                 ns: ns(Instant::now().saturating_duration_since(t)).saturating_sub(waited),
                 units,
+                kept: None,
             })
         });
         // A packing's channels close before the result is sent, so every buffer still held is
@@ -342,6 +357,7 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
             worker: id,
             result,
             physical_error,
+            kept,
         };
         if unwound {
             // Close admission before Done: its owner can immediately try this same seat.
@@ -1215,6 +1231,7 @@ impl Pool {
                 worker,
                 result,
                 physical_error,
+                kept,
             } => {
                 // A canceled request can consume Done before closing starts. Physical
                 // failures and worker unwinds stay terminal even after that Back is taken.
@@ -1242,6 +1259,7 @@ impl Pool {
                     Back {
                         ticket,
                         result,
+                        kept,
                         physical_error,
                         topped,
                         buffers,

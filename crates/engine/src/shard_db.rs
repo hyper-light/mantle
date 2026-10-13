@@ -2515,6 +2515,7 @@ impl<F: BlockFile> ShardDb<F> {
             grant: Vec::new(),
             file_end: self.store.end(),
             generation: self.store.generation(),
+            keep: None,
         });
         match pool.send(job, Owner::Grow, true) {
             Ok(Ok(ticket)) => {
@@ -2758,6 +2759,7 @@ impl<F: BlockFile> ShardDb<F> {
                 grant: grant.clone(),
                 file_end: self.store.end(),
                 generation: self.store.generation(),
+                keep: None,
             });
             let sent = match pool.send(job, Owner::Pack, true) {
                 Ok(sent) => sent,

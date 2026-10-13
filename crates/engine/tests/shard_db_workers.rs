@@ -233,6 +233,45 @@ fn seeks_buy_consolidations_priced_by_the_workers_compactions() {
     db.check_references().unwrap();
 }
 
+/// The pages a worker's compaction writes come back cached where they were written: the shard's
+/// cache lends each job room, the worker keeps its pages in it as it writes them, and the shard
+/// takes them with the job's branches. With a cache that holds the store and nothing read before
+/// maintenance ends, reading every key after it reads no page from the device.
+#[test]
+fn a_workers_pages_are_cached_where_they_were_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let mut db = ShardDb::create(open(&path, true), STORE, MEM, TRUNK).unwrap();
+    db.set_cache(1 << 16);
+    workers(&mut db, &path);
+    let mut oracle: BTreeMap<u64, Option<Vec<u8>>> = BTreeMap::new();
+    let mut x = 0x5851_f42d_4c95_7f2du64;
+    for i in 0..OPS {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let k = x % KEYS;
+        let v = format!("v{i}-{}", "x".repeat((x % 40) as usize)).into_bytes();
+        db.put(&key(k), &v).unwrap();
+        oracle.insert(k, Some(v));
+    }
+    while db.owed() {
+        db.idle_step(64).unwrap();
+    }
+    let (_, trunk, io) = db.stats();
+    assert!(
+        trunk.pivot_compactions > 0 && trunk.leaf_compactions > 0,
+        "{trunk:?}"
+    );
+    let before = io.device_reads;
+    for k in 0..KEYS {
+        check(&mut db, &oracle, k);
+    }
+    let (_, _, io) = db.stats();
+    assert_eq!(io.device_reads, before, "{io:?}");
+    db.check_references().unwrap();
+}
+
 /// The same with the shard's runs on a two-worker issuer: a job waits for its inputs' runs to
 /// land before a worker reads them.
 #[test]

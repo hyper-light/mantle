@@ -203,6 +203,9 @@ pub struct Store<F: BlockFile> {
     io: IoStats,
     /// The page cache for point reads, when the owner gives one ([`Store::set_cache`]).
     cache: Option<cache::Cache>,
+    /// A worker's job's loan of the shard's cache memory, its written pages kept in it
+    /// ([`Store::keep_pages`]).
+    keep: Option<cache::Kept>,
     /// What the machine has free, asked before the cache takes more memory
     /// ([`Store::follow_machine`]).
     machine_free: Option<fn() -> Option<u64>>,
@@ -688,6 +691,7 @@ impl<F: BlockFile> Store<F> {
             end: 0,
             io: IoStats::default(),
             cache: None,
+            keep: None,
             machine_free: None,
             range_filter_bits: RANGE_FILTER_BITS,
             writer: None,
@@ -770,6 +774,7 @@ impl<F: BlockFile> Store<F> {
             end: 0,
             io: IoStats::default(),
             cache: None,
+            keep: None,
             machine_free: None,
             range_filter_bits: RANGE_FILTER_BITS,
             writer: None,
@@ -898,6 +903,7 @@ impl<F: BlockFile> Store<F> {
                 end,
                 io: IoStats::default(),
                 cache: None,
+                keep: None,
                 machine_free: None,
                 range_filter_bits: RANGE_FILTER_BITS,
                 writer: None,
@@ -1708,6 +1714,38 @@ impl<F: BlockFile> Store<F> {
         Ok(())
     }
 
+    /// Room in the cache for up to `pages` pages a worker's job will write, lent with the job
+    /// ([`cache::Cache::lend`]); none without a cache.
+    pub(crate) fn lend_pages(&mut self, pages: usize) -> Option<cache::Kept> {
+        self.cache.as_mut()?.lend(pages)
+    }
+
+    /// A loan back with the pages a job wrote, which the cache takes as its own
+    /// ([`cache::Cache::adopt`]).
+    pub(crate) fn adopt_pages(&mut self, kept: cache::Kept) {
+        if let Some(c) = self.cache.as_mut() {
+            c.adopt(kept);
+        }
+    }
+
+    /// A loan back whose pages are not the store's to read: a job failed or abandoned.
+    pub(crate) fn unlend_pages(&mut self, kept: cache::Kept) {
+        if let Some(c) = self.cache.as_mut() {
+            c.unlend(kept);
+        }
+    }
+
+    /// A worker's store keeps the node pages its job writes in `kept`, the shard's cache's memory
+    /// lent for them; none keeps none.
+    pub(crate) fn keep_pages(&mut self, kept: Option<cache::Kept>) {
+        self.keep = kept;
+    }
+
+    /// The loan the job's pages were kept in, taken back at the job's end.
+    pub(crate) fn take_kept(&mut self) -> Option<cache::Kept> {
+        self.keep.take()
+    }
+
     /// Takes back a run its writer is done with: its pages written, its buffer for the next.
     pub fn give_run(&mut self, run: Run) {
         self.give_buf(run.buf);
@@ -1826,6 +1864,11 @@ impl<F: BlockFile> Store<F> {
             } else {
                 cache.forget(address);
             }
+        }
+        if kind == Kind::Node
+            && let Some(kept) = self.keep.as_mut()
+        {
+            kept.keep(address, payload);
         }
         if run.pages == 0 {
             run.job_ordinal = self.job_ordinal;
@@ -1995,6 +2038,9 @@ impl<F: BlockFile> Store<F> {
         // A page just compacted can be read from memory while its run waits for the device.
         if let Some(c) = self.cache.as_mut() {
             c.insert(address, payload);
+        }
+        if let Some(kept) = self.keep.as_mut() {
+            kept.keep(address, payload);
         }
         if run.pages == 0 {
             run.job_ordinal = self.job_ordinal;

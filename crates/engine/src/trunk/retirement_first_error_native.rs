@@ -158,6 +158,7 @@ fn a_physical_job_failure_stays_first_after_native_worker_join_failure() {
             .unwrap(),
         file_end: store.end(),
         generation: store.generation(),
+        keep: None,
     });
     assert!(pool.send(job, Owner::Pack, true).unwrap().is_ok());
     let (answer, result) = mpsc::sync_channel(1);

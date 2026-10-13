@@ -86,6 +86,7 @@ fn packing(store: &mut Store<DeviceFile>, entries: u64) -> (Box<Job>, mpsc::Sync
             .unwrap(),
         file_end: store.end(),
         generation: store.generation(),
+        keep: None,
     });
     (job, full)
 }

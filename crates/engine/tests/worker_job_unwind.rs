@@ -207,6 +207,7 @@ fn packed(store: &mut Store<File>, key: &[u8], value: &[u8]) -> Box<Job> {
             .unwrap(),
         file_end: store.end(),
         generation: store.generation(),
+        keep: None,
     })
 }
 fn returned_branch(store: &mut Store<File>, pool: &mut Pool, job: Box<Job>) -> Branch {
@@ -283,6 +284,7 @@ fn an_active_job_read_panic_returns_after_retirement_and_preserves_retry_and_che
         grant,
         file_end: store.end(),
         generation: store.generation(),
+        keep: None,
     });
     assert!(pool.send(job, Owner::Trunk, true).unwrap().is_ok());
     assert!(

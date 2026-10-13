@@ -159,18 +159,17 @@ enum Call {
 }
 #[derive(Debug)]
 enum ResultOf {
-    Take(Result<Option<Back>, Error>),
+    Take(Box<Result<Option<Back>, Error>>),
     Buffer(Result<Option<Vec<u8>>, Error>),
     Any(Result<bool, Error>),
 }
 impl ResultOf {
     fn refused(&self) -> bool {
-        matches!(
-            self,
-            Self::Take(Err(Error::InvalidArgument { .. }))
-                | Self::Buffer(Err(Error::InvalidArgument { .. }))
-                | Self::Any(Err(Error::InvalidArgument { .. }))
-        )
+        match self {
+            Self::Take(r) => matches!(**r, Err(Error::InvalidArgument { .. })),
+            Self::Buffer(r) => matches!(r, Err(Error::InvalidArgument { .. })),
+            Self::Any(r) => matches!(r, Err(Error::InvalidArgument { .. })),
+        }
     }
 }
 
@@ -224,6 +223,7 @@ fn run(call: Call) {
             .unwrap(),
         file_end: store.end(),
         generation: store.generation(),
+        keep: None,
     });
     let ticket = pool.send(job, Owner::Pack, true).unwrap().unwrap();
     held.recv().unwrap(); // An actual worker write is now held before the runtime call.
@@ -237,7 +237,11 @@ fn run(call: Call) {
     rt.spawn_on(rt.shard_ids()[0], async move {
         attempted.try_send(()).unwrap();
         let result = match call {
-            Call::Take => ResultOf::Take(owned.pool.take(&mut owned.store, Owner::Pack, true)),
+            Call::Take => ResultOf::Take(Box::new(owned.pool.take(
+                &mut owned.store,
+                Owner::Pack,
+                true,
+            ))),
             Call::Buffer => ResultOf::Buffer(owned.pool.buffer(&mut owned.store, ticket, true)),
             Call::Any => ResultOf::Any(owned.pool.wait_any(&mut owned.store, std::iter::empty())),
         };
@@ -257,9 +261,16 @@ fn run(call: Call) {
         mut store,
     } = owned;
     let refused = result.refused();
-    let back = match result {
-        ResultOf::Take(Ok(Some(back))) => back,
-        _ => pool.take(&mut store, Owner::Pack, true).unwrap().unwrap(),
+    let taken = match result {
+        ResultOf::Take(r) => match *r {
+            Ok(Some(back)) => Some(back),
+            _ => None,
+        },
+        _ => None,
+    };
+    let back = match taken {
+        Some(back) => back,
+        None => pool.take(&mut store, Owner::Pack, true).unwrap().unwrap(),
     };
     assert!(back.physical_error.is_none());
     let output = back.result.unwrap();

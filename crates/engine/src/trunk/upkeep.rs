@@ -951,9 +951,13 @@ impl Trunk {
         let parts = match run {
             Running::Finished(parts) => parts,
             Running::Remote {
-                state: State::Done(out),
+                state: State::Done(mut out),
                 ..
             } => {
+                // The pages the job wrote, cached where they were written, with its branches.
+                if let Some(kept) = out.kept.take() {
+                    store.adopt_pages(kept);
+                }
                 store.grant_back(&out.unused)?;
                 store.extend_end(out.end);
                 // The worker timed its merge: a compacted key's cost, which consolidations are
@@ -1131,16 +1135,32 @@ impl Trunk {
                     continue;
                 };
                 grant.clone_from(&given);
+                // The cache's room for what it writes: at most its inputs' pages, as a merge
+                // writes no more entries than it reads.
+                let pages = task
+                    .inputs
+                    .iter()
+                    .map(|b| {
+                        b.counts
+                            .len()
+                            .saturating_add(usize::try_from(b.filter_pages).unwrap_or(usize::MAX))
+                    })
+                    .fold(0usize, usize::saturating_add);
                 let job = Box::new(pool::Job {
                     work: Work::Compact(*task),
                     grant: given,
                     file_end: store.end(),
                     generation: store.generation(),
+                    keep: store.lend_pages(pages),
                 });
                 let pool = self.pool.as_mut().ok_or(no_pool())?;
                 let sent = match pool.send(job, Owner::Trunk, admit) {
                     Ok(sent) => sent,
                     Err((error, job)) => {
+                        let job = *job;
+                        if let Some(kept) = job.keep {
+                            store.unlend_pages(kept);
+                        }
                         let Work::Compact(task) = job.work else {
                             return Err(corrupt());
                         };
@@ -1155,6 +1175,10 @@ impl Trunk {
                 match sent {
                     Ok(ticket) => *state = State::Out(ticket),
                     Err(job) => {
+                        let job = *job;
+                        if let Some(kept) = job.keep {
+                            store.unlend_pages(kept);
+                        }
                         let Work::Compact(task) = job.work else {
                             return Err(corrupt());
                         };
@@ -1205,12 +1229,16 @@ impl Trunk {
                         run: Running::Remote { grant, state },
                         ..
                     }),
-                    Ok(out),
+                    Ok(mut out),
                 ) => {
                     grant.extend_from_slice(&back.topped);
+                    out.kept = back.kept;
                     *state = State::Done(out);
                 }
                 (task, result) => {
+                    if let Some(kept) = back.kept {
+                        store.unlend_pages(kept);
+                    }
                     if let Some(NodeTask {
                         run: Running::Remote { grant, state },
                         ..
@@ -1249,6 +1277,9 @@ impl Trunk {
                 self.workers_waiting = true;
                 return Ok(());
             };
+            if let Some(kept) = back.kept {
+                store.unlend_pages(kept);
+            }
             for t in &mut self.tasks {
                 if let Running::Remote { grant, state } = &mut t.run
                     && matches!(state, State::Out(k) if *k == back.ticket)
@@ -1265,7 +1296,12 @@ impl Trunk {
         let mut kept = Vec::with_capacity(self.tasks.len());
         for t in std::mem::take(&mut self.tasks) {
             match t.run {
-                Running::Remote { grant, .. } => {
+                Running::Remote { grant, state } => {
+                    if let State::Done(out) = state
+                        && let Some(kept) = out.kept
+                    {
+                        store.unlend_pages(kept);
+                    }
                     for e in grant {
                         store.release(e)?;
                     }

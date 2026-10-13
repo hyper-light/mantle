@@ -96,6 +96,45 @@ struct Slot {
     len: usize,
 }
 
+/// Memory a cache lends a maintenance worker for the pages its job writes ([`Cache::lend`]):
+/// the worker keeps each page's payload in it as it queues the page ([`Kept::keep`]), a page at
+/// each step of the cache's page size, and the shard's cache takes it back filled, as a chunk of
+/// its own ([`Cache::adopt`]). A worker's pages are so cached where they were written, as a
+/// SplinterDB pack fills pages in its cache (clockcache.c `clockcache_alloc`), by handing the
+/// memory over and back. Its room is taken when lent, so keeping a page allocates nothing.
+#[derive(Debug)]
+pub struct Kept {
+    page: usize,
+    lent: usize,
+    buf: Vec<u8>,
+    pages: Vec<(u64, usize)>,
+}
+
+impl Kept {
+    /// Keeps `payload`, written at `address`, while the room lent holds a page more.
+    pub fn keep(&mut self, address: u64, payload: &[u8]) {
+        if payload.len() > self.page || self.pages.len() >= self.lent {
+            return;
+        }
+        let Some(end) = self.buf.len().checked_add(self.page) else {
+            return;
+        };
+        self.buf.extend_from_slice(payload);
+        self.buf.resize(end, 0);
+        self.pages.push((address, payload.len()));
+    }
+
+    /// The pages kept.
+    pub fn len(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// Whether no page was kept.
+    pub fn is_empty(&self) -> bool {
+        self.pages.is_empty()
+    }
+}
+
 /// A page cache of at most `limit` pages.
 #[derive(Debug)]
 pub struct Cache {
@@ -139,6 +178,8 @@ pub struct Cache {
     evict_steps_most: u64,
     /// Inserts left out because their bounded eviction freed no slot.
     skipped: u64,
+    /// Pages of room lent to workers and not yet taken back ([`Self::lend`]).
+    lent: usize,
 }
 
 impl Cache {
@@ -171,6 +212,7 @@ impl Cache {
             misses: 0,
             evict_steps_most: 0,
             skipped: 0,
+            lent: 0,
         }
     }
 
@@ -398,6 +440,111 @@ impl Cache {
         true
     }
 
+    /// Whether the machine has twice `bytes` free for the cache to take them (the gate a chunk
+    /// meets, §4.2); true when no reading is given. A refusal is counted.
+    fn machine_spares(&mut self, bytes: usize) -> bool {
+        let spares = self.available.is_none_or(|read| {
+            read().is_none_or(|free| {
+                u64::try_from(bytes)
+                    .ok()
+                    .and_then(|b| b.checked_mul(2))
+                    .is_some_and(|need| free >= need)
+            })
+        });
+        if !spares {
+            self.refused = self.refused.saturating_add(1);
+        }
+        spares
+    }
+
+    /// Room for up to `pages` pages a worker will write, as a [`Kept`] to fill: within the
+    /// limit, less the room the chunks and earlier loans hold, and while the machine has the
+    /// memory as a chunk of the cache's own needs it. None while a chunk retires.
+    pub fn lend(&mut self, pages: usize) -> Option<Kept> {
+        if self.retiring.is_some() {
+            return None;
+        }
+        let n = pages.min(
+            self.limit
+                .saturating_sub(self.room().saturating_add(self.lent)),
+        );
+        if n == 0 {
+            return None;
+        }
+        let bytes = n.checked_mul(self.page)?;
+        if !self.machine_spares(bytes) {
+            return None;
+        }
+        let mut buf = Vec::new();
+        let mut list = Vec::new();
+        if buf.try_reserve_exact(bytes).is_err() || list.try_reserve_exact(n).is_err() {
+            return None;
+        }
+        self.lent = self.lent.saturating_add(n);
+        Some(Kept {
+            page: self.page,
+            lent: n,
+            buf,
+            pages: list,
+        })
+    }
+
+    /// Takes back memory lent with the pages a worker kept in it, as a chunk of the cache's own:
+    /// its pages enter the queues as inserts do (the small queue, or main for an address the
+    /// ghost names), and pages past the limit are evicted by the rule an insert meets. A loan
+    /// back while a chunk retires, or with no page in it, is given up.
+    pub fn adopt(&mut self, kept: Kept) {
+        self.lent = self.lent.saturating_sub(kept.lent);
+        let Kept { buf, pages, .. } = kept;
+        let n = pages.len();
+        if n == 0
+            || self.retiring.is_some()
+            || self.slots.try_reserve(n).is_err()
+            || self.free.try_reserve(n).is_err()
+            || self.chunks.try_reserve(1).is_err()
+            || self.starts.try_reserve(1).is_err()
+            || self.sizes.try_reserve(1).is_err()
+        {
+            return;
+        }
+        let chunk = self.chunks.len();
+        self.starts.push(self.slots.len());
+        self.sizes.push(n);
+        self.chunks.push(buf);
+        let mut at = 0usize;
+        for (address, len) in pages {
+            self.forget(address);
+            let to_main = self.forget_ghost(address);
+            let queue = if to_main { Queue::Main } else { Queue::Small };
+            let i = self.slots.len();
+            self.slots.push(Slot {
+                address,
+                freq: 0,
+                queue,
+                live: true,
+                newer: None,
+                older: None,
+                chunk,
+                at,
+                len,
+            });
+            self.push(queue, i);
+            self.map
+                .insert(address, u64::try_from(i).unwrap_or(u64::MAX));
+            at = at.saturating_add(self.page);
+        }
+        for _ in 0..self.held().saturating_sub(self.limit) {
+            if !self.evict(EVICT_STEPS) {
+                break;
+            }
+        }
+    }
+
+    /// Takes back a loan its job did not fill: a job abandoned, or ended in error.
+    pub fn unlend(&mut self, kept: Kept) {
+        self.lent = self.lent.saturating_sub(kept.lent);
+    }
+
     /// Takes a new chunk by the module's rule, with room in the slot and free lists for its
     /// pages, so making them reallocates nothing. False when the limit has no room left or the
     /// memory refuses it.
@@ -413,15 +560,7 @@ impl Cache {
         };
         // The machine keeps a chunk's room free after the cache takes one: what a tuning step
         // moves, so the next step finds memory to move. No reading sets no bound.
-        if let Some(read) = self.available
-            && read().is_some_and(|free| {
-                u64::try_from(bytes)
-                    .ok()
-                    .and_then(|b| b.checked_mul(2))
-                    .is_none_or(|need| free < need)
-            })
-        {
-            self.refused = self.refused.saturating_add(1);
+        if !self.machine_spares(bytes) {
             return false;
         }
         let mut chunk = Vec::new();
@@ -807,6 +946,88 @@ mod tests {
 
     fn page(a: u64) -> Vec<u8> {
         format!("page {a}").into_bytes()
+    }
+
+    #[test]
+    fn a_worker_s_pages_come_back_cached_in_the_memory_lent() {
+        let mut c = Cache::new(8, 16);
+        let mut k = c.lend(4).unwrap();
+        for a in 0..3u64 {
+            k.keep(100 + a, &page(a));
+        }
+        assert_eq!(k.len(), 3);
+        c.adopt(k);
+        let mut out = Vec::new();
+        for a in 0..3u64 {
+            out.clear();
+            assert!(c.get(100 + a, &mut out));
+            assert_eq!(out, page(a));
+        }
+        assert_eq!(c.bytes(), 3 * 16);
+        assert_eq!(c.lent, 0);
+    }
+
+    #[test]
+    fn a_loan_holds_its_room_until_it_comes_back() {
+        let mut c = Cache::new(8, 16);
+        let a = c.lend(6).unwrap();
+        let b = c.lend(6).unwrap();
+        assert_eq!((a.lent, b.lent), (6, 2));
+        assert!(c.lend(1).is_none());
+        c.unlend(a);
+        assert_eq!(c.lend(9).unwrap().lent, 6);
+    }
+
+    #[test]
+    fn keeping_stops_at_the_room_lent_and_skips_what_a_slot_cannot_hold() {
+        let mut c = Cache::new(8, 16);
+        let mut k = c.lend(2).unwrap();
+        k.keep(1, &[7; 17]);
+        for a in 2..6u64 {
+            k.keep(a, &page(a));
+        }
+        assert_eq!(k.len(), 2);
+        assert_eq!(k.buf.capacity(), 2 * 16);
+        c.adopt(k);
+        let mut out = Vec::new();
+        assert!(!c.get(1, &mut out));
+        assert!(c.get(2, &mut out) && c.get(3, &mut out));
+        assert!(!c.get(4, &mut out));
+    }
+
+    #[test]
+    fn adopted_pages_past_a_lowered_limit_are_evicted_and_a_kept_address_replaces_the_cached() {
+        let mut c = Cache::new(8, 16);
+        c.insert(1, b"old");
+        let mut k = c.lend(4).unwrap();
+        for a in 1..5u64 {
+            k.keep(a, &page(a));
+        }
+        c.resize(3);
+        c.adopt(k);
+        assert!(c.held() <= 3);
+        let mut out = Vec::new();
+        if c.get(1, &mut out) {
+            assert_eq!(out, page(1));
+        }
+    }
+
+    #[test]
+    fn nothing_is_lent_while_a_chunk_retires() {
+        let mut c = warm(1000, 64);
+        for a in 0..1000u64 {
+            c.insert(a, &page(a));
+        }
+        c.resize(500);
+        // A step a call: the last chunk's retirement begins once the pages are within the limit.
+        for _ in 0..2000 {
+            if c.retiring.is_some() {
+                break;
+            }
+            c.trim(1);
+        }
+        assert!(c.retiring.is_some());
+        assert!(c.lend(1).is_none());
     }
 
     /// A cache whose slots are all made, as idle time leaves one its reads have filled.

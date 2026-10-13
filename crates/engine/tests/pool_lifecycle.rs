@@ -201,6 +201,7 @@ fn job(store: &mut Store<File>, number: u8) -> Box<Job> {
             .unwrap(),
         file_end: store.end(),
         generation: store.generation(),
+        keep: None,
     })
 }
 fn take(store: &mut Store<File>, back: Back) -> u8 {

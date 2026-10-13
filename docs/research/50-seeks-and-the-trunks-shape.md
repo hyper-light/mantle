@@ -15,6 +15,10 @@ Sources. Measured on this Mac (APFS, the internal SSD) on 2026-10-12/13 under th
 - **[rocks]** `benchmark-results/mantle-gate1b-20261012/n1000000000-r1-rocks18`: RocksDB 11.8.1,
   18 background jobs, the same keys, values, seed, memtable and cache, `waitforcompaction` before
   its queries.
+- **[cache]** `benchmark-results/mantle-arms-20261013`: the arms, and the cache's variants with
+  256 MiB and 32 GiB of cache beside RocksDB with both (§9).
+- **[contig]** `benchmark-results/mantle-contig-20261013`: the price-fixed arm, the layout's steps
+  and the gate at 1M, 10M, 100M and 1B, each beside RocksDB sized as it is (§10 to §12).
 - **[src]** SplinterDB at `vmware/splinterdb@938676b`, `src/trunk.c` (the commit research/34
   cites): `leaf_might_need_to_split`, `leaf_split_target_num_leaves`, `leaf_split`,
   `leaf_split_init`, `trunk_node_receive_bundles`, `bundle_compaction_create`,
@@ -128,3 +132,113 @@ against it, with consolidation off as a control and RocksDB beside, at 10M, 100M
 - **stbe**: SplinterDB's rules: the fullest pivot of a node that has received data flushes past
   `m` entries, and a leaf settles by size only past `m · F`, by branches into one leaf.
 - **stbe + local**.
+
+## 8. How fast a consolidation runs
+
+At 1B the seek phase's consolidations merged for 116 s of worker time over the 405 s phase
+[instr]: 0.29 workers busy on average, on a host with 18 cores. The pool admits a job past its
+measured need only when the shard waits on it (`Trunk::admit`: a pending branch, a root without
+room, a step that waits); otherwise it admits as many as the last period kept busy, `busy /
+period` by Little's law (`pool.rs`). A consolidation starts a period (`start_consolidation` calls
+`period_started`) after a seek phase that kept no worker busy, so its need measures 1, and a
+consolidation run one job at a time measures 1 again: the cap measures itself. Little's law sizes
+a pool to a steady arrival of work; a consolidation is one batch, every seek pays rent until it is
+done, and SILK gives such deeper work the cores the foreground leaves (research/34 §5).
+- **fastcons**: a consolidation in progress admits its jobs within the cores, as a waiting shard
+  does.
+- **popenfast**: popen and fastcons together.
+
+## 9. A cache sized to the machine
+
+Sources. **[cache]** `benchmark-results/mantle-arms-20261013`: `stbelocalfast` (seek-stbelocalfast
+58a836b), `slfc` (9542868: the cache in chunks made as reads want slots), `slfzc` (slfc with the
+cursor reading leaves in place in the cache), `slfm` (73ac148: the shard's memory sized from the
+machine, `--machine-memory`); each with 256 MiB of cache and with 32 GiB (`…big`), RocksDB 11.8.1
+beside with both; 10M three to six rounds, 100M one to four.
+
+The cache reserved its slots up to its limit as reads came. With 32 GiB at 10M the gets made 7.74
+allocations, 31.7 KB of allocation and 1.97 page faults each, and ran at 292 K/s against 678 K/s
+with 256 MiB: a larger cache was slower. The cache now takes memory in chunks as reads want slots,
+each chunk at most `TUNE_STEP_PERCENT` of the limit (the memory tuner's step, Luo & Carey, PVLDB
+2021 §5.4), a read with no free slot making its own, and a chunk only while the machine has twice
+its bytes free; a lowered limit gives back whole chunks, the last first.
+
+| 10M | gets/s | allocations a get | faults a get | seeks/s |
+|---|---|---|---|---|
+| reserved to the limit, 32 GiB | 292 K | 7.74 | 1.97 | 211 K |
+| chunks, 32 GiB | 771 K | 0.00 | 0.06 | 222 K |
+| chunks, leaves read in place, 32 GiB | 801 K | 0.00 | 0.06 | 231 K |
+| RocksDB, 32 GiB | 326 K | | | 172 K |
+
+Sized to the machine (`ShardDb::follow_machine`: the machine's effective capacity and the memory
+available now, from hyper-rt's facts, research/36's tuner over it): at 10M 2.35 M puts/s, 685 K
+gets/s and 209 K seeks/s; at 100M (one round) 2.09 M, 412 K and 84 K against RocksDB with 32 GiB's
+989 K, 244 K and 73 K. A 100M run with 32 GiB fixed, no machine gate, filled at 1.07 M with one
+put of 1.1 s; not explained.
+
+## 10. A consolidation's price, in the seeks' units
+
+Seeks pay a pivot rent in wall time, the nanoseconds their extra sources cost them, and the
+pivot's consolidation is bought once the rent covers its price (§3). The price was its merging's
+CPU time on one core. The merging runs on the maintenance workers idle when it is bought, beside
+the seeks, so what it costs them is that work spread over those workers: compared with a
+wall-time rent, a CPU-time price overcharged every consolidation by the idle workers' count. At
+10M, 1M seeks over 8 leaves of two branches each bought none. The price is now the merging over
+the idle workers (`wall_price`, `Pool::idle`).
+
+**[contig]** `benchmark-results/mantle-contig-20261013`, one interleaved pass (10M three rounds,
+100M two, the host as it was), each arm sized to the machine: `slft` (seek-stbelocalfast 0d703db,
+the control) and `slfp` (the same with the price fixed, seek-slfp 8658da5), RocksDB with 256 MiB
+and 32 GiB beside:
+
+| keys | arm | puts/s | gets/s | seeks/s | sources a seek | rewritten during the seeks |
+|---|---|---|---|---|---|---|
+| 10M | control | 2.06 M | 611 K | 193 K | 2.96 | 2.8 M |
+| 10M | price fixed | 1.91 M | 640 K | 282 K | 1.36 | 9.1 M |
+| 10M | RocksDB 256 MiB / 32 GiB | 785 K / 871 K | 266 K / 295 K | 97 K / 151 K | | |
+| 100M | control | 1.36 M | 311 K | 60 K | 6.56 | 14.6 M |
+| 100M | price fixed | 1.75 M | 378 K | 110 K | 2.07 | 91.0 M |
+| 100M | RocksDB 256 MiB / 32 GiB | 762 K / 773 K | 204 K / 200 K | 74 K / 65 K | | |
+
+Seeks rose 1.46× at 10M and 1.82× at 100M; what they bought was rewritten during their own phase.
+The fills run the same code in both arms: their spread, 1.27 M to 2.02 M puts/s across the
+control's 100M rounds, is the host's.
+
+## 11. A layout contiguous by key: buffers bounded by size, flushes that carry
+
+Index pivots flush past `fanout` branches whatever those hold, so at 100M a third of the entries
+sit in index buffers after the fill (§2), and a seek opens a source in each level it passes. Two
+changes were measured against it [contig]:
+
+- **Index pivots flushed past a memtable's entries** (`contig1`, seek-contig bd8804b, on the fill's
+  own path; SplinterDB's fullest-child flush past one incorporation, §4): at 10M the entries above
+  the leaves fell from 41% to 7% and gets rose 9%, but seeks fell 5%: the runs moved into the
+  leaves rather than merging, 1.88 branches a leaf against 1.25, and each put wrote 1.72 entries
+  against 1.47. At 100M the fill fell to 0.81× (1.64 M against 2.02 M puts/s, one put 1.5 s) and
+  seeks to 0.82×: flushes for size set off compactions the fill's maintenance waited behind.
+- **The same in idle time only** (`contig3`, seek-contig 472667e: `Trunk::balance_step`, owed once
+  nothing else is): the fill matched the price-fixed arm's (10M 1.97 M against 1.91 M, 100M
+  1.73 M against 1.75 M), gets at 10M too (646 K against 640 K), but at 100M gets fell to 0.75×
+  (284 K against 378 K) and seeks to 0.90× (99 K against 110 K). Its gets ran fewer instructions
+  (16.0 K against 17.5 K a get) in more cycles (14.2 K against 11.1 K), with more kernel time
+  (1.19 µs against 0.90 µs) and a longer tail (p99.99 160 µs against 36 µs), the page reads the
+  same (0.57 a get). Not kept.
+- **A full pivot carries its live in-flight branches down** (seek-slfpc a94d32b, on the
+  price-fixed arm): a pivot holding `fanout` branches compacted each in-flight arrival into the
+  branch that filled it, and the flush that followed carried that branch down to be merged again;
+  such a pivot now flushes at once, the in-flight branches uncompacted and named by both nodes'
+  lists until each lets them go (SplinterDB flushes a pivot whose eventual branch count passes F,
+  `restore_balance_index` [src]). Where nothing else flushes full pivots (`contig3`), such merging
+  was 0% of the pivots' merging at 10M and 9 to 11% at 100M (`passthrough_entries`). On the
+  price-fixed arm, whose fullest-pivot flush (§4) empties pivots first, the carry took 36 to 87
+  branches a 100M fill, the entries written fell 0.3% (3.34 against 3.35 a put), and the fill,
+  gets and seeks were within the host's spread (1.66 M against 1.59 M puts/s, 327 K against 326 K
+  gets/s, 91.7 K against 92.4 K seeks/s, three rounds each). Not kept.
+
+Merging data once, at the leaf, is not open to a Bε-tree: a buffer's merge at each level is what
+lets one leaf rewrite absorb many arrivals (Brodal and Fagerberg, "Lower bounds for external
+memory dictionaries", SODA 2003; Bender et al., "An introduction to Bε-trees and
+write-optimization", ;login: 40(5), 2015). Carried uncompacted to where they rest, in-flight
+branches would either stay as sources at every pivot until enough of a pivot's range arrived, or
+reach the leaves in small batches that rewrite each leaf more often. The merge a carry can skip
+is the one before a flush, and a pivot reaches it only when nothing else flushes it first.

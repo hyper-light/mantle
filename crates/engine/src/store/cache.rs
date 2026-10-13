@@ -15,11 +15,11 @@
 //! times; it holds at most one tuning step of the limit (`TUNE_STEP_PERCENT`, Luo and Carey, PVLDB
 //! 2021 §5.4), so a step that lowers the limit gives back whole chunks, and at most what the limit
 //! has left. A chunk's pages become slots in idle time (`reserve`), each written once as it is
-//! made, and only as many as the reads since the last such time asked for: a read never
-//! allocates or touches memory for the first time, and the cache takes the memory its reads use,
-//! not its limit (measured: reserving the whole limit ahead took 38.7 GB, 7.9 M allocations, for a
-//! 10M-key store of 2.3 GB, and halved its gets; research/50 §9). A read that finds no slot made
-//! leaves its page out, as an insert past its eviction bound does. Resizing sets the page limit;
+//! made, as many as the reads since the last such time asked for; a read that finds none makes
+//! its own (`make_now`), and leaves its page out only at the limit or while a chunk retires. The
+//! cache takes the memory its reads use, not its limit (measured: reserving up to a 32 GiB limit
+//! as reads came made 7.74 allocations and 31.7 KB of allocation a get over a 10M-key store, and
+//! more than halved its gets; research/50 §9). Resizing sets the page limit;
 //! a cache above it is brought down a few pages an operation (`trim`) by the rule above, and the
 //! chunks above it are given back the last first, its pages dropped. A freed slot is the next
 //! page's, so a warm cache allocates nothing. The index and the ghost grow a few buckets a write

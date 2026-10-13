@@ -168,12 +168,94 @@ impl Bundle {
     }
 }
 
+/// A branch in nodes' in-flight lists, and the lists naming it.
+#[derive(Debug)]
+struct Flight {
+    branch: Branch,
+    holders: u32,
+}
+
+/// The in-flight lists' branches, each kept once however many lists name it. A flush carries
+/// its pivot's live in-flight branches down uncompacted, naming them in the child's list beside
+/// its own, so they are merged once, where they stop (SplinterDB's flush-then-compact, trunk.c
+/// `flush_then_compact`); a branch's extents go back once the last list naming it lets it go.
+/// Its slots are reused: it holds at most the in-flight branches live at once, which each
+/// node's pivots' compactions bound ([`Trunk::has_room`]).
+#[derive(Debug, Default)]
+struct Flights {
+    slots: Vec<Option<Flight>>,
+    free: Vec<usize>,
+}
+
+impl Flights {
+    /// Holds `branch` for one list: its place.
+    fn add(&mut self, branch: Branch) -> usize {
+        let flight = Flight { branch, holders: 1 };
+        if let Some(at) = self.free.pop()
+            && let Some(slot) = self.slots.get_mut(at)
+        {
+            *slot = Some(flight);
+            return at;
+        }
+        self.slots.push(Some(flight));
+        self.slots.len().saturating_sub(1)
+    }
+
+    fn branch(&self, at: usize) -> Option<&Branch> {
+        self.slots.get(at)?.as_ref().map(|f| &f.branch)
+    }
+
+    fn branch_mut(&mut self, at: usize) -> Option<&mut Branch> {
+        self.slots.get_mut(at)?.as_mut().map(|f| &mut f.branch)
+    }
+
+    /// The branches `places` name, newest first (the order a merge takes), once each is held.
+    fn newest_first<'a>(
+        &'a self,
+        places: &'a [usize],
+    ) -> Result<impl Iterator<Item = &'a Branch> + Clone + 'a, Error> {
+        if places.iter().any(|&at| self.branch(at).is_none()) {
+            return Err(corrupt());
+        }
+        Ok(places.iter().rev().filter_map(|&at| self.branch(at)))
+    }
+
+    /// Another list names the branch at `at`.
+    fn hold(&mut self, at: usize) -> Result<(), Error> {
+        let flight = self
+            .slots
+            .get_mut(at)
+            .and_then(Option::as_mut)
+            .ok_or(corrupt())?;
+        flight.holders = flight.holders.checked_add(1).ok_or(corrupt())?;
+        Ok(())
+    }
+
+    /// A list lets the branch at `at` go: the branch, once no list names it.
+    fn let_go(&mut self, at: usize) -> Result<Option<Branch>, Error> {
+        let slot = self.slots.get_mut(at).ok_or(corrupt())?;
+        let flight = slot.as_mut().ok_or(corrupt())?;
+        flight.holders = flight.holders.checked_sub(1).ok_or(corrupt())?;
+        if flight.holders > 0 {
+            return Ok(None);
+        }
+        let gone = slot.take().map(|f| f.branch);
+        self.free.push(at);
+        Ok(gone)
+    }
+
+    /// Every branch held, once.
+    fn live(&self) -> impl Iterator<Item = &Branch> {
+        self.slots.iter().flatten().map(|f| &f.branch)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Node {
     leaf: bool,
     pivots: Vec<Pivot>,
-    /// Oldest first.
-    inflight: Vec<Vec<Branch>>,
+    /// Oldest first: the in-flight branches' places in [`Trunk::flights`].
+    inflight: Vec<usize>,
     /// The keys below this, if any bound them: the next node's first pivot.
     end: Option<Vec<u8>>,
     /// The settle or split this node waits to take ([`upkeep::Change`]).
@@ -215,6 +297,8 @@ pub struct TrunkStats {
     pub leaf_compactions: u64,
     /// Pivot bundles flushed to a child.
     pub flushes: u64,
+    /// In-flight branches flushes carried down uncompacted, to be merged where they stop.
+    pub carried: u64,
     /// Nodes made by splits, leaves and index nodes.
     pub splits: u64,
     /// Entries written into branches by compactions.
@@ -285,6 +369,8 @@ fn ns_since(t: Option<std::time::Instant>) -> u64 {
 #[derive(Debug)]
 pub struct Trunk {
     nodes: Vec<Node>,
+    /// The branches the nodes' in-flight lists name.
+    flights: Flights,
     root: usize,
     config: TrunkConfig,
     /// The extents of the last saved image, released when the next one is saved.
@@ -518,6 +604,7 @@ impl Trunk {
                 queued: false,
                 received: false,
             }],
+            flights: Flights::default(),
             root: 0,
             config,
             saved: Vec::new(),
@@ -607,39 +694,38 @@ impl Trunk {
                 return Ok(Some(op));
             }
         }
-        let mut at = self.root;
+        let Self {
+            nodes,
+            flights,
+            root,
+            ..
+        } = self;
+        let mut at = *root;
         // Every level down is a node's child: at most the trunk's node count of steps.
-        for _ in 0..self.nodes.len() {
-            let node = self.nodes.get_mut(at).ok_or(corrupt())?;
+        for _ in 0..nodes.len() {
+            let node = nodes.get_mut(at).ok_or(corrupt())?;
             let p = Self::pivot_of(node, key);
             let Node {
                 pivots, inflight, ..
             } = node;
             let pivot = pivots.get_mut(p).ok_or(corrupt())?;
+            let live = inflight.get(pivot.start..).unwrap_or_default();
             // Every candidate's filter block read first, their misses overlapping; the probes in
             // order then find them cached.
             let mut touched = 0u64;
-            for b in inflight
-                .get(pivot.start..)
-                .unwrap_or_default()
+            for b in live
                 .iter()
-                .flatten()
+                .filter_map(|&f| flights.branch(f))
                 .chain(pivot.bundle.branches.iter())
             {
                 touched ^= b.filter.touch(hash);
             }
             std::hint::black_box(touched);
-            for bundle in inflight
-                .get_mut(pivot.start..)
-                .unwrap_or_default()
-                .iter_mut()
-                .rev()
-            {
-                for b in bundle.iter_mut() {
-                    b.probes = b.probes.saturating_add(1);
-                    if let Some(op) = b.get_hashed_async(store, key, hash, value).await? {
-                        return Ok(Some(op));
-                    }
+            for &f in live.iter().rev() {
+                let b = flights.branch_mut(f).ok_or(corrupt())?;
+                b.probes = b.probes.saturating_add(1);
+                if let Some(op) = b.get_hashed_async(store, key, hash, value).await? {
+                    return Ok(Some(op));
                 }
             }
             for b in pivot.bundle.branches.iter_mut() {
@@ -671,39 +757,38 @@ impl Trunk {
                 return Ok(Some(op));
             }
         }
-        let mut at = self.root;
+        let Self {
+            nodes,
+            flights,
+            root,
+            ..
+        } = self;
+        let mut at = *root;
         // Every level down is a node's child: at most the trunk's node count of steps.
-        for _ in 0..self.nodes.len() {
-            let node = self.nodes.get_mut(at).ok_or(corrupt())?;
+        for _ in 0..nodes.len() {
+            let node = nodes.get_mut(at).ok_or(corrupt())?;
             let p = Self::pivot_of(node, key);
             let Node {
                 pivots, inflight, ..
             } = node;
             let pivot = pivots.get_mut(p).ok_or(corrupt())?;
+            let live = inflight.get(pivot.start..).unwrap_or_default();
             // Every candidate's filter block read first, their misses overlapping; the probes in
             // order then find them cached.
             let mut touched = 0u64;
-            for b in inflight
-                .get(pivot.start..)
-                .unwrap_or_default()
+            for b in live
                 .iter()
-                .flatten()
+                .filter_map(|&f| flights.branch(f))
                 .chain(pivot.bundle.branches.iter())
             {
                 touched ^= b.filter.touch(hash);
             }
             std::hint::black_box(touched);
-            for bundle in inflight
-                .get_mut(pivot.start..)
-                .unwrap_or_default()
-                .iter_mut()
-                .rev()
-            {
-                for b in bundle.iter_mut() {
-                    b.probes = b.probes.saturating_add(1);
-                    if let Some(op) = b.get_hashed(store, key, hash, value)? {
-                        return Ok(Some(op));
-                    }
+            for &f in live.iter().rev() {
+                let b = flights.branch_mut(f).ok_or(corrupt())?;
+                b.probes = b.probes.saturating_add(1);
+                if let Some(op) = b.get_hashed(store, key, hash, value)? {
+                    return Ok(Some(op));
                 }
             }
             for b in pivot.bundle.branches.iter_mut() {
@@ -734,8 +819,8 @@ impl Trunk {
             live.push((b.count.max(1) as f64, bits as f64, b.probes as f64 / gets));
         };
         self.pending.iter().for_each(&mut add);
+        self.flights.live().for_each(&mut add);
         for node in &self.nodes {
-            node.inflight.iter().flatten().for_each(&mut add);
             node.pivots
                 .iter()
                 .flat_map(|p| p.bundle.branches())
@@ -834,8 +919,8 @@ impl Trunk {
                 });
             }
             let before = sources.len();
-            for bundle in node.inflight.get(pivot.start..).unwrap_or(&[]).iter().rev() {
-                sources.extend(bundle.iter().map(Source::Branch));
+            for &f in node.inflight.get(pivot.start..).unwrap_or(&[]).iter().rev() {
+                sources.push(Source::Branch(self.flights.branch(f).ok_or(corrupt())?));
             }
             // The pivot's bundle, a branch a source.
             sources.extend(pivot.bundle.branches().iter().map(Source::Branch));
@@ -956,7 +1041,7 @@ impl Trunk {
                 .bundle
                 .branches()
                 .iter()
-                .chain(inflight.iter().flatten()),
+                .chain(inflight.iter().filter_map(|&f| self.flights.branch(f))),
             extent_pages,
         )
     }
@@ -1832,6 +1917,7 @@ impl Trunk {
         }
         Ok(Self {
             nodes,
+            flights: Flights::default(),
             root,
             config: TrunkConfig {
                 fanout,
@@ -1895,14 +1981,14 @@ impl Trunk {
         if dead == 0 {
             return Ok(());
         }
-        let gone: Vec<Vec<Branch>> = node.inflight.drain(..dead).collect();
+        let gone: Vec<usize> = node.inflight.drain(..dead).collect();
         for p in &mut node.pivots {
             p.start = p.start.saturating_sub(dead);
         }
         self.shift_tasks(n, dead);
-        for bundle in gone {
-            for b in &bundle {
-                release(store, b)?;
+        for f in gone {
+            if let Some(b) = self.flights.let_go(f)? {
+                release(store, &b)?;
             }
         }
         Ok(())
@@ -2053,8 +2139,8 @@ impl Trunk {
             m.ranges = m.ranges.saturating_add(b.range.bytes());
         };
         self.pending.iter().for_each(&mut add);
+        self.flights.live().for_each(&mut add);
         for n in &self.nodes {
-            n.inflight.iter().flatten().for_each(&mut add);
             for p in &n.pivots {
                 p.bundle.branches().iter().for_each(&mut add);
             }
@@ -2142,11 +2228,11 @@ impl Trunk {
                     queue.push_back((c, depth.saturating_add(1)));
                 }
             }
-            for bundle in &node.inflight {
-                level.inflight = level
-                    .inflight
-                    .saturating_add(u64::try_from(bundle.len()).unwrap_or(u64::MAX));
-                level.entries = level.entries.saturating_add(entries_of(bundle));
+            for &f in &node.inflight {
+                level.inflight = level.inflight.saturating_add(1);
+                level.entries = level
+                    .entries
+                    .saturating_add(self.flights.branch(f).map_or(0, |b| b.count));
             }
         }
         levels
@@ -2160,10 +2246,8 @@ impl Trunk {
     /// The trunk's branches, for checks: every branch a node names, each naming once.
     pub fn branches(&self) -> Vec<Branch> {
         let mut out = self.pending.clone();
+        out.extend(self.flights.live().cloned());
         for node in &self.nodes {
-            for bundle in &node.inflight {
-                out.extend(bundle.iter().cloned());
-            }
             for p in &node.pivots {
                 out.extend(p.bundle.branches().iter().cloned());
             }

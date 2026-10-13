@@ -140,6 +140,8 @@ pub struct IoStats {
     pub cache_bytes: u64,
     pub cache_limit_pages: u64,
     pub cache_refused: u64,
+    /// Where the page cache's memory is, and what its loans held.
+    pub cache_memory: cache::Memory,
     /// What those reads asked the OS: probes made, reads made on a probe's kept answer instead,
     /// epochs read and changed, and in shadow mode the kept answers found wrong (hyper-block
     /// `resident`; docs/research/46-reclaim-epochs.md).
@@ -1028,6 +1030,10 @@ impl<F: BlockFile> Store<F> {
                 .cache
                 .as_ref()
                 .map_or(0, cache::Cache::evict_steps_most),
+            cache_memory: self
+                .cache
+                .as_ref()
+                .map_or_else(cache::Memory::default, cache::Cache::memory),
             buffers_out: u64::try_from(self.lent).unwrap_or(u64::MAX),
             residency: self.residency(),
             ..self.io

@@ -112,6 +112,8 @@ pub struct Kept {
     /// The buffer the next page goes in.
     at: usize,
     pages: Vec<(u64, usize)>,
+    /// Pages written that the room lent could not hold.
+    missed: usize,
 }
 
 /// One buffer of a loan: a chunk's memory lent again, or fresh.
@@ -125,21 +127,21 @@ impl Kept {
     /// Keeps `payload`, written at `address`, while the room lent holds a page more: each buffer
     /// filled in turn, within the capacity it was lent with.
     pub fn keep(&mut self, address: u64, payload: &[u8]) {
-        if payload.len() > self.page {
-            return;
-        }
-        while let Some(l) = self.bufs.get_mut(self.at) {
-            let Some(end) = l.buf.len().checked_add(self.page) else {
-                return;
-            };
-            if end <= l.buf.capacity() {
-                l.buf.extend_from_slice(payload);
-                l.buf.resize(end, 0);
-                self.pages.push((address, payload.len()));
-                return;
+        if payload.len() <= self.page {
+            while let Some(l) = self.bufs.get_mut(self.at) {
+                let Some(end) = l.buf.len().checked_add(self.page) else {
+                    break;
+                };
+                if end <= l.buf.capacity() {
+                    l.buf.extend_from_slice(payload);
+                    l.buf.resize(end, 0);
+                    self.pages.push((address, payload.len()));
+                    return;
+                }
+                self.at = self.at.saturating_add(1);
             }
-            self.at = self.at.saturating_add(1);
         }
+        self.missed = self.missed.saturating_add(1);
     }
 
     /// The pages kept.
@@ -222,6 +224,34 @@ pub struct Cache {
     /// again): the memory the cache holds ([`Self::bytes`]).
     made: usize,
     loaned: usize,
+    /// Loans made, the pages of room they held, and of the pages their workers wrote, those the
+    /// cache took back and those the room could not hold ([`Memory`]).
+    loans: u64,
+    loan_room: u64,
+    loan_kept: u64,
+    loan_missed: u64,
+}
+
+/// Where a cache's memory is, in pages, and what its loans held ([`Cache::memory`]): what
+/// sizes a loan (research/50 §13).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Memory {
+    /// Pages cached.
+    pub live: u64,
+    /// Slots made for reads that hold no page.
+    pub free: u64,
+    /// Slots of loans' chunks that hold no page while others of their chunk do.
+    pub dead: u64,
+    /// Loans' chunks none of whose pages is cached, kept for the next loan.
+    pub spare: u64,
+    /// Out on loan: chunks lent again, and fresh room (not yet in [`Cache::bytes`]).
+    pub lent: u64,
+    /// Loans made, the pages of room they held, and of the pages their workers wrote, those
+    /// taken back cached and those the room could not hold.
+    pub loans: u64,
+    pub loan_room: u64,
+    pub loan_kept: u64,
+    pub loan_missed: u64,
 }
 
 impl Cache {
@@ -259,6 +289,10 @@ impl Cache {
             spares: Vec::new(),
             made: 0,
             loaned: 0,
+            loans: 0,
+            loan_room: 0,
+            loan_kept: 0,
+            loan_missed: 0,
         }
     }
 
@@ -574,12 +608,17 @@ impl Cache {
             .filter(|l| l.chunk.is_none())
             .map(|l| l.buf.capacity().checked_div(self.page).unwrap_or(0))
             .sum::<usize>();
+        self.loans = self.loans.saturating_add(1);
+        self.loan_room = self
+            .loan_room
+            .saturating_add(u64::try_from(room).unwrap_or(u64::MAX));
         Some(Kept {
             page: self.page,
             fresh,
             bufs,
             at: 0,
             pages: list,
+            missed: 0,
         })
     }
 
@@ -604,8 +643,15 @@ impl Cache {
     /// buffer with no page in it is spare again; a loan back while a chunk retires is given up.
     pub fn adopt(&mut self, kept: Kept) {
         let Kept {
-            fresh, bufs, pages, ..
+            fresh,
+            bufs,
+            pages,
+            missed,
+            ..
         } = kept;
+        self.loan_missed = self
+            .loan_missed
+            .saturating_add(u64::try_from(missed).unwrap_or(u64::MAX));
         if self.retiring.is_some() {
             self.give_back(bufs, fresh);
             return;
@@ -685,6 +731,9 @@ impl Cache {
                     .insert(address, u64::try_from(i).unwrap_or(u64::MAX));
                 live = live.saturating_add(1);
             }
+            self.loan_kept = self
+                .loan_kept
+                .saturating_add(u64::try_from(live).unwrap_or(u64::MAX));
             if let Some(h) = self.held.get_mut(c) {
                 *h = if live == 0 {
                     self.spares.push(c);
@@ -1159,6 +1208,35 @@ impl Cache {
             .saturating_add(self.loaned)
             .saturating_mul(self.page)
     }
+
+    /// Where the memory is: a walk of the chunks, for reports.
+    pub fn memory(&self) -> Memory {
+        let pages = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+        let live = self.small_live.saturating_add(self.main_live);
+        let (mut kept, mut dead, mut spare, mut lent) = (0usize, 0usize, 0usize, self.lent);
+        for (h, &size) in self.held.iter().zip(&self.sizes) {
+            match *h {
+                Held::Kept(l) => {
+                    kept = kept.saturating_add(l);
+                    dead = dead.saturating_add(size.saturating_sub(l));
+                }
+                Held::Spare => spare = spare.saturating_add(size),
+                Held::Lent => lent = lent.saturating_add(size),
+                Held::Grown | Held::Hollow => {}
+            }
+        }
+        Memory {
+            live: pages(live),
+            free: pages(self.made.saturating_sub(live.saturating_sub(kept))),
+            dead: pages(dead),
+            spare: pages(spare),
+            lent: pages(lent),
+            loans: self.loans,
+            loan_room: self.loan_room,
+            loan_kept: self.loan_kept,
+            loan_missed: self.loan_missed,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1189,6 +1267,45 @@ mod tests {
         // The memory held is the room lent, four pages, one of them empty.
         assert_eq!(c.bytes(), 4 * 16);
         assert_eq!(c.lent, 0);
+    }
+
+    #[test]
+    fn memory_names_where_the_pages_are_and_what_the_loans_held() {
+        let mut c = Cache::new(64, 16);
+        for a in 100..103u64 {
+            c.insert(a, &page(a));
+        }
+        let mut k = c.lend(4).unwrap();
+        for a in 0..6u64 {
+            k.keep(a, &page(a));
+        }
+        c.adopt(k);
+        let m = c.memory();
+        assert_eq!(
+            (m.loans, m.loan_room, m.loan_kept, m.loan_missed),
+            (1, 4, 4, 2)
+        );
+        assert_eq!((m.live, m.dead, m.spare, m.lent), (7, 0, 0, 0));
+        // Every page of memory is named once: made slots, live or free, and the loan's chunk.
+        let named = |m: Memory| m.live + m.free + m.dead + m.spare + m.lent;
+        assert_eq!(named(m), c.bytes() as u64 / 16);
+        c.forget(0);
+        let m = c.memory();
+        assert_eq!((m.live, m.dead), (6, 1));
+        assert_eq!(named(m), c.bytes() as u64 / 16);
+        for a in 1..4u64 {
+            c.forget(a);
+        }
+        let m = c.memory();
+        assert_eq!((m.live, m.dead, m.spare), (3, 0, 4));
+        assert_eq!(named(m), c.bytes() as u64 / 16);
+        // A spare chunk is lent whole.
+        let k = c.lend(2).unwrap();
+        let m = c.memory();
+        assert_eq!((m.spare, m.lent, m.loans, m.loan_room), (0, 4, 2, 8));
+        assert_eq!(named(m), c.bytes() as u64 / 16);
+        c.unlend(k);
+        assert_eq!(c.memory().spare, 4);
     }
 
     #[test]

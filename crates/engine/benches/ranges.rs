@@ -6,7 +6,9 @@
 //! write memory are divided equally across ranges. Buffered I/O, fanout 8, no WAL.
 //!
 //! This compares identical Range controls, not direct RocksDB timings: throughput/work
-//! include exact membership/value/row checks; latency is the API call alone. Postfill and
+//! include exact membership/value/row checks. An operation's latency is the time since the one
+//! before it ended, db_bench's measure (its `FinishedOps`: one clock read an operation), so it
+//! holds the API call and the checks of the operation before. Postfill and
 //! postquery flush+checkpoint barriers are timed and charged, including metadata/flushes.
 //! Continuous process counts through
 //! stop/shutdown include maintenance between phase snapshots and discard/cleanup work.
@@ -297,6 +299,7 @@ impl Workload {
                         let mut client = ranges.client()?;
                         let mut rng = self.rng(phase, thread);
                         let mut lat = Histogram::new();
+                        let mut last = Instant::now();
                         let mut value = Vec::new();
                         let mut page = Rows::new();
                         let mut next = Vec::new();
@@ -308,7 +311,6 @@ impl Workload {
                             let key = rocks_workload::key(start);
                             page.clear();
                             next.clear();
-                            let began = Instant::now();
                             let hit = match work {
                                 Work::Fill => {
                                     client.put(&key, fill_value())?;
@@ -320,7 +322,9 @@ impl Workload {
                                     false
                                 }
                             };
-                            lat.record(began.elapsed().as_nanos() as u64);
+                            let now = Instant::now();
+                            lat.record(now.duration_since(last).as_nanos() as u64);
+                            last = now;
                             let hit = match work {
                                 Work::Fill => hit,
                                 Work::Get => {
@@ -401,6 +405,7 @@ impl Workload {
         let mut client = ranges.client()?;
         let mut rng = self.rng(phase, thread);
         let mut lat = Histogram::new();
+        let mut last = Instant::now();
         let mut value = Vec::new();
         let mut page = Rows::new();
         let mut next = Vec::new();
@@ -412,7 +417,6 @@ impl Workload {
             let key = rocks_workload::key(start);
             page.clear();
             next.clear();
-            let began = Instant::now();
             let hit = match work {
                 Work::Fill => {
                     client.put_async(&key, fill_value()).await?;
@@ -426,7 +430,9 @@ impl Workload {
                     false
                 }
             };
-            lat.record(began.elapsed().as_nanos() as u64);
+            let now = Instant::now();
+            lat.record(now.duration_since(last).as_nanos() as u64);
+            last = now;
             let hit = match work {
                 Work::Fill => hit,
                 Work::Get => {

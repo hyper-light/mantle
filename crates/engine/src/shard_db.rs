@@ -82,6 +82,13 @@ pub struct FlushStats {
     /// A runtime task's idle slices ([`ShardDb::idle_paced_step`]) and the work units they did.
     pub idle_slices: u64,
     pub idle_units: u64,
+    /// The record cache's gets served and missed, its misses on keys its ghost named, and its
+    /// bytes held and allowed, when the shard has one (set as the stats are taken).
+    pub record_hits: u64,
+    pub record_misses: u64,
+    pub record_ghost_hits: u64,
+    pub record_held: u64,
+    pub record_bytes: u64,
     /// Puts whose trunk share waited for its input reads: the last memtable before a rotation
     /// would stall ([`ShardDb::put`]'s pacing).
     pub waited_steps: u64,
@@ -321,9 +328,9 @@ pub struct ShardDb<F: BlockFile> {
     cycle_written: usize,
     cycle_ops: u64,
     ops_since: u64,
-    record_misses: u64,
-    record_miss_ns: u64,
-    record_ghost_hits: u64,
+    /// The trunk lookups of the gets the record cache's ghost named since the last division, in
+    /// nanoseconds: what a larger record cache would have saved.
+    record_ghost_ns: u64,
     write_share: usize,
     tuned: crate::store::IoStats,
     /// The tuner's past steps, for its Newton step.
@@ -620,9 +627,7 @@ impl<F: BlockFile> ShardDb<F> {
             cycle_written: 0,
             cycle_ops: u64::MAX,
             ops_since: 0,
-            record_misses: 0,
-            record_miss_ns: 0,
-            record_ghost_hits: 0,
+            record_ghost_ns: 0,
             write_share: 0,
             tuned: crate::store::IoStats::default(),
             newton: Newton::default(),
@@ -1131,11 +1136,7 @@ impl<F: BlockFile> ShardDb<F> {
                 .unwrap_or(0),
         );
         self.tuned = self.store.io_stats();
-        (
-            self.record_misses,
-            self.record_miss_ns,
-            self.record_ghost_hits,
-        ) = (0, 0, 0);
+        self.record_ghost_ns = 0;
         self.partition_memory();
         Ok(())
     }
@@ -1342,20 +1343,10 @@ impl<F: BlockFile> ShardDb<F> {
             saved_ns: io.budget_wait_ns.saturating_sub(last.budget_wait_ns),
             bytes: self.write_share.max(self.store.run_bytes()),
         };
-        // A record-cache ghost hit saves a trunk lookup, at the mean the cycle measured.
-        let ghost_hits = self
-            .records
-            .as_ref()
-            .map_or(0, crate::records::RecordCache::ghost_hits);
-        let record_ghost = ghost_hits.saturating_sub(self.record_ghost_hits);
-        self.record_ghost_hits = ghost_hits;
-        let lookup_ns = self
-            .record_miss_ns
-            .checked_div(self.record_misses)
-            .unwrap_or(0);
-        (self.record_misses, self.record_miss_ns) = (0, 0);
+        // A record-cache ghost hit saves its trunk lookup: the lookups of the gets the ghost
+        // named, each timed, are what a larger record cache would have saved this cycle.
         let records = Gain {
-            saved_ns: record_ghost.saturating_mul(lookup_ns),
+            saved_ns: std::mem::take(&mut self.record_ghost_ns),
             bytes: self.records_share,
         };
         // Write memory the cycle did not use goes back at once: a share above the most queued
@@ -1879,6 +1870,35 @@ impl<F: BlockFile> ShardDb<F> {
         }
     }
 
+    /// [`Self::scan`] made only if it can finish without waiting for the device or for a write
+    /// still out over a page it needs: `Some` of its answer, or `None` when a page it needs is
+    /// not in memory now, the rows it took and `next` back as they were and the scan uncounted,
+    /// for the caller to take the paced path ([`Self::scan_async`]).
+    pub(crate) fn scan_now(
+        &mut self,
+        from: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+        out: &mut Rows,
+        next: &mut Vec<u8>,
+    ) -> Result<Option<bool>, Error> {
+        let rows = out.len();
+        let counted = (self.scans, self.scan_segments, self.scan_listed);
+        self.store.begin_no_wait();
+        let scanned = self.scan(from, end, limit, out, next);
+        let refused = self.store.end_no_wait();
+        match scanned {
+            Ok(more) => Ok(Some(more)),
+            Err(_) if refused => {
+                out.truncate(rows);
+                next.clear();
+                (self.scans, self.scan_segments, self.scan_listed) = counted;
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn lookup(&mut self, key: &[u8], value: &mut Vec<u8>) -> Result<bool, Error> {
         // The key's filter hash, once for the memtables and every branch on its path.
         let hash = crate::branch::filter::hash(key);
@@ -1895,20 +1915,27 @@ impl<F: BlockFile> ShardDb<F> {
             }
             found = f.mem.get_hashed(key, hash, value)?;
         }
+        let mut ghost = false;
         if found.is_none()
-            && let Some(cached) = self.records.as_mut().and_then(|r| r.get(key, hash))
+            && let Some(r) = self.records.as_mut()
         {
-            value.clear();
-            value.extend_from_slice(cached);
-            return Ok(true);
+            match r.lookup(key, hash) {
+                crate::records::Lookup::Hit(cached) => {
+                    value.clear();
+                    value.extend_from_slice(cached);
+                    return Ok(true);
+                }
+                crate::records::Lookup::Miss { ghost: named } => ghost = named,
+            }
         }
         if found.is_none() {
-            // A get the record cache missed is timed: its trunk lookup is what a hit saves.
-            let t = self.records.as_ref().map(|_| std::time::Instant::now());
+            // A miss the ghost named is timed: a larger record cache would have served it, so
+            // its trunk lookup is what growing the cache saves (the tuner's marginal gain,
+            // research/36). Other misses' lookups price nothing, and are not timed.
+            let t = ghost.then(std::time::Instant::now);
             found = self.trunk.get_hashed(&mut self.store, key, hash, value)?;
             if let Some(r) = self.records.as_mut() {
-                self.record_misses = self.record_misses.saturating_add(1);
-                self.record_miss_ns = self.record_miss_ns.saturating_add(ns_since(t));
+                self.record_ghost_ns = self.record_ghost_ns.saturating_add(ns_since(t));
                 if found == Some(Op::Put) {
                     r.insert(key, hash, value);
                 }
@@ -1941,23 +1968,30 @@ impl<F: BlockFile> ShardDb<F> {
             }
             found = f.mem.get_hashed(key, hash, value)?;
         }
+        let mut ghost = false;
         if found.is_none()
-            && let Some(cached) = self.records.as_mut().and_then(|r| r.get(key, hash))
+            && let Some(r) = self.records.as_mut()
         {
-            value.clear();
-            value.extend_from_slice(cached);
-            return Ok(true);
+            match r.lookup(key, hash) {
+                crate::records::Lookup::Hit(cached) => {
+                    value.clear();
+                    value.extend_from_slice(cached);
+                    return Ok(true);
+                }
+                crate::records::Lookup::Miss { ghost: named } => ghost = named,
+            }
         }
         if found.is_none() {
-            // A get the record cache missed is timed: its trunk lookup is what a hit saves.
-            let t = self.records.as_ref().map(|_| std::time::Instant::now());
+            // A miss the ghost named is timed: a larger record cache would have served it, so
+            // its trunk lookup is what growing the cache saves (the tuner's marginal gain,
+            // research/36). Other misses' lookups price nothing, and are not timed.
+            let t = ghost.then(std::time::Instant::now);
             found = self
                 .trunk
                 .get_hashed_async(&mut self.store, key, hash, value)
                 .await?;
             if let Some(r) = self.records.as_mut() {
-                self.record_misses = self.record_misses.saturating_add(1);
-                self.record_miss_ns = self.record_miss_ns.saturating_add(ns_since(t));
+                self.record_ghost_ns = self.record_ghost_ns.saturating_add(ns_since(t));
                 if found == Some(Op::Put) {
                     r.insert(key, hash, value);
                 }
@@ -2043,20 +2077,25 @@ impl<F: BlockFile> ShardDb<F> {
         let mut merge: ScanMerge<'_> = std::mem::take(&mut self.scan_merge).recycle(store);
         let before_end = |k: &[u8]| end.is_none_or(|e| k < e);
         let mut taken = 0usize;
-        let more = loop {
+        // Every error ends the walk here, so the merge gives its sources' pages and spans back to
+        // the store before the scan returns it (`ScanMerge::close`): a scan refused a page that
+        // would wait ([`Self::scan_now`]) holds none of the store's buffers after.
+        let walked: Result<bool, Error> = 'walk: loop {
             // The trunk's next key: from the segment open, or the next segment's first.
             while merge.entry().is_none() {
                 if trunk_done || !before_end(seg_from) {
                     break;
                 }
-                let bounded = trunk.segment_at(seg_from, &mut sources, seg_end, passed)?;
+                let bounded = match trunk.segment_at(seg_from, &mut sources, seg_end, passed) {
+                    Ok(bounded) => bounded,
+                    Err(error) => break 'walk Err(error),
+                };
                 *scan_segments = scan_segments.saturating_add(1);
                 *scan_listed =
                     scan_listed.saturating_add(u64::try_from(sources.len()).unwrap_or(u64::MAX));
                 // Each segment ends past its start, so the walk moves a leaf a step and ends.
                 if bounded && seg_end.as_slice() <= seg_from.as_slice() {
-                    merge.close(store);
-                    return Err(Error::Corruption {
+                    break 'walk Err(Error::Corruption {
                         what: "a trunk segment's bounds",
                         why: crate::error::Malformed::OutOfOrder,
                     });
@@ -2071,7 +2110,10 @@ impl<F: BlockFile> ShardDb<F> {
                     let (_, n) = p.sources();
                     n > 1
                 });
-                merge.open(store, &sources, seg_from, hi, end.is_some(), spare)?;
+                if let Err(error) = merge.open(store, &sources, seg_from, hi, end.is_some(), spare)
+                {
+                    break 'walk Err(error);
+                }
                 // Each pivot's rent: the measured time its sources took to open, all but the
                 // dearest, which stands for the one branch a consolidated leaf keeps and a
                 // flushed index pivot's bundle becomes in its child.
@@ -2102,13 +2144,13 @@ impl<F: BlockFile> ShardDb<F> {
                 .filter(|k| before_end(k))
                 .min();
             let Some(least) = [mem_a, mem_p, mem_f, tree].into_iter().flatten().min() else {
-                break false;
+                break Ok(false);
             };
             key.clear();
             key.extend_from_slice(least);
             if taken == limit {
                 next.extend_from_slice(key);
-                break true;
+                break Ok(true);
             }
             // The newest source holding the key decides; every source holding it moves past it.
             let mut decided = false;
@@ -2118,7 +2160,9 @@ impl<F: BlockFile> ShardDb<F> {
                     out.push(key, &active.value);
                     taken = taken.saturating_add(1);
                 }
-                active.advance(&self.mem)?;
+                if let Err(error) = active.advance(&self.mem) {
+                    break Err(error);
+                }
             }
             if let (Some(c), Some(p)) = (packing.as_mut(), self.packing.as_ref())
                 && c.key() == Some(key.as_slice())
@@ -2130,7 +2174,9 @@ impl<F: BlockFile> ShardDb<F> {
                         taken = taken.saturating_add(1);
                     }
                 }
-                c.advance(&p.mem)?;
+                if let Err(error) = c.advance(&p.mem) {
+                    break Err(error);
+                }
             }
             for (c, f) in frozen.iter_mut().zip(self.frozen.iter().rev()) {
                 if c.key() != Some(key.as_slice()) {
@@ -2143,7 +2189,9 @@ impl<F: BlockFile> ShardDb<F> {
                         taken = taken.saturating_add(1);
                     }
                 }
-                c.advance(&f.mem)?;
+                if let Err(error) = c.advance(&f.mem) {
+                    break 'walk Err(error);
+                }
             }
             if let Some((k, op, v)) = merge.entry()
                 && k == key.as_slice()
@@ -2152,7 +2200,16 @@ impl<F: BlockFile> ShardDb<F> {
                     out.push(key, v);
                     taken = taken.saturating_add(1);
                 }
-                merge.next(store)?;
+                if let Err(error) = merge.next(store) {
+                    break Err(error);
+                }
+            }
+        };
+        let more = match walked {
+            Ok(more) => more,
+            Err(error) => {
+                merge.close(store);
+                return Err(error);
             }
         };
         let (skipped, opened) = merge.counts();
@@ -3682,13 +3739,21 @@ impl<F: BlockFile> ShardDb<F> {
 
     /// The flushes' time, the trunk's maintenance, and the store's I/O since the engine started.
     pub fn stats(&self) -> (FlushStats, crate::trunk::TrunkStats, crate::store::IoStats) {
+        let mut flush = self.flush_stats;
+        if let Some(r) = self.records.as_ref() {
+            let as_u64 = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+            (flush.record_hits, flush.record_misses) = r.stats();
+            flush.record_ghost_hits = r.ghost_hits();
+            flush.record_held = as_u64(r.held_bytes());
+            flush.record_bytes = as_u64(r.bytes());
+        }
         let mut trunk = self.trunk.stats();
         trunk.scans = self.scans;
         trunk.scan_segments = self.scan_segments;
         trunk.scan_sources = self.scan_listed;
         trunk.scan_skipped = self.scan_skipped;
         trunk.scan_opened = self.scan_opened;
-        (self.flush_stats, trunk, self.store.io_stats())
+        (flush, trunk, self.store.io_stats())
     }
 
     /// Shadow mode for the store's resident reads' kept answers, for measurement

@@ -32,6 +32,19 @@ impl Rows {
         self.ends.is_empty()
     }
 
+    /// Keeps the first `len` rows, dropping the rest, the buffers kept.
+    pub fn truncate(&mut self, len: usize) {
+        if len >= self.ends.len() {
+            return;
+        }
+        let end = len
+            .checked_sub(1)
+            .and_then(|last| self.ends.get(last))
+            .map_or(0, |&(_, end)| end);
+        self.ends.truncate(len);
+        self.bytes.truncate(end);
+    }
+
     /// Appends a row.
     pub fn push(&mut self, key: &[u8], value: &[u8]) {
         self.bytes.extend_from_slice(key);

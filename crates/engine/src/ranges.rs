@@ -116,6 +116,16 @@ trait Inline {
     fn delete(&mut self, key: &[u8], keys: u64) -> Result<bool, Error>;
     /// A get answered now, or none when a page it needs is not in memory.
     fn get(&mut self, key: &[u8], value: &mut Vec<u8>) -> Result<Option<bool>, Error>;
+    /// A scan answered now, its rows appended to `out` and whether more follow, or none when a
+    /// page it needs is not in memory, `out` and `next` as they were.
+    fn scan(
+        &mut self,
+        from: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+        out: &mut Rows,
+        next: &mut Vec<u8>,
+    ) -> Result<Option<bool>, Error>;
     /// Whether the range owes maintenance: its task has work once it runs.
     fn owed(&self) -> bool;
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any>;
@@ -132,6 +142,17 @@ impl<F: BlockFile + 'static> Inline for ShardDb<F> {
 
     fn get(&mut self, key: &[u8], value: &mut Vec<u8>) -> Result<Option<bool>, Error> {
         self.get_now(key, value)
+    }
+
+    fn scan(
+        &mut self,
+        from: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+        out: &mut Rows,
+        next: &mut Vec<u8>,
+    ) -> Result<Option<bool>, Error> {
+        self.scan_now(from, end, limit, out, next)
     }
 
     fn owed(&self) -> bool {
@@ -1594,10 +1615,8 @@ impl Client<'_> {
         let ranges = self.ranges;
         let mut range = ranges.range_of(from);
         let mut left = limit;
-        if let Some(r) = self.request.as_mut() {
-            r.key.clear();
-            r.key.extend_from_slice(from);
-        }
+        // Where this range's part starts: the scan's own key, then each next range's first.
+        let mut start: &[u8] = from;
         loop {
             // The range's own end, or the scan's when it comes first; the last range asked is
             // the one whose end the scan's reaches.
@@ -1607,6 +1626,35 @@ impl Client<'_> {
                 (Some(b), Some(e)) if e <= b.as_slice() => (Some(e), true),
                 (Some(b), _) => (Some(b.as_slice()), false),
             };
+            // Inline first, when the range lends its engine and every page the part needs is in
+            // memory; else the request path.
+            let before = out.len();
+            if let Some(scanned) = self
+                .inline(range, |db, _| db.scan(start, stop, left, out, next))
+                .await
+                && let Some(more) = scanned?
+            {
+                self.completed_inline();
+                left = left.saturating_sub(out.len().saturating_sub(before));
+                if more {
+                    return Ok(true);
+                }
+                if last {
+                    return Ok(false);
+                }
+                range = range.saturating_add(1);
+                start = ranges.starts.get(range).map_or(&[][..], Vec::as_slice);
+                if left == 0 {
+                    next.clear();
+                    next.extend_from_slice(start);
+                    return Ok(true);
+                }
+                continue;
+            }
+            if let Some(r) = self.request.as_mut() {
+                r.key.clear();
+                r.key.extend_from_slice(start);
+            }
             let r = self
                 .call_async(range, |r| {
                     r.end.clear();
@@ -1630,14 +1678,12 @@ impl Client<'_> {
                 return Ok(false);
             }
             range = range.saturating_add(1);
-            let start = ranges.starts.get(range).map_or(&[][..], Vec::as_slice);
+            start = ranges.starts.get(range).map_or(&[][..], Vec::as_slice);
             if left == 0 {
                 next.clear();
                 next.extend_from_slice(start);
                 return Ok(true);
             }
-            r.key.clear();
-            r.key.extend_from_slice(start);
         }
     }
 

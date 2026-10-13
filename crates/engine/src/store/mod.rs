@@ -3667,6 +3667,10 @@ impl<F: BlockFile> Store<F> {
                 .first_queued(address, address.saturating_add(1))
                 .is_some();
         if pending.is_none() && !memory {
+            // A page only the device has: refused while reads may not wait, nothing moved.
+            if self.no_wait {
+                return Err(self.refuse_wait());
+            }
             blocking_allowed("a cold span read synchronously in a runtime task")?;
         }
         if let Some(number) = pending
@@ -3678,6 +3682,9 @@ impl<F: BlockFile> Store<F> {
                 .is_some_and(|writer| writer.parked.iter().any(|&(ready, _)| ready == number))
         {
             // Refuse before removing the pending read or replacing its current page.
+            if self.no_wait {
+                return Err(self.refuse_wait());
+            }
             blocking_allowed("an unanswered span read synchronously in a runtime task")?;
         }
         if let Some((prepared, mut page)) = span.prepared.take() {

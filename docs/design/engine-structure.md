@@ -125,10 +125,11 @@ operation finishes without waiting, as an event loop runs a call made on its own
   Arc, no RefCell); a lend dropped mid-await (the task's future dropped) takes the engine back
   and drops it there, as the task's local would have been;
 - a range lends only with no fault, no mutation waiting to be applied (their arrival order is
-  kept) and no request in hand; a put `put_paced` cannot apply now, a get whose page is neither
-  cached nor in the OS's memory (`ShardDb::get_now`: the store refuses a read that would wait,
-  `Store::begin_no_wait`), a scan, a barrier and every request from another shard take the
-  request path unchanged;
+  kept) and no request in hand; a put `put_paced` cannot apply now, a get or a scan needing a
+  page neither cached nor in the OS's memory (`ShardDb::get_now`, `ShardDb::scan_now`: the store
+  refuses a read that would wait, `Store::begin_no_wait`, and a refused scan leaves its rows, its
+  next key and its counters as they were), a barrier and every request from another shard take
+  the request path unchanged;
 - an inline operation runs to its end in the poll that starts it, or not at all: canceled
   before, nothing of it happened; nothing of it is ever outstanding. `RangesConfig::inline` off
   gives every client the request path's semantics alone (a canceled mutation published and kept),

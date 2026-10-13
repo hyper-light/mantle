@@ -93,6 +93,14 @@ impl Head {
     }
 }
 
+/// A record cache's answer ([`RecordCache::lookup`]): the value cached, or a miss and whether the
+/// ghost named its key.
+#[derive(Debug)]
+pub enum Lookup<'a> {
+    Hit(&'a [u8]),
+    Miss { ghost: bool },
+}
+
 impl RecordCache {
     /// A cache of `bytes` of records in pages of `page` bytes, the store's page size: a record
     /// larger than a page is not cached. None fit below a page.
@@ -240,24 +248,37 @@ impl RecordCache {
     /// The value cached for `key` of hash `hash`, if its record is current; counted as read, so
     /// it has a second chance at the head.
     pub fn get(&mut self, key: &[u8], hash: u64) -> Option<&[u8]> {
+        match self.lookup(key, hash) {
+            Lookup::Hit(value) => Some(value),
+            Lookup::Miss { .. } => None,
+        }
+    }
+
+    /// [`Self::get`], a miss saying whether the ghost named its key: a get a larger cache would
+    /// have served.
+    pub fn lookup(&mut self, key: &[u8], hash: u64) -> Lookup<'_> {
         // A phase of hits writes nothing: the read moves the index's migration on.
         self.table.settle();
         let Some(offset) = self.table.get(hash) else {
             self.misses = self.misses.saturating_add(1);
-            if self.in_ghost(hash) {
+            let ghost = self.in_ghost(hash);
+            if ghost {
                 self.ghost_hits = self.ghost_hits.saturating_add(1);
             }
-            return None;
+            return Lookup::Miss { ghost };
         };
         let Some((h, _)) = self.current(offset, key) else {
             self.misses = self.misses.saturating_add(1);
-            return None;
+            return Lookup::Miss { ghost: false };
         };
         if h.flags & READ == 0 {
             self.set_flags(offset, h.flags | READ);
         }
         self.hits = self.hits.saturating_add(1);
-        self.current(offset, key).map(|(_, v)| v)
+        match self.current(offset, key) {
+            Some((_, value)) => Lookup::Hit(value),
+            None => Lookup::Miss { ghost: false },
+        }
     }
 
     /// Drops `key`'s record, if cached: a write to the key makes it stale.
@@ -482,6 +503,47 @@ mod tests {
     use super::*;
     use crate::branch::filter::hash;
     use std::collections::HashMap;
+
+    /// A miss says whether the ghost named its key: of the keys evicted from a full cache, the
+    /// ghost names the last evicted, at most as many as the cache ever held, and each such miss
+    /// is a ghost hit; a key never cached is not named, and a key cached again is a hit.
+    #[test]
+    fn a_miss_says_whether_the_ghost_named_its_key() {
+        // One page of room: filling past it evicts the first records.
+        let mut c = RecordCache::new(256, 256);
+        let keys: Vec<[u8; 4]> = (0..64u32).map(u32::to_be_bytes).collect();
+        for k in &keys {
+            c.insert(k, hash(k), &[7u8; 24]);
+        }
+        let ghost_before = c.ghost_hits();
+        let (mut named, mut unnamed) = (0u64, 0u64);
+        let mut last_named = None;
+        for k in &keys {
+            match c.lookup(k, hash(k)) {
+                Lookup::Miss { ghost: true } => {
+                    named += 1;
+                    last_named = Some(*k);
+                }
+                Lookup::Miss { ghost: false } => unnamed += 1,
+                Lookup::Hit(v) => assert_eq!(v, [7u8; 24]),
+            }
+        }
+        assert_eq!(c.ghost_hits() - ghost_before, named);
+        assert!(named >= 1, "the last evicted are not named");
+        assert!(
+            named <= c.live_most as u64,
+            "the ghost holds more than the cache held"
+        );
+        assert!(unnamed >= 1, "the first evicted are still named");
+        let never = 1_000_000u32.to_be_bytes();
+        assert!(matches!(
+            c.lookup(&never, hash(&never)),
+            Lookup::Miss { ghost: false }
+        ));
+        let again = last_named.unwrap();
+        c.insert(&again, hash(&again), &[9u8; 24]);
+        assert!(matches!(c.lookup(&again, hash(&again)), Lookup::Hit(v) if v == [9u8; 24]));
+    }
 
     #[test]
     #[allow(clippy::cast_possible_truncation)]

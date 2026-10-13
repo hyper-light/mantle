@@ -1,7 +1,7 @@
-//! A client on its range's own shard makes a put or a get inline on the range's lent engine when
-//! it needs no wait (docs/design/engine-structure.md, "Same-shard clients"), the range waiting on
-//! its workers meanwhile included; one that would wait takes the request path, and a client that
-//! makes nothing but inline operations still yields its shard.
+//! A client on its range's own shard makes a put, a get or a scan inline on the range's lent
+//! engine when it needs no wait (docs/design/engine-structure.md, "Same-shard clients"), the
+//! range waiting on its workers meanwhile included; one that would wait takes the request path,
+//! and a client that makes nothing but inline operations still yields its shard.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -24,6 +24,7 @@ use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::issuer::Issuer;
 use hyper_rt::{Runtime, RuntimeConfig};
 use mantle_engine::ranges::{Ranges, RangesConfig};
+use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::Config;
 use mantle_engine::trunk::TrunkConfig;
@@ -439,4 +440,124 @@ fn puts_stay_inline_while_the_range_waits_on_a_packing_worker() {
         assert!(db.get(&key(i), &mut out).unwrap());
         assert_eq!(out, value(i));
     }
+}
+
+/// Every row of `[from, ..)`, `limit` a page, through `client`: the pages' rows in order.
+async fn scan_all(
+    client: &mut mantle_engine::ranges::Client<'_>,
+    from: &[u8],
+    limit: usize,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut got = Vec::new();
+    let mut from = from.to_vec();
+    loop {
+        let mut rows = Rows::new();
+        let mut next = Vec::new();
+        let more = client
+            .scan_async(&from, None, limit, &mut rows, &mut next)
+            .await
+            .unwrap();
+        got.extend(rows.iter().map(|(k, v)| (k.to_vec(), v.to_vec())));
+        if !more {
+            return got;
+        }
+        from = next;
+    }
+}
+
+/// Do: from a client on the range's shard, with a memtable that holds every row, put every key,
+/// then scan the whole keyspace a page of 97 rows at a time, and seek 10 rows from every 50th
+/// key. Expect: every scan was made inline as each put was (none needs a page from the device),
+/// and every page holds the oracle's rows in order.
+#[test]
+fn a_same_shard_client_scans_inline() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("range");
+    let reads: &'static AtomicUsize = Box::leak(Box::default());
+    let issuer = Issuer::start_for(dir.path(), 2, 2).unwrap();
+    let mut runtime = runtime();
+    let ranges = range(&mut runtime, &issuer, &path, (reads, true, 1 << 20), |_| {});
+    let (done, finished) = mpsc::sync_channel(1);
+    runtime
+        .spawn_on(runtime.shard_ids()[0], async move {
+            let mut client = ranges.client().unwrap();
+            for i in 0..ROWS {
+                client.put_async(&key(i), &value(i)).await.unwrap();
+            }
+            let want: Vec<(Vec<u8>, Vec<u8>)> = (0..ROWS).map(|i| (key(i), value(i))).collect();
+            assert_eq!(scan_all(&mut client, b"", 97).await, want);
+            let pages = ROWS.div_ceil(97);
+            let mut seeks = 0;
+            for i in (0..ROWS).step_by(50) {
+                let mut rows = Rows::new();
+                let mut next = Vec::new();
+                client
+                    .scan_async(&key(i), None, 10, &mut rows, &mut next)
+                    .await
+                    .unwrap();
+                let got: Vec<(Vec<u8>, Vec<u8>)> =
+                    rows.iter().map(|(k, v)| (k.to_vec(), v.to_vec())).collect();
+                let expect: Vec<(Vec<u8>, Vec<u8>)> =
+                    (i..ROWS.min(i + 10)).map(|j| (key(j), value(j))).collect();
+                assert_eq!(got, expect, "seek {i}");
+                seeks += 1;
+            }
+            let inlined = client.inlined();
+            drop(client);
+            ranges.stop_async().await.unwrap();
+            done.send((inlined, pages, seeks)).unwrap();
+        })
+        .unwrap();
+    let (inlined, pages, seeks) = finished.recv().unwrap();
+    runtime.shutdown().unwrap();
+    drop(issuer);
+    assert_eq!(inlined, (ROWS + pages + seeks) as u64);
+}
+
+/// Do: fill the range cold, so its pages are on disk and none in memory a read can take, then
+/// scan the whole keyspace from a client on the range's shard. Expect: no scan is made inline
+/// (each needs a device read), the pages hold the oracle's rows in order, and the issuer read the
+/// pages.
+#[test]
+fn an_inline_scan_that_needs_the_device_takes_the_request_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("range");
+    let reads: &'static AtomicUsize = Box::leak(Box::default());
+    let issuer = Issuer::start_for(dir.path(), 2, 2).unwrap();
+    let mut runtime = runtime();
+    let ranges = range(
+        &mut runtime,
+        &issuer,
+        &path,
+        (reads, false, STORE.page_size),
+        |db| {
+            for i in 0..ROWS {
+                db.put(&key(i), &value(i)).unwrap();
+            }
+            db.flush().unwrap();
+            db.maintain(u64::MAX).unwrap();
+            db.checkpoint(1).unwrap();
+            db.maintain(u64::MAX).unwrap();
+            assert!(!db.owed());
+        },
+    );
+    let before = reads.load(Ordering::SeqCst);
+    let (done, finished) = mpsc::sync_channel(1);
+    runtime
+        .spawn_on(runtime.shard_ids()[0], async move {
+            let mut client = ranges.client().unwrap();
+            let got = scan_all(&mut client, b"", 97).await;
+            let inlined = client.inlined();
+            drop(client);
+            ranges.stop_async().await.unwrap();
+            done.send((got, inlined)).unwrap();
+        })
+        .unwrap();
+    let (got, inlined) = finished.recv().unwrap();
+    runtime.shutdown().unwrap();
+    drop(issuer);
+    let want: Vec<(Vec<u8>, Vec<u8>)> = (0..ROWS).map(|i| (key(i), value(i))).collect();
+    assert_eq!(got, want);
+    assert_eq!(inlined, 0);
+    assert!(reads.load(Ordering::SeqCst) > before);
 }

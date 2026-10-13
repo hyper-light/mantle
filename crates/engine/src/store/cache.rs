@@ -217,6 +217,29 @@ impl Cache {
         self.payload(i)
     }
 
+    /// The slot holding `address`, counted as a read: a reader that reads the page in place,
+    /// looking at it again with [`Self::page_at`] before each read.
+    pub fn lookup(&mut self, address: u64) -> Option<usize> {
+        self.map.settle();
+        let Some(i) = self.slot_of(address) else {
+            self.misses = self.misses.saturating_add(1);
+            return None;
+        };
+        let slot = self.slots.get_mut(i)?;
+        slot.freq = slot.freq.saturating_add(1).min(MAX_FREQ);
+        self.hits = self.hits.saturating_add(1);
+        Some(i)
+    }
+
+    /// The payload slot `i` holds, if it still holds `address`: the cache may have given the
+    /// slot to another page since [`Self::lookup`].
+    pub fn page_at(&self, i: usize, address: u64) -> Option<&[u8]> {
+        self.slots
+            .get(i)
+            .filter(|s| s.live && s.address == address)?;
+        self.payload(i)
+    }
+
     /// The payload cached for `address`, appended to `out`, without counting a read: a scan's
     /// look, which must not promote what it passes.
     pub fn peek(&self, address: u64, out: &mut Vec<u8>) -> bool {

@@ -1300,10 +1300,16 @@ pub struct RunCursor {
     span: Span,
     /// The payload in the span when it was read there; a cache hit uses `page` instead.
     span_page: Option<std::ops::Range<usize>>,
+    /// The cache slot an async scan's leaf is read in place in, and the page's address: looked
+    /// at again before each read, since the cache may give the slot to another page meanwhile.
+    cached: Option<(usize, u64)>,
     key: Vec<u8>,
     /// Where the entry's value lies in the page: read in place, not copied out, since the page
-    /// stays until the cursor moves to another.
+    /// stays until the cursor moves to another. A leaf read in the cache is out of reach of
+    /// [`Self::value`], so its entry's value is copied, `copied` saying so.
     value: std::ops::Range<usize>,
+    value_copy: Vec<u8>,
+    copied: bool,
     op: Op,
     valid: bool,
 }
@@ -1425,9 +1431,12 @@ impl RunCursor {
             page: store.take_page(),
             span,
             span_page: None,
+            cached: None,
             // An entry fits a page, so buffers of a page from the pool never grow.
             key: store.take_page(),
             value: 0..0,
+            value_copy: store.take_page(),
+            copied: false,
             op: Op::Put,
             valid: false,
         }
@@ -1437,6 +1446,7 @@ impl RunCursor {
     pub fn give_back<F: BlockFile>(self, store: &mut Store<F>) {
         store.give_page(self.page);
         store.give_page(self.key);
+        store.give_page(self.value_copy);
         store.give_span(self.span);
     }
 
@@ -1455,6 +1465,9 @@ impl RunCursor {
     }
 
     pub fn value(&self) -> &[u8] {
+        if self.copied {
+            return &self.value_copy;
+        }
         self.page_bytes()
             .and_then(|page| page.get(self.value.clone()))
             .unwrap_or(&[])
@@ -1535,12 +1548,15 @@ impl RunCursor {
     ) -> Result<(), Error> {
         let page = u64::from(branch.leaf_of(from)?);
         self.land_async(branch, store, page, 0).await?;
-        let (index, entries) = self.page_lower_bound(from)?;
+        let (index, entries) = {
+            let view = View::new(self.page_in(store)?)?;
+            (view.lower_bound(from)?, view.n)
+        };
         if index >= entries {
             self.next_leaf_async(branch, store).await
         } else {
             self.index = index;
-            self.load()
+            self.load_in(store)
         }
     }
 
@@ -1554,7 +1570,16 @@ impl RunCursor {
         }
         self.index = self.index.saturating_add(1);
         if self.index < self.n {
-            return self.load();
+            if let Some((slot, address)) = self.cached
+                && store.cache_page(slot, address).is_none()
+            {
+                // The cache gave the leaf's slot away: read the leaf again.
+                self.loaded = None;
+                return self
+                    .land_async(branch, store, self.page_no, self.index)
+                    .await;
+            }
+            return self.load_in(store);
         }
         self.next_leaf_async(branch, store).await
     }
@@ -1567,26 +1592,39 @@ impl RunCursor {
         index: usize,
     ) -> Result<(), Error> {
         let address = branch.page_address(store, page)?;
-        if self.loaded != Some(address) {
+        let held = self.loaded == Some(address)
+            && self
+                .cached
+                .is_none_or(|(slot, a)| store.cache_page(slot, a).is_some());
+        if !held {
             self.loaded = None;
             self.valid = false;
             self.span_page = None;
+            self.cached = None;
             self.page.clear();
-            store
-                .read_page_async(&mut self.span, address, &mut self.page)
-                .await?;
-            let view = View::new(self.page_data()?)?;
-            if view.kind != LEAF {
-                return Err(corrupt(Malformed::CountMismatch));
+            // A leaf the cache holds is read where it lies; another is read into the cursor.
+            match store.cache_lookup(address) {
+                Some(slot) => self.cached = Some((slot, address)),
+                None => {
+                    store
+                        .read_page_async(&mut self.span, address, &mut self.page)
+                        .await?
+                }
             }
-            let (n, table) = (view.n, view.table);
+            let (n, table) = {
+                let view = View::new(self.page_in(store)?)?;
+                if view.kind != LEAF {
+                    return Err(corrupt(Malformed::CountMismatch));
+                }
+                (view.n, view.table)
+            };
             self.n = n;
             self.table = table;
             self.loaded = Some(address);
         }
         self.page_no = page;
         self.index = index;
-        self.load()
+        self.load_in(store)
     }
 
     async fn next_leaf_async<F: BlockFile>(
@@ -1616,6 +1654,7 @@ impl RunCursor {
             self.loaded = None;
             self.valid = false;
             self.span_page = None;
+            self.cached = None;
             self.page.clear();
             self.span_page = store.read_page_ahead_ref(&mut self.span, address, &mut self.page)?;
             let view = View::new(self.page_data()?)?;
@@ -1707,6 +1746,34 @@ impl RunCursor {
         }
     }
 
+    /// The leaf held: in its cache slot, the span, or the cursor's own page.
+    fn page_in<'p, F: BlockFile>(&'p self, store: &'p Store<F>) -> Result<&'p [u8], Error> {
+        match self.cached {
+            Some((slot, address)) => store
+                .cache_page(slot, address)
+                .ok_or(corrupt(Malformed::Truncated)),
+            None => self.page_data(),
+        }
+    }
+
+    /// Loads entry `index` of the leaf held, wherever it lies.
+    fn load_in<F: BlockFile>(&mut self, store: &Store<F>) -> Result<(), Error> {
+        let Some((slot, address)) = self.cached else {
+            return self.load();
+        };
+        let page = store
+            .cache_page(slot, address)
+            .ok_or(corrupt(Malformed::Truncated))?;
+        let (op, value) = Self::decode(page, self.table, self.index, &mut self.key)?;
+        self.value_copy.clear();
+        self.value_copy
+            .extend_from_slice(page.get(value).ok_or(corrupt(Malformed::Truncated))?);
+        self.copied = true;
+        self.op = op;
+        self.valid = true;
+        Ok(())
+    }
+
     fn load(&mut self) -> Result<(), Error> {
         let page = match &self.span_page {
             Some(range) => self
@@ -1715,16 +1782,28 @@ impl RunCursor {
                 .ok_or(corrupt(Malformed::Truncated))?,
             None => self.page.as_slice(),
         };
-        let (suffix, rest) = entry_ranges(page, LEAF, self.table, self.index)?;
+        let (op, value) = Self::decode(page, self.table, self.index, &mut self.key)?;
+        self.op = op;
+        self.value = value;
+        self.copied = false;
+        self.valid = true;
+        Ok(())
+    }
+
+    /// Entry `index` of leaf `page` (its entry table at `table`): its operation and where its
+    /// value lies, its key written into `key`.
+    fn decode(
+        page: &[u8],
+        table: usize,
+        index: usize,
+        key: &mut Vec<u8>,
+    ) -> Result<(Op, std::ops::Range<usize>), Error> {
+        let (suffix, rest) = entry_ranges(page, LEAF, table, index)?;
         let tag = page.get(rest.start).copied().unwrap_or(0);
-        self.op = Op::from_byte(tag).ok_or(corrupt(Malformed::UnknownTag(tag)))?;
-        self.key.clear();
-        self.key.extend_from_slice(
-            page.get(HEAD..self.table)
-                .ok_or(corrupt(Malformed::Truncated))?,
-        );
-        self.key
-            .extend_from_slice(page.get(suffix).ok_or(corrupt(Malformed::Truncated))?);
+        let op = Op::from_byte(tag).ok_or(corrupt(Malformed::UnknownTag(tag)))?;
+        key.clear();
+        key.extend_from_slice(page.get(HEAD..table).ok_or(corrupt(Malformed::Truncated))?);
+        key.extend_from_slice(page.get(suffix).ok_or(corrupt(Malformed::Truncated))?);
         // The value follows the operation and its 2-byte length.
         let from = rest
             .start
@@ -1733,8 +1812,6 @@ impl RunCursor {
         if from > rest.end {
             return Err(corrupt(Malformed::Truncated));
         }
-        self.value = from..rest.end;
-        self.valid = true;
-        Ok(())
+        Ok((op, from..rest.end))
     }
 }

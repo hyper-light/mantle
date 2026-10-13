@@ -2693,6 +2693,19 @@ impl<F: BlockFile> Store<F> {
         Ok(())
     }
 
+    /// The cache slot holding page `address`, counted as a read, for a reader that reads it in
+    /// place ([`Self::cache_page`]); none on a miss.
+    pub(crate) fn cache_lookup(&mut self, address: u64) -> Option<usize> {
+        let i = self.cache.as_mut()?.lookup(address)?;
+        self.io.span_cache_hits = self.io.span_cache_hits.saturating_add(1);
+        Some(i)
+    }
+
+    /// The payload in cache slot `slot` if it still holds page `address`.
+    pub(crate) fn cache_page(&self, slot: usize, address: u64) -> Option<&[u8]> {
+        self.cache.as_ref()?.page_at(slot, address)
+    }
+
     /// Reads the node page at `address` and appends its payload to `out`.
     pub fn read_page(&mut self, address: u64, out: &mut Vec<u8>) -> Result<(), Error> {
         if let Some(c) = self.cache.as_mut()

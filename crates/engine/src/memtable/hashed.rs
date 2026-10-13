@@ -364,6 +364,14 @@ impl Sorter {
     }
 }
 
+/// Entry buffers a memtable shed for another's fill ([`HashMem::shed`]), and the most entries its
+/// tail held.
+#[derive(Debug, Default)]
+pub struct Bufs {
+    bufs: Vec<Vec<Keyed>>,
+    high: usize,
+}
+
 /// A memtable: the arena, its bound, the index of newest entries, the collisions the index
 /// cannot hold, the sorted runs and the unsorted tail, and the work in progress on them.
 #[derive(Debug)]
@@ -633,6 +641,48 @@ impl HashMem {
     #[inline]
     pub fn touch(&self, hash: u64) -> u64 {
         self.index.touch(hash)
+    }
+
+    /// Gives up the entry buffers a memtable read through its index alone no longer needs: its
+    /// tail, its sorted runs' and merges' buffers and its sort's, for a memtable starting its
+    /// fill ([`Self::take_shed`]), which then grows none of them. A packed memtable kept for gets
+    /// (the shard's kept memtables) is never walked again.
+    pub fn shed(&mut self) -> Bufs {
+        self.tail_high = self.tail_high.max(self.tail.len());
+        let mut bufs = std::mem::take(&mut self.bufs);
+        bufs.push(std::mem::take(&mut self.tail));
+        while let Some(r) = self.runs.pop() {
+            bufs.push(r.keys);
+        }
+        while let Some(m) = self.merges.pop() {
+            bufs.push(m.a.keys);
+            bufs.push(m.b.keys);
+            bufs.push(m.out.keys);
+        }
+        if let Some(sort) = self.sort.take() {
+            bufs.push(sort.src);
+            bufs.push(sort.dst);
+        }
+        Bufs {
+            bufs,
+            high: self.tail_high,
+        }
+    }
+
+    /// Takes the buffers another memtable shed ([`Self::shed`]) for this one's fill, its tail
+    /// the one that held the most entries: an empty memtable's tail grows no more than that
+    /// one's did.
+    pub fn take_shed(&mut self, shed: Bufs) {
+        let Bufs { bufs, high } = shed;
+        for b in bufs {
+            self.give_buf(b);
+        }
+        if self.tail.is_empty() {
+            self.tail_high = self.tail_high.max(high);
+            let tail = std::mem::take(&mut self.tail);
+            self.give_buf(tail);
+            self.tail = self.take_buf(self.tail_high);
+        }
     }
 
     /// Empties the memtable for its next fill, keeping its arena and every entry buffer, the
@@ -2685,5 +2735,50 @@ mod tests {
         // Taken, it is gone past a clear too.
         m.clear();
         assert!(!m.mirrored());
+    }
+
+    /// A memtable read through its index alone sheds its entry buffers to a new one: that one's
+    /// tail holds as many entries as the first's did without growing, its walk reads every
+    /// entry in key order, and the first still answers every get.
+    #[test]
+    fn a_memtable_sheds_its_buffers_to_a_new_one_and_still_answers_gets() {
+        let mut a = HashMem::new(1 << 20).unwrap();
+        let keys: Vec<Vec<u8>> = (0..2_000u32)
+            .map(|n| n.wrapping_mul(2_654_435_761).to_be_bytes().to_vec())
+            .collect();
+        for k in &keys {
+            a.insert(k, Op::Put, k).unwrap();
+        }
+        a.seal();
+        let shed = a.shed();
+        let mut b = HashMem::new(1 << 20).unwrap();
+        b.take_shed(shed);
+        let room = b.tail.capacity();
+        assert!(
+            room >= keys.len(),
+            "a tail of {room} for {} entries",
+            keys.len()
+        );
+        for k in &keys {
+            b.insert(k, Op::Put, b"b").unwrap();
+        }
+        assert_eq!(b.tail.capacity(), room, "the tail grew");
+        let mut value = Vec::new();
+        for k in &keys {
+            assert_eq!(a.get(k, &mut value).unwrap(), Some(Op::Put));
+            assert_eq!(&value, k);
+        }
+        let mut sorted = keys.clone();
+        sorted.sort();
+        let mut walked = Vec::new();
+        b.seal();
+        let mut w = b.walk_start();
+        b.walk_some_hashed(&mut w, usize::MAX, |k, _, v, _| {
+            assert_eq!(v, b"b");
+            walked.push(k.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(walked, sorted);
     }
 }

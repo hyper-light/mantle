@@ -121,3 +121,31 @@ it holds and the room its next chunk takes (store/cache.rs grows by chunks), so 
 needs memory takes it from the kept memtables first, oldest first, as F2's log evicts at its
 head. The machine keeps twice a memtable's bytes free before a fill starts a new one, the page
 cache's own rule (`Cache::machine_spares`).
+
+## 7. What 100M showed: one index over the kept memtables
+
+Kept memtables as built (065cd73), paired with 1d5caa9 (`runs/n*-r61..65-*`):
+
+| keys | gets | fill | seeks |
+|---|---|---|---|
+| 1M, 3 rounds | 1.72× (1.66–1.75) | 0.93× (0.87–1.07) | 0.97× |
+| 10M, 5 rounds | 1.52× (1.26–1.66) | 1.01× (0.78–1.36) | 1.36× |
+| 100M, first round | 0.31× | 0.95× | 0.88× |
+
+At 100M the budget kept all 178 memtables (16.7 GB) and they answered every present key, but a
+get probed 178 indexes, an absent one all of them: 120K gets a second against 390K. Probing a
+memtable's own index costs a get one group's miss each; their overlap is bounded by the core's
+outstanding misses, which no published figure states for this core (the Cimple paper cites 6–10
+L1 miss buffers as typical, Haswell's 10 line fill buffers; arXiv 1807.01624), so the probes a get
+makes must not grow with the memtables kept.
+
+**One index over them, built on workers.** The packing worker already hashes every key of the
+memtable's copy as it sorts it (the full 64-bit filter hash, of which the branch keeps 32 bits) and
+walks each key's newest entry once: it emits that walk's (hash, arena offset) pairs, which the copy
+shares with the arena. A worker inserts them into a table mapping a key's hash to (memtable,
+offset), the newest memtable's entry replacing an older one's, and the table goes to the shard; a
+get probes the few kept memtables the table does not yet cover, then the table, one group's miss
+and the record's. Two tables take turns: one serves while the other is out being extended with the
+memtables kept since, so the shard never lends what it reads and each entry is inserted twice. An
+entry whose memtable was given back is a miss (the trunk holds its record); the table drops such
+entries when it next grows or holds more of them than of live ones.

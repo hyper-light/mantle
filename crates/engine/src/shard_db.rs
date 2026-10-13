@@ -293,6 +293,8 @@ pub struct ShardDb<F: BlockFile> {
     /// What the page cache and the record cache held at the last look: more since, and the kept
     /// memtables look again ([`Self::kept_crowded`]).
     kept_seen: usize,
+    /// The entry buffers the last kept memtable shed, for the next memtable a fill starts new.
+    kept_shed: Option<crate::memtable::hashed::Bufs>,
     /// Sorted packings back from their workers, their buffers for the next memtables' mirrors
     /// and sorts: no more than were ever out at once with the active memtable's, and at most a
     /// worker's packing each beside it ([`Self::keep_sort_pack`]).
@@ -631,6 +633,7 @@ impl<F: BlockFile> ShardDb<F> {
             kept_refused: 0,
             kept_step: 0,
             kept_seen: 0,
+            kept_shed: None,
             sort_spares: Vec::new(),
             order_paced: false,
             scans_at_rotation: 0,
@@ -2994,8 +2997,12 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     /// A packed memtable, its branch in the trunk: kept readable for gets, newest last, the
-    /// oldest given back while they hold more than [`Self::fit_kept`] allows.
-    fn keep(&mut self, mem: HashMem) {
+    /// oldest given back while they hold more than [`Self::fit_kept`] allows. It is read through
+    /// its index alone, so its entry buffers go to the next memtable a fill starts new.
+    fn keep(&mut self, mut mem: HashMem) {
+        if self.memory.is_some() {
+            self.kept_shed = Some(mem.shed());
+        }
         self.kept_bytes = self.kept_bytes.saturating_add(mem.memory());
         self.kept.push_back(mem);
         self.fit_kept(true);
@@ -3479,9 +3486,16 @@ impl<F: BlockFile> ShardDb<F> {
     fn fresh_mem(&mut self) -> Result<HashMem, Error> {
         let mut fresh = match self.spare.take() {
             Some(m) => m,
-            // Sized for the entries the memtable it follows holds: it fills without its index
-            // growing or migrating, as a cleared spare refills.
-            None => HashMem::new_for(self.mem_limit, self.mem.len())?,
+            // Sized for the entries the memtable it follows holds, with the entry buffers a kept
+            // memtable shed: it fills without its index or buffers growing, as a cleared spare
+            // refills.
+            None => {
+                let mut fresh = HashMem::new_for(self.mem_limit, self.mem.len())?;
+                if let Some(bufs) = self.kept_shed.take() {
+                    fresh.take_shed(bufs);
+                }
+                fresh
+            }
         };
         self.give_mirror(&mut fresh);
         Ok(fresh)

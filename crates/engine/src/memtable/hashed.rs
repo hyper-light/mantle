@@ -37,7 +37,7 @@ use crate::branch::Op;
 use crate::branch::filter::hash;
 use crate::error::{Error, Malformed};
 use crate::memtable::index::KeyIndex;
-use crate::util::coding::{get_varint32_ptr, put_varint32};
+use crate::util::coding::{get_varint32_ptr, put_varint32s};
 use std::cmp::Ordering;
 
 /// The most bytes an entry's head takes in the arena: the operation (1), then the key's and the
@@ -1032,12 +1032,13 @@ impl HashMem {
         if self.hot_root != NIL {
             self.unmerge(key);
         }
-        self.arena.push(match op {
+        // The entry's head in one append: its operation's byte (below 128, its own varint) and
+        // the key's and value's lengths, a byte each below 128.
+        let code = match op {
             Op::Put => 1,
             Op::Delete => 2,
-        });
-        put_varint32(&mut self.arena, u32::from(klen));
-        put_varint32(&mut self.arena, vlen);
+        };
+        put_varint32s(&mut self.arena, &[code, u32::from(klen), vlen]);
         self.arena.extend_from_slice(key);
         self.arena.extend_from_slice(value);
         if self.mirrored {

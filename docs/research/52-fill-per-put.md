@@ -74,3 +74,17 @@ memtables' bytes and limit while their index is out: that part is the index's to
 All told, 16.2% of polls, 11.9% of the trunk's pass, the 1.8% look, the 1.4% `trim` check, the
 `u128` division's 1.8% and the second hash's 0.9% are 34% of the shard's time per put, about the
 29% 100M needs, and hyper-rt's clocks fixed upstream are 6.8% more.
+
+## 5. Measured
+
+Interleaved on macOS, 10M keys, five rounds, beside 9e53a6c on the same busy host
+(`mac-ab.sh`): the polls at the turn (1e5fee7) filled at 1.17× (0.77–1.71), and with the turn's
+shares paid at the turn (a3a840c) at 1.43× (1.27–2.21), 6.38M puts a second against 4.58M; the
+puts' p99.9 1.9–2.4 µs against 2.3–3.7. Instructions a put across the process fell from 8,110 to
+5,715.
+
+The shard thread after them [sample, a3a840c, 1,181 samples]: the insert 33% (the arena's copy
+and its first-touch faults 10.5%, the copy for the packing worker 3.9%, the head's two varints
+1.9%); the bench's clock read after each put 33%, which on aarch64 waits at its `isb` for the
+loads before it, the insert's misses among them (research/36 §2), and its key generator 7%. The
+head is written in one append now (`put_varint32s`, its operation's byte a varint of its own).

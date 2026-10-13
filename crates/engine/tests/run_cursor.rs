@@ -180,6 +180,59 @@ fn seeks_alternating_between_branches_read_each_leafs_prefix_and_entry_ranges() 
     }
 }
 
+/// A scan's cursor reads a leaf the cache holds where it lies (`Store::cache_slot_ahead`), not
+/// copied into it; once the cache gives that slot to other pages between two steps, the next
+/// step reads the leaf again, so the walk reads exactly the entries the branch holds.
+#[test]
+fn a_cursor_reads_its_leaf_again_once_the_cache_gives_its_slot_away() {
+    let mut s = store(19);
+    s.set_cache(4);
+    let e: Entries = (0u32..3_000)
+        .map(|n| {
+            (
+                n.to_be_bytes().to_vec(),
+                (Op::Put, vec![(n % 256) as u8; 60]),
+            )
+        })
+        .collect();
+    let b = build(&mut s, &e);
+    let want: Vec<Read> = e
+        .iter()
+        .map(|(k, (op, v))| (k.clone(), *op, v.clone()))
+        .collect();
+    let start = want.len() / 3;
+    // A seek reads the start's leaf into the cache; the walk's cursor then reads it in place.
+    let first = b.seek(&mut s, &want[start].0).unwrap();
+    first.give_back(&mut s);
+    let hits = s.io_stats().span_cache_hits;
+    let mut c = b.seek(&mut s, &want[start].0).unwrap();
+    assert!(
+        s.io_stats().span_cache_hits > hits,
+        "the leaf was not cached"
+    );
+    let mut got = Vec::new();
+    let mut i = start;
+    while c.valid() {
+        got.push((c.key().to_vec(), c.op(), c.value().to_vec()));
+        // Seeks elsewhere take the cache's few slots for their own leaves.
+        for far in [
+            i / 7,
+            (i * 3) % want.len(),
+            (i + want.len() / 2) % want.len(),
+            0,
+            want.len() - 1,
+        ] {
+            let other = b.seek(&mut s, &want[far].0).unwrap();
+            other.give_back(&mut s);
+        }
+        c.next(&b, &mut s).unwrap();
+        i += 1;
+        assert!(got.len() <= want.len(), "a walk past the branch's entries");
+    }
+    c.give_back(&mut s);
+    assert_eq!(got, want[start..]);
+}
+
 #[test]
 fn a_seek_refuses_a_corrupt_leaf_and_a_valid_branch_still_reads() {
     let mut s = store(17);

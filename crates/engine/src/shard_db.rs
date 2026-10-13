@@ -2404,10 +2404,10 @@ impl<F: BlockFile> ShardDb<F> {
         self.scan_frozen = frozen;
         // What the walks merged from the runs stays merged for the next seek of that range.
         if !self.scan_charges.is_empty() {
-            let io = self.store.io_stats();
+            let (read_ns, write_ns) = self.store.page_costs();
             let pages = crate::trunk::PageCosts {
-                read_ns: io.read_ns.checked_div(io.pages_read).unwrap_or(0),
-                write_ns: io.write_ns.checked_div(io.pages_written).unwrap_or(0),
+                read_ns,
+                write_ns,
                 extent_pages: u64::from(self.store.extent_pages()),
             };
             self.trunk.charge(&self.scan_charges, pages);
@@ -2638,10 +2638,10 @@ impl<F: BlockFile> ShardDb<F> {
         self.scan_frozen = frozen;
         // What the walks merged from the runs stays merged for the next seek of that range.
         if !self.scan_charges.is_empty() {
-            let io = self.store.io_stats();
+            let (read_ns, write_ns) = self.store.page_costs();
             let pages = crate::trunk::PageCosts {
-                read_ns: io.read_ns.checked_div(io.pages_read).unwrap_or(0),
-                write_ns: io.write_ns.checked_div(io.pages_written).unwrap_or(0),
+                read_ns,
+                write_ns,
                 extent_pages: u64::from(self.store.extent_pages()),
             };
             self.trunk.charge(&self.scan_charges, pages);

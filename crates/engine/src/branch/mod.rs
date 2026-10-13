@@ -1444,13 +1444,12 @@ impl Branch {
         let placed = (|| {
             let page_no = self.leaf_of(from)?;
             c.land(self, store, u64::from(page_no), 0)?;
-            let view = View::new(c.page_data()?)?;
-            let i = view.lower_bound(from)?;
-            if i >= view.n {
+            let (i, n) = c.page_lower_bound(store, from)?;
+            if i >= n {
                 c.next_leaf(self, store)
             } else {
                 c.index = i;
-                c.load()
+                c.load_in(store)
             }
         })();
         match placed {
@@ -1536,10 +1535,14 @@ impl RunCursor {
             .unwrap_or(&[])
     }
 
-    /// In the leaf held: the index of its first entry at least `key` (its entries when none
-    /// is), and its entries.
-    pub fn page_lower_bound(&self, key: &[u8]) -> Result<(usize, usize), Error> {
-        let view = View::new(self.page_data()?)?;
+    /// In the leaf held, wherever it lies: the index of its first entry at least `key` (its
+    /// entries when none is), and its entries.
+    pub fn page_lower_bound<F: BlockFile>(
+        &self,
+        store: &Store<F>,
+        key: &[u8],
+    ) -> Result<(usize, usize), Error> {
+        let view = View::new(self.page_in(store)?)?;
         Ok((view.lower_bound(key)?, view.n))
     }
 
@@ -1554,7 +1557,14 @@ impl RunCursor {
         }
         self.index = self.index.saturating_add(1);
         if self.index < self.n {
-            return self.load();
+            if let Some((slot, address)) = self.cached
+                && store.cache_page(slot, address).is_none()
+            {
+                // The cache gave the leaf's slot away: read the leaf again.
+                self.loaded = None;
+                return self.land(branch, store, self.page_no, self.index);
+            }
+            return self.load_in(store);
         }
         self.next_leaf(branch, store)
     }
@@ -1585,10 +1595,10 @@ impl RunCursor {
             return Ok(Initial::Waiting);
         }
         self.land(branch, store, self.page_no, 0)?;
-        let (index, entries) = self.page_lower_bound(from)?;
+        let (index, entries) = self.page_lower_bound(store, from)?;
         if index < entries {
             self.index = index;
-            self.load()?;
+            self.load_in(store)?;
             return Ok(Initial::Done);
         }
         self.valid = false;
@@ -1713,14 +1723,26 @@ impl RunCursor {
         index: usize,
     ) -> Result<(), Error> {
         let address = branch.page_address(store, page)?;
-        if self.loaded != Some(address) {
+        let held = self.loaded == Some(address)
+            && self
+                .cached
+                .is_none_or(|(slot, a)| store.cache_page(slot, a).is_some());
+        if !held {
             self.loaded = None;
             self.valid = false;
             self.span_page = None;
             self.cached = None;
             self.page.clear();
-            self.span_page = store.read_page_ahead_ref(&mut self.span, address, &mut self.page)?;
-            let view = View::new(self.page_data()?)?;
+            // A scan's leaf the cache holds is read where it lies, as the paced path reads it,
+            // not copied into the cursor; another is read through the span.
+            match store.cache_slot_ahead(&self.span, address) {
+                Some(slot) => self.cached = Some((slot, address)),
+                None => {
+                    self.span_page =
+                        store.read_page_ahead_ref(&mut self.span, address, &mut self.page)?;
+                }
+            }
+            let view = View::new(self.page_in(store)?)?;
             if view.kind != LEAF {
                 return Err(corrupt(Malformed::CountMismatch));
             }
@@ -1745,7 +1767,7 @@ impl RunCursor {
         }
         self.page_no = page;
         self.index = index;
-        self.load()
+        self.load_in(store)
     }
 
     /// Whether moving to the next entry of `branch` reads no page that has not landed

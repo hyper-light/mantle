@@ -2057,22 +2057,18 @@ impl<F: BlockFile> ShardDb<F> {
                 // Sources are timed only when a pivot gave more than its one: what earns rent.
                 let spare = passed.iter().any(|p| {
                     let (_, n) = p.sources();
-                    if p.leaf() { n > 1 } else { n > 0 }
+                    n > 1
                 });
                 merge.open(store, &sources, seg_from, hi, end.is_some(), spare)?;
-                // Each pivot's rent: the measured time its sources took to open, all an index
-                // pivot gave, all but the dearest of a leaf's, which stands for the one branch a
-                // consolidated leaf keeps.
+                // Each pivot's rent: the measured time its sources took to open, all but the
+                // dearest, which stands for the one branch a consolidated leaf keeps and a
+                // flushed index pivot's bundle becomes in its child.
                 let open_ns = merge.open_ns();
                 charges.extend(passed.iter().map(|&p| {
                     let (first, n) = p.sources();
                     let own = open_ns.get(first..first.saturating_add(n)).unwrap_or(&[]);
                     let sum = own.iter().fold(0u64, |a, &b| a.saturating_add(b));
-                    let rent = if p.leaf() {
-                        sum.saturating_sub(own.iter().copied().max().unwrap_or(0))
-                    } else {
-                        sum
-                    };
+                    let rent = sum.saturating_sub(own.iter().copied().max().unwrap_or(0));
                     (p, rent)
                 }));
                 if bounded {
@@ -2269,24 +2265,20 @@ impl<F: BlockFile> ShardDb<F> {
                 // Sources are timed only when a pivot gave more than its one: what earns rent.
                 let spare = passed.iter().any(|p| {
                     let (_, n) = p.sources();
-                    if p.leaf() { n > 1 } else { n > 0 }
+                    n > 1
                 });
                 merge
                     .open(&sources, seg_from, hi, end.is_some(), spare)
                     .await?;
-                // Each pivot's rent: the measured time its sources took to open, all an index
-                // pivot gave, all but the dearest of a leaf's, which stands for the one branch a
-                // consolidated leaf keeps.
+                // Each pivot's rent: the measured time its sources took to open, all but the
+                // dearest, which stands for the one branch a consolidated leaf keeps and a
+                // flushed index pivot's bundle becomes in its child.
                 let open_ns = merge.open_ns();
                 charges.extend(passed.iter().map(|&p| {
                     let (first, n) = p.sources();
                     let own = open_ns.get(first..first.saturating_add(n)).unwrap_or(&[]);
                     let sum = own.iter().fold(0u64, |a, &b| a.saturating_add(b));
-                    let rent = if p.leaf() {
-                        sum.saturating_sub(own.iter().copied().max().unwrap_or(0))
-                    } else {
-                        sum
-                    };
+                    let rent = sum.saturating_sub(own.iter().copied().max().unwrap_or(0));
                     (p, rent)
                 }));
                 if bounded {

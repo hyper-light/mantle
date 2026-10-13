@@ -180,6 +180,9 @@ struct Node {
     wants: Option<Change>,
     /// Queued to be looked at ([`Trunk::queue`]).
     queued: bool,
+    /// Data reached it (the root's pending branches, a parent's flush) since its fullest pivot
+    /// was last considered for a flush ([`Trunk::flush_fullest`]).
+    received: bool,
 }
 
 /// One depth of the trunk ([`Trunk::levels`]): its nodes and pivots, the branches the pivots'
@@ -251,6 +254,8 @@ pub struct TrunkStats {
     pub paid_index: u64,
     pub paid_below: u64,
     pub consolidations_started: u64,
+    /// Fullest pivots flushed past a memtable's entries ([`Trunk::flush_fullest`]).
+    pub fullest_flushes: u64,
     /// The trunk's shape when these were taken ([`Trunk::levels`]), a depth an element from the
     /// root, depths past the last summed into it.
     pub shape: [LevelShape; SHAPE_DEPTHS],
@@ -501,6 +506,7 @@ impl Trunk {
                 end: None,
                 wants: None,
                 queued: false,
+                received: false,
             }],
             root: 0,
             config,
@@ -856,27 +862,11 @@ impl Trunk {
         } else {
             pages.read_ns.saturating_add(pages.write_ns)
         };
-        // The entries and pages of the bundles above, from the descent's root down: each
-        // segment's path starts again at the root.
-        let (mut above_entries, mut above_pages) = (0u64, 0u64);
         for &(ref step, rent) in path {
-            if step.node == self.root {
-                (above_entries, above_pages) = (0, 0);
-            }
-            let (entries, pages_own) = self.consolidation_size(step, pages.extent_pages);
-            let price = above_entries
-                .saturating_add(entries)
+            let (entries, pages_own) = self.bundle_size(step, pages.extent_pages);
+            let price = entries
                 .saturating_mul(key_ns)
-                .saturating_add(
-                    above_pages
-                        .saturating_add(pages_own)
-                        .saturating_mul(page_ns),
-                );
-            if !step.leaf {
-                let (e, p) = self.bundle_size(step, pages.extent_pages);
-                above_entries = above_entries.saturating_add(e);
-                above_pages = above_pages.saturating_add(p);
-            }
+                .saturating_add(pages_own.saturating_mul(page_ns));
             let Some(pivot) = self
                 .nodes
                 .get_mut(step.node)
@@ -928,28 +918,6 @@ impl Trunk {
                 .iter()
                 .chain(inflight.iter().flatten()),
             extent_pages,
-        )
-    }
-
-    /// The entries and pages consolidating the pivot `step` names rewrites, the bundles above
-    /// it aside: a leaf's whole bundle; an index pivot's own branches, and the leaf below's too
-    /// when its child is one, since the settle that follows rewrites it.
-    fn consolidation_size(&self, step: &Passed, extent_pages: u64) -> (u64, u64) {
-        let (entries, pages) = self.bundle_size(step, extent_pages);
-        let below = self
-            .nodes
-            .get(step.node)
-            .and_then(|n| n.pivots.get(step.pivot))
-            .and_then(|p| p.child)
-            .and_then(|c| self.nodes.get(c))
-            .filter(|c| c.leaf)
-            .and_then(|c| c.pivots.first())
-            .map_or((0, 0), |p| {
-                size_of_branches(p.bundle.branches().iter(), extent_pages)
-            });
-        (
-            entries.saturating_add(below.0),
-            pages.saturating_add(below.1),
         )
     }
 
@@ -1262,6 +1230,7 @@ impl Trunk {
             end: None,
             wants: None,
             queued: false,
+            received: false,
         });
         self.root = self.nodes.len().saturating_sub(1);
     }
@@ -1815,6 +1784,7 @@ impl Trunk {
                 end,
                 wants: None,
                 queued: false,
+                received: false,
             });
         }
         if root >= nodes.len() {
@@ -1962,6 +1932,7 @@ impl Trunk {
                     end: None,
                     wants: None,
                     queued: false,
+                    received: false,
                 });
                 out.push((key, self.nodes.len().saturating_sub(1)));
             }
@@ -2012,6 +1983,7 @@ impl Trunk {
                 end: None,
                 wants: None,
                 queued: false,
+                received: false,
             });
             out.push((key, self.nodes.len().saturating_sub(1)));
             rest = tail;

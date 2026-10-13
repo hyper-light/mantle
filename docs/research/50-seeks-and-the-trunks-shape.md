@@ -278,3 +278,46 @@ Direct I/O (`CachingRequest::PreferDirect`; `F_NOCACHE` on this Mac's APFS) doub
 wall time (settle 352 to 401 ns an entry against 151 to 205 buffered), its CPU time the same or more
 (177 to 199 against 150 to 187 ns) and 5% more instructions: no read-ahead or write-behind serves a
 merge reading and writing in turn, and the kernel's copies it avoids did not show as CPU saved.
+
+## 13. Pages workers write, cached where they were written; memory moving between regions
+
+**What a read paid for.** In 1M gets after a 10M fill, 0.49 a get read a page from below the
+shard's cache, 0.57 at 100M, and seeks at 100M 1.57 a seek; the cache held 0.7 MB after the fill
+against a limit of 31.9M pages, and nothing was evicted. The shard's own store wrote 16.7K pages
+of a 100M fill: maintenance workers wrote the rest through stores of their own with no cache, so
+each such read was the first of a page a worker had just written, and a read with no slot made one
+(0.07 page faults a get at 10M, 0.16 at 100M). With 5M gets, the cache warm after the first
+million, the same build answered 867K gets/s against 638K in the 1M-get phase.
+
+**Lent and adopted.** The shard's cache lends each compaction job room for its inputs' pages, within
+its limit and while the machine has twice the memory free (`Cache::lend`); the worker's store keeps
+each node page it writes there (`Kept::keep`, no allocation), and the buffer comes back with the
+job's result, adopted as a chunk whose slots hold those pages when the trunk applies the job's
+branches (`Cache::adopt`); a failed or abandoned job gives the room back. SplinterDB fills its
+cache's pages in place for a pack (clockcache.c `clockcache_alloc`); this reaches the same by
+handing the memory over and back, one owner at a time. Against the build without it [contig],
+three rounds at 10M and two at 100M, RocksDB beside:
+
+| keys | | puts/s | gets/s | seeks/s | page faults a get |
+|---|---|---|---|---|---|
+| 10M | lent | 2.44 M | 905 K | 397 K | 0.0065 |
+| 10M | not lent | 2.30 M | 727 K | 342 K | 0.068 |
+| 10M | RocksDB 256 MiB / 32 GiB | 922 K / 901 K | 282 K / 311 K | 108 K / 164 K | |
+| 100M | lent | 1.92 M | 516 K | 126 K | |
+| 100M | not lent | 1.74 M | 261 K | 109 K | |
+| 100M | RocksDB 256 MiB / 32 GiB | 861 K / 837 K | 245 K / 233 K | 84 K / 98 K | |
+
+Every get's page came from the cache (no device read in the gets). Two costs remain. Each loan is
+fresh memory, so a worker's first touch of it faults (0.078 faults a seek at 10M, whose
+consolidations rewrite about 1.2 GB: about 75K faults of 16 KiB pages), and the memory of pages
+forgotten when their branch is merged away is not lent again: the cache held 55.5 GB after the
+100M seeks against 4.3 GB not lent, its pages' memory following the bytes written, not the data
+live. Loans must reuse what forgotten pages free.
+
+**Memory moving between regions.** A retune gave each region its new share at once: the page cache
+a smaller one it trims down to over half a cycle, the record cache a larger one it grew into at
+once. On one CPU the record cache took a 4 KiB page while the page cache still held 22 KiB above
+its share, and the regions held 1,536 bytes past the budget (`shard_db_paced`'s
+`memory_moving_between_regions_never_holds_more_than_the_budget`, 7 of 40 runs). A region now grows
+past what it holds only into the budget's room, and each trim step grants again what it freed:
+0 of 60 runs.

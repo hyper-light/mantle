@@ -314,6 +314,10 @@ fn rewritten_keys_of_different_prefixes_read_back_after_reopen() {
     }
 }
 
+/// A step's memory as the budget test saw it: the step, the page cache's, write memory's and the
+/// record cache's bytes, the two index charges, and whether a region was giving memory back.
+type Seen = (u64, usize, usize, usize, (usize, usize), bool);
+
 #[test]
 fn memory_moving_between_regions_never_holds_more_than_the_budget() {
     // A shard under a memory budget, filled, then read with a skew that makes the tuner move
@@ -346,6 +350,8 @@ fn memory_moving_between_regions_never_holds_more_than_the_budget() {
     let (mut records_most, mut records_least) = (0, usize::MAX);
     // While giving back: the total when it began, the ops it has taken, and the cycle then.
     let mut giving: Option<(usize, u64, u64)> = None;
+    // The last steps as seen, for a failure's message.
+    let mut recent: std::collections::VecDeque<Seen> = std::collections::VecDeque::new();
     for step in 0..60_000u64 {
         x ^= x << 13;
         x ^= x >> 7;
@@ -363,11 +369,20 @@ fn memory_moving_between_regions_never_holds_more_than_the_budget() {
         }
         let (cache, write, records) = db.memory_held();
         let total = cache + write + records;
+        if recent.len() == 6 {
+            recent.pop_front();
+        }
+        recent.push_back((step, cache, write, records, db.index_bytes(), db.trimming()));
         giving = match (db.trimming(), giving) {
             (false, _) => None,
             (true, None) => Some((total.max(budget), 0, db.cycle_ops())),
             (true, Some((most, ops, cycle))) => {
-                assert!(total <= most, "step {step}: {total} rose past {most}");
+                assert!(
+                    total <= most,
+                    "step {step}: {total} rose past {most}: cache {cache} write {write} records {records}; split {:?} indexes {:?}; recent {recent:?}",
+                    db.memory_split(),
+                    db.index_bytes()
+                );
                 assert!(ops < 2 * cycle, "step {step}: giving back for {ops} ops");
                 Some((most, ops + 1, cycle))
             }

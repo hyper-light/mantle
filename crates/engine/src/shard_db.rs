@@ -1453,30 +1453,65 @@ impl<F: BlockFile> ShardDb<F> {
         );
     }
 
-    /// Sets the page cache's and the record cache's data limits to their shares, each less the
+    /// Sets the page cache's and the record cache's data limits from their shares, each less the
     /// index and ghost bytes it takes now, the charge `memory_held` counts until the next grant:
     /// a cache's data at its limit and that charge are within its share whatever either holds.
-    /// A region whose limit fell is brought down to it by `trim`, a few pages an operation,
-    /// which outpaces a growing region's filling (a page or a record a miss): memory moving
-    /// between them never holds more than it did when the step began.
+    /// A region whose limit fell is brought down to it by `trim`, a few pages an operation; a
+    /// region whose share rose grows past what it holds only into the budget's room, which the
+    /// other's trimming frees, and `trim` grants again after each of its steps. Trimming alone
+    /// did not outpace a growing region's filling (a record cache took a 4 KiB page while the
+    /// page cache still held 22 KiB above its share, research/50 §13), so memory moving between
+    /// them now never holds more than the budget, or than it did when the move began.
     fn grant(&mut self) {
-        if self.memory.is_none() {
+        let Some(budget) = self.memory else {
             return;
-        }
+        };
         let page = self.store.page_size().max(1);
         let (cache_index, records_index) = self.index_bytes();
         self.charged = (cache_index, records_index);
-        let cache = self.cache_share.saturating_sub(cache_index);
+        // A region grows past what it holds only into the budget's room now: while another still
+        // holds what it is giving back (`trim`), the memory moves as it is freed, never held twice.
+        let (cache_held, write_held, records_held) = self.memory_held();
+        let mut room = budget.saturating_sub(
+            cache_held
+                .saturating_add(write_held)
+                .saturating_add(records_held),
+        );
+        let cache = Self::sized(
+            self.cache_share.saturating_sub(cache_index),
+            cache_held.saturating_sub(cache_index),
+            &mut room,
+        );
         self.store
             .resize_cache(cache.checked_div(page).unwrap_or(0));
         if let Some(r) = self.records.as_mut() {
-            let records = self.records_share.saturating_sub(records_index);
+            let records = Self::sized(
+                self.records_share.saturating_sub(records_index),
+                r.held_bytes(),
+                &mut room,
+            );
             r.resize(records);
         }
     }
 
-    /// An operation's share of bringing shrunk regions down to their size.
+    /// A region's size from its `share`: the share when it holds that much or more, which it
+    /// trims down to; else what it `held` and as much more toward the share as `room` has, taken
+    /// from `room`.
+    fn sized(share: usize, held: usize, room: &mut usize) -> usize {
+        if share <= held {
+            return share;
+        }
+        let grow = share.saturating_sub(held).min(*room);
+        *room = room.saturating_sub(grow);
+        held.saturating_add(grow)
+    }
+
+    /// An operation's share of bringing shrunk regions down to their size; what they gave back
+    /// the growing regions may take ([`Self::grant`]).
     fn trim(&mut self) {
+        if !self.trimming() {
+            return;
+        }
         if self.trim_cache > 0 && !self.store.trim_cache(self.trim_cache) {
             self.trim_cache = 0;
         }
@@ -1488,6 +1523,7 @@ impl<F: BlockFile> ShardDb<F> {
         {
             self.trim_records = 0;
         }
+        self.grant();
     }
 
     /// Gives point reads a cache of `bytes` of hot records (`records::RecordCache`), replacing

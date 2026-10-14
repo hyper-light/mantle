@@ -2772,7 +2772,12 @@ impl<F: BlockFile> ShardDb<F> {
             generation: self.store.generation(),
             keep: None,
         });
-        match pool.send(job, Owner::Grow, true) {
+        let sent = match pool.can_take(&mut self.store, true) {
+            Ok(true) => pool.send(job, Owner::Grow, true),
+            Ok(false) => Ok(Err(job)),
+            Err(error) => Err((error, job)),
+        };
+        match sent {
             Ok(Ok(ticket)) => {
                 self.growth = Some((ticket, p.start, p.extents));
                 Ok(true)
@@ -2925,7 +2930,7 @@ impl<F: BlockFile> ShardDb<F> {
                 self.fit_kept(false);
             }
         } else if !self.kept_lists.is_empty() {
-            self.extend_kept();
+            self.extend_kept()?;
         }
         Ok(())
     }
@@ -3254,9 +3259,9 @@ impl<F: BlockFile> ShardDb<F> {
 
     /// Sends the index that is home out to a free worker to take the key lists it lacks, oldest
     /// first: the spare, or a new one while there are fewer than two. One is out at a time.
-    fn extend_kept(&mut self) {
+    fn extend_kept(&mut self) -> Result<(), Error> {
         if self.kept_out || self.kept_lists.is_empty() || self.kept.is_empty() {
-            return;
+            return Ok(());
         }
         let newest = self.kept_lists.back().map(|(n, _)| *n);
         let lacks = |i: &crate::kept::KeptIndex| {
@@ -3268,15 +3273,23 @@ impl<F: BlockFile> ShardDb<F> {
             Some(spare) if lacks(&spare) => spare,
             Some(spare) => {
                 self.kept_spare = Some(spare);
-                return;
+                return Ok(());
             }
             None => crate::kept::KeptIndex::new(),
         };
         // Within the pool's bound, as a packing is: the index is owed maintenance a get waits
         // on, not work the measured need for compactions sizes.
-        let Some(pool) = self.trunk.pool_mut().filter(|pool| pool.can_take(true)) else {
+        let admitted = match self.trunk.pool_mut() {
+            Some(pool) => pool.can_take(&mut self.store, true),
+            None => Ok(false),
+        };
+        let Some(pool) = self
+            .trunk
+            .pool_mut()
+            .filter(|_| matches!(admitted, Ok(true)))
+        else {
             self.kept_spare = Some(index);
-            return;
+            return admitted.map(|_| ());
         };
         let oldest = self.kept.front().map_or(self.kept_next, |k| k.number);
         // Swept when the entries given back since its last sweep are more than half it holds.
@@ -3319,6 +3332,7 @@ impl<F: BlockFile> ShardDb<F> {
                 }
             }
         }
+        Ok(())
     }
 
     /// Takes the index back from its worker, if it is back: it serves gets when it covers newer
@@ -3381,8 +3395,7 @@ impl<F: BlockFile> ShardDb<F> {
             None => self.kept_index = Some(index),
         }
         self.prune_lists();
-        self.extend_kept();
-        Ok(())
+        self.extend_kept()
     }
 
     /// Frees the key lists both indexes have taken, and those of memtables given back.
@@ -3846,7 +3859,7 @@ impl<F: BlockFile> ShardDb<F> {
                     return Ok(1);
                 }
             } else {
-                self.extend_kept();
+                self.extend_kept()?;
                 if self.kept_out {
                     return Ok(1);
                 }
@@ -4118,11 +4131,17 @@ impl<F: BlockFile> ShardDb<F> {
             .unwrap_or(0)
             .saturating_add(1);
         let asked = u64::try_from(extents).unwrap_or(u64::MAX);
+        // The seat first: taking what the workers sent answers their asks for extents, which
+        // take from the extents counted next.
+        let admitted = match self.trunk.pool_mut() {
+            Some(pool) => pool.can_take(&mut self.store, true)?,
+            None => false,
+        };
         if self.store.segments().is_some() && self.store.capacity() < asked {
             self.packing_wanted = self.packing_wanted.max(asked);
             return Ok(Some((full, pack)));
         }
-        let Some(pool) = self.trunk.pool_mut().filter(|pool| pool.can_take(true)) else {
+        let Some(pool) = self.trunk.pool_mut().filter(|_| admitted) else {
             if let Some(pool) = self.trunk.pool_mut() {
                 // Every worker busy: a completion frees the one this packing needs.
                 pool.want_message();
@@ -4250,12 +4269,12 @@ impl<F: BlockFile> ShardDb<F> {
             if let Some(r) = self.rotation.as_mut() {
                 r.stalled = true;
             }
-            if self.trunk.packing_blocks_dispatch() {
+            if self.trunk.packing_blocks_dispatch(&mut self.store)? {
                 // Packings hold every seat: their results free them. Take any back before
                 // waiting on maintenance's worker capacity.
                 self.pack_some(keys.max(1), false)?;
                 self.take_packs(false)?;
-                if self.trunk.packing_blocks_dispatch() {
+                if self.trunk.packing_blocks_dispatch(&mut self.store)? {
                     return Ok(false);
                 }
             }
@@ -4344,7 +4363,7 @@ impl<F: BlockFile> ShardDb<F> {
             stalled = true;
         }
         if !self.trunk.has_room() {
-            if self.trunk.packing_blocks_dispatch() {
+            if self.trunk.packing_blocks_dispatch(&mut self.store)? {
                 // The root's compactions cannot admit a job until a packing seat is free: the
                 // oldest packing's result frees one.
                 self.take_packs(true)?;
@@ -4961,7 +4980,11 @@ mod frozen_tests {
                     "a younger packing neither came back nor waits for a worker"
                 );
                 assert!(
-                    !db.trunk.pool_mut().unwrap().can_take(true),
+                    !db.trunk
+                        .pool_mut()
+                        .unwrap()
+                        .can_take(&mut db.store, true)
+                        .unwrap(),
                     "a younger packing waits while a worker is free"
                 );
             }

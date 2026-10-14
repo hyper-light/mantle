@@ -890,13 +890,7 @@ impl Pool {
     /// Workers a job handed now could have beside those busy: the cores the pool may use less
     /// the jobs out, at least one (the job's own).
     pub fn idle(&self) -> usize {
-        let busy = self
-            .workers
-            .iter()
-            .flatten()
-            .filter(|w| w.owner.is_some())
-            .count();
-        self.most.saturating_sub(busy).max(1)
+        self.most.saturating_sub(self.held()).max(1)
     }
 
     /// The active workers the measured need asks for; idle warm seats may exceed it.
@@ -930,17 +924,45 @@ impl Pool {
     /// Whether a job handed now would go out: a worker is free, or another may start, within
     /// the measured need or, when `waiting` (the shard would otherwise wait on a job no worker
     /// takes, itself evidence the need is more), within the cores.
-    pub fn can_take(&self, waiting: bool) -> bool {
+    ///
+    /// A worker is free once its result is sent, not once its owner takes it, so what the
+    /// workers sent is taken first, as [`Self::take`] takes it: asks for extents answered from
+    /// `store`, results kept for their owners. Counted held until taken, a seat stays held by a
+    /// result whose owner takes it only after the refused work is done: the kept index's,
+    /// taken back once the trunk is idle, held the one seat the trunk's measured need allowed,
+    /// and the trunk, refused it, never became idle (mantle's ranges bench, `--no-inline`,
+    /// 2026-10-14).
+    pub fn can_take<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        waiting: bool,
+    ) -> Result<bool, Error> {
         if self.closing {
-            return false;
+            return Ok(false);
         }
-        let bound = if waiting { self.most } else { self.want };
+        let bound = self.bound(waiting);
+        // The channel holds at most this many: each pass takes one or ends.
+        for _ in 0..self.most.saturating_mul(MESSAGES_A_WORKER) {
+            if self.held() < bound || !self.next(store, false)? {
+                break;
+            }
+        }
+        Ok(self.held() < bound)
+    }
+
+    /// The workers [`Self::can_take`] allows busy: the cores when `waiting`, else the measured
+    /// need.
+    fn bound(&self, waiting: bool) -> usize {
+        if waiting { self.most } else { self.want }
+    }
+
+    /// Workers with a job out whose result is not taken yet.
+    fn held(&self) -> usize {
         self.workers
             .iter()
             .flatten()
             .filter(|w| w.owner.is_some())
             .count()
-            < bound
     }
 
     /// Hands `job` to a free worker for `owner`, starting one if none is free within the bound
@@ -972,15 +994,7 @@ impl Pool {
                 job,
             ));
         };
-        let bound = if waiting { self.most } else { self.want };
-        if self
-            .workers
-            .iter()
-            .flatten()
-            .filter(|w| w.owner.is_some())
-            .count()
-            >= bound
-        {
+        if self.held() >= self.bound(waiting) {
             return Ok(Err(job));
         }
         let free = self
@@ -1347,3 +1361,7 @@ fn ns(d: std::time::Duration) -> u64 {
 #[cfg(test)]
 #[path = "retirement_first_error_native.rs"]
 mod retirement_first_error_native;
+
+#[cfg(test)]
+#[path = "seat_freed.rs"]
+mod seat_freed;

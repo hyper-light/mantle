@@ -1087,7 +1087,10 @@ impl Trunk {
                 let State::Ready(task) = &*state else {
                     continue;
                 };
-                if !self.pool.as_ref().is_some_and(|p| p.can_take(admit)) {
+                let Some(pool) = self.pool.as_mut() else {
+                    return Ok(());
+                };
+                if !pool.can_take(store, admit)? {
                     return Ok(());
                 }
                 let mut landed = true;

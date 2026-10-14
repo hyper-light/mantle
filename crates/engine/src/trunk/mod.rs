@@ -1190,10 +1190,18 @@ impl Trunk {
 
     /// Ready compactions cannot take a seat until packing progresses. A packing can still
     /// need its owner to feed it, so the owner must not wait for its Done inside the trunk.
-    pub(crate) fn packing_blocks_dispatch(&self) -> bool {
-        self.pool.as_ref().is_some_and(|pool| {
-            !pool.can_take(true) && !pool.out_for(Owner::Trunk) && pool.out_for(Owner::Pack)
-        })
+    pub(crate) fn packing_blocks_dispatch<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+    ) -> Result<bool, Error> {
+        let Some(pool) = self.pool.as_mut() else {
+            return Ok(false);
+        };
+        Ok(
+            !pool.can_take(store, true)?
+                && !pool.out_for(Owner::Trunk)
+                && pool.out_for(Owner::Pack),
+        )
     }
 
     /// Hands the trunk maintenance workers: from the next compaction planned on, compactions

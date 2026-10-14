@@ -1016,6 +1016,13 @@ impl Trunk {
         self.consolidation = choice;
     }
 
+    /// Whether the layout is consolidated since branches last entered the root, as far as a
+    /// consolidation of every pivot of several sources asks ([`Self::consolidate_all`]): none is
+    /// asked for or due with consolidation off.
+    pub fn unconsolidated(&self) -> bool {
+        self.consolidation != Consolidation::Never && !self.consolidated && !self.full
+    }
+
     /// Whether a consolidation is owed: seeks paid for one, or a drain asked for one of a
     /// layout not consolidated since branches last entered the root.
     pub fn consolidation_owed(&self) -> bool {

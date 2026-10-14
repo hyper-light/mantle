@@ -3709,6 +3709,20 @@ impl<F: BlockFile> ShardDb<F> {
             || self.store.cache_unreserved() > 0
             || self.kept_out
             || !self.kept_lists.is_empty()
+            || self.quiet_unconsolidated()
+    }
+
+    /// The shard is quiet with a layout to consolidate: its memtable empty since a flush, no
+    /// packing out or frozen, the trunk owing nothing, and its layout not consolidated since
+    /// branches last entered the root. A fill keeps its memtable full, so none is quiet while one
+    /// runs.
+    fn quiet_unconsolidated(&self) -> bool {
+        self.mem.is_empty()
+            && self.packing.is_none()
+            && self.frozen.is_empty()
+            && self.trunk.debt() == 0
+            && self.trunk.is_idle()
+            && self.trunk.unconsolidated()
     }
 
     /// Pays up to `keys` work units of maintenance owed, for the shard's idle time (SILK: the
@@ -3864,6 +3878,12 @@ impl<F: BlockFile> ShardDb<F> {
                     return Ok(1);
                 }
             }
+        }
+        if self.quiet_unconsolidated() {
+            // Nothing written since a flush emptied the memtable and nothing else owed: the whole
+            // trunk consolidates now rather than as seeks pay for it, pivot by pivot
+            // (research/53 §10, the eager arm).
+            self.trunk.consolidate_all();
         }
         if self.trunk.consolidation_owed() {
             // Seeks paid for consolidating leaves: one consolidation, in bulk, flushes and settles

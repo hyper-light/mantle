@@ -71,9 +71,9 @@ const HEIGHT_MASK: u64 = 0xFF;
 const GOLDEN_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
 /// SplitMix64's first finalizer multiplier (Steele, Lea and Flood, OOPSLA 2014; the published
 /// generator's mix).
-const MIX_1: u64 = 0xbf58_476d_1ce4_e5b9;
+pub(crate) const MIX_1: u64 = 0xbf58_476d_1ce4_e5b9;
 /// SplitMix64's second finalizer multiplier, as `MIX_1`.
-const MIX_2: u64 = 0x94d0_49bb_1331_11eb;
+pub(crate) const MIX_2: u64 = 0x94d0_49bb_1331_11eb;
 
 /// A node's key, read from the arena.
 #[derive(Clone, Copy)]

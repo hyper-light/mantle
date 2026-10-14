@@ -336,6 +336,12 @@ impl Sorter {
         Ok(self.keyed.len())
     }
 
+    /// The sorted entries whose keys are below `key`: those a walk in order passes before it.
+    pub fn below(&self, arena: &[u8], key: &[u8]) -> usize {
+        self.keyed
+            .partition_point(|k| self::key(arena, k.entry) < key)
+    }
+
     /// [`Self::each`] with each entry's arena offset: `each(key, op, value, hash, offset)`.
     pub fn each_at(
         &self,

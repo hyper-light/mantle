@@ -92,7 +92,34 @@ is an option, off by default (1), and its boundaries come from 128 anchors a fil
 the task count comes from the settle and the host, the cuts are exact to a leaf, and a task is at
 least one leaf.
 
-## 5. Measured
+## 5. The root's merge (design)
+
+With the settle split, the worst puts left waited on the root's pivot compactions once a root
+split left the root two pivots: one or two tasks of 1.7-2.25M entries (`stallprobe-ps2-*`), the
+shard thread parked through 0.2-1.85 s. A compaction's job measured on its worker
+(`stallprobe-job-quiet-*`, 795 jobs past 200K entries in one quiet 100M fill) spent 825 ns of
+wall time an entry and 214 ns of the worker's CPU: three quarters of a compaction is waiting,
+and the slowest jobs, two inputs of 0.8-0.9M entries, waited over 90% of 3-4.5 s, about 4.5 ms an
+extent read on a device queue every worker and the shard share.
+
+- **Step one: is the root's merge needed?** Every entry is merged once at the root before it
+  moves down: about 100M of the 417-464M entries a 100M fill writes. The merge makes one branch a
+  root pivot, so a pivot's bundle can flush to its child by reference, and holds the sources a
+  read probes at the root to `fanout`. The packing worker writes each memtable in key order
+  already; cut there at the root's pivot keys, each piece is one pivot's alone and enters that
+  pivot's bundle as its newest branch, the same bound on sources, no entry written twice. The
+  root's room is then freed by flushes, which wait on no merge. So the merge is not needed.
+- **The design.** A packing carries the root's pivot keys past its first, as they stand when it is
+  handed out; the worker counts the sorted entries below each (a binary search of the sorted
+  order) so each piece's filter is sized to its own keys, and builds one branch a range. A piece
+  enters its pivot's bundle when its range lies in that pivot's and nothing older is live for the
+  pivot (an in-flight bundle, or a compaction of one, is read before the bundle and must not be
+  newer); a piece whose range a later pivot change crossed, or one behind older in-flight
+  bundles, goes through the root's in-flight list and its compactions as every branch did. The
+  root's room counts a bundle's excess past `fanout` (pieces entered while its child changes and
+  it may not flush), so the sources a read probes at the root keep their bound.
+
+## 6. Measured
 
 To follow: the arm against main, fill-only at 100M, quiet and busy, interleaved; then the
 release gate against RocksDB and SplinterDB.

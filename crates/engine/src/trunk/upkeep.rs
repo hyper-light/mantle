@@ -139,10 +139,18 @@ impl Trunk {
     /// above the root's pivot bundles (the pending branches and a pivot's live in-flight ones),
     /// the bound a pivot's bundle has before it flushes.
     pub fn has_room(&self) -> bool {
+        // A bundle past `fanout` (pieces entered while its child changes and it may not flush)
+        // counts as its excess.
+        let fanout = self.config.fanout;
         let live = self.nodes.get(self.root).map_or(0, |node| {
             node.pivots
                 .iter()
-                .map(|p| node.inflight.len().saturating_sub(p.start))
+                .map(|p| {
+                    node.inflight
+                        .len()
+                        .saturating_sub(p.start)
+                        .saturating_add(p.bundle.branches().len().saturating_sub(fanout))
+                })
                 .max()
                 .unwrap_or(0)
         });
@@ -311,10 +319,44 @@ impl Trunk {
             p.period_started();
         }
         let root = self.root;
-        for b in std::mem::take(&mut self.pending) {
+        let ranges = std::mem::take(&mut self.pending_ranges);
+        for (b, range) in std::mem::take(&mut self.pending).into_iter().zip(ranges) {
             self.entered = self.entered.saturating_add(b.count);
             self.held = self.held.saturating_add(b.count);
-            self.node_mut(root)?.inflight.push(vec![b]);
+            // A piece whose range lies in one root pivot's enters that pivot's bundle as its
+            // newest branch, written once by the packing and merged first below the root, when
+            // nothing older is live for the pivot (an in-flight bundle, or a compaction of one,
+            // is read before the bundle and must not be newer) and the pivot is not held for its
+            // child's split (its bundle stays empty for the parts to replace it). Otherwise, or
+            // for a memtable packed whole, the root's in-flight list takes it, as the pivots'
+            // compactions do.
+            let node = self.node(root)?;
+            let mut pivot = None;
+            if let Some((start, end)) = range.as_ref().filter(|_| !node.leaf) {
+                let i = Self::pivot_of(node, start);
+                let fits = match (end, Self::pivot_end(node, i)) {
+                    (Some(e), Some(u)) => e.as_slice() <= u.as_slice(),
+                    (_, None) => true,
+                    (None, Some(_)) => false,
+                };
+                let p = node.pivots.get(i).ok_or(corrupt())?;
+                if fits && node.inflight.len() <= p.start && !self.held(p)? {
+                    pivot = Some(i);
+                }
+            }
+            match pivot {
+                Some(i) => {
+                    let p = self.node_mut(root)?.pivots.get_mut(i).ok_or(corrupt())?;
+                    p.bundle.push_newest(b);
+                    self.stats.pieces_entered = self.stats.pieces_entered.saturating_add(1);
+                }
+                None => {
+                    if range.is_some() {
+                        self.stats.pieces_inflight = self.stats.pieces_inflight.saturating_add(1);
+                    }
+                    self.node_mut(root)?.inflight.push(vec![b]);
+                }
+            }
         }
         self.node_mut(root)?.received = true;
         self.queue(root);

@@ -573,3 +573,78 @@ fn a_settle_runs_as_one_task_a_leaf_on_the_workers_cores() {
     check_all(&mut db);
     db.check_references().unwrap();
 }
+
+/// Do: on workers, with memtables of 64 KiB and leaves of 1024 entries, put and delete keys
+/// across a trunk that grows a root with pivots; checkpoint, reopen.
+/// Expect: memtables packed while the root has pivots are cut at its pivot keys and their pieces
+/// enter its pivots' bundles with no merge at the root; every key reads its newest value and a
+/// scan reads exactly the live keys, before and after the reopen, every extent named once; and
+/// the trunk holds what its shape walks.
+#[test]
+fn a_memtable_cut_at_the_roots_pivots_enters_their_bundles_unmerged() {
+    const MEM: usize = 64 * 1024;
+    const TRUNK: TrunkConfig = TrunkConfig {
+        fanout: 3,
+        leaf_entries: 1024,
+    };
+    const KEYS: u64 = 6000;
+    const OPS: u64 = 40_000;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let mut db = ShardDb::create(open(&path, true), STORE, MEM, TRUNK).unwrap();
+    workers(&mut db, &path);
+    let mut oracle: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+    let mut x = 0x9e37_79b9_7f4a_7c15_u64;
+    for i in 0..OPS {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let k = key(x % KEYS);
+        if x.is_multiple_of(7) {
+            db.delete(&k).unwrap();
+            oracle.insert(k, None);
+        } else {
+            let v = format!("v{i}-{}", "x".repeat((x % 40) as usize)).into_bytes();
+            db.put(&k, &v).unwrap();
+            oracle.insert(k, Some(v));
+        }
+    }
+    let check_all = |db: &mut ShardDb<DeviceFile>| {
+        for (k, v) in &oracle {
+            let mut value = Vec::new();
+            let got = if db.get(k, &mut value).unwrap() {
+                Some(value)
+            } else {
+                None
+            };
+            assert_eq!(&got, v);
+        }
+        let want: Vec<(Vec<u8>, Vec<u8>)> = oracle
+            .iter()
+            .filter_map(|(k, v)| v.as_ref().map(|v| (k.clone(), v.clone())))
+            .collect();
+        let mut rows = Rows::new();
+        let mut next = Vec::new();
+        assert!(
+            !db.scan(b"", None, usize::MAX, &mut rows, &mut next)
+                .unwrap()
+        );
+        let got: Vec<(Vec<u8>, Vec<u8>)> =
+            rows.iter().map(|(k, v)| (k.to_vec(), v.to_vec())).collect();
+        assert_eq!(got, want);
+    };
+    check_all(&mut db);
+    let (_, trunk, _) = db.stats();
+    assert!(trunk.pieces_entered > 0, "{trunk:?}");
+    held_is_the_shapes(&db);
+    db.checkpoint(OPS).unwrap();
+    db.check_references().unwrap();
+    let (file, landed) = finished_file(db.into_file());
+    landed.unwrap();
+    drop(file);
+    let (mut db, applied) = ShardDb::open(open(&path, false), STORE, MEM, TRUNK).unwrap();
+    assert_eq!(applied, OPS);
+    held_is_the_shapes(&db);
+    check_all(&mut db);
+    db.check_references().unwrap();
+}

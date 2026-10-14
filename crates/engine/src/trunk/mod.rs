@@ -40,6 +40,9 @@ pub mod pool;
 mod upkeep;
 use upkeep::{Change, NodeTask};
 
+/// A key range: its first key and its end, none for no end.
+type KeyRange = (Vec<u8>, Option<Vec<u8>>);
+
 /// The bytes a trunk's branches hold in memory ([`Trunk::memory`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Memory {
@@ -250,6 +253,10 @@ pub struct TrunkStats {
     pub pivot_compactions: u64,
     /// Leaves compacted whole.
     pub leaf_compactions: u64,
+    /// Packed memtables' pieces that entered a root pivot's bundle with no merge at the root
+    /// (docs/research/55), and those that went through the root's in-flight list.
+    pub pieces_entered: u64,
+    pub pieces_inflight: u64,
     /// Tasks the leaves' settles were planned as: one each inline; on the workers, one a leaf a
     /// settle makes, at most one a core they may use (docs/research/55).
     pub settle_tasks: u64,
@@ -348,6 +355,10 @@ pub struct Trunk {
     /// Packed memtables not yet in the tree, oldest first: read before it, and moved into the
     /// root's in-flight list once the root takes no change ([`upkeep`]).
     pending: Vec<Branch>,
+    /// Each pending branch's range when its memtable was cut at the root's pivot keys as it was
+    /// packed ([`Self::add_pieces`]): the root pivot it enters without a merge. None for a
+    /// memtable packed whole.
+    pending_ranges: Vec<Option<KeyRange>>,
     /// Maintenance in progress (CLAUDE.md §10): at most one compaction a pivot and one settle a
     /// node, so bounded by the trunk's size ([`upkeep`]).
     tasks: Vec<NodeTask>,
@@ -586,6 +597,7 @@ impl Trunk {
             saving: Saving::default(),
             stats: TrunkStats::default(),
             pending: Vec::new(),
+            pending_ranges: Vec::new(),
             tasks: Vec::new(),
             looking: VecDeque::new(),
             abandoning: None,
@@ -1182,6 +1194,31 @@ impl Trunk {
     /// next step ([`Self::step`]). Its references are the trunk's from here.
     pub fn add(&mut self, branch: Branch) {
         self.pending.push(branch);
+        self.pending_ranges.push(None);
+    }
+
+    /// Takes a packed memtable cut at the root's pivot keys `cuts` as pending: its pieces, each
+    /// with the key its range starts at (empty for the first), in key order; a piece's range
+    /// ends at the next cut past its start.
+    pub fn add_pieces(&mut self, parts: Vec<(Vec<u8>, Branch)>, cuts: &[Vec<u8>]) {
+        for (start, branch) in parts {
+            let end = cuts
+                .iter()
+                .find(|c| c.as_slice() > start.as_slice())
+                .cloned();
+            self.pending.push(branch);
+            self.pending_ranges.push(Some((start, end)));
+        }
+    }
+
+    /// The keys a memtable packed now is cut at: the root's pivot keys past its first, none
+    /// while the root is a leaf.
+    pub fn root_cuts(&self) -> Vec<Vec<u8>> {
+        self.nodes
+            .get(self.root)
+            .filter(|n| !n.leaf)
+            .map(|n| n.pivots.iter().skip(1).map(|p| p.key.clone()).collect())
+            .unwrap_or_default()
     }
 
     /// Packed memtables pending.
@@ -1943,6 +1980,7 @@ impl Trunk {
             saving: Saving::default(),
             stats: TrunkStats::default(),
             pending: Vec::new(),
+            pending_ranges: Vec::new(),
             tasks: Vec::new(),
             looking: VecDeque::new(),
             abandoning: None,

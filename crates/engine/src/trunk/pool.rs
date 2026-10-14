@@ -88,6 +88,10 @@ pub struct SortPack {
     /// Each kept key's filter hash and arena offset, written as the branch is built, for the
     /// index over the memtables the shard keeps for gets (`crate::kept`, research/51 §7).
     pub keys: crate::kept::KeyList,
+    /// The root's pivot keys past its first, when the root has pivots: the memtable is packed
+    /// into one branch a pivot's range, each entering its pivot's bundle with no merge at the
+    /// root (docs/research/55). None for a root that is a leaf.
+    pub cuts: Vec<Vec<u8>>,
 }
 
 impl SortPack {
@@ -422,6 +426,7 @@ fn run<F: BlockFile>(store: &mut Store<F>, job: &mut Job) -> Result<(Parts, u64)
                 arena,
                 sorter,
                 keys,
+                cuts,
             } = pack;
             let kept = sorter.sort(arena, *skip)?;
             // The memtable counted each key once as it took it: the sort keeps as many.
@@ -431,7 +436,6 @@ fn run<F: BlockFile>(store: &mut Store<F>, job: &mut Job) -> Result<(Parts, u64)
                     why: crate::error::Malformed::CountMismatch,
                 });
             }
-            let mut b = Builder::new(store, Keys::Exactly(*entries))?;
             // The walk's keys, each its newest entry, with their offsets in the copy, the
             // arena's own: the index over kept memtables is built from them.
             keys.clear();
@@ -447,11 +451,43 @@ fn run<F: BlockFile>(store: &mut Store<F>, job: &mut Job) -> Result<(Parts, u64)
                     what: "a memtable's key list",
                     limit: *entries,
                 })?;
-            sorter.each_at(arena, |k, op, v, h, at| {
-                keys.push(crate::branch::filter::hash(k), at);
-                b.add_hashed(store, k, op, v, h)
+            // A piece a range between the root's pivot keys, each the entries the sort holds
+            // below its end less those below its start: its filter sized to its own keys.
+            let mut ends: Vec<usize> = cuts.iter().map(|c| sorter.below(arena, c)).collect();
+            ends.push(kept);
+            let mut parts: Parts = Vec::new();
+            let mut piece = 0usize;
+            let mut begun = 0usize;
+            let mut at = 0usize;
+            let mut b: Option<Builder> = None;
+            sorter.each_at(arena, |k, op, v, h, offset| {
+                keys.push(crate::branch::filter::hash(k), offset);
+                while ends.get(piece).is_some_and(|&end| at >= end) {
+                    if let Some(done) = b.take() {
+                        let start = piece.checked_sub(1).and_then(|c| cuts.get(c)).cloned();
+                        parts.push((start.unwrap_or_default(), done.finish(store)?));
+                    }
+                    begun = ends.get(piece).copied().unwrap_or(begun);
+                    piece = piece.saturating_add(1);
+                }
+                if b.is_none() {
+                    let end = ends.get(piece).copied().unwrap_or(kept);
+                    let n = u64::try_from(end.saturating_sub(begun)).unwrap_or(u64::MAX);
+                    b = Some(Builder::new(store, Keys::Exactly(n))?);
+                }
+                at = at.saturating_add(1);
+                match b.as_mut() {
+                    Some(b) => b.add_hashed(store, k, op, v, h),
+                    None => Err(Error::InvalidArgument {
+                        what: "a packing's piece with no builder",
+                    }),
+                }
             })?;
-            vec![(Vec::new(), b.finish(store)?)]
+            if let Some(done) = b.take() {
+                let start = piece.checked_sub(1).and_then(|c| cuts.get(c)).cloned();
+                parts.push((start.unwrap_or_default(), done.finish(store)?));
+            }
+            parts
         }
         Work::Grow(g) => {
             store.grow_segment(g.start, g.extents, g.add)?;

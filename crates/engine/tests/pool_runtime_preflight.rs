@@ -313,5 +313,6 @@ fn sort_pack(key: &[u8], value: &[u8]) -> SortPack {
         arena: mem.take_mirror().unwrap(),
         sorter: Sorter::default(),
         keys: Default::default(),
+        cuts: Vec::new(),
     }
 }

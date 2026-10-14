@@ -3083,6 +3083,7 @@ impl<F: BlockFile> ShardDb<F> {
     /// No shard-owned Builder repeats the failed job, and nothing younger retires past it.
     fn retire(&mut self, mut f: Frozen) -> Result<(), Error> {
         let mut keys = None;
+        let mut cuts = Vec::new();
         let retired = (|| {
             if let Some(error) = f.error.clone() {
                 return Err(error);
@@ -3093,6 +3094,7 @@ impl<F: BlockFile> ShardDb<F> {
             if let Some(mut pack) = back.sorted.take() {
                 f.sorting = 0;
                 keys = Some(std::mem::take(&mut pack.keys));
+                cuts = std::mem::take(&mut pack.cuts);
                 self.keep_sort_pack(pack);
             }
             let failed = back
@@ -3142,19 +3144,18 @@ impl<F: BlockFile> ShardDb<F> {
             if let Some(error) = cleanup_error {
                 return Err(error);
             }
-            if out.parts.len() != 1 {
+            // One branch a range between the root's pivot keys the memtable was cut at, at most
+            // one more than the cuts, at least one; one without cuts.
+            if out.parts.is_empty() || out.parts.len() > cuts.len().saturating_add(1) {
                 return Err(Error::InvalidArgument {
-                    what: "a packing worker's result without exactly one branch",
+                    what: "a packing worker's result with no branch or more than its cuts make",
                 });
             }
-            let (_, branch) = out.parts.pop().ok_or(Error::InvalidArgument {
-                what: "a packing worker's result with no branch",
-            })?;
             self.store.extend_end(out.end);
-            Ok(branch)
+            Ok(std::mem::take(&mut out.parts))
         })();
-        let branch = match retired {
-            Ok(branch) => branch,
+        let parts = match retired {
+            Ok(parts) => parts,
             Err(error) => {
                 f.error.get_or_insert_with(|| error.clone());
                 self.terminal_error.get_or_insert_with(|| error.clone());
@@ -3163,7 +3164,13 @@ impl<F: BlockFile> ShardDb<F> {
             }
         };
         let Frozen { mem, since, .. } = f;
-        self.trunk.add(branch);
+        if cuts.is_empty() {
+            for (_, branch) in parts {
+                self.trunk.add(branch);
+            }
+        } else {
+            self.trunk.add_pieces(parts, &cuts);
+        }
         self.pack_ns = u64::try_from(
             std::time::Instant::now()
                 .saturating_duration_since(since)
@@ -4122,6 +4129,9 @@ impl<F: BlockFile> ShardDb<F> {
             pack.entries = u64::try_from(full.len()).unwrap_or(u64::MAX);
             pack.skip = full.skip();
             pack.arena = arena;
+            // Cut at the root's pivot keys as they stand: each piece enters its pivot's bundle
+            // with no merge at the root (docs/research/55).
+            pack.cuts = self.trunk.root_cuts();
             if let Some((mem, pack)) = self.sort_off(full, pack, since)? {
                 self.packing = Some(Packing {
                     mem,

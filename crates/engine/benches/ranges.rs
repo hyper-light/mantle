@@ -239,6 +239,20 @@ struct Trickled {
     done: Mark,
 }
 
+/// `--tombstones`: the keys drawn, the deletes of those the fill left absent and the gets after
+/// each draw, their latencies, each range's counters before and after, and the marks around them.
+struct Tombstoned {
+    draws: u64,
+    deletes: u64,
+    found: u64,
+    delete_lat: Histogram,
+    get_lat: Histogram,
+    before: Vec<RangeStats>,
+    after: Vec<RangeStats>,
+    start: Mark,
+    done: Mark,
+}
+
 /// The settled queries of `--queries-again`: their gets and seeks and the marks around them.
 struct Again {
     start: Mark,
@@ -315,6 +329,57 @@ impl Workload {
             }
         }
         Ok(puts)
+    }
+
+    /// `--tombstones`: `n` draws over the key space from the stream `phase`, each key the fill left
+    /// absent deleted, a delete's entry a sixth of a put's, so a memtable takes more keys than its
+    /// index was made for; after each draw a get of a key from the queries' stream, checked
+    /// against the fill's oracle, which the deletes leave as it was. Each operation's latency is
+    /// the time since the one before it ended, as the phases measure it.
+    async fn tombstones_async(
+        &self,
+        ranges: &Ranges,
+        n: u64,
+        phase: u64,
+    ) -> Result<(u64, u64, Histogram, Histogram), BenchError> {
+        let mut client = ranges.client()?;
+        let mut draws = self.rng(phase, 0);
+        let mut gets = self.rng(2, 0);
+        let mut delete_lat = Histogram::new();
+        let mut get_lat = Histogram::new();
+        let mut value = Vec::new();
+        let mut deletes = 0u64;
+        let mut found = 0u64;
+        let mut last = Instant::now();
+        for _ in 0..n {
+            let k = draws.next() % self.num;
+            if !self.present.holds(k) {
+                client.delete_async(&rocks_workload::key(k)).await?;
+                let now = Instant::now();
+                delete_lat.record(now.duration_since(last).as_nanos() as u64);
+                last = now;
+                deletes += 1;
+            }
+            let g = gets.next() % self.num;
+            let hit = client
+                .get_async(&rocks_workload::key(g), &mut value)
+                .await?;
+            let now = Instant::now();
+            get_lat.record(now.duration_since(last).as_nanos() as u64);
+            last = now;
+            require(
+                hit == self.present.holds(g),
+                "found flag differs from the fill oracle",
+            )?;
+            if hit {
+                require(
+                    value.as_slice() == fill_value(),
+                    "get value differs from the fill oracle",
+                )?;
+            }
+            found += u64::from(hit);
+        }
+        Ok((deletes, found, delete_lat, get_lat))
     }
 
     fn rng(&self, phase: u64, thread: u64) -> rocks_workload::Rng {
@@ -767,6 +832,11 @@ fn main() -> Result<(), BenchError> {
     // `pretrickle` and `posttrickle` and the `trickle` costs count apart from the queries
     // (docs/research/53). The client on its range's shard only.
     let mut trickle: Option<(u64, u64)> = None;
+    // `--tombstones=N`: after the queries, N draws over the key space, each key the fill left
+    // absent deleted and a get after each draw (`Workload::tombstones_async`): a memtable taking
+    // more keys than its index was made for, read as it fills (docs/research/54 §5). The client
+    // on its range's shard only.
+    let mut tombstones: Option<u64> = None;
     let mut args = Vec::new();
     for arg in std::env::args().skip(1) {
         if arg == "--shard-client" {
@@ -783,6 +853,8 @@ fn main() -> Result<(), BenchError> {
             caching = CachingRequest::PreferDirect;
         } else if arg == "--queries-again" {
             queries_again = true;
+        } else if let Some(value) = arg.strip_prefix("--tombstones=") {
+            tombstones = Some(value.parse()?);
         } else if let Some(value) = arg.strip_prefix("--trickle=") {
             let (rounds, puts) = value
                 .split_once(':')
@@ -809,6 +881,12 @@ fn main() -> Result<(), BenchError> {
         } else if arg != "--bench" {
             args.push(arg);
         }
+    }
+    if tombstones.is_some() && !shard_client {
+        return Err(io::Error::other(
+            "--tombstones= runs the client on its range's shard: --shard-client",
+        )
+        .into());
     }
     if trickle.is_some() && !shard_client {
         return Err(io::Error::other(
@@ -1023,6 +1101,7 @@ fn main() -> Result<(), BenchError> {
         query_stats,
         postquery,
         again,
+        mut tombstoned,
         trickled,
         workload,
     ) = if shard_client {
@@ -1090,6 +1169,30 @@ fn main() -> Result<(), BenchError> {
                 } else {
                     None
                 };
+                let tombstoned = match tombstones {
+                    Some(n) => {
+                        let before = client.stats_async().await?;
+                        let start = Mark::now()?;
+                        // The stream after every one the trickle draws from.
+                        let phase = 4 + trickle.map_or(0, |(rounds, _)| rounds);
+                        let (deletes, found, delete_lat, get_lat) =
+                            workload.tombstones_async(&ranges, n, phase).await?;
+                        let done = Mark::now()?;
+                        let after = client.stats_async().await?;
+                        Some(Tombstoned {
+                            draws: n,
+                            deletes,
+                            found,
+                            delete_lat,
+                            get_lat,
+                            before,
+                            after,
+                            start,
+                            done,
+                        })
+                    }
+                    None => None,
+                };
                 let trickled = match trickle {
                     Some((rounds, draws)) => {
                         let before = client.stats_async().await?;
@@ -1128,6 +1231,7 @@ fn main() -> Result<(), BenchError> {
                     query_stats,
                     postquery,
                     again,
+                    tombstoned,
                     trickled,
                     workload,
                 ))
@@ -1195,6 +1299,7 @@ fn main() -> Result<(), BenchError> {
             query_stats,
             postquery,
             again,
+            None,
             None,
             workload,
         )
@@ -1265,13 +1370,40 @@ fn main() -> Result<(), BenchError> {
         }
         None => postquery,
     };
+    let stop_from = match tombstoned.as_mut() {
+        Some(t) => {
+            println!(
+                "tombstones draws {} deletes {} found {}",
+                t.draws, t.deletes, t.found
+            );
+            let at = |h: &Histogram, ppm: u32| h.quantile(ppm) as f64 / 1000.0;
+            for (name, h) in [("delete", &t.delete_lat), ("get", &t.get_lat)] {
+                println!(
+                    "tombstones {name} latency_us p50 {:.2} p99 {:.2} p99.9 {:.2} p99.99 {:.2} max {:.2}",
+                    at(h, 500_000),
+                    at(h, 990_000),
+                    at(h, 999_000),
+                    at(h, 999_900),
+                    h.max() as f64 / 1000.0
+                );
+            }
+            costs(
+                "tombstones",
+                t.draws.saturating_add(t.deletes).max(1),
+                &t.start,
+                &t.done,
+            );
+            &t.done
+        }
+        None => &stop_from,
+    };
     let stop_from = match &trickled {
         Some(t) => {
             println!("trickle rounds {} puts {}", t.rounds, t.puts);
             costs("trickle", t.puts.max(1), &t.start, &t.done);
             &t.done
         }
-        None => &stop_from,
+        None => stop_from,
     };
     costs("stop_shutdown", threads * num, stop_from, &stopped);
     costs("paid_total", total, &start, &stopped);
@@ -1292,6 +1424,10 @@ fn main() -> Result<(), BenchError> {
     stats("postfill", &fill_stats);
     stats("postread", &read_stats);
     stats("postquery", &query_stats);
+    if let Some(t) = &tombstoned {
+        stats("pretombstones", &t.before);
+        stats("posttombstones", &t.after);
+    }
     if let Some(t) = &trickled {
         stats("pretrickle", &t.before);
         stats("posttrickle", &t.after);

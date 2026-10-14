@@ -37,7 +37,7 @@ use crate::branch::Op;
 use crate::branch::filter::hash;
 use crate::error::{Error, Malformed};
 use crate::memtable::index::KeyIndex;
-use crate::util::coding::{get_varint32_ptr, put_varint32s};
+use crate::util::coding::{get_varint32_ptr, put_varint32s, varint_length};
 use std::cmp::Ordering;
 
 /// The most bytes an entry's head takes in the arena: the operation (1), then the key's and the
@@ -1033,14 +1033,30 @@ impl HashMem {
                 limit: u64::try_from(self.limit).unwrap_or(u64::MAX),
             });
         }
-        // An index with no bucket free bounds the memtable as its arena does: it is packed.
-        if self.index_sized && !self.index.has_room() {
+        let entry = u32::try_from(self.arena.len()).map_err(|_| corrupt())?;
+        if !self.index_sized {
+            // A memtable made with no size for its index: a bucket for each entry the arena holds
+            // at the bytes this first one takes, as `full_keys` counts.
+            let bytes = varint_length(u64::from(klen))
+                .saturating_add(varint_length(u64::from(vlen)))
+                .saturating_add(1)
+                .saturating_add(key.len())
+                .saturating_add(value.len());
+            self.index = KeyIndex::sized(self.limit.checked_div(bytes).unwrap_or(0), 0);
+            self.index_sized = true;
+        }
+        // The entry's place in the index first: a key both of whose groups are full is refused,
+        // nothing changed, and the memtable is packed as when its arena is full.
+        let arena = &self.arena;
+        let Some(replaced) = self.index.put(h, entry, |e| self::key(arena, e) == key) else {
             return Err(Error::LimitExceeded {
                 what: "a memtable's index",
                 limit: u64::try_from(self.index.buckets()).unwrap_or(u64::MAX),
             });
+        };
+        if replaced.is_none() {
+            self.len = self.len.saturating_add(1);
         }
-        let entry = u32::try_from(self.arena.len()).map_err(|_| corrupt())?;
         if entry == 0 {
             self.first.clear();
             self.first.extend_from_slice(key);
@@ -1084,22 +1100,6 @@ impl HashMem {
             } else {
                 self.mirrored = false;
             }
-        }
-        if !self.index_sized {
-            // A memtable made with no size for its index: a bucket for each entry the arena holds
-            // at the bytes this first one took, so the index fills no sooner than the arena with
-            // entries like it.
-            // The keys its arena holds full of entries like this one, as `full_keys` counts.
-            self.index = KeyIndex::sized(self.limit.checked_div(self.arena.len()).unwrap_or(0), 0);
-            self.index_sized = true;
-        }
-        let arena = &self.arena;
-        let replaced = self
-            .index
-            .put(h, entry, |e| self::key(arena, e) == key)
-            .ok_or_else(corrupt)?;
-        if replaced.is_none() {
-            self.len = self.len.saturating_add(1);
         }
         self.tail.push(Keyed {
             prefix: prefix(key, self.skip),

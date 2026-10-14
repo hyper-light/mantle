@@ -9,12 +9,15 @@
 //! clashes beside the table.
 //!
 //! A group is matched as `IncMap` matches one (Abseil's SwissTable: a control byte a bucket, 7 bits
-//! of the hash, read eight at a time; hashbrown's portable group). A key's first group is its
-//! hash's bits below the tag multiplied into the count of groups, the product's high word
-//! (multiply-shift range reduction: Lemire, "Fast Random Integer Generation in an Interval", ACM
-//! TOMACS 29(1), 2019), so a table holds any count of groups its memory buys; a probe goes on to
-//! the next group, wrapping, so it reaches every group of any count. The table never grows: one
-//! with no bucket free refuses a new key ([`KeyIndex::put`]), and its memtable is packed.
+//! of the hash, read eight at a time; hashbrown's portable group). A key has two groups, each from
+//! its own half of the hash's bits below the tag, multiplied into the count of groups and shifted
+//! down (multiply-shift range reduction: Lemire, "Fast Random Integer Generation in an Interval",
+//! ACM TOMACS 29(1), 2019), so a table holds any count of groups its memory buys; a new key takes
+//! the emptier of its two (Azar, Broder, Karlin and Upfal, "Balanced Allocations", SIAM J. Comput.
+//! 29(1), 1999: two choices hold the fullest group within `ln ln n / ln 2` of the mean, where one
+//! choice lets it grow as `ln n / ln ln n`). Every probe reads the two groups' lines and no other,
+//! as two loads issued together, at any load. The table never grows: a key whose two groups are
+//! full is refused ([`KeyIndex::put`]), and its memtable is packed.
 
 // Group matching's constants are `util::incmap`'s, derived and cited there.
 use crate::util::incmap::{EMPTY, FIB, GROUP, HIGH, LOW, repeat};
@@ -38,7 +41,12 @@ impl Group {
     };
 }
 
-/// One table: the groups its memory buys, at least one.
+/// The bits of the hash each of a key's two groups is taken from: half of the 57 below the tag.
+const HALF: u32 = 28;
+/// The most groups a table holds: a group's bits times the count of groups stays in a word.
+const MOST_GROUPS: usize = 1 << HALF;
+
+/// One table: the groups its memory buys, at least one and at most [`MOST_GROUPS`].
 #[derive(Debug)]
 struct Table {
     groups: Vec<Group>,
@@ -54,7 +62,7 @@ impl Default for Table {
 impl Table {
     fn new(groups: usize) -> Self {
         Self {
-            groups: vec![Group::EMPTY; groups.max(1)],
+            groups: vec![Group::EMPTY; groups.clamp(1, MOST_GROUPS)],
             full: 0,
         }
     }
@@ -85,51 +93,62 @@ impl Table {
             .and_then(|group| group.slots.get_mut(i % GROUP))
     }
 
-    /// A hash's tag, its top 7 bits after mixing, and its first group: the 57 bits below the tag
-    /// times the count of groups, the product's high word.
+    /// A hash's tag, its top 7 bits after mixing, and its two groups: each a half of the 57 bits
+    /// below the tag times the count of groups, the product shifted down by the half's bits.
     #[inline]
-    fn place(&self, hash: u64) -> (u8, usize) {
+    fn place(&self, hash: u64) -> (u8, usize, usize) {
         let m = hash.wrapping_mul(FIB);
         let tag = u8::try_from(m >> 57).unwrap_or(0);
-        let groups = u128::try_from(self.groups.len()).unwrap_or(u128::MAX);
-        let group = usize::try_from(u128::from(m << 7).wrapping_mul(groups) >> 64).unwrap_or(0);
-        (tag, group)
+        let half = (1u64 << HALF).wrapping_sub(1);
+        let groups = u64::try_from(self.groups.len()).unwrap_or(0);
+        let group =
+            |bits: u64| usize::try_from((bits & half).wrapping_mul(groups) >> HALF).unwrap_or(0);
+        (tag, group(m), group(m >> HALF))
     }
 
-    /// The bucket holding an entry whose key `same` accepts, or else the first empty bucket the
-    /// probe passed.
+    /// The bucket in group `g` (control word `w`) holding an entry whose key `same` accepts.
+    #[inline]
+    fn found(&self, g: usize, w: u64, pattern: u64, same: &impl Fn(u32) -> bool) -> Option<usize> {
+        let at = g.wrapping_mul(GROUP);
+        let cmp = w ^ pattern;
+        let mut m = cmp.wrapping_sub(LOW) & !cmp & HIGH;
+        while m != 0 {
+            let i = at.wrapping_add(usize::try_from(m.trailing_zeros() / 8).unwrap_or(0));
+            if self.slot(i).is_some_and(same) {
+                return Some(i);
+            }
+            m &= m.wrapping_sub(1);
+        }
+        None
+    }
+
+    /// The bucket holding an entry whose key `same` accepts, or else the first empty bucket of
+    /// the key's emptier group, none when both are full. Both groups' words are read before
+    /// either is matched, so their misses overlap.
     #[inline]
     fn seek(&self, hash: u64, same: impl Fn(u32) -> bool) -> Result<usize, Option<usize>> {
-        let (tag, mut g) = self.place(hash);
+        let (tag, g1, g2) = self.place(hash);
         let pattern = repeat(tag);
-        let mut free = None;
-        // Each round reads a group, the next after it: every group once.
-        for _ in 0..self.groups.len() {
-            let w = self.word(g);
-            let at = g.wrapping_mul(GROUP);
-            let cmp = w ^ pattern;
-            let mut m = cmp.wrapping_sub(LOW) & !cmp & HIGH;
-            while m != 0 {
-                let i = at.wrapping_add(usize::try_from(m.trailing_zeros() / 8).unwrap_or(0));
-                if self.slot(i).is_some_and(&same) {
-                    return Ok(i);
-                }
-                m &= m.wrapping_sub(1);
-            }
-            if free.is_none() && w & HIGH != 0 {
-                let b = usize::try_from((w & HIGH).trailing_zeros() / 8).unwrap_or(0);
-                free = Some(at.wrapping_add(b));
-            }
-            // An empty bucket ends the probe: the key would have been placed by then.
-            if w & (w << 1) & HIGH != 0 {
-                return Err(free);
-            }
-            g = g.wrapping_add(1);
-            if g == self.groups.len() {
-                g = 0;
-            }
+        let (w1, w2) = (self.word(g1), self.word(g2));
+        if let Some(i) = self.found(g1, w1, pattern, &same) {
+            return Ok(i);
         }
-        Err(free)
+        if g2 != g1
+            && let Some(i) = self.found(g2, w2, pattern, &same)
+        {
+            return Ok(i);
+        }
+        let empty = |w: u64| (w & HIGH).count_ones();
+        let (g, w) = if g2 != g1 && empty(w2) > empty(w1) {
+            (g2, w2)
+        } else {
+            (g1, w1)
+        };
+        if w & HIGH == 0 {
+            return Err(None);
+        }
+        let b = usize::try_from((w & HIGH).trailing_zeros() / 8).unwrap_or(0);
+        Err(Some(g.wrapping_mul(GROUP).wrapping_add(b)))
     }
 
     fn set_ctrl(&mut self, i: usize, c: u8) {
@@ -148,7 +167,7 @@ impl Table {
     }
 
     /// Puts `entry` in the bucket an entry `same` accepts holds, or a new one: the entry it
-    /// replaced. `None` with no bucket free.
+    /// replaced. `None` with both of the key's groups full.
     fn put(&mut self, hash: u64, entry: u32, same: impl Fn(u32) -> bool) -> Option<Option<u32>> {
         match self.seek(hash, same) {
             Ok(i) => {
@@ -157,7 +176,7 @@ impl Table {
             }
             Err(free) => {
                 let at = free?;
-                let (tag, _) = self.place(hash);
+                let (tag, _, _) = self.place(hash);
                 self.set_ctrl(at, tag);
                 *self.slot_mut(at)? = entry;
                 self.full = self.full.saturating_add(1);
@@ -190,16 +209,16 @@ impl KeyIndex {
 
     /// Whether [`Self::sized`] with these would make the table this one has.
     pub fn is_sized(&self, entries: usize, extra: usize) -> bool {
-        self.table.groups.len() == Self::groups_for(entries, extra).max(1)
+        self.table.groups.len() == Self::groups_for(entries, extra).clamp(1, MOST_GROUPS)
     }
 
-    /// Reads `hash`'s first group, the line holding its control word and its entries, so a probe
-    /// made after finds it cached: several indexes' misses overlapped rather than one after
+    /// Reads `hash`'s two groups, the lines holding their control words and entries, so a probe
+    /// made after finds them cached: several indexes' misses overlapped rather than one after
     /// another (the shard's kept memtables, research/51).
     #[inline]
     pub fn touch(&self, hash: u64) -> u64 {
-        let (_, g) = self.table.place(hash);
-        self.table.word(g)
+        let (_, g1, g2) = self.table.place(hash);
+        self.table.word(g1) ^ self.table.word(g2)
     }
 
     /// Each key's newest entry, in no order.
@@ -231,11 +250,6 @@ impl KeyIndex {
         self.table.buckets()
     }
 
-    /// Whether a new key has a bucket.
-    pub fn has_room(&self) -> bool {
-        self.table.full < self.table.buckets()
-    }
-
     /// The newest entry of a key of hash `hash` that `same` accepts.
     #[inline]
     pub fn get(&self, hash: u64, same: impl Fn(u32) -> bool) -> Option<u32> {
@@ -264,10 +278,13 @@ mod tests {
     use std::collections::HashMap;
 
     /// Keys as offsets into a list standing for the arena; a key's hash chosen by the test, so
-    /// keys of one hash are distinct entries. Tables of counts of groups that are not powers of
-    /// two, from one group, filled to every bucket.
+    /// keys of one hash are distinct entries, and those sharing hash 42 share both groups. Tables
+    /// of counts of groups that are not powers of two, from one group, drawn into four times
+    /// their buckets over: a key is taken while one of its groups has a bucket and refused once
+    /// both are full, changing nothing; what is held answers as a map does, a held key is still
+    /// replaced, a refused one is never found.
     #[test]
-    fn it_answers_as_a_map_does_to_its_last_bucket_for_any_count_of_groups() {
+    fn it_answers_as_a_map_does_and_refuses_a_key_both_of_whose_groups_are_full() {
         let hash_of_key = |k: u64| {
             if k.is_multiple_of(7) {
                 42
@@ -281,57 +298,68 @@ mod tests {
             assert_eq!(index.buckets(), buckets);
             let mut keys: Vec<u64> = Vec::new();
             let mut model: HashMap<u64, u32> = HashMap::new();
+            let mut refused: std::collections::HashSet<u64> = Default::default();
             let mut x = 0x9e37_79b9_7f4a_7c15u64 ^ groups as u64;
-            while model.len() < buckets {
+            for _ in 0..4 * buckets {
                 x ^= x << 13;
                 x ^= x >> 7;
                 x ^= x << 17;
-                // Keys drawn from twice the buckets: repeats replace, new ones take a bucket.
                 let k = x % (2 * buckets as u64);
                 let entry = u32::try_from(keys.len()).unwrap();
                 keys.push(k);
-                let was = index.put(hash_of_key(k), entry, |e| keys[e as usize] == k);
-                assert_eq!(was, Some(model.insert(k, entry)), "groups {groups}");
+                match index.put(hash_of_key(k), entry, |e| keys[e as usize] == k) {
+                    Some(was) => {
+                        assert!(
+                            !refused.contains(&k),
+                            "groups {groups}: a refused key taken"
+                        );
+                        assert_eq!(was, model.insert(k, entry), "groups {groups}");
+                    }
+                    None => {
+                        assert!(
+                            !model.contains_key(&k),
+                            "groups {groups}: a held key refused"
+                        );
+                        refused.insert(k);
+                    }
+                }
                 if x.is_multiple_of(5) {
                     let probe = (x >> 20) % (2 * buckets as u64);
                     let got = index.get(hash_of_key(probe), |e| keys[e as usize] == probe);
                     assert_eq!(got, model.get(&probe).copied(), "groups {groups}");
                 }
             }
-            assert!(!index.has_room());
-            // Full: a new key is refused, changing nothing; a held key is still replaced.
-            let absent = 2 * buckets as u64 + 1;
-            keys.push(absent);
-            let entry = u32::try_from(keys.len() - 1).unwrap();
-            assert_eq!(
-                index.put(hash_of_key(absent), entry, |e| keys[e as usize] == absent),
-                None
-            );
-            let (&held, _) = model.iter().next().unwrap();
-            keys.push(held);
-            let entry = u32::try_from(keys.len() - 1).unwrap();
-            assert!(
-                index
-                    .put(hash_of_key(held), entry, |e| keys[e as usize] == held)
-                    .is_some_and(|was| was.is_some())
-            );
-            model.insert(held, entry);
+            assert!(model.len() <= buckets);
             for (&k, &e) in &model {
                 assert_eq!(
                     index.get(hash_of_key(k), |f| keys[f as usize] == k),
                     Some(e)
                 );
             }
-            assert_eq!(
-                index.get(hash_of_key(absent), |e| keys[e as usize] == absent),
-                None
-            );
+            for &k in &refused {
+                assert_eq!(index.get(hash_of_key(k), |e| keys[e as usize] == k), None);
+            }
+            if let Some((&held, _)) = model.iter().next() {
+                keys.push(held);
+                let entry = u32::try_from(keys.len() - 1).unwrap();
+                assert!(
+                    index
+                        .put(hash_of_key(held), entry, |e| keys[e as usize] == held)
+                        .is_some_and(|was| was.is_some())
+                );
+            }
             let mut listed = 0;
             index.each_entry(|_| listed += 1);
             assert_eq!(listed, model.len());
             index.clear();
-            assert!(index.has_room());
             assert_eq!(index.buckets(), buckets);
+            let k = 1u64;
+            keys.push(k);
+            let entry = u32::try_from(keys.len() - 1).unwrap();
+            assert_eq!(
+                index.put(hash_of_key(k), entry, |e| keys[e as usize] == k),
+                Some(None)
+            );
         }
     }
 

@@ -12,12 +12,15 @@
 //! of the hash, read eight at a time; hashbrown's portable group). A key has two groups, each from
 //! its own half of the hash's bits below the tag, multiplied into the count of groups and shifted
 //! down (multiply-shift range reduction: Lemire, "Fast Random Integer Generation in an Interval",
-//! ACM TOMACS 29(1), 2019), so a table holds any count of groups its memory buys; a new key takes
-//! the emptier of its two (Azar, Broder, Karlin and Upfal, "Balanced Allocations", SIAM J. Comput.
-//! 29(1), 1999: two choices hold the fullest group within `ln ln n / ln 2` of the mean, where one
-//! choice lets it grow as `ln n / ln ln n`). Every probe reads the two groups' lines and no other,
-//! as two loads issued together, at any load. The table never grows: a key whose two groups are
-//! full is refused ([`KeyIndex::put`]), and its memtable is packed.
+//! ACM TOMACS 29(1), 2019), so a table holds any count of groups its memory buys. A new key takes
+//! its first group while that has a bucket free, and only once it is full its second, marking the
+//! first as overflowed, in its line: as folly's F14 counts the keys that overflowed a chunk so a
+//! lookup stops at one none did (Bronson and Shi, "Open-sourcing F14", Engineering at Meta,
+//! 2019). A group only fills, so a marked group is full and an unmarked one sent no key away: a
+//! lookup reads a key's first group, and its second only when the first is marked, two lines at
+//! most and one while the first never overflowed, where taking the emptier of the two always
+//! reads both (research/54 §6). The table never grows: a key both of whose groups are full is
+//! refused ([`KeyIndex::put`]), and its memtable is packed.
 
 // Group matching's constants are `util::incmap`'s, derived and cited there.
 use crate::util::incmap::{EMPTY, FIB, GROUP, HIGH, LOW, repeat};
@@ -32,12 +35,15 @@ use crate::util::incmap::{EMPTY, FIB, GROUP, HIGH, LOW, repeat};
 struct Group {
     ctrl: u64,
     slots: [u32; GROUP],
+    /// A key whose first group this is went to its second: set once this group was full.
+    overflowed: bool,
 }
 
 impl Group {
     const EMPTY: Self = Self {
         ctrl: repeat(EMPTY),
         slots: [0; GROUP],
+        overflowed: false,
     };
 }
 
@@ -122,33 +128,65 @@ impl Table {
         None
     }
 
-    /// The bucket holding an entry whose key `same` accepts, or else the first empty bucket of
-    /// the key's emptier group, none when both are full. Both groups' words are read before
-    /// either is matched, so their misses overlap.
+    /// Whether group `g` sent a key to that key's second group.
     #[inline]
-    fn seek(&self, hash: u64, same: impl Fn(u32) -> bool) -> Result<usize, Option<usize>> {
+    fn marked(&self, g: usize) -> bool {
+        self.groups.get(g).is_some_and(|group| group.overflowed)
+    }
+
+    /// The first free bucket of group `g`, whose control word is `w`.
+    #[inline]
+    fn free(g: usize, w: u64) -> Option<usize> {
+        (w & HIGH != 0).then(|| {
+            let b = usize::try_from((w & HIGH).trailing_zeros() / 8).unwrap_or(0);
+            g.wrapping_mul(GROUP).wrapping_add(b)
+        })
+    }
+
+    /// The bucket holding an entry whose key `same` accepts: its first group, and its second only
+    /// when the first is marked.
+    #[inline]
+    fn find(&self, hash: u64, same: impl Fn(u32) -> bool) -> Option<usize> {
         let (tag, g1, g2) = self.place(hash);
         let pattern = repeat(tag);
-        let (w1, w2) = (self.word(g1), self.word(g2));
+        if let Some(i) = self.found(g1, self.word(g1), pattern, &same) {
+            return Some(i);
+        }
+        if g2 == g1 || !self.marked(g1) {
+            return None;
+        }
+        self.found(g2, self.word(g2), pattern, &same)
+    }
+
+    /// The bucket holding an entry whose key `same` accepts; or else where a new one goes, the
+    /// first free bucket of its first group, or once that is full of its second with the first
+    /// to be marked; none when both are full.
+    #[inline]
+    fn seek(
+        &self,
+        hash: u64,
+        same: impl Fn(u32) -> bool,
+    ) -> Result<usize, Option<(usize, Option<usize>)>> {
+        let (tag, g1, g2) = self.place(hash);
+        let pattern = repeat(tag);
+        let w1 = self.word(g1);
         if let Some(i) = self.found(g1, w1, pattern, &same) {
             return Ok(i);
         }
-        if g2 != g1
+        // A first group with a bucket free was never full, so never marked: the key is nowhere.
+        if let Some(at) = Self::free(g1, w1) {
+            return Err(Some((at, None)));
+        }
+        if g2 == g1 {
+            return Err(None);
+        }
+        let w2 = self.word(g2);
+        if self.marked(g1)
             && let Some(i) = self.found(g2, w2, pattern, &same)
         {
             return Ok(i);
         }
-        let empty = |w: u64| (w & HIGH).count_ones();
-        let (g, w) = if g2 != g1 && empty(w2) > empty(w1) {
-            (g2, w2)
-        } else {
-            (g1, w1)
-        };
-        if w & HIGH == 0 {
-            return Err(None);
-        }
-        let b = usize::try_from((w & HIGH).trailing_zeros() / 8).unwrap_or(0);
-        Err(Some(g.wrapping_mul(GROUP).wrapping_add(b)))
+        Err(Self::free(g2, w2).map(|at| (at, Some(g1))))
     }
 
     fn set_ctrl(&mut self, i: usize, c: u8) {
@@ -175,10 +213,13 @@ impl Table {
                 Some(Some(std::mem::replace(e, entry)))
             }
             Err(free) => {
-                let at = free?;
+                let (at, overflowed) = free?;
                 let (tag, _, _) = self.place(hash);
                 self.set_ctrl(at, tag);
                 *self.slot_mut(at)? = entry;
+                if let Some(group) = overflowed.and_then(|g| self.groups.get_mut(g)) {
+                    group.overflowed = true;
+                }
                 self.full = self.full.saturating_add(1);
                 Some(None)
             }
@@ -218,7 +259,12 @@ impl KeyIndex {
     #[inline]
     pub fn touch(&self, hash: u64) -> u64 {
         let (_, g1, g2) = self.table.place(hash);
-        self.table.word(g1) ^ self.table.word(g2)
+        let w = self.table.word(g1);
+        if self.table.marked(g1) {
+            w ^ self.table.word(g2)
+        } else {
+            w
+        }
     }
 
     /// Each key's newest entry, in no order.
@@ -236,6 +282,7 @@ impl KeyIndex {
     pub fn clear(&mut self) {
         for group in &mut self.table.groups {
             group.ctrl = repeat(EMPTY);
+            group.overflowed = false;
         }
         self.table.full = 0;
     }
@@ -254,8 +301,7 @@ impl KeyIndex {
     #[inline]
     pub fn get(&self, hash: u64, same: impl Fn(u32) -> bool) -> Option<u32> {
         self.table
-            .seek(hash, &same)
-            .ok()
+            .find(hash, &same)
             .and_then(|i| self.table.slot(i))
     }
 

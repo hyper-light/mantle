@@ -2624,9 +2624,14 @@ mod tests {
         // Cleared for reuse, it keeps the arena's written pages, its index's table and its
         // buffers: what it holds is not what it now uses.
         let mut m = HashMem::new(1 << 22).unwrap();
+        // Filled as a memtable is, until its arena or its index refuses an entry.
         for i in 0..20_000u32 {
-            m.insert(&i.to_be_bytes(), Op::Put, &[7; 100]).unwrap();
+            if let Err(e) = m.insert(&i.to_be_bytes(), Op::Put, &[7; 100]) {
+                assert!(matches!(e, Error::LimitExceeded { .. }), "{e}");
+                break;
+            }
         }
+        assert!(!m.is_empty());
         m.seal();
         let filled = m.bytes();
         m.clear();

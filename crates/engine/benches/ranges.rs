@@ -228,6 +228,17 @@ fn costs(name: &str, ops: u64, from: &Mark, to: &Mark) {
     );
 }
 
+/// `--trickle`'s rounds: the puts made, each range's counters before and after, and the marks
+/// around them.
+struct Trickled {
+    rounds: u64,
+    puts: u64,
+    before: Vec<RangeStats>,
+    after: Vec<RangeStats>,
+    start: Mark,
+    done: Mark,
+}
+
 /// The settled queries of `--queries-again`: their gets and seeks and the marks around them.
 struct Again {
     start: Mark,
@@ -287,6 +298,25 @@ struct Workload {
 }
 
 impl Workload {
+    /// `--trickle`'s round `round`: `n` draws over the key space from a stream of the round's
+    /// own, each key the fill left present put again with the fill's value, so the oracle's keys
+    /// and values stay as the fill left them; the puts made.
+    async fn trickle_async(&self, ranges: &Ranges, n: u64, round: u64) -> Result<u64, BenchError> {
+        let mut client = ranges.client()?;
+        let mut rng = self.rng(4 + round, 0);
+        let mut puts = 0u64;
+        for _ in 0..n {
+            let k = rng.next() % self.num;
+            if self.present.holds(k) {
+                client
+                    .put_async(&rocks_workload::key(k), fill_value())
+                    .await?;
+                puts += 1;
+            }
+        }
+        Ok(puts)
+    }
+
     fn rng(&self, phase: u64, thread: u64) -> rocks_workload::Rng {
         // db_bench_tool.cc RunBenchmark increments total_thread_count for every thread in
         // every phase; ThreadState seeds Random64 with seed + that count. Keep the helper's
@@ -730,6 +760,12 @@ fn main() -> Result<(), BenchError> {
     // `seekrandom_settled`: the queries' rate on the layout they paid for, apart from the
     // consolidation the first seeks run beside (docs/research/50 §1, §8).
     let mut queries_again = false;
+    // `--trickle=ROUNDS:PUTS`: after the queries, ROUNDS rounds of PUTS draws over the key space,
+    // each key the fill left present put again with the fill's value, every round flushed and its
+    // maintenance settled: a store written in bursts with idle time between, whose maintenance
+    // `pretrickle` and `posttrickle` and the `trickle` costs count apart from the queries
+    // (docs/research/53). The client on its range's shard only.
+    let mut trickle: Option<(u64, u64)> = None;
     let mut args = Vec::new();
     for arg in std::env::args().skip(1) {
         if arg == "--shard-client" {
@@ -746,6 +782,11 @@ fn main() -> Result<(), BenchError> {
             caching = CachingRequest::PreferDirect;
         } else if arg == "--queries-again" {
             queries_again = true;
+        } else if let Some(value) = arg.strip_prefix("--trickle=") {
+            let (rounds, puts) = value
+                .split_once(':')
+                .ok_or_else(|| io::Error::other("--trickle= takes ROUNDS:PUTS"))?;
+            trickle = Some((rounds.parse()?, puts.parse()?));
         } else if let Some(value) = arg.strip_prefix("--consolidation=") {
             consolidation = match value {
                 "never" => mantle_engine::trunk::Consolidation::Never,
@@ -767,6 +808,12 @@ fn main() -> Result<(), BenchError> {
         } else if arg != "--bench" {
             args.push(arg);
         }
+    }
+    if trickle.is_some() && !shard_client {
+        return Err(io::Error::other(
+            "--trickle= runs the client on its range's shard: --shard-client",
+        )
+        .into());
     }
     VALUE
         .set(vec![b'v'; value_bytes])
@@ -975,6 +1022,7 @@ fn main() -> Result<(), BenchError> {
         query_stats,
         postquery,
         again,
+        trickled,
         workload,
     ) = if shard_client {
         let (done, result) = std::sync::mpsc::sync_channel(1);
@@ -1041,6 +1089,29 @@ fn main() -> Result<(), BenchError> {
                 } else {
                     None
                 };
+                let trickled = match trickle {
+                    Some((rounds, draws)) => {
+                        let before = client.stats_async().await?;
+                        let start = Mark::now()?;
+                        let mut puts = 0u64;
+                        for round in 0..rounds {
+                            puts += workload.trickle_async(&ranges, draws, round).await?;
+                            client.flush_async().await?;
+                            client.settled_async().await?;
+                        }
+                        let done = Mark::now()?;
+                        let after = client.stats_async().await?;
+                        Some(Trickled {
+                            rounds,
+                            puts,
+                            before,
+                            after,
+                            start,
+                            done,
+                        })
+                    }
+                    None => None,
+                };
                 drop(client);
                 ranges.stop_async().await?;
                 Ok::<_, BenchError>((
@@ -1056,6 +1127,7 @@ fn main() -> Result<(), BenchError> {
                     query_stats,
                     postquery,
                     again,
+                    trickled,
                     workload,
                 ))
             }
@@ -1122,6 +1194,7 @@ fn main() -> Result<(), BenchError> {
             query_stats,
             postquery,
             again,
+            None,
             workload,
         )
     };
@@ -1191,7 +1264,15 @@ fn main() -> Result<(), BenchError> {
         }
         None => postquery,
     };
-    costs("stop_shutdown", threads * num, &stop_from, &stopped);
+    let stop_from = match &trickled {
+        Some(t) => {
+            println!("trickle rounds {} puts {}", t.rounds, t.puts);
+            costs("trickle", t.puts.max(1), &t.start, &t.done);
+            &t.done
+        }
+        None => &stop_from,
+    };
+    costs("stop_shutdown", threads * num, stop_from, &stopped);
     costs("paid_total", total, &start, &stopped);
     costs("cold_setup", threads * num, &before_setup, &start);
     costs("recovery_verify", threads * num, &stopped, &recovered);
@@ -1210,6 +1291,10 @@ fn main() -> Result<(), BenchError> {
     stats("postfill", &fill_stats);
     stats("postread", &read_stats);
     stats("postquery", &query_stats);
+    if let Some(t) = &trickled {
+        stats("pretrickle", &t.before);
+        stats("posttrickle", &t.after);
+    }
     for (shard, counters) in runtime_stats.iter().enumerate() {
         println!(
             "runtime shard {shard} polls {} waits {} harvests {} long_steps {} blocked_steps {} preempted_steps {} foreign_wakes {} spin_hits {} spin_misses {} poller_wakes {} longest_step_ns {}",

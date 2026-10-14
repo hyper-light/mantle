@@ -112,6 +112,16 @@ fn check_scan<F: BlockFile>(
     assert_eq!(got, want);
 }
 
+/// The entries the trunk counts as held, as branches enter and leave it, are those its shape walks.
+fn held_is_the_shapes(db: &ShardDb<DeviceFile>) {
+    let t = db.stats().1;
+    assert_eq!(
+        t.held_entries,
+        t.shape.iter().map(|l| l.entries).sum::<u64>(),
+        "{t:?}"
+    );
+}
+
 /// The workload: puts and deletes, a checkpoint every 1500, every key read every 50 operations
 /// and a scan of everything every 997; idle slices between operations when `idle`. Returns
 /// the oracle.
@@ -175,6 +185,7 @@ fn run(issuer: bool, idle: bool) {
     );
     let (held, want) = db.workers().unwrap();
     assert!(held >= 1 && want >= 1, "{held} {want}");
+    held_is_the_shapes(&db);
     db.checkpoint(OPS).unwrap();
     for k in 0..KEYS {
         check(&mut db, &oracle, k);
@@ -186,6 +197,7 @@ fn run(issuer: bool, idle: bool) {
     drop(file);
     let (mut db, applied) = ShardDb::open(open(&path, false), STORE, MEM, TRUNK).unwrap();
     assert_eq!(applied, OPS);
+    held_is_the_shapes(&db);
     for k in 0..KEYS {
         check(&mut db, &oracle, k);
     }
@@ -292,8 +304,8 @@ fn seeks_consolidate_every_descent_to_one_source() {
 /// consolidation's flushes bring each paid leaf the data above it, and the leaf settles that with
 /// its own in one merge rather than compacting it into its bundle first and settling it again. The
 /// fill's last flush leaves data at the root, over keys every leaf already holds older versions
-/// of, so the passes that consolidate bring some leaf in-flight data: settles take it, every read
-/// stays exact, and every reference is accounted.
+/// of, so the consolidations, the quiet shard's after the drain or the seeks' passes, bring some
+/// leaf in-flight data: settles take it, every read stays exact, and every reference is accounted.
 #[test]
 fn a_leafs_settle_takes_the_in_flight_bundles_a_consolidation_brings() {
     let dir = tempfile::tempdir().unwrap();
@@ -302,11 +314,12 @@ fn a_leafs_settle_takes_the_in_flight_bundles_a_consolidation_brings() {
     db.set_consolidation(Consolidation::Always);
     workers(&mut db, &path);
     let oracle = workload(&mut db, false, 0x5bd1_e995_9e37_79b9);
+    // Counted from before the drain: a quiet shard whose writes paid for it consolidates there.
+    let before = db.stats().1.settle_inflight_entries;
     db.flush().unwrap();
     while db.owed() {
         db.idle_step(64).unwrap();
     }
-    let before = db.stats().1.settle_inflight_entries;
     // Passes of scanning every key and draining, as seeks_consolidate_every_descent_to_one_source
     // bounds them, until one pays for nothing.
     let paid = |db: &ShardDb<DeviceFile>| {
@@ -331,6 +344,52 @@ fn a_leafs_settle_takes_the_in_flight_bundles_a_consolidation_brings() {
     assert!(
         took > 0,
         "no settle took in-flight entries over {passes} consolidating passes"
+    );
+    for k in 0..KEYS {
+        check(&mut db, &oracle, k);
+    }
+    check_scan(&mut db, &oracle, 64);
+    db.check_references().unwrap();
+}
+
+/// A quiet shard consolidates its whole trunk once its writes since the last whole consolidation
+/// cover one, and no sooner (research/53 §11): the workload's writes, many times the entries the
+/// trunk holds, cover one, so its drain leaves the layout consolidated with no seek paying; a
+/// burst of a few puts into that trunk covers none, so its drain consolidates nothing whole and
+/// leaves its layout to the seeks' rent. Every read exact and every reference accounted after.
+#[test]
+fn a_quiet_shard_consolidates_what_its_writes_paid_for_and_no_more() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let mut db = ShardDb::create(open(&path, true), STORE, MEM, TRUNK).unwrap();
+    workers(&mut db, &path);
+    let mut oracle = workload(&mut db, false, 0x0f0f_3c3c_5a5a_9696);
+    held_is_the_shapes(&db);
+    db.flush().unwrap();
+    while db.owed() {
+        db.idle_step(64).unwrap();
+    }
+    held_is_the_shapes(&db);
+    let whole = db.stats().1.whole_consolidations;
+    assert!(
+        whole >= 1,
+        "the workload's writes bought no whole consolidation"
+    );
+    // A burst far smaller than the trunk: its writes cover no whole consolidation.
+    for k in 0..8u64 {
+        let v = format!("burst-{k}").into_bytes();
+        db.put(&key(k), &v).unwrap();
+        oracle.insert(k, Some(v));
+    }
+    db.flush().unwrap();
+    while db.owed() {
+        db.idle_step(64).unwrap();
+    }
+    held_is_the_shapes(&db);
+    assert_eq!(
+        db.stats().1.whole_consolidations,
+        whole,
+        "a burst of eight puts bought a whole consolidation"
     );
     for k in 0..KEYS {
         check(&mut db, &oracle, k);

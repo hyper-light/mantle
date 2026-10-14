@@ -3712,10 +3712,11 @@ impl<F: BlockFile> ShardDb<F> {
             || self.quiet_unconsolidated()
     }
 
-    /// The shard is quiet with a layout to consolidate: its memtable empty since a flush, no
-    /// packing out or frozen, the trunk owing nothing, and its layout not consolidated since
-    /// branches last entered the root. A fill keeps its memtable full, so none is quiet while one
-    /// runs.
+    /// The shard is quiet with a layout to consolidate that its writes have paid for: its
+    /// memtable empty since a flush, no packing out or frozen, the trunk owing nothing, its
+    /// layout not consolidated since branches last entered the root, and the writes since the
+    /// last whole consolidation at least what one rewrites ([`Trunk::writes_cover_consolidation`]).
+    /// A fill keeps its memtable full, so none is quiet while one runs.
     fn quiet_unconsolidated(&self) -> bool {
         self.mem.is_empty()
             && self.packing.is_none()
@@ -3723,6 +3724,7 @@ impl<F: BlockFile> ShardDb<F> {
             && self.trunk.debt() == 0
             && self.trunk.is_idle()
             && self.trunk.unconsolidated()
+            && self.trunk.writes_cover_consolidation()
     }
 
     /// Pays up to `keys` work units of maintenance owed, for the shard's idle time (SILK: the

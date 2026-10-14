@@ -24,7 +24,7 @@ use crate::error::RtError;
 use crate::mem::Encoded;
 use crate::queue::LocalQueue;
 use crate::registry::{self, Entry, SlotHolder};
-use crate::task::{BoxedFuture, Outcome};
+use crate::task::{BoxedFuture, Outcome, TaskFuture};
 
 /// A shard's process-wide id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -60,6 +60,11 @@ pub(crate) enum Phase {
     Done,
 }
 
+/// Format: "no task is being polled" in [`ShardContext`]'s current word (no task word is all ones: its
+/// generation field would be `Encoded::ANY_GENERATION` and its shard `u16::MAX`, which the registry never
+/// issues).
+pub(crate) const NO_TASK: u64 = u64::MAX;
+
 /// What a task asked of its slot since the loop last looked (bits of [`TaskCell::asks`]).
 pub(crate) mod ask {
     /// A future waits in the slot's incoming cell to be installed.
@@ -76,7 +81,7 @@ pub(crate) mod ask {
 
 /// A future waiting to be installed in its slot, with how it was spawned.
 pub(crate) struct Incoming {
-    pub(crate) future: BoxedFuture,
+    pub(crate) future: TaskFuture,
     pub(crate) parent: Option<u32>,
     pub(crate) joinable: bool,
     pub(crate) service: bool,
@@ -107,6 +112,10 @@ pub(crate) struct TaskCell {
     pub(crate) cancelled: Cell<bool>,
     /// Direct children are cancelled before a service begins cleanup, once per admission.
     pub(crate) cancel_children: Cell<bool>,
+    /// Whether the task was spawned under a parent: linking it at its install and unlinking it at its reap
+    /// are the loop's, so its install and its reap are asked of the loop; a task with no parent is listed at
+    /// its spawn, installed at its first poll, and reaped by its join.
+    pub(crate) parented: Cell<bool>,
 }
 
 /// Where a timer slot is in its life.
@@ -294,6 +303,8 @@ pub struct ShardContext {
     pub id: u16,
     /// The local run queue.
     pub(crate) local: LocalQueue,
+    /// The frames the shard's own spawns write their futures into (`crate::frames`).
+    pub(crate) frames: crate::frames::Frames,
     pub(crate) tasks: Box<[TaskCell]>,
     pub(crate) free_tasks: CellStack<u32>,
     pub(crate) dirty_tasks: CellRing<u32>,
@@ -309,8 +320,13 @@ pub struct ShardContext {
     /// The readiness waits, one slot each, bounded by `interests_per_shard`.
     waits: Box<[WaitCell]>,
     free_waits: CellStack<u32>,
-    /// The task being polled.
-    pub(crate) current_task: Cell<Option<u32>>,
+    /// Whether a task asked the loop for something since the loop last applied the desk's intents: set by
+    /// every push onto `dirty_tasks`, `dirty_timers` and `interests`, so the loop's look after each poll is
+    /// one load when nothing was asked.
+    pub(crate) asked: Cell<bool>,
+    /// The word of the task being polled, or [`NO_TASK`]: its slot for the local wake's test, its whole word
+    /// for a future that asks which task polls it (`crate::waker::polling_task`), with nothing to pack.
+    pub(crate) current: Cell<u64>,
     /// Admission is paused while owned futures are cancelled, and closed at shutdown.
     pub(crate) accepting: Cell<bool>,
     /// The shard's clock at the start of the current poll (or step), published by the loop.
@@ -352,8 +368,11 @@ pub struct ShardContext {
     /// Set by the shard when the root's poll unwound and its task ended `Outcome::Unwound`: no output will
     /// come, and `block_on` is refused rather than wait for one.
     pub(crate) root_unwound: Cell<bool>,
-    /// The loop's counters as of the start of the current step, published for tasks that report them.
-    pub(crate) counters: Cell<crate::shard_loop::Counters>,
+    /// One past the highest task generation issued: what the registry slot's next holder starts from. On the
+    /// desk, so a join that frees its task's slot raises it as the loop's frees do.
+    pub(crate) generation_high: Cell<u32>,
+    /// The loop's counters, which it counts here in place (`crate::shard_loop::LiveCounters`).
+    pub(crate) live: crate::shard_loop::LiveCounters,
     /// A simulated shard's sockets (docs/runtime.md §11); `None` on an OS driver.
     pub(crate) sim: Option<crate::sim::SimSockets>,
 }
@@ -395,6 +414,7 @@ impl ShardContext {
         Self {
             id,
             local: LocalQueue::new(shape.tasks),
+            frames: crate::frames::Frames::new(shape.tasks),
             tasks: (0..shape.tasks)
                 .map(|_| TaskCell {
                     generation: Cell::new(shape.generation_base),
@@ -409,6 +429,7 @@ impl ShardContext {
                     service: Cell::new(false),
                     cancelled: Cell::new(false),
                     cancel_children: Cell::new(false),
+                    parented: Cell::new(false),
                 })
                 .collect(),
             free_tasks: CellStack::full_of(task_ids.into_iter()),
@@ -437,7 +458,8 @@ impl ShardContext {
                 })
                 .collect(),
             free_waits: CellStack::full_of(wait_ids.into_iter()),
-            current_task: Cell::new(None),
+            asked: Cell::new(false),
+            current: Cell::new(NO_TASK),
             accepting: Cell::new(true),
             now_ns: Cell::new(0),
             activity_ns: Cell::new(None),
@@ -457,7 +479,8 @@ impl ShardContext {
             root_output: Cell::new(None),
             root: Cell::new(None),
             root_unwound: Cell::new(false),
-            counters: Cell::new(crate::shard_loop::Counters::default()),
+            generation_high: Cell::new(shape.generation_base),
+            live: crate::shard_loop::LiveCounters::default(),
             sim: None,
         }
     }
@@ -534,9 +557,14 @@ impl ShardContext {
 
     /// The task being polled on this shard right now.
     pub fn current_task(&self) -> Option<TaskId> {
-        let slot = self.current_task.get()?;
-        let generation = self.task(slot)?.generation.get();
-        Encoded::pack(self.id, slot, generation).map(TaskId)
+        let word = self.current.get();
+        (word != NO_TASK).then(|| TaskId(Encoded::from_word(word)))
+    }
+
+    /// The slot of the task being polled, if one is.
+    pub(crate) fn current_slot(&self) -> Option<u32> {
+        let word = self.current.get();
+        (word != NO_TASK).then(|| Encoded::from_word(word).slot())
     }
 
     /// The step quantum (docs/runtime.md §3.4): the online wake estimate while the shard tracks one, else its
@@ -561,9 +589,17 @@ impl ShardContext {
         self.timer_tick_ns
     }
 
-    /// The shard's counters as of the start of the current step.
+    /// The shard's counters as they stand now: the loop counts on the desk in place, so a task reads what the
+    /// loop has counted up to its poll.
     pub fn counters(&self) -> crate::shard_loop::Counters {
-        self.counters.get()
+        let mut counters = self.live.snapshot();
+        counters.admission_refused = counters
+            .admission_refused
+            .saturating_add(self.refused_spawns.get());
+        counters.timer_waits = counters.timer_waits.saturating_add(self.timer_waits.get());
+        counters.scheduler_overrun_ns = self.scheduler_overrun_ns.get();
+        counters.wake_cost_ns = self.quantum_ns.get();
+        counters
     }
 
     /// Whether this shard runs the simulation driver.
@@ -603,7 +639,7 @@ impl ShardContext {
     /// installs it before the next poll. Refused `TooManyTasks` when no slot is free.
     pub fn spawn_local(&self, future: BoxedFuture, parent: Option<u32>) -> Result<TaskId, RtError> {
         self.claim(Incoming {
-            future,
+            future: TaskFuture::Boxed(future),
             parent,
             joinable: true,
             service: false,
@@ -613,7 +649,7 @@ impl ShardContext {
     /// Spawns a detached task on this shard: nobody joins it, and its slot is freed when it ends.
     pub fn spawn_detached(&self, future: BoxedFuture) -> Result<TaskId, RtError> {
         self.claim(Incoming {
-            future,
+            future: TaskFuture::Boxed(future),
             parent: None,
             joinable: false,
             service: false,
@@ -628,14 +664,35 @@ impl ShardContext {
         parent: Option<u32>,
     ) -> Result<TaskId, RtError> {
         self.claim(Incoming {
-            future,
+            future: TaskFuture::Boxed(future),
             parent,
             joinable: true,
             service: true,
         })
     }
 
-    /// Claims a free slot for `incoming` and asks the loop to install it.
+    /// Spawns `future` written into a frame of this shard's (`crate::frames`): under `parent` (a slot of this
+    /// shard), joinable or detached, a service or not. The spawns a task makes on its own shard
+    /// (`crate::futures`); refused as a claim is, and `Mem` when no frame could be had.
+    pub(crate) fn spawn_framed<F: std::future::Future<Output = ()> + 'static>(
+        &self,
+        future: F,
+        parent: Option<u32>,
+        joinable: bool,
+        service: bool,
+    ) -> Result<TaskId, RtError> {
+        let future = TaskFuture::Framed(self.frames.put(future)?);
+        self.claim(Incoming {
+            future,
+            parent,
+            joinable,
+            service,
+        })
+    }
+
+    /// Claims a free slot for `incoming`: a task with a parent is installed by the loop when it next applies
+    /// the desk's intents, which links it under its parent before that parent's poll is recorded; one with no
+    /// parent is listed now, and the loop installs it as it first polls it.
     pub(crate) fn claim(&self, incoming: Incoming) -> Result<TaskId, RtError> {
         if !self.accepting.get()
             || self.entry.is_some_and(|entry| {
@@ -665,9 +722,43 @@ impl ShardContext {
         cell.cancel_children.set(false);
         cell.outcome.set(None);
         cell.joiner.set(None);
+        let parented = incoming.parent.is_some();
+        cell.parented.set(parented);
         cell.incoming.set(Some(incoming));
-        self.ask(slot, ask::INSTALL);
+        if parented {
+            self.ask(slot, ask::INSTALL);
+        } else {
+            self.local.push(slot);
+        }
+        // Counted at its admission, here, whenever the loop installs it (`Counters::spawns`).
+        self.live
+            .spawns
+            .set(self.live.spawns.get().saturating_add(1));
         Ok(TaskId(word))
+    }
+
+    /// Gives a slot back on the desk's side: emptied, a new generation (so no word minted for its last task
+    /// names the next), its intents dropped (an intent asked of its last task, still on the dirty ring, must
+    /// not reach the next one), and onto the free stack, unless its generations are spent (the slot then
+    /// retires, AUD-29-11). A slot already free is left as it is: freeing it twice would list it twice.
+    pub(crate) fn free_slot(&self, slot: u32) {
+        let Some(cell) = self.task(slot) else {
+            return;
+        };
+        if cell.phase.get() == Phase::Free {
+            return;
+        }
+        let next = cell.generation.get().saturating_add(1);
+        cell.generation.set(next);
+        cell.phase.set(Phase::Free);
+        cell.outcome.set(None);
+        cell.joiner.set(None);
+        cell.asks.set(0);
+        self.generation_high
+            .set(self.generation_high.get().max(next));
+        if next < Encoded::TASK_GENERATION_LIMIT {
+            let _ = self.free_tasks.push(slot);
+        }
     }
 
     /// Requests a task's cancellation; it terminates at its next poll boundary. Refused for a stale id.
@@ -703,8 +794,16 @@ impl ShardContext {
             if cell.asks.get() & ask::JOINED != 0 {
                 return Poll::Ready(Err(stale(id)));
             }
-            self.ask(slot, ask::JOINED);
-            return Poll::Ready(Ok(cell.outcome.get().unwrap_or(Outcome::Cancelled)));
+            let outcome = cell.outcome.get().unwrap_or(Outcome::Cancelled);
+            if cell.parented.get() {
+                // Unlinking it from its parent is the loop's.
+                self.ask(slot, ask::JOINED);
+            } else {
+                // The loop's side of a done task holds nothing to let go (its future dropped as it ended): its
+                // slot is the desk's to free, now.
+                self.free_slot(slot);
+            }
+            return Poll::Ready(Ok(outcome));
         }
         match joiner {
             Some(word) => {
@@ -944,6 +1043,7 @@ impl ShardContext {
             ticket,
             withdraw: false,
         });
+        self.asked.set(true);
         if pushed.is_err() {
             // Unreachable by the ring's sizing (see `interests`); refused rather than lost.
             self.free_wait(ticket);
@@ -1001,6 +1101,7 @@ impl ShardContext {
                     ticket,
                     withdraw: true,
                 });
+                self.asked.set(true);
                 // Unreachable by the ring's sizing (see `interests`). Were it refused, the slot would stay
                 // abandoned, held against the bound, until the handle fires and `fire_wait` frees it.
                 let _ = pushed;
@@ -1077,9 +1178,17 @@ impl ShardContext {
         Ok(())
     }
 
-    /// Wakes a task of this shard by its slot.
+    /// Wakes a task of this shard by its slot. A task that wakes itself in its own poll (a yield, or any
+    /// future with more to do) waits for the loop's next reading of its inputs (`crate::queue`). Inlined: every
+    /// waker of this shard's tasks on its own thread ends here.
+    #[inline]
     pub(crate) fn wake_local(&self, slot: u32) {
-        self.local.push(slot);
+        let current = self.current.get();
+        if current != NO_TASK && Encoded::from_word(current).slot() == slot {
+            self.local.defer(slot);
+        } else {
+            self.local.push(slot);
+        }
     }
 
     // ------------------------------------------------------------------ helpers
@@ -1120,12 +1229,14 @@ impl ShardContext {
         if !cell.dirty.replace(true) && self.dirty_tasks.push(slot).is_err() {
             cell.dirty.set(false);
         }
+        self.asked.set(true);
     }
 
     fn timer_dirty(&self, slot: u32, cell: &TimerCell) {
         if !cell.dirty.replace(true) && self.dirty_timers.push(slot).is_err() {
             cell.dirty.set(false);
         }
+        self.asked.set(true);
     }
 }
 

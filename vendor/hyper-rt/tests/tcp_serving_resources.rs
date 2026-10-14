@@ -56,6 +56,7 @@ fn config(tasks: usize) -> RuntimeConfig {
         page_bytes: 4096,
         spin_ns: 0,
         wake_tracking: None,
+        latency_objective_ns: None,
     }
 }
 

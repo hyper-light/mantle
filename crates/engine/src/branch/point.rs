@@ -336,6 +336,7 @@ mod tests {
             spin_ns: 0,
             page_bytes: CONFIG.page_size,
             wake_tracking: None,
+            latency_objective_ns: None,
             pin: false,
             cores: Vec::new(),
         };

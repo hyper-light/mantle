@@ -153,6 +153,7 @@ fn an_async_range_reads_its_resident_pages_on_its_own_shard() {
         page_bytes: STORE.page_size,
         spin_ns: 0,
         wake_tracking: None,
+        latency_objective_ns: None,
     })
     .unwrap();
     let ranges = Ranges::start(

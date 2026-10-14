@@ -70,6 +70,7 @@ fn completed_output_is_not_retained_by_the_owner_after_a_driver_loss_error() {
         page_bytes: 4096,
         spin_ns: 0,
         wake_tracking: None,
+        latency_objective_ns: None,
     };
     let (lost, faults) = channel();
     let (dropped, notices) = channel();

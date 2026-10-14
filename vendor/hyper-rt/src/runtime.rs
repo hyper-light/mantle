@@ -90,6 +90,10 @@ pub struct RuntimeConfig {
     /// `None` is a hand-written configuration with no measured prior to track (a test harness's fixed
     /// quanta, an internal helper runtime), which keeps its fixed values.
     pub wake_tracking: Option<WakeTracking>,
+    /// The consumer's latency objective for one loop step, nanoseconds, where it is tighter than the wake
+    /// ([`Constants::latency_objective_ns`]): a step's batch reads its inputs again by the smaller of it and
+    /// the step quantum (docs/runtime.md §3.3). `None`: the quantum alone.
+    pub latency_objective_ns: Option<u64>,
 }
 
 /// What a shard needs to refine its wake estimate after boot (§4.1: the boot probe's mean converges
@@ -191,6 +195,7 @@ impl RuntimeConfig {
                 shift: calibration.wake.estimate_shift(),
                 idle_ratio: 1,
             }),
+            latency_objective_ns: constants.latency_objective_ns,
         };
         config.batch = config
             .calibrate_batch(constants.batch_budget_ns.get())

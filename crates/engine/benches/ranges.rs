@@ -649,6 +649,7 @@ fn runtime_config(
             page_bytes: usize::try_from(*page)?,
             spin_ns: *saved_spin,
             wake_tracking: None,
+            latency_objective_ns: None,
         });
     }
     let calibration = Calibration::measure(Duration::from_millis(40), threads)?;

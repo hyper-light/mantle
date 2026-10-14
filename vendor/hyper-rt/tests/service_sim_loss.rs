@@ -48,6 +48,7 @@ fn a_lost_simulated_driver_keeps_idle_service_ownership_until_external_completio
         page_bytes: 4096,
         spin_ns: 0,
         wake_tracking: None,
+        latency_objective_ns: None,
     };
     let mut sim = SimRuntime::new(&cfg, 3).unwrap();
     let shard = sim.shard_ids().first().copied().unwrap();

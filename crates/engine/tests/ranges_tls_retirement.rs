@@ -231,6 +231,7 @@ fn stopping_a_range_yields_through_actual_worker_tls_retirement() {
         page_bytes: STORE.page_size,
         spin_ns: 0,
         wake_tracking: None,
+        latency_objective_ns: None,
     })
     .unwrap();
     let shard = runtime.shard_ids()[0];

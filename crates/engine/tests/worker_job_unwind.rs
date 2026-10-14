@@ -420,6 +420,7 @@ fn same_shard_stop_keeps_held_job_ownership_and_reports_its_read_panic_after_ret
         page_bytes: CONFIG.page_size,
         spin_ns: 0,
         wake_tracking: None,
+        latency_objective_ns: None,
     })
     .unwrap();
     // The guard is later than Runtime/Issuer/engine owners and opens before their implicit joins.

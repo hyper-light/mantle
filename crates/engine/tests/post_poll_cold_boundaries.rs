@@ -154,6 +154,7 @@ fn runtime() -> LocalRuntime {
         page_bytes: CONFIG.page_size,
         spin_ns: 0,
         wake_tracking: None,
+        latency_objective_ns: None,
     })
     .unwrap()
 }
@@ -340,6 +341,7 @@ fn post_poll_client_prepare_refuses_before_request_publication() {
         page_bytes: CONFIG.page_size,
         spin_ns: 0,
         wake_tracking: None,
+        latency_objective_ns: None,
     })
     .unwrap();
     let ranges = Ranges::start(

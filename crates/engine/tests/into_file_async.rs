@@ -191,6 +191,7 @@ fn runtime() -> LocalRuntime {
         page_bytes: CONFIG.page_size,
         spin_ns: 0,
         wake_tracking: None,
+        latency_objective_ns: None,
     })
     .unwrap()
 }
@@ -446,6 +447,7 @@ fn shard_case(start_on_drop: bool) {
             page_bytes: CONFIG.page_size,
             spin_ns: 0,
             wake_tracking: None,
+            latency_objective_ns: None,
         })
         .unwrap();
         let engines = vec![(Vec::new(), db)];

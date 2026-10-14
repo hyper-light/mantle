@@ -180,6 +180,7 @@ fn an_async_run_from_a_previous_grant_is_refused_on_its_actual_task_and_a_curren
         page_bytes: CONFIG.page_size,
         spin_ns: 0,
         wake_tracking: None,
+        latency_objective_ns: None,
     })
     .unwrap();
     let mut worker = runtime

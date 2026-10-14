@@ -32,6 +32,7 @@ fn config(batch: usize, step_budget_ns: u64) -> RuntimeConfig {
         page_bytes: 4096,
         spin_ns: 0,
         wake_tracking: None,
+        latency_objective_ns: None,
     }
 }
 

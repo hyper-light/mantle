@@ -179,6 +179,7 @@ fn an_async_nonempty_run_cannot_cross_a_same_grant_job_but_empty_warm_reuse_roun
         page_bytes: CONFIG.page_size,
         spin_ns: 0,
         wake_tracking: None,
+        latency_objective_ns: None,
     })
     .unwrap();
     let (mut worker, mut warm, refused, no_stale_write) = runtime

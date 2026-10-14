@@ -74,6 +74,7 @@ fn config(step_budget_ns: u64, wake_tracking: Option<WakeTracking>) -> RuntimeCo
         // No idle spin: every wait below is a park.
         spin_ns: 0,
         wake_tracking,
+        latency_objective_ns: None,
     }
 }
 

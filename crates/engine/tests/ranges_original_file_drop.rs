@@ -277,6 +277,7 @@ fn stopping_a_range_yields_through_held_original_file_drop() {
         page_bytes: STORE.page_size,
         spin_ns: 0,
         wake_tracking: None,
+        latency_objective_ns: None,
     })
     .unwrap();
     let guard = ReleaseOnDrop::new(Arc::clone(&gate));

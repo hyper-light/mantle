@@ -1,4 +1,6 @@
-//! A fixed poll budget serves new local handoffs in FIFO order without growing on self-wakes.
+//! A fixed poll budget serves new local handoffs in FIFO order without growing on self-wakes. A task
+//! that wakes itself waits for the loop's next reading of its inputs (`tests/yield_defers.rs`); with
+//! none to read, the step reads them and goes on, so a self-waking set still fills its budget.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -8,7 +10,10 @@
     clippy::missing_panics_doc
 )]
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::mpsc::{Sender, channel};
+use std::task::{Context, Poll};
 
 use hyper_rt::RtError;
 use hyper_rt::driver::{Completion, Driver, DriverKind, DriverSeed, Kick};
@@ -65,6 +70,7 @@ fn owner(roles: usize, polls_per_role: usize) -> LocalRuntime {
         page_bytes: 4096,
         spin_ns: 0,
         wake_tracking: None,
+        latency_objective_ns: None,
     };
     let seed: DriverSeed = Box::new(|_| Ok(Box::new(IdleDriver) as Box<dyn Driver>));
     LocalRuntime::with_driver(&config, seed, Kick::None).unwrap()
@@ -76,6 +82,22 @@ enum Fact {
     Request(usize),
     Reply(usize),
     Dropped(usize),
+}
+
+/// Pending once with its own waker woken: listed again at once, as a future with more to do returns.
+struct SelfWake(bool);
+
+impl Future for SelfWake {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.0 {
+            return Poll::Ready(());
+        }
+        self.0 = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
 }
 
 struct Capture(usize, Sender<Fact>);
@@ -101,7 +123,7 @@ fn ready_fifo_is_bounded_even_when_every_poll_requeues() {
                 let _capture = capture;
                 loop {
                     facts.send(Fact::Poll(role)).unwrap();
-                    hyper_rt::futures::yield_now().await;
+                    SelfWake(false).await;
                 }
             })
             .unwrap(),

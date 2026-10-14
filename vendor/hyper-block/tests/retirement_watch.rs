@@ -33,6 +33,7 @@ fn runtime() -> Runtime {
         pin: false,
         cores: Vec::new(),
         wake_tracking: None,
+        latency_objective_ns: None,
     })
     .unwrap()
 }

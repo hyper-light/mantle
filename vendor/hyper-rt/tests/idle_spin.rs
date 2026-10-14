@@ -64,6 +64,7 @@ fn config() -> RuntimeConfig {
         page_bytes: 4096,
         spin_ns: WINDOW_NS,
         wake_tracking: None,
+        latency_objective_ns: None,
     }
 }
 

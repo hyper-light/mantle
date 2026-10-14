@@ -352,6 +352,7 @@ fn run(case: Case, slice_ns: u64) {
         page_bytes: STORE.page_size,
         spin_ns: 0,
         wake_tracking: None,
+        latency_objective_ns: None,
     })
     .unwrap();
     // Failure cleanup is declared after Runtime, so it opens both genuine holds before joins.

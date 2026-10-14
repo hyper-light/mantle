@@ -312,6 +312,7 @@ fn async_stop_reports_worker_attachment_failure_only_after_native_tls_and_file_r
         page_bytes: CONFIG.page_size,
         spin_ns: 0,
         wake_tracking: None,
+        latency_objective_ns: None,
     })
     .unwrap();
     let ranges = mantle_engine::ranges::Ranges::start(

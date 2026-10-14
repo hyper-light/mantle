@@ -434,6 +434,7 @@ fn retention_case(fail: bool) {
         page_bytes: STORE.page_size,
         spin_ns: 0,
         wake_tracking: None,
+        latency_objective_ns: None,
     })
     .unwrap();
     let shard = runtime.shard_ids()[0];
@@ -832,6 +833,7 @@ fn terminal_case(stop: bool) {
         page_bytes: STORE.page_size,
         spin_ns: 0,
         wake_tracking: None,
+        latency_objective_ns: None,
     })
     .unwrap();
     let shard = runtime.shard_ids()[0];

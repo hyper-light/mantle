@@ -105,6 +105,7 @@ fn runtime_refill_refuses_before_callback_then_the_same_grant_resumes_cold() {
         page_bytes: CONFIG.page_size,
         spin_ns: 0,
         wake_tracking: None,
+        latency_objective_ns: None,
     })
     .unwrap();
     // Declared after Runtime so any controller assertion opens the callback first.

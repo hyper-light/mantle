@@ -512,6 +512,7 @@ fn a_held_worker_page_write_leaves_same_shard_unrelated_range_progress() {
         page_bytes: STORE.page_size,
         spin_ns: 0,
         wake_tracking: None,
+        latency_objective_ns: None,
     })
     .unwrap();
     let shard = runtime.shard_ids()[0];

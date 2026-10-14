@@ -195,10 +195,14 @@ pub(crate) fn attribute(window: &Window, quantum_ns: u64) -> Attribution {
 }
 
 /// The shard's windows and when it reads. A window opens at every reading the attribution takes, and —
-/// while armed — at each wait's end, and at a step's start where no window is open or polls are judged
-/// one at a time. A wait closes the window, so a park's own block is never charged to a poll. The shard
-/// arms when a long poll found no window, or one that did not decide it; a busy period (from one wait to
-/// the next, having done work) that runs no long poll disarms, so a healthy shard reads nothing.
+/// while armed — at each wait's end, and at a step's start where no window is open or, judging one at a
+/// time, after a step that ran a long poll. A wait closes the window, so a park's own block is never
+/// charged to a poll. The shard arms when a long poll found no window, or one that did not decide it; a
+/// busy period (from one wait to the next, having done work) that runs no long poll disarms, so a healthy
+/// shard reads nothing. A shard that never waits keeps its arming, so it is the steps without a long poll
+/// that stop its readings: one at every step's start, while armed one at a time, read its thread's clock
+/// at every step of a shard that a single preempted poll had armed, long after its last long poll (3.3% of
+/// a shard whose tasks only yielded, `docs/benchmarks.md`, "hyper-rt: the loop under load").
 ///
 /// Long polls are judged one at a time, each at a reading of its own end, until one is judged a run on
 /// the CPU; from then they are judged by step ([`Tracker::by_step`]): the step's long polls wait for one
@@ -221,6 +225,10 @@ pub(crate) struct Tracker {
     /// reading of its own end (false): one at a time from a long poll whose window was missing or did not
     /// decide it, by step from one judged a run on the CPU.
     by_step: bool,
+    /// Whether the step running now has run a long poll.
+    step_long: bool,
+    /// Whether the last step to end ran a long poll.
+    last_step_long: bool,
 }
 
 /// What the overruns of a window's long polls show (the step's, judged at one reading at its end): a poll
@@ -243,10 +251,10 @@ impl Tracker {
         self.armed
     }
 
-    /// Whether a step's start opens a window: while armed, where no window is open or long polls are judged
-    /// one at a time. The loop asks before it reads.
+    /// Whether a step's start opens a window: while armed, where no window is open or, judging one at a
+    /// time, after a step that ran a long poll. The loop asks before it reads.
     pub(crate) fn reads_at_step_start(&self) -> bool {
-        self.armed && (!self.by_step || self.window_start.is_none())
+        self.armed && (self.window_start.is_none() || (!self.by_step && self.last_step_long))
     }
 
     /// Whether a long poll ending now waits for the step's end to be judged: judging by step, in an open
@@ -266,6 +274,7 @@ impl Tracker {
     /// A long poll was left for the step's end ([`Tracker::defers`]): the busy period ran one.
     pub(crate) fn long_poll_deferred(&mut self) {
         self.period_long = true;
+        self.step_long = true;
     }
 
     /// The step's end, at a reading `end` taken at `now_ns`: the off-CPU time of the window its long polls
@@ -294,6 +303,7 @@ impl Tracker {
     /// A step ended; `did_work` marks the busy period as one.
     pub(crate) fn step_ended(&mut self, did_work: bool) {
         self.period_worked |= did_work;
+        self.last_step_long = std::mem::take(&mut self.step_long);
     }
 
     /// A wait (a spin or a park) begins: the window closes, and a busy period that ran no long poll disarms.
@@ -326,6 +336,7 @@ impl Tracker {
         quantum_ns: u64,
     ) -> Attribution {
         self.period_long = true;
+        self.step_long = true;
         let attribution = match (self.window_start, end) {
             (_, None) => Attribution::NoClock,
             (None, Some(_)) => Attribution::NoWindow,
@@ -536,6 +547,7 @@ mod tests {
             tracker.long_poll(0, 2 * QUANTUM_NS, account(2 * QUANTUM_NS, None), QUANTUM_NS),
             Attribution::NoWindow
         );
+        tracker.step_ended(true);
         assert!(tracker.reads_at_step_start() && !tracker.defers());
         // A step's start reads; its long poll runs three quanta on the CPU: a run, and by step from here.
         tracker.step_began(|| at(3 * QUANTUM_NS, account(3 * QUANTUM_NS, None)));
@@ -567,10 +579,45 @@ mod tests {
             Attribution::Ambiguous
         );
         tracker.undecided();
+        tracker.step_ended(true);
         assert!(tracker.reads_at_step_start() && !tracker.defers());
         // A wait closes the window; while armed, its end opens one, and judging stays one at a time.
         tracker.wait_began();
         tracker.wait_ended(|| at(20 * QUANTUM_NS, account(10 * QUANTUM_NS, None)));
         assert!(!tracker.defers());
+    }
+
+    /// A shard that never waits: armed by one long poll and judging one at a time, it reads at the start of
+    /// the step after it and at no step after a step that ran none, however long it stays armed; the window
+    /// its last reading opened judges the next long poll, and the step after that one reads again.
+    #[test]
+    fn steps_without_a_long_poll_stop_the_readings_of_a_shard_that_never_waits() {
+        let mut tracker = Tracker::default();
+        assert_eq!(
+            tracker.long_poll(0, 2 * QUANTUM_NS, account(QUANTUM_NS, None), QUANTUM_NS),
+            Attribution::NoWindow
+        );
+        tracker.step_ended(true);
+        assert!(tracker.reads_at_step_start());
+        tracker.step_began(|| at(3 * QUANTUM_NS, account(2 * QUANTUM_NS, None)));
+        tracker.step_ended(true);
+        for _ in 0..1_000 {
+            assert!(!tracker.reads_at_step_start());
+            tracker.step_began(|| panic!("a step after a quiet one reads nothing"));
+            tracker.step_ended(true);
+        }
+        assert!(tracker.armed(), "no wait: still armed");
+        // A run on the CPU in the window the last reading opened: by step from here.
+        assert_eq!(
+            tracker.long_poll(
+                100 * QUANTUM_NS,
+                103 * QUANTUM_NS,
+                account(102 * QUANTUM_NS, None),
+                QUANTUM_NS
+            ),
+            Attribution::Long
+        );
+        tracker.step_ended(true);
+        assert!(!tracker.reads_at_step_start(), "by step, a window open");
     }
 }

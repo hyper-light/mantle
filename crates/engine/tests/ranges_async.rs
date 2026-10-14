@@ -56,6 +56,7 @@ fn runtime(actors: usize) -> Runtime {
         page_bytes: STORE.page_size,
         spin_ns: 0,
         wake_tracking: None,
+        latency_objective_ns: None,
     })
     .unwrap()
 }

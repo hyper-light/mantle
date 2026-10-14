@@ -243,6 +243,7 @@ fn runtime() -> LocalRuntime {
         page_bytes: PAGE,
         spin_ns: 0,
         wake_tracking: None,
+        latency_objective_ns: None,
     })
     .unwrap()
 }

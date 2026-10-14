@@ -82,6 +82,7 @@ fn initial_arm_loss_during_park_cancels_the_task_without_another_device_operatio
         page_bytes: 4096,
         spin_ns: 0,
         wake_tracking: None,
+        latency_objective_ns: None,
     };
     let (events, observed) = channel();
     let capture = TaskCapture(events.clone());

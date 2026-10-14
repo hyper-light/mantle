@@ -57,6 +57,7 @@ fn config() -> RuntimeConfig {
             shift: 4,
             idle_ratio: 1,
         }),
+        latency_objective_ns: None,
     }
 }
 

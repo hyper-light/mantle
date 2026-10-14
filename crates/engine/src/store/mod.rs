@@ -4694,6 +4694,7 @@ mod checkpoint_tests {
             spin_ns: 0,
             page_bytes: config.page_size,
             wake_tracking: None,
+            latency_objective_ns: None,
         })
         .unwrap();
         let (store, failed) = runtime

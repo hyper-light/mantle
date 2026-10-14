@@ -228,6 +228,15 @@ fn costs(name: &str, ops: u64, from: &Mark, to: &Mark) {
     );
 }
 
+/// The settled queries of `--queries-again`: their gets and seeks and the marks around them.
+struct Again {
+    start: Mark,
+    get: Option<Phase>,
+    read: Mark,
+    seek: Option<Phase>,
+    done: Mark,
+}
+
 struct Phase {
     name: &'static str,
     ops: u64,
@@ -715,6 +724,11 @@ fn main() -> Result<(), BenchError> {
     // (hyper-block `CachingRequest::PreferDirect`), past the OS page cache, for an A/B against
     // buffered I/O.
     let mut caching = CachingRequest::Buffered;
+    // `--queries-again`: once the queries' flush has left the trunk idle (every consolidation the
+    // seeks bought done), the gets and seeks run again and report as `readrandom_settled` and
+    // `seekrandom_settled`: the queries' rate on the layout they paid for, apart from the
+    // consolidation the first seeks run beside (docs/research/50 §1, §8).
+    let mut queries_again = false;
     let mut args = Vec::new();
     for arg in std::env::args().skip(1) {
         if arg == "--shard-client" {
@@ -729,6 +743,8 @@ fn main() -> Result<(), BenchError> {
             machine_memory = true;
         } else if arg == "--direct" {
             caching = CachingRequest::PreferDirect;
+        } else if arg == "--queries-again" {
+            queries_again = true;
         } else if let Some(value) = arg.strip_prefix("--consolidation=") {
             consolidation = match value {
                 "never" => mantle_engine::trunk::Consolidation::Never,
@@ -957,6 +973,7 @@ fn main() -> Result<(), BenchError> {
         queried,
         query_stats,
         postquery,
+        again,
         workload,
     ) = if shard_client {
         let (done, result) = std::sync::mpsc::sync_channel(1);
@@ -995,6 +1012,34 @@ fn main() -> Result<(), BenchError> {
                 client.checkpoint_async(threads * num).await?;
                 let query_stats = client.stats_async().await?;
                 let postquery = Mark::now()?;
+                let again = if queries_again {
+                    let start = Mark::now()?;
+                    let get = if reads > 0 {
+                        Some(workload.phase_async(&ranges, reads, Work::Get).await?)
+                    } else {
+                        None
+                    };
+                    let read = Mark::now()?;
+                    let seek = if seeks > 0 {
+                        Some(
+                            workload
+                                .phase_async(&ranges, seeks, Work::Seek(seek_nexts))
+                                .await?,
+                        )
+                    } else {
+                        None
+                    };
+                    let done = Mark::now()?;
+                    Some(Again {
+                        start,
+                        get,
+                        read,
+                        seek,
+                        done,
+                    })
+                } else {
+                    None
+                };
                 drop(client);
                 ranges.stop_async().await?;
                 Ok::<_, BenchError>((
@@ -1009,6 +1054,7 @@ fn main() -> Result<(), BenchError> {
                     queried,
                     query_stats,
                     postquery,
+                    again,
                     workload,
                 ))
             }
@@ -1039,6 +1085,26 @@ fn main() -> Result<(), BenchError> {
         client.checkpoint(threads * num)?;
         let query_stats = client.stats()?;
         let postquery = Mark::now()?;
+        let again = if queries_again {
+            let start = Mark::now()?;
+            let get = (reads > 0)
+                .then(|| workload.phase(&ranges, reads, Work::Get))
+                .transpose()?;
+            let read = Mark::now()?;
+            let seek = (seeks > 0)
+                .then(|| workload.phase(&ranges, seeks, Work::Seek(seek_nexts)))
+                .transpose()?;
+            let done = Mark::now()?;
+            Some(Again {
+                start,
+                get,
+                read,
+                seek,
+                done,
+            })
+        } else {
+            None
+        };
         drop(client);
         ranges.stop()?;
 
@@ -1054,6 +1120,7 @@ fn main() -> Result<(), BenchError> {
             queried,
             query_stats,
             postquery,
+            again,
             workload,
         )
     };
@@ -1109,7 +1176,21 @@ fn main() -> Result<(), BenchError> {
     let query_ops = (threads * (reads + seeks)).max(1);
     costs("postqueryflush", query_ops, &queried, &postquery);
     costs("paid_queries", query_ops, &postfill, &postquery);
-    costs("stop_shutdown", threads * num, &postquery, &stopped);
+    let stop_from = match again {
+        Some(mut again) => {
+            if let Some(get) = again.get.as_mut() {
+                get.name = "readrandom_settled";
+                get.report(&again.start, &again.read);
+            }
+            if let Some(seek) = again.seek.as_mut() {
+                seek.name = "seekrandom_settled";
+                seek.report(&again.read, &again.done);
+            }
+            again.done
+        }
+        None => postquery,
+    };
+    costs("stop_shutdown", threads * num, &stop_from, &stopped);
     costs("paid_total", total, &start, &stopped);
     costs("cold_setup", threads * num, &before_setup, &start);
     costs("recovery_verify", threads * num, &stopped, &recovered);

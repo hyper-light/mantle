@@ -398,6 +398,9 @@ pub struct HashMem {
     /// first entry ([`Self::insert_hashed`]).
     index: KeyIndex,
     index_sized: bool,
+    /// The keys it held and its index's buckets when the index first refused a key this fill:
+    /// the load two-choice groups reach, which the next memtable's index is sized by.
+    refused: Option<(usize, usize)>,
     len: usize,
     /// The first key written, and how many of its first bytes every key written since shares.
     first: Vec<u8>,
@@ -619,6 +622,7 @@ impl HashMem {
             touched: 0,
             index: KeyIndex::default(),
             index_sized: false,
+            refused: None,
             len: 0,
             first: Vec::new(),
             skip: 0,
@@ -718,6 +722,7 @@ impl HashMem {
         self.mirror.clear();
         self.mirrored = self.mirror.capacity() >= self.limit;
         self.index.clear();
+        self.refused = None;
         self.len = 0;
         self.first.clear();
         self.skip = 0;
@@ -862,6 +867,11 @@ impl HashMem {
             .checked_div(used)
             .and_then(|n| usize::try_from(n).ok())
             .unwrap_or(0)
+    }
+
+    /// The keys it held and its index's buckets when the index first refused a key this fill.
+    pub fn refused(&self) -> Option<(usize, usize)> {
+        self.refused
     }
 
     /// Whether it holds none.
@@ -1049,6 +1059,7 @@ impl HashMem {
         // nothing changed, and the memtable is packed as when its arena is full.
         let arena = &self.arena;
         let Some(replaced) = self.index.put(h, entry, |e| self::key(arena, e) == key) else {
+            self.refused.get_or_insert((self.len, self.index.buckets()));
             return Err(Error::LimitExceeded {
                 what: "a memtable's index",
                 limit: u64::try_from(self.index.buckets()).unwrap_or(u64::MAX),
@@ -2487,6 +2498,44 @@ mod tests {
                 proptest::prop_assert_eq!(&sliced, &expected);
             }
         }
+    }
+
+    /// A memtable whose index refuses a key packs as one whose arena is full: the refused key
+    /// leaves no trace, the first refusal's keys and buckets are kept for the next memtable's
+    /// size, and a clear forgets them.
+    #[test]
+    fn a_refused_key_leaves_no_trace_and_the_first_refusal_is_kept_until_a_clear() {
+        let mut m = HashMem::new_for(1 << 20, 3 * crate::util::incmap::GROUP, 0).unwrap();
+        let mut held = Vec::new();
+        let refusal = loop {
+            let k = (held.len() as u64)
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                .to_le_bytes();
+            let (len, bytes) = (m.len(), m.arena.len());
+            match m.insert(&k, Op::Put, b"v") {
+                Ok(()) => held.push(k),
+                Err(Error::LimitExceeded { what, .. }) => {
+                    assert_eq!(what, "a memtable's index");
+                    assert_eq!((m.len(), m.arena.len()), (len, bytes));
+                    let mut value = Vec::new();
+                    assert_eq!(m.get(&k, &mut value).unwrap(), None);
+                    break m.refused();
+                }
+                Err(e) => panic!("{e}"),
+            }
+        };
+        assert_eq!(refusal, Some((held.len(), m.index.buckets())));
+        let mut value = Vec::new();
+        for k in &held {
+            assert_eq!(m.get(k, &mut value).unwrap(), Some(Op::Put));
+        }
+        // A second refusal keeps the first's numbers.
+        let first = m.refused();
+        let k = u64::MAX.to_le_bytes();
+        let _ = m.insert(&k, Op::Put, b"v");
+        assert_eq!(m.refused(), first);
+        m.clear();
+        assert_eq!(m.refused(), None);
     }
 
     #[test]

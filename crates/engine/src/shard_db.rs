@@ -357,6 +357,9 @@ pub struct ShardDb<F: BlockFile> {
     /// The bytes of headroom a new memtable's index takes beside a bucket for each key it will
     /// hold: the memory tuner's share for the index (research/54 §5).
     index_extra: usize,
+    /// The keys an index held and its buckets when it last refused a key: the load two-choice
+    /// groups reach, learned (research/54 §5). A key a bucket before any index refused one.
+    index_fill: (usize, usize),
     trunk: Trunk,
     /// Work owed but not yet whole, in work·bytes over the room: the remainder of each debt's
     /// share.
@@ -717,6 +720,7 @@ impl<F: BlockFile> ShardDb<F> {
             scans_at_rotation: 0,
             mem_limit,
             index_extra: 0,
+            index_fill: (1, 1),
             trunk,
             pack_carry: 0,
             turn_bytes: 0,
@@ -4030,15 +4034,15 @@ impl<F: BlockFile> ShardDb<F> {
     fn fresh_mem(&mut self) -> Result<HashMem, Error> {
         let mut fresh = match self.spare.take() {
             Some(mut m) => {
-                m.size_index(self.mem.full_keys(), self.index_extra);
+                m.size_index(self.index_entries(), self.index_extra);
                 m
             }
-            // Its index a bucket for each key the memtable it follows holds full, and the
-            // headroom the tuner gives the index (research/54 §5); the entry buffers a kept
-            // memtable shed.
+            // Its index the buckets the keys the memtable it follows holds full take at the load
+            // the last index to refuse a key reached, and the headroom the tuner gives the index
+            // (research/54 §5); the entry buffers a kept memtable shed.
             None => {
                 let mut fresh =
-                    HashMem::new_for(self.mem_limit, self.mem.full_keys(), self.index_extra)?;
+                    HashMem::new_for(self.mem_limit, self.index_entries(), self.index_extra)?;
                 if let Some(bufs) = self.kept_shed.take() {
                     fresh.take_shed(bufs);
                 }
@@ -4047,6 +4051,22 @@ impl<F: BlockFile> ShardDb<F> {
         };
         self.give_mirror(&mut fresh);
         Ok(fresh)
+    }
+
+    /// The buckets the next memtable's index takes: the keys the active one holds full, at the
+    /// load the last index to refuse a key held, which this one's refusal, if it had one, now
+    /// teaches; a bucket a key before any index has refused one.
+    fn index_entries(&mut self) -> usize {
+        if let Some(r) = self.mem.refused() {
+            self.index_fill = r;
+        }
+        let (keys, buckets) = self.index_fill;
+        u128::try_from(self.mem.full_keys())
+            .unwrap_or(u128::MAX)
+            .saturating_mul(u128::try_from(buckets).unwrap_or(u128::MAX))
+            .checked_div(u128::try_from(keys).unwrap_or(u128::MAX))
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or_else(|| self.mem.full_keys())
     }
 
     /// Gives an empty memtable a copy of its arena to keep for the worker that will sort and

@@ -74,9 +74,9 @@ struct Pivot {
 }
 
 /// The rent seeks pay a pivot for opening more sources under it than one consolidated leaf
-/// branch, and whether it covers the consolidation's price: then idle time flushes the pivot's
-/// bundle down and settles the leaf below to one branch (the ski-rental rule; Karlin, Manasse,
-/// Rudolph and Sleator, Algorithmica 1988). LevelDB compacts a file once seeks through it pass a
+/// branch, and whether it covers the drawn fraction of the consolidation's price
+/// ([`rent_draw`]): then idle time flushes the pivot's bundle down and settles the leaf below to
+/// one branch (the ski-rental rule; Karlin, Manasse, Rudolph and Sleator, Algorithmica 1988). LevelDB compacts a file once seeks through it pass a
 /// fixed allowance (`allowed_seeks`, a seek priced at 16 KiB of compaction; db/version_set.cc);
 /// here both sides are measured on the running machine.
 #[derive(Clone, Copy, Debug, Default)]
@@ -86,6 +86,9 @@ struct SeekRent {
     /// consolidation of sources no longer there.
     ns: u64,
     shape: (usize, u64),
+    /// The fraction of the consolidation's price whose rent buys it, drawn as the rent began
+    /// ([`rent_draw`]).
+    draw: f64,
     /// The rent covers the price: the next consolidation flushes or settles this pivot.
     paid: bool,
     /// A paid pivot lies below: a consolidation descends through this one to reach it.
@@ -314,6 +317,38 @@ pub(crate) fn wall_price(work: u64, idle: usize) -> u64 {
         .unwrap_or(work)
 }
 
+/// The fraction of a consolidation's price whose rent buys it: Karlin, Manasse, McGeoch and
+/// Owicki's randomized ski rental (Algorithmica 11(6), 1994), which buys once the rent reaches `x`
+/// of the price for `x` drawn with density eˣ/(e − 1) on [0, 1). Its expected cost is at most
+/// e/(e − 1) ≈ 1.58 times the best in hindsight, where the deterministic rule's, buying at the
+/// whole price, is 2; it buys at 1/(e − 1) ≈ 0.58 of the price on average. Drawn by inverting the
+/// distribution, `x = ln(1 + u(e − 1))` for `u` uniform on [0, 1), `u` the top 53 bits of a
+/// xorshift64* step (Vigna, ACM TOMS 42(4), 2016) of `state`.
+fn rent_draw(state: &mut u64) -> f64 {
+    let mut x = *state;
+    x ^= x.wrapping_shr(12);
+    x ^= x.wrapping_shl(25);
+    x ^= x.wrapping_shr(27);
+    *state = x;
+    let r = x.wrapping_mul(XORSHIFT64_STAR);
+    rent_fraction(r.wrapping_shr(11) as f64 / TWO_POW_53)
+}
+
+/// The draw's distribution inverted: the `x` whose probability (eˣ − 1)/(e − 1) is `u`.
+fn rent_fraction(u: f64) -> f64 {
+    (1.0 + u * (std::f64::consts::E - 1.0)).ln()
+}
+
+/// xorshift64*'s multiplier (Vigna, 2016, §3).
+const XORSHIFT64_STAR: u64 = 0x2545_F491_4F6C_DD1D;
+
+/// 2⁵³, a double's significand: `u`'s 53 bits as a fraction of it are uniform on [0, 1).
+const TWO_POW_53: f64 = 9_007_199_254_740_992.0;
+
+/// The rent generator's first state: xorshift64* runs its full period from any nonzero state, and
+/// a fixed one makes a run's draws repeat.
+const RENT_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
 /// Nanoseconds since `t`, none when timing is off (`Trunk::set_timed`).
 fn ns_since(t: Option<std::time::Instant>) -> u64 {
     t.map_or(0, |t| {
@@ -376,6 +411,8 @@ pub struct Trunk {
     /// How long this step waits on the workers ([`Wait`]), and whether it stopped for them.
     wait: Wait,
     workers_waiting: bool,
+    /// The state of the generator the pivots' rent draws come from ([`rent_draw`]).
+    rent_draws: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -581,6 +618,7 @@ impl Trunk {
             consolidating: false,
             consolidation: Consolidation::Measured,
             marks: Vec::new(),
+            rent_draws: RENT_SEED,
             pool: None,
             wait: Wait::No,
             workers_waiting: false,
@@ -962,6 +1000,7 @@ impl Trunk {
                 }
                 pivot.seek = SeekRent {
                     shape,
+                    draw: rent_draw(&mut self.rent_draws),
                     ..SeekRent::default()
                 };
             }
@@ -969,7 +1008,7 @@ impl Trunk {
                 continue;
             }
             pivot.seek.ns = pivot.seek.ns.saturating_add(rent);
-            if !pivot.seek.paid && pivot.seek.ns >= price {
+            if !pivot.seek.paid && pivot.seek.ns as f64 >= pivot.seek.draw * price as f64 {
                 pivot.seek.paid = true;
                 self.paid = self.paid.saturating_add(1);
                 let counted = if step.leaf {
@@ -1906,6 +1945,7 @@ impl Trunk {
             consolidating: false,
             consolidation: Consolidation::Measured,
             marks: Vec::new(),
+            rent_draws: RENT_SEED,
             pool: None,
             wait: Wait::No,
             workers_waiting: false,
@@ -2238,7 +2278,29 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Passed, earns_rent, rents, wall_price};
+    use super::{Passed, RENT_SEED, earns_rent, rent_draw, rent_fraction, rents, wall_price};
+
+    /// The draw inverts its distribution: the probability of the fraction drawn at `u` is `u`,
+    /// the fraction rises with `u` from 0 to 1, and every draw from the seed lies in [0, 1).
+    #[test]
+    fn a_rent_draw_inverts_karlins_distribution() {
+        let cdf = |x: f64| (x.exp() - 1.0) / (std::f64::consts::E - 1.0);
+        assert_eq!(rent_fraction(0.0), 0.0);
+        assert!((rent_fraction(1.0) - 1.0).abs() <= f64::EPSILON);
+        let mut last = -1.0;
+        for k in 0..=1024u32 {
+            let u = f64::from(k) / 1024.0;
+            let x = rent_fraction(u);
+            assert!((cdf(x) - u).abs() <= 4.0 * f64::EPSILON, "u {u} x {x}");
+            assert!(x > last, "u {u} x {x} after {last}");
+            last = x;
+        }
+        let mut state = RENT_SEED;
+        for _ in 0..100_000 {
+            let x = rent_draw(&mut state);
+            assert!((0.0..1.0).contains(&x), "{x}");
+        }
+    }
 
     /// A descent's pivot giving `sources` sources from `first` in the segment's list.
     fn step(first: usize, sources: usize, leaf: bool) -> Passed {

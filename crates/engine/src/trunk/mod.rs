@@ -281,6 +281,9 @@ pub struct TrunkStats {
     pub settle_entries_seeks: u64,
     pub settle_entries_branches: u64,
     pub settle_entries_size: u64,
+    /// Entries of in-flight bundles a leaf's settle took among its inputs: what an in-flight
+    /// compaction would have written once before the settle rewrote it (research/53 §5).
+    pub settle_inflight_entries: u64,
     /// Sources seeks were given by leaves' pivots and by index pivots ([`Trunk::charge`]); the
     /// pivots seeks' rent paid for, leaves' and index pivots' apart; the pivots a paid flush
     /// marked paid below it; and the consolidations started: where a consolidation's work

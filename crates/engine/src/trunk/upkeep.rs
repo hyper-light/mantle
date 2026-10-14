@@ -53,9 +53,29 @@ enum What {
         start: usize,
         covered: usize,
     },
-    /// The leaf's whole compaction; `extents` its inputs hold, released once it replaces them,
-    /// and what asked for it.
-    Settle { extents: Vec<u64>, cause: Cause },
+    /// The leaf's whole compaction, its in-flight bundles from `start` to `covered` among its
+    /// inputs; `extents` its bundle's branches hold, released once it replaces them (the
+    /// in-flight bundles' go as the leaf reads past them), and what asked for it.
+    Settle {
+        extents: Vec<u64>,
+        cause: Cause,
+        start: usize,
+        covered: usize,
+    },
+}
+
+/// What leaf's settle would take now ([`Trunk::leaf_settle`]).
+#[derive(Clone, Copy, Debug)]
+struct LeafSettle {
+    /// Entries over its bundle and its live in-flight bundles, an upper bound on its keys.
+    count: u64,
+    /// Its bundle's branches once an in-flight compaction would have added its one.
+    after: usize,
+    /// Seeks paid for it in a consolidation in progress, and whether its sources are several.
+    was_paid: bool,
+    paid: bool,
+    /// Whether it settles now.
+    due: bool,
 }
 
 /// What asked a leaf to settle: seeks' rent ([`Trunk::charge`]), more than `fanout` branches, or
@@ -404,7 +424,38 @@ impl Trunk {
         let pivot = node.pivots.get(i).ok_or(corrupt())?;
         Ok(node.inflight.len() > pivot.start
             && !self.compacting(n, &pivot.key)
-            && !self.held(pivot)?)
+            && !self.held(pivot)?
+            && !(node.leaf && self.leaf_settle(n)?.due))
+    }
+
+    /// Leaf `n`'s sources as a settle takes them: its live in-flight bundles with its bundle.
+    /// A settle due counting them takes them too, so what an in-flight compaction would write
+    /// once before the settle rewrote it is written once (research/53 §5): the settle due once
+    /// that compaction's branch had joined the bundle is due now.
+    fn leaf_settle(&self, n: usize) -> Result<LeafSettle, Error> {
+        let node = self.node(n)?;
+        let pivot = node.pivots.first().ok_or(corrupt())?;
+        let live = node.inflight.get(pivot.start..).unwrap_or(&[]);
+        let live_branches = live
+            .iter()
+            .map(Vec::len)
+            .fold(0usize, usize::saturating_add);
+        let live_entries = live
+            .iter()
+            .map(|b| entries(b))
+            .fold(0u64, u64::saturating_add);
+        let held = pivot.bundle.branches().len();
+        let count = entries(pivot.bundle.branches()).saturating_add(live_entries);
+        let after = held.saturating_add(usize::from(live_branches > 0));
+        let was_paid = self.consolidating && pivot.seek.paid;
+        let paid = was_paid && held.saturating_add(live_branches) > 1;
+        Ok(LeafSettle {
+            count,
+            after,
+            was_paid,
+            paid,
+            due: paid || after > self.config.fanout || count > self.leaf_limit(),
+        })
     }
 
     /// Whether a compaction of node `n`'s pivot keyed `key` is planned or out.
@@ -586,7 +637,6 @@ impl Trunk {
     /// splits. A change that splits queues the parent, whose pivot flushes down to it.
     fn want_change(&mut self, n: usize) -> Result<(), Error> {
         let fanout = self.config.fanout;
-        let consolidating = self.consolidating;
         let busy = self.tasks.iter().any(|t| t.node == n);
         let node = self.node(n)?;
         if node.wants.is_some() {
@@ -594,21 +644,18 @@ impl Trunk {
         }
         let live = node.pivots.iter().any(|p| node.inflight.len() > p.start);
         let kind = if node.leaf {
-            let pivot = node.pivots.first().ok_or(corrupt())?;
-            let count = entries(pivot.bundle.branches());
-            let was_paid = consolidating && pivot.seek.paid;
-            let paid = was_paid && pivot.bundle.branches().len() > 1;
-            if !paid && pivot.bundle.branches().len() <= fanout && count <= self.leaf_limit() {
-                // Paid with one branch: nothing to rewrite once the leaf's own compactions are
+            let settle = self.leaf_settle(n)?;
+            if !settle.due {
+                // Paid with one source: nothing to rewrite once the leaf's own compactions are
                 // in (a consolidation's flush may still be on its way down), then the rent is
                 // spent; the apply of a compaction due or out looks at the leaf again.
-                if was_paid && !live && !busy {
+                if settle.was_paid && !live && !busy {
                     self.spend(n, 0)?;
                 }
                 return Ok(());
             }
             ChangeKind::Settle {
-                parts: self.leaf_parts(count),
+                parts: self.leaf_parts(settle.count),
             }
         } else if node.pivots.len() > fanout {
             ChangeKind::Split
@@ -638,7 +685,8 @@ impl Trunk {
             return Ok(());
         }
         let node = self.node(n)?;
-        if node.pivots.iter().any(|p| node.inflight.len() > p.start) {
+        // A leaf's settle takes its live in-flight bundles; a split waits for them to empty.
+        if !node.leaf && node.pivots.iter().any(|p| node.inflight.len() > p.start) {
             return Ok(());
         }
         if change.splits() && n != self.root {
@@ -680,10 +728,10 @@ impl Trunk {
         }
     }
 
-    /// The leaves leaf `n`'s settle would make, as its bundle stands ([`Self::leaf_parts`]).
+    /// The leaves leaf `n`'s settle would make, as its bundle and live in-flight bundles stand
+    /// ([`Self::leaf_parts`]).
     fn settle_parts(&self, n: usize) -> Result<u64, Error> {
-        let pivot = self.node(n)?.pivots.first().ok_or(corrupt())?;
-        Ok(self.leaf_parts(entries(pivot.bundle.branches())))
+        Ok(self.leaf_parts(self.leaf_settle(n)?.count))
     }
 
     /// The entries a leaf holds before it splits: `fanout` memtables' (SplinterDB's
@@ -712,23 +760,23 @@ impl Trunk {
     /// branches in place and splits one over its size into even parts; trunk.c, research/34).
     fn plan_settle(&mut self, n: usize) -> Result<(), Error> {
         let t = self.timed.then(std::time::Instant::now);
-        let node = self.node(n)?;
-        let pivot = node.pivots.first().ok_or(corrupt())?;
-        let count = entries(pivot.bundle.branches());
-        let pivot_branches = pivot.bundle.branches().len();
         // A leaf seeks paid to consolidate settles to one branch, within the ordinary bounds.
-        let was_paid = self.consolidating && pivot.seek.paid;
-        let paid = was_paid && pivot.bundle.branches().len() > 1;
-        if !paid
-            && pivot.bundle.branches().len() <= self.config.fanout
-            && count <= self.leaf_limit()
-        {
-            if was_paid {
+        let settle = self.leaf_settle(n)?;
+        if !settle.due {
+            if settle.was_paid {
                 self.spend(n, 0)?;
             }
             self.node_mut(n)?.wants = None;
             return Ok(());
         }
+        let node = self.node(n)?;
+        let pivot = node.pivots.first().ok_or(corrupt())?;
+        // Its live in-flight bundles with its bundle, newest first: they came down after the
+        // bundle's branches were made. No flush reaches the leaf while its change is started
+        // ([`Self::flush_due`]), so the range it takes is all there is until it applies.
+        let (start, covered) = (pivot.start, node.inflight.len());
+        let live = node.inflight.get(start..covered).ok_or(corrupt())?;
+        let inputs = live.iter().rev().flatten().chain(pivot.bundle.branches());
         let (from, end) = (pivot.key.clone(), node.end.clone());
         let extents: Vec<u64> = pivot
             .bundle
@@ -736,19 +784,15 @@ impl Trunk {
             .iter()
             .flat_map(|b| b.extents.iter().copied())
             .collect();
-        // Its entries counted over every branch, an upper bound on its keys.
+        // Its entries counted over every input, an upper bound on its keys.
+        let count = settle.count;
         let parts = self.leaf_parts(count);
         let per = crate::util::div_ceil(count, parts).unwrap_or(count).max(1);
         let run = if self.pool.is_some() {
             Running::Remote {
                 grant: Vec::new(),
                 state: State::Ready(Box::new(Task {
-                    inputs: pivot
-                        .bundle
-                        .branches()
-                        .iter()
-                        .map(Branch::for_merge)
-                        .collect(),
+                    inputs: inputs.map(Branch::for_merge).collect(),
                     from,
                     end,
                     drop_tombstones: true,
@@ -756,30 +800,29 @@ impl Trunk {
                 })),
             }
         } else {
-            Running::Inline(Box::new(Compaction::prepare(
-                pivot.bundle.branches(),
-                from,
-                end,
-                true,
-                per,
-            )))
+            Running::Inline(Box::new(Compaction::prepare(inputs, from, end, true, per)))
         };
-        if was_paid {
+        if settle.was_paid {
             self.spend(n, 0)?;
         }
-        if paid {
+        if settle.paid {
             self.stats.consolidations = self.stats.consolidations.saturating_add(1);
         }
-        let cause = if paid {
+        let cause = if settle.paid {
             Cause::Seeks
-        } else if pivot_branches > self.config.fanout {
+        } else if settle.after > self.config.fanout {
             Cause::Branches
         } else {
             Cause::Size
         };
         self.tasks.push(NodeTask {
             node: n,
-            what: What::Settle { extents, cause },
+            what: What::Settle {
+                extents,
+                cause,
+                start,
+                covered,
+            },
             run,
             units: count,
         });
@@ -832,13 +875,14 @@ impl Trunk {
                             .iter()
                             .flatten()
                             .collect(),
-                        What::Settle { .. } => node
-                            .pivots
-                            .first()
+                        What::Settle { start, covered, .. } => node
+                            .inflight
+                            .get(*start..*covered)
                             .ok_or(corrupt())?
-                            .bundle
-                            .branches()
                             .iter()
+                            .rev()
+                            .flatten()
+                            .chain(node.pivots.first().ok_or(corrupt())?.bundle.branches())
                             .collect(),
                     };
                     let extents = inputs
@@ -875,9 +919,10 @@ impl Trunk {
                         let live = node.inflight.get(*start..*covered).ok_or(corrupt())?;
                         c.step(store, live.iter().rev().flatten(), left)
                     }
-                    What::Settle { .. } => {
+                    What::Settle { start, covered, .. } => {
+                        let live = node.inflight.get(*start..*covered).ok_or(corrupt())?;
                         let bundle = node.pivots.first().ok_or(corrupt())?.bundle.branches();
-                        c.step(store, bundle, left)
+                        c.step(store, live.iter().rev().flatten().chain(bundle), left)
                     }
                 };
                 merge_ns = merge_ns.saturating_add(ns_since(Some(merging)));
@@ -988,8 +1033,28 @@ impl Trunk {
                     self.queue(c);
                 }
             }
-            What::Settle { extents, cause } => {
+            What::Settle {
+                extents,
+                cause,
+                start,
+                covered,
+            } => {
+                let took = self
+                    .node(n)?
+                    .inflight
+                    .get(start..covered)
+                    .ok_or(corrupt())?
+                    .iter()
+                    .map(|b| entries(b))
+                    .fold(0u64, u64::saturating_add);
+                self.stats.settle_inflight_entries =
+                    self.stats.settle_inflight_entries.saturating_add(took);
                 let leaves = self.apply_settle(store, n, parts, &extents, cause)?;
+                // The in-flight bundles it took are read by none now: the leaf reads past them.
+                if let Some(p) = self.node_mut(n)?.pivots.first_mut() {
+                    p.start = covered;
+                }
+                self.drop_dead(store, n)?;
                 self.node_mut(n)?.wants = None;
                 self.splice(n, leaves)?;
             }
@@ -1327,7 +1392,8 @@ impl Trunk {
     pub(super) fn shift_tasks(&mut self, n: usize, dead: usize) {
         for t in &mut self.tasks {
             if t.node == n
-                && let What::Compact { start, covered, .. } = &mut t.what
+                && let What::Compact { start, covered, .. } | What::Settle { start, covered, .. } =
+                    &mut t.what
             {
                 *start = start.saturating_sub(dead);
                 *covered = covered.saturating_sub(dead);

@@ -288,6 +288,57 @@ fn seeks_consolidate_every_descent_to_one_source() {
     db.check_references().unwrap();
 }
 
+/// A leaf's settle takes the in-flight bundles it finds among its inputs (research/53 §5): a
+/// consolidation's flushes bring each paid leaf the data above it, and the leaf settles that with
+/// its own in one merge rather than compacting it into its bundle first and settling it again. The
+/// fill's last flush leaves data at the root, over keys every leaf already holds older versions
+/// of, so the passes that consolidate bring some leaf in-flight data: settles take it, every read
+/// stays exact, and every reference is accounted.
+#[test]
+fn a_leafs_settle_takes_the_in_flight_bundles_a_consolidation_brings() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let mut db = ShardDb::create(open(&path, true), STORE, MEM, TRUNK).unwrap();
+    db.set_consolidation(Consolidation::Always);
+    workers(&mut db, &path);
+    let oracle = workload(&mut db, false, 0x5bd1_e995_9e37_79b9);
+    db.flush().unwrap();
+    while db.owed() {
+        db.idle_step(64).unwrap();
+    }
+    let before = db.stats().1.settle_inflight_entries;
+    // Passes of scanning every key and draining, as seeks_consolidate_every_descent_to_one_source
+    // bounds them, until one pays for nothing.
+    let paid = |db: &ShardDb<DeviceFile>| {
+        let (_, t, _) = db.stats();
+        t.paid_index + t.paid_leaves
+    };
+    let bound = 2 * (OPS + 1);
+    let mut passes = 0u64;
+    loop {
+        let paid_before = paid(&db);
+        check_scan(&mut db, &oracle, 7);
+        while db.owed() {
+            db.idle_step(64).unwrap();
+        }
+        if paid(&db) == paid_before {
+            break;
+        }
+        passes += 1;
+        assert!(passes <= bound, "seeks kept paying after {passes} passes");
+    }
+    let took = db.stats().1.settle_inflight_entries - before;
+    assert!(
+        took > 0,
+        "no settle took in-flight entries over {passes} consolidating passes"
+    );
+    for k in 0..KEYS {
+        check(&mut db, &oracle, k);
+    }
+    check_scan(&mut db, &oracle, 64);
+    db.check_references().unwrap();
+}
+
 /// The pages a worker's compaction writes come back cached where they were written: the shard's
 /// cache lends each job room, the worker keeps its pages in it as it writes them, and the shard
 /// takes them with the job's branches. With a cache that holds the store and nothing read before

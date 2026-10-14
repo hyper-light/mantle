@@ -792,19 +792,59 @@ impl Trunk {
         let count = settle.count;
         let parts = self.leaf_parts(count);
         let per = crate::util::div_ceil(count, parts).unwrap_or(count).max(1);
-        let run = if self.pool.is_some() {
-            Running::Remote {
-                grant: Vec::new(),
-                state: State::Ready(Box::new(Task {
-                    inputs: inputs.map(Branch::for_merge).collect(),
-                    from,
-                    end,
-                    drop_tombstones: true,
-                    per,
-                })),
+        // On the workers, one task a leaf it makes, each merging the range its leaf will hold:
+        // the leaves are cut at keys found in the inputs' leaf indexes, so the merges run side by
+        // side and the settle, which holds the leaf (and the root's intake while the leaf is the
+        // root) until it applies, takes the time of one leaf's merge rather than all of them
+        // (docs/research/55). Inline, one merge cuts the leaves as it writes them.
+        let runs: Vec<(Running, u64)> = if self.pool.is_some() {
+            let inputs: Vec<&Branch> = inputs.collect();
+            // A task a leaf, at most one a core the workers may use.
+            let cores = u64::try_from(self.pool_capacity()).unwrap_or(u64::MAX);
+            let cuts = split_keys(&inputs, &from, end.as_deref(), parts.min(cores));
+            let mut bounds: Vec<Vec<u8>> = Vec::with_capacity(cuts.len().saturating_add(1));
+            bounds.push(from);
+            bounds.extend(cuts);
+            let mut runs = Vec::with_capacity(bounds.len());
+            for (i, lo) in bounds.iter().enumerate() {
+                let hi = bounds
+                    .get(i.saturating_add(1))
+                    .cloned()
+                    .or_else(|| end.clone());
+                // At most the entries its range holds: those of the leaves its ends fall in
+                // are counted whole.
+                let units = inputs
+                    .iter()
+                    .map(|b| b.entries_between(lo, hi.as_deref()))
+                    .fold(0u64, u64::saturating_add);
+                // Its leaves, as the settle's are made: `round(units / per)`, at least one, of
+                // even size, so none passes the settle's size by more than its rounding.
+                let leaves = units
+                    .saturating_add(per / 2)
+                    .checked_div(per)
+                    .unwrap_or(1)
+                    .max(1);
+                let per = crate::util::div_ceil(units, leaves).unwrap_or(units).max(1);
+                runs.push((
+                    Running::Remote {
+                        grant: Vec::new(),
+                        state: State::Ready(Box::new(Task {
+                            inputs: inputs.iter().map(|b| b.for_merge()).collect(),
+                            from: lo.clone(),
+                            end: hi,
+                            drop_tombstones: true,
+                            per,
+                        })),
+                    },
+                    units,
+                ));
             }
+            runs
         } else {
-            Running::Inline(Box::new(Compaction::prepare(inputs, from, end, true, per)))
+            vec![(
+                Running::Inline(Box::new(Compaction::prepare(inputs, from, end, true, per))),
+                count,
+            )]
         };
         if settle.was_paid {
             self.spend(n, 0)?;
@@ -819,17 +859,25 @@ impl Trunk {
         } else {
             Cause::Size
         };
-        self.tasks.push(NodeTask {
-            node: n,
-            what: What::Settle {
-                extents,
-                cause,
-                start,
-                covered,
-            },
-            run,
-            units: count,
-        });
+        self.stats.settle_tasks = self
+            .stats
+            .settle_tasks
+            .saturating_add(u64::try_from(runs.len()).unwrap_or(u64::MAX));
+        // The bundle's extents go once, with the first of its tasks, when they apply together.
+        let mut extents = Some(extents);
+        for (run, units) in runs {
+            self.tasks.push(NodeTask {
+                node: n,
+                what: What::Settle {
+                    extents: extents.take().unwrap_or_default(),
+                    cause,
+                    start,
+                    covered,
+                },
+                run,
+                units,
+            });
+        }
         if let Some(c) = self.node_mut(n)?.wants.as_mut() {
             c.started = true;
         }
@@ -982,23 +1030,42 @@ impl Trunk {
                 at = at.saturating_add(1);
                 continue;
             }
+            if let What::Settle { .. } = task.what {
+                // A settle's tasks (one a leaf it makes) apply together once all are done.
+                let n = task.node;
+                let settles = |t: &NodeTask| t.node == n && matches!(t.what, What::Settle { .. });
+                if !self
+                    .tasks
+                    .iter()
+                    .filter(|t| settles(t))
+                    .all(|t| t.run.done())
+                {
+                    at = at.saturating_add(1);
+                    continue;
+                }
+                let (siblings, rest): (Vec<NodeTask>, Vec<NodeTask>) =
+                    std::mem::take(&mut self.tasks)
+                        .into_iter()
+                        .partition(settles);
+                self.tasks = rest;
+                self.apply_settle_tasks(store, siblings)?;
+                continue;
+            }
             let task = self.tasks.remove(at);
             self.apply_task(store, task)?;
         }
         Ok(())
     }
 
-    fn apply_task<F: BlockFile>(
+    /// A finished task's parts, its worker's pages adopted, unused grant returned and merge
+    /// timed.
+    fn take_parts<F: BlockFile>(
         &mut self,
         store: &mut Store<F>,
-        task: NodeTask,
-    ) -> Result<(), Error> {
-        let t = self.timed.then(std::time::Instant::now);
-        let NodeTask {
-            node: n, what, run, ..
-        } = task;
-        let parts = match run {
-            Running::Finished(parts) => parts,
+        run: Running,
+    ) -> Result<Vec<(Vec<u8>, Branch)>, Error> {
+        match run {
+            Running::Finished(parts) => Ok(parts),
             Running::Remote {
                 state: State::Done(mut out),
                 ..
@@ -1012,10 +1079,74 @@ impl Trunk {
                 // The worker timed its merge: a compacted key's cost, which consolidations are
                 // priced at, measured wherever compactions run.
                 self.note_merge(out.ns, out.units);
-                out.parts
+                Ok(out.parts)
             }
-            _ => return Err(corrupt()),
+            _ => Err(corrupt()),
+        }
+    }
+
+    /// A settle's tasks, every one done: their parts in key order (their ranges do not
+    /// overlap) applied as the one settle they are.
+    fn apply_settle_tasks<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        tasks: Vec<NodeTask>,
+    ) -> Result<(), Error> {
+        let mut parts = Vec::new();
+        let mut first: Option<(usize, What)> = None;
+        let mut extents = Vec::new();
+        for task in tasks {
+            let NodeTask {
+                node: n, what, run, ..
+            } = task;
+            parts.extend(self.take_parts(store, run)?);
+            if let What::Settle { extents: mine, .. } = &what {
+                extents.extend_from_slice(mine);
+            }
+            first.get_or_insert((n, what));
+        }
+        let Some((n, what)) = first else {
+            return Ok(());
         };
+        parts.sort_by(|a, b| a.0.cmp(&b.0));
+        let what = match what {
+            What::Settle {
+                cause,
+                start,
+                covered,
+                ..
+            } => What::Settle {
+                extents,
+                cause,
+                start,
+                covered,
+            },
+            What::Compact { .. } => return Err(corrupt()),
+        };
+        self.apply_parts(store, n, what, parts)
+    }
+
+    fn apply_task<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        task: NodeTask,
+    ) -> Result<(), Error> {
+        let NodeTask {
+            node: n, what, run, ..
+        } = task;
+        let parts = self.take_parts(store, run)?;
+        self.apply_parts(store, n, what, parts)
+    }
+
+    /// Node `n`'s task `what` applied with the parts it made.
+    fn apply_parts<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        n: usize,
+        what: What,
+        parts: Vec<(Vec<u8>, Branch)>,
+    ) -> Result<(), Error> {
+        let t = self.timed.then(std::time::Instant::now);
         match what {
             What::Compact {
                 key,
@@ -1174,11 +1305,21 @@ impl Trunk {
                 if !landed {
                     continue;
                 }
-                let extents = task
+                // Its output's room: no more extents than its inputs hold, nor than the pages a
+                // merge of its range writes fill ([`Branch::pages_between`]), which a settle's
+                // task of one leaf's range needs where the leaf's whole inputs are its inputs.
+                let held = task
                     .inputs
                     .iter()
                     .map(|b| b.extents.len())
                     .fold(0usize, usize::saturating_add);
+                let spanned = task
+                    .inputs
+                    .iter()
+                    .map(|b| b.pages_between(&task.from, task.end.as_deref()))
+                    .fold(0usize, usize::saturating_add);
+                let per_extent = usize::try_from(store.extent_pages()).unwrap_or(usize::MAX);
+                let extents = held.min(spanned.div_ceil(per_extent.max(1)));
                 let entries = task
                     .inputs
                     .iter()
@@ -1210,11 +1351,7 @@ impl Trunk {
                 // The cache's room for what it writes: at most the pages its inputs hold in its
                 // range, as a merge writes no more entries than it reads; a pivot's compaction
                 // reads its slice of inputs that span the node.
-                let pages = task
-                    .inputs
-                    .iter()
-                    .map(|b| b.pages_between(&task.from, task.end.as_deref()))
-                    .fold(0usize, usize::saturating_add);
+                let pages = spanned;
                 let job = Box::new(pool::Job {
                     work: Work::Compact(*task),
                     grant: given,
@@ -1411,6 +1548,177 @@ impl Trunk {
             .iter()
             .any(|t| matches!(t.run, Running::Inline(_)))
     }
+}
+
+/// Keys cutting `inputs`' entries in `[from, end)` into at most `parts` ranges of about equal
+/// entries, ascending and each inside the range (docs/research/55): for each share, [`cut_at`]
+/// the entries below a key counted through each input's leaf index ([`Branch::entries_below`]),
+/// which tells keys apart only to a leaf an input, so no more ranges than shares of that size
+/// the range holds. Cuts that coincide are kept once; none when fewer than two ranges fit.
+fn split_keys(inputs: &[&Branch], from: &[u8], end: Option<&[u8]>, parts: u64) -> Vec<Vec<u8>> {
+    if parts < 2 || inputs.is_empty() {
+        return Vec::new();
+    }
+    let before: Vec<Vec<u64>> = inputs.iter().map(|b| b.entries_before_pages()).collect();
+    let below = |key: &[u8]| -> u64 {
+        inputs
+            .iter()
+            .zip(&before)
+            .map(|(b, sums)| b.entries_below(key, sums))
+            .fold(0u64, u64::saturating_add)
+    };
+    // The most `below` falls short of a key's rank: a leaf an input.
+    let grain = inputs
+        .iter()
+        .map(|b| b.counts.iter().copied().max().map_or(0, u64::from))
+        .fold(0u64, u64::saturating_add);
+    let low = below(from);
+    let high = match end {
+        Some(e) => below(e),
+        None => before
+            .iter()
+            .map(|sums| sums.last().copied().unwrap_or(0))
+            .fold(0u64, u64::saturating_add),
+    };
+    let parts = parts.min(high.saturating_sub(low).checked_div(grain).unwrap_or(0));
+    if parts < 2 {
+        return Vec::new();
+    }
+    // The least key at or past `from` an input's leaf index holds: the bytes every key in the
+    // range shares are its, which the search takes without searching.
+    let mut least: Option<Vec<u8>> = None;
+    let mut out = Vec::new();
+    for b in inputs {
+        if b.index.ceil(from, &mut out).is_some()
+            && end.is_none_or(|e| out.as_slice() < e)
+            && least.as_ref().is_none_or(|l| out < *l)
+        {
+            least = Some(out.clone());
+        }
+    }
+    let total = u128::from(high.saturating_sub(low));
+    let mut cuts: Vec<Vec<u8>> = Vec::new();
+    for j in 1..parts {
+        let share = total
+            .checked_mul(u128::from(j))
+            .and_then(|t| t.checked_div(u128::from(parts)))
+            .unwrap_or(total);
+        let target = low.saturating_add(u64::try_from(share).unwrap_or(u64::MAX));
+        let Some(cut) = cut_at(&below, from, end, least.as_deref(), target, grain) else {
+            continue;
+        };
+        if cut.as_slice() > from
+            && end.is_none_or(|e| cut.as_slice() < e)
+            && cuts.last().is_none_or(|c| cut > *c)
+        {
+            cuts.push(cut);
+        }
+    }
+    cuts
+}
+
+/// The least key in `[from, end)`, as far as `below` resolves it, at which `below` reaches
+/// `target`: built a byte at a time from the prefix `from` and `end` share, each byte the
+/// greatest whose keys are still below the target (the byte `least` has there when that is it,
+/// else a binary search over the byte's values), until the keys between that byte and the next
+/// number no more than `grain`, which `below` cannot tell apart. A byte a step and a key at most
+/// `u16::MAX` bytes (a memtable's key length is a `u16`) bound it.
+fn cut_at(
+    below: &impl Fn(&[u8]) -> u64,
+    from: &[u8],
+    end: Option<&[u8]>,
+    least: Option<&[u8]>,
+    target: u64,
+    grain: u64,
+) -> Option<Vec<u8>> {
+    let shared = end.map_or(0, |e| {
+        from.iter().zip(e).take_while(|(a, b)| a == b).count()
+    });
+    let mut key: Vec<u8> = from.get(..shared)?.to_vec();
+    let high = end.map_or(u64::MAX, below);
+    // The rank of every key past those `key` prefixes: at the next prefix, else the range's end.
+    let after = |key: &[u8]| -> u64 {
+        match successor(key) {
+            Some(next) if end.is_none_or(|e| next.as_slice() < e) => below(&next).min(high),
+            _ => high,
+        }
+    };
+    let mut probe = Vec::new();
+    let mut at = |key: &[u8], byte: u8| -> u64 {
+        probe.clear();
+        probe.extend_from_slice(key);
+        probe.push(byte);
+        below(&probe)
+    };
+    for _ in 0..=usize::from(u16::MAX) {
+        let depth = key.len();
+        let on = |bound: &[u8]| bound.len() > depth && bound.get(..depth) == Some(key.as_slice());
+        let lo = if on(from) {
+            from.get(depth).copied()?
+        } else {
+            0
+        };
+        let hi = match end {
+            Some(e) if on(e) => e.get(depth).copied()?,
+            _ => u8::MAX,
+        };
+        let above = |at: &mut dyn FnMut(&[u8], u8) -> u64, b: u8, key: &[u8]| -> u64 {
+            match b.checked_add(1) {
+                Some(next) => at(key, next),
+                None => after(key),
+            }
+        };
+        // The greatest byte in [lo, hi] whose keys are below the target.
+        let hinted = least
+            .filter(|l| l.len() > depth && l.get(..depth) == Some(key.as_slice()))
+            .and_then(|l| l.get(depth).copied())
+            .filter(|&b| (lo..=hi).contains(&b));
+        let byte = match hinted {
+            Some(b) if at(&key, b) < target && above(&mut at, b, &key) >= target => b,
+            _ => {
+                let (mut l, mut h) = (lo, hi);
+                for _ in 0..u8::BITS {
+                    if l >= h {
+                        break;
+                    }
+                    let m = l.saturating_add(h.saturating_sub(l).div_ceil(2));
+                    if at(&key, m) < target {
+                        l = m;
+                    } else {
+                        h = m.saturating_sub(1);
+                    }
+                }
+                l
+            }
+        };
+        let base = at(&key, byte);
+        let top = above(&mut at, byte, &key);
+        if top.saturating_sub(base) <= grain {
+            // The cut: the next byte's first key, or past every key `key` prefixes.
+            return match byte.checked_add(1) {
+                Some(next) => {
+                    key.push(next);
+                    Some(key)
+                }
+                None => successor(&key),
+            };
+        }
+        key.push(byte);
+    }
+    None
+}
+
+/// The least key past every key `key` prefixes: its last byte below 255 raised, those after it
+/// dropped; none when every byte is 255.
+fn successor(key: &[u8]) -> Option<Vec<u8>> {
+    let mut next = key.to_vec();
+    while let Some(last) = next.pop() {
+        if let Some(up) = last.checked_add(1) {
+            next.push(up);
+            return Some(next);
+        }
+    }
+    None
 }
 
 /// The entries of `branches`, an upper bound on their keys.

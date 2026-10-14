@@ -250,6 +250,9 @@ pub struct TrunkStats {
     pub pivot_compactions: u64,
     /// Leaves compacted whole.
     pub leaf_compactions: u64,
+    /// Tasks the leaves' settles were planned as: one each inline; on the workers, one a leaf a
+    /// settle makes, at most one a core they may use (docs/research/55).
+    pub settle_tasks: u64,
     /// Pivot bundles flushed to a child.
     pub flushes: u64,
     /// Nodes made by splits, leaves and index nodes.

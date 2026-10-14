@@ -1359,17 +1359,9 @@ impl Branch {
     /// where the trailer's sections fall.
     pub fn pages_between(&self, from: &[u8], end: Option<&[u8]>) -> usize {
         let total = self.counts.len();
-        let page = |p: Result<u32, Error>| p.ok().and_then(|p| usize::try_from(p).ok());
-        let first = page(self.leaf_of(from)).unwrap_or(0);
-        let last = end
-            .and_then(|e| page(self.leaf_of(e)))
-            .unwrap_or(total.saturating_sub(1))
-            .min(total.saturating_sub(1));
+        let (first, last) = self.pages_spanned(from, end);
         let tree = last.saturating_sub(first).saturating_add(1).min(total);
-        let keys = self
-            .counts
-            .get(first..=last)
-            .map_or(0u64, |c| c.iter().map(|&n| u64::from(n)).sum());
+        let keys = self.entries_between(from, end);
         let trailer = u64::from(self.filter_pages);
         let share = |part: u64, whole: u64| {
             trailer
@@ -1385,6 +1377,52 @@ impl Branch {
         tree.saturating_add(usize::from(self.height).saturating_sub(1))
             .saturating_add(usize::try_from(trailer).unwrap_or(usize::MAX))
             .saturating_add(1)
+    }
+
+    /// The first and last tree pages a merge of `[from, end)` reads: the leaf `from` falls in
+    /// and the one `end` does (the last without an end), in page order.
+    fn pages_spanned(&self, from: &[u8], end: Option<&[u8]>) -> (usize, usize) {
+        let total = self.counts.len();
+        let page = |p: Result<u32, Error>| p.ok().and_then(|p| usize::try_from(p).ok());
+        let first = page(self.leaf_of(from)).unwrap_or(0);
+        let last = end
+            .and_then(|e| page(self.leaf_of(e)))
+            .unwrap_or(total.saturating_sub(1))
+            .min(total.saturating_sub(1));
+        (first, last)
+    }
+
+    /// The entries of the leaves a merge of `[from, end)` reads ([`Self::pages_spanned`]): its
+    /// range's entries and at most those of the leaf each end falls in besides.
+    pub fn entries_between(&self, from: &[u8], end: Option<&[u8]>) -> u64 {
+        let (first, last) = self.pages_spanned(from, end);
+        self.counts
+            .get(first..=last)
+            .map_or(0u64, |c| c.iter().map(|&n| u64::from(n)).sum())
+    }
+
+    /// The entries in the tree pages before the leaf `key` falls in: the keys below it, short
+    /// of them by at most that leaf's entries below `key`. `before` is the running sum of
+    /// [`Self::counts`] ([`Self::entries_before_pages`]).
+    pub fn entries_below(&self, key: &[u8], before: &[u64]) -> u64 {
+        self.index
+            .floor(key)
+            .and_then(|p| usize::try_from(p).ok())
+            .and_then(|p| before.get(p).copied())
+            .unwrap_or(0)
+    }
+
+    /// The entries before each tree page, in page order, and after the last: the running sum
+    /// [`Self::entries_below`] reads.
+    pub fn entries_before_pages(&self) -> Vec<u64> {
+        let mut sum = 0u64;
+        let mut before = Vec::with_capacity(self.counts.len().saturating_add(1));
+        before.push(0);
+        for &c in &self.counts {
+            sum = sum.saturating_add(u64::from(c));
+            before.push(sum);
+        }
+        before
     }
 
     /// The address of page `page_no`, counted through the branch's extents in order.

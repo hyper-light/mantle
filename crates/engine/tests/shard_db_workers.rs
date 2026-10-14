@@ -480,3 +480,91 @@ fn workers_and_inline_compactions_hold_the_same_data() {
     };
     assert_eq!(rows(&mut inline), rows(&mut remote));
 }
+
+/// Do: on workers, with memtables of 64 KiB and leaves of 1024 entries (so a settle's share of
+/// its leaves is larger than a leaf of each input, the most its cuts can tell keys apart by), put
+/// and delete keys sharing a 23-byte prefix (`a/shared-prefix/object-`, so the cuts are found
+/// past the bytes every key holds); checkpoint, reopen.
+/// Expect: every key reads its newest value and a scan reads exactly the live keys, before and
+/// after the reopen, every extent named once; the trunk holds what its shape walks; and where the
+/// workers have more than one core (the pool's rule: the cores the OS reports less the shard's),
+/// a settle that made several leaves ran as several tasks, one a leaf, so the settles' tasks
+/// outnumber them, and where they have one, each settle ran as one.
+#[test]
+fn a_settle_runs_as_one_task_a_leaf_on_the_workers_cores() {
+    const MEM: usize = 64 * 1024;
+    const TRUNK: TrunkConfig = TrunkConfig {
+        fanout: 3,
+        leaf_entries: 1024,
+    };
+    const KEYS: u64 = 6000;
+    const OPS: u64 = 40_000;
+    let shared = |k: u64| format!("a/shared-prefix/object-{k:06}").into_bytes();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let mut db = ShardDb::create(open(&path, true), STORE, MEM, TRUNK).unwrap();
+    workers(&mut db, &path);
+    let mut oracle: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+    let mut x = 0x2545_f491_4f6c_dd1d_u64;
+    for i in 0..OPS {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let k = shared(x % KEYS);
+        if x.is_multiple_of(7) {
+            db.delete(&k).unwrap();
+            oracle.insert(k, None);
+        } else {
+            let v = format!("v{i}-{}", "x".repeat((x % 40) as usize)).into_bytes();
+            db.put(&k, &v).unwrap();
+            oracle.insert(k, Some(v));
+        }
+    }
+    let check_all = |db: &mut ShardDb<DeviceFile>| {
+        for (k, v) in &oracle {
+            let mut value = Vec::new();
+            let got = if db.get(k, &mut value).unwrap() {
+                Some(value)
+            } else {
+                None
+            };
+            assert_eq!(&got, v);
+        }
+        let want: Vec<(Vec<u8>, Vec<u8>)> = oracle
+            .iter()
+            .filter_map(|(k, v)| v.as_ref().map(|v| (k.clone(), v.clone())))
+            .collect();
+        let mut rows = Rows::new();
+        let mut next = Vec::new();
+        assert!(
+            !db.scan(b"", None, usize::MAX, &mut rows, &mut next)
+                .unwrap()
+        );
+        let got: Vec<(Vec<u8>, Vec<u8>)> =
+            rows.iter().map(|(k, v)| (k.to_vec(), v.to_vec())).collect();
+        assert_eq!(got, want);
+    };
+    check_all(&mut db);
+    let (_, trunk, _) = db.stats();
+    assert!(trunk.leaf_compactions > 0 && trunk.splits > 0, "{trunk:?}");
+    let cores = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .saturating_sub(1)
+        .max(1);
+    if cores > 1 {
+        assert!(trunk.settle_tasks > trunk.leaf_compactions, "{trunk:?}");
+    } else {
+        assert_eq!(trunk.settle_tasks, trunk.leaf_compactions, "{trunk:?}");
+    }
+    held_is_the_shapes(&db);
+    db.checkpoint(OPS).unwrap();
+    db.check_references().unwrap();
+    let (file, landed) = finished_file(db.into_file());
+    landed.unwrap();
+    drop(file);
+    let (mut db, applied) = ShardDb::open(open(&path, false), STORE, MEM, TRUNK).unwrap();
+    assert_eq!(applied, OPS);
+    held_is_the_shapes(&db);
+    check_all(&mut db);
+    db.check_references().unwrap();
+}

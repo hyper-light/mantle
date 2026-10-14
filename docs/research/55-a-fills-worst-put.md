@@ -70,13 +70,15 @@ merge of the inputs' entries in its range alone, and nothing makes one worker ma
   key in the range holds in two lookups each (the least key the inputs hold names them), the
   others by a binary search over a byte's values, until the keys between one byte and the next
   are no more than the lookups can tell apart.
-- **What each makes.** Its share of the settle's own leaves: the `j`th cut ends where
-  `floor(j * parts / tasks)` of the settle's `parts` leaves lie below it, so the tasks make the
-  `parts` leaves between them, each task cutting its share evenly; no more leaves than the one
-  merge would make, however the cuts fall. A first version let each task round its own count
-  from an over-count of its entries (the leaves its ends fall in counted whole): at 10M it made a
-  ninth leaf where the merge made eight, the root passed its fanout and split, and the tree grew
-  a level, 32% more entries written and gets and seeks 10% slower (runs `n10000000-r441..443`).
+- **What each makes.** Its range's entries cut at the leaf size of the settle's one merge,
+  `per`; once every task is back, the parts are gathered into the leaves that merge would make,
+  `ceil(entries / per)` of the entries they hold, each part in the leaf its first entry's share
+  falls in, so a task's short last part may share a leaf with the next task's first, their ranges
+  apart. The leaf count is the merge's from what was written: the count a settle plans from is an
+  upper bound, its inputs sharing keys, and the merge makes fewer leaves when they do. A first
+  version made at least one leaf a task: at 10M (3.9M distinct keys among 5.06M entries) it made 9
+  where the merge made 7, the root passed its fanout and the tree grew a level, 32% more entries
+  written and seeks 3-10% slower (runs `n10000000-r441..443`, `-r461..463`).
   `TrunkStats::settle_leaves_made` never passes `settle_leaves_planned`.
 - **How they apply.** Together, once all are done, their parts in key order: the one settle they
   are. A failure abandons all of them, as any task's does.

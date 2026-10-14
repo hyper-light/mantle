@@ -354,6 +354,9 @@ pub struct ShardDb<F: BlockFile> {
     order_paced: bool,
     scans_at_rotation: u64,
     mem_limit: usize,
+    /// The bytes of headroom a new memtable's index takes beside a bucket for each key it will
+    /// hold: the memory tuner's share for the index (research/54 §5).
+    index_extra: usize,
     trunk: Trunk,
     /// Work owed but not yet whole, in work·bytes over the room: the remainder of each debt's
     /// share.
@@ -713,6 +716,7 @@ impl<F: BlockFile> ShardDb<F> {
             order_paced: false,
             scans_at_rotation: 0,
             mem_limit,
+            index_extra: 0,
             trunk,
             pack_carry: 0,
             turn_bytes: 0,
@@ -4025,12 +4029,16 @@ impl<F: BlockFile> ShardDb<F> {
     /// workers will pack it ([`Self::give_mirror`]).
     fn fresh_mem(&mut self) -> Result<HashMem, Error> {
         let mut fresh = match self.spare.take() {
-            Some(m) => m,
-            // Sized for the entries the memtable it follows holds, with the entry buffers a kept
-            // memtable shed: it fills without its index or buffers growing, as a cleared spare
-            // refills.
+            Some(mut m) => {
+                m.size_index(self.mem.full_keys(), self.index_extra);
+                m
+            }
+            // Its index a bucket for each key the memtable it follows holds full, and the
+            // headroom the tuner gives the index (research/54 §5); the entry buffers a kept
+            // memtable shed.
             None => {
-                let mut fresh = HashMem::new_for(self.mem_limit, self.mem.len())?;
+                let mut fresh =
+                    HashMem::new_for(self.mem_limit, self.mem.full_keys(), self.index_extra)?;
                 if let Some(bufs) = self.kept_shed.take() {
                     fresh.take_shed(bufs);
                 }

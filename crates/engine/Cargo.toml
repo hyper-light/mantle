@@ -42,6 +42,10 @@ name = "memtable"
 harness = false
 
 [[bench]]
+name = "index_load"
+harness = false
+
+[[bench]]
 name = "block_read"
 harness = false
 

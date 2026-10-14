@@ -1,21 +1,23 @@
-//! A memtable's index of each key's newest entry: a SwissTable of the entries' arena offsets,
-//! growing a few buckets a write, as `util::incmap` grows.
+//! A memtable's index of each key's newest entry: a SwissTable of the entries' arena offsets in as
+//! many groups as its memory buys (research/54 §5).
 //!
 //! `IncMap` keeps a 64-bit key and a 64-bit value a bucket, 17 bytes with its control byte, so a
 //! 64 MiB memtable of 560 Ki entries spent 17 MiB on it. Here a bucket holds only the entry's
 //! 32-bit offset, in its group's cache line beside the group's control word (8 bytes a bucket
-//! with the line's padding): the key a probe compares is the entry's own, read from the arena, and
-//! a migration takes each entry's hash again from its key. Keys compare by their bytes, so two
-//! keys of one 64-bit hash are two entries, with no list of clashes beside the table.
+//! with the line's padding): the key a probe compares is the entry's own, read from the arena.
+//! Keys compare by their bytes, so two keys of one 64-bit hash are two entries, with no list of
+//! clashes beside the table.
 //!
-//! Probing is `IncMap`'s (Abseil's SwissTable: a control byte a bucket, 7 bits of the hash, read
-//! eight at a time; hashbrown's portable group); growth is `IncMap`'s too, a full table starting a
-//! new one and each write moving `MOVE` of the old one's buckets (Redis's `dict.c`
-//! `_dictRehashStep`), so no write rehashes the table whole.
+//! A group is matched as `IncMap` matches one (Abseil's SwissTable: a control byte a bucket, 7 bits
+//! of the hash, read eight at a time; hashbrown's portable group). A key's first group is its
+//! hash's bits below the tag multiplied into the count of groups, the product's high word
+//! (multiply-shift range reduction: Lemire, "Fast Random Integer Generation in an Interval", ACM
+//! TOMACS 29(1), 2019), so a table holds any count of groups its memory buys; a probe goes on to
+//! the next group, wrapping, so it reaches every group of any count. The table never grows: one
+//! with no bucket free refuses a new key ([`KeyIndex::put`]), and its memtable is packed.
 
-// Probing's and migration's constants are `util::incmap`'s, derived and cited there: this index
-// differs only in what a bucket holds and how a group lies in memory.
-use crate::util::incmap::{DELETED, EMPTY, FIB, GROUP, HIGH, LOW, MOVE, repeat};
+// Group matching's constants are `util::incmap`'s, derived and cited there.
+use crate::util::incmap::{EMPTY, FIB, GROUP, HIGH, LOW, repeat};
 
 /// A group of buckets: their control bytes as one word, byte `b` for bucket `b`, beside their
 /// entry offsets, in one cache line, so the line a probe reads is the one an insert then writes
@@ -36,24 +38,24 @@ impl Group {
     };
 }
 
-/// One table: a power-of-two count of buckets, at least a group.
-#[derive(Debug, Default)]
+/// One table: the groups its memory buys, at least one.
+#[derive(Debug)]
 struct Table {
     groups: Vec<Group>,
     full: usize,
-    /// From a hash to its group: the bits below the tag's, `(m >> shift) & mask`.
-    shift: u32,
-    mask: usize,
+}
+
+impl Default for Table {
+    fn default() -> Self {
+        Self::new(0)
+    }
 }
 
 impl Table {
-    fn new(buckets: usize) -> Self {
-        let groups = (buckets / GROUP).max(1);
+    fn new(groups: usize) -> Self {
         Self {
-            groups: vec![Group::EMPTY; groups],
+            groups: vec![Group::EMPTY; groups.max(1)],
             full: 0,
-            shift: 57u32.saturating_sub(groups.trailing_zeros()),
-            mask: groups.wrapping_sub(1),
         }
     }
 
@@ -83,12 +85,14 @@ impl Table {
             .and_then(|group| group.slots.get_mut(i % GROUP))
     }
 
-    /// A hash's tag, its top 7 bits after mixing, and its first group.
+    /// A hash's tag, its top 7 bits after mixing, and its first group: the 57 bits below the tag
+    /// times the count of groups, the product's high word.
     #[inline]
     fn place(&self, hash: u64) -> (u8, usize) {
         let m = hash.wrapping_mul(FIB);
         let tag = u8::try_from(m >> 57).unwrap_or(0);
-        let group = usize::try_from(m.wrapping_shr(self.shift)).unwrap_or(0) & self.mask;
+        let groups = u128::try_from(self.groups.len()).unwrap_or(u128::MAX);
+        let group = usize::try_from(u128::from(m << 7).wrapping_mul(groups) >> 64).unwrap_or(0);
         (tag, group)
     }
 
@@ -99,8 +103,8 @@ impl Table {
         let (tag, mut g) = self.place(hash);
         let pattern = repeat(tag);
         let mut free = None;
-        // Each round reads a group; triangular steps visit each group once.
-        for stride in 1..=self.groups.len() {
+        // Each round reads a group, the next after it: every group once.
+        for _ in 0..self.groups.len() {
             let w = self.word(g);
             let at = g.wrapping_mul(GROUP);
             let cmp = w ^ pattern;
@@ -120,7 +124,10 @@ impl Table {
             if w & (w << 1) & HIGH != 0 {
                 return Err(free);
             }
-            g = g.wrapping_add(stride) & self.mask;
+            g = g.wrapping_add(1);
+            if g == self.groups.len() {
+                g = 0;
+            }
         }
         Err(free)
     }
@@ -141,7 +148,7 @@ impl Table {
     }
 
     /// Puts `entry` in the bucket an entry `same` accepts holds, or a new one: the entry it
-    /// replaced. `None` with no bucket free, which a table under its threshold always has.
+    /// replaced. `None` with no bucket free.
     fn put(&mut self, hash: u64, entry: u32, same: impl Fn(u32) -> bool) -> Option<Option<u32>> {
         match self.seek(hash, same) {
             Ok(i) => {
@@ -158,154 +165,96 @@ impl Table {
             }
         }
     }
-
-    /// Whether one more entry passes `7/8` of the buckets.
-    fn crowded(&self) -> bool {
-        self.full.saturating_add(1).saturating_mul(8) > self.buckets().saturating_mul(7)
-    }
 }
 
-/// The index: its table, the old one a migration is emptying, and how far it has come.
+/// The index: one table, its size set when it is made.
 #[derive(Debug, Default)]
 pub struct KeyIndex {
     table: Table,
-    old: Option<Table>,
-    moved: usize,
 }
 
 impl KeyIndex {
-    /// An index whose table holds `entries` within the load at which a table grows (`7/8`,
-    /// `Table::crowded`): a memtable that fills to as many entries as the one before it neither
-    /// grows nor migrates, as a cleared one refilled does not, in the fewest buckets that allow.
-    pub fn for_entries(entries: usize) -> Self {
-        if entries == 0 {
-            return Self::default();
-        }
-        let want = entries.saturating_mul(8).div_ceil(7).max(GROUP);
-        let buckets = want.checked_next_power_of_two().unwrap_or(want);
+    /// An index of at least `entries` buckets and the groups `extra` bytes buy beside them.
+    pub fn sized(entries: usize, extra: usize) -> Self {
         Self {
-            table: Table::new(buckets),
-            old: None,
-            moved: 0,
+            table: Table::new(Self::groups_for(entries, extra)),
         }
     }
 
-    /// Reads `hash`'s first group in each table, the line holding its control word and its
-    /// entries, so a probe made after finds it cached: several indexes' misses overlapped rather
-    /// than one after another (the shard's kept memtables, research/51).
+    /// The groups an index of at least `entries` buckets and `extra` bytes more takes.
+    fn groups_for(entries: usize, extra: usize) -> usize {
+        entries
+            .div_ceil(GROUP)
+            .saturating_add(extra.checked_div(size_of::<Group>()).unwrap_or(0))
+    }
+
+    /// Whether [`Self::sized`] with these would make the table this one has.
+    pub fn is_sized(&self, entries: usize, extra: usize) -> bool {
+        self.table.groups.len() == Self::groups_for(entries, extra).max(1)
+    }
+
+    /// Reads `hash`'s first group, the line holding its control word and its entries, so a probe
+    /// made after finds it cached: several indexes' misses overlapped rather than one after
+    /// another (the shard's kept memtables, research/51).
     #[inline]
     pub fn touch(&self, hash: u64) -> u64 {
-        let first = |t: &Table| {
-            let (_, g) = t.place(hash);
-            t.word(g)
-        };
-        first(&self.table) ^ self.old.as_ref().map_or(0, first)
+        let (_, g) = self.table.place(hash);
+        self.table.word(g)
     }
 
-    /// Each key's newest entry, in no order: every entry the index holds, in either table while a
-    /// migration runs.
+    /// Each key's newest entry, in no order.
     pub fn each_entry(&self, mut each: impl FnMut(u32)) {
-        for t in std::iter::once(&self.table).chain(self.old.as_ref()) {
-            for i in 0..t.buckets() {
-                if t.is_full(i)
-                    && let Some(e) = t.slot(i)
-                {
-                    each(e);
-                }
+        for i in 0..self.table.buckets() {
+            if self.table.is_full(i)
+                && let Some(e) = self.table.slot(i)
+            {
+                each(e);
             }
         }
     }
 
-    /// Empties the index, keeping its table: refilled to the size it last held, it neither grows
-    /// nor migrates again.
+    /// Empties the index, keeping its table.
     pub fn clear(&mut self) {
-        self.old = None;
-        self.moved = 0;
         for group in &mut self.table.groups {
             group.ctrl = repeat(EMPTY);
         }
         self.table.full = 0;
     }
 
-    /// The bytes its tables take, the old one's while a migration runs included.
+    /// The bytes its table takes.
     pub fn bytes(&self) -> usize {
-        let of = |t: &Table| t.groups.len().saturating_mul(size_of::<Group>());
-        of(&self.table).saturating_add(self.old.as_ref().map_or(0, of))
+        self.table.groups.len().saturating_mul(size_of::<Group>())
+    }
+
+    /// The buckets its table has.
+    pub fn buckets(&self) -> usize {
+        self.table.buckets()
+    }
+
+    /// Whether a new key has a bucket.
+    pub fn has_room(&self) -> bool {
+        self.table.full < self.table.buckets()
     }
 
     /// The newest entry of a key of hash `hash` that `same` accepts.
     #[inline]
     pub fn get(&self, hash: u64, same: impl Fn(u32) -> bool) -> Option<u32> {
-        let found = |t: &Table| t.seek(hash, &same).ok().and_then(|i| t.slot(i));
-        found(&self.table).or_else(|| self.old.as_ref().and_then(found))
+        self.table
+            .seek(hash, &same)
+            .ok()
+            .and_then(|i| self.table.slot(i))
     }
 
-    /// Makes `entry` the newest of its key, of hash `hash`: the entry it replaced, if the key had
-    /// one. `same` accepts the entries of the same key; `hash_of` gives an entry's hash, for those
-    /// a migration moves.
+    /// Makes `entry` the newest of its key, of hash `hash`: `Some` of the entry it replaced, if
+    /// the key had one; `None`, nothing changed, for a new key with no bucket free. `same` accepts
+    /// the entries of the same key.
     pub fn put(
         &mut self,
         hash: u64,
         entry: u32,
         same: impl Fn(u32) -> bool,
-        hash_of: impl Fn(u32) -> u64,
-    ) -> Option<u32> {
-        self.step(&hash_of);
-        if self.table.buckets() == 0 || self.table.crowded() {
-            // A migration still running would break `MOVE`'s bound: it is finished first.
-            while self.old.is_some() {
-                self.step(&hash_of);
-            }
-            self.rebuild();
-        }
-        // The key may be in the old table still: its entry there is taken out, so a get finds
-        // the newest in the new one.
-        let was = self.old.as_mut().and_then(|o| {
-            let i = o.seek(hash, &same).ok()?;
-            o.set_ctrl(i, DELETED);
-            o.full = o.full.saturating_sub(1);
-            o.slot(i)
-        });
-        self.table.put(hash, entry, &same).flatten().or(was)
-    }
-
-    /// Starts a migration to a table at most half full, with room for the writes the migration
-    /// spans (`util::incmap`'s rule).
-    fn rebuild(&mut self) {
-        let c = self.table.buckets();
-        let len = self.table.full.saturating_add(1);
-        let want = len
-            .saturating_mul(2)
-            .max((len.saturating_add(c / 4).saturating_mul(8) / 7).saturating_add(1));
-        let buckets = want.checked_next_power_of_two().unwrap_or(want);
-        let old = std::mem::replace(&mut self.table, Table::new(buckets));
-        if old.full > 0 {
-            self.old = Some(old);
-            self.moved = 0;
-        }
-    }
-
-    /// Moves the next `MOVE` buckets of the old table, each entry by its key's hash again.
-    fn step(&mut self, hash_of: &impl Fn(u32) -> u64) {
-        let Some(old) = self.old.as_mut() else {
-            return;
-        };
-        for _ in 0..MOVE {
-            if self.moved >= old.buckets() || old.full == 0 {
-                self.old = None;
-                return;
-            }
-            let i = self.moved;
-            if old.is_full(i)
-                && let Some(e) = old.slot(i)
-            {
-                old.set_ctrl(i, DELETED);
-                old.full = old.full.saturating_sub(1);
-                // An entry moving is the only one of its key: nothing for `same` to match.
-                self.table.put(hash_of(e), e, |_| false);
-            }
-            self.moved = self.moved.saturating_add(1);
-        }
+    ) -> Option<Option<u32>> {
+        self.table.put(hash, entry, &same)
     }
 }
 
@@ -315,10 +264,10 @@ mod tests {
     use std::collections::HashMap;
 
     /// Keys as offsets into a list standing for the arena; a key's hash chosen by the test, so
-    /// keys of one hash are distinct entries.
+    /// keys of one hash are distinct entries. Tables of counts of groups that are not powers of
+    /// two, from one group, filled to every bucket.
     #[test]
-    fn it_answers_as_a_map_does_through_every_migration_even_for_keys_of_one_hash() {
-        let mut keys: Vec<u64> = Vec::new();
+    fn it_answers_as_a_map_does_to_its_last_bucket_for_any_count_of_groups() {
         let hash_of_key = |k: u64| {
             if k.is_multiple_of(7) {
                 42
@@ -326,41 +275,81 @@ mod tests {
                 k.wrapping_mul(0x2545_f491)
             }
         };
-        let mut index = KeyIndex::default();
-        let mut model: HashMap<u64, u32> = HashMap::new();
-        let mut x = 0x9e37_79b9_7f4a_7c15u64;
-        for _ in 0..300_000u64 {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            let k = x % 50_000;
-            let entry = u32::try_from(keys.len()).unwrap();
-            keys.push(k);
-            let h = hash_of_key(k);
-            let was = index.put(
-                h,
-                entry,
-                |e| keys[e as usize] == k,
-                |e| hash_of_key(keys[e as usize]),
-            );
-            assert_eq!(was, model.insert(k, entry));
-            if x.is_multiple_of(5) {
-                let probe = (x >> 20) % 50_000;
-                let got = index.get(hash_of_key(probe), |e| keys[e as usize] == probe);
-                assert_eq!(got, model.get(&probe).copied());
+        for groups in [1usize, 3, 7, 100, 1000, 4097] {
+            let buckets = groups * GROUP;
+            let mut index = KeyIndex::sized(buckets, 0);
+            assert_eq!(index.buckets(), buckets);
+            let mut keys: Vec<u64> = Vec::new();
+            let mut model: HashMap<u64, u32> = HashMap::new();
+            let mut x = 0x9e37_79b9_7f4a_7c15u64 ^ groups as u64;
+            while model.len() < buckets {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                // Keys drawn from twice the buckets: repeats replace, new ones take a bucket.
+                let k = x % (2 * buckets as u64);
+                let entry = u32::try_from(keys.len()).unwrap();
+                keys.push(k);
+                let was = index.put(hash_of_key(k), entry, |e| keys[e as usize] == k);
+                assert_eq!(was, Some(model.insert(k, entry)), "groups {groups}");
+                if x.is_multiple_of(5) {
+                    let probe = (x >> 20) % (2 * buckets as u64);
+                    let got = index.get(hash_of_key(probe), |e| keys[e as usize] == probe);
+                    assert_eq!(got, model.get(&probe).copied(), "groups {groups}");
+                }
             }
-        }
-        for (&k, &e) in &model {
+            assert!(!index.has_room());
+            // Full: a new key is refused, changing nothing; a held key is still replaced.
+            let absent = 2 * buckets as u64 + 1;
+            keys.push(absent);
+            let entry = u32::try_from(keys.len() - 1).unwrap();
             assert_eq!(
-                index.get(hash_of_key(k), |f| keys[f as usize] == k),
-                Some(e)
+                index.put(hash_of_key(absent), entry, |e| keys[e as usize] == absent),
+                None
             );
+            let (&held, _) = model.iter().next().unwrap();
+            keys.push(held);
+            let entry = u32::try_from(keys.len() - 1).unwrap();
+            assert!(
+                index
+                    .put(hash_of_key(held), entry, |e| keys[e as usize] == held)
+                    .is_some_and(|was| was.is_some())
+            );
+            model.insert(held, entry);
+            for (&k, &e) in &model {
+                assert_eq!(
+                    index.get(hash_of_key(k), |f| keys[f as usize] == k),
+                    Some(e)
+                );
+            }
+            assert_eq!(
+                index.get(hash_of_key(absent), |e| keys[e as usize] == absent),
+                None
+            );
+            let mut listed = 0;
+            index.each_entry(|_| listed += 1);
+            assert_eq!(listed, model.len());
+            index.clear();
+            assert!(index.has_room());
+            assert_eq!(index.buckets(), buckets);
         }
-        // A group's line a group, a table at most twice its entries' next power of two.
-        assert!(
-            index.bytes() <= size_of::<Group>() / GROUP * 4 * model.len().next_power_of_two(),
-            "{}",
-            index.bytes()
+    }
+
+    /// The groups an index is sized to: the buckets its entries need, a group's line each, and
+    /// what the extra bytes buy.
+    #[test]
+    fn it_takes_the_groups_its_entries_and_its_extra_bytes_buy() {
+        assert_eq!(KeyIndex::sized(0, 0).buckets(), GROUP);
+        assert_eq!(KeyIndex::sized(1, 0).buckets(), GROUP);
+        assert_eq!(KeyIndex::sized(GROUP + 1, 0).buckets(), 2 * GROUP);
+        let line = size_of::<Group>();
+        assert_eq!(KeyIndex::sized(GROUP, 3 * line).buckets(), 4 * GROUP);
+        assert_eq!(
+            KeyIndex::sized(GROUP, 3 * line + line - 1).buckets(),
+            4 * GROUP
         );
+        assert_eq!(KeyIndex::sized(GROUP, 3 * line).bytes(), 4 * line);
+        assert!(KeyIndex::sized(5 * GROUP, 2 * line).is_sized(5 * GROUP, 2 * line));
+        assert!(!KeyIndex::sized(5 * GROUP, 2 * line).is_sized(5 * GROUP, 3 * line));
     }
 }

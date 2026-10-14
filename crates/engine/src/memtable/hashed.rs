@@ -394,8 +394,10 @@ pub struct HashMem {
     /// The most bytes the arena has held: its pages written so far, which a clear keeps.
     touched: usize,
     /// Each key's newest entry, by the key's hash: keys of one hash are told apart by their
-    /// bytes ([`KeyIndex`]).
+    /// bytes ([`KeyIndex`]). Sized when the memtable is made ([`Self::new_for`]), or else by its
+    /// first entry ([`Self::insert_hashed`]).
     index: KeyIndex,
+    index_sized: bool,
     len: usize,
     /// The first key written, and how many of its first bytes every key written since shares.
     first: Vec<u8>,
@@ -616,6 +618,7 @@ impl HashMem {
             limit,
             touched: 0,
             index: KeyIndex::default(),
+            index_sized: false,
             len: 0,
             first: Vec::new(),
             skip: 0,
@@ -641,13 +644,21 @@ impl HashMem {
         })
     }
 
-    /// [`Self::new`], its index sized for `entries`, as many as the memtable before it held: it
-    /// fills without the index growing or migrating, as a cleared spare refills
-    /// ([`KeyIndex::for_entries`]).
-    pub fn new_for(limit: usize, entries: usize) -> Result<Self, Error> {
+    /// [`Self::new`], its index of a bucket for each of `entries`, as many as the memtable before
+    /// it held, and the groups `extra` bytes buy beside them ([`KeyIndex::sized`]).
+    pub fn new_for(limit: usize, entries: usize, extra: usize) -> Result<Self, Error> {
         let mut mem = Self::new(limit)?;
-        mem.index = KeyIndex::for_entries(entries);
+        mem.size_index(entries, extra);
         Ok(mem)
+    }
+
+    /// Sizes an empty memtable's index as [`Self::new_for`] does, its table made again only if
+    /// its size changes.
+    pub fn size_index(&mut self, entries: usize, extra: usize) {
+        if !self.index_sized || !self.index.is_sized(entries, extra) {
+            self.index = KeyIndex::sized(entries, extra);
+        }
+        self.index_sized = true;
     }
 
     /// Reads `hash`'s first index group ([`KeyIndex::touch`]).
@@ -840,6 +851,19 @@ impl HashMem {
         self.len
     }
 
+    /// The keys its arena holds when full, at the mix of entries it holds now: its keys scaled
+    /// by its bound over the bytes they took. A memtable whose index filled first counts more
+    /// than it holds, so the next one's index lets its arena fill.
+    pub fn full_keys(&self) -> usize {
+        let held = u128::try_from(self.len).unwrap_or(u128::MAX);
+        let limit = u128::try_from(self.limit).unwrap_or(u128::MAX);
+        let used = u128::try_from(self.arena.len()).unwrap_or(u128::MAX);
+        held.saturating_mul(limit)
+            .checked_div(used)
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(0)
+    }
+
     /// Whether it holds none.
     pub fn is_empty(&self) -> bool {
         self.len == 0
@@ -1009,6 +1033,13 @@ impl HashMem {
                 limit: u64::try_from(self.limit).unwrap_or(u64::MAX),
             });
         }
+        // An index with no bucket free bounds the memtable as its arena does: it is packed.
+        if self.index_sized && !self.index.has_room() {
+            return Err(Error::LimitExceeded {
+                what: "a memtable's index",
+                limit: u64::try_from(self.index.buckets()).unwrap_or(u64::MAX),
+            });
+        }
         let entry = u32::try_from(self.arena.len()).map_err(|_| corrupt())?;
         if entry == 0 {
             self.first.clear();
@@ -1054,13 +1085,19 @@ impl HashMem {
                 self.mirrored = false;
             }
         }
+        if !self.index_sized {
+            // A memtable made with no size for its index: a bucket for each entry the arena holds
+            // at the bytes this first one took, so the index fills no sooner than the arena with
+            // entries like it.
+            // The keys its arena holds full of entries like this one, as `full_keys` counts.
+            self.index = KeyIndex::sized(self.limit.checked_div(self.arena.len()).unwrap_or(0), 0);
+            self.index_sized = true;
+        }
         let arena = &self.arena;
-        let replaced = self.index.put(
-            h,
-            entry,
-            |e| self::key(arena, e) == key,
-            |e| hash(self::key(arena, e)),
-        );
+        let replaced = self
+            .index
+            .put(h, entry, |e| self::key(arena, e) == key)
+            .ok_or_else(corrupt)?;
         if replaced.is_none() {
             self.len = self.len.saturating_add(1);
         }

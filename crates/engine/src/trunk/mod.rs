@@ -2016,7 +2016,11 @@ impl Trunk {
     }
 
     /// A leaf's compaction is done: `parts` replace the branches whose `extents` it releases,
-    /// each part beyond the first a leaf of its own. Returns the leaves now covering the range, each with its first key.
+    /// gathered into the leaves its one merge would make: `ceil(entries / per)` of what they
+    /// hold, each part in the leaf its first entry's share falls in. A merge cut at `per` makes
+    /// one part a leaf; the parts of a settle split across the workers ([`upkeep`]), each task's
+    /// last part short, may share a leaf, their ranges apart (docs/research/55 §4). Returns the
+    /// leaves now covering the range, each with its first key.
     fn apply_settle<F: BlockFile>(
         &mut self,
         store: &mut Store<F>,
@@ -2024,6 +2028,7 @@ impl Trunk {
         parts: Vec<(Vec<u8>, Branch)>,
         extents: &[u64],
         cause: upkeep::Cause,
+        per: u64,
     ) -> Result<Vec<(Vec<u8>, usize)>, Error> {
         let node = self.node(n)?;
         let pivot = node.pivots.first().ok_or(corrupt())?;
@@ -2034,15 +2039,38 @@ impl Trunk {
             .held
             .saturating_sub(entries_of(pivot.bundle.branches()));
         self.stats.leaf_compactions = self.stats.leaf_compactions.saturating_add(1);
+        // The parts gathered into leaves.
+        let entries = parts
+            .iter()
+            .map(|(_, b)| b.count)
+            .fold(0u64, u64::saturating_add);
+        let leaves = crate::util::div_ceil(entries, per.max(1))
+            .unwrap_or(1)
+            .max(1);
+        let mut groups: Vec<(Vec<u8>, Vec<Branch>)> = Vec::new();
+        let mut placed = 0u64;
+        for (first, branch) in parts {
+            let leaf = u128::from(placed)
+                .checked_mul(u128::from(leaves))
+                .and_then(|x| x.checked_div(u128::from(entries.max(1))))
+                .and_then(|x| usize::try_from(x).ok())
+                .unwrap_or(0);
+            placed = placed.saturating_add(branch.count);
+            let opened = groups.len();
+            match groups.last_mut() {
+                Some((_, bs)) if opened > leaf => bs.push(branch),
+                _ => groups.push((first, vec![branch])),
+            }
+        }
         self.stats.settle_leaves_made = self
             .stats
             .settle_leaves_made
-            .saturating_add(u64::try_from(parts.len().max(1)).unwrap_or(u64::MAX));
+            .saturating_add(u64::try_from(groups.len().max(1)).unwrap_or(u64::MAX));
         self.stats.splits = self
             .stats
             .splits
-            .saturating_add(u64::try_from(parts.len().saturating_sub(1)).unwrap_or(0));
-        for (_, b) in &parts {
+            .saturating_add(u64::try_from(groups.len().saturating_sub(1)).unwrap_or(0));
+        for b in groups.iter().flat_map(|(_, bs)| bs.iter()) {
             self.stats.entries_written = self.stats.entries_written.saturating_add(b.count);
             self.held = self.held.saturating_add(b.count);
             let by_cause = match cause {
@@ -2056,7 +2084,7 @@ impl Trunk {
             store.release(e)?;
         }
         // Every compacted part's references are the leaf's that takes it.
-        if parts.is_empty() {
+        if groups.is_empty() {
             self.node_mut(n)?
                 .pivots
                 .first_mut()
@@ -2066,14 +2094,14 @@ impl Trunk {
                 .clear();
             return Ok(vec![(from, n)]);
         }
-        let mut out = Vec::with_capacity(parts.len());
-        let count = parts.len();
-        for (j, (first, branch)) in parts.into_iter().enumerate() {
+        let mut out = Vec::with_capacity(groups.len());
+        let count = groups.len();
+        for (j, (first, branches)) in groups.into_iter().enumerate() {
             let key = if j == 0 { from.clone() } else { first };
             if j == 0 {
                 let node = self.node_mut(n)?;
                 let p = node.pivots.first_mut().ok_or(corrupt())?;
-                p.bundle = Bundle::from(vec![branch]);
+                p.bundle = Bundle::from(branches);
                 out.push((key, n));
             } else {
                 self.nodes.push(Node {
@@ -2081,7 +2109,7 @@ impl Trunk {
                     pivots: vec![Pivot {
                         key: key.clone(),
                         child: None,
-                        bundle: Bundle::from(vec![branch]),
+                        bundle: Bundle::from(branches),
                         start: 0,
                         seek: SeekRent::default(),
                     }],

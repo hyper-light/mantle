@@ -61,6 +61,9 @@ enum What {
         cause: Cause,
         start: usize,
         covered: usize,
+        /// The entries a leaf of its one merge holds at most: its parts are gathered into the
+        /// leaves that merge would make ([`Trunk::apply_settle`]).
+        per: u64,
     },
 }
 
@@ -801,29 +804,25 @@ impl Trunk {
             let inputs: Vec<&Branch> = inputs.collect();
             // A task a leaf, at most one a core the workers may use.
             let cores = u64::try_from(self.pool_capacity()).unwrap_or(u64::MAX);
-            let cut = split_keys(&inputs, &from, end.as_deref(), parts, parts.min(cores));
-            // A task's range ends at a cut, the cut's share `j` of `cut.tasks`: the leaves before
-            // it are `floor(j * parts / tasks)`, so the tasks make the settle's `parts` leaves
-            // between them, the tree its one merge would make (docs/research/55 §4).
-            let before = |j: u64| j.saturating_mul(parts).checked_div(cut.tasks).unwrap_or(0);
-            let mut bounds: Vec<(Vec<u8>, u64)> =
-                Vec::with_capacity(cut.keys.len().saturating_add(1));
-            bounds.push((from, 0));
-            bounds.extend(cut.keys);
+            // A task's range ends at a cut, each cutting what it merges at the one merge's leaf
+            // size; the parts are gathered into the leaves that merge would make once all are
+            // back, from the entries they hold ([`Trunk::apply_settle`]; docs/research/55 §4).
+            let cut = split_keys(&inputs, &from, end.as_deref(), parts.min(cores));
+            let mut bounds: Vec<Vec<u8>> = Vec::with_capacity(cut.len().saturating_add(1));
+            bounds.push(from);
+            bounds.extend(cut);
             let mut runs = Vec::with_capacity(bounds.len());
-            for (i, (lo, j)) in bounds.iter().enumerate() {
-                let (hi, next) = match bounds.get(i.saturating_add(1)) {
-                    Some((key, next)) => (Some(key.clone()), *next),
-                    None => (end.clone(), cut.tasks),
-                };
-                let leaves = before(next).saturating_sub(before(*j)).max(1);
+            for (i, lo) in bounds.iter().enumerate() {
+                let hi = bounds
+                    .get(i.saturating_add(1))
+                    .cloned()
+                    .or_else(|| end.clone());
                 // At most the entries its range holds: those of the leaves its ends fall in
-                // are counted whole. Its leaves of even size, no more than its share of them.
+                // are counted whole.
                 let units = inputs
                     .iter()
                     .map(|b| b.entries_between(lo, hi.as_deref()))
                     .fold(0u64, u64::saturating_add);
-                let per = crate::util::div_ceil(units, leaves).unwrap_or(units).max(1);
                 runs.push((
                     Running::Remote {
                         grant: Vec::new(),
@@ -873,6 +872,7 @@ impl Trunk {
                     cause,
                     start,
                     covered,
+                    per,
                 },
                 run,
                 units,
@@ -1114,12 +1114,14 @@ impl Trunk {
                 cause,
                 start,
                 covered,
+                per,
                 ..
             } => What::Settle {
                 extents,
                 cause,
                 start,
                 covered,
+                per,
             },
             What::Compact { .. } => return Err(corrupt()),
         };
@@ -1173,6 +1175,7 @@ impl Trunk {
                 cause,
                 start,
                 covered,
+                per,
             } => {
                 let took = self
                     .node(n)?
@@ -1184,7 +1187,7 @@ impl Trunk {
                     .fold(0u64, u64::saturating_add);
                 self.stats.settle_inflight_entries =
                     self.stats.settle_inflight_entries.saturating_add(took);
-                let leaves = self.apply_settle(store, n, parts, &extents, cause)?;
+                let leaves = self.apply_settle(store, n, parts, &extents, cause, per)?;
                 // The in-flight bundles it took are read by none now: the leaf reads past them.
                 if let Some(p) = self.node_mut(n)?.pivots.first_mut() {
                     p.start = covered;
@@ -1550,31 +1553,14 @@ impl Trunk {
     }
 }
 
-/// Where a settle's tasks part: each cut with the share `j` of `tasks` it ends, ascending.
-struct Cuts {
-    keys: Vec<(Vec<u8>, u64)>,
-    tasks: u64,
-}
-
-/// Keys cutting `inputs`' entries in `[from, end)` among at most `tasks` ranges, at the
-/// boundaries of the settle's `leaves` leaves: the `j`th cut where `floor(j * leaves / tasks)`
-/// leaves' entries lie below it (docs/research/55), each found by [`cut_at`] through the entries
-/// below a key counted through each input's leaf index ([`Branch::entries_below`]). Those counts
-/// tell keys apart only to a leaf an input, so no more ranges than shares of that size the range
-/// holds. Cuts that coincide are kept once; none when fewer than two ranges fit.
-fn split_keys(
-    inputs: &[&Branch],
-    from: &[u8],
-    end: Option<&[u8]>,
-    leaves: u64,
-    tasks: u64,
-) -> Cuts {
-    let none = Cuts {
-        keys: Vec::new(),
-        tasks: 1,
-    };
+/// Keys cutting `inputs`' entries in `[from, end)` into at most `tasks` ranges of about equal
+/// entries, ascending and each inside the range (docs/research/55): for each share, [`cut_at`]
+/// the entries below a key counted through each input's leaf index ([`Branch::entries_below`]),
+/// which tells keys apart only to a leaf an input, so no more ranges than shares of that size
+/// the range holds. Cuts that coincide are kept once; none when fewer than two ranges fit.
+fn split_keys(inputs: &[&Branch], from: &[u8], end: Option<&[u8]>, tasks: u64) -> Vec<Vec<u8>> {
     if tasks < 2 || inputs.is_empty() {
-        return none;
+        return Vec::new();
     }
     let before: Vec<Vec<u64>> = inputs.iter().map(|b| b.entries_before_pages()).collect();
     let below = |key: &[u8]| -> u64 {
@@ -1599,7 +1585,7 @@ fn split_keys(
     };
     let tasks = tasks.min(high.saturating_sub(low).checked_div(grain).unwrap_or(0));
     if tasks < 2 {
-        return none;
+        return Vec::new();
     }
     // The least key at or past `from` an input's leaf index holds: the bytes every key in the
     // range shares are its, which the search takes without searching.
@@ -1614,12 +1600,11 @@ fn split_keys(
         }
     }
     let total = u128::from(high.saturating_sub(low));
-    let mut cuts: Vec<(Vec<u8>, u64)> = Vec::new();
+    let mut cuts: Vec<Vec<u8>> = Vec::new();
     for j in 1..tasks {
-        let below_j = j.saturating_mul(leaves).checked_div(tasks).unwrap_or(0);
         let share = total
-            .checked_mul(u128::from(below_j))
-            .and_then(|t| t.checked_div(u128::from(leaves.max(1))))
+            .checked_mul(u128::from(j))
+            .and_then(|t| t.checked_div(u128::from(tasks)))
             .unwrap_or(total);
         let target = low.saturating_add(u64::try_from(share).unwrap_or(u64::MAX));
         let Some(cut) = cut_at(&below, from, end, least.as_deref(), target, grain) else {
@@ -1627,12 +1612,12 @@ fn split_keys(
         };
         if cut.as_slice() > from
             && end.is_none_or(|e| cut.as_slice() < e)
-            && cuts.last().is_none_or(|(c, _)| cut > *c)
+            && cuts.last().is_none_or(|c| cut > *c)
         {
-            cuts.push((cut, j));
+            cuts.push(cut);
         }
     }
-    Cuts { keys: cuts, tasks }
+    cuts
 }
 
 /// The least key in `[from, end)`, as far as `below` resolves it, at which `below` reaches

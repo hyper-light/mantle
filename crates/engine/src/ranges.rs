@@ -1750,6 +1750,15 @@ impl Client<'_> {
         self.barrier_async(BarrierAsk::Flush).await
     }
 
+    /// [`Self::settled`] from a hyper-rt task: waits, range by range, until every range owes no
+    /// maintenance.
+    pub async fn settled_async(&mut self) -> Result<(), Error> {
+        for range in 0..self.ranges.len() {
+            self.call_async(range, |r| r.ask = Ask::Settled).await?;
+        }
+        Ok(())
+    }
+
     /// Each range's counters from a hyper-rt task, in range order.
     pub async fn stats_async(&mut self) -> Result<Vec<RangeStats>, Error> {
         self.finish_async().await?;

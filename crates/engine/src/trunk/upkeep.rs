@@ -309,6 +309,8 @@ impl Trunk {
         }
         let root = self.root;
         for b in std::mem::take(&mut self.pending) {
+            self.entered = self.entered.saturating_add(b.count);
+            self.held = self.held.saturating_add(b.count);
             self.node_mut(root)?.inflight.push(vec![b]);
         }
         self.node_mut(root)?.received = true;
@@ -347,6 +349,8 @@ impl Trunk {
             if self.full {
                 self.full = false;
                 self.consolidated = true;
+                self.consolidated_at = (self.stats.entries_written, self.entered);
+                self.stats.whole_consolidations = self.stats.whole_consolidations.saturating_add(1);
             }
         }
     }

@@ -143,7 +143,76 @@ hedge against consolidating a store no seek reads (research/43, research/50 §3)
 is a design choice about workloads that write and then seek rarely, measured against the seeks it
 buys, and the phase on the consolidated trunk already runs 5.4–5.8× RocksDB (§1).
 
-## 11. Measured and not kept
+## 11. A whole consolidation once a shard falls quiet (kept: C)
+
+§10 left open when the trunk should consolidate. Three builds of one tree, differing only in what
+buys a whole consolidation (every pivot of several sources rewritten, as a drain's is), ran
+interleaved with RocksDB and SplinterDB in every round [ab]:
+
+- **A** (`95edbd8`, main's rule): nothing buys one; seeks' rent buys each pivot (§6).
+- **B** (`eb64216`): a shard that falls quiet consolidates whole: its memtable empty since a flush,
+  nothing packing or frozen, its trunk idle and owing nothing.
+- **C** (`c3e56da`): B's rule, once the writes since the last whole consolidation reach the entries
+  the trunk holds, counting the entries that entered the root and the entries maintenance wrote.
+  This is global rebuilding's rule (Overmars, The Design of Dynamic Data Structures, LNCS 156,
+  Springer 1983): a structure is rebuilt once the updates since its last rebuild reach its size,
+  so each rebuild is paid for by at least as many writes as it rewrites. A bulk load pays for one
+  at once; a burst into a large trunk does not.
+
+Every run ends with the bench's `--trickle=2:1000000`: two bursts of a million draws, each key the
+fill left present put again (1.26M puts at 100M), each burst flushed and its maintenance settled.
+That is the workload that costs B most, since each burst leaves the shard quiet with its layout
+unconsolidated.
+
+[ab]: `benchmark-results/mantle-splinterdb-20261013`, the [vm] setup with `--queries-again`: runs
+`r311..314` on a quiet host (A and B; four rounds at 10M, three at 100M) and `r321..323` on a busy
+one, 18 busy loops in the container, one a core, from before each run to its end (A, B and C; three
+rounds at 10M, one at 100M). Medians over rounds; the trickle's CPU is the process's, workers
+included.
+
+| keys, host | arm | puts/s | gets/s | seeks/s | seek p99 | trickle CPU a put | trickle wrote |
+|---|---|---|---|---|---|---|---|
+| 10M, quiet | A | 3.67M | 2.65M | 440K | 9.0 µs | 0.70 µs | 1.2M |
+| | B | 3.92M | 2.43M | 516K | 3.3 µs | 2.69 µs | 13.8M |
+| | RocksDB, SplinterDB | 690K, 954K | 167K, 706K | 91K, 185K | 31.3, 11.0 µs | | |
+| 100M, quiet | A | 3.49M | 1.38M | 143K | 31.7 µs | 0.97 µs | 1.9M |
+| | B | 3.66M | 1.52M | 347K | 5.5 µs | 25.4 µs | 130M |
+| | RocksDB, SplinterDB | 562K, 917K | 178K, 299K | 57K, 38K | 50.2, 59.4 µs | | |
+| 10M, busy | A | 1.31M | 0.86M | 188K | 11.8 µs | 1.50 µs | 1.2M |
+| | B | 1.32M | 1.18M | 236K | 5.1 µs | 4.66 µs | 13.8M |
+| | C | 1.34M | 1.00M | 327K | 4.4 µs | 1.16 µs | 1.2M |
+| | RocksDB, SplinterDB | 301K, 543K | 93K, 257K | 48K, 86K | 48.7, 25.1 µs | | |
+| 100M, busy | A | 1.46M | 0.65M | 68K | 44.0 µs | 4.57 µs | 13.7M |
+| | B | 1.45M | 0.74M | 213K | 9.0 µs | 43.9 µs | 130M |
+| | C | 1.32M | 0.57M | 140K | 9.7 µs | 1.48 µs | 2.1M |
+| | RocksDB, SplinterDB | 250K, 514K | 54K, 191K | 35K, 20K | 75.6, 200.7 µs | | |
+
+**Where B's and C's consolidation runs.** The bench's flush after the fill runs maintenance to its
+end, so their whole consolidation ran there: 4.1–6.5 s at 100M on the quiet host against A's
+0.5–1.1 s, outside every engine's measured phases. RocksDB's runs at 100M spent 4.9–5.8 s outside
+theirs (`waitforcompaction`, with the open and close), and SplinterDB 4.9 s in the barrier after its
+fill. A's seek phase carries its consolidation (§3); B's and C's queries ran on the trunk it left and
+wrote nothing.
+
+**What B costs.** Each burst of the trickle bought a rewrite of the whole trunk: at 100M B spent
+25–31 µs of CPU a put on the quiet host and 44 µs on the busy one, against A's 0.95–1.16 µs, and
+wrote 130M entries against 1.9M.
+
+**What C does.** Its fill and queries ran as B's, the fill's writes having paid for the
+consolidation after it, and its trickle as A's, no burst buying a whole consolidation: at 10M on the
+busy host 1.16 µs of CPU a put against A's 1.50 µs and B's 4.66 µs, and at 100M 1.48 µs against B's
+44 µs, writing 2.1M entries where A wrote 1.9M on the quiet host. Against A on the busy host at 10M
+(the medians of the paired rounds) its seeks ran 1.74× (0.82–2.26), its gets 1.15× and its fill
+1.15×. At 100M on the busy host A's seeks bought only part of their consolidation (43.6M entries
+written in the queries, 7 leaves settled) and its trickle settled the rest (13.7M written, 4.57 µs a
+put); C's seeks ran 2.08× A's in that round, its trickle 0.32× A's CPU a put. Under load A's phase
+is as slow as the merging the busy host leaves it, where C's consolidation ran in the window after
+the fill (21.5 s there).
+
+Kept: C. Its quiet-host rates are measured as the control of the batches that follow, with 1M and
+1B.
+
+## 12. Measured and not kept
 
 - **The leaves' separators as 8-byte heads** in a sorted array a branch keeps beside its trie,
   searched in place of the trie's descent: the consolidated phase ran 343K to 384K against 366K to

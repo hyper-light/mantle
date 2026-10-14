@@ -284,6 +284,13 @@ pub struct TrunkStats {
     /// Entries of in-flight bundles a leaf's settle took among its inputs: what an in-flight
     /// compaction would have written once before the settle rewrote it (research/53 §5).
     pub settle_inflight_entries: u64,
+    /// Consolidations of every pivot of several sources finished: a drain's, or a quiet shard's
+    /// its writes paid for (research/53 §11).
+    pub whole_consolidations: u64,
+    /// The entries the trunk's bundles and in-flight lists hold, as counted when branches enter
+    /// and leave them: what [`Trunk::writes_cover_consolidation`] weighs the writes since
+    /// against, the shape's entries counted another way.
+    pub held_entries: u64,
     /// Sources seeks were given by leaves' pivots and by index pivots ([`Trunk::charge`]); the
     /// pivots seeks' rent paid for, leaves' and index pivots' apart; the pivots a paid flush
     /// marked paid below it; and the consolidations started: where a consolidation's work
@@ -376,6 +383,14 @@ pub struct Trunk {
     /// How long this step waits on the workers ([`Wait`]), and whether it stopped for them.
     wait: Wait,
     workers_waiting: bool,
+    /// Entries of the branches that entered the root, since the trunk was made or opened.
+    entered: u64,
+    /// The maintenance's entries written and the entries entered when a whole consolidation last
+    /// ended: what the writes since are counted from ([`Self::writes_cover_consolidation`]).
+    consolidated_at: (u64, u64),
+    /// The entries every pivot's bundle and every node's in-flight bundles hold, counted as
+    /// branches enter and leave them.
+    held: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -584,6 +599,9 @@ impl Trunk {
             pool: None,
             wait: Wait::No,
             workers_waiting: false,
+            entered: 0,
+            consolidated_at: (0, 0),
+            held: 0,
         })
     }
 
@@ -1014,6 +1032,31 @@ impl Trunk {
     /// When seeks consolidate a pivot ([`Consolidation`]).
     pub fn set_consolidation(&mut self, choice: Consolidation) {
         self.consolidation = choice;
+    }
+
+    /// Whether the layout is consolidated since branches last entered the root, as far as a
+    /// consolidation of every pivot of several sources asks ([`Self::consolidate_all`]): none is
+    /// asked for or due with consolidation off.
+    pub fn unconsolidated(&self) -> bool {
+        self.consolidation != Consolidation::Never && !self.consolidated && !self.full
+    }
+
+    /// Whether the writes since the last whole consolidation have paid for one: the entries that
+    /// entered the root since, with the entries the trunk's maintenance wrote since, at least the
+    /// entries the trunk holds. The rent rule buys a pivot once seeks have paid its price; this
+    /// buys the whole trunk once its writes have, as global rebuilding rebuilds a structure once
+    /// the updates since its last rebuild reach its size (Overmars, The Design of Dynamic Data
+    /// Structures, LNCS 156, 1983): each rebuild is paid for by at least as many writes as the
+    /// entries it rewrites, however often the shard falls quiet (research/53 §11). A bulk load
+    /// pays for one at once; a small burst into a large trunk does not.
+    pub fn writes_cover_consolidation(&self) -> bool {
+        let (written, entered) = self.consolidated_at;
+        let since = self
+            .stats
+            .entries_written
+            .saturating_sub(written)
+            .saturating_add(self.entered.saturating_sub(entered));
+        since >= self.held
     }
 
     /// Whether a consolidation is owed: seeks paid for one, or a drain asked for one of a
@@ -1878,6 +1921,10 @@ impl Trunk {
         if root >= nodes.len() {
             return Err(corrupt());
         }
+        let held = nodes
+            .iter()
+            .flat_map(|n| n.pivots.iter().map(|p| entries_of(p.bundle.branches())))
+            .fold(0u64, u64::saturating_add);
         Ok(Self {
             nodes,
             root,
@@ -1909,6 +1956,9 @@ impl Trunk {
             pool: None,
             wait: Wait::No,
             workers_waiting: false,
+            entered: 0,
+            consolidated_at: (0, 0),
+            held,
         })
     }
 
@@ -1925,6 +1975,7 @@ impl Trunk {
         if let Some(b) = &merged {
             self.stats.entries_written = self.stats.entries_written.saturating_add(b.count);
             self.stats.pivot_entries = self.stats.pivot_entries.saturating_add(b.count);
+            self.held = self.held.saturating_add(b.count);
         }
         let pivot = self.node_mut(n)?.pivots.get_mut(i).ok_or(corrupt())?;
         pivot.start = covered;
@@ -1949,6 +2000,7 @@ impl Trunk {
         }
         self.shift_tasks(n, dead);
         for bundle in gone {
+            self.held = self.held.saturating_sub(entries_of(&bundle));
             for b in &bundle {
                 release(store, b)?;
             }
@@ -1969,6 +2021,11 @@ impl Trunk {
         let node = self.node(n)?;
         let pivot = node.pivots.first().ok_or(corrupt())?;
         let (from, end) = (pivot.key.clone(), node.end.clone());
+        // The parts replace the leaf's bundle; the in-flight bundles it took go once it reads
+        // past them ([`Self::drop_dead`]).
+        self.held = self
+            .held
+            .saturating_sub(entries_of(pivot.bundle.branches()));
         self.stats.leaf_compactions = self.stats.leaf_compactions.saturating_add(1);
         self.stats.splits = self
             .stats
@@ -1976,6 +2033,7 @@ impl Trunk {
             .saturating_add(u64::try_from(parts.len().saturating_sub(1)).unwrap_or(0));
         for (_, b) in &parts {
             self.stats.entries_written = self.stats.entries_written.saturating_add(b.count);
+            self.held = self.held.saturating_add(b.count);
             let by_cause = match cause {
                 upkeep::Cause::Seeks => &mut self.stats.settle_entries_seeks,
                 upkeep::Cause::Branches => &mut self.stats.settle_entries_branches,
@@ -2149,6 +2207,7 @@ impl Trunk {
         TrunkStats {
             merge_units: self.merge_keys,
             merge_ns: self.merge_ns,
+            held_entries: self.held,
             shape,
             ..self.stats
         }

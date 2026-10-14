@@ -328,6 +328,26 @@ RemixDB and SplinterDB build their structures eagerly because there they are man
 so nothing requires a view, and none is built. Seeks are measured against the page-access cost
 they pay instead.
 
+**Whole consolidations paid for by writes** (2026-10-14; research/53 §11). Seeks' rent buys each
+pivot's consolidation once it covers the pivot's price (research/50 §3, §10), so after a bulk load
+the seek phase carried the whole trunk's consolidation: at 100M it ran 2.5–2.9× RocksDB, where the
+same seeks on the trunk they had consolidated ran 5.4–5.8× (research/53 §1). A shard that falls quiet
+(its memtable empty since a flush, nothing packing or frozen, its trunk idle and owing nothing) now
+consolidates every pivot of several sources at once, as a drain does, once the writes since the
+last whole consolidation reach the entries the trunk holds. That is global rebuilding's rule
+(Overmars, The Design of Dynamic Data Structures, LNCS 156, Springer 1983): each rebuild is paid for
+by at least as many writes as it rewrites, however often the shard falls quiet. A/B'd against the
+rent alone and against consolidating at every quiet moment, with bursts of puts after the queries:
+- consolidating once quiet ran 100M seeks at 347K a second against the rent's 143K on a quiet host,
+  its consolidation in the window after the fill (4.1–6.5 s), where RocksDB's compactions and
+  SplinterDB's barrier take about 5 s;
+- at every quiet moment, each burst rewrote the whole trunk: 25–44 µs of CPU a put at 100M against
+  the rent's 1 µs;
+- paid for by writes, the queries ran as at every quiet moment (on a busy host at 10M, seeks 1.74×
+  the rent's) and the bursts as under the rent alone (1.16 µs of CPU a put against 1.50).
+The rent still buys pivots wherever a shard never falls quiet or its writes have not paid for a
+rebuild.
+
 **SuRF range filters** (Zhang et al., SIGMOD 2018; research/33 row 8, research/35 §2) let a
 bounded seek pass over a source with nothing in its range without reading it (closed seeks up to
 5× in RocksDB). As built (2026-10-07):

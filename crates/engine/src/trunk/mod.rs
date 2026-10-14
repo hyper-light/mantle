@@ -253,6 +253,10 @@ pub struct TrunkStats {
     /// Tasks the leaves' settles were planned as: one each inline; on the workers, one a leaf a
     /// settle makes, at most one a core they may use (docs/research/55).
     pub settle_tasks: u64,
+    /// Leaves the settles planned (`round(entries / leaf_entries)` each) and the leaves they
+    /// made: never more, however a settle's tasks parted its range.
+    pub settle_leaves_planned: u64,
+    pub settle_leaves_made: u64,
     /// Pivot bundles flushed to a child.
     pub flushes: u64,
     /// Nodes made by splits, leaves and index nodes.
@@ -2030,6 +2034,10 @@ impl Trunk {
             .held
             .saturating_sub(entries_of(pivot.bundle.branches()));
         self.stats.leaf_compactions = self.stats.leaf_compactions.saturating_add(1);
+        self.stats.settle_leaves_made = self
+            .stats
+            .settle_leaves_made
+            .saturating_add(u64::try_from(parts.len().max(1)).unwrap_or(u64::MAX));
         self.stats.splits = self
             .stats
             .splits

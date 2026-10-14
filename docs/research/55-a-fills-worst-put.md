@@ -70,8 +70,14 @@ merge of the inputs' entries in its range alone, and nothing makes one worker ma
   key in the range holds in two lookups each (the least key the inputs hold names them), the
   others by a binary search over a byte's values, until the keys between one byte and the next
   are no more than the lookups can tell apart.
-- **What each makes.** Its range's leaves, `round(entries / per)` of even size, so none is larger
-  than the settle's own leaves by more than their rounding, however the cuts fall.
+- **What each makes.** Its share of the settle's own leaves: the `j`th cut ends where
+  `floor(j * parts / tasks)` of the settle's `parts` leaves lie below it, so the tasks make the
+  `parts` leaves between them, each task cutting its share evenly; no more leaves than the one
+  merge would make, however the cuts fall. A first version let each task round its own count
+  from an over-count of its entries (the leaves its ends fall in counted whole): at 10M it made a
+  ninth leaf where the merge made eight, the root passed its fanout and split, and the tree grew
+  a level, 32% more entries written and gets and seeks 10% slower (runs `n10000000-r441..443`).
+  `TrunkStats::settle_leaves_made` never passes `settle_leaves_planned`.
 - **How they apply.** Together, once all are done, their parts in key order: the one settle they
   are. A failure abandons all of them, as any task's does.
 - **Their room.** Each task's grant is the extents the pages its range spans fill

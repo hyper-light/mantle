@@ -556,6 +556,11 @@ fn a_settle_runs_as_one_task_a_leaf_on_the_workers_cores() {
     } else {
         assert_eq!(trunk.settle_tasks, trunk.leaf_compactions, "{trunk:?}");
     }
+    // However its tasks parted it, a settle made no more leaves than its one merge would.
+    assert!(
+        trunk.settle_leaves_made <= trunk.settle_leaves_planned,
+        "{trunk:?}"
+    );
     held_is_the_shapes(&db);
     db.checkpoint(OPS).unwrap();
     db.check_references().unwrap();

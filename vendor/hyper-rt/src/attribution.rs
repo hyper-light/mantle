@@ -1,5 +1,12 @@
-//! Who held a long poll (§4.3, the long-step count; A-31). A poll that runs past the step quantum by the
-//! wall clock was held either by its task — it ran past the quantum on the CPU, or it waited inside a
+//! Who held a long poll (§4.3, the long-step count; A-31). A long poll is one that held its shard past twice
+//! the step quantum since it was last let go on (docs/runtime.md §3.11): from its start, or from the last
+//! time it asked `ShardContext::wanted` and was told no. A task that asks once a quantum and yields when
+//! told to holds a wanted shard less than a quantum and an operation, so only a task that broke that
+//! contract passes twice it (Seastar's reactor counts a task that ran past twice its task quota as a
+//! violation, `task_queue_group::account_runtime`). Before, a long poll was any past one quantum, which a
+//! consumer whose turns are a quantum long (mantle's inline client, its range's maintenance slice) passed on
+//! half its polls, each judged with two readings of the thread's account. A long poll was held either by
+//! its task — it ran past the threshold on the CPU, or it waited inside a
 //! call (blocked in the kernel, such as the base plane's synchronous `pread` on a cold page cache, or
 //! yielding the thread to a full peer ring) — or by the host: the thread was runnable and off the CPU,
 //! preempted by the operating system or its virtual CPU stolen by the hypervisor. The wall clock counts

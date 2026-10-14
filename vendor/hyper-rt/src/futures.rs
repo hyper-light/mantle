@@ -208,6 +208,37 @@ impl Future for YieldNow {
     }
 }
 
+/// Yields only where the shard is wanted ([`ShardContext::wanted`], docs/runtime.md §3.10): a task listed
+/// or yielded, an intent unapplied, a wake or control message from another thread, a timer or the driver's
+/// harvest due. Where nothing is, it is ready at once, and the task goes on without the loop's round trip,
+/// which with nothing else to run would only poll it again. The cooperative point of a task that runs
+/// operations back to back (Seastar's `maybe_yield`; IX's batching only under congestion). Off a shard's
+/// thread it yields, as [`yield_now`] does.
+///
+/// [`ShardContext::wanted`]: crate::shard::ShardContext::wanted
+pub fn maybe_yield() -> MaybeYield {
+    MaybeYield { yielded: false }
+}
+
+/// The conditional yield's future.
+#[derive(Debug)]
+pub struct MaybeYield {
+    yielded: bool,
+}
+
+impl Future for MaybeYield {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.yielded || !registry::with_current(|ctx| ctx.wanted()).unwrap_or(true) {
+            return Poll::Ready(());
+        }
+        self.yielded = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+}
+
 /// Yields without re-queueing: the task resumes only when something wakes it (a registered
 /// poller's ring, a foreign wake, a cancellation). The idle form of a ring-polling task.
 pub fn idle() -> Idle {

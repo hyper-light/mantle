@@ -298,13 +298,61 @@ impl<T: 'static> Kept<T> {
 }
 
 /// The shard as its tasks see it: the desk.
+///
+/// Laid out in order (`repr(C)`), from a 128-byte line (Apple silicon's, the largest we target): what a
+/// poll, a yield and [`ShardContext::wanted`] read fills the first line, the run queue and the counters a
+/// poll counts the second, then the intents a task pushes, and last what only admission, the root, spawns
+/// and the simulation touch. A consumer's operations run between polls and evict the loop's lines, so a
+/// switch pays for every line it touches (docs/runtime.md §3.10): two, where the compiler's own order
+/// spread the same fields over six with the frames between them.
+#[repr(C, align(128))]
 pub struct ShardContext {
+    // The first line: what a poll, a yield and `wanted` read.
+    /// The word of the task being polled, or [`NO_TASK`]: its slot for the local wake's test, its whole word
+    /// for a future that asks which task polls it (`crate::waker::polling_task`), with nothing to pack.
+    pub(crate) current: Cell<u64>,
+    /// The shard's clock at the start of the current poll (or step), published by the loop.
+    pub(crate) now_ns: Cell<u64>,
+    /// The loop's last reading of the driver's clock with the counter's ticks then, which a live reading
+    /// carries forward (`machine::clock::Carried`); `None` where the shard reads no counter, and the driver's
+    /// clock takes every reading.
+    pub(crate) carried: Cell<Option<crate::machine::clock::Carried>>,
+    /// The latest live reading handed out, so none is earlier than one before it: each step reads the
+    /// driver's clock afresh, and a scale off by a fraction could carry a reading past the next step's.
+    latest_ns: Cell<u64>,
+    /// The earliest time the loop has timed work of its own, kept by the loop as it changes
+    /// (docs/runtime.md §3.10): the wheel's next occupied tick, the driver's next harvest while readiness
+    /// waits are registered, or 0 while the driver or a poller has work for every turn; `u64::MAX` with
+    /// none. [`ShardContext::wanted`] compares the clock against it.
+    pub(crate) due_ns: Cell<u64>,
+    /// When the polling task last asked [`ShardContext::wanted`] and was told no, by the shard's clock: the
+    /// last time the shard let it go on, from which the loop judges how long it held the shard (a long poll
+    /// is one held past twice the quantum since then, docs/runtime.md §3.11).
+    pub(crate) checked_ns: Cell<u64>,
+    /// The step quantum now, published by the loop.
+    pub(crate) quantum_ns: Cell<u64>,
+    /// The driver's clock, read live.
+    pub(crate) clock: crate::driver::Clock,
+    pub(crate) entry: Option<&'static Entry>,
     /// The shard id.
     pub id: u16,
+    /// Whether a task asked the loop for something since the loop last applied the desk's intents: set by
+    /// every push onto `dirty_tasks`, `dirty_timers` and `interests`, so the loop's look after each poll is
+    /// one load when nothing was asked.
+    pub(crate) asked: Cell<bool>,
+    /// Whether the poll running now served a client's work: the loop then moves `activity_ns` to the
+    /// poll's end.
+    pub(crate) activity_noted: Cell<bool>,
+    /// Whether the shard's driver is the simulation's.
+    pub(crate) is_sim: bool,
+    /// Admission is paused while owned futures are cancelled, and closed at shutdown.
+    pub(crate) accepting: Cell<bool>,
+    // The second: the run queue, and the counters a poll counts (`LiveCounters` leads with them).
     /// The local run queue.
     pub(crate) local: LocalQueue,
-    /// The frames the shard's own spawns write their futures into (`crate::frames`).
-    pub(crate) frames: crate::frames::Frames,
+    /// The loop's counters, which it counts here in place (`crate::shard_loop::LiveCounters`).
+    pub(crate) live: crate::shard_loop::LiveCounters,
+    // What a task asks the loop: the intents and their tables.
     pub(crate) tasks: Box<[TaskCell]>,
     pub(crate) free_tasks: CellStack<u32>,
     pub(crate) dirty_tasks: CellRing<u32>,
@@ -320,24 +368,9 @@ pub struct ShardContext {
     /// The readiness waits, one slot each, bounded by `interests_per_shard`.
     waits: Box<[WaitCell]>,
     free_waits: CellStack<u32>,
-    /// Whether a task asked the loop for something since the loop last applied the desk's intents: set by
-    /// every push onto `dirty_tasks`, `dirty_timers` and `interests`, so the loop's look after each poll is
-    /// one load when nothing was asked.
-    pub(crate) asked: Cell<bool>,
-    /// The word of the task being polled, or [`NO_TASK`]: its slot for the local wake's test, its whole word
-    /// for a future that asks which task polls it (`crate::waker::polling_task`), with nothing to pack.
-    pub(crate) current: Cell<u64>,
-    /// Admission is paused while owned futures are cancelled, and closed at shutdown.
-    pub(crate) accepting: Cell<bool>,
-    /// The shard's clock at the start of the current poll (or step), published by the loop.
-    pub(crate) now_ns: Cell<u64>,
+    // What admission, the root, the clock's overrun, spawns and the simulation touch.
     /// When the server last served a client's work here, opening the idle window (`note_activity`).
     pub(crate) activity_ns: Cell<Option<u64>>,
-    /// Whether the poll running now served a client's work: the loop then moves `activity_ns` to the
-    /// poll's end.
-    pub(crate) activity_noted: Cell<bool>,
-    /// The step quantum now, published by the loop.
-    pub(crate) quantum_ns: Cell<u64>,
     /// The measured scheduler overrun, published by the loop.
     pub(crate) scheduler_overrun_ns: Cell<u64>,
     /// The timer wheel's tick: a deadline is kept on the tick after it.
@@ -346,18 +379,6 @@ pub struct ShardContext {
     pub(crate) refused_spawns: Cell<u64>,
     /// Sleeps that found every timer taken and waited for one (folded into the loop's counters).
     pub(crate) timer_waits: Cell<u64>,
-    /// Whether the shard's driver is the simulation's.
-    pub(crate) is_sim: bool,
-    /// The driver's clock, read live.
-    pub(crate) clock: crate::driver::Clock,
-    /// The loop's last reading of the driver's clock with the counter's ticks then, which a live reading
-    /// carries forward (`machine::clock::Carried`); `None` where the shard reads no counter, and the driver's
-    /// clock takes every reading.
-    pub(crate) carried: Cell<Option<crate::machine::clock::Carried>>,
-    /// The latest live reading handed out, so none is earlier than one before it: each step reads the
-    /// driver's clock afresh, and a scale off by a fraction could carry a reading past the next step's.
-    latest_ns: Cell<u64>,
-    pub(crate) entry: Option<&'static Entry>,
     pub(crate) incarnation: Option<SlotHolder>,
     pub(crate) kept: KeptValues,
     /// The output of a [`crate::runtime::LocalRuntime::block_on`] root, moved here by the root as it finishes
@@ -371,8 +392,8 @@ pub struct ShardContext {
     /// One past the highest task generation issued: what the registry slot's next holder starts from. On the
     /// desk, so a join that frees its task's slot raises it as the loop's frees do.
     pub(crate) generation_high: Cell<u32>,
-    /// The loop's counters, which it counts here in place (`crate::shard_loop::LiveCounters`).
-    pub(crate) live: crate::shard_loop::LiveCounters,
+    /// The frames the shard's own spawns write their futures into (`crate::frames`).
+    pub(crate) frames: crate::frames::Frames,
     /// A simulated shard's sockets (docs/runtime.md §11); `None` on an OS driver.
     pub(crate) sim: Option<crate::sim::SimSockets>,
 }
@@ -465,6 +486,8 @@ impl ShardContext {
             activity_ns: Cell::new(None),
             activity_noted: Cell::new(false),
             quantum_ns: Cell::new(1),
+            due_ns: Cell::new(u64::MAX),
+            checked_ns: Cell::new(0),
             scheduler_overrun_ns: Cell::new(0),
             timer_tick_ns: shape.timer_tick_ns,
             refused_spawns: Cell::new(0),
@@ -571,6 +594,32 @@ impl ShardContext {
     /// configured step budget. A cooperative operation sizes its slices by it.
     pub fn quantum_ns(&self) -> u64 {
         self.quantum_ns.get()
+    }
+
+    /// Whether anything other than the task polling now wants this shard (docs/runtime.md §3.10): a task
+    /// listed or yielded, an intent the loop has yet to apply, a wake or a control message from another
+    /// thread, or a timer or the driver's harvest falling due. The test a task that runs operations back
+    /// to back makes between them ([`crate::futures::maybe_yield`]): no system call, the desk's fields, the
+    /// entry's two flags and the counter. A simulated shard always answers true, so its schedules stay a
+    /// step a yield. An answer of no is the shard letting the task go on: the loop judges the poll's hold
+    /// from the last one (`checked_ns`).
+    pub fn wanted(&self) -> bool {
+        if self.is_sim
+            || !self.local.is_empty()
+            || self.asked.get()
+            || self
+                .entry
+                .is_some_and(|entry| entry.wakes.is_pending() || entry.control_pending.is_pending())
+        {
+            return true;
+        }
+        let now = self.now_ns();
+        if now >= self.due_ns.get() {
+            return true;
+        }
+        // Told no: the task may go on, and the loop judges its hold from here (`checked_ns`).
+        self.checked_ns.set(now);
+        false
     }
 
     /// The online wake estimate, nanoseconds (the quantum).

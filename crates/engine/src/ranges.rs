@@ -1449,7 +1449,9 @@ impl Client<'_> {
     /// Takes this client's turn before an operation made inline. An inline operation never waits,
     /// so a client making them in a loop would hold its shard: after about the shard's quantum of
     /// them, at the rate measured over the turn just ended (two reads of the shard's clock a turn),
-    /// it yields, and the shard's other tasks run, a range it left maintenance owed among them.
+    /// it yields where the shard is wanted (`hyper_rt::futures::maybe_yield`), and the shard's other
+    /// tasks run, a range it left maintenance owed among them; where nothing else wants the shard, a
+    /// yield would only poll this client again, and it goes on.
     async fn turn(&mut self) {
         if let Some(left) = self.turn.left.checked_sub(1) {
             self.turn.left = left;
@@ -1465,7 +1467,7 @@ impl Client<'_> {
             .checked_div(u128::from(elapsed))
             .unwrap_or(1);
         let per = u64::try_from(per).unwrap_or(u64::MAX).max(1);
-        hyper_rt::futures::yield_now().await;
+        hyper_rt::futures::maybe_yield().await;
         self.turn.left = per.saturating_sub(1);
         self.turn.done = 1;
         self.turn.began_ns = hyper_rt::registry::with_current(|ctx| ctx.now_ns()).unwrap_or(0);

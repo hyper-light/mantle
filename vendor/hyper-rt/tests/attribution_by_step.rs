@@ -22,9 +22,9 @@ use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
 
 /// Shape: the step quantum, a millisecond, far past any wake, so only a poll's own hold passes it.
 const QUANTUM_NS: u64 = 1_000_000;
-/// Shape: what each poll runs on its own thread clock, past the quantum whatever holds the thread off
-/// the CPU meanwhile.
-const HOLD: Duration = Duration::from_millis(2);
+/// Shape: what each poll runs on its own thread clock, three quanta: past twice the quantum (a long poll,
+/// docs/runtime.md §3.11) whatever holds the thread off it.
+const HOLD: Duration = Duration::from_millis(3);
 /// Shape: the tasks a step polls, its poll budget.
 const TASKS: usize = 4;
 /// Shape: the polls each task holds the CPU in.

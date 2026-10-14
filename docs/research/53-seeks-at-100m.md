@@ -89,7 +89,61 @@ Each is built as a variant and run against main, RocksDB and SplinterDB at 10M, 
 interleaved, the fill and gets beside the seeks (no lever may cost them). SuRF and the range filter
 stay whole: LIST needs them.
 
-## 6. Measured and not kept
+## 6. What paces the phase
+
+Seeks buy each pivot's consolidation once their rent for it covers its price (`Trunk::charge`; the
+deterministic ski-rental rule). At 100M a phase bought 70–77 leaves and 66–104 index pivots one at a
+time, in 18–35 consolidations (`consolidations_started`), and no paid flush paid the pivots below it
+(`paid_below` 0: only a drain's cascades) [vm, runs `r271..273`]. A consolidation starts only with
+nothing in progress and ends only when nothing is, and a pivot paid while one runs is looked at only
+when the next starts: the consolidations ran one after another, each as long as its slowest settle.
+In one of main's rounds the phase ended with 35 of 73 leaves paid, and ran 82K seeks a second [vm,
+`r282`].
+
+## 7. A leaf's settle taking its in-flight bundles (kept)
+
+A leaf compacted the in-flight bundles its parent flushed into its bundle, then settled, rewriting
+them: a settle due once that compaction's branch joined the bundle now takes them among its inputs
+(`c8067c3`). Over seven interleaved rounds at 100M against main [vm, `r271..273`, `r281..284`] the
+rates were level (the medians of the paired ratios 1.019 fill, 0.991 gets, 0.998 seeks, a round's
+ratio 0.68–1.63), the seek phase's process CPU an operation 12% less (median 1.136 inverted, better in
+five rounds of seven), and the fill wrote 3–7% fewer entries (302M–309M against 311M–325M at the
+queries' start). In a consolidation bought by seeks a leaf is rarely paid when its parent's data
+arrives, so the settles took in-flight entries during the fill, not the queries (`settle_inflight_entries`).
+
+## 8. A drawn fraction of the price (measured, not kept)
+
+Karlin, Manasse, McGeoch and Owicki's randomized ski rental (Algorithmica 11(6), 1994) buys once the
+rent reaches `x` of the price, `x` drawn with density eˣ/(e − 1) on [0, 1): an expected cost at most
+e/(e − 1) ≈ 1.58 times the best in hindsight against the deterministic rule's 2, buying at 0.58 of
+the price on average. Each pivot drew its fraction as its rent began (`cd04482`, on `c8067c3`).
+Over four rounds at 100M [vm, `r281..284`] it bought earlier and in fewer consolidations (7–10 against
+15–30) but settled some leaves twice (76–83 settles over 73 leaves), wrote 103M–115M entries in the
+queries against 94M–104M, and used 22% more process CPU a seek than `c8067c3` (the paired ratio 0.777,
+worse in four rounds of four), its seeks 0.881 of `c8067c3`'s: a leaf bought before its parent's
+data reached it settles again when it does.
+
+## 9. Consolidations pipelined (measured, not kept)
+
+A pivot paid while a consolidation ran was queued for that consolidation's next look rather than the
+next consolidation's start. Over four rounds at 100M against `c8067c3` [vm, `r291..294`] the phase
+started 3–23 consolidations against 18–24 and spent 9% less process CPU a seek (the paired ratio
+1.087, better in four rounds of four), but its seeks were level (0.984; the phase 6.6–7.6 s against
+6.4–8.1 s): the consolidations' order was not what paced it. What does is the rent itself: a leaf is
+bought once seeks have paid its price, and one bought sooner is bought before its parent's data
+reaches it (§8). The fill, which neither change touches, ran 0.82–1.03 of the same build in the same
+rounds: three or four rounds resolve no smaller change in this phase.
+
+## 10. Where the phase's remaining gap lies
+
+Four times RocksDB in the phase that consolidates needs the consolidation, about 2 s of the
+workers' time at 100M, to be done by the time most seeks run: started at the fill's end or the
+phase's first seeks, not bought pivot by pivot as each one's rent covers its price. The rent is the
+hedge against consolidating a store no seek reads (research/43, research/50 §3): spending it earlier
+is a design choice about workloads that write and then seek rarely, measured against the seeks it
+buys, and the phase on the consolidated trunk already runs 5.4–5.8× RocksDB (§1).
+
+## 11. Measured and not kept
 
 - **The leaves' separators as 8-byte heads** in a sorted array a branch keeps beside its trie,
   searched in place of the trie's descent: the consolidated phase ran 343K to 384K against 366K to

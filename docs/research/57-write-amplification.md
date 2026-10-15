@@ -216,6 +216,43 @@ by depth and inputs:
 - **Below the root.** The levels below merge two or more branches.
 
 The entries those copies wrote are counted next (§7).
+
+## 7. Step one and two for the root's copies
+
+[diag3] r1771: 91ddf13 with every pivot compaction's depth, input branches and entries written
+printed at its apply (md5 `ccd98886`, DIAGNOSTIC; recovery exact). Its prints sum to the run's
+`pivot_entries` exactly (267,027,371).
+
+| depth | input branches | compactions | entries written | of pivot writes |
+|---|---|---|---|---|
+| 0 (the root) | 1 | 303 | 78.8M | 29.5% |
+| 0 | 2–3 | 12 | 7.1M | 2.7% |
+| 0 | 4+ | 34 | 13.1M | 4.9% |
+| 1 | 1 | 154 | 3.5M | 1.3% |
+| 1 | 2–3 | 442 | 66.4M | 24.9% |
+| 1 | 4+ | 45 | 15.7M | 5.9% |
+| 2 | 1 | 14 | 0.3M | 0.1% |
+| 2 | 2–3 | 25 | 3.2M | 1.2% |
+| 2 | 4+ | 336 | 72.5M | 27.2% |
+| 3 | 4+ | 15 | 6.6M | 2.5% |
+
+**Need it at all?** A root compaction with one input branch reads the branch its packing just
+wrote and writes, for its pivot, the entries of that branch in the pivot's range, in the same
+order: it merges nothing and drops nothing. Had the packing ended a branch at each of the root's
+pivot keys, each pivot's would already be written.
+
+**This much?** 78.8M entries, about 21% of the 374.0M the run wrote and 0.8 a put. Every one is
+written in the fill, the phase whose writes saturate the device (§1).
+
+**The design.**
+1. The root's pivot keys go out with a memtable's packing, and the packing ends a branch at each.
+2. On its return, with the root's pivots as they were, each part is its pivot's newest bundle
+   branch. That holds only when no pivot taking one has a live in-flight bundle, a compaction out,
+   or a child that will split, which is the case in which that pivot's compaction would have had
+   this branch alone for its input.
+3. Otherwise the parts enter as one in-flight bundle and are compacted as now. The root's merges of
+   several memtables (20.2M entries) are real merges and stay.
+4. Reads find the same bundles: one branch a memtable for each root pivot, until the pivot flushes.
 - Write-back with discard (§3) is the remaining lever the size of the gap to SplinterDB's large
   cache. Its design comes first: pages shared with workers without copies, dirty pages bounded by
   the cache and cleaned ahead of eviction, a checkpoint's write-back before its flush, a freed

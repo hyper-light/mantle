@@ -561,6 +561,7 @@ impl Trunk {
             .fold(0u64, u64::saturating_add);
         // Newest first, the order a merge takes.
         let run = if self.pool.is_some() {
+            let pages = read_pages(live.iter().flatten(), &from, end.as_deref());
             Running::Remote {
                 grant: Vec::new(),
                 state: State::Ready(Box::new(Task {
@@ -569,6 +570,7 @@ impl Trunk {
                     end,
                     drop_tombstones: false,
                     per: u64::MAX,
+                    pages,
                 })),
             }
         } else {
@@ -793,6 +795,7 @@ impl Trunk {
         let parts = self.leaf_parts(count);
         let per = crate::util::div_ceil(count, parts).unwrap_or(count).max(1);
         let run = if self.pool.is_some() {
+            let pages = read_pages(inputs.clone(), &from, end.as_deref());
             Running::Remote {
                 grant: Vec::new(),
                 state: State::Ready(Box::new(Task {
@@ -801,6 +804,7 @@ impl Trunk {
                     end,
                     drop_tombstones: true,
                     per,
+                    pages,
                 })),
             }
         } else {
@@ -1133,9 +1137,9 @@ impl Trunk {
     }
 
     /// Hands out each ready job whose inputs have landed (waited for when the step waits),
-    /// the root's first, while a worker is free, each with a grant sized to its inputs: their
-    /// extents and one more a part it may make. A job that needs more asks for it, and the pool
-    /// answers from the store ([`Pool::take`]).
+    /// the root's first, while a worker is free, each with a grant sized to what it reads: the
+    /// extents its range of its inputs fills, and one more a part it may make. A job that needs
+    /// more asks for it, and the pool answers from the store ([`Pool::take`]).
     fn dispatch_tasks<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
         let wait = self.wait != Wait::No;
         let admit = self.admit();
@@ -1174,11 +1178,20 @@ impl Trunk {
                 if !landed {
                     continue;
                 }
+                // A pivot's compaction reads its slice of inputs that span the node: its grant is
+                // the extents the pages it writes at most fill, or all its inputs' extents when
+                // that is less, and the cache lends room for as many pages.
+                let pages = task.pages;
+                let read = crate::util::div_ceil_usize(
+                    pages,
+                    usize::try_from(store.extent_pages()).unwrap_or(usize::MAX),
+                );
                 let extents = task
                     .inputs
                     .iter()
                     .map(|b| b.extents.len())
                     .fold(0usize, usize::saturating_add);
+                let extents = read.map_or(extents, |read| read.min(extents));
                 let entries = task
                     .inputs
                     .iter()
@@ -1207,14 +1220,6 @@ impl Trunk {
                     continue;
                 };
                 grant.clone_from(&given);
-                // The cache's room for what it writes: at most the pages its inputs hold in its
-                // range, as a merge writes no more entries than it reads; a pivot's compaction
-                // reads its slice of inputs that span the node.
-                let pages = task
-                    .inputs
-                    .iter()
-                    .map(|b| b.pages_between(&task.from, task.end.as_deref()))
-                    .fold(0usize, usize::saturating_add);
                 let job = Box::new(pool::Job {
                     work: Work::Compact(*task),
                     grant: given,
@@ -1426,4 +1431,16 @@ fn entries(branches: &[Branch]) -> u64 {
         .iter()
         .map(|b| b.count)
         .fold(0u64, u64::saturating_add)
+}
+
+/// The pages a merge of `[from, end)` writes from `inputs` at most: each one's
+/// [`Branch::pages_between`], summed.
+fn read_pages<'a>(
+    inputs: impl Iterator<Item = &'a Branch>,
+    from: &[u8],
+    end: Option<&[u8]>,
+) -> usize {
+    inputs
+        .map(|b| b.pages_between(from, end))
+        .fold(0usize, usize::saturating_add)
 }

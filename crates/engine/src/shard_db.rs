@@ -4803,6 +4803,10 @@ mod tune_tests {
 }
 
 #[cfg(test)]
+#[path = "shard_db/room_seats.rs"]
+mod room_seats;
+
+#[cfg(test)]
 mod frozen_tests {
     //! Frozen memtables out of order and through failure, live: the host's own workers and the
     //! overlap the shard measures, a stall or a failure armed on the worker a packing went to.

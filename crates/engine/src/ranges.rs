@@ -907,6 +907,76 @@ impl Ranges {
         Self::start_cold(runtime, ranges, config).map_err(StartError::Failed)
     }
 
+    /// A module-local test's own task over one engine, prepared as [`Self::start`] prepares each:
+    /// its setup validated, its native retirement adopted, its device backend and workers
+    /// started cold; then handed to `task` on the runtime's first shard as a service task, in
+    /// place of a range's. The task owns the engine's whole life, so it finishes the engine
+    /// ([`ShardDb::finish_async`]) as a range's task does.
+    #[cfg(test)]
+    pub(crate) fn start_fixture<F, T, Fut>(
+        runtime: &mut Runtime,
+        mut db: ShardDb<F>,
+        task: T,
+    ) -> Result<(), Error>
+    where
+        F: BlockFile + Send + 'static,
+        T: FnOnce(ShardDb<F>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        if hyper_rt::registry::current_shard().is_some() {
+            return Err(Error::InvalidArgument {
+                what: "a fixture's cold setup on a runtime",
+            });
+        }
+        db.validate_async_setup()?;
+        let mut leases = runtime
+            .prepare_retirement_with_original::<F, crate::store::OriginalPhysical>(&[
+                db.retirement_capacity()
+            ])
+            .map_err(|error| Error::Io {
+                op: "prepare a fixture's native retirement",
+                detail: error.to_string(),
+            })?;
+        let (lease, mut original) = leases.pop().ok_or(Error::InvalidArgument {
+            what: "a fixture's retirement with no lease",
+        })?;
+        db.prepare_async_backend()?;
+        db.adopt_retirement(lease)?;
+        let physical = db.prepare_original_retirement_watch()?;
+        db.adopt_original(&mut original, physical)?;
+        let shard = runtime
+            .shard_ids()
+            .first()
+            .copied()
+            .ok_or(Error::InvalidArgument {
+                what: "a runtime with no shards",
+            })?;
+        let (offer, mut offered) = channel(1).map_err(|_| Error::LimitExceeded {
+            what: "a fixture's single cold engine handoff",
+            limit: 1,
+        })?;
+        let receipt = runtime
+            .spawn_service_on_with_receipt(shard, async move {
+                if let Ok(db) = offered.recv().await {
+                    task(db).await;
+                }
+            })
+            .map_err(|_| Error::Gone {
+                what: "the shard a fixture was placed on",
+            })?;
+        match receipt.wait_blocking() {
+            Ok(hyper_rt::task::Admission::Admitted(_)) => {}
+            _ => {
+                return Err(Error::Gone {
+                    what: "a fixture's task admission",
+                });
+            }
+        }
+        offer.try_send(db).map_err(|_| Error::Gone {
+            what: "an admitted fixture's cold handoff",
+        })
+    }
+
     fn start_cold<F: BlockFile + Send + 'static>(
         runtime: &mut Runtime,
         mut ranges: Vec<(Vec<u8>, ShardDb<F>)>,

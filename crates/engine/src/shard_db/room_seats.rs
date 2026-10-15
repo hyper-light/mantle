@@ -67,6 +67,9 @@ const MID: usize = 1500;
 /// Extents granted cold to no job, held for the steps that set the room ([`Step::ReserveTo`]):
 /// past any room a case raises it to, the segment and lead a growth is due at.
 const BANK: usize = 256;
+/// The room the last-free-seat case gives back from the bank before the writer goes on: past
+/// what the packings and compactions it makes ask.
+const ROOM: u64 = 64;
 
 fn align() -> Alignment {
     Alignment::new(STORE.page_size).unwrap()
@@ -136,6 +139,12 @@ enum Step {
     ReserveTo(u64),
     /// Nothing done: what the owner holds now.
     Look,
+    /// Every message the workers have sent taken, as the pool takes them (an ask answered from
+    /// the room admitted, or kept waiting for growth; a result kept for its owner), and nothing
+    /// else done.
+    Drain,
+    /// One look of the owner's growth ([`ShardDb::grow`]) and nothing else.
+    Grow,
     /// Extents granted to no job, so the room admitted is what the held packing's hand-off
     /// asks: it fits, and a growth is due. Given back by [`Step::Unreserve`].
     Reserve,
@@ -158,10 +167,10 @@ struct Witness {
     /// The room admitted, and what the held packing's hand-off asks of it.
     capacity: u64,
     asks: u64,
-    /// The extents of the growth out, and the segment and lead the next growth is due at.
+    /// The extents of the growth out.
     growth_extents: u64,
-    segment: u64,
-    lead: u64,
+    /// Nothing pending or in progress in the trunk.
+    trunk_idle: bool,
     frozen_most: usize,
 }
 
@@ -193,8 +202,7 @@ fn witness(db: &mut ShardDb<SegmentedFile>, done: bool) -> Witness {
         capacity: db.store.capacity(),
         asks: hand_off_asks(db),
         growth_extents: db.growth.map_or(0, |(_, _, extents)| extents),
-        segment: db.segment_extents,
-        lead: db.growth_lead,
+        trunk_idle: db.trunk.is_idle(),
         frozen_most: db.frozen_most(),
     }
 }
@@ -295,6 +303,16 @@ async fn run(
 ) -> Result<bool, Error> {
     match step {
         Step::Look => Ok(true),
+        Step::Drain => {
+            let ShardDb { trunk, store, .. } = &mut *db;
+            let pool = trunk.pool_mut().ok_or(Error::InvalidArgument {
+                what: "a fixture with no pool",
+            })?;
+            // The test's own job's result is held by the relays while this is used: a take for
+            // its owner finds none and takes every message there is.
+            Ok(pool.take(store, Owner::Index, false)?.is_none())
+        }
+        Step::Grow => db.grow(false),
         Step::ReserveTo(target) => {
             let capacity = db.store.capacity();
             if capacity > target {
@@ -613,26 +631,32 @@ fn the_last_free_seat_goes_to_the_packing_held_for_one_not_a_growth_due_ahead_of
         })
         .held_jobs[0];
     let free = 1 - holder;
+    // Room enough that no hand-off from here waits for it: the packing that comes to be held
+    // waits for a seat alone.
+    let w = fx.step(Step::Look);
+    assert!(fx.step(Step::ReserveTo(w.capacity + ROOM)).done);
     // The free seat's next result is held: from then both seats are held.
     relays.hold_done(&[Kind::Sort, Kind::Compact, Kind::Grow]);
-    let mut set = None;
+    // The writer's operations, once each, until a packing is held for a seat: the free seat is
+    // taken by a job whose result is held once it is done.
+    let mut held = false;
     for _ in 0..OPS {
         let w = fx.step(Step::Once(i));
         if w.done {
             i += 1;
         }
-        if w.packing_held && relays.seen().held_dones == [free] {
-            set = Some(w);
+        if w.packing_held {
+            held = true;
             break;
         }
         assert!(
             w.done,
-            "the writer waits before a packing was held for a seat with both seats held: {w:?}; \
-             {:?}",
+            "the writer waits before a packing was held for a seat: {w:?}; {:?}",
             relays.seen()
         );
     }
-    set.expect("no packing held for a seat within the operations");
+    assert!(held, "no packing held for a seat within the operations");
+    relays.until("the free seat's result held", |s| s.held_dones == [free]);
     // The room admitted is what the held packing's hand-off asks: it fits, a growth is due.
     let w = fx.step(Step::Reserve);
     assert!(
@@ -680,41 +704,35 @@ fn the_last_free_seat_goes_to_the_packing_held_for_one_not_a_growth_due_ahead_of
     fx.finish(i);
 }
 
-/// Idle slices until every job the relays handed a seat has its result delivered: both seats
-/// free. Fails the test past [`TURNS`].
-fn until_seats_free(fx: &mut Fixture, relays: &'static Relays) {
-    for _ in 0..TURNS {
-        let seen = relays.seen();
-        let out = |seat| {
-            let jobs = seen
-                .events
-                .iter()
-                .filter(|e| matches!(e, Event::Job { seat: s, .. } if *s == seat))
-                .count();
-            let back = seen
-                .events
-                .iter()
-                .filter(|e| matches!(e, Event::Delivered { seat: s } if *s == seat))
-                .count();
-            jobs > back
-        };
-        if !out(0) && !out(1) {
-            return;
-        }
-        fx.step(Step::Idle);
-    }
-    panic!("both seats free: not seen within {TURNS} idle slices");
+/// Whether every job the relays handed a seat has sent its result, none of them held: both
+/// seats free once the owner takes them.
+fn seats_free(relays: &'static Relays) -> bool {
+    let seen = relays.seen();
+    seen.held_dones.is_empty()
+        && (0..2).all(|seat| {
+            let count = |done: bool| {
+                seen.events
+                    .iter()
+                    .filter(|e| match **e {
+                        Event::Job { seat: s, .. } => !done && s == seat,
+                        Event::Done { seat: s, .. } => done && s == seat,
+                        _ => false,
+                    })
+                    .count()
+            };
+            count(false) <= count(true)
+        })
 }
 
-/// Do: two seats. The test's own merge outgrows its grant on one and asks for more while every
-/// admitted extent is reserved, so the ask waits for growth; the growth booked for it goes to
-/// the other seat, its result held. The writer's operations go once each until a packing is held
-/// for a seat. The room is set so that once the growth's segment is admitted and the ask
-/// answered, what is left is what the packing's hand-off asks: it fits, and the ask answered was
-/// larger. Growths are held as a seat takes them, the merge's result is held, and the growth's
-/// result reaches the shard; then two idle slices.
-/// Expect: the first lands the growth and answers the ask, and books no growth, nothing waiting
-/// for room; the second hands the freed seat to the packing, not a growth. The writer's waiting
+/// Do: two seats, from a quiet engine (no growth out, the trunk idle, both seats free). The
+/// test's own merge outgrows its grant on one and asks for n more, with the room one short of n.
+/// The owner takes the ask, which waits, and one look of its growth books a growth sized to it on
+/// the other seat, its result held; the merge's result is held too. The writer's operations go
+/// once each until a packing is held for a seat. The room is set so that, once the growth's
+/// segment is admitted and the ask answered, what is left is that packing's ask, smaller than n.
+/// Growths are held as a seat takes them, and the growth's result reaches the shard.
+/// Expect: one look of the owner's growth lands it, answers the ask and books no growth; the
+/// next idle slice hands the freed seat to the packing, not a growth. The writer's waiting
 /// operation then completes; let everything go, and every value and tombstone reads back exactly
 /// after a checkpoint and a cold reopen, the references whole.
 #[test]
@@ -730,15 +748,17 @@ fn an_ask_answered_as_its_growth_lands_leaves_the_freed_seat_to_the_packing_that
         assert!(fx.step(Step::Until(i)).done);
         i += 1;
     }
-    let mut w = fx.step(Step::Idle);
+    // Idle slices until no growth is out, the trunk owes nothing and both seats are free: from
+    // here only the steps below move the engine.
+    let mut quiet = None;
     for _ in 0..TURNS {
-        if !w.growth_out {
+        let w = fx.step(Step::Idle);
+        if !w.growth_out && w.trunk_idle && seats_free(relays) {
+            quiet = Some(w);
             break;
         }
-        w = fx.step(Step::Idle);
     }
-    assert!(!w.growth_out, "a growth out did not land: {w:?}");
-    until_seats_free(&mut fx, relays);
+    quiet.expect("no growth out, the trunk idle and both seats free: not seen");
     // The asker on a seat; its ask for more comes before the owner takes it.
     let from = relays.seen().events.len();
     assert!(fx.step(Step::InjectAsker).done, "the asker got no seat");
@@ -758,29 +778,25 @@ fn an_ask_answered_as_its_growth_lands_leaves_the_freed_seat_to_the_packing_that
         })
         .unwrap();
     let free = 1 - asker;
-    // The room is the segment and lead a growth is due at: none is due, and the ask, larger,
-    // waits, so the growth booked once the owner takes the ask is the ask's, sized to it.
-    let w = fx.step(Step::Look);
-    let room = w.segment + w.lead;
-    assert!(
-        room < n && !w.growth_out,
-        "the setup: an ask past the room no growth is due at: {w:?}, ask {n}"
-    );
-    assert!(fx.step(Step::ReserveTo(room)).done);
-    // The growth booked for the ask goes to the other seat, its result held there.
+    // The room one short of the ask: the ask waits for growth, and a packing the writer hands
+    // off before the growth lands fits it.
+    assert!(fx.step(Step::ReserveTo(n - 1)).done);
+    // The owner takes the ask, which waits; one look books the growth for it, sized to it, and
+    // hands it to the other seat, where its result is held.
     relays.hold_done(&[Kind::Grow]);
-    for _ in 0..TURNS {
-        if relays.seen().held_dones == [free] {
-            break;
-        }
-        fx.step(Step::Idle);
-    }
-    assert_eq!(
-        relays.seen().held_dones,
-        [free],
-        "the growth for the ask held on the other seat: {:?}",
-        relays.seen()
+    let w = fx.step(Step::Drain);
+    assert!(
+        w.needs == n && !w.growth_out,
+        "the ask taken and waiting: {w:?}, ask {n}"
     );
+    let w = fx.step(Step::Grow);
+    assert!(
+        w.growth_out && w.growth_extents >= n,
+        "a growth booked for the ask: {w:?}, ask {n}"
+    );
+    relays.until("the growth's result held on the other seat", |s| {
+        s.held_dones == [free]
+    });
     // From here the merge's result is held too, so its seat stays its own.
     relays.hold_done(&[Kind::Compact]);
     // The writer's operations, once each, until a packing is held for a seat.
@@ -802,7 +818,10 @@ fn an_ask_answered_as_its_growth_lands_leaves_the_freed_seat_to_the_packing_that
     let w = held.expect("no packing held for a seat within the operations");
     // Once the growth's segment is admitted and the ask answered, what is left is the packing's
     // ask; the ask answered is larger than it.
-    assert!(w.growth_out && w.needs == n, "the setup: {w:?}, ask {n}");
+    assert!(
+        w.growth_out && w.needs == n && w.packing_wanted == 0,
+        "the setup: {w:?}, ask {n}"
+    );
     assert!(
         n > w.asks && w.growth_extents <= w.asks + n,
         "the setup: an ask larger than the packing's, a segment within both: {w:?}, ask {n}"
@@ -823,13 +842,13 @@ fn an_ask_answered_as_its_growth_lands_leaves_the_freed_seat_to_the_packing_that
             .skip(from)
             .any(|e| *e == Event::Delivered { seat: free })
     });
-    // The first slice lands the growth and answers the ask, and books no growth.
-    let first = fx.step(Step::Idle);
+    // One look of the owner's growth lands it and answers the ask, and books no growth.
+    let first = fx.step(Step::Grow);
     assert!(
         !first.growth_out && first.needs == 0 && first.capacity == first.asks,
         "the growth landed, the ask answered, the room left the packing's ask: {first:?}"
     );
-    // The second hands the freed seat to the packing.
+    // The next slice hands the freed seat to the packing.
     let second = fx.step(Step::Idle);
     let seen = relays.until("the freed seat's next job", |s| {
         !jobs_after(s, from, free).is_empty()

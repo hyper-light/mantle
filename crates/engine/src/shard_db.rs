@@ -4867,15 +4867,22 @@ mod frozen_tests {
             self.worker.store(worker, Ordering::SeqCst);
         }
 
-        /// Waits until the stalled worker waits in a write.
-        fn until_waiting(&self) {
+        /// Waits until the stalled worker waits in a write; past the failure guard, a passing
+        /// run never reaches, it returns false.
+        fn until_waiting(&self) -> bool {
+            let deadline = std::time::Instant::now() + WAIT;
             let mut s = self.state();
             while !s.waiting {
+                let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                    return false;
+                };
                 s = self
                     .changed
-                    .wait(s)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    .wait_timeout(s, left)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .0;
             }
+            true
         }
 
         fn waited(&self) -> bool {
@@ -4992,6 +4999,10 @@ mod frozen_tests {
         leaf_entries: 96,
     };
     const MEM: usize = 4 * 1024;
+    /// The failure guard of every wait for a fact, the native worker fixtures'
+    /// (pool_lifecycle.rs): a passing run never waits for it, and elapsed time never counts as
+    /// the fact.
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
     fn key(k: u64) -> Vec<u8> {
         format!("k{:05}", k % 700).into_bytes()
@@ -5079,7 +5090,17 @@ mod frozen_tests {
             put(db, oracle, *i);
             *i += 1;
         }
-        gates.until_waiting();
+        assert!(
+            gates.until_waiting(),
+            "worker {worker}'s write: not begun within the failure guard; frozen on {:?}, \
+             packing held for a seat {:?}, {} workers opened",
+            db.frozen
+                .iter()
+                .map(|f| (f.ticket.worker, f.ready()))
+                .collect::<Vec<_>>(),
+            db.packing.as_ref().map(|p| p.sort.is_some()),
+            gates.opened.load(Ordering::SeqCst)
+        );
         assert!(
             db.frozen
                 .front()
@@ -5103,8 +5124,18 @@ mod frozen_tests {
             put(db, oracle, *i);
             *i += 1;
         }
-        if db.frozen.len() > 1 {
-            db.take_packs(true).unwrap();
+        // The younger's result, taken as it comes, without a blocking wait: one taken already
+        // (a rotation takes what is in) leaves only the stalled packing's out, and a blocking
+        // take would wait on the stall the test releases after this (CI linux-x86_64,
+        // 2026-10-15: younger_beside held in Pool::take while the other worker sat idle).
+        let deadline = std::time::Instant::now() + WAIT;
+        while db.frozen.get(1).is_some_and(|f| f.back.is_none()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a younger packing's result: not back within the failure guard"
+            );
+            db.take_packs(false).unwrap();
+            std::thread::yield_now();
         }
         match db.frozen.get(1) {
             Some(younger) => assert!(

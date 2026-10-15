@@ -64,6 +64,9 @@ const TURNS: usize = 1 << 16;
 const ROWS: u64 = 200;
 const BIG: usize = 3000;
 const MID: usize = 1500;
+/// Extents granted cold to no job, held for the steps that set the room ([`Step::ReserveTo`]):
+/// past any room a case raises it to, the segment and lead a growth is due at.
+const BANK: usize = 256;
 
 fn align() -> Alignment {
     Alignment::new(STORE.page_size).unwrap()
@@ -128,7 +131,8 @@ enum Step {
     /// The test's own job's result, taken back once it came, and every extent the job wrote or
     /// read given back.
     TakeInjected,
-    /// Extents granted to no job or given back, so the room admitted is exactly this many.
+    /// Extents granted to no job, or given back from those (the cold bank first among them), so
+    /// the room admitted is exactly this many.
     ReserveTo(u64),
     /// Nothing done: what the owner holds now.
     Look,
@@ -415,10 +419,10 @@ async fn run(
 async fn owner(
     mut db: ShardDb<SegmentedFile>,
     mut asker: Option<Asker>,
+    mut reserved: Vec<u64>,
     mut steps: ChannelReceiver<Step>,
     answers: mpsc::SyncSender<Result<Witness, Error>>,
 ) {
-    let mut reserved = Vec::new();
     while let Ok(step) = steps.recv().await {
         let finish = matches!(step, Step::Finish(_));
         let answer = run(&mut db, &mut reserved, &mut asker, step)
@@ -468,6 +472,12 @@ impl Fixture {
             SegmentedFile::create(&path, CachingRequest::Buffered, align(), BOUND).unwrap();
         let mut db = ShardDb::create(created, STORE, MEM, TRUNK).unwrap();
         let asker = asker.then(|| self::asker(&mut db.store).unwrap());
+        // The bank, cold: the file grown in place if it has not room for it.
+        let banked = u64::try_from(BANK).unwrap();
+        if db.store.capacity() < banked {
+            db.store.grow_now(banked).unwrap();
+        }
+        let bank = db.store.grant(BANK).unwrap();
         // The owner's write roles and two workers' (ranges_growth_asker.rs's recipe gives one).
         let run = STORE.page_size * usize::try_from(STORE.extent_pages).unwrap();
         db.set_memory(3 * (issuer.depth() + 2) * run).unwrap();
@@ -484,7 +494,7 @@ impl Fixture {
         let (steps, received) = hyper_rt::sync::channel::<Step>(1).unwrap();
         let (answer, answers) = mpsc::sync_channel(1);
         Ranges::start_fixture(&mut runtime, db, move |db| {
-            owner(db, asker, received, answer)
+            owner(db, asker, bank, received, answer)
         })
         .unwrap();
         Self {

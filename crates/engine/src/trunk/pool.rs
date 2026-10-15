@@ -1092,11 +1092,12 @@ impl Pool {
             }
         }
         self.needs.pop_front();
-        self.handed = next;
+        // Numbered as `send` numbers a job: the number not yet handed, then the next.
         let ticket = Ticket {
             worker: asker,
-            job: next,
+            job: self.handed,
         };
+        self.handed = next;
         self.growing = Some((asker, n, ticket));
         Ok(Ok(ticket))
     }

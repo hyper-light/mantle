@@ -53,23 +53,51 @@ second time. In a 100M trunk, root, two index levels and 74 leaves, the flushes 
 waves, and every leaf took one after its first settle. The first settle's 60.8M entries were
 merged again whole by the second.
 
-**The change.** In a consolidation, a paid leaf whose path from the root still holds a pivot that
-will flush (paid, or in a whole consolidation one a paid pivot lies below) waits for that flush.
-While it waits:
-- it keeps its rent;
-- its in-flight bundles are left for the settle;
-- the flush's arrival looks at it again.
+**The change, as first made (4fbe780), and its faults.** A paid leaf waited while a pivot on its
+path from the root would still flush in the consolidation, kept its rent, left its in-flight
+bundles to the settle, and settled once the flushes landed. The drain then settled each leaf once
+(63.2M entries at 100M against 124–127M), but two faults followed, both from index pivots still
+flushing as soon as their own in-flight bundles were compacted:
 
-It then settles once, over everything the consolidation brought it
+- **A whole consolidation could end early.**
+  - A flush could land in a leaf while a pivot higher on its path was still to flush, so the leaf
+    waited.
+  - That higher flush then landed in a node above the leaf, and nothing looked at the leaf again.
+  - With no task out, the consolidation ended with the leaf unsettled and its rent unspent, and a
+    second consolidation settled it.
+  - Measured: 3 consolidations by the postfill counters in 2 of 4 runs of 4fbe780 at 100M, against
+    2 in every run of e43e632.
+- **Data could be left above the leaves.**
+  - A pivot that had gone down was given data by a later flush from a pivot above it marked only
+    for the descent, not paid. Such a flush pays nothing below it, so the data stayed.
+  - Measured on 4fbe780 with every waiting leaf woken at each spend, so the first fault could not
+    mask it: 5 of 10 runs of `a_drain_consolidates_whole_in_one_consolidation` (6 workloads each)
+    ended with 5–14 entries at an index level. e43e632 ended none so, in 10 of 10.
+  - There, every leaf's settle started at once, and a pivot never flushes into a child whose change
+    has started, so the index pivots waited for the flushes above them by that ordering alone.
+
+**The design kept.** A whole consolidation is a pass down from the root: in it, a pivot's flush
+and a paid leaf's settle each wait while a pivot above it on its path will still flush
 (`Trunk::flush_to_come`).
+- Each pivot then flushes once, after every pivot above it, so no data lands in a node whose
+  pivots have gone down.
+- The pivots that will still flush on a path are those above its first that has flushed. The
+  last to flush above a waiting node is its parent's, whose flush lands in that node and looks
+  at it again.
+- A consolidation that seeks' rent bought pays no pivot it flushes into, and is unchanged.
 
-**The test.** `tests/shard_db_workers.rs`
-`a_whole_consolidation_settles_each_leaf_once` drains a four-level trunk on workers (fanout 3).
-It asserts:
-- the consolidation's paid settles are at most the leaves it leaves;
-- they wrote at most the entries those leaves hold.
+**The tests** (`tests/shard_db_workers.rs`).
 
-On e43e632 the same test failed with 65 settles over 21 leaves.
+| test | asserts | e43e632 | 4fbe780 | kept |
+|---|---|---|---|---|
+| `a_whole_consolidation_settles_each_leaf_once` | settles at most the leaves, their entries at most the leaves' | fails (65 settles, 21 leaves) | passes | 10 of 10 |
+| `a_drain_consolidates_whole_in_one_consolidation` | one consolidation, ended whole; no index branch; every leaf one branch | 10 of 10 | fails (a second consolidation) | 10 of 10 |
+
+Each test passes only with both waits.
+- Without the leaf's, the first fails 10 of 10.
+- Without the pivot's, the second fails (4fbe780's row).
+- A wake of every waiting node at each spend, and payment by every flush carrying data, passed
+  10 of 10 when each was taken out alone with the two waits in place; neither is kept.
 
 ## 3. What is not changed here, and why
 
@@ -93,7 +121,9 @@ On e43e632 the same test failed with 65 settles over 21 leaves.
 
 ## 4. Open
 
-- Measured: §2's change at 100M and 10M against e43e632, interleaved. Results to follow in §5.
+- Measured: §2's design at 100M and 10M against e43e632, interleaved. Results to follow in §5.
+  The first A/B (r1711–r1713, 4fbe780) was stopped once its faults were found; its finished cases
+  stand as 4fbe780's.
 - Write-back with discard (§3) is the remaining lever the size of the gap to SplinterDB's large
   cache. Its design comes first: pages shared with workers without copies, dirty pages bounded by
   the cache and cleaned ahead of eviction, a checkpoint's write-back before its flush, a freed

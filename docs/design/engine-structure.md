@@ -348,12 +348,14 @@ rent alone and against consolidating at every quiet moment, with bursts of puts 
 The rent still buys pivots wherever a shard never falls quiet or its writes have not paid for a
 rebuild.
 
-A consolidation writes each leaf once (2026-10-15; research/57 §2). Its flushes come down a trunk
-of several index levels in waves, and a leaf settled before a wave reached it was paid again and
-settled again: at 100M every leaf of the drain's consolidation settled twice, the first settles
-60.8M of its 127.2M entries. A paid leaf now waits while a pivot on its path from the root will
-still flush in the consolidation: it keeps its rent, leaves its in-flight bundles to the settle,
-and settles once the last flush lands.
+A whole consolidation is a pass down from the root, writing each leaf once (2026-10-15;
+research/57 §2). Its flushes came down a trunk of several index levels in waves, and a leaf settled
+before a wave reached it was paid again and settled again: at 100M every leaf of the drain's
+consolidation settled twice, the first settles 60.8M of its 127.2M entries. In a whole
+consolidation a pivot's flush and a paid leaf's settle now each wait while a pivot above them on
+their path will still flush, so each pivot flushes once, after all above it, and each leaf
+settles once, after the last flush lands. Leaves alone waiting (the first form of the change) let
+a consolidation end with a leaf unsettled or leave data above the leaves.
 
 **SuRF range filters** (Zhang et al., SIGMOD 2018; research/33 row 8, research/35 §2) let a
 bounded seek pass over a source with nothing in its range without reading it (closed seeks up to

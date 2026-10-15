@@ -449,6 +449,55 @@ fn a_whole_consolidation_settles_each_leaf_once() {
     db.check_references().unwrap();
 }
 
+/// A drain's whole consolidation is one consolidation, ended whole: it starts once, ends whole,
+/// and leaves every leaf one branch and no index pivot holding any. Over several workloads, each
+/// checked exactly. With leaves waiting for the flushes above them but index pivots flushing as
+/// soon as their own in-flight bundles were compacted, a consolidation ended with a leaf unsettled
+/// (another had to settle it) or with data left above the leaves (research/57 §2).
+#[test]
+fn a_drain_consolidates_whole_in_one_consolidation() {
+    for seed in [
+        0x5bd1_e995_9e37_79b9u64,
+        0x9e37_79b9_7f4a_7c15,
+        0x2545_f491_4f6c_dd1d,
+        0x0f0f_3c3c_5a5a_9696,
+        0x1234_5678_9abc_def1,
+        0x6c62_272e_07bb_0142,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let mut db = ShardDb::create(open(&path, true), STORE, MEM, TRUNK).unwrap();
+        workers(&mut db, &path);
+        let oracle = workload(&mut db, false, seed);
+        let before = db.stats().1;
+        db.flush().unwrap();
+        while db.owed() {
+            db.idle_step(64).unwrap();
+        }
+        let after = db.stats().1;
+        assert_eq!(
+            (
+                after.consolidations_started - before.consolidations_started,
+                after.whole_consolidations - before.whole_consolidations
+            ),
+            (1, 1),
+            "seed {seed:#x}: the drain's consolidations (started, whole): {after:?}"
+        );
+        let depths = after.shape.iter().take_while(|l| l.nodes > 0).count();
+        for level in &after.shape[..depths - 1] {
+            assert_eq!(level.branches, 0, "seed {seed:#x}: {after:?}");
+        }
+        assert!(
+            after.shape[depths - 1].most <= 1,
+            "seed {seed:#x}: {after:?}"
+        );
+        for k in 0..KEYS {
+            check(&mut db, &oracle, k);
+        }
+        db.check_references().unwrap();
+    }
+}
+
 /// The pages a worker's compaction writes come back cached where they were written: the shard's
 /// cache lends each job room, the worker keeps its pages in it as it writes them, and the shard
 /// takes them with the job's branches. With a cache that holds the store and nothing read before

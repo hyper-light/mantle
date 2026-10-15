@@ -472,14 +472,20 @@ impl Trunk {
         })
     }
 
-    /// Whether a pivot on leaf `n`'s path from the root, `key` its first, will still flush in
-    /// the consolidation in progress: a paid one, or in a whole consolidation one a paid pivot
-    /// lies below ([`Self::flush_due`]). Its flush brings the leaf data, and in a whole
-    /// consolidation pays for the leaf again, so a leaf settled before it settles a second time
-    /// once it lands: at 100M every leaf of a four-level trunk did, the first settles 60.8M of
-    /// the 127.2M entries the drain's consolidation wrote (research/57 §2). Down from the root by
-    /// the key: at most the height.
+    /// Whether, in a whole consolidation, a pivot above node `n` on its path from the root, `key`
+    /// one of `n`'s pivots' keys, will still flush: a paid one, or one a paid pivot lies below
+    /// ([`Self::flush_due`]). Its flush brings `n` data and pays for `n`'s pivots again, so a
+    /// pivot that went down before it goes down a second time once it lands, and a leaf settled
+    /// before it settles a second time: at 100M every leaf of a four-level trunk did, the first
+    /// settles 60.8M of the 127.2M entries the drain's consolidation wrote (research/57 §2). The
+    /// pivots that will still flush on a path are those above its first that has flushed, so the
+    /// last to flush above `n` is its parent's, whose flush lands in `n` and looks at it again.
+    /// A consolidation seeks' rent bought pays no pivot it flushes into, and waits for none.
+    /// Down from the root by the key: at most the height.
     fn flush_to_come(&self, n: usize, key: &[u8]) -> Result<bool, Error> {
+        if !self.full {
+            return Ok(false);
+        }
         let mut at = self.root;
         for _ in 0..self.nodes.len() {
             if at == n {
@@ -518,8 +524,11 @@ impl Trunk {
     /// last flush before its child splits, or a consolidation's through a paid or marked pivot.
     /// A consolidation carries the pivot's data down, so it waits for the pivot's live in-flight
     /// bundles to be compacted into the bundle, and flushes even an empty one, so the rent is
-    /// spent and a paid pivot's payment goes down to the child's pivots. Never into a child whose
-    /// change has started.
+    /// spent and a paid pivot's payment goes down to the child's pivots. In a whole
+    /// consolidation it also waits while a pivot above it will still flush
+    /// ([`Self::flush_to_come`]): the consolidation is a pass down from the root, each pivot
+    /// flushing once everything above it has, so no data lands in a node whose pivots have
+    /// already gone down (research/57 §2). Never into a child whose change has started.
     fn flush_due(&self, n: usize, i: usize) -> Result<bool, Error> {
         let node = self.node(n)?;
         if node.leaf {
@@ -541,7 +550,9 @@ impl Trunk {
             return Ok(true);
         }
         if self.consolidating && (pivot.seek.paid || (self.full && pivot.seek.below)) {
-            return Ok(node.inflight.len() <= pivot.start && !self.compacting(n, &pivot.key));
+            return Ok(node.inflight.len() <= pivot.start
+                && !self.compacting(n, &pivot.key)
+                && !self.flush_to_come(n, &pivot.key)?);
         }
         Ok(held > self.config.fanout)
     }

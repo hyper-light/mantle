@@ -398,6 +398,57 @@ fn a_quiet_shard_consolidates_what_its_writes_paid_for_and_no_more() {
     db.check_references().unwrap();
 }
 
+/// A whole consolidation writes each leaf once (research/57 §2): a paid leaf waits for the
+/// flushes still to come down its path and settles once they land, where it settled first and
+/// again after them. The drain of a trunk with index levels between its root and leaves
+/// consolidates it whole; the settles its payment made are at most the leaves it leaves, each
+/// leaf's one, and the entries they wrote at most what those leaves hold. Every read exact and
+/// every reference accounted after.
+#[test]
+fn a_whole_consolidation_settles_each_leaf_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let mut db = ShardDb::create(open(&path, true), STORE, MEM, TRUNK).unwrap();
+    workers(&mut db, &path);
+    let oracle = workload(&mut db, false, 0x9e37_79b9_7f4a_7c15);
+    let before = db.stats().1;
+    db.flush().unwrap();
+    while db.owed() {
+        db.idle_step(64).unwrap();
+    }
+    let after = db.stats().1;
+    assert_eq!(
+        after.whole_consolidations,
+        before.whole_consolidations + 1,
+        "the drain consolidated no trunk whole: {after:?}"
+    );
+    // Flushes come down to a leaf in waves only through index levels below the root.
+    let depths = after.shape.iter().take_while(|l| l.nodes > 0).count();
+    assert!(
+        depths >= 4,
+        "a trunk of {depths} levels has no index level below its root for a wave to cross"
+    );
+    let leaf = after.shape[depths - 1];
+    assert!(leaf.leaf, "{after:?}");
+    let settles = after.consolidations - before.consolidations;
+    let written = after.settle_entries_seeks - before.settle_entries_seeks;
+    assert!(
+        settles > 0 && settles <= leaf.nodes,
+        "{settles} settles the consolidation paid for over {} leaves",
+        leaf.nodes
+    );
+    assert!(
+        written <= leaf.entries,
+        "the consolidation's settles wrote {written} entries into leaves holding {}",
+        leaf.entries
+    );
+    for k in 0..KEYS {
+        check(&mut db, &oracle, k);
+    }
+    check_scan(&mut db, &oracle, 64);
+    db.check_references().unwrap();
+}
+
 /// The pages a worker's compaction writes come back cached where they were written: the shard's
 /// cache lends each job room, the worker keeps its pages in it as it writes them, and the shard
 /// takes them with the job's branches. With a cache that holds the store and nothing read before

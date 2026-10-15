@@ -74,6 +74,9 @@ struct LeafSettle {
     /// Seeks paid for it in a consolidation in progress, and whether its sources are several.
     was_paid: bool,
     paid: bool,
+    /// Paid, with a flush still to come down its path in this consolidation
+    /// ([`Trunk::flush_to_come`]): it settles once that flush is in, not before and again after.
+    waits: bool,
     /// Whether it settles now.
     due: bool,
 }
@@ -429,7 +432,12 @@ impl Trunk {
         Ok(node.inflight.len() > pivot.start
             && !self.compacting(n, &pivot.key)
             && !self.held(pivot)?
-            && !(node.leaf && self.leaf_settle(n)?.due))
+            && !(node.leaf && {
+                // A leaf whose settle is due takes its in-flight bundles, and one waiting for a
+                // consolidation's flush will: either way they are merged once, by the settle.
+                let settle = self.leaf_settle(n)?;
+                settle.due || settle.waits
+            }))
     }
 
     /// Leaf `n`'s sources as a settle takes them: its live in-flight bundles with its bundle.
@@ -452,14 +460,42 @@ impl Trunk {
         let count = entries(pivot.bundle.branches()).saturating_add(live_entries);
         let after = held.saturating_add(usize::from(live_branches > 0));
         let was_paid = self.consolidating && pivot.seek.paid;
-        let paid = was_paid && held.saturating_add(live_branches) > 1;
+        let waits = was_paid && self.flush_to_come(n, &pivot.key)?;
+        let paid = was_paid && !waits && held.saturating_add(live_branches) > 1;
         Ok(LeafSettle {
             count,
             after,
             was_paid,
             paid,
+            waits,
             due: paid || after > self.config.fanout || count > self.leaf_limit(),
         })
+    }
+
+    /// Whether a pivot on leaf `n`'s path from the root, `key` its first, will still flush in
+    /// the consolidation in progress: a paid one, or in a whole consolidation one a paid pivot
+    /// lies below ([`Self::flush_due`]). Its flush brings the leaf data, and in a whole
+    /// consolidation pays for the leaf again, so a leaf settled before it settles a second time
+    /// once it lands: at 100M every leaf of a four-level trunk did, the first settles 60.8M of
+    /// the 127.2M entries the drain's consolidation wrote (research/57 §2). Down from the root by
+    /// the key: at most the height.
+    fn flush_to_come(&self, n: usize, key: &[u8]) -> Result<bool, Error> {
+        let mut at = self.root;
+        for _ in 0..self.nodes.len() {
+            if at == n {
+                return Ok(false);
+            }
+            let node = self.node(at)?;
+            let pivot = node
+                .pivots
+                .get(Self::pivot_of(node, key))
+                .ok_or(corrupt())?;
+            if pivot.seek.paid || (self.full && pivot.seek.below) {
+                return Ok(true);
+            }
+            at = pivot.child.ok_or(corrupt())?;
+        }
+        Err(corrupt())
     }
 
     /// Whether a compaction of node `n`'s pivot keyed `key` is planned or out.
@@ -653,9 +689,10 @@ impl Trunk {
             let settle = self.leaf_settle(n)?;
             if !settle.due {
                 // Paid with one source: nothing to rewrite once the leaf's own compactions are
-                // in (a consolidation's flush may still be on its way down), then the rent is
-                // spent; the apply of a compaction due or out looks at the leaf again.
-                if settle.was_paid && !live && !busy {
+                // in and no flush is still to come down its path, then the rent is spent; the
+                // apply of a compaction due or out, or the flush's arrival, looks at the leaf
+                // again.
+                if settle.was_paid && !settle.waits && !live && !busy {
                     self.spend(n, 0)?;
                 }
                 return Ok(());
@@ -769,7 +806,8 @@ impl Trunk {
         // A leaf seeks paid to consolidate settles to one branch, within the ordinary bounds.
         let settle = self.leaf_settle(n)?;
         if !settle.due {
-            if settle.was_paid {
+            // A leaf waiting for a consolidation's flush keeps its rent for the settle after it.
+            if settle.was_paid && !settle.waits {
                 self.spend(n, 0)?;
             }
             self.node_mut(n)?.wants = None;

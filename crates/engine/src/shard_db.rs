@@ -464,6 +464,10 @@ pub struct ShardDb<F: BlockFile> {
     growth_waited: u64,
     growth_due_at: Option<u64>,
     growth_lead: u64,
+    /// A growth whose write failed: every look for room after it answers with that failure, so
+    /// whichever call took the growth's result first, a put waiting for room or a turn's look,
+    /// the range's next turn keeps it as its fault, and no growth is ever booked past it.
+    growth_failed: Option<Error>,
 }
 
 /// Cited (Luo & Carey, PVLDB 2021 §5.4): a tuning step moves 5% of the memory budget toward
@@ -765,6 +769,7 @@ impl<F: BlockFile> ShardDb<F> {
             scan_end: Vec::new(),
             timed: false,
             growth: None,
+            growth_failed: None,
             segment_extents: 0,
             packing_wanted: 0,
             room_came: false,
@@ -2708,6 +2713,9 @@ impl<F: BlockFile> ShardDb<F> {
         if self.store.segments().is_none() {
             return Ok(false);
         }
+        if let Some(error) = &self.growth_failed {
+            return Err(error.clone());
+        }
         let mut did = false;
         if let Some((ticket, start, extents)) = self.growth {
             let pool = self.trunk.pool_mut().ok_or(Error::InvalidArgument {
@@ -2719,10 +2727,15 @@ impl<F: BlockFile> ShardDb<F> {
                         what: "a growth result for another growth",
                     });
                 }
-                if let Some(error) = back.physical_error {
+                // Its result is taken once: the failure stays, the growth no longer out.
+                if let Some(error) = back
+                    .physical_error
+                    .or_else(|| back.result.as_ref().err().cloned())
+                {
+                    self.growth = None;
+                    self.growth_failed = Some(error.clone());
                     return Err(error);
                 }
-                back.result?;
                 self.growth = None;
                 self.store.growth_added();
                 self.note_lead();

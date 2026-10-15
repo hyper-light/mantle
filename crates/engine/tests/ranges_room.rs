@@ -397,6 +397,9 @@ fn parks_and_goes_on(one_worker: bool) {
     let path = dir.path().join("range");
     let growths: &'static Growths = Box::leak(Box::new(Growths::new(0)));
     let done: &'static AtomicU64 = Box::leak(Box::default());
+    // Where the writer's run is past its operations: 1 flushed, 2 checkpointed, 3 stopped. A
+    // failure guard that fires names it, so a run found slow is told from one found stuck.
+    let step: &'static AtomicU64 = Box::leak(Box::default());
     let issuer = Issuer::start_for(dir.path(), 2, 2).unwrap();
     let mut runtime = runtime();
     let shard = runtime.shard_ids()[0];
@@ -473,9 +476,12 @@ fn parks_and_goes_on(one_worker: bool) {
             join2(write, probe).await;
             drop(prober);
             writer.flush_async().await.unwrap();
+            step.store(1, Ordering::Release);
             writer.checkpoint_async(OPS).await.unwrap();
+            step.store(2, Ordering::Release);
             drop(writer);
             ranges.stop_async().await.unwrap();
+            step.store(3, Ordering::Release);
             finish.send(oracle).unwrap();
         })
         .unwrap();
@@ -502,7 +508,16 @@ fn parks_and_goes_on(one_worker: bool) {
     // Every growth goes: the writer finishes, the range checkpoints and stops.
     growths.open();
     drop(ask);
-    let oracle = received(&finished, "the writer's finished run");
+    let oracle = finished.recv_timeout(WAIT).unwrap_or_else(|e| {
+        panic!(
+            "the writer's finished run: not received within the failure guard ({e}): {} of {OPS} \
+             operations done, past them {}",
+            done.load(Ordering::Acquire),
+            ["none", "flushed", "checkpointed", "stopped"]
+                .get(usize::try_from(step.load(Ordering::Acquire)).unwrap())
+                .unwrap()
+        )
+    });
     runtime.shutdown().unwrap();
     drop(issuer);
     let (mut db, applied) = ShardDb::open(open(&path, None), STORE, MEM, TRUNK).unwrap();

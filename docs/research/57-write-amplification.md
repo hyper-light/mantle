@@ -123,6 +123,10 @@ Each test passes only with both waits.
 
 - The first A/B (r1711–r1713, 4fbe780) was stopped once its faults were found; its finished cases
   stand as 4fbe780's.
+- Write-back with discard (§3) is the remaining lever the size of the gap to SplinterDB's large
+  cache. Its design comes first: pages shared with workers without copies, dirty pages bounded by
+  the cache and cleaned ahead of eviction, a checkpoint's write-back before its flush, a freed
+  extent's dirty pages dropped, and a failed write's fence.
 
 ## 5. Measured: the pass down from the root (c2da2c3), and what each node waits for
 
@@ -270,7 +274,3 @@ pivot keys put each branch in its pivot's bundle. It was reverted for a fault an
   - a diagnostic run (r1791) placed 3 of 18 inline and 7 of 18 queued.
 - **For a second attempt:** a packing that may be placed keeps its pages cached as a compaction's
   are, and it is measured at 100M on a quiet host.
-- Write-back with discard (§3) is the remaining lever the size of the gap to SplinterDB's large
-  cache. Its design comes first: pages shared with workers without copies, dirty pages bounded by
-  the cache and cleaned ahead of eviction, a checkpoint's write-back before its flush, a freed
-  extent's dirty pages dropped, and a failed write's fence.

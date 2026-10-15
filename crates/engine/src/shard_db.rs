@@ -4174,6 +4174,14 @@ impl<F: BlockFile> ShardDb<F> {
             pack.entries = u64::try_from(full.len()).unwrap_or(u64::MAX);
             pack.skip = full.skip();
             pack.arena = arena;
+            // A key list no index needs any more, kept for the next packing ([`Self::free_list`]):
+            // the worker's reserve for the walk's keys finds its room, counted in the packing's
+            // memory while it is out.
+            if pack.keys.bytes() == 0
+                && let Some(list) = self.kept_free.pop()
+            {
+                pack.keys = list;
+            }
             if let Some((mem, pack)) = self.sort_off(full, pack, since)? {
                 self.packing = Some(Packing {
                     mem,

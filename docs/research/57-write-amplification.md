@@ -121,9 +121,49 @@ Each test passes only with both waits.
 
 ## 4. Open
 
-- Measured: §2's design at 100M and 10M against e43e632, interleaved. Results to follow in §5.
-  The first A/B (r1711–r1713, 4fbe780) was stopped once its faults were found; its finished cases
+- The first A/B (r1711–r1713, 4fbe780) was stopped once its faults were found; its finished cases
   stand as 4fbe780's.
+
+## 5. Measured: the pass down from the root (c2da2c3), and what each node waits for
+
+[runs] r1731 at 100M and r1731–r1733 at 10M: c2da2c3 (`wa2`, md5 `a106fb38`) against e43e632
+(`corr2`, md5 `c0f87536`), interleaved, inline (`x_`) and queued (`n_`); every case's recovery
+exact.
+
+| 100M, r1731 | fills/s | stalls | postfill flush | entries written | settled by consolidation | GB written |
+|---|---|---|---|---|---|---|
+| c2da2c3, inline | 3.27M | 1 | 3.47 s | 389.1M | 63.2M | 45.6 |
+| e43e632, inline | 3.31M | 1 | 6.56 s | 455.1M | 133.2M | 55.7 |
+| c2da2c3, queued | 1.82M | 0 | 3.06 s | 392.0M | 63.2M | 44.0 |
+| e43e632, queued | 1.84M | 0 | 5.16 s | 466.4M | 133.9M | 53.3 |
+
+| 10M, median of 3 | entries written | settled by consolidation | postfill flush, each round |
+|---|---|---|---|
+| c2da2c3, inline | 19.78M | 6.32M | 1.39, 0.56, 0.69 s |
+| e43e632, inline | 19.35M | 6.32M | 1.47, 0.54, 0.66 s |
+| c2da2c3, queued | 19.63M | 6.32M | 1.87, 5.16, 5.64 s |
+| e43e632, queued | 21.30M | 7.17M | 0.98, 2.85, 1.62 s |
+
+At 100M the drain wrote each leaf once and took 41–47% less time, and the run wrote 17–18% fewer
+bytes, at the same fill (one stall or none in each arm). At 10M, a trunk of three levels, e43e632
+already settled nearly every leaf once, so the pass had little to save there. It still made every
+paid leaf and pivot wait while any pivot above it was to flush, holding pivots with nothing,
+and the queued drain took longer in all three rounds.
+
+**The refinement.** A node now waits only for a pivot above it that is to flush and holds data:
+- in its bundle;
+- in live in-flight bundles;
+- in a compaction out.
+
+A pivot holding nothing brings nothing down. Data comes down a path from a paid pivot (a whole
+consolidation starts with no live in-flight bundle, its trunk idle), and a paid flush pays the next
+pivot on the path, so the last flush above a waiting node still lands in it and looks at it again.
+Both waits remain necessary:
+- without the leaf's, `a_whole_consolidation_settles_each_leaf_once` fails 10 of 10 runs;
+- without the pivot's, `a_drain_consolidates_whole_in_one_consolidation` fails 2 of 10;
+- with both, both pass 10 of 10.
+
+Its A/B against e43e632 follows.
 - Write-back with discard (§3) is the remaining lever the size of the gap to SplinterDB's large
   cache. Its design comes first: pages shared with workers without copies, dirty pages bounded by
   the cache and cleaned ahead of eviction, a checkpoint's write-back before its flush, a freed

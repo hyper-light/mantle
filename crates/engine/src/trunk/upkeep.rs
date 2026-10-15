@@ -473,15 +473,17 @@ impl Trunk {
     }
 
     /// Whether, in a whole consolidation, a pivot above node `n` on its path from the root, `key`
-    /// one of `n`'s pivots' keys, will still flush: a paid one, or one a paid pivot lies below
-    /// ([`Self::flush_due`]). Its flush brings `n` data and pays for `n`'s pivots again, so a
-    /// pivot that went down before it goes down a second time once it lands, and a leaf settled
-    /// before it settles a second time: at 100M every leaf of a four-level trunk did, the first
-    /// settles 60.8M of the 127.2M entries the drain's consolidation wrote (research/57 §2). The
-    /// pivots that will still flush on a path are those above its first that has flushed, so the
-    /// last to flush above `n` is its parent's, whose flush lands in `n` and looks at it again.
-    /// A consolidation seeks' rent bought pays no pivot it flushes into, and waits for none.
-    /// Down from the root by the key: at most the height.
+    /// one of `n`'s pivots' keys, will still flush data down to it: a paid one, or one a paid
+    /// pivot lies below ([`Self::flush_due`]), that holds data in its bundle, in live in-flight
+    /// bundles or in a compaction out. Its flush brings `n` that data and pays for `n`'s pivots
+    /// again, so a pivot that went down before it goes down a second time once it lands, and a
+    /// leaf settled before it settles a second time: at 100M every leaf of a four-level trunk
+    /// did, the first settles 60.8M of the 127.2M entries the drain's consolidation wrote
+    /// (research/57 §2). A pivot that holds nothing brings nothing, and waiting for it held every
+    /// leaf of a 10M trunk behind the root's compactions (research/57 §5). Data comes down a path
+    /// from a paid pivot, whose flush pays the next pivot on it, so the last flush above a waiting
+    /// node lands in it and looks at it again. A consolidation seeks' rent bought pays no pivot
+    /// it flushes into, and waits for none. Down from the root by the key: at most the height.
     fn flush_to_come(&self, n: usize, key: &[u8]) -> Result<bool, Error> {
         if !self.full {
             return Ok(false);
@@ -496,7 +498,12 @@ impl Trunk {
                 .pivots
                 .get(Self::pivot_of(node, key))
                 .ok_or(corrupt())?;
-            if pivot.seek.paid || (self.full && pivot.seek.below) {
+            let pending = pivot.seek.paid || pivot.seek.below;
+            if pending
+                && (!pivot.bundle.branches().is_empty()
+                    || node.inflight.len() > pivot.start
+                    || self.compacting(at, &pivot.key))
+            {
                 return Ok(true);
             }
             at = pivot.child.ok_or(corrupt())?;

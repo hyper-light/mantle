@@ -206,8 +206,23 @@ impl TrieBuilder {
         self.keys == 0
     }
 
-    /// Level `d`, the levels down to it in use.
+    /// Level `d`, the levels down to it in use. Taken for every label of every key, so the
+    /// growth a level needs once ([`Self::deepen`]) is kept out of it: together they saved and
+    /// restored a 240-byte frame on each call, 12.6% of a memtable's packing
+    /// (`prof/packing-base-1.txt`, 2026-10-15).
+    #[inline]
     fn level(&mut self, d: usize) -> Result<&mut Level, Error> {
+        if d >= self.depth {
+            self.deepen(d)?;
+        }
+        self.levels.get_mut(d).ok_or_else(corrupt)
+    }
+
+    /// Puts the levels down to `d` in use, each emptied for values of the trie's width, its
+    /// buffers kept: once a level a trie reaches.
+    #[cold]
+    #[inline(never)]
+    fn deepen(&mut self, d: usize) -> Result<(), Error> {
         while self.depth <= d {
             if self.levels.len() <= self.depth {
                 self.levels.push(Level::default());
@@ -215,11 +230,11 @@ impl TrieBuilder {
             let width = self.width;
             self.levels
                 .get_mut(self.depth)
-                .ok_or(corrupt())?
+                .ok_or_else(corrupt)?
                 .reset(width)?;
             self.depth = self.depth.saturating_add(1);
         }
-        self.levels.get_mut(d).ok_or(corrupt())
+        Ok(())
     }
 
     /// Adds `key`, greater than every key added, with `value`.

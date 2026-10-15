@@ -299,3 +299,64 @@ with workers and a cache:
   reaches the root's branch) read no page from the device.
 - Giving the room back instead of adopting it fails it (3 device reads), and so does a packing
   taking no room (2). Never placing fails its count.
+
+## 8. The page cache's per-page work on the shard: a grant and an adoption
+
+**What the trace showed.** The fill's slowest puts lie inside the range task's long "taking worker
+results" sections:
+- At 100M they took 6–42 ms; at 10M, 5–7 ms.
+- Diagnostic: the scalar event trace on wa-wr 667de8f, branch trace-wr.
+- Runs: `diag-runs/n100000000-r1901..r1902-t_trwr1` and `n10000000-r1901..r1904-t_trwr1`.
+
+A frame-pointer profile of the traced build (`prof/ab3-tr100m`, two rounds) was cut to those
+sections by the trace's base on CLOCK_MONOTONIC.
+- Inside them the shard was sampled at 0.48 of the time, against 0.50 over the whole fill: it ran
+  there, it was not descheduled.
+- Round 1: of 143.1 ms sampled, `Cache::adopt` took 64.5 ms. The trunk's dispatch took 59.5 ms,
+  almost all in `Store::grant`'s forgets.
+- Round 2: 67.0 and 55.0 ms of 138.6 ms.
+- A worker's compaction comes back with pages written into memory the cache lent it. Before it
+  is applied:
+  - every page of every extent granted it was forgotten from the cache, one map probe a page;
+  - its result's adoption forgot each page again, looked it up in the ghost, then mapped it.
+
+**Counted** (diagnostic counters, trace-wr dbfa3af; `n100000000-r1911-t_trwr2`,
+`n10000000-r1911..r1912-t_trwr2`, whole runs):
+
+| per-page work | 100M probes | found a page | 10M probes (two runs) | found |
+|---|---|---|---|---|
+| a grant's forget | 16,542,944 | 5,741,144 (35%) | 1,260,480 / 1,259,840 | 89,306 / 44,211 (7%, 3.5%) |
+| an adoption's forget | 12,048,789 | 0 | 643,605 / 625,043 | 0 / 0 |
+| an adoption's ghost lookup | 12,048,789 | 0 | 643,605 / 625,043 | 0 / 0 |
+| evictions an adoption ran | — | 0 | — | 0 / 0 |
+| the paced forgetting | 5,140,416 | 4,311,854 (84%) | 552,832 / 576,704 | 354,780 / 381,307 |
+
+**Step one: is the work needed at all?**
+- An adoption's forget: no. Every page a job writes lies in an extent granted it, and the grant
+  forgot whatever the cache held there; none of 12.0M found a page. The map's insert returns the
+  mapping it replaces, so a page found there would be released in that same probe.
+- An adoption's ghost lookup: not while the ghost is empty. The ghost holds only addresses the
+  cache evicted, and at 100M and 10M it evicted none. Empty, it names this address no more than
+  any other; holding entries, the lookup stays and the rule is unchanged.
+
+**Step two: does a grant need this much?** It needs the 35% (100M) and 3.5–7% (10M) of its probes
+that found a page: dead branches' pages, which hold the cache's memory until forgotten. Only an
+extent whose forgetting is pending can have any. The cache holds pages read or written through
+extents held, and a released extent enters the forgetting at once. One bit an extent carries that
+from the release:
+- a grant forgets the extents whose bit is set, and takes the bit;
+- the paced forgetting passes over an extent whose bit is gone, as it already passed over one
+  held again.
+
+**Tests.**
+- `store::cache` `an_adopted_page_replaces_the_page_its_address_held`: an adopted page displaces
+  an older page at its address in the one probe. Without releasing the displaced slot it fails:
+  five pages live where four should be.
+- `store::cache` `an_adopted_page_at_an_address_the_ghost_names_enters_main`: an empty ghost puts
+  adopted pages in small; one the ghost names goes to main, as before.
+- `tests/store_grant_pressure.rs` `a_freed_extents_pages_leave_the_cache_once_whoever_reaches_it_first`:
+  - the paced forgetting reaches a freed extent first, then a grant of it finds nothing cached;
+  - a grant reaches one first and forgets its pages;
+  - an extent freed twice before the forgetting is forgotten once, its newest pages.
+  - Each check reads through an injected device fault, so a stale cached page would answer. A
+    grant that skipped a pending extent, or a forgetting that skipped every extent, fails it.

@@ -141,6 +141,94 @@ fn a_refused_grant_preserves_cached_pages_but_an_accepted_grant_invalidates_them
     assert_eq!(out, b"new granted bytes");
 }
 
+/// A freed extent's pages leave the cache once, by whichever reaches it first: the paced
+/// forgetting, after which a grant of it finds nothing cached and the device answers its reads;
+/// or a grant, after which the forgetting passes it over. Freed again before the forgetting
+/// came, its newest pages are the ones forgotten.
+#[test]
+fn a_freed_extents_pages_leave_the_cache_once_whoever_reaches_it_first() {
+    let (mut store, observed) = store(8);
+    store.set_cache(2 * usize::try_from(CONFIG.extent_pages).unwrap());
+    let page = u64::try_from(CONFIG.page_size).unwrap();
+    let extent = store.allocate_extent().unwrap();
+    let address = store.address(extent, 0).unwrap();
+    store
+        .write_page(address, b"before its first release")
+        .unwrap();
+    store.checkpoint(Some(address), 1).unwrap();
+    store.release(extent).unwrap();
+    store.checkpoint(None, 2).unwrap();
+    // The forgetting reaches it first: the device answers, its fault seen.
+    assert_eq!(
+        store.forget_some(u64::from(CONFIG.extent_pages)),
+        u64::from(CONFIG.extent_pages)
+    );
+    assert_eq!(store.forget_debt(), 0);
+    observed
+        .inject(Fault::ReadError {
+            offset: address * page,
+            len: page,
+        })
+        .unwrap();
+    let mut out = Vec::new();
+    assert!(matches!(
+        store.read_page(address, &mut out),
+        Err(Error::Io { .. })
+    ));
+    // Granted then, nothing of it is cached to forget, and the device still answers.
+    let grant = store.grant(2).unwrap();
+    assert!(grant.contains(&extent));
+    assert!(matches!(
+        store.read_page(address, &mut out),
+        Err(Error::Io { .. })
+    ));
+    observed.clear_faults().unwrap();
+    store.write_page(address, b"granted, then written").unwrap();
+    out.clear();
+    store.read_page(address, &mut out).unwrap();
+    assert_eq!(out, b"granted, then written");
+    // Freed again: a grant reaches it first and forgets its pages, and the forgetting, which
+    // holds it twice once it is freed a third time, forgets the newest pages once.
+    store.release(extent).unwrap();
+    let grant = store.grant(2).unwrap();
+    assert!(grant.contains(&extent));
+    observed
+        .inject(Fault::ReadError {
+            offset: address * page,
+            len: page,
+        })
+        .unwrap();
+    assert!(matches!(
+        store.read_page(address, &mut out),
+        Err(Error::Io { .. })
+    ));
+    observed.clear_faults().unwrap();
+    store.write_page(address, b"the newest pages").unwrap();
+    out.clear();
+    store.read_page(address, &mut out).unwrap();
+    assert_eq!(out, b"the newest pages");
+    store.release(extent).unwrap();
+    assert_eq!(
+        store.forget_debt(),
+        2 * u64::from(CONFIG.extent_pages),
+        "the forgetting holds the extent once for each time it was freed"
+    );
+    assert_eq!(
+        store.forget_some(u64::MAX),
+        2 * u64::from(CONFIG.extent_pages)
+    );
+    observed
+        .inject(Fault::ReadError {
+            offset: address * page,
+            len: page,
+        })
+        .unwrap();
+    assert!(matches!(
+        store.read_page(address, &mut out),
+        Err(Error::Io { .. })
+    ));
+}
+
 #[test]
 fn an_invalid_return_cannot_release_an_earlier_valid_grant_member() {
     let (mut store, _) = store(CONFIG.max_extents);

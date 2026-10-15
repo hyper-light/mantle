@@ -714,8 +714,13 @@ impl Cache {
             let first = self.starts.get(c).copied().unwrap_or(0);
             let mut live = 0usize;
             for (k, (address, len)) in kept_pages.by_ref().take(count).enumerate() {
-                self.forget(address);
-                let to_main = self.forget_ghost(address);
+                // A grant forgot whatever its extents' pages the cache held (`Store::grant`), so
+                // the address maps to nothing: the insert below finds no page to replace, and
+                // one it did find would be released there, in the same probe. The ghost names
+                // addresses the cache evicted: empty, it names this one no more than any other.
+                // A 100M fill adopted 12.0M pages, none mapped and none in the ghost (research/57
+                // §8).
+                let to_main = !self.ghosts.is_empty() && self.forget_ghost(address);
                 let queue = if to_main { Queue::Main } else { Queue::Small };
                 let i = first.saturating_add(k);
                 let Some(s) = self.slots.get_mut(i) else {
@@ -733,8 +738,13 @@ impl Cache {
                     len,
                 };
                 self.push(queue, i);
-                self.map
-                    .insert(address, u64::try_from(i).unwrap_or(u64::MAX));
+                if let Some(was) = self
+                    .map
+                    .insert(address, u64::try_from(i).unwrap_or(u64::MAX))
+                    .and_then(|was| usize::try_from(was).ok())
+                {
+                    self.release(was);
+                }
                 live = live.saturating_add(1);
             }
             self.loan_kept = self
@@ -1698,6 +1708,74 @@ mod tests {
         // Bounded: never more pages than the limit, nor a ghost past a few times its window.
         assert!(c.map.len() <= 10);
         assert!(c.ghosts.len() <= 4 * 16);
+    }
+
+    /// An adopted page whose address still maps to an older page takes its place in the one
+    /// probe that maps it: the address reads the job's bytes, the older page's slot holds nothing,
+    /// and a forget leaves nothing of either mapped.
+    #[test]
+    fn an_adopted_page_replaces_the_page_its_address_held() {
+        let mut c = Cache::new(64, 16);
+        for a in 100..103u64 {
+            c.insert(a, &page(a));
+        }
+        let mut k = c.lend(4).unwrap();
+        k.keep(101, b"rewritten");
+        k.keep(200, &page(200));
+        c.adopt(k);
+        let mut out = Vec::new();
+        assert!(c.get(101, &mut out));
+        assert_eq!(out, b"rewritten");
+        for a in [100u64, 102, 200] {
+            out.clear();
+            assert!(c.get(a, &mut out));
+            assert_eq!(out, page(a));
+        }
+        let m = c.memory();
+        assert_eq!(m.live, 4, "the older page's slot still holds a page");
+        let named = |m: Memory| m.live + m.free + m.dead + m.spare + m.lent;
+        assert_eq!(named(m), c.bytes() as u64 / 16);
+        c.forget(101);
+        out.clear();
+        assert!(!c.get(101, &mut out), "a page of 101 stayed mapped");
+        assert_eq!(c.memory().live, 3);
+    }
+
+    /// With pages evicted, the ghost holds addresses, and an adopted page at one it names enters
+    /// main, as a page read again does; with the ghost empty, adopted pages enter small.
+    #[test]
+    fn an_adopted_page_at_an_address_the_ghost_names_enters_main() {
+        let mut c = warm(10, 64);
+        // Room for a loan past the slots made.
+        c.resize(12);
+        let mut k = c.lend(2).unwrap();
+        k.keep(300, &page(300));
+        k.keep(301, &page(301));
+        c.adopt(k);
+        assert!(c.ghosts.is_empty());
+        for a in [300u64, 301] {
+            let i = c.slot_of(a).unwrap();
+            assert_eq!(c.slots[i].queue, Queue::Small);
+        }
+        // Seventeen pages in twelve: pages the small queue evicts unread leave for the ghost.
+        for a in 0..15u64 {
+            c.insert(a, &page(a));
+        }
+        let named = [300u64, 301]
+            .into_iter()
+            .chain(0..15)
+            .find(|&a| c.in_ghost(a))
+            .expect("no page left for the ghost");
+        c.resize(14);
+        let mut k = c.lend(2).unwrap();
+        k.keep(named, b"written again");
+        c.adopt(k);
+        let i = c.slot_of(named).unwrap();
+        assert_eq!(c.slots[i].queue, Queue::Main);
+        assert!(!c.in_ghost(named));
+        let mut out = Vec::new();
+        assert!(c.get(named, &mut out));
+        assert_eq!(out, b"written again");
     }
 
     #[test]

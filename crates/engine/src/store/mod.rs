@@ -250,6 +250,10 @@ pub struct Store<F: BlockFile> {
     /// Freed extents whose pages the cache still holds, forgotten a share at a time
     /// ([`Store::forget_some`]): at most the extents freed.
     forgetting: VecDeque<u64>,
+    /// A bit an extent, set while its forgetting is pending: the cache holds pages read or
+    /// written through extents held, so a free extent has pages cached only while its forgetting
+    /// is pending, and a grant forgets those alone ([`Store::grant`]).
+    forget_pending: Vec<u64>,
     /// A worker's way to more extents once its grant is spent ([`Store::set_refill`]).
     refill: Option<Refill>,
     /// A file grown by segments ([`BlockFile::grow`]): what the allocator may hand out. None for
@@ -551,6 +555,41 @@ fn io(op: &'static str, e: impl std::fmt::Display) -> Error {
     }
 }
 
+/// Sets `extent`'s bit in `bits`, growing them to hold it; refused where memory cannot.
+fn set_bit(bits: &mut Vec<u64>, extent: u64) -> Result<(), Error> {
+    let limit = || Error::LimitExceeded {
+        what: "the extents whose forgetting is pending",
+        limit: extent,
+    };
+    let word = usize::try_from(extent / 64).map_err(|_| limit())?;
+    if let Some(more) = word
+        .checked_add(1)
+        .and_then(|n| n.checked_sub(bits.len()))
+        .filter(|&more| more > 0)
+    {
+        bits.try_reserve(more).map_err(|_| limit())?;
+        bits.resize(word.checked_add(1).ok_or_else(limit)?, 0);
+    }
+    if let Some(w) = bits.get_mut(word) {
+        *w |= 1u64 << (extent % 64);
+    }
+    Ok(())
+}
+
+/// Clears `extent`'s bit in `bits`: whether it was set.
+fn take_bit(bits: &mut [u64], extent: u64) -> bool {
+    let Some(w) = usize::try_from(extent / 64)
+        .ok()
+        .and_then(|word| bits.get_mut(word))
+    else {
+        return false;
+    };
+    let mask = 1u64 << (extent % 64);
+    let was = *w & mask != 0;
+    *w &= !mask;
+    was
+}
+
 fn corrupt(why: Malformed) -> Error {
     Error::Corruption {
         what: "a store",
@@ -731,6 +770,7 @@ impl<F: BlockFile> Store<F> {
             lists_lent: 0,
             lists_most_lent: 0,
             forgetting: VecDeque::new(),
+            forget_pending: Vec::new(),
             timed: false,
             refill: None,
             segments: None,
@@ -814,6 +854,7 @@ impl<F: BlockFile> Store<F> {
             lists_lent: 0,
             lists_most_lent: 0,
             forgetting: VecDeque::new(),
+            forget_pending: Vec::new(),
             timed: false,
             refill: None,
             segments: None,
@@ -943,6 +984,7 @@ impl<F: BlockFile> Store<F> {
                 lists_lent: 0,
                 lists_most_lent: 0,
                 forgetting: VecDeque::new(),
+                forget_pending: Vec::new(),
                 timed: false,
                 refill: None,
                 segments,
@@ -1265,8 +1307,10 @@ impl<F: BlockFile> Store<F> {
     /// `count` extents for a maintenance worker's job, each held once as the shard's own: the
     /// worker writes them through its own store ([`Self::worker`]), whose writes this store's
     /// cache never sees, so any page the cache still holds of them, from before they were freed,
-    /// is forgotten now rather than in its turn ([`Self::forget_some`] passes over extents held
-    /// again, since this store's own writes replace what it cached).
+    /// is forgotten now rather than in its turn. Only an extent whose forgetting is pending can
+    /// hold any: the forgetting has reached every other, or nothing cached it. A 100M fill's
+    /// grants probed 16.5M pages, 35% of them cached; a 10M fill's 1.26M, 3.5-7% (research/57
+    /// §8).
     pub fn grant(&mut self, count: usize) -> Result<Vec<u64>, Error> {
         self.allocator_available()?;
         let mut out = Vec::new();
@@ -1287,6 +1331,9 @@ impl<F: BlockFile> Store<F> {
         if let Some(c) = self.cache.as_mut() {
             let per = u64::from(self.config.extent_pages);
             for &extent in &out {
+                if !take_bit(&mut self.forget_pending, extent) {
+                    continue;
+                }
                 let first = extent
                     .checked_mul(per)
                     .ok_or(corrupt(Malformed::TooLarge))?;
@@ -1534,6 +1581,7 @@ impl<F: BlockFile> Store<F> {
         // compaction's inputs at once cost milliseconds of one slice, so the extent waits its
         // turn ([`Self::forget_some`]).
         if !self.alloc.is_held(extent) && self.cache.is_some() {
+            set_bit(&mut self.forget_pending, extent)?;
             self.forgetting.push_back(extent);
         }
         Ok(())
@@ -1547,8 +1595,9 @@ impl<F: BlockFile> Store<F> {
     }
 
     /// Forgets up to `pages` pages of freed extents, an extent at a time; returns the pages
-    /// forgotten. An extent held again by then is passed over: each page written there replaced
-    /// what the cache held, and its pages not written are read by no one.
+    /// forgotten. An extent a grant has forgotten already, or one held again by then, is passed
+    /// over: each page written there replaced what the cache held, and its pages not written are
+    /// read by no one.
     pub fn forget_some(&mut self, pages: u64) -> u64 {
         let per = u64::from(self.config.extent_pages);
         let mut done = 0u64;
@@ -1557,7 +1606,7 @@ impl<F: BlockFile> Store<F> {
                 break;
             };
             done = done.saturating_add(per);
-            if self.alloc.is_held(extent) {
+            if !take_bit(&mut self.forget_pending, extent) || self.alloc.is_held(extent) {
                 continue;
             }
             if let Some(c) = self.cache.as_mut() {

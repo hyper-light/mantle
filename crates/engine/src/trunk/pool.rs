@@ -43,7 +43,9 @@ use hyper_block::block::BlockFile;
 
 /// A compaction for a worker: `inputs` newest first, the descriptors a merge reads (no filters),
 /// merged over `[from, end)` into branches of at most `per` entries, tombstones dropped when
-/// `drop_tombstones`.
+/// `drop_tombstones`. `pages`: the pages the merge writes from its inputs at most, their
+/// [`Branch::pages_between`] summed when it is planned, what its grant and the cache's room for
+/// its writes are sized by.
 #[derive(Debug)]
 pub struct Task {
     pub inputs: Vec<Branch>,
@@ -51,6 +53,7 @@ pub struct Task {
     pub end: Option<Vec<u8>>,
     pub drop_tombstones: bool,
     pub per: u64,
+    pub pages: usize,
 }
 
 /// A worker's work: a compaction, a full memtable to sort and pack into one branch, or a growth

@@ -454,8 +454,8 @@ pub fn pack_memtable<F: BlockFile>(
         keys,
         cuts,
     } = pack;
-    // The keys with their offsets in the copy, the arena's own, for the index over kept
-    // memtables: listed by the sort as it hashes each key, at least one a key the memtable holds.
+    // The walk's keys, each its newest entry, with the hash its put computed and its offset in
+    // the copy, the arena's own: the index over kept memtables is built from them.
     keys.clear();
     keys.hashes
         .try_reserve(usize::try_from(*entries).unwrap_or(usize::MAX))
@@ -469,7 +469,7 @@ pub fn pack_memtable<F: BlockFile>(
             what: "a memtable's key list",
             limit: *entries,
         })?;
-    let kept = sorter.sort(arena, *skip, keys)?;
+    let kept = sorter.sort(arena, *skip)?;
     // The memtable counted each key once as it took it: the sort keeps as many.
     if u64::try_from(kept).ok() != Some(*entries) {
         return Err(Error::Corruption {
@@ -486,7 +486,8 @@ pub fn pack_memtable<F: BlockFile>(
     let mut begun = 0usize;
     let mut at = 0usize;
     let mut b: Option<Builder> = None;
-    sorter.each(arena, |k, op, v, h| {
+    sorter.each_at(arena, |k, op, v, h, offset| {
+        keys.push(h, offset);
         while ends.get(piece).is_some_and(|&end| at >= end) {
             if let Some(done) = b.take() {
                 let start = piece.checked_sub(1).and_then(|c| cuts.get(c)).cloned();
@@ -502,7 +503,7 @@ pub fn pack_memtable<F: BlockFile>(
         }
         at = at.saturating_add(1);
         match b.as_mut() {
-            Some(b) => b.add_hashed(store, k, op, v, h),
+            Some(b) => b.add_hashed(store, k, op, v, crate::branch::filter::hash32(h)),
             None => Err(Error::InvalidArgument {
                 what: "a packing's piece with no builder",
             }),

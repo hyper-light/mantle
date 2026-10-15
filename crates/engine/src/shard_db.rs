@@ -68,6 +68,9 @@ pub struct FlushStats {
     /// stall included), and in forgetting freed pages: in all, timed only as the rest are.
     /// Memtables rotated: filled, and handed to packing.
     pub rotations: u64,
+    /// The bytes the store wrote in the last memtable's cycle, from one rotation's re-budget to
+    /// the next: what the write budget is set from (`ShardDb::set_write_budget`).
+    pub cycle_written: u64,
     pub insert_ns: u64,
     pub rotate_ns: u64,
     pub forget_ns: u64,
@@ -1923,7 +1926,14 @@ impl<F: BlockFile> ShardDb<F> {
     /// A range's owned request remains unapplied when its rotation stops for work still out.
     /// HashMem's capacity refusal changes nothing; record invalidation follows insertion so a
     /// yielded request leaves the previous value and its cache entry reachable.
-    fn apply_paced(&mut self, key: &[u8], op: Op, value: &[u8], keys: u64) -> Result<bool, Error> {
+    fn apply_paced(
+        &mut self,
+        key: &[u8],
+        h: u64,
+        op: Op,
+        value: &[u8],
+        keys: u64,
+    ) -> Result<bool, Error> {
         self.no_worker_failure()?;
         self.no_checkpoint_mutation()?;
         self.require_async_backend()?;
@@ -1937,7 +1947,6 @@ impl<F: BlockFile> ShardDb<F> {
         if self.rotation.is_some() && !self.rotate_paced(keys)? {
             return Ok(false);
         }
-        let h = crate::branch::filter::hash(key);
         let mut before = self.mem.bytes();
         match self.mem.insert_hashed(key, h, op, value) {
             Err(Error::LimitExceeded { .. }) if !self.mem.is_empty() => {
@@ -1957,12 +1966,22 @@ impl<F: BlockFile> ShardDb<F> {
         Ok(true)
     }
 
-    pub(crate) fn put_paced(&mut self, key: &[u8], value: &[u8], keys: u64) -> Result<bool, Error> {
-        self.apply_paced(key, Op::Put, value, keys)
+    /// A put of `key`, of filter hash `hash` ([`crate::branch::filter::hash`]), applied now
+    /// (true) or left unapplied when it would wait (false): its caller hashes the key once, and
+    /// each attempt takes that hash.
+    pub(crate) fn put_paced(
+        &mut self,
+        key: &[u8],
+        hash: u64,
+        value: &[u8],
+        keys: u64,
+    ) -> Result<bool, Error> {
+        self.apply_paced(key, hash, Op::Put, value, keys)
     }
 
-    pub(crate) fn delete_paced(&mut self, key: &[u8], keys: u64) -> Result<bool, Error> {
-        self.apply_paced(key, Op::Delete, &[], keys)
+    /// [`Self::put_paced`] for a deletion.
+    pub(crate) fn delete_paced(&mut self, key: &[u8], hash: u64, keys: u64) -> Result<bool, Error> {
+        self.apply_paced(key, hash, Op::Delete, &[], keys)
     }
 
     /// Records `key` holding `value`.
@@ -1978,20 +1997,24 @@ impl<F: BlockFile> ShardDb<F> {
     /// The value `key` holds, into `value`; false when it holds none.
     pub fn get(&mut self, key: &[u8], value: &mut Vec<u8>) -> Result<bool, Error> {
         self.count_get();
-        self.lookup(key, value)
+        // The key's filter hash, once for the memtables and every branch on its path.
+        let hash = crate::branch::filter::hash(key);
+        self.lookup(key, hash, value)
     }
 
-    /// [`Self::get`] made only if it can finish without waiting for the device or for a write
-    /// still out over a page it needs: `Some` of its answer, or `None` when a page it needs is
-    /// not in memory now, with `value` left empty, for the caller to take the paced path
-    /// ([`Self::get_async`]), which counts the get.
+    /// [`Self::get`] of a key of filter hash `hash`, made only if it can finish without waiting
+    /// for the device or for a write still out over a page it needs: `Some` of its answer, or
+    /// `None` when a page it needs is not in memory now, with `value` left empty, for the
+    /// caller to take the paced path ([`Self::get_async`]) with the same hash, which counts the
+    /// get.
     pub(crate) fn get_now(
         &mut self,
         key: &[u8],
+        hash: u64,
         value: &mut Vec<u8>,
     ) -> Result<Option<bool>, Error> {
         self.store.begin_no_wait();
-        let found = self.lookup(key, value);
+        let found = self.lookup(key, hash, value);
         let refused = self.store.end_no_wait();
         match found {
             Ok(found) => {
@@ -2035,9 +2058,8 @@ impl<F: BlockFile> ShardDb<F> {
         }
     }
 
-    fn lookup(&mut self, key: &[u8], value: &mut Vec<u8>) -> Result<bool, Error> {
-        // The key's filter hash, once for the memtables and every branch on its path.
-        let hash = crate::branch::filter::hash(key);
+    /// The get of `key`, of filter hash `hash`, for the memtables and every branch on its path.
+    fn lookup(&mut self, key: &[u8], hash: u64, value: &mut Vec<u8>) -> Result<bool, Error> {
         let mut found = self.mem.get_hashed(key, hash, value)?;
         if found.is_none()
             && let Some(p) = &self.packing
@@ -2104,17 +2126,17 @@ impl<F: BlockFile> ShardDb<F> {
         Ok(found == Some(Op::Put))
     }
 
-    /// A runtime lookup keeps its source borrows until the owned request is answered.
-    /// Memtable and record hits complete immediately; device demand reads yield.
+    /// A runtime lookup of a key of filter hash `hash` keeps its source borrows until the owned
+    /// request is answered. Memtable and record hits complete immediately; device demand reads
+    /// yield.
     pub(crate) async fn get_async(
         &mut self,
         key: &[u8],
+        hash: u64,
         value: &mut Vec<u8>,
     ) -> Result<bool, Error> {
         self.require_async_backend()?;
         self.count_get();
-        // The key's filter hash, once for the memtables and every branch on its path.
-        let hash = crate::branch::filter::hash(key);
         let mut found = self.mem.get_hashed(key, hash, value)?;
         if found.is_none()
             && let Some(p) = &self.packing
@@ -4521,6 +4543,7 @@ impl<F: BlockFile> ShardDb<F> {
             flush.record_held = as_u64(r.held_bytes());
             flush.record_bytes = as_u64(r.bytes());
         }
+        flush.cycle_written = as_u64(self.cycle_written);
         flush.kept = as_u64(self.kept.len());
         flush.kept_bytes = as_u64(self.kept_held());
         flush.kept_hits = self.kept_hits;

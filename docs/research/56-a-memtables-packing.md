@@ -10,7 +10,9 @@ Sources.
   one) packed into a store on a buffered file, round after round, wall nanoseconds an entry;
   `prof/packing-base-1*` and `prof/packing-trielvl*` the same under `perf record`.
 - **[gate]** runs `n10000000-r541..543` and `n100000000-r541..543`: the full bench (`inside3.sh`'s
-  mantle arms) beside main, RocksDB and SplinterDB, three quiet rounds interleaved.
+  mantle arms) beside main, RocksDB and SplinterDB, three quiet rounds interleaved; and
+  `n100000000-r551..553`, the same with the trie change (`e3a5c76`) and §4's (`a5a0a55`) as
+  arms, every run's recovery verified exact.
 - Zhang et al., "SuRF: Practical Range Query Filtering with Fast Succinct Tries", SIGMOD 2018: a
   range filter keeps each key cut one byte past what it shares with either neighbour.
 
@@ -65,3 +67,35 @@ entries were written, and the walk hashes nothing. A key written twice is listed
 entry after; the index keeps the last entry it is given for a hash, so it holds each key's
 newest, as the walk's list in key order gave it. The kept memtable's key count is the memtable's
 own, each key once.
+
+## 5. The put's hash in its entry
+
+§4's list still left two costs: the memtable's index, growing, hashed every key it moved to its
+larger table, and the list held every entry the memtable had, an overwritten key's more than
+once, so the index over kept memtables took more entries than keys (its bytes at 100M 19.28 GiB
+where the trie change's were 18.17 GiB [gate]). A put's paced attempts each hashed
+the key again, as did a get refused its inline attempt and queued.
+
+A memtable entry now holds the whole 64-bit hash its put computed, after its lengths:
+operation, key length, value length, hash (8 bytes), key, value. Everything that reads the entry
+later takes the hash from it:
+- the index, growing, moves each entry by its stored hash;
+- the packing's sort keys each entry by the stored hash's high 32 bits, its records still 16
+  bytes;
+- the walk, over the sort's survivors (each key's newest entry, whole keys compared), lists
+  each key once, in key order, with its stored hash: the index over kept memtables takes one
+  entry a key.
+
+A client hashes a put, a deletion or a get once, and its request carries the hash from the
+inline attempt to the range's queue and through every attempt a paced put makes.
+
+Two keys of one whole hash stay two entries of the memtable and two of the walk's list; the index
+over kept memtables holds the later one's entry for the hash, and a get of the other finds a key
+not its own there and reads the trunk. The engine's tests drive this with two 16-byte keys of one
+xxh3-64 hash, and grow a memtable's index with entries stored under hashes not their keys' own,
+which a move that hashed the key again would lose.
+
+The cost is 8 bytes an entry: an entry of a 16-byte key and a 100-byte value takes 127 bytes of
+the arena where it took 119, so a memtable of a fixed size holds 6.3% fewer entries and rotates
+6.7% more often, and a kept memtable holds 6.3% fewer keys in the same bytes. Whether the hashes
+saved pay for that is the full bench's to decide, beside §4's arm and its bases.

@@ -640,11 +640,13 @@ fn the_write_budget_is_the_last_cycles_writes_within_the_owners_cap() {
     let file = SimFile::new(align, Alignment::new(512).unwrap(), 29).unwrap();
     let mut db = ShardDb::create(file, STORE, MEM, TRUNK).unwrap();
     let run = STORE.page_size * STORE.extent_pages as usize;
+    // The pages written as the last rotating put began and as it ended: the shard's cycle starts
+    // at its re-budget, inside that put, and its first at the store's first page.
+    let (mut last_before, mut last_after) = (0, 0);
     for cap in [1_000 * run, 3 * run] {
         db.set_write_budget(cap).unwrap();
         let mut rotations = 0;
         let mut rotated = db.stats().0.rotations;
-        let mut cycle_start = db.stats().2.pages_written;
         let mut x = 0x1234_5678_9abc_def0u64;
         while rotations < 6 {
             x ^= x << 13;
@@ -652,22 +654,34 @@ fn the_write_budget_is_the_last_cycles_writes_within_the_owners_cap() {
             x ^= x << 17;
             let before = db.stats().2.pages_written;
             db.put(&key(x % KEYS), b"value").unwrap();
-            let r = db.stats().0.rotations;
-            if r != rotated {
-                // A rotation set the budget from the cycle that ended as this put began.
-                let written = usize::try_from(before - cycle_start).unwrap() * STORE.page_size;
+            let after = db.stats().2.pages_written;
+            let (flush, _, _) = db.stats();
+            if flush.rotations != rotated {
+                // The cycle the rotation measured lies between the two puts that rotated: no
+                // more than from the last one's start to this one's end, no less than from the
+                // last one's end to this one's start.
+                let cycle = usize::try_from(flush.cycle_written).unwrap();
+                let pages = |n: u64| usize::try_from(n).unwrap() * STORE.page_size;
+                assert!(
+                    cycle <= pages(after - last_before),
+                    "cap {cap}: cycle {cycle} past {} written",
+                    pages(after - last_before)
+                );
+                assert!(
+                    cycle >= pages(before - last_after),
+                    "cap {cap}: cycle {cycle} short of {} written",
+                    pages(before - last_after)
+                );
+                // The budget is that cycle's writes within the cap, whole runs of them.
                 let budget = db.write_budget();
-                assert!(budget <= cap, "cap {cap}: budget {budget}");
-                assert!(
-                    budget <= written,
-                    "cap {cap}: budget {budget} past {written} written"
+                assert_eq!(
+                    budget,
+                    cycle.min(cap) / run * run,
+                    "cap {cap}: cycle {cycle}"
                 );
-                assert!(
-                    budget + run > written.min(cap),
-                    "cap {cap}: budget {budget} for {written}"
-                );
-                cycle_start = before;
-                rotated = r;
+                last_before = before;
+                last_after = after;
+                rotated = flush.rotations;
                 rotations += 1;
             }
         }

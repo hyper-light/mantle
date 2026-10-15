@@ -1,9 +1,11 @@
 //! A shard's memtable (docs/design/engine-structure.md §8, step E3), keeping order only when
 //! order is asked for.
 //!
-//! Every entry is appended to one byte arena (operation, key length, value length, key, value),
-//! as the B-tree memtable kept them, and a hash index maps each key's hash to its newest entry:
-//! an insert is an append and an index write, and a get one index lookup. Nothing is sorted as
+//! Every entry is appended to one byte arena (operation, key length, value length, the key's
+//! 64-bit filter hash as its put computed it, key, value), and a hash index maps each key's hash
+//! to its newest entry: an insert is an append and an index write, and a get one index lookup.
+//! What reads an entry later takes its hash from it, never hashing the key again: the index as it
+//! grows, the packing's sort and its list for the index over kept memtables. Nothing is sorted as
 //! entries arrive (RocksDB's vector memtable defers its sort the same way; FloDB, Balmau et al.,
 //! EuroSys '17, puts a hash table in front of its ordered memtable for the same reason).
 //!
@@ -40,10 +42,15 @@ use crate::memtable::index::KeyIndex;
 use crate::util::coding::{get_varint32_ptr, put_varint32s};
 use std::cmp::Ordering;
 
-/// The most bytes an entry's head takes in the arena: the operation (1), then the key's and the
+/// The bytes of a key's filter hash an entry holds after its lengths: the hash its put computed,
+/// kept so nothing that reads the entry hashes the key again (the index's growth, the packing's
+/// sort and its list for the index over kept memtables).
+const ENTRY_HASH: usize = 8;
+
+/// The most bytes an entry's head takes in the arena: the operation (1), the key's and the
 /// value's lengths as varints of at most 3 and 5 bytes (a key is below 64 KiB, a value below
-/// 4 GiB).
-const ENTRY_HEAD_MAX: usize = 9;
+/// 4 GiB), then the key's filter hash.
+const ENTRY_HEAD_MAX: usize = 9 + ENTRY_HASH;
 
 fn corrupt() -> Error {
     Error::Corruption {
@@ -190,8 +197,9 @@ impl Sort {
     }
 }
 
-/// An entry's operation byte, key and value lengths, and where its key starts in `arena`.
-fn parse(arena: &[u8], entry: u32) -> Option<(u8, usize, usize, usize)> {
+/// An entry's operation byte, key and value lengths, its key's filter hash, and where its key
+/// starts in `arena`.
+fn parse(arena: &[u8], entry: u32) -> Option<(u8, usize, usize, u64, usize)> {
     let at = usize::try_from(entry).ok()?;
     let op = *arena.get(at)?;
     let mut pos = at.checked_add(1)?;
@@ -199,20 +207,24 @@ fn parse(arena: &[u8], entry: u32) -> Option<(u8, usize, usize, usize)> {
     pos = pos.checked_add(used)?;
     let (vlen, used) = get_varint32_ptr(arena.get(pos..)?).ok()?;
     pos = pos.checked_add(used)?;
+    let hash = u64::from_le_bytes(*arena.get(pos..)?.first_chunk::<ENTRY_HASH>()?);
+    pos = pos.checked_add(ENTRY_HASH)?;
     Some((
         op,
         usize::try_from(klen).ok()?,
         usize::try_from(vlen).ok()?,
+        hash,
         pos,
     ))
 }
 
-/// An entry's key, operation and value, and where the next entry starts.
-type EntryAt<'a> = (&'a [u8], Op, &'a [u8], usize);
+/// An entry's key, operation, value and key's filter hash, and where the next entry starts.
+type EntryAt<'a> = (&'a [u8], Op, &'a [u8], u64, usize);
 
-/// An entry's key, operation and value in `arena`, and where the next entry starts.
+/// An entry's key, operation, value and key's filter hash in `arena`, and where the next entry
+/// starts.
 fn read_at(arena: &[u8], entry: u32) -> Result<EntryAt<'_>, Error> {
-    let (op, klen, vlen, start) = parse(arena, entry).ok_or(corrupt())?;
+    let (op, klen, vlen, hash, start) = parse(arena, entry).ok_or(corrupt())?;
     let op = match op {
         1 => Op::Put,
         2 => Op::Delete,
@@ -222,19 +234,33 @@ fn read_at(arena: &[u8], entry: u32) -> Result<EntryAt<'_>, Error> {
     let end = mid.checked_add(vlen).ok_or(corrupt())?;
     let key = arena.get(start..mid).ok_or(corrupt())?;
     let value = arena.get(mid..end).ok_or(corrupt())?;
-    Ok((key, op, value, end))
+    Ok((key, op, value, hash, end))
 }
 
 /// An entry's key, operation and value in `arena`.
 fn read(arena: &[u8], entry: u32) -> Result<(&[u8], Op, &[u8]), Error> {
-    read_at(arena, entry).map(|(key, op, value, _)| (key, op, value))
+    read_at(arena, entry).map(|(key, op, value, _, _)| (key, op, value))
+}
+
+/// An entry's key, operation, value and key's filter hash.
+type Hashed<'a> = (&'a [u8], Op, &'a [u8], u64);
+
+/// An entry's key, operation, value and key's filter hash in `arena`.
+fn read_hashed(arena: &[u8], entry: u32) -> Result<Hashed<'_>, Error> {
+    read_at(arena, entry).map(|(key, op, value, hash, _)| (key, op, value, hash))
 }
 
 /// An entry's key in `arena`.
 fn key(arena: &[u8], entry: u32) -> &[u8] {
     parse(arena, entry)
-        .and_then(|(_, klen, _, start)| arena.get(start..start.checked_add(klen)?))
+        .and_then(|(_, klen, _, _, start)| arena.get(start..start.checked_add(klen)?))
         .unwrap_or(&[])
+}
+
+/// An entry's key's filter hash in `arena`, as its put computed it; none for an offset that
+/// starts no entry.
+fn stored_hash(arena: &[u8], entry: u32) -> Option<u64> {
+    parse(arena, entry).map(|(_, _, _, hash, _)| hash)
 }
 
 /// `a`, of a run at skip `sa`, against `b`, of a run at `sb`, by key: by their prefixes when
@@ -274,37 +300,24 @@ pub struct Sorter {
 impl Sorter {
     /// Sorts the entries of `arena`, a memtable's arena as written, every key of which shares its
     /// first `skip` bytes with the first: the entries left once the newest of each key is kept.
-    /// Each key is hashed once, as its entry is keyed: the hash's high bits key the entry for its
-    /// branch's filter, and the whole hash goes into `list` with the entry's offset, in the order
-    /// the entries were written, for the index over kept memtables (`crate::kept`). A key written
-    /// twice is listed twice, its newer entry after: the index keeps the last it is given.
-    pub fn sort(
-        &mut self,
-        arena: &[u8],
-        skip: usize,
-        list: &mut crate::kept::KeyList,
-    ) -> Result<usize, Error> {
+    /// No key is hashed here: each entry holds the hash its put computed.
+    pub fn sort(&mut self, arena: &[u8], skip: usize) -> Result<usize, Error> {
         let too_large = || Error::LimitExceeded {
             what: "entries of a memtable's sort",
             limit: u64::try_from(arena.len()).unwrap_or(u64::MAX),
         };
         let mut src = std::mem::take(&mut self.keyed);
         src.clear();
-        list.clear();
         let mut at = 0usize;
         while at < arena.len() {
             let entry = u32::try_from(at).map_err(|_| corrupt())?;
-            let (key, _, _, end) = read_at(arena, entry)?;
-            let h = hash(key);
+            let (key, _, _, h, end) = read_at(arena, entry)?;
             src.try_reserve(1).map_err(|_| too_large())?;
-            list.hashes.try_reserve(1).map_err(|_| too_large())?;
-            list.offsets.try_reserve(1).map_err(|_| too_large())?;
             src.push(Keyed {
                 prefix: prefix(key, skip),
                 entry,
                 hash32: crate::branch::filter::hash32(h),
             });
-            list.push(h, entry);
             at = end;
         }
         let n = src.len();
@@ -356,15 +369,16 @@ impl Sorter {
             .partition_point(|k| self::key(arena, k.entry) < key)
     }
 
-    /// [`Self::each`] with each entry's arena offset: `each(key, op, value, hash, offset)`.
+    /// Each entry the last sort kept, in key order, with its key's whole filter hash as its put
+    /// computed it and its arena offset: `each(key, op, value, hash, offset)`.
     pub fn each_at(
         &self,
         arena: &[u8],
-        mut each: impl FnMut(&[u8], Op, &[u8], u32, u32) -> Result<(), Error>,
+        mut each: impl FnMut(&[u8], Op, &[u8], u64, u32) -> Result<(), Error>,
     ) -> Result<(), Error> {
         for k in &self.keyed {
-            let (key, op, value) = read(arena, k.entry)?;
-            each(key, op, value, k.hash32, k.entry)?;
+            let (key, op, value, hash) = read_hashed(arena, k.entry)?;
+            each(key, op, value, hash, k.entry)?;
         }
         Ok(())
     }
@@ -980,12 +994,13 @@ impl HashMem {
     pub fn key_list(&self, list: &mut crate::kept::KeyList) -> Result<(), Error> {
         list.clear();
         let mut failed = None;
-        self.index.each_entry(|e| match self.read(e) {
-            Ok((k, _, _)) => list.push(hash(k), e),
-            Err(error) => {
-                failed.get_or_insert(error);
-            }
-        });
+        self.index
+            .each_entry(|e| match read_hashed(&self.arena, e) {
+                Ok((_, _, _, h)) => list.push(h, e),
+                Err(error) => {
+                    failed.get_or_insert(error);
+                }
+            });
         failed.map_or(Ok(()), Err)
     }
 
@@ -1043,6 +1058,12 @@ impl HashMem {
             });
         }
         let entry = u32::try_from(self.arena.len()).map_err(|_| corrupt())?;
+        // The index readied first, the only step that can fail (an entry whose stored hash
+        // cannot be read): a refused insert has written nothing, the arena, its copy and every
+        // count as they were, so no later read or packing meets it. Its growth moves entries by
+        // their stored hashes; none is hashed again.
+        let arena = &self.arena;
+        self.index.prepare(|e| stored_hash(arena, e))?;
         if entry == 0 {
             self.first.clear();
             self.first.extend_from_slice(key);
@@ -1072,6 +1093,7 @@ impl HashMem {
             Op::Delete => 2,
         };
         put_varint32s(&mut self.arena, &[code, u32::from(klen), vlen]);
+        self.arena.extend_from_slice(&h.to_le_bytes());
         self.arena.extend_from_slice(key);
         self.arena.extend_from_slice(value);
         self.longest_key = self.longest_key.max(key.len());
@@ -1090,12 +1112,7 @@ impl HashMem {
             }
         }
         let arena = &self.arena;
-        let replaced = self.index.put(
-            h,
-            entry,
-            |e| self::key(arena, e) == key,
-            |e| hash(self::key(arena, e)),
-        );
+        let replaced = self.index.insert(h, entry, |e| self::key(arena, e) == key);
         if replaced.is_none() {
             self.len = self.len.saturating_add(1);
         }
@@ -2761,31 +2778,57 @@ mod tests {
         ) {
             let mut m = HashMem::new(1 << 24).unwrap();
             m.mirror_into(Vec::new()).unwrap();
+            // Each key's newest operation and value, by its whole key.
+            let mut newest: std::collections::BTreeMap<Vec<u8>, (Op, Vec<u8>)> =
+                std::collections::BTreeMap::new();
             for (suffix, put, v, cut) in &ops {
                 let mut k = vec![9u8; if *cut < 12 { shared.min(*cut) } else { shared }];
                 k.extend_from_slice(suffix);
                 let op = if *put { Op::Put } else { Op::Delete };
                 let v = if *put { v.clone() } else { Vec::new() };
                 m.insert(&k, op, &v).unwrap();
+                newest.insert(k, (op, v));
             }
             let skip = m.skip();
             let arena = m.take_mirror().unwrap();
             proptest::prop_assert_eq!(&arena, &m.arena);
             proptest::prop_assert!(!m.mirrored());
+            // Every entry holds the hash its put computed: the key's canonical one.
+            let mut at = 0usize;
+            while at < arena.len() {
+                let (k, _, _, h, end) = read_at(&arena, u32::try_from(at).unwrap()).unwrap();
+                proptest::prop_assert_eq!(h, hash(k));
+                at = end;
+            }
             let mut sorter = Sorter::default();
-            let mut list = crate::kept::KeyList::default();
-            proptest::prop_assert_eq!(sorter.sort(&arena, skip, &mut list).unwrap(), m.len());
-            // Every entry listed in the order written: taken in order, the last listed of each
-            // hash is the key's newest entry, as the memtable's own index holds it.
-            let mut listed = std::collections::HashMap::new();
-            for (&h, &offset) in list.hashes.iter().zip(&list.offsets) {
-                listed.insert(h, offset);
+            proptest::prop_assert_eq!(sorter.sort(&arena, skip).unwrap(), m.len());
+            // The walk's list for the index over kept memtables: one entry a key, in key order,
+            // each the key's newest by its whole key (its tombstone, if a delete was newest),
+            // with the hash its put computed; the same entries, offset for offset, as the
+            // memtable's own index names.
+            let mut listed = Vec::new();
+            sorter.each_at(&arena, |k, op, v, h, offset| {
+                listed.push((k.to_vec(), op, v.to_vec(), h, offset));
+                Ok(())
+            }).unwrap();
+            let expect: Vec<(Vec<u8>, Op, Vec<u8>)> =
+                newest.iter().map(|(k, (op, v))| (k.clone(), *op, v.clone())).collect();
+            let got: Vec<(Vec<u8>, Op, Vec<u8>)> =
+                listed.iter().map(|(k, op, v, _, _)| (k.clone(), *op, v.clone())).collect();
+            proptest::prop_assert_eq!(&got, &expect);
+            for (k, op, v, h, offset) in &listed {
+                proptest::prop_assert_eq!(*h, hash(k));
+                let (kk, oo, vv) = read(&arena, *offset).unwrap();
+                proptest::prop_assert_eq!((kk, oo, vv), (k.as_slice(), *op, v.as_slice()));
             }
             let mut own = crate::kept::KeyList::default();
             m.key_list(&mut own).unwrap();
-            let own: std::collections::HashMap<u64, u32> =
+            let mut own: Vec<(u64, u32)> =
                 own.hashes.iter().copied().zip(own.offsets.iter().copied()).collect();
-            proptest::prop_assert_eq!(&listed, &own);
+            own.sort_unstable();
+            let mut pairs: Vec<(u64, u32)> = listed.iter().map(|(_, _, _, h, o)| (*h, *o)).collect();
+            pairs.sort_unstable();
+            proptest::prop_assert_eq!(&pairs, &own);
             let mut sorted = Vec::new();
             sorter.each(&arena, |k, op, v, h| {
                 sorted.push((k.to_vec(), op, v.to_vec(), h));
@@ -2803,8 +2846,227 @@ mod tests {
                 proptest::prop_assert_eq!(*h, crate::branch::filter::hash32(hash(k)));
             }
             // The sorter's buffers serve the next arena as they are.
-            proptest::prop_assert_eq!(sorter.sort(&arena, skip, &mut list).unwrap(), m.len());
+            proptest::prop_assert_eq!(sorter.sort(&arena, skip).unwrap(), m.len());
         }
+    }
+
+    /// Two keys of one whole hash, as a put given it would hold them: two entries, each found by
+    /// its own key, each its own newest through the packing's sort and walk, both listed with
+    /// the hash for the index over kept memtables (whose probe checks the key it finds).
+    #[test]
+    fn two_keys_of_one_hash_are_two_entries_through_the_walk_and_its_list() {
+        let mut m = HashMem::new(1 << 20).unwrap();
+        m.mirror_into(Vec::new()).unwrap();
+        let h = 0x1234_5678_9abc_def0u64;
+        m.insert_hashed(b"apple", h, Op::Put, b"1").unwrap();
+        m.insert_hashed(b"berry", h, Op::Put, b"2").unwrap();
+        m.insert_hashed(b"apple", h, Op::Delete, b"").unwrap();
+        m.insert_hashed(b"cherry", 7, Op::Put, b"3").unwrap();
+        let mut v = Vec::new();
+        assert_eq!(m.get_hashed(b"apple", h, &mut v).unwrap(), Some(Op::Delete));
+        assert_eq!(m.get_hashed(b"berry", h, &mut v).unwrap(), Some(Op::Put));
+        assert_eq!(v, b"2");
+        let skip = m.skip();
+        let arena = m.take_mirror().unwrap();
+        let mut sorter = Sorter::default();
+        assert_eq!(sorter.sort(&arena, skip).unwrap(), 3);
+        let mut listed = Vec::new();
+        sorter
+            .each_at(&arena, |k, op, v, hh, _| {
+                listed.push((k.to_vec(), op, v.to_vec(), hh));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            listed,
+            vec![
+                (b"apple".to_vec(), Op::Delete, Vec::new(), h),
+                (b"berry".to_vec(), Op::Put, b"2".to_vec(), h),
+                (b"cherry".to_vec(), Op::Put, b"3".to_vec(), 7),
+            ]
+        );
+    }
+
+    /// The index grows through many migrations while keys are written again and deleted, one
+    /// key in seven of a single shared hash and every other of a hash its put gave it that is not
+    /// the key's own: each entry moves by the hash read back from the arena, where a move that
+    /// hashed its key again would lose it. Gets read each key's newest exactly throughout, and
+    /// once filled the packing's walk and its list hold each key's newest once, in key order,
+    /// with its put's hash, offset for offset the entries the memtable's own index names.
+    #[test]
+    fn a_growing_index_moves_entries_by_their_stored_hash_and_answers_exactly() {
+        let mut m = HashMem::new(1 << 24).unwrap();
+        m.mirror_into(Vec::new()).unwrap();
+        let key_of = |k: u64| format!("key{k:05}").into_bytes();
+        let given = |k: u64| {
+            if k.is_multiple_of(7) {
+                42
+            } else {
+                hash(&key_of(k)).rotate_left(17) ^ 0x5bd1_e995
+            }
+        };
+        let mut newest: std::collections::BTreeMap<Vec<u8>, (Op, Vec<u8>, u64)> =
+            std::collections::BTreeMap::new();
+        let mut v = Vec::new();
+        let mut sizes = std::collections::BTreeSet::new();
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for i in 0..40_000u64 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let k = x % 4000;
+            let (op, value) = if x.is_multiple_of(5) {
+                (Op::Delete, Vec::new())
+            } else {
+                (
+                    Op::Put,
+                    i.to_le_bytes()[..usize::try_from(x % 9).unwrap()].to_vec(),
+                )
+            };
+            m.insert_hashed(&key_of(k), given(k), op, &value).unwrap();
+            newest.insert(key_of(k), (op, value, given(k)));
+            sizes.insert(m.index.bytes());
+            // A key read back while its entry may be in either table of a migration.
+            let probe = (x >> 20) % 4000;
+            let got = m.get_hashed(&key_of(probe), given(probe), &mut v).unwrap();
+            match newest.get(&key_of(probe)) {
+                Some((op, value, _)) => {
+                    assert_eq!(got, Some(*op), "key {probe} at {i}");
+                    if *op == Op::Put {
+                        assert_eq!(&v, value, "key {probe} at {i}");
+                    }
+                }
+                None => assert_eq!(got, None, "key {probe} at {i}"),
+            }
+        }
+        assert!(sizes.len() >= 8, "the index grew {} times", sizes.len());
+        for (k, (op, value, h)) in &newest {
+            assert_eq!(m.get_hashed(k, *h, &mut v).unwrap(), Some(*op));
+            if *op == Op::Put {
+                assert_eq!(&v, value);
+            }
+        }
+        let skip = m.skip();
+        let arena = m.take_mirror().unwrap();
+        let mut sorter = Sorter::default();
+        assert_eq!(sorter.sort(&arena, skip).unwrap(), newest.len());
+        let mut listed = Vec::new();
+        sorter
+            .each_at(&arena, |k, op, v, h, offset| {
+                listed.push((k.to_vec(), op, v.to_vec(), h, offset));
+                Ok(())
+            })
+            .unwrap();
+        let expect: Vec<_> = newest
+            .iter()
+            .map(|(k, (op, v, h))| (k.clone(), *op, v.clone(), *h))
+            .collect();
+        let got: Vec<_> = listed
+            .iter()
+            .map(|(k, op, v, h, _)| (k.clone(), *op, v.clone(), *h))
+            .collect();
+        assert_eq!(got, expect);
+        let mut own = crate::kept::KeyList::default();
+        m.key_list(&mut own).unwrap();
+        let mut own: Vec<(u64, u32)> = own.hashes.iter().copied().zip(own.offsets).collect();
+        own.sort_unstable();
+        let mut pairs: Vec<(u64, u32)> = listed.iter().map(|(_, _, _, h, o)| (*h, *o)).collect();
+        pairs.sort_unstable();
+        assert_eq!(pairs, own);
+    }
+
+    /// An insert whose index growth meets an entry it cannot read is refused whole: nothing of
+    /// it is written (the arena, its copy, the count and the tail as they were), and every entry
+    /// put before it still reads back.
+    #[test]
+    fn an_insert_refused_by_its_index_writes_nothing() {
+        let mut m = HashMem::new(1 << 22).unwrap();
+        m.mirror_into(Vec::new()).unwrap();
+        m.insert(b"k00000", Op::Put, b"v").unwrap();
+        // Entry 0's key length made a varint that never ends, as a corrupted arena would hold
+        // it: its stored hash can no longer be read.
+        for b in m.arena.get_mut(1..6).unwrap() {
+            *b = 0xff;
+        }
+        let mut refused = false;
+        for i in 1..100_000u32 {
+            let k = format!("k{i:05}").into_bytes();
+            let (arena, mirror, len, tail) = (m.arena.len(), m.mirror.len(), m.len(), m.tail.len());
+            match m.insert(&k, Op::Put, &i.to_le_bytes()) {
+                Ok(()) => {}
+                Err(error) => {
+                    assert!(matches!(error, Error::Corruption { .. }), "{error:?}");
+                    assert_eq!(
+                        (m.arena.len(), m.mirror.len(), m.len(), m.tail.len()),
+                        (arena, mirror, len, tail)
+                    );
+                    let mut v = Vec::new();
+                    assert_eq!(m.get(&k, &mut v).unwrap(), None);
+                    for j in 1..i {
+                        let k = format!("k{j:05}").into_bytes();
+                        assert_eq!(m.get(&k, &mut v).unwrap(), Some(Op::Put), "key {j}");
+                        assert_eq!(v, j.to_le_bytes());
+                    }
+                    refused = true;
+                    break;
+                }
+            }
+        }
+        assert!(refused, "no growth of the index moved entry 0");
+    }
+
+    /// A memtable at its bound refuses the entry that would pass it, its stored hash counted, and
+    /// keeps every entry before it: each key's newest value or tombstone reads back, its copy is
+    /// whole, and the packing's sort and walk give each key's newest with the hash its put
+    /// computed.
+    #[test]
+    fn a_full_memtable_refuses_the_entry_past_its_bound_and_keeps_every_other() {
+        let limit = 4096;
+        let mut m = HashMem::new(limit).unwrap();
+        m.mirror_into(Vec::new()).unwrap();
+        let mut newest: std::collections::BTreeMap<Vec<u8>, (Op, Vec<u8>)> =
+            std::collections::BTreeMap::new();
+        let mut i = 0u32;
+        loop {
+            let k = format!("key{:05}", i % 40).into_bytes();
+            let (op, v) = if i.is_multiple_of(7) {
+                (Op::Delete, Vec::new())
+            } else {
+                (Op::Put, format!("value{i}").into_bytes())
+            };
+            match m.insert(&k, op, &v) {
+                Ok(()) => {
+                    newest.insert(k, (op, v));
+                }
+                Err(Error::LimitExceeded { .. }) => break,
+                Err(error) => panic!("{error:?}"),
+            }
+            i += 1;
+        }
+        assert!(m.bytes() <= limit, "{} past {limit}", m.bytes());
+        let mut got = Vec::new();
+        for (k, (op, v)) in &newest {
+            assert_eq!(m.get(k, &mut got).unwrap(), Some(*op));
+            if *op == Op::Put {
+                assert_eq!(&got, v);
+            }
+        }
+        let skip = m.skip();
+        let arena = m.take_mirror().unwrap();
+        assert_eq!(arena, m.arena);
+        let mut sorter = Sorter::default();
+        assert_eq!(sorter.sort(&arena, skip).unwrap(), newest.len());
+        let mut walked = Vec::new();
+        sorter
+            .each_at(&arena, |k, op, v, h, _| {
+                assert_eq!(h, hash(k));
+                walked.push((k.to_vec(), op, v.to_vec()));
+                Ok(())
+            })
+            .unwrap();
+        let expect: Vec<(Vec<u8>, Op, Vec<u8>)> =
+            newest.into_iter().map(|(k, (op, v))| (k, op, v)).collect();
+        assert_eq!(walked, expect);
     }
 
     #[test]

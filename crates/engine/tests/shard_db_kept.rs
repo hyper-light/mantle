@@ -223,6 +223,127 @@ fn kept_memtables_answer_gets_through_one_index_and_every_read_is_exact() {
     db.check_references().unwrap();
 }
 
+/// Two keys of one 64-bit filter hash (xxh3-64, [`mantle_engine::branch::filter::hash`]). `B`
+/// is any 16 bytes. `A` is built on xxh3's 9-to-16-byte path (`XXH3_len_9to16_64b`), whose
+/// accumulator is `len + swap(lo) + hi + fold(lo * hi)` over the input's two words, each XORed
+/// with a word of the secret: `A`'s first word is that secret word, so `lo` and the product are
+/// zero and the accumulator is `16 + hi`, with `hi` chosen as `B`'s accumulator less 16.
+const COLLIDES_A: [u8; 16] = [
+    0xb9, 0x39, 0x42, 0xea, 0x7b, 0x73, 0x82, 0x67, 0x3d, 0x17, 0x80, 0x93, 0xc1, 0x2c, 0xa3, 0xf3,
+];
+const COLLIDES_B: [u8; 16] = *b"mantle-collide-B";
+
+/// A step's writes to the colliding keys: which (0 for `A`, 1 for `B`) and its value, none for a
+/// deletion.
+type Writes<'a> = &'a [(usize, Option<&'a [u8]>)];
+
+/// Reads both colliding keys: each exactly what was last written to it.
+fn check_pair(db: &mut ShardDb<DeviceFile>, held: &[Option<&[u8]>; 2], when: &str) {
+    let mut value = Vec::new();
+    for (key, want) in [COLLIDES_A, COLLIDES_B].iter().zip(held) {
+        let found = db.get(key, &mut value).unwrap();
+        match want {
+            Some(v) => {
+                assert!(found, "{when}: {key:02x?} lost");
+                assert_eq!(&value, v, "{when}: {key:02x?}");
+            }
+            None => assert!(!found, "{when}: {key:02x?} reads a value it does not hold"),
+        }
+    }
+}
+
+/// Two keys of one full hash share the kept index's entry: the one the index holds is answered
+/// from its kept memtable, and a get of the other finds a key not its own there and reads the
+/// trunk. Each key reads exactly what was last written to it, in kept memtables of their own or
+/// one together, overwritten and deleted, before and after the index covers them, once their
+/// memtables are given back (through the record cache, also keyed by the hash) and reopened.
+#[test]
+fn two_keys_of_one_hash_read_exactly_through_the_kept_index() {
+    use mantle_engine::branch::filter::hash;
+    assert_ne!(COLLIDES_A, COLLIDES_B);
+    assert_eq!(
+        hash(&COLLIDES_A),
+        hash(&COLLIDES_B),
+        "the two keys no longer share a hash"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let mut db = ShardDb::create(open(&path, true), STORE, MEM, TRUNK).unwrap();
+    db.set_memory(BUDGET).unwrap();
+    workers(&mut db, &path);
+    let mut oracle = Oracle::new();
+    let mut held: [Option<&[u8]>; 2] = [None, None];
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    // Each step's writes, then its memtable rotated, and both keys read: while the index is
+    // out, then with every kept memtable covered and none of their memtables anywhere else.
+    let steps: [Writes; 5] = [
+        // Each key in a memtable of its own, the newer holding the index's entry.
+        &[(0, Some(b"a1"))],
+        &[(1, Some(b"b1"))],
+        // A overwritten, then deleted: the index's entry is A's, and B's get reads the trunk.
+        &[(0, Some(b"a2"))],
+        &[(0, None)],
+        // Both in one memtable: B sorts first, so the index takes A's entry, listed after it.
+        &[(1, Some(b"b2")), (0, Some(b"a3"))],
+    ];
+    let mut kept_hits = db.stats().0.kept_hits;
+    for (step, writes) in steps.iter().enumerate() {
+        for &(which, value) in *writes {
+            let key = [COLLIDES_A, COLLIDES_B][which];
+            match value {
+                Some(v) => db.put(&key, v).unwrap(),
+                None => db.delete(&key).unwrap(),
+            }
+            held[which] = value;
+        }
+        x = fill(&mut db, &mut oracle, x, 1);
+        check_pair(&mut db, &held, &format!("step {step}, index out"));
+        db.flush().unwrap();
+        settle(&mut db);
+        let kept = db.stats().0;
+        assert!(
+            kept.kept > u64::try_from(step).unwrap(),
+            "step {step}: too few memtables kept: {kept:?}"
+        );
+        assert_eq!(
+            kept.kept_covered, kept.kept,
+            "step {step}: the index does not cover every kept memtable: {kept:?}"
+        );
+        check_pair(&mut db, &held, &format!("step {step}, index covering"));
+        // The index's key was answered by its kept memtable.
+        let read = db.stats().0;
+        assert!(
+            read.kept_hits > kept_hits,
+            "step {step}: no get answered by a kept memtable: {read:?}"
+        );
+        kept_hits = read.kept_hits;
+    }
+    check_all(&mut db, &oracle);
+
+    // The kept memtables given back: both keys read from the trunk, twice, the second time
+    // through the record cache, which holds one record a hash.
+    let mut least = BUDGET;
+    while db.set_memory(least / 2).is_ok() {
+        least /= 2;
+    }
+    db.set_memory(least).unwrap();
+    check_pair(&mut db, &held, "given back");
+    check_pair(&mut db, &held, "given back, cached");
+    check_all(&mut db, &oracle);
+
+    // Reopened: nothing kept, both read from the trunk.
+    db.flush().unwrap();
+    db.checkpoint(1).unwrap();
+    let (file, landed) = finished_file(db.into_file());
+    landed.unwrap();
+    drop(file);
+    let (mut db, _) = ShardDb::open(open(&path, false), STORE, MEM, TRUNK).unwrap();
+    db.set_memory(BUDGET).unwrap();
+    check_pair(&mut db, &held, "reopened");
+    check_all(&mut db, &oracle);
+    db.check_references().unwrap();
+}
+
 /// Under a budget of a few hundred pages, with workers, the kept memtables, their key lists and
 /// their indexes hold only what the page cache, write memory and the record cache leave: after
 /// every operation the regions and the kept memtables together hold no more than the budget,

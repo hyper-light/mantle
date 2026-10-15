@@ -58,6 +58,9 @@ pub type RangeStats = (FlushStats, TrunkStats, IoStats);
 struct Request {
     ask: Ask,
     key: Vec<u8>,
+    /// A put's, a deletion's or a get's key hash ([`crate::branch::filter::hash`]): computed
+    /// once by the operation, which every attempt to apply or answer it reuses.
+    hash: u64,
     /// A put's value; a get's answer.
     value: Vec<u8>,
     /// A scan's end, when bounded.
@@ -92,6 +95,7 @@ impl Request {
         Self {
             ask: Ask::Flush,
             key: Vec::new(),
+            hash: 0,
             value: Vec::new(),
             end: Vec::new(),
             rows: Rows::new(),
@@ -110,12 +114,15 @@ impl Request {
 /// lends it ([`Lend`]): an operation that finishes without waiting, or nothing, and the client
 /// takes the request path.
 trait Inline {
-    /// Applies a put now (true), or leaves it unapplied when it would wait for room (false).
-    fn put(&mut self, key: &[u8], value: &[u8], keys: u64) -> Result<bool, Error>;
-    /// Applies a deletion now (true), or leaves it unapplied when it would wait (false).
-    fn delete(&mut self, key: &[u8], keys: u64) -> Result<bool, Error>;
-    /// A get answered now, or none when a page it needs is not in memory.
-    fn get(&mut self, key: &[u8], value: &mut Vec<u8>) -> Result<Option<bool>, Error>;
+    /// Applies a put of a key of hash `hash` now (true), or leaves it unapplied when it would
+    /// wait for room (false).
+    fn put(&mut self, key: &[u8], hash: u64, value: &[u8], keys: u64) -> Result<bool, Error>;
+    /// Applies a deletion of a key of hash `hash` now (true), or leaves it unapplied when it
+    /// would wait (false).
+    fn delete(&mut self, key: &[u8], hash: u64, keys: u64) -> Result<bool, Error>;
+    /// A get of a key of hash `hash` answered now, or none when a page it needs is not in
+    /// memory.
+    fn get(&mut self, key: &[u8], hash: u64, value: &mut Vec<u8>) -> Result<Option<bool>, Error>;
     /// A scan answered now, its rows appended to `out` and whether more follow, or none when a
     /// page it needs is not in memory, `out` and `next` as they were.
     fn scan(
@@ -132,16 +139,16 @@ trait Inline {
 }
 
 impl<F: BlockFile + 'static> Inline for ShardDb<F> {
-    fn put(&mut self, key: &[u8], value: &[u8], keys: u64) -> Result<bool, Error> {
-        self.put_paced(key, value, keys)
+    fn put(&mut self, key: &[u8], hash: u64, value: &[u8], keys: u64) -> Result<bool, Error> {
+        self.put_paced(key, hash, value, keys)
     }
 
-    fn delete(&mut self, key: &[u8], keys: u64) -> Result<bool, Error> {
-        self.delete_paced(key, keys)
+    fn delete(&mut self, key: &[u8], hash: u64, keys: u64) -> Result<bool, Error> {
+        self.delete_paced(key, hash, keys)
     }
 
-    fn get(&mut self, key: &[u8], value: &mut Vec<u8>) -> Result<Option<bool>, Error> {
-        self.get_now(key, value)
+    fn get(&mut self, key: &[u8], hash: u64, value: &mut Vec<u8>) -> Result<Option<bool>, Error> {
+        self.get_now(key, hash, value)
     }
 
     fn scan(
@@ -627,7 +634,7 @@ impl Range {
     async fn query<F: BlockFile>(db: &mut ShardDb<F>, request: &mut Request) -> Result<(), Error> {
         match &request.ask {
             Ask::Get => db
-                .get_async(&request.key, &mut request.value)
+                .get_async(&request.key, request.hash, &mut request.value)
                 .await
                 .map(|found| request.found = found),
             Ask::Scan { bounded, limit } => {
@@ -780,8 +787,8 @@ fn apply<F: BlockFile>(
     keys: u64,
 ) -> Result<bool, Error> {
     match &request.ask {
-        Ask::Put => return db.put_paced(&request.key, &request.value, keys),
-        Ask::Delete => return db.delete_paced(&request.key, keys),
+        Ask::Put => return db.put_paced(&request.key, request.hash, &request.value, keys),
+        Ask::Delete => return db.delete_paced(&request.key, request.hash, keys),
         Ask::Get => Err(Error::InvalidArgument {
             what: "a runtime point lookup outside its owned async request",
         }),
@@ -1396,6 +1403,7 @@ impl Client<'_> {
         let range = self.ranges.range_of(key);
         self.call(range, |r| {
             r.ask = Ask::Put;
+            r.hash = crate::branch::filter::hash(key);
             r.key.clear();
             r.key.extend_from_slice(key);
             r.value.clear();
@@ -1409,6 +1417,7 @@ impl Client<'_> {
         let range = self.ranges.range_of(key);
         self.call(range, |r| {
             r.ask = Ask::Delete;
+            r.hash = crate::branch::filter::hash(key);
             r.key.clear();
             r.key.extend_from_slice(key);
         })
@@ -1421,6 +1430,7 @@ impl Client<'_> {
         let range = self.ranges.range_of(key);
         let r = self.call(range, |r| {
             r.ask = Ask::Get;
+            r.hash = crate::branch::filter::hash(key);
             r.key.clear();
             r.key.extend_from_slice(key);
         })?;
@@ -1496,8 +1506,11 @@ impl Client<'_> {
 
     pub async fn put_async(&mut self, key: &[u8], value: &[u8]) -> Result<(), Error> {
         let range = self.ranges.range_of(key);
+        // The key hashed once: the inline attempt and the request the range applies after it
+        // take the same hash.
+        let hash = crate::branch::filter::hash(key);
         if let Some(applied) = self
-            .inline(range, |db, keys| db.put(key, value, keys))
+            .inline(range, |db, keys| db.put(key, hash, value, keys))
             .await
             && applied?
         {
@@ -1506,6 +1519,7 @@ impl Client<'_> {
         }
         self.call_async(range, |r| {
             r.ask = Ask::Put;
+            r.hash = hash;
             r.key.clear();
             r.key.extend_from_slice(key);
             r.value.clear();
@@ -1518,7 +1532,10 @@ impl Client<'_> {
     /// Records a deletion from a hyper-rt task; cancellation never republishes it.
     pub async fn delete_async(&mut self, key: &[u8]) -> Result<(), Error> {
         let range = self.ranges.range_of(key);
-        if let Some(applied) = self.inline(range, |db, keys| db.delete(key, keys)).await
+        let hash = crate::branch::filter::hash(key);
+        if let Some(applied) = self
+            .inline(range, |db, keys| db.delete(key, hash, keys))
+            .await
             && applied?
         {
             self.completed_inline();
@@ -1526,6 +1543,7 @@ impl Client<'_> {
         }
         self.call_async(range, |r| {
             r.ask = Ask::Delete;
+            r.hash = hash;
             r.key.clear();
             r.key.extend_from_slice(key);
         })
@@ -1536,7 +1554,9 @@ impl Client<'_> {
     /// A hyper-rt task's get, with the same swapped value buffer as `get`.
     pub async fn get_async(&mut self, key: &[u8], value: &mut Vec<u8>) -> Result<bool, Error> {
         let range = self.ranges.range_of(key);
-        if let Some(found) = self.inline(range, |db, _| db.get(key, value)).await
+        // Hashed once: a get the range answers after its inline attempt takes the same hash.
+        let hash = crate::branch::filter::hash(key);
+        if let Some(found) = self.inline(range, |db, _| db.get(key, hash, value)).await
             && let Some(found) = found?
         {
             self.completed_inline();
@@ -1545,6 +1565,7 @@ impl Client<'_> {
         let r = self
             .call_async(range, |r| {
                 r.ask = Ask::Get;
+                r.hash = hash;
                 r.key.clear();
                 r.key.extend_from_slice(key);
             })

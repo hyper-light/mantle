@@ -4,7 +4,8 @@
 //! `IncMap` keeps a 64-bit key and a 64-bit value a bucket, 17 bytes with its control byte, so a
 //! 64 MiB memtable of 560 Ki entries spent 17 MiB on it. Here a bucket holds only the entry's
 //! 32-bit offset, 5 bytes: the key a probe compares is the entry's own, read from the arena, and
-//! a migration takes each entry's hash again from its key. Keys compare by their bytes, so two
+//! a migration takes each entry's hash from the entry, where its put stored it; an entry whose hash
+//! cannot be read is a typed corruption, left where it was. Keys compare by their bytes, so two
 //! keys of one 64-bit hash are two entries, with no list of clashes beside the table.
 //!
 //! Probing is `IncMap`'s (Abseil's SwissTable: a control byte a bucket, 7 bits of the hash, read
@@ -14,6 +15,7 @@
 
 // Probing's and migration's constants are `util::incmap`'s, derived and cited there: this index
 // differs only in what a bucket holds.
+use crate::error::{Error, Malformed};
 use crate::util::incmap::{DELETED, EMPTY, FIB, GROUP, HIGH, LOW, MOVE, repeat};
 
 /// One table: a power-of-two count of buckets, at least a group.
@@ -212,22 +214,37 @@ impl KeyIndex {
 
     /// Makes `entry` the newest of its key, of hash `hash`: the entry it replaced, if the key had
     /// one. `same` accepts the entries of the same key; `hash_of` gives an entry's hash, for those
-    /// a migration moves.
+    /// a migration moves, none for an entry whose hash cannot be read: a typed corruption.
     pub fn put(
         &mut self,
         hash: u64,
         entry: u32,
         same: impl Fn(u32) -> bool,
-        hash_of: impl Fn(u32) -> u64,
-    ) -> Option<u32> {
-        self.step(&hash_of);
+        hash_of: impl Fn(u32) -> Option<u64>,
+    ) -> Result<Option<u32>, Error> {
+        self.prepare(hash_of)?;
+        Ok(self.insert(hash, entry, same))
+    }
+
+    /// Readies the index for one put: the migration's next buckets moved, and a crowded table's
+    /// migration finished and a new one begun, so the put's own insert has room. The only part
+    /// of a put that can fail (an entry whose hash cannot be read, a typed corruption, left where
+    /// it was): its owner calls it before writing the entry, so a refused put leaves nothing.
+    pub fn prepare(&mut self, hash_of: impl Fn(u32) -> Option<u64>) -> Result<(), Error> {
+        self.step(&hash_of)?;
         if self.table.buckets() == 0 || self.table.crowded() {
             // A migration still running would break `MOVE`'s bound: it is finished first.
             while self.old.is_some() {
-                self.step(&hash_of);
+                self.step(&hash_of)?;
             }
             self.rebuild();
         }
+        Ok(())
+    }
+
+    /// The put [`Self::prepare`] readied: `entry` the newest of its key, of hash `hash`; the
+    /// entry it replaced, if the key had one. `same` accepts the entries of the same key.
+    pub fn insert(&mut self, hash: u64, entry: u32, same: impl Fn(u32) -> bool) -> Option<u32> {
         // The key may be in the old table still: its entry there is taken out, so a get finds
         // the newest in the new one.
         let was = self.old.as_mut().and_then(|o| {
@@ -255,27 +272,37 @@ impl KeyIndex {
         }
     }
 
-    /// Moves the next `MOVE` buckets of the old table, each entry by its key's hash again.
-    fn step(&mut self, hash_of: &impl Fn(u32) -> u64) {
+    /// Moves the next `MOVE` buckets of the old table, each entry by the hash it holds.
+    fn step(&mut self, hash_of: &impl Fn(u32) -> Option<u64>) -> Result<(), Error> {
         let Some(old) = self.old.as_mut() else {
-            return;
+            return Ok(());
         };
         for _ in 0..MOVE {
             if self.moved >= old.buckets() || old.full == 0 {
                 self.old = None;
-                return;
+                return Ok(());
             }
             let i = self.moved;
             if old.is_full(i)
                 && let Some(&e) = old.slots.get(i)
             {
+                // Its hash first: an entry whose hash cannot be read stays where it is, found.
+                let h = hash_of(e).ok_or_else(corrupt)?;
                 old.set_ctrl(i, DELETED);
                 old.full = old.full.saturating_sub(1);
                 // An entry moving is the only one of its key: nothing for `same` to match.
-                self.table.put(hash_of(e), e, |_| false);
+                self.table.put(h, e, |_| false);
             }
             self.moved = self.moved.saturating_add(1);
         }
+        Ok(())
+    }
+}
+
+fn corrupt() -> Error {
+    Error::Corruption {
+        what: "a memtable's index: an entry whose hash cannot be read",
+        why: Malformed::OutOfRange,
     }
 }
 
@@ -307,12 +334,14 @@ mod tests {
             let entry = u32::try_from(keys.len()).unwrap();
             keys.push(k);
             let h = hash_of_key(k);
-            let was = index.put(
-                h,
-                entry,
-                |e| keys[e as usize] == k,
-                |e| hash_of_key(keys[e as usize]),
-            );
+            let was = index
+                .put(
+                    h,
+                    entry,
+                    |e| keys[e as usize] == k,
+                    |e| Some(hash_of_key(keys[e as usize])),
+                )
+                .unwrap();
             assert_eq!(was, model.insert(k, entry));
             if x.is_multiple_of(5) {
                 let probe = (x >> 20) % 50_000;
@@ -332,5 +361,39 @@ mod tests {
             "{}",
             index.bytes()
         );
+    }
+
+    /// An entry whose hash cannot be read when a migration moves it is a typed corruption, and
+    /// the entry stays where it was: every entry put before is still found.
+    #[test]
+    fn an_unreadable_hash_in_a_migration_is_an_error_and_moves_nothing_away() {
+        let hash_of_key = |k: u64| k.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let mut index = KeyIndex::default();
+        let mut keys: Vec<u64> = Vec::new();
+        let mut failed = false;
+        for k in 0..10_000u64 {
+            let entry = u32::try_from(keys.len()).unwrap();
+            keys.push(k);
+            // Entry 7's hash cannot be read once it is in, as a corrupted arena would hold it.
+            let got = index.put(
+                hash_of_key(k),
+                entry,
+                |e| keys[e as usize] == k,
+                |e| (e != 7).then(|| hash_of_key(keys[e as usize])),
+            );
+            if got.is_err() {
+                assert!(matches!(got, Err(Error::Corruption { .. })));
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed, "no migration moved entry 7");
+        for (e, &k) in keys.iter().enumerate().take(keys.len() - 1) {
+            assert_eq!(
+                index.get(hash_of_key(k), |f| keys[f as usize] == k),
+                Some(u32::try_from(e).unwrap()),
+                "key {k}"
+            );
+        }
     }
 }

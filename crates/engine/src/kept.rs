@@ -2,9 +2,9 @@
 //! newest entry among the memtables it covers, by the key's 64-bit filter hash
 //! ([`crate::branch::filter::hash`]), as the memtable's number and the entry's arena offset.
 //!
-//! A packing worker lists each entry of a memtable's copy as its sort hashes the key, in the order
-//! the entries were written, a key written twice listed twice and its newer entry last, and hands
-//! back the (hash, offset) pairs ([`KeyList`]); a maintenance worker adds the lists of
+//! A packing worker walks each key's newest entry of a memtable's copy as it builds the branch,
+//! with the hash the entry holds from its put, and hands back the (hash, offset) pairs
+//! ([`KeyList`]), one a key, in key order; a maintenance worker adds the lists of
 //! the memtables kept since to an index it was handed ([`KeptIndex::extend`]), the newer
 //! memtable's entry replacing an older one's, and hands it back; the shard only probes it. A
 //! probe's answer is the shard's to check: the memtable still kept, and its key at that offset

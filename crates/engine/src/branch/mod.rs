@@ -1443,13 +1443,11 @@ impl Branch {
     ) -> Result<RunCursor, Error> {
         let placed = (|| {
             let page_no = self.leaf_of(from)?;
-            c.land(self, store, u64::from(page_no), 0)?;
-            let (i, n) = c.page_lower_bound(store, from)?;
-            if i >= n {
-                c.next_leaf(self, store)
+            c.acquire(self, store, u64::from(page_no))?;
+            if c.place_in(store, from)? {
+                Ok(())
             } else {
-                c.index = i;
-                c.load_in(store)
+                c.next_leaf(self, store)
             }
         })();
         match placed {
@@ -1546,6 +1544,24 @@ impl RunCursor {
         Ok((view.lower_bound(key)?, view.n))
     }
 
+    /// Places the cursor at the first entry at least `key` of the leaf held, wherever it lies,
+    /// and loads that entry alone; false when every entry is below `key`. Its first entry is
+    /// checked as loading it would check it, though not copied out.
+    fn place_in<F: BlockFile>(&mut self, store: &Store<F>, key: &[u8]) -> Result<bool, Error> {
+        let (index, entries) = {
+            let page = self.page_in(store)?;
+            Self::locate(page, self.table, 0)?;
+            let view = View::new(page)?;
+            (view.lower_bound(key)?, view.n)
+        };
+        if index >= entries {
+            return Ok(false);
+        }
+        self.index = index;
+        self.load_in(store)?;
+        Ok(true)
+    }
+
     /// Moves to the next entry of `branch`, the one the cursor walks.
     pub fn next<F: BlockFile>(
         &mut self,
@@ -1594,11 +1610,8 @@ impl RunCursor {
         if yield_io && !store.ready(&mut self.span, address)? {
             return Ok(Initial::Waiting);
         }
-        self.land(branch, store, self.page_no, 0)?;
-        let (index, entries) = self.page_lower_bound(store, from)?;
-        if index < entries {
-            self.index = index;
-            self.load_in(store)?;
+        self.acquire(branch, store, self.page_no)?;
+        if self.place_in(store, from)? {
             return Ok(Initial::Done);
         }
         self.valid = false;
@@ -1620,16 +1633,11 @@ impl RunCursor {
         from: &[u8],
     ) -> Result<(), Error> {
         let page = u64::from(branch.leaf_of(from)?);
-        self.land_async(branch, store, page, 0).await?;
-        let (index, entries) = {
-            let view = View::new(self.page_in(store)?)?;
-            (view.lower_bound(from)?, view.n)
-        };
-        if index >= entries {
-            self.next_leaf_async(branch, store).await
+        self.acquire_async(branch, store, page).await?;
+        if self.place_in(store, from)? {
+            Ok(())
         } else {
-            self.index = index;
-            self.load_in(store)
+            self.next_leaf_async(branch, store).await
         }
     }
 
@@ -1664,6 +1672,18 @@ impl RunCursor {
         page: u64,
         index: usize,
     ) -> Result<(), Error> {
+        self.acquire_async(branch, store, page).await?;
+        self.index = index;
+        self.load_in(store)
+    }
+
+    /// [`Self::acquire`] through demand completion.
+    async fn acquire_async<F: BlockFile>(
+        &mut self,
+        branch: &Branch,
+        store: &mut Store<F>,
+        page: u64,
+    ) -> Result<(), Error> {
         let address = branch.page_address(store, page)?;
         let held = self.loaded == Some(address)
             && self
@@ -1696,8 +1716,7 @@ impl RunCursor {
             self.loaded = Some(address);
         }
         self.page_no = page;
-        self.index = index;
-        self.load_in(store)
+        Ok(())
     }
 
     async fn next_leaf_async<F: BlockFile>(
@@ -1721,6 +1740,19 @@ impl RunCursor {
         store: &mut Store<F>,
         page: u64,
         index: usize,
+    ) -> Result<(), Error> {
+        self.acquire(branch, store, page)?;
+        self.index = index;
+        self.load_in(store)
+    }
+
+    /// Reads leaf `page` unless it is the one held: its entries and their table, the next
+    /// extents read ahead for a compaction's span.
+    fn acquire<F: BlockFile>(
+        &mut self,
+        branch: &Branch,
+        store: &mut Store<F>,
+        page: u64,
     ) -> Result<(), Error> {
         let address = branch.page_address(store, page)?;
         let held = self.loaded == Some(address)
@@ -1766,8 +1798,7 @@ impl RunCursor {
             }
         }
         self.page_no = page;
-        self.index = index;
-        self.load_in(store)
+        Ok(())
     }
 
     /// Whether moving to the next entry of `branch` reads no page that has not landed
@@ -1883,12 +1914,23 @@ impl RunCursor {
         index: usize,
         key: &mut Vec<u8>,
     ) -> Result<(Op, std::ops::Range<usize>), Error> {
-        let (suffix, rest) = entry_ranges(page, LEAF, table, index)?;
-        let tag = page.get(rest.start).copied().unwrap_or(0);
-        let op = Op::from_byte(tag).ok_or(corrupt(Malformed::UnknownTag(tag)))?;
+        let (op, suffix, value) = Self::locate(page, table, index)?;
         key.clear();
         key.extend_from_slice(page.get(HEAD..table).ok_or(corrupt(Malformed::Truncated))?);
         key.extend_from_slice(page.get(suffix).ok_or(corrupt(Malformed::Truncated))?);
+        Ok((op, value))
+    }
+
+    /// Entry `index` of leaf `page` (its entry table at `table`), checked and copied nowhere:
+    /// its operation and where its suffix and value lie.
+    fn locate(
+        page: &[u8],
+        table: usize,
+        index: usize,
+    ) -> Result<(Op, std::ops::Range<usize>, std::ops::Range<usize>), Error> {
+        let (suffix, rest) = entry_ranges(page, LEAF, table, index)?;
+        let tag = page.get(rest.start).copied().unwrap_or(0);
+        let op = Op::from_byte(tag).ok_or(corrupt(Malformed::UnknownTag(tag)))?;
         // The value follows the operation and its 2-byte length.
         let from = rest
             .start
@@ -1897,6 +1939,10 @@ impl RunCursor {
         if from > rest.end {
             return Err(corrupt(Malformed::Truncated));
         }
-        Ok((op, from..rest.end))
+        Ok((op, suffix, from..rest.end))
     }
 }
+
+#[cfg(test)]
+#[path = "seek_async_checks.rs"]
+mod seek_async_checks;

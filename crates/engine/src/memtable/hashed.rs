@@ -690,12 +690,24 @@ impl HashMem {
         for b in bufs {
             self.give_buf(b);
         }
+        self.reserve_tail(high);
+    }
+
+    /// Gives an empty memtable's tail room for `high` entries, the most a memtable's tail held
+    /// ([`Self::tail_high`]), from its entry buffers or else newly: its tail then fills without
+    /// growing.
+    pub fn reserve_tail(&mut self, high: usize) {
         if self.tail.is_empty() {
             self.tail_high = self.tail_high.max(high);
             let tail = std::mem::take(&mut self.tail);
             self.give_buf(tail);
             self.tail = self.take_buf(self.tail_high);
         }
+    }
+
+    /// The most entries its tail has held.
+    pub fn tail_high(&self) -> usize {
+        self.tail_high.max(self.tail.len())
     }
 
     /// Empties the memtable for its next fill, keeping its arena and every entry buffer, the
@@ -2782,6 +2794,46 @@ mod tests {
         // Taken, it is gone past a clear too.
         m.clear();
         assert!(!m.mirrored());
+    }
+
+    /// A memtable no kept memtable's buffers came for gets its tail room for as many entries as
+    /// the tail of the memtable it follows held ([`HashMem::reserve_tail`]): it fills without its
+    /// tail growing or moving, and walks every entry in key order.
+    #[test]
+    fn a_memtable_given_its_predecessors_tail_room_fills_without_growing() {
+        let keys: Vec<Vec<u8>> = (0..2_000u32)
+            .map(|n| n.wrapping_mul(2_654_435_761).to_be_bytes().to_vec())
+            .collect();
+        let mut a = HashMem::new(1 << 20).unwrap();
+        for k in &keys {
+            a.insert(k, Op::Put, k).unwrap();
+        }
+        let mut b = HashMem::new_for(1 << 20, a.len()).unwrap();
+        b.reserve_tail(a.tail_high());
+        let room = b.tail.capacity();
+        assert!(
+            room >= keys.len(),
+            "a tail of {room} for {} entries",
+            keys.len()
+        );
+        let at = b.tail.as_ptr();
+        for k in &keys {
+            b.insert(k, Op::Put, b"b").unwrap();
+        }
+        assert_eq!(b.tail.capacity(), room, "the tail grew");
+        assert_eq!(b.tail.as_ptr(), at, "the tail moved");
+        let mut sorted = keys.clone();
+        sorted.sort();
+        let mut walked = Vec::new();
+        b.seal();
+        let mut w = b.walk_start();
+        b.walk_some_hashed(&mut w, usize::MAX, |k, _, v, _| {
+            assert_eq!(v, b"b");
+            walked.push(k.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(walked, sorted);
     }
 
     /// A memtable read through its index alone sheds its entry buffers to a new one: that one's

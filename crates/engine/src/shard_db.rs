@@ -4080,8 +4080,11 @@ impl<F: BlockFile> ShardDb<F> {
             // refills.
             None => {
                 let mut fresh = HashMem::new_for(self.mem_limit, self.mem.len())?;
-                if let Some(bufs) = self.kept_shed.take() {
-                    fresh.take_shed(bufs);
+                match self.kept_shed.take() {
+                    Some(bufs) => fresh.take_shed(bufs),
+                    // No kept memtable's buffers came for it: its tail gets room for as many
+                    // entries as the tail of the memtable it follows held.
+                    None => fresh.reserve_tail(self.mem.tail_high()),
                 }
                 fresh
             }

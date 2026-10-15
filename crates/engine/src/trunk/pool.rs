@@ -419,76 +419,7 @@ fn run<F: BlockFile>(store: &mut Store<F>, job: &mut Job) -> Result<(Parts, u64)
             units = c.step(store, &t.inputs, u64::MAX)?;
             c.finish(store)?
         }
-        Work::Sort(pack) => {
-            let SortPack {
-                entries,
-                skip,
-                arena,
-                sorter,
-                keys,
-                cuts,
-            } = pack;
-            let kept = sorter.sort(arena, *skip)?;
-            // The memtable counted each key once as it took it: the sort keeps as many.
-            if u64::try_from(kept).ok() != Some(*entries) {
-                return Err(Error::Corruption {
-                    what: "a memtable's sorted entries",
-                    why: crate::error::Malformed::CountMismatch,
-                });
-            }
-            // The walk's keys, each its newest entry, with their offsets in the copy, the
-            // arena's own: the index over kept memtables is built from them.
-            keys.clear();
-            keys.hashes
-                .try_reserve(usize::try_from(*entries).unwrap_or(usize::MAX))
-                .map_err(|_| Error::LimitExceeded {
-                    what: "a memtable's key list",
-                    limit: *entries,
-                })?;
-            keys.offsets
-                .try_reserve(usize::try_from(*entries).unwrap_or(usize::MAX))
-                .map_err(|_| Error::LimitExceeded {
-                    what: "a memtable's key list",
-                    limit: *entries,
-                })?;
-            // A piece a range between the root's pivot keys, each the entries the sort holds
-            // below its end less those below its start: its filter sized to its own keys.
-            let mut ends: Vec<usize> = cuts.iter().map(|c| sorter.below(arena, c)).collect();
-            ends.push(kept);
-            let mut parts: Parts = Vec::new();
-            let mut piece = 0usize;
-            let mut begun = 0usize;
-            let mut at = 0usize;
-            let mut b: Option<Builder> = None;
-            sorter.each_at(arena, |k, op, v, h, offset| {
-                keys.push(crate::branch::filter::hash(k), offset);
-                while ends.get(piece).is_some_and(|&end| at >= end) {
-                    if let Some(done) = b.take() {
-                        let start = piece.checked_sub(1).and_then(|c| cuts.get(c)).cloned();
-                        parts.push((start.unwrap_or_default(), done.finish(store)?));
-                    }
-                    begun = ends.get(piece).copied().unwrap_or(begun);
-                    piece = piece.saturating_add(1);
-                }
-                if b.is_none() {
-                    let end = ends.get(piece).copied().unwrap_or(kept);
-                    let n = u64::try_from(end.saturating_sub(begun)).unwrap_or(u64::MAX);
-                    b = Some(Builder::new(store, Keys::Exactly(n))?);
-                }
-                at = at.saturating_add(1);
-                match b.as_mut() {
-                    Some(b) => b.add_hashed(store, k, op, v, h),
-                    None => Err(Error::InvalidArgument {
-                        what: "a packing's piece with no builder",
-                    }),
-                }
-            })?;
-            if let Some(done) = b.take() {
-                let start = piece.checked_sub(1).and_then(|c| cuts.get(c)).cloned();
-                parts.push((start.unwrap_or_default(), done.finish(store)?));
-            }
-            parts
-        }
+        Work::Sort(pack) => pack_memtable(store, pack)?,
         Work::Grow(g) => {
             store.grow_segment(g.start, g.extents, g.add)?;
             Vec::new()
@@ -505,6 +436,84 @@ fn run<F: BlockFile>(store: &mut Store<F>, job: &mut Job) -> Result<(Parts, u64)
         }
     };
     Ok((parts, units))
+}
+
+/// A memtable's packing, the work a packing job runs on a worker: its arena's copy sorted, then
+/// walked in key order into one branch a range between the root's pivot keys (`cuts`; one
+/// branch without them), each kept key's filter hash and arena offset listed for the index over
+/// the memtables the shard keeps (`keys`). Public so `benches/packing.rs` measures this code.
+pub fn pack_memtable<F: BlockFile>(
+    store: &mut Store<F>,
+    pack: &mut SortPack,
+) -> Result<Vec<(Vec<u8>, Branch)>, Error> {
+    let SortPack {
+        entries,
+        skip,
+        arena,
+        sorter,
+        keys,
+        cuts,
+    } = pack;
+    let kept = sorter.sort(arena, *skip)?;
+    // The memtable counted each key once as it took it: the sort keeps as many.
+    if u64::try_from(kept).ok() != Some(*entries) {
+        return Err(Error::Corruption {
+            what: "a memtable's sorted entries",
+            why: crate::error::Malformed::CountMismatch,
+        });
+    }
+    // The walk's keys, each its newest entry, with their offsets in the copy, the
+    // arena's own: the index over kept memtables is built from them.
+    keys.clear();
+    keys.hashes
+        .try_reserve(usize::try_from(*entries).unwrap_or(usize::MAX))
+        .map_err(|_| Error::LimitExceeded {
+            what: "a memtable's key list",
+            limit: *entries,
+        })?;
+    keys.offsets
+        .try_reserve(usize::try_from(*entries).unwrap_or(usize::MAX))
+        .map_err(|_| Error::LimitExceeded {
+            what: "a memtable's key list",
+            limit: *entries,
+        })?;
+    // A piece a range between the root's pivot keys, each the entries the sort holds
+    // below its end less those below its start: its filter sized to its own keys.
+    let mut ends: Vec<usize> = cuts.iter().map(|c| sorter.below(arena, c)).collect();
+    ends.push(kept);
+    let mut parts: Parts = Vec::new();
+    let mut piece = 0usize;
+    let mut begun = 0usize;
+    let mut at = 0usize;
+    let mut b: Option<Builder> = None;
+    sorter.each_at(arena, |k, op, v, h, offset| {
+        keys.push(crate::branch::filter::hash(k), offset);
+        while ends.get(piece).is_some_and(|&end| at >= end) {
+            if let Some(done) = b.take() {
+                let start = piece.checked_sub(1).and_then(|c| cuts.get(c)).cloned();
+                parts.push((start.unwrap_or_default(), done.finish(store)?));
+            }
+            begun = ends.get(piece).copied().unwrap_or(begun);
+            piece = piece.saturating_add(1);
+        }
+        if b.is_none() {
+            let end = ends.get(piece).copied().unwrap_or(kept);
+            let n = u64::try_from(end.saturating_sub(begun)).unwrap_or(u64::MAX);
+            b = Some(Builder::new(store, Keys::Exactly(n))?);
+        }
+        at = at.saturating_add(1);
+        match b.as_mut() {
+            Some(b) => b.add_hashed(store, k, op, v, h),
+            None => Err(Error::InvalidArgument {
+                what: "a packing's piece with no builder",
+            }),
+        }
+    })?;
+    if let Some(done) = b.take() {
+        let start = piece.checked_sub(1).and_then(|c| cuts.get(c)).cloned();
+        parts.push((start.unwrap_or_default(), done.finish(store)?));
+    }
+    Ok(parts)
 }
 
 fn gone(what: &'static str) -> Error {

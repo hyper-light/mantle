@@ -77,6 +77,10 @@ name = "compaction"
 harness = false
 
 [[bench]]
+name = "packing"
+harness = false
+
+[[bench]]
 name = "point_read"
 harness = false
 

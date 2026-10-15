@@ -360,3 +360,54 @@ from the release:
   - an extent freed twice before the forgetting is forgotten once, its newest pages.
   - Each check reads through an injected device fault, so a stale cached page would answer. A
     grant that skipped a pending extent, or a forgetting that skipped every extent, fails it.
+
+**Measured** (release binaries, no diagnostic code). The cut is x_cw1, cache-wr 65e3709, md5
+56670b48; the candidate is x_wa5, fc80a9c, md5 69b435e0.
+
+- **The first A/B (r2001-r2004) is set aside.** This session's own gate and test runs overlapped
+  every 100M round; in r2004 the cut's case started at VM load 22.5.
+- **The rerun had nothing of the session's beside it** (`runs/n*-r2011..r2014-*`, run7.sh's
+  balanced order). Another project's processes loaded the host throughout: VM load 7.6-10.5 at
+  the cases' starts.
+
+100M, medians of 4:
+
+| engine | fills | gets | seeks | p50 | p99.9 | p99.99 | max | stalls (sum) |
+|---|---|---|---|---|---|---|---|---|
+| the cut | 3.30M | 1.10M | 280K | 0.25 µs | 5.06 µs | 23.8 µs | 99.5 ms | 4 |
+| the candidate | 2.98M | 983K | 252K | 0.25 µs | 5.83 µs | 25.9 µs | 27.8 ms | 11 |
+| RocksDB 32 GiB | 479K | 171K | 54K | | | | | |
+| SplinterDB 32 GiB | 861K | 279K | 34K | | | | | |
+
+The cut led in 3 of 4 rounds.
+
+10M, medians of 4:
+
+| engine | fills | gets | seeks | p50 | p99.9 | p99.99 | max | stalls (sum) |
+|---|---|---|---|---|---|---|---|---|
+| the cut | 4.04M | 2.44M | 540K | 0.21 µs | 2.84 µs | 20.7 µs | 6.0 ms | 2 |
+| the candidate | 4.05M | 2.37M | 552K | 0.21 µs | 2.98 µs | 20.2 µs | 6.5 ms | 0 |
+| RocksDB 32 GiB | 678K | 208K | 100K | | | | | |
+| SplinterDB 32 GiB | 968K | 745K | 187K | | | | | |
+
+**The cut's stalls are the load's, not the cut's.**
+- In the rerun at 100M the cut stalled once in every run, and the candidate in two of four. Side
+  by side afterwards (`diag-runs/n100000000-r1931..r1933`), the candidate stalled once in every
+  run, and the cut 0, 2 and 2 times.
+- The traced cut's stalls are of the kinds the candidate has under load (research/58 §2 on wa-wr's line). Two waited for the
+  root's room: the root compactions freeing it took 0.99-1.19 s.
+- One waited for the frozen memtables' bound, behind a packing that ran 31% of its 554 ms while
+  the VM's disk was saturated (I/O full 68%).
+
+**Under a controlled load** the cut did worse (research/58 §1, on the candidate's line). At 10M
+beside 12 busy loops on the VM's 18 cores, against none (`runs/n10000000-r2101..r2114`):
+
+| build | fills kept | its worst puts under load |
+|---|---|---|
+| the cut | 0.45× (4.18M → 1.87M) | 0.97-3.7 s |
+| the candidate | 0.69× (3.75M → 2.57M) | 0.22-2.4 s |
+
+The cut was the lower in 3 of 4 rounds, and nothing measured here explains it.
+
+**Not adopted.** +11% at 100M under host load and level at 10M without load, but worse under a
+controlled load for reasons not known: an unexplained regression.

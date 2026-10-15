@@ -24,9 +24,9 @@ rustix.workspace = true
 windows-sys.workspace = true
 
 [features]
-# The ranges bench's count of every allocation, hyper-measure's counting allocator installed as the
-# global allocator: a diagnostic, off by default and never in a performance build. Off, the bench
-# runs on the system allocator and reports its allocation counts as unavailable.
+# The ranges and seek_cursor benches' count of every allocation, hyper-measure's counting allocator
+# installed as the global allocator: a diagnostic, off by default and never in a performance build.
+# Off, each bench runs on the system allocator and reports its allocation counts as unavailable.
 count-allocs = []
 # The ranges bench's phase bounds on CLOCK_MONOTONIC ("phasemono" lines), for checking a profile's
 # samples against its phases: a diagnostic, off by default and never in a performance build.

@@ -2,7 +2,8 @@
 //! `cargo bench -p mantle-engine --bench seek_cursor -- DIR KEYS SEEKS [NEXTS]`
 //! Sixteen-byte keys and 100-byte values match shard_db; even-numbered keys exercise absent
 //! starts too. A 256MiB cache matches that comparison. Each case warms with the same stream,
-//! then reports whole-process CPU/instructions, allocation and physical-read counts. This
+//! then reports whole-process CPU/instructions, allocation and physical-read counts; allocations
+//! are counted only in a build with the `count-allocs` feature, unavailable otherwise. This
 //! isolates cursor/merge work; it is not a replacement for the full fill/drain comparison.
 #![allow(
     clippy::unwrap_used,
@@ -31,8 +32,30 @@ use mantle_engine::trunk::Source;
 #[path = "support/rocks_workload.rs"]
 mod rocks_workload;
 
+// The allocation count is a diagnostic: compiled in only with the `count-allocs` feature, so a
+// timed run allocates through the system allocator with nothing counted.
+#[cfg(feature = "count-allocs")]
 #[global_allocator]
 static ALLOCATOR: alloc::Counting = alloc::Counting;
+
+/// Starts counting the process's allocations with the `count-allocs` feature; without it, nothing.
+fn begin_allocs() {
+    #[cfg(feature = "count-allocs")]
+    alloc::begin_process();
+}
+
+/// The process's allocation counts since [`begin_allocs`] with the `count-allocs` feature;
+/// without it, none: unmeasured.
+fn end_allocs() -> Option<alloc::Counts> {
+    #[cfg(feature = "count-allocs")]
+    {
+        Some(alloc::end_process())
+    }
+    #[cfg(not(feature = "count-allocs"))]
+    {
+        None
+    }
+}
 
 fn run<'a>(
     store: &mut Store<DeviceFile>,
@@ -118,6 +141,16 @@ fn main() -> Result<(), mantle_engine::Error> {
     println!(
         "fixture keys {keys} seeks {seeks} nexts {nexts} cache_mib 256 seed 301 read_only true resident_work_diagnostic true"
     );
+    // Whether allocation accounting is compiled into this build: a timed run has none (its CPU
+    // and instruction counts are measured either way).
+    println!(
+        "harness diagnostics count_allocs {}",
+        if cfg!(feature = "count-allocs") {
+            "on"
+        } else {
+            "off"
+        }
+    );
     for use_merge in [false, true] {
         let name = if use_merge { "merge" } else { "branch" };
         let mut rows = Rows::new();
@@ -133,7 +166,7 @@ fn main() -> Result<(), mantle_engine::Error> {
         );
         let before_io = store.io_stats();
         let before = usage::this().ok();
-        alloc::begin_process();
+        begin_allocs();
         let start = Instant::now();
         let read = run(
             &mut store,
@@ -145,7 +178,7 @@ fn main() -> Result<(), mantle_engine::Error> {
             (&mut rows, &mut merge),
         );
         let elapsed = start.elapsed().as_secs_f64();
-        let allocations = alloc::end_process();
+        let allocations = end_allocs();
         let account = usage::this()
             .ok()
             .zip(before)
@@ -163,8 +196,11 @@ fn main() -> Result<(), mantle_engine::Error> {
             seeks as f64 / elapsed,
             per_op(account.and_then(|account| account.user_ns.checked_add(account.system_ns))),
             per_op(account.and_then(|account| account.instructions)),
-            allocations.allocations,
-            allocations.reallocations,
+            allocations.map_or_else(|| "unavailable".to_string(), |a| a.allocations.to_string()),
+            allocations.map_or_else(
+                || "unavailable".to_string(),
+                |a| a.reallocations.to_string()
+            ),
             after_io.reads - before_io.reads,
             after_io.pages_read - before_io.pages_read,
             after_io.span_cache_hits - before_io.span_cache_hits

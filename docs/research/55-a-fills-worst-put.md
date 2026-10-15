@@ -121,5 +121,45 @@ extent read on a device queue every worker and the shard share.
 
 ## 6. Measured
 
-To follow: the arm against main, fill-only at 100M, quiet and busy, interleaved; then the
-release gate against RocksDB and SplinterDB.
+The full bench (`inside3.sh`'s mantle arms: fill, gets, seeks, tombstones, the settled second
+queries) at 10M and 100M, three quiet rounds interleaved, runs `n10000000-r481..483` and
+`n100000000-r481..483`: main `f3deb05`, the settle split `84af82c`, the pieces on it `f4f7e5f`,
+RocksDB 11.8.1 and SplinterDB, each with a 32 GiB cache. Rates and percentiles are the rounds'
+medians, the maximum the worst round's. Two 100M runs ran beside a local build and test on the
+Mac, whose cores the VM shares (`r482`'s pieces and RocksDB, the pieces' fill 2.82M against
+3.09M and 3.42M in their other rounds): they are not counted. db_bench's fill maximum is a
+wrapped negative interval; the lower edge of the highest bucket its histogram fills below an
+hour stands in, marked ≥.
+
+At 10M:
+
+| arm | fill | p50 | p99.9 | max | gets | p50 | p99.9 | max | seeks | p50 | p99.9 | max |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| main | 3.42M | 0.25 µs | 4.35 µs | 540 ms | 2.25M | 0.42 µs | 10.2 µs | 0.29 ms | 501K | 1.89 µs | 17.9 µs | 0.64 ms |
+| settle split | 2.92M | 0.25 µs | 5.63 µs | 9.1 ms | 2.18M | 0.42 µs | 11.3 µs | 0.22 ms | 474K | 1.98 µs | 21.5 µs | 5.1 ms |
+| split + pieces | 3.73M | 0.21 µs | 3.58 µs | 332 ms | 2.42M | 0.42 µs | 5.63 µs | 0.13 ms | 527K | 1.82 µs | 18.9 µs | 0.69 ms |
+| RocksDB | 485K | 1.26 µs | 28.8 µs | 43.2 ms | 212K | 3.75 µs | 31.5 µs | 10.1 ms | 100K | 8.89 µs | 53.9 µs | 9.4 ms |
+| SplinterDB | 932K | 0.85 µs | 13.6 µs | 101 ms | 688K | 1.70 µs | 14.8 µs | 0.21 ms | 173K | 5.50 µs | 31.7 µs | 1.8 ms |
+
+At 100M:
+
+| arm | fill | p50 | p99.9 | max | gets | p50 | p99.9 | max | seeks | p50 | p99.9 | max |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| main | 2.97M | 0.29 µs | 5.12 µs | 1.16 s | 1.04M | 0.93 µs | 17.4 µs | 0.90 ms | 272K | 3.46 µs | 39.9 µs | 2.2 ms |
+| settle split | 3.29M | 0.25 µs | 5.38 µs | 329 ms | 1.17M | 0.80 µs | 19.4 µs | 0.26 ms | 266K | 3.39 µs | 39.9 µs | 0.65 ms |
+| split + pieces | 3.25M | 0.27 µs | 5.05 µs | 338 ms | 1.27M | 0.78 µs | 13.9 µs | 2.5 ms | 287K | 3.17 µs | 33.5 µs | 0.35 ms |
+| RocksDB | 427K | 1.35 µs | 33.5 µs | ≥2.9 s | 165K | 5.62 µs | 64.0 µs | 9.3 ms | 62K | 15.0 µs | 145.5 µs | 28.6 ms |
+| SplinterDB | 702K | 0.93 µs | 19.4 µs | 423 ms | 230K | 3.84 µs | 32.3 µs | 25.0 ms | 28K | 29.2 µs | 200.7 µs | 173 ms |
+
+- **Writes.** Entries written at 100M: main 436M, the split 432M, the pieces 352M, the root's
+  merge gone. The data disk's bytes over a whole run (`/proc/diskstats`, sampled each second):
+  main 53-58 GB, the split 48 GB, the pieces 49-52 GB, RocksDB 90 GB; about 14 GB of mantle's are
+  each new segment written once with zeros as the file grows (research/48). SplinterDB's 11.6 GB
+  is the data written once: its cache holds the whole store at 100M and its compactions never
+  reach the device, so its writes are not comparable here.
+- **The worst put.** At 100M the pieces' worst round waited 338 ms, the other 58 ms, below
+  SplinterDB's 423 ms; at 10M one round of three waited 332 ms in two rotation stalls (main 540
+  ms in the same round), against SplinterDB's 101 ms. The settle split alone stalled in none of
+  its 10M rounds.
+- **Against the bound.** The pieces fill 4.6× SplinterDB's rate at 100M and 7.6× RocksDB's,
+  gets 5.5× and 7.7×, seeks 10× and 4.6×.

@@ -274,23 +274,37 @@ pub struct Sorter {
 impl Sorter {
     /// Sorts the entries of `arena`, a memtable's arena as written, every key of which shares its
     /// first `skip` bytes with the first: the entries left once the newest of each key is kept.
-    pub fn sort(&mut self, arena: &[u8], skip: usize) -> Result<usize, Error> {
+    /// Each key is hashed once, as its entry is keyed: the hash's high bits key the entry for its
+    /// branch's filter, and the whole hash goes into `list` with the entry's offset, in the order
+    /// the entries were written, for the index over kept memtables (`crate::kept`). A key written
+    /// twice is listed twice, its newer entry after: the index keeps the last it is given.
+    pub fn sort(
+        &mut self,
+        arena: &[u8],
+        skip: usize,
+        list: &mut crate::kept::KeyList,
+    ) -> Result<usize, Error> {
         let too_large = || Error::LimitExceeded {
             what: "entries of a memtable's sort",
             limit: u64::try_from(arena.len()).unwrap_or(u64::MAX),
         };
         let mut src = std::mem::take(&mut self.keyed);
         src.clear();
+        list.clear();
         let mut at = 0usize;
         while at < arena.len() {
             let entry = u32::try_from(at).map_err(|_| corrupt())?;
             let (key, _, _, end) = read_at(arena, entry)?;
+            let h = hash(key);
             src.try_reserve(1).map_err(|_| too_large())?;
+            list.hashes.try_reserve(1).map_err(|_| too_large())?;
+            list.offsets.try_reserve(1).map_err(|_| too_large())?;
             src.push(Keyed {
                 prefix: prefix(key, skip),
                 entry,
-                hash32: crate::branch::filter::hash32(hash(key)),
+                hash32: crate::branch::filter::hash32(h),
             });
+            list.push(h, entry);
             at = end;
         }
         let n = src.len();
@@ -2759,7 +2773,19 @@ mod tests {
             proptest::prop_assert_eq!(&arena, &m.arena);
             proptest::prop_assert!(!m.mirrored());
             let mut sorter = Sorter::default();
-            proptest::prop_assert_eq!(sorter.sort(&arena, skip).unwrap(), m.len());
+            let mut list = crate::kept::KeyList::default();
+            proptest::prop_assert_eq!(sorter.sort(&arena, skip, &mut list).unwrap(), m.len());
+            // Every entry listed in the order written: taken in order, the last listed of each
+            // hash is the key's newest entry, as the memtable's own index holds it.
+            let mut listed = std::collections::HashMap::new();
+            for (&h, &offset) in list.hashes.iter().zip(&list.offsets) {
+                listed.insert(h, offset);
+            }
+            let mut own = crate::kept::KeyList::default();
+            m.key_list(&mut own).unwrap();
+            let own: std::collections::HashMap<u64, u32> =
+                own.hashes.iter().copied().zip(own.offsets.iter().copied()).collect();
+            proptest::prop_assert_eq!(&listed, &own);
             let mut sorted = Vec::new();
             sorter.each(&arena, |k, op, v, h| {
                 sorted.push((k.to_vec(), op, v.to_vec(), h));
@@ -2777,7 +2803,7 @@ mod tests {
                 proptest::prop_assert_eq!(*h, crate::branch::filter::hash32(hash(k)));
             }
             // The sorter's buffers serve the next arena as they are.
-            proptest::prop_assert_eq!(sorter.sort(&arena, skip).unwrap(), m.len());
+            proptest::prop_assert_eq!(sorter.sort(&arena, skip, &mut list).unwrap(), m.len());
         }
     }
 

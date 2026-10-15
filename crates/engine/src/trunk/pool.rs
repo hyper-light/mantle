@@ -454,16 +454,8 @@ pub fn pack_memtable<F: BlockFile>(
         keys,
         cuts,
     } = pack;
-    let kept = sorter.sort(arena, *skip)?;
-    // The memtable counted each key once as it took it: the sort keeps as many.
-    if u64::try_from(kept).ok() != Some(*entries) {
-        return Err(Error::Corruption {
-            what: "a memtable's sorted entries",
-            why: crate::error::Malformed::CountMismatch,
-        });
-    }
-    // The walk's keys, each its newest entry, with their offsets in the copy, the
-    // arena's own: the index over kept memtables is built from them.
+    // The keys with their offsets in the copy, the arena's own, for the index over kept
+    // memtables: listed by the sort as it hashes each key, at least one a key the memtable holds.
     keys.clear();
     keys.hashes
         .try_reserve(usize::try_from(*entries).unwrap_or(usize::MAX))
@@ -477,6 +469,14 @@ pub fn pack_memtable<F: BlockFile>(
             what: "a memtable's key list",
             limit: *entries,
         })?;
+    let kept = sorter.sort(arena, *skip, keys)?;
+    // The memtable counted each key once as it took it: the sort keeps as many.
+    if u64::try_from(kept).ok() != Some(*entries) {
+        return Err(Error::Corruption {
+            what: "a memtable's sorted entries",
+            why: crate::error::Malformed::CountMismatch,
+        });
+    }
     // A piece a range between the root's pivot keys, each the entries the sort holds
     // below its end less those below its start: its filter sized to its own keys.
     let mut ends: Vec<usize> = cuts.iter().map(|c| sorter.below(arena, c)).collect();
@@ -486,8 +486,7 @@ pub fn pack_memtable<F: BlockFile>(
     let mut begun = 0usize;
     let mut at = 0usize;
     let mut b: Option<Builder> = None;
-    sorter.each_at(arena, |k, op, v, h, offset| {
-        keys.push(crate::branch::filter::hash(k), offset);
+    sorter.each(arena, |k, op, v, h| {
         while ends.get(piece).is_some_and(|&end| at >= end) {
             if let Some(done) = b.take() {
                 let start = piece.checked_sub(1).and_then(|c| cuts.get(c)).cloned();

@@ -3234,7 +3234,9 @@ impl<F: BlockFile> ShardDb<F> {
             .kept_bytes
             .saturating_add(mem.memory())
             .saturating_add(list.bytes());
-        let keys = u64::try_from(list.len()).unwrap_or(u64::MAX);
+        // The keys it holds, each once: its list may name a key twice, in the order written
+        // (`Sorter::sort`).
+        let keys = u64::try_from(mem.len()).unwrap_or(u64::MAX);
         self.kept.push_back(KeptMem { mem, number, keys });
         self.kept_lists.push_back((number, list));
         self.fit_kept(true);

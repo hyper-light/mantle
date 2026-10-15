@@ -410,11 +410,13 @@ enum Fact {
 }
 
 /// A case's end as the runtime task saw it: each growth's ticket and result, in order; the job's
-/// result as it came back; the close's outcome; and the gate as the close completed.
+/// result as it came back; when the job completed, a later job's ticket as sent and as its result
+/// named it; the close's outcome; and the gate as the close completed.
 #[derive(Debug)]
 struct End {
     growths: Vec<(Ticket, Result<(), Error>)>,
     job: Option<Back>,
+    later: Option<(Ticket, Ticket)>,
     closed: Result<(), Error>,
     gate: GateState,
 }
@@ -502,6 +504,31 @@ async fn shard(
             None => panic!("the workers' channel closed with the job out"),
         }
     }
+    // Once the job completed, the next job on the same worker: its ticket as sent, and as its
+    // result names it.
+    let mut later = None;
+    if job.as_ref().is_some_and(|back| back.result.is_ok()) {
+        let index = Box::new(Job {
+            work: Work::Index(Box::default()),
+            grant: Vec::new(),
+            file_end: s.end(),
+            generation: s.generation(),
+            keep: None,
+        });
+        let sent = pool.send(index, Owner::Index, true).unwrap().unwrap();
+        for _ in 0..MESSAGES {
+            if let Some(back) = pool.take(s, Owner::Index, false).unwrap() {
+                later = Some((sent, back.ticket));
+                break;
+            }
+            match pool.receive().await.unwrap() {
+                Some(message) => {
+                    pool.accept(s, message).unwrap();
+                }
+                None => panic!("the workers' channel closed with the later job out"),
+            }
+        }
+    }
     // The close: refuse what waits, take every terminal result, wait for the workers to retire.
     let mut closed = Err(Error::InvalidArgument {
         what: "the close did not complete within its messages",
@@ -546,6 +573,7 @@ async fn shard(
         .send(Fact::End(Box::new(End {
             growths,
             job,
+            later,
             closed,
             gate: at_close,
         })))
@@ -625,10 +653,29 @@ fn completed(fact: Fact, case: &Case, store: &mut Store<Grown>, growths_at_least
     let End {
         growths,
         job,
+        later,
         closed,
         gate: at_close,
     } = end(fact);
     closed.unwrap();
+    // Every ticket the pool issued names one job: the merge, each growth, and the job after them
+    // on the same worker, whose result comes back under the ticket it was sent under.
+    let (sent, named) = later.expect("the later job's result came back");
+    assert_eq!(named, sent, "the later job's result names its own ticket");
+    let mut numbers: Vec<u64> = std::iter::once(case.ticket.job)
+        .chain(growths.iter().map(|(t, _)| t.job))
+        .chain(std::iter::once(sent.job))
+        .collect();
+    let issued = numbers.len();
+    numbers.sort_unstable();
+    numbers.dedup();
+    assert_eq!(
+        numbers.len(),
+        issued,
+        "two tickets share a job number: the merge {:?}, the growths {:?}, the later job {sent:?}",
+        case.ticket,
+        growths.iter().map(|(t, _)| *t).collect::<Vec<_>>()
+    );
     assert!(growths.len() >= growths_at_least, "{growths:?}");
     for (ticket, result) in &growths {
         assert_eq!(
@@ -725,6 +772,7 @@ fn a_growth_whose_write_fails_stays_the_first_error_through_the_close() {
         job,
         closed,
         gate: at_close,
+        ..
     } = end(fact);
     assert_eq!(growths.len(), 1, "{growths:?}");
     assert!(
@@ -759,6 +807,7 @@ fn a_growth_that_fails_after_the_close_began_stays_the_first_error() {
         job,
         closed,
         gate: at_close,
+        ..
     } = end(fact);
     assert_eq!(
         (at_close.begun, at_close.finished),
@@ -795,6 +844,7 @@ fn a_growth_that_unwinds_comes_back_failed_when_its_askers_job_ends() {
         job,
         closed,
         gate: at_close,
+        ..
     } = end(fact);
     assert_eq!(
         (at_close.begun, at_close.finished),
@@ -833,6 +883,7 @@ fn a_close_while_an_askers_growth_is_held_waits_for_its_write() {
         job,
         closed,
         gate: at_close,
+        ..
     } = end(fact);
     assert_eq!(
         (at_close.begun, at_close.finished),

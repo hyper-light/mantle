@@ -77,6 +77,57 @@ const KEY_HEAD: usize = 4;
 /// The table bytes an entry takes: its offset and its head.
 const SLOT: usize = OFFSET + KEY_HEAD;
 
+/// The most tree pages a branch of `entries` entries takes, packed from `bytes` of an arena
+/// (each entry's key and value with at least a byte of head) whose longest key and value are
+/// `key` and `value`, cut into `pieces` branches, its pages of `capacity` payload bytes: the
+/// pages a packing's cache loan keeps. A leaf entry is its slot, its fixed bytes and at most its
+/// key and value, so the leaves hold at most `bytes` and `SLOT + LEAF_FIXED` an entry; a leaf
+/// closes only when the next entry does not fit, so each holds all but less than one entry of its
+/// room, and each piece's last may hold less. Each index level above holds an entry a page below
+/// it, at most `SLOT + INDEX_FIXED` and a key, the same way, until one page is left.
+pub fn tree_pages_most(
+    entries: usize,
+    bytes: usize,
+    key: usize,
+    value: usize,
+    pieces: usize,
+    capacity: usize,
+) -> usize {
+    let room = capacity.saturating_sub(HEAD);
+    let leaf_entry = SLOT
+        .saturating_add(LEAF_FIXED)
+        .saturating_add(key)
+        .saturating_add(value);
+    let payload = bytes.saturating_add(entries.saturating_mul(SLOT.saturating_add(LEAF_FIXED)));
+    let leaves = payload
+        .div_ceil(room.saturating_sub(leaf_entry).max(1))
+        .saturating_add(pieces);
+    // The levels above: a level's pages hold its entries, one a page below, the same way. An
+    // index page holds at least two entries (`Builder::fits`), so a level has at most half the
+    // pages of the one below and a level a bit of the leaves' count bounds them.
+    let index_entry = SLOT.saturating_add(INDEX_FIXED).saturating_add(key);
+    let per_index = room.saturating_sub(index_entry).max(1);
+    let mut levels = 0usize;
+    let mut below = leaves;
+    for _ in 0..usize::BITS {
+        if below <= 1 {
+            break;
+        }
+        below = below.saturating_mul(index_entry).div_ceil(per_index);
+        levels = levels.saturating_add(1);
+    }
+    // A level holds at most `index_entry / per_index` of the pages below and a partial page a
+    // piece: summed over the levels, the shares form a geometric series of that ratio, over the
+    // leaves and over each level's partial pages.
+    let partial = pieces.saturating_mul(levels);
+    let index = leaves
+        .saturating_add(partial)
+        .saturating_mul(index_entry)
+        .div_ceil(per_index.saturating_sub(index_entry).max(1))
+        .saturating_add(partial);
+    leaves.saturating_add(index)
+}
+
 /// A suffix's head: its first 4 bytes, big-endian, zero-padded. Heads that differ order their
 /// suffixes as the suffixes order; equal heads say nothing, and the suffixes are compared.
 fn key_head(suffix: &[u8]) -> u32 {

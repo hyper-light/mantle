@@ -3152,11 +3152,19 @@ impl<F: BlockFile> ShardDb<F> {
                 });
             }
             self.store.extend_end(out.end);
+            // The pages the packing wrote, cached where they were written, with its pieces.
+            if let Some(kept) = back.kept.take() {
+                self.store.adopt_pages(*kept);
+            }
             Ok(std::mem::take(&mut out.parts))
         })();
         let parts = match retired {
             Ok(parts) => parts,
             Err(error) => {
+                // A failed packing's pages are not the store's to read: its loan goes back unread.
+                if let Some(kept) = f.back.as_mut().and_then(|b| b.kept.take()) {
+                    self.store.unlend_pages(*kept);
+                }
                 f.error.get_or_insert_with(|| error.clone());
                 self.terminal_error.get_or_insert_with(|| error.clone());
                 self.frozen.push_front(f);
@@ -4182,25 +4190,46 @@ impl<F: BlockFile> ShardDb<F> {
         };
         let grant = self.store.grant(extents)?;
         let sorting = pack.memory();
+        // The cache's room for the pages the packing writes, as a compaction's job has for its:
+        // its pieces enter the trunk with their pages cached where they were written.
+        let (key, value) = full.longest();
+        let pages = crate::branch::tree_pages_most(
+            full.len(),
+            full.bytes(),
+            key,
+            value,
+            pack.cuts.len().saturating_add(1),
+            self.store.page_capacity(),
+        );
+        let keep = self.store.lend_pages(pages);
         let job = Box::new(Job {
             work: Work::Sort(pack),
             grant: grant.clone(),
             file_end: self.store.end(),
             generation: self.store.generation(),
-            keep: None,
+            keep,
         });
         let sent = match pool.send(job, Owner::Pack, true) {
             Ok(sent) => sent,
             Err((error, job)) => {
-                self.store.grant_back(&job.grant)?;
+                let Job { grant, keep, .. } = *job;
+                if let Some(kept) = keep {
+                    self.store.unlend_pages(*kept);
+                }
+                self.store.grant_back(&grant)?;
                 return Err(error);
             }
         };
         let ticket = match sent {
             Ok(ticket) => ticket,
             Err(job) => {
-                self.store.grant_back(&job.grant)?;
-                let Job { work, .. } = *job;
+                let Job {
+                    work, grant, keep, ..
+                } = *job;
+                if let Some(kept) = keep {
+                    self.store.unlend_pages(*kept);
+                }
+                self.store.grant_back(&grant)?;
                 let Work::Sort(pack) = work else {
                     return Err(Error::InvalidArgument {
                         what: "a sorted packing's job came back as other work",

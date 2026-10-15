@@ -19,7 +19,7 @@ use hyper_block::buf::Alignment;
 use hyper_block::sim::{Fault, SimFile};
 use mantle_engine::Error;
 use mantle_engine::branch::filter::Keys;
-use mantle_engine::branch::{Branch, Builder, Op};
+use mantle_engine::branch::{Branch, Builder, Op, tree_pages_most};
 use mantle_engine::store::{Config, Store};
 use proptest::prelude::*;
 use std::collections::BTreeMap;
@@ -129,6 +129,71 @@ proptest! {
         let branch = build(&mut s, &entries);
         check(&mut s, &branch, &entries);
     }
+
+    /// A packing's cache loan holds every tree page its pieces write: the bound counts what a
+    /// memtable holds (its entries, their key and value bytes, its longest key and value) and the
+    /// pieces its cuts make, and no packing of those entries writes more.
+    #[test]
+    fn a_packings_tree_pages_stay_within_its_cache_loan(
+        entries in proptest::collection::btree_map(
+            proptest::collection::vec(any::<u8>(), 0..120),
+            proptest::collection::vec(any::<u8>(), 0..600),
+            1..3000,
+        ),
+        cuts in proptest::collection::vec(any::<u16>(), 0..8),
+        seed in any::<u64>(),
+    ) {
+        let list: Vec<(&Vec<u8>, &Vec<u8>)> = entries.iter().collect();
+        let at = cuts.iter().map(|&c| usize::from(c) % list.len()).collect();
+        let mut s = store(seed);
+        let (pages, most) = pack(&mut s, &list, at);
+        prop_assert!(pages <= most, "{} tree pages past the bound {}", pages, most);
+    }
+}
+
+/// `list` packed as a memtable is, cut at the entry positions `at` (as the root's pivot keys fall
+/// in it), one branch a range: the tree pages written, and the bound a packing's loan is sized by,
+/// given the entries' key and value bytes with no head, the least an arena holds them in.
+fn pack(store: &mut Store<SimFile>, list: &[(&Vec<u8>, &Vec<u8>)], mut at: Vec<usize>) -> (usize, usize) {
+    at.sort_unstable();
+    at.dedup();
+    let mut pages = 0usize;
+    let mut begun = 0usize;
+    for end in at.iter().copied().chain(std::iter::once(list.len())) {
+        if end <= begun {
+            continue;
+        }
+        let piece = &list[begun..end];
+        let mut b = Builder::new(store, Keys::Exactly(piece.len() as u64)).unwrap();
+        for (k, v) in piece {
+            b.add(store, k, Op::Put, v).unwrap();
+        }
+        pages += b.finish(store).unwrap().counts.len();
+        begun = end;
+    }
+    let bytes = list.iter().map(|(k, v)| k.len() + v.len()).sum();
+    let key = list.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    let value = list.iter().map(|(_, v)| v.len()).max().unwrap_or(0);
+    let most = tree_pages_most(list.len(), bytes, key, value, at.len() + 1, store.page_capacity());
+    (pages, most)
+}
+
+/// The bench's shape, 16-byte keys and 100-byte values cut in nine: the bound holds, and how far
+/// past the pages written it lends is printed.
+#[test]
+fn a_bench_shaped_packing_stays_within_its_cache_loan() {
+    let entries: BTreeMap<Vec<u8>, Vec<u8>> = (0..200_000u64)
+        .map(|i| {
+            let k = i.wrapping_mul(0x9e37_79b9_7f4a_7c15).to_be_bytes();
+            ([k, k].concat(), vec![(i % 251) as u8; 100])
+        })
+        .collect();
+    let list: Vec<(&Vec<u8>, &Vec<u8>)> = entries.iter().collect();
+    let at = (1..9).map(|i| i * list.len() / 9).collect();
+    let mut s = store(5);
+    let (pages, most) = pack(&mut s, &list, at);
+    eprintln!("tree pages {pages} bound {most}");
+    assert!(pages <= most, "{pages} tree pages past the bound {most}");
 }
 
 #[test]

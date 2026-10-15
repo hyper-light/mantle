@@ -398,9 +398,10 @@ fn a_quiet_shard_consolidates_what_its_writes_paid_for_and_no_more() {
     db.check_references().unwrap();
 }
 
-/// The pages a worker's compaction writes come back cached where they were written: the shard's
-/// cache lends each job room, the worker keeps its pages in it as it writes them, and the shard
-/// takes them with the job's branches. With a cache that holds the store and nothing read before
+/// The pages a worker's compaction or packing writes come back cached where they were written:
+/// the shard's cache lends each job room, the worker keeps its pages in it as it writes them, and
+/// the shard takes them with the job's branches (a packing's pieces enter the root's pivots
+/// unmerged, so their pages are the ones read). With a cache that holds the store and nothing read before
 /// maintenance ends, reading every key after it reads no page from the device.
 #[test]
 fn a_workers_pages_are_cached_where_they_were_written() {

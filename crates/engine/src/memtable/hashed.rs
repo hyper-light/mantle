@@ -425,6 +425,10 @@ pub struct HashMem {
     bufs: Vec<Vec<Keyed>>,
     /// The longest the tail has grown: what the next fill's tail is given room for.
     tail_high: usize,
+    /// The longest key and value written since the memtable was last empty: what a page of its
+    /// packed branch holds least of ([`crate::branch::tree_pages_most`]).
+    longest_key: usize,
+    longest_value: usize,
     /// A copy of the arena, written with it, for a worker to sort and pack ([`Sorter`]); whole
     /// while `mirrored`, which it is only if given before the first entry and never short of
     /// room, as it is reserved to the arena's bound.
@@ -633,6 +637,8 @@ impl HashMem {
             sort: None,
             bufs: Vec::new(),
             tail_high: 0,
+            longest_key: 0,
+            longest_value: 0,
             mirror: Vec::new(),
             mirrored: false,
             counts: None,
@@ -714,6 +720,8 @@ impl HashMem {
         self.mirrored = self.mirror.capacity() >= self.limit;
         self.index.clear();
         self.len = 0;
+        self.longest_key = 0;
+        self.longest_value = 0;
         self.first.clear();
         self.skip = 0;
         self.tail_stale = 0;
@@ -910,6 +918,11 @@ impl HashMem {
         self.arena.len()
     }
 
+    /// The longest key and value written since the memtable was last empty.
+    pub fn longest(&self) -> (usize, usize) {
+        (self.longest_key, self.longest_value)
+    }
+
     fn key(&self, entry: u32) -> &[u8] {
         key(&self.arena, entry)
     }
@@ -1047,6 +1060,8 @@ impl HashMem {
         put_varint32s(&mut self.arena, &[code, u32::from(klen), vlen]);
         self.arena.extend_from_slice(key);
         self.arena.extend_from_slice(value);
+        self.longest_key = self.longest_key.max(key.len());
+        self.longest_value = self.longest_value.max(value.len());
         if self.mirrored {
             // Within the room reserved, so the copy never reallocates; past it (never, as the
             // arena's bound is the room) the mirror is no longer whole.

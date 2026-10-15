@@ -416,7 +416,7 @@ enum Fact {
 struct End {
     growths: Vec<(Ticket, Result<(), Error>)>,
     job: Option<Back>,
-    later: Option<(Ticket, Ticket)>,
+    later: Option<(Ticket, Ticket, Result<(), Error>)>,
     closed: Result<(), Error>,
     gate: GateState,
 }
@@ -518,7 +518,7 @@ async fn shard(
         let sent = pool.send(index, Owner::Index, true).unwrap().unwrap();
         for _ in 0..MESSAGES {
             if let Some(back) = pool.take(s, Owner::Index, false).unwrap() {
-                later = Some((sent, back.ticket));
+                later = Some((sent, back.ticket, back.result.map(drop)));
                 break;
             }
             match pool.receive().await.unwrap() {
@@ -660,8 +660,9 @@ fn completed(fact: Fact, case: &Case, store: &mut Store<Grown>, growths_at_least
     closed.unwrap();
     // Every ticket the pool issued names one job: the merge, each growth, and the job after them
     // on the same worker, whose result comes back under the ticket it was sent under.
-    let (sent, named) = later.expect("the later job's result came back");
+    let (sent, named, done) = later.expect("the later job's result came back");
     assert_eq!(named, sent, "the later job's result names its own ticket");
+    done.expect("the later job succeeded");
     let mut numbers: Vec<u64> = std::iter::once(case.ticket.job)
         .chain(growths.iter().map(|(t, _)| t.job))
         .chain(std::iter::once(sent.job))

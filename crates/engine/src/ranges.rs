@@ -844,11 +844,33 @@ pub struct RangesConfig {
     /// measured cost of a wake (the 2-competitive spin-then-park rule; Karlin, Li, Manasse and
     /// Owicki, SOSP 1991). An answer that comes within it costs the client no wake.
     pub spin_ns: u64,
-    /// Whether a client on a range's own shard makes an operation inline on the range's lent
-    /// engine when it can finish without waiting (docs/design/engine-structure.md, "Same-shard
-    /// clients"). Off, every operation crosses the range's channel, as one from another shard
-    /// does: the request path's semantics alone, a canceled mutation published and kept.
-    pub inline: bool,
+    /// Which operations a client on a range's own shard makes inline on the range's lent engine.
+    pub inline: InlineOps,
+}
+
+/// Which operations a client on a range's own shard makes inline on the range's lent engine,
+/// each only when it can finish without waiting (docs/design/engine-structure.md, "Same-shard
+/// clients"); every other crosses the range's channel, as one from another shard does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InlineOps {
+    /// None: the request path's semantics alone, a canceled mutation published and kept.
+    Off,
+    /// Gets and scans. Puts and deletions cross the channel, so the range's task applies each
+    /// and runs its maintenance slice before the next, as for a client on another shard.
+    Reads,
+    /// Every operation.
+    All,
+}
+
+impl InlineOps {
+    /// Whether an operation is made inline: a write (a put or a deletion) or a read.
+    fn takes(self, write: bool) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Reads => !write,
+            Self::All => true,
+        }
+    }
 }
 
 /// A node's ranges, each on a shard of a runtime, and the clients that reach them.
@@ -862,8 +884,8 @@ pub struct Ranges {
     live: Arc<AtomicUsize>,
     clients: usize,
     spin_ns: u64,
-    /// Whether clients on a range's shard make operations inline ([`RangesConfig::inline`]).
-    inline: bool,
+    /// Which operations clients on a range's shard make inline ([`RangesConfig::inline`]).
+    inline: InlineOps,
 }
 
 /// Runtime preflight retains every engine. Later cold startup errors follow cold rollback.
@@ -987,7 +1009,7 @@ impl Ranges {
                     what: "a range's request channel",
                     limit: u64::try_from(clients).unwrap_or(u64::MAX),
                 })?;
-            let range = Range::new(clients, slice_ns, inline)?;
+            let range = Range::new(clients, slice_ns, inline != InlineOps::Off)?;
             let (offer, offered) = channel(1).map_err(|_| Error::LimitExceeded {
                 what: "a range's single cold engine handoff",
                 limit: 1,
@@ -1431,11 +1453,12 @@ impl Client<'_> {
     /// Records a value from a hyper-rt task, yielding for the same bounded reply channel.
     /// Canceling this borrowed wait leaves its request outstanding. The next async operation
     /// recovers its answer and reports its error before publishing another request.
-    /// The task of `range` when this client may make an operation on its engine inline: the client
-    /// runs on the range's shard, with no request or barrier of its own out.
-    fn inline_task(&self, range: usize) -> Option<TaskId> {
+    /// The task of `range` when this client may make an operation, a write or a read, on its
+    /// engine inline: the ranges make that operation inline, and the client runs on the range's
+    /// shard, with no request or barrier of its own out.
+    fn inline_task(&self, range: usize, write: bool) -> Option<TaskId> {
         let task = *self.ranges.tasks.get(range)?;
-        if self.ranges.inline
+        if self.ranges.inline.takes(write)
             && self.request.is_some()
             && self.barrier.is_none()
             && hyper_rt::registry::current_shard() == Some(task.shard().0)
@@ -1473,14 +1496,15 @@ impl Client<'_> {
         self.turn.began_ns = hyper_rt::registry::with_current(|ctx| ctx.now_ns()).unwrap_or(0);
     }
 
-    /// Makes `op` on `range`'s engine inline when the range lends it now: its answer, or none for
-    /// the request path.
+    /// Makes `op`, a write or a read, on `range`'s engine inline when the range lends it now and
+    /// the ranges make that operation inline: its answer, or none for the request path.
     async fn inline<R>(
         &mut self,
         range: usize,
+        write: bool,
         op: impl FnOnce(&mut dyn Inline, u64) -> R,
     ) -> Option<R> {
-        let task = self.inline_task(range)?;
+        let task = self.inline_task(range, write)?;
         self.turn().await;
         with_lent(task, op)
     }
@@ -1497,7 +1521,7 @@ impl Client<'_> {
     pub async fn put_async(&mut self, key: &[u8], value: &[u8]) -> Result<(), Error> {
         let range = self.ranges.range_of(key);
         if let Some(applied) = self
-            .inline(range, |db, keys| db.put(key, value, keys))
+            .inline(range, true, |db, keys| db.put(key, value, keys))
             .await
             && applied?
         {
@@ -1518,7 +1542,9 @@ impl Client<'_> {
     /// Records a deletion from a hyper-rt task; cancellation never republishes it.
     pub async fn delete_async(&mut self, key: &[u8]) -> Result<(), Error> {
         let range = self.ranges.range_of(key);
-        if let Some(applied) = self.inline(range, |db, keys| db.delete(key, keys)).await
+        if let Some(applied) = self
+            .inline(range, true, |db, keys| db.delete(key, keys))
+            .await
             && applied?
         {
             self.completed_inline();
@@ -1536,7 +1562,7 @@ impl Client<'_> {
     /// A hyper-rt task's get, with the same swapped value buffer as `get`.
     pub async fn get_async(&mut self, key: &[u8], value: &mut Vec<u8>) -> Result<bool, Error> {
         let range = self.ranges.range_of(key);
-        if let Some(found) = self.inline(range, |db, _| db.get(key, value)).await
+        if let Some(found) = self.inline(range, false, |db, _| db.get(key, value)).await
             && let Some(found) = found?
         {
             self.completed_inline();
@@ -1644,7 +1670,7 @@ impl Client<'_> {
             // memory; else the request path.
             let before = out.len();
             if let Some(scanned) = self
-                .inline(range, |db, _| db.scan(start, stop, left, out, next))
+                .inline(range, false, |db, _| db.scan(start, stop, left, out, next))
                 .await
                 && let Some(more) = scanned?
             {

@@ -26,7 +26,7 @@ use hyper_block::issuer::Issuer;
 mod shared_sim;
 use hyper_rt::{Runtime, RuntimeConfig};
 use mantle_engine::Error;
-use mantle_engine::ranges::{Client, Ranges, RangesConfig};
+use mantle_engine::ranges::{Client, InlineOps, Ranges, RangesConfig};
 use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::Config;
@@ -73,7 +73,7 @@ fn ranges_config(clients: usize) -> RangesConfig {
         clients,
         slice_ns: SLICE_NS,
         spin_ns: SLICE_NS,
-        inline: false,
+        inline: InlineOps::Off,
     }
 }
 

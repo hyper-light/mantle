@@ -27,7 +27,7 @@ use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::issuer::Issuer;
 use hyper_rt::{Runtime, RuntimeConfig};
 use mantle_engine::Error;
-use mantle_engine::ranges::{Ranges, RangesConfig};
+use mantle_engine::ranges::{InlineOps, Ranges, RangesConfig};
 use mantle_engine::shard_db::{ShardDb, issuer_batches};
 use mantle_engine::store::Config;
 use mantle_engine::trunk::TrunkConfig;
@@ -365,7 +365,7 @@ fn run(case: Case, slice_ns: u64) {
             clients: 1,
             slice_ns,
             spin_ns: 0,
-            inline: false,
+            inline: InlineOps::Off,
         },
     )
     .unwrap();

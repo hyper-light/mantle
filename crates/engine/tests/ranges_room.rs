@@ -36,7 +36,7 @@ use hyper_block::segmented::SegmentedFile;
 use hyper_rt::ShardId;
 use hyper_rt::combine::join2;
 use hyper_rt::{Runtime, RuntimeConfig};
-use mantle_engine::ranges::{Ranges, RangesConfig};
+use mantle_engine::ranges::{InlineOps, Ranges, RangesConfig};
 use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::{FlushStats, ShardDb};
 use mantle_engine::store::Config;
@@ -419,7 +419,7 @@ fn a_range_waiting_for_room_parks_and_goes_on_with_each_growth() {
             clients: 2,
             slice_ns: SLICE_NS,
             spin_ns: 0,
-            inline: true,
+            inline: InlineOps::All,
         },
     )
     .unwrap();
@@ -550,7 +550,7 @@ fn a_growth_that_fails_while_the_writer_waits_for_room_ends_the_range_in_its_fau
             clients: 1,
             slice_ns: SLICE_NS,
             spin_ns: 0,
-            inline: true,
+            inline: InlineOps::All,
         },
     )
     .unwrap();

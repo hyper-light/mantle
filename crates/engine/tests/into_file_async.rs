@@ -21,7 +21,7 @@ use hyper_rt::sync::{Sender, channel};
 use mantle_engine::Error;
 use mantle_engine::branch::Op;
 use mantle_engine::memtable::hashed::HashMem;
-use mantle_engine::ranges::{Ranges, RangesConfig, StartError};
+use mantle_engine::ranges::{InlineOps, Ranges, RangesConfig, StartError};
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::{Config, IntoFile, Store};
 use mantle_engine::trunk::TrunkConfig;
@@ -375,7 +375,7 @@ impl Drop for StartOnDrop {
                 clients: 1,
                 slice_ns: 50_000,
                 spin_ns: 0,
-                inline: false,
+                inline: InlineOps::Off,
             },
         );
         self.returned.try_send((runtime, outcome)).unwrap();

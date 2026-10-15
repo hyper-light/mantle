@@ -19,7 +19,7 @@ use hyper_rt::runtime::interests_for;
 use hyper_rt::{Runtime, RuntimeConfig};
 use mantle_engine::branch::Op;
 use mantle_engine::memtable::hashed::HashMem;
-use mantle_engine::ranges::{Client, Ranges, RangesConfig};
+use mantle_engine::ranges::{Client, InlineOps, Ranges, RangesConfig};
 use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::{ShardDb, issuer_batches};
 use mantle_engine::store::Config;
@@ -350,7 +350,7 @@ fn case(mode: Mode) {
             clients: 1,
             slice_ns: 50_000,
             spin_ns: 0,
-            inline: false,
+            inline: InlineOps::Off,
         },
     )
     .unwrap();

@@ -25,7 +25,7 @@ use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::issuer::Issuer;
 use hyper_rt::{Runtime, RuntimeConfig};
 use mantle_engine::Error;
-use mantle_engine::ranges::{Ranges, RangesConfig};
+use mantle_engine::ranges::{InlineOps, Ranges, RangesConfig};
 use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::Config;
@@ -245,7 +245,7 @@ fn ranges(runtime: &mut Runtime, first: ShardDb<Gated>, second: ShardDb<Gated>) 
                 clients: 3,
                 slice_ns: SLICE_NS,
                 spin_ns: 0,
-                inline: false,
+                inline: InlineOps::Off,
             },
         )
         .unwrap(),

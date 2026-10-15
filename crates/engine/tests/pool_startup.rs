@@ -23,7 +23,7 @@ use hyper_rt::{Runtime, RuntimeConfig};
 use mantle_engine::Error;
 use mantle_engine::branch::Op;
 use mantle_engine::memtable::hashed::{HashMem, Sorter};
-use mantle_engine::ranges::{Ranges, RangesConfig};
+use mantle_engine::ranges::{InlineOps, Ranges, RangesConfig};
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::{Config, Store};
 use mantle_engine::trunk::TrunkConfig;
@@ -262,7 +262,7 @@ fn a_worker_attachment_startup_error_refuses_range_placement_and_preserves_check
                 clients: 1,
                 slice_ns: 50_000,
                 spin_ns: 0,
-                inline: false,
+                inline: InlineOps::Off,
             }
         ),
         Err(mantle_engine::ranges::StartError::Failed(Error::Io { .. }))

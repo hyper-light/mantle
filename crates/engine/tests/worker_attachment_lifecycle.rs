@@ -322,7 +322,7 @@ fn async_stop_reports_worker_attachment_failure_only_after_native_tls_and_file_r
             clients: 1,
             slice_ns: 50_000,
             spin_ns: 0,
-            inline: false,
+            inline: mantle_engine::ranges::InlineOps::Off,
         },
     )
     .unwrap();

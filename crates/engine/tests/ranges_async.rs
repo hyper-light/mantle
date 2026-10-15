@@ -22,7 +22,7 @@ use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::issuer::Issuer;
 use hyper_rt::{Runtime, RuntimeConfig};
 use mantle_engine::Error;
-use mantle_engine::ranges::{Client, Ranges, RangesConfig};
+use mantle_engine::ranges::{Client, InlineOps, Ranges, RangesConfig};
 use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::Config;
@@ -66,7 +66,7 @@ fn ranges_config() -> RangesConfig {
         clients: 1,
         slice_ns: SLICE_NS,
         spin_ns: 0,
-        inline: false,
+        inline: InlineOps::Off,
     }
 }
 

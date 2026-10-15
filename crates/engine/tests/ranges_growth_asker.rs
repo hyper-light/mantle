@@ -41,7 +41,7 @@ use hyper_block::issuer::Issuer;
 use hyper_block::segmented::SegmentedFile;
 use hyper_rt::{Runtime, RuntimeConfig, ShardId};
 use mantle_engine::Error;
-use mantle_engine::ranges::{Ranges, RangesConfig};
+use mantle_engine::ranges::{InlineOps, Ranges, RangesConfig};
 use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::{ShardDb, issuer_batches};
 use mantle_engine::store::Config;
@@ -352,7 +352,11 @@ fn start(path: &Path, gate: &'static Gate, inline: bool) -> (Runtime, Issuer, Ra
             clients: 1,
             slice_ns: SLICE_NS,
             spin_ns: 0,
-            inline,
+            inline: if inline {
+                InlineOps::All
+            } else {
+                InlineOps::Off
+            },
         },
     )
     .unwrap();

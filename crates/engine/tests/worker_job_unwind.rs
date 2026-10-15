@@ -349,7 +349,7 @@ fn an_active_job_read_panic_returns_after_retirement_and_preserves_retry_and_che
 fn same_shard_stop_keeps_held_job_ownership_and_reports_its_read_panic_after_retirement() {
     use hyper_rt::combine::{Either, race2};
     use hyper_rt::{Runtime, RuntimeConfig};
-    use mantle_engine::ranges::{Ranges, RangesConfig};
+    use mantle_engine::ranges::{InlineOps, Ranges, RangesConfig};
     use std::future::Future;
     use std::task::Poll;
 
@@ -433,7 +433,7 @@ fn same_shard_stop_keeps_held_job_ownership_and_reports_its_read_panic_after_ret
             clients: 2,
             slice_ns: 50_000,
             spin_ns: 0,
-            inline: false,
+            inline: InlineOps::Off,
         },
     )
     .unwrap();
@@ -444,7 +444,7 @@ fn same_shard_stop_keeps_held_job_ownership_and_reports_its_read_panic_after_ret
             clients: 1,
             slice_ns: 50_000,
             spin_ns: 0,
-            inline: false,
+            inline: InlineOps::Off,
         },
     )
     .unwrap();

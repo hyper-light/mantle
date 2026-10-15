@@ -20,7 +20,7 @@ use hyper_rt::sync::{Sender, channel};
 use mantle_engine::Error;
 use mantle_engine::branch::Op;
 use mantle_engine::memtable::hashed::{HashMem, Sorter};
-use mantle_engine::ranges::{Ranges, RangesConfig};
+use mantle_engine::ranges::{InlineOps, Ranges, RangesConfig};
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::{Config, Store};
 use mantle_engine::trunk::TrunkConfig;
@@ -351,7 +351,7 @@ fn post_poll_client_prepare_refuses_before_request_publication() {
             clients: 1,
             slice_ns: 50_000,
             spin_ns: 0,
-            inline: false,
+            inline: InlineOps::Off,
         },
     )
     .unwrap();

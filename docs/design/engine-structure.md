@@ -152,6 +152,14 @@ second, 9.85 to 6.80 thousand instructions a put; gets 1.10 to 1.61 million a se
 0.61 us a get, p99 3.33 to 2.75 us. Seeks take the request path in both arms: 0.41 and 0.39
 million a second, within the rounds' spread.
 
+`RangesConfig::inline` is `InlineOps::All`, `Off`, or `Reads`, an experimental arm
+(benches/ranges.rs `--inline-reads`): gets and scans inline, puts and deletions through the
+channel, so the range's task applies each write and runs its maintenance slice before the next.
+In the integ2 trial (`benchmark-results/mantle-supervision-20261014/claude-integ2-trial-20261015T1330Z.md`)
+inline was faster in every rate column (100M quiet fill 3.94 against 2.14 million puts a
+second), while every write through the channel counted no stall and the fill's maxima were lower
+(100M busy 100 ms against 2.66 s); why is not established. `Reads` measures that trade.
+
 An idle range that reaches a required trunk read yields its work before opening or claiming
 that read. Its task then waits for either a request or an issuer answer through hyper-rt's
 existing bounded channel. The answer channel holds the attachment's admitted batch count,

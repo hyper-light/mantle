@@ -26,7 +26,7 @@ use hyper_block::issuer::Issuer;
 use hyper_rt::{Runtime, RuntimeConfig};
 use mantle_engine::branch::Op;
 use mantle_engine::memtable::hashed::HashMem;
-use mantle_engine::ranges::{Client, Ranges, RangesConfig};
+use mantle_engine::ranges::{Client, InlineOps, Ranges, RangesConfig};
 use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::Config;
@@ -526,7 +526,7 @@ fn a_held_worker_page_write_leaves_same_shard_unrelated_range_progress() {
                 clients: 2,
                 slice_ns: 50_000,
                 spin_ns: 0,
-                inline: false,
+                inline: InlineOps::Off,
             },
         )
         .unwrap(),

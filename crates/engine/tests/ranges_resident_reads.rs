@@ -23,7 +23,7 @@ use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::issuer::Issuer;
 use hyper_rt::{Runtime, RuntimeConfig};
-use mantle_engine::ranges::{Ranges, RangesConfig};
+use mantle_engine::ranges::{InlineOps, Ranges, RangesConfig};
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::Config;
 use mantle_engine::trunk::TrunkConfig;
@@ -163,7 +163,7 @@ fn an_async_range_reads_its_resident_pages_on_its_own_shard() {
             clients: 2,
             slice_ns: SLICE_NS,
             spin_ns: 0,
-            inline: false,
+            inline: InlineOps::Off,
         },
     )
     .unwrap();

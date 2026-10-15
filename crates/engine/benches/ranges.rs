@@ -52,7 +52,7 @@ use hyper_measure::{alloc, faults, usage};
 use hyper_rt::machine::calibration::{Calibration, Policy};
 use hyper_rt::{Runtime, RuntimeConfig};
 use mantle_disk::histogram::Histogram;
-use mantle_engine::ranges::{RangeStats, Ranges, RangesConfig};
+use mantle_engine::ranges::{InlineOps, RangeStats, Ranges, RangesConfig};
 use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::{Config, IntoFile};
@@ -839,8 +839,9 @@ fn runtime_config(
 fn main() -> Result<(), BenchError> {
     let mut shard_client = false;
     // `--no-inline`: a client on its range's shard sends every operation through the range's
-    // channel, as one from another shard does (`RangesConfig::inline`), for an A/B of the two.
-    let mut no_inline = false;
+    // channel, as one from another shard does; `--inline-reads`: only its puts and deletions
+    // (`RangesConfig::inline`), for an A/B of the three.
+    let mut inline = InlineOps::All;
     let mut seed = 301u64;
     let mut runtime_record = None;
     let mut value_bytes = 100usize;
@@ -881,8 +882,16 @@ fn main() -> Result<(), BenchError> {
     for arg in std::env::args().skip(1) {
         if arg == "--shard-client" {
             shard_client = true;
-        } else if arg == "--no-inline" {
-            no_inline = true;
+        } else if arg == "--no-inline" || arg == "--inline-reads" {
+            require(
+                inline == InlineOps::All,
+                "at most one of --no-inline and --inline-reads",
+            )?;
+            inline = if arg == "--no-inline" {
+                InlineOps::Off
+            } else {
+                InlineOps::Reads
+            };
         } else if arg == "--shadow-probe" {
             shadow_probe = true;
         } else if arg == "--segments" {
@@ -1068,6 +1077,7 @@ fn main() -> Result<(), BenchError> {
         1,
         issuer.depth()
     );
+    println!("inline_ops {inline:?}");
     let mut engines = Vec::new();
     let mut paths = Vec::new();
     for i in 0..threads {
@@ -1124,7 +1134,7 @@ fn main() -> Result<(), BenchError> {
             clients: threads as usize + 1,
             slice_ns: rt.step_budget_ns,
             spin_ns: rt.spin_ns,
-            inline: !no_inline,
+            inline,
         },
     )
     .map_err(|failure| match failure {

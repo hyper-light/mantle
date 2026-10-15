@@ -1,7 +1,8 @@
 //! A client on its range's own shard makes a put, a get or a scan inline on the range's lent
 //! engine when it needs no wait (docs/design/engine-structure.md, "Same-shard clients"), the
 //! range waiting on its workers meanwhile included; one that would wait takes the request path,
-//! and a client that makes nothing but inline operations still yields its shard.
+//! and a client that makes nothing but inline operations still yields its shard. With reads alone
+//! inline, its puts and deletions take the request path and its reads stay inline.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -23,7 +24,7 @@ use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::issuer::Issuer;
 use hyper_rt::{Runtime, RuntimeConfig};
-use mantle_engine::ranges::{Ranges, RangesConfig};
+use mantle_engine::ranges::{InlineOps, Ranges, RangesConfig};
 use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::Config;
@@ -180,12 +181,13 @@ fn runtime() -> Runtime {
 }
 
 /// A range over a fresh file whose memtable holds `memtable` bytes, attached to `issuer`, with its
-/// workers, started on `runtime`.
+/// workers, started on `runtime`, its clients making `inline` operations inline.
 fn range(
     runtime: &mut Runtime,
     issuer: &Issuer,
     path: &Path,
     (reads, resident, memtable): (&'static AtomicUsize, bool, usize),
+    inline: InlineOps,
     fill: impl FnOnce(&mut ShardDb<Counted>),
 ) -> Ranges {
     let mut db =
@@ -203,7 +205,7 @@ fn range(
             clients: 3,
             slice_ns: SLICE_NS,
             spin_ns: 0,
-            inline: true,
+            inline,
         },
     )
     .unwrap()
@@ -220,7 +222,14 @@ fn a_same_shard_client_puts_and_gets_inline() {
     let reads: &'static AtomicUsize = Box::leak(Box::default());
     let issuer = Issuer::start_for(dir.path(), 2, 2).unwrap();
     let mut runtime = runtime();
-    let ranges = range(&mut runtime, &issuer, &path, (reads, true, 1 << 20), |_| {});
+    let ranges = range(
+        &mut runtime,
+        &issuer,
+        &path,
+        (reads, true, 1 << 20),
+        InlineOps::All,
+        |_| {},
+    );
     let (done, finished) = mpsc::sync_channel(1);
     runtime
         .spawn_on(runtime.shard_ids()[0], async move {
@@ -278,6 +287,7 @@ fn an_inline_get_that_needs_the_device_takes_the_request_path() {
         &issuer,
         &path,
         (reads, false, STORE.page_size),
+        InlineOps::All,
         |db| {
             for i in 0..ROWS {
                 db.put(&key(i), &value(i)).unwrap();
@@ -329,7 +339,14 @@ fn a_loop_of_inline_operations_yields_its_shard() {
     let issuer = Issuer::start_for(dir.path(), 2, 2).unwrap();
     let mut runtime = runtime();
     // A memtable that holds every key, so no get needs a page.
-    let ranges = range(&mut runtime, &issuer, &path, (reads, true, 1 << 20), |_| {});
+    let ranges = range(
+        &mut runtime,
+        &issuer,
+        &path,
+        (reads, true, 1 << 20),
+        InlineOps::All,
+        |_| {},
+    );
     let shard = runtime.shard_ids()[0];
     let (done, finished) = mpsc::sync_channel(1);
     runtime
@@ -403,7 +420,7 @@ fn puts_stay_inline_while_the_range_waits_on_a_packing_worker() {
             clients: 3,
             slice_ns: SLICE_NS,
             spin_ns: 0,
-            inline: true,
+            inline: InlineOps::All,
         },
     )
     .unwrap();
@@ -477,7 +494,14 @@ fn a_same_shard_client_scans_inline() {
     let reads: &'static AtomicUsize = Box::leak(Box::default());
     let issuer = Issuer::start_for(dir.path(), 2, 2).unwrap();
     let mut runtime = runtime();
-    let ranges = range(&mut runtime, &issuer, &path, (reads, true, 1 << 20), |_| {});
+    let ranges = range(
+        &mut runtime,
+        &issuer,
+        &path,
+        (reads, true, 1 << 20),
+        InlineOps::All,
+        |_| {},
+    );
     let (done, finished) = mpsc::sync_channel(1);
     runtime
         .spawn_on(runtime.shard_ids()[0], async move {
@@ -531,6 +555,7 @@ fn an_inline_scan_that_needs_the_device_takes_the_request_path() {
         &issuer,
         &path,
         (reads, false, STORE.page_size),
+        InlineOps::All,
         |db| {
             for i in 0..ROWS {
                 db.put(&key(i), &value(i)).unwrap();
@@ -561,4 +586,108 @@ fn an_inline_scan_that_needs_the_device_takes_the_request_path() {
     assert_eq!(got, want);
     assert_eq!(inlined, 0);
     assert!(reads.load(Ordering::SeqCst) > before);
+}
+
+/// Do: from a client on the range's shard, its ranges making reads alone inline
+/// ([`InlineOps::Reads`]) and its memtable holding every row: put every key, getting each right
+/// after its put; delete every third key, getting each right after its deletion; get every key;
+/// scan the whole keyspace a page of 97 rows at a time; then flush, checkpoint and reopen the file
+/// cold. Expect: no put or deletion was made inline (each took the request path) and every get and
+/// scan was (none needs a page from the device), each counted at its own operation; every answer is
+/// the oracle's, a get made inline right after its write took the channel included; and the
+/// reopened range holds exactly the oracle.
+#[test]
+fn with_reads_alone_inline_writes_take_the_request_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("range");
+    let reads: &'static AtomicUsize = Box::leak(Box::default());
+    let issuer = Issuer::start_for(dir.path(), 2, 2).unwrap();
+    let mut runtime = runtime();
+    let ranges = range(
+        &mut runtime,
+        &issuer,
+        &path,
+        (reads, true, 1 << 20),
+        InlineOps::Reads,
+        |_| {},
+    );
+    let (done, finished) = mpsc::sync_channel(1);
+    runtime
+        .spawn_on(runtime.shard_ids()[0], async move {
+            let mut client = ranges.client().unwrap();
+            let mut oracle = BTreeMap::new();
+            let mut out = Vec::new();
+            for i in 0..ROWS {
+                let before = client.inlined();
+                client.put_async(&key(i), &value(i)).await.unwrap();
+                assert_eq!(client.inlined(), before, "put {i} was made inline");
+                oracle.insert(key(i), value(i));
+                assert!(client.get_async(&key(i), &mut out).await.unwrap());
+                assert_eq!(out, value(i));
+                assert_eq!(
+                    client.inlined(),
+                    before + 1,
+                    "get {i} took the request path"
+                );
+            }
+            for i in (0..ROWS).step_by(3) {
+                let before = client.inlined();
+                client.delete_async(&key(i)).await.unwrap();
+                assert_eq!(client.inlined(), before, "deletion {i} was made inline");
+                oracle.remove(&key(i));
+                assert!(!client.get_async(&key(i), &mut out).await.unwrap());
+                assert_eq!(
+                    client.inlined(),
+                    before + 1,
+                    "get {i} took the request path"
+                );
+            }
+            for i in 0..ROWS {
+                let before = client.inlined();
+                let found = client.get_async(&key(i), &mut out).await.unwrap();
+                assert_eq!(found.then(|| out.clone()), oracle.get(&key(i)).cloned());
+                assert_eq!(
+                    client.inlined(),
+                    before + 1,
+                    "get {i} took the request path"
+                );
+            }
+            let before = client.inlined();
+            let want: Vec<(Vec<u8>, Vec<u8>)> =
+                oracle.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            assert_eq!(scan_all(&mut client, b"", 97).await, want);
+            let pages = oracle.len().div_ceil(97) as u64;
+            assert_eq!(
+                client.inlined(),
+                before + pages,
+                "a scan took the request path"
+            );
+            client.flush_async().await.unwrap();
+            client.checkpoint_async(1).await.unwrap();
+            drop(client);
+            ranges.stop_async().await.unwrap();
+            done.send(oracle).unwrap();
+        })
+        .unwrap();
+    let oracle = finished.recv().unwrap();
+    runtime.shutdown().unwrap();
+    drop(issuer);
+    assert_eq!(oracle.len(), ROWS - ROWS.div_ceil(3));
+    let (mut db, applied) = ShardDb::open(
+        open(&path, false, reads, true),
+        STORE,
+        STORE.page_size,
+        TRUNK,
+    )
+    .unwrap();
+    assert_eq!(applied, 1);
+    let mut out = Vec::new();
+    for i in 0..=ROWS {
+        let found = db.get(&key(i), &mut out).unwrap();
+        assert_eq!(
+            found.then(|| out.clone()),
+            oracle.get(&key(i)).cloned(),
+            "key {i}"
+        );
+    }
 }

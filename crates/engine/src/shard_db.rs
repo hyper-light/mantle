@@ -457,6 +457,10 @@ pub struct ShardDb<F: BlockFile> {
     growth: Option<(Ticket, u64, u64)>,
     segment_extents: u64,
     packing_wanted: u64,
+    /// A growth landed at the last wait for room: a wait declared before it may now be met, so
+    /// the runtime task passes again before it waits ([`Self::waiting_for_io`]); cleared as its
+    /// next turn begins ([`Self::take_results`]).
+    room_came: bool,
     growth_waited: u64,
     growth_due_at: Option<u64>,
     growth_lead: u64,
@@ -763,6 +767,7 @@ impl<F: BlockFile> ShardDb<F> {
             growth: None,
             segment_extents: 0,
             packing_wanted: 0,
+            room_came: false,
             growth_waited: 0,
             growth_due_at: None,
             growth_lead: 0,
@@ -2803,6 +2808,32 @@ impl<F: BlockFile> ShardDb<F> {
         }
     }
 
+    /// Room found short at a runtime task's idle step: a packing's hand-off, a ready job's grant
+    /// or a worker's ask wanted more extents than the file has admitted. The growth that brings
+    /// them is booked now, where none is out and a worker is free ([`Self::grow`], which waits
+    /// for a worker to free where none is), so it runs from the moment the room was wanted. A
+    /// growth that landed meanwhile is progress, and the task passes again, its waiters taking
+    /// the room; otherwise, while a growth is out, the task waits for a worker's message, that
+    /// growth's result among them, rather than trying again at every pass. Called once the room's
+    /// owners are held where a failure leaves them (`self.packing`, the trunk's tasks), from the
+    /// step whose failure the range keeps as its fault.
+    fn wait_for_room(&mut self) -> Result<(), Error> {
+        let out = self.growth.map(|(ticket, ..)| ticket);
+        self.grow(false)?;
+        let landed = out.is_some() && self.growth.map(|(ticket, ..)| ticket) != out;
+        if landed {
+            // Its room may meet a wait declared before it, whichever message that wait named:
+            // the task passes again, each waiter declaring afresh what it still waits for.
+            self.room_came = true;
+            self.trunk.clear_io_wait();
+        } else if self.growth.is_some()
+            && let Some(pool) = self.trunk.pool_mut()
+        {
+            pool.want_message();
+        }
+        Ok(())
+    }
+
     /// Grows a file kept as segments until `extents` can be handed out, waiting for each growth:
     /// for the shard's own allocations where it may wait.
     fn grow_for(&mut self, extents: u64) -> Result<(), Error> {
@@ -3740,6 +3771,7 @@ impl<F: BlockFile> ShardDb<F> {
     /// of the work owed that the turn's puts wrote paid, once a turn rather than at every put
     /// (research/52). Nothing while a checkpoint holds the trunk still.
     pub(crate) fn take_results(&mut self) -> Result<(), Error> {
+        self.room_came = false;
         self.require_async_backend()?;
         if self.checkpoint_frozen() {
             return Ok(());
@@ -3769,6 +3801,11 @@ impl<F: BlockFile> ShardDb<F> {
         }
         self.trunk.clear_io_wait();
         let done = self.idle_step_with(keys, true)?;
+        // A hand-off, a grant or an ask left waiting for room: its growth is booked before the task
+        // can wait, and the wait is for that growth's result.
+        if self.packing_wanted > 0 || self.trunk.wants_room() {
+            self.wait_for_room()?;
+        }
         let f = &mut self.flush_stats;
         f.idle_slices = f.idle_slices.saturating_add(1);
         f.idle_units = f.idle_units.saturating_add(done);
@@ -3776,12 +3813,13 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     pub(crate) fn waiting_for_io(&self) -> bool {
-        self.trunk.waiting_for_worker()
-            || ((self.stopping
-                || self.rotation.is_some()
-                || self.checkpoint.is_some()
-                || self.trunk.waiting_for_io())
-                && self.store.io_outstanding())
+        !self.room_came
+            && (self.trunk.waiting_for_worker()
+                || ((self.stopping
+                    || self.rotation.is_some()
+                    || self.checkpoint.is_some()
+                    || self.trunk.waiting_for_io())
+                    && self.store.io_outstanding()))
     }
 
     pub(crate) async fn wait_completion(&mut self) -> Result<bool, Error> {

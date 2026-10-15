@@ -2190,6 +2190,12 @@ impl Trunk {
         std::mem::take(&mut self.capacity_wanted)
     }
 
+    /// Whether a ready job's grant, or a worker's ask, waits for room the shard's admitted
+    /// extents cannot give yet: the shard books its growth before it waits.
+    pub(crate) fn wants_room(&self) -> bool {
+        self.capacity_wanted > 0 || self.pool.as_ref().is_some_and(|p| p.needs_wanted() > 0)
+    }
+
     pub fn stats(&self) -> TrunkStats {
         let mut shape = [LevelShape::default(); SHAPE_DEPTHS];
         for (depth, level) in self.levels().into_iter().enumerate() {

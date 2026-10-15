@@ -157,6 +157,17 @@ fn segment_bound(issuer_depth: usize) -> usize {
 #[global_allocator]
 static ALLOCATOR: alloc::Counting = alloc::Counting;
 
+/// CLOCK_MONOTONIC in nanoseconds, for the phase bounds a profile is checked against: the
+/// `profile-phases` diagnostic only.
+#[cfg(feature = "profile-phases")]
+fn mono_ns() -> u64 {
+    let t = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    u64::try_from(t.tv_sec)
+        .unwrap_or(0)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u64::try_from(t.tv_nsec).unwrap_or(0))
+}
+
 /// The process's allocation counts with the `count-allocs` feature; without it, none: unmeasured.
 fn allocs() -> Option<alloc::Counts> {
     #[cfg(feature = "count-allocs")]
@@ -528,6 +539,10 @@ impl Workload {
         };
         // Its start and end as they happen, so a profiler can sample this phase alone.
         println!("phase {name} start");
+        // With the `profile-phases` diagnostic: the phase's start on CLOCK_MONOTONIC, the clock
+        // `perf record -k mono` stamps samples on, so a profile is checked against its phases.
+        #[cfg(feature = "profile-phases")]
+        println!("phasemono {name} start {}", mono_ns());
         let thread = 0;
         let mut client = ranges.client()?;
         let mut rng = self.rng(phase, thread);
@@ -602,6 +617,8 @@ impl Workload {
             };
             found += u64::from(hit);
         }
+        #[cfg(feature = "profile-phases")]
+        println!("phasemono {name} end {}", mono_ns());
         println!("phase {name} end");
         println!("{name} inline {} of {n}", client.inlined());
         // Match the threaded driver's joined histogram aggregation.
@@ -1010,18 +1027,16 @@ fn main() -> Result<(), BenchError> {
         rt.tasks_per_shard
     );
     println!(
-        "workload generator rocksdb-mt19937_64 seed {seed} key_padding ascii-0 values repeated-v value_bytes {} num {num} client_threads {threads} ranges {threads} shards {threads} reads_per_thread {reads} seeks_per_thread {seeks} seek_nexts {seek_nexts} issuer_depth {issuer_depth} runs_in_flight_per_range {issuer_depth} cache_mib {cache_mib} write_budget_mib {write_budget_mib} oracle_keys {} throughput full-oracle latency api-only barriers flush+durable-checkpoint",
+        "workload generator rocksdb-mt19937_64 seed {seed} key_padding ascii-0 values repeated-v value_bytes {} num {num} client_threads {threads} ranges {threads} shards {threads} reads_per_thread {reads} seeks_per_thread {seeks} seek_nexts {seek_nexts} issuer_depth {issuer_depth} runs_in_flight_per_range {issuer_depth} cache_mib {cache_mib} write_budget_mib {write_budget_mib} oracle_keys {} throughput full-oracle latency since-previous-completion barriers flush+durable-checkpoint",
         fill_value().len(),
         workload.present.len()
     );
     // The diagnostics compiled into this build: a performance run has none.
+    let state = |on: bool| if on { "on" } else { "off" };
     println!(
-        "harness diagnostics count_allocs {}",
-        if cfg!(feature = "count-allocs") {
-            "on"
-        } else {
-            "off"
-        }
+        "harness diagnostics count_allocs {} profile_phases {}",
+        state(cfg!(feature = "count-allocs")),
+        state(cfg!(feature = "profile-phases"))
     );
     println!(
         "runtime shards {} step_budget_ns {} spin_ns {} batch {}",

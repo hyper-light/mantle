@@ -28,6 +28,9 @@ windows-sys.workspace = true
 # global allocator: a diagnostic, off by default and never in a performance build. Off, the bench
 # runs on the system allocator and reports its allocation counts as unavailable.
 count-allocs = []
+# The ranges bench's phase bounds on CLOCK_MONOTONIC ("phasemono" lines), for checking a profile's
+# samples against its phases: a diagnostic, off by default and never in a performance build.
+profile-phases = []
 
 [dev-dependencies]
 # The simulated device with power-loss semantics the store's crash tests run on.

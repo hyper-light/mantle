@@ -6,7 +6,8 @@ is listed here, and every such file is FFI to an OS interface with each block co
 
 Every numeric constant in production code has a row in docs/design/constants.md saying what
 kind of value it is and what establishes it, and every row names a constant that exists
-(audit §12.6).
+(audit §12.6). Test code is not production code: an inline `#[cfg(test)]` module's body, and a
+file only `#[cfg(test)]` module declarations include (`#[path]` or not).
 """
 import pathlib
 import re
@@ -38,15 +39,49 @@ CONST = re.compile(
 )
 ROW = re.compile(r"^\|\s*`([^`]+)`\s+`([^`]+)`\s*\|\s*([a-z]+)\s*\|")
 TEST_MODULE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+")
+MOD_FILE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;")
+PATH_ATTR = re.compile(r'^\s*#\[path\s*=\s*"([^"]+)"\]')
 
 ALLOW_UNSAFE = re.compile(r"allow\s*\(\s*unsafe_code\s*\)")
 UNSAFE_BLOCK = re.compile(r"\bunsafe\s*(\{|fn\b|extern\b|impl\b)")
 
 
+def test_only_files():
+    """The files under crates/*/src that only `#[cfg(test)]` module declarations include: each
+    `mod NAME;` resolved as rustc does (a `#[path]` from the declaring file's directory; else
+    NAME.rs or NAME/mod.rs in the module's directory), test code when every declaration of it is
+    under `#[cfg(test)]`."""
+    test, production = set(), set()
+    for path in ROOT.glob("crates/*/src/**/*.rs"):
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for i, line in enumerate(lines):
+            m = MOD_FILE.match(line)
+            if not m:
+                continue
+            # The attributes on the declaration: the lines above it that are attributes.
+            attrs = []
+            for above in reversed(lines[:i]):
+                if not above.strip().startswith("#["):
+                    break
+                attrs.append(above)
+            cfg_test = any(a.strip() == "#[cfg(test)]" for a in attrs)
+            given = next((PATH_ATTR.match(a).group(1) for a in attrs if PATH_ATTR.match(a)), None)
+            if given is not None:
+                targets = [(path.parent / given).resolve()]
+            else:
+                base = path.parent if path.name in ("mod.rs", "lib.rs", "main.rs") else path.parent / path.stem
+                targets = [(base / f"{m.group(1)}.rs").resolve(), (base / m.group(1) / "mod.rs").resolve()]
+            (test if cfg_test else production).update(targets)
+    return test - production
+
+
 def production_constants():
-    """Every numeric constant outside test modules in crates/*/src, as (file, name)."""
+    """Every numeric constant outside test code in crates/*/src, as (file, name)."""
     found = []
+    skip = test_only_files()
     for path in sorted(ROOT.glob("crates/*/src/**/*.rs")):
+        if path.resolve() in skip:
+            continue
         rel = path.relative_to(ROOT).as_posix()
         lines = path.read_text(encoding="utf-8").splitlines()
         for i, line in enumerate(lines):

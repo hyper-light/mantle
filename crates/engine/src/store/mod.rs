@@ -321,9 +321,26 @@ impl OriginalFence for OriginalPhysical {
     }
 }
 
-/// Asks the shard for `n` more extents and waits for them: a worker's, whose job outgrew its
-/// grant.
-pub struct Refill(pub Box<dyn FnMut(usize) -> Result<Vec<u64>, Error> + Send>);
+/// What a worker whose job outgrew its grant tells the shard: it wants `n` more extents, or the
+/// outcome of the growth the shard handed it in reply ([`TopUp::Grow`]).
+#[derive(Debug)]
+pub enum Ask {
+    Extents(usize),
+    Grown(Result<(), Error>),
+}
+
+/// The shard's reply to an [`Ask`]: the extents, or a segment booked for the asking worker to add
+/// and write whole first ([`Store::grow_segment`]): the shard's file must grow before the ask can
+/// be answered, and every worker that could grow it waits for extents itself. The worker then
+/// tells the shard the growth's outcome and waits again.
+#[derive(Debug)]
+pub enum TopUp {
+    Extents(Vec<u64>),
+    Grow { start: u64, extents: u64, add: bool },
+}
+
+/// Asks the shard and waits for its reply: a worker's, whose job outgrew its grant.
+pub struct Refill(pub Box<dyn FnMut(Ask) -> Result<TopUp, Error> + Send>);
 
 impl std::fmt::Debug for Refill {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1210,10 +1227,34 @@ impl<F: BlockFile> Store<F> {
                 let n = usize::try_from(self.alloc.limit())
                     .unwrap_or(usize::MAX)
                     .max(1);
-                let more = match self.refill.as_mut() {
-                    Some(Refill(ask)) => ask(n)?,
-                    None => Vec::new(),
-                };
+                // Each growth the shard hands an ask is reported, then admitted before the next,
+                // adding at least an extent, and the file holds at most `max_extents`: an ask
+                // takes at most that many growths before its extents or a refusal.
+                let replies = usize::try_from(self.config.max_extents)
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(1);
+                let mut ask = Ask::Extents(n);
+                let mut more = None;
+                for _ in 0..replies {
+                    let reply = match self.refill.as_mut() {
+                        Some(Refill(refill)) => refill(ask)?,
+                        None => TopUp::Extents(Vec::new()),
+                    };
+                    match reply {
+                        TopUp::Extents(extents) => {
+                            more = Some(extents);
+                            break;
+                        }
+                        TopUp::Grow {
+                            start,
+                            extents,
+                            add,
+                        } => ask = Ask::Grown(self.grow_segment(start, extents, add)),
+                    }
+                }
+                let more = more.ok_or(Error::InvalidArgument {
+                    what: "more growths handed one ask for extents than the file has extents",
+                })?;
                 self.alloc.grant_more(&more);
                 self.alloc.allocate()
             }

@@ -2698,7 +2698,8 @@ impl<F: BlockFile> ShardDb<F> {
     /// growth back from its worker, waiting for it when `wait`, admits its segment and answers the
     /// asks for extents that waited for it; then, with fewer extents left than a segment and the
     /// lead, or than any grant waiting wants, books the next segment and hands it to a worker to
-    /// add and write whole. A segment is as large as the largest grant asked; the lead is the most
+    /// add and write whole: a free one, or, when every seat is held, the worker whose ask for
+    /// extents waits longest ([`Pool::send_growth`]). A segment is as large as the largest grant asked; the lead is the most
     /// the allocations took from the time a growth came due to its segment's admission, the wait
     /// for a free worker and any grant that waited included, so the next growth starts that far
     /// ahead. A larger segment would not help: it takes the longer to write. Without workers it
@@ -2777,11 +2778,7 @@ impl<F: BlockFile> ShardDb<F> {
             generation: self.store.generation(),
             keep: None,
         });
-        let sent = match pool.can_take(&mut self.store, true) {
-            Ok(true) => pool.send(job, Owner::Grow, true),
-            Ok(false) => Ok(Err(job)),
-            Err(error) => Err((error, job)),
-        };
+        let sent = pool.send_growth(&mut self.store, job);
         match sent {
             Ok(Ok(ticket)) => {
                 self.growth = Some((ticket, p.start, p.extents));

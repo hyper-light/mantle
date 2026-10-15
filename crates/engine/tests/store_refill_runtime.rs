@@ -19,7 +19,7 @@ use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_rt::runtime::interests_for;
 use hyper_rt::{Runtime, RuntimeConfig};
 use mantle_engine::Error;
-use mantle_engine::store::{Config, Refill, Store};
+use mantle_engine::store::{Config, Refill, Store, TopUp};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 
@@ -88,7 +88,7 @@ fn runtime_refill_refuses_before_callback_then_the_same_grant_resumes_cold() {
             op: "release native refill oracle",
             detail: error.to_string(),
         })?;
-        Ok(vec![second])
+        Ok(TopUp::Extents(vec![second]))
     })));
     let roles = 1; // One actual runtime call; the release is the cold test controller.
     let rt = Runtime::start(&RuntimeConfig {

@@ -38,7 +38,7 @@ use crate::branch::{Branch, Builder};
 use crate::error::Error;
 use crate::memtable::hashed::Sorter;
 use crate::store::cache::Kept;
-use crate::store::{Config, IntoFile, Refill, Store};
+use crate::store::{Ask, Config, IntoFile, Refill, Store, TopUp};
 use hyper_block::block::BlockFile;
 
 /// A compaction for a worker: `inputs` newest first, the descriptors a merge reads (no filters),
@@ -206,6 +206,12 @@ pub(crate) enum Message {
         worker: usize,
         result: Result<(), Error>,
     },
+    /// The outcome of the growth handed to a worker whose ask waited for it ([`TopUp::Grow`]);
+    /// the worker then waits for its ask's answer.
+    Grown {
+        worker: usize,
+        result: Result<(), Error>,
+    },
 }
 
 /// The most messages one worker sends before the shard must take one, counted from [`serve`]:
@@ -223,7 +229,7 @@ const MESSAGES_A_WORKER: usize = 2;
 pub struct Seat {
     pub id: usize,
     jobs: Receiver<Box<Job>>,
-    more: Receiver<Result<Vec<u64>, Error>>,
+    more: Receiver<Result<TopUp, Error>>,
     back: Sender<Message>,
     /// The device's issuer and the batches the worker may have out on it, when the shard has
     /// one: its store's writes then go to the device while the worker builds on.
@@ -285,8 +291,12 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
         return;
     }
     let asks = back.clone();
-    store.set_refill(Refill(Box::new(move |n| {
-        asks.blocking_send(Message::Need { worker: id, n })
+    store.set_refill(Refill(Box::new(move |ask| {
+        let message = match ask {
+            Ask::Extents(n) => Message::Need { worker: id, n },
+            Ask::Grown(result) => Message::Grown { worker: id, result },
+        };
+        asks.blocking_send(message)
             .map_err(|_| gone("ask the shard for extents"))?;
         more.recv()
             .map_err(|_| gone("take extents from the shard"))?
@@ -486,7 +496,7 @@ fn gone(what: &'static str) -> Error {
 #[derive(Debug)]
 struct Worker {
     jobs: Option<SyncSender<Box<Job>>>,
-    more: Option<SyncSender<Result<Vec<u64>, Error>>>,
+    more: Option<SyncSender<Result<TopUp, Error>>>,
     thread: Option<JoinHandle<()>>,
     owner: Option<Owner>,
     job: u64,
@@ -509,6 +519,10 @@ pub struct Pool {
     /// Workers' asks for more extents the shard's admitted extents could not give yet, oldest
     /// first: at most one a worker, each waiting for its one reply.
     needs: VecDeque<(usize, usize)>,
+    /// The growth handed to a waiting asker instead of a free worker ([`Self::send_growth`]):
+    /// the asker, its ask, and the growth's ticket. Its ask waits outside `needs` until the
+    /// asker reports the growth.
+    growing: Option<(usize, usize, Ticket)>,
     /// Jobs handed to workers since the pool began: the next one's number ([`Ticket`]).
     handed: u64,
     /// The cores the OS reports less the shard's own: the most workers.
@@ -581,6 +595,7 @@ impl Pool {
             messages,
             undelivered: VecDeque::new(),
             needs: VecDeque::new(),
+            growing: None,
             handed: 0,
             most,
             want: 1,
@@ -972,6 +987,120 @@ impl Pool {
     /// [`Self::can_take`] states for `waiting`: the job's ticket, which its result carries back,
     /// or the job back when every worker is busy. Every hard refusal returns its owned job too,
     /// before any grant is lost.
+    /// The growth handed to `worker` when its job ended or it retired without reporting it
+    /// (it unwound in the segment's write, or its report could not be sent): the growth comes
+    /// back under its ticket as failed, with `cause`, the worker's own failure, when it has one,
+    /// so whoever takes the growth's result sees the cause the close reports; the shard takes it
+    /// as it takes a growth job's failure, its booking left pending to be booked again.
+    fn growth_unreported(&mut self, worker: usize, cause: Option<Error>) {
+        let Some((_, _, ticket)) = self.growing.take_if(|(asker, _, _)| *asker == worker) else {
+            return;
+        };
+        let error = cause.unwrap_or_else(|| Error::Io {
+            op: "grow the shard's file on a worker waiting for extents",
+            detail: "the worker ended before it reported the growth".into(),
+        });
+        self.close_error.get_or_insert_with(|| error.clone());
+        self.undelivered.push_back((
+            Owner::Grow,
+            Back {
+                ticket,
+                result: Err(error.clone()),
+                kept: None,
+                physical_error: Some(error),
+                topped: Vec::new(),
+                sorted: None,
+                indexed: None,
+            },
+        ));
+    }
+
+    /// Hands `job`, a growth of the shard's file, to a worker free within the cores; with none
+    /// free and an ask for extents waiting for growth, to the oldest such asker as its reply
+    /// ([`TopUp::Grow`]), which adds and writes the segment whole and reports it
+    /// ([`Message::Grown`]) before its ask is answered. A worker waiting for extents holds its
+    /// seat, so when every seat's job waits for extents the file still grows, by a worker that
+    /// would otherwise wait. The ticket names the growth's result as [`Self::send`]'s does; the
+    /// job back when no worker can take it.
+    pub fn send_growth<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        job: Box<Job>,
+    ) -> Result<Result<Ticket, Box<Job>>, (Error, Box<Job>)> {
+        // As [`Self::send`] admits: a runtime's pool hands out nothing before its preparation,
+        // and nothing is taken from the workers or answered first.
+        if hyper_rt::registry::current_shard().is_some() && !self.prepared() {
+            return Err((
+                Error::InvalidArgument {
+                    what: "runtime worker admission before preparation",
+                },
+                job,
+            ));
+        }
+        match self.can_take(store, true) {
+            Ok(true) => return self.send(job, Owner::Grow, true),
+            Ok(false) => {}
+            Err(error) => return Err((error, job)),
+        }
+        if self.closing || self.growing.is_some() {
+            return Ok(Err(job));
+        }
+        let Some(&(asker, n)) = self.needs.front() else {
+            return Ok(Err(job));
+        };
+        let Work::Grow(growth) = &job.work else {
+            return Err((
+                Error::InvalidArgument {
+                    what: "a growth handed out that is not one",
+                },
+                job,
+            ));
+        };
+        let reply = TopUp::Grow {
+            start: growth.start,
+            extents: growth.extents,
+            add: growth.add,
+        };
+        let Some(next) = self.handed.checked_add(1) else {
+            return Err((
+                Error::InvalidArgument {
+                    what: "a maintenance job past the pool's job numbers",
+                },
+                job,
+            ));
+        };
+        let Some(more) = self
+            .workers
+            .get(asker)
+            .and_then(Option::as_ref)
+            .and_then(|w| w.more.as_ref())
+        else {
+            return Err((gone("hand a waiting worker its growth"), job));
+        };
+        match more.try_send(Ok(reply)) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                return Err((
+                    Error::InvalidArgument {
+                        what: "a maintenance worker's top-up still pending",
+                    },
+                    job,
+                ));
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                return Err((gone("hand a waiting worker its growth"), job));
+            }
+        }
+        self.needs.pop_front();
+        self.handed = next;
+        let ticket = Ticket {
+            worker: asker,
+            job: next,
+        };
+        self.growing = Some((asker, n, ticket));
+        Ok(Ok(ticket))
+    }
+
     pub fn send(
         &mut self,
         job: Box<Job>,
@@ -1147,6 +1276,7 @@ impl Pool {
                 if self.workers.get(worker).and_then(Option::as_ref).is_none() {
                     return Err(gone("take a worker's terminal result"));
                 }
+                self.growth_unreported(worker, result.as_ref().err().cloned());
                 if let Err(error) = result {
                     self.close_error.get_or_insert(error);
                 }
@@ -1184,7 +1314,7 @@ impl Pool {
                     .more
                     .as_ref()
                     .ok_or(gone("give a closing worker extents"))?
-                    .try_send(more)
+                    .try_send(more.map(TopUp::Extents))
                 {
                     Ok(()) => {}
                     Err(std::sync::mpsc::TrySendError::Full(_)) => {
@@ -1195,6 +1325,62 @@ impl Pool {
                     Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                         return Err(gone("give a worker extents"));
                     }
+                }
+            }
+            Message::Grown { worker, result } => {
+                let Some((asker, n, ticket)) = self.growing.take() else {
+                    return Err(Error::InvalidArgument {
+                        what: "a growth reported by a worker handed none",
+                    });
+                };
+                if asker != worker {
+                    return Err(Error::InvalidArgument {
+                        what: "a growth reported by a worker handed none",
+                    });
+                }
+                // A failed segment write is the pool's first cause from here, whatever takes
+                // the growth's result or refuses the ask after it.
+                let physical_error = result.as_ref().err().cloned();
+                if let Some(error) = &physical_error {
+                    self.close_error.get_or_insert_with(|| error.clone());
+                }
+                // The growth comes back to the file's grower as a growth job's result would:
+                // nothing made, no grant, its time the asker's own job's.
+                self.undelivered.push_back((
+                    Owner::Grow,
+                    Back {
+                        ticket,
+                        result: result.map(|()| Output {
+                            parts: Vec::new(),
+                            unused: Vec::new(),
+                            end: store.end(),
+                            ns: 0,
+                            units: 0,
+                            kept: None,
+                        }),
+                        kept: None,
+                        physical_error,
+                        topped: Vec::new(),
+                        sorted: None,
+                        indexed: None,
+                    },
+                ));
+                if self.closing {
+                    // Closing refused the asks that waited; this one is refused now, as the
+                    // worker waits for one more reply.
+                    let refused = self
+                        .workers
+                        .get(asker)
+                        .and_then(Option::as_ref)
+                        .and_then(|w| w.more.as_ref())
+                        .map(|more| more.try_send(Err(gone("give a closing worker extents"))));
+                    if let Some(Err(std::sync::mpsc::TrySendError::Disconnected(_))) = refused {
+                        self.close_error
+                            .get_or_insert(gone("give a closing worker extents"));
+                    }
+                } else {
+                    // Answered first once the growth is admitted ([`Self::answer_needs`]).
+                    self.needs.push_front((asker, n));
                 }
             }
             Message::Done {
@@ -1210,6 +1396,10 @@ impl Pool {
                 if let Some(error) = &physical_error {
                     self.close_error.get_or_insert_with(|| error.clone());
                 }
+                let cause = physical_error
+                    .clone()
+                    .or_else(|| result.as_ref().err().cloned());
+                self.growth_unreported(worker, cause);
                 let w = self
                     .workers
                     .get_mut(worker)
@@ -1278,7 +1468,7 @@ impl Pool {
                 .more
                 .as_ref()
                 .ok_or(gone("give a closing worker extents"))?
-                .try_send(more)
+                .try_send(more.map(TopUp::Extents))
             {
                 Ok(()) => {}
                 Err(std::sync::mpsc::TrySendError::Full(_)) => {
@@ -1308,6 +1498,7 @@ impl Pool {
             .flatten()
             .any(|w| w.owner == Some(owner))
             || self.undelivered.iter().any(|(o, _)| *o == owner)
+            || (owner == Owner::Grow && self.growing.is_some())
     }
 }
 
@@ -1368,3 +1559,7 @@ mod retirement_first_error_native;
 #[cfg(test)]
 #[path = "seat_freed.rs"]
 mod seat_freed;
+
+#[cfg(test)]
+#[path = "growth_asker.rs"]
+mod growth_asker;

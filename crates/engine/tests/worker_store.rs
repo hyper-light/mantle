@@ -159,10 +159,14 @@ fn a_job_past_its_grant_asks_for_more_and_writes_the_same() {
         .unwrap();
     let mut handed = grant.clone();
     let mut pool = spare.clone();
-    worker.set_refill(mantle_engine::store::Refill(Box::new(move |n| {
+    worker.set_refill(mantle_engine::store::Refill(Box::new(move |ask| {
+        // No reply here hands a growth, so every ask is for extents.
+        let mantle_engine::store::Ask::Extents(n) = ask else {
+            panic!("a growth reported with none handed: {ask:?}");
+        };
         let more: Vec<u64> = pool.drain(..n.min(pool.len())).collect();
         tx.send((n, more.clone())).unwrap();
-        Ok(more)
+        Ok(mantle_engine::store::TopUp::Extents(more))
     })));
     let there = compact_split(&mut worker, &inputs, b"", None, false, u64::MAX).unwrap();
     worker.drain().unwrap();

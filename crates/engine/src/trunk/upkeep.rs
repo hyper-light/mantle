@@ -172,7 +172,7 @@ impl Trunk {
         let pending = self
             .pending
             .iter()
-            .map(|b| b.count)
+            .map(super::Pending::entries)
             .fold(0, u64::saturating_add);
         self.tasks
             .iter()
@@ -280,7 +280,7 @@ impl Trunk {
         if self.abandoning.is_some() {
             return self.abandon_tasks(store).map(|_| 0);
         }
-        self.incorporate_pending()?;
+        self.incorporate_pending(store)?;
         self.start_consolidation()?;
         self.sweep();
         self.look(store)?;
@@ -289,7 +289,7 @@ impl Trunk {
             self.tend_tasks(store)?;
         }
         self.apply_done(store)?;
-        self.incorporate_pending()?;
+        self.incorporate_pending(store)?;
         self.look(store)?;
         if self.pool.is_some() && self.abandoning.is_none() {
             self.dispatch_tasks(store)?;
@@ -298,9 +298,11 @@ impl Trunk {
         Ok(used)
     }
 
-    /// Moves the pending branches into the root's in-flight list, oldest first, unless the root
-    /// is changing: they wait as pending, read before the tree, until the change is applied.
-    fn incorporate_pending(&mut self) -> Result<(), Error> {
+    /// Moves the pending branches into the root, oldest first, unless the root is changing: they
+    /// wait as pending, read before the tree, until the change is applied. A memtable packed at
+    /// the root's pivot keys goes into the pivots' bundles where [`Self::takes_parts`], its pages
+    /// adopted into the cache; any other enters the in-flight list.
+    fn incorporate_pending<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
         if self.pending.is_empty() || self.node(self.root)?.wants.is_some() {
             return Ok(());
         }
@@ -311,14 +313,64 @@ impl Trunk {
             p.period_started();
         }
         let root = self.root;
-        for b in std::mem::take(&mut self.pending) {
-            self.entered = self.entered.saturating_add(b.count);
-            self.held = self.held.saturating_add(b.count);
-            self.node_mut(root)?.inflight.push(vec![b]);
+        for p in std::mem::take(&mut self.pending) {
+            let entries = p.entries();
+            self.entered = self.entered.saturating_add(entries);
+            self.held = self.held.saturating_add(entries);
+            if self.takes_parts(&p)? {
+                self.stats.parted_entries = self.stats.parted_entries.saturating_add(entries);
+                // The branches stay in the tree as written: their pages cached where they were
+                // written, as a compaction's are.
+                if let Some(kept) = p.kept {
+                    store.adopt_pages(*kept);
+                }
+                let node = self.node_mut(root)?;
+                for (j, b) in p.parts {
+                    node.pivots
+                        .get_mut(j)
+                        .ok_or(corrupt())?
+                        .bundle
+                        .push_newest(b);
+                }
+            } else {
+                // Compacted next: the compaction's pages are the ones to cache.
+                if let Some(kept) = p.kept {
+                    store.unlend_pages(*kept);
+                }
+                let bundle = p.parts.into_iter().map(|(_, b)| b).collect();
+                self.node_mut(root)?.inflight.push(bundle);
+            }
         }
         self.node_mut(root)?.received = true;
         self.queue(root);
         Ok(())
+    }
+
+    /// Whether the root takes `p`'s branches straight into its pivots' bundles: its pivots are
+    /// those `p`'s packing ended its branches at, and no pivot taking one has a live in-flight
+    /// bundle, a compaction out or a child that will split. Each such pivot's compaction would
+    /// then have had that branch alone for input and written its entries again, unchanged, as the
+    /// pivot's newest bundle branch: 78.8M of the 374.0M entries a 100M fill wrote (research/57
+    /// §7). Otherwise the branches enter as one in-flight bundle and are compacted.
+    fn takes_parts(&self, p: &super::Pending) -> Result<bool, Error> {
+        let node = self.node(self.root)?;
+        if node.leaf
+            || p.cuts.is_empty()
+            || node.pivots.len() != p.cuts.len()
+            || node.pivots.iter().zip(&p.cuts).any(|(q, c)| q.key != *c)
+        {
+            return Ok(false);
+        }
+        for (j, _) in &p.parts {
+            let pivot = node.pivots.get(*j).ok_or(corrupt())?;
+            if node.inflight.len() > pivot.start
+                || self.compacting(self.root, &pivot.key)
+                || self.held(pivot)?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Idle time's consolidation, when seeks paid for one and nothing else is in progress: the

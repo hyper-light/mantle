@@ -537,6 +537,51 @@ fn a_workers_pages_are_cached_where_they_were_written() {
     db.check_references().unwrap();
 }
 
+/// A memtable packed at the root's pivot keys goes into their bundles as written, its pages kept
+/// in the cache where they were written, as a compaction's are (research/57 §7). After a workload
+/// whose maintenance has run to its end, a memtable of twenty keys written nowhere else is
+/// flushed: its packing finds the root's pivots as they were and nothing in flight, so all twenty
+/// entries go into the root's bundles, too few for a pivot to flush them on; with no memtable kept
+/// for gets (no memory budget), each of those keys' gets reads its branch in the root, and none
+/// reads a page from the device. Every read exact and every reference accounted.
+#[test]
+fn a_packing_taken_into_the_roots_bundles_is_cached_where_it_was_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let mut db = ShardDb::create(open(&path, true), STORE, MEM, TRUNK).unwrap();
+    db.set_cache(1 << 16);
+    workers(&mut db, &path);
+    let mut oracle = workload(&mut db, false, 0x2c1b_3c6d_6e5a_7f81);
+    db.flush().unwrap();
+    while db.owed() {
+        db.idle_step(64).unwrap();
+    }
+    let before = db.stats().1.parted_entries;
+    let fresh: Vec<u64> = (KEYS..KEYS + 20).collect();
+    for &k in &fresh {
+        let v = format!("fresh-{k}").into_bytes();
+        db.put(&key(k), &v).unwrap();
+        oracle.insert(k, Some(v));
+    }
+    db.flush().unwrap();
+    let (_, trunk, io) = db.stats();
+    assert_eq!(
+        trunk.parted_entries - before,
+        fresh.len() as u64,
+        "the fresh memtable did not go into the root's bundles: {trunk:?}"
+    );
+    let reads = io.device_reads;
+    for &k in &fresh {
+        check(&mut db, &oracle, k);
+    }
+    let (_, _, io) = db.stats();
+    assert_eq!(io.device_reads, reads, "{io:?}");
+    for k in 0..KEYS {
+        check(&mut db, &oracle, k);
+    }
+    db.check_references().unwrap();
+}
+
 /// The same with the shard's runs on a two-worker issuer: a job waits for its inputs' runs to
 /// land before a worker reads them.
 #[test]

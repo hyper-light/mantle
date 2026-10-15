@@ -159,13 +159,22 @@ static ALLOCATOR: alloc::Counting = alloc::Counting;
 
 /// CLOCK_MONOTONIC in nanoseconds, for the phase bounds a profile is checked against: the
 /// `profile-phases` diagnostic only.
-#[cfg(feature = "profile-phases")]
+#[cfg(all(feature = "profile-phases", unix))]
 fn mono_ns() -> u64 {
     let t = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
     u64::try_from(t.tv_sec)
         .unwrap_or(0)
         .saturating_mul(1_000_000_000)
         .saturating_add(u64::try_from(t.tv_nsec).unwrap_or(0))
+}
+
+/// Where there is no CLOCK_MONOTONIC (Windows): the nanoseconds since the bench's first reading
+/// of its monotonic clock (`Instant`, QueryPerformanceCounter on Windows), so the phase bounds
+/// still order a profile's samples from the process's start.
+#[cfg(all(feature = "profile-phases", not(unix)))]
+fn mono_ns() -> u64 {
+    static FIRST: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    u64::try_from(FIRST.get_or_init(Instant::now).elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// The process's allocation counts with the `count-allocs` feature; without it, none: unmeasured.

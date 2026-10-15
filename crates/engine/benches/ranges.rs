@@ -151,8 +151,23 @@ fn segment_bound(issuer_depth: usize) -> usize {
     (limit / (1 + issuer_depth + cores)).max(2)
 }
 
+// The allocation count is a diagnostic: compiled in only with the `count-allocs` feature, so a
+// performance run allocates through the system allocator with nothing counted.
+#[cfg(feature = "count-allocs")]
 #[global_allocator]
 static ALLOCATOR: alloc::Counting = alloc::Counting;
+
+/// The process's allocation counts with the `count-allocs` feature; without it, none: unmeasured.
+fn allocs() -> Option<alloc::Counts> {
+    #[cfg(feature = "count-allocs")]
+    {
+        Some(alloc::read_process())
+    }
+    #[cfg(not(feature = "count-allocs"))]
+    {
+        None
+    }
+}
 
 /// The value every put writes: `--value-bytes=N` bytes of `v` (100 unless given), set once
 /// before any workload runs. A 1B-key run takes a smaller value where 100 bytes a key would not
@@ -174,7 +189,7 @@ fn require(holds: bool, what: &'static str) -> Result<(), BenchError> {
 
 struct Mark {
     at: Instant,
-    alloc: alloc::Counts,
+    alloc: Option<alloc::Counts>,
     faults: faults::Faults,
     switches: Option<u64>,
     usage: Option<usage::Usage>,
@@ -184,7 +199,7 @@ impl Mark {
     fn now() -> Result<Self, BenchError> {
         Ok(Self {
             at: Instant::now(),
-            alloc: alloc::read_process(),
+            alloc: allocs(),
             faults: faults::read()?,
             switches: faults::switches().ok(),
             usage: usage::this().ok(),
@@ -193,7 +208,15 @@ impl Mark {
 }
 
 fn costs(name: &str, ops: u64, from: &Mark, to: &Mark) {
-    let a = to.alloc.less(&from.alloc);
+    let a = to.alloc.zip(from.alloc).map(|(to, from)| to.less(&from));
+    // An allocation count the build did not take is unavailable, never zero.
+    let count = |n: Option<u64>, places: usize| {
+        n.map_or_else(
+            || "unavailable".to_string(),
+            |n| format!("{:.places$}", n as f64 / ops as f64),
+        )
+    };
+    let total = |n: Option<u64>| n.map_or_else(|| "unavailable".to_string(), |n| n.to_string());
     let f = to.faults.since(&from.faults);
     let process = to.usage.zip(from.usage).map(|(a, b)| a.since(&b));
     let per_op = |count: Option<u64>| {
@@ -203,14 +226,14 @@ fn costs(name: &str, ops: u64, from: &Mark, to: &Mark) {
         )
     };
     println!(
-        "{name} elapsed {:.6}s allocs/op {:.3} reallocs/op {:.3} bytes/op {:.1} faults/op {:.4} (allocs {} reallocs {} faults {})",
+        "{name} elapsed {:.6}s allocs/op {} reallocs/op {} bytes/op {} faults/op {:.4} (allocs {} reallocs {} faults {})",
         to.at.duration_since(from.at).as_secs_f64(),
-        a.allocations as f64 / ops as f64,
-        a.reallocations as f64 / ops as f64,
-        a.bytes as f64 / ops as f64,
+        count(a.map(|a| a.allocations), 3),
+        count(a.map(|a| a.reallocations), 3),
+        count(a.map(|a| a.bytes), 1),
         f.total() as f64 / ops as f64,
-        a.allocations,
-        a.reallocations,
+        total(a.map(|a| a.allocations)),
+        total(a.map(|a| a.reallocations)),
         f.total(),
     );
     println!(
@@ -951,6 +974,7 @@ fn main() -> Result<(), BenchError> {
     let all_batches = mantle_engine::shard_db::issuer_batches(issuer_depth, issuer_depth)
         .checked_mul(usize::try_from(threads)?)
         .ok_or_else(overflow)?;
+    #[cfg(feature = "count-allocs")]
     alloc::begin_process();
     let before_setup = Mark::now()?;
     std::fs::create_dir_all(&dir)?;
@@ -989,6 +1013,15 @@ fn main() -> Result<(), BenchError> {
         "workload generator rocksdb-mt19937_64 seed {seed} key_padding ascii-0 values repeated-v value_bytes {} num {num} client_threads {threads} ranges {threads} shards {threads} reads_per_thread {reads} seeks_per_thread {seeks} seek_nexts {seek_nexts} issuer_depth {issuer_depth} runs_in_flight_per_range {issuer_depth} cache_mib {cache_mib} write_budget_mib {write_budget_mib} oracle_keys {} throughput full-oracle latency api-only barriers flush+durable-checkpoint",
         fill_value().len(),
         workload.present.len()
+    );
+    // The diagnostics compiled into this build: a performance run has none.
+    println!(
+        "harness diagnostics count_allocs {}",
+        if cfg!(feature = "count-allocs") {
+            "on"
+        } else {
+            "off"
+        }
     );
     println!(
         "runtime shards {} step_budget_ns {} spin_ns {} batch {}",
@@ -1343,6 +1376,7 @@ fn main() -> Result<(), BenchError> {
         }
     }
     let recovered = Mark::now()?;
+    #[cfg(feature = "count-allocs")]
     alloc::end_process();
     fill.report(&start, &filled);
     costs("postfillflush", threads * num, &filled, &postfill);

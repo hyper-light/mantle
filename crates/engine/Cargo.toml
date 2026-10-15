@@ -23,6 +23,12 @@ rustix.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
 
+[features]
+# The ranges bench's count of every allocation, hyper-measure's counting allocator installed as the
+# global allocator: a diagnostic, off by default and never in a performance build. Off, the bench
+# runs on the system allocator and reports its allocation counts as unavailable.
+count-allocs = []
+
 [dev-dependencies]
 # The simulated device with power-loss semantics the store's crash tests run on.
 hyper-block = { path = "../../vendor/hyper-block", features = ["sim"] }

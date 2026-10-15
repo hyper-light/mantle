@@ -336,33 +336,6 @@ impl Sorter {
         Ok(self.keyed.len())
     }
 
-    /// Into `ends`, for each of `cuts` (ascending), how many of the entries the last sort kept
-    /// lie below it: where a walk in key order ends a part at each cut. A binary search over
-    /// the sorted entries each, reading the keys it compares from `arena`.
-    pub fn ends_below(
-        &self,
-        arena: &[u8],
-        cuts: &[Vec<u8>],
-        ends: &mut Vec<usize>,
-    ) -> Result<(), Error> {
-        ends.clear();
-        for cut in cuts {
-            let (mut lo, mut hi) = (0usize, self.keyed.len());
-            while lo < hi {
-                let mid = lo.midpoint(hi);
-                let entry = self.keyed.get(mid).ok_or(corrupt())?.entry;
-                let (key, _, _) = read(arena, entry)?;
-                if key < cut.as_slice() {
-                    lo = mid.checked_add(1).ok_or(corrupt())?;
-                } else {
-                    hi = mid;
-                }
-            }
-            ends.push(lo);
-        }
-        Ok(())
-    }
-
     /// [`Self::each`] with each entry's arena offset: `each(key, op, value, hash, offset)`.
     pub fn each_at(
         &self,

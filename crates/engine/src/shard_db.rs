@@ -3125,7 +3125,6 @@ impl<F: BlockFile> ShardDb<F> {
     /// No shard-owned Builder repeats the failed job, and nothing younger retires past it.
     fn retire(&mut self, mut f: Frozen) -> Result<(), Error> {
         let mut keys = None;
-        let mut cuts = Vec::new();
         let retired = (|| {
             if let Some(error) = f.error.clone() {
                 return Err(error);
@@ -3136,7 +3135,6 @@ impl<F: BlockFile> ShardDb<F> {
             if let Some(mut pack) = back.sorted.take() {
                 f.sorting = 0;
                 keys = Some(std::mem::take(&mut pack.keys));
-                cuts = std::mem::take(&mut pack.cuts);
                 self.keep_sort_pack(pack);
             }
             let failed = back
@@ -3186,19 +3184,19 @@ impl<F: BlockFile> ShardDb<F> {
             if let Some(error) = cleanup_error {
                 return Err(error);
             }
-            // A branch for each root pivot the memtable held keys of, each named by the pivot key
-            // it begins at; one over every key when the packing had no cuts.
-            if out.parts.is_empty() || (cuts.is_empty() && out.parts.len() != 1) {
+            if out.parts.len() != 1 {
                 return Err(Error::InvalidArgument {
-                    what: "a packing worker's result of other than its parts",
+                    what: "a packing worker's result without exactly one branch",
                 });
             }
-            let parts = std::mem::take(&mut out.parts);
+            let (_, branch) = out.parts.pop().ok_or(Error::InvalidArgument {
+                what: "a packing worker's result with no branch",
+            })?;
             self.store.extend_end(out.end);
-            Ok(parts)
+            Ok(branch)
         })();
-        let parts = match retired {
-            Ok(parts) => parts,
+        let branch = match retired {
+            Ok(branch) => branch,
             Err(error) => {
                 f.error.get_or_insert_with(|| error.clone());
                 self.terminal_error.get_or_insert_with(|| error.clone());
@@ -3207,22 +3205,7 @@ impl<F: BlockFile> ShardDb<F> {
             }
         };
         let Frozen { mem, since, .. } = f;
-        if cuts.is_empty() {
-            for (_, branch) in parts {
-                self.trunk.add(branch);
-            }
-        } else {
-            let mut placed = Vec::with_capacity(parts.len());
-            for (key, branch) in parts {
-                let j = cuts
-                    .binary_search(&key)
-                    .map_err(|_| Error::InvalidArgument {
-                        what: "a packed part named by no pivot key it was cut at",
-                    })?;
-                placed.push((j, branch));
-            }
-            self.trunk.add_parts(cuts, placed);
-        }
+        self.trunk.add(branch);
         self.pack_ns = u64::try_from(
             std::time::Instant::now()
                 .saturating_duration_since(since)
@@ -4211,17 +4194,13 @@ impl<F: BlockFile> ShardDb<F> {
     fn sort_off(
         &mut self,
         full: HashMem,
-        mut pack: SortPack,
+        pack: SortPack,
         since: std::time::Instant,
     ) -> Result<Option<(HashMem, SortPack)>, Error> {
-        // The packing ends a branch at each of the root's pivot keys, each branch then that
-        // pivot's (research/57 §7), and each branch begins an extent.
-        self.trunk.root_cuts(&mut pack.cuts);
         let run = self.store.run_bytes().max(1);
         let extents = crate::util::div_ceil_usize(full.bytes(), run)
             .unwrap_or(0)
-            .saturating_add(1)
-            .saturating_add(pack.cuts.len());
+            .saturating_add(1);
         let asked = u64::try_from(extents).unwrap_or(u64::MAX);
         // The seat first: taking what the workers sent answers their asks for extents, which
         // take from the extents counted next.

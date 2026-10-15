@@ -205,41 +205,6 @@ impl Bundle {
     }
 }
 
-/// A packed memtable not yet in the tree: its branches, over disjoint ranges in key order, and
-/// the root's pivot keys its packing ended a branch at, each branch at its index into them (none
-/// for one branch over every key). A branch holds the keys from its pivot's key up to the next
-/// pivot's, the first branch every key below the second pivot's.
-#[derive(Debug)]
-struct Pending {
-    cuts: Vec<Vec<u8>>,
-    parts: Vec<(usize, Branch)>,
-}
-
-impl Pending {
-    fn branches(&self) -> impl Iterator<Item = &Branch> {
-        self.parts.iter().map(|(_, b)| b)
-    }
-
-    /// The branch that holds `key`'s range, if the packing wrote one there.
-    fn part_mut(&mut self, key: &[u8]) -> Option<&mut Branch> {
-        let at = self
-            .cuts
-            .get(1..)
-            .map_or(0, |cuts| cuts.partition_point(|c| c.as_slice() <= key));
-        let i = self.parts.partition_point(|(j, _)| *j < at);
-        self.parts
-            .get_mut(i)
-            .filter(|(j, _)| *j == at)
-            .map(|(_, b)| b)
-    }
-
-    fn entries(&self) -> u64 {
-        self.branches()
-            .map(|b| b.count)
-            .fold(0, u64::saturating_add)
-    }
-}
-
 #[derive(Clone, Debug)]
 struct Node {
     leaf: bool,
@@ -338,10 +303,6 @@ pub struct TrunkStats {
     pub consolidations_started: u64,
     /// Fullest pivots flushed past a memtable's entries ([`Trunk::flush_fullest`]).
     pub fullest_flushes: u64,
-    /// Entries of packed memtables whose branches went straight into the root's pivots' bundles
-    /// ([`Trunk::add_parts`]): what the root's compactions of one input would have written again
-    /// (research/57 §7).
-    pub parted_entries: u64,
     /// The trunk's shape when these were taken ([`Trunk::levels`]), a depth an element from the
     /// root, depths past the last summed into it.
     pub shape: [LevelShape; SHAPE_DEPTHS],
@@ -378,8 +339,8 @@ pub struct Trunk {
     saving: Saving,
     stats: TrunkStats,
     /// Packed memtables not yet in the tree, oldest first: read before it, and moved into the
-    /// root once the root takes no change ([`upkeep`]).
-    pending: Vec<Pending>,
+    /// root's in-flight list once the root takes no change ([`upkeep`]).
+    pending: Vec<Branch>,
     /// Maintenance in progress (CLAUDE.md §10): at most one compaction a pivot and one settle a
     /// node, so bounded by the trunk's size ([`upkeep`]).
     tasks: Vec<NodeTask>,
@@ -698,10 +659,7 @@ impl Trunk {
         value: &mut Vec<u8>,
     ) -> Result<Option<Op>, Error> {
         self.gets = self.gets.saturating_add(1);
-        for p in self.pending.iter_mut().rev() {
-            let Some(b) = p.part_mut(key) else {
-                continue;
-            };
+        for b in self.pending.iter_mut().rev() {
             b.probes = b.probes.saturating_add(1);
             if let Some(op) = b.get_hashed_async(store, key, hash, value).await? {
                 return Ok(Some(op));
@@ -765,10 +723,7 @@ impl Trunk {
         value: &mut Vec<u8>,
     ) -> Result<Option<Op>, Error> {
         self.gets = self.gets.saturating_add(1);
-        for p in self.pending.iter_mut().rev() {
-            let Some(b) = p.part_mut(key) else {
-                continue;
-            };
+        for b in self.pending.iter_mut().rev() {
             b.probes = b.probes.saturating_add(1);
             if let Some(op) = b.get_hashed(store, key, hash, value)? {
                 return Ok(Some(op));
@@ -836,10 +791,7 @@ impl Trunk {
                 .saturating_mul(8);
             live.push((b.count.max(1) as f64, bits as f64, b.probes as f64 / gets));
         };
-        self.pending
-            .iter()
-            .flat_map(Pending::branches)
-            .for_each(&mut add);
+        self.pending.iter().for_each(&mut add);
         for node in &self.nodes {
             node.inflight.iter().flatten().for_each(&mut add);
             node.pivots
@@ -920,13 +872,7 @@ impl Trunk {
         sources.clear();
         end.clear();
         path.clear();
-        sources.extend(
-            self.pending
-                .iter()
-                .rev()
-                .flat_map(Pending::branches)
-                .map(Source::Branch),
-        );
+        sources.extend(self.pending.iter().rev().map(Source::Branch));
         let mut bound: Option<&[u8]> = None;
         let mut at = self.root;
         // Every level down is a node's child: at most the trunk's node count of steps.
@@ -1228,29 +1174,7 @@ impl Trunk {
     /// Takes a packed memtable as pending: read before the tree, taken into the root when the
     /// next step ([`Self::step`]). Its references are the trunk's from here.
     pub fn add(&mut self, branch: Branch) {
-        self.pending.push(Pending {
-            cuts: Vec::new(),
-            parts: vec![(0, branch)],
-        });
-    }
-
-    /// Takes a packed memtable written as a branch for each pivot of the root it holds keys of,
-    /// ended at `cuts`, the root's pivot keys when its packing began ([`Self::root_cuts`]):
-    /// each branch with the index of the pivot key it begins at, in key order. Taken into the
-    /// root as [`Self::add`]'s is, and there each branch becomes its pivot's newest bundle branch
-    /// where that pivot's compaction would have had it alone for input, rather than written
-    /// again (research/57 §7).
-    pub fn add_parts(&mut self, cuts: Vec<Vec<u8>>, parts: Vec<(usize, Branch)>) {
-        self.pending.push(Pending { cuts, parts });
-    }
-
-    /// Into `cuts`, the root's pivot keys, at which a packing ends its branches so each is one
-    /// pivot's ([`Self::add_parts`]); none while the root is a leaf.
-    pub fn root_cuts(&self, cuts: &mut Vec<Vec<u8>>) {
-        cuts.clear();
-        if let Some(root) = self.nodes.get(self.root).filter(|n| !n.leaf) {
-            cuts.extend(root.pivots.iter().map(|p| p.key.clone()));
-        }
+        self.pending.push(branch);
     }
 
     /// Packed memtables pending.
@@ -2234,10 +2158,7 @@ impl Trunk {
             m.counts = m.counts.saturating_add(b.counts.len().saturating_mul(2));
             m.ranges = m.ranges.saturating_add(b.range.bytes());
         };
-        self.pending
-            .iter()
-            .flat_map(Pending::branches)
-            .for_each(&mut add);
+        self.pending.iter().for_each(&mut add);
         for n in &self.nodes {
             n.inflight.iter().flatten().for_each(&mut add);
             for p in &n.pivots {
@@ -2351,12 +2272,7 @@ impl Trunk {
 
     /// The trunk's branches, for checks: every branch a node names, each naming once.
     pub fn branches(&self) -> Vec<Branch> {
-        let mut out: Vec<Branch> = self
-            .pending
-            .iter()
-            .flat_map(Pending::branches)
-            .cloned()
-            .collect();
+        let mut out = self.pending.clone();
         for node in &self.nodes {
             for bundle in &node.inflight {
                 out.extend(bundle.iter().cloned());

@@ -254,28 +254,22 @@ written in the fill, the phase whose writes saturate the device (§1).
    several memtables (20.2M entries) are real merges and stay.
 4. Reads find the same bundles: one branch a memtable for each root pivot, until the pivot flushes.
 
-**The change** (`Trunk::add_parts`, `Trunk::root_cuts`, `Sorter::ends_below`).
-- A worker's packing gets the root's pivot keys with its job and ends a branch at each.
-- Pending memtables are kept as groups, so the root's room counts memtables. A get probes the
-  branch of its key's range, and a scan takes every branch as a source.
-- On incorporation, a group whose cuts are the root's pivot keys, where no pivot taking a branch
-  has a live in-flight bundle, a compaction out or a child to split, puts each branch in its
-  pivot's bundle as its newest. Any other group enters as one in-flight bundle.
-- Each branch begins an extent, so the packing's grant is one extent larger a cut.
-- The shard's own packing, with no worker, still writes one branch.
-
-**The tests** (`tests/trunk_test.rs`, deterministic: a simulated file, no worker).
-
-| test | what it runs | what it asserts |
-|---|---|---|
-| `batches_packed_at_the_roots_pivots_enter_its_bundles_as_they_are` | each batch packed at the root's pivot keys | every batch taken whole once the root is an index node (`parted_entries` = those batches' entries) |
-| `batches_packed_at_other_keys_enter_in_flight_and_are_compacted` | every batch's cuts drop one of the root's keys | none taken (`parted_entries` 0) |
-
-- Both check, after every batch, every key's newest value and the store's extents against the
-  trunk's.
-- Placing each branch in the next pivot fails the first test's reads.
-- Not checking the cuts against the root's pivot keys fails the second's.
-- Never placing fails the first's count.
+**Tried and reverted (01f1f7d).** The design was built: the root's pivot keys went out with a
+worker's packing, pending memtables were kept as groups, and a group cut at the root's current
+pivot keys put each branch in its pivot's bundle. It was reverted for a fault and a measurement.
+- **The fault.** CI failed `a_workers_pages_are_cached_where_they_were_written` on linux-x86_64,
+  linux-aarch64 and macos-aarch64: reads after maintenance read pages from the device. A worker's
+  packing keeps none of its pages in the shard's cache (a packed branch was always compacted at
+  the root, and that compaction's pages were cached). Branches placed whole stayed uncached.
+- **The measurement.** At 10M its fills could not be told from 91ddf13's. That batch ran beside
+  another session's soak loop in the same VM: 91ddf13 itself went from 4.00M puts a second
+  (r1752) to 2.85M (r1782). At 10M few memtables qualify anyway:
+  - the root is a leaf for the first 9 of 18;
+  - while its first split settles, the memtables packed meanwhile wait as pending and are merged
+    together at the root, a real merge;
+  - a diagnostic run (r1791) placed 3 of 18 inline and 7 of 18 queued.
+- **For a second attempt:** a packing that may be placed keeps its pages cached as a compaction's
+  are, and it is measured at 100M on a quiet host.
 - Write-back with discard (§3) is the remaining lever the size of the gap to SplinterDB's large
   cache. Its design comes first: pages shared with workers without copies, dirty pages bounded by
   the cache and cleaned ahead of eviction, a checkpoint's write-back before its flush, a freed

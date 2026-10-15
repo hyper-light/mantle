@@ -556,12 +556,7 @@ SILK (research/34 §5) gives the work that blocks clients first claim: flush and
 paused. The trunk becomes a set of per-node tasks, each with a trigger, run by one loop with a
 counted budget; no task waits on another node's:
 - **Incorporation** moves pending branches into the root's in-flight list whenever the root takes
-  no structural change. A packing on a worker ends a branch at each of the root's pivot keys
-  as they were when it was handed out, and where the root's pivots are still those and no pivot
-  taking a branch has an in-flight bundle, a compaction out or a child to split, each branch
-  becomes its pivot's newest bundle branch as it is: that pivot's compaction would have had it
-  alone for input and written it again, 78.8M of the 374.0M entries a 100M fill wrote, all in
-  the fill (2026-10-15; research/57 §7). A compaction plans over the in-flight bundles up to `covered`, so later
+  no structural change. A compaction plans over the in-flight bundles up to `covered`, so later
   ones land past it. Puts wait only when the root holds more than `fanout` uncompacted in-flight
   bundles, the bound pending has now, so a read probes no more sources than today; this is the
   one stall left. Root compactions free it, so they are first among ready tasks, and while a put

@@ -91,12 +91,6 @@ pub struct SortPack {
     /// Each kept key's filter hash and arena offset, written as the branch is built, for the
     /// index over the memtables the shard keeps for gets (`crate::kept`, research/51 §7).
     pub keys: crate::kept::KeyList,
-    /// The root's pivot keys when the packing was handed out (`Trunk::root_cuts`): it ends a
-    /// branch at each, so that each branch is one root pivot's (research/57 §7). None writes one
-    /// branch.
-    pub cuts: Vec<Vec<u8>>,
-    /// Where each cut after the first falls among the sorted entries.
-    pub ends: Vec<usize>,
 }
 
 impl SortPack {
@@ -106,7 +100,6 @@ impl SortPack {
             .capacity()
             .saturating_add(self.sorter.memory())
             .saturating_add(self.keys.bytes())
-            .saturating_add(self.ends.capacity().saturating_mul(size_of::<usize>()))
     }
 }
 
@@ -442,8 +435,6 @@ fn run<F: BlockFile>(store: &mut Store<F>, job: &mut Job) -> Result<(Parts, u64)
                 arena,
                 sorter,
                 keys,
-                cuts,
-                ends,
             } = pack;
             let kept = sorter.sort(arena, *skip)?;
             // The memtable counted each key once as it took it: the sort keeps as many.
@@ -453,10 +444,7 @@ fn run<F: BlockFile>(store: &mut Store<F>, job: &mut Job) -> Result<(Parts, u64)
                     why: crate::error::Malformed::CountMismatch,
                 });
             }
-            // A branch for each root pivot the memtable holds keys of: the first ends below the
-            // second pivot's key, each next one below the pivot key after its own.
-            sorter.ends_below(arena, cuts.get(1..).unwrap_or(&[]), ends)?;
-            let end_of = |part: usize| ends.get(part).copied().unwrap_or(kept);
+            let mut b = Builder::new(store, Keys::Exactly(*entries))?;
             // The walk's keys, each its newest entry, with their offsets in the copy, the
             // arena's own: the index over kept memtables is built from them.
             keys.clear();
@@ -472,41 +460,11 @@ fn run<F: BlockFile>(store: &mut Store<F>, job: &mut Job) -> Result<(Parts, u64)
                     what: "a memtable's key list",
                     limit: *entries,
                 })?;
-            let mut parts: Vec<(Vec<u8>, Branch)> = Vec::new();
-            let (mut part, mut walked) = (0usize, 0usize);
-            let mut building: Option<Builder> = None;
             sorter.each_at(arena, |k, op, v, h, at| {
-                // Past the part the last entry ended: its branch finished, and every part with
-                // no entry passed over.
-                while walked >= end_of(part) {
-                    if let Some(b) = building.take() {
-                        let key = cuts.get(part).cloned().unwrap_or_default();
-                        parts.push((key, b.finish(store)?));
-                    }
-                    part = part.checked_add(1).ok_or(Error::Corruption {
-                        what: "a memtable's packed parts",
-                        why: crate::error::Malformed::CountMismatch,
-                    })?;
-                }
-                if building.is_none() {
-                    let n = end_of(part).saturating_sub(walked);
-                    let n = u64::try_from(n).unwrap_or(u64::MAX);
-                    building = Some(Builder::new(store, Keys::Exactly(n))?);
-                }
-                let b = building.as_mut().ok_or(Error::Corruption {
-                    what: "a memtable's packed parts",
-                    why: crate::error::Malformed::CountMismatch,
-                })?;
                 keys.push(crate::branch::filter::hash(k), at);
-                b.add_hashed(store, k, op, v, h)?;
-                walked = walked.saturating_add(1);
-                Ok(())
+                b.add_hashed(store, k, op, v, h)
             })?;
-            if let Some(b) = building.take() {
-                let key = cuts.get(part).cloned().unwrap_or_default();
-                parts.push((key, b.finish(store)?));
-            }
-            parts
+            vec![(Vec::new(), b.finish(store)?)]
         }
         Work::Grow(g) => {
             store.grow_segment(g.start, g.extents, g.add)?;

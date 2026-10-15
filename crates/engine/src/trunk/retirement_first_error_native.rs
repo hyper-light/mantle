@@ -147,8 +147,6 @@ fn a_physical_job_failure_stays_first_after_native_worker_join_failure() {
             arena: mem.take_mirror().unwrap(),
             sorter: crate::memtable::hashed::Sorter::default(),
             keys: Default::default(),
-            cuts: Vec::new(),
-            ends: Vec::new(),
         }),
         grant: store
             .grant(usize::try_from(CONFIG.extent_pages).unwrap())

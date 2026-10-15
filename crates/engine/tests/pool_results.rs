@@ -76,8 +76,6 @@ fn packing(store: &mut Store<DeviceFile>, number: u8, corrupt: bool) -> Box<Job>
             arena,
             sorter: Sorter::default(),
             keys: Default::default(),
-            cuts: Vec::new(),
-            ends: Vec::new(),
         }),
         grant: store
             .grant(usize::try_from(CONFIG.extent_pages).unwrap())

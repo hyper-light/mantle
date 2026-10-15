@@ -154,7 +154,11 @@ proptest! {
 /// `list` packed as a memtable is, cut at the entry positions `at` (as the root's pivot keys fall
 /// in it), one branch a range: the tree pages written, and the bound a packing's loan is sized by,
 /// given the entries' key and value bytes with no head, the least an arena holds them in.
-fn pack(store: &mut Store<SimFile>, list: &[(&Vec<u8>, &Vec<u8>)], mut at: Vec<usize>) -> (usize, usize) {
+fn pack(
+    store: &mut Store<SimFile>,
+    list: &[(&Vec<u8>, &Vec<u8>)],
+    mut at: Vec<usize>,
+) -> (usize, usize) {
     at.sort_unstable();
     at.dedup();
     let mut pages = 0usize;
@@ -174,7 +178,14 @@ fn pack(store: &mut Store<SimFile>, list: &[(&Vec<u8>, &Vec<u8>)], mut at: Vec<u
     let bytes = list.iter().map(|(k, v)| k.len() + v.len()).sum();
     let key = list.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
     let value = list.iter().map(|(_, v)| v.len()).max().unwrap_or(0);
-    let most = tree_pages_most(list.len(), bytes, key, value, at.len() + 1, store.page_capacity());
+    let most = tree_pages_most(
+        list.len(),
+        bytes,
+        key,
+        value,
+        at.len() + 1,
+        store.page_capacity(),
+    );
     (pages, most)
 }
 

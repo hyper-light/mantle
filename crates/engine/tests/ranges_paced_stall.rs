@@ -1,5 +1,8 @@
 //! Public Range request retention, cancellation, ordering and same-shard progress.
-//! Run under an external controller deadline; no clock decides a successful verdict.
+//! Run under an external controller deadline; no clock decides a successful verdict. The
+//! retention cases' waits for facts also have a failure guard ([`WAIT`]) that a passing run never
+//! reaches: past it the case fails, naming the fact that did not come, and its held write is let
+//! go before the runtime's teardown.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -18,6 +21,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use hyper_block::DiskError;
 use hyper_block::block::BlockFile;
@@ -47,6 +51,27 @@ const TRUNK: TrunkConfig = TrunkConfig {
     leaf_entries: 96,
 };
 const OPS: u64 = 2048;
+/// The failure guard of a wait for a fact, the native worker fixtures' (pool_lifecycle.rs): a
+/// passing run never waits for it, and elapsed time never counts as the fact.
+const WAIT: Duration = Duration::from_secs(5);
+
+/// Waits for `fact`, yielding between looks; past the failure guard the test fails, naming it.
+fn until(what: &str, mut fact: impl FnMut() -> bool) {
+    let deadline = Instant::now() + WAIT;
+    while !fact() {
+        assert!(
+            Instant::now() < deadline,
+            "{what}: not seen within the failure guard"
+        );
+        std::thread::yield_now();
+    }
+}
+
+/// A message from the run's tasks, waited for under the failure guard.
+fn received<T>(from: &mpsc::Receiver<T>, what: &str) -> T {
+    from.recv_timeout(WAIT)
+        .unwrap_or_else(|e| panic!("{what}: not received within the failure guard ({e})"))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Event {
@@ -310,7 +335,9 @@ fn record(oracle: &mut BTreeMap<Vec<u8>, Vec<u8>>, key: Vec<u8>, value: Option<V
     }
 }
 
-// Three stable values exercise exact reads and one-row pagination during a retained mutation.
+// Three stable rows exercise exact reads and one-row pagination while a worker write is held. No
+// request of the test changes them, so each read of them has one answer whenever the range applies
+// the mutations it owns.
 fn stable() -> BTreeMap<Vec<u8>, Vec<u8>> {
     (0..3)
         .map(|i| {
@@ -322,35 +349,113 @@ fn stable() -> BTreeMap<Vec<u8>, Vec<u8>> {
         .collect()
 }
 
-async fn check_stable(client: &mut Client<'_>) {
-    let expected = stable();
-    let mut out = Vec::new();
-    for (key, value) in &expected {
-        assert!(client.get_async(key, &mut out).await.unwrap());
-        assert_eq!(&out, value);
-    }
-    let mut from = b"a/stable/".to_vec();
+// The one key the canceled put and delete name, outside the stable rows' prefix. Published in that
+// order, each is the range's to apply from then on, in its turn: a read in the meantime finds the
+// key in one of these states, and never in an earlier one after a later.
+const TARGET: &[u8] = b"a/target";
+const TARGET_BEFORE: &[u8] = b"before-target";
+const TARGET_QUEUED: &[u8] = b"queued-before-delete";
+const TARGET_STATES: [Option<&[u8]>; 3] = [Some(TARGET_BEFORE), Some(TARGET_QUEUED), None];
+
+/// A page's start, its rows, the next start it gave and whether more remained, kept for a failure
+/// to name (every key and value here is text).
+type Page = (String, Vec<(String, String)>, String, bool);
+
+fn text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Every row in [from, end), one row a page, as the cursor gives them: each next start beyond its
+/// page's own, and no more pages than `live` rows and the last.
+async fn one_row_pages(
+    client: &mut Client<'_>,
+    from: &[u8],
+    end: &[u8],
+    live: usize,
+) -> (Vec<(Vec<u8>, Vec<u8>)>, Vec<Page>) {
+    let mut from = from.to_vec();
     let mut rows = Rows::new();
     let mut next = Vec::new();
     let mut got = Vec::new();
-    for _ in 0..=expected.len() {
+    let mut pages = Vec::new();
+    for _ in 0..=live {
         rows.clear();
         let more = client
-            .scan_async(&from, Some(b"a/stable0"), 1, &mut rows, &mut next)
+            .scan_async(&from, Some(end), 1, &mut rows, &mut next)
             .await
             .unwrap();
-        got.extend(
-            rows.iter()
-                .map(|(key, value)| (key.to_vec(), value.to_vec())),
-        );
+        let page: Vec<(Vec<u8>, Vec<u8>)> = rows
+            .iter()
+            .map(|(key, value)| (key.to_vec(), value.to_vec()))
+            .collect();
+        pages.push((
+            text(&from),
+            page.iter()
+                .map(|(key, value)| (text(key), text(value)))
+                .collect(),
+            text(&next),
+            more,
+        ));
+        got.extend(page);
         if !more {
-            assert_eq!(got, expected.into_iter().collect::<Vec<_>>());
-            return;
+            return (got, pages);
         }
-        assert!(next > from);
+        assert!(next > from, "a next start not beyond its page's: {pages:?}");
         from.clone_from(&next);
     }
-    panic!("stable pagination exceeds its live-row bound");
+    panic!("pagination exceeds its live-row bound: {pages:?}");
+}
+
+/// The target's state, its index in [`TARGET_STATES`]: read by a get, or by one-row pages of the
+/// target's key alone. Any other answer fails, named.
+async fn target_state(client: &mut Client<'_>, by_scan: bool) -> usize {
+    let held = if by_scan {
+        let (rows, pages) = one_row_pages(client, TARGET, b"a/target\0", 1).await;
+        match rows.as_slice() {
+            [] => None,
+            [(key, value)] if key == TARGET => Some(value.clone()),
+            _ => panic!("a scan of the target alone gave {pages:?}"),
+        }
+    } else {
+        let mut value = Vec::new();
+        if client.get_async(TARGET, &mut value).await.unwrap() {
+            Some(value)
+        } else {
+            None
+        }
+    };
+    match TARGET_STATES
+        .iter()
+        .position(|state| *state == held.as_deref())
+    {
+        Some(state) => state,
+        None => panic!(
+            "the target holds {:?}, none of its states",
+            held.as_deref().map(text)
+        ),
+    }
+}
+
+/// Exact gets and one-row pages of the stable rows, a failure naming the key and what it read, or
+/// every page, beside the target's states seen so far.
+async fn check_stable(client: &mut Client<'_>, seen: &[usize]) {
+    let expected = stable();
+    for (key, value) in &expected {
+        let mut out = Vec::new();
+        let found = client.get_async(key, &mut out).await.unwrap();
+        assert!(
+            found && out == *value,
+            "stable row {} read {:?}; target states seen {seen:?}",
+            text(key),
+            found.then(|| text(&out))
+        );
+    }
+    let (got, pages) = one_row_pages(client, b"a/stable/", b"a/stable0", expected.len()).await;
+    assert_eq!(
+        got,
+        expected.into_iter().collect::<Vec<_>>(),
+        "stable pages (start, rows, next, more) {pages:?}; target states seen {seen:?}"
+    );
 }
 
 fn check_all(db: &mut ShardDb<Gated>, expected: &BTreeMap<Vec<u8>, Vec<u8>>) {
@@ -360,8 +465,8 @@ fn check_all(db: &mut ShardDb<Gated>, expected: &BTreeMap<Vec<u8>, Vec<u8>>) {
         assert_eq!(&value, want);
     }
     assert_eq!(
-        db.get(b"a/stable/0", &mut value).unwrap(),
-        expected.contains_key(&b"a/stable/0"[..]),
+        db.get(TARGET, &mut value).unwrap(),
+        expected.contains_key(TARGET),
         "a refused deletion preserves the old value; an applied later deletion wins"
     );
     let mut from = Vec::new();
@@ -401,6 +506,7 @@ fn retention_case(fail: bool) {
     for (key, value) in stable() {
         first.put(&key, &value).unwrap();
     }
+    first.put(TARGET, TARGET_BEFORE).unwrap();
     cold_complete(&mut first);
     first.checkpoint(0).unwrap();
     let (other, _) = Gate::new(false, false);
@@ -440,13 +546,14 @@ fn retention_case(fail: bool) {
     let shard = runtime.shard_ids()[0];
     // Open before runtime/issuer teardown and before scoped work could be joined on failure.
     let _open = OpenOnDrop(Arc::clone(&gate));
-    // Four simultaneous clients: writer, canceled put, canceled delete, and read/progress probe.
+    // Five simultaneous clients at most: writer, the failure's flush, canceled put, canceled
+    // delete, and read/progress probe.
     let ranges = Arc::new(
         Ranges::start(
             &mut runtime,
             vec![(Vec::new(), first), (b"m".to_vec(), second)],
             RangesConfig {
-                clients: 4,
+                clients: 5,
                 slice_ns: 50_000,
                 spin_ns: 0,
                 inline: false,
@@ -492,23 +599,61 @@ fn retention_case(fail: bool) {
             done.send((oracle, failure)).unwrap();
         })
         .unwrap();
-    assert_eq!(events.recv().unwrap(), Event::Held);
+    assert_eq!(
+        received(&events, "the first worker write, held"),
+        Event::Held
+    );
     // Public owner wait/announcement facts, not a sleep or a private engine-work assertion.
     // Pending CPU slices remain runnable; a fresh park with the writer unfinished exercises
-    // the event wait. This is not a proof of native syscall residency.
-    loop {
-        assert!(
-            !writer_ended.load(Ordering::Acquire),
-            "input did not exercise a retained write"
+    // the event wait. This is not a proof of native syscall residency, nor of any one mutation
+    // still pending: the writer's oldest may be applied after it.
+    until(
+        "a park of the shard with the write held and the writer's input unfinished",
+        || {
+            assert!(
+                !writer_ended.load(Ordering::Acquire),
+                "the writer's whole input finished before the shard parked with the write held"
+            );
+            hyper_rt::registry::with_entry(shard.0, |entry| {
+                entry.pulse.waits() > before_wait && entry.parking.parked()
+            })
+            .unwrap()
+        },
+    );
+    // With the failure, a flush is published before the canceled mutations. It cannot finish
+    // while a worker job's write is held (a flush retires every packing and leaves the trunk
+    // idle), and the range keeps every later mutation behind it in arrival order: the canceled
+    // put and delete are owned and unapplied when the held write fails, whatever the writer's
+    // oldest mutation is doing, and each one's own answer is the failure.
+    let (flush_published, flush_publication) = mpsc::sync_channel(1);
+    let (flush_done, flushed) = mpsc::sync_channel(1);
+    if fail {
+        let flush_ranges = Arc::clone(&ranges);
+        runtime
+            .spawn_on(shard, async move {
+                let mut client = flush_ranges.client().unwrap();
+                let result = {
+                    let mut flushing = pin!(client.flush_async());
+                    poll_fn(|cx| {
+                        assert!(
+                            flushing.as_mut().poll(cx).is_pending(),
+                            "a flush finished while a worker write was held"
+                        );
+                        flush_published.send(()).unwrap();
+                        std::task::Poll::Ready(())
+                    })
+                    .await;
+                    flushing.await
+                };
+                drop(client);
+                drop(flush_ranges);
+                flush_done.send(result).unwrap();
+            })
+            .unwrap();
+        received(
+            &flush_publication,
+            "the flush's publication before the canceled mutations",
         );
-        if hyper_rt::registry::with_entry(shard.0, |entry| {
-            entry.pulse.waits() > before_wait && entry.parking.parked()
-        })
-        .unwrap()
-        {
-            break;
-        }
-        std::thread::yield_now();
     }
     let (published, publications) = mpsc::sync_channel(2);
     let (put_resume, put_continue) = hyper_rt::sync::channel::<()>(1).unwrap();
@@ -520,7 +665,7 @@ fn retention_case(fail: bool) {
             let mut client = put_ranges.client().unwrap();
             let mut first_pending = false;
             let canceled = {
-                let mut pending = pin!(client.put_async(b"a/stable/0", b"queued-before-delete"));
+                let mut pending = pin!(client.put_async(TARGET, TARGET_QUEUED));
                 race2(
                     poll_fn(|cx| {
                         let result = pending.as_mut().poll(cx);
@@ -535,19 +680,20 @@ fn retention_case(fail: bool) {
             published_put.send("put").unwrap();
             let mut put_continue = put_continue;
             put_continue.recv().await.unwrap();
-            // Recovers the original answer; it must not replay a refused mutation.
-            let recovered = client.stats_async().await;
-            if fail {
-                assert!(matches!(recovered, Err(mantle_engine::Error::Io { .. })));
-            } else {
-                recovered.unwrap();
-            }
+            // Recovers the original answer and never replays it. The next request reads the other
+            // range, which no fault of this one reaches: it fails only with the canceled request's
+            // own answer.
+            let mut out = Vec::new();
+            let recovered = client.get_async(b"z-recovery", &mut out).await.map(drop);
             drop(client);
             drop(put_ranges);
-            put_done.send(()).unwrap();
+            put_done.send(recovered).unwrap();
         })
         .unwrap();
-    assert_eq!(publications.recv().unwrap(), "put");
+    assert_eq!(
+        received(&publications, "the canceled put's publication"),
+        "put"
+    );
     let (delete_resume, delete_continue) = hyper_rt::sync::channel::<()>(1).unwrap();
     let (delete_done, delete_finished) = mpsc::sync_channel(1);
     let delete_ranges = Arc::clone(&ranges);
@@ -556,7 +702,7 @@ fn retention_case(fail: bool) {
             let mut client = delete_ranges.client().unwrap();
             let mut first_pending = false;
             let canceled = {
-                let mut pending = pin!(client.delete_async(b"a/stable/0"));
+                let mut pending = pin!(client.delete_async(TARGET));
                 race2(
                     poll_fn(|cx| {
                         let result = pending.as_mut().poll(cx);
@@ -571,25 +717,32 @@ fn retention_case(fail: bool) {
             published.send("delete").unwrap();
             let mut delete_continue = delete_continue;
             delete_continue.recv().await.unwrap();
-            let recovered = client.stats_async().await;
-            if fail {
-                assert!(matches!(recovered, Err(mantle_engine::Error::Io { .. })));
-            } else {
-                recovered.unwrap();
-            }
+            let mut out = Vec::new();
+            let recovered = client.get_async(b"z-recovery", &mut out).await.map(drop);
             drop(client);
             drop(delete_ranges);
-            delete_done.send(()).unwrap();
+            delete_done.send(recovered).unwrap();
         })
         .unwrap();
-    assert_eq!(publications.recv().unwrap(), "delete");
+    assert_eq!(
+        received(&publications, "the canceled delete's publication"),
+        "delete"
+    );
     let probe_ranges = Arc::clone(&ranges);
     let probe_gate = Arc::clone(&gate);
     let (progress, progressed) = mpsc::sync_channel(1);
     runtime
         .spawn_on(shard, async move {
             let mut client = probe_ranges.client().unwrap();
-            check_stable(&mut client).await;
+            // The target read around the stable rows' reads, by get and by scan in turn: the owned
+            // put and delete reach it in their order, whenever the range applies them.
+            let mut seen = vec![
+                target_state(&mut client, false).await,
+                target_state(&mut client, true).await,
+            ];
+            check_stable(&mut client, &seen).await;
+            seen.push(target_state(&mut client, true).await);
+            seen.push(target_state(&mut client, false).await);
             client
                 .put_async(b"z-unrelated", b"other range during retained input")
                 .await
@@ -597,6 +750,18 @@ fn retention_case(fail: bool) {
             let mut out = Vec::new();
             assert!(client.get_async(b"z-unrelated", &mut out).await.unwrap());
             assert_eq!(out, b"other range during retained input");
+            seen.push(target_state(&mut client, false).await);
+            assert!(
+                seen.is_sorted(),
+                "the target read an earlier state after a later one: {seen:?}"
+            );
+            if fail {
+                assert!(
+                    seen.iter().all(|&state| state == 0),
+                    "the target changed while the flush before its canceled mutations was held: \
+                     {seen:?}"
+                );
+            }
             assert!(
                 probe_gate.state.lock().unwrap().active.is_some(),
                 "reads progressed before release"
@@ -606,33 +771,63 @@ fn retention_case(fail: bool) {
             progress.send(()).unwrap();
         })
         .unwrap();
-    progressed.recv().unwrap();
-    assert!(!writer_ended.load(Ordering::Acquire));
+    received(
+        &progressed,
+        "the probe's reads and its other range's write with the write held",
+    );
+    assert!(
+        !writer_ended.load(Ordering::Acquire),
+        "the writer's whole input finished while a worker write was held"
+    );
     assert!(!gate.flushed_early.load(Ordering::SeqCst));
     gate.open();
+    // Each canceled request's owner recovers its answer by reading the other range, which no
+    // fault of this one reaches: a recovery is an error only as the canceled request's own answer.
     put_resume.blocking_send(()).unwrap();
     delete_resume.blocking_send(()).unwrap();
-    put_finished.recv().unwrap();
-    delete_finished.recv().unwrap();
-    let (mut oracle, failure) = completed.recv().unwrap();
+    let recoveries = [
+        received(&put_finished, "the canceled put's owner's recovery"),
+        received(&delete_finished, "the canceled delete's owner's recovery"),
+    ];
+    let (mut oracle, failure) = received(&completed, "the writer's last answer after the release");
     assert_eq!(failure.is_some(), fail);
-    oracle.extend(stable());
-    if !fail {
-        oracle.remove(b"a/stable/0".as_slice());
+    // The failure's every answer is its first error, the held write's injected one: the flush's,
+    // and the canceled mutations' own, owned behind it when the write failed.
+    let first_error = failure.as_ref().map(|fault| {
+        assert!(
+            format!("{fault:?}").contains("one worker page write rejected by test"),
+            "{fault:?}"
+        );
+        format!("{:?}", Err::<(), _>(fault.clone()))
+    });
+    match &first_error {
+        Some(first) => {
+            let flush = received(&flushed, "the flush's answer after the release");
+            assert_eq!(&format!("{flush:?}"), first, "the flush's answer");
+            for recovered in &recoveries {
+                assert_eq!(
+                    &format!("{recovered:?}"),
+                    first,
+                    "a canceled mutation's answer"
+                );
+            }
+        }
+        None => {
+            for recovered in &recoveries {
+                assert!(recovered.is_ok(), "{recovered:?}");
+            }
+        }
     }
-    // Three initial stable puts, two canceled-but-owned mutations, and the unrelated put.
-    let applied = OPS + 3 + 2 + 1;
+    // The target's newest operation is the canceled delete, after the canceled put: none.
+    oracle.extend(stable());
+    // Four initial puts (the stable rows and the target), two canceled-but-owned mutations, and
+    // the unrelated put.
+    let applied = OPS + 4 + 2 + 1;
     {
         let mut client = ranges.client().unwrap();
-        if fail {
-            assert!(matches!(
-                client.flush(),
-                Err(mantle_engine::Error::Io { .. })
-            ));
-            assert!(matches!(
-                client.checkpoint(applied),
-                Err(mantle_engine::Error::Io { .. })
-            ));
+        if let Some(first) = &first_error {
+            assert_eq!(&format!("{:?}", client.flush()), first);
+            assert_eq!(&format!("{:?}", client.checkpoint(applied)), first);
         } else {
             client.flush().unwrap();
             client.checkpoint(applied).unwrap();
@@ -642,10 +837,9 @@ fn retention_case(fail: bool) {
     assert!(!gate.reused_early.load(Ordering::SeqCst));
     assert!(!gate.flushed_early.load(Ordering::SeqCst));
     let stopped = Arc::try_unwrap(ranges).unwrap().stop();
-    if fail {
-        assert!(matches!(stopped, Err(mantle_engine::Error::Io { .. })));
-    } else {
-        stopped.unwrap();
+    match &first_error {
+        Some(first) => assert_eq!(&format!("{stopped:?}"), first),
+        None => stopped.unwrap(),
     }
     runtime.shutdown().unwrap();
     gate.armed.store(false, Ordering::SeqCst);
@@ -657,8 +851,9 @@ fn retention_case(fail: bool) {
     )
     .unwrap();
     assert_eq!(index, if fail { 0 } else { applied });
-    let expected_stable = stable();
-    check_all(&mut first, if fail { &expected_stable } else { &oracle });
+    let mut before = stable();
+    before.insert(TARGET.to_vec(), TARGET_BEFORE.to_vec());
+    check_all(&mut first, if fail { &before } else { &oracle });
     let (reopen_gate, _) = Gate::new(false, false);
     let (mut second, index) = ShardDb::open(
         open(&second_path, false, false, reopen_gate),

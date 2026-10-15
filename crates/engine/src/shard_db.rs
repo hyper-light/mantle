@@ -3611,18 +3611,31 @@ impl<F: BlockFile> ShardDb<F> {
         }
     }
 
-    /// The frozen memtables a rotation may leave in flight: the packings whose lifetimes reach
-    /// past it. A packing lasts `pack_ns` from its rotation to its branch and a memtable fills
-    /// in `fill_ns` (Little's law, L = λW: λ a memtable each `fill_ns`, W `pack_ns`). A packing
-    /// that lasts any part of a fill reaches the rotation that freezes it, so the overlap is
-    /// rounded up, `ceil(pack_ns / fill_ns)`: rounded down, a packing a little shorter than its
-    /// last measure counted none, and every rotation it outlasted fed it whole and waited for it.
-    /// With no measure yet, none. At most the pool's admitted capacity, each packing a worker's.
+    /// The older frozen memtables a rotation may leave in flight: the packings whose lifetimes
+    /// reach past it. A rotation goes on once no more than this many are frozen, then hands its
+    /// own memtable on: one more than this stays frozen beside the active memtable at most
+    /// ([`Self::rotate_paced`], [`Self::rotate`]). A packing lasts `pack_ns` from its rotation to
+    /// its branch and a memtable fills in `fill_ns` (Little's law, L = λW: λ a memtable each
+    /// `fill_ns`, W `pack_ns`). A packing that lasts any part of a fill reaches the rotation that
+    /// freezes it, so the overlap is rounded up, `ceil(pack_ns / fill_ns)`: rounded down, a
+    /// packing a little shorter than its last measure counted none, and every rotation it outlasted
+    /// fed it whole and waited for it. With no packing measured yet, one, so two frozen beside the
+    /// active memtable: the least the rounded-up measure gives any packing once a fill is
+    /// measured, so no more overlap than the shortest packing would earn. It is that floor, not a
+    /// measured optimum. None, which no measure gives, had the second rotation wait for the first
+    /// packing however long it took: a 7.8–79 ms stall at the second rotation in 3 of the 6 traced
+    /// loaded 10M fills of diagnostic pilots 1 and 2 (2026-10-15). A packing's age is no measure:
+    /// one stuck would justify any count, and the bound would hold back nothing short of the pool's
+    /// capacity. At most the pool's admitted capacity, each packing a worker's.
     fn frozen_most(&self) -> usize {
         if !self.trunk.has_pool() {
             return 0;
         }
-        let overlap = crate::util::div_ceil(self.pack_ns, self.fill_ns).unwrap_or(0);
+        let overlap = if self.pack_ns == 0 {
+            1
+        } else {
+            crate::util::div_ceil(self.pack_ns, self.fill_ns).unwrap_or(0)
+        };
         usize::try_from(overlap)
             .unwrap_or(usize::MAX)
             .min(self.trunk.pool_capacity())
@@ -4962,23 +4975,20 @@ mod frozen_tests {
     type Put = fn(&mut ShardDb<Held>, &mut BTreeMap<Vec<u8>, Vec<u8>>, u64);
 
     /// Puts until the shard has measured a fill and a packing, so the overlap it lets stay
-    /// frozen is its own: by the second rotation, which, with no overlap measured yet, waits for
-    /// the first packing a worker took and so measures it.
+    /// frozen is its own: a second rotation measures a fill, and the packings in flight, waited
+    /// for, measure a packing.
     fn warm(
         db: &mut ShardDb<Held>,
         oracle: &mut BTreeMap<Vec<u8>, Vec<u8>>,
         i: &mut u64,
         put: Put,
     ) {
-        let rotations = db.flush_stats.rotations;
-        while db.pack_ns == 0 || db.fill_ns == 0 {
-            assert!(
-                db.flush_stats.rotations < rotations + 2,
-                "a second rotation measured no packing"
-            );
+        while db.fill_ns == 0 {
             put(db, oracle, *i);
             *i += 1;
         }
+        db.drain_frozen().unwrap();
+        assert!(db.pack_ns > 0, "no packing a worker took was measured");
     }
 
     /// Drains every packing and the trunk's maintenance, so every worker is free and the next
@@ -5050,6 +5060,10 @@ mod frozen_tests {
             }
         }
     }
+
+    /// The failure guard of a wait for a fact, the native worker fixtures' (pool_lifecycle.rs): a
+    /// passing run never waits for it.
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
     static GATES_A: Gates = Gates::new();
 
@@ -5130,9 +5144,140 @@ mod frozen_tests {
         db.check_references().unwrap();
     }
 
+    static GATES_C: Gates = Gates::new();
+
+    /// With no packing measured yet, one older packing may be in flight: the second rotation
+    /// hands its memtable on beside the first packing rather than waiting for it
+    /// ([`ShardDb::frozen_most`]). The first packing's worker held in its first write, the puts go
+    /// on through the second rotation, and the held memtable's keys read exact, then take new
+    /// values and deletions read back at once, each kind counted so none goes untested; let go, it
+    /// lands, every read is exact and the store reopens at its checkpoint.
+    #[test]
+    fn a_second_rotation_leaves_the_first_packing_in_flight_before_any_is_measured() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let mut db = ShardDb::create(plain(&path, true), STORE, MEM, TRUNK).unwrap();
+        let _open = Open(&GATES_C);
+        db.set_workers(gated(&path, &GATES_C)).unwrap();
+        GATES_C.arm(0, false);
+        let mut oracle = BTreeMap::new();
+        let mut i = 0u64;
+        let (rotated, rotations) = std::sync::mpsc::sync_channel(2);
+        let (go, going) = std::sync::mpsc::sync_channel::<()>(1);
+        let (checked, checks) = std::sync::mpsc::sync_channel(1);
+        let verdict = std::thread::scope(|scope| {
+            let (db, oracle, i) = (&mut db, &mut oracle, &mut i);
+            scope.spawn(move || {
+                let mut first = 0u64;
+                for target in [1, 2] {
+                    while db.flush_stats.rotations < target {
+                        put_or_delete(db, oracle, *i);
+                        *i += 1;
+                    }
+                    rotated.send(target).unwrap();
+                    if target == 1 {
+                        first = *i;
+                        if going.recv().is_err() {
+                            return;
+                        }
+                    }
+                }
+                // The first packing still in flight: every key reads its newest value; keys its
+                // memtable holds (the earliest half of its operations) take a new value or a
+                // deletion, read at once, in fewer bytes than half a memtable, so no third
+                // rotation comes. Counted as they go, so a shorter half cannot pass with a kind
+                // untested: the keys live when touched, and the live ones deleted and given new
+                // values.
+                check(db, oracle);
+                let (mut live, mut deleted, mut overwritten) = (0u64, 0u64, 0u64);
+                for j in 0..first / 2 {
+                    let k = key(j.wrapping_mul(2_654_435_761));
+                    let was = u64::from(oracle.contains_key(&k));
+                    live += was;
+                    if j.is_multiple_of(3) {
+                        db.delete(&k).unwrap();
+                        oracle.remove(&k);
+                        deleted += was;
+                    } else {
+                        let v = format!("o{j}").into_bytes();
+                        db.put(&k, &v).unwrap();
+                        oracle.insert(k, v);
+                        overwritten += was;
+                    }
+                }
+                check(db, oracle);
+                checked
+                    .send((db.flush_stats.rotations, live, deleted, overwritten))
+                    .unwrap();
+            });
+            // The first rotation handed the first packing to the first seat, whose write is held.
+            let first = rotations.recv_timeout(WAIT);
+            let deadline = std::time::Instant::now() + WAIT;
+            while first.is_ok() && !GATES_C.waited() && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let held = first.is_ok() && GATES_C.waited();
+            go.send(()).unwrap();
+            // The second rotation, then the reads and writes over the held memtable's keys, the
+            // first packing still held.
+            let second = if held {
+                rotations.recv_timeout(WAIT)
+            } else {
+                Ok(0)
+            };
+            let read = if second == Ok(2) {
+                checks.recv_timeout(WAIT)
+            } else {
+                Ok((0, 0, 0, 0))
+            };
+            // Let go before any verdict, so the puts' thread never waits on a held write.
+            GATES_C.release();
+            (first, held, second, read)
+        });
+        let (first, held, second, read) = verdict;
+        assert_eq!(
+            first,
+            Ok(1),
+            "the first rotation: not within the failure guard"
+        );
+        assert!(
+            held,
+            "the first packing's write: not held within the failure guard"
+        );
+        assert_eq!(
+            second,
+            Ok(2),
+            "the second rotation waited for the first packing"
+        );
+        let Ok((rotations, live, deleted, overwritten)) = read else {
+            panic!(
+                "the reads and writes over the held memtable's keys: not done within the failure \
+                 guard"
+            );
+        };
+        assert_eq!(rotations, 2, "a third rotation came");
+        assert!(
+            live > 0 && deleted > 0 && overwritten > 0,
+            "the held memtable's keys: {live} live when touched, {deleted} of those deleted, \
+             {overwritten} given new values"
+        );
+        db.drain_frozen().unwrap();
+        assert!(db.frozen.is_empty());
+        check(&mut db, &oracle);
+        db.checkpoint(i).unwrap();
+        let (file, landed) = crate::store::cold_file(db.into_file());
+        landed.unwrap();
+        drop(file);
+        let (mut db, applied) = ShardDb::open(plain(&path, false), STORE, MEM, TRUNK).unwrap();
+        assert_eq!(applied, i);
+        check(&mut db, &oracle);
+        db.check_references().unwrap();
+    }
+
     /// The cap rounds the measured overlap up: a packing that lasts any part of a fill reaches the
     /// rotation that freezes it, so one a little shorter than a fill may still be out there; with
-    /// no workers, or no fill measured, none ([`ShardDb::frozen_most`]).
+    /// no workers, or no fill measured, none; with no packing measured, one, the least a measure
+    /// gives ([`ShardDb::frozen_most`]).
     #[test]
     fn the_frozen_cap_rounds_the_measured_overlap_up() {
         let dir = tempfile::tempdir().unwrap();
@@ -5144,7 +5289,7 @@ mod frozen_tests {
         let p = path.clone();
         db.set_workers(move || Ok(plain(&p, false))).unwrap();
         for (pack_ns, most) in [
-            (0u64, 0usize),
+            (0u64, 1usize),
             (1, 1),
             (999, 1),
             (1_000, 1),
@@ -5161,5 +5306,7 @@ mod frozen_tests {
         db.fill_ns = 0;
         db.pack_ns = 5_000;
         assert_eq!(db.frozen_most(), 0, "no fill measured, none");
+        db.pack_ns = 0;
+        assert_eq!(db.frozen_most(), 1, "no packing measured, one");
     }
 }

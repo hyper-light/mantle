@@ -855,8 +855,8 @@ pub struct RangesConfig {
 pub enum InlineOps {
     /// None: the request path's semantics alone, a canceled mutation published and kept.
     Off,
-    /// Gets and scans. Puts and deletions cross the channel, so the range's task applies each
-    /// and runs its maintenance slice before the next, as for a client on another shard.
+    /// Gets and scans. Puts and deletions cross the channel: the range's task applies them in its
+    /// request batches, a maintenance slice between batches while one is owed (`serve`).
     Reads,
     /// Every operation.
     All,

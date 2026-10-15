@@ -154,7 +154,8 @@ million a second, within the rounds' spread.
 
 `RangesConfig::inline` is `InlineOps::All`, `Off`, or `Reads`, an experimental arm
 (benches/ranges.rs `--inline-reads`): gets and scans inline, puts and deletions through the
-channel, so the range's task applies each write and runs its maintenance slice before the next.
+channel, applied in the range's request batches with a maintenance slice between batches while
+one is owed (`serve`; a full batch yields without one).
 In the integ2 trial (`benchmark-results/mantle-supervision-20261014/claude-integ2-trial-20261015T1330Z.md`)
 inline was faster in every rate column (100M quiet fill 3.94 against 2.14 million puts a
 second), while every write through the channel counted no stall and the fill's maxima were lower

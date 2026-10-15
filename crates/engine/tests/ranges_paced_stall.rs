@@ -881,6 +881,195 @@ fn retained_mutations_survive_a_required_worker_write_failure_and_reopen() {
     retention_case(true);
 }
 
+/// A mutation published behind a flush that a held worker write keeps from finishing is not
+/// applied while it is held. The flush hands the active memtable to packing before it waits, so
+/// the fresh one has room for the mutation: only the range's order keeps it out. While the
+/// packing's write is held, a get reads the later key absent and the key put before the flush
+/// present; let go, the flush and the mutation are both answered Ok, and both keys read back,
+/// after a checkpoint and a cold reopen too.
+#[test]
+fn a_mutation_behind_a_held_flush_is_not_applied_while_it_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let (gate, events) = Gate::new(true, false);
+    let mut db = engine(&path, Arc::clone(&gate));
+    for (key, value) in stable() {
+        db.put(&key, &value).unwrap();
+    }
+    cold_complete(&mut db);
+    db.checkpoint(0).unwrap();
+    // Existing attached worker-write fixture: one held device transfer plus a live one.
+    let depth = 2;
+    let batches = mantle_engine::shard_db::issuer_batches(depth, depth)
+        .checked_mul(2)
+        .unwrap();
+    let issuer = Issuer::start_for(dir.path(), depth, batches).unwrap();
+    assert_eq!(
+        issuer.depth(),
+        depth,
+        "device depth refused this fixture's held-plus-live setup"
+    );
+    db.attach(&issuer, depth).unwrap();
+    workers(&mut db, &path, Arc::clone(&gate));
+    let mut runtime = Runtime::start(&RuntimeConfig {
+        shards: 1,
+        tasks_per_shard: 64,
+        timers_per_shard: 64,
+        interests_per_shard: 64,
+        ring_entries: 64,
+        step_budget_ns: 50_000,
+        timer_tick_ns: 100_000,
+        batch: 64,
+        pin: false,
+        cores: Vec::new(),
+        page_bytes: STORE.page_size,
+        spin_ns: 0,
+        wake_tracking: None,
+        latency_objective_ns: None,
+    })
+    .unwrap();
+    let shard = runtime.shard_ids()[0];
+    // Open before runtime/issuer teardown and before scoped work could be joined on failure.
+    let _open = OpenOnDrop(Arc::clone(&gate));
+    // Three simultaneous clients: the flusher, the later mutation's owner, and the reader.
+    let ranges = Arc::new(
+        Ranges::start(
+            &mut runtime,
+            vec![(Vec::new(), db)],
+            RangesConfig {
+                clients: 3,
+                slice_ns: 50_000,
+                spin_ns: 0,
+                inline: false,
+            },
+        )
+        .unwrap(),
+    );
+    gate.armed.store(true, Ordering::SeqCst);
+    let (flush_published, flush_publication) = mpsc::sync_channel(1);
+    let (flush_done, flushed) = mpsc::sync_channel(1);
+    let flush_ranges = Arc::clone(&ranges);
+    runtime
+        .spawn_on(shard, async move {
+            let mut client = flush_ranges.client().unwrap();
+            client
+                .put_async(b"a/flushed", b"packed by the flush")
+                .await
+                .unwrap();
+            let result = {
+                let mut flushing = pin!(client.flush_async());
+                poll_fn(|cx| {
+                    assert!(
+                        flushing.as_mut().poll(cx).is_pending(),
+                        "a flush finished while its packing's write could not have"
+                    );
+                    flush_published.send(()).unwrap();
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                flushing.await
+            };
+            drop(client);
+            drop(flush_ranges);
+            flush_done.send(result).unwrap();
+        })
+        .unwrap();
+    received(&flush_publication, "the flush's publication");
+    assert_eq!(
+        received(&events, "the flush's packing's first write, held"),
+        Event::Held
+    );
+    let (put_published, put_publication) = mpsc::sync_channel(1);
+    let (put_done, put_finished) = mpsc::sync_channel(1);
+    let put_ranges = Arc::clone(&ranges);
+    runtime
+        .spawn_on(shard, async move {
+            let mut client = put_ranges.client().unwrap();
+            let result = {
+                let mut putting =
+                    pin!(client.put_async(b"a/behind", b"published behind the flush"));
+                poll_fn(|cx| {
+                    assert!(
+                        putting.as_mut().poll(cx).is_pending(),
+                        "a put was answered as it was published"
+                    );
+                    put_published.send(()).unwrap();
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                putting.await
+            };
+            drop(client);
+            drop(put_ranges);
+            put_done.send(result).unwrap();
+        })
+        .unwrap();
+    received(&put_publication, "the later put's publication");
+    // The reader's requests reach the range after the put's: what they read is after the range
+    // took the put, deferred behind the flush or not.
+    let (read_done, read) = mpsc::sync_channel(1);
+    let read_ranges = Arc::clone(&ranges);
+    let read_gate = Arc::clone(&gate);
+    runtime
+        .spawn_on(shard, async move {
+            let mut client = read_ranges.client().unwrap();
+            let mut out = Vec::new();
+            let behind = if client.get_async(b"a/behind", &mut out).await.unwrap() {
+                Some(text(&out))
+            } else {
+                None
+            };
+            let before = if client.get_async(b"a/flushed", &mut out).await.unwrap() {
+                Some(text(&out))
+            } else {
+                None
+            };
+            let held = read_gate.state.lock().unwrap().active.is_some();
+            drop(client);
+            drop(read_ranges);
+            read_done.send((behind, before, held)).unwrap();
+        })
+        .unwrap();
+    let (behind, before, held) = received(&read, "the reads while the flush is held");
+    assert!(
+        held,
+        "the packing's write was let go before the reads ended"
+    );
+    assert_eq!(
+        behind, None,
+        "the put published behind the held flush was applied before it"
+    );
+    assert_eq!(before.as_deref(), Some("packed by the flush"));
+    gate.open();
+    received(&flushed, "the flush's answer after the release").unwrap();
+    received(&put_finished, "the later put's answer after the release").unwrap();
+    {
+        let mut client = ranges.client().unwrap();
+        let mut out = Vec::new();
+        assert!(client.get(b"a/behind", &mut out).unwrap());
+        assert_eq!(out, b"published behind the flush");
+        client.flush().unwrap();
+        client.checkpoint(2).unwrap();
+    }
+    assert!(!gate.reused_early.load(Ordering::SeqCst));
+    assert!(!gate.flushed_early.load(Ordering::SeqCst));
+    Arc::try_unwrap(ranges).unwrap().stop().unwrap();
+    runtime.shutdown().unwrap();
+    gate.armed.store(false, Ordering::SeqCst);
+    let (mut db, index) = ShardDb::open(
+        open(&path, false, false, gate),
+        STORE,
+        STORE.page_size,
+        TRUNK,
+    )
+    .unwrap();
+    assert_eq!(index, 2);
+    let mut expected = stable();
+    expected.insert(b"a/flushed".to_vec(), b"packed by the flush".to_vec());
+    expected.insert(b"a/behind".to_vec(), b"published behind the flush".to_vec());
+    check_all(&mut db, &expected);
+}
+
 /// Native handle lifetime is observable at the BlockFile seam. A closed range must return
 /// every file after its physical callbacks finish; the count includes every try_clone.
 struct Files {

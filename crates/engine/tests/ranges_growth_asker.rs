@@ -496,9 +496,9 @@ async fn checkpointed(
 
 /// Do: a checkpointed round; then, every growth write from here failing, puts of big values past
 /// one memtable, so a rotation hands a full one to packing behind the writer; once a growth write
-/// has failed, a read, a put and the stop. Expect: the read and the put answer with the injected
-/// write failure, the range's fault, and the stop with the same; reopened cold, the store holds
-/// exactly the checkpoint's image.
+/// has failed, a flush, which settles that packing, then a read, a put and the stop. Expect: the
+/// flush answers with the failed segment write, the range's fault, and the read, the put and the
+/// stop each with that same cause; reopened cold, the store holds exactly the checkpoint's image.
 #[test]
 fn a_failed_growth_write_ends_the_range_in_that_fault() {
     let dir = tempfile::tempdir().unwrap();
@@ -530,13 +530,16 @@ fn a_failed_growth_write_ends_the_range_in_that_fault() {
             }
             put.send(()).unwrap();
             afterwards.recv().await.unwrap();
+            // The flush settles the packing whose growth failed: the fault is the range's by its
+            // answer, whatever a read before it might have found.
+            let flushed = writer.flush_async().await;
             let mut out = Vec::new();
             let read = writer.get_async(&key(0), &mut out).await.map(|_| out);
             let wrote = writer.put_async(&key(1), &value(8, SMALL)).await;
             drop(writer);
             let stopped = ranges.stop_async().await;
             finish
-                .send((oracle, applied, early, read, wrote, stopped))
+                .send((oracle, applied, early, flushed, read, wrote, stopped))
                 .unwrap();
         })
         .unwrap();
@@ -546,22 +549,33 @@ fn a_failed_growth_write_ends_the_range_in_that_fault() {
     received(&put_rx, "the writer's puts answered");
     gate.until("a growth write failed", |s| s.finished >= 1);
     after.blocking_send(()).unwrap();
-    let (oracle, applied, early, read, wrote, stopped) =
+    let (oracle, applied, early, flushed, read, wrote, stopped) =
         received(&finished, "the writer's run after the fault");
     runtime.shutdown().unwrap();
     drop(issuer);
-    let fault = |what: &str, answer: String| {
-        assert!(
-            answer.contains("a test's failed growth write"),
-            "{what} answered {answer}, not the injected write failure"
-        );
+    // The first answer that must carry the fault: a put that waited for it, else the flush.
+    let first = match early {
+        Some(error) => error,
+        None => flushed.expect_err("the flush after the failed growth write"),
     };
-    if let Some(error) = early {
-        fault("a put before the fault was seen", format!("{error:?}"));
+    match &first {
+        Error::Io { op, detail } => {
+            assert_eq!(*op, "write a store segment whole", "{first:?}");
+            assert!(
+                detail.contains("a test's failed growth write"),
+                "the fault is the injected write failure: {first:?}"
+            );
+        }
+        other => panic!("the fault is {other:?}, not the failed segment write"),
     }
-    fault("a read after the fault", format!("{read:?}"));
-    fault("a put after the fault", format!("{wrote:?}"));
-    fault("the stop", format!("{stopped:?}"));
+    let cause = format!("{:?}", Err::<(), _>(first));
+    assert_eq!(
+        format!("{:?}", read.map(drop)),
+        cause,
+        "a read after the fault"
+    );
+    assert_eq!(format!("{wrote:?}"), cause, "a put after the fault");
+    assert_eq!(format!("{stopped:?}"), cause, "the stop");
     reopened(&path, applied, &oracle);
 }
 

@@ -16,24 +16,24 @@ use hyper_block::block::BlockFile;
 /// The cursors play a tournament kept as a tree of losers (Knuth, The Art of Computer
 /// Programming vol. 3 §5.4.1): each internal node holds the cursor that lost the match below
 /// it, the root's slot the winner, the cursor at the least key in range (of equal keys the
-/// newest). A step that moves the winner plays its path again, a comparison a level, where a
-/// scan of every cursor took two a cursor; the runner-up, the best of the losers on the
-/// winner's path, lets a winner whose next key stays below it go on with one comparison.
+/// newest). A step that moves the winner plays its path again, one key comparison a level,
+/// where a scan of every cursor took up to two a cursor. Whether a cursor is spent (past its
+/// entries or the end) is noted when it moves, so a match compares keys alone.
 #[derive(Debug)]
 pub struct Merge {
     cursors: Vec<RunCursor>,
     end: Option<Vec<u8>>,
     /// The cursor whose entry is current, if any.
     current: Option<usize>,
-    /// The cursor at the least key of the others, as the tournament last left it: while the
-    /// current key stays below its key, no other cursor holds the current key, so a step moves
-    /// the current cursor alone and compares its next key with this one only.
-    second: Option<usize>,
     /// The tournament: slot 0 the winner, slots `1..k` each internal node's loser, the cursors
     /// at leaf positions `k..2k` (node `n`'s children `2n` and `2n + 1`).
     tree: Vec<usize>,
     /// Each node's winner while the tournament is played whole, kept for the next.
     wins: Vec<usize>,
+    /// Whether each cursor is spent: past its entries, or at or past the end.
+    spent: Vec<bool>,
+    /// The cursors on their leaf's last entry: the only ones a move can make read a page.
+    edges: usize,
     /// The key `next` moves past, its buffer reused so a step allocates nothing.
     past: Vec<u8>,
     /// While opening, `current` is the next input and `past` holds its from-key.
@@ -90,9 +90,10 @@ impl Merge {
             cursors,
             end: end.map(<[u8]>::to_vec),
             current: None,
-            second: None,
             tree: Vec::new(),
             wins: Vec::new(),
+            spent: Vec::new(),
+            edges: 0,
             past: Vec::new(),
             opening: false,
         };
@@ -105,9 +106,10 @@ impl Merge {
             cursors: Vec::new(),
             end,
             current: Some(0),
-            second: None,
             tree: Vec::new(),
             wins: Vec::new(),
+            spent: Vec::new(),
+            edges: 0,
             past: from,
             opening: true,
         }
@@ -172,30 +174,44 @@ impl Merge {
         }
     }
 
-    /// Whether cursor `c` holds an entry in range: valid and below the end.
-    fn live(&self, c: &RunCursor) -> bool {
-        c.valid() && self.end.as_deref().is_none_or(|end| c.key() < end)
+    /// Whether cursor `i` is spent: past its last entry, or at or past the end.
+    fn spent_now(&self, i: usize) -> bool {
+        self.cursors
+            .get(i)
+            .is_none_or(|c| !c.valid() || self.end.as_deref().is_some_and(|end| c.key() >= end))
     }
 
-    /// Whether cursor `a` comes before cursor `b`: one in range before one not, then the less
-    /// key, then of equal keys the newer (the earlier input).
-    fn before(&self, a: usize, b: usize) -> bool {
-        let live = |i: usize| self.cursors.get(i).filter(|c| self.live(c));
-        match (live(a), live(b)) {
+    /// Whether cursor `a` wins its match with cursor `b`: one with an entry in range before a
+    /// spent one, then the less key, then of equal keys the newer (the earlier input). Whether
+    /// each is spent was noted when it moved, so a match compares keys once.
+    fn beats(&self, a: usize, b: usize) -> bool {
+        let spent = |i: usize| self.spent.get(i).copied().unwrap_or(true);
+        if spent(a) {
+            return false;
+        }
+        if spent(b) {
+            return true;
+        }
+        match (self.cursors.get(a), self.cursors.get(b)) {
             (Some(x), Some(y)) => match x.key().cmp(y.key()) {
                 Ordering::Less => true,
                 Ordering::Greater => false,
                 Ordering::Equal => a < b,
             },
-            (Some(_), None) => true,
-            (None, _) => false,
+            _ => false,
         }
     }
 
-    /// Plays the tournament whole: each node's match between its children's winners, from
-    /// the bottom up, then the winner and runner-up.
+    /// Plays the tournament whole: each cursor's state noted, then each node's match between
+    /// its children's winners from the bottom up, the losers kept and the winner current.
     fn pick(&mut self) {
         let k = self.cursors.len();
+        self.spent.clear();
+        for i in 0..k {
+            let spent = self.spent_now(i);
+            self.spent.push(spent);
+        }
+        self.edges = self.cursors.iter().filter(|c| c.at_leaf_end()).count();
         self.tree.clear();
         self.tree.resize(k.max(1), 0);
         self.wins.clear();
@@ -212,7 +228,7 @@ impl Merge {
                 .get(node.saturating_mul(2).saturating_add(1))
                 .copied()
                 .unwrap_or(0);
-            let (winner, loser) = if self.before(right, left) {
+            let (winner, loser) = if self.beats(right, left) {
                 (right, left)
             } else {
                 (left, right)
@@ -232,7 +248,7 @@ impl Merge {
         if let Some(w) = self.tree.first_mut() {
             *w = winner;
         }
-        self.settle();
+        self.crown();
     }
 
     /// Plays cursor `i`'s path again after it moved: at each node on the way up the better of
@@ -247,7 +263,7 @@ impl Merge {
                 break;
             }
             if let Some(&loser) = self.tree.get(node)
-                && self.before(loser, winner)
+                && self.beats(loser, winner)
             {
                 if let Some(l) = self.tree.get_mut(node) {
                     *l = winner;
@@ -259,73 +275,43 @@ impl Merge {
         if let Some(w) = self.tree.first_mut() {
             *w = winner;
         }
+        self.crown();
     }
 
-    /// The current cursor, the winner if it holds an entry in range, and the runner-up: the best
-    /// of the losers on the winner's path, every one of which the winner beat, so the cursor
-    /// the winner alone stands before.
-    fn settle(&mut self) {
-        let k = self.cursors.len();
-        let winner = if k == 0 {
+    /// The winner current, if it holds an entry in range.
+    fn crown(&mut self) {
+        let winner = if self.cursors.is_empty() {
             None
         } else {
             self.tree.first().copied()
         };
-        self.current = winner.filter(|&w| self.cursors.get(w).is_some_and(|c| self.live(c)));
-        let mut second: Option<usize> = None;
-        if let Some(w) = winner {
-            let mut node = k.saturating_add(w) >> 1;
-            for _ in 0..=usize::BITS {
-                if node == 0 {
-                    break;
-                }
-                if let Some(&loser) = self.tree.get(node)
-                    && second.is_none_or(|s| self.before(loser, s))
-                {
-                    second = Some(loser);
-                }
-                node >>= 1;
-            }
-        }
-        self.second = second.filter(|&s| self.cursors.get(s).is_some_and(|c| self.live(c)));
-    }
-
-    /// Whether the current key is below every other cursor's: no other cursor holds it.
-    fn alone(&self, at: &RunCursor) -> bool {
-        self.second
-            .and_then(|s| self.cursors.get(s))
-            .is_none_or(|s| !s.valid() || at.key() < s.key())
+        self.current = winner.filter(|&w| !self.spent.get(w).copied().unwrap_or(true));
     }
 
     /// Whether moving past the current key reads no page that has not landed: every cursor
     /// holding it either stays in its leaf or has its next leaf ready ([`RunCursor::next_ready`]).
+    /// Only a cursor on its leaf's last entry can read a page as it moves, so with none there is
+    /// nothing to look at, and otherwise only those are compared with the current key.
     pub fn ready<'a, F: BlockFile>(
         &mut self,
         store: &mut Store<F>,
         branches: impl IntoIterator<Item = &'a Branch>,
     ) -> Result<bool, Error> {
-        if self.opening {
+        if self.opening || self.edges == 0 {
             return Ok(true);
         }
         let Some(i) = self.current else {
             return Ok(true);
         };
-        let Some(at) = self.cursors.get(i) else {
-            return Ok(true);
-        };
-        if self.alone(at) {
-            let b = branches.into_iter().nth(i).ok_or(Error::InvalidArgument {
-                what: "a merge stepped over inputs it was not opened on",
-            })?;
-            return match self.cursors.get_mut(i) {
-                Some(c) => c.next_ready(b, store),
-                None => Ok(true),
+        for (j, b) in branches.into_iter().enumerate() {
+            let holds = match (self.cursors.get(j), self.cursors.get(i)) {
+                (Some(c), Some(at)) => c.at_leaf_end() && (j == i || c.key() == at.key()),
+                _ => false,
             };
-        }
-        self.past.clear();
-        self.past.extend_from_slice(at.key());
-        for (c, b) in self.cursors.iter_mut().zip(branches) {
-            if c.valid() && c.key() == self.past.as_slice() && !c.next_ready(b, store)? {
+            if holds
+                && let Some(c) = self.cursors.get_mut(j)
+                && !c.next_ready(b, store)?
+            {
                 return Ok(false);
             }
         }
@@ -364,20 +350,6 @@ impl Merge {
         let Some(at) = self.cursors.get(i) else {
             return Ok(0);
         };
-        if self.alone(at) {
-            // Only this cursor holds the key: it moves alone, and stays the winner while its
-            // next key is below the runner-up's, every other loser being no better.
-            self.advance(store, branches, i)?;
-            let stays = self
-                .cursors
-                .get(i)
-                .is_some_and(|c| self.live(c) && self.alone(c));
-            if !stays {
-                self.replay(i);
-                self.settle();
-            }
-            return Ok(1);
-        }
         self.past.clear();
         self.past.extend_from_slice(at.key());
         let mut moved = 0u64;
@@ -387,23 +359,23 @@ impl Merge {
             self.advance(store, branches.clone(), winner)?;
             moved = moved.saturating_add(1);
             self.replay(winner);
-            let Some(&next) = self.tree.first() else {
-                break;
-            };
-            let same = self
-                .cursors
-                .get(next)
-                .is_some_and(|c| self.live(c) && c.key() == self.past.as_slice());
-            if !same {
-                break;
+            match self.current {
+                Some(n)
+                    if self
+                        .cursors
+                        .get(n)
+                        .is_some_and(|c| c.key() == self.past.as_slice()) =>
+                {
+                    winner = n;
+                }
+                _ => break,
             }
-            winner = next;
         }
-        self.settle();
         Ok(moved)
     }
 
-    /// Moves cursor `i` past its key, reading its next leaf by its branch's page counts.
+    /// Moves cursor `i` past its key, reading its next leaf by its branch's page counts, and
+    /// notes whether it is spent and whether it now stands on its leaf's last entry.
     fn advance<'a, F: BlockFile>(
         &mut self,
         store: &mut Store<F>,
@@ -413,10 +385,22 @@ impl Merge {
         let b = branches.into_iter().nth(i).ok_or(Error::InvalidArgument {
             what: "a merge stepped over inputs it was not opened on",
         })?;
+        let end = self.end.as_deref();
         let c = self.cursors.get_mut(i).ok_or(Error::InvalidArgument {
             what: "a merge stepped over inputs it was not opened on",
         })?;
-        c.next(b, store)
+        let was = c.at_leaf_end();
+        c.next(b, store)?;
+        let now = c.at_leaf_end();
+        let spent = !c.valid() || end.is_some_and(|e| c.key() >= e);
+        if let Some(s) = self.spent.get_mut(i) {
+            *s = spent;
+        }
+        self.edges = self
+            .edges
+            .saturating_sub(usize::from(was))
+            .saturating_add(usize::from(now));
+        Ok(())
     }
 }
 

@@ -1859,6 +1859,12 @@ impl RunCursor {
         self.load_in(store)
     }
 
+    /// Whether moving on leaves the leaf held: the cursor stands on its leaf's last entry, and
+    /// only then can a move read a page ([`Self::next_ready`]).
+    pub(crate) fn at_leaf_end(&self) -> bool {
+        self.valid && self.index.saturating_add(1) >= self.n
+    }
+
     /// Whether moving to the next entry of `branch` reads no page that has not landed
     /// ([`Store::ready`]): the next entry is in the leaf held, there is none, or the next leaf
     /// is held or read ahead.

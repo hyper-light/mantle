@@ -163,3 +163,26 @@ At 100M:
   its 10M rounds.
 - **Against the bound.** The pieces fill 4.6× SplinterDB's rate at 100M and 7.6× RocksDB's,
   gets 5.5× and 7.7×, seeks 10× and 4.6×.
+
+## 7. The merge's pick: a tree of losers
+
+Sources: D. E. Knuth, *The Art of Computer Programming* vol. 3, §5.4.1 (the tree of losers);
+runs `n10000000-r501..503` and `n100000000-r501..503` (the full bench, quiet, interleaved).
+
+- **Step one: is the pick's work needed?** A merge emits its inputs' least key, the newest of
+  those tied, at every step. The pick scanned every cursor for the least and the runner-up, up
+  to two key comparisons a cursor, and skipped the scan while the winner's next key stayed below
+  the runner-up's. A root pivot's compaction merges its bundle and live in-flight branches, up
+  to `fanout + 1` inputs (nine), its keys interleaved, so the skip rarely holds: up to 16
+  comparisons a key. A tree of losers finds the next winner by playing the moved cursor's path
+  again, one comparison a level, four at nine inputs.
+- **A first version cost more than the scan.** Each match checked both cursors against the
+  range's end besides their keys, three comparisons a match, and every step walked the winner's
+  path a second time for the runner-up. Its merge took 170 ns a unit at 10M against the scan's
+  144 (the workers' wall time over the units they merged, three rounds each), and 465 against
+  332 at 100M in the first round, whose fill's worst put grew from 140 ms to 1.41 s: slower
+  merges hold the tree's changes longer.
+- **The second.** A cursor's state (spent: past its entries or the end) is noted once, when it
+  moves, so a match compares keys alone; the runner-up is not kept; a move is ready to take
+  without a read unless a cursor holding the key stands on its leaf's last entry, which a count
+  of those cursors answers at once when there are none.

@@ -16,6 +16,7 @@
 //! Facts decide every verdict: the gate counts growth writes begun and finished, the runtime task
 //! reports what it saw, and each wait for a fact has a failure guard ([`WAIT`]) a passing run never
 //! reaches.
+#![cfg(test)]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,

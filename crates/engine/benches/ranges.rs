@@ -168,9 +168,10 @@ fn mono_ns() -> u64 {
         .saturating_add(u64::try_from(t.tv_nsec).unwrap_or(0))
 }
 
-/// Where there is no CLOCK_MONOTONIC (Windows): the nanoseconds since the bench's first reading
-/// of its monotonic clock (`Instant`, QueryPerformanceCounter on Windows), so the phase bounds
-/// still order a profile's samples from the process's start.
+/// Where there is no CLOCK_MONOTONIC (Windows): the nanoseconds since this run's first phase
+/// bound read its monotonic clock (`Instant`, QueryPerformanceCounter on Windows). The bounds
+/// order the run's phases; they share no origin with an outside profiler's clock, which needs its
+/// own offset mapping to be compared with them.
 #[cfg(all(feature = "profile-phases", not(unix)))]
 fn mono_ns() -> u64 {
     static FIRST: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();

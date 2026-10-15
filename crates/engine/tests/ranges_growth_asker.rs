@@ -39,7 +39,6 @@ use hyper_block::buf::Alignment;
 use hyper_block::file::CachingRequest;
 use hyper_block::issuer::Issuer;
 use hyper_block::segmented::SegmentedFile;
-use hyper_rt::combine::{Either, race2};
 use hyper_rt::{Runtime, RuntimeConfig, ShardId};
 use mantle_engine::Error;
 use mantle_engine::ranges::{Ranges, RangesConfig};

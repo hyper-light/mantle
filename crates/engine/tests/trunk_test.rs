@@ -254,3 +254,139 @@ fn a_growing_trunk_splits_deepens_and_reads_after_every_batch() {
     // size-tiered Bε-tree), so many keys sit above the leaves; the leaves still split.
     assert!(leaves >= 10, "leaves {leaves}");
 }
+
+/// One batch, a memtable's view of it, packed as `Trunk::add_parts` takes it: a branch for each
+/// range between consecutive `cuts` (the first range every key below the second cut), each named
+/// by its index into `cuts`, empty ranges skipped. With no cuts, one branch over every key.
+fn pack_at(
+    store: &mut Store<SimFile>,
+    mem: &BTreeMap<Vec<u8>, Vec<u8>>,
+    cuts: &[Vec<u8>],
+) -> Vec<(usize, mantle_engine::branch::Branch)> {
+    let part_of = |k: &[u8]| {
+        cuts.get(1..)
+            .map_or(0, |c| c.partition_point(|x| x.as_slice() <= k))
+    };
+    let entries: Vec<_> = mem.iter().collect();
+    let mut parts = Vec::new();
+    let mut at = 0;
+    while at < entries.len() {
+        let j = part_of(entries[at].0);
+        let end = at
+            + entries[at..]
+                .iter()
+                .take_while(|(k, _)| part_of(k) == j)
+                .count();
+        let mut b = Builder::new(store, Keys::Exactly((end - at) as u64)).unwrap();
+        for (k, v) in &entries[at..end] {
+            b.add(store, k, Op::Put, v).unwrap();
+        }
+        parts.push((j, b.finish(store).unwrap()));
+        at = end;
+    }
+    parts
+}
+
+/// Batches packed at the root's pivot keys go into its pivots' bundles as they are, never
+/// written again by a root compaction of one input (research/57 §7): with no compaction out and
+/// no in-flight bundle left between batches, every batch packed while the root is an index node
+/// is taken whole, its entries counted in `parted_entries`, and after every batch every key reads
+/// its newest value and the store holds exactly the extents the trunk names.
+#[test]
+fn batches_packed_at_the_roots_pivots_enter_its_bundles_as_they_are() {
+    let align = Alignment::new(4096).unwrap();
+    let file = SimFile::new(align, Alignment::new(512).unwrap(), 11).unwrap();
+    let mut store = Store::create(file, CONFIG).unwrap();
+    let mut trunk = Trunk::new(TrunkConfig {
+        fanout: 4,
+        leaf_entries: 128,
+    })
+    .unwrap();
+    let mut oracle: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    let mut value = Vec::new();
+    let mut cuts = Vec::new();
+    let mut cut_entries = 0u64;
+    for batch in 0..120u32 {
+        let mut mem: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        for _ in 0..200 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let k = (x % 20_000) as u32;
+            mem.insert(key(k), format!("v{batch}-{k}").into_bytes());
+        }
+        trunk.root_cuts(&mut cuts);
+        let parts = pack_at(&mut store, &mem, &cuts);
+        if cuts.is_empty() {
+            for (_, b) in parts {
+                trunk.incorporate(&mut store, b).unwrap();
+            }
+        } else {
+            cut_entries += mem.len() as u64;
+            trunk.add_parts(cuts.clone(), parts);
+            trunk.drain(&mut store).unwrap();
+        }
+        oracle.extend(mem);
+        check_refs(&store, &trunk);
+        for (k, v) in &oracle {
+            assert_eq!(trunk.get(&mut store, k, &mut value).unwrap(), Some(Op::Put));
+            assert_eq!(&value, v);
+        }
+    }
+    assert!(cut_entries > 0, "the root never became an index node");
+    assert_eq!(trunk.stats().parted_entries, cut_entries);
+}
+
+/// Batches packed at keys that are not the root's pivot keys enter the root as one in-flight
+/// bundle and are compacted, never placed as a pivot's: every batch's cuts drop one of the root's
+/// pivot keys, so no pivot's range is one branch's, and no entry is counted in
+/// `parted_entries`; every key reads its newest value after every batch, and the store holds
+/// exactly the extents the trunk names.
+#[test]
+fn batches_packed_at_other_keys_enter_in_flight_and_are_compacted() {
+    let align = Alignment::new(4096).unwrap();
+    let file = SimFile::new(align, Alignment::new(512).unwrap(), 13).unwrap();
+    let mut store = Store::create(file, CONFIG).unwrap();
+    let mut trunk = Trunk::new(TrunkConfig {
+        fanout: 4,
+        leaf_entries: 128,
+    })
+    .unwrap();
+    let mut oracle: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let mut x = 0x5bd1_e995_9e37_79b9u64;
+    let mut value = Vec::new();
+    let mut cuts = Vec::new();
+    let mut stale = 0u32;
+    for batch in 0..120u32 {
+        let mut mem: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        for _ in 0..200 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let k = (x % 20_000) as u32;
+            mem.insert(key(k), format!("v{batch}-{k}").into_bytes());
+        }
+        trunk.root_cuts(&mut cuts);
+        if cuts.len() > 1 {
+            // The root's last pivot key dropped: its last branch spans two pivots.
+            cuts.pop();
+            stale += 1;
+            let parts = pack_at(&mut store, &mem, &cuts);
+            trunk.add_parts(cuts.clone(), parts);
+            trunk.drain(&mut store).unwrap();
+        } else {
+            for (_, b) in pack_at(&mut store, &mem, &[]) {
+                trunk.incorporate(&mut store, b).unwrap();
+            }
+        }
+        oracle.extend(mem);
+        check_refs(&store, &trunk);
+        for (k, v) in &oracle {
+            assert_eq!(trunk.get(&mut store, k, &mut value).unwrap(), Some(Op::Put));
+            assert_eq!(&value, v);
+        }
+    }
+    assert!(stale > 0, "the root never had two pivots");
+    assert_eq!(trunk.stats().parted_entries, 0);
+}

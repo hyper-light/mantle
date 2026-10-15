@@ -163,7 +163,59 @@ Both waits remain necessary:
 - without the pivot's, `a_drain_consolidates_whole_in_one_consolidation` fails 2 of 10;
 - with both, both pass 10 of 10.
 
-Its A/B against e43e632 follows.
+**Measured (kept: 91ddf13).** [runs] r1751–r1753, 91ddf13 (`wa3`, md5 `db11055d`) against
+e43e632 at 100M and 10M, interleaved, with RocksDB 11.8.1 and SplinterDB in each 100M round; every
+mantle case's recovery exact.
+
+| 100M, median of 3 | entries written | settled by consolidation | GB written | postfill flush | CPU |
+|---|---|---|---|---|---|
+| 91ddf13, inline | 381.3M | 63.2M | 45.9 | 2.67 s | 175 s |
+| e43e632, inline | 450.4M | 131.5M | 54.9 | 4.64 s | 195 s |
+| 91ddf13, queued | 394.5M | 63.2M | 44.3 | 2.61 s | 195 s |
+| e43e632, queued | 465.8M | 131.8M | 54.1 | 5.00 s | 208 s |
+
+The paired ratios, round by round:
+- entries written: 0.835–0.852;
+- bytes: 0.808–0.854;
+- the drain: 0.37–0.83, shorter in every round of both modes.
+
+| 100M, median of 3 | fills/s | gets/s | seeks/s |
+|---|---|---|---|
+| 91ddf13, inline | 3.71M | 1.43M | 343K |
+| e43e632, inline | 3.63M | 1.37M | 336K |
+| 91ddf13, queued | 1.94M | 1.06M | 322K |
+| e43e632, queued | 1.99M | 1.02M | 320K |
+| RocksDB, 32 GiB cache | 759K | 212K | 70K |
+| SplinterDB, 32 GiB cache | 1.11M | 356K | 44K |
+
+At 10M (r1751–r1753) the queued drain took 0.48, 0.40, 0.38 s against e43e632's 0.56, 0.50,
+0.48 s (c2da2c3's: 1.87, 5.16, 5.64 s), writing 20.48M entries against 21.33M; inline was
+unchanged (19.82M both, 0.53 s both). Throughput at both sizes was within the rounds' spread of
+e43e632's. The seek phase did identical work in every pair (sources opened, cache hits, no page
+from the file or device), so its rates differed by the host alone.
+
+## 6. The root's compactions copy a single memtable
+
+The drain's cut leaves the fill's writes, where the device saturates, as they were (pivot entries
+274.7M against 276.5M at 100M). [diag2] r1761 (91ddf13 with each pivot compaction's depth and
+input branches printed, md5 `6b3d35a3`, DIAGNOSTIC) counted the pivot compactions of a 100M fill
+by depth and inputs:
+
+| depth | input branches | compactions |
+|---|---|---|
+| 0 (the root) | 1 | 309 |
+| 0 | 2–3 | 30 |
+| 0 | 4+ | 18 |
+| 1 | 1 | 94 |
+| 1 | 2–3 | 398 |
+| 1 | 4+ | 107 |
+| 2 | 4+ | 291 |
+
+- **At the root.** 309 of the root's 357 compactions took one input: a packed memtable's branch,
+  rewritten split at the root's pivots, its entries and their order unchanged.
+- **Below the root.** The levels below merge two or more branches.
+
+The entries those copies wrote are counted next (§7).
 - Write-back with discard (§3) is the remaining lever the size of the gap to SplinterDB's large
   cache. Its design comes first: pages shared with workers without copies, dirty pages bounded by
   the cache and cleaned ahead of eviction, a checkpoint's write-back before its flush, a freed

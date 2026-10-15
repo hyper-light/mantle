@@ -70,10 +70,41 @@ A 100M fill grows its file by about 36 segments (`runs/n100000000-r2011..r2014-x
 The zeros are needed: a file's own first writes stall its other writers on ext4 as on APFS
 (research/48 §4).
 
-## 4. Open
+## 4. The stalls of seconds: the root leaf's first settle
 
-- **The multi-second stalls.** §2's traces were taken under host load only, where stalls lasted
-  0.2-0.5 s. The 12-loop stalls (0.2-3.7 s) are next, traced the same way.
+The candidate with the trace, at 10M beside 12 and 18 busy loops (`diag-runs/n10000000-r1941..r1944`
+and `r1951..r1954`), stalled on two things:
+
+| stall | its length | what the rotation waited on | the stage it waited for |
+|---|---|---|---|
+| r1954, 18 loops, 7.5 s | 1,257 ms | the root's room: 5 branches pending, 7.6M entries owed | the root leaf's first settle: 3,320 ms, 32% on CPU, 3,080 preemptions |
+| r1951, 18 loops, 5.9 s | 134 ms | the root's room: 7 pending | that settle: 1,983 ms |
+| r1943, 12 loops, 3.1 s | 147 ms | the root's room: 6 pending | that settle: 960 ms, 4,105,704 entries, 69% on CPU |
+| rotation 2, each loaded run | 1-130 ms | the first packing: no overlap measured, none allowed frozen | the first packing, 165-380 ms |
+
+**Why the root leaf.**
+- The root starts as a leaf.
+- A leaf settles past `leaf_limit()` = fanout × `leaf_entries`. The bench's `leaf_entries` is one
+  memtable's entries, so the root leaf takes eight packings, about 4.1M entries at 10M.
+- It then merges them all in one settle, which splits it into an index node.
+- Until that settle applies, the packings that follow wait as pending branches, and the root's room
+  (pending and live in-flight, below fanout) runs out.
+- Afterwards the root split (research/57 §7) places each packing's parts in the root's pivots, and
+  this wait does not come again.
+
+**Step one: is the work needed?** Yes. The first settle is what builds the trunk's first level.
+
+**Step two: is this much needed at once?** Open. The root leaf is the one node whose settle every
+packing waits on. Settled at one memtable's entries instead of fanout of them, the root would be an
+index node within the first few packings, and every packing after would take the root split.
+
+That is to be measured against the candidate:
+- at 0, 12 and 18 busy loops;
+- at 10M and 100M;
+- with its writes (entries written), seeks and gets beside its stalls.
+
+## 5. Open
+
 - **Step one for the slow stages.**
   - Does the root's first compaction, which computed 1-1.2 s, need to merge that much while
     the root fills?

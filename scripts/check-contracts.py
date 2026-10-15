@@ -48,6 +48,11 @@ PATH_ATTR = re.compile(r'^\s*#\[path\s*=\s*"([^"]+)"\]')
 # Every form that names a source file: a path attribute, under cfg_attr or not, and the include
 # macros.
 NAMED_FILE = re.compile(r'(?:\bpath\s*=\s*|\binclude(?:_str|_bytes)?!\s*\(\s*)"([^"]+)"')
+# A `mod NAME;` anywhere on a line, inline modules' included.
+MOD_ANY = re.compile(r"\bmod\s+(\w+)\s*;")
+# Forms whose file the scan does not resolve: any include macro, whatever its argument, and a
+# path attribute given as a raw string. A crate holding one has no test-only file.
+UNRESOLVED = re.compile(r"\binclude(?:_str|_bytes)?!|\bpath\s*=\s*r")
 
 ALLOW_UNSAFE = re.compile(r"allow\s*\(\s*unsafe_code\s*\)")
 UNSAFE_BLOCK = re.compile(r"\bunsafe\s*(\{|fn\b|extern\b|impl\b)")
@@ -56,16 +61,20 @@ UNSAFE_BLOCK = re.compile(r"\bunsafe\s*(\{|fn\b|extern\b|impl\b)")
 def test_only_files():
     """The files under crates/*/src only test code includes: each one a `#[cfg(test)]` module
     declaration's file (its `#[path]`, or NAME.rs or NAME/mod.rs beside the declaring module) whose
-    name no production form names. A production form is a `mod NAME;` outside `#[cfg(test)]`, at
-    any depth (inline modules included), and every other file a source names: a `#[path]` not on
-    a `#[cfg(test)]` declaration, any `cfg_attr` path, `include!`, `include_str!` and
-    `include_bytes!`. Names decide, not resolved paths, so a reach the scan cannot resolve keeps
-    the file production's."""
-    test, names = set(), set()
+    name no production form names, in a crate with no form the scan does not resolve. A production
+    form is any `mod NAME;` but the test declaration's own (at any depth, on any line), and every
+    other file a source names: a `#[path]` not on a `#[cfg(test)]` declaration and any `cfg_attr`
+    path. An include macro in any form, or a raw-string path, leaves its crate with no test-only
+    file. Names decide, not resolved paths, so a reach the scan cannot resolve keeps the file
+    production's."""
+    test, names, unresolved = set(), set(), set()
     for path in ROOT.glob("crates/*/src/**/*.rs"):
+        crate = path.relative_to(ROOT).parts[1]
         lines = path.read_text(encoding="utf-8").splitlines()
-        test_attrs = set()
+        test_attrs, test_decls = set(), set()
         for i, line in enumerate(lines):
+            if UNRESOLVED.search(line):
+                unresolved.add(crate)
             m = MOD_FILE.match(line)
             if not m:
                 continue
@@ -78,21 +87,27 @@ def test_only_files():
             attrs = [lines[j].strip() for j in at]
             if "#[cfg(test)]" in attrs and not any(a.startswith("#[cfg_attr") for a in attrs):
                 test_attrs.update(at)
+                test_decls.add(i)
                 given = next((PATH_ATTR.match(a).group(1) for a in attrs if PATH_ATTR.match(a)), None)
                 if given is not None:
                     test.add((path.parent / given).resolve())
                 else:
                     base = path.parent if path.name in ("mod.rs", "lib.rs", "main.rs") else path.parent / path.stem
                     test.update({(base / f"{m.group(1)}.rs").resolve(), (base / m.group(1) / "mod.rs").resolve()})
-            else:
-                names.update({f"{m.group(1)}.rs", m.group(1)})
         for i, line in enumerate(lines):
             if i in test_attrs:
                 continue
+            # Every `mod NAME;` on the line but a test declaration's own, its first.
+            for k, mm in enumerate(MOD_ANY.finditer(line)):
+                if not (i in test_decls and k == 0):
+                    names.update({f"{mm.group(1)}.rs", mm.group(1)})
             names.update(pathlib.PurePosixPath(named).name for named in NAMED_FILE.findall(line))
     def reached(f):
         return f.name in names or (f.name == "mod.rs" and f.parent.name in names)
-    return {f for f in test if not reached(f)}
+    def crate_of(f):
+        parts = f.relative_to(ROOT.resolve()).parts if f.is_relative_to(ROOT.resolve()) else ()
+        return parts[1] if len(parts) > 1 else None
+    return {f for f in test if crate_of(f) not in unresolved and not reached(f)}
 
 
 # The test-only rule on small trees, each with whether an uninventoried constant in it must be
@@ -136,6 +151,34 @@ FIXTURES = {
         },
         True,
     ),
+    "production_raw_include": (
+        {
+            "lib.rs": 'include!(r"shared.rs");\n#[cfg(test)]\n#[path = "shared.rs"]\nmod checks;\n',
+            "shared.rs": "const MISSED: u64 = 1;\n",
+        },
+        True,
+    ),
+    "production_computed_include": (
+        {
+            "lib.rs": 'include!(concat!("sha", "red.rs"));\n#[cfg(test)]\n#[path = "shared.rs"]\nmod checks;\n',
+            "shared.rs": "const MISSED: u64 = 1;\n",
+        },
+        True,
+    ),
+    "production_one_line_inline_module": (
+        {
+            "lib.rs": 'mod outer { mod shared; }\n#[cfg(test)]\n#[path = "outer/shared.rs"]\nmod checks;\n',
+            "outer/shared.rs": "const MISSED: u64 = 1;\n",
+        },
+        True,
+    ),
+    "production_raw_path": (
+        {
+            "lib.rs": '#[path = r"shared.rs"]\nmod live;\n#[cfg(test)]\n#[path = "shared.rs"]\nmod checks;\n',
+            "shared.rs": "const MISSED: u64 = 1;\n",
+        },
+        True,
+    ),
     # A test declaration with a conditional path is ambiguous: the file of its name stays
     # production's.
     "conditional_test_declaration": (
@@ -172,11 +215,15 @@ def fixtures():
                 timeout=60,
                 env={**os.environ, "CHECK_CONTRACTS_FIXTURE": "1"},
             )
-            refused = run.returncode != 0 and "MISSED has no row" in run.stderr
-            if refused != refuse:
+            # A refusal exits 1 naming the constant; a pass exits 0 with nothing to say.
+            if refuse:
+                ok = run.returncode == 1 and "MISSED has no row" in run.stderr
+            else:
+                ok = run.returncode == 0 and not run.stderr.strip()
+            if not ok:
                 failures.append(
                     f"scripts/check-contracts.py: fixture {name}: "
-                    + ("passed an uninventoried production constant" if refuse else "refused a test-only constant")
+                    + ("did not refuse an uninventoried production constant" if refuse else "did not pass a test-only constant")
                     + f" (exit {run.returncode}: {run.stderr.strip()})"
                 )
     return failures

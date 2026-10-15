@@ -554,9 +554,12 @@ fn a_failed_growth_write_ends_the_range_in_that_fault() {
     runtime.shutdown().unwrap();
     drop(issuer);
     // The first answer that must carry the fault: a put that waited for it, else the flush.
-    let first = match early {
-        Some(error) => error,
-        None => flushed.expect_err("the flush after the failed growth write"),
+    let first = match &early {
+        Some(error) => error.clone(),
+        None => flushed
+            .as_ref()
+            .expect_err("the flush after the failed growth write")
+            .clone(),
     };
     match &first {
         Error::Io { op, detail } => {
@@ -569,6 +572,7 @@ fn a_failed_growth_write_ends_the_range_in_that_fault() {
         other => panic!("the fault is {other:?}, not the failed segment write"),
     }
     let cause = format!("{:?}", Err::<(), _>(first));
+    assert_eq!(format!("{flushed:?}"), cause, "the flush after the fault");
     assert_eq!(
         format!("{:?}", read.map(drop)),
         cause,

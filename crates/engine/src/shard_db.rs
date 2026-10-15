@@ -2740,8 +2740,21 @@ impl<F: BlockFile> ShardDb<F> {
         }
         if wanted > self.store.capacity() {
             self.growth_waited = self.growth_waited.max(wanted);
+        } else if self.growth_waited <= self.store.capacity() {
+            // Every ask that waited for room fits the room admitted since: none waits for a
+            // growth.
+            self.growth_waited = 0;
         }
         if self.growth.is_some() || (!self.growth_due() && self.growth_waited == 0) {
+            return Ok(did);
+        }
+        // Due only ahead of need (no ask waits for room), a growth leaves the last free seat to a
+        // packing held for one: the packing fits the room admitted and the writer waits on it; the
+        // next look books the growth.
+        if self.growth_waited == 0
+            && self.packing.as_ref().is_some_and(|p| p.sort.is_some())
+            && self.trunk.pool_mut().is_some_and(|pool| pool.idle() <= 1)
+        {
             return Ok(did);
         }
         // Due from now, if it was not already: the lead counts from the first look that found it.

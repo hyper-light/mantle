@@ -377,9 +377,22 @@ impl Probe<'_> {
 /// begins; the writer comes to wait for room, and from then on the range answers each request with
 /// one idle slice and parks between them. Let the first growth through, the second held: the writer
 /// does more operations before the second lands. Let every growth through: the writer finishes;
-/// every value and tombstone reads back exactly, after a checkpoint and a cold reopen too.
+/// every value and tombstone reads back exactly, after a checkpoint and a cold reopen too. With as
+/// many workers as the host's cores.
 #[test]
 fn a_range_waiting_for_room_parks_and_goes_on_with_each_growth() {
+    parks_and_goes_on(false);
+}
+
+/// The same with one worker, the memory budget's (ranges_growth_asker.rs's recipe), on any host:
+/// the second growth, due ahead of need, leaves the one seat to the packing the writer waits on,
+/// whose room the first growth brought.
+#[test]
+fn with_one_worker_a_range_waiting_for_room_goes_on_with_the_room_each_growth_brings() {
+    parks_and_goes_on(true);
+}
+
+fn parks_and_goes_on(one_worker: bool) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("range");
     let growths: &'static Growths = Box::leak(Box::new(Growths::new(0)));
@@ -398,6 +411,11 @@ fn a_range_waiting_for_room_parks_and_goes_on_with_each_growth() {
         TRUNK,
     )
     .unwrap();
+    if one_worker {
+        // Enough for the owner and one worker's depth, active output and hand-off roles.
+        let run = STORE.page_size * usize::try_from(STORE.extent_pages).unwrap();
+        db.set_memory(2 * (issuer.depth() + 2) * run).unwrap();
+    }
     db.attach(&issuer, issuer.depth()).unwrap();
     let worker_path = path.clone();
     db.set_workers(move || {

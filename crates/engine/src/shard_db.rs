@@ -2730,28 +2730,29 @@ impl<F: BlockFile> ShardDb<F> {
                 did = true;
             }
         }
-        let wanted = self
+        let asked = self
             .trunk
             .take_capacity_wanted()
-            .max(std::mem::take(&mut self.packing_wanted))
-            .max(self.trunk.pool_mut().map_or(0, |p| p.needs_wanted()));
+            .max(std::mem::take(&mut self.packing_wanted));
+        let wanted = asked.max(self.trunk.pool_mut().map_or(0, |p| p.needs_wanted()));
         if let Some(pool) = self.trunk.pool_mut() {
             pool.answer_needs(&mut self.store)?;
         }
         if wanted > self.store.capacity() {
             self.growth_waited = self.growth_waited.max(wanted);
-        } else if self.growth_waited <= self.store.capacity() {
-            // Every ask that waited for room fits the room admitted since: none waits for a
-            // growth.
-            self.growth_waited = 0;
         }
-        if self.growth.is_some() || (!self.growth_due() && self.growth_waited == 0) {
+        // What waits for room now: the asks declared since the last look, and the workers' asks
+        // the admitted room could not answer. `growth_waited` keeps the most that waited since the
+        // last booking, for the next segment's size and lead.
+        let short = asked.max(self.trunk.pool_mut().map_or(0, |p| p.needs_wanted()))
+            > self.store.capacity();
+        if self.growth.is_some() || (!self.growth_due() && !short) {
             return Ok(did);
         }
-        // Due only ahead of need (no ask waits for room), a growth leaves the last free seat to a
-        // packing held for one: the packing fits the room admitted and the writer waits on it; the
-        // next look books the growth.
-        if self.growth_waited == 0
+        // Due ahead of need, nothing waiting for room, a growth leaves the last free seat to a
+        // packing held for one: the packing fits the room admitted, the writer waits on it, and
+        // the idle step hands it off next; the growth is booked at a later look.
+        if !short
             && self.packing.as_ref().is_some_and(|p| p.sort.is_some())
             && self.trunk.pool_mut().is_some_and(|pool| pool.idle() <= 1)
         {

@@ -16,21 +16,23 @@ use file_outcome::finished_file;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use hyper_block::DiskError;
 use hyper_block::block::BlockFile;
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::issuer::Issuer;
-use hyper_rt::combine::{Either, race2};
+use hyper_rt::ShardId;
+use hyper_rt::combine::{Either, join2, race2};
 use hyper_rt::{Runtime, RuntimeConfig};
 use mantle_engine::branch::Op;
 use mantle_engine::memtable::hashed::HashMem;
 use mantle_engine::ranges::{Client, Ranges, RangesConfig};
 use mantle_engine::rows::Rows;
-use mantle_engine::shard_db::ShardDb;
+use mantle_engine::shard_db::{FlushStats, ShardDb};
 use mantle_engine::store::Config;
 use mantle_engine::trunk::TrunkConfig;
 use std::future::{Future, poll_fn};
@@ -47,6 +49,12 @@ const TRUNK: TrunkConfig = TrunkConfig {
     leaf_entries: 96,
 };
 const OPS: u64 = 2048;
+/// The span of a failure guard, the native worker fixtures' (pool_lifecycle.rs): a passing run
+/// never goes this long without progress, and elapsed time never counts as the fact.
+const WAIT: Duration = Duration::from_secs(5);
+/// The guard spans a wait may take: one more than the writer's operations, each span after the
+/// first granted only by an operation done in the one before.
+const SPANS: u64 = OPS + 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Event {
@@ -78,6 +86,9 @@ struct Gate {
     events: mpsc::SyncSender<Event>,
     failures: AtomicUsize,
     hold_remaining_writes: AtomicBool,
+    /// Holds the first packing's page write ([`first_packing_page`]) rather than the first
+    /// worker write.
+    first_packing: AtomicBool,
     reused_early: AtomicBool,
     flushed_early: AtomicBool,
     forbidden: AtomicBool,
@@ -101,6 +112,7 @@ impl Gate {
                 events,
                 failures: AtomicUsize::new(0),
                 hold_remaining_writes: AtomicBool::new(false),
+                first_packing: AtomicBool::new(false),
                 reused_early: AtomicBool::new(false),
                 flushed_early: AtomicBool::new(false),
                 forbidden: AtomicBool::new(false),
@@ -155,7 +167,10 @@ impl Gate {
                 "held output bytes reused before their write retired",
             ));
         }
-        if worker && !state.selected {
+        if worker
+            && !state.selected
+            && (!self.first_packing.load(Ordering::SeqCst) || first_packing_page(bytes))
+        {
             state.selected = true;
             state.active = Some(Region { offset, end });
             self.report(Event::Held);
@@ -186,6 +201,19 @@ impl Gate {
         drop(state);
         file.write_all_at(bytes, offset)
     }
+}
+
+/// Whether a write carries the writer's operation 3 value whole: 1365 bytes of 3
+/// ([`operation`]), stored as written in a leaf page, which the first memtable holds (it begins
+/// empty when the gate is armed, and four operations fit in a page's memtable), so its packing is
+/// the first to write it.
+fn first_packing_page(bytes: &[u8]) -> bool {
+    let value = STORE.page_size / 3;
+    let mut run = 0;
+    bytes.iter().any(|&b| {
+        run = if b == 3 { run + 1 } else { 0 };
+        run == value
+    })
 }
 
 struct OpenOnDrop(Arc<Gate>);
@@ -392,11 +420,132 @@ fn check_all(db: &mut ShardDb<Gated>, expected: &BTreeMap<Vec<u8>, Vec<u8>>) {
     panic!("full pagination exceeds its live-row bound");
 }
 
+fn parked_since(shard: ShardId, waits: u64) -> bool {
+    hyper_rt::registry::with_entry(shard.0, |e| e.pulse.waits() > waits && e.parking.parked())
+        .unwrap()
+}
+
+fn waits(shard: ShardId) -> u64 {
+    hyper_rt::registry::with_entry(shard.0, |e| e.pulse.waits()).unwrap()
+}
+
+/// Waits for `fact`, yielding between looks, the guard on the writer's progress, not on the
+/// wait's length: a span of [`WAIT`] with neither the fact nor an operation of the writer's
+/// fails the test, naming the fact. The writer's operations are bounded, so the wait ends.
+fn until(what: &str, done: &AtomicU64, mut fact: impl FnMut() -> bool) {
+    let mut seen = done.load(Ordering::Acquire);
+    for _ in 0..SPANS {
+        let deadline = Instant::now() + WAIT;
+        while Instant::now() < deadline {
+            if fact() {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        let now = done.load(Ordering::Acquire);
+        assert!(
+            now != seen,
+            "{what}: not seen, the writer without progress for the failure guard's span, {now} \
+             of {OPS} operations done"
+        );
+        seen = now;
+    }
+    panic!("{what}: not seen within the writer's operations");
+}
+
+/// The range's counters on request, from a client in the writer's task.
+struct Probe<'a> {
+    ask: &'a hyper_rt::sync::Sender<()>,
+    answers: &'a mpsc::Receiver<FlushStats>,
+    done: &'a AtomicU64,
+    shard: ShardId,
+}
+
+impl Probe<'_> {
+    /// One request to the range; returns its answer and the writer's operations done, once the
+    /// shard has parked again after answering: a fact the shard announces, not a time.
+    fn take(&self) -> (FlushStats, u64) {
+        let before = waits(self.shard);
+        self.ask.blocking_send(()).unwrap();
+        let mut seen = self.done.load(Ordering::Acquire);
+        let mut stats = None;
+        for _ in 0..SPANS {
+            match self.answers.recv_timeout(WAIT) {
+                Ok(answer) => {
+                    stats = Some(answer);
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let now = self.done.load(Ordering::Acquire);
+                    assert!(
+                        now != seen,
+                        "the range's answer to a probe: not received, the writer without \
+                         progress for the failure guard's span"
+                    );
+                    seen = now;
+                }
+                Err(e) => panic!("the range's answer to a probe: not received ({e})"),
+            }
+        }
+        let stats = stats.expect("the range's answer to a probe within the writer's operations");
+        let done = self.done.load(Ordering::Acquire);
+        until(
+            "the shard parked after answering a probe",
+            self.done,
+            || parked_since(self.shard, before),
+        );
+        (stats, done)
+    }
+
+    /// Probes until two answers in a row show the writer waiting for room: no operation done
+    /// and no rotation between them, and the range's idle work between them the one
+    /// maintenance slice its task takes for the one event between them, the second probe's
+    /// request, before it parks (ranges_room.rs's `Probe::until_waiting`). With every worker
+    /// write held from the first, no packing comes back until the gate opens, so the first wait
+    /// for room lasts until then. A writer that finished first never waited, which fails.
+    fn until_waiting(&self, writer_ended: &AtomicBool) {
+        let mut seen = self.done.load(Ordering::Acquire);
+        let mut deadline = Instant::now() + WAIT;
+        let mut spans = 0;
+        let (mut last, mut done) = self.take();
+        loop {
+            assert!(
+                !writer_ended.load(Ordering::Acquire),
+                "input did not exercise a retained write"
+            );
+            if Instant::now() >= deadline {
+                let now = self.done.load(Ordering::Acquire);
+                assert!(
+                    now != seen && spans < SPANS,
+                    "the writer waiting for room: not seen, the writer without progress for \
+                     the failure guard's span, {now} of {OPS} operations done"
+                );
+                (seen, deadline, spans) = (now, Instant::now() + WAIT, spans + 1);
+            }
+            let (now, now_done) = self.take();
+            if now_done == done
+                && now.rotations == last.rotations
+                && now.idle_slices == last.idle_slices + 1
+            {
+                return;
+            }
+            (last, done) = (now, now_done);
+        }
+    }
+}
+
 fn retention_case(fail: bool) {
     let dir = tempfile::tempdir().unwrap();
     let first_path = dir.path().join("first");
     let second_path = dir.path().join("second");
     let (gate, events) = Gate::new(true, fail);
+    // The held write is the first packing's, which the writer comes to wait for whatever a
+    // rotation leaves in flight: the first worker write may be another's, as a rotation may leave
+    // one packing out beside the first before any has come back (`ShardDb::frozen_most`), and
+    // with that one held the first comes back and its room lets the writer and the mutations
+    // queued behind it go on. Every other write stays live: the device's second slot serves the
+    // probe's reads.
+    gate.first_packing.store(true, Ordering::SeqCst);
     let mut first = engine(&first_path, Arc::clone(&gate));
     for (key, value) in stable() {
         first.put(&key, &value).unwrap();
@@ -440,13 +589,14 @@ fn retention_case(fail: bool) {
     let shard = runtime.shard_ids()[0];
     // Open before runtime/issuer teardown and before scoped work could be joined on failure.
     let _open = OpenOnDrop(Arc::clone(&gate));
-    // Four simultaneous clients: writer, canceled put, canceled delete, and read/progress probe.
+    // Five simultaneous clients: writer, canceled put, canceled delete, read/progress probe,
+    // and the writer's task's counter prober.
     let ranges = Arc::new(
         Ranges::start(
             &mut runtime,
             vec![(Vec::new(), first), (b"m".to_vec(), second)],
             RangesConfig {
-                clients: 4,
+                clients: 5,
                 slice_ns: 50_000,
                 spin_ns: 0,
                 inline: false,
@@ -454,7 +604,9 @@ fn retention_case(fail: bool) {
         )
         .unwrap(),
     );
-    let before_wait = hyper_rt::registry::with_entry(shard.0, |entry| entry.pulse.waits()).unwrap();
+    let done_ops: &'static AtomicU64 = Box::leak(Box::default());
+    let (ask, mut asked) = hyper_rt::sync::channel::<()>(1).unwrap();
+    let (answer, answers) = mpsc::sync_channel(1);
     gate.armed.store(true, Ordering::SeqCst);
     let writer_ranges = Arc::clone(&ranges);
     let writer_gate = Arc::clone(&gate);
@@ -465,21 +617,34 @@ fn retention_case(fail: bool) {
         .spawn_on(shard, async move {
             let _terminal = Terminal(writer_gate);
             let mut client = writer_ranges.client().unwrap();
+            let mut prober = writer_ranges.client().unwrap();
             let mut oracle = BTreeMap::new();
             let mut failure = None;
-            for i in 0..OPS {
-                let (key, value) = operation(i);
-                let applied = match &value {
-                    Some(v) => client.put_async(&key, v).await,
-                    None => client.delete_async(&key).await,
-                };
-                if let Err(error) = applied {
-                    assert!(fail && matches!(error, mantle_engine::Error::Io { .. }));
-                    failure = Some(error);
-                    break;
+            let write = async {
+                for i in 0..OPS {
+                    let (key, value) = operation(i);
+                    let applied = match &value {
+                        Some(v) => client.put_async(&key, v).await,
+                        None => client.delete_async(&key).await,
+                    };
+                    if let Err(error) = applied {
+                        assert!(fail && matches!(error, mantle_engine::Error::Io { .. }));
+                        failure = Some(error);
+                        break;
+                    }
+                    record(&mut oracle, key, value);
+                    done_ops.store(i + 1, Ordering::Release);
                 }
-                record(&mut oracle, key, value);
-            }
+            };
+            // Until the test closes its end, each ask is answered with the range's counters.
+            let probe = async {
+                while asked.recv().await.is_ok() {
+                    let stats = prober.stats_async().await.unwrap();
+                    answer.send(stats[0].0).unwrap();
+                }
+            };
+            join2(write, probe).await;
+            drop(prober);
             if fail && failure.is_none() {
                 let error = client.flush_async().await.unwrap_err();
                 assert!(matches!(error, mantle_engine::Error::Io { .. }));
@@ -493,23 +658,18 @@ fn retention_case(fail: bool) {
         })
         .unwrap();
     assert_eq!(events.recv().unwrap(), Event::Held);
-    // Public owner wait/announcement facts, not a sleep or a private engine-work assertion.
-    // Pending CPU slices remain runnable; a fresh park with the writer unfinished exercises
-    // the event wait. This is not a proof of native syscall residency.
-    loop {
-        assert!(
-            !writer_ended.load(Ordering::Acquire),
-            "input did not exercise a retained write"
-        );
-        if hyper_rt::registry::with_entry(shard.0, |entry| {
-            entry.pulse.waits() > before_wait && entry.parking.parked()
-        })
-        .unwrap()
-        {
-            break;
-        }
-        std::thread::yield_now();
+    // The writer retained behind the held write, by the range's counters and the shard's parks,
+    // public facts, not a sleep or a private engine-work assertion: a park alone came while the
+    // writer still had room, and the mutations queued after it then applied under the probe's
+    // reads. The prober's end closed once it has.
+    Probe {
+        ask: &ask,
+        answers: &answers,
+        done: done_ops,
+        shard,
     }
+    .until_waiting(&writer_ended);
+    drop(ask);
     let (published, publications) = mpsc::sync_channel(2);
     let (put_resume, put_continue) = hyper_rt::sync::channel::<()>(1).unwrap();
     let (put_done, put_finished) = mpsc::sync_channel(1);

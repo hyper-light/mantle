@@ -346,6 +346,10 @@ pub struct TrunkStats {
     /// ([`Trunk::add_parts`]): what the root's compactions of one input would have written again
     /// (research/57 §7).
     pub parted_entries: u64,
+    /// Settles that split a leaf and ran as several jobs over key ranges, a part each, and those
+    /// jobs.
+    pub parallel_settles: u64,
+    pub parallel_settle_jobs: u64,
     /// The trunk's shape when these were taken ([`Trunk::levels`]), a depth an element from the
     /// root, depths past the last summed into it.
     pub shape: [LevelShape; SHAPE_DEPTHS],

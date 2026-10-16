@@ -585,7 +585,13 @@ counted budget; no task waits on another node's:
 - **Settle and split**, one structural task per node: a leaf past `fanout` branches or
   `leaf_entries` entries is compacted whole and split by entries; an index node past `fanout`
   pivots splits. The apply splices the parts into the parent, which may make the parent a split
-  task in turn: a trigger per level, never a frame waiting on a frame.
+  task in turn: a trigger per level, never a frame waiting on a frame. A split holds its
+  parent's pivot until it applies, so on workers its merge runs as one job a part, over key
+  ranges cut at the separators of its largest input's leaf pages where each part's share of
+  that input's entries begins (read from the leaf index and page counts in memory). The jobs
+  run at once and apply together, as the node's one change. One job merging a 3.5-7M-entry
+  split held a root pivot for 1.3-5.9 s beside 18 busy loops, while every packing waited for
+  the root's room (research/58 §5).
 - **Exclusivity, not discard.** A node with a structural task out takes no flush and plans no
   compaction until it applies, so no work is thrown away and no branch is shared; every other
   node proceeds.

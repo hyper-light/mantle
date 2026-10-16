@@ -762,6 +762,63 @@ impl Trie {
         self.rightmost(fallback?)
     }
 
+    /// The greatest key whose value is at most `v`, written to `out`, and its value, where the
+    /// values rise with the keys, as a branch's leaf separators' page numbers do. One descent:
+    /// at each node the last branch whose least value is at most `v` (a node's own key is the
+    /// least beneath it, so with no such branch it is that key or none).
+    pub fn floor_by_value(&self, v: u32, out: &mut Vec<u8>) -> Option<u32> {
+        out.clear();
+        out.extend_from_slice(&self.prefix);
+        let mut least = Vec::new();
+        let mut node = self.root();
+        // A level a step.
+        for _ in 0..=self.sparse.len().saturating_add(self.dense.nodes) {
+            let mut at = self.last_label(node);
+            let mut chosen = None;
+            // From the node's last label down: at most its 256.
+            for _ in 0..=256 {
+                let Some(f) = at else { break };
+                least.clear();
+                if self.leftmost(f, &mut least)? <= v {
+                    chosen = Some(f);
+                    break;
+                }
+                at = self.label_before(node, f);
+            }
+            let Some(f) = chosen else {
+                return if self.is_key(node) {
+                    self.value_of(node).filter(|&own| own <= v)
+                } else {
+                    None
+                };
+            };
+            match f {
+                Fallback::Dense(pos) => out.push(u8::try_from(pos % 256).ok()?),
+                Fallback::Sparse(l, p) => out.push(self.label(l, p)?),
+                Fallback::Node(_) => return None,
+            }
+            match self.step(f) {
+                Ok(child) => node = child,
+                Err(value) => return value,
+            }
+        }
+        None
+    }
+
+    /// Node `n`'s greatest label below the label at `f`.
+    fn label_before(&self, n: Node, f: Fallback) -> Option<Fallback> {
+        match (n, f) {
+            (Node::Dense(n), Fallback::Dense(pos)) => self.dense_below(n, pos).map(Fallback::Dense),
+            (Node::Sparse(l, n), Fallback::Sparse(_, p)) => {
+                let (start, _) = self.node_range(l, n);
+                p.checked_sub(1)
+                    .filter(|&q| q >= start)
+                    .map(|q| Fallback::Sparse(l, q))
+            }
+            _ => None,
+        }
+    }
+
     /// Node `n`'s greatest label.
     fn last_label(&self, n: Node) -> Option<Fallback> {
         match n {
@@ -1208,6 +1265,49 @@ mod tests {
                     );
                     let want = map.range(..=q.clone()).next_back().map(|(_, v)| *v);
                     assert_eq!(t.floor(q), want, "case {case} cut {cutoff} floor {q:?}");
+                }
+            }
+        }
+    }
+
+    /// The floor by value is the greatest key whose value is at most it, where the values rise
+    /// with the keys, with gaps between them as a branch's leaf pages have index pages: at every
+    /// cut between the dense and sparse parts, each value's floor is the ordered map's.
+    #[test]
+    fn floors_by_value_agree_with_an_ordered_map() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for case in 0..400 {
+            let n = (rng(&mut x) % 300) as usize;
+            let keys: std::collections::BTreeSet<Vec<u8>> = (0..n).map(|_| key(&mut x)).collect();
+            let mut next = 0u32;
+            let mut values = Vec::with_capacity(keys.len());
+            for _ in &keys {
+                next += 1 + u32::try_from(rng(&mut x) % 3).unwrap();
+                values.push(next);
+            }
+            let keys: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+            let queries: Vec<u32> = (0..64)
+                .map(|_| u32::try_from(rng(&mut x) % u64::from(next + 2)).unwrap())
+                .chain([0, next, next + 1])
+                .collect();
+            for cutoff in 0..=8 {
+                let t = Trie::builder(&keys, &values)
+                    .unwrap()
+                    .finish_at(cutoff)
+                    .unwrap();
+                let mut out = Vec::new();
+                for &v in &queries {
+                    let at = values.partition_point(|&w| w <= v);
+                    let want = at.checked_sub(1).map(|i| (keys[i], values[i]));
+                    let got = t.floor_by_value(v, &mut out);
+                    assert_eq!(
+                        got,
+                        want.map(|(_, w)| w),
+                        "case {case} cut {cutoff} value {v}"
+                    );
+                    if let Some((k, _)) = want {
+                        assert_eq!(out, k, "case {case} cut {cutoff} value {v}");
+                    }
                 }
             }
         }

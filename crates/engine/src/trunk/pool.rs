@@ -929,12 +929,16 @@ impl Pool {
         Ok(())
     }
 
-    /// The cores the OS reports less the shard's own thread, at least one.
+    /// The cores the OS reports, the shard's own included. Busy workers stay within the
+    /// measured need unless the shard waits on them (`Self::bound`), when its core is idle. Then
+    /// a worker takes the core, and while both run the OS shares it, as it shares one CPU's
+    /// only core between the shard and its worker.
+    ///
+    /// Less the shard's core, two CPUs had one seat. The shard's core sat idle through each
+    /// 0.8-2.7 s stall while the root's compaction waited behind a packing on that seat. One CPU,
+    /// its worker sharing the shard's core, kept worst fills at 15-90 ms (research/58 §6).
     pub fn cores() -> usize {
-        std::thread::available_parallelism()
-            .map_or(1, std::num::NonZero::get)
-            .saturating_sub(1)
-            .max(1)
+        std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
     }
 
     /// The admitted worker maximum, including workers that may start in a later period.

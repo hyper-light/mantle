@@ -19,8 +19,26 @@ pub fn common_prefix(a: &[u8], b: &[u8]) -> usize {
         }
         at = at.saturating_add(8);
     }
-    let (a, b) = (a.get(at..).unwrap_or(&[]), b.get(at..).unwrap_or(&[]));
-    at.saturating_add(a.iter().zip(b).take_while(|(x, y)| x == y).count())
+    // Fewer than eight bytes left in the shorter key. When it has eight in all, the word that
+    // ends it overlaps bytes already found equal, so its first difference is one past them.
+    let shorter = a.len().min(b.len());
+    let last = shorter.checked_sub(8).and_then(|from| {
+        let x = a.get(from..shorter)?.first_chunk::<8>()?;
+        let y = b.get(from..shorter)?.first_chunk::<8>()?;
+        let diff = u64::from_le_bytes(*x) ^ u64::from_le_bytes(*y);
+        Some(if diff == 0 {
+            shorter
+        } else {
+            from.saturating_add(usize::try_from(diff.trailing_zeros() / 8).unwrap_or(0))
+        })
+    });
+    match last {
+        Some(at) => at,
+        None => {
+            let (a, b) = (a.get(at..).unwrap_or(&[]), b.get(at..).unwrap_or(&[]));
+            at.saturating_add(a.iter().zip(b).take_while(|(x, y)| x == y).count())
+        }
+    }
 }
 
 /// Whether `a` orders below `b`: past their common prefix, a smaller byte, or `a` ending there

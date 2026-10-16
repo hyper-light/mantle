@@ -385,6 +385,72 @@ fn a_write_refused_for_room_stalls_the_replica_until_it_is_made_again() {
     assert_eq!(r.machine().now.entries.len(), 5);
 }
 
+/// A refused write's messages leave with the write made again only while the core's log still
+/// holds the entry it ended at when that write was laid out. A follower acknowledged a leader's
+/// entries in a write the log then refused, and took a later leader's append that cut those
+/// entries away before the refusal came: made again, the write held the cut log, and the
+/// acknowledgement left over it (I2; the shell's simulation, seed 3828 of its second shape:
+/// "member 1's MsgAppendResponse: Durability { member: 1, rule: I2, at: 46, held: 41 }").
+#[test]
+fn a_refused_writes_acknowledgement_of_entries_cut_since_never_leaves() {
+    let mut r: Sim = Replica::open(
+        &settings(1, 7),
+        SimStore::new(2),
+        Kv::new(voters(&[1, 2, 3]), false),
+        Unbounded,
+    )
+    .unwrap();
+    let append = |from: u64, term: u64, entries: Vec<Entry>| Message {
+        msg_type: MessageType::MsgAppend,
+        from,
+        to: 1,
+        term,
+        entries,
+        ..Message::default()
+    };
+    let entry = |index: u64, term: u64| Entry {
+        index,
+        term,
+        data: format!("{index}/{term}").into_bytes(),
+        ..Entry::default()
+    };
+    // Member 3 leads term 1: three entries, acknowledged in the write that holds them.
+    r.step(append(3, 1, vec![entry(1, 1), entry(2, 1), entry(3, 1)]))
+        .unwrap();
+    let mut out = Output::default();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert_eq!(r.in_flight(), 1);
+    assert!(
+        out.messages.is_empty(),
+        "an acknowledgement waits for its write"
+    );
+    // Member 2 leads term 2, and its first entry cuts term 1's away while that write is out.
+    r.step(append(2, 2, vec![entry(1, 2)])).unwrap();
+    // The write is refused for room: the replica stalls, and makes it again once let go.
+    r.log_mut().refuse = Some(Fault::Room("the group's retained bound"));
+    r.log_mut().make_durable();
+    out.clear();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert!(r.is_stalled());
+    r.resume();
+    let all = pump(&mut r);
+    assert!(!r.is_stalled());
+    let acknowledged: Vec<(u64, u64)> = all
+        .messages
+        .iter()
+        .chain(&out.messages)
+        .filter(|m| m.msg_type == MessageType::MsgAppendResponse && !m.reject)
+        .map(|m| (m.to, m.index))
+        .collect();
+    assert!(
+        acknowledged.iter().all(|&(to, _)| to != 3),
+        "member 3's entries, cut away, were acknowledged to it: {acknowledged:?}"
+    );
+    // What the log holds is member 2's, and member 2 hears so.
+    assert_eq!(r.log_mut().disk.entry(1).map(|e| e.term), Some(2));
+    assert!(acknowledged.contains(&(2, 1)), "{acknowledged:?}");
+}
+
 /// A write that held the fast track's proposals, refused for room, is made again with them once
 /// the log has room: the core keeps the proposals of every write issued until its notice
 /// (`RawNode::issued_proposals`). The replica was fenced here before, so a full log cost a fast

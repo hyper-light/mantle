@@ -175,6 +175,8 @@ pub struct Reached {
     pub overflowed: u64,
     /// The most messages in flight at once.
     pub most_in_flight: u64,
+    /// Reads a member answered: what the oracle of reads answered once a group settles judged.
+    pub reads: u64,
 }
 
 impl Reached {
@@ -195,6 +197,7 @@ impl Reached {
         self.lost += other.lost;
         self.overflowed += other.overflowed;
         self.most_in_flight = self.most_in_flight.max(other.most_in_flight);
+        self.reads += other.reads;
     }
 }
 
@@ -241,6 +244,10 @@ pub struct Cluster {
     settling: bool,
     /// The value an applied entry is judged by, refilled for each.
     scratch: Value,
+    /// The reads a member took and has not answered, by their context: the member and the term it
+    /// led when it took each. One whose member crashed or stopped leading that term is let go, as
+    /// an owner tells its askers to ask the new leader.
+    asked_reads: std::collections::BTreeMap<Vec<u8>, (u64, u64)>,
 }
 
 /// The most messages the network holds; past it the oldest is lost, as a network may lose any.
@@ -562,6 +569,7 @@ impl Cluster {
             last_event: None,
             settling: false,
             scratch: (0, 0, Vec::new()),
+            asked_reads: std::collections::BTreeMap::new(),
         }
     }
 
@@ -726,7 +734,12 @@ impl Cluster {
             Op::Read(id) => {
                 self.seq += 1;
                 let context = self.seq.to_le_bytes().to_vec();
-                self.with(id, |r| r.read(context))
+                let term = self.replica(id).map(|r| r.term());
+                let taken = self.with(id, |r| r.read(context.clone()));
+                if taken && let Some(term) = term {
+                    self.asked_reads.insert(context, (id, term));
+                }
+                taken
             }
             Op::Compact(id) => self.compact(id),
             Op::Crash(id) => self.crash(id),
@@ -1041,6 +1054,7 @@ impl Cluster {
     /// Loses power: the writes not durable, and what the state machine applied past its durable
     /// point.
     pub fn crash(&mut self, id: u64) -> bool {
+        self.asked_reads.retain(|_, (member, _)| *member != id);
         let node = self.node(id);
         let Some(mut replica) = node.replica.take() else {
             return false;
@@ -1184,6 +1198,14 @@ impl Cluster {
         self.check_output(id, &out, &configuration, led);
         self.check_applied(id, led.then_some(term));
         self.check_leadership(id);
+        for (context, _) in &out.reads {
+            let asked = self.asked_reads.remove(context);
+            assert!(
+                asked.is_some_and(|(member, _)| member == id),
+                "member {id} answered a read it was not asked: {context:?} (asked of {asked:?})"
+            );
+            self.reached.reads += 1;
+        }
         let did = after != events || !out.messages.is_empty() || !out.answers.is_empty();
         for m in out.messages.drain(..) {
             self.send(id, m);
@@ -1506,10 +1528,48 @@ impl Cluster {
             if let Some(data) = &proposed
                 && self.applied_by_all(leader, data)
             {
+                self.check_reads_answered();
                 return true;
             }
         }
         false
+    }
+
+    /// Every read a member took is answered by the time its group settles, unless the member
+    /// crashed or stopped leading the term it took the read in: a leader that keeps leading
+    /// confirms what it took, its group whole and its writes durable.
+    fn check_reads_answered(&mut self) {
+        let ids: Vec<u64> = self.nodes.iter().map(|n| n.id).collect();
+        let leading: Vec<(u64, u64)> = ids
+            .into_iter()
+            .filter_map(|id| {
+                let r = self.replica(id)?;
+                r.is_leader().then(|| (id, r.term()))
+            })
+            .collect();
+        let held: Vec<(Vec<u8>, u64, u64)> = self
+            .asked_reads
+            .iter()
+            .filter(|(_, (member, term))| leading.contains(&(*member, *term)))
+            .map(|(context, (member, term))| (context.clone(), *member, *term))
+            .collect();
+        for (_, member, _) in &held {
+            let r = self.replica(*member).expect("a leader is up");
+            let (confirmed, core) = (r.reads_held(), r.core().raft.reads_held());
+            eprintln!(
+                "member {member}: {confirmed} reads confirmed and waiting to apply, {core} held by \
+                 its core, applied {}, commit {}, last {}, term committed {}",
+                r.applied().index,
+                r.core().raft.log().committed(),
+                r.core().raft.log().last_index().unwrap_or(0),
+                r.core().raft.commit_to_current_term(),
+            );
+        }
+        assert!(
+            held.is_empty(),
+            "reads a leader took in its term and still leads, unanswered once the group settled: \
+             {held:?}"
+        );
     }
 
     /// A round with no faults: every member drives, makes its writes durable and drives again,

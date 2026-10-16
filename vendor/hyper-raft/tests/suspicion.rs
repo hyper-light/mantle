@@ -934,6 +934,39 @@ fn a_sole_voter_elects_itself_without_timing() {
     assert_eq!(node.view().role, 2);
 }
 
+/// A sole voter campaigns at once, and once a term: its vote counts once the hard state naming it
+/// is durable (`docs/durable.md` I9), and a wake before then finds it waiting for that write, with
+/// nothing armed. Campaigning at every wake, it moved its term past the write it waited for each
+/// time its owner woke it first, as an owner does after every call: hyper-durable-e2e's member
+/// alone reached term 1,232,434 before one write outran the calls between them.
+#[test]
+fn a_sole_voter_waits_for_its_own_vote_and_campaigns_once() {
+    let settings = Settings::focal().by_suspicion();
+    let mut node = New::open(1, Store::new(Sim::voters(&[1])), &settings, 1, 1);
+    node.wake(0);
+    let term = node.raw.raft.term();
+    assert_eq!(node.raw.raft.state(), hyper_raft::StateRole::Candidate);
+    let ready = node.raw.ready().unwrap();
+    let hard = *ready.hard_state().expect("its term and vote to write");
+    assert_eq!((hard.term, hard.vote), (term, 1));
+    node.raw.advance_issued(ready).unwrap();
+    for now in 1..=3 {
+        node.wake(now);
+        assert_eq!(
+            (node.raw.raft.term(), node.raw.raft.state()),
+            (term, hyper_raft::StateRole::Candidate),
+            "a wake at {now} with its vote out"
+        );
+        assert_eq!(node.raw.deadline(), None, "a campaign armed at {now}");
+    }
+    node.raw.store_mut().0.hard_state = hard;
+    node.raw.on_persist(1).unwrap();
+    assert_eq!(
+        (node.raw.raft.term(), node.raw.raft.state()),
+        (term, hyper_raft::StateRole::Leader)
+    );
+}
+
 /// A member that elects by suspicion takes no ticks, and one on ticks takes no word of its
 /// detectors: each is refused, and nothing changes.
 #[test]

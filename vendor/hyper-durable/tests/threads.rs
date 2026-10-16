@@ -61,11 +61,6 @@ fn threads_do_not_grow_with_the_groups() {
         .unwrap();
         r.campaign().unwrap();
         let h = owner.insert(r).map_err(|_| ()).unwrap();
-        owner
-            .get_mut(h)
-            .unwrap()
-            .propose(Vec::new(), b"x".to_vec())
-            .unwrap();
         owner.schedule(h);
         handles.push(h);
         if group == 0 || group == 63 {
@@ -74,10 +69,23 @@ fn threads_do_not_grow_with_the_groups() {
     }
     let mut out = Output::default();
     let mut applied = 0;
+    // A sole voter leads once its vote is durable (`docs/durable.md` I9): each proposes once it does.
+    let mut proposed = vec![false; handles.len()];
     for _ in 0..10_000 {
         owner.turn(now(), &mut out, |_, d, _| {
             d.unwrap();
         });
+        for (h, proposed) in handles.iter().zip(proposed.iter_mut()) {
+            if !*proposed && owner.get(*h).is_some_and(Replica::is_leader) {
+                owner
+                    .get_mut(*h)
+                    .unwrap()
+                    .propose(Vec::new(), b"x".to_vec())
+                    .unwrap();
+                owner.schedule(*h);
+                *proposed = true;
+            }
+        }
         applied = handles
             .iter()
             .filter(|&&h| {

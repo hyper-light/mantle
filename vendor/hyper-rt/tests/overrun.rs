@@ -104,14 +104,20 @@ fn a_wait_stepped_past_its_deadline_reports_the_lateness() {
         futures::sleep(SLEEP_NS).await.unwrap();
     })
     .unwrap();
-    // The task arms its timer; the shard then has nothing to do until it fires.
-    let mut outcome = rt.step();
-    while outcome.did_work {
-        outcome = rt.step();
-    }
-    let deadline = outcome
-        .next_deadline_ns
-        .expect("the sleep armed a timer the shard waits for");
+    // The step that polls the task arms its timer and names its deadline; the shard steps no further, so
+    // nothing fires the timer before the shard waits for it. Stepping on until the shard was idle let a host
+    // that held the test past the sleep between two steps fire it in the later step, which left no timer to
+    // wait for (macos-15-intel, CI run 38445610795; 10 ms held there fails that form every run).
+    let deadline = loop {
+        let outcome = rt.step();
+        if let Some(deadline) = outcome.next_deadline_ns {
+            break deadline;
+        }
+        assert!(
+            outcome.did_work,
+            "the sleep armed a timer the shard waits for"
+        );
+    };
     // Parked until the shard's clock reaches the deadline: a wait may return before it (Windows waits expire
     // on the timer tick, and the loop parks again on such a wake), so one park is not the premise.
     rt.park(Some(deadline));

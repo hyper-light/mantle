@@ -350,7 +350,8 @@ const DONE: u32 = 2;
 /// may take ([`span`]), and no round starts past it. Charged to the share, setup spent it: on windows-2025,
 /// with the machine tests' probes pinned to the same cores at once, a waiter took up to 149 ms to start
 /// where a share was 8 ms, 29 % of the rounds kept nothing, and once every round of three probes did,
-/// each refused (CI run 38021030068; the trace in diag run 38266052185).
+/// each refused (CI run 38021030068; the trace in diag run 38266052185). A wake begun within a share is
+/// waited for to its answer within the span, and kept however slow ([`wake_round`]).
 pub fn wake(budget: Duration, placement: &Placement) -> Result<WakeLatency, MachineError> {
     wake_with(budget, placement, &|| {})
 }
@@ -385,7 +386,7 @@ fn wake_with(
             .and_then(|round| pairs.get(round.checked_rem(pairs.len().max(1)).unwrap_or(0)))
             .copied();
         rounds = rounds.saturating_add(1);
-        let outcome = wake_round(pair, round_budget, &probe, setup, &mut rng);
+        let outcome = wake_round(pair, round_budget, &probe, setup, &|| {}, &mut rng);
         placement = weaker(placement, outcome.placement);
         same_cpu_samples = same_cpu_samples.saturating_add(outcome.same_cpu);
         asleep_confirmed &= outcome.asleep_confirmed;
@@ -612,8 +613,15 @@ struct Shared {
     waiter_pin: AtomicU32,
 }
 
-/// One round: a fresh waiter, pinned with the waker to `pair` when there is one, timed until its mean
-/// converges or `budget` ends.
+/// One round: a fresh waiter, pinned with the waker to `pair` when there is one, its wakes begun until
+/// their mean converges or its `share` ends. A wake begun within the share is waited for to its answer
+/// within the probe's span: one slower than the share is a wake all the same, and the slowest are the
+/// ones a loaded host makes. Abandoned at the share's end, as it was, every round of a probe whose first
+/// wake outran its share kept nothing, and the probe refused (windows-2025, CI runs 38376252976 and
+/// 38552220675: the record test's second 40 ms probe; in diag run 38756344126, 349 of 4,256 rounds of the
+/// machine tests, run at once, ended on a first answer 8 to 21 ms into an 8 ms share). `woken` runs in the
+/// waiter as each wake reaches it, before it reads the clock: nothing in production, and in tests a wake
+/// made slow as a busy core makes it.
 #[allow(
     clippy::disallowed_methods,
     reason = "the wake probe measures the host: a real thread parked and woken on the host clock (docs/runtime.md §10.2)"
@@ -623,6 +631,7 @@ fn wake_round(
     share: Duration,
     probe: &Probe,
     setup: &(dyn Fn() + Sync),
+    woken: &(dyn Fn() + Sync),
     rng: &mut Xorshift,
 ) -> Round {
     let waker_pin = pair.map_or(Pinning::Scheduled, |(waker, _)| pin_current_thread(waker));
@@ -646,7 +655,7 @@ fn wake_round(
         window: None,
     };
     std::thread::scope(|scope| {
-        let waiter = scope.spawn(|| waiter_loop(&shared, pair, epoch, &waker, setup));
+        let waiter = scope.spawn(|| waiter_loop(&shared, pair, epoch, &waker, setup, woken));
         let Some(id) = await_waiter(&shared, probe.started, probe.span) else {
             shared.stop.store(true, Ordering::Release);
             waiter.thread().unpark();
@@ -669,8 +678,7 @@ fn wake_round(
                 break;
             };
             round.asleep_confirmed &= confirmed;
-            let Some((latency, one_cpu)) =
-                time_one_wake(&shared, waiter.thread(), started, budget, epoch)
+            let Some((latency, one_cpu)) = time_one_wake(&shared, waiter.thread(), probe, epoch)
             else {
                 break;
             };
@@ -696,13 +704,15 @@ fn wake_round(
 }
 
 /// The waiter: pins itself, publishes its id, then wakes on each [`GO`], stamps the latency and hands
-/// the turn back, parking in between; leaves on `stop`.
+/// the turn back, parking in between; leaves on `stop`. `woken` runs as each wake reaches it, before the
+/// clock is read ([`wake_round`]).
 fn waiter_loop(
     shared: &Shared,
     pair: Option<(u32, u32)>,
     epoch: Instant,
     waker: &std::thread::Thread,
     setup: &(dyn Fn() + Sync),
+    woken: &(dyn Fn() + Sync),
 ) {
     let pin = pair.map_or(Pinning::Scheduled, |(_, waiter)| pin_current_thread(waiter));
     setup();
@@ -721,6 +731,7 @@ fn waiter_loop(
             std::thread::park();
             shared.parking.store(false, Ordering::Release);
         }
+        woken();
         let woke = nanos(epoch.elapsed());
         shared.waiter_cpu.store(
             platform::current_cpu().unwrap_or(UNKNOWN_CPU),
@@ -767,13 +778,12 @@ fn await_asleep(shared: &Shared, id: u64, started: Instant, budget: Duration) ->
 }
 
 /// Wakes the sleeping waiter and waits for its answer: the latency it measured and whether it woke on
-/// the waker's CPU. `None` when the answer does not come within the round's budget (the waker's wait is
+/// the waker's CPU. `None` when the answer does not come within the probe's span (the waker's wait is
 /// bounded, never an open park).
 fn time_one_wake(
     shared: &Shared,
     waiter: &std::thread::Thread,
-    started: Instant,
-    budget: Duration,
+    probe: &Probe,
     epoch: Instant,
 ) -> Option<(u64, bool)> {
     let waker_cpu = platform::current_cpu();
@@ -783,7 +793,7 @@ fn time_one_wake(
     shared.turn.store(GO, Ordering::Release);
     waiter.unpark();
     while shared.turn.load(Ordering::Acquire) != DONE {
-        let remaining = budget.saturating_sub(started.elapsed());
+        let remaining = probe.left();
         if remaining.is_zero() {
             return None;
         }
@@ -1304,7 +1314,7 @@ mod tests {
         let probe = Probe::starting(share);
         let setup = || std::thread::sleep(start);
         let mut rng = Xorshift::new(Xorshift::SEED);
-        let round = wake_round(None, share, &probe, &setup, &mut rng);
+        let round = wake_round(None, share, &probe, &setup, &|| {}, &mut rng);
         match round.setup_left {
             Some(left) => {
                 assert!(
@@ -1323,6 +1333,38 @@ mod tests {
                     "a waiter given up before the span ended"
                 );
                 assert_eq!(round.window, None);
+                assert!(round.samples.is_empty());
+            }
+        }
+    }
+
+    /// A wake slower than its round's share is a wake, kept (windows-2025, CI runs 38376252976 and
+    /// 38552220675: every round of the record test's second probe ended on a first answer past its share, and
+    /// the probe refused). Do: a round whose waiter answers its first wake three shares late, as a busy core
+    /// makes it. Expect: the round keeps that wake, three shares or more, where a round that gave up its wake
+    /// at the share's end kept nothing.
+    #[test]
+    fn a_wake_slower_than_its_rounds_share_is_kept() {
+        let share = Duration::from_millis(5);
+        let late = share.saturating_mul(3);
+        let probe = Probe::starting(share);
+        let first = AtomicBool::new(true);
+        let woken = || {
+            if first.swap(false, Ordering::AcqRel) {
+                std::thread::sleep(late);
+            }
+        };
+        let mut rng = Xorshift::new(Xorshift::SEED);
+        let round = wake_round(None, share, &probe, &|| {}, &woken, &mut rng);
+        match round.setup_left {
+            Some(_) => assert!(
+                round.samples.first().is_some_and(|ns| *ns >= nanos(late)),
+                "the late wake was kept: {:?}",
+                round.samples
+            ),
+            // Only a host that held the waiter past the whole span leaves a round without one.
+            None => {
+                assert_eq!(probe.left(), Duration::ZERO);
                 assert!(round.samples.is_empty());
             }
         }

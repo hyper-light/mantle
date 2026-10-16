@@ -126,6 +126,8 @@ fn random_schedules_keep_every_invariant_and_settle() {
             "{name}: {reached:?}"
         );
         assert!(reached.refused > 0, "{name}: {reached:?}");
+        // Reads were answered: the oracle of reads answered once a group settles judged some.
+        assert!(reached.reads > 0, "{name}: {reached:?}");
         assert!(
             reached.behind_fence > 0 && reached.acted > 0,
             "{name}: {reached:?}"

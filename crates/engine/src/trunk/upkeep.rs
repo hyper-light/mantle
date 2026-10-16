@@ -55,12 +55,17 @@ enum What {
     },
     /// The leaf's whole compaction, its in-flight bundles from `start` to `covered` among its
     /// inputs; `extents` its bundle's branches hold, released once it replaces them (the
-    /// in-flight bundles' go as the leaf reads past them), and what asked for it.
+    /// in-flight bundles' go as the leaf reads past them), and what asked for it. A settle that
+    /// splits the leaf may run as `jobs` jobs over consecutive key ranges, this one the `job`th
+    /// ([`settle_cuts`]); the first carries the extents, and the settle applies once every one is
+    /// done.
     Settle {
         extents: Vec<u64>,
         cause: Cause,
         start: usize,
         covered: usize,
+        job: usize,
+        jobs: usize,
     },
 }
 
@@ -902,22 +907,46 @@ impl Trunk {
         let count = settle.count;
         let parts = self.leaf_parts(count);
         let per = crate::util::div_ceil(count, parts).unwrap_or(count).max(1);
-        let run = if self.pool.is_some() {
-            let pages = read_pages(inputs.clone(), &from, end.as_deref());
-            Running::Remote {
-                grant: Vec::new(),
-                state: State::Ready(Box::new(Task {
-                    inputs: inputs.map(Branch::for_merge).collect(),
-                    from,
-                    end,
-                    drop_tombstones: true,
-                    per,
-                    pages,
-                })),
+        // On workers, a settle that splits merges its parts in parallel, a job a part over the
+        // key ranges its cuts bound, each job's range one leaf: a split held its parent's pivot
+        // for the whole merge on one worker, 2.9-4.4 s beside 18 busy loops at 100M while every
+        // packing waited for the root's room (research/58 §4).
+        let cuts = if self.pool.is_some() && parts > 1 {
+            settle_cuts(inputs.clone(), parts, &from, end.as_deref())?
+        } else {
+            Vec::new()
+        };
+        let jobs = cuts.len().saturating_add(1);
+        let mut runs = Vec::with_capacity(jobs);
+        if self.pool.is_some() {
+            let per = if jobs > 1 { u64::MAX } else { per };
+            let mut lo = from;
+            for j in 0..jobs {
+                let hi = cuts.get(j).cloned().or_else(|| end.clone());
+                let pages = read_pages(inputs.clone(), &lo, hi.as_deref());
+                let next = hi.clone();
+                runs.push(Running::Remote {
+                    grant: Vec::new(),
+                    state: State::Ready(Box::new(Task {
+                        inputs: inputs.clone().map(Branch::for_merge).collect(),
+                        from: lo,
+                        end: hi,
+                        drop_tombstones: true,
+                        per,
+                        pages,
+                    })),
+                });
+                let Some(next) = next else { break };
+                lo = next;
             }
         } else {
-            Running::Inline(Box::new(Compaction::prepare(inputs, from, end, true, per)))
-        };
+            runs.push(Running::Inline(Box::new(Compaction::prepare(
+                inputs, from, end, true, per,
+            ))));
+        }
+        if runs.len() != jobs {
+            return Err(corrupt());
+        }
         if settle.was_paid {
             self.spend(n, 0)?;
         }
@@ -931,17 +960,31 @@ impl Trunk {
         } else {
             Cause::Size
         };
-        self.tasks.push(NodeTask {
-            node: n,
-            what: What::Settle {
-                extents,
-                cause,
-                start,
-                covered,
-            },
-            run,
-            units: count,
-        });
+        // The settle's units spread over its jobs, so the debt is the same planned whole.
+        let share = count
+            .checked_div(u64::try_from(jobs).unwrap_or(u64::MAX))
+            .unwrap_or(count);
+        let mut extents = Some(extents);
+        for (job, run) in runs.into_iter().enumerate() {
+            let units = if job.saturating_add(1) == jobs {
+                count.saturating_sub(share.saturating_mul(u64::try_from(job).unwrap_or(0)))
+            } else {
+                share
+            };
+            self.tasks.push(NodeTask {
+                node: n,
+                what: What::Settle {
+                    extents: extents.take().unwrap_or_default(),
+                    cause,
+                    start,
+                    covered,
+                    job,
+                    jobs,
+                },
+                run,
+                units,
+            });
+        }
         if let Some(c) = self.node_mut(n)?.wants.as_mut() {
             c.started = true;
         }
@@ -1094,23 +1137,77 @@ impl Trunk {
                 at = at.saturating_add(1);
                 continue;
             }
+            // A settle run as several jobs applies once every one is done, all together.
+            if let What::Settle { jobs, .. } = task.what
+                && jobs > 1
+            {
+                let n = task.node;
+                let settles = |t: &NodeTask| t.node == n && matches!(t.what, What::Settle { .. });
+                let done = self
+                    .tasks
+                    .iter()
+                    .filter(|t| settles(t) && t.run.done())
+                    .count();
+                if done < jobs {
+                    at = at.saturating_add(1);
+                    continue;
+                }
+                let (mut group, rest): (Vec<NodeTask>, Vec<NodeTask>) =
+                    std::mem::take(&mut self.tasks)
+                        .into_iter()
+                        .partition(|t| settles(t));
+                self.tasks = rest;
+                group.sort_by_key(|t| match t.what {
+                    What::Settle { job, .. } => job,
+                    What::Compact { .. } => usize::MAX,
+                });
+                self.apply_settle_jobs(store, group)?;
+                at = 0;
+                continue;
+            }
             let task = self.tasks.remove(at);
             self.apply_task(store, task)?;
         }
         Ok(())
     }
 
-    fn apply_task<F: BlockFile>(
+    /// A settle's jobs, in key order, applied as its one change: their parts together.
+    fn apply_settle_jobs<F: BlockFile>(
         &mut self,
         store: &mut Store<F>,
-        task: NodeTask,
+        group: Vec<NodeTask>,
     ) -> Result<(), Error> {
-        let t = self.timed.then(std::time::Instant::now);
-        let NodeTask {
-            node: n, what, run, ..
-        } = task;
-        let parts = match run {
-            Running::Finished(parts) => parts,
+        let mut parts = Vec::new();
+        let mut first = None;
+        for task in group {
+            let NodeTask {
+                node, what, run, ..
+            } = task;
+            parts.extend(self.task_parts(store, run)?);
+            if first.is_none() {
+                first = Some((node, what));
+            }
+        }
+        let (n, what) = first.ok_or(corrupt())?;
+        if let What::Settle { jobs, .. } = what {
+            self.stats.parallel_settles = self.stats.parallel_settles.saturating_add(1);
+            self.stats.parallel_settle_jobs = self
+                .stats
+                .parallel_settle_jobs
+                .saturating_add(u64::try_from(jobs).unwrap_or(u64::MAX));
+        }
+        self.apply_what(store, n, what, parts)
+    }
+
+    /// A finished task's parts: kept inline, or a worker's, the pages it wrote adopted, the
+    /// grant it left given back.
+    fn task_parts<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        run: Running,
+    ) -> Result<Vec<(Vec<u8>, Branch)>, Error> {
+        match run {
+            Running::Finished(parts) => Ok(parts),
             Running::Remote {
                 state: State::Done(mut out),
                 ..
@@ -1124,10 +1221,33 @@ impl Trunk {
                 // The worker timed its merge: a compacted key's cost, which consolidations are
                 // priced at, measured wherever compactions run.
                 self.note_merge(out.ns, out.units);
-                out.parts
+                Ok(out.parts)
             }
-            _ => return Err(corrupt()),
-        };
+            _ => Err(corrupt()),
+        }
+    }
+
+    fn apply_task<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        task: NodeTask,
+    ) -> Result<(), Error> {
+        let NodeTask {
+            node: n, what, run, ..
+        } = task;
+        let parts = self.task_parts(store, run)?;
+        self.apply_what(store, n, what, parts)
+    }
+
+    /// Node `n`'s task applied with the parts it made.
+    fn apply_what<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        n: usize,
+        what: What,
+        parts: Vec<(Vec<u8>, Branch)>,
+    ) -> Result<(), Error> {
+        let t = self.timed.then(std::time::Instant::now);
         match what {
             What::Compact {
                 key,
@@ -1154,6 +1274,7 @@ impl Trunk {
                 cause,
                 start,
                 covered,
+                ..
             } => {
                 let took = self
                     .node(n)?
@@ -1543,6 +1664,60 @@ fn entries(branches: &[Branch]) -> u64 {
 
 /// The pages a merge of `[from, end)` writes from `inputs` at most: each one's
 /// [`Branch::pages_between`], summed.
+/// Where a settle into `parts` leaves cuts its merge, a job a part: at the separators of its
+/// largest input's leaf pages where each `1/parts` of that input's entries begins, rising and
+/// strictly between `from` and `end`. Its leaf index maps each separator to its page, and its
+/// pages' entry counts are in memory, so the cuts read nothing. A cut bounds one job's range
+/// exactly; the other inputs spread over the ranges as their keys fall, so the leaves come out
+/// as even as the largest input's keys stand for theirs. None where that input has too few leaf
+/// pages to cut every part at: the settle is then one job, its parts cut by entries as it merges.
+fn settle_cuts<'a>(
+    mut inputs: impl Iterator<Item = &'a Branch>,
+    parts: u64,
+    from: &[u8],
+    end: Option<&[u8]>,
+) -> Result<Vec<Vec<u8>>, Error> {
+    let Some(largest) = inputs.by_ref().max_by_key(|b| b.count) else {
+        return Ok(Vec::new());
+    };
+    let total = largest
+        .counts
+        .iter()
+        .map(|&c| u64::from(c))
+        .fold(0u64, u64::saturating_add);
+    let wanted = usize::try_from(parts.saturating_sub(1)).unwrap_or(usize::MAX);
+    let mut cuts: Vec<Vec<u8>> = Vec::with_capacity(wanted);
+    let mut below = 0u64;
+    let mut key = Vec::new();
+    for (page, &c) in largest.counts.iter().enumerate() {
+        // An index page holds no entries.
+        if c == 0 {
+            continue;
+        }
+        let next = u64::try_from(cuts.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        // The next cut's share of the input's entries lies before this page: cut where it
+        // begins, at its separator.
+        if cuts.len() < wanted && below.saturating_mul(parts) >= total.saturating_mul(next) {
+            let p = u32::try_from(page).map_err(|_| corrupt())?;
+            if largest.index.floor_by_value(p, &mut key) == Some(p)
+                && key.as_slice() > from
+                && end.is_none_or(|e| key.as_slice() < e)
+                && cuts.last().is_none_or(|last| key > *last)
+            {
+                cuts.push(key.clone());
+            }
+        }
+        below = below.saturating_add(u64::from(c));
+    }
+    Ok(if cuts.len() == wanted {
+        cuts
+    } else {
+        Vec::new()
+    })
+}
+
 fn read_pages<'a>(
     inputs: impl Iterator<Item = &'a Branch>,
     from: &[u8],
@@ -1552,3 +1727,7 @@ fn read_pages<'a>(
         .map(|b| b.pages_between(from, end))
         .fold(0usize, usize::saturating_add)
 }
+
+#[cfg(test)]
+#[path = "settle_jobs.rs"]
+mod settle_jobs;

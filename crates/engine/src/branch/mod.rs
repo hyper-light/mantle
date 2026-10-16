@@ -143,15 +143,19 @@ fn u16_of(n: usize) -> Result<[u8; 2], Error> {
         .map_err(|_| corrupt(Malformed::TooLarge))
 }
 
-/// One page being filled: its entries' keys and their encoded rest, until it is full.
+/// One page being filled: its entries, each its key and then its encoded rest, back to back in
+/// one buffer, until it is full.
 #[derive(Debug, Default)]
 pub(crate) struct Page {
-    /// Keys, back to back, and where each ends.
-    keys: Vec<u8>,
-    key_ends: Vec<usize>,
-    /// Each entry's bytes after its suffix length (operation and value, or child and count).
-    rests: Vec<u8>,
-    rest_ends: Vec<usize>,
+    /// Each entry's key, then its bytes after its suffix length (operation and value, or child
+    /// and count).
+    bytes: Vec<u8>,
+    /// Where each entry's key and its rest end in `bytes`. A page stages whole keys, each at
+    /// most half a page ([`Builder::fits`]), so its bytes stay far within what 32 bits reach.
+    ends: Vec<[u32; 2]>,
+    /// The keys' bytes and the rests' bytes staged, each summed: what the page's size counts.
+    key_bytes: usize,
+    rest_bytes: usize,
     prefix: usize,
     /// Leaf entries' total under the page (1 each), or an index page's children's totals.
     total: u64,
@@ -159,72 +163,96 @@ pub(crate) struct Page {
 
 impl Page {
     /// A page with room reserved for the most a page of `capacity` payload bytes can hold, so
-    /// filling it never grows a buffer: keys and rests within the payload, and an entry for each
-    /// offset and suffix length the payload has room for.
+    /// filling it never grows a buffer: its keys whole and its rests within twice the payload,
+    /// and an entry's ends for each offset and suffix length the payload has room for.
     fn with_capacity(capacity: usize) -> Self {
         let entries = capacity.checked_div(SLOT.saturating_add(2)).unwrap_or(0);
         Self {
-            keys: Vec::with_capacity(capacity),
-            key_ends: Vec::with_capacity(entries),
-            rests: Vec::with_capacity(capacity),
-            rest_ends: Vec::with_capacity(entries),
+            bytes: Vec::with_capacity(capacity.saturating_mul(2)),
+            ends: Vec::with_capacity(entries),
+            key_bytes: 0,
+            rest_bytes: 0,
             prefix: 0,
             total: 0,
         }
     }
 
     fn len(&self) -> usize {
-        self.key_ends.len()
+        self.ends.len()
     }
 
     fn key(&self, i: usize) -> &[u8] {
         let start = i
             .checked_sub(1)
-            .and_then(|j| self.key_ends.get(j))
-            .copied()
+            .and_then(|j| self.ends.get(j))
+            .and_then(|&[_, rest]| usize::try_from(rest).ok())
             .unwrap_or(0);
-        let end = self.key_ends.get(i).copied().unwrap_or(start);
-        self.keys.get(start..end).unwrap_or(&[])
+        let end = self
+            .ends
+            .get(i)
+            .and_then(|&[key, _]| usize::try_from(key).ok())
+            .unwrap_or(start);
+        self.bytes.get(start..end).unwrap_or(&[])
     }
 
     fn rest(&self, i: usize) -> &[u8] {
-        let start = i
-            .checked_sub(1)
-            .and_then(|j| self.rest_ends.get(j))
-            .copied()
-            .unwrap_or(0);
-        let end = self.rest_ends.get(i).copied().unwrap_or(start);
-        self.rests.get(start..end).unwrap_or(&[])
+        match self.ends.get(i) {
+            Some(&[key, rest]) => match (usize::try_from(key), usize::try_from(rest)) {
+                (Ok(key), Ok(rest)) => self.bytes.get(key..rest).unwrap_or(&[]),
+                _ => &[],
+            },
+            None => &[],
+        }
     }
 
     /// The payload the page's entries take with `prefix` and one more entry of `key` and
     /// `rest` bytes after its suffix.
     fn size_with(&self, prefix: usize, key: usize, rest: usize) -> Option<usize> {
         let n = self.len().checked_add(1)?;
-        let keys = self.keys.len().checked_add(key)?;
+        let keys = self.key_bytes.checked_add(key)?;
         let suffixes = keys.checked_sub(n.checked_mul(prefix)?)?;
         HEAD.checked_add(prefix)?
             .checked_add(n.checked_mul(SLOT.checked_add(2)?)?)?
             .checked_add(suffixes)?
-            .checked_add(self.rests.len())?
+            .checked_add(self.rest_bytes)?
             .checked_add(rest)
     }
 
-    fn push(&mut self, key: &[u8], head: &[u8], tail: &[u8], under: u64, prefix: usize) {
+    /// Stages an entry: its ends are counted before a byte is, so a refusal stages nothing.
+    fn push(
+        &mut self,
+        key: &[u8],
+        head: &[u8],
+        tail: &[u8],
+        under: u64,
+        prefix: usize,
+    ) -> Result<(), Error> {
+        let key_end = self.bytes.len().checked_add(key.len());
+        let rest = head.len().checked_add(tail.len());
+        let rest_end = key_end.zip(rest).and_then(|(k, r)| k.checked_add(r));
+        let (Some(key_end), Some(rest_end), Some(rest)) = (
+            key_end.and_then(|e| u32::try_from(e).ok()),
+            rest_end.and_then(|e| u32::try_from(e).ok()),
+            rest,
+        ) else {
+            return Err(corrupt(Malformed::TooLarge));
+        };
+        self.bytes.extend_from_slice(key);
+        self.bytes.extend_from_slice(head);
+        self.bytes.extend_from_slice(tail);
+        self.ends.push([key_end, rest_end]);
+        self.key_bytes = self.key_bytes.saturating_add(key.len());
+        self.rest_bytes = self.rest_bytes.saturating_add(rest);
         self.prefix = prefix;
-        self.keys.extend_from_slice(key);
-        self.key_ends.push(self.keys.len());
-        self.rests.extend_from_slice(head);
-        self.rests.extend_from_slice(tail);
-        self.rest_ends.push(self.rests.len());
         self.total = self.total.saturating_add(under);
+        Ok(())
     }
 
     pub(crate) fn clear(&mut self) {
-        self.keys.clear();
-        self.key_ends.clear();
-        self.rests.clear();
-        self.rest_ends.clear();
+        self.bytes.clear();
+        self.ends.clear();
+        self.key_bytes = 0;
+        self.rest_bytes = 0;
         self.prefix = 0;
         self.total = 0;
     }
@@ -561,7 +589,7 @@ impl Builder {
             self.levels
                 .get_mut(level)
                 .ok_or(corrupt(Malformed::TooLarge))?
-                .push(key, head, tail, under, prefix);
+                .push(key, head, tail, under, prefix)?;
             // A separator pushed here came from the level below, whose first-key buffer it is.
             if let Some(s) = up.take() {
                 self.give_first(level.saturating_sub(1), s.first);

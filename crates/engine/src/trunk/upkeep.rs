@@ -875,25 +875,18 @@ impl Trunk {
         self.config.leaf_entries.saturating_mul(fanout)
     }
 
-    /// The entries leaf `n` holds before it splits: [`Self::leaf_limit`], or one memtable's
-    /// (`leaf_entries`) while the root is a leaf. The root's settle is the one every packing
-    /// waits on: until it applies they wait as pending branches. At fanout memtables' the root
-    /// stayed a leaf for eight packings, then merged 4.1M entries at 10M while the root's room
-    /// ran out, 3.3 s beside 18 busy loops (research/58 §4). At one memtable's it is an index
-    /// node within the first packings, and each packing after takes the root split
-    /// (research/57 §7).
-    fn settle_limit(&self, n: usize) -> u64 {
-        if n == self.root {
-            self.config.leaf_entries
-        } else {
-            self.leaf_limit()
-        }
+    /// The entries leaf `n` holds before it splits: [`Self::leaf_limit`], the root's as every
+    /// leaf's. The root's first settle merges fanout memtables into fanout leaves, so the root's
+    /// first pivots are fanout, which the root split's placement of packings needs on few workers
+    /// (research/58 §5: a two-pivot root lost it on two CPUs); its merge runs as one job a leaf
+    /// on workers ([`settle_cuts`]), which is what shortens the wait the packings see.
+    fn settle_limit(&self, _n: usize) -> u64 {
+        self.leaf_limit()
     }
 
     /// The leaves a settle of `count` entries in leaf `n` makes: one within
     /// [`Self::settle_limit`], else `round(count / leaf_entries)` (SplinterDB's
-    /// `leaf_split_target_num_leaves`), and at least two for the root, which a settle past its
-    /// limit makes an index node.
+    /// `leaf_split_target_num_leaves`).
     fn leaf_parts(&self, n: usize, count: u64) -> u64 {
         if count <= self.settle_limit(n) {
             return 1;
@@ -904,7 +897,7 @@ impl Trunk {
             .checked_div(target)
             .unwrap_or(1)
             .max(1);
-        if n == self.root { parts.max(2) } else { parts }
+        parts
     }
 
     /// Plans leaf `n`'s whole compaction, tombstones dropped, into `ceil(entries /

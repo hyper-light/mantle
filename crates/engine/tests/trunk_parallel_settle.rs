@@ -16,6 +16,8 @@
     clippy::cast_possible_truncation
 )]
 
+use hyper_block::DiskError;
+use hyper_block::block::{BlockFile, Durable};
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use mantle_engine::Error;
@@ -25,7 +27,8 @@ use mantle_engine::store::{Config, Store};
 use mantle_engine::trunk::pool::{self, Pool, Spawn};
 use mantle_engine::trunk::{Trunk, TrunkConfig};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const CONFIG: Config = Config {
     page_size: 4096,
@@ -176,4 +179,155 @@ fn a_split_merges_as_a_job_a_part_on_the_workers_and_every_key_reads_its_newest_
         t.splits > 0 && t.parallel_settles > 0 && t.parallel_settle_jobs >= 2 * t.parallel_settles,
         "{t:?}"
     );
+}
+
+/// A worker's file whose writes are refused while `refuse` is set, as a device refusing one
+/// seat's writes; everything else as its file does.
+struct Refusing {
+    file: DeviceFile,
+    refuse: Option<&'static AtomicBool>,
+}
+
+impl Refusing {
+    fn check(&self) -> Result<(), DiskError> {
+        if self.refuse.is_some_and(|r| r.load(Ordering::Acquire)) {
+            return Err(DiskError::Io {
+                op: "write a page the test refuses",
+                path: PathBuf::new(),
+                source: std::io::Error::other("refused by the test"),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl BlockFile for Refusing {
+    fn alignment(&self) -> Alignment {
+        self.file.alignment()
+    }
+    fn layout_block(&self) -> Alignment {
+        self.file.layout_block()
+    }
+    fn len(&self) -> Result<u64, DiskError> {
+        self.file.len()
+    }
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), DiskError> {
+        self.file.read_exact_at(buf, offset)
+    }
+    fn read_resident_at(&mut self, buf: &mut [u8], offset: u64) -> Result<bool, DiskError> {
+        self.file.read_resident_at(buf, offset)
+    }
+    fn reads_resident(&self) -> bool {
+        self.file.reads_resident()
+    }
+    fn residency(&self) -> hyper_block::Residency {
+        self.file.residency()
+    }
+    fn set_residency_shadow(&mut self, on: bool) {
+        self.file.set_residency_shadow(on);
+    }
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError> {
+        self.check()?;
+        self.file.write_all_at(buf, offset)
+    }
+    fn sync_data(&self) -> Result<(), DiskError> {
+        self.file.sync_data()
+    }
+    fn write_durable_at(&self, buf: &[u8], offset: u64) -> Result<Durable, DiskError> {
+        self.check()?;
+        self.file.write_durable_at(buf, offset)
+    }
+    fn fills_new_space(&self) -> bool {
+        self.file.fills_new_space()
+    }
+    fn try_clone(&self) -> Result<Self, DiskError> {
+        Ok(Self {
+            file: self.file.try_clone()?,
+            refuse: self.refuse,
+        })
+    }
+}
+
+/// Do: a trunk on two workers, the second seat's writes refused; one batch past what the root
+/// leaf holds, so the root settles into several leaves as several jobs, the first two out at
+/// once, one on each seat; idle steps until one returns the refusal. Expect: nothing of the
+/// settle applied, though the first seat's job came back whole: the root still the one leaf, no
+/// settle counted, every key reading what was written, and the store holding exactly the
+/// extents the trunk names. Then the writes allowed again and the maintenance run to its end:
+/// the settle is planned again and applies once, a leaf a job, every key reading what was
+/// written, the store's extents the trunk's.
+#[test]
+fn a_split_settle_with_a_failed_job_applies_nothing_and_settles_again() {
+    const ENTRIES: u64 = 256;
+    let refuse: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(true)));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let mut store = Store::create(open(&path, true), CONFIG).unwrap();
+    let mut trunk = Trunk::new(TRUNK).unwrap();
+    let worker_path = path.clone();
+    let spawn: Spawn = Box::new(move |seat| {
+        let file = Refusing {
+            file: open(&worker_path, false),
+            refuse: if seat.id == 1 { Some(refuse) } else { None },
+        };
+        std::thread::Builder::new()
+            .name(format!("settle-worker-{}", seat.id))
+            .spawn(move || pool::serve(file, CONFIG, seat))
+            .map_err(|error| Error::Io {
+                op: "start a settle worker",
+                detail: error.to_string(),
+            })
+    });
+    trunk.set_pool(Pool::new(spawn, 2).unwrap());
+    let oracle: BTreeMap<Vec<u8>, (Op, Vec<u8>)> = (0..ENTRIES)
+        .map(|k| (key(k), (Op::Put, vec![(k % 251) as u8; VALUE])))
+        .collect();
+    let mut b = Builder::new(&mut store, Keys::Exactly(ENTRIES)).unwrap();
+    for (k, (op, v)) in &oracle {
+        b.add(&mut store, k, *op, v).unwrap();
+    }
+    trunk.add(b.finish(&mut store).unwrap());
+    let mut failure = None;
+    for _ in 0..STEPS {
+        if let Err(error) = trunk.idle_step(&mut store, STEP) {
+            failure = Some(error);
+            break;
+        }
+        assert!(
+            !trunk.is_idle(),
+            "the settle applied with a seat's writes refused"
+        );
+    }
+    assert!(
+        matches!(failure, Some(Error::Io { .. })),
+        "a refused write's job reported: {failure:?}"
+    );
+    let t = trunk.stats();
+    let levels = trunk.levels();
+    assert!(
+        t.parallel_settles == 0 && levels.len() == 1 && levels[0].leaf && levels[0].nodes == 1,
+        "nothing of the settle applied: {levels:?}; {t:?}"
+    );
+    check_reads(&mut store, &mut trunk, &oracle);
+    check_refs(&store, &trunk);
+    refuse.store(false, Ordering::Release);
+    let mut steps = 0;
+    while !trunk.is_idle() {
+        trunk.idle_step(&mut store, STEP).unwrap();
+        steps += 1;
+        assert!(steps < STEPS, "maintenance not done within {STEPS} steps");
+    }
+    let t = trunk.stats();
+    let leaves: u64 = trunk
+        .levels()
+        .iter()
+        .filter(|l| l.leaf)
+        .map(|l| l.nodes)
+        .sum();
+    assert!(
+        t.parallel_settles == 1 && t.parallel_settle_jobs == leaves && leaves > 1,
+        "the settle applied once, a leaf a job: {leaves} leaves; {t:?}"
+    );
+    check_reads(&mut store, &mut trunk, &oracle);
+    check_refs(&store, &trunk);
 }

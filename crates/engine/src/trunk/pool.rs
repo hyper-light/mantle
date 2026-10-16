@@ -969,13 +969,18 @@ impl Pool {
         if let Some(since) = self.since {
             let wall = ns(now.saturating_duration_since(since));
             let period = wall.saturating_sub(self.waited_ns);
+            // The measured need never takes the shard's own core: that is a worker's only while
+            // the shard waits on the workers (`Self::bound`). Run beside the shard's puts, a
+            // second worker on two CPUs kept every pivot of the root busy, so packings went in
+            // flight and were compacted: 1.27-1.35x the writes (research/58 §6).
+            let beside = self.most.saturating_sub(1).max(1);
             self.want = if period == 0 {
                 self.most
             } else {
                 usize::try_from(crate::util::div_ceil(self.busy_ns, period).unwrap_or(0))
                     .unwrap_or(usize::MAX)
                     .max(1)
-                    .min(self.most)
+                    .min(beside)
             };
         }
         self.since = Some(now);

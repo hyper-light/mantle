@@ -1042,13 +1042,10 @@ impl HashMem {
             self.first.extend_from_slice(key);
             self.skip = key.len();
         } else {
-            let shared = self
-                .first
-                .iter()
-                .zip(key)
-                .take(self.skip)
-                .take_while(|(a, b)| a == b)
-                .count();
+            let shared = crate::util::keys::common_prefix(
+                self.first.get(..self.skip).unwrap_or(&self.first),
+                key,
+            );
             if shared < self.skip {
                 // The tail's prefixes so far start too far in for the keys to come: its sort
                 // takes them again.

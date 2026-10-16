@@ -559,6 +559,19 @@ impl Fixture {
         w
     }
 
+    /// Idle slices until no growth is out, the trunk owes nothing and no seat has a job out, as
+    /// the pool counts them (a result it has not taken keeps a seat out): from then only the
+    /// steps the test takes move the engine.
+    fn quiet(&mut self) -> Witness {
+        for _ in 0..TURNS {
+            let w = self.step(Step::Idle);
+            if !w.growth_out && w.trunk_idle && w.seats_out == 0 {
+                return w;
+            }
+        }
+        panic!("no growth out, the trunk idle and no seat out: not seen within the turns");
+    }
+
     /// The writer's operations `from..OPS`, flushed, checkpointed and finished; the runtime
     /// stopped; then the store reopened cold, every value and tombstone read back exactly, and
     /// its references whole.
@@ -601,7 +614,8 @@ fn jobs_after(seen: &Seen, from: usize, seat: usize) -> Vec<Kind> {
         .collect()
 }
 
-/// Do: two seats, one held by the test's own job; the other's next result held; the writer's
+/// Do: two seats, from a quiet engine, one held by the test's own job; the other's next result
+/// held; the writer's
 /// operations tried once each until a packing is held for a seat, with a growth due ahead of
 /// need and nothing waiting for room. Let the held result reach the shard, then take one idle
 /// slice, with growths held as a seat takes them.
@@ -621,15 +635,9 @@ fn the_last_free_seat_goes_to_the_packing_held_for_one_not_a_growth_due_ahead_of
         assert!(fx.step(Step::Until(i)).done);
         i += 1;
     }
-    // No growth out: idle slices until any growth out has landed.
-    let mut w = fx.step(Step::Idle);
-    for _ in 0..TURNS {
-        if !w.growth_out {
-            break;
-        }
-        w = fx.step(Step::Idle);
-    }
-    assert!(!w.growth_out, "a growth out did not land: {w:?}");
+    // A quiet engine: the seat the test's job leaves is free, not held by a result the pool
+    // has yet to take.
+    let w = fx.quiet();
     assert!(
         w.frozen_most >= 1,
         "no frozen memtable allowed after warming: {w:?}"
@@ -754,17 +762,8 @@ fn an_ask_answered_as_its_growth_lands_leaves_the_freed_seat_to_the_packing_that
         assert!(fx.step(Step::Until(i)).done);
         i += 1;
     }
-    // Idle slices until no growth is out, the trunk owes nothing and no seat has a job out, as
-    // the pool counts them: from here only the steps below move the engine.
-    let mut quiet = None;
-    for _ in 0..TURNS {
-        let w = fx.step(Step::Idle);
-        if !w.growth_out && w.trunk_idle && w.seats_out == 0 {
-            quiet = Some(w);
-            break;
-        }
-    }
-    quiet.expect("no growth out, the trunk idle and no seat out: not seen");
+    // A quiet engine: from here only the steps below move it.
+    fx.quiet();
     // The asker on a seat; its ask for more is on the shard's channel before the owner takes it.
     let from = relays.seen().events.len();
     assert!(fx.step(Step::InjectAsker).done, "the asker got no seat");

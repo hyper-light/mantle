@@ -53,7 +53,8 @@ fn corrupt() -> Error {
 }
 
 /// An entry as order work moves it: eight bytes of its key from its run's skip, beside its
-/// offset in the arena and the high bits of its filter hash, for packing.
+/// offset in the arena and the high bits of its filter hash, for packing. A [`Sorter`]'s entries
+/// leave the hash clear: its walk hashes each key it keeps, once ([`Sorter::each_at`]).
 #[derive(Clone, Copy, Debug, Default)]
 struct Keyed {
     prefix: u64,
@@ -260,10 +261,11 @@ fn digit(prefix: u64, byte: usize) -> usize {
 }
 
 /// A memtable's copied arena sorted where it is packed (research/40 §4): every entry keyed by
-/// eight bytes of its key past the bytes every key shares and by its filter hash, as the
-/// memtable keys its tail, then put in order by the memtable's own sort ([`Sort`]: a radix sort
-/// of the prefixes, ties by key, the newest of each key kept), and walked in key order. Its
-/// buffers are kept for the next arena it sorts.
+/// eight bytes of its key past the bytes every key shares, as the memtable keys its tail, then
+/// put in order by the memtable's own sort ([`Sort`]: a radix sort of the prefixes, ties by key,
+/// the newest of each key kept), and walked in key order, each key the walk reaches hashed there
+/// once: the sort orders by the prefixes and keys alone, and a key the sort drops as an older
+/// entry is never hashed. Its buffers are kept for the next arena it sorts.
 #[derive(Debug, Default)]
 pub struct Sorter {
     keyed: Vec<Keyed>,
@@ -289,7 +291,7 @@ impl Sorter {
             src.push(Keyed {
                 prefix: prefix(key, skip),
                 entry,
-                hash32: crate::branch::filter::hash32(hash(key)),
+                hash32: 0,
             });
             at = end;
         }
@@ -363,29 +365,17 @@ impl Sorter {
         Ok(())
     }
 
-    /// [`Self::each`] with each entry's arena offset: `each(key, op, value, hash, offset)`.
+    /// Each entry the last sort kept, in key order, with its key's filter hash and its arena
+    /// offset: `each(key, op, value, hash, offset)`. The hash is taken here, once a key: the
+    /// branch's filter takes its high bits and the kept memtables' index all of it.
     pub fn each_at(
         &self,
         arena: &[u8],
-        mut each: impl FnMut(&[u8], Op, &[u8], u32, u32) -> Result<(), Error>,
+        mut each: impl FnMut(&[u8], Op, &[u8], u64, u32) -> Result<(), Error>,
     ) -> Result<(), Error> {
         for k in &self.keyed {
             let (key, op, value) = read(arena, k.entry)?;
-            each(key, op, value, k.hash32, k.entry)?;
-        }
-        Ok(())
-    }
-
-    /// Each entry the last sort kept, in key order: `each(key, op, value, hash)`, the hash the
-    /// key's 32-bit filter hash.
-    pub fn each(
-        &self,
-        arena: &[u8],
-        mut each: impl FnMut(&[u8], Op, &[u8], u32) -> Result<(), Error>,
-    ) -> Result<(), Error> {
-        for k in &self.keyed {
-            let (key, op, value) = read(arena, k.entry)?;
-            each(key, op, value, k.hash32)?;
+            each(key, op, value, hash(key), k.entry)?;
         }
         Ok(())
     }
@@ -2764,10 +2754,15 @@ mod tests {
             let mut sorter = Sorter::default();
             proptest::prop_assert_eq!(sorter.sort(&arena, skip).unwrap(), m.len());
             let mut sorted = Vec::new();
-            sorter.each(&arena, |k, op, v, h| {
-                sorted.push((k.to_vec(), op, v.to_vec(), h));
+            let mut hashes = Vec::new();
+            sorter.each_at(&arena, |k, op, v, h, _| {
+                hashes.push(h);
+                sorted.push((k.to_vec(), op, v.to_vec(), crate::branch::filter::hash32(h)));
                 Ok(())
             }).unwrap();
+            for ((k, _, _, _), h) in sorted.iter().zip(&hashes) {
+                proptest::prop_assert_eq!(*h, hash(k));
+            }
             m.seal();
             let mut walked = Vec::new();
             let mut walk = m.walk_start();

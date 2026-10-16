@@ -497,8 +497,10 @@ fn run<F: BlockFile>(store: &mut Store<F>, job: &mut Job) -> Result<(Parts, u64)
                     what: "a memtable's packed parts",
                     why: crate::error::Malformed::CountMismatch,
                 })?;
-                keys.push(crate::branch::filter::hash(k), at);
-                b.add_hashed(store, k, op, v, h)?;
+                // The walk's one hash of the key: all of it for the kept memtables' index, its
+                // high bits for the branch's filter.
+                keys.push(h, at);
+                b.add_hashed(store, k, op, v, crate::branch::filter::hash32(h))?;
                 walked = walked.saturating_add(1);
                 Ok(())
             })?;

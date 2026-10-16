@@ -2071,11 +2071,10 @@ impl<F: BlockFile> ShardDb<F> {
                     self.kept_hits = self.kept_hits.saturating_add(1);
                 }
                 KeptAnswer::Absent if self.kept_whole => {
+                    // Answered without the trunk: no cache grew, so the kept memtables' budget
+                    // has nothing new to look at.
                     self.kept_absent = self.kept_absent.saturating_add(1);
                     value.clear();
-                    if self.kept_crowded() {
-                        self.fit_kept(false);
-                    }
                     return Ok(false);
                 }
                 KeptAnswer::Absent | KeptAnswer::Unknown => {}
@@ -2094,6 +2093,9 @@ impl<F: BlockFile> ShardDb<F> {
                 crate::records::Lookup::Miss { ghost: named } => ghost = named,
             }
         }
+        // Only a read of the trunk grows the caches (a page read in, a record kept): after one,
+        // the kept memtables give way before the get returns if the budget needs it. A get a
+        // memtable or a kept memtable answered grew none, and looks at nothing.
         if found.is_none() {
             // A miss the ghost named is timed: a larger record cache would have served it, so
             // its trunk lookup is what growing the cache saves (the tuner's marginal gain,
@@ -2106,10 +2108,9 @@ impl<F: BlockFile> ShardDb<F> {
                     r.insert(key, hash, value);
                 }
             }
-        }
-        // The get may have grown the caches: the kept memtables give way before it returns.
-        if self.kept_crowded() {
-            self.fit_kept(false);
+            if self.kept_crowded() {
+                self.fit_kept(false);
+            }
         }
         Ok(found == Some(Op::Put))
     }
@@ -2148,11 +2149,10 @@ impl<F: BlockFile> ShardDb<F> {
                     self.kept_hits = self.kept_hits.saturating_add(1);
                 }
                 KeptAnswer::Absent if self.kept_whole => {
+                    // Answered without the trunk: no cache grew, so the kept memtables' budget
+                    // has nothing new to look at.
                     self.kept_absent = self.kept_absent.saturating_add(1);
                     value.clear();
-                    if self.kept_crowded() {
-                        self.fit_kept(false);
-                    }
                     return Ok(false);
                 }
                 KeptAnswer::Absent | KeptAnswer::Unknown => {}
@@ -2171,6 +2171,9 @@ impl<F: BlockFile> ShardDb<F> {
                 crate::records::Lookup::Miss { ghost: named } => ghost = named,
             }
         }
+        // Only a read of the trunk grows the caches (a page read in, a record kept): after one,
+        // the kept memtables give way before the get returns if the budget needs it. A get a
+        // memtable or a kept memtable answered grew none, and looks at nothing.
         if found.is_none() {
             // A miss the ghost named is timed: a larger record cache would have served it, so
             // its trunk lookup is what growing the cache saves (the tuner's marginal gain,
@@ -2186,10 +2189,9 @@ impl<F: BlockFile> ShardDb<F> {
                     r.insert(key, hash, value);
                 }
             }
-        }
-        // The get may have grown the caches: the kept memtables give way before it returns.
-        if self.kept_crowded() {
-            self.fit_kept(false);
+            if self.kept_crowded() {
+                self.fit_kept(false);
+            }
         }
         Ok(found == Some(Op::Put))
     }

@@ -65,19 +65,15 @@ pub struct Grow {
 
 impl Grow {
     /// Appends `b`. Every bit past the length is clear (a word is added clear, and only `set`
-    /// writes, within the length), so the bit is or-ed in as it is, set or clear, with no branch
-    /// on it: a trie's bits follow its keys, and a branch on each is mispredicted as often as
-    /// they are unpredictable (research/59 §1: the trie builder's hottest instruction was such a
-    /// branch's target).
-    #[inline]
+    /// writes, within the length), so a clear bit is appended by the length alone.
     pub fn push(&mut self, b: bool) {
         let i = self.len;
         if i.is_multiple_of(64) {
             self.words.push(0);
         }
         self.len = i.saturating_add(1);
-        if let Some(w) = self.words.last_mut() {
-            *w |= u64::from(b) << (i % 64);
+        if b && let Some(w) = self.words.last_mut() {
+            *w |= 1u64 << (i % 64);
         }
     }
 

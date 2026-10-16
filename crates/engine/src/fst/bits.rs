@@ -64,14 +64,17 @@ pub struct Grow {
 }
 
 impl Grow {
-    /// Appends `b`.
+    /// Appends `b`. Every bit past the length is clear (a word is added clear, and only `set`
+    /// writes, within the length), so a clear bit is appended by the length alone.
     pub fn push(&mut self, b: bool) {
-        if self.len.is_multiple_of(64) {
+        let i = self.len;
+        if i.is_multiple_of(64) {
             self.words.push(0);
         }
-        let i = self.len;
-        self.len = self.len.saturating_add(1);
-        self.set(i, b);
+        self.len = i.saturating_add(1);
+        if b && let Some(w) = self.words.last_mut() {
+            *w |= 1u64 << (i % 64);
+        }
     }
 
     /// Sets bit `i`, within the length, to `b`.

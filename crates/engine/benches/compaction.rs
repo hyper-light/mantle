@@ -9,7 +9,7 @@
 //! `cargo bench -p mantle-engine --bench compaction -- DIR ENTRIES [ROUNDS] [--direct]`, the
 //! last opening the store for direct I/O where the file system takes it. Sixteen-byte keys
 //! and 100-byte values as `ranges`; reports, per input entry, wall and process CPU nanoseconds,
-//! instructions, and the allocations a merge made.
+//! instructions and cycles, and the allocations a merge made.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -141,11 +141,12 @@ fn main() -> Result<(), mantle_engine::Error> {
                 )
             };
             println!(
-                "{name} round {round} inputs {} read {read} written {written} wall_ns/entry {:.1} cpu_ns/entry {} instructions/entry {} allocations {} reallocations {}",
+                "{name} round {round} inputs {} read {read} written {written} wall_ns/entry {:.1} cpu_ns/entry {} instructions/entry {} cycles/entry {} allocations {} reallocations {}",
                 inputs.len(),
                 wall / read as f64,
                 per(account.and_then(|a| a.user_ns.checked_add(a.system_ns))),
                 per(account.and_then(|a| a.instructions)),
+                per(account.and_then(|a| a.cycles)),
                 allocations.allocations,
                 allocations.reallocations,
             );

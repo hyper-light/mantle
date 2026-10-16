@@ -1,8 +1,11 @@
 //! The range filter's cost and accuracy by suffix bits (docs/design/engine-structure.md §5, E6;
-//! research/35 §2): a run of `KEYS` keys of two shapes, 16-byte keys of a random 64-bit number
-//! (the shard benchmark's) and object names under a few thousand prefixes (an S3 listing's). For
-//! each, ranges holding no key, as a bounded seek or a listing asks: the share let through (false
-//! positives), bits a key, and nanoseconds a check at p50 and p99, with allocations a check.
+//! research/35 §2): a run of `KEYS` keys of three shapes, 16-byte keys of a random 64-bit number,
+//! the `ranges` bench's keys (a number below four times `KEYS`, big-endian, padded with ASCII
+//! '0', as db_bench writes them: a run of a dense key space) and object names under a few
+//! thousand prefixes (an S3 listing's). For each, the build's nanoseconds, instructions and
+//! cycles a key (the last two where the OS counts them), and ranges holding no key, as a bounded
+//! seek or a listing asks: the share let through (false positives), bits a key, and nanoseconds a
+//! check at p50 and p99, with allocations a check.
 //! `cargo bench -p mantle-engine --bench surf -- [KEYS] [QUERIES] [PASSES]`
 #![allow(
     clippy::unwrap_used,
@@ -20,7 +23,7 @@
 use std::collections::BTreeSet;
 use std::time::Instant;
 
-use hyper_measure::alloc;
+use hyper_measure::{alloc, usage};
 use mantle_engine::fst::surf::SurfBuilder;
 
 #[global_allocator]
@@ -39,6 +42,13 @@ impl Rng {
 
 fn number(n: u64) -> Vec<u8> {
     let mut k = vec![0u8; 16];
+    k[..8].copy_from_slice(&n.to_be_bytes());
+    k
+}
+
+/// The `ranges` bench's key of `n`: its number big-endian, then ASCII '0' to 16 bytes.
+fn dense(n: u64) -> Vec<u8> {
+    let mut k = vec![b'0'; 16];
     k[..8].copy_from_slice(&n.to_be_bytes());
     k
 }
@@ -87,7 +97,12 @@ fn empty_ranges(
     let mut gaps = Vec::with_capacity(n);
     let mut prefixes = Vec::with_capacity(n);
     let mut tries = 0usize;
-    while (points.len() < n || gaps.len() < n || prefixes.len() < n) && tries < n * 1_000 {
+    // A shape whose cut prefixes every key shares (the dense keys' first five bytes) has no
+    // empty prefix to find: the search for them ends once `10 n` draws found none.
+    let wants_prefixes = |tries: usize, found: usize| found < n && (found > 0 || tries <= 10 * n);
+    while (points.len() < n || gaps.len() < n || wants_prefixes(tries, prefixes.len()))
+        && tries < n * 1_000
+    {
         tries += 1;
         let x = make(r);
         if set.contains(&x) {
@@ -141,8 +156,10 @@ fn main() {
     let queries: usize = args.get(1).map_or(200_000, |s| s.parse().unwrap());
     // Passes over each kind's ranges, for a profiler to sample a steady loop.
     let passes: usize = args.get(2).map_or(1, |s| s.parse().unwrap());
-    let shapes: [Shape; 2] = [
+    let span = 4 * keys as u64;
+    let shapes: [Shape; 3] = [
         ("number16", &|r: &mut Rng| number(r.next())),
+        ("dense16", &|r: &mut Rng| dense(r.next() % span)),
         ("object", &|r: &mut Rng| object(r)),
     ];
     for (name, make) in shapes {
@@ -152,6 +169,7 @@ fn main() {
         let key_bytes: usize = set.iter().map(Vec::len).sum();
         for suffix in [0u32, 4, 8, 12, 16, 24, 32] {
             let mut b = SurfBuilder::new(suffix).unwrap();
+            let counted = usage::this().ok();
             let t = Instant::now();
             let mut before: Option<&Vec<u8>> = None;
             for k in &set {
@@ -164,17 +182,33 @@ fn main() {
             let t = Instant::now();
             let f = b.finish(before.map(Vec::as_slice)).unwrap();
             let finish = t.elapsed().as_secs_f64();
+            let account = usage::this()
+                .ok()
+                .zip(counted)
+                .map(|(now, counted)| now.since(&counted));
+            let per_key = |count: Option<u64>| {
+                count.map_or_else(
+                    || "unavailable".to_string(),
+                    |count| format!("{:.1}", count as f64 / set.len() as f64),
+                )
+            };
             let build = added + finish;
             let mut scratch = Vec::with_capacity(64);
             let mut line = format!(
-                "{name} keys {} ({:.1} B) suffix {suffix:2}: {:.2} bits/key, build {:.0} ns/key (finish {:.2} ms) |",
+                "{name} keys {} ({:.1} B) suffix {suffix:2}: {:.2} bits/key, build {:.0} ns/key {} instructions/key {} cycles/key (finish {:.2} ms) |",
                 set.len(),
                 key_bytes as f64 / set.len() as f64,
                 f.bytes() as f64 * 8.0 / set.len() as f64,
                 build * 1e9 / set.len() as f64,
+                per_key(account.and_then(|a| a.instructions)),
+                per_key(account.and_then(|a| a.cycles)),
                 finish * 1e3,
             );
             for (kind, ranges) in ["point", "gap", "prefix"].iter().zip(&kinds) {
+                if ranges.is_empty() {
+                    line += &format!(" {kind} n 0 |");
+                    continue;
+                }
                 let mut lat = Vec::with_capacity(ranges.len());
                 let mut through = 0usize;
                 alloc::begin();

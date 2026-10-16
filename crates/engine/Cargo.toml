@@ -92,3 +92,7 @@ harness = false
 [[bench]]
 name = "active_order"
 harness = false
+
+[[bench]]
+name = "kept"
+harness = false

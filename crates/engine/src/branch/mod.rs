@@ -1079,18 +1079,25 @@ impl<'a> View<'a> {
             },
         };
         let kh = key_head(suffix);
-        let (mut lo, mut hi) = (0usize, self.n);
-        while lo < hi {
-            let mid = lo.saturating_add(hi.saturating_sub(lo) / 2);
+        // The entries before the boundary (below the key, or at most it for an upper bound) are
+        // a prefix of the page: counted by halving over the heads. Which half a step keeps
+        // follows the keys, as unpredictable as they are, so it is chosen by selects, not
+        // branches; only a tie on the head reads the entry to compare the suffixes.
+        let (mut lo, mut len) = (0usize, self.n);
+        while len > 0 {
+            let half = len / 2;
+            let mid = lo.saturating_add(half);
             let order = match kh.cmp(&self.head(mid)) {
                 Ordering::Equal => suffix.cmp(self.entry(mid)?.0),
                 other => other,
             };
-            if order == Ordering::Less || (!upper && order == Ordering::Equal) {
-                hi = mid;
-            } else {
-                lo = mid.saturating_add(1);
-            }
+            let before = order == Ordering::Greater || (upper && order == Ordering::Equal);
+            lo = std::hint::select_unpredictable(before, mid.saturating_add(1), lo);
+            len = std::hint::select_unpredictable(
+                before,
+                len.saturating_sub(half).saturating_sub(1),
+                half,
+            );
         }
         Ok(lo)
     }

@@ -3670,10 +3670,20 @@ impl<F: BlockFile> ShardDb<F> {
     /// that lasts any part of a fill reaches the rotation that freezes it, so the overlap is
     /// rounded up, `ceil(pack_ns / fill_ns)`: rounded down, a packing a little shorter than its
     /// last measure counted none, and every rotation it outlasted fed it whole and waited for it.
-    /// With no measure yet, none. At most the pool's admitted capacity, each packing a worker's.
+    /// Before any packing has come back, one still out has outlasted the fill since its
+    /// rotation, so packings last at least a fill's part: one rotation's overlap, which the
+    /// next rotation leaves in flight. Counted as none, the second rotation waited 1-130 ms for
+    /// the first packing beside 12 and 18 busy loops, every loaded run (research/58 §4). It is
+    /// one: a packing's age is a lower bound that grows with a stalled write, and taken as the
+    /// measure it let a stalled first packing's memtables stay frozen up to the pool's capacity,
+    /// a memtable each. With no fill measured, none. At most the pool's admitted capacity, each
+    /// packing a worker's.
     fn frozen_most(&self) -> usize {
         if !self.trunk.has_pool() {
             return 0;
+        }
+        if self.pack_ns == 0 && self.fill_ns > 0 && self.frozen.iter().any(|f| !f.ready()) {
+            return self.trunk.pool_capacity().min(1);
         }
         let overlap = crate::util::div_ceil(self.pack_ns, self.fill_ns).unwrap_or(0);
         usize::try_from(overlap)
@@ -5050,8 +5060,9 @@ mod frozen_tests {
     type Put = fn(&mut ShardDb<Held>, &mut BTreeMap<Vec<u8>, Vec<u8>>, u64);
 
     /// Puts until the shard has measured a fill and a packing, so the overlap it lets stay
-    /// frozen is its own: by the second rotation, which, with no overlap measured yet, waits for
-    /// the first packing a worker took and so measures it.
+    /// frozen is its own: by the third rotation, which, with one packing allowed in flight
+    /// before any is measured ([`ShardDb::frozen_most`]), waits for the first if it is still
+    /// out, and so measures it.
     fn warm(
         db: &mut ShardDb<Held>,
         oracle: &mut BTreeMap<Vec<u8>, Vec<u8>>,
@@ -5061,8 +5072,8 @@ mod frozen_tests {
         let rotations = db.flush_stats.rotations;
         while db.pack_ns == 0 || db.fill_ns == 0 {
             assert!(
-                db.flush_stats.rotations < rotations + 2,
-                "a second rotation measured no packing"
+                db.flush_stats.rotations < rotations + 3,
+                "a third rotation measured no packing"
             );
             put(db, oracle, *i);
             *i += 1;

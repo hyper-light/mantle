@@ -1,5 +1,6 @@
 //! Who gets a seat when a growth due ahead of need and a packing held for a seat both want one
-//! ([`ShardDb::grow`]), on an engine prepared as a range's is, whose owner steps a test's task
+//! ([`ShardDb::grow`]), and what a rotation leaves in flight while a packing is out
+//! ([`ShardDb::frozen_most`]), on an engine prepared as a range's is, whose owner steps a test's task
 //! takes one at a time, on a store grown by segments, its pool's two seats on a test's relays
 //! ([`relay`]). Each step is answered with what the owner left: whether a packing is held for a
 //! seat, a growth is out or due, what waits for room, and the seats free.
@@ -174,6 +175,9 @@ struct Witness {
     frozen_most: usize,
     /// The seats with a job out, as the pool counts them ([`relay::seats_out`]).
     seats_out: usize,
+    /// The rotations begun, and the frozen memtables whose packings are out or not yet retired.
+    rotations: u64,
+    frozen: usize,
 }
 
 /// The extents a hand-off of the held packing asks, as `ShardDb::sort_off` counts them: its
@@ -207,6 +211,8 @@ fn witness(db: &mut ShardDb<SegmentedFile>, done: bool) -> Witness {
         trunk_idle: db.trunk.is_idle(),
         frozen_most: db.frozen_most(),
         seats_out: db.trunk.pool_mut().map_or(0, |p| relay::seats_out(p)),
+        rotations: db.flush_stats.rotations,
+        frozen: db.frozen.len(),
     }
 }
 
@@ -572,10 +578,11 @@ impl Fixture {
         panic!("no growth out, the trunk idle and no seat out: not seen within the turns");
     }
 
-    /// The writer's operations `from..OPS`, flushed, checkpointed and finished; the runtime
-    /// stopped; then the store reopened cold, every value and tombstone read back exactly, and
-    /// its references whole.
+    /// The room reserved given back (the cold bank among it, [`BANK`]); the writer's operations
+    /// `from..OPS`, flushed, checkpointed and finished; the runtime stopped; then the store
+    /// reopened cold, every value and tombstone read back exactly, and its references whole.
     fn finish(mut self, from: u64) {
+        assert!(self.step(Step::Unreserve).done);
         for i in from..OPS {
             assert!(self.step(Step::Until(i)).done);
         }
@@ -864,5 +871,95 @@ fn an_ask_answered_as_its_growth_lands_leaves_the_freed_seat_to_the_packing_that
     assert!(fx.step(Step::Unreserve).done);
     relays.open();
     assert!(fx.step(Step::TakeInjected).done);
+    fx.finish(i);
+}
+
+/// Whether the first packing's result has not reached the shard: its job still runs, or its
+/// result is held. Its seat's first delivery after the job would be that result.
+fn first_packing_out(seen: &Seen) -> bool {
+    let first = |e: &&Event| {
+        matches!(
+            e,
+            Event::Job {
+                kind: Kind::Sort,
+                ..
+            }
+        )
+    };
+    seen.events
+        .iter()
+        .find(first)
+        .is_some_and(|job| match *job {
+            Event::Job { seat, .. } => !seen
+                .events
+                .iter()
+                .skip_while(|e| !first(e))
+                .any(|e| *e == Event::Delivered { seat }),
+            _ => false,
+        })
+}
+
+/// Do: a fresh engine, two seats; the first packing's result held on its seat, so it stays out.
+/// The writer's operations, each until done, through its second rotation; then once each, an
+/// idle slice between tries of one that waits, until one waits at the third rotation with the
+/// second packing handed off.
+/// Expect: before any packing has come back, one still out counts as one rotation's overlap.
+/// The second rotation leaves the first packing in flight: every operation through it
+/// completes, the first packing still out and frozen. The third waits for it, with two frozen,
+/// rather than leave a second in flight. Let everything go, and every value and tombstone reads
+/// back exactly after a checkpoint and a cold reopen, the references whole.
+#[test]
+fn the_second_rotation_leaves_the_first_packing_in_flight_and_the_third_waits_for_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let relays = Relays::leak();
+    let mut fx = Fixture::start(dir.path(), relays, false);
+    // Declared after the fixture, it drops first: a failed assertion lets everything held go
+    // before the runtime's teardown joins the workers.
+    let _open = OpenOnDrop(relays);
+    relays.hold_done(&[Kind::Sort]);
+    let mut i = 0;
+    let w = loop {
+        let w = fx.step(Step::Until(i));
+        assert!(w.done);
+        i += 1;
+        if w.rotations >= 2 {
+            break w;
+        }
+        assert!(i < OPS, "no second rotation within the operations: {w:?}");
+    };
+    let seen = relays.seen();
+    assert!(
+        first_packing_out(&seen) && w.frozen >= 1,
+        "past the second rotation, the first packing out and frozen: {w:?}; {seen:?}"
+    );
+    let mut third = None;
+    for _ in 0..TURNS {
+        let w = fx.step(Step::Once(i));
+        if w.done {
+            assert!(
+                w.rotations < 3,
+                "the writer went past its third rotation with the first packing out: {w:?}; {:?}",
+                relays.seen()
+            );
+            i += 1;
+            assert!(i < OPS, "no third rotation within the operations: {w:?}");
+            continue;
+        }
+        // The rotation hands the second packing off first, which may wait for room or a seat;
+        // once it is out, what the rotation waits for is the first.
+        if w.rotations >= 3 && !w.packing_held && w.packing_wanted == 0 {
+            third = Some(w);
+            break;
+        }
+        // Waiting for something else, room or a seat: an idle slice, then the same again.
+        fx.step(Step::Idle);
+    }
+    let w = third.expect("the writer waiting at its third rotation: not seen within the turns");
+    let seen = relays.seen();
+    assert!(
+        first_packing_out(&seen) && w.frozen == 2,
+        "at the third rotation, the first packing out and two frozen: {w:?}; {seen:?}"
+    );
+    relays.open();
     fx.finish(i);
 }

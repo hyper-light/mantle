@@ -350,6 +350,9 @@ pub struct TrunkStats {
     /// jobs.
     pub parallel_settles: u64,
     pub parallel_settle_jobs: u64,
+    /// The entries settles were planned on and the entries they wrote ([`Trunk::settle_output`]).
+    pub settled_in: u64,
+    pub settled_out: u64,
     /// The trunk's shape when these were taken ([`Trunk::levels`]), a depth an element from the
     /// root, depths past the last summed into it.
     pub shape: [LevelShape; SHAPE_DEPTHS],
@@ -410,6 +413,10 @@ pub struct Trunk {
     /// key's compaction, a consolidation's price per entry it rewrites.
     merge_ns: u64,
     merge_keys: u64,
+    /// The entries settles were planned on, counted over every input (an upper bound on their
+    /// keys), and the entries they wrote: how many of a settle's counted entries its output
+    /// keeps, learned, which a split's jobs are sized by ([`Self::settle_output`]).
+    settled: (u64, u64),
     /// Pivots whose seeks' rent covers their consolidation ([`SeekRent::paid`]).
     paid: usize,
     /// Whether a drain asked for every pivot of several sources to be consolidated
@@ -636,6 +643,7 @@ impl Trunk {
             gets: 0,
             merge_ns: 0,
             merge_keys: 0,
+            settled: (0, 0),
             paid: 0,
             full: false,
             consolidated: false,
@@ -2037,6 +2045,7 @@ impl Trunk {
             gets: 0,
             merge_ns: 0,
             merge_keys: 0,
+            settled: (0, 0),
             paid: 0,
             full: false,
             consolidated: false,
@@ -2307,6 +2316,8 @@ impl Trunk {
         TrunkStats {
             merge_units: self.merge_keys,
             merge_ns: self.merge_ns,
+            settled_in: self.settled.0,
+            settled_out: self.settled.1,
             held_entries: self.held,
             shape,
             ..self.stats

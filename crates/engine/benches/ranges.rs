@@ -666,7 +666,7 @@ fn stats(name: &str, counters: &[RangeStats]) {
     }
     for (range, (f, t, io)) in counters.iter().enumerate() {
         println!(
-            "{name} range {range} flushes {} stalls {} waited_steps {} pivot_compactions {} leaf_compactions {} splits {} entries_written {} consolidations {} merge_units {} merge_ns {} io reads {} pages_read {} submitted {} pages_written {} syncs {} queued {} queued_most {} write_waits {} prefetches {} prefetch_waits {} cache_hits {} span_cache_hits {} device_reads {} resident_reads {} device_read_ns {} resident_probes {} resident_skips {} residency_epochs {} residency_changes {} residency_wrong {} scans {} scan_segments {} scan_sources {} scan_skipped {} scan_opened {} pivot_entries {} settle_entries_seeks {} settle_entries_branches {} settle_entries_size {} settle_inflight_entries {} whole_consolidations {} charged_leaf_sources {} charged_index_sources {} paid_leaves {} paid_index {} paid_below {} consolidations_started {} fullest_flushes {} parted_entries {} parallel_settles {} parallel_settle_jobs {}",
+            "{name} range {range} flushes {} stalls {} waited_steps {} pivot_compactions {} leaf_compactions {} splits {} entries_written {} consolidations {} merge_units {} merge_ns {} io reads {} pages_read {} submitted {} pages_written {} syncs {} queued {} queued_most {} write_waits {} prefetches {} prefetch_waits {} cache_hits {} span_cache_hits {} device_reads {} resident_reads {} device_read_ns {} resident_probes {} resident_skips {} residency_epochs {} residency_changes {} residency_wrong {} scans {} scan_segments {} scan_sources {} scan_skipped {} scan_opened {} pivot_entries {} settle_entries_seeks {} settle_entries_branches {} settle_entries_size {} settle_inflight_entries {} whole_consolidations {} charged_leaf_sources {} charged_index_sources {} paid_leaves {} paid_index {} paid_below {} consolidations_started {} fullest_flushes {} parted_entries {} parallel_settles {} parallel_settle_jobs {} settled_in {} settled_out {}",
             f.flushes,
             f.stalls,
             f.waited_steps,
@@ -717,7 +717,9 @@ fn stats(name: &str, counters: &[RangeStats]) {
             t.fullest_flushes,
             t.parted_entries,
             t.parallel_settles,
-            t.parallel_settle_jobs
+            t.parallel_settle_jobs,
+            t.settled_in,
+            t.settled_out
         );
         let mut shape = String::new();
         for (depth, l) in t.shape.iter().enumerate().filter(|(_, l)| l.nodes > 0) {

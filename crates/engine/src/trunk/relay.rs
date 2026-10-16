@@ -221,6 +221,12 @@ impl Relays {
     }
 }
 
+/// The seats with a job out, as the pool counts them: a seat stays out until the shard has taken
+/// its job's result, whatever the relays have passed.
+pub(crate) fn seats_out(pool: &Pool) -> usize {
+    pool.held()
+}
+
 /// Opens the relays when dropped: a failed assertion leaves nothing held.
 pub(crate) struct OpenOnDrop(pub(crate) &'static Relays);
 

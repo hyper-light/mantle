@@ -172,6 +172,8 @@ struct Witness {
     /// Nothing pending or in progress in the trunk.
     trunk_idle: bool,
     frozen_most: usize,
+    /// The seats with a job out, as the pool counts them ([`relay::seats_out`]).
+    seats_out: usize,
 }
 
 /// The extents a hand-off of the held packing asks, as `ShardDb::sort_off` counts them: its
@@ -204,6 +206,7 @@ fn witness(db: &mut ShardDb<SegmentedFile>, done: bool) -> Witness {
         growth_extents: db.growth.map_or(0, |(_, _, extents)| extents),
         trunk_idle: db.trunk.is_idle(),
         frozen_most: db.frozen_most(),
+        seats_out: db.trunk.pool_mut().map_or(0, |p| relay::seats_out(p)),
     }
 }
 
@@ -360,8 +363,17 @@ async fn run(
             }
         }
         Step::Reserve => {
-            let spare = db.store.capacity().saturating_sub(hand_off_asks(db));
+            let asks = hand_off_asks(db);
+            let spare = db.store.capacity().saturating_sub(asks);
             reserved.extend(db.store.grant(usize::try_from(spare).unwrap())?);
+            // A growth is due at this room. The lead is learned from how the growths so far
+            // landed (`note_lead`): where none was out while an allocation went on, it taught
+            // none, and a segment of a packing's grant is not past this room. The lead is then
+            // the least at which one is due, as a growth out while that many extents were
+            // allocated teaches it.
+            if db.segment_extents.saturating_add(db.growth_lead) <= asks {
+                db.growth_lead = asks + 1 - db.segment_extents;
+            }
             Ok(true)
         }
         Step::Unreserve => {
@@ -704,24 +716,18 @@ fn the_last_free_seat_goes_to_the_packing_held_for_one_not_a_growth_due_ahead_of
     fx.finish(i);
 }
 
-/// Whether every job the relays handed a seat has sent its result, none of them held: both
-/// seats free once the owner takes them.
-fn seats_free(relays: &'static Relays) -> bool {
-    let seen = relays.seen();
-    seen.held_dones.is_empty()
-        && (0..2).all(|seat| {
-            let count = |done: bool| {
-                seen.events
-                    .iter()
-                    .filter(|e| match **e {
-                        Event::Job { seat: s, .. } => !done && s == seat,
-                        Event::Done { seat: s, .. } => done && s == seat,
-                        _ => false,
-                    })
-                    .count()
-            };
-            count(false) <= count(true)
-        })
+/// The first ask for more after the `from`th event, once it is on the shard's channel: its seat
+/// and what it asks. A seat's relay hands its worker's messages on one at a time, so the seat's
+/// first delivery after the ask is the ask's.
+fn ask_delivered(seen: &Seen, from: usize) -> Option<(usize, u64)> {
+    let mut after = seen.events.iter().skip(from);
+    let (seat, n) = after.by_ref().find_map(|e| match *e {
+        Event::Need { seat, n } => Some((seat, n)),
+        _ => None,
+    })?;
+    after
+        .any(|e| *e == Event::Delivered { seat })
+        .then(|| (seat, u64::try_from(n).unwrap()))
 }
 
 /// Do: two seats, from a quiet engine (no growth out, the trunk idle, both seats free). The
@@ -748,35 +754,24 @@ fn an_ask_answered_as_its_growth_lands_leaves_the_freed_seat_to_the_packing_that
         assert!(fx.step(Step::Until(i)).done);
         i += 1;
     }
-    // Idle slices until no growth is out, the trunk owes nothing and both seats are free: from
-    // here only the steps below move the engine.
+    // Idle slices until no growth is out, the trunk owes nothing and no seat has a job out, as
+    // the pool counts them: from here only the steps below move the engine.
     let mut quiet = None;
     for _ in 0..TURNS {
         let w = fx.step(Step::Idle);
-        if !w.growth_out && w.trunk_idle && seats_free(relays) {
+        if !w.growth_out && w.trunk_idle && w.seats_out == 0 {
             quiet = Some(w);
             break;
         }
     }
-    quiet.expect("no growth out, the trunk idle and both seats free: not seen");
-    // The asker on a seat; its ask for more comes before the owner takes it.
+    quiet.expect("no growth out, the trunk idle and no seat out: not seen");
+    // The asker on a seat; its ask for more is on the shard's channel before the owner takes it.
     let from = relays.seen().events.len();
     assert!(fx.step(Step::InjectAsker).done, "the asker got no seat");
-    let seen = relays.until("the asker's ask", |s| {
-        s.events
-            .iter()
-            .skip(from)
-            .any(|e| matches!(e, Event::Need { .. }))
+    let seen = relays.until("the asker's ask on the shard's channel", |s| {
+        ask_delivered(s, from).is_some()
     });
-    let (asker, n) = seen
-        .events
-        .iter()
-        .skip(from)
-        .find_map(|e| match *e {
-            Event::Need { seat, n } => Some((seat, u64::try_from(n).unwrap())),
-            _ => None,
-        })
-        .unwrap();
+    let (asker, n) = ask_delivered(&seen, from).unwrap();
     let free = 1 - asker;
     // The room one short of the ask: the ask waits for growth, and a packing the writer hands
     // off before the growth lands fits it.

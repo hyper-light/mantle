@@ -892,12 +892,11 @@ impl Trunk {
             return 1;
         }
         let target = self.config.leaf_entries.max(1);
-        let parts = count
+        count
             .saturating_add(target / 2)
             .checked_div(target)
             .unwrap_or(1)
-            .max(1);
-        parts
+            .max(1)
     }
 
     /// Plans leaf `n`'s whole compaction, tombstones dropped, into `ceil(entries /

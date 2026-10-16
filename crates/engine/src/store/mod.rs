@@ -1819,6 +1819,31 @@ impl<F: BlockFile> Store<F> {
     /// not continuing the run writes the run out first ([`Self::write_run`]), and a full extent
     /// writes it.
     pub fn queue_page(&mut self, run: &mut Run, address: u64, payload: &[u8]) -> Result<(), Error> {
+        // Refused before the run moves, as a payload of its length always was.
+        if payload.len() > self.page_capacity() {
+            return Err(Error::InvalidArgument {
+                what: "a page payload longer than the page",
+            });
+        }
+        self.queue_page_with(run, address, |dst| {
+            dst.get_mut(..payload.len())
+                .ok_or(Error::InvalidArgument {
+                    what: "a page payload longer than the page",
+                })?
+                .copy_from_slice(payload);
+            Ok(payload.len())
+        })
+    }
+
+    /// Queues a node page as [`Self::queue_page`] does, its payload written by `fill` straight
+    /// into the page's place in the run's buffer, which it is handed whole: its length back. The
+    /// page is sealed and cached from there, so its bytes are written once before the device.
+    pub fn queue_page_with(
+        &mut self,
+        run: &mut Run,
+        address: u64,
+        fill: impl FnOnce(&mut [u8]) -> Result<usize, Error>,
+    ) -> Result<(), Error> {
         blocking_allowed("a synchronous store page queue in a runtime task")?;
         self.admission_open()?;
         self.checkpoint_idle()?;
@@ -1829,7 +1854,7 @@ impl<F: BlockFile> Store<F> {
             ));
         }
         let started = self.timed.then(std::time::Instant::now);
-        let queued = self.queue_page_timed(run, address, payload);
+        let queued = self.queue_page_timed(run, address, fill);
         self.io.queue_ns = self.io.queue_ns.saturating_add(elapsed_ns(started));
         queued
     }
@@ -2058,7 +2083,7 @@ impl<F: BlockFile> Store<F> {
         &mut self,
         run: &mut Run,
         address: u64,
-        payload: &[u8],
+        fill: impl FnOnce(&mut [u8]) -> Result<usize, Error>,
     ) -> Result<(), Error> {
         let extent = self.extent_of(address);
         if extent == 0 || !self.alloc.is_held(extent) {
@@ -2066,11 +2091,7 @@ impl<F: BlockFile> Store<F> {
                 what: "a page written outside a held extent",
             });
         }
-        if payload.len() > self.page_capacity() {
-            return Err(Error::InvalidArgument {
-                what: "a page payload longer than the page",
-            });
-        }
+        let capacity = self.page_capacity();
         self.current_run_job(run)?;
         let continues = run.pages > 0
             && run.first.checked_add(u64::from(run.pages)) == Some(address)
@@ -2089,13 +2110,20 @@ impl<F: BlockFile> Store<F> {
             .as_mut_slice()
             .get_mut(at..at.checked_add(size).ok_or(corrupt(Malformed::TooLarge))?)
             .ok_or(corrupt(Malformed::TooLarge))?;
-        page.get_mut(HEADER..HEADER.saturating_add(payload.len()))
-            .ok_or(Error::InvalidArgument {
+        let len = fill(
+            page.get_mut(HEADER..HEADER.saturating_add(capacity))
+                .ok_or(corrupt(Malformed::TooLarge))?,
+        )?;
+        if len > capacity {
+            return Err(Error::InvalidArgument {
                 what: "a page payload longer than the page",
-            })?
-            .copy_from_slice(payload);
+            });
+        }
         let generation = self.durable.generation.saturating_add(1);
-        page::seal(page, address, Kind::Node, generation, payload.len())?;
+        page::seal(page, address, Kind::Node, generation, len)?;
+        let payload = page
+            .get(HEADER..HEADER.saturating_add(len))
+            .ok_or(corrupt(Malformed::TooLarge))?;
         // Only a validated, sealed page enters the write-through cache (research/34 §1).
         // A page just compacted can be read from memory while its run waits for the device.
         if let Some(c) = self.cache.as_mut() {

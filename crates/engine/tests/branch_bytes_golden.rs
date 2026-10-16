@@ -69,7 +69,11 @@ fn bench_like(rng: &mut Rng, n: u64, span: u64) -> Entries {
     let mut e = Entries::new();
     while (e.len() as u64) < n {
         let k = rng.next() % span;
-        let op = if k % 29 == 0 { Op::Delete } else { Op::Put };
+        let op = if k.is_multiple_of(29) {
+            Op::Delete
+        } else {
+            Op::Put
+        };
         let value = if op == Op::Delete {
             Vec::new()
         } else {
@@ -118,7 +122,11 @@ fn binary(rng: &mut Rng, n: usize) -> Entries {
                 y >>= 2;
             }
         }
-        let op = if x % 7 == 0 { Op::Delete } else { Op::Put };
+        let op = if x.is_multiple_of(7) {
+            Op::Delete
+        } else {
+            Op::Put
+        };
         let value = vec![(x >> 33) as u8; ((x >> 40) % 64) as usize];
         e.insert(key, (op, value));
     }

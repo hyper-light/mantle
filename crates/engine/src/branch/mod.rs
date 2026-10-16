@@ -257,62 +257,92 @@ impl Page {
         self.total = 0;
     }
 
-    /// The page's payload into `out`.
-    fn encode(&self, kind: u8, out: &mut Vec<u8>) -> Result<(), Error> {
-        out.clear();
-        let first = self.key(0);
-        let prefix = first
+    /// The page's payload written into the front of `out`, its length returned. Its sections'
+    /// sizes are counted from the staged sums first and each section is cut from `out` once, so
+    /// an entry's writes are copies into slices it owns.
+    fn encode_into(&self, kind: u8, out: &mut [u8]) -> Result<usize, Error> {
+        let too_large = || corrupt(Malformed::TooLarge);
+        let n = self.len();
+        let prefix = self
+            .key(0)
             .get(..self.prefix)
             .ok_or(corrupt(Malformed::Truncated))?;
-        out.push(kind);
-        out.extend_from_slice(&u16_of(self.len())?);
-        out.extend_from_slice(&u16_of(self.prefix)?);
-        out.extend_from_slice(prefix);
-        let table = out.len();
-        let heads = table
-            .checked_add(
-                self.len()
-                    .checked_mul(OFFSET)
-                    .ok_or(corrupt(Malformed::TooLarge))?,
-            )
-            .ok_or(corrupt(Malformed::TooLarge))?;
-        out.resize(
-            heads
-                .checked_add(
-                    self.len()
-                        .checked_mul(KEY_HEAD)
-                        .ok_or(corrupt(Malformed::TooLarge))?,
-                )
-                .ok_or(corrupt(Malformed::TooLarge))?,
-            0,
+        let suffixes = self
+            .key_bytes
+            .checked_sub(n.checked_mul(self.prefix).ok_or_else(too_large)?)
+            .ok_or(corrupt(Malformed::Truncated))?;
+        // The head, the prefix, an offset and a key head an entry; then each entry's suffix
+        // length, rest and suffix.
+        let bodies = HEAD
+            .checked_add(prefix.len())
+            .and_then(|b| b.checked_add(n.checked_mul(SLOT)?))
+            .ok_or_else(too_large)?;
+        let total = n
+            .checked_mul(2)
+            .and_then(|l| l.checked_add(bodies))
+            .and_then(|t| t.checked_add(self.rest_bytes))
+            .and_then(|t| t.checked_add(suffixes))
+            .ok_or_else(too_large)?;
+        let out = out.get_mut(..total).ok_or(Error::InvalidArgument {
+            what: "a page payload longer than the page",
+        })?;
+        let (head, out) = out.split_at_mut_checked(HEAD).ok_or_else(too_large)?;
+        let ([n0, n1], [p0, p1]) = (u16_of(n)?, u16_of(self.prefix)?);
+        head.copy_from_slice(&[kind, n0, n1, p0, p1]);
+        let (pre, out) = out
+            .split_at_mut_checked(prefix.len())
+            .ok_or_else(too_large)?;
+        pre.copy_from_slice(prefix);
+        let (table, out) = out
+            .split_at_mut_checked(n.checked_mul(OFFSET).ok_or_else(too_large)?)
+            .ok_or_else(too_large)?;
+        let (heads, mut body) = out
+            .split_at_mut_checked(n.checked_mul(KEY_HEAD).ok_or_else(too_large)?)
+            .ok_or_else(too_large)?;
+        let mut at = bodies;
+        let (table, heads) = (
+            table.as_chunks_mut::<OFFSET>().0,
+            heads.as_chunks_mut::<KEY_HEAD>().0,
         );
-        for i in 0..self.len() {
-            let at = out.len();
-            let slot = table
-                .checked_add(i.checked_mul(OFFSET).ok_or(corrupt(Malformed::TooLarge))?)
-                .ok_or(corrupt(Malformed::TooLarge))?;
-            out.get_mut(slot..slot.saturating_add(OFFSET))
-                .ok_or(corrupt(Malformed::TooLarge))?
-                .copy_from_slice(&u16_of(at)?);
+        for ((i, slot), head) in table.iter_mut().enumerate().zip(heads.iter_mut()) {
             let suffix = self
                 .key(i)
                 .get(self.prefix..)
                 .ok_or(corrupt(Malformed::Truncated))?;
-            let head_at = heads
-                .checked_add(
-                    i.checked_mul(KEY_HEAD)
-                        .ok_or(corrupt(Malformed::TooLarge))?,
-                )
-                .ok_or(corrupt(Malformed::TooLarge))?;
-            out.get_mut(head_at..head_at.saturating_add(KEY_HEAD))
-                .ok_or(corrupt(Malformed::TooLarge))?
-                .copy_from_slice(&key_head(suffix).to_be_bytes());
-            out.extend_from_slice(&u16_of(suffix.len())?);
-            out.extend_from_slice(self.rest(i));
-            out.extend_from_slice(suffix);
+            let rest = self.rest(i);
+            *slot = u16_of(at)?;
+            *head = key_head(suffix).to_be_bytes();
+            let (len, tail) = std::mem::take(&mut body)
+                .split_at_mut_checked(2)
+                .ok_or_else(too_large)?;
+            len.copy_from_slice(&u16_of(suffix.len())?);
+            let (r, tail) = tail
+                .split_at_mut_checked(rest.len())
+                .ok_or_else(too_large)?;
+            r.copy_from_slice(rest);
+            let (k, tail) = tail
+                .split_at_mut_checked(suffix.len())
+                .ok_or_else(too_large)?;
+            k.copy_from_slice(suffix);
+            body = tail;
+            at = at
+                .checked_add(2)
+                .and_then(|a| a.checked_add(rest.len()))
+                .and_then(|a| a.checked_add(suffix.len()))
+                .ok_or_else(too_large)?;
         }
-        Ok(())
+        Ok(total)
     }
+}
+
+/// An entry for a level's page: its key, the bytes after its suffix length (a head and a tail,
+/// back to back), and the leaf entries under it.
+#[derive(Clone, Copy)]
+struct Entry<'a> {
+    key: &'a [u8],
+    head: &'a [u8],
+    tail: &'a [u8],
+    under: u64,
 }
 
 /// Packs entries given in strictly ascending key order into a branch's pages in `store`.
@@ -530,7 +560,13 @@ impl Builder {
         let [low, high] = u16_of(value.len())?;
         let head = [op.byte(), low, high];
         // Append the entry to its page directly, without staging the value in another buffer.
-        self.insert(store, 0, key, &head, value, 1, Some(common))?;
+        let entry = Entry {
+            key,
+            head: &head,
+            tail: value,
+            under: 1,
+        };
+        self.insert(store, 0, entry, Some(common))?;
         self.count = self.count.saturating_add(1);
         let h32 = hash32.unwrap_or_else(|| filter::hash32(filter::hash(key)));
         // The filter's block and probes use these high bits alone.
@@ -550,19 +586,26 @@ impl Builder {
         &mut self,
         store: &mut Store<F>,
         level: usize,
-        key: &[u8],
-        head: &[u8],
-        tail: &[u8],
-        under: u64,
+        entry: Entry<'_>,
         common: Option<usize>,
     ) -> Result<(), Error> {
         let mut level = level;
         // The entry for the level in hand: the caller's, then each written page's.
         let mut up: Option<Separator> = None;
         for _ in 0..=self.levels.len() {
-            let (key, head, tail, under) = match &up {
-                None => (key, head, tail, under),
-                Some(s) => (s.first.as_slice(), &s.head[..], &[][..], s.total),
+            let Entry {
+                key,
+                head,
+                tail,
+                under,
+            } = match &up {
+                None => entry,
+                Some(s) => Entry {
+                    key: &s.first,
+                    head: &s.head,
+                    tail: &[],
+                    under: s.total,
+                },
             };
             let page = self.levels.get(level).ok_or(corrupt(Malformed::TooLarge))?;
             let mut prefix = match (&up, common) {
@@ -609,7 +652,13 @@ impl Builder {
     fn write<F: BlockFile>(&mut self, store: &mut Store<F>, level: usize) -> Result<(), Error> {
         let s = self.write_page(store, level)?;
         let above = level.checked_add(1).ok_or(corrupt(Malformed::TooLarge))?;
-        let inserted = self.insert(store, above, &s.first, &s.head, &[], s.total, None);
+        let separator = Entry {
+            key: &s.first,
+            head: &s.head,
+            tail: &[],
+            under: s.total,
+        };
+        let inserted = self.insert(store, above, separator, None);
         self.give_first(level, s.first);
         inserted
     }
@@ -629,9 +678,7 @@ impl Builder {
         level: usize,
     ) -> Result<Separator, Error> {
         let kind = if level == 0 { LEAF } else { INDEX };
-        let mut payload = std::mem::take(&mut self.payload);
         let page = self.levels.get(level).ok_or(corrupt(Malformed::TooLarge))?;
-        page.encode(kind, &mut payload)?;
         if self.firsts.len() <= level {
             self.firsts.resize_with(level.saturating_add(1), Vec::new);
         }
@@ -651,7 +698,9 @@ impl Builder {
         }
         self.counts
             .push(u16::try_from(entries).map_err(|_| corrupt(Malformed::TooLarge))?);
-        store.queue_page(&mut self.run, address, &payload)?;
+        // Encoded straight into the page's place in the run's buffer.
+        let page = self.levels.get(level).ok_or(corrupt(Malformed::TooLarge))?;
+        store.queue_page_with(&mut self.run, address, |dst| page.encode_into(kind, dst))?;
         if level == 0 {
             // The leaf's separator: the shortest prefix of its first key above the last leaf's
             // last key, the empty key for the first leaf.
@@ -677,7 +726,6 @@ impl Builder {
                     .extend_from_slice(page.key(page.len().saturating_sub(1)));
             }
         }
-        self.payload = payload;
         if let Some(page) = self.levels.get_mut(level) {
             page.clear();
         }

@@ -76,7 +76,7 @@ mod tests {
     #[test]
     fn a_difference_is_found_at_every_place() {
         for len in 0..33usize {
-            let a: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let a: Vec<u8> = (0..len).map(|i| u8::try_from(i).unwrap()).collect();
             for at in 0..len {
                 let mut b = a.clone();
                 b[at] ^= 0x40;

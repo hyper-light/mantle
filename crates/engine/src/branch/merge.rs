@@ -158,37 +158,35 @@ impl Merge {
     /// The cursor at the smallest key, the newest of those tied; none past the end. Notes the
     /// least of the others too ([`Self::second`]).
     fn pick(&mut self) {
-        let mut best: Option<usize> = None;
-        let mut second: Option<usize> = None;
+        // The least and second least cursors held as they are found, each with its place.
+        let mut best: Option<(usize, &RunCursor)> = None;
+        let mut second: Option<(usize, &RunCursor)> = None;
         for (i, c) in self.cursors.iter().enumerate() {
             if !c.valid() {
                 continue;
             }
-            match best.and_then(|b| self.cursors.get(b)) {
-                None => best = Some(i),
+            match best {
+                None => best = Some((i, c)),
                 // Strictly smaller only: an equal key keeps the earlier, newer cursor.
-                Some(b) if keys::less(c.key(), b.key()) => {
+                Some((_, b)) if keys::less(c.key(), b.key()) => {
                     second = best;
-                    best = Some(i);
+                    best = Some((i, c));
                 }
                 Some(_) => {
-                    if second
-                        .and_then(|s| self.cursors.get(s))
-                        .is_none_or(|s| keys::less(c.key(), s.key()))
-                    {
-                        second = Some(i);
+                    if second.is_none_or(|(_, s)| keys::less(c.key(), s.key())) {
+                        second = Some((i, c));
                     }
                 }
             }
         }
-        self.second = second;
-        self.current = best.filter(|&b| {
-            self.cursors.get(b).is_some_and(|c| {
+        self.second = second.map(|(i, _)| i);
+        self.current = best
+            .filter(|(_, c)| {
                 self.end
                     .as_deref()
                     .is_none_or(|end| keys::less(c.key(), end))
             })
-        });
+            .map(|(i, _)| i);
     }
 
     /// Whether the current key is below every other cursor's: no other cursor holds it.

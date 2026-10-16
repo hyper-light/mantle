@@ -1402,6 +1402,9 @@ pub struct RunCursor {
     /// at again before each read, since the cache may give the slot to another page meanwhile.
     cached: Option<(usize, u64)>,
     key: Vec<u8>,
+    /// Whether `key` begins with the held leaf's prefix, written when its first entry was
+    /// decoded: each entry after writes only its suffix past it.
+    prefixed: bool,
     /// Where the entry's value lies in the page: read in place, not copied out, since the page
     /// stays until the cursor moves to another. A leaf read in the cache is out of reach of
     /// [`Self::value`], so its entry's value is copied, `copied` saying so.
@@ -1570,6 +1573,7 @@ impl RunCursor {
             cached: None,
             // An entry fits a page, so buffers of a page from the pool never grow.
             key: store.take_page(),
+            prefixed: false,
             value: 0..0,
             value_copy: store.take_page(),
             copied: false,
@@ -1636,6 +1640,7 @@ impl RunCursor {
             {
                 // The cache gave the leaf's slot away: read the leaf again.
                 self.loaded = None;
+                self.prefixed = false;
                 return self.land(branch, store, self.page_no, self.index);
             }
             return self.load_in(store);
@@ -1722,6 +1727,7 @@ impl RunCursor {
             {
                 // The cache gave the leaf's slot away: read the leaf again.
                 self.loaded = None;
+                self.prefixed = false;
                 return self
                     .land_async(branch, store, self.page_no, self.index)
                     .await;
@@ -1745,6 +1751,7 @@ impl RunCursor {
                 .is_none_or(|(slot, a)| store.cache_page(slot, a).is_some());
         if !held {
             self.loaded = None;
+            self.prefixed = false;
             self.valid = false;
             self.span_page = None;
             self.cached = None;
@@ -1803,6 +1810,7 @@ impl RunCursor {
                 .is_none_or(|(slot, a)| store.cache_page(slot, a).is_some());
         if !held {
             self.loaded = None;
+            self.prefixed = false;
             self.valid = false;
             self.span_page = None;
             self.cached = None;
@@ -1923,7 +1931,13 @@ impl RunCursor {
         let page = store
             .cache_page(slot, address)
             .ok_or(corrupt(Malformed::Truncated))?;
-        let (op, value) = Self::decode(page, self.table, self.index, &mut self.key)?;
+        let (op, value) = Self::decode(
+            page,
+            self.table,
+            self.index,
+            &mut self.key,
+            &mut self.prefixed,
+        )?;
         self.value_copy.clear();
         self.value_copy
             .extend_from_slice(page.get(value).ok_or(corrupt(Malformed::Truncated))?);
@@ -1941,7 +1955,13 @@ impl RunCursor {
                 .ok_or(corrupt(Malformed::Truncated))?,
             None => self.page.as_slice(),
         };
-        let (op, value) = Self::decode(page, self.table, self.index, &mut self.key)?;
+        let (op, value) = Self::decode(
+            page,
+            self.table,
+            self.index,
+            &mut self.key,
+            &mut self.prefixed,
+        )?;
         self.op = op;
         self.value = value;
         self.copied = false;
@@ -1950,18 +1970,26 @@ impl RunCursor {
     }
 
     /// Entry `index` of leaf `page` (its entry table at `table`): its operation and where its
-    /// value lies, its key written into `key`.
+    /// value lies, its key written into `key`. The leaf's prefix, the same for each of its
+    /// entries, is written once, `prefixed` then set; each entry after replaces only the suffix.
     fn decode(
         page: &[u8],
         table: usize,
         index: usize,
         key: &mut Vec<u8>,
+        prefixed: &mut bool,
     ) -> Result<(Op, std::ops::Range<usize>), Error> {
         let (suffix, rest) = entry_ranges(page, LEAF, table, index)?;
         let tag = page.get(rest.start).copied().unwrap_or(0);
         let op = Op::from_byte(tag).ok_or(corrupt(Malformed::UnknownTag(tag)))?;
-        key.clear();
-        key.extend_from_slice(page.get(HEAD..table).ok_or(corrupt(Malformed::Truncated))?);
+        let prefix = page.get(HEAD..table).ok_or(corrupt(Malformed::Truncated))?;
+        if *prefixed {
+            key.truncate(prefix.len());
+        } else {
+            key.clear();
+            key.extend_from_slice(prefix);
+            *prefixed = true;
+        }
         key.extend_from_slice(page.get(suffix).ok_or(corrupt(Malformed::Truncated))?);
         // The value follows the operation and its 2-byte length.
         let from = rest

@@ -442,12 +442,14 @@ impl Compaction {
         budget: u64,
     ) -> Result<u64, Error>
     where
-        I: IntoIterator<Item = &'a Branch> + Clone,
+        I: IntoIterator<Item = &'a Branch>,
     {
-        // The inputs are the ones the compaction was opened on, in its order.
-        let mut n = 0usize;
-        for b in inputs.clone() {
-            if self.roots.get(n) != Some(&b.root) {
+        // The inputs are the ones the compaction was opened on, in its order: walked once here
+        // into a list of them, which the merge then indexes for each entry rather than walking
+        // the caller's iterator (in-flight bundles flattened) to its cursor's branch.
+        let mut list: Vec<&'a Branch> = Vec::with_capacity(self.roots.len());
+        for b in inputs {
+            if self.roots.get(list.len()) != Some(&b.root) {
                 if self.merge.opening {
                     self.merge.cancel_opening(store);
                 }
@@ -455,9 +457,10 @@ impl Compaction {
                     what: "a compaction stepped over inputs it was not opened on",
                 });
             }
-            n = n.saturating_add(1);
+            list.push(b);
         }
-        if n != self.roots.len() {
+        let inputs = list.iter().copied();
+        if list.len() != self.roots.len() {
             if self.merge.opening {
                 self.merge.cancel_opening(store);
             }

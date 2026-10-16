@@ -150,3 +150,18 @@ fn a_split_settle_applies_once_every_job_is_back() {
         assert_eq!(&value, v);
     }
 }
+
+/// Do: a trunk's settles' planned and written entries set as no settle, then 200 planned and
+/// 140 written. Expect: a settle planned on 100 entries writes 100 with none applied yet, and 70
+/// once the settles so far kept 70% of their counts; never more than its count.
+#[test]
+fn a_splits_output_is_its_count_times_what_settles_kept() {
+    let mut trunk = Trunk::new(TRUNK).unwrap();
+    assert_eq!(trunk.settle_output(100), 100);
+    trunk.settled = (200, 140);
+    assert_eq!(trunk.settle_output(100), 70);
+    trunk.settled = (u64::MAX, u64::MAX);
+    assert_eq!(trunk.settle_output(100), 100);
+    trunk.settled = (10, 20);
+    assert_eq!(trunk.settle_output(100), 100);
+}

@@ -66,6 +66,8 @@ enum What {
         covered: usize,
         job: usize,
         jobs: usize,
+        /// The entries it was planned on, counted over every input.
+        count: u64,
     },
 }
 
@@ -846,6 +848,20 @@ impl Trunk {
         }
     }
 
+    /// The entries a settle planned on `count` writes, as the settles so far have: their
+    /// output's share of what they were planned on, learned; `count` before any has applied.
+    pub(super) fn settle_output(&self, count: u64) -> u64 {
+        let (planned, wrote) = self.settled;
+        if planned == 0 {
+            return count;
+        }
+        let kept = u128::from(count)
+            .saturating_mul(u128::from(wrote))
+            .checked_div(u128::from(planned))
+            .unwrap_or(u128::from(count));
+        u64::try_from(kept).unwrap_or(count).min(count)
+    }
+
     /// The leaves leaf `n`'s settle would make, as its bundle and live in-flight bundles stand
     /// ([`Self::leaf_parts`]).
     fn settle_parts(&self, n: usize) -> Result<u64, Error> {
@@ -909,10 +925,16 @@ impl Trunk {
         let per = crate::util::div_ceil(count, parts).unwrap_or(count).max(1);
         // On workers, a settle that splits merges its parts in parallel, a job a part over the
         // key ranges its cuts bound, each job's range one leaf: a split held its parent's pivot
-        // for the whole merge on one worker, 2.9-4.4 s beside 18 busy loops at 100M while every
-        // packing waited for the root's room (research/58 §4).
-        let cuts = if self.pool.is_some() && parts > 1 {
-            settle_cuts(inputs.clone(), parts, &from, end.as_deref())?
+        // for the whole merge on one worker, 3.5-7M entries for 1.3-5.9 s beside busy loops,
+        // while every packing waited for the root's room (research/58 §5).
+        // The jobs are as many as the leaves its output makes, one each: its count, an upper
+        // bound counting overwrites and tombstones the merge drops, made the output earlier
+        // settles kept of theirs. Planned on the count alone, a split at 100M made up to twice
+        // the leaves the one job cuts by entries as it merges, smaller ones, which settled again
+        // and wrote 2-3% more (research/58 §5).
+        let split = self.leaf_parts(self.settle_output(count));
+        let cuts = if self.pool.is_some() && parts > 1 && split > 1 {
+            settle_cuts(inputs.clone(), split, &from, end.as_deref())?
         } else {
             Vec::new()
         };
@@ -980,6 +1002,7 @@ impl Trunk {
                     covered,
                     job,
                     jobs,
+                    count,
                 },
                 run,
                 units,
@@ -1274,8 +1297,18 @@ impl Trunk {
                 cause,
                 start,
                 covered,
+                count,
                 ..
             } => {
+                // What its output kept of what it was planned on, learned for the next split.
+                let wrote = parts
+                    .iter()
+                    .map(|(_, b)| b.count)
+                    .fold(0u64, u64::saturating_add);
+                self.settled = (
+                    self.settled.0.saturating_add(count),
+                    self.settled.1.saturating_add(wrote),
+                );
                 let took = self
                     .node(n)?
                     .inflight

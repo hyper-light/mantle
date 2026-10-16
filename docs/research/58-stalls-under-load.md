@@ -143,6 +143,28 @@ counts are in memory, so the cuts read nothing. The jobs run on the pool's worke
 the settle applies when all are back, as the node's one change. The writes are the same
 entries; the hold divides by the parts, about 8 for a leaf past `fanout` memtables.
 
+**Measured at 100M beside 18 busy loops** (`runs/n100000000-r2331..r2334`, the same four builds,
+release binaries, 4 rounds):
+
+| arm | fills | gets | seeks | fill max, median (worst) | stalls, median (worst) | entries written |
+|---|---|---|---|---|---|---|
+| candidate | 1.29M | 620K | 160K | 1,073 ms (1,887) | 2 (4) | 298.6M |
+| root leaf | 1.14M | 494K | 197K | 755 ms (3,156) | 2 (4) | 280.0M |
+| split jobs | 1.19M | 635K | 158K | 280 ms (637) | 2 (2) | 286.5M |
+| split jobs, one in flight | 1.21M | 569K | 181K | 89 ms (144) | 1 (3) | 289.7M |
+
+**The split jobs made too many leaves.** Their splits wrote 2-3.5% more than the root leaf's:
+- splits: 90-181 a run against 69-80;
+- writes of size-caused settles: up to 66.2M against 37.3-41.1M.
+
+A settle plans its parts on its count: the entries over every input, an upper bound that counts
+the overwrites and tombstones its merge drops (at 100M a third of the puts overwrite). The one
+job cuts its output by entries as it merges, so its leaves come out whole and fewer. The split
+jobs made one leaf a planned part, smaller ones, which settled and split again. The jobs are
+now as many as the leaves the output is expected to make. The trunk learns what share of their
+count its settles' outputs keep (`Trunk::settle_output`): the entries every applied settle wrote,
+over the entries it was planned on.
+
 ## 6. Open
 
 - **Step one for the slow stages.**

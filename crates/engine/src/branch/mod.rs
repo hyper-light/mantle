@@ -295,7 +295,6 @@ pub struct Builder {
     /// The extent pages are being written into, and the next page in it.
     extent: Option<(u64, u32)>,
     extents: Vec<u64>,
-    last: Vec<u8>,
     /// Each level's written page's first key, for its entry in the level above: a buffer a
     /// level, since writing a page may write the level above's in turn.
     firsts: Vec<Vec<u8>>,
@@ -382,7 +381,6 @@ impl Builder {
             levels,
             extent: None,
             extents: lists.extents,
-            last: lists.last,
             firsts: lists.firsts,
             spare_pages,
             counts: lists.counts,
@@ -468,21 +466,29 @@ impl Builder {
                 what: "an entry added to a sealed branch",
             });
         }
-        // The bytes the key shares with the one before it: where the order check looks, and
-        // what the range filter cuts keys by.
-        let common = if self.count > 0 {
-            let common = shared(&self.last, key);
-            let greater = match (self.last.get(common), key.get(common)) {
-                (None, Some(_)) => true,
-                (Some(a), Some(b)) => b > a,
-                _ => false,
-            };
-            if !greater {
-                return Err(corrupt(Malformed::OutOfOrder));
+        // The key added before this one, read where it already is: the leaf being filled, or
+        // the last leaf written when this entry's turn came after it filled.
+        let prev = match self.levels.first() {
+            _ if self.count == 0 => None,
+            Some(page) if page.len() > 0 => Some(page.key(page.len().saturating_sub(1))),
+            _ => Some(self.prev_last.as_slice()),
+        };
+        // The bytes the key shares with the one before it: where the order check looks, what
+        // the range filter cuts keys by, and with the page's prefix, the page's prefix after.
+        let common = match prev {
+            Some(prev) => {
+                let common = shared(prev, key);
+                let greater = match (prev.get(common), key.get(common)) {
+                    (None, Some(_)) => true,
+                    (Some(a), Some(b)) => b > a,
+                    _ => false,
+                };
+                if !greater {
+                    return Err(corrupt(Malformed::OutOfOrder));
+                }
+                common
             }
-            common
-        } else {
-            0
+            None => 0,
         };
         if !self.fits(key.len(), value.len()) {
             return Err(Error::LimitExceeded {
@@ -490,20 +496,13 @@ impl Builder {
                 limit: u64::try_from(self.capacity).unwrap_or(u64::MAX),
             });
         }
+        // The range filter takes the key before this one, its neighbours now known, before the
+        // entry lands and may write the leaf that holds it.
+        self.keys.push(prev, common)?;
         let [low, high] = u16_of(value.len())?;
         let head = [op.byte(), low, high];
         // Append the entry to its page directly, without staging the value in another buffer.
-        self.insert(store, 0, key, &head, value, 1)?;
-        self.keys.push(
-            if self.count > 0 {
-                Some(self.last.as_slice())
-            } else {
-                None
-            },
-            common,
-        )?;
-        self.last.clear();
-        self.last.extend_from_slice(key);
+        self.insert(store, 0, key, &head, value, 1, Some(common))?;
         self.count = self.count.saturating_add(1);
         let h32 = hash32.unwrap_or_else(|| filter::hash32(filter::hash(key)));
         // The filter's block and probes use these high bits alone.
@@ -527,6 +526,7 @@ impl Builder {
         head: &[u8],
         tail: &[u8],
         under: u64,
+        common: Option<usize>,
     ) -> Result<(), Error> {
         let mut level = level;
         // The entry for the level in hand: the caller's, then each written page's.
@@ -537,10 +537,13 @@ impl Builder {
                 Some(s) => (s.first.as_slice(), &s.head[..], &[][..], s.total),
             };
             let page = self.levels.get(level).ok_or(corrupt(Malformed::TooLarge))?;
-            let mut prefix = if page.len() == 0 {
-                key.len()
-            } else {
-                page.prefix.min(shared(page.key(0), key))
+            let mut prefix = match (&up, common) {
+                _ if page.len() == 0 => key.len(),
+                // The caller's entry follows the page's last key, its shared bytes with that key
+                // `common`. Keys in order share with the page's first what each pair between
+                // them shares at least: the page's prefix and that, the lesser.
+                (None, Some(common)) => page.prefix.min(common),
+                _ => page.prefix.min(shared(page.key(0), key)),
             };
             let rest = head
                 .len()
@@ -578,7 +581,7 @@ impl Builder {
     fn write<F: BlockFile>(&mut self, store: &mut Store<F>, level: usize) -> Result<(), Error> {
         let s = self.write_page(store, level)?;
         let above = level.checked_add(1).ok_or(corrupt(Malformed::TooLarge))?;
-        let inserted = self.insert(store, above, &s.first, &s.head, &[], s.total);
+        let inserted = self.insert(store, above, &s.first, &s.head, &[], s.total, None);
         self.give_first(level, s.first);
         inserted
     }
@@ -826,8 +829,9 @@ impl Builder {
         self.index.clear();
         trie.encode(&mut self.index);
         self.index_trie = Some(trie);
+        // The seal wrote the last leaf first: its last key is the branch's.
         let range = self.keys.finish(if self.count > 0 {
-            Some(self.last.as_slice())
+            Some(self.prev_last.as_slice())
         } else {
             None
         })?;
@@ -880,7 +884,6 @@ impl Builder {
             levels,
             pages,
             firsts: self.firsts,
-            last: self.last,
             prev_last: self.prev_last,
             payload: self.payload,
         });

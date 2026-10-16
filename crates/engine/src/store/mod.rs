@@ -451,12 +451,10 @@ pub struct Lists {
     pub range: Vec<u8>,
     pub index: Vec<u8>,
     /// The builder's levels (empty between builders) and its spare pages; each level's first-key
-    /// buffer; the last key and the last leaf's last key; and the payload a page
-    /// is encoded into.
+    /// buffer; the last leaf's last key; and the payload a page is encoded into.
     pub(crate) levels: Vec<crate::branch::Page>,
     pub(crate) pages: Vec<crate::branch::Page>,
     pub(crate) firsts: Vec<Vec<u8>>,
-    pub(crate) last: Vec<u8>,
     pub(crate) prev_last: Vec<u8>,
     pub(crate) payload: Vec<u8>,
 }
@@ -471,7 +469,6 @@ impl Lists {
             p.clear();
         }
         self.levels.clear();
-        self.last.clear();
         self.prev_last.clear();
         self.payload.clear();
     }

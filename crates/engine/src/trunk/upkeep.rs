@@ -1272,6 +1272,9 @@ impl Trunk {
                     return Ok(());
                 };
                 if !pool.can_take(store, admit)? {
+                    // Every seat held: only a worker's message frees one, so the shard waits for
+                    // it rather than pass again.
+                    pool.want_message();
                     return Ok(());
                 }
                 let mut landed = true;
@@ -1367,6 +1370,7 @@ impl Trunk {
                         *state = State::Ready(Box::new(task));
                         store.grant_back(&job.grant)?;
                         grant.clear();
+                        pool.want_message();
                         return Ok(());
                     }
                 }
@@ -1552,3 +1556,7 @@ fn read_pages<'a>(
         .map(|b| b.pages_between(from, end))
         .fold(0usize, usize::saturating_add)
 }
+
+#[cfg(test)]
+#[path = "seat_wait.rs"]
+mod seat_wait;

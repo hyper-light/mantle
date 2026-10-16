@@ -1,0 +1,100 @@
+# kiln's translation of .github/workflows/ci.yml ("gates"): the same jobs and the same commands.
+# Only the Linux x86_64 legs run here. kiln has no macOS, Windows or ARM agents, so the
+# linux-aarch64, macos-aarch64, macos-x86_64, windows-x86_64 and windows-aarch64 legs of `gates`
+# and the linux-aarch64-1cpu leg of `constrained` stay on GitHub.
+#
+# Work lands on `dev` (CLAUDE.md, "Gates"), so pushes to dev run the gates as well as pushes to
+# main. GitHub's jobs set no timeout (its default is six hours), so the bounds below are kiln's
+# own. A pod sees all of the host's CPUs, whatever it requests. So the pod jobs hold cargo's build
+# jobs, and the gates hold libtest's test threads, to the pod's CPU request. The pod's memory
+# request is also its limit.
+name: ci
+on:
+  push: { branches: [main, dev] }
+  pull_request: {}
+concurrency: { group: "ci-${{ branch }}", cancel-in-progress: true }
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+jobs:
+  dependencies:
+    # cargo-deny installs into CARGO_HOME, which kiln keeps between runs, so later runs skip the
+    # build unless a newer cargo-deny is out.
+    runs-on: [k8s]
+    toolchain: rust
+    resources: { cpu: "2", memory: 4Gi }
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: Audit dependencies
+        run: cargo deny check advisories bans licenses sources
+
+  gates:
+    name: linux-x86_64
+    runs-on: [k8s]
+    toolchain: rust
+    resources: { cpu: "6", memory: 12Gi }
+    timeout-minutes: 180
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CARGO_BUILD_JOBS: "6"
+      RUST_TEST_THREADS: "6"
+    steps:
+      - name: Install pinned Rust
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
+          rustup target add --toolchain 1.98.1 x86_64-unknown-linux-gnu
+          command -v python3 >/dev/null || { apt-get update && apt-get install -y --no-install-recommends python3; }
+      - name: Source contracts
+        run: python3 scripts/check-contracts.py
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Lints
+        run: cargo clippy --workspace --all-targets --all-features --locked --target x86_64-unknown-linux-gnu -- -D warnings
+      - name: Production panic policy
+        run: bash scripts/check-production.sh --target x86_64-unknown-linux-gnu
+      - name: Tests
+        run: cargo test --workspace --locked --target x86_64-unknown-linux-gnu
+      - name: Vendored crates' suites
+        run: cargo test --manifest-path vendor/Cargo.toml --workspace --locked --target x86_64-unknown-linux-gnu
+      - name: Release build
+        run: cargo build --release --workspace --locked --target x86_64-unknown-linux-gnu
+
+  # The same suites on a small, busy host as on a large, idle one: built with many CPUs, then run
+  # on the CPUs named alone, beside busy loops they did not start.
+  # std::thread::available_parallelism follows the affinity mask (sched_getaffinity(2)), so the
+  # engine's worker pools and the test harness size themselves to that host
+  # (scripts/linux-test.sh runs the same locally: CPUS, HOGS). It runs on the bare-metal host,
+  # where taskset pins a real machine's CPUs. TMPDIR is the job's directory on that host's disk.
+  constrained:
+    name: linux-x86_64-2cpu-busy
+    runs-on: [baremetal]
+    timeout-minutes: 180
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      # Half of the 32-core host, which other jobs share. The build is not what is measured.
+      CARGO_BUILD_JOBS: "16"
+    steps:
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - name: Build the suites
+        run: |
+          cargo test --workspace --locked --no-run
+          cargo test --manifest-path vendor/Cargo.toml --workspace --locked --no-run
+      - name: Suites on 0-1, beside 2 busy loops
+        run: |
+          # The busy loops end with this step, however it ends.
+          trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
+          for _ in $(seq 2); do taskset -c 0-1 sh -c 'while :; do :; done' & done
+          taskset -c 0-1 cargo test --workspace --locked
+          taskset -c 0-1 cargo test --manifest-path vendor/Cargo.toml --workspace --locked

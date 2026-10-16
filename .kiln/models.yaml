@@ -1,0 +1,31 @@
+# kiln's translation of .github/workflows/models.yml. The TLA+ models' verdict depends on the
+# models and on the script that pins the checker, so the check runs when they change rather than
+# on every push. This file stands where the workflow file stood in the path list.
+# kiln filters pushes by path. Pull requests run it every time.
+name: models
+on:
+  push:
+    branches: [main, dev]
+    paths: ["docs/models/**", "scripts/check-model.sh", ".kiln/models.yaml"]
+  pull_request:
+    paths: ["docs/models/**", "scripts/check-model.sh", ".kiln/models.yaml"]
+concurrency: { group: "models-${{ branch }}", cancel-in-progress: true }
+jobs:
+  models:
+    runs-on: [k8s]
+    image: eclipse-temurin:21-jdk
+    resources: { cpu: "4", memory: 8Gi }
+    # GitHub set no timeout (its default is six hours). The models are small, so this is kiln's own
+    # bound.
+    timeout-minutes: 60
+    env:
+      # The script runs TLC with `-workers auto`. A pod's JVM sees all of the host's CPUs, so this
+      # holds it to the pod's request: four, as GitHub's runner had.
+      JAVA_TOOL_OPTIONS: "-XX:ActiveProcessorCount=4"
+    steps:
+      - name: curl (the checker's download)
+        run: command -v curl >/dev/null || { apt-get update && apt-get install -y --no-install-recommends curl ca-certificates; }
+      - name: TLA+ models
+        run: bash scripts/check-model.sh
+      - name: The models' controls fail as they must
+        run: bash scripts/check-model.sh controls

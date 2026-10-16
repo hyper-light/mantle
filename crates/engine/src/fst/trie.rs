@@ -237,11 +237,7 @@ impl TrieBuilder {
         let lcp = if self.keys == 0 {
             0
         } else {
-            self.prev
-                .iter()
-                .zip(key)
-                .take_while(|(a, b)| a == b)
-                .count()
+            crate::util::keys::common_prefix(&self.prev, key)
         };
         self.push_key(key, lcp, value)?;
         self.prev.clear();

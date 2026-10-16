@@ -134,7 +134,7 @@ fn corrupt(why: Malformed) -> Error {
 }
 
 fn shared(a: &[u8], b: &[u8]) -> usize {
-    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+    crate::util::keys::common_prefix(a, b)
 }
 
 fn u16_of(n: usize) -> Result<[u8; 2], Error> {
@@ -629,12 +629,7 @@ impl Builder {
             // key below it in the first leaf).
             let mut cut = first.len();
             if !self.separators.is_empty() {
-                let lcp = self
-                    .prev_last
-                    .iter()
-                    .zip(first.iter())
-                    .take_while(|(a, b)| a == b)
-                    .count();
+                let lcp = shared(&self.prev_last, &first);
                 cut = lcp.saturating_add(1).min(first.len());
             }
             let page_no = self

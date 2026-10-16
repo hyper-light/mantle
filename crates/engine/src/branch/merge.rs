@@ -6,6 +6,7 @@ use super::filter::Keys;
 use super::{Branch, Builder, Initial, Op, RunCursor};
 use crate::error::Error;
 use crate::store::Store;
+use crate::util::keys;
 use hyper_block::block::BlockFile;
 
 /// A merge over cursors given newest first, from a start key up to an end key (exclusive, none
@@ -166,14 +167,14 @@ impl Merge {
             match best.and_then(|b| self.cursors.get(b)) {
                 None => best = Some(i),
                 // Strictly smaller only: an equal key keeps the earlier, newer cursor.
-                Some(b) if c.key() < b.key() => {
+                Some(b) if keys::less(c.key(), b.key()) => {
                     second = best;
                     best = Some(i);
                 }
                 Some(_) => {
                     if second
                         .and_then(|s| self.cursors.get(s))
-                        .is_none_or(|s| c.key() < s.key())
+                        .is_none_or(|s| keys::less(c.key(), s.key()))
                     {
                         second = Some(i);
                     }
@@ -182,9 +183,11 @@ impl Merge {
         }
         self.second = second;
         self.current = best.filter(|&b| {
-            self.cursors
-                .get(b)
-                .is_some_and(|c| self.end.as_deref().is_none_or(|end| c.key() < end))
+            self.cursors.get(b).is_some_and(|c| {
+                self.end
+                    .as_deref()
+                    .is_none_or(|end| keys::less(c.key(), end))
+            })
         });
     }
 
@@ -192,7 +195,7 @@ impl Merge {
     fn alone(&self, at: &RunCursor) -> bool {
         self.second
             .and_then(|s| self.cursors.get(s))
-            .is_none_or(|s| !s.valid() || at.key() < s.key())
+            .is_none_or(|s| !s.valid() || keys::less(at.key(), s.key()))
     }
 
     /// Whether moving past the current key reads no page that has not landed: every cursor
@@ -223,7 +226,7 @@ impl Merge {
         self.past.clear();
         self.past.extend_from_slice(at.key());
         for (c, b) in self.cursors.iter_mut().zip(branches) {
-            if c.valid() && c.key() == self.past.as_slice() && !c.next_ready(b, store)? {
+            if c.valid() && keys::equal(c.key(), &self.past) && !c.next_ready(b, store)? {
                 return Ok(false);
             }
         }
@@ -268,7 +271,12 @@ impl Merge {
             })?;
             c.next(b, store)?;
             let stays = self.cursors.get(i).is_some_and(|c| {
-                c.valid() && self.alone(c) && self.end.as_deref().is_none_or(|end| c.key() < end)
+                c.valid()
+                    && self.alone(c)
+                    && self
+                        .end
+                        .as_deref()
+                        .is_none_or(|end| keys::less(c.key(), end))
             });
             if !stays {
                 self.pick();
@@ -279,7 +287,7 @@ impl Merge {
         self.past.extend_from_slice(at.key());
         let mut moved = 0u64;
         for (c, b) in self.cursors.iter_mut().zip(branches) {
-            if c.valid() && c.key() == self.past.as_slice() {
+            if c.valid() && keys::equal(c.key(), &self.past) {
                 c.next(b, store)?;
                 moved = moved.saturating_add(1);
             }

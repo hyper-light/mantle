@@ -433,7 +433,7 @@ impl BTreeMem {
         match (lo, hi) {
             (Some(a), Some(b)) => {
                 let (a, b) = (self.key(a), self.key(b));
-                a.iter().zip(b).take_while(|(x, y)| x == y).count()
+                crate::util::keys::common_prefix(a, b)
             }
             _ => 0,
         }

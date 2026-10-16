@@ -418,8 +418,8 @@ impl Trunk {
             return;
         }
         let fanout = self.config.fanout;
-        let leaf_entries = self.leaf_limit();
         for at in 0..self.nodes.len() {
+            let limit = self.settle_limit(at);
             let due = self.nodes.get(at).is_some_and(|n| {
                 !n.inflight.is_empty()
                     || n.wants.is_some()
@@ -430,7 +430,7 @@ impl Trunk {
                             .first()
                             .map(|p| entries(p.bundle.branches()))
                             .unwrap_or(0)
-                            > leaf_entries)
+                            > limit)
             });
             if due {
                 self.queue(at);
@@ -520,7 +520,7 @@ impl Trunk {
             was_paid,
             paid,
             waits,
-            due: paid || after > self.config.fanout || count > self.leaf_limit(),
+            due: paid || after > self.config.fanout || count > self.settle_limit(n),
         })
     }
 
@@ -768,7 +768,7 @@ impl Trunk {
                 return Ok(());
             }
             ChangeKind::Settle {
-                parts: self.leaf_parts(settle.count),
+                parts: self.leaf_parts(n, settle.count),
             }
         } else if node.pivots.len() > fanout {
             ChangeKind::Split
@@ -844,7 +844,7 @@ impl Trunk {
     /// The leaves leaf `n`'s settle would make, as its bundle and live in-flight bundles stand
     /// ([`Self::leaf_parts`]).
     fn settle_parts(&self, n: usize) -> Result<u64, Error> {
-        Ok(self.leaf_parts(self.leaf_settle(n)?.count))
+        Ok(self.leaf_parts(n, self.leaf_settle(n)?.count))
     }
 
     /// The entries a leaf holds before it splits: `fanout` memtables' (SplinterDB's
@@ -854,18 +854,36 @@ impl Trunk {
         self.config.leaf_entries.saturating_mul(fanout)
     }
 
-    /// The leaves a settle of `count` entries makes: one within [`Self::leaf_limit`], else
-    /// `round(count / leaf_entries)` (SplinterDB's `leaf_split_target_num_leaves`).
-    fn leaf_parts(&self, count: u64) -> u64 {
-        if count <= self.leaf_limit() {
+    /// The entries leaf `n` holds before it splits: [`Self::leaf_limit`], or one memtable's
+    /// (`leaf_entries`) while the root is a leaf. The root's settle is the one every packing
+    /// waits on: until it applies they wait as pending branches. At fanout memtables' the root
+    /// stayed a leaf for eight packings, then merged 4.1M entries at 10M while the root's room
+    /// ran out, 3.3 s beside 18 busy loops (research/58 §4). At one memtable's it is an index
+    /// node within the first packings, and each packing after takes the root split
+    /// (research/57 §7).
+    fn settle_limit(&self, n: usize) -> u64 {
+        if n == self.root {
+            self.config.leaf_entries
+        } else {
+            self.leaf_limit()
+        }
+    }
+
+    /// The leaves a settle of `count` entries in leaf `n` makes: one within
+    /// [`Self::settle_limit`], else `round(count / leaf_entries)` (SplinterDB's
+    /// `leaf_split_target_num_leaves`), and at least two for the root, which a settle past its
+    /// limit makes an index node.
+    fn leaf_parts(&self, n: usize, count: u64) -> u64 {
+        if count <= self.settle_limit(n) {
             return 1;
         }
         let target = self.config.leaf_entries.max(1);
-        count
+        let parts = count
             .saturating_add(target / 2)
             .checked_div(target)
             .unwrap_or(1)
-            .max(1)
+            .max(1);
+        if n == self.root { parts.max(2) } else { parts }
     }
 
     /// Plans leaf `n`'s whole compaction, tombstones dropped, into `ceil(entries /
@@ -900,7 +918,7 @@ impl Trunk {
             .collect();
         // Its entries counted over every input, an upper bound on its keys.
         let count = settle.count;
-        let parts = self.leaf_parts(count);
+        let parts = self.leaf_parts(n, count);
         let per = crate::util::div_ceil(count, parts).unwrap_or(count).max(1);
         let run = if self.pool.is_some() {
             let pages = read_pages(inputs.clone(), &from, end.as_deref());
@@ -977,7 +995,8 @@ impl Trunk {
                 let Running::Inline(c) = &mut task.run else {
                     continue;
                 };
-                let node = self.nodes.get(task.node).ok_or(corrupt())?;
+                let n = task.node;
+                let node = self.nodes.get(n).ok_or(corrupt())?;
                 // A task about to write takes its output's room first, as a worker's job takes
                 // its grant (`dispatch_tasks`): the inputs' extents and one more a part, the
                 // file grown in place where the shard may, else asked of the shard's growth and
@@ -1007,7 +1026,7 @@ impl Trunk {
                         .fold(0u64, u64::saturating_add);
                     let parts = match &task.what {
                         What::Compact { .. } => 1,
-                        What::Settle { .. } => self.leaf_parts(entries_of_refs(&inputs)),
+                        What::Settle { .. } => self.leaf_parts(n, entries_of_refs(&inputs)),
                     };
                     let asked = extents.saturating_add(parts).saturating_add(1);
                     if store.capacity() < asked {

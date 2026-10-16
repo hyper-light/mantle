@@ -94,14 +94,51 @@ and `r1951..r1954`), stalled on two things:
 
 **Step one: is the work needed?** Yes. The first settle is what builds the trunk's first level.
 
-**Step two: is this much needed at once?** Open. The root leaf is the one node whose settle every
-packing waits on. Settled at one memtable's entries instead of fanout of them, the root would be an
-index node within the first few packings, and every packing after would take the root split.
+**Step two: is this much needed at once?** No. The root leaf is the one node whose settle every
+packing waits on. Settled at one memtable's entries instead of fanout of them (x_rl1, rootleaf-wr
+4a01df7, md5 af86913f), the root is an index node from the second packing, its first settle 1.07M
+entries instead of 4.1M, and every packing after takes the root split.
 
-That is to be measured against the candidate:
-- at 0, 12 and 18 busy loops;
-- at 10M and 100M;
-- with its writes (entries written), seeks and gets beside its stalls.
+Measured at 10M against the candidate, release binaries, run7.sh's balanced order, RocksDB and
+SplinterDB beside them, 4 rounds a condition (`runs/n10000000-r2201..r2204`: 18 busy loops;
+`r2211..r2214`: none; `r2221..r2224`: 12):
+
+| arm, condition | fills | gets | seeks | fill max, median (worst) | stalls, median (worst) | entries written |
+|---|---|---|---|---|---|---|
+| candidate, none | 4.01M | 2.60M | 551K | 6.4 ms (30.8) | 1 (1) | 18.50M |
+| root leaf, none | 4.23M | 2.46M | 561K | 2.7 ms (7.2) | 0 (0) | 16.72M |
+| candidate, 12 loops | 2.12M | 1.90M | 385K | 1,475 ms (3,164) | 2 (3) | 17.51M |
+| root leaf, 12 loops | 2.40M | 1.95M | 428K | 1,024 ms (1,204) | 2 (2) | 18.37M |
+| candidate, 18 loops | 1.83M | 1.23M | 328K | 215 ms (541) | 1 (2) | 18.95M |
+| root leaf, 18 loops | 1.67M | 924K | 330K | 97 ms (355) | 1 (1) | 17.46M |
+| RocksDB 32 GiB, none / 12 / 18 | 726K / 459K / 279K | 213K / 143K / 87K | 102K / 67K / 48K | 3.4 / 27.1 / 32.4 ms | — | — |
+| SplinterDB 32 GiB, none / 12 / 18 | 1.02M / 572K / 586K | 807K / 532K / 364K | 192K / 122K / 112K | 92.4 / 160.7 / 257.8 ms | — | — |
+
+The gets differences above follow the order, not the build: the root leaf's two low-gets rounds
+with no loops (r2212, r2214) each ran right after RocksDB's 32 GiB run, a carryover the Williams
+order balances within a round but not across a round's boundary. With no foreign engine between
+them (`r2261..r2266`, 6 rounds alternating, no loops), the root leaf's gets were 2.43M against
+2.29M, seeks 562K against 519K, fills 3.87M against 3.90M, writes 16.72M against 18.23M, and
+the most memory either held the same (4.21-4.30 GB against 4.26-4.32 GB).
+
+**Reading.**
+- With no loops, the root leaf removes the stall every candidate run had, and writes 8-10% less.
+- Beside 18 loops, the worst fills halve.
+- Beside 12 loops, both builds still stall for about a second (two stalls a run). The release
+  binaries count stalls but do not time them. They are traced next, at 10M beside 12 loops and
+  at 100M beside 18.
+
+**What the root leaf leaves at 100M.** In the cut's trace at 100M (`diag-runs/n100000000-r1932`,
+host load only), 1,312 trunk jobs had a median of 23 ms and a p90 of 127 ms. Ten were past 2M
+entries:
+- the root's compaction of the packings that had waited out the first settle, 5.1M, 2.3 s in;
+- nine splits of first-level leaves, 3.9-4.5M entries each, 0.7-1.2 s, 14-19 s in, three of them
+  at once.
+
+A leaf's split holds its parent's pivot for as long as it runs: the pivot takes no parts and
+plans no compaction, so the leaf's older data stays below everything newer in the parent. Each
+packing meanwhile enters the root's in-flight list, and the root's room runs out once fanout of
+them wait. The root leaf moves only the first of these settles.
 
 ## 5. Open
 

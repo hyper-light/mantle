@@ -35,8 +35,10 @@ const TRUNK: TrunkConfig = TrunkConfig {
 };
 /// A value of this many bytes: a page holds a handful, so the batch spans tens of pages.
 const VALUE: usize = 600;
-/// The batch's entries: past the root leaf's `leaf_entries`, so it settles into two leaves.
-const ENTRIES: u64 = 100;
+/// The batch's entries: past what the root leaf holds before it settles, fanout of
+/// `leaf_entries` (`Trunk::settle_limit`), so it settles at once into `ENTRIES / leaf_entries`
+/// leaves.
+const ENTRIES: u64 = 256;
 /// A step's budget in work units, a few pages' merging.
 const STEP: u64 = 256;
 
@@ -71,13 +73,14 @@ fn held_and_other_delivered(seen: &Seen) -> bool {
         .any(|e| matches!(e, Event::Delivered { seat } if *seat != held))
 }
 
-/// Do: a trunk on two relayed seats over the store's file; one batch past the root leaf's
-/// entries, so the root settles into two leaves as two jobs; the first job's result held on its
-/// seat. One idle step, which hands both out and waits for one result: the other's.
-/// Expect: the settle is not applied: the root is still the leaf it was, no settle counted, one
-/// job done and one out. Let the held result go and run the maintenance to its end: the settle
-/// applies once, as two jobs, the root an index node over two leaves, and every key reads what
-/// was written.
+/// Do: a trunk on two relayed seats over the store's file; one batch past what the root leaf
+/// holds, so the root settles into several leaves as several jobs; the first job's result held
+/// on its seat. One step that waits for nothing, which plans the settle; then one idle step,
+/// which hands jobs out on both seats and waits for one result: another's.
+/// Expect: the settle is planned as more than one job before anything waits. It is not applied:
+/// the root is still the leaf it was, no settle counted, a job done and one out, not every one
+/// done. Let the held result go and run the maintenance to its end: the settle applies once, as
+/// its jobs, the root an index node and a leaf a job, and every key reads what was written.
 #[test]
 fn a_split_settle_applies_once_every_job_is_back() {
     let dir = tempfile::tempdir().unwrap();
@@ -106,43 +109,61 @@ fn a_split_settle_applies_once_every_job_is_back() {
     }
     let branch = b.finish(&mut store).unwrap();
     relays.hold_done(&[Kind::Compact]);
-    // Pending, taken into the root by the next step: no step here waits on the workers.
+    // Pending, taken into the root by the next step.
     trunk.add(branch);
     let root = trunk.root;
-    // One idle step: the settle planned, both jobs out (a waiting step admits the cores), and a
-    // wait for one message, which with the first job's result held is the other's.
+    // A step that waits for nothing plans the root's settle; nothing below waits unless it is
+    // several jobs, so a plan of one fails here rather than hold the test.
+    trunk.step(&mut store, STEP).unwrap();
+    let settles = |trunk: &Trunk| -> Vec<(bool, bool)> {
+        trunk
+            .tasks
+            .iter()
+            .filter(|t| t.node == root && matches!(t.what, What::Settle { .. }))
+            .map(|t| (t.run.done(), t.run.out()))
+            .collect()
+    };
+    let jobs = settles(&trunk).len();
+    assert!(
+        jobs > 1,
+        "the root's settle planned as several jobs: {jobs}"
+    );
+    // One idle step: jobs out on both seats (a waiting step admits the cores) and a wait for one
+    // message, which with the first job's result held is another's.
     trunk.idle_step(&mut store, STEP).unwrap();
-    let seen = relays.until("one job's result held and the other's delivered", |s| {
+    let seen = relays.until("one job's result held and another's delivered", |s| {
         held_and_other_delivered(s)
     });
-    let settles: Vec<(bool, bool)> = trunk
-        .tasks
-        .iter()
-        .filter(|t| t.node == root && matches!(t.what, What::Settle { .. }))
-        .map(|t| (t.run.done(), t.run.out()))
-        .collect();
+    let now = settles(&trunk);
+    let done = now.iter().filter(|(done, _)| *done).count();
+    let out = now.iter().filter(|(_, out)| *out).count();
     assert!(
         trunk.node(root).unwrap().leaf
             && trunk.stats().parallel_settles == 0
-            && settles.len() == 2
-            && settles.iter().filter(|(done, _)| *done).count() == 1
-            && settles.iter().filter(|(_, out)| *out).count() == 1,
-        "with one job back and one out, the settle unapplied: settles {settles:?}; {:?}; {seen:?}",
+            && now.len() == jobs
+            && done >= 1
+            && done < jobs
+            && out >= 1,
+        "with a job back and one out, the settle unapplied: settles {now:?}; {:?}; {seen:?}",
         trunk.stats()
     );
     relays.open();
     trunk.drain(&mut store).unwrap();
     let t = trunk.stats();
     assert!(
-        t.parallel_settles == 1 && t.parallel_settle_jobs == 2,
-        "the settle applied once, as two jobs: {t:?}"
+        t.parallel_settles == 1 && t.parallel_settle_jobs == u64::try_from(jobs).unwrap(),
+        "the settle applied once, as its {jobs} jobs: {t:?}"
     );
-    let root = trunk.node(trunk.root).unwrap();
+    // A leaf a job, under however many index levels the root's fanout puts above them.
+    let leaves: u64 = trunk
+        .levels()
+        .iter()
+        .filter(|l| l.leaf)
+        .map(|l| l.nodes)
+        .sum();
     assert!(
-        !root.leaf && root.pivots.len() == 2,
-        "the root an index node over two leaves: {} pivots, leaf {}",
-        root.pivots.len(),
-        root.leaf
+        !trunk.node(trunk.root).unwrap().leaf && leaves == u64::try_from(jobs).unwrap(),
+        "the root an index node, a leaf a job: {leaves} leaves for {jobs} jobs"
     );
     let mut value = Vec::new();
     for (k, v) in &oracle {

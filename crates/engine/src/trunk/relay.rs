@@ -221,10 +221,34 @@ impl Relays {
     }
 }
 
-/// The seats with a job out, as the pool counts them: a seat stays out until the shard has taken
-/// its job's result, whatever the relays have passed.
+/// The seats with a job out, as the pool counts them: a seat is out until the pool has taken its
+/// job's result off the channel, whatever the relays have passed.
 pub(crate) fn seats_out(pool: &Pool) -> usize {
     pool.held()
+}
+
+/// Takes every message the workers have sent, as the pool takes them: an ask answered from the
+/// room admitted or kept waiting for growth, a result kept for its owner. No result is taken for
+/// an owner, so none of the engine's own is taken from it.
+pub(crate) fn drain<F: BlockFile>(pool: &mut Pool, store: &mut Store<F>) -> Result<(), Error> {
+    // The channel holds at most this many: each pass takes one or ends.
+    for _ in 0..pool.most.saturating_mul(MESSAGES_A_WORKER) {
+        if !pool.next(store, false)? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// The result of the job `ticket` names, if the pool has taken it: every other result stays kept
+/// for its own owner. The test's jobs go out as `Owner::Index`, as the engine's kept index does,
+/// so only the ticket tells the test's result from the engine's.
+pub(crate) fn take_ticket(pool: &mut Pool, ticket: Ticket) -> Option<Back> {
+    let at = pool
+        .undelivered
+        .iter()
+        .position(|(_, b)| b.ticket == ticket)?;
+    pool.undelivered.remove(at).map(|(_, b)| b)
 }
 
 /// Opens the relays when dropped: a failed assertion leaves nothing held.

@@ -131,8 +131,8 @@ enum Step {
     /// The test's own merge: its inputs, written cold, merged under a grant of their extents and
     /// two more, as the trunk grants one, sent to the pool for a seat; it outgrows the grant.
     InjectAsker,
-    /// The test's own job's result, taken back once it came, and every extent the job wrote or
-    /// read given back.
+    /// The test's own job's result, taken back by its ticket once it came (the engine's own
+    /// `Owner::Index` results left for it), and every extent the job wrote or read given back.
     TakeInjected,
     /// Extents granted to no job, or given back from those (the cold bank first among them), so
     /// the room admitted is exactly this many.
@@ -140,8 +140,8 @@ enum Step {
     /// Nothing done: what the owner holds now.
     Look,
     /// Every message the workers have sent taken, as the pool takes them (an ask answered from
-    /// the room admitted, or kept waiting for growth; a result kept for its owner), and nothing
-    /// else done.
+    /// the room admitted, or kept waiting for growth; a result kept for its owner), no result
+    /// taken for an owner, and nothing else done ([`relay::drain`]).
     Drain,
     /// One look of the owner's growth ([`ShardDb::grow`]) and nothing else.
     Grow,
@@ -298,10 +298,31 @@ fn asker_inputs(store: &mut Store<SegmentedFile>) -> Result<(Branch, Branch), Er
     Ok((newer, older))
 }
 
+/// The test's own job sent to the pool as `Owner::Index`: its ticket kept in `injected`, done
+/// once a seat took it.
+fn inject(
+    db: &mut ShardDb<SegmentedFile>,
+    injected: &mut Option<Ticket>,
+    job: Box<Job>,
+) -> Result<bool, Error> {
+    let pool = db.trunk.pool_mut().ok_or(Error::InvalidArgument {
+        what: "a fixture with no pool",
+    })?;
+    match pool.send(job, Owner::Index, true) {
+        Ok(Ok(ticket)) => {
+            *injected = Some(ticket);
+            Ok(true)
+        }
+        Ok(Err(_)) => Ok(false),
+        Err((error, _)) => Err(error),
+    }
+}
+
 async fn run(
     db: &mut ShardDb<SegmentedFile>,
     reserved: &mut Vec<u64>,
     asker: &mut Option<Asker>,
+    injected: &mut Option<Ticket>,
     step: Step,
 ) -> Result<bool, Error> {
     match step {
@@ -311,9 +332,8 @@ async fn run(
             let pool = trunk.pool_mut().ok_or(Error::InvalidArgument {
                 what: "a fixture with no pool",
             })?;
-            // The test's own job's result is held by the relays while this is used: a take for
-            // its owner finds none and takes every message there is.
-            Ok(pool.take(store, Owner::Index, false)?.is_none())
+            relay::drain(pool, store)?;
+            Ok(true)
         }
         Step::Grow => db.grow(false),
         Step::ReserveTo(target) => {
@@ -354,13 +374,7 @@ async fn run(
                 generation: db.store.generation(),
                 keep: None,
             });
-            let pool = db.trunk.pool_mut().ok_or(Error::InvalidArgument {
-                what: "a fixture with no pool",
-            })?;
-            match pool.send(job, Owner::Index, true) {
-                Ok(sent) => Ok(sent.is_ok()),
-                Err((error, _)) => Err(error),
-            }
+            inject(db, injected, job)
         }
         Step::Reserve => {
             let asks = hand_off_asks(db);
@@ -392,21 +406,18 @@ async fn run(
                 generation: db.store.generation(),
                 keep: None,
             });
-            let pool = db.trunk.pool_mut().ok_or(Error::InvalidArgument {
-                what: "a fixture with no pool",
-            })?;
-            match pool.send(job, Owner::Index, true) {
-                Ok(sent) => Ok(sent.is_ok()),
-                Err((error, _)) => Err(error),
-            }
+            inject(db, injected, job)
         }
         Step::TakeInjected => {
+            let ticket = injected.take().ok_or(Error::InvalidArgument {
+                what: "no job of the test's out to take",
+            })?;
             for _ in 0..TURNS {
                 let ShardDb { trunk, store, .. } = &mut *db;
                 let pool = trunk.pool_mut().ok_or(Error::InvalidArgument {
                     what: "a fixture with no pool",
                 })?;
-                if let Some(back) = pool.take(store, Owner::Index, false)? {
+                if let Some(back) = relay::take_ticket(pool, ticket) {
                     // What the job made and was granted is no one's: every extent back.
                     let out = back.result?;
                     for (_, branch) in &out.parts {
@@ -453,9 +464,10 @@ async fn owner(
     mut steps: ChannelReceiver<Step>,
     answers: mpsc::SyncSender<Result<Witness, Error>>,
 ) {
+    let mut injected = None;
     while let Ok(step) = steps.recv().await {
         let finish = matches!(step, Step::Finish(_));
-        let answer = run(&mut db, &mut reserved, &mut asker, step)
+        let answer = run(&mut db, &mut reserved, &mut asker, &mut injected, step)
             .await
             .map(|done| witness(&mut db, done));
         let failed = answer.is_err();
@@ -659,14 +671,14 @@ fn the_last_free_seat_goes_to_the_packing_held_for_one_not_a_growth_due_ahead_of
     relays.hold_done(&[Kind::Sort, Kind::Compact, Kind::Grow]);
     // The writer's operations, once each, until a packing is held for a seat: the free seat is
     // taken by a job whose result is held once it is done.
-    let mut held = false;
+    let mut held = None;
     for _ in 0..OPS {
         let w = fx.step(Step::Once(i));
         if w.done {
             i += 1;
         }
         if w.packing_held {
-            held = true;
+            held = Some(w);
             break;
         }
         assert!(
@@ -675,8 +687,11 @@ fn the_last_free_seat_goes_to_the_packing_held_for_one_not_a_growth_due_ahead_of
             relays.seen()
         );
     }
-    assert!(held, "no packing held for a seat within the operations");
-    relays.until("the free seat's result held", |s| s.held_dones == [free]);
+    let held = held.expect("no packing held for a seat within the operations");
+    relays.until(
+        &format!("the free seat's result held, the packing held with {held:?}"),
+        |s| s.held_dones == [free],
+    );
     // The room admitted is what the held packing's hand-off asks: it fits, a growth is due.
     let w = fx.step(Step::Reserve);
     assert!(

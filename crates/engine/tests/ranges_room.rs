@@ -9,8 +9,10 @@
 //! every later request is answered with it, none with a value, the stop reports it once the
 //! range's writes and workers retire, and the store reopens at its last checkpoint, its whole image
 //! exactly the checkpoint's. Facts decide every verdict. Each wait for a fact has a failure guard
-//! ([`WAIT`]) that a passing run never reaches: past it the test fails, naming the fact that did
-//! not come, and lets every held growth go before the runtime's teardown.
+//! on the run's progress ([`until`]): a guard's span ([`WAIT`]) with neither the fact nor any
+//! progress fails the test, naming the fact and where the run is, and lets every held growth go
+//! before the runtime's teardown. A run that goes on, however slowly a loaded host lets it, is
+//! waited for.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -58,26 +60,95 @@ const OPS: u64 = 4096;
 /// Segments a file may have: past what the workload makes.
 const BOUND: usize = 1 << 12;
 const SLICE_NS: u64 = 50_000;
-/// The failure guard of every wait for a fact, the native worker fixtures' (pool_lifecycle.rs): a
-/// passing run never waits for it, and elapsed time never counts as the fact.
+/// The span of a failure guard, the native worker fixtures' (pool_lifecycle.rs): a passing run
+/// never goes this long without progress, and elapsed time never counts as the fact.
 const WAIT: Duration = Duration::from_secs(5);
 
-/// Waits for `fact`, yielding between looks; past the failure guard the test fails, naming it.
-fn until(what: &str, mut fact: impl FnMut() -> bool) {
-    let deadline = Instant::now() + WAIT;
-    while !fact() {
-        assert!(
-            Instant::now() < deadline,
-            "{what}: not seen within the failure guard"
-        );
-        std::thread::yield_now();
+/// The run's progress: the writer's operations done, and its steps past them (1 flushed, 2
+/// checkpointed, 3 stopped). Both only grow, bounded by [`OPS`] and three.
+#[derive(Clone, Copy)]
+struct Progress {
+    done: &'static AtomicU64,
+    step: &'static AtomicU64,
+}
+
+impl Progress {
+    fn new() -> Self {
+        Self {
+            done: Box::leak(Box::default()),
+            step: Box::leak(Box::default()),
+        }
+    }
+
+    fn now(self) -> u64 {
+        self.done.load(Ordering::Acquire) + self.step.load(Ordering::Acquire)
+    }
+
+    /// Where the run is, for a failure guard's message.
+    fn at(self) -> String {
+        let step = usize::try_from(self.step.load(Ordering::Acquire)).unwrap();
+        format!(
+            "{} of {OPS} operations done, past them {}",
+            self.done.load(Ordering::Acquire),
+            ["none", "flushed", "checkpointed", "stopped"][step]
+        )
     }
 }
 
-/// A message from the run's tasks, waited for under the failure guard.
-fn received<T>(from: &mpsc::Receiver<T>, what: &str) -> T {
-    from.recv_timeout(WAIT)
-        .unwrap_or_else(|e| panic!("{what}: not received within the failure guard ({e})"))
+/// The guard spans a wait may take: one more than the progress a run can make, each span after
+/// the first granted only by progress in the one before.
+const SPANS: u64 = OPS + 4;
+
+/// Waits for `fact`, yielding between looks. The guard is on progress, not on the wait's length:
+/// a span of [`WAIT`] with neither the fact nor any progress of the run fails the test, naming
+/// the fact and where the run is. Progress is bounded, so the wait ends.
+fn until(what: &str, progress: Progress, mut fact: impl FnMut() -> bool) {
+    let mut seen = progress.now();
+    for _ in 0..SPANS {
+        let deadline = Instant::now() + WAIT;
+        while Instant::now() < deadline {
+            if fact() {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        let now = progress.now();
+        assert!(
+            now != seen,
+            "{what}: not seen, the run without progress for the failure guard's span: {}",
+            progress.at()
+        );
+        seen = now;
+    }
+    panic!(
+        "{what}: not seen within the run's progress: {}",
+        progress.at()
+    );
+}
+
+/// A message from the run's tasks, waited for with the guard on progress ([`until`]).
+fn received<T>(from: &mpsc::Receiver<T>, what: &str, progress: Progress) -> T {
+    let mut seen = progress.now();
+    for _ in 0..SPANS {
+        match from.recv_timeout(WAIT) {
+            Ok(message) => return message,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let now = progress.now();
+                assert!(
+                    now != seen,
+                    "{what}: not received, the run without progress for the failure guard's \
+                     span: {}",
+                    progress.at()
+                );
+                seen = now;
+            }
+            Err(e) => panic!("{what}: not received ({e}): {}", progress.at()),
+        }
+    }
+    panic!(
+        "{what}: not received within the run's progress: {}",
+        progress.at()
+    );
 }
 
 /// Growth writes made on the workers, let through by count: the first `allowed` go on, every
@@ -142,20 +213,38 @@ impl Growths {
         s.failing = s.started;
     }
 
-    /// Waits until `n` growth writes have begun.
-    fn until_started(&self, n: u64) {
-        let deadline = Instant::now() + WAIT;
+    /// Waits until `n` growth writes have begun, the guard on the run's progress ([`until`]).
+    fn until_started(&self, n: u64, progress: Progress) {
+        let mut seen = progress.now();
         let mut s = self.state();
-        while s.started < n {
-            let left = deadline
-                .checked_duration_since(Instant::now())
-                .unwrap_or_else(|| panic!("growth write {n}: not begun within the failure guard"));
-            s = self
-                .changed
-                .wait_timeout(s, left)
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .0;
+        for _ in 0..SPANS {
+            let deadline = Instant::now() + WAIT;
+            while s.started < n {
+                let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                s = self
+                    .changed
+                    .wait_timeout(s, left)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .0;
+            }
+            if s.started >= n {
+                return;
+            }
+            let now = progress.now();
+            assert!(
+                now != seen,
+                "growth write {n}: not begun, the run without progress for the failure guard's \
+                 span: {}",
+                progress.at()
+            );
+            seen = now;
         }
+        panic!(
+            "growth write {n}: not begun within the run's progress: {}",
+            progress.at()
+        );
     }
 
     fn allow(&self, n: u64) {
@@ -325,7 +414,7 @@ fn expected(oracle: &BTreeMap<Vec<u8>, Option<Vec<u8>>>) -> Vec<(Vec<u8>, Vec<u8
 struct Probe<'a> {
     ask: &'a hyper_rt::sync::Sender<()>,
     answers: &'a mpsc::Receiver<FlushStats>,
-    done: &'static AtomicU64,
+    progress: Progress,
     shard: ShardId,
 }
 
@@ -336,11 +425,15 @@ impl Probe<'_> {
     fn take(&self) -> (FlushStats, u64) {
         let before = waits(self.shard);
         self.ask.blocking_send(()).unwrap();
-        let stats = received(self.answers, "the range's answer to a probe");
-        let done = self.done.load(Ordering::Acquire);
-        until("the shard parked after answering a probe", || {
-            parked_since(self.shard, before)
-        });
+        let stats = received(self.answers, "the range's answer to a probe", self.progress);
+        let done = self.progress.done.load(Ordering::Acquire);
+        // The shard parks once every task on it waits: while the writer goes on it may not, and
+        // the guard is on the run's progress.
+        until(
+            "the shard parked after answering a probe",
+            self.progress,
+            || parked_since(self.shard, before),
+        );
         (stats, done)
     }
 
@@ -350,16 +443,26 @@ impl Probe<'_> {
     /// bounded by events, where a range that passed again on its own would take a slice a pass.
     /// Every probe before that saw another event of the run's (an operation, a rotation, a
     /// worker's message), and the writer's wait for room comes once the held growth's room is
-    /// gone; a writer that finished first never waited, which fails the test.
+    /// gone; a writer that finished first never waited, which fails the test. The guard is on the
+    /// run's progress ([`until`]): a writer that waits makes none, so a range that kept passing
+    /// on its own fails it within a span.
     fn until_waiting(&self) -> FlushStats {
-        let deadline = Instant::now() + WAIT;
+        let mut seen = self.progress.now();
+        let mut deadline = Instant::now() + WAIT;
+        let mut spans = 0;
         let (mut last, mut done) = self.take();
         loop {
             assert!(done < OPS, "the writer finished without waiting for room");
-            assert!(
-                Instant::now() < deadline,
-                "the writer waiting for room: not seen within the failure guard"
-            );
+            if Instant::now() >= deadline {
+                let now = self.progress.now();
+                assert!(
+                    now != seen && spans < SPANS,
+                    "the writer waiting for room: not seen, the run without progress for the \
+                     failure guard's span: {}",
+                    self.progress.at()
+                );
+                (seen, deadline, spans) = (now, Instant::now() + WAIT, spans + 1);
+            }
             let (now, now_done) = self.take();
             if now_done == done
                 && now.rotations == last.rotations
@@ -396,10 +499,9 @@ fn parks_and_goes_on(one_worker: bool) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("range");
     let growths: &'static Growths = Box::leak(Box::new(Growths::new(0)));
-    let done: &'static AtomicU64 = Box::leak(Box::default());
-    // Where the writer's run is past its operations: 1 flushed, 2 checkpointed, 3 stopped. A
-    // failure guard that fires names it, so a run found slow is told from one found stuck.
-    let step: &'static AtomicU64 = Box::leak(Box::default());
+    // The writer's operations done, and where its run is past them: every guard is on it.
+    let progress = Progress::new();
+    let (done, step) = (progress.done, progress.step);
     let issuer = Issuer::start_for(dir.path(), 2, 2).unwrap();
     let mut runtime = runtime();
     let shard = runtime.shard_ids()[0];
@@ -488,11 +590,11 @@ fn parks_and_goes_on(one_worker: bool) {
     let probe = Probe {
         ask: &ask,
         answers: &answers,
-        done,
+        progress,
         shard,
     };
     // The first growth on a worker begins its write and is held there.
-    growths.until_started(1);
+    growths.until_started(1, progress);
     // The writer comes to wait for room; the range parks between requests.
     let waiting = probe.until_waiting();
     // The held growth goes, the next is held: the writer goes on with the room the first brought,
@@ -501,6 +603,7 @@ fn parks_and_goes_on(one_worker: bool) {
     growths.allow(1);
     until(
         "the writer's next operation after the first growth landed",
+        progress,
         || done.load(Ordering::Acquire) > at,
     );
     let (after, _) = probe.take();
@@ -508,16 +611,7 @@ fn parks_and_goes_on(one_worker: bool) {
     // Every growth goes: the writer finishes, the range checkpoints and stops.
     growths.open();
     drop(ask);
-    let oracle = finished.recv_timeout(WAIT).unwrap_or_else(|e| {
-        panic!(
-            "the writer's finished run: not received within the failure guard ({e}): {} of {OPS} \
-             operations done, past them {}",
-            done.load(Ordering::Acquire),
-            ["none", "flushed", "checkpointed", "stopped"]
-                .get(usize::try_from(step.load(Ordering::Acquire)).unwrap())
-                .unwrap()
-        )
-    });
+    let oracle = received(&finished, "the writer's finished run", progress);
     runtime.shutdown().unwrap();
     drop(issuer);
     let (mut db, applied) = ShardDb::open(open(&path, None), STORE, MEM, TRUNK).unwrap();
@@ -548,6 +642,9 @@ fn a_growth_that_fails_while_the_writer_waits_for_room_ends_the_range_in_its_fau
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("range");
     let growths: &'static Growths = Box::leak(Box::new(Growths::new(u64::MAX)));
+    // The writer's operations answered, and its stop: every guard is on it.
+    let progress = Progress::new();
+    let (done, step) = (progress.done, progress.step);
     let issuer = Issuer::start_for(dir.path(), 2, 2).unwrap();
     let mut runtime = runtime();
     let shard = runtime.shard_ids()[0];
@@ -602,6 +699,7 @@ fn a_growth_that_fails_while_the_writer_waits_for_room_ends_the_range_in_its_fau
                     None => writer.delete_async(&key).await.unwrap(),
                 }
                 oracle.insert(key, value);
+                done.store(i + 1, Ordering::Release);
             }
             writer.checkpoint_async(CHECKPOINT).await.unwrap();
             checkpointed.send(()).unwrap();
@@ -614,6 +712,7 @@ fn a_growth_that_fails_while_the_writer_waits_for_room_ends_the_range_in_its_fau
                     Some(v) => writer.put_async(&key, v).await,
                     None => writer.delete_async(&key).await,
                 };
+                done.store(i + 1, Ordering::Release);
                 if let Err(error) = applied {
                     failed = Some(error);
                     break;
@@ -625,13 +724,15 @@ fn a_growth_that_fails_while_the_writer_waits_for_room_ends_the_range_in_its_fau
             drop(writer);
             // The stop answers once the range's writes and workers have retired.
             let stopped = ranges.stop_async().await;
+            step.store(3, Ordering::Release);
             finish.send((oracle, failed, read, stopped)).unwrap();
         })
         .unwrap();
-    received(&at_checkpoint, "the writer's checkpoint");
+    received(&at_checkpoint, "the writer's checkpoint", progress);
     growths.fail_from_now();
     go.blocking_send(()).unwrap();
-    let (oracle, failed, read, stopped) = received(&finished, "the writer's run after the fault");
+    let (oracle, failed, read, stopped) =
+        received(&finished, "the writer's run after the fault", progress);
     runtime.shutdown().unwrap();
     drop(issuer);
     // The fault is the failure injected, and every later answer is that fault.

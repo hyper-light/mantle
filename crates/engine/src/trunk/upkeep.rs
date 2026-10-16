@@ -317,60 +317,87 @@ impl Trunk {
             let entries = p.entries();
             self.entered = self.entered.saturating_add(entries);
             self.held = self.held.saturating_add(entries);
-            if self.takes_parts(&p)? {
-                self.stats.parted_entries = self.stats.parted_entries.saturating_add(entries);
-                // The branches stay in the tree as written: their pages cached where they were
-                // written, as a compaction's are.
-                if let Some(kept) = p.kept {
-                    store.adopt_pages(*kept);
-                }
-                let node = self.node_mut(root)?;
-                for (j, b) in p.parts {
-                    node.pivots
-                        .get_mut(j)
-                        .ok_or(corrupt())?
-                        .bundle
-                        .push_newest(b);
-                }
-            } else {
+            let places = self.places(&p)?;
+            if !places.iter().any(|&placed| placed) {
                 // Compacted next: the compaction's pages are the ones to cache.
                 if let Some(kept) = p.kept {
                     store.unlend_pages(*kept);
                 }
                 let bundle = p.parts.into_iter().map(|(_, b)| b).collect();
                 self.node_mut(root)?.inflight.push(bundle);
+                continue;
             }
+            // The branches placed stay in the tree as written, their pages cached where they were
+            // written, as a compaction's are; those in flight are read from the cache by the
+            // compaction that comes for them.
+            if let Some(kept) = p.kept {
+                store.adopt_pages(*kept);
+            }
+            let node = self.node_mut(root)?;
+            let before = node.inflight.len();
+            let mut flight = Vec::new();
+            let mut flying = vec![false; node.pivots.len()];
+            let mut parted = 0u64;
+            for ((j, b), placed) in p.parts.into_iter().zip(places) {
+                if placed {
+                    parted = parted.saturating_add(b.count);
+                    node.pivots
+                        .get_mut(j)
+                        .ok_or(corrupt())?
+                        .bundle
+                        .push_newest(b);
+                } else {
+                    *flying.get_mut(j).ok_or(corrupt())? = true;
+                    flight.push(b);
+                }
+            }
+            if !flight.is_empty() {
+                node.inflight.push(flight);
+                // A pivot with nothing in flight before, and no branch in this bundle, has
+                // nothing in it: its start moves past it, so it is not live there.
+                for (pivot, flies) in node.pivots.iter_mut().zip(flying) {
+                    if pivot.start == before && !flies {
+                        pivot.start = before.saturating_add(1);
+                    }
+                }
+            }
+            self.stats.parted_entries = self.stats.parted_entries.saturating_add(parted);
         }
         self.node_mut(root)?.received = true;
         self.queue(root);
         Ok(())
     }
 
-    /// Whether the root takes `p`'s branches straight into its pivots' bundles: its pivots are
-    /// those `p`'s packing ended its branches at, and no pivot taking one has a live in-flight
-    /// bundle, a compaction out or a child that will split. Each such pivot's compaction would
+    /// For each of `p`'s branches, whether its pivot takes it straight into its bundle: the
+    /// root's pivots are those `p`'s packing ended its branches at, and that pivot has no live
+    /// in-flight bundle, no compaction out and no child that will split. Its compaction would
     /// then have had that branch alone for input and written its entries again, unchanged, as the
     /// pivot's newest bundle branch: 78.8M of the 374.0M entries a 100M fill wrote (research/57
-    /// §7). Otherwise the branches enter as one in-flight bundle and are compacted.
-    fn takes_parts(&self, p: &super::Pending) -> Result<bool, Error> {
+    /// §7). The others enter in flight and are compacted.
+    ///
+    /// Taken per pivot, not all or none: with any pivot busy, the whole packing went in flight,
+    /// every pivot then had a live bundle, and the next packing went in flight too. Once tipped,
+    /// the root took no parts until its backlog cleared, so its writes followed timing: on two
+    /// CPUs a fill wrote 14.7M entries with parts taken, against 18.7M with none (research/58 §6).
+    fn places(&self, p: &super::Pending) -> Result<Vec<bool>, Error> {
         let node = self.node(self.root)?;
         if node.leaf
             || p.cuts.is_empty()
             || node.pivots.len() != p.cuts.len()
             || node.pivots.iter().zip(&p.cuts).any(|(q, c)| q.key != *c)
         {
-            return Ok(false);
+            return Ok(vec![false; p.parts.len()]);
         }
+        let mut places = Vec::with_capacity(p.parts.len());
         for (j, _) in &p.parts {
             let pivot = node.pivots.get(*j).ok_or(corrupt())?;
-            if node.inflight.len() > pivot.start
-                || self.compacting(self.root, &pivot.key)
-                || self.held(pivot)?
-            {
-                return Ok(false);
-            }
+            places.push(
+                node.inflight.len() <= pivot.start
+                    && !self.compacting(self.root, &pivot.key)
+                    && !self.held(pivot)?,
+            );
         }
-        Ok(true)
+        Ok(places)
     }
 
     /// Idle time's consolidation, when seeks paid for one and nothing else is in progress: the
@@ -1552,3 +1579,7 @@ fn read_pages<'a>(
         .map(|b| b.pages_between(from, end))
         .fold(0usize, usize::saturating_add)
 }
+
+#[cfg(test)]
+#[path = "parts_per_pivot.rs"]
+mod parts_per_pivot;

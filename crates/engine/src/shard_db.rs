@@ -911,6 +911,10 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     fn no_worker_failure(&self) -> Result<(), Error> {
+        // Looked for first, so a put with no failed packing clones nothing.
+        if self.frozen.iter().all(|f| f.error.is_none()) {
+            return Ok(());
+        }
         self.frozen
             .iter()
             .find_map(|f| f.error.as_ref())

@@ -283,6 +283,10 @@ impl RecordCache {
 
     /// Drops `key`'s record, if cached: a write to the key makes it stale.
     pub fn invalidate(&mut self, key: &[u8], hash: u64) {
+        // Only a live record is dropped: with none, nothing is looked up.
+        if self.live == 0 {
+            return;
+        }
         let Some(offset) = self.table.get(hash) else {
             return;
         };

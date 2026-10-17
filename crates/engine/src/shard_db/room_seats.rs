@@ -174,6 +174,9 @@ struct Witness {
     frozen_most: usize,
     /// The seats with a job out, as the pool counts them ([`relay::seats_out`]).
     seats_out: usize,
+    /// Whether the trunk's counts of nodes with in-flight bundles and wanting a change match a
+    /// look at every node ([`crate::trunk::Trunk::check_idle_counts`]).
+    counts_whole: bool,
 }
 
 /// The extents a hand-off of the held packing asks, as `ShardDb::sort_off` counts them: its
@@ -207,6 +210,7 @@ fn witness(db: &mut ShardDb<SegmentedFile>, done: bool) -> Witness {
         trunk_idle: db.trunk.is_idle(),
         frozen_most: db.frozen_most(),
         seats_out: db.trunk.pool_mut().map_or(0, |p| relay::seats_out(p)),
+        counts_whole: db.trunk.check_idle_counts().is_ok(),
     }
 }
 
@@ -562,6 +566,10 @@ impl Fixture {
             .recv_timeout(WAIT)
             .unwrap_or_else(|e| panic!("the owner's answer to {what}: not received ({e})"))
             .unwrap_or_else(|e| panic!("the owner's {what} failed: {e:?}"));
+        assert!(
+            w.counts_whole,
+            "the trunk's idle counts differ from its nodes after {what}: {w:?}"
+        );
         if let Some(i) = op
             && w.done
         {
@@ -575,13 +583,18 @@ impl Fixture {
     /// the pool counts them (a result it has not taken keeps a seat out): from then only the
     /// steps the test takes move the engine.
     fn quiet(&mut self) -> Witness {
+        let mut last = None;
         for _ in 0..TURNS {
             let w = self.step(Step::Idle);
             if !w.growth_out && w.trunk_idle && w.seats_out == 0 {
                 return w;
             }
+            last = Some(w);
         }
-        panic!("no growth out, the trunk idle and no seat out: not seen within the turns");
+        panic!(
+            "no growth out, the trunk idle and no seat out: not seen within the turns, the last \
+             step leaving {last:?}"
+        );
     }
 
     /// The writer's operations `from..OPS`, flushed, checkpointed and finished; the runtime

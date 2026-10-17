@@ -74,12 +74,35 @@ fn block_of(h: u64, blocks: usize) -> usize {
 /// from the low 32). The high 32 are what a memtable keeps of each key ([`hash32`]), so a filter
 /// can be rebuilt at any size from them without reading the keys (research/39 §3).
 fn probes(h: u64) -> impl Iterator<Item = (usize, u64)> {
-    let mut x = u32::try_from(h >> 32).unwrap_or(0);
-    (0..PROBES).map(move |_| {
-        x = x.wrapping_mul(0x9E37_79B9);
-        let bit = x >> 23;
+    let x = u32::try_from(h >> 32).unwrap_or(0);
+    // Each remix from `x` by the multiplier's power, the chained remix's value (`x·G·G = x·G²`
+    // mod 2^32): the probes wait on no other probe's multiply.
+    POWERS.into_iter().map(move |g| {
+        let bit = x.wrapping_mul(g) >> 23;
         (usize::try_from(bit >> 6).unwrap_or(0), 1u64 << (bit & 63))
     })
+}
+
+/// The golden-ratio multiplier's powers 1 to [`PROBES`], mod 2^32: probe `i`'s remix.
+const POWERS: [u32; PROBES as usize] = [
+    power(1),
+    power(2),
+    power(3),
+    power(4),
+    power(5),
+    power(6),
+    power(7),
+];
+
+/// The golden-ratio multiplier to the `n`th power, mod 2^32.
+const fn power(n: u32) -> u32 {
+    let mut g: u32 = 1;
+    let mut i = 0;
+    while i < n {
+        g = g.wrapping_mul(0x9E37_79B9);
+        i = i.wrapping_add(1);
+    }
+    g
 }
 
 impl Filter {

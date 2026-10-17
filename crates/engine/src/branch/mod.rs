@@ -2023,10 +2023,11 @@ impl RunCursor {
         let (suffix, rest) = entry_ranges(page, LEAF, table, index)?;
         let tag = page.get(rest.start).copied().unwrap_or(0);
         let op = Op::from_byte(tag).ok_or(corrupt(Malformed::UnknownTag(tag)))?;
-        let prefix = page.get(HEAD..table).ok_or(corrupt(Malformed::Truncated))?;
+        // The leaf's prefix ends where its table starts: read once, by its first entry decoded.
         if *prefixed {
-            key.truncate(prefix.len());
+            key.truncate(table.saturating_sub(HEAD));
         } else {
+            let prefix = page.get(HEAD..table).ok_or(corrupt(Malformed::Truncated))?;
             key.clear();
             key.extend_from_slice(prefix);
             *prefixed = true;

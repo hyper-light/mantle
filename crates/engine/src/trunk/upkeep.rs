@@ -155,15 +155,55 @@ impl Trunk {
         !self.tasks.is_empty()
             || !self.looking.is_empty()
             || self.abandoning.is_some()
-            || self.nodes.iter().any(|n| n.wants.is_some())
+            || self.wanting_nodes > 0
     }
 
     /// Whether nothing is pending or in progress and every node's in-flight list is empty, which
     /// a checkpoint's image relies on.
     pub fn is_idle(&self) -> bool {
-        self.pending.is_empty()
-            && !self.maintaining()
-            && self.nodes.iter().all(|n| n.inflight.is_empty())
+        self.pending.is_empty() && !self.maintaining() && self.inflight_nodes == 0
+    }
+
+    /// Appends `bundle` to node `n`'s in-flight list, counting the node among those holding one.
+    fn push_inflight(&mut self, n: usize, bundle: Vec<Branch>) -> Result<(), Error> {
+        let node = self.node_mut(n)?;
+        let was_empty = node.inflight.is_empty();
+        node.inflight.push(bundle);
+        if was_empty {
+            self.inflight_nodes = self.inflight_nodes.checked_add(1).ok_or(corrupt())?;
+        }
+        Ok(())
+    }
+
+    /// Node `n` wants `change`, counted among the nodes wanting one if it wanted none.
+    fn set_wants(&mut self, n: usize, change: Change) -> Result<(), Error> {
+        if self.node_mut(n)?.wants.replace(change).is_none() {
+            self.wanting_nodes = self.wanting_nodes.checked_add(1).ok_or(corrupt())?;
+        }
+        Ok(())
+    }
+
+    /// Node `n` wants no change, and leaves the count if it wanted one.
+    fn clear_wants(&mut self, n: usize) -> Result<(), Error> {
+        if self.node_mut(n)?.wants.take().is_some() {
+            self.wanting_nodes = self.wanting_nodes.checked_sub(1).ok_or(corrupt())?;
+        }
+        Ok(())
+    }
+
+    /// The counts [`Self::is_idle`] reads, against a look at every node: a corruption if they
+    /// differ.
+    pub(crate) fn check_idle_counts(&self) -> Result<(), Error> {
+        let inflight = self.nodes.iter().filter(|n| !n.inflight.is_empty()).count();
+        let wanting = self.nodes.iter().filter(|n| n.wants.is_some()).count();
+        if inflight == self.inflight_nodes && wanting == self.wanting_nodes {
+            Ok(())
+        } else {
+            Err(Error::Corruption {
+                what: "the trunk's counts of nodes with in-flight bundles and wanting a change",
+                why: Malformed::CountMismatch,
+            })
+        }
     }
 
     /// The maintenance estimate, in work units: the pending branches' entries, what inline
@@ -338,7 +378,7 @@ impl Trunk {
                     store.unlend_pages(*kept);
                 }
                 let bundle = p.parts.into_iter().map(|(_, b)| b).collect();
-                self.node_mut(root)?.inflight.push(bundle);
+                self.push_inflight(root, bundle)?;
             }
         }
         self.node_mut(root)?.received = true;
@@ -735,7 +775,7 @@ impl Trunk {
         // Oldest first into the child's in-flight list: the bundle is newest first.
         let received = !bundle.is_empty();
         for b in bundle.into_iter().rev() {
-            self.node_mut(child)?.inflight.push(vec![b]);
+            self.push_inflight(child, vec![b])?;
         }
         if received {
             self.node_mut(child)?.received = true;
@@ -779,7 +819,7 @@ impl Trunk {
             kind,
             started: false,
         };
-        self.node_mut(n)?.wants = Some(change);
+        self.set_wants(n, change)?;
         if change.splits() && n != self.root {
             let (parent, _) = self.parent_of(n)?;
             self.queue(parent);
@@ -817,10 +857,13 @@ impl Trunk {
                 // this leaf again, so the split settle is planned now.
                 let now = self.settle_parts(n)?;
                 if now > 1 && parts <= 1 && n != self.root {
-                    self.node_mut(n)?.wants = Some(Change {
-                        kind: ChangeKind::Settle { parts: now },
-                        started: false,
-                    });
+                    self.set_wants(
+                        n,
+                        Change {
+                            kind: ChangeKind::Settle { parts: now },
+                            started: false,
+                        },
+                    )?;
                     let (parent, i) = self.parent_of(n)?;
                     let pivot = self.node(parent)?.pivots.get(i).ok_or(corrupt())?;
                     if !pivot.bundle.branches().is_empty() || self.compacting(parent, &pivot.key) {
@@ -835,7 +878,7 @@ impl Trunk {
                 // partitions the pivots.
                 self.drop_dead(store, n)?;
                 let parts = self.split_node(n)?;
-                self.node_mut(n)?.wants = None;
+                self.clear_wants(n)?;
                 self.splice(n, parts)
             }
         }
@@ -880,7 +923,7 @@ impl Trunk {
             if settle.was_paid && !settle.waits {
                 self.spend(n, 0)?;
             }
-            self.node_mut(n)?.wants = None;
+            self.clear_wants(n)?;
             return Ok(());
         }
         let node = self.node(n)?;
@@ -1171,7 +1214,7 @@ impl Trunk {
                     p.start = covered;
                 }
                 self.drop_dead(store, n)?;
-                self.node_mut(n)?.wants = None;
+                self.clear_wants(n)?;
                 self.splice(n, leaves)?;
             }
         }

@@ -389,6 +389,11 @@ pub struct Trunk {
     tasks: Vec<NodeTask>,
     /// Nodes to look at for work, each queued once until looked at.
     looking: VecDeque<usize>,
+    /// The nodes whose in-flight list holds a bundle, and those that want a change: counted as
+    /// the lists and the changes come and go, so whether the trunk is idle is known without a
+    /// look at every node ([`Self::is_idle`]), which a range asks after each operation.
+    inflight_nodes: usize,
+    wanting_nodes: usize,
     /// A worker's failure, reported once every other job out is back and its grant released.
     abandoning: Option<Error>,
     /// Whether compactions' planning and finishing are timed ([`Trunk::set_timed`]).
@@ -628,6 +633,8 @@ impl Trunk {
             timed: false,
             yield_io: false,
             io_waiting: false,
+            inflight_nodes: 0,
+            wanting_nodes: 0,
             capacity_wanted: 0,
             gets: 0,
             merge_ns: 0,
@@ -2029,6 +2036,8 @@ impl Trunk {
             timed: false,
             yield_io: false,
             io_waiting: false,
+            inflight_nodes: 0,
+            wanting_nodes: 0,
             capacity_wanted: 0,
             gets: 0,
             merge_ns: 0,
@@ -2084,6 +2093,9 @@ impl Trunk {
         let gone: Vec<Vec<Branch>> = node.inflight.drain(..dead).collect();
         for p in &mut node.pivots {
             p.start = p.start.saturating_sub(dead);
+        }
+        if node.inflight.is_empty() {
+            self.inflight_nodes = self.inflight_nodes.checked_sub(1).ok_or(corrupt())?;
         }
         self.shift_tasks(n, dead);
         for bundle in gone {

@@ -1013,6 +1013,7 @@ impl<F: BlockFile> ShardDb<F> {
     /// recovery, it finds an extent leaked or freed while named; a difference is a typed
     /// corruption.
     pub fn check_references(&self) -> Result<(), Error> {
+        self.trunk.check_idle_counts()?;
         let mut named = std::collections::BTreeSet::new();
         named.insert(0u64);
         let mut once = |e: u64| -> Result<(), Error> {

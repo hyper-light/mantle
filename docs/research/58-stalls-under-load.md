@@ -218,4 +218,39 @@ which the journal commits at the next flush, and the store flushes at its checkp
 | one CPU | 1.11×, 3/4 | 0.37×, 4/4 | 0.76×, 4/4 | 49 / 111 ms |
 | 100M | 1.00×, 2/4 | 1.26×, 1/4 | 0.72×, 2/4 | 78 / 587 ms |
 
-[The confirmation on main f417e4c, traced and against main with RocksDB and SplinterDB beside, goes here.]
+**On main f417e4c.** Traced, 8 rounds each at 100M on the whole host (`diag-runs/n100000000-
+r5001..r5008`, t_trm8, main; `r5011..r5018`, t_trz0m8, the zeros gone; jobs.py, stalls.py), a
+job's time from its send to its result taken:
+
+| job | main p50 / p99 / max | zeros gone p50 / p99 / max |
+|---|---|---|
+| growth | 25 / 1,359 / 1,862 ms | 5 / 1,400 / 1,660 ms |
+| packing | 109 / 144 / 494 ms | 106 / 134 / 277 ms |
+| compaction | 16 / 513 / 840 ms | 16 / 585 / 926 ms |
+| index | 35 / 479 / 1,054 ms | 34 / 483 / 925 ms |
+
+Main stalled twice in its 8 (114 and 283 ms), each a frozen memtable past the overlap whose
+packing ran 379 and 494 ms, beside a growth writing its zeros (369 ms) in one and two compactions
+(about 435 ms) in the other; the zeros gone, none stalled. The worst put, a round's, was 10-283 ms
+on main (median of rounds 20.7 ms) and 8.9-43 ms without the zeros (11.3 ms).
+
+Untraced, against main in the same rounds with RocksDB beside (`runs/n*-r4821..r4836`, 6 rounds a
+size, run7's balanced order over the three; abtab.py, cmp3tab.py):
+
+| zeros gone over main | 10M CPU | 10M rate | 100M CPU | 100M rate |
+|---|---|---|---|---|
+| fill | 0.93×, 6/6 | 1.08×, 6/6 | 1.00×, 3/6 | 1.00×, 4/6 |
+| gets | 0.97×, 5/6 | 1.02×, 5/6 | 1.01×, 1/6 | 1.00×, 4/6 |
+| seeks | 0.99×, 3/6 | 1.02×, 3/6 | 1.01×, 2/6 | 0.99×, 3/6 |
+
+| a run's | main | zeros gone |
+|---|---|---|
+| bytes written, 10M | 6.1 GB | 2.0 GB |
+| bytes written, 100M | 45.0 GB | 29.6 GB |
+| stalls, 100M, 6 rounds | 3 (rounds' worst fill 7.2-60 ms) | 2 (13.6-357 ms) |
+
+Against RocksDB the zeros gone are 5.22× its fills, 10.39× its gets and 5.42× its seeks at 10M and
+4.91×, 8.09× and 5.24× at 100M, every round. A round's worst fill at 10M, the median of rounds, was
+5.4 ms without the zeros, 5.5 ms on main and 6.1 ms for RocksDB; at 100M RocksDB's histogram
+maximum wrapped in all 6 rounds, no measure. Without the zeros a 100M fill still stalls now and then (two
+rounds of six, as main three): the zeros were one cause of the tail, not the last.

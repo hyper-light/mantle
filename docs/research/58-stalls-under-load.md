@@ -113,3 +113,73 @@ That is to be measured against the candidate:
   waits on? A first writer in another file stalls no one (research/48 §4).
 - **The cut under load.** 0.45× against the candidate's 0.69× at 12 loops, worse in 3 of 4
   rounds. That regression is unexplained, so the cut is not adopted (cache-wr's research/57 §8).
+
+## 6. A compaction no seat could take: the shard spun
+
+**What failed.** `ranges_room`'s one-worker test failed now and then in CI: on 2 CPUs beside 2
+busy loops (cna-wr, eff4-wr), on windows-x86_64 and on linux-aarch64 (split-wr). Each failure
+whose message was read waited for the same fact, the shard parking after it answered a probe.
+The two whose guard names the run's progress stopped at the same place, 79 of 4096 operations
+done.
+
+**Reproduced.** In the Linux VM, on 2 CPUs beside 2 busy loops on the same CPUs:
+- the test binary failed in 1 of 40 runs;
+- the one-worker test alone failed in 2 of 36 and 2 of 40 runs.
+
+**Traced.** Stacks were sampled with eu-stack while a run hung:
+- The worker was in the held growth's write.
+- The shard thread was not parked. It cycled through the range's turn: the paused put's rotation,
+  the idle slice, the turn's growth look, the cancellation check.
+
+A scratch build counted the range's passes that neither served a request nor waited. At 100,000
+passes it printed the shard's state:
+
+| part | state |
+|---|---|
+| writer | one put pending, its rotation waiting for the root's room |
+| root | no room, its one compaction ready |
+| pool | one seat, held by a growth; no wait registered |
+| range | work owed (`idle_owed`), nothing to wait for (`waiting_for_io` false) |
+
+**Cause.** A ready compaction that found every seat held returned from the dispatch with no wait
+registered. Only a worker's message frees a seat. The range had nothing to wait for, so it passed
+again at once, for as long as the seat stayed held. A packing in the same position already
+registers the wait (`ShardDb::sort_off`).
+
+The spin has a cost beyond the test. On a loaded host, the spinning shard takes CPU from the
+very worker whose message it waits for. This is the condition §1 measures and §2's stalls sit in:
+the rotation waiting for the root's room.
+
+**Change** (`seat-wr` 6ec8434). The dispatch registers the wait for a worker's message
+(`Pool::want_message`) when no seat takes a ready compaction. The range then waits for that
+message or a request.
+
+The test `trunk/seat_wait.rs`:
+- holds a pool's one seat with a job the trunk does not own;
+- lets a branch of more rows than a leaf holds into the root, and takes one paced step;
+- requires that the compaction is ready, none is out, and the trunk reports the wait.
+
+It fails on the code before the change and passes on it. It then lets the holder go, sees the
+compaction take the freed seat, drains, and reads every row back.
+
+**After.**
+- The one-worker test passed 300 of 300 runs under the same load.
+- The instrumented build with the change passed the whole binary 200 of 200 times, with no
+  passes counted without progress.
+
+**Measured.** The change (x_seat) against its base (x_eff3) in the same round, 6 rounds each,
+run7's order. Each cell is the median of the same-round ratios and the rounds the change won.
+Worst put and CPU are lower-is-better; CPU is the run's user and system seconds.
+
+| condition | fills | gets | seeks | worst put | CPU | runs |
+|---|---|---|---|---|---|---|
+| 10M, whole host | 1.07×, 4/6 | 1.15×, 5/6 | 1.03×, 4/6 | 1.01×, 3/6 | 0.92×, 5/6 | `r4001..r4006` |
+| 10M, 12 busy loops | 1.12×, 3/6 | 1.01×, 3/6 | 1.08×, 6/6 | 0.63×, 4/6 | 0.98×, 4/6 | `r4031..r4036` |
+| 10M, 2 CPUs, 2 loops | 1.04×, 4/6 | 1.00×, 3/6 | 0.99×, 3/6 | 1.05×, 2/6 | 0.99×, 5/6 | `r4011..r4016` |
+| 100M, whole host | 1.03×, 4/6 | 1.04×, 5/6 | 1.05×, 4/6 | 0.48×, 4/6 | 0.97×, 4/6 | `r4021..r4026` |
+
+- Under 12 loops the base's worst puts were 0.35-2.6 s and the change's 0.16-2.0 s.
+- On two CPUs both arms' worst puts stayed at 1.5-1.9 s. That tail is the one worker seat two
+  CPUs get, not the spin.
+- On the whole host at 10M the change did the same work with 8% less CPU.
+- At 100M the base's worst puts were 35-736 ms and the change's 9-594 ms.

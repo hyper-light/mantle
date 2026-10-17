@@ -563,14 +563,18 @@ impl Builder {
         self.keys.push(prev, common)?;
         let [low, high] = u16_of(value.len())?;
         let head = [op.byte(), low, high];
-        // Append the entry to its page directly, without staging the value in another buffer.
-        let entry = Entry {
-            key,
-            head: &head,
-            tail: value,
-            under: 1,
-        };
-        self.insert(store, 0, entry, Some(common))?;
+        // Append the entry to its page directly, without staging the value in another buffer:
+        // the leaf being filled takes it when it has room, and only a full leaf walks up the
+        // levels its written page reaches.
+        if !self.leaf_push(key, &head, value, common)? {
+            let entry = Entry {
+                key,
+                head: &head,
+                tail: value,
+                under: 1,
+            };
+            self.insert(store, 0, entry, Some(common))?;
+        }
         self.count = self.count.saturating_add(1);
         let h32 = hash32.unwrap_or_else(|| filter::hash32(filter::hash(key)));
         // The filter's block and probes use these high bits alone.
@@ -579,6 +583,39 @@ impl Builder {
             u64::try_from(key.len().saturating_add(value.len())).unwrap_or(u64::MAX),
         );
         Ok(())
+    }
+
+    /// Stages a leaf entry, `common` bytes shared with the key before it, in the leaf being
+    /// filled when that leaf is empty or has room for it, as [`Self::insert`] does at level 0:
+    /// false, staging nothing, when the leaf must be written first.
+    fn leaf_push(
+        &mut self,
+        key: &[u8],
+        head: &[u8],
+        value: &[u8],
+        common: usize,
+    ) -> Result<bool, Error> {
+        let capacity = self.capacity;
+        let Some(page) = self.levels.first_mut() else {
+            return Ok(false);
+        };
+        let prefix = if page.len() == 0 {
+            key.len()
+        } else {
+            page.prefix.min(common)
+        };
+        let rest = head
+            .len()
+            .checked_add(value.len())
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        let size = page
+            .size_with(prefix, key.len(), rest)
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        if size > capacity && page.len() > 0 {
+            return Ok(false);
+        }
+        page.push(key, head, value, 1, prefix)?;
+        Ok(true)
     }
 
     /// Adds an entry to level `level`. A level whose page the entry would overflow writes the

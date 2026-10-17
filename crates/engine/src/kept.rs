@@ -131,6 +131,12 @@ impl KeptIndex {
         self.map.touch(hash)
     }
 
+    /// [`Self::get`] of the index read alone ([`IncMap::get_touched`]).
+    #[inline]
+    pub fn get_touched(&self, hash: u64) -> Option<(u32, u32)> {
+        self.map.get_touched(hash).map(unpack)
+    }
+
     /// Adds each memtable's keys, `lists` oldest first, passing over those it already covers: a
     /// key's entry in a newer memtable replaces its entry in an older one. With
     /// `sweep`, entries of memtables older than `oldest` (given back) are dropped first. The

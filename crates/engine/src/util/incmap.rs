@@ -269,6 +269,26 @@ impl IncMap {
         first(&self.table) ^ self.old.as_ref().map_or(0, first)
     }
 
+    /// [`Self::get`] of a map read alone: the key's first group's control word and first bucket
+    /// read together before the probe, as [`Self::touch`] reads several maps', so its two misses
+    /// overlap; the key's group and tag computed once for both.
+    #[inline]
+    pub fn get_touched(&self, key: u64) -> Option<u64> {
+        if self.old.is_some() {
+            std::hint::black_box(self.touch(key));
+            return self.get(key);
+        }
+        let t = &self.table;
+        let (tag, g) = t.hash(key);
+        let w = t.ctrl.get(g).copied().unwrap_or(0);
+        let e = t.slots.get(g.wrapping_mul(GROUP)).map_or(0, |e| e[1]);
+        std::hint::black_box(w ^ e);
+        t.seek(key, tag, g)
+            .ok()
+            .and_then(|i| t.slots.get(i))
+            .map(|e| e[1])
+    }
+
     pub fn contains_key(&self, key: u64) -> bool {
         self.get(key).is_some()
     }

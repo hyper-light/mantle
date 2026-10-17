@@ -3711,21 +3711,28 @@ impl<F: BlockFile> ShardDb<F> {
         let index = self.kept_index.as_ref();
         let covered = index.and_then(crate::kept::KeptIndex::covers);
         let uncovered = |k: &&KeptMem| covered.is_none_or(|c| crate::kept::older(c, k.number));
-        let mut touched = index.map_or(0, |i| i.touch(hash));
-        for k in self.kept.iter().rev().take_while(uncovered) {
-            touched ^= k.mem.touch(hash);
-        }
-        std::hint::black_box(touched);
-        for k in self.kept.iter().rev().take_while(uncovered) {
-            if let Some(op) = k.mem.get_hashed(key, hash, value)? {
-                return Ok(KeptAnswer::Found(op));
+        // The index covers the newest kept memtable, and so every one: it is read alone.
+        let alone = index.is_some() && self.kept.back().is_none_or(|k| !uncovered(&k));
+        let found = if let (true, Some(index)) = (alone, index) {
+            index.get_touched(hash)
+        } else {
+            let mut touched = index.map_or(0, |i| i.touch(hash));
+            for k in self.kept.iter().rev().take_while(uncovered) {
+                touched ^= k.mem.touch(hash);
             }
-        }
-        let (Some(index), Some(oldest)) = (index, self.kept.front()) else {
+            std::hint::black_box(touched);
+            for k in self.kept.iter().rev().take_while(uncovered) {
+                if let Some(op) = k.mem.get_hashed(key, hash, value)? {
+                    return Ok(KeptAnswer::Found(op));
+                }
+            }
+            index.and_then(|i| i.get(hash))
+        };
+        let (Some(_), Some(oldest)) = (index, self.kept.front()) else {
             // No index: every kept memtable was probed above.
             return Ok(KeptAnswer::Absent);
         };
-        let Some((number, offset)) = index.get(hash) else {
+        let Some((number, offset)) = found else {
             return Ok(KeptAnswer::Absent);
         };
         if crate::kept::older(number, oldest.number) {

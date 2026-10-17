@@ -9,6 +9,9 @@ use crate::store::Store;
 use crate::trunk::Source;
 use hyper_block::block::BlockFile;
 
+/// A row a merge gives: key, operation, value.
+type Row<'s> = (&'s [u8], Op, &'s [u8]);
+
 /// One source's head: a branch's cursor.
 #[derive(Debug)]
 enum Head<'a> {
@@ -31,6 +34,12 @@ impl Head<'_> {
     fn value(&self) -> &[u8] {
         match self {
             Head::Branch(c, _) => c.value(),
+        }
+    }
+
+    fn value_in<'s, F: BlockFile>(&'s self, store: &'s Store<F>) -> Result<&'s [u8], Error> {
+        match self {
+            Head::Branch(c, _) => c.value_in(store),
         }
     }
 
@@ -72,6 +81,8 @@ pub struct ScanMerge<'a> {
     /// The nanoseconds each source of the last open took to open, in the sources' order, none
     /// for one passed over: what a seek's extra sources cost it, measured.
     open_ns: Vec<u64>,
+    /// Whether the heads opened keep a cached leaf's values in the cache ([`Self::entry_in`]).
+    in_place: bool,
 }
 
 impl<'a> ScanMerge<'a> {
@@ -116,7 +127,13 @@ impl<'a> ScanMerge<'a> {
             }
             self.opened = self.opened.saturating_add(1);
             let head = match *s {
-                Source::Branch(b) => Head::Branch(b.seek(store, from)?, b),
+                Source::Branch(b) => {
+                    let mut c = b.seek(store, from)?;
+                    if self.in_place {
+                        c.set_in_place();
+                    }
+                    Head::Branch(c, b)
+                }
             };
             self.heads.push(head);
             self.open_ns.push(t.map_or(0, |t| {
@@ -190,6 +207,7 @@ impl<'a> ScanMerge<'a> {
             skipped: 0,
             opened: 0,
             open_ns: self.open_ns,
+            in_place: false,
         }
     }
 
@@ -224,6 +242,26 @@ impl<'a> ScanMerge<'a> {
         self.current = best
             .filter(|&(_, k)| !self.bounded || k < self.end.as_slice())
             .map(|(i, _)| i);
+    }
+
+    /// Makes the heads it opens from here keep a cached leaf's values in the cache: for a scan
+    /// that reads its rows with [`Self::entry_in`] and changes nothing in the cache meanwhile.
+    pub(crate) fn set_in_place(&mut self) {
+        self.in_place = true;
+    }
+
+    /// [`Self::entry`] with the value read where its head keeps it, the cache included.
+    pub(crate) fn entry_in<'s, F: BlockFile>(
+        &'s self,
+        store: &'s Store<F>,
+    ) -> Result<Option<Row<'s>>, Error> {
+        let Some(h) = self.current.and_then(|i| self.heads.get(i)) else {
+            return Ok(None);
+        };
+        let Some(key) = h.key() else {
+            return Ok(None);
+        };
+        Ok(Some((key, h.op(), h.value_in(store)?)))
     }
 
     /// The current entry: key, operation, value; none past the end.

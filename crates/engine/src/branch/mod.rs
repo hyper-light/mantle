@@ -1411,6 +1411,9 @@ pub struct RunCursor {
     value: std::ops::Range<usize>,
     value_copy: Vec<u8>,
     copied: bool,
+    /// Whether a leaf read in the cache keeps its entry's value there: a synchronous scan, which
+    /// changes nothing in the cache while it runs, reads it with [`Self::value_in`].
+    in_place: bool,
     op: Op,
     valid: bool,
 }
@@ -1576,6 +1579,7 @@ impl RunCursor {
             prefixed: false,
             value: 0..0,
             value_copy: store.take_page(),
+            in_place: false,
             copied: false,
             op: Op::Put,
             valid: false,
@@ -1602,6 +1606,26 @@ impl RunCursor {
 
     pub fn op(&self) -> Op {
         self.op
+    }
+
+    /// Makes a leaf the cache holds keep its entries' values there ([`Self::in_place`]).
+    pub(crate) fn set_in_place(&mut self) {
+        self.in_place = true;
+    }
+
+    /// The entry's value, read in the cache's slot for a leaf held there in place: refused as
+    /// corruption if the slot no longer holds the leaf, never an empty value.
+    pub(crate) fn value_in<'s, F: BlockFile>(
+        &'s self,
+        store: &'s Store<F>,
+    ) -> Result<&'s [u8], Error> {
+        match self.cached {
+            Some((slot, address)) if !self.copied => store
+                .cache_page(slot, address)
+                .and_then(|page| page.get(self.value.clone()))
+                .ok_or(corrupt(Malformed::Truncated)),
+            _ => Ok(self.value()),
+        }
     }
 
     pub fn value(&self) -> &[u8] {
@@ -1946,6 +1970,16 @@ impl RunCursor {
             &mut self.key,
             &mut self.prefixed,
         )?;
+        if self.in_place {
+            if value.end > page.len() {
+                return Err(corrupt(Malformed::Truncated));
+            }
+            self.value = value;
+            self.op = op;
+            self.copied = false;
+            self.valid = true;
+            return Ok(());
+        }
         self.value_copy.clear();
         self.value_copy
             .extend_from_slice(page.get(value).ok_or(corrupt(Malformed::Truncated))?);

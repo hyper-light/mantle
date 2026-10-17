@@ -2365,6 +2365,9 @@ impl<F: BlockFile> ShardDb<F> {
         charges.clear();
         let mut trunk_done = false;
         let mut merge: ScanMerge<'_> = std::mem::take(&mut self.scan_merge).recycle(store);
+        // A synchronous scan changes nothing in the cache while it runs: a cached leaf's values
+        // are read where the cache holds them.
+        merge.set_in_place();
         let before_end = |k: &[u8]| end.is_none_or(|e| k < e);
         let mut taken = 0usize;
         // Every error ends the walk here, so the merge gives its sources' pages and spans back to
@@ -2423,11 +2426,15 @@ impl<F: BlockFile> ShardDb<F> {
                 .filter_map(MemCursor::key)
                 .filter(|k| before_end(k))
                 .min();
-            if mem_a.is_none()
-                && mem_p.is_none()
-                && mem_f.is_none()
-                && let Some((k, op, v)) = merge.entry()
-            {
+            let row = if mem_a.is_none() && mem_p.is_none() && mem_f.is_none() {
+                match merge.entry_in(store) {
+                    Ok(row) => row,
+                    Err(error) => break Err(error),
+                }
+            } else {
+                None
+            };
+            if let Some((k, op, v)) = row {
                 // Only the trunk holds keys from here: its entry is the row, read where the
                 // merge holds it, with nothing of the memtables to compare it with.
                 if taken == limit {
@@ -2493,7 +2500,11 @@ impl<F: BlockFile> ShardDb<F> {
                     break 'walk Err(error);
                 }
             }
-            if let Some((k, op, v)) = merge.entry()
+            let row = match merge.entry_in(store) {
+                Ok(row) => row,
+                Err(error) => break Err(error),
+            };
+            if let Some((k, op, v)) = row
                 && k == key.as_slice()
             {
                 if !decided && op == Op::Put {

@@ -156,7 +156,8 @@ impl<F: BlockFile + 'static> Inline for ShardDb<F> {
     }
 
     fn owed(&self) -> bool {
-        self.idle_owed()
+        // A calm get changed nothing the look reads: the look before it stands.
+        !self.calm() && self.idle_owed()
     }
 
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {

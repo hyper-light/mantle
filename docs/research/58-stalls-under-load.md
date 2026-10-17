@@ -67,8 +67,9 @@ A 100M fill grows its file by about 36 segments (`runs/n100000000-r2011..r2014-x
 - 14.7-15.4 GB of zeros in all;
 - each late segment one 626 MiB burst, about every 1.6 s of fill.
 
-The zeros are needed: a file's own first writes stall its other writers on ext4 as on APFS
-(research/48 §4).
+Whether the zeros were needed was taken from research/48 §4, a file's own first writes
+stalling its other writers on ext4 as on APFS. That measurement wrote past the file's end; §8
+measures a segment allocated whole, written without them.
 
 ## 4. The stalls of seconds: the root leaf's first settle
 
@@ -109,8 +110,7 @@ That is to be measured against the candidate:
   - Does the root's first compaction, which computed 1-1.2 s, need to merge that much while
     the root fills?
   - Does a packing need to fault 17,803 fresh pages?
-- **Step two for the zeros.** Must they come as one 626 MiB burst beside the packing the writer
-  waits on? A first writer in another file stalls no one (research/48 §4).
+- **Step two for the zeros:** §8.
 - **The cut under load.** 0.45× against the candidate's 0.69× at 12 loops, worse in 3 of 4
   rounds. That regression is unexplained, so the cut is not adopted (cache-wr's research/57 §8).
 
@@ -183,3 +183,39 @@ Worst put and CPU are lower-is-better; CPU is the run's user and system seconds.
   CPUs get, not the spin.
 - On the whole host at 10M the change did the same work with 8% less CPU.
 - At 100M the base's worst puts were 35-736 ms and the change's 9-594 ms.
+## 7. 100M: the growth's zeros
+
+**Traced** (`diag-runs/n100000000-r2901..r2903`, t_trmain, stalls.py):
+
+| round | stalls | stall time | waiting on a growth |
+|---|---|---|---|
+| r2901 | 2 | 0.9 s | none: a packing at 12% CPU, 1.26 s |
+| r2902 | 5 | 2.5 s | 4, all in the fill's first 3 s |
+| r2903 | 10 | 6.0 s | 6 in the first 7 s, one of 4.5 s |
+
+Each early growth wrote a 64 MiB segment's zeros in 0.24-1.39 s at 0% CPU while the fill wanted
+about 500 MB/s; later, packings and compactions ran at 2-16% CPU beside a growth writing its
+zeros (`r2941`, `r2951..r2952`). The zeros are a write of every new byte: 14.65 GB in a 100M fill
+whose writes came to 44-46 GB.
+
+**What they buy on Linux.** None of the transfers they were for. ext4's, XFS's and btrfs's
+buffered writes take the inode's lock exclusively whether they overwrite or not; their direct
+writes within the file take it shared whatever the extent state; a segment is allocated whole
+(`fallocate(2)`), so no write into it extends the file (research/48 [ext4] [xfs] [btrfs]). What they save is the extents' conversion,
+which the journal commits at the next flush, and the store flushes at its checkpoints.
+
+**The change: on Linux a new segment is allocated whole and not written with zeros**
+(`store::ZEROS_NEW_SEGMENTS`); on APFS and NTFS the zeros stay. Against main in the same round,
+4 rounds each (`runs/n*-r3101..r3164`), beside it the zeros gone with the pool on every core
+("both": cores-wr's `Pool::cores`, a variant not landed):
+
+| condition | fills, zeros gone | worst fill, zeros gone | worst fill, both | both's worst / main's |
+|---|---|---|---|---|
+| 10M, whole host | 1.06×, 4/4 | 0.86×, 3/4 | 0.80×, 4/4 | 5.6 / 89 ms |
+| 10M, 18 busy loops | 1.24×, 3/4 | 0.76×, 2/4 | 1.86×, 2/4 | 420 / 778 ms |
+| two CPUs | 1.07×, 4/4 | 0.92×, 3/4 | 0.37×, 4/4 | 464 / 836 ms |
+| two CPUs, 2 loops | 0.92×, 2/4 | 0.99×, 2/4 | 0.01×, 4/4 | 14 / 2,128 ms |
+| one CPU | 1.11×, 3/4 | 0.37×, 4/4 | 0.76×, 4/4 | 49 / 111 ms |
+| 100M | 1.00×, 2/4 | 1.26×, 1/4 | 0.72×, 2/4 | 78 / 587 ms |
+
+[The confirmation on main f417e4c, traced and against main with RocksDB and SplinterDB beside, goes here.]

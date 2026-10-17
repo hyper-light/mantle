@@ -165,6 +165,20 @@ pub const RANGE_FILTER_BITS: u32 = 8;
 /// first checkpoint's map, whose one count takes one page of one extent.
 const FIRST_SEGMENT_EXTENTS: u64 = 2;
 
+/// Whether a new segment is written whole with zeros before any of its extents is handed out. On
+/// APFS and NTFS a file's own first writes hold up its other reads and writes, while a first writer
+/// in another file holds up none (research/48 §2, §4), and NTFS fills the space below a write past
+/// a file's valid data length with zeros itself (research/48 [ntfs]): there the zeros, written once
+/// by a worker past the cache, make every later transfer an overwrite. On Linux they make none
+/// sooner: ext4's, XFS's and btrfs's buffered writes take the inode's lock exclusively whether they
+/// overwrite or not, their direct writes within the file take it shared whatever the extent state,
+/// and a segment allocated whole (`fallocate(2)`) takes no extending write (research/48 [ext4]
+/// [xfs] [btrfs]). What they save there, the extents' conversion the journal commits at the next
+/// flush, comes at the store's checkpoints; what they cost is a write of every new byte, 14.65 GB
+/// in a 100M fill, which the fill waited for whenever the disk wrote slower than the file grew
+/// (research/58 §7).
+const ZEROS_NEW_SEGMENTS: bool = !cfg!(target_os = "linux");
+
 /// A store over one file, owned by one thread (as every `BlockFile` is).
 #[derive(Debug)]
 pub struct Store<F: BlockFile> {
@@ -1413,8 +1427,9 @@ impl<F: BlockFile> Store<F> {
     }
 
     /// Adds the segment booked at `start` of `extents` when `add` (else it exists), through this
-    /// store's own file, and writes it whole with zeros: a worker's growth job, or the shard's
-    /// own while it is cold (creation, recovery).
+    /// store's own file, and writes it whole with zeros where the platform needs them
+    /// ([`ZEROS_NEW_SEGMENTS`]): a worker's growth job, or the shard's own while it is cold
+    /// (creation, recovery).
     pub fn grow_segment(&mut self, start: u64, extents: u64, add: bool) -> Result<(), Error> {
         blocking_allowed("a synchronous segment write in a runtime task")?;
         let bytes = Self::extent_bytes(self.config)?;
@@ -1437,6 +1452,9 @@ impl<F: BlockFile> Store<F> {
                     what: "a segment added somewhere other than past the admitted extents",
                 });
             }
+        }
+        if !ZEROS_NEW_SEGMENTS {
+            return Ok(());
         }
         let zeros = Self::run_buf(file.alignment(), self.config)?;
         file.write_whole(at, extents, zeros.as_slice())

@@ -9,10 +9,11 @@
 //! - The writer's rounds of puts and deletes finish, inline and through the range's channel;
 //!   flushed, checkpointed, stopped and reopened cold, every key reads its newest value or is gone,
 //!   and the store's image is exactly the writes'.
-//! - A growth write that fails ends the range in that fault: the operation that waited for it, a
-//!   later read and the stop each answer with it, and the store reopens at its checkpoint exactly.
-//! - A stop asked while a growth write is held answers only after that write has finished, and
-//!   the store reopens at its checkpoint exactly.
+//! - A growth that fails, its segment's add, ends the range in that fault: the operation that
+//!   waited for it, a later read and the stop each answer with it, and the store reopens at its
+//!   checkpoint exactly.
+//! - A stop asked while a growth is held answers only after it has finished, and the store
+//!   reopens at its checkpoint exactly.
 //!
 //! Each wait for a fact has a failure guard ([`WAIT`]) a passing run never reaches.
 //!
@@ -108,8 +109,9 @@ fn round(r: u64) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
     ops
 }
 
-/// Growth writes on the workers' files: passed through until the gate is armed; once armed,
-/// counted as they begin and finish, held until it opens when it holds, failed when it fails.
+/// Growths on the workers' files, each its segment's add (`BlockFile::grow`), the I/O every
+/// growth makes on every target: passed through until the gate is armed; once armed, counted as
+/// they begin and finish, held until it opens when it holds, failed when it fails.
 struct Gate {
     state: Mutex<GateState>,
     changed: Condvar,
@@ -161,7 +163,7 @@ impl Gate {
         self.changed.notify_all();
     }
 
-    fn write(&self, write: impl FnOnce() -> Result<(), DiskError>) -> Result<(), DiskError> {
+    fn write<T>(&self, write: impl FnOnce() -> Result<T, DiskError>) -> Result<T, DiskError> {
         let mut s = self.state();
         if !s.armed {
             drop(s);
@@ -209,7 +211,7 @@ impl Gate {
     }
 }
 
-/// Opens the gate when dropped: a failed assertion leaves no worker held in a growth write.
+/// Opens the gate when dropped: a failed assertion leaves no worker held in a growth.
 struct Open(&'static Gate);
 
 impl Drop for Open {
@@ -218,7 +220,7 @@ impl Drop for Open {
     }
 }
 
-/// The store's file grown by segments; a worker's growth writes pass its gate.
+/// The store's file grown by segments; a worker's growths pass its gate.
 struct Grown {
     file: SegmentedFile,
     gate: Option<&'static Gate>,
@@ -262,13 +264,13 @@ impl BlockFile for Grown {
         self.file.grows_by_segments()
     }
     fn grow(&self, len: u64) -> Result<Option<u64>, DiskError> {
-        self.file.grow(len)
+        match self.gate {
+            Some(gate) => gate.write(|| self.file.grow(len)),
+            None => self.file.grow(len),
+        }
     }
     fn write_whole(&self, offset: u64, copies: u64, fill: &[u8]) -> Result<(), DiskError> {
-        match self.gate {
-            Some(gate) => gate.write(|| self.file.write_whole(offset, copies, fill)),
-            None => self.file.write_whole(offset, copies, fill),
-        }
+        self.file.write_whole(offset, copies, fill)
     }
     fn segment_end(&self, offset: u64) -> Result<Option<u64>, DiskError> {
         self.file.segment_end(offset)
@@ -312,7 +314,7 @@ fn runtime() -> Runtime {
 }
 
 /// A range on a new store at `path` grown by segments, its maintenance worker the memory budget's
-/// one, its growth writes passing `gate`; clients `inline` or through the range's channel.
+/// one, its growths passing `gate`; clients `inline` or through the range's channel.
 fn start(path: &Path, gate: &'static Gate, inline: bool) -> (Runtime, Issuer, Ranges) {
     let mut runtime = runtime();
     let created = SegmentedFile::create(path, CachingRequest::Buffered, align(), BOUND).unwrap();
@@ -494,8 +496,8 @@ async fn checkpointed(
     (oracle, ROWS)
 }
 
-/// Do: a checkpointed round; then, every growth write from here failing, puts of big values past
-/// one memtable, so a rotation hands a full one to packing behind the writer; once a growth write
+/// Do: a checkpointed round; then, every growth from here failing, puts of big values past
+/// one memtable, so a rotation hands a full one to packing behind the writer; once a growth
 /// has failed, a flush, which settles that packing, then a read, a put and the stop. Expect: the
 /// flush answers with the failed segment write, the range's fault, and the read, the put and the
 /// stop each with that same cause; reopened cold, the store holds exactly the checkpoint's image.
@@ -547,7 +549,7 @@ fn a_failed_growth_write_ends_the_range_in_that_fault() {
     gate.arm(false, true);
     go.blocking_send(()).unwrap();
     received(&put_rx, "the writer's puts answered");
-    gate.until("a growth write failed", |s| s.finished >= 1);
+    gate.until("a growth failed", |s| s.finished >= 1);
     after.blocking_send(()).unwrap();
     let (oracle, applied, early, flushed, read, wrote, stopped) =
         received(&finished, "the writer's run after the fault");
@@ -558,12 +560,12 @@ fn a_failed_growth_write_ends_the_range_in_that_fault() {
         Some(error) => error.clone(),
         None => flushed
             .as_ref()
-            .expect_err("the flush after the failed growth write")
+            .expect_err("the flush after the failed growth")
             .clone(),
     };
     match &first {
         Error::Io { op, detail } => {
-            assert_eq!(*op, "write a store segment whole", "{first:?}");
+            assert_eq!(*op, "add a store segment", "{first:?}");
             assert!(
                 detail.contains("a test's failed growth write"),
                 "the fault is the injected write failure: {first:?}"
@@ -583,11 +585,11 @@ fn a_failed_growth_write_ends_the_range_in_that_fault() {
     reopened(&path, applied, &oracle);
 }
 
-/// Do: a checkpointed round; then, every growth write from here held, puts of big values past one
+/// Do: a checkpointed round; then, every growth from here held, puts of big values past one
 /// memtable, so a rotation hands a full one to packing behind the writer, which is idle once its
-/// puts are answered; once a growth write is held, the writer goes and the range is asked to stop;
+/// puts are answered; once a growth is held, the writer goes and the range is asked to stop;
 /// once the shard has parked with the stop asked, the held writes are let go. Expect: the stop
-/// answers only after every held growth write has finished; reopened cold, the store holds
+/// answers only after every held growth has finished; reopened cold, the store holds
 /// exactly the checkpoint's image.
 #[test]
 fn a_stop_asked_while_a_growth_write_is_held_answers_after_it() {
@@ -628,7 +630,7 @@ fn a_stop_asked_while_a_growth_write_is_held_answers_after_it() {
     gate.arm(true, false);
     go.blocking_send(()).unwrap();
     received(&put_rx, "the writer's puts answered");
-    gate.until("a growth write held", |s| s.begun >= 1);
+    gate.until("a growth held", |s| s.begun >= 1);
     let before = waits(shard);
     stop.blocking_send(()).unwrap();
     received(&asked_rx, "the stop asked");
@@ -638,7 +640,7 @@ fn a_stop_asked_while_a_growth_write_is_held_answers_after_it() {
     assert_eq!(
         gate.now().finished,
         0,
-        "a held growth write finished before its release"
+        "a held growth finished before its release"
     );
     gate.open();
     let (oracle, applied, stopped, at_stop) = received(&finished, "the stop's answer");
@@ -646,7 +648,7 @@ fn a_stop_asked_while_a_growth_write_is_held_answers_after_it() {
     drop(issuer);
     assert!(
         at_stop.begun >= 1 && at_stop.finished == at_stop.begun,
-        "the stop answered before the held growth writes finished: {at_stop:?}, its answer \
+        "the stop answered before the held growths finished: {at_stop:?}, its answer \
          {stopped:?}"
     );
     stopped.unwrap();

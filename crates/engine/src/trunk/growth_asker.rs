@@ -8,12 +8,12 @@
 //!   every extent granted or topped up is the output's or comes back unused, each once;
 //! - a segment booked before the ask and smaller than it is grown and admitted first, and the ask,
 //!   still short, is handed a second growth, each reported;
-//! - a growth whose write fails comes back as that failure, which stays the pool's first error
-//!   through the close, whether the close began before the report or after;
-//! - a growth whose write unwinds comes back failed when its asker's job ends, the unwind first;
-//! - a close that begins while the asker's growth write is held completes only after that write.
+//! - a growth that fails, its segment's add, comes back as that failure, which stays the pool's
+//!   first error through the close, whether the close began before the report or after;
+//! - a growth that unwinds comes back failed when its asker's job ends, the unwind first;
+//! - a close that begins while the asker's growth is held completes only after that growth.
 //!
-//! Facts decide every verdict: the gate counts growth writes begun and finished, the runtime task
+//! Facts decide every verdict: the gate counts growths begun and finished, the runtime task
 //! reports what it saw, and each wait for a fact has a failure guard ([`WAIT`]) a passing run never
 //! reaches.
 #![cfg(test)]
@@ -62,8 +62,9 @@ const WAIT: Duration = Duration::from_secs(5);
 /// each, the job's result, and the close's.
 const MESSAGES: usize = 64;
 
-/// Growth writes on the worker's file: counted as they begin and as they finish; held until the
-/// gate opens; the write numbered `fail` fails, the one numbered `unwind` unwinds.
+/// Growths on the worker's file, each its segment's add (`BlockFile::grow`), the I/O every growth
+/// makes on every target: counted as they begin and as they finish; held until the gate opens;
+/// the growth numbered `fail` fails, the one numbered `unwind` unwinds.
 struct Gate {
     state: Mutex<GateState>,
     changed: Condvar,
@@ -102,9 +103,9 @@ impl Gate {
         *self.state()
     }
 
-    /// A growth write on the worker's file: counted, held until the gate opens, then failed,
-    /// unwound or made as its number says.
-    fn write(&self, write: impl FnOnce() -> Result<(), DiskError>) -> Result<(), DiskError> {
+    /// A growth on the worker's file: counted, held until the gate opens, then failed, unwound or
+    /// made as its number says.
+    fn write<T>(&self, write: impl FnOnce() -> Result<T, DiskError>) -> Result<T, DiskError> {
         let mut s = self.state();
         let me = s.begun;
         s.begun += 1;
@@ -157,7 +158,7 @@ impl Gate {
     }
 }
 
-/// Opens the gate when dropped: a failed assertion leaves no worker held in a growth write.
+/// Opens the gate when dropped: a failed assertion leaves no worker held in a growth.
 struct OpenOnDrop(&'static Gate);
 
 impl Drop for OpenOnDrop {
@@ -166,7 +167,7 @@ impl Drop for OpenOnDrop {
     }
 }
 
-/// The store's file grown by segments; the worker's growth writes pass its gate.
+/// The store's file grown by segments; the worker's growths pass its gate.
 struct Grown {
     file: SegmentedFile,
     gate: Option<&'static Gate>,
@@ -210,13 +211,13 @@ impl BlockFile for Grown {
         self.file.grows_by_segments()
     }
     fn grow(&self, len: u64) -> Result<Option<u64>, DiskError> {
-        self.file.grow(len)
+        match self.gate {
+            Some(gate) => gate.write(|| self.file.grow(len)),
+            None => self.file.grow(len),
+        }
     }
     fn write_whole(&self, offset: u64, copies: u64, fill: &[u8]) -> Result<(), DiskError> {
-        match self.gate {
-            Some(gate) => gate.write(|| self.file.write_whole(offset, copies, fill)),
-            None => self.file.write_whole(offset, copies, fill),
-        }
+        self.file.write_whole(offset, copies, fill)
     }
     fn segment_end(&self, offset: u64) -> Result<Option<u64>, DiskError> {
         self.file.segment_end(offset)
@@ -282,7 +283,7 @@ fn inputs(store: &mut Store<Grown>) -> (Branch, Branch, Image) {
 
 /// A case's prepared parts: the shard's store on a segmented file whose admitted extents are all
 /// held (the inputs' and a holder's), so the job's first ask for more waits for growth; a pool of
-/// one worker over the file opened again, whose growth writes pass the case's gate; and the job
+/// one worker over the file opened again, whose growths pass the case's gate; and the job
 /// sent to it, a merge granted all its inputs' extents and one more a part, as the trunk granted
 /// one.
 struct Case {
@@ -588,7 +589,7 @@ async fn shard(
 fn run(gate: &'static Gate, plan: Plan) -> (Fact, Case, Store<Grown>) {
     let (case, store, pool) = case(gate);
     // Declared after the case, so a failing exit opens the gate before the case's runtime and
-    // worker are torn down: no teardown waits on a held growth write.
+    // worker are torn down: no teardown waits on a held growth.
     let _open = OpenOnDrop(gate);
     let (facts_tx, facts) = mpsc::sync_channel(4);
     let (done_tx, done) = mpsc::sync_channel(1);
@@ -609,12 +610,12 @@ fn run(gate: &'static Gate, plan: Plan) -> (Fact, Case, Store<Grown>) {
         ticket.worker, case.ticket.worker,
         "the growth goes to the one worker, whose job waits for extents"
     );
-    gate.until("the asker's growth write held", |s| s.begun == 1);
+    gate.until("the asker's growth held", |s| s.begun == 1);
     if plan.close_early {
         let closing = facts.recv_timeout(WAIT).expect("the close never began");
         assert!(matches!(closing, Fact::Closing), "{closing:?}");
     }
-    assert_eq!(gate.now().finished, 0, "the growth write is held, not done");
+    assert_eq!(gate.now().finished, 0, "the growth is held, not done");
     gate.open();
     let end = facts.recv_timeout(WAIT).expect("the case never ended");
     let store = done
@@ -721,7 +722,7 @@ fn completed(fact: Fact, case: &Case, store: &mut Store<Grown>, growths_at_least
     store.grant_back(&case.holder).unwrap();
 }
 
-/// The error a failed growth write carries.
+/// The error a failed growth carries.
 fn the_failed_write(error: &Error) -> bool {
     matches!(error, Error::Io { detail, .. } if detail.contains("a test's failed growth write"))
 }
@@ -758,9 +759,9 @@ fn an_ask_past_an_undersized_booked_segment_is_handed_a_second_growth() {
     drop(case.issuer);
 }
 
-/// Do: as the first case, but the asker's growth write fails once let go. Expect: the growth
-/// comes back under its ticket as the write's failure; the asker's job ends refused once the pool
-/// closes; the close reports the write's failure first, not the refusal.
+/// Do: as the first case, but the asker's growth, its segment's add, fails once let go. Expect:
+/// the growth comes back under its ticket as that failure; the asker's job ends refused once the
+/// pool closes; the close reports the growth's failure first, not the refusal.
 #[test]
 fn a_growth_whose_write_fails_stays_the_first_error_through_the_close() {
     let gate = Gate::leak(Some(0), None);
@@ -814,7 +815,7 @@ fn a_growth_that_fails_after_the_close_began_stays_the_first_error() {
     assert_eq!(
         (at_close.begun, at_close.finished),
         (1, 1),
-        "the close completed before the held growth write finished"
+        "the close completed before the held growth finished"
     );
     assert_eq!(growths.len(), 1, "{growths:?}");
     assert!(
@@ -830,7 +831,7 @@ fn a_growth_that_fails_after_the_close_began_stays_the_first_error() {
     drop(case.issuer);
 }
 
-/// Do: as the first case, but the asker's growth write unwinds once let go. Expect: the asker's
+/// Do: as the first case, but the asker's growth unwinds once let go. Expect: the asker's
 /// job ends unwound, its growth unreported, and the growth comes back under its ticket failed with
 /// the unwind as its cause; the worker retires and the close completes, its first error the same.
 #[test]
@@ -851,7 +852,7 @@ fn a_growth_that_unwinds_comes_back_failed_when_its_askers_job_ends() {
     assert_eq!(
         (at_close.begun, at_close.finished),
         (1, 0),
-        "the growth write began and unwound"
+        "the growth began and unwound"
     );
     assert_eq!(growths.len(), 1, "{growths:?}");
     assert!(
@@ -890,7 +891,7 @@ fn a_close_while_an_askers_growth_is_held_waits_for_its_write() {
     assert_eq!(
         (at_close.begun, at_close.finished),
         (1, 1),
-        "the close completed before the held growth write finished"
+        "the close completed before the held growth finished"
     );
     assert_eq!(growths.len(), 1, "{growths:?}");
     assert!(growths[0].1.is_ok(), "{growths:?}");

@@ -151,9 +151,10 @@ fn received<T>(from: &mpsc::Receiver<T>, what: &str, progress: Progress) -> T {
     );
 }
 
-/// Growth writes made on the workers, let through by count: the first `allowed` go on, every
-/// later one waits in its write until it is allowed or every one is let go. `started` counts the
-/// growth writes begun; those from `failing` on fail once let through.
+/// Growths made on the workers, each its segment's add (`BlockFile::grow`), the I/O every growth
+/// makes on every target, let through by count: the first `allowed` go on, every later one waits
+/// in its add until it is allowed or every one is let go. `started` counts the growths begun;
+/// those from `failing` on fail once let through.
 struct Growths {
     state: Mutex<GrowthState>,
     changed: Condvar,
@@ -185,7 +186,7 @@ impl Growths {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// A worker's growth write: counted, then held until it is let through; a failing one fails.
+    /// A worker's growth: counted, then held until it is let through; a failing one fails.
     fn pass(&self) -> Result<(), DiskError> {
         let mut s = self.state();
         let me = s.started;
@@ -207,13 +208,13 @@ impl Growths {
         Ok(())
     }
 
-    /// Every growth write begun from now on fails.
+    /// Every growth begun from now on fails.
     fn fail_from_now(&self) {
         let mut s = self.state();
         s.failing = s.started;
     }
 
-    /// Waits until `n` growth writes have begun, the guard on the run's progress ([`until`]).
+    /// Waits until `n` growths have begun, the guard on the run's progress ([`until`]).
     fn until_started(&self, n: u64, progress: Progress) {
         let mut seen = progress.now();
         let mut s = self.state();
@@ -235,14 +236,14 @@ impl Growths {
             let now = progress.now();
             assert!(
                 now != seen,
-                "growth write {n}: not begun, the run without progress for the failure guard's \
+                "growth {n}: not begun, the run without progress for the failure guard's \
                  span: {}",
                 progress.at()
             );
             seen = now;
         }
         panic!(
-            "growth write {n}: not begun within the run's progress: {}",
+            "growth {n}: not begun within the run's progress: {}",
             progress.at()
         );
     }
@@ -267,7 +268,7 @@ impl Drop for Open {
     }
 }
 
-/// A store file grown by segments; a worker's growth writes pass its test's [`Growths`].
+/// A store file grown by segments; a worker's growths pass its test's [`Growths`].
 struct Grown {
     file: SegmentedFile,
     growths: Option<&'static Growths>,
@@ -311,12 +312,12 @@ impl BlockFile for Grown {
         self.file.grows_by_segments()
     }
     fn grow(&self, len: u64) -> Result<Option<u64>, DiskError> {
-        self.file.grow(len)
-    }
-    fn write_whole(&self, offset: u64, copies: u64, fill: &[u8]) -> Result<(), DiskError> {
         if let Some(growths) = self.growths {
             growths.pass()?;
         }
+        self.file.grow(len)
+    }
+    fn write_whole(&self, offset: u64, copies: u64, fill: &[u8]) -> Result<(), DiskError> {
         self.file.write_whole(offset, copies, fill)
     }
     fn segment_end(&self, offset: u64) -> Result<Option<u64>, DiskError> {

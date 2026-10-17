@@ -19,6 +19,10 @@ Sources. Measured on this Mac (APFS, the internal SSD) and on CI's runners for e
   "regardless of extent state", and exclusively, completing synchronously, when it extends.
 - **[xfs]** Linux `fs/xfs/xfs_file.c`: buffered reads take the iolock shared and buffered writes
   exclusively; aligned direct writes shared; extending direct writes exclusively.
+- **[btrfs]** Linux v6.12 `fs/btrfs/file.c`: `btrfs_buffered_write` takes the inode's lock
+  exclusively for every buffered write; `fs/btrfs/direct-io.c`: `btrfs_direct_write` takes it
+  shared when the write ends within the file's size and exclusively when it extends, and a write
+  into a preallocated extent goes in place, without copy-on-write, and converts it.
 - **[pg]** PostgreSQL, `wal_init_zero`: "new WAL files [are] filled with zeroes. On some file
   systems, this ensures that space is allocated before we need to write WAL records"; and
   `wal_recycle`, segments reused by renaming them.
@@ -122,6 +126,11 @@ segment's admission, the wait for a free worker included (§6); a packing, a com
 worker's ask that does not fit waits for the growth. Opened,
 the segments holding an extent ever handed out are admitted, and a segment past them, which a crash
 may have left unwritten, is written again before use.
+
+On Linux the segments are no longer written whole (research/58 §7): ext4's, XFS's and btrfs's writes
+take the inode's lock the same way whether they overwrite or not ([ext4] [xfs] [btrfs]), a segment
+allocated whole takes no extending write, and the zeros, a write of every new byte, were what a 100M
+fill waited on there.
 
 ## 6. Writing a segment whole
 

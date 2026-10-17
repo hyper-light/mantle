@@ -80,6 +80,10 @@ const SLOT: usize = OFFSET + KEY_HEAD;
 /// A suffix's head: its first 4 bytes, big-endian, zero-padded. Heads that differ order their
 /// suffixes as the suffixes order; equal heads say nothing, and the suffixes are compared.
 fn key_head(suffix: &[u8]) -> u32 {
+    // A suffix of a head's bytes or more, almost every one: one load.
+    if let Some(b) = suffix.first_chunk::<KEY_HEAD>() {
+        return u32::from_be_bytes(*b);
+    }
     let mut b = [0u8; KEY_HEAD];
     for (d, s) in b.iter_mut().zip(suffix) {
         *d = *s;

@@ -77,7 +77,9 @@ fn ready(trunk: &Trunk) -> bool {
 /// leaf holds enters the root, and one paced step runs.
 /// Expect: the root's compaction is ready, no seat takes it, and the trunk says the shard waits
 /// for a worker's message. Let the held job go: once its result is on the channel, the next
-/// paced step hands the compaction the freed seat. Drained, every row reads back.
+/// paced step hands the compaction the freed seat, which its worker takes (its result may come
+/// back within that step: on one CPU the worker ran it and the step applied it, 55 of 300 runs,
+/// 2026-10-17). Drained, every row reads back.
 #[test]
 fn a_compaction_no_seat_takes_waits_for_a_workers_message() {
     let dir = tempfile::tempdir().unwrap();
@@ -136,10 +138,15 @@ fn a_compaction_no_seat_takes_waits_for_a_workers_message() {
     });
     trunk.clear_io_wait();
     trunk.step_paced(&mut store, KEYS).unwrap();
-    assert!(
-        trunk.workers_out() && !ready(&trunk),
-        "the compaction did not take the freed seat"
-    );
+    assert!(!ready(&trunk), "the compaction did not take the freed seat");
+    relays.until("the compaction on the freed seat", |s| {
+        s.events.iter().skip(from).any(|e| {
+            *e == Event::Job {
+                seat,
+                kind: Kind::Compact,
+            }
+        })
+    });
     // Drained: each step waits for every job out, and planning is bounded by the rows.
     for _ in 0..=ROWS {
         if trunk.is_idle() {

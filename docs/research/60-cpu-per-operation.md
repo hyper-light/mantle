@@ -70,9 +70,25 @@ of arithmetic independent of the reads:
 
 The core reaches the next get's reads while this one's are out only when the work between fits its
 window. At 1,600 instructions a get, consecutive gets' misses never overlap, so cutting a few
-hundred changes nothing; a get of a few hundred instructions would overlap them and beat the serial
-floor of §2. Natively on macOS the effect is weaker: at 16 KiB pages its table walks bound the
-overlap (146 ns an op with no work between).
+hundred changes nothing.
+
+Nor would a get of a few hundred: the bench reads the clock once an operation for its latency
+histogram, as db_bench does, and on arm64 Linux the vDSO reads the counter after an `isb`, which
+drains the pipeline, unless the CPU has the self-synchronizing counter (`FEAT_ECV`; Linux
+`arch/arm64/include/asm/vdso/gettimeofday.h`, `__arch_get_hw_counter`). The VM's CPU reports no
+`ecv`. `mlp2.c` repeats the measurement with a `clock_gettime` an operation:
+
+| work between (VM, 100M sizes) | no clock read | a clock read an op |
+|---|---|---|
+| ~0 instructions | 18 ns | 328 ns |
+| ~200 | 110 ns | 362 ns |
+| ~400 | 175 ns | 351 ns |
+| ~800 | 377 ns | 394 ns |
+
+So a get in this bench is its two serial reads (§2) and its instructions, end to end, whatever its
+length: half of a 100M get is below the floor. Natively on macOS a timer read did not serialize so
+(the native runs were noisy), and at 16 KiB pages its table walks bound the overlap anyway (146 ns
+an op with no work between).
 
 ## 4. Where the instructions go
 
@@ -176,8 +192,10 @@ on the consolidate case, 0.99× on the pivot case.
 
 ## 7. What half needs
 
-- Gets: the work between consecutive gets' reads down to a few hundred instructions, or fewer
-  lines a get. The floor and its harness are about 360-390 ns at 100M in the VM.
+- Gets: under a clock read an operation (§3) a get is its two serial reads and its instructions;
+  the floor and its harness are about 360-390 ns at 100M in the VM against 550-580 measured, so
+  what is left is the engine's instructions (about 440 a get on main 935428c, callgrind) and any
+  line a get reads beyond the slot and the entry.
 - Seeks: fewer dependent lines a seek (the trie's levels, the leaf's header and search, the
   entry), since their instructions are not what they wait on.
 - Puts: workers are compute-bound, so their instructions are CPU; each put is written about four

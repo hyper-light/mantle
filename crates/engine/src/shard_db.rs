@@ -1440,15 +1440,16 @@ impl<F: BlockFile> ShardDb<F> {
         if self.memory.is_none() {
             return;
         }
-        self.trim();
+        let trimmed = self.trim();
         self.ops_since = self.ops_since.saturating_add(1);
-        if self.ops_since >= self.cycle_ops {
+        let retuned = self.ops_since >= self.cycle_ops;
+        if retuned {
             self.ops_since = 0;
             self.retune();
         }
         // A tuning step may have moved shares, write memory's among them: the kept memtables give
-        // way at once.
-        if self.kept_crowded() {
+        // way at once. With none made, the look the get's lookup ends with is the one it needs.
+        if (trimmed || retuned) && self.kept_crowded() {
             self.fit_kept(false);
         }
     }
@@ -1591,12 +1592,12 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     /// An operation's share of bringing shrunk regions down to their size; what they gave back
-    /// the growing regions may take ([`Self::grant`]).
-    fn trim(&mut self) {
+    /// the growing regions may take ([`Self::grant`]). Whether any region was still trimming.
+    fn trim(&mut self) -> bool {
         // Its regions only: the kept memtables' part of `trimming` is given back by their index's
         // return, not here.
         if self.trim_cache == 0 && self.trim_records == 0 {
-            return;
+            return false;
         }
         if self.trim_cache > 0 && !self.store.trim_cache(self.trim_cache) {
             self.trim_cache = 0;
@@ -1610,6 +1611,7 @@ impl<F: BlockFile> ShardDb<F> {
             self.trim_records = 0;
         }
         self.grant();
+        true
     }
 
     /// Gives point reads a cache of `bytes` of hot records (`records::RecordCache`), replacing

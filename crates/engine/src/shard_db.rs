@@ -2423,6 +2423,26 @@ impl<F: BlockFile> ShardDb<F> {
                 .filter_map(MemCursor::key)
                 .filter(|k| before_end(k))
                 .min();
+            if mem_a.is_none()
+                && mem_p.is_none()
+                && mem_f.is_none()
+                && let Some((k, op, v)) = merge.entry()
+            {
+                // Only the trunk holds keys from here: its entry is the row, read where the
+                // merge holds it, with nothing of the memtables to compare it with.
+                if taken == limit {
+                    next.extend_from_slice(k);
+                    break Ok(true);
+                }
+                if op == Op::Put {
+                    out.push(k, v);
+                    taken = taken.saturating_add(1);
+                }
+                if let Err(error) = merge.next(store) {
+                    break Err(error);
+                }
+                continue;
+            }
             let Some(least) = [mem_a, mem_p, mem_f, tree].into_iter().flatten().min() else {
                 break Ok(false);
             };

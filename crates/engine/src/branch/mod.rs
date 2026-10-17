@@ -1635,15 +1635,17 @@ impl RunCursor {
         }
         self.index = self.index.saturating_add(1);
         if self.index < self.n {
-            if let Some((slot, address)) = self.cached
-                && store.cache_page(slot, address).is_none()
-            {
-                // The cache gave the leaf's slot away: read the leaf again.
+            if let Some((slot, address)) = self.cached {
+                // The leaf's slot looked up once: its entry loaded from it, or, given away by
+                // the cache, the leaf read again.
+                if let Some(page) = store.cache_page(slot, address) {
+                    return self.load_cached(page);
+                }
                 self.loaded = None;
                 self.prefixed = false;
                 return self.land(branch, store, self.page_no, self.index);
             }
-            return self.load_in(store);
+            return self.load();
         }
         self.next_leaf(branch, store)
     }
@@ -1931,6 +1933,12 @@ impl RunCursor {
         let page = store
             .cache_page(slot, address)
             .ok_or(corrupt(Malformed::Truncated))?;
+        self.load_cached(page)
+    }
+
+    /// Loads entry `index` of the leaf held in the cache's `page`, its value copied out: the
+    /// cache may give the slot away before the cursor's next step.
+    fn load_cached(&mut self, page: &[u8]) -> Result<(), Error> {
         let (op, value) = Self::decode(
             page,
             self.table,

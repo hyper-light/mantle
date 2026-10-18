@@ -230,7 +230,16 @@ pub struct Cache {
     loan_room: u64,
     loan_kept: u64,
     loan_missed: u64,
+    /// The store's pages an extent, and each extent's slot hint ([`Self::hint`]): where its
+    /// pages lie were they in a row as a loan keeps them, `NO_HINT` for none. One word an
+    /// extent, at most one a store extent, so a landing reads it from a line the CPU holds
+    /// where the index's control word and bucket are a miss each at scale.
+    extent_pages: u64,
+    hints: Vec<u32>,
 }
+
+/// An extent with no slot hint: a hint is at least 1 ([`Cache::hint`]).
+const NO_HINT: u32 = 0;
 
 /// Where a cache's memory is, in pages, and what its loans held ([`Cache::memory`]): what
 /// sizes a loan (research/50 §13).
@@ -255,9 +264,9 @@ pub struct Memory {
 }
 
 impl Cache {
-    /// A cache of `pages` pages of `page` bytes, at least one. Its memory is taken as reads
-    /// want it ([`Self::reserve`]).
-    pub fn new(pages: usize, page: usize) -> Self {
+    /// A cache of `pages` pages of `page` bytes, at least one, for a store of `extent_pages`
+    /// pages an extent. Its memory is taken as reads want it ([`Self::reserve`]).
+    pub fn new(pages: usize, page: usize, extent_pages: u64) -> Self {
         Self {
             page,
             limit: pages.max(1),
@@ -293,6 +302,8 @@ impl Cache {
             loan_room: 0,
             loan_kept: 0,
             loan_missed: 0,
+            extent_pages,
+            hints: Vec::new(),
         }
     }
 
@@ -736,6 +747,7 @@ impl Cache {
                 self.push(queue, i);
                 self.map
                     .insert(address, u64::try_from(i).unwrap_or(u64::MAX));
+                self.hint(address, i);
                 live = live.saturating_add(1);
             }
             self.loan_kept = self
@@ -930,17 +942,38 @@ impl Cache {
         self.map.get(address).and_then(|i| usize::try_from(i).ok())
     }
 
-    /// [`Self::slot_of`] for a reader about to read the page: the index's control word and first
-    /// bucket read together ([`IncMap::get_touched`]), and, once the slot is known, its page's
-    /// first line started while the slot itself is read, the page's place taken from the layout
-    /// every chunk keeps (its slots in a row from its first, a page apart: `make_slot`, `adopt`).
+    /// [`Self::slot_of`] for a reader about to read the page: the slot its extent's hint names
+    /// ([`Self::hint`]) if it holds the page, the slot and the page's first line read together;
+    /// else the index's control word and first bucket read together ([`IncMap::get_touched`]),
+    /// and, once the slot is known, its page's first line started while the slot itself is read.
     /// A scan landing on a leaf waited on four misses in a row: the control word, the bucket,
-    /// the slot and the page (445 ns of a 10M seek's 1.1 µs placing; research/61 §2).
+    /// the slot and the page (445 ns of a 10M seek's 1.1 µs placing; research/61 §2); the index
+    /// read in pairs leaves two, the hint one.
     fn slot_touched(&self, address: u64) -> Option<usize> {
+        if let Some(i) = self.hinted(address) {
+            self.touch_page(i);
+            // The test `page_at` makes: a slot live at the address is the page's one slot, every
+            // removal from the index clearing `live` and every insert forgetting the page first.
+            if self
+                .slots
+                .get(i)
+                .is_some_and(|s| s.live && s.address == address)
+            {
+                return Some(i);
+            }
+        }
         let i = self
             .map
             .get_touched(address)
             .and_then(|i| usize::try_from(i).ok())?;
+        self.touch_page(i);
+        Some(i)
+    }
+
+    /// Starts slot `i`'s page's first line, the page's place taken from the layout every chunk
+    /// keeps (its slots in a row from its first, a page apart: `make_slot`, `adopt`), so the
+    /// page's miss overlaps the slot's.
+    fn touch_page(&self, i: usize) {
         let c = self
             .starts
             .partition_point(|&first| first <= i)
@@ -954,7 +987,57 @@ impl Cache {
         {
             std::hint::black_box(*byte);
         }
-        Some(i)
+    }
+
+    /// The slot `address`'s extent hint names for it, holding the page or not.
+    fn hinted(&self, address: u64) -> Option<usize> {
+        let extent = usize::try_from(address.checked_div(self.extent_pages)?).ok()?;
+        let hint = *self.hints.get(extent)?;
+        if hint == NO_HINT {
+            return None;
+        }
+        let within = address.checked_rem(self.extent_pages)?;
+        let i = u64::from(hint)
+            .checked_add(within)?
+            .checked_sub(self.extent_pages)?;
+        usize::try_from(i).ok()
+    }
+
+    /// Names slot `i`, a loan's page at `address`, as its extent's place: a job writes an
+    /// extent's pages in a row (`Store::write_page_paced`) and a loan keeps them in a row, so the
+    /// extent's other pages lie in the slots beside it. The hint is the slot the extent's first
+    /// page would hold plus the extent's pages, so a row that starts before the cache's first
+    /// slot has one too and none is 0. The hints grow to the extent, which the store's own
+    /// extents bound; a hint the memory refuses is not kept, the index finding the page as before.
+    fn hint(&mut self, address: u64, i: usize) {
+        let (Some(extent), Some(within)) = (
+            address.checked_div(self.extent_pages),
+            address.checked_rem(self.extent_pages),
+        ) else {
+            return;
+        };
+        let hint = u64::try_from(i)
+            .ok()
+            .and_then(|i| i.checked_add(self.extent_pages)?.checked_sub(within))
+            .and_then(|h| u32::try_from(h).ok());
+        let (Ok(extent), Some(hint)) = (usize::try_from(extent), hint) else {
+            return;
+        };
+        if let Some(len) = extent.checked_add(1)
+            && len > self.hints.len()
+        {
+            if self
+                .hints
+                .try_reserve(len.saturating_sub(self.hints.len()))
+                .is_err()
+            {
+                return;
+            }
+            self.hints.resize(len, NO_HINT);
+        }
+        if let Some(h) = self.hints.get_mut(extent) {
+            *h = hint;
+        }
     }
 
     /// The slot holding `address` with its payload, counted as a read and promoted, the look
@@ -1308,13 +1391,71 @@ mod tests {
 
     use super::*;
 
+    /// A store's pages an extent: few, so one loan's pages span several extents.
+    const EXTENT: u64 = 4;
+
     fn page(a: u64) -> Vec<u8> {
         format!("page {a}").into_bytes()
     }
 
+    /// A landing takes the slot its extent's hint names only while that slot holds the page:
+    /// a loan's pages, kept in a row across extents and from an extent's middle, are each named
+    /// by their extent's hint; a page forgotten and read again into a slot of the reads' own, or
+    /// a hinted slot given to another page, is found by the index or not at all.
+    #[test]
+    fn a_landing_trusts_an_extent_s_hint_only_while_its_slot_holds_the_page() {
+        let mut c = Cache::new(64, 16, EXTENT);
+        let mut k = c.lend(8).unwrap();
+        for a in 3..11u64 {
+            k.keep(a, &page(a));
+        }
+        c.adopt(k);
+        for a in 3..11u64 {
+            assert!(c.hinted(a).is_some(), "page {a} has no hint");
+            assert_eq!(c.hinted(a), c.slot_of(a), "page {a}");
+            let i = c.lookup_held(a).unwrap();
+            assert_eq!(c.page_at(i, a), Some(&page(a)[..]));
+        }
+        // Page 5 written again and read into a slot of the reads' own: its extent's hint names
+        // the loan's slot, which holds no page now.
+        c.forget(5);
+        assert_eq!(c.lookup_held(5), None);
+        assert_eq!(c.slot_peek(5), None);
+        c.insert(5, b"again");
+        let i = c.lookup_held(5).unwrap();
+        assert_ne!(c.hinted(5), Some(i));
+        assert_eq!(c.page_at(i, 5), Some(&b"again"[..]));
+        // The loan's pages all forgotten, its chunk lent again and filled with another extent's
+        // pages: the old extents' hints name slots that now hold those.
+        for a in 3..11u64 {
+            c.forget(a);
+        }
+        let mut k = c.lend(8).unwrap();
+        assert_eq!(k.fresh, 0, "the spare chunk was not lent");
+        for a in 20..28u64 {
+            k.keep(a, &page(a));
+        }
+        c.adopt(k);
+        for a in 3..11u64 {
+            assert_eq!(
+                c.lookup_held(a),
+                None,
+                "page {a} found after it was forgotten"
+            );
+            assert_eq!(c.slot_peek(a), None);
+        }
+        c.insert(9, b"nine");
+        let i = c.slot_peek(9).unwrap();
+        assert_eq!(c.page_at(i, 9), Some(&b"nine"[..]));
+        for a in 20..28u64 {
+            let i = c.lookup_held(a).unwrap();
+            assert_eq!(c.page_at(i, a), Some(&page(a)[..]));
+        }
+    }
+
     #[test]
     fn a_worker_s_pages_come_back_cached_in_the_memory_lent() {
-        let mut c = Cache::new(8, 16);
+        let mut c = Cache::new(8, 16, EXTENT);
         let mut k = c.lend(4).unwrap();
         for a in 0..3u64 {
             k.keep(100 + a, &page(a));
@@ -1334,7 +1475,7 @@ mod tests {
 
     #[test]
     fn memory_names_where_the_pages_are_and_what_the_loans_held() {
-        let mut c = Cache::new(64, 16);
+        let mut c = Cache::new(64, 16, EXTENT);
         for a in 100..103u64 {
             c.insert(a, &page(a));
         }
@@ -1373,7 +1514,7 @@ mod tests {
 
     #[test]
     fn a_loan_s_chunk_whose_pages_are_all_forgotten_is_lent_again_already_mapped() {
-        let mut c = Cache::new(8, 16);
+        let mut c = Cache::new(8, 16, EXTENT);
         let mut k = c.lend(4).unwrap();
         for a in 0..4u64 {
             k.keep(a, &page(a));
@@ -1408,7 +1549,7 @@ mod tests {
 
     #[test]
     fn reads_take_no_slot_of_a_loan_s_chunk_so_it_empties_whole() {
-        let mut c = Cache::new(64, 16);
+        let mut c = Cache::new(64, 16, EXTENT);
         let mut k = c.lend(4).unwrap();
         for a in 0..4u64 {
             k.keep(a, &page(a));
@@ -1436,7 +1577,7 @@ mod tests {
 
     #[test]
     fn a_lowered_limit_gives_back_spare_loans_before_a_live_page() {
-        let mut c = Cache::new(16, 16);
+        let mut c = Cache::new(16, 16, EXTENT);
         let mut k = c.lend(8).unwrap();
         for a in 0..8u64 {
             k.keep(a, &page(a));
@@ -1467,7 +1608,7 @@ mod tests {
     /// idle time asks for again and again.
     #[test]
     fn slots_none_can_be_made_for_are_not_owed() {
-        let mut c = Cache::new(8, 16);
+        let mut c = Cache::new(8, 16, EXTENT);
         c.set_available(|| Some(0));
         c.wanted = 8;
         assert!(c.unreserved() > 0);
@@ -1477,7 +1618,7 @@ mod tests {
 
     #[test]
     fn a_loan_holds_its_room_until_it_comes_back() {
-        let mut c = Cache::new(8, 16);
+        let mut c = Cache::new(8, 16, EXTENT);
         let a = c.lend(6).unwrap();
         let b = c.lend(6).unwrap();
         assert_eq!((a.fresh, b.fresh), (6, 2));
@@ -1488,7 +1629,7 @@ mod tests {
 
     #[test]
     fn keeping_stops_at_the_room_lent_and_skips_what_a_slot_cannot_hold() {
-        let mut c = Cache::new(8, 16);
+        let mut c = Cache::new(8, 16, EXTENT);
         let mut k = c.lend(2).unwrap();
         k.keep(1, &[7; 17]);
         for a in 2..6u64 {
@@ -1505,7 +1646,7 @@ mod tests {
 
     #[test]
     fn adopted_pages_past_a_lowered_limit_are_evicted_and_a_kept_address_replaces_the_cached() {
-        let mut c = Cache::new(8, 16);
+        let mut c = Cache::new(8, 16, EXTENT);
         c.insert(1, b"old");
         let mut k = c.lend(4).unwrap();
         for a in 1..5u64 {
@@ -1540,7 +1681,7 @@ mod tests {
 
     /// A cache whose slots are all made, as idle time leaves one its reads have filled.
     fn warm(pages: usize, page: usize) -> Cache {
-        let mut c = Cache::new(pages, page);
+        let mut c = Cache::new(pages, page, EXTENT);
         c.wanted = pages;
         c.reserve(usize::MAX);
         c
@@ -1550,7 +1691,7 @@ mod tests {
     fn a_cache_takes_memory_only_as_reads_want_it_in_chunks_and_never_on_a_read() {
         // A cache of a million pages takes memory as its reads come, not its limit: the first
         // read makes its own slot, and idle time then makes as many as the reads since wanted.
-        let mut c = Cache::new(1 << 20, 64);
+        let mut c = Cache::new(1 << 20, 64, EXTENT);
         assert_eq!(c.unreserved(), 0);
         c.insert(1, &page(1));
         assert!(c.contains(1));
@@ -1569,7 +1710,7 @@ mod tests {
         assert_eq!(c.slots.len(), 3);
         // Chunks double up to a tuning step of the limit, so a cache filled to its limit took
         // O(log n) of them plus the steps.
-        let mut c = Cache::new(4096, 64);
+        let mut c = Cache::new(4096, 64, EXTENT);
         c.wanted = 4096;
         c.reserve(usize::MAX);
         assert_eq!(c.slots.len(), 4096);

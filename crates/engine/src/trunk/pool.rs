@@ -67,13 +67,15 @@ pub enum Work {
 }
 
 /// One part of the index over the memtables a shard keeps for gets (`crate::kept`, research/51
-/// §7), out on a worker beside its other parts to take its records of the memtables kept since
-/// the index last covered one, oldest first, after dropping, with `sweep`, the records of
-/// memtables older than `oldest`, given back. It comes back with its records' lists, which the
-/// other index's part takes next.
+/// §7, research/63 §6), out on a worker to take its records of the memtables kept since it last
+/// did, oldest first, after dropping, with `sweep`, the records of memtables older than `oldest`,
+/// given back. It comes back holding the records of memtables up to `newest`, its lists merged.
 #[derive(Debug, Default)]
 pub struct IndexJob {
+    /// The shard's index the part is of ([`crate::kept::KeptIndex::id`]).
+    pub index: u64,
     pub part: usize,
+    pub newest: Option<u32>,
     pub table: crate::kept_table::RecordTable,
     pub lists: Vec<(u32, crate::kept_table::RecordList)>,
     pub oldest: u32,

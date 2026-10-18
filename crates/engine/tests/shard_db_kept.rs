@@ -268,6 +268,63 @@ fn kept_memtables_hold_only_the_budget_s_idle_memory() {
     check_all(&mut db, &oracle);
 }
 
+/// Under a budget the kept records outgrow (keys from a space far wider than [`KEYS`], each with a
+/// value the size the benchmark writes), the open generation of the index closes at its share and
+/// later ones follow; giving memory back drops the oldest generation whole. The budget holds after
+/// every operation, and every read is exact, from a generation, a memtable or the trunk.
+#[test]
+fn generations_close_at_their_share_and_are_given_back_whole_within_the_budget() {
+    const WIDE: u64 = 200_000;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let mut db = ShardDb::create(open(&path, true), STORE, MEM, TRUNK).unwrap();
+    let budget = 2048 * STORE.page_size;
+    db.set_memory(budget).unwrap();
+    workers(&mut db, &path);
+    let mut oracle = Oracle::new();
+    let mut value = Vec::new();
+    let (mut generations_most, mut gave_back) = (0u64, false);
+    let mut kept_before = 0u64;
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    for step in 0..60_000u64 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let k = x % WIDE;
+        if step % 2 == 0 {
+            let v = format!("{step:0100}").into_bytes();
+            db.put(&key(k), &v).unwrap();
+            oracle.insert(k, Some(v));
+        } else {
+            let found = db.get(&key(k), &mut value).unwrap();
+            match oracle.get(&k) {
+                Some(Some(v)) => assert!(found && &value == v, "key {k} at step {step}"),
+                _ => assert!(!found, "key {k} at step {step}"),
+            }
+        }
+        let stats = db.stats().0;
+        let (cache, write, records) = db.memory_held();
+        let kept = usize::try_from(stats.kept_bytes).unwrap();
+        assert!(
+            db.trimming() || cache + write + records + kept <= budget,
+            "step {step}: kept {kept} beside cache {cache} write {write} records {records}: {stats:?}"
+        );
+        generations_most = generations_most.max(stats.kept_generations);
+        gave_back |= stats.kept < kept_before;
+        kept_before = stats.kept;
+    }
+    assert!(generations_most > 0, "no generation closed");
+    assert!(gave_back, "no kept memtable was given back");
+    settle(&mut db);
+    for (k, want) in &oracle {
+        let found = db.get(&key(*k), &mut value).unwrap();
+        match want {
+            Some(v) => assert!(found && &value == v, "key {k} after settling"),
+            None => assert!(!found, "key {k} after settling"),
+        }
+    }
+}
+
 /// Without maintenance workers no index over kept memtables can be built, and a get's probes
 /// would grow with them: none is kept.
 #[test]

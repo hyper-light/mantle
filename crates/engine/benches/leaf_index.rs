@@ -68,6 +68,9 @@ fn lookups(branch: &Branch, probes: &[Vec<u8>]) -> u64 {
     std::hint::black_box(sum)
 }
 
+/// A key shape: its name and the key of a number.
+type Shape = (&'static str, fn(u64) -> Vec<u8>);
+
 fn main() {
     let args: Vec<_> = std::env::args()
         .skip(1)
@@ -78,7 +81,7 @@ fn main() {
     let count: u64 = args.get(2).expect("LOOKUPS").parse().unwrap();
     assert!(keys > 0 && count > 0);
     let only = args.get(3);
-    let shapes: [(&str, fn(u64) -> Vec<u8>); 2] = [("number", number), ("object", object)];
+    let shapes: [Shape; 2] = [("number", number), ("object", object)];
     assert!(
         only.is_none_or(|o| shapes.iter().any(|(shape, _)| shape == o)),
         "SHAPE is number or object"

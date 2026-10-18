@@ -174,9 +174,7 @@ impl Starts {
         }
         let block = *self.blocks.get(n / STARTS_BLOCK)? as usize;
         let extra = self.extra.get(n).map_or(0, |&e| usize::from(e));
-        block
-            .checked_add(n % STARTS_BLOCK)?
-            .checked_add(extra)
+        block.checked_add(n % STARTS_BLOCK)?.checked_add(extra)
     }
 
     /// Bytes held.
@@ -666,7 +664,6 @@ impl Trie {
         let i = self.level(l).map_or(0, |s| before(&s.has_child, p));
         Node::Sparse(l.saturating_add(1), i)
     }
-
 
     /// The label at `p` of level `l`.
     fn label(&self, l: usize, p: usize) -> Option<u8> {
@@ -1576,7 +1573,11 @@ mod tests {
                 assert_eq!(t.floor(q), floor, "cut {cutoff} floor {q:?}");
                 let mut found = Vec::new();
                 let ceil = map.range(q.clone()..).next();
-                assert_eq!(t.ceil(q, &mut found), ceil.map(|(_, v)| *v), "cut {cutoff} ceil {q:?}");
+                assert_eq!(
+                    t.ceil(q, &mut found),
+                    ceil.map(|(_, v)| *v),
+                    "cut {cutoff} ceil {q:?}"
+                );
                 if let Some((k, _)) = ceil {
                     assert_eq!(&found, k, "cut {cutoff} ceil key {q:?}");
                 }
@@ -1640,9 +1641,7 @@ mod tests {
         // tries of these keys encode to the bytes main b8bd6cd wrote for them.
         let mut out = Vec::new();
         let mut x = 0x2545_f491_4f6c_dd1du64;
-        let small: BTreeMap<Vec<u8>, u32> = (0..300)
-            .map(|i| (key(&mut x), i))
-            .collect();
+        let small: BTreeMap<Vec<u8>, u32> = (0..300).map(|i| (key(&mut x), i)).collect();
         let small: Vec<Vec<u8>> = small.into_keys().collect();
         for cutoff in 0..=8 {
             sparse_from(&small, cutoff).encode(&mut out);

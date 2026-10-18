@@ -1089,7 +1089,11 @@ impl<F: BlockFile> Store<F> {
     /// memory is `pages` times the page size, taken now.
     pub fn set_cache(&mut self, pages: usize) {
         self.cache = (pages > 0).then(|| {
-            let mut c = cache::Cache::new(pages, self.config.page_size);
+            let mut c = cache::Cache::new(
+                pages,
+                self.config.page_size,
+                u64::from(self.config.extent_pages),
+            );
             if let Some(read) = self.machine_free {
                 c.set_available(read);
             }

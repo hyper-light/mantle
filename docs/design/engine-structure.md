@@ -88,7 +88,8 @@ but its own first part: the work spread over shards, one per core, each owning w
   Packing and the root's compaction are never paused, since a full memtable stops puts; deeper
   compactions run only in that idle time. The debt pacing of §6 stays as the backstop: when a
   debt's room is running out, puts pay their share as now, so a saturated shard still cannot
-  fall behind. A shard never runs another shard's maintenance: its replicas' state never leaves
+  fall behind. A flush pays what the writes still owe, the cache's freed pages included, so the
+  reads after it find no maintenance waiting (research/63 §8). A shard never runs another shard's maintenance: its replicas' state never leaves
   it.
 - **I/O.** Each range's store attaches to its device's issuer (hyper-block), shared by every
   range on the device, so a device keeps its measured depth whatever the range count. A demand

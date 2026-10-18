@@ -536,15 +536,15 @@ impl RecordTable {
         laid.ok_or_else(too_large)
     }
 
-    /// Places the record in `scratch` (displacement 0) from its home slot, replacing the key's
-    /// record if the table holds one. Robin Hood keeps a run's records in the order of their
+    /// Places the record whose slot image (displacement 0) is `image` from its home slot,
+    /// replacing the key's record if the table holds one. Robin Hood keeps a run's records in the order of their
     /// homes, so the record goes where the first record nearer its own home sits, and the rest of
     /// the run moves along one slot, each a step further from its home: one move of the run's
     /// bytes, where carrying each displaced record on to the next slot read and wrote every slot
     /// twice (128-byte slots: an insert spent 104-131 ns, `kept_merge`). False, the table
     /// unchanged, when the record or a record it moves would pass [`MOST_DISPLACED`], or no slot is
     /// empty: nothing moves before every check passes.
-    fn place(&mut self, place: u32, key: &[u8]) -> bool {
+    fn place(&mut self, place: u32, key: &[u8], image: &[u8]) -> bool {
         if self.slots == 0 {
             return false;
         }
@@ -562,7 +562,7 @@ impl RecordTable {
                 break;
             }
             if self.holds(s, d, place, key) {
-                return self.lay(i, d);
+                return self.lay(i, d, image);
             }
             i = self.next(i);
             d = d.wrapping_add(1);
@@ -592,25 +592,30 @@ impl RecordTable {
             return false;
         }
         self.live = self.live.saturating_add(1);
-        self.lay(i, d)
+        self.lay(i, d, image)
     }
 
-    /// Writes `scratch` into slot `i` at displacement `d`.
-    fn lay(&mut self, i: usize, d: usize) -> bool {
+    /// Writes `image` into slot `i` at displacement `d`.
+    fn lay(&mut self, i: usize, d: usize, image: &[u8]) -> bool {
         let Ok(disp) = u8::try_from(d.saturating_add(1)) else {
             return false;
         };
-        let mut s = std::mem::take(&mut self.scratch);
-        let whole = s.len() == self.slot;
-        let laid = match s.get_mut(2) {
-            Some(b) if whole => {
-                *b = disp;
-                self.at_mut(i).map(|dst| dst.copy_from_slice(&s)).is_some()
-            }
-            _ => false,
+        if image.len() != self.slot {
+            return false;
+        }
+        let Some(dst) = self.at_mut(i) else {
+            return false;
         };
-        self.scratch = s;
-        laid
+        dst.copy_from_slice(image);
+        dst.get_mut(2).map(|b| *b = disp).is_some()
+    }
+
+    /// Places the record laid in `scratch` ([`Self::place`]).
+    fn place_scratch(&mut self, place: u32, key: &[u8]) -> bool {
+        let image = std::mem::take(&mut self.scratch);
+        let placed = self.place(place, key, &image);
+        self.scratch = image;
+        placed
     }
 
     /// Moves the records of slots `from` up to the empty slot `end` along one slot, around the
@@ -687,14 +692,14 @@ impl RecordTable {
             let Some(place) = place_of(s) else {
                 return Err(corrupt());
             };
-            let key = if flags_of(s) & SPILLED == 0 {
-                // An inline slot moves as it is, its displacement set where it lands; the old
-                // table's slot order is its homes' order in the new one but where a run
-                // wrapped, so each lands at or just after the last.
-                fresh.scratch.clear();
-                fresh.scratch.extend_from_slice(s);
-                s.get(INLINE_HEAD..INLINE_HEAD.saturating_add(klen_of(s)))
-                    .ok_or_else(corrupt)?
+            let placed = if flags_of(s) & SPILLED == 0 {
+                // An inline slot moves as it is, copied once from where it lies, its displacement
+                // set where it lands; the old table's slot order is its homes' order in the new
+                // one but where a run wrapped, so each lands at or just after the last.
+                let key = s
+                    .get(INLINE_HEAD..INLINE_HEAD.saturating_add(klen_of(s)))
+                    .ok_or_else(corrupt)?;
+                fresh.place(place, key, s)
             } else {
                 let Some((key, value, op)) = self.record_of(s) else {
                     return Err(corrupt());
@@ -706,9 +711,9 @@ impl RecordTable {
                     value,
                 };
                 fresh.image(u32::from(number_of(s)), place, &r)?;
-                key
+                fresh.place_scratch(place, key)
             };
-            if !fresh.place(place, key) {
+            if !placed {
                 return Err(corrupt());
             }
         }
@@ -773,12 +778,12 @@ impl RecordTable {
             std::hint::black_box(touched);
             for r in group.iter().flatten() {
                 self.image(number, r.hash32, r)?;
-                if !self.place(r.hash32, r.key) {
+                if !self.place_scratch(r.hash32, r.key) {
                     // A run too long: grown, and placed again.
                     let room = self.live.saturating_add(self.live / 2).saturating_add(1);
                     self.rebuild(room, oldest)?;
                     self.image(number, r.hash32, r)?;
-                    if !self.place(r.hash32, r.key) {
+                    if !self.place_scratch(r.hash32, r.key) {
                         return Err(corrupt());
                     }
                 }

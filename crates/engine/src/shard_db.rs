@@ -145,7 +145,7 @@ struct KeptTrip {
     /// Every list home when it went, oldest first; those it lacked have their parts out.
     lists: Vec<(u32, crate::kept::KeyList)>,
     /// Parts waiting for a free worker.
-    waiting: Vec<Box<Job>>,
+    waiting: Vec<Job>,
     /// Parts out on workers.
     out: usize,
     /// The newest memtable whose records the trip takes: what the index covers once home.
@@ -3559,7 +3559,7 @@ impl<F: BlockFile> ShardDb<F> {
                 .filter(|(n, _)| lacked(*n))
                 .map(|(n, l)| (*n, l.take(part)))
                 .collect();
-            waiting.push(Box::new(Job {
+            waiting.push(Job {
                 work: Work::Index(Box::new(crate::trunk::pool::IndexJob {
                     part,
                     table: index.take_part(part),
@@ -3571,7 +3571,7 @@ impl<F: BlockFile> ShardDb<F> {
                 file_end: self.store.end(),
                 generation: self.store.generation(),
                 keep: None,
-            }));
+            });
         }
         self.kept_trip = Some(KeptTrip {
             index,
@@ -3596,14 +3596,14 @@ impl<F: BlockFile> ShardDb<F> {
                 trip.waiting.push(job);
                 break;
             }
-            match pool.send(job, Owner::Index, true) {
+            match pool.send(Box::new(job), Owner::Index, true) {
                 Ok(Ok(_)) => trip.out = trip.out.saturating_add(1),
                 Ok(Err(job)) => {
-                    trip.waiting.push(job);
+                    trip.waiting.push(*job);
                     break;
                 }
                 Err((error, job)) => {
-                    trip.waiting.push(job);
+                    trip.waiting.push(*job);
                     return Err(error);
                 }
             }

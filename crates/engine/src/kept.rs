@@ -153,7 +153,7 @@ impl KeptIndex {
                 }
             }
         }
-        if let Some((newest, _)) = lacked().last() {
+        if let Some((newest, _)) = lacked().next_back() {
             self.covers = Some(*newest);
         }
         Ok(())

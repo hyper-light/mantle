@@ -968,15 +968,21 @@ impl HashMem {
         Ok(Some(op))
     }
 
-    /// Each key's newest entry, its filter hash and arena offset, into `list`: what a packing
-    /// worker's walk gives for a memtable it sorted, made here from the index for one the shard
-    /// packed itself.
+    /// Each key's newest entry as a record, into `list`: what a packing worker's walk gives for a
+    /// memtable it sorted, made here from the index for one the shard packed itself.
     pub fn key_list(&self, list: &mut crate::kept::KeyList) -> Result<(), Error> {
         list.clear();
         let mut failed = None;
-        self.index.each_entry(|e| match self.read(e) {
-            Ok((k, _, _)) => list.push(hash(k), e),
-            Err(error) => {
+        self.index.each_entry(|e| {
+            let pushed = self.read(e).and_then(|(key, op, value)| {
+                list.push(&crate::kept_table::Record {
+                    hash32: crate::branch::filter::hash32(hash(key)),
+                    op,
+                    key,
+                    value,
+                })
+            });
+            if let Err(error) = pushed {
                 failed.get_or_insert(error);
             }
         });

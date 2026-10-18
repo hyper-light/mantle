@@ -183,3 +183,169 @@ impl Drop for LazyZeroed {
         }
     }
 }
+
+/// `len` bytes of anonymous memory, zero, faulted in for writing when made, which Linux backs with
+/// transparent huge pages where it has them (`madvise(MADV_HUGEPAGE)`, madvise(2)). For a table
+/// read at random over gigabytes: on 4 KiB pages its probes walk the page tables, which cost a 10M
+/// get the read a one-read layout saves (research/63 §4). Released when dropped.
+///
+/// It is faulted in for writing at once (`MADV_POPULATE_WRITE`, Linux 5.14) because a first touch
+/// that reads, as a table's probe before its insert does, maps the shared zero page, and the write
+/// after it copies 4 KiB pages out of it: the kernel allocates no huge page on that path, and a
+/// 10M table built so held none (research/63 §4). A kernel without it has each page written once
+/// instead. Elsewhere a mapping as [`LazyZeroed`]'s, whose pages are the OS's size.
+pub struct HugeZeroed {
+    addr: Option<NonNull<u8>>,
+    len: usize,
+    #[cfg(windows)]
+    section: windows_sys::Win32::Foundation::HANDLE,
+}
+
+// SAFETY: the mapping is owned by this value alone, read through `&self` and written through
+// `&mut self` only, so moving it or sharing it across threads cannot race; it is unmapped only
+// in `drop`, when no borrow of it is left.
+unsafe impl Send for HugeZeroed {}
+// SAFETY: as for `Send`: shared access is read-only.
+unsafe impl Sync for HugeZeroed {}
+
+impl std::fmt::Debug for HugeZeroed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HugeZeroed")
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+impl HugeZeroed {
+    /// A mapping of no bytes, which maps nothing.
+    pub fn empty() -> Self {
+        Self {
+            addr: None,
+            len: 0,
+            #[cfg(windows)]
+            section: std::ptr::null_mut(),
+        }
+    }
+
+    /// Maps `len` zeroed bytes, or refuses with the OS's error.
+    pub fn allocate(len: usize) -> Result<Self, Error> {
+        let refused = |_| Error::LimitExceeded {
+            what: "a kept record table (the OS refused the mapping)",
+            limit: u64::try_from(len).unwrap_or(u64::MAX),
+        };
+        if len == 0 {
+            return Ok(Self::empty());
+        }
+        let words = len.div_ceil(WORD);
+        let mut lazy = LazyZeroed::map(words.checked_mul(WORD).ok_or_else(|| refused(()))?, words)
+            .map_err(refused)?;
+        // The mapping now belongs to this value: taken out of `lazy`, whose drop then unmaps
+        // nothing.
+        let addr = lazy.addr.take().map(NonNull::cast::<u8>);
+        #[cfg(windows)]
+        let section = std::mem::replace(&mut lazy.section, std::ptr::null_mut());
+        drop(lazy);
+        let mut mapped = Self {
+            addr,
+            len,
+            #[cfg(windows)]
+            section,
+        };
+        mapped.fault_in();
+        Ok(mapped)
+    }
+
+    /// Asks Linux for huge pages and faults every page in for writing (the type's docs).
+    #[cfg(target_os = "linux")]
+    fn fault_in(&mut self) {
+        let Some(addr) = self.addr else {
+            return;
+        };
+        // SAFETY: advises the whole mapping this value owns; the advice changes how the kernel
+        // backs it, never its contents. Refused, the pages are the base size.
+        let _ = unsafe {
+            rustix::mm::madvise(
+                addr.as_ptr().cast(),
+                self.len,
+                rustix::mm::Advice::LinuxHugepage,
+            )
+        };
+        // SAFETY: as above; populating for writing leaves the zeros the mapping already reads as.
+        let populated = unsafe {
+            rustix::mm::madvise(
+                addr.as_ptr().cast(),
+                self.len,
+                rustix::mm::Advice::LinuxPopulateWrite,
+            )
+        };
+        if populated.is_err() {
+            // A kernel before 5.14: each page written once, a write fault each.
+            let page = page_size().max(1);
+            for b in self.bytes_mut().iter_mut().step_by(page) {
+                *b = 0;
+            }
+        }
+    }
+
+    /// Elsewhere pages fault in as they are first touched, at the OS's page size.
+    #[cfg(not(target_os = "linux"))]
+    fn fault_in(&mut self) {}
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        match self.addr {
+            // SAFETY: `addr` starts a live mapping of at least `len` bytes, zero-filled by the
+            // OS; unmapped only in `drop`, which this borrow of `self` keeps from running; no
+            // `&mut` to it lives while `&self` does.
+            Some(addr) => unsafe { std::slice::from_raw_parts(addr.as_ptr(), self.len) },
+            None => &[],
+        }
+    }
+
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        match self.addr {
+            // SAFETY: as `bytes`, and `&mut self` makes this the mapping's only borrow.
+            Some(addr) => unsafe { std::slice::from_raw_parts_mut(addr.as_ptr(), self.len) },
+            None => &mut [],
+        }
+    }
+}
+
+impl Drop for HugeZeroed {
+    fn drop(&mut self) {
+        let Some(addr) = self.addr.take() else {
+            return;
+        };
+        // Handed back to a `LazyZeroed` of the same words, whose drop unmaps it.
+        drop(LazyZeroed {
+            addr: Some(addr.cast::<AtomicU64>()),
+            words: self.len.div_ceil(WORD),
+            #[cfg(windows)]
+            section: self.section,
+        });
+    }
+}
+
+#[cfg(test)]
+mod huge_tests {
+    use super::*;
+
+    #[test]
+    fn a_huge_mapping_reads_zero_and_keeps_what_is_written() {
+        let mut m = HugeZeroed::allocate(3 * 1024 * 1024 + 5).unwrap();
+        assert_eq!(m.len(), 3 * 1024 * 1024 + 5);
+        assert!(m.bytes().iter().all(|&b| b == 0));
+        let n = m.len();
+        m.bytes_mut()[n - 1] = 7;
+        m.bytes_mut()[0] = 9;
+        assert_eq!((m.bytes()[0], m.bytes()[n - 1]), (9, 7));
+        assert!(HugeZeroed::allocate(0).unwrap().is_empty());
+    }
+}

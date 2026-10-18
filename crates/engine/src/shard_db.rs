@@ -60,7 +60,8 @@ pub struct FlushStats {
     /// The largest share of each debt one put was given: entries to pack, keys to merge.
     pub pack_share_most: u64,
     pub trunk_share_most: u64,
-    /// Stalls, and their nanoseconds in all and at the most.
+    /// Stalls, each counted as it begins so one under way is counted, and their nanoseconds in
+    /// all and at the most, added as each ends.
     pub stalls: u64,
     pub stall_ns: u64,
     pub stall_max_ns: u64,
@@ -4481,8 +4482,11 @@ impl<F: BlockFile> ShardDb<F> {
                 started: now,
                 finish_packing,
                 most: None,
-                stalled: finish_packing,
+                stalled: false,
             });
+            if finish_packing {
+                self.stall_rotation();
+            }
         }
         if self.rotation.as_ref().is_some_and(|r| r.finish_packing) {
             if self.packing.is_some() {
@@ -4511,18 +4515,14 @@ impl<F: BlockFile> ShardDb<F> {
             }
         };
         if self.frozen.len() > most {
-            if let Some(r) = self.rotation.as_mut() {
-                r.stalled = true;
-            }
+            self.stall_rotation();
             self.take_packs(false)?;
             if self.frozen.len() > most {
                 return Ok(false);
             }
         }
         if !self.trunk.has_room() {
-            if let Some(r) = self.rotation.as_mut() {
-                r.stalled = true;
-            }
+            self.stall_rotation();
             if self.trunk.packing_blocks_dispatch(&mut self.store)? {
                 // Packings hold every seat: their results free them. Take any back before
                 // waiting on maintenance's worker capacity.
@@ -4550,12 +4550,22 @@ impl<F: BlockFile> ShardDb<F> {
         self.flush_stats.rotate_ns = self.flush_stats.rotate_ns.saturating_add(ns);
         if r.stalled {
             let f = &mut self.flush_stats;
-            f.stalls = f.stalls.saturating_add(1);
             f.stall_ns = f.stall_ns.saturating_add(ns);
             f.stall_max_ns = f.stall_max_ns.max(ns);
         }
         self.rotated = Some(std::time::Instant::now());
         Ok(true)
+    }
+
+    /// Marks the rotation under way stalled, counting the stall as it begins: one under way is
+    /// in the stats a reader takes, so a writer held behind it is seen held while it lasts.
+    fn stall_rotation(&mut self) {
+        if let Some(r) = self.rotation.as_mut()
+            && !r.stalled
+        {
+            r.stalled = true;
+            self.flush_stats.stalls = self.flush_stats.stalls.saturating_add(1);
+        }
     }
 
     /// Packs every memtable and finishes its maintenance before a range starts durability.

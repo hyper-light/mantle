@@ -110,7 +110,8 @@ That is to be measured against the candidate:
   - Does the root's first compaction, which computed 1-1.2 s, need to merge that much while
     the root fills?
   - Does a packing need to fault 17,803 fresh pages?
-- **Step two for the zeros:** §8.
+- **Step two for the zeros:** §7.
+- **What a 100M fill's tail waits on without them:** §8.
 - **The cut under load.** 0.45× against the candidate's 0.69× at 12 loops, worse in 3 of 4
   rounds. That regression is unexplained, so the cut is not adopted (cache-wr's research/57 §8).
 
@@ -254,3 +255,104 @@ Against RocksDB the zeros gone are 5.22× its fills, 10.39× its gets and 5.42×
 5.4 ms without the zeros, 5.5 ms on main and 6.1 ms for RocksDB; at 100M RocksDB's histogram
 maximum wrapped in all 6 rounds, no measure. Without the zeros a 100M fill still stalls now and then (two
 rounds of six, as main three): the zeros were one cause of the tail, not the last.
+
+## 8. 100M without the zeros: what the tail waits on
+
+**Traced** on the zeros-gone code, 8 rounds each at 100M on the whole host, two diagnostic builds
+of it (never merged):
+- spans over the shard's turn (`diag-runs/n100000000-r5031..r5038`, t_trz0t, trace-z0m8 b61beda;
+  a span is one event at its end, kept when it ran 50 µs or more; spans.py);
+- each worker job's waits for the issuer's answers and the runs it handed it (`r5051..r5058`,
+  t_trz0w, 2f29d8b; events 43 and 44; issuerwaits.py).
+
+**The shard's own work.** The 8 fills had 33 puts of 8 ms or more outside a stall. 32 waited on
+the shard thread inside its turn's taking of the workers' results, on one of two pieces of
+page-cache work done whole when a result came or a job went out: adopting a compaction's pages
+(17 puts) or a grant forgetting its extents' cached pages (15). The other, 11.8 ms, was the put's
+own operation, which froze the memtable and handed it off.
+
+| a 100M fill, mean of 8 | spans of 50 µs or more | total | longest |
+|---|---|---|---|
+| adopting a compaction's pages | 1,209 | 687 ms | 17.3 ms |
+| a grant forgetting its extents' cached pages | 1,133 | 527 ms | 15.1 ms |
+| adopting a packing's pages | 161 | 171 ms | 3.2 ms |
+
+Adopting took 77 ns a page and a grant 2.2 µs an extent (spans of 1 ms or more). A grant probed
+16.6M pages a fill and found 5.8M cached. Adopting probed 12.1M addresses for a cached page first
+and found none, the grant having forgotten them.
+
+**Measured and not kept: extent churn** (churn-wr f8c8cc8, 60d20b0; traced `r5041..r5048`,
+t_trchurn, trace-churn 0df7d0c). Free extents reused oldest first, a bit an extent marking whether
+any of its pages may be cached, and no probe before an adopted page's insert:
+
+| 8 traced 100M fills | zeros gone | churn |
+|---|---|---|
+| a grant's probes, a fill | 16.6M | 4.5M |
+| a grant's time, a fill | 527 ms | 309 ms |
+| one probe | 32 ns | 69 ns |
+| adopting, a page | 77 ns | 96 ns |
+| stalls | 3 (10, 56, 299 ms) | none |
+| a round's worst put | 10.0-299 ms, median 13.8 | 9.5-35 ms, median 27.6 |
+
+Oldest first, grants took the extents the paced forgetting had not reached: 4.49M of churn's 4.50M
+probes found a page and released it, so a probe cost twice as much, and one grant of 5,424
+extents took 27.2 ms against 8.3 ms. Adopting slowed without the probe before its insert, which
+had likely brought the index's line in for it. In the rounds without a stall, a round's worst put
+went from a median of 12.9 ms to 27.6 ms.
+
+**The stalls.** A 100M fill still stalled in some rounds (§7), each a frozen memtable past the
+overlap whose packing ran long. The long packings ran their usual CPU and waited the rest in one
+wait for the issuer:
+
+| packing | wall | CPU | waiting for the issuer |
+|---|---|---|---|
+| r5051 #461 | 440 ms | 113 ms | 326 ms, one wait |
+| r5051 #547 | 402 ms | 114 ms | 287 ms, one wait |
+| r5051 #462 | 325 ms | 112 ms | 211 ms, one wait |
+| median of the 1,424 | 105 ms | 104 ms | none (80 waited at all) |
+
+Beside each, two compactions had handed the issuer 3,984-4,223 runs each and ran 0.88-0.98 s;
+three of those four waited on nothing. The VM's I/O pressure (some) was 53-65% across each long
+packing, against 12% over the run (psi.txt). The issuer keeps one queue of transfers in the order
+they came (hyper-block `issuer.rs`, `pending`). The packing's runs waited behind every compaction
+run handed in before them. The trunk's tasks already follow SILK's first rule: the work clients
+wait on is never queued behind compactions (Balmau et al., USENIX ATC 2019; research/34 §5;
+engine-structure.md §6). The issuer's queue does not.
+
+**Measured and not kept: the urgent class** (urgent-wr a62885b; traced twin trace-urgent e091a70).
+A store's batches are marked urgent while its worker packs a memtable (`Attached::set_urgent`), and
+the issuer dispatches an urgent batch's transfers before every transfer of a batch that is not. The
+change is to hyper-block's issuer, so it would land through hyper-raft and a new snapshot. Traced
+(`r5061..r5068`, t_trurg, against `r5051..r5058`):
+
+| 8 traced 100M fills | zeros gone | urgent |
+|---|---|---|
+| a packing's issuer wait, p99 | 32.1 ms | 4.3 ms |
+| a packing's issuer wait, longest | 326 ms | 200 ms |
+| packings' issuer waits, total | 2,077 ms | 919 ms |
+| stalls | 3 (211, 167, 7 ms) | 3 (75, 22, 5 ms) |
+| a round's worst put | 9.3-211 ms | 8.9-75 ms |
+
+Untraced, with RocksDB beside in run7's balanced order (`runs/n*-r4841..r4856`, x_z0m8 and x_urg,
+6 rounds a size):
+
+| | zeros gone | urgent |
+|---|---|---|
+| 10M, a round's worst fill | 5.1-6.1 ms | 5.3-6.4 ms |
+| 100M, a round's worst fill | 15-73 ms | 7.7-802 ms |
+| 100M, worst fill worse | | 4 of 6 rounds |
+| 100M stalls, 6 rounds | 3 | 6 |
+
+Rates and CPU a put were level: fills 0.99-1.00×, gets 1.00-1.02×, seeks 0.99-1.02× at both
+sizes. In the traces the class did what it was for. Untraced, the 100M tail was worse in 4 of 6
+rounds and the stalls doubled. A traced build's timing is not the release build's, and acceptance
+comes only from binaries without diagnostic code, so the class is not kept.
+
+**What remains.** With packings dispatched first, their longest waits were still 157-200 ms in one
+or two waits each (r5061, r5063, r5065). Dispatched first, a packing's runs wait only for the
+transfers already in the issuer's threads and for their own. Mantle's writes are buffered, and the
+kernel pauses a writer over its dirty limits up to 200 ms at a time (`balance_dirty_pages`,
+`MAX_PAUSE` = HZ/5; Linux v6.12 `mm/page-writeback.c`). These traces did not sample Dirty and
+Writeback, so they cannot tell that throttle from the device's own queue. Two runs decide it: a
+traced run that samples Dirty and Writeback beside the waits (inside-diag3.sh does), and the
+direct-I/O A/B, whose writes dirty no page cache for the throttle to count.

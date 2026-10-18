@@ -424,51 +424,122 @@ impl RecordTable {
     }
 
     /// Places the record in `scratch` (displacement 0) from its home slot, replacing the key's
-    /// record if the table holds one. False when the probe would pass [`MOST_DISPLACED`]: the
-    /// table then still holds every record it held, some moved along the run.
+    /// record if the table holds one. Robin Hood keeps a run's records in the order of their
+    /// homes, so the record goes where the first record nearer its own home sits, and the rest of
+    /// the run moves along one slot, each a step further from its home: one move of the run's
+    /// bytes, where carrying each displaced record on to the next slot read and wrote every slot
+    /// twice (128-byte slots: an insert spent 104-131 ns, `kept_merge`). False, the table
+    /// unchanged, when the record or a record it moves would pass [`MOST_DISPLACED`], or no slot is
+    /// empty: nothing moves before every check passes.
     fn place(&mut self, place: u32, key: &[u8]) -> bool {
-        let mut cur = std::mem::take(&mut self.scratch);
+        if self.slots == 0 {
+            return false;
+        }
         let mut i = self.home(place);
         let mut d = 0usize;
-        let mut carrying_new = true;
-        let placed = loop {
+        loop {
             if d > MOST_DISPLACED {
-                break false;
+                return false;
             }
             let Some(s) = self.at(i) else {
-                break false;
+                return false;
             };
             let disp = usize::from(disp_of(s));
-            let replaces = disp != 0 && carrying_new && self.holds(s, d, place, key);
-            if disp == 0 || replaces {
-                if let Some(b) = cur.get_mut(2) {
-                    *b = u8::try_from(d.wrapping_add(1)).unwrap_or(u8::MAX);
-                }
-                if let Some(dst) = self.at_mut(i) {
-                    dst.copy_from_slice(&cur);
-                }
-                if disp == 0 {
-                    self.live = self.live.saturating_add(1);
-                }
-                break true;
+            if disp == 0 || disp.wrapping_sub(1) < d {
+                break;
             }
-            let sd = disp.wrapping_sub(1);
-            if sd < d {
-                // Robin Hood: the record carried takes the slot, and the one there moves on.
-                if let Some(b) = cur.get_mut(2) {
-                    *b = u8::try_from(d.wrapping_add(1)).unwrap_or(u8::MAX);
-                }
-                if let Some(dst) = self.at_mut(i) {
-                    dst.swap_with_slice(&mut cur);
-                }
-                d = sd;
-                carrying_new = false;
+            if self.holds(s, d, place, key) {
+                return self.lay(i, d);
             }
             i = self.next(i);
             d = d.wrapping_add(1);
+        }
+        // The run from `i` to the first empty slot moves along one: each record there must
+        // still have a displacement to give.
+        let mut end = i;
+        let mut moved = 0usize;
+        loop {
+            let Some(s) = self.at(end) else {
+                return false;
+            };
+            let disp = usize::from(disp_of(s));
+            if disp == 0 {
+                break;
+            }
+            if disp > MOST_DISPLACED {
+                return false;
+            }
+            end = self.next(end);
+            moved = moved.saturating_add(1);
+            if moved >= self.slots {
+                return false;
+            }
+        }
+        if !self.shift(i, end) {
+            return false;
+        }
+        self.live = self.live.saturating_add(1);
+        self.lay(i, d)
+    }
+
+    /// Writes `scratch` into slot `i` at displacement `d`.
+    fn lay(&mut self, i: usize, d: usize) -> bool {
+        let Ok(disp) = u8::try_from(d.saturating_add(1)) else {
+            return false;
         };
-        self.scratch = cur;
-        placed
+        let mut s = std::mem::take(&mut self.scratch);
+        let whole = s.len() == self.slot;
+        let laid = match s.get_mut(2) {
+            Some(b) if whole => {
+                *b = disp;
+                self.at_mut(i).map(|dst| dst.copy_from_slice(&s)).is_some()
+            }
+            _ => false,
+        };
+        self.scratch = s;
+        laid
+    }
+
+    /// Moves the records of slots `from` up to the empty slot `end` along one slot, around the
+    /// table's end if the run wraps, each a step further from its home. False, nothing moved, when
+    /// a range falls outside the table.
+    fn shift(&mut self, from: usize, end: usize) -> bool {
+        if from == end {
+            return true;
+        }
+        let slot = self.slot;
+        let (Some(from_at), Some(end_at), Some(len)) = (
+            from.checked_mul(slot),
+            end.checked_mul(slot),
+            self.slots.checked_mul(slot),
+        ) else {
+            return false;
+        };
+        let bytes = self.map.bytes_mut();
+        if bytes.len() < len || from_at >= len || end_at >= len {
+            return false;
+        }
+        if from < end {
+            // [from, end) to [from + 1, end]: `end` is in the table, so is `end_at + slot`.
+            bytes.copy_within(from_at..end_at, from_at.saturating_add(slot));
+        } else {
+            // The run is [from, slots) then [0, end): the start's records move first, then the
+            // last slot's to slot 0, then the rest of the run's tail.
+            let last = len.saturating_sub(slot);
+            bytes.copy_within(0..end_at, slot);
+            bytes.copy_within(last..len, 0);
+            bytes.copy_within(from_at..last, from_at.saturating_add(slot));
+        }
+        let mut k = self.next(from);
+        loop {
+            if let Some(b) = self.at_mut(k).and_then(|s| s.get_mut(2)) {
+                *b = b.saturating_add(1);
+            }
+            if k == end {
+                return true;
+            }
+            k = self.next(k);
+        }
     }
 
     /// Rebuilt with room for `records` at a load of at most 2/3, holding only the records of
@@ -498,17 +569,31 @@ impl RecordTable {
             if disp_of(s) == 0 || older16(number_of(s), oldest) {
                 continue;
             }
-            let (Some((key, value, op)), Some(place)) = (self.record_of(s), place_of(s)) else {
+            // A record's place is what puts it in a slot: the slot kept it.
+            let Some(place) = place_of(s) else {
                 return Err(corrupt());
             };
-            // A record's place is what puts it in a slot: the slot kept it.
-            let r = Record {
-                hash32: place,
-                op,
-                key,
-                value,
+            let key = if flags_of(s) & SPILLED == 0 {
+                // An inline slot moves as it is, its displacement set where it lands; the old
+                // table's slot order is its homes' order in the new one but where a run
+                // wrapped, so each lands at or just after the last.
+                fresh.scratch.clear();
+                fresh.scratch.extend_from_slice(s);
+                s.get(INLINE_HEAD..INLINE_HEAD.saturating_add(klen_of(s)))
+                    .ok_or_else(corrupt)?
+            } else {
+                let Some((key, value, op)) = self.record_of(s) else {
+                    return Err(corrupt());
+                };
+                let r = Record {
+                    hash32: place,
+                    op,
+                    key,
+                    value,
+                };
+                fresh.image(u32::from(number_of(s)), place, &r)?;
+                key
             };
-            fresh.image(u32::from(number_of(s)), place, &r)?;
             if !fresh.place(place, key) {
                 return Err(corrupt());
             }
@@ -740,6 +825,50 @@ mod tests {
         assert_eq!(t.get(7, b"a", 0), Answer::Record(Op::Put, b"3"));
         assert_eq!(t.get(7, b"b", 0), Answer::Record(Op::Put, b"2"));
         assert_eq!(t.get(7, b"c", 0), Answer::Absent);
+    }
+
+    /// Places crowded into the top half of their range put every home in the table's last half, so
+    /// runs wrap past its end, and several keys share each place, so a record placed in a run
+    /// moves the rest of it along, around the end too: through rounds that write every key again
+    /// and add new ones, growing the table, each key answers its newest record.
+    #[test]
+    fn records_moved_along_runs_that_wrap_the_table_s_end_keep_their_places() {
+        let place = |k: u32| u32::MAX - (k % 97) * (u32::MAX / 200);
+        let mut t = RecordTable::new();
+        let mut model: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+        for round in 0u32..8 {
+            let mut list = RecordList::default();
+            for k in 0..60 * (round + 1) {
+                let key = format!("key{k:05}").into_bytes();
+                let value = vec![u8::try_from(round).unwrap(); 30 + (k % 9) as usize];
+                list.push(&Record {
+                    hash32: place(k),
+                    op: Op::Put,
+                    key: &key,
+                    value: &value,
+                })
+                .unwrap();
+                model.insert(k, value);
+            }
+            t.merge(round, &list, 0).unwrap();
+            assert_eq!(t.len(), model.len());
+            for (k, v) in &model {
+                let key = format!("key{k:05}").into_bytes();
+                assert_eq!(
+                    t.get(place(*k), &key, 0),
+                    Answer::Record(Op::Put, v.as_slice()),
+                    "key {k} after round {round}"
+                );
+            }
+            let absent = format!("key{:05}", 60 * (round + 1)).into_bytes();
+            assert_eq!(t.get(place(60 * (round + 1)), &absent, 0), Answer::Absent);
+            // Every home is in the table's last half: a record in its first slot wrapped there.
+            assert_ne!(
+                disp_of(t.at(0).unwrap()),
+                0,
+                "no run wrapped the table's end"
+            );
+        }
     }
 
     /// The slot size fits a list of one size in a whole number of lines, and a list whose records

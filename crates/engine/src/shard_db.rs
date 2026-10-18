@@ -3546,8 +3546,18 @@ impl<F: BlockFile> ShardDb<F> {
     /// The parts out at once that keep pace with the writes: the workers a memtable's records keep
     /// busy for its fill, at the last part's measured merge time a record (`x r`, with `x` ns a
     /// record and `r` records a second), twice that so a trip's records never wait a fill for a
-    /// worker, at least one and at most every part. With nothing measured yet, one.
+    /// worker, at least one and at most every part. With nothing measured yet, one. Once no memtable
+    /// has rotated for longer than the last one took to fill, the writes have slowed or stopped and
+    /// no fill competes for the workers: every part may go, so the index is whole again soonest
+    /// (paced by the fill alone, a 10M fill's first gets ran with parts still out: 1.17x main where
+    /// the settled gets ran 1.33x, r5461-r5466).
     fn kept_pace(&self, parts: usize) -> usize {
+        let quiet = self.rotated.is_some_and(|r| {
+            u64::try_from(r.elapsed().as_nanos()).unwrap_or(u64::MAX) > self.fill_ns
+        });
+        if quiet && self.fill_ns > 0 {
+            return parts.max(1);
+        }
         let records = self.kept_lists.back().map_or(0, |(_, l)| l.len());
         let busy = u64::try_from(records)
             .unwrap_or(u64::MAX)

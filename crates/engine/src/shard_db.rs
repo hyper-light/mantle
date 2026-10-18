@@ -3784,12 +3784,20 @@ impl<F: BlockFile> ShardDb<F> {
     /// that lasts any part of a fill reaches the rotation that freezes it, so the overlap is
     /// rounded up, `ceil(pack_ns / fill_ns)`: rounded down, a packing a little shorter than its
     /// last measure counted none, and every rotation it outlasted fed it whole and waited for it.
-    /// With no measure yet, none. At most the pool's admitted capacity, each packing a worker's.
+    /// With a fill measured but no packing back yet, the one out: the overlap a pipeline has at
+    /// all. Counted none, a shard's second rotation, a fill after its first, waited for that
+    /// packing whole (1.9 ms and 6.9 ms, once each 10M fill, when puts came faster than a first
+    /// packing); a third waits for it, as a rotation waits for any packing it outlasts. With no
+    /// fill measured, none. At most the pool's admitted capacity, each packing a worker's.
     fn frozen_most(&self) -> usize {
         if !self.trunk.has_pool() {
             return 0;
         }
-        let overlap = crate::util::div_ceil(self.pack_ns, self.fill_ns).unwrap_or(0);
+        let overlap = if self.pack_ns == 0 && self.fill_ns > 0 {
+            1
+        } else {
+            crate::util::div_ceil(self.pack_ns, self.fill_ns).unwrap_or(0)
+        };
         usize::try_from(overlap)
             .unwrap_or(usize::MAX)
             .min(self.trunk.pool_capacity())
@@ -5238,8 +5246,8 @@ mod frozen_tests {
     type Put = fn(&mut ShardDb<Held>, &mut BTreeMap<Vec<u8>, Vec<u8>>, u64);
 
     /// Puts until the shard has measured a fill and a packing, so the overlap it lets stay
-    /// frozen is its own: by the second rotation, which, with no overlap measured yet, waits for
-    /// the first packing a worker took and so measures it.
+    /// frozen is its own: by the third rotation, which, with no packing back yet, waits for the
+    /// first one a worker took (the second lets it stay) and so measures it.
     fn warm(
         db: &mut ShardDb<Held>,
         oracle: &mut BTreeMap<Vec<u8>, Vec<u8>>,
@@ -5249,8 +5257,8 @@ mod frozen_tests {
         let rotations = db.flush_stats.rotations;
         while db.pack_ns == 0 || db.fill_ns == 0 {
             assert!(
-                db.flush_stats.rotations < rotations + 2,
-                "a second rotation measured no packing"
+                db.flush_stats.rotations < rotations + 3,
+                "a third rotation measured no packing"
             );
             put(db, oracle, *i);
             *i += 1;
@@ -5428,7 +5436,8 @@ mod frozen_tests {
 
     /// The cap rounds the measured overlap up: a packing that lasts any part of a fill reaches the
     /// rotation that freezes it, so one a little shorter than a fill may still be out there; with
-    /// no workers, or no fill measured, none ([`ShardDb::frozen_most`]).
+    /// a fill measured and no packing back yet, the one out; with no workers, or no fill measured,
+    /// none ([`ShardDb::frozen_most`]).
     #[test]
     fn the_frozen_cap_rounds_the_measured_overlap_up() {
         let dir = tempfile::tempdir().unwrap();
@@ -5440,7 +5449,8 @@ mod frozen_tests {
         let p = path.clone();
         db.set_workers(move || Ok(plain(&p, false))).unwrap();
         for (pack_ns, most) in [
-            (0u64, 0usize),
+            // No packing back yet: the one out.
+            (0u64, 1usize),
             (1, 1),
             (999, 1),
             (1_000, 1),

@@ -310,6 +310,13 @@ throughput at 3 M keys (benches/shard_db.rs, 2026-10-07: 151–165 k seeks a sec
 against 84–94 k at p50 9.5–11.2 µs). What remains is the merge: a seek descends every branch of
 the leaf's bundle, and every `next` compares the heads of all of them.
 
+A 10M seek's placing is 72% of a seek of ten (research/61, 2026-10-18). Landing on its leaf reads
+the cache index's control word and bucket together and starts the page's first line with the slot,
+and loads only the entry the leaf's table search finds; where a leaf segment holds one source and
+no memtable holds a key before its next, its rows go out in a run, with no comparison of sources a
+row (`ScanMerge::push_run`). Seeks 1.20× at 10M and 1.25× at 100M. The trie's floor and the table's
+search are the placing's steps left.
+
 **REMIX views were built, measured and removed** (2026-10-11; research/43). A view per pivot
 bundle of two runs or more (Zhong et al., FAST 2021; research/34 §4) was built in the shard's idle
 time and, on the async path, from every run each time its bundle gained one (a rebuild's

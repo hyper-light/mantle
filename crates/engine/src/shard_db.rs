@@ -3795,7 +3795,6 @@ impl<F: BlockFile> ShardDb<F> {
                 part,
                 newest,
                 table,
-                lists,
                 ..
             } = *job;
             if let Some(at) = self
@@ -3810,8 +3809,6 @@ impl<F: BlockFile> ShardDb<F> {
                     self.kept_merge_ns = output.ns.checked_div(records).unwrap_or(0);
                 }
             }
-            // Merged: the part's records of those memtables are in its table.
-            drop(lists);
             if back.result.is_err() {
                 // The part came back partly extended, its memory refused: the index is dropped,
                 // and with it the kept memtables, whose gets the trunk answers, as when the

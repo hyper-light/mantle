@@ -83,8 +83,17 @@ pub struct IndexJob {
 }
 
 impl IndexJob {
-    /// The part swept, with `sweep`, then given its records of each list, oldest first.
+    /// The part swept, with `sweep`, then given its records of each list, oldest first. Merged or
+    /// not, the lists are done with and freed here, on the worker: the shard that took them back
+    /// freed a trip's tens of megabytes at 100M, as much as 45 ms a take (`keptdiag` 826b383,
+    /// box, `r321`).
     pub fn run(&mut self) -> Result<(), Error> {
+        let merged = self.merge();
+        self.lists = Vec::new();
+        merged
+    }
+
+    fn merge(&mut self) -> Result<(), Error> {
         if self.sweep {
             self.table.sweep(self.oldest)?;
         }

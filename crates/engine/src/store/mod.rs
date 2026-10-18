@@ -2915,10 +2915,7 @@ impl<F: BlockFile> Store<F> {
         let slot = if span.runs_on(address) {
             c.slot_peek(address)?
         } else {
-            if !c.contains(address) {
-                return None;
-            }
-            c.lookup(address)?
+            c.lookup_held(address)?
         };
         self.io.span_cache_hits = self.io.span_cache_hits.saturating_add(1);
         Some(slot)

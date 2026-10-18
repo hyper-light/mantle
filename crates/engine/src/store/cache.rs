@@ -387,7 +387,8 @@ impl Cache {
     /// The slot holding `address`, for a reader that reads it in place ([`Self::page_at`]),
     /// without counting or promoting the look: a scan's look at a page it runs on to.
     pub fn slot_peek(&self, address: u64) -> Option<usize> {
-        self.slot_of(address).filter(|&i| self.payload(i).is_some())
+        self.slot_touched(address)
+            .filter(|&i| self.payload(i).is_some())
     }
 
     /// Whether the page can be read from memory, without counting or promoting the look.
@@ -927,6 +928,46 @@ impl Cache {
     /// The slot holding `address`.
     fn slot_of(&self, address: u64) -> Option<usize> {
         self.map.get(address).and_then(|i| usize::try_from(i).ok())
+    }
+
+    /// [`Self::slot_of`] for a reader about to read the page: the index's control word and first
+    /// bucket read together ([`IncMap::get_touched`]), and, once the slot is known, its page's
+    /// first line started while the slot itself is read, the page's place taken from the layout
+    /// every chunk keeps (its slots in a row from its first, a page apart: `make_slot`, `adopt`).
+    /// A scan landing on a leaf waited on four misses in a row: the control word, the bucket,
+    /// the slot and the page (445 ns of a 10M seek's 1.1 µs placing; research/61 §2).
+    fn slot_touched(&self, address: u64) -> Option<usize> {
+        let i = self
+            .map
+            .get_touched(address)
+            .and_then(|i| usize::try_from(i).ok())?;
+        let c = self
+            .starts
+            .partition_point(|&first| first <= i)
+            .checked_sub(1);
+        if let Some(c) = c
+            && let (Some(&first), Some(chunk)) = (self.starts.get(c), self.chunks.get(c))
+            && let Some(byte) = i
+                .checked_sub(first)
+                .and_then(|k| k.checked_mul(self.page))
+                .and_then(|at| chunk.get(at))
+        {
+            std::hint::black_box(*byte);
+        }
+        Some(i)
+    }
+
+    /// The slot holding `address` with its payload, counted as a read and promoted, the look
+    /// made as [`Self::slot_touched`] makes it; none, and nothing counted, when no slot holds
+    /// it: a scan's landing, whose miss is counted where the page is then read.
+    pub fn lookup_held(&mut self, address: u64) -> Option<usize> {
+        self.map.settle();
+        let i = self.slot_touched(address)?;
+        self.payload(i)?;
+        let slot = self.slots.get_mut(i)?;
+        slot.freq = slot.freq.saturating_add(1).min(MAX_FREQ);
+        self.hits = self.hits.saturating_add(1);
+        Some(i)
     }
 
     /// Frees one slot within `steps` queue steps: from the small queue while it holds its

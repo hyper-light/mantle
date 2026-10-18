@@ -82,4 +82,12 @@ fn main() {
         ns / records as f64,
         ns / 1e6
     );
+    use std::sync::atomic::Ordering::Relaxed;
+    use mantle_engine::kept_table::{DIAG_ALLOC_NS, DIAG_REBUILD_NS, DIAG_REBUILDS};
+    println!(
+        "kept_merge diag rebuilds {} rebuild_ms {:.0} of which alloc_ms {:.0}",
+        DIAG_REBUILDS.load(Relaxed),
+        DIAG_REBUILD_NS.load(Relaxed) as f64 / 1e6,
+        DIAG_ALLOC_NS.load(Relaxed) as f64 / 1e6
+    );
 }

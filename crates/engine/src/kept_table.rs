@@ -36,6 +36,10 @@ const LINE: usize = 64;
 /// A record list's header: the 32-bit hash (4), the operation (1), the key's length (4) and the
 /// value's (4).
 const LIST_HEAD: usize = 13;
+/// DIAGNOSTIC (never merged): time in allocations and rebuilds, and rebuilds.
+pub static DIAG_ALLOC_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DIAG_REBUILD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DIAG_REBUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// What a table answers for a key.
 #[derive(Debug, PartialEq, Eq)]
@@ -474,6 +478,7 @@ impl RecordTable {
     /// Rebuilt with room for `records` at a load of at most 2/3, holding only the records of
     /// memtables no older than `oldest`.
     fn rebuild(&mut self, records: usize, oldest: u32) -> Result<(), Error> {
+        let diag_t0 = std::time::Instant::now();
         let too_large = || Error::LimitExceeded {
             what: "a kept index's records",
             limit: u64::try_from(records).unwrap_or(u64::MAX),
@@ -484,7 +489,12 @@ impl RecordTable {
             .ok_or_else(too_large)?;
         let len = slots.checked_mul(self.slot).ok_or_else(too_large)?;
         let mut fresh = RecordTable {
-            map: HugeZeroed::allocate(len)?,
+            map: {
+                let t = std::time::Instant::now();
+                let m = HugeZeroed::allocate(len)?;
+                DIAG_ALLOC_NS.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                m
+            },
             slot: self.slot,
             slots,
             live: 0,
@@ -514,6 +524,8 @@ impl RecordTable {
             }
         }
         *self = fresh;
+        DIAG_REBUILD_NS.fetch_add(diag_t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        DIAG_REBUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 

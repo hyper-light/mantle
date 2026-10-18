@@ -258,6 +258,11 @@ struct Rotation {
     finish_packing: bool,
     most: Option<usize>,
     stalled: bool,
+    /// DIAGNOSTIC: what the stall waited on, and the state when it first did.
+    diag_frozen: bool,
+    diag_room: bool,
+    diag_blocked: bool,
+    diag_state: String,
 }
 
 /// One retained durability operation. Its index and phases survive a canceled borrowed wait.
@@ -4455,6 +4460,21 @@ impl<F: BlockFile> ShardDb<F> {
         })
     }
 
+    /// DIAGNOSTIC: the state a stalled rotation waits in.
+    fn diag_rotation_state(&self, most: usize) -> String {
+        format!(
+            "frozen {} most {} pack_ns {} fill_ns {} pending {} has_room {} packing {} workers_out {}",
+            self.frozen.len(),
+            most,
+            self.pack_ns,
+            self.fill_ns,
+            self.trunk.pending(),
+            self.trunk.has_room(),
+            self.packing.is_some(),
+            self.trunk.pool_workers().map_or(0, |(held, _)| held)
+        )
+    }
+
     /// The same rotation as the blocking API, paid in the task's existing slice budget.
     /// Only old packing and maintenance state changes before it returns true; the caller's entry
     /// remains unapplied, and every old memtable remains reachable by reads.
@@ -4474,6 +4494,10 @@ impl<F: BlockFile> ShardDb<F> {
                 finish_packing,
                 most: None,
                 stalled: finish_packing,
+                diag_frozen: false,
+                diag_room: false,
+                diag_blocked: false,
+                diag_state: String::new(),
             });
         }
         if self.rotation.as_ref().is_some_and(|r| r.finish_packing) {
@@ -4503,8 +4527,13 @@ impl<F: BlockFile> ShardDb<F> {
             }
         };
         if self.frozen.len() > most {
+            let state = self.diag_rotation_state(most);
             if let Some(r) = self.rotation.as_mut() {
                 r.stalled = true;
+                if !r.diag_frozen {
+                    r.diag_frozen = true;
+                    r.diag_state.push_str(&format!(" at_frozen[{state}]"));
+                }
             }
             self.take_packs(false)?;
             if self.frozen.len() > most {
@@ -4512,10 +4541,18 @@ impl<F: BlockFile> ShardDb<F> {
             }
         }
         if !self.trunk.has_room() {
+            let state = self.diag_rotation_state(most);
             if let Some(r) = self.rotation.as_mut() {
                 r.stalled = true;
+                if !r.diag_room {
+                    r.diag_room = true;
+                    r.diag_state.push_str(&format!(" at_room[{state}]"));
+                }
             }
             if self.trunk.packing_blocks_dispatch(&mut self.store)? {
+                if let Some(r) = self.rotation.as_mut() {
+                    r.diag_blocked = true;
+                }
                 // Packings hold every seat: their results free them. Take any back before
                 // waiting on maintenance's worker capacity.
                 self.pack_some(keys.max(1), false)?;
@@ -4545,6 +4582,16 @@ impl<F: BlockFile> ShardDb<F> {
             f.stalls = f.stalls.saturating_add(1);
             f.stall_ns = f.stall_ns.saturating_add(ns);
             f.stall_max_ns = f.stall_max_ns.max(ns);
+            eprintln!(
+                "diag_stall rotation {} us {} finish_packing {} frozen {} room {} blocked {}{}",
+                self.flush_stats.rotations,
+                r.started.elapsed().as_micros(),
+                r.finish_packing,
+                r.diag_frozen,
+                r.diag_room,
+                r.diag_blocked,
+                r.diag_state
+            );
         }
         self.rotated = Some(std::time::Instant::now());
         Ok(true)

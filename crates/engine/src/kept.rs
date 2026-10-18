@@ -1,58 +1,30 @@
 //! One index over the memtables a shard keeps readable for gets (research/51 §7): each key's
-//! newest entry among the memtables it covers, by the key's 64-bit filter hash
-//! ([`crate::branch::filter::hash`]), as the memtable's number and the entry's arena offset.
+//! newest record among the memtables it covers, where the key's hash points
+//! ([`crate::kept_table`], research/63), so a get the index answers reads one place.
 //!
 //! A packing worker walks each key's newest entry of a memtable's copy as it builds the branch,
-//! and hands back the (hash, offset) pairs ([`KeyList`]); a maintenance worker adds the lists of
-//! the memtables kept since to an index it was handed ([`KeptIndex::extend`]), the newer
-//! memtable's entry replacing an older one's, and hands it back; the shard only probes it. A
-//! probe's answer is the shard's to check: the memtable still kept, and its key at that offset
-//! the one asked. Two keys of one hash share an entry, the newer memtable's: a get of the other
-//! finds a key that is not its own, a miss, and reads the trunk, which holds every kept
-//! memtable's records.
+//! and hands back those records ([`KeyList`]), split by the top bits of their places into the
+//! index's parts. The index is one copy: a part goes out on a worker alone to take its records of
+//! the memtables kept since it last did ([`KeptIndex::take_part`]), the newer memtable's record
+//! replacing an older one's, and comes back to serve again; while it is out, a key of that part
+//! is answered by the memtables newer than its part holds and then the trunk. Once every part
+//! holds a memtable's records, its arena is read no more.
+//!
+//! One copy holds a record in one slot: two copies taking turns held 46-60 GB at 100M against
+//! main's 35-37, kept a fifth of the memtables there and sent the rest of the gets to the trunk
+//! (research/63 §5). Each record is merged once, and a trip is one part's: the parts out at once
+//! are as many as keep pace with the writes, `x` ns to merge a record and `r` records a second
+//! needing `x r` workers busy.
 //!
 //! Memtables are numbered by a counter that wraps: the memtables an index covers and the shard
 //! keeps span far fewer than 2^31 numbers, so "older" is decided modulo 2^32 ([`older`]).
 
-use crate::util::incmap::IncMap;
+use crate::error::Error;
+use crate::kept_table::{Answer, PartedList, RecordTable, part_of};
 
-/// A memtable's keys as its packing worker walked them: each key's newest entry, its filter
-/// hash and its arena offset, in two arrays so an entry takes 12 bytes.
-#[derive(Debug, Default)]
-pub struct KeyList {
-    pub hashes: Vec<u64>,
-    pub offsets: Vec<u32>,
-}
-
-impl KeyList {
-    /// Empties the list, keeping its buffers for the next memtable's walk.
-    pub fn clear(&mut self) {
-        self.hashes.clear();
-        self.offsets.clear();
-    }
-
-    pub fn len(&self) -> usize {
-        self.hashes.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.hashes.is_empty()
-    }
-
-    /// Adds an entry.
-    pub fn push(&mut self, hash: u64, offset: u32) {
-        self.hashes.push(hash);
-        self.offsets.push(offset);
-    }
-
-    /// The bytes its buffers take, at their capacities.
-    pub fn bytes(&self) -> usize {
-        self.hashes
-            .capacity()
-            .saturating_mul(8)
-            .saturating_add(self.offsets.capacity().saturating_mul(4))
-    }
-}
+/// A memtable's records as its packing worker walked them, each key's newest entry once, split
+/// by the index's parts.
+pub type KeyList = PartedList;
 
 /// Whether memtable `a` was numbered before `b`, the counter having wrapped or not.
 pub fn older(a: u32, b: u32) -> bool {
@@ -60,116 +32,217 @@ pub fn older(a: u32, b: u32) -> bool {
     d != 0 && d < 1 << 31
 }
 
-/// A memtable's number and an entry's offset in its arena, as the index holds them.
-fn pack(memtable: u32, offset: u32) -> u64 {
-    (u64::from(memtable) << 32) | u64::from(offset)
-}
-
-fn unpack(v: u64) -> (u32, u32) {
-    (
-        u32::try_from(v >> 32).unwrap_or(0),
-        u32::try_from(v & u64::from(u32::MAX)).unwrap_or(0),
-    )
-}
-
-/// The index: each key's newest entry among the memtables it covers, and the newest memtable it
-/// covers.
-#[derive(Debug, Default)]
+/// The index: each key's newest record among the memtables its part covers, in parts split by
+/// the top `bits` bits of a key's place, each part one table, home serving gets or out on a
+/// worker.
+#[derive(Debug)]
 pub struct KeptIndex {
-    map: IncMap,
-    covers: Option<u32>,
-    /// The entries of given-back memtables the shard had counted (its `kept_gone`) when this
-    /// index was last swept: what has gone stale in it since is the count now less this.
-    swept_at: u64,
+    /// Each part's table, none while it is out.
+    parts: Vec<Option<RecordTable>>,
+    bits: u32,
+    /// The newest memtable each part's table holds the records of, none before its first.
+    covers: Vec<Option<u32>>,
+    /// Per part, the shard's count of given-back records (its `kept_gone`) when the part was last
+    /// swept: what has gone stale in it since is the count now less this.
+    swept_at: Vec<u64>,
+    /// Which index this is among those the shard has made, so a part back from a worker after its
+    /// index was dropped is dropped too.
+    id: u64,
 }
 
 impl KeptIndex {
-    pub fn new() -> Self {
-        Self::default()
+    /// An empty index of `2^bits` parts, the shard's `id`th.
+    pub fn new(bits: u32, id: u64) -> Self {
+        let parts = 1usize.checked_shl(bits).unwrap_or(1);
+        Self {
+            parts: (0..parts).map(|_| Some(RecordTable::part(bits))).collect(),
+            bits,
+            covers: vec![None; parts],
+            swept_at: vec![0; parts],
+            id,
+        }
     }
 
-    /// The newest memtable whose keys the index holds, none before the first.
-    pub fn covers(&self) -> Option<u32> {
-        self.covers
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
-    /// The shard's count of given-back entries when this index was last swept.
-    pub fn swept_at(&self) -> u64 {
-        self.swept_at
+    /// Its parts.
+    pub fn parts(&self) -> usize {
+        self.parts.len()
     }
 
-    /// Notes that the sweep this index is sent for drops what the shard has given back up to
-    /// `gone` entries.
-    pub fn set_swept_at(&mut self, gone: u64) {
-        self.swept_at = gone;
+    /// The part a key of 32-bit filter hash `hash32` is in.
+    pub fn part_of(&self, hash32: u32) -> usize {
+        part_of(hash32, self.bits)
     }
 
-    /// Entries held, those of memtables given back included until a sweep drops them.
+    /// The newest memtable part `part` holds the records of, none before its first.
+    pub fn covers(&self, part: usize) -> Option<u32> {
+        self.covers.get(part).copied().flatten()
+    }
+
+    /// The newest memtable every part holds the records of: none while a part holds none.
+    pub fn covers_all(&self) -> Option<u32> {
+        let mut all: Option<u32> = None;
+        for c in &self.covers {
+            let c = (*c)?;
+            all = Some(match all {
+                Some(a) if older(a, c) => a,
+                _ => c,
+            });
+        }
+        all
+    }
+
+    /// The newest memtable any part holds the records of: none before the first.
+    pub fn covers_newest(&self) -> Option<u32> {
+        let mut newest: Option<u32> = None;
+        for c in self.covers.iter().flatten() {
+            newest = Some(match newest {
+                Some(n) if older(*c, n) => n,
+                _ => *c,
+            });
+        }
+        newest
+    }
+
+    /// Whether part `part` is out on a worker.
+    pub fn is_out(&self, part: usize) -> bool {
+        self.parts.get(part).is_some_and(Option::is_none)
+    }
+
+    /// The parts out on workers.
+    pub fn out(&self) -> usize {
+        self.parts.iter().filter(|p| p.is_none()).count()
+    }
+
+    /// The shard's count of given-back records when part `part` was last swept.
+    pub fn swept_at(&self, part: usize) -> u64 {
+        self.swept_at.get(part).copied().unwrap_or(0)
+    }
+
+    /// Records held by the parts home, those of memtables given back included until a sweep
+    /// drops them.
     pub fn len(&self) -> usize {
-        self.map.len()
+        self.parts
+            .iter()
+            .flatten()
+            .map(RecordTable::len)
+            .fold(0, usize::saturating_add)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.parts.iter().flatten().all(RecordTable::is_empty)
     }
 
-    /// The bytes its table takes.
+    /// The bytes the tables of the parts home take.
     pub fn bytes(&self) -> usize {
-        self.map.bytes()
+        self.parts
+            .iter()
+            .flatten()
+            .map(RecordTable::bytes)
+            .fold(0, usize::saturating_add)
     }
 
-    /// The memtable and arena offset of the newest entry of a key of hash `hash`, if the index
-    /// holds one.
+    /// The newest record of `key`, of 32-bit filter hash `hash32`, among the memtables its part
+    /// covers: unknown when that memtable is older than `oldest`, given back, or the part is out.
     #[inline]
-    pub fn get(&self, hash: u64) -> Option<(u32, u32)> {
-        self.map.get(hash).map(unpack)
-    }
-
-    /// Reads `hash`'s first group, so a lookup after finds it cached ([`IncMap::touch`]).
-    #[inline]
-    pub fn touch(&self, hash: u64) -> u64 {
-        self.map.touch(hash)
-    }
-
-    /// [`Self::get`] of the index read alone ([`IncMap::get_touched`]).
-    #[inline]
-    pub fn get_touched(&self, hash: u64) -> Option<(u32, u32)> {
-        self.map.get_touched(hash).map(unpack)
-    }
-
-    /// Adds each memtable's keys, `lists` oldest first, passing over those it already covers: a
-    /// key's entry in a newer memtable replaces its entry in an older one. With
-    /// `sweep`, entries of memtables older than `oldest` (given back) are dropped first. The
-    /// table ends settled: a lookup probes one table.
-    pub fn extend(&mut self, lists: &[(u32, KeyList)], oldest: u32, sweep: bool) {
-        if sweep {
-            // Settled first, so one pass over the table looks at every entry.
-            while self.map.migrating() {
-                self.map.settle();
-            }
-            let buckets = self.map.buckets();
-            self.map.sweep(buckets, |_, v| !older(unpack(v).0, oldest));
+    pub fn get(&self, hash32: u32, key: &[u8], oldest: u32) -> Answer<'_> {
+        match self.parts.get(self.part_of(hash32)) {
+            Some(Some(t)) => t.get(hash32, key, oldest),
+            Some(None) => Answer::Unknown,
+            None => Answer::Absent,
         }
-        for (memtable, list) in lists {
-            // A list it took on an earlier trip is passed over: its entries are in, or replaced
-            // by newer ones.
-            if self.covers.is_some_and(|c| !older(c, *memtable)) {
+    }
+
+    /// Reads `hash32`'s home slot, so a lookup after finds it cached ([`RecordTable::touch`]).
+    #[inline]
+    pub fn touch(&self, hash32: u32) -> u8 {
+        match self.parts.get(self.part_of(hash32)) {
+            Some(Some(t)) => t.touch(hash32),
+            _ => 0,
+        }
+    }
+
+    /// The bytes a trip of part `part` that takes `lists` (memtable number and records) and,
+    /// with `sweep`, sweeps first, grows its table to beside the one it took
+    /// ([`RecordTable::growth`]), the part's slot size settled from its first records here, once:
+    /// what the trip holds beyond the table it took, at most. None for a part out.
+    pub fn growth<'a>(
+        &mut self,
+        part: usize,
+        lists: impl Iterator<Item = &'a crate::kept_table::RecordList> + Clone,
+        sweep: bool,
+    ) -> usize {
+        let Some(Some(table)) = self.parts.get_mut(part) else {
+            return 0;
+        };
+        if let Some(first) = lists.clone().find(|l| !l.is_empty()) {
+            table.settle_slot(first);
+        }
+        table.growth(sweep, lists.map(crate::kept_table::RecordList::len))
+    }
+
+    /// Part `part`'s table, taken out for a worker to extend, the part out until it is back;
+    /// none for a part already out. With `sweep`, the part is noted swept at `gone`.
+    pub fn take_part(&mut self, part: usize, sweep: Option<u64>) -> Option<RecordTable> {
+        let table = self.parts.get_mut(part)?.take()?;
+        if let (Some(gone), Some(at)) = (sweep, self.swept_at.get_mut(part)) {
+            *at = gone;
+        }
+        Some(table)
+    }
+
+    /// Part `part`'s table, back from its worker holding the records of memtables up to `covers`.
+    pub fn put_part(&mut self, part: usize, table: RecordTable, covers: Option<u32>) {
+        if let Some(p) = self.parts.get_mut(part) {
+            *p = Some(table);
+        }
+        if let (Some(c), Some(slot)) = (covers, self.covers.get_mut(part)) {
+            *slot = Some(c);
+        }
+    }
+
+    /// Every part home takes each memtable's records it lacks, `lists` oldest first, after a
+    /// sweep with `sweep` of records of memtables older than `oldest` (given back), here rather
+    /// than on workers: for a shard without them, and tests. On an error (memory refused) the
+    /// index holds some of the lists' records and must be dropped, not served.
+    pub fn extend(
+        &mut self,
+        lists: &[(u32, KeyList)],
+        oldest: u32,
+        sweep: bool,
+    ) -> Result<(), Error> {
+        for (p, slot) in self.parts.iter_mut().enumerate() {
+            let Some(table) = slot.as_mut() else {
                 continue;
+            };
+            let covers = self.covers.get(p).copied().flatten();
+            if sweep {
+                table.sweep(oldest)?;
             }
-            for (&hash, &offset) in list.hashes.iter().zip(&list.offsets) {
-                self.map.insert(hash, pack(*memtable, offset));
+            for (memtable, list) in lists {
+                if covers.is_some_and(|c| !older(c, *memtable)) {
+                    continue;
+                }
+                if let Some(records) = list.part(p) {
+                    table.merge(*memtable, records, oldest)?;
+                }
+                if let Some(c) = self.covers.get_mut(p) {
+                    *c = Some(*memtable);
+                }
             }
-            self.covers = Some(*memtable);
         }
-        while self.map.migrating() {
-            self.map.settle();
-        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::branch::Op;
+    use crate::kept_table::Record;
     use proptest::prelude::*;
     use std::collections::HashMap;
 
@@ -183,54 +256,91 @@ mod tests {
         assert!(!older(2, u32::MAX - 3));
     }
 
+    fn h(k: &[u8]) -> u32 {
+        crate::branch::filter::hash32(crate::branch::filter::hash(k))
+    }
+
     proptest! {
-        /// Against a map of the newest entry per hash: lists added a few at a time, the numbers
-        /// running past the counter's wrap, and memtables given back with a sweep, which drops
-        /// exactly the entries whose newest memtable was given back.
+        /// Against a map of each key's newest record: lists added a few at a time, in one, two or
+        /// four parts, through the index's own extend or part by part as trips take them (a key
+        /// of a part out answered unknown), the numbers running past the counter's wrap, each
+        /// list offered twice, and memtables given back with a sweep, which drops exactly the
+        /// records whose newest memtable was given back.
         #[test]
-        fn it_holds_each_key_s_newest_entry_among_the_memtables_it_covers(
+        fn it_holds_each_key_s_newest_record_among_the_memtables_it_covers(
             batches in prop::collection::vec(
-                prop::collection::vec(prop::collection::vec((0u64..400, any::<u32>()), 0..60), 1..4),
+                prop::collection::vec(prop::collection::vec((0u64..400, any::<u8>()), 0..60), 1..4),
                 1..8,
             ),
             start in prop_oneof![Just(0u32), Just(u32::MAX - 5)],
             gone in 0u32..6,
+            bits in 0u32..3,
+            by_parts in any::<bool>(),
         ) {
-            let mut index = KeptIndex::new();
-            let mut model: HashMap<u64, (u32, u32)> = HashMap::new();
+            let mut index = KeptIndex::new(bits, 1);
+            let mut model: HashMap<Vec<u8>, (u32, Vec<u8>)> = HashMap::new();
             let mut next = start;
             for batch in &batches {
                 let mut lists = Vec::new();
                 for keys in batch {
-                    let mut list = KeyList::default();
+                    let mut list = KeyList::new(bits);
                     // A memtable holds a key once: its newest entry.
                     let mut seen = std::collections::HashSet::new();
-                    for &(h, off) in keys {
-                        if seen.insert(h) {
-                            list.push(h, off);
-                            model.insert(h, (next, off));
+                    for &(k, b) in keys {
+                        if seen.insert(k) {
+                            let key = format!("{k:016}").into_bytes();
+                            let value = vec![b; 100];
+                            list.push(&Record { hash32: h(&key), op: Op::Put, key: &key, value: &value })
+                                .unwrap();
+                            model.insert(key, (next, value));
                         }
                     }
                     lists.push((next, list));
                     next = next.wrapping_add(1);
                 }
-                // The lists taken again, as a trip that carries them for the other index does:
-                // nothing changes.
                 let before = index.len();
-                index.extend(&lists, start, false);
-                index.extend(&lists, start, false);
-                prop_assert_eq!(index.covers(), Some(next.wrapping_sub(1)));
+                if by_parts {
+                    // As trips do it: each part taken out alone, a key of it answered unknown
+                    // while it is out, its records of the lists it lacks merged, and put back
+                    // covering the newest.
+                    for part in 0..index.parts() {
+                        let covers = index.covers(part);
+                        let mut table = index.take_part(part, None).unwrap();
+                        prop_assert!(index.is_out(part));
+                        if let Some(k) = model.keys().find(|k| index.part_of(h(k)) == part) {
+                            prop_assert_eq!(index.get(h(k), k, start), Answer::Unknown);
+                        }
+                        for (n, list) in &lists {
+                            if covers.is_none_or(|c| older(c, *n)) {
+                                table.merge(*n, list.part(part).unwrap(), start).unwrap();
+                            }
+                        }
+                        index.put_part(part, table, lists.last().map(|(n, _)| *n));
+                    }
+                } else {
+                    index.extend(&lists, start, false).unwrap();
+                }
+                index.extend(&lists, start, false).unwrap();
+                for part in 0..index.parts() {
+                    prop_assert_eq!(index.covers(part), Some(next.wrapping_sub(1)));
+                }
+                prop_assert_eq!(index.covers_all(), Some(next.wrapping_sub(1)));
+                prop_assert_eq!(index.out(), 0);
                 prop_assert!(index.len() >= before);
             }
-            for (h, want) in &model {
-                prop_assert_eq!(index.get(*h), Some(*want));
+            for (k, (_, v)) in &model {
+                prop_assert_eq!(index.get(h(k), k, start), Answer::Record(Op::Put, v.as_slice()));
             }
-            // Give back the oldest `gone` memtables: the sweep drops their entries, no other.
+            // Give back the oldest `gone` memtables: the sweep drops their records, no other.
             let oldest = start.wrapping_add(gone);
-            index.extend(&[], oldest, true);
-            for (h, want) in &model {
-                let kept = if older(want.0, oldest) { None } else { Some(*want) };
-                prop_assert_eq!(index.get(*h), kept);
+            index.extend(&[], oldest, true).unwrap();
+            for (k, (n, v)) in &model {
+                let got = index.get(h(k), k, oldest);
+                if older(*n, oldest) {
+                    prop_assert_eq!(got, Answer::Absent);
+                } else {
+                    prop_assert_eq!(got, Answer::Record(Op::Put, v.as_slice()));
+                }
             }
         }
     }

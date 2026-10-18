@@ -1036,6 +1036,9 @@ impl HashMem {
                 limit: u64::try_from(self.limit).unwrap_or(u64::MAX),
             });
         }
+        // The index's group for the key read first, so its miss runs beside the entry's copies
+        // into the arena and the mirror rather than after them: the probe below finds it cached.
+        std::hint::black_box(self.index.touch(h));
         let entry = u32::try_from(self.arena.len()).map_err(|_| corrupt())?;
         if entry == 0 {
             self.first.clear();

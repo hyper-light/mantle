@@ -96,6 +96,8 @@ pub struct FlushStats {
     pub kept_hits: u64,
     /// Of the kept memtables, those the index a get probes covers (research/51 §7).
     pub kept_covered: u64,
+    /// The closed generations of that index, each given back whole (research/63 §3).
+    pub kept_generations: u64,
     /// Gets of keys no kept memtable held, answered without the trunk while they held every
     /// record it does (research/51 §8).
     pub kept_absent: u64,
@@ -113,15 +115,30 @@ enum KeptAnswer {
     Unknown,
 }
 
-/// A memtable kept readable for gets: the memtable, its number among the kept ones (`crate::kept`
-/// numbers them by a counter that wraps), and the entries its key list held, which giving it
-/// back leaves in the indexes until a sweep.
+/// A memtable kept readable for gets: the memtable until both indexes hold its records (then it
+/// is read no more and its memory goes back), its number among the kept ones (`crate::kept`
+/// numbers them by a counter that wraps), and the records its list held, which giving it back
+/// leaves in the indexes until a sweep.
 #[derive(Debug)]
 struct KeptMem {
-    mem: HashMem,
+    mem: Option<HashMem>,
     number: u32,
     keys: u64,
 }
+
+/// A closed generation of the index over kept memtables (research/63 §3): one copy of the records
+/// of the kept memtables from `first` through its index's newest, read by gets, never written
+/// again, and given back whole, its memory free at once.
+#[derive(Debug)]
+struct KeptGen {
+    index: crate::kept::KeptIndex,
+    first: u32,
+}
+
+/// The memtable numbers a generation may span before the slots' 16 bits of a number would alias
+/// (`crate::kept_table`, which decides "older" modulo 2^16): half of the 2^15 that decision
+/// allows, so a generation is given back well before it reaches it.
+const GENERATION_SPAN: u32 = 1 << 14;
 
 /// A memtable read in key order from a seek, its next entry held in buffers it reuses: one
 /// source of a scan.
@@ -330,6 +347,10 @@ pub struct ShardDb<F: BlockFile> {
     /// take turns, so a get never waits for an index and the shard never lends the one it reads.
     kept_index: Option<crate::kept::KeptIndex>,
     kept_spare: Option<crate::kept::KeptIndex>,
+    /// The closed generations, oldest first ([`KeptGen`]), and the first memtable of the open one
+    /// the two indexes above extend.
+    kept_gens: std::collections::VecDeque<KeptGen>,
+    kept_open_first: u32,
     kept_out: bool,
     /// The bytes the index out on a worker held when it went.
     kept_out_bytes: usize,
@@ -714,6 +735,8 @@ impl<F: BlockFile> ShardDb<F> {
             kept_lists: std::collections::VecDeque::new(),
             kept_index: None,
             kept_spare: None,
+            kept_gens: std::collections::VecDeque::new(),
+            kept_open_first: 0,
             kept_out: false,
             kept_out_bytes: 0,
             kept_next: 0,
@@ -3405,7 +3428,11 @@ impl<F: BlockFile> ShardDb<F> {
             .saturating_add(mem.memory())
             .saturating_add(list.bytes());
         let keys = u64::try_from(list.len()).unwrap_or(u64::MAX);
-        self.kept.push_back(KeptMem { mem, number, keys });
+        self.kept.push_back(KeptMem {
+            mem: Some(mem),
+            number,
+            keys,
+        });
         self.kept_lists.push_back((number, list));
         self.fit_kept(true);
         // The index out on a worker comes back here, a rotation's look, before the next goes.
@@ -3418,7 +3445,9 @@ impl<F: BlockFile> ShardDb<F> {
         while let Some(k) = self.kept.pop_front() {
             self.kept_gone = self.kept_gone.saturating_add(k.keys);
             self.kept_whole = false;
-            self.recycle(k.mem);
+            if let Some(mem) = k.mem {
+                self.recycle(mem);
+            }
         }
         self.kept_bytes = 0;
         while let Some((_, list)) = self.kept_lists.pop_front() {
@@ -3426,6 +3455,8 @@ impl<F: BlockFile> ShardDb<F> {
         }
         self.kept_index = None;
         self.kept_spare = None;
+        self.kept_gens.clear();
+        self.kept_open_first = self.kept_next;
     }
 
     /// A key list no index needs: kept for the next packing's or list's, at most one a worker
@@ -3540,7 +3571,13 @@ impl<F: BlockFile> ShardDb<F> {
         };
         self.kept_out = false;
         self.kept_out_bytes = 0;
-        back.result?;
+        if back.result.is_err() {
+            // The index came back partly extended, its memory refused: it is dropped, and with it
+            // the kept memtables, whose gets the trunk answers, as when the budget gives them
+            // back.
+            self.give_back_kept();
+            return Ok(());
+        }
         let Some(job) = back.indexed else {
             return Err(Error::InvalidArgument {
                 what: "an index job's result with no index",
@@ -3580,6 +3617,15 @@ impl<F: BlockFile> ShardDb<F> {
             None => self.kept_index = Some(index),
         }
         self.prune_lists();
+        if self.open_gen_full() {
+            self.close_open_gen();
+        }
+        // The index back may hold more than it did when it went (it grew on its worker), and
+        // whatever took it back, a get's tending or a maintenance step, leaves the regions and the
+        // kept memtables within the budget.
+        if self.kept_held() > self.kept_limit() {
+            self.fit_kept(false);
+        }
         self.extend_kept()
     }
 
@@ -3597,8 +3643,11 @@ impl<F: BlockFile> ShardDb<F> {
             (Some(a), Some(b)) => Some(if crate::kept::older(a, b) { a } else { b }),
             _ => None,
         };
+        // A closed generation holds every record of the memtables it covers.
+        let closed = self.kept_gens.back().and_then(|g| g.index.covers());
         while let Some(&(n, _)) = self.kept_lists.front() {
-            let taken = both.is_some_and(|b| !crate::kept::older(b, n));
+            let taken = both.is_some_and(|b| !crate::kept::older(b, n))
+                || closed.is_some_and(|c| !crate::kept::older(c, n));
             let gone = oldest.is_none_or(|o| crate::kept::older(n, o));
             if !(taken || gone) {
                 break;
@@ -3607,7 +3656,105 @@ impl<F: BlockFile> ShardDb<F> {
                 self.kept_bytes = self.kept_bytes.saturating_sub(list.bytes());
                 self.free_list(list);
             }
+            if taken {
+                // Both indexes hold its records: its arena is read no more.
+                self.release_arena(n);
+            }
         }
+    }
+
+    /// Gives back kept memtable `n`'s arena, its records being in both indexes.
+    fn release_arena(&mut self, n: u32) {
+        let Some(front) = self.kept.front().map(|k| k.number) else {
+            return;
+        };
+        let at = usize::try_from(n.wrapping_sub(front)).unwrap_or(usize::MAX);
+        let Some(mem) = self
+            .kept
+            .get_mut(at)
+            .filter(|k| k.number == n)
+            .and_then(|k| k.mem.take())
+        else {
+            return;
+        };
+        self.kept_bytes = self.kept_bytes.saturating_sub(mem.memory());
+        self.recycle(mem);
+    }
+
+    /// Gives the oldest closed generation back whole, with the kept memtables it covers: false
+    /// with none.
+    fn give_back_gen(&mut self) -> bool {
+        let Some(oldest) = self.kept_gens.pop_front() else {
+            return false;
+        };
+        let last = oldest.index.covers();
+        while self
+            .kept
+            .front()
+            .is_some_and(|k| last.is_some_and(|l| !crate::kept::older(l, k.number)))
+        {
+            if let Some(k) = self.kept.pop_front()
+                && let Some(mem) = k.mem
+            {
+                self.kept_bytes = self.kept_bytes.saturating_sub(mem.memory());
+                self.recycle(mem);
+            }
+        }
+        true
+    }
+
+    /// Closes the open generation: its serving index becomes a closed one, its spare dropped, and
+    /// the next memtable's records start a new one. Only with the spare home: one out on a worker
+    /// comes back first. False when there is nothing to close.
+    fn close_open_gen(&mut self) -> bool {
+        if self.kept_out {
+            return false;
+        }
+        let Some(home) = self.kept_index.take() else {
+            return false;
+        };
+        let Some(last) = home.covers() else {
+            self.kept_index = Some(home);
+            return false;
+        };
+        self.kept_spare = None;
+        self.kept_gens.push_back(KeptGen {
+            index: home,
+            first: self.kept_open_first,
+        });
+        self.kept_open_first = last.wrapping_add(1);
+        // The lists the closed copy holds are taken, their memtables' arenas read no more.
+        self.prune_lists();
+        true
+    }
+
+    /// Gives back each generation that spans more memtable numbers than [`GENERATION_SPAN`],
+    /// closing an open one that does: whether any was.
+    fn give_back_aliasing(&mut self) -> bool {
+        let bound = self.kept_next.wrapping_sub(GENERATION_SPAN);
+        let mut gave = false;
+        if crate::kept::older(self.kept_open_first, bound) && self.close_open_gen() {
+            gave = true;
+        }
+        while self
+            .kept_gens
+            .front()
+            .is_some_and(|g| crate::kept::older(g.first, bound))
+        {
+            gave |= self.give_back_gen();
+            self.kept_whole = false;
+        }
+        gave
+    }
+
+    /// Whether the open generation has grown to its share of the kept memtables' memory, a
+    /// third of what they may hold: closed then, its closed copy and the open one's two stay
+    /// within that memory together as further generations follow (research/63 §3).
+    fn open_gen_full(&self) -> bool {
+        !self.kept_out
+            && self.kept_index.as_ref().is_some_and(|home| {
+                home.bytes().saturating_mul(3) >= self.kept_limit() && home.covers().is_some()
+            })
     }
 
     /// Gives kept memtables back, oldest first: while they hold more than the budget's idle
@@ -3629,7 +3776,7 @@ impl<F: BlockFile> ShardDb<F> {
         let mut short = refused > self.kept_refused;
         self.kept_refused = refused;
         let limit = self.kept_limit();
-        let mut gave = false;
+        let mut gave = self.give_back_aliasing();
         while !self.kept.is_empty() {
             let over = self.kept_held() > limit;
             let machine_short = machine && self.spare.is_none() && !self.machine_spares();
@@ -3637,12 +3784,24 @@ impl<F: BlockFile> ShardDb<F> {
                 break;
             }
             short = false;
+            self.kept_whole = false;
+            gave = true;
+            // The oldest records go first: a closed generation whole, its memory free at once;
+            // then the open one, closed (its spare dropped) and given back next.
+            if self.give_back_gen() || self.close_open_gen() {
+                continue;
+            }
+            // Else the oldest memtable, when giving it back frees its arena; one whose records
+            // are only in an index out on a worker waits for that index's return.
+            if self.kept.front().is_none_or(|k| k.mem.is_none()) {
+                break;
+            }
             if let Some(k) = self.kept.pop_front() {
-                self.kept_bytes = self.kept_bytes.saturating_sub(k.mem.memory());
+                if let Some(mem) = k.mem {
+                    self.kept_bytes = self.kept_bytes.saturating_sub(mem.memory());
+                    self.recycle(mem);
+                }
                 self.kept_gone = self.kept_gone.saturating_add(k.keys);
-                self.recycle(k.mem);
-                self.kept_whole = false;
-                gave = true;
             }
         }
         if self.kept.is_empty() {
@@ -3660,6 +3819,12 @@ impl<F: BlockFile> ShardDb<F> {
     /// counted as it went.
     fn kept_held(&self) -> usize {
         self.kept_bytes
+            .saturating_add(
+                self.kept_gens
+                    .iter()
+                    .map(|g| g.index.bytes())
+                    .fold(0, usize::saturating_add),
+            )
             .saturating_add(
                 self.kept_index
                     .as_ref()
@@ -3725,51 +3890,67 @@ impl<F: BlockFile> ShardDb<F> {
         }
     }
 
-    /// The newest entry of `key` among the kept memtables: those the index a get probes does not
-    /// cover, newest first, each through its own index, then the index, whose entry is checked:
-    /// its memtable still kept, its key the one asked. Every probe's first group is read before
-    /// any is probed, their misses overlapped.
+    /// The newest record of `key` among the kept memtables: those the index a get probes does not
+    /// cover, newest first, each through its own index, then the index, which holds the record
+    /// itself where the key's hash points (research/63). With memtables to probe, every probe's
+    /// first line is read before any is probed, their misses overlapped.
     fn kept_get(&self, key: &[u8], hash: u64, value: &mut Vec<u8>) -> Result<KeptAnswer, Error> {
+        let hash32 = crate::branch::filter::hash32(hash);
         let index = self.kept_index.as_ref();
-        let covered = index.and_then(crate::kept::KeptIndex::covers);
+        let covered = index
+            .and_then(crate::kept::KeptIndex::covers)
+            .or_else(|| self.kept_gens.back().and_then(|g| g.index.covers()));
         let uncovered = |k: &&KeptMem| covered.is_none_or(|c| crate::kept::older(c, k.number));
-        // The index covers the newest kept memtable, and so every one: it is read alone.
-        let alone = index.is_some() && self.kept.back().is_none_or(|k| !uncovered(&k));
-        let found = if let (true, Some(index)) = (alone, index) {
-            index.get_touched(hash)
-        } else {
-            let mut touched = index.map_or(0, |i| i.touch(hash));
+        if !self.kept_gens.is_empty() {
+            // Every generation's home slot read together, so their misses overlap.
+            let touched = self
+                .kept_gens
+                .iter()
+                .fold(index.map_or(0, |i| i.touch(hash32)), |t, g| {
+                    t ^ g.index.touch(hash32)
+                });
+            std::hint::black_box(touched);
+        }
+        if self.kept.back().is_some_and(|k| uncovered(&k)) {
+            let mut touched = u64::from(index.map_or(0, |i| i.touch(hash32)));
             for k in self.kept.iter().rev().take_while(uncovered) {
-                touched ^= k.mem.touch(hash);
+                if let Some(mem) = &k.mem {
+                    touched ^= mem.touch(hash);
+                }
             }
             std::hint::black_box(touched);
             for k in self.kept.iter().rev().take_while(uncovered) {
-                if let Some(op) = k.mem.get_hashed(key, hash, value)? {
+                // A memtable no index covers holds its arena: one goes back only once both
+                // indexes hold its records.
+                let Some(mem) = &k.mem else {
+                    return Ok(KeptAnswer::Unknown);
+                };
+                if let Some(op) = mem.get_hashed(key, hash, value)? {
                     return Ok(KeptAnswer::Found(op));
                 }
             }
-            index.and_then(|i| i.get(hash))
-        };
-        let (Some(_), Some(oldest)) = (index, self.kept.front()) else {
-            // No index: every kept memtable was probed above.
+        }
+        let Some(oldest) = self.kept.front().map(|k| k.number) else {
             return Ok(KeptAnswer::Absent);
         };
-        let Some((number, offset)) = found else {
-            return Ok(KeptAnswer::Absent);
-        };
-        if crate::kept::older(number, oldest.number) {
-            // Its memtable was given back: the trunk holds the record.
-            return Ok(KeptAnswer::Unknown);
+        // The open generation, then the closed ones, newest first: the first that holds the key
+        // holds its newest record.
+        let generations = index
+            .into_iter()
+            .chain(self.kept_gens.iter().rev().map(|g| &g.index));
+        for index in generations {
+            match index.get(hash32, key, oldest) {
+                crate::kept_table::Answer::Record(op, v) => {
+                    value.clear();
+                    value.extend_from_slice(v);
+                    return Ok(KeptAnswer::Found(op));
+                }
+                crate::kept_table::Answer::Absent => {}
+                // Its memtable was given back: the trunk holds the record.
+                crate::kept_table::Answer::Unknown => return Ok(KeptAnswer::Unknown),
+            }
         }
-        let at = usize::try_from(number.wrapping_sub(oldest.number)).unwrap_or(usize::MAX);
-        match self.kept.get(at) {
-            Some(k) if k.number == number => Ok(k
-                .mem
-                .get_at(offset, key, value)?
-                // Another key of its hash: the trunk answers.
-                .map_or(KeptAnswer::Unknown, KeptAnswer::Found)),
-            _ => Ok(KeptAnswer::Unknown),
-        }
+        Ok(KeptAnswer::Absent)
     }
 
     /// The frozen memtables a rotation may leave in flight: the packings whose lifetimes reach
@@ -4706,7 +4887,9 @@ impl<F: BlockFile> ShardDb<F> {
         let covered = self
             .kept_index
             .as_ref()
-            .and_then(crate::kept::KeptIndex::covers);
+            .and_then(crate::kept::KeptIndex::covers)
+            .or_else(|| self.kept_gens.back().and_then(|g| g.index.covers()));
+        flush.kept_generations = as_u64(self.kept_gens.len());
         flush.kept_covered = as_u64(
             self.kept
                 .iter()

@@ -457,25 +457,14 @@ fn run<F: BlockFile>(store: &mut Store<F>, job: &mut Job) -> Result<(Parts, u64)
             // second pivot's key, each next one below the pivot key after its own.
             sorter.ends_below(arena, cuts.get(1..).unwrap_or(&[]), ends)?;
             let end_of = |part: usize| ends.get(part).copied().unwrap_or(kept);
-            // The walk's keys, each its newest entry, with their offsets in the copy, the
-            // arena's own: the index over kept memtables is built from them.
+            // The walk's records, each key's newest entry: the index over kept memtables holds
+            // them (research/63). No more than the arena holds.
             keys.clear();
-            keys.hashes
-                .try_reserve(usize::try_from(*entries).unwrap_or(usize::MAX))
-                .map_err(|_| Error::LimitExceeded {
-                    what: "a memtable's key list",
-                    limit: *entries,
-                })?;
-            keys.offsets
-                .try_reserve(usize::try_from(*entries).unwrap_or(usize::MAX))
-                .map_err(|_| Error::LimitExceeded {
-                    what: "a memtable's key list",
-                    limit: *entries,
-                })?;
+            keys.reserve(arena.len())?;
             let mut parts: Vec<(Vec<u8>, Branch)> = Vec::new();
             let (mut part, mut walked) = (0usize, 0usize);
             let mut building: Option<Builder> = None;
-            sorter.each_at(arena, |k, op, v, h, at| {
+            sorter.each(arena, |k, op, v, h| {
                 // Past the part the last entry ended: its branch finished, and every part with
                 // no entry passed over.
                 while walked >= end_of(part) {
@@ -497,7 +486,13 @@ fn run<F: BlockFile>(store: &mut Store<F>, job: &mut Job) -> Result<(Parts, u64)
                     what: "a memtable's packed parts",
                     why: crate::error::Malformed::CountMismatch,
                 })?;
-                keys.push(crate::branch::filter::hash(k), at);
+                // The sort's own 32-bit hash: the key is hashed once.
+                keys.push(&crate::kept_table::Record {
+                    hash32: h,
+                    op,
+                    key: k,
+                    value: v,
+                })?;
                 b.add_hashed(store, k, op, v, h)?;
                 walked = walked.saturating_add(1);
                 Ok(())
@@ -519,7 +514,7 @@ fn run<F: BlockFile>(store: &mut Store<F>, job: &mut Job) -> Result<(Parts, u64)
                 oldest,
                 sweep,
             } = job.as_mut();
-            index.extend(lists, *oldest, *sweep);
+            index.extend(lists, *oldest, *sweep)?;
             Vec::new()
         }
     };

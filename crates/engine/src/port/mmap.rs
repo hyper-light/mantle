@@ -194,6 +194,14 @@ impl Drop for LazyZeroed {
 /// after it copies 4 KiB pages out of it: the kernel allocates no huge page on that path, and a
 /// 10M table built so held none (research/63 §4). A kernel without it has each page written once
 /// instead. Elsewhere a mapping as [`LazyZeroed`]'s, whose pages are the OS's size.
+///
+/// The populate goes a huge page at a time ([`huge_page_size`]). One `madvise` holds the
+/// process's mmap lock for reading over its whole range (Linux v6.12 mm/madvise.c,
+/// `madvise_populate`, which drops it only for a fault that retries), and a huge page's fault in
+/// a `MADV_HUGEPAGE` range may reclaim and compact memory before it maps (the `defrag` modes of
+/// Documentation/admin-guide/mm/transhuge.rst). A 100M table's gigabytes in one call held the lock
+/// for up to a second, and every mapping change in the process waited behind it: the shard's next
+/// memtable, whose allocation maps (box, 100M: rotations of 0.4-1.1 s).
 pub struct HugeZeroed {
     addr: Option<NonNull<u8>>,
     len: usize,
@@ -255,7 +263,8 @@ impl HugeZeroed {
         Ok(mapped)
     }
 
-    /// Asks Linux for huge pages and faults every page in for writing (the type's docs).
+    /// Asks Linux for huge pages and faults every page in for writing, a huge page at a time (the
+    /// type's docs).
     #[cfg(target_os = "linux")]
     fn fault_in(&mut self) {
         let Some(addr) = self.addr else {
@@ -270,20 +279,32 @@ impl HugeZeroed {
                 rustix::mm::Advice::LinuxHugepage,
             )
         };
-        // SAFETY: as above; populating for writing leaves the zeros the mapping already reads as.
-        let populated = unsafe {
-            rustix::mm::madvise(
-                addr.as_ptr().cast(),
-                self.len,
-                rustix::mm::Advice::LinuxPopulateWrite,
-            )
-        };
-        if populated.is_err() {
-            // A kernel before 5.14: each page written once, a write fault each.
-            let page = page_size().max(1);
-            for b in self.bytes_mut().iter_mut().step_by(page) {
-                *b = 0;
+        let step = huge_page_size().max(page_size()).max(1);
+        let mut done = 0usize;
+        while done < self.len {
+            let n = step.min(self.len.saturating_sub(done));
+            // SAFETY: `done` is below `len`, so the range starts inside the mapping this value
+            // owns and its `n` bytes end inside it; `done` is a multiple of `step`, a whole number
+            // of pages, so the start is page aligned as madvise(2) asks. Populating for writing
+            // leaves the zeros the mapping already reads as.
+            let populated = unsafe {
+                rustix::mm::madvise(
+                    addr.as_ptr().add(done).cast(),
+                    n,
+                    rustix::mm::Advice::LinuxPopulateWrite,
+                )
+            };
+            if populated.is_err() {
+                // A kernel before 5.14: each page left written once, a write fault each.
+                let page = page_size().max(1);
+                if let Some(rest) = self.bytes_mut().get_mut(done..) {
+                    for b in rest.iter_mut().step_by(page) {
+                        *b = 0;
+                    }
+                }
+                return;
             }
+            done = done.saturating_add(n);
         }
     }
 
@@ -316,6 +337,27 @@ impl HugeZeroed {
             None => &mut [],
         }
     }
+}
+
+/// The size of a transparent huge page, the unit [`HugeZeroed`] populates in: the kernel's own
+/// figure (`/sys/kernel/mm/transparent_hugepage/hpage_pmd_size`,
+/// Documentation/admin-guide/mm/transhuge.rst), read once; where it cannot be read, what one
+/// page-table page of 8-byte entries maps, which a PMD entry covers on the 64-bit architectures
+/// Linux runs mantle on (x86_64 and aarch64: 2 MiB on 4 KiB pages, 32 MiB on 16 KiB, 512 MiB on
+/// 64 KiB).
+#[cfg(target_os = "linux")]
+fn huge_page_size() -> usize {
+    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| {
+                let page = page_size();
+                page.saturating_mul(page.checked_div(8).unwrap_or(0))
+            })
+    })
 }
 
 impl Drop for HugeZeroed {

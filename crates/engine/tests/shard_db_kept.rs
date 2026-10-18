@@ -260,7 +260,8 @@ fn kept_memtables_hold_only_the_budget_s_idle_memory() {
         kept_most = kept_most.max(db.stats().0.kept);
         assert!(
             db.trimming() || cache + write + records + usize::try_from(kept).unwrap() <= budget,
-            "step {step}: kept {kept} beside cache {cache} write {write} records {records}"
+            "step {step}: kept {kept} beside cache {cache} write {write} records {records}: {}",
+            db.diag_budget()
         );
     }
     assert!(kept_most > 0, "no memtable was kept");

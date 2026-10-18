@@ -1410,6 +1410,33 @@ impl<F: BlockFile> ShardDb<F> {
             || (self.kept_out && self.kept_held() > self.kept_limit())
     }
 
+    /// DIAGNOSTIC (never merged): the budget's parts as the last grant left them and as they are.
+    pub fn diag_budget(&self) -> String {
+        let (cache_index, records_index) = self.index_bytes();
+        format!(
+            "memory {:?} write_reserved {} queue_reservation {} warm {} write_share {} cache_share {} records_share {} charged {:?} index_now ({cache_index}, {records_index}) cache_pages {:?} cache_bytes {} cache_over {} records_held {} records_limit {} records_over {} trim ({}, {}) kept_out {} cycle_ops {} ops_since {}",
+            self.memory,
+            self.write_reserved,
+            self.queue_reservation(),
+            self.store.warm_write_bytes(),
+            self.write_share,
+            self.cache_share,
+            self.records_share,
+            self.charged,
+            self.store.cache_pages(),
+            self.store.cache_bytes(),
+            self.store.cache_over(),
+            self.records.as_ref().map_or(0, crate::records::RecordCache::held_bytes),
+            self.records.as_ref().map_or(0, crate::records::RecordCache::bytes),
+            self.records.as_ref().map_or(0, crate::records::RecordCache::over),
+            self.trim_cache,
+            self.trim_records,
+            self.kept_out,
+            self.cycle_ops,
+            self.ops_since,
+        )
+    }
+
     /// The bytes the page cache's and record cache's indexes and ghosts take.
     pub fn index_bytes(&self) -> (usize, usize) {
         (

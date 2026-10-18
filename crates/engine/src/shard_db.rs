@@ -146,6 +146,18 @@ struct KeptAway {
     records: usize,
 }
 
+/// DIAGNOSTIC (never merged): a shard-side kept operation of a millisecond or more, printed with
+/// its kind as it ends.
+struct DiagKept(&'static str, std::time::Instant);
+impl Drop for DiagKept {
+    fn drop(&mut self) {
+        let took = self.1.elapsed();
+        if took.as_millis() >= 1 {
+            eprintln!("diag_kept {} {} us", self.0, took.as_micros());
+        }
+    }
+}
+
 /// The memtable numbers a generation may span before the slots' 16 bits of a number would alias
 /// (`crate::kept_table`, which decides "older" modulo 2^16): half of the 2^15 that decision
 /// allows, so a generation is given back well before it reaches it.
@@ -3427,6 +3439,7 @@ impl<F: BlockFile> ShardDb<F> {
     /// Without a memory budget, or without workers to build the indexes, none is kept, and none
     /// older stays: a get's probes would grow with the memtables kept (research/51 §7).
     fn keep(&mut self, mut mem: HashMem, keys: Option<crate::kept::KeyList>) -> Result<(), Error> {
+        let _diag = DiagKept("keep", std::time::Instant::now());
         if self.memory.is_none() || !self.trunk.has_pool() {
             // A packed memtable not kept: the trunk holds records no kept one does.
             self.kept_whole = false;
@@ -3604,6 +3617,7 @@ impl<F: BlockFile> ShardDb<F> {
     /// memory: grown on workers unannounced, the tables reached the machine's memory at 100M and
     /// the kernel killed the shard (r5371, r5374).
     fn send_kept_part(&mut self, part: usize) -> Result<bool, Error> {
+        let _diag = DiagKept("send_part", std::time::Instant::now());
         let covers = self.kept_covers(part);
         let lacked = move |n: u32| covers.is_none_or(|c| crate::kept::older(c, n));
         let Some(newest) = self
@@ -3777,6 +3791,7 @@ impl<F: BlockFile> ShardDb<F> {
     /// part home serves gets again, its records' lists merged and freed; lists every part has
     /// taken go, with their memtables' arenas; more parts go out.
     fn take_kept_waiting(&mut self, wait: bool) -> Result<(), Error> {
+        let _diag = DiagKept("take", std::time::Instant::now());
         while !self.kept_away.is_empty() {
             let Some(pool) = self.trunk.pool_mut() else {
                 return Ok(());
@@ -3838,6 +3853,7 @@ impl<F: BlockFile> ShardDb<F> {
 
     /// Frees the key lists every part has taken, and those of memtables given back.
     fn prune_lists(&mut self) {
+        let _diag = DiagKept("prune", std::time::Instant::now());
         let oldest = self.kept.front().map(|k| k.number);
         let all = self.kept_covers_all();
         while let Some(&(n, _)) = self.kept_lists.front() {
@@ -3859,6 +3875,7 @@ impl<F: BlockFile> ShardDb<F> {
 
     /// Gives back kept memtable `n`'s arena, its records being in every part.
     fn release_arena(&mut self, n: u32) {
+        let _diag = DiagKept("release_arena", std::time::Instant::now());
         let Some(front) = self.kept.front().map(|k| k.number) else {
             return;
         };
@@ -3958,6 +3975,7 @@ impl<F: BlockFile> ShardDb<F> {
     /// bytes free, the rule the page cache takes memory by (`Cache::machine_spares`). Without a
     /// memory budget none is kept.
     fn fit_kept(&mut self, machine: bool) {
+        let _diag = DiagKept("fit", std::time::Instant::now());
         if machine {
             // Between two looks a get grows the page cache by at most a chunk and the record
             // cache by at most a page; a put's growth is looked at as its pacing ends.

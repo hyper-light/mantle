@@ -673,7 +673,8 @@ impl Cache {
         }
         self.lent = self.lent.saturating_sub(fresh);
         let page = self.page.max(1);
-        let mut kept_pages = pages.into_iter();
+        // Pages taken so far, the next chunk's from here.
+        let mut taken = 0usize;
         for Loaned { chunk, buf } in bufs {
             let count = buf.len().checked_div(page).unwrap_or(0);
             let c = match chunk {
@@ -693,9 +694,7 @@ impl Cache {
                         || self.held.try_reserve(1).is_err()
                     {
                         // Its pages go uncached; the memory is dropped.
-                        for _ in 0..count {
-                            kept_pages.next();
-                        }
+                        taken = taken.saturating_add(count);
                         continue;
                     }
                     let c = self.chunks.len();
@@ -722,7 +721,16 @@ impl Cache {
             };
             let first = self.starts.get(c).copied().unwrap_or(0);
             let mut live = 0usize;
-            for (k, (address, len)) in kept_pages.by_ref().take(count).enumerate() {
+            let end = taken.saturating_add(count).min(pages.len());
+            let these = pages.get(taken..end).unwrap_or(&[]);
+            taken = end;
+            // The chunk's pages' index and ghost groups read first, all at once, so their misses
+            // overlap rather than each page's waiting on its own in turn below (group
+            // prefetching: Chen, Ailamaki, Gibbons and Mowry, ICDE 2004).
+            for &(address, _) in these {
+                std::hint::black_box(self.map.touch(address) ^ self.ghosts.touch(address));
+            }
+            for (k, &(address, len)) in these.iter().enumerate() {
                 self.forget(address);
                 let to_main = self.forget_ghost(address);
                 let queue = if to_main { Queue::Main } else { Queue::Small };
@@ -909,6 +917,20 @@ impl Cache {
         match slot.queue {
             Queue::Small => self.small_live = self.small_live.saturating_sub(1),
             Queue::Main => self.main_live = self.main_live.saturating_sub(1),
+        }
+    }
+
+    /// [`Self::forget`] of the `count` addresses from `first`, an extent's pages: every one's
+    /// index group read first, all at once, so the probes' misses overlap rather than each
+    /// waiting on its own in turn (group prefetching: Chen, Ailamaki, Gibbons and Mowry,
+    /// "Improving Hash Join Performance through Prefetching", ICDE 2004).
+    pub fn forget_run(&mut self, first: u64, count: u64) {
+        let end = first.saturating_add(count);
+        for address in first..end {
+            std::hint::black_box(self.map.touch(address));
+        }
+        for address in first..end {
+            self.forget(address);
         }
     }
 

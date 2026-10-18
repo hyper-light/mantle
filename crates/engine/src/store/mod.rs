@@ -1305,9 +1305,7 @@ impl<F: BlockFile> Store<F> {
                 let first = extent
                     .checked_mul(per)
                     .ok_or(corrupt(Malformed::TooLarge))?;
-                for page in 0..per {
-                    c.forget(first.saturating_add(page));
-                }
+                c.forget_run(first, per);
             }
         }
         Ok(out)
@@ -1580,10 +1578,7 @@ impl<F: BlockFile> Store<F> {
                 continue;
             }
             if let Some(c) = self.cache.as_mut() {
-                let first = extent.saturating_mul(per);
-                for address in first..first.saturating_add(per) {
-                    c.forget(address);
-                }
+                c.forget_run(extent.saturating_mul(per), per);
             }
         }
         done

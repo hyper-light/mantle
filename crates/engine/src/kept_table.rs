@@ -202,6 +202,103 @@ impl RecordList {
     }
 }
 
+/// The part of an index split by the top `bits` bits of a place that `place` goes to.
+pub fn part_of(place: u32, bits: u32) -> usize {
+    if bits == 0 {
+        return 0;
+    }
+    usize::try_from(place.wrapping_shr(32u32.saturating_sub(bits))).unwrap_or(0)
+}
+
+/// One memtable's records split by the top `bits` bits of their places, a list for each part of
+/// the index they go to, so a part's merge reads only its own records ([`crate::kept`]).
+#[derive(Debug)]
+pub struct PartedList {
+    parts: Vec<RecordList>,
+    bits: u32,
+}
+
+impl Default for PartedList {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+impl PartedList {
+    /// Empty lists for `2^bits` parts.
+    pub fn new(bits: u32) -> Self {
+        let parts = 1usize.checked_shl(bits).unwrap_or(1);
+        Self {
+            parts: (0..parts).map(|_| RecordList::default()).collect(),
+            bits,
+        }
+    }
+
+    /// The top bits of a place that choose its part.
+    pub fn bits(&self) -> u32 {
+        self.bits
+    }
+
+    /// Empties every part, keeping the buffers for the next memtable's walk.
+    pub fn clear(&mut self) {
+        self.parts.iter_mut().for_each(RecordList::clear);
+    }
+
+    pub fn len(&self) -> usize {
+        self.parts
+            .iter()
+            .map(RecordList::len)
+            .fold(0, usize::saturating_add)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.parts.iter().all(RecordList::is_empty)
+    }
+
+    /// The bytes its buffers hold, at their capacities.
+    pub fn bytes(&self) -> usize {
+        self.parts
+            .iter()
+            .map(RecordList::bytes)
+            .fold(0, usize::saturating_add)
+    }
+
+    /// Room for `bytes` more bytes of records, an even share in each part: places are a filter
+    /// hash's, spread evenly over the parts.
+    pub fn reserve(&mut self, bytes: usize) -> Result<(), Error> {
+        let share = bytes.div_ceil(self.parts.len().max(1));
+        self.parts.iter_mut().try_for_each(|p| p.reserve(share))
+    }
+
+    /// Adds a record to its part.
+    pub fn push(&mut self, r: &Record<'_>) -> Result<(), Error> {
+        self.parts
+            .get_mut(part_of(r.hash32, self.bits))
+            .ok_or_else(corrupt)?
+            .push(r)
+    }
+
+    /// Part `part`'s list, taken out for its merge; an empty one is left until it comes back.
+    pub fn take(&mut self, part: usize) -> RecordList {
+        self.parts
+            .get_mut(part)
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    /// Part `part`'s list, back from its merge.
+    pub fn put(&mut self, part: usize, list: RecordList) {
+        if let Some(p) = self.parts.get_mut(part) {
+            *p = list;
+        }
+    }
+
+    /// Part `part`'s list.
+    pub fn part(&self, part: usize) -> Option<&RecordList> {
+        self.parts.get(part)
+    }
+}
+
 /// The records: `slots` slots of `slot` bytes on a huge-page mapping, and the spill of those too
 /// large for a slot.
 pub struct RecordTable {
@@ -212,6 +309,9 @@ pub struct RecordTable {
     spill: Vec<u8>,
     /// A record's slot image as it is placed, reused.
     scratch: Vec<u8>,
+    /// The top bits of a place that chose this table among an index's parts ([`part_of`]): its
+    /// records share them, so a home is reduced from the bits below.
+    shift: u32,
 }
 
 impl std::fmt::Debug for RecordTable {
@@ -221,6 +321,7 @@ impl std::fmt::Debug for RecordTable {
             .field("slots", &self.slots)
             .field("live", &self.live)
             .field("spill", &self.spill.len())
+            .field("shift", &self.shift)
             .finish()
     }
 }
@@ -234,6 +335,11 @@ impl Default for RecordTable {
 impl RecordTable {
     /// An empty table, its slot size taken from the first records merged into it.
     pub fn new() -> Self {
+        Self::part(0)
+    }
+
+    /// An empty table for one part of an index split by the top `bits` bits of a place.
+    pub fn part(bits: u32) -> Self {
         Self {
             map: HugeZeroed::empty(),
             slot: 0,
@@ -241,6 +347,7 @@ impl RecordTable {
             live: 0,
             spill: Vec::new(),
             scratch: Vec::new(),
+            shift: bits,
         }
     }
 
@@ -258,9 +365,11 @@ impl RecordTable {
         self.map.len().saturating_add(self.spill.capacity())
     }
 
-    /// The home slot of a place: scaled to the slot count (Lemire's reduction of a 32-bit value).
+    /// The home slot of a place: its bits below the part's, scaled to the slot count (Lemire's
+    /// reduction of a 32-bit value).
     fn home(&self, place: u32) -> usize {
-        let scaled = u64::from(place).wrapping_mul(self.slots as u64) >> 32;
+        let local = place.wrapping_shl(self.shift);
+        let scaled = u64::from(local).wrapping_mul(self.slots as u64) >> 32;
         usize::try_from(scaled).unwrap_or(0)
     }
 
@@ -561,6 +670,7 @@ impl RecordTable {
             live: 0,
             spill: Vec::new(),
             scratch: Vec::new(),
+            shift: self.shift,
         };
         for i in 0..self.slots {
             let Some(s) = self.at(i) else {

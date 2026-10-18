@@ -135,6 +135,25 @@ struct KeptGen {
     first: u32,
 }
 
+/// The index out on a trip (`crate::kept`): its parts each out on a worker, or waiting for one,
+/// taking their records of the memtables kept since the index last covered one, and the lists
+/// those records came from, their parts out with them. It comes home once every part is back.
+#[derive(Debug)]
+struct KeptTrip {
+    /// The index, its parts out taken.
+    index: crate::kept::KeptIndex,
+    /// Every list home when it went, oldest first; those it lacked have their parts out.
+    lists: Vec<(u32, crate::kept::KeyList)>,
+    /// Parts waiting for a free worker.
+    waiting: Vec<Box<Job>>,
+    /// Parts out on workers.
+    out: usize,
+    /// The newest memtable whose records the trip takes: what the index covers once home.
+    newest: Option<u32>,
+    /// Whether a part came back with its memory refused: the index is then dropped.
+    failed: bool,
+}
+
 /// The memtable numbers a generation may span before the slots' 16 bits of a number would alias
 /// (`crate::kept_table`, which decides "older" modulo 2^16): half of the 2^15 that decision
 /// allows, so a generation is given back well before it reaches it.
@@ -351,9 +370,14 @@ pub struct ShardDb<F: BlockFile> {
     /// the two indexes above extend.
     kept_gens: std::collections::VecDeque<KeptGen>,
     kept_open_first: u32,
-    kept_out: bool,
-    /// The bytes the index out on a worker held when it went.
+    /// The index out on its trip, if one is.
+    kept_trip: Option<KeptTrip>,
+    /// The bytes the index out on its trip held when it went.
     kept_out_bytes: usize,
+    /// The top bits of a key's place that choose its part of an index (`crate::kept`): a part for
+    /// each of the host's workers, rounded down to a power of two, so a trip's parts all go out
+    /// at once where the workers are free.
+    kept_bits: u32,
     /// The next kept memtable's number.
     kept_next: u32,
     /// Whether the kept memtables hold every record the trunk does: from a shard made empty, while
@@ -737,8 +761,11 @@ impl<F: BlockFile> ShardDb<F> {
             kept_spare: None,
             kept_gens: std::collections::VecDeque::new(),
             kept_open_first: 0,
-            kept_out: false,
+            kept_trip: None,
             kept_out_bytes: 0,
+            kept_bits: usize::BITS
+                .saturating_sub(1)
+                .saturating_sub(Pool::cores().max(1).leading_zeros()),
             kept_next: 0,
             kept_whole: false,
             calm: false,
@@ -1430,7 +1457,7 @@ impl<F: BlockFile> ShardDb<F> {
     pub fn trimming(&self) -> bool {
         self.trim_cache > 0
             || self.trim_records > 0
-            || (self.kept_out && self.kept_held() > self.kept_limit())
+            || (self.kept_out() && self.kept_held() > self.kept_limit())
     }
 
     /// The bytes the page cache's and record cache's indexes and ghosts take.
@@ -1737,7 +1764,7 @@ impl<F: BlockFile> ShardDb<F> {
             // A stopping shard keeps no memtable for gets: an index out on a worker comes back
             // with the pool's close and is dropped with it.
             self.give_back_kept();
-            self.kept_out = false;
+            self.kept_trip = None;
             self.kept_out_bytes = 0;
         }
     }
@@ -2097,7 +2124,7 @@ impl<F: BlockFile> ShardDb<F> {
             self.memory.is_some() && self.ops_since.saturating_add(1) >= self.cycle_ops;
         if !self.kept_whole
             || self.kept.is_empty()
-            || self.kept_out
+            || self.kept_out()
             || !self.kept_lists.is_empty()
             || self.trim_cache > 0
             || self.trim_records > 0
@@ -3101,7 +3128,7 @@ impl<F: BlockFile> ShardDb<F> {
     /// The index over kept memtables, tended between operations: taken back if its worker is
     /// done, sent out if it lacks a list and a worker is free; a flag's look when neither.
     fn tend_kept(&mut self) -> Result<(), Error> {
-        if self.kept_out {
+        if self.kept_out() {
             self.take_kept()?;
             // The index home may hold more than it did when it went: the kept memtables look
             // again at once.
@@ -3408,7 +3435,11 @@ impl<F: BlockFile> ShardDb<F> {
             Some(list) => list,
             None => {
                 // Packed on the shard: its list made here, from its index.
-                let mut list = self.kept_free.pop().unwrap_or_default();
+                let bits = self.kept_bits;
+                let mut list = self
+                    .kept_free
+                    .pop()
+                    .unwrap_or_else(|| crate::kept::KeyList::new(bits));
                 if mem.key_list(&mut list).is_err() {
                     // An entry it cannot read is not kept: nor is any older.
                     self.kept_whole = false;
@@ -3473,10 +3504,12 @@ impl<F: BlockFile> ShardDb<F> {
         }
     }
 
-    /// Sends the index that is home out to a free worker to take the key lists it lacks, oldest
-    /// first: the spare, or a new one while there are fewer than two. One is out at a time.
+    /// Sends the index that is home out on a trip to take the key lists it lacks, oldest first:
+    /// the spare, or a new one while there are fewer than two. Each of its parts goes to a worker
+    /// of its own with its records of those lists, as many at once as the pool admits, the rest
+    /// as workers free ([`Self::send_kept_parts`]); one index is out at a time.
     fn extend_kept(&mut self) -> Result<(), Error> {
-        if self.kept_out || self.kept_lists.is_empty() || self.kept.is_empty() {
+        if self.kept_out() || self.kept_lists.is_empty() || self.kept.is_empty() {
             return Ok(());
         }
         let newest = self.kept_lists.back().map(|(n, _)| *n);
@@ -3485,13 +3518,13 @@ impl<F: BlockFile> ShardDb<F> {
         };
         // The spare when it lacks a list; with fewer than two indexes, a new one, which takes
         // every list home (none is freed before both indexes have it).
-        let index = match self.kept_spare.take() {
+        let mut index = match self.kept_spare.take() {
             Some(spare) if lacks(&spare) => spare,
             Some(spare) => {
                 self.kept_spare = Some(spare);
                 return Ok(());
             }
-            None => crate::kept::KeptIndex::new(),
+            None => crate::kept::KeptIndex::new(self.kept_bits),
         };
         // Within the pool's bound, as a packing is: the index is owed maintenance a get waits
         // on, not work the measured need for compactions sizes.
@@ -3499,91 +3532,167 @@ impl<F: BlockFile> ShardDb<F> {
             Some(pool) => pool.can_take(&mut self.store, true),
             None => Ok(false),
         };
-        let Some(pool) = self
-            .trunk
-            .pool_mut()
-            .filter(|_| matches!(admitted, Ok(true)))
-        else {
+        if !matches!(admitted, Ok(true)) {
             self.kept_spare = Some(index);
             return admitted.map(|_| ());
-        };
+        }
         let oldest = self.kept.front().map_or(self.kept_next, |k| k.number);
         // Swept when the entries given back since its last sweep are more than half it holds.
         let stale = self.kept_gone.saturating_sub(index.swept_at());
         let sweep = stale.saturating_mul(2) > u64::try_from(index.len()).unwrap_or(u64::MAX);
-        let bytes = index.bytes();
-        let mut job = Box::new(crate::trunk::pool::IndexJob {
-            index,
-            lists: self.kept_lists.drain(..).collect(),
-            oldest,
-            sweep,
-        });
         if sweep {
-            job.index.set_swept_at(self.kept_gone);
+            index.set_swept_at(self.kept_gone);
         }
-        let lists_bytes = job
-            .lists
+        let bytes = index.bytes();
+        let covers = index.covers();
+        let mut lists: Vec<(u32, crate::kept::KeyList)> = self.kept_lists.drain(..).collect();
+        let lists_bytes = lists
             .iter()
             .map(|(_, l)| l.bytes())
             .fold(0, usize::saturating_add);
-        let job = Box::new(Job {
-            work: Work::Index(job),
-            grant: Vec::new(),
-            file_end: self.store.end(),
-            generation: self.store.generation(),
-            keep: None,
+        let lacked = |n: u32| covers.is_none_or(|c| crate::kept::older(c, n));
+        let newest = lists.iter().rev().map(|(n, _)| *n).find(|n| lacked(*n));
+        let mut waiting = Vec::with_capacity(index.parts());
+        for part in 0..index.parts() {
+            let records = lists
+                .iter_mut()
+                .filter(|(n, _)| lacked(*n))
+                .map(|(n, l)| (*n, l.take(part)))
+                .collect();
+            waiting.push(Box::new(Job {
+                work: Work::Index(Box::new(crate::trunk::pool::IndexJob {
+                    part,
+                    table: index.take_part(part),
+                    lists: records,
+                    oldest,
+                    sweep,
+                })),
+                grant: Vec::new(),
+                file_end: self.store.end(),
+                generation: self.store.generation(),
+                keep: None,
+            }));
+        }
+        self.kept_trip = Some(KeptTrip {
+            index,
+            lists,
+            waiting,
+            out: 0,
+            newest,
+            failed: false,
         });
-        match pool.send(job, Owner::Index, true) {
-            Ok(Ok(_)) => {
-                self.kept_out = true;
-                self.kept_out_bytes = bytes.saturating_add(lists_bytes);
-                self.kept_bytes = self.kept_bytes.saturating_sub(lists_bytes);
+        self.kept_out_bytes = bytes.saturating_add(lists_bytes);
+        self.kept_bytes = self.kept_bytes.saturating_sub(lists_bytes);
+        self.send_kept_parts()
+    }
+
+    /// Sends the trip's parts still waiting to as many workers as the pool admits now.
+    fn send_kept_parts(&mut self) -> Result<(), Error> {
+        let (Some(trip), Some(pool)) = (self.kept_trip.as_mut(), self.trunk.pool_mut()) else {
+            return Ok(());
+        };
+        while let Some(job) = trip.waiting.pop() {
+            if !pool.can_take(&mut self.store, true)? {
+                trip.waiting.push(job);
+                break;
             }
-            Ok(Err(job)) | Err((_, job)) => {
-                // Not taken: everything back where it was.
-                if let Work::Index(job) = job.work {
-                    let crate::trunk::pool::IndexJob { index, lists, .. } = *job;
-                    self.kept_lists = lists.into();
-                    self.kept_spare = Some(index);
+            match pool.send(job, Owner::Index, true) {
+                Ok(Ok(_)) => trip.out = trip.out.saturating_add(1),
+                Ok(Err(job)) => {
+                    trip.waiting.push(job);
+                    break;
+                }
+                Err((error, job)) => {
+                    trip.waiting.push(job);
+                    return Err(error);
                 }
             }
         }
         Ok(())
     }
 
-    /// Takes the index back from its worker, if it is back: it serves gets when it covers newer
-    /// memtables than the one serving, which becomes the spare; lists both have taken are freed,
-    /// and the spare goes out again when lists remain that it lacks.
+    /// Takes the index home from its trip, if every part is back: it serves gets when it covers
+    /// newer memtables than the one serving, which becomes the spare; lists both have taken are
+    /// freed, and the spare goes out again when lists remain that it lacks.
     fn take_kept(&mut self) -> Result<(), Error> {
         self.take_kept_waiting(false)
     }
 
-    /// [`Self::take_kept`], waiting for the index when `wait` (where the shard may wait).
+    /// [`Self::take_kept`], waiting for every part when `wait` (where the shard may wait): one
+    /// that no worker took is merged here, rather than waiting on a worker none of the trip's
+    /// parts holds.
     fn take_kept_waiting(&mut self, wait: bool) -> Result<(), Error> {
-        if !self.kept_out {
+        if !self.kept_out() {
             return Ok(());
         }
-        let Some(pool) = self.trunk.pool_mut() else {
+        self.send_kept_parts()?;
+        loop {
+            let Some(trip) = self.kept_trip.as_mut() else {
+                return Ok(());
+            };
+            if trip.out == 0 {
+                let Some(mut job) = trip.waiting.pop() else {
+                    break;
+                };
+                if !wait {
+                    trip.waiting.push(job);
+                    return Ok(());
+                }
+                let failed = match &mut job.work {
+                    Work::Index(part) => part.run().is_err(),
+                    _ => true,
+                };
+                let Work::Index(part) = job.work else {
+                    return Err(Error::InvalidArgument {
+                        what: "a kept index trip's part that is not an index job",
+                    });
+                };
+                Self::part_home(trip, *part, failed);
+                continue;
+            }
+            let Some(pool) = self.trunk.pool_mut() else {
+                return Ok(());
+            };
+            let Some(back) = pool.take(&mut self.store, Owner::Index, wait)? else {
+                return Ok(());
+            };
+            let trip = self.kept_trip.as_mut().ok_or(Error::InvalidArgument {
+                what: "a kept index part back with no trip out",
+            })?;
+            trip.out = trip.out.saturating_sub(1);
+            let Some(part) = back.indexed else {
+                return Err(Error::InvalidArgument {
+                    what: "an index job's result with no index",
+                });
+            };
+            Self::part_home(trip, *part, back.result.is_err());
+            // Its worker is free: a part waiting for one goes out.
+            self.send_kept_parts()?;
+        }
+        let Some(trip) = self.kept_trip.take() else {
             return Ok(());
         };
-        let Some(back) = pool.take(&mut self.store, Owner::Index, wait)? else {
-            return Ok(());
-        };
-        self.kept_out = false;
         self.kept_out_bytes = 0;
-        if back.result.is_err() {
-            // The index came back partly extended, its memory refused: it is dropped, and with it
-            // the kept memtables, whose gets the trunk answers, as when the budget gives them
-            // back.
+        let KeptTrip {
+            mut index,
+            lists,
+            newest,
+            failed,
+            ..
+        } = trip;
+        if failed {
+            // A part came back partly extended, its memory refused: the index is dropped, and
+            // with it the kept memtables, whose gets the trunk answers, as when the budget gives
+            // them back.
+            for (_, list) in lists {
+                self.free_list(list);
+            }
             self.give_back_kept();
             return Ok(());
         }
-        let Some(job) = back.indexed else {
-            return Err(Error::InvalidArgument {
-                what: "an index job's result with no index",
-            });
-        };
-        let crate::trunk::pool::IndexJob { index, lists, .. } = *job;
+        if newest.is_some() {
+            index.set_covers(newest);
+        }
         // The lists out with the index come before those kept since.
         let mut all: std::collections::VecDeque<_> = lists.into();
         all.extend(self.kept_lists.drain(..));
@@ -3620,13 +3729,28 @@ impl<F: BlockFile> ShardDb<F> {
         if self.open_gen_full() {
             self.close_open_gen();
         }
-        // The index back may hold more than it did when it went (it grew on its worker), and
+        // The index back may hold more than it did when it went (it grew on its workers), and
         // whatever took it back, a get's tending or a maintenance step, leaves the regions and the
         // kept memtables within the budget.
         if self.kept_held() > self.kept_limit() {
             self.fit_kept(false);
         }
         self.extend_kept()
+    }
+
+    /// A part of the trip's index back: its table in its place, and its records' lists back in
+    /// the lists they were taken from.
+    fn part_home(trip: &mut KeptTrip, part: crate::trunk::pool::IndexJob, failed: bool) {
+        let crate::trunk::pool::IndexJob {
+            part, table, lists, ..
+        } = part;
+        trip.index.put_part(part, table);
+        for (n, records) in lists {
+            if let Some((_, list)) = trip.lists.iter_mut().find(|(m, _)| *m == n) {
+                list.put(part, records);
+            }
+        }
+        trip.failed |= failed;
     }
 
     /// Frees the key lists both indexes have taken, and those of memtables given back.
@@ -3707,7 +3831,7 @@ impl<F: BlockFile> ShardDb<F> {
     /// the next memtable's records start a new one. Only with the spare home: one out on a worker
     /// comes back first. False when there is nothing to close.
     fn close_open_gen(&mut self) -> bool {
-        if self.kept_out {
+        if self.kept_out() {
             return false;
         }
         let Some(home) = self.kept_index.take() else {
@@ -3751,7 +3875,7 @@ impl<F: BlockFile> ShardDb<F> {
     /// third of what they may hold: closed then, its closed copy and the open one's two stay
     /// within that memory together as further generations follow (research/63 §3).
     fn open_gen_full(&self) -> bool {
-        !self.kept_out
+        !self.kept_out()
             && self.kept_index.as_ref().is_some_and(|home| {
                 home.bytes().saturating_mul(3) >= self.kept_limit() && home.covers().is_some()
             })
@@ -3815,7 +3939,12 @@ impl<F: BlockFile> ShardDb<F> {
         self.kept_seen_held = self.kept_held();
     }
 
-    /// What kept memtables, their key lists and their indexes hold, the index out on a worker
+    /// Whether an index is out on its trip.
+    fn kept_out(&self) -> bool {
+        self.kept_trip.is_some()
+    }
+
+    /// What kept memtables, their key lists and their indexes hold, the index out on its trip
     /// counted as it went.
     fn kept_held(&self) -> usize {
         self.kept_bytes
@@ -4080,7 +4209,7 @@ impl<F: BlockFile> ShardDb<F> {
             || self.tidy_paid()
             || self.store.forget_debt() > 0
             || self.store.cache_unreserved() > 0
-            || self.kept_out
+            || self.kept_out()
             || !self.kept_lists.is_empty()
             || self.quiet_unconsolidated()
     }
@@ -4244,19 +4373,19 @@ impl<F: BlockFile> ShardDb<F> {
             }
             return Ok(used.max(1));
         }
-        if self.kept_out || !self.kept_lists.is_empty() {
+        if self.kept_out() || !self.kept_lists.is_empty() {
             // The index over kept memtables: back from its worker, waited for where the shard may
             // wait, or sent out with the lists it lacks. With no worker free, the work below
             // goes on, its results freeing one.
-            if self.kept_out {
-                let out = self.kept_out;
+            if self.kept_out() {
+                let out = self.kept_out();
                 self.take_kept_waiting(!paced)?;
-                if out != self.kept_out {
+                if out != self.kept_out() {
                     return Ok(1);
                 }
             } else {
                 self.extend_kept()?;
-                if self.kept_out {
+                if self.kept_out() {
                     return Ok(1);
                 }
             }
@@ -4499,6 +4628,14 @@ impl<F: BlockFile> ShardDb<F> {
         };
         if let Some(arena) = arena {
             let mut pack = self.sort_spares.pop().unwrap_or_default();
+            if pack.keys.bits() != self.kept_bits {
+                // A pack back from its worker left its list with the kept memtable it made.
+                let bits = self.kept_bits;
+                pack.keys = self
+                    .kept_free
+                    .pop()
+                    .unwrap_or_else(|| crate::kept::KeyList::new(bits));
+            }
             pack.entries = u64::try_from(full.len()).unwrap_or(u64::MAX);
             pack.skip = full.skip();
             pack.arena = arena;

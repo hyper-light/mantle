@@ -66,16 +66,31 @@ pub enum Work {
     Index(Box<IndexJob>),
 }
 
-/// The index over the memtables a shard keeps for gets (`crate::kept`, research/51 §7), out on a
-/// worker to take the key lists of the memtables kept since it last covered one, oldest first,
-/// after dropping, with `sweep`, the entries of memtables older than `oldest`, given back. It
-/// comes back whole with its lists, which the other index takes next.
+/// One part of the index over the memtables a shard keeps for gets (`crate::kept`, research/51
+/// §7), out on a worker beside its other parts to take its records of the memtables kept since
+/// the index last covered one, oldest first, after dropping, with `sweep`, the records of
+/// memtables older than `oldest`, given back. It comes back with its records' lists, which the
+/// other index's part takes next.
 #[derive(Debug, Default)]
 pub struct IndexJob {
-    pub index: crate::kept::KeptIndex,
-    pub lists: Vec<(u32, crate::kept::KeyList)>,
+    pub part: usize,
+    pub table: crate::kept_table::RecordTable,
+    pub lists: Vec<(u32, crate::kept_table::RecordList)>,
     pub oldest: u32,
     pub sweep: bool,
+}
+
+impl IndexJob {
+    /// The part swept, with `sweep`, then given its records of each list, oldest first.
+    pub fn run(&mut self) -> Result<(), Error> {
+        if self.sweep {
+            self.table.sweep(self.oldest)?;
+        }
+        for (memtable, records) in &self.lists {
+            self.table.merge(*memtable, records, self.oldest)?;
+        }
+        Ok(())
+    }
 }
 
 /// A full memtable packed by a worker that sorts it (research/40 §4): the copy of its arena it
@@ -508,13 +523,7 @@ fn run<F: BlockFile>(store: &mut Store<F>, job: &mut Job) -> Result<(Parts, u64)
             Vec::new()
         }
         Work::Index(job) => {
-            let IndexJob {
-                index,
-                lists,
-                oldest,
-                sweep,
-            } = job.as_mut();
-            index.extend(lists, *oldest, *sweep)?;
+            job.run()?;
             Vec::new()
         }
     };

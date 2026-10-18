@@ -33,6 +33,7 @@ use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::Config;
 use mantle_engine::trunk::TrunkConfig;
+use mantle_engine::trunk::pool::Pool;
 use std::future::{Future, poll_fn};
 use std::pin::pin;
 
@@ -767,14 +768,20 @@ fn terminal_case(stop: bool) {
         writes: AtomicUsize::new(0),
         retired,
     });
-    // Unique half-page rows: the first full table holds a quarter of this bounded input.
-    // It spans far more than the two attached output runs and two extent-sized feed buffers;
-    // holding every worker write prevents its input being fed whole before closure.
+    // Unique half-page rows: a full table holds a quarter of OPS of them, far more than the two
+    // attached output runs and two extent-sized feed buffers; holding every worker write
+    // prevents its input being fed whole before closure.
     let value_bytes = STORE.page_size / 2;
-    let mem_bytes = usize::try_from(OPS / 4)
+    let rows = OPS / 4;
+    let mem_bytes = usize::try_from(rows)
         .unwrap()
         .checked_mul(value_bytes)
         .unwrap();
+    // With every worker's write held, a writer stops at the latest where its frozen tables pass
+    // what the pool admits (the frozen cap's bound, however long the held packings have been
+    // out) and the root's pending branches pass its fanout: a table's rows for each, and two
+    // more, and a correct engine has blocked it.
+    let input = rows * u64::try_from(Pool::cores() + TRUNK.fanout + 2).unwrap();
     let mut first = ShardDb::create(
         tracked(
             &first_path,
@@ -876,7 +883,7 @@ fn terminal_case(stop: bool) {
             let result = {
                 let writes = async {
                     let value = vec![7; value_bytes];
-                    for i in 0..OPS {
+                    for i in 0..input {
                         let key = format!("a/closing/{i:08}");
                         client.put_async(key.as_bytes(), &value).await.unwrap();
                     }

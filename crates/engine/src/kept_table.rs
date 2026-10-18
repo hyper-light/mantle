@@ -36,6 +36,10 @@ const LINE: usize = 64;
 /// A record list's header: the 32-bit hash (4), the operation (1), the key's length (4) and the
 /// value's (4).
 const LIST_HEAD: usize = 13;
+/// Records a merge places together, their home slots read first, back to back, so their misses
+/// are out at once rather than each in turn (group prefetching: Chen, Ailamaki, Gibbons and
+/// Mowry, ICDE 2004).
+const GROUP: usize = 16;
 
 /// What a table answers for a key.
 #[derive(Debug, PartialEq, Eq)]
@@ -748,20 +752,38 @@ impl RecordTable {
         if need.saturating_mul(3) > self.slots.saturating_mul(2) {
             self.rebuild(need.saturating_add(need / 2), oldest)?;
         }
-        for r in list.records() {
-            let r = r?;
-            self.image(number, r.hash32, &r)?;
-            if !self.place(r.hash32, r.key) {
-                // A run too long: grown, and placed again.
-                let room = self.live.saturating_add(self.live / 2).saturating_add(1);
-                self.rebuild(room, oldest)?;
-                self.image(number, r.hash32, &r)?;
+        let mut records = list.records();
+        loop {
+            let mut group: [Option<Record<'_>>; GROUP] = [None; GROUP];
+            let mut taken = 0usize;
+            for slot in &mut group {
+                match records.next() {
+                    Some(r) => *slot = Some(r?),
+                    None => break,
+                }
+                taken = taken.saturating_add(1);
+            }
+            if taken == 0 {
+                return Ok(());
+            }
+            let touched = group
+                .iter()
+                .flatten()
+                .fold(0u8, |t, r| t ^ self.touch(r.hash32));
+            std::hint::black_box(touched);
+            for r in group.iter().flatten() {
+                self.image(number, r.hash32, r)?;
                 if !self.place(r.hash32, r.key) {
-                    return Err(corrupt());
+                    // A run too long: grown, and placed again.
+                    let room = self.live.saturating_add(self.live / 2).saturating_add(1);
+                    self.rebuild(room, oldest)?;
+                    self.image(number, r.hash32, r)?;
+                    if !self.place(r.hash32, r.key) {
+                        return Err(corrupt());
+                    }
                 }
             }
         }
-        Ok(())
     }
 
     /// Drops the records of memtables older than `oldest`, given back, the table rebuilt to its

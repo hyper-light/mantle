@@ -3555,6 +3555,34 @@ impl<F: BlockFile> ShardDb<F> {
             .iter()
             .map(|(_, l)| l.bytes())
             .fold(0, usize::saturating_add);
+        // The tables the trip grows its parts to are held beside the ones it took until each
+        // part's rebuild ends: counted as out from the start, they must fit the kept memtables'
+        // share of the budget and leave the machine twice a memtable free, as the page cache
+        // grows only so (`Cache::machine_spares`). A growth either refuses closes the open
+        // generation instead, its spare dropped, and the next memtables start a new one
+        // (research/63 §3): grown on workers unannounced, two indexes' tables reached the
+        // machine's memory at 100M and the kernel killed the shard (r5371, r5374: 62-63 GB of 67).
+        let growth = index.growth(&lists, sweep);
+        let held = self
+            .kept_held()
+            .saturating_add(bytes)
+            .saturating_add(growth);
+        let machine_room = self.store.machine_free().is_none_or(|free| {
+            u64::try_from(growth.saturating_add(self.mem_limit.saturating_mul(2)))
+                .is_ok_and(|need| free >= need)
+        });
+        if held > self.kept_limit() || !machine_room {
+            self.kept_lists = lists.into();
+            self.kept_spare = Some(index);
+            // With no open generation to close, the memtables no index can take are given
+            // back, as when the budget refuses an index's memory, and the trunk answers their
+            // gets: kept with their lists waiting, maintenance stayed owed and a shard settling
+            // looped on a growth it would never take.
+            if !self.close_open_gen() {
+                self.give_back_kept();
+            }
+            return Ok(());
+        }
         let lacked = |n: u32| covers.is_none_or(|c| crate::kept::older(c, n));
         let newest = lists.iter().rev().map(|(n, _)| *n).find(|n| lacked(*n));
         let mut waiting = Vec::with_capacity(index.parts());
@@ -3586,7 +3614,7 @@ impl<F: BlockFile> ShardDb<F> {
             newest,
             failed: false,
         });
-        self.kept_out_bytes = bytes.saturating_add(lists_bytes);
+        self.kept_out_bytes = bytes.saturating_add(lists_bytes).saturating_add(growth);
         self.kept_bytes = self.kept_bytes.saturating_sub(lists_bytes);
         self.send_kept_parts()
     }

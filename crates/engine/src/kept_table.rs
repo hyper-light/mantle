@@ -743,14 +743,44 @@ impl RecordTable {
         ))
     }
 
+    /// Sets the slot size of a table that has none from the first records it will take
+    /// ([`RecordList::slot_size`]), once.
+    pub fn settle_slot(&mut self, list: &RecordList) {
+        if self.slot == 0 && !list.is_empty() {
+            self.slot = list.slot_size();
+        }
+    }
+
+    /// The bytes of the table that a sweep, with `sweep`, then merging lists of `lengths` records,
+    /// oldest first, grows this one to at its last growth, as [`Self::sweep`] and [`Self::merge`]
+    /// rebuild it, every record counted new and none dropped: what a trip holds beside this table
+    /// while it rebuilds, at most; none when nothing would rebuild it. A table's slot size must be
+    /// settled first ([`Self::settle_slot`]).
+    pub fn growth(&self, sweep: bool, lengths: impl Iterator<Item = usize>) -> usize {
+        let (mut live, mut slots, mut grown) = (self.live, self.slots, 0usize);
+        if sweep && slots > 0 {
+            // A sweep rebuilds to the records it keeps, at most every one.
+            slots = live.saturating_add(live / 2).saturating_add(1);
+            grown = slots.saturating_mul(self.slot);
+        }
+        for len in lengths {
+            let need = live.saturating_add(len);
+            if need.saturating_mul(3) > slots.saturating_mul(2) {
+                let records = need.saturating_add(need / 2);
+                slots = records.saturating_add(records / 2).saturating_add(1);
+                grown = slots.saturating_mul(self.slot);
+            }
+            live = need;
+        }
+        grown
+    }
+
     /// Takes memtable `number`'s records, each key once, after every record already held: a key's
     /// record here is replaced by its newer one. The first list a table takes sets its slot size
     /// ([`RecordList::slot_size`]). A table that must grow drops, as it rebuilds, the records of
     /// memtables older than `oldest`.
     pub fn merge(&mut self, number: u32, list: &RecordList, oldest: u32) -> Result<(), Error> {
-        if self.slot == 0 {
-            self.slot = list.slot_size();
-        }
+        self.settle_slot(list);
         let need = self.live.checked_add(list.len()).ok_or_else(corrupt)?;
         // At most 2/3 full: grown by half again past the need, so a table grows in steps that
         // move each record a bounded number of times.

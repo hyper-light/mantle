@@ -159,6 +159,24 @@ impl KeptIndex {
         Ok(())
     }
 
+    /// The bytes a trip that takes `lists` (those it lacks), after a sweep with `sweep`, grows its
+    /// parts to beside their tables, summed over the parts ([`RecordTable::growth`]): what the
+    /// trip holds beyond the index as it went, at most. Each part's slot size is settled from its
+    /// first records here, once.
+    pub fn growth(&mut self, lists: &[(u32, KeyList)], sweep: bool) -> usize {
+        let covers = self.covers;
+        let lacked = move |(n, _): &&(u32, KeyList)| covers.is_none_or(|c| older(c, *n));
+        let mut total = 0usize;
+        for (p, table) in self.parts.iter_mut().enumerate() {
+            let records = || lists.iter().filter(lacked).filter_map(|(_, l)| l.part(p));
+            if let Some(first) = records().find(|l| !l.is_empty()) {
+                table.settle_slot(first);
+            }
+            total = total.saturating_add(table.growth(sweep, records().map(|l| l.len())));
+        }
+        total
+    }
+
     /// Part `part`'s table, taken out for a worker to extend; an empty one is left until it
     /// comes back.
     pub fn take_part(&mut self, part: usize) -> RecordTable {

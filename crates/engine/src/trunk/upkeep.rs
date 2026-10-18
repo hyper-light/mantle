@@ -341,23 +341,37 @@ impl Trunk {
     /// Moves the pending branches into the root, oldest first, unless the root is changing: they
     /// wait as pending, read before the tree, until the change is applied. A memtable packed at
     /// the root's pivot keys goes into the pivots' bundles where [`Self::takes_parts`], its pages
-    /// adopted into the cache; any other enters the in-flight list.
+    /// adopted into the cache; one packed at them whose pivots are busy waits as pending for them
+    /// ([`Self::waits_for_parts`]), and every newer one behind it, as they enter in order; any
+    /// other enters the in-flight list.
     fn incorporate_pending<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
         if self.pending.is_empty() || self.node(self.root)?.wants.is_some() {
             return Ok(());
         }
-        // A new branch ends a consolidation in progress and unsettles a consolidated layout.
-        self.consolidating = false;
-        self.consolidated = false;
-        if let Some(p) = self.pool.as_mut() {
-            p.period_started();
-        }
         let root = self.root;
-        for p in std::mem::take(&mut self.pending) {
+        let mut entered = false;
+        while let Some(first) = self.pending.first() {
+            // Each one against the root as the ones before it left it: one gone in flight makes
+            // the pivots it meets busy for the next.
+            let parted = self.takes_parts(first)?;
+            if !parted && self.waits_for_parts(first)? {
+                break;
+            }
+            let p = self.pending.remove(0);
+            if !entered {
+                entered = true;
+                // A new branch ends a consolidation in progress and unsettles a consolidated
+                // layout.
+                self.consolidating = false;
+                self.consolidated = false;
+                if let Some(pool) = self.pool.as_mut() {
+                    pool.period_started();
+                }
+            }
             let entries = p.entries();
             self.entered = self.entered.saturating_add(entries);
             self.held = self.held.saturating_add(entries);
-            if self.takes_parts(&p)? {
+            if parted {
                 self.stats.parted_entries = self.stats.parted_entries.saturating_add(entries);
                 // The branches stay in the tree as written: their pages cached where they were
                 // written, as a compaction's are.
@@ -381,9 +395,26 @@ impl Trunk {
                 self.push_inflight(root, bundle)?;
             }
         }
-        self.node_mut(root)?.received = true;
-        self.queue(root);
+        if entered {
+            self.node_mut(root)?.received = true;
+            self.queue(root);
+        }
         Ok(())
+    }
+
+    /// Whether `p` waits as pending for the root's pivots rather than entering the in-flight list:
+    /// it was packed at the root's pivot keys as they are, so only a pivot it would go into being
+    /// busy keeps the root from taking its branches straight into their bundles
+    /// ([`Self::takes_parts`]). That pivot's in-flight bundles are compacted, its compaction comes
+    /// back or its child splits, each work under way, and the packing's branches go into the
+    /// bundles then, unwritten: in the list they are compacted, every entry written again. A root
+    /// split since the packing changes the pivots, and it enters the list.
+    fn waits_for_parts(&self, p: &super::Pending) -> Result<bool, Error> {
+        let node = self.node(self.root)?;
+        Ok(!node.leaf
+            && !p.cuts.is_empty()
+            && node.pivots.len() == p.cuts.len()
+            && node.pivots.iter().zip(&p.cuts).all(|(q, c)| q.key == *c))
     }
 
     /// Whether the root takes `p`'s branches straight into its pivots' bundles: its pivots are

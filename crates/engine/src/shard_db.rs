@@ -1325,16 +1325,10 @@ impl<F: BlockFile> ShardDb<F> {
         self.cache_share = available
             .saturating_sub(self.write_share)
             .saturating_sub(self.records_share);
+        // The shares changed: what each region holds above its new limit is trimmed afresh.
+        self.trim_cache = 0;
+        self.trim_records = 0;
         self.grant();
-        let half = usize::try_from(self.cycle_ops / 2)
-            .unwrap_or(usize::MAX)
-            .max(1);
-        self.trim_cache = self.store.cache_over().div_ceil(half);
-        self.trim_records = self
-            .records
-            .as_ref()
-            .map_or(0, crate::records::RecordCache::over)
-            .div_ceil(half);
     }
 
     /// The bytes the memtables hold: the active one, the one packing and the spare kept for
@@ -1531,19 +1525,10 @@ impl<F: BlockFile> ShardDb<F> {
         self.store.set_write_budget(write_share.min(self.write_cap));
         self.cache_share = cache;
         self.records_share = records_share;
+        // The shares changed: what each region holds above its new limit is trimmed afresh.
+        self.trim_cache = 0;
+        self.trim_records = 0;
         self.grant();
-        // What a shrunk region holds above its size leaves a few pages an operation, over half
-        // a cycle, so no operation pays for the step and the memory moves within the cycle.
-        let half = usize::try_from(self.cycle_ops / 2)
-            .unwrap_or(usize::MAX)
-            .max(1);
-        let per_op = |over: usize| over.div_ceil(half);
-        self.trim_cache = per_op(self.store.cache_over());
-        self.trim_records = per_op(
-            self.records
-                .as_ref()
-                .map_or(0, crate::records::RecordCache::over),
-        );
     }
 
     /// Sets the page cache's and the record cache's data limits from their shares, each less the
@@ -1584,6 +1569,26 @@ impl<F: BlockFile> ShardDb<F> {
                 &mut room,
             );
             r.resize(records);
+        }
+        // A limit falls below what its region holds when the region's share fell, or when its
+        // index grew since the last grant and is charged more: the region is trimmed down to it
+        // either way. A record cache whose index outgrew its share by a page while the page
+        // cache trimmed held that page above the budget with no trim of its own. What a region
+        // holds above its limit leaves a few pages an operation, over half a cycle, so no
+        // operation pays for the step and the memory moves within the cycle; a region already
+        // trimming keeps the pace it started at.
+        let half = usize::try_from(self.cycle_ops / 2)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        if self.trim_cache == 0 {
+            self.trim_cache = self.store.cache_over().div_ceil(half);
+        }
+        if self.trim_records == 0 {
+            self.trim_records = self
+                .records
+                .as_ref()
+                .map_or(0, crate::records::RecordCache::over)
+                .div_ceil(half);
         }
     }
 
@@ -4913,6 +4918,71 @@ mod tune_tests {
 #[cfg(test)]
 #[path = "shard_db/room_seats.rs"]
 mod room_seats;
+
+#[cfg(test)]
+mod grant_tests {
+    //! The budget's grant charges each cache's share what the cache's index and ghost take now,
+    //! so an index that grew lowers its cache's limit: a region a grant leaves above its limit
+    //! is trimming, and the regions hold more than the budget only while one trims down.
+    use super::*;
+    use hyper_block::buf::Alignment;
+    use hyper_block::file::{CachingRequest, DeviceFile};
+
+    const STORE: Config = Config {
+        page_size: 4096,
+        extent_pages: 8,
+        max_extents: 1 << 16,
+    };
+    const TRUNK: TrunkConfig = TrunkConfig {
+        fanout: 3,
+        leaf_entries: 96,
+    };
+    const MEM: usize = 8 * 1024;
+
+    /// Records taken at the record cache's limit evict its head pages into its ghost, which
+    /// grows: after each, a grant, and whenever the grant leaves the record cache above its
+    /// limit, the record cache trims and the budget's check sees it trimming.
+    #[test]
+    fn a_cache_whose_index_grew_past_its_limit_trims_down_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let file = DeviceFile::open(
+            &path,
+            true,
+            CachingRequest::Buffered,
+            Alignment::new(4096).unwrap(),
+        )
+        .unwrap();
+        let mut db = ShardDb::create(file, STORE, MEM, TRUNK).unwrap();
+        db.set_memory(512 * STORE.page_size).unwrap();
+        let value = [7u8; 100];
+        let (mut over_seen, mut index_grew) = (0u32, false);
+        let index_first = db.index_bytes().1;
+        for k in 0..20_000u64 {
+            let key = format!("k{k:08}").into_bytes();
+            let hash = crate::branch::filter::hash(&key);
+            db.records.as_mut().unwrap().insert(&key, hash, &value);
+            db.grant();
+            index_grew |= db.index_bytes().1 > index_first;
+            let over = db.records.as_ref().unwrap().over();
+            if over > 0 {
+                over_seen += 1;
+                assert!(
+                    db.trim_records > 0 && db.trimming(),
+                    "key {k}: {over} pages over, no trim"
+                );
+                // The trim the next operations make, all of it at once.
+                while db.trim() {}
+                assert_eq!(db.records.as_ref().unwrap().over(), 0, "key {k}");
+            }
+        }
+        assert!(index_grew, "the record cache's index never grew");
+        assert!(
+            over_seen > 0,
+            "no grant left the record cache above its limit"
+        );
+    }
+}
 
 #[cfg(test)]
 mod frozen_tests {

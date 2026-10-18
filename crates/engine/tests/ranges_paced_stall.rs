@@ -48,6 +48,14 @@ const TRUNK: TrunkConfig = TrunkConfig {
 };
 const OPS: u64 = 2048;
 
+/// The value of the retained writer's first entry. The retention case's gate holds the first
+/// worker write that carries it: the packing of the first memtable the writer fills, which the
+/// writer's first stall waits on whatever else is out, as the oldest frozen memtable or the worker
+/// a waiting packing needs. Held by arrival alone, the write could be a later packing's, and the
+/// stall then ended as the first packing retired (the frozen cap's one before a packing is back).
+const MARKER: &[u8] = b"retention-marker/the-first-filled-memtable's-packing";
+const MARKER_KEY: &[u8] = b"a/marker";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Event {
     Held,
@@ -73,6 +81,8 @@ struct State {
 struct Gate {
     armed: AtomicBool,
     reject_producer_write: bool,
+    /// The bytes the held write must carry, or none for the first worker write armed.
+    marker: Option<&'static [u8]>,
     state: Mutex<State>,
     changed: Condvar,
     events: mpsc::SyncSender<Event>,
@@ -84,13 +94,18 @@ struct Gate {
 }
 
 impl Gate {
-    fn new(reject_producer_write: bool, fail: bool) -> (Arc<Self>, mpsc::Receiver<Event>) {
+    fn new(
+        reject_producer_write: bool,
+        fail: bool,
+        marker: Option<&'static [u8]>,
+    ) -> (Arc<Self>, mpsc::Receiver<Event>) {
         // Each of the five witness kinds is emitted at most once.
         let (events, received) = mpsc::sync_channel(5);
         (
             Arc::new(Self {
                 armed: AtomicBool::new(false),
                 reject_producer_write,
+                marker,
                 state: Mutex::new(State {
                     selected: false,
                     released: false,
@@ -155,7 +170,12 @@ impl Gate {
                 "held output bytes reused before their write retired",
             ));
         }
-        if worker && !state.selected {
+        if worker
+            && !state.selected
+            && self
+                .marker
+                .is_none_or(|m| bytes.windows(m.len()).any(|w| w == m))
+        {
             state.selected = true;
             state.active = Some(Region { offset, end });
             self.report(Event::Held);
@@ -396,14 +416,14 @@ fn retention_case(fail: bool) {
     let dir = tempfile::tempdir().unwrap();
     let first_path = dir.path().join("first");
     let second_path = dir.path().join("second");
-    let (gate, events) = Gate::new(true, fail);
+    let (gate, events) = Gate::new(true, fail, Some(MARKER));
     let mut first = engine(&first_path, Arc::clone(&gate));
     for (key, value) in stable() {
         first.put(&key, &value).unwrap();
     }
     cold_complete(&mut first);
     first.checkpoint(0).unwrap();
-    let (other, _) = Gate::new(false, false);
+    let (other, _) = Gate::new(false, false, None);
     let mut second = engine(&second_path, Arc::clone(&other));
     // Existing attached worker-write fixture: one held device transfer plus a live one.
     let depth = 2;
@@ -454,6 +474,10 @@ fn retention_case(fail: bool) {
         )
         .unwrap(),
     );
+    // A stall is counted as it begins (FlushStats::stalls): the held range's count before the gate
+    // is armed is the baseline its retained writer raises, and the shard's waits then the baseline
+    // a park after arming raises.
+    let stalls_before = ranges.client().unwrap().stats().unwrap()[0].0.stalls;
     let before_wait = hyper_rt::registry::with_entry(shard.0, |entry| entry.pulse.waits()).unwrap();
     gate.armed.store(true, Ordering::SeqCst);
     let writer_ranges = Arc::clone(&ranges);
@@ -467,6 +491,9 @@ fn retention_case(fail: bool) {
             let mut client = writer_ranges.client().unwrap();
             let mut oracle = BTreeMap::new();
             let mut failure = None;
+            // The marker opens the first memtable filled after the gate is armed.
+            client.put_async(MARKER_KEY, MARKER).await.unwrap();
+            record(&mut oracle, MARKER_KEY.to_vec(), Some(MARKER.to_vec()));
             for i in 0..OPS {
                 let (key, value) = operation(i);
                 let applied = match &value {
@@ -493,9 +520,21 @@ fn retention_case(fail: bool) {
         })
         .unwrap();
     assert_eq!(events.recv().unwrap(), Event::Held);
-    // Public owner wait/announcement facts, not a sleep or a private engine-work assertion.
-    // Pending CPU slices remain runnable; a fresh park with the writer unfinished exercises
-    // the event wait. This is not a proof of native syscall residency.
+    // Public facts, not a sleep or a private engine-work assertion. The writer is retained once a
+    // rotation of the held range stalls behind the held packing, which the range's stats state
+    // while it lasts (a shard parked earlier may only be between the writer's puts); then the shard
+    // parked, with a wait since arming and the writer unfinished, exercises the event wait. Pending
+    // CPU slices remain runnable. This is not a proof of native syscall residency.
+    {
+        let mut watcher = ranges.client().unwrap();
+        while watcher.stats().unwrap()[0].0.stalls == stalls_before {
+            assert!(
+                !writer_ended.load(Ordering::Acquire),
+                "input did not exercise a retained write"
+            );
+            std::thread::yield_now();
+        }
+    }
     loop {
         assert!(
             !writer_ended.load(Ordering::Acquire),
@@ -620,8 +659,9 @@ fn retention_case(fail: bool) {
     if !fail {
         oracle.remove(b"a/stable/0".as_slice());
     }
-    // Three initial stable puts, two canceled-but-owned mutations, and the unrelated put.
-    let applied = OPS + 3 + 2 + 1;
+    // Three initial stable puts, the marker, two canceled-but-owned mutations, and the unrelated
+    // put.
+    let applied = OPS + 3 + 1 + 2 + 1;
     {
         let mut client = ranges.client().unwrap();
         if fail {
@@ -659,7 +699,7 @@ fn retention_case(fail: bool) {
     assert_eq!(index, if fail { 0 } else { applied });
     let expected_stable = stable();
     check_all(&mut first, if fail { &expected_stable } else { &oracle });
-    let (reopen_gate, _) = Gate::new(false, false);
+    let (reopen_gate, _) = Gate::new(false, false, None);
     let (mut second, index) = ShardDb::open(
         open(&second_path, false, false, reopen_gate),
         STORE,
@@ -759,7 +799,7 @@ fn terminal_case(stop: bool) {
     let dir = tempfile::tempdir().unwrap();
     let first_path = dir.path().join("closing");
     let second_path = dir.path().join("still-live");
-    let (gate, events) = Gate::new(true, false);
+    let (gate, events) = Gate::new(true, false, None);
     gate.hold_remaining_writes.store(true, Ordering::SeqCst);
     let (retired, retirement) = mpsc::sync_channel(1);
     let files = Arc::new(Files {
@@ -804,7 +844,7 @@ fn terminal_case(stop: bool) {
             ))
         })
         .unwrap();
-    let (other_gate, _) = Gate::new(false, false);
+    let (other_gate, _) = Gate::new(false, false, None);
     let mut second = engine(&second_path, Arc::clone(&other_gate));
     let depth = 2;
     let batches = mantle_engine::shard_db::issuer_batches(depth, depth)
@@ -842,9 +882,10 @@ fn terminal_case(stop: bool) {
         Ranges::start(
             &mut runtime,
             vec![(Vec::new(), first)],
-            // The canceled writer's published request and, in the Stop case, its terminal caller.
+            // The canceled writer's published request, the stall watcher and, in the Stop case,
+            // its terminal caller.
             RangesConfig {
-                clients: 1 + usize::from(stop),
+                clients: 2 + usize::from(stop),
                 slice_ns: 50_000,
                 spin_ns: 0,
                 inline: false,
@@ -865,6 +906,10 @@ fn terminal_case(stop: bool) {
         )
         .unwrap(),
     );
+    // A stall is counted as it begins (FlushStats::stalls): the closing range's count before the
+    // gate is armed is the baseline its retained writer raises, and the shard's waits then the
+    // baseline a park after arming raises.
+    let stalls_before = closing.client().unwrap().stats().unwrap()[0].0.stalls;
     let before_wait = hyper_rt::registry::with_entry(shard.0, |entry| entry.pulse.waits()).unwrap();
     gate.armed.store(true, Ordering::SeqCst);
     let (cancel, mut cancellation) = hyper_rt::sync::channel::<()>(1).unwrap();
@@ -894,6 +939,16 @@ fn terminal_case(stop: bool) {
         })
         .unwrap();
     assert_eq!(events.recv().unwrap(), Event::Held);
+    // The writer is retained once a rotation stalls behind the held writes, which the range's
+    // stats state while it lasts; then the shard parked, with a wait since arming and the writer
+    // unfinished, exercises the event wait.
+    {
+        let mut watcher = closing.client().unwrap();
+        while watcher.stats().unwrap()[0].0.stalls == stalls_before {
+            assert!(canceled_writer.try_recv().is_err());
+            std::thread::yield_now();
+        }
+    }
     loop {
         assert!(canceled_writer.try_recv().is_err());
         if hyper_rt::registry::with_entry(shard.0, |entry| {
@@ -1024,7 +1079,7 @@ fn stop_waits_for_held_worker_writes_and_native_handle_retirement_before_reply()
 fn direct_terminal_case(fail: bool) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("direct");
-    let (gate, events) = Gate::new(true, fail);
+    let (gate, events) = Gate::new(true, fail, None);
     gate.hold_remaining_writes.store(true, Ordering::SeqCst);
     let (retired, retirement) = mpsc::sync_channel(1);
     let files = Arc::new(Files {

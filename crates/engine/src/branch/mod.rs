@@ -1561,7 +1561,7 @@ impl Branch {
     ) -> Result<RunCursor, Error> {
         let placed = (|| {
             let page_no = self.leaf_of(from)?;
-            c.land(self, store, u64::from(page_no), 0)?;
+            c.land_page(self, store, u64::from(page_no))?;
             let (i, n) = c.page_lower_bound(store, from)?;
             if i >= n {
                 c.next_leaf(self, store)
@@ -1844,6 +1844,20 @@ impl RunCursor {
         page: u64,
         index: usize,
     ) -> Result<(), Error> {
+        self.land_page(branch, store, page)?;
+        self.index = index;
+        self.load_in(store)
+    }
+
+    /// Reads leaf `page` unless it is the one held, loading no entry: a seek finds its entry in
+    /// the leaf's table first ([`Branch::place_at`]), so an entry loaded on landing was decoded
+    /// and copied for nothing.
+    fn land_page<F: BlockFile>(
+        &mut self,
+        branch: &Branch,
+        store: &mut Store<F>,
+        page: u64,
+    ) -> Result<(), Error> {
         let address = branch.page_address(store, page)?;
         let held = self.loaded == Some(address)
             && self
@@ -1889,8 +1903,7 @@ impl RunCursor {
             }
         }
         self.page_no = page;
-        self.index = index;
-        self.load_in(store)
+        Ok(())
     }
 
     /// Whether moving to the next entry of `branch` reads no page that has not landed

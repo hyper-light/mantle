@@ -126,6 +126,9 @@ enum Step {
     Until(u64),
     /// One idle slice of maintenance, as a range's idle turn takes.
     Idle,
+    /// One of a range's turns ([`turn`]): results taken, an idle slice, and a wait where one is
+    /// owed.
+    Turn,
     /// The test's own job: an index of nothing, sent to the pool for a seat.
     Inject,
     /// The test's own merge: its inputs, written cold, merged under a grant of their extents and
@@ -223,14 +226,19 @@ fn once(db: &mut ShardDb<SegmentedFile>, i: u64) -> Result<bool, Error> {
     }
 }
 
-/// One of a range's turns between tries: what the workers sent back taken, then a wait for a
-/// worker's message or the device where that is what is owed, else an idle slice.
+/// One of a range's turns between tries, in a range's order (`ranges.rs`'s task): what the
+/// workers sent back taken, an idle slice, and then a wait for a worker's message or the device
+/// where the slice left that owed, else a yield. A slice is what declares the wait (a hand-off
+/// refused a seat, an ask waiting for growth), and the next try or take may clear it, so a turn
+/// that looked for it first spun: a packing held for room while a growth was out took all of
+/// [`TURNS`] in 211 ms without one wait, every growth slowed by 400 ms, as a zero-filled
+/// segment is on a slow disk (CI windows-x86_64, run 39079182870).
 async fn turn(db: &mut ShardDb<SegmentedFile>) -> Result<(), Error> {
     db.take_results()?;
+    db.idle_paced_step(KEYS)?;
     if db.waiting_for_io() {
         db.wait_completion().await?;
     } else {
-        db.idle_paced_step(KEYS)?;
         hyper_rt::futures::yield_now().await;
     }
     Ok(())
@@ -402,6 +410,7 @@ async fn run(
         Step::Once(i) => once(db, i),
         Step::Until(i) => until(db, |db| once(db, i)).await,
         Step::Idle => db.idle_paced_step(KEYS).map(|_| true),
+        Step::Turn => turn(db).await.map(|()| true),
         Step::Inject => {
             let job = Box::new(Job {
                 work: Work::Index(Box::default()),
@@ -579,13 +588,14 @@ impl Fixture {
         w
     }
 
-    /// Idle slices until no growth is out, the trunk owes nothing and no seat has a job out, as
-    /// the pool counts them (a result it has not taken keeps a seat out): from then only the
-    /// steps the test takes move the engine.
+    /// A range's turns until no growth is out, the trunk owes nothing and no seat has a job out,
+    /// as the pool counts them (a result it has not taken keeps a seat out): from then only the
+    /// steps the test takes move the engine. Each turn waits for what it is owed, so the turns
+    /// count what came, not how long it took.
     fn quiet(&mut self) -> Witness {
         let mut last = None;
         for _ in 0..TURNS {
-            let w = self.step(Step::Idle);
+            let w = self.step(Step::Turn);
             if !w.growth_out && w.trunk_idle && w.seats_out == 0 {
                 return w;
             }

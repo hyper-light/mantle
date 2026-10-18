@@ -33,7 +33,7 @@
 //! dropped from the cache (`forget`), so an address reused after its extent is freed never reads
 //! the page it held before.
 
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 
 use crate::shard_db::TUNE_STEP_PERCENT;
 use crate::util::incmap::{IncMap, SWEEP};
@@ -231,15 +231,12 @@ pub struct Cache {
     loan_kept: u64,
     loan_missed: u64,
     /// The store's pages an extent, and each extent's slot hint ([`Self::hint`]): where its
-    /// pages lie were they in a row as a loan keeps them, `NO_HINT` for none. One word an
-    /// extent, at most one a store extent, so a landing reads it from a line the CPU holds
-    /// where the index's control word and bucket are a miss each at scale.
+    /// pages lie were they in a row as a loan keeps them. One word an extent, at most one a
+    /// store extent, so a landing reads it from a line the CPU holds where the index's control
+    /// word and bucket are a miss each at scale.
     extent_pages: u64,
-    hints: Vec<u32>,
+    hints: Vec<Option<NonZeroU32>>,
 }
-
-/// An extent with no slot hint: a hint is at least 1 ([`Cache::hint`]).
-const NO_HINT: u32 = 0;
 
 /// Where a cache's memory is, in pages, and what its loans held ([`Cache::memory`]): what
 /// sizes a loan (research/50 §13).
@@ -992,12 +989,9 @@ impl Cache {
     /// The slot `address`'s extent hint names for it, holding the page or not.
     fn hinted(&self, address: u64) -> Option<usize> {
         let extent = usize::try_from(address.checked_div(self.extent_pages)?).ok()?;
-        let hint = *self.hints.get(extent)?;
-        if hint == NO_HINT {
-            return None;
-        }
+        let hint = (*self.hints.get(extent)?)?;
         let within = address.checked_rem(self.extent_pages)?;
-        let i = u64::from(hint)
+        let i = u64::from(hint.get())
             .checked_add(within)?
             .checked_sub(self.extent_pages)?;
         usize::try_from(i).ok()
@@ -1007,8 +1001,9 @@ impl Cache {
     /// extent's pages in a row (`Store::write_page_paced`) and a loan keeps them in a row, so the
     /// extent's other pages lie in the slots beside it. The hint is the slot the extent's first
     /// page would hold plus the extent's pages, so a row that starts before the cache's first
-    /// slot has one too and none is 0. The hints grow to the extent, which the store's own
-    /// extents bound; a hint the memory refuses is not kept, the index finding the page as before.
+    /// slot has one too, and a hint is never 0. The hints grow to the extent, which the store's
+    /// own extents bound; a hint the memory refuses is not kept, the index finding the page as
+    /// before.
     fn hint(&mut self, address: u64, i: usize) {
         let (Some(extent), Some(within)) = (
             address.checked_div(self.extent_pages),
@@ -1019,7 +1014,8 @@ impl Cache {
         let hint = u64::try_from(i)
             .ok()
             .and_then(|i| i.checked_add(self.extent_pages)?.checked_sub(within))
-            .and_then(|h| u32::try_from(h).ok());
+            .and_then(|h| u32::try_from(h).ok())
+            .and_then(NonZeroU32::new);
         let (Ok(extent), Some(hint)) = (usize::try_from(extent), hint) else {
             return;
         };
@@ -1033,10 +1029,10 @@ impl Cache {
             {
                 return;
             }
-            self.hints.resize(len, NO_HINT);
+            self.hints.resize(len, None);
         }
         if let Some(h) = self.hints.get_mut(extent) {
-            *h = hint;
+            *h = Some(hint);
         }
     }
 

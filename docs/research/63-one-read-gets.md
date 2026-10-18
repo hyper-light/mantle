@@ -151,3 +151,61 @@ over a gets phase of 1M, 10M; each read costs about 20 ns itself, the floor of t
 The kept lookup is four fifths of a get; the rest of the path is 60-80 ns. At 1M keys, much of the
 kept data in cache, gets ran 288-418 ns on the same build (`r3941..r3946`): a get is its path's
 latency, not its instructions, which research/60 §3 removed 274 of for nothing.
+
+## 5. Keeping pace with the writes
+
+**The index fell behind.** In the bench's first gets phase, a fill of 10M just ended, not one get
+of a million took the calm path (`gettime4`, cand4 `c4a385f`, `r5381..r5382`): an index was out on
+its worker for the whole phase, its lists waiting, and each get went the full path, 454-484 ns.
+The phase after the seeks, the index home, read the record in 219-221 ns, against 268-277 ns for
+main's slot and entry. Against main in the same rounds (`r5361..r5376`):
+
+| cand4 over main | 10M | 100M |
+|---|---|---|
+| gets after the fill | 0.95× | 0.32× |
+| gets after the seeks | 1.41× | 0.56× |
+
+**Why: the trips' recurrence.** The two indexes take turns: a trip takes every list kept since its
+index last went, which is two trips' worth, the other index's and its own's. With `x` ns to merge
+a record and `r` records a second, the time between departures obeys `d_k = x r (d_{k-1} +
+d_{k-2})`, whose characteristic root stays at most 1, the trips bounded, only while `x r <= 1/2`.
+At the bench's 5M records a second, `x` must be at most 100 ns.
+
+**What a merge costs.** `benches/kept_merge.rs` merges 19 memtable lists of the bench's records,
+9.7M in all, into one table, as a worker extends an index copy:
+
+| | ns a record |
+|---|---|
+| the box, lists in key order (as packings make them) | 178-317 |
+| the box, lists in place order | 151-250 |
+| the M5, natively, key order / place order | 130-189 / 84-138 |
+
+Counting the work: a placement probes 0.44-0.47 slots past its home and moves 0.20-0.22 records,
+so a record costs its placements' fixed work and their misses, but there are two placements a
+record: the growth rebuilds re-place 9.4M records beside the 9.7M merged, and each new table is
+zeroed or faulted in (on macOS 290K minor faults, 0.25 s of a run's system time). A profile
+(`sample`, natively) puts 86% of the merge in `place`, at the loads of a slot.
+
+Kept, each short of the bound alone: placing a run's records along with one move rather than a
+swap a slot (about 10%, and a refused placement now leaves the table unchanged, where the swapping
+version could drop the record it carried); placing records sixteen at a time, a group's homes read
+back to back first (Chen, Ailamaki, Gibbons and Mowry, ICDE 2004): 118-153 ns a record against
+154-168 ns one at a time, natively, a sweep finding 16-32 best; a rebuild copying each slot once
+rather than twice (no change measured: the time is the slots' misses). Measured and not kept:
+lists in place order (10-20%, and a sort on the packing worker); reading the homes of the records
+ahead one at a time (real loads, which retire in order: 15% at best); reading more of each run
+(nothing). A compact index of locators small enough to
+cache does not stand in for the table either: with the arena's random reads beside it, an 8 MiB
+index costs a get what a 256 MiB one does (`mlp3` with an `isb` an operation, natively: 149-166
+ns against 151-169 ns; 86-95 ns for 1 MiB).
+
+**Parts.** No single worker's merge reaches 100 ns a record with margin, so the merge is split:
+the index is `2^b` parts, a key's part chosen by its place's top `b` bits and its home in the part
+by the bits below, `2^b` the host's workers rounded down to a power of two. A packing splits its
+records by part as it walks them; a trip sends each part with its records to a worker of its own,
+as many at once as the pool admits, and the index comes home once every part is back. A get
+reads one slot of one part, as before; `x` falls to the slowest part's time, about `1/2^b`.
+
+On the box, pinned to one die (8 CPUs, 4 parts), against cand4 at 10M (`r201..r204`): gets after
+the fill 1.20× (4/4), their CPU an operation 1,060 to 420 ns; the fill 0.92×, its parts' merges
+beside the packings on 8 CPUs.

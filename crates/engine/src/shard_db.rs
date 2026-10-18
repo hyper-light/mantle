@@ -3778,17 +3778,25 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     /// The frozen memtables a rotation may leave in flight: the packings whose lifetimes reach
-    /// past it. A packing lasts `pack_ns` from its rotation to its branch and a memtable fills
-    /// in `fill_ns` (Little's law, L = λW: λ a memtable each `fill_ns`, W `pack_ns`). A packing
-    /// that lasts any part of a fill reaches the rotation that freezes it, so the overlap is
-    /// rounded up, `ceil(pack_ns / fill_ns)`: rounded down, a packing a little shorter than its
-    /// last measure counted none, and every rotation it outlasted fed it whole and waited for it.
-    /// With no measure yet, none. At most the pool's admitted capacity, each packing a worker's.
+    /// past it. A packing lasts W from its rotation to its branch and a memtable fills in
+    /// `fill_ns` (Little's law, L = λW: λ a memtable each `fill_ns`). A packing that lasts any
+    /// part of a fill reaches the rotation that freezes it, so the overlap is rounded up,
+    /// `ceil(W / fill_ns)`: rounded down, a packing a little shorter than its last measure
+    /// counted none, and every rotation it outlasted fed it whole and waited for it. W is the
+    /// last packing's measure, `pack_ns`, or the age of the oldest packing still out when that is
+    /// longer: one still out has lasted at least that long. With the measure alone, a shard's
+    /// second rotation came before its first packing had come back to measure anything, counted
+    /// none, and waited for that packing whole (1.9 ms and 6.9 ms, once each 10M fill), and a
+    /// packing slower than the last counted as the last. With no fill measured, none. At most the
+    /// pool's admitted capacity, each packing a worker's.
     fn frozen_most(&self) -> usize {
         if !self.trunk.has_pool() {
             return 0;
         }
-        let overlap = crate::util::div_ceil(self.pack_ns, self.fill_ns).unwrap_or(0);
+        let out_ns = self.frozen.front().map_or(0, |f| {
+            u64::try_from(f.since.elapsed().as_nanos()).unwrap_or(u64::MAX)
+        });
+        let overlap = crate::util::div_ceil(self.pack_ns.max(out_ns), self.fill_ns).unwrap_or(0);
         usize::try_from(overlap)
             .unwrap_or(usize::MAX)
             .min(self.trunk.pool_capacity())
@@ -5228,8 +5236,8 @@ mod frozen_tests {
     type Put = fn(&mut ShardDb<Held>, &mut BTreeMap<Vec<u8>, Vec<u8>>, u64);
 
     /// Puts until the shard has measured a fill and a packing, so the overlap it lets stay
-    /// frozen is its own: by the second rotation, which, with no overlap measured yet, waits for
-    /// the first packing a worker took and so measures it.
+    /// frozen is its own: by the rotation that finds more memtables frozen than the pool admits,
+    /// which waits for the oldest packing and so measures it, if none came back before.
     fn warm(
         db: &mut ShardDb<Held>,
         oracle: &mut BTreeMap<Vec<u8>, Vec<u8>>,
@@ -5237,10 +5245,11 @@ mod frozen_tests {
         put: Put,
     ) {
         let rotations = db.flush_stats.rotations;
+        let admitted = u64::try_from(db.trunk.pool_capacity()).unwrap();
         while db.pack_ns == 0 || db.fill_ns == 0 {
             assert!(
-                db.flush_stats.rotations < rotations + 2,
-                "a second rotation measured no packing"
+                db.flush_stats.rotations < rotations + admitted + 2,
+                "{admitted} admitted packings and no packing measured"
             );
             put(db, oracle, *i);
             *i += 1;
@@ -5376,6 +5385,31 @@ mod frozen_tests {
         assert_eq!(applied, i);
         check(&mut db, &oracle);
         db.check_references().unwrap();
+    }
+
+    static GATES_C: Gates = Gates::new();
+
+    /// A cold shard has measured no packing, but its first packing, still out, has lasted at
+    /// least its age: against a fill measured shorter than that age the shard lets as many
+    /// memtables stay frozen as the pool admits, so its next rotation does not wait for the
+    /// packing ([`ShardDb::frozen_most`]). Released, the packing comes back and is measured.
+    #[test]
+    fn a_packing_still_out_counts_at_least_its_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let mut db = ShardDb::create(plain(&path, true), STORE, MEM, TRUNK).unwrap();
+        let _open = Open(&GATES_C);
+        db.set_workers(gated(&path, &GATES_C)).unwrap();
+        let mut oracle = BTreeMap::new();
+        let mut i = 0u64;
+        stall_oldest(&mut db, &mut oracle, &mut i, put_or_delete, &GATES_C, false);
+        assert_eq!(db.pack_ns, 0, "a packing came back");
+        db.fill_ns = 1;
+        assert_eq!(db.frozen_most(), db.trunk.pool_capacity());
+        GATES_C.release();
+        db.drain_frozen().unwrap();
+        assert!(db.frozen.is_empty() && db.pack_ns > 0);
+        check(&mut db, &oracle);
     }
 
     static GATES_B: Gates = Gates::new();

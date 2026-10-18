@@ -232,6 +232,48 @@ impl<'a> ScanMerge<'a> {
         Some((h.key()?, h.op(), h.value()))
     }
 
+    /// With one source, its entries from the current one pushed to `out` in a run, a deletion
+    /// passed over, until `rows` rows are pushed, an entry at or past `before` (the least key
+    /// the scan's memtables hold next, which the caller merges) or the merge's end, or the
+    /// source's end: the number pushed, or none, nothing moved, when the merge holds more than
+    /// one source. Nothing is decided by comparing sources, so the run leaves the merge where the
+    /// caller's step would have, the entry it stopped at current. A 10M seek spent 43 ns a row
+    /// after its placing, most of it in the shard's merge of one source with memtables holding
+    /// nothing before the segment's end (research/61 §3).
+    pub fn push_run<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        rows: usize,
+        before: Option<&[u8]>,
+        out: &mut crate::rows::Rows,
+    ) -> Result<Option<usize>, Error> {
+        let mut pushed = 0usize;
+        let [head] = self.heads.as_mut_slice() else {
+            return Ok(None);
+        };
+        let end = if self.bounded {
+            Some(self.end.as_slice())
+        } else {
+            None
+        };
+        // At most a step an entry the source holds: each step moves the cursor on or ends it.
+        while pushed < rows {
+            let Some(key) = head.key() else {
+                break;
+            };
+            if end.is_some_and(|e| key >= e) || before.is_some_and(|b| key >= b) {
+                break;
+            }
+            if head.op() == Op::Put {
+                out.push(key, head.value());
+                pushed = pushed.saturating_add(1);
+            }
+            head.next(store)?;
+        }
+        self.pick();
+        Ok(Some(pushed))
+    }
+
     /// Moves every head holding the current key past it.
     pub fn next<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
         if self.current == Some(0)

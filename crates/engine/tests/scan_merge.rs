@@ -203,3 +203,141 @@ fn a_failed_single_head_step_can_reopen_over_another_run() {
         Err(Error::Io { .. })
     ));
 }
+
+/// Do: one branch whose keys are puts with a deletion every fourth and its last twenty all
+/// deletions; runs from a key inside it, under a row budget, a memtable bound and the merge's
+/// end; then a merge of two branches.
+/// Expect: a run pushes the puts in order and passes the deletions over, stops at its budget with
+/// the next entry current, stops before the bound and before the end, ends with no entry current
+/// when only deletions are left, and is refused, nothing moved, with two sources.
+#[test]
+fn a_run_of_one_source_pushes_its_puts_to_each_bound_and_refuses_two() {
+    let config = Config {
+        page_size: 4096,
+        extent_pages: 8,
+        max_extents: 4096,
+    };
+    let align = Alignment::new(4096).unwrap();
+    let file = SimFile::new(align, Alignment::new(512).unwrap(), 43).unwrap();
+    let mut store = Store::create(file, config).unwrap();
+    store.set_cache(64);
+    let n = 200u16;
+    let entries: Entries = (0..n)
+        .map(|i| {
+            let op = if i >= n - 20 || i % 4 == 3 {
+                Op::Delete
+            } else {
+                Op::Put
+            };
+            let value = if op == Op::Put {
+                vec![(i % 251) as u8; 100]
+            } else {
+                Vec::new()
+            };
+            (format!("k/{i:04}").into_bytes(), (op, value))
+        })
+        .collect();
+    let branch = build(&mut store, &entries);
+    let puts = |from: &[u8], before: &[u8]| -> Vec<(Vec<u8>, Vec<u8>)> {
+        entries
+            .range(from.to_vec()..before.to_vec())
+            .filter(|(_, (op, _))| *op == Op::Put)
+            .map(|(k, (_, v))| (k.clone(), v.clone()))
+            .collect()
+    };
+    let rows_of = |rows: &mantle_engine::rows::Rows| -> Vec<(Vec<u8>, Vec<u8>)> {
+        rows.iter().map(|(k, v)| (k.to_vec(), v.to_vec())).collect()
+    };
+    let mut merge = ScanMerge::new();
+    // A budget of seven rows from k/0010: the seven puts from there, the next entry current.
+    merge
+        .open(
+            &mut store,
+            &[Source::Branch(&branch)],
+            b"k/0010",
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+    let mut rows = mantle_engine::rows::Rows::new();
+    assert_eq!(
+        merge.push_run(&mut store, 7, None, &mut rows).unwrap(),
+        Some(7)
+    );
+    let want: Vec<_> = puts(b"k/0010", b"k/9999").into_iter().take(7).collect();
+    assert_eq!(rows_of(&rows), want);
+    let next = merge.entry().expect("an entry past the budget").0.to_vec();
+    assert!(next.as_slice() > want.last().unwrap().0.as_slice());
+    // A memtable bound at k/0050: every put before it, the entry at the bound current.
+    let mut rows = mantle_engine::rows::Rows::new();
+    let pushed = merge
+        .push_run(&mut store, 1000, Some(b"k/0050"), &mut rows)
+        .unwrap();
+    let want = puts(&next, b"k/0050");
+    assert_eq!(pushed, Some(want.len()));
+    assert_eq!(rows_of(&rows), want);
+    assert_eq!(
+        merge.entry().map(|(k, _, _)| k.to_vec()),
+        Some(b"k/0050".to_vec())
+    );
+    // The merge's end at k/0120: every put before it, no entry current.
+    merge
+        .open(
+            &mut store,
+            &[Source::Branch(&branch)],
+            b"k/0100",
+            Some(b"k/0120"),
+            false,
+            false,
+        )
+        .unwrap();
+    let mut rows = mantle_engine::rows::Rows::new();
+    let pushed = merge.push_run(&mut store, 1000, None, &mut rows).unwrap();
+    let want = puts(b"k/0100", b"k/0120");
+    assert_eq!(pushed, Some(want.len()));
+    assert_eq!(rows_of(&rows), want);
+    assert!(merge.entry().is_none());
+    // From inside the last twenty, all deletions: nothing pushed, the source at its end.
+    merge
+        .open(
+            &mut store,
+            &[Source::Branch(&branch)],
+            b"k/0185",
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+    let mut rows = mantle_engine::rows::Rows::new();
+    assert_eq!(
+        merge.push_run(&mut store, 1000, None, &mut rows).unwrap(),
+        Some(0)
+    );
+    assert!(rows.iter().next().is_none());
+    assert!(merge.entry().is_none());
+    // Two sources: refused, and the merge where it was.
+    let other: Entries = (0..10u16)
+        .map(|i| (format!("k/{i:04}x").into_bytes(), (Op::Put, vec![9; 100])))
+        .collect();
+    let second = build(&mut store, &other);
+    merge
+        .open(
+            &mut store,
+            &[Source::Branch(&branch), Source::Branch(&second)],
+            b"k/0000",
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+    let before = merge.entry().map(|(k, _, _)| k.to_vec());
+    let mut rows = mantle_engine::rows::Rows::new();
+    assert_eq!(
+        merge.push_run(&mut store, 1000, None, &mut rows).unwrap(),
+        None
+    );
+    assert!(rows.iter().next().is_none());
+    assert_eq!(merge.entry().map(|(k, _, _)| k.to_vec()), before);
+    merge.close(&mut store);
+}

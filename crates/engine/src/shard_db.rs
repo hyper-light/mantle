@@ -2427,6 +2427,24 @@ impl<F: BlockFile> ShardDb<F> {
                 .filter_map(MemCursor::key)
                 .filter(|k| before_end(k))
                 .min();
+            let mem_least = [mem_a, mem_p, mem_f].into_iter().flatten().min();
+            // The trunk's one source holds the next keys, before any a memtable holds: its rows
+            // go out in a run, with no merge of sources a row. A run moves the source at least
+            // once (its first key is before every bound), so the walk goes round again, opening
+            // the next segment where the run ended this one: a run of deletions to a segment's
+            // end pushes nothing and must not end the scan. A merge of several sources takes the
+            // step below.
+            if taken < limit && tree.is_some_and(|t| mem_least.is_none_or(|m| t < m)) {
+                match merge.push_run(store, limit.saturating_sub(taken), mem_least, out) {
+                    Ok(Some(n)) => {
+                        taken = taken.saturating_add(n);
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error) => break Err(error),
+                }
+            }
+            let tree = merge.entry().map(|(k, _, _)| k);
             let Some(least) = [mem_a, mem_p, mem_f, tree].into_iter().flatten().min() else {
                 break Ok(false);
             };

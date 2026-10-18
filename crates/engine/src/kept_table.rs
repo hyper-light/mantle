@@ -19,7 +19,7 @@ use crate::port::mmap::HugeZeroed;
 
 /// A slot's header: the memtable's number's low 16 bits (2 bytes; [`older16`]), the displacement
 /// plus one (0: empty), the flags, the record's place (4: the key's 32-bit filter hash, which names
-/// its home slot, kept so a rebuild places it without hashing the key again), and the key's
+/// its home slot, kept so a resize places it without hashing the key again), and the key's
 /// length (2). An inline record's value length follows (2); a spilled one's spill offset (4) and
 /// value length (4), then the key's head. A 16-byte key and a 100-byte value fill a 128-byte slot.
 const HEADER: usize = 10;
@@ -372,9 +372,23 @@ impl RecordTable {
     /// The home slot of a place: its bits below the part's, scaled to the slot count (Lemire's
     /// reduction of a 32-bit value).
     fn home(&self, place: u32) -> usize {
+        self.home_in(place, self.slots)
+    }
+
+    /// [`Self::home`] in a table of `slots` slots: a place's home scales with the table, so its
+    /// records' order is their homes' order at every size.
+    fn home_in(&self, place: u32, slots: usize) -> usize {
         let local = place.wrapping_shl(self.shift);
-        let scaled = u64::from(local).wrapping_mul(self.slots as u64) >> 32;
+        let scaled = u64::from(local).wrapping_mul(slots as u64) >> 32;
         usize::try_from(scaled).unwrap_or(0)
+    }
+
+    /// Empties slot `i`.
+    fn clear(&mut self, i: usize) -> Result<(), Error> {
+        self.at_mut(i)
+            .and_then(|s| s.get_mut(2))
+            .map(|b| *b = 0)
+            .ok_or_else(corrupt)
     }
 
     fn at(&self, i: usize) -> Option<&[u8]> {
@@ -537,8 +551,9 @@ impl RecordTable {
     }
 
     /// Places the record whose slot image (displacement 0) is `image` from its home slot,
-    /// replacing the key's record if the table holds one. Robin Hood keeps a run's records in the order of their
-    /// homes, so the record goes where the first record nearer its own home sits, and the rest of
+    /// replacing the key's record if the table holds one. Robin Hood keeps a run's records in the
+    /// order of their homes, here of their places within a home, so the record goes where the
+    /// first record nearer its own home, or of its home and a later place, sits, and the rest of
     /// the run moves along one slot, each a step further from its home: one move of the run's
     /// bytes, where carrying each displaced record on to the next slot read and wrote every slot
     /// twice (128-byte slots: an insert spent 104-131 ns, `kept_merge`). False, the table
@@ -558,7 +573,13 @@ impl RecordTable {
                 return false;
             };
             let disp = usize::from(disp_of(s));
-            if disp == 0 || disp.wrapping_sub(1) < d {
+            // Before the first record nearer its home, or of its home and a later place: a run's
+            // records are in their places' order, so in their homes' order at every table size,
+            // which a resize moves them by ([`Self::resize`]). A record of its key has its place.
+            if disp == 0
+                || disp.wrapping_sub(1) < d
+                || (disp.wrapping_sub(1) == d && place_of(s).is_some_and(|p| p > place))
+            {
                 break;
             }
             if self.holds(s, d, place, key) {
@@ -660,9 +681,18 @@ impl RecordTable {
         }
     }
 
-    /// Rebuilt with room for `records` at a load of at most 2/3, holding only the records of
-    /// memtables no older than `oldest`.
-    fn rebuild(&mut self, records: usize, oldest: u32) -> Result<(), Error> {
+    /// Resized in place to room for `records` at a load of at most 2/3, holding only the records
+    /// of memtables no older than `oldest`. A table's slots hold its records in their homes' order
+    /// but for the run at its start, and a home scales with the table ([`Self::home_in`]): with
+    /// that run taken out ([`Self::take_run`]), no record's slot in a larger table is before the
+    /// one it lies in, and none in a smaller or swept one is after it. So the stale records go and
+    /// a smaller table's records move front to back ([`Self::forward`]), a larger table's back to
+    /// front once its mapping has grown ([`Self::backward`]), each record moved once, and the run
+    /// is placed again last. Where the mapping keeps its pages as it resizes
+    /// ([`HugeZeroed::resize`]), a table never holds a second copy of itself and only the slots it
+    /// gains are populated: built new at each growth with every record copied in, a 100M fill's
+    /// tables populated 37.9 GB to hold 13.3 GB (box, stepchunk 325902f, r351-r354).
+    fn resize(&mut self, records: usize, oldest: u32) -> Result<(), Error> {
         let too_large = || Error::LimitExceeded {
             what: "a kept index's records",
             limit: u64::try_from(records).unwrap_or(u64::MAX),
@@ -672,75 +702,237 @@ impl RecordTable {
             .and_then(|n| n.checked_add(1))
             .ok_or_else(too_large)?;
         let len = slots.checked_mul(self.slot).ok_or_else(too_large)?;
-        let mut fresh = RecordTable {
-            map: HugeZeroed::allocate(len)?,
-            slot: self.slot,
-            slots,
-            live: 0,
-            spill: Vec::new(),
-            scratch: Vec::new(),
-            shift: self.shift,
+        if self.slots == 0 {
+            self.map = HugeZeroed::allocate(len)?;
+            self.slots = slots;
+            self.live = 0;
+            return Ok(());
+        }
+        let stale = (0..self.slots)
+            .filter_map(|i| self.at(i))
+            .any(|s| disp_of(s) != 0 && older16(number_of(s), oldest));
+        if slots == self.slots && !stale {
+            return Ok(());
+        }
+        let old = self.slots;
+        let run = if slots > old {
+            // The mapping grows first: refused, the table is as it was.
+            self.map.resize(len)?;
+            let mut run = self.take_run(oldest)?;
+            if stale {
+                self.forward(old, oldest, &mut run)?;
+            }
+            self.slots = slots;
+            self.backward(old, &mut run)?;
+            run
+        } else {
+            let mut run = self.take_run(oldest)?;
+            self.forward(slots, oldest, &mut run)?;
+            self.slots = slots;
+            run
         };
+        self.live = (0..self.slots)
+            .filter_map(|i| self.at(i))
+            .filter(|s| disp_of(s) != 0)
+            .count();
+        let mut key = Vec::new();
+        for image in run.chunks_exact(self.slot) {
+            let place = place_of(image).ok_or_else(corrupt)?;
+            key.clear();
+            if flags_of(image) & SPILLED == 0 {
+                let klen = klen_of(image);
+                key.extend_from_slice(
+                    image
+                        .get(INLINE_HEAD..INLINE_HEAD.saturating_add(klen))
+                        .ok_or_else(corrupt)?,
+                );
+            } else {
+                key.extend_from_slice(self.spilled(image).ok_or_else(corrupt)?.0);
+            }
+            if !self.place(place, &key, image) {
+                return Err(corrupt());
+            }
+        }
+        self.compact_spill()?;
+        if slots < old {
+            // Shrunk around its records last. Refused, the larger mapping stays, every slot past
+            // the table's empty, and the bytes it holds are counted as they are.
+            let _ = self.map.resize(len);
+        }
+        Ok(())
+    }
+
+    /// Takes out the run at the table's start: its records from slot 0 to the first slot empty or
+    /// holding a record at its home, which a run around the table's end wrapped into or moved
+    /// along. The rest of the table is then its records in their homes' order, each at its home or
+    /// just after the one before, none around its end. The records of memtables older than
+    /// `oldest` are dropped; the others' slot images are returned, to be placed again.
+    fn take_run(&mut self, oldest: u32) -> Result<Vec<u8>, Error> {
+        let mut run = Vec::new();
         for i in 0..self.slots {
             let Some(s) = self.at(i) else {
                 return Err(corrupt());
             };
-            if disp_of(s) == 0 || older16(number_of(s), oldest) {
+            if disp_of(s) <= 1 {
+                break;
+            }
+            if !older16(number_of(s), oldest) {
+                run.try_reserve(s.len()).map_err(|_| corrupt())?;
+                run.extend_from_slice(s);
+            }
+            self.clear(i)?;
+        }
+        Ok(run)
+    }
+
+    /// Front to back, each record to its slot in a table of `target` slots, no more than it has:
+    /// the records of memtables older than `oldest` dropped, each kept one at its home or just
+    /// after the last, which is never after the slot it lies in, so a record moves only into slots
+    /// those before it have left. One whose slot would fall past `target`, where its run would
+    /// wrap, or past [`MOST_DISPLACED`], joins `run`, to be placed again.
+    fn forward(&mut self, target: usize, oldest: u32, run: &mut Vec<u8>) -> Result<(), Error> {
+        let slot = self.slot;
+        let mut next = 0usize;
+        for i in 0..self.slots {
+            let Some(s) = self.at(i) else {
+                return Err(corrupt());
+            };
+            if disp_of(s) == 0 {
                 continue;
             }
-            // A record's place is what puts it in a slot: the slot kept it.
-            let Some(place) = place_of(s) else {
-                return Err(corrupt());
-            };
-            let placed = if flags_of(s) & SPILLED == 0 {
-                // An inline slot moves as it is, copied once from where it lies, its displacement
-                // set where it lands; the old table's slot order is its homes' order in the new
-                // one but where a run wrapped, so each lands at or just after the last.
-                let key = s
-                    .get(INLINE_HEAD..INLINE_HEAD.saturating_add(klen_of(s)))
-                    .ok_or_else(corrupt)?;
-                fresh.place(place, key, s)
-            } else {
-                let Some((key, value, op)) = self.record_of(s) else {
+            if older16(number_of(s), oldest) {
+                self.clear(i)?;
+                continue;
+            }
+            let place = place_of(s).ok_or_else(corrupt)?;
+            let home = self.home_in(place, target);
+            let at = home.max(next);
+            let d = at.saturating_sub(home);
+            if at >= target || at > i || d > MOST_DISPLACED {
+                run.try_reserve(s.len()).map_err(|_| corrupt())?;
+                run.extend_from_slice(s);
+                self.clear(i)?;
+                continue;
+            }
+            if at != i {
+                let (Some(from), Some(to)) = (i.checked_mul(slot), at.checked_mul(slot)) else {
                     return Err(corrupt());
                 };
-                let r = Record {
-                    hash32: place,
-                    op,
-                    key,
-                    value,
-                };
-                fresh.image(u32::from(number_of(s)), place, &r)?;
-                fresh.place_scratch(place, key)
-            };
-            if !placed {
-                return Err(corrupt());
+                let end = from.checked_add(slot).ok_or_else(corrupt)?;
+                self.map.bytes_mut().copy_within(from..end, to);
+                self.clear(i)?;
             }
+            let disp = u8::try_from(d.saturating_add(1)).map_err(|_| corrupt())?;
+            self.at_mut(at)
+                .and_then(|s| s.get_mut(2))
+                .map(|b| *b = disp)
+                .ok_or_else(corrupt)?;
+            next = at.saturating_add(1);
         }
-        *self = fresh;
         Ok(())
     }
 
-    /// A slot's key, value and operation.
-    fn record_of<'a>(&'a self, s: &'a [u8]) -> Option<(&'a [u8], &'a [u8], Op)> {
-        let flags = flags_of(s);
-        let op = if flags & PUT != 0 {
-            Op::Put
-        } else {
-            Op::Delete
-        };
-        if flags & SPILLED != 0 {
-            let (k, v) = self.spilled(s)?;
-            return Some((k, v, op));
+    /// Back to front, each record to its slot in this larger table, which had `old` slots: each
+    /// record's slot reckoned front to back first, at its new home or just after the last, which
+    /// is never before the slot it lies in, and held in its own slot as the displacement it will
+    /// have; then the records moved from the last, so none is written over before it moves. One
+    /// whose slot would fall past the table's end, where its run would wrap, or past
+    /// [`MOST_DISPLACED`], joins `run` with every record after it, to be placed again.
+    fn backward(&mut self, old: usize, run: &mut Vec<u8>) -> Result<(), Error> {
+        let slot = self.slot;
+        let mut next = 0usize;
+        let mut cut = old;
+        for i in 0..old {
+            let Some(s) = self.at(i) else {
+                return Err(corrupt());
+            };
+            if disp_of(s) == 0 {
+                continue;
+            }
+            let place = place_of(s).ok_or_else(corrupt)?;
+            let home = self.home(place);
+            let at = home.max(next);
+            let d = at.saturating_sub(home);
+            let disp = u8::try_from(d.saturating_add(1)).ok();
+            let Some(disp) = disp.filter(|_| at < self.slots && at >= i && d <= MOST_DISPLACED)
+            else {
+                cut = i;
+                break;
+            };
+            self.at_mut(i)
+                .and_then(|s| s.get_mut(2))
+                .map(|b| *b = disp)
+                .ok_or_else(corrupt)?;
+            next = at.saturating_add(1);
         }
-        let klen = klen_of(s);
-        let vlen = usize::from(u16_at(s, 10)?);
-        let mid = INLINE_HEAD.checked_add(klen)?;
-        Some((
-            s.get(INLINE_HEAD..mid)?,
-            s.get(mid..mid.checked_add(vlen)?)?,
-            op,
-        ))
+        for i in cut..old {
+            let Some(s) = self.at(i) else {
+                return Err(corrupt());
+            };
+            if disp_of(s) == 0 {
+                continue;
+            }
+            run.try_reserve(s.len()).map_err(|_| corrupt())?;
+            run.extend_from_slice(s);
+            self.clear(i)?;
+        }
+        for i in (0..cut).rev() {
+            let Some(s) = self.at(i) else {
+                return Err(corrupt());
+            };
+            let disp = usize::from(disp_of(s));
+            if disp == 0 {
+                continue;
+            }
+            let place = place_of(s).ok_or_else(corrupt)?;
+            let at = self
+                .home(place)
+                .checked_add(disp.saturating_sub(1))
+                .ok_or_else(corrupt)?;
+            if at != i {
+                let (Some(from), Some(to)) = (i.checked_mul(slot), at.checked_mul(slot)) else {
+                    return Err(corrupt());
+                };
+                let end = from.checked_add(slot).ok_or_else(corrupt)?;
+                self.map.bytes_mut().copy_within(from..end, to);
+                self.clear(i)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The spill compacted to the keys and values its live records name: a record replaced, or
+    /// dropped as its memtable was given back, leaves its own there until the table resizes.
+    fn compact_spill(&mut self) -> Result<(), Error> {
+        if self.spill.is_empty() {
+            return Ok(());
+        }
+        let mut fresh: Vec<u8> = Vec::new();
+        let mut moved: Vec<(usize, u32)> = Vec::new();
+        for i in 0..self.slots {
+            let Some(s) = self.at(i) else {
+                return Err(corrupt());
+            };
+            if disp_of(s) == 0 || flags_of(s) & SPILLED == 0 {
+                continue;
+            }
+            let (k, v) = self.spilled(s).ok_or_else(corrupt)?;
+            let at = u32::try_from(fresh.len()).map_err(|_| corrupt())?;
+            let grows = k.len().checked_add(v.len()).ok_or_else(corrupt)?;
+            fresh.try_reserve(grows).map_err(|_| corrupt())?;
+            fresh.extend_from_slice(k);
+            fresh.extend_from_slice(v);
+            moved.try_reserve(1).map_err(|_| corrupt())?;
+            moved.push((i, at));
+        }
+        for (i, at) in moved {
+            self.at_mut(i)
+                .and_then(|s| s.get_mut(10..14))
+                .map(|b| b.copy_from_slice(&at.to_le_bytes()))
+                .ok_or_else(corrupt)?;
+        }
+        self.spill = fresh;
+        Ok(())
     }
 
     /// Sets the slot size of a table that has none from the first records it will take
@@ -751,15 +943,16 @@ impl RecordTable {
         }
     }
 
-    /// The bytes of the table that a sweep, with `sweep`, then merging lists of `lengths` records,
-    /// oldest first, grows this one to at its last growth, as [`Self::sweep`] and [`Self::merge`]
-    /// rebuild it, every record counted new and none dropped: what a trip holds beside this table
-    /// while it rebuilds, at most; none when nothing would rebuild it. A table's slot size must be
+    /// The bytes a trip holds beside this table while a sweep, with `sweep`, then merging lists of
+    /// `lengths` records, oldest first, resize it, as [`Self::sweep`] and [`Self::merge`] do, every
+    /// record counted new and none dropped, at most; none when nothing would resize it. Where the
+    /// mapping keeps its pages ([`HugeZeroed::RESIZES_IN_PLACE`]), the slots it gains; elsewhere
+    /// the largest table it is copied into, which lies beside it. A table's slot size must be
     /// settled first ([`Self::settle_slot`]).
     pub fn growth(&self, sweep: bool, lengths: impl Iterator<Item = usize>) -> usize {
         let (mut live, mut slots, mut grown) = (self.live, self.slots, 0usize);
         if sweep && slots > 0 {
-            // A sweep rebuilds to the records it keeps, at most every one.
+            // A sweep resizes to the records it keeps, at most every one.
             slots = live.saturating_add(live / 2).saturating_add(1);
             grown = slots.saturating_mul(self.slot);
         }
@@ -772,12 +965,16 @@ impl RecordTable {
             }
             live = need;
         }
-        grown
+        if HugeZeroed::RESIZES_IN_PLACE {
+            slots.saturating_sub(self.slots).saturating_mul(self.slot)
+        } else {
+            grown
+        }
     }
 
     /// Takes memtable `number`'s records, each key once, after every record already held: a key's
     /// record here is replaced by its newer one. The first list a table takes sets its slot size
-    /// ([`RecordList::slot_size`]). A table that must grow drops, as it rebuilds, the records of
+    /// ([`RecordList::slot_size`]). A table that must grow drops, as it resizes, the records of
     /// memtables older than `oldest`.
     pub fn merge(&mut self, number: u32, list: &RecordList, oldest: u32) -> Result<(), Error> {
         self.settle_slot(list);
@@ -785,7 +982,7 @@ impl RecordTable {
         // At most 2/3 full: grown by half again past the need, so a table grows in steps that
         // move each record a bounded number of times.
         if need.saturating_mul(3) > self.slots.saturating_mul(2) {
-            self.rebuild(need.saturating_add(need / 2), oldest)?;
+            self.resize(need.saturating_add(need / 2), oldest)?;
         }
         let mut records = list.records();
         loop {
@@ -811,7 +1008,7 @@ impl RecordTable {
                 if !self.place_scratch(r.hash32, r.key) {
                     // A run too long: grown, and placed again.
                     let room = self.live.saturating_add(self.live / 2).saturating_add(1);
-                    self.rebuild(room, oldest)?;
+                    self.resize(room, oldest)?;
                     self.image(number, r.hash32, r)?;
                     if !self.place_scratch(r.hash32, r.key) {
                         return Err(corrupt());
@@ -831,7 +1028,7 @@ impl RecordTable {
             .filter_map(|i| self.at(i))
             .filter(|s| disp_of(s) != 0 && !older16(number_of(s), oldest))
             .count();
-        self.rebuild(live, oldest)
+        self.resize(live, oldest)
     }
 }
 
@@ -992,6 +1189,107 @@ mod tests {
         assert_eq!(t.get(7, b"a", 0), Answer::Record(Op::Put, b"3"));
         assert_eq!(t.get(7, b"b", 0), Answer::Record(Op::Put, b"2"));
         assert_eq!(t.get(7, b"c", 0), Answer::Absent);
+    }
+
+    /// Each record at its home or after it with no empty slot between, the slots between holding
+    /// records of homes no later and places no greater (a run's places' order), and each key in one
+    /// slot: what a probe and a resize rely on.
+    fn layout_holds(t: &RecordTable) -> Result<(), String> {
+        let mut keys = std::collections::BTreeMap::new();
+        for i in 0..t.slots {
+            let s = t.at(i).unwrap();
+            let disp = usize::from(disp_of(s));
+            if disp == 0 {
+                continue;
+            }
+            let place = place_of(s).unwrap();
+            let home = t.home(place);
+            if (home + disp - 1) % t.slots != i {
+                return Err(format!("slot {i}: home {home}, displacement {}", disp - 1));
+            }
+            let prev = (i + t.slots - 1) % t.slots;
+            if disp > 1 {
+                let p = t.at(prev).unwrap();
+                if disp_of(p) == 0 {
+                    return Err(format!("slot {i}: slot {prev} empty inside its run"));
+                }
+                let (ph, pp) = (t.home(place_of(p).unwrap()), place_of(p).unwrap());
+                if ph == home && pp > place {
+                    return Err(format!(
+                        "slot {i}: place {place} after place {pp} of its home"
+                    ));
+                }
+            }
+            let key = if flags_of(s) & SPILLED == 0 {
+                s.get(INLINE_HEAD..INLINE_HEAD + klen_of(s))
+                    .unwrap()
+                    .to_vec()
+            } else {
+                t.spilled(s).unwrap().0.to_vec()
+            };
+            if let Some(j) = keys.insert(key, i) {
+                return Err(format!("one key in slots {j} and {i}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Places crowded so runs wrap the table's end, several keys to a place, some records too long
+    /// for a slot: through rounds that grow the table, give back the oldest memtables (a sweep
+    /// that shrinks it) and write keys again, every slot keeps its run's order and each key
+    /// answers its newest record kept.
+    #[test]
+    fn a_table_resized_in_place_keeps_its_runs_and_answers() {
+        let place = |k: u32| u32::MAX - (k % 41) * (u32::MAX / 90);
+        let mut t = RecordTable::new();
+        let mut model: BTreeMap<u32, (u32, Vec<u8>)> = BTreeMap::new();
+        for round in 0u32..10 {
+            let mut list = RecordList::default();
+            for k in (round * 37 % 50)..(round * 37 % 50) + 40 * (round % 4 + 1) {
+                let key = format!("key{k:05}").into_bytes();
+                // One record in seven is longer than the slot the first list settles: spilled.
+                let len = if k % 7 == 0 {
+                    300
+                } else {
+                    20 + (k % 5) as usize
+                };
+                let value = vec![u8::try_from(round).unwrap(); len];
+                list.push(&Record {
+                    hash32: place(k),
+                    op: Op::Put,
+                    key: &key,
+                    value: &value,
+                })
+                .unwrap();
+                model.insert(k, (round, value));
+            }
+            let oldest = round.saturating_sub(2);
+            t.merge(round, &list, oldest).unwrap();
+            layout_holds(&t).unwrap_or_else(|e| panic!("round {round} merge: {e}"));
+            if round % 3 == 2 {
+                t.sweep(oldest).unwrap();
+                layout_holds(&t).unwrap_or_else(|e| panic!("round {round} sweep: {e}"));
+                model.retain(|_, (r, _)| *r >= oldest);
+            }
+            for (k, (r, v)) in &model {
+                let key = format!("key{k:05}").into_bytes();
+                let got = t.get(place(*k), &key, oldest);
+                if *r < oldest {
+                    // Given back: unknown while held, absent once a resize dropped it, the trunk
+                    // answering it either way.
+                    assert!(
+                        matches!(got, Answer::Unknown | Answer::Absent),
+                        "key {k} round {round}: {got:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        got,
+                        Answer::Record(Op::Put, v.as_slice()),
+                        "key {k} round {round}"
+                    );
+                }
+            }
+        }
     }
 
     /// Places crowded into the top half of their range put every home in the table's last half, so

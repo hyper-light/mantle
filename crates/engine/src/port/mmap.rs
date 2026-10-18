@@ -259,14 +259,95 @@ impl HugeZeroed {
             #[cfg(windows)]
             section,
         };
-        mapped.fault_in();
+        mapped.fault_in(0);
         Ok(mapped)
     }
 
-    /// Asks Linux for huge pages and faults every page in for writing, a huge page at a time (the
-    /// type's docs).
+    /// Whether [`Self::resize`] keeps the mapping's pages where they are. On Linux they move
+    /// with the mapping (`mremap(MREMAP_MAYMOVE)`, mremap(2)), and nothing is copied: a resize
+    /// holds no second copy beside the first. Elsewhere a new mapping takes a copy.
+    pub const RESIZES_IN_PLACE: bool = cfg!(target_os = "linux");
+
+    /// Resized to `len` bytes: the first `len.min(self.len())` kept, zero after them, the new
+    /// bytes faulted in as [`Self::allocate`]'s are. Refused, the mapping is as it was.
+    pub fn resize(&mut self, len: usize) -> Result<(), Error> {
+        if len == self.len {
+            return Ok(());
+        }
+        if self.addr.is_none() || len == 0 {
+            *self = Self::allocate(len)?;
+            return Ok(());
+        }
+        self.remap(len)
+    }
+
+    /// [`Self::resize`] of a mapping on Linux: the pages move with it, and only the bytes past
+    /// the old length are populated.
     #[cfg(target_os = "linux")]
-    fn fault_in(&mut self) {
+    fn remap(&mut self, len: usize) -> Result<(), Error> {
+        let refused = || Error::LimitExceeded {
+            what: "a kept record table (the OS refused to resize its mapping)",
+            limit: u64::try_from(len).unwrap_or(u64::MAX),
+        };
+        let Some(addr) = self.addr else {
+            return Err(refused());
+        };
+        let old = self.len;
+        let words = |n: usize| n.div_ceil(WORD).checked_mul(WORD);
+        let (Some(old_bytes), Some(new_bytes)) = (words(old), words(len)) else {
+            return Err(refused());
+        };
+        if len < old {
+            // The bytes past `len` on its last page stay mapped: zeroed, so a later growth
+            // reads zero there as fresh pages do.
+            let page = page_size().max(1);
+            let end = len.div_ceil(page).saturating_mul(page).min(old);
+            if let Some(tail) = self.bytes_mut().get_mut(len..end) {
+                tail.fill(0);
+            }
+        }
+        // SAFETY: `addr` maps the `old_bytes` this value owns (`allocate` mapped them through a
+        // `LazyZeroed` of `old.div_ceil(WORD)` words), and `&mut self` leaves no borrow of them;
+        // with MREMAP_MAYMOVE the kernel may move the pages to a new address, which replaces
+        // `addr`. Refused, the old mapping is unchanged (mremap(2)).
+        let moved = unsafe {
+            rustix::mm::mremap(
+                addr.as_ptr().cast(),
+                old_bytes,
+                new_bytes,
+                rustix::mm::MremapFlags::MAYMOVE,
+            )
+        }
+        .map_err(|_| refused())?;
+        let Some(moved) = NonNull::new(moved.cast::<u8>()) else {
+            return Err(refused());
+        };
+        self.addr = Some(moved);
+        self.len = len;
+        if len > old {
+            self.fault_in(old);
+        }
+        Ok(())
+    }
+
+    /// [`Self::resize`] elsewhere: a new mapping, the old bytes copied into it.
+    #[cfg(not(target_os = "linux"))]
+    fn remap(&mut self, len: usize) -> Result<(), Error> {
+        let mut fresh = Self::allocate(len)?;
+        let keep = len.min(self.len);
+        if let (Some(dst), Some(src)) =
+            (fresh.bytes_mut().get_mut(..keep), self.bytes().get(..keep))
+        {
+            dst.copy_from_slice(src);
+        }
+        *self = fresh;
+        Ok(())
+    }
+
+    /// Asks Linux for huge pages and faults every page from byte `from` on in for writing, a huge
+    /// page at a time (the type's docs).
+    #[cfg(target_os = "linux")]
+    fn fault_in(&mut self, from: usize) {
         let Some(addr) = self.addr else {
             return;
         };
@@ -280,13 +361,14 @@ impl HugeZeroed {
             )
         };
         let step = huge_page_size().max(page_size()).max(1);
-        let mut done = 0usize;
+        let page = page_size().max(1);
+        let mut done = from.checked_div(page).unwrap_or(0).saturating_mul(page);
         while done < self.len {
             let n = step.min(self.len.saturating_sub(done));
             // SAFETY: `done` is below `len`, so the range starts inside the mapping this value
-            // owns and its `n` bytes end inside it; `done` is a multiple of `step`, a whole number
-            // of pages, so the start is page aligned as madvise(2) asks. Populating for writing
-            // leaves the zeros the mapping already reads as.
+            // owns and its `n` bytes end inside it; `done` starts on a page and moves in steps of
+            // whole pages, so the start is page aligned as madvise(2) asks. Populating for
+            // writing leaves the bytes the mapping holds as they are.
             let populated = unsafe {
                 rustix::mm::madvise(
                     addr.as_ptr().add(done).cast(),
@@ -295,11 +377,11 @@ impl HugeZeroed {
                 )
             };
             if populated.is_err() {
-                // A kernel before 5.14: each page left written once, a write fault each.
-                let page = page_size().max(1);
+                // A kernel before 5.14: each page left written once, a write fault each; the
+                // bytes written are the ones each holds.
                 if let Some(rest) = self.bytes_mut().get_mut(done..) {
                     for b in rest.iter_mut().step_by(page) {
-                        *b = 0;
+                        *b = std::hint::black_box(*b);
                     }
                 }
                 return;
@@ -310,7 +392,7 @@ impl HugeZeroed {
 
     /// Elsewhere pages fault in as they are first touched, at the OS's page size.
     #[cfg(not(target_os = "linux"))]
-    fn fault_in(&mut self) {}
+    fn fault_in(&mut self, _from: usize) {}
 
     pub fn len(&self) -> usize {
         self.len
@@ -389,5 +471,38 @@ mod huge_tests {
         m.bytes_mut()[0] = 9;
         assert_eq!((m.bytes()[0], m.bytes()[n - 1]), (9, 7));
         assert!(HugeZeroed::allocate(0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_resized_mapping_keeps_its_bytes_and_reads_zero_past_them() {
+        let byte = |i: usize| u8::try_from(i % 251).unwrap() + 1;
+        let mut m = HugeZeroed::allocate(5 * 4096 + 3).unwrap();
+        for (i, b) in m.bytes_mut().iter_mut().enumerate() {
+            *b = byte(i);
+        }
+        m.resize(9 * 1024 * 1024 + 17).unwrap();
+        assert_eq!(m.len(), 9 * 1024 * 1024 + 17);
+        assert!(
+            m.bytes()[..5 * 4096 + 3]
+                .iter()
+                .enumerate()
+                .all(|(i, &b)| b == byte(i))
+        );
+        assert!(m.bytes()[5 * 4096 + 3..].iter().all(|&b| b == 0));
+        // Shrunk into a page, then grown: the page's bytes past the shrunk length read zero.
+        m.resize(4096 + 100).unwrap();
+        assert!(m.bytes().iter().enumerate().all(|(i, &b)| b == byte(i)));
+        m.resize(3 * 4096).unwrap();
+        assert!(
+            m.bytes()[..4096 + 100]
+                .iter()
+                .enumerate()
+                .all(|(i, &b)| b == byte(i))
+        );
+        assert!(m.bytes()[4096 + 100..].iter().all(|&b| b == 0));
+        m.resize(0).unwrap();
+        assert!(m.is_empty());
+        m.resize(10).unwrap();
+        assert!(m.bytes().iter().all(|&b| b == 0));
     }
 }

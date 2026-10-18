@@ -4972,6 +4972,14 @@ impl<F: BlockFile> ShardDb<F> {
             self.trunk.step_paced(&mut self.store, keys.max(1))?;
             return Ok(false);
         }
+        // The cache's freed pages the writes' compactions left, a slice at a time: puts forget
+        // them in shares over the room the trunk's work frees them in (`pay_shares`), and the last
+        // compactions free theirs after the last put. The flush finishes the writes' maintenance;
+        // left to idle slices, these were forgotten during the first gets after a fill.
+        if self.store.forget_debt() > 0 {
+            self.store.forget_some(keys.max(1));
+            return Ok(false);
+        }
         self.trunk_carry = 0;
         Ok(true)
     }
@@ -5086,6 +5094,8 @@ impl<F: BlockFile> ShardDb<F> {
         let t = self.timed.then(std::time::Instant::now);
         self.trunk.drain(&mut self.store)?;
         self.note_trunk(ns_since(t));
+        // The cache's freed pages the writes' compactions left ([`Self::flush_paced`]).
+        self.store.forget_some(self.store.forget_debt());
         self.trunk_carry = 0;
         Ok(())
     }

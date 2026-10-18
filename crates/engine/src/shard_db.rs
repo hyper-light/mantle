@@ -3625,8 +3625,13 @@ impl<F: BlockFile> ShardDb<F> {
             self.prune_lists();
             return Ok(true);
         }
+        // The first part out is owed maintenance a get waits on, admitted within the pool's
+        // cores as a packing is; the parts beside it take only seats the measured need already
+        // keeps, so the index's own parallelism starts no worker of its own: each worker holds
+        // its own files on the shard's segments.
+        let waiting = self.kept_away.is_empty();
         let admitted = match self.trunk.pool_mut() {
-            Some(pool) => pool.can_take(&mut self.store, true)?,
+            Some(pool) => pool.can_take(&mut self.store, waiting)?,
             None => false,
         };
         if !admitted {

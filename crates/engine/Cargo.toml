@@ -82,6 +82,10 @@ name = "seek_cursor"
 harness = false
 
 [[bench]]
+name = "leaf_index"
+harness = false
+
+[[bench]]
 name = "compaction"
 harness = false
 

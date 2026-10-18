@@ -383,12 +383,16 @@ bounded seek pass over a source with nothing in its range without reading it (cl
   followed by the next suffix. `may_hold(from, end)` checks the stored prefixes of `from` (one
   descent reports them) and the ceiling against `[from, end)`. No range holding a key is ruled
   out.
-- **The trie under it.** The trie is built in one streaming pass with packed values. Only
-  S-LOUDS keeps select samples, as the paper says; dense labels are found by word scans. The
+- **The trie under it.** The trie is built in one streaming pass with packed values. Where the
+  paper selects on S-LOUDS for a node's first label, each sparse level keeps its nodes' starts.
+  A node starts at its block's first node's position (every 256th), plus one label for each
+  node before it in the block, plus those nodes' labels past their first (16 bits). A level
+  whose nodes all hold one label keeps no extras. The starts are built when a level is built or
+  read, so no byte written changes (research/62). Dense labels are found by word scans. The
   sparse part is kept a level at a time, as the builder lays it out, not assembled into one
-  sequence as the paper does. A level's nodes are the branches going on above it, so rank and
-  select run within the level. Finishing copies words, not labels: 0.17 ms for 500 k keys
-  against 3.3 ms assembled, which was the put latency maximum once a flush.
+  sequence as the paper does. A level's nodes are the branches going on above it, so rank runs
+  within the level. Finishing copies words, not labels: 0.17 ms for 500 k keys against 3.3 ms
+  assembled, which was the put latency maximum once a flush.
 - **Consulted on bounded scans.** At a segment's open, a branch is passed over when its filter
   rules out `[from, min(end, segment end))`. An open scan does not check, since a leaf's end alone
   almost never rules out a branch above it.

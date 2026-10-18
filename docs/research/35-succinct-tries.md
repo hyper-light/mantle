@@ -61,4 +61,5 @@ the range filters of its bundles.
     against the intervals of the query's stored prefixes and its ceiling, with no
     false-positive flag.
   - Trie values are packed at the width the largest needs.
-  - Select samples are kept only on S-LOUDS; dense labels are found by word scans.
+  - S-LOUDS is not selected: each sparse level keeps its nodes' starts (research/62). Dense
+    labels are found by word scans.

@@ -1,7 +1,7 @@
-//! A bit vector with rank and select as the Fast Succinct Trie uses them (research/35 §1; Zhang et
-//! al. SIGMOD 2018 §2.6): rank from one level of lookup table, a running count of set bits at
-//! the start of every block of `B` bits, then a popcount within the block; select from a table
-//! sampling the position of every `S`th set bit, then a forward scan by popcount.
+//! A bit vector with rank as the Fast Succinct Trie uses it (research/35 §1; Zhang et al. SIGMOD
+//! 2018 §2.6): one level of lookup table, a running count of set bits at the start of every block
+//! of `B` bits, then a popcount within the block. The paper's select, on S-LOUDS alone, is a
+//! stored node start in the trie instead (research/62 §1).
 
 use crate::error::{Error, Malformed};
 
@@ -12,37 +12,6 @@ fn corrupt() -> Error {
     }
 }
 
-/// Bits a select sample covers: one sample every 64 set bits, 9–17% of a dense vector, 1–2% of
-/// the trie (research/35 §1).
-pub const SELECT_SAMPLE: usize = 64;
-
-/// The position of set bit `k` (from 0) of `w`, which has more than `k`: halves of 32, 16 and 8
-/// bits passed by their popcounts, then the byte's bits, at most eight steps.
-pub(crate) fn select_in_word(w: u64, k: usize) -> usize {
-    let mut k = u32::try_from(k).unwrap_or(u32::MAX);
-    let mut shift = 0u32;
-    for (half, mask) in [(32u32, 0xffff_ffffu64), (16, 0xffff), (8, 0xff)] {
-        let low = ((w >> shift) & mask).count_ones();
-        if k >= low {
-            k = k.saturating_sub(low);
-            shift = shift.saturating_add(half);
-        }
-    }
-    let mut byte = (w >> shift) & 0xff;
-    for _ in 0..k {
-        byte &= byte.wrapping_sub(1);
-    }
-    shift.saturating_add(byte.trailing_zeros()) as usize
-}
-
-/// Whether a vector keeps select samples: only LOUDS-Sparse's node starts are selected
-/// (research/35 §1); every other vector is ranked and scanned by words.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Select {
-    Sampled,
-    None,
-}
-
 /// A bit vector, its bits in 64-bit words, least significant first.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Bits {
@@ -51,8 +20,6 @@ pub struct Bits {
     /// Words a rank block holds (`B / 64`), and the set bits before each block.
     block_words: usize,
     ranks: Vec<u32>,
-    /// The position of every `SELECT_SAMPLE`th set bit, the first included.
-    selects: Vec<u32>,
     ones: usize,
 }
 
@@ -145,17 +112,17 @@ impl Bits {
         for &b in bits {
             g.push(b);
         }
-        Self::from_grow(g, block_bits, Select::Sampled)
+        Self::from_grow(g, block_bits)
     }
 
     /// A copy of the vector a builder fills, its words copied whole: the builder keeps its
     /// buffers for its next trie.
-    pub fn copy_of(bits: &Grow, block_bits: usize, select: Select) -> Result<Self, Error> {
-        Self::from_grow(bits.clone(), block_bits, select)
+    pub fn copy_of(bits: &Grow, block_bits: usize) -> Result<Self, Error> {
+        Self::from_grow(bits.clone(), block_bits)
     }
 
     /// The vector a builder filled, its words taken as they are.
-    pub fn from_grow(bits: Grow, block_bits: usize, select: Select) -> Result<Self, Error> {
+    pub fn from_grow(bits: Grow, block_bits: usize) -> Result<Self, Error> {
         let block_words =
             block_bits
                 .checked_div(64)
@@ -168,32 +135,19 @@ impl Bits {
             len: bits.len,
             block_words,
             ranks: Vec::new(),
-            selects: Vec::new(),
             ones: 0,
         };
-        v.index(select)?;
+        v.index()?;
         Ok(v)
     }
 
-    fn index(&mut self, select: Select) -> Result<(), Error> {
+    fn index(&mut self) -> Result<(), Error> {
         let mut ones = 0usize;
         for (i, w) in self.words.iter().enumerate() {
             if i.checked_rem(self.block_words) == Some(0) {
                 self.ranks.push(u32::try_from(ones).map_err(|_| corrupt())?);
             }
-            let mut bits = *w;
-            while bits != 0 {
-                if select == Select::Sampled && ones.is_multiple_of(SELECT_SAMPLE) {
-                    let pos = i
-                        .checked_mul(64)
-                        .and_then(|p| p.checked_add(bits.trailing_zeros() as usize))
-                        .ok_or(corrupt())?;
-                    self.selects
-                        .push(u32::try_from(pos).map_err(|_| corrupt())?);
-                }
-                ones = ones.saturating_add(1);
-                bits &= bits.wrapping_sub(1);
-            }
+            ones = ones.saturating_add(w.count_ones() as usize);
         }
         self.ones = ones;
         Ok(())
@@ -284,36 +238,8 @@ impl Bits {
         }
     }
 
-    /// The position of the `k`th set bit, counting from 1 as the paper does; none past the last,
-    /// and none in a vector built without select samples.
-    pub fn select1(&self, k: usize) -> Option<usize> {
-        if k == 0 || k > self.ones {
-            return None;
-        }
-        let before = k.checked_sub(1)?;
-        let sample = before / SELECT_SAMPLE;
-        let start = *self.selects.get(sample)? as usize;
-        // Set bits before `start`, and those still to pass from it.
-        let mut left = before % SELECT_SAMPLE;
-        let mut word = start / 64;
-        let mut bits = self.words.get(word)? & (u64::MAX << (start % 64));
-        // At most the vector's words.
-        for _ in 0..=self.words.len() {
-            let n = bits.count_ones() as usize;
-            if left < n {
-                return word
-                    .checked_mul(64)
-                    .and_then(|p| p.checked_add(select_in_word(bits, left)));
-            }
-            left = left.saturating_sub(n);
-            word = word.checked_add(1)?;
-            bits = *self.words.get(word)?;
-        }
-        None
-    }
-
     /// Appends the vector to `out`: its length in bits, its rank block in words, its words. The
-    /// rank and select tables are rebuilt when it is read.
+    /// rank table is rebuilt when it is read.
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&u64::try_from(self.len).unwrap_or(u64::MAX).to_le_bytes());
         out.extend_from_slice(
@@ -327,7 +253,7 @@ impl Bits {
     }
 
     /// A vector [`Self::encode`] wrote at the start of `bytes`, and the bytes it took.
-    pub fn decode(bytes: &[u8], select: Select) -> Result<(Self, usize), Error> {
+    pub fn decode(bytes: &[u8]) -> Result<(Self, usize), Error> {
         let word = |at: usize| -> Result<u64, Error> {
             bytes
                 .get(at..)
@@ -362,10 +288,9 @@ impl Bits {
             len,
             block_words,
             ranks: Vec::new(),
-            selects: Vec::new(),
             ones: 0,
         };
-        v.index(select)?;
+        v.index()?;
         Ok((v, at))
     }
 
@@ -375,39 +300,11 @@ impl Bits {
             .len()
             .saturating_mul(8)
             .saturating_add(self.ranks.len().saturating_mul(4))
-            .saturating_add(self.selects.len().saturating_mul(4))
     }
 }
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn the_select_finds_every_set_bit() {
-        let mut x = 0x9e37_79b9_7f4a_7c15u64;
-        let mut words = vec![
-            0u64,
-            1,
-            u64::MAX,
-            1 << 63,
-            0x8000_0000_0000_0001,
-            0x00FF_00FF_00FF_00FF,
-        ];
-        for _ in 0..2_000 {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            words.push(x);
-            words.push(x & (x >> 3));
-        }
-        for &w in &words {
-            let ones: Vec<usize> = (0..64).filter(|&i| (w >> i) & 1 == 1).collect();
-            for (k, &want) in ones.iter().enumerate() {
-                assert_eq!(super::select_in_word(w, k), want, "{w:#x} k {k}");
-            }
-        }
-    }
-
     use super::*;
 
     fn naive_rank(bits: &[bool], i: usize) -> usize {
@@ -417,16 +314,8 @@ mod tests {
             .count()
     }
 
-    fn naive_select(bits: &[bool], k: usize) -> Option<usize> {
-        bits.iter()
-            .enumerate()
-            .filter(|(_, b)| **b)
-            .nth(k.checked_sub(1)?)
-            .map(|(i, _)| i)
-    }
-
     #[test]
-    fn rank_and_select_agree_with_counting_on_every_position() {
+    fn rank_and_scans_agree_with_counting_on_every_position() {
         let mut x = 0x9e37_79b9_7f4a_7c15u64;
         for len in [1usize, 63, 64, 65, 511, 512, 513, 2_000, 9_999] {
             for density in [1u64, 3, 17, 50, 97] {
@@ -454,17 +343,6 @@ mod tests {
                         assert_eq!(v.prev_one(i), back, "len {len} prev from {i}");
                         let want = (i..len).find(|&j| bits[j]);
                         assert_eq!(v.next_one(i), want, "len {len} next from {i}");
-                    }
-                    for k in 0..=v.ones() + 1 {
-                        assert_eq!(v.select1(k), naive_select(&bits, k), "len {len} k {k}");
-                    }
-                    let mut g = Grow::default();
-                    for &b in &bits {
-                        g.push(b);
-                    }
-                    let unsampled = Bits::from_grow(g, block, Select::None).unwrap();
-                    for i in 0..len {
-                        assert_eq!(unsampled.rank1(i), naive_rank(&bits, i));
                     }
                 }
             }

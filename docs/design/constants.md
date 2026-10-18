@@ -96,13 +96,13 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/ec/src/durability.rs` `YEAR` | derived | Unit conversion: 365.25 days × 24 h = 8766 hours. |
 | `crates/engine/src/branch/mod.rs` `KEY_HEAD` | format | 4: the bytes of a page entry's head, its suffix's first 4 bytes, which a search compares before reading the entry. |
 | `crates/engine/src/branch/mod.rs` `SLOT` | format | 6: a page entry's table bytes, its offset (2) and its head (4). |
-| `crates/engine/src/fst/bits.rs` `SELECT_SAMPLE` | cited | 64: select samples every 64th set bit, 9–17% of a dense bit vector and 1–2% of the trie (Zhang et al., SuRF, SIGMOD 2018 §2.6; research/35 §1). |
 | `crates/engine/src/fst/packed.rs` `MAX_WIDTH` | format | 32: a trie value is a `u32` (a leaf's page number, a range filter's suffix bits). |
 | `crates/engine/src/fst/surf.rs` `SUFFIX_BYTES` | format | 4: the bytes a suffix of at most 32 bits (`MAX_WIDTH`) spans. |
 | `crates/engine/src/fst/trie.rs` `DENSE_BLOCK` | cited | 64-bit rank blocks for LOUDS-Dense: a rank is one popcount, 50% over its small bitmaps (SuRF §2.6; research/35 §1). |
 | `crates/engine/src/fst/trie.rs` `DENSE_NODE_BITS` | format | 513: a LOUDS-Dense node's two 256-bit bitmaps (labels, branches going on) and its own-key bit. |
 | `crates/engine/src/fst/trie.rs` `DENSE_RATIO` | cited | R = 64: the dense levels at most 1/64 of the sparse levels below them (SuRF §2.4; research/35 §1). |
 | `crates/engine/src/fst/trie.rs` `SPARSE_BLOCK` | cited | 512-bit rank blocks for LOUDS-Sparse: a block in a cache line, 6.25% over the bits (SuRF §2.6; research/35 §1). |
+| `crates/engine/src/fst/trie.rs` `STARTS_BLOCK` | derived | 256 nodes a block of a sparse level's node starts: the most whose offsets from the block's first always fit 16 bits, since a node holds at most 256 labels (one a byte value) and 255 nodes span at most 65,280 (research/62 §2). |
 | `crates/engine/src/fst/trie.rs` `SPARSE_LABEL_BITS` | format | 10: a LOUDS-Sparse label's byte and its has-child and node-start bits. |
 | `crates/engine/src/store/cache.rs` `EVICT_STEPS` | derived | `MAX_FREQ + 2`: queue steps an insert may take to free a slot, S3-FIFO's amortized cost of an eviction (a page moves to main at most once and goes round main at most `MAX_FREQ` times; Yang et al., SOSP '23 §4). Past it the optional admission is left out and the queues keep their place; unbounded, one insert took 117,973 steps (344 us) at 32,768 pages (review §4). |
 | `crates/engine/src/records.rs` `EVICT_PAGES` | derived | 2: pages an append may evict for room; a page whose records were all read again frees none but clears their second chance, so a second lets an append past one read-hot page. Unbounded, one append carried a whole 16 MiB cache round, 7.7 ms (review §4). |

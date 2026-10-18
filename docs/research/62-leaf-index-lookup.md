@@ -71,3 +71,46 @@ level once a byte, and reads the node's labels from its starts, then the label's
 A fallback to a smaller label keeps its node. So the value of the key a label ends is found by
 the label's rank and its node's own-key rank, without S-LOUDS's rank to find the node.
 `rightmost` descends the same way. `select1`, its samples and `Select` left the bit vector.
+
+## 4. Measured
+
+**The lookup alone.** `benches/leaf_index.rs` in the Linux VM, main b8bd6cd plus the bench
+(`leaf-base` 75893de) against the change (`trie-wr` f177997), 6 rounds each at 1M and 10M keys,
+1M lookups a run, the arms' order alternating (`native-ab/leaf/vm-ab.sh`, `leaf/vm-ab.out`): the
+median ns a lookup.
+
+| shape | keys | before | after | | index memory before | after |
+|---|---|---|---|---|---|---|
+| number | 1M | 156.3 | 66.5 | 0.43× | 106,798 B | 122,122 B |
+| number | 10M | 213.8 | 80.0 | 0.37× | 1,215,093 B | 1,368,287 B |
+| object | 1M | 856.3 | 342.1 | 0.40× | 268,459 B | 288,423 B |
+| object | 10M | 866.8 | 368.2 | 0.42× | 1,817,491 B | 1,983,857 B |
+
+The starts cost 7-15% more memory beside the levels; the bytes written are unchanged.
+
+**The product.** The shard bench in the VM, run7's balanced order, RocksDB and SplinterDB beside
+(`runs/n*-r5221..r5236`, x_trie against x_main61; one 100M case, r5236, is invalid: the host's
+file sharing stalled it, `INVALID.txt`):
+
+| x_trie over main | fill | gets | seeks | seeks, settled |
+|---|---|---|---|---|
+| 10M, 6 rounds | 0.99×, 3/6 | 0.98×, 1/6 | 1.06×, 5/6 | |
+| 100M, 5 rounds | 0.99×, 2/5 | 0.91×, 2/5 | 0.99×, 2/5 | 0.98×, 2/5 |
+
+At 100M every get is answered from the kept memtables and reads no trie; a round's gets ran
+1.66-2.31M/s in every arm, a spread of a fifth, so five rounds do not separate the arms.
+
+**With the landing hint.** The change and the landing hint (research/61's follow-on: a seek's
+landing tries the slot its extent's hint names before the cache's index) together, against main,
+RocksDB and SplinterDB beside, 8 rounds a size (`runs/n*-r5261..r5278`, x_seeks2 against
+x_main61):
+
+| x_seeks2 over main | fill | gets | seeks | gets, settled | seeks, settled |
+|---|---|---|---|---|---|
+| 10M | 1.01×, 5/8 | 1.03×, 5/8 | 1.28×, 8/8 | 1.03×, 6/8 | 1.28×, 8/8 |
+| 100M | 0.99×, 2/8 | 1.02×, 6/8 | 1.13×, 7/8 | 0.99×, 3/8 | 1.19×, 8/8 |
+
+Over SplinterDB in the same rounds, seeks 4.60× at 10M and 12.56× at 100M; over RocksDB 7.95× and
+7.54×. A 100M fill's tail is unchanged: p99.9 2.56-3.39 µs against 2.69-3.58, p99.99 18.4-21.5 µs
+against 18.9-23.0, the entries written alike; a round's stalls, 100M's own (research/58 §8), came
+to 6 against 4 over the 8 rounds.

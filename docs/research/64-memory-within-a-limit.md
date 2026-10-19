@@ -173,12 +173,16 @@ reservations and the caches' indexes and ghosts.
   worth of operations), and in a range task's turns and idle slices once a fill's time
   (`fill_ns`, the cycle a rotation measures) has passed since the last look. The flush after a
   fill, which has no rotations, follows the machine at the pace a fill does.
-- **The room kept free.** Twice the largest step a growth gate admits, a memtable's arena or the
-  page cache's next chunk (the gates' own rule), plus the most that the process's memory outside
-  the shard's account has grown between two looks: its resident memory less the budget's
-  regions, the kept memtables and the memtables in flight (workers' buffers, the allocator's free
-  lists, other shards). Other processes' memory lowers the free memory a look reads, not the room
-  kept: a margin learned from them would hold memory back forever after one burst.
+- **The room kept free.** The most that the process's memory outside the shard's account has
+  grown between two looks: its resident memory less the budget's regions, the kept memtables and
+  the memtables in flight (workers' buffers, the allocator's free lists, other shards). That is
+  what may grow before the next look with no gate to ask. The gates keep their own steps' room as
+  they admit them, so the budget does not keep it again: with twice the cache's next chunk
+  (0.5-0.9 GiB) added, the budget swung by that much from look to look and left 4.7 GiB unused,
+  the kept memtables were all given to the page cache by the fill's end, and the first gets after
+  it read the device 1.61M times (`dirty/memtrace-memlimf-24g`, 60K gets a second). Other
+  processes' memory lowers the free memory a look reads, not the room kept: a margin learned from
+  them would hold memory back forever after one burst.
 - **Giving back.** A budget that falls has the kept memtables give memory back at once
   (`fit_kept`), and the page cache and record cache trimmed to their new shares at once, rather
   than a few pages an operation: the machine has no room for them. A trim retires whole chunks,
@@ -186,6 +190,6 @@ reservations and the caches' indexes and ghosts.
 
 `tests/shard_db_follow.rs` drives the machine's reading through three phases: memory to spare,
 then none, then memory again. Every read is checked against an oracle throughout. With nothing
-free, the next rotation's look lowers the budget below what the shard held, the kept memtables
-give memory back, and the regions and kept memtables then hold no more than the budget. The budget
-does not rise while the machine has nothing. When memory returns, so does the budget.
+free, the next rotation's look lowers the budget from its bound to what the shard holds at most;
+it never rises while nothing is free, the regions and kept memtables hold no more than it, and the
+kept memtables give memory back. When memory returns, so does the budget.

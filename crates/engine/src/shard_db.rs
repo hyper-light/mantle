@@ -1344,11 +1344,11 @@ impl<F: BlockFile> ShardDb<F> {
     /// regions and kept memtables hold now and this shard's share of the memory the machine leaves
     /// free, less the room kept free, never above the shard's share of the machine's capacity
     /// nor below what it cannot give back: its fixed write reservations and the caches' indexes
-    /// and ghosts. The room kept free is twice the largest step a
-    /// growth gate admits (a memtable's arena, the page cache's next chunk), the gates' own rule,
-    /// and the most the process's memory outside the shard's account has grown between two looks
-    /// ([`Follow::grew_most`]): what may grow before the next. Other processes' memory lowers the
-    /// free memory a look reads, not the room kept. A budget that falls has the kept memtables give memory back and
+    /// and ghosts. The room kept free is the most the process's memory outside the shard's
+    /// account has grown between two looks ([`Follow::grew_most`]): what may grow before the next
+    /// with no gate to ask. The gates keep their own steps' room as they admit them (twice a cache
+    /// chunk, a memtable), so the budget does not keep it again. Other processes' memory lowers
+    /// the free memory a look reads, not the room kept. A budget that falls has the kept memtables give memory back and
     /// the caches trimmed to their shares at once, not a few pages an operation: the machine has
     /// no room for them. No reading leaves the budget as it is.
     fn look_machine(&mut self) {
@@ -1366,7 +1366,6 @@ impl<F: BlockFile> ShardDb<F> {
                 .unwrap_or(usize::MAX)
                 .saturating_sub(held.saturating_add(self.memtable_bytes()))
         });
-        let step = self.mem_limit.max(self.store.cache_next_chunk_bytes());
         // The least the shard holds: its fixed write reservations, and the caches' indexes and
         // ghosts, charged to them whatever they hold.
         let (cache_index, records_index) = self.index_bytes();
@@ -1383,10 +1382,9 @@ impl<F: BlockFile> ShardDb<F> {
             follow.grew_most = follow.grew_most.max(outside.saturating_sub(was));
         }
         follow.last = Some((outside, now));
-        let keep = step.saturating_mul(2).saturating_add(follow.grew_most);
         let budget = held
             .saturating_add(free.checked_div(follow.shares).unwrap_or(0))
-            .saturating_sub(keep)
+            .saturating_sub(follow.grew_most)
             .min(follow.bound)
             .max(floor);
         let Some(was) = self.memory.filter(|&m| m != budget) else {

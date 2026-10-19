@@ -126,30 +126,35 @@ fn a_budget_that_follows_the_machine_gives_memory_back_when_the_machine_runs_sho
     assert_eq!(db.budget(), Some(BOUND), "a machine with memory to spare");
     let kept = db.stats().0.kept;
     assert!(kept > 0, "no memtable was kept");
-    let before = held(&db);
+    assert!(held(&db) < BOUND, "the test's memtables fill the bound");
 
-    // The machine has nothing free: the next rotation's look lowers the budget below what the
-    // shard held, and the kept memtables give their memory back.
+    // The machine has nothing free: the next rotation's look lowers the budget to what the shard
+    // holds at most, below its bound; nothing grows while nothing is free, so the budget never
+    // rises again, the regions and the kept memtables hold no more than it, and the kept
+    // memtables, a new memtable's arena not to be had, give memory back.
     FREE.store(0, Ordering::Relaxed);
     x = run(&mut db, &mut oracle, x, 1);
-    let short = db.budget().unwrap();
-    assert!(short < before, "budget {short} not below the {before} held");
-    assert!(
-        db.trimming() || held(&db) <= short,
-        "held {} above the budget {short}",
-        held(&db)
-    );
+    let mut short = db.budget().unwrap();
+    assert!(short < BOUND, "budget {short} stayed at its bound");
+    for _ in 0..4 {
+        assert!(
+            db.trimming() || held(&db) <= short,
+            "held {} above the budget {short}",
+            held(&db)
+        );
+        x = run(&mut db, &mut oracle, x, 1);
+        let now = db.budget().unwrap();
+        assert!(
+            now <= short,
+            "the budget rose to {now} from {short} with nothing free"
+        );
+        short = now;
+    }
     assert!(
         db.stats().0.kept < kept,
         "kept {} of {kept}",
         db.stats().0.kept
     );
-    x = run(&mut db, &mut oracle, x, 4);
-    assert!(
-        db.budget().unwrap() <= short,
-        "the budget rose while the machine had nothing free"
-    );
-    assert!(db.trimming() || held(&db) <= db.budget().unwrap());
 
     // The machine frees memory: the budget returns to its bound.
     FREE.store(1 << 40, Ordering::Relaxed);

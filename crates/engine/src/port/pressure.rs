@@ -43,6 +43,7 @@ fn some_total(path: &std::path::Path) -> Option<u64> {
 
 /// The `total=` of the "some" line of a pressure file's text: `some avg10=0.00 avg60=0.00
 /// avg300=0.00 total=12345` (psi.rst's format).
+#[cfg(any(target_os = "linux", test))]
 fn parse_some_total(text: &str) -> Option<u64> {
     text.lines()
         .find_map(|l| l.strip_prefix("some "))?

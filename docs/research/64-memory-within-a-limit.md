@@ -397,3 +397,33 @@ in all: 30.5 GB of live pages, 5.6 GB of dead slots in loans' chunks some of who
 forgotten, 4.7 GB of spare loan memory kept for loans after the fill had ended, and the rest its
 index and ghost. The loans could not hold 22.1M pages of what their workers wrote (84 GB of 412 GB):
 what the cache holds when the gets begin is the next question at this size, not its limit.
+
+## 12. Where a full cache's memory goes at 1B
+
+A trace of each look with the retirement fixed (c1b3 4a4f99ea, never merged; r801, the box quiet,
+the 64 GB scope; sizes in GB):
+
+| s | rotation | cache / limit | live | dead | spare | loans' pages kept / missed in 30 s |
+|---|---|---|---|---|---|---|
+| 92 | 542 | 42.1 / 57.7 | 35.7 | 6.2 | 0.1 | 47.5 / 0.5 |
+| 152 | 830 | 57.4 / 57.9 | 37.7 | 19.7 | 0 | 23.6 / 4.5 |
+| 305 (the fill's end) | 1773 | 52.9 / 53.6 | 35.4 | 17.5 | 0 | 4.8 / 2.9 |
+| 368 (the flush) | 1773 | 53.7 / 53.8 | 36.2 | 17.3 | 0 | 2.3 / 12.7 |
+| 552 | 1773 | 54.7 / 54.7 | 40.8 | 12.5 | 0 | 3.8 / 5.4 |
+| 582 (the gets) | 1773 | 37.2 / 54.7 | 29.1 | 4.9 | 3.2 | |
+
+From the moment the cache meets its limit, a third of it is dead: slots of loans' chunks whose
+pages were forgotten while others of the same chunk were not. A loan's fresh memory came back as
+one chunk, the whole of what the job wrote (49 MB a loan on average here), and a chunk is free
+only when its last page is. A job's pages are freed an extent at a time, as later jobs consume
+the slices of the branch they wrote, so a chunk spanning many extents sits mostly dead for most of
+its life. With no spare chunk and no room under the limit, a loan gets less room than its job
+writes and the rest is missed: through the flush, whose whole consolidation writes the tree that
+the gets will read, the loans missed 5 to 13 GB every 30 s, and kept 2 to 4.
+
+A loan's fresh memory now comes in buffers of at most a huge page of whole extents, each its own
+chunk once back ([`Cache::lend`], `loan_chunk_pages`), so a chunk is freed with the extents it
+holds. The chunks' room, spare and lent pages, which `room`, `shed_spare` and `out_on_loan` summed
+over every chunk, are kept as fields, with tens of thousands of chunks a cache at 1B. The cache's
+40,000-step test checks the fields against those sums, and the retirement invariant (§11), after
+every step, with loans in buffers of two pages.

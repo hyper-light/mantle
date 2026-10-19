@@ -580,3 +580,71 @@ lowers a ceiling on the budget to one tuning step (5%, §7's step, Luo & Carey) 
 shard holds, and the caches and kept memtables give that memory back at once (§7's fall); each
 6 s window with less raises the ceiling a step, until it no longer binds. Elsewhere than Linux
 there is no reading, and the budget is §7's.
+
+## 17. What a 1B put waits for, and the pages held twice
+
+**The yield holds the maintenance.** §16's spans are not disjoint: the client's yield is the shard's
+turn for its other tasks, and the range's task pays the turn's maintenance shares inside it. Of
+the trace's 98.5 s of yields of 50 µs or more, 82.6 s are paying shares inside them (`nest.py`
+over r5301's events; the trunk's steps 61.6 of their 61.6 s, lending 14.5 of 14.6). A put then
+splits so (ns a put, the fill's EVSPAN totals; 100M from the traced r5313, clean of the
+carryover r5311 met):
+
+| ns a put | 1B (r5301) | 100M (r5313) |
+|---|---|---|
+| the whole put | 426 | 200 |
+| the client's yield, the maintenance inside it | 112.2 | 22.9 |
+| puts by request, behind a full memtable | 36.4 | 0.0 |
+| the put itself, outside both | 277 | 177 |
+
+**Every step slower alike.** The same work costs 4 to 24 times as much a call at 1B, the steps
+that touch no device among them:
+
+| a call | 1B | 100M |
+|---|---|---|
+| a trunk step | 7.9 µs | 0.72 µs |
+| taking packed memtables | 1.24 µs | 0.075 µs |
+| forgetting pages | 3.3 µs | 0.41 µs |
+| applying a job's result | 3.7 µs | 0.21 µs |
+| dropping dead branches | 801 µs | 40 µs |
+| lending a job memory | 722 µs | 29.5 µs |
+| a loan's pages into the cache | 795 µs | 229 µs |
+| granting a job extents | 342 µs | 84 µs |
+
+The cost is in tails: a loan's p50 is 0.1 ms, its p90 1.8-6.2 ms and its longest 140 ms; the
+longest drop of dead branches 348 ms, grant 2.2 s, adoption 3.7 s (`lendsz.py`, spans of 50 µs or
+more). The VM had 18 CPUs and the process used 5.9 of them (2,387 ns of CPU a put at 2.46M a
+second, r6531), so the shard waited on the machine, not for a CPU: §16's memory stall, and the
+device. Every task in the VM waited on I/O 20-40% of the fill's time (`psi.txt`, the "full"
+total in 30 s windows; 70% in its last 30 s).
+
+**What the device carried.** Each phase's storage bytes (`/proc/self/io`), a put's share:
+
+| run | written a put | read a put | fill |
+|---|---|---|---|
+| 10M pagebuf (r6526) | 164.6 B | 0 | 1.3 s |
+| 1B pagebuf (r6531) | 546.7 B | 290.2 B | 406.8 s |
+| 1B fairq (r6541, the cache not working, §13) | 503.3 B | 167.5 B | 385.3 s |
+
+At 1B the compactions merged 4,286M entries and wrote 4,109M, about 133 B each written, so their
+inputs came to about 570 GB; half of it the device served. A worker reads its inputs from the
+store file through the OS page cache and never from the shard's cache, which held 42.2 GiB at the
+fill's end (37.4 GiB live) and took in 446.5 GiB of the jobs' written pages over the fill. The
+budget's free memory is the machine's available memory, which counts the page cache the kernel
+can reclaim, so the cache grew into the memory that served the workers' reads: the VM's available
+memory stood at 1.3-2.5 GB through the fill, its anonymous memory at 56-62 GB. The pages a job
+wrote were held twice, in the shard's cache and in the page cache, and the copy the workers read
+was the one squeezed out. fairq, its cache not working, left the page cache the memory and read
+42% fewer bytes.
+
+The fill also took 112.7M page faults, about one for each of the loans' kept pages counted at
+4 KiB (117.0M): the loans' fresh memory asks for huge pages (§15), and under this pressure the
+kernel seems to have given small ones.
+
+**What decides the next step.** Three runs, each against r6531: the budget with the pressure
+ceiling (§16) at 1B; the share of each compaction's input pages the shard's cache holds as the
+job goes out (a diagnostic count, r5321), which bounds what workers reading their inputs from the
+cache would save; and the same build with its files opened for direct I/O (r6611), where no page
+cache sits beside the shard's cache, every compaction read goes to the device, and the cache may
+take the memory the page cache held. Each run samples the kernel's huge page faults and
+fallbacks, compaction stalls and direct reclaim beside it (`memsample2.sh`).

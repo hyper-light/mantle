@@ -300,6 +300,8 @@ struct Follow {
     /// The process's memory outside the shard's account at the last look ([`ShardDb::look_machine`]),
     /// and when it was.
     last: Option<(usize, std::time::Instant)>,
+    /// The workers' messages taken by the last look (`Trunk::pool_accepted`).
+    accepted: u64,
     /// The most the process's memory outside the shard's account grew between two looks: its
     /// resident memory less the budget's regions, the kept memtables and the memtables in flight
     /// (workers' buffers, the allocator's free lists, other shards' growth).
@@ -1329,6 +1331,7 @@ impl<F: BlockFile> ShardDb<F> {
             bound,
             shares: shares.max(1),
             last: None,
+            accepted: 0,
             grew_most: 0,
         });
         Ok(())
@@ -1343,8 +1346,7 @@ impl<F: BlockFile> ShardDb<F> {
     /// Divides the machine's free memory again (docs/research/64 §5): the budget becomes what its
     /// regions and kept memtables hold now and this shard's share of the memory the machine leaves
     /// free, less the room kept free, never above the shard's share of the machine's capacity
-    /// nor below what it cannot give back: its fixed write reservations and the caches' indexes
-    /// and ghosts. The room kept free is the most the process's memory outside the shard's
+    /// nor below what it cannot give back: its write memory and the caches' indexes and ghosts. The room kept free is the most the process's memory outside the shard's
     /// account has grown between two looks ([`Follow::grew_most`]): what may grow before the next
     /// with no gate to ask. The gates keep their own steps' room as they admit them (twice a cache
     /// chunk, a memtable), so the budget does not keep it again. Other processes' memory lowers
@@ -1366,12 +1368,13 @@ impl<F: BlockFile> ShardDb<F> {
                 .unwrap_or(usize::MAX)
                 .saturating_sub(held.saturating_add(self.memtable_bytes()))
         });
-        // The least the shard holds: its fixed write reservations, and the caches' indexes and
-        // ghosts, charged to them whatever they hold.
+        // The least the shard holds: its write memory, fixed reservations and the queue's share,
+        // which only a tuning step moves, and the caches' indexes and ghosts, charged to them
+        // whatever they hold.
         let (cache_index, records_index) = self.index_bytes();
         let floor = self
-            .write_reserved
-            .saturating_add(self.store.warm_write_bytes())
+            .memory_held()
+            .1
             .saturating_add(cache_index)
             .saturating_add(records_index);
         let now = std::time::Instant::now();
@@ -1382,6 +1385,7 @@ impl<F: BlockFile> ShardDb<F> {
             follow.grew_most = follow.grew_most.max(outside.saturating_sub(was));
         }
         follow.last = Some((outside, now));
+        follow.accepted = self.trunk.pool_accepted();
         let budget = held
             .saturating_add(free.checked_div(follow.shares).unwrap_or(0))
             .saturating_sub(follow.grew_most)
@@ -1404,7 +1408,36 @@ impl<F: BlockFile> ShardDb<F> {
                     self.trim_records = 0;
                 }
             }
-            self.grant();
+            // A trim names what it evicts in its cache's ghost, which the cache is charged for: the
+            // floor is what that leaves, and the budget no less.
+            let (cache_index, records_index) = self.index_bytes();
+            let floor = self
+                .memory_held()
+                .1
+                .saturating_add(cache_index)
+                .saturating_add(records_index);
+            if budget < floor {
+                self.memory = Some(floor);
+                self.partition_memory();
+            } else {
+                self.grant();
+            }
+        }
+    }
+
+    /// In idle time, looks at the machine ([`Self::look_machine`]) whenever a worker's message
+    /// has come back since the last look, as well as once a fill's time has passed: the workers'
+    /// memory moves with their jobs, and idle time is the shard's own to spend. The flush after a
+    /// fill, which has no client work, looked only at the fill's pace, and its consolidations grew
+    /// past the room kept between two looks (docs/research/64 §9).
+    fn look_when_idle(&mut self) {
+        let Some(follow) = self.follow.as_ref() else {
+            return;
+        };
+        if follow.last.is_some() && self.trunk.pool_accepted() != follow.accepted {
+            self.look_machine();
+        } else {
+            self.look_when_due();
         }
     }
 
@@ -4553,7 +4586,7 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     fn idle_step_with(&mut self, keys: u64, paced: bool) -> Result<u64, Error> {
-        self.look_when_due();
+        self.look_when_idle();
         let done = self.idle_step_inner(keys, paced)?;
         // Idle work may have kept a compaction's pages or a page read: the kept memtables give
         // way before the step returns.

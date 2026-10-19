@@ -225,3 +225,52 @@ workers times the largest loan. Tests: `store::cache::tests::spare_loan_memory_h
 (eight loans in turn, their pages forgotten: spare stays within one loan, seven loans' memory
 goes back, and the next loan takes the spare), and the 40,000-step test, which now asserts the
 bound after every step.
+
+With spare loan memory bounded (memlim4, 3f85185b), every 24 GiB run survived, but in two of
+three the page cache ended at 2.7-5.5 GB, and the first gets ran at 48K-268K a second. A trace of
+each look (`dirty/memtrace-memlimf2-*`) shows why the cache stayed small. After the fill, the
+memory outside the account rose to 3.7-4.1 GiB, and the most it grew between two looks
+(`grew_most`) reached 1.2-2.0 GiB: freed memory that glibc's arenas kept counted as growth outside
+the account, and the budget kept that much free. With glibc's free pages released at each look
+(`malloc_trim(3)`, a diagnostic: memlimf3, c0897f27), the outside memory stayed under 0.85 GiB,
+the cache held the whole get working set (1,995,943 live pages, no device read in the gets), and
+gets ran at 598K and 648K a second. But a trim took 1.7-2.2 ms at the median, 13-22 ms at the p99
+and up to 95 ms on the shard's thread, at every look.
+
+## 9. The allocator's threshold, kept, and looks in idle time
+
+Turning glibc's threshold adjustment off at the process's start (`port::mmap::return_freed_blocks`)
+keeps freed large blocks out of the arenas with no trim. Alone, it left one run of three killed in
+the 24 GiB container, 23 s in, just after the fill: in the flush, with no rotation, the shard looked
+at the machine only once a fill's time had passed, and the consolidations on every worker grew past
+the room kept between two looks. In idle time the shard now looks whenever a worker's message has
+come back since the last look; idle time is the shard's own to spend, and the workers' memory moves
+with their jobs. A trim's ghost entries are charged to the cache, so after a look's trims the budget
+is never below what the shard then cannot give back.
+
+| 100M, VM, 24 GiB | survived | fill/s | gets/s | seeks/s | live pages |
+|---|---|---|---|---|---|
+| memlim4, the arenas' default | 3 of 3 | | 48K-268K | 39K-234K | 0-1,876,136 |
+| memlim4t, the threshold kept | 2 of 3 | | 643K-657K | 618K-624K | 1,995,580-1,995,652 |
+| memlim4t2, and looks in idle time | 8 of 8 | 5.08M-5.32M | 619K-799K | 607K-673K | 1,995,582-1,995,784 |
+
+With no limit, against land9 (memhalf2's binary), median ratios (rounds won):
+
+| 10M, 12 rounds | fill | gets | seeks | settled gets | settled seeks |
+|---|---|---|---|---|---|
+| memlim4 | 1.01x (7) | 1.02x (8) | 1.01x (8) | 1.01x (7) | 1.01x (9) |
+| memlim4t | 1.01x (8) | 0.99x (4) | 1.01x (7) | 1.01x (7) | 1.02x (8) |
+
+| 100M, 6 rounds | fill | gets | seeks | settled gets | settled seeks | resident |
+|---|---|---|---|---|---|---|
+| land9 | | | | | | 36-37 GB |
+| memlim4 | 0.99x (2) | 0.95x (0) | 0.98x (1) | 0.96x (1) | 1.00x (3) | 38-40 GB |
+| memlim4t | 1.01x (4) | 1.01x (4) | 1.06x (6) | 1.00x (3) | 1.08x (6) | 36-37 GB |
+
+The spare bound alone (memlim4) gave memory back that glibc kept: 2-3 GB more resident and 5 % of
+the gets at 100M. With the threshold kept, what the engine gives back leaves the process.
+
+The longest puts are not the looks. A trace of every rotation and packing (stallm, never merged:
+three runs with no limit, three in 24 GiB) put each stall of 300 ms or more on a packing's wait for
+its writes, 0.69-0.83 s once each for three packings at once (research/58 §8's journal waits); no
+look took more than 24 ms.

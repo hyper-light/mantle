@@ -4,7 +4,8 @@
 //! next look lowers the budget to what the shard holds less what the machine lacks: the kept
 //! memtables give their memory back and the caches are trimmed at once, so the regions and the
 //! kept memtables hold no more than the lower budget. When the machine frees memory again the
-//! budget returns to its bound. Every read stays exact throughout.
+//! budget returns to its bound. Idle maintenance looks at the machine as the workers' results
+//! come back, so the budget falls with no write to rotate. Every read stays exact throughout.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -158,8 +159,36 @@ fn a_budget_that_follows_the_machine_gives_memory_back_when_the_machine_runs_sho
 
     // The machine frees memory: the budget returns to its bound.
     FREE.store(1 << 40, Ordering::Relaxed);
-    run(&mut db, &mut oracle, x, 1);
+    x = run(&mut db, &mut oracle, x, 1);
     assert_eq!(db.budget(), Some(BOUND), "the machine has memory again");
+
+    // The machine runs short with no write to rotate: idle maintenance looks at it as the
+    // workers' results come back, and the budget falls with no rotation.
+    x = run(&mut db, &mut oracle, x, 1);
+    assert!(db.owed(), "nothing owed to wait on");
+    FREE.store(0, Ordering::Relaxed);
+    let rotations = db.stats().0.rotations;
+    while db.owed() {
+        db.idle_step(64).unwrap();
+    }
+    assert_eq!(db.stats().0.rotations, rotations, "a rotation in idle time");
+    assert!(
+        db.budget().unwrap() < BOUND,
+        "idle maintenance never looked at the machine"
+    );
+    let (cache, write, records) = db.memory_held();
+    assert!(
+        db.trimming() || held(&db) <= db.budget().unwrap(),
+        "held {} above the budget {}: cache {cache} write {write} records {records} kept {} ({} memtables) index {:?} split {:?}",
+        held(&db),
+        db.budget().unwrap(),
+        db.stats().0.kept_bytes,
+        db.stats().0.kept,
+        db.index_bytes(),
+        db.memory_split()
+    );
+    FREE.store(1 << 40, Ordering::Relaxed);
+    run(&mut db, &mut oracle, x, 1);
     let mut value = Vec::new();
     for (k, v) in &oracle {
         assert!(db.get(&key(*k), &mut value).unwrap(), "key {k} lost");

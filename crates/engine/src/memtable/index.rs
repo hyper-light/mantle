@@ -163,14 +163,23 @@ pub struct KeyIndex {
 }
 
 impl KeyIndex {
-    /// An index whose table holds `entries` at most half full, the size a migration starts
-    /// (`rebuild`): a memtable that fills to as many entries as the one before it neither grows
-    /// nor migrates, as a cleared one refilled does not.
+    /// An index whose table holds `entries` under its rebuild threshold, `7/8` of its buckets: a
+    /// memtable that fills to as many entries as the one before it neither grows nor migrates,
+    /// as a cleared one refilled does not. A migration starts its new table at most half full
+    /// (`rebuild`), for the writes the migration spans; a table made for a fill spans none, and
+    /// at half full a 64 MiB memtable's table was 2^21 buckets for 0.56M entries, 10 MiB a put
+    /// probes at random, where 2^20 holds them (at 54% a group of eight is full one time in
+    /// 140, so a probe still reads one).
     pub fn for_entries(entries: usize) -> Result<Self, Error> {
         if entries == 0 {
             return Ok(Self::default());
         }
-        let want = entries.saturating_mul(2).max(GROUP);
+        let want = entries
+            .saturating_mul(8)
+            .checked_div(7)
+            .unwrap_or(entries)
+            .saturating_add(1)
+            .max(GROUP);
         let buckets = want.checked_next_power_of_two().unwrap_or(want);
         Ok(Self {
             table: Table::new(buckets)?,

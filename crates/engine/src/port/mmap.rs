@@ -675,8 +675,11 @@ impl Drop for HugeZeroed {
 /// §15). No populate at mapping: the first touch of a chunk is a write, a worker's keep or a
 /// slot's making, which the kernel backs with a huge page itself. Elsewhere a heap buffer.
 pub struct PageBuf {
+    /// The mapping's first byte; dangling, aligned and never read, while nothing is mapped
+    /// (`mapped` 0), as an empty `Vec`'s is: every borrow is a slice of it with no test, a page
+    /// read's every access (a 1M seek's 220 instructions of tests, docs/research/64 §18).
     #[cfg(target_os = "linux")]
-    addr: Option<NonNull<u8>>,
+    addr: NonNull<u8>,
     #[cfg(target_os = "linux")]
     mapped: usize,
     #[cfg(not(target_os = "linux"))]
@@ -687,7 +690,8 @@ pub struct PageBuf {
 
 // SAFETY: the mapping (on Linux) is owned by this value alone, read through `&self` and written
 // through `&mut self` only, so moving it to another thread or sharing it cannot race; it is
-// unmapped only in `drop`, when no borrow of it is left. Elsewhere it is a `Vec<u8>`.
+// unmapped only in `drop`, when no borrow of it is left; a dangling `addr` (nothing mapped) is
+// never read. Elsewhere it is a `Vec<u8>`.
 unsafe impl Send for PageBuf {}
 // SAFETY: as for `Send`: shared access is read-only.
 unsafe impl Sync for PageBuf {}
@@ -712,7 +716,7 @@ impl PageBuf {
     pub const fn new() -> Self {
         Self {
             #[cfg(target_os = "linux")]
-            addr: None,
+            addr: NonNull::dangling(),
             #[cfg(target_os = "linux")]
             mapped: 0,
             #[cfg(not(target_os = "linux"))]
@@ -749,7 +753,7 @@ impl PageBuf {
             };
         }
         Some(Self {
-            addr: Some(addr),
+            addr,
             mapped,
             len: 0,
             capacity,
@@ -799,18 +803,18 @@ impl PageBuf {
         else {
             return false;
         };
+        // SAFETY: `end` is at most `capacity`, which is at most the `mapped` bytes this value
+        // owns, so the `src.len()` bytes from `len` lie inside the mapping (none, from a dangling
+        // `addr`, when nothing is mapped: `capacity` is then 0); `src` is a borrow of other
+        // memory, so the two do not overlap; the `&mut self` keeps any other borrow of the mapping
+        // out.
         #[cfg(target_os = "linux")]
-        {
-            let Some(addr) = self.addr else {
-                return src.is_empty();
-            };
-            // SAFETY: `end` is at most `capacity`, which is at most the `mapped` bytes this value
-            // owns, so the `src.len()` bytes from `len` lie inside the mapping; `src` is a borrow
-            // of other memory, so the two do not overlap; the `&mut self` keeps any other borrow
-            // of the mapping out.
-            unsafe {
-                std::ptr::copy_nonoverlapping(src.as_ptr(), addr.as_ptr().add(self.len), src.len());
-            }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr(),
+                self.addr.as_ptr().add(self.len),
+                src.len(),
+            );
         }
         #[cfg(not(target_os = "linux"))]
         self.heap.extend_from_slice(src);
@@ -825,14 +829,16 @@ impl PageBuf {
             return false;
         }
         #[cfg(target_os = "linux")]
-        if len > self.len
-            && let Some(addr) = self.addr
-        {
-            // SAFETY: `len` is at most `capacity`, inside the `mapped` bytes this value owns, so
-            // the bytes from the old length to `len` lie inside the mapping; `&mut self` keeps any
-            // other borrow of it out.
+        if len > self.len {
+            // SAFETY: `len` is at most `capacity`, inside the `mapped` bytes this value owns (a
+            // `capacity` of 0 never passes the test above), so the bytes from the old length to
+            // `len` lie inside the mapping; `&mut self` keeps any other borrow of it out.
             unsafe {
-                std::ptr::write_bytes(addr.as_ptr().add(self.len), 0, len.saturating_sub(self.len));
+                std::ptr::write_bytes(
+                    self.addr.as_ptr().add(self.len),
+                    0,
+                    len.saturating_sub(self.len),
+                );
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -843,16 +849,14 @@ impl PageBuf {
 
     /// The bytes written.
     pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: `addr` starts a live mapping of `mapped` bytes, at least `len`, unmapped only in
+        // `drop`, which this borrow of `self` keeps from running; its first `len` bytes were
+        // written (`extend_from_slice`, `resize_zeroed`), and writes need `&mut self`, which this
+        // borrow excludes. With nothing mapped `len` is 0, and a dangling, aligned, non-null
+        // pointer is a valid start for an empty slice (`slice::from_raw_parts`).
         #[cfg(target_os = "linux")]
-        {
-            match self.addr {
-                // SAFETY: `addr` starts a live mapping of `mapped` bytes, at least `len`, unmapped
-                // only in `drop`, which this borrow of `self` keeps from running; its first `len`
-                // bytes were written (`extend_from_slice`, `resize_zeroed`), and writes need
-                // `&mut self`, which this borrow excludes.
-                Some(addr) => unsafe { std::slice::from_raw_parts(addr.as_ptr(), self.len) },
-                None => &[],
-            }
+        unsafe {
+            std::slice::from_raw_parts(self.addr.as_ptr(), self.len)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -862,13 +866,10 @@ impl PageBuf {
 
     /// The bytes written, to change in place.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: as for `as_slice`, and `&mut self` makes this the mapping's only borrow.
         #[cfg(target_os = "linux")]
-        {
-            match self.addr {
-                // SAFETY: as for `as_slice`, and `&mut self` makes this the mapping's only borrow.
-                Some(addr) => unsafe { std::slice::from_raw_parts_mut(addr.as_ptr(), self.len) },
-                None => &mut [],
-            }
+        unsafe {
+            std::slice::from_raw_parts_mut(self.addr.as_ptr(), self.len)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -880,11 +881,12 @@ impl PageBuf {
 impl Drop for PageBuf {
     fn drop(&mut self) {
         #[cfg(target_os = "linux")]
-        if let Some(addr) = self.addr.take() {
+        if self.mapped > 0 {
             // SAFETY: unmaps exactly the `mapped` bytes this value mapped, which no borrow
             // outlives (`as_slice` borrows `self`). A failure leaves them mapped: nothing can act
             // on it in a drop.
-            let _ = unsafe { rustix::mm::munmap(addr.as_ptr().cast(), self.mapped) };
+            let _ = unsafe { rustix::mm::munmap(self.addr.as_ptr().cast(), self.mapped) };
+            self.mapped = 0;
         }
     }
 }

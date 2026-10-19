@@ -648,3 +648,25 @@ cache would save; and the same build with its files opened for direct I/O (r6611
 cache sits beside the shard's cache, every compaction read goes to the device, and the cache may
 take the memory the page cache held. Each run samples the kernel's huge page faults and
 fallbacks, compaction stalls and direct reclaim beside it (`memsample2.sh`).
+
+## 18. A seek's instructions under loan chunks
+
+pagebuf (2495fb6d) seeks 3.8% slower than cand (43cd9c15) at 10M, in all 8 of the gate's rounds,
+and 6.5% slower at 1M (r6551-r6568, medians 1.27M against 1.36M at 1M, 1.08M against 1.12M at
+10M). The two differ only in the cache and its memory (§13-§15). Callgrind counts each build's
+instructions exactly over the same 2M seeks of 10 rows at 1M (the box, one CPU, rustix through
+libc for valgrind: 199be215 and e30e36eb, never merged): 21.17G against 21.75G, 289 more a seek
+(2.7%), and where:
+
+| a seek's instructions | cand | pagebuf | what |
+|---|---|---|---|
+| a page buffer's borrow | 0 | ~220 | `PageBuf::as_slice` tests its optional mapping at every page access, where a `Vec`'s borrow is a slice |
+| the chunk of a landing's slot | 26 | 72 | `touch_page` searches the chunks' starts, and loan chunks of a huge page each made them many |
+| idle time's reserve | 0 | ~78 | `unreserved` reckons the slots reads could make even when none is owed |
+
+Each is work the shard does where it need not. A page buffer's pointer now dangles, aligned and
+never read, while nothing is mapped, as an empty `Vec`'s does, so a borrow is a slice with no
+test; an extent's hint names the chunk holding its pages beside the slot (a word more an
+extent), so a landing that the hint finds starts its page's first line from that chunk's place
+with no search; and the reserve that runs after every operation asks nothing of the chunks
+when no slot is owed.

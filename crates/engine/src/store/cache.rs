@@ -179,6 +179,17 @@ enum Held {
     Refilled,
 }
 
+/// An extent's hint: the slot its first page would hold were its pages in a row as a loan keeps
+/// them, plus the extent's pages, so a row that starts before the cache's first slot has one too
+/// and the slot is never 0; and the chunk holding them, so a landing starts the page's first line
+/// from the chunk's place with no search of the chunks' starts, which loan chunks of a huge page
+/// each made long (46 more of a 1M seek's instructions, docs/research/64 §18).
+#[derive(Clone, Copy, Debug)]
+struct Hint {
+    slot: NonZeroU32,
+    chunk: u32,
+}
+
 /// A page cache of at most `limit` pages.
 #[derive(Debug)]
 pub struct Cache {
@@ -251,16 +262,16 @@ pub struct Cache {
     loan_room: u64,
     loan_kept: u64,
     loan_missed: u64,
-    /// The store's pages an extent, and each extent's slot hint ([`Self::hint`]): where its
-    /// pages lie were they in a row as a loan keeps them. One word an extent, at most one a
-    /// store extent, so a landing reads it from a line the CPU holds where the index's control
-    /// word and bucket are a miss each at scale.
+    /// The store's pages an extent, and each extent's hint ([`Self::hint`]): where its pages lie
+    /// were they in a row as a loan keeps them, and the chunk holding them. Two words an extent,
+    /// at most one hint a store extent, so a landing reads it from a line the CPU holds where the
+    /// index's control word and bucket are a miss each at scale.
     extent_pages: u64,
     /// `extent_pages`' power of two, when it is one: an address's extent and its place in it by
     /// a shift and a mask, where a division was ten to forty cycles on every cached read's hint
     /// and every page counted.
     extent_shift: Option<u32>,
-    hints: Vec<Option<NonZeroU32>>,
+    hints: Vec<Option<Hint>>,
     /// Each extent's pages cached, while `counted`: an extent with none has no page for a forget
     /// to find, and a grant's, a freed extent's or an adopted page's forget skips its probes (a
     /// 100M fill's grants probed 16.6M addresses and found 5.8M cached; adoption's probe found
@@ -990,7 +1001,7 @@ impl Cache {
                 {
                     self.release(old);
                 }
-                self.hint(address, i);
+                self.hint(address, i, c);
                 live = live.saturating_add(1);
             }
             self.loan_kept = self
@@ -1231,8 +1242,8 @@ impl Cache {
     /// the slot and the page (445 ns of a 10M seek's 1.1 µs placing; research/61 §2); the index
     /// read in pairs leaves two, the hint one.
     fn slot_touched(&self, address: u64) -> Option<usize> {
-        if let Some(i) = self.hinted(address) {
-            self.touch_page(i);
+        if let Some((i, c)) = self.hinted(address) {
+            self.touch_in(i, c);
             // The test `page_at` makes: a slot live at the address is the page's one slot, every
             // removal from the index clearing `live` and every insert forgetting the page first.
             if self
@@ -1255,12 +1266,19 @@ impl Cache {
     /// keeps (its slots in a row from its first, a page apart: `make_slot`, `adopt`), so the
     /// page's miss overlaps the slot's.
     fn touch_page(&self, i: usize) {
-        let c = self
+        if let Some(c) = self
             .starts
             .partition_point(|&first| first <= i)
-            .checked_sub(1);
-        if let Some(c) = c
-            && let (Some(&first), Some(chunk)) = (self.starts.get(c), self.chunks.get(c))
+            .checked_sub(1)
+        {
+            self.touch_in(i, c);
+        }
+    }
+
+    /// [`Self::touch_page`] for slot `i` in chunk `c`, as an extent's hint names it: no read
+    /// where the slot is not in that chunk, as when the hint is stale.
+    fn touch_in(&self, i: usize, c: usize) {
+        if let (Some(&first), Some(chunk)) = (self.starts.get(c), self.chunks.get(c))
             && let Some(byte) = i
                 .checked_sub(first)
                 .and_then(|k| k.checked_mul(self.page))
@@ -1270,36 +1288,35 @@ impl Cache {
         }
     }
 
-    /// The slot `address`'s extent hint names for it, holding the page or not.
-    fn hinted(&self, address: u64) -> Option<usize> {
+    /// The slot `address`'s extent hint names for it, holding the page or not, and its chunk.
+    fn hinted(&self, address: u64) -> Option<(usize, usize)> {
         let extent = self.extent_of(address)?;
         let hint = (*self.hints.get(extent)?)?;
         let within = self.within(address)?;
-        let i = u64::from(hint.get())
+        let i = u64::from(hint.slot.get())
             .checked_add(within)?
             .checked_sub(self.extent_pages)?;
-        usize::try_from(i).ok()
+        Some((usize::try_from(i).ok()?, usize::try_from(hint.chunk).ok()?))
     }
 
-    /// Names slot `i`, a loan's page at `address`, as its extent's place: a job writes an
-    /// extent's pages in a row (`Store::write_page_paced`) and a loan keeps them in a row, so the
-    /// extent's other pages lie in the slots beside it. The hint is the slot the extent's first
-    /// page would hold plus the extent's pages, so a row that starts before the cache's first
-    /// slot has one too, and a hint is never 0. The hints grow to the extent, which the store's
-    /// own extents bound; a hint the memory refuses is not kept, the index finding the page as
-    /// before.
-    fn hint(&mut self, address: u64, i: usize) {
+    /// Names slot `i` of chunk `c`, a loan's page at `address`, as its extent's place: a job
+    /// writes an extent's pages in a row (`Store::write_page_paced`) and a loan keeps them in a
+    /// row, so the extent's other pages lie in the slots beside it ([`Hint`]). The hints grow to
+    /// the extent, which the store's own extents bound; a hint the memory refuses is not kept, the
+    /// index finding the page as before.
+    fn hint(&mut self, address: u64, i: usize, c: usize) {
         let (Some(extent), Some(within)) = (self.extent_of(address), self.within(address)) else {
             return;
         };
-        let hint = u64::try_from(i)
+        let slot = u64::try_from(i)
             .ok()
             .and_then(|i| i.checked_add(self.extent_pages)?.checked_sub(within))
             .and_then(|h| u32::try_from(h).ok())
             .and_then(NonZeroU32::new);
-        let Some(hint) = hint else {
+        let (Some(slot), Ok(chunk)) = (slot, u32::try_from(c)) else {
             return;
         };
+        let hint = Hint { slot, chunk };
         if let Some(len) = extent.checked_add(1)
             && len > self.hints.len()
         {
@@ -1621,12 +1638,13 @@ impl Cache {
     /// Slots wanted and not made: the pages inserted since [`Self::reserve`] last caught up that
     /// the free slots do not cover, within the limit; none while chunks retire.
     pub fn unreserved(&self) -> usize {
-        if self.retiring.is_some() {
+        let owed = self.wanted.saturating_sub(self.free.len());
+        // Nothing owed, the common case of the idle step after every operation, asks nothing of
+        // the chunks (a 1M seek's 78 instructions, docs/research/64 §18).
+        if owed == 0 || self.retiring.is_some() {
             return 0;
         }
-        self.wanted
-            .saturating_sub(self.free.len())
-            .min(self.makeable())
+        owed.min(self.makeable())
     }
 
     /// Slots reads could still make: the last chunk's room not yet made, when reads made it, and
@@ -1805,7 +1823,7 @@ mod tests {
         c.adopt(k);
         for a in 3..11u64 {
             assert!(c.hinted(a).is_some(), "page {a} has no hint");
-            assert_eq!(c.hinted(a), c.slot_of(a), "page {a}");
+            assert_eq!(c.hinted(a).map(|(i, _)| i), c.slot_of(a), "page {a}");
             let i = c.lookup_held(a).unwrap();
             assert_eq!(c.page_at(i, a), Some(&page(a)[..]));
         }
@@ -1816,7 +1834,7 @@ mod tests {
         assert_eq!(c.slot_peek(5), None);
         c.insert(5, b"again");
         let i = c.lookup_held(5).unwrap();
-        assert_ne!(c.hinted(5), Some(i));
+        assert_ne!(c.hinted(5).map(|(i, _)| i), Some(i));
         assert_eq!(c.page_at(i, 5), Some(&b"again"[..]));
         // The loan's pages all forgotten, its chunk lent again and filled with another extent's
         // pages: the old extents' hints name slots that now hold those.

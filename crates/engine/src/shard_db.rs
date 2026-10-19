@@ -116,6 +116,21 @@ enum KeptAnswer {
     Unknown,
 }
 
+/// What one generation of the kept index answers for a key, as the kept memtables' answer: a
+/// record, its value into `value`; unknown, its memtable given back, the trunk holding the record;
+/// none when the generation does not hold the key, for the next to be asked.
+fn kept_answer(answer: crate::kept_table::Answer<'_>, value: &mut Vec<u8>) -> Option<KeptAnswer> {
+    match answer {
+        crate::kept_table::Answer::Record(op, v) => {
+            value.clear();
+            value.extend_from_slice(v);
+            Some(KeptAnswer::Found(op))
+        }
+        crate::kept_table::Answer::Absent => None,
+        crate::kept_table::Answer::Unknown => Some(KeptAnswer::Unknown),
+    }
+}
+
 /// A memtable kept readable for gets: the memtable until both indexes hold its records (then it
 /// is read no more and its memory goes back), its number among the kept ones (`crate::kept`
 /// numbers them by a counter that wraps), and the records its list held, which giving it back
@@ -4306,20 +4321,18 @@ impl<F: BlockFile> ShardDb<F> {
             return Ok(KeptAnswer::Absent);
         };
         // The open generation, then the closed ones, newest first: the first that holds the key
-        // holds its newest record.
-        let generations = index
-            .into_iter()
-            .chain(self.kept_gens.iter().rev().map(|g| &g.index));
-        for index in generations {
-            match index.get(hash32, key, oldest) {
-                crate::kept_table::Answer::Record(op, v) => {
-                    value.clear();
-                    value.extend_from_slice(v);
-                    return Ok(KeptAnswer::Found(op));
+        // holds its newest record. The closed ones are walked only when there are any: most gets
+        // read the open generation alone.
+        if let Some(index) = index
+            && let Some(answer) = kept_answer(index.get(hash32, key, oldest), value)
+        {
+            return Ok(answer);
+        }
+        if !self.kept_gens.is_empty() {
+            for g in self.kept_gens.iter().rev() {
+                if let Some(answer) = kept_answer(g.index.get(hash32, key, oldest), value) {
+                    return Ok(answer);
                 }
-                crate::kept_table::Answer::Absent => {}
-                // Its memtable was given back: the trunk holds the record.
-                crate::kept_table::Answer::Unknown => return Ok(KeptAnswer::Unknown),
             }
         }
         Ok(KeptAnswer::Absent)

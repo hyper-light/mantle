@@ -390,3 +390,35 @@ Over memhuge3 the smaller table's 100M gets ran 0.97-0.98x (`r6041..r6052`, 3-5 
 faster) though no get reads a memtable's index once the fill is flushed: every function of the
 get path lies 28 bytes later in its binary, the size of the change before it, and an A/A of
 layout alone moves a 100M phase 3-4% (research/61 §4).
+
+## 11. A get in the steady state a fill leaves
+
+A 1M get, exactly (fairq 7dc6ee63 under callgrind, a Debian container on the box, collection over
+the gets phase and its untimed replay, 7.9M gets; `bench/cgget/cg.1341`): about 1,069
+instructions a get with the bench's own work, its engine path about 741 of them: the client's
+`get_async` 177, the shard's `Inline::get` (its calm checks) 119, `kept_get` 145, the slot's probe
+139 with `holds` 32 and a `memcmp` 23, the key's hash 28. On the box the get took 926 cycles (177
+ns) at 1.18 instructions a cycle, with 1.9 fills from memory: the slot's line pair, read once
+(§1). In the VM it took 216 ns, and SplinterDB's 675: four times SplinterDB is 169 ns.
+
+Once a fill is flushed, every get finds what `kept_get` was written for gone: no memtable holds an
+entry, the index is one generation, home, and its part for the key covers the newest kept
+memtable. `kept_get` still builds what the general case needs (the part's covered number through
+an `Option` chain over the generations, a walk of the kept memtables from the newest that stops
+at once, an iterator chaining the open generation before the closed ones) before its one probe.
+`ShardDb::get_steady` checks those conditions, with `get_calm`'s, in loads of fields, then makes
+the probe; any condition failing leaves the get to `get_calm` and `lookup` as before, and the key's
+hash, computed once by `get_now`, goes with it. Where a closed generation exists, `kept_get` asks
+the open one and then the closed ones newest first with no iterator built over them.
+
+| 1M gets, exact (callgrind) | fairq | the closed ones' loop | and the steady get |
+|---|---|---|---|
+| `kept_get`, a get | 145 | 110 | 0 |
+| `Inline::get` (with the steady get) | 119 | 119 | 104 |
+| `get_async` | 177 | 169 | 168 |
+| the probe, `holds`, `memcmp` | 195 | 192 | 191 |
+
+The probe itself was tried with its header read once into a fixed array and keys compared a word
+at a time (`util::keys::equal`): 185 instructions against 183, the fields it no longer checked one
+by one paid for in the struct it built (probe f4591e07, reverted). The time of a get with these is
+measured beside fairq, an A/A of layout and RocksDB in queue-d4-90.

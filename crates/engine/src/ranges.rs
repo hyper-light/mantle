@@ -1166,6 +1166,11 @@ impl Ranges {
 
     /// The range that holds `key`.
     fn range_of(&self, key: &[u8]) -> usize {
+        // One range holds every key: no start to compare it with (78 of a 10M put's 1,446
+        // instructions went to the comparison).
+        if self.starts.len() <= 1 {
+            return 0;
+        }
         self.starts
             .partition_point(|s| s.as_slice() <= key)
             .saturating_sub(1)

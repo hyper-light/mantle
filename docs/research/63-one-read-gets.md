@@ -235,3 +235,116 @@ record, `r` a memtable's records over its measured fill.
 **Generations.** A generation closes only with every part home. Its parts may hold different
 memtables; giving it back gives back the memtables through the newest any part holds, so no key
 is answered from a newer part whose older record went with it.
+
+## 7. Resizing in place
+
+**The populate held the mmap lock.** A table's mapping is faulted in for writing when it is made
+(§4). One `madvise(MADV_POPULATE_WRITE)` over gigabytes held the process's mmap lock for reading
+for the whole call: `madvise_populate` (Linux v6.12 mm/madvise.c) drops it only for a fault that
+retries. A huge page's fault in a `MADV_HUGEPAGE` range may also reclaim and compact memory before
+it maps; that is the `defrag` setting's `madvise` and `defer+madvise` modes
+(Documentation/admin-guide/mm/transhuge.rst). For that whole time every mapping change in the
+process waited, including the shard's next memtable, whose arena it maps. On the box at 100M
+(pinned to 8 CPUs, the host's page cache full), every shard step of 100 ms or more lay inside a
+worker's populate of the same length. Populated a huge page at a time, the lock is held for one
+huge page's fault:
+
+| box, 100M, land2 with stamps | worst put, 4 rounds | shard steps of 100 ms or more | runs |
+|---|---|---|---|
+| one populate a table | 423, 341, 311, 1,752 ms | 6 a run, each inside a populate | `r351..r354` |
+| a huge page at a time | 45, 48, 881, 6,893 ms | none | `r351..r354` |
+
+The two long worst puts left were not single steps: they were rotations that waited many steps on
+workers, whose populates took twice as long once the shard ran beside them (5.1-10.7 s of
+populate a run, against 2.7-5.2 s). Each growth built a new table and populated it. A 100M fill's
+four parts went through ten steps of 1.5x each, from 0.04 to 3.3 GB, and populated 37.9 GB to
+hold 13.3 GB; a part's last growth held 2.2 GB beside 3.3 GB.
+
+**In place.** A table's slots hold its records in their homes' order, but for the run at its
+start that wrapped around its end. A home scales with the table (Lemire's reduction of the place:
+`home = place * slots >> 32`), so in a larger table no record's home is before the one it had,
+and in a smaller one none is after. Take that run out (the records from slot 0 to the first slot
+that is empty or holds a record at its home): what is left is each record at its home or just
+after the one before it. A record's slot in the resized table is then its new home or just after
+the last record's, so:
+
+- in a larger table, no record's slot is before the one it lies in, and the records move back to
+  front once the mapping has grown;
+- in a smaller or swept one, none is after, and they move front to back before it shrinks.
+
+Each record moves once, and the run is placed again last, by the insert. This holds only if the
+records of one home are also in their places' order. Robin Hood keeps a run in its homes' order
+but leaves ties in the order the records came. Grown, two records of one old home can have new
+homes the other way round, and moved in their old order they left a gap a probe stopped at, a key
+then found twice. The insert now puts a record before the first one of its home with a later
+place.
+
+**From a huge page's boundary.** On Linux the mapping resizes with mremap(2): its pages move with it
+and nothing is copied. Moved where the kernel chose, though, the tables lost their huge pages. The
+kernel moves a huge page whole only between two addresses both on its boundary, and splits it into
+base pages otherwise (Linux v6.12 mm/mremap.c, `move_page_tables`). A 10M run held 75% of its
+resident bytes on huge pages, against 94% for tables built new (box, `r471`, `r461`), and at 100M
+the gets ran 0.81x (`r391..r396`). The mapping now starts on a huge page's boundary. It grows in
+place where the address space after it is free, nothing moving; otherwise it moves onto a
+reservation from a boundary, so each huge page moves whole. Its length is whole huge pages where a
+huge page is at most an eighth of it, and pages where one is larger: on a 64 KiB-page kernel a huge
+page is 512 MiB. Rounded to pages alone, each table's last huge page stayed on base pages, and the
+10M settled gets ran 0.96x those of tables built new (VM, `r5701..r5706`, 0/6); whole, the tables
+are all on huge pages (box, `r631`, `r641`) and the settled gets ran 1.07x and the first 1.05x those
+rounded to pages (6/6 each). Elsewhere a new mapping takes a copy, and the growth a trip reserves
+counts it.
+
+| box, 100M | populated a run | populate a run | the tables on huge pages | gets, vs a new table | runs |
+|---|---|---|---|---|---|
+| a new table each growth | 37.9 GB | 2.7-10.7 s | 100% | | `r351..r354`, `r561` |
+| in place, moved where the kernel chose | 13.3 GB | 0.95-1.3 s | (70% of all memory) | 0.81x settled, 0.91x first | `r391..r412`, `r491` |
+| in place, from a huge page's boundary | as above | as above | 97% | 1.01x settled, 1.01x first | `r521..r526`, `r571` |
+
+The tables' share is from each mapping's `AnonHugePages` (`/proc/PID/smaps`) as a 100M fill ends.
+The rest of the process's memory, memtables and the page cache, held 70-71% of its bytes on huge
+pages for both builds. That share moved from run to run with the host's free memory, and an
+earlier whole-process reading put it at 76% against 95%.
+
+## 8. The first gets after a fill
+
+A put forgets the cache's pages of the extents compactions freed, in shares over the room the
+trunk's work frees them in. The last compactions free theirs after the last put. A flush finished
+the packing and the trunk's work but left those pages, and the idle slices forgot them during the
+first gets after a fill: about 287K pages at 10M, and those gets ran 0.79-0.89 of the settled
+ones in most rounds. The flush now forgets them, a slice at a time, as part of the maintenance
+the writes owe:
+
+| land3 vs the flush forgetting | first gets | their CPU | idle units, first phase | flush | runs |
+|---|---|---|---|---|---|
+| 10M | 1.08x (6/6) | 0.82x (6/6) | 287K -> 0 | +30-60 ms | `r5611..r5616` |
+| 100M | 1.24x (4/6) | 0.77x (4/6) | 0.19-0.74M -> 0 | | `r5621..r5626` |
+
+At 100M the first gets still ran 0.54-0.89 of the settled ones: the parts out merging the last
+memtables, which a get of their keys skips for the trunk (§6).
+
+## 9. The memory look after every read
+
+The shard looks at what its kept memtables and their indexes hold after every get, scan and
+trunk charge (`kept_crowded`), so that after any operation they and the caches stay within the
+budget. With the index in parts, the look summed every part's table of every generation each time.
+Under callgrind over a 10M seek phase (200K seeks of 10 rows after 1M gets; `native-ab/cg/
+cgphase-seekrandom-*`, normalized by `Trie::floor` calls, 742 instructions each in both builds),
+the sum was 201 instructions a look and a seek made 2.6 looks: 523 of a seek's 10,959
+instructions, 4.8%, where main 63098c7's look summed three fields. The 10M seeks ran 0.95x main
+(`r5651..r5656`, 0/6) once the index came in.
+
+An index now keeps its home tables' bytes in a field: a part taken out subtracts its table's, a
+part put back adds its own, and an extension, made only without workers, counts again once, its
+merges all made or one refused. A table home changes size only through these.
+
+| 10M, `r5761..r5766` | seeks | seeks, settled |
+|---|---|---|
+| the field over the sum (land8 over landg) | 1.06x (4/6) | 1.03x (3/6) |
+| over main 63098c7 | 1.00x (3/6) | 0.99x (3/6) |
+
+The look at whether maintenance is owed (`owed_with`), made after an inline operation that is not
+a calm get while the range is not already marked owed, is the rest: 145 instructions a look, and
+in the same profiles 157K looks in the phase against main's 8K, 1.3% of a seek. With the flush
+now paying the writes' debts (§8), nothing is owed during a seek phase, so each look runs every
+clause and finds none. A scan can make work owed (its rents, the cache's slots), so the look
+stays.

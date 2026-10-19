@@ -356,3 +356,62 @@ kernel pauses a writer over its dirty limits up to 200 ms at a time (`balance_di
 Writeback, so they cannot tell that throttle from the device's own queue. Two runs decide it: a
 traced run that samples Dirty and Writeback beside the waits (inside-diag3.sh does), and the
 direct-I/O A/B, whose writes dirty no page cache for the throttle to count.
+
+**What the writes wait on.** Both runs are in, and neither is the throttle. Direct I/O
+(`d_fill6`, fill6's files opened past the page cache, against the same build buffered,
+`runs/n*-r5541..r5556`) slowed the fills and lengthened the tail:
+
+| direct over buffered | fill | gets | a round's worst fill, direct | buffered |
+|---|---|---|---|---|
+| 10M | 0.79×, 0/6 | 0.98×, 2/6 | 6-1,228 ms | 5-13 ms |
+| 100M | 0.83×, 2/6 | 0.94×, 3/6 | 299-1,520 ms | 19-155 ms |
+
+Traced beside a 100M fill in a privileged container (landf 2d6504c with diagnostics, stallf
+8c69059: each packing's sort, walk, finish, its thread's CPU and its write waits; `writeback:
+balance_dirty_pages` pauses of 10 ms or more; bpftrace off-CPU sleeps of 10 ms or more of the
+bench's threads with their kernel stacks, and `jbd2:jbd2_run_stats`; `native-ab/dirty/`,
+`runs/n100000000-r5711..r5731`), no writer was throttled during any fill: Dirty peaked at 966K
+pages (3.7 GB) against a throttle point near 1.7M, and the 21 pauses, 27-32 ms each, came in the
+flush after the fill. The packings that ran long ran their usual CPU and waited once on their
+writes, as before:
+
+| packing | wall | CPU | write waits |
+|---|---|---|---|
+| r5712, the longest | 541 ms | 134 ms | 1, 407 ms |
+| r5712 | 539 ms | 131 ms | 1, 408 ms |
+| r5711, the longest | 444 ms | 136 ms | 1, 308 ms |
+| median of 356 | 123 ms | 122 ms | none |
+
+The device's threads (`hyper-io`) slept in ext4. A buffered write takes its file's inode lock
+exclusively and updates the file's modification time; the update takes the inode's block in the
+journal, and while a commit is writing that block the writer waits, holding the lock, and every
+other thread writing the same segment waits for the lock (Linux v6.12 `fs/ext4/file.c`
+`ext4_buffered_write_iter`, `fs/jbd2/transaction.c` `do_get_write_access`). The commits were slow
+because their journal writes queued behind the data's writeback in the device's queue: one in the
+flush logged 15 blocks in 416 ms. The volume is ext4 with `data=ordered`, `delalloc` and
+`commit=5` (the VM's `/dev/vda1`).
+
+| a 100M fill's sleeps of 10 ms or more, `hyper-io` (r5731) | sleeps | total | longest |
+|---|---|---|---|
+| the inode's lock in a buffered write | 27 | 1,737 ms | 88 ms |
+| a timestamp's journal access | 9 | 681 ms | 88 ms |
+| the descriptor table growing on an open | 13 | 146 ms | 12 ms |
+
+A file growth adds a second wait. A segment is made whole by `fallocate`, `fdatasync` and the
+directory's `fsync` (hyper-block `segmented.rs` `made_whole`), and each forces a commit. In r5721
+a rotation stalled 720 ms with 13 of 17 workers idle: a growth was out, the store had fewer free
+extents than the next packing asks, and the packing before it had waited 785 ms of its walk for
+extents. Every stall in r5711 and r5712 also began with a growth out and ended once it was in.
+
+**Measured and not kept: writeback started at each write** (wbhint ed6a92f, landf with
+`sync_file_range(SYNC_FILE_RANGE_WRITE)` after every buffered write, as RocksDB's `bytes_per_sync`
+does it; `runs/n*-r5741..r5756`, 6 rounds a size against landf):
+
+| | 10M | 100M |
+|---|---|---|
+| fill | 0.83×, 0/6 | 0.87×, 0/6 |
+| stalls a run | 0 | 8-13, against 0-1 |
+| a round's worst fill | 4-16 ms, against 5-7 | 196-661 ms, against 19-413 |
+
+The device's threads waited in the call instead, for room in the device's queue: at 100M this
+disk does not take the fill's writes as they come, and the page cache holds them until after it.

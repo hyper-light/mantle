@@ -39,6 +39,10 @@ pub fn older(a: u32, b: u32) -> bool {
 pub struct KeptIndex {
     /// Each part's table, none while it is out.
     parts: Vec<Option<RecordTable>>,
+    /// The bytes the tables of the parts home take, kept as parts go out and come back, so the
+    /// look at the shard's memory after every get and scan reads a field: summed over every part
+    /// it was 201 instructions a look, and a 10M seek makes 2.6 looks, 5% of its instructions.
+    held: usize,
     bits: u32,
     /// The newest memtable each part's table holds the records of, none before its first.
     covers: Vec<Option<u32>>,
@@ -53,12 +57,15 @@ pub struct KeptIndex {
 impl KeptIndex {
     /// An empty index of `2^bits` parts, the shard's `id`th.
     pub fn new(bits: u32, id: u64) -> Self {
-        let parts = 1usize.checked_shl(bits).unwrap_or(1);
+        let count = 1usize.checked_shl(bits).unwrap_or(1);
+        let parts: Vec<Option<RecordTable>> =
+            (0..count).map(|_| Some(RecordTable::part(bits))).collect();
         Self {
-            parts: (0..parts).map(|_| Some(RecordTable::part(bits))).collect(),
+            held: held_by(&parts),
+            parts,
             bits,
-            covers: vec![None; parts],
-            swept_at: vec![0; parts],
+            covers: vec![None; count],
+            swept_at: vec![0; count],
             id,
         }
     }
@@ -138,11 +145,7 @@ impl KeptIndex {
 
     /// The bytes the tables of the parts home take.
     pub fn bytes(&self) -> usize {
-        self.parts
-            .iter()
-            .flatten()
-            .map(RecordTable::bytes)
-            .fold(0, usize::saturating_add)
+        self.held
     }
 
     /// The newest record of `key`, of 32-bit filter hash `hash32`, among the memtables its part
@@ -188,6 +191,7 @@ impl KeptIndex {
     /// none for a part already out. With `sweep`, the part is noted swept at `gone`.
     pub fn take_part(&mut self, part: usize, sweep: Option<u64>) -> Option<RecordTable> {
         let table = self.parts.get_mut(part)?.take()?;
+        self.held = self.held.saturating_sub(table.bytes());
         if let (Some(gone), Some(at)) = (sweep, self.swept_at.get_mut(part)) {
             *at = gone;
         }
@@ -197,7 +201,9 @@ impl KeptIndex {
     /// Part `part`'s table, back from its worker holding the records of memtables up to `covers`.
     pub fn put_part(&mut self, part: usize, table: RecordTable, covers: Option<u32>) {
         if let Some(p) = self.parts.get_mut(part) {
-            *p = Some(table);
+            let came = table.bytes();
+            let went = p.replace(table).map_or(0, |t| t.bytes());
+            self.held = self.held.saturating_sub(went).saturating_add(came);
         }
         if let (Some(c), Some(slot)) = (covers, self.covers.get_mut(part)) {
             *slot = Some(c);
@@ -209,6 +215,18 @@ impl KeptIndex {
     /// than on workers: for a shard without them, and tests. On an error (memory refused) the
     /// index holds some of the lists' records and must be dropped, not served.
     pub fn extend(
+        &mut self,
+        lists: &[(u32, KeyList)],
+        oldest: u32,
+        sweep: bool,
+    ) -> Result<(), Error> {
+        let extended = self.extend_parts(lists, oldest, sweep);
+        // The tables resized in place, whether every merge was made or one was refused.
+        self.held = held_by(&self.parts);
+        extended
+    }
+
+    fn extend_parts(
         &mut self,
         lists: &[(u32, KeyList)],
         oldest: u32,
@@ -238,6 +256,15 @@ impl KeptIndex {
     }
 }
 
+/// The bytes the tables home among `parts` take.
+fn held_by(parts: &[Option<RecordTable>]) -> usize {
+    parts
+        .iter()
+        .flatten()
+        .map(RecordTable::bytes)
+        .fold(0, usize::saturating_add)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,7 +292,8 @@ mod tests {
         /// four parts, through the index's own extend or part by part as trips take them (a key
         /// of a part out answered unknown), the numbers running past the counter's wrap, each
         /// list offered twice, and memtables given back with a sweep, which drops exactly the
-        /// records whose newest memtable was given back.
+        /// records whose newest memtable was given back. The bytes it reports are its home
+        /// tables' after every part's move.
         #[test]
         fn it_holds_each_key_s_newest_record_among_the_memtables_it_covers(
             batches in prop::collection::vec(
@@ -307,6 +335,7 @@ mod tests {
                         let covers = index.covers(part);
                         let mut table = index.take_part(part, None).unwrap();
                         prop_assert!(index.is_out(part));
+                        prop_assert_eq!(index.bytes(), held_by(&index.parts));
                         if let Some(k) = model.keys().find(|k| index.part_of(h(k)) == part) {
                             prop_assert_eq!(index.get(h(k), k, start), Answer::Unknown);
                         }
@@ -316,6 +345,7 @@ mod tests {
                             }
                         }
                         index.put_part(part, table, lists.last().map(|(n, _)| *n));
+                        prop_assert_eq!(index.bytes(), held_by(&index.parts));
                     }
                 } else {
                     index.extend(&lists, start, false).unwrap();
@@ -326,6 +356,7 @@ mod tests {
                 }
                 prop_assert_eq!(index.covers_all(), Some(next.wrapping_sub(1)));
                 prop_assert_eq!(index.out(), 0);
+                prop_assert_eq!(index.bytes(), held_by(&index.parts));
                 prop_assert!(index.len() >= before);
             }
             for (k, (_, v)) in &model {
@@ -334,6 +365,7 @@ mod tests {
             // Give back the oldest `gone` memtables: the sweep drops their records, no other.
             let oldest = start.wrapping_add(gone);
             index.extend(&[], oldest, true).unwrap();
+            prop_assert_eq!(index.bytes(), held_by(&index.parts));
             for (k, (n, v)) in &model {
                 let got = index.get(h(k), k, oldest);
                 if older(*n, oldest) {

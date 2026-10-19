@@ -321,6 +321,13 @@ struct Follow {
     /// resident memory less the budget's regions, the kept memtables and the memtables in flight
     /// (workers' buffers, the allocator's free lists, other shards' growth).
     grew_most: usize,
+    /// The process's memory stall count ([`crate::port::pressure`]), the window it is read over,
+    /// and the ceiling a window stalled past its allowance puts on the budget: a tuning step under
+    /// what the shard held, raised a step each quiet window until it no longer binds
+    /// (docs/research/64 §16).
+    stalls: fn() -> Option<u64>,
+    window: Option<StallWindow>,
+    ceiling: Option<usize>,
 }
 
 /// One retained durability operation. Its index and phases survive a canceled borrowed wait.
@@ -561,6 +568,56 @@ const TUNE_DONOR_PERCENT: usize = 10;
 /// Cited (Luo & Carey, PVLDB 2021 §5.4): the Newton step fits the cost's slope to the last
 /// three allocations.
 const TUNE_SAMPLES: usize = 3;
+
+/// Cited (TMO, Weiner et al., ASPLOS 2022; facebookincubator/senpai `senpai.py`): the memory
+/// stall a window may hold before the budget gives memory back, the window, and the least time a
+/// decision is made over. Senpai holds a container where its "some" memory stall stays at
+/// `--pressure` 10*1000 microseconds a window of `--interval` 6 seconds, sampling once a second
+/// (`run`'s `time.sleep(1)`), and backs off on any second past that (docs/research/64 §16).
+const PRESSURE_STALL_US: u64 = 10_000;
+const PRESSURE_WINDOW: std::time::Duration = std::time::Duration::from_secs(6);
+const PRESSURE_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The process's memory stall count since a window began, and when it began
+/// ([`ShardDb::look_machine`], docs/research/64 §16).
+#[derive(Clone, Copy, Debug)]
+struct StallWindow {
+    from_us: u64,
+    began: std::time::Instant,
+}
+
+/// What a reading says of its window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stalled {
+    /// The window held more stall than it allows: the budget steps down, a new window begins.
+    Over,
+    /// A whole window held no more: the ceiling steps up, a new window begins.
+    Quiet,
+    /// Neither, yet.
+    Within,
+}
+
+impl StallWindow {
+    /// The window a count of `now_us` read at `at` leaves, and what it says: nothing decided
+    /// before a tick has passed, so the budget steps down at most once a tick however often it
+    /// looks.
+    fn observe(self, now_us: u64, at: std::time::Instant) -> (Self, Stalled) {
+        let held = at.saturating_duration_since(self.began);
+        let next = Self {
+            from_us: now_us,
+            began: at,
+        };
+        if held < PRESSURE_TICK {
+            (self, Stalled::Within)
+        } else if now_us.saturating_sub(self.from_us) > PRESSURE_STALL_US {
+            (next, Stalled::Over)
+        } else if held >= PRESSURE_WINDOW {
+            (next, Stalled::Quiet)
+        } else {
+            (self, Stalled::Within)
+        }
+    }
+}
 
 /// The last allocations between one pair of regions and how much more a byte the first saved
 /// than the second at each, for the Newton step: research/36, the paper's `K` of them.
@@ -1326,19 +1383,22 @@ impl<F: BlockFile> ShardDb<F> {
             budget,
             shares,
             hyper_rt::machine::facts::Facts::memory_available_now,
+            crate::port::pressure::memory_stalled_us,
         )
     }
 
     /// Sizes the shard to a machine whose free memory `read` gives: a budget of at most `bound`,
     /// the shard's share of the machine's capacity, which follows one of `shares` of the memory
     /// the machine leaves free as reads and writes run ([`Self::look_machine`]), and the page
-    /// cache growing only while the machine has the memory ([`Self::follow_machine`] reads the
-    /// host's facts for both).
+    /// cache growing only while the machine has the memory; and gives memory back while `stalls`,
+    /// the microseconds the process's tasks have waited for memory, grows past its allowance
+    /// ([`Self::follow_machine`] reads the host's facts for all three).
     pub fn follow(
         &mut self,
         bound: usize,
         shares: usize,
         read: fn() -> Option<u64>,
+        stalls: fn() -> Option<u64>,
     ) -> Result<(), Error> {
         self.store.follow_machine(read);
         self.set_memory(bound)?;
@@ -1348,6 +1408,9 @@ impl<F: BlockFile> ShardDb<F> {
             last: None,
             accepted: 0,
             grew_most: 0,
+            stalls,
+            window: None,
+            ceiling: None,
         });
         Ok(())
     }
@@ -1401,10 +1464,41 @@ impl<F: BlockFile> ShardDb<F> {
         }
         follow.last = Some((outside, now));
         follow.accepted = self.trunk.pool_accepted();
+        // The memory the process's tasks waited for over the window (docs/research/64 §16): past
+        // its allowance the budget's ceiling falls a tuning step under what the shard holds, and
+        // each quiet window raises it a step, until it no longer binds.
+        let stalled = (follow.stalls)().map(|now_us| match follow.window {
+            Some(w) => {
+                let (w, said) = w.observe(now_us, now);
+                follow.window = Some(w);
+                said
+            }
+            None => {
+                follow.window = Some(StallWindow {
+                    from_us: now_us,
+                    began: now,
+                });
+                Stalled::Within
+            }
+        });
+        match stalled {
+            Some(Stalled::Over) => {
+                let step = held.saturating_mul(TUNE_STEP_PERCENT) / 100;
+                follow.ceiling = Some(held.saturating_sub(step));
+            }
+            Some(Stalled::Quiet) => {
+                follow.ceiling = follow.ceiling.and_then(|c| {
+                    let up = c.saturating_add(c.saturating_mul(TUNE_STEP_PERCENT) / 100);
+                    (up < follow.bound).then_some(up)
+                });
+            }
+            Some(Stalled::Within) | None => {}
+        }
         let budget = held
             .saturating_add(free.checked_div(follow.shares).unwrap_or(0))
             .saturating_sub(follow.grew_most)
             .min(follow.bound)
+            .min(follow.ceiling.unwrap_or(usize::MAX))
             .max(floor);
         let Some(was) = self.memory.filter(|&m| m != budget) else {
             return;
@@ -5570,6 +5664,43 @@ mod tune_tests {
             tune(m, m / 2, m, gain(1, 1), gain(u64::MAX, usize::MAX)),
             m / 2
         );
+    }
+}
+
+#[cfg(test)]
+mod stall_tests {
+    //! The stall window decides nothing before a tick, steps down once a tick at most while the
+    //! stall passes its allowance, and calls a whole window with no more quiet.
+    use super::{PRESSURE_STALL_US, PRESSURE_TICK, PRESSURE_WINDOW, StallWindow, Stalled};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_window_steps_down_once_a_tick_past_its_allowance_and_is_quiet_after_a_whole_one() {
+        let t0 = Instant::now();
+        let w = StallWindow {
+            from_us: 1_000,
+            began: t0,
+        };
+        // A stall past the allowance before a tick has passed decides nothing.
+        let early = t0 + PRESSURE_TICK - Duration::from_millis(1);
+        let (w, said) = w.observe(1_000 + PRESSURE_STALL_US + 1, early);
+        assert_eq!(said, Stalled::Within);
+        assert_eq!(w.from_us, 1_000);
+        // At a tick it is over, and a window begins from that count.
+        let tick = t0 + PRESSURE_TICK;
+        let count = 1_000 + PRESSURE_STALL_US + 1;
+        let (w, said) = w.observe(count, tick);
+        assert_eq!(said, Stalled::Over);
+        assert_eq!((w.from_us, w.began), (count, tick));
+        // The allowance itself is no step: within, until the window has passed.
+        let (w, said) = w.observe(count + PRESSURE_STALL_US, tick + PRESSURE_TICK);
+        assert_eq!(said, Stalled::Within);
+        let (w, said) = w.observe(count + PRESSURE_STALL_US, tick + PRESSURE_WINDOW);
+        assert_eq!(said, Stalled::Quiet);
+        assert_eq!(w.began, tick + PRESSURE_WINDOW);
+        // A count that runs backward, a group changed, is no stall.
+        let (_, said) = w.observe(0, tick + PRESSURE_WINDOW + PRESSURE_TICK);
+        assert_eq!(said, Stalled::Within);
     }
 }
 

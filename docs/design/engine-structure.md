@@ -295,7 +295,12 @@ when it binds, and is measured then.
      has passed or, in idle time, whenever a worker's message has come back, it becomes what the
      regions and kept memtables hold plus the shard's share of the free memory, less the most the
      process's memory outside the account grew between two looks; the kept memtables give memory
-     back and the caches are trimmed to it at once. A loan's spare memory is bounded by the most
+     back and the caches are trimmed to it at once. Where the kernel counts the time the
+     process's tasks wait for memory (Linux PSI, the cgroup's `memory.pressure`), a window of 6 s
+     whose stall passes 10 ms, TMO's Senpai's allowance, caps the budget a tuning step under what
+     the shard holds, and each quiet window lifts the cap a step (research/64 §16): the free
+     memory a look reads counts reclaimable cache, and a 1B fill held the VM's swap full and every
+     task stalled 7-17% of the time under a budget that only stopped growing. A loan's spare memory is bounded by the most
      the loans have had out at once, and the node's process keeps glibc's mmap threshold at its
      initial value, so memory the engine frees leaves the process. A fresh
      memtable's index is sized for the entries the one before it held under its rebuild

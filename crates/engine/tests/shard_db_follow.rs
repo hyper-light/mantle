@@ -46,6 +46,14 @@ fn free() -> Option<u64> {
     Some(FREE.load(Ordering::Relaxed))
 }
 
+/// The microseconds the process's tasks have stalled on memory, as the test sets it: the only
+/// reader of it is [`stalls`].
+static STALLS: AtomicU64 = AtomicU64::new(0);
+
+fn stalls() -> Option<u64> {
+    Some(STALLS.load(Ordering::Relaxed))
+}
+
 fn key(k: u64) -> Vec<u8> {
     format!("bucket-{}/obj-{k:06}", k % 5).into_bytes()
 }
@@ -119,7 +127,7 @@ fn a_budget_that_follows_the_machine_gives_memory_back_when_the_machine_runs_sho
     let path = dir.path().join("store");
     let mut db = ShardDb::create(open(&path, true), STORE, MEM, TRUNK).unwrap();
     FREE.store(1 << 40, Ordering::Relaxed);
-    db.follow(BOUND, 1, free).unwrap();
+    db.follow(BOUND, 1, free, stalls).unwrap();
     workers(&mut db, &path);
     let mut oracle = Oracle::new();
     let mut x = 0x5851_f42d_4c95_7f2du64;
@@ -189,6 +197,67 @@ fn a_budget_that_follows_the_machine_gives_memory_back_when_the_machine_runs_sho
     );
     FREE.store(1 << 40, Ordering::Relaxed);
     run(&mut db, &mut oracle, x, 1);
+    let mut value = Vec::new();
+    for (k, v) in &oracle {
+        assert!(db.get(&key(*k), &mut value).unwrap(), "key {k} lost");
+        assert_eq!(&value, v, "key {k}");
+    }
+}
+
+/// The second test's machine: its own free memory and stall count, since tests run at once.
+static FREE_2: AtomicU64 = AtomicU64::new(1 << 40);
+static STALLS_2: AtomicU64 = AtomicU64::new(0);
+
+fn free_2() -> Option<u64> {
+    Some(FREE_2.load(Ordering::Relaxed))
+}
+
+fn stalls_2() -> Option<u64> {
+    Some(STALLS_2.load(Ordering::Relaxed))
+}
+
+/// A machine that reports memory free while the process's tasks stall on memory, as when the
+/// kernel swaps the shard's own pages out (docs/research/64 §16): once a window's stall passes
+/// its allowance, the budget falls a tuning step under what the shard holds and the shard gives
+/// the memory back, though the free memory read never fell. Every read stays exact.
+#[test]
+fn a_budget_gives_memory_back_while_the_process_stalls_on_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let mut db = ShardDb::create(open(&path, true), STORE, MEM, TRUNK).unwrap();
+    db.follow(BOUND, 1, free_2, stalls_2).unwrap();
+    workers(&mut db, &path);
+    let mut oracle = Oracle::new();
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    x = run(&mut db, &mut oracle, x, 40);
+    assert_eq!(db.budget(), Some(BOUND), "a machine with memory to spare");
+
+    // The tasks stall 20 ms a rotation: the first look a tick after the window began finds the
+    // window past its allowance. Bounded by rotations, each a look.
+    let mut rotations = 0u64;
+    let held_before = loop {
+        let held_now = held(&db);
+        STALLS_2.fetch_add(20_000, Ordering::Relaxed);
+        x = run(&mut db, &mut oracle, x, 1);
+        rotations += 1;
+        if db.budget().unwrap() < BOUND {
+            break held_now;
+        }
+        assert!(
+            rotations < 1_000_000,
+            "the budget never fell under a stalling machine"
+        );
+    };
+    let budget = db.budget().unwrap();
+    assert!(
+        budget <= held_before,
+        "budget {budget} above the {held_before} the shard held before the stall"
+    );
+    assert!(
+        db.trimming() || held(&db) <= budget,
+        "held {} above the budget {budget}",
+        held(&db)
+    );
     let mut value = Vec::new();
     for (k, v) in &oracle {
         assert!(db.get(&key(*k), &mut value).unwrap(), "key {k} lost");

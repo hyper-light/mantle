@@ -533,3 +533,50 @@ six rounds of three arms):
 | pagebuf b80151ce | 7.20M | 4.81M | 1,105K | 1,068-1,114K |
 
 The seeks are back to 0.97× cand's, every round above hollowio's.
+
+## 16. The machine stalling on memory under a full budget
+
+A traced 1B fill of pagebuf (spantot-p 45e429ab, never merged; `diag-runs/n1000000000-r5301-t_stp1b`,
+426 s, 2.35M puts a second), with the VM's memory sampled every 5 s beside it
+(`-mem.txt`, `-mem2.txt`: `/proc/pressure/memory`, `/proc/vmstat`, `/proc/meminfo`; a sample
+across the sampler's restart is left out):
+
+| seconds into the run | all tasks stalled on memory | swapped out | swapped in | major faults | swap free |
+|---|---|---|---|---|---|
+| 119-259 (the fill) | 86-171 ms a second | 19-143 MB/s | 2-91 MB/s | 336-7,479/s | 0-1.1 of 4.2 GB |
+| 286-395 (the fill) | 74-97 ms a second | 4-8 MB/s | 4-7 MB/s | 421-693/s | none |
+| 601-784 (the reads) | 2-4 ms a second | none | 0-4.5 MB/s | 2-816/s | 3.5 GB |
+
+Through the fill every task in the VM waited on memory 7-17% of the time, the swap full; the
+engine's anonymous memory stood at 56-62 GB of the VM's 65.7. The container's own cgroup counted
+26.0 s of "some" memory stall in the run, 25.2 s of "full" (`memory.pressure`). §14's candidate
+took 1.1M major faults in its run against fairq's 0.27M. The budget (§7) follows what the shard
+holds and a share of the free memory the machine reports: when the free memory runs out it stops
+growing, but nothing in it gives memory back when the kernel reclaims the engine's own pages and
+swaps them.
+
+The same trace's spans name the shard's part of a 1B put (ns a put, the fill's 426):
+
+| shard work | ns a put | a span |
+|---|---|---|
+| paying maintenance shares (the trunk's steps 65.7, forgetting 11.2, packs 10.5) | 90.2 | 10.3 µs |
+| applying jobs' results (dead branches dropped 16.2, loans adopted 12.0) | 31.5 | |
+| a loan's pages into the cache | 14.7 | 795 µs |
+| lending a job memory | 14.6 | 722 µs |
+| granting a job extents | 6.9 | 342 µs |
+| puts waiting on a full memtable (115) | 36.4 | 316 ms |
+| the client yielding to the shard's maintenance | 112.2 | 12.8 µs |
+
+**Pressure in the budget.** Linux measures what a cgroup's tasks lose to memory shortage directly:
+pressure stall information, a cumulative count of the microseconds at least one of the group's
+tasks waited for memory ("some") in `memory.pressure` (kernel `Documentation/accounting/psi.rst`;
+research/25 [PSI]). TMO (Weiner et al., "TMO: Transparent Memory Offloading in Datacenters",
+ASPLOS 2022) sizes containers' memory from it: its controller, Senpai, holds a container where its
+"some" stall stays at 10 ms in every 6 s (facebookincubator/senpai, `senpai.py`: `--pressure`
+10*1000 microseconds, `--interval` 6 seconds; it backs off on any window past that). The budget
+now reads the process's cgroup's `memory.pressure` (the system's `/proc/pressure/memory` where the
+process has no cgroup v2 path with one) at each look. A window in which the stall passed 10 ms
+lowers a ceiling on the budget to one tuning step (5%, §7's step, Luo & Carey) under what the
+shard holds, and the caches and kept memtables give that memory back at once (§7's fall); each
+6 s window with less raises the ceiling a step, until it no longer binds. Elsewhere than Linux
+there is no reading, and the budget is §7's.

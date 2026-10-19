@@ -427,3 +427,47 @@ holds. The chunks' room, spare and lent pages, which `room`, `shed_spare` and `o
 over every chunk, are kept as fields, with tens of thousands of chunks a cache at 1B. The cache's
 40,000-step test checks the fields against those sums, and the retirement invariant (§11), after
 every step, with loans in buffers of two pages.
+
+## 13. Hollow chunks' slots and a cache that stopped taking pages
+
+The same trace past the fill (r801; sizes in GiB, as the diagnostic prints them): the cache's
+live pages are 7,624,385 at the fill's end, after the gets, after the seeks and after the
+tombstones, while the gets read 383,890 pages from the device, the seeks 803,861 more, the cache
+stands 17.5 under its limit and the machine has 20 free.
+
+| s | phase | cache / limit | live | dead | spare | machine free |
+|---|---|---|---|---|---|---|
+| 548 | the fill's flush | 54.8 / 54.8 | 40.9 | 12.7 | 0 | 2.4 |
+| 609 | the gets | 37.2 / 54.7 | 29.1 | 4.9 | 3.2 | 20.2 |
+| 851 | the seeks' end | 37.2 / 54.7 | 29.1 | 4.9 | 3.2 | 20.0 |
+
+A read's insert takes a free slot or makes one (`make_now`), and idle time makes the slots the
+reads asked for (`reserve`, up to `unreserved`). Both counted the slot table's length against the
+limit. A chunk whose memory goes back, spare beyond the loans' need (§8) or to a lowered limit,
+keeps its slots in the table, since slots are indexed from it by every later chunk. With live
+pages under the limit and none inserted, the table held at least the limit's 14.34M slots where
+the chunks held 9.76M pages: at least 4.6M slots, 17.5 GiB, of memory the fill's last forgetting
+had given back, counted as if the cache still held it. From then on no read made a slot: every
+page the gets, seeks and tombstones read was left out.
+
+The same slots were never used again. A loan's fresh memory always came back as new chunks, each
+adding its slots (56 bytes a page) to the table, so the table grew with every page of fresh loan
+memory over the process's life, with no bound.
+
+Both are fixed at their cause ([`Cache::lend`], `make_now`, `unreserved`):
+
+- The limit holds the chunks' room. A read makes a slot while the last read-made chunk has room
+  not yet made or a new chunk fits under the limit (`make_slot`), and idle time makes as many;
+  past the limit, until `trim` brings the room down, neither does.
+- A loan's fresh memory fills hollow chunks' slots first, a whole chunk each, before any new
+  buffer, and a new buffer is lent only once no hollow chunk is left. A refilled chunk counts as
+  fresh room until it comes back. When a loan adds a chunk, then, the loans' chunks' slots are
+  the memory those chunks and the loans out hold, at most the limit; read-made slots are within
+  the chunks' room: the table stays within twice the largest limit. The bench prints it
+  (`cache_slots`). The price: room under the limit short of the next hollow chunk's slots, at
+  most a loan chunk (2 MiB on Linux), lends no fresh memory. A chunk refilled in part would keep
+  its unused slots for as long as it lives, and nothing would bound how many such chunks the
+  table holds.
+
+Two tests reproduce the trace's two defects on the old code, and the cache's 40,000-step test
+checks the bound, and that every hollow chunk is listed for the next loan, after every step.

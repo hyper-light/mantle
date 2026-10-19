@@ -2247,7 +2247,7 @@ impl<F: BlockFile> ShardDb<F> {
     /// The value `key` holds, into `value`; false when it holds none.
     pub fn get(&mut self, key: &[u8], value: &mut Vec<u8>) -> Result<bool, Error> {
         self.count_get();
-        self.lookup(key, value)
+        self.lookup(key, crate::branch::filter::hash(key), value)
     }
 
     /// [`Self::get`] made only if it can finish without waiting for the device or for a write
@@ -2259,12 +2259,17 @@ impl<F: BlockFile> ShardDb<F> {
         key: &[u8],
         value: &mut Vec<u8>,
     ) -> Result<Option<bool>, Error> {
-        if let Some(found) = self.get_calm(key, value)? {
+        // The key's filter hash, once for every place the get looks.
+        let hash = crate::branch::filter::hash(key);
+        if let Some(found) = self.get_steady(key, hash, value) {
+            return Ok(Some(found));
+        }
+        if let Some(found) = self.get_calm(key, hash, value)? {
             return Ok(Some(found));
         }
         self.calm = false;
         self.store.begin_no_wait();
-        let found = self.lookup(key, value);
+        let found = self.lookup(key, hash, value);
         let refused = self.store.end_no_wait();
         match found {
             Ok(found) => {
@@ -2309,6 +2314,58 @@ impl<F: BlockFile> ShardDb<F> {
         }
     }
 
+    /// A get the kept index answers by one probe, in the steady state a fill leaves: no memtable
+    /// holds an entry, the index is one generation, home, with no list owed it, its part for the
+    /// key covers the newest kept memtable, no region trims, and the tuning cycle does not end
+    /// with this get ([`Self::get_calm`]'s conditions). Its answer is the one `get_calm` gives
+    /// there through `kept_get`, without probing the empty memtables or walking the kept ones;
+    /// none when a condition fails, for `get_calm` and the full path.
+    #[inline]
+    fn get_steady(&mut self, key: &[u8], hash: u64, value: &mut Vec<u8>) -> Option<bool> {
+        if !self.kept_gens.is_empty()
+            || !self.kept_whole
+            || self.kept_out()
+            || !self.kept_lists.is_empty()
+            || self.trim_cache > 0
+            || self.trim_records > 0
+            || !self.mem.is_empty()
+            || self.packing.is_some()
+            || !self.frozen.is_empty()
+            || (self.memory.is_some() && self.ops_since.saturating_add(1) >= self.cycle_ops)
+        {
+            return None;
+        }
+        let index = self.kept_index.as_ref()?;
+        let newest = self.kept.back()?.number;
+        let oldest = self.kept.front()?.number;
+        let hash32 = crate::branch::filter::hash32(hash);
+        if index
+            .covers(index.part_of(hash32))
+            .is_none_or(|c| crate::kept::older(c, newest))
+        {
+            return None;
+        }
+        let found = match index.get(hash32, key, oldest) {
+            crate::kept_table::Answer::Record(op, v) => {
+                value.clear();
+                value.extend_from_slice(v);
+                self.kept_hits = self.kept_hits.saturating_add(1);
+                op == Op::Put
+            }
+            crate::kept_table::Answer::Absent => {
+                self.kept_absent = self.kept_absent.saturating_add(1);
+                value.clear();
+                false
+            }
+            crate::kept_table::Answer::Unknown => return None,
+        };
+        if self.memory.is_some() {
+            self.ops_since = self.ops_since.saturating_add(1);
+        }
+        self.calm = true;
+        Some(found)
+    }
+
     /// A get the memtables and the kept memtables answer whole, with nothing of the kept
     /// memtables out or to tend, no region trimming and the tuning cycle not ending: it reads
     /// the device for nothing and changes nothing the memory budget or maintenance looks at, so
@@ -2316,7 +2373,12 @@ impl<F: BlockFile> ShardDb<F> {
     /// operation, maintenance step and turn ends with those looks, and between them only an
     /// operation changes the engine. `None`, the get not made, when any of that does not hold
     /// or a key of the same hash leaves the trunk to answer: the full path ([`Self::lookup`]).
-    fn get_calm(&mut self, key: &[u8], value: &mut Vec<u8>) -> Result<Option<bool>, Error> {
+    fn get_calm(
+        &mut self,
+        key: &[u8],
+        hash: u64,
+        value: &mut Vec<u8>,
+    ) -> Result<Option<bool>, Error> {
         let cycle_ends =
             self.memory.is_some() && self.ops_since.saturating_add(1) >= self.cycle_ops;
         if !self.kept_whole
@@ -2329,7 +2391,6 @@ impl<F: BlockFile> ShardDb<F> {
         {
             return Ok(None);
         }
-        let hash = crate::branch::filter::hash(key);
         let mut found = None;
         if !self.mem.is_empty() {
             found = self.mem.get_hashed(key, hash, value)?;
@@ -2370,9 +2431,9 @@ impl<F: BlockFile> ShardDb<F> {
         self.calm
     }
 
-    fn lookup(&mut self, key: &[u8], value: &mut Vec<u8>) -> Result<bool, Error> {
-        // The key's filter hash, once for the memtables and every branch on its path.
-        let hash = crate::branch::filter::hash(key);
+    /// The full get of `key`, of filter hash `hash` (its caller's, once for every place the get
+    /// looks).
+    fn lookup(&mut self, key: &[u8], hash: u64, value: &mut Vec<u8>) -> Result<bool, Error> {
         // An empty memtable holds no key: its index is not probed.
         let mut found = if self.mem.is_empty() {
             None

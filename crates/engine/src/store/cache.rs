@@ -235,6 +235,10 @@ pub struct Cache {
     /// store extent, so a landing reads it from a line the CPU holds where the index's control
     /// word and bucket are a miss each at scale.
     extent_pages: u64,
+    /// `extent_pages`' power of two, when it is one: an address's extent and its place in it by
+    /// a shift and a mask, where a division was ten to forty cycles on every cached read's hint
+    /// and every page counted.
+    extent_shift: Option<u32>,
     hints: Vec<Option<NonZeroU32>>,
     /// Each extent's pages cached, while `counted`: an extent with none has no page for a forget
     /// to find, and a grant's, a freed extent's or an adopted page's forget skips its probes (a
@@ -307,6 +311,11 @@ impl Cache {
             loan_kept: 0,
             loan_missed: 0,
             extent_pages,
+            extent_shift: if extent_pages.is_power_of_two() {
+                Some(extent_pages.trailing_zeros())
+            } else {
+                None
+            },
             hints: Vec::new(),
             pages_in: Vec::new(),
             counted: true,
@@ -741,7 +750,6 @@ impl Cache {
                 std::hint::black_box(self.map.touch(address) ^ self.ghosts.touch(address));
             }
             for (k, &(address, len)) in these.iter().enumerate() {
-                self.forget(address);
                 let to_main = self.forget_ghost(address);
                 let queue = if to_main { Queue::Main } else { Queue::Small };
                 let i = first.saturating_add(k);
@@ -761,8 +769,18 @@ impl Cache {
                 };
                 self.count_in(address);
                 self.push(queue, i);
-                self.map
-                    .insert(address, u64::try_from(i).unwrap_or(u64::MAX));
+                // The page the address cached before, a read's or an earlier page of this loan,
+                // is the one the index's insert replaces: released by that one probe, where a
+                // forget probed the index for it first (adoption's 77 ns a page, research/58
+                // §8).
+                if let Some(old) = self
+                    .map
+                    .insert(address, u64::try_from(i).unwrap_or(u64::MAX))
+                    .and_then(|j| usize::try_from(j).ok())
+                    .filter(|&j| j != i)
+                {
+                    self.release(old);
+                }
                 self.hint(address, i);
                 live = live.saturating_add(1);
             }
@@ -1035,9 +1053,9 @@ impl Cache {
 
     /// The slot `address`'s extent hint names for it, holding the page or not.
     fn hinted(&self, address: u64) -> Option<usize> {
-        let extent = usize::try_from(address.checked_div(self.extent_pages)?).ok()?;
+        let extent = self.extent_of(address)?;
         let hint = (*self.hints.get(extent)?)?;
-        let within = address.checked_rem(self.extent_pages)?;
+        let within = self.within(address)?;
         let i = u64::from(hint.get())
             .checked_add(within)?
             .checked_sub(self.extent_pages)?;
@@ -1052,10 +1070,7 @@ impl Cache {
     /// own extents bound; a hint the memory refuses is not kept, the index finding the page as
     /// before.
     fn hint(&mut self, address: u64, i: usize) {
-        let (Some(extent), Some(within)) = (
-            address.checked_div(self.extent_pages),
-            address.checked_rem(self.extent_pages),
-        ) else {
+        let (Some(extent), Some(within)) = (self.extent_of(address), self.within(address)) else {
             return;
         };
         let hint = u64::try_from(i)
@@ -1063,7 +1078,7 @@ impl Cache {
             .and_then(|i| i.checked_add(self.extent_pages)?.checked_sub(within))
             .and_then(|h| u32::try_from(h).ok())
             .and_then(NonZeroU32::new);
-        let (Ok(extent), Some(hint)) = (usize::try_from(extent), hint) else {
+        let Some(hint) = hint else {
             return;
         };
         if let Some(len) = extent.checked_add(1)
@@ -1085,7 +1100,19 @@ impl Cache {
 
     /// The extent `address` lies in, as an index into the per-extent tables.
     fn extent_of(&self, address: u64) -> Option<usize> {
-        usize::try_from(address.checked_div(self.extent_pages)?).ok()
+        let extent = match self.extent_shift {
+            Some(shift) => address.checked_shr(shift)?,
+            None => address.checked_div(self.extent_pages)?,
+        };
+        usize::try_from(extent).ok()
+    }
+
+    /// `address`'s place within its extent.
+    fn within(&self, address: u64) -> Option<u64> {
+        match self.extent_shift {
+            Some(_) => Some(address & self.extent_pages.wrapping_sub(1)),
+            None => address.checked_rem(self.extent_pages),
+        }
     }
 
     /// Whether a page of `address`'s extent may be cached: no only where its count says none.
@@ -2118,6 +2145,17 @@ mod tests {
             for (e, &n) in c.pages_in.iter().enumerate() {
                 assert_eq!(n, live[e], "step {step}: extent {e}");
             }
+            // Each live slot is its address's one entry in the index, and each entry a live slot.
+            let entries = c.map.entries();
+            assert!(entries.iter().all(|&(a, i)| {
+                let i = usize::try_from(i).unwrap();
+                c.slots[i].live && c.slots[i].address == a
+            }));
+            assert_eq!(
+                entries.len(),
+                c.slots.iter().filter(|s| s.live).count(),
+                "step {step}"
+            );
         }
     }
 

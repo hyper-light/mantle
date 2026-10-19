@@ -1522,18 +1522,14 @@ impl Client<'_> {
         }
     }
 
-    /// Takes this client's turn before an operation made inline. An inline operation never waits,
-    /// so a client making them in a loop would hold its shard: after about the shard's quantum of
-    /// them, at the rate measured over the turn just ended (two reads of the shard's clock a turn),
-    /// it yields where the shard is wanted (`hyper_rt::futures::maybe_yield`), and the shard's other
-    /// tasks run, a range it left maintenance owed among them; where nothing else wants the shard, a
-    /// yield would only poll this client again, and it goes on.
-    async fn turn(&mut self) {
-        if let Some(left) = self.turn.left.checked_sub(1) {
-            self.turn.left = left;
-            self.turn.done = self.turn.done.saturating_add(1);
-            return;
-        }
+    /// Ends this client's turn before an operation made inline ([`Self::inline`] counts the
+    /// operations inside it). An inline operation never waits, so a client making them in a loop
+    /// would hold its shard: after about the shard's quantum of them, at the rate measured over the
+    /// turn just ended (two reads of the shard's clock a turn), it yields where the shard is wanted
+    /// (`hyper_rt::futures::maybe_yield`), and the shard's other tasks run, a range it left
+    /// maintenance owed among them; where nothing else wants the shard, a yield would only poll
+    /// this client again, and it goes on.
+    async fn end_turn(&mut self) {
         let (now, quantum) =
             hyper_rt::registry::with_current(|ctx| (ctx.now_ns(), ctx.quantum_ns()))
                 .unwrap_or((0, 0));
@@ -1557,7 +1553,14 @@ impl Client<'_> {
         op: impl FnOnce(&mut dyn Inline, u64) -> R,
     ) -> Option<R> {
         let task = self.inline_task(range)?;
-        self.turn().await;
+        // An operation inside the turn is counted here, with no future made for it: awaited, the
+        // turn cost 66 of a 10M put's 1,446 instructions though it ends one put in about 49.
+        if let Some(left) = self.turn.left.checked_sub(1) {
+            self.turn.left = left;
+            self.turn.done = self.turn.done.saturating_add(1);
+        } else {
+            self.end_turn().await;
+        }
         with_lent(task, op)
     }
 

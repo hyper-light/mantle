@@ -421,4 +421,26 @@ the open one and then the closed ones newest first with no iterator built over t
 The probe itself was tried with its header read once into a fixed array and keys compared a word
 at a time (`util::keys::equal`): 185 instructions against 183, the fields it no longer checked one
 by one paid for in the struct it built (probe f4591e07, reverted). The time of a get with these is
-measured beside fairq, an A/A of layout and RocksDB in queue-d4-90.
+measured below (§12).
+
+## 12. Four times SplinterDB at 1M is at the floor
+
+The gate (VM, `runs/n1000000-r6451..r6460`, ten rounds each, run7's balanced order, medians):
+
+| arm | gets a second | ns a get | vs SplinterDB |
+|---|---|---|---|
+| SplinterDB | 1.80M | 556 | 1.00 |
+| fairq 7dc6ee63 | 4.78M | 209 | 2.66 |
+| faa aa861c53 (fairq, layout shifted: an A/A) | 4.89M | 205 | 2.72 |
+| cand 43cd9c15 (the steady get) | 4.98M | 201 | 2.77 |
+
+The steady get's 145 instructions fewer (§11) are 1.04× over fairq and 1.02× over the A/A of
+layout. SplinterDB's own 1M gets, batch by batch since `r5801`, have medians of 1.66M, 1.77M,
+1.89M, 1.48M and 1.80M a second (602, 563, 530, 675 and 556 ns): four times SplinterDB is 132-151
+ns a get in four of the five batches, 169 ns in the slowest. §1's floor, the record's slot read
+and the bench's clock read with nothing else, is 142 ns at 10M; at 1M the table holds 632K records in
+128-byte slots at most 2/3 full, 121 MB or more, past the last-level cache, and the slot is
+still a read from memory. Four times SplinterDB at 1M asks a
+get to cost what its one read and its clock read cost alone: no path reaches it. The work a get
+has above the floor, about 60 ns (§4), halved would leave 171 ns: 3.3× against this batch's
+SplinterDB, 3.9× against the slowest.

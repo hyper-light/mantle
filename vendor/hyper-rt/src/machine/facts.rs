@@ -60,13 +60,15 @@ pub struct PageFacts {
 pub struct MemoryFacts {
     /// Physical memory in bytes.
     pub total: u64,
-    /// Memory available to a new allocation without reclaim, in bytes, as the OS estimates it.
+    /// Memory available to a new allocation without reclaim, in bytes, as the OS estimates it,
+    /// on Linux within the room the process's cgroups leave it ([`cgroup_room`]).
     pub available: u64,
     /// The width of a user address, in bits.
     pub address_bits: u32,
     /// The tightest bound an OS, job or cgroup sets on this process's memory, if any (§4.2
     /// "effective capacity ... constrained by OS/job/cgroup/lock limits"): on Linux the smallest
-    /// `memory.max` (cgroup v2) or `memory.limit_in_bytes` (v1) up the process's cgroup path, and on
+    /// `memory.max` or `memory.high` (cgroup v2: past the one the kernel kills, past the other it
+    /// throttles) or `memory.limit_in_bytes` (v1) up the process's cgroup path, and on
     /// every Unix a finite `RLIMIT_AS` or `RLIMIT_DATA`; Windows reports none yet (the job object's
     /// limit is owed). `None` when nothing binds; a bound above `total` is kept and clamped by
     /// [`effective_capacity`]. Absent from a profile written before the field existed.
@@ -95,6 +97,160 @@ pub fn parse_cgroup_limit(text: &str) -> Option<u64> {
 /// The tightest of several optional bounds.
 fn tightest(bounds: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
     bounds.into_iter().flatten().min()
+}
+
+/// A file's text, trimmed; none when it cannot be read. The cgroup files it reads are queries of
+/// the kernel, never disk reads.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn read_text(path: &str) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_owned())
+}
+
+/// The memory controller's cgroup directories a `/proc/self/cgroup` text places a process under, in
+/// the cgroup file system mounted at `mount` (`/sys/fs/cgroup`, v1's memory hierarchy at its
+/// `memory`), its own first and its namespace's root last, each marked when it is v1's: a line is
+/// `id:controllers:path`, v2's with no controllers (cgroup(7)), and a parent's limit binds its
+/// children, so every ancestor is listed. Lines naming neither are passed over.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn memory_dirs_of(cgroup: &str, mount: &str) -> Vec<(String, bool)> {
+    let mut dirs = Vec::new();
+    for line in cgroup.lines() {
+        // Format: three colon-separated fields (the path may itself hold no colon; the split is
+        // bounded to three so a hostile path cannot).
+        let mut fields = line.splitn(3, ':');
+        let (Some(_), Some(controllers), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let (root, v1) = if controllers.is_empty() {
+            (mount.to_owned(), false)
+        } else if controllers.split(',').any(|c| c == "memory") {
+            (format!("{mount}/memory"), true)
+        } else {
+            continue;
+        };
+        // Each step cuts the path at its last separator, so the walk ends at the root.
+        let mut dir = path.trim_end_matches('/').to_owned();
+        loop {
+            dirs.push((format!("{root}{dir}"), v1));
+            match dir.rfind('/') {
+                Some(cut) => dir.truncate(cut),
+                None => break,
+            }
+        }
+    }
+    dirs
+}
+
+/// The most a cgroup directory lets its processes hold before the kernel acts on them: v2's
+/// `memory.max`, past which it reclaims and then kills, and `memory.high`, past which it throttles
+/// them under heavy reclaim, the lower (cgroup-v2.rst; the ceiling the kernel measures a cgroup's
+/// headroom to, mm/memcontrol.c `mem_cgroup_wb_stats`); v1's `memory.limit_in_bytes`. None when no
+/// file there reads as a bound.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn memory_ceiling(dir: &str, v1: bool) -> Option<u64> {
+    let bound =
+        |file: &str| read_text(&format!("{dir}/{file}")).and_then(|t| parse_cgroup_limit(&t));
+    if v1 {
+        bound("memory.limit_in_bytes")
+    } else {
+        tightest([bound("memory.max"), bound("memory.high")])
+    }
+}
+
+/// The tightest memory limit a `/proc/self/cgroup` text's cgroups set, in the cgroup file system
+/// mounted at `mount`: the least ceiling ([`memory_ceiling`]) of the process's cgroup and every
+/// ancestor. None when none sets one or none can be read.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn least_ceiling(cgroup: &str, mount: &str) -> Option<u64> {
+    memory_dirs_of(cgroup, mount)
+        .iter()
+        .filter_map(|(dir, v1)| memory_ceiling(dir, *v1))
+        .min()
+}
+
+/// The least of `machine`, the OS's estimate of the memory the machine has for a new allocation,
+/// and the room each cgroup with a ceiling over the process leaves it ([`cgroup_room`]), from the
+/// cgroup's usage (`memory.current`, v1's `memory.usage_in_bytes`) and its `memory.stat`: a
+/// machine with memory free may have none the process's cgroups let it take. A cgroup's room is at
+/// least its headroom, the ceiling less the usage, so a cgroup whose headroom is no less than the
+/// least found binds nothing and its `memory.stat` is not read; one whose `memory.stat` cannot be
+/// read is its headroom, all the room known; one whose usage cannot be read lowers nothing.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn within_cgroups(machine: Option<u64>, cgroup: &str, mount: &str) -> Option<u64> {
+    let mut least = machine;
+    for (dir, v1) in memory_dirs_of(cgroup, mount) {
+        let Some(ceiling) = memory_ceiling(&dir, v1) else {
+            continue;
+        };
+        let usage = if v1 {
+            "memory.usage_in_bytes"
+        } else {
+            "memory.current"
+        };
+        let Some(usage) = read_text(&format!("{dir}/{usage}")).and_then(|t| parse_cgroup_limit(&t))
+        else {
+            continue;
+        };
+        // No headroom past the ceiling, as the kernel's own `min` gives none.
+        let headroom = ceiling.saturating_sub(usage);
+        if least.is_some_and(|l| headroom >= l) {
+            continue;
+        }
+        let room = read_text(&format!("{dir}/memory.stat"))
+            .and_then(|stat| cgroup_room(ceiling, usage, &stat, v1))
+            .unwrap_or(headroom);
+        least = tightest([least, Some(room)]);
+    }
+    least
+}
+
+/// The memory a cgroup leaves a new allocation, from its ceiling (the lower of `memory.max` and
+/// `memory.high`, v1's `memory.limit_in_bytes`), its usage (`memory.current`, v1's
+/// `memory.usage_in_bytes`) and its `memory.stat` text: the headroom under the ceiling, none past
+/// it, as the kernel measures a cgroup's headroom for its own dirty-memory bound (mm/memcontrol.c
+/// `mem_cgroup_wb_stats`), and the cgroup's file pages that are clean, which reclaim takes back
+/// before a charge to the cgroup fails, where dirty pages and pages under writeback wait to be
+/// written first (mm/page-writeback.c `mdtc_calc_avail` and `domain_dirty_avail`: the file pages
+/// less the dirty and writeback ones). `v1` reads v1's hierarchical counts (`total_active_file` and
+/// the rest; cgroup-v1/memory.rst §5.2). None when the text lacks a count or holds one that is not
+/// a byte count: a reading that cannot be made is none, never a guessed one.
+pub fn cgroup_room(ceiling: u64, usage: u64, stat: &str, v1: bool) -> Option<u64> {
+    let names = if v1 {
+        [
+            "total_active_file",
+            "total_inactive_file",
+            "total_dirty",
+            "total_writeback",
+        ]
+    } else {
+        [
+            "active_file",
+            "inactive_file",
+            "file_dirty",
+            "file_writeback",
+        ]
+    };
+    let [active, inactive, dirty, writeback] = names.map(|name| {
+        stat.lines()
+            .find_map(|line| {
+                let mut fields = line.split_whitespace();
+                (fields.next() == Some(name))
+                    .then(|| fields.next())
+                    .flatten()
+            })
+            .and_then(parse_cgroup_limit)
+    });
+    let file = active?.checked_add(inactive?)?;
+    let unclean = dirty?.checked_add(writeback?)?;
+    // Saturating as the kernel's own `min`s are: no headroom past the ceiling, and no clean pages
+    // when the dirty ones, counted at another instant, are more.
+    let headroom = ceiling.saturating_sub(usage);
+    let clean = file.saturating_sub(unclean);
+    headroom.checked_add(clean)
 }
 
 /// The CPU time a cgroup grants the process: `quota_us` microseconds of CPU in every `period_us`
@@ -268,9 +424,9 @@ pub struct Facts {
 pub(crate) use platform::process_affinity_mask;
 
 impl Facts {
-    /// Queries every fact from the OS.
-    /// Memory available to a new allocation right now, as the OS estimates it (one cheap query;
-    /// the pressure source of dynamic quotas asks this before each growth, §4.2).
+    /// Memory available to a new allocation right now, as the OS estimates it, on Linux within the
+    /// room the process's cgroups leave it (a few pseudo-file reads; the pressure source of dynamic
+    /// quotas asks this before each growth, §4.2).
     pub fn memory_available_now() -> Option<u64> {
         platform::available_bytes()
     }
@@ -695,9 +851,7 @@ mod platform {
 
     /// Reads a pseudo-file as text (a query of the kernel, never a disk read; R1's allowed site).
     fn read(path: &str) -> Option<String> {
-        std::fs::read_to_string(path)
-            .ok()
-            .map(|s| s.trim().to_owned())
+        super::read_text(path)
     }
 
     fn list(path: &str) -> Vec<String> {
@@ -927,57 +1081,23 @@ mod platform {
         }
     }
 
-    /// The tightest cgroup memory limit over this process (§4.2 "OS/job/cgroup limits"): the
-    /// process's cgroup path from `/proc/self/cgroup`, then `memory.max` (v2) or
-    /// `memory.limit_in_bytes` (v1) at that cgroup and every ancestor up to the root — a parent's
-    /// limit binds its children — the smallest numeric value found. None when no controller limits
+    /// Where the cgroup file system is mounted (cgroup(7); v1's memory hierarchy at its `memory`).
+    const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
+
+    /// The tightest cgroup memory limit over this process (§4.2 "OS/job/cgroup limits"): the least
+    /// ceiling of its cgroup and every ancestor up to the root ([`super::least_ceiling`] of
+    /// `/proc/self/cgroup`) — a parent's limit binds its children. None when no controller limits
     /// the process, or the files cannot be read (a query refused is no bound, never a guessed one).
     pub(super) fn cgroup_bound(notes: &mut Vec<String>) -> Option<u64> {
-        let cgroup = read("/proc/self/cgroup")?;
-        let mut bounds = Vec::new();
-        for line in cgroup.lines() {
-            // Format: a `/proc/self/cgroup` line is `id:controllers:path`, three colon-separated fields
-            // (the path may itself hold no colon; the split is bounded to three so a hostile path cannot).
-            let mut fields = line.splitn(3, ':');
-            let (Some(_), Some(controllers), Some(path)) =
-                (fields.next(), fields.next(), fields.next())
-            else {
-                continue;
-            };
-            let (root, file) = if controllers.is_empty() {
-                ("/sys/fs/cgroup", "memory.max")
-            } else if controllers.split(',').any(|c| c == "memory") {
-                ("/sys/fs/cgroup/memory", "memory.limit_in_bytes")
-            } else {
-                continue;
-            };
-            let mut dir = path.trim_end_matches('/').to_owned();
-            loop {
-                if let Some(bound) =
-                    read(&format!("{root}{dir}/{file}")).and_then(|t| super::parse_cgroup_limit(&t))
-                {
-                    bounds.push(bound);
-                }
-                match dir.rfind('/') {
-                    Some(0) | None => break,
-                    Some(cut) => dir.truncate(cut),
-                }
-            }
-            if let Some(bound) =
-                read(&format!("{root}/{file}")).and_then(|t| super::parse_cgroup_limit(&t))
-            {
-                bounds.push(bound);
-            }
-        }
-        let bound = bounds.into_iter().min();
+        let bound =
+            read("/proc/self/cgroup").and_then(|text| super::least_ceiling(&text, CGROUP_MOUNT));
         if let Some(bytes) = bound {
             notes.push(format!("cgroup memory limit {bytes} bytes"));
         }
         bound
     }
 
-    /// Memory available to a new allocation without reclaim, as the kernel estimates it now
-    /// (`MemAvailable` of `/proc/meminfo`).
+    /// This process's resident memory now: `/proc/self/statm`'s second field, in pages (proc(5)).
     pub(super) fn resident_bytes() -> Option<u64> {
         // `/proc/self/statm`: size, then resident, in pages (proc(5)).
         let pages: u64 = read("/proc/self/statm")?
@@ -988,12 +1108,20 @@ mod platform {
         pages.checked_mul(u64::try_from(rustix::param::page_size()).ok()?)
     }
 
+    /// Memory available to a new allocation now: the kernel's estimate for the machine
+    /// (`MemAvailable` of `/proc/meminfo`, which counts the page cache reclaim can take back,
+    /// proc(5)), within the room the cgroups over this process leave it
+    /// ([`super::within_cgroups`] of `/proc/self/cgroup`).
     pub(super) fn available_bytes() -> Option<u64> {
-        read("/proc/meminfo").and_then(|text| {
+        let machine = read("/proc/meminfo").and_then(|text| {
             text.lines()
                 .find_map(|l| l.strip_prefix("MemAvailable:"))
                 .and_then(parse_size)
-        })
+        });
+        match read("/proc/self/cgroup") {
+            Some(cgroup) => super::within_cgroups(machine, &cgroup, CGROUP_MOUNT),
+            None => machine,
+        }
     }
 
     pub(super) fn power(notes: &mut Vec<String>) -> PowerState {
@@ -1387,6 +1515,218 @@ mod tests {
         assert_eq!(effective_capacity(1 << 37, Some(1 << 40)), 1 << 37);
         assert_eq!(effective_capacity(1 << 37, None), 1 << 37);
         assert_eq!(effective_capacity(1 << 37, Some(0)), 0);
+    }
+
+    /// A cgroup's room is its headroom under the ceiling, none past it, and its file pages less
+    /// the dirty and writeback ones, none when those are more; v1 reads its hierarchical totals.
+    /// A text lacking a count, or with a count that is not a byte count, or a sum past `u64`, is
+    /// no reading: v2's text read as v1's is none, since its counts carry other names.
+    #[test]
+    fn a_cgroup_s_room_is_its_headroom_and_its_clean_file_pages() {
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
+        // The counts of a v2 `memory.stat`, in its order, among the names that share their words.
+        let v2 = |active: u64, inactive: u64, dirty: u64, writeback: u64| {
+            format!(
+                "anon {}\nfile {}\nfile_mapped 4096\nfile_dirty {dirty}\nfile_writeback {writeback}\n\
+                 inactive_anon 0\nactive_anon {}\ninactive_file {inactive}\nactive_file {active}\n\
+                 unevictable 0\n",
+                22 * GIB,
+                active + inactive,
+                22 * GIB,
+            )
+        };
+        let text = v2(300 * MIB, 500 * MIB, 100 * MIB, 50 * MIB);
+        assert_eq!(
+            cgroup_room(24 * GIB, 23 * GIB, &text, false),
+            Some(GIB + 650 * MIB)
+        );
+        // Past the ceiling only the clean file pages are room; with more dirty than file, none.
+        assert_eq!(
+            cgroup_room(24 * GIB, 25 * GIB, &text, false),
+            Some(650 * MIB)
+        );
+        let dirtier = v2(MIB, MIB, 2 * MIB, MIB);
+        assert_eq!(cgroup_room(24 * GIB, 24 * GIB, &dirtier, false), Some(0));
+        let v1 = "cache 8192\ndirty 4096\ntotal_dirty 4096\ntotal_writeback 0\n\
+                  total_inactive_file 8192\ntotal_active_file 4096\n";
+        assert_eq!(
+            cgroup_room(1 << 20, 1 << 19, v1, true),
+            Some((1 << 19) + 8192)
+        );
+        assert_eq!(cgroup_room(24 * GIB, 23 * GIB, &text, true), None);
+        for (from, to) in [
+            ("file_writeback 52428800\n", ""),
+            ("active_file 314572800", "active_file 300M"),
+            ("active_file 314572800", "active_file -1"),
+            (
+                "inactive_file 524288000",
+                "inactive_file 18446744073709551615",
+            ),
+        ] {
+            let hostile = text.replace(from, to);
+            assert_ne!(hostile, text, "{from:?}");
+            assert_eq!(
+                cgroup_room(24 * GIB, 23 * GIB, &hostile, false),
+                None,
+                "{to:?}"
+            );
+        }
+        assert_eq!(
+            cgroup_room(u64::MAX, 0, &v2(1, 0, 0, 0), false),
+            None,
+            "headroom and clean pages past u64"
+        );
+    }
+
+    /// The memory directories are the process's cgroup and each ancestor to its namespace's root,
+    /// in v2's hierarchy or v1's memory controller's, and no other controller's.
+    #[test]
+    fn the_memory_dirs_are_the_cgroup_and_each_ancestor() {
+        let dirs = |text: &str| -> Vec<(String, bool)> { memory_dirs_of(text, "/sys/fs/cgroup") };
+        let owned = |list: &[(&str, bool)]| -> Vec<(String, bool)> {
+            list.iter().map(|(d, v1)| ((*d).to_owned(), *v1)).collect()
+        };
+        assert_eq!(
+            dirs("0::/user.slice/run-1.scope\n"),
+            owned(&[
+                ("/sys/fs/cgroup/user.slice/run-1.scope", false),
+                ("/sys/fs/cgroup/user.slice", false),
+                ("/sys/fs/cgroup", false),
+            ])
+        );
+        assert_eq!(dirs("0::/\n"), owned(&[("/sys/fs/cgroup", false)]));
+        assert_eq!(
+            dirs("5:cpu,cpuacct:/a\n4:memory:/a/b/\n"),
+            owned(&[
+                ("/sys/fs/cgroup/memory/a/b", true),
+                ("/sys/fs/cgroup/memory/a", true),
+                ("/sys/fs/cgroup/memory", true),
+            ])
+        );
+        assert!(dirs("").is_empty());
+        assert!(dirs("garbage\n3:pids:/x\n").is_empty());
+    }
+
+    /// A cgroup file system written to a directory of this test's own: each cgroup a directory of
+    /// the files given, under the mount; removed when dropped.
+    struct FakeCgroups {
+        mount: std::path::PathBuf,
+    }
+
+    impl FakeCgroups {
+        fn new(name: &str) -> Self {
+            let mount = std::env::temp_dir()
+                .join(format!("hyper-rt-cgroups-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&mount);
+            std::fs::create_dir_all(&mount).unwrap();
+            FakeCgroups { mount }
+        }
+
+        fn mount(&self) -> &str {
+            self.mount.to_str().unwrap()
+        }
+
+        fn write(&self, dir: &str, files: &[(&str, &str)]) {
+            let dir = self.mount.join(dir.trim_start_matches('/'));
+            std::fs::create_dir_all(&dir).unwrap();
+            for (name, text) in files {
+                std::fs::write(dir.join(name), text).unwrap();
+            }
+        }
+
+        fn remove(&self, dir: &str, file: &str) {
+            std::fs::remove_file(self.mount.join(dir.trim_start_matches('/')).join(file)).unwrap();
+        }
+    }
+
+    impl Drop for FakeCgroups {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.mount);
+        }
+    }
+
+    /// The memory a process may take is the least of the machine's and the room of each cgroup over
+    /// it with a ceiling, `memory.high` as much as `memory.max`: a process in a 24 GiB cgroup on a
+    /// machine with 82 GB free has the cgroup's room, which `MemAvailable` alone (the reading before
+    /// this) did not give. A cgroup whose `memory.stat` cannot be read is its headroom; one whose
+    /// usage cannot be read lowers nothing; with no ceiling anywhere the machine's reading stands.
+    /// v1's memory hierarchy is read by its own names. The tightest ceiling is the facts' limit.
+    #[test]
+    fn the_memory_available_is_within_each_bounding_cgroup_s_room() {
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
+        let fake = FakeCgroups::new("room");
+        let mount = fake.mount();
+        let stat = |active: u64, inactive: u64, dirty: u64, writeback: u64| {
+            format!(
+                "anon 0\nfile {}\nfile_dirty {dirty}\nfile_writeback {writeback}\n\
+                 inactive_file {inactive}\nactive_file {active}\n",
+                active + inactive
+            )
+        };
+        let unbounded = [("memory.max", "max\n"), ("memory.high", "max\n")];
+        let cgroup = "0::/a/b\n";
+        fake.write("/", &[("memory.stat", &stat(0, 0, 0, 0))]);
+        fake.write("/a", &unbounded);
+        fake.write("/a/b", &unbounded);
+        let machine = Some(82_000_000_000);
+        assert_eq!(within_cgroups(machine, cgroup, mount), machine);
+        assert_eq!(least_ceiling(cgroup, mount), None);
+
+        let max = (24 * GIB).to_string();
+        let used = (23 * GIB).to_string();
+        let a_stat = stat(300 * MIB, 500 * MIB, 100 * MIB, 50 * MIB);
+        fake.write(
+            "/a",
+            &[
+                ("memory.max", &max),
+                ("memory.current", &used),
+                ("memory.stat", &a_stat),
+            ],
+        );
+        let room = GIB + 650 * MIB;
+        assert_eq!(within_cgroups(machine, cgroup, mount), Some(room));
+        assert_eq!(within_cgroups(None, cgroup, mount), Some(room));
+        assert_eq!(within_cgroups(Some(GIB), cgroup, mount), Some(GIB));
+        assert_eq!(least_ceiling(cgroup, mount), Some(24 * GIB));
+
+        // A leaf throttled at 1 GiB, 900 MiB used, none of it file pages: its room binds.
+        let high = GIB.to_string();
+        let leaf_used = (900 * MIB).to_string();
+        fake.write(
+            "/a/b",
+            &[
+                ("memory.high", &high),
+                ("memory.current", &leaf_used),
+                ("memory.stat", &stat(0, 0, 0, 0)),
+            ],
+        );
+        assert_eq!(within_cgroups(machine, cgroup, mount), Some(124 * MIB));
+        assert_eq!(least_ceiling(cgroup, mount), Some(GIB));
+
+        // Unreadable counts: the leaf's `memory.stat` gone leaves its headroom; its usage gone
+        // leaves the parent's room.
+        fake.remove("/a/b", "memory.stat");
+        assert_eq!(within_cgroups(machine, cgroup, mount), Some(124 * MIB));
+        fake.remove("/a/b", "memory.current");
+        assert_eq!(within_cgroups(machine, cgroup, mount), Some(room));
+
+        let v1 = "4:memory:/x\n";
+        fake.write(
+            "/memory/x",
+            &[
+                ("memory.limit_in_bytes", &(2 * GIB).to_string()),
+                ("memory.usage_in_bytes", &GIB.to_string()),
+                (
+                    "memory.stat",
+                    "total_inactive_file 8192\ntotal_active_file 4096\ntotal_dirty 4096\n\
+                     total_writeback 0\n",
+                ),
+            ],
+        );
+        assert_eq!(within_cgroups(machine, v1, mount), Some(GIB + 8192));
+        assert_eq!(least_ceiling(v1, mount), Some(2 * GIB));
     }
 
     /// The tightest of several optional bounds is the smallest present one; none present is none.

@@ -1905,6 +1905,51 @@ mod tests {
         }
     }
 
+    /// A retirement ends once the spare loan memory a trim gives back brings the room within the
+    /// limit: the trim that hollows the spare chunk ends it, where it was ended only before the
+    /// spare memory went, and lasted until some later trim or idle reservation.
+    #[test]
+    fn a_retirement_ends_once_spare_memory_given_back_brings_the_room_within_the_limit() {
+        let mut c = Cache::new(1000, 64, EXTENT);
+        // A loan's chunk of 200 pages first, then 800 read slots after it.
+        let mut k = c.lend(200).unwrap();
+        for a in 5000..5200u64 {
+            k.keep(a, &page(a));
+        }
+        c.adopt(k);
+        c.wanted = 800;
+        c.reserve(usize::MAX);
+        for a in 0..800u64 {
+            c.insert(a, &page(a));
+        }
+        assert_eq!(c.room(), 1000);
+        // A lowered limit: the last chunk, of read slots, begins to retire.
+        c.resize(900);
+        for _ in 0..2000 {
+            if c.retiring.is_some() {
+                break;
+            }
+            c.trim(1);
+        }
+        assert!(c.retiring.is_some());
+        // The loan's pages forgotten, as branches merged away forget theirs: its chunk is spare,
+        // and the next trim gives its memory back.
+        for a in 5000..5200u64 {
+            c.forget(a);
+        }
+        c.trim(1);
+        assert!(c.room() <= 900, "room {}", c.room());
+        assert!(c.retiring.is_none(), "the retirement outlived its need");
+        let mut k = c.lend(4).expect("a loan within the limit");
+        for a in 6000..6004u64 {
+            k.keep(a, &page(a));
+        }
+        c.adopt(k);
+        let mut out = Vec::new();
+        assert!(c.get(6003, &mut out), "the loan's page was not cached");
+        assert_eq!(out, page(6003));
+    }
+
     /// A cache whose slots are all made, as idle time leaves one its reads have filled.
     fn warm(pages: usize, page: usize) -> Cache {
         let mut c = Cache::new(pages, page, EXTENT);

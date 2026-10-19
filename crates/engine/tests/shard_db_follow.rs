@@ -1,0 +1,163 @@
+//! A budget that follows the machine's free memory (docs/research/64 §5). While the machine has
+//! memory to spare, the budget is the shard's share of its capacity and the kept memtables fill
+//! the idle part. When the machine's free memory falls below the room the budget keeps free, the
+//! next look lowers the budget to what the shard holds less what the machine lacks: the kept
+//! memtables give their memory back and the caches are trimmed at once, so the regions and the
+//! kept memtables hold no more than the lower budget. When the machine frees memory again the
+//! budget returns to its bound. Every read stays exact throughout.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::disallowed_macros
+)]
+
+use hyper_block::buf::Alignment;
+use hyper_block::file::{CachingRequest, DeviceFile};
+use mantle_engine::shard_db::ShardDb;
+use mantle_engine::store::Config;
+use mantle_engine::trunk::TrunkConfig;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+const STORE: Config = Config {
+    page_size: 4096,
+    extent_pages: 8,
+    max_extents: 1 << 16,
+};
+const MEM: usize = 8 * 1024;
+const TRUNK: TrunkConfig = TrunkConfig {
+    fanout: 4,
+    leaf_entries: 128,
+};
+const KEYS: u64 = 2000;
+/// The shard's share of the machine: room for every memtable the test fills, kept, beside the
+/// page cache and write memory.
+const BOUND: usize = 256 << 20;
+
+/// The machine's free memory as the test sets it: the only reader of it is [`free`].
+static FREE: AtomicU64 = AtomicU64::new(0);
+
+fn free() -> Option<u64> {
+    Some(FREE.load(Ordering::Relaxed))
+}
+
+fn key(k: u64) -> Vec<u8> {
+    format!("bucket-{}/obj-{k:06}", k % 5).into_bytes()
+}
+
+fn open(path: &Path, create: bool) -> DeviceFile {
+    DeviceFile::open(
+        path,
+        create,
+        CachingRequest::Buffered,
+        Alignment::new(4096).unwrap(),
+    )
+    .unwrap()
+}
+
+fn workers(db: &mut ShardDb<DeviceFile>, path: &Path) {
+    let path: PathBuf = path.to_path_buf();
+    db.set_workers(move || {
+        DeviceFile::open(
+            &path,
+            false,
+            CachingRequest::Buffered,
+            Alignment::new(4096).unwrap(),
+        )
+        .map_err(|e| mantle_engine::Error::Io {
+            op: "open a worker's file",
+            detail: e.to_string(),
+        })
+    })
+    .unwrap();
+}
+
+type Oracle = BTreeMap<u64, Vec<u8>>;
+
+/// Puts and gets from `x` until `rotations` more memtables have rotated, every get checked against
+/// the oracle: the generator's state after.
+fn run(db: &mut ShardDb<DeviceFile>, oracle: &mut Oracle, mut x: u64, rotations: u64) -> u64 {
+    let until = db.stats().0.rotations + rotations;
+    let mut value = Vec::new();
+    let mut i = 0u64;
+    while db.stats().0.rotations < until {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let k = x % KEYS;
+        if i.is_multiple_of(3) {
+            let v = format!("v{i}-{}", "x".repeat((x % 40) as usize)).into_bytes();
+            db.put(&key(k), &v).unwrap();
+            oracle.insert(k, v);
+        } else {
+            let found = db.get(&key(k), &mut value).unwrap();
+            match oracle.get(&k) {
+                Some(v) => assert!(found && &value == v, "key {k} at {i}"),
+                None => assert!(!found, "key {k} at {i}"),
+            }
+        }
+        i += 1;
+        assert!(i < 1_000_000, "no rotation");
+    }
+    x
+}
+
+/// What the budget's regions and the kept memtables hold.
+fn held(db: &ShardDb<DeviceFile>) -> usize {
+    let (cache, write, records) = db.memory_held();
+    cache + write + records + usize::try_from(db.stats().0.kept_bytes).unwrap()
+}
+
+#[test]
+fn a_budget_that_follows_the_machine_gives_memory_back_when_the_machine_runs_short() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let mut db = ShardDb::create(open(&path, true), STORE, MEM, TRUNK).unwrap();
+    FREE.store(1 << 40, Ordering::Relaxed);
+    db.follow(BOUND, 1, free).unwrap();
+    workers(&mut db, &path);
+    let mut oracle = Oracle::new();
+    let mut x = 0x5851_f42d_4c95_7f2du64;
+    x = run(&mut db, &mut oracle, x, 40);
+    assert_eq!(db.budget(), Some(BOUND), "a machine with memory to spare");
+    let kept = db.stats().0.kept;
+    assert!(kept > 0, "no memtable was kept");
+    let before = held(&db);
+
+    // The machine has nothing free: the next rotation's look lowers the budget below what the
+    // shard held, and the kept memtables give their memory back.
+    FREE.store(0, Ordering::Relaxed);
+    x = run(&mut db, &mut oracle, x, 1);
+    let short = db.budget().unwrap();
+    assert!(short < before, "budget {short} not below the {before} held");
+    assert!(
+        db.trimming() || held(&db) <= short,
+        "held {} above the budget {short}",
+        held(&db)
+    );
+    assert!(
+        db.stats().0.kept < kept,
+        "kept {} of {kept}",
+        db.stats().0.kept
+    );
+    x = run(&mut db, &mut oracle, x, 4);
+    assert!(
+        db.budget().unwrap() <= short,
+        "the budget rose while the machine had nothing free"
+    );
+    assert!(db.trimming() || held(&db) <= db.budget().unwrap());
+
+    // The machine frees memory: the budget returns to its bound.
+    FREE.store(1 << 40, Ordering::Relaxed);
+    run(&mut db, &mut oracle, x, 1);
+    assert_eq!(db.budget(), Some(BOUND), "the machine has memory again");
+    let mut value = Vec::new();
+    for (k, v) in &oracle {
+        assert!(db.get(&key(*k), &mut value).unwrap(), "key {k} lost");
+        assert_eq!(&value, v, "key {k}");
+    }
+}

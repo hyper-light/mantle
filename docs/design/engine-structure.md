@@ -289,7 +289,13 @@ when it binds, and is measured then.
      the kept memtables never hold more than the budget after an operation. Any region that
      grows takes memory from them, oldest first, as F2's log evicts at its head; one goes back
      when the page cache is refused the machine's memory, and before a rotation would take a new
-     memtable while the machine has not twice its bytes free (the cache's rule). A fresh
+     memtable while the machine has not twice its bytes free (the cache's rule). A budget that
+     follows the machine falls with its free memory, the cgroup's room within the host's
+     (research/64): at each rotation, get cycle and, in phases without either, once a fill's time
+     has passed, it becomes what the regions and kept memtables hold plus the shard's share of the
+     free memory, less twice the largest step a gate admits and the most the process's memory
+     outside the account grew between two looks; the kept memtables give memory back and the
+     caches are trimmed to it at once. A fresh
      memtable's index is sized for the entries the one before it held under its rebuild
      threshold, on huge pages, so it neither grows nor migrates as it fills and a put's probe
      stays cached (research/63 §10). Without a memory budget, or without workers to build the

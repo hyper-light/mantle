@@ -214,6 +214,7 @@ struct Mark {
     faults: faults::Faults,
     switches: Option<u64>,
     usage: Option<usage::Usage>,
+    io: Option<StorageIo>,
 }
 
 impl Mark {
@@ -224,7 +225,39 @@ impl Mark {
             faults: faults::read()?,
             switches: faults::switches().ok(),
             usage: usage::this().ok(),
+            io: StorageIo::read(),
         })
+    }
+}
+
+/// The bytes the process has had the storage layer read and write for it, every thread's, page
+/// cache hits not among them: Linux's `/proc/self/io` `read_bytes` and `write_bytes` (proc(5)),
+/// so a phase's read and write amplification is measured, not the whole run's. Other systems say
+/// none here.
+#[derive(Clone, Copy)]
+struct StorageIo {
+    read: u64,
+    write: u64,
+}
+
+impl StorageIo {
+    #[cfg(target_os = "linux")]
+    fn read() -> Option<Self> {
+        let text = std::fs::read_to_string("/proc/self/io").ok()?;
+        let field = |name: &str| {
+            text.lines()
+                .find_map(|l| l.strip_prefix(name))
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        };
+        Some(Self {
+            read: field("read_bytes:")?,
+            write: field("write_bytes:")?,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn read() -> Option<Self> {
+        None
     }
 }
 
@@ -269,6 +302,17 @@ fn costs(name: &str, ops: u64, from: &Mark, to: &Mark) {
                 .zip(from.switches)
                 .and_then(|(a, b)| a.checked_sub(b))
         ),
+    );
+    let io = to
+        .io
+        .zip(from.io)
+        .and_then(|(a, b)| Some((a.read.checked_sub(b.read)?, a.write.checked_sub(b.write)?)));
+    println!(
+        "{name} storage read_bytes {} write_bytes {} read_bytes/op {} write_bytes/op {}",
+        total(io.map(|(r, _)| r)),
+        total(io.map(|(_, w)| w)),
+        per_op(io.map(|(r, _)| r)),
+        per_op(io.map(|(_, w)| w)),
     );
 }
 

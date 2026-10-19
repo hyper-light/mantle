@@ -236,6 +236,13 @@ pub struct Cache {
     /// word and bucket are a miss each at scale.
     extent_pages: u64,
     hints: Vec<Option<NonZeroU32>>,
+    /// Each extent's pages cached, while `counted`: an extent with none has no page for a forget
+    /// to find, and a grant's, a freed extent's or an adopted page's forget skips its probes (a
+    /// 100M fill's grants probed 16.6M addresses and found 5.8M cached; adoption's probe found
+    /// none, research/58 §8). A count the memory refuses ends the counting, every forget then
+    /// probing as before.
+    pages_in: Vec<u32>,
+    counted: bool,
 }
 
 /// Where a cache's memory is, in pages, and what its loans held ([`Cache::memory`]): what
@@ -301,6 +308,8 @@ impl Cache {
             loan_missed: 0,
             extent_pages,
             hints: Vec::new(),
+            pages_in: Vec::new(),
+            counted: true,
         }
     }
 
@@ -455,6 +464,7 @@ impl Cache {
                 len: payload.len(),
             };
         }
+        self.count_in(address);
         self.push(queue, i);
         self.map
             .insert(address, u64::try_from(i).unwrap_or(u64::MAX));
@@ -749,6 +759,7 @@ impl Cache {
                     at: k.saturating_mul(page),
                     len,
                 };
+                self.count_in(address);
                 self.push(queue, i);
                 self.map
                     .insert(address, u64::try_from(i).unwrap_or(u64::MAX));
@@ -926,6 +937,15 @@ impl Cache {
     /// "Improving Hash Join Performance through Prefetching", ICDE 2004).
     pub fn forget_run(&mut self, first: u64, count: u64) {
         let end = first.saturating_add(count);
+        if self.counted
+            && let (Some(a), Some(b)) = (
+                self.extent_of(first),
+                end.checked_sub(1).and_then(|last| self.extent_of(last)),
+            )
+            && (a..=b).all(|e| self.pages_in.get(e).is_none_or(|&n| n == 0))
+        {
+            return;
+        }
         for address in first..end {
             std::hint::black_box(self.map.touch(address));
         }
@@ -936,6 +956,9 @@ impl Cache {
 
     /// Drops `address` from the cache: a page written there replaces what was cached.
     pub fn forget(&mut self, address: u64) {
+        if !self.may_hold(address) {
+            return;
+        }
         if let Some(i) = self
             .map
             .remove(address)
@@ -952,6 +975,8 @@ impl Cache {
             && slot.live
         {
             slot.live = false;
+            let address = slot.address;
+            self.count_out(address);
             self.vacate(i);
         }
     }
@@ -1058,6 +1083,64 @@ impl Cache {
         }
     }
 
+    /// The extent `address` lies in, as an index into the per-extent tables.
+    fn extent_of(&self, address: u64) -> Option<usize> {
+        usize::try_from(address.checked_div(self.extent_pages)?).ok()
+    }
+
+    /// Whether a page of `address`'s extent may be cached: no only where its count says none.
+    fn may_hold(&self, address: u64) -> bool {
+        !self.counted
+            || self
+                .extent_of(address)
+                .and_then(|e| self.pages_in.get(e))
+                .is_some_and(|&n| n > 0)
+    }
+
+    /// A page of `address` cached: its extent's count grows, the table grown to it; refused its
+    /// memory, the counting ends.
+    fn count_in(&mut self, address: u64) {
+        if !self.counted {
+            return;
+        }
+        let Some(extent) = self.extent_of(address) else {
+            self.counted = false;
+            return;
+        };
+        if let Some(len) = extent.checked_add(1)
+            && len > self.pages_in.len()
+        {
+            if self
+                .pages_in
+                .try_reserve(len.saturating_sub(self.pages_in.len()))
+                .is_err()
+            {
+                self.counted = false;
+                return;
+            }
+            self.pages_in.resize(len, 0);
+        }
+        match self.pages_in.get_mut(extent) {
+            Some(n) => *n = n.saturating_add(1),
+            None => self.counted = false,
+        }
+    }
+
+    /// A page of `address` no longer cached: its extent's count falls.
+    fn count_out(&mut self, address: u64) {
+        if !self.counted {
+            return;
+        }
+        match self
+            .extent_of(address)
+            .and_then(|e| self.pages_in.get_mut(e))
+        {
+            Some(n) if *n > 0 => *n = n.saturating_sub(1),
+            // A page uncounted, which no counted cache holds: the counts no longer stand.
+            _ => self.counted = false,
+        }
+    }
+
     /// The slot holding `address` with its payload, counted as a read and promoted, the look
     /// made as [`Self::slot_touched`] makes it; none, and nothing counted, when no slot holds
     /// it: a scan's landing, whose miss is counted where the page is then read.
@@ -1117,6 +1200,7 @@ impl Cache {
         if let Some(s) = self.slots.get_mut(i) {
             s.live = false;
         }
+        self.count_out(slot.address);
         self.map.remove(slot.address);
         self.vacate(i);
         self.remember_ghost(slot.address);
@@ -1168,6 +1252,7 @@ impl Cache {
         if let Some(s) = self.slots.get_mut(i) {
             s.live = false;
         }
+        self.count_out(slot.address);
         self.map.remove(slot.address);
         self.vacate(i);
     }
@@ -1949,6 +2034,90 @@ mod tests {
                 assert_eq!(c.in_ghost(a), model.contains(&Some(a)), "step {step} {a}");
             }
             assert!(c.ghosts.len() <= 4 * cap, "step {step}: {}", c.ghosts.len());
+        }
+    }
+
+    /// Every extent's count is the pages its live slots hold, whatever reads, loans, forgetting,
+    /// limits and trims came: so a forget that skips an extent counted empty skips only what it
+    /// would not have found, and a read never returns a page older than the address's newest.
+    #[test]
+    fn each_extent_s_count_is_its_live_pages_and_a_skipped_forget_hides_nothing() {
+        let mut c = warm(64, 32);
+        let mut latest: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut out = Vec::new();
+        for step in 0..40_000u32 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let address = x % 160;
+            let payload: Vec<u8> = (0..(1 + x % 24))
+                .map(|b| ((b ^ address ^ u64::from(step)) & 0xff) as u8)
+                .collect();
+            match x % 13 {
+                0..=3 => {
+                    c.insert(address, &payload);
+                    latest.insert(address, payload);
+                }
+                4..=6 => {
+                    out.clear();
+                    if c.get(address, &mut out) {
+                        assert_eq!(
+                            Some(&out),
+                            latest.get(&address),
+                            "step {step} read {address}"
+                        );
+                    }
+                }
+                7 => {
+                    c.forget(address);
+                    latest.remove(&address);
+                }
+                8 => {
+                    // A grant: the extent's pages forgotten whole.
+                    let first = address - address % EXTENT;
+                    c.forget_run(first, EXTENT);
+                    for a in first..first + EXTENT {
+                        latest.remove(&a);
+                    }
+                }
+                9 => {
+                    // A job's pages back in the memory lent, an extent's row from its middle.
+                    if let Some(mut k) = c.lend(1 + usize::try_from((x >> 20) % 6).unwrap()) {
+                        for a in address..address + 1 + (x >> 30) % 6 {
+                            let p: Vec<u8> = (0..(1 + a % 16))
+                                .map(|b| u8::try_from((b ^ a) & 0xff).unwrap())
+                                .collect();
+                            let before = k.len();
+                            k.keep(a, &p);
+                            if k.len() > before {
+                                latest.insert(a, p);
+                            }
+                        }
+                        c.adopt(k);
+                    }
+                }
+                10 => {
+                    let pages = 1 + usize::try_from((x >> 20) % 96).unwrap();
+                    c.resize(pages);
+                }
+                _ => {
+                    c.trim(1 + usize::try_from((x >> 20) % 8).unwrap());
+                }
+            }
+            assert!(c.counted, "step {step}: the counting ended");
+            let mut live = vec![0u32; c.pages_in.len().max(1)];
+            for slot in c.slots.iter().filter(|s| s.live) {
+                let e = usize::try_from(slot.address / EXTENT).unwrap();
+                assert!(
+                    e < c.pages_in.len(),
+                    "step {step}: extent {e} never counted"
+                );
+                live[e] += 1;
+            }
+            for (e, &n) in c.pages_in.iter().enumerate() {
+                assert_eq!(n, live[e], "step {step}: extent {e}");
+            }
         }
     }
 

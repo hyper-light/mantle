@@ -415,3 +415,16 @@ does it; `runs/n*-r5741..r5756`, 6 rounds a size against landf):
 
 The device's threads waited in the call instead, for room in the device's queue: at 100M this
 disk does not take the fill's writes as they come, and the page cache holds them until after it.
+
+**Measured and kept: each extent's cached pages counted** (`cache::Cache`, land9). A grant, the
+paced forgetting of a freed extent and a flush skip an extent the count says holds no page, and an
+adopted page's earlier slot is released by the index's own insert, one probe where a forget probed
+first. Step timings of a 100M fill (land8 without them and with, `runs/n100000000-r6031..r6032`):
+
+| a call | land8 | counted, one probe |
+|---|---|---|
+| a grant | 179-199 µs | 114-126 µs |
+| an adoption | 331-365 µs | 362-369 µs |
+| the puts' turn work, a put | 10.7-13.1 ns | 10.9-11.3 ns |
+
+The counting itself cost adoption what its one probe saved; a grant's probes were the work kept off.

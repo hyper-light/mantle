@@ -348,3 +348,45 @@ in the same profiles 157K looks in the phase against main's 8K, 1.3% of a seek. 
 now paying the writes' debts (§8), nothing is owed during a seek phase, so each look runs every
 clause and finds none. A scan can make work owed (its rents, the cache's slots), so the look
 stays.
+
+## 10. A put's own probe
+
+A put probes its memtable's index at random: a control word and a slot. Measured, the memory it
+probes mattered and the instructions around the probe did not.
+
+**Its pages.** Each process's smaps a second through a fill (`native-ab/dirty/smaps-watch.sh`,
+`r5871` at 100M, `r5881` at 10M): the memtables' 64 MiB arenas lay 95-99% on huge pages, but the
+4-16 MiB mappings, the index's control words and slots and the entries' tail, held none or one
+2 MiB page of about 10 MB resident, at both sizes. The VM's kernel backs memory with huge pages
+everywhere but compacts for them only where advised (`enabled` always, `defrag` madvise,
+Documentation/admin-guide/mm/transhuge.rst): a region not advised takes a huge page at its fault
+only if one is free. The index now lies on the record index's allocation (`HugeZeroed`: mapped
+from a huge page's boundary, advised, faulted in a huge page at a time).
+
+**Its size.** A table made for a fill was the size a migration starts, at most half full, which a
+migration needs for the writes it spans (`util::incmap`); a table made for a fill spans none. For a
+64 MiB memtable of 0.56M entries the power of two above twice them is 2^21 buckets, 10 MiB of
+control words and slots. 2^20 holds them under the 7/8 rebuild threshold, and at 54% a group of
+eight is full one time in 140, so a probe still reads one group. A fill streams about 140 MB
+through the shard's core a memtable (its arena, the worker's copy of it, the tail), and an index
+line touched every 11 ms or so is evicted between touches; half the index stays cached:
+
+| over land8 da4f3a8 | 10M fill | 100M fill | runs |
+|---|---|---|---|
+| index on huge pages (as a diagnostic build) | 1.06x (6/6), 1.04x (11/12) | 1.04x (6/6) | `r5891..r5906`, `r5931..r5942` |
+| and its instructions trimmed, extents counted (memhuge3) | 1.05x (11/12) | 1.04x (6/6) | `r6001..r6026` |
+| and a fill's table under the threshold (memhalf2) | 1.17x (12/12) | 1.14x (6/6) | `r6001..r6026` |
+| the threshold's table over memhuge3's | 1.11x (12/12) | 1.11x (12/12) | `r6001..r6012`, `r6041..r6052` |
+
+**Its instructions.** Under callgrind with the runtime's quantum scaled to valgrind's pace (turns
+as often in puts as natively, `cg/put-inner2.sh`), a 10M put ran 1,446 instructions, and three
+were work for nothing: a look through every frozen memtable for a failed packing (55, now the
+terminal error's one field), the range a key falls in when there is one (78, now none), and a
+future made for each operation inside the client's turn (66, now a count). Without them puts ran
+as fast (1.00x, `r5911..r5916`, `r5931..r5942`): a put waits on its misses, and work off their
+path runs in their shadow (§1).
+
+Over memhuge3 the smaller table's 100M gets ran 0.97-0.98x (`r6041..r6052`, 3-5 of 12 rounds
+faster) though no get reads a memtable's index once the fill is flushed: every function of the
+get path lies 28 bytes later in its binary, the size of the change before it, and an A/A of
+layout alone moves a 100M phase 3-4% (research/61 §4).

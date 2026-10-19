@@ -961,6 +961,12 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     fn no_worker_failure(&self) -> Result<(), Error> {
+        // A frozen memtable's failure is set only where the shard's terminal error is (`retire`),
+        // which stays until the shard is consumed: with none, no packing failed, and a put reads
+        // one field rather than every frozen memtable (55 of a 10M put's 1,446 instructions).
+        if self.terminal_error.is_none() {
+            return Ok(());
+        }
         // Looked for first, so a put with no failed packing clones nothing.
         if self.frozen.iter().all(|f| f.error.is_none()) {
             return Ok(());

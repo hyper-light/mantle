@@ -697,6 +697,7 @@ impl Cache {
                 *h = Held::Hollow;
             }
         }
+        self.settle_retirement();
     }
 
     /// Takes back memory lent with the pages a worker kept in it: each buffer its chunk again,
@@ -1199,11 +1200,13 @@ impl Cache {
         self.vacate(i);
     }
 
-    /// Sets the cache's limit to `pages` pages, at least one. Growing takes effect at once; a
-    /// cache above a lowered limit is brought down by `trim`, and meanwhile an insert evicts a
-    /// page for each it adds, so the pages held only fall. The ghost's window follows the limit.
+    /// Sets the cache's limit to `pages` pages, at least one. Growing takes effect at once, a
+    /// retirement the raised limit no longer asks for ending with it; a cache above a lowered
+    /// limit is brought down by `trim`, and meanwhile an insert evicts a page for each it adds, so
+    /// the pages held only fall. The ghost's window follows the limit.
     pub fn resize(&mut self, pages: usize) {
         self.limit = pages.max(1);
+        self.settle_retirement();
     }
 
     /// Up to `n` queue steps toward the limit: pages freed by the cache's own rule (S3-FIFO's
@@ -1217,7 +1220,6 @@ impl Cache {
             }
             self.step();
         }
-        self.settle_retirement();
         // Spare loans' memory goes first: it holds no page.
         while self.room() > self.limit {
             let Some(c) = self.spares.pop() else {
@@ -1236,6 +1238,8 @@ impl Cache {
                 *h = Held::Hollow;
             }
         }
+        // A retirement the room left no longer asks for ends before another chunk's begins.
+        self.settle_retirement();
         // Then the chunks above the limit, the last first: its slots looked at `n` a call, the
         // pages they hold dropped, and the chunk given back once none is left. A chunk out on
         // loan waits for its memory to come back.
@@ -1291,6 +1295,10 @@ impl Cache {
     }
 
     /// A retirement the limit no longer asks for ends: the slots it set aside are free again.
+    /// While one lasts the cache lends nothing and gives up each loan that comes back, so it ends
+    /// wherever the room falls or the limit rises (`resize`, `trim`, `shed_spare`), not only when
+    /// idle time reserves slots, which a busy shard may not reach for minutes (docs/research/64
+    /// §11).
     fn settle_retirement(&mut self) {
         if self.retiring.is_some() && self.room() <= self.limit {
             self.retiring = None;
@@ -1722,6 +1730,45 @@ mod tests {
         }
         assert!(c.retiring.is_some());
         assert!(c.lend(1).is_none());
+    }
+
+    /// A retirement ends once a raised limit holds the chunks' room, with no trim or idle
+    /// reservation after: while it lasted the cache lent nothing and gave up each loan that came
+    /// back, so a limit that fell and rose again on a shard too busy for idle work left a 1B fill's
+    /// cache taking none of the pages its compactions wrote (docs/research/64 §11).
+    #[test]
+    fn a_retirement_ends_once_a_raised_limit_holds_the_room() {
+        let mut c = warm(1000, 64);
+        for a in 0..1000u64 {
+            c.insert(a, &page(a));
+        }
+        c.resize(500);
+        for _ in 0..2000 {
+            if c.retiring.is_some() {
+                break;
+            }
+            c.trim(1);
+        }
+        assert!(c.retiring.is_some());
+        c.resize(1100);
+        assert!(c.retiring.is_none());
+        let mut k = c.lend(4).expect("a loan within the raised limit");
+        for a in 2000..2004u64 {
+            k.keep(a, &page(a));
+        }
+        c.adopt(k);
+        for a in 2000..2004u64 {
+            let mut out = Vec::new();
+            assert!(c.get(a, &mut out), "page {a} was not cached");
+            assert_eq!(out, page(a));
+        }
+        // What the retirement had not dropped reads back exactly.
+        for a in 0..1000u64 {
+            let mut out = Vec::new();
+            if c.get(a, &mut out) {
+                assert_eq!(out, page(a));
+            }
+        }
     }
 
     /// A cache whose slots are all made, as idle time leaves one its reads have filled.

@@ -18,6 +18,32 @@ use crate::error::Error;
 /// The size of one word, the unit a mapping is counted in.
 const WORD: usize = std::mem::size_of::<AtomicU64>();
 
+/// Has the C library's allocator give a freed large block's memory back to the OS when it is
+/// freed, as it does until its first such block is freed. glibc's `malloc` maps each block of at
+/// least its mmap threshold, 128 KiB to begin with, and unmaps it when freed; but each mapped block
+/// up to 32 MiB that is freed raises the threshold to its size, so later blocks of that size come
+/// from its arenas and stay there once freed (mallopt(3), `M_MMAP_THRESHOLD`): 1.3-2.8 GiB held
+/// at 100M, outside any account (docs/research/64 §6). Setting the threshold, here to its initial
+/// value, turns the adjustment off (mallopt(3)). For a process's owner to call at its start,
+/// before its threads allocate; elsewhere than glibc it does nothing.
+pub fn return_freed_blocks() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" {
+            fn mallopt(param: i32, value: i32) -> i32;
+        }
+        /// glibc's `M_MMAP_THRESHOLD` parameter number (malloc.h).
+        const M_MMAP_THRESHOLD: i32 = -3;
+        /// glibc's initial mmap threshold, `DEFAULT_MMAP_THRESHOLD_MIN` (mallopt(3): 128*1024).
+        const INITIAL_MMAP_THRESHOLD: i32 = 128 * 1024;
+        // SAFETY: mallopt(3) takes a parameter number and a value and changes only the
+        // allocator's settings; a refusal (0) leaves them as they were.
+        unsafe {
+            mallopt(M_MMAP_THRESHOLD, INITIAL_MMAP_THRESHOLD);
+        }
+    }
+}
+
 /// The size of the OS's memory pages, the least a mapping takes: below it a block is not mapped
 /// (memory/arena.rs).
 pub fn page_size() -> usize {

@@ -848,6 +848,8 @@ fn runtime_config(
 }
 
 fn main() -> Result<(), BenchError> {
+    // Freed large blocks go back to the OS, as the node's process has them (docs/research/64 §6).
+    mantle_engine::port::mmap::return_freed_blocks();
     let mut shard_client = false;
     // `--no-inline`: a client on its range's shard sends every operation through the range's
     // channel, as one from another shard does (`RangesConfig::inline`), for an A/B of the two.

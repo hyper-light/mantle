@@ -24,7 +24,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 UNSAFE_ALLOWED = {
     "crates/disk/src/probe/macos.rs": "IOKit and CoreFoundation (device identification)",
     "crates/disk/src/probe/windows.rs": "volume management and IOCTL_STORAGE_QUERY_PROPERTY (device identification)",
-    "crates/engine/src/port/mmap.rs": "mmap/munmap and CreateFileMappingW/MapViewOfFile (the memtable arena's lazily zeroed blocks)",
+    "crates/engine/src/port/mmap.rs": "mmap/munmap and CreateFileMappingW/MapViewOfFile (the memtable arena's lazily zeroed blocks); glibc's mallopt (freed large blocks back to the OS)",
 }
 
 INVENTORY = ROOT / "docs/design/constants.md"

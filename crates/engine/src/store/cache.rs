@@ -217,6 +217,8 @@ pub struct Cache {
     skipped: u64,
     /// Fresh pages of room lent to workers and not yet taken back ([`Self::lend`]).
     lent: usize,
+    /// The most pages the loans have had out at once, fresh and spare ([`Self::shed_spare`]).
+    out_most: usize,
     /// Each chunk's state, and the chunks spare for loans.
     held: Vec<Held>,
     spares: Vec<usize>,
@@ -291,6 +293,7 @@ impl Cache {
             evict_steps_most: 0,
             skipped: 0,
             lent: 0,
+            out_most: 0,
             held: Vec::new(),
             spares: Vec::new(),
             made: 0,
@@ -627,6 +630,7 @@ impl Cache {
         self.loan_room = self
             .loan_room
             .saturating_add(u64::try_from(room).unwrap_or(u64::MAX));
+        self.out_most = self.out_most.max(self.out_on_loan());
         Some(Kept {
             page: self.page,
             fresh,
@@ -648,6 +652,49 @@ impl Cache {
                 *slot = buf;
                 *h = Held::Spare;
                 self.spares.push(c);
+            }
+        }
+        self.shed_spare();
+    }
+
+    /// The pages out on loan now: fresh room lent, and spare chunks lent again.
+    fn out_on_loan(&self) -> usize {
+        self.held
+            .iter()
+            .zip(&self.sizes)
+            .filter(|(h, _)| matches!(h, Held::Lent))
+            .fold(self.lent, |a, (_, &s)| a.saturating_add(s))
+    }
+
+    /// Gives back spare chunks' memory beyond what the loans may take: the most they have had out
+    /// at once less what is out now. Spare memory holds no page; kept, it serves a loan without
+    /// the OS mapping it again, and no loan has needed more of it. Loaned chunks whose pages
+    /// were all forgotten, as branches merged away forget theirs, otherwise gather spare beyond
+    /// any loan's need (10 GiB at 100M, docs/research/64 §8); this bounds them.
+    fn shed_spare(&mut self) {
+        let need = self.out_most.saturating_sub(self.out_on_loan());
+        let mut spare = self
+            .held
+            .iter()
+            .zip(&self.sizes)
+            .filter(|(h, _)| matches!(h, Held::Spare))
+            .fold(0usize, |a, (_, &s)| a.saturating_add(s));
+        while spare > need {
+            let Some(c) = self.spares.pop() else {
+                break;
+            };
+            if self.held.get(c) == Some(&Held::Spare)
+                && let (Some(chunk), Some(size), Some(h)) = (
+                    self.chunks.get_mut(c),
+                    self.sizes.get_mut(c),
+                    self.held.get_mut(c),
+                )
+            {
+                *chunk = Vec::new();
+                self.loaned = self.loaned.saturating_sub(*size);
+                spare = spare.saturating_sub(*size);
+                *size = 0;
+                *h = Held::Hollow;
             }
         }
     }
@@ -764,6 +811,7 @@ impl Cache {
                 break;
             }
         }
+        self.shed_spare();
     }
 
     /// Takes back a loan its job did not fill: a job abandoned, or ended in error.
@@ -786,6 +834,7 @@ impl Cache {
                         *h = Held::Spare;
                     }
                     self.spares.push(c);
+                    self.shed_spare();
                 }
             }
             Some(Held::Grown) | None => self.free.push(i),
@@ -1681,6 +1730,50 @@ mod tests {
         c.wanted = pages;
         c.reserve(usize::MAX);
         c
+    }
+
+    /// Loans adopted with their pages kept, one after another, then every page forgotten, as
+    /// branches merged away forget theirs: the chunks they leave spare hold no more than the most
+    /// the loans had out at once, the rest of their memory given back, and the next loan takes the
+    /// spare rather than fresh memory.
+    #[test]
+    fn spare_loan_memory_holds_no_more_than_the_loans_had_out_at_once() {
+        let mut c = Cache::new(1 << 10, 64, EXTENT);
+        let spare = |c: &Cache| -> usize {
+            c.held
+                .iter()
+                .zip(&c.sizes)
+                .filter(|(h, _)| matches!(h, Held::Spare))
+                .map(|(_, &s)| s)
+                .sum()
+        };
+        let mut addresses = Vec::new();
+        for loan in 0..8u64 {
+            let mut k = c.lend(16).unwrap();
+            for a in loan * 16..loan * 16 + 16 {
+                k.keep(a, &[u8::try_from(a % 251).unwrap(); 8]);
+                addresses.push(a);
+            }
+            c.adopt(k);
+        }
+        assert_eq!(c.out_most, 16, "one loan out at a time");
+        assert_eq!(spare(&c), 0, "every loan's pages live");
+        let before = c.bytes();
+        for &a in &addresses {
+            c.forget(a);
+        }
+        assert!(spare(&c) <= 16, "spare {} beside a most of 16", spare(&c));
+        assert_eq!(
+            before - c.bytes(),
+            7 * 16 * 64,
+            "seven loans' memory given back"
+        );
+        let k = c.lend(16).unwrap();
+        assert_eq!(
+            k.fresh, 0,
+            "the next loan took fresh memory beside the spare"
+        );
+        c.unlend(k);
     }
 
     #[test]

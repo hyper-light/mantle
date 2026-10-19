@@ -665,9 +665,270 @@ impl Drop for HugeZeroed {
     }
 }
 
+/// Memory for the page cache's chunks: room for `capacity` bytes fixed when made, the first
+/// `len` of them written, filled and emptied without moving. On Linux mapped from a huge page's
+/// boundary and advised for huge pages (`madvise(MADV_HUGEPAGE)`, madvise(2)), so the first write
+/// into each huge page it covers maps one where the kernel has them: a loan's buffer, a huge
+/// page's worth of whole extents (`cache::loan_chunk_pages`), lies on one, where a block the C
+/// library mapped for it starts past its own header and spans two on base pages, and the cache's
+/// reads walk the page tables for every page they touch (a 10M seek 15% slower, docs/research/64
+/// §15). No populate at mapping: the first touch of a chunk is a write, a worker's keep or a
+/// slot's making, which the kernel backs with a huge page itself. Elsewhere a heap buffer.
+pub struct PageBuf {
+    #[cfg(target_os = "linux")]
+    addr: Option<NonNull<u8>>,
+    #[cfg(target_os = "linux")]
+    mapped: usize,
+    #[cfg(not(target_os = "linux"))]
+    heap: Vec<u8>,
+    len: usize,
+    capacity: usize,
+}
+
+// SAFETY: the mapping (on Linux) is owned by this value alone, read through `&self` and written
+// through `&mut self` only, so moving it to another thread or sharing it cannot race; it is
+// unmapped only in `drop`, when no borrow of it is left. Elsewhere it is a `Vec<u8>`.
+unsafe impl Send for PageBuf {}
+// SAFETY: as for `Send`: shared access is read-only.
+unsafe impl Sync for PageBuf {}
+
+impl Default for PageBuf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for PageBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PageBuf")
+            .field("len", &self.len)
+            .field("capacity", &self.capacity)
+            .finish()
+    }
+}
+
+impl PageBuf {
+    /// Room for no bytes, which maps nothing.
+    pub const fn new() -> Self {
+        Self {
+            #[cfg(target_os = "linux")]
+            addr: None,
+            #[cfg(target_os = "linux")]
+            mapped: 0,
+            #[cfg(not(target_os = "linux"))]
+            heap: Vec::new(),
+            len: 0,
+            capacity: 0,
+        }
+    }
+
+    /// Room for `capacity` bytes, none written; none when the OS refuses the memory.
+    #[cfg(target_os = "linux")]
+    pub fn with_capacity(capacity: usize) -> Option<Self> {
+        if capacity == 0 {
+            return Some(Self::new());
+        }
+        let page = page_size().max(1);
+        let huge = huge_page_size().max(page);
+        let mapped = capacity.div_ceil(page).checked_mul(page)?;
+        // From a huge page's boundary when the room spans one, else a page's: a smaller room
+        // could not lie on a huge page anyway.
+        let align = if mapped >= huge { huge } else { page };
+        let rw = rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE;
+        let addr = map_aligned(mapped, align, rw, rustix::mm::MapFlags::empty()).ok()?;
+        if align == huge {
+            // SAFETY: advises the whole mapping just made, which this value owns; the advice
+            // changes how the kernel backs it, never its contents. Refused, its pages are the
+            // base size.
+            let _ = unsafe {
+                rustix::mm::madvise(
+                    addr.as_ptr().cast(),
+                    mapped,
+                    rustix::mm::Advice::LinuxHugepage,
+                )
+            };
+        }
+        Some(Self {
+            addr: Some(addr),
+            mapped,
+            len: 0,
+            capacity,
+        })
+    }
+
+    /// Room for `capacity` bytes, none written; none when the allocator refuses the memory.
+    #[cfg(not(target_os = "linux"))]
+    pub fn with_capacity(capacity: usize) -> Option<Self> {
+        let mut heap = Vec::new();
+        heap.try_reserve_exact(capacity).ok()?;
+        Some(Self {
+            heap,
+            len: 0,
+            capacity,
+        })
+    }
+
+    /// The bytes written.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The bytes it has room for.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Nothing written, the room kept.
+    pub fn clear(&mut self) {
+        self.len = 0;
+        #[cfg(not(target_os = "linux"))]
+        self.heap.clear();
+    }
+
+    /// `src` written after the bytes written, when the room holds it; false, and nothing
+    /// written, when it does not.
+    pub fn extend_from_slice(&mut self, src: &[u8]) -> bool {
+        let Some(end) = self
+            .len
+            .checked_add(src.len())
+            .filter(|&e| e <= self.capacity)
+        else {
+            return false;
+        };
+        #[cfg(target_os = "linux")]
+        {
+            let Some(addr) = self.addr else {
+                return src.is_empty();
+            };
+            // SAFETY: `end` is at most `capacity`, which is at most the `mapped` bytes this value
+            // owns, so the `src.len()` bytes from `len` lie inside the mapping; `src` is a borrow
+            // of other memory, so the two do not overlap; the `&mut self` keeps any other borrow
+            // of the mapping out.
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr(), addr.as_ptr().add(self.len), src.len());
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        self.heap.extend_from_slice(src);
+        self.len = end;
+        true
+    }
+
+    /// Written to `len` bytes: zeros after the bytes written, or those past `len` given up; false,
+    /// and nothing changed, past the room.
+    pub fn resize_zeroed(&mut self, len: usize) -> bool {
+        if len > self.capacity {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        if len > self.len
+            && let Some(addr) = self.addr
+        {
+            // SAFETY: `len` is at most `capacity`, inside the `mapped` bytes this value owns, so
+            // the bytes from the old length to `len` lie inside the mapping; `&mut self` keeps any
+            // other borrow of it out.
+            unsafe {
+                std::ptr::write_bytes(addr.as_ptr().add(self.len), 0, len.saturating_sub(self.len));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        self.heap.resize(len, 0);
+        self.len = len;
+        true
+    }
+
+    /// The bytes written.
+    pub fn as_slice(&self) -> &[u8] {
+        #[cfg(target_os = "linux")]
+        {
+            match self.addr {
+                // SAFETY: `addr` starts a live mapping of `mapped` bytes, at least `len`, unmapped
+                // only in `drop`, which this borrow of `self` keeps from running; its first `len`
+                // bytes were written (`extend_from_slice`, `resize_zeroed`), and writes need
+                // `&mut self`, which this borrow excludes.
+                Some(addr) => unsafe { std::slice::from_raw_parts(addr.as_ptr(), self.len) },
+                None => &[],
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            &self.heap
+        }
+    }
+
+    /// The bytes written, to change in place.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        #[cfg(target_os = "linux")]
+        {
+            match self.addr {
+                // SAFETY: as for `as_slice`, and `&mut self` makes this the mapping's only borrow.
+                Some(addr) => unsafe { std::slice::from_raw_parts_mut(addr.as_ptr(), self.len) },
+                None => &mut [],
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            &mut self.heap
+        }
+    }
+}
+
+impl Drop for PageBuf {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(addr) = self.addr.take() {
+            // SAFETY: unmaps exactly the `mapped` bytes this value mapped, which no borrow
+            // outlives (`as_slice` borrows `self`). A failure leaves them mapped: nothing can act
+            // on it in a drop.
+            let _ = unsafe { rustix::mm::munmap(addr.as_ptr().cast(), self.mapped) };
+        }
+    }
+}
+
 #[cfg(test)]
 mod huge_tests {
     use super::*;
+
+    #[test]
+    fn a_page_buffer_keeps_what_is_written_within_its_room() {
+        let room = 3 * 4096 + 10;
+        let mut b = PageBuf::with_capacity(room).unwrap();
+        assert_eq!((b.len(), b.capacity()), (0, room));
+        assert!(b.extend_from_slice(b"page"));
+        assert!(b.resize_zeroed(4096));
+        assert_eq!(&b.as_slice()[..4], b"page");
+        assert!(b.as_slice()[4..].iter().all(|&x| x == 0));
+        assert!(!b.resize_zeroed(room + 1), "a resize past the room");
+        assert!(b.extend_from_slice(&vec![7u8; room - 4096]));
+        assert!(!b.extend_from_slice(b"x"), "a write past the room");
+        assert_eq!(b.len(), room);
+        b.as_mut_slice()[0] = 1;
+        assert_eq!(b.as_slice()[0], 1);
+        b.clear();
+        assert!(b.is_empty());
+        assert!(b.resize_zeroed(8));
+        assert!(
+            b.as_slice().iter().all(|&x| x == 0),
+            "not zeros after a clear"
+        );
+        assert!(PageBuf::new().as_slice().is_empty());
+        assert!(PageBuf::with_capacity(0).unwrap().as_slice().is_empty());
+    }
+
+    /// A loan's buffer of a huge page's bytes starts on a huge page's boundary, where the kernel
+    /// can back it with one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_page_buffer_of_a_huge_page_starts_on_one() {
+        let huge = huge_page_size();
+        let mut b = PageBuf::with_capacity(huge).unwrap();
+        assert!(b.resize_zeroed(1));
+        assert_eq!(b.as_slice().as_ptr().addr() % huge, 0);
+    }
 
     #[test]
     fn a_huge_mapping_reads_zero_and_keeps_what_is_written() {

@@ -37,6 +37,7 @@
 
 use std::num::{NonZeroU32, NonZeroUsize};
 
+use crate::port::mmap::PageBuf;
 use crate::shard_db::TUNE_STEP_PERCENT;
 use crate::util::incmap::{IncMap, SWEEP};
 
@@ -122,7 +123,7 @@ pub struct Kept {
 #[derive(Debug)]
 struct Loaned {
     chunk: Option<usize>,
-    buf: Vec<u8>,
+    buf: PageBuf,
 }
 
 impl Kept {
@@ -134,9 +135,10 @@ impl Kept {
                 let Some(end) = l.buf.len().checked_add(self.page) else {
                     break;
                 };
-                if end <= l.buf.capacity() {
-                    l.buf.extend_from_slice(payload);
-                    l.buf.resize(end, 0);
+                if end <= l.buf.capacity()
+                    && l.buf.extend_from_slice(payload)
+                    && l.buf.resize_zeroed(end)
+                {
                     self.pages.push((address, payload.len()));
                     return;
                 }
@@ -183,7 +185,7 @@ pub struct Cache {
     page: usize,
     limit: usize,
     /// The pages' memory (the module's rule), each chunk's first slot, and its pages.
-    chunks: Vec<Vec<u8>>,
+    chunks: Vec<PageBuf>,
     starts: Vec<usize>,
     sizes: Vec<usize>,
     slots: Vec<Slot>,
@@ -406,6 +408,7 @@ impl Cache {
         let s = self.slots.get(i)?;
         self.chunks
             .get(s.chunk)?
+            .as_slice()
             .get(s.at..s.at.checked_add(s.len)?)
     }
 
@@ -504,7 +507,7 @@ impl Cache {
         };
         let Some(room) = at
             .checked_add(payload.len())
-            .and_then(|end| self.chunks.get_mut(chunk)?.get_mut(at..end))
+            .and_then(|end| self.chunks.get_mut(chunk)?.as_mut_slice().get_mut(at..end))
         else {
             self.free.push(i);
             return;
@@ -594,7 +597,9 @@ impl Cache {
             return false;
         };
         // Within the room taken for the chunk: no reallocation, the page written once.
-        c.resize(end, 0);
+        if !c.resize_zeroed(end) {
+            return false;
+        }
         let i = self.slots.len();
         self.slots.push(Slot {
             address: 0,
@@ -706,15 +711,14 @@ impl Cache {
                     break;
                 };
                 let span = self.span(c);
-                let mut buf = Vec::new();
-                if bufs.try_reserve(1).is_err()
-                    || span
-                        .checked_mul(self.page)
-                        .is_none_or(|bytes| buf.try_reserve_exact(bytes).is_err())
-                {
+                let Some(buf) = span
+                    .checked_mul(self.page)
+                    .filter(|_| bufs.try_reserve(1).is_ok())
+                    .and_then(PageBuf::with_capacity)
+                else {
                     self.hollows.push(c);
                     break;
-                }
+                };
                 if let Some(h) = self.held.get_mut(c) {
                     *h = Held::Refilled;
                 }
@@ -732,10 +736,12 @@ impl Cache {
                 let Some(bytes) = n.checked_mul(self.page) else {
                     break;
                 };
-                let mut buf = Vec::new();
-                if bufs.try_reserve(1).is_err() || buf.try_reserve_exact(bytes).is_err() {
+                if bufs.try_reserve(1).is_err() {
                     break;
                 }
+                let Some(buf) = PageBuf::with_capacity(bytes) else {
+                    break;
+                };
                 self.lent = self.lent.saturating_add(n);
                 fresh = fresh.saturating_add(n);
                 room = room.saturating_add(n);
@@ -813,7 +819,7 @@ impl Cache {
                     self.held.get_mut(c),
                 )
             {
-                *chunk = Vec::new();
+                *chunk = PageBuf::new();
                 self.loaned = self.loaned.saturating_sub(*size);
                 self.spare_pages = self.spare_pages.saturating_sub(*size);
                 self.room_pages = self.room_pages.saturating_sub(*size);
@@ -1031,9 +1037,10 @@ impl Cache {
         if !self.machine_spares(bytes) {
             return false;
         }
-        let mut chunk = Vec::new();
-        if chunk.try_reserve_exact(bytes).is_err()
-            || self.slots.try_reserve_exact(pages).is_err()
+        let Some(chunk) = PageBuf::with_capacity(bytes) else {
+            return false;
+        };
+        if self.slots.try_reserve_exact(pages).is_err()
             || self.free.try_reserve_exact(pages).is_err()
             || self.chunks.try_reserve(1).is_err()
             || self.starts.try_reserve(1).is_err()
@@ -1217,7 +1224,7 @@ impl Cache {
             && let Some(byte) = i
                 .checked_sub(first)
                 .and_then(|k| k.checked_mul(self.page))
-                .and_then(|at| chunk.get(at))
+                .and_then(|at| chunk.as_slice().get(at))
         {
             std::hint::black_box(*byte);
         }
@@ -1488,7 +1495,7 @@ impl Cache {
                     self.held.get_mut(c),
                 )
             {
-                *chunk = Vec::new();
+                *chunk = PageBuf::new();
                 self.loaned = self.loaned.saturating_sub(*size);
                 self.spare_pages = self.spare_pages.saturating_sub(*size);
                 self.room_pages = self.room_pages.saturating_sub(*size);

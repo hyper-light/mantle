@@ -22,7 +22,7 @@ use mantle_engine::store::Config;
 use mantle_engine::trunk::TrunkConfig;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const STORE: Config = Config {
     page_size: 4096,
@@ -207,13 +207,21 @@ fn a_budget_that_follows_the_machine_gives_memory_back_when_the_machine_runs_sho
 /// The second test's machine: its own free memory and stall count, since tests run at once.
 static FREE_2: AtomicU64 = AtomicU64::new(1 << 40);
 static STALLS_2: AtomicU64 = AtomicU64::new(0);
+static STALLING_2: AtomicBool = AtomicBool::new(false);
 
 fn free_2() -> Option<u64> {
     Some(FREE_2.load(Ordering::Relaxed))
 }
 
+/// While the machine stalls, every read finds 20 ms more stall than the last: every window a tick
+/// long passes its allowance and none is quiet, so the ceiling only falls, however long a look
+/// takes to come.
 fn stalls_2() -> Option<u64> {
-    Some(STALLS_2.load(Ordering::Relaxed))
+    if STALLING_2.load(Ordering::Relaxed) {
+        Some(STALLS_2.fetch_add(20_000, Ordering::Relaxed) + 20_000)
+    } else {
+        Some(STALLS_2.load(Ordering::Relaxed))
+    }
 }
 
 /// A machine that reports memory free while the process's tasks stall on memory, as when the
@@ -232,26 +240,31 @@ fn a_budget_gives_memory_back_while_the_process_stalls_on_memory() {
     x = run(&mut db, &mut oracle, x, 40);
     assert_eq!(db.budget(), Some(BOUND), "a machine with memory to spare");
 
-    // The tasks stall 20 ms a rotation: the first look a tick after the window began finds the
-    // window past its allowance. Bounded by rotations, each a look.
+    // The tasks stall: the first look a tick after the window began finds the window past its
+    // allowance. Bounded by rotations, each a look.
+    STALLING_2.store(true, Ordering::Relaxed);
     let mut rotations = 0u64;
-    let held_before = loop {
-        let held_now = held(&db);
-        STALLS_2.fetch_add(20_000, Ordering::Relaxed);
+    while db.budget().unwrap() >= BOUND {
         x = run(&mut db, &mut oracle, x, 1);
         rotations += 1;
-        if db.budget().unwrap() < BOUND {
-            break held_now;
-        }
         assert!(
             rotations < 1_000_000,
             "the budget never fell under a stalling machine"
         );
-    };
+    }
+    // Each fall puts the ceiling a tuning step under what the shard held at that look, and the
+    // floor (the write memory and the caches' indexes) is a small part of that holding here: the
+    // budget is no more than the holding the last fall saw.
     let budget = db.budget().unwrap();
+    let flush = db.stats().0;
     assert!(
-        budget <= held_before,
-        "budget {budget} above the {held_before} the shard held before the stall"
+        flush.pressure_falls > 0,
+        "the budget fell with no fall counted"
+    );
+    assert!(
+        u64::try_from(budget).unwrap() <= flush.pressure_held,
+        "budget {budget} above the {} the shard held at the last fall",
+        flush.pressure_held
     );
     assert!(
         db.trimming() || held(&db) <= budget,

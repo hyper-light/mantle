@@ -105,6 +105,11 @@ pub struct FlushStats {
     /// Puts whose trunk share waited for its input reads: the last memtable before a rotation
     /// would stall ([`ShardDb::put`]'s pacing).
     pub waited_steps: u64,
+    /// Windows in which the process's tasks stalled on memory past the allowance, each lowering
+    /// the budget's ceiling a tuning step under what the shard held, and the bytes it held at
+    /// the last of them (docs/research/64 §16).
+    pub pressure_falls: u64,
+    pub pressure_held: u64,
 }
 
 /// What the kept memtables say of a key: its newest entry's operation; that none holds it; or,
@@ -1485,6 +1490,9 @@ impl<F: BlockFile> ShardDb<F> {
             Some(Stalled::Over) => {
                 let step = held.saturating_mul(TUNE_STEP_PERCENT) / 100;
                 follow.ceiling = Some(held.saturating_sub(step));
+                let f = &mut self.flush_stats;
+                f.pressure_falls = f.pressure_falls.saturating_add(1);
+                f.pressure_held = u64::try_from(held).unwrap_or(u64::MAX);
             }
             Some(Stalled::Quiet) => {
                 follow.ceiling = follow

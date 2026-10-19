@@ -338,3 +338,41 @@ research/63 §3 priced a get over two generations at one overlapped read (145-14
 one, `mlp4` mode 2, at 10M); here, at 100M, the second generation costs 20 ns a get, about 5 %.
 That gap, between the step's designed and measured price, is the kept index's to close
 (research/63), not the budget's: land9 meets the same step at a larger store.
+
+## 11. A retirement the limit no longer asks for
+
+A trace of each look at 1B in the box's 64 GB scope (c1b 2396a6de, never merged; r761) showed the
+page cache holding 35-44 GB of live pages through the fill, then losing them: from rotation 1386
+of 1773 no loan was made again (11,337 loans, then none), and through the flush that followed the
+cache's live pages fell from 35 GB to 16 GB while its limit stayed near 57 GB. land10's own 1B runs
+began their gets with no live page at all (`postfill_waits`, r751 and r752), and read the device for
+nearly every found key. The same happens at 100M in an 8 GB scope, in minutes rather than at 1B's
+hour (c1b2 126eb51a, r771):
+
+| 100M, box, 8 GB scope (r771) | at 32 s | at the fill's end | the gets |
+|---|---|---|---|
+| a chunk retiring | yes | yes | yes |
+| chunks' room, GB | 4.87 | 3.53 | 0.79 |
+| the limit, GB | 5.26 | 6.67 | 5.71 |
+| loans made | 99 | 99 | 99 |
+| live pages, GB | 3.76 | 2.52 | 0 |
+
+A chunk retires when the chunks' room passes the limit (`Cache::trim`): its pages are dropped a
+step at a time and the chunk is given back. While one retires the cache makes no loan
+(`Cache::lend`), gives up each loan that comes back with its pages (`Cache::adopt`), and makes no
+slot for a read (`Cache::make_now`, `Cache::unreserved`). A retirement ended when its chunk was gone
+or, once the limit no longer asked for it, at the next `trim` or idle `reserve`
+(`settle_retirement`). Under a budget that follows the machine (§7), the limit falls and rises
+with each look. A retirement begun under a lower limit then outlived its need: `trim` runs only
+while the cache is over its limit, which it no longer was, and `reserve` runs in idle time only
+when slots are owed, which `unreserved` reports as none while a chunk retires. Nothing ended it,
+and the cache took no page again for the rest of the run.
+
+A retirement now ends wherever the limit rises (`resize`) or the room falls (`trim` once its
+spare memory is given back, `shed_spare`). With that (c1b3 = c1b2 + the change, r781, same scope
+and size), retirements began and ended as the limit moved (each look's line: retiring at 54 s,
+over by 61 s), loans went on through the flush (102 at 33 s, 313 at the end), and the cache began
+the gets with 1.36 GB of live pages and 1.39 GB spare. Test:
+`store::cache::tests::a_retirement_ends_once_a_raised_limit_holds_the_room` (a retirement begun
+under a lowered limit, the limit raised: the retirement is over, a loan is made and its pages
+read back); without `resize`'s settle it fails at its first assertion (box, retire 0fdf9c1f).

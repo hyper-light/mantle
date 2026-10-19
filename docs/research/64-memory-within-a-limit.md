@@ -503,3 +503,33 @@ system time, and stalled twice as often. The loans kept 3.5 times fairq's pages,
 them in memory newly mapped and faulted a page at a time; and the page cache the OS kept beside an
 empty engine cache, which served the compactions' reads, is the engine's own cache now, which the
 workers do not read. A traced 1B fill attributes the time (queue 94).
+
+## 15. Loan chunks off huge pages
+
+The 10M and 100M gates (VM, `runs/n10000000-r6461..r6470`, `n100000000-r6471..r6480`, ten
+rounds, run7's balanced order) ran the candidate's seeks below cand's in every round at 10M, 898K
+against 1,056K a second (0.85×), and 568K against 619K at 100M (0.92×), with the same cache hits,
+the same sources a seek and no device read; its fills and gets ran level. On the box, bare metal,
+the two seeked level (`n10000000-r901..r906` on CPUs 8-15: 824-902K and 845-895K).
+
+§12's loan chunks are heap blocks of at most a huge page each. glibc maps such a block alone,
+from past its own header and a page longer than asked (mallopt(3), `M_MMAP_THRESHOLD`), so none
+lies on a huge page's boundary and the cached leaves in it sit on base pages: at the 10M seek
+phase the box's engine held 1.59 GiB on huge pages of 3.79 GiB resident, against cand's 2.01 GiB of
+3.39 (`r906`, `/proc/PID/smaps_rollup`). A seek's leaf read then misses the TLB, and in the VM a
+miss walks the guest's tables and the host's for each of the guest's (the cost bare metal does
+not pay twice).
+
+`port::mmap::PageBuf` is a chunk's memory now: room fixed when made, written and emptied in place;
+on Linux mapped from a huge page's boundary and advised for huge pages, faulted in by its first
+writes, a worker's keep or a slot's making, so a loan chunk of a huge page's bytes takes one huge
+page and one fault rather than 512; elsewhere a heap buffer. In the VM (`n10000000-r6521..r6526`,
+six rounds of three arms):
+
+| 10M | fill | gets | seeks | seeks, each round |
+|---|---|---|---|---|
+| cand 43cd9c15 | 7.32M | 4.85M | 1,136K | 1,035-1,150K |
+| hollowio b6793592 | 7.38M | 4.85M | 984K | 969-1,006K |
+| pagebuf b80151ce | 7.20M | 4.81M | 1,105K | 1,068-1,114K |
+
+The seeks are back to 0.97× cand's, every round above hollowio's.

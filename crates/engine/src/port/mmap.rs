@@ -205,10 +205,10 @@ impl Drop for LazyZeroed {
 pub struct HugeZeroed {
     addr: Option<NonNull<u8>>,
     len: usize,
-    /// The bytes mapped. On Linux whole pages from a huge page's boundary ([`huge_page_size`]):
-    /// every huge page the bytes cover whole lies on huge pages' boundaries, so the kernel can back
-    /// each with one and a move keeps each whole ([`Self::resize`]); the length is rounded to
-    /// pages, not huge pages, which on a 64 KiB-page kernel are 512 MiB. Elsewhere `len` in words.
+    /// The bytes mapped. On Linux from a huge page's boundary ([`huge_page_size`]), so the kernel
+    /// can back each huge page the bytes cover with one and a move keeps each whole
+    /// ([`Self::resize`]), and to a whole number of huge pages where one is at most an eighth of
+    /// the bytes ([`mapped_len`]). Elsewhere `len` in words.
     mapped: usize,
     #[cfg(windows)]
     section: windows_sys::Win32::Foundation::HANDLE,
@@ -251,8 +251,8 @@ impl HugeZeroed {
             what: "a kept record table (the OS refused the mapping)",
             limit: u64::try_from(len).unwrap_or(u64::MAX),
         };
-        let (page, huge) = (page_size().max(1), huge_page_size().max(page_size()).max(1));
-        let mapped = len.div_ceil(page).checked_mul(page).ok_or_else(refused)?;
+        let huge = huge_page_size().max(page_size()).max(1);
+        let mapped = mapped_len(len).ok_or_else(refused)?;
         let rw = rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE;
         let addr =
             map_aligned(mapped, huge, rw, rustix::mm::MapFlags::empty()).map_err(|()| refused())?;
@@ -336,8 +336,8 @@ impl HugeZeroed {
         let Some(addr) = self.addr else {
             return Err(refused());
         };
-        let (page, huge) = (page_size().max(1), huge_page_size().max(page_size()).max(1));
-        let mapped = len.div_ceil(page).checked_mul(page).ok_or_else(refused)?;
+        let huge = huge_page_size().max(page_size()).max(1);
+        let mapped = mapped_len(len).ok_or_else(refused)?;
         let (old, old_mapped) = (self.len, self.mapped);
         if mapped != old_mapped {
             // SAFETY: `addr` maps the `old_mapped` bytes this value owns, and `&mut self` leaves no
@@ -505,6 +505,25 @@ fn huge_page_size() -> usize {
                 page.saturating_mul(page.checked_div(8).unwrap_or(0))
             })
     })
+}
+
+/// The bytes a mapping of `len` takes on Linux: whole huge pages where one is at most an eighth of
+/// `len`, else whole pages. A mapping that ends inside a huge page leaves that page's bytes on base
+/// pages, and a table grown in place leaves one such page each growth: on the VM a 10M table's
+/// gets ran 0.97x of tables built new, every round (`r5651..r5656`). Rounded to whole huge pages,
+/// none is left, and an eighth stays under the third of its slots a table at its most, 2/3 full,
+/// leaves empty. Where a huge page is more than an eighth, as 512 MiB ones on a 64 KiB-page kernel
+/// are for all but the largest tables, the length is rounded to pages, not to a huge page the
+/// table would leave mostly unused.
+#[cfg(target_os = "linux")]
+fn mapped_len(len: usize) -> Option<usize> {
+    let (page, huge) = (page_size().max(1), huge_page_size().max(page_size()).max(1));
+    let unit = if huge <= len.checked_div(8).unwrap_or(0) {
+        huge
+    } else {
+        page
+    };
+    len.div_ceil(unit).checked_mul(unit)
 }
 
 /// `bytes` of private anonymous memory of protection `prot` mapped from an `align` boundary:

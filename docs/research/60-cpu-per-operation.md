@@ -24,6 +24,18 @@ The bench's own loop costs a share of each (`--harness-floor` runs each phase wi
 oracle answering in the engine's place): natively, 36-44 ns a get at 1M and 10M and 48-84 ns at
 100M (its oracle a bitmap of the key space), 75-150 ns a seek, 24-31 ns a put.
 
+The timed loop now makes the checks splinter_bench.c makes, and db_bench's are fewer: a get found
+is counted and its value's length checked; a seek's rows are counted, and it is found when its
+first row is the key sought. Before, it checked every answer against the oracle inside the timed
+loop: a get's found flag against the bitmap and its 100 value bytes, a seek's ten keys, each one
+formatted from the bitmap's next present key, and their values. SplinterDB's and RocksDB's loops
+did none of that, so the comparison timed work the other engines' runs never did. The oracle check
+is unchanged in what it checks, and now runs untimed: after the last phase, each query phase's
+queries are replayed in the same order, on the store as the phases left it, which the trickle and
+tombstone phases leave answering as the fill did, and every answer is checked in full. Every timed
+phase's counts of operations, keys found and rows must equal the replay's, or the run fails
+(`checked_against`, benches/ranges.rs).
+
 ## 2. A get's floor
 
 A get the kept memtables answer reads the kept index's slot, then the entry the slot names: two

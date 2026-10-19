@@ -306,6 +306,69 @@ struct Again {
     done: Mark,
 }
 
+/// A timed query's own check of its answer, as splinter_bench.c and db_bench make theirs: a get
+/// found is counted and its value's length checked; a seek's rows are counted, and it is found
+/// when its first row is the key sought. Each answer is checked against the fill's oracle in full
+/// after the last phase, untimed, by a replay of the same queries ([`Workload::checked`]), whose
+/// counts every timed phase's must equal. Returns the found flag and the rows.
+fn counted(
+    work: Work,
+    key: &[u8],
+    hit: bool,
+    value: &[u8],
+    page: &Rows,
+) -> Result<(bool, u64), BenchError> {
+    match work {
+        Work::Fill => Ok((hit, 0)),
+        Work::Get => {
+            if hit {
+                require(
+                    value.len() == fill_value().len(),
+                    "get value length differs from the fill's",
+                )?;
+            }
+            Ok((hit, 0))
+        }
+        Work::Seek(_) => Ok((
+            page.get(0).is_some_and(|(first, _)| first == key),
+            page.len() as u64,
+        )),
+    }
+}
+
+/// The replay of a query phase against the timed runs of it: each must have found as many keys
+/// and scanned as many rows, the replay having checked every answer against the oracle. Prints
+/// the replay's counts.
+fn checked_against(
+    verified: &Verified,
+    first: &Option<Phase>,
+    again: Option<&Phase>,
+) -> Result<(), BenchError> {
+    for phase in first.iter().chain(again) {
+        require(
+            phase.ops == verified.ops
+                && phase.found == verified.found
+                && phase.rows == verified.rows,
+            "a timed phase's counts differ from the oracle-checked replay's",
+        )?;
+    }
+    if let Some(phase) = first {
+        println!(
+            "{} verified untimed against the oracle: ops {} found {} rows {}",
+            phase.name, verified.ops, verified.found, verified.rows
+        );
+    }
+    Ok(())
+}
+
+/// What the untimed replay of a query phase found ([`Workload::verify_async`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Verified {
+    ops: u64,
+    found: u64,
+    rows: u64,
+}
+
 struct Phase {
     name: &'static str,
     ops: u64,
@@ -426,6 +489,157 @@ impl Workload {
         Ok((deletes, found, delete_lat, get_lat))
     }
 
+    /// A query's answer checked against the fill's oracle in full: its found flag, a get's value,
+    /// and a seek's count of rows and every row's key and value. Returns the found flag and the
+    /// rows.
+    fn checked(
+        &self,
+        work: Work,
+        start: u64,
+        hit: bool,
+        value: &[u8],
+        page: &Rows,
+        expected: &mut Vec<u64>,
+    ) -> Result<(bool, u64), BenchError> {
+        match work {
+            Work::Fill => Ok((hit, 0)),
+            Work::Get => {
+                require(
+                    hit == self.present.holds(start),
+                    "found flag differs from the fill oracle",
+                )?;
+                if hit {
+                    require(
+                        value == fill_value(),
+                        "get value differs from the fill oracle",
+                    )?;
+                }
+                Ok((hit, 0))
+            }
+            Work::Seek(limit) => {
+                self.present.after(start, limit, expected);
+                require(
+                    page.len() == expected.len(),
+                    "scan row count differs from the fill oracle",
+                )?;
+                for ((key, value), &number) in page.iter().zip(expected.iter()) {
+                    require(
+                        key == rocks_workload::key(number),
+                        "scan key differs from the fill oracle",
+                    )?;
+                    require(
+                        value == fill_value(),
+                        "scan value differs from the fill oracle",
+                    )?;
+                }
+                let key = rocks_workload::key(start);
+                let hit = page.get(0).is_some_and(|(first, _)| first == key);
+                require(
+                    hit == self.present.holds(start),
+                    "found flag differs from the fill oracle",
+                )?;
+                Ok((hit, page.len() as u64))
+            }
+        }
+    }
+
+    /// The `n` queries of `work` each client thread makes, replayed untimed in the order its
+    /// timed phase made them (the same streams), every answer checked against the fill's oracle in
+    /// full ([`Self::checked`]).
+    fn verify(&self, ranges: &Ranges, n: u64, work: Work) -> Result<Verified, BenchError> {
+        let phase = match work {
+            Work::Fill => {
+                return Ok(Verified {
+                    ops: 0,
+                    found: 0,
+                    rows: 0,
+                });
+            }
+            Work::Get => 2,
+            Work::Seek(_) => 3,
+        };
+        let mut total = Verified {
+            ops: 0,
+            found: 0,
+            rows: 0,
+        };
+        for thread in 0..self.threads {
+            let mut client = ranges.client()?;
+            let mut rng = self.rng(phase, thread);
+            let (mut value, mut page, mut next, mut expected) =
+                (Vec::new(), Rows::new(), Vec::new(), Vec::new());
+            for _ in 0..n {
+                let start = rng.next() % self.num;
+                let key = rocks_workload::key(start);
+                page.clear();
+                next.clear();
+                let hit = match work {
+                    Work::Fill => true,
+                    Work::Get => client.get(&key, &mut value)?,
+                    Work::Seek(limit) => {
+                        client.scan(&key, None, limit, &mut page, &mut next)?;
+                        false
+                    }
+                };
+                let (hit, rows) = self.checked(work, start, hit, &value, &page, &mut expected)?;
+                total.ops += 1;
+                total.found += u64::from(hit);
+                total.rows += rows;
+            }
+        }
+        Ok(total)
+    }
+
+    /// [`Self::verify`] with the client task on the range's shard, as [`Self::phase_async`].
+    async fn verify_async(
+        &self,
+        ranges: &Ranges,
+        n: u64,
+        work: Work,
+    ) -> Result<Verified, BenchError> {
+        let phase = match work {
+            Work::Fill => {
+                return Ok(Verified {
+                    ops: 0,
+                    found: 0,
+                    rows: 0,
+                });
+            }
+            Work::Get => 2,
+            Work::Seek(_) => 3,
+        };
+        let mut client = ranges.client()?;
+        let mut rng = self.rng(phase, 0);
+        let (mut value, mut page, mut next, mut expected) =
+            (Vec::new(), Rows::new(), Vec::new(), Vec::new());
+        let mut total = Verified {
+            ops: 0,
+            found: 0,
+            rows: 0,
+        };
+        for _ in 0..n {
+            let start = rng.next() % self.num;
+            let key = rocks_workload::key(start);
+            page.clear();
+            next.clear();
+            let hit = match work {
+                Work::Fill => true,
+                Work::Get => client.get_async(&key, &mut value).await?,
+                Work::Seek(limit) => {
+                    client
+                        .scan_async(&key, None, limit, &mut page, &mut next)
+                        .await?;
+                    false
+                }
+            };
+            let (hit, rows) = self.checked(work, start, hit, &value, &page, &mut expected)?;
+            total.ops += 1;
+            total.found += u64::from(hit);
+            total.rows += rows;
+        }
+        Ok(total)
+    }
+
     fn rng(&self, phase: u64, thread: u64) -> rocks_workload::Rng {
         // db_bench_tool.cc RunBenchmark increments total_thread_count for every thread in
         // every phase; ThreadState seeds Random64 with seed + that count. Keep the helper's
@@ -451,7 +665,6 @@ impl Workload {
                         let mut value = Vec::new();
                         let mut page = Rows::new();
                         let mut next = Vec::new();
-                        let mut expected = Vec::new();
                         let mut found = 0;
                         let mut rows = 0;
                         for _ in 0..n {
@@ -473,46 +686,8 @@ impl Workload {
                             let now = Instant::now();
                             lat.record(now.duration_since(last).as_nanos() as u64);
                             last = now;
-                            let hit = match work {
-                                Work::Fill => hit,
-                                Work::Get => {
-                                    require(
-                                        hit == self.present.holds(start),
-                                        "found flag differs from the fill oracle",
-                                    )?;
-                                    if hit {
-                                        require(
-                                            value.as_slice() == fill_value(),
-                                            "get value differs from the fill oracle",
-                                        )?;
-                                    }
-                                    hit
-                                }
-                                Work::Seek(limit) => {
-                                    self.present.after(start, limit, &mut expected);
-                                    require(
-                                        page.len() == expected.len(),
-                                        "scan row count differs from the fill oracle",
-                                    )?;
-                                    for ((key, value), &number) in page.iter().zip(&expected) {
-                                        require(
-                                            key == rocks_workload::key(number),
-                                            "scan key differs from the fill oracle",
-                                        )?;
-                                        require(
-                                            value == fill_value(),
-                                            "scan value differs from the fill oracle",
-                                        )?;
-                                    }
-                                    rows += page.len() as u64;
-                                    let hit = page.get(0).is_some_and(|(first, _)| first == key);
-                                    require(
-                                        hit == self.present.holds(start),
-                                        "found flag differs from the fill oracle",
-                                    )?;
-                                    hit
-                                }
-                            };
+                            let (hit, scanned) = counted(work, &key, hit, &value, &page)?;
+                            rows += scanned;
                             found += u64::from(hit);
                         }
                         Ok::<_, BenchError>((lat, found, rows))
@@ -561,7 +736,6 @@ impl Workload {
         let mut value = Vec::new();
         let mut page = Rows::new();
         let mut next = Vec::new();
-        let mut expected = Vec::new();
         let mut found = 0;
         let mut rows = 0;
         for _ in 0..n {
@@ -585,46 +759,8 @@ impl Workload {
             let now = Instant::now();
             lat.record(now.duration_since(last).as_nanos() as u64);
             last = now;
-            let hit = match work {
-                Work::Fill => hit,
-                Work::Get => {
-                    require(
-                        hit == self.present.holds(start),
-                        "found flag differs from the fill oracle",
-                    )?;
-                    if hit {
-                        require(
-                            value.as_slice() == fill_value(),
-                            "get value differs from the fill oracle",
-                        )?;
-                    }
-                    hit
-                }
-                Work::Seek(limit) => {
-                    self.present.after(start, limit, &mut expected);
-                    require(
-                        page.len() == expected.len(),
-                        "scan row count differs from the fill oracle",
-                    )?;
-                    for ((key, value), &number) in page.iter().zip(&expected) {
-                        require(
-                            key == rocks_workload::key(number),
-                            "scan key differs from the fill oracle",
-                        )?;
-                        require(
-                            value == fill_value(),
-                            "scan value differs from the fill oracle",
-                        )?;
-                    }
-                    rows += page.len() as u64;
-                    let hit = page.get(0).is_some_and(|(first, _)| first == key);
-                    require(
-                        hit == self.present.holds(start),
-                        "found flag differs from the fill oracle",
-                    )?;
-                    hit
-                }
-            };
+            let (hit, scanned) = counted(work, &key, hit, &value, &page)?;
+            rows += scanned;
             found += u64::from(hit);
         }
         #[cfg(feature = "profile-phases")]
@@ -1040,7 +1176,7 @@ fn main() -> Result<(), BenchError> {
         rt.tasks_per_shard
     );
     println!(
-        "workload generator rocksdb-mt19937_64 seed {seed} key_padding ascii-0 values repeated-v value_bytes {} num {num} client_threads {threads} ranges {threads} shards {threads} reads_per_thread {reads} seeks_per_thread {seeks} seek_nexts {seek_nexts} issuer_depth {issuer_depth} runs_in_flight_per_range {issuer_depth} cache_mib {cache_mib} write_budget_mib {write_budget_mib} oracle_keys {} throughput full-oracle latency since-previous-completion barriers flush+durable-checkpoint",
+        "workload generator rocksdb-mt19937_64 seed {seed} key_padding ascii-0 values repeated-v value_bytes {} num {num} client_threads {threads} ranges {threads} shards {threads} reads_per_thread {reads} seeks_per_thread {seeks} seek_nexts {seek_nexts} issuer_depth {issuer_depth} runs_in_flight_per_range {issuer_depth} cache_mib {cache_mib} write_budget_mib {write_budget_mib} oracle_keys {} throughput counted-as-splinter_bench oracle-replay-untimed latency since-previous-completion barriers flush+durable-checkpoint",
         fill_value().len(),
         workload.present.len()
     );
@@ -1277,6 +1413,25 @@ fn main() -> Result<(), BenchError> {
                     }
                     None => None,
                 };
+                // Every timed query's answer checked against the oracle in full, untimed, by a
+                // replay of the same queries on the store as the phases left it: the trickle
+                // puts the fill's values again and the tombstones delete absent keys, so the
+                // oracle's answers are unchanged, and each timed phase's counts must be the
+                // replay's.
+                if reads > 0 {
+                    let verified = workload.verify_async(&ranges, reads, Work::Get).await?;
+                    checked_against(&verified, &get, again.as_ref().and_then(|a| a.get.as_ref()))?;
+                }
+                if seeks > 0 {
+                    let verified = workload
+                        .verify_async(&ranges, seeks, Work::Seek(seek_nexts))
+                        .await?;
+                    checked_against(
+                        &verified,
+                        &seek,
+                        again.as_ref().and_then(|a| a.seek.as_ref()),
+                    )?;
+                }
                 drop(client);
                 ranges.stop_async().await?;
                 Ok::<_, BenchError>((
@@ -1344,6 +1499,20 @@ fn main() -> Result<(), BenchError> {
         } else {
             None
         };
+        // Every timed query's answer checked against the oracle in full, untimed, as on the
+        // shard-client path.
+        if reads > 0 {
+            let verified = workload.verify(&ranges, reads, Work::Get)?;
+            checked_against(&verified, &get, again.as_ref().and_then(|a| a.get.as_ref()))?;
+        }
+        if seeks > 0 {
+            let verified = workload.verify(&ranges, seeks, Work::Seek(seek_nexts))?;
+            checked_against(
+                &verified,
+                &seek,
+                again.as_ref().and_then(|a| a.seek.as_ref()),
+            )?;
+        }
         drop(client);
         ranges.stop()?;
 

@@ -186,8 +186,9 @@ impl Drop for LazyZeroed {
 
 /// `len` bytes of anonymous memory, zero, faulted in for writing when made, which Linux backs with
 /// transparent huge pages where it has them (`madvise(MADV_HUGEPAGE)`, madvise(2)). For a table
-/// read at random over gigabytes: on 4 KiB pages its probes walk the page tables, which cost a 10M
-/// get the read a one-read layout saves (research/63 §4). Released when dropped.
+/// read at random: on 4 KiB pages its probes walk the page tables, which cost a 10M get the read a
+/// one-read layout saves (research/63 §4), and a put its memtable index's probe (research/63 §10).
+/// Released when dropped.
 ///
 /// It is faulted in for writing at once (`MADV_POPULATE_WRITE`, Linux 5.14) because a first touch
 /// that reads, as a table's probe before its insert does, maps the shared zero page, and the write
@@ -248,7 +249,7 @@ impl HugeZeroed {
             return Ok(Self::empty());
         }
         let refused = || Error::LimitExceeded {
-            what: "a kept record table (the OS refused the mapping)",
+            what: "a table on huge pages (the OS refused the mapping)",
             limit: u64::try_from(len).unwrap_or(u64::MAX),
         };
         let huge = huge_page_size().max(page_size()).max(1);
@@ -269,7 +270,7 @@ impl HugeZeroed {
     #[cfg(not(target_os = "linux"))]
     pub fn allocate(len: usize) -> Result<Self, Error> {
         let refused = |_| Error::LimitExceeded {
-            what: "a kept record table (the OS refused the mapping)",
+            what: "a table on huge pages (the OS refused the mapping)",
             limit: u64::try_from(len).unwrap_or(u64::MAX),
         };
         if len == 0 {
@@ -484,6 +485,51 @@ impl HugeZeroed {
             None => &mut [],
         }
     }
+
+    /// Its bytes as 64-bit words, a tail shorter than one left out.
+    pub fn u64s(&self) -> &[u64] {
+        match self.addr {
+            // SAFETY: as `bytes`; a mapping starts on a page's boundary, so it is aligned for
+            // u64, `len / 8` words lie within its `len` bytes, and every bit pattern is a u64.
+            Some(addr) => unsafe {
+                std::slice::from_raw_parts(addr.as_ptr().cast::<u64>(), self.len / 8)
+            },
+            None => &[],
+        }
+    }
+
+    /// [`Self::u64s`], written.
+    pub fn u64s_mut(&mut self) -> &mut [u64] {
+        match self.addr {
+            // SAFETY: as `u64s`, and `&mut self` makes this the mapping's only borrow.
+            Some(addr) => unsafe {
+                std::slice::from_raw_parts_mut(addr.as_ptr().cast::<u64>(), self.len / 8)
+            },
+            None => &mut [],
+        }
+    }
+
+    /// Its bytes as 32-bit words, a tail shorter than one left out.
+    pub fn u32s(&self) -> &[u32] {
+        match self.addr {
+            // SAFETY: as `u64s`, for u32: aligned, `len / 4` words within, any bit pattern.
+            Some(addr) => unsafe {
+                std::slice::from_raw_parts(addr.as_ptr().cast::<u32>(), self.len / 4)
+            },
+            None => &[],
+        }
+    }
+
+    /// [`Self::u32s`], written.
+    pub fn u32s_mut(&mut self) -> &mut [u32] {
+        match self.addr {
+            // SAFETY: as `u32s`, and `&mut self` makes this the mapping's only borrow.
+            Some(addr) => unsafe {
+                std::slice::from_raw_parts_mut(addr.as_ptr().cast::<u32>(), self.len / 4)
+            },
+            None => &mut [],
+        }
+    }
 }
 
 /// The size of a transparent huge page, the unit [`HugeZeroed`] populates in: the kernel's own
@@ -640,5 +686,25 @@ mod huge_tests {
         assert!(m.is_empty());
         m.resize(10).unwrap();
         assert!(m.bytes().iter().all(|&b| b == 0));
+    }
+
+    /// The word views are the bytes in the machine's order, a tail shorter than a word left out,
+    /// and what one view writes the others read.
+    #[test]
+    fn a_mapping_s_word_views_are_its_bytes() {
+        let mut m = HugeZeroed::allocate(2 * 1024 * 1024 + 6).unwrap();
+        assert_eq!(m.u64s().len(), (2 * 1024 * 1024 + 6) / 8);
+        assert_eq!(m.u32s().len(), (2 * 1024 * 1024 + 6) / 4);
+        assert!(m.u64s().iter().all(|&w| w == 0));
+        let last = m.u64s().len() - 1;
+        m.u64s_mut()[last] = 0x0102_0304_0506_0708;
+        let at = last * 8;
+        assert_eq!(
+            m.bytes()[at..at + 8],
+            0x0102_0304_0506_0708u64.to_ne_bytes()
+        );
+        m.u32s_mut()[1] = 0xdead_beef;
+        assert_eq!(m.bytes()[4..8], 0xdead_beefu32.to_ne_bytes());
+        assert!(HugeZeroed::empty().u64s().is_empty() && HugeZeroed::empty().u32s().is_empty());
     }
 }

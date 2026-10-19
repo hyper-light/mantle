@@ -673,7 +673,7 @@ impl HashMem {
     /// ([`KeyIndex::for_entries`]).
     pub fn new_for(limit: usize, entries: usize) -> Result<Self, Error> {
         let mut mem = Self::new(limit)?;
-        mem.index = KeyIndex::for_entries(entries);
+        mem.index = KeyIndex::for_entries(entries)?;
         Ok(mem)
     }
 
@@ -1074,6 +1074,7 @@ impl HashMem {
         put_varint32s(&mut self.arena, &[code, u32::from(klen), vlen]);
         self.arena.extend_from_slice(key);
         self.arena.extend_from_slice(value);
+        let mirror_from = self.mirror.len();
         if self.mirrored {
             // Within the room reserved, so the copy never reallocates; past it (never, as the
             // arena's bound is the room) the mirror is no longer whole.
@@ -1088,12 +1089,23 @@ impl HashMem {
             }
         }
         let arena = &self.arena;
-        let replaced = self.index.put(
+        let replaced = match self.index.put(
             h,
             entry,
             |e| self::key(arena, e) == key,
             |e| hash(self::key(arena, e)),
-        );
+        ) {
+            Ok(replaced) => replaced,
+            Err(error) => {
+                // The index's growth was refused its memory: the entry's bytes go again, so the
+                // memtable, and the mirror a worker sorts, hold what they held. What changed before
+                // only narrows the keys' shared prefix or drops a scan's cached segments.
+                self.arena
+                    .truncate(usize::try_from(entry).unwrap_or(usize::MAX));
+                self.mirror.truncate(mirror_from);
+                return Err(error);
+            }
+        };
         if replaced.is_none() {
             self.len = self.len.saturating_add(1);
         }

@@ -376,3 +376,24 @@ the gets with 1.36 GB of live pages and 1.39 GB spare. Test:
 `store::cache::tests::a_retirement_ends_once_a_raised_limit_holds_the_room` (a retirement begun
 under a lowered limit, the limit raised: the retirement is over, a loan is made and its pages
 read back); without `resize`'s settle it fails at its first assertion (box, retire 0fdf9c1f).
+
+At 1B in the box's 64 GB scope (retire 0fdf9c1f, r791; the box at a load of 60 to 290 from other
+work through the run, where land10's r752 ran at 10 to 60), the cache began the gets holding 30.5
+GB of live pages where land10's held none, and the gets read the device about a third less:
+
+| 1B, box, 64 GB scope | land10 r752 | retire r791 |
+|---|---|---|
+| live pages when the gets begin | 0 | 7,983,683 (30.5 GB) |
+| device reads in 1M gets | 595,301 | 374,117 |
+| gets made in memory (inline) | 496,744 | 629,844 |
+| a get's median | 47.1 µs | 8.2 µs |
+| seeks made in memory | 0 | 407,012 |
+| seeks a second | 12,584 | 15,136 |
+| gets a second | 29,533 | 14,606 |
+
+The gets' rate fell with the load, through its tail (p99.9 3.5 ms, p99.99 55 ms, against 0.8 and 1.8
+ms in r752), not through its device reads; a run on a quiet host decides it. The cache held 43.8 GB
+in all: 30.5 GB of live pages, 5.6 GB of dead slots in loans' chunks some of whose pages were
+forgotten, 4.7 GB of spare loan memory kept for loans after the fill had ended, and the rest its
+index and ghost. The loans could not hold 22.1M pages of what their workers wrote (84 GB of 412 GB):
+what the cache holds when the gets begin is the next question at this size, not its limit.

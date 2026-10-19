@@ -193,3 +193,35 @@ then none, then memory again. Every read is checked against an oracle throughout
 free, the next rotation's look lowers the budget from its bound to what the shard holds at most;
 it never rises while nothing is free, the regions and kept memtables hold no more than it, and the
 kept memtables give memory back. When memory returns, so does the budget.
+
+## 8. Spare loan memory crowds out the pages
+
+With the budget following the machine, every run in the VM's 24 GiB container survived (eight
+of eight). But the first gets after the fill ran at 24K-137K a second, where the reading-only
+runs that survived ran at 316K-728K. The page cache's own account shows why (pages of 4 KiB):
+
+| 100M, VM, 24 GiB | live pages | spare pages | device reads in the queries | gets/s |
+|---|---|---|---|---|
+| reading only (memlimd) | 1,995,461 | 2,393,022 | 0 | 728,226 |
+| budget follows (memlimf) | 337,242 | 3,755,238 | 1,613,151 | 59,992 |
+| budget follows (memlim3) | 0 | 4,489,097 | 1,944,078 | 24,087 |
+
+A loan (`Cache::lend`) lends the page cache's memory to a worker for the pages it writes; when
+the loan comes back, its chunk holds the pages kept (`Held::Kept`). Once every one of those pages
+is forgotten, as a branch merged away forgets its pages together, the chunk is spare
+(`Held::Spare`): mapped memory kept for the next loan, holding no page. Spare chunks count against
+the cache's limit, and read slots never use them. Nothing bounded them. At 100M with no limit,
+land9's cache held 7.6 GiB of live pages, 2.2 GiB of dead slots and 10 GiB of spare loan memory
+in 21 GB (r6085, `postfill_waits`), while the loans, about 13K pages each with at most one a
+worker, never had more than about 0.9 GiB out at once. Under a budget that falls, the spare took
+all but 50K pages of the cache's limit, and the get working set no longer fit.
+
+Spare memory is now bounded by the most the loans have had out at once, less what is out now
+(`Cache::shed_spare`). Beyond that, no loan has needed it, and its memory goes back to the OS
+whenever a chunk becomes spare. The next loan still takes spare memory, already mapped, before
+fresh memory. A chunk given back keeps its slot entries (`Held::Hollow`), as a trim's does. Fresh
+memory is taken only when loans pass their earlier peak, so these entries are bounded by the
+workers times the largest loan. Tests: `store::cache::tests::spare_loan_memory_holds_no_more_than_the_loans_had_out_at_once`
+(eight loans in turn, their pages forgotten: spare stays within one loan, seven loans' memory
+goes back, and the next loan takes the spare), and the 40,000-step test, which now asserts the
+bound after every step.

@@ -562,11 +562,51 @@ impl Cache {
             return None;
         }
         self.grown = self.grown.saturating_add(1);
-        if self.make_slot() {
+        if self.make_slot() || self.spare_to_reads() {
             self.take_free()
         } else {
             None
         }
+    }
+
+    /// A spare chunk made into slots for reads, when a read finds none free and none can be made
+    /// under the limit: memory the loans left holding no page serves the read, where the read was
+    /// left out (a 1B store's reads met a full cache 5 GiB of whose memory was spare, docs/research/64
+    /// §14). Its slots go on the free list, its memory counted made, as a read-made chunk's.
+    fn spare_to_reads(&mut self) -> bool {
+        while let Some(c) = self.spares.pop() {
+            if self.held.get(c) != Some(&Held::Spare) {
+                continue;
+            }
+            let (Some(&first), Some(&size)) = (self.starts.get(c), self.sizes.get(c)) else {
+                continue;
+            };
+            let Some(bytes) = size.checked_mul(self.page) else {
+                continue;
+            };
+            if self.free.try_reserve(size).is_err() {
+                self.spares.push(c);
+                return false;
+            }
+            // Written to its whole room, so a slot is never made in it again (`make_slot`).
+            if !self
+                .chunks
+                .get_mut(c)
+                .is_some_and(|chunk| chunk.resize_zeroed(bytes))
+            {
+                self.spares.push(c);
+                return false;
+            }
+            if let Some(h) = self.held.get_mut(c) {
+                *h = Held::Grown;
+            }
+            self.spare_pages = self.spare_pages.saturating_sub(size);
+            self.loaned = self.loaned.saturating_sub(size);
+            self.made = self.made.saturating_add(size);
+            self.free.extend(first..first.saturating_add(size));
+            return true;
+        }
+        false
     }
 
     /// Pages the chunks have room for, made into slots or not.
@@ -1954,6 +1994,43 @@ mod tests {
             assert!(c.get(a, &mut out));
             assert_eq!(out, page(a));
         }
+    }
+
+    /// Memory a loan's chunk left spare, with the limit's room all held, is the reads' when a read
+    /// finds no slot: its page cached rather than left out, the chunk's other slots the next
+    /// reads'.
+    #[test]
+    fn a_read_takes_a_spare_chunk_when_the_limit_s_room_is_held() {
+        let mut c = Cache::new(64, 16, EXTENT);
+        c.loan_chunk = 64;
+        for a in 0..48u64 {
+            c.insert(a, &page(a));
+        }
+        let mut k = c.lend(64).unwrap();
+        let lent = k.fresh;
+        for a in 1000..1000 + lent as u64 {
+            k.keep(a, &page(a));
+        }
+        c.adopt(k);
+        c.forget_run(1000, lent as u64);
+        assert_eq!(c.room(), 64, "the loan's chunk holds the rest of the room");
+        assert_eq!(c.memory().spare, lent as u64);
+        assert_eq!(c.memory().live, 48);
+        c.insert(500, &page(500));
+        let mut out = Vec::new();
+        assert!(c.get(500, &mut out), "the read's page was left out");
+        assert_eq!(out, page(500));
+        assert_eq!(c.memory().spare, 0);
+        for a in 501..500 + lent as u64 {
+            c.insert(a, &page(a));
+        }
+        assert_eq!(c.memory().live, 48 + lent as u64);
+        for a in 500..500 + lent as u64 {
+            out.clear();
+            assert!(c.get(a, &mut out));
+            assert_eq!(out, page(a));
+        }
+        assert_eq!(c.room(), 64);
     }
 
     /// Chunks whose memory went back keep their slots in the table, and the room they gave back

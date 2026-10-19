@@ -1452,6 +1452,10 @@ pub struct RunCursor {
     value: std::ops::Range<usize>,
     value_copy: Vec<u8>,
     copied: bool,
+    /// Whether a value in a cache slot is read where it lies ([`Self::value_in`]) rather than
+    /// copied: a synchronous scan's only head's, whose row is pushed before the cursor moves and
+    /// beside which no other head lands a page that could take the slot.
+    in_place: bool,
     op: Op,
     valid: bool,
 }
@@ -1542,6 +1546,18 @@ impl Branch {
         self.place_at(store, c, from)
     }
 
+    /// [`Self::seek`] for a synchronous scan's only source, its values read where they lie
+    /// ([`RunCursor::value_in`]).
+    pub fn seek_in_place<F: BlockFile>(
+        &self,
+        store: &mut Store<F>,
+        from: &[u8],
+    ) -> Result<RunCursor, Error> {
+        let mut c = RunCursor::new(store)?;
+        c.in_place = true;
+        self.place_at(store, c, from)
+    }
+
     /// [`Self::seek`] for a compaction, which reads the branch to its end: an extent a read.
     pub fn seek_sequential<F: BlockFile>(
         &self,
@@ -1618,6 +1634,7 @@ impl RunCursor {
             value: 0..0,
             value_copy: store.take_page(),
             copied: false,
+            in_place: false,
             op: Op::Put,
             valid: false,
         }
@@ -1645,6 +1662,8 @@ impl RunCursor {
         self.op
     }
 
+    /// The value of a cursor that does not read in place, a compaction's: its copy, or its
+    /// place in the cursor's own page or span.
     pub fn value(&self) -> &[u8] {
         if self.copied {
             return &self.value_copy;
@@ -1652,6 +1671,16 @@ impl RunCursor {
         self.page_bytes()
             .and_then(|page| page.get(self.value.clone()))
             .unwrap_or(&[])
+    }
+
+    /// The value wherever it lies: its copy, its cache slot, or the cursor's own page or span.
+    pub fn value_in<'p, F: BlockFile>(&'p self, store: &'p Store<F>) -> Result<&'p [u8], Error> {
+        if self.copied {
+            return Ok(&self.value_copy);
+        }
+        self.page_in(store)?
+            .get(self.value.clone())
+            .ok_or(corrupt(Malformed::Truncated))
     }
 
     /// In the leaf held, wherever it lies: the index of its first entry at least `key` (its
@@ -1992,10 +2021,20 @@ impl RunCursor {
             &mut self.key,
             &mut self.prefixed,
         )?;
-        self.value_copy.clear();
-        self.value_copy
-            .extend_from_slice(page.get(value).ok_or(corrupt(Malformed::Truncated))?);
-        self.copied = true;
+        if self.in_place {
+            // Read from the slot when its row is pushed (`value_in`): a 1M seek copied each of
+            // its eleven values here and again into its rows.
+            if page.get(value.clone()).is_none() {
+                return Err(corrupt(Malformed::Truncated));
+            }
+            self.value = value;
+            self.copied = false;
+        } else {
+            self.value_copy.clear();
+            self.value_copy
+                .extend_from_slice(page.get(value).ok_or(corrupt(Malformed::Truncated))?);
+            self.copied = true;
+        }
         self.op = op;
         self.valid = true;
         Ok(())

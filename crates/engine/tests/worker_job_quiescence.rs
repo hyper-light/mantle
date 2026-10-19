@@ -220,7 +220,8 @@ fn a_worker_refuses_a_new_job_until_an_old_held_write_retires_then_reuses_its_st
     scan.open(&mut owner, &sources, b"", None, false, false)
         .unwrap();
     for (key, value) in &values {
-        assert_eq!(scan.entry(), Some((*key, Op::Put, value.as_slice())));
+        assert_eq!(scan.entry(), Some((*key, Op::Put)));
+        assert_eq!(scan.value(&owner).unwrap(), value.as_slice());
         scan.next(&mut owner).unwrap();
     }
     assert!(scan.entry().is_none());

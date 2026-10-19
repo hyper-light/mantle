@@ -28,9 +28,9 @@ impl Head<'_> {
         }
     }
 
-    fn value(&self) -> &[u8] {
+    fn value<'s, F: BlockFile>(&'s self, store: &'s Store<F>) -> Result<&'s [u8], Error> {
         match self {
-            Head::Branch(c, _) => c.value(),
+            Head::Branch(c, _) => c.value_in(store),
         }
     }
 
@@ -115,7 +115,12 @@ impl<'a> ScanMerge<'a> {
                 }
             }
             self.opened = self.opened.saturating_add(1);
+            // An only source's values are read where they lie: no other head lands a page
+            // between its entry's load and its row's push.
             let head = match *s {
+                Source::Branch(b) if sources.len() == 1 => {
+                    Head::Branch(b.seek_in_place(store, from)?, b)
+                }
                 Source::Branch(b) => Head::Branch(b.seek(store, from)?, b),
             };
             self.heads.push(head);
@@ -226,10 +231,21 @@ impl<'a> ScanMerge<'a> {
             .map(|(i, _)| i);
     }
 
-    /// The current entry: key, operation, value; none past the end.
-    pub fn entry(&self) -> Option<(&[u8], Op, &[u8])> {
+    /// The current entry's key and operation; none past the end.
+    pub fn entry(&self) -> Option<(&[u8], Op)> {
         let h = self.heads.get(self.current?)?;
-        Some((h.key()?, h.op(), h.value()))
+        Some((h.key()?, h.op()))
+    }
+
+    /// The current entry's value, wherever it lies ([`RunCursor::value_in`]).
+    pub fn value<'s, F: BlockFile>(&'s self, store: &'s Store<F>) -> Result<&'s [u8], Error> {
+        let h = self
+            .current
+            .and_then(|i| self.heads.get(i))
+            .ok_or(Error::InvalidArgument {
+                what: "a scan value with no current entry",
+            })?;
+        h.value(store)
     }
 
     /// With one source, its entries from the current one pushed to `out` in a run, a deletion
@@ -265,7 +281,7 @@ impl<'a> ScanMerge<'a> {
                 break;
             }
             if head.op() == Op::Put {
-                out.push(key, head.value());
+                out.push(key, head.value(store)?);
                 pushed = pushed.saturating_add(1);
             }
             head.next(store)?;
@@ -369,8 +385,19 @@ impl<'s, 'a, F: BlockFile> BorrowedScanMerge<'s, 'a, F> {
             .await
     }
 
-    pub(crate) fn entry(&self) -> Option<(&[u8], Op, &[u8])> {
+    pub(crate) fn entry(&self) -> Option<(&[u8], Op)> {
         self.merge.as_ref().and_then(ScanMerge::entry)
+    }
+
+    /// The current entry's value: a copy, since an async scan's heads yield between their loads
+    /// and their rows ([`RunCursor::value_in`]).
+    pub(crate) fn value(&self) -> Result<&[u8], Error> {
+        self.merge
+            .as_ref()
+            .ok_or(Error::InvalidArgument {
+                what: "an async scan after its merge was returned",
+            })?
+            .value(self.store)
     }
 
     pub(crate) fn open_ns(&self) -> &[u64] {

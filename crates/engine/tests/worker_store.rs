@@ -68,7 +68,8 @@ fn entries(s: &mut Store<DeviceFile>, parts: &[(Vec<u8>, Branch)]) -> Vec<(Vec<u
     let mut merge = ScanMerge::new();
     merge.open(s, &sources, b"", None, false, false).unwrap();
     let mut out = Vec::new();
-    while let Some((k, op, v)) = merge.entry() {
+    while let Some((k, op)) = merge.entry() {
+        let v = merge.value(s).unwrap();
         out.push((k.to_vec(), op, v.to_vec()));
         merge.next(s).unwrap();
     }

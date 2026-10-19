@@ -2724,7 +2724,7 @@ impl<F: BlockFile> ShardDb<F> {
                 }
             }
             // The smallest key any source holds next, copied so the sources can move.
-            let tree = merge.entry().map(|(k, _, _)| k);
+            let tree = merge.entry().map(|(k, _)| k);
             let mem_a = active.key().filter(|k| before_end(k));
             let mem_p = packing
                 .as_ref()
@@ -2752,7 +2752,7 @@ impl<F: BlockFile> ShardDb<F> {
                     Err(error) => break Err(error),
                 }
             }
-            let tree = merge.entry().map(|(k, _, _)| k);
+            let tree = merge.entry().map(|(k, _)| k);
             let Some(least) = [mem_a, mem_p, mem_f, tree].into_iter().flatten().min() else {
                 break Ok(false);
             };
@@ -2803,11 +2803,14 @@ impl<F: BlockFile> ShardDb<F> {
                     break 'walk Err(error);
                 }
             }
-            if let Some((k, op, v)) = merge.entry()
+            if let Some((k, op)) = merge.entry()
                 && k == key.as_slice()
             {
                 if !decided && op == Op::Put {
-                    out.push(key, v);
+                    match merge.value(store) {
+                        Ok(v) => out.push(key, v),
+                        Err(error) => break Err(error),
+                    }
                     taken = taken.saturating_add(1);
                 }
                 if let Err(error) = merge.next(store) {
@@ -2981,7 +2984,7 @@ impl<F: BlockFile> ShardDb<F> {
                 }
             }
             // The smallest key any source holds next, copied so the sources can move.
-            let tree = merge.entry().map(|(k, _, _)| k);
+            let tree = merge.entry().map(|(k, _)| k);
             let mem_a = active.key().filter(|k| before_end(k));
             let mem_p = packing
                 .as_ref()
@@ -3036,11 +3039,11 @@ impl<F: BlockFile> ShardDb<F> {
                 }
                 c.advance(&f.mem)?;
             }
-            if let Some((k, op, v)) = merge.entry()
+            if let Some((k, op)) = merge.entry()
                 && k == key.as_slice()
             {
                 if !decided && op == Op::Put {
-                    out.push(key, v);
+                    out.push(key, merge.value()?);
                     taken = taken.saturating_add(1);
                 }
                 merge.next().await?;

@@ -55,10 +55,10 @@ fn run<'a>(
                 .open(store, &sources, &from, None, false, false)
                 .unwrap();
             for _ in 0..nexts {
-                let Some((key, _, value)) = merge.entry() else {
+                let Some((key, _)) = merge.entry() else {
                     break;
                 };
-                rows.push(key, value);
+                rows.push(key, merge.value(store).unwrap());
                 merge.next(store).unwrap();
             }
         } else {

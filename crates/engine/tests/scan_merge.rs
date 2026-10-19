@@ -100,8 +100,9 @@ fn reused_single_and_multiple_heads_keep_bounds_versions_and_deletions() {
                         .open(&mut store, &sources, from, end, false, false)
                         .unwrap();
                     let mut got = Vec::new();
-                    while let Some((key, op, value)) = merge.entry() {
+                    while let Some((key, op)) = merge.entry() {
                         assert!(got.len() <= want.len(), "a merge that does not end");
+                        let value = merge.value(&store).unwrap();
                         got.push((key.to_vec(), op, value.to_vec()));
                         merge.next(&mut store).unwrap();
                     }
@@ -158,7 +159,8 @@ fn a_failed_single_head_step_can_reopen_over_another_run() {
     let mut got = Vec::new();
     let mut failed = false;
     for _ in 0..=entries.len() {
-        let (key, op, value) = merge.entry().unwrap();
+        let (key, op) = merge.entry().unwrap();
+        let value = merge.value(&store).unwrap();
         got.push((key.to_vec(), op, value.to_vec()));
         match merge.next(&mut store) {
             Ok(()) => {}
@@ -187,8 +189,9 @@ fn a_failed_single_head_step_can_reopen_over_another_run() {
         )
         .unwrap();
     got.clear();
-    while let Some((key, op, value)) = merge.entry() {
+    while let Some((key, op)) = merge.entry() {
         assert!(got.len() <= good.len(), "a merge that does not end");
+        let value = merge.value(&store).unwrap();
         got.push((key.to_vec(), op, value.to_vec()));
         merge.next(&mut store).unwrap();
     }
@@ -278,7 +281,7 @@ fn a_run_of_one_source_pushes_its_puts_to_each_bound_and_refuses_two() {
     assert_eq!(pushed, Some(want.len()));
     assert_eq!(rows_of(&rows), want);
     assert_eq!(
-        merge.entry().map(|(k, _, _)| k.to_vec()),
+        merge.entry().map(|(k, _)| k.to_vec()),
         Some(b"k/0050".to_vec())
     );
     // The merge's end at k/0120: every put before it, no entry current.
@@ -331,13 +334,13 @@ fn a_run_of_one_source_pushes_its_puts_to_each_bound_and_refuses_two() {
             false,
         )
         .unwrap();
-    let before = merge.entry().map(|(k, _, _)| k.to_vec());
+    let before = merge.entry().map(|(k, _)| k.to_vec());
     let mut rows = mantle_engine::rows::Rows::new();
     assert_eq!(
         merge.push_run(&mut store, 1000, None, &mut rows).unwrap(),
         None
     );
     assert!(rows.iter().next().is_none());
-    assert_eq!(merge.entry().map(|(k, _, _)| k.to_vec()), before);
+    assert_eq!(merge.entry().map(|(k, _)| k.to_vec()), before);
     merge.close(&mut store);
 }

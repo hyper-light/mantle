@@ -230,8 +230,9 @@ fn scan(
         merge
             .open(store, &sources, &from, hi, end.is_some(), false)
             .unwrap();
-        while let Some((key, op, value)) = merge.entry() {
+        while let Some((key, op)) = merge.entry() {
             if op == Op::Put {
+                let value = merge.value(store).unwrap();
                 got.push((key.to_vec(), value.to_vec()));
                 assert!(got.len() <= keys, "a scan repeated a key");
             }

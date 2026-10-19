@@ -1487,10 +1487,10 @@ impl<F: BlockFile> ShardDb<F> {
                 follow.ceiling = Some(held.saturating_sub(step));
             }
             Some(Stalled::Quiet) => {
-                follow.ceiling = follow.ceiling.and_then(|c| {
-                    let up = c.saturating_add(c.saturating_mul(TUNE_STEP_PERCENT) / 100);
-                    (up < follow.bound).then_some(up)
-                });
+                follow.ceiling = follow
+                    .ceiling
+                    .map(|c| c.saturating_add(c.saturating_mul(TUNE_STEP_PERCENT) / 100))
+                    .filter(|&up| up < follow.bound);
             }
             Some(Stalled::Within) | None => {}
         }

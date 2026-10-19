@@ -21,8 +21,8 @@ pub fn memory_stalled_us() -> Option<u64> {
             })
             .filter(|p| some_total(p).is_some());
         own.or_else(|| {
-            let machine = std::path::PathBuf::from("/proc/pressure/memory");
-            some_total(&machine).is_some().then_some(machine)
+            Some(std::path::PathBuf::from("/proc/pressure/memory"))
+                .filter(|p| some_total(p).is_some())
         })
     });
     path.as_deref().and_then(some_total)

@@ -565,7 +565,7 @@ impl HugeZeroed {
 /// Linux runs mantle on (x86_64 and aarch64: 2 MiB on 4 KiB pages, 32 MiB on 16 KiB, 512 MiB on
 /// 64 KiB).
 #[cfg(target_os = "linux")]
-fn huge_page_size() -> usize {
+pub fn huge_page_size() -> usize {
     static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
         std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size")

@@ -471,3 +471,35 @@ Both are fixed at their cause ([`Cache::lend`], `make_now`, `unreserved`):
 
 Two tests reproduce the trace's two defects on the old code, and the cache's 40,000-step test
 checks the bound, and that every hollow chunk is listed for the next loan, after every step.
+
+## 14. 1B in the VM with the cache working
+
+One round each in the VM (62.7 GiB, 18 CPUs), the engines the same day: the candidate (hollowio
+b6793592: §11's retirement fix, §12's loan chunks, §13's hollow chunks, and the bench's per-phase
+storage bytes) beside fairq, whose cache §11's freeze left empty (`runs/n1000000000-r6491-x_hollow`,
+`r6401-x_fairq`, `r6401-sdb32all`, `r6401-rocks32`).
+
+| 1B | candidate | fairq | SplinterDB | RocksDB |
+|---|---|---|---|---|
+| fill | 1.87M/s (534 s) | 2.80M/s (357 s) | 1.21M/s | 636K/s |
+| gets | 21.5K/s | 8.7K/s | 9.64K/s | 13.2K/s |
+| seeks | 10.4K/s | 3.77K/s | 1.68K/s | 5.56K/s |
+| fill CPU a put (system) | 2,540 ns (1,031) | 1,996 ns (689) | 1,414 ns | |
+| fill page faults | 124.8M | 76.4M | | |
+| fill stalls, worst put | 269, 10.7 s | 137, 4.2 s | 2.2 s | |
+| run's reads, writes (rusage) | 522 GB, 615 GB | 430 GB, 635 GB | | |
+| cache at the fill's end: live, dead, spare | 38.9, 0.1, 5.4 GiB | 0, 0, 2.8 GiB | | |
+| loans' pages kept, missed | 423 GiB, 67 GiB | 121 GiB, 1.7 GiB | | |
+
+The cache holds the tree now: 38.9 GiB live at the fill's end, dead memory 0.1 GiB where §12 had
+a third of the cache, the slot table 12.7M slots against a 12.3M-page limit, and the reads grow it
+(40.0 GiB live after the gets, 42.0 after the seeks, 43.7 after the tombstones, the limit 47 GiB).
+A get read the device 0.30 times (298,685 reads for 1M gets) at 46.5 µs a get, and the gets and
+seeks ran 2.5 and 2.8 times fairq's.
+
+The fill lost a third. Its storage, measured for the phase alone now (`fillrandom storage`), read
+313 GB and wrote 525 GB. Against fairq's fill it took 48.4M more page faults and 342 ns a put more
+system time, and stalled twice as often. The loans kept 3.5 times fairq's pages, about half of
+them in memory newly mapped and faulted a page at a time; and the page cache the OS kept beside an
+empty engine cache, which served the compactions' reads, is the engine's own cache now, which the
+workers do not read. A traced 1B fill attributes the time (queue 94).

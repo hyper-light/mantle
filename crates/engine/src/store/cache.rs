@@ -2143,7 +2143,9 @@ mod tests {
     #[test]
     fn a_retirement_ends_once_spare_memory_given_back_brings_the_room_within_the_limit() {
         let mut c = Cache::new(1000, 64, EXTENT);
-        // A loan's chunk of 200 pages first, then 800 read slots after it.
+        // A loan's chunk of 200 pages first, then 800 read slots after it: one chunk on every
+        // platform, whose loan chunks are otherwise a huge page's pages or one extent's.
+        c.loan_chunk = 200;
         let mut k = c.lend(200).unwrap();
         for a in 5000..5200u64 {
             k.keep(a, &page(a));

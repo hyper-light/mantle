@@ -1023,13 +1023,6 @@ impl Trunk {
         };
         let idle = self.pool.as_ref().map_or(1, Pool::idle);
         for &(ref step, rent) in path {
-            let (entries, pages_own) = self.bundle_size(step, pages.extent_pages);
-            let price = wall_price(
-                entries
-                    .saturating_mul(key_ns)
-                    .saturating_add(pages_own.saturating_mul(page_ns)),
-                idle,
-            );
             let Some(pivot) = self
                 .nodes
                 .get_mut(step.node)
@@ -1052,7 +1045,26 @@ impl Trunk {
                 continue;
             }
             pivot.seek.ns = pivot.seek.ns.saturating_add(rent);
-            if !pivot.seek.paid && pivot.seek.ns >= price {
+            if pivot.seek.paid {
+                continue;
+            }
+            // Priced only where a rent may now cover it: a step with no rent, as a settled leaf
+            // and an index pivot with no sources of its own are, or one already paid, weighs
+            // nothing (a 1M seek's walk of every step's branches, docs/research/64 §18).
+            let held = pivot.seek.ns;
+            let (entries, pages_own) = self.bundle_size(step, pages.extent_pages);
+            let price = wall_price(
+                entries
+                    .saturating_mul(key_ns)
+                    .saturating_add(pages_own.saturating_mul(page_ns)),
+                idle,
+            );
+            if held >= price
+                && let Some(pivot) = self
+                    .nodes
+                    .get_mut(step.node)
+                    .and_then(|n| n.pivots.get_mut(step.pivot))
+            {
                 pivot.seek.paid = true;
                 self.paid = self.paid.saturating_add(1);
                 let counted = if step.leaf {

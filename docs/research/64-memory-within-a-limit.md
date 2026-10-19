@@ -274,3 +274,67 @@ The longest puts are not the looks. A trace of every rotation and packing (stall
 three runs with no limit, three in 24 GiB) put each stall of 300 ms or more on a packing's wait for
 its writes, 0.69-0.83 s once each for three packings at once (research/58 §8's journal waits); no
 look took more than 24 ms.
+
+## 10. The release gate (land10, 24c1084d)
+
+land10 is land9 with §4-§9. The VM, no limit, all arms interleaved (run7's order), in ops a
+second (n = rounds):
+
+| 1M, 8 rounds (r6211-6218) | fill | gets | seeks |
+|---|---|---|---|
+| RocksDB | 979,456 | 698,843 | 222,914 |
+| SplinterDB | 1,429,009 | 1,887,110 | 352,433 |
+| main63 | 6,207,072 | 4,715,282 | 1,317,354 |
+| land10 | 7,220,702 | 4,829,191 | 1,319,390 |
+
+| 10M, 6 rounds (r6221-6226) | fill | gets | seeks |
+|---|---|---|---|
+| RocksDB | 943,824 | 277,046 | 124,872 |
+| SplinterDB | 1,295,537 | 961,262 | 221,009 |
+| main63 | 4,912,822 | 3,080,342 | 1,029,052 |
+| land9 | 6,954,509 | 4,478,570 | 1,003,508 |
+| land10 | 7,221,894 | 4,523,253 | 1,019,846 |
+
+| 100M, 6 rounds (r6231-6236) | fill | gets | seeks |
+|---|---|---|---|
+| RocksDB | 851,716 | 250,761 | 77,212 |
+| SplinterDB | 1,351,961 | 400,706 | 49,210 |
+| main63 | 4,416,734 | 2,100,036 | 610,558 |
+| land9 | 6,090,162 | 2,569,302 | 598,420 |
+| land10 | 5,835,783 | 2,567,592 | 634,012 |
+
+| land10 | fill | gets | seeks |
+|---|---|---|---|
+| 10M x SplinterDB | 5.57x | 4.71x | 4.61x |
+| 10M x RocksDB | 7.65x | 16.3x | 8.17x |
+| 100M x SplinterDB | 4.32x | 6.41x | 12.9x |
+| 100M x RocksDB | 6.85x | 10.2x | 8.21x |
+
+In a 24 GiB container, three runs of three survived (fill 4.80M-5.40M, gets 562K-755K, seeks
+448K-640K). On the box, in the 64 GB scope where main63 and land8 were killed at 1B, land10
+completed both runs, beside SplinterDB's three (the box under kiln's load, which moves SplinterDB's
+fill 2.8x between its runs):
+
+| 1B, box | fill | gets | seeks | worst put |
+|---|---|---|---|---|
+| land10 r751, r752 | 2,950,196, 3,618,068 | 26,343, 29,533 | 10,966, 12,584 | 16.1 s, 4.5 s |
+| SplinterDB r711, r721, r751 | 228,879-650,377 | 2,575-18,942 | 988-3,160 | 45.2, 8.5, 5.0 s |
+
+With no limit at 100M, land10 runs land9's gets at 0.93-0.95x and seeks at 1.05-1.07x over three
+12-round runs (r6241-6252, r6261-6272 with an A/A of layout alone moving 3 % or less, r6301-6312).
+Every found get in both is a kept-index probe (no cache hit, no device read), and land10's gets
+take 420 ns of CPU against 400, with no fault or switch. The spare bound is not the cause: land10
+without it (a18214c1, never merged) runs gets at 0.90x. Nor is the allocator: memlim4, without the
+threshold, holds the same larger kept index. A line at each generation's close (land9k/land10k,
+never merged) shows the cause. A generation closes when the open index reaches a third of what the
+kept memtables may hold (research/63 §3). land9's fixed budget is the machine's capacity, 67 GB,
+and its third was reached at the fill's last rotation: one table, 62.8M records, 13.7 GB. land10's
+budget is what the VM has free, about 60 GB, so its third came at rotation 147-148: 54.3M records
+in a table closed just after a growth step (259 bytes a record against 235), and the last 30
+memtables' records in a second, open table, 17.2 GB in all. Every get then reads two populated
+tables. It is the one-third rule's step, landing between rotation 147 and 177 at this size; at 10M
+neither reaches it, and a store a little larger than 100M crosses it under either budget.
+research/63 §3 priced a get over two generations at one overlapped read (145-146 ns against 142 for
+one, `mlp4` mode 2, at 10M); here, at 100M, the second generation costs 20 ns a get, about 5 %.
+That gap, between the step's designed and measured price, is the kept index's to close
+(research/63), not the budget's: land9 meets the same step at a larger store.

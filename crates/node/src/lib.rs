@@ -2,10 +2,12 @@
 //! transport, QUIC for everything stateful and a sealed UDP datagram plane for consensus control
 //! (node.md §3).
 //!
+//! - [`bounds`]: every bound of the transport, derived from what the node states.
 //! - [`classes`]: the kinds of message QUIC carries, their classes and who may send each.
 //! - [`directory`]: the peers a connection may name, by certificate.
 //! - [`frame`]: a range's Raft message as it travels.
 //! - [`layout`]: what the node keeps beside its log: its run.
+//! - [`node`]: the owner: the ranges, their log, the transport, one turn at a time.
 
 #![cfg_attr(
     test,
@@ -19,7 +21,9 @@
     )
 )]
 
+pub mod bounds;
 pub mod classes;
 pub mod directory;
 pub mod frame;
 pub mod layout;
+pub mod node;

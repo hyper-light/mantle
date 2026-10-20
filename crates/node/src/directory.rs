@@ -1,13 +1,11 @@
 //! Which peer a connection names (docs/design/node.md §3.6): the cell's nodes this node knows, each
-//! by the certificate its authority issued it, the name a dial checks that certificate against,
-//! and the addresses its QUIC endpoint and its datagram plane listen on. A connection whose
+//! by the certificate its authority issued it and the name a dial checks that certificate against.
+//! Where a peer listens is the node's to learn (`crate::node::Node::learn`). A connection whose
 //! certificate the directory does not hold is refused at its handshake, charged to no identity
 //! (hyper-transport `Directory::identify`).
 //!
 //! The table is the node's configuration for now: placement's map and the root range's rows of
 //! nodes (node.md §1.5, §7) take its place once they run.
-
-use std::net::SocketAddr;
 
 use hyper_transport::{Authenticated, Directory, PeerId};
 
@@ -20,10 +18,6 @@ pub struct Peer {
     pub role: Role,
     /// Its certificate, DER, as its authority issued it.
     pub certificate: Vec<u8>,
-    /// The QUIC endpoint's address.
-    pub quic: SocketAddr,
-    /// The datagram plane's address.
-    pub plane: SocketAddr,
 }
 
 /// The name a node's certificate carries and a dial checks it against.
@@ -104,8 +98,6 @@ mod tests {
             id,
             role: Role::Node,
             certificate: certificate.to_vec(),
-            quic: "127.0.0.1:1".parse().unwrap(),
-            plane: "127.0.0.1:2".parse().unwrap(),
         }
     }
 

@@ -65,6 +65,9 @@ pub fn encoded_len(message: &Message) -> usize {
 /// The group and message a frame carries, its checksum verified first.
 pub fn decode(frame: &[u8]) -> Result<(u128, Message), FrameError> {
     let short = || FrameError::Short(frame.len());
+    if frame.len() < HEADER_BYTES {
+        return Err(short());
+    }
     let (crc, rest) = frame.split_first_chunk::<CRC_BYTES>().ok_or_else(short)?;
     if mantle_crc::crc32c(rest) != u32::from_le_bytes(*crc) {
         return Err(FrameError::Checksum);

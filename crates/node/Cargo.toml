@@ -23,13 +23,14 @@ hyper-rt = { path = "../../vendor/hyper-rt" }
 hyper-rt-transport = { path = "../../vendor/hyper-rt-transport" }
 hyper-timing = { path = "../../vendor/hyper-timing" }
 hyper-transport = { path = "../../vendor/hyper-transport" }
-mantle-cert = { path = "../cert" }
 mantle-crc = { path = "../crc" }
 mantle-meta = { path = "../meta" }
 mantle-range = { path = "../range" }
 thiserror.workspace = true
 
 [dev-dependencies]
+# The cell's authority and its nodes' certificates, issued for the tests' nodes.
+mantle-cert = { path = "../cert" }
 tempfile.workspace = true
 
 [lints]

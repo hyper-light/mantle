@@ -15,7 +15,10 @@
 //! connected, how long until it is again by the node's law (`Status::reconnect`, else 0); while
 //! some peer is not yet judged, the longest its stream's heartbeats go between
 //! (`Status::measuring_for`, else 0); and
-//! `replaced FAILED JOINING` once, from the node that led then, when a replacement ended. On
+//! `replaced FAILED JOINING` once, from the node that led then, when a replacement ended; and
+//! `link PEER KEYED DIALS ENDED REFUSAL` when a peer's link changes: whether the plane holds keys
+//! for its connection, the dials made to it, the connections and dials to it that ended, and the
+//! last refusal one ended with (`Node::links`). On
 //! standard input: `learn ID QUIC PLANE`, where a peer listens, and `replace FAILED JOINING`, a
 //! member of the range lost for good and the spare that takes its place (`Node::replace`). A line
 //! it cannot read ends the process with the line named; standard input closing ends it as a stop.
@@ -48,7 +51,7 @@ use mantle_range::{ConfState, Range, Settings, Stored};
 
 use crate::classes::Role;
 use crate::directory::Peer;
-use crate::node::{Hosted, Node, NodeError, NodeSettings, Status};
+use crate::node::{Hosted, Link, Node, NodeError, NodeSettings, Status};
 
 /// Why the process stopped.
 #[derive(Debug, thiserror::Error)]
@@ -349,6 +352,8 @@ async fn serve(config: ProcessConfig) -> Result<(), ProcessError> {
     let mut read = vec![0u8; chunk];
     let mut pending = Vec::new();
     let mut told: Option<Status> = None;
+    // Each peer's link as last said, a peer a slot.
+    let mut links: Vec<Link> = Vec::with_capacity(config.peers.len());
     loop {
         let ended = {
             let turn = pin!(node.turn());
@@ -375,6 +380,26 @@ async fn serve(config: ProcessConfig) -> Result<(), ProcessError> {
         for (_, replaced) in node.take_replaced() {
             let line = format!("replaced {} {}\n", replaced.failed(), replaced.joining());
             say(&mut output, &line).await?;
+        }
+        for (at, now) in node.links().enumerate() {
+            if links.get(at) == Some(&now) {
+                continue;
+            }
+            let refusal = now
+                .refusal
+                .map_or_else(|| "none".into(), |r| format!("{r:?}"));
+            let line = format!(
+                "link {} {} {} {} {refusal}\n",
+                now.peer,
+                if now.keyed { "keyed" } else { "unkeyed" },
+                now.dials,
+                now.ended
+            );
+            say(&mut output, &line).await?;
+            match links.get_mut(at) {
+                Some(was) => *was = now,
+                None => links.push(now),
+            }
         }
         if let Some(now) = node.status(config.group) {
             // While some pair is not yet judged, the node is measuring its links, which moves only

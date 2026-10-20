@@ -152,9 +152,11 @@ fn bounds() -> Bounds {
 }
 
 /// A node's report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Line {
     Bound(SocketAddr, SocketAddr),
+    /// A peer's link as the node keeps it: the peer, and the rest of its line as said.
+    Link(u64, String),
     /// A replacement the node ended as the range's leader: the member lost for good and the one
     /// in its place.
     Replaced(u64, u64),
@@ -178,6 +180,7 @@ fn parse(line: &str) -> Option<Line> {
         ["replaced", failed, joining] => {
             Some(Line::Replaced(failed.parse().ok()?, joining.parse().ok()?))
         }
+        ["link", peer, rest @ ..] => Some(Line::Link(peer.parse().ok()?, rest.join(" "))),
         [
             "status",
             term,
@@ -361,6 +364,8 @@ struct Cell {
     clients: BTreeMap<u64, Duration>,
     /// The replacements a leader ended: the member lost for good and the one in its place.
     replaced: BTreeSet<(u64, u64)>,
+    /// Each node's link to each peer as it last said, by node and peer.
+    links: BTreeMap<(u64, u64), String>,
     relay: Option<Relay>,
     /// Where the running workload's clients are told of a node started again.
     learns: Vec<Sender<(u64, SocketAddr)>>,
@@ -409,6 +414,7 @@ impl Cell {
             progress: BTreeMap::new(),
             clients: BTreeMap::new(),
             replaced: BTreeSet::new(),
+            links: BTreeMap::new(),
             relay: (network == Network::Relayed)
                 .then(|| Relay::start(&(1..=nodes).collect::<Vec<_>>())),
             learns: Vec::new(),
@@ -541,7 +547,7 @@ impl Cell {
                     measuring,
                     ..
                 } => Some((*patience).max(*reconnect).max(*measuring)),
-                Line::Bound(..) | Line::Replaced(..) => None,
+                Line::Bound(..) | Line::Replaced(..) | Line::Link(..) => None,
             })
             .chain(self.clients.values().copied())
             .fold(INITIAL_RTO, Duration::max)
@@ -558,10 +564,11 @@ impl Cell {
             match self.heard.recv_timeout(left) {
                 Ok(heard) => self.take(heard),
                 Err(_) => panic!(
-                    "quiet for {:?} with nothing moved: {:?}, progress {:?}",
+                    "quiet for {:?} with nothing moved: {:?}, progress {:?}, links {:?}",
                     self.quiet(),
                     self.status,
-                    self.progress
+                    self.progress,
+                    self.links
                 ),
             }
         }
@@ -592,6 +599,9 @@ impl Cell {
                     Line::Bound(quic, plane) => running.bound = Some((quic, plane)),
                     Line::Replaced(failed, joining) => {
                         self.replaced.insert((failed, joining));
+                    }
+                    Line::Link(peer, link) => {
+                        self.links.insert((id, peer), link);
                     }
                     Line::Status { .. } => {
                         self.status.insert(id, line);

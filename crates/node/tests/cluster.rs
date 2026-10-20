@@ -1374,13 +1374,9 @@ fn replaced_for_good(engines: Engines) {
     cell.spawn(joining);
     cell.introduce(&[joining]);
     cell.tell_workload(joining);
-    let told: Vec<u64> = cell
-        .watch
-        .live
-        .iter()
-        .copied()
-        .filter(|id| *id != joining)
-        .collect();
+    // Every live node is told, the spare among them: whichever leads, the spare too once it
+    // votes, takes the replacement up from the configuration it finds.
+    let told: Vec<u64> = cell.watch.live.iter().copied().collect();
     for id in told {
         cell.order(id, Order::Replace(lost, joining));
     }

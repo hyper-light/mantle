@@ -230,6 +230,18 @@ pub struct Status {
     pub commanded: usize,
 }
 
+/// A peer's link as the node keeps it: whether the plane holds keys for its connection, the
+/// dials made to it, the connections and dials to it that ended, and the last refusal one ended
+/// with, as its peer or this side stated it (`None` when none was stated: a timeout, the path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Link {
+    pub peer: PeerId,
+    pub keyed: bool,
+    pub dials: u64,
+    pub ended: u64,
+    pub refusal: Option<Refusal>,
+}
+
 /// What the node's sends of Raft messages did, all told.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Sends {
@@ -291,6 +303,11 @@ struct Remote {
     backoff: Duration,
     /// Redials paused for so far: the draw each pause's jitter takes ([`bounds::pause`]).
     redials: u32,
+    /// Dials made to it, connections and dials to it that ended, and the last refusal one ended
+    /// with ([`Link`]).
+    dials: u64,
+    ended: u64,
+    refusal: Option<Refusal>,
 }
 
 /// A body going out on an exchange, with how much of it the exchange has taken (`write_body`
@@ -527,6 +544,9 @@ impl<E: Engine + 'static> Node<E> {
                 redial_at: None,
                 backoff: bounds::initial_pto(),
                 redials: 0,
+                dials: 0,
+                ended: 0,
+                refusal: None,
             })
             .collect();
         let mut node = Self {
@@ -729,6 +749,17 @@ impl<E: Engine + 'static> Node<E> {
         self.log
             .stats(into)
             .map_err(|e| NodeError::Log(e.to_string()))
+    }
+
+    /// Each peer's link as the node keeps it.
+    pub fn links(&self) -> impl Iterator<Item = Link> + '_ {
+        self.remotes.iter().map(|r| Link {
+            peer: r.id,
+            keyed: r.keyed,
+            dials: r.dials,
+            ended: r.ended,
+            refusal: r.refusal,
+        })
     }
 
     /// What the node's ranges answered as they applied, since the last call.
@@ -1149,7 +1180,11 @@ impl<E: Engine + 'static> Node<E> {
                 self.write_exchange(exchange);
                 Ok(())
             }
-            Event::Closed { peer, .. } | Event::Unreachable { peer, .. } => {
+            Event::Closed { peer, refusal, .. } | Event::Unreachable { peer, refusal } => {
+                if let Some(remote) = self.remotes.iter_mut().find(|r| r.id == peer) {
+                    remote.ended = remote.ended.saturating_add(1);
+                    remote.refusal = refusal;
+                }
                 self.lost(peer, now);
                 Ok(())
             }
@@ -1239,10 +1274,14 @@ impl<E: Engine + 'static> Node<E> {
             let Some(quic) = quic else {
                 continue;
             };
-            if self.driver.endpoint().connect(clock, id, quic).is_err()
-                && let Some(remote) = self.remotes.get_mut(at)
-            {
-                Self::redial_later(self.id, remote, now);
+            let dialed = self.driver.endpoint().connect(clock, id, quic);
+            if let Some(remote) = self.remotes.get_mut(at) {
+                remote.dials = remote.dials.saturating_add(1);
+                if let Err(refusal) = dialed {
+                    remote.ended = remote.ended.saturating_add(1);
+                    remote.refusal = Some(refusal);
+                    Self::redial_later(self.id, remote, now);
+                }
             }
         }
     }

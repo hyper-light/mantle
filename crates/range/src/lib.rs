@@ -21,9 +21,12 @@ mod replica;
 
 pub use error::ReplicaError;
 pub use hyper_durable::{Driven, GroupStore, LogStore};
+pub use hyper_raft::Elections;
 pub use hyper_raft::proto::{
     ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState, Entry,
     Message, MessageType,
 };
-pub use machine::Applied;
-pub use replica::{Output, Range, Replica, Settings, claim, remove};
+pub use machine::{Applied, RangeMachine};
+pub use replica::{
+    Output, Range, Replica, Settings, Shell, claim, open_shell, propose_entry, remove,
+};

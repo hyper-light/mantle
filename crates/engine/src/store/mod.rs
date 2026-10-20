@@ -569,8 +569,22 @@ fn corrupt(why: Malformed) -> Error {
     }
 }
 
+std::thread_local! {
+    /// Whether this thread's owner stated that it may wait on the device although it runs a
+    /// hyper-rt shard ([`permit_blocking`]).
+    static BLOCKING_PERMITTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// States that the shard this thread runs may wait on the device: a node's metadata shard, whose
+/// replicas apply through the synchronous engine and which runs nothing a wait would hold up
+/// (docs/design/node.md §1.2). Elsewhere a synchronous wait on a shard is refused, since it holds
+/// up every task the shard runs.
+pub fn permit_blocking() {
+    BLOCKING_PERMITTED.with(|permitted| permitted.set(true));
+}
+
 pub(crate) fn blocking_allowed(what: &'static str) -> Result<(), Error> {
-    if hyper_rt::registry::current_shard().is_some() {
+    if hyper_rt::registry::current_shard().is_some() && !BLOCKING_PERMITTED.with(|p| p.get()) {
         Err(Error::InvalidArgument { what })
     } else {
         Ok(())

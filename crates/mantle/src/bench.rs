@@ -739,9 +739,12 @@ impl Puts<'_> {
                     Err(e) => self.fail(e),
                 }
             }
-            if !sampled && (idle.is_empty() || busy) {
-                // As many of this driver's clients are out as will be: the process runs the
-                // most threads it will.
+            if !sampled && (first == 0 || busy) {
+                // Every client of this driver has had a put out, or the store has refused one:
+                // the process runs the most threads it will. In closed loop every client goes out
+                // at the first pass; in open loop each goes out at its arrival, so the clients
+                // never need all be out at once, which on a machine of many cores (ten clients a
+                // core at 20,000 puts a second) they never were, and no sample was taken.
                 self.peak
                     .fetch_max(drive::thread_count(), Ordering::Relaxed);
                 sampled = true;

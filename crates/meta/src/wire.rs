@@ -1395,6 +1395,11 @@ fn take_name_outcome(r: &mut Reader<'_>) -> Option<name::Outcome> {
     })
 }
 
+/// A bucket's name at most: S3's 63 characters (research/05 §10.3).
+pub const MAX_BUCKET: usize = 63;
+/// An object's key at most: S3's 1,024 bytes (research/05 §10.1).
+pub const MAX_KEY: usize = 1024;
+
 /// Bytes of the largest entry a Name, File or Block range must take: one command, the largest
 /// a gateway sends, in the session wrapping it carries. A range whose `max_entry_bytes` or log
 /// frame is smaller refuses a request S3 allows (audit §16.5). The largest is a
@@ -1402,11 +1407,9 @@ fn take_name_outcome(r: &mut Reader<'_>) -> Option<name::Outcome> {
 /// bucket and key, with the most preconditions a request's headers hold, or the file of parts
 /// it writes, of 10,000 extents; each is encoded here at its longest and the larger taken.
 pub fn largest_entry_bytes() -> Result<usize, RecordError> {
-    // S3's limits: a key of 1,024 bytes (05 §10.1), a request's headers within 8 KB (05
-    // §10.2), a bucket name of 63 (05 §10.3), and 10,000 parts (05 §4.1). An upload ID is one
-    // the Name range made, and a gateway sends no other.
-    const MAX_BUCKET: usize = 63;
-    const MAX_KEY: usize = 1024;
+    // S3's limits: a request's headers within 8 KB (05 §10.2) and 10,000 parts (05 §4.1), with
+    // the longest bucket and key. An upload ID is one the Name range made, and a gateway sends
+    // no other.
     const MAX_HEADERS: usize = 8 << 10;
     const MAX_PARTS: usize = 10_000;
     const ETAG_HEX: usize = 32;

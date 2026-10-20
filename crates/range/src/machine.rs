@@ -68,11 +68,11 @@ struct Termed<'a, E> {
 }
 
 impl<E: Rows> Rows for Termed<'_, E> {
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
+    fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
         self.engine.get(key)
     }
 
-    fn next(&self, from: &[u8], to: &[u8]) -> Result<Option<Row>, EngineError> {
+    fn next(&mut self, from: &[u8], to: &[u8]) -> Result<Option<Row>, EngineError> {
         self.engine.next(from, to)
     }
 
@@ -145,6 +145,11 @@ impl<E: Engine> RangeMachine<E> {
 
     pub fn engine(&self) -> &E {
         &self.engine
+    }
+
+    /// The engine for a read, which takes it whole: an engine's read moves its cache.
+    pub fn engine_mut(&mut self) -> &mut E {
+        &mut self.engine
     }
 
     pub fn into_engine(self) -> E {
@@ -251,8 +256,8 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
     /// the image counts, gives none, so the log is not weighed against an image until its first
     /// compaction makes one.
     fn image_bytes(&self) -> Option<u64> {
-        let rows = self.engine.image().ok()?;
-        image::encoded_len(&rows)
+        let (rows, bytes) = self.engine.image_size()?;
+        image::encoded_len_of(rows, bytes)
     }
 
     /// The engine takes the image's rows, with the configuration and the term of its point, and

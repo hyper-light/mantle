@@ -230,18 +230,18 @@ impl World {
         name::apply(&mut range.engine, range.index, &command).unwrap()
     }
 
-    fn row(&self) -> Option<mantle_meta::record::Bucket> {
-        bucket::read(&self.buckets, BUCKET).unwrap()
+    fn row(&mut self) -> Option<mantle_meta::record::Bucket> {
+        bucket::read(&mut self.buckets, BUCKET).unwrap()
     }
 
-    fn lineage(&self, id: u64) -> Lineage {
-        name::lineage(&self.names[&id].engine).unwrap()
+    fn lineage(&mut self, id: u64) -> Lineage {
+        name::lineage(&mut self.names.get_mut(&id).unwrap().engine).unwrap()
     }
 
     /// Splits range `id` at `at` as its replicas would: the child starts from the rows the
     /// split names, taken from the parent as they stand, and then the parent applies the split.
     fn split(&mut self, id: u64, at: Vec<u8>) {
-        let parent = &self.names[&id].engine;
+        let parent = &mut self.names.get_mut(&id).unwrap().engine;
         let s = Split {
             generation: name::lineage(parent).unwrap().now.generation,
             at,
@@ -278,7 +278,12 @@ impl World {
             Request::Bucket(command) => Answer::Bucket(self.bucket(command)),
             Request::Name { range, command } => Answer::Name(self.name(range, *command)),
             Request::Gate { range, generation } => Answer::Gate(
-                name::read_gate(&self.names[&range].engine, BUCKET, generation).unwrap(),
+                name::read_gate(
+                    &mut self.names.get_mut(&range).unwrap().engine,
+                    BUCKET,
+                    generation,
+                )
+                .unwrap(),
             ),
             Request::Probe {
                 range,
@@ -287,7 +292,7 @@ impl World {
                 budget,
             } => Answer::Probe(
                 name::probe(
-                    &self.names[&range].engine,
+                    &mut self.names.get_mut(&range).unwrap().engine,
                     BUCKET,
                     generation,
                     from.as_deref(),
@@ -310,11 +315,11 @@ impl World {
                 from,
                 command,
             } => {
-                let upper = self.names[&from].engine.clone();
+                let mut upper = self.names[&from].engine.clone();
                 let lower = self.names.get_mut(&range).unwrap();
                 lower.index += 1;
                 let outcome =
-                    name::merge(&mut lower.engine, lower.index, &command, &upper).unwrap();
+                    name::merge(&mut lower.engine, lower.index, &command, &mut upper).unwrap();
                 if let name::Outcome::Merged(_) = outcome {
                     self.taken.insert((range, command.generation));
                 }
@@ -414,7 +419,7 @@ impl World {
                 }
             }
             Action::Collector => {
-                for (name, row) in bucket::attempts(&self.buckets, None, 16).unwrap() {
+                for (name, row) in bucket::attempts(&mut self.buckets, None, 16).unwrap() {
                     match SCHEDULE.takeover(&row, self.clock) {
                         None => {}
                         Some(Takeover::Abandon) => {
@@ -523,7 +528,8 @@ impl World {
                 self.split(id, key::route(bucket, key));
             }
             Action::Publish => {
-                self.directory = self.names.keys().map(|&id| self.lineage(id).now).collect();
+                let ids: Vec<u64> = self.names.keys().copied().collect();
+                self.directory = ids.into_iter().map(|id| self.lineage(id).now).collect();
             }
             Action::Refresh => self.cache.clone_from(&self.directory),
             Action::Merge { range, rows } => {
@@ -606,7 +612,8 @@ impl World {
             self.check();
         }
         assert!(self.mergers.is_empty(), "a merge never finished");
-        for id in self.names.keys() {
+        let ids: Vec<u64> = self.names.keys().copied().collect();
+        for id in &ids {
             let lineage = self.lineage(*id);
             assert!(
                 lineage.standing != Standing::Frozen && lineage.taken.is_none(),
@@ -622,7 +629,10 @@ impl World {
                 budget -= 1;
             }
             assert!(self.coordinators.is_empty(), "a coordinator never finished");
-            if bucket::attempts(&self.buckets, None, 1).unwrap().is_empty() {
+            if bucket::attempts(&mut self.buckets, None, 1)
+                .unwrap()
+                .is_empty()
+            {
                 let state = self.row().map(|r| r.state);
                 assert!(
                     matches!(state, None | Some(BucketState::Active)),
@@ -640,30 +650,35 @@ impl World {
     /// The ranges that own their spans: every serving range, and every frozen one whose merge
     /// was not taken. A range that ended, or whose merge was taken, keeps rows its lower range
     /// took and now owns.
-    fn owners(&self) -> Vec<(u64, Lineage)> {
-        self.names
-            .keys()
-            .map(|&id| (id, self.lineage(id)))
-            .filter(|(_, l)| match (l.standing, &l.into) {
+    fn owners(&mut self) -> Vec<(u64, Lineage)> {
+        let ids: Vec<u64> = self.names.keys().copied().collect();
+        let mut owners = Vec::new();
+        for id in ids {
+            let l = self.lineage(id);
+            let owns = match (l.standing, &l.into) {
                 (Standing::Serving, _) => true,
                 (Standing::Frozen, Some(into)) => !self.taken.contains(&(into.id, into.generation)),
                 _ => false,
-            })
-            .collect()
+            };
+            if owns {
+                owners.push((id, l));
+            }
+        }
+        owners
     }
 
     /// The range that owns `key`, and its rows.
-    fn holder(&self, key: &str) -> &Model {
+    fn holder(&mut self, key: &str) -> &mut Model {
         let route = key::route(BUCKET, key);
         let (id, _) = self
             .owners()
             .into_iter()
             .find(|(_, l)| l.now.holds(&route))
             .unwrap();
-        &self.names[&id].engine
+        &mut self.names.get_mut(&id).unwrap().engine
     }
 
-    fn check(&self) {
+    fn check(&mut self) {
         // The ranges divide the keys between them, and each holds rows, marks and gates only
         // of its own keys and buckets.
         let owners = self.owners();
@@ -675,7 +690,7 @@ impl World {
         }
         assert_eq!(spans.last().unwrap().hi, None);
         for (id, lineage) in &owners {
-            let (now, range) = (&lineage.now, &self.names[id]);
+            let (now, range) = (&lineage.now, self.names.get_mut(id).unwrap());
             for (k, _) in range.engine.image().unwrap() {
                 if let Some((bucket, key, _)) = key::decode_name(&k) {
                     assert!(
@@ -696,7 +711,8 @@ impl World {
         let row = self.row();
         // Every acknowledged put is in a bucket that still exists, under the incarnation
         // that took it, and the range that holds its key holds it.
-        for (key, incarnation) in &self.acked {
+        let acked: Vec<(&'static str, u64)> = self.acked.iter().map(|(k, i)| (*k, *i)).collect();
+        for (key, incarnation) in &acked {
             let row = row
                 .as_ref()
                 .unwrap_or_else(|| panic!("{key} lost to a forgotten bucket"));
@@ -715,9 +731,9 @@ impl World {
         }
         let (first, past) = key::bucket_routes(BUCKET);
         for (id, lineage) in &owners {
-            let (now, range) = (&lineage.now, &self.names[id]);
-            let gate = name::gate(&range.engine, BUCKET).unwrap();
-            let versions = holds_versions(&range.engine);
+            let (now, range) = (&lineage.now, self.names.get_mut(id).unwrap());
+            let gate = name::gate(&mut range.engine, BUCKET).unwrap();
+            let versions = holds_versions(&mut range.engine);
             match row.as_ref().map(|r| (r.state, r.created_ns)) {
                 // An active bucket takes writes to every key: every range that can hold its
                 // keys has its gate open.
@@ -744,7 +760,7 @@ impl World {
 
 /// Whether a range's rows hold a version or delete marker of the bucket, read as they are,
 /// frozen or not.
-fn holds_versions(engine: &Model) -> bool {
+fn holds_versions(engine: &mut Model) -> bool {
     engine.image().unwrap().iter().any(|(k, _)| {
         matches!(
             key::decode_name(k),

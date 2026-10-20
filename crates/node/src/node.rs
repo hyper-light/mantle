@@ -142,6 +142,18 @@ impl From<hyper_rt::RtError> for NodeError {
     }
 }
 
+/// What a refused reply on one of the node's exchanges comes to. A refusal of the exchange alone
+/// (its asker gave up, its stream or connection closed, its progress or a budget ran out: the
+/// transport ended it, and its `Refused` event follows or came) concerns that one asker, never the
+/// node's ranges: the reply is dropped and the node goes on, and the client asks again. A reply out
+/// of order or past its class's bounds is the node's own fault, and stops it.
+fn exchange_ended(refusal: Refusal) -> Result<(), NodeError> {
+    match refusal {
+        Refusal::Order | Refusal::FrameBound => Err(NodeError::Transport(refusal)),
+        _ => Ok(()),
+    }
+}
+
 type Store = GroupStore<DeviceFile>;
 
 /// What the liveness stream asked during a call into it.
@@ -1570,8 +1582,12 @@ impl<E: Engine + 'static> Node<E> {
         let received = self.receiving.swap_remove(at);
         match received.what {
             Arriving::Snapshot => {
-                endpoint.reply(exchange, &[], Some(0))?;
-                endpoint.end(exchange);
+                // The snapshot arrived whole and verified: it is stepped whether or not its
+                // sender's exchange is still there to hear that it was taken.
+                match endpoint.reply(exchange, &[], Some(0)) {
+                    Ok(()) => endpoint.end(exchange),
+                    Err(refusal) => exchange_ended(refusal)?,
+                }
                 self.snapshots_taken = self.snapshots_taken.saturating_add(1);
                 self.step_frame(received.peer, &received.bytes)
             }
@@ -1666,11 +1682,10 @@ impl<E: Engine + 'static> Node<E> {
             return self.answer_status(exchange, command::Status::TooLarge, self.id);
         }
         let len = u64::try_from(body.len()).unwrap_or(u64::MAX);
-        self.driver.endpoint().reply(
-            exchange,
-            &command::reply_head(command::Status::Answered, self.id, 0),
-            Some(len),
-        )?;
+        let head = command::reply_head(command::Status::Answered, self.id, 0);
+        if let Err(refusal) = self.driver.endpoint().reply(exchange, &head, Some(len)) {
+            return exchange_ended(refusal);
+        }
         self.writing.push(Writing {
             exchange,
             bytes: body,
@@ -1754,9 +1769,13 @@ impl<E: Engine + 'static> Node<E> {
         leader: u64,
     ) -> Result<(), NodeError> {
         let endpoint = self.driver.endpoint();
-        endpoint.reply(exchange, &command::reply_head(status, leader, 0), None)?;
-        endpoint.end(exchange);
-        Ok(())
+        match endpoint.reply(exchange, &command::reply_head(status, leader, 0), None) {
+            Ok(()) => {
+                endpoint.end(exchange);
+                Ok(())
+            }
+            Err(refusal) => exchange_ended(refusal),
+        }
     }
 
     /// Replies that this node does not lead `group`'s range: the leader it knows, and how long
@@ -1768,13 +1787,14 @@ impl<E: Engine + 'static> Node<E> {
             .patience(group)
             .map_or(0, |p| u64::try_from(p.as_nanos()).unwrap_or(u64::MAX));
         let endpoint = self.driver.endpoint();
-        endpoint.reply(
-            exchange,
-            &command::reply_head(command::Status::Redirect, leader, patience_ns),
-            None,
-        )?;
-        endpoint.end(exchange);
-        Ok(())
+        let head = command::reply_head(command::Status::Redirect, leader, patience_ns);
+        match endpoint.reply(exchange, &head, None) {
+            Ok(()) => {
+                endpoint.end(exchange);
+                Ok(())
+            }
+            Err(refusal) => exchange_ended(refusal),
+        }
     }
 
     /// Replies to each command whose every answer came, and sends a command whose range this

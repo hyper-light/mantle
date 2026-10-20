@@ -34,6 +34,23 @@ every one of their constants its derivation or citation where it is defined.
 
 | Constant | Kind | Basis |
 |---|---|---|
+| `crates/cert/src/der.rs` `BIT_STRING` | format | Universal tag 3, BIT STRING (ITU-T X.680 §8.6 table 1; X.690 §8.6). |
+| `crates/cert/src/der.rs` `BOOLEAN` | format | Universal tag 1, BOOLEAN (X.680 table 1; X.690 §8.2, DER's TRUE is 0xFF, §11.1). |
+| `crates/cert/src/der.rs` `DNS_NAME` | format | Context tag [2], primitive: a GeneralName's dNSName, IMPLICIT IA5String (RFC 5280 §4.2.1.6). |
+| `crates/cert/src/der.rs` `EXPLICIT_0` | format | Context tag [0], constructed: a certificate's version, EXPLICIT (RFC 5280 §4.1). |
+| `crates/cert/src/der.rs` `EXPLICIT_3` | format | Context tag [3], constructed: a certificate's extensions, EXPLICIT (RFC 5280 §4.1). |
+| `crates/cert/src/der.rs` `GENERALIZED_TIME` | format | Universal tag 24, GeneralizedTime (X.680 table 1), for validity from 2050 (RFC 5280 §4.1.2.5.2). |
+| `crates/cert/src/der.rs` `INTEGER` | format | Universal tag 2, INTEGER (X.680 table 1; X.690 §8.3). |
+| `crates/cert/src/der.rs` `OCTET_STRING` | format | Universal tag 4, OCTET STRING (X.680 table 1; X.690 §8.7). |
+| `crates/cert/src/der.rs` `OID` | format | Universal tag 6, OBJECT IDENTIFIER (X.680 table 1; X.690 §8.19). |
+| `crates/cert/src/der.rs` `SEQUENCE` | format | Universal tag 16, constructed: SEQUENCE and SEQUENCE OF (X.680 table 1; X.690 §8.9). |
+| `crates/cert/src/der.rs` `SET` | format | Universal tag 17, constructed: SET and SET OF (X.680 table 1; X.690 §8.11). |
+| `crates/cert/src/der.rs` `UTC_TIME` | format | Universal tag 23, UTCTime (X.680 table 1), for validity through 2049 (RFC 5280 §4.1.2.5.1). |
+| `crates/cert/src/der.rs` `UTF8_STRING` | format | Universal tag 12, UTF8String, which RFC 5280 §4.1.2.4 asks of new certificates' names. |
+| `crates/cert/src/time.rs` `FIRST_YEAR` | external | 1950: UTCTime's two-digit years cover 1950-2049 (RFC 5280 §4.1.2.5.1). |
+| `crates/cert/src/time.rs` `GENERALIZED_FROM` | external | 2050: validity from then on is GeneralizedTime (RFC 5280 §4.1.2.5). |
+| `crates/cert/src/time.rs` `LAST_YEAR` | external | 9999: GeneralizedTime's four-digit year (RFC 5280 §4.1.2.5.2). |
+| `crates/cert/src/time.rs` `SECONDS_A_DAY` | format | 86,400 seconds a day: POSIX time counts no leap seconds (IEEE Std 1003.1, 4.16 Seconds Since the Epoch). |
 | `crates/chunk/src/frame.rs` `CRC_AT` | format | Byte offset of the CRC-32C inside the 48-byte frame header. |
 | `crates/chunk/src/frame.rs` `DELETE_LEN` | format | Encoded delete-record length, the sum of its field widths. |
 | `crates/chunk/src/frame.rs` `FRAME_HEADER` | format | Byte length of the index-log frame header, fixed by its encoding. |

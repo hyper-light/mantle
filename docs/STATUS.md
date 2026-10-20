@@ -336,16 +336,19 @@ even, an entry's latency its write's on either shell, with 21–31% fewer alloca
 
 Remaining before it is done:
 
-- Elections by suspicion on hyper-raft's node-pair liveness stream (`hyper-liveness`, L-3), which
-  the range's shell takes where its owner gives it the stream's word: the node lacks the owner
-  that holds its replicas, the datagram plane with kernel receive stamps, placement's map of
-  members to nodes, a durable run, liveness writes on its log devices, shard timers that measure
-  their own lateness, and the cell's history for the detectors' prior
-  ([design](design/node.md) §2.4). Ranges elect on ticks until then.
+- Elections by suspicion on hyper-raft's node-pair liveness stream (`hyper-liveness`, L-3): a node
+  (`crates/node`) carries the stream for the ranges it hosts, which elect by suspicion over it,
+  with the owner that holds its replicas, the datagram plane with kernel receive stamps, a durable
+  run, liveness writes on its log, and shard timers that measure their own lateness. Placement's
+  map of members to nodes and the cell's history for the detectors' prior are left
+  ([design](design/node.md) §2.4). A range hosted by no node elects on ticks.
 - Chunks a stopped gateway wrote for a block it never recorded, reconciled per volume once
   storage nodes run, and the collector's pacing against foreground latency (design §2, §6;
   docs/research/22 §10).
-- The production engine, once its binding is chosen (design §4).
+- The production engine: a node keeps its ranges' rows in mantle's engine
+  (`mantle_range::Stored`, `ShardDb` checkpointed at the applied index, the Raft log its only
+  log) on the shard that runs the node, whose owner permits it to wait on the device. Moving the
+  replicas to metadata shards apart from the network's (node.md §1.2) is left.
 - The replica side of splits and merges: the child's group made on the parent's replicas
   from the parent's engine files as they stood at the split's entry, which carries the split
   alone; a merge's replica sets aligned first, its decision proposed once every replica of
@@ -354,9 +357,16 @@ Remaining before it is done:
   descriptors to; which ranges to split and merge, from measured size and load; and a read
   by key answered only by the range whose span holds it, when the gateway's read path is
   built.
-- The fast track under simulation, and the transport: QUIC for bulk transfers and
-  snapshots, and a UDP transport for consensus messages.
-- Linearizability checked with real processes on the production engine.
+- The fast track under simulation. The transport is built on hyper-raft's shared stack
+  (node.md §3): a range's Raft messages on QUIC lanes, snapshots on bulk exchanges, clients'
+  commands and ReadIndex reads on the request class, and consensus control on the sealed
+  datagram plane; chunk transfers, SWIM and the TCP fallback are left.
+- Linearizability with real processes. `crates/node/tests/cluster.rs` checks the histories of
+  three clients putting and reading through a leader stopped or cut off by a relay, on three
+  and five voters and on both engines, with real sockets in one process; `crates/mantle/tests/
+  node.rs` kills the leader of three `mantle node` processes mid-write and checks every answered
+  write applied once and the restarted node caught up. Left: histories of real processes under
+  kills and partitions, disk faults, and a node lost for good replaced in a cell.
 - Done when a linearizability checker accepts histories recorded under network partitions,
   process crashes and disk faults, both in deterministic simulation and with real
   processes.

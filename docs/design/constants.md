@@ -484,6 +484,11 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/node/src/bounds.rs` `INITIAL_RTT` | external | `kInitialRtt`, 333 ms, a path's smoothed round trip before any sample (RFC 9002 §6.2.2). |
 | `crates/node/src/bounds.rs` `MAX_ACK_DELAY` | external | `max_ack_delay`'s default, 25 ms, which a probe timeout adds once established (RFC 9000 §18.2). |
 | `crates/node/src/classes.rs` `RANKS` | format | Three classes on a node's QUIC connections: replication, request and bulk (docs/design/node.md §3.1); consensus control that fits a datagram takes the plane. |
+| `crates/node/src/client.rs` `PERSISTENT_CONGESTION_THRESHOLD` | external | `kPersistentCongestionThreshold`, three probe timeouts with no acknowledgement (RFC 9002 §7.6.1): the least an exchange is given once the client has measured its exchanges. |
+| `crates/node/src/client.rs` `PIECE` | derived | hyper-transport's `RECEIVE_CHUNK`: a reply's body is read a receive chunk at a time. |
+| `crates/node/src/command.rs` `HEAD_BYTES` | format | A command's head: the range's group, a u128 as the log names it. |
+| `crates/node/src/command.rs` `LENGTH_BYTES` | format | An answer's length before it in a reply's body, a u32. |
+| `crates/node/src/command.rs` `REPLY_HEAD_BYTES` | format | A reply's head: its status, one byte; the leader the node knows, a u64; and, for a redirect, how long until the node acts on its leader's silence, a u64 of nanoseconds. |
 | `crates/node/src/frame.rs` `CRC_BYTES` | format | A Raft frame's CRC-32C, four bytes (CLAUDE.md §6). |
 | `crates/node/src/frame.rs` `GROUP_BYTES` | format | A Raft frame's group, a u128 as the log names a range's group (hyper-log). |
 | `crates/node/src/frame.rs` `HEADER_BYTES` | derived | CRC_BYTES plus GROUP_BYTES: the bytes before a frame's message. |
@@ -492,6 +497,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/node/src/node.rs` `LIVENESS_GROUP` | format | The log group of the liveness stream's own writes, the top of the group space: group 0 holds hyper-log's own key records, and a range named either is refused at open. |
 | `crates/node/src/node.rs` `PIECE` | derived | hyper-transport's `RECEIVE_CHUNK`: a snapshot's body is read a receive chunk at a time. |
 | `crates/node/src/node.rs` `PLANE_RAFT` | format | A plane message's first byte for a range's Raft frame, apart from hyper-liveness's `KIND` for a heartbeat. |
+| `crates/node/src/read.rs` `CURRENT` | format | A read's kind: the current version of a key, the one query a range answers yet. |
 | `crates/range/src/conf.rs` `FORMAT` | format | Version byte of the encoded configuration row. |
 | `crates/range/src/image.rs` `FORMAT` | format | Version byte of the encoded snapshot image. |
 | `crates/range/src/replica.rs` `QUIET` | derived | `Duration::MAX`, no quiet write: the durable shell writes a commit no write stated after its owner's period so that a member acting on applied state at its next start reopens with it (hyper-raft docs/durable.md §4.1); no entry of a range is acted on at start (`RangeMachine::acts_at_start`), and the engine's durable index is part of the durable commit, so the write is never due. |

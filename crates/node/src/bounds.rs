@@ -10,7 +10,7 @@ use hyper_rt_transport::{Io, MAX_BATCH};
 use hyper_transport::{AdmissionLimits, AskQueue, Limits, RECEIVE_CHUNK, StreamCredit};
 
 use crate::classes::Bounds;
-use crate::frame;
+use crate::command;
 
 /// RFC 9002 §6.2.2: before a path has a sample, its smoothed round trip is `kInitialRtt`, 333 ms,
 /// and its variation half that.
@@ -18,8 +18,8 @@ const INITIAL_RTT: Duration = Duration::from_millis(333);
 /// RFC 9002 §6.1.2: `kGranularity`, the timer granularity a probe timeout adds at least.
 const GRANULARITY: Duration = Duration::from_millis(1);
 /// RFC 9000 §18.2: `max_ack_delay`'s default, 25 ms, which a probe timeout adds once a connection
-/// is established.
-const MAX_ACK_DELAY: Duration = Duration::from_millis(25);
+/// is established; every node's endpoint states it.
+pub(crate) const MAX_ACK_DELAY: Duration = Duration::from_millis(25);
 /// RFC 9000 §10.1: an idle timeout of at least three probe timeouts, so a connection whose packets
 /// a loss delays is not taken for idle.
 const IDLE_PTOS: u32 = 3;
@@ -48,6 +48,13 @@ pub struct Stated {
 #[error("the node's stated bounds overflow: {0}")]
 pub struct Unfit(&'static str);
 
+/// A path's measured probe timeout, the current retransmission timeout a backoff doubles from
+/// (RFC 6298 §5.5): hyper-quic's, with the peer's whole `max_ack_delay` (RFC 9002 §6.2.1), since
+/// hyper-quic adds the delay its ACK frequency asks for, which may be shorter.
+pub fn measured_pto(path: &hyper_transport::PathFacts) -> Duration {
+    path.probe_timeout.saturating_add(MAX_ACK_DELAY)
+}
+
 /// RFC 9002 §6.2.1's probe timeout before any sample: `smoothed_rtt + max(4·rttvar, kGranularity)
 /// + max_ack_delay`, with `rttvar` half the initial round trip (§6.2.2).
 pub fn initial_pto() -> Duration {
@@ -60,6 +67,25 @@ pub fn initial_pto() -> Duration {
 /// The idle timeout: three probe timeouts at the initial estimates (RFC 9000 §10.1).
 pub fn idle_timeout() -> Duration {
     initial_pto().saturating_mul(IDLE_PTOS)
+}
+
+/// A backoff's next delay (node.md §5, retries and reconnects): doubled (RFC 6298 §5.5), at most
+/// the idle timeout.
+pub fn backed_off(delay: Duration) -> Duration {
+    delay.saturating_mul(2).min(idle_timeout())
+}
+
+/// One pause of a backoff of `delay` (node.md §5): focal's equal jitter, drawn uniformly between
+/// half of `delay` and the whole of it, by `local`'s `attempt`-th draw (hyper-timing's, the one
+/// a node's campaign delay takes: independent across nodes and attempts, deterministic for a
+/// simulation's seed), so the peers that lost one node do not ask it again in step.
+pub fn pause(delay: Duration, local: u64, attempt: u32) -> Duration {
+    let half = delay.checked_div(2).unwrap_or(delay);
+    half.saturating_add(hyper_timing::election_delay(
+        delay.saturating_sub(half),
+        local,
+        attempt,
+    ))
 }
 
 /// The transport's limits for a node of `stated`.
@@ -114,8 +140,10 @@ pub fn limits(stated: &Stated) -> Result<Limits, Unfit> {
         // One lane a peer: the node runs its ranges on one shard (node.md §3.2's lane a shard).
         lanes_per_peer: 1,
         lane_window,
-        // A snapshot's exchange carries its frame in the body, a frame's header ahead of it.
-        max_head: u32::try_from(frame::HEADER_BYTES).map_err(|_| Unfit("head"))?,
+        // A command's head names its range; a reply's, its status and the leader. A snapshot's
+        // exchange carries its frame in the body and no head.
+        max_head: u32::try_from(command::HEAD_BYTES.max(command::REPLY_HEAD_BYTES))
+            .map_err(|_| Unfit("head"))?,
         window_ceiling,
         // An exchange that makes no progress for as long as a connection may stay silent is
         // judged stalled.
@@ -178,6 +206,29 @@ mod tests {
         // 333 ms + max(4 × 166.5 ms, 1 ms) + 25 ms.
         assert_eq!(initial_pto(), Duration::from_micros(1_024_000));
         assert_eq!(idle_timeout(), Duration::from_micros(3_072_000));
+    }
+
+    #[test]
+    fn a_backoff_doubles_to_the_idle_timeout_and_each_pause_is_within_its_upper_half() {
+        let mut delay = Duration::from_millis(3);
+        let mut delays = Vec::new();
+        for _ in 0..16 {
+            delays.push(delay);
+            delay = backed_off(delay);
+        }
+        assert_eq!(delays[1], Duration::from_millis(6));
+        assert_eq!(*delays.last().unwrap(), idle_timeout());
+        for (attempt, delay) in delays.iter().enumerate() {
+            for local in [1, 2, u64::MAX] {
+                let pause = pause(*delay, local, u32::try_from(attempt).unwrap());
+                assert!(
+                    pause >= *delay / 2 && pause <= *delay,
+                    "{pause:?} for {delay:?}"
+                );
+            }
+        }
+        // Two peers' pauses of one delay differ: they do not ask again in step.
+        assert_ne!(pause(delays[4], 1, 0), pause(delays[4], 2, 0));
     }
 
     #[test]

@@ -23,6 +23,7 @@ pub enum Kind {
     Raft,
     Command,
     Snapshot,
+    Read,
 }
 
 /// The classes a node's QUIC connections share credit by, most urgent first (node.md §3.1, §3.3):
@@ -83,7 +84,7 @@ pub fn state_bounds(bounds: Bounds) -> Result<(), BoundsTaken> {
 /// The classes of a node's connections ([`Kind`], [`Class`], [`Role`]).
 pub struct NodeClasses;
 
-const KINDS: [Kind; 3] = [Kind::Raft, Kind::Command, Kind::Snapshot];
+const KINDS: [Kind; 4] = [Kind::Raft, Kind::Command, Kind::Snapshot, Kind::Read];
 
 impl Classes for NodeClasses {
     type Class = Class;
@@ -104,7 +105,7 @@ impl Classes for NodeClasses {
         match (kind, role) {
             (Kind::Raft, Role::Node) => Some(Class::Replication),
             (Kind::Snapshot, Role::Node) => Some(Class::Bulk),
-            (Kind::Command, _) => Some(Class::Request),
+            (Kind::Command | Kind::Read, _) => Some(Class::Request),
             (Kind::Raft | Kind::Snapshot, Role::Gateway | Role::Client) => None,
         }
     }
@@ -123,6 +124,7 @@ impl Classes for NodeClasses {
             Kind::Raft => 1,
             Kind::Command => 2,
             Kind::Snapshot => 3,
+            Kind::Read => 4,
         }
     }
 
@@ -157,7 +159,7 @@ mod tests {
             );
         }
         assert_eq!(NodeClasses::kind_of(0), None);
-        assert_eq!(NodeClasses::kind_of(4), None);
+        assert_eq!(NodeClasses::kind_of(5), None);
     }
 
     #[test]

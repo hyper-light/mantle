@@ -23,9 +23,16 @@ mantle-disk = { path = "../disk" }
 mantle-ec = { path = "../ec" }
 mantle-gateway = { path = "../gateway" }
 mantle-meta = { path = "../meta" }
+mantle-node = { path = "../node" }
 mantle-s3 = { path = "../s3" }
 
 [dev-dependencies]
+# The real-process test of `mantle node` (tests/node.rs): the client's runtime and transport, the
+# cell's certificates, and the range's settings the nodes are given.
+hyper-rt = { path = "../../vendor/hyper-rt" }
+hyper-transport = { path = "../../vendor/hyper-transport" }
+mantle-cert = { path = "../cert" }
+mantle-range = { path = "../range" }
 tempfile.workspace = true
 
 [lints]

@@ -34,6 +34,10 @@ use crate::membership::Replacement;
 /// of the commands applied, and the reads confirmed and applied far enough to serve.
 pub type Output = hyper_durable::Output<Applied>;
 
+/// A member as the shared shell holds it, its machine the range's engine and layer: what a node's
+/// owner keeps in its arena (`hyper_durable::Owner`) and drives with the node-pair liveness stream.
+pub type Shell<L, E> = hyper_durable::Replica<L, RangeMachine<E>, Unbounded>;
+
 /// What every member of a range shares: its layer, the bounds of its sessions, the configuration
 /// it starts from, and how its core runs.
 #[derive(Debug, Clone, PartialEq)]
@@ -162,7 +166,13 @@ fn limits(range: &Range) -> Result<Limits, ReplicaError> {
     })?)
 }
 
-fn shell(e: hyper_durable::ReplicaError) -> ReplicaError {
+impl From<hyper_durable::ReplicaError> for ReplicaError {
+    fn from(e: hyper_durable::ReplicaError) -> Self {
+        shell_error(e)
+    }
+}
+
+fn shell_error(e: hyper_durable::ReplicaError) -> ReplicaError {
     match e {
         hyper_durable::ReplicaError::Refused(e) => ReplicaError::Refused(e),
         hyper_durable::ReplicaError::Stalled => ReplicaError::Stalled,
@@ -206,8 +216,61 @@ pub fn remove<F: BlockFile + 'static>(log: &Log<F>, group: u128) -> Result<(), R
 }
 
 pub struct Replica<L: LogStore, E: Engine> {
-    shell: hyper_durable::Replica<L, RangeMachine<E>, Unbounded>,
+    shell: Shell<L, E>,
     max_entry_bytes: u64,
+}
+
+/// Opens member `id` of `range` over its group's store as the shared shell holds it, at the
+/// state `engine` holds durably; what [`Replica::open`] does for an owner that elects on its
+/// ticks, here for any `elections`. A member that elects by suspicion takes no ticks and no tick
+/// counts: its owner gives it the node-pair liveness stream's word (docs/design/node.md §2.4).
+pub fn open_shell<L: LogStore, E: Engine>(
+    id: u64,
+    store: L,
+    engine: E,
+    range: &Range,
+    seed: u64,
+    elections: Elections,
+) -> Result<Shell<L, E>, ReplicaError> {
+    let s = &range.settings;
+    let machine = RangeMachine::open(engine, range.layer, range.rules, &range.boot)?;
+    let settings = hyper_durable::Settings {
+        core: Config {
+            election_tick: s.election_tick,
+            heartbeat_tick: s.heartbeat_tick,
+            max_size_per_msg: s.max_size_per_msg,
+            max_inflight_msgs: s.max_inflight_msgs,
+            max_uncommitted_size: s.max_uncommitted_size,
+            max_committed_size_per_ready: s.max_committed_size_per_ready,
+            // Pre-vote and check-quorum together keep a partitioned member from deposing a
+            // healthy leader and a leader cut off from stepping down late (06 §A1); elections by
+            // suspicion need both (hyper-raft docs/timing.md §2.9).
+            check_quorum: true,
+            pre_vote: true,
+            seed,
+            ..Config::new(id, limits(range)?)
+        },
+        elections,
+        quiet: QUIET,
+    };
+    hyper_durable::Replica::open(&settings, store, machine, Unbounded).map_err(opened)
+}
+
+/// Proposes an entry of commands to `shell`, refused past the range's bound on an entry: only a
+/// leader takes it.
+pub fn propose_entry<L: LogStore, E: Engine>(
+    shell: &mut Shell<L, E>,
+    entry: &wire::Entry,
+    max_entry_bytes: u64,
+) -> Result<(), ReplicaError> {
+    let data = entry.encode()?;
+    if u64::try_from(data.len()).map_or(true, |l| l > max_entry_bytes) {
+        return Err(ReplicaError::EntryTooLarge {
+            len: data.len(),
+            max: max_entry_bytes,
+        });
+    }
+    shell.propose(Vec::new(), data).map_err(shell_error)
 }
 
 impl<L: LogStore, E: Engine> Replica<L, E> {
@@ -222,31 +285,9 @@ impl<L: LogStore, E: Engine> Replica<L, E> {
         range: &Range,
         seed: u64,
     ) -> Result<Self, ReplicaError> {
-        let s = &range.settings;
-        let machine = RangeMachine::open(engine, range.layer, range.rules, &range.boot)?;
-        let settings = hyper_durable::Settings {
-            core: Config {
-                election_tick: s.election_tick,
-                heartbeat_tick: s.heartbeat_tick,
-                max_size_per_msg: s.max_size_per_msg,
-                max_inflight_msgs: s.max_inflight_msgs,
-                max_uncommitted_size: s.max_uncommitted_size,
-                max_committed_size_per_ready: s.max_committed_size_per_ready,
-                // Pre-vote and check-quorum together keep a partitioned member from deposing a
-                // healthy leader and a leader cut off from stepping down late (06 §A1).
-                check_quorum: true,
-                pre_vote: true,
-                seed,
-                ..Config::new(id, limits(range)?)
-            },
-            elections: Elections::Ticks,
-            quiet: QUIET,
-        };
-        let shell =
-            hyper_durable::Replica::open(&settings, store, machine, Unbounded).map_err(opened)?;
         Ok(Self {
-            shell,
-            max_entry_bytes: s.max_entry_bytes,
+            shell: open_shell(id, store, engine, range, seed, Elections::Ticks)?,
+            max_entry_bytes: range.settings.max_entry_bytes,
         })
     }
 
@@ -416,32 +457,30 @@ impl<L: LogStore, E: Engine> Replica<L, E> {
     /// counts say. A replica waiting for room is not ticked, as it takes no part in the group,
     /// and the ticks it missed are not given again.
     pub fn tick(&mut self) -> Result<(), ReplicaError> {
-        self.shell.tick().map(drop).map_err(shell)
+        self.shell.tick().map(drop).map_err(shell_error)
     }
 
     /// Takes a message, bound to its sender by the transport. Taken while writes are out; a
     /// replica waiting for room refuses it with `Stalled`, as the network may drop it.
     pub fn step(&mut self, message: Message) -> Result<(), ReplicaError> {
-        self.shell.step(message).map_err(shell)
+        self.shell.step(message).map_err(shell_error)
     }
 
     /// Campaigns now; refused [`ReplicaError::Uncertain`] while its log may lack entries it
     /// acknowledged and the others are no quorum without it (core step R-7).
     pub fn campaign(&mut self) -> Result<(), ReplicaError> {
-        self.shell.campaign().map_err(shell)
+        self.shell.campaign().map_err(shell_error)
     }
 
     /// Proposes an entry of commands; only a leader takes it, and none larger than the range's
     /// bound.
     pub fn propose(&mut self, entry: &wire::Entry) -> Result<(), ReplicaError> {
-        let data = entry.encode()?;
-        self.bounded(data.len())?;
-        self.shell.propose(Vec::new(), data).map_err(shell)
+        propose_entry(&mut self.shell, entry, self.max_entry_bytes)
     }
 
     pub fn propose_change(&mut self, change: &ConfChangeV2) -> Result<(), ReplicaError> {
         self.bounded(change.encoded_len())?;
-        self.shell.change(Vec::new(), change).map_err(shell)
+        self.shell.change(Vec::new(), change).map_err(shell_error)
     }
 
     fn bounded(&self, len: usize) -> Result<(), ReplicaError> {
@@ -461,14 +500,14 @@ impl<L: LogStore, E: Engine> Replica<L, E> {
     /// and one a leader that steps down held is dropped, as a lost message is, for its caller to
     /// ask again.
     pub fn read_index(&mut self, context: Vec<u8>) -> Result<(), ReplicaError> {
-        self.shell.read(context).map_err(shell)
+        self.shell.read(context).map_err(shell_error)
     }
 
     /// Reports whether a snapshot this member sent to `to` arrived. Replication to a member
     /// pauses while its snapshot is out, so the transport reports every snapshot's fate; one
     /// that comes while the replica waits for room is kept, the latest for each member.
     pub fn report_snapshot(&mut self, to: u64, arrived: bool) -> Result<(), ReplicaError> {
-        self.shell.report_snapshot(to, arrived).map_err(shell)
+        self.shell.report_snapshot(to, arrived).map_err(shell_error)
     }
 
     /// Does what there is to do (docs/design/replica.md §3): takes the log's answers, applies
@@ -482,7 +521,7 @@ impl<L: LogStore, E: Engine> Replica<L, E> {
         waker: &Waker,
         out: &mut Output,
     ) -> Result<Driven, ReplicaError> {
-        self.shell.drive(now, waker, out).map_err(shell)
+        self.shell.drive(now, waker, out).map_err(shell_error)
     }
 
     /// The owner freed room in the log (another group compacted or left): a replica waiting for
@@ -495,6 +534,6 @@ impl<L: LogStore, E: Engine> Replica<L, E> {
     /// keeping `keep` entries behind for followers that lag (docs/design/replica.md §4); true
     /// when a compaction's start went out, with `waker`.
     pub fn compact(&mut self, keep: u64, now: u64, waker: &Waker) -> Result<bool, ReplicaError> {
-        self.shell.compact(keep, now, waker).map_err(shell)
+        self.shell.compact(keep, now, waker).map_err(shell_error)
     }
 }

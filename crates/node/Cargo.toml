@@ -1,0 +1,47 @@
+[package]
+name = "mantle-node"
+description = "A node: its ranges' replicas on its shards, replicating over hyper-raft's transport, QUIC for stateful traffic and a sealed UDP datagram plane for consensus control"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The shared stack, vendored from hyper-raft (vendor/*/SNAPSHOT, vendor/UPSTREAM.md): the runtime
+# and the transport driven on it, QUIC's application layer, the sealed datagram plane, the
+# node-pair liveness stream, the durable shell and its core, the shared log and its block layer.
+hyper-block = { path = "../../vendor/hyper-block" }
+hyper-datagram = { path = "../../vendor/hyper-datagram" }
+hyper-durable = { path = "../../vendor/hyper-durable" }
+hyper-liveness = { path = "../../vendor/hyper-liveness" }
+hyper-log = { path = "../../vendor/hyper-log" }
+hyper-raft = { path = "../../vendor/hyper-raft" }
+hyper-rt = { path = "../../vendor/hyper-rt" }
+hyper-rt-transport = { path = "../../vendor/hyper-rt-transport" }
+hyper-timing = { path = "../../vendor/hyper-timing" }
+hyper-transport = { path = "../../vendor/hyper-transport" }
+mantle-codec = { path = "../codec" }
+mantle-crc = { path = "../crc" }
+# The engine a node keeps its ranges' rows in (`mantle_range::Stored`), its store's settings.
+mantle-engine = { path = "../engine" }
+mantle-meta = { path = "../meta" }
+mantle-range = { path = "../range" }
+thiserror.workspace = true
+
+[dev-dependencies]
+# The simulated device a simulated node's log runs on (tests/sim.rs).
+hyper-block = { path = "../../vendor/hyper-block", features = ["sim"] }
+# The waker the synchronous store a simulated node's ranges write through counts its answers by
+# (crates/range/tests/support/store.rs).
+hyper-measure = { path = "../../vendor/hyper-measure" }
+# The simulation's draws: hyper-sim's generator and named streams (tests/sim.rs).
+hyper-sim = { path = "../../vendor/hyper-sim" }
+# The cell's authority and its nodes' certificates, issued for the tests' nodes.
+mantle-cert = { path = "../cert" }
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -336,16 +336,19 @@ even, an entry's latency its write's on either shell, with 21–31% fewer alloca
 
 Remaining before it is done:
 
-- Elections by suspicion on hyper-raft's node-pair liveness stream (`hyper-liveness`, L-3), which
-  the range's shell takes where its owner gives it the stream's word: the node lacks the owner
-  that holds its replicas, the datagram plane with kernel receive stamps, placement's map of
-  members to nodes, a durable run, liveness writes on its log devices, shard timers that measure
-  their own lateness, and the cell's history for the detectors' prior
-  ([design](design/node.md) §2.4). Ranges elect on ticks until then.
+- Elections by suspicion on hyper-raft's node-pair liveness stream (`hyper-liveness`, L-3): a node
+  (`crates/node`) carries the stream for the ranges it hosts, which elect by suspicion over it,
+  with the owner that holds its replicas, the datagram plane with kernel receive stamps, a durable
+  run, liveness writes on its log, and shard timers that measure their own lateness. Placement's
+  map of members to nodes and the cell's history for the detectors' prior are left
+  ([design](design/node.md) §2.4). A range hosted by no node elects on ticks.
 - Chunks a stopped gateway wrote for a block it never recorded, reconciled per volume once
   storage nodes run, and the collector's pacing against foreground latency (design §2, §6;
   docs/research/22 §10).
-- The production engine, once its binding is chosen (design §4).
+- The production engine: a node keeps its ranges' rows in mantle's engine
+  (`mantle_range::Stored`, `ShardDb` checkpointed at the applied index, the Raft log its only
+  log) on the shard that runs the node, whose owner permits it to wait on the device. Moving the
+  replicas to metadata shards apart from the network's (node.md §1.2) is left.
 - The replica side of splits and merges: the child's group made on the parent's replicas
   from the parent's engine files as they stood at the split's entry, which carries the split
   alone; a merge's replica sets aligned first, its decision proposed once every replica of
@@ -354,9 +357,28 @@ Remaining before it is done:
   descriptors to; which ranges to split and merge, from measured size and load; and a read
   by key answered only by the range whose span holds it, when the gateway's read path is
   built.
-- The fast track under simulation, and the transport: QUIC for bulk transfers and
-  snapshots, and a UDP transport for consensus messages.
-- Linearizability checked with real processes on the production engine.
+- The fast track under simulation. The transport is built on hyper-raft's shared stack
+  (node.md §3): a range's Raft messages on QUIC lanes, snapshots on bulk exchanges, clients'
+  commands and ReadIndex reads on the request class, and consensus control on the sealed
+  datagram plane; chunk transfers, SWIM and the TCP fallback are left.
+- Linearizability with real processes. `crates/node/tests/cluster.rs` checks the histories of
+  three clients putting and reading through a leader stopped or cut off by a relay, and through
+  a follower lost for good and replaced by a spare, on three and five voters and on both
+  engines, with real sockets in one process. `crates/mantle/tests/node.rs` runs `mantle node`
+  processes: the leader killed (SIGKILL) mid-write, every answered write applied once and the
+  restarted node caught up; the clients' histories through a leader killed and started again
+  and through a leader cut off, on three voters and five; and a follower whose engine store is
+  damaged at rest, which refuses it with a typed corruption error, is replaced by a spare, and
+  then as many original voters are killed as leave a bare quorum, the spare in it. Each key's
+  history is checked linearizable (`crates/node/tests/support/history.rs`). Left: damage to a
+  node's log (a group the log finds damaged is rebuilt under a new identity, `Replica::rebuild`,
+  which needs placement's map of members to nodes).
+- The node under deterministic simulation. `crates/node/tests/sim.rs` runs cells of three and
+  five nodes and their clients on hyper-rt's simulation runtime. The production node and client
+  speak QUIC and the sealed plane on its fabric, and each node's log is on hyper-block's
+  simulated device. Each run puts a leader or a follower through a cut, a power cut, or a device
+  failing a write, on one of three path profiles, with 2% loss on some seeds. Each key's history
+  must be linearizable, and each seed must replay to the same histories (node.md §9.1).
 - Done when a linearizability checker accepts histories recorded under network partitions,
   process crashes and disk faults, both in deterministic simulation and with real
   processes.

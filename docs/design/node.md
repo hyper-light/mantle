@@ -54,7 +54,7 @@ threads grow (26 §4.2).
 
 | Owner | Threads | What runs there |
 |---|---|---|
-| Network runtime | a tokio multi-thread runtime, one worker per core the process is granted | QUIC connections and the datagram plane (§3), SWIM, HTTP connections (§4), the drivers of each S3 request, the routing layer (§5), clients and connections as tasks |
+| Network runtime | hyper-rt's shards, one thread per core the process is granted (the owner's decision of 2026-10-05: a shared thread-per-core runtime, no tokio) | QUIC connections and the datagram plane (§3), SWIM, HTTP connections (§4), the drivers of each S3 request, the routing layer (§5), clients and connections as tasks |
 | Metadata shards | one per granted core | range replicas: stepping, ticking, proposing, driving, applying, serving confirmed reads (§2) |
 | Coding pool | one per granted core | erasure encoding and decoding of whole blocks, block checksums, the write path's inverse checks (§5.6) |
 | Device issuers | one per physical device | every volume's writer, cleaner and scrubber and the device's Raft log writer, as state machines (chunk-store.md §4; raft-log.md §3); the device's dispatcher (§2.7). As built: every volume's writes and flushes, dispatched to the device's pool; the writers, cleaners and scrubbers are still threads of their own (STATUS item 4) |
@@ -108,16 +108,25 @@ can run a transform's inverse on a different core from the transform (§5.6). ma
 binding affinity, so there the inverse runs on another worker, on whichever core the scheduler
 gives it, and a fault tied to one core is caught only when the two land apart.
 
-The network runtime never blocks. tokio says why: "A blocking operation performed in a task
-running on a thread that is also running other tasks would block the entire thread, preventing
-other tasks from running", and CPU-bound work belongs in "a separate thread pool dedicated to
-CPU bound tasks" (25 §1). Replicas therefore do not run as tokio tasks. Their work includes
+The network runtime never blocks. tokio says why, of any runtime that runs many tasks on a
+thread: "A blocking operation performed in a task running on a thread that is also running
+other tasks would block the entire thread, preventing other tasks from running", and CPU-bound
+work belongs in "a separate thread pool dedicated to CPU bound tasks" (25 §1). Replicas
+therefore do not run as the network's tasks. Their work includes
 engine reads that miss the cache and wait on the device, reads of log entries no longer in
 memory, which are synchronous (audit §12.2), and applies that take milliseconds: completing an
 upload of 10,000 parts applies in 6.3–6.7 ms (measurements/2026-09-29-metadata-apply.md). A
 shard owns its replicas outright, so a `Replica` is touched by one thread and needs no lock.
 Encoding a block under RS(9,6) needs a work space of 128 MiB (gateway.md §4) and is CPU-bound for
 its duration, so it goes to the coding pool.
+
+*As built (2026-10-20).* A node's ranges run in one task with its transport on a hyper-rt shard
+(`crates/node`), their rows in mantle's engine (`mantle_range::Stored`) or the model. The
+shard's owner states that it may wait on the device (`mantle_engine::store::permit_blocking`),
+so the engine takes its synchronous paths there, as on a thread with no shard: its cache misses,
+writes and maintenance wait on that shard and hold up its transport while they do, which the
+liveness stream counts in its timer's granularity (the owner's own waits). Moving the replicas
+to metadata shards apart from the network's, as above, is still to build.
 
 A granted core is what `std::thread::available_parallelism` reports: the operating system's
 answer, affinity masks and quotas included where it reports them. Three pools of that size
@@ -534,8 +543,32 @@ seven things the node does not have (§10, phases A and C):
    detectors' prior evidence on the time between failures (`Settings::history`), kept with the
    cell's membership in the root range (§3.5, §7).
 
-Until then a range elects on ticks with focal's counts, as above (replica.md §3), and the stream
-is vendored only as the shell's dependency (vendor/UPSTREAM.md). SWIM's place (§3.5) does not
+*As built (2026-10-20).* A node's owner (`crates/node`) carries the stream for the ranges it
+hosts, and they elect by suspicion over it; items 1, 2, 4, 5 and 6 are built, 3 and 7 are not:
+
+- (1) One task on a hyper-rt shard holds the shard's replicas in hyper-durable's `Owner`,
+  attaches their pairs (`Owner::pairs`), takes each change to them (`Owner::believe`), and after
+  measuring (`Owner::measure`) drives each range whose timing moved, since a core draws its
+  campaign's delay only when driven: given its first timing with nothing else to drive it, a
+  range never campaigned (its term stayed 0 on one CPU).
+- (2) hyper-rt-transport's `PlaneSocket` stamps each datagram in the kernel where the platform
+  does; the owner reads its clock, drains the plane's socket, and polls the stream at that clock
+  only when the drain found the socket empty, so every heartbeat stamped before it was fed.
+- (3) A member's id is its node's, and a node keeps a pair for each node it is told of; placement's
+  map and its bound on pairs are not built (§7).
+- (4) The run is kept as hyper-block's `record` in the node's directory (`crates/node/src/layout.rs`).
+- (5) `Driven::flushed` feeds `Liveness::on_durable`, and a stream that asks for a flush gets an
+  empty update of a log group of its own (the top of the group space, since group 0 holds
+  hyper-log's key records), one out at a time. A liveness write the log refuses stops the node,
+  as a fenced range stops it (§6.2): a log whose device failed a write makes nothing durable
+  again, so the node could prove no heartbeat and serve nothing, and its peers would keep its
+  connections up for nothing. The simulation (§9.1) found a node going on that way after its
+  device failed a write.
+- (6) Each range's next wake and the stream's are the task's deadlines, and a wait that ends at
+  or past the stream's wake is reported (`Liveness::on_wait`).
+- (7) Each start begins with no history (`Exposure::new`); the root range does not keep it yet.
+
+A range hosted by no node still elects on ticks with focal's counts, as above (replica.md §3). SWIM's place (§3.5) does not
 change with it: SWIM's word stays a hint for routing and repair, and the stream's is what a
 group's elections take.
 
@@ -687,7 +720,53 @@ the cell's mechanisms reduce exactly to the local ones (research/27 §7.6).
 
 Nodes, and clients through mantle's client library, talk over two layers, as the hecate
 specification lays them out (07 §4.7): QUIC for everything stateful, and a separate plane of
-sealed UDP datagrams for consensus control and membership. Neither is built.
+sealed UDP datagrams for consensus control and membership.
+
+*As built (2026-10-20).* Both layers come from hyper-raft's shared crates (vendor/UPSTREAM.md):
+hyper-transport, the application protocol below, over hyper-quic (quinn-proto 0.11.18) and
+hyper-tls (rustls 0.23.45 on AWS-LC), driven on a hyper-rt shard by hyper-rt-transport's driver;
+and hyper-datagram, the plane of §3.4, on a socket of its own (hyper-rt-transport's
+`PlaneSocket`). A node's owner (`crates/node`) runs a shard's ranges and both layers in one task:
+a range's Raft messages travel on one lane to each peer, a snapshot on an exchange of the bulk
+class, and control that carries no entries and fits a datagram on the plane. Of each pair of
+nodes the lower id dials, so a pair keeps one connection and each end knows its side of the
+plane's key schedule. Both ends key the plane from the connection's TLS exporter and number its
+epoch from a second export under a label of mantle's own, `EXPERIMENTAL mantle plane epoch`
+(RFC 5705 §4 keeps labels beginning "EXPERIMENTAL" for private use), so each new connection
+replaces the last one's keys with nothing sent between the nodes. The transport's bounds are
+derived from what the node states and from QUIC's initial estimates (RFC 9002 §6.2,
+RFC 9000 §10.1; `crates/node/src/bounds.rs`) until its budgets are measured (§2.6). A client
+(`crates/node/src/client.rs`) asks a range's leader its commands and its reads on the request
+class, the request's head naming the range's group: a command's body is its entry, answered once
+applied; a read's is its query, answered by ReadIndex (§5.1). A node that does not lead replies
+with the leader it knows and, when it knows none, how long until it acts on the leader's silence
+(its patience: the stream's freshness, the range's expected election and one round), by which the
+range has elected. Retries and redials back off as below: from the measured probe timeout,
+doubled, at most the idle timeout, with equal jitter (`bounds::backed_off`, `bounds::pause`), the
+client's waits no longer than the patience its nodes stated. A node redials only on the
+transport's word that a connection or a dial ended (`Closed`, `Unreachable`), so every dial must
+end in an event its owner is told: hyper-transport before hyper-raft `26b5af8` told nothing of a
+dial that failed as the last one had, and a peer cut off for two failed redials (18 s on the
+Windows runners) was never dialed again (`crates/node/tests/cluster.rs` holds a cut that long).
+A node states how long a link to a peer it dials may go without moving should that peer fall
+silent, which it cannot tell from slow (`Status::reconnect`): its connection's idle timeout and
+the peer's backoff. A peer learned at a new address has its old connection closed at once, since
+the transport dials no peer it holds a connection to. A node that answers a request without its
+body (with the leader it knows, or a status) first reads the body to its end, keeping none of it:
+ending an exchange whose request half is unread resets that half, and the asker's transport
+refuses the whole exchange on the reset, the answer it carried with it. RFC 9114 §4.1 lets a
+server answer early only because its client must keep a complete response, which
+hyper-transport's asker does not yet do. On the Windows runners, where a request's head often
+arrives in a datagram of its own, that turned 1,330 and 1,634 redirects into lost exchanges in
+three rounds of two process tests (one run per Windows target), and 4 and 7 once the body was
+read first. A client cuts an exchange that has not been answered within its
+period, and each cut doubles the next period with that node until that node replies (RFC 6298
+§5.5, collapsed only by a new measurement of the same path, §5). A registration, which would
+register again if asked again (the Raft dissertation §6.3), is cut by no period. On the Windows
+runners, registrations cut and asked again filled a range's 64 sessions (`SessionsFull`).
+`crates/node/tests/sim.rs` holds both laws.
+Still to build: the TCP fallback below, an ALPN of mantle's own in place of the transport's, chunk
+transfers (§5.2) and SWIM (§3.5).
 
 The QUIC layer combines standard QUIC with slates' measured work, each layer taken from the side
 that does it better (research 30 §6):
@@ -1523,6 +1602,15 @@ bounded per node, per device and per cell by the bulk budget, and a learner's la
 bounded; a member is removed only once its replacement holds the durable state the range needs
 (audit §5.7).
 
+*As built (2026-10-20).* A node replaces a member lost for good (`Node::replace`; `mantle node`'s
+`replace FAILED JOINING`): while it leads the range it proposes what `membership::Replacement`
+names next at each turn, a change only while none is pending, and the node that leads when the
+replacement ends reports it once (`replaced`). Every node may be told it, since the replacement
+is stateless. The joining member is a spare identity every directory holds from the start, its
+node started as the founders were, with their configuration and rows, of which it is no member
+until the learner change adds it; a node's directory taking an identity it did not hold (an
+invitation) and moves chosen from size and load are still to build.
+
 ### 6.5 Voters across failure domains
 
 A range's `2f + 1` voters are placed one to a failure domain at the level the configuration
@@ -1644,6 +1732,25 @@ The simulation also carries the faults and loads the 2026-09-30 designs answer f
   range's last-write check.
 - **Power changes mid-batch**: no acknowledgement before durability across a switch to battery or
   a thermal step, and every deferred job still meeting its deadline (research/28 §8).
+
+*As built (2026-10-20).* `crates/node/tests/sim.rs` runs a cell of three or five nodes and its
+clients on one hyper-rt simulation runtime (`SimRuntime`): every shard on one thread on a
+virtual clock, every socket on its fabric. The nodes are the production owner (`Node::open_on`),
+elected by suspicion and replicating over QUIC and the sealed plane. Each node's log is
+hyper-log on hyper-block's simulated device (`NodeLog`), and its range runs on the model engine.
+The clients are the production client. A run is its seed: keys, certificate serials and every
+endpoint's draws derive from it (`KeyPair::from_seed`, `Serial::from_octets`,
+`Endpoint::new_seeded`), so the handshakes carry the same bytes and a seed run twice gives the
+same histories, operation by operation. The paths are focal's profiles: one switch, one
+continent, or across the planet. Half way through the clients' operations, the leader or a
+follower is cut off, loses power (its device keeping what it flushed, as the seed draws), or has
+its device fail a write, which stops it as its process would. On some seeds every path also
+loses 2% of its datagrams meanwhile. The WGL checker judges each key's history, and every node
+must apply as far as the others. Two further tests hold laws the Windows runners exposed (§3):
+a registration slower than every exchange its client measured is applied once, and a request
+answered without its body is still answered when its body arrives after its head. Still to
+build: many ranges per node, the clients in their millions, and the faults and loads listed
+above.
 
 ### 9.2 Real processes
 

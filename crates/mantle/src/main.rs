@@ -51,6 +51,13 @@ enum Command {
         #[command(subcommand)]
         command: BenchCommand,
     },
+    /// Run a node: its range replicas and their transport, as the file at CONFIG states them
+    /// (mantle_node::process). It says where it listens and how its range moves on standard
+    /// output, and takes where its peers listen on standard input; it stops when that closes.
+    Node {
+        /// The node's configuration: one `key = value` a line.
+        config: PathBuf,
+    },
     /// Estimate how likely a block is to be lost in a year under each scheme mantle can store
     /// it in, and the scheme that meets the durability target at least cost.
     Durability {
@@ -255,9 +262,15 @@ fn parse_zones(text: &str) -> Result<(usize, f64), String> {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // A node writes its lines through the runtime's own writer thread: this thread holds no
+    // lock on standard output for it.
+    if let Command::Node { config } = &cli.command {
+        return exit(mantle_node::process::run(config).map_err(|e| e.to_string()));
+    }
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let result = match cli.command {
+        Command::Node { .. } => Ok(()),
         Command::Disk {
             command:
                 DiskCommand::Probe {
@@ -402,6 +415,10 @@ fn main() -> ExitCode {
             }
         }
     };
+    exit(result)
+}
+
+fn exit(result: Result<(), String>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

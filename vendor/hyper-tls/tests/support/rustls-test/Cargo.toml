@@ -1,0 +1,9 @@
+[package]
+name = "rustls-test"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Upstream's test-support crate (rustls repository at 2976d90, `rustls-test/`), pointed at hyper-tls.
+[dependencies]
+rustls = { package = "hyper-tls", path = "../../.." }

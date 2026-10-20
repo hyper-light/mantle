@@ -1118,8 +1118,8 @@ pub fn drive<R: Core, D: Driver<R>>(
         departure: None,
         steps: 0,
     };
-    for _ in 0..steps {
-        let Some(op) = both.driver.choose(&mut group, mix) else {
+    for step in 0..steps {
+        let Some(op) = both.driver.choose(&mut group, &mix.at(step)) else {
             break;
         };
         group.act_observed(&mut both, &op);

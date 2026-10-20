@@ -26,8 +26,9 @@
 mod support;
 
 use hyper_check::strategy::fork::each_point;
-use hyper_sim::Source;
-use support::cluster::{Cluster, Op, Reached, Shape, runs_the_same};
+use hyper_sim::tape::Tape;
+use hyper_sim::{Seeded, Source};
+use support::cluster::{Cluster, Op, Reached, Shape, played, runs_the_same};
 
 /// The liveness phase's rounds: a group that has not settled in them is reported, not waited on.
 const ROUNDS: usize = 4_000;
@@ -157,6 +158,38 @@ fn a_schedule_runs_the_same_twice_and_from_its_trace() {
         let record =
             runs_the_same(shape, 0, steps, ROUNDS).unwrap_or_else(|e| panic!("{name}: {e}"));
         assert!(record.steps > 0 && !record.trace.is_empty(), "{name}");
+    }
+}
+
+/// Each shape's schedule played from a tape (`docs/sim.md` §18): a fresh run's tape replays it
+/// exactly, and every mutation of it (a step's words redrawn, two steps of one kind exchanged, a
+/// step dropped or repeated: Gulcan et al.'s feasible mutations) is a schedule that keeps every
+/// oracle and settles, and whose own tape replays it. The world's schedules are mutated as
+/// hyper-check mutates a harness's own.
+#[test]
+fn a_schedule_plays_from_its_tape_and_every_mutation_keeps_every_invariant() {
+    let steps = support::count("HYPER_DURABLE_TAPE_STEPS", 800);
+    let mutations = support::count("HYPER_DURABLE_MUTATIONS", 8);
+    for (name, shape) in SHAPES {
+        let run = |tape: Tape, filler: u64| {
+            played(shape, tape, filler, steps, ROUNDS).unwrap_or_else(|e| panic!("{name}: {e}"))
+        };
+        let fresh = run(Tape::default(), 0);
+        let tape = fresh
+            .tape
+            .clone()
+            .expect("a played run gives its tape back");
+        assert_eq!(tape.len() as u64, steps, "{name}: a step an operation");
+        assert_eq!(run(tape.clone(), 1).digest, fresh.digest, "{name}");
+        let mut draws = Seeded::new(17);
+        let mut differed = 0u64;
+        for _ in 0..mutations {
+            let mutated = run(tape.mutate(&mut draws), 2);
+            differed += u64::from(mutated.digest != fresh.digest);
+            let taken = mutated.tape.clone().expect("its tape");
+            assert_eq!(run(taken, 3).digest, mutated.digest, "{name}");
+        }
+        assert!(differed > 0, "{name}: the mutations ran other schedules");
     }
 }
 

@@ -6,15 +6,21 @@ members = ["aws-lc-rs", "aws-lc-sys"]
 # target, and mantle's suites run against them (vendor/UPSTREAM.md).
 exclude = [
   "hyper-block",
+  "hyper-datagram",
   "hyper-durable",
   "hyper-liveness",
   "hyper-log",
   "hyper-measure",
+  "hyper-quic",
   "hyper-raft",
   "hyper-rt",
+  "hyper-rt-transport",
   "hyper-seal",
   "hyper-sim",
+  "hyper-swim",
   "hyper-timing",
+  "hyper-tls",
+  "hyper-transport",
 ]
 resolver = "2"
 

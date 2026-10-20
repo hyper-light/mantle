@@ -29,9 +29,10 @@ pub(crate) const MAX_SEGMENTS: usize = 64;
 pub(crate) const SEGMENTED_BYTES: usize = 65_507;
 /// The control buffer of one message, in 8-byte words for `cmsghdr`'s alignment: room for one
 /// `UDP_SEGMENT` (a `u16`) or one `UDP_GRO` (an `int`) beside one `SCM_TIMESTAMPNS` (a
-/// `struct timespec`): `CMSG_SPACE(4) + CMSG_SPACE(16)`, 24 + 32 = 56 bytes on a 64-bit target
-/// (a 16-byte header) and less on a 32-bit one, seven words (`the_control_buffer_holds_both`).
-const CONTROL_WORDS: usize = 7;
+/// `struct timespec`) and one `SO_RXQ_OVFL` (a `u32`): `CMSG_SPACE(4) + CMSG_SPACE(16) +
+/// CMSG_SPACE(4)`, 24 + 32 + 24 = 80 bytes on a 64-bit target (a 16-byte header) and less on a
+/// 32-bit one, ten words (`the_control_buffer_holds_every_message`).
+const CONTROL_WORDS: usize = 10;
 
 type Control = [u64; CONTROL_WORDS];
 
@@ -66,6 +67,25 @@ pub(crate) fn realtime_ns() -> io::Result<u64> {
     clock_ns(libc::CLOCK_REALTIME)
 }
 
+/// Asks the kernel to tell, with each datagram `fd` receives, how many it dropped for want of
+/// room since the socket was made (`SO_RXQ_OVFL`, socket(7)): an `SO_RXQ_OVFL` control message of
+/// a `u32`, attached once the count is past zero. A drop is then known from the traffic itself,
+/// without asking the socket's account. Whether it agreed.
+pub(crate) fn enable_drop_counts(fd: RawFd) -> bool {
+    let on: libc::c_int = 1;
+    // SAFETY: `on` is a live `c_int` and the length passed is its size; setsockopt only reads it.
+    let status = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RXQ_OVFL,
+            ptr::addr_of!(on).cast(),
+            socklen(size_of::<libc::c_int>()),
+        )
+    };
+    status == 0
+}
+
 /// Asks the kernel to stamp each datagram `fd` receives (`SO_TIMESTAMPNS`). Whether it agreed.
 pub(crate) fn enable_stamps(fd: RawFd) -> bool {
     let on: libc::c_int = 1;
@@ -80,6 +100,49 @@ pub(crate) fn enable_stamps(fd: RawFd) -> bool {
         )
     };
     status == 0
+}
+
+/// Format: `SK_MEMINFO_VARS` (`include/uapi/linux/sock_diag.h`), the words `SO_MEMINFO` fills on a
+/// kernel that reports drops, the last of them `SK_MEMINFO_DROPS`. An older kernel fills fewer and
+/// says so in the length it returns (`sk_getsockopt` copies the smaller).
+const MEMINFO_WORDS: usize = 9;
+
+/// What the kernel charges `fd`'s receive queue now (`SO_MEMINFO`, `sk_get_meminfo`): the bytes
+/// charged for the datagrams queued (`SK_MEMINFO_RMEM_ALLOC`, each its allocation's truesize), the
+/// buffer they count against (`SK_MEMINFO_RCVBUF`) and, where the kernel reports them, the
+/// datagrams it has dropped for want of room (`SK_MEMINFO_DROPS`).
+pub(crate) fn queue_charge(fd: RawFd) -> io::Result<(u32, u32, Option<u32>)> {
+    let mut info = [0u32; MEMINFO_WORDS];
+    let mut length = socklen(size_of::<[u32; MEMINFO_WORDS]>());
+    // SAFETY: `info` and `length` are live locals of the sizes passed; getsockopt writes at most
+    // `length` bytes into `info` and the length it wrote into `length`.
+    let status = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_MEMINFO,
+            info.as_mut_ptr().cast(),
+            &raw mut length,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let filled = usize::try_from(length)
+        .unwrap_or(0)
+        .checked_div(size_of::<u32>())
+        .unwrap_or(0);
+    let word = |index: libc::c_int| {
+        usize::try_from(index)
+            .ok()
+            .filter(|at| *at < filled)
+            .and_then(|at| info.get(at).copied())
+    };
+    let charged = word(libc::SK_MEMINFO_RMEM_ALLOC)
+        .ok_or_else(|| io::Error::other("SO_MEMINFO without the receive queue's charge"))?;
+    let buffer = word(libc::SK_MEMINFO_RCVBUF)
+        .ok_or_else(|| io::Error::other("SO_MEMINFO without the receive buffer"))?;
+    Ok((charged, buffer, word(libc::SK_MEMINFO_DROPS)))
 }
 
 /// What the kernel offers this socket.
@@ -162,6 +225,11 @@ pub(crate) const fn message_bytes() -> usize {
 }
 
 impl Headers {
+    /// The messages a receive offers the kernel at most, beside the buffers it is lent.
+    pub(crate) fn places(&self) -> usize {
+        self.names.len()
+    }
+
     /// Headers for up to `batch` messages.
     pub(crate) fn new(batch: usize) -> Self {
         Self {
@@ -346,6 +414,83 @@ pub(crate) fn send(
     }
 }
 
+/// The datagrams of `size` bytes one segmented send carries at most: [`MAX_SEGMENTS`], and no more
+/// than [`SEGMENTED_BYTES`] hold; at least one.
+pub(crate) fn segments_per_message(size: usize) -> usize {
+    SEGMENTED_BYTES
+        .checked_div(size)
+        .unwrap_or(1)
+        .clamp(1, MAX_SEGMENTS)
+}
+
+/// Sends `bytes` to `to` as one message straight from the caller's buffer, segmented into datagrams
+/// of `size` bytes (the last may be shorter) where it holds more than one, with one `sendmmsg` of
+/// one message; the caller keeps the message within [`segments_per_message`].
+pub(crate) fn send_one(
+    fd: RawFd,
+    to: SocketAddr,
+    bytes: &[u8],
+    size: usize,
+    headers: &mut Headers,
+) -> Result<(), SendFailed> {
+    let Headers {
+        headers: messages,
+        iovecs,
+        names,
+        controls,
+        groups,
+    } = headers;
+    messages.clear();
+    iovecs.clear();
+    groups.clear();
+    let (Some(name), Some(control)) = (names.first_mut(), controls.first_mut()) else {
+        return Err(SendFailed {
+            error: io::Error::from_raw_os_error(libc::ENOBUFS),
+            slots: 1,
+        });
+    };
+    iovecs.push(libc::iovec {
+        iov_base: bytes.as_ptr().cast_mut().cast(),
+        iov_len: bytes.len(),
+    });
+    let name_length = write_name(to, name);
+    // SAFETY: an all-zero `mmsghdr` is valid: null pointers with zero lengths.
+    let mut message: libc::mmsghdr = unsafe { zeroed() };
+    message.msg_hdr.msg_name = ptr::from_mut(name).cast();
+    message.msg_hdr.msg_namelen = name_length;
+    message.msg_hdr.msg_iov = iovecs.as_mut_ptr();
+    message.msg_hdr.msg_iovlen = field(1);
+    if size < bytes.len() {
+        segment(&mut message.msg_hdr, control, size);
+    }
+    messages.push(message);
+    let one: libc::c_uint = 1;
+    // SAFETY: `messages` holds one initialised header whose name, iovec and control point into
+    // `names`, `iovecs`, `controls` and `bytes`, all borrowed for this call and not moved since the
+    // pointers were taken; sendmmsg reads them and writes only `msg_len`.
+    let sent = unsafe {
+        libc::syscall(
+            libc::SYS_sendmmsg,
+            fd,
+            messages.as_mut_ptr(),
+            one,
+            libc::MSG_DONTWAIT,
+        )
+    };
+    match usize::try_from(sent) {
+        Ok(1) => Ok(()),
+        // Nothing taken and no error: as a full socket
+        Ok(_) => Err(SendFailed {
+            error: io::Error::from_raw_os_error(libc::EAGAIN),
+            slots: 1,
+        }),
+        Err(_) => Err(SendFailed {
+            error: io::Error::last_os_error(),
+            slots: 1,
+        }),
+    }
+}
+
 /// Writes one `UDP_SEGMENT` control message of `size` into `control` and points `header` at it.
 fn segment(header: &mut libc::msghdr, control: &mut Control, size: usize) {
     let Ok(size) = u16::try_from(size) else {
@@ -395,6 +540,9 @@ pub(crate) struct Received {
     pub(crate) segment: Option<usize>,
     /// The kernel's receive stamp, nanoseconds of `CLOCK_REALTIME`, when it attached one.
     pub(crate) stamp: Option<u64>,
+    /// The datagrams the socket had dropped for want of room when this one was queued
+    /// (`SO_RXQ_OVFL`), when the kernel attached the count: none until it is past zero.
+    pub(crate) drops: Option<u32>,
 }
 
 /// Receives up to one message into each of `buffers` with one `recvmmsg`, appending what arrived
@@ -471,13 +619,14 @@ pub(crate) fn receive(
         let Ok(length) = usize::try_from(message.msg_len) else {
             continue;
         };
-        let (segment, stamp) = controls_of(&message.msg_hdr);
+        let (segment, stamp, drops) = controls_of(&message.msg_hdr);
         out.push(Received {
             index,
             from,
             length,
             segment,
             stamp,
+            drops,
         });
     }
     Ok(received)
@@ -499,12 +648,12 @@ fn whole(bytes: usize) -> usize {
 /// The `UDP_GRO` segment size of a received message, if the kernel coalesced it, and its
 /// `SCM_TIMESTAMPNS` stamp in nanoseconds, if the kernel stamped it. A message whose `cmsg_len`
 /// does not cover its data (a truncated control buffer) is not read.
-fn controls_of(header: &libc::msghdr) -> (Option<usize>, Option<u64>) {
-    let (mut segment, mut stamp) = (None, None);
+fn controls_of(header: &libc::msghdr) -> (Option<usize>, Option<u64>, Option<u32>) {
+    let (mut segment, mut stamp, mut drops) = (None, None, None);
     // SAFETY: `header` was filled by recvmmsg, whose control buffer and length are its own;
     // CMSG_FIRSTHDR and CMSG_NXTHDR stay within `msg_controllen`; a `UDP_GRO` message's data is
-    // an `int` and an `SCM_TIMESTAMPNS` message's a `timespec`, each read unaligned once its
-    // `cmsg_len` is checked to cover it.
+    // an `int`, an `SCM_TIMESTAMPNS` message's a `timespec` and an `SO_RXQ_OVFL` message's a
+    // `u32`, each read unaligned once its `cmsg_len` is checked to cover it.
     unsafe {
         let mut at = libc::CMSG_FIRSTHDR(header);
         while let Some(control) = at.as_ref() {
@@ -521,25 +670,32 @@ fn controls_of(header: &libc::msghdr) -> (Option<usize>, Option<u64>) {
             {
                 let time = ptr::read_unaligned(libc::CMSG_DATA(at).cast::<libc::timespec>());
                 stamp = timespec_ns(&time);
+            } else if control.cmsg_level == libc::SOL_SOCKET
+                && control.cmsg_type == libc::SO_RXQ_OVFL
+                && length >= whole(size_of::<u32>())
+            {
+                drops = Some(ptr::read_unaligned(libc::CMSG_DATA(at).cast::<u32>()));
             }
             at = libc::CMSG_NXTHDR(header, at);
         }
     }
-    (segment, stamp)
+    (segment, stamp, drops)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The control buffer holds a `UDP_GRO` message beside an `SCM_TIMESTAMPNS` one.
+    /// The control buffer holds a `UDP_GRO` message beside an `SCM_TIMESTAMPNS` one and an
+    /// `SO_RXQ_OVFL` one.
     #[test]
-    fn the_control_buffer_holds_both() {
+    fn the_control_buffer_holds_every_message() {
         // SAFETY: CMSG_SPACE only computes a length.
-        let both = unsafe {
+        let every = unsafe {
             libc::CMSG_SPACE(socklen_u32(size_of::<libc::c_int>()))
                 + libc::CMSG_SPACE(socklen_u32(size_of::<libc::timespec>()))
+                + libc::CMSG_SPACE(socklen_u32(size_of::<u32>()))
         };
-        assert!(usize::try_from(both).unwrap() <= size_of::<Control>());
+        assert!(usize::try_from(every).unwrap() <= size_of::<Control>());
     }
 }

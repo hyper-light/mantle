@@ -193,6 +193,76 @@ fn every_datagram_socket_probes_with_the_dont_fragment_bit() {
     assert!(socket.dont_fragment().unwrap(), "IP_PMTUDISC_PROBE");
 }
 
+/// RFC 8899 §5.1.2 on Linux: a socket connected to a peer reads its path's MTU from the kernel
+/// (`IP_MTU`) and gives the largest UDP payload it carries: loopback's MTU (65,536) is past what
+/// IPv4's length field can say, so the payload is that field's limit less the headers (65,507). A
+/// socket with no peer has no path, and says so.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_connected_socket_reads_its_paths_payload_from_the_kernel() {
+    let receiver = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let mut sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+    assert_eq!(sender.path_payload().unwrap(), None, "no peer, no path");
+    sender.connect(receiver.local_addr().unwrap()).unwrap();
+    assert_eq!(sender.path_payload().unwrap(), Some(65_507));
+}
+
+/// XNU keeps no path MTU a socket can read, so a connected socket reads its interface's, and the
+/// host's UDP cap below it: loopback's MTU (16,384, `lo0`) less the IPv4 and UDP headers is past
+/// macOS's cap (`net.inet.udp.maxdgram`, 9,216 by default), so the payload is the cap, and a
+/// datagram of it sends. A socket with no peer has no path.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_connected_socket_on_macos_reads_its_interfaces_payload_under_the_hosts_cap() {
+    let receiver = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let mut sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    assert_eq!(sender.path_payload().unwrap(), None, "no peer, no path");
+    let target = receiver.local_addr().unwrap();
+    sender.connect(target).unwrap();
+    let payload = sender.path_payload().unwrap().unwrap();
+    assert!(payload <= 16_384 - 28, "{payload}");
+    assert!(payload >= 1_200, "{payload}");
+    assert_eq!(
+        sender
+            .send_to(&vec![0u8; usize::from(payload)], target)
+            .unwrap(),
+        usize::from(payload)
+    );
+}
+
+/// Windows (10 1703 on) reads a connected socket's path MTU (`IP_MTU`): loopback carries any
+/// datagram IPv4 can say, past QUIC's 1,200-byte floor; a socket with no peer has no path.
+#[cfg(windows)]
+#[test]
+fn a_connected_socket_on_windows_reads_its_paths_payload() {
+    let receiver = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let mut sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+    assert_eq!(sender.path_payload().unwrap(), None, "no peer, no path");
+    sender.connect(receiver.local_addr().unwrap()).unwrap();
+    let payload = sender.path_payload().unwrap();
+    assert!(payload.is_some_and(|bytes| bytes >= 1_200), "{payload:?}");
+}
+
+/// A socket that serves many peers (a listener, never connected) reads the payload of the path to
+/// any one of them as a socket connected there would: the same payload, on every platform that can
+/// say, and nothing sent.
+#[test]
+fn a_listener_reads_the_path_to_a_peer_as_a_connected_socket_would() {
+    let receiver = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let target = receiver.local_addr().unwrap();
+    let listener = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    let mut connected = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    connected.connect(target).unwrap();
+    assert_eq!(
+        listener.path_payload_to(target).unwrap(),
+        connected.path_payload().unwrap()
+    );
+    if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
+        assert!(listener.path_payload_to(target).unwrap().is_some());
+    }
+    assert_eq!(receiver.queued_bytes().unwrap(), 0, "nothing was sent");
+}
+
 /// AC (§4.10a; docs/bugs/2026-09-28-a-released-test-port-was-taken-before-the-daemon-bound-it.md): a
 /// caller that binds a port and hands the runtime a duplicate of that socket keeps the port from the moment
 /// it learned it — no other socket can bind it while the caller's handle lives, even after the adopted
@@ -566,4 +636,26 @@ fn a_send_under_local_pressure_waits_for_writability_and_sends_once() {
         vec![b"pressure".to_vec()],
         "the datagram arrived exactly once"
     );
+}
+
+/// A socket asked for a receive buffer reports at least the size asked, where the OS grants it
+/// (a small ask, under every platform's default ceiling; Linux reports it doubled), and asking a size
+/// past every ceiling is no error: the OS caps it, and the socket reports what it granted.
+#[test]
+fn a_socket_reports_the_receive_buffer_it_was_granted() {
+    /// Shape: a small ask, which every platform's default ceiling grants (Linux 208 KiB, macOS
+    /// 8 MiB, Windows unbounded).
+    const ASK: usize = 64 << 10;
+    /// Shape: an ask past every platform's ceiling for an unprivileged process.
+    const PAST: usize = 1 << 30;
+    let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let reported = socket.set_recv_buffer_bytes(ASK).unwrap();
+    assert!(reported >= ASK, "{reported} reported for an ask of {ASK}");
+    assert_eq!(socket.recv_buffer_bytes().unwrap(), reported);
+    let capped = socket.set_recv_buffer_bytes(PAST).unwrap();
+    assert!(
+        capped >= ASK,
+        "a cap never takes back what was granted below it: {capped}"
+    );
+    assert_eq!(socket.recv_buffer_bytes().unwrap(), capped);
 }

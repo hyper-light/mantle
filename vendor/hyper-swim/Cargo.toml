@@ -1,0 +1,20 @@
+[package]
+name = "hyper-swim"
+description = "SWIM membership and failure detection with Lifeguard, sans-io: slates' detector, shared by mantle, focal and slates"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/hyper-light/hyper-raft"
+rust-version = "1.98.1"
+publish = false
+[dependencies]
+hyper-timing = { path = "../hyper-timing" }
+
+[dev-dependencies]
+hyper-datagram = { path = "../hyper-datagram" }
+hyper-measure = { path = "../hyper-measure" }
+# The simulation's world and network (`tests/sim.rs`, `docs/sim.md` §9, S-2).
+hyper-sim = { path = "../hyper-sim" }
+
+# A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside any consumer workspace.
+[workspace]

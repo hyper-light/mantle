@@ -131,6 +131,10 @@ pub struct Mix {
     /// acknowledged may be lost to both, and the group then waits for good
     /// (`docs/durable.md` §5.2); such waits are counted, not failed.
     pub marks: usize,
+    /// Calm and adversarial stretches of this many steps alternate, the first adversarial
+    /// (`docs/sim.md` §3.8): a calm stretch loses, repeats, partitions, restarts and corrupts
+    /// nothing ([`Mix::calm`]). `None`: every step is drawn from the whole mix.
+    pub stretch: Option<u64>,
 }
 impl Mix {
     pub fn everything() -> Self {
@@ -150,6 +154,27 @@ impl Mix {
             leader_durable: 100,
             corrupt: 0,
             marks: 1,
+            stretch: None,
+        }
+    }
+
+    /// This mix with its faults off: a calm stretch's.
+    pub fn calm(&self) -> Self {
+        Self {
+            restarts: false,
+            partitions: false,
+            lose: 0,
+            repeat: 0,
+            corrupt: 0,
+            ..*self
+        }
+    }
+
+    /// The mix step `step` draws from: the calm one in every second stretch.
+    pub fn at(&self, step: u64) -> Self {
+        match self.stretch {
+            Some(stretch) if stretch > 0 && (step / stretch) % 2 == 1 => self.calm(),
+            _ => *self,
         }
     }
 }

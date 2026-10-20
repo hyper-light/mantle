@@ -10,7 +10,7 @@ use hyper_rt_transport::{Io, MAX_BATCH};
 use hyper_transport::{AdmissionLimits, AskQueue, Limits, RECEIVE_CHUNK, StreamCredit};
 
 use crate::classes::Bounds;
-use crate::frame;
+use crate::command;
 
 /// RFC 9002 §6.2.2: before a path has a sample, its smoothed round trip is `kInitialRtt`, 333 ms,
 /// and its variation half that.
@@ -114,8 +114,10 @@ pub fn limits(stated: &Stated) -> Result<Limits, Unfit> {
         // One lane a peer: the node runs its ranges on one shard (node.md §3.2's lane a shard).
         lanes_per_peer: 1,
         lane_window,
-        // A snapshot's exchange carries its frame in the body, a frame's header ahead of it.
-        max_head: u32::try_from(frame::HEADER_BYTES).map_err(|_| Unfit("head"))?,
+        // A command's head names its range; a reply's, its status and the leader. A snapshot's
+        // exchange carries its frame in the body and no head.
+        max_head: u32::try_from(command::HEAD_BYTES.max(command::REPLY_HEAD_BYTES))
+            .map_err(|_| Unfit("head"))?,
         window_ceiling,
         // An exchange that makes no progress for as long as a connection may stay silent is
         // judged stalled.

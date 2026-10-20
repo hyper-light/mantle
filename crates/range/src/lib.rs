@@ -18,6 +18,7 @@ mod image;
 mod machine;
 pub mod membership;
 mod replica;
+mod stored;
 
 pub use error::ReplicaError;
 pub use hyper_durable::{Driven, GroupStore, LogStore};
@@ -30,3 +31,4 @@ pub use machine::{Applied, RangeMachine};
 pub use replica::{
     Output, Range, Replica, Settings, Shell, claim, open_shell, propose_entry, remove,
 };
+pub use stored::Stored;

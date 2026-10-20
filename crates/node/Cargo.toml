@@ -31,6 +31,8 @@ thiserror.workspace = true
 [dev-dependencies]
 # The cell's authority and its nodes' certificates, issued for the tests' nodes.
 mantle-cert = { path = "../cert" }
+# The engine the tests' nodes keep a range's rows in, beside the model.
+mantle-engine = { path = "../engine" }
 tempfile.workspace = true
 
 [lints]

@@ -4,6 +4,8 @@
 //!
 //! - [`bounds`]: every bound of the transport, derived from what the node states.
 //! - [`classes`]: the kinds of message QUIC carries, their classes and who may send each.
+//! - [`client`]: a client of the cell's ranges, asking their leaders to apply entries.
+//! - [`command`]: a command for a range as a client asks it and a node answers it.
 //! - [`directory`]: the peers a connection may name, by certificate.
 //! - [`frame`]: a range's Raft message as it travels.
 //! - [`layout`]: what the node keeps beside its log: its run.
@@ -23,6 +25,8 @@
 
 pub mod bounds;
 pub mod classes;
+pub mod client;
+pub mod command;
 pub mod directory;
 pub mod frame;
 pub mod layout;

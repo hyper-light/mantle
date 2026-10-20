@@ -35,18 +35,22 @@ use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_datagram::{AdmitAll, EXPORTER_LABEL, ExporterSecret, Plane, SECRET_BYTES};
 use hyper_durable::{Driven, Handle, Owner, Unbounded};
 use hyper_liveness::{Change, Liveness};
-use hyper_log::{Class as LogClass, Config as LogConfig, Log, Pending, Update};
+use hyper_log::{Class as LogClass, Config as LogConfig, Log, LogStats, Pending, Update};
 use hyper_raft::proto::{Message, MessageType};
 use hyper_rt::combine::{Either, Either3, race2, race3};
 use hyper_rt_transport::{Driver, PlaneSocket};
 use hyper_timing::Exposure;
 use hyper_transport::tls::{Credentials, Tls};
-use hyper_transport::{Config, Endpoint, Event, ExchangeId, Fixed, PeerId, Progress, Refusal};
-use mantle_meta::engine::Model;
+use hyper_transport::{
+    Classes, Config, Endpoint, Event, ExchangeId, Fixed, PeerId, Progress, Refusal,
+};
+use mantle_meta::engine::Engine;
+use mantle_meta::wire::Answer;
 use mantle_range::{Applied, Elections, GroupStore, Range, RangeMachine};
 
 use crate::bounds::{self, Stated};
 use crate::classes::{self, Bounds, Kind, NodeClasses, Role};
+use crate::command;
 use crate::directory::{Peer, Peers};
 use crate::frame;
 use crate::layout::Layout;
@@ -70,7 +74,7 @@ fn log_id(node: u64) -> u128 {
 }
 
 /// What a node is given.
-pub struct NodeSettings {
+pub struct NodeSettings<E> {
     pub id: u64,
     pub dir: PathBuf,
     /// The QUIC endpoint's address, and the plane's.
@@ -81,19 +85,20 @@ pub struct NodeSettings {
     /// Where peers listen, as far as the node knows at its start: QUIC's address, the plane's.
     pub addresses: Vec<(PeerId, SocketAddr, SocketAddr)>,
     /// The ranges it hosts, each a member named by the node's id.
-    pub ranges: Vec<Hosted>,
+    pub ranges: Vec<Hosted<E>>,
     pub log: LogConfig,
     /// The bytes the transport may hold at once.
     pub transport_bytes: u64,
 }
 
 /// A range the node hosts: its log group, the range, and its engine as it starts: a range's
-/// founding state, or what the node's engine holds durably.
+/// founding state, or what the engine holds durably (`mantle_range::Stored`, opened at its last
+/// checkpoint), from which the log is replayed.
 #[derive(Debug, Clone)]
-pub struct Hosted {
+pub struct Hosted<E> {
     pub group: u128,
     pub range: Range,
-    pub engine: Model,
+    pub engine: E,
 }
 
 /// Why the node stopped.
@@ -136,7 +141,6 @@ impl From<hyper_rt::RtError> for NodeError {
 }
 
 type Store = GroupStore<DeviceFile>;
-type Machine = RangeMachine<Model>;
 
 /// What the liveness stream asked during a call into it.
 #[derive(Default)]
@@ -176,6 +180,51 @@ pub struct Status {
     /// the range's expected election from a suspicion and one more round (hyper-raft's `Timing`);
     /// `None` until both are measured.
     pub patience: Option<Duration>,
+    /// Snapshots this node sent that their member took, and snapshots it took, of every range.
+    pub snapshots_sent: u64,
+    pub snapshots_taken: u64,
+    /// Whether the range's member waits for room in the log, its writes out, and the writes it
+    /// made by what they were for.
+    pub stalled: bool,
+    pub in_flight: usize,
+    pub writes: hyper_durable::Writes,
+    /// Whether the member is fenced.
+    pub fenced: bool,
+    /// What the node's Raft sends did, and what it did with the frames that came to it.
+    pub sends: Sends,
+    pub received: Received,
+}
+
+/// What the node's sends of Raft messages did, all told.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Sends {
+    /// Messages queued on the plane, frames given a lane, and snapshots' exchanges opened.
+    pub plane: u64,
+    pub lane: u64,
+    pub snapshots: u64,
+    /// Frames a full lane held for room.
+    pub waited: u64,
+    /// Messages dropped, as the network may drop them, for Raft to send again: no connection, a
+    /// lane past its window, a refusal; and the latest refusal, with its frame's bytes and its
+    /// message's type when it was a Raft message's.
+    pub dropped: u64,
+    pub refused: Option<(Refusal, usize, Option<MessageType>)>,
+}
+
+impl Sends {
+    fn dropped(&mut self, refusal: Refusal, bytes: usize, kind: Option<MessageType>) {
+        self.dropped = self.dropped.saturating_add(1);
+        self.refused = Some((refusal, bytes, kind));
+    }
+}
+
+/// What the node did with the Raft frames that came to it, all told: stepped into their range,
+/// or dropped (damaged, misaddressed, for a range it does not host, from a sender not in the
+/// range's configuration, or refused by a replica waiting for room).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Received {
+    pub stepped: u64,
+    pub dropped: u64,
 }
 
 /// A range as the node keeps it.
@@ -204,32 +253,69 @@ struct Remote {
     backoff: Duration,
 }
 
-/// A snapshot out on its exchange: to whom, for which range, and its frame with how much of it the
-/// exchange has taken (`write_body` takes what credit allows; `Event::Writable` says when more).
-struct Sending {
+/// A body going out on an exchange, with how much of it the exchange has taken (`write_body`
+/// takes what credit allows; `Event::Writable` says when more), and what follows once it is all
+/// written.
+struct Writing {
     exchange: ExchangeId,
-    group: u128,
-    to: u64,
-    frame: Vec<u8>,
+    bytes: Vec<u8>,
     written: usize,
+    then: Then,
 }
 
-/// A snapshot arriving on an exchange: from whom, the body's length, and what was read of it.
+/// What a body written whole waits for.
+#[derive(Clone, Copy)]
+enum Then {
+    /// A snapshot of `group` to `to`: the member's reply, which says it arrived.
+    Snapshot { group: u128, to: u64 },
+    /// A command's reply: nothing; the exchange ends.
+    Reply,
+}
+
+/// A body arriving on an exchange: from whom, its length, what was read of it, and what it is.
 struct Receiving {
     exchange: ExchangeId,
     peer: PeerId,
     body: u64,
     bytes: Vec<u8>,
+    what: Arriving,
+}
+
+/// What an arriving body is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Arriving {
+    /// A range's snapshot, its frame whole.
+    Snapshot,
+    /// A command for the range of this group: an entry.
+    Command(u128),
+}
+
+impl Arriving {
+    /// The class its body is read into.
+    fn class(self) -> classes::Class {
+        match self {
+            Self::Snapshot => classes::Class::Bulk,
+            Self::Command(_) => classes::Class::Request,
+        }
+    }
+}
+
+/// A command this node's member of `group` proposed as leader, waiting for its entry to apply:
+/// each command's session and serial, in the entry's order, with its answer once applied.
+struct Commanded {
+    exchange: ExchangeId,
+    group: u128,
+    commands: Vec<(u64, u64, Option<Answer>)>,
 }
 
 /// The piece a body is read in: the transport's own receive chunk.
 const PIECE: u64 = hyper_transport::RECEIVE_CHUNK as u64;
 
 /// One shard's ranges and the transport they replicate over.
-pub struct Node {
+pub struct Node<E: Engine> {
     id: u64,
     log: Log<DeviceFile>,
-    owner: Owner<Store, Machine, Unbounded>,
+    owner: Owner<Store, RangeMachine<E>, Unbounded>,
     ranges: Vec<Kept>,
     deadlines: BTreeSet<(u64, usize)>,
     liveness: Liveness,
@@ -242,21 +328,30 @@ pub struct Node {
     plane_socket: PlaneSocket,
     remotes: Vec<Remote>,
     lane_window: usize,
-    sending: Vec<Sending>,
+    writing: Vec<Writing>,
     receiving: Vec<Receiving>,
+    /// Commands proposed and not yet answered: at most what the transport admits as exchanges.
+    commanded: Vec<Commanded>,
     /// Plane messages taken this turn: sender, the kernel's arrival stamp, the bytes.
     inbox: Vec<(PeerId, u64, Vec<u8>)>,
     events: Vec<Event<NodeClasses>>,
     out: hyper_durable::Output<Applied>,
     frame: Vec<u8>,
     applied: Vec<(u128, Applied)>,
+    snapshots_sent: u64,
+    snapshots_taken: u64,
+    /// Each range's timing before a measure, to tell which moved.
+    timings: Vec<Option<hyper_raft::Timing>>,
+    sends: Sends,
+    received: Received,
     waker: Waker,
 }
 
 /// The node's message bounds: a Raft message is at most the larger of a page of entries and one
-/// entry of the range's largest, inside the core's fixed bytes, in a frame; a command is an entry;
-/// a snapshot's data is at most what hyper-raft's wire states, a u32 of bytes.
-fn message_bounds(ranges: &[Hosted]) -> Result<Bounds, NodeError> {
+/// entry of the range's largest, inside the core's fixed bytes, in a frame; a command is an entry
+/// behind its head, and its reply no larger (`command::Status::TooLarge` otherwise); a snapshot's
+/// data is at most what hyper-raft's wire states, a u32 of bytes.
+pub fn message_bounds<E>(ranges: &[Hosted<E>]) -> Result<Bounds, NodeError> {
     let unfit = || NodeError::Bounds("a range's settings overflow a message's bound".into());
     let mut largest = 0u64;
     let mut entry = 0u64;
@@ -274,18 +369,21 @@ fn message_bounds(ranges: &[Hosted]) -> Result<Bounds, NodeError> {
         entry = entry.max(s.max_entry_bytes);
     }
     let bulk = u64::from(u32::MAX).checked_add(largest).ok_or_else(unfit)?;
+    let request = entry
+        .checked_add(u64::try_from(command::HEAD_BYTES).map_err(|_| unfit())?)
+        .ok_or_else(unfit)?;
     Ok(Bounds {
         replication: largest,
-        request: entry,
+        request,
         bulk,
     })
 }
 
-impl Node {
+impl<E: Engine + 'static> Node<E> {
     /// Opens the node on the current hyper-rt shard: raises its run, opens its log and its ranges,
     /// binds its QUIC endpoint and its plane, and dials each peer whose id is above its own. The
     /// task that opens it is the one that turns it: its waker is the one the log answers through.
-    pub async fn open(settings: NodeSettings) -> Result<Self, NodeError> {
+    pub async fn open(mut settings: NodeSettings<E>) -> Result<Self, NodeError> {
         let waker = poll_fn(|context| Poll::Ready(context.waker().clone())).await;
         let layout = Layout::new(&settings.dir);
         let run = layout.raise_run()?;
@@ -310,9 +408,10 @@ impl Node {
         let io = bounds::io(&stated);
         let plane_limits = bounds::plane(&stated).map_err(|e| NodeError::Bounds(e.to_string()))?;
 
-        let mut owner = Owner::new(vec![waker.clone(); settings.ranges.len()]);
-        let mut ranges = Vec::with_capacity(settings.ranges.len());
-        for hosted in &settings.ranges {
+        let hosting = std::mem::take(&mut settings.ranges);
+        let mut owner = Owner::new(vec![waker.clone(); hosting.len()]);
+        let mut ranges = Vec::with_capacity(hosting.len());
+        for hosted in hosting {
             if hosted.group == 0 || hosted.group == LIVENESS_GROUP {
                 return Err(NodeError::Reserved(hosted.group));
             }
@@ -320,7 +419,7 @@ impl Node {
             let shell = mantle_range::open_shell(
                 settings.id,
                 store,
-                hosted.engine.clone(),
+                hosted.engine,
                 &hosted.range,
                 settings.id,
                 Elections::Suspicion,
@@ -359,6 +458,7 @@ impl Node {
         let remotes = settings
             .peers
             .iter()
+            .filter(|p| p.role == Role::Node)
             .map(|p| Remote {
                 id: p.id,
                 quic: None,
@@ -385,13 +485,19 @@ impl Node {
             plane_socket,
             remotes,
             lane_window,
-            sending: Vec::new(),
+            writing: Vec::new(),
             receiving: Vec::new(),
+            commanded: Vec::new(),
             inbox: Vec::new(),
             events: Vec::new(),
             out: hyper_durable::Output::default(),
             frame: Vec::new(),
             applied: Vec::new(),
+            snapshots_sent: 0,
+            snapshots_taken: 0,
+            timings: Vec::new(),
+            sends: Sends::default(),
+            received: Received::default(),
             waker,
         };
         for kept in &node.ranges {
@@ -406,15 +512,19 @@ impl Node {
     }
 
     /// Where `peer` listens: QUIC's address and the plane's. A peer this node dials (its id is
-    /// above this node's) is dialed at the next turn.
+    /// above this node's) is dialed at the next turn when it has no connection, or when it moved:
+    /// a peer that started again elsewhere is dialed there at once, not after the old connection's
+    /// idle timeout.
     pub fn learn(&mut self, peer: PeerId, quic: SocketAddr, plane: SocketAddr) {
         let dials = self.id < peer;
         let now = hyper_rt::futures::now_ns();
         if let Some(remote) = self.remotes.iter_mut().find(|r| r.id == peer) {
+            let moved = remote.quic.is_some_and(|known| known != quic);
             remote.quic = Some(quic);
             remote.plane = Some(plane);
-            if dials && !remote.keyed {
+            if dials && (moved || !remote.keyed) {
                 remote.redial_at = Some(now);
+                remote.backoff = bounds::initial_pto();
             }
         }
     }
@@ -493,7 +603,24 @@ impl Node {
             heartbeats,
             judged,
             patience,
+            snapshots_sent: self.snapshots_sent,
+            snapshots_taken: self.snapshots_taken,
+            stalled: replica.is_stalled(),
+            in_flight: replica.in_flight(),
+            writes: replica.writes(),
+            fenced: replica.fenced().is_some(),
+            sends: self.sends,
+            received: self.received,
         })
+    }
+
+    /// What the node's log measured from its opening (hyper-log `Log::stats`), asked of the log's
+    /// owner, which answers as it comes: a flush that stalls shows as `flushing_since`. `into`, a
+    /// box an earlier call gave back, is filled again.
+    pub fn log_stats(&self, into: Option<Box<LogStats>>) -> Result<Box<LogStats>, NodeError> {
+        self.log
+            .stats(into)
+            .map_err(|e| NodeError::Log(e.to_string()))
     }
 
     /// What the node's ranges answered as they applied, since the last call.
@@ -529,13 +656,38 @@ impl Node {
         }
         self.dial(now);
         if std::mem::take(&mut self.liveness_moved) {
-            self.owner.measure(&mut self.liveness);
+            self.measure();
         }
         self.schedule_due(now);
         self.drive(now)?;
         self.send_plane();
         self.driver.flush()?;
         Ok(())
+    }
+
+    /// Each range's timing from what the stream measured, and each pair charged its ranges'
+    /// election (hyper-durable's `Owner::measure`). A range whose timing moved is driven: its core
+    /// draws a campaign's delay, or times a timer, only when driven, so a range given its first
+    /// timing with nothing else to drive it never campaigned (its term stayed 0 on one CPU).
+    fn measure(&mut self) {
+        self.timings.clear();
+        for kept in &self.ranges {
+            let timing = self
+                .owner
+                .get(kept.handle)
+                .and_then(|r| r.core().raft.timing());
+            self.timings.push(timing);
+        }
+        self.owner.measure(&mut self.liveness);
+        for (kept, was) in self.ranges.iter().zip(&self.timings) {
+            let now = self
+                .owner
+                .get(kept.handle)
+                .and_then(|r| r.core().raft.timing());
+            if now != *was {
+                self.owner.schedule(kept.handle);
+            }
+        }
     }
 
     /// Waits for the first of: the transport's next event, a datagram on the plane, the earliest
@@ -677,21 +829,44 @@ impl Node {
     /// Steps a Raft frame from `sender` into its range, if this node hosts it and `sender` is the
     /// message's `from`: a message is bound to the peer the transport authenticated.
     fn step_frame(&mut self, sender: PeerId, bytes: &[u8]) -> Result<(), NodeError> {
+        let stepped = self.step_checked(sender, bytes);
+        let counter = if stepped {
+            &mut self.received.stepped
+        } else {
+            &mut self.received.dropped
+        };
+        *counter = counter.saturating_add(1);
+        Ok(())
+    }
+
+    /// Steps the frame if it may act: whether it was stepped.
+    fn step_checked(&mut self, sender: PeerId, bytes: &[u8]) -> bool {
         let Ok((group, message)) = frame::decode(bytes) else {
-            return Ok(());
+            return false;
         };
         if message.from != sender || message.to != self.id {
-            return Ok(());
+            return false;
         }
         let Some(handle) = self.kept(group).map(|k| k.handle) else {
-            return Ok(());
+            return false;
         };
-        if let Some(shell) = self.owner.get_mut(handle) {
-            // A replica waiting for room refuses a message, as the network may drop it.
-            let _ = shell.step(message);
-            self.owner.schedule(handle);
+        // Only a member of the range's configuration may act on it (node.md §3.6); a member whose
+        // configuration is still empty, one joining, learns it from its leader.
+        let member = self.owner.get(handle).is_some_and(|r| {
+            let c = r.configuration();
+            let lists = [&c.voters, &c.learners, &c.voters_outgoing, &c.learners_next];
+            lists.iter().all(|ids| ids.is_empty()) || lists.iter().any(|ids| ids.contains(&sender))
+        });
+        if !member {
+            return false;
         }
-        Ok(())
+        let Some(shell) = self.owner.get_mut(handle) else {
+            return false;
+        };
+        // A replica waiting for room refuses a message, as the network may drop it.
+        let stepped = shell.step(message).is_ok();
+        self.owner.schedule(handle);
+        stepped
     }
 
     /// Carries out what the stream asked: heartbeats onto the plane, a liveness write on the log,
@@ -725,17 +900,21 @@ impl Node {
 
     fn on_event(&mut self, event: Event<NodeClasses>, now: u64) -> Result<(), NodeError> {
         match event {
-            Event::Connected { peer, epoch, .. } => self.key_plane(peer, epoch, now),
+            // A client's connection carries commands alone; only a node's keys the plane.
+            Event::Connected {
+                peer,
+                epoch,
+                role: Role::Node,
+            } => self.key_plane(peer, epoch, now),
+            Event::Connected { .. } => Ok(()),
             Event::Frame {
                 peer, kind, frame, ..
             } => {
+                // Stepped from the transport's own buffer, then given back.
                 if kind == Kind::Raft {
-                    let bytes = frame.bytes().to_vec();
-                    self.driver.endpoint().release(frame);
-                    self.step_frame(peer, &bytes)?;
-                } else {
-                    self.driver.endpoint().release(frame);
+                    self.step_frame(peer, frame.bytes())?;
                 }
+                self.driver.endpoint().release(frame);
                 Ok(())
             }
             Event::LaneRoom { peer, .. } => {
@@ -745,27 +924,35 @@ impl Node {
             Event::Request {
                 exchange,
                 peer,
-                kind: Kind::Snapshot,
+                kind,
                 body,
                 ..
             } => {
+                let what = match kind {
+                    Kind::Snapshot => Arriving::Snapshot,
+                    Kind::Command => match self.take_command(exchange)? {
+                        Some(group) => Arriving::Command(group),
+                        None => return Ok(()),
+                    },
+                    // A Raft message travels on a lane, never on an exchange.
+                    Kind::Raft => {
+                        self.driver
+                            .endpoint()
+                            .refuse_exchange(exchange, Refusal::Kind);
+                        return Ok(());
+                    }
+                };
                 let body = body.unwrap_or(0);
                 self.receiving.push(Receiving {
                     exchange,
                     peer,
                     body,
                     bytes: Vec::with_capacity(usize::try_from(body).unwrap_or(0)),
+                    what,
                 });
-                self.read_snapshot(exchange)
+                self.read_exchange(exchange)
             }
-            Event::Request { exchange, .. } => {
-                // Commands come with the request path (node.md §4); none is taken yet.
-                self.driver
-                    .endpoint()
-                    .refuse_exchange(exchange, Refusal::Kind);
-                Ok(())
-            }
-            Event::BodyReady { exchange } => self.read_snapshot(exchange),
+            Event::BodyReady { exchange } => self.read_exchange(exchange),
             Event::Reply { exchange, .. } => {
                 self.snapshot_done(exchange, true);
                 self.driver.endpoint().end(exchange);
@@ -773,10 +960,13 @@ impl Node {
             }
             Event::Refused { exchange, .. } => {
                 self.snapshot_done(exchange, false);
+                self.receiving.retain(|r| r.exchange != exchange);
+                self.writing.retain(|w| w.exchange != exchange);
+                self.commanded.retain(|c| c.exchange != exchange);
                 Ok(())
             }
             Event::Writable { exchange } => {
-                self.write_snapshot(exchange);
+                self.write_exchange(exchange);
                 Ok(())
             }
             Event::Closed { peer, .. } | Event::Unreachable { peer, .. } => {
@@ -826,16 +1016,18 @@ impl Node {
     /// A peer's connection went: its plane keys with it, and a peer this node dials is dialed
     /// again after its backoff (RFC 6298 §5.5: doubled each time, from the initial probe timeout).
     fn lost(&mut self, peer: PeerId, now: u64) {
-        self.plane.remove_peer(peer);
         let dials = self.id < peer;
-        if let Some(remote) = self.remotes.iter_mut().find(|r| r.id == peer) {
-            remote.keyed = false;
-            remote.waiting.clear();
-            if dials {
-                let wait = u64::try_from(remote.backoff.as_nanos()).unwrap_or(u64::MAX);
-                remote.redial_at = Some(now.saturating_add(wait));
-                remote.backoff = remote.backoff.saturating_mul(2);
-            }
+        // A client's connection is its own to make again.
+        let Some(remote) = self.remotes.iter_mut().find(|r| r.id == peer) else {
+            return;
+        };
+        self.plane.remove_peer(peer);
+        remote.keyed = false;
+        remote.waiting.clear();
+        if dials {
+            let wait = u64::try_from(remote.backoff.as_nanos()).unwrap_or(u64::MAX);
+            remote.redial_at = Some(now.saturating_add(wait));
+            remote.backoff = remote.backoff.saturating_mul(2);
         }
         for kept in &self.ranges {
             if let Some(shell) = self.owner.get_mut(kept.handle) {
@@ -900,6 +1092,8 @@ impl Node {
     /// to the stream, its next wake kept.
     fn drive(&mut self, now: u64) -> Result<(), NodeError> {
         let mut driven: Vec<(Handle, Driven)> = Vec::new();
+        let answered_from = self.applied.len();
+        let mut fenced: Option<hyper_durable::ReplicaError> = None;
         let mut messages: Vec<(u128, Message)> = Vec::new();
         let groups: Vec<(Handle, u128)> = self.ranges.iter().map(|k| (k.handle, k.group)).collect();
         let applied = &mut self.applied;
@@ -914,8 +1108,11 @@ impl Node {
             for answer in out.answers.drain(..) {
                 applied.push((group, answer));
             }
-            if let Ok(d) = outcome {
-                driven.push((handle, d));
+            match outcome {
+                Ok(d) => driven.push((handle, d)),
+                Err(e) => {
+                    fenced.get_or_insert(e);
+                }
             }
         });
         for (handle, Driven { wake, flushed, .. }) in driven {
@@ -942,11 +1139,53 @@ impl Node {
         for (group, message) in messages {
             self.send(group, message, now)?;
         }
+        // A fenced range stops the node for now: reopening it from its log or its peers, with the
+        // others serving on, is the node's to build (node.md §6.2).
+        if let Some(e) = fenced {
+            return Err(NodeError::Range(e.into()));
+        }
+        if !self.commanded.is_empty() {
+            for (group, applied) in self.applied.get(answered_from..).unwrap_or_default() {
+                answer_command(&mut self.commanded, *group, applied);
+            }
+            self.reply_commands()?;
+        }
+        self.compact_if_stalled(now)
+    }
+
+    /// A range whose write the log refused for room: every range compacts through what its engine
+    /// made durable, freeing the log's room, and the stalled ones whose compaction had nothing to
+    /// free make their writes again at their next drive (another range's compaction may have freed
+    /// it). With the log out of room nothing older can be kept for a member that lags, which a
+    /// snapshot then catches up; keeping entries while resending them costs less than a snapshot
+    /// (node.md §2.6) needs the engine's size, which the model engine does not state.
+    fn compact_if_stalled(&mut self, now: u64) -> Result<(), NodeError> {
+        let any = self
+            .ranges
+            .iter()
+            .any(|k| self.owner.get(k.handle).is_some_and(|r| r.is_stalled()));
+        if !any {
+            return Ok(());
+        }
+        for kept in &self.ranges {
+            let Some(shell) = self.owner.get_mut(kept.handle) else {
+                continue;
+            };
+            let stalled = shell.is_stalled();
+            let compacted = shell
+                .compact(0, now, &self.waker)
+                .map_err(mantle_range::ReplicaError::from)?;
+            if stalled && !compacted {
+                shell.resume();
+            }
+            self.owner.schedule(kept.handle);
+        }
         Ok(())
     }
 
     /// Sends a range's message by its class: control that fits a datagram on the plane, a
-    /// snapshot on the bulk class, everything else on the peer's lane.
+    /// snapshot on the bulk class, everything else on the peer's lane. The message is encoded
+    /// once, behind the plane's first byte: the plane takes the whole, a lane the frame after it.
     fn send(&mut self, group: u128, message: Message, _now: u64) -> Result<(), NodeError> {
         let to = message.to;
         let Some(remote_at) = self.remotes.iter().position(|r| r.id == to) else {
@@ -955,46 +1194,51 @@ impl Node {
         let snapshot = message.snapshot.is_some() && message.msg_type == MessageType::MsgSnapshot;
         let control = message.entries.is_empty() && message.snapshot.is_none();
         self.frame.clear();
+        self.frame.push(PLANE_RAFT);
         frame::encode(&mut self.frame, group, &message);
         if control && self.remotes.get(remote_at).is_some_and(|r| r.keyed) {
-            let mut datagram = Vec::with_capacity(self.frame.len().saturating_add(1));
-            datagram.push(PLANE_RAFT);
-            datagram.extend_from_slice(&self.frame);
-            match self.plane.queue(to, &datagram) {
-                Ok(()) => return Ok(()),
-                // The datagram in the making is full: send it and queue this in the next.
-                Err(hyper_datagram::Refusal::Busy) => {
-                    self.send_plane();
-                    if self.plane.queue(to, &datagram).is_ok() {
-                        return Ok(());
-                    }
-                }
-                // Too large for the path's datagram: it takes the lane, as node.md §3.4 says.
-                Err(_) => {}
+            let mut queued = self.plane.queue(to, &self.frame);
+            // The datagram in the making is full: send it and queue this in the next.
+            if queued == Err(hyper_datagram::Refusal::Busy) {
+                self.send_plane();
+                queued = self.plane.queue(to, &self.frame);
+            }
+            // Refused, or too large for the path's datagram: it takes the lane (node.md §3.4).
+            if queued.is_ok() {
+                self.sends.plane = self.sends.plane.saturating_add(1);
+                return Ok(());
             }
         }
         if snapshot {
             return self.send_snapshot(group, to);
         }
-        let frame = std::mem::take(&mut self.frame);
+        let lane_frame = self.frame.get(1..).unwrap_or_default();
         match self
             .driver
             .endpoint()
-            .send_frame(to, LANE, Kind::Raft, &frame)
+            .send_frame(to, LANE, Kind::Raft, lane_frame)
         {
-            Ok(()) => {}
+            Ok(()) => self.sends.lane = self.sends.lane.saturating_add(1),
             Err(Refusal::LaneFull) => {
-                if let Some(remote) = self.remotes.get_mut(remote_at)
-                    && remote.waiting.len() < self.lane_window
-                {
-                    remote.waiting.push_back(frame.clone());
+                match self.remotes.get_mut(remote_at) {
+                    Some(remote) if remote.waiting.len() < self.lane_window => {
+                        remote.waiting.push_back(lane_frame.to_vec());
+                        self.sends.waited = self.sends.waited.saturating_add(1);
+                    }
+                    // Past the lane's window the frame is dropped, as the network may drop it.
+                    _ => self.sends.dropped(
+                        Refusal::LaneFull,
+                        lane_frame.len(),
+                        Some(message.msg_type),
+                    ),
                 }
             }
             // A peer with no connection: the message is lost, as on the network, and Raft sends
             // it again once the peer is reached.
-            Err(_) => {}
+            Err(refusal) => self
+                .sends
+                .dropped(refusal, lane_frame.len(), Some(message.msg_type)),
         }
-        self.frame = frame;
         Ok(())
     }
 
@@ -1009,21 +1253,21 @@ impl Node {
                 .endpoint()
                 .send_frame(peer, LANE, Kind::Raft, &frame)
             {
-                Ok(()) => {}
+                Ok(()) => self.sends.lane = self.sends.lane.saturating_add(1),
                 Err(Refusal::LaneFull) => {
                     if let Some(remote) = self.remotes.get_mut(at) {
                         remote.waiting.push_front(frame);
                     }
                     break;
                 }
-                Err(_) => {}
+                Err(refusal) => self.sends.dropped(refusal, frame.len(), None),
             }
         }
     }
 
     /// Opens a snapshot's exchange to `to`, its frame in the body, and writes what credit allows.
     fn send_snapshot(&mut self, group: u128, to: u64) -> Result<(), NodeError> {
-        let frame = self.frame.clone();
+        let frame = self.frame.get(1..).unwrap_or_default().to_vec();
         let body = u64::try_from(frame.len()).unwrap_or(u64::MAX);
         let clock = self.driver.clock()?;
         let period = Progress::new(bounds::idle_timeout())?;
@@ -1033,54 +1277,72 @@ impl Node {
             .open(clock, to, Kind::Snapshot, &[], Some(body), period)
         {
             Ok(exchange) => {
-                self.sending.push(Sending {
+                self.sends.snapshots = self.sends.snapshots.saturating_add(1);
+                self.writing.push(Writing {
                     exchange,
-                    group,
-                    to,
-                    frame,
+                    bytes: frame,
                     written: 0,
+                    then: Then::Snapshot { group, to },
                 });
-                self.write_snapshot(exchange);
+                self.write_exchange(exchange);
             }
-            Err(_) => self.report_snapshot(group, to, false),
+            Err(refusal) => {
+                self.sends
+                    .dropped(refusal, usize::try_from(body).unwrap_or(usize::MAX), None);
+                self.report_snapshot(group, to, false);
+            }
         }
         Ok(())
     }
 
-    /// Writes what a snapshot's exchange takes of what is left of its frame.
-    fn write_snapshot(&mut self, exchange: ExchangeId) {
-        let Some(at) = self.sending.iter().position(|s| s.exchange == exchange) else {
+    /// Writes what an exchange takes of what is left of its body; a reply written whole ends its
+    /// exchange, and a snapshot waits for its member's reply.
+    fn write_exchange(&mut self, exchange: ExchangeId) {
+        let Some(at) = self.writing.iter().position(|w| w.exchange == exchange) else {
             return;
         };
         let endpoint = self.driver.endpoint();
         let mut failed = false;
-        if let Some(sending) = self.sending.get_mut(at) {
-            while let Some(rest) = sending.frame.get(sending.written..)
+        let mut whole = false;
+        let mut then = None;
+        if let Some(writing) = self.writing.get_mut(at) {
+            while let Some(rest) = writing.bytes.get(writing.written..)
                 && !rest.is_empty()
             {
                 match endpoint.write_body(exchange, rest) {
                     Ok(0) => break,
-                    Ok(took) => sending.written = sending.written.saturating_add(took),
+                    Ok(took) => writing.written = writing.written.saturating_add(took),
                     Err(_) => {
                         failed = true;
                         break;
                     }
                 }
             }
+            whole = writing.written >= writing.bytes.len();
+            then = Some(writing.then);
         }
-        if failed {
-            self.snapshot_done(exchange, false);
+        match then {
+            Some(Then::Snapshot { .. }) if failed => self.snapshot_done(exchange, false),
+            Some(Then::Reply) if failed || whole => {
+                self.writing.swap_remove(at);
+                self.driver.endpoint().end(exchange);
+            }
+            _ => {}
         }
     }
 
     fn snapshot_done(&mut self, exchange: ExchangeId, arrived: bool) {
-        if let Some(at) = self.sending.iter().position(|s| s.exchange == exchange) {
-            let sent = self.sending.swap_remove(at);
-            self.report_snapshot(sent.group, sent.to, arrived);
+        let Some(at) = self.writing.iter().position(|w| w.exchange == exchange) else {
+            return;
+        };
+        let Some(Then::Snapshot { group, to }) = self.writing.get(at).map(|w| w.then) else {
+            return;
+        };
+        self.writing.swap_remove(at);
+        if arrived {
+            self.snapshots_sent = self.snapshots_sent.saturating_add(1);
         }
-        if !arrived {
-            self.receiving.retain(|r| r.exchange != exchange);
-        }
+        self.report_snapshot(group, to, arrived);
     }
 
     fn report_snapshot(&mut self, group: u128, to: u64, arrived: bool) {
@@ -1092,9 +1354,10 @@ impl Node {
         }
     }
 
-    /// Reads what a snapshot's exchange holds, a piece at a time from the budget; once it is whole,
-    /// answers it, steps its frame and ends the exchange.
-    fn read_snapshot(&mut self, exchange: ExchangeId) -> Result<(), NodeError> {
+    /// Reads what an exchange's body holds, a piece at a time from its class's budget; once it is
+    /// whole, with its checksum verified, takes it: a snapshot is answered and its frame stepped,
+    /// an entry is proposed.
+    fn read_exchange(&mut self, exchange: ExchangeId) -> Result<(), NodeError> {
         let Some(at) = self.receiving.iter().position(|r| r.exchange == exchange) else {
             return Ok(());
         };
@@ -1103,7 +1366,7 @@ impl Node {
             return Ok(());
         };
         while u64::try_from(receiving.bytes.len()).unwrap_or(u64::MAX) < receiving.body {
-            let Ok(mut into) = endpoint.reserve(classes::Class::Bulk, PIECE) else {
+            let Ok(mut into) = endpoint.reserve(receiving.what.class(), PIECE) else {
                 return Ok(());
             };
             let got = endpoint.read_body(exchange, &mut into);
@@ -1127,9 +1390,142 @@ impl Node {
             }
         }
         let received = self.receiving.swap_remove(at);
-        endpoint.reply(exchange, &[], Some(0))?;
+        match received.what {
+            Arriving::Snapshot => {
+                endpoint.reply(exchange, &[], Some(0))?;
+                endpoint.end(exchange);
+                self.snapshots_taken = self.snapshots_taken.saturating_add(1);
+                self.step_frame(received.peer, &received.bytes)
+            }
+            Arriving::Command(group) => self.propose_command(exchange, group, &received.bytes),
+        }
+    }
+
+    /// A command's head, checked before its body is read: the group of a range this node leads,
+    /// or the reply that says why not (no such range, or where the leader is) and the exchange
+    /// ended.
+    fn take_command(&mut self, exchange: ExchangeId) -> Result<Option<u128>, NodeError> {
+        let endpoint = self.driver.endpoint();
+        let Ok(group) = command::group_of(endpoint.head(exchange).unwrap_or_default()) else {
+            self.answer_status(exchange, command::Status::Malformed, 0)?;
+            return Ok(None);
+        };
+        let Some(replica) = self.kept(group).and_then(|k| self.owner.get(k.handle)) else {
+            self.answer_status(exchange, command::Status::NoRange, 0)?;
+            return Ok(None);
+        };
+        if !replica.is_leader() {
+            let leader = replica.leader();
+            self.answer_status(exchange, command::Status::Redirect, leader)?;
+            return Ok(None);
+        }
+        Ok(Some(group))
+    }
+
+    /// Proposes the entry a command's body holds, as the range's leader, and keeps the command
+    /// until its entry applies.
+    fn propose_command(
+        &mut self,
+        exchange: ExchangeId,
+        group: u128,
+        body: &[u8],
+    ) -> Result<(), NodeError> {
+        let Ok(entry) = mantle_meta::wire::Entry::decode(body) else {
+            return self.answer_status(exchange, command::Status::Malformed, 0);
+        };
+        match self.propose(group, &entry) {
+            Ok(()) => {
+                self.commanded.push(Commanded {
+                    exchange,
+                    group,
+                    commands: entry
+                        .commands
+                        .iter()
+                        .map(|c| (c.session, c.serial, None))
+                        .collect(),
+                });
+                Ok(())
+            }
+            Err(NodeError::Range(mantle_range::ReplicaError::EntryTooLarge { .. })) => {
+                self.answer_status(exchange, command::Status::Malformed, 0)
+            }
+            Err(_) => {
+                let leader = self.leader_of(group);
+                let status = if leader == self.id {
+                    command::Status::Refused
+                } else {
+                    command::Status::Redirect
+                };
+                self.answer_status(exchange, status, leader)
+            }
+        }
+    }
+
+    /// The leader this node's member of `group` knows, 0 for none.
+    fn leader_of(&self, group: u128) -> u64 {
+        self.kept(group)
+            .and_then(|k| self.owner.get(k.handle))
+            .map_or(0, |r| r.leader())
+    }
+
+    /// Replies a status alone and ends the exchange.
+    fn answer_status(
+        &mut self,
+        exchange: ExchangeId,
+        status: command::Status,
+        leader: u64,
+    ) -> Result<(), NodeError> {
+        let endpoint = self.driver.endpoint();
+        endpoint.reply(exchange, &command::reply_head(status, leader), None)?;
         endpoint.end(exchange);
-        self.step_frame(received.peer, &received.bytes)
+        Ok(())
+    }
+
+    /// Replies to each command whose every answer came, and sends a command whose range this
+    /// node no longer leads to the leader it knows: its entry may yet apply, and asking again
+    /// returns the answers its sessions keep.
+    fn reply_commands(&mut self) -> Result<(), NodeError> {
+        let mut at = 0;
+        while let Some(c) = self.commanded.get(at) {
+            let answered = c.commands.iter().all(|(_, _, a)| a.is_some());
+            let led = self
+                .kept(c.group)
+                .and_then(|k| self.owner.get(k.handle))
+                .is_some_and(|r| r.is_leader());
+            if !answered && led {
+                at = at.saturating_add(1);
+                continue;
+            }
+            let c = self.commanded.swap_remove(at);
+            if !answered {
+                let leader = self.leader_of(c.group);
+                self.answer_status(c.exchange, command::Status::Redirect, leader)?;
+                continue;
+            }
+            let answers: Vec<Answer> = c.commands.into_iter().filter_map(|(_, _, a)| a).collect();
+            let mut body = Vec::new();
+            let fits = command::encode_answers(&mut body, &answers).is_ok()
+                && u64::try_from(body.len().saturating_add(command::REPLY_HEAD_BYTES))
+                    .is_ok_and(|len| len <= NodeClasses::frame_bound(classes::Class::Request));
+            if !fits {
+                self.answer_status(c.exchange, command::Status::TooLarge, self.id)?;
+                continue;
+            }
+            let len = u64::try_from(body.len()).unwrap_or(u64::MAX);
+            self.driver.endpoint().reply(
+                c.exchange,
+                &command::reply_head(command::Status::Answered, self.id),
+                Some(len),
+            )?;
+            self.writing.push(Writing {
+                exchange: c.exchange,
+                bytes: body,
+                written: 0,
+                then: Then::Reply,
+            });
+            self.write_exchange(c.exchange);
+        }
+        Ok(())
     }
 
     /// Seals what the plane queued and sends it, each peer's datagram to its plane's address.
@@ -1140,6 +1536,21 @@ impl Node {
             |peer| remotes.iter().find(|r| r.id == peer).and_then(|r| r.plane),
             |_, _| {},
         );
+    }
+}
+
+/// An answer a range applied, given to the command waiting for it, if one is: the first whose
+/// command of that session and serial has no answer yet.
+fn answer_command(commanded: &mut [Commanded], group: u128, applied: &Applied) {
+    let waiting = |(session, serial, answer): &(u64, u64, Option<Answer>)| {
+        *session == applied.session && *serial == applied.serial && answer.is_none()
+    };
+    if let Some(slot) = commanded
+        .iter_mut()
+        .filter(|c| c.group == group)
+        .find_map(|c| c.commands.iter_mut().find(|command| waiting(command)))
+    {
+        slot.2 = Some(applied.answer.clone());
     }
 }
 

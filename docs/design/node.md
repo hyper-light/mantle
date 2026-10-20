@@ -54,7 +54,7 @@ threads grow (26 §4.2).
 
 | Owner | Threads | What runs there |
 |---|---|---|
-| Network runtime | a tokio multi-thread runtime, one worker per core the process is granted | QUIC connections and the datagram plane (§3), SWIM, HTTP connections (§4), the drivers of each S3 request, the routing layer (§5), clients and connections as tasks |
+| Network runtime | hyper-rt's shards, one thread per core the process is granted (the owner's decision of 2026-10-05: a shared thread-per-core runtime, no tokio) | QUIC connections and the datagram plane (§3), SWIM, HTTP connections (§4), the drivers of each S3 request, the routing layer (§5), clients and connections as tasks |
 | Metadata shards | one per granted core | range replicas: stepping, ticking, proposing, driving, applying, serving confirmed reads (§2) |
 | Coding pool | one per granted core | erasure encoding and decoding of whole blocks, block checksums, the write path's inverse checks (§5.6) |
 | Device issuers | one per physical device | every volume's writer, cleaner and scrubber and the device's Raft log writer, as state machines (chunk-store.md §4; raft-log.md §3); the device's dispatcher (§2.7). As built: every volume's writes and flushes, dispatched to the device's pool; the writers, cleaners and scrubbers are still threads of their own (STATUS item 4) |
@@ -108,16 +108,22 @@ can run a transform's inverse on a different core from the transform (§5.6). ma
 binding affinity, so there the inverse runs on another worker, on whichever core the scheduler
 gives it, and a fault tied to one core is caught only when the two land apart.
 
-The network runtime never blocks. tokio says why: "A blocking operation performed in a task
-running on a thread that is also running other tasks would block the entire thread, preventing
-other tasks from running", and CPU-bound work belongs in "a separate thread pool dedicated to
-CPU bound tasks" (25 §1). Replicas therefore do not run as tokio tasks. Their work includes
+The network runtime never blocks. tokio says why, of any runtime that runs many tasks on a
+thread: "A blocking operation performed in a task running on a thread that is also running
+other tasks would block the entire thread, preventing other tasks from running", and CPU-bound
+work belongs in "a separate thread pool dedicated to CPU bound tasks" (25 §1). Replicas
+therefore do not run as the network's tasks. Their work includes
 engine reads that miss the cache and wait on the device, reads of log entries no longer in
 memory, which are synchronous (audit §12.2), and applies that take milliseconds: completing an
 upload of 10,000 parts applies in 6.3–6.7 ms (measurements/2026-09-29-metadata-apply.md). A
 shard owns its replicas outright, so a `Replica` is touched by one thread and needs no lock.
 Encoding a block under RS(9,6) needs a work space of 128 MiB (gateway.md §4) and is CPU-bound for
 its duration, so it goes to the coding pool.
+
+*As built (2026-10-20).* A node's ranges run in one task with its transport on a hyper-rt shard
+(`crates/node`), on the model engine, whose reads and applies are in memory. Keeping the
+production engine's cache misses and long applies off the transport's shard, as above, comes
+with hosting that engine on a node.
 
 A granted core is what `std::thread::available_parallelism` reports: the operating system's
 answer, affinity masks and quotas included where it reports them. Three pools of that size
@@ -534,8 +540,28 @@ seven things the node does not have (§10, phases A and C):
    detectors' prior evidence on the time between failures (`Settings::history`), kept with the
    cell's membership in the root range (§3.5, §7).
 
-Until then a range elects on ticks with focal's counts, as above (replica.md §3), and the stream
-is vendored only as the shell's dependency (vendor/UPSTREAM.md). SWIM's place (§3.5) does not
+*As built (2026-10-20).* A node's owner (`crates/node`) carries the stream for the ranges it
+hosts, and they elect by suspicion over it; items 1, 2, 4, 5 and 6 are built, 3 and 7 are not:
+
+- (1) One task on a hyper-rt shard holds the shard's replicas in hyper-durable's `Owner`,
+  attaches their pairs (`Owner::pairs`), takes each change to them (`Owner::believe`), and after
+  measuring (`Owner::measure`) drives each range whose timing moved, since a core draws its
+  campaign's delay only when driven: given its first timing with nothing else to drive it, a
+  range never campaigned (its term stayed 0 on one CPU).
+- (2) hyper-rt-transport's `PlaneSocket` stamps each datagram in the kernel where the platform
+  does; the owner reads its clock, drains the plane's socket, and polls the stream at that clock
+  only when the drain found the socket empty, so every heartbeat stamped before it was fed.
+- (3) A member's id is its node's, and a node keeps a pair for each node it is told of; placement's
+  map and its bound on pairs are not built (§7).
+- (4) The run is kept as hyper-block's `record` in the node's directory (`crates/node/src/layout.rs`).
+- (5) `Driven::flushed` feeds `Liveness::on_durable`, and a stream that asks for a flush gets an
+  empty update of a log group of its own (the top of the group space, since group 0 holds
+  hyper-log's key records), one out at a time.
+- (6) Each range's next wake and the stream's are the task's deadlines, and a wait that ends at
+  or past the stream's wake is reported (`Liveness::on_wait`).
+- (7) Each start begins with no history (`Exposure::new`); the root range does not keep it yet.
+
+A range hosted by no node still elects on ticks with focal's counts, as above (replica.md §3). SWIM's place (§3.5) does not
 change with it: SWIM's word stays a hint for routing and repair, and the stream's is what a
 group's elections take.
 
@@ -687,7 +713,24 @@ the cell's mechanisms reduce exactly to the local ones (research/27 §7.6).
 
 Nodes, and clients through mantle's client library, talk over two layers, as the hecate
 specification lays them out (07 §4.7): QUIC for everything stateful, and a separate plane of
-sealed UDP datagrams for consensus control and membership. Neither is built.
+sealed UDP datagrams for consensus control and membership.
+
+*As built (2026-10-20).* Both layers come from hyper-raft's shared crates (vendor/UPSTREAM.md):
+hyper-transport, the application protocol below, over hyper-quic (quinn-proto 0.11.18) and
+hyper-tls (rustls 0.23.45 on AWS-LC), driven on a hyper-rt shard by hyper-rt-transport's driver;
+and hyper-datagram, the plane of §3.4, on a socket of its own (hyper-rt-transport's
+`PlaneSocket`). A node's owner (`crates/node`) runs a shard's ranges and both layers in one task:
+a range's Raft messages travel on one lane to each peer, a snapshot on an exchange of the bulk
+class, and control that carries no entries and fits a datagram on the plane. Of each pair of
+nodes the lower id dials, so a pair keeps one connection and each end knows its side of the
+plane's key schedule. Both ends key the plane from the connection's TLS exporter and number its
+epoch from a second export under a label of mantle's own, `EXPERIMENTAL mantle plane epoch`
+(RFC 5705 §4 keeps labels beginning "EXPERIMENTAL" for private use), so each new connection
+replaces the last one's keys with nothing sent between the nodes. The transport's bounds are
+derived from what the node states and from QUIC's initial estimates (RFC 9002 §6.2,
+RFC 9000 §10.1; `crates/node/src/bounds.rs`) until its budgets are measured (§2.6). Still to
+build: the TCP fallback below, an ALPN of mantle's own in place of the transport's, the request
+class's commands (§4), chunk transfers (§5.2) and SWIM (§3.5).
 
 The QUIC layer combines standard QUIC with slates' measured work, each layer taken from the side
 that does it better (research 30 §6):

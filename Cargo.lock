@@ -822,6 +822,7 @@ dependencies = [
  "hyper-raft",
  "mantle-codec",
  "mantle-crc",
+ "mantle-engine",
  "mantle-meta",
  "proptest",
  "tempfile",

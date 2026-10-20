@@ -18,6 +18,8 @@ hyper-log = { path = "../../vendor/hyper-log" }
 hyper-raft = { path = "../../vendor/hyper-raft" }
 mantle-codec = { path = "../codec" }
 mantle-crc = { path = "../crc" }
+# The engine a node keeps a range's rows in (`stored`).
+mantle-engine = { path = "../engine" }
 mantle-meta = { path = "../meta" }
 thiserror.workspace = true
 

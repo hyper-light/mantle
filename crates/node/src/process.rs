@@ -9,10 +9,12 @@
 //!
 //! **Its talk** is lines. On standard output: `bound QUIC PLANE` once the node listens, then
 //! `status TERM LEADER COMMIT APPLIED PATIENCE_NS RECONNECT_NS MEASURING_NS` each time one of the first four
-//! moves, a peer it dials goes or comes back, or the heartbeats it takes from peers not yet judged
-//! move (`Status::measuring`): how long the node states it may go without moving
-//! while its peers live (`Status::patience`, 0 until measured), and while a peer it dials is not
-//! connected, how long until it is again by the node's law (`Status::reconnect`, else 0); while
+//! moves, its redials to a peer back off further or start over, or the heartbeats it takes from
+//! peers not yet judged move (`Status::measuring`): how long the node states it may go
+//! without moving
+//! while its peers live (`Status::patience`, 0 until measured), how long a link to a peer it dials
+//! may go without moving should that peer fall silent (`Status::reconnect`, 0 when it dials none);
+//! while
 //! some peer is not yet judged, the longest its stream's heartbeats go between
 //! (`Status::measuring_for`, else 0); and
 //! `replaced FAILED JOINING` once, from the node that led then, when a replacement ended; and
@@ -404,21 +406,13 @@ async fn serve(config: ProcessConfig) -> Result<(), ProcessError> {
         if let Some(now) = node.status(config.group) {
             // While some pair is not yet judged, the node is measuring its links, which moves only
             // the heartbeats it takes from those pairs: said too, so a watcher sees it move before
-            // it elects, and sees it stop if a peer it measures goes silent.
+            // it elects, and sees it stop if a peer it measures goes silent. The reconnect bound
+            // is said each time it changes, as a redial's backoff doubles, so a watcher never
+            // holds one shorter than the node's own.
             let moved = told.is_none_or(|was| {
-                (
-                    was.term,
-                    was.leader,
-                    was.commit,
-                    was.applied,
-                    was.reconnect.is_some(),
-                ) != (
-                    now.term,
-                    now.leader,
-                    now.commit,
-                    now.applied,
-                    now.reconnect.is_some(),
-                ) || was.measuring != now.measuring
+                (was.term, was.leader, was.commit, was.applied, was.reconnect)
+                    != (now.term, now.leader, now.commit, now.applied, now.reconnect)
+                    || was.measuring != now.measuring
             });
             if moved {
                 let patience = now.patience.map_or(0, |p| p.as_nanos());

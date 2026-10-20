@@ -20,8 +20,8 @@
 //!
 //! The test waits on facts the processes report (`bound`, `status` lines) and the clients'
 //! progress, and gives up once a quiet period passes with nothing moved: the longest any node
-//! states it may go without moving (`Status::patience`) or until a peer it dials is connected
-//! again (`Status::reconnect`), or any client gives an exchange (`Client::patience`), never less
+//! states it may go without moving (`Status::patience`) or a link to a peer it dials may, should
+//! that peer fall silent (`Status::reconnect`), or any client gives an exchange (`Client::patience`), never less
 //! than RFC 6298's initial retransmission timeout, one second (as `crates/node/tests/cluster.rs`
 //! does). A process's lines are taken only while that process runs: a node started again is a new
 //! process, and a line its killed one left is dropped.
@@ -535,8 +535,9 @@ impl Cell {
         self.status.remove(&id);
     }
 
-    /// The quiet period: the longest any node states it may go without moving or until a peer it
-    /// dials is connected again, or any client gives an exchange, never less than the initial RTO.
+    /// The quiet period: the longest any node states it may go without moving or a link to a peer
+    /// it dials may, should that peer fall silent, or any client gives an exchange, never less than
+    /// the initial RTO.
     fn quiet(&self) -> Duration {
         self.status
             .values()

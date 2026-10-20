@@ -215,9 +215,11 @@ pub struct Status {
     /// What the node's Raft sends did, and what it did with the frames that came to it.
     pub sends: Sends,
     pub received: Received,
-    /// How long until every peer this node dials is connected again, by its own law, while one
-    /// is not: a dial out ends within the idle timeout, and the next follows within the peer's
-    /// backoff ([`bounds::backed_off`]). `None` while each is connected.
+    /// How long a link to a peer this node dials may go without moving, by its own law, should
+    /// that peer fall silent (cut off, killed, stopped, its host stalled), which the node cannot
+    /// tell from slow: a connection to a silent peer ends within the idle timeout, as a dial out
+    /// does, and the next dial follows within the peer's backoff ([`bounds::backed_off`]), until
+    /// one connects. `None` when the node dials no peer.
     pub reconnect: Option<Duration>,
     /// The reads the range's core holds, as its leader: waiting for its term's first commit,
     /// for a quorum to confirm it leads, or to be taken; and of them, those waiting for that
@@ -713,7 +715,7 @@ impl<E: Engine + 'static> Node<E> {
             reconnect: self
                 .remotes
                 .iter()
-                .filter(|r| self.id < r.id && !r.keyed)
+                .filter(|r| self.id < r.id)
                 .map(|r| bounds::idle_timeout().saturating_add(r.backoff))
                 .max(),
             reads_held: replica.core().raft.reads_held(),

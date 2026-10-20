@@ -739,8 +739,15 @@ with the leader it knows and, when it knows none, how long until it acts on the 
 (its patience: the stream's freshness, the range's expected election and one round), by which the
 range has elected. Retries and redials back off as below: from the measured probe timeout,
 doubled, at most the idle timeout, with equal jitter (`bounds::backed_off`, `bounds::pause`), the
-client's waits no longer than the patience its nodes stated. A peer learned at a new address has
-its old connection closed at once, since the transport dials no peer it holds a connection to.
+client's waits no longer than the patience its nodes stated. A node redials only on the
+transport's word that a connection or a dial ended (`Closed`, `Unreachable`), so every dial must
+end in an event its owner is told: hyper-transport before hyper-raft `26b5af8` told nothing of a
+dial that failed as the last one had, and a peer cut off for two failed redials (18 s on the
+Windows runners) was never dialed again (`crates/node/tests/cluster.rs` holds a cut that long).
+A node states how long a link to a peer it dials may go without moving should that peer fall
+silent, which it cannot tell from slow (`Status::reconnect`): its connection's idle timeout and
+the peer's backoff. A peer learned at a new address has its old connection closed at once, since
+the transport dials no peer it holds a connection to.
 Still to build: the TCP fallback below, an ALPN of mantle's own in place of the transport's, chunk
 transfers (§5.2) and SWIM (§3.5).
 

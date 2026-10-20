@@ -18,8 +18,10 @@
 //! - A client's command, asked first of a node that does not lead, is redirected to the leader,
 //!   answered there once applied, and applied by every node with the same answer.
 //! - A leader cut off from its followers by the test's relay (`support/relay.rs`) loses the lead:
-//!   the others elect and apply a write it does not have; joined again, it follows the new leader
-//!   and applies the write as they did.
+//!   the others elect and apply a write it does not have, and the cut holds until each node that
+//!   dials across it has seen its connection close and then two redials end unanswered, each end
+//!   told to it (a dial that fails as the last one did is still the owner's to hear of, or it never
+//!   dials again); joined again, it follows the new leader and applies the write as they did.
 //! - Three clients, each its own identity and session, put and read two keys while the leader is
 //!   stopped half way through, or cut off for a quarter of the history, each read by ReadIndex;
 //!   each key's history is linearizable (Wing and Gong's search with Lowe's memo,
@@ -37,11 +39,13 @@
 //!
 //! Each node's task reports its status (`Node::status`) and its answers over a channel. The test's
 //! thread waits on those reports and goes on while the nodes move: a term, a leader, a commit or an
-//! applied index, an answer, a node opened or stopped, or the heartbeats taken from the peers not
-//! yet judged by a margin (`Status::measuring`), which stop if a peer measured goes silent. It
+//! applied index, an answer, a node opened or stopped, a peer's link (a dial, or one ended:
+//! `Node::links`), or the heartbeats taken from the peers not yet judged by a margin
+//! (`Status::measuring`), which stop if a peer measured goes silent. It
 //! gives up once a quiet period passes with nothing moved: the
-//! longest patience any node states by its own law (`Status::patience`), or the longest until a
-//! peer a node dials is connected again (`Status::reconnect`), or any client gives an exchange by
+//! longest patience any node states by its own law (`Status::patience`), or the longest a link to
+//! a peer a node dials may go without moving should that peer fall silent (`Status::reconnect`:
+//! a cut's first movement is its connections' idle timeout), or any client gives an exchange by
 //! its own (`Client::patience`), and never less than RFC 6298's initial retransmission timeout, one
 //! second, before anything is measured. A node
 //! whose log has a flush out extends the watch, since its range moves only as its writes become
@@ -87,7 +91,7 @@ use mantle_meta::wire::{Answer, Entry};
 use mantle_node::classes::Role;
 use mantle_node::client::{Client, ClientSettings};
 use mantle_node::directory::{Peer, node_name};
-use mantle_node::node::{Hosted, Node, NodeSettings, Status, message_bounds};
+use mantle_node::node::{Hosted, Link, Node, NodeSettings, Status, message_bounds};
 use mantle_range::{ConfState, Range, Settings, Stored};
 
 #[path = "support/history.rs"]
@@ -411,6 +415,8 @@ enum Report {
     /// A replacement a node ended as the range's leader: the member lost for good and the one
     /// that took its place.
     Replaced(u64, u64),
+    /// A node's link to a peer as it changed: dialed, keyed, or a connection or dial ended.
+    Link(u64, Link),
 }
 
 /// What the test tells the client's task.
@@ -497,6 +503,8 @@ async fn run<E: Engine + 'static>(
     };
     let mut told: Option<Status> = None;
     let mut stats = None;
+    // Each peer's link as last reported, a slot a peer.
+    let mut links: Vec<Link> = Vec::new();
     loop {
         let ended = {
             let turn = pin!(node.turn());
@@ -537,6 +545,18 @@ async fn run<E: Engine + 'static>(
             let report = Report::Replaced(replaced.failed(), replaced.joining());
             if reports.send(report).is_err() {
                 return;
+            }
+        }
+        for (at, now) in node.links().enumerate() {
+            if links.get(at) == Some(&now) {
+                continue;
+            }
+            if reports.send(Report::Link(id, now)).is_err() {
+                return;
+            }
+            match links.get_mut(at) {
+                Some(was) => *was = now,
+                None => links.push(now),
             }
         }
         for (_, applied) in node.take_applied() {
@@ -596,6 +616,8 @@ struct Watch {
     clients: BTreeMap<u64, Duration>,
     /// The replacements a leader ended: the member lost for good and the one in its place.
     replaced: BTreeSet<(u64, u64)>,
+    /// Each live node's link to each peer, as it last reported it, by (node, peer).
+    links: BTreeMap<(u64, u64), Link>,
     /// When a node last moved.
     moved_at: Option<Instant>,
 }
@@ -664,6 +686,7 @@ impl Watch {
                 self.live.remove(&id);
                 self.status.remove(&id);
                 self.log.remove(&id);
+                self.links.retain(|(of, _), _| *of != id);
                 self.moved_at = Some(Instant::now());
             }
             Report::Failed(id, error) => {
@@ -676,6 +699,10 @@ impl Watch {
             }
             Report::Replaced(failed, joining) => {
                 self.replaced.insert((failed, joining));
+                self.moved_at = Some(Instant::now());
+            }
+            Report::Link(id, link) => {
+                self.links.insert((id, link.peer), link);
                 self.moved_at = Some(Instant::now());
             }
             Report::Progress(client, done, patience) => {
@@ -708,9 +735,9 @@ impl Watch {
             .unwrap_or_else(Instant::now)
     }
 
-    /// The longest any node states it may go without moving or until a peer it dials is
-    /// connected again, or any client gives an exchange before it asks another node, and never
-    /// less than the initial retransmission timeout.
+    /// The longest any node states it may go without moving or a link to a peer it dials may,
+    /// should that peer fall silent, or any client gives an exchange before it asks another node,
+    /// and never less than the initial retransmission timeout.
     fn quiet(&self) -> Duration {
         self.status
             .values()
@@ -1243,11 +1270,23 @@ enum Fault {
     Cut,
 }
 
+/// The ends a dialer's link to a node cut off counts before the cut is healed: its connection's
+/// close, then two redials unanswered, the second ending as the first did.
+const ENDS_ACROSS_CUT: u64 = 3;
+
 fn leader_cut_off(engines: Engines, nodes: u64) {
     let mut cell = Cell::start_on(engines, Network::Relayed, nodes);
     let leader = cell.leader();
     cell.write(1);
     cell.applied_everywhere(1);
+    // Each pair across the cut, as the lower node dials it, and the ends its link had counted.
+    let across: Vec<((u64, u64), u64)> = (1..=cell.nodes)
+        .filter(|id| *id != leader)
+        .map(|peer| {
+            let pair = (leader.min(peer), leader.max(peer));
+            (pair, cell.watch.links.get(&pair).map_or(0, |l| l.ended))
+        })
+        .collect();
     cell.isolate(leader, true);
     // The other nodes elect one of themselves, in a later term than the one cut off leads.
     let led = cell.watch.status[&leader].term;
@@ -1280,6 +1319,17 @@ fn leader_cut_off(engines: Engines, nodes: u64) {
         !cell.watch.applied[&leader].contains_key(&2),
         "the node cut off applied a write its peers made without it"
     );
+    // The cut holds until every dialer across it was told its connection closed and two redials
+    // ended unanswered: a dial that ends as the last one did must still be told its owner, or
+    // the owner never dials again and the node cut off is never joined.
+    cell.watch.until(&cell.reports, |w| {
+        let told = across.iter().all(|(pair, ended)| {
+            w.links
+                .get(pair)
+                .is_some_and(|l| l.ended >= ended + ENDS_ACROSS_CUT)
+        });
+        if told { Some(()) } else { None }
+    });
     // Joined again, it follows the new leader and applies the write as the others did.
     cell.isolate(leader, false);
     assert_eq!(cell.applied_everywhere(2), applied);

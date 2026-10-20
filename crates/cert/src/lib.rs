@@ -9,8 +9,12 @@
 //! in its `subjectAltName`, which a dial verifies against the name the peer is known by
 //! (RFC 5280 §4.2.1.6, RFC 6125); it is no authority, signs only (`digitalSignature`), and may
 //! serve either end of a connection (`extKeyUsage` serverAuth and clientAuth, §4.2.1.12). A serial
-//! is 16 bytes from the operating system's random source, positive and within the 20 octets
-//! §4.2.1.2 allows. Nothing here reads a certificate back: the TLS stack verifies what peers
+//! is 16 octets, 126 bits of them the issuer's draw ([`Serial`]): positive and within the 20
+//! octets RFC 5280 §4.1.2.2 allows, past the 64 random bits the CA/Browser Forum's Baseline
+//! Requirements §7.1 ask, and of one length whatever its bits. A key pair and a serial are drawn
+//! from the operating system's random source, or derived by the caller (a simulation, whose run
+//! is its seed and whose handshakes compress the certificates they carry, RFC 8879: the same
+//! bytes, the same sizes). Nothing here reads a certificate back: the TLS stack verifies what peers
 //! present.
 
 #![cfg_attr(
@@ -77,6 +81,14 @@ impl KeyPair {
         Self::from_pkcs8(document.as_ref())
     }
 
+    /// The key pair whose private key is `seed` (RFC 8032 §5.1.5: an Ed25519 private key is 32
+    /// octets, the seed its public key and every signature derive from): one its caller derived.
+    pub fn from_seed(seed: &[u8; 32]) -> Result<Self, CertError> {
+        let key = Ed25519KeyPair::from_seed_unchecked(seed).map_err(|_| CertError::Key)?;
+        let document = key.to_pkcs8().map_err(|_| CertError::Key)?;
+        Self::from_pkcs8(document.as_ref())
+    }
+
     /// The key pair a PKCS#8 document holds.
     pub fn from_pkcs8(pkcs8: &[u8]) -> Result<Self, CertError> {
         let key = Ed25519KeyPair::from_pkcs8(pkcs8).map_err(|_| CertError::Key)?;
@@ -105,8 +117,39 @@ pub struct Validity {
     pub not_after: u64,
 }
 
+/// A certificate's serial: 16 octets, its first octet's top bit cleared, so the integer is
+/// positive with no octet before it, and the next bit set, so none of its octets is a leading zero
+/// dropped (X.690 §8.3.2): every serial encodes as 16 content octets, the other 126 bits a draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Serial([u8; 16]);
+
+impl Serial {
+    /// A serial of 126 bits from the operating system's random source.
+    pub fn draw() -> Result<Self, CertError> {
+        let mut random = [0u8; 16];
+        SystemRandom::new()
+            .fill(&mut random)
+            .map_err(|_| CertError::Random)?;
+        Ok(Self::from_octets(random))
+    }
+
+    /// The serial of `random`, 16 octets its caller drew or derived: all but its first octet's two
+    /// top bits.
+    pub fn from_octets(mut random: [u8; 16]) -> Self {
+        if let Some(first) = random.first_mut() {
+            *first = (*first & 0x7f) | 0x40;
+        }
+        Self(random)
+    }
+}
+
 /// A self-signed authority's certificate: `name` its subject and issuer, `key` its own.
-pub fn authority(key: &KeyPair, name: &str, validity: Validity) -> Result<Vec<u8>, CertError> {
+pub fn authority(
+    key: &KeyPair,
+    name: &str,
+    validity: Validity,
+    serial: Serial,
+) -> Result<Vec<u8>, CertError> {
     check_name(name)?;
     issue(
         key,
@@ -115,7 +158,7 @@ pub fn authority(key: &KeyPair, name: &str, validity: Validity) -> Result<Vec<u8
             name,
             public_key: key.public_key(),
         },
-        validity,
+        (validity, serial),
         Role::Authority,
     )
 }
@@ -128,7 +171,7 @@ pub fn node(
     authority_name: &str,
     public_key: &[u8],
     dns_name: &str,
-    validity: Validity,
+    (validity, serial): (Validity, Serial),
 ) -> Result<Vec<u8>, CertError> {
     check_name(authority_name)?;
     check_dns_name(dns_name)?;
@@ -142,7 +185,7 @@ pub fn node(
             name: dns_name,
             public_key,
         },
-        validity,
+        (validity, serial),
         Role::Node { dns_name },
     )
 }
@@ -195,17 +238,13 @@ fn issue(
     issuer_key: &KeyPair,
     issuer_name: &str,
     subject: &Subject<'_>,
-    validity: Validity,
+    (validity, serial): (Validity, Serial),
     role: Role<'_>,
 ) -> Result<Vec<u8>, CertError> {
     if validity.not_after <= validity.not_before {
         return Err(CertError::Time);
     }
-    let mut serial = [0u8; 16];
-    SystemRandom::new()
-        .fill(&mut serial)
-        .map_err(|_| CertError::Random)?;
-    let tbs = tbs_certificate(&serial, issuer_name, subject, validity, &role)?;
+    let tbs = tbs_certificate(&serial.0, issuer_name, subject, validity, &role)?;
     let signature = issuer_key.key.sign(&tbs);
     let mut out = Vec::new();
     nested(&mut out, der::SEQUENCE, |c| {
@@ -350,6 +389,20 @@ mod tests {
         }
     }
 
+    /// A serial encodes as 16 content octets whatever its random bits: the draws that made one
+    /// longer (a top bit set, which takes a sign octet) or shorter (a leading zero, dropped).
+    #[test]
+    fn every_serial_encodes_in_sixteen_octets() {
+        let mut leading_zero = [0x5au8; 16];
+        leading_zero[0] = 0;
+        for random in [[0u8; 16], [0xff; 16], [0x80; 16], leading_zero] {
+            let mut out = Vec::new();
+            der::unsigned(&mut out, &Serial::from_octets(random).0).unwrap();
+            // The INTEGER's tag, its length and its content.
+            assert_eq!(out.len(), 2 + 16, "{random:?}");
+        }
+    }
+
     fn roots(authority: &[u8]) -> RootCertStore {
         let mut roots = RootCertStore::empty();
         roots.add(CertificateDer::from(authority.to_vec())).unwrap();
@@ -387,7 +440,13 @@ mod tests {
     #[test]
     fn a_node_certificate_verifies_under_its_authority_as_server_and_client() {
         let authority_key = KeyPair::generate().unwrap();
-        let ca = authority(&authority_key, "mantle cell authority", day_around_now()).unwrap();
+        let ca = authority(
+            &authority_key,
+            "mantle cell authority",
+            day_around_now(),
+            Serial::draw().unwrap(),
+        )
+        .unwrap();
         for id in [1u64, 2] {
             let node_key = KeyPair::generate().unwrap();
             let name = format!("node-{id}");
@@ -396,7 +455,7 @@ mod tests {
                 "mantle cell authority",
                 node_key.public_key(),
                 &name,
-                day_around_now(),
+                (day_around_now(), Serial::draw().unwrap()),
             )
             .unwrap();
             as_server(&ca, &cert, &name).unwrap();
@@ -412,14 +471,14 @@ mod tests {
     fn a_certificate_from_another_authority_is_refused() {
         let ours = KeyPair::generate().unwrap();
         let theirs = KeyPair::generate().unwrap();
-        let ca = authority(&ours, "cell", day_around_now()).unwrap();
+        let ca = authority(&ours, "cell", day_around_now(), Serial::draw().unwrap()).unwrap();
         let node_key = KeyPair::generate().unwrap();
         let foreign = node(
             &theirs,
             "cell",
             node_key.public_key(),
             "node-1",
-            day_around_now(),
+            (day_around_now(), Serial::draw().unwrap()),
         )
         .unwrap();
         assert!(as_server(&ca, &foreign, "node-1").is_err());
@@ -429,7 +488,13 @@ mod tests {
     #[test]
     fn an_expired_certificate_or_one_not_yet_valid_is_refused() {
         let authority_key = KeyPair::generate().unwrap();
-        let ca = authority(&authority_key, "cell", day_around_now()).unwrap();
+        let ca = authority(
+            &authority_key,
+            "cell",
+            day_around_now(),
+            Serial::draw().unwrap(),
+        )
+        .unwrap();
         let node_key = KeyPair::generate().unwrap();
         for validity in [
             Validity {
@@ -446,7 +511,7 @@ mod tests {
                 "cell",
                 node_key.public_key(),
                 "node-1",
-                validity,
+                (validity, Serial::draw().unwrap()),
             )
             .unwrap();
             assert!(as_server(&ca, &cert, "node-1").is_err(), "{validity:?}");
@@ -460,20 +525,60 @@ mod tests {
             not_before: now(),
             not_after: now(),
         };
-        assert_eq!(authority(&key, "cell", backwards), Err(CertError::Time));
-        assert_eq!(authority(&key, "", day_around_now()), Err(CertError::Name));
+        assert_eq!(
+            authority(&key, "cell", backwards, Serial::draw().unwrap()),
+            Err(CertError::Time)
+        );
+        assert_eq!(
+            authority(&key, "", day_around_now(), Serial::draw().unwrap()),
+            Err(CertError::Name)
+        );
         let long = "x".repeat(64);
         for bad in ["", "-node", "node-", "no de", "a..b", long.as_str()] {
             assert_eq!(
-                node(&key, "cell", key.public_key(), bad, day_around_now()),
+                node(
+                    &key,
+                    "cell",
+                    key.public_key(),
+                    bad,
+                    (day_around_now(), Serial::draw().unwrap())
+                ),
                 Err(CertError::Name),
                 "{bad:?}"
             );
         }
         assert_eq!(
-            node(&key, "cell", &[0; 31], "node-1", day_around_now()),
+            node(
+                &key,
+                "cell",
+                &[0; 31],
+                "node-1",
+                (day_around_now(), Serial::draw().unwrap())
+            ),
             Err(CertError::Key)
         );
+    }
+
+    /// A key pair from a seed, and a certificate issued with a serial its caller gave, are the same
+    /// bytes every time: what a simulation's run, its seed, rests on. The certificate verifies.
+    #[test]
+    fn a_seed_and_a_given_serial_issue_the_same_certificate() {
+        let seed = [7u8; 32];
+        let (a, b) = (
+            KeyPair::from_seed(&seed).unwrap(),
+            KeyPair::from_seed(&seed).unwrap(),
+        );
+        assert_eq!(a.pkcs8(), b.pkcs8());
+        let issued = (day_around_now(), Serial::from_octets([9; 16]));
+        let ca = authority(&a, "cell", issued.0, issued.1).unwrap();
+        assert_eq!(ca, authority(&b, "cell", issued.0, issued.1).unwrap());
+        let node_key = KeyPair::from_seed(&[8; 32]).unwrap();
+        let first = node(&a, "cell", node_key.public_key(), "node-1", issued).unwrap();
+        assert_eq!(
+            first,
+            node(&b, "cell", node_key.public_key(), "node-1", issued).unwrap()
+        );
+        as_server(&ca, &first, "node-1").unwrap();
     }
 
     #[test]

@@ -46,7 +46,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig, interests_for};
 use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer};
-use mantle_cert::{KeyPair, Validity};
+use mantle_cert::{KeyPair, Serial, Validity};
 use mantle_meta::wire::Answer;
 use mantle_node::classes::{Bounds, Role};
 use mantle_node::client::{Client, ClientSettings};
@@ -237,13 +237,16 @@ impl Pki {
             not_after: NO_EXPIRY,
         };
         let key = KeyPair::generate().unwrap();
-        let authority_der = mantle_cert::authority(&key, "mantle test cell", validity).unwrap();
+        let authority_der =
+            mantle_cert::authority(&key, "mantle test cell", validity, Serial::draw().unwrap())
+                .unwrap();
         let authority = dir.join("authority.der");
         std::fs::write(&authority, &authority_der).unwrap();
         let issue = |name: &str| {
             let own = KeyPair::generate().unwrap();
+            let issued = (validity, Serial::draw().unwrap());
             let certificate =
-                mantle_cert::node(&key, "mantle test cell", own.public_key(), name, validity)
+                mantle_cert::node(&key, "mantle test cell", own.public_key(), name, issued)
                     .unwrap();
             (certificate, own.pkcs8().to_vec())
         };

@@ -80,7 +80,7 @@ use hyper_rt::machine::facts::Facts;
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig, interests_for};
 use hyper_rt::sync::{ChannelReceiver, Sender, channel};
 use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer};
-use mantle_cert::{KeyPair, Validity};
+use mantle_cert::{KeyPair, Serial, Validity};
 use mantle_engine::store::Config as StoreConfig;
 use mantle_engine::trunk::TrunkConfig;
 use mantle_meta::apply::Layer;
@@ -302,11 +302,13 @@ impl Pki {
             not_after: NO_EXPIRY,
         };
         let key = KeyPair::generate().unwrap();
-        let authority = mantle_cert::authority(&key, AUTHORITY, validity).unwrap();
+        let drawn = || Serial::draw().unwrap();
+        let authority = mantle_cert::authority(&key, AUTHORITY, validity, drawn()).unwrap();
         let issue = |name: &str| {
             let own = KeyPair::generate().unwrap();
             let certificate =
-                mantle_cert::node(&key, AUTHORITY, own.public_key(), name, validity).unwrap();
+                mantle_cert::node(&key, AUTHORITY, own.public_key(), name, (validity, drawn()))
+                    .unwrap();
             (certificate, own.pkcs8().to_vec())
         };
         let nodes = (1..=nodes).map(|id| (id, issue(&node_name(id)))).collect();

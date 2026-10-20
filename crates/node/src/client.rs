@@ -301,7 +301,11 @@ impl Client {
             .map(|n| n.id)
     }
 
-    /// Dials `node` if it has no connection and waits for it: whether it was reached.
+    /// Dials `node` if it has no connection and waits for it, as long as the client gives an
+    /// exchange with it (the module's law): whether it was reached. A dial that takes longer leaves
+    /// the node unreached this round and goes on, and a later round finds it up: a dial to a node
+    /// that is gone ends only at its handshake's idle timeout, which a request asked of the nodes
+    /// that answer never waits out.
     async fn reach(&mut self, node: PeerId, deadline_ns: u64) -> Result<bool, ClientError> {
         let Some(known) = self.nodes.iter().find(|n| n.id == node) else {
             return Ok(false);
@@ -319,15 +323,18 @@ impl Client {
         if self.driver.endpoint().connect(clock, node, quic).is_err() {
             return Ok(false);
         }
+        let now_ns = hyper_rt::futures::now_ns();
+        let until_ns = now_ns.saturating_add(self.period_ns(node, deadline_ns, now_ns));
         loop {
-            match self.next_event(deadline_ns).await? {
+            match self.next_event(until_ns).await? {
                 Some(Event::Connected { peer, .. }) if peer == node => return Ok(true),
                 Some(Event::Unreachable { peer, .. }) if peer == node => return Ok(false),
                 Some(Event::Closed { peer, epoch, .. }) if peer == node && epoch > before => {
                     return Ok(false);
                 }
                 Some(_) => {}
-                None => return Err(ClientError::Deadline),
+                None if until_ns >= deadline_ns => return Err(ClientError::Deadline),
+                None => return Ok(false),
             }
         }
     }
@@ -427,9 +434,11 @@ impl Client {
         most.unwrap_or_else(bounds::initial_pto)
     }
 
-    /// The longest an exchange with any node it knows is given now before the client takes the
-    /// node as lost (the module's law), for a caller with no deadline of its own; none until an
-    /// exchange is measured, before which an exchange is given all the time its caller left.
+    /// The longest the client may wait now without asking a node anything, by the module's law,
+    /// for a caller with no deadline of its own: an exchange with any node it knows, or a dial,
+    /// given its period before the node is taken as lost, and a pause between rounds, at most the
+    /// idle timeout (`bounds::backed_off`). None until an exchange is measured, before which an
+    /// exchange is given all the time its caller left.
     pub fn patience(&mut self) -> Option<Duration> {
         self.slowest_ns?;
         let now = hyper_rt::futures::now_ns();
@@ -439,7 +448,7 @@ impl Client {
                 most = most.max(self.period_ns(id, u64::MAX, now));
             }
         }
-        Some(Duration::from_nanos(most))
+        Some(Duration::from_nanos(most).max(bounds::idle_timeout()))
     }
 
     /// The progress period an exchange with `node` is given (the module's law): the time left
@@ -564,6 +573,27 @@ impl Client {
             }
         }
         Ok(())
+    }
+}
+
+impl Drop for Client {
+    /// The client's connections close as it goes, each node told by QUIC's CONNECTION_CLOSE, so
+    /// a node frees what they held at once rather than after their idle timeout. A node admits a
+    /// bounded number of connections an identity, and replaces one only once it has been idle
+    /// for the serve period: a client started again under the same identity while its old
+    /// connections were held was refused (`Refusal::Busy`) until they were. A client whose
+    /// process ends without dropping it leaves them to the idle timeout. Best effort: a clock
+    /// the shard cannot read, or a send the OS refuses, leaves them so too.
+    fn drop(&mut self) {
+        let Ok(clock) = self.driver.clock() else {
+            return;
+        };
+        for at in 0..self.nodes.len() {
+            if let Some(id) = self.nodes.get(at).map(|n| n.id) {
+                self.driver.endpoint().disconnect(clock, id);
+            }
+        }
+        let _ = self.driver.flush();
     }
 }
 

@@ -559,7 +559,11 @@ hosts, and they elect by suspicion over it; items 1, 2, 4, 5 and 6 are built, 3 
 - (4) The run is kept as hyper-block's `record` in the node's directory (`crates/node/src/layout.rs`).
 - (5) `Driven::flushed` feeds `Liveness::on_durable`, and a stream that asks for a flush gets an
   empty update of a log group of its own (the top of the group space, since group 0 holds
-  hyper-log's key records), one out at a time.
+  hyper-log's key records), one out at a time. A liveness write the log refuses stops the node,
+  as a fenced range stops it (§6.2): a log whose device failed a write makes nothing durable
+  again, so the node could prove no heartbeat and serve nothing, and its peers would keep its
+  connections up for nothing. The simulation (§9.1) found a node going on that way after its
+  device failed a write.
 - (6) Each range's next wake and the stream's are the task's deadlines, and a wait that ends at
   or past the stream's wake is reported (`Liveness::on_wait`).
 - (7) Each start begins with no history (`Exposure::new`); the root range does not keep it yet.
@@ -1715,6 +1719,22 @@ The simulation also carries the faults and loads the 2026-09-30 designs answer f
   range's last-write check.
 - **Power changes mid-batch**: no acknowledgement before durability across a switch to battery or
   a thermal step, and every deferred job still meeting its deadline (research/28 §8).
+
+*As built (2026-10-20).* `crates/node/tests/sim.rs` runs a cell of three or five nodes and its
+clients on one hyper-rt simulation runtime (`SimRuntime`): every shard on one thread on a
+virtual clock, every socket on its fabric. The nodes are the production owner (`Node::open_on`),
+elected by suspicion and replicating over QUIC and the sealed plane. Each node's log is
+hyper-log on hyper-block's simulated device (`NodeLog`), and its range runs on the model engine.
+The clients are the production client. A run is its seed: keys, certificate serials and every
+endpoint's draws derive from it (`KeyPair::from_seed`, `Serial::from_octets`,
+`Endpoint::new_seeded`), so the handshakes carry the same bytes and a seed run twice gives the
+same histories, operation by operation. The paths are focal's profiles: one switch, one
+continent, or across the planet. Half way through the clients' operations, the leader or a
+follower is cut off, loses power (its device keeping what it flushed, as the seed draws), or has
+its device fail a write, which stops it as its process would. On some seeds every path also
+loses 2% of its datagrams meanwhile. The WGL checker judges each key's history, and every node
+must apply as far as the others. Still to build: many ranges per node, the clients in their
+millions, and the faults and loads listed above.
 
 ### 9.2 Real processes
 

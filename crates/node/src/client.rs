@@ -50,6 +50,9 @@ pub struct ClientSettings {
     pub messages: Bounds,
     /// The bytes its transport may hold at once.
     pub transport_bytes: u64,
+    /// The seed of its QUIC endpoint's draws (`Endpoint::new_seeded`), so a simulation's run is its
+    /// seed (node.md §9.1); `None` elsewhere, the endpoint drawing its own.
+    pub seed: Option<[u8; 32]>,
 }
 
 /// Why a command was not answered.
@@ -152,12 +155,11 @@ impl Client {
                 epoch: 0,
             })
             .collect();
-        let endpoint = Endpoint::new(
-            config,
-            budget,
-            Peers::new(settings.nodes),
-            std::time::Instant::now(),
-        )?;
+        let (directory, now) = (Peers::new(settings.nodes), std::time::Instant::now());
+        let endpoint = match settings.seed {
+            Some(seed) => Endpoint::new_seeded(config, budget, directory, now, seed)?,
+            None => Endpoint::new(config, budget, directory, now)?,
+        };
         let driver = Driver::bind(endpoint, settings.bind, io)?;
         Ok(Self {
             id: settings.id,

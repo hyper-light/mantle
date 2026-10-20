@@ -52,11 +52,12 @@ use mantle_node::classes::{Bounds, Role};
 use mantle_node::client::{Client, ClientSettings};
 use mantle_node::directory::{Peer, node_name};
 
+#[allow(dead_code)]
 #[path = "../../node/tests/support/history.rs"]
 mod history;
 #[path = "../../range/tests/support/linear.rs"]
 mod linear;
-use history::{Part, Plan, Steer, Told, check_histories, registration, workload};
+use history::{Clock, Part, Plan, Steer, Told, check_histories, registration, workload};
 #[path = "../../node/tests/support/relay.rs"]
 mod relay;
 use relay::Relay;
@@ -330,6 +331,7 @@ impl Pki {
             messages: bounds(),
             transport_bytes: u64::try_from(self.nodes.len() * 3 * hyper_transport::RECEIVE_CHUNK)
                 .unwrap(),
+            seed: None,
         }
     }
 }
@@ -922,7 +924,7 @@ fn linearizable(nodes: u64, fault: Fault) {
         group: GROUP,
         ops,
         phase: 0,
-        start: Instant::now(),
+        clock: Clock::Host(Instant::now()),
     });
     cell.done_by(ops, 2);
     match fault {
@@ -984,7 +986,7 @@ fn damaged_and_replaced(voters: u64) {
         group: GROUP,
         ops,
         phase: 0,
-        start,
+        clock: Clock::Host(start),
     });
     cell.done_by(ops, 1);
     let damaged = (1..=voters).find(|id| *id != leader).unwrap();
@@ -1018,7 +1020,7 @@ fn damaged_and_replaced(voters: u64) {
         group: GROUP,
         ops,
         phase: 1,
-        start,
+        clock: Clock::Host(start),
     });
     cell.done_by(ops, 4);
     drop(stops);

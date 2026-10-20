@@ -339,6 +339,7 @@ async fn serve(config: ProcessConfig) -> Result<(), ProcessError> {
         }],
         log: config.log,
         transport_bytes: config.transport_bytes,
+        seed: None,
     };
     let mut node = Node::open(settings).await?;
     // A buffer each way, a page each (hyper-rt `stdio`: a page is the natural chunk): the talk is

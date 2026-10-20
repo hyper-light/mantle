@@ -130,7 +130,26 @@ pub struct Plan {
     pub group: u128,
     pub ops: u64,
     pub phase: u64,
-    pub start: Instant,
+    pub clock: Clock,
+}
+
+/// The clock a history's calls and returns are on, one every client of it reads.
+#[derive(Clone, Copy)]
+pub enum Clock {
+    /// The host's monotonic clock, from `Instant`: clients on threads of their own.
+    Host(Instant),
+    /// The shard's: every shard of a simulation runtime reads its one virtual clock.
+    Shard,
+}
+
+impl Clock {
+    /// Nanoseconds now on this clock.
+    fn now(&self) -> u64 {
+        match self {
+            Self::Host(start) => u64::try_from(start.elapsed().as_nanos()).unwrap(),
+            Self::Shard => hyper_rt::futures::now_ns(),
+        }
+    }
 }
 
 /// What steers a workload client as it runs: where a node it had not heard of listens, and the
@@ -163,97 +182,101 @@ pub fn workload(
     runtime: fn(usize) -> LocalRuntime,
     tell: impl Fn(Told) + 'static,
 ) -> Part {
+    // Its endpoint's socket and one for each node.
+    runtime(settings.nodes.len() + 1)
+        .block_on(work(settings, bound, (plan, steer), tell))
+        .unwrap()
+}
+
+/// A workload client's operations, as [`workload`] runs them, on the shard that polls it: a
+/// simulated shard's task, or a thread's runtime.
+pub async fn work(
+    settings: ClientSettings,
+    bound: Vec<(u64, SocketAddr)>,
+    (plan, steer): (Plan, Steer),
+    tell: impl Fn(Told),
+) -> Part {
     let id = settings.id;
     let Plan {
         group,
         ops,
         phase,
-        start,
+        clock,
     } = plan;
-    // Its endpoint's socket and one for each node.
-    runtime(settings.nodes.len() + 1)
-        .block_on(async move {
-            let mut part = Vec::new();
-            let mut client = match Client::open(settings).await {
-                Ok(client) => client,
+    let mut part = Vec::new();
+    let mut client = match Client::open(settings).await {
+        Ok(client) => client,
+        Err(error) => {
+            tell(Told::Failed(id, error.to_string()));
+            return part;
+        }
+    };
+    for (node, quic) in bound {
+        client.learn(node, quic).unwrap();
+    }
+    let session = match register(&mut client, group, id).await {
+        Ok(session) => session,
+        Err(why) => {
+            tell(Told::Failed(id, why));
+            return part;
+        }
+    };
+    let mut serial = 0u64;
+    for i in 0..ops {
+        if matches!(steer.stop.try_recv(), Err(mpsc::TryRecvError::Disconnected)) {
+            break;
+        }
+        while let Ok((node, quic)) = steer.learn.try_recv() {
+            client.learn(node, quic).unwrap();
+        }
+        let key = KEYS[usize::try_from(i / 2).unwrap() % KEYS.len()];
+        let call = clock.now();
+        let (input, output) = if i % 2 == 0 {
+            serial += 1;
+            let etag = format!("c{id}-{phase}-{i}");
+            let file = u128::from(id) << 64 | u128::from(phase) << 32 | u128::from(i);
+            let entry = sessioned(session, serial, put(key, &etag, file));
+            match client.command(group, &entry, u64::MAX).await {
+                Ok(answers)
+                    if matches!(
+                        answers.as_slice(),
+                        [Answer::Name(name::Outcome::Put { .. })]
+                    ) =>
+                {
+                    (Input::Put(etag), Output::Put)
+                }
+                answered => {
+                    tell(Told::Failed(id, format!("put {i} of {key}: {answered:?}")));
+                    return part;
+                }
+            }
+        } else {
+            let query = Query::Current {
+                bucket: "b".into(),
+                key: key.into(),
+            };
+            match client.read(group, &query, u64::MAX).await {
+                Ok(Read::Current(current)) => {
+                    (Input::Get, Output::Got(current.map(|(_, v)| v.etag)))
+                }
                 Err(error) => {
-                    tell(Told::Failed(id, error.to_string()));
+                    tell(Told::Failed(id, format!("read {i} of {key}: {error}")));
                     return part;
                 }
-            };
-            for (node, quic) in bound {
-                client.learn(node, quic).unwrap();
             }
-            let session = match register(&mut client, group, id).await {
-                Ok(session) => session,
-                Err(why) => {
-                    tell(Told::Failed(id, why));
-                    return part;
-                }
-            };
-            let mut serial = 0u64;
-            for i in 0..ops {
-                if matches!(steer.stop.try_recv(), Err(mpsc::TryRecvError::Disconnected)) {
-                    break;
-                }
-                while let Ok((node, quic)) = steer.learn.try_recv() {
-                    client.learn(node, quic).unwrap();
-                }
-                let key = KEYS[usize::try_from(i / 2).unwrap() % KEYS.len()];
-                let call = since(start);
-                let (input, output) = if i % 2 == 0 {
-                    serial += 1;
-                    let etag = format!("c{id}-{phase}-{i}");
-                    let file = u128::from(id) << 64 | u128::from(phase) << 32 | u128::from(i);
-                    let entry = sessioned(session, serial, put(key, &etag, file));
-                    match client.command(group, &entry, u64::MAX).await {
-                        Ok(answers)
-                            if matches!(
-                                answers.as_slice(),
-                                [Answer::Name(name::Outcome::Put { .. })]
-                            ) =>
-                        {
-                            (Input::Put(etag), Output::Put)
-                        }
-                        answered => {
-                            tell(Told::Failed(id, format!("put {i} of {key}: {answered:?}")));
-                            return part;
-                        }
-                    }
-                } else {
-                    let query = Query::Current {
-                        bucket: "b".into(),
-                        key: key.into(),
-                    };
-                    match client.read(group, &query, u64::MAX).await {
-                        Ok(Read::Current(current)) => {
-                            (Input::Get, Output::Got(current.map(|(_, v)| v.etag)))
-                        }
-                        Err(error) => {
-                            tell(Told::Failed(id, format!("read {i} of {key}: {error}")));
-                            return part;
-                        }
-                    }
-                };
-                part.push((
-                    key,
-                    Operation {
-                        call,
-                        ret: Some(since(start)),
-                        input,
-                        output: Some(output),
-                    },
-                ));
-                tell(Told::Progress(id, i + 1, client.patience()));
-            }
-            part
-        })
-        .unwrap()
-}
-
-/// Nanoseconds since `start`: the clock every client's history is on.
-fn since(start: Instant) -> u64 {
-    u64::try_from(start.elapsed().as_nanos()).unwrap()
+        };
+        part.push((
+            key,
+            Operation {
+                call,
+                ret: Some(clock.now()),
+                input,
+                output: Some(output),
+            },
+        ));
+        tell(Told::Progress(id, i + 1, client.patience()));
+    }
+    part
 }
 
 /// Checks the history's every key linearizable, and that some read of each saw a put.

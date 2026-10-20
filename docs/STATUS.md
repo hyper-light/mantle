@@ -370,10 +370,15 @@ Remaining before it is done:
   and through a leader cut off, on three voters and five; and a follower whose engine store is
   damaged at rest, which refuses it with a typed corruption error, is replaced by a spare, and
   then as many original voters are killed as leave a bare quorum, the spare in it. Each key's
-  history is checked linearizable (`crates/node/tests/support/history.rs`). Left: the node
-  under deterministic simulation, and damage to a node's log (a group the log finds damaged is
-  rebuilt under a new identity, `Replica::rebuild`, which needs placement's map of members to
-  nodes).
+  history is checked linearizable (`crates/node/tests/support/history.rs`). Left: damage to a
+  node's log (a group the log finds damaged is rebuilt under a new identity, `Replica::rebuild`,
+  which needs placement's map of members to nodes).
+- The node under deterministic simulation. `crates/node/tests/sim.rs` runs cells of three and
+  five nodes and their clients on hyper-rt's simulation runtime. The production node and client
+  speak QUIC and the sealed plane on its fabric, and each node's log is on hyper-block's
+  simulated device. Each run puts a leader or a follower through a cut, a power cut, or a device
+  failing a write, on one of three path profiles, with 2% loss on some seeds. Each key's history
+  must be linearizable, and each seed must replay to the same histories (node.md §9.1).
 - Done when a linearizability checker accepts histories recorded under network partitions,
   process crashes and disk faults, both in deterministic simulation and with real
   processes.

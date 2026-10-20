@@ -30,12 +30,13 @@ use std::pin::pin;
 use std::task::{Poll, Waker};
 use std::time::Duration;
 
+use hyper_block::block::BlockFile;
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_datagram::{AdmitAll, EXPORTER_LABEL, ExporterSecret, Plane, SECRET_BYTES};
 use hyper_durable::{Driven, Handle, Owner, Unbounded};
 use hyper_liveness::{Change, Liveness};
-use hyper_log::{Class as LogClass, Config as LogConfig, Log, LogStats, Pending, Update};
+use hyper_log::{Class as LogClass, Config as LogConfig, Log, LogError, LogStats, Pending, Update};
 use hyper_raft::proto::{Message, MessageType};
 use hyper_rt::combine::{Either, Either3, race2, race3};
 use hyper_rt_transport::{Driver, PlaneSocket};
@@ -47,7 +48,7 @@ use hyper_transport::{
 use mantle_meta::engine::Engine;
 use mantle_meta::wire::Answer;
 use mantle_range::membership::{Next, Replacement};
-use mantle_range::{Applied, Elections, GroupStore, Range, RangeMachine};
+use mantle_range::{Applied, Elections, GroupStore, LogStore, Range, RangeMachine, ReplicaError};
 
 use crate::bounds::{self, Stated};
 use crate::classes::{self, Bounds, Kind, NodeClasses, Role};
@@ -91,6 +92,9 @@ pub struct NodeSettings<E> {
     pub log: LogConfig,
     /// The bytes the transport may hold at once.
     pub transport_bytes: u64,
+    /// The seed of the QUIC endpoint's draws (`Endpoint::new_seeded`), so a simulation's run is its
+    /// seed (node.md §9.1); `None` in a process, whose endpoint draws its own.
+    pub seed: Option<[u8; 32]>,
 }
 
 /// A range the node hosts: its log group, the range, and its engine as it starts: a range's
@@ -154,7 +158,53 @@ fn exchange_ended(refusal: Refusal) -> Result<(), NodeError> {
     }
 }
 
-type Store = GroupStore<DeviceFile>;
+/// The node's log as its owner uses it: each range's group claimed as the store its replica writes
+/// through, the liveness stream's writes on the log's own group (`LIVENESS_GROUP`), and what the
+/// log measured. A node runs on hyper-log over its device's file ([`Node::open`]); a simulation
+/// gives it hyper-log over a simulated device whose answers its run takes where it decides
+/// (node.md §9.1).
+pub trait NodeLog {
+    /// The store a range's replica writes through.
+    type Store: LogStore;
+    /// A liveness write, until the log answers it.
+    type Written: Written;
+    /// `group`'s records, claimed for `range`'s replica.
+    fn claim(&self, group: u128, range: &Range) -> Result<Self::Store, ReplicaError>;
+    /// The stream's liveness write, an empty update on `group` of the latency class, its answer
+    /// told through `waker`.
+    fn write_liveness(&self, group: u128, waker: Waker) -> Result<Self::Written, LogError>;
+    /// What the log measured from its opening (hyper-log's `Log::stats`).
+    fn stats(&self, into: Option<Box<LogStats>>) -> Result<Box<LogStats>, LogError>;
+}
+
+/// A write the log answers once (hyper-log's `Pending::poll`).
+pub trait Written {
+    /// Its answer, once it came: given once.
+    fn poll(&self) -> Option<Result<(), LogError>>;
+}
+
+impl Written for Pending {
+    fn poll(&self) -> Option<Result<(), LogError>> {
+        Pending::poll(self)
+    }
+}
+
+impl<F: BlockFile + 'static> NodeLog for Log<F> {
+    type Store = GroupStore<F>;
+    type Written = Pending;
+
+    fn claim(&self, group: u128, range: &Range) -> Result<GroupStore<F>, ReplicaError> {
+        mantle_range::claim(self, group, range)
+    }
+
+    fn write_liveness(&self, group: u128, waker: Waker) -> Result<Pending, LogError> {
+        self.submit_waking(group, LogClass::Latency, Update::default(), waker)
+    }
+
+    fn stats(&self, into: Option<Box<LogStats>>) -> Result<Box<LogStats>, LogError> {
+        Log::stats(self, into)
+    }
+}
 
 /// What the liveness stream asked during a call into it.
 #[derive(Default)]
@@ -381,17 +431,16 @@ struct Commanded {
 /// The piece a body is read in: the transport's own receive chunk.
 const PIECE: u64 = hyper_transport::RECEIVE_CHUNK as u64;
 
-/// One shard's ranges and the transport they replicate over.
-pub struct Node<E: Engine> {
+/// One shard's ranges and the transport they replicate over, on the node's log.
+pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     id: u64,
-    log: Log<DeviceFile>,
-    owner: Owner<Store, RangeMachine<E>, Unbounded>,
+    log: L,
+    owner: Owner<L::Store, RangeMachine<E>, Unbounded>,
     ranges: Vec<Kept>,
     deadlines: BTreeSet<(u64, usize)>,
     liveness: Liveness,
     asked: Asked,
-    liveness_write: Option<(Pending, u64)>,
-    liveness_failed: bool,
+    liveness_write: Option<(L::Written, u64)>,
     liveness_moved: bool,
     driver: Driver<NodeClasses, Fixed, Peers>,
     plane: Plane,
@@ -457,14 +506,23 @@ pub fn message_bounds<E>(ranges: &[Hosted<E>]) -> Result<Bounds, NodeError> {
 }
 
 impl<E: Engine + 'static> Node<E> {
-    /// Opens the node on the current hyper-rt shard: raises its run, opens its log and its ranges,
-    /// binds its QUIC endpoint and its plane, and dials each peer whose id is above its own. The
-    /// task that opens it is the one that turns it: its waker is the one the log answers through.
-    pub async fn open(mut settings: NodeSettings<E>) -> Result<Self, NodeError> {
+    /// Opens the node on the current hyper-rt shard on its log in its directory, as
+    /// [`Node::open_on`] opens it on any.
+    pub async fn open(settings: NodeSettings<E>) -> Result<Self, NodeError> {
+        let log = open_log(&settings.dir, settings.id, settings.log)?;
+        Self::open_on(settings, log).await
+    }
+}
+
+impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
+    /// Opens the node on the current hyper-rt shard, on `log`: raises its run, claims its ranges'
+    /// groups and opens their replicas, binds its QUIC endpoint and its plane, and dials each peer
+    /// whose id is above its own. The task that opens it is the one that turns it: its waker is the
+    /// one the log answers through.
+    pub async fn open_on(mut settings: NodeSettings<E>, log: L) -> Result<Self, NodeError> {
         let waker = poll_fn(|context| Poll::Ready(context.waker().clone())).await;
         let layout = Layout::new(&settings.dir);
         let run = layout.raise_run()?;
-        let log = open_log(&settings.dir, settings.id, settings.log)?;
         let messages = message_bounds(&settings.ranges)?;
         classes::state_bounds(messages).map_err(|e| NodeError::Bounds(e.to_string()))?;
         let inflight = settings
@@ -492,7 +550,7 @@ impl<E: Engine + 'static> Node<E> {
             if hosted.group == 0 || hosted.group == LIVENESS_GROUP {
                 return Err(NodeError::Reserved(hosted.group));
             }
-            let store = mantle_range::claim(&log, hosted.group, &hosted.range)?;
+            let store = log.claim(hosted.group, &hosted.range)?;
             let shell = mantle_range::open_shell(
                 settings.id,
                 store,
@@ -529,7 +587,11 @@ impl<E: Engine + 'static> Node<E> {
         };
         let budget = Fixed::new(settings.transport_bytes, settings.peers.len().max(1));
         let directory = Peers::new(settings.peers.clone());
-        let endpoint = Endpoint::new(config, budget, directory, std::time::Instant::now())?;
+        let now = std::time::Instant::now();
+        let endpoint = match settings.seed {
+            Some(seed) => Endpoint::new_seeded(config, budget, directory, now, seed)?,
+            None => Endpoint::new(config, budget, directory, now)?,
+        };
         let driver = Driver::bind(endpoint, settings.quic, io)?;
         let plane_socket = PlaneSocket::bind(settings.plane, io)?;
         let plane = Plane::new(settings.id, plane_limits).map_err(NodeError::Plane)?;
@@ -560,7 +622,6 @@ impl<E: Engine + 'static> Node<E> {
             liveness,
             asked: Asked::default(),
             liveness_write: None,
-            liveness_failed: false,
             liveness_moved: true,
             driver,
             plane,
@@ -744,6 +805,19 @@ impl<E: Engine + 'static> Node<E> {
         )
     }
 
+    /// Stops the node as a power cut stops it, giving back what it held of its own: its log, and
+    /// each range's group and engine as they stood, with whatever they had not made durable. Its
+    /// connections and sockets go with it, unclosed, as a cut leaves them to its peers' timeouts.
+    pub fn close(mut self) -> (L, Vec<(u128, E)>) {
+        let mut engines = Vec::with_capacity(self.ranges.len());
+        for kept in std::mem::take(&mut self.ranges) {
+            if let Some(replica) = self.owner.remove(kept.handle) {
+                engines.push((kept.group, replica.into_machine().into_engine()));
+            }
+        }
+        (self.log, engines)
+    }
+
     /// What the node's log measured from its opening (hyper-log `Log::stats`), asked of the log's
     /// owner, which answers as it comes: a flush that stalls shows as `flushing_since`. `into`, a
     /// box an earlier call gave back, is filled again.
@@ -847,7 +921,7 @@ impl<E: Engine + 'static> Node<E> {
             return Err(NodeError::Task);
         }
         self.wait().await?;
-        self.liveness_written();
+        self.liveness_written()?;
         let now = hyper_rt::futures::now_ns();
         let emptied = self.drain_plane()?;
         self.take_inbox()?;
@@ -968,24 +1042,23 @@ impl<E: Engine + 'static> Node<E> {
         Ok(())
     }
 
-    /// What the stream's own write made durable, before the clock it is polled at.
-    fn liveness_written(&mut self) {
+    /// What the stream's own write made durable, before the clock it is polled at. A write the
+    /// log refused stops the node, as a fenced range does: a log whose device failed a write makes
+    /// nothing durable again, so the node can prove no heartbeat and serve nothing; stopped, its
+    /// process ends and is started again on what the device kept (node.md §6.2).
+    fn liveness_written(&mut self) -> Result<(), NodeError> {
         if let Some((pending, started)) = &self.liveness_write
             && let Some(answer) = pending.poll()
         {
             let started = *started;
             self.liveness_write = None;
-            match answer {
-                Ok(()) => {
-                    let durable = hyper_rt::futures::now_ns();
-                    self.liveness
-                        .on_durable(hyper_liveness::Write::Liveness, started, durable);
-                    self.liveness_moved = true;
-                }
-                // The device failed: no heartbeat is proved again, so the peers suspect the node.
-                Err(_) => self.liveness_failed = true,
-            }
+            answer.map_err(|e| NodeError::Log(e.to_string()))?;
+            let durable = hyper_rt::futures::now_ns();
+            self.liveness
+                .on_durable(hyper_liveness::Write::Liveness, started, durable);
+            self.liveness_moved = true;
         }
+        Ok(())
     }
 
     /// Every datagram already on the plane's socket, opened into the inbox; whether a drain found
@@ -1080,20 +1153,13 @@ impl<E: Engine + 'static> Node<E> {
     /// Carries out what the stream asked: heartbeats onto the plane, a liveness write on the log,
     /// and its changes to the replicas.
     fn act_on_liveness(&mut self) -> Result<(), NodeError> {
-        if std::mem::take(&mut self.asked.flush)
-            && self.liveness_write.is_none()
-            && !self.liveness_failed
-        {
+        if std::mem::take(&mut self.asked.flush) && self.liveness_write.is_none() {
             let started = hyper_rt::futures::now_ns();
-            match self.log.submit_waking(
-                LIVENESS_GROUP,
-                LogClass::Latency,
-                Update::default(),
-                self.waker.clone(),
-            ) {
-                Ok(pending) => self.liveness_write = Some((pending, started)),
-                Err(_) => self.liveness_failed = true,
-            }
+            let pending = self
+                .log
+                .write_liveness(LIVENESS_GROUP, self.waker.clone())
+                .map_err(|e| NodeError::Log(e.to_string()))?;
+            self.liveness_write = Some((pending, started));
         }
         for (peer, message) in std::mem::take(&mut self.asked.heartbeats) {
             // A peer with no keys yet loses the heartbeat, as the network may.

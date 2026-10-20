@@ -94,11 +94,12 @@ use mantle_node::directory::{Peer, node_name};
 use mantle_node::node::{Hosted, Link, Node, NodeSettings, Status, message_bounds};
 use mantle_range::{ConfState, Range, Settings, Stored};
 
+#[allow(dead_code)]
 #[path = "support/history.rs"]
 mod history;
 #[path = "../../range/tests/support/linear.rs"]
 mod linear;
-use history::{Part, Plan, Steer, Told, check_histories, registration, workload};
+use history::{Clock, Part, Plan, Steer, Told, check_histories, registration, workload};
 #[path = "support/relay.rs"]
 mod relay;
 use relay::Relay;
@@ -355,6 +356,7 @@ impl Pki {
             nodes: peers,
             messages: message_bounds(&[hosted(u64::try_from(order.len()).unwrap(), ())]).unwrap(),
             transport_bytes,
+            seed: None,
         }
     }
 
@@ -390,6 +392,7 @@ impl Pki {
             ranges: vec![hosted(self.voters, engine)],
             log: log_config(),
             transport_bytes,
+            seed: None,
         }
     }
 }
@@ -1375,7 +1378,7 @@ fn linearizable(engines: Engines, fault: Fault, nodes: u64) {
         group: GROUP,
         ops,
         phase: 0,
-        start: Instant::now(),
+        clock: Clock::Host(Instant::now()),
     });
     // Half the history before the fault, and for a cut, a quarter cut off and a quarter after.
     cell.done_by(ops, 2);
@@ -1418,7 +1421,7 @@ fn replaced_for_good(engines: Engines) {
         group: GROUP,
         ops,
         phase: 0,
-        start,
+        clock: Clock::Host(start),
     });
     cell.done_by(ops, 1);
     let lost = (1..=NODES).find(|id| *id != leader).unwrap();
@@ -1454,7 +1457,7 @@ fn replaced_for_good(engines: Engines) {
         group: GROUP,
         ops,
         phase: 1,
-        start,
+        clock: Clock::Host(start),
     });
     cell.done_by(ops, 4);
     drop(stops);

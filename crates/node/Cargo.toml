@@ -32,6 +32,13 @@ mantle-range = { path = "../range" }
 thiserror.workspace = true
 
 [dev-dependencies]
+# The simulated device a simulated node's log runs on (tests/sim.rs).
+hyper-block = { path = "../../vendor/hyper-block", features = ["sim"] }
+# The waker the synchronous store a simulated node's ranges write through counts its answers by
+# (crates/range/tests/support/store.rs).
+hyper-measure = { path = "../../vendor/hyper-measure" }
+# The simulation's draws: hyper-sim's generator and named streams (tests/sim.rs).
+hyper-sim = { path = "../../vendor/hyper-sim" }
 # The cell's authority and its nodes' certificates, issued for the tests' nodes.
 mantle-cert = { path = "../cert" }
 tempfile.workspace = true

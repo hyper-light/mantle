@@ -14,10 +14,18 @@
 //! three probe timeouts with no acknowledgement, each with the peer's `max_ack_delay`, which an
 //! exchange's period must exceed), never past the deadline. A node that died
 //! holding a command's exchange is then left within that, not after the connection's idle
-//! timeout. A
-//! command whose exchange ended without its reply may have been applied: asking it again with
-//! the same sessions and serials is answered from what the range's sessions keep, never applied
-//! twice (mantle_meta's sessions, replica.md §1).
+//! timeout. An exchange cut by its period is no measure (it never replied), so each one cut doubles
+//! the period of the next exchange with that node until that node replies (RFC 6298 §5.5's
+//! backed-off timer, which only a new measurement of the same path collapses, §5): a leader
+//! slower than every exchange measured, its writes or its device under load, is asked again a
+//! bounded number of times, not at the first measure's pace for ever, and a redirect from another
+//! node, which measures nothing of the leader, does not set its period back. A command whose
+//! exchange ended without its reply may have been applied: asking it again with the same sessions
+//! and serials is answered from what the range's sessions keep, never applied twice (mantle_meta's
+//! sessions, replica.md §1). A command no session holds, a registration, would apply again (the
+//! Raft dissertation §6.3: a registration asked twice registers twice): its exchange is never cut
+//! by a period, only by its connection's loss, as a live node answers every command, applied or,
+//! once it no longer leads, with the leader it knows.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -90,6 +98,22 @@ impl From<hyper_rt::RtError> for ClientError {
     }
 }
 
+/// What the client's asks of nodes came to, from its opening: each exchange it opened, by how
+/// it ended. A cell whose nodes and paths are well loses none, and a node that does not lead
+/// answers each ask with the leader it knows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Asks {
+    /// Answered: a command's answers, or a read's.
+    pub answered: u64,
+    /// Answered with the leader the node knows, or with none known.
+    pub redirected: u64,
+    /// Refused by the leader for room, its uncommitted bound or its log full.
+    pub refused: u64,
+    /// Ended with no answer: cut by its period, refused by the transport, or its connection
+    /// lost.
+    pub lost: u64,
+}
+
 /// A node as the client keeps it.
 struct Known {
     id: PeerId,
@@ -98,6 +122,10 @@ struct Known {
     /// The epoch of the newest connection to it that came up: the transport counts each peer's
     /// connections, so one dialed since has a newer epoch.
     epoch: Epoch,
+    /// Exchanges with it in a row cut by their period with no reply from it since: each doubles
+    /// the next one's period (RFC 6298 §5.5), and its reply, a new measurement of it, sets it back
+    /// (§5).
+    stalled: u32,
 }
 
 /// RFC 9002 §7.6.1's `kPersistentCongestionThreshold`: probe timeouts with no acknowledgement
@@ -119,6 +147,7 @@ pub struct Client {
     slowest_ns: Option<u64>,
     /// Waits paused for so far: the draw each pause's jitter takes (`bounds::pause`).
     waits: u32,
+    asks: Asks,
     body: Vec<u8>,
 }
 
@@ -153,6 +182,7 @@ impl Client {
                 quic: None,
                 connected: false,
                 epoch: 0,
+                stalled: 0,
             })
             .collect();
         let (directory, now) = (Peers::new(settings.nodes), std::time::Instant::now());
@@ -168,6 +198,7 @@ impl Client {
             leaders: BTreeMap::new(),
             slowest_ns: None,
             waits: 0,
+            asks: Asks::default(),
             body: Vec::new(),
         })
     }
@@ -200,7 +231,12 @@ impl Client {
     ) -> Result<Vec<Answer>, ClientError> {
         self.body.clear();
         self.body.extend_from_slice(&entry.encode()?);
-        let reply = self.request(Kind::Command, group, deadline_ns).await?;
+        // A command no session holds (a registration) applies again if asked again: its exchange is
+        // never cut by a period, only by its connection's loss (the module's rules).
+        let guarded = entry.commands.iter().all(|c| c.session != 0);
+        let reply = self
+            .request(Kind::Command, group, (deadline_ns, guarded))
+            .await?;
         Ok(command::decode_answers(&reply)?)
     }
 
@@ -214,17 +250,18 @@ impl Client {
     ) -> Result<Read, ClientError> {
         self.body.clear();
         self.body.extend_from_slice(&query.encode());
-        let reply = self.request(Kind::Read, group, deadline_ns).await?;
+        let reply = self.request(Kind::Read, group, (deadline_ns, true)).await?;
         Ok(Read::decode(query, &reply)?)
     }
 
     /// Asks the request of `kind` whose body the client holds of `group`'s leader, following the
-    /// leaders the nodes name (the module's rules): the answered reply's body.
+    /// leaders the nodes name (the module's rules), by `deadline_ns`; `guarded` when asking it
+    /// again cannot apply it twice. The answered reply's body.
     async fn request(
         &mut self,
         kind: Kind,
         group: u128,
-        deadline_ns: u64,
+        (deadline_ns, guarded): (u64, bool),
     ) -> Result<Vec<u8>, ClientError> {
         let mut target = self.leaders.get(&group).copied();
         // RFC 6298 §5.5: the wait doubles from the current retransmission timeout, the client's
@@ -262,7 +299,15 @@ impl Client {
                 target = self.next_node(Some(node));
                 continue;
             }
-            match self.ask(node, kind, group, deadline_ns).await? {
+            let asked = self.ask(node, kind, group, (deadline_ns, guarded)).await?;
+            let count = match asked {
+                Asked::Answered(_) => &mut self.asks.answered,
+                Asked::Leader(..) => &mut self.asks.redirected,
+                Asked::Refused => &mut self.asks.refused,
+                Asked::Lost => &mut self.asks.lost,
+            };
+            *count = count.saturating_add(1);
+            match asked {
                 Asked::Answered(reply) => {
                     self.leaders.insert(group, node);
                     return Ok(reply);
@@ -354,15 +399,16 @@ impl Client {
         node: PeerId,
         kind: Kind,
         group: u128,
-        deadline_ns: u64,
+        (deadline_ns, guarded): (u64, bool),
     ) -> Result<Asked, ClientError> {
         let clock = self.driver.clock()?;
         let opened_ns = hyper_rt::futures::now_ns();
-        let period = Progress::new(Duration::from_nanos(self.period_ns(
-            node,
-            deadline_ns,
-            opened_ns,
-        )))?;
+        let period_ns = if guarded {
+            self.period_ns(node, deadline_ns, opened_ns)
+        } else {
+            deadline_ns.saturating_sub(opened_ns).max(1)
+        };
+        let period = Progress::new(Duration::from_nanos(period_ns))?;
         let len = u64::try_from(self.body.len()).unwrap_or(u64::MAX);
         let exchange = match self.driver.endpoint().open(
             clock,
@@ -395,6 +441,9 @@ impl Client {
                 Event::Reply { exchange: e, .. } if e == exchange => {
                     let took = hyper_rt::futures::now_ns().saturating_sub(opened_ns);
                     self.slowest_ns = Some(self.slowest_ns.map_or(took, |s| s.max(took)));
+                    if let Some(known) = self.nodes.iter_mut().find(|n| n.id == node) {
+                        known.stalled = 0;
+                    }
                     let head = self.driver.endpoint().head(exchange).unwrap_or_default();
                     let read = command::read_reply_head(head)?;
                     reply = Some(read);
@@ -411,7 +460,16 @@ impl Client {
                         return Ok(Asked::Answered(done));
                     }
                 }
-                Event::Refused { exchange: e, .. } if e == exchange => {
+                Event::Refused {
+                    exchange: e,
+                    refusal,
+                    ..
+                } if e == exchange => {
+                    if refusal == Refusal::Stalled
+                        && let Some(known) = self.nodes.iter_mut().find(|n| n.id == node)
+                    {
+                        known.stalled = known.stalled.saturating_add(1);
+                    }
                     return Ok(Asked::Lost);
                 }
                 Event::Closed { peer, .. } | Event::Unreachable { peer, .. } => {
@@ -443,6 +501,11 @@ impl Client {
         most.unwrap_or_else(bounds::initial_pto)
     }
 
+    /// What its asks came to so far.
+    pub fn asks(&self) -> Asks {
+        self.asks
+    }
+
     /// The longest the client may wait now without asking a node anything, by the module's law,
     /// for a caller with no deadline of its own: an exchange with any node it knows, or a dial,
     /// given its period before the node is taken as lost, and a pause between rounds, at most the
@@ -462,7 +525,8 @@ impl Client {
 
     /// The progress period an exchange with `node` is given (the module's law): the time left
     /// before `deadline_ns` while nothing is measured, else the slowest exchange measured or the
-    /// path's persistent-congestion duration, whichever is longer, within that time.
+    /// path's persistent-congestion duration, whichever is longer, doubled for each exchange with
+    /// the node cut by its period since its last reply, within that time.
     fn period_ns(&mut self, node: PeerId, deadline_ns: u64, now_ns: u64) -> u64 {
         let left = deadline_ns.saturating_sub(now_ns).max(1);
         let Some(slowest) = self.slowest_ns else {
@@ -478,7 +542,13 @@ impl Client {
             )
             .unwrap_or(u64::MAX)
         });
-        slowest.max(congested).min(left)
+        let stalled = self
+            .nodes
+            .iter()
+            .find(|n| n.id == node)
+            .map_or(0, |n| n.stalled);
+        let doubling = 1u64.checked_shl(stalled).unwrap_or(u64::MAX);
+        slowest.max(congested).saturating_mul(doubling).min(left)
     }
 
     /// Writes what the exchange takes of the command's body.

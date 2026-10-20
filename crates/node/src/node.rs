@@ -381,11 +381,13 @@ enum Then {
     Reply,
 }
 
-/// A body arriving on an exchange: from whom, its length, what was read of it, and what it is.
+/// A body arriving on an exchange: from whom, its length, how much of it was read and what of it
+/// is kept, and what it is.
 struct Receiving {
     exchange: ExchangeId,
     peer: PeerId,
     body: u64,
+    read: u64,
     bytes: Vec<u8>,
     what: Arriving,
 }
@@ -399,6 +401,14 @@ enum Arriving {
     Command(u128),
     /// A read of the range of this group: a query.
     Read(u128),
+    /// A request this node answers without its body: the range of this group is led elsewhere,
+    /// or the request's head is answered with this status. Its body is still read to its end,
+    /// and dropped, before the answer goes, so the exchange ends whole: ending an exchange whose
+    /// request half is unread resets that half (hyper-transport's `Endpoint::end`), and the asker
+    /// hears the reset as the exchange refused, not the answer it carried (an early response,
+    /// which RFC 9114 §4.1 allows a server only where its client keeps the complete response).
+    Redirect(u128),
+    Status(command::Status),
 }
 
 impl Arriving {
@@ -406,7 +416,17 @@ impl Arriving {
     fn class(self) -> classes::Class {
         match self {
             Self::Snapshot => classes::Class::Bulk,
-            Self::Command(_) | Self::Read(_) => classes::Class::Request,
+            Self::Command(_) | Self::Read(_) | Self::Redirect(_) | Self::Status(_) => {
+                classes::Class::Request
+            }
+        }
+    }
+
+    /// Whether its body is kept as it is read: what it is answered without is only read.
+    fn keeps(self) -> bool {
+        match self {
+            Self::Snapshot | Self::Command(_) | Self::Read(_) => true,
+            Self::Redirect(_) | Self::Status(_) => false,
         }
     }
 }
@@ -1204,14 +1224,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             } => {
                 let what = match kind {
                     Kind::Snapshot => Arriving::Snapshot,
-                    Kind::Command => match self.take_request(exchange)? {
-                        Some(group) => Arriving::Command(group),
-                        None => return Ok(()),
-                    },
-                    Kind::Read => match self.take_request(exchange)? {
-                        Some(group) => Arriving::Read(group),
-                        None => return Ok(()),
-                    },
+                    Kind::Command => self.take_request(exchange, Arriving::Command),
+                    Kind::Read => self.take_request(exchange, Arriving::Read),
                     // A Raft message travels on a lane, never on an exchange.
                     Kind::Raft => {
                         self.driver
@@ -1221,11 +1235,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     }
                 };
                 let body = body.unwrap_or(0);
+                let kept = if what.keeps() { body } else { 0 };
                 self.receiving.push(Receiving {
                     exchange,
                     peer,
                     body,
-                    bytes: Vec::with_capacity(usize::try_from(body).unwrap_or(0)),
+                    read: 0,
+                    bytes: Vec::with_capacity(usize::try_from(kept).unwrap_or(0)),
                     what,
                 });
                 self.read_exchange(exchange)
@@ -1663,7 +1679,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// Reads what an exchange's body holds, a piece at a time from its class's budget; once it is
     /// whole, with its checksum verified, takes it: a snapshot is answered and its frame stepped,
-    /// an entry is proposed.
+    /// an entry is proposed, a read asked, and a request answered without its body is answered.
     fn read_exchange(&mut self, exchange: ExchangeId) -> Result<(), NodeError> {
         let Some(at) = self.receiving.iter().position(|r| r.exchange == exchange) else {
             return Ok(());
@@ -1672,12 +1688,18 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(receiving) = self.receiving.get_mut(at) else {
             return Ok(());
         };
-        while u64::try_from(receiving.bytes.len()).unwrap_or(u64::MAX) < receiving.body {
+        while receiving.read < receiving.body {
             let Ok(mut into) = endpoint.reserve(receiving.what.class(), PIECE) else {
                 return Ok(());
             };
             let got = endpoint.read_body(exchange, &mut into);
-            receiving.bytes.extend_from_slice(into.bytes());
+            let piece = into.bytes();
+            receiving.read = receiving
+                .read
+                .saturating_add(u64::try_from(piece.len()).unwrap_or(u64::MAX));
+            if receiving.what.keeps() {
+                receiving.bytes.extend_from_slice(piece);
+            }
             endpoint.release(into);
             match got {
                 Ok(0) => return Ok(()),
@@ -1710,6 +1732,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
             Arriving::Command(group) => self.propose_command(exchange, group, &received.bytes),
             Arriving::Read(group) => self.ask_read(exchange, group, &received.bytes),
+            // Answered now its request was read whole: the leader as this node knows it now.
+            Arriving::Redirect(group) => self.redirect(exchange, group),
+            Arriving::Status(status) => self.answer_status(exchange, status, 0),
         }
     }
 
@@ -1813,24 +1838,21 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(())
     }
 
-    /// A command's or a read's head, checked before its body is read: the group of a range this
-    /// node leads, or the reply that says why not (no such range, or where the leader is) and the
-    /// exchange ended.
-    fn take_request(&mut self, exchange: ExchangeId) -> Result<Option<u128>, NodeError> {
+    /// A command's or a read's head, checked before its body is read: what its body is read as,
+    /// `led` of the group of a range this node leads, or the answer that says why not (no such
+    /// range, or where the leader is), given once the body is read whole.
+    fn take_request(&mut self, exchange: ExchangeId, led: fn(u128) -> Arriving) -> Arriving {
         let endpoint = self.driver.endpoint();
         let Ok(group) = command::group_of(endpoint.head(exchange).unwrap_or_default()) else {
-            self.answer_status(exchange, command::Status::Malformed, 0)?;
-            return Ok(None);
+            return Arriving::Status(command::Status::Malformed);
         };
         let Some(replica) = self.kept(group).and_then(|k| self.owner.get(k.handle)) else {
-            self.answer_status(exchange, command::Status::NoRange, 0)?;
-            return Ok(None);
+            return Arriving::Status(command::Status::NoRange);
         };
         if !replica.is_leader() {
-            self.redirect(exchange, group)?;
-            return Ok(None);
+            return Arriving::Redirect(group);
         }
-        Ok(Some(group))
+        led(group)
     }
 
     /// Proposes the entry a command's body holds, as the range's leader, and keeps the command

@@ -25,7 +25,9 @@
 )]
 
 use hyper_block::sim::Fault as DeviceFault;
+use hyper_rt::sim::SimPath;
 use hyper_sim::rng::{Seeded, stream_seed};
+use mantle_meta::wire::Answer;
 
 #[allow(dead_code)]
 #[path = "support/cell.rs"]
@@ -37,8 +39,8 @@ mod history;
 mod linear;
 #[path = "../../range/tests/support/store.rs"]
 mod store;
-use cell::{CLIENTS, Sim, log_config};
-use history::{Part, check_histories};
+use cell::{CLIENT, CLIENTS, GROUP, PROFILES, Sim, log_config};
+use history::{Part, check_histories, registration};
 
 /// The seeds run when `MANTLE_NODE_SIM_SEEDS` is not set: one cell of three and one of five, each
 /// run twice.
@@ -132,4 +134,49 @@ fn a_cells_histories_through_cuts_power_cuts_and_device_faults_are_linearizable_
             "seed {seed} ran otherwise the second time"
         );
     }
+}
+
+/// A registration whose answer takes longer than every exchange its client measured is applied
+/// once. Asked again, a registration registers again (the Raft dissertation §6.3), so the client
+/// cuts its exchange by no period and waits for the leader's answer (`mantle_node::client`); a
+/// client that cut it and asked again would leave a session registered for nothing each time, and
+/// a range holding its bound of sessions refuses every registration after.
+#[test]
+fn a_registration_slower_than_every_exchange_its_client_measured_is_applied_once() {
+    // A cell of three, one switch apart.
+    let mut cell = Sim::new(1);
+    cell.leader();
+    let order: Vec<u64> = (1..=cell.nodes).collect();
+    let asking = cell.asking(CLIENT, &order);
+    let (first, _) = cell.ask(&asking, GROUP, registration(1));
+    assert!(
+        matches!(first.as_deref(), Ok([Answer::Registered { .. }])),
+        "the first registration answered {first:?}"
+    );
+    let before = cell.converged();
+    // From now on the client's paths cross the planet, and the nodes' stay one switch apart: the
+    // registration's answer takes longer than every exchange the client measured.
+    let (_, one_way, jitter) = PROFILES[2];
+    cell.slow_clients(SimPath::in_order(one_way, jitter));
+    asking
+        .try_send((GROUP, registration(2)))
+        .map_err(|_| "the client's asks are full")
+        .unwrap();
+    let (second, asks) = cell.until("the second registration's answer", |c| {
+        for (id, member) in &c.members {
+            let applied = member.status.as_ref().map_or(0, |s| s.applied);
+            assert!(
+                applied <= before + 1,
+                "node {id} applied to {applied}, past {before} and the one registration asked: \
+                 the registration was asked again"
+            );
+        }
+        c.asked.take()
+    });
+    assert!(
+        matches!(second.as_deref(), Ok([Answer::Registered { .. }])),
+        "the second registration answered {second:?}"
+    );
+    assert_eq!(asks.lost, 0, "an exchange was lost: {asks:?}");
+    assert_eq!(cell.converged(), before + 1);
 }

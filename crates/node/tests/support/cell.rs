@@ -32,9 +32,9 @@ use mantle_meta::apply::Layer;
 use mantle_meta::engine::{Engine, Model};
 use mantle_meta::name;
 use mantle_meta::session::Rules;
-use mantle_meta::wire::Answer;
+use mantle_meta::wire::{Answer, Entry};
 use mantle_node::classes::Role;
-use mantle_node::client::{Client, ClientSettings};
+use mantle_node::client::{Asks, Client, ClientSettings};
 use mantle_node::directory::{Peer, node_name};
 use mantle_node::node::{Hosted, Node, NodeLog, NodeSettings, Status, Written, message_bounds};
 use mantle_range::{ConfState, Range, ReplicaError, Settings};
@@ -326,6 +326,8 @@ enum Report {
     Failed(u64, String),
     /// The gate's opening: its answers, or why there were none.
     Opened(Result<Vec<Answer>, String>),
+    /// A test client's answer, or why there was none, and what its asks came to so far.
+    Asked(Result<Vec<Answer>, String>, Asks),
     Told(Told),
     /// A workload client's part of the history, once it ended.
     Part(u64, Part),
@@ -425,10 +427,14 @@ pub struct Sim {
     /// The profile's path, and its one-way delay: the finest step anything between nodes moves in.
     path: SimPath,
     step_ns: u64,
+    /// The longest a datagram may take on any of the cell's paths now: a round trip of it is the
+    /// least the cell may go without moving.
+    longest_ns: u64,
     progress: BTreeMap<u64, u64>,
     patience: BTreeMap<u64, Duration>,
     pub parts: BTreeMap<u64, Part>,
     opened: Option<Result<Vec<Answer>, String>>,
+    pub asked: Option<(Result<Vec<Answer>, String>, Asks)>,
     learns: Vec<mpsc::Sender<(u64, SocketAddr)>>,
     /// When something last moved, on the virtual clock.
     moved_at: u64,
@@ -504,10 +510,12 @@ impl Sim {
             log,
             path,
             step_ns: one_way,
+            longest_ns: one_way + jitter,
             progress: BTreeMap::new(),
             patience: BTreeMap::new(),
             parts: BTreeMap::new(),
             opened: None,
+            asked: None,
             learns: Vec::new(),
             moved_at: 0,
             starts: 0,
@@ -674,6 +682,22 @@ impl Sim {
         self.rt.set_path(path);
     }
 
+    /// Sets every path to or from a client to `path` from now on; the nodes' paths among
+    /// themselves stay the profile's.
+    pub fn slow_clients(&mut self, path: SimPath) {
+        for id in 1..=self.nodes {
+            for peer in (1..=self.nodes).filter(|p| *p != id) {
+                for ours in self.ports(id) {
+                    for theirs in self.ports(peer) {
+                        self.rt.set_pair_path(ours, theirs, self.path);
+                    }
+                }
+            }
+        }
+        self.rt.set_path(path);
+        self.longest_ns = self.longest_ns.max(path.one_way_ns() + path.jitter_ns());
+    }
+
     /// Starts node `id` again on what its device and engines kept.
     pub fn restart(&mut self, id: u64) {
         let (file, engines) = self.members.get_mut(&id).unwrap().down.take().unwrap();
@@ -724,6 +748,7 @@ impl Sim {
                 }
                 Report::Failed(id, why) => panic!("seed {}: {id} failed: {why}", self.seed),
                 Report::Opened(answers) => self.opened = Some(answers),
+                Report::Asked(answered, asks) => self.asked = Some((answered, asks)),
                 Report::Told(Told::Progress(id, done, patience)) => {
                     self.progress.insert(id, done);
                     if let Some(patience) = patience {
@@ -742,7 +767,7 @@ impl Sim {
 
     /// The quiet period: the longest any node states it may go without moving, or a link to a
     /// peer it dials may should that peer fall silent, or any client gives an exchange; never
-    /// less than one step.
+    /// less than a round trip of the longest path, nor than one step.
     fn quiet(&self) -> u64 {
         self.members
             .values()
@@ -751,7 +776,10 @@ impl Sim {
             .flatten()
             .chain(self.patience.values().copied())
             .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
-            .fold(self.step_ns.max(1), u64::max)
+            .fold(
+                self.step_ns.max(1).max(self.longest_ns.saturating_mul(2)),
+                u64::max,
+            )
     }
 
     /// Runs the cell a step at a time until `done` holds; fails once a quiet period passes with
@@ -840,6 +868,56 @@ impl Sim {
             .until("the gate opens", |c| c.opened.take())
             .unwrap_or_else(|why| panic!("seed {}: the gate's opening: {why}", self.seed));
         assert_eq!(answers, vec![Answer::Name(name::Outcome::GateMoved)]);
+    }
+
+    /// Starts a client of the test's own, `id` on its shard, that knows the nodes in `order` and
+    /// asks each command the test sends it of the range of the group sent with it, telling the
+    /// test its answer and what its asks came to.
+    pub fn asking(&mut self, id: u64, order: &[u64]) -> Sender<(u128, Entry)> {
+        let mut settings = self.pki.client_settings(id, self.seed, self.settings);
+        settings
+            .nodes
+            .sort_by_key(|peer| order.iter().position(|o| *o == peer.id));
+        let bound = self.bound_quic();
+        let (asks, mut taking) = channel::<(u128, Entry)>(1).unwrap();
+        let tell = self.tell.clone();
+        let shard = self.client_shards[&id];
+        self.rt
+            .spawn_on(shard, async move {
+                let mut client = match Client::open(settings).await {
+                    Ok(client) => client,
+                    Err(error) => {
+                        let _ = tell.send(Report::Failed(id, error.to_string()));
+                        return;
+                    }
+                };
+                for (node, quic) in bound {
+                    client.learn(node, quic).unwrap();
+                }
+                while let Ok((group, entry)) = taking.recv().await {
+                    let answered = client
+                        .command(group, &entry, u64::MAX)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tell.send(Report::Asked(answered, client.asks()));
+                }
+            })
+            .unwrap();
+        asks
+    }
+
+    /// Has the client `asking` ask `entry` of `group`'s range: its answer and what its asks came to.
+    pub fn ask(
+        &mut self,
+        asking: &Sender<(u128, Entry)>,
+        group: u128,
+        entry: Entry,
+    ) -> (Result<Vec<Answer>, String>, Asks) {
+        asking
+            .try_send((group, entry))
+            .map_err(|_| "the client's asks are full")
+            .unwrap();
+        self.until("the client's answer", |c| c.asked.take())
     }
 
     fn bound_quic(&self) -> Vec<(u64, SocketAddr)> {

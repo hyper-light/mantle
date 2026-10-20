@@ -751,7 +751,20 @@ Windows runners) was never dialed again (`crates/node/tests/cluster.rs` holds a 
 A node states how long a link to a peer it dials may go without moving should that peer fall
 silent, which it cannot tell from slow (`Status::reconnect`): its connection's idle timeout and
 the peer's backoff. A peer learned at a new address has its old connection closed at once, since
-the transport dials no peer it holds a connection to.
+the transport dials no peer it holds a connection to. A node that answers a request without its
+body (with the leader it knows, or a status) first reads the body to its end, keeping none of it:
+ending an exchange whose request half is unread resets that half, and the asker's transport
+refuses the whole exchange on the reset, the answer it carried with it. RFC 9114 §4.1 lets a
+server answer early only because its client must keep a complete response, which
+hyper-transport's asker does not yet do. On the Windows runners, where a request's head often
+arrives in a datagram of its own, that turned 1,330 and 1,634 redirects into lost exchanges in
+three rounds of two process tests (one run per Windows target), and 4 and 7 once the body was
+read first. A client cuts an exchange that has not been answered within its
+period, and each cut doubles the next period with that node until that node replies (RFC 6298
+§5.5, collapsed only by a new measurement of the same path, §5). A registration, which would
+register again if asked again (the Raft dissertation §6.3), is cut by no period. On the Windows
+runners, registrations cut and asked again filled a range's 64 sessions (`SessionsFull`).
+`crates/node/tests/sim.rs` holds both laws.
 Still to build: the TCP fallback below, an ALPN of mantle's own in place of the transport's, chunk
 transfers (§5.2) and SWIM (§3.5).
 
@@ -1733,8 +1746,11 @@ continent, or across the planet. Half way through the clients' operations, the l
 follower is cut off, loses power (its device keeping what it flushed, as the seed draws), or has
 its device fail a write, which stops it as its process would. On some seeds every path also
 loses 2% of its datagrams meanwhile. The WGL checker judges each key's history, and every node
-must apply as far as the others. Still to build: many ranges per node, the clients in their
-millions, and the faults and loads listed above.
+must apply as far as the others. Two further tests hold laws the Windows runners exposed (§3):
+a registration slower than every exchange its client measured is applied once, and a request
+answered without its body is still answered when its body arrives after its head. Still to
+build: many ranges per node, the clients in their millions, and the faults and loads listed
+above.
 
 ### 9.2 Real processes
 

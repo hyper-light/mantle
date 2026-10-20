@@ -569,8 +569,31 @@ fn corrupt(why: Malformed) -> Error {
     }
 }
 
+std::thread_local! {
+    /// Whether this thread's owner stated that it may wait on the device although it runs a
+    /// hyper-rt shard ([`permit_blocking`]).
+    static BLOCKING_PERMITTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// States that the shard this thread runs may wait on the device: a node's metadata shard, whose
+/// replicas apply through the synchronous engine and which runs nothing a wait would hold up
+/// (docs/design/node.md §1.2). Its engine takes the synchronous paths a thread with no shard
+/// takes: the store reads and writes at once, with no issuer, and its maintenance workers are
+/// waited on. Elsewhere a synchronous wait on a shard is refused, since it holds up every task the
+/// shard runs, and an engine there takes its runtime paths: paced I/O through its issuer, and
+/// workers prepared before the shard runs it.
+pub fn permit_blocking() {
+    BLOCKING_PERMITTED.with(|permitted| permitted.set(true));
+}
+
+/// Whether this thread's owner stated that its shard may wait on the device ([`permit_blocking`]).
+/// Each check that reads it reads it last, so a runtime's own paths never do.
+pub(crate) fn blocking_permitted() -> bool {
+    BLOCKING_PERMITTED.with(|permitted| permitted.get())
+}
+
 pub(crate) fn blocking_allowed(what: &'static str) -> Result<(), Error> {
-    if hyper_rt::registry::current_shard().is_some() {
+    if hyper_rt::registry::current_shard().is_some() && !blocking_permitted() {
         Err(Error::InvalidArgument { what })
     } else {
         Ok(())
@@ -3618,7 +3641,10 @@ impl<F: BlockFile> Store<F> {
     /// once it has landed, rather than hold the put that paces it behind the device. A scan's
     /// span, or a store with no issuer, always reads at once.
     pub fn ready(&mut self, span: &mut Span, address: u64) -> Result<bool, Error> {
-        if hyper_rt::futures::current_task().is_some() {
+        // A store with no issuer on a shard that may wait reads at once, as one off a shard does.
+        if hyper_rt::futures::current_task().is_some()
+            && (self.writer.is_some() || !blocking_permitted())
+        {
             self.async_writer()?;
             self.reap()?;
             if span.floor <= 1 {
@@ -4674,7 +4700,7 @@ impl<F: BlockFile> Store<F> {
                 error: Self::original_missing(),
             };
         }
-        if hyper_rt::registry::current_shard().is_some() {
+        if hyper_rt::registry::current_shard().is_some() && !blocking_permitted() {
             return IntoFile::Refused {
                 owner: self,
                 error: Error::InvalidArgument {

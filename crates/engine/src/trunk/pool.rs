@@ -1071,7 +1071,10 @@ impl Pool {
     ) -> Result<Result<Ticket, Box<Job>>, (Error, Box<Job>)> {
         // As [`Self::send`] admits: a runtime's pool hands out nothing before its preparation,
         // and nothing is taken from the workers or answered first.
-        if hyper_rt::registry::current_shard().is_some() && !self.prepared() {
+        if hyper_rt::registry::current_shard().is_some()
+            && !self.prepared()
+            && !crate::store::blocking_permitted()
+        {
             return Err((
                 Error::InvalidArgument {
                     what: "runtime worker admission before preparation",
@@ -1150,7 +1153,10 @@ impl Pool {
         owner: Owner,
         waiting: bool,
     ) -> Result<Result<Ticket, Box<Job>>, (Error, Box<Job>)> {
-        if hyper_rt::registry::current_shard().is_some() && !self.prepared() {
+        if hyper_rt::registry::current_shard().is_some()
+            && !self.prepared()
+            && !crate::store::blocking_permitted()
+        {
             return Err((
                 Error::InvalidArgument {
                     what: "runtime worker admission before preparation",
@@ -1209,7 +1215,7 @@ impl Pool {
     }
 
     fn start(&mut self, prepare: bool) -> Result<usize, Error> {
-        if hyper_rt::registry::current_shard().is_some() {
+        if hyper_rt::registry::current_shard().is_some() && !crate::store::blocking_permitted() {
             return Err(Error::InvalidArgument {
                 what: "maintenance worker startup inside a runtime task",
             });
@@ -1581,7 +1587,8 @@ impl Drop for Pool {
 /// Borrowed blocking APIs refuse before consuming a ready receipt or buffer. Runtime
 /// callers keep the same job and await its existing receiver through the paced owner.
 fn blocking_wait_allowed(wait: bool) -> Result<(), Error> {
-    if wait && hyper_rt::registry::current_shard().is_some() {
+    if wait && hyper_rt::registry::current_shard().is_some() && !crate::store::blocking_permitted()
+    {
         Err(Error::InvalidArgument {
             what: "a synchronous maintenance worker wait inside a runtime task",
         })

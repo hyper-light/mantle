@@ -225,11 +225,11 @@ impl Cell {
 
     fn serve_get(&mut self, request: get::Request) -> Result<get::Answer, Error> {
         Ok(match request {
-            get::Request::Header { file } => get::Answer::Header(file::header(&self.files, file)?),
+            get::Request::Header { file } => get::Answer::Header(file::header(&mut self.files, file)?),
             get::Request::Extents { file, offset, max } => {
-                get::Answer::Extents(file::extents(&self.files, file, offset, max)?)
+                get::Answer::Extents(file::extents(&mut self.files, file, offset, max)?)
             }
-            get::Request::Block { block } => get::Answer::Block(block::read(&self.blocks, block)?),
+            get::Request::Block { block } => get::Answer::Block(block::read(&mut self.blocks, block)?),
             get::Request::Chunk {
                 volume,
                 key,

@@ -161,13 +161,13 @@ impl Cell {
         *self.gets.entry(kind).or_default() += 1;
         match request {
             get::Request::Header { file } => {
-                get::Answer::Header(file::header(&self.files, file).unwrap())
+                get::Answer::Header(file::header(&mut self.files, file).unwrap())
             }
             get::Request::Extents { file, offset, max } => {
-                get::Answer::Extents(file::extents(&self.files, file, offset, max).unwrap())
+                get::Answer::Extents(file::extents(&mut self.files, file, offset, max).unwrap())
             }
             get::Request::Block { block } => {
-                get::Answer::Block(block::read(&self.blocks, block).unwrap())
+                get::Answer::Block(block::read(&mut self.blocks, block).unwrap())
             }
             get::Request::Chunk {
                 volume,
@@ -223,11 +223,11 @@ impl Cell {
         request: complete::Request,
     ) -> complete::Answer {
         match request {
-            complete::Request::Upload => {
-                complete::Answer::Upload(name::upload(&self.names, BUCKET, key, upload).unwrap())
-            }
+            complete::Request::Upload => complete::Answer::Upload(
+                name::upload(&mut self.names, BUCKET, key, upload).unwrap(),
+            ),
             complete::Request::Parts { after, max } => complete::Answer::Parts(
-                name::parts(&self.names, BUCKET, key, upload, after, max).unwrap(),
+                name::parts(&mut self.names, BUCKET, key, upload, after, max).unwrap(),
             ),
             complete::Request::File(c) => complete::Answer::File(self.file(c)),
             complete::Request::Name(c) => complete::Answer::Name(self.name(*c)),
@@ -235,8 +235,8 @@ impl Cell {
     }
 
     /// The plaintext of `file`, read from its rows and chunks and opened under its key.
-    fn read_file(&self, f: u128, size: u64, wrapping: &WrappingKey) -> Vec<u8> {
-        let header = file::header(&self.files, f).unwrap().unwrap();
+    fn read_file(&mut self, f: u128, size: u64, wrapping: &WrappingKey) -> Vec<u8> {
+        let header = file::header(&mut self.files, f).unwrap().unwrap();
         let wrapped = header.key.unwrap();
         let data = DataKey::unwrap(&wrapped.bytes, wrapping).unwrap();
         let segments = Segments::new(&data, f).unwrap();
@@ -255,13 +255,13 @@ impl Cell {
 
     /// The bytes `file` stores, its segments as sealed, read from its rows and chunks: each
     /// block rebuilt from its data chunks alone and checked against its CRC-32C.
-    fn read_sealed(&self, f: u128, size: u64) -> Vec<u8> {
+    fn read_sealed(&mut self, f: u128, size: u64) -> Vec<u8> {
         let mut sealed = Vec::new();
-        for (_, extent) in file::extents(&self.files, f, 0, 10_000).unwrap() {
+        for (_, extent) in file::extents(&mut self.files, f, 0, 10_000).unwrap() {
             let Target::Block(b) = extent.target else {
                 panic!("a PUT's file names blocks");
             };
-            let (h, places) = block::read(&self.blocks, b).unwrap().unwrap();
+            let (h, places) = block::read(&mut self.blocks, b).unwrap().unwrap();
             let chunk = |i: usize| -> &[u8] { &self.volumes[&places[i].volume][&places[i].key] };
             let bytes = if h.data == 1 {
                 chunk(0).to_vec()
@@ -288,8 +288,11 @@ impl Cell {
     }
 
     /// The current version of `key`.
-    fn current(&self, key: &str) -> Version {
-        name::current(&self.names, BUCKET, key).unwrap().unwrap().1
+    fn current(&mut self, key: &str) -> Version {
+        name::current(&mut self.names, BUCKET, key)
+            .unwrap()
+            .unwrap()
+            .1
     }
 }
 
@@ -662,7 +665,7 @@ fn an_object_is_written_bottom_up_and_committed() {
         Some(Algorithm::Crc64Nvme)
     );
     assert_eq!(kept.value, sent.bytes);
-    assert_eq!(file::extents(&cell.files, 77, 0, 100).unwrap().len(), 3);
+    assert_eq!(file::extents(&mut cell.files, 77, 0, 100).unwrap().len(), 3);
     assert!(cell.read_file(77, len as u64, &wrapping) == bytes);
 }
 
@@ -780,9 +783,9 @@ fn a_coded_object_is_rebuilt_from_its_data_chunks() {
     )
     .unwrap();
     assert!(cell.read_file(5, 1_000_000, &wrapping) == bytes);
-    let (_, e) = file::extents(&cell.files, 5, 0, 10).unwrap()[0];
+    let (_, e) = file::extents(&mut cell.files, 5, 0, 10).unwrap()[0];
     let Target::Block(b) = e.target else { panic!() };
-    let (h, places) = block::read(&cell.blocks, b).unwrap().unwrap();
+    let (h, places) = block::read(&mut cell.blocks, b).unwrap().unwrap();
     assert_eq!((h.data, h.parity, places.len()), (2, 1, 3));
     let code = Code::new(2, 1).unwrap();
     let chunk = |i: usize| -> &[u8] { &cell.volumes[&places[i].volume][&places[i].key] };
@@ -827,8 +830,12 @@ fn a_refused_chunk_goes_to_another_volume() {
         |_, _| {},
     );
     assert!(matches!(failed, Err(PutError::Unplaced(_))), "{failed:?}");
-    assert!(name::current(&cell.names, BUCKET, "j").unwrap().is_none());
-    assert!(file::header(&cell.files, 10).unwrap().is_none());
+    assert!(
+        name::current(&mut cell.names, BUCKET, "j")
+            .unwrap()
+            .is_none()
+    );
+    assert!(file::header(&mut cell.files, 10).unwrap().is_none());
 }
 
 /// A body that streams in over many handovers keeps its blocks: the PUT renews each block it
@@ -891,7 +898,7 @@ fn a_released_block_fails_the_put() {
             if let Request::Block(block::Command::Renew { block, .. }) = r
                 && released.is_none()
             {
-                let origin = block::origin(&cell.blocks, *block).unwrap().unwrap();
+                let origin = block::origin(&mut cell.blocks, *block).unwrap().unwrap();
                 let release = block::Command::Release {
                     block: *block,
                     deadline_ns: origin.deadline_ns,
@@ -902,7 +909,7 @@ fn a_released_block_fails_the_put() {
         },
     );
     assert_eq!(failed, Err(PutError::Released(released.unwrap())));
-    assert!(file::header(&cell.files, 12).unwrap().is_none());
+    assert!(file::header(&mut cell.files, 12).unwrap().is_none());
 }
 
 /// An empty object is its version alone, with no file; an empty part has a file holding one
@@ -940,7 +947,7 @@ fn an_empty_object_has_no_file_and_an_empty_part_has_one() {
     )
     .unwrap();
     assert_eq!(stored.version, None);
-    let parts = name::parts(&cell.names, BUCKET, "m", &upload, 0, 10).unwrap();
+    let parts = name::parts(&mut cell.names, BUCKET, "m", &upload, 0, 10).unwrap();
     assert_eq!(parts.len(), 1);
     assert_eq!((parts[0].1.file, parts[0].1.size), (21, 0));
     assert!(cell.read_file(21, 0, &wrapping).is_empty());
@@ -996,7 +1003,9 @@ fn an_empty_object_sent_again_makes_one_version() {
             version: stored.version.clone().unwrap()
         }
     );
-    let (order, _) = name::current(&cell.names, BUCKET, "e").unwrap().unwrap();
+    let (order, _) = name::current(&mut cell.names, BUCKET, "e")
+        .unwrap()
+        .unwrap();
     assert_eq!(
         Some(mantle_meta::key::version_id(order)),
         stored.version,
@@ -1040,7 +1049,11 @@ fn the_body_is_held_to_its_length_and_digests() {
     let mut put = new_put(&cell, object("k"), 1_000, layout, keys(33, &wrapping));
     let failed = run(&mut cell, &mut put, &bytes, &FAST, &bad, |_, _| {});
     assert_eq!(failed, Err(PutError::BadChecksum));
-    assert!(name::current(&cell.names, BUCKET, "k").unwrap().is_none());
+    assert!(
+        name::current(&mut cell.names, BUCKET, "k")
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// A PUT holds at most two blocks: the body waits while one block is being written and the
@@ -1118,7 +1131,7 @@ proptest! {
             Err(e) => {
                 prop_assert!(matches!(e, PutError::Unplaced(_)), "{:?}", e);
                 prop_assert!(usable < scheme.width());
-                prop_assert!(name::current(&cell.names, BUCKET, "k").unwrap().is_none());
+                prop_assert!(name::current(&mut cell.names, BUCKET, "k").unwrap().is_none());
             }
         }
     }
@@ -1157,7 +1170,7 @@ proptest! {
                     "{:?}",
                     e
                 );
-                prop_assert!(name::current(&cell.names, BUCKET, "k").unwrap().is_none());
+                prop_assert!(name::current(&mut cell.names, BUCKET, "k").unwrap().is_none());
             }
         }
     }
@@ -1229,9 +1242,9 @@ fn a_chunk_that_cannot_be_read_is_read_elsewhere() {
     for scheme in [Scheme::Copies(3), Scheme::Rs(Code::new(2, 1).unwrap())] {
         let bytes = body(len, 9);
         let (mut cell, wrapping) = stored(scheme, &bytes, 80, 3);
-        let (_, e) = file::extents(&cell.files, 80, 0, 1).unwrap()[0];
+        let (_, e) = file::extents(&mut cell.files, 80, 0, 1).unwrap()[0];
         let Target::Block(b) = e.target else { panic!() };
-        let (_, places) = block::read(&cell.blocks, b).unwrap().unwrap();
+        let (_, places) = block::read(&mut cell.blocks, b).unwrap().unwrap();
         cell.unreadable.insert(places[0].volume);
         let got = read(
             &mut cell,
@@ -1262,9 +1275,9 @@ fn bytes_that_are_not_the_blocks_fail_the_get() {
     let len = 300_000usize;
     let bytes = body(len, 11);
     let (mut cell, wrapping) = stored(Scheme::Rs(Code::new(2, 1).unwrap()), &bytes, 90, 3);
-    let (_, e) = file::extents(&cell.files, 90, 0, 1).unwrap()[0];
+    let (_, e) = file::extents(&mut cell.files, 90, 0, 1).unwrap()[0];
     let Target::Block(b) = e.target else { panic!() };
-    let (_, places) = block::read(&cell.blocks, b).unwrap().unwrap();
+    let (_, places) = block::read(&mut cell.blocks, b).unwrap().unwrap();
     // The second data chunk's first byte, as its volume keeps it, flipped.
     let tamper = |cell: &mut Cell| {
         let chunk = cell.volumes.get_mut(&places[1].volume).unwrap();
@@ -1703,7 +1716,7 @@ fn a_completion_is_held_to_its_parts() {
     // Parts 1 and 3, part 2 left out, and the empty part 4 last.
     let done = complete_upload(&mut cell, "k", &upload, listed(&[1, 3, 4]), 703).unwrap();
     assert_eq!(done.size, 10 << 20);
-    let extents = file::extents(&cell.files, 703, 0, 10).unwrap();
+    let extents = file::extents(&mut cell.files, 703, 0, 10).unwrap();
     assert_eq!(extents.len(), 2);
     let whole: Vec<u8> = [bodies[0].clone(), bodies[2].clone()].concat();
     let got = read(

@@ -448,6 +448,11 @@ impl<L: LogStore, E: Engine> Replica<L, E> {
         self.shell.machine().engine()
     }
 
+    /// The engine for a read, which takes it whole: an engine's read moves its cache.
+    pub fn engine_mut(&mut self) -> &mut E {
+        self.shell.machine_mut().engine_mut()
+    }
+
     /// Takes back the engine, as a crash does with the process that held it.
     pub fn into_engine(self) -> E {
         self.shell.into_machine().into_engine()

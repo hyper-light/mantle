@@ -8,7 +8,7 @@ use std::ops::Bound;
 use crate::engine::{EngineError, Row, Rows, Write};
 
 pub struct Overlay<'a, R> {
-    rows: &'a R,
+    rows: &'a mut R,
     /// Each key the entry wrote since it last cleared the key's range: its value, or `None`
     /// where it deleted the key.
     writes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
@@ -17,7 +17,7 @@ pub struct Overlay<'a, R> {
 }
 
 impl<'a, R: Rows> Overlay<'a, R> {
-    pub fn new(rows: &'a R) -> Self {
+    pub fn new(rows: &'a mut R) -> Self {
         Self {
             rows,
             writes: BTreeMap::new(),
@@ -51,7 +51,7 @@ impl<'a, R: Rows> Overlay<'a, R> {
 }
 
 impl<R: Rows> Rows for Overlay<'_, R> {
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
+    fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
         match self.writes.get(key) {
             Some(value) => Ok(value.clone()),
             None if self.cleared_past(key).is_some() => Ok(None),
@@ -59,7 +59,7 @@ impl<R: Rows> Rows for Overlay<'_, R> {
         }
     }
 
-    fn next(&self, from: &[u8], to: &[u8]) -> Result<Option<Row>, EngineError> {
+    fn next(&mut self, from: &[u8], to: &[u8]) -> Result<Option<Row>, EngineError> {
         if from >= to {
             return Ok(None);
         }
@@ -147,7 +147,7 @@ mod tests {
             let mut engine = Model::default();
             engine.apply(1, &before).unwrap();
             let mut expected = engine.clone();
-            let mut overlay = Overlay::new(&engine);
+            let mut overlay = Overlay::new(&mut engine);
             for (i, writes) in entry.iter().enumerate() {
                 overlay.apply(2, writes).unwrap();
                 expected.apply(2 + i as u64, writes).unwrap();
@@ -158,7 +158,7 @@ mod tests {
             }
             let writes = overlay.into_writes();
             engine.apply(2, &writes).unwrap();
-            let all = |m: &Model| {
+            let all = |m: &mut Model| {
                 let mut rows = Vec::new();
                 let mut at = Vec::new();
                 while let Some((k, v)) = m.next(&at, &[0xFF]).unwrap() {
@@ -168,7 +168,7 @@ mod tests {
                 }
                 rows
             };
-            prop_assert_eq!(all(&engine), all(&expected));
+            prop_assert_eq!(all(&mut engine), all(&mut expected));
         }
     }
 }

@@ -1012,16 +1012,16 @@ impl World {
             };
             let Some(r) = self
                 .nodes
-                .iter()
+                .iter_mut()
                 .find(|n| n.id == node)
-                .and_then(|n| n.replica.as_ref())
+                .and_then(|n| n.replica.as_mut())
             else {
                 continue;
             };
             if r.applied() < index {
                 continue;
             }
-            let seen = name::current(r.engine(), "b", &key)
+            let seen = name::current(r.engine_mut(), "b", &key)
                 .unwrap()
                 .map(|(_, v)| v.etag);
             self.history.push(Seen {
@@ -1343,7 +1343,7 @@ fn open_gate() -> Command {
 
 /// Every row of an engine: every one is its range's, the configuration and the term of the last
 /// entry applied among them, which every member applying the same entries writes alike.
-fn rows(m: &Model) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn rows(m: &mut Model) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut out = Vec::new();
     let mut at = Vec::new();
     while let Some((k, v)) = m.next(&at, &[0xFF]).unwrap() {
@@ -1355,7 +1355,7 @@ fn rows(m: &Model) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 /// The ETags of every version of `key`, newest first.
-fn versions(m: &Model, key: &str) -> Vec<String> {
+fn versions(m: &mut Model, key: &str) -> Vec<String> {
     let mut out = Vec::new();
     let from = mantle_meta::key::name("b", key, &mantle_meta::key::NameRow::Version(0));
     let to = mantle_meta::key::name("b", key, &mantle_meta::key::NameRow::Upload(Vec::new()));
@@ -1383,13 +1383,17 @@ fn run(seed: u64, members: u64) -> Ran {
         }
         w.step();
     }
-    let engines: Vec<&Model> = w
+    let mut engines: Vec<&mut Model> = w
         .nodes
-        .iter()
-        .map(|n| n.replica.as_ref().unwrap().engine())
+        .iter_mut()
+        .map(|n| n.replica.as_mut().unwrap().engine_mut())
         .collect();
     let first = rows(engines[0]);
-    if engines[1..].iter().any(|e| rows(e) != first) {
+    let differ = engines[1..].iter_mut().any(|e| rows(e) != first);
+    // The rows of each key's versions on the first member, read while the members are held.
+    let held: Vec<Vec<String>> = w.put.keys().map(|key| versions(engines[0], key)).collect();
+    drop(engines);
+    if differ {
         w.fail("members hold different rows");
     }
     // Every member marked by damage was repaired from its peers.
@@ -1404,8 +1408,7 @@ fn run(seed: u64, members: u64) -> Ran {
     {
         w.fail("the members' configurations are not the live members");
     }
-    for (key, values) in &w.put {
-        let held = versions(engines[0], key);
+    for ((key, values), held) in w.put.iter().zip(&held) {
         for value in values {
             let copies = held.iter().filter(|v| *v == value).count();
             if copies != 1 {

@@ -28,7 +28,7 @@ pub fn apply_entry<R: Rows>(
     rules: &Rules,
 ) -> Result<Vec<Answer>, MetaError> {
     let (answers, writes) = {
-        let mut overlay = Overlay::new(&*rows);
+        let mut overlay = Overlay::new(&mut *rows);
         session::expire(&mut overlay, index, entry.at_ns, rules)?;
         let mut touched = Touched::default();
         let mut answers = reserved(entry.commands.len())?;
@@ -46,7 +46,7 @@ pub fn apply_entry<R: Rows>(
                         }
                     }
                 }
-                command => match touched.check(&overlay, c.session, c.serial)? {
+                command => match touched.check(&mut overlay, c.session, c.serial)? {
                     // A session whose serials are spent is done: the gateway registers anew.
                     Check::Unknown | Check::Spent => Answer::SessionExpired,
                     Check::Repeated => Answer::Repeated,
@@ -210,7 +210,7 @@ mod tests {
                 version: version.clone()
             })]
         );
-        let current = crate::name::current(&m, "b", "k").unwrap().unwrap();
+        let current = crate::name::current(&mut m, "b", "k").unwrap().unwrap();
         assert_eq!(current.1.etag, "a");
         // Wrong layer, unknown session, and a serial the gateway already acknowledged.
         let block = Command::Block(crate::block::Command::Delete { block: 1 });
@@ -282,7 +282,7 @@ mod tests {
             run(&mut m, 5, entry(50, vec![last("a")])),
             [Answer::SessionExpired]
         );
-        assert!(crate::name::current(&m, "b", "k").unwrap().is_none());
+        assert!(crate::name::current(&mut m, "b", "k").unwrap().is_none());
     }
 
     /// Answers are forgotten only once the gateway has acknowledged them. A session whose
@@ -303,7 +303,7 @@ mod tests {
             unanswered,
             command: put(&format!("k{serial}"), "e", false),
         };
-        let applied = |m: &Model, serial: u64| {
+        let applied = |m: &mut Model, serial: u64| {
             crate::name::current(m, "b", &format!("k{serial}"))
                 .unwrap()
                 .is_some()
@@ -332,12 +332,12 @@ mod tests {
             }
             for (answer, serial) in answers.iter().zip([4, 2, 3]) {
                 match answer {
-                    Answer::Name(Outcome::Put { .. }) => assert!(applied(&m, serial)),
-                    Answer::SessionExpired => assert!(!applied(&m, serial)),
+                    Answer::Name(Outcome::Put { .. }) => assert!(applied(&mut m, serial)),
+                    Answer::SessionExpired => assert!(!applied(&mut m, serial)),
                     other => panic!("serial {serial} answered {other:?}"),
                 }
             }
-            assert_eq!(applied(&m, 3), kept, "{answers:?}");
+            assert_eq!(applied(&mut m, 3), kept, "{answers:?}");
             // A retry is answered from what was kept, or refused once the session expired.
             let retries = run(&mut m, 6, [4, 2, 3].map(|s| sessioned(put(s, 2))).to_vec());
             if kept {
@@ -394,7 +394,7 @@ mod tests {
     }
 
     /// Every row of a model engine, in key order.
-    fn all(m: &Model) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fn all(m: &mut Model) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut rows = Vec::new();
         let mut at = Vec::new();
         while let Some((k, v)) = m.next(&at, &[0xFF]).unwrap() {
@@ -426,13 +426,13 @@ mod tests {
             k.extend_from_slice(&session.to_be_bytes());
             k
         };
-        let read = |rows: &Overlay<'_, Model>, session: u64| {
+        let read = |rows: &mut Overlay<'_, Model>, session: u64| {
             rows.get(&key(session))
                 .unwrap()
                 .map(|b| Session::decode(&b).unwrap())
         };
         let (answers, writes) = {
-            let mut overlay = Overlay::new(&*rows);
+            let mut overlay = Overlay::new(&mut *rows);
             session::expire(&mut overlay, index, entry.at_ns, rules).unwrap();
             let mut answers = Vec::new();
             for (position, c) in entry.commands.iter().enumerate() {
@@ -450,7 +450,7 @@ mod tests {
                         }
                     }
                     command => {
-                        let check = match read(&overlay, c.session) {
+                        let check = match read(&mut overlay, c.session) {
                             None => Check::Unknown,
                             Some(_) if c.serial == u64::MAX => Check::Spent,
                             Some(s) if c.serial < s.low => Check::Repeated,
@@ -471,7 +471,7 @@ mod tests {
                             Check::Answered(answer) => (answer, false),
                             Check::New => (run(&mut overlay, index, command, layer).unwrap(), true),
                         };
-                        let mut s = read(&overlay, c.session).unwrap();
+                        let mut s = read(&mut overlay, c.session).unwrap();
                         let mut writes = vec![Write::Delete(expiry(s.last_ns, c.session))];
                         s.low = s.low.max(c.unanswered);
                         s.answers.retain(|(kept, _)| *kept >= s.low);
@@ -578,7 +578,7 @@ mod tests {
             let a = apply_entry(&mut held, index, &e, Layer::Name, &rules).unwrap();
             let b = apply_per_command(&mut each, index, &e, Layer::Name, &rules);
             assert_eq!(a, b, "entry {index}");
-            assert_eq!(all(&held), all(&each), "entry {index}");
+            assert_eq!(all(&mut held), all(&mut each), "entry {index}");
             for (answer, c) in a.iter().zip(&e.commands) {
                 match answer {
                     Answer::Registered { session } => {
@@ -627,6 +627,6 @@ mod tests {
                 apply_entry(&mut b, i, e, Layer::Name, &RULES).unwrap()
             );
         }
-        assert_eq!(all(&a), all(&b));
+        assert_eq!(all(&mut a), all(&mut b));
     }
 }

@@ -316,41 +316,51 @@ impl World {
         name::apply(&mut range.engine, range.index, &command).unwrap()
     }
 
-    fn lineage(&self, id: u64) -> Lineage {
-        name::lineage(&self.names[&id].engine).unwrap()
+    fn lineage(&mut self, id: u64) -> Lineage {
+        name::lineage(&mut self.names.get_mut(&id).unwrap().engine).unwrap()
     }
 
     /// The descriptor of every Name range that has not ended: what the directory holds,
     /// current here.
-    fn directory(&self) -> Vec<Descriptor> {
-        self.names
-            .keys()
-            .map(|&id| self.lineage(id))
-            .filter(|l| l.standing != Standing::Ended)
-            .map(|l| l.now)
-            .collect()
+    fn directory(&mut self) -> Vec<Descriptor> {
+        let ids: Vec<u64> = self.names.keys().copied().collect();
+        let mut out = Vec::new();
+        for id in ids {
+            let l = self.lineage(id);
+            if l.standing != Standing::Ended {
+                out.push(l.now);
+            }
+        }
+        out
     }
 
     /// The ranges that own their spans: every serving range, and every frozen one whose merge
     /// was not taken. A range that ended, or whose merge was taken, keeps rows its lower range
     /// took and now owns.
-    fn owners(&self) -> Vec<(u64, Lineage)> {
-        self.names
-            .keys()
-            .map(|&id| (id, self.lineage(id)))
-            .filter(|(_, l)| match (l.standing, &l.into) {
+    fn owners(&mut self) -> Vec<(u64, Lineage)> {
+        let ids: Vec<u64> = self.names.keys().copied().collect();
+        let mut owners = Vec::new();
+        for id in ids {
+            let l = self.lineage(id);
+            let owns = match (l.standing, &l.into) {
                 (Standing::Serving, _) => true,
                 (Standing::Frozen, Some(into)) => !self.taken.contains(&(into.id, into.generation)),
                 _ => false,
-            })
-            .collect()
+            };
+            if owns {
+                owners.push((id, l));
+            }
+        }
+        owners
     }
 
     /// The rows of every range that owns its span.
-    fn owned(&self) -> Vec<&Model> {
-        self.owners()
-            .into_iter()
-            .map(|(id, _)| &self.names[&id].engine)
+    fn owned(&mut self) -> Vec<&mut Model> {
+        let owners: BTreeSet<u64> = self.owners().into_iter().map(|(id, _)| id).collect();
+        self.names
+            .iter_mut()
+            .filter(|(id, _)| owners.contains(id))
+            .map(|(_, r)| &mut r.engine)
             .collect()
     }
 
@@ -365,11 +375,11 @@ impl World {
                 from,
                 command,
             } => {
-                let upper = self.names[&from].engine.clone();
+                let mut upper = self.names[&from].engine.clone();
                 let lower = self.names.get_mut(&range).unwrap();
                 lower.index += 1;
                 let outcome =
-                    name::merge(&mut lower.engine, lower.index, &command, &upper).unwrap();
+                    name::merge(&mut lower.engine, lower.index, &command, &mut upper).unwrap();
                 if let name::Outcome::Merged(_) = outcome {
                     self.taken.insert((range, command.generation));
                 }
@@ -403,7 +413,7 @@ impl World {
     /// Splits range `id` at `at` as its replicas would: the child starts from the rows the
     /// split names, taken from the parent as they stand, and then the parent applies the split.
     fn split(&mut self, id: u64, at: Vec<u8>) {
-        let parent = &self.names[&id].engine;
+        let parent = &mut self.names.get_mut(&id).unwrap().engine;
         let s = Split {
             generation: name::lineage(parent).unwrap().now.generation,
             at,
@@ -488,7 +498,8 @@ impl World {
             }
         }
         let route = key::route(BUCKET, key);
-        let frozen = self.names.keys().any(|&id| {
+        let ids: Vec<u64> = self.names.keys().copied().collect();
+        let frozen = ids.into_iter().any(|id| {
             let l = self.lineage(id);
             l.standing == Standing::Frozen && l.now.holds(&route)
         });
@@ -497,14 +508,14 @@ impl World {
     }
 
     /// The range that owns `key` now.
-    fn holder(&self, key: &str) -> &Model {
+    fn holder(&mut self, key: &str) -> &mut Model {
         let route = key::route(BUCKET, key);
         let (id, _) = self
             .owners()
             .into_iter()
             .find(|(_, l)| l.now.holds(&route))
             .unwrap();
-        &self.names[&id].engine
+        &mut self.names.get_mut(&id).unwrap().engine
     }
 
     fn file(&mut self, command: file::Command) -> file::Outcome {
@@ -710,7 +721,7 @@ impl World {
         match g.stage {
             Stage::Block { block, deadline_ns } => {
                 // The write takes the range's next instant.
-                let late = self.proposed().max(last_instant(&self.files)) > deadline_ns;
+                let late = self.proposed().max(last_instant(&mut self.files)) > deadline_ns;
                 let outcome = self.file(file::Command::Write {
                     file: g.file,
                     extents: vec![Extent {
@@ -800,8 +811,8 @@ impl World {
             id: 0,
             deadline_ns,
         });
-        let late =
-            mantle_meta::clock::now(self.holder(g.key), self.proposed()).unwrap() > deadline_ns;
+        let proposed = self.proposed();
+        let late = mantle_meta::clock::now(self.holder(g.key), proposed).unwrap() > deadline_ns;
         match self.send(g.key, &put) {
             None => return false,
             Some(name::Outcome::Put { .. }) => assert!(!late, "a late handover was taken"),
@@ -839,7 +850,9 @@ impl World {
     fn collect_step(&mut self) {
         let Some(c) = self.collector.as_mut() else {
             for (id, _) in self.owners() {
-                let queue = name::released(&self.names[&id].engine, u64::MAX, 1).unwrap();
+                let queue =
+                    name::released(&mut self.names.get_mut(&id).unwrap().engine, u64::MAX, 1)
+                        .unwrap();
                 if let Some(released) = queue.into_iter().next() {
                     self.collector = Some(Collecting {
                         range: id,
@@ -858,10 +871,10 @@ impl World {
         let range = c.range;
         let answer = match request {
             reclaim::Request::Extents { file, from, max } => {
-                reclaim::Answer::Extents(file::extents(&self.files, file, from, max).unwrap())
+                reclaim::Answer::Extents(file::extents(&mut self.files, file, from, max).unwrap())
             }
             reclaim::Request::Block(b) => {
-                reclaim::Answer::Block(block::read(&self.blocks, b).unwrap())
+                reclaim::Answer::Block(block::read(&mut self.blocks, b).unwrap())
             }
             reclaim::Request::Chunk(place) => {
                 self.volumes.remove(&slot(&place));
@@ -1086,8 +1099,9 @@ impl World {
     fn serve(&mut self, request: Request) -> Option<Answer> {
         Some(match request {
             Request::Due { max } => {
-                let now = mantle_meta::clock::now(&self.files, self.proposed()).unwrap();
-                Answer::Due(file::unsettled(&self.files, now, max).unwrap())
+                let proposed = self.proposed();
+                let now = mantle_meta::clock::now(&mut self.files, proposed).unwrap();
+                Answer::Due(file::unsettled(&mut self.files, now, max).unwrap())
             }
             Request::Check(files) => {
                 let mut verdicts: Vec<Option<Verdict>> = vec![None; files.len()];
@@ -1139,8 +1153,9 @@ impl World {
     fn serve_blocks(&mut self, request: BlockRequest) -> BlockAnswer {
         match request {
             BlockRequest::Due { max } => {
-                let now = mantle_meta::clock::now(&self.blocks, self.proposed()).unwrap();
-                BlockAnswer::Due(block::unsettled(&self.blocks, now, max).unwrap())
+                let proposed = self.proposed();
+                let now = mantle_meta::clock::now(&mut self.blocks, proposed).unwrap();
+                BlockAnswer::Due(block::unsettled(&mut self.blocks, now, max).unwrap())
             }
             BlockRequest::Check { file, blocks } => {
                 let check = file::Command::CheckBlocks {
@@ -1169,7 +1184,7 @@ impl World {
                     other => panic!("{other:?}"),
                 }
             }
-            BlockRequest::Block(b) => BlockAnswer::Block(block::read(&self.blocks, b).unwrap()),
+            BlockRequest::Block(b) => BlockAnswer::Block(block::read(&mut self.blocks, b).unwrap()),
             BlockRequest::Chunk(place) => {
                 self.volumes.remove(&slot(&place));
                 BlockAnswer::Chunk
@@ -1186,7 +1201,7 @@ impl World {
 
     /// Files the Name ranges hold: each a version or an upload's part references, and each
     /// part a referenced composite adopted.
-    fn referenced(&self) -> BTreeSet<u128> {
+    fn referenced(&mut self) -> BTreeSet<u128> {
         let mut out = BTreeSet::new();
         for range in self.owned() {
             let (mut from, to) = key::bucket_span(BUCKET);
@@ -1206,7 +1221,7 @@ impl World {
         }
         let composites: Vec<u128> = out.iter().copied().collect();
         for f in composites {
-            for (_, e) in file::extents(&self.files, f, 0, 16).unwrap() {
+            for (_, e) in file::extents(&mut self.files, f, 0, 16).unwrap() {
                 if let Target::File(part) = e.target {
                     out.insert(part);
                 }
@@ -1215,7 +1230,7 @@ impl World {
         out
     }
 
-    fn released(&self) -> BTreeSet<u128> {
+    fn released(&mut self) -> BTreeSet<u128> {
         self.owned()
             .into_iter()
             .flat_map(|r| name::released(r, u64::MAX, usize::MAX).unwrap())
@@ -1223,23 +1238,23 @@ impl World {
             .collect()
     }
 
-    fn unsettled(&self) -> BTreeSet<u128> {
-        file::unsettled(&self.files, u64::MAX, usize::MAX)
+    fn unsettled(&mut self) -> BTreeSet<u128> {
+        file::unsettled(&mut self.files, u64::MAX, usize::MAX)
             .unwrap()
             .into_iter()
             .map(|u| u.file)
             .collect()
     }
 
-    fn unsettled_blocks(&self) -> Vec<block::Unsettled> {
-        block::unsettled(&self.blocks, u64::MAX, usize::MAX).unwrap()
+    fn unsettled_blocks(&mut self) -> Vec<block::Unsettled> {
+        block::unsettled(&mut self.blocks, u64::MAX, usize::MAX).unwrap()
     }
 
     /// Blocks the written files name.
-    fn named(&self) -> BTreeSet<u128> {
+    fn named(&mut self) -> BTreeSet<u128> {
         self.written
             .iter()
-            .flat_map(|&f| file::extents(&self.files, f, 0, 16).unwrap())
+            .flat_map(|&f| file::extents(&mut self.files, f, 0, 16).unwrap())
             .filter_map(|(_, e)| match e.target {
                 Target::Block(b) => Some(b),
                 Target::File(_) => None,
@@ -1248,14 +1263,14 @@ impl World {
     }
 
     /// Blocks with rows in the Block range.
-    fn recorded(&self) -> BTreeSet<u128> {
+    fn recorded(&mut self) -> BTreeSet<u128> {
         (0..=self.next_id)
-            .filter(|&b| block::read(&self.blocks, b).unwrap().is_some())
+            .filter(|&b| block::read(&mut self.blocks, b).unwrap().is_some())
             .collect()
     }
 
     /// Files marked in any Name range, under whatever key.
-    fn marked(&self) -> BTreeSet<u128> {
+    fn marked(&mut self) -> BTreeSet<u128> {
         let mut out = BTreeSet::new();
         for range in self.owned() {
             let (mut from, to) = key::marks_span(BUCKET);
@@ -1268,7 +1283,7 @@ impl World {
         out
     }
 
-    fn check(&self) {
+    fn check(&mut self) {
         let (referenced, released, unsettled) =
             (self.referenced(), self.released(), self.unsettled());
         let lost: Vec<_> = referenced.intersection(&released).collect();
@@ -1276,7 +1291,7 @@ impl World {
         // A released composite's parts stay its own until the collector gives them back.
         let giving_back: BTreeSet<u128> = released
             .iter()
-            .flat_map(|&f| file::extents(&self.files, f, 0, 16).unwrap())
+            .flat_map(|&f| file::extents(&mut self.files, f, 0, 16).unwrap())
             .filter_map(|(_, e)| match e.target {
                 Target::File(part) => Some(part),
                 Target::Block(_) => None,
@@ -1297,13 +1312,13 @@ impl World {
         let chunked: BTreeSet<u128> = self.volumes.iter().map(|&(_, b, _, _)| b).collect();
         for &f in &referenced {
             assert!(
-                file::header(&self.files, f).unwrap().is_some(),
+                file::header(&mut self.files, f).unwrap().is_some(),
                 "file {f}, held, was taken apart"
             );
-            for (_, e) in file::extents(&self.files, f, 0, 16).unwrap() {
+            for (_, e) in file::extents(&mut self.files, f, 0, 16).unwrap() {
                 if let Target::Block(b) = e.target {
                     assert!(
-                        block::read(&self.blocks, b).unwrap().is_some(),
+                        block::read(&mut self.blocks, b).unwrap().is_some(),
                         "block {b} of held file {f} was taken apart"
                     );
                     assert!(
@@ -1429,7 +1444,7 @@ fn slot(p: &ChunkPlace) -> (u128, u128, u32, u16) {
 }
 
 /// The last instant a range's clock assigned: a write takes the one after it.
-fn last_instant(rows: &Model) -> u64 {
+fn last_instant(rows: &mut Model) -> u64 {
     mantle_meta::clock::now(rows, 0).unwrap() + 1
 }
 

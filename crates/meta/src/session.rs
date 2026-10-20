@@ -63,14 +63,14 @@ fn expiry_key(last_ns: u64, session: u64) -> Vec<u8> {
     k
 }
 
-fn read<R: Rows>(rows: &R, session: u64) -> Result<Option<Session>, MetaError> {
+fn read<R: Rows>(rows: &mut R, session: u64) -> Result<Option<Session>, MetaError> {
     Ok(rows
         .get(&session_key(session))?
         .map(|b| Session::decode(&b))
         .transpose()?)
 }
 
-fn count<R: Rows>(rows: &R) -> Result<u64, MetaError> {
+fn count<R: Rows>(rows: &mut R) -> Result<u64, MetaError> {
     Ok(match rows.get(COUNT)? {
         None => 0,
         Some(bytes) => record::decode_number(&bytes, "sessions")?,
@@ -106,7 +106,11 @@ pub struct Touched {
 
 impl Touched {
     /// The held state of `session`, read from `rows` at its first use; `None` if it has none.
-    fn held<R: Rows>(&mut self, rows: &R, session: u64) -> Result<Option<&mut Held>, MetaError> {
+    fn held<R: Rows>(
+        &mut self,
+        rows: &mut R,
+        session: u64,
+    ) -> Result<Option<&mut Held>, MetaError> {
         Ok(match self.held.entry(session) {
             std::collections::btree_map::Entry::Occupied(held) => Some(held.into_mut()),
             std::collections::btree_map::Entry::Vacant(place) => match read(rows, session)? {
@@ -134,7 +138,7 @@ impl Touched {
     /// refused before it takes effect, and the gateway registers a session anew (audit B03).
     pub fn check<R: Rows>(
         &mut self,
-        rows: &R,
+        rows: &mut R,
         session: u64,
         serial: u64,
     ) -> Result<Check, MetaError> {
@@ -401,7 +405,7 @@ mod tests {
         }
     }
 
-    fn check(m: &Model, session: u64, serial: u64) -> Result<Check, MetaError> {
+    fn check(m: &mut Model, session: u64, serial: u64) -> Result<Check, MetaError> {
         Touched::default().check(m, session, serial)
     }
 
@@ -415,7 +419,7 @@ mod tests {
         rules: &Rules,
     ) -> Result<(), MetaError> {
         let mut touched = Touched::default();
-        touched.check(&*m, command.session, command.serial)?;
+        touched.check(&mut *m, command.session, command.serial)?;
         touched.record(command, answer, at_ns, rules)?;
         touched.write(m, index)
     }
@@ -425,22 +429,22 @@ mod tests {
         let mut m = Model::default();
         let s = register(&mut m, 1, 3, 10, &RULES).unwrap();
         assert_eq!(s, (1 << 16) + 3);
-        assert_eq!(check(&m, s, 1).unwrap(), Check::New);
+        assert_eq!(check(&mut m, s, 1).unwrap(), Check::New);
         record(&mut m, 2, &used(s, 1, 1), Some(&answer(1)), 20, &RULES).unwrap();
-        assert_eq!(check(&m, s, 1).unwrap(), Check::Answered(answer(1)));
+        assert_eq!(check(&mut m, s, 1).unwrap(), Check::Answered(answer(1)));
         record(&mut m, 3, &used(s, 2, 1), Some(&answer(2)), 30, &RULES).unwrap();
         // The gateway received 1's answer: it is forgotten, and 1 is a repeat now.
         record(&mut m, 4, &used(s, 3, 2), Some(&answer(3)), 40, &RULES).unwrap();
-        assert_eq!(check(&m, s, 1).unwrap(), Check::Repeated);
-        assert_eq!(check(&m, s, 2).unwrap(), Check::Answered(answer(2)));
+        assert_eq!(check(&mut m, s, 1).unwrap(), Check::Repeated);
+        assert_eq!(check(&mut m, s, 2).unwrap(), Check::Answered(answer(2)));
         // Past the bound of answers kept unacknowledged, the session expires, and a retry of
         // any serial is refused rather than taken for a repeat.
         record(&mut m, 5, &used(s, 4, 2), Some(&answer(4)), 50, &RULES).unwrap();
         for serial in 1..=4 {
-            assert_eq!(check(&m, s, serial).unwrap(), Check::Unknown);
+            assert_eq!(check(&mut m, s, serial).unwrap(), Check::Unknown);
         }
-        assert_eq!(count(&m).unwrap(), 0);
-        assert_eq!(check(&m, s + 1, 1).unwrap(), Check::Unknown);
+        assert_eq!(count(&mut m).unwrap(), 0);
+        assert_eq!(check(&mut m, s + 1, 1).unwrap(), Check::Unknown);
     }
 
     /// The answers a gateway has received are forgotten wherever they lie among those kept: a
@@ -457,7 +461,7 @@ mod tests {
         record(&mut m, 3, &used(s, 3, 1), Some(&answer(3)), 30, &rules).unwrap();
         // The gateway has every answer before 4: 3's is forgotten, 5's kept.
         record(&mut m, 4, &used(s, 6, 4), Some(&answer(6)), 40, &rules).unwrap();
-        let kept: Vec<u64> = read(&m, s)
+        let kept: Vec<u64> = read(&mut m, s)
             .unwrap()
             .unwrap()
             .answers
@@ -465,8 +469,8 @@ mod tests {
             .map(|(k, _)| *k)
             .collect();
         assert_eq!(kept, [5, 6]);
-        assert_eq!(check(&m, s, 3).unwrap(), Check::Repeated);
-        assert_eq!(check(&m, s, 5).unwrap(), Check::Answered(answer(5)));
+        assert_eq!(check(&mut m, s, 3).unwrap(), Check::Repeated);
+        assert_eq!(check(&mut m, s, 5).unwrap(), Check::Answered(answer(5)));
     }
 
     /// Past the bytes of answers a session may keep unacknowledged, it expires as past the
@@ -493,13 +497,13 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(check(&m, s, 1).unwrap(), Check::Answered(answer(1)));
-        assert_eq!(check(&m, s, 3).unwrap(), Check::Answered(answer(3)));
+        assert_eq!(check(&mut m, s, 1).unwrap(), Check::Answered(answer(1)));
+        assert_eq!(check(&mut m, s, 3).unwrap(), Check::Answered(answer(3)));
         record(&mut m, 4, &used(s, 2, 1), Some(&answer(2)), 40, &rules).unwrap();
         for serial in 1..=3 {
-            assert_eq!(check(&m, s, serial).unwrap(), Check::Unknown);
+            assert_eq!(check(&mut m, s, serial).unwrap(), Check::Unknown);
         }
-        assert_eq!(count(&m).unwrap(), 0);
+        assert_eq!(count(&mut m).unwrap(), 0);
     }
 
     #[test]
@@ -518,17 +522,17 @@ mod tests {
             super::register(&mut m, 4, 0, 120, &RULES).unwrap(),
             Registration::Full { until_ns: 121 }
         );
-        assert_eq!(check(&m, b, 1).unwrap(), Check::New);
+        assert_eq!(check(&mut m, b, 1).unwrap(), Check::New);
         // At 121 b's lifetime has passed, and its place goes to a new session.
         let c = register(&mut m, 4, 0, 121, &RULES).unwrap();
-        assert_eq!(check(&m, b, 1).unwrap(), Check::Unknown);
-        assert_eq!(check(&m, a, 1).unwrap(), Check::Answered(answer(1)));
+        assert_eq!(check(&mut m, b, 1).unwrap(), Check::Unknown);
+        assert_eq!(check(&mut m, a, 1).unwrap(), Check::Answered(answer(1)));
         // An entry at 131 passes a's lifetime (30 + 100) but not c's (121 + 100).
         expire(&mut m, 5, 131, &RULES).unwrap();
-        assert_eq!(check(&m, a, 1).unwrap(), Check::Unknown);
-        assert_eq!(check(&m, c, 1).unwrap(), Check::New);
-        assert_eq!(count(&m).unwrap(), 1);
+        assert_eq!(check(&mut m, a, 1).unwrap(), Check::Unknown);
+        assert_eq!(check(&mut m, c, 1).unwrap(), Check::New);
+        assert_eq!(count(&mut m).unwrap(), 1);
         expire(&mut m, 6, 222, &RULES).unwrap();
-        assert_eq!(count(&m).unwrap(), 0);
+        assert_eq!(count(&mut m).unwrap(), 0);
     }
 }

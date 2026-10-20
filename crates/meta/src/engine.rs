@@ -36,10 +36,10 @@ pub enum EngineError {
 /// Rows as a state machine reads and writes them.
 pub trait Rows {
     /// The value of `key`.
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError>;
+    fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError>;
 
     /// The first row in `[from, to)`.
-    fn next(&self, from: &[u8], to: &[u8]) -> Result<Option<Row>, EngineError>;
+    fn next(&mut self, from: &[u8], to: &[u8]) -> Result<Option<Row>, EngineError>;
 
     /// Applies `writes` atomically as log entry `index`.
     fn apply(&mut self, index: u64, writes: &[Write]) -> Result<(), EngineError>;
@@ -58,7 +58,10 @@ pub trait Engine: Rows {
 
     /// Every row as of `applied()`: what a snapshot carries to a member that lags
     /// (docs/design/replica.md §4).
-    fn image(&self) -> Result<Vec<Row>, EngineError>;
+    fn image(&mut self) -> Result<Vec<Row>, EngineError>;
+    /// The rows `image` would give and their keys' and values' bytes, when the engine knows them
+    /// without reading its rows; `None` when it does not.
+    fn image_size(&self) -> Option<(u64, u64)>;
 
     /// Replaces every row with `rows`, as of log entry `index`: a snapshot installed. It is
     /// durable once `persist` returns.
@@ -84,11 +87,11 @@ impl Model {
 }
 
 impl Rows for Model {
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
+    fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
         Ok(self.rows.get(key).cloned())
     }
 
-    fn next(&self, from: &[u8], to: &[u8]) -> Result<Option<Row>, EngineError> {
+    fn next(&mut self, from: &[u8], to: &[u8]) -> Result<Option<Row>, EngineError> {
         if from >= to {
             return Ok(None);
         }
@@ -143,12 +146,21 @@ impl Engine for Model {
         Ok(())
     }
 
-    fn image(&self) -> Result<Vec<Row>, EngineError> {
+    fn image(&mut self) -> Result<Vec<Row>, EngineError> {
         Ok(self
             .rows
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect())
+    }
+
+    fn image_size(&self) -> Option<(u64, u64)> {
+        let bytes = self.rows.iter().try_fold(0u64, |bytes, (k, v)| {
+            bytes
+                .checked_add(u64::try_from(k.len()).ok()?)?
+                .checked_add(u64::try_from(v.len()).ok()?)
+        })?;
+        Some((u64::try_from(self.rows.len()).ok()?, bytes))
     }
 
     fn install(&mut self, index: u64, rows: Vec<Row>) -> Result<(), EngineError> {

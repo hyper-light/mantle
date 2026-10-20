@@ -288,8 +288,8 @@ fn a_group_elects_a_leader_and_applies_the_same_entries_everywhere() {
     assert_eq!(at(1).len(), 2);
     assert_eq!(at(1), at(2));
     assert_eq!(at(1), at(3));
-    for n in &nodes {
-        let current = name::current(n.replica.engine(), "b", "k")
+    for n in &mut nodes {
+        let current = name::current(n.replica.engine_mut(), "b", "k")
             .unwrap()
             .unwrap();
         assert_eq!(current.1.etag, "k");
@@ -454,7 +454,7 @@ fn a_read_asked_after_a_round_left_waits_for_the_next() {
 
 /// Every row of an engine: every one is its range's, the configuration and the term of the last
 /// entry applied among them, which every member applying the same entries writes alike.
-fn rows(m: &Model) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn rows(m: &mut Model) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut out = Vec::new();
     let mut at = Vec::new();
     while let Some((k, v)) = m.next(&at, &[0xFF]).unwrap() {
@@ -562,16 +562,13 @@ fn a_member_added_after_compaction_catches_up_and_replaces_a_lost_one() {
         voters: vec![1, 2, 4],
         ..ConfState::default()
     };
+    let first = rows(nodes[0].replica.engine_mut());
     for id in [1, 2, 4] {
-        let r = &nodes[usize::try_from(id).unwrap() - 1].replica;
+        let r = &mut nodes[usize::try_from(id).unwrap() - 1].replica;
         let mut conf = r.configuration().clone();
         conf.voters.sort_unstable();
         assert_eq!(conf, want, "member {id}");
-        assert_eq!(
-            rows(r.engine()),
-            rows(nodes[0].replica.engine()),
-            "member {id}"
-        );
+        assert_eq!(rows(r.engine_mut()), first, "member {id}");
     }
 }
 
@@ -641,8 +638,8 @@ fn a_member_whose_engine_is_ahead_of_its_logs_commit_reopens() {
     assert!(last > applied);
     assert!(nodes.iter().all(|n| n.replica.applied() == last));
     assert_eq!(
-        rows(nodes[1].replica.engine()),
-        rows(nodes[0].replica.engine())
+        rows(nodes[1].replica.engine_mut()),
+        rows(nodes[0].replica.engine_mut())
     );
 }
 
@@ -1704,16 +1701,16 @@ fn a_member_whose_group_was_damaged_at_rest_is_rebuilt_from_its_peers() {
     };
     let by_index = agreed(&answers);
     let last = *by_index.keys().max().unwrap();
-    let rows_of_leader = rows(d.nodes[leader].replica.engine());
-    for n in &d.nodes {
-        let r = &n.replica;
+    let rows_of_leader = rows(d.nodes[leader].replica.engine_mut());
+    for n in &mut d.nodes {
+        let r = &mut n.replica;
         let mut conf = r.configuration().clone();
         conf.voters.sort_unstable();
         assert_eq!(conf, want, "member {}", r.id());
         assert!(r.applied() >= last, "member {}", r.id());
-        assert_eq!(rows(r.engine()), rows_of_leader, "member {}", r.id());
+        assert_eq!(rows(r.engine_mut()), rows_of_leader, "member {}", r.id());
         for key in ["k1", "k2", "k3", "k4"] {
-            let current = name::current(r.engine(), "b", key).unwrap().unwrap();
+            let current = name::current(r.engine_mut(), "b", key).unwrap().unwrap();
             assert_eq!(current.1.etag, key, "member {}", r.id());
         }
     }
@@ -1874,14 +1871,11 @@ fn a_member_whose_engine_applied_what_its_damaged_log_lost_is_repaired_in_place(
     assert!(acknowledged > 0);
     let last = d.nodes[0].replica.applied();
     agreed(&answers);
-    for n in &d.nodes {
+    let first = rows(d.nodes[0].replica.engine_mut());
+    for n in &mut d.nodes {
         assert_eq!(n.replica.applied(), last, "member {}", n.replica.id());
-        assert_eq!(
-            rows(n.replica.engine()),
-            rows(d.nodes[0].replica.engine()),
-            "member {}",
-            n.replica.id()
-        );
+        let id = n.replica.id();
+        assert_eq!(rows(n.replica.engine_mut()), first, "member {id}");
     }
     assert!(!d.nodes[1].replica.is_uncertain());
 }

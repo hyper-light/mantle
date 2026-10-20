@@ -23,7 +23,9 @@ use hyper_block::DiskError;
 use hyper_block::block::BlockFile;
 use hyper_block::buf::Alignment;
 use hyper_block::sim::SimFile;
-use hyper_log::{Class, Config, Entries, Entry, Fetched, HardState, Log, LogError, Update, Waits};
+use hyper_log::{
+    Class, Config, Entries, Entry, Fetched, HardState, Log, LogError, Page, Update, Waits,
+};
 
 use common::held;
 
@@ -137,7 +139,14 @@ fn a_waker_that_unwinds_costs_only_its_wake() {
     )
     .unwrap();
     let fetched = log
-        .fetch_waking(7, 1, 2, u64::MAX, Fetched::default(), Some(waker.clone()))
+        .fetch_waking(
+            7,
+            1,
+            2,
+            Page::payload(u64::MAX),
+            Fetched::default(),
+            Some(waker.clone()),
+        )
         .unwrap()
         .wait()
         .unwrap();

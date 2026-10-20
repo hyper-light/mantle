@@ -1,0 +1,66 @@
+[package]
+name = "hyper-quic"
+version = "0.1.0"
+description = "QUIC (RFC 9000, 9001, 9002) as a sans-io state machine: quinn-proto 0.11.18 conformed to the shared rules"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hyper-light/hyper-raft"
+rust-version = "1.98.1"
+publish = false
+
+[features]
+default = ["qlog"]
+# Fuzzing derives only; never in a shipped build.
+arbitrary = ["dep:arbitrary"]
+# qlog traces (`QlogConfig`, `QlogStream`). Optional because `qlog` turns on serde_json's
+# `preserve_order` for the whole build it is in, which changes every serde_json map's order there;
+# a consumer whose JSON relies on sorted maps builds without it (VENDORED.md §20).
+qlog = ["dep:qlog"]
+
+[dependencies]
+arbitrary = { version = "1.0.1", features = ["derive"], optional = true }
+aws-lc-rs = { version = "1.9", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+bytes = "1"
+fastbloom = { version = "0.17", default-features = false }
+lru-slab = "0.1.2"
+qlog = { version = "0.15.2", optional = true }
+rand = "0.10.1"
+rand_pcg = "0.10"
+rustc-hash = "2"
+rustls = { package = "hyper-tls", path = "../hyper-tls" }
+slab = "0.4.6"
+thiserror = "2.0.3"
+tinyvec = { version = "1.1", features = ["alloc"] }
+tracing = { version = "0.1.10", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+assert_matches = "1.1"
+hex-literal = "1"
+hyper-measure = { path = "../hyper-measure" }
+# Tests that need an Instant epoch take it from simulated time's one anchor, not the host clock
+# (docs/sim.md §3.2, §12.6).
+hyper-sim = { path = "../hyper-sim" }
+lazy_static = "1"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+tracing-subscriber = { version = "0.3.0", default-features = false, features = ["env-filter", "fmt", "ansi", "time", "local-time"] }
+# Upstream quinn-proto 0.11.18, unmodified, on rustls with AWS-LC and the token log hyper-quic always
+# builds: the other process of the interoperation test (`tests/e2e.rs`; slates'
+# docs/wip/transport-quic.md §4, stage 5). A test dependency only, never shipped.
+upstream-quinn-proto = { package = "quinn-proto", version = "=0.11.18", default-features = false, features = ["bloom", "rustls-aws-lc-rs"] }
+# The rustls upstream quinn-proto runs on, with hyper-tls's one build path, as hyper-tls's own tests
+# take it: one feature set for it whichever crates a build includes.
+upstream-rustls = { package = "rustls", version = "=0.23.45", default-features = false, features = ["aws_lc_rs", "brotli", "logging", "prefer-post-quantum", "std", "tls12", "zlib"] }
+
+[[test]]
+name = "e2e"
+# Real processes over UDP: the binary is the client and spawns itself as the server, the relay and,
+# for one scenario, the client (CLAUDE.md §1a), one peer process at a time.
+harness = false
+
+# hyper-raft's workspace declares the cfgs its interleaving and schedule tests select; the
+# snapshot keeps that declaration alone of the workspace's lints, so `cfg(loom)` is known here.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(shuttle)", "cfg(fuzzing)"] }
+
+# A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside any consumer workspace.
+[workspace]

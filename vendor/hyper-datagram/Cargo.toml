@@ -1,0 +1,19 @@
+[package]
+name = "hyper-datagram"
+description = "The sealed UDP datagram plane for consensus control and membership: AES-256-GCM under per-epoch keys from the QUIC connection's TLS exporter, an RFC 4303 replay window, one packed datagram per peer per flush"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/hyper-light/hyper-raft"
+rust-version = "1.98.1"
+publish = false
+
+[dependencies]
+aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+crc32c = "0.6"
+
+[dev-dependencies]
+hyper-measure = { path = "../hyper-measure" }
+
+# A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside any consumer workspace.
+[workspace]

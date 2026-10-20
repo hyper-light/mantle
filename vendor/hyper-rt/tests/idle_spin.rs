@@ -210,3 +210,58 @@ fn a_spin_with_a_readiness_wait_polls_the_driver_once_a_quantum() {
     );
     rt.shutdown().unwrap();
 }
+
+/// An idle shard parks without asking its driver first: the park's wait asks it, and returns at once
+/// with what is ready, so a zero-timeout ask before it is a second system call for the same answer (at
+/// 10,000 one-datagram messages a second a bus node made one of each a message, 2026-10-16). Do: hold a
+/// read wait on a socket nobody sends to, run a periodic timer task, and let a quiet stretch pass with
+/// no client activity (no spin) and a quantum longer than the test (no busy turn's ask). Expect: the
+/// shard parked at the timers' pace (non-vacuity), and the driver was asked by no idle turn.
+#[test]
+fn an_idle_shard_parks_without_asking_its_driver_first() {
+    use hyper_rt::udp::{Ipv4Addr, SocketAddr, UdpSocket};
+
+    let rt = Runtime::start(&config()).unwrap();
+    let shard = rt.shard_ids()[0];
+    let (armed, is_armed) = channel();
+    rt.spawn_on(shard, async move {
+        let idle = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let wait = idle.readable();
+        let mut wait = std::pin::pin!(wait);
+        // Polled once, the wait is registered; the task then holds it, unfired, for the test's span.
+        std::future::poll_fn(|cx| {
+            let _ = wait.as_mut().poll(cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+        armed.send(()).unwrap();
+        wait.await.unwrap();
+    })
+    .unwrap();
+    is_armed.recv_timeout(ANSWER).unwrap();
+    rt.spawn_on(shard, async {
+        loop {
+            sleep(TICK_NS).await.unwrap();
+        }
+    })
+    .unwrap();
+    let before = counters_of(&rt, shard);
+    wait(QUIET);
+    let after = counters_of(&rt, shard);
+    // A fifth of the stretch's 40 ticks: a loaded runner fires timers late, never not at all.
+    let ticks = WINDOW_NS / TICK_NS;
+    assert!(
+        after.waits - before.waits >= ticks / 5,
+        "the shard did not park at its timers' pace: {after:?}"
+    );
+    assert_eq!(
+        spins(&after),
+        spins(&before),
+        "no window, no spin: {after:?}"
+    );
+    assert_eq!(
+        after.harvests, before.harvests,
+        "an idle turn asked the driver before its park: {after:?}"
+    );
+    rt.shutdown().unwrap();
+}

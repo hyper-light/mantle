@@ -225,3 +225,20 @@ fn a_shard_tells_its_timer_tick() {
     let tick = rt.block_on(async { timer_tick_ns() }).unwrap();
     assert_eq!(tick, one_timer().timer_tick_ns);
 }
+
+/// A task reads its shard's counters as the loop keeps them (`futures::shard_counters`): the timer its
+/// sleep waited on has fired by the time it reads them, and off a shard there are none.
+#[test]
+fn a_task_reads_its_shard_s_counters() {
+    assert_eq!(hyper_rt::futures::shard_counters(), None);
+    let mut rt = LocalRuntime::new(&one_timer()).unwrap();
+    let counters = rt
+        .block_on(async {
+            sleep(SPAN_NS).await.unwrap();
+            hyper_rt::futures::shard_counters()
+        })
+        .unwrap()
+        .unwrap();
+    assert!(counters.timers_fired >= 1, "{counters:?}");
+    assert!(counters.steps >= 1, "{counters:?}");
+}

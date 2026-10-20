@@ -48,13 +48,21 @@ fn config() -> RuntimeConfig {
     }
 }
 
-/// The thread's CPU time.
+/// The thread's CPU time, as the runtime reads it: on macOS libc's clock restated at the kernel's rate,
+/// which a process Rosetta 2 translates is not shown (`hyper_rt::machine::clock::MachTicks`).
 fn thread_time() -> Duration {
     let reading = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
-    Duration::new(
+    let read = Duration::new(
         u64::try_from(reading.tv_sec).unwrap(),
         u32::try_from(reading.tv_nsec).unwrap(),
-    )
+    );
+    #[cfg(target_os = "macos")]
+    let read = Duration::from_nanos(
+        hyper_rt::machine::clock::mach_ticks()
+            .unwrap()
+            .at_kernel_rate(u64::try_from(read.as_nanos()).unwrap()),
+    );
+    read
 }
 
 /// Runs `span` on the thread's CPU clock.

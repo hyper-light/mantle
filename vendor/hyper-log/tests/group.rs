@@ -16,8 +16,8 @@
 use hyper_block::buf::Alignment;
 use hyper_block::sim::{Fault, SimFile};
 use hyper_log::{
-    Config, Entries, Entry, Fetched, GroupLog, HardState, Log, LogError, Proposal, Start, Update,
-    Waits,
+    Config, Entries, Entry, Fetched, GroupLog, HardState, Log, LogError, Page, Proposal, Start,
+    Update, Waits,
 };
 use proptest::prelude::*;
 
@@ -135,7 +135,8 @@ fn update(s: Step, start: Start, last: u64, term: &mut u64) -> Update {
 }
 
 /// Every read the handle answers equals the log's own answer to it: the view, the bounds, the
-/// term of every index around the group's, and fetches of every range, by every byte bound.
+/// term of every index around the group's, and fetches of every range, by every byte bound, with
+/// each entry counted at its payload alone and at its payload and more.
 fn same_reads(log: &Log<SimFile>, h: &GroupLog<SimFile>, g: u128) -> Result<(), TestCaseError> {
     let view = log.view(g).unwrap();
     prop_assert_eq!(&h.view().unwrap(), &view);
@@ -151,16 +152,24 @@ fn same_reads(log: &Log<SimFile>, h: &GroupLog<SimFile>, g: u128) -> Result<(), 
     }
     for lo in low..=last + 1 {
         for hi in [lo, lo + 1, last + 1, last + 2] {
-            for max in [0, 600, u64::MAX] {
-                let ours = h.fetch(lo, hi, max, Fetched::new());
-                let theirs = log.fetch(g, lo, hi, max, Fetched::new());
+            for page in [
+                Page::payload(0),
+                Page::payload(600),
+                Page {
+                    max_bytes: 600,
+                    per_entry: 25,
+                },
+                Page::payload(u64::MAX),
+            ] {
+                let ours = h.fetch(lo, hi, page, Fetched::new());
+                let theirs = log.fetch(g, lo, hi, page, Fetched::new());
                 prop_assert_eq!(
                     ours.map_err(|e| e.to_string()),
                     theirs.map_err(|e| e.to_string()),
-                    "fetch [{}, {}) by {}",
+                    "fetch [{}, {}) by {:?}",
                     lo,
                     hi,
-                    max
+                    page
                 );
             }
         }
@@ -296,11 +305,15 @@ fn a_handle_asks_the_log_only_for_what_it_lacks() {
     }
     h.bounds().unwrap();
     h.view().unwrap();
-    let recent = h.fetch(3, 6, u64::MAX, Fetched::new()).unwrap();
+    let recent = h
+        .fetch(3, 6, Page::payload(u64::MAX), Fetched::new())
+        .unwrap();
     assert_eq!(recent.len(), 3);
     assert_eq!(h.asked(), 0, "the handle asked for what it held");
     // Older than the cache: from the file, through the log.
-    let old = h.fetch(1, 6, u64::MAX, Fetched::new()).unwrap();
+    let old = h
+        .fetch(1, 6, Page::payload(u64::MAX), Fetched::new())
+        .unwrap();
     assert_eq!(old.len(), 5);
     assert_eq!(h.asked(), 1);
     // Its own writes' entries come back to it: the newest three are its own.
@@ -309,12 +322,82 @@ fn a_handle_asks_the_log_only_for_what_it_lacks() {
         ..Update::default()
     })
     .unwrap();
-    let mine = h.fetch(6, 9, u64::MAX, Fetched::new()).unwrap();
+    let mine = h
+        .fetch(6, 9, Page::payload(u64::MAX), Fetched::new())
+        .unwrap();
     assert_eq!(
         mine.get(2).unwrap().1,
         entries(8, 1, 1, 100).entries[0].bytes
     );
     assert_eq!(h.asked(), 1);
+}
+
+/// How many entries of payloads `lens` a page takes: those whose running total fits its bytes,
+/// each counted at its payload and the page's `per_entry`, and the first whatever its count.
+fn page_of(lens: &[u64], page: Page) -> usize {
+    let mut total = 0u64;
+    let mut taken = 0;
+    for &len in lens {
+        total += len + page.per_entry;
+        if taken > 0 && total > page.max_bytes {
+            break;
+        }
+        taken += 1;
+    }
+    taken
+}
+
+/// A fetch counts each entry at its payload and the page's `per_entry` more, so a caller that
+/// bounds its pages by its own encoding of an entry, larger than the payload by a fixed part, is
+/// given the page that bound admits, chosen before anything is copied (hyper-durable's store: what
+/// an entry takes in a Raft message, mantle 2026-10-19). Held at every bound a page turns at, from
+/// the handle's memory and from the log's file alike.
+#[test]
+fn a_fetch_counts_each_entry_at_its_payload_and_the_pages_part_for_each() {
+    let lens = [30u64, 70, 5, 120, 0, 64, 64, 9, 1, 200];
+    let high = lens.len() as u64 + 1;
+    // The handle holds every entry; the group's share of the cache holds none, and each fetch is
+    // read from the log's file.
+    for (cache, asks) in [(1 << 20, 0), (1, 1)] {
+        let log = Log::create(sim(12), config(cache), ID).unwrap();
+        let mut h = log.group(1).unwrap();
+        h.write(Update {
+            entries: Some(Entries {
+                first: 1,
+                entries: lens
+                    .iter()
+                    .map(|&len| Entry {
+                        term: 1,
+                        bytes: vec![7; len as usize],
+                    })
+                    .collect(),
+            }),
+            ..Update::default()
+        })
+        .unwrap();
+        for per_entry in [0, 25, 1_000] {
+            let mut bounds = vec![0, 1, u64::MAX];
+            let mut total = 0;
+            for &len in &lens {
+                total += len + per_entry;
+                bounds.extend([total - 1, total, total + 1]);
+            }
+            for max_bytes in bounds {
+                let page = Page {
+                    max_bytes,
+                    per_entry,
+                };
+                let asked = h.asked();
+                let fetched = h.fetch(1, high, page, Fetched::new()).unwrap();
+                assert_eq!(h.asked() - asked, asks, "cache {cache}: read by {page:?}");
+                let taken = page_of(&lens, page);
+                assert_eq!(fetched.len(), taken, "cache {cache}: by {page:?}");
+                for (at, (term, bytes)) in fetched.iter().enumerate() {
+                    assert_eq!((term, bytes.len() as u64), (1, lens[at]));
+                }
+            }
+        }
+    }
 }
 
 /// A handle keeps the entries after its replica's mark whatever its group's share of the log's
@@ -333,14 +416,29 @@ fn a_handle_keeps_what_its_replica_has_yet_to_apply() {
     })
     .unwrap();
     assert_eq!(h.kept_bytes(), 600);
-    assert_eq!(h.fetch(1, 7, u64::MAX, Fetched::new()).unwrap().len(), 6);
+    assert_eq!(
+        h.fetch(1, 7, Page::payload(u64::MAX), Fetched::new())
+            .unwrap()
+            .len(),
+        6
+    );
     assert_eq!(h.asked(), 0, "every kept entry answered by the handle");
     // The share is a byte: what the mark passes goes, and is the log's to answer.
     h.keep_after(4);
     assert_eq!(h.kept_bytes(), 200);
-    assert_eq!(h.fetch(5, 7, u64::MAX, Fetched::new()).unwrap().len(), 2);
+    assert_eq!(
+        h.fetch(5, 7, Page::payload(u64::MAX), Fetched::new())
+            .unwrap()
+            .len(),
+        2
+    );
     assert_eq!(h.asked(), 0);
-    assert_eq!(h.fetch(3, 5, u64::MAX, Fetched::new()).unwrap().len(), 2);
+    assert_eq!(
+        h.fetch(3, 5, Page::payload(u64::MAX), Fetched::new())
+            .unwrap()
+            .len(),
+        2
+    );
     assert_eq!(h.asked(), 1, "what the mark passed is the log's");
     // A suffix past the mark replaced: its old entry uncounted, the new ones counted.
     h.write(Update {
@@ -349,7 +447,9 @@ fn a_handle_keeps_what_its_replica_has_yet_to_apply() {
     })
     .unwrap();
     assert_eq!(h.kept_bytes(), 100 + 3 * 50);
-    let replaced = h.fetch(5, 9, u64::MAX, Fetched::new()).unwrap();
+    let replaced = h
+        .fetch(5, 9, Page::payload(u64::MAX), Fetched::new())
+        .unwrap();
     assert_eq!(
         replaced.get(1).unwrap(),
         (2, &entries(6, 1, 2, 50).entries[0].bytes[..])

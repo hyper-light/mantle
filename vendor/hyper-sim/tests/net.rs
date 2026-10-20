@@ -911,6 +911,56 @@ fn codel_marks_a_standing_queue_after_an_interval_and_ever_sooner_until_it_drain
     );
 }
 
+/// A message the capacity loses takes its arrival out of the world with it, so the world's events
+/// stay within `C` while the network loses past it (docs/sim.md §7: the event queue's bound is `C`
+/// beside timers and completions). Before, each lost message left its arrival pending, naming
+/// nothing, until the strategy took it; a world bounded by the rule's `C` filled with them and
+/// refused the next send (`SimError::Full`, §17).
+#[test]
+fn a_message_lost_to_the_capacity_takes_its_arrival_with_it() {
+    let capacity = 3;
+    let mut world = World::new(
+        Source::Seed(7),
+        Discipline::Ordered,
+        Limits {
+            events: capacity + 1,
+            ..LIMITS
+        },
+    )
+    .unwrap();
+    for id in 0..5 {
+        assert_eq!(world.node(Clock::default()).unwrap(), NodeId(id));
+    }
+    let mut net = Net::new(NetLimits {
+        messages: capacity,
+        ..NET
+    });
+    net.set_path(Path::in_order(SECOND, 0));
+    let sent = 50u64;
+    for message in 0..sent {
+        assert!(matches!(
+            send(&mut world, &mut net, 1, 2, message, 50),
+            Fate::Arrives { .. }
+        ));
+        assert!(
+            world.pending() <= capacity,
+            "{} arrivals pending for {capacity} in flight",
+            world.pending()
+        );
+    }
+    assert_eq!(net.stats().dropped_capacity, sent - capacity as u64);
+    let delivered: Vec<u64> = drain(&mut world, &mut net)
+        .into_iter()
+        .map(|(_, m)| m)
+        .collect();
+    assert_eq!(delivered, vec![47, 48, 49]);
+    assert_eq!(
+        world.steps(),
+        capacity as u64,
+        "no step took a stale arrival"
+    );
+}
+
 #[test]
 fn past_its_capacity_the_oldest_message_in_flight_is_lost_and_counted() {
     let limits = NetLimits {

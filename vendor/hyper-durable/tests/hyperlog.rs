@@ -59,10 +59,21 @@ fn sole(log: &Log<SimFile>) -> (Member, Waker, Receiver<usize>) {
 
 /// Drives until nothing is out and nothing more to do, waiting on the log's answers.
 fn settle(r: &mut Member, waker: &Waker, woken: &Receiver<usize>) {
+    settle_sending(r, waker, woken, &mut Vec::new());
+}
+
+/// As [`settle`], keeping the messages the member sends.
+fn settle_sending(
+    r: &mut Member,
+    waker: &Waker,
+    woken: &Receiver<usize>,
+    sent: &mut Vec<hyper_raft::proto::Message>,
+) {
     let mut out = Output::default();
     loop {
         out.clear();
         let driven = r.drive(now(), waker, &mut out).unwrap();
+        sent.append(&mut out.messages);
         if driven.more {
             continue;
         }
@@ -473,7 +484,7 @@ fn a_replaced_suffix_is_read_as_the_answered_writes_left_it() {
 }
 
 /// A read asks for as many entries as its bytes admit and one at least, from what was kept as
-/// from the log.
+/// from the log: the bytes of their bodies in a message, as the core counts them.
 #[test]
 fn a_read_from_what_was_kept_takes_what_its_bytes_admit_and_one_at_least() {
     let log = Log::create(sim_file(33), config(16, 1 << 12), 1).unwrap();
@@ -482,13 +493,279 @@ fn a_read_from_what_was_kept_takes_what_its_bytes_admit_and_one_at_least() {
     let written = entries_of(1, 6, 1);
     store.submit(&write_of(1, &written), &waker).unwrap();
     answer_of(&mut store, &woken);
-    let one = hyper_durable::encode_entry(&written[0]).unwrap().len() as u64;
+    let one = hyper_raft::proto::encoded_bytes(&written[0]);
     let mut two = Vec::new();
     store.entries(1, 7, one * 2, &mut two).unwrap();
     assert_eq!(two, written[..2]);
     let mut least = Vec::new();
     store.entries(1, 7, 1, &mut least).unwrap();
     assert_eq!(least, written[..1]);
+}
+
+/// Entries of a few tens of bytes, of lengths that differ, every fourth with a context: a range's
+/// commands as mantle writes them, about 50 bytes of data each (2026-10-19).
+fn small_entries(count: u64) -> Vec<hyper_raft::proto::Entry> {
+    (1..=count)
+        .map(|index| hyper_raft::proto::Entry {
+            index,
+            term: 1,
+            data: vec![index as u8; 20 + (index as usize * 7) % 61],
+            context: if index % 4 == 0 {
+                vec![0xc0; 6]
+            } else {
+                Vec::new()
+            },
+            ..hyper_raft::proto::Entry::default()
+        })
+        .collect()
+}
+
+/// How many of `entries` the core's page takes within `max_bytes`: the rule of
+/// `hyper_raft::log::page_and_bytes`, which every page the core builds holds to, the longest prefix
+/// whose running total of the entries' bodies in a message (`hyper_raft::proto::encoded_bytes`)
+/// fits, and the first whatever its bytes.
+fn core_page(entries: &[hyper_raft::proto::Entry], max_bytes: u64) -> usize {
+    let mut total = 0u64;
+    let mut taken = 0;
+    for entry in entries {
+        total = total.saturating_add(hyper_raft::proto::encoded_bytes(entry));
+        if taken > 0 && total > max_bytes {
+            break;
+        }
+        taken += 1;
+    }
+    taken
+}
+
+/// The bounds a page of `entries` turns at: each prefix's bytes in a message, one fewer and one
+/// more, and none, one byte and no bound.
+fn bounds_of(entries: &[hyper_raft::proto::Entry]) -> Vec<u64> {
+    let mut bounds = vec![0, 1, u64::MAX];
+    let mut total = 0u64;
+    for entry in entries {
+        total += hyper_raft::proto::encoded_bytes(entry);
+        bounds.extend([total - 1, total, total + 1]);
+    }
+    bounds
+}
+
+/// A store of group 1 holding `written` from index 1, answered, on a log whose groups each keep
+/// `group_cache` bytes of their entries in memory.
+fn holding(
+    seed: u64,
+    group_cache: u64,
+    written: &[hyper_raft::proto::Entry],
+) -> (Log<SimFile>, GroupStore<SimFile>) {
+    let log = Log::create(
+        sim_file(seed),
+        Config {
+            group_cache,
+            ..config(16, 1 << 12)
+        },
+        1,
+    )
+    .unwrap();
+    let mut store = GroupStore::claim(&log, 1).unwrap();
+    let (waker, woken) = store_waker();
+    store.submit(&write_of(1, written), &waker).unwrap();
+    answer_of(&mut store, &woken);
+    (log, store)
+}
+
+/// Every page `store` reads of `written`, from several starts and at every bound a page turns at,
+/// is the core's: what its entries take in a message fits the bound unless it holds one, and it is
+/// the longest prefix that does. Each read asks the log `asks` times: none when the handle holds the
+/// entries, once when they are older than its cache.
+fn every_page_is_the_cores(
+    store: &GroupStore<SimFile>,
+    written: &[hyper_raft::proto::Entry],
+    asks: u64,
+) {
+    let high = written.len() as u64 + 1;
+    for low in [1, 2, 9, high / 2, high - 1] {
+        let from = &written[(low - 1) as usize..];
+        for max_bytes in bounds_of(from) {
+            let asked = store.handle().asked();
+            let mut page = Vec::new();
+            store.entries(low, high, max_bytes, &mut page).unwrap();
+            assert_eq!(
+                store.handle().asked() - asked,
+                asks,
+                "[{low}, {high}) by {max_bytes}: read where the entries are"
+            );
+            let bytes: u64 = page.iter().map(hyper_raft::proto::encoded_bytes).sum();
+            assert!(
+                page.len() == 1 || bytes <= max_bytes,
+                "[{low}, {high}) by {max_bytes}: {} entries take {bytes} bytes in a message",
+                page.len()
+            );
+            let taken = core_page(from, max_bytes);
+            assert_eq!(
+                page.len(),
+                taken,
+                "[{low}, {high}) by {max_bytes}: the longest prefix that fits"
+            );
+            assert_eq!(page, from[..taken]);
+        }
+    }
+}
+
+/// A page the store reads is the page the core would take: as many entries as `max_bytes` of
+/// their bodies in a message admit, and one at least, counted as the core counts an entry
+/// (`hyper_raft::proto::encoded_bytes`), never by the shorter encoding the log stores
+/// (`encode_entry` keeps no term or index). The core takes a page the store cut as whole, so a page
+/// cut by the stored bytes ran past the core's bound by 20 bytes an entry: in mantle a leader's
+/// append read from the store was 1,553 bytes where the core promises 1,024 and an append's fixed
+/// part, its transport refused it on every retry, and the follower never caught up (2026-10-19).
+/// Held from the handle's memory and from the log's file alike.
+#[test]
+fn a_page_read_from_the_store_is_the_cores_by_what_its_entries_take_in_a_message() {
+    let written = small_entries(64);
+    // The handle holds every entry.
+    let (_log, cached) = holding(34, 1 << 20, &written);
+    every_page_is_the_cores(&cached, &written, 0);
+    // The group's share of the cache holds none: each read goes to the log's file.
+    let (_log, old) = holding(35, 1, &written);
+    every_page_is_the_cores(&old, &written, 1);
+}
+
+/// A walk of the store reads its pages by the same rule: at most `page` bytes of the entries'
+/// bodies in a message at a time, the bytes its callers state a page in (the replica's walks, a
+/// page of `max_committed_size_per_ready`), and one entry at least. Seen where each page is one read
+/// of the log: entries older than the handle's cache.
+#[test]
+fn a_walk_of_the_store_reads_pages_of_the_cores_rule() {
+    let written = small_entries(64);
+    let (_log, store) = holding(36, 1, &written);
+    let high = written.len() as u64 + 1;
+    for low in [1, 9] {
+        let from = &written[(low - 1) as usize..];
+        let mut pages = bounds_of(&from[..8]);
+        pages.retain(|&page| page != u64::MAX);
+        for page in pages {
+            let asked = store.handle().asked();
+            let mut visited = Vec::new();
+            store
+                .visit(low, high, page, &mut |entry| {
+                    visited.push(entry.index);
+                    false
+                })
+                .unwrap();
+            assert_eq!(visited, (low..high).collect::<Vec<_>>());
+            let mut reads = 0;
+            let mut at = 0;
+            while at < from.len() {
+                at += core_page(&from[at..], page);
+                reads += 1;
+            }
+            assert_eq!(
+                store.handle().asked() - asked,
+                reads,
+                "[{low}, {high}) by pages of {page}: one read a page of the core's rule"
+            );
+        }
+    }
+}
+
+/// A learner caught up from its leader's log is sent appends within the core's bound on one
+/// (`max_size_per_msg`, counted by what the entries take in the message), though every page is
+/// read from the store, whose page the core takes whole: from the log's file and from the handle's
+/// memory alike. In mantle such an append ran past the bound and was refused by its transport on
+/// every retry (2026-10-19).
+#[test]
+fn a_learner_caught_up_from_the_log_is_sent_appends_within_the_bound() {
+    use hyper_raft::proto::{
+        ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, Message, MessageType,
+    };
+    let bound = settings(1, 3).core.max_size_per_msg;
+    for (seed, group_cache) in [(37, 1), (38, 1 << 20)] {
+        let log = Log::create(
+            sim_file(seed),
+            Config {
+                group_cache,
+                ..config(16, 1 << 12)
+            },
+            1,
+        )
+        .unwrap();
+        let (mut r, waker, woken) = sole(&log);
+        settle(&mut r, &waker, &woken);
+        assert!(r.is_leader());
+        for i in 0..48u8 {
+            r.propose(Vec::new(), vec![i; 50]).unwrap();
+        }
+        settle(&mut r, &waker, &woken);
+        let learner = ConfChangeV2 {
+            transition: ConfChangeTransition::Auto,
+            changes: vec![ConfChangeSingle {
+                change_type: ConfChangeType::AddLearnerNode,
+                node_id: 2,
+            }],
+            context: Vec::new(),
+        };
+        r.change(Vec::new(), &learner).unwrap();
+        let mut sent = Vec::new();
+        settle_sending(&mut r, &waker, &woken, &mut sent);
+        let probe = sent
+            .iter()
+            .find(|m| m.to == 2 && m.msg_type == MessageType::MsgAppend)
+            .cloned()
+            .expect("a probe of the learner");
+        // The learner holds nothing: its refusal takes the leader back to the log's first entry.
+        r.step(Message {
+            msg_type: MessageType::MsgAppendResponse,
+            from: 2,
+            to: 1,
+            term: probe.term,
+            index: probe.index,
+            reject: true,
+            reject_hint: 0,
+            ..Message::default()
+        })
+        .unwrap();
+        let last = r.core().raft.log().last_index().unwrap();
+        let mut matched = 0;
+        let mut most = 0;
+        // Each round sends at least one entry the learner lacks, so it is caught up within `last`.
+        for _ in 0..last {
+            sent.clear();
+            settle_sending(&mut r, &waker, &woken, &mut sent);
+            for m in sent
+                .iter()
+                .filter(|m| m.to == 2 && m.msg_type == MessageType::MsgAppend)
+            {
+                let bytes: u64 = m.entries.iter().map(hyper_raft::proto::encoded_bytes).sum();
+                assert!(
+                    m.entries.len() <= 1 || bytes <= bound,
+                    "cache {group_cache}: an append of {} entries takes {bytes} bytes, past {bound}",
+                    m.entries.len()
+                );
+                most = most.max(m.entries.len());
+                matched = m.entries.last().map_or(matched, |e| matched.max(e.index));
+            }
+            if matched >= last {
+                break;
+            }
+            // The learner takes what it was sent.
+            r.step(Message {
+                msg_type: MessageType::MsgAppendResponse,
+                from: 2,
+                to: 1,
+                term: probe.term,
+                index: matched,
+                ..Message::default()
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            matched, last,
+            "cache {group_cache}: the learner is caught up"
+        );
+        assert!(
+            most > 1,
+            "cache {group_cache}: the bound admits several entries an append"
+        );
+    }
 }
 
 /// A group stopped with a write out and opened again at once in the same process opens on the

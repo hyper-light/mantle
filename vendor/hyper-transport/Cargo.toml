@@ -1,0 +1,47 @@
+[package]
+name = "hyper-transport"
+description = "The application layer over hyper-quic, sans-io: one connection per peer, request and reply exchanges in classes with a credit reserve, streaming bodies through reservations, replication lanes and typed refusals at every bound"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "MIT"
+repository = "https://github.com/hyper-light/hyper-raft"
+publish = false
+
+[dependencies]
+hyper-quic = { path = "../hyper-quic" }
+hyper-timing = { path = "../hyper-timing" }
+# The QUIC layer takes a received datagram as `BytesMut` (hyper-quic's own dependency).
+bytes = "1"
+# Every message's prefix and head, and every body, carry a CRC-32C (mantle CLAUDE.md §6).
+crc-fast = { version = "1.10", default-features = false, features = ["std", "vpclmulqdq"] }
+thiserror = "2.0"
+
+[features]
+# Compares the scheduling core's running sums with the folds they replaced, on an endpoint switched
+# to it (`Endpoint::set_oracle`); the tests switch every endpoint they build, the benches none.
+oracle = []
+
+[dev-dependencies]
+# The tests run with the oracle compiled in (src/tally.rs).
+hyper-transport = { path = ".", features = ["oracle"] }
+hyper-measure = { path = "../hyper-measure" }
+# The deadline heap's model test (src/deadlines.rs).
+proptest = "1.11"
+# Tests that need an Instant epoch take it from simulated time's one anchor, not the host clock
+# (docs/sim.md §3.2, §12.6).
+hyper-sim = { path = "../hyper-sim" }
+# Certificates for the tests' mutual TLS (hyper-quic's own dev-dependency).
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+# A frame's own checksum written as a producer writes it, by another implementation of CRC-32C
+# than the one the crate checks it with.
+crc32c = "0.6"
+
+[[test]]
+name = "e2e"
+# The scenarios run one after another in one thread, each with one peer process at a time
+# (CLAUDE.md §1a; no thread per anything). The binary also serves as the peer process.
+harness = false
+
+# A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside any consumer workspace.
+[workspace]

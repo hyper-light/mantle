@@ -298,6 +298,8 @@ struct Node {
     owner: Owner,
     alive: bool,
     disk_stalled: bool,
+    /// What every flush of the node's disk takes past its world's draw: a device slowed for good.
+    disk_slowed: u64,
     /// The heartbeats taken when the node last charged its detectors an election.
     charged: u64,
     /// The disk's flush queue: one write at a time, as one device.
@@ -385,6 +387,7 @@ impl Sim {
                     },
                     alive: true,
                     disk_stalled: false,
+                    disk_slowed: 0,
                     charged: 0,
                     disk_busy_until: 0,
                     log: Vec::new(),
@@ -490,7 +493,7 @@ impl Sim {
         }
         let start = self.now.max(self.nodes[node].disk_busy_until);
         let u = self.streams.unit(&mut self.sim, "disk", node as u64);
-        let done = start + quantile(self.world.flush, u);
+        let done = start + quantile(self.world.flush, u) + self.nodes[node].disk_slowed;
         self.nodes[node].disk_busy_until = done;
         let started = self.now;
         self.writing += 1;
@@ -1788,6 +1791,65 @@ fn a_peer_dead_before_its_links_have_evidence_is_suspected_once_a_sibling_has_it
             noticed[noticed.len() * 9 / 10] / MS,
             noticed[noticed.len() - 1] / MS
         );
+    }
+}
+
+/// Every node's device slows for good while its links are young: each flush takes 741 ms more,
+/// the longest write hyper-durable-e2e's `member-stopped` reported on CI's ubuntu-24.04 (run
+/// 37152765895), from the first heartbeat the victim sends on. The links still configure, and a
+/// peer killed once they have is suspected by every other within the bound each suspicion states.
+/// How long they take is the open defect in `docs/STATUS.md` (the senders' floors, the mean of
+/// every flush since each log opened, climbing toward the slow flushes and moving each interval,
+/// the receiver's evidence starting again at each move): each run prints it.
+#[test]
+fn links_young_when_every_device_slows_for_good_still_configure() {
+    for world in [MACOS, LINUX] {
+        let name = world.name;
+        for seed in seeds(11, 8) {
+            let victim = 2usize;
+            let mut sim = Sim::new(3, world, seed);
+            sim.run_while(|sim| sim.nodes[victim].log.is_empty(), None);
+            assert!(
+                sim.configured_at.is_empty(),
+                "{name} seed {seed}: configured already"
+            );
+            for node in &mut sim.nodes {
+                node.disk_slowed = 741 * MS;
+            }
+            let slowed_at = sim.now;
+            sim.run_until_configured();
+            let killed_at = sim.now;
+            sim.nodes[victim].alive = false;
+            sim.run_while(
+                |sim| {
+                    (0..2).any(|node| {
+                        sim.nodes[node].liveness.trust(victim as u64 + 1) != Some(Trust::Suspected)
+                    })
+                },
+                None,
+            );
+            for node in 0..2usize {
+                let suspicion = sim.nodes[node]
+                    .suspicions
+                    .iter()
+                    .rfind(|s| s.peer == victim as u64 + 1)
+                    .copied()
+                    .unwrap_or_else(|| panic!("{name} seed {seed}: {node} holds no suspicion"));
+                let (Some(last), Some(bound)) = (suspicion.last, suspicion.detection) else {
+                    panic!("{name} seed {seed}: node {node} stated no bound");
+                };
+                assert!(
+                    suspicion.at_ns - last.due_ns <= bound.as_nanos() as u64,
+                    "{name} seed {seed}: node {node} past its stated bound"
+                );
+            }
+            println!(
+                "{name} seed {seed}: every pair configured {} s after the slowdown; the victim \
+                 suspected {} s after its kill",
+                (killed_at - slowed_at) / (1_000 * MS),
+                (sim.now - killed_at) / (1_000 * MS)
+            );
+        }
     }
 }
 

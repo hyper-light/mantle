@@ -60,21 +60,27 @@ fn config(tasks_per_shard: usize) -> RuntimeConfig {
 }
 
 /// Holds `shard` inside one poll until the test calls [`Release::release`] on the handle returned —
-/// a task that spins on that hold's own flag, so holds of tests running in parallel never free or
-/// reset each other — and returns once the shard has admitted it, so everything submitted before the release
-/// queues behind the hold whatever the machine's load. It held for a fixed 300 ms before, and a
-/// test thread preempted past that queued its request after the shard had drained the shutdown and
-/// exited: the request was dropped unprocessed, its receipt `Terminated` by its drop and counted by
-/// no shard (ubuntu-24.04, hyper-raft run 37569511180). The spin ends at [`WAIT`] at most, so a
-/// test that never releases fails rather than hangs.
+/// a task that spins on that hold's own flags, so holds of tests running in parallel never free or
+/// reset each other — and returns once the shard is inside that poll, so everything submitted before
+/// the release queues behind the hold whatever the machine's load. It returned once the shard had
+/// admitted the hold before, but a shard answers an admission inside a pass over its control channel
+/// and takes what is queued behind it in the same pass before it polls what it admitted: in
+/// hyper-raft run 39410706279 (windows-11-arm) the test's shutdown, sent as the hold's admission was
+/// answered, was taken in that pass, the hold was cancelled unpolled and the request that followed was
+/// refused as gone (`ShardGone`). It held for a fixed 300 ms before that, and a test thread preempted
+/// past that queued its request after the shard had drained the shutdown and exited: the request was
+/// dropped unprocessed, its receipt `Terminated` by its drop and counted by no shard (ubuntu-24.04,
+/// hyper-raft run 37569511180). The spin ends at [`WAIT`] at most, so a test that never releases
+/// fails rather than hangs, and a hold the shard never polls fails the wait for it at [`WAIT`].
 fn hold(rt: &Runtime, shard: ShardId) -> Release {
-    // Leaked: the spinning task and the test share it, and the task may outlive the test's frame.
-    let released: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+    // Leaked: the spinning task and the test share them, and the task may outlive the test's frame.
+    let flags: &'static HoldFlags = Box::leak(Box::new(HoldFlags::default()));
     let receipt = rt
         .spawn_on_with_receipt(shard, async move {
+            flags.entered.store(true, Ordering::Release);
             let bound = u64::try_from(WAIT.as_nanos()).unwrap_or(u64::MAX);
             let end = now_ns().saturating_add(bound);
-            while !released.load(Ordering::Acquire) && now_ns() < end {
+            while !flags.released.load(Ordering::Acquire) && now_ns() < end {
                 std::hint::spin_loop();
             }
         })
@@ -83,7 +89,22 @@ fn hold(rt: &Runtime, shard: ShardId) -> Release {
         matches!(receipt.wait(WAIT), Some(Admission::Admitted(_))),
         "the hold is admitted"
     );
-    Release(released)
+    let admitted = Instant::now();
+    while !flags.entered.load(Ordering::Acquire) {
+        assert!(
+            admitted.elapsed() < WAIT,
+            "the shard never polled the hold it admitted"
+        );
+        std::thread::yield_now();
+    }
+    Release(&flags.released)
+}
+
+/// What a hold's task and its test share: that the task's poll has begun, and that the test let it go.
+#[derive(Default)]
+struct HoldFlags {
+    entered: AtomicBool,
+    released: AtomicBool,
 }
 
 /// One hold's release: lets the held shard go on, once what the test queues behind it is queued.

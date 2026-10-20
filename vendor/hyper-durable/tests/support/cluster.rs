@@ -51,6 +51,7 @@ use hyper_raft::proto::{
 use hyper_raft::wire::Record as _;
 use hyper_raft::{Config, Configuration, StateRole};
 use hyper_sim::net::{Net, NetLimits, NetStats, Path, Ticket};
+use hyper_sim::tape::{Bounds, Tape};
 use hyper_sim::{
     Clock, Discipline, Fifo, Limits, NodeId, Random, Record, Source, Step, Strategy, StreamId,
     Twice, World, twice,
@@ -141,6 +142,30 @@ pub enum Op {
     Refuse(u64),
     Fail(u64),
     Resume(u64),
+}
+
+impl Op {
+    /// The kind a played tape's step is named by: which operation it was, so a tape's mutations
+    /// exchange, drop and repeat operations of one kind (`hyper_sim::tape`).
+    fn kind(self) -> u8 {
+        match self {
+            Self::Suspect(..) => 0,
+            Self::Trust(..) => 1,
+            Self::World => 2,
+            Self::Lose => 3,
+            Self::Drive(_) => 4,
+            Self::Durable(_) => 5,
+            Self::Propose(_) => 6,
+            Self::Fence(_) => 7,
+            Self::Change(..) => 8,
+            Self::Read(_) => 9,
+            Self::Compact(_) => 10,
+            Self::Crash(_) => 11,
+            Self::Refuse(_) => 12,
+            Self::Fail(_) => 13,
+            Self::Resume(_) => 14,
+        }
+    }
 }
 
 /// An event of the group's world.
@@ -251,7 +276,12 @@ pub struct Cluster {
 }
 
 /// The most messages the network holds; past it the oldest is lost, as a network may lose any.
-const NET: usize = 4096;
+/// `docs/sim.md` §7's rule: the smallest capacity at which every shape loses fewer to it than to
+/// the schedule over the gate's seeds (128 schedules of 5,000 steps), measured 2026-10-17: at 20
+/// the five-voter shape lost 859 to the bound against 799 to the schedule, at 21 808 against 834
+/// (`docs/sim.md` §17). Below 24 the world refused such runs before a lost message's arrival left
+/// it with the message.
+const NET: usize = 21;
 
 /// The schedule's clock: a step is a millisecond.
 const STEP_NS: u64 = 1_000_000;
@@ -493,9 +523,9 @@ impl Cluster {
             source,
             Discipline::Free,
             Limits {
-                // What the network holds, and as many arrivals of messages it lost to its bound
-                // since, and each device's completion.
-                events: 2 * NET + members,
+                // What the network holds, each message with its one arrival (a message the network
+                // loses to its bound takes its arrival with it), and each device's completion.
+                events: NET + members,
                 nodes: members,
                 // The schedule's two, each node's lateness and its core's seed, and each directed
                 // pair's delay, loss and duplication.
@@ -584,6 +614,10 @@ impl Cluster {
     pub fn step(&mut self) -> (bool, u64) {
         let op = self.choose(true);
         let did = self.act(op);
+        // A step of a played tape closes with its operation (`Source::Tape`); otherwise nothing.
+        self.world
+            .end_step(op.kind())
+            .expect("a step within the tape's bounds");
         (did, self.member_of(op, self.last_event))
     }
 
@@ -1658,6 +1692,37 @@ fn recorded(shape: Shape, source: Source, steps: u64, rounds: usize) -> Result<R
         return Err(format!("the group did not settle: {:?}", group.reached()));
     }
     Ok(group.finish())
+}
+
+/// The bounds of a played tape of a `steps` schedule of `members`: a step an operation, its words
+/// at most the trace's (`docs/sim.md` §18).
+pub fn tape_bounds(steps: u64, members: usize) -> Bounds {
+    Bounds {
+        steps: usize::try_from(steps).expect("steps a host holds"),
+        words: trace_bound(steps, members),
+    }
+}
+
+/// The schedule played from `tape`, its words past a step's own from `filler`, run and settled: its
+/// record, whose tape replays it (`docs/sim.md` §18).
+pub fn played(
+    shape: Shape,
+    tape: Tape,
+    filler: u64,
+    steps: u64,
+    rounds: usize,
+) -> Result<Record, String> {
+    let bounds = tape_bounds(steps, shape.members as usize);
+    recorded(
+        shape,
+        Source::Tape {
+            tape,
+            filler,
+            bounds,
+        },
+        steps,
+        rounds,
+    )
 }
 
 /// The schedule from `seed` run twice from its seed and once from its first run's trace, to one

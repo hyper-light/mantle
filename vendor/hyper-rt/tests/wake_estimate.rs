@@ -216,10 +216,19 @@ fn thread_time(since: Instant) -> Duration {
     {
         let _ = since;
         let reading = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
-        Duration::new(
+        let read = Duration::new(
             u64::try_from(reading.tv_sec).unwrap(),
             u32::try_from(reading.tv_nsec).unwrap(),
-        )
+        );
+        // As the runtime reads it: libc's clock restated at the kernel's rate, which a process
+        // Rosetta 2 translates is not shown (`hyper_rt::machine::clock::MachTicks`).
+        #[cfg(target_os = "macos")]
+        let read = Duration::from_nanos(
+            hyper_rt::machine::clock::mach_ticks()
+                .unwrap()
+                .at_kernel_rate(u64::try_from(read.as_nanos()).unwrap()),
+        );
+        read
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {

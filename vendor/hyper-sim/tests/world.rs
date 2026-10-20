@@ -15,6 +15,7 @@
 
 use std::collections::BTreeSet;
 
+use hyper_sim::tape::{Bounds, Tape};
 use hyper_sim::{
     Clock, Discipline, Fifo, Lateness, Limits, NodeId, Random, Record, Seeded, SimError, Source,
     Step, Trace, Twice, World, twice,
@@ -232,6 +233,44 @@ fn drain<S: hyper_sim::Strategy>(world: &mut World<u64>, strategy: &mut S) -> Ve
             Step::Wake { node } => taken.push((world.now(), node.0, u64::MAX)),
             Step::Idle | Step::Spent => return taken,
         }
+    }
+}
+
+/// An event taken back before a step took it is gone: it frees its place among the bounded events,
+/// no step takes it, and a second take-back, or one after its step, finds nothing; under both
+/// disciplines, and a switch between them carries the rest.
+#[test]
+fn an_event_taken_back_is_never_stepped_and_frees_its_place() {
+    for discipline in [Discipline::Ordered, Discipline::Free] {
+        let mut world = World::new(
+            Source::Seed(3),
+            discipline,
+            Limits {
+                events: 3,
+                ..LIMITS
+            },
+        )
+        .unwrap();
+        let node = world.node(Clock::default()).unwrap();
+        let first = world.schedule(10, node, 1).unwrap();
+        let second = world.schedule(20, node, 2).unwrap();
+        world.schedule(30, node, 3).unwrap();
+        assert!(matches!(
+            world.schedule(40, node, 4),
+            Err(SimError::Full { .. })
+        ));
+        assert_eq!(world.cancel(second), Some(2));
+        assert_eq!(world.cancel(second), None, "taken back once");
+        assert_eq!(world.pending(), 2);
+        world.schedule(40, node, 4).unwrap();
+        world.set_discipline(match discipline {
+            Discipline::Ordered => Discipline::Free,
+            Discipline::Free => Discipline::Ordered,
+        });
+        let mut tags: Vec<u64> = drain(&mut world, &mut Fifo).iter().map(|t| t.2).collect();
+        tags.sort_unstable();
+        assert_eq!(tags, [1, 3, 4], "{discipline:?}");
+        assert_eq!(world.cancel(first), None, "stepped already");
     }
 }
 
@@ -586,14 +625,20 @@ proptest! {
 /// after a delay its link's stream draws, sometimes lost; every node's timer re-armed to inject a
 /// fresh token. Every arrival is observed.
 fn ring(source: Source, discipline: Discipline, leak: u64) -> Result<Record, SimError> {
-    let mut world: World<u64> = World::new(
-        source,
-        discipline,
-        Limits {
-            steps: 5_000,
-            ..LIMITS
-        },
-    )?;
+    ring_of(source, discipline, leak, RING_STEPS)
+}
+
+/// The steps of the ring the run-twice checks take.
+const RING_STEPS: u64 = 5_000;
+
+/// [`ring`] of `steps` steps.
+fn ring_of(
+    source: Source,
+    discipline: Discipline,
+    leak: u64,
+    steps: u64,
+) -> Result<Record, SimError> {
+    let mut world: World<u64> = World::new(source, discipline, Limits { steps, ..LIMITS })?;
     let late = Lateness {
         floor_ns: 10,
         spread_ns: 1_000,
@@ -638,15 +683,92 @@ fn ring(source: Source, discipline: Discipline, leak: u64) -> Result<Record, Sim
         let from = u64::from(node.0);
         let to = world.below(own[node.0 as usize], 5)?;
         let link = links[(from * 5 + to) as usize];
+        // A step of kind 1 lost its token, of kind 0 passed it on: what a played tape's steps name.
         if world.chance(link, 50_000)? {
+            world.end_step(1)?;
             continue;
         }
         let delay = 1_000 + world.below(link, 20_000)?;
         if world.pending() < 64 {
             world.after(delay, nodes[to as usize], token)?;
         }
+        world.end_step(0)?;
     }
     Ok(world.finish())
+}
+
+/// The steps of a played ring: the run-twice checks' ring, or under Miri a twentieth of it, the
+/// same code over fewer steps (a ring of 5,000 steps took 56 s under Miri in CI, 2026-10-17, where
+/// the crate's whole Miri job has 36 minutes).
+const PLAYED_STEPS: u64 = if cfg!(miri) {
+    RING_STEPS / 20
+} else {
+    RING_STEPS
+};
+
+/// What a played ring's tape may hold: a step a world step, and a word a decision, as many as its
+/// trace holds.
+const TAPE: Bounds = Bounds {
+    steps: PLAYED_STEPS as usize,
+    words: LIMITS.trace_words,
+};
+
+/// A ring played from `tape`, words past a step's own from `filler`.
+fn played(tape: Tape, filler: u64, discipline: Discipline) -> Record {
+    ring_of(
+        Source::Tape {
+            tape,
+            filler,
+            bounds: TAPE,
+        },
+        discipline,
+        0,
+        PLAYED_STEPS,
+    )
+    .unwrap()
+}
+
+/// The world plays a decision tape (`docs/sim.md` §18): a fresh run's tape replays it exactly,
+/// whatever fills past it, as does its trace; and every mutation of the tape is a run, whose own
+/// tape replays it. So a world's runs are mutated and shrunk as hyper-check does a harness's own.
+#[test]
+fn a_tape_the_world_plays_replays_its_run_and_every_mutation_is_a_run() {
+    // Under Miri the free discipline alone, one mutation and a twentieth of the steps: the same code
+    // over fewer runs (a debug run of 5,000 steps takes about 0.3 s natively, 56 s under Miri).
+    let (disciplines, mutations): (&[Discipline], usize) = if cfg!(miri) {
+        (&[Discipline::Free], 1)
+    } else {
+        (&[Discipline::Ordered, Discipline::Free], 10)
+    };
+    for &discipline in disciplines {
+        let fresh = played(Tape::default(), 7, discipline);
+        let tape = fresh
+            .tape
+            .clone()
+            .expect("a played run gives its tape back");
+        assert_eq!(tape.len() as u64, PLAYED_STEPS, "a step a world step");
+        assert!(tape.kinds().any(|kind| kind == 1) && tape.kinds().any(|kind| kind == 0));
+        let again = played(tape.clone(), 99, discipline);
+        assert_eq!(again.digest, fresh.digest, "{discipline:?}");
+        assert_eq!(again.tape.as_ref(), Some(&tape));
+        let traced = ring_of(
+            Source::Trace(fresh.trace.clone()),
+            discipline,
+            0,
+            PLAYED_STEPS,
+        )
+        .unwrap();
+        assert_eq!(traced.digest, fresh.digest);
+        let mut draws = Seeded::new(11);
+        let mut differed = 0;
+        for _ in 0..mutations {
+            let run = played(tape.mutate(&mut draws), 5, discipline);
+            differed += usize::from(run.digest != fresh.digest);
+            let taken = run.tape.clone().unwrap();
+            assert_eq!(played(taken, 6, discipline).digest, run.digest);
+        }
+        assert!(differed > 0, "the mutations ran other runs");
+    }
 }
 
 #[test]
@@ -676,7 +798,7 @@ fn the_check_refuses_a_draw_made_outside_the_world() {
     let refused = twice(1, |source| {
         let outside = match &source {
             Source::Seed(seed) => Seeded::new(*seed).next_u64(),
-            Source::Trace(_) => 0,
+            Source::Trace(_) | Source::Tape { .. } => 0,
         };
         ring(source, Discipline::Free, outside)
     });

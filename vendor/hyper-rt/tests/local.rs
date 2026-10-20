@@ -98,3 +98,97 @@ fn a_local_stream_carries_bytes_and_the_kernels_identity_of_its_peer() {
     .unwrap();
     let _ = std::fs::remove_file(&path);
 }
+
+/// A future whose polls that found it pending are counted into `pending`.
+struct Counted<'a, F> {
+    future: std::pin::Pin<Box<F>>,
+    pending: &'a std::cell::Cell<u32>,
+}
+
+impl<F: std::future::Future> std::future::Future for Counted<'_, F> {
+    type Output = F::Output;
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        let polled = self.future.as_mut().poll(context);
+        if polled.is_pending() {
+            self.pending.set(self.pending.get() + 1);
+        }
+        polled
+    }
+}
+
+fn counted<F: std::future::Future>(future: F, pending: &std::cell::Cell<u32>) -> Counted<'_, F> {
+    Counted {
+        future: Box::pin(future),
+        pending,
+    }
+}
+
+/// The byte at `at` of the stream: its offset modulo 251, a prime, so no buffer's boundary lines up
+/// with the pattern's.
+fn pattern(at: usize) -> u8 {
+    u8::try_from(at % 251).unwrap()
+}
+
+/// The bytes the client sends: more than any OS's local stream buffers hold, so its writes wait for
+/// the server to read.
+const STREAMED: usize = 16 << 20;
+
+/// Do: await an accept before any client connects, then stream 16 MiB from the client while the
+/// server reads it. Expect: the accept and the server's reads each waited on the driver's readiness
+/// at least once, and every byte arrived in order; on Linux and macOS the client's writes waited too,
+/// their kernels holding a local stream's unread bytes to its buffers. On Windows this is AFD's
+/// `IOCTL_AFD_POLL` on `AF_UNIX` sockets (docs/runtime.md §15 item 1): accept and receive readiness
+/// reported, or the shard would park forever. Windows took the 16 MiB a write at a time without a
+/// write ever refused (both runners, CI run 39015895080), so no send readiness was asked there.
+#[test]
+fn a_local_streams_accept_reads_and_writes_each_wait_on_readiness() {
+    let path = path("waits");
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    let server_path = path.clone();
+    let (writes_seen, writes) = std::sync::mpsc::channel();
+    let (accepts, reads) = rt
+        .block_on(async move {
+            let (accepts, reads) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
+            let listener = LocalListener::bind(&server_path, 4).unwrap();
+            let client_path = server_path.clone();
+            // The client runs only once the server's accept has found nothing pending and yielded.
+            hyper_rt::futures::spawn_detached(async move {
+                let client = LocalStream::connect(&client_path).await.unwrap();
+                let bytes: Vec<u8> = (0..STREAMED).map(pattern).collect();
+                let pending = std::cell::Cell::new(0);
+                counted(client.write_all(&bytes), &pending).await.unwrap();
+                client.shutdown(Shutdown::Write).unwrap();
+                let _ = writes_seen.send(pending.get());
+            })
+            .unwrap();
+            let stream = counted(listener.accept(), &accepts).await.unwrap();
+            let mut buffer = vec![0u8; 64 << 10];
+            let mut got = 0usize;
+            loop {
+                let read = counted(stream.read(&mut buffer), &reads).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                for (at, byte) in buffer[..read].iter().enumerate() {
+                    assert_eq!(*byte, pattern(got + at), "byte {} out of order", got + at);
+                }
+                got += read;
+            }
+            assert_eq!(got, STREAMED, "every byte arrived");
+            (accepts.get(), reads.get())
+        })
+        .unwrap();
+    let writes = writes.try_recv().expect("the client finished");
+    assert!(accepts >= 1, "the accept waited for the connect");
+    assert!(reads >= 1, "the server's reads waited for bytes");
+    if cfg!(not(windows)) {
+        assert!(
+            writes >= 1,
+            "the client's writes waited for the server to read"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}

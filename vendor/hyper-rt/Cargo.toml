@@ -21,24 +21,13 @@ libc = "0.2.189"
 rustix = { version = "1.1", features = ["event", "net", "pipe", "thread", "process", "param", "system", "time", "fs"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = [
-  "Win32_Foundation",
-  "Win32_Networking_WinSock",
-  "Win32_Security",
-  "Win32_System_Console",
-  "Win32_System_IO",
-  "Win32_System_Memory",
-  "Win32_System_Power",
-  "Win32_System_SystemInformation",
-  "Win32_System_Threading",
-  "Win32_System_WindowsProgramming",
-] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_System_Console", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Power", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_Storage_FileSystem", "Win32_System_Kernel", "Win32_System_Performance", "Win32_System_Ioctl", "Win32_System_ProcessStatus"] }
 
 [dev-dependencies]
 hyper-measure = { path = "../hyper-measure" }
 
-# Not vendored here: loom, which hyper-raft's CI runs for the park and kick protocol's
-# interleavings under `RUSTFLAGS="--cfg loom"`.
+# loom builds only under `RUSTFLAGS="--cfg loom"`, for the park and kick protocol's interleavings.
+# Not vendored here: loom, which hyper-raft's CI runs for the interleavings its `cfg(loom)` tests select.
 # [target.'cfg(loom)'.dependencies]
 # loom = "0.7"
 

@@ -42,6 +42,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Network
 hyper-sim = { path = "../hyper-sim" }
 proptest = "1.11"
 tempfile = "3.20"
+# The reads bench counts allocator calls and page faults (benches/reads.rs).
 hyper-measure = { path = "../hyper-measure" }
 
 # A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside any consumer workspace.

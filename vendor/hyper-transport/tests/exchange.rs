@@ -2382,6 +2382,192 @@ fn a_peer_table_held_by_unpolled_events_refuses_a_new_peer() {
     });
 }
 
+/// Runs the network until node 1 holds `held` connections (`Stats::connections`: a dial or a
+/// connection that ended is let go once its lifecycle event is queued), polling node 1's events as
+/// they come; returns them.
+fn told_until_a_holds(
+    net: &mut Net<Node<Mantle>, Node<Mantle>>,
+    held: usize,
+) -> Vec<Event<Mantle>> {
+    let mut told = Vec::new();
+    net.until(TURNS, |net| {
+        told.extend(events(&mut net.a));
+        net.a.stats().connections == held
+    });
+    told
+}
+
+/// Node 1 and node 2, both nodes, on the zero path, neither dialed.
+fn apart(pair: &Pair) -> Net<Node<Mantle>, Node<Mantle>> {
+    let now = hyper_sim::Anchor::new().instant(0).unwrap();
+    let node = |which| {
+        pair.node::<Mantle>(
+            which,
+            Role::Node,
+            pair.book(Role::Node, Role::Node),
+            limits(),
+            256 << 20,
+            now,
+        )
+    };
+    Net::new(now, node(1), node(2))
+}
+
+/// An address node 1's dial hears nothing from: the network carries node 1's datagrams to node 2
+/// wherever they are addressed, node 2 answers from its own address, and a client discards
+/// what comes from an address it did not dial (RFC 9000 §9).
+fn elsewhere() -> std::net::SocketAddr {
+    "127.0.0.1:4435".parse().unwrap()
+}
+
+/// Every dial the owner starts ends in a lifecycle event it is told, though the dial ends in the
+/// state the owner polled last (found by mantle on Windows CI, 2026-10-20). Cut off from its peer
+/// for longer than two dials, a node was told its connection closed, its first redial unreachable,
+/// and nothing of its second, which ended in the state the owner had polled from the first; mantle's
+/// node dials again on what it is told, so it never dialed again and the peer stayed unreachable
+/// after the path healed (docs/transport.md §4u). One `Unreachable` waiting unpolled stands for
+/// every dial that ends as it says.
+#[test]
+fn a_dial_failing_as_the_last_one_did_is_told_all_the_same() {
+    let pair = Pair::new();
+    let mut net = connected::<Mantle, Mantle>(&pair, limits(), 256 << 20);
+    let address = net.b_address;
+    // The path is cut: node 2 hears nothing more, and the connection idles out.
+    net.b_dead = true;
+    let told = told_until_a_holds(&mut net, 0);
+    assert!(
+        matches!(
+            told[..],
+            [Event::Closed {
+                peer: 2,
+                epoch: 1,
+                refusal: None
+            }]
+        ),
+        "{told:?}"
+    );
+    for dial in 1..=3 {
+        net.a.connect(net.now, 2, address).unwrap();
+        let told = told_until_a_holds(&mut net, 0);
+        assert!(
+            matches!(
+                told[..],
+                [Event::Unreachable {
+                    peer: 2,
+                    refusal: None
+                }]
+            ),
+            "dial {dial}: {told:?}"
+        );
+    }
+    // Two dials end with nothing polled between them: the event waiting tells both.
+    for _ in 0..2 {
+        net.a.connect(net.now, 2, address).unwrap();
+        net.until(TURNS, |net| net.a.stats().connections == 0);
+    }
+    let told = events(&mut net.a);
+    assert!(
+        matches!(
+            told[..],
+            [Event::Unreachable {
+                peer: 2,
+                refusal: None
+            }]
+        ),
+        "{told:?}"
+    );
+    // The path heals: the next dial connects.
+    net.b_dead = false;
+    net.a.connect(net.now, 2, address).unwrap();
+    let mut told = Vec::new();
+    net.until(TURNS, |net| {
+        told.extend(events(&mut net.a));
+        !told.is_empty()
+    });
+    assert!(
+        matches!(
+            told[..],
+            [Event::Connected {
+                peer: 2,
+                epoch: 2,
+                ..
+            }]
+        ),
+        "{told:?}"
+    );
+}
+
+/// A dial that ends after its peer connected in, and went, while the owner polled nothing is told:
+/// the peer's state that came and went is not, and the dial's end is, though it is the state the
+/// owner was told last.
+#[test]
+fn a_dial_ending_after_its_peer_came_and_went_unpolled_is_told() {
+    let pair = Pair::new();
+    let mut net = apart(&pair);
+    net.a.connect(net.now, 2, elsewhere()).unwrap();
+    let told = told_until_a_holds(&mut net, 0);
+    assert!(
+        matches!(
+            told[..],
+            [Event::Unreachable {
+                peer: 2,
+                refusal: None
+            }]
+        ),
+        "{told:?}"
+    );
+    net.a.connect(net.now, 2, elsewhere()).unwrap();
+    // While node 1's dial goes on, node 2 dials it and then closes what it dialed.
+    let address = net.a_address;
+    net.b.connect(net.now, 1, address).unwrap();
+    net.until(TURNS, |net| net.a.connection_live(2, 1));
+    net.b.disconnect(net.now, 1);
+    net.until(TURNS, |net| !net.a.connection_live(2, 1));
+    net.until(TURNS, |net| net.a.stats().connections == 0);
+    let told = events(&mut net.a);
+    assert!(
+        matches!(
+            told[..],
+            [Event::Unreachable {
+                peer: 2,
+                refusal: None
+            }]
+        ),
+        "{told:?}"
+    );
+}
+
+/// A dial that ends while a connection its peer opened is up tells its owner nothing new: the peer
+/// is connected, as the owner was told, and that is not told again.
+#[test]
+fn a_dial_ending_while_its_peer_is_connected_tells_nothing_new() {
+    let pair = Pair::new();
+    let mut net = apart(&pair);
+    net.a.connect(net.now, 2, elsewhere()).unwrap();
+    let address = net.a_address;
+    net.b.connect(net.now, 1, address).unwrap();
+    let mut told = Vec::new();
+    net.until(TURNS, |net| {
+        told.extend(events(&mut net.a));
+        !told.is_empty()
+    });
+    assert!(
+        matches!(
+            told[..],
+            [Event::Connected {
+                peer: 2,
+                epoch: 1,
+                ..
+            }]
+        ),
+        "{told:?}"
+    );
+    assert_eq!(net.a.stats().connections, 2, "node 1's own dial goes on");
+    let told = told_until_a_holds(&mut net, 1);
+    assert!(told.is_empty(), "{told:?}");
+    assert!(net.a.connection_live(2, 1));
+}
+
 /// Exchanges queued behind the peer's stream credit (rule 2's bound, policy C): a queued exchange is judged on whether
 /// the connection's credit queue moves, not on its own age. Do: one stream a connection, eight exchanges asked at once,
 /// and a server that answers one every half period, so the last waits about four periods for its stream. Expect: all

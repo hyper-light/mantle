@@ -166,6 +166,8 @@ enum Line {
         patience: Duration,
         /// While a peer it dials is not connected, how long until it is again (else zero).
         reconnect: Duration,
+        /// While a peer is not yet judged, the longest its stream's heartbeats go between.
+        measuring: Duration,
     },
 }
 
@@ -176,13 +178,23 @@ fn parse(line: &str) -> Option<Line> {
         ["replaced", failed, joining] => {
             Some(Line::Replaced(failed.parse().ok()?, joining.parse().ok()?))
         }
-        ["status", term, leader, commit, applied, patience, reconnect] => Some(Line::Status {
+        [
+            "status",
+            term,
+            leader,
+            commit,
+            applied,
+            patience,
+            reconnect,
+            measuring,
+        ] => Some(Line::Status {
             term: term.parse().ok()?,
             leader: leader.parse().ok()?,
             commit: commit.parse().ok()?,
             applied: applied.parse().ok()?,
             patience: Duration::from_nanos(patience.parse().ok()?),
             reconnect: Duration::from_nanos(reconnect.parse().ok()?),
+            measuring: Duration::from_nanos(measuring.parse().ok()?),
         }),
         _ => None,
     }
@@ -192,6 +204,8 @@ fn parse(line: &str) -> Option<Line> {
 /// workload client tells.
 enum Heard {
     Line(u64, u64, Line),
+    /// A process's output ended, by the node and the process's generation: the process ended.
+    Ended(u64, u64),
     Told(Told),
 }
 
@@ -401,6 +415,7 @@ impl Cell {
             moved_at: Instant::now(),
             _root: root,
         };
+        // One at a time, each listening before the next starts (`Cell::start`).
         for id in 1..=voters {
             cell.start(id);
         }
@@ -408,7 +423,8 @@ impl Cell {
         cell
     }
 
-    /// Starts node `id`'s process on its directory; a thread forwards its lines, one a process.
+    /// Starts node `id`'s process on its directory, a thread forwarding its lines, and waits until
+    /// it listens.
     fn start(&mut self, id: u64) {
         let config = self.pki.config(id, &self.dirs[&id]);
         let mut child = Command::new(NODE)
@@ -424,13 +440,14 @@ impl Cell {
         self.generations += 1;
         std::thread::spawn(move || {
             for line in BufReader::new(output).lines() {
-                let Ok(line) = line else { return };
+                let Ok(line) = line else { break };
                 if let Some(parsed) = parse(&line)
                     && tell.send(Heard::Line(id, generation, parsed)).is_err()
                 {
                     return;
                 }
             }
+            let _ = tell.send(Heard::Ended(id, generation));
         });
         self.running.insert(
             id,
@@ -441,6 +458,21 @@ impl Cell {
                 generation,
             },
         );
+        self.listening(id);
+    }
+
+    /// Waits until node `id`'s process listens, or fails once it ends first. A process's start
+    /// (its runtime's calibration, its log's and store's files, its keys) is the operating
+    /// system's and the device's work, with no law of the node's to bound it, so nothing but the
+    /// process's own word ends the wait: its `bound` line, or its output's end.
+    fn listening(&mut self, id: u64) {
+        while self.running[&id].bound.is_none() {
+            match self.heard.recv() {
+                Ok(heard) => self.take(heard),
+                Err(_) => panic!("node {id}'s output is gone"),
+            }
+        }
+        self.moved_at = Instant::now();
     }
 
     /// Starts node `id`'s process on a directory whose store is damaged, and waits for its end:
@@ -506,8 +538,9 @@ impl Cell {
                 Line::Status {
                     patience,
                     reconnect,
+                    measuring,
                     ..
-                } => Some((*patience).max(*reconnect)),
+                } => Some((*patience).max(*reconnect).max(*measuring)),
                 Line::Bound(..) | Line::Replaced(..) => None,
             })
             .chain(self.clients.values().copied())
@@ -565,6 +598,16 @@ impl Cell {
                     }
                 }
             }
+            // A process ended that the cell did not kill: it failed.
+            Heard::Ended(id, generation) => {
+                if self
+                    .running
+                    .get(&id)
+                    .is_some_and(|r| r.generation == generation)
+                {
+                    panic!("node {id} ended: {:?}", self.status);
+                }
+            }
             Heard::Told(Told::Progress(client, done, patience)) => {
                 self.progress.insert(client, done);
                 if let Some(patience) = patience {
@@ -576,16 +619,9 @@ impl Cell {
         self.moved_at = Instant::now();
     }
 
-    /// Waits until every running node listens, then tells each where the others do: where they
+    /// Tells each running node, each listening (`Cell::start`), where the others do: where they
     /// do, or on a relayed cell, at the relay, which forwards to where they do.
     fn introduce(&mut self) {
-        self.until(|c| {
-            if c.running.values().all(|r| r.bound.is_some()) {
-                Some(())
-            } else {
-                None
-            }
-        });
         let bound: Vec<(u64, SocketAddr, SocketAddr)> = self
             .running
             .iter()

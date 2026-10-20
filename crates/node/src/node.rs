@@ -192,6 +192,11 @@ pub struct Status {
     /// Heartbeats taken from the peers not yet judged: what moves while the node measures its
     /// links, and stops moving if a peer it measures goes silent.
     pub measuring: u64,
+    /// While some peer is not yet judged, the longest its heartbeats or this node's to it go
+    /// between by the stream's schedule (`PairReport::interval`, `PairReport::sending`): how long
+    /// the node's measuring may go without moving. `None` while every peer is judged, or none has
+    /// a schedule yet.
+    pub measuring_for: Option<Duration>,
     /// How long the node may go without moving while its peers live, by its own law: the longest
     /// any peer's evidence may go unmoved before it is suspected (`PairReport::freshness`), then
     /// the range's expected election from a suspicion and one more round (hyper-raft's `Timing`);
@@ -650,6 +655,7 @@ impl<E: Engine + 'static> Node<E> {
     pub fn status(&self, group: u128) -> Option<Status> {
         let replica = self.kept(group).and_then(|k| self.owner.get(k.handle))?;
         let (mut heartbeats, mut measuring) = (0u64, 0u64);
+        let mut measuring_for: Option<Duration> = None;
         let mut judged = true;
         for report in self
             .remotes
@@ -660,6 +666,9 @@ impl<E: Engine + 'static> Node<E> {
             judged &= report.judged;
             if !report.judged {
                 measuring = measuring.saturating_add(report.taken);
+                for gap in [report.interval, report.sending].into_iter().flatten() {
+                    measuring_for = Some(measuring_for.map_or(gap, |m| m.max(gap)));
+                }
             }
         }
         let patience = self.patience(group);
@@ -671,6 +680,7 @@ impl<E: Engine + 'static> Node<E> {
             heartbeats,
             judged,
             measuring,
+            measuring_for,
             patience,
             snapshots_sent: self.snapshots_sent,
             snapshots_taken: self.snapshots_taken,

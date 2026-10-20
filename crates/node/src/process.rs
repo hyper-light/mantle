@@ -8,11 +8,13 @@
 //! key PKCS #8).
 //!
 //! **Its talk** is lines. On standard output: `bound QUIC PLANE` once the node listens, then
-//! `status TERM LEADER COMMIT APPLIED PATIENCE_NS RECONNECT_NS` each time one of the first four
+//! `status TERM LEADER COMMIT APPLIED PATIENCE_NS RECONNECT_NS MEASURING_NS` each time one of the first four
 //! moves, a peer it dials goes or comes back, or the heartbeats it takes from peers not yet judged
 //! move (`Status::measuring`): how long the node states it may go without moving
 //! while its peers live (`Status::patience`, 0 until measured), and while a peer it dials is not
-//! connected, how long until it is again by the node's law (`Status::reconnect`, else 0); and
+//! connected, how long until it is again by the node's law (`Status::reconnect`, else 0); while
+//! some peer is not yet judged, the longest its stream's heartbeats go between
+//! (`Status::measuring_for`, else 0); and
 //! `replaced FAILED JOINING` once, from the node that led then, when a replacement ended. On
 //! standard input: `learn ID QUIC PLANE`, where a peer listens, and `replace FAILED JOINING`, a
 //! member of the range lost for good and the spare that takes its place (`Node::replace`). A line
@@ -396,8 +398,9 @@ async fn serve(config: ProcessConfig) -> Result<(), ProcessError> {
             if moved {
                 let patience = now.patience.map_or(0, |p| p.as_nanos());
                 let reconnect = now.reconnect.map_or(0, |r| r.as_nanos());
+                let measuring = now.measuring_for.map_or(0, |m| m.as_nanos());
                 let line = format!(
-                    "status {} {} {} {} {patience} {reconnect}\n",
+                    "status {} {} {} {} {patience} {reconnect} {measuring}\n",
                     now.term, now.leader, now.commit, now.applied
                 );
                 say(&mut output, &line).await?;

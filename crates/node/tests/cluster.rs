@@ -714,7 +714,7 @@ impl Watch {
     fn quiet(&self) -> Duration {
         self.status
             .values()
-            .flat_map(|s| [s.patience, s.reconnect])
+            .flat_map(|s| [s.patience, s.reconnect, s.measuring_for])
             .flatten()
             .chain(self.clients.values().copied())
             .fold(INITIAL_RTO, Duration::max)
@@ -832,19 +832,26 @@ impl Cell {
         let (pki, tell, engines) = (self.pki.clone(), self.tell.clone(), self.engines);
         let sockets = node_sockets(self.nodes);
         let thread = std::thread::spawn(move || {
-            let mut rt = shard(sockets);
-            match engines {
-                Engines::Model => {
-                    let settings = pki.settings(id, &dir, first_range(Model::default()));
-                    rt.block_on(run(settings, taken, tell)).unwrap();
+            // A panic on the node's thread is told as its failure, so a wait on it ends.
+            let failed = tell.clone();
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let mut rt = shard(sockets);
+                match engines {
+                    Engines::Model => {
+                        let settings = pki.settings(id, &dir, first_range(Model::default()));
+                        rt.block_on(run(settings, taken, tell)).unwrap();
+                    }
+                    Engines::Mantle => {
+                        // The node's shard is its metadata shard: its replicas apply through the
+                        // engine's synchronous calls (node.md §1.2).
+                        mantle_engine::store::permit_blocking();
+                        let settings = pki.settings(id, &dir, stored(&dir));
+                        rt.block_on(run(settings, taken, tell)).unwrap();
+                    }
                 }
-                Engines::Mantle => {
-                    // The node's shard is its metadata shard: its replicas apply through the
-                    // engine's synchronous calls (node.md §1.2).
-                    mantle_engine::store::permit_blocking();
-                    let settings = pki.settings(id, &dir, stored(&dir));
-                    rt.block_on(run(settings, taken, tell)).unwrap();
-                }
+            }));
+            if ran.is_err() {
+                let _ = failed.send(Report::Failed(id, "its thread panicked".into()));
             }
         });
         // A node started again: its last thread ended with its task.
@@ -861,15 +868,17 @@ impl Cell {
     }
 
     /// Waits until each of `ids` is open, then tells every live node where the others listen: where
-    /// they do, or on a relayed cell, at the relay, which forwards to where they do.
+    /// they do, or on a relayed cell, at the relay, which forwards to where they do. A node's
+    /// opening (its runtime, its log's and store's files, its keys) is the operating system's and
+    /// the device's work, with no law of the node's to bound it, so nothing but the node's own
+    /// word ends the wait: it listens (`Report::Bound`) or it failed.
     fn introduce(&mut self, ids: &[u64]) {
-        self.watch.until(&self.reports, |w| {
-            if ids.iter().all(|id| w.bound.contains_key(id)) {
-                Some(())
-            } else {
-                None
+        while !ids.iter().all(|id| self.watch.bound.contains_key(id)) {
+            match self.reports.recv() {
+                Ok(report) => self.watch.take(report),
+                Err(_) => panic!("every node's task ended: {:?}", self.watch),
             }
-        });
+        }
         if let Some(relay) = &self.relay {
             for id in ids {
                 let (quic, plane) = self.watch.bound[id];

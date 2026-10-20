@@ -278,6 +278,13 @@ impl Client {
                     }
                     target = self.next_node(Some(node));
                 }
+                // The leader refused it for room, its uncommitted bound or its log full: nothing
+                // was applied, and it is asked again of the same leader after the client's
+                // pause, which that room takes to free.
+                Asked::Refused => {
+                    target = Some(node);
+                    tried = self.nodes.len();
+                }
                 Asked::Lost => {
                     // At most every node the client knows, each once.
                     if !lost.contains(&node) {
@@ -604,6 +611,8 @@ enum Asked {
     /// The node leads nothing for the range: the leader it knows, 0 for none, and how long
     /// until it acts on the leader's silence (zero while not yet measured).
     Leader(u64, Duration),
+    /// The leader refused the request for room; nothing was applied.
+    Refused,
     /// The exchange or its connection ended without a reply.
     Lost,
 }
@@ -615,6 +624,7 @@ fn finish(head: ReplyHead) -> Result<Asked, ClientError> {
             head.leader,
             Duration::from_nanos(head.patience_ns),
         )),
+        Status::Refused => Ok(Asked::Refused),
         status => Err(ClientError::Status(status)),
     }
 }

@@ -46,6 +46,7 @@ use hyper_transport::{
 };
 use mantle_meta::engine::Engine;
 use mantle_meta::wire::Answer;
+use mantle_range::membership::{Next, Replacement};
 use mantle_range::{Applied, Elections, GroupStore, Range, RangeMachine};
 
 use crate::bounds::{self, Stated};
@@ -176,6 +177,9 @@ pub struct Status {
     pub heartbeats: u64,
     /// Whether a margin judges every peer the stream keeps (`hyper_liveness::PairReport::judged`).
     pub judged: bool,
+    /// Heartbeats taken from the peers not yet judged: what moves while the node measures its
+    /// links, and stops moving if a peer it measures goes silent.
+    pub measuring: u64,
     /// How long the node may go without moving while its peers live, by its own law: the longest
     /// any peer's evidence may go unmoved before it is suspected (`PairReport::freshness`), then
     /// the range's expected election from a suspicion and one more round (hyper-raft's `Timing`);
@@ -198,6 +202,15 @@ pub struct Status {
     /// is not: a dial out ends within the idle timeout, and the next follows within the peer's
     /// backoff ([`bounds::backed_off`]). `None` while each is connected.
     pub reconnect: Option<Duration>,
+    /// The reads the range's core holds, as its leader: waiting for its term's first commit,
+    /// for a quorum to confirm it leads, or to be taken; and of them, those waiting for that
+    /// quorum (hyper-raft's `Raft::reads_held`, `Raft::pending_read_count`).
+    pub reads_held: usize,
+    pub reads_confirming: usize,
+    /// Clients' reads and commands this node holds open: reads waiting to be confirmed and
+    /// applied through, and commands waiting for every answer.
+    pub reading: usize,
+    pub commanded: usize,
 }
 
 /// What the node's sends of Raft messages did, all told.
@@ -239,6 +252,8 @@ struct Kept {
     max_entry_bytes: u64,
     /// The replica's latest wake, held in [`Node::deadlines`].
     wake: Option<u64>,
+    /// A member lost for good the node replaces while it leads the range ([`Node::replace`]).
+    replacing: Option<Replacement>,
 }
 
 /// A peer as the node keeps it.
@@ -361,6 +376,9 @@ pub struct Node<E: Engine> {
     out: hyper_durable::Output<Applied>,
     frame: Vec<u8>,
     applied: Vec<(u128, Applied)>,
+    /// The replacements that ended while this node led, since the last call
+    /// ([`Node::take_replaced`]).
+    replaced: Vec<(u128, Replacement)>,
     snapshots_sent: u64,
     snapshots_taken: u64,
     /// Each range's timing before a measure, to tell which moved.
@@ -454,6 +472,7 @@ impl<E: Engine + 'static> Node<E> {
                 handle,
                 max_entry_bytes: hosted.range.settings.max_entry_bytes,
                 wake: None,
+                replacing: None,
             });
         }
         let liveness = Liveness::new(hyper_liveness::Settings {
@@ -519,6 +538,7 @@ impl<E: Engine + 'static> Node<E> {
             out: hyper_durable::Output::default(),
             frame: Vec::new(),
             applied: Vec::new(),
+            replaced: Vec::new(),
             snapshots_sent: 0,
             snapshots_taken: 0,
             timings: Vec::new(),
@@ -617,7 +637,7 @@ impl<E: Engine + 'static> Node<E> {
     /// What the node shows of `group` and of its stream.
     pub fn status(&self, group: u128) -> Option<Status> {
         let replica = self.kept(group).and_then(|k| self.owner.get(k.handle))?;
-        let mut heartbeats = 0u64;
+        let (mut heartbeats, mut measuring) = (0u64, 0u64);
         let mut judged = true;
         for report in self
             .remotes
@@ -626,6 +646,9 @@ impl<E: Engine + 'static> Node<E> {
         {
             heartbeats = heartbeats.saturating_add(report.taken);
             judged &= report.judged;
+            if !report.judged {
+                measuring = measuring.saturating_add(report.taken);
+            }
         }
         let patience = self.patience(group);
         Some(Status {
@@ -635,6 +658,7 @@ impl<E: Engine + 'static> Node<E> {
             applied: replica.applied().index,
             heartbeats,
             judged,
+            measuring,
             patience,
             snapshots_sent: self.snapshots_sent,
             snapshots_taken: self.snapshots_taken,
@@ -650,6 +674,10 @@ impl<E: Engine + 'static> Node<E> {
                 .filter(|r| self.id < r.id && !r.keyed)
                 .map(|r| bounds::idle_timeout().saturating_add(r.backoff))
                 .max(),
+            reads_held: replica.core().raft.reads_held(),
+            reads_confirming: replica.core().raft.pending_read_count(),
+            reading: self.reading.iter().filter(|r| r.group == group).count(),
+            commanded: self.commanded.iter().filter(|c| c.group == group).count(),
         })
     }
 
@@ -686,6 +714,72 @@ impl<E: Engine + 'static> Node<E> {
         std::mem::take(&mut self.applied)
     }
 
+    /// Replaces `failed`, a member of `group`'s range lost for good, with `joining`, a member
+    /// under an identity never used, hosted on a node that opened the range as its founders did
+    /// (its founding configuration and rows), of which it is no member, so it campaigns for
+    /// nothing until the replacement adds it (replica.md §6). While this node leads the range it proposes what
+    /// `membership::Replacement` names next at each turn: `joining` as a learner, then, once it
+    /// has caught up, one joint change that makes it a voter and removes `failed`. The
+    /// replacement is stateless, so every node may be told it: one that leads later takes it up
+    /// from the configuration it finds, and one already done ends at once. A replacement that
+    /// ended is reported once by the node that led then ([`Self::take_replaced`]).
+    pub fn replace(&mut self, group: u128, failed: u64, joining: u64) -> Result<(), NodeError> {
+        let replacement = Replacement::new(failed, joining).ok_or(NodeError::Bounds(
+            "a replacement takes a member under an identity never used, not zero".into(),
+        ))?;
+        let kept = self
+            .ranges
+            .iter_mut()
+            .find(|k| k.group == group)
+            .ok_or(NodeError::Bounds(format!("no range of group {group:x}")))?;
+        kept.replacing = Some(replacement);
+        self.owner.schedule(kept.handle);
+        Ok(())
+    }
+
+    /// The replacements that ended while this node led, since the last call: each range's group,
+    /// and the members swapped.
+    pub fn take_replaced(&mut self) -> Vec<(u128, Replacement)> {
+        std::mem::take(&mut self.replaced)
+    }
+
+    /// Proposes what each replacement names next, of the ranges this node leads: a change only
+    /// while none is pending, since the core takes one at a time (a change it drops, with a
+    /// leader stepping down, is proposed again by whichever node leads next).
+    fn step_replacements(&mut self) {
+        for kept in &mut self.ranges {
+            let Some(replacement) = kept.replacing else {
+                continue;
+            };
+            let Some(shell) = self.owner.get_mut(kept.handle) else {
+                continue;
+            };
+            if !shell.is_leader() {
+                continue;
+            }
+            let next = replacement.next(
+                shell.configuration(),
+                shell.caught_up(replacement.joining()),
+                shell.configuration_known(),
+            );
+            match next {
+                Next::Propose(change) => {
+                    if !shell.core().raft.has_pending_conf() {
+                        // A change the core refuses (its leader stepping down, its log full) is
+                        // proposed again at a later turn.
+                        let _ = shell.change(Vec::new(), &change);
+                        self.owner.schedule(kept.handle);
+                    }
+                }
+                Next::Wait => {}
+                Next::Done => {
+                    kept.replacing = None;
+                    self.replaced.push((kept.group, replacement));
+                }
+            }
+        }
+    }
+
     /// One turn: waits until something is due, then takes everything that arrived, drives the
     /// replicas that have work, and sends what they gave.
     ///
@@ -718,6 +812,7 @@ impl<E: Engine + 'static> Node<E> {
         }
         self.schedule_due(now);
         self.drive(now)?;
+        self.step_replacements();
         self.send_plane();
         self.driver.flush()?;
         Ok(())

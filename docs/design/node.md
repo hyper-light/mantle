@@ -1578,6 +1578,15 @@ bounded per node, per device and per cell by the bulk budget, and a learner's la
 bounded; a member is removed only once its replacement holds the durable state the range needs
 (audit §5.7).
 
+*As built (2026-10-20).* A node replaces a member lost for good (`Node::replace`; `mantle node`'s
+`replace FAILED JOINING`): while it leads the range it proposes what `membership::Replacement`
+names next at each turn, a change only while none is pending, and the node that leads when the
+replacement ends reports it once (`replaced`). Every node may be told it, since the replacement
+is stateless. The joining member is a spare identity every directory holds from the start, its
+node started as the founders were, with their configuration and rows, of which it is no member
+until the learner change adds it; a node's directory taking an identity it did not hold (an
+invitation) and moves chosen from size and load are still to build.
+
 ### 6.5 Voters across failure domains
 
 A range's `2f + 1` voters are placed one to a failure domain at the level the configuration

@@ -9,16 +9,19 @@
 //!
 //! **Its talk** is lines. On standard output: `bound QUIC PLANE` once the node listens, then
 //! `status TERM LEADER COMMIT APPLIED PATIENCE_NS RECONNECT_NS` each time one of the first four
-//! moves or a peer it dials goes or comes back: how long the node states it may go without moving
+//! moves, a peer it dials goes or comes back, or the heartbeats it takes from peers not yet judged
+//! move (`Status::measuring`): how long the node states it may go without moving
 //! while its peers live (`Status::patience`, 0 until measured), and while a peer it dials is not
-//! connected, how long until it is again by the node's law (`Status::reconnect`, else 0). On
-//! standard input:
-//! `learn ID QUIC PLANE`, where a peer listens. A line it cannot read ends the process with the
-//! line named; standard input closing ends it as a stop.
+//! connected, how long until it is again by the node's law (`Status::reconnect`, else 0); and
+//! `replaced FAILED JOINING` once, from the node that led then, when a replacement ended. On
+//! standard input: `learn ID QUIC PLANE`, where a peer listens, and `replace FAILED JOINING`, a
+//! member of the range lost for good and the spare that takes its place (`Node::replace`). A line
+//! it cannot read ends the process with the line named; standard input closing ends it as a stop.
 //!
 //! The range it hosts is the cell's first Name range of the voters the file names, its rows in
 //! mantle's engine in the node's directory: founded on first start, opened at its last
-//! checkpoint after, the log replayed past it.
+//! checkpoint after, the log replayed past it. A node whose id the voters do not name is a spare:
+//! it starts as the founders did and is no member of the range until a replacement adds it.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -357,7 +360,7 @@ async fn serve(config: ProcessConfig) -> Result<(), ProcessError> {
                 pending.extend_from_slice(read.get(..n).unwrap_or_default());
                 while let Some(end) = pending.iter().position(|b| *b == b'\n') {
                     let line: Vec<u8> = pending.drain(..=end).collect();
-                    learn(&mut node, &line)?;
+                    take_line(&mut node, config.group, &line)?;
                 }
                 // A line is never longer than the buffer it is read into.
                 if pending.len() > chunk {
@@ -367,7 +370,14 @@ async fn serve(config: ProcessConfig) -> Result<(), ProcessError> {
             }
             Either::Second(Err(e)) => return Err(ProcessError::Runtime(format!("{e:?}"))),
         }
+        for (_, replaced) in node.take_replaced() {
+            let line = format!("replaced {} {}\n", replaced.failed(), replaced.joining());
+            say(&mut output, &line).await?;
+        }
         if let Some(now) = node.status(config.group) {
+            // While some pair is not yet judged, the node is measuring its links, which moves only
+            // the heartbeats it takes from those pairs: said too, so a watcher sees it move before
+            // it elects, and sees it stop if a peer it measures goes silent.
             let moved = told.is_none_or(|was| {
                 (
                     was.term,
@@ -381,7 +391,7 @@ async fn serve(config: ProcessConfig) -> Result<(), ProcessError> {
                     now.commit,
                     now.applied,
                     now.reconnect.is_some(),
-                )
+                ) || was.measuring != now.measuring
             });
             if moved {
                 let patience = now.patience.map_or(0, |p| p.as_nanos());
@@ -397,29 +407,49 @@ async fn serve(config: ProcessConfig) -> Result<(), ProcessError> {
     }
 }
 
-/// Takes a `learn ID QUIC PLANE` line.
-fn learn<E: Engine + 'static>(node: &mut Node<E>, line: &[u8]) -> Result<(), ProcessError> {
+/// Takes a line of the node's input: `learn ID QUIC PLANE` or `replace FAILED JOINING`, a
+/// replacement of `group`'s range.
+fn take_line<E: Engine + 'static>(
+    node: &mut Node<E>,
+    group: u128,
+    line: &[u8],
+) -> Result<(), ProcessError> {
     let text = String::from_utf8_lossy(line).trim().to_owned();
     let mut fields = text.split_whitespace();
-    let (Some("learn"), Some(id), Some(quic), Some(plane), None) = (
+    let words = (
         fields.next(),
         fields.next(),
         fields.next(),
         fields.next(),
         fields.next(),
-    ) else {
-        return Err(ProcessError::Input(text, "learn ID QUIC PLANE"));
+    );
+    let id = |word: &str, what| {
+        word.parse::<u64>()
+            .map_err(|_| ProcessError::Input(text.clone(), what))
     };
-    let id = id
-        .parse()
-        .map_err(|_| ProcessError::Input(text.clone(), "a peer's id"))?;
-    let quic = quic
-        .parse()
-        .map_err(|_| ProcessError::Input(text.clone(), "a QUIC address"))?;
-    let plane = plane
-        .parse()
-        .map_err(|_| ProcessError::Input(text.clone(), "a plane address"))?;
-    node.learn(id, quic, plane)?;
+    let address = |word: &str, what| {
+        word.parse::<SocketAddr>()
+            .map_err(|_| ProcessError::Input(text.clone(), what))
+    };
+    match words {
+        (Some("learn"), Some(peer), Some(quic), Some(plane), None) => {
+            let peer = id(peer, "a peer's id")?;
+            let quic = address(quic, "a QUIC address")?;
+            let plane = address(plane, "a plane address")?;
+            node.learn(peer, quic, plane)?;
+        }
+        (Some("replace"), Some(failed), Some(joining), None, None) => {
+            let failed = id(failed, "a member's id")?;
+            let joining = id(joining, "a spare's id")?;
+            node.replace(group, failed, joining)?;
+        }
+        _ => {
+            return Err(ProcessError::Input(
+                text,
+                "learn ID QUIC PLANE, or replace FAILED JOINING",
+            ));
+        }
+    }
     Ok(())
 }
 

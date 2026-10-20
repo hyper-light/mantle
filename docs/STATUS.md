@@ -362,11 +362,18 @@ Remaining before it is done:
   commands and ReadIndex reads on the request class, and consensus control on the sealed
   datagram plane; chunk transfers, SWIM and the TCP fallback are left.
 - Linearizability with real processes. `crates/node/tests/cluster.rs` checks the histories of
-  three clients putting and reading through a leader stopped or cut off by a relay, on three
-  and five voters and on both engines, with real sockets in one process; `crates/mantle/tests/
-  node.rs` kills the leader of three `mantle node` processes mid-write and checks every answered
-  write applied once and the restarted node caught up. Left: histories of real processes under
-  kills and partitions, disk faults, and a node lost for good replaced in a cell.
+  three clients putting and reading through a leader stopped or cut off by a relay, and through
+  a follower lost for good and replaced by a spare, on three and five voters and on both
+  engines, with real sockets in one process. `crates/mantle/tests/node.rs` runs `mantle node`
+  processes: the leader killed (SIGKILL) mid-write, every answered write applied once and the
+  restarted node caught up; the clients' histories through a leader killed and started again
+  and through a leader cut off, on three voters and five; and a follower whose engine store is
+  damaged at rest, which refuses it with a typed corruption error, is replaced by a spare, and
+  then as many original voters are killed as leave a bare quorum, the spare in it. Each key's
+  history is checked linearizable (`crates/node/tests/support/history.rs`). Left: the node
+  under deterministic simulation, and damage to a node's log (a group the log finds damaged is
+  rebuilt under a new identity, `Replica::rebuild`, which needs placement's map of members to
+  nodes).
 - Done when a linearizability checker accepts histories recorded under network partitions,
   process crashes and disk faults, both in deterministic simulation and with real
   processes.

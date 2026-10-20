@@ -25,6 +25,10 @@
 //!   each key's history is linearizable (Wing and Gong's search with Lowe's memo,
 //!   `crates/range/tests/support/linear.rs`), and every live node ends where the others do.
 //!
+//! - A follower lost for good, its directory with it, is replaced by a node under an identity
+//!   never used (replica.md §6), and an original node then stops, so the quorum counts the new
+//!   one: the clients' history through both is linearizable, no acknowledged write lost.
+//!
 //! The cut and the linearizable histories run on cells of three voters and of five (node.md's
 //! Phase C).
 //!
@@ -33,8 +37,9 @@
 //!
 //! Each node's task reports its status (`Node::status`) and its answers over a channel. The test's
 //! thread waits on those reports and goes on while the nodes move: a term, a leader, a commit or an
-//! applied index, an answer, a node opened or stopped, or, while some pair is not yet judged by a
-//! margin, the heartbeats taken. It gives up once a quiet period passes with nothing moved: the
+//! applied index, an answer, a node opened or stopped, or the heartbeats taken from the peers not
+//! yet judged by a margin (`Status::measuring`), which stop if a peer measured goes silent. It
+//! gives up once a quiet period passes with nothing moved: the
 //! longest patience any node states by its own law (`Status::patience`), or the longest until a
 //! peer a node dials is connected again (`Status::reconnect`), or any client gives an exchange by
 //! its own (`Client::patience`), and never less than RFC 6298's initial retransmission timeout, one
@@ -76,20 +81,20 @@ use mantle_engine::store::Config as StoreConfig;
 use mantle_engine::trunk::TrunkConfig;
 use mantle_meta::apply::Layer;
 use mantle_meta::engine::{Engine, Model};
-use mantle_meta::name::{self, GateChange, Preconditions, Put};
-use mantle_meta::record::{GateState, Version, Versioning};
+use mantle_meta::name;
 use mantle_meta::session::Rules;
-use mantle_meta::wire::{Answer, Command as Op, Entry, Sessioned};
+use mantle_meta::wire::{Answer, Entry};
 use mantle_node::classes::Role;
 use mantle_node::client::{Client, ClientSettings};
 use mantle_node::directory::{Peer, node_name};
 use mantle_node::node::{Hosted, Node, NodeSettings, Status, message_bounds};
-use mantle_node::read::{Query, Read};
 use mantle_range::{ConfState, Range, Settings, Stored};
 
+#[path = "support/history.rs"]
+mod history;
 #[path = "../../range/tests/support/linear.rs"]
 mod linear;
-use linear::{Input, Operation, Output, Register, Verdict};
+use history::{Part, Plan, Steer, Told, check_histories, registration, workload};
 #[path = "support/relay.rs"]
 mod relay;
 use relay::Relay;
@@ -106,11 +111,6 @@ const CLIENT: u64 = MOST_NODES + 1;
 /// The clients of the linearizable scenario, each its own identity and session: one for each node
 /// of a cell of three.
 const CLIENTS: u64 = NODES;
-/// The keys they write and read: two, so the history's partitions are checked apart (Herlihy and
-/// Wing's locality) and each key's interleaving is dense.
-const KEYS: [&str; 2] = ["k0", "k1"];
-/// The steps the history's check may take: the range simulation's (`crates/range/tests/sim.rs`).
-const CHECK_BUDGET: u64 = 10_000_000;
 /// RFC 6298 §2.1: the retransmission timeout before any round trip is measured, one second; the
 /// least quiet period the test waits through.
 const INITIAL_RTO: Duration = Duration::from_secs(1);
@@ -195,23 +195,24 @@ const TRUNK: TrunkConfig = TrunkConfig {
     leaf_entries: 96,
 };
 
+/// The store file of a node's range engine in `dir`.
+fn store_file(dir: &Path, create: bool) -> DeviceFile {
+    DeviceFile::open(
+        &dir.join("range.store"),
+        create,
+        CachingRequest::Buffered,
+        Alignment::new(STORE.page_size).unwrap(),
+    )
+    .unwrap()
+}
+
 /// The node's range engine in `dir`: opened at its last checkpoint when its store is there,
 /// created with the range's founding rows when not.
 fn stored(dir: &Path) -> Stored<DeviceFile> {
-    let path = dir.join("range.store");
-    let file = |create| {
-        DeviceFile::open(
-            &path,
-            create,
-            CachingRequest::Buffered,
-            Alignment::new(STORE.page_size).unwrap(),
-        )
-        .unwrap()
-    };
-    if path.exists() {
-        Stored::open(file(false), STORE, STORE.page_size, TRUNK).unwrap()
+    if dir.join("range.store").exists() {
+        Stored::open(store_file(dir, false), STORE, STORE.page_size, TRUNK).unwrap()
     } else {
-        first_range(Stored::create(file(true), STORE, STORE.page_size, TRUNK).unwrap())
+        first_range(Stored::create(store_file(dir, true), STORE, STORE.page_size, TRUNK).unwrap())
     }
 }
 
@@ -230,198 +231,10 @@ fn log_config() -> LogConfig {
     }
 }
 
-/// A registration, told from the others by its serial.
-fn registration(serial: u64) -> Entry {
-    Entry {
-        at_ns: 0,
-        commands: vec![Sessioned {
-            session: 0,
-            serial,
-            unanswered: 0,
-            command: Op::Register,
-        }],
-    }
-}
-
 /// Writes that pass a log group's room: one more entry than a group may retain, so the range
 /// compacts at least once whatever an entry's bytes.
 fn past_room() -> u64 {
     log_config().group_entries + 1
-}
-
-/// A put of `key`, its etag `etag`, the version naming `file`: as the range simulation writes one
-/// (`crates/range/tests/sim.rs`).
-fn put(key: &str, etag: &str, file: u128) -> Op {
-    Op::Name(Box::new(name::Command::Put(Put {
-        bucket: "b".into(),
-        incarnation: 1,
-        key: key.into(),
-        versioning: Versioning::Enabled,
-        preconditions: Preconditions::default(),
-        at_ns: 0,
-        ordered_ns: None,
-        version: Version {
-            marker: false,
-            null: false,
-            modified_ns: 0,
-            etag: etag.into(),
-            size: 1,
-            checksum: None,
-            file: Some(file),
-            owner: "o".into(),
-            headers: Vec::new(),
-            retention: None,
-            legal_hold: None,
-            listing: None,
-        },
-        default: None,
-        id: 0,
-        deadline_ns: u64::MAX,
-    })))
-}
-
-/// The gate a put needs, as the range simulation opens it.
-fn open_gate() -> Op {
-    Op::Name(Box::new(name::Command::Gate(GateChange {
-        bucket: "b".into(),
-        incarnation: 1,
-        attempt: 1,
-        from: None,
-        to: Some(GateState::Open),
-        generation: 1,
-    })))
-}
-
-/// One command of a session: its serial, and every answer before it acknowledged.
-fn sessioned(session: u64, serial: u64, command: Op) -> Entry {
-    Entry {
-        at_ns: 0,
-        commands: vec![Sessioned {
-            session,
-            serial,
-            unanswered: serial,
-            command,
-        }],
-    }
-}
-
-/// Nanoseconds since `start`: the clock every client's history is on.
-fn since(start: Instant) -> u64 {
-    u64::try_from(start.elapsed().as_nanos()).unwrap()
-}
-
-/// Whether the test has told a workload to stop: its sender is gone.
-fn stopped(stop: &mpsc::Receiver<()>) -> bool {
-    matches!(stop.try_recv(), Err(mpsc::TryRecvError::Disconnected))
-}
-
-/// Registers a session under `nonce`: its ID, or why the range gave none.
-async fn register(client: &mut Client, nonce: u64) -> Result<u64, String> {
-    match client.command(GROUP, &registration(nonce), u64::MAX).await {
-        Ok(answers) => match answers.as_slice() {
-            [Answer::Registered { session }] => Ok(*session),
-            _ => Err(format!("registration answered {answers:?}")),
-        },
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-/// A client's part of the history: each operation's key, and its call and return on the test's
-/// clock with what it asked and was answered.
-type Part = Vec<(&'static str, Operation<Input, Output>)>;
-
-/// A workload client's thread: registers its session, then `ops` operations, a put and a get of
-/// each key in turn, each recorded; it stops early when the test does. An operation has no
-/// deadline of its own, as the client's commands have none: the client follows the leader through
-/// the stop, a command asked again with its serial, so the session applies it once; the test's
-/// watch ends an operation that is never answered, and one refused fails the test.
-fn workload(
-    settings: ClientSettings,
-    bound: Vec<(u64, SocketAddr)>,
-    ops: u64,
-    start: Instant,
-    stop: mpsc::Receiver<()>,
-    tell: mpsc::Sender<Report>,
-) -> Part {
-    let id = settings.id;
-    shard(client_sockets(settings.nodes.len()))
-        .block_on(async move {
-            let mut part = Vec::new();
-            let failed = |why: String| {
-                let _ = tell.send(Report::Failed(id, why));
-            };
-            let mut client = match Client::open(settings).await {
-                Ok(client) => client,
-                Err(error) => {
-                    failed(error.to_string());
-                    return part;
-                }
-            };
-            for (node, quic) in bound {
-                client.learn(node, quic).unwrap();
-            }
-            let session = match register(&mut client, id).await {
-                Ok(session) => session,
-                Err(why) => {
-                    failed(why);
-                    return part;
-                }
-            };
-            let mut serial = 0u64;
-            for i in 0..ops {
-                if stopped(&stop) {
-                    break;
-                }
-                let key = KEYS[usize::try_from(i / 2).unwrap() % KEYS.len()];
-                let call = since(start);
-                let (input, output) = if i % 2 == 0 {
-                    serial += 1;
-                    let etag = format!("c{id}-{i}");
-                    let file = u128::from(id) << 64 | u128::from(i);
-                    let entry = sessioned(session, serial, put(key, &etag, file));
-                    match client.command(GROUP, &entry, u64::MAX).await {
-                        Ok(answers)
-                            if matches!(
-                                answers.as_slice(),
-                                [Answer::Name(name::Outcome::Put { .. })]
-                            ) =>
-                        {
-                            (Input::Put(etag), Output::Put)
-                        }
-                        answered => {
-                            failed(format!("put {i} of {key}: {answered:?}"));
-                            return part;
-                        }
-                    }
-                } else {
-                    let query = Query::Current {
-                        bucket: "b".into(),
-                        key: key.into(),
-                    };
-                    match client.read(GROUP, &query, u64::MAX).await {
-                        Ok(Read::Current(current)) => {
-                            (Input::Get, Output::Got(current.map(|(_, v)| v.etag)))
-                        }
-                        Err(error) => {
-                            failed(format!("read {i} of {key}: {error}"));
-                            return part;
-                        }
-                    }
-                };
-                part.push((
-                    key,
-                    Operation {
-                        call,
-                        ret: Some(since(start)),
-                        input,
-                        output: Some(output),
-                    },
-                ));
-                let _ = tell.send(Report::Progress(id, i + 1, client.patience()));
-            }
-            part
-        })
-        .unwrap()
 }
 
 /// A shard of its own, sized by what it holds: one task, its wait's timer and its driver's QUIC
@@ -463,6 +276,9 @@ fn client_sockets(nodes: usize) -> usize {
 #[derive(Clone)]
 struct Pki {
     authority: Vec<u8>,
+    /// The range's founding voters: nodes 1 to `voters`. A node past them is a spare identity,
+    /// one a replacement takes, which every directory holds from the start.
+    voters: u64,
     /// By node id: the certificate, DER, and the key, PKCS #8.
     nodes: BTreeMap<u64, (Vec<u8>, Vec<u8>)>,
     /// By client id: the certificate and the key.
@@ -470,8 +286,9 @@ struct Pki {
 }
 
 impl Pki {
-    /// The authority, `nodes` nodes' certificates and keys, and the clients'.
-    fn new(nodes: u64) -> Self {
+    /// The authority, `nodes` nodes' certificates and keys, the first `voters` of them the range's
+    /// founding voters, and the clients'.
+    fn new(voters: u64, nodes: u64) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -494,6 +311,7 @@ impl Pki {
             .collect();
         Self {
             authority,
+            voters,
             nodes,
             clients,
         }
@@ -536,6 +354,8 @@ impl Pki {
 
     /// Node `id`'s settings: its directory, loopback addresses the kernel picks, its credentials,
     /// its peers by certificate, and the range.
+    /// Node `id`'s settings, its rows in `engine`: its range names the founding voters, whether
+    /// it is one or a spare that joins as a replacement adds it.
     fn settings<E>(&self, id: u64, dir: &Path, engine: E) -> NodeSettings<E> {
         let others: Vec<u64> = self
             .nodes
@@ -561,7 +381,7 @@ impl Pki {
             credentials: self.credentials(&self.nodes[&id]),
             peers,
             addresses: Vec::new(),
-            ranges: vec![hosted(u64::try_from(self.nodes.len()).unwrap(), engine)],
+            ranges: vec![hosted(self.voters, engine)],
             log: log_config(),
             transport_bytes,
         }
@@ -588,6 +408,9 @@ enum Report {
     /// A workload client's operations done, of all it does, and how long it now gives an exchange
     /// before it takes the node as lost (`Client::patience`).
     Progress(u64, u64, Option<Duration>),
+    /// A replacement a node ended as the range's leader: the member lost for good and the one
+    /// that took its place.
+    Replaced(u64, u64),
 }
 
 /// What the test tells the client's task.
@@ -639,13 +462,15 @@ enum Order {
     /// Where a peer listens.
     Learn(u64, SocketAddr, SocketAddr),
     Propose(Entry),
+    /// Replace the first, a member lost for good, with the second (`Node::replace`).
+    Replace(u64, u64),
     Stop,
 }
 
-/// Orders the channel of a node of a cell of `nodes` holds: where each peer listens, a proposal
-/// and a stop.
+/// Orders the channel of a node of a cell of `nodes` holds: where each peer listens, a proposal,
+/// a replacement and a stop.
 fn orders_bound(nodes: u64) -> usize {
-    usize::try_from(nodes).unwrap() + 1
+    usize::try_from(nodes).unwrap() + 2
 }
 
 /// A node's task: opens the node, as the task that turns a node opens it (`Node::open`), reports
@@ -694,6 +519,12 @@ async fn run<E: Engine + 'static>(
             Either::Second(Ok(Order::Propose(entry))) => {
                 let _ = node.propose(GROUP, &entry);
             }
+            Either::Second(Ok(Order::Replace(failed, joining))) => {
+                if let Err(error) = node.replace(GROUP, failed, joining) {
+                    let _ = reports.send(Report::Failed(id, error.to_string()));
+                    return;
+                }
+            }
             Either::Second(Ok(Order::Stop)) => {
                 drop(node);
                 let _ = reports.send(Report::Stopped(id));
@@ -701,6 +532,12 @@ async fn run<E: Engine + 'static>(
             }
             // The test is done.
             Either::Second(Err(_)) => return,
+        }
+        for (_, replaced) in node.take_replaced() {
+            let report = Report::Replaced(replaced.failed(), replaced.joining());
+            if reports.send(report).is_err() {
+                return;
+            }
         }
         for (_, applied) in node.take_applied() {
             if applied.session == 0 {
@@ -757,6 +594,8 @@ struct Watch {
     progress: BTreeMap<u64, u64>,
     /// How long each workload client gives an exchange before it takes the node as lost.
     clients: BTreeMap<u64, Duration>,
+    /// The replacements a leader ended: the member lost for good and the one in its place.
+    replaced: BTreeSet<(u64, u64)>,
     /// When a node last moved.
     moved_at: Option<Instant>,
 }
@@ -804,7 +643,7 @@ impl Watch {
                 let moved = self.status.get(&id).is_none_or(|was| {
                     (was.term, was.leader, was.commit, was.applied)
                         != (now.term, now.leader, now.commit, now.applied)
-                        || (!(was.judged && now.judged) && was.heartbeats != now.heartbeats)
+                        || was.measuring != now.measuring
                 });
                 if moved {
                     self.moved_at = Some(Instant::now());
@@ -833,6 +672,10 @@ impl Watch {
             }
             Report::Answered(serial, answered) => {
                 self.answered.insert(serial, answered);
+                self.moved_at = Some(Instant::now());
+            }
+            Report::Replaced(failed, joining) => {
+                self.replaced.insert((failed, joining));
                 self.moved_at = Some(Instant::now());
             }
             Report::Progress(client, done, patience) => {
@@ -905,7 +748,8 @@ impl Watch {
 /// The cell under test: each node's thread and the orders to it, the client's, the reports from
 /// all, and what the test heard.
 struct Cell {
-    /// The cell's nodes, each a founding voter of the range: 1 to `nodes`.
+    /// The cell's node identities, 1 to `nodes`: the range's founding voters, then any spares
+    /// (`Pki::voters`).
     nodes: u64,
     engines: Engines,
     pki: Pki,
@@ -918,6 +762,8 @@ struct Cell {
     reports: mpsc::Receiver<Report>,
     watch: Watch,
     relay: Option<Relay>,
+    /// Where the running workload's clients are told of a node that starts.
+    learns: Vec<mpsc::Sender<(u64, SocketAddr)>>,
 }
 
 impl Drop for Cell {
@@ -942,11 +788,18 @@ impl Cell {
 
     /// A cell of `nodes` nodes started on `network`, each told where the others listen.
     fn start_on(engines: Engines, network: Network, nodes: u64) -> Self {
+        Self::start_spared(engines, network, nodes, 0)
+    }
+
+    /// A cell of `voters` nodes started on `network`, each told where the others listen, and
+    /// `spares` identities past them that every directory holds and no node runs yet.
+    fn start_spared(engines: Engines, network: Network, voters: u64, spares: u64) -> Self {
+        let nodes = voters + spares;
         let (tell, reports) = mpsc::channel();
         let mut cell = Cell {
             nodes,
             engines,
-            pki: Pki::new(nodes),
+            pki: Pki::new(voters, nodes),
             dirs: (1..=nodes)
                 .map(|id| (id, tempfile::tempdir().unwrap()))
                 .collect(),
@@ -959,16 +812,18 @@ impl Cell {
             watch: Watch::default(),
             relay: (network == Network::Relayed)
                 .then(|| Relay::start(&(1..=nodes).collect::<Vec<_>>())),
+            learns: Vec::new(),
         };
-        for id in 1..=nodes {
+        for id in 1..=voters {
             cell.spawn(id);
         }
-        cell.introduce(&(1..=nodes).collect::<Vec<_>>());
+        cell.introduce(&(1..=voters).collect::<Vec<_>>());
         cell
     }
 
     /// Starts node `id` on a thread of its own, its shard, on its directory: the engine is opened
-    /// on the shard that turns its node.
+    /// on the shard that turns its node. A spare starts as the founding voters did, with their
+    /// configuration and rows, and is no member of the range until a replacement adds it.
     fn spawn(&mut self, id: u64) {
         let (order, taken) = channel(orders_bound(self.nodes)).unwrap();
         self.orders.insert(id, order);
@@ -1040,6 +895,19 @@ impl Cell {
         for peer in (1..=self.nodes).filter(|peer| *peer != id) {
             relay.join(id, peer, !cut);
         }
+    }
+
+    /// Waits until the workload's clients, `ops` operations each, have done `quarters` quarters
+    /// of them in all.
+    fn done_by(&mut self, ops: u64, quarters: u64) {
+        let done = ops * CLIENTS * quarters / 4;
+        self.watch.until(&self.reports, |w| {
+            if w.progress.values().sum::<u64>() >= done {
+                Some(())
+            } else {
+                None
+            }
+        });
     }
 
     /// Waits until every live node has applied as far as the others.
@@ -1161,13 +1029,7 @@ impl Cell {
                     for (node, quic) in bound {
                         client.learn(node, quic).unwrap();
                     }
-                    let answered = match register(&mut client, CLIENT).await {
-                        Ok(session) => client
-                            .command(GROUP, &sessioned(session, 1, open_gate()), u64::MAX)
-                            .await
-                            .map_err(|e| e.to_string()),
-                        Err(why) => Err(why),
-                    };
+                    let answered = history::open_bucket(&mut client, GROUP, CLIENT).await;
                     let _ = tell.send(Report::Answered(u64::MAX, answered));
                 })
                 .unwrap();
@@ -1180,26 +1042,51 @@ impl Cell {
         assert_eq!(answers, vec![Answer::Name(name::Outcome::GateMoved)]);
     }
 
-    /// Starts the workload clients, `ops` operations each, on `start`'s clock; the senders whose
-    /// drop stops them.
-    fn start_workload(
-        &mut self,
-        ops: u64,
-        start: Instant,
-    ) -> (Vec<JoinHandle<Part>>, Vec<mpsc::Sender<()>>) {
+    /// Starts the workload clients, as `plan` says, each knowing every node identity and told
+    /// where the live nodes listen; the senders whose drop stops them.
+    fn start_workload(&mut self, plan: Plan) -> (Vec<JoinHandle<Part>>, Vec<mpsc::Sender<()>>) {
         let order: Vec<u64> = (1..=self.nodes).collect();
         let mut threads = Vec::new();
         let mut stops = Vec::new();
+        self.learns.clear();
         for id in CLIENT..CLIENT + CLIENTS {
             let (stop, stopping) = mpsc::channel();
+            let (learn, learning) = mpsc::channel();
             let settings = self.pki.client_settings(id, &order);
             let (bound, tell) = (self.bound_quic(), self.tell.clone());
+            let steer = Steer {
+                learn: learning,
+                stop: stopping,
+            };
+            let told = move |told: Told| {
+                let _ = tell.send(match told {
+                    Told::Progress(id, done, patience) => Report::Progress(id, done, patience),
+                    Told::Failed(id, why) => Report::Failed(id, why),
+                });
+            };
             threads.push(std::thread::spawn(move || {
-                workload(settings, bound, ops, start, stopping, tell)
+                workload(settings, bound, (plan, steer), shard, told)
             }));
             stops.push(stop);
+            self.learns.push(learn);
         }
         (threads, stops)
+    }
+
+    /// Tells the running workload's clients where node `id` listens.
+    fn tell_workload(&self, id: u64) {
+        let (quic, _) = self.watch.bound[&id];
+        for learn in &self.learns {
+            // A client done with its operations has dropped its end.
+            let _ = learn.send((id, quic));
+        }
+    }
+
+    /// Stops node `id` for good: its process and its directory gone, as a node whose device
+    /// failed. Its identity never runs again.
+    fn lose(&mut self, id: u64) {
+        self.stop(id);
+        self.dirs.remove(&id);
     }
 
     /// Stops every live node, so each closes its log before its directory goes.
@@ -1422,53 +1309,114 @@ fn linearizable(engines: Engines, fault: Fault, nodes: u64) {
     let leader = cell.leader();
     cell.open_bucket();
     // Puts enough to pass the log group's room in all, so the history crosses compactions.
-    let ops = (2 * past_room()).div_ceil(CLIENTS);
-    let start = Instant::now();
-    let (threads, stops) = cell.start_workload(ops, start);
+    let ops = workload_ops();
+    let (threads, stops) = cell.start_workload(Plan {
+        group: GROUP,
+        ops,
+        phase: 0,
+        start: Instant::now(),
+    });
     // Half the history before the fault, and for a cut, a quarter cut off and a quarter after.
-    let done_by = |cell: &mut Cell, quarters: u64| {
-        let ops = ops * CLIENTS * quarters / 4;
-        cell.watch.until(&cell.reports, |w| {
-            if w.progress.values().sum::<u64>() >= ops {
-                Some(())
-            } else {
-                None
-            }
-        });
-    };
-    done_by(&mut cell, 2);
+    cell.done_by(ops, 2);
     match fault {
         Fault::Stop => cell.stop(leader),
         Fault::Cut => {
             cell.isolate(leader, true);
-            done_by(&mut cell, 3);
+            cell.done_by(ops, 3);
             cell.isolate(leader, false);
         }
     }
-    done_by(&mut cell, 4);
+    cell.done_by(ops, 4);
     drop(stops);
-    let mut by_key: BTreeMap<&str, Vec<Operation<Input, Output>>> = BTreeMap::new();
-    for thread in threads {
-        for (key, op) in thread.join().unwrap() {
-            by_key.entry(key).or_default().push(op);
-        }
-    }
-    for (key, ops) in &by_key {
-        let read = ops
-            .iter()
-            .filter(|o| matches!(o.output, Some(Output::Got(Some(_)))))
-            .count();
-        assert!(read > 0, "{key}: no read saw a put");
-        assert_eq!(
-            linear::check(&Register, ops, CHECK_BUDGET),
-            Verdict::Linearizable,
-            "{key}: {} operations",
-            ops.len()
-        );
-    }
+    check_histories(threads.into_iter().flat_map(|t| t.join().unwrap()));
     // Every live node, the one cut off among them, ends where the others do.
     cell.converged();
     cell.close();
+}
+
+/// Each workload client's operations: puts enough to pass the log group's room in all, so the
+/// history crosses compactions.
+fn workload_ops() -> u64 {
+    (2 * past_room()).div_ceil(CLIENTS)
+}
+
+/// A follower lost for good, its directory with it, replaced by a node under an identity never
+/// used: added as a learner, caught up, and swapped in by one joint change (replica.md §6). Then
+/// an original node stops, so the range's quorum counts the new one. The history of both phases,
+/// one through the loss and the replacement and one after the stop, is linearizable: no write
+/// acknowledged before is lost, since a read after sees it.
+fn replaced_for_good(engines: Engines) {
+    let mut cell = Cell::start_spared(engines, Network::Direct, NODES, 1);
+    let joining = NODES + 1;
+    let leader = cell.leader();
+    cell.open_bucket();
+    let ops = workload_ops();
+    let start = Instant::now();
+    let mut history = Vec::new();
+    let (threads, stops) = cell.start_workload(Plan {
+        group: GROUP,
+        ops,
+        phase: 0,
+        start,
+    });
+    cell.done_by(ops, 1);
+    let lost = (1..=NODES).find(|id| *id != leader).unwrap();
+    cell.lose(lost);
+    cell.spawn(joining);
+    cell.introduce(&[joining]);
+    cell.tell_workload(joining);
+    let told: Vec<u64> = cell
+        .watch
+        .live
+        .iter()
+        .copied()
+        .filter(|id| *id != joining)
+        .collect();
+    for id in told {
+        cell.order(id, Order::Replace(lost, joining));
+    }
+    cell.watch.until(&cell.reports, |w| {
+        if w.replaced.contains(&(lost, joining)) {
+            Some(())
+        } else {
+            None
+        }
+    });
+    cell.done_by(ops, 4);
+    drop(stops);
+    for thread in threads {
+        history.extend(thread.join().unwrap());
+    }
+    // An original voter stops: the two left of the three are a quorum only with the new one.
+    let original = (1..=NODES)
+        .find(|id| *id != lost && cell.watch.live.contains(id))
+        .unwrap();
+    cell.stop(original);
+    cell.watch.progress.clear();
+    let (threads, stops) = cell.start_workload(Plan {
+        group: GROUP,
+        ops,
+        phase: 1,
+        start,
+    });
+    cell.done_by(ops, 4);
+    drop(stops);
+    for thread in threads {
+        history.extend(thread.join().unwrap());
+    }
+    check_histories(history.into_iter());
+    cell.converged();
+    cell.close();
+}
+
+#[test]
+fn a_follower_lost_for_good_is_replaced_and_no_acknowledged_write_is_lost() {
+    replaced_for_good(Engines::Model);
+}
+
+#[test]
+fn a_follower_lost_for_good_is_replaced_and_no_acknowledged_write_is_lost_on_mantles_engine() {
+    replaced_for_good(Engines::Mantle);
 }
 
 #[test]

@@ -478,6 +478,11 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/meta/src/wire.rs` `ETAG_HEX` | external | A part's ETag, the hex of its 16-byte MD5 (research/05 §4.5). |
 | `crates/meta/src/wire.rs` `FORMAT` | format | Version byte 5 of an encoded log entry; 5 since a registration refused at the bound of sessions is answered `SessionsFull` with the time a place frees, 4 since a part carries its file's handover deadline in place of the command beside it, 3 since a PUT and a completion carry the ID of their request, which names a write with no file, and a mark kept past an unmark is answered with its deadline, 2 since a completion carries its part listing's digest. |
 | `crates/meta/src/wire.rs` `MAX_COMMANDS` | bound | 2^16 command places per entry, so a session ID is index × 2^16 + place (session.rs `register`); the audit (§12.6) keeps it as a versioned encoding bound with byte and work budgets beside it. |
+| `crates/node/src/classes.rs` `RANKS` | format | Three classes on a node's QUIC connections: replication, request and bulk (docs/design/node.md §3.1); consensus control that fits a datagram takes the plane. |
+| `crates/node/src/frame.rs` `CRC_BYTES` | format | A Raft frame's CRC-32C, four bytes (CLAUDE.md §6). |
+| `crates/node/src/frame.rs` `GROUP_BYTES` | format | A Raft frame's group, a u128 as the log names a range's group (hyper-log). |
+| `crates/node/src/frame.rs` `HEADER_BYTES` | derived | CRC_BYTES plus GROUP_BYTES: the bytes before a frame's message. |
+| `crates/node/src/layout.rs` `RUN_BYTES` | format | The node's run record: one u64 count (hyper-liveness `Settings::run`). |
 | `crates/range/src/conf.rs` `FORMAT` | format | Version byte of the encoded configuration row. |
 | `crates/range/src/image.rs` `FORMAT` | format | Version byte of the encoded snapshot image. |
 | `crates/range/src/replica.rs` `QUIET` | derived | `Duration::MAX`, no quiet write: the durable shell writes a commit no write stated after its owner's period so that a member acting on applied state at its next start reopens with it (hyper-raft docs/durable.md §4.1); no entry of a range is acted on at start (`RangeMachine::acts_at_start`), and the engine's durable index is part of the durable commit, so the write is never due. |

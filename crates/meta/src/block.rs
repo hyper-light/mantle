@@ -122,7 +122,7 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
 }
 
 fn write<E: Rows>(
-    engine: &E,
+    engine: &mut E,
     block: u128,
     header: &BlockHeader,
     chunks: &[ChunkPlace],
@@ -199,7 +199,7 @@ fn valid(block: u128, header: &BlockHeader, chunks: &[ChunkPlace]) -> bool {
 }
 
 fn renew<E: Rows>(
-    engine: &E,
+    engine: &mut E,
     block: u128,
     file: u128,
     handover_ns: u64,
@@ -240,7 +240,7 @@ fn renew<E: Rows>(
 }
 
 fn release<E: Rows>(
-    engine: &E,
+    engine: &mut E,
     block: u128,
     deadline_ns: u64,
 ) -> Result<(Outcome, Vec<Write>), MetaError> {
@@ -270,7 +270,7 @@ fn release<E: Rows>(
 }
 
 fn relocate<E: Rows>(
-    engine: &E,
+    engine: &mut E,
     chunk: &ChunkKey,
     from: u128,
     to: u128,
@@ -309,7 +309,7 @@ fn relocate<E: Rows>(
     Ok((Outcome::Moved, writes))
 }
 
-fn delete<E: Rows>(engine: &E, block: u128) -> Result<(Outcome, Vec<Write>), MetaError> {
+fn delete<E: Rows>(engine: &mut E, block: u128) -> Result<(Outcome, Vec<Write>), MetaError> {
     let Some((_, places)) = read(engine, block)? else {
         return Ok((Outcome::Deleted, Vec::new()));
     };
@@ -330,7 +330,7 @@ fn delete<E: Rows>(engine: &E, block: u128) -> Result<(Outcome, Vec<Write>), Met
 /// Writes that take `blocks` out of the unsettled queue; a block already out, or removed,
 /// needs none. A released block stays queued until its rows go, so a sweep that stops while
 /// taking it apart finds it again.
-fn settle<E: Rows>(engine: &E, blocks: &[u128]) -> Result<Vec<Write>, MetaError> {
+fn settle<E: Rows>(engine: &mut E, blocks: &[u128]) -> Result<Vec<Write>, MetaError> {
     let mut writes = reserved(blocks.len())?;
     for &block in blocks {
         if let Some(o) = origin(engine, block)?
@@ -343,7 +343,7 @@ fn settle<E: Rows>(engine: &E, blocks: &[u128]) -> Result<Vec<Write>, MetaError>
 }
 
 /// Where a block came from.
-pub fn origin<E: Rows>(engine: &E, block: u128) -> Result<Option<BlockOrigin>, MetaError> {
+pub fn origin<E: Rows>(engine: &mut E, block: u128) -> Result<Option<BlockOrigin>, MetaError> {
     Ok(engine
         .get(&key::block_origin(block))?
         .map(|b| BlockOrigin::decode(&b))
@@ -353,7 +353,7 @@ pub fn origin<E: Rows>(engine: &E, block: u128) -> Result<Option<BlockOrigin>, M
 /// The blocks whose handover deadline passed before `before_ns` and the sweep has yet to
 /// settle, soonest deadline first, at most `max`: the sweep's work.
 pub fn unsettled<E: Rows>(
-    engine: &E,
+    engine: &mut E,
     before_ns: u64,
     max: usize,
 ) -> Result<Vec<Unsettled>, MetaError> {
@@ -382,7 +382,7 @@ fn width(header: &BlockHeader) -> Option<u16> {
 
 /// A block's header and its chunks' places, in index order.
 pub fn read<E: Rows>(
-    engine: &E,
+    engine: &mut E,
     block: u128,
 ) -> Result<Option<(BlockHeader, Vec<ChunkPlace>)>, MetaError> {
     let Some(bytes) = engine.get(&key::block_header(block))? else {
@@ -407,7 +407,7 @@ pub fn read<E: Rows>(
 /// The range's blocks with a chunk on `volume`, after block `after`, at most `max` of them in
 /// block order, each with the index of its chunk there.
 pub fn on_volume<E: Rows>(
-    engine: &E,
+    engine: &mut E,
     volume: u128,
     after: Option<u128>,
     max: usize,
@@ -498,9 +498,9 @@ mod tests {
             handover_ns: u64::MAX / 2,
         };
         assert_eq!(apply(&mut m, 3, &again).unwrap(), Outcome::Conflict);
-        assert_eq!(read(&m, 5).unwrap(), Some((header(2, 1), placed)));
-        assert_eq!(on_volume(&m, 10, None, 10).unwrap(), [(5, 0)]);
-        assert_eq!(on_volume(&m, 12, None, 10).unwrap(), [(5, 2)]);
+        assert_eq!(read(&mut m, 5).unwrap(), Some((header(2, 1), placed)));
+        assert_eq!(on_volume(&mut m, 10, None, 10).unwrap(), [(5, 0)]);
+        assert_eq!(on_volume(&mut m, 12, None, 10).unwrap(), [(5, 2)]);
 
         let mv = |index, from, to| Command::Move {
             chunk: chunk(5, index),
@@ -508,8 +508,8 @@ mod tests {
             to,
         };
         assert_eq!(apply(&mut m, 4, &mv(0, 10, 13)).unwrap(), Outcome::Moved);
-        assert!(on_volume(&m, 10, None, 10).unwrap().is_empty());
-        assert_eq!(on_volume(&m, 13, None, 10).unwrap(), [(5, 0)]);
+        assert!(on_volume(&mut m, 10, None, 10).unwrap().is_empty());
+        assert_eq!(on_volume(&mut m, 13, None, 10).unwrap(), [(5, 0)]);
         // A retry answers as before; a move from where the chunk is not, or onto a volume
         // holding another of the block's chunks, conflicts.
         assert_eq!(apply(&mut m, 5, &mv(0, 10, 13)).unwrap(), Outcome::Moved);
@@ -534,13 +534,13 @@ mod tests {
 
         let delete = Command::Delete { block: 5 };
         assert_eq!(apply(&mut m, 11, &delete).unwrap(), Outcome::Deleted);
-        assert_eq!(read(&m, 5).unwrap(), None);
+        assert_eq!(read(&mut m, 5).unwrap(), None);
         assert_eq!(
             m.next(&[key::DATA], &[u8::MAX]).unwrap(),
             None,
             "a deleted block leaves no rows"
         );
-        assert!(unsettled(&m, u64::MAX, 10).unwrap().is_empty());
+        assert!(unsettled(&mut m, u64::MAX, 10).unwrap().is_empty());
         assert_eq!(apply(&mut m, 12, &delete).unwrap(), Outcome::Deleted);
     }
 
@@ -597,12 +597,12 @@ mod tests {
                 Outcome::Written { .. }
             ));
         }
-        let first = on_volume(&m, 7, None, 2).unwrap();
+        let first = on_volume(&mut m, 7, None, 2).unwrap();
         assert_eq!(first, [(1, 0), (2, 0)]);
-        let rest = on_volume(&m, 7, Some(2), 10).unwrap();
+        let rest = on_volume(&mut m, 7, Some(2), 10).unwrap();
         assert_eq!(rest, [(3, 0), (4, 0), (5, 0)]);
-        assert_eq!(on_volume(&m, 103, None, 10).unwrap(), [(3, 1)]);
-        assert!(on_volume(&m, 8, None, 10).unwrap().is_empty());
+        assert_eq!(on_volume(&mut m, 103, None, 10).unwrap(), [(3, 1)]);
+        assert!(on_volume(&mut m, 8, None, 10).unwrap().is_empty());
     }
 
     /// A renewal holds a block for another handover from the range's time. The sweep's
@@ -632,14 +632,14 @@ mod tests {
             apply(&mut m, 2, &renew(9, 100, 1_050)).unwrap(),
             held(1_150)
         );
-        let queued = |m: &Model| -> Vec<u64> {
+        let queued = |m: &mut Model| -> Vec<u64> {
             unsettled(m, u64::MAX, 10)
                 .unwrap()
                 .iter()
                 .map(|u| u.deadline_ns)
                 .collect()
         };
-        assert_eq!(queued(&m), [1_150]);
+        assert_eq!(queued(&mut m), [1_150]);
         // A renewal never brings the deadline nearer.
         assert_eq!(apply(&mut m, 3, &renew(9, 10, 1_060)).unwrap(), held(1_150));
         assert_eq!(
@@ -678,10 +678,10 @@ mod tests {
             to: 3,
         };
         assert_eq!(apply(&mut m, 11, &repair).unwrap(), Outcome::Expired);
-        assert_eq!(queued(&m), [1_150]);
+        assert_eq!(queued(&mut m), [1_150]);
         let delete = Command::Delete { block: 5 };
         assert_eq!(apply(&mut m, 12, &delete).unwrap(), Outcome::Deleted);
-        assert!(queued(&m).is_empty());
+        assert!(queued(&mut m).is_empty());
         assert_eq!(m.next(&[key::DATA], &[u8::MAX]).unwrap(), None);
     }
 
@@ -714,8 +714,8 @@ mod tests {
             deadline_ns: 1_100,
         };
         assert_eq!(apply(&mut m, 4, &release).unwrap(), held);
-        assert!(unsettled(&m, u64::MAX, 10).unwrap().is_empty());
-        assert!(!origin(&m, 5).unwrap().unwrap().released);
+        assert!(unsettled(&mut m, u64::MAX, 10).unwrap().is_empty());
+        assert!(!origin(&mut m, 5).unwrap().unwrap().released);
     }
 
     fn command() -> impl Strategy<Value = Command> {
@@ -771,9 +771,9 @@ mod tests {
             let mut before: Vec<Option<BlockOrigin>> = vec![None; 3];
             for (index, command) in (1..).zip(&commands) {
                 apply(&mut m, index, command).unwrap();
-                let queue = unsettled(&m, u64::MAX, 100).unwrap();
+                let queue = unsettled(&mut m, u64::MAX, 100).unwrap();
                 for block in 0..3u128 {
-                    let now = origin(&m, block).unwrap();
+                    let now = origin(&mut m, block).unwrap();
                     let queued: Vec<u64> = queue
                         .iter()
                         .filter(|u| u.block == block)
@@ -795,7 +795,7 @@ mod tests {
                 }
                 let mut forward = Vec::new();
                 for block in 0..3 {
-                    if let Some((_, places)) = read(&m, block).unwrap() {
+                    if let Some((_, places)) = read(&mut m, block).unwrap() {
                         let mut volumes: Vec<_> = places.iter().map(|p| p.volume).collect();
                         volumes.sort_unstable();
                         volumes.dedup();
@@ -805,7 +805,7 @@ mod tests {
                 }
                 let mut reverse = Vec::new();
                 for volume in 0..6 {
-                    for (block, index) in on_volume(&m, volume, None, 10).unwrap() {
+                    for (block, index) in on_volume(&mut m, volume, None, 10).unwrap() {
                         reverse.push((volume, block, index));
                     }
                 }

@@ -13,7 +13,7 @@ pub(crate) const ROW: &[u8] = &[key::LOCAL, key::marker::CLOCK];
 
 /// The time a write proposed at `at_ns` takes, the later of that and just after the range's
 /// last, and the write that records it.
-pub fn tick<E: Rows>(engine: &E, at_ns: u64) -> Result<(u64, Write), MetaError> {
+pub fn tick<E: Rows>(engine: &mut E, at_ns: u64) -> Result<(u64, Write), MetaError> {
     let next = last(engine)?
         .checked_add(1)
         .ok_or(MetaError::ClockExhausted)?;
@@ -23,11 +23,11 @@ pub fn tick<E: Rows>(engine: &E, at_ns: u64) -> Result<(u64, Write), MetaError> 
 
 /// The range's time at an entry proposed at `at_ns`, the later of that and the range's last,
 /// read without taking an instant: what a lock's expiry is judged against.
-pub fn now<E: Rows>(engine: &E, at_ns: u64) -> Result<u64, MetaError> {
+pub fn now<E: Rows>(engine: &mut E, at_ns: u64) -> Result<u64, MetaError> {
     Ok(at_ns.max(last(engine)?))
 }
 
-fn last<E: Rows>(engine: &E) -> Result<u64, MetaError> {
+fn last<E: Rows>(engine: &mut E) -> Result<u64, MetaError> {
     match engine.get(ROW)? {
         None => Ok(0),
         Some(bytes) => Ok(record::decode_number(&bytes, "clock")?),
@@ -42,18 +42,18 @@ mod tests {
     #[test]
     fn the_clock_only_moves_forward_and_refuses_to_wrap() {
         let mut m = Model::default();
-        let (first, write) = tick(&m, 100).unwrap();
+        let (first, write) = tick(&mut m, 100).unwrap();
         assert_eq!(first, 100);
         m.apply(1, &[write]).unwrap();
-        let (second, write) = tick(&m, 50).unwrap();
+        let (second, write) = tick(&mut m, 50).unwrap();
         assert_eq!(
             second, 101,
             "a proposal behind the clock takes the next instant"
         );
         m.apply(2, &[write]).unwrap();
-        let (last, write) = tick(&m, u64::MAX).unwrap();
+        let (last, write) = tick(&mut m, u64::MAX).unwrap();
         assert_eq!(last, u64::MAX);
         m.apply(3, &[write]).unwrap();
-        assert_eq!(tick(&m, 0).unwrap_err(), MetaError::ClockExhausted);
+        assert_eq!(tick(&mut m, 0).unwrap_err(), MetaError::ClockExhausted);
     }
 }

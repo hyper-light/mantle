@@ -124,7 +124,7 @@ struct Intent<'a> {
 }
 
 fn write<E: Rows>(
-    engine: &E,
+    engine: &mut E,
     file: u128,
     extents: &[Extent],
     intent: &Intent<'_>,
@@ -193,7 +193,7 @@ fn write<E: Rows>(
 
 /// Writes that remove every row of `file`: its header, at most `MAX_EXTENTS` extents, and its
 /// place in the unsettled queue.
-fn remove<E: Rows>(engine: &E, file: u128) -> Result<Vec<Write>, MetaError> {
+fn remove<E: Rows>(engine: &mut E, file: u128) -> Result<Vec<Write>, MetaError> {
     let mut writes = Vec::new();
     if let Some(h) = header(engine, file)? {
         writes.push(Write::Delete(key::unsettled(h.deadline_ns, file)));
@@ -213,7 +213,7 @@ fn remove<E: Rows>(engine: &E, file: u128) -> Result<Vec<Write>, MetaError> {
 
 /// Writes that take `files` out of the unsettled queue; a file already out, or removed,
 /// needs none.
-fn settle<E: Rows>(engine: &E, files: &[u128]) -> Result<Vec<Write>, MetaError> {
+fn settle<E: Rows>(engine: &mut E, files: &[u128]) -> Result<Vec<Write>, MetaError> {
     let mut writes = reserved(files.len())?;
     for &file in files {
         if let Some(h) = header(engine, file)? {
@@ -228,7 +228,7 @@ fn settle<E: Rows>(engine: &E, files: &[u128]) -> Result<Vec<Write>, MetaError> 
 /// block's deadline never will, since its write would be refused. The check records that time
 /// as a write's, so every later write reads a time at least as late.
 fn check_blocks<E: Rows>(
-    engine: &E,
+    engine: &mut E,
     file: u128,
     blocks: &[(u128, u64)],
     at_ns: u64,
@@ -253,7 +253,7 @@ fn check_blocks<E: Rows>(
 }
 
 /// A file's header.
-pub fn header<E: Rows>(engine: &E, file: u128) -> Result<Option<FileHeader>, MetaError> {
+pub fn header<E: Rows>(engine: &mut E, file: u128) -> Result<Option<FileHeader>, MetaError> {
     Ok(engine
         .get(&key::file_header(file))?
         .map(|b| FileHeader::decode(&b))
@@ -263,7 +263,7 @@ pub fn header<E: Rows>(engine: &E, file: u128) -> Result<Option<FileHeader>, Met
 /// A file's extents from the one holding byte `offset`, at most `max` of them, in order, each
 /// with the offset of its first byte.
 pub fn extents<E: Rows>(
-    engine: &E,
+    engine: &mut E,
     file: u128,
     offset: u64,
     max: usize,
@@ -292,7 +292,7 @@ pub fn extents<E: Rows>(
 /// The files whose handover deadline passed before `before_ns` and the sweep has yet to
 /// settle, soonest deadline first, at most `max`: the sweep's work.
 pub fn unsettled<E: Rows>(
-    engine: &E,
+    engine: &mut E,
     before_ns: u64,
     max: usize,
 ) -> Result<Vec<Unsettled>, MetaError> {
@@ -357,15 +357,15 @@ mod tests {
             apply(&mut m, 1, &write(7, parts.clone(), 1_000)).unwrap(),
             written
         );
-        let h = header(&m, 7).unwrap().unwrap();
+        let h = header(&mut m, 7).unwrap().unwrap();
         assert_eq!((h.length, h.made_ns, h.deadline_ns), (35, 1_000, 1_100));
         assert_eq!(h.referrer, referrer("k"));
-        assert_eq!(extents(&m, 7, 0, 10).unwrap(), placed);
-        assert_eq!(extents(&m, 7, 9, 1).unwrap(), placed[..1]);
-        assert_eq!(extents(&m, 7, 10, 10).unwrap(), placed[1..]);
-        assert_eq!(extents(&m, 7, 34, 10).unwrap(), placed[2..]);
-        assert!(extents(&m, 7, 35, 10).unwrap().is_empty());
-        assert!(extents(&m, 7, u64::MAX, 10).unwrap().is_empty());
+        assert_eq!(extents(&mut m, 7, 0, 10).unwrap(), placed);
+        assert_eq!(extents(&mut m, 7, 9, 1).unwrap(), placed[..1]);
+        assert_eq!(extents(&mut m, 7, 10, 10).unwrap(), placed[1..]);
+        assert_eq!(extents(&mut m, 7, 34, 10).unwrap(), placed[2..]);
+        assert!(extents(&mut m, 7, 35, 10).unwrap().is_empty());
+        assert!(extents(&mut m, 7, u64::MAX, 10).unwrap().is_empty());
         // The same file again changes nothing, and answers the first deadline; another
         // under its ID is a conflict.
         assert_eq!(apply(&mut m, 2, &write(7, parts, 5_000)).unwrap(), written);
@@ -375,10 +375,10 @@ mod tests {
         );
         let delete = Command::Delete { file: 7 };
         assert_eq!(apply(&mut m, 4, &delete).unwrap(), Outcome::Deleted);
-        assert_eq!(header(&m, 7).unwrap(), None);
+        assert_eq!(header(&mut m, 7).unwrap(), None);
         let rest = m.next(&[key::DATA], &[u8::MAX]).unwrap();
         assert_eq!(rest, None, "a deleted file leaves no rows");
-        assert!(unsettled(&m, u64::MAX, 10).unwrap().is_empty());
+        assert!(unsettled(&mut m, u64::MAX, 10).unwrap().is_empty());
         assert_eq!(apply(&mut m, 5, &delete).unwrap(), Outcome::Deleted);
     }
 
@@ -394,7 +394,7 @@ mod tests {
             let i = u64::try_from(i).unwrap() + 1;
             apply(&mut m, i, &write(file, vec![extent(1, file)], at)).unwrap();
         }
-        let due = |m: &Model, before| -> Vec<u128> {
+        let due = |m: &mut Model, before| -> Vec<u128> {
             unsettled(m, before, 10)
                 .unwrap()
                 .into_iter()
@@ -402,17 +402,17 @@ mod tests {
                 .collect()
         };
         // Deadlines 200, 300 and 400 in order of their passing.
-        assert_eq!(due(&m, 250), [2]);
-        assert_eq!(due(&m, u64::MAX), [2, 3, 1]);
+        assert_eq!(due(&mut m, 250), [2]);
+        assert_eq!(due(&mut m, u64::MAX), [2, 3, 1]);
         assert_eq!(
-            unsettled(&m, u64::MAX, 10).unwrap()[0].referrer,
+            unsettled(&mut m, u64::MAX, 10).unwrap()[0].referrer,
             referrer("k")
         );
         let settle = Command::Settle {
             files: vec![2, 3, 99],
         };
         assert_eq!(apply(&mut m, 4, &settle).unwrap(), Outcome::Settled);
-        assert_eq!(due(&m, u64::MAX), [1]);
+        assert_eq!(due(&mut m, u64::MAX), [1]);
         // Settling again, or a removed file, changes nothing.
         assert_eq!(apply(&mut m, 5, &settle).unwrap(), Outcome::Settled);
         // A file's clock is the range's: a proposal behind it takes the next instant.
@@ -440,7 +440,7 @@ mod tests {
             run(5, vec![extent(1, 1); MAX_EXTENTS]),
             Outcome::Written { deadline_ns: 110 }
         );
-        let count = header(&m, 1).unwrap().unwrap().extents;
+        let count = header(&mut m, 1).unwrap().unwrap().extents;
         assert_eq!(usize::try_from(count).unwrap(), MAX_EXTENTS);
         let far = Command::Write {
             file: 2,
@@ -457,6 +457,6 @@ mod tests {
             Outcome::Deleted
         );
         assert_eq!(m.next(&[key::DATA], &[u8::MAX]).unwrap(), None);
-        assert!(unsettled(&m, u64::MAX, 10).unwrap().is_empty());
+        assert!(unsettled(&mut m, u64::MAX, 10).unwrap().is_empty());
     }
 }

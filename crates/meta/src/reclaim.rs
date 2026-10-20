@@ -403,9 +403,11 @@ mod tests {
         fn answer(&mut self, request: Request) -> Answer {
             match request {
                 Request::Extents { file, from, max } => {
-                    Answer::Extents(file::extents(&self.files, file, from, max).unwrap())
+                    Answer::Extents(file::extents(&mut self.files, file, from, max).unwrap())
                 }
-                Request::Block(block) => Answer::Block(block::read(&self.blocks, block).unwrap()),
+                Request::Block(block) => {
+                    Answer::Block(block::read(&mut self.blocks, block).unwrap())
+                }
                 Request::Chunk(place) => {
                     self.chunks.remove(&(place.volume, place.key));
                     Answer::Chunk
@@ -443,7 +445,7 @@ mod tests {
             reclaimer.is_done()
         }
 
-        fn rows(engine: &Model) -> usize {
+        fn rows(engine: &mut Model) -> usize {
             let mut count = 0;
             let mut from = vec![crate::key::DATA];
             let to = vec![crate::key::REVERSE, 0xFF];
@@ -511,25 +513,25 @@ mod tests {
             bypass: false,
             owner: "o".into(),
         }));
-        let queue = name::released(&cell.name, u64::MAX, 10).unwrap();
+        let queue = name::released(&mut cell.name, u64::MAX, 10).unwrap();
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].file, 300);
         reclaim_all(&mut cell);
         for gone in [100, 200, 300] {
-            assert_eq!(file::header(&cell.files, gone).unwrap(), None);
+            assert_eq!(file::header(&mut cell.files, gone).unwrap(), None);
         }
         for gone in [11, 12, 21] {
-            assert_eq!(block::read(&cell.blocks, gone).unwrap(), None);
+            assert_eq!(block::read(&mut cell.blocks, gone).unwrap(), None);
         }
         // Only the other object's chunks, block and file remain.
         assert_eq!(cell.chunks.len(), 2);
         assert!(cell.chunks.iter().all(|(_, key)| key.block == 41));
-        assert!(block::read(&cell.blocks, 41).unwrap().is_some());
-        assert!(file::header(&cell.files, 400).unwrap().is_some());
-        assert!(Cell::rows(&cell.blocks) > 0);
+        assert!(block::read(&mut cell.blocks, 41).unwrap().is_some());
+        assert!(file::header(&mut cell.files, 400).unwrap().is_some());
+        assert!(Cell::rows(&mut cell.blocks) > 0);
         // No mark is left on a file reclaimed.
         let (mut from, to) = crate::key::marks_span("b");
-        while let Some((k, _)) = crate::engine::Rows::next(&cell.name, &from, &to).unwrap() {
+        while let Some((k, _)) = crate::engine::Rows::next(&mut cell.name, &from, &to).unwrap() {
             let (_, _, file) = crate::key::decode_mark(&k).unwrap();
             assert_eq!(file, 400, "a mark left on file {file}");
             from = k;
@@ -623,7 +625,7 @@ mod tests {
     /// Reclaims every file the Name range has released, each to its end.
     fn reclaim_all(cell: &mut Cell) {
         for _ in 0..10 {
-            let queue = name::released(&cell.name, u64::MAX, 10).unwrap();
+            let queue = name::released(&mut cell.name, u64::MAX, 10).unwrap();
             if queue.is_empty() {
                 return;
             }
@@ -636,13 +638,13 @@ mod tests {
     }
 
     /// The part files, their blocks and their chunks are all still held.
-    fn parts_held(cell: &Cell) -> bool {
+    fn parts_held(cell: &mut Cell) -> bool {
         [100, 200]
             .iter()
-            .all(|&f| file::header(&cell.files, f).unwrap().is_some())
+            .all(|&f| file::header(&mut cell.files, f).unwrap().is_some())
             && [11, 12, 21]
                 .iter()
-                .all(|&b| block::read(&cell.blocks, b).unwrap().is_some())
+                .all(|&b| block::read(&mut cell.blocks, b).unwrap().is_some())
             && cell.chunks.len() == 8
     }
 
@@ -658,10 +660,10 @@ mod tests {
             Outcome::NoSuchKey
         );
         reclaim_all(&mut cell);
-        assert_eq!(file::header(&cell.files, 300).unwrap(), None);
-        assert!(parts_held(&cell), "the upload's parts were taken apart");
+        assert_eq!(file::header(&mut cell.files, 300).unwrap(), None);
+        assert!(parts_held(&mut cell), "the upload's parts were taken apart");
         assert_eq!(
-            name::parts(&cell.name, "b", "k", &upload, 0, 10)
+            name::parts(&mut cell.name, "b", "k", &upload, 0, 10)
                 .unwrap()
                 .len(),
             2
@@ -695,10 +697,10 @@ mod tests {
             Outcome::Completed { .. }
         ));
         reclaim_all(&mut cell);
-        assert_eq!(file::header(&cell.files, 301).unwrap(), None);
-        assert!(file::header(&cell.files, 300).unwrap().is_some());
+        assert_eq!(file::header(&mut cell.files, 301).unwrap(), None);
+        assert!(file::header(&mut cell.files, 300).unwrap().is_some());
         assert!(
-            parts_held(&cell),
+            parts_held(&mut cell),
             "the committed object's parts were taken apart"
         );
         cell.run_name(&Command::Delete(Delete {
@@ -715,7 +717,7 @@ mod tests {
         reclaim_all(&mut cell);
         assert!(cell.chunks.is_empty());
         for gone in [100, 200, 300] {
-            assert_eq!(file::header(&cell.files, gone).unwrap(), None);
+            assert_eq!(file::header(&mut cell.files, gone).unwrap(), None);
         }
     }
 
@@ -743,7 +745,7 @@ mod tests {
             deadline_ns: DEADLINE,
         }));
         assert!(matches!(outcome, Outcome::Put { .. }));
-        let mut queue = name::released(&cell.name, u64::MAX, 10).unwrap();
+        let mut queue = name::released(&mut cell.name, u64::MAX, 10).unwrap();
         assert_eq!(queue.len(), 1);
         assert!(!queue[0].holder.file);
         let mut reclaimer = Reclaimer::new(queue.remove(0), 2);
@@ -757,9 +759,16 @@ mod tests {
         cell.now_ns = COLLECTED;
         assert!(cell.drive(&mut reclaimer, 3));
         assert_eq!(reclaimer.after_ns(), None);
-        assert!(name::released(&cell.name, u64::MAX, 10).unwrap().is_empty());
+        assert!(
+            name::released(&mut cell.name, u64::MAX, 10)
+                .unwrap()
+                .is_empty()
+        );
         let mark = crate::key::mark("b", "k", 700);
-        assert_eq!(crate::engine::Rows::get(&cell.name, &mark).unwrap(), None);
+        assert_eq!(
+            crate::engine::Rows::get(&mut cell.name, &mark).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -905,7 +914,7 @@ mod tests {
             // Each stop takes the oldest file released and drops its reclaimer after that
             // many steps; the next starts again from the queue.
             for &stop in &stops {
-                let mut queue = name::released(&cell.name, u64::MAX, 1).unwrap();
+                let mut queue = name::released(&mut cell.name, u64::MAX, 1).unwrap();
                 if queue.is_empty() {
                     break;
                 }
@@ -913,10 +922,10 @@ mod tests {
                 cell.drive(&mut reclaimer, stop);
             }
             reclaim_all(&mut cell);
-            prop_assert_eq!(name::released(&cell.name, u64::MAX, 2).unwrap(), vec![]);
+            prop_assert_eq!(name::released(&mut cell.name, u64::MAX, 2).unwrap(), vec![]);
             prop_assert!(cell.chunks.is_empty());
-            prop_assert_eq!(Cell::rows(&cell.files), 0);
-            prop_assert_eq!(Cell::rows(&cell.blocks), 0);
+            prop_assert_eq!(Cell::rows(&mut cell.files), 0);
+            prop_assert_eq!(Cell::rows(&mut cell.blocks), 0);
         }
     }
 }

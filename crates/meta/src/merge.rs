@@ -314,7 +314,7 @@ mod tests {
                 at: key::route("b", "m"),
                 child: 2,
             };
-            let child = name::child(&first, &s).unwrap().unwrap();
+            let child = name::child(&mut first, &s).unwrap().unwrap();
             let mut engine = Model::default();
             engine.install(0, child.rows).unwrap();
             name::apply(&mut first, 1, &name::Command::Split(s)).unwrap();
@@ -333,8 +333,8 @@ mod tests {
             &mut self.ranges[usize::try_from(id - 1).unwrap()]
         }
 
-        fn lineage(&self, id: u64) -> Lineage {
-            name::lineage(&self.ranges[usize::try_from(id - 1).unwrap()].engine).unwrap()
+        fn lineage(&mut self, id: u64) -> Lineage {
+            name::lineage(&mut self.ranges[usize::try_from(id - 1).unwrap()].engine).unwrap()
         }
 
         fn serve(&mut self, request: Request) -> Answer {
@@ -353,14 +353,14 @@ mod tests {
                         panic!("two ranges");
                     };
                     let (lower, upper) = if range == 1 {
-                        (lower, &*upper)
+                        (lower, upper)
                     } else {
-                        (upper, &*lower)
+                        (upper, lower)
                     };
                     assert_eq!(from, if range == 1 { 2 } else { 1 });
                     lower.index += 1;
                     Answer::Name(
-                        name::merge(&mut lower.engine, lower.index, &command, &upper.engine)
+                        name::merge(&mut lower.engine, lower.index, &command, &mut upper.engine)
                             .unwrap(),
                     )
                 }

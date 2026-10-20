@@ -1883,7 +1883,7 @@ impl<F: BlockFile> ShardDb<F> {
         if self.terminal_done {
             return self.into_file_finished();
         }
-        if hyper_rt::registry::current_shard().is_some() {
+        if hyper_rt::registry::current_shard().is_some() && !crate::store::blocking_permitted() {
             return IntoFile::Refused {
                 owner: self,
                 error: Error::InvalidArgument {

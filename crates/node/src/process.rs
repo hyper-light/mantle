@@ -12,8 +12,9 @@
 //! gateways write, and `chunk_asks` the chunk puts and gets the node keeps out to its peers.
 //!
 //! **Its talk** is lines. On standard output: `bound QUIC PLANE` once the node listens, and
-//! `volume ID` for each volume it holds, its 128-bit id in hex; then
-//! `status TERM LEADER COMMIT APPLIED PATIENCE_NS RECONNECT_NS MEASURING_NS HELD` each time one of the first four
+//! `volume ID` for each volume it holds, its 128-bit id in hex; then, for each range it hosts,
+//! `status GROUP TERM LEADER COMMIT APPLIED PATIENCE_NS RECONNECT_NS MEASURING_NS HELD`, the group
+//! in hex, each time one of the term, leader, commit or applied index
 //! moves, its redials to a peer back off further or start over, or the heartbeats it takes from
 //! peers not yet judged move (`Status::measuring`): how long the node states it may go
 //! without moving
@@ -26,18 +27,24 @@
 //! long the log's flush has been out (0 when none is) and the longest an update has waited for
 //! its commit (hyper-log's `LogStats`), since the node moves only as its writes become durable;
 //! and
-//! `replaced FAILED JOINING` once, from the node that led then, when a replacement ended; and
+//! `replaced GROUP FAILED JOINING` once, from the node that led the range then, when a
+//! replacement ended; and
 //! `link PEER KEYED DIALS ENDED REFUSAL` when a peer's link changes: whether the plane holds keys
 //! for its connection, the dials made to it, the connections and dials to it that ended, and the
 //! last refusal one ended with (`Node::links`). On
 //! standard input: `learn ID QUIC PLANE`, where a peer listens, and `replace FAILED JOINING`, a
-//! member of the range lost for good and the spare that takes its place (`Node::replace`). A line
-//! it cannot read ends the process with the line named; standard input closing ends it as a stop.
+//! member lost for good and the spare that takes its place in every range the node hosts
+//! (`Node::replace`). A line it cannot read ends the process with the line named; standard input
+//! closing ends it as a stop.
 //!
-//! The range it hosts is the cell's first Name range of the voters the file names, its rows in
-//! mantle's engine in the node's directory: founded on first start, opened at its last
-//! checkpoint after, the log replayed past it. A node whose id the voters do not name is a spare:
-//! it starts as the founders did and is no member of the range until a replacement adds it.
+//! The ranges it hosts are the `range` lines', each `range = GROUP LAYER`: a group of the voters
+//! the file names, holding the rows of one layer (`bucket`, `name`, `file` or `block`), at most
+//! one of each, since a cell's first ranges each span their layer's whole key space (node.md
+//! §1.5) and splitting them is the range directory's. Each keeps its rows in an engine store of
+//! its own in the node's directory, `range-GROUP.store`: founded on first start, opened at its
+//! last checkpoint after, the log replayed past it. A node whose id the voters do not name is a
+//! spare: it starts as the founders did and is no member of the ranges until a replacement adds
+//! it.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -98,7 +105,9 @@ pub struct ProcessConfig {
     pub certificate: PathBuf,
     pub key: PathBuf,
     pub peers: Vec<(u64, Role, PathBuf)>,
-    pub group: u128,
+    /// The ranges the node hosts (`range` lines): each one's group and layer, every one founded
+    /// by `voters`.
+    pub ranges: Vec<(u128, Layer)>,
     pub voters: Vec<u64>,
     pub settings: Settings,
     pub rules: Rules,
@@ -117,10 +126,12 @@ pub struct ProcessConfig {
     pub chunk_asks: usize,
 }
 
-/// The file's values by key, each with the line it was on; `peer` and `volume` lines kept apart.
+/// The file's values by key, each with the line it was on; `peer`, `range` and `volume` lines
+/// kept apart.
 struct Lines {
     values: BTreeMap<String, (usize, String)>,
     peers: Vec<(usize, String)>,
+    ranges: Vec<(usize, String)>,
     volumes: Vec<(usize, String)>,
 }
 
@@ -128,6 +139,7 @@ impl Lines {
     fn parse(text: &str) -> Result<Self, ProcessError> {
         let mut values = BTreeMap::new();
         let mut peers = Vec::new();
+        let mut ranges = Vec::new();
         let mut volumes = Vec::new();
         for (at, line) in text.lines().enumerate() {
             let number = at.saturating_add(1);
@@ -141,6 +153,8 @@ impl Lines {
             let (key, value) = (key.trim(), value.trim().to_owned());
             if key == "peer" {
                 peers.push((number, value));
+            } else if key == "range" {
+                ranges.push((number, value));
             } else if key == "volume" {
                 volumes.push((number, value));
             } else if values.insert(key.to_owned(), (number, value)).is_some() {
@@ -150,6 +164,7 @@ impl Lines {
         Ok(Self {
             values,
             peers,
+            ranges,
             volumes,
         })
     }
@@ -204,9 +219,6 @@ impl ProcessConfig {
             };
             peers.push((id, role, PathBuf::from(certificate)));
         }
-        let group = lines.text("group")?;
-        let group = u128::from_str_radix(group.trim_start_matches("0x"), 16)
-            .map_err(|e| ProcessError::Value("group", e.to_string()))?;
         let voters = lines
             .text("voters")?
             .split(',')
@@ -227,7 +239,7 @@ impl ProcessConfig {
             certificate: PathBuf::from(lines.text("certificate")?),
             key: PathBuf::from(lines.text("key")?),
             peers,
-            group,
+            ranges: ranges(&lines)?,
             voters,
             settings: Settings {
                 election_tick: lines.get("range.election_tick")?,
@@ -272,6 +284,41 @@ impl ProcessConfig {
             chunk_asks: lines.get("chunk_asks")?,
         })
     }
+}
+
+/// The ranges the `range` lines state, each `range = GROUP LAYER`: its group in hex, as the log
+/// names it, and the layer whose rows it holds, at most one range of each layer.
+fn ranges(lines: &Lines) -> Result<Vec<(u128, Layer)>, ProcessError> {
+    if lines.ranges.is_empty() {
+        return Err(ProcessError::Missing("range"));
+    }
+    let mut ranges: Vec<(u128, Layer)> = Vec::with_capacity(lines.ranges.len());
+    for (number, value) in &lines.ranges {
+        let bad = |what: &str| ProcessError::Line(*number, what.into());
+        let fields: Vec<&str> = value.split_whitespace().collect();
+        let [group, layer] = fields.as_slice() else {
+            return Err(bad("range = GROUP LAYER"));
+        };
+        let group = u128::from_str_radix(group.trim_start_matches("0x"), 16)
+            .map_err(|_| bad("a range's group, in hex"))?;
+        let layer = match *layer {
+            "bucket" => Layer::Bucket,
+            "name" => Layer::Name,
+            "file" => Layer::File,
+            "block" => Layer::Block,
+            _ => return Err(bad("a layer: bucket, name, file or block")),
+        };
+        if ranges.iter().any(|(g, _)| *g == group) {
+            return Err(bad("a group another range has"));
+        }
+        if ranges.iter().any(|(_, l)| *l == layer) {
+            return Err(bad(
+                "a second range of a layer, whose first spans every key",
+            ));
+        }
+        ranges.push((group, layer));
+    }
+    Ok(ranges)
 }
 
 /// The volumes the `volume` lines state, each `volume = DIR SIZE DEPTH READ_BYTES READ_GAP
@@ -373,10 +420,15 @@ fn read_file(path: &Path) -> Result<Vec<u8>, ProcessError> {
     std::fs::read(path).map_err(|e| ProcessError::Read(path.to_path_buf(), e.to_string()))
 }
 
-/// The node's range engine in its directory: opened at its last checkpoint when its store is
-/// there, created and founded with the range's first rows when not.
-fn engine(config: &ProcessConfig) -> Result<Stored<DeviceFile>, ProcessError> {
-    let path = config.dir.join("range.store");
+/// Range `group`'s engine in the node's directory, holding `layer`'s rows: opened at its last
+/// checkpoint when its store is there, created when not, a Name range founded with its first rows
+/// (its descriptor, spanning every key).
+fn engine(
+    config: &ProcessConfig,
+    group: u128,
+    layer: Layer,
+) -> Result<Stored<DeviceFile>, ProcessError> {
+    let path = config.dir.join(format!("range-{group:032x}.store"));
     let fresh = !path.exists();
     let align = Alignment::new(config.store.page_size)
         .map_err(|e| ProcessError::Engine(format!("{e:?}")))?;
@@ -389,9 +441,11 @@ fn engine(config: &ProcessConfig) -> Result<Stored<DeviceFile>, ProcessError> {
     }
     let mut stored =
         Stored::create(file, config.store, config.memtable_bytes, config.trunk).map_err(engine)?;
-    let first = name::first(1).map_err(|e| ProcessError::Engine(e.to_string()))?;
     let founded = |e: mantle_meta::engine::EngineError| ProcessError::Engine(e.to_string());
-    stored.install(0, first).map_err(founded)?;
+    if layer == Layer::Name {
+        let first = name::first(1).map_err(|e| ProcessError::Engine(e.to_string()))?;
+        stored.install(0, first).map_err(founded)?;
+    }
     stored.persist().map_err(founded)?;
     Ok(stored)
 }
@@ -401,7 +455,22 @@ async fn serve(config: ProcessConfig, storage: Storage) -> Result<(), ProcessErr
     // This process's one shard runs the node's replicas, which apply through the engine's
     // synchronous calls (node.md §1.2).
     mantle_engine::store::permit_blocking();
-    let engine = engine(&config)?;
+    let mut ranges = Vec::with_capacity(config.ranges.len());
+    for (group, layer) in &config.ranges {
+        ranges.push(Hosted {
+            group: *group,
+            range: Range {
+                layer: *layer,
+                rules: config.rules,
+                boot: ConfState {
+                    voters: config.voters.clone(),
+                    ..ConfState::default()
+                },
+                settings: config.settings,
+            },
+            engine: engine(&config, *group, *layer)?,
+        });
+    }
     let mut peers = Vec::with_capacity(config.peers.len());
     for (id, role, certificate) in &config.peers {
         peers.push(Peer {
@@ -422,19 +491,7 @@ async fn serve(config: ProcessConfig, storage: Storage) -> Result<(), ProcessErr
         },
         peers,
         addresses: Vec::new(),
-        ranges: vec![Hosted {
-            group: config.group,
-            range: Range {
-                layer: Layer::Name,
-                rules: config.rules,
-                boot: ConfState {
-                    voters: config.voters.clone(),
-                    ..ConfState::default()
-                },
-                settings: config.settings,
-            },
-            engine,
-        }],
+        ranges,
         log: config.log,
         transport_bytes: config.transport_bytes,
         seed: None,
@@ -459,7 +516,8 @@ async fn serve(config: ProcessConfig, storage: Storage) -> Result<(), ProcessErr
     }
     let mut read = vec![0u8; chunk];
     let mut pending = Vec::new();
-    let mut told: Option<Status> = None;
+    // Each range's status as last said, a range a slot in the configuration's order.
+    let mut told: Vec<Option<Status>> = vec![None; config.ranges.len()];
     // The log's measures, filled again at each status said (hyper-log's `Log::stats`).
     let mut stats: Option<Box<LogStats>> = None;
     // Each peer's link as last said, a peer a slot.
@@ -477,7 +535,7 @@ async fn serve(config: ProcessConfig, storage: Storage) -> Result<(), ProcessErr
                 pending.extend_from_slice(read.get(..n).unwrap_or_default());
                 while let Some(end) = pending.iter().position(|b| *b == b'\n') {
                     let line: Vec<u8> = pending.drain(..=end).collect();
-                    take_line(&mut node, config.group, &line)?;
+                    take_line(&mut node, &config.ranges, &line)?;
                 }
                 // A line is never longer than the buffer it is read into.
                 if pending.len() > chunk {
@@ -487,8 +545,16 @@ async fn serve(config: ProcessConfig, storage: Storage) -> Result<(), ProcessErr
             }
             Either::Second(Err(e)) => return Err(ProcessError::Runtime(format!("{e:?}"))),
         }
-        for (_, replaced) in node.take_replaced() {
-            let line = format!("replaced {} {}\n", replaced.failed(), replaced.joining());
+        // The node keeps what its ranges answered as they applied for a caller that proposed to
+        // them itself (`Node::take_applied`); this process proposes nothing itself, and a client's
+        // answers reach it through its exchange, so they are dropped each turn, never kept.
+        node.take_applied().for_each(drop);
+        for (group, replaced) in node.take_replaced() {
+            let line = format!(
+                "replaced {group:x} {} {}\n",
+                replaced.failed(),
+                replaced.joining()
+            );
             say(&mut output, &line).await?;
         }
         for (at, now) in node.links().enumerate() {
@@ -511,50 +577,59 @@ async fn serve(config: ProcessConfig, storage: Storage) -> Result<(), ProcessErr
                 None => links.push(now),
             }
         }
-        if let Some(now) = node.status(config.group) {
+        let mut said = false;
+        for ((group, _), was) in config.ranges.iter().zip(told.iter_mut()) {
+            let Some(now) = node.status(*group) else {
+                continue;
+            };
             // While some pair is not yet judged, the node is measuring its links, which moves only
             // the heartbeats it takes from those pairs: said too, so a watcher sees it move before
             // it elects, and sees it stop if a peer it measures goes silent. The reconnect bound
             // is said each time it changes, as a redial's backoff doubles, so a watcher never
             // holds one shorter than the node's own; and whether the node waits on its own device,
             // so a watcher knows it holds still for its device and not by choice.
-            let moved = told.is_none_or(|was| {
+            let moved = was.is_none_or(|was| {
                 (was.term, was.leader, was.commit, was.applied, was.reconnect)
                     != (now.term, now.leader, now.commit, now.applied, now.reconnect)
                     || was.measuring != now.measuring
                     || was.held != now.held
             });
-            if moved {
-                let patience = now.patience.map_or(0, |p| p.as_nanos());
-                let reconnect = now.reconnect.map_or(0, |r| r.as_nanos());
-                let measuring = now.measuring_for.map_or(0, |m| m.as_nanos());
-                let line = format!(
-                    "status {} {} {} {} {patience} {reconnect} {measuring} {}\n",
-                    now.term,
-                    now.leader,
-                    now.commit,
-                    now.applied,
-                    u8::from(now.held)
-                );
-                say(&mut output, &line).await?;
-                told = Some(now);
-                let log = node.log_stats(stats.take())?;
-                let flushing = log.flushing_since.map_or(0, |since| {
-                    log.at.saturating_duration_since(since).as_nanos()
-                });
-                let longest = log.commit_wait.quantile(1_000_000).unwrap_or(0);
-                say(&mut output, &format!("log {flushing} {longest}\n")).await?;
-                stats = Some(log);
+            if !moved {
+                continue;
             }
+            let patience = now.patience.map_or(0, |p| p.as_nanos());
+            let reconnect = now.reconnect.map_or(0, |r| r.as_nanos());
+            let measuring = now.measuring_for.map_or(0, |m| m.as_nanos());
+            let line = format!(
+                "status {group:x} {} {} {} {} {patience} {reconnect} {measuring} {}\n",
+                now.term,
+                now.leader,
+                now.commit,
+                now.applied,
+                u8::from(now.held)
+            );
+            say(&mut output, &line).await?;
+            *was = Some(now);
+            said = true;
+        }
+        // The log the ranges share, once after the statuses that moved.
+        if said {
+            let log = node.log_stats(stats.take())?;
+            let flushing = log.flushing_since.map_or(0, |since| {
+                log.at.saturating_duration_since(since).as_nanos()
+            });
+            let longest = log.commit_wait.quantile(1_000_000).unwrap_or(0);
+            say(&mut output, &format!("log {flushing} {longest}\n")).await?;
+            stats = Some(log);
         }
     }
 }
 
 /// Takes a line of the node's input: `learn ID QUIC PLANE` or `replace FAILED JOINING`, a
-/// replacement of `group`'s range.
+/// replacement in each of `ranges`.
 fn take_line<E: Engine + 'static>(
     node: &mut Node<E>,
-    group: u128,
+    ranges: &[(u128, Layer)],
     line: &[u8],
 ) -> Result<(), ProcessError> {
     let text = String::from_utf8_lossy(line).trim().to_owned();
@@ -584,7 +659,9 @@ fn take_line<E: Engine + 'static>(
         (Some("replace"), Some(failed), Some(joining), None, None) => {
             let failed = id(failed, "a member's id")?;
             let joining = id(joining, "a spare's id")?;
-            node.replace(group, failed, joining)?;
+            for (group, _) in ranges {
+                node.replace(*group, failed, joining)?;
+            }
         }
         _ => {
             return Err(ProcessError::Input(
@@ -630,5 +707,33 @@ mod tests {
             lines.get::<u64>("dir"),
             Err(ProcessError::Missing("dir"))
         ));
+    }
+
+    #[test]
+    fn ranges_are_a_group_and_a_layer_each_and_one_of_each_layer() {
+        let ranges = |text: &str| super::ranges(&Lines::parse(text).unwrap());
+        assert_eq!(
+            ranges("range = 0x72 name\nrange = 9 block\n").unwrap(),
+            vec![(0x72, Layer::Name), (9, Layer::Block)]
+        );
+        assert!(matches!(
+            ranges("id = 1\n"),
+            Err(ProcessError::Missing("range"))
+        ));
+        // A layer no range holds, a group stated twice, a second range of a layer whose first
+        // spans every key, and a line of the wrong shape: each refused at its line.
+        for (text, line) in [
+            ("range = 1 root\n", 1),
+            ("range = 1 name\nrange = 1 file\n", 2),
+            ("range = 1 file\nrange = 2 file\n", 2),
+            ("range = 1\n", 1),
+            ("range = 1 name name\n", 1),
+            ("range = zz name\n", 1),
+        ] {
+            assert!(
+                matches!(ranges(text), Err(ProcessError::Line(n, _)) if n == line),
+                "{text:?}"
+            );
+        }
     }
 }

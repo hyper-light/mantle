@@ -228,6 +228,15 @@ spanning its whole key space. In a fleet the region's root range is hosted apart
 cell's ranges; on a laptop it is one more range on the one node. The
 node reports at startup that it survives no device failure, as README's table says it must.
 
+*As built (2026-10-21).* `mantle node` hosts the ranges its configuration's `range = GROUP LAYER`
+lines name, at most one of each layer, since each of a cell's first ranges spans its layer's whole
+key space; each keeps its rows in an engine store of its own (`range-GROUP.store`) and shares the
+node's one log, and the node says each one's status by its group. A cell of three nodes hosting a
+Bucket, a Name, a File and a Block range on every node, voters one to a node, elects in each,
+applies each layer's commands only in its own range (`WrongLayer` elsewhere), and serves on through
+the kill (`SIGKILL`) of the node leading the most of them (`crates/mantle/tests/node.rs`). The root
+ranges, and `mantle init` making them, are still to build.
+
 **Joining.** An existing node mints an invitation (`mantle invite`): a one-time token recorded
 in the root range, so the log decides whether it was used. `mantle init --join` sends the token
 and a certificate request over the enrollment protocol, whose key the joining node keeps; the
@@ -1631,9 +1640,9 @@ bounded; a member is removed only once its replacement holds the durable state t
 (audit §5.7).
 
 *As built (2026-10-20).* A node replaces a member lost for good (`Node::replace`; `mantle node`'s
-`replace FAILED JOINING`): while it leads the range it proposes what `membership::Replacement`
-names next at each turn, a change only while none is pending, and the node that leads when the
-replacement ends reports it once (`replaced`). Every node may be told it, since the replacement
+`replace FAILED JOINING`, in every range the node hosts): while it leads a range it proposes what
+`membership::Replacement` names next at each turn, a change only while none is pending, and the
+node that leads when the replacement ends reports it once (`replaced`, with the range's group). Every node may be told it, since the replacement
 is stateless. The joining member is a spare identity every directory holds from the start, its
 node started as the founders were, with their configuration and rows, of which it is no member
 until the learner change adds it; a node's directory taking an identity it did not hold (an

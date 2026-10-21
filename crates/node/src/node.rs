@@ -982,9 +982,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         })
     }
 
-    /// What the node's ranges answered as they applied, since the last call.
-    pub fn take_applied(&mut self) -> Vec<(u128, Applied)> {
-        std::mem::take(&mut self.applied)
+    /// What the node's ranges answered as they applied, since the last call: kept until taken, so
+    /// its caller takes them at each turn, or drops them there.
+    pub fn take_applied(&mut self) -> std::vec::Drain<'_, (u128, Applied)> {
+        self.applied.drain(..)
     }
 
     /// Replaces `failed`, a member of `group`'s range lost for good, with `joining`, a member

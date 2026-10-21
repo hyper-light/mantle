@@ -385,7 +385,9 @@ Remaining before it is done:
   and through a leader cut off, on three voters and five, and through a leader whose plane goes
   deaf (it hears no peer's plane while they hear its), on three; and a follower whose engine
   store is damaged at rest, which refuses it with a typed corruption error, is replaced by a
-  spare, and then as many original voters are killed as leave a bare quorum, the spare in it.
+  spare, and then as many original voters are killed as leave a bare quorum, the spare in it;
+  and a cell hosting a Bucket, a Name, a File and a Block range on every node, voters one to a
+  node, each range serving on through the kill of the node leading the most of them.
   Each key's history is checked linearizable (`crates/node/tests/support/history.rs`). Left:
   damage to a node's log (a group the log finds damaged is rebuilt under a new identity,
   `Replica::rebuild`, which needs placement's map of members to nodes).

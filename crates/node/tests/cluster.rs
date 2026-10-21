@@ -104,6 +104,7 @@ mod history;
 #[path = "../../range/tests/support/linear.rs"]
 mod linear;
 use history::{Clock, Part, Plan, Steer, Told, check_histories, registration, workload};
+#[allow(dead_code)]
 #[path = "support/relay.rs"]
 mod relay;
 use relay::Relay;

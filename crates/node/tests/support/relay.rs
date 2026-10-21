@@ -2,9 +2,11 @@
 //! relay: for each pair, from each side, one address for QUIC and one for the plane. The relay
 //! forwards each datagram to where the peer does listen, and a reply back to its sender, while the
 //! pair is joined; a pair cut has its datagrams dropped both ways, QUIC's and the plane's, as a
-//! partition drops them, and joined again they pass. A node started again elsewhere is followed by
-//! the relay, so its peers reach it at the address they knew, as they would a node started again
-//! on its own address.
+//! partition drops them, and joined again they pass. A node's plane may be deafened: every datagram
+//! its peers' planes send it is dropped, on their links and as replies on its own, while its own
+//! reach them, as a host that loses what it is sent and not what it sends. A node started again
+//! elsewhere is followed by the relay, so its peers reach it at the address they knew, as they
+//! would a node started again on its own address.
 //!
 //! The relay is one hyper-rt shard on a thread of its own, a task a link (a pair's direction and
 //! socket), each link two sockets: its front, which the dialing side sends to, and its back, which
@@ -26,14 +28,17 @@ use hyper_rt::udp::UdpSocket;
 /// IPv4's least header of 20. Any datagram a node sends fits.
 const LARGEST: usize = 65_507;
 
-/// What a link is told: where its listening side listens now, or whether its pair is joined.
+/// What a link is told: where its listening side listens now, whether its pair is joined, or
+/// whether what goes to its listening side, or back to its sender, is dropped.
 enum Told {
     To(SocketAddr),
     Joined(bool),
+    DropForward(bool),
+    DropBack(bool),
 }
 
 /// Orders a link holds before it takes them: the test tells a link at most where its side listens
-/// and whether its pair is joined between two of the link's turns, and waits on the cell between
+/// and one change of what passes between two of the link's turns, and waits on the cell between
 /// one change and the next.
 const TOLD: usize = 2;
 
@@ -43,18 +48,25 @@ async fn link(front: UdpSocket, back: UdpSocket, mut told: ChannelReceiver<Told>
     let mut to: Option<SocketAddr> = None;
     let mut from: Option<SocketAddr> = None;
     let mut joined = true;
+    let (mut drop_forward, mut drop_back) = (false, false);
     let mut datagram = vec![0u8; LARGEST];
     loop {
         // What waits on either side is forwarded, or dropped while the pair is cut. A datagram the
         // OS refuses (its destination gone) is lost, as the network loses one.
         while let Ok(Some((len, sender))) = front.try_recv_from(&mut datagram) {
             from = Some(sender);
-            if joined && let Some(to) = to {
+            if joined
+                && !drop_forward
+                && let Some(to) = to
+            {
                 let _ = back.send_to_writable(&datagram[..len], to).await;
             }
         }
         while let Ok(Some((len, _))) = back.try_recv_from(&mut datagram) {
-            if joined && let Some(from) = from {
+            if joined
+                && !drop_back
+                && let Some(from) = from
+            {
                 let _ = front.send_to_writable(&datagram[..len], from).await;
             }
         }
@@ -69,6 +81,8 @@ async fn link(front: UdpSocket, back: UdpSocket, mut told: ChannelReceiver<Told>
         match woke {
             Either3::Third(Ok(Told::To(at))) => to = Some(at),
             Either3::Third(Ok(Told::Joined(now))) => joined = now,
+            Either3::Third(Ok(Told::DropForward(now))) => drop_forward = now,
+            Either3::Third(Ok(Told::DropBack(now))) => drop_back = now,
             // The relay is done.
             Either3::Third(Err(_)) => return,
             Either3::First(_) | Either3::Second(_) => {}
@@ -173,6 +187,24 @@ impl Relay {
                     .map_err(|_| "a link's orders are full")
                     .unwrap();
             }
+        }
+    }
+
+    /// Drops every datagram the other nodes' planes send node `id`'s, or none: on each peer's link
+    /// to it, and as the replies on its link to each peer. What it sends, and QUIC, pass as they did.
+    pub fn deafen_plane(&self, id: u64, deaf: bool) {
+        for ((from, to), [_, plane]) in &self.links {
+            let told = if *to == id {
+                Told::DropForward(deaf)
+            } else if *from == id {
+                Told::DropBack(deaf)
+            } else {
+                continue;
+            };
+            plane
+                .try_send(told)
+                .map_err(|_| "a link's orders are full")
+                .unwrap();
         }
     }
 

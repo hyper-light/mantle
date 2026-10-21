@@ -180,3 +180,76 @@ fn a_registration_slower_than_every_exchange_its_client_measured_is_applied_once
     assert_eq!(asks.lost, 0, "an exchange was lost: {asks:?}");
     assert_eq!(cell.converged(), before + 1);
 }
+
+/// Runs until node `leader` names a leader other than itself.
+fn stepped_down(cell: &mut Sim, leader: u64) {
+    cell.until("the leader steps down", |c| {
+        c.members[&leader]
+            .status
+            .filter(|s| s.leader != leader)
+            .map(|_| ())
+    });
+}
+
+/// Runs until the nodes but `deaf` name one leader other than `deaf`, in a term after `term`.
+fn others_elect(cell: &mut Sim, deaf: u64, term: u64) {
+    cell.until("the others elect one of themselves", |c| {
+        let named: Vec<(u64, u64)> = c
+            .members
+            .iter()
+            .filter(|(id, _)| **id != deaf)
+            .map(|(_, m)| m.status.map(|s| (s.term, s.leader)))
+            .collect::<Option<_>>()?;
+        let first = *named.first()?;
+        let elected =
+            first.0 > term && ![0, deaf].contains(&first.1) && named.iter().all(|n| *n == first);
+        if elected { Some(()) } else { None }
+    });
+}
+
+/// A leader whose plane stops hearing its followers once it has judged them suspects them all and
+/// steps down, with no voter it trusts to hand its term over to, while its followers, whose planes
+/// hear it, trust it still (its node lives). Once it hears them again, the cell elects a leader.
+#[test]
+fn a_leader_that_hears_no_follower_for_a_while_steps_down_and_the_cell_elects_again() {
+    let mut cell = Sim::new(1);
+    let leader = cell.leader();
+    cell.judged();
+    cell.deafen_plane(leader, true);
+    stepped_down(&mut cell, leader);
+    cell.deafen_plane(leader, false);
+    cell.leader();
+}
+
+/// As above, but the leader stays deaf: the others, which still trust it, elect one of themselves
+/// in a later term, which the deaf node follows by its lanes.
+#[test]
+fn a_leader_that_hears_no_follower_steps_down_and_the_others_elect_one_of_themselves() {
+    let mut cell = Sim::new(1);
+    let leader = cell.leader();
+    cell.judged();
+    let term = cell.members[&leader].status.unwrap().term;
+    cell.deafen_plane(leader, true);
+    stepped_down(&mut cell, leader);
+    others_elect(&mut cell, leader, term);
+    cell.deafen_plane(leader, false);
+    cell.leader();
+}
+
+/// A leader whose plane stops hearing its followers before it has judged them, with no evidence
+/// of its own to judge them by, steps down all the same, and the others elect one of themselves.
+#[test]
+fn a_leader_deaf_before_it_judges_its_links_steps_down_and_the_others_elect_one_of_themselves() {
+    let mut cell = Sim::new(1);
+    let leader = cell.leader();
+    let status = cell.members[&leader].status.unwrap();
+    assert!(
+        !status.judged,
+        "the leader judged its links when it was elected, which this test is not about"
+    );
+    cell.deafen_plane(leader, true);
+    stepped_down(&mut cell, leader);
+    others_elect(&mut cell, leader, status.term);
+    cell.deafen_plane(leader, false);
+    cell.leader();
+}

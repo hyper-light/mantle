@@ -1748,9 +1748,14 @@ its device fail a write, which stops it as its process would. On some seeds ever
 loses 2% of its datagrams meanwhile. The WGL checker judges each key's history, and every node
 must apply as far as the others. Two further tests hold laws the Windows runners exposed (§3):
 a registration slower than every exchange its client measured is applied once, and a request
-answered without its body is still answered when its body arrives after its head. Still to
-build: many ranges per node, the clients in their millions, and the faults and loads listed
-above.
+answered without its body is still answered when its body arrives after its head. Three more
+deafen the leader's plane, so that it hears no peer's plane while they hear its, as a host that
+loses what it is sent and not what it sends: once it has judged its links, for a while and for
+good, and at its election, before it has judged any. Its followers trust it, for they hear it;
+it suspects them and steps down, and the others elect one of themselves, which it follows by its
+lanes. A Windows runner showed the same end with no fault at all: a leader on a starved host
+suspected both its followers at once. Still to build: many ranges per node, the clients in their
+millions, and the faults and loads listed above.
 
 ### 9.2 Real processes
 

@@ -639,6 +639,25 @@ impl Sim {
         }
     }
 
+    /// Loses every datagram the other nodes' planes send node `id`'s, or none: their liveness
+    /// streams and the consensus control their planes carry reach it no more, while its own reach
+    /// them and every QUIC path stays as it was.
+    pub fn deafen_plane(&mut self, id: u64, deaf: bool) {
+        let path = if deaf {
+            self.path.with_loss(SimLoss::random(PPM))
+        } else {
+            self.path
+        };
+        let Some(&own) = self.ports(id).get(1) else {
+            return;
+        };
+        for peer in (1..=self.nodes).filter(|p| *p != id) {
+            if let Some(&theirs) = self.ports(peer).get(1) {
+                self.rt.set_pair_path(theirs, own, path);
+            }
+        }
+    }
+
     /// Cuts node `id`'s power: its task gives back its log and engines, its device keeps what it
     /// made durable as the seed says, its engine what it persisted.
     pub fn crash(&mut self, id: u64) {
@@ -823,6 +842,18 @@ impl Sim {
                 && named.iter().all(|n| *n == first);
             if agreed { Some(first.1) } else { None }
         })
+    }
+
+    /// Runs until every running node judges every peer its stream keeps by a margin.
+    pub fn judged(&mut self) {
+        self.until("every node judges its links", |c| {
+            let judged = c
+                .members
+                .values()
+                .filter(|m| m.orders.is_some())
+                .all(|m| m.status.is_some_and(|s| s.judged));
+            if judged { Some(()) } else { None }
+        });
     }
 
     /// Every node's applied index, once all are equal.

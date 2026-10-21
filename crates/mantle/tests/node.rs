@@ -9,9 +9,11 @@
 //!   index past every answered write.
 //! - Three clients, each its own identity and session, put and read two keys while the leader is
 //!   killed with SIGKILL half way and started again three quarters through, or cut off from the
-//!   other nodes for a quarter by the test's relay (`crates/node/tests/support/relay.rs`); each
-//!   key's history is linearizable (`crates/node/tests/support/history.rs`), and every node ends
-//!   where the others do. On cells of three voters and of five.
+//!   other nodes for a quarter by the test's relay (`crates/node/tests/support/relay.rs`), or, on
+//!   three voters, has its plane deafened by the relay for a quarter (it hears no peer's plane
+//!   while they hear its); each key's history is linearizable
+//!   (`crates/node/tests/support/history.rs`), and every node ends where the others do. On cells
+//!   of three voters and of five.
 //! - A follower's engine store is damaged at rest while it is down, where both its superblocks
 //!   lie: started again, it refuses the store with a typed corruption error rather than serve,
 //!   and a spare under an identity never used replaces it (`replace` on the nodes' input, the
@@ -790,6 +792,11 @@ impl Cell {
         }
     }
 
+    /// Drops every datagram the other nodes' planes send node `id`'s, or none.
+    fn deafen_plane(&self, id: u64, deaf: bool) {
+        self.relay.as_ref().unwrap().deafen_plane(id, deaf);
+    }
+
     /// Cuts node `id` from every other node, both ways, or joins it to them again.
     fn isolate(&self, id: u64, cut: bool) {
         let relay = self.relay.as_ref().unwrap();
@@ -1038,12 +1045,15 @@ enum Fault {
     Kill,
     /// It is cut off from the other nodes, and joined to them again three quarters through.
     Cut,
+    /// Its plane hears the other nodes no more, while they hear it and every QUIC path passes, and
+    /// hears them again three quarters through.
+    Deaf,
 }
 
 fn linearizable(nodes: u64, fault: Fault) {
     let network = match fault {
         Fault::Kill => Network::Direct,
-        Fault::Cut => Network::Relayed,
+        Fault::Cut | Fault::Deaf => Network::Relayed,
     };
     let mut cell = Cell::new(nodes, network);
     let leader = cell.leader();
@@ -1070,6 +1080,11 @@ fn linearizable(nodes: u64, fault: Fault) {
             cell.done_by(ops, 3);
             cell.isolate(leader, false);
         }
+        Fault::Deaf => {
+            cell.deafen_plane(leader, true);
+            cell.done_by(ops, 3);
+            cell.deafen_plane(leader, false);
+        }
     }
     cell.done_by(ops, 4);
     drop(stops);
@@ -1086,6 +1101,13 @@ fn puts_and_reads_through_a_leader_killed_and_started_again_are_linearizable() {
 #[test]
 fn puts_and_reads_through_a_leader_cut_off_are_linearizable() {
     linearizable(NODES, Fault::Cut);
+}
+
+/// The leader's plane goes deaf: it suspects its followers, which hear it and trust it, and steps
+/// down; the others elect one of themselves, which it follows by its lanes.
+#[test]
+fn puts_and_reads_through_a_leader_whose_plane_goes_deaf_are_linearizable() {
+    linearizable(NODES, Fault::Deaf);
 }
 
 #[test]

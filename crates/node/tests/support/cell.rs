@@ -37,6 +37,7 @@ use mantle_node::classes::Role;
 use mantle_node::client::{Asks, Client, ClientSettings};
 use mantle_node::directory::{Peer, node_name};
 use mantle_node::node::{Hosted, Node, NodeLog, NodeSettings, Status, Written, message_bounds};
+use mantle_node::storage::Storage;
 use mantle_range::{ConfState, Range, ReplicaError, Settings};
 
 use crate::history::{Clock, Part, Plan, Steer, Told, open_bucket, work};
@@ -44,6 +45,9 @@ use crate::store::Synchronous;
 
 /// The range every node hosts: the cell's first Name range.
 pub const GROUP: u128 = 0x0072_616e_6765;
+/// The largest chunk the cell's gateways write: `mantle_gateway::layout::CHUNK`. Every node and
+/// client of the process states the same bounds.
+const CHUNK_BYTES: u64 = 8 << 20;
 /// The nodes of a cell on an odd seed: three, and on an even one five, the cells node.md's
 /// Phase C asks histories of.
 pub const NODES: u64 = 3;
@@ -274,11 +278,14 @@ impl Pki {
             transport_bytes: u64::try_from(nodes.len() * 3 * hyper_transport::RECEIVE_CHUNK)
                 .unwrap(),
             nodes,
-            messages: message_bounds(&[Hosted {
-                group: GROUP,
-                range: range(count, settings),
-                engine: (),
-            }])
+            messages: message_bounds(
+                &[Hosted {
+                    group: GROUP,
+                    range: range(count, settings),
+                    engine: (),
+                }],
+                CHUNK_BYTES,
+            )
             .unwrap(),
             seed: Some(derived(seed, id, Derived::Endpoint)),
         }
@@ -570,7 +577,7 @@ impl Sim {
                 .collect(),
             log: self.log,
             transport_bytes: u64::try_from(
-                self.pki.peers(id).len() * 3 * hyper_transport::RECEIVE_CHUNK,
+                self.pki.peers(id).len() * 4 * hyper_transport::RECEIVE_CHUNK,
             )
             .unwrap(),
             // A node started again draws afresh, as a process started again would.
@@ -579,6 +586,10 @@ impl Sim {
                 id,
                 Derived::Endpoint,
             )),
+            // The simulated cell's nodes keep ranges only.
+            storage: Storage::none(),
+            chunk_bytes: CHUNK_BYTES,
+            chunk_asks: 0,
         };
         self.starts += 1;
         let shard = member.shard;

@@ -4,10 +4,15 @@
 //!
 //! **The file** states every number the node is run with, one `key = value` a line (`#` begins a
 //! comment): nothing is assumed for the operator. A `peer` line, repeated, names a peer's id, its
-//! role (`node` or `client`) and its certificate's file. Certificates and the key are DER (the
-//! key PKCS #8).
+//! role (`node`, `gateway` or `client`) and its certificate's file. Certificates and the key are
+//! DER (the key PKCS #8). A `volume` line, repeated, names a chunk volume of the node's storage
+//! role (node.md §1.1): `volume = DIR SIZE DEPTH READ_BYTES READ_GAP PREWRITE`, its device
+//! directory, its bytes, and what its device measured (`mantle disk probe --measure`); the layout
+//! every volume shares is the `volume.` keys. `chunk_bytes` is the largest chunk the cell's
+//! gateways write, and `chunk_asks` the chunk puts and gets the node keeps out to its peers.
 //!
-//! **Its talk** is lines. On standard output: `bound QUIC PLANE` once the node listens, then
+//! **Its talk** is lines. On standard output: `bound QUIC PLANE` once the node listens, and
+//! `volume ID` for each volume it holds, its 128-bit id in hex; then
 //! `status TERM LEADER COMMIT APPLIED PATIENCE_NS RECONNECT_NS MEASURING_NS HELD` each time one of the first four
 //! moves, its redials to a peer back off further or start over, or the heartbeats it takes from
 //! peers not yet judged move (`Status::measuring`): how long the node states it may go
@@ -58,6 +63,7 @@ use mantle_range::{ConfState, Range, Settings, Stored};
 use crate::classes::Role;
 use crate::directory::Peer;
 use crate::node::{Hosted, Link, Node, NodeError, NodeSettings, Status};
+use crate::storage::{Storage, StorageError, VolumeSettings};
 
 /// Why the process stopped.
 #[derive(Debug, thiserror::Error)]
@@ -76,6 +82,8 @@ pub enum ProcessError {
     Engine(String),
     #[error("the node: {0}")]
     Node(#[from] NodeError),
+    #[error("the node's storage: {0}")]
+    Storage(#[from] StorageError),
     #[error("standard input, line {0:?}: {1}")]
     Input(String, &'static str),
 }
@@ -101,18 +109,26 @@ pub struct ProcessConfig {
     pub transport_bytes: u64,
     /// Each probe of the machine's calibration runs within this (hyper-rt `Calibration::measure`).
     pub probe_budget: Duration,
+    /// The chunk volumes the node keeps (`volume` lines), none for a node with no storage role.
+    pub volumes: Vec<VolumeSettings>,
+    /// The largest chunk the cell's gateways write, and the chunk puts and gets the node keeps out
+    /// to its peers at once (`NodeSettings::chunk_bytes`, `chunk_asks`).
+    pub chunk_bytes: u64,
+    pub chunk_asks: usize,
 }
 
-/// The file's values by key, each with the line it was on; `peer` lines kept apart.
+/// The file's values by key, each with the line it was on; `peer` and `volume` lines kept apart.
 struct Lines {
     values: BTreeMap<String, (usize, String)>,
     peers: Vec<(usize, String)>,
+    volumes: Vec<(usize, String)>,
 }
 
 impl Lines {
     fn parse(text: &str) -> Result<Self, ProcessError> {
         let mut values = BTreeMap::new();
         let mut peers = Vec::new();
+        let mut volumes = Vec::new();
         for (at, line) in text.lines().enumerate() {
             let number = at.saturating_add(1);
             let line = line.split('#').next().unwrap_or_default().trim();
@@ -125,11 +141,17 @@ impl Lines {
             let (key, value) = (key.trim(), value.trim().to_owned());
             if key == "peer" {
                 peers.push((number, value));
+            } else if key == "volume" {
+                volumes.push((number, value));
             } else if values.insert(key.to_owned(), (number, value)).is_some() {
                 return Err(ProcessError::Line(number, format!("{key} stated twice")));
             }
         }
-        Ok(Self { values, peers })
+        Ok(Self {
+            values,
+            peers,
+            volumes,
+        })
     }
 
     fn text(&self, key: &'static str) -> Result<&str, ProcessError> {
@@ -171,8 +193,14 @@ impl ProcessConfig {
                 .map_err(|_| ProcessError::Line(*number, "a peer's id".into()))?;
             let role = match role {
                 "node" => Role::Node,
+                "gateway" => Role::Gateway,
                 "client" => Role::Client,
-                _ => return Err(ProcessError::Line(*number, "a role: node or client".into())),
+                _ => {
+                    return Err(ProcessError::Line(
+                        *number,
+                        "a role: node, gateway or client".into(),
+                    ));
+                }
             };
             peers.push((id, role, PathBuf::from(certificate)));
         }
@@ -239,17 +267,83 @@ impl ProcessConfig {
             },
             transport_bytes: lines.get("transport_bytes")?,
             probe_budget: Duration::from_millis(lines.get("runtime.probe_budget_ms")?),
+            volumes: volumes(&lines)?,
+            chunk_bytes: lines.get("chunk_bytes")?,
+            chunk_asks: lines.get("chunk_asks")?,
         })
     }
+}
+
+/// The volumes the `volume` lines state, each `volume = DIR SIZE DEPTH READ_BYTES READ_GAP
+/// PREWRITE`: its device directory, its bytes, and what its device measured (mantle disk probe
+/// --measure): the depth its reads and its issuer keep in flight, the bytes reads buffer at once,
+/// the payload a read goes past rather than ask twice, and whether it is written once at layout
+/// (1) or not (0). The layout every volume shares is stated once, in the `volume.` keys.
+fn volumes(lines: &Lines) -> Result<Vec<VolumeSettings>, ProcessError> {
+    if lines.volumes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let scrub_s: u64 = lines.get("volume.scrub_period_s")?;
+    let shared = mantle_chunk::Config {
+        segment_size: lines.get("volume.segment_bytes")?,
+        checksum_shift: lines.get("volume.checksum_shift")?,
+        max_fragments: lines.get("volume.max_fragments")?,
+        compact: lines.get::<u8>("volume.compact")? == 1,
+        scrub_period: (scrub_s > 0).then(|| Duration::from_secs(scrub_s)),
+        limits: mantle_chunk::Limits {
+            batch_requests: lines.get("volume.batch_requests")?,
+            batch_bytes: lines.get("volume.batch_bytes")?,
+            fragments_per_chunk: lines.get("volume.fragments_per_chunk")?,
+        },
+        prewrite: false,
+        reads: mantle_chunk::Reads::default(),
+    };
+    let mut volumes = Vec::with_capacity(lines.volumes.len());
+    for (number, value) in &lines.volumes {
+        let bad = || {
+            ProcessError::Line(
+                *number,
+                "volume = DIR SIZE DEPTH READ_BYTES READ_GAP PREWRITE".into(),
+            )
+        };
+        let fields: Vec<&str> = value.split_whitespace().collect();
+        let [dir, size, depth, bytes, gap, prewrite] = fields.as_slice() else {
+            return Err(bad());
+        };
+        let depth: usize = depth.parse().map_err(|_| bad())?;
+        let prewrite = match *prewrite {
+            "0" => false,
+            "1" => true,
+            _ => return Err(bad()),
+        };
+        volumes.push(VolumeSettings {
+            dir: PathBuf::from(dir),
+            size: size.parse().map_err(|_| bad())?,
+            config: mantle_chunk::Config {
+                prewrite,
+                reads: mantle_chunk::Reads::measured(
+                    depth,
+                    bytes.parse().map_err(|_| bad())?,
+                    gap.parse().map_err(|_| bad())?,
+                ),
+                ..shared
+            },
+            depth,
+        });
+    }
+    Ok(volumes)
 }
 
 /// Runs the node the file at `config` states until standard input closes.
 pub fn run(config: &Path) -> Result<(), ProcessError> {
     let config = ProcessConfig::read(config)?;
+    // The volumes open before the node's runtime starts: an issuer's start and a volume's
+    // recovery wait on their device, which no shard may (node.md §1.3).
+    let storage = Storage::open(&config.volumes)?;
     let runtime = runtime(&config)?;
     let mut rt =
         LocalRuntime::new(&runtime).map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
-    rt.block_on(serve(config))
+    rt.block_on(serve(config, storage))
         .map_err(|e| ProcessError::Runtime(format!("{e:?}")))?
 }
 
@@ -303,7 +397,7 @@ fn engine(config: &ProcessConfig) -> Result<Stored<DeviceFile>, ProcessError> {
 }
 
 /// The node, its talk on standard input and output.
-async fn serve(config: ProcessConfig) -> Result<(), ProcessError> {
+async fn serve(config: ProcessConfig, storage: Storage) -> Result<(), ProcessError> {
     // This process's one shard runs the node's replicas, which apply through the engine's
     // synchronous calls (node.md §1.2).
     mantle_engine::store::permit_blocking();
@@ -344,6 +438,9 @@ async fn serve(config: ProcessConfig) -> Result<(), ProcessError> {
         log: config.log,
         transport_bytes: config.transport_bytes,
         seed: None,
+        storage,
+        chunk_bytes: config.chunk_bytes,
+        chunk_asks: config.chunk_asks,
     };
     let mut node = Node::open(settings).await?;
     // A buffer each way, a page each (hyper-rt `stdio`: a page is the natural chunk): the talk is
@@ -356,6 +453,10 @@ async fn serve(config: ProcessConfig) -> Result<(), ProcessError> {
         hyper_rt::stdio::stdout(1, chunk).map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
     let (quic, plane) = node.addresses()?;
     say(&mut output, &format!("bound {quic} {plane}\n")).await?;
+    let held: Vec<u128> = node.volumes().map(|(id, _)| id).collect();
+    for volume in held {
+        say(&mut output, &format!("volume {volume:032x}\n")).await?;
+    }
     let mut read = vec![0u8; chunk];
     let mut pending = Vec::new();
     let mut told: Option<Status> = None;

@@ -592,6 +592,19 @@ impl<F: BlockFile + Sync + 'static> Volume<F> {
     }
 
     /// The most payload bytes one record holds: a segment less its header and the record's.
+    /// Requests the writer's queue holds (`Limits::queue_requests`): past them a write is
+    /// refused `Busy`.
+    pub fn queue_requests(&self) -> usize {
+        self.limits.queue_requests()
+    }
+
+    /// Payload bytes the writer's queue holds (`Limits::queue_bytes`): past them a write is
+    /// refused `Busy`, so a storage node holds no more of the chunks it is sent than its volumes
+    /// can queue.
+    pub fn queue_bytes(&self) -> u64 {
+        self.limits.queue_bytes()
+    }
+
     pub fn max_payload(&self) -> u64 {
         crate::writer::max_payload(&self.shared.geometry, self.shared.checksum_shift)
     }

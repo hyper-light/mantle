@@ -208,15 +208,7 @@ pub struct Options {
 
 pub fn chunk(out: &mut impl Write, path: &Path, options: &Options) -> Result<(), Error> {
     let id = mantle_disk::probe::identify(path);
-    let align = [id.logical_block, id.physical_block]
-        .into_iter()
-        .flatten()
-        .filter_map(|b| usize::try_from(b).ok())
-        .filter_map(|b| Alignment::new(b).ok())
-        .fold(
-            Alignment::new(4096).unwrap_or(Alignment::BYTE),
-            Alignment::max,
-        );
+    let align = id.transfer_alignment();
     let mut plan = Plan::standard(id.file_system.available_bytes, options.step, options.rounds);
     if !options.sizes.is_empty() {
         plan.sizes.clone_from(&options.sizes);

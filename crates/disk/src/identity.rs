@@ -8,6 +8,8 @@
 
 use std::fmt;
 
+use hyper_block::buf::Alignment;
+
 /// The storage medium.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Medium {
@@ -167,6 +169,22 @@ impl fmt::Display for Note {
 }
 
 impl Identity {
+    /// The alignment direct transfers to the device keep: the larger of its logical block, the
+    /// unit it addresses, and its physical block, the unit it writes, so no write is split into a
+    /// read-modify-write; and 4 KiB at least, for a device that states neither. `mantle disk
+    /// probe --measure`, `mantle bench` and a node's volumes take it alike.
+    pub fn transfer_alignment(&self) -> Alignment {
+        [self.logical_block, self.physical_block]
+            .into_iter()
+            .flatten()
+            .filter_map(|b| usize::try_from(b).ok())
+            .filter_map(|b| Alignment::new(b).ok())
+            .fold(
+                Alignment::new(4096).unwrap_or(Alignment::BYTE),
+                Alignment::max,
+            )
+    }
+
     pub(crate) fn unknown(file_system: FileSystem) -> Self {
         Self {
             device: None,

@@ -4,7 +4,6 @@ use std::fmt;
 use std::io::Write;
 use std::path::Path;
 
-use hyper_block::buf::Alignment;
 use hyper_block::file::Caching;
 use mantle_disk::calibrate::{self, Calibration, Plan};
 use mantle_disk::identity::{FileSystemKind, Identity, Interconnect, Medium, WriteCache, Zoned};
@@ -149,15 +148,7 @@ fn write_cache(id: &Identity) -> &'static str {
 }
 
 fn measured(out: &mut impl Write, path: &Path, id: &Identity) -> Result<(), Error> {
-    let align = [id.logical_block, id.physical_block]
-        .into_iter()
-        .flatten()
-        .filter_map(|b| usize::try_from(b).ok())
-        .filter_map(|b| Alignment::new(b).ok())
-        .fold(
-            Alignment::new(4096).unwrap_or(Alignment::BYTE),
-            Alignment::max,
-        );
+    let align = id.transfer_alignment();
     let plan = Plan::standard(align, id.queue_depth);
     writeln!(
         out,

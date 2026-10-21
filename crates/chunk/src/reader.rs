@@ -207,6 +207,11 @@ impl Reader {
         }
     }
 
+    /// The depth, bytes and waiting this reader holds its reads to: the volume's.
+    pub fn reads(&self) -> Reads {
+        self.reads
+    }
+
     /// Reads at the device now.
     pub fn out(&self) -> usize {
         self.out.len()

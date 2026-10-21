@@ -7,6 +7,7 @@
 //! |---|---|---|---|
 //! | `Raft` | replication, on a lane | nodes | a range's Raft message: appends with entries, and control too large for a datagram |
 //! | `Command` | request, an exchange | anyone | a gateway's or client's commands to a range |
+//! | `ChunkPut`, `ChunkGet` | transfer, an exchange | nodes and gateways | a chunk's bytes to the volume that keeps them, a range of them back (`crate::chunk`) |
 //! | `Snapshot` | bulk, an exchange | nodes | a range's snapshot to a member that lags past the log's start |
 //!
 //! The frame bound of each class is the largest message of that kind the node's ranges can make,
@@ -24,14 +25,18 @@ pub enum Kind {
     Command,
     Snapshot,
     Read,
+    ChunkPut,
+    ChunkGet,
 }
 
 /// The classes a node's QUIC connections share credit by, most urgent first (node.md §3.1, §3.3):
-/// their order is their urgency.
+/// their order is their urgency. `Transfer` is node.md's request class's lower level, the bodies
+/// of chunk writes and reads, below the requests someone waits on and above bulk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Class {
     Replication,
     Request,
+    Transfer,
     Bulk,
 }
 
@@ -52,6 +57,7 @@ pub enum Role {
 pub struct Bounds {
     pub replication: u64,
     pub request: u64,
+    pub transfer: u64,
     pub bulk: u64,
 }
 
@@ -84,20 +90,28 @@ pub fn state_bounds(bounds: Bounds) -> Result<(), BoundsTaken> {
 /// The classes of a node's connections ([`Kind`], [`Class`], [`Role`]).
 pub struct NodeClasses;
 
-const KINDS: [Kind; 4] = [Kind::Raft, Kind::Command, Kind::Snapshot, Kind::Read];
+const KINDS: [Kind; 6] = [
+    Kind::Raft,
+    Kind::Command,
+    Kind::Snapshot,
+    Kind::Read,
+    Kind::ChunkPut,
+    Kind::ChunkGet,
+];
 
 impl Classes for NodeClasses {
     type Class = Class;
     type Kind = Kind;
     type Role = Role;
 
-    const RANKS: u8 = 3;
+    const RANKS: u8 = 4;
 
     fn rank(class: Class) -> u8 {
         match class {
             Class::Replication => 0,
             Class::Request => 1,
-            Class::Bulk => 2,
+            Class::Transfer => 2,
+            Class::Bulk => 3,
         }
     }
 
@@ -106,7 +120,11 @@ impl Classes for NodeClasses {
             (Kind::Raft, Role::Node) => Some(Class::Replication),
             (Kind::Snapshot, Role::Node) => Some(Class::Bulk),
             (Kind::Command | Kind::Read, _) => Some(Class::Request),
-            (Kind::Raft | Kind::Snapshot, Role::Gateway | Role::Client) => None,
+            // A chunk is a gateway's to place, a node's gateway's included; a client asks a
+            // gateway for objects and never writes a volume (node.md §3.6).
+            (Kind::ChunkPut | Kind::ChunkGet, Role::Node | Role::Gateway) => Some(Class::Transfer),
+            (Kind::Raft | Kind::Snapshot, Role::Gateway | Role::Client)
+            | (Kind::ChunkPut | Kind::ChunkGet, Role::Client) => None,
         }
     }
 
@@ -115,6 +133,7 @@ impl Classes for NodeClasses {
         BOUNDS.get().map_or(0, |b| match class {
             Class::Replication => b.replication,
             Class::Request => b.request,
+            Class::Transfer => b.transfer,
             Class::Bulk => b.bulk,
         })
     }
@@ -125,6 +144,8 @@ impl Classes for NodeClasses {
             Kind::Command => 2,
             Kind::Snapshot => 3,
             Kind::Read => 4,
+            Kind::ChunkPut => 5,
+            Kind::ChunkGet => 6,
         }
     }
 
@@ -159,7 +180,19 @@ mod tests {
             );
         }
         assert_eq!(NodeClasses::kind_of(0), None);
-        assert_eq!(NodeClasses::kind_of(5), None);
+        assert_eq!(NodeClasses::kind_of(7), None);
+    }
+
+    #[test]
+    fn chunks_travel_on_the_transfer_class_from_nodes_and_gateways_only() {
+        for kind in [Kind::ChunkPut, Kind::ChunkGet] {
+            for role in [Role::Node, Role::Gateway] {
+                assert_eq!(NodeClasses::class_of(kind, role), Some(Class::Transfer));
+            }
+            assert_eq!(NodeClasses::class_of(kind, Role::Client), None);
+        }
+        assert!(NodeClasses::rank(Class::Request) < NodeClasses::rank(Class::Transfer));
+        assert!(NodeClasses::rank(Class::Transfer) < NodeClasses::rank(Class::Bulk));
     }
 
     #[test]
@@ -183,6 +216,7 @@ mod tests {
         let bounds = Bounds {
             replication: 4096,
             request: 8192,
+            transfer: 1 << 16,
             bulk: 1 << 20,
         };
         // Tests share the process: whichever states first, the same statement holds after.

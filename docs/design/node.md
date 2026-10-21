@@ -1376,6 +1376,26 @@ returns them; `Corrupt`, an error or no answer by the deadline is `Unreadable`, 
 reads another copy or decodes the block (gateway.md §3). A volume that returned `Corrupt` also
 reports the chunk for repair (chunk-store.md §7).
 
+*As built (2026-10-21).* A node's storage role (`crates/node/src/storage.rs`) opens each volume
+its configuration names before its runtime starts, since an issuer's start and a volume's
+recovery wait on the device: it takes the device directory's `LOCK` (§1.6), starts one issuer a
+device the OS names, lays the volume out under another name at its first start and renames it
+into place, and opens it after. Chunks travel on a class of their own, `Transfer`, node.md §3.1's
+lower request level, below the requests someone waits on and above bulk, sent by nodes and
+gateways and never by clients (`crates/node/src/chunk.rs`): a put's head names the volume, the
+key and the sender's CRC-32C, its body the bytes; a get's head names the range; a reply's status
+is the volume's own answer, typed (`Stored`, `Read`, `Busy`, `Full`, `Fenced`, `NoVolume`,
+`Checksum`, `TooLarge`, `NotFound`, `Range`, `Corrupt`, `Exists`, ...). A put is written from the
+buffer it arrived in (`Volume::put_checked_waking`) and answered when the volume's writer wakes
+the node; a get is a batch at the device's issuer, taken as its answer comes (`Volume::reader`),
+so the shard never waits on a chunk's I/O. A put a peer sends takes room from what the volumes'
+writer queues hold before its body is read, and one the node has no room for is refused unread
+(`Refusal::Budget`), as the queue would refuse it `Busy` once read. A node asks its own volumes
+in-process, the laptop's path (§5.5), and its peers' over the transfer class (`Node::put_chunk`,
+`Node::get_chunk`). Tested node to node over real sockets and disks (`crates/node/tests/cluster.rs`):
+chunks on every node read back whole and in part from any node, each refusal answered why, and
+what a peer acknowledged read back after it stops and starts again.
+
 ### 5.3 Sessions
 
 Each gateway holds one session with each range it writes to, registered by a `Register` command

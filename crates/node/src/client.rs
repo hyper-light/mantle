@@ -158,9 +158,10 @@ impl Client {
         let peers = settings.nodes.len();
         let stated = Stated {
             peers,
-            // A client keeps one command out, to one range at a time.
+            // A client keeps one command out, to one range at a time, and moves no chunk.
             ranges: 1,
             inflight: 0,
+            transfers: 0,
             transport_bytes: settings.transport_bytes,
             messages: settings.messages,
         };

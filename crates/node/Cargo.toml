@@ -23,8 +23,11 @@ hyper-rt = { path = "../../vendor/hyper-rt" }
 hyper-rt-transport = { path = "../../vendor/hyper-rt-transport" }
 hyper-timing = { path = "../../vendor/hyper-timing" }
 hyper-transport = { path = "../../vendor/hyper-transport" }
+# The chunk volumes of the node's storage role (node.md §1.1), and the device each is on.
+mantle-chunk = { path = "../chunk" }
 mantle-codec = { path = "../codec" }
 mantle-crc = { path = "../crc" }
+mantle-disk = { path = "../disk" }
 # The engine a node keeps its ranges' rows in (`mantle_range::Stored`), its store's settings.
 mantle-engine = { path = "../engine" }
 mantle-meta = { path = "../meta" }

@@ -10,7 +10,7 @@ use hyper_rt_transport::{Io, MAX_BATCH};
 use hyper_transport::{AdmissionLimits, AskQueue, Limits, RECEIVE_CHUNK, StreamCredit};
 
 use crate::classes::Bounds;
-use crate::command;
+use crate::{chunk, command};
 
 /// RFC 9002 §6.2.2: before a path has a sample, its smoothed round trip is `kInitialRtt`, 333 ms,
 /// and its variation half that.
@@ -37,6 +37,9 @@ pub struct Stated {
     pub ranges: usize,
     /// The appends a range's leader keeps out to one follower (`Settings::max_inflight_msgs`).
     pub inflight: usize,
+    /// The chunk exchanges the node keeps open at once: those its volumes take (each volume's
+    /// writer queue and its reads at the device and waiting) and those it asks of its peers.
+    pub transfers: usize,
     /// The bytes the node's transport may hold at once, its budget's capacity.
     pub transport_bytes: u64,
     /// The largest message of each class (`crate::classes::Bounds`).
@@ -96,11 +99,13 @@ pub fn limits(stated: &Stated) -> Result<Limits, Unfit> {
         .ok_or(Unfit("connections"))?;
     // A peer node opens at most a snapshot for each range it leads to this one, Raft holding
     // replication to a member while its snapshot is out (hyper-raft's `report_snapshot`), and a
-    // command for each range besides; every range may be led there.
+    // command for each range besides; every range may be led there. Its chunk exchanges are at
+    // most the node's transfers.
     let streams = stated
         .ranges
         .max(1)
         .checked_mul(2)
+        .and_then(|n| n.checked_add(stated.transfers))
         .and_then(|n| u32::try_from(n).ok())
         .ok_or(Unfit("streams"))?;
     let exchanges = usize::try_from(streams)
@@ -140,10 +145,22 @@ pub fn limits(stated: &Stated) -> Result<Limits, Unfit> {
         // One lane a peer: the node runs its ranges on one shard (node.md §3.2's lane a shard).
         lanes_per_peer: 1,
         lane_window,
-        // A command's head names its range; a reply's, its status and the leader. A snapshot's
-        // exchange carries its frame in the body and no head.
-        max_head: u32::try_from(command::HEAD_BYTES.max(command::REPLY_HEAD_BYTES))
-            .map_err(|_| Unfit("head"))?,
+        // A command's head names its range; a reply's, its status and the leader; a chunk's, its
+        // volume, its key and the CRC-32C or the range asked. A snapshot's exchange carries its
+        // frame in the body and no head.
+        max_head: u32::try_from(
+            [
+                command::HEAD_BYTES,
+                command::REPLY_HEAD_BYTES,
+                chunk::PUT_HEAD_BYTES,
+                chunk::GET_HEAD_BYTES,
+                chunk::REPLY_HEAD_BYTES,
+            ]
+            .into_iter()
+            .max()
+            .unwrap_or(0),
+        )
+        .map_err(|_| Unfit("head"))?,
         window_ceiling,
         // An exchange that makes no progress for as long as a connection may stay silent is
         // judged stalled.
@@ -192,10 +209,12 @@ mod tests {
             peers: 2,
             ranges: 3,
             inflight: 4,
+            transfers: 5,
             transport_bytes: 64 << 20,
             messages: Bounds {
                 replication: 1 << 16,
                 request: 1 << 16,
+                transfer: 1 << 20,
                 bulk: 1 << 24,
             },
         }
@@ -235,8 +254,13 @@ mod tests {
     fn the_limits_follow_what_the_node_states() {
         let limits = limits(&stated()).unwrap();
         assert_eq!(limits.admission.connections, 4);
-        assert_eq!(limits.streams_per_connection, 6);
-        assert_eq!(limits.exchanges, 24);
+        // Six for the ranges' snapshots and commands, five for chunks.
+        assert_eq!(limits.streams_per_connection, 11);
+        assert_eq!(limits.exchanges, 44);
+        assert_eq!(
+            limits.max_head,
+            u32::try_from(chunk::GET_HEAD_BYTES).unwrap()
+        );
         assert_eq!(limits.lane_window, 15);
         assert_eq!(limits.window_ceiling, 32 << 20);
         assert_eq!(

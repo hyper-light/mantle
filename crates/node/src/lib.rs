@@ -26,6 +26,7 @@
 )]
 
 pub mod bounds;
+pub mod chunk;
 pub mod classes;
 pub mod client;
 pub mod command;
@@ -35,3 +36,4 @@ pub mod layout;
 pub mod node;
 pub mod process;
 pub mod read;
+pub mod storage;

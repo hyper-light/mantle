@@ -85,6 +85,7 @@ use hyper_rt::runtime::{LocalRuntime, RuntimeConfig, interests_for};
 use hyper_rt::sync::{ChannelReceiver, Sender, channel};
 use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer};
 use mantle_cert::{KeyPair, Serial, Validity};
+use mantle_chunk::{ChunkKey, Config as VolumeConfig, Limits as VolumeLimits, Reads};
 use mantle_engine::store::Config as StoreConfig;
 use mantle_engine::trunk::TrunkConfig;
 use mantle_meta::apply::Layer;
@@ -92,10 +93,14 @@ use mantle_meta::engine::{Engine, Model};
 use mantle_meta::name;
 use mantle_meta::session::Rules;
 use mantle_meta::wire::{Answer, Entry};
+use mantle_node::chunk::Status as ChunkStatus;
 use mantle_node::classes::Role;
 use mantle_node::client::{Client, ClientSettings};
 use mantle_node::directory::{Peer, node_name};
-use mantle_node::node::{Hosted, Link, Node, NodeSettings, Status, message_bounds};
+use mantle_node::node::{
+    ChunkAsk, ChunkOutcome, Hosted, Link, Node, NodeSettings, Status, message_bounds,
+};
+use mantle_node::storage::{Storage, VolumeSettings};
 use mantle_range::{ConfState, Range, Settings, Stored};
 
 #[allow(dead_code)]
@@ -111,6 +116,13 @@ use relay::Relay;
 
 /// The range every node hosts: the cell's first Name range.
 const GROUP: u128 = 0x0072_616e_6765;
+/// The largest chunk the cell's gateways write, the transfer class's bound with its head:
+/// `mantle_gateway::layout::CHUNK`, Tectonic's 8 MiB. Every node and client of the process states
+/// the same bounds.
+const CHUNK_BYTES: u64 = 8 << 20;
+/// The chunk puts and gets a node keeps out to its peers at once, and the most chunk orders the
+/// test keeps out to one node.
+const CHUNK_ASKS: usize = 4;
 /// The nodes of most cells, each a founding voter of the range.
 const NODES: u64 = 3;
 /// The most nodes a cell has: five, the larger of the cells node.md's Phase C asks histories of
@@ -359,7 +371,11 @@ impl Pki {
             bind: "127.0.0.1:0".parse().unwrap(),
             credentials: self.credentials(&self.clients[&id]),
             nodes: peers,
-            messages: message_bounds(&[hosted(u64::try_from(order.len()).unwrap(), ())]).unwrap(),
+            messages: message_bounds(
+                &[hosted(u64::try_from(order.len()).unwrap(), ())],
+                CHUNK_BYTES,
+            )
+            .unwrap(),
             transport_bytes,
             seed: None,
         }
@@ -383,9 +399,9 @@ impl Pki {
             certificate: certificate.clone(),
         }));
         // Each peer's share holds a receive chunk, the largest datagram QUIC carries, for each of
-        // the node's three classes.
+        // the node's four classes.
         let transport_bytes =
-            u64::try_from(peers.len() * 3 * hyper_transport::RECEIVE_CHUNK).unwrap();
+            u64::try_from(peers.len() * 4 * hyper_transport::RECEIVE_CHUNK).unwrap();
         NodeSettings {
             id,
             dir: dir.to_path_buf(),
@@ -398,6 +414,9 @@ impl Pki {
             log: log_config(),
             transport_bytes,
             seed: None,
+            storage: Storage::none(),
+            chunk_bytes: CHUNK_BYTES,
+            chunk_asks: CHUNK_ASKS,
         }
     }
 }
@@ -427,6 +446,10 @@ enum Report {
     Replaced(u64, u64),
     /// A node's link to a peer as it changed: dialed, keyed, or a connection or dial ended.
     Link(u64, Link),
+    /// The volumes a node holds, once open.
+    Volumes(u64, Vec<u128>),
+    /// A chunk's put or get answered, under the test's tag.
+    Chunk(u64, ChunkOutcome),
 }
 
 /// What the test tells the client's task.
@@ -480,13 +503,35 @@ enum Order {
     Propose(Entry),
     /// Replace the first, a member lost for good, with the second (`Node::replace`).
     Replace(u64, u64),
+    /// A chunk's put or get for the node to ask, under the test's tag.
+    Chunk(u64, Chunked),
     Stop,
+}
+
+/// A chunk's put or get a node asks (`Node::put_chunk`, `Node::get_chunk`): of the volume, which
+/// the node `at` holds, itself or a peer.
+#[derive(Debug)]
+enum Chunked {
+    Put {
+        at: u64,
+        volume: u128,
+        key: ChunkKey,
+        bytes: Vec<u8>,
+        crc32c: u32,
+    },
+    Get {
+        at: u64,
+        volume: u128,
+        key: ChunkKey,
+        offset: u64,
+        len: u64,
+    },
 }
 
 /// Orders the channel of a node of a cell of `nodes` holds: where each peer listens, a proposal,
 /// a replacement and a stop.
 fn orders_bound(nodes: u64) -> usize {
-    usize::try_from(nodes).unwrap() + 2
+    usize::try_from(nodes).unwrap() + 2 + CHUNK_ASKS
 }
 
 /// A node's task: opens the node, as the task that turns a node opens it (`Node::open`), reports
@@ -504,6 +549,10 @@ async fn run<E: Engine + 'static>(
             if reports.send(Report::Bound(id, quic, plane)).is_err() {
                 return;
             }
+            let volumes = node.volumes().map(|(volume, _)| volume).collect();
+            if reports.send(Report::Volumes(id, volumes)).is_err() {
+                return;
+            }
             node
         }
         Err(error) => {
@@ -513,6 +562,8 @@ async fn run<E: Engine + 'static>(
     };
     let mut told: Option<Status> = None;
     let mut stats = None;
+    // The test's tag for each chunk asked, by the number the node asked it under.
+    let mut tags: BTreeMap<ChunkAsk, u64> = BTreeMap::new();
     // Each peer's link as last reported, a slot a peer.
     let mut links: Vec<Link> = Vec::new();
     loop {
@@ -543,6 +594,33 @@ async fn run<E: Engine + 'static>(
                     return;
                 }
             }
+            Either::Second(Ok(Order::Chunk(tag, chunked))) => {
+                let asked = match chunked {
+                    Chunked::Put {
+                        at,
+                        volume,
+                        key,
+                        bytes,
+                        crc32c,
+                    } => node.put_chunk(at, volume, key, bytes, crc32c),
+                    Chunked::Get {
+                        at,
+                        volume,
+                        key,
+                        offset,
+                        len,
+                    } => node.get_chunk(at, volume, key, offset, len),
+                };
+                match asked {
+                    Ok(asked) => {
+                        tags.insert(asked, tag);
+                    }
+                    Err(error) => {
+                        let _ = reports.send(Report::Failed(id, error.to_string()));
+                        return;
+                    }
+                }
+            }
             Either::Second(Ok(Order::Stop)) => {
                 drop(node);
                 let _ = reports.send(Report::Stopped(id));
@@ -554,6 +632,15 @@ async fn run<E: Engine + 'static>(
         for (_, replaced) in node.take_replaced() {
             let report = Report::Replaced(replaced.failed(), replaced.joining());
             if reports.send(report).is_err() {
+                return;
+            }
+        }
+        let chunks: Vec<_> = node.take_chunks().collect();
+        for (asked, outcome) in chunks {
+            let Some(tag) = tags.remove(&asked) else {
+                continue;
+            };
+            if reports.send(Report::Chunk(tag, outcome)).is_err() {
                 return;
             }
         }
@@ -610,6 +697,10 @@ async fn run<E: Engine + 'static>(
 #[derive(Debug, Default)]
 struct Watch {
     bound: BTreeMap<u64, (SocketAddr, SocketAddr)>,
+    /// The volumes each node said it holds when it opened.
+    volumes: BTreeMap<u64, Vec<u128>>,
+    /// The chunk puts and gets answered, by the test's tag.
+    chunks: BTreeMap<u64, ChunkOutcome>,
     /// The nodes open and not stopped.
     live: BTreeSet<u64>,
     status: BTreeMap<u64, Status>,
@@ -720,6 +811,14 @@ impl Watch {
             }
             Report::Link(id, link) => {
                 self.links.insert((id, link.peer), link);
+                self.moved();
+            }
+            Report::Volumes(id, volumes) => {
+                self.volumes.insert(id, volumes);
+                self.moved();
+            }
+            Report::Chunk(tag, outcome) => {
+                self.chunks.insert(tag, outcome);
                 self.moved();
             }
             Report::Progress(client, done, patience) => {
@@ -868,6 +967,11 @@ struct Cell {
     relay: Option<Relay>,
     /// Where the running workload's clients are told of a node that starts.
     learns: Vec<mpsc::Sender<(u64, SocketAddr)>>,
+    /// The volume each node keeps, in its directory's `device`, in a cell whose nodes store
+    /// chunks.
+    volume: Option<VolumeSettings>,
+    /// The next tag a chunk order is asked under.
+    next_tag: u64,
 }
 
 impl Drop for Cell {
@@ -892,12 +996,18 @@ impl Cell {
 
     /// A cell of `nodes` nodes started on `network`, each told where the others listen.
     fn start_on(engines: Engines, network: Network, nodes: u64) -> Self {
-        Self::start_spared(engines, network, nodes, 0)
+        Self::start_spared(engines, network, nodes, 0, None)
     }
 
     /// A cell of `voters` nodes started on `network`, each told where the others listen, and
     /// `spares` identities past them that every directory holds and no node runs yet.
-    fn start_spared(engines: Engines, network: Network, voters: u64, spares: u64) -> Self {
+    fn start_spared(
+        engines: Engines,
+        network: Network,
+        voters: u64,
+        spares: u64,
+        volume: Option<VolumeSettings>,
+    ) -> Self {
         let nodes = voters + spares;
         let (tell, reports) = mpsc::channel();
         let mut cell = Cell {
@@ -917,12 +1027,98 @@ impl Cell {
             relay: (network == Network::Relayed)
                 .then(|| Relay::start(&(1..=nodes).collect::<Vec<_>>())),
             learns: Vec::new(),
+            volume,
+            next_tag: 0,
         };
         for id in 1..=voters {
             cell.spawn(id);
         }
         cell.introduce(&(1..=voters).collect::<Vec<_>>());
         cell
+    }
+
+    /// A cell of three nodes on `engines`, each keeping one volume as `volume` states it, in its
+    /// directory.
+    fn start_stored(engines: Engines, volume: VolumeSettings) -> Self {
+        Self::start_spared(engines, Network::Direct, NODES, 0, Some(volume))
+    }
+
+    /// The volume node `id` holds, once it says so.
+    fn volume_of(&mut self, id: u64) -> u128 {
+        self.watch.until(&self.reports, |w| {
+            w.volumes.get(&id).and_then(|v| v.first().copied())
+        })
+    }
+
+    /// Orders node `from` to ask a chunk's put or get, and returns the tag its answer comes under.
+    fn ask_chunk(&mut self, from: u64, chunked: Chunked) -> u64 {
+        let tag = self.next_tag;
+        self.next_tag += 1;
+        self.order(from, Order::Chunk(tag, chunked));
+        tag
+    }
+
+    /// Waits until node `from` holds a connection to `to`: its link to it keyed.
+    fn connected(&mut self, from: u64, to: u64) {
+        self.watch.until(&self.reports, |w| {
+            w.links
+                .get(&(from, to))
+                .filter(|link| link.keyed)
+                .map(|_| ())
+        });
+    }
+
+    /// What became of the chunk's put or get asked under `tag`, once it is answered.
+    fn chunk(&mut self, tag: u64) -> ChunkOutcome {
+        self.watch
+            .until(&self.reports, |w| w.chunks.get(&tag).cloned())
+    }
+
+    /// Node `from` puts `bytes` as `key`'s chunk on `volume`, which `at` holds, and waits for what
+    /// became of it.
+    fn put_chunk(
+        &mut self,
+        from: u64,
+        at: u64,
+        volume: u128,
+        key: ChunkKey,
+        bytes: &[u8],
+    ) -> ChunkOutcome {
+        let tag = self.ask_chunk(
+            from,
+            Chunked::Put {
+                at,
+                volume,
+                key,
+                bytes: bytes.to_vec(),
+                crc32c: mantle_crc::crc32c(bytes),
+            },
+        );
+        self.chunk(tag)
+    }
+
+    /// Node `from` gets bytes `[offset, offset + len)` of `key`'s chunk from `volume`, which `at`
+    /// holds, and waits for what became of it.
+    fn get_chunk(
+        &mut self,
+        from: u64,
+        at: u64,
+        volume: u128,
+        key: ChunkKey,
+        offset: u64,
+        len: u64,
+    ) -> ChunkOutcome {
+        let tag = self.ask_chunk(
+            from,
+            Chunked::Get {
+                at,
+                volume,
+                key,
+                offset,
+                len,
+            },
+        );
+        self.chunk(tag)
     }
 
     /// Starts node `id` on a thread of its own, its shard, on its directory: the engine is opened
@@ -935,21 +1131,33 @@ impl Cell {
         let dir: PathBuf = self.dirs[&id].path().to_path_buf();
         let (pki, tell, engines) = (self.pki.clone(), self.tell.clone(), self.engines);
         let sockets = node_sockets(self.nodes);
+        let volume = self.volume.clone().map(|template| VolumeSettings {
+            dir: dir.join("device"),
+            ..template
+        });
         let thread = std::thread::spawn(move || {
             // A panic on the node's thread is told as its failure, so a wait on it ends.
             let failed = tell.clone();
             let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                // Its volume opens before its runtime runs: a volume's recovery waits on its
+                // device, which no shard may.
+                let storage = match volume {
+                    Some(volume) => Storage::open(&[volume]).unwrap(),
+                    None => Storage::none(),
+                };
                 let mut rt = shard(sockets);
                 match engines {
                     Engines::Model => {
-                        let settings = pki.settings(id, &dir, first_range(Model::default()));
+                        let mut settings = pki.settings(id, &dir, first_range(Model::default()));
+                        settings.storage = storage;
                         rt.block_on(run(settings, taken, tell)).unwrap();
                     }
                     Engines::Mantle => {
                         // The node's shard is its metadata shard: its replicas apply through the
                         // engine's synchronous calls (node.md §1.2).
                         mantle_engine::store::permit_blocking();
-                        let settings = pki.settings(id, &dir, stored(&dir));
+                        let mut settings = pki.settings(id, &dir, stored(&dir));
+                        settings.storage = storage;
                         rt.block_on(run(settings, taken, tell)).unwrap();
                     }
                 }
@@ -1482,7 +1690,7 @@ fn workload_ops() -> u64 {
 /// one through the loss and the replacement and one after the stop, is linearizable: no write
 /// acknowledged before is lost, since a read after sees it.
 fn replaced_for_good(engines: Engines) {
-    let mut cell = Cell::start_spared(engines, Network::Direct, NODES, 1);
+    let mut cell = Cell::start_spared(engines, Network::Direct, NODES, 1, None);
     let joining = NODES + 1;
     let leader = cell.leader();
     cell.open_bucket();
@@ -1589,4 +1797,202 @@ fn puts_and_reads_through_a_leader_cut_off_from_five_voters_are_linearizable() {
 #[test]
 fn puts_and_reads_through_a_leader_cut_off_from_five_voters_are_linearizable_on_mantles_engine() {
     linearizable(Engines::Mantle, Fault::Cut, MOST_NODES);
+}
+
+/// The volume each node of a chunk test keeps: 64 MiB of 4 MiB segments, so a chunk of up to a
+/// segment's payload; 4 KiB checksum blocks; a device not measured, read one at a time at an
+/// issuer of one transfer (`Reads::default`, `issuer::depth`).
+fn test_volume() -> VolumeSettings {
+    VolumeSettings {
+        dir: PathBuf::new(),
+        size: 64 << 20,
+        config: VolumeConfig {
+            segment_size: 4 << 20,
+            checksum_shift: 12,
+            max_fragments: 4096,
+            compact: true,
+            scrub_period: None,
+            limits: VolumeLimits {
+                batch_requests: 64,
+                batch_bytes: 4 << 20,
+                fragments_per_chunk: 64,
+            },
+            prewrite: false,
+            reads: Reads::default(),
+        },
+        depth: 1,
+    }
+}
+
+/// Chunk `n`'s key.
+fn chunk_key(n: u64) -> ChunkKey {
+    ChunkKey {
+        block: u128::from(n).wrapping_mul(0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C835),
+        epoch: 1,
+        index: u16::try_from(n % 9).unwrap(),
+    }
+}
+
+/// Deterministic bytes, different for each seed.
+fn chunk_data(seed: u64, len: usize) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x.to_le_bytes()[0]
+        })
+        .collect()
+}
+
+#[test]
+fn chunks_put_on_each_nodes_volume_read_back_whole_and_in_part_from_any_node() {
+    let mut cell = Cell::start_stored(Engines::Model, test_volume());
+    let volumes: Vec<u128> = (1..=NODES).map(|id| cell.volume_of(id)).collect();
+    // Nodes 1 and 2 ask every node's volume.
+    for from in [1, 2] {
+        for to in (1..=NODES).filter(|to| *to != from) {
+            cell.connected(from, to);
+        }
+    }
+    // Node 1 puts chunks on every node's volume: its own in-process, its peers' over the transfer
+    // class. The sizes cross the checksum block and a large one spans many.
+    let mut kept = Vec::new();
+    let mut n = 0u64;
+    for at in 1..=NODES {
+        let volume = volumes[usize::try_from(at - 1).unwrap()];
+        for size in [1usize, 4096, 4097, 65_537, 1 << 20] {
+            n += 1;
+            let (key, bytes) = (chunk_key(n), chunk_data(n, size));
+            assert_eq!(
+                cell.put_chunk(1, at, volume, key, &bytes),
+                ChunkOutcome::Stored
+            );
+            kept.push((at, volume, key, bytes));
+        }
+    }
+    // Each reads back whole and in part, from node 1 and node 2: their own volume in-process, a
+    // peer's over the transfer class, every byte verified by the volume that holds it.
+    for (at, volume, key, bytes) in &kept {
+        let len = u64::try_from(bytes.len()).unwrap();
+        for from in [1, 2] {
+            assert_eq!(
+                cell.get_chunk(from, *at, *volume, *key, 0, len),
+                ChunkOutcome::Read(bytes.clone())
+            );
+            if len > 2 {
+                let (offset, part) = (len / 3, len / 3);
+                let range =
+                    usize::try_from(offset).unwrap()..usize::try_from(offset + part).unwrap();
+                assert_eq!(
+                    cell.get_chunk(from, *at, *volume, *key, offset, part),
+                    ChunkOutcome::Read(bytes[range].to_vec())
+                );
+            }
+        }
+    }
+    cell.close();
+}
+
+#[test]
+fn a_chunk_refused_is_answered_why_by_the_node_that_refused_it() {
+    let mut cell = Cell::start_stored(Engines::Model, test_volume());
+    let (own, peer) = (cell.volume_of(1), cell.volume_of(2));
+    cell.connected(1, 2);
+    let bytes = chunk_data(7, 10_000);
+    let crc = mantle_crc::crc32c(&bytes);
+    for (at, volume) in [(1, own), (2, peer)] {
+        // Changed on the way: the volume checks the CRC-32C its sender computed.
+        let tag = cell.ask_chunk(
+            1,
+            Chunked::Put {
+                at,
+                volume,
+                key: chunk_key(at),
+                bytes: bytes.clone(),
+                crc32c: crc ^ 1,
+            },
+        );
+        assert_eq!(
+            cell.chunk(tag),
+            ChunkOutcome::Refused(ChunkStatus::Checksum)
+        );
+        // A volume the node does not hold.
+        assert_eq!(
+            cell.put_chunk(1, at, volume ^ 1, chunk_key(at), &bytes),
+            ChunkOutcome::Refused(ChunkStatus::NoVolume)
+        );
+        // A chunk the volume does not hold, and bytes past one's end.
+        assert_eq!(
+            cell.get_chunk(1, at, volume, chunk_key(at), 0, 1),
+            ChunkOutcome::Refused(ChunkStatus::NotFound)
+        );
+        assert_eq!(
+            cell.put_chunk(1, at, volume, chunk_key(at), &bytes),
+            ChunkOutcome::Stored
+        );
+        assert_eq!(
+            cell.get_chunk(1, at, volume, chunk_key(at), 9_999, 2),
+            ChunkOutcome::Refused(ChunkStatus::Range)
+        );
+        // The same bytes again are answered as stored; other bytes under the key never replace
+        // what a write stored (node.md §5.2).
+        assert_eq!(
+            cell.put_chunk(1, at, volume, chunk_key(at), &bytes),
+            ChunkOutcome::Stored
+        );
+        assert_eq!(
+            cell.put_chunk(1, at, volume, chunk_key(at), &chunk_data(8, 10_000)),
+            ChunkOutcome::Refused(ChunkStatus::Exists)
+        );
+        assert_eq!(
+            cell.get_chunk(1, at, volume, chunk_key(at), 0, 10_000),
+            ChunkOutcome::Read(bytes.clone())
+        );
+    }
+    // More bytes than the transfer class carries in a reply.
+    assert_eq!(
+        cell.get_chunk(1, 2, peer, chunk_key(2), 0, CHUNK_BYTES + 1),
+        ChunkOutcome::Refused(ChunkStatus::TooLarge)
+    );
+    cell.close();
+}
+
+#[test]
+fn chunks_a_peer_stored_read_back_after_it_stops_and_starts_again() {
+    let mut cell = Cell::start_stored(Engines::Model, test_volume());
+    let volume = cell.volume_of(2);
+    cell.connected(1, 2);
+    let chunks: Vec<(ChunkKey, Vec<u8>)> = (1..=6u64)
+        .map(|n| {
+            (
+                chunk_key(n),
+                chunk_data(n, 30_000 * usize::try_from(n).unwrap()),
+            )
+        })
+        .collect();
+    for (key, bytes) in &chunks {
+        assert_eq!(
+            cell.put_chunk(1, 2, volume, *key, bytes),
+            ChunkOutcome::Stored
+        );
+    }
+    cell.stop(2);
+    // Its volume is closed: what node 1 asks of it is lost, not answered.
+    assert!(matches!(
+        cell.get_chunk(1, 2, volume, chunks[0].0, 0, 1),
+        ChunkOutcome::Lost(_)
+    ));
+    cell.restart(2);
+    assert_eq!(cell.volume_of(2), volume, "the same volume, recovered");
+    cell.connected(1, 2);
+    for (key, bytes) in &chunks {
+        let len = u64::try_from(bytes.len()).unwrap();
+        assert_eq!(
+            cell.get_chunk(1, 2, volume, *key, 0, len),
+            ChunkOutcome::Read(bytes.clone())
+        );
+    }
+    cell.close();
 }

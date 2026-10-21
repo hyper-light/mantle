@@ -127,7 +127,13 @@ engine.memtable_bytes = 4096
 engine.fanout = 3
 engine.leaf_entries = 96
 runtime.probe_budget_ms = 40
+chunk_bytes = 8388608
+chunk_asks = 0
 ";
+
+/// The largest chunk the cell's gateways write (`chunk_bytes` above): `mantle_gateway::layout::CHUNK`,
+/// Tectonic's 8 MiB.
+const CHUNK_BYTES: u64 = 8 << 20;
 
 /// The message bounds the nodes state for these settings (`mantle_node::node::message_bounds`):
 /// the client states the same.
@@ -136,30 +142,33 @@ fn bounds() -> Bounds {
     use mantle_meta::session::Rules;
     use mantle_node::node::{Hosted, message_bounds};
     use mantle_range::{ConfState, Range, Settings};
-    message_bounds(&[Hosted {
-        group: GROUP,
-        range: Range {
-            layer: Layer::Name,
-            rules: Rules {
-                lifetime_ns: u64::MAX / 2,
-                max_sessions: 64,
-                max_answers: 16,
-                max_answer_bytes: usize::MAX,
-                expiries_per_entry: 8,
+    message_bounds(
+        &[Hosted {
+            group: GROUP,
+            range: Range {
+                layer: Layer::Name,
+                rules: Rules {
+                    lifetime_ns: u64::MAX / 2,
+                    max_sessions: 64,
+                    max_answers: 16,
+                    max_answer_bytes: usize::MAX,
+                    expiries_per_entry: 8,
+                },
+                boot: ConfState::default(),
+                settings: Settings {
+                    election_tick: 10,
+                    heartbeat_tick: 2,
+                    max_size_per_msg: 1024,
+                    max_inflight_msgs: 2,
+                    max_uncommitted_size: 2048,
+                    max_committed_size_per_ready: 1 << 20,
+                    max_entry_bytes: 1024,
+                },
             },
-            boot: ConfState::default(),
-            settings: Settings {
-                election_tick: 10,
-                heartbeat_tick: 2,
-                max_size_per_msg: 1024,
-                max_inflight_msgs: 2,
-                max_uncommitted_size: 2048,
-                max_committed_size_per_ready: 1 << 20,
-                max_entry_bytes: 1024,
-            },
-        },
-        engine: (),
-    }])
+            engine: (),
+        }],
+        CHUNK_BYTES,
+    )
     .unwrap()
 }
 
@@ -333,7 +342,7 @@ impl Pki {
         let (certificate, key, _) = &self.nodes[&id];
         let voters: Vec<String> = (1..=self.voters).map(|v| v.to_string()).collect();
         // Each peer's share holds a receive chunk, the largest datagram QUIC carries, for each of
-        // the node's three classes.
+        // the node's four classes.
         let peers = self.nodes.len() - 1 + self.clients.len();
         let mut text = format!(
             "id = {id}\ndir = {}\nquic = 127.0.0.1:0\nplane = 127.0.0.1:0\nauthority = {}\n\
@@ -345,7 +354,7 @@ impl Pki {
             certificate.display(),
             key.display(),
             voters.join(","),
-            peers * 3 * hyper_transport::RECEIVE_CHUNK,
+            peers * 4 * hyper_transport::RECEIVE_CHUNK,
         );
         for (peer, (c, _, _)) in self.nodes.iter().filter(|(p, _)| **p != id) {
             text.push_str(&format!("peer = {peer} node {}\n", c.display()));

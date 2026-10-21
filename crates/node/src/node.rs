@@ -45,18 +45,21 @@ use hyper_transport::tls::{Credentials, Tls};
 use hyper_transport::{
     Classes, Config, Endpoint, Event, ExchangeId, Fixed, PeerId, Progress, Refusal,
 };
+use mantle_chunk::ChunkKey;
 use mantle_meta::engine::Engine;
 use mantle_meta::wire::Answer;
 use mantle_range::membership::{Next, Replacement};
 use mantle_range::{Applied, Elections, GroupStore, LogStore, Range, RangeMachine, ReplicaError};
 
 use crate::bounds::{self, Stated};
+use crate::chunk;
 use crate::classes::{self, Bounds, Kind, NodeClasses, Role};
 use crate::command;
 use crate::directory::{Peer, Peers};
 use crate::frame;
 use crate::layout::Layout;
 use crate::read::Query;
+use crate::storage::{Done, Origin, Storage};
 
 /// A plane message's first byte: a range's Raft frame. A liveness heartbeat starts with its own,
 /// `hyper_liveness::KIND`.
@@ -95,6 +98,34 @@ pub struct NodeSettings<E> {
     /// The seed of the QUIC endpoint's draws (`Endpoint::new_seeded`), so a simulation's run is its
     /// seed (node.md §9.1); `None` in a process, whose endpoint draws its own.
     pub seed: Option<[u8; 32]>,
+    /// The node's storage role: the chunk volumes it keeps, opened before its runtime starts
+    /// ([`Storage::open`]), or [`Storage::none`].
+    pub storage: Storage,
+    /// The largest chunk the cell's gateways write: with a chunk message's head, the transfer
+    /// class's bound (node.md §3.1), the same in every node and client of a process, as every
+    /// class's bound is.
+    pub chunk_bytes: u64,
+    /// The chunk puts and gets this node keeps out to its peers at once; one past them is
+    /// answered `Busy` ([`Node::put_chunk`]).
+    pub chunk_asks: usize,
+}
+
+/// The number a chunk put or get this node asked is answered under ([`Node::take_chunks`]).
+pub type ChunkAsk = u64;
+
+/// What became of a chunk put or get this node asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChunkOutcome {
+    /// The put's chunk is durable on its volume.
+    Stored,
+    /// The get's bytes, verified by the volume.
+    Read(Vec<u8>),
+    /// The volume, or the node that holds it, refused it, and says why.
+    Refused(chunk::Status),
+    /// The exchange ended without an answer: its peer is unreachable, refused it (the
+    /// transport's refusal: `Budget` when the peer holds as many chunks as its volumes queue), or
+    /// its connection closed. A put may still have landed (node.md §5.2).
+    Lost(Refusal),
 }
 
 /// A range the node hosts: its log group, the range, and its engine as it starts: a range's
@@ -370,6 +401,15 @@ struct Remote {
     refusal: Option<Refusal>,
 }
 
+/// A chunk put or get this node asked of a peer, out on an exchange.
+#[derive(Clone, Copy)]
+struct ChunkOut {
+    exchange: ExchangeId,
+    asked: ChunkAsk,
+    peer: PeerId,
+    get: bool,
+}
+
 /// A body going out on an exchange, with how much of it the exchange has taken (`write_body`
 /// takes what credit allows; `Event::Writable` says when more), and what follows once it is all
 /// written.
@@ -387,6 +427,8 @@ enum Then {
     Snapshot { group: u128, to: u64 },
     /// A command's reply: nothing; the exchange ends.
     Reply,
+    /// A chunk's put this node asked: its peer's reply.
+    Asked,
 }
 
 /// A body arriving on an exchange: from whom, its length, how much of it was read and what of it
@@ -417,6 +459,24 @@ enum Arriving {
     /// which RFC 9114 §4.1 allows a server only where its client keeps the complete response).
     Redirect(u128),
     Status(command::Status),
+    /// A chunk's put for the volume in this slot, its body the chunk's bytes, which hold their
+    /// length of the room the node takes chunks into.
+    ChunkPut {
+        slot: usize,
+        key: ChunkKey,
+        crc32c: u32,
+    },
+    /// A chunk's get from the volume in this slot; it carries no body.
+    ChunkGet {
+        slot: usize,
+        key: ChunkKey,
+        offset: u64,
+        len: u64,
+    },
+    /// A chunk's request answered with this status once its body is read and dropped.
+    ChunkStatus(chunk::Status),
+    /// The bytes a peer read for this node's get, asked under this number.
+    ChunkBytes(ChunkAsk),
 }
 
 impl Arriving {
@@ -427,14 +487,24 @@ impl Arriving {
             Self::Command(_) | Self::Read(_) | Self::Redirect(_) | Self::Status(_) => {
                 classes::Class::Request
             }
+            Self::ChunkPut { .. }
+            | Self::ChunkGet { .. }
+            | Self::ChunkStatus(_)
+            | Self::ChunkBytes(_) => classes::Class::Transfer,
         }
     }
 
     /// Whether its body is kept as it is read: what it is answered without is only read.
     fn keeps(self) -> bool {
         match self {
-            Self::Snapshot | Self::Command(_) | Self::Read(_) => true,
-            Self::Redirect(_) | Self::Status(_) => false,
+            Self::Snapshot
+            | Self::Command(_)
+            | Self::Read(_)
+            | Self::ChunkPut { .. }
+            | Self::ChunkBytes(_) => true,
+            Self::Redirect(_) | Self::Status(_) | Self::ChunkGet { .. } | Self::ChunkStatus(_) => {
+                false
+            }
         }
     }
 }
@@ -499,13 +569,24 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     sends: Sends,
     received: Received,
     waker: Waker,
+    storage: Storage,
+    /// The storage's puts and gets answered, taken each turn (kept for its allocation).
+    stored: Vec<Done>,
+    /// The chunk puts and gets this node asked of its peers and not yet answered; at most
+    /// `chunk_asks` of them.
+    chunks_out: Vec<ChunkOut>,
+    chunk_asks: usize,
+    next_chunk: ChunkAsk,
+    /// The chunk puts and gets this node asked, answered and not yet taken.
+    chunks_done: Vec<(ChunkAsk, ChunkOutcome)>,
+    chunk_bytes: u64,
 }
 
 /// The node's message bounds: a Raft message is at most the larger of a page of entries and one
 /// entry of the range's largest, inside the core's fixed bytes, in a frame; a command is an entry
 /// behind its head, and its reply no larger (`command::Status::TooLarge` otherwise); a snapshot's
 /// data is at most what hyper-raft's wire states, a u32 of bytes.
-pub fn message_bounds<E>(ranges: &[Hosted<E>]) -> Result<Bounds, NodeError> {
+pub fn message_bounds<E>(ranges: &[Hosted<E>], chunk_bytes: u64) -> Result<Bounds, NodeError> {
     let unfit = || NodeError::Bounds("a range's settings overflow a message's bound".into());
     let mut largest = 0u64;
     let mut entry = 0u64;
@@ -526,9 +607,17 @@ pub fn message_bounds<E>(ranges: &[Hosted<E>]) -> Result<Bounds, NodeError> {
     let request = entry
         .checked_add(u64::try_from(command::HEAD_BYTES).map_err(|_| unfit())?)
         .ok_or_else(unfit)?;
+    // A chunk's put carries the chunk behind its head; a get's reply, the bytes asked.
+    let chunk_head = chunk::PUT_HEAD_BYTES
+        .max(chunk::GET_HEAD_BYTES)
+        .max(chunk::REPLY_HEAD_BYTES);
+    let transfer = chunk_bytes
+        .checked_add(u64::try_from(chunk_head).map_err(|_| unfit())?)
+        .ok_or_else(unfit)?;
     Ok(Bounds {
         replication: largest,
         request,
+        transfer,
         bulk,
     })
 }
@@ -551,7 +640,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let waker = poll_fn(|context| Poll::Ready(context.waker().clone())).await;
         let layout = Layout::new(&settings.dir);
         let run = layout.raise_run()?;
-        let messages = message_bounds(&settings.ranges)?;
+        let messages = message_bounds(&settings.ranges, settings.chunk_bytes)?;
         classes::state_bounds(messages).map_err(|e| NodeError::Bounds(e.to_string()))?;
         let inflight = settings
             .ranges
@@ -563,6 +652,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             peers: settings.peers.len(),
             ranges: settings.ranges.len(),
             inflight,
+            transfers: settings
+                .storage
+                .transfers()
+                .saturating_add(settings.chunk_asks),
             transport_bytes: settings.transport_bytes,
             messages,
         };
@@ -673,6 +766,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             sends: Sends::default(),
             received: Received::default(),
             waker,
+            storage: std::mem::take(&mut settings.storage),
+            stored: Vec::new(),
+            chunks_out: Vec::new(),
+            chunk_asks: settings.chunk_asks,
+            next_chunk: 0,
+            chunks_done: Vec::new(),
+            chunk_bytes: settings.chunk_bytes,
         };
         for kept in &node.ranges {
             node.owner
@@ -979,6 +1079,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         for event in std::mem::take(&mut self.events) {
             self.on_event(event, now)?;
         }
+        self.take_stored().await?;
         self.dial(now);
         if std::mem::take(&mut self.liveness_moved) {
             self.measure();
@@ -1250,6 +1351,18 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     Kind::Snapshot => Arriving::Snapshot,
                     Kind::Command => self.take_request(exchange, Arriving::Command),
                     Kind::Read => self.take_request(exchange, Arriving::Read),
+                    Kind::ChunkGet => self.take_chunk_get(exchange),
+                    Kind::ChunkPut => match self.take_chunk_put(exchange, body.unwrap_or(0)) {
+                        Some(what) => what,
+                        // No room for its bytes now: refused before any is read, which its asker
+                        // hears as this node's refusal, not its connection failing.
+                        None => {
+                            self.driver
+                                .endpoint()
+                                .refuse_exchange(exchange, Refusal::Budget);
+                            return Ok(());
+                        }
+                    },
                     // A Raft message travels on a lane, never on an exchange.
                     Kind::Raft => {
                         self.driver
@@ -1271,13 +1384,24 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.read_exchange(exchange)
             }
             Event::BodyReady { exchange } => self.read_exchange(exchange),
-            Event::Reply { exchange, .. } => {
+            Event::Reply { exchange, body } => {
+                if self.chunks_out.iter().any(|c| c.exchange == exchange) {
+                    return self.chunk_replied(exchange, body.unwrap_or(0));
+                }
                 self.snapshot_done(exchange, true);
                 self.driver.endpoint().end(exchange);
                 Ok(())
             }
-            Event::Refused { exchange, .. } => {
+            Event::Refused {
+                exchange, refusal, ..
+            } => {
                 self.snapshot_done(exchange, false);
+                if let Some(at) = self.chunks_out.iter().position(|c| c.exchange == exchange) {
+                    let out = self.chunks_out.swap_remove(at);
+                    self.chunks_done
+                        .push((out.asked, ChunkOutcome::Lost(refusal)));
+                }
+                self.give_back(exchange);
                 self.receiving.retain(|r| r.exchange != exchange);
                 self.writing.retain(|w| w.exchange != exchange);
                 self.commanded.retain(|c| c.exchange != exchange);
@@ -1674,6 +1798,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.writing.swap_remove(at);
                 self.driver.endpoint().end(exchange);
             }
+            // A put whose bytes could not all go is lost; one sent whole waits for its reply.
+            Some(Then::Asked) if failed => {
+                self.writing.swap_remove(at);
+                if let Some(at) = self.chunks_out.iter().position(|c| c.exchange == exchange) {
+                    let out = self.chunks_out.swap_remove(at);
+                    self.chunks_done
+                        .push((out.asked, ChunkOutcome::Lost(Refusal::Closed)));
+                }
+                self.driver.endpoint().end(exchange);
+            }
+            Some(Then::Asked) if whole => {
+                self.writing.swap_remove(at);
+            }
             _ => {}
         }
     }
@@ -1728,8 +1865,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             match got {
                 Ok(0) => return Ok(()),
                 Ok(_) => {}
-                Err(_) => {
-                    self.receiving.swap_remove(at);
+                Err(refusal) => {
+                    let lost = self.receiving.swap_remove(at);
+                    match lost.what {
+                        Arriving::ChunkPut { .. } => self.storage.give_room(lost.body),
+                        Arriving::ChunkBytes(asked) => {
+                            self.chunks_done.push((asked, ChunkOutcome::Lost(refusal)));
+                        }
+                        _ => {}
+                    }
                     return Ok(());
                 }
             }
@@ -1759,6 +1903,43 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             // Answered now its request was read whole: the leader as this node knows it now.
             Arriving::Redirect(group) => self.redirect(exchange, group),
             Arriving::Status(status) => self.answer_status(exchange, status, 0),
+            Arriving::ChunkPut { slot, key, crc32c } => {
+                let room = received.body;
+                let put = self.storage.put(
+                    slot,
+                    key,
+                    received.bytes,
+                    crc32c,
+                    &self.waker,
+                    (Origin::Exchange(exchange), room),
+                );
+                match put {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        self.storage.give_room(room);
+                        self.answer_chunk(exchange, chunk::Status::of_error(&error), None)
+                    }
+                }
+            }
+            Arriving::ChunkGet {
+                slot,
+                key,
+                offset,
+                len,
+            } => match self
+                .storage
+                .get(slot, &key, offset, len, Origin::Exchange(exchange))
+            {
+                Ok(()) => Ok(()),
+                Err(error) => self.answer_chunk(exchange, chunk::Status::of_error(&error), None),
+            },
+            Arriving::ChunkStatus(status) => self.answer_chunk(exchange, status, None),
+            Arriving::ChunkBytes(asked) => {
+                endpoint.end(exchange);
+                self.chunks_done
+                    .push((asked, ChunkOutcome::Read(received.bytes)));
+                Ok(())
+            }
         }
     }
 
@@ -1925,6 +2106,313 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// Replies a status alone and ends the exchange.
+    /// A chunk put's head, checked before its body is read: what its body is read as, or the
+    /// status it is answered with once its body is read and dropped (no such volume here, a head
+    /// that does not decode). `None` when the node has no room for its bytes now: refused unread.
+    fn take_chunk_put(&mut self, exchange: ExchangeId, body: u64) -> Option<Arriving> {
+        let head = self.driver.endpoint().head(exchange).unwrap_or_default();
+        let Ok(put) = chunk::Put::decode(head) else {
+            return Some(Arriving::ChunkStatus(chunk::Status::Malformed));
+        };
+        let Some(slot) = self.storage.holds(put.volume) else {
+            return Some(Arriving::ChunkStatus(chunk::Status::NoVolume));
+        };
+        if !self.storage.take_room(body) {
+            return None;
+        }
+        Some(Arriving::ChunkPut {
+            slot,
+            key: put.key,
+            crc32c: put.crc32c,
+        })
+    }
+
+    /// A chunk get's head: the volume it is asked of, or why it is answered at once.
+    fn take_chunk_get(&mut self, exchange: ExchangeId) -> Arriving {
+        let head = self.driver.endpoint().head(exchange).unwrap_or_default();
+        let Ok(get) = chunk::Get::decode(head) else {
+            return Arriving::ChunkStatus(chunk::Status::Malformed);
+        };
+        let Some(slot) = self.storage.holds(get.volume) else {
+            return Arriving::ChunkStatus(chunk::Status::NoVolume);
+        };
+        // Its reply carries the bytes asked, which the transfer class's bound must hold.
+        if get.len > self.chunk_bytes {
+            return Arriving::ChunkStatus(chunk::Status::TooLarge);
+        }
+        Arriving::ChunkGet {
+            slot,
+            key: get.key,
+            offset: get.offset,
+            len: get.len,
+        }
+    }
+
+    /// Answers a chunk's request: its status, and a get's bytes behind it.
+    fn answer_chunk(
+        &mut self,
+        exchange: ExchangeId,
+        status: chunk::Status,
+        body: Option<Vec<u8>>,
+    ) -> Result<(), NodeError> {
+        let head = chunk::reply_head(status);
+        let endpoint = self.driver.endpoint();
+        let Some(bytes) = body else {
+            return match endpoint.reply(exchange, &head, None) {
+                Ok(()) => {
+                    endpoint.end(exchange);
+                    Ok(())
+                }
+                Err(refusal) => exchange_ended(refusal),
+            };
+        };
+        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if let Err(refusal) = endpoint.reply(exchange, &head, Some(len)) {
+            return exchange_ended(refusal);
+        }
+        self.writing.push(Writing {
+            exchange,
+            bytes,
+            written: 0,
+            then: Then::Reply,
+        });
+        self.write_exchange(exchange);
+        Ok(())
+    }
+
+    /// Gives back the room a chunk put being read on `exchange` held, the exchange gone.
+    fn give_back(&mut self, exchange: ExchangeId) {
+        for receiving in self.receiving.iter().filter(|r| r.exchange == exchange) {
+            if matches!(receiving.what, Arriving::ChunkPut { .. }) {
+                self.storage.give_room(receiving.body);
+            }
+        }
+    }
+
+    /// The puts and gets the storage answered since the last turn: a peer's answered on its
+    /// exchange, this node's own kept for [`Self::take_chunks`]. Registers this task to be woken
+    /// when a get still out is answered.
+    async fn take_stored(&mut self) -> Result<(), NodeError> {
+        if self.storage.out() == 0 {
+            return Ok(());
+        }
+        let mut stored = std::mem::take(&mut self.stored);
+        poll_fn(|context| {
+            self.storage.poll_done(context, &mut stored);
+            Poll::Ready(())
+        })
+        .await;
+        for done in stored.drain(..) {
+            match done {
+                Done::Put(Origin::Exchange(exchange), Ok(())) => {
+                    self.answer_chunk(exchange, chunk::Status::Stored, None)?;
+                }
+                Done::Get(Origin::Exchange(exchange), Ok(bytes)) => {
+                    self.answer_chunk(exchange, chunk::Status::Read, Some(bytes))?;
+                }
+                Done::Put(Origin::Exchange(exchange), Err(error))
+                | Done::Get(Origin::Exchange(exchange), Err(error)) => {
+                    self.answer_chunk(exchange, chunk::Status::of_error(&error), None)?;
+                }
+                Done::Put(Origin::Asked(asked), answered) => {
+                    let outcome = match answered {
+                        Ok(()) => ChunkOutcome::Stored,
+                        Err(error) => ChunkOutcome::Refused(chunk::Status::of_error(&error)),
+                    };
+                    self.chunks_done.push((asked, outcome));
+                }
+                Done::Get(Origin::Asked(asked), answered) => {
+                    let outcome = match answered {
+                        Ok(bytes) => ChunkOutcome::Read(bytes),
+                        Err(error) => ChunkOutcome::Refused(chunk::Status::of_error(&error)),
+                    };
+                    self.chunks_done.push((asked, outcome));
+                }
+            }
+        }
+        self.stored = stored;
+        Ok(())
+    }
+
+    /// A peer's reply to a chunk put or get this node asked: a put's status, or a get's bytes,
+    /// read through the transfer class's budget as a body is.
+    fn chunk_replied(&mut self, exchange: ExchangeId, body: u64) -> Result<(), NodeError> {
+        let Some(at) = self.chunks_out.iter().position(|c| c.exchange == exchange) else {
+            return Ok(());
+        };
+        let ChunkOut {
+            asked, peer, get, ..
+        } = self.chunks_out.swap_remove(at);
+        let endpoint = self.driver.endpoint();
+        let status = chunk::read_reply_head(endpoint.head(exchange).unwrap_or_default())
+            .unwrap_or(chunk::Status::Malformed);
+        match status {
+            chunk::Status::Read if get => {
+                self.receiving.push(Receiving {
+                    exchange,
+                    peer,
+                    body,
+                    read: 0,
+                    bytes: Vec::with_capacity(usize::try_from(body).unwrap_or(0)),
+                    what: Arriving::ChunkBytes(asked),
+                });
+                self.read_exchange(exchange)
+            }
+            chunk::Status::Stored if !get => {
+                endpoint.end(exchange);
+                self.chunks_done.push((asked, ChunkOutcome::Stored));
+                Ok(())
+            }
+            status => {
+                endpoint.end(exchange);
+                self.chunks_done
+                    .push((asked, ChunkOutcome::Refused(status)));
+                Ok(())
+            }
+        }
+    }
+
+    /// Puts `bytes`, `key`'s whole chunk with the CRC-32C its writer computed, on `volume`, which
+    /// `at` holds: this node's own volume in-process (node.md §5.5), or a peer's on the transfer
+    /// class. Its outcome comes from [`Self::take_chunks`] under the number returned, at once when
+    /// it is refused before it goes (no such volume here, the node's asks all out).
+    pub fn put_chunk(
+        &mut self,
+        at: PeerId,
+        volume: u128,
+        key: ChunkKey,
+        bytes: Vec<u8>,
+        crc32c: u32,
+    ) -> Result<ChunkAsk, NodeError> {
+        let asked = self.next_chunk;
+        self.next_chunk = asked.wrapping_add(1);
+        if at == self.id {
+            let outcome = match self.storage.holds(volume) {
+                None => Some(ChunkOutcome::Refused(chunk::Status::NoVolume)),
+                Some(slot) => self
+                    .storage
+                    .put(
+                        slot,
+                        key,
+                        bytes,
+                        crc32c,
+                        &self.waker,
+                        (Origin::Asked(asked), 0),
+                    )
+                    .err()
+                    .map(|e| ChunkOutcome::Refused(chunk::Status::of_error(&e))),
+            };
+            if let Some(outcome) = outcome {
+                self.chunks_done.push((asked, outcome));
+            }
+            return Ok(asked);
+        }
+        if self.chunks_out.len() >= self.chunk_asks {
+            self.chunks_done
+                .push((asked, ChunkOutcome::Refused(chunk::Status::Busy)));
+            return Ok(asked);
+        }
+        let head = chunk::Put {
+            volume,
+            key,
+            crc32c,
+        }
+        .encode();
+        let body = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let clock = self.driver.clock()?;
+        let period = Progress::new(bounds::idle_timeout())?;
+        match self
+            .driver
+            .endpoint()
+            .open(clock, at, Kind::ChunkPut, &head, Some(body), period)
+        {
+            Ok(exchange) => {
+                self.chunks_out.push(ChunkOut {
+                    exchange,
+                    asked,
+                    peer: at,
+                    get: false,
+                });
+                self.writing.push(Writing {
+                    exchange,
+                    bytes,
+                    written: 0,
+                    then: Then::Asked,
+                });
+                self.write_exchange(exchange);
+            }
+            Err(refusal) => self.chunks_done.push((asked, ChunkOutcome::Lost(refusal))),
+        }
+        Ok(asked)
+    }
+
+    /// Gets bytes `[offset, offset + len)` of `key`'s chunk from `volume`, which `at` holds, as
+    /// [`Self::put_chunk`] puts one.
+    pub fn get_chunk(
+        &mut self,
+        at: PeerId,
+        volume: u128,
+        key: ChunkKey,
+        offset: u64,
+        len: u64,
+    ) -> Result<ChunkAsk, NodeError> {
+        let asked = self.next_chunk;
+        self.next_chunk = asked.wrapping_add(1);
+        if at == self.id {
+            let outcome = match self.storage.holds(volume) {
+                None => Some(ChunkOutcome::Refused(chunk::Status::NoVolume)),
+                Some(slot) => self
+                    .storage
+                    .get(slot, &key, offset, len, Origin::Asked(asked))
+                    .err()
+                    .map(|e| ChunkOutcome::Refused(chunk::Status::of_error(&e))),
+            };
+            if let Some(outcome) = outcome {
+                self.chunks_done.push((asked, outcome));
+            }
+            return Ok(asked);
+        }
+        if self.chunks_out.len() >= self.chunk_asks {
+            self.chunks_done
+                .push((asked, ChunkOutcome::Refused(chunk::Status::Busy)));
+            return Ok(asked);
+        }
+        let head = chunk::Get {
+            volume,
+            key,
+            offset,
+            len,
+        }
+        .encode();
+        let clock = self.driver.clock()?;
+        let period = Progress::new(bounds::idle_timeout())?;
+        match self
+            .driver
+            .endpoint()
+            .open(clock, at, Kind::ChunkGet, &head, None, period)
+        {
+            Ok(exchange) => self.chunks_out.push(ChunkOut {
+                exchange,
+                asked,
+                peer: at,
+                get: true,
+            }),
+            Err(refusal) => self.chunks_done.push((asked, ChunkOutcome::Lost(refusal))),
+        }
+        Ok(asked)
+    }
+
+    /// The chunk puts and gets this node asked that were answered since the last call, each
+    /// under the number it was asked under.
+    pub fn take_chunks(&mut self) -> std::vec::Drain<'_, (ChunkAsk, ChunkOutcome)> {
+        self.chunks_done.drain(..)
+    }
+
+    /// The volumes the node holds: each one's id and its device directory.
+    pub fn volumes(&self) -> impl Iterator<Item = (u128, &Path)> {
+        self.storage.volumes()
+    }
+
     fn answer_status(
         &mut self,
         exchange: ExchangeId,

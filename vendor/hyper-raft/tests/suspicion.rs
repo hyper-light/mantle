@@ -84,6 +84,8 @@ struct Sim {
     now: u64,
     /// Every message sent, in order.
     sent: Vec<Message>,
+    /// When each message in `sent` was sent.
+    sent_at: Vec<u64>,
     /// Members cut off: what is sent to them is lost.
     cut: Vec<u64>,
     /// Who led each term.
@@ -116,6 +118,7 @@ impl Sim {
             sent_count: 0,
             now: 0,
             sent: Vec::new(),
+            sent_at: Vec::new(),
             cut: Vec::new(),
             leaders: BTreeMap::new(),
             timing,
@@ -155,6 +158,7 @@ impl Sim {
         }
         for message in output.messages {
             self.sent.push(message.clone());
+            self.sent_at.push(self.now);
             self.sent_count += 1;
             self.flight
                 .insert((self.now + LATENCY, self.sent_count), message);
@@ -289,6 +293,15 @@ impl Sim {
         assert!(self.run_until(|sim| sim.leader() == Some(id)));
         // Everything in flight lands, and the group goes quiet.
         assert!(self.run(), "the group never went quiet");
+    }
+    /// When `member` sent each hand-over order from `from` on.
+    fn order_times(&self, member: u64, from: usize) -> Vec<u64> {
+        self.sent[from..]
+            .iter()
+            .zip(&self.sent_at[from..])
+            .filter(|(m, _)| m.msg_type == MessageType::MsgTimeoutNow && m.from == member)
+            .map(|(_, at)| *at)
+            .collect()
     }
     fn count_sent(&self, from: usize, kind: MessageType) -> usize {
         self.sent[from..]
@@ -648,6 +661,238 @@ fn a_leader_that_steps_down_hands_over() {
     assert_eq!(sim.count_sent(from, MessageType::MsgTimeoutNow), 1);
     assert!(sim.run_until(|sim| sim.leader().is_some()));
     assert_eq!(sim.leader(), Some(2), "the one voter it still trusted");
+}
+
+/// A leader whose detectors suspect every other voter steps down and still hands over, a round and
+/// a draw later while it suspects them still: a suspicion says only that it does not hear the voter,
+/// not that the voter does not hear it, and its followers, which hear it and trust it for good,
+/// would never campaign. Handing over to
+/// none, it stood leaderless for as long as its suspicions lasted (mantle's node simulation, a
+/// leader whose plane went deaf; mantle's Windows CI, run 39503516282).
+#[test]
+fn a_leader_that_suspects_every_other_voter_hands_over_all_the_same() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 7);
+    sim.found(1);
+    let from = sim.sent.len();
+    sim.suspect(1, 2);
+    sim.suspect(1, 3);
+    assert_eq!(sim.peek(1).view().role, 0);
+    // It may be the one that stalled: no order at once (the next test).
+    assert_eq!(sim.count_sent(from, MessageType::MsgTimeoutNow), 0);
+    assert!(
+        sim.run_until(|sim| sim.leader().is_some()),
+        "its followers trusted it and no one campaigned"
+    );
+    assert_eq!(
+        sim.count_sent(from, MessageType::MsgTimeoutNow),
+        1,
+        "it told no voter to campaign"
+    );
+    assert!(sim.leader() != Some(1));
+}
+
+/// A leader that suspects every other voter for less than a round, as one whose host stalls does,
+/// steps down and orders no hand-over at once: within a round and a draw it trusts a quorum again and
+/// campaigns, and the group elects it again, its followers having trusted it throughout. Ordered at
+/// the step-down, the heir's campaign moved the group's leadership at every short stall (mantle's
+/// cluster tests on a loaded Linux runner, run 39525134119: the leader elected during a cut lost its
+/// leadership around the rejoin, to the lowest id holding the log, in three tests of three).
+#[test]
+fn a_leader_that_suspects_every_voter_for_less_than_a_round_is_elected_again() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 7);
+    sim.found(1);
+    let term = sim.term(1);
+    let from = sim.sent.len();
+    sim.suspect(1, 2);
+    sim.suspect(1, 3);
+    assert_eq!(sim.peek(1).view().role, 0);
+    sim.trust(1, 2);
+    sim.trust(1, 3);
+    assert!(sim.run_until(|sim| sim.leader().is_some()));
+    assert_eq!(
+        sim.count_sent(from, MessageType::MsgTimeoutNow),
+        0,
+        "it handed over at its step-down"
+    );
+    assert_eq!(
+        sim.leader(),
+        Some(1),
+        "its stall moved the group's leadership"
+    );
+    assert!(sim.term(1) > term);
+}
+
+/// A leader in the joint configuration that replaces a failed voter with a spare (`{1, 2, 3}` to
+/// `{1, 2, 4}`, 3 dead) suspects the survivor 2 as well and steps down; the heir it trusts is the
+/// spare, which has not taken the joint entry and is a learner by its own configuration, so it
+/// refuses the order; 2 trusts the leader. The group elects all the same within the rounds its
+/// timing states (mantle's `a_follower_lost_for_good_is_replaced_*`, stalled once in five rounds on
+/// a pinned Linux runner at `757740c`).
+#[test]
+fn a_leader_whose_heir_is_a_spare_that_has_not_taken_its_change_still_hands_over() {
+    let (timing, _) = timing_for(3);
+    let boot = ConfState {
+        voters: vec![1, 2, 3],
+        learners: vec![4],
+        ..ConfState::default()
+    };
+    let mut sim = Sim::new(4, &boot, timing, 11);
+    sim.found(1);
+    sim.stop(3);
+    sim.suspect(1, 3);
+    sim.cut.push(4);
+    let change = ConfChangeV2 {
+        transition: ConfChangeTransition::Explicit,
+        changes: vec![
+            ConfChangeSingle {
+                change_type: ConfChangeType::AddNode,
+                node_id: 4,
+            },
+            ConfChangeSingle {
+                change_type: ConfChangeType::RemoveNode,
+                node_id: 3,
+            },
+        ],
+        context: vec![],
+    };
+    sim.node(1).propose_change(&change);
+    sim.settle(1);
+    let joint = sim.peek(1).view().last_index;
+    assert!(sim.run_until(|sim| sim.peek(1).view().commit >= joint));
+    sim.cut.clear();
+    let from = sim.sent.len();
+    let term = sim.term(1);
+    sim.suspect(1, 2);
+    assert_eq!(
+        sim.peek(1).view().role,
+        0,
+        "it kept a quorum of the old half"
+    );
+    // Its first order may go to the spare, which refuses it as a learner; then 2.
+    let elected = sim.run_until(|sim| sim.leader().is_some());
+    let orders: Vec<u64> = sim.sent[from..]
+        .iter()
+        .filter(|m| m.msg_type == MessageType::MsgTimeoutNow)
+        .map(|m| m.to)
+        .collect();
+    assert!(
+        elected,
+        "no leader; orders {orders:?}, terms {:?}",
+        [1, 2, 4].map(|id| sim.term(id))
+    );
+    assert!(sim.term(1) > term);
+}
+
+/// A member that led its term orders no heir sooner than the election the law expects (`T_E`)
+/// after its last order: each order forces a campaign, and a second before the first can finish
+/// makes two candidates that split the vote. Leader 1 of five suspects every other voter for good
+/// and hears nothing after its step-down, so its term never moves and it orders for as long as the
+/// run lasts; re-ordered a round and a draw after the last, stepped-down members forced a new heir
+/// every 4 to 9 ms on loopback, and two within one millisecond (mantle's cluster suite at
+/// `eb85154`).
+#[test]
+fn a_member_that_led_orders_no_heir_within_an_expected_election_of_the_last() {
+    let (timing, _) = timing_for(5);
+    let election = timing.election.as_nanos() as u64;
+    let mut sim = Sim::new(5, &Sim::voters(&[1, 2, 3, 4, 5]), timing, 7);
+    sim.found(1);
+    let from = sim.sent.len();
+    for member in [2, 3, 4, 5] {
+        sim.suspect(1, member);
+    }
+    assert_eq!(sim.peek(1).view().role, 0);
+    sim.cut.push(1);
+    let until = sim.now + 20 * election;
+    sim.run_until_time(until, |_| false);
+    let mut orders = Vec::new();
+    for message in &sim.sent[from..] {
+        if message.msg_type == MessageType::MsgTimeoutNow && message.from == 1 {
+            orders.push(message.to);
+        }
+    }
+    assert!(
+        orders.len() >= 2,
+        "it ordered {orders:?}: the test needs it to order again"
+    );
+    let times = sim.order_times(1, from);
+    for pair in times.windows(2) {
+        assert!(
+            pair[1] - pair[0] >= election,
+            "orders {} ns apart, within an expected election of {election} ns: {orders:?}",
+            pair[1] - pair[0]
+        );
+    }
+    assert!(
+        (2..=5).any(|id| sim.peek(id).view().role == 2),
+        "the others elected no one"
+    );
+}
+
+/// Each term a member leads starts its hand-overs from the first heir: the voter it trusts that
+/// holds the most. Leader 1 hands over once, to 2; led again, it steps down trusting only 3, and
+/// names 3, not whichever voter its count from the first term reached.
+#[test]
+fn a_leader_that_led_before_hands_over_first_to_the_voter_it_trusts() {
+    let (timing, _) = timing_for(5);
+    let mut sim = Sim::new(5, &Sim::voters(&[1, 2, 3, 4, 5]), timing, 7);
+    sim.found(1);
+    for member in [3, 4, 5] {
+        sim.suspect(1, member);
+    }
+    assert!(sim.run_until(|sim| sim.leader() == Some(2)));
+    for member in [3, 4, 5] {
+        sim.trust(1, member);
+    }
+    sim.node(2).transfer(1);
+    sim.settle(2);
+    assert!(sim.run_until(|sim| sim.leader() == Some(1)));
+    assert!(sim.run(), "the group never went quiet");
+    let from = sim.sent.len();
+    for member in [2, 4, 5] {
+        sim.suspect(1, member);
+    }
+    assert_eq!(sim.peek(1).view().role, 0);
+    let orders: Vec<u64> = sim.sent[from..]
+        .iter()
+        .filter(|m| m.msg_type == MessageType::MsgTimeoutNow)
+        .map(|m| m.to)
+        .collect();
+    assert_eq!(orders, [3], "the one voter it still trusted");
+    assert!(sim.run_until(|sim| sim.leader().is_some_and(|l| l != 1)));
+    assert_eq!(sim.leader(), Some(3));
+}
+
+/// A leader's first heir may be dead: at its step-down it names the voter that holds the most of
+/// its log, trusted ones first. Leader 1 of five steps down trusting only 2, which holds an entry
+/// the others lack and is dead; it then suspects 2 as well, and its next hand-overs name the live
+/// voters, which trust it, in turn, and they elect one of themselves. Stepped down, it no longer
+/// knows what each holds (a follower's progress is reset), so those hand-overs turn through every
+/// voter, those it trusts first.
+#[test]
+fn a_dead_heir_that_holds_the_most_does_not_absorb_every_hand_over() {
+    let (timing, _) = timing_for(5);
+    let mut sim = Sim::new(5, &Sim::voters(&[1, 2, 3, 4, 5]), timing, 7);
+    sim.found(1);
+    sim.cut.extend([3, 4, 5]);
+    sim.node(1).propose(b"only 2 holds it".to_vec());
+    sim.settle(1);
+    assert!(!sim.run_until(|_| false), "a write that cannot commit");
+    sim.stop(2);
+    // Suspected while still cut off, they are sent nothing more and never catch up: 2 alone
+    // holds the most, and the hand-over at the step-down names it, the one voter trusted.
+    for member in [3, 4, 5] {
+        sim.suspect(1, member);
+    }
+    assert_eq!(sim.peek(1).view().role, 0);
+    sim.suspect(1, 2);
+    sim.cut.clear();
+    assert!(
+        sim.run_until(|sim| sim.leader().is_some()),
+        "every hand-over went to the dead heir"
+    );
+    assert!(![1, 2].contains(&sim.leader().unwrap_or(0)));
 }
 
 /// A leader that removes itself counts its commits by the configuration it wrote, which needs both

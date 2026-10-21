@@ -50,7 +50,11 @@
 //! second, before anything is measured. A node
 //! whose log has a flush out extends the watch, since its range moves only as its writes become
 //! durable, until the flush has been out longer than the longest any node's log has taken and the
-//! quiet period besides (hyper-durable-e2e's rule, in one process). A node's shard is its own, as
+//! quiet period besides (hyper-durable-e2e's rule, in one process). A cell no majority of whose
+//! live nodes is free of its own device holds still for its devices (`Status::held`: a node
+//! judges no peer while its own proof is out, timing.md §2.8), and the watch does not count that
+//! time, each such stretch up to the longest any node's log has taken and the quiet period
+//! besides, as `crates/mantle/tests/node.rs`'s does. A node's shard is its own, as
 //! its process's would be, so an engine's flush on one node holds up none of the others, nor the
 //! test.
 
@@ -625,6 +629,10 @@ struct Watch {
     links: BTreeMap<(u64, u64), Link>,
     /// When a node last moved.
     moved_at: Option<Instant>,
+    /// Since the last movement, how long the cell held still for its devices, each stretch at
+    /// most `Watch::held_bound`, and when the stretch under way began, if one is.
+    held_for: Duration,
+    held_since: Option<Instant>,
 }
 
 impl Watch {
@@ -634,14 +642,13 @@ impl Watch {
         reports: &mpsc::Receiver<Report>,
         done: impl Fn(&Self) -> Option<T>,
     ) -> T {
-        self.moved_at = Some(Instant::now());
+        self.moved();
         loop {
             if let Some(found) = done(self) {
                 return found;
             }
             let quiet = self.quiet();
-            let moved = self.moved_at.unwrap_or_else(Instant::now);
-            let until = (moved + quiet).max(self.flush_deadline(quiet));
+            let until = self.deadline(quiet).max(self.flush_deadline(quiet));
             // Checked before each report: reports that keep coming with nothing moved in them
             // (a heartbeat's count, a log's stats) end the wait all the same.
             let Some(left) = until.checked_duration_since(Instant::now()) else {
@@ -664,7 +671,7 @@ impl Watch {
             Report::Bound(id, quic, plane) => {
                 self.bound.insert(id, (quic, plane));
                 self.live.insert(id);
-                self.moved_at = Some(Instant::now());
+                self.moved();
             }
             Report::Status(id, now) => {
                 let moved = self.status.get(&id).is_none_or(|was| {
@@ -672,17 +679,21 @@ impl Watch {
                         != (now.term, now.leader, now.commit, now.applied)
                         || was.measuring != now.measuring
                 });
-                if moved {
-                    self.moved_at = Some(Instant::now());
-                }
                 self.status.insert(id, now);
+                // A status that moved nothing may say the node waits on its device, or no
+                // longer does: a stretch held still begins or ends.
+                if moved {
+                    self.moved();
+                } else {
+                    self.hold();
+                }
             }
             Report::Applied(id, serial, index, answer) => {
                 self.applied
                     .entry(id)
                     .or_default()
                     .insert(serial, (index, answer));
-                self.moved_at = Some(Instant::now());
+                self.moved();
             }
             Report::Log(id, flushing, longest) => {
                 self.log.insert(id, (Instant::now(), flushing, longest));
@@ -692,7 +703,7 @@ impl Watch {
                 self.status.remove(&id);
                 self.log.remove(&id);
                 self.links.retain(|(of, _), _| *of != id);
-                self.moved_at = Some(Instant::now());
+                self.moved();
             }
             Report::Failed(id, error) => {
                 let what = if id >= CLIENT { "client" } else { "node" };
@@ -700,24 +711,84 @@ impl Watch {
             }
             Report::Answered(serial, answered) => {
                 self.answered.insert(serial, answered);
-                self.moved_at = Some(Instant::now());
+                self.moved();
             }
             Report::Replaced(failed, joining) => {
                 self.replaced.insert((failed, joining));
-                self.moved_at = Some(Instant::now());
+                self.moved();
             }
             Report::Link(id, link) => {
                 self.links.insert((id, link.peer), link);
-                self.moved_at = Some(Instant::now());
+                self.moved();
             }
             Report::Progress(client, done, patience) => {
                 self.progress.insert(client, done);
                 if let Some(patience) = patience {
                     self.clients.insert(client, patience);
                 }
-                self.moved_at = Some(Instant::now());
+                self.moved();
             }
         }
+    }
+
+    /// How long one stretch of the cell holding still for its devices goes uncounted: the longest
+    /// any node's log has taken and the quiet period besides.
+    fn held_bound(&self, quiet: Duration) -> Duration {
+        let longest = self
+            .log
+            .values()
+            .map(|(_, _, longest)| *longest)
+            .max()
+            .unwrap_or_default();
+        longest + quiet
+    }
+
+    /// Whether no majority of the live nodes is free of its own device: the range's quorum then
+    /// waits on the devices of the nodes that wait on theirs.
+    fn held_by_devices(&self) -> bool {
+        let held = self
+            .live
+            .iter()
+            .filter(|id| self.status.get(id).is_some_and(|s| s.held))
+            .count();
+        held > 0 && 2 * held >= self.live.len()
+    }
+
+    /// Begins or ends a stretch of the cell holding still for its devices, as it now stands.
+    fn hold(&mut self) {
+        let now = Instant::now();
+        match (self.held_since, self.held_by_devices()) {
+            (None, true) => self.held_since = Some(now),
+            (Some(since), false) => {
+                let bound = self.held_bound(self.quiet());
+                self.held_for += now.saturating_duration_since(since).min(bound);
+                self.held_since = None;
+            }
+            (None, false) | (Some(_), true) => {}
+        }
+    }
+
+    /// Something moved: the watch begins again.
+    fn moved(&mut self) {
+        let now = Instant::now();
+        self.moved_at = Some(now);
+        self.held_for = Duration::ZERO;
+        self.held_since = if self.held_by_devices() {
+            Some(now)
+        } else {
+            None
+        };
+    }
+
+    /// When the watch ends: `quiet` after the last movement, past the stretches the cell held still
+    /// for its devices, the one under way counted to its bound.
+    fn deadline(&self, quiet: Duration) -> Instant {
+        let holding = if self.held_since.is_some() {
+            self.held_bound(quiet)
+        } else {
+            Duration::ZERO
+        };
+        self.moved_at.unwrap_or_else(Instant::now) + quiet + self.held_for + holding
     }
 
     /// When the watch ends for the flushes out: each live node's, as last heard, past the

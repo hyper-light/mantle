@@ -79,8 +79,8 @@ use std::time::Duration;
 
 use hyper_datagram::{AdmitAll, ExporterSecret, Plane, PlaneLimits, Role, SECRET_BYTES};
 use hyper_liveness::{
-    Change, Heartbeat, Last, Liveness, Output, PairReport, PeerId, Refusal, Settings, Suspicion,
-    Write, is_liveness,
+    Change, Heartbeat, Last, Liveness, Output, OwnProof, PairReport, PeerId, Refusal, Settings,
+    Suspicion, Write, is_liveness,
 };
 use hyper_timing::{Ballot, Exposure, Trust, WINDOW_LIMIT};
 use hyper_tokio::{Clock, Io, PlaneSocket};
@@ -317,8 +317,9 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
         sent: Vec::new(),
     };
     let now = clock.now_ns();
+    let own = liveness.own_proof();
     liveness.poll(now, &mut first);
-    record.polled(now, &first.changes, trusts(&liveness, &peers));
+    record.polled(now, &first.changes, trusts(&liveness, &peers), own);
     for (peer, run, seq) in first.sent.drain(..) {
         record.sent(peer, run, seq);
     }
@@ -456,6 +457,7 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
         }
         for (from, at, message) in &inbox {
             let told = asked.changes.len();
+            let own = liveness.own_proof();
             let outcome = liveness.on_heartbeat(*from, message, *at, &mut asked);
             if let Some(beat) = Beat::of(message, *at) {
                 record.fed(
@@ -464,6 +466,7 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
                     outcome,
                     &asked.changes[told..],
                     liveness.trust(*from),
+                    own,
                 );
             }
         }
@@ -476,8 +479,9 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
             liveness.on_durable(Write::Liveness, started, durable);
         }
         let told = asked.changes.len();
+        let own = liveness.own_proof();
         liveness.poll(now, &mut asked);
-        record.polled(now, &asked.changes[told..], trusts(&liveness, &peers));
+        record.polled(now, &asked.changes[told..], trusts(&liveness, &peers), own);
         for (peer, run, seq) in asked.sent.drain(..) {
             record.sent(peer, run, seq);
         }
@@ -638,6 +642,17 @@ fn record_lines(me: u64, entries: &[Entry], liveness: &Liveness, out: &mut Strin
                 writeln!(out, "r {me} h {peer} {}", trust_field(trust))
             }
             Entry::Sent { peer, run, seq } => writeln!(out, "r {me} o {peer} {run} {seq}"),
+            Entry::Own(own) => {
+                let field =
+                    |value: Option<u64>| value.map_or_else(|| "-".to_owned(), |v| v.to_string());
+                writeln!(
+                    out,
+                    "r {me} w {} {} {}",
+                    field(own.durable_ns),
+                    field(own.waited.map(|(since, _)| since)),
+                    field(own.waited.and_then(|(_, end)| end)),
+                )
+            }
         };
     }
 }
@@ -721,6 +736,22 @@ fn parse_record(fields: &[&str]) -> Option<(u64, Entry, Option<u64>)> {
             },
             None,
         ),
+        "w" => {
+            let field = |at: usize| -> Option<Option<u64>> {
+                match *fields.get(at)? {
+                    "-" => Some(None),
+                    value => Some(Some(value.parse().ok()?)),
+                }
+            };
+            let since = field(3)?;
+            (
+                Entry::Own(OwnProof {
+                    durable_ns: field(2)?,
+                    waited: since.map(|since| (since, field(4).flatten())),
+                }),
+                None,
+            )
+        }
         "o" => (
             Entry::Sent {
                 peer: number(2)?,
@@ -1978,7 +2009,12 @@ fn a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is() {
     let killed_at = clock.now_ns();
     victim.kill().unwrap();
     victim.wait().unwrap();
-    let survivors: Vec<u64> = (1..=NODES).filter(|m| *m != KILLED).collect();
+    // The stalled member suspects no one while its own proof is outstanding, which it now is for
+    // good (`docs/timing.md` §2.8, "A judge whose own proof stalls"): its own stream stopped, and
+    // its peers suspect it, as a crashed node's.
+    let survivors: Vec<u64> = (1..=NODES)
+        .filter(|m| *m != KILLED && *m != STALLED)
+        .collect();
     supervisor.wait("every survivor suspects the killed member", |s| {
         survivors
             .iter()
@@ -2004,6 +2040,10 @@ fn a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is() {
             s.holds_suspected(*m, STALLED, killed_at) && s.holds_suspected(*m, KILLED, killed_at)
         })
     });
+    assert!(
+        !supervisor.holds_suspected(STALLED, KILLED, killed_at),
+        "the stalled member suspected the killed one with its own proof outstanding"
+    );
     supervisor.members.stop();
     supervisor.finish();
     let traced = supervisor.traced();

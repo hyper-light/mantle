@@ -247,6 +247,11 @@ pub struct Status {
     /// the node's measuring may go without moving. `None` while every peer is judged, or none has
     /// a schedule yet.
     pub measuring_for: Option<Duration>,
+    /// Whether the node waits on its own device: its stream wants a durable completion it lacks
+    /// (`hyper_liveness::Liveness::own_proof`), and by its law judges no peer until one comes
+    /// (timing.md §2.8, "A judge whose own proof stalls"). Nodes on one device wait on it
+    /// together, and hold still together, as a stall of that device makes them.
+    pub held: bool,
     /// How long the node may go without moving while its peers live, by its own law: the longest
     /// any peer's evidence may go unmoved before it is suspected (`PairReport::freshness`), then
     /// the range's expected election from a suspicion and one more round (hyper-raft's `Timing`);
@@ -784,6 +789,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             judged,
             measuring,
             measuring_for,
+            held: matches!(self.liveness.own_proof().waited, Some((_, None))),
             patience,
             snapshots_sent: self.snapshots_sent,
             snapshots_taken: self.snapshots_taken,

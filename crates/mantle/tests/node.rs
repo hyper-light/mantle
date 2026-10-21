@@ -21,10 +21,18 @@
 //! The test waits on facts the processes report (`bound`, `status` lines) and the clients'
 //! progress, and gives up once a quiet period passes with nothing moved: the longest any node
 //! states it may go without moving (`Status::patience`) or a link to a peer it dials may, should
-//! that peer fall silent (`Status::reconnect`), or any client gives an exchange (`Client::patience`), never less
-//! than RFC 6298's initial retransmission timeout, one second (as `crates/node/tests/cluster.rs`
-//! does). A process's lines are taken only while that process runs: a node started again is a new
-//! process, and a line its killed one left is dropped.
+//! that peer fall silent (`Status::reconnect`), or any client gives an exchange
+//! (`Client::patience`), never less than RFC 6298's initial retransmission timeout, one second (as
+//! `crates/node/tests/cluster.rs` does). A cell no majority of whose running nodes is free of its
+//! own device holds still for its devices, as its law has it (`Status::held`: a node judges no peer
+//! while its own proof is out, timing.md §2.8, and a range's quorum waits on its members' devices),
+//! and the watch does not count that time, each such stretch up to the longest any node's log has
+//! taken and the quiet period besides (its `log` line; the bound hyper-durable-e2e's rule and the
+//! cluster's give a flush out), so a cell held by a fault of its own still fails. On windows-2025
+//! the runner's one disk held every node's writes 5 to 7.5 s at once (CI run 39544711299): the
+//! nodes held still, and the watch took the cell for a stopped one. A process's lines are taken
+//! only while that process runs: a node started again is a new process, and a line its killed one
+//! left is dropped.
 
 #![allow(
     clippy::unwrap_used,
@@ -171,7 +179,12 @@ enum Line {
         reconnect: Duration,
         /// While a peer is not yet judged, the longest its stream's heartbeats go between.
         measuring: Duration,
+        /// Whether the node waits on its own device (`Status::held`).
+        held: bool,
     },
+    /// The node's log as it said with its last status: how long its flush had been out, if one
+    /// was, and the longest an update has waited for its commit.
+    Log(Option<Duration>, Duration),
 }
 
 fn parse(line: &str) -> Option<Line> {
@@ -182,6 +195,18 @@ fn parse(line: &str) -> Option<Line> {
             Some(Line::Replaced(failed.parse().ok()?, joining.parse().ok()?))
         }
         ["link", peer, rest @ ..] => Some(Line::Link(peer.parse().ok()?, rest.join(" "))),
+        ["log", flushing, longest] => {
+            let flushing = Duration::from_nanos(flushing.parse().ok()?);
+            let flushing = if flushing.is_zero() {
+                None
+            } else {
+                Some(flushing)
+            };
+            Some(Line::Log(
+                flushing,
+                Duration::from_nanos(longest.parse().ok()?),
+            ))
+        }
         [
             "status",
             term,
@@ -191,6 +216,7 @@ fn parse(line: &str) -> Option<Line> {
             patience,
             reconnect,
             measuring,
+            held,
         ] => Some(Line::Status {
             term: term.parse().ok()?,
             leader: leader.parse().ok()?,
@@ -199,8 +225,29 @@ fn parse(line: &str) -> Option<Line> {
             patience: Duration::from_nanos(patience.parse().ok()?),
             reconnect: Duration::from_nanos(reconnect.parse().ok()?),
             measuring: Duration::from_nanos(measuring.parse().ok()?),
+            held: match *held {
+                "0" => false,
+                "1" => true,
+                _ => return None,
+            },
         }),
         _ => None,
+    }
+}
+
+/// What of a status is movement: all of it but whether the node waits on its device.
+fn movement(line: &Line) -> Option<(u64, u64, u64, u64, Duration, Duration)> {
+    match line {
+        Line::Status {
+            term,
+            leader,
+            commit,
+            applied,
+            reconnect,
+            measuring,
+            ..
+        } => Some((*term, *leader, *commit, *applied, *reconnect, *measuring)),
+        Line::Bound(..) | Line::Replaced(..) | Line::Link(..) | Line::Log(..) => None,
     }
 }
 
@@ -371,10 +418,17 @@ struct Cell {
     replaced: BTreeSet<(u64, u64)>,
     /// Each node's link to each peer as it last said, by node and peer.
     links: BTreeMap<(u64, u64), String>,
+    /// Each node's log as it last said: its flush out, if one was, and the longest an update has
+    /// waited for its commit.
+    log: BTreeMap<u64, (Option<Duration>, Duration)>,
     relay: Option<Relay>,
     /// Where the running workload's clients are told of a node started again.
     learns: Vec<Sender<(u64, SocketAddr)>>,
     moved_at: Instant,
+    /// Since the last movement, how long the cell held still for its devices, each stretch at
+    /// most `Cell::held_bound`, and when the stretch under way began, if one is.
+    held_for: Duration,
+    held_since: Option<Instant>,
     _root: tempfile::TempDir,
 }
 
@@ -420,10 +474,13 @@ impl Cell {
             clients: BTreeMap::new(),
             replaced: BTreeSet::new(),
             links: BTreeMap::new(),
+            log: BTreeMap::new(),
             relay: (network == Network::Relayed)
                 .then(|| Relay::start(&(1..=nodes).collect::<Vec<_>>())),
             learns: Vec::new(),
             moved_at: Instant::now(),
+            held_for: Duration::ZERO,
+            held_since: None,
             _root: root,
         };
         // One at a time, each listening before the next starts (`Cell::start`).
@@ -483,7 +540,7 @@ impl Cell {
                 Err(_) => panic!("node {id}'s output is gone"),
             }
         }
-        self.moved_at = Instant::now();
+        self.moved();
     }
 
     /// Starts node `id`'s process on a directory whose store is damaged, and waits for its end:
@@ -538,6 +595,8 @@ impl Cell {
         running.child.kill().unwrap();
         running.child.wait().unwrap();
         self.status.remove(&id);
+        self.log.remove(&id);
+        self.hold();
     }
 
     /// The quiet period: the longest any node states it may go without moving or a link to a peer
@@ -553,28 +612,88 @@ impl Cell {
                     measuring,
                     ..
                 } => Some((*patience).max(*reconnect).max(*measuring)),
-                Line::Bound(..) | Line::Replaced(..) | Line::Link(..) => None,
+                Line::Bound(..) | Line::Replaced(..) | Line::Link(..) | Line::Log(..) => None,
             })
             .chain(self.clients.values().copied())
             .fold(INITIAL_RTO, Duration::max)
     }
 
+    /// How long one stretch of the cell holding still for its devices goes uncounted: the longest
+    /// any node's log has taken and the quiet period besides.
+    fn held_bound(&self, quiet: Duration) -> Duration {
+        let longest = self
+            .log
+            .values()
+            .map(|(_, longest)| *longest)
+            .max()
+            .unwrap_or_default();
+        longest + quiet
+    }
+
+    /// Whether no majority of the running nodes is free of its own device: the range's quorum then
+    /// waits on the devices of the nodes that wait on theirs.
+    fn held_by_devices(&self) -> bool {
+        let held = self
+            .running
+            .keys()
+            .filter(|id| matches!(self.status.get(id), Some(Line::Status { held: true, .. })))
+            .count();
+        held > 0 && 2 * held >= self.running.len()
+    }
+
+    /// Begins or ends a stretch of the cell holding still for its devices, as it now stands.
+    fn hold(&mut self) {
+        let now = Instant::now();
+        match (self.held_since, self.held_by_devices()) {
+            (None, true) => self.held_since = Some(now),
+            (Some(since), false) => {
+                let bound = self.held_bound(self.quiet());
+                self.held_for += now.saturating_duration_since(since).min(bound);
+                self.held_since = None;
+            }
+            (None, false) | (Some(_), true) => {}
+        }
+    }
+
+    /// Something moved: the watch begins again.
+    fn moved(&mut self) {
+        self.moved_at = Instant::now();
+        self.held_for = Duration::ZERO;
+        self.held_since = if self.held_by_devices() {
+            Some(self.moved_at)
+        } else {
+            None
+        };
+    }
+
+    /// When the watch ends: `quiet` after the last movement, past the stretches the cell held still
+    /// for its devices, the one under way counted to its bound.
+    fn deadline(&self, quiet: Duration) -> Instant {
+        let holding = if self.held_since.is_some() {
+            self.held_bound(quiet)
+        } else {
+            Duration::ZERO
+        };
+        self.moved_at + quiet + self.held_for + holding
+    }
+
     /// Takes what it hears until `done` holds; fails once a quiet period passes with nothing.
     fn until<T>(&mut self, mut done: impl FnMut(&mut Self) -> Option<T>) -> T {
-        self.moved_at = Instant::now();
+        self.moved();
         loop {
             if let Some(found) = done(self) {
                 return found;
             }
-            let left = (self.moved_at + self.quiet()).saturating_duration_since(Instant::now());
+            let quiet = self.quiet();
+            let left = self
+                .deadline(quiet)
+                .saturating_duration_since(Instant::now());
             match self.heard.recv_timeout(left) {
                 Ok(heard) => self.take(heard),
                 Err(_) => panic!(
-                    "quiet for {:?} with nothing moved: {:?}, progress {:?}, links {:?}",
-                    self.quiet(),
-                    self.status,
-                    self.progress,
-                    self.links
+                    "quiet for {quiet:?} with nothing moved, besides {:?} held still for the \
+                     devices: {:?}, progress {:?}, links {:?}, log {:?}",
+                    self.held_for, self.status, self.progress, self.links, self.log
                 ),
             }
         }
@@ -610,7 +729,18 @@ impl Cell {
                         self.links.insert((id, peer), link);
                     }
                     Line::Status { .. } => {
+                        // A status that says only whether the node waits on its device begins
+                        // or ends a stretch held still, and moves nothing.
+                        let moved = self.status.get(&id).and_then(movement) != movement(&line);
                         self.status.insert(id, line);
+                        if !moved {
+                            self.hold();
+                            return;
+                        }
+                    }
+                    Line::Log(flushing, longest) => {
+                        self.log.insert(id, (flushing, longest));
+                        return;
                     }
                 }
             }
@@ -632,7 +762,7 @@ impl Cell {
             }
             Heard::Told(Told::Failed(client, why)) => panic!("client {client} failed: {why}"),
         }
-        self.moved_at = Instant::now();
+        self.moved();
     }
 
     /// Tells each running node, each listening (`Cell::start`), where the others do: where they

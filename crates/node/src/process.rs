@@ -8,7 +8,7 @@
 //! key PKCS #8).
 //!
 //! **Its talk** is lines. On standard output: `bound QUIC PLANE` once the node listens, then
-//! `status TERM LEADER COMMIT APPLIED PATIENCE_NS RECONNECT_NS MEASURING_NS` each time one of the first four
+//! `status TERM LEADER COMMIT APPLIED PATIENCE_NS RECONNECT_NS MEASURING_NS HELD` each time one of the first four
 //! moves, its redials to a peer back off further or start over, or the heartbeats it takes from
 //! peers not yet judged move (`Status::measuring`): how long the node states it may go
 //! without moving
@@ -16,7 +16,11 @@
 //! may go without moving should that peer fall silent (`Status::reconnect`, 0 when it dials none);
 //! while
 //! some peer is not yet judged, the longest its stream's heartbeats go between
-//! (`Status::measuring_for`, else 0); and
+//! (`Status::measuring_for`, else 0); and 1 while the node waits on its own device, said each time
+//! that changes (`Status::held`, else 0). After each status, `log FLUSHING_NS LONGEST_NS`: how
+//! long the log's flush has been out (0 when none is) and the longest an update has waited for
+//! its commit (hyper-log's `LogStats`), since the node moves only as its writes become durable;
+//! and
 //! `replaced FAILED JOINING` once, from the node that led then, when a replacement ended; and
 //! `link PEER KEYED DIALS ENDED REFUSAL` when a peer's link changes: whether the plane holds keys
 //! for its connection, the dials made to it, the connections and dials to it that ended, and the
@@ -38,7 +42,7 @@ use std::time::Duration;
 
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
-use hyper_log::{Config as LogConfig, Waits};
+use hyper_log::{Config as LogConfig, LogStats, Waits};
 use hyper_rt::combine::{Either, race2};
 use hyper_rt::machine::calibration::{Calibration, Policy};
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
@@ -355,6 +359,8 @@ async fn serve(config: ProcessConfig) -> Result<(), ProcessError> {
     let mut read = vec![0u8; chunk];
     let mut pending = Vec::new();
     let mut told: Option<Status> = None;
+    // The log's measures, filled again at each status said (hyper-log's `Log::stats`).
+    let mut stats: Option<Box<LogStats>> = None;
     // Each peer's link as last said, a peer a slot.
     let mut links: Vec<Link> = Vec::with_capacity(config.peers.len());
     loop {
@@ -409,22 +415,35 @@ async fn serve(config: ProcessConfig) -> Result<(), ProcessError> {
             // the heartbeats it takes from those pairs: said too, so a watcher sees it move before
             // it elects, and sees it stop if a peer it measures goes silent. The reconnect bound
             // is said each time it changes, as a redial's backoff doubles, so a watcher never
-            // holds one shorter than the node's own.
+            // holds one shorter than the node's own; and whether the node waits on its own device,
+            // so a watcher knows it holds still for its device and not by choice.
             let moved = told.is_none_or(|was| {
                 (was.term, was.leader, was.commit, was.applied, was.reconnect)
                     != (now.term, now.leader, now.commit, now.applied, now.reconnect)
                     || was.measuring != now.measuring
+                    || was.held != now.held
             });
             if moved {
                 let patience = now.patience.map_or(0, |p| p.as_nanos());
                 let reconnect = now.reconnect.map_or(0, |r| r.as_nanos());
                 let measuring = now.measuring_for.map_or(0, |m| m.as_nanos());
                 let line = format!(
-                    "status {} {} {} {} {patience} {reconnect} {measuring}\n",
-                    now.term, now.leader, now.commit, now.applied
+                    "status {} {} {} {} {patience} {reconnect} {measuring} {}\n",
+                    now.term,
+                    now.leader,
+                    now.commit,
+                    now.applied,
+                    u8::from(now.held)
                 );
                 say(&mut output, &line).await?;
                 told = Some(now);
+                let log = node.log_stats(stats.take())?;
+                let flushing = log.flushing_since.map_or(0, |since| {
+                    log.at.saturating_duration_since(since).as_nanos()
+                });
+                let longest = log.commit_wait.quantile(1_000_000).unwrap_or(0);
+                say(&mut output, &format!("log {flushing} {longest}\n")).await?;
+                stats = Some(log);
             }
         }
     }

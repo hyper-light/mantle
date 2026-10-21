@@ -494,6 +494,20 @@ device not measured reads one at a time. Before this gate nothing bounded the re
 took at once: every caller's thread read at the device. The scrubber's paced steps (§9) and
 the cleaner's relocations (§8) keep their own pacing outside the gate.
 
+An owner on a runtime task, a storage node serving chunks from the shard that also runs its
+transport, cannot wait at the gate: a parked shard holds every connection it carries (node.md
+§1.3). It reads through a `Reader` (`Volume::reader`) instead, which hands each read to the
+device's issuer as one batch, the record's header, table and blocks for every fragment the
+range covers, and takes it when its answer comes, verified by the same check as a thread's
+read, a device error or failed check being the same `Corrupt`. A reader holds its reads to the
+same `Reads` as the gate: at most `depth` at the device and their buffers within `bytes` (or one
+alone), `waiting` more in the order they came, sent as answers give turns back, and `Busy` past
+them before anything is taken. A read that waited finds its chunk's fragments again when its
+turn comes, so one deleted meanwhile is answered `NotFound`. Writes need no reader: a waking
+put already answers through its owner's waker, and `Volume::put_checked_waking` takes the
+chunk's bytes from the buffer they arrived in, checked against their sender's CRC-32C, without
+a copy.
+
 The gate is the device dispatcher's (node.md §2.7): the reads that wait are taken in start-tag
 order across tenants and principals rather than in arrival order, and each is charged its cost
 in the device's measured units, so one principal's flood of reads waits behind its own share.

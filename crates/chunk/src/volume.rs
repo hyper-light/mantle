@@ -423,13 +423,33 @@ impl<F: BlockFile + Sync + 'static> Volume<F> {
         seal: bool,
         expected: Option<u32>,
     ) -> Result<(Op, Ticket<'_>), ChunkError> {
-        let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        let ticket = self.admit_payload(data.len())?;
+        let op = self.write_payload(key, offset, data.to_vec(), seal, expected)?;
+        Ok((op, ticket))
+    }
+
+    /// Room in the writer's queue for a payload of `len` bytes: refused before anything is
+    /// copied when no record can hold it, or the queue has no room.
+    fn admit_payload(&self, len: usize) -> Result<Ticket<'_>, ChunkError> {
+        let len = u64::try_from(len).unwrap_or(u64::MAX);
         let max = crate::writer::max_payload(&self.shared.geometry, self.shared.checksum_shift);
         if len > max {
             return Err(ChunkError::TooLarge { len, max });
         }
-        let ticket = self.admit(len)?;
-        let payload = Payload::new(data.to_vec(), self.shared.checksum_shift)
+        self.admit(len)
+    }
+
+    /// The write of `data` at `offset` of `key`'s chunk, its checksums computed in the calling
+    /// thread and checked against `expected` when the sender supplied one.
+    fn write_payload(
+        &self,
+        key: ChunkKey,
+        offset: u64,
+        data: Vec<u8>,
+        seal: bool,
+        expected: Option<u32>,
+    ) -> Result<Op, ChunkError> {
+        let payload = Payload::new(data, self.shared.checksum_shift)
             .ok_or_else(|| ChunkError::Config("checksum block size".into()))?;
         if let Some(expected) = expected
             && expected != payload.crc
@@ -440,15 +460,12 @@ impl<F: BlockFile + Sync + 'static> Volume<F> {
                 actual: payload.crc,
             });
         }
-        Ok((
-            Op::Write {
-                key,
-                offset,
-                payload,
-                seal,
-            },
-            ticket,
-        ))
+        Ok(Op::Write {
+            key,
+            offset,
+            payload,
+            seal,
+        })
     }
 
     /// Deletes a chunk; deleting one that does not exist succeeds.
@@ -467,6 +484,24 @@ impl<F: BlockFile + Sync + 'static> Volume<F> {
         waker: Waker,
     ) -> Result<Answer, ChunkError> {
         let (op, ticket) = self.write_op(key, 0, data, true, None)?;
+        self.dispatch(op, ticket, Some(waker))
+    }
+
+    /// Writes a whole chunk as [`Volume::put_checked`] does, from bytes the caller hands over
+    /// rather than lends, and answers as [`Volume::put_waking`] does: a storage node writes a
+    /// chunk it was sent from the buffer the chunk arrived in, checked against the CRC-32C its
+    /// sender computed, without a copy and without its thread waiting for the flush (node.md
+    /// §5.2). Refused before anything is checksummed when no record can hold it or the queue
+    /// has no room.
+    pub fn put_checked_waking(
+        &self,
+        key: ChunkKey,
+        data: Vec<u8>,
+        crc32c: u32,
+        waker: Waker,
+    ) -> Result<Answer, ChunkError> {
+        let ticket = self.admit_payload(data.len())?;
+        let op = self.write_payload(key, 0, data, true, Some(crc32c))?;
         self.dispatch(op, ticket, Some(waker))
     }
 
@@ -603,24 +638,7 @@ impl<F: BlockFile + Sync + 'static> Volume<F> {
         buffers: &mut ReadBuffers,
     ) -> Result<(), ChunkError> {
         out.clear();
-        let fragments = {
-            let index = self.shared.index.read().map_err(|_| ChunkError::Fenced)?;
-            let entry = index.get(key).ok_or(ChunkError::NotFound(*key))?;
-            let end = offset.checked_add(len);
-            if end.is_none_or(|e| e > entry.len()) {
-                return Err(ChunkError::Range {
-                    key: *key,
-                    offset,
-                    len,
-                    chunk_len: entry.len(),
-                });
-            }
-            let end = offset.saturating_add(len);
-            entry
-                .covering(offset, end)
-                .copied()
-                .collect::<Vec<Fragment>>()
-        };
+        let fragments = self.fragments(key, offset, len)?;
         let end = offset.saturating_add(len);
         // The fragments are read one at a time, so the read buffers the most any one needs.
         let mut cost = 0u64;
@@ -660,6 +678,52 @@ impl<F: BlockFile + Sync + 'static> Volume<F> {
             read::fragment(&self.shared, &mut buffers.0, key, fragment, from, to, out)?;
         }
         Ok(())
+    }
+
+    /// The fragments that hold bytes `[offset, offset + len)` of `key`'s chunk, in order:
+    /// `NotFound` for a chunk the index does not hold, `Range` for bytes past its end.
+    pub(crate) fn fragments(
+        &self,
+        key: &ChunkKey,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<Fragment>, ChunkError> {
+        let index = self.shared.index.read().map_err(|_| ChunkError::Fenced)?;
+        let entry = index.get(key).ok_or(ChunkError::NotFound(*key))?;
+        let end = offset.checked_add(len);
+        if end.is_none_or(|e| e > entry.len()) {
+            return Err(ChunkError::Range {
+                key: *key,
+                offset,
+                len,
+                chunk_len: entry.len(),
+            });
+        }
+        let end = offset.saturating_add(len);
+        Ok(entry.covering(offset, end).copied().collect())
+    }
+
+    /// What readers share with the writer: the file, its geometry and the index.
+    pub(crate) fn shared(&self) -> &Shared<F> {
+        &self.shared
+    }
+
+    /// A reader of this volume's chunks for an owner on a runtime task, through `issuer`, the
+    /// issuer of the device the volume is on: its reads go to the device as the issuer's
+    /// batches and are taken as their answers come, so its owner's thread never waits on the
+    /// device (docs/design/node.md §1.3). It keeps as many reads out as the volume's measured
+    /// read depth (`Reads::depth`), and refuses one past them with `Busy`.
+    pub fn reader(&self, issuer: &Issuer) -> Result<crate::Reader, ChunkError> {
+        let reads = self.shared.reads.reads();
+        let attached = issuer
+            .attach_deep(&self.shared.file, reads.depth)
+            .map_err(ChunkError::Device)?;
+        Ok(crate::Reader::new(
+            attached,
+            self.shared.file.alignment(),
+            self.limits.batch_bytes,
+            reads,
+        ))
     }
 
     /// What the read gate has let through and refused since the volume opened.

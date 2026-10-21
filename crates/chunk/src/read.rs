@@ -92,6 +92,12 @@ impl Gate {
         self.reads.gap
     }
 
+    /// The depth, bytes and waiting the gate holds reads to, which a volume's
+    /// [`crate::Reader`] holds its own reads to as well.
+    pub fn reads(&self) -> Reads {
+        self.reads
+    }
+
     /// A turn for a read that buffers `cost` bytes: at once if it fits and none waits, after
     /// the reads that came first if one may wait, and otherwise `Busy`.
     pub fn enter(&self, cost: u64) -> Result<Turn<'_>, ChunkError> {
@@ -273,7 +279,7 @@ pub(crate) fn fragment<F: BlockFile>(
 /// Verifies a read of `fragment` against the index and its checksums, from the header and
 /// table in `head` and the checksum blocks in `apart`, or after the table in `head` when
 /// read with it, and appends payload bytes `[from, to)` to `out`.
-fn check<F>(
+pub(crate) fn check<F>(
     shared: &Shared<F>,
     key: &ChunkKey,
     fragment: &Fragment,

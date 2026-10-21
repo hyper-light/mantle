@@ -371,6 +371,7 @@ impl Pki {
             bind: "127.0.0.1:0".parse().unwrap(),
             credentials: self.credentials(&self.clients[&id]),
             nodes: peers,
+            role: Role::Client,
             messages: message_bounds(
                 &[hosted(u64::try_from(order.len()).unwrap(), ())],
                 CHUNK_BYTES,

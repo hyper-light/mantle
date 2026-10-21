@@ -278,6 +278,7 @@ impl Pki {
             transport_bytes: u64::try_from(nodes.len() * 3 * hyper_transport::RECEIVE_CHUNK)
                 .unwrap(),
             nodes,
+            role: Role::Client,
             messages: message_bounds(
                 &[Hosted {
                     group: GROUP,

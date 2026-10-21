@@ -38,12 +38,15 @@ use hyper_transport::tls::{Credentials, Tls};
 use hyper_transport::{
     Config, Endpoint, Epoch, Event, ExchangeId, Fixed, PeerId, Progress, Refusal,
 };
+use mantle_chunk::ChunkKey;
 use mantle_meta::wire::{Answer, Entry};
 
 use crate::bounds::{self, Stated};
+use crate::chunk;
 use crate::classes::{self, Bounds, Kind, NodeClasses, Role};
 use crate::command::{self, CommandError, ReplyHead, Status};
 use crate::directory::{Peer, Peers};
+use crate::node::ChunkOutcome;
 use crate::read::{Query, Read, ReadError};
 
 /// What a client is given.
@@ -54,6 +57,9 @@ pub struct ClientSettings {
     pub credentials: Credentials,
     /// The nodes it may ask, by certificate.
     pub nodes: Vec<Peer>,
+    /// What it is to the nodes, as their configurations name its certificate: a client of
+    /// mantle's protocol, or a gateway, which also moves chunks (node.md §3.6).
+    pub role: Role,
     /// The largest message of each class, as the cell's nodes state them (`classes::Bounds`).
     pub messages: Bounds,
     /// The bytes its transport may hold at once.
@@ -158,10 +164,10 @@ impl Client {
         let peers = settings.nodes.len();
         let stated = Stated {
             peers,
-            // A client keeps one command out, to one range at a time, and moves no chunk.
+            // A client keeps one command out, to one range at a time, and a gateway one chunk.
             ranges: 1,
             inflight: 0,
-            transfers: 0,
+            transfers: usize::from(settings.role == Role::Gateway),
             transport_bytes: settings.transport_bytes,
             messages: settings.messages,
         };
@@ -170,7 +176,7 @@ impl Client {
         let tls = Tls::mutual(&settings.credentials, false)?;
         let config = Config {
             tls,
-            role: Role::Client,
+            role: settings.role,
             limits,
             congestion: Default::default(),
         };
@@ -452,12 +458,16 @@ impl Client {
                         self.driver.endpoint().end(exchange);
                         return finish(read);
                     }
-                    if let Some(done) = self.read_reply(exchange, &mut bytes)? {
+                    if let Some(done) =
+                        self.read_reply(exchange, classes::Class::Request, &mut bytes)?
+                    {
                         return Ok(Asked::Answered(done));
                     }
                 }
                 Event::BodyReady { exchange: e } if e == exchange && reply.is_some() => {
-                    if let Some(done) = self.read_reply(exchange, &mut bytes)? {
+                    if let Some(done) =
+                        self.read_reply(exchange, classes::Class::Request, &mut bytes)?
+                    {
                         return Ok(Asked::Answered(done));
                     }
                 }
@@ -554,27 +564,158 @@ impl Client {
 
     /// Writes what the exchange takes of the command's body.
     fn write(&mut self, exchange: ExchangeId, written: &mut usize) -> Result<(), ClientError> {
-        let endpoint = self.driver.endpoint();
-        while let Some(rest) = self.body.get(*written..)
-            && !rest.is_empty()
-        {
-            match endpoint.write_body(exchange, rest)? {
-                0 => break,
-                took => *written = written.saturating_add(took),
-            }
-        }
-        Ok(())
+        write_body(self.driver.endpoint(), exchange, &self.body, written)
     }
 
-    /// Reads what the reply's body holds; once it is whole and its checksum verified, its answers.
+    /// Puts `bytes`, `key`'s whole chunk with the CRC-32C its writer computed, on `volume`, which
+    /// `node` holds, as a gateway does (node.md §5.2): `Stored`, the status the node refused it
+    /// with, or why the exchange was lost, after which the chunk may still have landed. One
+    /// exchange at a time, as commands are; a client whose role is no gateway's is refused.
+    pub async fn put_chunk(
+        &mut self,
+        node: PeerId,
+        (volume, key): (u128, ChunkKey),
+        bytes: &[u8],
+        crc32c: u32,
+        deadline_ns: u64,
+    ) -> Result<ChunkOutcome, ClientError> {
+        let head = chunk::Put {
+            volume,
+            key,
+            crc32c,
+        }
+        .encode();
+        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let replied = self
+            .transfer(node, Kind::ChunkPut, (&head, bytes, Some(len)), deadline_ns)
+            .await?;
+        Ok(match replied {
+            Ok((chunk::Status::Stored, _)) => ChunkOutcome::Stored,
+            Ok((status, _)) => ChunkOutcome::Refused(status),
+            Err(refusal) => ChunkOutcome::Lost(refusal),
+        })
+    }
+
+    /// Gets bytes `[offset, offset + len)` of `key`'s chunk from `volume`, which `node` holds:
+    /// the bytes the volume verified, the status the node refused it with, or why the exchange
+    /// was lost.
+    pub async fn get_chunk(
+        &mut self,
+        node: PeerId,
+        (volume, key): (u128, ChunkKey),
+        (offset, len): (u64, u64),
+        deadline_ns: u64,
+    ) -> Result<ChunkOutcome, ClientError> {
+        let head = chunk::Get {
+            volume,
+            key,
+            offset,
+            len,
+        }
+        .encode();
+        let replied = self
+            .transfer(node, Kind::ChunkGet, (&head, &[], None), deadline_ns)
+            .await?;
+        Ok(match replied {
+            Ok((chunk::Status::Read, bytes)) => ChunkOutcome::Read(bytes),
+            Ok((status, _)) => ChunkOutcome::Refused(status),
+            Err(refusal) => ChunkOutcome::Lost(refusal),
+        })
+    }
+
+    /// One chunk exchange with `node`: its reply's status and body, or the refusal that ended it
+    /// unanswered (`NotConnected` for a node not reached).
+    async fn transfer(
+        &mut self,
+        node: PeerId,
+        kind: Kind,
+        (head, body, len): (&[u8], &[u8], Option<u64>),
+        deadline_ns: u64,
+    ) -> Result<Result<(chunk::Status, Vec<u8>), Refusal>, ClientError> {
+        if !self.reach(node, deadline_ns).await? {
+            return Ok(Err(Refusal::NotConnected));
+        }
+        let clock = self.driver.clock()?;
+        let now_ns = hyper_rt::futures::now_ns();
+        let period = Progress::new(Duration::from_nanos(self.period_ns(
+            node,
+            deadline_ns,
+            now_ns,
+        )))?;
+        let exchange = match self
+            .driver
+            .endpoint()
+            .open(clock, node, kind, head, len, period)
+        {
+            Ok(exchange) => exchange,
+            Err(Refusal::NotConnected) => {
+                self.lost(node);
+                return Ok(Err(Refusal::NotConnected));
+            }
+            Err(refusal) => return Err(refusal.into()),
+        };
+        let mut written = 0usize;
+        write_body(self.driver.endpoint(), exchange, body, &mut written)?;
+        let mut status = None;
+        let mut bytes = Vec::new();
+        loop {
+            let Some(event) = self.next_event(deadline_ns).await? else {
+                self.driver.endpoint().end(exchange);
+                return Err(ClientError::Deadline);
+            };
+            match event {
+                Event::Writable { exchange: e } if e == exchange => {
+                    write_body(self.driver.endpoint(), exchange, body, &mut written)?;
+                }
+                Event::Reply { exchange: e, .. } if e == exchange => {
+                    let head = self.driver.endpoint().head(exchange).unwrap_or_default();
+                    let replied = chunk::read_reply_head(head).unwrap_or(chunk::Status::Malformed);
+                    if replied != chunk::Status::Read {
+                        self.driver.endpoint().end(exchange);
+                        return Ok(Ok((replied, Vec::new())));
+                    }
+                    status = Some(replied);
+                    if let Some(done) =
+                        self.read_reply(exchange, classes::Class::Transfer, &mut bytes)?
+                    {
+                        return Ok(Ok((replied, done)));
+                    }
+                }
+                Event::BodyReady { exchange: e } if e == exchange => {
+                    if let Some(replied) = status
+                        && let Some(done) =
+                            self.read_reply(exchange, classes::Class::Transfer, &mut bytes)?
+                    {
+                        return Ok(Ok((replied, done)));
+                    }
+                }
+                Event::Refused {
+                    exchange: e,
+                    refusal,
+                    ..
+                } if e == exchange => return Ok(Err(refusal)),
+                Event::Closed { peer, .. } | Event::Unreachable { peer, .. } => {
+                    self.lost(peer);
+                    if peer == node {
+                        return Ok(Err(Refusal::Closed));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Reads what the reply's body holds, a piece at a time from `class`'s budget; once it is
+    /// whole and its checksum verified, the body.
     fn read_reply(
         &mut self,
         exchange: ExchangeId,
+        class: classes::Class,
         into: &mut Vec<u8>,
     ) -> Result<Option<Vec<u8>>, ClientError> {
         let endpoint = self.driver.endpoint();
         loop {
-            let mut piece = endpoint.reserve(classes::Class::Request, PIECE)?;
+            let mut piece = endpoint.reserve(class, PIECE)?;
             let got = endpoint.read_body(exchange, &mut piece);
             into.extend_from_slice(piece.bytes());
             endpoint.release(piece);
@@ -700,4 +841,22 @@ fn finish(head: ReplyHead) -> Result<Asked, ClientError> {
         Status::Refused => Ok(Asked::Refused),
         status => Err(ClientError::Status(status)),
     }
+}
+
+/// Writes what `exchange` takes of `body` past `written`.
+fn write_body(
+    endpoint: &mut Endpoint<NodeClasses, Fixed, Peers>,
+    exchange: ExchangeId,
+    body: &[u8],
+    written: &mut usize,
+) -> Result<(), ClientError> {
+    while let Some(rest) = body.get(*written..)
+        && !rest.is_empty()
+    {
+        match endpoint.write_body(exchange, rest)? {
+            0 => break,
+            took => *written = written.saturating_add(took),
+        }
+    }
+    Ok(())
 }

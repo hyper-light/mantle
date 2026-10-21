@@ -93,6 +93,19 @@ section once named, is reported beside it and is not the bound; design §7), let
 wait in the order they came, and refuses the rest with `Busy`, where before every caller's
 thread read at the device unbounded.
 
+A node's storage role (`mantle_node::storage`, [design](design/node.md) §5.2) opens the volumes
+its configuration names before its runtime starts, one issuer per device the OS names and each
+device directory locked against a second process, and answers chunk puts and gets from nodes and
+gateways as exchanges of their own class over QUIC: a put's bytes checked against the CRC-32C its
+sender computed before the volume writes them, answered once durable, and refused unread past
+what the volumes' writer queues hold; a get read at the device through its issuer from the
+node's shard (`mantle_chunk::Reader`) and verified before it is sent; each refusal typed. Tested
+in one process (`crates/node/tests/cluster.rs`) and with `mantle node` processes
+(`crates/mantle/tests/node.rs`): a gateway puts chunks round three nodes and one is killed with
+`SIGKILL` mid-put. Every chunk acknowledged reads back whole after the node starts again on its
+volume. A lost put either landed whole or not at all, and is stored when retried. This holds with
+a busy loop on every core.
+
 Remaining before it is done:
 
 - `mantle bench chunk` measures puts and reads next to the same reads through the file
@@ -250,10 +263,11 @@ Remaining before it is done:
 
 - The windows a gateway admits, from its memory and measured latency; the rates of the paths
   measured on an idle machine.
-- The server around it: mantle's protocol over QUIC for its client and its nodes, the HTTP/1.1
-  listener for stock S3 clients, the transport to storage nodes and ranges, routing by
-  descriptors, placement across failure domains, and each request's memory admitted against
-  the gateway's.
+- The server around it: the drivers' requests carried over mantle's protocol on QUIC (a
+  client in the gateway's role puts and gets chunks on storage nodes and sends commands to
+  ranges, `mantle_node::client`; the host that runs the drivers over it is left), the HTTP/1.1
+  listener for stock S3 clients, routing by descriptors, placement across failure domains, and
+  each request's memory admitted against the gateway's.
 
 The Raft log (`hyper-log`, vendored from hyper-raft with the block layer under it,
 `hyper-block`; [design](design/raft-log.md), vendor/UPSTREAM.md), which every range replica on
@@ -360,7 +374,8 @@ Remaining before it is done:
 - The fast track under simulation. The transport is built on hyper-raft's shared stack
   (node.md §3): a range's Raft messages on QUIC lanes, snapshots on bulk exchanges, clients'
   commands and ReadIndex reads on the request class, and consensus control on the sealed
-  datagram plane; chunk transfers, SWIM and the TCP fallback are left.
+  datagram plane, and chunk puts and gets on a transfer class between the requests someone waits
+  on and bulk (node.md §3.1, §5.2); SWIM and the TCP fallback are left.
 - Linearizability with real processes. `crates/node/tests/cluster.rs` checks the histories of
   three clients putting and reading through a leader stopped or cut off by a relay, and through
   a follower lost for good and replaced by a spare, on three and five voters and on both

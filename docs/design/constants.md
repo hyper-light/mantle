@@ -483,7 +483,10 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/node/src/bounds.rs` `IDLE_PTOS` | external | Three probe timeouts, the least idle timeout RFC 9000 §10.1 allows. |
 | `crates/node/src/bounds.rs` `INITIAL_RTT` | external | `kInitialRtt`, 333 ms, a path's smoothed round trip before any sample (RFC 9002 §6.2.2). |
 | `crates/node/src/bounds.rs` `MAX_ACK_DELAY` | external | `max_ack_delay`'s default, 25 ms, which a probe timeout adds once established (RFC 9000 §18.2). |
-| `crates/node/src/classes.rs` `RANKS` | format | Three classes on a node's QUIC connections: replication, request and bulk (docs/design/node.md §3.1); consensus control that fits a datagram takes the plane. |
+| `crates/node/src/chunk.rs` `GET_HEAD_BYTES` | format | A chunk get's head: the volume, a u128; the chunk's key, `mantle_chunk::ChunkKey::ENCODED_LEN` bytes; the offset and the length asked, a u64 each. |
+| `crates/node/src/chunk.rs` `PUT_HEAD_BYTES` | format | A chunk put's head: the volume, a u128; the chunk's key, `mantle_chunk::ChunkKey::ENCODED_LEN` bytes; the CRC-32C its sender computed, a u32 (CLAUDE.md §6). |
+| `crates/node/src/chunk.rs` `REPLY_HEAD_BYTES` | format | A chunk reply's head: its status, one byte. |
+| `crates/node/src/classes.rs` `RANKS` | format | Four classes on a node's QUIC connections: replication, request, transfer (the request class's lower level, chunk bodies) and bulk (docs/design/node.md §3.1); consensus control that fits a datagram takes the plane. |
 | `crates/node/src/client.rs` `PERSISTENT_CONGESTION_THRESHOLD` | external | `kPersistentCongestionThreshold`, three probe timeouts with no acknowledgement (RFC 9002 §7.6.1): the least an exchange is given once the client has measured its exchanges. |
 | `crates/node/src/client.rs` `PIECE` | derived | hyper-transport's `RECEIVE_CHUNK`: a reply's body is read a receive chunk at a time. |
 | `crates/node/src/command.rs` `HEAD_BYTES` | format | A command's head: the range's group, a u128 as the log names it. |
@@ -495,7 +498,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/node/src/layout.rs` `RUN_BYTES` | format | The node's run record: one u64 count (hyper-liveness `Settings::run`). |
 | `crates/node/src/node.rs` `LANE` | format | The one lane a peer's Raft frames take: the node runs its ranges on one shard (docs/design/node.md §3.2's lane a shard). |
 | `crates/node/src/node.rs` `LIVENESS_GROUP` | format | The log group of the liveness stream's own writes, the top of the group space: group 0 holds hyper-log's own key records, and a range named either is refused at open. |
-| `crates/node/src/node.rs` `PIECE` | derived | hyper-transport's `RECEIVE_CHUNK`: a snapshot's body is read a receive chunk at a time. |
+| `crates/node/src/node.rs` `PIECE` | derived | hyper-transport's `RECEIVE_CHUNK`: a snapshot's or a chunk's body is read a receive chunk at a time. |
 | `crates/node/src/node.rs` `PLANE_RAFT` | format | A plane message's first byte for a range's Raft frame, apart from hyper-liveness's `KIND` for a heartbeat. |
 | `crates/node/src/read.rs` `CURRENT` | format | A read's kind: the current version of a key, the one query a range answers yet. |
 | `crates/range/src/conf.rs` `FORMAT` | format | Version byte of the encoded configuration row. |

@@ -28,10 +28,12 @@ mantle-s3 = { path = "../s3" }
 
 [dev-dependencies]
 # The real-process test of `mantle node` (tests/node.rs): the client's runtime and transport, the
-# cell's certificates, and the range's settings the nodes are given.
+# cell's certificates, the range's settings the nodes are given, and the CRC-32C the gateway
+# states for each chunk it puts.
 hyper-rt = { path = "../../vendor/hyper-rt" }
 hyper-transport = { path = "../../vendor/hyper-transport" }
 mantle-cert = { path = "../cert" }
+mantle-crc = { path = "../crc" }
 mantle-range = { path = "../range" }
 tempfile.workspace = true
 

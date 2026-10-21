@@ -1392,9 +1392,17 @@ so the shard never waits on a chunk's I/O. A put a peer sends takes room from wh
 writer queues hold before its body is read, and one the node has no room for is refused unread
 (`Refusal::Budget`), as the queue would refuse it `Busy` once read. A node asks its own volumes
 in-process, the laptop's path (§5.5), and its peers' over the transfer class (`Node::put_chunk`,
-`Node::get_chunk`). Tested node to node over real sockets and disks (`crates/node/tests/cluster.rs`):
-chunks on every node read back whole and in part from any node, each refusal answered why, and
-what a peer acknowledged read back after it stops and starts again.
+`Node::get_chunk`); a gateway asks them through a client whose certificate the nodes name a
+gateway's (§3.6; `Client::put_chunk`, `Client::get_chunk`), one exchange at a time, a reply's
+body read from the transfer class's budget. Tested node to node over real sockets and disks
+(`crates/node/tests/cluster.rs`): chunks on every node read back whole and in part from any node,
+each refusal answered why, and what a peer acknowledged read back after it stops and starts again.
+And with `mantle node` processes (`crates/mantle/tests/node.rs`): a gateway's puts round three
+nodes, one node killed with `SIGKILL` mid-put; every put to a running node is stored, the killed
+node's until the kill and lost after; with it down its peers' chunks read back whole; started
+again it holds the same volume, every chunk acknowledged reads back whole, a lost put landed whole
+or not at all and is stored when retried (a retry's bytes are the first's, chunk-store's audit
+B05), and each refusal is typed. It passes with a busy loop on every core.
 
 ### 5.3 Sessions
 

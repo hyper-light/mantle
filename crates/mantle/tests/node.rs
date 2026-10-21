@@ -25,16 +25,17 @@
 //! states it may go without moving (`Status::patience`) or a link to a peer it dials may, should
 //! that peer fall silent (`Status::reconnect`), or any client gives an exchange
 //! (`Client::patience`), never less than RFC 6298's initial retransmission timeout, one second (as
-//! `crates/node/tests/cluster.rs` does). A cell no majority of whose running nodes is free of its
-//! own device holds still for its devices, as its law has it (`Status::held`: a node judges no peer
-//! while its own proof is out, timing.md §2.8, and a range's quorum waits on its members' devices),
-//! and the watch does not count that time, each such stretch up to the longest any node's log has
-//! taken and the quiet period besides (its `log` line; the bound hyper-durable-e2e's rule and the
-//! cluster's give a flush out), so a cell held by a fault of its own still fails. On windows-2025
-//! the runner's one disk held every node's writes 5 to 7.5 s at once (CI run 39544711299): the
-//! nodes held still, and the watch took the cell for a stopped one. A process's lines are taken
-//! only while that process runs: a node started again is a new process, and a line its killed one
-//! left is dropped.
+//! `crates/node/tests/cluster.rs` does). A node whose log has a flush out extends the watch, since
+//! its range moves only as its writes become durable, until the flush has been out longer than the
+//! longest any node's log has taken and the quiet period besides (its `log` line;
+//! hyper-durable-e2e's rule, as the cluster's). A cell no majority of whose running nodes is free
+//! of its own device holds still for its devices, as its law has it (`Status::held`: a node judges
+//! no peer while its own proof is out, timing.md §2.8, and a range's quorum waits on its members'
+//! devices), and the watch does not count that time, each such stretch up to the same bound, so a
+//! cell held by a fault of its own still fails. On windows-2025 the runner's one disk held every
+//! node's writes 5 to 7.5 s at once (CI run 39544711299): the nodes held still, and the watch took
+//! the cell for a stopped one. A process's lines are taken only while that process runs: a node
+//! started again is a new process, and a line its killed one left is dropped.
 
 #![allow(
     clippy::unwrap_used,
@@ -420,9 +421,9 @@ struct Cell {
     replaced: BTreeSet<(u64, u64)>,
     /// Each node's link to each peer as it last said, by node and peer.
     links: BTreeMap<(u64, u64), String>,
-    /// Each node's log as it last said: its flush out, if one was, and the longest an update has
-    /// waited for its commit.
-    log: BTreeMap<u64, (Option<Duration>, Duration)>,
+    /// Each node's log as it last said, and when that was heard: its flush out, if one was, and the
+    /// longest an update has waited for its commit.
+    log: BTreeMap<u64, (Instant, Option<Duration>, Duration)>,
     relay: Option<Relay>,
     /// Where the running workload's clients are told of a node started again.
     learns: Vec<Sender<(u64, SocketAddr)>>,
@@ -626,7 +627,7 @@ impl Cell {
         let longest = self
             .log
             .values()
-            .map(|(_, longest)| *longest)
+            .map(|(_, _, longest)| *longest)
             .max()
             .unwrap_or_default();
         longest + quiet
@@ -679,6 +680,20 @@ impl Cell {
         self.moved_at + quiet + self.held_for + holding
     }
 
+    /// When the watch ends for the flushes out: each running node's, as last said, past the
+    /// longest any node's log has taken and `quiet` besides, as the cluster's watch has it.
+    fn flush_deadline(&self, quiet: Duration) -> Instant {
+        let allowed = self.held_bound(quiet);
+        self.log
+            .iter()
+            .filter(|(id, _)| self.running.contains_key(id))
+            .filter_map(|(_, (heard, flushing, _))| {
+                Some(*heard + allowed.saturating_sub(*flushing.as_ref()?))
+            })
+            .max()
+            .unwrap_or_else(Instant::now)
+    }
+
     /// Takes what it hears until `done` holds; fails once a quiet period passes with nothing.
     fn until<T>(&mut self, mut done: impl FnMut(&mut Self) -> Option<T>) -> T {
         self.moved();
@@ -689,6 +704,7 @@ impl Cell {
             let quiet = self.quiet();
             let left = self
                 .deadline(quiet)
+                .max(self.flush_deadline(quiet))
                 .saturating_duration_since(Instant::now());
             match self.heard.recv_timeout(left) {
                 Ok(heard) => self.take(heard),
@@ -741,7 +757,7 @@ impl Cell {
                         }
                     }
                     Line::Log(flushing, longest) => {
-                        self.log.insert(id, (flushing, longest));
+                        self.log.insert(id, (Instant::now(), flushing, longest));
                         return;
                     }
                 }

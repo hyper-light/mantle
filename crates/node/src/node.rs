@@ -253,8 +253,11 @@ pub struct Status {
     /// together, and hold still together, as a stall of that device makes them.
     pub held: bool,
     /// How long the node may go without moving while its peers live, by its own law: the longest
-    /// any peer's evidence may go unmoved before it is suspected (`PairReport::freshness`), then
-    /// the range's expected election from a suspicion and one more round (hyper-raft's `Timing`);
+    /// any peer's evidence may go unmoved before it is suspected (`PairReport::freshness`), and the
+    /// wait of a judge with nothing durable since that point for a completion of its own, which its
+    /// stream asks within its sending interval and a flush makes (hyper-liveness, timing.md §2.8:
+    /// the longest interval it sends at, `PairReport::sending`, and its mean flush); then the
+    /// range's expected election from a suspicion and one more round (hyper-raft's `Timing`).
     /// `None` until both are measured.
     pub patience: Option<Duration>,
     /// Snapshots this node sent that their member took, and snapshots it took, of every range.
@@ -814,18 +817,33 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// How long `group`'s member may go without moving while its peers live, by the node's own law
     /// ([`Status::patience`]): the longest any peer's evidence may go unmoved before it is
-    /// suspected, then the range's expected election and one more round. `None` until both are
-    /// measured.
+    /// suspected, the judge's wait for a completion of its own, then the range's expected election
+    /// and one more round. `None` until both are measured. Since hyper-liveness 2b13b15 a judge
+    /// with nothing durable since a passed point asks no write of its own and judges on its next
+    /// completion, its stream's within its sending interval. Left out, the patience a deaf leader
+    /// stated was shorter than its step-down: on windows-11-arm leaders that heard no peer stopped
+    /// leading up to 7.7 s after their last heartbeat, freshness about 5 s and sending about 2 s
+    /// (CI run 39567831694), and the deaf leader's watch gave up at 5.3 s (run 39565012904).
     fn patience(&self, group: u128) -> Option<Duration> {
         let replica = self.kept(group).and_then(|k| self.owner.get(k.handle))?;
-        let evidence = self
+        let (mut evidence, mut sending) = (None::<Duration>, Duration::ZERO);
+        for report in self
             .remotes
             .iter()
-            .filter_map(|r| self.liveness.report(r.id)?.freshness)
-            .max()?;
+            .filter_map(|r| self.liveness.report(r.id))
+        {
+            if let Some(freshness) = report.freshness {
+                evidence = Some(evidence.map_or(freshness, |e| e.max(freshness)));
+            }
+            if let Some(interval) = report.sending {
+                sending = sending.max(interval);
+            }
+        }
+        let judging = sending.saturating_add(self.liveness.flush_mean().unwrap_or_default());
         let timing = replica.core().raft.timing()?;
         Some(
-            evidence
+            evidence?
+                .saturating_add(judging)
                 .saturating_add(timing.election)
                 .saturating_add(timing.round),
         )

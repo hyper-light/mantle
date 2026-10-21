@@ -1,7 +1,8 @@
 # kiln's translation of .github/workflows/ci.yml ("gates"): the same jobs and the same commands.
-# Only the Linux x86_64 legs run here. kiln has no macOS, Windows or ARM agents, so the
-# linux-aarch64, macos-aarch64, macos-x86_64, windows-x86_64 and windows-aarch64 legs of `gates`
-# and the linux-aarch64-1cpu leg of `constrained` stay on GitHub.
+# Only the Linux x86_64 legs run here: the linux-aarch64, macos-aarch64, macos-x86_64,
+# windows-x86_64 and windows-aarch64 legs of `gates` and the linux-aarch64-1cpu leg of
+# `constrained` stay on GitHub. kiln's bare-metal machines aren't all Linux (a Mac, a Windows PC),
+# so the bare-metal leg asks for `linux` too.
 #
 # Work lands on `dev` (CLAUDE.md, "Gates"), so pushes to dev run the gates as well as pushes to
 # main. GitHub's jobs set no timeout (its default is six hours), so the bounds below are kiln's
@@ -76,7 +77,7 @@ jobs:
   # where taskset pins a real machine's CPUs. TMPDIR is the job's directory on that host's disk.
   constrained:
     name: linux-x86_64-2cpu-busy
-    runs-on: [baremetal]
+    runs-on: [baremetal, linux]
     timeout-minutes: 180
     env:
       CARGO_INCREMENTAL: "0"

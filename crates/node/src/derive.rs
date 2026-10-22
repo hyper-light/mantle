@@ -4,10 +4,14 @@
 //! measured at the scale step (node.md §9.3). Each value carries its basis, which the node says
 //! at start.
 
+use std::mem::size_of;
 use std::time::Duration;
 
 use hyper_block::buf::Alignment;
 use hyper_log::{Config as LogConfig, Facts, LogError, Unfit};
+use hyper_raft::progress::Progress;
+use hyper_raft::proto::{Entry, Message};
+use hyper_raft::read::PendingRead;
 use hyper_rt::machine::bench::MIN_SAMPLES;
 use mantle_chunk::layout::{self as volume_layout, Geometry};
 use mantle_chunk::{ChunkError, Config as VolumeConfig, Limits, Reads, index};
@@ -19,7 +23,7 @@ use mantle_gateway::{get, put};
 use mantle_meta::record::{RecordError, Session};
 use mantle_meta::session::Rules;
 use mantle_meta::{key, wire};
-use mantle_range::Settings;
+use mantle_range::{Range, Settings};
 
 /// focal's election timeout and heartbeat interval in ticks (docs/design/node.md §2.4), which
 /// ranges keep though they elect by suspicion, which takes no ticks.
@@ -451,6 +455,119 @@ pub fn log_bytes(config: &LogConfig) -> Option<u64> {
         .checked_add(config.segment_bytes.checked_mul(LOG_SEGMENTS_HELD)?)
 }
 
+/// The writes a range's member keeps out at once on the node's log: one in each of hyper-log's
+/// pipeline frames (`GroupLog::depth`), which the shell takes `Ready`s ahead of persistence to.
+/// hyper-log keeps the count to itself; `tests/log_memory.rs` pins it to a live group's depth.
+pub const LOG_DEPTH: usize = 3;
+
+/// The heap a range's member takes as it opens, beside what it keeps for each member of its
+/// configuration: measured, 1,080 bytes under elections by suspicion, the node's, at one to ten
+/// members (`tests/range_memory.rs`).
+pub const MEMBER_BYTES: u64 = 1_080;
+
+/// The bytes of the context a node names a read by: the read's number (`Node`'s reads).
+const READ_CONTEXT_BYTES: u64 = 8;
+
+/// The most bytes a member of `range` holds beside its log and its engine, asked `reads` reads at
+/// once, its node's own and those its peers' exchanges bring: hyper-durable's holds (hyper-raft
+/// docs/durable.md §6), each at the bound hyper-raft's limits put on it (`mantle_range::limits`),
+/// a vector at twice what it holds as doubling grows it, four at least:
+/// - what it keeps of each member: its progress and its window of appends, its vote and its
+///   place in a quorum's count, as the core counts them (`ProgressTracker::resident_bytes`);
+/// - the entries not yet durable, at most `unstable_entries`; their bytes a leader's uncommitted
+///   proposals or a follower's window, and one entry past either (`mantle_range::ready_bytes`),
+///   at twice those bytes, the room the encoder leaves a proposal;
+/// - the entries kept ahead of a hole in its log, at most `unstable_entries`; their bytes the
+///   leader's window to it and one entry past, the most a leader sends ahead of what it heard:
+///   the core bounds their count and not their bytes;
+/// - the messages that wait to be taken, past `pending_messages` refused and one operation adding
+///   at most two a member and one a member for each place in its window: the queue, and one
+///   given with each write out and kept spare after, `LOG_DEPTH` of them;
+/// - the appends its window holds to each other member, of at most `entries_per_message` entries
+///   and the larger of a message's bytes and one entry's;
+/// - the reads, `reads` or `pending_reads` if fewer, in the leader's queue, its confirmed reads
+///   and the shell's, each with its context, its askers and its confirmations, a member each;
+/// - its store's (`hyper_durable::GroupStore`): each entry of its writes out copied in the log's
+///   form, its bytes and the shell's and a slot of hyper-log's entry, the slots thrice as an
+///   update is cut into a frame's parts, every entry in one write, so as many as are not yet
+///   durable; and the page it reads the log by, of the larger of a message's bytes and a drive's
+///   apply and one entry past, each entry counted at its fixed bytes in a message at least.
+///
+/// Pinned by `tests/range_memory.rs`, three members counted through the shapes that fill each
+/// over stores that hold nothing of their own, and `tests/range_log_memory.rs`, the same over the
+/// node's logs. What the core and the shell may hold is wider than what a range reaches: each
+/// queue's bound is what one `Ready` of the range's settings holds (`mantle_range::limits`).
+pub fn range_bytes(range: &Range, reads: usize) -> Option<u64> {
+    let s = &range.settings;
+    let limits = mantle_range::limits(range).ok()?;
+    let count = |n: usize| u64::try_from(n).ok();
+    let grown = |n: u64| n.checked_mul(2).map(|slots| slots.max(4));
+    let members = count(limits.members)?;
+    let inflight = count(s.max_inflight_msgs)?;
+    let id = count(size_of::<u64>())?;
+    let entry = count(size_of::<Entry>())?;
+    let each = count(
+        size_of::<(u64, Progress)>()
+            .checked_add(size_of::<(u64, bool)>())?
+            .checked_add(size_of::<u64>())?
+            .checked_add(size_of::<u64>().checked_mul(4)?)?,
+    )?
+    .checked_add(grown(inflight)?.checked_mul(count(size_of::<(u64, u64)>())?)?)?;
+    let tracker = members.checked_mul(each)?;
+    let ready = mantle_range::ready_bytes(s)?;
+    let window = inflight
+        .checked_mul(s.max_size_per_msg)?
+        .checked_add(s.max_entry_bytes)?;
+    let slots = grown(count(limits.unstable_entries)?)?.checked_mul(entry)?;
+    let unstable = slots.checked_add(ready.checked_mul(2)?)?;
+    let early = slots.checked_add(window)?;
+    let per_operation = members.checked_mul(inflight.checked_add(2)?)?;
+    let queue = grown(count(limits.pending_messages)?.checked_add(per_operation)?)?
+        .checked_mul(count(size_of::<Message>())?)?;
+    let queues = queue.checked_mul(count(LOG_DEPTH)?.checked_add(1)?)?;
+    let append = grown(count(limits.entries_per_message)?)?
+        .checked_mul(entry)?
+        .checked_add(s.max_size_per_msg.max(s.max_entry_bytes))?;
+    let appends = members
+        .checked_sub(1)?
+        .checked_mul(inflight)?
+        .checked_mul(append)?;
+    let asked = count(reads.min(limits.pending_reads))?;
+    let read_slots = count(
+        size_of::<PendingRead>()
+            .checked_add(size_of::<hyper_raft::ReadState>())?
+            .checked_add(size_of::<(u64, Vec<u8>)>())?,
+    )?;
+    let per_read = READ_CONTEXT_BYTES
+        .checked_mul(3)?
+        .checked_add(grown(members)?.checked_mul(id)?.checked_mul(2)?)?;
+    let read_bytes = grown(asked)?
+        .checked_mul(read_slots)?
+        .checked_add(asked.checked_mul(per_read)?)?;
+    let shell = count(hyper_durable::ENTRY_OVERHEAD)?;
+    let log_entry = count(size_of::<hyper_log::Entry>())?;
+    let writes = count(limits.unstable_entries)?
+        .checked_mul(shell.checked_add(log_entry.checked_mul(3)?)?)?
+        .checked_add(ready)?;
+    let page = s.max_size_per_msg.max(s.max_committed_size_per_ready);
+    let fetched = grown(page.checked_add(s.max_entry_bytes)?.checked_add(shell)?)?.checked_add(
+        grown(
+            page.checked_div(count(hyper_raft::wire::ENTRY_FIXED_BYTES)?)?
+                .checked_add(1)?,
+        )?
+        .checked_mul(count(size_of::<(u64, usize, usize)>())?)?,
+    )?;
+    MEMBER_BYTES
+        .checked_add(writes)?
+        .checked_add(fetched)?
+        .checked_add(tracker)?
+        .checked_add(unstable)?
+        .checked_add(early)?
+        .checked_add(queues)?
+        .checked_add(appends)?
+        .checked_add(read_bytes)
+}
+
 /// The threads a node starts beside its shard's, which runs on the process's own: its standard
 /// input's and output's, its log's and its log's device's; for each device holding volumes, its
 /// issuer and a worker for each read its profile measured at the device at once
@@ -715,6 +832,37 @@ mod tests {
         assert_eq!(threads(&[2], &[true]), Some(4 + 3 + 3));
         assert_eq!(threads(&[1, 4], &[true, false]), Some(4 + 2 + 5 + 3 + 2));
         assert_eq!(stacks(10), Some(20 << 20));
+    }
+
+    /// A range's member holds more for each read it is asked, up to the core's bound on reads,
+    /// and for each member its configuration names; a range whose settings this machine cannot
+    /// address has no bound.
+    #[test]
+    fn a_ranges_member_holds_its_queues_at_their_bounds() {
+        let (settings, rules) = cell(3).unwrap();
+        let range = |voters: u64| Range {
+            layer: mantle_meta::apply::Layer::Name,
+            rules,
+            boot: mantle_range::ConfState {
+                voters: (1..=voters).collect(),
+                ..mantle_range::ConfState::default()
+            },
+            settings,
+        };
+        let three = range(3);
+        let reads = mantle_range::limits(&three).unwrap().pending_reads;
+        let none = range_bytes(&three, 0).unwrap();
+        assert!(range_bytes(&three, 1).unwrap() > none);
+        assert_eq!(range_bytes(&three, usize::MAX), range_bytes(&three, reads));
+        assert!(range_bytes(&range(5), 0).unwrap() > none);
+        let unfit = Range {
+            settings: Settings {
+                max_entry_bytes: u64::MAX,
+                ..settings
+            },
+            ..three
+        };
+        assert_eq!(range_bytes(&unfit, 0), None);
     }
 
     /// The schemes a block may take grow with the domains a cell holds, each no wider than them:

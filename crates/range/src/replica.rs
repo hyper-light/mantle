@@ -111,7 +111,7 @@ fn check_settings<F: BlockFile + 'static>(
 /// bytes make of the least entry a range proposes (`mantle_meta::wire::least_entry_bytes`) and its
 /// term's empty first one, the core's own; and their bytes, each with its durable shell's.
 pub fn ready_held(settings: &Settings) -> Option<(u64, u64)> {
-    let ready = one_ready(settings)?;
+    let ready = ready_bytes(settings)?;
     let least = u64::try_from(mantle_meta::wire::least_entry_bytes().ok()?).ok()?;
     let entries = ready.checked_div(least)?.checked_add(1)?;
     let shell = u64::try_from(hyper_durable::ENTRY_OVERHEAD).ok()?;
@@ -121,7 +121,7 @@ pub fn ready_held(settings: &Settings) -> Option<(u64, u64)> {
 
 /// The bytes one ready of the range's settings holds: a leader's uncommitted proposals or the
 /// appends a follower has in flight, and one entry past either bound, which the core admits alone.
-fn one_ready(settings: &Settings) -> Option<u64> {
+pub fn ready_bytes(settings: &Settings) -> Option<u64> {
     let inflight = u64::try_from(settings.max_inflight_msgs)
         .ok()
         .and_then(|n| n.checked_mul(settings.max_size_per_msg));
@@ -143,7 +143,7 @@ fn one_ready(settings: &Settings) -> Option<u64> {
 ///   fixed bytes on the wire, at an entry's bytes in memory each, so that a member holds a
 ///   leader's message whole;
 /// - one write is out, which the shell raises to the store's depth.
-fn limits(range: &Range) -> Result<Limits, ReplicaError> {
+pub fn limits(range: &Range) -> Result<Limits, ReplicaError> {
     let s = &range.settings;
     let unfit = || ReplicaError::Config("the range's settings exceed what this machine addresses");
     let entry = usize::try_from(s.max_entry_bytes)
@@ -162,7 +162,7 @@ fn limits(range: &Range) -> Result<Limits, ReplicaError> {
         .checked_add(range.boot.learners.len())
         .and_then(|n| n.checked_add(1))
         .ok_or_else(unfit)?;
-    let memory = one_ready(s)
+    let memory = ready_bytes(s)
         .and_then(|bytes| usize::try_from(bytes).ok())
         .and_then(|bytes| bytes.checked_div(ENTRY_FIXED_BYTES))
         .and_then(|entries| entries.checked_mul(std::mem::size_of::<Entry>()))

@@ -249,8 +249,32 @@ measures the second, and derives the rest by these rules:
   extent its file may hold its allocator's count, its free or pending slot, its map bit and a map
   word); and the threads the node starts (`derive::threads`: standard input's and output's, the
   log's two, each device's issuer and a worker a read of its depth, each volume's writer, cleaner
-  and scrubber), each at Rust's default stack of 2 MiB, reserved whole. Each is pinned by a test
-  of the running code (`tests/volume_memory.rs`, `tests/floor_memory.rs`, `tests/threads.rs`).
+  and scrubber), each at Rust's default stack of 2 MiB, reserved whole; and each range's member
+  (`derive::range_bytes`, hyper-durable's holds at the bounds hyper-raft's limits put on each:
+  what it keeps of each member of its configuration; the entries not yet durable, a leader's
+  uncommitted proposals or a follower's window and one entry past, at twice their bytes for the
+  room mantle's encoder leaves a proposal; the entries kept ahead of a hole in its log; the
+  messages that wait, in the queue and one a write out; the appends its window holds to each
+  other member; the reads it is asked; its store's copies of its writes out in the log's form,
+  and the page it reads the log by). Each is pinned by a test of the running code
+  (`tests/volume_memory.rs`, `tests/floor_memory.rs`, `tests/threads.rs`, `tests/range_memory.rs`
+  over stores that hold nothing of their own, `tests/range_log_memory.rs` over the node's logs).
+  *Open:* a range's member is stated at the bounds hyper-raft puts on each queue, which mantle
+  states as one `Ready` of the range's settings (`mantle_range::limits`): 52.9 MB a member at the
+  floor, where three members held 11.0 MB at most through the shapes that fill each hold, and
+  70.7 MB with their three logs against 425.1 MB stated. Asked of hyper-raft's owner: the core's
+  and the shell's holds stated exactly as functions of their settings and pinned there; a byte
+  bound on the entries kept ahead of a hole, which the core counts and only a leader's window
+  bounds in bytes; each queue's bound stated apart, so an owner states its messages from its
+  turns and its reads from its asks; and the log's depth exported, which mantle keeps as
+  `derive::LOG_DEPTH` pinned to a live group. mantle's own encoder leaves a proposal up to twice
+  its bytes of room (`mantle_codec::Writer` grows by doubling), which the statement counts and a
+  length known before encoding would remove.
+  *Open:* the snapshot path holds whole images, the one class the floor does not bound yet: a
+  range's image is every row scanned and copied (`Stored::image`), encoded again for its message,
+  kept by the shell and by the core's log until it is installed, framed and copied again by the
+  node to send, and taken whole by a receiver that sizes its buffer to the length its sender
+  declares; installing decodes every row, and clearing a range scans every old one.
   *Open:* an engine's builders and its pools of pages, runs, spans and lists hold what was ever out
   at once, which its trunk's shape and its longest keys set, not its configuration: at the floor's
   pages, a range taking rows of the longest key and the largest value besides the shortest held

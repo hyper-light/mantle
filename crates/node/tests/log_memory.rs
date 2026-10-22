@@ -48,6 +48,8 @@ fn the_log_at_the_floor_holds_its_groups_retention() {
     let mut groups: Vec<_> = (1..=RANGES as u128 + 1)
         .map(|g| log.group(g).unwrap())
         .collect();
+    // The writes a group keeps out, which the node's floor counts a range's at.
+    assert_eq!(groups[0].depth(), derive::LOG_DEPTH);
     for group in &mut groups {
         let mut next = 1u64;
         for _ in 0..3 {

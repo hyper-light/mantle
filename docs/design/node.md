@@ -211,6 +211,51 @@ A configuration key the node does not know is refused, as the S3 layer's readers
 they do not know. `mantle status` prints every derived value with the input or constraint that
 bound it (audit §12.6).
 
+*Planned for `mantle serve` (2026-10-22; research 64).* `mantle node`, the process the tests drive,
+is told every number it runs with. `mantle serve` is told only what the first column above names,
+measures the second, and derives the rest by these rules:
+
+- **Every class at its floor.** The memory paragraph's floor is computed class by class from the
+  structures each fills, and the settings are the floor's: one object put and one got at a time, a
+  window of one block, one append out to a follower, an entry of the range's largest in each append and each
+  apply, one chunk ask to each node a block's width needs, the transport funding each peer a
+  receive chunk for each class beside the messages' room and each connection's reserve
+  (`bounds::buffering`). The node refuses to start, naming the class, when the floor exceeds the
+  stated ceiling or the limit the OS sets for the process (hyper-rt's `MemoryFacts::limit`:
+  cgroup v2's `memory.max`, a job's limit, `RLIMIT_AS`). A share above a class's floor waits for
+  its knee, where throughput stops growing as the share grows, measured at the scale step (§9.3):
+  until then it has no basis.
+- **Sessions are named by their owner and its run** (the node's id and its run record, §1.6): a
+  registration ends its owner's sessions of earlier runs, whose process has ended, since a
+  directory holds one process (§1.6's `LOCK`). An identity the directory pins then holds at most
+  one session a range, so `max_sessions` is the identities the configuration names, and no session
+  expires by time: a restart leaves none behind. A client registers under its id and its start.
+
+| Value (`mantle node`'s key) | Kind | Model and source |
+|---|---|---|
+| `id`, `certificate`, `key`, `authority` | stated | written by `mantle init` (§1.5); an id is 64 bits from the OS, as hyper-transport's `PeerId` holds, where §1.5 names 128 |
+| `quic`, `plane`, `domain`, `peer` lines | stated | the operator's addresses and failure domain; each peer by the certificate its authority issued and where it listens, a name resolved at each dial |
+| `voters`, `range` lines, `root_key` lines | stated | the cell's founders and founding groups, drawn with its authority, and the root key's generations (§1.5; encryption.md §2) |
+| `root.max_nodes`, `root.max_volumes` | stated | the cell's bounds (architecture §11) |
+| `volume` directory and bytes | stated | the devices that hold data |
+| `volume` depth, read bytes, read gap, first-write penalty | measured | the device's calibration (chunk-store.md §7), kept in its `profile` (§1.6) and measured again when the device no longer matches it (§1.7) |
+| `engine.page_size`, the log's block | measured | the device's write unit (hyper-block's `layout_block`), at least `MIN_PAGE` |
+| `chunk_bytes` | cited | `mantle_gateway::layout::CHUNK` |
+| `durability.*` | cited, stated | the device class's annual failure rate an hour (`mantle_ec::durability`'s disk and flash rates); repair in research 15's day until repair is built and measured; the target S3's 10⁻¹¹ unless stated |
+| `range.max_entry_bytes` | derived | `mantle_meta::wire::largest_entry_bytes` (replica.md §7) |
+| `range.election_tick`, `range.heartbeat_tick` | cited | focal's 10 and 2 (§2.4), checked though ranges elect by suspicion, which takes no ticks |
+| `range.max_size_per_msg`, `max_uncommitted_size`, `max_committed_size_per_ready`, `max_inflight_msgs` | derived | the floor's `Ready`: an entry of the range's largest each, one append out |
+| `rules.*` | derived | sessions as above; an owner's answers kept as its commands held at once (`command_asks`), each at the largest answer (`wire::largest_answer_bytes`, computed as `largest_entry_bytes` is) |
+| `log.*` | derived | `hyper_log::Config::derive` from the log's block, its largest entry, its groups (the ranges and the liveness stream's), the floor's cache and uncommitted bytes, its checkpoints, and the least file (raft-log.md §5 sizes the file by measured rates later) |
+| `engine.extent_pages`, `engine.max_extents` | derived | an extent of pages; extents bounded by the device's space |
+| `engine.memtable_bytes`, `engine.fanout`, `engine.leaf_entries` | derived | the least write buffer; a node's pivots and a leaf's entries filling a page at the layer's key and value bounds |
+| `transport_bytes` | derived | the transport's floor (`bounds::buffering` solved for its least funding) |
+| `volume.*` layout | derived | a segment holding one chunk record whole at the device's write unit, batches of one record, checksum blocks of the write unit (research 11 §5–§8) |
+| `gateway.window`, `gateway.objects`, `chunk_asks`, `command_asks`, `read_asks` | derived | the floor: a window of one block, one put and one get, a block's width of chunks, and the commands and reads those two hold at once |
+| `gateway.bucket_quota`, `gateway.scan_rows` | cited, derived | S3's 10,000 (research 05 §10.4); the rows one reply carries |
+| `gateway.handover_ns` | cited | HDFS's 60 s soft limit (research 22 §3.6), one of the bounds metadata.md §2 names for the same window, until the gateway measures research 22 §10.2's `D_b`: its retry budget for a step times a high quantile of one try, plus the clocks' offset; it bounds how long a leftover waits, not correctness |
+| `runtime.probe_budget_ms` | bound | hyper-rt's probes stop at Wilks' 59 samples (hyper-rt runtime.md §10.2), measured once by `mantle init` and kept as hyper-rt's record, reused while the machine's key matches; the budget bounds a starved host only: 59 wakes at the longest scheduling quantum a supported system grants (research 64) |
+
 ### 1.5 Identity and bootstrap
 
 **A node** is named by a random 128-bit ID drawn from the operating system at `mantle init`,
@@ -237,6 +282,21 @@ applies each layer's commands only in its own range (`WrongLayer` elsewhere), an
 the kill (`SIGKILL`) of the node leading the most of them (`crates/mantle/tests/node.rs`). The
 cell's root range holds its volume table (§6.6); the rest of its rows, the region's root range,
 and `mantle init` making them are still to build.
+
+*Planned for `mantle init` (2026-10-22).* `mantle init DIR` makes a cell of one in `DIR`: the
+cell's authority (`mantle_cert::authority`, its key owner-only), the root key's first generation (32
+bytes from the OS, owner-only), the founding ranges' groups (one each for the root range and the
+Bucket, Name, File and Block layers, drawn from the OS), the node's identity (a key and the
+certificate the authority signs it, `mantle_cert::node`), its devices measured into their
+profiles (§1.6), and its configuration of stated values (§1.4). `mantle init cell OUT --nodes N`
+makes a cell's founders at once, since each must pin every other's certificate before any serves
+(§3.6's directory holds a peer by the certificate its authority issued): the authority and the root
+key in `OUT/authority`, which the operator keeps, and a node directory for each founder naming the
+founders as the founding ranges' voters, one to a node, with each founder's certificate and where
+it listens; the operator moves each directory to its node. Clients of the native protocol are made
+by the same authority (`mantle init client`), and the founders pin those the operator names.
+Joining by invitation (below) replaces the static founders once the root range keeps the cell's
+membership.
 
 **Joining.** An existing node mints an invitation (`mantle invite`): a one-time token recorded
 in the root range, so the log decides whether it was used. `mantle init --join` sends the token
@@ -282,6 +342,16 @@ separates the format choices fixed at format from the runtime choices, and it is
 when the device's identity, firmware, file system or topology no longer match it. On a laptop
 the key file and the data share a disk, which the node reports.
 
+*As built, and planned (2026-10-22).* The node's directory holds its metadata today: the shared
+log (`log`), its run record (`run`, §2.4 item 4) and each range's engine store
+(`range-GROUP.store`), and each volume's device directory holds `mantle/LOCK` and `mantle/volume`.
+`mantle init` and `mantle serve` add to the node's directory its `config`, `identity/` (the node's
+key and certificate, the authority's certificate, each pinned peer's certificate), `keys/` (one
+root-key file a generation), hyper-rt's calibration record, and a `LOCK` of its own, held as the
+volumes' are, since its log and stores admit one process as a volume does; and to each device
+directory its `profile`. `meta/` on a metadata device, `DEVICE` and `map` wait for the storage
+graph (§1.7 step 3) and the cell map (architecture §4).
+
 ### 1.7 Starting, stopping, rolling back
 
 Startup runs in this order, each step owning what it starts:
@@ -318,6 +388,25 @@ leads, since a leader that only steps down can leave a rolling update with no le
 A stop that runs past its requests' deadlines stops the rest as a crash would. A stop for low
 battery (§1.8) is an orderly stop that also ends each open native upload at a checkpoint
 (gateway.md §2.1), so what power's return replays is the drained state and not a run.
+
+*Planned for `mantle serve` (2026-10-22; research 64).* **A start that fails** exits non-zero with
+a typed error naming the step and what failed in it, not a sysexits(3) code, which its own manual
+deprecates: the configuration (no such file, a line that does not parse, a key it does not know,
+a value out of its bounds), the identity (a file missing, a key that is not PKCS #8, a certificate
+its configured authority did not sign), a root key (not 32 bytes, readable by others than its
+owner), a directory or device another process holds (`LOCK`), a device whose profile no longer
+matches and cannot be measured again, the floor past the memory allowed (§1.4, naming the class),
+an address in use, and a store, log or volume that does not recover (naming its file). **An
+orderly stop** begins at SIGTERM or SIGINT (hyper-rt's signals; Ctrl-C, a console's close and
+shutdown on Windows), as a container's stop sends TERM to its first process and KILL once the grace
+period, 30 s by default, passes (research 64): the node answers new object exchanges `SlowDown`;
+lets those in flight end within the stop's bound; transfers each range it leads to a voter whose
+log matches its own (Raft §3.10, hyper-durable's `Replica::transfer`), and waits until that voter
+shows it leads, or for an election timeout, after which the range elects as after a crash; closes
+its connections and answers their late packets for three probe timeouts (RFC 9000 §10.2: a node
+keeps the socket its peers know); then closes its logs and volumes and exits 0. The stop's bound
+is stated beside the orchestrator's grace period; a second signal, or the bound passing, ends the
+process as a crash would, which loses nothing acknowledged.
 
 **Versions.** Every on-disk format already names its version (a volume's superblock, a log
 segment's header, an entry's format byte in `mantle_meta::wire`), and a connection's first
@@ -1955,6 +2044,10 @@ range's workload (12 §6.6).
 
 ## 11. Open
 
+- **Each class's share above its floor** (§1.4): the knee where a class's throughput stops growing
+  as its share grows, measured at the scale step, decides what a budget above the floor buys.
+- **A peer known by its name under the authority** rather than by its pinned certificate (§1.5,
+  §3.6), once the root range keeps the cell's membership and a join records each new identity.
 - **Cores among pools.** Three pools sized to the granted cores oversubscribe under full load;
   whether dividing cores by measured demand does better is measured once phase A runs.
 - **Quiescing idle ranges**, and the protocol that wakes one without weakening its election or

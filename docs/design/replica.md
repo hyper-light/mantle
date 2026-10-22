@@ -596,4 +596,6 @@ change. Membership changes are rare, so this costs one image each.
   by ReadIndex rounds (§3) until then.
 - The session lifetime and bounds, sessions a range holds and the answers and bytes of
   answers one keeps, from how long gateways go between commands to a range and how many
-  they keep in flight.
+  they keep in flight. Planned (node.md §1.4, 2026-10-22): a registration names its owner and
+  run, and ends its owner's sessions of earlier runs, so the sessions a range holds are bounded
+  by the identities the cell names and none expires by time.

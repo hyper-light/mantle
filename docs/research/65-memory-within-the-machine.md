@@ -237,3 +237,28 @@ Each comes with its tests (`spare_loan_memory_holds_no_more_than_the_loans_had_o
 `loans_that_come_and_go_reuse_the_slots_of_memory_given_back`, and the 40,000-step
 `the_fields_the_slot_table_and_the_hollow_list_hold_through_every_step`); the hollow one fails on a
 cache whose reads count the slot table again. The kernel's share is measured on top of them (E1c).
+
+## 6. Memory the allocator keeps
+
+E1c (`diag-follow` on the follow with §5's fixes, never merged; `diag-runs/n1000000000-e1c-1-m_e1c`)
+held the page cache's pages through the fill: at its end 73.2 GiB live, 1.6 dead, none spare, where
+E1b's had 7.9 GiB live and 62 spare. But at rotation 1,434 the budget fell from 82.8 GiB to 49.3 in
+five seconds, and its own account says where the memory went (GiB):
+
+| rotation | s | budget | cache | room read | resident | outside the account |
+|---|---|---|---|---|---|---|
+| 1428 | 312 | 82.8 | 77.7 | 4.0 | 83.2 | 0.62 |
+| 1434 | 313 | 66.0 | 61.7 | 3.6 | 82.9 | 16.62 |
+| 1446 | 316 | 53.9 | 49.1 | 3.7 | 83.4 | 28.98 |
+| 1452 | 318 | 49.3 | 43.8 | 4.5 | 83.1 | 34.37 |
+
+The cache gave up 34 GiB of its chunks and the process's resident memory did not move: the memory
+went back to glibc, not to the OS. glibc's malloc maps each block of at least its mmap threshold
+and unmaps it when freed, but each mapped block up to 32 MiB that is freed raises the threshold to
+its size, so later blocks of that size come from its heap and stay in it once freed (mallopt(3),
+`M_MMAP_THRESHOLD`); the cache's loan buffers, whole huge pages since §5, are such blocks. The room
+the follow read stayed at 4 GiB, so each look lowered the budget to what the shard then held, and
+the cache shrank to give memory that never left the process. The unlanded branch memlim measured
+the same at 100M, 1.3-2.8 GiB of freed record lists held in glibc's arenas (its research/64 §6),
+and kept the threshold at its initial value, which mallopt(3) says turns the adjustment off
+(`port::mmap::return_freed_blocks`), called at the start of the node's process and the bench.

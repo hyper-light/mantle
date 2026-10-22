@@ -300,10 +300,12 @@ measures the second, and derives the rest by these rules:
   payload, run, filter and lists, and its two tries, at most a level and a label a key byte
   (`branch::builder_bytes`, `fst::trie::builder_bytes`); a cursor an extent, four pages and its
   reads in flight (`branch::cursor_bytes`); the store's pools at most each kind's peak
-  (`shard_db::pooled_bytes`); the branches' metadata as held (`ShardDb::memory`, exact against
+  (`shard_db::pooled_bytes`); the branches' metadata, the trunk's pivots and the branches'
+  records as held (`ShardDb::memory`: buffers' capacities and records, the tries' exact against
   the counting allocator). An engine at the floor's pages held no more than its configured bytes,
   its pools at their peaks and that metadata (`tests/engine_memory.rs`): at 8-byte keys 17.4 MB
-  for 1.28 million rows, the pools' peaks 64 extents, 186 pages and three builders' lists; at
+  for 1.28 million rows, 6.8 MB of it metadata (0.5 MB pivots), the pools' peaks 64 extents, 186
+  pages and three builders' lists; at
   2,132-byte keys 189.7 MB for 32,000 rows, 96% of it pooled extents and pages at peaks of 1,480
   and 4,437, scans opening a source for each of the trunk's in-flight bundles. Bounding those
   bundles by rule bounds every pool. Resident metadata per extent of data: 21% at 8-byte keys

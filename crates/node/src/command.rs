@@ -37,6 +37,8 @@ pub enum Status {
     /// The entry was applied, and its answers are larger than a reply carries: they are kept in
     /// the commands' sessions, and asking the same serials again returns them.
     TooLarge,
+    /// The read asks for rows of another layer than the range holds (`crate::read::Query::layer`).
+    WrongLayer,
 }
 
 impl Status {
@@ -48,6 +50,7 @@ impl Status {
             Self::Refused => 3,
             Self::Malformed => 4,
             Self::TooLarge => 5,
+            Self::WrongLayer => 6,
         }
     }
 
@@ -59,6 +62,7 @@ impl Status {
             Self::Refused,
             Self::Malformed,
             Self::TooLarge,
+            Self::WrongLayer,
         ]
         .into_iter()
         .find(|s| s.code() == code)
@@ -181,6 +185,7 @@ mod tests {
             Status::Refused,
             Status::Malformed,
             Status::TooLarge,
+            Status::WrongLayer,
         ] {
             assert_eq!(
                 read_reply_head(&reply_head(status, 3, 7)),
@@ -192,8 +197,8 @@ mod tests {
             );
         }
         let mut bad = reply_head(Status::Answered, 0, 0);
-        bad[0] = 6;
-        assert_eq!(read_reply_head(&bad), Err(CommandError::Status(6)));
+        bad[0] = 7;
+        assert_eq!(read_reply_head(&bad), Err(CommandError::Status(7)));
     }
 
     #[test]

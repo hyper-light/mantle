@@ -487,6 +487,49 @@ pub fn decode_reverse(k: &[u8]) -> Option<(u128, u128)> {
     Some((volume, block))
 }
 
+/// After `DATA` in the root range: its census, a node's row, or a volume's.
+const CENSUS: u8 = 0;
+const MEMBER: u8 = 1;
+const VOLUME: u8 = 2;
+
+/// The key of the root range's census: how many nodes and volumes its table holds.
+pub fn census() -> Vec<u8> {
+    vec![DATA, CENSUS]
+}
+
+/// The key of node `node`'s row in the root range's table.
+pub fn member(node: u64) -> Vec<u8> {
+    let mut out = vec![DATA, MEMBER];
+    out.extend_from_slice(&node.to_be_bytes());
+    out
+}
+
+/// The key of volume `volume`'s row in the root range's table: volumes sort by id.
+pub fn volume(volume: u128) -> Vec<u8> {
+    let mut out = vec![DATA, VOLUME];
+    out.extend_from_slice(&volume.to_be_bytes());
+    out
+}
+
+/// The first key of the volume rows after `after`, or of all of them, and a key past the last.
+pub fn volume_rows(after: Option<u128>) -> (Vec<u8>, Vec<u8>) {
+    let from = match after {
+        Some(after) => {
+            let mut from = volume(after);
+            from.push(0);
+            from
+        }
+        None => vec![DATA, VOLUME],
+    };
+    (from, vec![DATA, VOLUME.saturating_add(1)])
+}
+
+/// The volume a volume row's key names.
+pub fn decode_volume(k: &[u8]) -> Option<u128> {
+    let rest = k.strip_prefix(&[DATA, VOLUME])?;
+    Some(u128::from_be_bytes(rest.try_into().ok()?))
+}
+
 /// The key of a bucket's row in the Bucket layer.
 pub fn bucket(name: &str) -> Vec<u8> {
     let mut out = Vec::new();

@@ -19,9 +19,10 @@
 //!   and a spare under an identity never used replaces it (`replace` on the nodes' input, the
 //!   leader's `replaced` line); then as many original voters are killed as leave a bare quorum,
 //!   the spare in it. The clients' history through both is linearizable. On three voters and five.
-//! - A cell hosting a range of each layer, Bucket, Name, File and Block, on every node, voters one
-//!   to a node: each range elects and answers a session, and a Name command is applied by the
-//!   Name range and answered `WrongLayer` by the others; the node leading the most ranges is
+//! - A cell hosting a range of each layer, the root range and the Bucket, Name, File and Block
+//!   ranges, on every node, voters one to a node: each range elects and answers a session, a Name
+//!   command is applied by the Name range and answered `WrongLayer` by the others, and the root
+//!   range reads its volume table and refuses a read of another layer's rows; the node leading the most ranges is
 //!   killed (SIGKILL), each range serves on, and the node started again catches up on each.
 //! - A storage cell, each node keeping a chunk volume: a gateway, a client in the gateway's role,
 //!   puts chunks round the nodes over QUIC, one of each length on each, and one node is killed
@@ -73,9 +74,12 @@ use mantle_chunk::ChunkKey;
 use mantle_meta::wire::{Answer, Entry};
 use mantle_node::chunk::Status;
 use mantle_node::classes::{Bounds, Role};
+use mantle_node::client::ClientError;
 use mantle_node::client::{Client, ClientSettings};
+use mantle_node::command::Status as CommandStatus;
 use mantle_node::directory::{Peer, node_name};
 use mantle_node::node::ChunkOutcome;
+use mantle_node::read::{Query, Read};
 
 #[allow(dead_code)]
 #[path = "../../node/tests/support/history.rs"]
@@ -92,7 +96,8 @@ use relay::Relay;
 const NODE: &str = env!("CARGO_BIN_EXE_mantle");
 /// The Name range's group, the range most tests write through.
 const GROUP: u128 = 0x0072_616e_6765;
-/// The groups of the cell's Bucket, File and Block ranges, where a cell hosts every layer.
+/// The groups of the cell's root, Bucket, File and Block ranges, where a cell hosts every layer.
+const ROOT: u128 = 0x726f_6f74;
 const BUCKETS: u128 = 0x6275_636b_6574;
 const FILES: u128 = 0x6669_6c65;
 const BLOCKS: u128 = 0x62_6c6f_636b;
@@ -100,6 +105,7 @@ const BLOCKS: u128 = 0x62_6c6f_636b;
 const NAME_RANGE: &[(u128, &str)] = &[(GROUP, "name")];
 /// A range of each layer, as a cell of node.md §1.5 hosts them.
 const EVERY_LAYER: &[(u128, &str)] = &[
+    (ROOT, "root"),
     (BUCKETS, "bucket"),
     (GROUP, "name"),
     (FILES, "file"),
@@ -1170,6 +1176,25 @@ impl Cell {
         thread.join().unwrap()
     }
 
+    /// What `reads` read, each a query of a range's group, which the writer client asks in turn,
+    /// knowing every node and told where the running ones listen.
+    fn read(&mut self, reads: Vec<(u128, Query)>) -> Vec<Result<Read, ClientError>> {
+        self.progress.remove(&CLIENT);
+        self.clients.remove(&CLIENT);
+        let done = reads.len() as u64;
+        let (settings, bound) = (self.pki.client_settings(CLIENT), self.bound_quic());
+        let tell = self.tell.clone();
+        let thread = std::thread::spawn(move || reader(settings, bound, reads, tell));
+        self.until(|c| {
+            if c.progress.get(&CLIENT).is_some_and(|d| *d >= done) {
+                Some(())
+            } else {
+                None
+            }
+        });
+        thread.join().unwrap()
+    }
+
     /// The answers to `asks`, each an entry to a range's group, which the writer client asks in
     /// turn, knowing every node and told where the running ones listen.
     fn asked(&mut self, asks: Vec<(u128, Entry)>) -> Vec<Vec<Answer>> {
@@ -1277,6 +1302,31 @@ fn asker(
                 let _ = tell.send(Heard::Told(Told::Progress(id, done, client.patience())));
             }
             answered
+        })
+        .unwrap()
+}
+
+/// The reader: `reads` in turn through a client of its own, each a query of a range's group with
+/// no deadline of its own, each answer or refusal kept and each told as progress.
+fn reader(
+    settings: ClientSettings,
+    bound: Vec<(u64, SocketAddr)>,
+    reads: Vec<(u128, Query)>,
+    tell: Sender<Heard>,
+) -> Vec<Result<Read, ClientError>> {
+    let id = settings.id;
+    client_runtime(settings.nodes.len() + 1)
+        .block_on(async move {
+            let mut client = Client::open(settings).await.unwrap();
+            for (node, quic) in bound {
+                client.learn(node, quic).unwrap();
+            }
+            let mut read = Vec::with_capacity(reads.len());
+            for (done, (group, query)) in (1..).zip(reads) {
+                read.push(client.read(group, &query, u64::MAX).await);
+                let _ = tell.send(Heard::Told(Told::Progress(id, done, client.patience())));
+            }
+            read
         })
         .unwrap()
 }
@@ -1746,6 +1796,28 @@ fn a_cell_hosts_a_range_of_each_layer_one_voter_a_node_and_each_serves_through_a
         };
         assert_eq!(answers, &vec![want], "the {layer} range");
     }
+    // The root range's volume table, empty in a cell no node of which keeps a volume, and a read
+    // of the Name layer's rows asked of it, refused.
+    let read = cell.read(vec![
+        (ROOT, Query::Volumes { after: None }),
+        (
+            ROOT,
+            Query::Current {
+                bucket: "b".into(),
+                key: "k".into(),
+            },
+        ),
+    ]);
+    assert!(
+        matches!(
+            read.as_slice(),
+            [
+                Ok(Read::Volumes { volumes, more: false }),
+                Err(ClientError::Status(CommandStatus::WrongLayer)),
+            ] if volumes.is_empty()
+        ),
+        "{read:?}"
+    );
     // The node leading the most ranges killed: each range has a quorum of its voters, one to a
     // node, and serves on; started again, the node catches up on each.
     let mut leaders: BTreeMap<u64, usize> = BTreeMap::new();

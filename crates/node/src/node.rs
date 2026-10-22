@@ -46,6 +46,7 @@ use hyper_transport::{
     Classes, Config, Endpoint, Event, ExchangeId, Fixed, PeerId, Progress, Refusal,
 };
 use mantle_chunk::ChunkKey;
+use mantle_meta::apply::Layer;
 use mantle_meta::engine::Engine;
 use mantle_meta::wire::Answer;
 use mantle_range::membership::{Next, Replacement};
@@ -368,6 +369,8 @@ pub struct Received {
 /// A range as the node keeps it.
 struct Kept {
     group: u128,
+    /// The layer whose rows the range holds, which a read must ask of.
+    layer: Layer,
     handle: Handle,
     max_entry_bytes: u64,
     /// The replica's latest wake, held in [`Node::deadlines`].
@@ -684,6 +687,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             owner.schedule(handle);
             ranges.push(Kept {
                 group: hosted.group,
+                layer: hosted.range.layer,
                 handle,
                 max_entry_bytes: hosted.range.settings.max_entry_bytes,
                 wake: None,
@@ -1957,9 +1961,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         let id = self.next_read;
         self.next_read = id.wrapping_add(1);
-        let Some(handle) = self.kept(group).map(|k| k.handle) else {
+        let Some((handle, layer)) = self.kept(group).map(|k| (k.handle, k.layer)) else {
             return self.answer_status(exchange, command::Status::NoRange, 0);
         };
+        if query.layer() != layer {
+            return self.answer_status(exchange, command::Status::WrongLayer, self.id);
+        }
         let asked = self
             .owner
             .get_mut(handle)
@@ -2004,10 +2011,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let Some(handle) = self.kept(group).map(|k| k.handle) else {
                 continue;
             };
+            // An answer fills at most what a reply's body carries, past its head.
+            let room = NodeClasses::frame_bound(classes::Class::Request)
+                .saturating_sub(u64::try_from(command::REPLY_HEAD_BYTES).unwrap_or(u64::MAX));
+            let room = usize::try_from(room).unwrap_or(usize::MAX);
             let read = self
                 .owner
                 .get_mut(handle)
-                .map(|shell| reading.query.answer(shell.machine_mut().engine_mut()));
+                .map(|shell| reading.query.answer(shell.machine_mut().engine_mut(), room));
             let body = match read {
                 Some(Ok(read)) => read.encode().ok(),
                 _ => None,

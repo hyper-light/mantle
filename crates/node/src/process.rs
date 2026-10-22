@@ -38,8 +38,8 @@
 //! closing ends it as a stop.
 //!
 //! The ranges it hosts are the `range` lines', each `range = GROUP LAYER`: a group of the voters
-//! the file names, holding the rows of one layer (`bucket`, `name`, `file` or `block`), at most
-//! one of each, since a cell's first ranges each span their layer's whole key space (node.md
+//! the file names, holding the rows of one layer (`root`, the cell's volume table; `bucket`,
+//! `name`, `file` or `block`), at most one of each, since a cell's first ranges each span their layer's whole key space (node.md
 //! §1.5) and splitting them is the range directory's. Each keeps its rows in an engine store of
 //! its own in the node's directory, `range-GROUP.store`: founded on first start, opened at its
 //! last checkpoint after, the log replayed past it. A node whose id the voters do not name is a
@@ -306,7 +306,8 @@ fn ranges(lines: &Lines) -> Result<Vec<(u128, Layer)>, ProcessError> {
             "name" => Layer::Name,
             "file" => Layer::File,
             "block" => Layer::Block,
-            _ => return Err(bad("a layer: bucket, name, file or block")),
+            "root" => Layer::Root,
+            _ => return Err(bad("a layer: root, bucket, name, file or block")),
         };
         if ranges.iter().any(|(g, _)| *g == group) {
             return Err(bad("a group another range has"));
@@ -723,7 +724,8 @@ mod tests {
         // A layer no range holds, a group stated twice, a second range of a layer whose first
         // spans every key, and a line of the wrong shape: each refused at its line.
         for (text, line) in [
-            ("range = 1 root\n", 1),
+            ("range = 1 trunk\n", 1),
+            ("range = 1 root\nrange = 2 root\n", 2),
             ("range = 1 name\nrange = 1 file\n", 2),
             ("range = 1 file\nrange = 2 file\n", 2),
             ("range = 1\n", 1),

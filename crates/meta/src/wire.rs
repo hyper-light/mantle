@@ -10,7 +10,7 @@ use crate::record::{
     self, BlockHeader, Checksum, ChunkPlace, DefaultRetention, Extent, GateState, Part,
     RecordError, Referrer, Upload, Verdict, Version, Versioning,
 };
-use crate::{block, bucket, file, name};
+use crate::{block, bucket, file, name, root};
 
 const FORMAT: u8 = 5;
 
@@ -44,6 +44,7 @@ pub enum Command {
     Name(Box<name::Command>),
     File(file::Command),
     Block(block::Command),
+    Root(root::Command),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +68,7 @@ pub enum Answer {
     Name(name::Outcome),
     File(file::Outcome),
     Block(block::Outcome),
+    Root(root::Outcome),
 }
 
 fn too_large(len: usize) -> RecordError {
@@ -180,6 +182,14 @@ impl Answer {
                     block::Outcome::Expired => w.u8(8),
                 }
             }
+            Answer::Root(o) => {
+                w.u8(9);
+                w.u8(match o {
+                    root::Outcome::Enlisted => 0,
+                    root::Outcome::Conflict => 1,
+                    root::Outcome::Full => 2,
+                });
+            }
         }
         Ok(w.into_vec())
     }
@@ -219,6 +229,12 @@ impl Answer {
                     6 => block::Outcome::Settled,
                     7 => block::Outcome::Released,
                     8 => block::Outcome::Expired,
+                    _ => return None,
+                }),
+                9 => Answer::Root(match r.u8()? {
+                    0 => root::Outcome::Enlisted,
+                    1 => root::Outcome::Conflict,
+                    2 => root::Outcome::Full,
                     _ => return None,
                 }),
                 _ => return None,
@@ -342,6 +358,19 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
                 }
             }
         }
+        Command::Root(root::Command::Enlist(e)) => {
+            w.u8(5);
+            w.u8(0);
+            w.u64(e.node);
+            record::put_str(w, &e.domain)?;
+            record::put_len(w, e.volumes.len())?;
+            for (volume, bytes) in &e.volumes {
+                w.u128(*volume);
+                w.u64(*bytes);
+            }
+            w.u32(e.max_nodes);
+            w.u32(e.max_volumes);
+        }
     }
     Ok(())
 }
@@ -435,6 +464,25 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
                 block: r.u128()?,
                 deadline_ns: r.u64()?,
             },
+            _ => return None,
+        }),
+        5 => Command::Root(match r.u8()? {
+            0 => {
+                let node = r.u64()?;
+                let domain = record::take_str(r)?;
+                let count = bounded(r, 24)?;
+                let mut volumes = crate::record::reserved(count)?;
+                for _ in 0..count {
+                    volumes.push((r.u128()?, r.u64()?));
+                }
+                root::Command::Enlist(root::Enlist {
+                    node,
+                    domain,
+                    volumes,
+                    max_nodes: r.u32()?,
+                    max_volumes: r.u32()?,
+                })
+            }
             _ => return None,
         }),
         _ => return None,
@@ -1899,6 +1947,20 @@ mod tests {
                 block: 5,
                 deadline_ns: u64::MAX,
             }),
+            Command::Root(root::Command::Enlist(root::Enlist {
+                node: 3,
+                domain: "rack-a".into(),
+                volumes: vec![(1, 1 << 30), (u128::MAX, u64::MAX)],
+                max_nodes: 3,
+                max_volumes: u32::MAX,
+            })),
+            Command::Root(root::Command::Enlist(root::Enlist {
+                node: u64::MAX,
+                domain: String::new(),
+                volumes: Vec::new(),
+                max_nodes: 0,
+                max_volumes: 0,
+            })),
         ]
     }
 
@@ -2088,6 +2150,14 @@ mod tests {
                 block::Outcome::NoSuchBlock,
             ]
             .map(Answer::Block),
+        );
+        answers.extend(
+            [
+                root::Outcome::Enlisted,
+                root::Outcome::Conflict,
+                root::Outcome::Full,
+            ]
+            .map(Answer::Root),
         );
         for answer in answers {
             let bytes = answer.encode().unwrap();

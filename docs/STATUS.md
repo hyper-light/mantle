@@ -239,6 +239,14 @@ merge ranges while buckets are created and deleted and files are handed over and
 writers and sweeps that learn of both late and merge drivers that stop, resume, give up and
 send late, and each rule removed on purpose fails one of them or a test of its own.
 
+The cell's root range keeps the volume table ([node design §6.6](design/node.md)): each node's
+failure domain and each volume's node and bytes, enlisted by one command that records what the
+table does not hold, refuses a node or volume held otherwise as a conflict that changes nothing,
+and refuses past the cell's stated bounds; read a page at a time, as many volumes as a reply
+carries. A cell of three `mantle node` processes hosts it beside a range of each layer.
+Remaining: nodes enlisting themselves, placement from the table, and a node's own commands to
+ranges.
+
 **Gateway object path** (`mantle-gateway`, [design](design/gateway.md)). A PUT or an upload
 part as a state machine that names each request and does no I/O: the body sealed in 64 KiB
 segments as it streams, cut into blocks of whole segments sized to the scheme's 8 MiB chunks,

@@ -511,6 +511,26 @@ pub struct ChunkPlace {
     pub key: mantle_chunk::ChunkKey,
 }
 
+/// A node of the cell, in the root range's table: its failure domain (docs/design/node.md §5.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Member {
+    pub domain: String,
+}
+
+/// A volume of the cell, in the root range's table: the node that holds it and its bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeRow {
+    pub node: u64,
+    pub bytes: u64,
+}
+
+/// How many nodes and volumes the root range's table holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Census {
+    pub nodes: u32,
+    pub volumes: u32,
+}
+
 /// A reverse row: which chunk of its block the volume in its key holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reverse {
@@ -949,6 +969,66 @@ impl Gate {
             })
         })();
         decoded(gate, &r, "gate")
+    }
+}
+
+impl Member {
+    pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
+        let mut w = start();
+        put_str(&mut w, &self.domain)?;
+        Ok(finish(w))
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "member")?;
+        let member = take_str(&mut r).map(|domain| Self { domain });
+        decoded(member, &r, "member")
+    }
+}
+
+impl VolumeRow {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = start();
+        w.u64(self.node);
+        w.u64(self.bytes);
+        finish(w)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "volume")?;
+        decoded(
+            (|| {
+                Some(Self {
+                    node: r.u64()?,
+                    bytes: r.u64()?,
+                })
+            })(),
+            &r,
+            "volume",
+        )
+    }
+}
+
+impl Census {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = start();
+        w.u32(self.nodes);
+        w.u32(self.volumes);
+        finish(w)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "census")?;
+        decoded(
+            (|| {
+                Some(Self {
+                    nodes: r.u32()?,
+                    volumes: r.u32()?,
+                })
+            })(),
+            &r,
+            "census",
+        )
     }
 }
 

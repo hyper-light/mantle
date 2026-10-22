@@ -440,6 +440,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/meta/src/collector.rs` `GRACE_NS` | cited | GFS keeps deleted files for three days (GGL03 §4.4, docs/research/22 §1.1). A recovery-point policy, not a safety bound (22 §10.4). |
 | `crates/meta/src/file.rs` `MAX_EXTENTS` | external | The S3 limit of 10,000 parts per upload (docs/research/05 §4.1). Audit §12.6 says single-PUT block manifests reuse this count and need their own derived fanout limit. |
 | `crates/meta/src/key.rs` `ATTEMPT` | format | Marker byte `a` after `LOCAL` for Bucket-range create/delete attempts. |
+| `crates/meta/src/key.rs` `CENSUS` | format | Root-range row tag 0 after `DATA` for its census, sorting before the node and volume rows (docs/design/node.md §5.6). |
 | `crates/meta/src/key.rs` `CHUNK` | format | Block-layer row tag 2 for a block's chunk places. |
 | `crates/meta/src/key.rs` `CLOCK` | format | Marker byte `c` after `LOCAL` for the range clock row. |
 | `crates/meta/src/key.rs` `CONFIGURATION` | format | Marker byte `r` after `LOCAL` for the group configuration row. |
@@ -449,6 +450,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/meta/src/key.rs` `FLOOR` | format | Marker byte `f` after `LOCAL` for the Name range's gate floor. |
 | `crates/meta/src/key.rs` `GATE` | format | Marker byte `g` after `LOCAL` for gate rows. |
 | `crates/meta/src/key.rs` `HEADER` | format | File-layer row tag 1 for a file's header. |
+| `crates/meta/src/key.rs` `MEMBER` | format | Root-range row tag 1 after `DATA` for a node's row: its failure domain. |
 | `crates/meta/src/key.rs` `NAMED` | format | File-layer row tag 4 for the row saying a file names a block, after the extents' tag so a scan of extents stops before it. |
 | `crates/meta/src/key.rs` `LINEAGE` | format | Marker byte `l` after `LOCAL` for the Name range's lineage row. |
 | `crates/meta/src/key.rs` `LOCAL` | format | Key-space prefix byte 0x00 for a range's own rows (docs/design/metadata.md §1). |
@@ -465,12 +467,14 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/meta/src/key.rs` `UNSETTLED` | format | Marker byte `u` after `LOCAL` for files and blocks whose handover is unsettled. |
 | `crates/meta/src/key.rs` `UPLOAD` | format | Name-row tag 3: upload rows, sorting after versions. |
 | `crates/meta/src/key.rs` `VERSION` | format | Name-row tag 2: version rows, sorting after the null pointer. |
+| `crates/meta/src/key.rs` `VOLUME` | format | Root-range row tag 2 after `DATA` for a volume's row, keyed by the volume's id so the table reads in id order. |
 | `crates/meta/src/name.rs` `MAX_PART` | external | The S3 maximum part size of 5 GiB (docs/research/05 §4.1, AWS S3 multipart limits). |
 | `crates/meta/src/name.rs` `MAX_PART_NUMBER` | external | S3 part numbers run from 1 to 10,000 (docs/research/05 §4.3, AWS UploadPart reference). |
 | `crates/meta/src/name.rs` `MIN_PART` | external | The S3 minimum part size of 5 MiB, with no minimum for the last part (docs/research/05 §4.1, AWS S3 multipart limits). |
 | `crates/meta/src/record.rs` `DAY_MS` | derived | Unit conversion: 86,400 s × 1,000 ms per day, for S3 Object Lock retention days and years (docs/research/18 §2.4, §2.6). |
 | `crates/meta/src/record.rs` `FORMAT` | format | Version byte 6 that begins every row value written by this code; 6 since a file keeps a row for each block it names, 5 since a part's row records its file's handover deadline, which the completion adopting it gives the part's mark without reading it, 4 since a mark records its write's handover deadline and a queue row whether its ID names a file, 3 since a file's mark records how the range took it (a version's order, a part, an adopting composite, or refused), 2 since a version records its completion's part listing. |
 | `crates/meta/src/record.rs` `LISTING` | external | Bytes of a completion's listing digest: SHA-256's 256-bit output (FIPS 180-4 §1). |
+| `crates/meta/src/root.rs` `MAX_DOMAIN` | bound | The longest failure domain a node names, 255 bytes: a label such as a rack's or a zone's name, which DNS bounds at 63 bytes a label and 255 a name (RFC 1035 §2.3.4); an enlistment past it is a conflict. |
 | `crates/meta/src/wire.rs` `MAX_BUCKET` | external | A bucket name of at most 63 characters (research/05 §10.3). |
 | `crates/meta/src/wire.rs` `MAX_KEY` | external | An object key of at most 1,024 bytes (research/05 §10.1). |
 | `crates/meta/src/wire.rs` `MAX_HEADERS` | external | A request's headers within 8 KB (research/05 §10.2), which bound its preconditions. |
@@ -500,7 +504,10 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/node/src/node.rs` `LIVENESS_GROUP` | format | The log group of the liveness stream's own writes, the top of the group space: group 0 holds hyper-log's own key records, and a range named either is refused at open. |
 | `crates/node/src/node.rs` `PIECE` | derived | hyper-transport's `RECEIVE_CHUNK`: a snapshot's or a chunk's body is read a receive chunk at a time. |
 | `crates/node/src/node.rs` `PLANE_RAFT` | format | A plane message's first byte for a range's Raft frame, apart from hyper-liveness's `KIND` for a heartbeat. |
-| `crates/node/src/read.rs` `CURRENT` | format | A read's kind: the current version of a key, the one query a range answers yet. |
+| `crates/node/src/read.rs` `CURRENT` | format | A read's kind: the current version of a key, of a Name range. |
+| `crates/node/src/read.rs` `PAGE_HEAD_BYTES` | format | A page of the volume table's bytes before its volumes: whether more follow, one byte, and the count, a u32. |
+| `crates/node/src/read.rs` `PLACED_BYTES` | derived | A volume in a page at the longest domain: its id (u128), node (u64) and bytes (u64), its domain's length (u32) and `MAX_DOMAIN` bytes; a page counts each at it so it fits whatever their domains. |
+| `crates/node/src/read.rs` `VOLUMES` | format | A read's kind: a page of the volume table, of the root range. |
 | `crates/range/src/conf.rs` `FORMAT` | format | Version byte of the encoded configuration row. |
 | `crates/range/src/image.rs` `FORMAT` | format | Version byte of the encoded snapshot image. |
 | `crates/range/src/replica.rs` `QUIET` | derived | `Duration::MAX`, no quiet write: the durable shell writes a commit no write stated after its owner's period so that a member acting on applied state at its next start reopens with it (hyper-raft docs/durable.md §4.1); no entry of a range is acted on at start (`RangeMachine::acts_at_start`), and the engine's durable index is part of the durable commit, so the write is never due. |

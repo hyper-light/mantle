@@ -7,7 +7,7 @@ use crate::error::{MetaError, reserved};
 use crate::overlay::Overlay;
 use crate::session::{self, Check, Rules, Touched};
 use crate::wire::{Answer, Command, Entry};
-use crate::{block, bucket, file, name};
+use crate::{block, bucket, file, name, root};
 
 /// Which layer's rows a range holds (docs/design/metadata.md §1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +16,8 @@ pub enum Layer {
     Name,
     File,
     Block,
+    /// The cell's root range: its volume table (docs/design/node.md §5.6).
+    Root,
 }
 
 /// Applies entry `index` to the range's rows and answers its commands in order. An error
@@ -81,6 +83,7 @@ fn run<R: Rows>(
         (Layer::Name, Command::Name(c)) => Answer::Name(name::apply(rows, index, c)?),
         (Layer::File, Command::File(c)) => Answer::File(file::apply(rows, index, c)?),
         (Layer::Block, Command::Block(c)) => Answer::Block(block::apply(rows, index, c)?),
+        (Layer::Root, Command::Root(c)) => Answer::Root(root::apply(rows, index, c)?),
         _ => Answer::WrongLayer,
     })
 }

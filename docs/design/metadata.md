@@ -41,6 +41,9 @@ fits the Name layer to S3.
 | Block | (block, CHUNK, index) | the chunk store volume and chunk key holding chunk `index` | block |
 | Block | (ON, volume, block) | reverse entry: which of the block's chunks `volume` holds | block |
 
+The cell's root range keeps, beside the three layers, the volume table placement reads: each
+node's failure domain and each volume's node and bytes (node.md §6.6, `mantle_meta::root`).
+
 - **A version carries its storage class,** and with it the fields S3's API reports about it:
   for INTELLIGENT_TIERING its access tier and the last day it was accessed, and for an
   archived version its restore record, whether a restore is in progress, its request date, its

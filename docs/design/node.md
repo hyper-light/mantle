@@ -234,8 +234,9 @@ key space; each keeps its rows in an engine store of its own (`range-GROUP.store
 node's one log, and the node says each one's status by its group. A cell of three nodes hosting a
 Bucket, a Name, a File and a Block range on every node, voters one to a node, elects in each,
 applies each layer's commands only in its own range (`WrongLayer` elsewhere), and serves on through
-the kill (`SIGKILL`) of the node leading the most of them (`crates/mantle/tests/node.rs`). The root
-ranges, and `mantle init` making them, are still to build.
+the kill (`SIGKILL`) of the node leading the most of them (`crates/mantle/tests/node.rs`). The
+cell's root range holds its volume table (§6.6); the rest of its rows, the region's root range,
+and `mantle init` making them are still to build.
 
 **Joining.** An existing node mints an invitation (`mantle invite`): a one-time token recorded
 in the root range, so the log decides whether it was used. `mantle init --join` sends the token
@@ -1663,6 +1664,51 @@ above quorum when one fails (architecture §8; 09 §8.4.1).
 Metadata availability and data durability are separate promises (audit §5.7): a range available
 with a quorum does not make its blocks durable, and a block's redundancy does not make its
 range available.
+
+### 6.6 The cell's ranges and the volume table
+
+A node hosts the ranges its configuration names, each `range = GROUP LAYER`: the cell's root
+range and its Bucket, Name, File and Block ranges, each a Raft group of its own on the node's one
+log (raft-log.md §1), its rows in an engine store of its own. A cell of three nodes hosts every
+range on every node, voters one to a node (§1.5's cell of one grown to the three domains `f = 1`
+needs, §6.5); ranges placed on some nodes of a larger cell are placement's (§7).
+
+**The volume table** is the root range's (§1.5; architecture §4), `mantle_meta::root`: a row per
+node, its failure domain, and a row per volume, the node that holds it and its bytes, with a
+census of both. A node enlists itself and its volumes by one `Enlist` command. The range records
+what it does not hold and answers `Conflict`, changing nothing, for a node whose domain or a
+volume whose node or bytes it holds otherwise, since a device moved between nodes is a move to
+make and never a silent overwrite; and `Full` past the most nodes and volumes the cell states, as
+every map keyed by a value a peer chooses is bounded (CLAUDE.md §2). A domain is at most 255
+bytes, DNS's bound on a name (RFC 1035 §2.3.4). The table is read a page at a time
+(`read::Query::Volumes`), each page as many volumes as a reply carries counted at the longest
+domain, and a read is answered only by a range of the layer whose rows it reads (`WrongLayer`
+otherwise).
+
+**Placement** (`Place`, §5.1) reads the node's own replica of the root range, which every node of
+a three-node cell holds: a stale table costs a refused chunk, never a wrong placement, since the
+Block range refuses two chunks on one volume (metadata.md §1) and a volume refuses a write it
+cannot take (architecture §5's invariant). It offers every volume, one to a domain first, in an
+order drawn from the block's id, which is uniform random (metadata.md §1), so blocks spread
+evenly and the same block is offered the same order again; then the volumes of domains already
+used, which a block takes only when the cell has fewer domains than the block is wide, as §1.5
+lets a cell short of domains place on the domains there are. Choosing by two random choices on
+credits (§7; research/27 D11a) waits for the credits nodes advertise.
+
+**A node's own commands.** A node enlisting, and the gateway host after it (§5.1), send commands
+to ranges as a gateway does: each within a session the node registers with the range at first
+use, its serials in order (replica.md §1). One whose range this node leads is proposed
+in-process; one whose range another node leads goes to that node on the request class, following
+the leader a node names, and is asked again with the same session and serials when its exchange
+is lost, which the range's sessions answer without applying twice. The asks out at once are a
+stated bound. The root range's leader takes an enlistment only from the node it names, over that
+node's own connection.
+
+*As built (2026-10-21).* The root layer, its rows and commands (`mantle_meta::root`), and its
+paged read (`crate::read`), with the layer check on reads; a cell of three `mantle node`
+processes hosting the root range and a range of each other layer reads its volume table through
+a client (`crates/mantle/tests/node.rs`). Enlisting, placement and a node's own commands are to
+build next.
 
 ## 7. Placement, repair and cells
 

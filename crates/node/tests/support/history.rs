@@ -259,6 +259,10 @@ pub async fn work(
                 Ok(Read::Current(current)) => {
                     (Input::Get, Output::Got(current.map(|(_, v)| v.etag)))
                 }
+                Ok(other) => {
+                    tell(Told::Failed(id, format!("read {i} of {key}: {other:?}")));
+                    return part;
+                }
                 Err(error) => {
                     tell(Told::Failed(id, format!("read {i} of {key}: {error}")));
                     return part;

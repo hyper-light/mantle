@@ -29,6 +29,7 @@ pub mod name;
 pub mod overlay;
 pub mod reclaim;
 pub mod record;
+pub mod root;
 pub mod session;
 pub mod sweep;
 pub mod wire;

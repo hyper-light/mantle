@@ -222,7 +222,11 @@ fn registration(serial: u64) -> Entry {
             session: 0,
             serial,
             unanswered: 0,
-            command: Command::Register,
+            command: Command::Register {
+                owner: serial,
+                run: 1,
+                nth: 1,
+            },
         }],
     }
 }
@@ -1957,7 +1961,11 @@ fn a_write_refused_for_a_full_log_waits_until_another_group_compacts() {
             session: 0,
             serial,
             unanswered: 0,
-            command: Command::Register,
+            command: Command::Register {
+                owner: serial,
+                run: 1,
+                nth: 1,
+            },
         });
         if many.encode().unwrap().len() > quarter {
             many.commands.pop();

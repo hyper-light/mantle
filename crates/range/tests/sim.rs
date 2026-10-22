@@ -9,11 +9,12 @@
 //! device and all, and a member with a new identity replaces it: added as a learner, caught
 //! up, then swapped in by one joint change (docs/design/replica.md §6). A down member's
 //! device is damaged at rest now and then, a bit of one of its log's frames flipped on the
-//! medium: its last frame, which its restart restores and marks, and the member is repaired
-//! in place from its peers; its last frame holding a fast-track proposal, which leaves its
-//! group damaged, and the member is rebuilt under a new identity on its device; or an earlier
-//! frame, which leaves its whole log damaged, and the device is replaced (docs/design/replica.md
-//! §4). Three
+//! medium: its last frame, which its restart restores from the frame's persist record, marking
+//! the entries it held, and the member is repaired in place from its peers; its last frame
+//! holding a fast-track proposal, which leaves its group damaged, and the member is rebuilt
+//! under a new identity on its device; or a live frame before its last, or its last where none
+//! precedes it, which leaves its whole log damaged, and the device is replaced
+//! (docs/design/replica.md §4). Each restart must find what its flip damaged. Three
 //! gateways, each with its own session, put and get two keys at once: puts go through the
 //! log, retried through leader changes with the session's serial numbers, and gets through
 //! the leader's ReadIndex. A run is its seed.
@@ -37,6 +38,9 @@
 //! joining member the same way, every member's power at the moment the leader says the
 //! replacement is done, and one member of the final configuration is then lost for good: each
 //! reopens in the final configuration, and the other two elect (docs/design/replica.md §6).
+//! Directed damage runs flip each of the three frames once, in a group of three and one of five,
+//! at the first moment a member's writes are all answered and its last frame holds entries its
+//! engine has not applied: each restart finds what its flip damaged, and the group repairs it.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -232,8 +236,8 @@ struct Node {
     members: u64,
     /// How far its clock runs ahead of the simulation's, in steps, or behind.
     skew: i64,
-    /// Its device was damaged at rest since it went down.
-    latent: bool,
+    /// The frame of its log flipped at rest since it went down.
+    latent: Option<Flipped>,
     /// What its last restart found damaged: the member is quarantined, down until the group
     /// rebuilds it.
     found: Option<Found>,
@@ -250,6 +254,22 @@ enum Found {
     Group,
     /// The log as a whole: the device is replaced.
     Log,
+}
+
+/// A bit flipped at rest in a frame of a down member's log, by what the member's restart must
+/// find (docs/design/replica.md §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flipped {
+    /// The last frame, a live one before it: the log restores the frame's groups from its
+    /// persist record, marking the entries it held where it was confirmed flushed (one never
+    /// confirmed is the torn tail) and damaging a group whose proposals it held.
+    Restored,
+    /// A live frame before the last, or the last where no live frame precedes it: the log no
+    /// longer runs unbroken to a valid frame, and is damaged as a whole.
+    Log,
+    /// The last frame after the member takes a fast-track proposal of its own, which a persist
+    /// record does not carry: the group is damaged.
+    Group,
 }
 
 /// What restarts found of damage at rest.
@@ -292,7 +312,7 @@ impl Node {
             lives: 0,
             members,
             skew: 0,
-            latent: false,
+            latent: None,
             found: None,
             uncertain: false,
         }
@@ -347,23 +367,42 @@ impl Node {
         let Some(engine) = self.engine.take() else {
             return;
         };
-        let latent = std::mem::take(&mut self.latent);
+        let latent = self.latent.take();
         self.lives += 1;
         self.device().clear_faults().unwrap();
         let (log, recovery) = match self.open_log() {
             Ok(opened) => opened,
-            Err(LogError::Damaged(_)) if latent => {
+            Err(LogError::Damaged(_)) if latent == Some(Flipped::Log) => {
                 self.found = Some(Found::Log);
                 return;
             }
-            Err(e) => panic!("member {} reopens its log: {e}", self.id),
+            Err(e) => panic!(
+                "member {} reopens its log, {latent:?} flipped: {e}",
+                self.id
+            ),
         };
+        assert_ne!(
+            latent,
+            Some(Flipped::Log),
+            "member {} opened a log it cannot read unbroken",
+            self.id
+        );
         let log = &*self.log.insert(log);
         if !recovery.damaged.is_empty() {
-            assert!(latent && recovery.damaged == [GROUP], "{recovery:?}");
+            assert!(
+                matches!(latent, Some(Flipped::Restored | Flipped::Group))
+                    && recovery.damaged == [GROUP],
+                "{latent:?} {recovery:?}"
+            );
             self.found = Some(Found::Group);
             return;
         }
+        assert_ne!(
+            latent,
+            Some(Flipped::Group),
+            "member {}'s group outlived its lost proposal",
+            self.id
+        );
         let ahead = log
             .view(GROUP)
             .unwrap()
@@ -381,7 +420,12 @@ impl Node {
                 let before = self.uncertain;
                 self.uncertain = replica.is_uncertain();
                 if self.uncertain && !before {
-                    assert!(latent, "member {} marked with no damage", self.id);
+                    assert_eq!(
+                        latent,
+                        Some(Flipped::Restored),
+                        "member {} marked with no last frame flipped",
+                        self.id
+                    );
                     damage.marked += 1;
                 }
                 // The log reached its mark before the member went down: a drive that wrote the
@@ -396,49 +440,46 @@ impl Node {
     }
 
     /// Damages a frame of the member's log at rest, the device down: a bit flipped on the
-    /// medium, which no clearing of faults heals. `kind` picks the frame: 0 its last, 1 one
-    /// before it, 2 its last after it takes a fast-track proposal of its own, which a persist
-    /// record does not carry.
-    fn damage(&mut self, kind: u64, rng: &mut Rng) {
+    /// medium, which no clearing of faults heals, in the frame whose loss the restart is to find
+    /// as `flip` says. A log with no group to take a proposal for, or no live frame before its
+    /// last, has its last flipped, and its restart is held to what that frame's loss is.
+    fn damage(&mut self, flip: Flipped, rng: &mut Rng) {
         self.device().clear_faults().unwrap();
-        if kind == 2 {
+        let mut flip = flip;
+        if flip == Flipped::Group {
             let (log, recovery) = self.open_log().unwrap();
             assert!(recovery.damaged.is_empty());
-            if let Some(view) = log.view(GROUP).unwrap() {
-                let term = view.hard_state.map_or(1, |h| h.term.max(1));
-                log.write(
-                    GROUP,
-                    hyper_log::Update {
-                        proposals: vec![hyper_log::Proposal {
-                            index: view.last + 1,
-                            term,
-                            bytes: b"fast".to_vec(),
-                        }],
-                        ..hyper_log::Update::default()
-                    },
-                )
-                .unwrap();
+            match log.view(GROUP).unwrap() {
+                Some(view) => {
+                    let term = view.hard_state.map_or(1, |h| h.term.max(1));
+                    log.write(
+                        GROUP,
+                        hyper_log::Update {
+                            proposals: vec![hyper_log::Proposal {
+                                index: view.last + 1,
+                                term,
+                                bytes: b"fast".to_vec(),
+                            }],
+                            ..hyper_log::Update::default()
+                        },
+                    )
+                    .unwrap();
+                }
+                None => flip = Flipped::Restored,
             }
             self.file = Some(log.close().unwrap());
         }
         let log_id = self.log_id;
         let file = self.device();
         let image = file.durable_image().unwrap();
-        let mut frames: Vec<(u64, usize, usize)> = image
-            .chunks(4096)
-            .enumerate()
-            .filter_map(|(i, block)| {
-                let h = hyper_log::format::FrameHeader::decode(block)?;
-                let len = h.frame_len()?;
-                let frame = image.get(i * 4096..i * 4096 + len)?;
-                (h.log == log_id && h.verifies(frame)).then(|| (h.sequence, i * 4096, len))
-            })
-            .collect();
-        frames.sort_unstable();
+        let frames = live_frames(&image, log_id);
         let Some(&last) = frames.last() else {
             return;
         };
-        let (_, at, len) = if kind == 1 && frames.len() > 1 {
+        let (_, at, len) = if frames.len() == 1 {
+            flip = Flipped::Log;
+            last
+        } else if flip == Flipped::Log {
             frames[rng.below(frames.len() as u64 - 1) as usize]
         } else {
             last
@@ -456,8 +497,62 @@ impl Node {
         buf.as_mut_slice()[(offset - block) as usize] ^= 1 << rng.below(8);
         file.write_all_at(buf.as_slice(), block).unwrap();
         file.sync_data().unwrap();
-        self.latent = true;
+        self.latent = Some(flip);
     }
+}
+
+/// The frames of log `id` its image holds live, by sequence, each with its offset and length:
+/// those that verify, in the segments from the oldest live one the last frame names onward. A
+/// frame of a segment the log has since freed still verifies where nothing wrote over it, but
+/// no open reads it (hyper-log `recover::replay_live`).
+fn live_frames(image: &[u8], id: u128) -> Vec<(u64, usize, usize)> {
+    let mut frames: Vec<(u64, u64, u64, usize, usize)> = image
+        .chunks(4096)
+        .enumerate()
+        .filter_map(|(i, block)| {
+            let h = hyper_log::format::FrameHeader::decode(block)?;
+            let len = h.frame_len()?;
+            let frame = image.get(i * 4096..i * 4096 + len)?;
+            (h.log == id && h.verifies(frame))
+                .then(|| (h.sequence, h.incarnation, h.tail, i * 4096, len))
+        })
+        .collect();
+    frames.sort_unstable();
+    let tail = frames.last().map_or(0, |&(_, _, tail, _, _)| tail);
+    frames
+        .into_iter()
+        .filter(|&(_, incarnation, _, _, _)| incarnation >= tail)
+        .map(|(sequence, _, _, at, len)| (sequence, at, len))
+        .collect()
+}
+
+/// Whether the persist records in the image of log `id` say the frame of `sequence` was
+/// confirmed flushed and wrote entries of the group from past `applied`: a restart that finds the
+/// frame lost restores its groups from its record and marks those entries, which the engine
+/// does not hold (hyper-log `recover::restores`).
+fn writes_past(image: &[u8], id: u128, sequence: u64, applied: u64) -> bool {
+    // A frame's record lies in one of the two slots at the file's start, each sized for the
+    // most groups the log holds and aligned to its block (hyper-log `recover::persist_slot`).
+    let slot = Alignment::new(4096)
+        .unwrap()
+        .up(hyper_log::format::persist_len(log_config().max_groups).unwrap())
+        .unwrap();
+    let records: Vec<hyper_log::format::Persist> = [0, slot]
+        .into_iter()
+        .filter_map(|at| image.get(at..).and_then(hyper_log::format::Persist::decode))
+        .filter(|p| p.log == id)
+        .collect();
+    records.iter().any(|p| p.confirms >= sequence)
+        && records
+            .iter()
+            .filter(|p| p.sequence == sequence)
+            .flat_map(|p| &p.groups)
+            .any(|g| {
+                g.group == GROUP
+                    && !g.proposals
+                    && !g.damaged
+                    && g.entries.is_some_and(|w| w.count > 0 && w.first > applied)
+            })
 }
 
 /// What a gateway is doing.
@@ -672,7 +767,28 @@ impl World {
             || self
                 .nodes
                 .iter()
-                .any(|n| n.latent || n.uncertain || n.found.is_some())
+                .any(|n| n.latent.is_some() || n.uncertain || n.found.is_some())
+    }
+
+    /// The first member whose writes are all answered, whose log's last frame was confirmed
+    /// flushed with entries past what its engine applied, and which holds a live frame before
+    /// that one: each flip damages there what it names (`Flipped`).
+    fn ready_to_damage(&self) -> Option<usize> {
+        self.nodes.iter().position(|n| {
+            let Some(r) = n.replica.as_ref() else {
+                return false;
+            };
+            let (id, applied) = (n.log_id, r.applied());
+            r.in_flight() == 0
+                && n.with_file(move |f| {
+                    let image = f.durable_image().unwrap();
+                    let frames = live_frames(&image, id);
+                    frames.len() > 1
+                        && frames.last().is_some_and(|&(sequence, _, _)| {
+                            writes_past(&image, id, sequence, applied)
+                        })
+                })
+        })
     }
 
     fn inject(&mut self) {
@@ -693,8 +809,9 @@ impl World {
             && self.nodes[i].replica.is_none()
             && self.nodes[i].engine.is_some()
         {
-            let kind = self.rng.below(3);
-            self.nodes[i].damage(kind, &mut self.rng);
+            let flip =
+                [Flipped::Restored, Flipped::Log, Flipped::Group][self.rng.below(3) as usize];
+            self.nodes[i].damage(flip, &mut self.rng);
             self.damage.injected += 1;
         }
         if self.rng.chance(20) && self.nodes[i].replica.is_none() {
@@ -1150,7 +1267,12 @@ impl World {
                     session: 0,
                     serial: gw.nonce,
                     unanswered: 0,
-                    command: Command::Register,
+                    // Its run is its only one, and its registrations count up in it.
+                    command: Command::Register {
+                        owner: gw.id,
+                        run: 1,
+                        nth: gw.nonce & 0xFFFF_FFFF,
+                    },
                 });
             } else if gw.left > 0 && (gate_open || gw.id == 0) {
                 gw.left -= 1;
@@ -1374,6 +1496,11 @@ fn run(seed: u64, members: u64) -> Ran {
     for _ in 0..3_000 {
         w.step();
     }
+    finish(w)
+}
+
+/// Stops the faults, runs until the group settles, and checks what every run must hold.
+fn finish(mut w: World) -> Ran {
     w.heal();
     let mut budget = 20_000;
     while !w.settled() {
@@ -1447,14 +1574,76 @@ fn run(seed: u64, members: u64) -> Ran {
     }
 }
 
+/// A run whose one fault is damage at rest: once a member's log holds what each flip finds
+/// (`World::ready_to_damage`), the member loses power, its frame is flipped as `flip` names, and
+/// it restarts; the group repairs it, and the run settles and is checked as a seeded run is.
+/// The wait is a few election timeouts' work for a group with a quorum and no faults: elect a
+/// leader, commit an entry (`PATIENT_ROUNDS`).
+fn run_damaged(seed: u64, members: u64, flip: Flipped) -> Ran {
+    let mut w = World::new(seed, members);
+    w.faults = false;
+    let mut rounds = 0;
+    let i = loop {
+        w.step();
+        if let Some(i) = w.ready_to_damage() {
+            break i;
+        }
+        rounds += 1;
+        if rounds == PATIENT_ROUNDS {
+            w.fail("no member's log held a confirmed frame of entries past its engine");
+        }
+    };
+    w.nodes[i].crash();
+    w.nodes[i].damage(flip, &mut w.rng);
+    w.damage.injected += 1;
+    let seed = w.seed;
+    w.nodes[i].restart(seed, &mut w.damage);
+    finish(w)
+}
+
+/// Each frame a flip at rest damages, in a group of three and one of five, is found by the
+/// member's restart and repaired by its group: the member marked and repaired in place, rebuilt
+/// under a new identity on its device, or replaced with its device. The seeded runs flip at
+/// random; these runs make each repair certain to run.
+#[test]
+fn each_kind_of_damage_at_rest_is_found_and_repaired() {
+    for (seed, members) in [(1, 3), (2, 5)] {
+        for flip in [Flipped::Restored, Flipped::Log, Flipped::Group] {
+            let ran = run_damaged(seed, members, flip);
+            let (marked, rebuilt, replaced) = match flip {
+                Flipped::Restored => (1, 0, 0),
+                Flipped::Group => (0, 1, 0),
+                Flipped::Log => (0, 0, 1),
+            };
+            let expected = Damage {
+                injected: 1,
+                marked,
+                unmarked: marked,
+                rebuilt,
+                replaced,
+                ahead_kept: 0,
+            };
+            assert_eq!(ran.damage, expected, "{flip:?} in a group of {members}");
+            assert_eq!(
+                ran.replaced,
+                rebuilt + replaced,
+                "{flip:?} in a group of {members}"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_group_under_faults_is_linearizable_and_applies_every_put_once() {
-    // By default the recorded seeds 1 to 10 (docs/design/replica.md §5), the fewest from 1 among
-    // which a restart finds each kind of damage: seed 10 is the first whose member is rebuilt.
+    // By default seeds 1 and 2, a group of three and one of five (docs/design/replica.md §5):
+    // the fewest from 1 in which every fault counted below occurs, two members down at once
+    // needing five. Each repair of damage at rest is certain in the directed runs
+    // (`each_kind_of_damage_at_rest_is_found_and_repaired`), every restart here is held to what
+    // its flip damaged, and breadth is the soaks'.
     let seeds: u64 = std::env::var("MANTLE_SIM_SEEDS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
+        .unwrap_or(2);
     let first: u64 = std::env::var("MANTLE_SIM_SEED")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1499,13 +1688,6 @@ fn a_group_under_faults_is_linearizable_and_applies_every_put_once() {
     assert!(
         two_down > 0 && duplicated > 0,
         "{two_down} steps two down, {duplicated} duplicated"
-    );
-    // Devices were damaged at rest, and each way a restart finds damage was repaired: members
-    // marked and repaired in place, members rebuilt under a new identity on their device, and
-    // devices replaced.
-    assert!(
-        damage.marked > 0 && damage.unmarked > 0 && damage.rebuilt > 0 && damage.replaced > 0,
-        "{damage:?}"
     );
     eprintln!("{damage:?}");
     eprintln!(
@@ -1761,7 +1943,11 @@ fn registration(nonce: u64) -> Entry {
             session: 0,
             serial: nonce,
             unanswered: 0,
-            command: Command::Register,
+            command: Command::Register {
+                owner: nonce,
+                run: 1,
+                nth: 1,
+            },
         }],
     }
 }

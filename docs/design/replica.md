@@ -405,10 +405,13 @@ kept. Once or twice a run a member is lost for good, its device and engine with 
 member under a new identity replaces it as §6 describes; a second loss waits for the first
 replacement to finish. A down member's device is damaged at rest now and then, one bit of
 one of its log's frames flipped on the medium, as §4 describes: its last frame, which its
-restart restores and marks, and the member is repaired in place; its last frame after it takes
-a fast-track proposal of its own, which leaves its group damaged, and the member is rebuilt
-under a new identity on its device; or an earlier frame, which leaves its log damaged, and the
-device is replaced. One member's data is short or being rebuilt at a time, the most a group
+restart restores from the frame's persist record, marking the entries it held, and the member
+is repaired in place; its last frame after it takes a fast-track proposal of its own, which
+leaves its group damaged, and the member is rebuilt under a new identity on its device; or a
+live frame before its last, or its last where none precedes it, which leaves its log damaged,
+and the device is replaced. A frame of a segment the log has freed still verifies where nothing
+wrote over it, but no open reads it, so only live frames are flipped, and each restart must
+find what its flip damaged. One member's data is short or being rebuilt at a time, the most a group
 of three survives, and no member is lost for good meanwhile. Members' clocks step forward and back by up to two seconds, and a leader stamps the entries
 it proposes with its own time. Replicas compact at random, so lagging
 members, new ones among them, are caught up by snapshot. Three gateways, each with its own session, put
@@ -428,17 +431,27 @@ must hold:
 
 A run settles only once every member marked by damage has been repaired, its log holding
 again what it acknowledged, and each run checks that every mark it made ended. With damage
-at rest in the faults, 6,000 seeds are linearizable and live on the shell: 4,919 frames
-damaged, 643 members marked and all 643 repaired by their lost entries, 230 of them with an
-engine past their log kept under their identity, 1,622 members rebuilt on their device and
-1,315 devices replaced; 14,864 members lost for good and replaced; members' writes left out
-past 653,807 drives, 825,890 messages and 752,454 ticks taken while writes were out, and
-14,687 drives that found a write waiting for room (`MANTLE_SIM_SEEDS=6000`, debug build, the
-hyper-raft crates of the snapshot vendor/UPSTREAM.md names, whose commit rides the next write
-rather than one of its own, 2026-10-07, this machine, 288 s at a one-minute load average of 8.5
-at the start and 6.1 at the end). The recorded seeds a default run takes, 1 to 10, are the
-fewest from 1 in which a restart finds each kind of damage: seed 10 is the first whose member is
-rebuilt on these crates (1 to 9 rebuild none).
+at rest in the faults, 6,000 seeds are linearizable and live on the shell, each restart finding
+what its flip damaged: 4,880 frames damaged, 625 members marked and all 625 repaired by their
+lost entries, 212 restarts finding an engine past their log and keeping it under their identity,
+1,599 members rebuilt on their device and 1,683 devices replaced; 15,180 members lost for good
+and replaced; members' writes left out past 660,170 drives, 833,263 messages and 759,396 ticks
+taken while writes were out, and 15,355 drives that found a write waiting for room
+(`MANTLE_SIM_SEEDS=6000`, debug build, the hyper-raft crates of the snapshot vendor/UPSTREAM.md
+names, 2026-10-21, this machine, 291 s at a one-minute load average of 10.6 at the start and 4.8
+at the end).
+
+Directed damage runs make each repair certain to run. In a group of three and one of five, each
+frame is flipped once at the first moment a member's writes are all answered and its last frame,
+confirmed flushed, holds entries its engine has not applied, with a live frame before it, and the
+run must find exactly what the flip names: one member marked and repaired, one rebuilt on its
+device, or one device replaced. The seeds a default run takes, 1 and 2, a group of three and one
+of five as the node simulation's (node.md §9.1), are the fewest from 1 in which every fault the
+seeded test counts occurs. A flip at random marks a member in about one seed in thirteen (2 of the
+first 26 seeds, 2026-10-21), so no small seed set is sure to find each repair, and any change to
+what the logs hold moves the seeds that do: the seeds 1 to 10 a default run took before found
+none replaced once registrations named their owner, the flips of earlier frames having landed on
+frames of freed segments, which no open reads.
 
 Soaks of mantle's own shell before the durable one found three faults whose rules the shell
 keeps (20,000 seeds, 2026-09-30): an install the log never recorded, which a restart now
@@ -596,6 +609,8 @@ change. Membership changes are rare, so this costs one image each.
   by ReadIndex rounds (§3) until then.
 - The session lifetime and bounds, sessions a range holds and the answers and bytes of
   answers one keeps, from how long gateways go between commands to a range and how many
-  they keep in flight. Planned (node.md §1.4, 2026-10-22): a registration names its owner and
-  run, and ends its owner's sessions of earlier runs, so the sessions a range holds are bounded
-  by the identities the cell names and none expires by time.
+  they keep in flight. Built (2026-10-21): a registration names its owner, its run and its place
+  in the run; it ends the session its owner's last registration opened, the same one delivered
+  again is answered that session, and an earlier one is refused `Superseded` (node.md §1.4).
+  Planned with `mantle serve`'s derived settings: the sessions a range holds bounded by the
+  identities the cell names, and none expiring by time.

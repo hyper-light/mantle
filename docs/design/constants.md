@@ -458,6 +458,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/meta/src/key.rs` `MARKS` | format | Key-space prefix byte 0x03 for the Name range's file marks (docs/design/metadata.md §2). |
 | `crates/meta/src/key.rs` `NULL` | format | Name-row tag 1: null-version pointer, sorting first under `(bucket, key)`. |
 | `crates/meta/src/key.rs` `ORIGIN` | format | Block-layer row tag 3 for a block's origin. |
+| `crates/meta/src/key.rs` `OWNER` | format | Marker byte `o` after `LOCAL` for an owner's row: the session its last registration opened, and that registration's run and place in the run (docs/design/node.md §1.4). |
 | `crates/meta/src/key.rs` `PART` | format | Tag 1 after an upload ID for its part rows. |
 | `crates/meta/src/key.rs` `RELEASED` | format | Marker byte `q` after `LOCAL` for the queue of released files. |
 | `crates/meta/src/key.rs` `REVERSE` | format | Key-space prefix byte 0x02 for reverse-index rows. |
@@ -475,6 +476,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/meta/src/record.rs` `FORMAT` | format | Version byte 6 that begins every row value written by this code; 6 since a file keeps a row for each block it names, 5 since a part's row records its file's handover deadline, which the completion adopting it gives the part's mark without reading it, 4 since a mark records its write's handover deadline and a queue row whether its ID names a file, 3 since a file's mark records how the range took it (a version's order, a part, an adopting composite, or refused), 2 since a version records its completion's part listing. |
 | `crates/meta/src/record.rs` `LISTING` | external | Bytes of a completion's listing digest: SHA-256's 256-bit output (FIPS 180-4 §1). |
 | `crates/meta/src/root.rs` `MAX_DOMAIN` | bound | The longest failure domain a node names, 255 bytes: a label such as a rack's or a zone's name, which DNS bounds at 63 bytes a label and 255 a name (RFC 1035 §2.3.4); an enlistment past it is a conflict. |
+| `crates/meta/src/session.rs` `OWNED_BYTES` | format | Bytes of an owner's row: the session its last registration opened, that registration's run and its place in the run, each a big-endian word (docs/design/node.md §1.4). |
 | `crates/meta/src/wire.rs` `MAX_BUCKET` | external | A bucket name of at most 63 characters (research/05 §10.3). |
 | `crates/meta/src/wire.rs` `MAX_KEY` | external | An object key of at most 1,024 bytes (research/05 §10.1). |
 | `crates/meta/src/wire.rs` `MAX_HEADERS` | external | A request's headers within 8 KB (research/05 §10.2), which bound its preconditions. |

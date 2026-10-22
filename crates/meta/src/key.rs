@@ -24,6 +24,9 @@ pub mod marker {
     pub const GATE: u8 = b'g';
     /// The Name range's lineage: its descriptor and the child of its last split.
     pub const LINEAGE: u8 = b'l';
+    /// An owner's row: the session its last registration opened, and that registration's run
+    /// and place in the run.
+    pub const OWNER: u8 = b'o';
     /// How many sessions the range holds.
     pub const SESSIONS: u8 = b'n';
     /// The Name range's queue of released files.
@@ -38,13 +41,14 @@ pub mod marker {
     pub const UNSETTLED: u8 = b'u';
 
     /// Every marker in use.
-    pub const ALL: [u8; 12] = [
+    pub const ALL: [u8; 13] = [
         ATTEMPT,
         CLOCK,
         EXPIRY,
         FLOOR,
         GATE,
         LINEAGE,
+        OWNER,
         UNSETTLED,
         SESSIONS,
         RELEASED,

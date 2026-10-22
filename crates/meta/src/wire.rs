@@ -38,8 +38,16 @@ pub struct Sessioned {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// Opens a session; the command's own session fields are not read.
-    Register,
+    /// Opens a session for `owner`, the identity its sender authenticated as, as the `nth`
+    /// registration of the owner's `run`, counted from 1: it ends the session the owner's last
+    /// registration opened, is answered that registration's session where it is the same one
+    /// again, and is refused where the owner has registered later (`session::register`). The
+    /// command's own session fields are not read.
+    Register {
+        owner: u64,
+        run: u64,
+        nth: u64,
+    },
     Bucket(bucket::Command),
     Name(Box<name::Command>),
     File(file::Command),
@@ -62,6 +70,9 @@ pub enum Answer {
     /// A serial the session answered and has since forgotten, as the gateway acknowledged
     /// it: a repeat, not applied again.
     Repeated,
+    /// No session was registered: the owner registered later than this registration, in a
+    /// later run or later in this one (`session::register`).
+    Superseded,
     /// The command is for another layer than the range's.
     WrongLayer,
     Bucket(bucket::Outcome),
@@ -139,6 +150,7 @@ impl Answer {
             }
             Answer::WrongLayer => w.u8(2),
             Answer::Repeated => w.u8(7),
+            Answer::Superseded => w.u8(10),
             Answer::Bucket(o) => {
                 w.u8(3);
                 put_bucket_outcome(&mut w, o);
@@ -203,6 +215,7 @@ impl Answer {
                 8 => Answer::SessionsFull { until_ns: r.u64()? },
                 2 => Answer::WrongLayer,
                 7 => Answer::Repeated,
+                10 => Answer::Superseded,
                 3 => Answer::Bucket(take_bucket_outcome(&mut r)?),
                 4 => Answer::Name(take_name_outcome(&mut r)?),
                 5 => Answer::File(match r.u8()? {
@@ -248,7 +261,12 @@ impl Answer {
 
 fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
     match command {
-        Command::Register => w.u8(0),
+        Command::Register { owner, run, nth } => {
+            w.u8(0);
+            w.u64(*owner);
+            w.u64(*run);
+            w.u64(*nth);
+        }
         Command::Bucket(c) => {
             w.u8(1);
             put_bucket(w, c)?;
@@ -377,7 +395,11 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
 
 fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
     Some(match r.u8()? {
-        0 => Command::Register,
+        0 => Command::Register {
+            owner: r.u64()?,
+            run: r.u64()?,
+            nth: r.u64()?,
+        },
         1 => Command::Bucket(take_bucket(r, at_ns)?),
         2 => Command::Name(Box::new(take_name(r, at_ns)?)),
         3 => Command::File(match r.u8()? {
@@ -1521,16 +1543,74 @@ pub fn largest_entry_bytes() -> Result<usize, RecordError> {
         Command::Name(Box::new(name::Command::Complete(complete))),
         Command::File(write),
     ] {
-        let entry = Entry {
+        largest = largest.max(alone(command).encode()?.len());
+    }
+    Ok(largest)
+}
+
+/// An entry of one command at the session's longest, as `largest_entry_bytes` counts one.
+fn alone(command: Command) -> Entry {
+    Entry {
+        at_ns: u64::MAX,
+        commands: vec![Sessioned {
+            session: u64::MAX,
+            serial: u64::MAX,
+            unanswered: u64::MAX,
+            command,
+        }],
+    }
+}
+
+/// The most blocks one block check names within an entry of `largest_entry_bytes`.
+fn most_checked_blocks() -> Result<usize, RecordError> {
+    let check = |blocks: usize| {
+        alone(Command::File(file::Command::CheckBlocks {
+            file: u128::MAX,
+            blocks: vec![(u128::MAX, u64::MAX); blocks],
             at_ns: u64::MAX,
-            commands: vec![Sessioned {
-                session: u64::MAX,
-                serial: u64::MAX,
-                unanswered: u64::MAX,
-                command,
-            }],
-        };
-        largest = largest.max(entry.encode()?.len());
+        }))
+        .encode()
+        .map(|bytes| bytes.len())
+    };
+    let fixed = check(0)?;
+    let each = check(1)?.checked_sub(fixed).ok_or(too_large(fixed))?;
+    let room = largest_entry_bytes()?.saturating_sub(fixed);
+    room.checked_div(each).ok_or(too_large(each))
+}
+
+/// Bytes of the largest answer a range gives one command, which a session keeps until its
+/// gateway acknowledges it (`session::Rules::max_answer_bytes`): a block check's verdicts, one
+/// for each block the largest entry's check can name, or an answer that carries a version, an
+/// upload or a completion's checksum at its longest; each is encoded here and the larger taken.
+pub fn largest_answer_bytes() -> Result<usize, RecordError> {
+    let version = crate::key::version_id(u64::MAX);
+    let answers = [
+        Answer::File(file::Outcome::BlocksChecked(vec![
+            Verdict::Young;
+            most_checked_blocks()?
+        ])),
+        Answer::Name(name::Outcome::Completed {
+            version: version.clone(),
+            size: u64::MAX,
+            checksum: Some(Checksum {
+                algorithm: u8::MAX,
+                parts: u16::MAX,
+                // SHA-512's, the longest value S3 takes.
+                value: vec![0; 64],
+            }),
+        }),
+        Answer::Name(name::Outcome::Put {
+            version: version.clone(),
+        }),
+        Answer::Name(name::Outcome::Deleted {
+            marker: true,
+            version: Some(version.clone()),
+        }),
+        Answer::Name(name::Outcome::Created { upload: version }),
+    ];
+    let mut largest = 0usize;
+    for answer in answers {
+        largest = largest.max(answer.encode()?.len());
     }
     Ok(largest)
 }
@@ -1538,6 +1618,39 @@ pub fn largest_entry_bytes() -> Result<usize, RecordError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A block check naming the most blocks fits the largest entry and one more does not, and
+    /// its answer is within the largest answer, as is every answer of a variable length.
+    #[test]
+    fn the_largest_answer_covers_the_largest_block_check() {
+        let most = most_checked_blocks().unwrap();
+        let check = |blocks: usize| {
+            alone(Command::File(file::Command::CheckBlocks {
+                file: 1,
+                blocks: vec![(u128::MAX, u64::MAX); blocks],
+                at_ns: u64::MAX,
+            }))
+            .encode()
+            .unwrap()
+            .len()
+        };
+        let largest_entry = largest_entry_bytes().unwrap();
+        assert!(check(most) <= largest_entry);
+        assert!(check(most + 1) > largest_entry);
+        let largest = largest_answer_bytes().unwrap();
+        let verdicts = Answer::File(file::Outcome::BlocksChecked(vec![Verdict::Held; most]));
+        assert!(verdicts.encode().unwrap().len() <= largest);
+        let completed = Answer::Name(name::Outcome::Completed {
+            version: crate::key::version_id(7),
+            size: 9,
+            checksum: Some(Checksum {
+                algorithm: 1,
+                parts: 2,
+                value: vec![1; 32],
+            }),
+        });
+        assert!(completed.encode().unwrap().len() <= largest);
+    }
 
     /// The bound covers a real completion of 10,000 parts, its session and entry around it,
     /// and stays within a MiB, which a range's settings and log frame must admit.
@@ -1631,7 +1744,11 @@ mod tests {
             index: 0,
         };
         vec![
-            Command::Register,
+            Command::Register {
+                owner: 7,
+                run: 3,
+                nth: 2,
+            },
             Command::Bucket(bucket::Command::Create(bucket::Create {
                 bucket: "b".into(),
                 owner: "o".into(),
@@ -2023,6 +2140,7 @@ mod tests {
             Answer::SessionsFull { until_ns: 9 },
             Answer::WrongLayer,
             Answer::Repeated,
+            Answer::Superseded,
         ];
         answers.extend(
             [

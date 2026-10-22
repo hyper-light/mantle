@@ -203,6 +203,8 @@ pub enum NodeError {
     Full,
     #[error("a range's group {0:x} is the log's own or the liveness stream's")]
     Reserved(u128),
+    #[error("the node's own entries this run cannot be counted past {0}: its next run counts anew")]
+    Registrations(u64),
     #[error("the node holds as many commands of its own as it keeps")]
     Asks,
 }
@@ -652,8 +654,13 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     asking: Vec<Asking>,
     command_asks: usize,
     next_command: CommandAsk,
-    /// The draws that tell this node's registrations apart from others' (`Carried::Registration`).
+    /// The draws that tell this node's registrations apart from others' (`Carried::Registration`),
+    /// each new entry's the next: a registration's also places it among the run's, which a range
+    /// orders an owner's registrations by (`mantle_meta::session::register`).
     next_nonce: u64,
+    /// The node's run (§2.4 item 4), which its registrations name: a range ends the node's
+    /// sessions of earlier runs as the node registers there.
+    run: u64,
     commands_done: Vec<(CommandAsk, CommandOutcome)>,
     /// The reads this node asks of ranges itself (`Node::read`): those out, and those answered and
     /// not yet taken, at most `read_asks` in all.
@@ -884,6 +891,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             command_asks: settings.command_asks,
             next_command: 0,
             next_nonce: 0,
+            run,
             commands_done: Vec::new(),
             reads_out: Vec::new(),
             read_asks: settings.read_asks,
@@ -2260,7 +2268,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// Proposes the entry a command's body holds, as the range's leader, and keeps the command
     /// until its entry applies. An enlistment is taken only from the node it names, over that
-    /// node's own connection (node.md §6.6).
+    /// node's own connection (node.md §6.6), and a registration only as its sender's own.
     fn propose_command(
         &mut self,
         exchange: ExchangeId,
@@ -2275,7 +2283,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if !entry
             .commands
             .iter()
-            .all(|c| enlists_only(&c.command, peer, from_node))
+            .all(|c| names_only_its_sender(&c.command, peer, from_node))
         {
             return self.answer_status(exchange, command::Status::Forbidden, self.id);
         }
@@ -2629,8 +2637,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         command: Command,
         deadline_ns: u64,
     ) -> Result<CommandAsk, NodeError> {
-        if !enlists_only(&command, self.id, true) {
-            return Err(NodeError::Bounds("a node enlists only itself".into()));
+        if !names_only_its_sender(&command, self.id, true) {
+            return Err(NodeError::Bounds(
+                "a node's commands name only itself".into(),
+            ));
         }
         let held = self
             .asking
@@ -2644,7 +2654,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Some(at) => at,
             None => {
                 // A range none of whose commands the node holds forgets its session, which the
-                // range expires in time: the ranges kept are no more than the commands held.
+                // node's next registration there ends: the ranges kept are no more than the
+                // commands held.
                 if self.asking.len() >= self.command_asks {
                     self.asking.retain(|a| a.held() > 0 || a.out.is_some());
                 }
@@ -2706,14 +2717,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     Some(Via::Unasked | Via::Paused { .. }) | None => {}
                 }
             }
-            let nonce = self.id.rotate_left(32) ^ self.next_nonce;
+            let nth = self.next_nonce;
+            let nonce = self.id.rotate_left(32) ^ nth;
             let Some(asking) = self.asking.get_mut(at) else {
                 continue;
             };
             if asking.out.is_none() && !asking.waiting.is_empty() {
-                self.next_nonce = self.next_nonce.wrapping_add(1);
+                // Each new entry draws the next, which places a registration among the run's.
+                self.next_nonce = nth.checked_add(1).ok_or(NodeError::Registrations(nth))?;
             }
-            asking.next_entry(limits, nonce, &mut self.commands_done);
+            let owner = (self.id, self.run, nth);
+            asking.next_entry(limits, owner, nonce, &mut self.commands_done);
             let due = match asking.out.as_ref().map(|o| o.via) {
                 Some(Via::Unasked) => true,
                 Some(Via::Paused { at_ns }) => at_ns <= now,
@@ -3332,10 +3346,13 @@ fn take_done<T>(done: &mut Vec<(u64, T)>, ask: u64) -> Option<T> {
     Some(done.swap_remove(at).1)
 }
 
-/// Whether `command` asks nothing its sender may not: an enlistment names the sender, a node.
-fn enlists_only(command: &Command, sender: PeerId, node: bool) -> bool {
+/// Whether `command` asks nothing its sender may not: an enlistment names the sender, a node, and
+/// a registration names the sender as the session's owner, so no sender ends another's session
+/// (`mantle_meta::session::register`).
+fn names_only_its_sender(command: &Command, sender: PeerId, node: bool) -> bool {
     match command {
         Command::Root(mantle_meta::root::Command::Enlist(e)) => node && e.node == sender,
+        Command::Register { owner, .. } => *owner == sender,
         _ => true,
     }
 }

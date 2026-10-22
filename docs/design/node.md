@@ -211,7 +211,7 @@ A configuration key the node does not know is refused, as the S3 layer's readers
 they do not know. `mantle status` prints every derived value with the input or constraint that
 bound it (audit §12.6).
 
-*Planned for `mantle serve` (2026-10-22; research 64).* `mantle node`, the process the tests drive,
+*Planned for `mantle serve` (2026-10-21; research 64).* `mantle node`, the process the tests drive,
 is told every number it runs with. `mantle serve` is told only what the first column above names,
 measures the second, and derives the rest by these rules:
 
@@ -225,11 +225,17 @@ measures the second, and derives the rest by these rules:
   cgroup v2's `memory.max`, a job's limit, `RLIMIT_AS`). A share above a class's floor waits for
   its knee, where throughput stops growing as the share grows, measured at the scale step (§9.3):
   until then it has no basis.
-- **Sessions are named by their owner and its run** (the node's id and its run record, §1.6): a
-  registration ends its owner's sessions of earlier runs, whose process has ended, since a
-  directory holds one process (§1.6's `LOCK`). An identity the directory pins then holds at most
-  one session a range, so `max_sessions` is the identities the configuration names, and no session
-  expires by time: a restart leaves none behind. A client registers under its id and its start.
+- **Sessions are named by their owner and its run** (the node's id and its run record, §1.6),
+  and a registration by its place among its run's, which rises with each: a later registration
+  ends the session its owner's last one opened, whose process has ended, since a directory holds
+  one process (§1.6's `LOCK`), or which the process let go holding nothing under it. The same
+  registration delivered again is answered the session it opened, and an earlier one is refused,
+  `Superseded`, so none delivered late ends a session opened after it whose commands may be out:
+  a retry under a new session would apply one of them twice (`mantle_meta::session::register`).
+  An identity the directory pins then holds at most one session a range, so `max_sessions` is the
+  identities the configuration names, and no session expires by time: a restart leaves none
+  behind. A process refused `Superseded` is not its identity's newest, and its commands there are
+  answered so. A client registers under its id and its start.
 
 | Value (`mantle node`'s key) | Kind | Model and source |
 |---|---|---|
@@ -248,7 +254,7 @@ measures the second, and derives the rest by these rules:
 | `rules.*` | derived | sessions as above; an owner's answers kept as its commands held at once (`command_asks`), each at the largest answer (`wire::largest_answer_bytes`, computed as `largest_entry_bytes` is) |
 | `log.*` | derived | `hyper_log::Config::derive` from the log's block, its largest entry, its groups (the ranges and the liveness stream's), the floor's cache and uncommitted bytes, its checkpoints, and the least file (raft-log.md §5 sizes the file by measured rates later) |
 | `engine.extent_pages`, `engine.max_extents` | derived | an extent of pages; extents bounded by the device's space |
-| `engine.memtable_bytes`, `engine.fanout`, `engine.leaf_entries` | derived | the least write buffer; a node's pivots and a leaf's entries filling a page at the layer's key and value bounds |
+| `engine.memtable_bytes`, `engine.fanout`, `engine.leaf_entries` | derived, cited | the least write buffer, one row of the range's largest whole; SplinterDB's fanout of 8, at which the engine's measurements ran (engine-structure.md §5–§6), until the fanout is measured against mantle's key counts as its §4 asks; a leaf holding one memtable's rows (`benches/ranges.rs`) |
 | `transport_bytes` | derived | the transport's floor (`bounds::buffering` solved for its least funding) |
 | `volume.*` layout | derived | a segment holding one chunk record whole at the device's write unit, batches of one record, checksum blocks of the write unit (research 11 §5–§8) |
 | `gateway.window`, `gateway.objects`, `chunk_asks`, `command_asks`, `read_asks` | derived | the floor: a window of one block, one put and one get, a block's width of chunks, and the commands and reads those two hold at once |
@@ -283,7 +289,7 @@ the kill (`SIGKILL`) of the node leading the most of them (`crates/mantle/tests/
 cell's root range holds its volume table (§6.6); the rest of its rows, the region's root range,
 and `mantle init` making them are still to build.
 
-*Planned for `mantle init` (2026-10-22).* `mantle init DIR` makes a cell of one in `DIR`: the
+*Planned for `mantle init` (2026-10-21).* `mantle init DIR` makes a cell of one in `DIR`: the
 cell's authority (`mantle_cert::authority`, its key owner-only), the root key's first generation (32
 bytes from the OS, owner-only), the founding ranges' groups (one each for the root range and the
 Bucket, Name, File and Block layers, drawn from the OS), the node's identity (a key and the
@@ -342,7 +348,7 @@ separates the format choices fixed at format from the runtime choices, and it is
 when the device's identity, firmware, file system or topology no longer match it. On a laptop
 the key file and the data share a disk, which the node reports.
 
-*As built, and planned (2026-10-22).* The node's directory holds its metadata today: the shared
+*As built, and planned (2026-10-21).* The node's directory holds its metadata today: the shared
 log (`log`), its run record (`run`, §2.4 item 4) and each range's engine store
 (`range-GROUP.store`), and each volume's device directory holds `mantle/LOCK` and `mantle/volume`.
 `mantle init` and `mantle serve` add to the node's directory its `config`, `identity/` (the node's
@@ -389,7 +395,7 @@ A stop that runs past its requests' deadlines stops the rest as a crash would. A
 battery (§1.8) is an orderly stop that also ends each open native upload at a checkpoint
 (gateway.md §2.1), so what power's return replays is the drained state and not a run.
 
-*Planned for `mantle serve` (2026-10-22; research 64).* **A start that fails** exits non-zero with
+*Planned for `mantle serve` (2026-10-21; research 64).* **A start that fails** exits non-zero with
 a typed error naming the step and what failed in it, not a sysexits(3) code, which its own manual
 deprecates: the configuration (no such file, a line that does not parse, a key it does not know,
 a value out of its bounds), the identity (a file missing, a key that is not PKCS #8, a certificate

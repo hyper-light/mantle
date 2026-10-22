@@ -1,6 +1,6 @@
 # 64. Starting and stopping a node
 
-Status: research note, 2026-10-22. For node.md §1.4–§1.7: how `mantle serve` stops when its host
+Status: research note, 2026-10-21. For node.md §1.4–§1.7: how `mantle serve` stops when its host
 asks it to, how it reports a start that fails, and what a closing connection owes its peer. The
 decisions this note supports are in node.md §1.7.
 
@@ -18,7 +18,7 @@ closes while the process that holds it goes away.
 ### Kubernetes: how a pod's containers are stopped
 
 Kubernetes documentation, "Pod Lifecycle", §"Termination of Pods" (kubernetes.io, read
-2026-10-22):
+2026-10-21):
 
 - "kubelet makes requests to the container runtime to attempt to stop the containers in the pod by
   first sending a TERM (aka. SIGTERM) signal, with a grace period timeout, to the main process in
@@ -35,7 +35,7 @@ Kubernetes documentation, "Pod Lifecycle", §"Termination of Pods" (kubernetes.i
 
 ### sysexits(3): exit codes for failures
 
-FreeBSD's manual page for sysexits(3) (man.freebsd.org, read 2026-10-22) lists `EX_USAGE` (64)
+FreeBSD's manual page for sysexits(3) (man.freebsd.org, read 2026-10-21) lists `EX_USAGE` (64)
 through `EX_CONFIG` (78), and says of the interface: "This interface has been deprecated and is
 retained only for compatibility." "Its use is discouraged." "This interface is not portable." "The
 choice of an appropriate exit value is often ambiguous." Windows has no such convention.
@@ -64,7 +64,7 @@ and the leader takes requests again. hyper-durable exposes it as `Replica::trans
 ### The memory a process may use
 
 Linux's cgroup v2 documentation (docs.kernel.org, "Control Group v2", Memory Interface Files, read
-2026-10-22):
+2026-10-21):
 
 - `memory.max`: "The default is “max”. Memory usage hard limit. This is the main mechanism to
   limit memory usage of a cgroup. If a cgroup’s memory usage reaches this limit and can’t be

@@ -73,7 +73,11 @@ fn past_first_window() -> Entry {
             session: 0,
             serial,
             unanswered: 0,
-            command: Op::Register,
+            command: Op::Register {
+                owner: CLIENT,
+                run: 1,
+                nth: serial,
+            },
         });
     }
     entry

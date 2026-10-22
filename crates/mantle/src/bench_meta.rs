@@ -374,7 +374,11 @@ fn session_entry(commands: usize) -> Result<Duration, Error> {
             session: 0,
             serial: 0,
             unanswered: 0,
-            command: Command::Register,
+            command: Command::Register {
+                owner: 1,
+                run: 1,
+                nth: 1,
+            },
         }],
     };
     let answers = apply_entry(&mut m, 2, &register, Layer::Name, &rules)?;

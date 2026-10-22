@@ -25,15 +25,21 @@ pub const KEYS: [&str; 2] = ["k0", "k1"];
 /// The steps a key's check may take: the range simulation's (`crates/range/tests/sim.rs`).
 pub const CHECK_BUDGET: u64 = 10_000_000;
 
-/// A registration, told from the others by its serial.
-pub fn registration(serial: u64) -> Entry {
+/// A registration as `owner` in its `run`, told from the others and placed among the run's by its
+/// serial; asked through a client, its owner is the client's own id (a node refuses one naming
+/// another).
+pub fn registration(owner: u64, run: u64, serial: u64) -> Entry {
     Entry {
         at_ns: 0,
         commands: vec![Sessioned {
             session: 0,
             serial,
             unanswered: 0,
-            command: Op::Register,
+            command: Op::Register {
+                owner,
+                run,
+                nth: serial,
+            },
         }],
     }
 }
@@ -95,8 +101,15 @@ pub fn sessioned(session: u64, serial: u64, command: Op) -> Entry {
 }
 
 /// Registers a session of `group`'s range under `nonce`: its ID, or why the range gave none.
-pub async fn register(client: &mut Client, group: u128, nonce: u64) -> Result<u64, String> {
-    match client.command(group, &registration(nonce), u64::MAX).await {
+pub async fn register(
+    client: &mut Client,
+    group: u128,
+    (run, nonce): (u64, u64),
+) -> Result<u64, String> {
+    match client
+        .command(group, &registration(client.id(), run, nonce), u64::MAX)
+        .await
+    {
         Ok(answers) => match answers.as_slice() {
             [Answer::Registered { session }] => Ok(*session),
             _ => Err(format!("registration answered {answers:?}")),
@@ -112,7 +125,8 @@ pub async fn open_bucket(
     group: u128,
     nonce: u64,
 ) -> Result<Vec<Answer>, String> {
-    let session = register(client, group, nonce).await?;
+    // The bucket's opener is its identity's process before every workload phase's (`work`).
+    let session = register(client, group, (0, nonce)).await?;
     client
         .command(group, &sessioned(session, 1, open_gate()), u64::MAX)
         .await
@@ -214,7 +228,11 @@ pub async fn work(
     for (node, quic) in bound {
         client.learn(node, quic).unwrap();
     }
-    let session = match register(&mut client, group, id).await {
+    // Each phase's clients are new processes under the ids of the phase's before and of the
+    // bucket's opener (`open_bucket`, run 0): phase `p` is run `p + 1`, whose registration ends
+    // the session the run before it opened.
+    let run = phase + 1;
+    let session = match register(&mut client, group, (run, id)).await {
         Ok(session) => session,
         Err(why) => {
             tell(Told::Failed(id, why));

@@ -39,13 +39,15 @@ pub fn apply_entry<R: Rows>(
                 // Registering may expire the session least recently used, which it finds by
                 // the order of last use: the sessions used so far are written first, and read
                 // anew after.
-                Command::Register => {
+                Command::Register { owner, run, nth } => {
                     touched.write(&mut overlay, index)?;
-                    match session::register(&mut overlay, index, position, entry.at_ns, rules)? {
+                    let at = (position, entry.at_ns);
+                    match session::register(&mut overlay, index, at, rules, (*owner, *run, *nth))? {
                         session::Registration::Session(session) => Answer::Registered { session },
                         session::Registration::Full { until_ns } => {
                             Answer::SessionsFull { until_ns }
                         }
+                        session::Registration::Superseded => Answer::Superseded,
                     }
                 }
                 command => match touched.check(&mut overlay, c.session, c.serial)? {
@@ -148,6 +150,16 @@ mod tests {
         }
     }
 
+    /// Owner 1's first registration.
+    fn registration() -> Sessioned {
+        let command = Command::Register {
+            owner: 1,
+            run: 1,
+            nth: 1,
+        };
+        from(0, 0, command)
+    }
+
     fn entry(at_ns: u64, commands: Vec<Sessioned>) -> Entry {
         Entry { at_ns, commands }
     }
@@ -176,7 +188,7 @@ mod tests {
         let run = |m: &mut Model, index, e: Entry| {
             apply_entry(m, index, &e, Layer::Name, &RULES).unwrap()
         };
-        let answers = run(&mut m, 1, entry(10, vec![from(0, 0, Command::Register)]));
+        let answers = run(&mut m, 1, entry(10, vec![registration()]));
         let [Answer::Registered { session }] = answers[..] else {
             panic!("{answers:?}")
         };
@@ -254,7 +266,7 @@ mod tests {
         let run = |m: &mut Model, index, e: Entry| {
             apply_entry(m, index, &e, Layer::Name, &rules).unwrap()
         };
-        let answers = run(&mut m, 1, entry(10, vec![from(0, 0, Command::Register)]));
+        let answers = run(&mut m, 1, entry(10, vec![registration()]));
         let [Answer::Registered { session }] = answers[..] else {
             panic!("{answers:?}")
         };
@@ -321,9 +333,7 @@ mod tests {
             let run = |m: &mut Model, index, commands: Vec<Sessioned>| {
                 apply_entry(m, index, &entry(10 * index, commands), Layer::Name, &rules).unwrap()
             };
-            let [Answer::Registered { session }] =
-                run(&mut m, 1, vec![from(0, 0, Command::Register)])[..]
-            else {
+            let [Answer::Registered { session }] = run(&mut m, 1, vec![registration()])[..] else {
                 panic!()
             };
             let sessioned = |c: Sessioned| Sessioned { session, ..c };
@@ -362,9 +372,7 @@ mod tests {
         let run = |m: &mut Model, index, commands: Vec<Sessioned>| {
             apply_entry(m, index, &entry(10 * index, commands), Layer::Name, &rules).unwrap()
         };
-        let [Answer::Registered { session }] =
-            run(&mut m, 1, vec![from(0, 0, Command::Register)])[..]
-        else {
+        let [Answer::Registered { session }] = run(&mut m, 1, vec![registration()])[..] else {
             panic!()
         };
         let sessioned = |c: Sessioned| Sessioned { session, ..c };
@@ -383,7 +391,7 @@ mod tests {
     #[test]
     fn a_session_unused_past_its_lifetime_expires_at_the_entry_that_passes_it() {
         let mut m = name_range();
-        let e = entry(10, vec![from(0, 0, Command::Register)]);
+        let e = entry(10, vec![registration()]);
         let [Answer::Registered { session }] =
             apply_entry(&mut m, 1, &e, Layer::Name, &RULES).unwrap()[..]
         else {
@@ -440,9 +448,15 @@ mod tests {
             let mut answers = Vec::new();
             for (position, c) in entry.commands.iter().enumerate() {
                 let answer = match &c.command {
-                    Command::Register => {
-                        match session::register(&mut overlay, index, position, entry.at_ns, rules)
-                            .unwrap()
+                    Command::Register { owner, run, nth } => {
+                        match session::register(
+                            &mut overlay,
+                            index,
+                            (position, entry.at_ns),
+                            rules,
+                            (*owner, *run, *nth),
+                        )
+                        .unwrap()
                         {
                             session::Registration::Session(session) => {
                                 Answer::Registered { session }
@@ -450,6 +464,7 @@ mod tests {
                             session::Registration::Full { until_ns } => {
                                 Answer::SessionsFull { until_ns }
                             }
+                            session::Registration::Superseded => Answer::Superseded,
                         }
                     }
                     command => {
@@ -541,12 +556,25 @@ mod tests {
         let mut seen = [0u64; 3];
         let mut registered = 0u64;
         let mut at_ns = 0u64;
+        // Each of a few owners' last registration: so some registrations end an owner's last
+        // session, and now and then one arrives again or late.
+        let mut last = [0u64; 8];
         for index in 1..=400u64 {
             at_ns += next(20);
             let commands = (0..1 + next(64))
                 .map(|_| {
                     if sessions.is_empty() || next(64) == 0 {
-                        return from(0, 0, Command::Register);
+                        let owner = next(8);
+                        let nth = &mut last[owner as usize];
+                        let nth = match next(8) {
+                            0 => nth.saturating_sub(1),
+                            1 => *nth,
+                            _ => {
+                                *nth += 1;
+                                *nth
+                            }
+                        };
+                        return from(0, 0, Command::Register { owner, run: 1, nth });
                     }
                     let pick = next(sessions.len() as u64) as usize;
                     let (session, sent) = &mut sessions[pick];
@@ -611,7 +639,7 @@ mod tests {
     fn replicas_applying_the_same_log_agree() {
         let log: Vec<Entry> = (1..=6u64)
             .map(|i| {
-                let mut commands = vec![from(0, 0, Command::Register)];
+                let mut commands = vec![registration()];
                 if i > 1 {
                     let session = 1u64 << 16;
                     commands = vec![

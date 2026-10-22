@@ -1505,7 +1505,10 @@ fn writer(
             }
             let mut answered = BTreeMap::new();
             for serial in 1..=writes {
-                match client.command(GROUP, &registration(serial), u64::MAX).await {
+                match client
+                    .command(GROUP, &registration(id, 1, serial), u64::MAX)
+                    .await
+                {
                     Ok(answers) => {
                         answered.insert(serial, answers);
                     }
@@ -2060,7 +2063,7 @@ fn a_cell_hosts_a_range_of_each_layer_one_voter_a_node_and_each_serves_through_a
     let registered = cell.asked(
         (1..)
             .zip(EVERY_LAYER)
-            .map(|(n, (group, _))| (*group, registration(n)))
+            .map(|(n, (group, _))| (*group, registration(CLIENT, 1, n)))
             .collect(),
     );
     let opened = cell.asked(
@@ -2115,7 +2118,7 @@ fn a_cell_hosts_a_range_of_each_layer_one_voter_a_node_and_each_serves_through_a
     let again = cell.asked(
         (10..)
             .zip(EVERY_LAYER)
-            .map(|(n, (group, _))| (*group, registration(n)))
+            .map(|(n, (group, _))| (*group, registration(CLIENT, 1, n)))
             .collect(),
     );
     sessions(&again);

@@ -5,17 +5,20 @@
 //! times pass its lifetime without it, or when those answers pass its bounds, so every replica
 //! expires the same sessions at the same entry.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use crate::engine::{Rows, Write};
 use crate::error::MetaError;
 use crate::key::LOCAL;
-use crate::key::marker::{EXPIRY, SESSION, SESSIONS};
+use crate::key::marker::{EXPIRY, OWNER, SESSION, SESSIONS};
 use crate::record::{self, Session};
 use crate::wire::{Answer, MAX_COMMANDS, Sessioned};
 
-// A session's row is `[LOCAL, SESSION, session]`, and its place in the order of last use
-// `[LOCAL, EXPIRY, last use, session]`.
+// A session's row is `[LOCAL, SESSION, session]`, its place in the order of last use
+// `[LOCAL, EXPIRY, last use, session]`, and its owner's `[LOCAL, OWNER, owner]` holds the session
+// that owner's last registration opened and that registration's run and place in the run, the
+// session named still where the range has since removed it.
 
 /// How many sessions the range holds.
 const COUNT: &[u8] = &[LOCAL, SESSIONS];
@@ -53,6 +56,12 @@ pub enum Check {
 fn session_key(session: u64) -> Vec<u8> {
     let mut k = vec![LOCAL, SESSION];
     k.extend_from_slice(&session.to_be_bytes());
+    k
+}
+
+fn owner_key(owner: u64) -> Vec<u8> {
+    let mut k = vec![LOCAL, OWNER];
+    k.extend_from_slice(&owner.to_be_bytes());
     k
 }
 
@@ -250,6 +259,9 @@ pub enum Registration {
     Full {
         until_ns: u64,
     },
+    /// The owner registered later than this registration, in a later run or later in this one:
+    /// no session is opened, and the later registration's is kept.
+    Superseded,
 }
 
 /// Registers a session at the command in place `position` of entry `index`, and returns its
@@ -261,12 +273,21 @@ pub enum Registration {
 /// The Raft dissertation expires sessions by a rule all replicas apply alike, the lifetime,
 /// and has a client whose session expired treat its commands' outcome as unknown (06 §A1.8),
 /// so a bound on sessions is kept by refusing registration, not by expiring the living.
+///
+/// A registration names its owner, the identity its sender authenticated as, the owner's run,
+/// and its place among the run's registrations (docs/design/node.md §1.4), and the range keeps
+/// that order of each owner's last. A later registration ends the session the owner's last one
+/// opened, if the range still holds it: the process that registered it has ended, or registers
+/// again only once it holds nothing under it. The same registration delivered again is
+/// answered the session it opened, and an earlier one is refused, `Superseded`, so none
+/// delivered late ends a session opened after it, whose commands may be out. An owner then holds
+/// at most one session, and a restart leaves none behind to wait out a lifetime.
 pub fn register<R: Rows>(
     rows: &mut R,
     index: u64,
-    position: usize,
-    at_ns: u64,
+    (position, at_ns): (usize, u64),
     rules: &Rules,
+    (owner, run, nth): (u64, u64, u64),
 ) -> Result<Registration, MetaError> {
     let places = u64::try_from(MAX_COMMANDS).map_err(|_| MetaError::Corrupt)?;
     let session = u64::try_from(position)
@@ -274,20 +295,38 @@ pub fn register<R: Rows>(
         .filter(|&p| p < places)
         .and_then(|p| index.checked_mul(places)?.checked_add(p))
         .ok_or(MetaError::Corrupt)?;
+    let last = owned(rows, owner)?;
+    if let Some(last) = &last {
+        match last.order.cmp(&(run, nth)) {
+            Ordering::Greater => return Ok(Registration::Superseded),
+            // The session it opened, which the range may have expired since: its owner finds
+            // that at its first command.
+            Ordering::Equal => return Ok(Registration::Session(last.session)),
+            Ordering::Less => {}
+        }
+    }
     let mut held = count(rows)?;
     let mut writes = Vec::new();
-    if held >= rules.max_sessions {
-        let (from, to) = (vec![LOCAL, EXPIRY], vec![LOCAL, EXPIRY.saturating_add(1)]);
-        let (k, _) = rows.next(&from, &to)?.ok_or(MetaError::Corrupt)?;
-        let ends_ns = last_used(&k)?.saturating_add(rules.lifetime_ns);
-        // Within its lifetime at `ends_ns` itself, as `expire` counts it.
-        if ends_ns >= at_ns {
-            return Ok(Registration::Full {
-                until_ns: ends_ns.saturating_add(1),
-            });
+    match last.and_then(|l| Some((l.session, l.last_ns?))) {
+        // Its own earlier session's place, which the bound already counts.
+        Some((earlier, last_ns)) => {
+            writes.extend(removal(&expiry_key(last_ns, earlier))?);
+            held = held.checked_sub(1).ok_or(MetaError::Corrupt)?;
         }
-        writes.extend(removal(&k)?);
-        held = held.checked_sub(1).ok_or(MetaError::Corrupt)?;
+        None if held >= rules.max_sessions => {
+            let (from, to) = (vec![LOCAL, EXPIRY], vec![LOCAL, EXPIRY.saturating_add(1)]);
+            let (k, _) = rows.next(&from, &to)?.ok_or(MetaError::Corrupt)?;
+            let ends_ns = last_used(&k)?.saturating_add(rules.lifetime_ns);
+            // Within its lifetime at `ends_ns` itself, as `expire` counts it.
+            if ends_ns >= at_ns {
+                return Ok(Registration::Full {
+                    until_ns: ends_ns.saturating_add(1),
+                });
+            }
+            writes.extend(removal(&k)?);
+            held = held.checked_sub(1).ok_or(MetaError::Corrupt)?;
+        }
+        None => {}
     }
     let row = Session {
         last_ns: at_ns,
@@ -298,8 +337,48 @@ pub fn register<R: Rows>(
     writes.push(Write::Put(session_key(session), row.encode()?));
     writes.push(Write::Put(expiry_key(at_ns, session), Vec::new()));
     writes.push(Write::Put(COUNT.to_vec(), record::encode_number(held)));
+    let last = [session, run, nth].map(u64::to_be_bytes).concat();
+    writes.push(Write::Put(owner_key(owner), last));
     rows.apply(index, &writes)?;
     Ok(Registration::Session(session))
+}
+
+/// Bytes of an owner's row: the session, the run and the place in it, each a big-endian word.
+const OWNED_BYTES: usize = 24;
+
+/// What a range keeps of an owner's last registration.
+struct Owned {
+    /// The session it opened.
+    session: u64,
+    /// Its run, then its place in the run.
+    order: (u64, u64),
+    /// That session's last use, while the range holds it.
+    last_ns: Option<u64>,
+}
+
+/// What the range keeps of `owner`'s last registration, if it took one.
+fn owned<R: Rows>(rows: &mut R, owner: u64) -> Result<Option<Owned>, MetaError> {
+    let Some(bytes) = rows.get(&owner_key(owner))? else {
+        return Ok(None);
+    };
+    let word = |at: std::ops::Range<usize>| {
+        bytes
+            .get(at)
+            .and_then(|w| <[u8; 8]>::try_from(w).ok())
+            .map(u64::from_be_bytes)
+            .ok_or(MetaError::Corrupt)
+    };
+    if bytes.len() != OWNED_BYTES {
+        return Err(MetaError::Corrupt);
+    }
+    let session = word(0..8)?;
+    let order = (word(8..16)?, word(16..24)?);
+    let last_ns = read(rows, session)?.map(|s| s.last_ns);
+    Ok(Some(Owned {
+        session,
+        order,
+        last_ns,
+    }))
 }
 
 /// Expires the sessions whose lifetime entry time `at_ns` has passed, at most
@@ -382,7 +461,11 @@ mod tests {
             session,
             serial,
             unanswered,
-            command: crate::wire::Command::Register,
+            command: crate::wire::Command::Register {
+                owner: 1,
+                run: 1,
+                nth: 1,
+            },
         }
     }
 
@@ -392,6 +475,9 @@ mod tests {
         })
     }
 
+    /// A registration at `position` of entry `index`, its owner's first: each test's
+    /// registrations are distinct owners' unless a test names the owner, its run and the
+    /// registration's place in it (`register_as`).
     fn register(
         m: &mut Model,
         index: u64,
@@ -399,9 +485,25 @@ mod tests {
         at_ns: u64,
         rules: &Rules,
     ) -> Result<u64, MetaError> {
-        match super::register(m, index, position, at_ns, rules)? {
+        register_as(
+            m,
+            (index, position),
+            at_ns,
+            rules,
+            (index * 100 + position as u64, 1, 1),
+        )
+    }
+
+    fn register_as(
+        m: &mut Model,
+        (index, position): (u64, usize),
+        at_ns: u64,
+        rules: &Rules,
+        owner: (u64, u64, u64),
+    ) -> Result<u64, MetaError> {
+        match super::register(m, index, (position, at_ns), rules, owner)? {
             Registration::Session(s) => Ok(s),
-            Registration::Full { .. } => Err(MetaError::Corrupt),
+            Registration::Full { .. } | Registration::Superseded => Err(MetaError::Corrupt),
         }
     }
 
@@ -515,11 +617,11 @@ mod tests {
         // At the bound, with both sessions live, a third is refused until b's lifetime ends,
         // b being the least recently used, and neither is taken from its gateway.
         assert_eq!(
-            super::register(&mut m, 4, 0, 40, &RULES).unwrap(),
+            super::register(&mut m, 4, (0, 40), &RULES, (400, 1, 1)).unwrap(),
             Registration::Full { until_ns: 121 }
         );
         assert_eq!(
-            super::register(&mut m, 4, 0, 120, &RULES).unwrap(),
+            super::register(&mut m, 4, (0, 120), &RULES, (400, 1, 1)).unwrap(),
             Registration::Full { until_ns: 121 }
         );
         assert_eq!(check(&mut m, b, 1).unwrap(), Check::New);
@@ -534,5 +636,98 @@ mod tests {
         assert_eq!(count(&mut m).unwrap(), 1);
         expire(&mut m, 6, 222, &RULES).unwrap();
         assert_eq!(count(&mut m).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_later_registration_ends_the_session_its_owner_registered_before() {
+        let mut m = Model::default();
+        let first = register_as(&mut m, (1, 0), 10, &RULES, (9, 1, 1)).unwrap();
+        record(&mut m, 2, &used(first, 1, 0), Some(&answer(1)), 20, &RULES).unwrap();
+        let other = register_as(&mut m, (3, 0), 30, &RULES, (8, 1, 1)).unwrap();
+        // The owner's process ended and its next run registers: the first session goes with
+        // its answers, the other owner's stays, and the range holds two.
+        let second = register_as(&mut m, (4, 0), 40, &RULES, (9, 2, 1)).unwrap();
+        assert_eq!(check(&mut m, first, 1).unwrap(), Check::Unknown);
+        assert_eq!(check(&mut m, second, 1).unwrap(), Check::New);
+        assert_eq!(check(&mut m, other, 1).unwrap(), Check::New);
+        assert_eq!(count(&mut m).unwrap(), 2);
+        // Later in the same run: a process that let its session go, holding nothing under it,
+        // registers again.
+        let third = register_as(&mut m, (5, 0), 50, &RULES, (9, 2, 2)).unwrap();
+        assert_eq!(check(&mut m, second, 1).unwrap(), Check::Unknown);
+        assert_eq!(check(&mut m, third, 1).unwrap(), Check::New);
+        assert_eq!(count(&mut m).unwrap(), 2);
+    }
+
+    #[test]
+    fn a_registration_delivered_again_is_answered_its_session_and_ends_none() {
+        let mut m = Model::default();
+        let first = register_as(&mut m, (1, 0), 10, &RULES, (9, 1, 1)).unwrap();
+        record(&mut m, 2, &used(first, 1, 0), Some(&answer(1)), 20, &RULES).unwrap();
+        // The same registration at a later entry, as a leader's retry puts it in the log twice:
+        // the session it opened, its answer kept.
+        assert_eq!(
+            super::register(&mut m, 3, (0, 30), &RULES, (9, 1, 1)).unwrap(),
+            Registration::Session(first)
+        );
+        assert_eq!(check(&mut m, first, 1).unwrap(), Check::Answered(answer(1)));
+        assert_eq!(count(&mut m).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_registration_older_than_its_owners_last_is_superseded() {
+        // Delivered late, after a later registration opened a session whose commands may be out,
+        // an earlier one of the same run, or one of an earlier run, ends nothing.
+        let mut m = Model::default();
+        let session = register_as(&mut m, (1, 0), 10, &RULES, (9, 2, 2)).unwrap();
+        record(
+            &mut m,
+            2,
+            &used(session, 1, 0),
+            Some(&answer(1)),
+            20,
+            &RULES,
+        )
+        .unwrap();
+        for (index, (run, nth)) in [(3, (2, 1)), (4, (1, 7))] {
+            assert_eq!(
+                super::register(&mut m, index, (0, 10 * index), &RULES, (9, run, nth)).unwrap(),
+                Registration::Superseded
+            );
+        }
+        assert_eq!(
+            check(&mut m, session, 1).unwrap(),
+            Check::Answered(answer(1))
+        );
+        assert_eq!(count(&mut m).unwrap(), 1);
+    }
+
+    #[test]
+    fn an_owner_at_the_bound_takes_its_own_place_back() {
+        // Two owners fill the bound, both within their lifetimes: a third owner is refused,
+        // and either of the two registering again takes its own session's place.
+        let mut m = Model::default();
+        let a = register_as(&mut m, (1, 0), 10, &RULES, (1, 1, 1)).unwrap();
+        register_as(&mut m, (2, 0), 20, &RULES, (2, 1, 1)).unwrap();
+        assert_eq!(
+            super::register(&mut m, 3, (0, 30), &RULES, (3, 1, 1)).unwrap(),
+            Registration::Full { until_ns: 111 }
+        );
+        let again = register_as(&mut m, (4, 0), 40, &RULES, (1, 2, 1)).unwrap();
+        assert_eq!(check(&mut m, a, 1).unwrap(), Check::Unknown);
+        assert_eq!(check(&mut m, again, 1).unwrap(), Check::New);
+        assert_eq!(count(&mut m).unwrap(), 2);
+    }
+
+    #[test]
+    fn an_owner_whose_session_expired_registers_without_counting_it_twice() {
+        let mut m = Model::default();
+        register_as(&mut m, (1, 0), 10, &RULES, (5, 1, 1)).unwrap();
+        // Unused past its lifetime, the session expires; its owner's row still names it.
+        expire(&mut m, 2, 111, &RULES).unwrap();
+        assert_eq!(count(&mut m).unwrap(), 0);
+        let next = register_as(&mut m, (3, 0), 120, &RULES, (5, 1, 2)).unwrap();
+        assert_eq!(check(&mut m, next, 1).unwrap(), Check::New);
+        assert_eq!(count(&mut m).unwrap(), 1);
     }
 }

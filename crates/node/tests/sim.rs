@@ -137,10 +137,10 @@ fn a_cells_histories_through_cuts_power_cuts_and_device_faults_are_linearizable_
 }
 
 /// A registration whose answer takes longer than every exchange its client measured is applied
-/// once. Asked again, a registration registers again (the Raft dissertation §6.3), so the client
-/// cuts its exchange by no period and waits for the leader's answer (`mantle_node::client`); a
-/// client that cut it and asked again would leave a session registered for nothing each time, and
-/// a range holding its bound of sessions refuses every registration after.
+/// once. Asked again, a registration is applied again (the Raft dissertation §6.3): answered the
+/// session it opened (`mantle_meta::session::register`), but an entry in the log each time, so the
+/// client cuts its exchange by no period and waits for the leader's answer
+/// (`mantle_node::client`).
 #[test]
 fn a_registration_slower_than_every_exchange_its_client_measured_is_applied_once() {
     // A cell of three, one switch apart.
@@ -148,7 +148,7 @@ fn a_registration_slower_than_every_exchange_its_client_measured_is_applied_once
     cell.leader();
     let order: Vec<u64> = (1..=cell.nodes).collect();
     let asking = cell.asking(CLIENT, &order);
-    let (first, _) = cell.ask(&asking, GROUP, registration(1));
+    let (first, _) = cell.ask(&asking, GROUP, registration(CLIENT, 1, 1));
     assert!(
         matches!(first.as_deref(), Ok([Answer::Registered { .. }])),
         "the first registration answered {first:?}"
@@ -159,7 +159,7 @@ fn a_registration_slower_than_every_exchange_its_client_measured_is_applied_once
     let (_, one_way, jitter) = PROFILES[2];
     cell.slow_clients(SimPath::in_order(one_way, jitter));
     asking
-        .try_send((GROUP, registration(2)))
+        .try_send((GROUP, registration(CLIENT, 1, 2)))
         .map_err(|_| "the client's asks are full")
         .unwrap();
     let (second, asks) = cell.until("the second registration's answer", |c| {

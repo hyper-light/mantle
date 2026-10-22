@@ -520,6 +520,11 @@ impl Client {
         most.unwrap_or_else(bounds::initial_pto)
     }
 
+    /// The client's own id, as the nodes' directories name it.
+    pub fn id(&self) -> PeerId {
+        self.id
+    }
+
     /// What its asks came to so far.
     pub fn asks(&self) -> Asks {
         self.asks

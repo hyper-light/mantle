@@ -130,7 +130,11 @@ fn registration(nonce: u64) -> Entry {
             session: 0,
             serial: nonce,
             unanswered: 0,
-            command: Op::Register,
+            command: Op::Register {
+                owner: nonce,
+                run: 1,
+                nth: 1,
+            },
         }],
     }
 }

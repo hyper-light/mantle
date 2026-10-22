@@ -148,12 +148,14 @@ impl Asking {
     }
 
     /// The next entry, when none is out and a command waits: the session's registration first,
-    /// under `nonce`; then as many waiting commands as `max_commands` lets one entry carry and fit
-    /// `max_entry_bytes` once encoded, each the next serial. A waiting command that fits no entry
-    /// alone is answered refused, `Malformed`, in `refused`.
+    /// as `owner` (the node, as it authenticates) in its `run`, placed at `nth` among the run's
+    /// registrations, under `nonce`; then as many waiting commands as `max_commands` lets one
+    /// entry carry and fit `max_entry_bytes` once encoded, each the next serial. A waiting command
+    /// that fits no entry alone is answered refused, `Malformed`, in `refused`.
     pub fn next_entry(
         &mut self,
         (max_commands, max_entry_bytes): (usize, usize),
+        (owner, run, nth): (u64, u64, u64),
         nonce: u64,
         refused: &mut Vec<(CommandAsk, CommandOutcome)>,
     ) {
@@ -167,7 +169,7 @@ impl Asking {
                     session: 0,
                     serial: nonce,
                     unanswered: 0,
-                    command: Command::Register,
+                    command: Command::Register { owner, run, nth },
                 }],
             };
             self.out = Some(Out {
@@ -228,21 +230,28 @@ impl Asking {
 
     /// The entry out was answered with `answers`, one for each of its commands: each command's
     /// outcome into `done`. A registration answered `Registered` opens the session; one answered
-    /// otherwise is asked again. A command whose session the range no longer holds was not applied
-    /// (`Answer::SessionExpired`): the session is registered anew and the command waits again, in
-    /// its place.
+    /// `Superseded` says the owner registered in a later run, a process other than this one, and
+    /// each waiting command is answered so; one answered otherwise is asked again. A command whose
+    /// session the range no longer holds was not applied (`Answer::SessionExpired`): the session is
+    /// registered anew and the command waits again, in its place.
     pub fn answered(&mut self, answers: Vec<Answer>, done: &mut Vec<(CommandAsk, CommandOutcome)>) {
         let Some(out) = self.out.take() else {
             return;
         };
         self.leader_found();
         match out.carried {
-            Carried::Registration { .. } => {
-                if let [Answer::Registered { session }] = answers.as_slice() {
+            Carried::Registration { .. } => match answers.as_slice() {
+                [Answer::Registered { session }] => {
                     self.session = *session;
                     self.next_serial = 1;
                 }
-            }
+                [Answer::Superseded] => {
+                    for wanted in self.waiting.drain(..) {
+                        done.push((wanted.ask, CommandOutcome::Answered(Answer::Superseded)));
+                    }
+                }
+                _ => {}
+            },
             Carried::Commands(commands) => {
                 if answers.len() != commands.len() || out.entry.commands.len() != commands.len() {
                     for (ask, _, _) in commands {
@@ -352,7 +361,11 @@ mod tests {
     fn wanted(ask: CommandAsk, deadline_ns: u64) -> Wanted {
         Wanted {
             ask,
-            command: Command::Register,
+            command: Command::Register {
+                owner: 1,
+                run: 1,
+                nth: 1,
+            },
             deadline_ns,
         }
     }
@@ -367,14 +380,14 @@ mod tests {
     fn a_session_is_registered_first_then_commands_go_in_order_as_serials() {
         let mut a = asking(&[wanted(1, 100), wanted(2, 100), wanted(3, 100)]);
         let mut done = Vec::new();
-        a.next_entry((2, 1 << 20), 42, &mut done);
+        a.next_entry((2, 1 << 20), (1, 1, 42), 42, &mut done);
         let out = a.out.clone().unwrap();
         assert_eq!(out.carried, Carried::Registration { nonce: 42 });
         assert_eq!(out.entry.commands[0].serial, 42);
         a.answered(vec![Answer::Registered { session: 9 }], &mut done);
         assert_eq!((a.session, a.next_serial), (9, 1));
         // Two to an entry: serials 1 and 2, the oldest unanswered the first.
-        a.next_entry((2, 1 << 20), 43, &mut done);
+        a.next_entry((2, 1 << 20), (1, 1, 43), 43, &mut done);
         let out = a.out.clone().unwrap();
         assert_eq!(
             out.carried,
@@ -387,7 +400,7 @@ mod tests {
                 .all(|c| c.session == 9 && c.unanswered == 1)
         );
         a.answered(vec![Answer::Repeated, Answer::WrongLayer], &mut done);
-        a.next_entry((2, 1 << 20), 44, &mut done);
+        a.next_entry((2, 1 << 20), (1, 1, 44), 44, &mut done);
         assert_eq!(
             a.out.as_ref().unwrap().carried,
             Carried::Commands(vec![(3, 3, 100)])
@@ -402,6 +415,24 @@ mod tests {
     }
 
     #[test]
+    fn a_superseded_registration_answers_each_waiting_command_so() {
+        // The owner registered in a later run: this process's commands go to no session.
+        let mut a = asking(&[wanted(1, 100), wanted(2, 100)]);
+        let mut done = Vec::new();
+        a.next_entry((2, 1 << 20), (1, 1, 5), 5, &mut done);
+        a.answered(vec![Answer::Superseded], &mut done);
+        assert_eq!(a.session, 0);
+        assert!(a.waiting.is_empty() && a.out.is_none());
+        assert_eq!(
+            done,
+            vec![
+                (1, CommandOutcome::Answered(Answer::Superseded)),
+                (2, CommandOutcome::Answered(Answer::Superseded)),
+            ]
+        );
+    }
+
+    #[test]
     fn an_entry_takes_what_fits_its_bytes_and_one_that_fits_none_is_refused() {
         let mut a = asking(&[wanted(1, 100), wanted(2, 100)]);
         a.session = 5;
@@ -411,7 +442,11 @@ mod tests {
                 session: 5,
                 serial: 1,
                 unanswered: 1,
-                command: Command::Register,
+                command: Command::Register {
+                    owner: 1,
+                    run: 1,
+                    nth: 1,
+                },
             }],
         }
         .encode()
@@ -419,7 +454,7 @@ mod tests {
         .len();
         let mut done = Vec::new();
         // Room for one command an entry: the first goes alone.
-        a.next_entry((16, one), 0, &mut done);
+        a.next_entry((16, one), (1, 1, 0), 0, &mut done);
         assert_eq!(
             a.out.as_ref().unwrap().carried,
             Carried::Commands(vec![(1, 1, 100)])
@@ -427,7 +462,7 @@ mod tests {
         // Room for none: each is refused, nothing goes.
         let mut b = asking(&[wanted(1, 100), wanted(2, 100)]);
         b.session = 5;
-        b.next_entry((16, one - 1), 0, &mut done);
+        b.next_entry((16, one - 1), (1, 1, 0), 0, &mut done);
         assert!(b.out.is_none() && b.waiting.is_empty());
         assert_eq!(
             done,
@@ -443,7 +478,7 @@ mod tests {
         let mut a = asking(&[wanted(1, 100), wanted(2, 100), wanted(3, 100)]);
         a.session = 5;
         let mut done = Vec::new();
-        a.next_entry((2, 1 << 20), 0, &mut done);
+        a.next_entry((2, 1 << 20), (1, 1, 0), 0, &mut done);
         a.answered(
             vec![Answer::SessionExpired, Answer::SessionExpired],
             &mut done,
@@ -453,7 +488,7 @@ mod tests {
         let order: Vec<_> = a.waiting.iter().map(|w| w.ask).collect();
         assert_eq!(order, vec![1, 2, 3]);
         // The new session first.
-        a.next_entry((2, 1 << 20), 8, &mut done);
+        a.next_entry((2, 1 << 20), (1, 1, 8), 8, &mut done);
         assert_eq!(
             a.out.as_ref().unwrap().carried,
             Carried::Registration { nonce: 8 }
@@ -465,7 +500,7 @@ mod tests {
         let mut a = asking(&[wanted(1, 50), wanted(2, 200), wanted(3, 60)]);
         a.session = 5;
         let mut done = Vec::new();
-        a.next_entry((2, 1 << 20), 0, &mut done);
+        a.next_entry((2, 1 << 20), (1, 1, 0), 0, &mut done);
         assert_eq!(a.next_deadline(), Some(50));
         // Command 3, waiting, passes; the entry out holds 2, not yet past.
         assert!(!a.expire(100, &mut done));

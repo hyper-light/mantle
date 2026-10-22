@@ -508,7 +508,7 @@ async fn client(
             }
             Ask::Command(serial) => {
                 let answered = client
-                    .command(GROUP, &registration(serial), u64::MAX)
+                    .command(GROUP, &registration(CLIENT, 1, serial), u64::MAX)
                     .await
                     .map_err(|e| e.to_string());
                 if reports.send(Report::Answered(serial, answered)).is_err() {
@@ -1357,7 +1357,7 @@ impl Cell {
     fn write(&mut self, serial: u64) -> (u64, Answer) {
         for _ in 0..self.nodes {
             let leader = self.leader();
-            self.order(leader, Order::Propose(registration(serial)));
+            self.order(leader, Order::Propose(registration(serial, 1, serial)));
             let heard = self.watch.until(&self.reports, |w| {
                 if let Some(applied) = w.applied.get(&leader).and_then(|a| a.get(&serial)) {
                     return Some(Some(applied.clone()));
@@ -1807,7 +1807,7 @@ fn leader_cut_off(engines: Engines, nodes: u64) {
         if agreed { Some(first.leader) } else { None }
     });
     // A write the new leader applies, which the node cut off cannot have.
-    cell.order(elected, Order::Propose(registration(2)));
+    cell.order(elected, Order::Propose(registration(2, 1, 2)));
     let applied = cell.watch.until(&cell.reports, |w| {
         let mut each = others
             .iter()

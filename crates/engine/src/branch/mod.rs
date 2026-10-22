@@ -33,7 +33,6 @@ use crate::error::{Error, Malformed};
 use crate::fst::surf::{Surf, SurfBuilder};
 use crate::fst::trie::{Trie, TrieBuilder, Width};
 use crate::store::{MIN_PAGE, Run, Span, Store};
-use crate::util::keys::Pieces;
 use hyper_block::block::BlockFile;
 use std::cmp::Ordering;
 
@@ -90,21 +89,6 @@ fn key_head(suffix: &[u8]) -> u32 {
         *d = *s;
     }
     u32::from_be_bytes(b)
-}
-
-/// [`key_head`] of a suffix read in two pieces, `a` then `b`.
-fn key_head_of(a: &[u8], b: &[u8]) -> u32 {
-    if let Some(h) = a.first_chunk::<KEY_HEAD>() {
-        return u32::from_be_bytes(*h);
-    }
-    if a.is_empty() {
-        return key_head(b);
-    }
-    let mut h = [0u8; KEY_HEAD];
-    for (d, s) in h.iter_mut().zip(a.iter().chain(b)) {
-        *d = *s;
-    }
-    u32::from_be_bytes(h)
 }
 
 /// A built branch: its root page, its height (1 for a lone leaf), its entries, and the extents
@@ -215,9 +199,6 @@ pub(crate) struct Page {
     ends: Vec<u64>,
     /// Where the first entry's key ends in `bytes`.
     first_end: usize,
-    /// The last entry's shared bytes and where its staged key lies in `bytes`: the key the next
-    /// entry is compared with, read without unpacking its ends.
-    last: [usize; 3],
     /// The keys' bytes and the rests' bytes, each summed: what the page's size counts.
     key_bytes: usize,
     rest_bytes: usize,
@@ -237,7 +218,6 @@ impl Page {
             bytes: Vec::with_capacity(capacity.saturating_mul(2)),
             ends: Vec::with_capacity(entries),
             first_end: 0,
-            last: [0; 3],
             key_bytes: 0,
             rest_bytes: 0,
             prefix: 0,
@@ -263,16 +243,6 @@ impl Page {
         self.bytes.get(self.first_end..end).unwrap_or(&[])
     }
 
-    /// The last entry's key, read where it is staged: the bytes it shares with the first, from
-    /// the first, then its own.
-    fn last_key(&self) -> Pieces<'_> {
-        let [shared, start, end] = self.last;
-        Pieces {
-            head: self.first().get(..shared).unwrap_or(&[]),
-            tail: self.bytes.get(start..end).unwrap_or(&[]),
-        }
-    }
-
     /// The payload the page's entries take with `prefix` and one more entry of `key` and
     /// `rest` bytes after its suffix.
     fn size_with(&self, prefix: usize, key: usize, rest: usize) -> Option<usize> {
@@ -296,7 +266,8 @@ impl Page {
         under: u64,
         prefix: usize,
     ) -> Result<(), Error> {
-        let shared = if self.len() == 0 { 0 } else { prefix };
+        let first = self.ends.is_empty();
+        let shared = if first { 0 } else { prefix };
         let own = key.get(shared..).ok_or(corrupt(Malformed::Truncated))?;
         let key_end = self.bytes.len().checked_add(own.len());
         let rest = head.len().checked_add(tail.len());
@@ -309,16 +280,14 @@ impl Page {
         ) else {
             return Err(corrupt(Malformed::TooLarge));
         };
-        let start = self.bytes.len();
         self.bytes.extend_from_slice(own);
         self.bytes.extend_from_slice(head);
         self.bytes.extend_from_slice(tail);
         self.ends.push(ends);
-        let key_end = start.saturating_add(own.len());
-        if self.ends.len() == 1 {
-            self.first_end = key_end;
+        // The first entry's key is staged whole at the buffer's start.
+        if first {
+            self.first_end = own.len();
         }
-        self.last = [shared, start, key_end];
         self.key_bytes = self.key_bytes.saturating_add(key.len());
         self.rest_bytes = self.rest_bytes.saturating_add(rest);
         self.prefix = prefix;
@@ -330,7 +299,6 @@ impl Page {
         self.bytes.clear();
         self.ends.clear();
         self.first_end = 0;
-        self.last = [0; 3];
         self.key_bytes = 0;
         self.rest_bytes = 0;
         self.prefix = 0;
@@ -387,12 +355,7 @@ impl Page {
         let first = self.first();
         // Each entry's staged key and rest lie after the one before it's.
         let mut start = 0usize;
-        for (((i, slot), head), &word) in table
-            .iter_mut()
-            .enumerate()
-            .zip(heads.iter_mut())
-            .zip(&self.ends)
-        {
+        for ((slot, head), &word) in table.iter_mut().zip(heads.iter_mut()).zip(&self.ends) {
             let e = Ends::of(word);
             let own = self
                 .bytes
@@ -403,20 +366,18 @@ impl Page {
                 .get(e.key..e.rest)
                 .ok_or(corrupt(Malformed::Truncated))?;
             start = e.rest;
-            // The suffix past the page's prefix, in two pieces: the first entry's own key past
-            // it; a later one's, the first's bytes from the prefix to what it shares with the
-            // first, then its own.
-            let (a, b) = if i == 0 {
-                (own.get(self.prefix..), Some(&[][..]))
-            } else {
-                (first.get(self.prefix..e.shared), Some(own))
-            };
-            let (Some(a), Some(b)) = (a, b) else {
+            // The suffix past the page's prefix, in two pieces: the first's bytes from the
+            // prefix to what the entry shares with the first, then its own past the prefix.
+            // The first entry shares nothing and stages its key whole, so its suffix is its
+            // own past the prefix; a later one shares at least the prefix and stages past it.
+            let (Some(a), Some(b)) = (
+                first.get(self.prefix..e.shared.max(self.prefix)),
+                own.get(self.prefix.saturating_sub(e.shared)..),
+            ) else {
                 return Err(corrupt(Malformed::Truncated));
             };
             let suffix = a.len().checked_add(b.len()).ok_or_else(too_large)?;
             *slot = u16_of(at)?;
-            *head = key_head_of(a, b).to_be_bytes();
             let (len, tail) = std::mem::take(&mut body)
                 .split_at_mut_checked(2)
                 .ok_or_else(too_large)?;
@@ -425,10 +386,15 @@ impl Page {
                 .split_at_mut_checked(rest.len())
                 .ok_or_else(too_large)?;
             r.copy_from_slice(rest);
-            let (k, tail) = tail.split_at_mut_checked(a.len()).ok_or_else(too_large)?;
-            k.copy_from_slice(a);
-            let (k, tail) = tail.split_at_mut_checked(b.len()).ok_or_else(too_large)?;
-            k.copy_from_slice(b);
+            let (k, tail) = tail.split_at_mut_checked(suffix).ok_or_else(too_large)?;
+            let (ka, kb) = k.split_at_mut_checked(a.len()).ok_or_else(too_large)?;
+            // An entry sharing just the prefix with the first has no first piece to copy.
+            if !a.is_empty() {
+                ka.copy_from_slice(a);
+            }
+            kb.copy_from_slice(b);
+            // The head read from the suffix as written, whole.
+            *head = key_head(k).to_be_bytes();
             body = tail;
             at = at
                 .checked_add(2)
@@ -475,8 +441,14 @@ pub struct Builder {
     keys: SurfBuilder,
     range: Vec<u8>,
     range_filter: Option<Surf>,
-    /// The last key of the last leaf written.
-    prev_last: Vec<u8>,
+    /// The last key added, whole, its first `last_len` bytes: what the next is compared with
+    /// and the range filter cuts by, written past the bytes each key shares with the one before
+    /// it. The buffer only grows, to the longest key added, so a write is that copy alone.
+    last: Vec<u8>,
+    last_len: usize,
+    /// What the first key of the leaf being filled shares with the key before it, the last
+    /// leaf's last: the leaf's separator keeps one byte more.
+    leaf_shared: usize,
     count: u64,
     payload: Vec<u8>,
     capacity: usize,
@@ -590,7 +562,9 @@ impl Builder {
             keys: keys_filter,
             range: lists.range,
             range_filter: None,
-            prev_last: lists.prev_last,
+            last: lists.last,
+            last_len: 0,
+            leaf_shared: 0,
             count: 0,
             payload,
             capacity,
@@ -657,21 +631,23 @@ impl Builder {
                 what: "an entry added to a sealed branch",
             });
         }
-        // The key added before this one, read where it already is: the leaf being filled, or
-        // the last leaf written when this entry's turn came after it filled.
-        let prev = match self.levels.first() {
-            _ if self.count == 0 => None,
-            Some(page) if page.len() > 0 => Some(page.last_key()),
-            _ => Some(Pieces::whole(&self.prev_last)),
+        let prev = if self.count > 0 {
+            Some(
+                self.last
+                    .get(..self.last_len)
+                    .ok_or(corrupt(Malformed::Truncated))?,
+            )
+        } else {
+            None
         };
         // The bytes the key shares with the one before it: where the order check looks, what
         // the range filter cuts keys by, and with the page's prefix, the page's prefix after.
         let common = match prev {
             Some(prev) => {
-                let common = prev.common_prefix(key);
+                let common = shared(prev, key);
                 let greater = match (prev.get(common), key.get(common)) {
                     (None, Some(_)) => true,
-                    (Some(a), Some(&b)) => b > a,
+                    (Some(a), Some(b)) => b > a,
                     _ => false,
                 };
                 if !greater {
@@ -681,6 +657,7 @@ impl Builder {
             }
             None => 0,
         };
+        let past = key.get(common..).ok_or(corrupt(Malformed::Truncated))?;
         if !self.fits(key.len(), value.len()) {
             return Err(Error::LimitExceeded {
                 what: "an entry's bytes in a branch page",
@@ -711,6 +688,14 @@ impl Builder {
         self.entry_bytes = self.entry_bytes.saturating_add(
             u64::try_from(key.len().saturating_add(value.len())).unwrap_or(u64::MAX),
         );
+        if self.last.len() < key.len() {
+            self.last.resize(key.len(), 0);
+        }
+        self.last
+            .get_mut(common..key.len())
+            .ok_or(corrupt(Malformed::TooLarge))?
+            .copy_from_slice(past);
+        self.last_len = key.len();
         Ok(())
     }
 
@@ -803,6 +788,11 @@ impl Builder {
                 .get_mut(level)
                 .ok_or(corrupt(Malformed::TooLarge))?
                 .push(key, head, tail, under, prefix)?;
+            // A leaf begun by the caller's entry: its first key shares `common` with the last
+            // leaf's last.
+            if let (0, Some(_), Some(common)) = (level, &written, common) {
+                self.leaf_shared = common;
+            }
             // A separator pushed here came from the level below, whose first-key buffer it is.
             if let Some(s) = up.take() {
                 self.give_first(level.saturating_sub(1), s.first);
@@ -879,8 +869,7 @@ impl Builder {
             // key below it in the first leaf).
             let mut cut = first.len();
             if !self.separators.is_empty() {
-                let lcp = shared(&self.prev_last, &first);
-                cut = lcp.saturating_add(1).min(first.len());
+                cut = self.leaf_shared.saturating_add(1).min(first.len());
             }
             let page_no = self
                 .issued
@@ -890,10 +879,6 @@ impl Builder {
                 first.get(..cut).ok_or(corrupt(Malformed::TooLarge))?,
                 u32::try_from(page_no).map_err(|_| corrupt(Malformed::TooLarge))?,
             )?;
-            if let Some(page) = self.levels.first() {
-                self.prev_last.clear();
-                page.last_key().extend_into(&mut self.prev_last);
-            }
         }
         if let Some(page) = self.levels.get_mut(level) {
             page.clear();
@@ -1074,9 +1059,12 @@ impl Builder {
         self.index.clear();
         trie.encode(&mut self.index);
         self.index_trie = Some(trie);
-        // The seal wrote the last leaf first: its last key is the branch's.
         let range = self.keys.finish(if self.count > 0 {
-            Some(Pieces::whole(&self.prev_last))
+            Some(
+                self.last
+                    .get(..self.last_len)
+                    .ok_or(corrupt(Malformed::Truncated))?,
+            )
         } else {
             None
         })?;
@@ -1129,7 +1117,7 @@ impl Builder {
             levels,
             pages,
             firsts: self.firsts,
-            prev_last: self.prev_last,
+            last: self.last,
             payload: self.payload,
         });
         branch

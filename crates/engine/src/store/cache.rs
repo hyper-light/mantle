@@ -29,9 +29,11 @@
 //! leaves a hole rather than keeping an older address longer, as libCacheSim's ghost FIFO does,
 //! so the ghost may name fewer: what keeps it a map with no queue to compact.
 //!
-//! Every queue and map is bounded by the cache's page count. A page written at an address is
-//! dropped from the cache (`forget`), so an address reused after its extent is freed never reads
-//! the page it held before.
+//! Every queue and map is bounded by the cache's page count, and the slot table by twice the
+//! largest limit: a loan's fresh memory goes in the slots of chunks whose memory was given back
+//! before it adds any (docs/research/64 §13). A page written at an address is dropped from the
+//! cache (`forget`), so an address reused after its extent is freed never reads the page it held
+//! before.
 
 use std::num::{NonZeroU32, NonZeroUsize};
 
@@ -168,8 +170,11 @@ enum Held {
     Lent,
     /// Every page forgotten: its memory, already mapped, kept for the next loan.
     Spare,
-    /// Its memory given back to a lowered limit.
+    /// Its memory given back, to a lowered limit or as spare beyond the loans' need; its slots
+    /// kept for a later loan's fresh memory.
     Hollow,
+    /// Hollow, and out on loan in fresh memory: counted as fresh room until it comes back.
+    Refilled,
 }
 
 /// A page cache of at most `limit` pages.
@@ -219,9 +224,11 @@ pub struct Cache {
     lent: usize,
     /// The most pages the loans have had out at once, fresh and spare ([`Self::shed_spare`]).
     out_most: usize,
-    /// Each chunk's state, and the chunks spare for loans.
+    /// Each chunk's state, the chunks spare for loans, and the hollow chunks whose slots a loan's
+    /// fresh memory takes before any new chunk's ([`Self::lend`]).
     held: Vec<Held>,
     spares: Vec<usize>,
+    hollows: Vec<usize>,
     /// The pages the chunks have room for (`sizes` summed), those of spare chunks and those of
     /// chunks out on loan again, kept as chunks change, so [`Self::room`], [`Self::shed_spare`]
     /// and [`Self::out_on_loan`] read a field where they summed every chunk: with a loan's
@@ -264,6 +271,8 @@ pub struct Memory {
     pub spare: u64,
     /// Out on loan: chunks lent again, and fresh room (not yet in [`Cache::bytes`]).
     pub lent: u64,
+    /// The slot table's entries, hollow chunks' among them: at most twice the largest limit.
+    pub slots: u64,
     /// Loans made, the pages of room they held, and of the pages their workers wrote, those
     /// taken back cached and those the room could not hold.
     pub loans: u64,
@@ -330,6 +339,7 @@ impl Cache {
             out_most: 0,
             held: Vec::new(),
             spares: Vec::new(),
+            hollows: Vec::new(),
             room_pages: 0,
             spare_pages: 0,
             lent_pages: 0,
@@ -519,10 +529,13 @@ impl Cache {
         None
     }
 
-    /// A slot made for a read when idle time has not made one: none at the limit or while a
-    /// chunk retires.
+    /// A slot made for a read when idle time has not made one: none at the limit, past it before
+    /// `trim` brings the room down, or while a chunk retires. The limit holds the chunks' room
+    /// ([`Self::make_slot`]), not the slot table's length, which counts hollow chunks' slots with
+    /// no memory behind them: counted, they froze a 1B store's cache 17 GiB under its limit
+    /// (docs/research/64 §13).
     fn make_now(&mut self) -> Option<usize> {
-        if self.retiring.is_some() || self.slots.len() >= self.limit {
+        if self.retiring.is_some() || self.room() > self.limit {
             return None;
         }
         self.grown = self.grown.saturating_add(1);
@@ -598,10 +611,13 @@ impl Cache {
 
     /// Room for up to `pages` pages a worker will write, as a [`Kept`] to fill: spare chunks'
     /// memory first, already mapped, then fresh memory within the limit, less the room the chunks
-    /// and earlier loans hold, while the machine has it as a chunk of the cache's own needs it,
-    /// in buffers of at most [`Self::loan_chunk`] pages, each its own chunk once back, so the
-    /// pages a later job's forgetting frees together free their chunk together. None while a
-    /// chunk retires.
+    /// and earlier loans hold, while the machine has it as a chunk of the cache's own needs it.
+    /// Fresh memory fills hollow chunks' slots first, a whole chunk each, then new buffers of at
+    /// most [`Self::loan_chunk`] pages, each its own chunk once back, so the pages a later job's
+    /// forgetting frees together free their chunk together. A new buffer is lent only once no
+    /// hollow chunk is left, which bounds the slot table (the module's rule): room under the
+    /// limit short of the next hollow chunk's slots lends no fresh memory. None while a chunk
+    /// retires.
     pub fn lend(&mut self, pages: usize) -> Option<Kept> {
         if self.retiring.is_some() || pages == 0 {
             return None;
@@ -637,15 +653,60 @@ impl Cache {
                 buf,
             });
         }
-        let fresh = pages.saturating_sub(room).min(
-            self.limit
-                .saturating_sub(self.room().saturating_add(self.lent)),
-        );
-        if fresh > 0
-            && let Some(bytes) = fresh.checked_mul(self.page)
+        // The fresh memory: hollow chunks whole, the last hollowed first, while the room under
+        // the limit holds the next; new buffers for the rest only once none is left.
+        let mut budget = self
+            .limit
+            .saturating_sub(self.room().saturating_add(self.lent));
+        let mut need = pages.saturating_sub(room);
+        let (mut refills, mut planned) = (0usize, 0usize);
+        for &c in self.hollows.iter().rev() {
+            let span = self.span(c);
+            if need == 0 || span == 0 || span > budget {
+                break;
+            }
+            refills = refills.saturating_add(1);
+            planned = planned.saturating_add(span);
+            budget = budget.saturating_sub(span);
+            need = need.saturating_sub(span);
+        }
+        let new = if refills == self.hollows.len() {
+            need.min(budget)
+        } else {
+            0
+        };
+        // Fresh pages lent, each counted in `lent` until the loan comes back.
+        let mut fresh = 0usize;
+        if let Some(bytes) = planned.saturating_add(new).checked_mul(self.page)
+            && bytes > 0
             && self.machine_spares(bytes)
         {
-            let mut left = fresh;
+            for _ in 0..refills {
+                let Some(c) = self.hollows.pop() else {
+                    break;
+                };
+                let span = self.span(c);
+                let mut buf = Vec::new();
+                if bufs.try_reserve(1).is_err()
+                    || span
+                        .checked_mul(self.page)
+                        .is_none_or(|bytes| buf.try_reserve_exact(bytes).is_err())
+                {
+                    self.hollows.push(c);
+                    break;
+                }
+                if let Some(h) = self.held.get_mut(c) {
+                    *h = Held::Refilled;
+                }
+                self.lent = self.lent.saturating_add(span);
+                fresh = fresh.saturating_add(span);
+                room = room.saturating_add(span);
+                bufs.push(Loaned {
+                    chunk: Some(c),
+                    buf,
+                });
+            }
+            let mut left = if self.hollows.is_empty() { new } else { 0 };
             while left > 0 {
                 let n = left.min(self.loan_chunk.max(1));
                 let Some(bytes) = n.checked_mul(self.page) else {
@@ -656,6 +717,7 @@ impl Cache {
                     break;
                 }
                 self.lent = self.lent.saturating_add(n);
+                fresh = fresh.saturating_add(n);
                 room = room.saturating_add(n);
                 left = left.saturating_sub(n);
                 bufs.push(Loaned { chunk: None, buf });
@@ -663,19 +725,9 @@ impl Cache {
         }
         let mut list = Vec::new();
         if room == 0 || list.try_reserve_exact(room).is_err() {
-            let fresh = bufs
-                .iter()
-                .filter(|l| l.chunk.is_none())
-                .map(|l| l.buf.capacity().checked_div(self.page).unwrap_or(0))
-                .sum::<usize>();
             self.give_back(bufs, fresh);
             return None;
         }
-        let fresh = bufs
-            .iter()
-            .filter(|l| l.chunk.is_none())
-            .map(|l| l.buf.capacity().checked_div(self.page).unwrap_or(0))
-            .sum::<usize>();
         self.loans = self.loans.saturating_add(1);
         self.loan_room = self
             .loan_room
@@ -692,7 +744,7 @@ impl Cache {
     }
 
     /// A loan's buffers back unread: chunks' memory spare again, fresh memory dropped and its
-    /// room no longer lent.
+    /// room no longer lent, a refilled chunk hollow again.
     fn give_back(&mut self, bufs: Vec<Loaned>, fresh: usize) {
         self.lent = self.lent.saturating_sub(fresh);
         for Loaned { chunk, buf } in bufs {
@@ -703,6 +755,11 @@ impl Cache {
                     self.held.get_mut(c),
                 )
             {
+                if *h == Held::Refilled {
+                    *h = Held::Hollow;
+                    self.hollows.push(c);
+                    continue;
+                }
                 *slot = buf;
                 *h = Held::Spare;
                 self.lent_pages = self.lent_pages.saturating_sub(size);
@@ -742,6 +799,7 @@ impl Cache {
                 self.room_pages = self.room_pages.saturating_sub(*size);
                 *size = 0;
                 *h = Held::Hollow;
+                self.hollows.push(c);
             }
         }
         self.settle_retirement();
@@ -773,6 +831,14 @@ impl Cache {
             let count = buf.len().checked_div(page).unwrap_or(0);
             let c = match chunk {
                 Some(c) => {
+                    if self.held.get(c) == Some(&Held::Refilled)
+                        && let Some(size) = self.sizes.get_mut(c)
+                    {
+                        // A hollow chunk's slots, its memory the loan's fresh room.
+                        *size = buf.capacity().checked_div(page).unwrap_or(0);
+                        self.room_pages = self.room_pages.saturating_add(*size);
+                        self.loaned = self.loaned.saturating_add(*size);
+                    }
                     if let Some(slot) = self.chunks.get_mut(c) {
                         *slot = buf;
                     }
@@ -1293,6 +1359,7 @@ impl Cache {
                 self.room_pages = self.room_pages.saturating_sub(*size);
                 *size = 0;
                 *h = Held::Hollow;
+                self.hollows.push(c);
             }
         }
         // A retirement the room left no longer asks for ends before another chunk's begins.
@@ -1302,7 +1369,7 @@ impl Cache {
         // loan waits for its memory to come back.
         let mut looked = 0usize;
         while self.room() > self.limit && looked < n {
-            if self.held.last() == Some(&Held::Lent) {
+            if matches!(self.held.last(), Some(Held::Lent | Held::Refilled)) {
                 break;
             }
             let (Some(&first), Some(&pages)) = (self.starts.last(), self.sizes.last()) else {
@@ -1351,6 +1418,7 @@ impl Cache {
             self.held.pop();
             let gone = self.chunks.len();
             self.spares.retain(|&c| c != gone);
+            self.hollows.retain(|&c| c != gone);
             self.retiring = None;
         }
         self.over() > 0
@@ -1376,7 +1444,34 @@ impl Cache {
         }
         self.wanted
             .saturating_sub(self.free.len())
-            .min(self.limit.saturating_sub(self.slots.len()))
+            .min(self.makeable())
+    }
+
+    /// Slots reads could still make: the last chunk's room not yet made, when reads made it, and
+    /// the room under the limit no chunk holds ([`Self::make_slot`]); none past the limit.
+    fn makeable(&self) -> usize {
+        if self.room() > self.limit {
+            return 0;
+        }
+        let unmade = match (self.held.last(), self.sizes.last(), self.starts.last()) {
+            (Some(Held::Grown), Some(&size), Some(&first)) => {
+                size.saturating_sub(self.slots.len().saturating_sub(first))
+            }
+            _ => 0,
+        };
+        unmade.saturating_add(self.limit.saturating_sub(self.room()))
+    }
+
+    /// The slots chunk `c` has: up to the next chunk's first, or the table's end for the last.
+    fn span(&self, c: usize) -> usize {
+        let Some(&first) = self.starts.get(c) else {
+            return 0;
+        };
+        let end = c
+            .checked_add(1)
+            .and_then(|next| self.starts.get(next).copied())
+            .unwrap_or(self.slots.len());
+        end.saturating_sub(first)
     }
 
     /// Makes up to `n` of the slots wanted, each its page written once so the OS maps it now: a
@@ -1483,7 +1578,7 @@ impl Cache {
                 }
                 Held::Spare => spare = spare.saturating_add(size),
                 Held::Lent => lent = lent.saturating_add(size),
-                Held::Grown | Held::Hollow => {}
+                Held::Grown | Held::Hollow | Held::Refilled => {}
             }
         }
         Memory {
@@ -1492,6 +1587,7 @@ impl Cache {
             dead: pages(dead),
             spare: pages(spare),
             lent: pages(lent),
+            slots: pages(self.slots.len()),
             loans: self.loans,
             loan_room: self.loan_room,
             loan_kept: self.loan_kept,
@@ -1718,6 +1814,83 @@ mod tests {
         }
     }
 
+    /// Chunks whose memory went back keep their slots in the table, and the room they gave back
+    /// is the reads' again, made in idle time and by the reads themselves, up to the limit: a 1B
+    /// store's cache, its fill's loans forgotten and their memory given back, took no page more
+    /// 17 GiB under its limit (docs/research/64 §13).
+    #[test]
+    fn reads_take_the_room_hollowed_loan_chunks_gave_back() {
+        let mut c = Cache::new(64, 16, EXTENT);
+        let mut k = c.lend(48).unwrap();
+        for a in 1000..1048u64 {
+            k.keep(a, &page(a));
+        }
+        c.adopt(k);
+        for a in 1000..1000 + 48 {
+            c.forget(a);
+        }
+        // A lowered limit gives the spare chunks' memory back; it rises again.
+        c.resize(1);
+        while c.trim(64) {}
+        assert_eq!(c.bytes(), 0);
+        assert_eq!(c.slots.len(), 48, "the hollow chunks' slots left the table");
+        c.resize(64);
+        c.wanted = 32;
+        assert_eq!(
+            c.reserve(usize::MAX),
+            32,
+            "idle time made fewer slots than wanted"
+        );
+        for a in 0..64u64 {
+            c.insert(a, &page(a));
+        }
+        assert_eq!(
+            c.memory().live,
+            64,
+            "reads were refused room under the limit"
+        );
+        let mut out = Vec::new();
+        for a in 0..64u64 {
+            out.clear();
+            assert!(c.get(a, &mut out));
+            assert_eq!(out, page(a));
+        }
+    }
+
+    /// Loans that come and go, each forgotten and its memory given back to a lowered limit,
+    /// reuse the slots of the chunks given back: their pages come back cached, and the slot table
+    /// stays within twice the largest limit however many loans pass.
+    #[test]
+    fn loans_that_come_and_go_reuse_the_slots_of_memory_given_back() {
+        let mut c = Cache::new(64, 16, EXTENT);
+        c.loan_chunk = 4;
+        let mut out = Vec::new();
+        for round in 0..1000u64 {
+            let mut k = c.lend(32).unwrap();
+            let first = 10_000 + round * 32;
+            for a in first..first + 32 {
+                k.keep(a, &page(a));
+            }
+            c.adopt(k);
+            for a in first..first + 32 {
+                out.clear();
+                assert!(c.get(a, &mut out), "round {round}: page {a} not cached");
+                assert_eq!(out, page(a));
+            }
+            for a in first..first + 32 {
+                c.forget(a);
+            }
+            c.resize(1);
+            while c.trim(64) {}
+            c.resize(64);
+            assert!(
+                c.slots.len() <= 2 * 64,
+                "round {round}: {} slots",
+                c.slots.len()
+            );
+        }
+    }
+
     /// Idle reservation that can make no slot stops owing them: the machine refusing the cache
     /// a chunk ends `reserve` with nothing left owed, rather than leaving slots wanted that
     /// idle time asks for again and again.
@@ -1868,7 +2041,15 @@ mod tests {
         c.trim(1);
         assert!(c.room() <= 900, "room {}", c.room());
         assert!(c.retiring.is_none(), "the retirement outlived its need");
+        // The 100 pages under the limit are short of the hollow chunk's 200 slots, which fresh
+        // memory takes whole while a hollow chunk is left: the limit raised, a loan takes it.
+        assert!(
+            c.lend(4).is_none(),
+            "fresh memory short of a hollow chunk's slots was lent"
+        );
+        c.resize(1000);
         let mut k = c.lend(4).expect("a loan within the limit");
+        assert_eq!(k.fresh, 200, "the hollow chunk was not refilled whole");
         for a in 6000..6004u64 {
             k.keep(a, &page(a));
         }
@@ -1884,6 +2065,162 @@ mod tests {
         c.wanted = pages;
         c.reserve(usize::MAX);
         c
+    }
+
+    /// Whatever reads, loans, forgetting, limits and trims came, a read never returns a page older
+    /// than the address's newest. Loans come in buffers of two pages, so a loan's pages come back in several chunks; the
+    /// chunks' room, their spare pages and those out on loan, kept as fields, are their sums
+    /// over the chunks after every step, and a chunk retires only while the room is past the
+    /// limit. Every hollow chunk is listed for the next loan's fresh memory, and the slot table
+    /// stays within twice the largest limit.
+    #[test]
+    fn the_fields_the_slot_table_and_the_hollow_list_hold_through_every_step() {
+        let mut c = warm(64, 32);
+        c.loan_chunk = 2;
+        let mut largest = 64usize;
+        let mut latest: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut out = Vec::new();
+        for step in 0..40_000u32 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let address = x % 160;
+            let payload: Vec<u8> = (0..(1 + x % 24))
+                .map(|b| ((b ^ address ^ u64::from(step)) & 0xff) as u8)
+                .collect();
+            match x % 13 {
+                0..=3 => {
+                    c.insert(address, &payload);
+                    latest.insert(address, payload);
+                }
+                4..=6 => {
+                    out.clear();
+                    if c.get(address, &mut out) {
+                        assert_eq!(
+                            Some(&out),
+                            latest.get(&address),
+                            "step {step} read {address}"
+                        );
+                    }
+                }
+                7 => {
+                    c.forget(address);
+                    latest.remove(&address);
+                }
+                8 => {
+                    // A grant: the extent's pages forgotten whole.
+                    let first = address - address % EXTENT;
+                    for a in first..first + EXTENT {
+                        c.forget(a);
+                        latest.remove(&a);
+                    }
+                }
+                9 => {
+                    // A job's pages back in the memory lent, an extent's row from its middle.
+                    if let Some(mut k) = c.lend(1 + usize::try_from((x >> 20) % 6).unwrap()) {
+                        for a in address..address + 1 + (x >> 30) % 6 {
+                            let p: Vec<u8> = (0..(1 + a % 16))
+                                .map(|b| u8::try_from((b ^ a) & 0xff).unwrap())
+                                .collect();
+                            let before = k.len();
+                            k.keep(a, &p);
+                            if k.len() > before {
+                                latest.insert(a, p);
+                            }
+                        }
+                        c.adopt(k);
+                    }
+                }
+                10 => {
+                    let pages = 1 + usize::try_from((x >> 20) % 96).unwrap();
+                    c.resize(pages);
+                    largest = largest.max(pages);
+                }
+                _ => {
+                    c.trim(1 + usize::try_from((x >> 20) % 8).unwrap());
+                }
+            }
+            let sum = |want: fn(&Held) -> bool| -> usize {
+                c.held
+                    .iter()
+                    .zip(&c.sizes)
+                    .filter(|(h, _)| want(h))
+                    .map(|(_, &s)| s)
+                    .sum()
+            };
+            assert_eq!(
+                c.room_pages,
+                c.sizes.iter().sum::<usize>(),
+                "step {step}: room"
+            );
+            assert_eq!(
+                c.spare_pages,
+                sum(|h| matches!(h, Held::Spare)),
+                "step {step}: spare"
+            );
+            assert_eq!(
+                c.lent_pages,
+                sum(|h| matches!(h, Held::Lent)),
+                "step {step}: lent"
+            );
+            assert!(
+                c.retiring.is_none() || c.room() > c.limit,
+                "step {step}: a retirement past its need, room {} limit {}",
+                c.room(),
+                c.limit
+            );
+            assert!(
+                c.sizes
+                    .iter()
+                    .zip(&c.held)
+                    .all(|(&s, h)| *h == Held::Grown || s <= 2),
+                "step {step}: a loan's chunk past two pages"
+            );
+            assert!(
+                c.slots.len() <= 2 * largest,
+                "step {step}: {} slots beside the largest limit {largest}",
+                c.slots.len()
+            );
+            assert_eq!(
+                c.hollows.len(),
+                c.held.iter().filter(|h| **h == Held::Hollow).count(),
+                "step {step}: a hollow chunk unlisted"
+            );
+            assert!(
+                c.hollows.iter().all(|&h| c.held[h] == Held::Hollow),
+                "step {step}: a listed chunk not hollow"
+            );
+            assert!(
+                !c.held.contains(&Held::Refilled),
+                "step {step}: a chunk refilled with no loan out"
+            );
+            // Spare memory never outgrows what the loans have had out at once.
+            let spare: usize = c
+                .held
+                .iter()
+                .zip(&c.sizes)
+                .filter(|(h, _)| matches!(h, Held::Spare))
+                .map(|(_, &s)| s)
+                .sum();
+            assert!(
+                spare <= c.out_most - c.out_on_loan(),
+                "step {step}: spare {spare} beside {} out of the most {}",
+                c.out_on_loan(),
+                c.out_most
+            );
+            // Each live slot is its address's one entry in the index, and each entry a live slot.
+            let entries = c.map.entries();
+            assert!(entries.iter().all(|&(a, i)| {
+                let i = usize::try_from(i).unwrap();
+                c.slots[i].live && c.slots[i].address == a
+            }));
+            assert_eq!(
+                entries.len(),
+                c.slots.iter().filter(|s| s.live).count(),
+                "step {step}"
+            );
+        }
     }
 
     /// Loans adopted with their pages kept, one after another, then every page forgotten, as

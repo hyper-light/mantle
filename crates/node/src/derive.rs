@@ -568,6 +568,102 @@ pub fn range_bytes(range: &Range, reads: usize) -> Option<u64> {
         .checked_add(read_bytes)
 }
 
+/// A transport endpoint as it opens, its TLS configurations with the node's certificate, key and
+/// authority included, beside the tables its limits size: measured, 59,325 bytes, and 713 for
+/// each peer its directory names, at one, two and four peers (`tests/transport_memory.rs`).
+const ENDPOINT_BYTES: u64 = 59_325;
+const ENDPOINT_PEER_BYTES: u64 = 713;
+
+/// A slot of an endpoint's table of receive chunks, beside the chunk its budget charges:
+/// measured, 72 bytes.
+const CHUNK_SLOT_BYTES: u64 = 72;
+
+/// A QUIC connection and its TLS session once established, a side's: measured, 122,012 bytes at
+/// the most any window took, and 95 for each stream it may hold.
+const CONNECTION_BYTES: u64 = 122_012;
+const STREAM_BYTES: u64 = 95;
+
+/// An exchange in use, a side's, beside what its budget charges: its stream's state and the
+/// transport's record of it, measured, 2,151 bytes at the most.
+const EXCHANGE_BYTES: u64 = 2_151;
+
+/// What a server's handshake takes, once a certificate, to compress the certificate (RFC 8879):
+/// hyper-tls's brotli at quality 11 and a 4 MiB window, measured, 34,267,200 bytes, given back as
+/// the handshake goes on.
+const CERTIFICATE_COMPRESSION_BYTES: u64 = 34_267_200;
+
+/// A peer's state on the plane beside its epochs' replay windows and its datagram's room:
+/// measured, 182 bytes at the most.
+const PLANE_PEER_BYTES: u64 = 182;
+
+/// The most bytes the node's transport holds beside its budget (`transport_bytes`), for a node of
+/// `stated`: what the budget does not charge.
+/// - The endpoint: as it opens, a slot of each exchange in use, a slot of each receive chunk, and
+///   the compression of its certificate as a server's first handshake makes it.
+/// - Each connection its admission takes: QUIC's and TLS's state with a stream's for each it may
+///   hold, and what QUIC keeps to send, at most what its peer's window takes, `window_ceiling`
+///   (every node of a cell states the same).
+/// - The sockets: the listener's, one for each connection where the platform gives a connection a
+///   socket of its own, and the plane's, each at what hyper-rt states one holds (`Io::held_bound`).
+/// - The plane ([`plane_bytes`]) and the liveness stream ([`liveness_bytes`]).
+///
+/// QUIC's datagrams are none: no node sends them, though hyper-quic's default takes up to
+/// 1,250,000 bytes of them a connection. What aws-lc keeps of keys is in its own heap, which a
+/// counting allocator does not see.
+pub fn transport_bytes_beside(stated: &crate::bounds::Stated) -> Option<u64> {
+    let limits = crate::bounds::limits(stated).ok()?;
+    let count = |n: usize| u64::try_from(n).ok();
+    let peers = count(stated.peers.max(1))?;
+    let connections = count(limits.admission.connections)?;
+    let endpoint = peers
+        .checked_mul(ENDPOINT_PEER_BYTES)?
+        .checked_add(ENDPOINT_BYTES)?
+        .checked_add(CERTIFICATE_COMPRESSION_BYTES)?
+        .checked_add(count(limits.exchanges)?.checked_mul(EXCHANGE_BYTES)?)?
+        .checked_add(count(limits.receive_chunks)?.checked_mul(CHUNK_SLOT_BYTES)?)?;
+    let connection = u64::from(limits.streams_per_connection)
+        .checked_mul(STREAM_BYTES)?
+        .checked_add(CONNECTION_BYTES)?
+        .checked_add(limits.window_ceiling)?;
+    let sockets = connections
+        .checked_add(2)?
+        .checked_mul(count(crate::bounds::io(stated).held_bound())?)?;
+    endpoint
+        .checked_add(connections.checked_mul(connection)?)?
+        .checked_add(sockets)?
+        .checked_add(plane_bytes(&crate::bounds::plane(stated).ok()?)?)?
+        .checked_add(liveness_bytes(stated.peers)?)
+}
+
+/// The most bytes the plane of `limits` holds: the datagram it seals into, and for each peer its
+/// state, each epoch's replay window a bit a counter, and a datagram's room of messages queued.
+pub fn plane_bytes(limits: &hyper_datagram::PlaneLimits) -> Option<u64> {
+    let count = |n: usize| u64::try_from(n).ok();
+    let datagram = count(hyper_datagram::MAX_DATAGRAM_BYTES)?;
+    let windows =
+        count(limits.window_limit.div_ceil(8))?.checked_mul(count(limits.epochs_per_peer)?)?;
+    let peer = datagram
+        .checked_add(PLANE_PEER_BYTES)?
+        .checked_add(windows)?;
+    count(limits.max_peers)?
+        .checked_mul(peer)?
+        .checked_add(datagram)
+}
+
+/// The most bytes the liveness stream of a node of `peers` holds: a link estimator for each peer
+/// and two of the node's own, its pool's and its own flushes', each ring at its longest window,
+/// `WINDOW_LIMIT + 1` prefix sums of eight bytes (hyper-timing's derivation from RFC 5905's
+/// frequency tolerance).
+pub fn liveness_bytes(peers: usize) -> Option<u64> {
+    let ring = hyper_timing::WINDOW_LIMIT
+        .checked_add(1)?
+        .checked_mul(u64::try_from(size_of::<i64>()).ok()?)?;
+    u64::try_from(peers.max(1))
+        .ok()?
+        .checked_add(2)?
+        .checked_mul(ring)
+}
+
 /// The threads a node starts beside its shard's, which runs on the process's own: its standard
 /// input's and output's, its log's and its log's device's; for each device holding volumes, its
 /// issuer and a worker for each read its profile measured at the device at once
@@ -863,6 +959,46 @@ mod tests {
             ..three
         };
         assert_eq!(range_bytes(&unfit, 0), None);
+    }
+
+    /// The liveness stream keeps a ring a peer and two of its own, at the longest window; the
+    /// plane its datagram, and each peer's room, state and windows; the transport beside its
+    /// budget grows with the peers a node keeps and the windows its budget funds.
+    #[test]
+    fn the_transport_beside_its_budget_counts_its_peers_and_windows() {
+        let ring = (hyper_timing::WINDOW_LIMIT + 1) * 8;
+        assert_eq!(liveness_bytes(0), Some(3 * ring));
+        assert_eq!(liveness_bytes(4), Some(6 * ring));
+        let limits = hyper_datagram::PlaneLimits {
+            max_peers: 2,
+            epochs_per_peer: 2,
+            window_limit: 64,
+        };
+        let datagram = hyper_datagram::MAX_DATAGRAM_BYTES as u64;
+        assert_eq!(
+            plane_bytes(&limits),
+            Some(datagram + 2 * (datagram + PLANE_PEER_BYTES + 2 * 8))
+        );
+        let (settings, _) = cell(3).unwrap();
+        let stated = |peers: usize, transport_bytes: u64| crate::bounds::Stated {
+            peers,
+            ranges: 5,
+            inflight: settings.max_inflight_msgs,
+            transfers: 38,
+            transport_bytes,
+            messages: crate::classes::Bounds {
+                replication: settings.max_entry_bytes + 1_024,
+                request: settings.max_entry_bytes + 1_024,
+                transfer: u64::from(u32::MAX),
+                bulk: u64::from(u32::MAX),
+            },
+        };
+        let least = |peers| crate::bounds::least_transport(&stated(peers, 0)).unwrap();
+        let one = transport_bytes_beside(&stated(1, least(1))).unwrap();
+        assert!(one > CERTIFICATE_COMPRESSION_BYTES);
+        assert!(transport_bytes_beside(&stated(2, least(2))).unwrap() > one);
+        assert!(transport_bytes_beside(&stated(1, 8 * least(1))).unwrap() > one);
+        assert_eq!(transport_bytes_beside(&stated(1, least(1) - 1)), None);
     }
 
     /// The schemes a block may take grow with the domains a cell holds, each no wider than them:

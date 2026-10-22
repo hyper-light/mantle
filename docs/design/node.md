@@ -256,9 +256,18 @@ measures the second, and derives the rest by these rules:
   room mantle's encoder leaves a proposal; the entries kept ahead of a hole in its log; the
   messages that wait, in the queue and one a write out; the appends its window holds to each
   other member; the reads it is asked; its store's copies of its writes out in the log's form,
-  and the page it reads the log by). Each is pinned by a test of the running code
-  (`tests/volume_memory.rs`, `tests/floor_memory.rs`, `tests/threads.rs`, `tests/range_memory.rs`
-  over stores that hold nothing of their own, `tests/range_log_memory.rs` over the node's logs).
+  and the page it reads the log by); and the transport beside its budget
+  (`derive::transport_bytes_beside`: the endpoint as it opens with its TLS configurations, a slot
+  of each exchange in use and of each receive chunk, and the compression of its certificate a
+  server's first handshake makes; each connection's QUIC and TLS state and what QUIC keeps to
+  send, at most its peer's window; the sockets, each at what hyper-rt states one holds
+  (`Io::held_bound`); the plane's datagram and each peer's room and replay windows
+  (`derive::plane_bytes`); and the liveness stream's estimator rings, one a peer and two of the
+  node's own, each at its longest window (`derive::liveness_bytes`)). Each is pinned by a test of
+  the running code (`tests/volume_memory.rs`, `tests/floor_memory.rs`, `tests/threads.rs`,
+  `tests/range_memory.rs` over stores that hold nothing of their own, `tests/range_log_memory.rs`
+  over the node's logs, `tests/transport_memory.rs` two endpoints at one, two and four peers and
+  at the floor's budget and eight times it).
   *Open:* a range's member is stated at the bounds hyper-raft puts on each queue, which mantle
   states as one `Ready` of the range's settings (`mantle_range::limits`): 52.9 MB a member at the
   floor, where three members held 11.0 MB at most through the shapes that fill each hold, and
@@ -270,6 +279,14 @@ measures the second, and derives the rest by these rules:
   `derive::LOG_DEPTH` pinned to a live group. mantle's own encoder leaves a proposal up to twice
   its bytes of room (`mantle_codec::Writer` grows by doubling), which the statement counts and a
   length known before encoding would remove.
+  *Open:* the transport's own structures are measured, where hyper-transport and hyper-quic state
+  none as hyper-rt states a socket's: asked of hyper-raft's owner, an endpoint's and a
+  connection's bound stated from their limits, as `Io::held_bound` is; hyper-tls compresses a
+  certificate of a few hundred bytes with brotli's 4 MiB window at quality 11, 34.3 MB for a moment
+  at a server's first handshake under it, which a window the size of the certificate would make
+  kilobytes; and hyper-quic takes QUIC datagrams, which no consumer sends, up to 1,250,000 bytes a
+  connection by default. aws-lc keeps keys in its own heap, which a counting allocator does not
+  see.
   *Open:* the snapshot path holds whole images, the one class the floor does not bound yet: a
   range's image is every row scanned and copied (`Stored::image`), encoded again for its message,
   kept by the shell and by the core's log until it is installed, framed and copied again by the

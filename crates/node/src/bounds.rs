@@ -9,7 +9,7 @@ use hyper_datagram::PlaneLimits;
 use hyper_rt_transport::{Io, MAX_BATCH};
 use hyper_transport::{
     AdmissionLimits, AskQueue, Classes, Limits, MIN_DATAGRAM, RECEIVE_CHUNK, StreamCredit,
-    class_reserve, initial_window,
+    class_reserve, frame_grant, initial_window,
 };
 
 use crate::classes::{Bounds, NodeClasses};
@@ -30,9 +30,6 @@ const IDLE_PTOS: u32 = 3;
 /// the handshake's round trip in which both carry traffic (hyper-datagram's `epochs_per_peer` of
 /// two, for the same overlap).
 const CONNECTIONS_PER_PEER: usize = 2;
-/// hyper-transport's frame prefix (its `frame.rs` `PREFIX_BYTES`, private to it): the bytes an
-/// outgoing message's reservation and a lane frame's carry before the head or the frame.
-const FRAME_PREFIX_BYTES: u64 = 20;
 
 /// What the node states of itself for its transport's bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,9 +179,9 @@ fn messages(
     lane_window: usize,
 ) -> Result<u64, Unfit> {
     let unfit = || Unfit("the messages' bytes");
-    let head = u64::from(max_head)
-        .checked_mul(2)
-        .and_then(|h| h.checked_add(FRAME_PREFIX_BYTES))
+    // An outgoing message's reservation, its prefix and head (`frame_grant`), and an incoming head.
+    let head = frame_grant(u64::from(max_head))
+        .checked_add(u64::from(max_head))
         .ok_or_else(unfit)?;
     let heads = u64::try_from(exchanges)
         .ok()
@@ -193,11 +190,7 @@ fn messages(
     let frames = if stated.inflight == 0 {
         0
     } else {
-        let frame = stated
-            .messages
-            .replication
-            .checked_add(FRAME_PREFIX_BYTES)
-            .ok_or_else(unfit)?;
+        let frame = frame_grant(stated.messages.replication);
         u64::try_from(stated.peers.max(1))
             .ok()
             .zip(u64::try_from(lane_window.checked_add(1).ok_or_else(unfit)?).ok())

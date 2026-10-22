@@ -7,9 +7,12 @@ use std::time::Duration;
 
 use hyper_datagram::PlaneLimits;
 use hyper_rt_transport::{Io, MAX_BATCH};
-use hyper_transport::{AdmissionLimits, AskQueue, Limits, RECEIVE_CHUNK, StreamCredit};
+use hyper_transport::{
+    AdmissionLimits, AskQueue, Classes, Limits, MIN_DATAGRAM, RECEIVE_CHUNK, StreamCredit,
+    class_reserve, initial_window,
+};
 
-use crate::classes::Bounds;
+use crate::classes::{Bounds, NodeClasses};
 use crate::{chunk, command};
 
 /// RFC 9002 §6.2.2: before a path has a sample, its smoothed round trip is `kInitialRtt`, 333 ms,
@@ -27,6 +30,9 @@ const IDLE_PTOS: u32 = 3;
 /// the handshake's round trip in which both carry traffic (hyper-datagram's `epochs_per_peer` of
 /// two, for the same overlap).
 const CONNECTIONS_PER_PEER: usize = 2;
+/// hyper-transport's frame prefix (its `frame.rs` `PREFIX_BYTES`, private to it): the bytes an
+/// outgoing message's reservation and a lane frame's carry before the head or the frame.
+const FRAME_PREFIX_BYTES: u64 = 20;
 
 /// What the node states of itself for its transport's bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,17 +125,18 @@ pub fn limits(stated: &Stated) -> Result<Limits, Unfit> {
         .max(1)
         .checked_mul(stated.inflight.checked_add(1).ok_or(Unfit("inflight"))?)
         .ok_or(Unfit("lane window"))?;
-    let peers_u64 = u64::try_from(peers).map_err(|_| Unfit("peers"))?;
-    let window_ceiling = stated
-        .transport_bytes
-        .checked_div(peers_u64)
-        .ok_or(Unfit("window"))?;
-    let chunk = u64::try_from(RECEIVE_CHUNK).map_err(|_| Unfit("chunk"))?;
-    let receive_chunks = window_ceiling
-        .div_ceil(chunk)
-        .checked_mul(peers_u64)
-        .and_then(|n| usize::try_from(n).ok())
-        .ok_or(Unfit("receive chunks"))?;
+    let max_head = [
+        command::HEAD_BYTES,
+        command::REPLY_HEAD_BYTES,
+        chunk::PUT_HEAD_BYTES,
+        chunk::GET_HEAD_BYTES,
+        chunk::REPLY_HEAD_BYTES,
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
+    let max_head = u32::try_from(max_head).map_err(|_| Unfit("head"))?;
+    let (window_ceiling, receive_chunks) = buffering(stated, exchanges, max_head, lane_window)?;
     let idle = idle_timeout();
     Ok(Limits {
         admission: AdmissionLimits {
@@ -148,19 +155,7 @@ pub fn limits(stated: &Stated) -> Result<Limits, Unfit> {
         // A command's head names its range; a reply's, its status and the leader; a chunk's, its
         // volume, its key and the CRC-32C or the range asked. A snapshot's exchange carries its
         // frame in the body and no head.
-        max_head: u32::try_from(
-            [
-                command::HEAD_BYTES,
-                command::REPLY_HEAD_BYTES,
-                chunk::PUT_HEAD_BYTES,
-                chunk::GET_HEAD_BYTES,
-                chunk::REPLY_HEAD_BYTES,
-            ]
-            .into_iter()
-            .max()
-            .unwrap_or(0),
-        )
-        .map_err(|_| Unfit("head"))?,
+        max_head,
         window_ceiling,
         // An exchange that makes no progress for as long as a connection may stay silent is
         // judged stalled.
@@ -173,6 +168,97 @@ pub fn limits(stated: &Stated) -> Result<Limits, Unfit> {
         max_responses: peers,
         receive_chunks,
     })
+}
+
+/// The bytes the transport and its owner hold of messages at once, at most: every exchange's head
+/// both ways (an outgoing message's prefix and head, an incoming head), the one body piece the
+/// owner reads at a time (a receive chunk: the node's and the client's `PIECE`), and, for a node
+/// that keeps appends out (`Stated::inflight`), each peer lane's frames, its window queued out and
+/// one read in.
+fn messages(
+    stated: &Stated,
+    exchanges: usize,
+    max_head: u32,
+    lane_window: usize,
+) -> Result<u64, Unfit> {
+    let unfit = || Unfit("the messages' bytes");
+    let head = u64::from(max_head)
+        .checked_mul(2)
+        .and_then(|h| h.checked_add(FRAME_PREFIX_BYTES))
+        .ok_or_else(unfit)?;
+    let heads = u64::try_from(exchanges)
+        .ok()
+        .and_then(|e| e.checked_mul(head))
+        .ok_or_else(unfit)?;
+    let frames = if stated.inflight == 0 {
+        0
+    } else {
+        let frame = stated
+            .messages
+            .replication
+            .checked_add(FRAME_PREFIX_BYTES)
+            .ok_or_else(unfit)?;
+        u64::try_from(stated.peers.max(1))
+            .ok()
+            .zip(u64::try_from(lane_window.checked_add(1).ok_or_else(unfit)?).ok())
+            .and_then(|(peers, window)| peers.checked_mul(window)?.checked_mul(frame))
+            .ok_or_else(unfit)?
+    };
+    let piece = u64::try_from(RECEIVE_CHUNK).map_err(|_| unfit())?;
+    heads
+        .checked_add(piece)
+        .and_then(|b| b.checked_add(frames))
+        .ok_or_else(unfit)
+}
+
+/// What QUIC buffers for peers, within the transport's bytes less the messages' (node.md §3.3): a
+/// connection's receive window, at most the ceiling returned, and the receive chunks datagrams are
+/// cut from, at most the count returned. Both are charged to the transport's budget, which the
+/// messages share, so they are sized to leave the messages' bytes free: reading what QUIC buffered
+/// is what frees it, and a read refused for the bytes the buffering holds never comes (CI run
+/// 39694528095: a client's receive chunks held its whole budget, and the piece a 1 MiB reply is
+/// read into was refused). Each peer holds at most two connections' windows, each with the class
+/// reserve its first window carries, and a full window of its unread data packed into whole
+/// chunks; each handshake admission lets wait holds a first window.
+fn buffering(
+    stated: &Stated,
+    exchanges: usize,
+    max_head: u32,
+    lane_window: usize,
+) -> Result<(u64, usize), Unfit> {
+    let unfit = || Unfit("the transport's bytes, less the messages', hold no window");
+    let peers = u64::try_from(stated.peers.max(1)).map_err(|_| unfit())?;
+    let connections = u64::try_from(CONNECTIONS_PER_PEER)
+        .ok()
+        .and_then(|c| c.checked_mul(peers))
+        .ok_or_else(unfit)?;
+    let reserve = class_reserve(<NodeClasses as Classes>::RANKS.saturating_sub(1));
+    // Each connection's reserve, and each waiting handshake's first window with its reserve.
+    let fixed = connections
+        .checked_mul(reserve)
+        .and_then(|r| {
+            let first = initial_window(MIN_DATAGRAM).checked_add(reserve)?;
+            r.checked_add(peers.checked_mul(first)?)
+        })
+        .ok_or_else(unfit)?;
+    let free = stated
+        .transport_bytes
+        .checked_sub(messages(stated, exchanges, max_head, lane_window)?)
+        .and_then(|b| b.checked_sub(fixed))
+        .ok_or_else(unfit)?;
+    // A share each for a peer's two connections' windows and its pool of chunks.
+    let shares = connections.checked_add(peers).ok_or_else(unfit)?;
+    let window_ceiling = free.checked_div(shares).ok_or_else(unfit)?;
+    if window_ceiling < initial_window(MIN_DATAGRAM) {
+        return Err(unfit());
+    }
+    let chunk = u64::try_from(RECEIVE_CHUNK).map_err(|_| unfit())?;
+    let receive_chunks = window_ceiling
+        .checked_div(chunk)
+        .and_then(|c| c.checked_mul(peers))
+        .and_then(|c| usize::try_from(c).ok())
+        .ok_or_else(unfit)?;
+    Ok((window_ceiling, receive_chunks))
 }
 
 /// How the node's sockets batch: a system call takes up to one datagram train from each peer, what
@@ -262,12 +348,73 @@ mod tests {
             u32::try_from(chunk::GET_HEAD_BYTES).unwrap()
         );
         assert_eq!(limits.lane_window, 15);
-        assert_eq!(limits.window_ceiling, 32 << 20);
-        assert_eq!(
-            limits.receive_chunks,
-            usize::try_from((32u64 << 20).div_ceil(RECEIVE_CHUNK as u64) * 2).unwrap()
-        );
         assert!(limits.keep_alive.unwrap() < limits.idle_timeout);
+    }
+
+    /// The most QUIC's buffering holds for `stated` under `limits`: each connection's window with
+    /// its reserve, each waiting handshake's first window, and the receive chunks.
+    fn buffered(stated: &Stated, limits: &Limits) -> u64 {
+        let peers = stated.peers.max(1) as u64;
+        let connections = peers * CONNECTIONS_PER_PEER as u64;
+        let reserve = class_reserve(<NodeClasses as Classes>::RANKS - 1);
+        connections * (limits.window_ceiling + reserve)
+            + peers * (initial_window(MIN_DATAGRAM) + reserve)
+            + limits.receive_chunks as u64 * RECEIVE_CHUNK as u64
+    }
+
+    #[test]
+    fn quics_buffering_leaves_the_messages_their_bytes() {
+        let client = Stated {
+            peers: 3,
+            ranges: 1,
+            inflight: 0,
+            transfers: 1,
+            transport_bytes: 3 * 4 * RECEIVE_CHUNK as u64,
+            ..stated()
+        };
+        // A storage node of a cell's process tests: Raft messages of about a kilobyte, a writer
+        // queue's transfers.
+        let node = Stated {
+            peers: 7,
+            ranges: 5,
+            inflight: 2,
+            transfers: 130,
+            transport_bytes: 7 * 4 * RECEIVE_CHUNK as u64,
+            messages: Bounds {
+                replication: 1_200,
+                ..stated().messages
+            },
+        };
+        for stated in [stated(), client, node] {
+            let limits = limits(&stated).unwrap();
+            let messages = messages(
+                &stated,
+                limits.exchanges,
+                limits.max_head,
+                limits.lane_window,
+            )
+            .unwrap();
+            let held = messages + buffered(&stated, &limits);
+            assert!(held <= stated.transport_bytes, "{stated:?}: {held}");
+            // Nothing is left over but what whole windows and whole chunks cannot use.
+            let peers = stated.peers.max(1) as u64;
+            let shares = peers * (CONNECTIONS_PER_PEER as u64 + 1);
+            let pool_short = limits.window_ceiling % RECEIVE_CHUNK as u64 * peers;
+            assert!(
+                stated.transport_bytes - held < shares + pool_short,
+                "{stated:?}"
+            );
+            assert_eq!(
+                limits.receive_chunks as u64,
+                limits.window_ceiling / RECEIVE_CHUNK as u64 * peers
+            );
+        }
+        // A budget the messages leave no window of is refused, not shared out.
+        let starved = Stated {
+            transport_bytes: 2 * RECEIVE_CHUNK as u64,
+            ..stated()
+        };
+        assert!(limits(&starved).is_err());
     }
 
     #[test]

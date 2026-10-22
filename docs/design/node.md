@@ -929,6 +929,18 @@ stage that is itself budgeted: a chunk being written is read into an assembly sl
 the chunk, reserved first and handed to the volume's ticket whole, so a chunk larger than the
 window never deadlocks and bytes read never pile up ahead of a busy disk (audit §13.4).
 
+*As built (2026-10-21).* The transport's bytes are one budget that QUIC's buffering and the
+messages share: a connection's receive window and the receive chunks datagrams are cut from are
+both charged to it, as are every message's head, every lane frame, and the piece a body is read
+into. Reading what QUIC buffered is what frees it, so the buffering is sized within the budget
+less what the messages hold at once at most (`bounds::limits`): every exchange's head both ways,
+one body piece, and for a node that keeps appends out each peer lane's frames, its window out and
+one in; a peer's two connections' windows (each with the class reserve its first window carries)
+and its full window of unread data packed into whole chunks share the rest, and a budget that
+leaves no window is refused at start. Before, the windows and the chunks were each sized from the
+whole budget: on macos-aarch64 a gateway's three connections grew their windows to the budget's
+whole and the piece a 1 MiB reply is read into was refused (CI run 39694528095).
+
 Bulk work is lowest, but it has a floor. A cell must rebuild its largest failure domain within
 the time its durability target allows, so repair needs at least `D/T` of bandwidth for lost
 capacity `D` and repair time `T` (audit §14.3; durability.md §5). While repair is behind that

@@ -12,7 +12,7 @@ use crate::record::{
 };
 use crate::{block, bucket, file, name, root};
 
-const FORMAT: u8 = 5;
+const FORMAT: u8 = 6;
 
 /// Commands one entry carries at most: a session is named by the index of the entry that
 /// registered it and the registration's place in that entry.
@@ -1474,6 +1474,15 @@ fn take_name_outcome(r: &mut Reader<'_>) -> Option<name::Outcome> {
 pub const MAX_BUCKET: usize = 63;
 /// An object's key at most: S3's 1,024 bytes (research/05 §10.1).
 pub const MAX_KEY: usize = 1024;
+/// A request's headers at most: S3's 8 KB (research/05 §10.2).
+pub const MAX_HEADERS: usize = 8 << 10;
+/// An owner's name at most: a canonical user ID's 64 hexadecimal digits, the longest form S3
+/// names an owner in (research/13, the ACL grantee); an account ID is 12 digits (research/17 §6).
+pub const MAX_OWNER: usize = 64;
+/// Hexadecimal digits of an MD5, a part's ETag and the stem of a multipart object's.
+const ETAG_HEX: usize = 32;
+/// Parts of a multipart upload at most: S3's 10,000 (research/05 §4.1).
+const MAX_PARTS: usize = 10_000;
 
 /// Bytes of the largest entry a Name, File or Block range must take: one command, the largest
 /// a gateway sends, in the session wrapping it carries. A range whose `max_entry_bytes` or log
@@ -1482,12 +1491,8 @@ pub const MAX_KEY: usize = 1024;
 /// bucket and key, with the most preconditions a request's headers hold, or the file of parts
 /// it writes, of 10,000 extents; each is encoded here at its longest and the larger taken.
 pub fn largest_entry_bytes() -> Result<usize, RecordError> {
-    // S3's limits: a request's headers within 8 KB (05 §10.2) and 10,000 parts (05 §4.1), with
-    // the longest bucket and key. An upload ID is one the Name range made, and a gateway sends
-    // no other.
-    const MAX_HEADERS: usize = 8 << 10;
-    const MAX_PARTS: usize = 10_000;
-    const ETAG_HEX: usize = 32;
+    // S3's limits: a request's headers within 8 KB and 10,000 parts, with the longest bucket and
+    // key. An upload ID is one the Name range made, and a gateway sends no other.
     // The most tags an If-Match within the headers names: one character and a comma each.
     let tags = || Some(name::Match::Tags(vec!["t".to_owned(); MAX_HEADERS / 2]));
     let complete = name::Complete {
@@ -1508,14 +1513,9 @@ pub fn largest_entry_bytes() -> Result<usize, RecordError> {
                 file: u128::MAX,
             })
             .collect(),
-        etag: format!("{}-{MAX_PARTS}", "e".repeat(ETAG_HEX)),
+        etag: longest_etag(),
         size: u64::MAX,
-        checksum: Some(Checksum {
-            algorithm: u8::MAX,
-            parts: u16::MAX,
-            // SHA-512's, the longest value S3 takes.
-            value: vec![0; 64],
-        }),
+        checksum: Some(longest_checksum()),
         file: Some(u128::MAX),
         listing: [u8::MAX; record::LISTING],
         default: Some(DefaultRetention {
@@ -1566,43 +1566,63 @@ fn alone(command: Command) -> Entry {
     }
 }
 
-/// The most blocks one block check names within an entry of `largest_entry_bytes`.
-fn most_checked_blocks() -> Result<usize, RecordError> {
-    let check = |blocks: usize| {
-        alone(Command::File(file::Command::CheckBlocks {
-            file: u128::MAX,
-            blocks: vec![(u128::MAX, u64::MAX); blocks],
-            at_ns: u64::MAX,
-        }))
-        .encode()
-        .map(|bytes| bytes.len())
-    };
-    let fixed = check(0)?;
-    let each = check(1)?.checked_sub(fixed).ok_or(too_large(fixed))?;
-    let room = largest_entry_bytes()?.saturating_sub(fixed);
-    room.checked_div(each).ok_or(too_large(each))
+/// A multipart object's ETag at its longest: an MD5's digits, `-`, and the count of parts.
+fn longest_etag() -> String {
+    format!("{}-{MAX_PARTS}", "e".repeat(ETAG_HEX))
 }
 
-/// Bytes of the largest answer a range gives one command, which a session keeps until its
-/// gateway acknowledges it (`session::Rules::max_answer_bytes`): a block check's verdicts, one
-/// for each block the largest entry's check can name, or an answer that carries a version, an
-/// upload or a completion's checksum at its longest; each is encoded here and the larger taken.
+/// A checksum at its longest: SHA-512's value, the longest S3 takes, of the most parts.
+fn longest_checksum() -> Checksum {
+    Checksum {
+        algorithm: u8::MAX,
+        parts: u16::MAX,
+        value: vec![0; 64],
+    }
+}
+
+/// A request's headers at the longest encoding S3's 8 KB of them gives a version or an upload:
+/// each header as short as a line holds one, a name of one byte and an empty value (`a:` and
+/// CRLF, four bytes of the request), since each costs a row's encoding eight bytes of lengths.
+fn longest_headers() -> Vec<(String, String)> {
+    vec![("a".to_owned(), String::new()); MAX_HEADERS / 4]
+}
+
+/// A Name range's lineage at its longest: its descriptor, its child and the range it merges into,
+/// each spanning routing keys of S3's longest bucket and key, every byte of the key the zero its
+/// escape doubles.
+fn longest_lineage() -> record::Lineage {
+    let route = crate::key::route(&"b".repeat(MAX_BUCKET), &"\0".repeat(MAX_KEY));
+    let descriptor = record::Descriptor {
+        id: u64::MAX,
+        lo: route.clone(),
+        hi: Some(route),
+        generation: u64::MAX,
+    };
+    record::Lineage {
+        now: descriptor.clone(),
+        child: Some(descriptor.clone()),
+        standing: record::Standing::Frozen,
+        into: Some(descriptor),
+        taken: Some(record::Taken {
+            from: u64::MAX,
+            generation: u64::MAX,
+        }),
+    }
+}
+
+/// Bytes of the largest answer a range gives a command a node sends, which a session keeps until
+/// its gateway acknowledges it (`session::Rules::max_answer_bytes`): a completion's, with its
+/// checksum at its longest; one carrying a version or an upload's ID; or one carrying the
+/// range's lineage at its longest, as a range that no longer holds a key answers. A block
+/// check's verdicts and a Name range's checked marks answer a sweep, which sizes its checks to
+/// the bound; each is encoded here and the larger taken.
 pub fn largest_answer_bytes() -> Result<usize, RecordError> {
     let version = crate::key::version_id(u64::MAX);
     let answers = [
-        Answer::File(file::Outcome::BlocksChecked(vec![
-            Verdict::Young;
-            most_checked_blocks()?
-        ])),
         Answer::Name(name::Outcome::Completed {
             version: version.clone(),
             size: u64::MAX,
-            checksum: Some(Checksum {
-                algorithm: u8::MAX,
-                parts: u16::MAX,
-                // SHA-512's, the longest value S3 takes.
-                value: vec![0; 64],
-            }),
+            checksum: Some(longest_checksum()),
         }),
         Answer::Name(name::Outcome::Put {
             version: version.clone(),
@@ -1612,6 +1632,7 @@ pub fn largest_answer_bytes() -> Result<usize, RecordError> {
             version: Some(version.clone()),
         }),
         Answer::Name(name::Outcome::Created { upload: version }),
+        Answer::Name(name::Outcome::Moved(Box::new(longest_lineage()))),
     ];
     let mut largest = 0usize;
     for answer in answers {
@@ -1620,31 +1641,67 @@ pub fn largest_answer_bytes() -> Result<usize, RecordError> {
     Ok(largest)
 }
 
+/// Bytes of the largest value a row of a range takes from a request S3 admits, a session's
+/// aside (`session::Rules::largest_session_row`): a version or an upload keeping a request's
+/// headers at their longest encoding, its owner a canonical ID and its ETag and checksum at
+/// their longest; a part; or the Name range's lineage at its longest. Every other row holds
+/// fixed fields, IDs, a count or a bucket's name. A command whose row passes the range's bound
+/// is refused whole (`apply::apply_entry`).
+pub fn largest_row_bytes() -> Result<usize, RecordError> {
+    let owner = "o".repeat(MAX_OWNER);
+    let retention = Some(record::Retention {
+        mode: record::RetentionMode::Compliance,
+        until_ms: i64::MAX,
+    });
+    let version = Version {
+        marker: false,
+        null: true,
+        modified_ns: u64::MAX,
+        etag: longest_etag(),
+        size: u64::MAX,
+        checksum: Some(longest_checksum()),
+        file: Some(u128::MAX),
+        owner: owner.clone(),
+        headers: longest_headers(),
+        retention,
+        legal_hold: Some(true),
+        listing: Some([u8::MAX; record::LISTING]),
+    };
+    let upload = Upload {
+        initiated_ns: u64::MAX,
+        owner,
+        headers: longest_headers(),
+        checksum: Some((u8::MAX, true)),
+        retention,
+        legal_hold: Some(true),
+    };
+    let part = Part {
+        etag: "e".repeat(ETAG_HEX),
+        size: u64::MAX,
+        checksum: Some(longest_checksum().value),
+        file: u128::MAX,
+        modified_ns: u64::MAX,
+        deadline_ns: u64::MAX,
+    };
+    let rows = [
+        version.encode()?,
+        upload.encode()?,
+        part.encode()?,
+        longest_lineage().encode()?,
+    ];
+    Ok(rows.iter().map(Vec::len).max().unwrap_or(0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A block check naming the most blocks fits the largest entry and one more does not, and
-    /// its answer is within the largest answer, as is every answer of a variable length.
+    /// The largest answer covers every answer a node's command gets at its longest, and the
+    /// largest row a version's headers in any layout S3's 8 KB of them admits: one long header
+    /// encodes shorter than the many short ones the bound takes.
     #[test]
-    fn the_largest_answer_covers_the_largest_block_check() {
-        let most = most_checked_blocks().unwrap();
-        let check = |blocks: usize| {
-            alone(Command::File(file::Command::CheckBlocks {
-                file: 1,
-                blocks: vec![(u128::MAX, u64::MAX); blocks],
-                at_ns: u64::MAX,
-            }))
-            .encode()
-            .unwrap()
-            .len()
-        };
-        let largest_entry = largest_entry_bytes().unwrap();
-        assert!(check(most) <= largest_entry);
-        assert!(check(most + 1) > largest_entry);
+    fn the_largest_answer_and_row_cover_what_a_request_s3_admits_gives() {
         let largest = largest_answer_bytes().unwrap();
-        let verdicts = Answer::File(file::Outcome::BlocksChecked(vec![Verdict::Held; most]));
-        assert!(verdicts.encode().unwrap().len() <= largest);
         let completed = Answer::Name(name::Outcome::Completed {
             version: crate::key::version_id(7),
             size: 9,
@@ -1655,6 +1712,31 @@ mod tests {
             }),
         });
         assert!(completed.encode().unwrap().len() <= largest);
+        let moved = Answer::Name(name::Outcome::Moved(Box::new(longest_lineage())));
+        assert_eq!(moved.encode().unwrap().len(), largest);
+        let row = largest_row_bytes().unwrap();
+        let version = |headers: Vec<(String, String)>| {
+            Version {
+                marker: false,
+                null: false,
+                modified_ns: 0,
+                etag: longest_etag(),
+                size: 0,
+                checksum: None,
+                file: None,
+                owner: "o".repeat(MAX_OWNER),
+                headers,
+                retention: None,
+                legal_hold: None,
+                listing: None,
+            }
+            .encode()
+            .unwrap()
+            .len()
+        };
+        let one = vec![("a".to_owned(), "v".repeat(MAX_HEADERS - 4))];
+        assert!(version(one) < version(longest_headers()));
+        assert!(version(longest_headers()) <= row);
     }
 
     /// The bound covers a real completion of 10,000 parts, its session and entry around it,

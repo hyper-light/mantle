@@ -623,6 +623,27 @@ fn take_string(k: &[u8]) -> Option<(Vec<u8>, &[u8])> {
     }
 }
 
+/// Bytes of the shortest key a range writes: one of its own rows, its marker after `LOCAL`.
+/// Every other key begins with a space's byte and a string, a bucket's name of S3's three
+/// characters at least, or an ID.
+pub fn least_bytes() -> usize {
+    [LOCAL, marker::CLOCK].len()
+}
+
+/// Bytes of the longest key a range writes from a request S3 admits: an object's row under S3's
+/// longest bucket name and key (`wire::MAX_BUCKET`, `wire::MAX_KEY`), every byte of the key the
+/// zero its escape doubles, with the longest suffix a row of it adds, a part of an upload under
+/// the longest upload ID, or a mark's file. Every other key is a range's own few bytes, an ID,
+/// or a bucket's or an owner's name (`wire::MAX_OWNER`). A command whose row's key passes the
+/// range's bound is refused whole (`apply::apply_entry`).
+pub fn largest_bytes() -> usize {
+    let bucket = "b".repeat(crate::wire::MAX_BUCKET);
+    let key = "\0".repeat(crate::wire::MAX_KEY);
+    let upload = version_id(u64::MAX).into_bytes();
+    let part = name(&bucket, &key, &NameRow::Part(upload, u16::MAX)).len();
+    part.max(mark(&bucket, &key, u128::MAX).len())
+}
+
 /// Crockford's base-32 alphabet, which ascends in ASCII.
 const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
@@ -663,6 +684,37 @@ pub fn parse_version_id(id: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// Every key at S3's longest names is within the longest key: each row of an object, its
+    /// marks, its bucket's and its owner's rows, and the range's own.
+    #[test]
+    fn every_key_at_s3s_longest_names_is_within_the_longest() {
+        let longest = largest_bytes();
+        let bucket = "b".repeat(crate::wire::MAX_BUCKET);
+        let key = "\0".repeat(crate::wire::MAX_KEY);
+        let owner = "o".repeat(crate::wire::MAX_OWNER);
+        let upload = version_id(u64::MAX).into_bytes();
+        let keys = [
+            name(&bucket, &key, &NameRow::Null),
+            name(&bucket, &key, &NameRow::Version(u64::MAX)),
+            name(&bucket, &key, &NameRow::Upload(upload.clone())),
+            name(&bucket, &key, &NameRow::Part(upload, u16::MAX)),
+            mark(&bucket, &key, u128::MAX),
+            self::bucket(&bucket),
+            gate(&bucket),
+            attempt(&bucket),
+            self::owner(&owner),
+            owned(&owner, &bucket),
+            released(u64::MAX, u128::MAX),
+            unsettled(u64::MAX, u128::MAX),
+            file_extent(u128::MAX, u64::MAX),
+            block_chunk(u128::MAX, u16::MAX),
+            reverse(u128::MAX, u128::MAX),
+            volume(u128::MAX),
+        ];
+        assert!(keys.iter().all(|k| k.len() <= longest));
+        assert!(keys.iter().any(|k| k.len() == longest));
+    }
 
     #[test]
     fn every_kind_of_a_ranges_own_rows_has_its_own_marker() {

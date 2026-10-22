@@ -483,8 +483,9 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/meta/src/wire.rs` `MAX_KEY` | external | An object key of at most 1,024 bytes (research/05 §10.1). |
 | `crates/meta/src/wire.rs` `MAX_HEADERS` | external | A request's headers within 8 KB (research/05 §10.2), which bound its preconditions. |
 | `crates/meta/src/wire.rs` `MAX_PARTS` | external | 10,000 parts to an upload (research/05 §4.1). |
+| `crates/meta/src/wire.rs` `MAX_OWNER` | external | An owner's name of at most 64 characters: a canonical user ID's 64 hexadecimal digits, the longest form S3 names an owner in (research/13, the ACL grantee); an account ID is 12 digits (research/17 §6). |
 | `crates/meta/src/wire.rs` `ETAG_HEX` | external | A part's ETag, the hex of its 16-byte MD5 (research/05 §4.5). |
-| `crates/meta/src/wire.rs` `FORMAT` | format | Version byte 5 of an encoded log entry; 5 since a registration refused at the bound of sessions is answered `SessionsFull` with the time a place frees, 4 since a part carries its file's handover deadline in place of the command beside it, 3 since a PUT and a completion carry the ID of their request, which names a write with no file, and a mark kept past an unmark is answered with its deadline, 2 since a completion carries its part listing's digest. |
+| `crates/meta/src/wire.rs` `FORMAT` | format | Version byte 6 of an encoded log entry; 6 since a registration names its owner, the owner's run and its place in the run, 5 since a registration refused at the bound of sessions is answered `SessionsFull` with the time a place frees, 4 since a part carries its file's handover deadline in place of the command beside it, 3 since a PUT and a completion carry the ID of their request, which names a write with no file, and a mark kept past an unmark is answered with its deadline, 2 since a completion carries its part listing's digest. |
 | `crates/meta/src/wire.rs` `MAX_COMMANDS` | bound | 2^16 command places per entry, so a session ID is index × 2^16 + place (session.rs `register`); the audit (§12.6) keeps it as a versioned encoding bound with byte and work budgets beside it. |
 | `crates/node/src/bounds.rs` `CONNECTIONS_PER_PEER` | bound | Two connections a peer: its current one and the one replacing it, for the handshake's round trip both carry traffic in (hyper-datagram's two epochs a peer, for the same overlap). |
 | `crates/node/src/bounds.rs` `GRANULARITY` | external | `kGranularity`, 1 ms, the least a probe timeout adds for the timer (RFC 9002 §6.1.2). |
@@ -500,6 +501,10 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/node/src/command.rs` `HEAD_BYTES` | format | A command's head: the range's group, a u128 as the log names it. |
 | `crates/node/src/command.rs` `LENGTH_BYTES` | format | An answer's length before it in a reply's body, a u32. |
 | `crates/node/src/command.rs` `REPLY_HEAD_BYTES` | format | A reply's head: its status, one byte; the leader the node knows, a u64; and, for a redirect, how long until the node acts on its leader's silence, a u64 of nanoseconds. |
+| `crates/node/src/derive.rs` `ELECTION_TICK` | cited | focal's election timeout of 10 ticks (docs/design/node.md §2.4; research/07 §2.2), which a range keeps though it elects by suspicion, which takes no ticks. |
+| `crates/node/src/derive.rs` `EXTENT_PAGES` | bound | The least pages an engine's extent takes: 2, extent 0 holding the superblock's two copies (`mantle_engine::store::Config`). |
+| `crates/node/src/derive.rs` `FANOUT` | cited | SplinterDB's trunk fanout of 8, at which the engine's measurements ran (docs/design/engine-structure.md §5–§6), until it is measured against mantle's key counts as §4 asks. |
+| `crates/node/src/derive.rs` `HEARTBEAT_TICK` | cited | focal's heartbeat every 2 ticks (docs/design/node.md §2.4; research/07 §2.2). |
 | `crates/node/src/frame.rs` `CRC_BYTES` | format | A Raft frame's CRC-32C, four bytes (CLAUDE.md §6). |
 | `crates/node/src/frame.rs` `GROUP_BYTES` | format | A Raft frame's group, a u128 as the log names a range's group (hyper-log). |
 | `crates/node/src/frame.rs` `HEADER_BYTES` | derived | CRC_BYTES plus GROUP_BYTES: the bytes before a frame's message. |

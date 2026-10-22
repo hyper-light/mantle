@@ -94,8 +94,19 @@ pub fn pause(delay: Duration, local: u64, attempt: u32) -> Duration {
     ))
 }
 
-/// The transport's limits for a node of `stated`.
-pub fn limits(stated: &Stated) -> Result<Limits, Unfit> {
+/// What a node of `stated` keeps of the transport's shape: its peers and their connections,
+/// the streams each connection takes and the exchanges all of them hold, a lane's window, and the
+/// largest head a message carries.
+struct Shape {
+    peers: usize,
+    connections: usize,
+    streams: u32,
+    exchanges: usize,
+    lane_window: usize,
+    max_head: u32,
+}
+
+fn shape(stated: &Stated) -> Result<Shape, Unfit> {
     let peers = stated.peers.max(1);
     let connections = peers
         .checked_mul(CONNECTIONS_PER_PEER)
@@ -135,7 +146,42 @@ pub fn limits(stated: &Stated) -> Result<Limits, Unfit> {
     .max()
     .unwrap_or(0);
     let max_head = u32::try_from(max_head).map_err(|_| Unfit("head"))?;
-    let (window_ceiling, receive_chunks) = buffering(stated, exchanges, max_head, lane_window)?;
+    Ok(Shape {
+        peers,
+        connections,
+        streams,
+        exchanges,
+        lane_window,
+        max_head,
+    })
+}
+
+/// The least bytes the node's transport may hold for `stated` (its `transport_bytes` aside):
+/// what it holds besides QUIC's windows, and each share of the rest at QUIC's initial window,
+/// below which [`limits`] refuses (docs/design/node.md §1.4). Receive chunks past it spare a
+/// datagram its copy, which its connection's window already charges (hyper-transport's
+/// `receive`), and wait for their knee.
+pub fn least_transport(stated: &Stated) -> Result<u64, Unfit> {
+    let shape = shape(stated)?;
+    let (held, shares) = held(stated, &shape)?;
+    shares
+        .checked_mul(initial_window(MIN_DATAGRAM))
+        .and_then(|windows| windows.checked_add(held))
+        .ok_or(Unfit("the transport's least bytes"))
+}
+
+/// The transport's limits for a node of `stated`.
+pub fn limits(stated: &Stated) -> Result<Limits, Unfit> {
+    let shape = shape(stated)?;
+    let (window_ceiling, receive_chunks) = buffering(stated, &shape)?;
+    let Shape {
+        peers,
+        connections,
+        streams,
+        exchanges,
+        lane_window,
+        max_head,
+    } = shape;
     let idle = idle_timeout();
     Ok(Limits {
         admission: AdmissionLimits {
@@ -216,18 +262,32 @@ fn messages(
 /// read into was refused). Each peer holds at most two connections' windows, each with the class
 /// reserve its first window carries, and a full window of its unread data packed into whole
 /// chunks; each handshake admission lets wait holds a first window.
-fn buffering(
-    stated: &Stated,
-    exchanges: usize,
-    max_head: u32,
-    lane_window: usize,
-) -> Result<(u64, usize), Unfit> {
+fn buffering(stated: &Stated, shape: &Shape) -> Result<(u64, usize), Unfit> {
     let unfit = || Unfit("the transport's bytes, less the messages', hold no window");
-    let peers = u64::try_from(stated.peers.max(1)).map_err(|_| unfit())?;
-    let connections = u64::try_from(CONNECTIONS_PER_PEER)
-        .ok()
+    let (held, shares) = held(stated, shape)?;
+    let free = stated.transport_bytes.checked_sub(held).ok_or_else(unfit)?;
+    let window_ceiling = free.checked_div(shares).ok_or_else(unfit)?;
+    if window_ceiling < initial_window(MIN_DATAGRAM) {
+        return Err(unfit());
+    }
+    let peers = u64::try_from(shape.peers).map_err(|_| unfit())?;
+    let chunk = u64::try_from(RECEIVE_CHUNK).map_err(|_| unfit())?;
+    let receive_chunks = window_ceiling
+        .checked_div(chunk)
         .and_then(|c| c.checked_mul(peers))
+        .and_then(|c| usize::try_from(c).ok())
         .ok_or_else(unfit)?;
+    Ok((window_ceiling, receive_chunks))
+}
+
+/// What the transport's bytes hold besides QUIC's windows, and the shares the rest is cut into
+/// ([`buffering`]): the messages' bytes, each connection's reserve and each waiting handshake's
+/// first window with its reserve; and a share each for a peer's two connections' windows and
+/// its pool of chunks.
+fn held(stated: &Stated, shape: &Shape) -> Result<(u64, u64), Unfit> {
+    let unfit = || Unfit("the transport's bytes, less the messages', hold no window");
+    let peers = u64::try_from(shape.peers).map_err(|_| unfit())?;
+    let connections = u64::try_from(shape.connections).map_err(|_| unfit())?;
     let reserve = class_reserve(<NodeClasses as Classes>::RANKS.saturating_sub(1));
     // Each connection's reserve, and each waiting handshake's first window with its reserve.
     let fixed = connections
@@ -237,24 +297,12 @@ fn buffering(
             r.checked_add(peers.checked_mul(first)?)
         })
         .ok_or_else(unfit)?;
-    let free = stated
-        .transport_bytes
-        .checked_sub(messages(stated, exchanges, max_head, lane_window)?)
-        .and_then(|b| b.checked_sub(fixed))
+    let held = messages(stated, shape.exchanges, shape.max_head, shape.lane_window)?
+        .checked_add(fixed)
         .ok_or_else(unfit)?;
     // A share each for a peer's two connections' windows and its pool of chunks.
     let shares = connections.checked_add(peers).ok_or_else(unfit)?;
-    let window_ceiling = free.checked_div(shares).ok_or_else(unfit)?;
-    if window_ceiling < initial_window(MIN_DATAGRAM) {
-        return Err(unfit());
-    }
-    let chunk = u64::try_from(RECEIVE_CHUNK).map_err(|_| unfit())?;
-    let receive_chunks = window_ceiling
-        .checked_div(chunk)
-        .and_then(|c| c.checked_mul(peers))
-        .and_then(|c| usize::try_from(c).ok())
-        .ok_or_else(unfit)?;
-    Ok((window_ceiling, receive_chunks))
+    Ok((held, shares))
 }
 
 /// How the node's sockets batch: a system call takes up to one datagram train from each peer, what
@@ -307,6 +355,23 @@ mod tests {
         // 333 ms + max(4 × 166.5 ms, 1 ms) + 25 ms.
         assert_eq!(initial_pto(), Duration::from_micros(1_024_000));
         assert_eq!(idle_timeout(), Duration::from_micros(3_072_000));
+    }
+
+    #[test]
+    fn the_least_transport_gives_windows_and_a_byte_less_gives_none() {
+        for peers in [1, 2, 9] {
+            let least = least_transport(&Stated { peers, ..stated() }).unwrap();
+            let at = |transport_bytes| {
+                limits(&Stated {
+                    peers,
+                    transport_bytes,
+                    ..stated()
+                })
+            };
+            let limits = at(least).unwrap();
+            assert_eq!(limits.window_ceiling, initial_window(MIN_DATAGRAM));
+            assert!(at(least - 1).is_err());
+        }
     }
 
     #[test]

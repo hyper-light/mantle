@@ -218,9 +218,10 @@ measures the second, and derives the rest by these rules:
 - **Every class at its floor.** The memory paragraph's floor is computed class by class from the
   structures each fills, and the settings are the floor's: one object put and one got at a time, a
   window of one block, one append out to a follower, an entry of the range's largest in each append and each
-  apply, one chunk ask to each node a block's width needs, the transport funding each peer a
-  receive chunk for each class beside the messages' room and each connection's reserve
-  (`bounds::buffering`). The node refuses to start, naming the class, when the floor exceeds the
+  apply, one chunk ask to each node a block's width needs, the transport funding each peer's
+  windows at QUIC's initial window beside the messages' room and each connection's reserve
+  (`bounds::least_transport`); a receive chunk past them spares a datagram its copy, which its
+  connection's window already charges, and waits for its knee. The node refuses to start, naming the class, when the floor exceeds the
   stated ceiling or the limit the OS sets for the process (hyper-rt's `MemoryFacts::limit`:
   cgroup v2's `memory.max`, a job's limit, `RLIMIT_AS`). A share above a class's floor waits for
   its knee, where throughput stops growing as the share grows, measured at the scale step (§9.3):
@@ -251,11 +252,11 @@ measures the second, and derives the rest by these rules:
 | `range.max_entry_bytes` | derived | `mantle_meta::wire::largest_entry_bytes` (replica.md §7) |
 | `range.election_tick`, `range.heartbeat_tick` | cited | focal's 10 and 2 (§2.4), checked though ranges elect by suspicion, which takes no ticks |
 | `range.max_size_per_msg`, `max_uncommitted_size`, `max_committed_size_per_ready`, `max_inflight_msgs` | derived | the floor's `Ready`: an entry of the range's largest each, one append out |
-| `rules.*` | derived | sessions as above; an owner's answers kept as its commands held at once (`command_asks`), each at the largest answer (`wire::largest_answer_bytes`, computed as `largest_entry_bytes` is); a row's key and value at most (`max_key_bytes`, `max_value_bytes`): the longest key S3's names give a row and the largest value a request S3 admits, or a session at its bounds, gives one, which every member's engine holds (replica.md §2), and the node refuses to start on an engine that does not (`mantle_range::holds_rows`) |
-| `log.*` | derived | `hyper_log::Config::derive` from the log's block, its largest entry, its groups (the ranges and the liveness stream's), the floor's cache and uncommitted bytes, its checkpoints, and the least file (raft-log.md §5 sizes the file by measured rates later) |
-| `engine.extent_pages`, `engine.max_extents` | derived | an extent of pages; extents bounded by the device's space |
-| `engine.memtable_bytes`, `engine.fanout`, `engine.leaf_entries` | derived, cited | the least write buffer, one row at the range's bounds whole (`memtable::hashed::entry_bytes`); SplinterDB's fanout of 8, at which the engine's measurements ran (engine-structure.md §5–§6), until the fanout is measured against mantle's key counts as its §4 asks; a leaf holding one memtable's rows (`benches/ranges.rs`) |
-| `transport_bytes` | derived | the transport's floor (`bounds::buffering` solved for its least funding) |
+| `rules.*` | derived | the same on every member, from the cell's identities and the metadata layer's bounds alone (`derive::cell`): a session of each identity for good, as above; one command an entry, its answer kept until the next entry acknowledges it, at the largest a node's command gets (`wire::largest_answer_bytes`: a range's lineage at the longest route keys; a sweep sizes its checks to it); a row's key and value at most the longest key S3's names give a row (`key::largest_bytes`) and the largest value a request S3 admits, or a session at its bounds, gives one (`wire::largest_row_bytes`: a version keeping S3's 8 KB of headers at their longest encoding), which every member's engine holds (replica.md §2); the node refuses to start on an engine that does not (`mantle_range::holds_rows`) |
+| `log.*` | derived | `hyper_log::Config::derive` from the log's block, its largest entry with the shell's bytes, its groups (the ranges and the liveness stream's), a checkpoint's cadence and what a group holds uncommitted past it of one `Ready` each, in bytes and in entries of the fewest bytes, a cache of one largest entry a group, and the least file, its persist area and three segments (`derive::log`; raft-log.md §5 sizes the file by measured rates later) |
+| `engine.extent_pages`, `engine.max_extents` | derived | the least pages the store takes an extent, two; as many extents as each range's share of the metadata device's space holds (`derive::engine`) |
+| `engine.memtable_bytes`, `engine.fanout`, `engine.leaf_entries` | derived, cited | the least write buffer, one row at the range's bounds whole (`memtable::hashed::entry_bytes`); SplinterDB's fanout of 8, at which the engine's measurements ran (engine-structure.md §5–§6), until the fanout is measured against mantle's key counts as its §4 asks; a leaf holding every row one memtable gives it, the most a memtable holds being rows of the shortest key and no value (`key::least_bytes`; `benches/ranges.rs` sizes a leaf so) |
+| `transport_bytes` | derived | the transport's floor: what it holds besides QUIC's windows, and each share at QUIC's initial window, below which its limits refuse (`bounds::least_transport`) |
 | `volume.*` layout | derived | a segment holding one chunk record whole at the device's write unit, batches of one record, checksum blocks of the write unit (research 11 §5–§8) |
 | `gateway.window`, `gateway.objects`, `chunk_asks`, `command_asks`, `read_asks` | derived | the floor: a window of one block, one put and one get, a block's width of chunks, and the commands and reads those two hold at once |
 | `gateway.bucket_quota`, `gateway.scan_rows` | cited, derived | S3's 10,000 (research 05 §10.4); the rows one reply carries |

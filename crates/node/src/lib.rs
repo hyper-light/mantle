@@ -31,6 +31,7 @@ pub mod chunk;
 pub mod classes;
 pub mod client;
 pub mod command;
+pub mod derive;
 pub mod directory;
 pub mod frame;
 pub mod layout;

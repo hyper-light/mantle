@@ -281,7 +281,9 @@ mod tests {
                         .map_or(0, |p| lcp(p, k));
                     let after = keys.get(i + 1).map_or(0, |n| lcp(k, n));
                     let len = before.max(after).saturating_add(1).min(k.len());
-                    whole.add(&k[..len], suffix_of(Pieces::whole(k), len, suffix)).unwrap();
+                    whole
+                        .add(&k[..len], suffix_of(Pieces::whole(k), len, suffix))
+                        .unwrap();
                 }
                 let expected = Surf {
                     trie: whole.finish().unwrap(),

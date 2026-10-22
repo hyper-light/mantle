@@ -31,9 +31,9 @@ pub(crate) mod point;
 
 use crate::error::{Error, Malformed};
 use crate::fst::surf::{Surf, SurfBuilder};
-use crate::util::keys::Pieces;
 use crate::fst::trie::{Trie, TrieBuilder, Width};
 use crate::store::{MIN_PAGE, Run, Span, Store};
+use crate::util::keys::Pieces;
 use hyper_block::block::BlockFile;
 use std::cmp::Ordering;
 
@@ -92,16 +92,19 @@ fn key_head(suffix: &[u8]) -> u32 {
     u32::from_be_bytes(b)
 }
 
-/// [`key_head`] of a suffix read in pieces.
-fn key_head_of(suffix: Pieces<'_>) -> u32 {
-    if let Some(b) = suffix.head.first_chunk::<KEY_HEAD>() {
-        return u32::from_be_bytes(*b);
+/// [`key_head`] of a suffix read in two pieces, `a` then `b`.
+fn key_head_of(a: &[u8], b: &[u8]) -> u32 {
+    if let Some(h) = a.first_chunk::<KEY_HEAD>() {
+        return u32::from_be_bytes(*h);
     }
-    let mut b = [0u8; KEY_HEAD];
-    for (at, d) in b.iter_mut().enumerate() {
-        *d = suffix.get(at).unwrap_or(0);
+    if a.is_empty() {
+        return key_head(b);
     }
-    u32::from_be_bytes(b)
+    let mut h = [0u8; KEY_HEAD];
+    for (d, s) in h.iter_mut().zip(a.iter().chain(b)) {
+        *d = *s;
+    }
+    u32::from_be_bytes(h)
 }
 
 /// A built branch: its root page, its height (1 for a lone leaf), its entries, and the extents
@@ -210,6 +213,11 @@ pub(crate) struct Page {
     /// For each entry, packed in a word: the bytes of its key it shares with the first and does
     /// not stage, and where its staged key and its rest end in `bytes` ([`Ends`]).
     ends: Vec<u64>,
+    /// Where the first entry's key ends in `bytes`.
+    first_end: usize,
+    /// The last entry's shared bytes and where its staged key lies in `bytes`: the key the next
+    /// entry is compared with, read without unpacking its ends.
+    last: [usize; 3],
     /// The keys' bytes and the rests' bytes, each summed: what the page's size counts.
     key_bytes: usize,
     rest_bytes: usize,
@@ -228,6 +236,8 @@ impl Page {
         Self {
             bytes: Vec::with_capacity(capacity.saturating_mul(2)),
             ends: Vec::with_capacity(entries),
+            first_end: 0,
+            last: [0; 3],
             key_bytes: 0,
             rest_bytes: 0,
             prefix: 0,
@@ -239,39 +249,27 @@ impl Page {
         self.ends.len()
     }
 
-    /// Entry `i`'s staged key: the first entry's whole, a later one's past what it shares with
-    /// the first.
-    fn staged(&self, i: usize) -> &[u8] {
-        let start = i
-            .checked_sub(1)
-            .and_then(|j| self.ends.get(j))
-            .map_or(0, |&e| Ends::of(e).rest);
-        let end = self.ends.get(i).map_or(start, |&e| Ends::of(e).key);
-        self.bytes.get(start..end).unwrap_or(&[])
-    }
-
     /// The first entry's key.
     fn first(&self) -> &[u8] {
-        self.staged(0)
+        self.bytes.get(..self.first_end).unwrap_or(&[])
     }
 
-    /// Entry `i`'s key, read where it is staged: the bytes it shares with the first, from the
-    /// first, then its own.
-    fn key(&self, i: usize) -> Pieces<'_> {
-        let shared = self.ends.get(i).map_or(0, |&e| Ends::of(e).shared);
+    /// The first entry's bytes after its key.
+    fn first_rest(&self) -> &[u8] {
+        let end = self
+            .ends
+            .first()
+            .map_or(self.first_end, |&e| Ends::of(e).rest);
+        self.bytes.get(self.first_end..end).unwrap_or(&[])
+    }
+
+    /// The last entry's key, read where it is staged: the bytes it shares with the first, from
+    /// the first, then its own.
+    fn last_key(&self) -> Pieces<'_> {
+        let [shared, start, end] = self.last;
         Pieces {
             head: self.first().get(..shared).unwrap_or(&[]),
-            tail: self.staged(i),
-        }
-    }
-
-    fn rest(&self, i: usize) -> &[u8] {
-        match self.ends.get(i) {
-            Some(&e) => {
-                let e = Ends::of(e);
-                self.bytes.get(e.key..e.rest).unwrap_or(&[])
-            }
-            None => &[],
+            tail: self.bytes.get(start..end).unwrap_or(&[]),
         }
     }
 
@@ -311,10 +309,16 @@ impl Page {
         ) else {
             return Err(corrupt(Malformed::TooLarge));
         };
+        let start = self.bytes.len();
         self.bytes.extend_from_slice(own);
         self.bytes.extend_from_slice(head);
         self.bytes.extend_from_slice(tail);
         self.ends.push(ends);
+        let key_end = start.saturating_add(own.len());
+        if self.ends.len() == 1 {
+            self.first_end = key_end;
+        }
+        self.last = [shared, start, key_end];
         self.key_bytes = self.key_bytes.saturating_add(key.len());
         self.rest_bytes = self.rest_bytes.saturating_add(rest);
         self.prefix = prefix;
@@ -325,6 +329,8 @@ impl Page {
     pub(crate) fn clear(&mut self) {
         self.bytes.clear();
         self.ends.clear();
+        self.first_end = 0;
+        self.last = [0; 3];
         self.key_bytes = 0;
         self.rest_bytes = 0;
         self.prefix = 0;
@@ -378,36 +384,56 @@ impl Page {
             table.as_chunks_mut::<OFFSET>().0,
             heads.as_chunks_mut::<KEY_HEAD>().0,
         );
-        for ((i, slot), head) in table.iter_mut().enumerate().zip(heads.iter_mut()) {
-            let key = self.key(i);
-            if key.len() < self.prefix {
+        let first = self.first();
+        // Each entry's staged key and rest lie after the one before it's.
+        let mut start = 0usize;
+        for (((i, slot), head), &word) in table
+            .iter_mut()
+            .enumerate()
+            .zip(heads.iter_mut())
+            .zip(&self.ends)
+        {
+            let e = Ends::of(word);
+            let own = self
+                .bytes
+                .get(start..e.key)
+                .ok_or(corrupt(Malformed::Truncated))?;
+            let rest = self
+                .bytes
+                .get(e.key..e.rest)
+                .ok_or(corrupt(Malformed::Truncated))?;
+            start = e.rest;
+            // The suffix past the page's prefix, in two pieces: the first entry's own key past
+            // it; a later one's, the first's bytes from the prefix to what it shares with the
+            // first, then its own.
+            let (a, b) = if i == 0 {
+                (own.get(self.prefix..), Some(&[][..]))
+            } else {
+                (first.get(self.prefix..e.shared), Some(own))
+            };
+            let (Some(a), Some(b)) = (a, b) else {
                 return Err(corrupt(Malformed::Truncated));
-            }
-            let suffix = key.skip(self.prefix);
-            let rest = self.rest(i);
+            };
+            let suffix = a.len().checked_add(b.len()).ok_or_else(too_large)?;
             *slot = u16_of(at)?;
-            *head = key_head_of(suffix).to_be_bytes();
+            *head = key_head_of(a, b).to_be_bytes();
             let (len, tail) = std::mem::take(&mut body)
                 .split_at_mut_checked(2)
                 .ok_or_else(too_large)?;
-            len.copy_from_slice(&u16_of(suffix.len())?);
+            len.copy_from_slice(&u16_of(suffix)?);
             let (r, tail) = tail
                 .split_at_mut_checked(rest.len())
                 .ok_or_else(too_large)?;
             r.copy_from_slice(rest);
-            let (k, tail) = tail
-                .split_at_mut_checked(suffix.head.len())
-                .ok_or_else(too_large)?;
-            k.copy_from_slice(suffix.head);
-            let (k, tail) = tail
-                .split_at_mut_checked(suffix.tail.len())
-                .ok_or_else(too_large)?;
-            k.copy_from_slice(suffix.tail);
+            let (k, tail) = tail.split_at_mut_checked(a.len()).ok_or_else(too_large)?;
+            k.copy_from_slice(a);
+            let (k, tail) = tail.split_at_mut_checked(b.len()).ok_or_else(too_large)?;
+            k.copy_from_slice(b);
             body = tail;
             at = at
                 .checked_add(2)
                 .and_then(|a| a.checked_add(rest.len()))
-                .and_then(|a| a.checked_add(suffix.len()))
+                .and_then(|a| a.checked_add(suffix))
                 .ok_or_else(too_large)?;
         }
         Ok(total)
@@ -635,7 +661,7 @@ impl Builder {
         // the last leaf written when this entry's turn came after it filled.
         let prev = match self.levels.first() {
             _ if self.count == 0 => None,
-            Some(page) if page.len() > 0 => Some(page.key(page.len().saturating_sub(1))),
+            Some(page) if page.len() > 0 => Some(page.last_key()),
             _ => Some(Pieces::whole(&self.prev_last)),
         };
         // The bytes the key shares with the one before it: where the order check looks, what
@@ -866,8 +892,7 @@ impl Builder {
             )?;
             if let Some(page) = self.levels.first() {
                 self.prev_last.clear();
-                page.key(page.len().saturating_sub(1))
-                    .extend_into(&mut self.prev_last);
+                page.last_key().extend_into(&mut self.prev_last);
             }
         }
         if let Some(page) = self.levels.get_mut(level) {
@@ -925,7 +950,7 @@ impl Builder {
                 // The level's single entry names the root: the page below it.
                 let page = self.levels.get(level).ok_or(corrupt(Malformed::TooLarge))?;
                 let root = page
-                    .rest(0)
+                    .first_rest()
                     .first_chunk::<8>()
                     .map(|b| u64::from_le_bytes(*b))
                     .ok_or(corrupt(Malformed::Truncated))?;

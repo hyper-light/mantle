@@ -128,7 +128,8 @@ pub fn log_config() -> LogConfig {
         max_segments: 64,
         max_groups: 2,
         group_entries: 1 << 10,
-        group_bytes: 4 << 10,
+        // The least that holds a ready of the range's settings, so writes pass it.
+        group_bytes: mantle_range::ready_held(&SETTINGS).unwrap().1,
         group_cache: 1 << 12,
         queue_submissions: 16,
         waits: Waits::Never,

@@ -263,8 +263,12 @@ entry the leader takes must fit one frame of every member's log: the range bound
 cannot hold one refuses to open (`claim`). A group compacted to its applied state retains at
 most one write's entries, a leader's uncommitted proposals or the appends in flight to a
 follower, and one entry past either bound, which the core admits alone; a member whose log
-bounds a group below that, in bytes or in entries of the fewest bytes, refuses to open, since a
-write refused for room there could wait for good.
+bounds a group below that refuses to open, since a write refused for room there could wait for
+good. A write holds as many entries as its bytes make of the least entry a range proposes (13
+bytes: its format, time and count of commands) and its term's empty first one, the core's own,
+each with its durable shell's 5 bytes (`ready_held`). Counted at the shell's bytes alone, as
+before, the bound asked for 2.6 times the entries a write can hold, which the log keeps a slot
+for each.
 
 **The core's bounds.** The core bounds every queue it keeps by what its owner states
 (`hyper_raft::Limits::derive`), and a range states each from its own settings, so no bound is

@@ -346,34 +346,34 @@ pub fn engine(block: usize, share: u64, rules: &Rules) -> Result<Engine, DeriveE
 }
 
 /// The node's shared log on a device whose write unit is `align`, for `ranges` ranges and the
-/// liveness stream's group (`hyper_log::Config::derive`): a frame of the range's largest entry
-/// with its durable shell's bytes; a checkpoint's cadence, and what a group holds uncommitted
-/// past it, of one `Ready` of the range's settings each, in bytes and in entries of the fewest
-/// bytes, so the group's retention holds the two cadences and a `Ready` the range checks it
-/// against (`mantle_range`'s `check_settings`); a cache of one largest entry a group; and the
-/// least file the log runs in, its persist area and three segments (raft-log.md §5 sizes the
-/// file by measured rates later).
+/// liveness stream's group (`hyper_log::Config::derive`):
+///
+/// - a frame of the range's largest entry with its durable shell's bytes;
+/// - a checkpoint's cadence, and what a group holds uncommitted past it, of one `Ready` of the
+///   range's settings each (`mantle_range::ready_held`): its entries, as many as its bytes make of
+///   the least entry a range proposes and the term's empty first one, and its bytes with each
+///   entry's shell, so a group's retention holds the two cadences and a `Ready`, as the range
+///   checks (`mantle_range`'s `check_settings`);
+/// - a cache of one largest entry a group;
+/// - a file holding every group's retention at once, beside the least file the log runs in: a
+///   `Ready`'s parts, each its entries behind their records' headers, as many as greedy parts of
+///   a frame's room make of them, each a segment at most, since a frame never spans segments. A
+///   write past what the file holds is refused `Full` until a checkpoint frees room, which a
+///   group writing toward its retention would otherwise wait on.
 pub fn log(align: Alignment, settings: &Settings, ranges: usize) -> Result<LogConfig, DeriveError> {
-    let overhead = hyper_durable::ENTRY_OVERHEAD;
-    let entry = usize::try_from(settings.max_entry_bytes)
-        .map_err(|_| DeriveError::Overflow("the largest entry"))?;
-    let largest_entry = entry
-        .checked_add(overhead)
-        .ok_or(DeriveError::Overflow("the largest entry"))?;
-    let groups = ranges
-        .checked_add(1)
-        .ok_or(DeriveError::Overflow("the log's groups"))?;
-    let ready = settings
+    let overflow = |what| DeriveError::Overflow(what);
+    let shell = u64::try_from(hyper_durable::ENTRY_OVERHEAD).map_err(|_| overflow("a shell"))?;
+    let largest_entry = settings
         .max_entry_bytes
-        .checked_mul(2)
-        .ok_or(DeriveError::Overflow("a Ready"))?;
-    let entries = ready
-        .checked_div(u64::try_from(overhead).map_err(|_| DeriveError::Overflow("an entry"))?)
-        .ok_or(DeriveError::Overflow("a Ready's entries"))?;
+        .checked_add(shell)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or(overflow("the largest entry"))?;
+    let groups = ranges.checked_add(1).ok_or(overflow("the log's groups"))?;
+    let (entries, payload) = mantle_range::ready_held(settings).ok_or(overflow("a Ready"))?;
     let cache_bytes = u64::try_from(largest_entry)
         .ok()
         .and_then(|entry| entry.checked_mul(u64::try_from(groups).ok()?))
-        .ok_or(DeriveError::Overflow("the log's cache"))?;
+        .ok_or(overflow("the log's cache"))?;
     let facts = |disk_bytes| Facts {
         align,
         sealed: false,
@@ -381,18 +381,74 @@ pub fn log(align: Alignment, settings: &Settings, ranges: usize) -> Result<LogCo
         disk_bytes,
         max_groups: groups,
         cadence_entries: entries,
-        cadence_bytes: ready,
+        cadence_bytes: payload,
         uncommitted_entries: entries,
-        uncommitted_bytes: ready,
+        uncommitted_bytes: payload,
         cache_bytes,
     };
-    // The least file is what a budget of none is refused for.
-    let needed = match LogConfig::derive(&facts(0)) {
+    // The least file, its persist area and three segments, is what a budget of none is refused
+    // for; its segment is the one every file of these facts takes.
+    let least_file = match LogConfig::derive(&facts(0)) {
         Err(LogError::Unfit(Unfit::Disk { needed, .. })) => needed,
         Err(e) => return Err(e.into()),
         Ok(config) => return Ok(config),
     };
-    Ok(LogConfig::derive(&facts(needed))?)
+    let segment = least_file.checked_div(4).ok_or(overflow("a segment"))?;
+    let block = u64::try_from(align.get()).map_err(|_| overflow("the block"))?;
+    let frame = hyper_log::format::FRAME_HEADER_BYTES;
+    let on_disk = entries
+        .checked_mul(hyper_log::format::ENTRY_HEADER_BYTES)
+        .and_then(|headers| headers.checked_add(payload))
+        .ok_or(overflow("a Ready on disk"))?;
+    let room = segment
+        .checked_sub(block)
+        .and_then(|room| room.checked_sub(frame))
+        .filter(|room| *room > 0)
+        .ok_or(overflow("a frame's room"))?;
+    // A Ready goes in parts, each filled until its next entry would pass a frame's room, so any
+    // two in a row hold more than one room; and a part takes a frame of its own, which never
+    // spans segments.
+    let parts = on_disk
+        .div_ceil(room)
+        .checked_mul(2)
+        .and_then(|parts| parts.checked_add(1))
+        .ok_or(overflow("a Ready's parts"))?;
+    // Each group's retention, two cadences and a Ready uncommitted, every group at once.
+    let retained = parts
+        .checked_mul(3)
+        .and_then(|group| group.checked_mul(u64::try_from(groups).ok()?))
+        .ok_or(overflow("the groups' retention"))?;
+    let disk = retained
+        .checked_mul(segment)
+        .and_then(|bytes| bytes.checked_add(least_file))
+        .ok_or(overflow("the log's file"))?;
+    Ok(LogConfig::derive(&facts(disk))?)
+}
+
+/// What hyper-log keeps for each entry a group retains: its term, its place, its length and its
+/// cached bytes' handle (`state::Slot`, 56 bytes on a 64-bit target).
+const LOG_SLOT_BYTES: u64 = 56;
+
+/// The segments' worth of buffers hyper-log keeps beside its groups: its device pool's two free,
+/// its three frames in flight (`PIPELINE_FRAMES`) and the one it keeps, its queue's three
+/// (`3·(frame room + PERSIST_GROUP_LEN)`), and recovery's window of one.
+const LOG_SEGMENTS_HELD: u64 = 10;
+
+/// The most bytes the node's log of `config` holds: for each group, its slots as a deque doubled
+/// past its retained entries holds them, its handle's unapplied entries up to its retained bytes,
+/// and the log's cache of it; one group's slots again while its deque grows, old beside new; and
+/// the log's own buffers. Pinned by `tests/log_memory.rs`, every group filled to its retention.
+pub fn log_bytes(config: &LogConfig) -> Option<u64> {
+    let groups = u64::try_from(config.max_groups).ok()?;
+    let slots = config.group_entries.checked_mul(LOG_SLOT_BYTES)?;
+    let group = slots
+        .checked_mul(2)?
+        .checked_add(config.group_bytes)?
+        .checked_add(config.group_cache)?;
+    group
+        .checked_mul(groups)?
+        .checked_add(slots)?
+        .checked_add(config.segment_bytes.checked_mul(LOG_SEGMENTS_HELD)?)
 }
 
 /// The threads a node starts beside its shard's, which runs on the process's own: its standard
@@ -703,20 +759,25 @@ mod tests {
         assert!(alone > 2 * (5 * block + sealed) + mantle_ec::TABLE_BYTES);
     }
 
-    /// The log derived takes a frame of the range's largest entry with its shell's bytes, and a
-    /// group holds a `Ready` of the settings in bytes and in entries of the fewest bytes, as the
-    /// range checks; its file is the least, its persist area and three segments.
+    /// The log derived takes a frame of the range's largest entry with its shell's bytes; a group
+    /// retains two cadences and a `Ready` of the settings, in its entries of the least entry a range
+    /// proposes and its bytes with their shells, as the range checks; and its file holds every
+    /// group's retention at once on disk, beside the least three segments the log runs in.
     #[test]
-    fn the_log_takes_the_largest_entry_and_a_ready_in_the_least_file() {
+    fn the_log_takes_the_largest_entry_and_holds_every_groups_retention() {
         let (settings, _) = cell(3).unwrap();
         let align = Alignment::new(4096).unwrap();
         let config = log(align, &settings, 5).unwrap();
         assert_eq!(config.max_groups, 6);
-        assert_eq!(config.max_segments, 3);
-        let ready = settings.max_entry_bytes * 2;
-        let overhead = u64::try_from(hyper_durable::ENTRY_OVERHEAD).unwrap();
-        assert!(config.group_bytes >= ready);
-        assert!(config.group_entries >= ready / overhead);
+        let (entries, bytes) = mantle_range::ready_held(&settings).unwrap();
+        let least = u64::try_from(wire::least_entry_bytes().unwrap()).unwrap();
+        assert_eq!(entries, settings.max_entry_bytes * 2 / least + 1);
+        assert_eq!(config.group_entries, 3 * entries);
+        assert_eq!(config.group_bytes, 3 * bytes);
+        let retained = 6 * config.group_bytes
+            + 6 * config.group_entries * hyper_log::format::ENTRY_HEADER_BYTES;
+        assert!(u64::from(config.max_segments) * config.segment_bytes >= retained);
+        assert!(config.max_segments >= 3);
         let file = SimFile::new(align, Alignment::new(512).unwrap(), 1).unwrap();
         let log = Log::create(file, config, 1).unwrap();
         let entry = usize::try_from(settings.max_entry_bytes).unwrap();

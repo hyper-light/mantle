@@ -142,6 +142,10 @@ const NO_EXPIRY: u64 = 253_402_300_799;
 const WRITES: u64 = 200;
 /// The entries a log group retains (the configuration's `log.group_entries`).
 const GROUP_ENTRIES: u64 = 1024;
+/// The bytes a log group retains (the configuration's `log.group_bytes`): the least that holds one
+/// ready of the stated range settings (`mantle_range::ready_held`), so the writes pass it: 3,072
+/// bytes in up to 237 entries of the least a range proposes, each with its 5-byte shell.
+const GROUP_BYTES: u64 = 3_072 + 237 * 5;
 /// The engine's page (the configuration's `engine.page_size`), the engine's own small test
 /// configuration's (crates/engine/tests/pool_startup.rs).
 const STORE_PAGE: usize = 4096;
@@ -167,7 +171,6 @@ rules.max_answer_bytes = 18446744073709551615
 rules.expiries_per_entry = 8
 log.segment_bytes = 65536
 log.max_segments = 64
-log.group_bytes = 4096
 log.group_cache = 4096
 log.queue_submissions = 16
 log.waits = measured
@@ -517,7 +520,7 @@ impl Pki {
         let mut text = format!(
             "id = {id}\ndir = {}\nquic = 127.0.0.1:0\nplane = 127.0.0.1:0\nauthority = {}\n\
              certificate = {}\nkey = {}\nvoters = {}\n\
-             transport_bytes = {}\nlog.group_entries = {GROUP_ENTRIES}\n\
+             transport_bytes = {}\nlog.group_entries = {GROUP_ENTRIES}\nlog.group_bytes = {GROUP_BYTES}\n\
              engine.page_size = {STORE_PAGE}\nengine.memtable_bytes = {MEMTABLE}\n\
              rules.max_key_bytes = {held}\nrules.max_value_bytes = {held}\n{STATED}",
             dir.display(),
@@ -1750,6 +1753,23 @@ fn chunk_bytes(n: u64, len: usize) -> Vec<u8> {
                 .to_le_bytes()[0]
         })
         .collect()
+}
+
+/// The stated log group's bytes are the least that holds one ready of the stated range settings.
+#[test]
+fn the_stated_log_group_holds_one_ready_of_the_stated_range() {
+    let settings = mantle_range::Settings {
+        election_tick: 10,
+        heartbeat_tick: 2,
+        max_size_per_msg: 1024,
+        max_inflight_msgs: 2,
+        max_uncommitted_size: 2048,
+        max_committed_size_per_ready: 1_048_576,
+        max_entry_bytes: 1024,
+    };
+    let (entries, bytes) = mantle_range::ready_held(&settings).unwrap();
+    assert_eq!(bytes, GROUP_BYTES);
+    assert!(entries <= GROUP_ENTRIES);
 }
 
 #[test]

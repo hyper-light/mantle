@@ -29,6 +29,6 @@ pub use hyper_raft::proto::{
 };
 pub use machine::{Applied, RangeMachine};
 pub use replica::{
-    Output, Range, Replica, Settings, Shell, claim, open_shell, propose_entry, remove,
+    Output, Range, Replica, Settings, Shell, claim, open_shell, propose_entry, ready_held, remove,
 };
 pub use stored::{Stored, holds_rows};

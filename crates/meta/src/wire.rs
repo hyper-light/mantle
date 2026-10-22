@@ -1484,6 +1484,17 @@ const ETAG_HEX: usize = 32;
 /// Parts of a multipart upload at most: S3's 10,000 (research/05 §4.1).
 const MAX_PARTS: usize = 10_000;
 
+/// Bytes of the least entry a range proposes: its format, its time and its count of commands, and
+/// no command. A range's empty entries are its Raft core's own, a leader's first in its term.
+pub fn least_entry_bytes() -> Result<usize, RecordError> {
+    Ok(Entry {
+        at_ns: 0,
+        commands: Vec::new(),
+    }
+    .encode()?
+    .len())
+}
+
 /// Bytes of the largest entry a Name, File or Block range must take: one command, the largest
 /// a gateway sends, in the session wrapping it carries. A range whose `max_entry_bytes` or log
 /// frame is smaller refuses a request S3 allows (audit §16.5). The largest is a

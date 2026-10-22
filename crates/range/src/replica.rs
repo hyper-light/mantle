@@ -81,8 +81,8 @@ const QUIET: Duration = Duration::MAX;
 /// largest must fit one frame, so a write of any size can be made in parts. And a group compacted
 /// to its applied state retains at most one write's entries: a leader's uncommitted proposals, or
 /// the appends a follower has in flight, and one entry past either bound, which the core admits
-/// alone. The group's bounds must hold so much, in bytes and in entries of the fewest bytes, or a
-/// write refused for room could wait for good.
+/// alone. The group's bounds must hold so much (`ready_held`), or a write refused for room could
+/// wait for good.
 fn check_settings<F: BlockFile + 'static>(
     settings: &Settings,
     log: &Log<F>,
@@ -95,12 +95,9 @@ fn check_settings<F: BlockFile + 'static>(
             "an entry of the range's largest does not fit one frame of this log",
         ));
     }
-    let ready = one_ready(settings);
     let config = log.config();
-    let fits = ready.is_some_and(|b| {
-        b <= config.group_bytes
-            && b.checked_div(overhead)
-                .is_some_and(|entries| entries <= config.group_entries)
+    let fits = ready_held(settings).is_some_and(|(entries, bytes)| {
+        bytes <= config.group_bytes && entries <= config.group_entries
     });
     if !fits {
         return Err(ReplicaError::Config(
@@ -108,6 +105,18 @@ fn check_settings<F: BlockFile + 'static>(
         ));
     }
     Ok(())
+}
+
+/// What one ready of the range's settings holds in its member's log: its entries, as many as its
+/// bytes make of the least entry a range proposes (`mantle_meta::wire::least_entry_bytes`) and its
+/// term's empty first one, the core's own; and their bytes, each with its durable shell's.
+pub fn ready_held(settings: &Settings) -> Option<(u64, u64)> {
+    let ready = one_ready(settings)?;
+    let least = u64::try_from(mantle_meta::wire::least_entry_bytes().ok()?).ok()?;
+    let entries = ready.checked_div(least)?.checked_add(1)?;
+    let shell = u64::try_from(hyper_durable::ENTRY_OVERHEAD).ok()?;
+    let bytes = entries.checked_mul(shell)?.checked_add(ready)?;
+    Some((entries, bytes))
 }
 
 /// The bytes one ready of the range's settings holds: a leader's uncommitted proposals or the

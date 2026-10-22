@@ -117,7 +117,8 @@ pub enum Inconsistent {
 pub const FRAGMENT_BYTES: u64 = 346;
 
 /// What the index of one fragment asks beyond [`FRAGMENT_BYTES`]: its table's first buckets and
-/// its place set's first node (492 bytes measured for one).
+/// its place set's first node (492 bytes measured for one on x86_64, whose table keeps its control
+/// bytes in SSE2's groups of 16; 484 on aarch64, in groups of 8).
 pub const INDEX_BYTES: u64 = 146;
 
 /// The most bytes an index of `fragments` fragments, one a chunk, asks of its allocator.

@@ -66,9 +66,12 @@ fn the_index_asks_at_most_its_stated_bytes_at_every_count() {
         tight |= peak > (index::FRAGMENT_BYTES - 1) * n + index::INDEX_BYTES;
     }
     alloc::end();
-    // Neither bound gives a byte to spare: one fragment asks exactly the two together, and a
-    // fragment past a growth asks more than one byte a fragment less allows.
-    assert_eq!(first, index::most_bytes(1).unwrap());
+    // Neither bound gives a byte to spare: one fragment asks exactly the two together where the
+    // table's control bytes come in SSE2's groups of 16, x86_64's, and 8 fewer in the groups of 8
+    // elsewhere (NEON's, or a machine word's); and a fragment past a growth asks more than one
+    // byte a fragment less allows.
+    let groups = if cfg!(target_arch = "x86_64") { 0 } else { 8 };
+    assert_eq!(first + groups, index::most_bytes(1).unwrap());
     assert!(tight);
     // And a budget of the bound holds as many fragments as it was stated for.
     assert_eq!(

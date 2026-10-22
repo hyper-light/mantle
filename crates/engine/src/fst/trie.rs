@@ -257,6 +257,33 @@ impl Level {
     }
 }
 
+/// The most bytes a trie builder holds of its own having taken keys whose longest is `longest`
+/// bytes, `labels` labels in all and `values` values of `width` bits. Each level a key reaches
+/// keeps its record, at most twice over for its list's doubling, and its buffers' first
+/// allocations: eight label bytes and four words in each of its three bit vectors and its
+/// values (std's least capacities). Past those, a label is its byte and three bits (its child
+/// and node bits and its node's prefix bit), and a value its bits, each at most twice over for
+/// its buffer's doubling. A builder given whole keys ([`TrieBuilder::add`]) keeps the last,
+/// grown to at most twice the longest. Pinned by `tests/trie_memory.rs` at the densest keys,
+/// the longest and the most labels keys of a length can make.
+pub fn builder_bytes(longest: usize, labels: u64, values: u64, width: u32) -> Option<u64> {
+    let first = u64::try_from(size_of::<u64>())
+        .ok()?
+        .checked_mul(16)?
+        .checked_add(8)?;
+    let level = u64::try_from(size_of::<Level>())
+        .ok()?
+        .checked_mul(2)?
+        .checked_add(first)?;
+    let longest = u64::try_from(longest).ok()?;
+    longest
+        .checked_add(1)?
+        .checked_mul(level)?
+        .checked_add(labels.checked_mul(11)?.div_ceil(4))?
+        .checked_add(values.checked_mul(u64::from(width))?.div_ceil(4))?
+        .checked_add(longest.checked_mul(2)?)
+}
+
 /// Builds a trie of keys given in strictly ascending order, each with a value of at most a
 /// width of bits, one pass and no key held but the last. Its levels keep their buffers when it
 /// is reset, so a builder used again for a trie no larger allocates nothing as keys are added.

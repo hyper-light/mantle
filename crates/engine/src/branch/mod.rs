@@ -207,15 +207,76 @@ pub(crate) struct Page {
     total: u64,
 }
 
+/// The bytes a page being filled holds for pages of `capacity` payload bytes, its two buffers
+/// as [`Page::with_capacity`] reserves them, which filling never grows: its staged bytes, at most
+/// the payload, and a word an entry for each entry the payload has room for.
+pub fn page_bytes(capacity: usize) -> Option<usize> {
+    let entries = capacity.checked_div(SLOT.checked_add(2)?)?;
+    capacity.checked_add(entries.checked_mul(std::mem::size_of::<u64>())?)
+}
+
+/// The most bytes a branch builder holds while it builds a branch of at most `entries` entries
+/// whose keys are at most `key` bytes, at pages of `capacity` payload bytes and extents of
+/// `extent` bytes, its range filter keeping `range_bits` bits a key. Its levels number at most
+/// the height of a tree of `entries` leaves, each index page holding two entries at least
+/// ([`fits`]), and one more a write may open above; each level is a page being filled
+/// ([`page_bytes`]), its record in the level lists twice over for their doubling, and its first
+/// key's buffer. It keeps the last key added; each key buffer grows to at most twice the longest.
+/// It holds a page's payload to encode into and an extent's run to write with, its filter for
+/// `entries` keys ([`filter::most_bytes`]), and each page's entry count and each extent's number
+/// (at most one a page, a page holding an entry at least: so at most twice as many pages as
+/// entries, the index pages above them counted), in lists grown at most twice over and copied
+/// once exactly into the branch. Its two tries, the range filter of its keys and its leaves'
+/// index, hold a level a key byte and a label a key byte at most ([`trie::builder_bytes`]); the
+/// seal finishes each and encodes it beside its builder, each again at most its builder's bytes.
+/// Pinned by `tests/builder_memory.rs` at the densest keys and the longest.
+pub fn builder_bytes(
+    capacity: usize,
+    extent: usize,
+    key: usize,
+    entries: u64,
+    range_bits: u32,
+) -> Option<u64> {
+    let bytes = |n: usize| u64::try_from(n).ok();
+    let key_buffer = bytes(key)?.checked_mul(2)?;
+    let levels = u64::from(entries.max(2).ilog2()).checked_add(3)?;
+    let level = bytes(page_bytes(capacity)?)?
+        .checked_add(bytes(std::mem::size_of::<Page>())?.checked_mul(2)?)?
+        .checked_add(key_buffer)?;
+    // Each page's count (two bytes) and extent number (eight), twice over, and once exactly.
+    let pages = entries.checked_mul(2)?;
+    let lists = pages.checked_mul(30)?;
+    let labels = entries.checked_mul(bytes(key)?)?;
+    let tries = crate::fst::trie::builder_bytes(key, labels, entries, range_bits)?
+        .checked_add(crate::fst::trie::builder_bytes(
+            key,
+            labels,
+            entries,
+            u32::BITS,
+        )?)?
+        .checked_mul(3)?;
+    levels
+        .checked_mul(level)?
+        .checked_add(key_buffer)?
+        .checked_add(bytes(capacity)?)?
+        .checked_add(bytes(extent)?)?
+        .checked_add(bytes(filter::most_bytes(filter::Keys::AtMost(entries))?)?)?
+        .checked_add(lists)?
+        .checked_add(tries)
+}
+
 impl Page {
     /// A page with room reserved for the most a page of `capacity` payload bytes can hold, so
-    /// filling it never grows a buffer: its first key, at most half the payload, and each later
-    /// key's bytes past the page's prefix and its rest, within the payload, so within twice it;
-    /// and an entry's ends for each offset and suffix length the payload has room for.
+    /// filling it never grows a buffer. Its staged bytes are within the payload: the first key
+    /// is the page's prefix, which the payload holds once, and its suffix; each later key's own
+    /// bytes are at most its suffix, since it shares with the first at least the prefix the page
+    /// ends with; and the rests are the payload's own. Each entry takes at least its offset, head
+    /// and suffix length of the payload ([`Page::size_with`]), so its ends' words are within the
+    /// payload's room too.
     fn with_capacity(capacity: usize) -> Self {
         let entries = capacity.checked_div(SLOT.saturating_add(2)).unwrap_or(0);
         Self {
-            bytes: Vec::with_capacity(capacity.saturating_mul(2)),
+            bytes: Vec::with_capacity(capacity),
             ends: Vec::with_capacity(entries),
             first_end: 0,
             key_bytes: 0,
@@ -1696,6 +1757,21 @@ impl Branch {
     }
 }
 
+/// The most bytes a cursor holds, all from its store's pools, at pages of `page_size` bytes in
+/// extents of `extent_pages`, with the device's issuer taking `batches` reads at once (one with
+/// no issuer): its span's extent buffer and its list of reads in flight, a read a batch; a page
+/// the span may hold prepared; and its three page buffers, its leaf, its key and a value copy,
+/// which an entry fitting a page never grows ([`RunCursor::new`]). Pinned by
+/// `tests/cursor_memory.rs`.
+pub fn cursor_bytes(page_size: usize, extent_pages: u32, batches: usize) -> Option<u64> {
+    let bytes = |n: usize| u64::try_from(n).ok();
+    let page = bytes(page_size)?;
+    let read = bytes(std::mem::size_of::<(u64, u64, u32, bool)>())?;
+    page.checked_mul(u64::from(extent_pages))?
+        .checked_add(read.checked_mul(bytes(batches.max(1))?)?)?
+        .checked_add(page.checked_mul(4)?)
+}
+
 /// One bounded move while positioning a private compaction cursor.
 pub(crate) enum Initial {
     Waiting,
@@ -2171,5 +2247,75 @@ impl RunCursor {
             return Err(corrupt(Malformed::Truncated));
         }
         Ok((op, from..rest.end))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `i`th of keys of `len` bytes in order: `common` bytes all share, then `i` big-endian,
+    /// then filler.
+    fn key(len: usize, common: usize, i: u64) -> Vec<u8> {
+        let mut k = vec![b'p'; common.min(len)];
+        let count = i.to_be_bytes();
+        let mut at = 0usize;
+        while k.len() < len {
+            k.push(count.get(at).copied().unwrap_or(b'z'));
+            at += 1;
+        }
+        k
+    }
+
+    /// A page filled to its payload, at the densest keys and the longest, those sharing long
+    /// prefixes and those sharing none, as a leaf and as an index page, stages no more bytes than
+    /// its payload and never grows the buffers it was made with, which [`page_bytes`] states.
+    #[test]
+    fn a_staged_page_holds_no_more_than_its_payload() {
+        for (len, common, value, index) in [
+            (8usize, 0usize, 0usize, false),
+            (16, 6, 100, false),
+            (2_132, 2_124, 0, false),
+            (2_132, 0, 0, false),
+            (2_132, 2_124, 18_699, false),
+            (8, 0, 0, true),
+            (2_132, 2_124, 0, true),
+        ] {
+            let capacity = crate::store::page::capacity(least_page(4096, len, value).unwrap());
+            let mut page = Page::with_capacity(capacity);
+            let reserved = (page.bytes.capacity(), page.ends.capacity());
+            let value = vec![b'v'; value];
+            let head: Vec<u8> = if index { vec![0; 16] } else { vec![1, 0, 0] };
+            let tail: &[u8] = if index { &[] } else { &value };
+            let mut prev: Option<Vec<u8>> = None;
+            let mut staged = 0usize;
+            for i in 0u64.. {
+                let k = key(len, common, i);
+                let prefix = match &prev {
+                    None => k.len(),
+                    Some(p) => page.prefix.min(shared(p, &k)),
+                };
+                let size = page
+                    .size_with(prefix, k.len(), head.len() + tail.len())
+                    .unwrap();
+                if size > capacity {
+                    break;
+                }
+                page.push(&k, &head, tail, 1, prefix).unwrap();
+                assert!(
+                    page.bytes.len() <= capacity,
+                    "{len}-byte keys sharing {common}: {} staged past {capacity}",
+                    page.bytes.len()
+                );
+                assert_eq!((page.bytes.capacity(), page.ends.capacity()), reserved);
+                staged += 1;
+                prev = Some(k);
+            }
+            assert!(staged >= 1, "{len}-byte keys: none staged");
+            assert_eq!(
+                page_bytes(capacity),
+                Some(reserved.0 + reserved.1 * std::mem::size_of::<u64>())
+            );
+        }
     }
 }

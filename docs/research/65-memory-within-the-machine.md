@@ -93,3 +93,98 @@ hold no more than it, the kept memtables give memory back, idle maintenance alon
 no rotation, and when memory returns so does the budget. A second test holds the machine's free
 memory at the reserve: the budget falls as with none free (a build that leaves no reserve fails
 it: "the budget rose ... with only the reserve free").
+
+## 3. What the machine's free memory counts, and what the kernel keeps
+
+Linux v6.12 sources (torvalds/linux, tag v6.12), by file and function; the VM runs 6.12.76.
+
+**`MemAvailable` counts dirty pages as free.** proc(5)'s `MemAvailable`: "An estimate of how much
+memory is available for starting new applications, without swapping. Calculated from MemFree,
+SReclaimable, the size of the file LRU lists, and the low watermarks in each zone"
+(Documentation/filesystems/proc.rst). The estimate (mm/show_mem.c, `si_mem_available`) is free
+pages less `totalreserve_pages`, plus the whole file LRU (`NR_ACTIVE_FILE + NR_INACTIVE_FILE`)
+less `min(pagecache / 2, wmark_low)`, plus half the reclaimable slab at most. Every page-cache folio
+is on that LRU (mm/filemap.c `filemap_add_folio` → `folio_add_lru`), dirty and under writeback
+alike, and nothing subtracts `NR_FILE_DIRTY` or `NR_WRITEBACK`; reclaim skips those folios until
+they are written (mm/vmscan.c `shrink_folio_list`: "waiting for disk writes is more expensive than
+potentially causing reloads down the line"). So the reading fell to nothing only once the page
+cache was nearly gone (§1): it estimates what reclaim could take, not a margin. The kernel's own
+domain for dirty memory inside a cgroup counts only clean file pages as room (mm/page-writeback.c
+`mdtc_calc_avail`: "clean = filepages - min(filepages, mdtc->dirty)"), the rule the follow's
+reading takes on Linux: `MemAvailable` less `Dirty` and `Writeback`.
+
+**The kernel keeps little for itself.** `min_free_kbytes = sqrt(lowmem_kbytes * 16)`, clamped to
+128 KiB-256 MiB (mm/page_alloc.c `calculate_min_free_kbytes`), the watermarks' gaps
+`max(min / 4, watermark_scale_factor / 10000 of the zone)` with a default factor of 10, 0.1 %
+(`__setup_per_zone_wmarks`), and `totalreserve_pages` the high watermarks and each zone's
+largest lowmem reserve (`calculate_totalreserve_pages`): under 1 % of memory. Raising it is no way
+to keep a share: "Setting this too high will OOM your machine instantly"
+(Documentation/admin-guide/sysctl/vm.rst, `min_free_kbytes`).
+
+**The engine's own memory lowers the kernel's dirty limits.** Dirtyable memory is free pages less
+the reserve plus the file LRU (`global_dirtyable_memory`); anonymous memory is not in it, and the
+background and foreground thresholds are 10 % and 20 % of it (`dirty_background_ratio`,
+`vm_dirty_ratio`; `domain_dirty_limits`), so the more the engine holds the sooner its own buffered
+writes are written back and, past the midpoint of the two, throttled (`balance_dirty_pages`).
+
+**The OOM killer.** With swap full, only file pages count as reclaimable
+(mm/vmscan.c `zone_reclaimable_pages`, `can_reclaim_anon_pages`); the allocator gives up after
+`MAX_RECLAIM_RETRIES` (16) rounds in a row without progress, or when no zone could reach its
+watermark even with every reclaimable page freed (mm/page_alloc.c `should_reclaim_retry`), and the
+victim is the task with the most rss, swap and page tables (mm/oom_kill.c `oom_badness`).
+
+**What engines on the page cache leave to it.** RocksDB, whose reads and compactions go through the
+page cache: the block cache "should be about 1/3 of your total memory budget. The remaining free
+memory can be left for the OS (Operating System) page cache" (RocksDB wiki, "Setup Options and
+Basic Tuning"); its memtables, index and filter blocks lie outside the block cache unless charged
+to it ("Memory usage in RocksDB", "Write Buffer Manager"). PostgreSQL: shared_buffers "25% of the
+memory in your system", rarely past 40 %, "because PostgreSQL also relies on the operating system
+cache" (PostgreSQL 18 §19.4.1). InnoDB's 75-80 % (MySQL 8.4 §17.8.12, `innodb_buffer_pool_size`)
+comes with `O_DIRECT` as the Unix default (`innodb_flush_method`), its data files not also in the
+page cache, so it does not carry over. Db2's self-tuning memory manager, the nearest precedent for
+a budget that follows free memory, keeps 5.5-7.8 % of memory free, 5 % of it an extra buffer
+(`DB2_MEM_TUNING_RANGE`'s minfree), re-examined each tuning interval of 30 s to 10 min, a heap
+growing at most 50 % and shrinking at most 20 % an interval (Storm et al., "Adaptive
+Self-Tuning Memory in DB2", VLDB 2006, §3, §3.3.1, §3.5). Meta sizes a workload's memory by its
+pressure: Senpai reclaims `current_mem × 0.0005 × max(0, 1 − PSI_some / 0.1%)` every six seconds,
+at most 1 % a period, and growth back is immediate (Weiner et al., "TMO: Transparent Memory
+Offloading in Datacenters", ASPLOS 2022, §3.3).
+
+No peer-reviewed work sizes an LSM or Bε store's memory against the OS page cache under buffered
+I/O. LSbM (Teng et al., ICDCS 2017) shows compaction reads through the OS cache evicting the data
+queries read; Wong and Wilkes ("My cache or yours?", USENIX ATC 2002) that two inclusive cache
+levels act only as large as the larger; Luo and Carey (PVLDB 14(3), 2020) tune one budget between
+memtables and a buffer cache without the OS page cache. The vendors' shares are set for their own
+two tiers (RocksDB's page cache holds compressed blocks its block cache holds uncompressed); this
+engine keeps the pages its workers write in its own cache, and the share it leaves the kernel is
+measured on the host (§4).
+
+## 4. Followed, and moved to swap
+
+E1 (branch `diag-follow`, never merged: the follow of §2 with no reserve, its reading
+`MemAvailable` less `Dirty` and `Writeback`, the account line of §1) ran machine-sized at 1B on the
+box (Fedora, Linux 7.2.9, 124 GiB, pinned to eight CPUs, other sessions' builds beside it),
+`~/Projects/bench/diag-runs/e1-20261022T220849`, sampled every second (s; stall in s, the rest
+GiB; swap is the box's zram, compressed in memory, `vm.swappiness` 150):
+
+| s | memory stall ("some") | reading | free | page cache | anonymous | swap used | file refaults |
+|---|---|---|---|---|---|---|---|
+| 0 | 0.00 | 87.8 | 12.7 | 74.9 | 18.8 | 0.0 | 0 |
+| 60 | 0.15 | 81.2 | 15.4 | 65.5 | 28.2 | 0.0 | 144,625 |
+| 100 | 1.35 | 62.2 | 35.4 | 28.1 | 44.8 | 8.0 | 1,477,345 |
+| 140 | 2.62 | 45.3 | 18.1 | 27.2 | 62.1 | 16.3 | 2,957,474 |
+| 180 | 4.01 | 40.6 | 0.6 | 39.7 | 65.1 | 29.8 | 4,180,491 |
+| 241 | 7.57 | 31.2 | 0.6 | 30.3 | 71.8 | 52.6 | 5,652,252 |
+
+The budget rose with the reading, from 89.6 GiB to the machine's whole 124.8 GiB by 207 s, as the
+shard's regions grew (page cache 46.6 GiB and kept memtables 62.6 GiB in its account at the last
+rotation) and the kernel moved anonymous memory to swap: the process's own `VmSwap` was 41.5 GiB
+beside 59 GiB resident when it was stopped at 4:06, at 2.5 minutes of fill. Every page the kernel
+moved out of the engine reads as available, so the reading never fell: the budget grew by what the
+kernel took from it. The memory stall grew to 3 % of the time and file pages were read back after
+eviction 5.8 million times (22 GiB). The run was stopped rather than let the box's other sessions
+be pushed into swap with it.
+
+So a budget that follows the reading must count the process's own pages in swap as taken from it
+(`port::memory::room_now`: the estimate less dirty and writeback pages and less `VmSwap`), and the
+reserve it leaves is measured where the engine runs alone, the VM lane: E1b.

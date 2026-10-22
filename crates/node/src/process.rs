@@ -574,6 +574,9 @@ fn volumes(lines: &Lines) -> Result<Vec<VolumeSettings>, ProcessError> {
 
 /// Runs the node the file at `config` states until standard input closes.
 pub fn run(config: &Path) -> Result<(), ProcessError> {
+    // Before any thread allocates: a freed large block's memory goes back to the OS, which a range's
+    // budget following the machine reads as room (docs/research/65 §6).
+    mantle_engine::port::mmap::return_freed_blocks();
     let mut config = ProcessConfig::read(config)?;
     // The volumes open before the node's runtime starts: an issuer's start and a volume's
     // recovery wait on their device, which no shard may (node.md §1.3).

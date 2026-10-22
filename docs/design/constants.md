@@ -271,6 +271,8 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/engine/src/memtable/inlineskiplist.rs` `NIL` | format | u64::MAX: no node, the end of a level. |
 | `crates/engine/src/memtable/inlineskiplist.rs` `WORD` | derived | 8: the arena's storage word. |
 | `crates/engine/src/port/mmap.rs` `WORD` | derived | The size of `AtomicU64`, the unit a mapping is counted in. |
+| `crates/engine/src/port/mmap.rs` `INITIAL_MMAP_THRESHOLD` | external | glibc's initial mmap threshold, `DEFAULT_MMAP_THRESHOLD_MIN`, 128 KiB (mallopt(3), `M_MMAP_THRESHOLD`); set to keep it, which turns its upward adjustment off. |
+| `crates/engine/src/port/mmap.rs` `M_MMAP_THRESHOLD` | external | glibc's parameter number for the mmap threshold in `mallopt` (malloc.h). |
 | `crates/engine/src/version.rs` `PLACE` | format | 1000: the decimal places each of the minor and patch numbers takes in `ROCKSDB_VERSION_INT` [R include/rocksdb/version.h:24-25]. |
 | `crates/engine/src/version.rs` `ROCKSDB_MAJOR` | format | 11 [R include/rocksdb/version.h:14]: the release the port converts. |
 | `crates/engine/src/version.rs` `ROCKSDB_MINOR` | format | 8 [R include/rocksdb/version.h:15]. |

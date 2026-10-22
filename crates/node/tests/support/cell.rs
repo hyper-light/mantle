@@ -598,6 +598,7 @@ impl Sim {
             // The run's clock from the Unix epoch: only differences of the times the ranges stamp
             // matter to the commands the simulation runs, and a seed replays them.
             wall: Wall::From(0),
+            gateway: None,
         };
         self.starts += 1;
         let shard = member.shard;

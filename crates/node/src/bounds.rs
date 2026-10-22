@@ -13,7 +13,7 @@ use hyper_transport::{
 };
 
 use crate::classes::{Bounds, NodeClasses};
-use crate::{chunk, command};
+use crate::{chunk, command, object};
 
 /// RFC 9002 §6.2.2: before a path has a sample, its smoothed round trip is `kInitialRtt`, 333 ms,
 /// and its variation half that.
@@ -128,6 +128,8 @@ pub fn limits(stated: &Stated) -> Result<Limits, Unfit> {
         chunk::PUT_HEAD_BYTES,
         chunk::GET_HEAD_BYTES,
         chunk::REPLY_HEAD_BYTES,
+        object::HEAD_BYTES,
+        object::REPLY_HEAD_BYTES,
     ]
     .into_iter()
     .max()
@@ -150,8 +152,9 @@ pub fn limits(stated: &Stated) -> Result<Limits, Unfit> {
         lanes_per_peer: 1,
         lane_window,
         // A command's head names its range; a reply's, its status and the leader; a chunk's, its
-        // volume, its key and the CRC-32C or the range asked. A snapshot's exchange carries its
-        // frame in the body and no head.
+        // volume, its key and the CRC-32C or the range asked; an object's, the operation and its
+        // names' lengths, which ride in its body. A snapshot's exchange carries its frame in the
+        // body and no head.
         max_head,
         window_ceiling,
         // An exchange that makes no progress for as long as a connection may stay silent is

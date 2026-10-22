@@ -32,6 +32,14 @@ mantle-disk = { path = "../disk" }
 mantle-engine = { path = "../engine" }
 mantle-meta = { path = "../meta" }
 mantle-range = { path = "../range" }
+# What the gateway host runs (node.md §5): the drivers, the S3 layer's limits and sealing, and the
+# durability model a block's scheme is chosen by.
+mantle-ec = { path = "../ec" }
+mantle-gateway = { path = "../gateway" }
+mantle-s3 = { path = "../s3" }
+bytes.workspace = true
+# A new file's id, 128 bits from the operating system (metadata.md §1).
+getrandom.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

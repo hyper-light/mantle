@@ -21,7 +21,7 @@ use mantle_meta::wire::{Answer, Command, Entry, Sessioned};
 use crate::command;
 use crate::read::{Query, Read};
 
-/// The number a command this node asked is answered under (`crate::node::Node::take_commands`).
+/// The number a command this node asked is answered under (`crate::node::Node::take_command`).
 pub type CommandAsk = u64;
 
 /// What became of a command this node asked.
@@ -37,7 +37,7 @@ pub enum CommandOutcome {
     Refused(command::Status),
 }
 
-/// The number a read this node asked is answered under (`crate::node::Node::take_reads`).
+/// The number a read this node asked is answered under (`crate::node::Node::take_read`).
 pub type ReadAsk = u64;
 
 /// What became of a read this node asked.

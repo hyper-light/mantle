@@ -8,6 +8,7 @@
 //! | `Raft` | replication, on a lane | nodes | a range's Raft message: appends with entries, and control too large for a datagram |
 //! | `Command` | request, an exchange | anyone | a gateway's or client's commands to a range |
 //! | `ChunkPut`, `ChunkGet` | transfer, an exchange | nodes and gateways | a chunk's bytes to the volume that keeps them, a range of them back (`crate::chunk`) |
+//! | `Object` | transfer, an exchange | anyone | a bucket made, an object's bytes put, a range of them got (`crate::object`) |
 //! | `Snapshot` | bulk, an exchange | nodes | a range's snapshot to a member that lags past the log's start |
 //!
 //! The frame bound of each class is the largest message of that kind the node's ranges can make,
@@ -27,6 +28,7 @@ pub enum Kind {
     Read,
     ChunkPut,
     ChunkGet,
+    Object,
 }
 
 /// The classes a node's QUIC connections share credit by, most urgent first (node.md §3.1, §3.3):
@@ -90,13 +92,14 @@ pub fn state_bounds(bounds: Bounds) -> Result<(), BoundsTaken> {
 /// The classes of a node's connections ([`Kind`], [`Class`], [`Role`]).
 pub struct NodeClasses;
 
-const KINDS: [Kind; 6] = [
+const KINDS: [Kind; 7] = [
     Kind::Raft,
     Kind::Command,
     Kind::Snapshot,
     Kind::Read,
     Kind::ChunkPut,
     Kind::ChunkGet,
+    Kind::Object,
 ];
 
 impl Classes for NodeClasses {
@@ -123,6 +126,8 @@ impl Classes for NodeClasses {
             // A chunk is a gateway's to place, a node's gateway's included; a client asks a
             // gateway for objects and never writes a volume (node.md §3.6).
             (Kind::ChunkPut | Kind::ChunkGet, Role::Node | Role::Gateway) => Some(Class::Transfer),
+            // An object's body is a large request's: the transfer level (node.md §3.1).
+            (Kind::Object, _) => Some(Class::Transfer),
             (Kind::Raft | Kind::Snapshot, Role::Gateway | Role::Client)
             | (Kind::ChunkPut | Kind::ChunkGet, Role::Client) => None,
         }
@@ -146,6 +151,7 @@ impl Classes for NodeClasses {
             Kind::Read => 4,
             Kind::ChunkPut => 5,
             Kind::ChunkGet => 6,
+            Kind::Object => 7,
         }
     }
 
@@ -180,7 +186,7 @@ mod tests {
             );
         }
         assert_eq!(NodeClasses::kind_of(0), None);
-        assert_eq!(NodeClasses::kind_of(7), None);
+        assert_eq!(NodeClasses::kind_of(8), None);
     }
 
     #[test]
@@ -190,6 +196,12 @@ mod tests {
                 assert_eq!(NodeClasses::class_of(kind, role), Some(Class::Transfer));
             }
             assert_eq!(NodeClasses::class_of(kind, Role::Client), None);
+        }
+        for role in [Role::Node, Role::Gateway, Role::Client] {
+            assert_eq!(
+                NodeClasses::class_of(Kind::Object, role),
+                Some(Class::Transfer)
+            );
         }
         assert!(NodeClasses::rank(Class::Request) < NodeClasses::rank(Class::Transfer));
         assert!(NodeClasses::rank(Class::Transfer) < NodeClasses::rank(Class::Bulk));

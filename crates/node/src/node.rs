@@ -48,7 +48,7 @@ use hyper_transport::{
 use mantle_chunk::ChunkKey;
 use mantle_meta::apply::Layer;
 use mantle_meta::engine::Engine;
-use mantle_meta::wire::{Answer, Command, Entry};
+use mantle_meta::wire::{Answer, Command, Entry, MAX_BUCKET, MAX_KEY};
 use mantle_range::membership::{Next, Replacement};
 use mantle_range::{Applied, Elections, GroupStore, LogStore, Range, RangeMachine, ReplicaError};
 
@@ -60,8 +60,12 @@ use crate::command;
 use crate::directory::{Peer, Peers};
 use crate::frame;
 use crate::layout::Layout;
+use crate::object;
 use crate::read::{Query, Read};
 use crate::storage::{Done, Origin, Storage};
+
+mod host;
+pub use host::GatewaySettings;
 
 /// A plane message's first byte: a range's Raft frame. A liveness heartbeat starts with its own,
 /// `hyper_liveness::KIND`.
@@ -108,7 +112,7 @@ pub struct NodeSettings<E> {
     /// class's bound is.
     pub chunk_bytes: u64,
     /// The chunk puts and gets this node keeps out to its peers at once; one past them is
-    /// answered `Busy` ([`Node::put_chunk`]).
+    /// refused ([`Node::put_chunk`]).
     pub chunk_asks: usize,
     /// The commands the node asks of ranges itself and holds at once, waiting, out, and answered
     /// and not yet taken; one past them is refused ([`Node::command`]).
@@ -118,6 +122,9 @@ pub struct NodeSettings<E> {
     pub read_asks: usize,
     /// The wall clock the entries the node proposes are stamped with.
     pub wall: Wall,
+    /// The gateway host's settings, for a node that answers object exchanges (node.md §4–§5);
+    /// none for one that refuses them.
+    pub gateway: Option<GatewaySettings>,
 }
 
 /// The wall clock a node stamps each entry it proposes with, nanoseconds since the Unix epoch: the
@@ -143,7 +150,7 @@ impl Wall {
     }
 }
 
-/// The number a chunk put or get this node asked is answered under ([`Node::take_chunks`]).
+/// The number a chunk put or get this node asked is answered under ([`Node::take_chunk`]).
 pub type ChunkAsk = u64;
 
 /// What became of a chunk put or get this node asked.
@@ -655,6 +662,15 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     next_read_ask: ReadAsk,
     reads_done: Vec<(ReadAsk, ReadOutcome)>,
     wall: Wall,
+    /// The gateway host's settings, and the object operations it runs, at most
+    /// `GatewaySettings::objects`.
+    gateway: Option<GatewaySettings>,
+    jobs: Vec<host::Job>,
+    /// What jobs that ended asked and was not yet answered: its outcomes are dropped as they come.
+    /// At most the node's asks.
+    abandoned: Vec<host::Pending>,
+    /// The volume table as this node's member of the root range last held it (`host::Table`).
+    table: Option<host::Table>,
 }
 
 /// The node's message bounds: a Raft message is at most the larger of a page of entries and one
@@ -682,13 +698,24 @@ pub fn message_bounds<E>(ranges: &[Hosted<E>], chunk_bytes: u64) -> Result<Bound
     let request = entry
         .checked_add(u64::try_from(command::HEAD_BYTES).map_err(|_| unfit())?)
         .ok_or_else(unfit)?;
-    // A chunk's put carries the chunk behind its head; a get's reply, the bytes asked.
+    // A chunk's put carries the chunk behind its head; a get's reply, the bytes asked. An object's
+    // put carries its body, at most a single upload's (S3's 5 GiB), and a get's reply a range of
+    // at most as many bytes.
     let chunk_head = chunk::PUT_HEAD_BYTES
         .max(chunk::GET_HEAD_BYTES)
         .max(chunk::REPLY_HEAD_BYTES);
-    let transfer = chunk_bytes
+    let chunked = chunk_bytes
         .checked_add(u64::try_from(chunk_head).map_err(|_| unfit())?)
         .ok_or_else(unfit)?;
+    // An object's body opens with its names, a reply's with its tags.
+    let object_head = object::HEAD_BYTES
+        .saturating_add(MAX_BUCKET)
+        .saturating_add(MAX_KEY)
+        .max(object::REPLY_HEAD_BYTES.saturating_add(object::MAX_TAG.saturating_mul(2)));
+    let object = mantle_s3::body::MAX_UPLOAD
+        .checked_add(u64::try_from(object_head).map_err(|_| unfit())?)
+        .ok_or_else(unfit)?;
+    let transfer = chunked.max(object);
     Ok(Bounds {
         replication: largest,
         request,
@@ -860,6 +887,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             next_read_ask: 0,
             reads_done: Vec::new(),
             wall: settings.wall,
+            gateway: settings.gateway.take(),
+            jobs: Vec::new(),
+            abandoned: Vec::new(),
+            table: None,
         };
         for kept in &node.ranges {
             node.owner
@@ -1172,6 +1203,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         self.schedule_due(now);
         self.drive(now)?;
+        self.step_host()?;
         self.step_asks(now)?;
         self.step_reads(now)?;
         self.step_replacements();
@@ -1224,6 +1256,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             self.remotes.iter().filter_map(|r| r.redial_at).min(),
             self.asks_due(now),
             self.reads_due(now),
+            self.host_due(),
         ]
         .into_iter()
         .flatten()
@@ -1437,6 +1470,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 body,
                 ..
             } => {
+                if kind == Kind::Object {
+                    self.take_object(exchange, peer, body);
+                    return Ok(());
+                }
                 let what = match kind {
                     Kind::Snapshot => Arriving::Snapshot,
                     Kind::Command => self.take_request(exchange, Arriving::Command),
@@ -1453,8 +1490,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                             return Ok(());
                         }
                     },
-                    // A Raft message travels on a lane, never on an exchange.
-                    Kind::Raft => {
+                    // A Raft message travels on a lane, never on an exchange; an object's is the
+                    // host's, taken above.
+                    Kind::Raft | Kind::Object => {
                         self.driver
                             .endpoint()
                             .refuse_exchange(exchange, Refusal::Kind);
@@ -1473,6 +1511,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 });
                 self.read_exchange(exchange)
             }
+            // A job's body is read, and its bytes written, at the host's turn.
+            Event::BodyReady { exchange } if self.job_on(exchange).is_some() => Ok(()),
             Event::BodyReady { exchange } => self.read_exchange(exchange),
             Event::Reply { exchange, body } => {
                 if self.chunks_out.iter().any(|c| c.exchange == exchange) {
@@ -1504,8 +1544,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.reading
                     .retain(|r| r.origin != ReadOrigin::Exchange(exchange));
                 self.ask_lost(exchange);
+                self.job_lost(exchange);
                 Ok(())
             }
+            Event::Writable { exchange } if self.job_on(exchange).is_some() => Ok(()),
             Event::Writable { exchange } => {
                 self.write_exchange(exchange);
                 Ok(())
@@ -2341,7 +2383,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// The puts and gets the storage answered since the last turn: a peer's answered on its
-    /// exchange, this node's own kept for [`Self::take_chunks`]. Registers this task to be woken
+    /// exchange, this node's own kept for [`Self::take_chunk`]. Registers this task to be woken
     /// when a get still out is answered.
     async fn take_stored(&mut self) -> Result<(), NodeError> {
         if self.storage.out() == 0 {
@@ -2425,8 +2467,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// Puts `bytes`, `key`'s whole chunk with the CRC-32C its writer computed, on `volume`, which
     /// `at` holds: this node's own volume in-process (node.md §5.5), or a peer's on the transfer
-    /// class. Its outcome comes from [`Self::take_chunks`] under the number returned, at once when
-    /// it is refused before it goes (no such volume here, the node's asks all out).
+    /// class. Its outcome comes from [`Self::take_chunk`] under the number returned, at once when
+    /// it is refused before it goes (no such volume here). Refused when the node keeps as many
+    /// chunk asks out to its peers as it keeps: the node's own bound, not the volume's refusal.
     pub fn put_chunk(
         &mut self,
         at: PeerId,
@@ -2435,6 +2478,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         bytes: Vec<u8>,
         crc32c: u32,
     ) -> Result<ChunkAsk, NodeError> {
+        if at != self.id && self.chunks_out.len() >= self.chunk_asks {
+            return Err(NodeError::Asks);
+        }
         let asked = self.next_chunk;
         self.next_chunk = asked.wrapping_add(1);
         if at == self.id {
@@ -2456,11 +2502,6 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if let Some(outcome) = outcome {
                 self.chunks_done.push((asked, outcome));
             }
-            return Ok(asked);
-        }
-        if self.chunks_out.len() >= self.chunk_asks {
-            self.chunks_done
-                .push((asked, ChunkOutcome::Refused(chunk::Status::Busy)));
             return Ok(asked);
         }
         let head = chunk::Put {
@@ -2507,6 +2548,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         offset: u64,
         len: u64,
     ) -> Result<ChunkAsk, NodeError> {
+        if at != self.id && self.chunks_out.len() >= self.chunk_asks {
+            return Err(NodeError::Asks);
+        }
         let asked = self.next_chunk;
         self.next_chunk = asked.wrapping_add(1);
         if at == self.id {
@@ -2521,11 +2565,6 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if let Some(outcome) = outcome {
                 self.chunks_done.push((asked, outcome));
             }
-            return Ok(asked);
-        }
-        if self.chunks_out.len() >= self.chunk_asks {
-            self.chunks_done
-                .push((asked, ChunkOutcome::Refused(chunk::Status::Busy)));
             return Ok(asked);
         }
         let head = chunk::Get {
@@ -2553,10 +2592,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(asked)
     }
 
-    /// The chunk puts and gets this node asked that were answered since the last call, each
-    /// under the number it was asked under.
-    pub fn take_chunks(&mut self) -> std::vec::Drain<'_, (ChunkAsk, ChunkOutcome)> {
-        self.chunks_done.drain(..)
+    /// Chunk put or get `ask`'s outcome, once answered, taken. Each asker takes its own asks'
+    /// outcomes and never another's: the gateway host's asks are the node's too.
+    pub fn take_chunk(&mut self, ask: ChunkAsk) -> Option<ChunkOutcome> {
+        take_done(&mut self.chunks_done, ask)
     }
 
     /// The volumes the node holds: each one's id and its device directory.
@@ -2566,7 +2605,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// Asks `command` of `group`'s range as a gateway asks one (node.md §6.6): within this node's
     /// session with the range, of its own member when that leads the range, else of the node that
-    /// does, by `deadline_ns` on the shard's clock. Its outcome comes from [`Self::take_commands`]
+    /// does, by `deadline_ns` on the shard's clock. Its outcome comes from [`Self::take_command`]
     /// under the number returned. Refused when the node holds as many commands of its own as it
     /// keeps, those answered and not yet taken among them.
     pub fn command(
@@ -2610,9 +2649,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(ask)
     }
 
-    /// The commands this node asked itself, answered since the last call, each under its number.
-    pub fn take_commands(&mut self) -> std::vec::Drain<'_, (CommandAsk, CommandOutcome)> {
-        self.commands_done.drain(..)
+    /// Command `ask`'s outcome, once answered, taken, as [`Self::take_chunk`] takes a chunk's.
+    pub fn take_command(&mut self, ask: CommandAsk) -> Option<CommandOutcome> {
+        take_done(&mut self.commands_done, ask)
     }
 
     /// The most commands an entry of this node's own carries, and its most bytes: the least any
@@ -2894,7 +2933,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// Reads `query` of `group`'s range as a gateway reads it (node.md §5.1): of this node's own
     /// member when that leads the range, confirmed by a quorum there, else of the node that leads
-    /// it, by `deadline_ns` on the shard's clock. Its outcome comes from [`Self::take_reads`] under
+    /// it, by `deadline_ns` on the shard's clock. Its outcome comes from [`Self::take_read`] under
     /// the number returned. Refused when the node holds as many reads of its own as it keeps,
     /// those answered and not yet taken among them.
     pub fn read(
@@ -2922,9 +2961,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(ask)
     }
 
-    /// The reads this node asked itself, answered since the last call, each under its number.
-    pub fn take_reads(&mut self) -> std::vec::Drain<'_, (ReadAsk, ReadOutcome)> {
-        self.reads_done.drain(..)
+    /// Read `ask`'s outcome, once answered, taken, as [`Self::take_chunk`] takes a chunk's.
+    pub fn take_read(&mut self, ask: ReadAsk) -> Option<ReadOutcome> {
+        take_done(&mut self.reads_done, ask)
     }
 
     /// The reads this node asks itself, at a turn: those past their deadline answered so, and each
@@ -3270,6 +3309,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             |_, _| {},
         );
     }
+}
+
+/// Takes `ask`'s outcome out of `done`, if it is there.
+fn take_done<T>(done: &mut Vec<(u64, T)>, ask: u64) -> Option<T> {
+    let at = done.iter().position(|(a, _)| *a == ask)?;
+    Some(done.swap_remove(at).1)
 }
 
 /// Whether `command` asks nothing its sender may not: an enlistment names the sender, a node.

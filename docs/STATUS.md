@@ -274,15 +274,24 @@ bodies, client pace, windows and refusing volumes commit an object whole or noth
 fails with renewals removed. `mantle bench gateway` measures both paths on one core and counts
 the round trips each waits through.
 
+A node hosts the drivers ([node design §5.1](design/node.md)): a client asks it over mantle's
+protocol on QUIC to create a bucket, put an object with its bytes on the exchange, or get a range
+of one with the bytes on the reply, and the node runs the bucket's coordinator or the `Put` and
+`Get` drivers, placing from its replica of the volume table, writing chunks to its own volume
+in-process and to its peers' over the transfer class, and asking the ranges' leaders through its
+own sessions. A cell of three `mantle node` processes takes objects from empty to three blocks
+through any node, each block's chunks on distinct nodes, and reads every one back whole and in
+part with each node in turn killed by `SIGKILL`, and through that node once started again; it
+passes with a busy loop on every core.
+
 Remaining before it is done:
 
 - The windows a gateway admits, from its memory and measured latency; the rates of the paths
   measured on an idle machine.
-- The server around it: the drivers' requests carried over mantle's protocol on QUIC (a
-  client in the gateway's role puts and gets chunks on storage nodes and sends commands to
-  ranges, `mantle_node::client`; the host that runs the drivers over it is left), the HTTP/1.1
-  listener for stock S3 clients, routing by descriptors, placement across failure domains, and
-  each request's memory admitted against the gateway's.
+- The server around it: the HTTP/1.1 listener for stock S3 clients; multipart uploads, deletes,
+  listings and conditional requests over mantle's protocol; deadlines and hedging on the node's
+  asks (node design §5.4); routing by descriptors once ranges split; and each request's memory
+  admitted against the gateway's.
 
 The Raft log (`hyper-log`, vendored from hyper-raft with the block layer under it,
 `hyper-block`; [design](design/raft-log.md), vendor/UPSTREAM.md), which every range replica on

@@ -800,6 +800,8 @@ dependencies = [
 name = "mantle-node"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "getrandom 0.4.3",
  "hyper-block",
  "hyper-datagram",
  "hyper-durable",
@@ -817,9 +819,12 @@ dependencies = [
  "mantle-codec",
  "mantle-crc",
  "mantle-disk",
+ "mantle-ec",
  "mantle-engine",
+ "mantle-gateway",
  "mantle-meta",
  "mantle-range",
+ "mantle-s3",
  "tempfile",
  "thiserror",
 ]

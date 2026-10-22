@@ -1381,6 +1381,38 @@ node learns it and sends again; a node whose descriptors no longer cover a key r
 directory from the root range. A range whose leader has moved answers with the leader it knows.
 A stale route costs a round trip and cannot produce a wrong answer (architecture §5).
 
+*As built (2026-10-21).* A node given a root key and the gateway's settings (`root_key`,
+`gateway.*`, `durability.*`) hosts the drivers itself (`crates/node/src/node/host.rs`). A client
+or gateway asks it on an exchange of the transfer class (`crate::object`): create a bucket, put an
+object with its bytes on the exchange, or get a range of one with the bytes on the reply. A
+request's head is a few fixed fields, held for the exchange's life, and its names ride in the body
+ahead of the bytes; a reply's head is its status, size and its tags' lengths, the version id and
+ETag opening its body. Each exchange is a job, at most `gateway.objects` of them, one past answered
+`SlowDown`. A create runs the bucket's coordinator (`mantle_meta::coordinator`): the Bucket range's
+`Create`, the Name range's gate read and opened, the bucket activated. A put reads its bucket's
+row and makes the `Put` driver over it, a data key drawn for the file and wrapped under the root
+key's current generation (encryption.md §2) and the scheme the durability model chooses for the
+cell's domains (`mantle_ec::durability::choose`); a get reads its key's current version and makes
+the `Get` driver. The host serves each driver's requests as the table above routes them: `Place`
+from the node's replica of the volume table (§6.6), read from the root range's rows once for each
+entry that replica applies, the only thing that changes it; a chunk to its volume's node,
+in-process for the node's own; a command or read to its range's leader through the node's own
+sessions (§6.6). A put's body is read only as fast as its driver takes it, a piece at a time, and
+a get's bytes are taken from its driver only as fast as the exchange takes them. The node's asks
+out are bounded (commands, reads, and chunk asks out to its peers): a request that finds them full
+waits in its place and is asked once an answer gives room back. That bound is the node's own, not
+a volume's refusal, which sends the chunk to the next volume offered (§5.2). Each asker takes only
+its own asks' outcomes (`Node::take_command`, `take_read`, `take_chunk`), and the asks of a job that
+ended before they were answered, its exchange lost or its driver failed, are let go, their
+outcomes dropped as they come. The host's asks carry no deadline of their own (§5.4 is to be
+built): a job ends with its exchange. Tested with `mantle node` processes
+(`crates/mantle/tests/node.rs`): a cell of three hosting every layer creates a bucket and takes
+objects of 0 and 1 bytes, either side of a sealed segment's 64 KiB, 3 MiB and 20 MiB (three
+blocks) through each node in turn; every object reads back whole and its middle third through
+another node; each block's chunks are on distinct nodes; and with each node in turn killed by
+`SIGKILL`, every object reads back whole and in part through the other two, and through the node
+once started again. It passes with a busy loop on every core.
+
 ### 5.2 Chunks
 
 A chunk write carries the bytes and their CRC-32C, which the volume checks before it writes

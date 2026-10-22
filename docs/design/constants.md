@@ -504,10 +504,18 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/node/src/node.rs` `LIVENESS_GROUP` | format | The log group of the liveness stream's own writes, the top of the group space: group 0 holds hyper-log's own key records, and a range named either is refused at open. |
 | `crates/node/src/node.rs` `PIECE` | derived | hyper-transport's `RECEIVE_CHUNK`: a snapshot's or a chunk's body is read a receive chunk at a time. |
 | `crates/node/src/node.rs` `PLANE_RAFT` | format | A plane message's first byte for a range's Raft frame, apart from hyper-liveness's `KIND` for a heartbeat. |
+| `crates/node/src/object.rs` `CREATE` | format | An object request's kind: a bucket created. |
+| `crates/node/src/object.rs` `GET` | format | An object request's kind: a range of an object's bytes read. |
+| `crates/node/src/object.rs` `HEAD_BYTES` | format | An object request's head: its kind, one byte; its bucket's and its key's lengths, a u32 each; the operation's identity, a u128; a put's length or a get's offset, and a get's length, a u64 each. |
+| `crates/node/src/object.rs` `MAX_TAG` | derived | The longest version id or ETag a reply carries: a multipart object's ETag bare of quotes, an MD5's 32 hex digits, `-` and its count of parts at `MAX_PARTS`'s five digits (`mantle_s3::checksum::multipart_etag`); a version id is 13 characters (`mantle_meta::key::version_id`). |
+| `crates/node/src/object.rs` `PUT` | format | An object request's kind: an object put, its bytes on the exchange. |
+| `crates/node/src/object.rs` `REPLY_HEAD_BYTES` | format | An object reply's head: its status, one byte; the object's size, a u64; its version id's and its ETag's lengths, a u32 each. |
 | `crates/node/src/read.rs` `BLOCK` | format | A read's kind: a block's header and its chunks' places, of a Block range. |
+| `crates/node/src/read.rs` `BUCKET` | format | A read's kind: a bucket's row, of a Bucket range. |
 | `crates/node/src/read.rs` `CURRENT` | format | A read's kind: the current version of a key, of a Name range. |
 | `crates/node/src/read.rs` `EXTENTS` | format | A read's kind: a file's extents from the one holding an offset, of a File range. |
 | `crates/node/src/read.rs` `EXTENT_BYTES` | derived | An extent in an answer at most: its first byte's offset (u64), its record's length (u32) and the record (`Extent::encode`: format byte, length u64, target kind byte, id u128, CRC-32C u32); a read of more extents than a reply carries is refused whole. |
+| `crates/node/src/read.rs` `GATE` | format | A read's kind: a bucket's gate at a generation, of a Name range (metadata.md §2). |
 | `crates/node/src/read.rs` `HEADER` | format | A read's kind: a file's header, of a File range. |
 | `crates/node/src/read.rs` `PAGE_HEAD_BYTES` | format | A page of the volume table's bytes before its volumes: whether more follow, one byte, and the count, a u32. |
 | `crates/node/src/read.rs` `PLACED_BYTES` | derived | A volume in a page at the longest domain: its id (u128), node (u64) and bytes (u64), its domain's length (u32) and `MAX_DOMAIN` bytes; a page counts each at it so it fits whatever their domains. |

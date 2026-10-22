@@ -431,6 +431,7 @@ impl Pki {
             command_asks: COMMAND_ASKS,
             read_asks: READ_ASKS,
             wall: Wall::System,
+            gateway: None,
         }
     }
 }
@@ -701,30 +702,30 @@ async fn run<E: Engine + 'static>(
                 return;
             }
         }
-        let chunks: Vec<_> = node.take_chunks().collect();
-        for (asked, outcome) in chunks {
-            let Some(tag) = tags.remove(&asked) else {
-                continue;
-            };
-            if reports.send(Report::Chunk(tag, outcome)).is_err() {
-                return;
+        let mut answered = Vec::new();
+        tags.retain(|asked, tag| match node.take_chunk(*asked) {
+            Some(outcome) => {
+                answered.push(Report::Chunk(*tag, outcome));
+                false
             }
-        }
-        let commands: Vec<_> = node.take_commands().collect();
-        for (asked, outcome) in commands {
-            let Some(tag) = command_tags.remove(&asked) else {
-                continue;
-            };
-            if reports.send(Report::Command(tag, outcome)).is_err() {
-                return;
+            None => true,
+        });
+        command_tags.retain(|asked, tag| match node.take_command(*asked) {
+            Some(outcome) => {
+                answered.push(Report::Command(*tag, outcome));
+                false
             }
-        }
-        let reads: Vec<_> = node.take_reads().collect();
-        for (asked, outcome) in reads {
-            let Some(tag) = read_tags.remove(&asked) else {
-                continue;
-            };
-            if reports.send(Report::Read(tag, outcome)).is_err() {
+            None => true,
+        });
+        read_tags.retain(|asked, tag| match node.take_read(*asked) {
+            Some(outcome) => {
+                answered.push(Report::Read(*tag, outcome));
+                false
+            }
+            None => true,
+        });
+        for report in answered {
+            if reports.send(report).is_err() {
                 return;
             }
         }

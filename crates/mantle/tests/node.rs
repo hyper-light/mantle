@@ -29,6 +29,10 @@
 //!   placement over it offers a volume of each node first for every block; started again, a node
 //!   enlists again and the table holds what it held; started in another domain, a node is refused
 //!   and ends saying why, and enlists again in its own.
+//! - A cell of every layer whose nodes keep volumes and host objects: a bucket made, objects of a
+//!   byte to 20 MiB put through each node in turn and read back, whole and in part, through
+//!   another, each block's chunks on distinct nodes; with one node killed (SIGKILL) every object
+//!   reads back through the others, and through it once it is started again.
 //! - A storage cell, each node keeping a chunk volume: a gateway, a client in the gateway's role,
 //!   puts chunks round the nodes over QUIC, one of each length on each, and one node is killed
 //!   (SIGKILL) part way. Every put to a node running is stored, the killed node's until the kill
@@ -80,11 +84,12 @@ use mantle_meta::root::Placed;
 use mantle_meta::wire::{Answer, Entry};
 use mantle_node::chunk::Status;
 use mantle_node::classes::{Bounds, Role};
-use mantle_node::client::ClientError;
 use mantle_node::client::{Client, ClientSettings};
+use mantle_node::client::{ClientError, ObjectOutcome};
 use mantle_node::command::Status as CommandStatus;
 use mantle_node::directory::{Peer, node_name};
 use mantle_node::node::ChunkOutcome;
+use mantle_node::object::{Op, Status as ObjectStatus};
 use mantle_node::place;
 use mantle_node::read::{Query, Read};
 
@@ -171,9 +176,6 @@ engine.fanout = 3
 engine.leaf_entries = 96
 runtime.probe_budget_ms = 40
 chunk_bytes = 8388608
-chunk_asks = 0
-command_asks = 1
-read_asks = 0
 ";
 
 /// The largest chunk the cell's gateways write (`chunk_bytes` above): `mantle_gateway::layout::CHUNK`,
@@ -198,6 +200,50 @@ volume.batch_requests = 64
 volume.batch_bytes = 4194304
 volume.fragments_per_chunk = 64
 ";
+
+/// The volume of a node that hosts objects: 256 MiB of 16 MiB segments, so a block's whole chunk
+/// (`mantle_gateway::layout::CHUNK`, Tectonic's 8 MiB) fits a segment's payload, written in batches
+/// of a chunk; the rest as `VOLUME_STATED`.
+const OBJECT_VOLUME_BYTES: u64 = 256 << 20;
+const OBJECT_VOLUME_STATED: &str = "\
+volume.segment_bytes = 16777216
+volume.checksum_shift = 12
+volume.max_fragments = 4096
+volume.compact = 1
+volume.scrub_period_s = 0
+volume.batch_requests = 64
+volume.batch_bytes = 8388608
+volume.fragments_per_chunk = 64
+";
+
+/// What a node that hosts objects states (`mantle_node::process`'s gateway keys): a block held 30 s
+/// for its file's write, two blocks going down or being read at once, four operations at once,
+/// S3's 10,000 buckets an owner (research/05 §10.4), 64 rows a coordinator's read; and the
+/// durability a block's scheme meets: Backblaze's 2025 drive AFR, 1.36% a drive-year, per hour;
+/// repair in a day, the slow end research/15 cites ([Cha12]); S3's eleven nines a year
+/// (research/15, "S3's target").
+const GATEWAY_STATED: &str = "\
+gateway.handover_ns = 30000000000
+gateway.window = 2
+gateway.objects = 4
+gateway.bucket_quota = 10000
+gateway.scan_rows = 64
+durability.chunk_rate = 0.0000015525114155251142
+durability.repair_rate = 0.041666666666666664
+durability.target = 0.00000000001
+";
+
+/// The cell's root key file in `dir`: 32 bytes only its owner may read.
+fn root_key(dir: &Path) -> PathBuf {
+    let path = dir.join("root.key");
+    std::fs::write(&path, [0x5a; 32]).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    path
+}
 
 /// The message bounds the nodes state for these settings (`mantle_node::node::message_bounds`):
 /// the client states the same.
@@ -365,6 +411,9 @@ struct Pki {
     clients: BTreeMap<u64, (PathBuf, Vec<u8>, Vec<u8>)>,
     /// The gateway's certificate's file, its certificate and its key.
     gateway: (PathBuf, Vec<u8>, Vec<u8>),
+    /// The cell's root key's first generation, which every node that hosts objects holds
+    /// (encryption.md §2): only its owner may read it, as `mantle init` makes it.
+    root_key: PathBuf,
 }
 
 impl Pki {
@@ -421,17 +470,14 @@ impl Pki {
             nodes: issued,
             clients,
             gateway: (c, certificate, pkcs8),
+            root_key: root_key(dir),
         }
     }
 
     /// Node `id`'s configuration file in `dir`, hosting `ranges`: on a storage cell, with its
     /// volume and the gateway.
-    fn config(
-        &self,
-        id: u64,
-        dir: &Path,
-        (stored, ranges, domain): (bool, &[(u128, &str)], &str),
-    ) -> PathBuf {
+    fn config(&self, id: u64, dir: &Path, shape: (bool, &[(u128, &str)], &str, bool)) -> PathBuf {
+        let (stored, ranges, domain, gateway) = shape;
         let (certificate, key, _) = &self.nodes[&id];
         let voters: Vec<String> = (1..=self.voters).map(|v| v.to_string()).collect();
         // Each peer's share holds a receive chunk, the largest datagram QUIC carries, for each of
@@ -452,6 +498,17 @@ impl Pki {
         for (group, layer) in ranges {
             text.push_str(&format!("range = {group:x} {layer}\n"));
         }
+        // What the node asks itself: a gateway's chunks for a put's window of blocks going down,
+        // each copied to every node, and its commands and reads; else its one enlistment.
+        if gateway {
+            text.push_str(&format!(
+                "chunk_asks = 12\ncommand_asks = 8\nread_asks = 8\nroot_key = 1 {}\n\
+                 {GATEWAY_STATED}",
+                self.root_key.display()
+            ));
+        } else {
+            text.push_str("chunk_asks = 0\ncommand_asks = 1\nread_asks = 0\n");
+        }
         // Each range's log group, and the liveness stream's own (`mantle_node::node`'s
         // `LIVENESS_GROUP`).
         text.push_str(&format!("log.max_groups = {}\n", ranges.len() + 1));
@@ -463,9 +520,15 @@ impl Pki {
         }
         if stored {
             // Its volume, enlisted in the root range in its failure domain; the table holds every
-            // node of the cell and a volume of each.
+            // node of the cell and a volume of each. A node that hosts objects keeps a volume whose
+            // segments hold a block's whole chunk.
+            let (bytes, layout) = if gateway {
+                (OBJECT_VOLUME_BYTES, OBJECT_VOLUME_STATED)
+            } else {
+                (VOLUME_BYTES, VOLUME_STATED)
+            };
             text.push_str(&format!(
-                "peer = {GATEWAY} gateway {}\nvolume = {} {VOLUME_BYTES} 1 0 0 0\n{VOLUME_STATED}\
+                "peer = {GATEWAY} gateway {}\nvolume = {} {bytes} 1 0 0 0\n{layout}\
                  domain = {domain}\nroot.max_nodes = {nodes}\nroot.max_volumes = {nodes}\n",
                 self.gateway.0.display(),
                 dir.join("device").display(),
@@ -593,8 +656,9 @@ struct Cell {
     /// The node whose process the test started to be refused, and that process once it ended.
     refusing: Option<u64>,
     refused: Option<Running>,
-    /// The ranges every node hosts.
+    /// The ranges every node hosts, and whether each hosts objects.
     ranges: &'static [(u128, &'static str)],
+    gateway: bool,
     _root: tempfile::TempDir,
 }
 
@@ -615,6 +679,8 @@ struct Shape {
     network: Network,
     stored: bool,
     ranges: &'static [(u128, &'static str)],
+    /// Whether each node hosts objects (a gateway host).
+    gateway: bool,
 }
 
 impl Cell {
@@ -627,6 +693,7 @@ impl Cell {
             network,
             stored: false,
             ranges: NAME_RANGE,
+            gateway: false,
         })
     }
 
@@ -638,6 +705,7 @@ impl Cell {
             network: Network::Direct,
             stored: true,
             ranges: STORAGE_RANGES,
+            gateway: false,
         })
     }
 
@@ -649,6 +717,20 @@ impl Cell {
             network: Network::Direct,
             stored: true,
             ranges: EVERY_LAYER,
+            gateway: false,
+        })
+    }
+
+    /// A cell of `nodes` nodes hosting a range of each layer, each keeping a volume and hosting
+    /// objects.
+    fn gateways(nodes: u64) -> Self {
+        Self::shaped(Shape {
+            voters: nodes,
+            spares: 0,
+            network: Network::Direct,
+            stored: true,
+            ranges: EVERY_LAYER,
+            gateway: true,
         })
     }
 
@@ -660,6 +742,7 @@ impl Cell {
             network: Network::Direct,
             stored: false,
             ranges: EVERY_LAYER,
+            gateway: false,
         })
     }
 
@@ -671,6 +754,7 @@ impl Cell {
             network,
             stored,
             ranges,
+            gateway,
         } = shape;
         let nodes = voters + spares;
         let root = tempfile::tempdir().unwrap();
@@ -710,6 +794,7 @@ impl Cell {
             refusing: None,
             refused: None,
             ranges,
+            gateway,
             _root: root,
         };
         // One at a time, each listening before the next starts (`Cell::start`).
@@ -818,8 +903,11 @@ impl Cell {
             .get(&id)
             .cloned()
             .unwrap_or_else(|| format!("n{id}"));
-        self.pki
-            .config(id, &self.dirs[&id], (self.stored, self.ranges, &domain))
+        self.pki.config(
+            id,
+            &self.dirs[&id],
+            (self.stored, self.ranges, &domain, self.gateway),
+        )
     }
 
     /// Starts node `id`'s process, which must listen and then end on a failure of its own: what
@@ -1266,6 +1354,25 @@ impl Cell {
         thread.join().unwrap()
     }
 
+    /// What `ops` came to, each an object's request asked of a node with its data, which the
+    /// writer client asks in turn, knowing every node and told where the running ones listen.
+    fn objects(&mut self, ops: Vec<(u64, Op, Vec<u8>)>) -> Vec<ObjectOutcome> {
+        self.progress.remove(&CLIENT);
+        self.clients.remove(&CLIENT);
+        let done = ops.len() as u64;
+        let (settings, bound) = (self.pki.client_settings(CLIENT), self.bound_quic());
+        let tell = self.tell.clone();
+        let thread = std::thread::spawn(move || objects(settings, bound, ops, tell));
+        self.until(|c| {
+            if c.progress.get(&CLIENT).is_some_and(|d| *d >= done) {
+                Some(())
+            } else {
+                None
+            }
+        });
+        thread.join().unwrap()
+    }
+
     /// The root range's volume table, read a page at a time through the writer client.
     fn table(&mut self) -> Vec<Placed> {
         let mut table = Vec::new();
@@ -1420,6 +1527,38 @@ fn asker(
                 let _ = tell.send(Heard::Told(Told::Progress(id, done, client.patience())));
             }
             answered
+        })
+        .unwrap()
+}
+
+/// The object client: `ops` in turn through a client of its own, each an object's request asked of
+/// a node with no deadline of its own, each outcome kept and each told as progress.
+fn objects(
+    settings: ClientSettings,
+    bound: Vec<(u64, SocketAddr)>,
+    ops: Vec<(u64, Op, Vec<u8>)>,
+    tell: Sender<Heard>,
+) -> Vec<ObjectOutcome> {
+    let id = settings.id;
+    client_runtime(settings.nodes.len() + 1)
+        .block_on(async move {
+            let mut client = Client::open(settings).await.unwrap();
+            for (node, quic) in bound {
+                client.learn(node, quic).unwrap();
+            }
+            let mut outcomes = Vec::with_capacity(ops.len());
+            for (done, (node, op, data)) in (1..).zip(ops) {
+                match client.object(node, &op, &data, u64::MAX).await {
+                    Ok(outcome) => outcomes.push(outcome),
+                    Err(error) => {
+                        let why = format!("object operation {done}: {error}");
+                        let _ = tell.send(Heard::Told(Told::Failed(id, why)));
+                        return outcomes;
+                    }
+                }
+                let _ = tell.send(Heard::Told(Told::Progress(id, done, client.patience())));
+            }
+            outcomes
         })
         .unwrap()
 }
@@ -1707,6 +1846,7 @@ fn damaged_and_replaced(voters: u64) {
         network: Network::Direct,
         stored: false,
         ranges: NAME_RANGE,
+        gateway: false,
     });
     let spare = voters + 1;
     let leader = cell.leader(GROUP);
@@ -2004,4 +2144,148 @@ fn each_node_enlists_its_volume_and_placement_offers_one_to_a_domain() {
     cell.introduce();
     cell.enlisted(3);
     assert_eq!(cell.table(), table);
+}
+
+/// Object `n`'s bytes: `len` of them, each a function of `n` and its place.
+fn object_bytes(n: u64, len: usize) -> Vec<u8> {
+    (0..len as u64)
+        .map(|i| {
+            i.wrapping_mul(0x2545_F491)
+                .wrapping_add(n * 7)
+                .to_le_bytes()[1]
+        })
+        .collect()
+}
+
+/// The outcome's reply, which must be done, and its bytes.
+fn done(outcome: &ObjectOutcome, what: &str) -> Vec<u8> {
+    match outcome {
+        ObjectOutcome::Replied { reply, bytes } if reply.status == ObjectStatus::Done => {
+            bytes.clone()
+        }
+        other => panic!("{what}: {other:?}"),
+    }
+}
+
+#[test]
+fn objects_round_trip_through_any_node_and_read_back_after_one_is_killed() {
+    let mut cell = Cell::gateways(NODES);
+    for id in 1..=NODES {
+        cell.enlisted(id);
+    }
+    let made = cell.objects(vec![(1, Op::Create { bucket: "b".into() }, Vec::new())]);
+    done(&made[0], "the bucket");
+    // Lengths either side of a sealed segment's 64 KiB and across blocks of 8 MiB chunks.
+    let lens = [0usize, 1, 65_535, 65_537, 3 << 20, 20 << 20];
+    let objects: Vec<(String, Vec<u8>)> = (0u64..)
+        .zip(lens)
+        .map(|(n, len)| (format!("o{n}"), object_bytes(n, len)))
+        .collect();
+    let puts = objects
+        .iter()
+        .enumerate()
+        .map(|(n, (key, data))| {
+            let op = Op::Put {
+                bucket: "b".into(),
+                key: key.clone(),
+                id: n as u128 + 1,
+                length: data.len() as u64,
+            };
+            (1 + n as u64 % NODES, op, data.clone())
+        })
+        .collect();
+    for (outcome, (key, _)) in cell.objects(puts).iter().zip(&objects) {
+        done(outcome, &format!("the put of {key}"));
+    }
+    // Each read back whole through another node than its put's, and its middle third.
+    let reads = |through: &dyn Fn(usize) -> u64| -> Vec<(u64, Op, Vec<u8>)> {
+        let mut ops = Vec::new();
+        for (n, (key, data)) in objects.iter().enumerate() {
+            let get = |offset: u64, len: u64| Op::Get {
+                bucket: "b".into(),
+                key: key.clone(),
+                offset,
+                len,
+            };
+            ops.push((through(n), get(0, u64::MAX), Vec::new()));
+            let third = data.len() as u64 / 3;
+            if third > 0 {
+                ops.push((through(n), get(third, third), Vec::new()));
+            }
+        }
+        ops
+    };
+    let check = |got: Vec<ObjectOutcome>, how: &str| {
+        let mut got = got.iter();
+        for (key, data) in &objects {
+            assert!(
+                done(got.next().unwrap(), &format!("{key} {how}")) == *data,
+                "{key} {how}: other bytes"
+            );
+            let third = data.len() / 3;
+            if third > 0 {
+                let part = done(got.next().unwrap(), &format!("{key}'s third {how}"));
+                assert!(part == data[third..2 * third], "{key}'s third {how}");
+            }
+        }
+    };
+    let got = cell.objects(reads(&|n| 1 + (n as u64 + 1) % NODES));
+    check(got, "through another node");
+    // Each block's chunks on distinct nodes.
+    let node_of: BTreeMap<u128, u64> = cell.table().iter().map(|p| (p.volume, p.node)).collect();
+    for (key, data) in &objects {
+        let current = cell.read(vec![(
+            GROUP,
+            Query::Current {
+                bucket: "b".into(),
+                key: key.clone(),
+            },
+        )]);
+        let [Ok(Read::Current(Some((_, version))))] = current.as_slice() else {
+            panic!("{key}: {current:?}");
+        };
+        let Some(file) = version.file else {
+            assert!(data.is_empty(), "{key} has bytes and no file");
+            continue;
+        };
+        let extents = cell.read(vec![(
+            FILES,
+            Query::Extents {
+                file,
+                offset: 0,
+                max: 16,
+            },
+        )]);
+        let [Ok(Read::Extents(extents))] = extents.as_slice() else {
+            panic!("{key}'s extents: {extents:?}");
+        };
+        for (_, extent) in extents {
+            let mantle_meta::record::Target::Block(block) = extent.target else {
+                panic!("{key}: an extent of a file");
+            };
+            let read = cell.read(vec![(BLOCKS, Query::Block { block })]);
+            let [Ok(Read::Block(Some((_, places))))] = read.as_slice() else {
+                panic!("{key}'s block: {read:?}");
+            };
+            let nodes: BTreeSet<u64> = places.iter().map(|p| node_of[&p.volume]).collect();
+            assert_eq!(
+                nodes.len(),
+                places.len(),
+                "{key}'s block {block:x}: {places:?}"
+            );
+        }
+    }
+    // Each node in turn killed: every object reads back through the other two; started again,
+    // it serves them too.
+    for killed in 1..=NODES {
+        cell.kill(killed);
+        let others: Vec<u64> = (1..=NODES).filter(|id| *id != killed).collect();
+        let got = cell.objects(reads(&|n| others[n % others.len()]));
+        check(got, &format!("with node {killed} killed"));
+        cell.start(killed);
+        cell.introduce();
+        cell.enlisted(killed);
+        let got = cell.objects(reads(&|_| killed));
+        check(got, &format!("through node {killed} started again"));
+    }
 }

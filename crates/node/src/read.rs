@@ -14,23 +14,28 @@
 //! | a file's header, of a File range | kind 2; the file (u128) | 0 for none; 1, then the header (`mantle_meta::record::FileHeader`) |
 //! | a file's extents from the one holding an offset, of a File range | kind 3; the file (u128), the offset (u64), the most extents (u32) | the count (u32); each extent's first byte's offset (u64), then the extent (`Extent`), its length (u32) before it |
 //! | a block's header and its chunks' places, of a Block range | kind 4; the block (u128) | 0 for none; 1, the header (`BlockHeader`) and the count of places (u32), each record its length (u32) before it |
+//! | a bucket's row, of the Bucket range | kind 5; the bucket's name, its length (u32) before it | 0 for none; 1, then the row (`Bucket`) |
+//! | a bucket's gate, of a Name range routed by a descriptor's generation | kind 6; the bucket's name, its length (u32) before it; the generation (u64) | 0 for no gate; 1, then the gate (`Gate`); 2, then the range's lineage (`Lineage`), where its span went |
 //!
 //! A read is answered only by a range of the layer whose rows it reads (`Query::layer`). A page
 //! holds as many volumes as a reply carries, each counted at the longest domain, so it fits
 //! whatever their domains. Extents are read as many as asked, the asker's window's worth (gateway.md
 //! §3): a read of more than a reply carries is refused whole, since an answer cut short reads as
 //! the file's end.
+//!
 //! Which reads a range answers grows with the request path (node.md §5.1: headers, extents, blocks,
 //! uploads and parts); a read never changes what the range holds.
 
 use mantle_codec::{Reader, Writer};
 use mantle_meta::apply::Layer;
 use mantle_meta::engine::Rows;
-use mantle_meta::name;
-use mantle_meta::record::{BlockHeader, ChunkPlace, Extent, FileHeader, Version};
+use mantle_meta::name::{self, Routed};
+use mantle_meta::record::{
+    BlockHeader, Bucket, ChunkPlace, Extent, FileHeader, Gate, Lineage, Version,
+};
 use mantle_meta::root::{self, MAX_DOMAIN, Placed};
 use mantle_meta::wire::{MAX_BUCKET, MAX_KEY};
-use mantle_meta::{block, file};
+use mantle_meta::{block, bucket, file};
 
 /// The query's kind: the current version of a key, or a page of the volume table.
 const CURRENT: u8 = 0;
@@ -38,6 +43,8 @@ const VOLUMES: u8 = 1;
 const HEADER: u8 = 2;
 const EXTENTS: u8 = 3;
 const BLOCK: u8 = 4;
+const BUCKET: u8 = 5;
+const GATE: u8 = 6;
 /// An extent's bytes in an answer, at most: its first byte's offset, its record's length and the
 /// record (`Extent::encode`: the format, the length, the target's kind and id, the CRC-32C).
 const EXTENT_BYTES: usize = 8 + 4 + (1 + 8 + 1 + 16 + 4);
@@ -60,6 +67,11 @@ pub enum Query {
     Extents { file: u128, offset: u64, max: u32 },
     /// A block's header and where each of its chunks lives.
     Block { block: u128 },
+    /// A bucket's row: its owner, incarnation, versioning and state (metadata.md §1).
+    Bucket { bucket: String },
+    /// A bucket's gate in a Name range, routed by the generation of the range's descriptor the
+    /// asker holds (the bucket's coordinator's read, `mantle_meta::coordinator`).
+    Gate { bucket: String, generation: u64 },
 }
 
 /// What a range answered a read.
@@ -75,6 +87,10 @@ pub enum Read {
     Extents(Vec<(u64, Extent)>),
     /// The block's header and its chunks' places, or none.
     Block(Option<(BlockHeader, Vec<ChunkPlace>)>),
+    /// The bucket's row, or none.
+    Bucket(Option<Bucket>),
+    /// The bucket's gate, or none; or where the range's span went.
+    Gate(Routed<Option<Gate>>),
 }
 
 /// Why a read's message was refused.
@@ -152,6 +168,15 @@ impl Query {
                 w.u8(BLOCK);
                 w.u128(*block);
             }
+            Self::Bucket { bucket } => {
+                w.u8(BUCKET);
+                put_text(&mut w, bucket);
+            }
+            Self::Gate { bucket, generation } => {
+                w.u8(GATE);
+                put_text(&mut w, bucket);
+                w.u64(*generation);
+            }
         }
         w.into_vec()
     }
@@ -177,6 +202,13 @@ impl Query {
                 max: r.u32()?,
             }),
             BLOCK => Some(Self::Block { block: r.u128()? }),
+            BUCKET => Some(Self::Bucket {
+                bucket: take_text(&mut r, MAX_BUCKET)?,
+            }),
+            GATE => Some(Self::Gate {
+                bucket: take_text(&mut r, MAX_BUCKET)?,
+                generation: r.u64()?,
+            }),
             _ => None,
         })();
         query.filter(|_| r.remaining() == 0).ok_or(ReadError::Query)
@@ -189,6 +221,8 @@ impl Query {
             Self::Volumes { .. } => Layer::Root,
             Self::Header { .. } | Self::Extents { .. } => Layer::File,
             Self::Block { .. } => Layer::Block,
+            Self::Bucket { .. } => Layer::Bucket,
+            Self::Gate { .. } => Layer::Name,
         }
     }
 
@@ -226,6 +260,10 @@ impl Query {
                     .map_err(meta)
             }
             Self::Block { block } => block::read(engine, *block).map(Read::Block).map_err(meta),
+            Self::Bucket { bucket } => bucket::read(engine, bucket).map(Read::Bucket).map_err(meta),
+            Self::Gate { bucket, generation } => name::read_gate(engine, bucket, *generation)
+                .map(Read::Gate)
+                .map_err(meta),
         }
     }
 }
@@ -250,7 +288,22 @@ impl Read {
                     put_text(&mut w, &p.domain);
                 }
             }
-            Self::Header(None) | Self::Block(None) => w.u8(0),
+            Self::Header(None)
+            | Self::Block(None)
+            | Self::Bucket(None)
+            | Self::Gate(Routed::Here(None)) => w.u8(0),
+            Self::Bucket(Some(row)) => {
+                w.u8(1);
+                w.bytes(&row.encode()?);
+            }
+            Self::Gate(Routed::Here(Some(gate))) => {
+                w.u8(1);
+                w.bytes(&gate.encode());
+            }
+            Self::Gate(Routed::Moved(lineage)) => {
+                w.u8(2);
+                w.bytes(&lineage.encode()?);
+            }
             Self::Header(Some(header)) => {
                 w.u8(1);
                 w.bytes(&header.encode()?);
@@ -337,6 +390,26 @@ impl Read {
                 }
                 Ok(Self::Extents(extents))
             }
+            Query::Bucket { .. } => match r.u8() {
+                Some(0) if r.remaining() == 0 => Ok(Self::Bucket(None)),
+                Some(1) => {
+                    let rest = r.take(r.remaining()).ok_or(ReadError::Answer)?;
+                    Ok(Self::Bucket(Some(Bucket::decode(rest)?)))
+                }
+                _ => Err(ReadError::Answer),
+            },
+            Query::Gate { .. } => match r.u8() {
+                Some(0) if r.remaining() == 0 => Ok(Self::Gate(Routed::Here(None))),
+                Some(1) => {
+                    let rest = r.take(r.remaining()).ok_or(ReadError::Answer)?;
+                    Ok(Self::Gate(Routed::Here(Some(Gate::decode(rest)?))))
+                }
+                Some(2) => {
+                    let rest = r.take(r.remaining()).ok_or(ReadError::Answer)?;
+                    Ok(Self::Gate(Routed::Moved(Box::new(Lineage::decode(rest)?))))
+                }
+                _ => Err(ReadError::Answer),
+            },
             Query::Block { .. } => match r.u8() {
                 Some(0) if r.remaining() == 0 => Ok(Self::Block(None)),
                 Some(1) => {

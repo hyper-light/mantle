@@ -35,6 +35,7 @@ pub mod directory;
 pub mod frame;
 pub mod layout;
 pub mod node;
+pub mod object;
 pub mod place;
 pub mod process;
 pub mod read;

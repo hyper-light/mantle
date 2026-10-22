@@ -15,7 +15,13 @@
 //! states its failure domain (`domain`, at most 255 bytes) and the cell's bounds on its volume
 //! table (`root.max_nodes`, `root.max_volumes`), and hosts the root range: once it listens it
 //! enlists itself and its volumes there (node.md §6.6), says `enlisted` once the range took them,
-//! and stops, naming the range's answer, on a refusal.
+//! and stops, naming the range's answer, on a refusal. A node that hosts objects for clients and
+//! gateways (node.md §4–§5) names its root key's generations, each `root_key = GENERATION FILE`, 32
+//! bytes only its owner may read (encryption.md §2), and states its `gateway.` and `durability.`
+//! keys: how long a block is held for its file's write, the blocks an object holds going down or
+//! being read, the operations it runs at once, the buckets an owner may have, the rows a bucket's
+//! coordinator passes in a read, and the chunk loss and repair rates, per hour, and the annual
+//! loss probability a block's scheme is chosen to meet.
 //!
 //! **Its talk** is lines. On standard output: `bound QUIC PLANE` once the node listens, and
 //! `volume ID` for each volume it holds, its 128-bit id in hex; then, for each range it hosts,
@@ -65,6 +71,7 @@ use hyper_rt::combine::{Either, race2};
 use hyper_rt::machine::calibration::{Calibration, Policy};
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
 use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer};
+use mantle_ec::durability::Rates;
 use mantle_engine::store::Config as StoreConfig;
 use mantle_engine::trunk::TrunkConfig;
 use mantle_meta::apply::Layer;
@@ -74,11 +81,12 @@ use mantle_meta::root::{self, Enlist, MAX_DOMAIN};
 use mantle_meta::session::Rules;
 use mantle_meta::wire::{Answer, Command};
 use mantle_range::{ConfState, Range, Settings, Stored};
+use mantle_s3::seal::WrappingKey;
 
 use crate::ask::CommandOutcome;
 use crate::classes::Role;
 use crate::directory::Peer;
-use crate::node::{Hosted, Link, Node, NodeError, NodeSettings, Status, Wall};
+use crate::node::{GatewaySettings, Hosted, Link, Node, NodeError, NodeSettings, Status, Wall};
 use crate::storage::{Storage, StorageError, VolumeSettings};
 
 /// Why the process stopped.
@@ -104,6 +112,8 @@ pub enum ProcessError {
     Input(String, &'static str),
     #[error("the root range refused the node's enlistment: {0}")]
     Enlist(String),
+    #[error("the root key {0}: {1}")]
+    Key(PathBuf, String),
 }
 
 /// What the file states.
@@ -142,6 +152,21 @@ pub struct ProcessConfig {
     pub read_asks: usize,
     /// How a node with volumes enlists them: none for a node without.
     pub enlist: Option<Enlisting>,
+    /// The gateway host's, for a node that hosts objects: none for one that refuses them.
+    pub gateway: Option<GatewayConfig>,
+}
+
+/// What a node that hosts objects states (`GatewaySettings`), its root keys by their files.
+pub struct GatewayConfig {
+    pub keys: Vec<(u32, PathBuf)>,
+    pub handover_ns: u64,
+    pub window: usize,
+    pub objects: usize,
+    pub bucket_quota: u32,
+    pub scan_rows: u32,
+    pub chunk_rate: f64,
+    pub repair_rate: f64,
+    pub target: f64,
 }
 
 /// How a node enlists itself and its volumes in the cell's volume table (node.md §6.6): the root
@@ -153,13 +178,14 @@ pub struct Enlisting {
     pub max_volumes: u32,
 }
 
-/// The file's values by key, each with the line it was on; `peer`, `range` and `volume` lines
-/// kept apart.
+/// The file's values by key, each with the line it was on; `peer`, `range`, `volume` and
+/// `root_key` lines kept apart.
 struct Lines {
     values: BTreeMap<String, (usize, String)>,
     peers: Vec<(usize, String)>,
     ranges: Vec<(usize, String)>,
     volumes: Vec<(usize, String)>,
+    keys: Vec<(usize, String)>,
 }
 
 impl Lines {
@@ -168,6 +194,7 @@ impl Lines {
         let mut peers = Vec::new();
         let mut ranges = Vec::new();
         let mut volumes = Vec::new();
+        let mut keys = Vec::new();
         for (at, line) in text.lines().enumerate() {
             let number = at.saturating_add(1);
             let line = line.split('#').next().unwrap_or_default().trim();
@@ -184,6 +211,8 @@ impl Lines {
                 ranges.push((number, value));
             } else if key == "volume" {
                 volumes.push((number, value));
+            } else if key == "root_key" {
+                keys.push((number, value));
             } else if values.insert(key.to_owned(), (number, value)).is_some() {
                 return Err(ProcessError::Line(number, format!("{key} stated twice")));
             }
@@ -193,6 +222,7 @@ impl Lines {
             peers,
             ranges,
             volumes,
+            keys,
         })
     }
 
@@ -312,6 +342,7 @@ impl ProcessConfig {
             command_asks: lines.get("command_asks")?,
             read_asks: lines.get("read_asks")?,
             enlist: enlisting(&lines)?,
+            gateway: gateway(&lines)?,
         })
     }
 }
@@ -350,6 +381,82 @@ fn ranges(lines: &Lines) -> Result<Vec<(u128, Layer)>, ProcessError> {
         ranges.push((group, layer));
     }
     Ok(ranges)
+}
+
+/// What a node with `root_key` lines states of its gateway host, each `root_key = GENERATION FILE`
+/// a generation of the root key, the last the current one; none for a node without them.
+fn gateway(lines: &Lines) -> Result<Option<GatewayConfig>, ProcessError> {
+    if lines.keys.is_empty() {
+        return Ok(None);
+    }
+    let mut keys: Vec<(u32, PathBuf)> = Vec::with_capacity(lines.keys.len());
+    for (number, value) in &lines.keys {
+        let bad = || ProcessError::Line(*number, "root_key = GENERATION FILE".into());
+        let fields: Vec<&str> = value.split_whitespace().collect();
+        let [generation, file] = fields.as_slice() else {
+            return Err(bad());
+        };
+        let generation: u32 = generation.parse().map_err(|_| bad())?;
+        if keys.last().is_some_and(|(last, _)| *last >= generation) {
+            return Err(ProcessError::Line(
+                *number,
+                "root key generations in increasing order".into(),
+            ));
+        }
+        keys.push((generation, PathBuf::from(file)));
+    }
+    Ok(Some(GatewayConfig {
+        keys,
+        handover_ns: lines.get("gateway.handover_ns")?,
+        window: lines.get("gateway.window")?,
+        objects: lines.get("gateway.objects")?,
+        bucket_quota: lines.get("gateway.bucket_quota")?,
+        scan_rows: lines.get("gateway.scan_rows")?,
+        chunk_rate: lines.get("durability.chunk_rate")?,
+        repair_rate: lines.get("durability.repair_rate")?,
+        target: lines.get("durability.target")?,
+    }))
+}
+
+/// The gateway host's settings, its root keys read from their files: each 32 bytes that only its
+/// owner may read, as `mantle init` makes them (encryption.md §2).
+fn gateway_settings(config: GatewayConfig) -> Result<GatewaySettings, ProcessError> {
+    let mut keys = Vec::with_capacity(config.keys.len());
+    for (generation, path) in &config.keys {
+        let refused = |why: &str| ProcessError::Key(path.clone(), why.to_owned());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path)
+                .map_err(|e| refused(&e.to_string()))?
+                .permissions()
+                .mode();
+            if mode & 0o077 != 0 {
+                return Err(refused("is readable by others than its owner"));
+            }
+        }
+        let bytes = std::fs::read(path).map_err(|e| refused(&e.to_string()))?;
+        let key: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| refused("is not 32 bytes"))?;
+        keys.push((*generation, WrappingKey::new(&key)));
+    }
+    Ok(GatewaySettings {
+        keys,
+        handover_ns: config.handover_ns,
+        window: config.window,
+        objects: config.objects,
+        bucket_quota: config.bucket_quota,
+        scan_rows: config.scan_rows,
+        rates: Rates {
+            chunk: config.chunk_rate,
+            domains: None,
+            bursts: Vec::new(),
+            repair: config.repair_rate,
+        },
+        target: config.target,
+    })
 }
 
 /// How a node with `volume` lines enlists them: the root range its `range` lines name, its
@@ -440,14 +547,15 @@ fn volumes(lines: &Lines) -> Result<Vec<VolumeSettings>, ProcessError> {
 
 /// Runs the node the file at `config` states until standard input closes.
 pub fn run(config: &Path) -> Result<(), ProcessError> {
-    let config = ProcessConfig::read(config)?;
+    let mut config = ProcessConfig::read(config)?;
     // The volumes open before the node's runtime starts: an issuer's start and a volume's
     // recovery wait on their device, which no shard may (node.md §1.3).
     let storage = Storage::open(&config.volumes)?;
+    let gateway = config.gateway.take().map(gateway_settings).transpose()?;
     let runtime = runtime(&config)?;
     let mut rt =
         LocalRuntime::new(&runtime).map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
-    rt.block_on(serve(config, storage))
+    rt.block_on(serve(config, storage, gateway))
         .map_err(|e| ProcessError::Runtime(format!("{e:?}")))?
 }
 
@@ -508,7 +616,11 @@ fn engine(
 }
 
 /// The node, its talk on standard input and output.
-async fn serve(config: ProcessConfig, storage: Storage) -> Result<(), ProcessError> {
+async fn serve(
+    config: ProcessConfig,
+    storage: Storage,
+    gateway: Option<GatewaySettings>,
+) -> Result<(), ProcessError> {
     // This process's one shard runs the node's replicas, which apply through the engine's
     // synchronous calls (node.md §1.2).
     mantle_engine::store::permit_blocking();
@@ -559,6 +671,7 @@ async fn serve(config: ProcessConfig, storage: Storage) -> Result<(), ProcessErr
         command_asks: config.command_asks,
         read_asks: config.read_asks,
         wall: Wall::System,
+        gateway,
     };
     let mut node = Node::open(settings).await?;
     // A buffer each way, a page each (hyper-rt `stdio`: a page is the natural chunk): the talk is
@@ -590,7 +703,6 @@ async fn serve(config: ProcessConfig, storage: Storage) -> Result<(), ProcessErr
         }
         None => None,
     };
-    let mut answered = Vec::new();
     let mut read = vec![0u8; chunk];
     let mut pending = Vec::new();
     // Each range's status as last said, a range a slot in the configuration's order.
@@ -626,11 +738,10 @@ async fn serve(config: ProcessConfig, storage: Storage) -> Result<(), ProcessErr
         // them itself (`Node::take_applied`); this process proposes nothing itself, and a client's
         // answers reach it through its exchange, so they are dropped each turn, never kept.
         node.take_applied().for_each(drop);
-        answered.extend(node.take_commands());
-        for (asked, outcome) in answered.drain(..) {
-            if enlisting != Some(asked) {
-                continue;
-            }
+        // Its own command's outcome only: the gateway host takes those of the commands it asks.
+        if let Some(asked) = enlisting
+            && let Some(outcome) = node.take_command(asked)
+        {
             enlisting = None;
             match outcome {
                 CommandOutcome::Answered(Answer::Root(root::Outcome::Enlisted)) => {

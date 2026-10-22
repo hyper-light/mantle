@@ -47,6 +47,7 @@ use crate::classes::{self, Bounds, Kind, NodeClasses, Role};
 use crate::command::{self, CommandError, ReplyHead, Status};
 use crate::directory::{Peer, Peers};
 use crate::node::ChunkOutcome;
+use crate::object::{self, Op};
 use crate::read::{Query, Read, ReadError};
 
 /// What a client is given.
@@ -623,6 +624,112 @@ impl Client {
         })
     }
 
+    /// Asks `node` an object's request (`crate::object`): a bucket made, `data` put as the object's
+    /// bytes, or a range got. The reply, with a get's bytes, or the refusal that ended the exchange
+    /// unanswered, after which a put may still have committed (asking it again with the same
+    /// identity is answered from what it made, gateway.md §2.1).
+    pub async fn object(
+        &mut self,
+        node: PeerId,
+        op: &Op,
+        data: &[u8],
+        deadline_ns: u64,
+    ) -> Result<ObjectOutcome, ClientError> {
+        let (head, names) = op
+            .encode()
+            .map_err(|e| ClientError::Bounds(e.to_string()))?;
+        if !self.reach(node, deadline_ns).await? {
+            return Ok(ObjectOutcome::Lost(Refusal::NotConnected));
+        }
+        let clock = self.driver.clock()?;
+        let now_ns = hyper_rt::futures::now_ns();
+        let period = Progress::new(Duration::from_nanos(self.period_ns(
+            node,
+            deadline_ns,
+            now_ns,
+        )))?;
+        let exchange = match self.driver.endpoint().open(
+            clock,
+            node,
+            Kind::Object,
+            &head,
+            Some(op.body()),
+            period,
+        ) {
+            Ok(exchange) => exchange,
+            Err(Refusal::NotConnected) => {
+                self.lost(node);
+                return Ok(ObjectOutcome::Lost(Refusal::NotConnected));
+            }
+            Err(refusal) => return Err(refusal.into()),
+        };
+        // The names, then the object's bytes, as the stream takes them.
+        let mut written = 0usize;
+        let write = |endpoint: &mut Endpoint<NodeClasses, Fixed, Peers>,
+                     written: &mut usize|
+         -> Result<(), ClientError> {
+            for (from, part) in [(0usize, names.as_slice()), (names.len(), data)] {
+                let end = from.saturating_add(part.len());
+                if *written >= end {
+                    continue;
+                }
+                let mut at = written.saturating_sub(from);
+                write_body(endpoint, exchange, part, &mut at)?;
+                *written = from.saturating_add(at);
+                // The stream took no more for now: the rest goes once it is writable.
+                if *written < end {
+                    break;
+                }
+            }
+            Ok(())
+        };
+        write(self.driver.endpoint(), &mut written)?;
+        let mut replied: Option<object::ReplyHead> = None;
+        let mut bytes = Vec::new();
+        loop {
+            let Some(event) = self.next_event(deadline_ns).await? else {
+                self.driver.endpoint().end(exchange);
+                return Err(ClientError::Deadline);
+            };
+            match event {
+                Event::Writable { exchange: e } if e == exchange => {
+                    write(self.driver.endpoint(), &mut written)?;
+                }
+                Event::Reply { exchange: e, .. } if e == exchange => {
+                    let head = self.driver.endpoint().head(exchange).unwrap_or_default();
+                    replied = Some(
+                        object::ReplyHead::decode(head)
+                            .map_err(|e| ClientError::Bounds(e.to_string()))?,
+                    );
+                    if let Some(done) =
+                        self.read_reply(exchange, classes::Class::Transfer, &mut bytes)?
+                    {
+                        return reply_of(replied, done);
+                    }
+                }
+                Event::BodyReady { exchange: e } if e == exchange && replied.is_some() => {
+                    if let Some(done) =
+                        self.read_reply(exchange, classes::Class::Transfer, &mut bytes)?
+                    {
+                        return reply_of(replied, done);
+                    }
+                }
+                Event::Refused {
+                    exchange: e,
+                    refusal,
+                    ..
+                } if e == exchange => return Ok(ObjectOutcome::Lost(refusal)),
+                Event::Closed { peer, .. } | Event::Unreachable { peer, .. } => {
+                    self.lost(peer);
+                    if peer == node {
+                        return Ok(ObjectOutcome::Lost(Refusal::Closed));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// One chunk exchange with `node`: its reply's status and body, or the refusal that ended it
     /// unanswered (`NotConnected` for a node not reached).
     async fn transfer(
@@ -841,6 +948,40 @@ fn finish(head: ReplyHead) -> Result<Asked, ClientError> {
         Status::Refused => Ok(Asked::Refused),
         status => Err(ClientError::Status(status)),
     }
+}
+
+/// What became of an object's request ([`Client::object`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectOutcome {
+    /// The node's reply, and a get's bytes.
+    Replied {
+        reply: object::Reply,
+        bytes: Vec<u8>,
+    },
+    /// The exchange ended unanswered: its node is unreachable or refused it, or its connection
+    /// closed.
+    Lost(Refusal),
+}
+
+/// A reply whose body was read whole: its tags taken from the body's start, the rest a get's bytes.
+fn reply_of(
+    head: Option<object::ReplyHead>,
+    mut body: Vec<u8>,
+) -> Result<ObjectOutcome, ClientError> {
+    let head = head.ok_or(ClientError::Bounds(
+        "an object's body before its head".into(),
+    ))?;
+    let tags = usize::try_from(head.tags()).unwrap_or(usize::MAX);
+    if tags > body.len() {
+        return Err(ClientError::Bounds(
+            "an object's reply shorter than its tags".into(),
+        ));
+    }
+    let bytes = body.split_off(tags);
+    let reply = head
+        .reply(&body)
+        .map_err(|e| ClientError::Bounds(e.to_string()))?;
+    Ok(ObjectOutcome::Replied { reply, bytes })
 }
 
 /// Writes what `exchange` takes of `body` past `written`.

@@ -222,6 +222,16 @@ pub struct Cache {
     /// Each chunk's state, and the chunks spare for loans.
     held: Vec<Held>,
     spares: Vec<usize>,
+    /// The pages the chunks have room for (`sizes` summed), those of spare chunks and those of
+    /// chunks out on loan again, kept as chunks change, so [`Self::room`], [`Self::shed_spare`]
+    /// and [`Self::out_on_loan`] read a field where they summed every chunk: with a loan's
+    /// memory in chunks of [`Self::loan_chunk`] pages, a cache holds tens of thousands.
+    room_pages: usize,
+    spare_pages: usize,
+    lent_pages: usize,
+    /// The most pages one buffer of a loan's fresh memory holds, each buffer its own chunk once
+    /// back ([`loan_chunk_pages`]).
+    loan_chunk: usize,
     /// Slots made in read-made chunks, and the pages of loans' chunks (kept, spare or lent
     /// again): the memory the cache holds ([`Self::bytes`]).
     made: usize,
@@ -262,6 +272,30 @@ pub struct Memory {
     pub loan_missed: u64,
 }
 
+/// The most pages one buffer of a loan's fresh memory holds ([`Cache::lend`]). A job's pages
+/// leave the cache an extent at a time, as the store frees their extents (`forget_run`), and a
+/// loan keeps a job's pages in the order it writes them, an extent's in a row: a buffer of whole
+/// extents leaves with its extents, where a buffer the size of a whole loan stays, its freed pages
+/// dead slots, until the last of its extents leaves (a third of the cache at 1B, docs/research/64
+/// §12). On Linux a buffer is at least one huge page, so each can lie on one, and a 64 GB cache of
+/// them is 32K buffers, half the default 65,530 mappings a process may hold should glibc map each
+/// alone (mallopt(3), `M_MMAP_THRESHOLD`; proc(5), `/proc/sys/vm/max_map_count`).
+fn loan_chunk_pages(page: usize, extent_pages: u64) -> usize {
+    let extent = usize::try_from(extent_pages).unwrap_or(usize::MAX).max(1);
+    #[cfg(target_os = "linux")]
+    {
+        let huge = crate::port::mmap::huge_page_size()
+            .checked_div(page.max(1))
+            .unwrap_or(0);
+        extent.saturating_mul(huge.div_ceil(extent).max(1))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = page;
+        extent
+    }
+}
+
 impl Cache {
     /// A cache of `pages` pages of `page` bytes, at least one, for a store of `extent_pages`
     /// pages an extent. Its memory is taken as reads want it ([`Self::reserve`]).
@@ -296,6 +330,10 @@ impl Cache {
             out_most: 0,
             held: Vec::new(),
             spares: Vec::new(),
+            room_pages: 0,
+            spare_pages: 0,
+            lent_pages: 0,
+            loan_chunk: loan_chunk_pages(page, extent_pages),
             made: 0,
             loaned: 0,
             loans: 0,
@@ -497,7 +535,7 @@ impl Cache {
 
     /// Pages the chunks have room for, made into slots or not.
     fn room(&self) -> usize {
-        self.sizes.iter().fold(0usize, |a, &p| a.saturating_add(p))
+        self.room_pages
     }
 
     /// One more slot, its page written once so the OS maps it now: the last chunk's next page,
@@ -560,8 +598,10 @@ impl Cache {
 
     /// Room for up to `pages` pages a worker will write, as a [`Kept`] to fill: spare chunks'
     /// memory first, already mapped, then fresh memory within the limit, less the room the chunks
-    /// and earlier loans hold, while the machine has it as a chunk of the cache's own needs it.
-    /// None while a chunk retires.
+    /// and earlier loans hold, while the machine has it as a chunk of the cache's own needs it,
+    /// in buffers of at most [`Self::loan_chunk`] pages, each its own chunk once back, so the
+    /// pages a later job's forgetting frees together free their chunk together. None while a
+    /// chunk retires.
     pub fn lend(&mut self, pages: usize) -> Option<Kept> {
         if self.retiring.is_some() || pages == 0 {
             return None;
@@ -589,6 +629,8 @@ impl Cache {
             let mut buf = std::mem::take(chunk);
             buf.clear();
             *h = Held::Lent;
+            self.spare_pages = self.spare_pages.saturating_sub(size);
+            self.lent_pages = self.lent_pages.saturating_add(size);
             room = room.saturating_add(size);
             bufs.push(Loaned {
                 chunk: Some(c),
@@ -602,12 +644,20 @@ impl Cache {
         if fresh > 0
             && let Some(bytes) = fresh.checked_mul(self.page)
             && self.machine_spares(bytes)
-            && bufs.try_reserve(1).is_ok()
         {
-            let mut buf = Vec::new();
-            if buf.try_reserve_exact(bytes).is_ok() {
-                self.lent = self.lent.saturating_add(fresh);
-                room = room.saturating_add(fresh);
+            let mut left = fresh;
+            while left > 0 {
+                let n = left.min(self.loan_chunk.max(1));
+                let Some(bytes) = n.checked_mul(self.page) else {
+                    break;
+                };
+                let mut buf = Vec::new();
+                if bufs.try_reserve(1).is_err() || buf.try_reserve_exact(bytes).is_err() {
+                    break;
+                }
+                self.lent = self.lent.saturating_add(n);
+                room = room.saturating_add(n);
+                left = left.saturating_sub(n);
                 bufs.push(Loaned { chunk: None, buf });
             }
         }
@@ -647,10 +697,16 @@ impl Cache {
         self.lent = self.lent.saturating_sub(fresh);
         for Loaned { chunk, buf } in bufs {
             if let Some(c) = chunk
-                && let (Some(slot), Some(h)) = (self.chunks.get_mut(c), self.held.get_mut(c))
+                && let (Some(slot), Some(&size), Some(h)) = (
+                    self.chunks.get_mut(c),
+                    self.sizes.get(c),
+                    self.held.get_mut(c),
+                )
             {
                 *slot = buf;
                 *h = Held::Spare;
+                self.lent_pages = self.lent_pages.saturating_sub(size);
+                self.spare_pages = self.spare_pages.saturating_add(size);
                 self.spares.push(c);
             }
         }
@@ -659,11 +715,7 @@ impl Cache {
 
     /// The pages out on loan now: fresh room lent, and spare chunks lent again.
     fn out_on_loan(&self) -> usize {
-        self.held
-            .iter()
-            .zip(&self.sizes)
-            .filter(|(h, _)| matches!(h, Held::Lent))
-            .fold(self.lent, |a, (_, &s)| a.saturating_add(s))
+        self.lent.saturating_add(self.lent_pages)
     }
 
     /// Gives back spare chunks' memory beyond what the loans may take: the most they have had out
@@ -673,13 +725,7 @@ impl Cache {
     /// any loan's need (10 GiB at 100M, docs/research/64 §8); this bounds them.
     fn shed_spare(&mut self) {
         let need = self.out_most.saturating_sub(self.out_on_loan());
-        let mut spare = self
-            .held
-            .iter()
-            .zip(&self.sizes)
-            .filter(|(h, _)| matches!(h, Held::Spare))
-            .fold(0usize, |a, (_, &s)| a.saturating_add(s));
-        while spare > need {
+        while self.spare_pages > need {
             let Some(c) = self.spares.pop() else {
                 break;
             };
@@ -692,7 +738,8 @@ impl Cache {
             {
                 *chunk = Vec::new();
                 self.loaned = self.loaned.saturating_sub(*size);
-                spare = spare.saturating_sub(*size);
+                self.spare_pages = self.spare_pages.saturating_sub(*size);
+                self.room_pages = self.room_pages.saturating_sub(*size);
                 *size = 0;
                 *h = Held::Hollow;
             }
@@ -749,6 +796,7 @@ impl Cache {
                     let c = self.chunks.len();
                     self.starts.push(self.slots.len());
                     self.sizes.push(size);
+                    self.room_pages = self.room_pages.saturating_add(size);
                     self.chunks.push(buf);
                     self.held.push(Held::Kept(0));
                     self.loaned = self.loaned.saturating_add(size);
@@ -798,9 +846,13 @@ impl Cache {
             self.loan_kept = self
                 .loan_kept
                 .saturating_add(u64::try_from(live).unwrap_or(u64::MAX));
-            if let Some(h) = self.held.get_mut(c) {
+            if let (Some(h), Some(&size)) = (self.held.get_mut(c), self.sizes.get(c)) {
+                if *h == Held::Lent {
+                    self.lent_pages = self.lent_pages.saturating_sub(size);
+                }
                 *h = if live == 0 {
                     self.spares.push(c);
+                    self.spare_pages = self.spare_pages.saturating_add(size);
                     Held::Spare
                 } else {
                     Held::Kept(live)
@@ -834,6 +886,8 @@ impl Cache {
                     if let Some(h) = self.held.get_mut(c) {
                         *h = Held::Spare;
                     }
+                    let size = self.sizes.get(c).copied().unwrap_or(0);
+                    self.spare_pages = self.spare_pages.saturating_add(size);
                     self.spares.push(c);
                     self.shed_spare();
                 }
@@ -886,6 +940,7 @@ impl Cache {
         }
         self.starts.push(self.slots.len());
         self.sizes.push(pages);
+        self.room_pages = self.room_pages.saturating_add(pages);
         self.chunks.push(chunk);
         self.held.push(Held::Grown);
         true
@@ -1234,6 +1289,8 @@ impl Cache {
             {
                 *chunk = Vec::new();
                 self.loaned = self.loaned.saturating_sub(*size);
+                self.spare_pages = self.spare_pages.saturating_sub(*size);
+                self.room_pages = self.room_pages.saturating_sub(*size);
                 *size = 0;
                 *h = Held::Hollow;
             }
@@ -1280,8 +1337,13 @@ impl Cache {
                         .saturating_sub(self.slots.len().saturating_sub(first));
                 }
                 Some(Held::Hollow) => {}
+                Some(Held::Spare) => {
+                    self.loaned = self.loaned.saturating_sub(pages);
+                    self.spare_pages = self.spare_pages.saturating_sub(pages);
+                }
                 _ => self.loaned = self.loaned.saturating_sub(pages),
             }
+            self.room_pages = self.room_pages.saturating_sub(pages);
             self.slots.truncate(first);
             self.chunks.pop();
             self.starts.pop();

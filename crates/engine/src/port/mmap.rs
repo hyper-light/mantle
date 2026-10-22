@@ -34,6 +34,26 @@ pub fn page_size() -> usize {
     }
 }
 
+/// The size of a transparent huge page: the kernel's own figure
+/// (`/sys/kernel/mm/transparent_hugepage/hpage_pmd_size`, Documentation/admin-guide/mm/transhuge.rst),
+/// read once; where it cannot be read, what one page-table page of 8-byte entries maps, which a PMD
+/// entry covers on the 64-bit architectures Linux runs mantle on (x86_64 and aarch64: 2 MiB on 4 KiB
+/// pages, 32 MiB on 16 KiB, 512 MiB on 64 KiB).
+#[cfg(target_os = "linux")]
+pub fn huge_page_size() -> usize {
+    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| {
+                let page = page_size();
+                page.saturating_mul(page.checked_div(8).unwrap_or(0))
+            })
+    })
+}
+
 /// `words` 8-byte words of anonymous memory, zero until written and resident only where written,
 /// released when dropped.
 pub struct LazyZeroed {

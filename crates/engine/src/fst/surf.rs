@@ -17,20 +17,17 @@ use std::ops::ControlFlow;
 use super::packed::MAX_WIDTH;
 use super::trie::{Trie, TrieBuilder, Width};
 use crate::error::{Error, Malformed};
+use crate::util::keys::Pieces;
 
 /// Bytes a suffix of at most 32 bits spans.
 const SUFFIX_BYTES: usize = 4;
 
 /// The `n` bits of `key` after its first `at` bytes, zero past its end, most significant first.
-fn suffix_of(key: &[u8], at: usize, n: u32) -> u32 {
+fn suffix_of(key: Pieces<'_>, at: usize, n: u32) -> u32 {
     let bytes = n.div_ceil(8) as usize;
     let mut v = 0u64;
     for i in 0..bytes {
-        let b = at
-            .checked_add(i)
-            .and_then(|j| key.get(j))
-            .copied()
-            .unwrap_or(0);
+        let b = at.checked_add(i).and_then(|j| key.get(j)).unwrap_or(0);
         v = (v << 8) | u64::from(b);
     }
     let spare = u32::try_from(bytes.saturating_mul(8))
@@ -90,7 +87,7 @@ impl Surf {
             // A stored prefix of `from`: its keys at or past `from` are those whose bits after
             // the prefix are at least `from`'s.
             let p = from.get(..len).unwrap_or(&[]);
-            if s >= suffix_of(from, len, n) && starts_below(p, s, n, end) {
+            if s >= suffix_of(Pieces::whole(from), len, n) && starts_below(p, s, n, end) {
                 ControlFlow::Break(())
             } else {
                 ControlFlow::Continue(())
@@ -181,7 +178,7 @@ impl SurfBuilder {
     /// greater, as the branch builder does as it adds an entry, so the filter keeps no copy of
     /// a key. A key goes into the trie once the next is known, cut one byte past what it shares
     /// with either neighbour: here `before`, and the last at [`Self::finish`].
-    pub fn push(&mut self, before: Option<&[u8]>, shared: usize) -> Result<(), Error> {
+    pub fn push(&mut self, before: Option<Pieces<'_>>, shared: usize) -> Result<(), Error> {
         match (before, self.pending) {
             (Some(key), true) => self.cut(key, shared)?,
             (None, false) => {}
@@ -200,19 +197,18 @@ impl SurfBuilder {
     /// neighbour (`shared_after` with the next). Two neighbours cut so differ at the byte the
     /// whole keys first differ at, `shared_before`, which is so what the trie is told they
     /// share.
-    fn cut(&mut self, key: &[u8], shared_after: usize) -> Result<(), Error> {
+    fn cut(&mut self, key: Pieces<'_>, shared_after: usize) -> Result<(), Error> {
         let len = self
             .shared_before
             .max(shared_after)
             .saturating_add(1)
             .min(key.len());
         let s = suffix_of(key, len, self.suffix);
-        self.trie
-            .add_after(key.get(..len).unwrap_or(&[]), self.shared_before, s)
+        self.trie.add_after(key.take(len), self.shared_before, s)
     }
 
     /// The filter of the keys pushed, `last` the last of them (none when there was none).
-    pub fn finish(&mut self, last: Option<&[u8]>) -> Result<Surf, Error> {
+    pub fn finish(&mut self, last: Option<Pieces<'_>>) -> Result<Surf, Error> {
         match (last, self.pending) {
             (Some(key), true) => {
                 self.cut(key, 0)?;
@@ -257,10 +253,10 @@ mod tests {
         let mut before: Option<&Vec<u8>> = None;
         for k in set {
             let shared = before.map_or(0, |p| p.iter().zip(k).take_while(|(x, y)| x == y).count());
-            b.push(before.map(Vec::as_slice), shared).unwrap();
+            b.push(before.map(|k| Pieces::whole(k)), shared).unwrap();
             before = Some(k);
         }
-        b.finish(before.map(Vec::as_slice)).unwrap()
+        b.finish(before.map(|k| Pieces::whole(k))).unwrap()
     }
 
     /// The filter a stream of keys and shared prefixes builds is byte for byte the one cut from
@@ -285,7 +281,7 @@ mod tests {
                         .map_or(0, |p| lcp(p, k));
                     let after = keys.get(i + 1).map_or(0, |n| lcp(k, n));
                     let len = before.max(after).saturating_add(1).min(k.len());
-                    whole.add(&k[..len], suffix_of(k, len, suffix)).unwrap();
+                    whole.add(&k[..len], suffix_of(Pieces::whole(k), len, suffix)).unwrap();
                 }
                 let expected = Surf {
                     trie: whole.finish().unwrap(),
@@ -301,10 +297,10 @@ mod tests {
 
     #[test]
     fn suffix_bits_and_bytes_agree() {
-        assert_eq!(suffix_of(b"ab", 0, 8), u32::from(b'a'));
-        assert_eq!(suffix_of(b"ab", 1, 4), u32::from(b'b') >> 4);
-        assert_eq!(suffix_of(b"ab", 1, 12), u32::from(b'b') << 4);
-        assert_eq!(suffix_of(b"ab", 2, 32), 0);
+        assert_eq!(suffix_of(Pieces::whole(b"ab"), 0, 8), u32::from(b'a'));
+        assert_eq!(suffix_of(Pieces::whole(b"ab"), 1, 4), u32::from(b'b') >> 4);
+        assert_eq!(suffix_of(Pieces::whole(b"ab"), 1, 12), u32::from(b'b') << 4);
+        assert_eq!(suffix_of(Pieces::whole(b"ab"), 2, 32), 0);
         assert_eq!(suffix_bytes(u32::from(b'b') << 4, 12), ([b'b', 0, 0, 0], 1));
         assert_eq!(suffix_bytes(0x0_1, 12), ([0, 0x10, 0, 0], 2));
         assert_eq!(suffix_bytes(0, 8), ([0; 4], 0));

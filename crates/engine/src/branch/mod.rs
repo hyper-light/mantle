@@ -31,6 +31,7 @@ pub(crate) mod point;
 
 use crate::error::{Error, Malformed};
 use crate::fst::surf::{Surf, SurfBuilder};
+use crate::util::keys::Pieces;
 use crate::fst::trie::{Trie, TrieBuilder, Width};
 use crate::store::{MIN_PAGE, Run, Span, Store};
 use hyper_block::block::BlockFile;
@@ -91,6 +92,18 @@ fn key_head(suffix: &[u8]) -> u32 {
     u32::from_be_bytes(b)
 }
 
+/// [`key_head`] of a suffix read in pieces.
+fn key_head_of(suffix: Pieces<'_>) -> u32 {
+    if let Some(b) = suffix.head.first_chunk::<KEY_HEAD>() {
+        return u32::from_be_bytes(*b);
+    }
+    let mut b = [0u8; KEY_HEAD];
+    for (at, d) in b.iter_mut().enumerate() {
+        *d = suffix.get(at).unwrap_or(0);
+    }
+    u32::from_be_bytes(b)
+}
+
 /// A built branch: its root page, its height (1 for a lone leaf), its entries, and the extents
 /// holding its pages, each held once by the branch.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -147,17 +160,57 @@ fn u16_of(n: usize) -> Result<[u8; 2], Error> {
         .map_err(|_| corrupt(Malformed::TooLarge))
 }
 
-/// One page being filled: its entries, each its key and then its encoded rest, back to back in
-/// one buffer, until it is full.
+/// A staged entry's place in its page's buffer: the bytes of its key it shares with the page's
+/// first key, and where its staged key and its rest end. Packed in a word as 16, 24 and 24 bits: a
+/// key is at most half a page ([`Builder::fits`]) and a page at most 64 KiB, so its shared bytes
+/// stay below 2^16, and the buffer holds at most a page's payload and its first key, within 2^24.
+#[derive(Clone, Copy)]
+struct Ends {
+    shared: usize,
+    key: usize,
+    rest: usize,
+}
+
+impl Ends {
+    const SHARED_BITS: u32 = 16;
+    const END_BITS: u32 = 24;
+    const END_MASK: u64 = (1 << Self::END_BITS) - 1;
+
+    /// The word, none when a field passes its bits.
+    fn packed(self) -> Option<u64> {
+        let fits = |n: usize, bits: u32| u64::try_from(n).ok().filter(|&n| n >> bits == 0);
+        let shared = fits(self.shared, Self::SHARED_BITS)?;
+        let key = fits(self.key, Self::END_BITS)?;
+        let rest = fits(self.rest, Self::END_BITS)?;
+        Some(shared << (2 * Self::END_BITS) | key << Self::END_BITS | rest)
+    }
+
+    fn of(word: u64) -> Self {
+        let field = |n: u64| usize::try_from(n).unwrap_or(0);
+        Self {
+            shared: field(word >> (2 * Self::END_BITS)),
+            key: field((word >> Self::END_BITS) & Self::END_MASK),
+            rest: field(word & Self::END_MASK),
+        }
+    }
+}
+
+/// One page being filled: its entries back to back in one buffer, until it is full. Its first
+/// entry's key is staged whole, and each later entry's key only past the bytes it shares with
+/// the first, which its encoding reads back from the first: the page's keys being in order, a
+/// key shares with the first what every pair between them shares, the page's prefix as that key
+/// leaves it. A staged page so holds no more than its encoding and its first key, where staging
+/// keys whole held hundreds of pages' bytes for keys sharing long prefixes (4.3 MB a 24 KiB page
+/// of 2,132-byte keys).
 #[derive(Debug, Default)]
 pub(crate) struct Page {
-    /// Each entry's key, then its bytes after its suffix length (operation and value, or child
-    /// and count).
+    /// Each entry's staged key, then its bytes after its suffix length (operation and value, or
+    /// child and count).
     bytes: Vec<u8>,
-    /// Where each entry's key and its rest end in `bytes`. A page stages whole keys, each at
-    /// most half a page ([`Builder::fits`]), so its bytes stay far within what 32 bits reach.
-    ends: Vec<[u32; 2]>,
-    /// The keys' bytes and the rests' bytes staged, each summed: what the page's size counts.
+    /// For each entry, packed in a word: the bytes of its key it shares with the first and does
+    /// not stage, and where its staged key and its rest end in `bytes` ([`Ends`]).
+    ends: Vec<u64>,
+    /// The keys' bytes and the rests' bytes, each summed: what the page's size counts.
     key_bytes: usize,
     rest_bytes: usize,
     prefix: usize,
@@ -167,7 +220,8 @@ pub(crate) struct Page {
 
 impl Page {
     /// A page with room reserved for the most a page of `capacity` payload bytes can hold, so
-    /// filling it never grows a buffer: its keys whole and its rests within twice the payload,
+    /// filling it never grows a buffer: its first key, at most half the payload, and each later
+    /// key's bytes past the page's prefix and its rest, within the payload, so within twice it;
     /// and an entry's ends for each offset and suffix length the payload has room for.
     fn with_capacity(capacity: usize) -> Self {
         let entries = capacity.checked_div(SLOT.saturating_add(2)).unwrap_or(0);
@@ -185,26 +239,38 @@ impl Page {
         self.ends.len()
     }
 
-    fn key(&self, i: usize) -> &[u8] {
+    /// Entry `i`'s staged key: the first entry's whole, a later one's past what it shares with
+    /// the first.
+    fn staged(&self, i: usize) -> &[u8] {
         let start = i
             .checked_sub(1)
             .and_then(|j| self.ends.get(j))
-            .and_then(|&[_, rest]| usize::try_from(rest).ok())
-            .unwrap_or(0);
-        let end = self
-            .ends
-            .get(i)
-            .and_then(|&[key, _]| usize::try_from(key).ok())
-            .unwrap_or(start);
+            .map_or(0, |&e| Ends::of(e).rest);
+        let end = self.ends.get(i).map_or(start, |&e| Ends::of(e).key);
         self.bytes.get(start..end).unwrap_or(&[])
+    }
+
+    /// The first entry's key.
+    fn first(&self) -> &[u8] {
+        self.staged(0)
+    }
+
+    /// Entry `i`'s key, read where it is staged: the bytes it shares with the first, from the
+    /// first, then its own.
+    fn key(&self, i: usize) -> Pieces<'_> {
+        let shared = self.ends.get(i).map_or(0, |&e| Ends::of(e).shared);
+        Pieces {
+            head: self.first().get(..shared).unwrap_or(&[]),
+            tail: self.staged(i),
+        }
     }
 
     fn rest(&self, i: usize) -> &[u8] {
         match self.ends.get(i) {
-            Some(&[key, rest]) => match (usize::try_from(key), usize::try_from(rest)) {
-                (Ok(key), Ok(rest)) => self.bytes.get(key..rest).unwrap_or(&[]),
-                _ => &[],
-            },
+            Some(&e) => {
+                let e = Ends::of(e);
+                self.bytes.get(e.key..e.rest).unwrap_or(&[])
+            }
             None => &[],
         }
     }
@@ -222,7 +288,8 @@ impl Page {
             .checked_add(rest)
     }
 
-    /// Stages an entry: its ends are counted before a byte is, so a refusal stages nothing.
+    /// Stages an entry whose key leaves the page's prefix `prefix`, which a later entry's key
+    /// shares with the first: its ends are counted before a byte is, so a refusal stages nothing.
     fn push(
         &mut self,
         key: &[u8],
@@ -231,20 +298,23 @@ impl Page {
         under: u64,
         prefix: usize,
     ) -> Result<(), Error> {
-        let key_end = self.bytes.len().checked_add(key.len());
+        let shared = if self.len() == 0 { 0 } else { prefix };
+        let own = key.get(shared..).ok_or(corrupt(Malformed::Truncated))?;
+        let key_end = self.bytes.len().checked_add(own.len());
         let rest = head.len().checked_add(tail.len());
         let rest_end = key_end.zip(rest).and_then(|(k, r)| k.checked_add(r));
-        let (Some(key_end), Some(rest_end), Some(rest)) = (
-            key_end.and_then(|e| u32::try_from(e).ok()),
-            rest_end.and_then(|e| u32::try_from(e).ok()),
+        let (Some(ends), Some(rest)) = (
+            key_end
+                .zip(rest_end)
+                .and_then(|(key, rest)| Ends { shared, key, rest }.packed()),
             rest,
         ) else {
             return Err(corrupt(Malformed::TooLarge));
         };
-        self.bytes.extend_from_slice(key);
+        self.bytes.extend_from_slice(own);
         self.bytes.extend_from_slice(head);
         self.bytes.extend_from_slice(tail);
-        self.ends.push([key_end, rest_end]);
+        self.ends.push(ends);
         self.key_bytes = self.key_bytes.saturating_add(key.len());
         self.rest_bytes = self.rest_bytes.saturating_add(rest);
         self.prefix = prefix;
@@ -268,7 +338,7 @@ impl Page {
         let too_large = || corrupt(Malformed::TooLarge);
         let n = self.len();
         let prefix = self
-            .key(0)
+            .first()
             .get(..self.prefix)
             .ok_or(corrupt(Malformed::Truncated))?;
         let suffixes = self
@@ -309,13 +379,14 @@ impl Page {
             heads.as_chunks_mut::<KEY_HEAD>().0,
         );
         for ((i, slot), head) in table.iter_mut().enumerate().zip(heads.iter_mut()) {
-            let suffix = self
-                .key(i)
-                .get(self.prefix..)
-                .ok_or(corrupt(Malformed::Truncated))?;
+            let key = self.key(i);
+            if key.len() < self.prefix {
+                return Err(corrupt(Malformed::Truncated));
+            }
+            let suffix = key.skip(self.prefix);
             let rest = self.rest(i);
             *slot = u16_of(at)?;
-            *head = key_head(suffix).to_be_bytes();
+            *head = key_head_of(suffix).to_be_bytes();
             let (len, tail) = std::mem::take(&mut body)
                 .split_at_mut_checked(2)
                 .ok_or_else(too_large)?;
@@ -325,9 +396,13 @@ impl Page {
                 .ok_or_else(too_large)?;
             r.copy_from_slice(rest);
             let (k, tail) = tail
-                .split_at_mut_checked(suffix.len())
+                .split_at_mut_checked(suffix.head.len())
                 .ok_or_else(too_large)?;
-            k.copy_from_slice(suffix);
+            k.copy_from_slice(suffix.head);
+            let (k, tail) = tail
+                .split_at_mut_checked(suffix.tail.len())
+                .ok_or_else(too_large)?;
+            k.copy_from_slice(suffix.tail);
             body = tail;
             at = at
                 .checked_add(2)
@@ -561,16 +636,16 @@ impl Builder {
         let prev = match self.levels.first() {
             _ if self.count == 0 => None,
             Some(page) if page.len() > 0 => Some(page.key(page.len().saturating_sub(1))),
-            _ => Some(self.prev_last.as_slice()),
+            _ => Some(Pieces::whole(&self.prev_last)),
         };
         // The bytes the key shares with the one before it: where the order check looks, what
         // the range filter cuts keys by, and with the page's prefix, the page's prefix after.
         let common = match prev {
             Some(prev) => {
-                let common = shared(prev, key);
+                let common = prev.common_prefix(key);
                 let greater = match (prev.get(common), key.get(common)) {
                     (None, Some(_)) => true,
-                    (Some(a), Some(b)) => b > a,
+                    (Some(a), Some(&b)) => b > a,
                     _ => false,
                 };
                 if !greater {
@@ -683,7 +758,7 @@ impl Builder {
                 // `common`. Keys in order share with the page's first what each pair between
                 // them shares at least: the page's prefix and that, the lesser.
                 (None, Some(common)) => page.prefix.min(common),
-                _ => page.prefix.min(shared(page.key(0), key)),
+                _ => page.prefix.min(shared(page.first(), key)),
             };
             let rest = head
                 .len()
@@ -757,7 +832,7 @@ impl Builder {
                 .ok_or(corrupt(Malformed::TooLarge))?,
         );
         first.clear();
-        first.extend_from_slice(page.key(0));
+        first.extend_from_slice(page.first());
         let total = page.total;
         let entries = if level == 0 { page.len() } else { 0 };
         let address = self.page(store)?;
@@ -791,8 +866,8 @@ impl Builder {
             )?;
             if let Some(page) = self.levels.first() {
                 self.prev_last.clear();
-                self.prev_last
-                    .extend_from_slice(page.key(page.len().saturating_sub(1)));
+                page.key(page.len().saturating_sub(1))
+                    .extend_into(&mut self.prev_last);
             }
         }
         if let Some(page) = self.levels.get_mut(level) {
@@ -976,7 +1051,7 @@ impl Builder {
         self.index_trie = Some(trie);
         // The seal wrote the last leaf first: its last key is the branch's.
         let range = self.keys.finish(if self.count > 0 {
-            Some(self.prev_last.as_slice())
+            Some(Pieces::whole(&self.prev_last))
         } else {
             None
         })?;

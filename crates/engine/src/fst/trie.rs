@@ -25,6 +25,7 @@ use std::ops::ControlFlow;
 use super::bits::{Bits, Grow};
 use super::packed::{MAX_WIDTH, Packed, width_of};
 use crate::error::{Error, Malformed};
+use crate::util::keys::Pieces;
 
 fn corrupt() -> Error {
     Error::Corruption {
@@ -245,9 +246,9 @@ impl Level {
 
     /// Adds `key`'s label at depth `d`, the first of a new node when `first`, with `value` when
     /// the label ends the key.
-    fn push(&mut self, key: &[u8], d: usize, first: bool, value: u32) -> Result<(), Error> {
+    fn push(&mut self, key: Pieces<'_>, d: usize, first: bool, value: u32) -> Result<(), Error> {
         let last = d.saturating_add(1) == key.len();
-        self.labels.push(key.get(d).copied().unwrap_or(0));
+        self.labels.push(key.get(d).unwrap_or(0));
         self.has_child.push(!last);
         self.louds.push(first);
         if last {
@@ -364,7 +365,7 @@ impl TrieBuilder {
         } else {
             crate::util::keys::common_prefix(&self.prev, key)
         };
-        self.push_key(key, lcp, value)?;
+        self.push_key(Pieces::whole(key), lcp, value)?;
         self.prev.clear();
         self.prev.extend_from_slice(key);
         Ok(())
@@ -373,8 +374,8 @@ impl TrieBuilder {
     /// [`Self::add`] for a caller that holds the keys: `key` shares its first `lcp` bytes with
     /// the key added before it, and the caller has checked it is the greater. The builder keeps
     /// no copy of it, so a range filter's keys are copied once, by the branch builder that holds
-    /// them ([`super::surf::SurfBuilder::push`]).
-    pub fn add_after(&mut self, key: &[u8], lcp: usize, value: u32) -> Result<(), Error> {
+    /// them where its page stages them ([`super::surf::SurfBuilder::push`]).
+    pub fn add_after(&mut self, key: Pieces<'_>, lcp: usize, value: u32) -> Result<(), Error> {
         if self.keys > 0 && !self.after {
             return Err(Error::InvalidArgument {
                 what: "a trie's keys given both with and without their shared prefixes",
@@ -392,7 +393,7 @@ impl TrieBuilder {
     }
 
     /// Adds `key`, sharing `lcp` bytes with the key before it, to the levels it reaches.
-    fn push_key(&mut self, key: &[u8], lcp: usize, value: u32) -> Result<(), Error> {
+    fn push_key(&mut self, key: Pieces<'_>, lcp: usize, value: u32) -> Result<(), Error> {
         if width_of(value) > self.width {
             return Err(Error::InvalidArgument {
                 what: "a trie value wider than its width",

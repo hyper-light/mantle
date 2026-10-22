@@ -59,6 +59,88 @@ pub fn equal(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && common_prefix(a, b) == a.len()
 }
 
+/// A key read where it lies in two pieces, back to back: the bytes it shares with another key,
+/// read from that key, and its own bytes past them, as a branch page stages a key after its
+/// first (`branch::Page`). Nothing is copied to read it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Pieces<'a> {
+    pub head: &'a [u8],
+    pub tail: &'a [u8],
+}
+
+impl<'a> Pieces<'a> {
+    /// `key` in one piece.
+    #[inline]
+    pub const fn whole(key: &'a [u8]) -> Self {
+        Self {
+            head: key,
+            tail: &[],
+        }
+    }
+
+    /// The key's bytes.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.head.len().saturating_add(self.tail.len())
+    }
+
+    /// Whether the key holds no byte.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.head.is_empty() && self.tail.is_empty()
+    }
+
+    /// The key's byte at `at`.
+    #[inline]
+    pub fn get(&self, at: usize) -> Option<u8> {
+        match at.checked_sub(self.head.len()) {
+            None => self.head.get(at).copied(),
+            Some(past) => self.tail.get(past).copied(),
+        }
+    }
+
+    /// The key's first `len` bytes, at most its own.
+    #[inline]
+    pub fn take(&self, len: usize) -> Self {
+        match len.checked_sub(self.head.len()) {
+            None => Self::whole(self.head.get(..len).unwrap_or(self.head)),
+            Some(past) => Self {
+                head: self.head,
+                tail: self.tail.get(..past).unwrap_or(self.tail),
+            },
+        }
+    }
+
+    /// The key past its first `len` bytes.
+    #[inline]
+    pub fn skip(&self, len: usize) -> Self {
+        match len.checked_sub(self.head.len()) {
+            None => Self {
+                head: self.head.get(len..).unwrap_or(&[]),
+                tail: self.tail,
+            },
+            Some(past) => Self::whole(self.tail.get(past..).unwrap_or(&[])),
+        }
+    }
+
+    /// The length of the prefix the key and `key` share.
+    #[inline]
+    pub fn common_prefix(&self, key: &[u8]) -> usize {
+        let head = common_prefix(self.head, key);
+        if head < self.head.len() {
+            return head;
+        }
+        head.saturating_add(common_prefix(self.tail, key.get(head..).unwrap_or(&[])))
+    }
+
+    /// The key's bytes appended to `into`.
+    #[inline]
+    pub fn extend_into(&self, into: &mut Vec<u8>) {
+        into.extend_from_slice(self.head);
+        into.extend_from_slice(self.tail);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

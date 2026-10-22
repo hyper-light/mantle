@@ -22,6 +22,7 @@ use std::time::Instant;
 
 use hyper_measure::alloc;
 use mantle_engine::fst::surf::SurfBuilder;
+use mantle_engine::util::keys::Pieces;
 
 #[global_allocator]
 static ALLOCATOR: alloc::Counting = alloc::Counting;
@@ -157,12 +158,12 @@ fn main() {
             for k in &set {
                 let shared =
                     before.map_or(0, |p| p.iter().zip(k).take_while(|(x, y)| x == y).count());
-                b.push(before.map(Vec::as_slice), shared).unwrap();
+                b.push(before.map(|k| Pieces::whole(k)), shared).unwrap();
                 before = Some(k);
             }
             let added = t.elapsed().as_secs_f64();
             let t = Instant::now();
-            let f = b.finish(before.map(Vec::as_slice)).unwrap();
+            let f = b.finish(before.map(|k| Pieces::whole(k))).unwrap();
             let finish = t.elapsed().as_secs_f64();
             let build = added + finish;
             let mut scratch = Vec::with_capacity(64);

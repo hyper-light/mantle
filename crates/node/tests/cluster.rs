@@ -1093,6 +1093,8 @@ struct Cell {
     volume: Option<VolumeSettings>,
     /// The next tag a chunk order is asked under.
     next_tag: u64,
+    /// The nodes told a chunk bound other than the cell's, by id.
+    chunk_bytes: BTreeMap<u64, u64>,
 }
 
 impl Drop for Cell {
@@ -1129,6 +1131,18 @@ impl Cell {
         spares: u64,
         volume: Option<VolumeSettings>,
     ) -> Self {
+        Self::start_bounded(engines, network, voters, spares, volume, BTreeMap::new())
+    }
+
+    /// `start_spared`, the nodes `chunk_bytes` names told those chunk bounds.
+    fn start_bounded(
+        engines: Engines,
+        network: Network,
+        voters: u64,
+        spares: u64,
+        volume: Option<VolumeSettings>,
+        chunk_bytes: BTreeMap<u64, u64>,
+    ) -> Self {
         let nodes = voters + spares;
         let (tell, reports) = mpsc::channel();
         let mut cell = Cell {
@@ -1150,6 +1164,7 @@ impl Cell {
             learns: Vec::new(),
             volume,
             next_tag: 0,
+            chunk_bytes,
         };
         for id in 1..=voters {
             cell.spawn(id);
@@ -1256,6 +1271,7 @@ impl Cell {
             dir: dir.join("device"),
             ..template
         });
+        let chunk_bytes = self.chunk_bytes.get(&id).copied().unwrap_or(CHUNK_BYTES);
         let thread = std::thread::spawn(move || {
             // A panic on the node's thread is told as its failure, so a wait on it ends.
             let failed = tell.clone();
@@ -1271,6 +1287,7 @@ impl Cell {
                     Engines::Model => {
                         let mut settings = pki.settings(id, &dir, first_range(Model::default()));
                         settings.storage = storage;
+                        settings.chunk_bytes = chunk_bytes;
                         rt.block_on(run(settings, taken, tell)).unwrap();
                     }
                     Engines::Mantle => {
@@ -1279,6 +1296,7 @@ impl Cell {
                         mantle_engine::store::permit_blocking();
                         let mut settings = pki.settings(id, &dir, stored(&dir));
                         settings.storage = storage;
+                        settings.chunk_bytes = chunk_bytes;
                         rt.block_on(run(settings, taken, tell)).unwrap();
                     }
                 }
@@ -2160,7 +2178,17 @@ fn chunks_put_on_each_nodes_volume_read_back_whole_and_in_part_from_any_node() {
 
 #[test]
 fn a_chunk_refused_is_answered_why_by_the_node_that_refused_it() {
-    let mut cell = Cell::start_stored(Engines::Model, test_volume());
+    // Node 2 is told a chunk bound below what its volume holds, past this test's chunks: a chunk
+    // past it its volume would store, so only the bound refuses it.
+    let bound = 16_384u64;
+    let mut cell = Cell::start_bounded(
+        Engines::Model,
+        Network::Direct,
+        NODES,
+        0,
+        Some(test_volume()),
+        BTreeMap::from([(2, bound)]),
+    );
     let (own, peer) = (cell.volume_of(1), cell.volume_of(2));
     cell.connected(1, 2);
     let bytes = chunk_data(7, 10_000);
@@ -2217,6 +2245,17 @@ fn a_chunk_refused_is_answered_why_by_the_node_that_refused_it() {
     // More bytes than the transfer class carries in a reply.
     assert_eq!(
         cell.get_chunk(1, 2, peer, chunk_key(2), 0, CHUNK_BYTES + 1),
+        ChunkOutcome::Refused(ChunkStatus::TooLarge)
+    );
+    // A chunk past the largest a node's cell writes: refused by its sender before it goes, and
+    // by a peer whatever its sender's bound, before any room or buffer is taken for its body.
+    let past = chunk_data(9, usize::try_from(bound).unwrap() + 1);
+    assert_eq!(
+        cell.put_chunk(2, 1, own, chunk_key(3), &past),
+        ChunkOutcome::Refused(ChunkStatus::TooLarge)
+    );
+    assert_eq!(
+        cell.put_chunk(1, 2, peer, chunk_key(3), &past),
         ChunkOutcome::Refused(ChunkStatus::TooLarge)
     );
     cell.close();

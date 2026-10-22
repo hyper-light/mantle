@@ -2334,7 +2334,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// Replies a status alone and ends the exchange.
     /// A chunk put's head, checked before its body is read: what its body is read as, or the
     /// status it is answered with once its body is read and dropped (no such volume here, a head
-    /// that does not decode). `None` when the node has no room for its bytes now: refused unread.
+    /// that does not decode, a body past the largest chunk the cell's gateways write, which no
+    /// room is taken for and no buffer sized to). `None` when the node has no room for its bytes
+    /// now: refused unread.
     fn take_chunk_put(&mut self, exchange: ExchangeId, body: u64) -> Option<Arriving> {
         let head = self.driver.endpoint().head(exchange).unwrap_or_default();
         let Ok(put) = chunk::Put::decode(head) else {
@@ -2343,6 +2345,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(slot) = self.storage.holds(put.volume) else {
             return Some(Arriving::ChunkStatus(chunk::Status::NoVolume));
         };
+        if body > self.chunk_bytes {
+            return Some(Arriving::ChunkStatus(chunk::Status::TooLarge));
+        }
         if !self.storage.take_room(body) {
             return None;
         }
@@ -2501,7 +2506,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// Puts `bytes`, `key`'s whole chunk with the CRC-32C its writer computed, on `volume`, which
     /// `at` holds: this node's own volume in-process (node.md §5.5), or a peer's on the transfer
     /// class. Its outcome comes from [`Self::take_chunk`] under the number returned, at once when
-    /// it is refused before it goes (no such volume here). Refused when the node keeps as many
+    /// it is refused before it goes (no such volume here, or bytes past `chunk_bytes`). Refused
+    /// when the node keeps as many
     /// chunk asks out to its peers as it keeps: the node's own bound, not the volume's refusal.
     pub fn put_chunk(
         &mut self,
@@ -2516,6 +2522,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         let asked = self.next_chunk;
         self.next_chunk = asked.wrapping_add(1);
+        // A chunk past the largest the cell's gateways write is refused here as a peer refuses
+        // it, before it is queued or sent.
+        if u64::try_from(bytes.len()).map_or(true, |len| len > self.chunk_bytes) {
+            self.chunks_done
+                .push((asked, ChunkOutcome::Refused(chunk::Status::TooLarge)));
+            return Ok(asked);
+        }
         if at == self.id {
             let outcome = match self.storage.holds(volume) {
                 None => Some(ChunkOutcome::Refused(chunk::Status::NoVolume)),

@@ -250,6 +250,29 @@ pub fn issuer_batches(shard_batches: usize, depth: usize) -> usize {
     shard_batches.saturating_add(Pool::cores().saturating_mul(depth))
 }
 
+/// What a shard whose budget follows the machine knows of it ([`ShardDb::follow`],
+/// docs/research/65).
+#[derive(Debug)]
+struct Follow {
+    /// The shard's share of what the machine has for its ranges: the most its budget is.
+    bound: usize,
+    /// The shares the machine's free memory is divided into.
+    shares: usize,
+    /// What the shard leaves free of its share of the machine's free memory, beyond the steps
+    /// its gates admit: the kernel's share (docs/research/65).
+    reserve: usize,
+    /// The process's memory outside the shard's account at the last look ([`ShardDb::look_machine`]),
+    /// and when it was.
+    last: Option<(usize, std::time::Instant)>,
+    /// The workers' messages taken by the last look (`Trunk::pool_accepted`).
+    accepted: u64,
+    /// The most the process's memory outside the shard's account grew between two looks: its
+    /// resident memory less the budget's regions, the kept memtables and the memtables in
+    /// flight (the branches' metadata, workers' builders and spans, the allocator's free lists,
+    /// other shards' growth).
+    grew_most: usize,
+}
+
 /// A runtime task's rotation, resumed before its entry is inserted. Its overlap bound is
 /// measured once, not again after waiting for a worker.
 #[derive(Debug)]
@@ -399,6 +422,8 @@ pub struct ShardDb<F: BlockFile> {
     /// The memory budget for the cache and write memory together, write memory's share of it,
     /// and the store's counters when it was last divided ([`ShardDb::set_memory`]).
     memory: Option<usize>,
+    /// The machine the budget follows, when it does ([`ShardDb::follow`]).
+    follow: Option<Follow>,
     /// The cache of hot records point reads consult before the trunk, if the owner gave one,
     /// its share of the memory budget, and the gets it missed with their trunk lookups'
     /// nanoseconds (what a record-cache hit saves), since the last division.
@@ -801,6 +826,7 @@ impl<F: BlockFile> ShardDb<F> {
             write_reserved,
             cycle_pages: 0,
             memory: None,
+            follow: None,
             records: None,
             records_share: 0,
             cycle_written: 0,
@@ -1292,6 +1318,152 @@ impl<F: BlockFile> ShardDb<F> {
         self.set_memory(budget)
     }
 
+    /// Sizes the shard to a machine whose free memory `read` gives: a budget of at most `bound`,
+    /// which follows one of `shares` of the memory the machine has free less `reserve` as reads
+    /// and writes run ([`Self::look_machine`]), and the page cache growing only while the machine
+    /// has the memory.
+    pub fn follow(
+        &mut self,
+        bound: usize,
+        shares: usize,
+        reserve: usize,
+        read: fn() -> Option<u64>,
+    ) -> Result<(), Error> {
+        self.store.follow_machine(read);
+        self.set_memory(bound)?;
+        self.follow = Some(Follow {
+            bound,
+            shares: shares.max(1),
+            reserve,
+            last: None,
+            accepted: 0,
+            grew_most: 0,
+        });
+        Ok(())
+    }
+
+    /// The memory budget the shard holds its page cache, write memory, record cache and kept
+    /// memtables within now; none without one.
+    pub fn budget(&self) -> Option<usize> {
+        self.memory
+    }
+
+    /// Divides the machine's free memory again (docs/research/65): the budget becomes what its
+    /// regions and kept memtables hold now and this shard's share of the memory the machine has
+    /// free, less what it leaves free, never above its bound nor below what it cannot give back
+    /// ([`Self::floor_held`]). It leaves free its
+    /// share's reserve and the most the process's memory outside the shard's account has grown
+    /// between two looks ([`Follow::grew_most`]): what may grow before the next look with no gate
+    /// to ask. The gates keep their own steps' room as they admit them (twice a cache chunk, a
+    /// memtable), so the budget does not keep it again: kept twice, the cache's next chunk swung
+    /// the budget by itself from look to look (docs/research/65). Other processes' memory lowers
+    /// the free memory a look reads, not what the budget leaves. A budget that falls has the kept
+    /// memtables give memory back and the caches trimmed to their shares at once, not a few pages
+    /// an operation: the machine has no room for them. No reading leaves the budget as it is.
+    fn look_machine(&mut self) {
+        if self.follow.is_none() || self.memory.is_none() {
+            return;
+        }
+        let Some(free) = self.store.machine_free() else {
+            return;
+        };
+        let free = usize::try_from(free).unwrap_or(usize::MAX);
+        let held = self.regions_held().saturating_add(self.kept_held());
+        // The process's memory the shard does not account; none without a reading.
+        let accounted = held.saturating_add(self.memtable_bytes());
+        let outside = hyper_rt::machine::facts::Facts::resident_now().map_or(0, |resident| {
+            usize::try_from(resident)
+                .unwrap_or(usize::MAX)
+                .saturating_sub(accounted)
+        });
+        let floor = self.floor_held();
+        let now = std::time::Instant::now();
+        let accepted = self.trunk.pool_accepted();
+        let Some(follow) = self.follow.as_mut() else {
+            return;
+        };
+        if let Some((was, _)) = follow.last {
+            follow.grew_most = follow.grew_most.max(outside.saturating_sub(was));
+        }
+        follow.last = Some((outside, now));
+        follow.accepted = accepted;
+        let keep = follow.grew_most.saturating_add(follow.reserve);
+        let budget = held
+            .saturating_add(free.checked_div(follow.shares).unwrap_or(0))
+            .saturating_sub(keep)
+            .min(follow.bound)
+            .max(floor);
+        let Some(was) = self.memory.filter(|&m| m != budget) else {
+            return;
+        };
+        self.memory = Some(budget);
+        self.partition_memory();
+        self.fit_kept(false);
+        if budget < was {
+            let over = self.store.cache_over();
+            if over > 0 && !self.store.trim_cache(over) {
+                self.trim_cache = 0;
+            }
+            if let Some(r) = self.records.as_mut() {
+                let over = r.over();
+                if over > 0 && !r.trim(over) {
+                    self.trim_records = 0;
+                }
+            }
+            // A trim names what it evicts in its cache's ghost, which the cache is charged for:
+            // the floor is what that leaves, and the budget no less.
+            let floor = self.floor_held();
+            if budget < floor {
+                self.memory = Some(floor);
+                self.partition_memory();
+            } else {
+                self.grant();
+            }
+        }
+    }
+
+    /// The least a budget that follows the machine may be: what the shard cannot give back, its
+    /// write memory (fixed reservations and the queue's share, which only a tuning step moves) and
+    /// the caches' indexes and ghosts, charged to them whatever they hold.
+    fn floor_held(&self) -> usize {
+        let (cache_index, records_index) = self.index_bytes();
+        self.memory_held()
+            .1
+            .saturating_add(cache_index)
+            .saturating_add(records_index)
+    }
+
+    /// In idle time, looks at the machine ([`Self::look_machine`]) whenever a worker's message
+    /// has come back since the last look, as well as once a fill's time has passed: the workers'
+    /// memory moves with their jobs, and idle time is the shard's own to spend. A flush after a
+    /// fill, with no client work, would otherwise look only at the fill's pace while its
+    /// consolidations grow on every worker (docs/research/65).
+    fn look_when_idle(&mut self) {
+        let Some(follow) = self.follow.as_ref() else {
+            return;
+        };
+        if follow.last.is_some() && self.trunk.pool_accepted() != follow.accepted {
+            self.look_machine();
+        } else {
+            self.look_when_due();
+        }
+    }
+
+    /// Looks at the machine ([`Self::look_machine`]) once a fill's time has passed since the
+    /// last look, the cycle a rotation measures (`fill_ns`): a phase without rotations, gets
+    /// apart, follows the machine at the pace a fill does. Rotations look at their own pace, and
+    /// before a fill is measured only they do.
+    fn look_when_due(&mut self) {
+        let Some((_, at)) = self.follow.as_ref().and_then(|f| f.last) else {
+            return;
+        };
+        if self.fill_ns > 0
+            && u64::try_from(at.elapsed().as_nanos()).unwrap_or(u64::MAX) >= self.fill_ns
+        {
+            self.look_machine();
+        }
+    }
+
     /// Gives the shard `bytes` of memory for its page cache and its write memory together,
     /// fixed output reservations charged first, then divided between cache, queued writes and
     /// records by measured marginal gains ([`tune`]; research/36). Refused unchanged when the
@@ -1310,6 +1482,8 @@ impl<F: BlockFile> ShardDb<F> {
             return Err(Self::write_limit(bytes));
         }
         // Validate before changing any share or cache: held output buffers cannot be reclaimed.
+        // A budget given stands as given: it no longer follows the machine.
+        self.follow = None;
         self.memory = Some(bytes);
         self.write_share = self.store.warm_write_bytes();
         self.write_cap = available;
@@ -1491,6 +1665,7 @@ impl<F: BlockFile> ShardDb<F> {
             self.store.set_write_budget(written.min(self.write_cap));
             return;
         }
+        self.look_machine();
         self.retune();
         self.fit_kept(true);
     }
@@ -1505,6 +1680,7 @@ impl<F: BlockFile> ShardDb<F> {
         let retuned = self.ops_since >= self.cycle_ops;
         if retuned {
             self.ops_since = 0;
+            self.look_machine();
             self.retune();
         }
         // A tuning step may have moved shares, write memory's among them: the kept memtables give
@@ -4000,6 +4176,7 @@ impl<F: BlockFile> ShardDb<F> {
         if self.checkpoint_frozen() {
             return Ok(());
         }
+        self.look_when_due();
         self.grow(false)?;
         let bytes = std::mem::take(&mut self.turn_bytes);
         if bytes > 0 {
@@ -4087,6 +4264,7 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     fn idle_step_with(&mut self, keys: u64, paced: bool) -> Result<u64, Error> {
+        self.look_when_idle();
         let done = self.idle_step_inner(keys, paced)?;
         // Idle work may have kept a compaction's pages or a page read: the kept memtables give
         // way before the step returns.

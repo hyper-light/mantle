@@ -9,6 +9,8 @@ use crate::engine::{EngineError, Row, Rows, Write};
 
 pub struct Overlay<'a, R> {
     rows: &'a mut R,
+    /// A row's key and value at most: a batch holding a longer one is refused whole.
+    bound: (usize, usize),
     /// Each key the entry wrote since it last cleared the key's range: its value, or `None`
     /// where it deleted the key.
     writes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
@@ -17,9 +19,12 @@ pub struct Overlay<'a, R> {
 }
 
 impl<'a, R: Rows> Overlay<'a, R> {
-    pub fn new(rows: &'a mut R) -> Self {
+    /// An overlay over `rows` that takes no row of a key past `max_key` bytes or a value past
+    /// `max_value`.
+    pub fn new(rows: &'a mut R, (max_key, max_value): (usize, usize)) -> Self {
         Self {
             rows,
+            bound: (max_key, max_value),
             writes: BTreeMap::new(),
             cleared: Vec::new(),
         }
@@ -94,6 +99,16 @@ impl<R: Rows> Rows for Overlay<'_, R> {
     }
 
     fn apply(&mut self, _index: u64, writes: &[Write]) -> Result<(), EngineError> {
+        let (max_key, max_value) = self.bound;
+        if let Some((k, v)) = writes.iter().find_map(|w| match w {
+            Write::Put(k, v) if k.len() > max_key || v.len() > max_value => Some((k, v)),
+            _ => None,
+        }) {
+            return Err(EngineError::RowTooLarge {
+                key: k.len(),
+                value: v.len(),
+            });
+        }
         for write in writes {
             match write {
                 Write::Put(k, v) => {
@@ -122,6 +137,24 @@ mod tests {
     use crate::engine::Model;
     use proptest::prelude::*;
 
+    /// A batch holding a row past the bound on a key or a value is refused whole: none of its
+    /// writes shows, and the overlay takes the next batch.
+    #[test]
+    fn a_batch_holding_a_row_past_its_bound_is_refused_whole() {
+        let mut engine = Model::default();
+        let mut overlay = Overlay::new(&mut engine, (2, 3));
+        let put = |k: &[u8], v: &[u8]| Write::Put(k.to_vec(), v.to_vec());
+        for row in [put(b"abc", b"v"), put(b"k", b"long")] {
+            assert!(matches!(
+                overlay.apply(1, &[put(b"a", b"1"), row]),
+                Err(EngineError::RowTooLarge { .. })
+            ));
+            assert_eq!(overlay.get(b"a").unwrap(), None);
+        }
+        overlay.apply(1, &[put(b"ab", b"xyz")]).unwrap();
+        assert_eq!(overlay.get(b"ab").unwrap(), Some(b"xyz".to_vec()));
+    }
+
     fn key() -> impl Strategy<Value = Vec<u8>> {
         prop::collection::vec(0u8..4, 0..3)
     }
@@ -147,7 +180,7 @@ mod tests {
             let mut engine = Model::default();
             engine.apply(1, &before).unwrap();
             let mut expected = engine.clone();
-            let mut overlay = Overlay::new(&mut engine);
+            let mut overlay = Overlay::new(&mut engine, (usize::MAX, usize::MAX));
             for (i, writes) in entry.iter().enumerate() {
                 overlay.apply(2, writes).unwrap();
                 expected.apply(2 + i as u64, writes).unwrap();

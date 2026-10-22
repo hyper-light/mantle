@@ -366,6 +366,9 @@ fn session_entry(commands: usize) -> Result<Duration, Error> {
         max_answers: usize::try_from(HISTORY).unwrap_or(usize::MAX),
         max_answer_bytes: usize::MAX,
         expiries_per_entry: 16,
+        // The model engine holds a row of any length.
+        max_key_bytes: usize::MAX,
+        max_value_bytes: usize::MAX,
     };
     let mut m = name_range()?;
     let register = Entry {

@@ -1069,7 +1069,22 @@ impl Owned {
     }
 }
 
+/// Bytes of a session's row besides its answers: its format, last use, low serial, count of
+/// answers and checksum.
+const SESSION_FIXED: usize = 25;
+/// Bytes of each answer a session's row holds besides the answer: its serial and its length.
+const SESSION_ANSWER_FIXED: usize = 12;
+
 impl Session {
+    /// Bytes of a session's row holding `answers` answers of `bytes` bytes between them, as
+    /// [`Session::encode`] writes it.
+    pub fn row_bytes(answers: usize, bytes: usize) -> Option<usize> {
+        answers
+            .checked_mul(SESSION_ANSWER_FIXED)?
+            .checked_add(bytes)?
+            .checked_add(SESSION_FIXED)
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
         let mut w = start();
         w.u64(self.last_ns);
@@ -1492,6 +1507,29 @@ pub(crate) fn take_pairs(r: &mut Reader<'_>) -> Option<Vec<(String, String)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session's row is as long as its encoding: the bound a range holds its sessions to is
+    /// the bytes its engine is asked to hold.
+    #[test]
+    fn a_sessions_row_bytes_are_its_encodings() {
+        for answers in [
+            Vec::new(),
+            vec![(1, vec![7u8; 3])],
+            vec![(5, Vec::new()), (9, vec![1; 40])],
+        ] {
+            let bytes = answers.iter().map(|(_, a): &(u64, Vec<u8>)| a.len()).sum();
+            let count = answers.len();
+            let session = Session {
+                last_ns: u64::MAX,
+                low: 3,
+                answers,
+            };
+            assert_eq!(
+                Session::row_bytes(count, bytes),
+                Some(session.encode().unwrap().len())
+            );
+        }
+    }
 
     fn version() -> Version {
         Version {

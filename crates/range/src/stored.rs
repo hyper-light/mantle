@@ -19,6 +19,23 @@ use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::Config;
 use mantle_engine::trunk::TrunkConfig;
 use mantle_meta::engine::{Engine, EngineError, Row, Rows, Write};
+use mantle_meta::session::Rules;
+
+/// Whether an engine of pages of `page_size` bytes and a memtable of `memtable_bytes` holds a row
+/// at the bounds `rules` sets on a key and a value whole: a branch page holds one alone
+/// (`mantle_engine::branch::fits`), and so does the memtable, which rotates only when it holds
+/// something (`mantle_engine::memtable::hashed::entry_bytes`). The apply layer refuses a command
+/// whose writes hold a row past the bounds (`mantle_meta::apply`), so an engine that holds a row
+/// at them holds every row its range writes. One that does not takes such a row into its memtable
+/// and fences at its next checkpoint, as the branch refuses it, on every member at once, and the
+/// log gives the row again at each restart (docs/design/node.md §1.4).
+pub fn holds_rows(page_size: usize, memtable_bytes: usize, rules: &Rules) -> bool {
+    let (key, value) = (rules.max_key_bytes, rules.max_value_bytes);
+    let page = mantle_engine::store::page::capacity(page_size);
+    mantle_engine::branch::fits(page, key, value)
+        && mantle_engine::memtable::hashed::entry_bytes(key, value)
+            .is_some_and(|bytes| bytes <= memtable_bytes)
+}
 
 /// A range's rows in mantle's engine.
 pub struct Stored<F: BlockFile> {
@@ -220,6 +237,50 @@ mod tests {
             .into_iter()
             .map(|(k, v)| (String::from_utf8(k).unwrap(), String::from_utf8(v).unwrap()))
             .collect()
+    }
+
+    /// Rules whose bounds on a row are `key` and `value`.
+    fn bounds(key: usize, value: usize) -> Rules {
+        Rules {
+            lifetime_ns: u64::MAX,
+            max_sessions: 1,
+            max_answers: 1,
+            max_answer_bytes: 0,
+            expiries_per_entry: 1,
+            max_key_bytes: key,
+            max_value_bytes: value,
+        }
+    }
+
+    /// An engine that holds a row at the bounds keeps one through a checkpoint. The engine's
+    /// small page, which does not, takes the row into its memtable and fences at the checkpoint
+    /// that packs it, as a range would on every member: a node refuses to start on it.
+    #[test]
+    fn an_engine_that_holds_a_row_at_the_bounds_keeps_one_and_one_that_does_not_fences() {
+        let (key, value) = (100, 8_000);
+        let rules = bounds(key, value);
+        let page = mantle_engine::branch::least_page(CONFIG.page_size, key, value).unwrap();
+        let store = Config {
+            page_size: page,
+            ..CONFIG
+        };
+        let memtable = mantle_engine::memtable::hashed::entry_bytes(key, value).unwrap();
+        assert!(holds_rows(store.page_size, memtable, &rules));
+        assert!(!holds_rows(store.page_size, memtable - 1, &rules));
+        assert!(!holds_rows(CONFIG.page_size, memtable, &rules));
+        let row = Write::Put(vec![b'k'; key], vec![7; value]);
+        for (config, kept) in [(store, true), (CONFIG, false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("range.store");
+            let mut e = Stored::create(file(&path, true), config, memtable, TRUNK).unwrap();
+            e.apply(1, std::slice::from_ref(&row)).unwrap();
+            if kept {
+                e.persist().unwrap();
+                assert_eq!(e.get(&vec![b'k'; key]).unwrap(), Some(vec![7; value]));
+            } else {
+                assert_eq!(e.persist(), Err(EngineError::Fenced));
+            }
+        }
     }
 
     #[test]

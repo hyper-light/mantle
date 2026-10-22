@@ -627,6 +627,14 @@ fn join(hot: &mut [Hot], a: u32, b: u32) -> Option<u32> {
     None
 }
 
+/// Bytes an entry of a `key`-byte key and a `value`-byte value takes of a memtable's arena, its
+/// head with them: [`HashMem::insert_hashed`] refuses one past the memtable's bound, and the shard
+/// rotates only a memtable that holds something, so a memtable holds the largest entry its
+/// engine takes, alone, or that entry is refused whenever it comes.
+pub fn entry_bytes(key: usize, value: usize) -> Option<usize> {
+    ENTRY_HEAD_MAX.checked_add(key)?.checked_add(value)
+}
+
 impl HashMem {
     /// An empty memtable whose arena holds at most `limit` bytes, at most 4 GiB (offsets are 32
     /// bits).

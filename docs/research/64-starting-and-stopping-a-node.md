@@ -125,8 +125,12 @@ of each thread ahead of it:
 6. **A restart leaves no session behind.** The dissertation's sessions expire by count or by the
    log's time, and a restarted client registers anew (research 06 §A1.8); a range's table then
    holds its owner's old sessions until they expire, and a node that restarts more often than the
-   lifetime finds the table full. A registration that names its owner and the owner's run (a
-   node's run record, raised at every start before anything else) lets the range end the owner's
-   sessions of earlier runs as it registers: the process that held them has ended, since one
-   directory admits one process. The sessions a range holds are then the identities the cell's
-   configuration pins, each at most one, and no expiry by time is needed for them.
+   lifetime finds the table full. A registration that names its owner, the owner's run (a node's
+   run record, raised at every start before anything else) and its place among the run's
+   registrations lets the range end the owner's last session as a later registration arrives:
+   the process that held it has ended, since one directory admits one process, or let it go
+   holding nothing under it. The same registration delivered again is answered its session, and
+   an earlier one is refused, so a registration delivered late ends no session whose commands
+   may be out, which a command asked again under a new session would apply twice. The sessions a
+   range holds are then the identities the cell's configuration pins, each at most one, and no
+   expiry by time is needed for them.

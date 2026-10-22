@@ -37,6 +37,43 @@ pub struct Rules {
     pub max_answer_bytes: usize,
     /// Sessions one entry expires at most, which bounds the entry's work.
     pub expiries_per_entry: usize,
+    /// A row's key and value at most, which every member's engine holds whole, its page and its
+    /// memtable sized to them: a command whose writes hold a longer one is refused whole,
+    /// `Answer::RowTooLarge`, and a session whose row would pass them expires.
+    pub max_key_bytes: usize,
+    pub max_value_bytes: usize,
+}
+
+impl Rules {
+    /// Bytes of the largest session row these rules let a range write: its answers at both
+    /// bounds, as many as `max_answers` holding `max_answer_bytes` between them, within a row's
+    /// value; a session that would pass any of them expires as its entry is written.
+    pub fn largest_session_row(&self) -> usize {
+        Session::row_bytes(self.max_answers, self.max_answer_bytes)
+            .map_or(self.max_value_bytes, |row| row.min(self.max_value_bytes))
+    }
+
+    /// Whether these rules' bounds on a row admit the rows the session layer writes of itself
+    /// whatever a session holds: a session with no answer kept, its place in the order of last
+    /// use, its owner's row and the count of sessions. Bounds below them would refuse a
+    /// registration's own writes, which no command's answer can carry, and stop the replica.
+    pub fn admit_sessions(&self) -> bool {
+        let keys = [
+            session_key(u64::MAX).len(),
+            expiry_key(u64::MAX, u64::MAX).len(),
+            owner_key(u64::MAX).len(),
+            COUNT.len(),
+        ];
+        let values = [
+            Session::row_bytes(0, 0),
+            Some(OWNED_BYTES),
+            Some(record::encode_number(u64::MAX).len()),
+        ];
+        keys.iter().all(|&key| key <= self.max_key_bytes)
+            && values
+                .iter()
+                .all(|value| value.is_some_and(|value| value <= self.max_value_bytes))
+    }
 }
 
 /// What a command's session says of it.
@@ -202,7 +239,11 @@ impl Touched {
             s.bytes = s.bytes.saturating_add(encoded.len());
             s.answers.push((command.serial, encoded));
         }
-        if s.answers.len() > rules.max_answers || s.bytes > rules.max_answer_bytes {
+        let row = Session::row_bytes(s.answers.len(), s.bytes);
+        if s.answers.len() > rules.max_answers
+            || s.bytes > rules.max_answer_bytes
+            || row.is_none_or(|row| row > rules.max_value_bytes)
+        {
             s.expired = true;
             s.answers.clear();
             s.bytes = 0;
@@ -454,6 +495,8 @@ mod tests {
         max_answers: 2,
         max_answer_bytes: usize::MAX,
         expiries_per_entry: 8,
+        max_key_bytes: usize::MAX,
+        max_value_bytes: usize::MAX,
     };
 
     fn used(session: u64, serial: u64, unanswered: u64) -> Sessioned {
@@ -605,6 +648,44 @@ mod tests {
         for serial in 1..=3 {
             assert_eq!(check(&mut m, s, serial).unwrap(), Check::Unknown);
         }
+        assert_eq!(count(&mut m).unwrap(), 0);
+    }
+
+    /// Bounds admit the session layer's own rows from the longest of its keys and values up, and
+    /// bounds a byte short of either do not.
+    #[test]
+    fn bounds_admit_a_sessions_own_rows_from_the_longest_up() {
+        let key = expiry_key(u64::MAX, u64::MAX).len();
+        let value = Session::row_bytes(0, 0).unwrap();
+        let bound = |max_key_bytes, max_value_bytes| Rules {
+            max_key_bytes,
+            max_value_bytes,
+            ..RULES
+        };
+        assert!(RULES.admit_sessions());
+        assert!(bound(key, value).admit_sessions());
+        assert!(!bound(key - 1, value).admit_sessions());
+        assert!(!bound(key, value - 1).admit_sessions());
+    }
+
+    /// A session whose row would pass the bound on a value expires before it is written, within
+    /// its count and its bytes of answers, so no session's row is one every member's engine
+    /// does not hold.
+    #[test]
+    fn a_session_whose_row_would_pass_a_values_bound_expires() {
+        let mut m = Model::default();
+        let size = answer(1).encode().unwrap().len();
+        let rules = Rules {
+            max_answers: 8,
+            max_value_bytes: Session::row_bytes(1, size).unwrap(),
+            ..RULES
+        };
+        assert_eq!(rules.largest_session_row(), rules.max_value_bytes);
+        let s = register(&mut m, 1, 0, 10, &rules).unwrap();
+        record(&mut m, 2, &used(s, 1, 1), Some(&answer(1)), 20, &rules).unwrap();
+        assert_eq!(check(&mut m, s, 1).unwrap(), Check::Answered(answer(1)));
+        record(&mut m, 3, &used(s, 2, 1), Some(&answer(2)), 30, &rules).unwrap();
+        assert_eq!(check(&mut m, s, 1).unwrap(), Check::Unknown);
         assert_eq!(count(&mut m).unwrap(), 0);
     }
 

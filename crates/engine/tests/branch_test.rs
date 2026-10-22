@@ -19,8 +19,8 @@ use hyper_block::buf::Alignment;
 use hyper_block::sim::{Fault, SimFile};
 use mantle_engine::Error;
 use mantle_engine::branch::filter::Keys;
-use mantle_engine::branch::{Branch, Builder, Op};
-use mantle_engine::store::{Config, Store};
+use mantle_engine::branch::{Branch, Builder, Op, least_page};
+use mantle_engine::store::{Config, MIN_PAGE, Store};
 use proptest::prelude::*;
 use std::collections::BTreeMap;
 
@@ -186,6 +186,44 @@ fn keys_out_of_order_and_oversized_entries_are_refused() {
     let (mut s, recovered) = Store::open(file, CONFIG).unwrap();
     assert_eq!(recovered.root, Some(branch.root));
     check(&mut s, &branch, &entries);
+}
+
+/// The least page holding an entry of a key and a value of given lengths holds it, in a branch
+/// built and read back in a store of that page, and the builder of the page below refuses it. No
+/// branch page holds an entry past what offsets of 16 bits reach.
+#[test]
+fn the_least_page_holds_its_entry_and_the_page_below_refuses_it() {
+    let align = Alignment::new(4096).unwrap();
+    let store_of = |page_size: usize| {
+        let config = Config {
+            page_size,
+            ..CONFIG
+        };
+        let file = SimFile::new(align, Alignment::new(512).unwrap(), 1).unwrap();
+        Store::create(file, config).unwrap()
+    };
+    for (key, value) in [(8usize, 100usize), (2_300, 8_400), (10, 30_000)] {
+        let page = least_page(align.get(), key, value).unwrap();
+        let (k, v) = (vec![b'k'; key], vec![7u8; value]);
+        let mut s = store_of(page);
+        let mut b = Builder::new(&mut s, Keys::Exactly(1)).unwrap();
+        b.add(&mut s, &k, Op::Put, &v).unwrap();
+        let branch = b.finish(&mut s).unwrap();
+        check(
+            &mut s,
+            &branch,
+            &BTreeMap::from([(k.clone(), (Op::Put, v.clone()))]),
+        );
+        if page > MIN_PAGE {
+            let mut s = store_of(page - align.get());
+            let mut b = Builder::new(&mut s, Keys::Exactly(1)).unwrap();
+            assert!(matches!(
+                b.add(&mut s, &k, Op::Put, &v),
+                Err(Error::LimitExceeded { .. })
+            ));
+        }
+    }
+    assert_eq!(least_page(align.get(), 10, 70_000), None);
 }
 
 #[test]

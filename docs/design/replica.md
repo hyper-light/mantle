@@ -98,6 +98,19 @@ range carries on without it.
 Applying never reads the clock, the network or anything else a replica does not share.
 Time comes from the entry, which is what lets every replica reach the same rows.
 
+**A row past the range's bounds refuses its command** (measured 2026-10-21). The engine holds a
+row whole, in one branch page and in its memtable (`mantle_engine::branch::fits`,
+`memtable::hashed::entry_bytes`), and takes a row past its page into its memtable, to fence at
+the checkpoint that packs it: on a 4 KiB page a value of 4,100 bytes applied, and the checkpoint
+fenced the engine, which a restart replays the entry into again, on every member at once. A
+range's rules therefore bound a row's key and value (`Rules::max_key_bytes`,
+`max_value_bytes`), the same on every member, and every member's engine holds a row at both,
+which a node checks before it starts (`mantle_range::holds_rows`; node.md §1.4). A command
+whose writes hold a row past either is answered `RowTooLarge` and writes nothing, since each
+layer writes its command's batch at once and the overlay refuses the batch whole, and every
+member refuses it alike. A session whose row would pass them expires, as past its other
+bounds. No committed entry then gives an engine a row it fences on.
+
 **A command carries its own checksum** (research/31 §5.4, B12; D16). A command is encoded in the
 gateway's memory and then replicated, so a flip before its encoding goes to every replica alike,
 and the log's frame CRC, computed later, protects it. Each command therefore carries a CRC-32C

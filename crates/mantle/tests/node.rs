@@ -145,6 +145,8 @@ const GROUP_ENTRIES: u64 = 1024;
 /// The engine's page (the configuration's `engine.page_size`), the engine's own small test
 /// configuration's (crates/engine/tests/pool_startup.rs).
 const STORE_PAGE: usize = 4096;
+/// The engine's memtable (the configuration's `engine.memtable_bytes`): a page's.
+const MEMTABLE: usize = STORE_PAGE;
 
 /// Every number the nodes run with, as the range's process test and the cluster test state them:
 /// the range's settings and rules, the log's and the engine's sizes (the engine's own small test
@@ -171,7 +173,6 @@ log.queue_submissions = 16
 log.waits = measured
 engine.extent_pages = 4
 engine.max_extents = 256
-engine.memtable_bytes = 4096
 engine.fanout = 3
 engine.leaf_entries = 96
 runtime.probe_budget_ms = 40
@@ -247,6 +248,25 @@ fn root_key(dir: &Path) -> PathBuf {
 
 /// The message bounds the nodes state for these settings (`mantle_node::node::message_bounds`):
 /// the client states the same.
+/// A row's bounds (`rules.max_key_bytes`, `rules.max_value_bytes`): the most of an equal key and
+/// value that the engine's page and memtable hold (`mantle_range::holds_rows`).
+fn held_row() -> usize {
+    use mantle_meta::session::Rules;
+    let bound = |x| Rules {
+        lifetime_ns: u64::MAX,
+        max_sessions: 1,
+        max_answers: 1,
+        max_answer_bytes: 0,
+        expiries_per_entry: 1,
+        max_key_bytes: x,
+        max_value_bytes: x,
+    };
+    (0..=STORE_PAGE)
+        .rev()
+        .find(|&x| mantle_range::holds_rows(STORE_PAGE, MEMTABLE, &bound(x)))
+        .unwrap()
+}
+
 fn bounds() -> Bounds {
     use mantle_meta::apply::Layer;
     use mantle_meta::session::Rules;
@@ -263,6 +283,8 @@ fn bounds() -> Bounds {
                     max_answers: 16,
                     max_answer_bytes: usize::MAX,
                     expiries_per_entry: 8,
+                    max_key_bytes: held_row(),
+                    max_value_bytes: held_row(),
                 },
                 boot: ConfState::default(),
                 settings: Settings {
@@ -491,11 +513,13 @@ impl Pki {
         // Each peer's share holds a receive chunk, the largest datagram QUIC carries, for each of
         // the node's four classes.
         let peers = self.nodes.len() - 1 + self.clients.len() + usize::from(stored);
+        let held = held_row();
         let mut text = format!(
             "id = {id}\ndir = {}\nquic = 127.0.0.1:0\nplane = 127.0.0.1:0\nauthority = {}\n\
              certificate = {}\nkey = {}\nvoters = {}\n\
              transport_bytes = {}\nlog.group_entries = {GROUP_ENTRIES}\n\
-             engine.page_size = {STORE_PAGE}\n{STATED}",
+             engine.page_size = {STORE_PAGE}\nengine.memtable_bytes = {MEMTABLE}\n\
+             rules.max_key_bytes = {held}\nrules.max_value_bytes = {held}\n{STATED}",
             dir.display(),
             self.authority.display(),
             certificate.display(),

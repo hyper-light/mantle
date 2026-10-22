@@ -2,7 +2,7 @@
 //! each checked against its session and run by the range's layer, through an overlay, so
 //! that the engine takes the whole entry as one batch at its index.
 
-use crate::engine::Rows;
+use crate::engine::{EngineError, Rows};
 use crate::error::{MetaError, reserved};
 use crate::overlay::Overlay;
 use crate::session::{self, Check, Rules, Touched};
@@ -30,7 +30,7 @@ pub fn apply_entry<R: Rows>(
     rules: &Rules,
 ) -> Result<Vec<Answer>, MetaError> {
     let (answers, writes) = {
-        let mut overlay = Overlay::new(&mut *rows);
+        let mut overlay = Overlay::new(&mut *rows, (rules.max_key_bytes, rules.max_value_bytes));
         session::expire(&mut overlay, index, entry.at_ns, rules)?;
         let mut touched = Touched::default();
         let mut answers = reserved(entry.commands.len())?;
@@ -59,7 +59,15 @@ pub fn apply_entry<R: Rows>(
                         answer
                     }
                     Check::New => {
-                        let answer = run(&mut overlay, index, command, layer)?;
+                        let answer = match run(&mut overlay, index, command, layer) {
+                            // A row past what every member's engine holds whole: the command is
+                            // refused whole, each layer writing its command's batch at once,
+                            // and every member refuses it alike.
+                            Err(MetaError::Engine(EngineError::RowTooLarge { .. })) => {
+                                Answer::RowTooLarge
+                            }
+                            ran => ran?,
+                        };
                         touched.record(c, Some(&answer), entry.at_ns, rules)?;
                         answer
                     }
@@ -95,7 +103,7 @@ mod tests {
     use super::*;
     use crate::engine::{Engine, Model, Write};
     use crate::name::{GateChange, Match, Outcome, Preconditions, Put};
-    use crate::record::{GateState, Version, Versioning};
+    use crate::record::{GateState, Session, Version, Versioning};
     use crate::wire::Sessioned;
 
     const RULES: Rules = Rules {
@@ -104,6 +112,8 @@ mod tests {
         max_answers: 4,
         max_answer_bytes: usize::MAX,
         expiries_per_entry: 8,
+        max_key_bytes: usize::MAX,
+        max_value_bytes: usize::MAX,
     };
 
     /// A PUT carrying a file made for it alone, which the same key, ETag and precondition
@@ -251,6 +261,45 @@ mod tests {
         assert_eq!(answers[1], Answer::SessionExpired);
         assert!(matches!(answers[2], Answer::Name(Outcome::Put { .. })));
         assert_eq!(answers[3], Answer::Repeated);
+    }
+
+    /// A command whose writes hold a row past the range's bounds is refused whole, as every
+    /// member refuses it, and the entry goes on: the command after it applies, the refused one
+    /// changed nothing, and asked again it is answered so from its session.
+    #[test]
+    fn a_command_whose_row_passes_the_bounds_is_refused_whole_and_the_entry_goes_on() {
+        let mut m = name_range();
+        let rules = Rules {
+            max_key_bytes: 32,
+            ..RULES
+        };
+        let run = |m: &mut Model, index, e: Entry| {
+            apply_entry(m, index, &e, Layer::Name, &rules).unwrap()
+        };
+        let answers = run(&mut m, 1, entry(10, vec![registration()]));
+        let [Answer::Registered { session }] = answers[..] else {
+            panic!("{answers:?}")
+        };
+        run(&mut m, 2, entry(20, vec![from(session, 1, open_gate())]));
+        let rows = all(&mut m);
+        let long = from(session, 2, put(&"k".repeat(40), "e", false));
+        let answers = run(
+            &mut m,
+            3,
+            entry(
+                30,
+                vec![long.clone(), from(session, 3, put("k", "e", false))],
+            ),
+        );
+        assert_eq!(answers[0], Answer::RowTooLarge);
+        assert!(matches!(answers[1], Answer::Name(Outcome::Put { .. })));
+        let mut after = all(&mut m);
+        after.retain(|row| !rows.contains(row));
+        assert!(
+            after.iter().all(|(k, _)| k.len() <= rules.max_key_bytes),
+            "{after:?}"
+        );
+        assert_eq!(run(&mut m, 4, entry(40, vec![long])), [Answer::RowTooLarge]);
     }
 
     /// The last serial is refused before it takes effect, so forgetting its answer cannot
@@ -425,7 +474,6 @@ mod tests {
         layer: Layer,
         rules: &Rules,
     ) -> Vec<Answer> {
-        use crate::record::Session;
         let key = |session: u64| {
             let mut k = vec![crate::key::LOCAL, crate::key::marker::SESSION];
             k.extend_from_slice(&session.to_be_bytes());
@@ -443,7 +491,8 @@ mod tests {
                 .map(|b| Session::decode(&b).unwrap())
         };
         let (answers, writes) = {
-            let mut overlay = Overlay::new(&mut *rows);
+            let bound = (rules.max_key_bytes, rules.max_value_bytes);
+            let mut overlay = Overlay::new(&mut *rows, bound);
             session::expire(&mut overlay, index, entry.at_ns, rules).unwrap();
             let mut answers = Vec::new();
             for (position, c) in entry.commands.iter().enumerate() {
@@ -487,7 +536,12 @@ mod tests {
                                 continue;
                             }
                             Check::Answered(answer) => (answer, false),
-                            Check::New => (run(&mut overlay, index, command, layer).unwrap(), true),
+                            Check::New => match run(&mut overlay, index, command, layer) {
+                                Err(MetaError::Engine(EngineError::RowTooLarge { .. })) => {
+                                    (Answer::RowTooLarge, true)
+                                }
+                                ran => (ran.unwrap(), true),
+                            },
                         };
                         let mut s = read(&mut overlay, c.session).unwrap();
                         let mut writes = vec![Write::Delete(expiry(s.last_ns, c.session))];
@@ -498,7 +552,10 @@ mod tests {
                         }
                         let bytes =
                             |s: &Session| s.answers.iter().map(|(_, a)| a.len()).sum::<usize>();
-                        if s.answers.len() > rules.max_answers || bytes(&s) > rules.max_answer_bytes
+                        let row = s.encode().unwrap().len();
+                        if s.answers.len() > rules.max_answers
+                            || bytes(&s) > rules.max_answer_bytes
+                            || row > rules.max_value_bytes
                         {
                             let count = vec![crate::key::LOCAL, crate::key::marker::SESSIONS];
                             let held = overlay.get(&count).unwrap().unwrap();
@@ -528,7 +585,9 @@ mod tests {
     /// each command's session change on its own did (audit P04).
     #[test]
     fn holding_an_entrys_sessions_answers_and_writes_as_each_command_did() {
-        // A budget of bytes four puts' answers pass, so both bounds expire sessions.
+        // A budget of bytes four puts' answers pass, so both bounds expire sessions; a row of
+        // three puts' answers, which three and a gate's pass before their bytes do; and a key
+        // a put of a long key passes, which is refused whole.
         let one = Answer::Name(Outcome::Put {
             version: crate::key::version_id(!12_345u64),
         })
@@ -541,6 +600,8 @@ mod tests {
             max_answers: 4,
             max_answer_bytes: 3 * one + one / 2,
             expiries_per_entry: 2,
+            max_key_bytes: 32,
+            max_value_bytes: Session::row_bytes(3, 3 * one).unwrap(),
         };
         let mut rng = 0x9E37_79B9_7F4A_7C15u64;
         let mut next = move |n: u64| {
@@ -552,8 +613,8 @@ mod tests {
         let (mut held, mut each) = (name_range(), name_range());
         // Each session registered, with the highest serial its gateway has sent.
         let mut sessions: Vec<(u64, u64)> = Vec::new();
-        // Answers seen: repeated, refused for an unknown session, and run.
-        let mut seen = [0u64; 3];
+        // Answers seen: repeated, refused for an unknown session, run, and refused for a row.
+        let mut seen = [0u64; 4];
         let mut registered = 0u64;
         let mut at_ns = 0u64;
         // Each of a few owners' last registration: so some registrations end an owner's last
@@ -591,6 +652,8 @@ mod tests {
                     }
                     let command = match next(4) {
                         0 => open_gate(),
+                        // Now and then a key whose rows pass the bound on a key.
+                        _ if next(16) == 0 => put(&"k".repeat(40), "e", next(2) == 0),
                         _ => put(
                             &format!("k{}", next(3)),
                             &format!("e{}", next(4)),
@@ -624,13 +687,15 @@ mod tests {
                             sessions.retain(|(s, _)| *s != c.session);
                         }
                     }
+                    Answer::RowTooLarge => seen[3] += 1,
                     _ => seen[2] += 1,
                 }
             }
         }
-        // Sessions came and went, and commands were repeated, refused and run.
+        // Sessions came and went, and commands were repeated, refused, run and refused whole.
         assert!(registered > 10, "{registered} sessions");
-        assert!(seen.iter().all(|&n| n > 500), "{seen:?}");
+        assert!(seen[..3].iter().all(|&n| n > 500), "{seen:?}");
+        assert!(seen[3] > 0, "{seen:?}");
     }
 
     /// Two replicas applying the same entries hold the same rows, however the entries were

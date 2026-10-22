@@ -80,6 +80,9 @@ const RULES: Rules = Rules {
     max_answers: 16,
     max_answer_bytes: usize::MAX,
     expiries_per_entry: 8,
+    // The model engine holds a row of any length.
+    max_key_bytes: usize::MAX,
+    max_value_bytes: usize::MAX,
 };
 
 /// The datagrams lost while a run's faults last, when its draw loses any: 2% of each, independently,

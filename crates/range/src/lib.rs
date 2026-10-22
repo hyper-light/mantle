@@ -31,4 +31,4 @@ pub use machine::{Applied, RangeMachine};
 pub use replica::{
     Output, Range, Replica, Settings, Shell, claim, open_shell, propose_entry, remove,
 };
-pub use stored::Stored;
+pub use stored::{Stored, holds_rows};

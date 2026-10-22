@@ -32,7 +32,7 @@ pub(crate) mod point;
 use crate::error::{Error, Malformed};
 use crate::fst::surf::{Surf, SurfBuilder};
 use crate::fst::trie::{Trie, TrieBuilder, Width};
-use crate::store::{Run, Span, Store};
+use crate::store::{MIN_PAGE, Run, Span, Store};
 use hyper_block::block::BlockFile;
 use std::cmp::Ordering;
 
@@ -412,6 +412,43 @@ struct Sealed {
     pages: u32,
 }
 
+/// Whether a branch page of `capacity` payload bytes holds an entry of a `key`-byte key and a
+/// `value`-byte value alone: a leaf of the page's fixed bytes, the entry's slot and fixed bytes, its
+/// key twice and its value, and an index page above with room for its key thrice. A builder
+/// refuses an entry no empty page of its holds ([`Builder::add`]).
+pub fn fits(capacity: usize, key: usize, value: usize) -> bool {
+    page_needs(key, value).is_some_and(|needs| needs <= capacity)
+}
+
+/// The least page, a multiple of `align` and at least [`MIN_PAGE`], whose branch pages each hold
+/// an entry of a `key`-byte key and a `value`-byte value alone ([`fits`]); `None` where no branch
+/// page does, its payload past what offsets of 16 bits reach ([`Builder::new`]).
+pub fn least_page(align: usize, key: usize, value: usize) -> Option<usize> {
+    let page = page_needs(key, value)?
+        .checked_add(crate::store::page::HEADER)?
+        .max(MIN_PAGE)
+        .checked_next_multiple_of(align)?;
+    if crate::store::page::capacity(page) <= usize::from(u16::MAX) {
+        Some(page)
+    } else {
+        None
+    }
+}
+
+/// The payload bytes an empty leaf needs for an entry of these lengths, and an index page above
+/// it: the larger of the two.
+fn page_needs(key: usize, value: usize) -> Option<usize> {
+    let leaf = HEAD
+        .checked_add(SLOT)?
+        .checked_add(LEAF_FIXED)?
+        .checked_add(key.checked_mul(2)?)?
+        .checked_add(value)?;
+    let index = HEAD
+        .checked_add(SLOT.checked_add(INDEX_FIXED)?.checked_mul(2)?)?
+        .checked_add(key.checked_mul(3)?)?;
+    Some(leaf.max(index))
+}
+
 impl Builder {
     /// A builder in `store`, for `keys` entries: pages of the store's payload capacity, which
     /// offsets of 16 bits must reach.
@@ -464,18 +501,9 @@ impl Builder {
         })
     }
 
-    /// The largest key and value an entry may have: with a page's fixed bytes, one entry, and
-    /// room for its key twice in an index page above, it fits an empty page.
+    /// Whether an entry of these lengths fits an empty page of this builder ([`fits`]).
     pub fn fits(&self, key: usize, value: usize) -> bool {
-        let leaf = HEAD
-            .saturating_add(SLOT)
-            .saturating_add(LEAF_FIXED)
-            .saturating_add(key.saturating_mul(2))
-            .saturating_add(value);
-        let index = HEAD
-            .saturating_add(SLOT.saturating_add(INDEX_FIXED).saturating_mul(2))
-            .saturating_add(key.saturating_mul(3));
-        leaf <= self.capacity && index <= self.capacity
+        fits(self.capacity, key, value)
     }
 
     fn page<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<u64, Error> {

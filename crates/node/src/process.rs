@@ -290,7 +290,7 @@ impl ProcessConfig {
             "never" => Waits::Never,
             other => return Err(ProcessError::Value("log.waits", other.to_owned())),
         };
-        Ok(Self {
+        let config = Self {
             id: lines.get("id")?,
             dir: PathBuf::from(lines.text("dir")?),
             quic: lines.get("quic")?,
@@ -316,6 +316,8 @@ impl ProcessConfig {
                 max_answers: lines.get("rules.max_answers")?,
                 max_answer_bytes: lines.get("rules.max_answer_bytes")?,
                 expiries_per_entry: lines.get("rules.expiries_per_entry")?,
+                max_key_bytes: lines.get("rules.max_key_bytes")?,
+                max_value_bytes: lines.get("rules.max_value_bytes")?,
             },
             log: LogConfig {
                 segment_bytes: lines.get("log.segment_bytes")?,
@@ -346,7 +348,29 @@ impl ProcessConfig {
             read_asks: lines.get("read_asks")?,
             enlist: enlisting(&lines)?,
             gateway: gateway(&lines)?,
-        })
+        };
+        if !config.rules.admit_sessions() {
+            return Err(ProcessError::Value(
+                "rules.max_key_bytes",
+                "with rules.max_value_bytes, admits no row a session writes of itself".into(),
+            ));
+        }
+        // An engine that took a row past its page would fence at its next checkpoint, on every
+        // member at once, and again at each restart (`mantle_range::holds_rows`).
+        if !mantle_range::holds_rows(config.store.page_size, config.memtable_bytes, &config.rules) {
+            return Err(ProcessError::Value(
+                "engine.page_size",
+                format!(
+                    "a page of {} bytes and a memtable of {} hold no row of a {}-byte key and a \
+                     {}-byte value (rules.max_key_bytes, rules.max_value_bytes)",
+                    config.store.page_size,
+                    config.memtable_bytes,
+                    config.rules.max_key_bytes,
+                    config.rules.max_value_bytes
+                ),
+            ));
+        }
+        Ok(config)
     }
 }
 

@@ -73,6 +73,9 @@ pub enum Answer {
     /// No session was registered: the owner registered later than this registration, in a
     /// later run or later in this one (`session::register`).
     Superseded,
+    /// The command's writes hold a row past the range's bounds on a key or a value
+    /// (`session::Rules::max_key_bytes`, `max_value_bytes`): nothing of it was written.
+    RowTooLarge,
     /// The command is for another layer than the range's.
     WrongLayer,
     Bucket(bucket::Outcome),
@@ -151,6 +154,7 @@ impl Answer {
             Answer::WrongLayer => w.u8(2),
             Answer::Repeated => w.u8(7),
             Answer::Superseded => w.u8(10),
+            Answer::RowTooLarge => w.u8(11),
             Answer::Bucket(o) => {
                 w.u8(3);
                 put_bucket_outcome(&mut w, o);
@@ -216,6 +220,7 @@ impl Answer {
                 2 => Answer::WrongLayer,
                 7 => Answer::Repeated,
                 10 => Answer::Superseded,
+                11 => Answer::RowTooLarge,
                 3 => Answer::Bucket(take_bucket_outcome(&mut r)?),
                 4 => Answer::Name(take_name_outcome(&mut r)?),
                 5 => Answer::File(match r.u8()? {
@@ -2141,6 +2146,7 @@ mod tests {
             Answer::WrongLayer,
             Answer::Repeated,
             Answer::Superseded,
+            Answer::RowTooLarge,
         ];
         answers.extend(
             [

@@ -170,13 +170,31 @@ const RULES: Rules = Rules {
     max_answers: 16,
     max_answer_bytes: usize::MAX,
     expiries_per_entry: 8,
+    // Set by `rules`, for the store the cell's mantle engines run with.
+    max_key_bytes: 0,
+    max_value_bytes: 0,
 };
+
+/// The range's rules: a row's bounds the most of an equal key and value that the store and its
+/// memtable of a page hold (`mantle_range::holds_rows`), so either engine takes the range alike.
+fn rules() -> Rules {
+    let bound = |x| Rules {
+        max_key_bytes: x,
+        max_value_bytes: x,
+        ..RULES
+    };
+    let held = (0..=STORE.page_size)
+        .rev()
+        .find(|&x| mantle_range::holds_rows(STORE.page_size, STORE.page_size, &bound(x)))
+        .unwrap();
+    bound(held)
+}
 
 /// The range of a cell of `nodes`, each a founding voter.
 fn range(nodes: u64) -> Range {
     Range {
         layer: Layer::Name,
-        rules: RULES,
+        rules: rules(),
         boot: ConfState {
             voters: (1..=nodes).collect(),
             ..ConfState::default()

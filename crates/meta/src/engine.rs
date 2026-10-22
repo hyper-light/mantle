@@ -31,6 +31,11 @@ pub enum EngineError {
     /// No memory for a batch: nothing was applied.
     #[error("no memory for a batch")]
     Memory,
+    /// A row past the range's bounds on a key or a value (`session::Rules::max_key_bytes`,
+    /// `max_value_bytes`), which every member's engine holds whole: nothing of the batch was
+    /// applied.
+    #[error("a row of a {key}-byte key and a {value}-byte value past the range's bounds")]
+    RowTooLarge { key: usize, value: usize },
 }
 
 /// Rows as a state machine reads and writes them.

@@ -707,6 +707,42 @@ pub fn bounded_bytes(config: &Config, mem_limit: usize) -> Option<u64> {
     memtables.checked_add(store)?.checked_add(allocator)
 }
 
+/// The most bytes an engine's store keeps in its pools, at the pages and extents of `config`, from
+/// the most of each pooled kind it ever had out at once (`peaks`): each extent buffer (a span's, a
+/// run's, an answered write's), each page buffer (a cursor's leaf, key and value copy, a point
+/// read's), each span's list of reads in flight ([`crate::store::span_reads_bytes`], the device's
+/// issuer taking `batches` reads at once), and each builder's working lists, at most a builder's
+/// whole for branches of `entries` entries of keys at most `key` bytes, its range filter keeping
+/// `range_bits` bits a key ([`crate::branch::builder_bytes`]). The pools keep no more than was
+/// ever out at once; how much was out the trunk's in-flight bundles set, measured, not bounded
+/// by rule yet (node.md §1.4).
+pub fn pooled_bytes(
+    config: &Config,
+    peaks: crate::store::PoolPeaks,
+    key: usize,
+    entries: u64,
+    batches: usize,
+    range_bits: u32,
+) -> Option<u64> {
+    let bytes = |n: usize| u64::try_from(n).ok();
+    let page = bytes(config.page_size)?;
+    let extent = page.checked_mul(u64::from(config.extent_pages))?;
+    let builder = crate::branch::builder_bytes(
+        crate::store::page::capacity(config.page_size),
+        usize::try_from(extent).ok()?,
+        key,
+        entries,
+        range_bits,
+    )?;
+    bytes(peaks.buffers)?
+        .checked_mul(extent)?
+        .checked_add(bytes(peaks.pages)?.checked_mul(page)?)?
+        .checked_add(
+            bytes(peaks.spans)?.checked_mul(bytes(crate::store::span_reads_bytes(batches)?)?)?,
+        )?
+        .checked_add(bytes(peaks.lists)?.checked_mul(builder)?)
+}
+
 impl<F: BlockFile> ShardDb<F> {
     fn with(store: Store<F>, mem_limit: usize, trunk: Trunk) -> Result<Self, Error> {
         let write_reserved = store.write_reservation_for(None)?;
@@ -4753,6 +4789,11 @@ impl<F: BlockFile> ShardDb<F> {
     /// ([`Store::set_residency_shadow`]).
     pub fn set_residency_shadow(&mut self, on: bool) {
         self.store.set_residency_shadow(on);
+    }
+
+    /// The most of each pooled kind the store ever had out at once.
+    pub fn pool_peaks(&self) -> crate::store::PoolPeaks {
+        self.store.pool_peaks()
     }
 
     /// The bytes the trunk's branches hold in memory.

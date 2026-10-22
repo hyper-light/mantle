@@ -292,12 +292,30 @@ measures the second, and derives the rest by these rules:
   kept by the shell and by the core's log until it is installed, framed and copied again by the
   node to send, and taken whole by a receiver that sizes its buffer to the length its sender
   declares; installing decodes every row, and clearing a range scans every old one.
-  *Open:* an engine's builders and its pools of pages, runs, spans and lists hold what was ever out
-  at once, which its trunk's shape and its longest keys set, not its configuration: at the floor's
-  pages, a range taking rows of the longest key and the largest value besides the shortest held
-  7.5 MB past its branches' own memory, most of it tries a builder keeps a level each key byte
-  deep (`fst::trie::TrieBuilder`, 640 KB a builder at 2,132-byte keys); bounding them by stated
-  caps is the engine's own goal, measured against RocksDB and SplinterDB.
+  *Open:* an engine's builders, cursors and pools hold what is out at once, which its trunk's
+  in-flight bundles and its rows' keys set: measured, not yet bounded by rule. Each kind's bytes
+  are stated and pinned by counting-allocator tests at the range's densest rows and its longest
+  keys: a builder at most its levels' pages (a page being filled reserves one payload, keys
+  staged past what they share with the page's first, `branch::page_bytes`), its key buffers,
+  payload, run, filter and lists, and its two tries, at most a level and a label a key byte
+  (`branch::builder_bytes`, `fst::trie::builder_bytes`); a cursor an extent, four pages and its
+  reads in flight (`branch::cursor_bytes`); the store's pools at most each kind's peak
+  (`shard_db::pooled_bytes`); the branches' metadata as held (`ShardDb::memory`, exact against
+  the counting allocator). An engine at the floor's pages held no more than its configured bytes,
+  its pools at their peaks and that metadata (`tests/engine_memory.rs`): at 8-byte keys 17.4 MB
+  for 1.28 million rows, the pools' peaks 64 extents, 186 pages and three builders' lists; at
+  2,132-byte keys 189.7 MB for 32,000 rows, 96% of it pooled extents and pages at peaks of 1,480
+  and 4,437, scans opening a source for each of the trunk's in-flight bundles. Bounding those
+  bundles by rule bounds every pool. Resident metadata per extent of data: 21% at 8-byte keys
+  without values (1.25 bytes of filter and 2.3 of range filter a key), 3% at 16-byte keys with
+  100-byte values; but neither trie compresses a key's levels, so their labels are bounded only by
+  the key bytes a branch stores, and keys in pairs sharing all but a last byte, each pair parting
+  from the one before at its first byte, made the range filter and the leaf index a third of the
+  data at 2,132-byte keys: a bound below the data, by a depth past which the range filter
+  truncates and the leaf index finds its leaf another way, is the engine's to research and measure.
+  And `ShardDb::follow_machine` gives its cache, writes and records the machine's whole capacity,
+  these holdings outside it: machine-sized, an engine was OOM-killed at a billion rows in a 64 GiB
+  VM, and sooner in a 96 GiB one; its budget must leave them room.
 
 | Value (`mantle node`'s key) | Kind | Model and source |
 |---|---|---|

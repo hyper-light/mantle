@@ -287,6 +287,15 @@ pub struct Segments {
     pub pending: Option<Pending>,
 }
 
+/// The most of each pooled kind a store ever had out at once ([`Store::pool_peaks`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PoolPeaks {
+    pub buffers: usize,
+    pub spans: usize,
+    pub pages: usize,
+    pub lists: usize,
+}
+
 /// A segment booked past the admitted extents ([`Store::begin_growth`]): its first extent, its
 /// extents, and whether its file exists yet (recovered, or added by a growth that ran).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -526,7 +535,19 @@ impl Span {
     }
 }
 
-type PendingReads = VecDeque<(u64, u64, u32, bool)>;
+/// A span's read in flight: its batch number, first page, pages, and whether its delay has
+/// widened the lookahead.
+type PendingRead = (u64, u64, u32, bool);
+type PendingReads = VecDeque<PendingRead>;
+
+/// The bytes a span's list of reads in flight holds for a device's issuer taking `batches` reads at
+/// once (one with no issuer): a read a batch, the list reserving at least four (std's least
+/// capacity for elements of this size).
+pub fn span_reads_bytes(batches: usize) -> Option<usize> {
+    batches
+        .max(4)
+        .checked_mul(std::mem::size_of::<PendingRead>())
+}
 
 /// Pages a scan reads ahead ([`Store::read_page_ahead`]): an extent's buffer, the first page it
 /// holds, and the pages it holds. A scan reads one finished branch's pages, which no write
@@ -1156,6 +1177,17 @@ impl<F: BlockFile> Store<F> {
 
     pub fn trim_cache(&mut self, n: usize) -> bool {
         self.cache.as_mut().is_some_and(|c| c.trim(n))
+    }
+
+    /// The most of each pooled kind ever out at once, which its pool keeps as many of: extent
+    /// buffers, span read lists, page buffers and branch builders' lists.
+    pub fn pool_peaks(&self) -> PoolPeaks {
+        PoolPeaks {
+            buffers: self.most_lent,
+            spans: self.spans_most_lent,
+            pages: self.pages_most_lent,
+            lists: self.lists_most_lent,
+        }
     }
 
     /// The page cache's bytes in memory: its pages and the buffers it keeps for more.

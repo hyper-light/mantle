@@ -1759,16 +1759,15 @@ impl Branch {
 
 /// The most bytes a cursor holds, all from its store's pools, at pages of `page_size` bytes in
 /// extents of `extent_pages`, with the device's issuer taking `batches` reads at once (one with
-/// no issuer): its span's extent buffer and its list of reads in flight, a read a batch; a page
-/// the span may hold prepared; and its three page buffers, its leaf, its key and a value copy,
-/// which an entry fitting a page never grows ([`RunCursor::new`]). Pinned by
-/// `tests/cursor_memory.rs`.
+/// no issuer): its span's extent buffer and its list of reads in flight
+/// ([`crate::store::span_reads_bytes`]); a page the span may hold prepared; and its three page
+/// buffers, its leaf, its key and a value copy, which an entry fitting a page never grows
+/// ([`RunCursor::new`]). Pinned by `tests/cursor_memory.rs`.
 pub fn cursor_bytes(page_size: usize, extent_pages: u32, batches: usize) -> Option<u64> {
     let bytes = |n: usize| u64::try_from(n).ok();
     let page = bytes(page_size)?;
-    let read = bytes(std::mem::size_of::<(u64, u64, u32, bool)>())?;
     page.checked_mul(u64::from(extent_pages))?
-        .checked_add(read.checked_mul(bytes(batches.max(1))?)?)?
+        .checked_add(bytes(crate::store::span_reads_bytes(batches)?)?)?
         .checked_add(page.checked_mul(4)?)
 }
 

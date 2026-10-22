@@ -62,6 +62,11 @@ fn blocks_of(keys: Keys) -> usize {
     }
 }
 
+/// The bytes a filter made for `keys` holds: its blocks, reserved exactly ([`Filter::try_new`]).
+pub fn most_bytes(keys: Keys) -> Option<usize> {
+    blocks_of(keys).checked_mul(BLOCK_WORDS.checked_mul(8)?)
+}
+
 /// The block for a hash: its high 32 bits scaled into the block count (Lemire, "Fast random
 /// integer generation in an interval", ACM TOMACS 29(1), 2019).
 fn block_of(h: u64, blocks: usize) -> usize {

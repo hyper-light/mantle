@@ -23,7 +23,7 @@ use mantle_gateway::complete::{self, CompleteError, Completed, Completion};
 use mantle_gateway::get::{self, Get, GetError, Keyring};
 use mantle_gateway::layout::{Layout, SEALED};
 use mantle_gateway::put::{
-    Answer, Body, Commit, Expected, Holding, Ids, Keys, Put, PutError, Request, Stored,
+    self, Answer, Body, Commit, Expected, Holding, Ids, Keys, Put, PutError, Request, Stored,
 };
 use mantle_meta::engine::{Engine, Model};
 use mantle_meta::name::{self, CreateUpload, GateChange, Preconditions, PutPart};
@@ -1861,6 +1861,124 @@ fn blocks_go_down_together_as_the_window_admits() {
         rounds.push(n);
     }
     assert!(rounds[0] > rounds[1] && rounds[1] > rounds[2], "{rounds:?}");
+}
+
+/// A PUT holds out at most its window's blocks' chunks at once (`put::most_chunks`), and a
+/// command for each block of its body: the last block's write with a renewal of each block
+/// recorded before it, every one due, reaches that. `put::most_commands` takes the largest body
+/// S3 takes.
+#[test]
+fn a_put_holds_out_its_windows_chunks_and_a_command_a_block_at_most() {
+    let mut cell = Cell::new(4);
+    let wrapping = WrappingKey::generate().unwrap();
+    let scheme = Scheme::Copies(2);
+    let layout = Layout::new(scheme).unwrap();
+    let len = (4 * layout.segments_per_block() * seal::SEGMENT as u64) as usize;
+    let blocks = layout.blocks(len as u64);
+    let bytes = body(len, 37);
+    let mut put = new_put(&cell, object("k"), len as u64, layout, keys(150, &wrapping));
+    let (mut at, mut ended, mut writes, mut renewed) = (0usize, false, 0u64, false);
+    let (mut chunks_out, mut commands_out) = (0usize, 0u64);
+    loop {
+        while at < len && put.wants_body() {
+            at += put.feed(&bytes[at..]).unwrap();
+        }
+        if at == len && !ended {
+            put.end(&Expected::default()).unwrap();
+            ended = true;
+        }
+        let mut asked = Vec::new();
+        while let Some(request) = put.poll() {
+            asked.push(request);
+        }
+        if asked.is_empty() {
+            break;
+        }
+        writes += asked
+            .iter()
+            .filter(|(_, r)| matches!(r, Request::Block(block::Command::Write { .. })))
+            .count() as u64;
+        if writes == blocks && !renewed {
+            // The last block's write is out: time passes to every recorded block's renewal,
+            // within its handover.
+            renewed = true;
+            cell.clock += HANDOVER / 2;
+            put.tick(cell.clock).unwrap();
+            while let Some(request) = put.poll() {
+                asked.push(request);
+            }
+        }
+        let chunks = asked
+            .iter()
+            .filter(|(_, r)| matches!(r, Request::Chunk { .. }))
+            .count();
+        let commands = asked
+            .iter()
+            .filter(|(_, r)| matches!(r, Request::Block(_) | Request::File(_) | Request::Name(_)))
+            .count() as u64;
+        chunks_out = chunks_out.max(chunks);
+        commands_out = commands_out.max(commands);
+        for (id, request) in asked {
+            let answer = cell.serve(request);
+            put.answer(id, answer).unwrap();
+        }
+    }
+    assert!(matches!(put.outcome(), Some(Ok(_))), "{:?}", put.outcome());
+    assert_eq!(chunks_out, put::most_chunks(1, scheme).unwrap());
+    assert_eq!(commands_out, blocks);
+    assert!(blocks <= put::most_commands(&layout));
+}
+
+/// A GET of a coded block holds out each data chunk's span and, a span failing, whole chunks for
+/// as many as the block still needs while the other spans are out: twice its data chunks less
+/// one, past its width where its parity is less than its data less one (`get::most_chunks`).
+#[test]
+fn a_get_holds_out_twice_a_blocks_data_less_one_chunks_at_most() {
+    let len = 300_000usize;
+    let bytes = body(len, 41);
+    let code = Code::new(4, 2).unwrap();
+    let scheme = Scheme::Rs(code);
+    let (mut cell, wrapping) = stored(scheme, &bytes, 160, 6);
+    let (_, e) = file::extents(&mut cell.files, 160, 0, 1).unwrap()[0];
+    let Target::Block(b) = e.target else { panic!() };
+    let (_, places) = block::read(&mut cell.blocks, b).unwrap().unwrap();
+    cell.unreadable.insert(places[0].volume);
+    let root = Root(WrappingKey::new(wrapping.bytes()));
+    let mut get = Get::new(Some(160), len as u64, 0..len as u64, Box::new(root), 1).unwrap();
+    let (mut out, mut most) = (Vec::new(), 0usize);
+    let mut held: Vec<(get::Id, get::Request)> = Vec::new();
+    loop {
+        while let Some(r) = get.poll() {
+            held.push(r);
+        }
+        let chunks = held
+            .iter()
+            .filter(|(_, r)| matches!(r, get::Request::Chunk { .. }))
+            .count();
+        most = most.max(chunks);
+        // The failing chunk answered first, the others held while what it adds is asked.
+        let Some(at) = held
+            .iter()
+            .position(|(_, r)| matches!(r, get::Request::Chunk { volume, .. } if cell.unreadable.contains(volume)))
+            .or(if held.is_empty() { None } else { Some(0) })
+        else {
+            match get.take() {
+                Some(b) => {
+                    out.extend_from_slice(&b);
+                    continue;
+                }
+                None => break,
+            }
+        };
+        let (id, request) = held.remove(at);
+        let answer = cell.serve_get(request);
+        get.answer(id, answer).unwrap();
+    }
+    assert_eq!(get.outcome(), Some(&Ok(())));
+    assert!(out == bytes);
+    let bound = get::most_chunks(1, scheme).unwrap();
+    assert_eq!(most, bound);
+    assert!(bound > scheme.width());
 }
 
 /// A GET holds as many blocks as its window: with the caller taking nothing, it reads that

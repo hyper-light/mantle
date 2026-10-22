@@ -16,6 +16,45 @@ pub const MAX_FRAME_BYTES: u64 = 4 << 20;
 /// Bytes of records one frame holds.
 pub const FRAME_PAYLOAD: u64 = MAX_FRAME_BYTES - FRAME_HEADER as u64;
 
+/// The largest payload one record of a segment of `segment_size` bytes holds on a device of
+/// `block`-byte blocks: the segment less its header block, the record's header, its checksum
+/// table at `checksum_shift` and its padding, at most what a record's length field holds.
+pub fn record_room(segment_size: u64, block: u64, checksum_shift: u8) -> u64 {
+    let room = segment_size.saturating_sub(block);
+    let table = room
+        .checked_shr(u32::from(checksum_shift))
+        .unwrap_or(0)
+        .saturating_add(1)
+        .saturating_mul(4);
+    room.saturating_sub(crate::record::HEADER_LEN as u64)
+        .saturating_sub(table)
+        .saturating_sub(crate::record::RECORD_ALIGN as u64)
+        .min(u64::from(u32::MAX))
+}
+
+/// The least segment, a multiple of `block` and four of them at least, one record of which holds
+/// a payload of `payload` bytes ([`record_room`]); `None` past what one I/O buffer reads, the
+/// most a segment may be ([`Layout::plan`]).
+pub fn least_segment(block: u64, checksum_shift: u8, payload: u64) -> Option<u64> {
+    let most = u64::try_from(MAX_BUFFER).ok()?.min(u64::from(u32::MAX));
+    let fixed =
+        (crate::record::HEADER_LEN as u64).checked_add(crate::record::RECORD_ALIGN as u64)?;
+    // A segment of no less than the payload, its record's fixed bytes and the header block, then
+    // a block more at a time while its table, a word a checksum block, leaves the payload out.
+    let mut segment = payload
+        .checked_add(fixed)?
+        .checked_add(block)?
+        .checked_next_multiple_of(block)?
+        .max(block.checked_mul(4)?);
+    while record_room(segment, block, checksum_shift) < payload {
+        segment = segment.checked_add(block)?;
+        if segment > most {
+            return None;
+        }
+    }
+    if segment <= most { Some(segment) } else { None }
+}
+
 /// Limits on the writer's queue and batches. Each bounds memory, not throughput: a batch
 /// is everything that arrived while the previous flush ran, up to these limits.
 #[derive(Debug, Clone, Copy)]
@@ -386,6 +425,25 @@ pub fn checkpoint_bytes(fragments: u64, segments: u64, block: u64) -> Option<u64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The least segment holding a payload holds it, the segment a block smaller does not, and
+    /// an 8 MiB chunk takes the segment its record's header and table add to it on a 4 KiB
+    /// device: 8,404,992 bytes at 4 KiB checksum blocks, 8,396,800 at 64 KiB.
+    #[test]
+    fn the_least_segment_holds_its_payload_and_a_block_less_does_not() {
+        let mib8 = 8 << 20;
+        assert_eq!(least_segment(4096, 12, mib8), Some(8_404_992));
+        assert_eq!(least_segment(4096, 16, mib8), Some(8_396_800));
+        for (block, shift, payload) in [(4096, 12, 1), (4096, 12, mib8), (16_384, 14, 300_000)] {
+            let segment = least_segment(block, shift, payload).unwrap();
+            assert_eq!(segment % block, 0);
+            assert!(record_room(segment, block, shift) >= payload);
+            if segment - block >= 4 * block {
+                assert!(record_room(segment - block, block, shift) < payload);
+            }
+        }
+        assert_eq!(least_segment(4096, 12, 1 << 32), None);
+    }
 
     #[test]
     fn a_compact_volume_fits_its_log_and_segments() {

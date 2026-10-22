@@ -17,6 +17,7 @@ use std::ops::Range;
 
 use bytes::Bytes;
 use mantle_chunk::ChunkKey;
+use mantle_ec::durability::Scheme;
 use mantle_ec::{Code, EcError};
 use mantle_meta::record::{BlockHeader, ChunkPlace, Extent, FileHeader, Target, WrappedKey};
 use mantle_s3::seal::{self, DataKey, SealError, Segments};
@@ -169,6 +170,19 @@ enum Asked {
     Block(u64),
     Span(u64, usize),
     Whole(u64, usize),
+}
+
+/// The most chunk gets a get holds out at once with `window` blocks being read under `scheme`:
+/// for a coded block, its data chunks' spans at once and, a span failing, whole chunks for as
+/// many as the block still needs while the other spans are out, twice its data chunks less one,
+/// more than its width where its parity is less than its data less one; for copies, one copy at
+/// a time.
+pub fn most_chunks(window: usize, scheme: Scheme) -> Option<usize> {
+    let per_block = match scheme {
+        Scheme::Copies(_) => 1,
+        Scheme::Rs(code) => code.data().checked_mul(2)?.checked_sub(1)?,
+    };
+    window.checked_mul(per_block)
 }
 
 pub struct Get {

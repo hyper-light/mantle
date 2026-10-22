@@ -501,10 +501,15 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/node/src/command.rs` `HEAD_BYTES` | format | A command's head: the range's group, a u128 as the log names it. |
 | `crates/node/src/command.rs` `LENGTH_BYTES` | format | An answer's length before it in a reply's body, a u32. |
 | `crates/node/src/command.rs` `REPLY_HEAD_BYTES` | format | A reply's head: its status, one byte; the leader the node knows, a u64; and, for a redirect, how long until the node acts on its leader's silence, a u64 of nanoseconds. |
+| `crates/node/src/derive.rs` `BUCKET_QUOTA` | external | S3's 10,000 buckets to an owner (research/05 §10.4). |
 | `crates/node/src/derive.rs` `ELECTION_TICK` | cited | focal's election timeout of 10 ticks (docs/design/node.md §2.4; research/07 §2.2), which a range keeps though it elects by suspicion, which takes no ticks. |
 | `crates/node/src/derive.rs` `EXTENT_PAGES` | bound | The least pages an engine's extent takes: 2, extent 0 holding the superblock's two copies (`mantle_engine::store::Config`). |
 | `crates/node/src/derive.rs` `FANOUT` | cited | SplinterDB's trunk fanout of 8, at which the engine's measurements ran (docs/design/engine-structure.md §5–§6), until it is measured against mantle's key counts as §4 asks. |
+| `crates/node/src/derive.rs` `HANDOVER` | cited | HDFS's 60-second soft limit (research/22 §3.6), one of the bounds metadata.md §2 names for the window a block or file is held for the write above it, until the gateway measures research 22 §10.2's `D_b`; it bounds how long a leftover waits, not correctness. |
 | `crates/node/src/derive.rs` `HEARTBEAT_TICK` | cited | focal's heartbeat every 2 ticks (docs/design/node.md §2.4; research/07 §2.2). |
+| `crates/node/src/derive.rs` `QUANTUM` | cited | The longest a runnable thread waits behind one other, per platform (research/64): Linux 3 ms (`sysctl_sched_base_slice` 0.75 ms × (1 + log2 of up to 8 CPUs), kernel/sched/fair.c v6.12); macOS 10 ms (XNU's default preemption rate of 100 a second, osfmk/kern/sched_prim.c); Windows and elsewhere 93.75 ms, six clock intervals of 15.625 ms, a foreground thread's quantum as Microsoft measured it; a server's longer one has no length Microsoft gives. |
+| `crates/node/src/derive.rs` `REPAIR_HOURS` | cited | A day to repair a lost chunk until repair is built and measured: "a day—or more" after a power-on restart (Chansler 2012; research/15 §8.4), the longest mean the sources give. |
+| `crates/node/src/derive.rs` `TARGET` | external | A block's annual chance of loss at most, unless stated: S3's eleven nines applied per block, 10⁻¹¹ (docs/design/durability.md §1; research/15 §5). |
 | `crates/node/src/frame.rs` `CRC_BYTES` | format | A Raft frame's CRC-32C, four bytes (CLAUDE.md §6). |
 | `crates/node/src/frame.rs` `GROUP_BYTES` | format | A Raft frame's group, a u128 as the log names a range's group (hyper-log). |
 | `crates/node/src/frame.rs` `HEADER_BYTES` | derived | CRC_BYTES plus GROUP_BYTES: the bytes before a frame's message. |

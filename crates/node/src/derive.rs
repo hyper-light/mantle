@@ -4,10 +4,16 @@
 //! measured at the scale step (node.md §9.3). Each value carries its basis, which the node says
 //! at start.
 
+use std::time::Duration;
+
 use hyper_block::buf::Alignment;
 use hyper_log::{Config as LogConfig, Facts, LogError, Unfit};
+use hyper_rt::machine::bench::MIN_SAMPLES;
+use mantle_ec::durability::{self, Burst, Rates};
 use mantle_engine::store::Config as StoreConfig;
 use mantle_engine::trunk::TrunkConfig;
+use mantle_gateway::layout::Layout;
+use mantle_gateway::{get, put};
 use mantle_meta::record::{RecordError, Session};
 use mantle_meta::session::Rules;
 use mantle_meta::{key, wire};
@@ -25,6 +31,135 @@ const FANOUT: usize = 8;
 
 /// Pages of an engine's extent: the least the store takes, the superblocks' two in extent 0.
 const EXTENT_PAGES: u32 = 2;
+
+/// A block's annual chance of loss at most, unless the operator states one: S3's eleven nines,
+/// applied to each block (docs/design/durability.md §1).
+const TARGET: f64 = 1e-11;
+
+/// Hours to repair a lost chunk until repair is built and measured: "a day—or more" after a
+/// power-on restart (Chansler 2012), the longest the sources give (docs/research/15 §8.4).
+const REPAIR_HOURS: f64 = 24.0;
+
+/// Buckets an owner may have: S3's 10,000 (docs/research/05 §10.4).
+const BUCKET_QUOTA: u32 = 10_000;
+
+/// How long a block or file is held for the write above it: HDFS's 60-second soft limit
+/// (docs/research/22 §3.6), one of the bounds metadata.md §2 names for the same window, until
+/// the gateway measures research 22 §10.2's `D_b`; it bounds how long a leftover waits, not
+/// correctness.
+const HANDOVER: Duration = Duration::from_secs(60);
+
+/// The longest a runnable thread waits behind one other: Linux's base slice of 0.75 ms scaled by
+/// one and the log of up to 8 CPUs (`sysctl_sched_base_slice`, kernel/sched/fair.c v6.12), 3 ms
+/// at most (docs/research/64).
+#[cfg(target_os = "linux")]
+const QUANTUM: Duration = Duration::from_millis(3);
+/// macOS's: XNU's default preemption rate of 100 a second (osfmk/kern/sched_prim.c), 10 ms.
+#[cfg(target_os = "macos")]
+const QUANTUM: Duration = Duration::from_millis(10);
+/// Windows': a multiple of its clock interval, 15.625 ms, a foreground thread's six of them,
+/// 93.75 ms, as Microsoft measured them; a server's quantum Microsoft gives only as longer, and
+/// on a starved server the probe keeps fewer wakes and says so (docs/research/64).
+#[cfg(target_os = "windows")]
+const QUANTUM: Duration = Duration::from_micros(93_750);
+/// Elsewhere, the longest of those.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+const QUANTUM: Duration = Duration::from_micros(93_750);
+
+/// The rates a block's scheme is chosen by until mantle measures its own (docs/design/durability.md
+/// §5): each chunk lost at the worst device class's annual rate, since a block's chunks may land
+/// on any device of the cell; a power-on restart a year, destroying a hundredth of the nodes;
+/// and repair in a day. No permanent loss of a rack, zone or site has a rate the sources give.
+pub fn rates() -> Rates {
+    use durability::field::{DISK_FAILURES, POWER_LOSS_FRACTION, POWER_LOSSES};
+    Rates {
+        chunk: DISK_FAILURES / durability::YEAR,
+        domains: None,
+        bursts: vec![Burst {
+            rate: POWER_LOSSES / durability::YEAR,
+            fraction: POWER_LOSS_FRACTION,
+        }],
+        repair: REPAIR_HOURS.recip(),
+    }
+}
+
+/// A block's annual chance of loss at most: what the operator states, or S3's eleven nines.
+pub fn target(stated: Option<f64>) -> f64 {
+    stated.unwrap_or(TARGET)
+}
+
+/// Each probe of the machine's calibration runs within this: the samples its probes stop at,
+/// Wilks' 59 (hyper-rt `machine::bench::MIN_SAMPLES`), each waiting at most the longest the
+/// platform's scheduler keeps a runnable thread behind another. The budget binds only a starved
+/// host, whose probe reports the wakes it measured (hyper-rt `machine::wake`).
+pub fn probe_budget() -> Result<Duration, DeriveError> {
+    u32::try_from(MIN_SAMPLES)
+        .ok()
+        .and_then(|samples| QUANTUM.checked_mul(samples))
+        .ok_or(DeriveError::Overflow("the probe budget"))
+}
+
+/// What a node that hosts objects runs its drivers with, at the floor: a window of one block;
+/// one put and one get; S3's quota of buckets; one row each step of a bucket's attempt passes or
+/// removes, the least that moves it; HDFS's handover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gateway {
+    pub window: usize,
+    pub objects: usize,
+    pub bucket_quota: u32,
+    pub scan_rows: u32,
+    pub handover_ns: u64,
+}
+
+pub fn gateway() -> Result<Gateway, DeriveError> {
+    Ok(Gateway {
+        window: 1,
+        objects: 2,
+        bucket_quota: BUCKET_QUOTA,
+        scan_rows: 1,
+        handover_ns: u64::try_from(HANDOVER.as_nanos())
+            .map_err(|_| DeriveError::Overflow("the handover"))?,
+    })
+}
+
+/// What a node holds of its own asks at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Asks {
+    pub chunks: usize,
+    pub commands: usize,
+    pub reads: usize,
+}
+
+/// The asks a node of `gateway` holds at most, each operation it hosts the most of any scheme a
+/// block may take (`mantle_ec::durability::candidates`): a put's window of chunks at their width,
+/// or a get's spans and the whole chunks a failed span adds (`put::most_chunks`,
+/// `get::most_chunks`); a put's command for each block of the largest body S3 takes
+/// (`put::most_commands`); one read an operation; and one command besides, the node's own
+/// enlistment.
+pub fn asks(gateway: &Gateway) -> Result<Asks, DeriveError> {
+    let overflow = |what| DeriveError::Overflow(what);
+    let (mut chunks, mut commands) = (0usize, 0u64);
+    for scheme in durability::candidates() {
+        let most = put::most_chunks(gateway.window, scheme)
+            .zip(get::most_chunks(gateway.window, scheme))
+            .map(|(put, get)| put.max(get))
+            .ok_or(overflow("a scheme's chunk asks"))?;
+        chunks = chunks.max(most);
+        let layout = Layout::new(scheme).map_err(|_| overflow("a scheme's layout"))?;
+        commands = commands.max(put::most_commands(&layout));
+    }
+    let per = |n: usize| n.checked_mul(gateway.objects);
+    let commands = usize::try_from(commands)
+        .ok()
+        .and_then(per)
+        .and_then(|n| n.checked_add(1))
+        .ok_or(overflow("the command asks"))?;
+    Ok(Asks {
+        chunks: per(chunks).ok_or(overflow("the chunk asks"))?,
+        commands,
+        reads: per(1).ok_or(overflow("the read asks"))?,
+    })
+}
 
 /// Why the settings cannot be derived: a fact that admits no unit of some class of work.
 #[derive(Debug, thiserror::Error)]
@@ -239,6 +374,58 @@ mod tests {
         // A device of a larger write unit takes a page of it.
         let wide = engine(64 << 10, 1 << 30, &rules).unwrap();
         assert_eq!(wide.store.page_size % (64 << 10), 0);
+    }
+
+    /// The rates are the design's defaults until mantle measures its own: the worst device
+    /// class's loss a chunk, a yearly power-on restart taking a hundredth of the nodes, repair in
+    /// a day; and the target is S3's unless stated.
+    #[test]
+    fn the_rates_and_target_are_the_designs_defaults() {
+        let r = rates();
+        assert_eq!(r.chunk, durability::field::DISK_FAILURES / durability::YEAR);
+        assert!(r.chunk > durability::field::FLASH_FAILURES / durability::YEAR);
+        assert_eq!(r.repair, 1.0 / 24.0);
+        assert_eq!(r.bursts.len(), 1);
+        assert_eq!(r.bursts[0].fraction, durability::field::POWER_LOSS_FRACTION);
+        assert_eq!(target(None), 1e-11);
+        assert_eq!(target(Some(1e-9)), 1e-9);
+    }
+
+    /// The probe budget is Wilks' samples each at the platform's longest wait behind another
+    /// thread.
+    #[test]
+    fn the_probe_budget_is_wilks_samples_at_a_quantum_each() {
+        let budget = probe_budget().unwrap();
+        assert_eq!(budget, QUANTUM * u32::try_from(MIN_SAMPLES).unwrap());
+        assert_eq!(MIN_SAMPLES, 59);
+    }
+
+    /// A node's asks hold its operations at their most under every scheme a block may take: the
+    /// widest put's chunks or the get that adds the most whole chunks to its spans, the put of the
+    /// largest body's commands, one read each, and its enlistment.
+    #[test]
+    fn the_asks_hold_each_operation_at_its_most_under_any_scheme() {
+        let g = gateway().unwrap();
+        let a = asks(&g).unwrap();
+        let schemes = durability::candidates();
+        let chunks = schemes
+            .iter()
+            .map(|&s| match s {
+                durability::Scheme::Copies(n) => n,
+                durability::Scheme::Rs(code) => code.width().max(2 * code.data() - 1),
+            })
+            .max()
+            .unwrap();
+        assert_eq!(a.chunks, g.objects * chunks);
+        // RS(10,4): a get's 19 chunks past the widest put's 15.
+        assert_eq!(chunks, 19);
+        let blocks = schemes
+            .iter()
+            .map(|&s| Layout::new(s).unwrap().blocks(mantle_s3::body::MAX_UPLOAD))
+            .max()
+            .unwrap();
+        assert_eq!(a.commands, g.objects * usize::try_from(blocks).unwrap() + 1);
+        assert_eq!(a.reads, g.objects);
     }
 
     /// The log derived takes a frame of the range's largest entry with its shell's bytes, and a

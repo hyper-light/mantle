@@ -92,9 +92,15 @@ of each thread ahead of it:
   `std_quantum_us = (1000 * 1000) / default_preemption_rate`: 10 ms.
 - Windows: Microsoft documents the quantum's setting, not its length ("This interval is specified
   as a range because threads can be preempted and processor time is not precisely determined",
-  `Win32PrioritySeparation`, Windows 2000 resource kit); its length in clock intervals and the
-  interval's default are to be taken from the documentation of the clock's resolution when this is
-  built.
+  `Win32PrioritySeparation`, learn.microsoft.com, read 2026-10-22): by default a server takes
+  "longer, fixed-length processor intervals" and a client "shorter, variable intervals" (the same
+  page), and "Quantum durations are typically longer on a server" ("CPU Analysis",
+  learn.microsoft.com, read 2026-10-22). A Microsoft engineer measured the clock interval at
+  15.625 ms with ClockRes, wrote that "The quantum that the scheduler assigns to a thread is a
+  multiple of the tick interval", and gave a foreground thread's default as "a quantum of 18 or 6
+  tick intervals", "about 94 milliseconds" ("Know Thy Tick", Microsoft's embedded blog, 2006,
+  archived on learn.microsoft.com, read 2026-10-22). No Microsoft page gives a server's quantum
+  in intervals.
 
 ## What follows for mantle
 
@@ -122,7 +128,14 @@ of each thread ahead of it:
    absent one, a limit the OS sets for the process (cgroup v2, a Windows job), which in an
    orchestrator is the operator's statement; absent both, node.md §1.4's floor, the smallest
    budget that admits one unit of every class of work.
-6. **A restart leaves no session behind.** The dissertation's sessions expire by count or by the
+6. **A probe's budget is its samples at a quantum each.** hyper-rt's probes stop at 59 samples,
+   and each waits at most about one quantum behind a runnable thread ahead of it, so the budget is
+   59 of the platform's quanta: 3 ms on Linux, 10 ms on macOS, Microsoft's measured 6 intervals of
+   15.625 ms on Windows. On a starved Windows server, whose quantum Microsoft gives only as
+   longer, the wake probe keeps fewer wakes than its floor and reports them as quick, which each
+   shard's own wakes replace within their first few dozen (hyper-rt `machine::wake`); it refuses
+   only a host on which it measured none.
+7. **A restart leaves no session behind.** The dissertation's sessions expire by count or by the
    log's time, and a restarted client registers anew (research 06 §A1.8); a range's table then
    holds its owner's old sessions until they expire, and a node that restarts more often than the
    lifetime finds the table full. A registration that names its owner, the owner's run (a node's

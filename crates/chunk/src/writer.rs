@@ -1591,18 +1591,10 @@ impl<F: BlockFile> Writer<F> {
     }
 }
 
-/// The largest payload one record can hold: a segment less its header block.
+/// The largest payload one record can hold: a segment less its header block
+/// (`layout::record_room`).
 pub(crate) fn max_payload(geometry: &Geometry, checksum_shift: u8) -> u64 {
-    let room = geometry.segment_size.saturating_sub(geometry.block);
-    let table = room
-        .checked_shr(u32::from(checksum_shift))
-        .unwrap_or(0)
-        .saturating_add(1)
-        .saturating_mul(4);
-    room.saturating_sub(record::HEADER_LEN as u64)
-        .saturating_sub(table)
-        .saturating_sub(record::RECORD_ALIGN as u64)
-        .min(u64::from(u32::MAX))
+    crate::layout::record_room(geometry.segment_size, geometry.block, checksum_shift)
 }
 
 /// Packs `records`, in order, into frames whose records fill at most `FRAME_PAYLOAD` bytes,

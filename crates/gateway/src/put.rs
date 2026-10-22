@@ -286,6 +286,19 @@ enum Phase {
     Name,
 }
 
+/// The most chunk puts a put holds out at once with `window` blocks going down under `scheme`:
+/// each block's chunks go at once, and one refused is replaced, never added to.
+pub fn most_chunks(window: usize, scheme: Scheme) -> Option<usize> {
+    window.checked_mul(scheme.width())
+}
+
+/// The most commands a put holds out at once under `layout`: the write of each block going down
+/// and a renewal of each block recorded, a block of the largest body S3 takes each at most
+/// (`MAX_UPLOAD`); its file's write and its name's command go alone, after them.
+pub fn most_commands(layout: &Layout) -> u64 {
+    layout.blocks(MAX_UPLOAD)
+}
+
 pub struct Put {
     commit: Commit,
     body: Body,

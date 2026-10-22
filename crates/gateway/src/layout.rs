@@ -80,6 +80,11 @@ impl Layout {
         self.per_block.get()
     }
 
+    /// The stored bytes of the largest block: its segments, each whole.
+    pub fn largest_block(&self) -> Option<u64> {
+        self.per_block.get().checked_mul(SEALED)
+    }
+
     /// Blocks a file of `plain` plaintext bytes is stored in.
     pub fn blocks(&self, plain: u64) -> u64 {
         crate::div_ceil(seal::segments(plain), self.per_block)

@@ -113,6 +113,9 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/ec/src/durability.rs` `MAX_TERMS` | bound | 170 series terms at Λτ ≤ ½: past it the tail bound 2·(½)^(K+1)/(K+1)! is below every positive double (170! is the largest factorial a double holds); research/15 §4.6. |
 | `crates/ec/src/durability.rs` `MOST_COPIES` | cited | Three copies, the replication of a block still being written; research/04 §R1.1. |
 | `crates/ec/src/durability.rs` `YEAR` | derived | Unit conversion: 365.25 days × 24 h = 8766 hours. |
+| `crates/ec/src/lib.rs` `CALL_FIXED` | measured | 112 bytes a coding call keeps of its own beside its work, its output and its chunks' slots: the most measured over every code mantle stores (`tests/work_memory.rs`: encoding 112, and 208 for RS(9,6) within its slots; decoding 80 on x86_64, 48 on aarch64). |
+| `crates/ec/src/lib.rs` `CHUNK_SLOT` | measured | 16 bytes a chunk a coding call keeps: a decode's slot for each data chunk, 16 bytes each on x86_64 and aarch64 (`tests/work_memory.rs`). |
+| `crates/ec/src/lib.rs` `TABLE_BYTES` | measured | 8,912,894 bytes of tables reed-solomon-simd 3.1.0 builds at its first use and keeps for the process: its multiply table, 8 MiB; its exponent, logarithm and Walsh-transformed logarithm tables, 128 KiB each; its skew factors, 65,535 two-byte elements. Counted whole, the same, on x86_64 and aarch64 (`tests/tables_memory.rs`). |
 | `crates/engine/src/branch/mod.rs` `KEY_HEAD` | format | 4: the bytes of a page entry's head, its suffix's first 4 bytes, which a search compares before reading the entry. |
 | `crates/engine/src/branch/mod.rs` `SLOT` | format | 6: a page entry's table bytes, its offset (2) and its head (4). |
 | `crates/engine/src/fst/packed.rs` `MAX_WIDTH` | format | 32: a trie value is a `u32` (a leaf's page number, a range filter's suffix bits). |

@@ -11,7 +11,7 @@ use hyper_log::{Config as LogConfig, Facts, LogError, Unfit};
 use hyper_rt::machine::bench::MIN_SAMPLES;
 use mantle_chunk::layout::{self as volume_layout, Geometry};
 use mantle_chunk::{ChunkError, Config as VolumeConfig, Limits, Reads, index};
-use mantle_ec::durability::{self, Burst, Rates};
+use mantle_ec::durability::{self, Burst, Choice, DurabilityError, Rates, Scheme};
 use mantle_engine::store::Config as StoreConfig;
 use mantle_engine::trunk::TrunkConfig;
 use mantle_gateway::layout::Layout;
@@ -111,8 +111,8 @@ pub fn probe_budget() -> Result<Duration, DeriveError> {
 }
 
 /// What a node that hosts objects runs its drivers with, at the floor: a window of one block;
-/// one put and one get; S3's quota of buckets; one row each step of a bucket's attempt passes or
-/// removes, the least that moves it; HDFS's handover.
+/// two operations at once, of any kind, so a put and a get; S3's quota of buckets; one row each
+/// step of a bucket's attempt passes or removes, the least that moves it; HDFS's handover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Gateway {
     pub window: usize,
@@ -141,16 +141,34 @@ pub struct Asks {
     pub reads: usize,
 }
 
-/// The asks a node of `gateway` holds at most, each operation it hosts the most of any scheme a
-/// block may take (`mantle_ec::durability::candidates`): a put's window of chunks at their width,
-/// or a get's spans and the whole chunks a failed span adds (`put::most_chunks`,
-/// `get::most_chunks`); a put's command for each block of the largest body S3 takes
-/// (`put::most_commands`); one read an operation; and one command besides, the node's own
-/// enlistment.
-pub fn asks(gateway: &Gateway) -> Result<Asks, DeriveError> {
+/// The schemes a new block may take in a cell whose volume table names at most `domains` failure
+/// domains: the durability model's choice at each count of them to the widest scheme's width,
+/// as the host chooses a block's scheme over its volume table (`durability::choose`), the scheme
+/// that meets `target` with the least overhead, or the closest where none does.
+pub fn schemes(domains: usize, rates: &Rates, target: f64) -> Result<Vec<Scheme>, DeriveError> {
+    let candidates = durability::candidates();
+    let widest = candidates.iter().map(|s| s.width()).max().unwrap_or(0);
+    let mut schemes: Vec<Scheme> = Vec::new();
+    for count in 1..=domains.min(widest) {
+        if let Some(Choice::Meets { scheme, .. } | Choice::Short { scheme, .. }) =
+            durability::choose(&candidates, count, rates, target)?
+            && !schemes.contains(&scheme)
+        {
+            schemes.push(scheme);
+        }
+    }
+    Ok(schemes)
+}
+
+/// The asks a node of `gateway` holds at most, each operation it hosts the most of the schemes
+/// its blocks may take (`schemes`): a put's window of chunks at their width, or a get's spans and
+/// the whole chunks a failed span adds (`put::most_chunks`, `get::most_chunks`); a put's command
+/// for each block of the largest body S3 takes (`put::most_commands`); one read an operation; and
+/// one command besides, the node's own enlistment.
+pub fn asks(gateway: &Gateway, schemes: &[Scheme]) -> Result<Asks, DeriveError> {
     let overflow = |what| DeriveError::Overflow(what);
     let (mut chunks, mut commands) = (0usize, 0u64);
-    for scheme in durability::candidates() {
+    for &scheme in schemes {
         let most = put::most_chunks(gateway.window, scheme)
             .zip(get::most_chunks(gateway.window, scheme))
             .map(|(put, get)| put.max(get))
@@ -172,6 +190,41 @@ pub fn asks(gateway: &Gateway) -> Result<Asks, DeriveError> {
     })
 }
 
+/// The most bytes the objects a node hosts hold at once: `gateway.objects` operations of any
+/// kind, each the larger of a put and a get of the largest blocks the schemes its blocks may take
+/// make. Each is the driver's own (`put::most_bytes`, `get::most_bytes`) and the host's: a put's
+/// chunks copied to send, every chunk of every block going down, and a piece of its body carried;
+/// a get's block taken and written out. A scheme that codes adds the coding library's tables,
+/// once a process (`mantle_ec::TABLE_BYTES`).
+pub fn objects(gateway: &Gateway, schemes: &[Scheme]) -> Result<u64, DeriveError> {
+    let overflow = || DeriveError::Overflow("an operation's bytes");
+    let piece = u64::try_from(hyper_transport::RECEIVE_CHUNK).map_err(|_| overflow())?;
+    let window = u64::try_from(gateway.window).map_err(|_| overflow())?;
+    let (mut most, mut codes) = (0u64, false);
+    for &scheme in schemes {
+        let layout = Layout::new(scheme).map_err(|_| overflow())?;
+        let block = layout.largest_block().ok_or_else(overflow)?;
+        let chunk = layout.chunk_len(block).map_err(|_| overflow())?;
+        let copies = u64::try_from(scheme.width())
+            .ok()
+            .and_then(|width| width.checked_mul(chunk)?.checked_mul(window))
+            .ok_or_else(overflow)?;
+        let put = put::most_bytes(gateway.window, &layout)
+            .and_then(|bytes| bytes.checked_add(copies)?.checked_add(piece))
+            .ok_or_else(overflow)?;
+        let get = get::most_bytes(gateway.window, &layout)
+            .and_then(|bytes| bytes.checked_add(block))
+            .ok_or_else(overflow)?;
+        most = most.max(put).max(get);
+        codes |= matches!(scheme, Scheme::Rs(_));
+    }
+    let tables = if codes { mantle_ec::TABLE_BYTES } else { 0 };
+    u64::try_from(gateway.objects)
+        .ok()
+        .and_then(|objects| objects.checked_mul(most)?.checked_add(tables))
+        .ok_or_else(overflow)
+}
+
 /// Why the settings cannot be derived: a fact that admits no unit of some class of work.
 #[derive(Debug, thiserror::Error)]
 pub enum DeriveError {
@@ -191,6 +244,8 @@ pub enum DeriveError {
     Index { bytes: u64 },
     #[error("a volume: {0}")]
     Volume(#[from] ChunkError),
+    #[error("the durability model: {0}")]
+    Durability(#[from] DurabilityError),
 }
 
 /// The range's settings and rules, which every member of the cell derives alike, from the
@@ -549,8 +604,8 @@ mod tests {
     #[test]
     fn the_asks_hold_each_operation_at_its_most_under_any_scheme() {
         let g = gateway().unwrap();
-        let a = asks(&g).unwrap();
         let schemes = durability::candidates();
+        let a = asks(&g, &schemes).unwrap();
         let chunks = schemes
             .iter()
             .map(|&s| match s {
@@ -569,6 +624,48 @@ mod tests {
             .unwrap();
         assert_eq!(a.commands, g.objects * usize::try_from(blocks).unwrap() + 1);
         assert_eq!(a.reads, g.objects);
+    }
+
+    /// The schemes a block may take grow with the domains a cell holds, each no wider than them:
+    /// one copy where the cell has one domain, and past the widest candidate's width no more.
+    #[test]
+    fn the_schemes_are_the_models_choices_at_each_count_of_domains() {
+        let (r, t) = (rates(), target(None));
+        assert_eq!(
+            schemes(1, &r, t).unwrap(),
+            vec![durability::Scheme::Copies(1)]
+        );
+        let widest = durability::candidates()
+            .iter()
+            .map(|s| s.width())
+            .max()
+            .unwrap();
+        let mut before = Vec::new();
+        for domains in 1..=widest {
+            let now = schemes(domains, &r, t).unwrap();
+            assert!(now.iter().all(|s| s.width() <= domains));
+            assert!(before.iter().all(|s| now.contains(s)));
+            before = now;
+        }
+        assert_eq!(schemes(widest + 10, &r, t).unwrap(), before);
+    }
+
+    /// Two operations of the larger of a put and a get each: for one copy, a get's spans and the
+    /// other copy, the copy cut, the bytes opened and the host's block taken, past a put's
+    /// segment, block filling, block going down, its copy sent and a piece of body; a code adds
+    /// the coding library's tables once.
+    #[test]
+    fn the_objects_hold_two_operations_of_their_largest_blocks() {
+        let g = gateway().unwrap();
+        let sealed = mantle_gateway::layout::SEALED;
+        let copies = durability::Scheme::Copies(1);
+        let block = Layout::new(copies).unwrap().largest_block().unwrap();
+        assert_eq!(objects(&g, &[copies]).unwrap(), 2 * (5 * block + sealed));
+        let coded = durability::Scheme::Rs(mantle_ec::Code::new(2, 1).unwrap());
+        let both = objects(&g, &[copies, coded]).unwrap();
+        let alone = objects(&g, &[coded]).unwrap();
+        assert_eq!(both, alone);
+        assert!(alone > 2 * (5 * block + sealed) + mantle_ec::TABLE_BYTES);
     }
 
     /// The log derived takes a frame of the range's largest entry with its shell's bytes, and a

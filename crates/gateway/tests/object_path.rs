@@ -1981,6 +1981,44 @@ fn a_get_holds_out_twice_a_blocks_data_less_one_chunks_at_most() {
     assert!(bound > scheme.width());
 }
 
+/// What the drivers hold of bytes at most, at their largest blocks, worked out for a copy and a
+/// code (`put::most_bytes`, `get::most_bytes`): a put's segment, the block filling and each block
+/// going down, or a code's block coded with nothing filling beside it; a get's spans, the whole
+/// chunks read in a failed span's place, its decoding, and the plaintext opened from the bytes
+/// cut from the block.
+#[test]
+fn the_drivers_hold_their_stated_bytes_at_most() {
+    // 127 whole segments in a chunk of 8 MiB.
+    let copies = Layout::new(Scheme::Copies(1)).unwrap();
+    let b = 127 * SEALED;
+    assert_eq!(copies.largest_block(), Some(b));
+    assert_eq!(put::most_bytes(1, &copies), Some(SEALED + 2 * b));
+    assert_eq!(put::most_bytes(2, &copies), Some(SEALED + 3 * b));
+    // The spans and another copy, the copy decoded and cut, or the cut opened a segment at a time.
+    assert_eq!(get::most_bytes(1, &copies), Some(4 * b + SEALED));
+    assert_eq!(get::most_bytes(2, &copies), Some(6 * b + SEALED));
+    // 255 whole segments in two chunks of 8 MiB, a chunk of half the block each.
+    let code = Code::new(2, 1).unwrap();
+    let coded = Layout::new(Scheme::Rs(code)).unwrap();
+    let b = 255 * SEALED;
+    let c = b / 2;
+    assert_eq!(code.chunk_len(b as usize).unwrap() as u64, c);
+    let going = b + 2 * c;
+    let coding = b + code.encode_bytes(b as usize).unwrap();
+    assert!(coding > b + going);
+    assert_eq!(put::most_bytes(1, &coded), Some(SEALED + coding));
+    assert_eq!(
+        put::most_bytes(2, &coded),
+        Some(SEALED + (b + 2 * going).max(going + coding))
+    );
+    let read = b + 2 * c;
+    let decoding = code.decode_bytes(b as usize).unwrap();
+    assert_eq!(
+        get::most_bytes(1, &coded),
+        Some(read + decoding.max(2 * b + SEALED))
+    );
+}
+
 /// A GET holds as many blocks as its window: with the caller taking nothing, it reads that
 /// many and no more; and a wider window reads an object of four blocks in fewer round trips,
 /// its blocks read out of order given out in order (audit §16.3).

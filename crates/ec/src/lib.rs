@@ -60,6 +60,19 @@ impl From<reed_solomon_simd::Error> for EcError {
     }
 }
 
+/// The tables the coding library builds at its first use and keeps for the process (3.1.0
+/// `engine/tables.rs`): its multiply table, 8 MiB; its exponent, logarithm and Walsh-transformed
+/// logarithm tables, 128 KiB each; and its skew factors, 65,535 elements of two bytes. Counted
+/// whole on x86_64 and aarch64 by `tests/tables_memory.rs`.
+pub const TABLE_BYTES: u64 = 8_912_894;
+
+/// What a coding call keeps besides its work and what it returns, at most: the library's own
+/// fixed bytes, and a slot a chunk. Measured over every code mantle stores by
+/// `tests/work_memory.rs`: a decode keeps 80 bytes and 16 a data chunk on x86_64, 48 and 16 on
+/// aarch64; an encode 112, and 208 for RS(9,6).
+const CALL_FIXED: u64 = 112;
+const CHUNK_SLOT: u64 = 16;
+
 /// The codes mantle stores blocks in, as `(data, parity)`: each is tested for every loss it
 /// tolerates. RS(6,3) through RS(9,6) are the profiles docs/research/04 §R1.2 names for
 /// clusters of 9 to 15 failure domains; the narrower ones serve fewer domains.
@@ -91,6 +104,72 @@ impl Code {
     /// Chunks in all: data and parity.
     pub fn width(&self) -> usize {
         self.data.saturating_add(self.parity)
+    }
+
+    /// Whether reed-solomon-simd codes this shape at its high rate (3.1.0 `rate_default.rs`):
+    /// when the data chunks' power of two passes the parity's, or meets it with no more data
+    /// than parity.
+    fn high_rate(&self) -> Option<bool> {
+        let data = self.data.checked_next_power_of_two()?;
+        let parity = self.parity.checked_next_power_of_two()?;
+        Some(data > parity || (data == parity && self.data <= self.parity))
+    }
+
+    /// The bytes the library's encoder works in for chunks of `c` bytes: shards of `c` rounded up
+    /// to 64 bytes, as many as its rate takes (3.1.0 `rate_high.rs`, `rate_low.rs`): at the high
+    /// rate the data chunks to a multiple of the parity's power of two, at the low rate the
+    /// parity chunks to a multiple of the data's.
+    fn encode_work(&self, c: usize) -> Option<u64> {
+        let shards = if self.high_rate()? {
+            self.data
+                .checked_next_multiple_of(self.parity.checked_next_power_of_two()?)?
+        } else {
+            self.parity
+                .checked_next_multiple_of(self.data.checked_next_power_of_two()?)?
+        };
+        work_bytes(shards, c)
+    }
+
+    /// The bytes the library's decoder works in for chunks of `c` bytes: shards of `c` rounded up
+    /// to 64 bytes, the power of two at or past the other side's power of two and this side's
+    /// chunks (3.1.0 `rate_high.rs`, `rate_low.rs`).
+    fn decode_work(&self, c: usize) -> Option<u64> {
+        let shards = if self.high_rate()? {
+            self.parity
+                .checked_next_power_of_two()?
+                .checked_add(self.data)?
+        } else {
+            self.data
+                .checked_next_power_of_two()?
+                .checked_add(self.parity)?
+        };
+        work_bytes(shards.checked_next_power_of_two()?, c)
+    }
+
+    /// The most bytes `parity_of` holds coding a block of `len` bytes: the encoder's work, the
+    /// parity chunks it returns, a padded last data chunk, and the call's own.
+    pub fn encode_bytes(&self, len: usize) -> Option<u64> {
+        let c = self.chunk_len(len).ok()?;
+        let chunks = u64::try_from(self.parity.checked_add(1)?).ok()?;
+        self.encode_work(c)?
+            .checked_add(u64::try_from(c).ok()?.checked_mul(chunks)?)?
+            .checked_add(self.call_bytes()?)
+    }
+
+    /// The most bytes `decode` holds restoring a block of `len` bytes: the block, the decoder's
+    /// work, and the call's own.
+    pub fn decode_bytes(&self, len: usize) -> Option<u64> {
+        let c = self.chunk_len(len).ok()?;
+        self.decode_work(c)?
+            .checked_add(u64::try_from(len).ok()?)?
+            .checked_add(self.call_bytes()?)
+    }
+
+    /// What a call keeps of its own for this code's chunks.
+    fn call_bytes(&self) -> Option<u64> {
+        CHUNK_SLOT
+            .checked_mul(u64::try_from(self.width()).ok()?)?
+            .checked_add(CALL_FIXED)
     }
 
     /// The length of each chunk of a block of `len` bytes: the block spread over the data
@@ -132,7 +211,11 @@ impl Code {
         let c = self.chunk_len(block.len())?;
         guarded(|| {
             let mut encoder = ReedSolomonEncoder::new(self.data, self.parity, c)?;
+            // A chunk's length exactly: grown from the short span, the vector doubled past it.
             let mut padded = Vec::new();
+            padded
+                .try_reserve_exact(c)
+                .map_err(|_| EcError::TooLarge(c))?;
             for i in 0..self.data {
                 let bytes = block
                     .get(self.data_span(block.len(), i)?)
@@ -338,6 +421,13 @@ type Each<'a> = dyn FnMut(usize, &[u8]) -> Result<(), EcError> + 'a;
 fn guarded<T>(f: impl FnOnce() -> Result<T, EcError>) -> Result<T, EcError> {
     catch_unwind(AssertUnwindSafe(f))
         .unwrap_or_else(|_| Err(EcError::Library("the library panicked".into())))
+}
+
+/// `shards` of chunks of `c` bytes as the library holds them: each `c` rounded up to whole
+/// 64-byte lines (3.1.0 `engine/shards.rs`).
+fn work_bytes(shards: usize, c: usize) -> Option<u64> {
+    let line = c.checked_next_multiple_of(64)?;
+    u64::try_from(shards.checked_mul(line)?).ok()
 }
 
 #[cfg(test)]

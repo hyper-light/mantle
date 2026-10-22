@@ -748,6 +748,7 @@ dependencies = [
 name = "mantle-ec"
 version = "0.1.0"
 dependencies = [
+ "hyper-measure",
  "proptest",
  "reed-solomon-simd",
  "thiserror",

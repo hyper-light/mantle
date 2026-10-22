@@ -22,7 +22,7 @@ use mantle_ec::{Code, EcError};
 use mantle_meta::record::{BlockHeader, ChunkPlace, Extent, FileHeader, Target, WrappedKey};
 use mantle_s3::seal::{self, DataKey, SealError, Segments};
 
-use crate::layout::SEALED;
+use crate::layout::{Layout, SEALED};
 
 /// A request's name among those in flight.
 pub type Id = u64;
@@ -183,6 +183,35 @@ pub fn most_chunks(window: usize, scheme: Scheme) -> Option<usize> {
         Scheme::Rs(code) => code.data().checked_mul(2)?.checked_sub(1)?,
     };
     window.checked_mul(per_block)
+}
+
+/// The most bytes a get holds with a window of `window` blocks under `layout`, its blocks the
+/// largest. A block being read holds the spans it read, the plaintext's, and, once a span
+/// failed, the whole chunks read in their place: a code's data chunks, a copy's one other copy.
+/// The block finishing holds them through its decoding, a code's restoring the block from its
+/// chunks (`Code::decode_bytes`) and a copy's copying the copy, then the stored bytes it wants
+/// cut from the block, and the plaintext it opens into from them a segment at a time, beside
+/// the others the window holds.
+pub fn most_bytes(window: usize, layout: &Layout) -> Option<u64> {
+    let block = layout.largest_block()?;
+    let others = u64::try_from(window.checked_sub(1)?).ok()?;
+    let (whole, decoding) = match layout.scheme() {
+        Scheme::Copies(_) => (block, block.checked_mul(2)?),
+        Scheme::Rs(code) => {
+            let len = usize::try_from(block).ok()?;
+            let chunk = u64::try_from(code.chunk_len(len).ok()?).ok()?;
+            (
+                chunk.checked_mul(u64::try_from(code.data()).ok()?)?,
+                code.decode_bytes(len)?.max(block.checked_mul(2)?),
+            )
+        }
+    };
+    let read = block.checked_add(whole)?;
+    let decoded = read.checked_add(decoding)?;
+    let opened = read
+        .checked_add(block.checked_mul(2)?)?
+        .checked_add(SEALED)?;
+    read.checked_mul(others)?.checked_add(decoded.max(opened))
 }
 
 pub struct Get {

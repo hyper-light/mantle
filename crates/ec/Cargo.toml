@@ -14,6 +14,8 @@ reed-solomon-simd.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# The coding work's bytes, counted by its allocator (tests/work_memory.rs).
+hyper-measure = { path = "../../vendor/hyper-measure" }
 proptest.workspace = true
 
 [lints]

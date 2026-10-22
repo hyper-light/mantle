@@ -22,7 +22,7 @@ use mantle_s3::checksum::{self, Algorithm, Hasher};
 use mantle_s3::crypto::CryptoError;
 use mantle_s3::seal::{self, DataKey, SealError, Segments};
 
-use crate::layout::{Layout, LayoutError};
+use crate::layout::{Layout, LayoutError, SEALED};
 
 /// A block's deadline is renewed once this fraction of the handover time has passed since the
 /// gateway asked for the write or renewal that set it: a quarter, as Centrifuge's owners renew
@@ -297,6 +297,34 @@ pub fn most_chunks(window: usize, scheme: Scheme) -> Option<usize> {
 /// (`MAX_UPLOAD`); its file's write and its name's command go alone, after them.
 pub fn most_commands(layout: &Layout) -> u64 {
     layout.blocks(MAX_UPLOAD)
+}
+
+/// The most bytes a put holds with `window` blocks going down under `layout`, its blocks the
+/// largest: the segment it seals in; the block filling, or a full one waiting once the window is
+/// full; and each block going down, which a copy shares, and beside which a code keeps its
+/// parity and a last data chunk the block does not fill, padded. A block is coded only once the
+/// one filling was taken whole, or the body stopped for the one waiting, so its coding
+/// (`Code::encode_bytes`) has no block filling beside it, only the others going down.
+pub fn most_bytes(window: usize, layout: &Layout) -> Option<u64> {
+    let block = layout.largest_block()?;
+    let window = u64::try_from(window).ok()?;
+    let (going, coding) = match layout.scheme() {
+        Scheme::Copies(_) => (block, block),
+        Scheme::Rs(code) => {
+            let len = usize::try_from(block).ok()?;
+            let chunk = u64::try_from(code.chunk_len(len).ok()?).ok()?;
+            let kept = chunk.checked_mul(u64::try_from(code.parity()).ok()?.checked_add(1)?)?;
+            (
+                block.checked_add(kept)?,
+                block.checked_add(code.encode_bytes(len)?)?,
+            )
+        }
+    };
+    let sending = block.checked_add(going.checked_mul(window)?)?;
+    let coded = going
+        .checked_mul(window.checked_sub(1)?)?
+        .checked_add(coding)?;
+    SEALED.checked_add(sending.max(coded))
 }
 
 pub struct Put {

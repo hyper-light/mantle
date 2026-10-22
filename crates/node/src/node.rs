@@ -366,14 +366,16 @@ pub struct Status {
 }
 
 /// A peer's link as the node keeps it: whether the plane holds keys for its connection, the
-/// dials made to it, the connections and dials to it that ended, and the last refusal one ended
-/// with, as its peer or this side stated it (`None` when none was stated: a timeout, the path).
+/// dials made to it, the connections and dials to it that ended, the times this node's detectors
+/// came to suspect it, and the last refusal one ended with, as its peer or this side stated it
+/// (`None` when none was stated: a timeout, the path).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Link {
     pub peer: PeerId,
     pub keyed: bool,
     pub dials: u64,
     pub ended: u64,
+    pub suspected: u64,
     pub refusal: Option<Refusal>,
 }
 
@@ -443,10 +445,11 @@ struct Remote {
     backoff: Duration,
     /// Redials paused for so far: the draw each pause's jitter takes ([`bounds::pause`]).
     redials: u32,
-    /// Dials made to it, connections and dials to it that ended, and the last refusal one ended
-    /// with ([`Link`]).
+    /// Dials made to it, connections and dials to it that ended, the times this node's detectors
+    /// came to suspect it, and the last refusal one ended with ([`Link`]).
     dials: u64,
     ended: u64,
+    suspected: u64,
     refusal: Option<Refusal>,
 }
 
@@ -845,6 +848,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 redials: 0,
                 dials: 0,
                 ended: 0,
+                suspected: 0,
                 refusal: None,
             })
             .collect();
@@ -1112,6 +1116,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             keyed: r.keyed,
             dials: r.dials,
             ended: r.ended,
+            suspected: r.suspected,
             refusal: r.refusal,
         })
     }
@@ -1452,6 +1457,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let _ = self.plane.queue(peer, &message);
         }
         for change in std::mem::take(&mut self.asked.changes) {
+            if let Change::Suspected(suspicion) = &change
+                && let Some(remote) = self.remotes.iter_mut().find(|r| r.id == suspicion.peer)
+            {
+                remote.suspected = remote.suspected.saturating_add(1);
+            }
             self.owner.believe(&change);
             self.liveness_moved = true;
         }

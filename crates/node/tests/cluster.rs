@@ -1809,10 +1809,21 @@ fn leader_cut_off(engines: Engines, nodes: u64) {
             (pair, cell.watch.links.get(&pair).map_or(0, |l| l.ended))
         })
         .collect();
+    let others: Vec<u64> = (1..=cell.nodes).filter(|id| *id != leader).collect();
+    // What the nodes the cut leaves joined have suspected of one another, all told: each node's
+    // detectors judge each peer apart.
+    let joined_suspicions = |w: &Watch| -> u64 {
+        others
+            .iter()
+            .flat_map(|of| others.iter().map(move |to| (*of, *to)))
+            .filter_map(|pair| w.links.get(&pair))
+            .map(|link| link.suspected)
+            .sum()
+    };
+    let suspected_at_cut = joined_suspicions(&cell.watch);
     cell.isolate(leader, true);
     // The other nodes elect one of themselves, in a later term than the one cut off leads.
     let led = cell.watch.status[&leader].term;
-    let others: Vec<u64> = (1..=cell.nodes).filter(|id| *id != leader).collect();
     let elected = cell.watch.until(&cell.reports, |w| {
         let named: Vec<&Status> = others.iter().filter_map(|id| w.status.get(id)).collect();
         let first = named.first()?;
@@ -1852,10 +1863,25 @@ fn leader_cut_off(engines: Engines, nodes: u64) {
         });
         if told { Some(()) } else { None }
     });
-    // Joined again, it follows the new leader and applies the write as the others did.
+    // Joined again, it follows the leader the others follow and applies the write as they did.
     cell.isolate(leader, false);
     assert_eq!(cell.applied_everywhere(2), applied);
-    assert_eq!(cell.leader(), elected);
+    let follows = cell.leader();
+    // A node cut off and joined again moves no leader its peers trust (pre-vote and check-quorum,
+    // Ongaro's dissertation §9.6): the leader the others elected leads still unless their own
+    // detectors, which the cut never touched, came to suspect one another, as a host that stalls
+    // makes them, for only that ends its lead. It steps down for want of a quorum it trusts, a
+    // hand-over is ordered only at a step-down, and an election wins only votes that no longer
+    // trust it. Each node's report of a suspicion comes before its status moves, and the leader
+    // the nodes agree on is read from their statuses, so the count read here holds every
+    // suspicion behind a change.
+    let suspected = joined_suspicions(&cell.watch) - suspected_at_cut;
+    if suspected == 0 {
+        assert_eq!(
+            follows, elected,
+            "the leader moved though no node the cut left joined suspected another"
+        );
+    }
     cell.close();
 }
 

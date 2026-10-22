@@ -41,9 +41,10 @@
 //! and
 //! `replaced GROUP FAILED JOINING` once, from the node that led the range then, when a
 //! replacement ended; and
-//! `link PEER KEYED DIALS ENDED REFUSAL` when a peer's link changes: whether the plane holds keys
-//! for its connection, the dials made to it, the connections and dials to it that ended, and the
-//! last refusal one ended with (`Node::links`); and `moved BYTES SERVE_NS` as its transfers move:
+//! `link PEER KEYED DIALS ENDED SUSPECTED REFUSAL` when a peer's link changes: whether the plane
+//! holds keys for its connection, the dials made to it, the connections and dials to it that
+//! ended, the times the node's detectors came to suspect it, and the last refusal one ended with
+//! (`Node::links`); and `moved BYTES SERVE_NS` as its transfers move:
 //! the bytes of exchanges' bodies it has read and written (`Node::moved`), said at most every half
 //! of the transport's serve period `SERVE_NS`, the longest an exchange it carries may go without
 //! moving before the transport refuses it. On
@@ -800,11 +801,12 @@ async fn serve(
                 .refusal
                 .map_or_else(|| "none".into(), |r| format!("{r:?}"));
             let line = format!(
-                "link {} {} {} {} {refusal}\n",
+                "link {} {} {} {} {} {refusal}\n",
                 now.peer,
                 if now.keyed { "keyed" } else { "unkeyed" },
                 now.dials,
-                now.ended
+                now.ended,
+                now.suspected
             );
             say(&mut output, &line).await?;
             match links.get_mut(at) {

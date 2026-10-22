@@ -43,7 +43,10 @@
 //! replacement ended; and
 //! `link PEER KEYED DIALS ENDED REFUSAL` when a peer's link changes: whether the plane holds keys
 //! for its connection, the dials made to it, the connections and dials to it that ended, and the
-//! last refusal one ended with (`Node::links`). On
+//! last refusal one ended with (`Node::links`); and `moved BYTES SERVE_NS` as its transfers move:
+//! the bytes of exchanges' bodies it has read and written (`Node::moved`), said at most every half
+//! of the transport's serve period `SERVE_NS`, the longest an exchange it carries may go without
+//! moving before the transport refuses it. On
 //! standard input: `learn ID QUIC PLANE`, where a peer listens, and `replace FAILED JOINING`, a
 //! member lost for good and the spare that takes its place in every range the node hosts
 //! (`Node::replace`). A line it cannot read ends the process with the line named; standard input
@@ -711,6 +714,13 @@ async fn serve(
     let mut stats: Option<Box<LogStats>> = None;
     // Each peer's link as last said, a peer a slot.
     let mut links: Vec<Link> = Vec::with_capacity(config.peers.len());
+    // The bytes its transfers moved as last said, and when: said again once they move, at most
+    // every half of the transport's serve period, the longest an exchange it carries may go
+    // without moving before the transport refuses it, so while a transfer lives the next is said
+    // within one serve period of the last.
+    let serve = crate::bounds::idle_timeout();
+    let serve_ns = u64::try_from(serve.as_nanos()).unwrap_or(u64::MAX);
+    let mut said_moved = (0u64, 0u64);
     loop {
         let ended = {
             let turn = pin!(node.turn());
@@ -777,6 +787,12 @@ async fn serve(
                 Some(was) => *was = now,
                 None => links.push(now),
             }
+        }
+        let moved = node.moved();
+        let now = hyper_rt::futures::now_ns();
+        if moved != said_moved.0 && now.saturating_sub(said_moved.1) >= serve_ns / 2 {
+            say(&mut output, &format!("moved {moved} {serve_ns}\n")).await?;
+            said_moved = (moved, now);
         }
         let mut said = false;
         for ((group, _), was) in config.ranges.iter().zip(told.iter_mut()) {

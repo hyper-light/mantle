@@ -671,6 +671,9 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     abandoned: Vec<host::Pending>,
     /// The volume table as this node's member of the root range last held it (`host::Table`).
     table: Option<host::Table>,
+    /// Bytes of exchanges' bodies this node has read and written: its transfers' progress
+    /// ([`Node::moved`]).
+    moved: u64,
 }
 
 /// The node's message bounds: a Raft message is at most the larger of a page of entries and one
@@ -891,6 +894,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             jobs: Vec::new(),
             abandoned: Vec::new(),
             table: None,
+            moved: 0,
         };
         for kept in &node.ranges {
             node.owner
@@ -1085,6 +1089,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.log
             .stats(into)
             .map_err(|e| NodeError::Log(e.to_string()))
+    }
+
+    /// Bytes of exchanges' bodies the node has read and written since it opened: what its
+    /// transfers moved (a put's body taken, a chunk's sent or received, a get's bytes written).
+    pub fn moved(&self) -> u64 {
+        self.moved
     }
 
     /// Each peer's link as the node keeps it.
@@ -1922,7 +1932,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             {
                 match endpoint.write_body(exchange, rest) {
                     Ok(0) => break,
-                    Ok(took) => writing.written = writing.written.saturating_add(took),
+                    Ok(took) => {
+                        writing.written = writing.written.saturating_add(took);
+                        self.moved = self
+                            .moved
+                            .saturating_add(u64::try_from(took).unwrap_or(u64::MAX));
+                    }
                     Err(_) => {
                         failed = true;
                         break;
@@ -2004,9 +2019,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             };
             let got = endpoint.read_body(exchange, &mut into);
             let piece = into.bytes();
-            receiving.read = receiving
-                .read
-                .saturating_add(u64::try_from(piece.len()).unwrap_or(u64::MAX));
+            let len = u64::try_from(piece.len()).unwrap_or(u64::MAX);
+            receiving.read = receiving.read.saturating_add(len);
+            self.moved = self.moved.saturating_add(len);
             if receiving.what.keeps() {
                 receiving.bytes.extend_from_slice(piece);
             }

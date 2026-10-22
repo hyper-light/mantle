@@ -6,6 +6,10 @@
 //! A node that names no leader, its range electing, is asked again after RFC 6298 §5.5's
 //! doubling backoff from QUIC's initial probe timeout (`crate::bounds::initial_pto`); a node the
 //! client cannot reach, or whose exchange was refused, is passed over for the next it knows.
+//! An object's request, asked of the node its caller names, is asked again of it after the same
+//! pause when the node cannot have taken it: its connection refused at the node's admission, for
+//! the identity's connections all in use (a client of the same identity that ended, its close
+//! lost, holds them until they idle), or its exchange given no stream.
 //!
 //! **How long an exchange is given** (hyper-transport's progress period): by hyper-timing's law for
 //! a round (`RoundBudget::derive`), a node nothing is known about is never cut off before the
@@ -133,6 +137,8 @@ struct Known {
     /// the next one's period (RFC 6298 §5.5), and its reply, a new measurement of it, sets it back
     /// (§5).
     stalled: u32,
+    /// Why its last connection or dial ended, where it said.
+    refused: Option<Refusal>,
 }
 
 /// RFC 9002 §7.6.1's `kPersistentCongestionThreshold`: probe timeouts with no acknowledgement
@@ -191,6 +197,7 @@ impl Client {
                 connected: false,
                 epoch: 0,
                 stalled: 0,
+                refused: None,
             })
             .collect();
         let (directory, now) = (Peers::new(settings.nodes), std::time::Instant::now());
@@ -628,7 +635,41 @@ impl Client {
     /// bytes, or a range got. The reply, with a get's bytes, or the refusal that ended the exchange
     /// unanswered, after which a put may still have committed (asking it again with the same
     /// identity is answered from what it made, gateway.md §2.1).
+    ///
+    /// A request `node` cannot have taken is asked again, after the client's pause, by
+    /// `deadline_ns`: its connection refused at the node's admission, which takes a connection
+    /// before any stream on it (hyper-transport), as a node does an identity whose connections are
+    /// all in use, a client of the same identity that ended and whose close was lost holding them
+    /// until they idle; or its exchange given no stream (`Refusal::Unsent`).
     pub async fn object(
+        &mut self,
+        node: PeerId,
+        op: &Op,
+        data: &[u8],
+        deadline_ns: u64,
+    ) -> Result<ObjectOutcome, ClientError> {
+        // RFC 6298 §5.5, as `request` waits.
+        let mut backoff = self.measured_pto();
+        loop {
+            match self.object_once(node, op, data, deadline_ns).await? {
+                ObjectOutcome::Lost(refusal) if untaken(refusal) => {
+                    let pause = bounds::pause(backoff, self.id, self.waits);
+                    self.waits = self.waits.wrapping_add(1);
+                    let wait = u64::try_from(pause.as_nanos()).unwrap_or(u64::MAX);
+                    self.wait_until(
+                        hyper_rt::futures::now_ns().saturating_add(wait),
+                        deadline_ns,
+                    )
+                    .await?;
+                    backoff = bounds::backed_off(backoff);
+                }
+                outcome => return Ok(outcome),
+            }
+        }
+    }
+
+    /// One object exchange with `node`, as [`Self::object`] asks it.
+    async fn object_once(
         &mut self,
         node: PeerId,
         op: &Op,
@@ -639,7 +680,14 @@ impl Client {
             .encode()
             .map_err(|e| ClientError::Bounds(e.to_string()))?;
         if !self.reach(node, deadline_ns).await? {
-            return Ok(ObjectOutcome::Lost(Refusal::NotConnected));
+            let refused = self
+                .nodes
+                .iter()
+                .find(|n| n.id == node)
+                .and_then(|n| n.refused);
+            return Ok(ObjectOutcome::Lost(
+                refused.unwrap_or(Refusal::NotConnected),
+            ));
         }
         let clock = self.driver.clock()?;
         let now_ns = hyper_rt::futures::now_ns();
@@ -714,15 +762,32 @@ impl Client {
                         return reply_of(replied, done);
                     }
                 }
+                // Its connection closed: the transport queues why with the exchange's refusal
+                // (`Event::Closed`), which says whether the node took the request at all.
+                Event::Refused {
+                    exchange: e,
+                    refusal: Refusal::Closed,
+                    ..
+                } if e == exchange => {
+                    while let Some(event) = self.driver.endpoint().poll_event() {
+                        if let Event::Closed { peer, refusal, .. }
+                        | Event::Unreachable { peer, refusal } = self.keep(event)
+                            && peer == node
+                        {
+                            return Ok(ObjectOutcome::Lost(refusal.unwrap_or(Refusal::Closed)));
+                        }
+                    }
+                    return Ok(ObjectOutcome::Lost(Refusal::Closed));
+                }
                 Event::Refused {
                     exchange: e,
                     refusal,
                     ..
                 } if e == exchange => return Ok(ObjectOutcome::Lost(refusal)),
-                Event::Closed { peer, .. } | Event::Unreachable { peer, .. } => {
+                Event::Closed { peer, refusal, .. } | Event::Unreachable { peer, refusal } => {
                     self.lost(peer);
                     if peer == node {
-                        return Ok(ObjectOutcome::Lost(Refusal::Closed));
+                        return Ok(ObjectOutcome::Lost(refusal.unwrap_or(Refusal::Closed)));
                     }
                 }
                 _ => {}
@@ -880,8 +945,11 @@ impl Client {
                     node.epoch = *epoch;
                 }
             }
-            Event::Closed { peer, .. } | Event::Unreachable { peer, .. } => {
+            Event::Closed { peer, refusal, .. } | Event::Unreachable { peer, refusal } => {
                 let peer = *peer;
+                if let Some(node) = self.nodes.iter_mut().find(|n| n.id == peer) {
+                    node.refused = *refusal;
+                }
                 self.lost(peer);
             }
             _ => {}
@@ -961,6 +1029,22 @@ pub enum ObjectOutcome {
     /// The exchange ended unanswered: its node is unreachable or refused it, or its connection
     /// closed.
     Lost(Refusal),
+}
+
+/// Whether a request lost with `refusal` was never taken by its node: its connection refused at
+/// the node's admission for the node's capacity, which comes before any stream on it is taken
+/// (hyper-transport's `Endpoint`), or its exchange given no stream (`Refusal::Unsent`). A
+/// certificate refused (`Identity`) is no capacity's, and asking again changes nothing.
+fn untaken(refusal: Refusal) -> bool {
+    matches!(
+        refusal,
+        Refusal::Pending
+            | Refusal::Identities
+            | Refusal::Connections
+            | Refusal::Busy
+            | Refusal::Events
+            | Refusal::Unsent
+    )
 }
 
 /// A reply whose body was read whole: its tags taken from the body's start, the rest a get's bytes.

@@ -231,6 +231,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             };
             let got = endpoint.read_body(exchange, &mut piece);
             names.extend_from_slice(piece.bytes());
+            self.moved = self
+                .moved
+                .saturating_add(u64::try_from(piece.bytes().len()).unwrap_or(u64::MAX));
             endpoint.release(piece);
             match got {
                 Ok(0) if names.len() < wanted => return Ok(false),
@@ -847,6 +850,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             };
             let got = endpoint.read_body(exchange, &mut piece);
             putting.carry.extend_from_slice(piece.bytes());
+            self.moved = self
+                .moved
+                .saturating_add(u64::try_from(piece.bytes().len()).unwrap_or(u64::MAX));
             endpoint.release(piece);
             match got {
                 Ok(0) if putting.carry.is_empty() => return Ok(()),
@@ -1116,10 +1122,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             match endpoint.write_body(exchange, rest) {
                 Ok(0) => return Ok(false),
                 Ok(took) => {
+                    let took_bytes = u64::try_from(took).unwrap_or(u64::MAX);
                     *written = written.saturating_add(took);
-                    getting.written = getting
-                        .written
-                        .saturating_add(u64::try_from(took).unwrap_or(u64::MAX));
+                    getting.written = getting.written.saturating_add(took_bytes);
+                    self.moved = self.moved.saturating_add(took_bytes);
                 }
                 Err(_) => {
                     endpoint.refuse_exchange(exchange, Refusal::Closed);
@@ -1266,6 +1272,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 return Ok(false);
             };
             let got = endpoint.read_body(exchange, &mut piece);
+            self.moved = self
+                .moved
+                .saturating_add(u64::try_from(piece.bytes().len()).unwrap_or(u64::MAX));
             endpoint.release(piece);
             match got {
                 Ok(0) => break,
@@ -1309,7 +1318,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         {
             match endpoint.write_body(exchange, rest) {
                 Ok(0) => return Ok(false),
-                Ok(took) => *written = written.saturating_add(took),
+                Ok(took) => {
+                    *written = written.saturating_add(took);
+                    self.moved = self
+                        .moved
+                        .saturating_add(u64::try_from(took).unwrap_or(u64::MAX));
+                }
                 Err(_) => return Ok(true),
             }
         }

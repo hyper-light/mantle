@@ -313,6 +313,9 @@ enum Line {
     Volume(u128),
     /// The root range took the node's enlistment of itself and its volumes.
     Enlisted,
+    /// The bytes the node's transfers moved, said as they move, and its transport's serve period:
+    /// the longest an exchange it carries may go without moving before the transport refuses it.
+    Moved(u64, Duration),
 }
 
 fn parse(line: &str) -> Option<Line> {
@@ -327,6 +330,10 @@ fn parse(line: &str) -> Option<Line> {
         ["link", peer, rest @ ..] => Some(Line::Link(peer.parse().ok()?, rest.join(" "))),
         ["volume", id] => Some(Line::Volume(u128::from_str_radix(id, 16).ok()?)),
         ["enlisted"] => Some(Line::Enlisted),
+        ["moved", bytes, serve] => Some(Line::Moved(
+            bytes.parse().ok()?,
+            Duration::from_nanos(serve.parse().ok()?),
+        )),
         ["log", flushing, longest] => {
             let flushing = Duration::from_nanos(flushing.parse().ok()?);
             let flushing = if flushing.is_zero() {
@@ -386,7 +393,8 @@ fn movement(line: &Line) -> Option<(u64, u64, u64, u64, Duration, Duration)> {
         | Line::Link(..)
         | Line::Log(..)
         | Line::Volume(..)
-        | Line::Enlisted => None,
+        | Line::Enlisted
+        | Line::Moved(..) => None,
     }
 }
 
@@ -638,6 +646,9 @@ struct Cell {
     /// Each node's log as it last said, and when that was heard: its flush out, if one was, and the
     /// longest an update has waited for its commit.
     log: BTreeMap<u64, (Instant, Option<Duration>, Duration)>,
+    /// The bytes each node's transfers moved as it last said, and its transport's serve period: a
+    /// transfer that lives moves within one, so the quiet period is never shorter.
+    transfers: BTreeMap<u64, (u64, Duration)>,
     relay: Option<Relay>,
     /// Where the running workload's clients are told of a node started again.
     learns: Vec<Sender<(u64, SocketAddr)>>,
@@ -781,6 +792,7 @@ impl Cell {
             replaced: BTreeSet::new(),
             links: BTreeMap::new(),
             log: BTreeMap::new(),
+            transfers: BTreeMap::new(),
             relay: (network == Network::Relayed)
                 .then(|| Relay::start(&(1..=nodes).collect::<Vec<_>>())),
             learns: Vec::new(),
@@ -952,6 +964,7 @@ impl Cell {
         running.child.wait().unwrap();
         self.status.retain(|(node, _), _| *node != id);
         self.log.remove(&id);
+        self.transfers.remove(&id);
         self.hold();
     }
 
@@ -973,9 +986,11 @@ impl Cell {
                 | Line::Link(..)
                 | Line::Log(..)
                 | Line::Volume(..)
-                | Line::Enlisted => None,
+                | Line::Enlisted
+                | Line::Moved(..) => None,
             })
             .chain(self.clients.values().copied())
+            .chain(self.transfers.values().map(|(_, serve)| *serve))
             .fold(INITIAL_RTO, Duration::max)
     }
 
@@ -1129,6 +1144,14 @@ impl Cell {
                     Line::Enlisted => {
                         self.enlisted.insert(id);
                     }
+                    // Bytes moving are the cell moving, though no range moves with them: a block's
+                    // chunks crossing to the nodes that store them commit nothing until all land.
+                    Line::Moved(bytes, serve) => {
+                        let was = self.transfers.insert(id, (bytes, serve));
+                        if was.is_some_and(|(before, _)| before == bytes) {
+                            return;
+                        }
+                    }
                 }
             }
             // A process ended that the cell did not kill: it failed.
@@ -1145,6 +1168,7 @@ impl Cell {
                     self.refused = self.running.remove(&id);
                     self.status.retain(|(node, _), _| *node != id);
                     self.log.remove(&id);
+                    self.transfers.remove(&id);
                 }
             }
             Heard::Told(Told::Progress(client, done, patience)) => {

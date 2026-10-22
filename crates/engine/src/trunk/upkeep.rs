@@ -127,6 +127,18 @@ impl Running {
     }
 }
 
+/// What a pivot does with its bundle now ([`Trunk::flush_due`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Flush {
+    /// Flushes it to its child.
+    Now,
+    /// Is due to, but its child, named, takes no flush until its live in-flight bundles fall
+    /// below the fanout.
+    Held(usize),
+    /// Keeps it.
+    No,
+}
+
 impl Trunk {
     /// Queues node `n` to be looked at, once until it is.
     pub(super) fn queue(&mut self, n: usize) {
@@ -142,14 +154,17 @@ impl Trunk {
     /// above the root's pivot bundles (the pending branches and a pivot's live in-flight ones),
     /// the bound a pivot's bundle has before it flushes.
     pub fn has_room(&self) -> bool {
-        let live = self.nodes.get(self.root).map_or(0, |node| {
-            node.pivots
-                .iter()
-                .map(|p| node.inflight.len().saturating_sub(p.start))
-                .max()
-                .unwrap_or(0)
-        });
+        let live = self.nodes.get(self.root).map_or(0, Node::live_most);
         self.pending.len().saturating_add(live) < self.config.fanout
+    }
+
+    /// Whether node `n` takes a flush: fewer than `fanout` live in-flight bundles for every pivot,
+    /// the bound the root's [`Self::has_room`] keeps for the pending branches. A flush lands up to
+    /// `fanout + 1` more (a bundle past the fanout), so a node holds at most `2 fanout`, and
+    /// `3 fanout + 1` for the moment between the last flush before its split, which does not wait
+    /// ([`Self::flush_due`]), and the split, which takes them.
+    fn takes_flush(&self, n: usize) -> Result<bool, Error> {
+        Ok(self.node(n)?.live_most() < self.config.fanout)
     }
 
     /// Whether maintenance is in progress: tasks out, nodes to look at, a change wanted, or a
@@ -172,6 +187,8 @@ impl Trunk {
         let node = self.node_mut(n)?;
         let was_empty = node.inflight.is_empty();
         node.inflight.push(bundle);
+        let live = u64::try_from(node.live_most()).unwrap_or(u64::MAX);
+        self.stats.inflight_most = self.stats.inflight_most.max(live);
         if was_empty {
             self.inflight_nodes = self.inflight_nodes.checked_add(1).ok_or(corrupt())?;
         }
@@ -510,8 +527,12 @@ impl Trunk {
             }
         }
         for i in 0..pivots {
-            if self.flush_due(n, i)? {
-                self.flush_pivot(n, i)?;
+            match self.flush_due(n, i)? {
+                Flush::Now => self.flush_pivot(n, i)?,
+                // Looked at again once the child's live in-flight bundles fall below the fanout
+                // ([`Self::wake_held`]).
+                Flush::Held(child) => self.node_mut(child)?.held_by = Some(n),
+                Flush::No => {}
             }
         }
         self.flush_fullest(n)?;
@@ -527,6 +548,7 @@ impl Trunk {
         Ok(node.inflight.len() > pivot.start
             && !self.compacting(n, &pivot.key)
             && !self.held(pivot)?
+            && !self.waits_for_child(pivot)?
             && !(node.leaf && {
                 // A leaf whose settle is due takes its in-flight bundles, and one waiting for a
                 // consolidation's flush will: either way they are merged once, by the settle.
@@ -622,48 +644,87 @@ impl Trunk {
         }
     }
 
-    /// Whether pivot `i` of node `n` flushes its bundle to its child now: past the fanout, the
-    /// last flush before its child splits, or a consolidation's through a paid or marked pivot.
-    /// A consolidation carries the pivot's data down, so it waits for the pivot's live in-flight
-    /// bundles to be compacted into the bundle, and flushes even an empty one, so the rent is
-    /// spent and a paid pivot's payment goes down to the child's pivots. In a whole
+    /// Whether `pivot`'s bundle is past the fanout and its child takes no flush: the pivot then
+    /// plans no compaction, which would grow its bundle a branch at a time while its flush waits,
+    /// so its live in-flight bundles fill to the fanout and its own parent's flush waits in turn,
+    /// up to the root, whose full in-flight list holds the next rotation ([`Self::has_room`]).
+    fn waits_for_child(&self, pivot: &Pivot) -> Result<bool, Error> {
+        match pivot.child {
+            Some(c) if pivot.bundle.branches().len() > self.config.fanout => {
+                Ok(!self.takes_flush(c)?)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Looks again at the parent whose flush into node `n` waited, once `n`'s live in-flight
+    /// bundles have fallen below the fanout.
+    fn wake_held(&mut self, n: usize) -> Result<(), Error> {
+        if self.node(n)?.held_by.is_some()
+            && self.takes_flush(n)?
+            && let Some(parent) = self.node_mut(n)?.held_by.take()
+        {
+            self.queue(parent);
+        }
+        Ok(())
+    }
+
+    /// What pivot `i` of node `n` does with its bundle now: flushes it to its child past the
+    /// fanout, as the last flush before its child splits, or as a consolidation's through a paid or
+    /// marked pivot. A consolidation carries the pivot's data down, so it waits for the pivot's live
+    /// in-flight bundles to be compacted into the bundle, and flushes even an empty one, so the
+    /// rent is spent and a paid pivot's payment goes down to the child's pivots. In a whole
     /// consolidation it also waits while a pivot above it will still flush
     /// ([`Self::flush_to_come`]): the consolidation is a pass down from the root, each pivot
     /// flushing once everything above it has, so no data lands in a node whose pivots have
-    /// already gone down (research/57 §2). Never into a child whose change has started.
-    fn flush_due(&self, n: usize, i: usize) -> Result<bool, Error> {
+    /// already gone down (research/57 §2). A flush that brings branches waits while its child
+    /// takes none ([`Self::takes_flush`]), as the root's pending branches wait for room, but the
+    /// last before the child splits, which the split waits for. Never into a child whose change
+    /// has started.
+    fn flush_due(&self, n: usize, i: usize) -> Result<Flush, Error> {
         let node = self.node(n)?;
         if node.leaf {
-            return Ok(false);
+            return Ok(Flush::No);
         }
         let pivot = node.pivots.get(i).ok_or(corrupt())?;
         let Some(child) = pivot.child else {
-            return Ok(false);
+            return Ok(Flush::No);
         };
         let wants = self.node(child)?.wants;
         if wants.is_some_and(|c| c.started) {
-            return Ok(false);
+            return Ok(Flush::No);
         }
         let held = pivot.bundle.branches().len();
         // The last flush before the child splits comes first, a consolidation's too: the split
         // waits for this bundle to empty and this pivot's compaction waits for the split
-        // ([`Self::held`]), so waiting for that compaction here would hold all three.
+        // ([`Self::held`]), so waiting for that compaction here would hold all three. It does not
+        // wait for the child's room either: a leaf's split is its settle, which alone takes its
+        // live in-flight bundles, so waiting for them would hold the flush, the split and the
+        // room for good. The split takes what the flush lands.
         if held > 0 && wants.is_some_and(Change::splits) {
-            return Ok(true);
+            return Ok(Flush::Now);
         }
-        if self.consolidating && (pivot.seek.paid || (self.full && pivot.seek.below)) {
-            return Ok(node.inflight.len() <= pivot.start
+        let due = if self.consolidating && (pivot.seek.paid || (self.full && pivot.seek.below)) {
+            node.inflight.len() <= pivot.start
                 && !self.compacting(n, &pivot.key)
-                && !self.flush_to_come(n, &pivot.key)?);
+                && !self.flush_to_come(n, &pivot.key)?
+        } else {
+            held > self.config.fanout
+        };
+        if !due {
+            Ok(Flush::No)
+        } else if held == 0 || self.takes_flush(child)? {
+            Ok(Flush::Now)
+        } else {
+            Ok(Flush::Held(child))
         }
-        Ok(held > self.config.fanout)
     }
 
     /// SplinterDB's pass through an index node that received data (`restore_balance_index`,
     /// trunk.c; research/50 §4): once what it received is compacted into its pivots, its fullest
     /// pivot flushes if it holds more than a memtable's entries, so index pivots hold about that
     /// much and the data lives in the leaves. Once a receipt; never into a child whose change has
-    /// started.
+    /// started or that takes no flush ([`Self::takes_flush`]).
     fn flush_fullest(&mut self, n: usize) -> Result<(), Error> {
         let node = self.node(n)?;
         if node.leaf || !node.received || node.pivots.iter().any(|p| node.inflight.len() > p.start)
@@ -687,7 +748,7 @@ impl Trunk {
             .get(i)
             .and_then(|p| p.child)
             .ok_or(corrupt())?;
-        if self.node(child)?.wants.is_some_and(|c| c.started) {
+        if self.node(child)?.wants.is_some_and(|c| c.started) || !self.takes_flush(child)? {
             return Ok(());
         }
         self.stats.fullest_flushes = self.stats.fullest_flushes.saturating_add(1);
@@ -1214,6 +1275,7 @@ impl Trunk {
                 self.apply_pivot(n, i, merged, covered)?;
                 self.drop_dead(store, n)?;
                 self.queue(n);
+                self.wake_held(n)?;
                 // A child waiting for this pivot to be empty may take its change now.
                 if let Some(c) = self.node(n)?.pivots.get(i).and_then(|p| p.child) {
                     self.queue(c);
@@ -1241,6 +1303,7 @@ impl Trunk {
                     p.start = covered;
                 }
                 self.drop_dead(store, n)?;
+                self.wake_held(n)?;
                 self.clear_wants(n)?;
                 self.splice(n, leaves)?;
             }

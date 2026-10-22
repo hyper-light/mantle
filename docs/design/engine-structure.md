@@ -596,7 +596,7 @@ counted budget; no task waits on another node's:
   flight, so a placed branch is cached where it was written, as a compaction's is. A compaction plans over the in-flight bundles up to `covered`, so later
   ones land past it. Puts wait only when the root holds more than `fanout` uncompacted in-flight
   bundles, the bound pending has now, so a read probes no more sources than today; this is the
-  one stall left. Root compactions free it, so they are first among ready tasks, and while a put
+  one stall left, which a node below reaches through its parents' held flushes (Flush, below). Root compactions free it, so they are first among ready tasks, and while a put
   or a pending branch waits, every ready task is admitted within the cores (`Pool::can_take`'s
   rule for a wait).
 - **Compaction**, one task per pivot with live in-flight bundles: it merges them, clipped to the
@@ -611,7 +611,21 @@ counted budget; no task waits on another node's:
   (benchmark-results/mantle-async10m-diag-20261011, run `rent`).
 - **Flush**, one task per pivot whose bundle passes `fanout`: its branches move to the child's
   in-flight list by reference, no entry rewritten, which makes the child's pivots compaction
-  tasks. A pivot bundle has one owner, so a branch is still named by one node at a time.
+  tasks. A pivot bundle has one owner, so a branch is still named by one node at a time. A
+  flush lands only in a child holding fewer than `fanout` live in-flight bundles for every
+  pivot, the bound the root keeps for pending branches (`Trunk::takes_flush`); SplinterDB
+  likewise counts a pivot's in-flight branches toward its flush (trunk.c
+  `trunk_flush_policy_should_flush_to_child`, the pivot's eventual branches against
+  `target_fanout`), and cascades a flush down at once, where this trunk's flat tasks hold it
+  instead. A held flush keeps its bundle, its pivot plans no compaction meanwhile (which would
+  grow the bundle a branch at a time), and the child's next compaction or settle looks at the
+  parent again (`Node::held_by`); so the hold climbs to the root, whose full in-flight list
+  holds the next rotation, and puts wait for the slowest node. The last flush before a split
+  does not wait: the split waits for it, and a leaf's split is its settle, which alone takes the
+  leaf's in-flight bundles. A node so holds at most `2 fanout` live in-flight bundles a pivot,
+  `3 fanout + 1` between that last flush and its split, and a pivot bundle at most `fanout + 1`.
+  Before the rule a node took every flush: 1,468 live in-flight bundles at 2,132-byte keys,
+  every scan opening each (`tests/engine_memory.rs`, `TrunkStats::inflight_most`).
 - **Settle and split**, one structural task per node: a leaf past `fanout` branches or
   `leaf_entries` entries is compacted whole and split by entries; an index node past `fanout`
   pivots splits. The apply splices the parts into the parent, which may make the parent a split

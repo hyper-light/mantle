@@ -293,7 +293,8 @@ measures the second, and derives the rest by these rules:
   node to send, and taken whole by a receiver that sizes its buffer to the length its sender
   declares; installing decodes every row, and clearing a range scans every old one.
   *Open:* an engine's builders, cursors and pools hold what is out at once, which its trunk's
-  in-flight bundles and its rows' keys set: measured, not yet bounded by rule. Each kind's bytes
+  in-flight bundles and its rows' keys set: bounded by rule now, stated from the measured peaks
+  still. Each kind's bytes
   are stated and pinned by counting-allocator tests at the range's densest rows and its longest
   keys: a builder at most its levels' pages (a page being filled reserves one payload, keys
   staged past what they share with the page's first, `branch::page_bytes`), its key buffers,
@@ -307,8 +308,14 @@ measures the second, and derives the rest by these rules:
   for 1.28 million rows, 6.8 MB of it metadata (0.5 MB pivots), the pools' peaks 64 extents, 186
   pages and three builders' lists; at
   2,132-byte keys 189.7 MB for 32,000 rows, 96% of it pooled extents and pages at peaks of 1,480
-  and 4,437, scans opening a source for each of the trunk's in-flight bundles. Bounding those
-  bundles by rule bounds every pool. Resident metadata per extent of data: 21% at 8-byte keys
+  and 4,437, scans opening a source for each of the trunk's in-flight bundles, of which a node
+  held 1,468. A node now takes a flush only while it holds fewer than `fanout` live in-flight
+  bundles a pivot, the root's own bound, and the hold climbs to the rotation
+  (engine-structure.md, Flush): a node holds at most `3 fanout + 1`, and the same fills held
+  13.5 MB at 8-byte keys (pools' peaks 38 extents and 111 pages; 15 bundles at a node) and
+  11.4 MB at 2,132-byte keys (39 and 114; 10 bundles). Stating each pool's peak from the fanout
+  and the trunk's height, as the configuration bounds them, is what remains. Resident metadata
+  per extent of data: 21% at 8-byte keys
   without values (1.25 bytes of filter and 2.3 of range filter a key), 3% at 16-byte keys with
   100-byte values; but neither trie compresses a key's levels, so their labels are bounded only by
   the key bytes a branch stores, and keys in pairs sharing all but a last byte, each pair parting

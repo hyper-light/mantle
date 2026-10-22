@@ -78,6 +78,14 @@ fn fill(key_bytes: usize, value_bytes: usize, rows: u64) {
     let held = u64::try_from(alloc::read().live).unwrap();
     let peaks = db.pool_peaks();
     let memory = db.memory();
+    // A node takes a flush while it holds fewer than `fanout` live in-flight bundles, and a flush
+    // lands at most `fanout + 1`; the last before a split does not wait, and the split takes what
+    // it lands: so at most `3 fanout + 1` (trunk/upkeep.rs `takes_flush`).
+    let inflight_most = db.stats().1.inflight_most;
+    assert!(
+        inflight_most <= 3 * trunk.fanout as u64 + 1,
+        "{key_bytes}-byte keys: a node held {inflight_most} live in-flight bundles"
+    );
     let metadata = (memory.filters
         + memory.indexes
         + memory.counts
@@ -92,7 +100,7 @@ fn fill(key_bytes: usize, value_bytes: usize, rows: u64) {
         shard_db::pooled_bytes(&config, peaks, key_bytes, trunk.leaf_entries, 1, 8).unwrap();
     let stated = bounded + pooled + metadata;
     eprintln!(
-        "keys {key_bytes} values {value_bytes} rows {rows}: held {held} of {stated} stated (configured {bounded}, pooled {pooled} at {peaks:?}, metadata {metadata} {memory:?})"
+        "keys {key_bytes} values {value_bytes} rows {rows}: held {held} of {stated} stated (configured {bounded}, pooled {pooled} at {peaks:?}, metadata {metadata} {memory:?}, inflight_most {inflight_most})"
     );
     assert!(
         held <= stated,

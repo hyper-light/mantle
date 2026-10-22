@@ -83,6 +83,10 @@ proptest! {
             trunk.incorporate(&mut store, branch).unwrap();
             oracle.extend(mem);
             check_refs(&store, &trunk);
+            // A node takes a flush only below `fanout` live in-flight bundles a pivot, so it holds
+            // at most `3 fanout + 1` (the last flush before a split landing on a full node).
+            let most = trunk.stats().inflight_most;
+            prop_assert!(most <= 3 * 3 + 1, "a node held {} live in-flight bundles", most);
         }
         let mut value = Vec::new();
         for (k, (op, v)) in &oracle {
@@ -239,6 +243,11 @@ fn a_growing_trunk_splits_deepens_and_reads_after_every_batch() {
         trunk.incorporate(&mut store, branch).unwrap();
         oracle.extend(mem);
         check_refs(&store, &trunk);
+        let most = trunk.stats().inflight_most;
+        assert!(
+            most <= 3 * 4 + 1,
+            "a node held {most} live in-flight bundles"
+        );
         for (k, v) in &oracle {
             assert_eq!(trunk.get(&mut store, k, &mut value).unwrap(), Some(Op::Put));
             assert_eq!(&value, v);

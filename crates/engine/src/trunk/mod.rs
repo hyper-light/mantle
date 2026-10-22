@@ -276,6 +276,21 @@ struct Node {
     /// Data reached it (the root's pending branches, a parent's flush) since its fullest pivot
     /// was last considered for a flush ([`Trunk::flush_fullest`]).
     received: bool,
+    /// The parent whose flush into this node waits for its live in-flight bundles to fall below
+    /// the fanout ([`Trunk::flush_due`]): looked at again once they do.
+    held_by: Option<usize>,
+}
+
+impl Node {
+    /// The most in-flight bundles any of its pivots has yet to take: the sources a read through
+    /// the node opens above a pivot's bundle, and what a flush into it adds to.
+    fn live_most(&self) -> usize {
+        self.pivots
+            .iter()
+            .map(|p| self.inflight.len().saturating_sub(p.start))
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 /// One depth of the trunk ([`Trunk::levels`]): its nodes and pivots, the branches the pivots'
@@ -340,6 +355,9 @@ pub struct TrunkStats {
     /// Entries of in-flight bundles a leaf's settle took among its inputs: what an in-flight
     /// compaction would have written once before the settle rewrote it (research/53 §5).
     pub settle_inflight_entries: u64,
+    /// The most live in-flight bundles a node held for one of its pivots, as a flush landed
+    /// them: at most `3 fanout + 1` ([`Trunk::takes_flush`]).
+    pub inflight_most: u64,
     /// Consolidations of every pivot of several sources finished: a drain's, or a quiet shard's
     /// its writes paid for (research/53 §11).
     pub whole_consolidations: u64,
@@ -659,6 +677,7 @@ impl Trunk {
                 wants: None,
                 queued: false,
                 received: false,
+                held_by: None,
             }],
             root: 0,
             config,
@@ -1553,6 +1572,7 @@ impl Trunk {
             wants: None,
             queued: false,
             received: false,
+            held_by: None,
         });
         self.root = self.nodes.len().saturating_sub(1);
     }
@@ -2107,6 +2127,7 @@ impl Trunk {
                 wants: None,
                 queued: false,
                 received: false,
+                held_by: None,
             });
         }
         if root >= nodes.len() {
@@ -2282,6 +2303,7 @@ impl Trunk {
                     wants: None,
                     queued: false,
                     received: false,
+                    held_by: None,
                 });
                 out.push((key, self.nodes.len().saturating_sub(1)));
             }
@@ -2333,6 +2355,7 @@ impl Trunk {
                 wants: None,
                 queued: false,
                 received: false,
+                held_by: None,
             });
             out.push((key, self.nodes.len().saturating_sub(1)));
             rest = tail;

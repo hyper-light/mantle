@@ -269,6 +269,14 @@ impl Filter {
             .len()
             .saturating_mul(BLOCK_WORDS.saturating_mul(8))
     }
+
+    /// The bytes its blocks hold in memory, their capacity: its bytes, the blocks being
+    /// reserved exactly and shrunk to fit.
+    pub fn held_bytes(&self) -> usize {
+        self.blocks
+            .capacity()
+            .saturating_mul(BLOCK_WORDS.saturating_mul(8))
+    }
 }
 
 #[cfg(test)]

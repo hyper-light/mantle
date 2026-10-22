@@ -2251,11 +2251,14 @@ impl Trunk {
     /// The bytes its branches hold in memory.
     pub fn memory(&self) -> Memory {
         let mut m = Memory::default();
+        // What each branch's metadata holds in memory, its buffers' capacities.
         let mut add = |b: &Branch| {
-            m.filters = m.filters.saturating_add(b.filter.bytes());
-            m.indexes = m.indexes.saturating_add(b.index.bytes());
-            m.counts = m.counts.saturating_add(b.counts.len().saturating_mul(2));
-            m.ranges = m.ranges.saturating_add(b.range.bytes());
+            m.filters = m.filters.saturating_add(b.filter.held_bytes());
+            m.indexes = m.indexes.saturating_add(b.index.held_bytes());
+            m.counts = m
+                .counts
+                .saturating_add(b.counts.capacity().saturating_mul(2));
+            m.ranges = m.ranges.saturating_add(b.range.held_bytes());
         };
         self.pending
             .iter()

@@ -192,6 +192,11 @@ impl Packed {
     pub fn bytes(&self) -> usize {
         self.words.len().saturating_mul(8)
     }
+
+    /// The bytes its words hold in memory, their capacity.
+    pub fn held_bytes(&self) -> usize {
+        self.words.capacity().saturating_mul(8)
+    }
 }
 
 #[cfg(test)]

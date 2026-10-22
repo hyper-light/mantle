@@ -1976,7 +1976,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.snapshots_taken = self.snapshots_taken.saturating_add(1);
                 self.step_frame(received.peer, &received.bytes)
             }
-            Arriving::Command(group) => self.propose_command(exchange, group, &received.bytes),
+            Arriving::Command(group) => {
+                self.propose_command(exchange, received.peer, group, &received.bytes)
+            }
             Arriving::Read(group) => self.ask_read(exchange, group, &received.bytes),
             // Answered now its request was read whole: the leader as this node knows it now.
             Arriving::Redirect(group) => self.redirect(exchange, group),
@@ -2151,16 +2153,26 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// Proposes the entry a command's body holds, as the range's leader, and keeps the command
-    /// until its entry applies.
+    /// until its entry applies. An enlistment is taken only from the node it names, over that
+    /// node's own connection (node.md §6.6).
     fn propose_command(
         &mut self,
         exchange: ExchangeId,
+        peer: PeerId,
         group: u128,
         body: &[u8],
     ) -> Result<(), NodeError> {
         let Ok(mut entry) = Entry::decode(body) else {
             return self.answer_status(exchange, command::Status::Malformed, 0);
         };
+        let from_node = self.remotes.iter().any(|r| r.id == peer);
+        if !entry
+            .commands
+            .iter()
+            .all(|c| enlists_only(&c.command, peer, from_node))
+        {
+            return self.answer_status(exchange, command::Status::Forbidden, self.id);
+        }
         match self.propose(group, &mut entry) {
             Ok(()) => {
                 self.commanded.push(Commanded {
@@ -2514,6 +2526,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         command: Command,
         deadline_ns: u64,
     ) -> Result<CommandAsk, NodeError> {
+        if !enlists_only(&command, self.id, true) {
+            return Err(NodeError::Bounds("a node enlists only itself".into()));
+        }
         let held = self
             .asking
             .iter()
@@ -2936,6 +2951,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             |peer| remotes.iter().find(|r| r.id == peer).and_then(|r| r.plane),
             |_, _| {},
         );
+    }
+}
+
+/// Whether `command` asks nothing its sender may not: an enlistment names the sender, a node.
+fn enlists_only(command: &Command, sender: PeerId, node: bool) -> bool {
+    match command {
+        Command::Root(mantle_meta::root::Command::Enlist(e)) => node && e.node == sender,
+        _ => true,
     }
 }
 

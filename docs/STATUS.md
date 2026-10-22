@@ -247,7 +247,12 @@ carries. A cell of three `mantle node` processes hosts it beside a range of each
 asks commands of ranges itself, as a gateway does, within a session of its own, in-process where
 it leads and over QUIC where another node does, each applied once through a leader's stop
 ([node design §6.6](design/node.md)); the leader stamps every entry it proposes with its wall
-clock. Remaining: nodes enlisting themselves, and placement from the table.
+clock. Each node with volumes enlists itself and them as it starts, a node in another domain
+than the table holds refused; placement offers a block's volumes by a capacity-weighted highest
+random weight, one to a failure domain first ([research 63](research/63-placement-order.md)).
+Remaining: the table published to nodes that host no root range (architecture §4's constant-work
+loop), two random choices on credits once nodes advertise them, and copysets once a cell has the
+domains for them (node design §7).
 
 **Gateway object path** (`mantle-gateway`, [design](design/gateway.md)). A PUT or an upload
 part as a state machine that names each request and does no I/O: the body sealed in 64 KiB

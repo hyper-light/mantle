@@ -1719,7 +1719,16 @@ follower over QUIC, and puts out when the leader is stopped, each answered once 
 the client then reads as its key's current. Every entry a node proposes is stamped with its wall
 clock (`Wall`) as the entry's time, the leader's time every command in it takes
 (`mantle_meta::wire::Entry::at_ns`), where before a client's entry kept whatever time its client
-wrote. Enlisting and placement are to build next.
+wrote. A node with volumes states its failure domain and the cell's bounds on the table, hosts
+the root range, and enlists itself and its volumes there once it listens (`mantle node`'s
+`enlisted` line), the root range's leader taking an enlistment only from the node it names over
+that node's own connection (`command::Status::Forbidden` otherwise); a refusal stops the node with
+the range's answer named. Placement's order is `crate::place::order` over the table's volumes
+(docs/research/63): a gateway that reads the table pages places from them. A cell of three
+`mantle node` processes hosting every layer enlists each node's volume, the table a client reads
+names each volume's node and domain, placement over it offers a volume of each node first for
+each of a thousand blocks, a node started again enlists again with the table unchanged, and one
+started in another domain is refused and ends saying why.
 
 ## 7. Placement, repair and cells
 

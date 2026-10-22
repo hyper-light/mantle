@@ -24,6 +24,11 @@
 //!   command is applied by the Name range and answered `WrongLayer` by the others, and the root
 //!   range reads its volume table and refuses a read of another layer's rows; the node leading the most ranges is
 //!   killed (SIGKILL), each range serves on, and the node started again catches up on each.
+//! - A cell of every layer whose nodes keep volumes: each node enlists itself and its volume in the
+//!   root range as it starts, the table a client reads names each volume's node and domain, and
+//!   placement over it offers a volume of each node first for every block; started again, a node
+//!   enlists again and the table holds what it held; started in another domain, a node is refused
+//!   and ends saying why, and enlists again in its own.
 //! - A storage cell, each node keeping a chunk volume: a gateway, a client in the gateway's role,
 //!   puts chunks round the nodes over QUIC, one of each length on each, and one node is killed
 //!   (SIGKILL) part way. Every put to a node running is stored, the killed node's until the kill
@@ -71,6 +76,7 @@ use hyper_transport::Refusal;
 use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer};
 use mantle_cert::{KeyPair, Serial, Validity};
 use mantle_chunk::ChunkKey;
+use mantle_meta::root::Placed;
 use mantle_meta::wire::{Answer, Entry};
 use mantle_node::chunk::Status;
 use mantle_node::classes::{Bounds, Role};
@@ -79,6 +85,7 @@ use mantle_node::client::{Client, ClientSettings};
 use mantle_node::command::Status as CommandStatus;
 use mantle_node::directory::{Peer, node_name};
 use mantle_node::node::ChunkOutcome;
+use mantle_node::place;
 use mantle_node::read::{Query, Read};
 
 #[allow(dead_code)]
@@ -103,6 +110,8 @@ const FILES: u128 = 0x6669_6c65;
 const BLOCKS: u128 = 0x62_6c6f_636b;
 /// The Name range alone, each group with its layer as a `range` line names it.
 const NAME_RANGE: &[(u128, &str)] = &[(GROUP, "name")];
+/// The Name range and the root range, where a storage cell's nodes enlist their volumes.
+const STORAGE_RANGES: &[(u128, &str)] = &[(ROOT, "root"), (GROUP, "name")];
 /// A range of each layer, as a cell of node.md §1.5 hosts them.
 const EVERY_LAYER: &[(u128, &str)] = &[
     (ROOT, "root"),
@@ -255,6 +264,8 @@ enum Line {
     Log(Option<Duration>, Duration),
     /// A volume the node holds.
     Volume(u128),
+    /// The root range took the node's enlistment of itself and its volumes.
+    Enlisted,
 }
 
 fn parse(line: &str) -> Option<Line> {
@@ -268,6 +279,7 @@ fn parse(line: &str) -> Option<Line> {
         )),
         ["link", peer, rest @ ..] => Some(Line::Link(peer.parse().ok()?, rest.join(" "))),
         ["volume", id] => Some(Line::Volume(u128::from_str_radix(id, 16).ok()?)),
+        ["enlisted"] => Some(Line::Enlisted),
         ["log", flushing, longest] => {
             let flushing = Duration::from_nanos(flushing.parse().ok()?);
             let flushing = if flushing.is_zero() {
@@ -326,7 +338,8 @@ fn movement(line: &Line) -> Option<(u64, u64, u64, u64, Duration, Duration)> {
         | Line::Replaced(..)
         | Line::Link(..)
         | Line::Log(..)
-        | Line::Volume(..) => None,
+        | Line::Volume(..)
+        | Line::Enlisted => None,
     }
 }
 
@@ -412,7 +425,12 @@ impl Pki {
 
     /// Node `id`'s configuration file in `dir`, hosting `ranges`: on a storage cell, with its
     /// volume and the gateway.
-    fn config(&self, id: u64, dir: &Path, (stored, ranges): (bool, &[(u128, &str)])) -> PathBuf {
+    fn config(
+        &self,
+        id: u64,
+        dir: &Path,
+        (stored, ranges, domain): (bool, &[(u128, &str)], &str),
+    ) -> PathBuf {
         let (certificate, key, _) = &self.nodes[&id];
         let voters: Vec<String> = (1..=self.voters).map(|v| v.to_string()).collect();
         // Each peer's share holds a receive chunk, the largest datagram QUIC carries, for each of
@@ -443,10 +461,14 @@ impl Pki {
             text.push_str(&format!("peer = {client} client {}\n", c.display()));
         }
         if stored {
+            // Its volume, enlisted in the root range in its failure domain; the table holds every
+            // node of the cell and a volume of each.
             text.push_str(&format!(
-                "peer = {GATEWAY} gateway {}\nvolume = {} {VOLUME_BYTES} 1 0 0 0\n{VOLUME_STATED}",
+                "peer = {GATEWAY} gateway {}\nvolume = {} {VOLUME_BYTES} 1 0 0 0\n{VOLUME_STATED}\
+                 domain = {domain}\nroot.max_nodes = {nodes}\nroot.max_volumes = {nodes}\n",
                 self.gateway.0.display(),
                 dir.join("device").display(),
+                nodes = self.nodes.len(),
             ));
         }
         let path = dir.join("node.conf");
@@ -560,9 +582,16 @@ struct Cell {
     /// most `Cell::held_bound`, and when the stretch under way began, if one is.
     held_for: Duration,
     held_since: Option<Instant>,
-    /// Whether each node keeps a volume, and the volume each running node said it holds.
+    /// Whether each node keeps a volume, the volume each running node said it holds, and the
+    /// nodes whose running process said the root range took its enlistment.
     stored: bool,
     volumes: BTreeMap<u64, u128>,
+    enlisted: BTreeSet<u64>,
+    /// Each node's failure domain, where a test states another than its own name's.
+    domains: BTreeMap<u64, String>,
+    /// The node whose process the test started to be refused, and that process once it ended.
+    refusing: Option<u64>,
+    refused: Option<Running>,
     /// The ranges every node hosts.
     ranges: &'static [(u128, &'static str)],
     _root: tempfile::TempDir,
@@ -607,7 +636,18 @@ impl Cell {
             spares: 0,
             network: Network::Direct,
             stored: true,
-            ranges: NAME_RANGE,
+            ranges: STORAGE_RANGES,
+        })
+    }
+
+    /// A cell of `nodes` nodes hosting a range of each layer, each keeping a volume.
+    fn layered_stored(nodes: u64) -> Self {
+        Self::shaped(Shape {
+            voters: nodes,
+            spares: 0,
+            network: Network::Direct,
+            stored: true,
+            ranges: EVERY_LAYER,
         })
     }
 
@@ -664,6 +704,10 @@ impl Cell {
             held_since: None,
             stored,
             volumes: BTreeMap::new(),
+            enlisted: BTreeSet::new(),
+            domains: BTreeMap::new(),
+            refusing: None,
+            refused: None,
             ranges,
             _root: root,
         };
@@ -678,19 +722,25 @@ impl Cell {
     /// Starts node `id`'s process on its directory, a thread forwarding its lines, and waits until
     /// it listens.
     fn start(&mut self, id: u64) {
-        let config = self
-            .pki
-            .config(id, &self.dirs[&id], (self.stored, self.ranges));
+        self.spawn_process(id, Stdio::inherit());
+    }
+
+    /// Starts node `id`'s process on its directory, its standard error to `stderr`, a thread
+    /// forwarding its lines, and waits until it listens.
+    fn spawn_process(&mut self, id: u64, stderr: Stdio) {
+        let config = self.config_of(id);
         let mut child = Command::new(NODE)
             .arg("node")
             .arg(&config)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            .stderr(stderr)
             .spawn()
             .unwrap();
         let input = child.stdin.take().unwrap();
         let output = child.stdout.take().unwrap();
         self.volumes.remove(&id);
+        self.enlisted.remove(&id);
         let (tell, generation) = (self.tell.clone(), self.generations);
         self.generations += 1;
         std::thread::spawn(move || {
@@ -734,9 +784,7 @@ impl Cell {
     /// it must refuse the store, a typed corruption error, before it listens. What it said on
     /// standard error.
     fn start_damaged(&mut self, id: u64) -> String {
-        let config = self
-            .pki
-            .config(id, &self.dirs[&id], (self.stored, self.ranges));
+        let config = self.config_of(id);
         let mut child = Command::new(NODE)
             .arg("node")
             .arg(&config)
@@ -758,6 +806,36 @@ impl Cell {
         let mut said = String::new();
         std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut said).unwrap();
         assert!(!status.success(), "node {id} ended well on a damaged store");
+        said
+    }
+
+    /// Node `id`'s configuration file, written for its process: its domain the test's, if it set
+    /// one, else its name's.
+    fn config_of(&self, id: u64) -> PathBuf {
+        let domain = self
+            .domains
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| format!("n{id}"));
+        self.pki
+            .config(id, &self.dirs[&id], (self.stored, self.ranges, &domain))
+    }
+
+    /// Starts node `id`'s process, which must listen and then end on a failure of its own: what
+    /// it said on standard error. The cell learns where it listens, and the watch waits for its end
+    /// as for any fact the cell reports.
+    fn start_refused(&mut self, id: u64) -> String {
+        self.refusing = Some(id);
+        self.spawn_process(id, Stdio::piped());
+        self.introduce();
+        let mut running = self.until(|c| c.refused.take());
+        self.refusing = None;
+        let status = running.child.wait().unwrap();
+        let mut said = String::new();
+        if let Some(mut stderr) = running.child.stderr.take() {
+            std::io::Read::read_to_string(&mut stderr, &mut said).unwrap();
+        }
+        assert!(!status.success(), "node {id} ended well: {said}");
         said
     }
 
@@ -805,7 +883,8 @@ impl Cell {
                 | Line::Replaced(..)
                 | Line::Link(..)
                 | Line::Log(..)
-                | Line::Volume(..) => None,
+                | Line::Volume(..)
+                | Line::Enlisted => None,
             })
             .chain(self.clients.values().copied())
             .fold(INITIAL_RTO, Duration::max)
@@ -958,6 +1037,9 @@ impl Cell {
                     Line::Volume(volume) => {
                         self.volumes.insert(id, volume);
                     }
+                    Line::Enlisted => {
+                        self.enlisted.insert(id);
+                    }
                 }
             }
             // A process ended that the cell did not kill: it failed.
@@ -967,7 +1049,13 @@ impl Cell {
                     .get(&id)
                     .is_some_and(|r| r.generation == generation)
                 {
-                    panic!("node {id} ended: {:?}", self.status);
+                    // A process the test starts to be refused ends as the test expects.
+                    if self.refusing != Some(id) {
+                        panic!("node {id} ended: {:?}", self.status);
+                    }
+                    self.refused = self.running.remove(&id);
+                    self.status.retain(|(node, _), _| *node != id);
+                    self.log.remove(&id);
                 }
             }
             Heard::Told(Told::Progress(client, done, patience)) => {
@@ -1175,6 +1263,34 @@ impl Cell {
         let thread = self.start_gateway(ops);
         self.gateway_done(done);
         thread.join().unwrap()
+    }
+
+    /// The root range's volume table, read a page at a time through the writer client.
+    fn table(&mut self) -> Vec<Placed> {
+        let mut table = Vec::new();
+        let mut after = None;
+        loop {
+            let read = self.read(vec![(ROOT, Query::Volumes { after })]);
+            let [Ok(Read::Volumes { volumes, more })] = read.as_slice() else {
+                panic!("the volume table read {read:?}");
+            };
+            after = volumes.last().map(|p| p.volume);
+            table.extend(volumes.iter().cloned());
+            if !more {
+                return table;
+            }
+        }
+    }
+
+    /// Waits until node `id`'s running process says the root range took its enlistment.
+    fn enlisted(&mut self, id: u64) {
+        self.until(|c| {
+            if c.enlisted.contains(&id) {
+                Some(())
+            } else {
+                None
+            }
+        });
     }
 
     /// What `reads` read, each a query of a range's group, which the writer client asks in turn,
@@ -1843,4 +1959,48 @@ fn a_cell_hosts_a_range_of_each_layer_one_voter_a_node_and_each_serves_through_a
     for (group, _) in EVERY_LAYER {
         cell.converged(*group);
     }
+}
+
+#[test]
+fn each_node_enlists_its_volume_and_placement_offers_one_to_a_domain() {
+    let mut cell = Cell::layered_stored(NODES);
+    for id in 1..=NODES {
+        cell.enlisted(id);
+    }
+    let volumes: BTreeMap<u64, u128> = (1..=NODES).map(|id| (id, cell.volume(id))).collect();
+    let table = cell.table();
+    assert_eq!(table.len(), volumes.len(), "{table:?}");
+    for placed in &table {
+        assert_eq!(volumes[&placed.node], placed.volume);
+        assert_eq!(placed.domain, format!("n{}", placed.node));
+        assert!(placed.bytes > 0);
+    }
+    // Every block is offered a volume of each node, each its own domain, before any other.
+    let node_of: BTreeMap<u128, u64> = table.iter().map(|p| (p.volume, p.node)).collect();
+    for n in 0..1_000u128 {
+        let block = n.wrapping_mul(0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C834);
+        let order = place::order(block, &table);
+        let first: BTreeSet<u64> = order[..volumes.len()].iter().map(|v| node_of[v]).collect();
+        assert_eq!(first.len(), volumes.len(), "block {block:x}: {order:?}");
+    }
+    // Started again, a node enlists again, and the table holds what it held.
+    cell.kill(2);
+    cell.start(2);
+    cell.introduce();
+    cell.enlisted(2);
+    assert_eq!(cell.table(), table);
+    // Started in another domain, a node is refused, and ends naming the range's answer; in its
+    // own domain again, it enlists.
+    cell.kill(3);
+    cell.domains.insert(3, "elsewhere".into());
+    let said = cell.start_refused(3);
+    assert!(
+        said.contains("refused the node's enlistment") && said.contains("Conflict"),
+        "{said}"
+    );
+    cell.domains.remove(&3);
+    cell.start(3);
+    cell.introduce();
+    cell.enlisted(3);
+    assert_eq!(cell.table(), table);
 }

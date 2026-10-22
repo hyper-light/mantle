@@ -10,7 +10,11 @@
 //! directory, its bytes, and what its device measured (`mantle disk probe --measure`); the layout
 //! every volume shares is the `volume.` keys. `chunk_bytes` is the largest chunk the cell's
 //! gateways write, `chunk_asks` the chunk puts and gets the node keeps out to its peers, and
-//! `command_asks` the commands it asks of ranges itself and holds at once.
+//! `command_asks` the commands it asks of ranges itself and holds at once. A node with volumes
+//! states its failure domain (`domain`, at most 255 bytes) and the cell's bounds on its volume
+//! table (`root.max_nodes`, `root.max_volumes`), and hosts the root range: once it listens it
+//! enlists itself and its volumes there (node.md §6.6), says `enlisted` once the range took them,
+//! and stops, naming the range's answer, on a refusal.
 //!
 //! **Its talk** is lines. On standard output: `bound QUIC PLANE` once the node listens, and
 //! `volume ID` for each volume it holds, its 128-bit id in hex; then, for each range it hosts,
@@ -65,9 +69,12 @@ use mantle_engine::trunk::TrunkConfig;
 use mantle_meta::apply::Layer;
 use mantle_meta::engine::Engine;
 use mantle_meta::name;
+use mantle_meta::root::{self, Enlist, MAX_DOMAIN};
 use mantle_meta::session::Rules;
+use mantle_meta::wire::{Answer, Command};
 use mantle_range::{ConfState, Range, Settings, Stored};
 
+use crate::ask::CommandOutcome;
 use crate::classes::Role;
 use crate::directory::Peer;
 use crate::node::{Hosted, Link, Node, NodeError, NodeSettings, Status, Wall};
@@ -94,6 +101,8 @@ pub enum ProcessError {
     Storage(#[from] StorageError),
     #[error("standard input, line {0:?}: {1}")]
     Input(String, &'static str),
+    #[error("the root range refused the node's enlistment: {0}")]
+    Enlist(String),
 }
 
 /// What the file states.
@@ -128,6 +137,17 @@ pub struct ProcessConfig {
     /// The commands the node asks of ranges itself and holds at once
     /// (`NodeSettings::command_asks`).
     pub command_asks: usize,
+    /// How a node with volumes enlists them: none for a node without.
+    pub enlist: Option<Enlisting>,
+}
+
+/// How a node enlists itself and its volumes in the cell's volume table (node.md §6.6): the root
+/// range it hosts, its failure domain, and the cell's bounds on the table.
+pub struct Enlisting {
+    pub root: u128,
+    pub domain: String,
+    pub max_nodes: u32,
+    pub max_volumes: u32,
 }
 
 /// The file's values by key, each with the line it was on; `peer`, `range` and `volume` lines
@@ -287,6 +307,7 @@ impl ProcessConfig {
             chunk_bytes: lines.get("chunk_bytes")?,
             chunk_asks: lines.get("chunk_asks")?,
             command_asks: lines.get("command_asks")?,
+            enlist: enlisting(&lines)?,
         })
     }
 }
@@ -325,6 +346,32 @@ fn ranges(lines: &Lines) -> Result<Vec<(u128, Layer)>, ProcessError> {
         ranges.push((group, layer));
     }
     Ok(ranges)
+}
+
+/// How a node with `volume` lines enlists them: the root range its `range` lines name, its
+/// `domain`, and the table's `root.` bounds, each required of it; none for a node without volumes.
+fn enlisting(lines: &Lines) -> Result<Option<Enlisting>, ProcessError> {
+    if lines.volumes.is_empty() {
+        return Ok(None);
+    }
+    let root = ranges(lines)?
+        .into_iter()
+        .find(|(_, layer)| *layer == Layer::Root)
+        .map(|(group, _)| group)
+        .ok_or(ProcessError::Missing("range = GROUP root, for the volumes"))?;
+    let domain = lines.text("domain")?.to_owned();
+    if domain.is_empty() || domain.len() > MAX_DOMAIN {
+        return Err(ProcessError::Value(
+            "domain",
+            format!("{} bytes, where 1 to {MAX_DOMAIN} are", domain.len()),
+        ));
+    }
+    Ok(Some(Enlisting {
+        root,
+        domain,
+        max_nodes: lines.get("root.max_nodes")?,
+        max_volumes: lines.get("root.max_volumes")?,
+    }))
 }
 
 /// The volumes the `volume` lines state, each `volume = DIR SIZE DEPTH READ_BYTES READ_GAP
@@ -461,6 +508,7 @@ async fn serve(config: ProcessConfig, storage: Storage) -> Result<(), ProcessErr
     // This process's one shard runs the node's replicas, which apply through the engine's
     // synchronous calls (node.md §1.2).
     mantle_engine::store::permit_blocking();
+    let volumes = storage.enlisting();
     let mut ranges = Vec::with_capacity(config.ranges.len());
     for (group, layer) in &config.ranges {
         ranges.push(Hosted {
@@ -522,6 +570,22 @@ async fn serve(config: ProcessConfig, storage: Storage) -> Result<(), ProcessErr
     for volume in held {
         say(&mut output, &format!("volume {volume:032x}\n")).await?;
     }
+    // Its volumes enlisted by one command, asked until the root range answers it: the range's
+    // laws, not a deadline of the node's, decide when.
+    let mut enlisting = match &config.enlist {
+        Some(e) => {
+            let enlist = Command::Root(root::Command::Enlist(Enlist {
+                node: config.id,
+                domain: e.domain.clone(),
+                volumes,
+                max_nodes: e.max_nodes,
+                max_volumes: e.max_volumes,
+            }));
+            Some(node.command(e.root, enlist, u64::MAX)?)
+        }
+        None => None,
+    };
+    let mut answered = Vec::new();
     let mut read = vec![0u8; chunk];
     let mut pending = Vec::new();
     // Each range's status as last said, a range a slot in the configuration's order.
@@ -557,6 +621,19 @@ async fn serve(config: ProcessConfig, storage: Storage) -> Result<(), ProcessErr
         // them itself (`Node::take_applied`); this process proposes nothing itself, and a client's
         // answers reach it through its exchange, so they are dropped each turn, never kept.
         node.take_applied().for_each(drop);
+        answered.extend(node.take_commands());
+        for (asked, outcome) in answered.drain(..) {
+            if enlisting != Some(asked) {
+                continue;
+            }
+            enlisting = None;
+            match outcome {
+                CommandOutcome::Answered(Answer::Root(root::Outcome::Enlisted)) => {
+                    say(&mut output, "enlisted\n").await?;
+                }
+                other => return Err(ProcessError::Enlist(format!("{other:?}"))),
+            }
+        }
         for (group, replaced) in node.take_replaced() {
             let line = format!(
                 "replaced {group:x} {} {}\n",

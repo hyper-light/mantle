@@ -605,6 +605,15 @@ impl<F: BlockFile + Sync + 'static> Volume<F> {
         self.limits.queue_bytes()
     }
 
+    /// The bytes the volume's segments hold, which chunks are written into: what placement
+    /// weighs it by (docs/research/63).
+    pub fn data_bytes(&self) -> u64 {
+        let geometry = &self.shared.geometry;
+        geometry
+            .segment_size
+            .saturating_mul(u64::from(geometry.segments))
+    }
+
     pub fn max_payload(&self) -> u64 {
         crate::writer::max_payload(&self.shared.geometry, self.shared.checksum_shift)
     }

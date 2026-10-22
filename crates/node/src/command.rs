@@ -39,6 +39,9 @@ pub enum Status {
     TooLarge,
     /// The read asks for rows of another layer than the range holds (`crate::read::Query::layer`).
     WrongLayer,
+    /// The entry asks what its sender may not: an enlistment of a node other than the sender
+    /// (node.md §6.6). Nothing of it applied.
+    Forbidden,
 }
 
 impl Status {
@@ -51,6 +54,7 @@ impl Status {
             Self::Malformed => 4,
             Self::TooLarge => 5,
             Self::WrongLayer => 6,
+            Self::Forbidden => 7,
         }
     }
 
@@ -63,6 +67,7 @@ impl Status {
             Self::Malformed,
             Self::TooLarge,
             Self::WrongLayer,
+            Self::Forbidden,
         ]
         .into_iter()
         .find(|s| s.code() == code)
@@ -186,6 +191,7 @@ mod tests {
             Status::Malformed,
             Status::TooLarge,
             Status::WrongLayer,
+            Status::Forbidden,
         ] {
             assert_eq!(
                 read_reply_head(&reply_head(status, 3, 7)),
@@ -197,8 +203,8 @@ mod tests {
             );
         }
         let mut bad = reply_head(Status::Answered, 0, 0);
-        bad[0] = 7;
-        assert_eq!(read_reply_head(&bad), Err(CommandError::Status(7)));
+        bad[0] = 8;
+        assert_eq!(read_reply_head(&bad), Err(CommandError::Status(8)));
     }
 
     #[test]

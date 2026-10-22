@@ -212,6 +212,15 @@ impl Storage {
         self.volumes.iter().map(|h| (h.id, h.dir.as_path()))
     }
 
+    /// The volumes as the node enlists them in the volume table: each one's id and the bytes its
+    /// segments hold.
+    pub fn enlisting(&self) -> Vec<(u128, u64)> {
+        self.volumes
+            .iter()
+            .map(|h| (h.id, h.volume.data_bytes()))
+            .collect()
+    }
+
     /// The slot of the volume `volume` names, if the node holds it.
     pub(crate) fn holds(&self, volume: u128) -> Option<usize> {
         self.volumes.iter().position(|h| h.id == volume)

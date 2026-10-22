@@ -184,6 +184,14 @@ impl Starts {
             .saturating_mul(4)
             .saturating_add(self.extra.len().saturating_mul(2))
     }
+
+    /// The bytes its buffers hold in memory, their capacities.
+    fn held_bytes(&self) -> usize {
+        self.blocks
+            .capacity()
+            .saturating_mul(4)
+            .saturating_add(self.extra.capacity().saturating_mul(2))
+    }
 }
 
 impl SparseLevel {
@@ -1285,6 +1293,33 @@ impl Trie {
                     .saturating_add(s.starts.bytes())
                     .saturating_add(s.prefix.bytes())
                     .saturating_add(s.values.bytes())
+            },
+        )
+    }
+
+    /// The bytes the trie holds in memory: each buffer's capacity and each sparse level's
+    /// record, where [`Self::bytes`] counts what the buffers' contents take.
+    pub fn held_bytes(&self) -> usize {
+        let d = &self.dense;
+        self.sparse.iter().fold(
+            self.prefix
+                .capacity()
+                .saturating_add(d.labels.held_bytes())
+                .saturating_add(d.has_child.held_bytes())
+                .saturating_add(d.prefix.held_bytes())
+                .saturating_add(d.values.held_bytes())
+                .saturating_add(
+                    self.sparse
+                        .capacity()
+                        .saturating_mul(size_of::<SparseLevel>()),
+                ),
+            |b, s| {
+                b.saturating_add(s.labels.capacity())
+                    .saturating_add(s.has_child.held_bytes())
+                    .saturating_add(s.louds.held_bytes())
+                    .saturating_add(s.starts.held_bytes())
+                    .saturating_add(s.prefix.held_bytes())
+                    .saturating_add(s.values.held_bytes())
             },
         )
     }

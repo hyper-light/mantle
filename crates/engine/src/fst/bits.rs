@@ -301,6 +301,14 @@ impl Bits {
             .saturating_mul(8)
             .saturating_add(self.ranks.len().saturating_mul(4))
     }
+
+    /// The bytes its buffers hold in memory: its words' and its rank samples' capacities.
+    pub fn held_bytes(&self) -> usize {
+        self.words
+            .capacity()
+            .saturating_mul(8)
+            .saturating_add(self.ranks.capacity().saturating_mul(4))
+    }
 }
 
 #[cfg(test)]

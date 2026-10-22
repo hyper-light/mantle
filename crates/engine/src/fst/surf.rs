@@ -123,6 +123,11 @@ impl Surf {
         self.trie.bytes()
     }
 
+    /// The bytes the filter holds in memory ([`Trie::held_bytes`]).
+    pub fn held_bytes(&self) -> usize {
+        self.trie.held_bytes()
+    }
+
     /// Appends the filter to `out`: its suffix bits, then its trie.
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.push(u8::try_from(self.suffix).unwrap_or(u8::MAX));

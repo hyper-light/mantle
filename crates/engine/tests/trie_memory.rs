@@ -127,3 +127,59 @@ fn a_trie_builder_holds_no_more_than_it_states() {
         }
     }
 }
+
+/// A finished trie holds exactly what [`trie::Trie::held_bytes`] counts: its builder dropped,
+/// the heap left from the build is the trie's alone. A range filter and a leaf index over every
+/// shape above.
+#[test]
+fn a_finished_trie_holds_what_it_counts() {
+    let shapes: Vec<(&str, Vec<Vec<u8>>)> = vec![
+        ("densest 100,000", sharing(100_000, 8, 0)),
+        ("longest sharing 2,124", sharing(4_000, 2_132, 2_124)),
+        ("longest sharing none", sharing(1_000, 2_132, 0)),
+        ("pairs of 2,132 bytes", pairs(4_000, 2_132)),
+    ];
+    for (name, keys) in &shapes {
+        alloc::begin();
+        let mut b = SurfBuilder::new(SUFFIX).unwrap();
+        let mut before: Option<&Vec<u8>> = None;
+        for k in keys {
+            b.push(before.map(Vec::as_slice), before.map_or(0, |p| lcp(p, k)))
+                .unwrap();
+            before = Some(k);
+        }
+        let f = b.finish(before.map(Vec::as_slice)).unwrap();
+        drop(b);
+        let held = alloc::read().live;
+        alloc::end();
+        eprintln!(
+            "{name}: range filter held {held}, counts {}",
+            f.held_bytes()
+        );
+        assert_eq!(
+            u64::try_from(held).unwrap(),
+            f.held_bytes() as u64,
+            "{name}"
+        );
+        drop(f);
+
+        alloc::begin();
+        let mut t = TrieBuilder::new(Width::Fit).unwrap();
+        for (i, k) in keys.iter().enumerate() {
+            t.add(k, u32::try_from(i).unwrap()).unwrap();
+        }
+        let trie = t.finish().unwrap();
+        drop(t);
+        let held = alloc::read().live;
+        alloc::end();
+        eprintln!(
+            "{name}: leaf index held {held}, counts {}",
+            trie.held_bytes()
+        );
+        assert_eq!(
+            u64::try_from(held).unwrap(),
+            trie.held_bytes() as u64,
+            "{name}"
+        );
+    }
+}

@@ -7,7 +7,10 @@
 //!
 //! What is here decides what an entry carries and what its answers mean; the node asks it, of its
 //! own member when that leads the range, or of a peer over the request class
-//! (`crate::node::Node::command`).
+//! (`crate::node::Node::command`). A read the node asks itself (`crate::node::Node::read`) needs no
+//! session: it is asked of the range's leader as an entry is, confirmed by a quorum there
+//! (`crate::read`), and asked again of the next leader when its asking ends unanswered, which a
+//! read may be, since it changes nothing.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -16,6 +19,7 @@ use hyper_transport::{ExchangeId, PeerId};
 use mantle_meta::wire::{Answer, Command, Entry, Sessioned};
 
 use crate::command;
+use crate::read::{Query, Read};
 
 /// The number a command this node asked is answered under (`crate::node::Node::take_commands`).
 pub type CommandAsk = u64;
@@ -31,6 +35,37 @@ pub enum CommandOutcome {
     /// or asked of a range of another layer (`command::Status`); or it applied and its answers are
     /// larger than a reply carries (`TooLarge`).
     Refused(command::Status),
+}
+
+/// The number a read this node asked is answered under (`crate::node::Node::take_reads`).
+pub type ReadAsk = u64;
+
+/// What became of a read this node asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadOutcome {
+    /// The range's leader read it, confirmed by a quorum: it sees every write committed before it
+    /// was asked.
+    Read(Box<Read>),
+    /// Its deadline passed before its answer came.
+    Deadline,
+    /// The range refused it for what it is: malformed, of another layer's rows (`WrongLayer`), its
+    /// answer past what a reply carries (`TooLarge`), or its engine failed it (`Refused`).
+    Refused(command::Status),
+}
+
+/// A read this node asked, and how it is being asked: as an entry is, with the leader the nodes
+/// last named and the backoff between rounds that found none.
+#[derive(Debug)]
+pub(crate) struct ReadOut {
+    pub ask: ReadAsk,
+    pub group: u128,
+    pub query: Query,
+    pub deadline_ns: u64,
+    pub via: Via,
+    pub leader: Option<PeerId>,
+    pub tried: usize,
+    pub backoff: Duration,
+    pub pauses: u32,
 }
 
 /// A command waiting for its range's next entry.

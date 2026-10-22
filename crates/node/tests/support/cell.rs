@@ -594,6 +594,7 @@ impl Sim {
             chunk_bytes: CHUNK_BYTES,
             chunk_asks: 0,
             command_asks: 0,
+            read_asks: 0,
             // The run's clock from the Unix epoch: only differences of the times the ranges stamp
             // matter to the commands the simulation runs, and a seed replays them.
             wall: Wall::From(0),

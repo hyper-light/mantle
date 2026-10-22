@@ -93,7 +93,7 @@ use mantle_meta::engine::{Engine, Model};
 use mantle_meta::name;
 use mantle_meta::session::Rules;
 use mantle_meta::wire::{Answer, Command, Entry};
-use mantle_node::ask::CommandOutcome;
+use mantle_node::ask::{CommandOutcome, ReadOutcome};
 use mantle_node::chunk::Status as ChunkStatus;
 use mantle_node::classes::Role;
 use mantle_node::client::{Client, ClientSettings};
@@ -130,6 +130,9 @@ const CHUNK_ASKS: usize = 4;
 /// The commands a node asks of ranges itself and holds at once, and the most command orders the
 /// test keeps out to one node.
 const COMMAND_ASKS: usize = 8;
+/// The reads a node asks of ranges itself and holds at once, and the most read orders the test
+/// keeps out to one node.
+const READ_ASKS: usize = 8;
 /// The nodes of most cells, each a founding voter of the range.
 const NODES: u64 = 3;
 /// The most nodes a cell has: five, the larger of the cells node.md's Phase C asks histories of
@@ -426,6 +429,7 @@ impl Pki {
             chunk_bytes: CHUNK_BYTES,
             chunk_asks: CHUNK_ASKS,
             command_asks: COMMAND_ASKS,
+            read_asks: READ_ASKS,
             wall: Wall::System,
         }
     }
@@ -462,6 +466,8 @@ enum Report {
     Chunk(u64, ChunkOutcome),
     /// A command a node asked itself answered, under the test's tag.
     Command(u64, CommandOutcome),
+    /// A read a node asked itself answered, under the test's tag.
+    Read(u64, ReadOutcome),
     /// The current version of a key, as the client read it: its order, or none.
     Current(String, Option<u64>),
 }
@@ -539,6 +545,8 @@ enum Order {
     Chunk(u64, Chunked),
     /// A command for the node to ask the range itself, under the test's tag.
     Command(u64, Command),
+    /// A read for the node to ask the range itself, under the test's tag.
+    Read(u64, Query),
     Stop,
 }
 
@@ -599,6 +607,7 @@ async fn run<E: Engine + 'static>(
     // The test's tag for each chunk asked, and each command, by the number the node asked it under.
     let mut tags: BTreeMap<ChunkAsk, u64> = BTreeMap::new();
     let mut command_tags: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut read_tags: BTreeMap<u64, u64> = BTreeMap::new();
     // Each peer's link as last reported, a slot a peer.
     let mut links: Vec<Link> = Vec::new();
     loop {
@@ -667,6 +676,17 @@ async fn run<E: Engine + 'static>(
                     }
                 }
             }
+            Either::Second(Ok(Order::Read(tag, query))) => {
+                match node.read(GROUP, query, u64::MAX) {
+                    Ok(asked) => {
+                        read_tags.insert(asked, tag);
+                    }
+                    Err(error) => {
+                        let _ = reports.send(Report::Failed(id, error.to_string()));
+                        return;
+                    }
+                }
+            }
             Either::Second(Ok(Order::Stop)) => {
                 drop(node);
                 let _ = reports.send(Report::Stopped(id));
@@ -696,6 +716,15 @@ async fn run<E: Engine + 'static>(
                 continue;
             };
             if reports.send(Report::Command(tag, outcome)).is_err() {
+                return;
+            }
+        }
+        let reads: Vec<_> = node.take_reads().collect();
+        for (asked, outcome) in reads {
+            let Some(tag) = read_tags.remove(&asked) else {
+                continue;
+            };
+            if reports.send(Report::Read(tag, outcome)).is_err() {
                 return;
             }
         }
@@ -760,6 +789,8 @@ struct Watch {
     /// the client read, by key.
     commands: BTreeMap<u64, CommandOutcome>,
     currents: BTreeMap<String, Option<u64>>,
+    /// The reads nodes asked themselves, answered, by the test's tag.
+    reads: BTreeMap<u64, ReadOutcome>,
     /// The nodes open and not stopped.
     live: BTreeSet<u64>,
     status: BTreeMap<u64, Status>,
@@ -882,6 +913,10 @@ impl Watch {
             }
             Report::Command(tag, outcome) => {
                 self.commands.insert(tag, outcome);
+                self.moved();
+            }
+            Report::Read(tag, outcome) => {
+                self.reads.insert(tag, outcome);
                 self.moved();
             }
             Report::Current(key, order) => {
@@ -1389,6 +1424,20 @@ impl Cell {
         tag
     }
 
+    /// Node `from` reads `query` of the range itself (`Node::read`), under the tag returned.
+    fn ask_read(&mut self, from: u64, query: Query) -> u64 {
+        let tag = self.next_tag;
+        self.next_tag += 1;
+        self.order(from, Order::Read(tag, query));
+        tag
+    }
+
+    /// What the read asked under `tag` read, once it is answered.
+    fn read_of(&mut self, tag: u64) -> ReadOutcome {
+        self.watch
+            .until(&self.reports, |w| w.reads.get(&tag).cloned())
+    }
+
     /// What became of the command asked under `tag`, once it is answered.
     fn commanded(&mut self, tag: u64) -> CommandOutcome {
         self.watch
@@ -1581,11 +1630,12 @@ fn catch_up_by_snapshot(engines: Engines) {
     }
 }
 
-/// A node's own commands (`Node::command`): the gate asked by the leader of its own member, puts
-/// asked by a follower of the leader over QUIC, and more puts with the leader stopped while they
-/// are out, which go to the next leader with their serials the same. Each put is answered with the
-/// version it made, which the client then reads as its key's current version: a put applied twice
-/// would have made a newer one.
+/// A node's own commands (`Node::command`) and reads (`Node::read`): the gate asked by the leader
+/// of its own member, puts asked by a follower of the leader over QUIC, and more puts with the
+/// leader stopped while they are out, which go to the next leader with their serials the same.
+/// Each put is answered with the version it made, which the client, the follower and the node that
+/// leads then (in-process) each read as its key's current version: a put applied twice would have
+/// made a newer one.
 fn own_commands(engines: Engines) {
     {
         let mut cell = Cell::start(engines);
@@ -1616,6 +1666,9 @@ fn own_commands(engines: Engines) {
         );
         let running: Vec<u64> = (1..=cell.nodes).filter(|id| *id != leader).collect();
         cell.start_client(&running);
+        // Each key's current version, read by the client, by the follower that put it, and by the
+        // node that leads now, in-process: the version its put was answered.
+        let now_leading = cell.leader();
         for (key, outcome) in answered {
             let CommandOutcome::Answered(Answer::Name(name::Outcome::Put { version })) = outcome
             else {
@@ -1623,6 +1676,20 @@ fn own_commands(engines: Engines) {
             };
             let current = cell.current(&key).expect("the key has a version");
             assert_eq!(mantle_meta::key::version_id(current), version, "{key}");
+            for reader in [follower, now_leading] {
+                let query = Query::Current {
+                    bucket: "b".into(),
+                    key: key.clone(),
+                };
+                let tag = cell.ask_read(reader, query);
+                let ReadOutcome::Read(read) = cell.read_of(tag) else {
+                    panic!("node {reader}'s read of {key} was not answered");
+                };
+                let Read::Current(Some((order, _))) = *read else {
+                    panic!("node {reader} read no version of {key}: {read:?}");
+                };
+                assert_eq!(order, current, "node {reader}'s read of {key}");
+            }
         }
         cell.close();
     }

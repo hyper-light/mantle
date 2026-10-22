@@ -173,6 +173,7 @@ runtime.probe_budget_ms = 40
 chunk_bytes = 8388608
 chunk_asks = 0
 command_asks = 1
+read_asks = 0
 ";
 
 /// The largest chunk the cell's gateways write (`chunk_bytes` above): `mantle_gateway::layout::CHUNK`,

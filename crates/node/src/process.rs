@@ -10,7 +10,8 @@
 //! directory, its bytes, and what its device measured (`mantle disk probe --measure`); the layout
 //! every volume shares is the `volume.` keys. `chunk_bytes` is the largest chunk the cell's
 //! gateways write, `chunk_asks` the chunk puts and gets the node keeps out to its peers, and
-//! `command_asks` the commands it asks of ranges itself and holds at once. A node with volumes
+//! `command_asks` and `read_asks` the commands and reads it asks of ranges itself and holds at
+//! once. A node with volumes
 //! states its failure domain (`domain`, at most 255 bytes) and the cell's bounds on its volume
 //! table (`root.max_nodes`, `root.max_volumes`), and hosts the root range: once it listens it
 //! enlists itself and its volumes there (node.md §6.6), says `enlisted` once the range took them,
@@ -137,6 +138,8 @@ pub struct ProcessConfig {
     /// The commands the node asks of ranges itself and holds at once
     /// (`NodeSettings::command_asks`).
     pub command_asks: usize,
+    /// The reads the node asks of ranges itself and holds at once (`NodeSettings::read_asks`).
+    pub read_asks: usize,
     /// How a node with volumes enlists them: none for a node without.
     pub enlist: Option<Enlisting>,
 }
@@ -307,6 +310,7 @@ impl ProcessConfig {
             chunk_bytes: lines.get("chunk_bytes")?,
             chunk_asks: lines.get("chunk_asks")?,
             command_asks: lines.get("command_asks")?,
+            read_asks: lines.get("read_asks")?,
             enlist: enlisting(&lines)?,
         })
     }
@@ -553,6 +557,7 @@ async fn serve(config: ProcessConfig, storage: Storage) -> Result<(), ProcessErr
         chunk_bytes: config.chunk_bytes,
         chunk_asks: config.chunk_asks,
         command_asks: config.command_asks,
+        read_asks: config.read_asks,
         wall: Wall::System,
     };
     let mut node = Node::open(settings).await?;

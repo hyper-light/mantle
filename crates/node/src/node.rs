@@ -52,7 +52,7 @@ use mantle_meta::wire::{Answer, Command, Entry};
 use mantle_range::membership::{Next, Replacement};
 use mantle_range::{Applied, Elections, GroupStore, LogStore, Range, RangeMachine, ReplicaError};
 
-use crate::ask::{Asking, CommandAsk, CommandOutcome, Via, Wanted};
+use crate::ask::{Asking, CommandAsk, CommandOutcome, ReadAsk, ReadOut, ReadOutcome, Via, Wanted};
 use crate::bounds::{self, Stated};
 use crate::chunk;
 use crate::classes::{self, Bounds, Kind, NodeClasses, Role};
@@ -60,7 +60,7 @@ use crate::command;
 use crate::directory::{Peer, Peers};
 use crate::frame;
 use crate::layout::Layout;
-use crate::read::Query;
+use crate::read::{Query, Read};
 use crate::storage::{Done, Origin, Storage};
 
 /// A plane message's first byte: a range's Raft frame. A liveness heartbeat starts with its own,
@@ -113,6 +113,9 @@ pub struct NodeSettings<E> {
     /// The commands the node asks of ranges itself and holds at once, waiting, out, and answered
     /// and not yet taken; one past them is refused ([`Node::command`]).
     pub command_asks: usize,
+    /// The reads the node asks of ranges itself and holds at once, out and answered and not yet
+    /// taken; one past them is refused ([`Node::read`]).
+    pub read_asks: usize,
     /// The wall clock the entries the node proposes are stamped with.
     pub wall: Wall,
 }
@@ -518,6 +521,8 @@ enum Arriving {
     ChunkBytes(ChunkAsk),
     /// The answers to an entry this node asked.
     Answers,
+    /// The answer to a read this node asked.
+    ReadAnswer,
 }
 
 impl Arriving {
@@ -529,7 +534,8 @@ impl Arriving {
             | Self::Read(_)
             | Self::Redirect(_)
             | Self::Status(_)
-            | Self::Answers => classes::Class::Request,
+            | Self::Answers
+            | Self::ReadAnswer => classes::Class::Request,
             Self::ChunkPut { .. }
             | Self::ChunkGet { .. }
             | Self::ChunkStatus(_)
@@ -545,7 +551,8 @@ impl Arriving {
             | Self::Read(_)
             | Self::ChunkPut { .. }
             | Self::ChunkBytes(_)
-            | Self::Answers => true,
+            | Self::Answers
+            | Self::ReadAnswer => true,
             Self::Redirect(_) | Self::Status(_) | Self::ChunkGet { .. } | Self::ChunkStatus(_) => {
                 false
             }
@@ -557,9 +564,16 @@ impl Arriving {
 /// served: its context's id (the shell gives it back with the read), and the query.
 struct Reading {
     id: u64,
-    exchange: ExchangeId,
+    origin: ReadOrigin,
     group: u128,
     query: Query,
+}
+
+/// Whom a read is answered to: a peer's exchange, or this node's own read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadOrigin {
+    Exchange(ExchangeId),
+    Own(ReadAsk),
 }
 
 /// A command this node's member of `group` proposed as leader, waiting for its entry to apply:
@@ -634,6 +648,12 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// The draws that tell this node's registrations apart from others' (`Carried::Registration`).
     next_nonce: u64,
     commands_done: Vec<(CommandAsk, CommandOutcome)>,
+    /// The reads this node asks of ranges itself (`Node::read`): those out, and those answered and
+    /// not yet taken, at most `read_asks` in all.
+    reads_out: Vec<ReadOut>,
+    read_asks: usize,
+    next_read_ask: ReadAsk,
+    reads_done: Vec<(ReadAsk, ReadOutcome)>,
     wall: Wall,
 }
 
@@ -835,6 +855,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             next_command: 0,
             next_nonce: 0,
             commands_done: Vec::new(),
+            reads_out: Vec::new(),
+            read_asks: settings.read_asks,
+            next_read_ask: 0,
+            reads_done: Vec::new(),
             wall: settings.wall,
         };
         for kept in &node.ranges {
@@ -1149,6 +1173,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.schedule_due(now);
         self.drive(now)?;
         self.step_asks(now)?;
+        self.step_reads(now)?;
         self.step_replacements();
         self.send_plane();
         self.driver.flush()?;
@@ -1198,6 +1223,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             wake,
             self.remotes.iter().filter_map(|r| r.redial_at).min(),
             self.asks_due(now),
+            self.reads_due(now),
         ]
         .into_iter()
         .flatten()
@@ -1455,6 +1481,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 if self.asking_on(exchange).is_some() {
                     return self.command_replied(exchange, body.unwrap_or(0), now);
                 }
+                if self.read_on(exchange).is_some() {
+                    return self.read_replied(exchange, body.unwrap_or(0), now);
+                }
                 self.snapshot_done(exchange, true);
                 self.driver.endpoint().end(exchange);
                 Ok(())
@@ -1472,7 +1501,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.receiving.retain(|r| r.exchange != exchange);
                 self.writing.retain(|w| w.exchange != exchange);
                 self.commanded.retain(|c| c.exchange != Some(exchange));
-                self.reading.retain(|r| r.exchange != exchange);
+                self.reading
+                    .retain(|r| r.origin != ReadOrigin::Exchange(exchange));
                 self.ask_lost(exchange);
                 Ok(())
             }
@@ -1949,7 +1979,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         Arriving::ChunkBytes(asked) => {
                             self.chunks_done.push((asked, ChunkOutcome::Lost(refusal)));
                         }
-                        Arriving::Answers => self.ask_lost(exchange),
+                        Arriving::Answers | Arriving::ReadAnswer => self.ask_lost(exchange),
                         _ => {}
                     }
                     return Ok(());
@@ -2025,6 +2055,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.answers_came(exchange, &received.bytes);
                 Ok(())
             }
+            Arriving::ReadAnswer => {
+                endpoint.end(exchange);
+                self.read_came(exchange, &received.bytes);
+                Ok(())
+            }
         }
     }
 
@@ -2056,7 +2091,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.owner.schedule(handle);
                 self.reading.push(Reading {
                     id,
-                    exchange,
+                    origin: ReadOrigin::Exchange(exchange),
                     group,
                     query,
                 });
@@ -2099,16 +2134,30 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .owner
                 .get_mut(handle)
                 .map(|shell| reading.query.answer(shell.machine_mut().engine_mut(), room));
+            let exchange = match reading.origin {
+                ReadOrigin::Exchange(exchange) => exchange,
+                ReadOrigin::Own(ask) => {
+                    // This node's own read, answered in-process; one the engine failed is refused
+                    // as a peer's would be.
+                    let outcome = match read {
+                        Some(Ok(read)) => ReadOutcome::Read(Box::new(read)),
+                        _ => ReadOutcome::Refused(command::Status::Refused),
+                    };
+                    self.reads_out.retain(|r| r.ask != ask);
+                    self.reads_done.push((ask, outcome));
+                    continue;
+                }
+            };
             let body = match read {
                 Some(Ok(read)) => read.encode().ok(),
                 _ => None,
             };
             let Some(body) = body else {
                 // The engine failed the read: the range is fenced at its next write.
-                self.answer_status(reading.exchange, command::Status::Refused, self.id)?;
+                self.answer_status(exchange, command::Status::Refused, self.id)?;
                 continue;
             };
-            self.reply_body(reading.exchange, body)?;
+            self.reply_body(exchange, body)?;
         }
         Ok(())
     }
@@ -2815,6 +2864,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// The exchange an entry of this node's was out on ended unanswered: it is asked again, its
     /// serials the same, of the next node unless one names the leader.
     fn ask_lost(&mut self, exchange: ExchangeId) {
+        if let Some(out) = self
+            .reads_out
+            .iter_mut()
+            .find(|r| matches!(r.via, Via::Exchange { exchange: e, .. } if e == exchange))
+        {
+            if let Via::Exchange { peer, .. } = out.via
+                && out.leader == Some(peer)
+            {
+                out.leader = None;
+            }
+            out.via = Via::Unasked;
+            return;
+        }
         let Some(at) = self.asking_on(exchange) else {
             return;
         };
@@ -2828,6 +2890,254 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 out.via = Via::Unasked;
             }
         }
+    }
+
+    /// Reads `query` of `group`'s range as a gateway reads it (node.md §5.1): of this node's own
+    /// member when that leads the range, confirmed by a quorum there, else of the node that leads
+    /// it, by `deadline_ns` on the shard's clock. Its outcome comes from [`Self::take_reads`] under
+    /// the number returned. Refused when the node holds as many reads of its own as it keeps,
+    /// those answered and not yet taken among them.
+    pub fn read(
+        &mut self,
+        group: u128,
+        query: Query,
+        deadline_ns: u64,
+    ) -> Result<ReadAsk, NodeError> {
+        if self.reads_out.len().saturating_add(self.reads_done.len()) >= self.read_asks {
+            return Err(NodeError::Asks);
+        }
+        let ask = self.next_read_ask;
+        self.next_read_ask = ask.wrapping_add(1);
+        self.reads_out.push(ReadOut {
+            ask,
+            group,
+            query,
+            deadline_ns,
+            via: Via::Unasked,
+            leader: None,
+            tried: 0,
+            backoff: bounds::initial_pto(),
+            pauses: 0,
+        });
+        Ok(ask)
+    }
+
+    /// The reads this node asked itself, answered since the last call, each under its number.
+    pub fn take_reads(&mut self) -> std::vec::Drain<'_, (ReadAsk, ReadOutcome)> {
+        self.reads_done.drain(..)
+    }
+
+    /// The reads this node asks itself, at a turn: those past their deadline answered so, and each
+    /// not out asked.
+    fn step_reads(&mut self, now: u64) -> Result<(), NodeError> {
+        let mut at = 0;
+        while let Some(out) = self.reads_out.get(at) {
+            if out.deadline_ns > now {
+                let due = match out.via {
+                    Via::Unasked => true,
+                    Via::Paused { at_ns } => at_ns <= now,
+                    Via::Local | Via::Exchange { .. } => false,
+                };
+                if due {
+                    self.ask_read_out(at, now)?;
+                }
+                at = at.saturating_add(1);
+                continue;
+            }
+            let out = self.reads_out.swap_remove(at);
+            match out.via {
+                Via::Exchange { exchange, .. } => self.driver.endpoint().end(exchange),
+                Via::Local => self
+                    .reading
+                    .retain(|r| r.origin != ReadOrigin::Own(out.ask)),
+                Via::Unasked | Via::Paused { .. } => {}
+            }
+            self.reads_done.push((out.ask, ReadOutcome::Deadline));
+        }
+        Ok(())
+    }
+
+    /// Asks read `at`: of this node's own member when it leads the range, which has a quorum
+    /// confirm that it still leads; else of the node it or the last reply names as leader, or of
+    /// the next node in turn; once every node was asked this round and none answered, after a
+    /// pause.
+    fn ask_read_out(&mut self, at: usize, now: u64) -> Result<(), NodeError> {
+        let Some(group) = self.reads_out.get(at).map(|r| r.group) else {
+            return Ok(());
+        };
+        let known = self.leader_of(group);
+        if known == self.id {
+            let id = self.next_read;
+            self.next_read = id.wrapping_add(1);
+            let Some(handle) = self.kept(group).map(|k| k.handle) else {
+                return Ok(());
+            };
+            let asked = self
+                .owner
+                .get_mut(handle)
+                .map(|shell| shell.read(id.to_le_bytes().to_vec()));
+            let local = self.id;
+            let Some(out) = self.reads_out.get_mut(at) else {
+                return Ok(());
+            };
+            if matches!(asked, Some(Ok(()))) {
+                self.owner.schedule(handle);
+                out.via = Via::Local;
+                self.reading.push(Reading {
+                    id,
+                    origin: ReadOrigin::Own(out.ask),
+                    group,
+                    query: out.query.clone(),
+                });
+            } else {
+                // The member takes no read now (it is stepping down): asked again after a pause.
+                let at_ns = paused_until(local, (&mut out.backoff, &mut out.pauses), now);
+                out.via = Via::Paused { at_ns };
+            }
+            return Ok(());
+        }
+        let nodes = self.remotes.len().max(1);
+        let local = self.id;
+        let Some(out) = self.reads_out.get_mut(at) else {
+            return Ok(());
+        };
+        if out.tried >= nodes {
+            out.tried = 0;
+            let at_ns = paused_until(local, (&mut out.backoff, &mut out.pauses), now);
+            out.via = Via::Paused { at_ns };
+            return Ok(());
+        }
+        let next = self
+            .remotes
+            .get(out.tried.checked_rem(nodes).unwrap_or(0))
+            .map(|r| r.id)
+            .unwrap_or(known);
+        let target = Some(known)
+            .filter(|l| *l != 0)
+            .or(out.leader)
+            .unwrap_or(next);
+        out.tried = out.tried.saturating_add(1);
+        let body = out.query.encode();
+        let len = u64::try_from(body.len()).unwrap_or(u64::MAX);
+        let clock = self.driver.clock()?;
+        let period = Progress::new(bounds::idle_timeout())?;
+        let head = command::head(group);
+        match self
+            .driver
+            .endpoint()
+            .open(clock, target, Kind::Read, &head, Some(len), period)
+        {
+            Ok(exchange) => {
+                out.via = Via::Exchange {
+                    exchange,
+                    peer: target,
+                };
+                self.writing.push(Writing {
+                    exchange,
+                    bytes: body,
+                    written: 0,
+                    then: Then::Commanded,
+                });
+                self.write_exchange(exchange);
+            }
+            // Not reached: the next node is asked at the next turn.
+            Err(_) => {
+                if out.leader == Some(target) {
+                    out.leader = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The read of this node's out on `exchange`.
+    fn read_on(&self, exchange: ExchangeId) -> Option<usize> {
+        self.reads_out
+            .iter()
+            .position(|r| matches!(r.via, Via::Exchange { exchange: e, .. } if e == exchange))
+    }
+
+    /// A reply's head to a read this node asked: its answer follows; or the leader the node names,
+    /// or none, and it is asked again of it or the next node; or the leader refused it for room,
+    /// and it is asked again after a pause; or it was refused for what it is.
+    fn read_replied(&mut self, exchange: ExchangeId, body: u64, now: u64) -> Result<(), NodeError> {
+        let Some(at) = self.read_on(exchange) else {
+            return Ok(());
+        };
+        let endpoint = self.driver.endpoint();
+        let head = command::read_reply_head(endpoint.head(exchange).unwrap_or_default());
+        let local = self.id;
+        let Some(out) = self.reads_out.get_mut(at) else {
+            return Ok(());
+        };
+        let Via::Exchange { peer, .. } = out.via else {
+            return Ok(());
+        };
+        let status = head
+            .as_ref()
+            .map_or(command::Status::Malformed, |h| h.status);
+        if status == command::Status::Answered {
+            self.receiving.push(Receiving {
+                exchange,
+                peer,
+                body,
+                read: 0,
+                bytes: Vec::with_capacity(usize::try_from(body).unwrap_or(0)),
+                what: Arriving::ReadAnswer,
+            });
+            return self.read_exchange(exchange);
+        }
+        endpoint.end(exchange);
+        match status {
+            command::Status::Redirect => {
+                let named = head.map_or(0, |h| h.leader);
+                out.leader = Some(named).filter(|l| *l != 0 && *l != peer);
+                out.via = Via::Unasked;
+            }
+            command::Status::NoRange => {
+                out.leader = None;
+                out.via = Via::Unasked;
+            }
+            command::Status::Refused => {
+                let at_ns = paused_until(local, (&mut out.backoff, &mut out.pauses), now);
+                out.via = Via::Paused { at_ns };
+            }
+            status => {
+                let out = self.reads_out.swap_remove(at);
+                self.reads_done
+                    .push((out.ask, ReadOutcome::Refused(status)));
+            }
+        }
+        Ok(())
+    }
+
+    /// The answer to the read this node asked on `exchange`, read whole.
+    fn read_came(&mut self, exchange: ExchangeId, bytes: &[u8]) {
+        let Some(at) = self.read_on(exchange) else {
+            return;
+        };
+        let out = self.reads_out.swap_remove(at);
+        let outcome = match Read::decode(&out.query, bytes) {
+            Ok(read) => ReadOutcome::Read(Box::new(read)),
+            Err(_) => ReadOutcome::Refused(command::Status::Malformed),
+        };
+        self.reads_done.push((out.ask, outcome));
+    }
+
+    /// When the reads this node asks itself next need a turn: one to ask now or after its pause,
+    /// or a deadline.
+    fn reads_due(&self, now: u64) -> Option<u64> {
+        self.reads_out
+            .iter()
+            .map(|r| {
+                let asked = match r.via {
+                    Via::Unasked => now,
+                    Via::Paused { at_ns } => at_ns,
+                    Via::Local | Via::Exchange { .. } => r.deadline_ns,
+                };
+                asked.min(r.deadline_ns)
+            })
+            .min()
     }
 
     /// When the commands this node asks itself next need a turn: an entry to ask now or after its
@@ -2938,7 +3248,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 continue;
             }
             let r = self.reading.swap_remove(at);
-            self.redirect(r.exchange, r.group)?;
+            match r.origin {
+                ReadOrigin::Exchange(exchange) => self.redirect(exchange, r.group)?,
+                // This node's own: asked again of the leader there is now.
+                ReadOrigin::Own(ask) => {
+                    if let Some(out) = self.reads_out.iter_mut().find(|o| o.ask == ask) {
+                        out.via = Via::Unasked;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -2966,13 +3284,18 @@ fn enlists_only(command: &Command, sender: PeerId, node: bool) -> bool {
 /// room. RFC 6298 §5.5's doubling backoff, at most the idle timeout (`bounds::backed_off`), each
 /// pause drawn between its half and its whole (`bounds::pause`) so nodes do not ask again in step.
 fn pause(local: u64, asking: &mut Asking, now: u64) {
-    let pause = bounds::pause(asking.backoff, local, asking.pauses);
-    asking.pauses = asking.pauses.wrapping_add(1);
-    asking.backoff = bounds::backed_off(asking.backoff);
-    let at_ns = now.saturating_add(u64::try_from(pause.as_nanos()).unwrap_or(u64::MAX));
+    let at_ns = paused_until(local, (&mut asking.backoff, &mut asking.pauses), now);
     if let Some(out) = asking.out.as_mut() {
         out.via = Via::Paused { at_ns };
     }
+}
+
+/// When a pause begun at `now` ends, its backoff doubled and its draw counted after it.
+fn paused_until(local: u64, (backoff, pauses): (&mut Duration, &mut u32), now: u64) -> u64 {
+    let pause = bounds::pause(*backoff, local, *pauses);
+    *pauses = pauses.wrapping_add(1);
+    *backoff = bounds::backed_off(*backoff);
+    now.saturating_add(u64::try_from(pause.as_nanos()).unwrap_or(u64::MAX))
 }
 
 /// An answer a range applied, given to the command waiting for it, if one is: the first whose

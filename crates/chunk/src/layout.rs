@@ -356,6 +356,71 @@ impl Geometry {
     }
 }
 
+/// The most bytes a volume of `config`, laid out as `geometry`, holds beside its index (whose
+/// bytes `index::most_bytes` states): each owner's free buffers at its pool's limit, and what it
+/// holds besides, the largest record a segment holds standing for a record of any size.
+///
+/// - The writer's queue, two batches of payloads with their checksum tables; and the cleaner's
+///   one relocation, a batch and the record that crossed it, gathered or queued.
+/// - The writer: two batches' buffers kept free; the batch it writes, a relocation's at most,
+///   encoded into its buffers, and its frame; and a batch's reads kept free and a record read.
+/// - The cleaner, and the scrubber where a period is set: a batch's reads kept free and a record
+///   read.
+/// - The volume's reader: a batch kept free, and its reads at the device, its measured bytes or
+///   one record alone.
+/// - The larger of a checkpoint's largest frame (`checkpoint_frame_bytes`), encoded to measure it
+///   and to write it and copied to its alignment, and recovery's window on the log.
+/// - Each segment's state, as the writer, the volume's usage and the index keep it.
+pub fn most_bytes(config: &Config, geometry: &Geometry) -> Option<u64> {
+    let batch = u64::try_from(config.limits.batch_bytes).ok()?;
+    let record = geometry.segment_size.checked_sub(geometry.block)?;
+    let table = |len: u64| {
+        len.checked_shr(u32::from(config.checksum_shift))?
+            .checked_add(1)?
+            .checked_mul(4)
+    };
+    let queued = batch
+        .checked_mul(2)?
+        .checked_add(table(batch)?.checked_mul(2)?)?;
+    let relocation = batch.checked_add(record)?.checked_add(table(batch)?)?;
+    let frame = batch_frame_bytes(
+        config.limits.batch_requests,
+        config.limits.batch_requests,
+        geometry.block,
+    )?;
+    let reading = batch.checked_add(record)?;
+    let writer = batch
+        .checked_mul(2)?
+        .checked_add(relocation)?
+        .checked_add(frame)?
+        .checked_add(reading)?;
+    let scrubber = if config.scrub_period.is_some() {
+        reading
+    } else {
+        0
+    };
+    let reader = batch.checked_add(config.reads.bytes.max(record))?;
+    let checkpoint = checkpoint_frame_bytes(
+        config.max_fragments,
+        u64::from(geometry.segments),
+        geometry.block,
+    )?
+    .checked_mul(3)?
+    .max(MAX_FRAME_BYTES.min(geometry.log_size));
+    let states = u64::try_from(std::mem::size_of::<crate::index::SegmentInfo>())
+        .ok()?
+        .checked_mul(u64::from(geometry.segments))?
+        .checked_mul(3)?;
+    queued
+        .checked_add(relocation)?
+        .checked_add(writer)?
+        .checked_add(reading)?
+        .checked_add(scrubber)?
+        .checked_add(reader)?
+        .checked_add(checkpoint)?
+        .checked_add(states)
+}
+
 /// Bytes the log needs: three checkpoints of the full fragment budget, one batch frame, and
 /// the wraps before two checkpoints: the one being written and the one before it, whose
 /// skipped tail stays in the live log until the next. With it, a full index leaves a

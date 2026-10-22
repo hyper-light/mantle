@@ -73,6 +73,10 @@ const QUANTUM: Duration = Duration::from_micros(93_750);
 /// §8.2).
 const CHECKSUM_SHIFT_MOST: u8 = 14;
 
+/// The stack a thread the node starts takes: Rust's default, 2 MiB on every tier-1 platform
+/// (std `thread` module, "Stack size"), which no thread of mantle's or its crates' sets.
+const STACK: u64 = 2 << 20;
+
 /// How long one scrub of a whole volume takes: research 03 §15.9's target of seven days, of the
 /// fourteen it allows at most.
 const SCRUB: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -391,6 +395,27 @@ pub fn log(align: Alignment, settings: &Settings, ranges: usize) -> Result<LogCo
     Ok(LogConfig::derive(&facts(needed))?)
 }
 
+/// The threads a node starts beside its shard's, which runs on the process's own: its standard
+/// input's and output's, its log's and its log's device's; for each device holding volumes, its
+/// issuer and a worker for each read its profile measured at the device at once
+/// (`hyper_block::issuer`); and for each volume its writer and its cleaner, and its scrubber
+/// where it scrubs. `devices` are those devices' depths, `volumes` whether each scrubs.
+pub fn threads(devices: &[usize], volumes: &[bool]) -> Option<u64> {
+    let mut threads = 4u64;
+    for &depth in devices {
+        threads = threads.checked_add(u64::try_from(depth).ok()?.checked_add(1)?)?;
+    }
+    for &scrubs in volumes {
+        threads = threads.checked_add(if scrubs { 3 } else { 2 })?;
+    }
+    Some(threads)
+}
+
+/// The stacks of `threads` threads, each reserved whole at its start.
+pub fn stacks(threads: u64) -> Option<u64> {
+    threads.checked_mul(STACK)
+}
+
 /// What a data device measured (docs/design/chunk-store.md §7; `mantle_disk::calibrate`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Profile {
@@ -624,6 +649,16 @@ mod tests {
             .unwrap();
         assert_eq!(a.commands, g.objects * usize::try_from(blocks).unwrap() + 1);
         assert_eq!(a.reads, g.objects);
+    }
+
+    /// The node's own four threads, and each device's issuer and workers and each volume's
+    /// writer, cleaner and scrubber where it scrubs, each a 2 MiB stack.
+    #[test]
+    fn the_threads_are_the_nodes_own_and_its_storages() {
+        assert_eq!(threads(&[], &[]), Some(4));
+        assert_eq!(threads(&[2], &[true]), Some(4 + 3 + 3));
+        assert_eq!(threads(&[1, 4], &[true, false]), Some(4 + 2 + 5 + 3 + 2));
+        assert_eq!(stacks(10), Some(20 << 20));
     }
 
     /// The schemes a block may take grow with the domains a cell holds, each no wider than them:

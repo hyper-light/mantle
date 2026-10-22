@@ -685,6 +685,28 @@ fn share(debt: u64, bytes: usize, room: usize, carry: &mut u128) -> u64 {
 /// burst of puts is held no longer than seeks' own tail (docs/design/constants.md).
 pub const ORDER_BOUND: usize = 2048;
 
+/// The bytes an engine of `config`, its memtables bounded at `mem_limit`, holds that its
+/// configuration bounds: its two memtables' arenas, each reserved whole (`HashMem::new`); its
+/// store's page buffer, a point read's page, a checkpoint page's payload and an extent's run; and
+/// for each extent the file may hold, its allocator's count and its slot in the free or pending
+/// list and its bit in the checkpoint's map, and a word of the map's extents. What its builders and
+/// its pools of pages, runs, spans and lists hold beyond these is bounded by what was ever out at
+/// once, which its trunk's shape and its longest keys set, not its configuration (node.md §1.4).
+pub fn bounded_bytes(config: &Config, mem_limit: usize) -> Option<u64> {
+    let page = u64::try_from(config.page_size).ok()?;
+    let memtables = u64::try_from(mem_limit).ok()?.checked_mul(2)?;
+    let store = page
+        .checked_mul(3)?
+        .checked_add(page.checked_mul(u64::from(config.extent_pages))?)?;
+    let count = u64::try_from(std::mem::size_of::<u32>()).ok()?;
+    let word = u64::try_from(std::mem::size_of::<u64>()).ok()?;
+    let allocator = count
+        .checked_add(word.checked_mul(2)?)?
+        .checked_mul(config.max_extents)?
+        .checked_add(config.max_extents.div_ceil(64).checked_mul(word)?)?;
+    memtables.checked_add(store)?.checked_add(allocator)
+}
+
 impl<F: BlockFile> ShardDb<F> {
     fn with(store: Store<F>, mem_limit: usize, trunk: Trunk) -> Result<Self, Error> {
         let write_reserved = store.write_reservation_for(None)?;

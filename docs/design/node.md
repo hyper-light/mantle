@@ -237,6 +237,26 @@ measures the second, and derives the rest by these rules:
   identities the configuration names, and no session expires by time: a restart leaves none
   behind. A process refused `Superseded` is not its identity's newest, and its commands there are
   answered so. A client registers under its id and its start.
+- **The floor's classes**, each the most its configuration lets it hold, beside the objects'
+  (the `gateway.*` row below): a volume's buffers (`mantle_chunk::layout::most_bytes`: its writer's
+  queue, two batches; the cleaner's relocation, a batch and the record that crossed it; the
+  writer's two batches kept free, the batch it writes and its frame; the writer's, cleaner's,
+  scrubber's and reader's reads, a batch kept free and a record read, the reader's its measured
+  bytes; a checkpoint's largest frame thrice or recovery's window; each segment's state thrice),
+  its index apart (`index::most_bytes`, from what memory remains); a range engine's buffers its
+  configuration bounds (`mantle_engine::shard_db::bounded_bytes`: two memtables' arenas, reserved
+  whole; a page buffer, a point read's page, a checkpoint page and an extent's run; for each
+  extent its file may hold its allocator's count, its free or pending slot, its map bit and a map
+  word); and the threads the node starts (`derive::threads`: standard input's and output's, the
+  log's two, each device's issuer and a worker a read of its depth, each volume's writer, cleaner
+  and scrubber), each at Rust's default stack of 2 MiB, reserved whole. Each is pinned by a test
+  of the running code (`tests/volume_memory.rs`, `tests/floor_memory.rs`, `tests/threads.rs`).
+  *Open:* an engine's builders and its pools of pages, runs, spans and lists hold what was ever out
+  at once, which its trunk's shape and its longest keys set, not its configuration: at the floor's
+  pages, a range taking rows of the longest key and the largest value besides the shortest held
+  7.5 MB past its branches' own memory, most of it tries a builder keeps a level each key byte
+  deep (`fst::trie::TrieBuilder`, 640 KB a builder at 2,132-byte keys); bounding them by stated
+  caps is the engine's own goal, measured against RocksDB and SplinterDB.
 
 | Value (`mantle node`'s key) | Kind | Model and source |
 |---|---|---|

@@ -68,7 +68,6 @@ use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::time::Duration;
 
-use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_log::{Config as LogConfig, LogStats, Waits};
 use hyper_rt::combine::{Either, race2};
@@ -623,8 +622,10 @@ fn engine(
 ) -> Result<Stored<DeviceFile>, ProcessError> {
     let path = config.dir.join(format!("range-{group:032x}.store"));
     let fresh = !path.exists();
-    let align = Alignment::new(config.store.page_size)
-        .map_err(|e| ProcessError::Engine(format!("{e:?}")))?;
+    // The file transfers at its device's alignment, which the engine's pages are a multiple of
+    // (`Store::check`): a page derived to hold a row is a multiple of the device's unit, not a
+    // power of two (`mantle_engine::branch::least_page`).
+    let align = mantle_disk::probe::identify(&config.dir).transfer_alignment();
     let file = DeviceFile::open(&path, fresh, CachingRequest::Buffered, align)
         .map_err(|e| ProcessError::Engine(e.to_string()))?;
     let engine = |e: mantle_engine::Error| ProcessError::Engine(e.to_string());

@@ -10,6 +10,7 @@ pub mod device;
 
 use std::sync::OnceLock;
 
+use hyper_block::block::BlockFile;
 use hyper_block::issuer::Issuer;
 use mantle_chunk::{ChunkError, ChunkKey, Config, Limits, Reads, Volume};
 
@@ -45,7 +46,11 @@ pub const SIZE: u64 = 8 << 20;
 
 /// Puts, retrying while the volume answers `Busy`, as a client backs off while the cleaner
 /// frees space. The bound only stops a hang.
-pub fn put_retrying(v: &Volume<SimDevice>, k: ChunkKey, data: &[u8]) -> Result<(), ChunkError> {
+pub fn put_retrying<F: BlockFile + Sync + 'static>(
+    v: &Volume<F>,
+    k: ChunkKey,
+    data: &[u8],
+) -> Result<(), ChunkError> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         match v.put(k, data) {

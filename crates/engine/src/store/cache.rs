@@ -31,7 +31,7 @@
 //!
 //! Every queue and map is bounded by the cache's page count, and the slot table by twice the
 //! largest limit: a loan's fresh memory goes in the slots of chunks whose memory was given back
-//! before it adds any (docs/research/64 §13). A page written at an address is dropped from the
+//! before it adds any (docs/research/65 §5). A page written at an address is dropped from the
 //! cache (`forget`), so an address reused after its extent is freed never reads the page it held
 //! before.
 
@@ -285,8 +285,8 @@ pub struct Memory {
 /// leave the cache an extent at a time, as the store frees their extents (`forget_run`), and a
 /// loan keeps a job's pages in the order it writes them, an extent's in a row: a buffer of whole
 /// extents leaves with its extents, where a buffer the size of a whole loan stays, its freed pages
-/// dead slots, until the last of its extents leaves (a third of the cache at 1B, docs/research/64
-/// §12). On Linux a buffer is at least one huge page, so each can lie on one, and a 64 GB cache of
+/// dead slots, until the last of its extents leaves (a third of the cache at 1B, docs/research/65
+/// §5). On Linux a buffer is at least one huge page, so each can lie on one, and a 64 GB cache of
 /// them is 32K buffers, half the default 65,530 mappings a process may hold should glibc map each
 /// alone (mallopt(3), `M_MMAP_THRESHOLD`; proc(5), `/proc/sys/vm/max_map_count`).
 fn loan_chunk_pages(page: usize, extent_pages: u64) -> usize {
@@ -533,7 +533,7 @@ impl Cache {
     /// `trim` brings the room down, or while a chunk retires. The limit holds the chunks' room
     /// ([`Self::make_slot`]), not the slot table's length, which counts hollow chunks' slots with
     /// no memory behind them: counted, they froze a 1B store's cache 17 GiB under its limit
-    /// (docs/research/64 §13).
+    /// (docs/research/65 §5).
     fn make_now(&mut self) -> Option<usize> {
         if self.retiring.is_some() || self.room() > self.limit {
             return None;
@@ -779,7 +779,7 @@ impl Cache {
     /// at once less what is out now. Spare memory holds no page; kept, it serves a loan without
     /// the OS mapping it again, and no loan has needed more of it. Loaned chunks whose pages
     /// were all forgotten, as branches merged away forget theirs, otherwise gather spare beyond
-    /// any loan's need (10 GiB at 100M, docs/research/64 §8); this bounds them.
+    /// any loan's need (10 GiB at 100M, docs/research/65 §5); this bounds them.
     fn shed_spare(&mut self) {
         let need = self.out_most.saturating_sub(self.out_on_loan());
         while self.spare_pages > need {
@@ -1427,8 +1427,8 @@ impl Cache {
     /// A retirement the limit no longer asks for ends: the slots it set aside are free again.
     /// While one lasts the cache lends nothing and gives up each loan that comes back, so it ends
     /// wherever the room falls or the limit rises (`resize`, `trim`, `shed_spare`), not only when
-    /// idle time reserves slots, which a busy shard may not reach for minutes (docs/research/64
-    /// §11).
+    /// idle time reserves slots, which a busy shard may not reach for minutes (docs/research/65
+    /// §5).
     fn settle_retirement(&mut self) {
         if self.retiring.is_some() && self.room() <= self.limit {
             self.retiring = None;
@@ -1817,7 +1817,7 @@ mod tests {
     /// Chunks whose memory went back keep their slots in the table, and the room they gave back
     /// is the reads' again, made in idle time and by the reads themselves, up to the limit: a 1B
     /// store's cache, its fill's loans forgotten and their memory given back, took no page more
-    /// 17 GiB under its limit (docs/research/64 §13).
+    /// 17 GiB under its limit (docs/research/65 §5).
     #[test]
     fn reads_take_the_room_hollowed_loan_chunks_gave_back() {
         let mut c = Cache::new(64, 16, EXTENT);
@@ -1970,7 +1970,7 @@ mod tests {
     /// A retirement ends once a raised limit holds the chunks' room, with no trim or idle
     /// reservation after: while it lasted the cache lent nothing and gave up each loan that came
     /// back, so a limit that fell and rose again on a shard too busy for idle work left a 1B fill's
-    /// cache taking none of the pages its compactions wrote (docs/research/64 §11).
+    /// cache taking none of the pages its compactions wrote (docs/research/65 §5).
     #[test]
     fn a_retirement_ends_once_a_raised_limit_holds_the_room() {
         let mut c = warm(1000, 64);

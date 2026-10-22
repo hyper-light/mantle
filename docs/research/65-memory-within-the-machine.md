@@ -188,3 +188,52 @@ be pushed into swap with it.
 So a budget that follows the reading must count the process's own pages in swap as taken from it
 (`port::memory::room_now`: the estimate less dirty and writeback pages and less `VmSwap`), and the
 reserve it leaves is measured where the engine runs alone, the VM lane: E1b.
+
+## 5. The page cache under a budget that falls
+
+E1b (branch `diag-follow` 909c5075, never merged: the follow of §2, its reading
+`port::memory::room_now`, no reserve, the account line of §1) completed the machine-sized 1B run on
+the VM at 96 GiB, the first to (`diag-runs/n1000000000-e1b-1-m_e1b`, recovery exact over
+632,113,920 live keys): fill 2,494,509 a second, gets 13,973, seeks 6,923. The engine with a
+fixed 32 GiB cache and no budget, which leaves the OS about 50 GiB, ran 3.16M-3.98M, 20.2K-24.5K
+and 10.8K-13.8K the same day. More memory for the engine's cache lost on every axis, and its own
+account says why (pages of 4 KiB):
+
+| E1b | cache bytes | live | dead | spare (loans' chunks holding no page) | cache hits in the gets | device reads in the gets |
+|---|---|---|---|---|---|---|
+| after the fill | 80.9 GiB | 2,081,005 | 2,888,559 | 16,230,751 | | |
+| after the gets | 80.9 GiB | 0 | 0 | 21,200,315 | 0 | 630,916 of 632,595 found |
+
+The cache held its whole limit, 80.9 GiB, and almost none of it pages: three quarters spare loan
+memory after the fill, all of it after the gets, and every found key read from the device. These
+are the page cache's defects that a falling limit exposes, each found, measured and fixed on the
+unlanded branches `memlim`, `retire` and `hollow` (their research/64, §8, §11, §12 and §13), taken
+here:
+
+- **Spare loan memory had no bound** (memlim §8; 3f85185b). A loan's chunk whose pages are all
+  forgotten is kept for the next loan and counts against the limit, never a read slot: 10 GiB at
+  100M with no limit beside 0.9 GiB the loans ever had out at once, all but 50K pages of a falling
+  limit in a 24 GiB container. `Cache::shed_spare` gives back spare memory past the most the loans
+  have had out at once.
+- **A retirement outlived its limit** (retire §11; 0fdf9c1f, 5282fe75). While a chunk retires the
+  cache lends nothing, gives up each loan that comes back and makes no read slot; a retirement
+  begun under a lowered limit ended only at a trim or an idle reservation, so with a limit that fell
+  and rose on a busy shard the cache stopped taking pages for the rest of a fill and the gets drained
+  it to none (box 1B r761, 100M in 8 GB r771). `resize`, `trim` after its spare and `shed_spare`
+  now end it at once.
+- **A loan came back as one chunk** (hollow §12; 1bf4b0ca). A chunk is free only with its last
+  page, and a job's pages leave an extent at a time, so a whole job's chunk sat a third dead at 1B.
+  Fresh loan memory comes in buffers of whole extents, a huge page at least on Linux.
+- **Hollow chunks' slots froze the reads** (hollow §13; f0d2976f). A chunk given back kept its slots,
+  and the reads' and idle time's slot making counted the table against the limit: 7.6M live pages
+  froze from the fill's end, 17.5 GiB under the limit, and every loan's fresh pages added slots
+  without bound. The limit now holds the chunks' room, and fresh loan memory refills hollow chunks
+  before any new one, the table within twice the largest limit.
+
+Each comes with its tests (`spare_loan_memory_holds_no_more_than_the_loans_had_out_at_once`,
+`a_retirement_ends_once_a_raised_limit_holds_the_room`,
+`a_retirement_ends_once_spare_memory_given_back_brings_the_room_within_the_limit`,
+`reads_take_the_room_hollowed_loan_chunks_gave_back`,
+`loans_that_come_and_go_reuse_the_slots_of_memory_given_back`, and the 40,000-step
+`the_fields_the_slot_table_and_the_hollow_list_hold_through_every_step`); the hollow one fails on a
+cache whose reads count the slot table again. The kernel's share is measured on top of them (E1c).

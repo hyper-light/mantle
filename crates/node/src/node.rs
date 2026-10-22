@@ -48,10 +48,11 @@ use hyper_transport::{
 use mantle_chunk::ChunkKey;
 use mantle_meta::apply::Layer;
 use mantle_meta::engine::Engine;
-use mantle_meta::wire::Answer;
+use mantle_meta::wire::{Answer, Command, Entry};
 use mantle_range::membership::{Next, Replacement};
 use mantle_range::{Applied, Elections, GroupStore, LogStore, Range, RangeMachine, ReplicaError};
 
+use crate::ask::{Asking, CommandAsk, CommandOutcome, Via, Wanted};
 use crate::bounds::{self, Stated};
 use crate::chunk;
 use crate::classes::{self, Bounds, Kind, NodeClasses, Role};
@@ -109,6 +110,34 @@ pub struct NodeSettings<E> {
     /// The chunk puts and gets this node keeps out to its peers at once; one past them is
     /// answered `Busy` ([`Node::put_chunk`]).
     pub chunk_asks: usize,
+    /// The commands the node asks of ranges itself and holds at once, waiting, out, and answered
+    /// and not yet taken; one past them is refused ([`Node::command`]).
+    pub command_asks: usize,
+    /// The wall clock the entries the node proposes are stamped with.
+    pub wall: Wall,
+}
+
+/// The wall clock a node stamps each entry it proposes with, nanoseconds since the Unix epoch: the
+/// entry's time, which every command in it takes as the leader's time from when the entry was
+/// proposed (`mantle_meta::wire::Entry::at_ns`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wall {
+    /// The operating system's.
+    System,
+    /// The shard's clock (`hyper_rt::futures::now_ns`) past this epoch: a simulation's, whose run
+    /// its seed decides, times included.
+    From(u64),
+}
+
+impl Wall {
+    fn now_ns(self) -> u64 {
+        match self {
+            Self::System => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)),
+            Self::From(epoch) => epoch.saturating_add(hyper_rt::futures::now_ns()),
+        }
+    }
 }
 
 /// The number a chunk put or get this node asked is answered under ([`Node::take_chunks`]).
@@ -164,6 +193,8 @@ pub enum NodeError {
     Full,
     #[error("a range's group {0:x} is the log's own or the liveness stream's")]
     Reserved(u128),
+    #[error("the node holds as many commands of its own as it keeps")]
+    Asks,
 }
 
 impl From<Refusal> for NodeError {
@@ -373,6 +404,9 @@ struct Kept {
     layer: Layer,
     handle: Handle,
     max_entry_bytes: u64,
+    /// The answers one session of the range keeps unacknowledged (`Rules::max_answers`): the most
+    /// commands an entry of this node's own carries.
+    max_answers: usize,
     /// The replica's latest wake, held in [`Node::deadlines`].
     wake: Option<u64>,
     /// A member lost for good the node replaces while it leads the range ([`Node::replace`]).
@@ -432,6 +466,8 @@ enum Then {
     Reply,
     /// A chunk's put this node asked: its peer's reply.
     Asked,
+    /// An entry of commands this node asked: its peer's reply.
+    Commanded,
 }
 
 /// A body arriving on an exchange: from whom, its length, how much of it was read and what of it
@@ -480,6 +516,8 @@ enum Arriving {
     ChunkStatus(chunk::Status),
     /// The bytes a peer read for this node's get, asked under this number.
     ChunkBytes(ChunkAsk),
+    /// The answers to an entry this node asked.
+    Answers,
 }
 
 impl Arriving {
@@ -487,9 +525,11 @@ impl Arriving {
     fn class(self) -> classes::Class {
         match self {
             Self::Snapshot => classes::Class::Bulk,
-            Self::Command(_) | Self::Read(_) | Self::Redirect(_) | Self::Status(_) => {
-                classes::Class::Request
-            }
+            Self::Command(_)
+            | Self::Read(_)
+            | Self::Redirect(_)
+            | Self::Status(_)
+            | Self::Answers => classes::Class::Request,
             Self::ChunkPut { .. }
             | Self::ChunkGet { .. }
             | Self::ChunkStatus(_)
@@ -504,7 +544,8 @@ impl Arriving {
             | Self::Command(_)
             | Self::Read(_)
             | Self::ChunkPut { .. }
-            | Self::ChunkBytes(_) => true,
+            | Self::ChunkBytes(_)
+            | Self::Answers => true,
             Self::Redirect(_) | Self::Status(_) | Self::ChunkGet { .. } | Self::ChunkStatus(_) => {
                 false
             }
@@ -524,7 +565,8 @@ struct Reading {
 /// A command this node's member of `group` proposed as leader, waiting for its entry to apply:
 /// each command's session and serial, in the entry's order, with its answer once applied.
 struct Commanded {
-    exchange: ExchangeId,
+    /// The exchange its asker waits on, or none for one this node asked itself.
+    exchange: Option<ExchangeId>,
     group: u128,
     commands: Vec<(u64, u64, Option<Answer>)>,
 }
@@ -583,6 +625,16 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// The chunk puts and gets this node asked, answered and not yet taken.
     chunks_done: Vec<(ChunkAsk, ChunkOutcome)>,
     chunk_bytes: u64,
+    /// The commands this node asks of ranges itself (node.md §6.6): each range's session, waiting
+    /// commands and entry out, holding at most `command_asks` commands with those answered and not
+    /// yet taken.
+    asking: Vec<Asking>,
+    command_asks: usize,
+    next_command: CommandAsk,
+    /// The draws that tell this node's registrations apart from others' (`Carried::Registration`).
+    next_nonce: u64,
+    commands_done: Vec<(CommandAsk, CommandOutcome)>,
+    wall: Wall,
 }
 
 /// The node's message bounds: a Raft message is at most the larger of a page of entries and one
@@ -690,6 +742,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 layer: hosted.range.layer,
                 handle,
                 max_entry_bytes: hosted.range.settings.max_entry_bytes,
+                max_answers: hosted.range.rules.max_answers,
                 wake: None,
                 replacing: None,
             });
@@ -777,6 +830,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             next_chunk: 0,
             chunks_done: Vec::new(),
             chunk_bytes: settings.chunk_bytes,
+            asking: Vec::new(),
+            command_asks: settings.command_asks,
+            next_command: 0,
+            next_nonce: 0,
+            commands_done: Vec::new(),
+            wall: settings.wall,
         };
         for kept in &node.ranges {
             node.owner
@@ -847,16 +906,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .map_or(0, |r| r.applied().index)
     }
 
-    /// Proposes an entry of commands to `group`; only its leader takes it.
-    pub fn propose(
-        &mut self,
-        group: u128,
-        entry: &mantle_meta::wire::Entry,
-    ) -> Result<(), NodeError> {
+    /// Proposes an entry of commands to `group`, stamped with this node's wall clock as the
+    /// entry's time; only its leader takes it.
+    pub fn propose(&mut self, group: u128, entry: &mut Entry) -> Result<(), NodeError> {
         let Some(kept) = self.ranges.iter().find(|k| k.group == group) else {
             return Err(NodeError::Bounds(format!("no range {group:x} here")));
         };
         let (handle, max) = (kept.handle, kept.max_entry_bytes);
+        entry.at_ns = self.wall.now_ns();
         let shell = self
             .owner
             .get_mut(handle)
@@ -1091,6 +1148,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         self.schedule_due(now);
         self.drive(now)?;
+        self.step_asks(now)?;
         self.step_replacements();
         self.send_plane();
         self.driver.flush()?;
@@ -1139,6 +1197,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             self.deadlines.first().map(|(at, _)| *at),
             wake,
             self.remotes.iter().filter_map(|r| r.redial_at).min(),
+            self.asks_due(now),
         ]
         .into_iter()
         .flatten()
@@ -1393,6 +1452,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 if self.chunks_out.iter().any(|c| c.exchange == exchange) {
                     return self.chunk_replied(exchange, body.unwrap_or(0));
                 }
+                if self.asking_on(exchange).is_some() {
+                    return self.command_replied(exchange, body.unwrap_or(0), now);
+                }
                 self.snapshot_done(exchange, true);
                 self.driver.endpoint().end(exchange);
                 Ok(())
@@ -1409,8 +1471,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.give_back(exchange);
                 self.receiving.retain(|r| r.exchange != exchange);
                 self.writing.retain(|w| w.exchange != exchange);
-                self.commanded.retain(|c| c.exchange != exchange);
+                self.commanded.retain(|c| c.exchange != Some(exchange));
                 self.reading.retain(|r| r.exchange != exchange);
+                self.ask_lost(exchange);
                 Ok(())
             }
             Event::Writable { exchange } => {
@@ -1816,6 +1879,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Some(Then::Asked) if whole => {
                 self.writing.swap_remove(at);
             }
+            // An entry whose bytes could not all go is asked again; one sent whole waits.
+            Some(Then::Commanded) if failed => {
+                self.writing.swap_remove(at);
+                self.driver.endpoint().end(exchange);
+                self.ask_lost(exchange);
+            }
+            Some(Then::Commanded) if whole => {
+                self.writing.swap_remove(at);
+            }
             _ => {}
         }
     }
@@ -1877,6 +1949,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         Arriving::ChunkBytes(asked) => {
                             self.chunks_done.push((asked, ChunkOutcome::Lost(refusal)));
                         }
+                        Arriving::Answers => self.ask_lost(exchange),
                         _ => {}
                     }
                     return Ok(());
@@ -1943,6 +2016,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 endpoint.end(exchange);
                 self.chunks_done
                     .push((asked, ChunkOutcome::Read(received.bytes)));
+                Ok(())
+            }
+            Arriving::Answers => {
+                endpoint.end(exchange);
+                self.answers_came(exchange, &received.bytes);
                 Ok(())
             }
         }
@@ -2080,13 +2158,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         group: u128,
         body: &[u8],
     ) -> Result<(), NodeError> {
-        let Ok(entry) = mantle_meta::wire::Entry::decode(body) else {
+        let Ok(mut entry) = Entry::decode(body) else {
             return self.answer_status(exchange, command::Status::Malformed, 0);
         };
-        match self.propose(group, &entry) {
+        match self.propose(group, &mut entry) {
             Ok(()) => {
                 self.commanded.push(Commanded {
-                    exchange,
+                    exchange: Some(exchange),
                     group,
                     commands: entry
                         .commands
@@ -2425,6 +2503,336 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.storage.volumes()
     }
 
+    /// Asks `command` of `group`'s range as a gateway asks one (node.md §6.6): within this node's
+    /// session with the range, of its own member when that leads the range, else of the node that
+    /// does, by `deadline_ns` on the shard's clock. Its outcome comes from [`Self::take_commands`]
+    /// under the number returned. Refused when the node holds as many commands of its own as it
+    /// keeps, those answered and not yet taken among them.
+    pub fn command(
+        &mut self,
+        group: u128,
+        command: Command,
+        deadline_ns: u64,
+    ) -> Result<CommandAsk, NodeError> {
+        let held = self
+            .asking
+            .iter()
+            .map(Asking::held)
+            .fold(self.commands_done.len(), usize::saturating_add);
+        if held >= self.command_asks {
+            return Err(NodeError::Asks);
+        }
+        let at = match self.asking.iter().position(|a| a.group == group) {
+            Some(at) => at,
+            None => {
+                // A range none of whose commands the node holds forgets its session, which the
+                // range expires in time: the ranges kept are no more than the commands held.
+                if self.asking.len() >= self.command_asks {
+                    self.asking.retain(|a| a.held() > 0 || a.out.is_some());
+                }
+                self.asking.push(Asking::new(group, bounds::initial_pto()));
+                self.asking.len().saturating_sub(1)
+            }
+        };
+        let ask = self.next_command;
+        self.next_command = ask.wrapping_add(1);
+        if let Some(asking) = self.asking.get_mut(at) {
+            asking.waiting.push_back(Wanted {
+                ask,
+                command,
+                deadline_ns,
+            });
+        }
+        Ok(ask)
+    }
+
+    /// The commands this node asked itself, answered since the last call, each under its number.
+    pub fn take_commands(&mut self) -> std::vec::Drain<'_, (CommandAsk, CommandOutcome)> {
+        self.commands_done.drain(..)
+    }
+
+    /// The most commands an entry of this node's own carries, and its most bytes: the least any
+    /// range it hosts takes, the cell's ranges being alike; with none hosted, one command, in what
+    /// a request carries.
+    fn entry_limits(&self) -> (usize, usize) {
+        let commands = self.ranges.iter().map(|k| k.max_answers).min().unwrap_or(1);
+        let bytes = self
+            .ranges
+            .iter()
+            .map(|k| k.max_entry_bytes)
+            .min()
+            .unwrap_or_else(|| {
+                NodeClasses::frame_bound(classes::Class::Request)
+                    .saturating_sub(u64::try_from(command::HEAD_BYTES).unwrap_or(u64::MAX))
+            });
+        (commands, usize::try_from(bytes).unwrap_or(usize::MAX))
+    }
+
+    /// The commands this node asks itself, at a turn: those past their deadline answered so, each
+    /// range's next entry made, and each entry not out asked.
+    fn step_asks(&mut self, now: u64) -> Result<(), NodeError> {
+        let limits = self.entry_limits();
+        for at in 0..self.asking.len() {
+            let Some(asking) = self.asking.get_mut(at) else {
+                continue;
+            };
+            let via = asking.out.as_ref().map(|o| o.via);
+            if asking.expire(now, &mut self.commands_done) {
+                match via {
+                    Some(Via::Exchange { exchange, .. }) => self.driver.endpoint().end(exchange),
+                    Some(Via::Local) => {
+                        let group = asking.group;
+                        self.commanded
+                            .retain(|c| c.exchange.is_some() || c.group != group);
+                    }
+                    Some(Via::Unasked | Via::Paused { .. }) | None => {}
+                }
+            }
+            let nonce = self.id.rotate_left(32) ^ self.next_nonce;
+            let Some(asking) = self.asking.get_mut(at) else {
+                continue;
+            };
+            if asking.out.is_none() && !asking.waiting.is_empty() {
+                self.next_nonce = self.next_nonce.wrapping_add(1);
+            }
+            asking.next_entry(limits, nonce, &mut self.commands_done);
+            let due = match asking.out.as_ref().map(|o| o.via) {
+                Some(Via::Unasked) => true,
+                Some(Via::Paused { at_ns }) => at_ns <= now,
+                Some(Via::Local | Via::Exchange { .. }) | None => false,
+            };
+            if due {
+                self.ask_entry(at, now)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Asks range `at`'s entry out: proposed to this node's own member when it leads the range,
+    /// else sent to the node the member, or the last reply, names as leader, or to the next node in
+    /// turn; once every node was asked this round and none answered, asked again after a pause.
+    fn ask_entry(&mut self, at: usize, now: u64) -> Result<(), NodeError> {
+        let Some(group) = self.asking.get(at).map(|a| a.group) else {
+            return Ok(());
+        };
+        let known = self.leader_of(group);
+        if known == self.id {
+            return self.propose_own(at, now);
+        }
+        let nodes = self.remotes.len().max(1);
+        let Some(asking) = self.asking.get_mut(at) else {
+            return Ok(());
+        };
+        if asking.tried >= nodes {
+            asking.tried = 0;
+            pause(self.id, asking, now);
+            return Ok(());
+        }
+        let next = self
+            .remotes
+            .get(asking.tried.checked_rem(nodes).unwrap_or(0))
+            .map(|r| r.id)
+            .unwrap_or(known);
+        let target = Some(known)
+            .filter(|l| *l != 0)
+            .or(asking.leader)
+            .unwrap_or(next);
+        asking.tried = asking.tried.saturating_add(1);
+        let Some(out) = asking.out.as_mut() else {
+            return Ok(());
+        };
+        let body = out
+            .entry
+            .encode()
+            .map_err(|e| NodeError::Bounds(e.to_string()))?;
+        let len = u64::try_from(body.len()).unwrap_or(u64::MAX);
+        let clock = self.driver.clock()?;
+        let period = Progress::new(bounds::idle_timeout())?;
+        let head = command::head(group);
+        match self
+            .driver
+            .endpoint()
+            .open(clock, target, Kind::Command, &head, Some(len), period)
+        {
+            Ok(exchange) => {
+                out.via = Via::Exchange {
+                    exchange,
+                    peer: target,
+                };
+                self.writing.push(Writing {
+                    exchange,
+                    bytes: body,
+                    written: 0,
+                    then: Then::Commanded,
+                });
+                self.write_exchange(exchange);
+            }
+            // Not reached: the next node is asked at the next turn.
+            Err(_) => {
+                if asking.leader == Some(target) {
+                    asking.leader = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Proposes range `at`'s entry out to this node's own member, which leads the range, and keeps
+    /// it until its entry applies (`reply_commands`); one the member does not take now (its log or
+    /// its uncommitted bound full, or no longer leading) is asked again after a pause.
+    fn propose_own(&mut self, at: usize, now: u64) -> Result<(), NodeError> {
+        let Some(mut out) = self.asking.get_mut(at).and_then(|a| a.out.take()) else {
+            return Ok(());
+        };
+        let Some(group) = self.asking.get(at).map(|a| a.group) else {
+            return Ok(());
+        };
+        let proposed = self.propose(group, &mut out.entry);
+        let commands = out
+            .entry
+            .commands
+            .iter()
+            .map(|c| (c.session, c.serial, None))
+            .collect();
+        let Some(asking) = self.asking.get_mut(at) else {
+            return Ok(());
+        };
+        match proposed {
+            Ok(()) => {
+                out.via = Via::Local;
+                asking.out = Some(out);
+                self.commanded.push(Commanded {
+                    exchange: None,
+                    group,
+                    commands,
+                });
+            }
+            Err(NodeError::Range(mantle_range::ReplicaError::EntryTooLarge { .. })) => {
+                asking.out = Some(out);
+                asking.refused(command::Status::Malformed, &mut self.commands_done);
+            }
+            Err(_) => {
+                asking.out = Some(out);
+                pause(self.id, asking, now);
+            }
+        }
+        Ok(())
+    }
+
+    /// The range whose entry out is on `exchange`.
+    fn asking_on(&self, exchange: ExchangeId) -> Option<usize> {
+        self.asking.iter().position(|a| {
+            matches!(a.out.as_ref().map(|o| o.via), Some(Via::Exchange { exchange: e, .. }) if e == exchange)
+        })
+    }
+
+    /// A reply's head to an entry this node asked: its answers follow; or the leader the node
+    /// names, or none, and the entry is asked again of it, or of the next node; or the leader
+    /// refused it for room, and it is asked again after a pause; or the entry was refused for what
+    /// it is.
+    fn command_replied(
+        &mut self,
+        exchange: ExchangeId,
+        body: u64,
+        now: u64,
+    ) -> Result<(), NodeError> {
+        let Some(at) = self.asking_on(exchange) else {
+            return Ok(());
+        };
+        let endpoint = self.driver.endpoint();
+        let head = command::read_reply_head(endpoint.head(exchange).unwrap_or_default());
+        let Some(asking) = self.asking.get_mut(at) else {
+            return Ok(());
+        };
+        let Some(Via::Exchange { peer, .. }) = asking.out.as_ref().map(|o| o.via) else {
+            return Ok(());
+        };
+        let status = head
+            .as_ref()
+            .map_or(command::Status::Malformed, |h| h.status);
+        if status == command::Status::Answered {
+            self.receiving.push(Receiving {
+                exchange,
+                peer,
+                body,
+                read: 0,
+                bytes: Vec::with_capacity(usize::try_from(body).unwrap_or(0)),
+                what: Arriving::Answers,
+            });
+            return self.read_exchange(exchange);
+        }
+        endpoint.end(exchange);
+        let unasked = |asking: &mut Asking| {
+            if let Some(out) = asking.out.as_mut() {
+                out.via = Via::Unasked;
+            }
+        };
+        match status {
+            command::Status::Redirect => {
+                let named = head.map_or(0, |h| h.leader);
+                asking.leader = Some(named).filter(|l| *l != 0 && *l != peer);
+                unasked(asking);
+            }
+            command::Status::NoRange => {
+                asking.leader = None;
+                unasked(asking);
+            }
+            command::Status::Refused => pause(self.id, asking, now),
+            status => asking.refused(status, &mut self.commands_done),
+        }
+        Ok(())
+    }
+
+    /// The answers to the entry this node asked on `exchange`, read whole.
+    fn answers_came(&mut self, exchange: ExchangeId, bytes: &[u8]) {
+        let Some(at) = self.asking_on(exchange) else {
+            return;
+        };
+        let Some(asking) = self.asking.get_mut(at) else {
+            return;
+        };
+        match command::decode_answers(bytes) {
+            Ok(answers) => asking.answered(answers, &mut self.commands_done),
+            Err(_) => asking.refused(command::Status::Malformed, &mut self.commands_done),
+        }
+    }
+
+    /// The exchange an entry of this node's was out on ended unanswered: it is asked again, its
+    /// serials the same, of the next node unless one names the leader.
+    fn ask_lost(&mut self, exchange: ExchangeId) {
+        let Some(at) = self.asking_on(exchange) else {
+            return;
+        };
+        if let Some(asking) = self.asking.get_mut(at) {
+            if let Some(Via::Exchange { peer, .. }) = asking.out.as_ref().map(|o| o.via)
+                && asking.leader == Some(peer)
+            {
+                asking.leader = None;
+            }
+            if let Some(out) = asking.out.as_mut() {
+                out.via = Via::Unasked;
+            }
+        }
+    }
+
+    /// When the commands this node asks itself next need a turn: an entry to ask now or after its
+    /// pause, or a deadline.
+    fn asks_due(&self, now: u64) -> Option<u64> {
+        self.asking
+            .iter()
+            .filter_map(|a| {
+                let asked = match a.out.as_ref().map(|o| o.via) {
+                    Some(Via::Unasked) => Some(now),
+                    Some(Via::Paused { at_ns }) => Some(at_ns),
+                    Some(Via::Local | Via::Exchange { .. }) => None,
+                    None if a.waiting.is_empty() => None,
+                    None => Some(now),
+                };
+                [asked, a.next_deadline()].into_iter().flatten().min()
+            })
+            .min()
+    }
+
     fn answer_status(
         &mut self,
         exchange: ExchangeId,
@@ -2476,17 +2884,32 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 continue;
             }
             let c = self.commanded.swap_remove(at);
+            let Some(exchange) = c.exchange else {
+                // One this node asked itself: answered, or asked again of the leader there is now,
+                // its serials the same.
+                if let Some(asking) = self.asking.iter_mut().find(|a| a.group == c.group) {
+                    if answered {
+                        let answers = c.commands.into_iter().filter_map(|(_, _, a)| a).collect();
+                        asking.answered(answers, &mut self.commands_done);
+                    } else if let Some(out) = asking.out.as_mut()
+                        && out.via == Via::Local
+                    {
+                        out.via = Via::Unasked;
+                    }
+                }
+                continue;
+            };
             if !answered {
-                self.redirect(c.exchange, c.group)?;
+                self.redirect(exchange, c.group)?;
                 continue;
             }
             let answers: Vec<Answer> = c.commands.into_iter().filter_map(|(_, _, a)| a).collect();
             let mut body = Vec::new();
             if command::encode_answers(&mut body, &answers).is_err() {
-                self.answer_status(c.exchange, command::Status::TooLarge, self.id)?;
+                self.answer_status(exchange, command::Status::TooLarge, self.id)?;
                 continue;
             }
-            self.reply_body(c.exchange, body)?;
+            self.reply_body(exchange, body)?;
         }
         // A read whose range this node no longer leads may never be confirmed here.
         let mut at = 0;
@@ -2513,6 +2936,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             |peer| remotes.iter().find(|r| r.id == peer).and_then(|r| r.plane),
             |_, _| {},
         );
+    }
+}
+
+/// Pauses `asking`'s entry out: no node named a leader this round, or the leader refused it for
+/// room. RFC 6298 §5.5's doubling backoff, at most the idle timeout (`bounds::backed_off`), each
+/// pause drawn between its half and its whole (`bounds::pause`) so nodes do not ask again in step.
+fn pause(local: u64, asking: &mut Asking, now: u64) {
+    let pause = bounds::pause(asking.backoff, local, asking.pauses);
+    asking.pauses = asking.pauses.wrapping_add(1);
+    asking.backoff = bounds::backed_off(asking.backoff);
+    let at_ns = now.saturating_add(u64::try_from(pause.as_nanos()).unwrap_or(u64::MAX));
+    if let Some(out) = asking.out.as_mut() {
+        out.via = Via::Paused { at_ns };
     }
 }
 

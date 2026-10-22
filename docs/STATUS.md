@@ -243,9 +243,11 @@ The cell's root range keeps the volume table ([node design §6.6](design/node.md
 failure domain and each volume's node and bytes, enlisted by one command that records what the
 table does not hold, refuses a node or volume held otherwise as a conflict that changes nothing,
 and refuses past the cell's stated bounds; read a page at a time, as many volumes as a reply
-carries. A cell of three `mantle node` processes hosts it beside a range of each layer.
-Remaining: nodes enlisting themselves, placement from the table, and a node's own commands to
-ranges.
+carries. A cell of three `mantle node` processes hosts it beside a range of each layer. A node
+asks commands of ranges itself, as a gateway does, within a session of its own, in-process where
+it leads and over QUIC where another node does, each applied once through a leader's stop
+([node design §6.6](design/node.md)); the leader stamps every entry it proposes with its wall
+clock. Remaining: nodes enlisting themselves, and placement from the table.
 
 **Gateway object path** (`mantle-gateway`, [design](design/gateway.md)). A PUT or an upload
 part as a state machine that names each request and does no I/O: the body sealed in 64 KiB

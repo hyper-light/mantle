@@ -92,14 +92,16 @@ use mantle_meta::apply::Layer;
 use mantle_meta::engine::{Engine, Model};
 use mantle_meta::name;
 use mantle_meta::session::Rules;
-use mantle_meta::wire::{Answer, Entry};
+use mantle_meta::wire::{Answer, Command, Entry};
+use mantle_node::ask::CommandOutcome;
 use mantle_node::chunk::Status as ChunkStatus;
 use mantle_node::classes::Role;
 use mantle_node::client::{Client, ClientSettings};
 use mantle_node::directory::{Peer, node_name};
 use mantle_node::node::{
-    ChunkAsk, ChunkOutcome, Hosted, Link, Node, NodeSettings, Status, message_bounds,
+    ChunkAsk, ChunkOutcome, Hosted, Link, Node, NodeSettings, Status, Wall, message_bounds,
 };
+use mantle_node::read::{Query, Read};
 use mantle_node::storage::{Storage, VolumeSettings};
 use mantle_range::{ConfState, Range, Settings, Stored};
 
@@ -108,7 +110,9 @@ use mantle_range::{ConfState, Range, Settings, Stored};
 mod history;
 #[path = "../../range/tests/support/linear.rs"]
 mod linear;
-use history::{Clock, Part, Plan, Steer, Told, check_histories, registration, workload};
+use history::{
+    Clock, Part, Plan, Steer, Told, check_histories, open_gate, put, registration, workload,
+};
 #[allow(dead_code)]
 #[path = "support/relay.rs"]
 mod relay;
@@ -123,6 +127,9 @@ const CHUNK_BYTES: u64 = 8 << 20;
 /// The chunk puts and gets a node keeps out to its peers at once, and the most chunk orders the
 /// test keeps out to one node.
 const CHUNK_ASKS: usize = 4;
+/// The commands a node asks of ranges itself and holds at once, and the most command orders the
+/// test keeps out to one node.
+const COMMAND_ASKS: usize = 8;
 /// The nodes of most cells, each a founding voter of the range.
 const NODES: u64 = 3;
 /// The most nodes a cell has: five, the larger of the cells node.md's Phase C asks histories of
@@ -418,6 +425,8 @@ impl Pki {
             storage: Storage::none(),
             chunk_bytes: CHUNK_BYTES,
             chunk_asks: CHUNK_ASKS,
+            command_asks: COMMAND_ASKS,
+            wall: Wall::System,
         }
     }
 }
@@ -451,6 +460,10 @@ enum Report {
     Volumes(u64, Vec<u128>),
     /// A chunk's put or get answered, under the test's tag.
     Chunk(u64, ChunkOutcome),
+    /// A command a node asked itself answered, under the test's tag.
+    Command(u64, CommandOutcome),
+    /// The current version of a key, as the client read it: its order, or none.
+    Current(String, Option<u64>),
 }
 
 /// What the test tells the client's task.
@@ -459,6 +472,8 @@ enum Ask {
     Learn(u64, SocketAddr),
     /// Registration `serial`, of the range.
     Command(u64),
+    /// The current version of a key of bucket `b`.
+    Current(String),
 }
 
 /// The client's task: opens the client and asks what the test orders, one command at a time,
@@ -493,6 +508,22 @@ async fn client(
                     return;
                 }
             }
+            Ask::Current(key) => {
+                let query = Query::Current {
+                    bucket: "b".into(),
+                    key: key.clone(),
+                };
+                let order = match client.read(GROUP, &query, u64::MAX).await {
+                    Ok(Read::Current(current)) => current.map(|(order, _)| order),
+                    other => {
+                        let _ = reports.send(Report::Failed(CLIENT, format!("{other:?}")));
+                        return;
+                    }
+                };
+                if reports.send(Report::Current(key, order)).is_err() {
+                    return;
+                }
+            }
         }
     }
 }
@@ -506,6 +537,8 @@ enum Order {
     Replace(u64, u64),
     /// A chunk's put or get for the node to ask, under the test's tag.
     Chunk(u64, Chunked),
+    /// A command for the node to ask the range itself, under the test's tag.
+    Command(u64, Command),
     Stop,
 }
 
@@ -530,9 +563,9 @@ enum Chunked {
 }
 
 /// Orders the channel of a node of a cell of `nodes` holds: where each peer listens, a proposal,
-/// a replacement and a stop.
+/// a replacement and a stop, and the chunks and commands the test keeps out to it.
 fn orders_bound(nodes: u64) -> usize {
-    usize::try_from(nodes).unwrap() + 2 + CHUNK_ASKS
+    usize::try_from(nodes).unwrap() + 2 + CHUNK_ASKS + COMMAND_ASKS
 }
 
 /// A node's task: opens the node, as the task that turns a node opens it (`Node::open`), reports
@@ -563,8 +596,9 @@ async fn run<E: Engine + 'static>(
     };
     let mut told: Option<Status> = None;
     let mut stats = None;
-    // The test's tag for each chunk asked, by the number the node asked it under.
+    // The test's tag for each chunk asked, and each command, by the number the node asked it under.
     let mut tags: BTreeMap<ChunkAsk, u64> = BTreeMap::new();
+    let mut command_tags: BTreeMap<u64, u64> = BTreeMap::new();
     // Each peer's link as last reported, a slot a peer.
     let mut links: Vec<Link> = Vec::new();
     loop {
@@ -586,8 +620,8 @@ async fn run<E: Engine + 'static>(
                 }
             }
             // A node that no longer leads refuses it, and the test proposes again at the leader.
-            Either::Second(Ok(Order::Propose(entry))) => {
-                let _ = node.propose(GROUP, &entry);
+            Either::Second(Ok(Order::Propose(mut entry))) => {
+                let _ = node.propose(GROUP, &mut entry);
             }
             Either::Second(Ok(Order::Replace(failed, joining))) => {
                 if let Err(error) = node.replace(GROUP, failed, joining) {
@@ -622,6 +656,17 @@ async fn run<E: Engine + 'static>(
                     }
                 }
             }
+            Either::Second(Ok(Order::Command(tag, command))) => {
+                match node.command(GROUP, command, u64::MAX) {
+                    Ok(asked) => {
+                        command_tags.insert(asked, tag);
+                    }
+                    Err(error) => {
+                        let _ = reports.send(Report::Failed(id, error.to_string()));
+                        return;
+                    }
+                }
+            }
             Either::Second(Ok(Order::Stop)) => {
                 drop(node);
                 let _ = reports.send(Report::Stopped(id));
@@ -642,6 +687,15 @@ async fn run<E: Engine + 'static>(
                 continue;
             };
             if reports.send(Report::Chunk(tag, outcome)).is_err() {
+                return;
+            }
+        }
+        let commands: Vec<_> = node.take_commands().collect();
+        for (asked, outcome) in commands {
+            let Some(tag) = command_tags.remove(&asked) else {
+                continue;
+            };
+            if reports.send(Report::Command(tag, outcome)).is_err() {
                 return;
             }
         }
@@ -702,6 +756,10 @@ struct Watch {
     volumes: BTreeMap<u64, Vec<u128>>,
     /// The chunk puts and gets answered, by the test's tag.
     chunks: BTreeMap<u64, ChunkOutcome>,
+    /// The commands nodes asked themselves, answered, by the test's tag, and the current versions
+    /// the client read, by key.
+    commands: BTreeMap<u64, CommandOutcome>,
+    currents: BTreeMap<String, Option<u64>>,
     /// The nodes open and not stopped.
     live: BTreeSet<u64>,
     status: BTreeMap<u64, Status>,
@@ -820,6 +878,14 @@ impl Watch {
             }
             Report::Chunk(tag, outcome) => {
                 self.chunks.insert(tag, outcome);
+                self.moved();
+            }
+            Report::Command(tag, outcome) => {
+                self.commands.insert(tag, outcome);
+                self.moved();
+            }
+            Report::Current(key, order) => {
+                self.currents.insert(key, order);
                 self.moved();
             }
             Report::Progress(client, done, patience) => {
@@ -1315,6 +1381,33 @@ impl Cell {
         self.asks = Some(asks);
     }
 
+    /// Node `from` asks `command` of the range itself (`Node::command`), under the tag returned.
+    fn ask_command(&mut self, from: u64, command: Command) -> u64 {
+        let tag = self.next_tag;
+        self.next_tag += 1;
+        self.order(from, Order::Command(tag, command));
+        tag
+    }
+
+    /// What became of the command asked under `tag`, once it is answered.
+    fn commanded(&mut self, tag: u64) -> CommandOutcome {
+        self.watch
+            .until(&self.reports, |w| w.commands.get(&tag).cloned())
+    }
+
+    /// The current version of `key`, as the client reads it: its order, or none.
+    fn current(&mut self, key: &str) -> Option<u64> {
+        self.watch.currents.remove(key);
+        self.asks
+            .as_ref()
+            .unwrap()
+            .try_send(Ask::Current(key.to_owned()))
+            .map_err(|_| "the client's asks are full")
+            .unwrap();
+        self.watch
+            .until(&self.reports, |w| w.currents.get(key).copied())
+    }
+
     /// The client's command for registration `serial`: its answers.
     fn command(&mut self, serial: u64) -> Vec<Answer> {
         self.asks
@@ -1488,6 +1581,53 @@ fn catch_up_by_snapshot(engines: Engines) {
     }
 }
 
+/// A node's own commands (`Node::command`): the gate asked by the leader of its own member, puts
+/// asked by a follower of the leader over QUIC, and more puts with the leader stopped while they
+/// are out, which go to the next leader with their serials the same. Each put is answered with the
+/// version it made, which the client then reads as its key's current version: a put applied twice
+/// would have made a newer one.
+fn own_commands(engines: Engines) {
+    {
+        let mut cell = Cell::start(engines);
+        let leader = cell.leader();
+        let follower = (1..=cell.nodes).find(|id| *id != leader).unwrap();
+        let gate = cell.ask_command(leader, open_gate());
+        assert_eq!(
+            cell.commanded(gate),
+            CommandOutcome::Answered(Answer::Name(name::Outcome::GateMoved))
+        );
+        let half = COMMAND_ASKS as u64 / 2;
+        let put_by = |cell: &mut Cell, n: u64| {
+            let key = format!("k{n}");
+            let tag = cell.ask_command(follower, put(&key, &format!("e{n}"), u128::from(n) + 1));
+            (key, tag)
+        };
+        let first: Vec<_> = (0..half).map(|n| put_by(&mut cell, n)).collect();
+        let mut answered: Vec<(String, CommandOutcome)> = first
+            .into_iter()
+            .map(|(key, tag)| (key, cell.commanded(tag)))
+            .collect();
+        let second: Vec<_> = (half..2 * half).map(|n| put_by(&mut cell, n)).collect();
+        cell.stop(leader);
+        answered.extend(
+            second
+                .into_iter()
+                .map(|(key, tag)| (key, cell.commanded(tag))),
+        );
+        let running: Vec<u64> = (1..=cell.nodes).filter(|id| *id != leader).collect();
+        cell.start_client(&running);
+        for (key, outcome) in answered {
+            let CommandOutcome::Answered(Answer::Name(name::Outcome::Put { version })) = outcome
+            else {
+                panic!("the put of {key} answered {outcome:?}");
+            };
+            let current = cell.current(&key).expect("the key has a version");
+            assert_eq!(mantle_meta::key::version_id(current), version, "{key}");
+        }
+        cell.close();
+    }
+}
+
 fn client_redirected(engines: Engines) {
     {
         let mut cell = Cell::start(engines);
@@ -1505,6 +1645,16 @@ fn client_redirected(engines: Engines) {
         assert_eq!(answers, vec![applied]);
         cell.close();
     }
+}
+
+#[test]
+fn a_nodes_own_commands_reach_the_leader_wherever_it_is_and_each_applies_once() {
+    own_commands(Engines::Model);
+}
+
+#[test]
+fn a_nodes_own_commands_reach_the_leader_wherever_it_is_on_mantles_engine() {
+    own_commands(Engines::Mantle);
 }
 
 #[test]

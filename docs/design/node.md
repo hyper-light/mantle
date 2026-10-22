@@ -1707,8 +1707,19 @@ node's own connection.
 *As built (2026-10-21).* The root layer, its rows and commands (`mantle_meta::root`), and its
 paged read (`crate::read`), with the layer check on reads; a cell of three `mantle node`
 processes hosting the root range and a range of each other layer reads its volume table through
-a client (`crates/mantle/tests/node.rs`). Enlisting, placement and a node's own commands are to
-build next.
+a client (`crates/mantle/tests/node.rs`). A node's own commands (`Node::command`,
+`crate::ask`): a session registered at first use, an entry out a range at a time carrying the
+commands waiting in order (at most a session's unacknowledged answers, within the range's entry
+bytes), proposed in-process where the node leads, else sent to the leader the node's member or
+the last reply names, or to each node in turn, pausing by RFC 6298's doubling backoff once every
+node was asked; asked again with the same serials when its exchange is lost, and a command whose
+session expired asked again under a new one, in its place. Tested node to node over real
+sockets (`crates/node/tests/cluster.rs`): the gate asked in-process by the leader, puts asked by a
+follower over QUIC, and puts out when the leader is stopped, each answered once with the version
+the client then reads as its key's current. Every entry a node proposes is stamped with its wall
+clock (`Wall`) as the entry's time, the leader's time every command in it takes
+(`mantle_meta::wire::Entry::at_ns`), where before a client's entry kept whatever time its client
+wrote. Enlisting and placement are to build next.
 
 ## 7. Placement, repair and cells
 

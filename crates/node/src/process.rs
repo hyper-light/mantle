@@ -9,7 +9,8 @@
 //! role (node.md §1.1): `volume = DIR SIZE DEPTH READ_BYTES READ_GAP PREWRITE`, its device
 //! directory, its bytes, and what its device measured (`mantle disk probe --measure`); the layout
 //! every volume shares is the `volume.` keys. `chunk_bytes` is the largest chunk the cell's
-//! gateways write, and `chunk_asks` the chunk puts and gets the node keeps out to its peers.
+//! gateways write, `chunk_asks` the chunk puts and gets the node keeps out to its peers, and
+//! `command_asks` the commands it asks of ranges itself and holds at once.
 //!
 //! **Its talk** is lines. On standard output: `bound QUIC PLANE` once the node listens, and
 //! `volume ID` for each volume it holds, its 128-bit id in hex; then, for each range it hosts,
@@ -69,7 +70,7 @@ use mantle_range::{ConfState, Range, Settings, Stored};
 
 use crate::classes::Role;
 use crate::directory::Peer;
-use crate::node::{Hosted, Link, Node, NodeError, NodeSettings, Status};
+use crate::node::{Hosted, Link, Node, NodeError, NodeSettings, Status, Wall};
 use crate::storage::{Storage, StorageError, VolumeSettings};
 
 /// Why the process stopped.
@@ -124,6 +125,9 @@ pub struct ProcessConfig {
     /// to its peers at once (`NodeSettings::chunk_bytes`, `chunk_asks`).
     pub chunk_bytes: u64,
     pub chunk_asks: usize,
+    /// The commands the node asks of ranges itself and holds at once
+    /// (`NodeSettings::command_asks`).
+    pub command_asks: usize,
 }
 
 /// The file's values by key, each with the line it was on; `peer`, `range` and `volume` lines
@@ -282,6 +286,7 @@ impl ProcessConfig {
             volumes: volumes(&lines)?,
             chunk_bytes: lines.get("chunk_bytes")?,
             chunk_asks: lines.get("chunk_asks")?,
+            command_asks: lines.get("command_asks")?,
         })
     }
 }
@@ -499,6 +504,8 @@ async fn serve(config: ProcessConfig, storage: Storage) -> Result<(), ProcessErr
         storage,
         chunk_bytes: config.chunk_bytes,
         chunk_asks: config.chunk_asks,
+        command_asks: config.command_asks,
+        wall: Wall::System,
     };
     let mut node = Node::open(settings).await?;
     // A buffer each way, a page each (hyper-rt `stdio`: a page is the natural chunk): the talk is

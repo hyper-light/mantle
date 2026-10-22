@@ -36,7 +36,9 @@ use mantle_meta::wire::{Answer, Entry};
 use mantle_node::classes::Role;
 use mantle_node::client::{Asks, Client, ClientSettings};
 use mantle_node::directory::{Peer, node_name};
-use mantle_node::node::{Hosted, Node, NodeLog, NodeSettings, Status, Written, message_bounds};
+use mantle_node::node::{
+    Hosted, Node, NodeLog, NodeSettings, Status, Wall, Written, message_bounds,
+};
 use mantle_node::storage::Storage;
 use mantle_range::{ConfState, Range, ReplicaError, Settings};
 
@@ -587,10 +589,14 @@ impl Sim {
                 id,
                 Derived::Endpoint,
             )),
-            // The simulated cell's nodes keep ranges only.
+            // The simulated cell's nodes keep ranges only, and ask nothing of them themselves.
             storage: Storage::none(),
             chunk_bytes: CHUNK_BYTES,
             chunk_asks: 0,
+            command_asks: 0,
+            // The run's clock from the Unix epoch: only differences of the times the ranges stamp
+            // matter to the commands the simulation runs, and a seed replays them.
+            wall: Wall::From(0),
         };
         self.starts += 1;
         let shard = member.shard;

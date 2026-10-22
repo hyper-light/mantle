@@ -51,6 +51,11 @@ pub struct Memory {
     pub counts: usize,
     /// Range filters.
     pub ranges: usize,
+    /// The trunk's nodes and pivots: their records, the pivots' keys and the nodes' ends.
+    pub pivots: usize,
+    /// The branches' records, in their bundles, in-flight lists and pending packings, and the
+    /// extents each holds.
+    pub branches: usize,
 }
 
 /// The trunk's shape: from measurement, given at creation.
@@ -2259,6 +2264,9 @@ impl Trunk {
                 .counts
                 .saturating_add(b.counts.capacity().saturating_mul(2));
             m.ranges = m.ranges.saturating_add(b.range.held_bytes());
+            m.branches = m
+                .branches
+                .saturating_add(b.extents.capacity().saturating_mul(size_of::<u64>()));
         };
         self.pending
             .iter()
@@ -2269,6 +2277,39 @@ impl Trunk {
             for p in &n.pivots {
                 p.bundle.branches().iter().for_each(&mut add);
             }
+        }
+        // The records holding them: each node's and pivot's, a pivot's key and a node's end, the
+        // branches' records in bundles, in-flight lists and pending packings, and the packings'
+        // cuts.
+        let records = |count: usize, size: usize| count.saturating_mul(size);
+        m.pivots = records(self.nodes.capacity(), size_of::<Node>());
+        for n in &self.nodes {
+            m.pivots = m
+                .pivots
+                .saturating_add(records(n.pivots.capacity(), size_of::<Pivot>()))
+                .saturating_add(records(n.inflight.capacity(), size_of::<Vec<Branch>>()))
+                .saturating_add(n.end.as_ref().map_or(0, Vec::capacity));
+            for p in &n.pivots {
+                m.pivots = m.pivots.saturating_add(p.key.capacity());
+                m.branches = m
+                    .branches
+                    .saturating_add(records(p.bundle.branches.capacity(), size_of::<Branch>()));
+            }
+            for f in &n.inflight {
+                m.branches = m
+                    .branches
+                    .saturating_add(records(f.capacity(), size_of::<Branch>()));
+            }
+        }
+        for p in &self.pending {
+            m.branches = m
+                .branches
+                .saturating_add(records(p.parts.capacity(), size_of::<(usize, Branch)>()));
+            m.pivots = p.cuts.iter().fold(
+                m.pivots
+                    .saturating_add(records(p.cuts.capacity(), size_of::<Vec<u8>>())),
+                |held, cut| held.saturating_add(cut.capacity()),
+            );
         }
         m
     }

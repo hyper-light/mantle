@@ -78,7 +78,12 @@ fn fill(key_bytes: usize, value_bytes: usize, rows: u64) {
     let held = u64::try_from(alloc::read().live).unwrap();
     let peaks = db.pool_peaks();
     let memory = db.memory();
-    let metadata = (memory.filters + memory.indexes + memory.counts + memory.ranges) as u64;
+    let metadata = (memory.filters
+        + memory.indexes
+        + memory.counts
+        + memory.ranges
+        + memory.pivots
+        + memory.branches) as u64;
     let bounded = shard_db::bounded_bytes(&config, memtable).unwrap();
     // Builders' lists stated for branches of a leaf's entries, what a packing and a leaf's settle
     // write; a pivot's flush writes what its in-flight bundles hold, which the trunk does not

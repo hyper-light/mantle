@@ -108,6 +108,33 @@ pub enum Inconsistent {
     TooManyFragments,
 }
 
+/// The bytes an index of chunks of one fragment each asks of its allocator a fragment, at most:
+/// its table's bucket and control byte, its fragment list, and its place, at the peak a table's
+/// growth reaches while it holds its old buckets and its new. Measured with hyper-measure's
+/// counting allocator through twenty doublings (tests/index_memory.rs): 345.3 bytes a fragment at
+/// 917,505 fragments, the first past a growth, which each growth repeats in proportion; 229.6 once
+/// the old buckets go.
+pub const FRAGMENT_BYTES: u64 = 346;
+
+/// What the index of one fragment asks beyond [`FRAGMENT_BYTES`]: its table's first buckets and
+/// its place set's first node (492 bytes measured for one).
+pub const INDEX_BYTES: u64 = 146;
+
+/// The most bytes an index of `fragments` fragments, one a chunk, asks of its allocator.
+pub fn most_bytes(fragments: u64) -> Option<u64> {
+    FRAGMENT_BYTES
+        .checked_mul(fragments)?
+        .checked_add(INDEX_BYTES)
+}
+
+/// The most fragments, one a chunk, an index of at most `bytes` holds.
+pub fn most_fragments(bytes: u64) -> u64 {
+    bytes
+        .saturating_sub(INDEX_BYTES)
+        .checked_div(FRAGMENT_BYTES)
+        .unwrap_or(0)
+}
+
 #[derive(Debug, Default)]
 pub struct Index {
     map: HashMap<ChunkKey, Entry>,

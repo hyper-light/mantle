@@ -20,6 +20,8 @@ thiserror.workspace = true
 
 [dev-dependencies]
 hyper-block = { path = "../../vendor/hyper-block", features = ["sim"] }
+# The index's bytes a fragment, counted by its allocator (tests/index_memory.rs).
+hyper-measure = { path = "../../vendor/hyper-measure" }
 # The runtime a `Reader`'s owner runs on, for its tests (tests/reader.rs).
 hyper-rt = { path = "../../vendor/hyper-rt" }
 proptest.workspace = true

@@ -677,7 +677,11 @@ the `(segment, offset)` of every live record, ordered, kept beside the key map. 
 segment summary [RO92 §3.3] held in memory, and it replaces a walk of the whole map, under
 its lock, for every segment cleaned or scrubbed. It costs about 20 bytes a fragment,
 measured with a counting allocator: 19.6 for 4M records appended in order, 15.9 once a
-third are deleted at random, against roughly 150 for the map's entry. Each record
+third are deleted at random. The whole index of chunks of one fragment each, as the node puts
+them, asks 229.6 bytes a fragment once its table has grown, and at most 346 a fragment and 146
+more, the peak a growth reaches while the table's old and new buckets are both held
+(`index::most_bytes`, counted through twenty doublings by `tests/index_memory.rs`); a volume's
+fragment budget is what its share of memory holds at that peak. Each record
 is read where it lies and verified from its own header, then counted only if the index
 still names it; a record too damaged to name itself is attributed by a search of the map,
 which only damage pays for.

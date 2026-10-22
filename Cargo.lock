@@ -708,6 +708,7 @@ version = "0.1.0"
 dependencies = [
  "getrandom 0.4.3",
  "hyper-block",
+ "hyper-measure",
  "hyper-rt",
  "mantle-codec",
  "mantle-crc",

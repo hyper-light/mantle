@@ -178,15 +178,7 @@ impl<F: BlockFile + Sync + 'static> Volume<F> {
     ) -> Result<(Self, RecoveryReport), ChunkError> {
         config.check()?;
         let superblock = read_superblock(&file)?;
-        let geometry = Geometry {
-            block: u64::from(superblock.block),
-            segment_size: superblock.segment_size,
-            segments: superblock.segments,
-            offset_b: superblock.offset_b,
-            log_offset: superblock.log_offset,
-            log_size: superblock.log_size,
-            data_offset: superblock.data_offset,
-        };
+        let geometry = Geometry::of(&superblock);
         if !file.alignment().is_aligned_u64(geometry.block) {
             return Err(ChunkError::Format(format!(
                 "volume block {} is not a multiple of the file's alignment {}",
@@ -1396,15 +1388,7 @@ mod tests {
             .unwrap()
             .close();
         let superblock = read_superblock(&file).unwrap();
-        let geometry = Geometry {
-            block: u64::from(superblock.block),
-            segment_size: superblock.segment_size,
-            segments: superblock.segments,
-            offset_b: superblock.offset_b,
-            log_offset: superblock.log_offset,
-            log_size: superblock.log_size,
-            data_offset: superblock.data_offset,
-        };
+        let geometry = Geometry::of(&superblock);
         let unchecked = batch_config(requests);
         assert!(unchecked.check().is_err());
         let (volume, _) = Volume::start(

@@ -4,7 +4,7 @@ use hyper_block::buf::{Alignment, MAX_BUFFER};
 
 use crate::error::ChunkError;
 use crate::frame::{DELETE_LEN, FRAME_HEADER, PUT_LEN, SEGMENT_LEN};
-use crate::superblock::{OFFSET_B_COMPACT, OFFSET_B_STANDARD};
+use crate::superblock::{OFFSET_B_COMPACT, OFFSET_B_STANDARD, Superblock};
 
 /// The largest index frame, and so the most memory reading or writing one frame takes. It is
 /// one bound for every frame (audit S13): recovery reads no larger frame, a checkpoint packs
@@ -15,6 +15,14 @@ use crate::superblock::{OFFSET_B_COMPACT, OFFSET_B_STANDARD};
 pub const MAX_FRAME_BYTES: u64 = 4 << 20;
 /// Bytes of records one frame holds.
 pub const FRAME_PAYLOAD: u64 = MAX_FRAME_BYTES - FRAME_HEADER as u64;
+
+/// The block of a volume on a device whose transfers align to `align`: the larger of 4 KiB
+/// [HL23 §2.2] and the alignment, the device's logical and physical blocks and its write unit
+/// (docs/design/chunk-store.md §2).
+pub fn block(align: Alignment) -> Option<u64> {
+    let least = Alignment::new(4096).ok()?;
+    u64::try_from(align.max(least).get()).ok()
+}
 
 /// The largest payload one record of a segment of `segment_size` bytes holds on a device of
 /// `block`-byte blocks: the segment less its header block, the record's header, its checksum
@@ -231,15 +239,23 @@ pub struct Geometry {
 }
 
 impl Geometry {
+    /// Where everything is in the volume `superblock` describes, as it was laid out.
+    pub fn of(superblock: &Superblock) -> Self {
+        Self {
+            block: u64::from(superblock.block),
+            segment_size: superblock.segment_size,
+            segments: superblock.segments,
+            offset_b: superblock.offset_b,
+            log_offset: superblock.log_offset,
+            log_size: superblock.log_size,
+            data_offset: superblock.data_offset,
+        }
+    }
+
     /// Lays out a volume of `size` bytes whose transfers align to `align`.
     pub fn plan(size: u64, align: Alignment, config: &Config) -> Result<Self, ChunkError> {
         let bad = |m: &str| ChunkError::Config(m.to_owned());
-        let block = u64::try_from(
-            align
-                .max(Alignment::new(4096).map_err(|_| bad("block"))?)
-                .get(),
-        )
-        .map_err(|_| bad("block"))?;
+        let block = block(align).ok_or_else(|| bad("block"))?;
         if !config.segment_size.is_multiple_of(block)
             || config.segment_size < block.saturating_mul(4)
         {

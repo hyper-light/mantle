@@ -65,6 +65,8 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/chunk/src/frame.rs` `TAG_DELETE` | format | Record tag for a delete record inside a frame. |
 | `crates/chunk/src/frame.rs` `TAG_PUT` | format | Record tag for a put record inside a frame. |
 | `crates/chunk/src/frame.rs` `TAG_SEGMENT` | format | Record tag for a segment-state record inside a frame. |
+| `crates/chunk/src/index.rs` `FRAGMENT_BYTES` | measured | 346 bytes an index of one-fragment chunks asks of its allocator a fragment at most: its table's bucket and control byte, its fragment list and its place, at the peak a table's growth reaches while it holds its old and new buckets (345.3 measured at 917,505 fragments, the first past a growth; 229.6 once the old buckets go), counted by hyper-measure's allocator through twenty doublings, each repeating the last's proportions (`tests/index_memory.rs`, which asserts the bound at every count and that a byte less does not hold). |
+| `crates/chunk/src/index.rs` `INDEX_BYTES` | measured | 146 bytes the index of one fragment asks beyond `FRAGMENT_BYTES`: its table's first buckets and its place set's first node (492 measured for one, exactly the two together). |
 | `crates/chunk/src/key.rs` `ENCODED_LEN` | format | Encoded ChunkKey width: u128 block + u32 epoch + u16 index = 22 bytes. |
 | `crates/chunk/src/layout.rs` `FRAME_PAYLOAD` | derived | MAX_FRAME_BYTES less FRAME_HEADER. |
 | `crates/chunk/src/layout.rs` `MAX_FRAME_BYTES` | bound | 4 MiB reader and writer frame ceiling checked by `Config::check` (audit S13); audit §12.6 asks to name the header and alignment terms and prove every legal frame fits. |
@@ -502,6 +504,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/node/src/command.rs` `LENGTH_BYTES` | format | An answer's length before it in a reply's body, a u32. |
 | `crates/node/src/command.rs` `REPLY_HEAD_BYTES` | format | A reply's head: its status, one byte; the leader the node knows, a u64; and, for a redirect, how long until the node acts on its leader's silence, a u64 of nanoseconds. |
 | `crates/node/src/derive.rs` `BUCKET_QUOTA` | external | S3's 10,000 buckets to an owner (research/05 §10.4). |
+| `crates/node/src/derive.rs` `CHECKSUM_SHIFT_MOST` | cited | A record's checksum blocks at most 16 KiB, the length up to which CRC-32C's guaranteed Hamming distances are verified (research/03 §15.8 C2; research 11 §8.2), the cap on a volume's block taken as its checksum block. |
 | `crates/node/src/derive.rs` `ELECTION_TICK` | cited | focal's election timeout of 10 ticks (docs/design/node.md §2.4; research/07 §2.2), which a range keeps though it elects by suspicion, which takes no ticks. |
 | `crates/node/src/derive.rs` `EXTENT_PAGES` | bound | The least pages an engine's extent takes: 2, extent 0 holding the superblock's two copies (`mantle_engine::store::Config`). |
 | `crates/node/src/derive.rs` `FANOUT` | cited | SplinterDB's trunk fanout of 8, at which the engine's measurements ran (docs/design/engine-structure.md §5–§6), until it is measured against mantle's key counts as §4 asks. |
@@ -509,6 +512,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/node/src/derive.rs` `HEARTBEAT_TICK` | cited | focal's heartbeat every 2 ticks (docs/design/node.md §2.4; research/07 §2.2). |
 | `crates/node/src/derive.rs` `QUANTUM` | cited | The longest a runnable thread waits behind one other, per platform (research/64): Linux 3 ms (`sysctl_sched_base_slice` 0.75 ms × (1 + log2 of up to 8 CPUs), kernel/sched/fair.c v6.12); macOS 10 ms (XNU's default preemption rate of 100 a second, osfmk/kern/sched_prim.c); Windows and elsewhere 93.75 ms, six clock intervals of 15.625 ms, a foreground thread's quantum as Microsoft measured it; a server's longer one has no length Microsoft gives. |
 | `crates/node/src/derive.rs` `REPAIR_HOURS` | cited | A day to repair a lost chunk until repair is built and measured: "a day—or more" after a power-on restart (Chansler 2012; research/15 §8.4), the longest mean the sources give. |
+| `crates/node/src/derive.rs` `SCRUB` | cited | A volume's whole scrub in seven days, research 03 §15.9's target of the fourteen it allows at most (field practice: SDG10 §5, Ceph weekly, AWK+19 §5.1; research 11 §12.4 notes it is practice, not a derivation). |
 | `crates/node/src/derive.rs` `TARGET` | external | A block's annual chance of loss at most, unless stated: S3's eleven nines applied per block, 10⁻¹¹ (docs/design/durability.md §1; research/15 §5). |
 | `crates/node/src/frame.rs` `CRC_BYTES` | format | A Raft frame's CRC-32C, four bytes (CLAUDE.md §6). |
 | `crates/node/src/frame.rs` `GROUP_BYTES` | format | A Raft frame's group, a u128 as the log names a range's group (hyper-log). |

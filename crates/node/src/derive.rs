@@ -9,6 +9,8 @@ use std::time::Duration;
 use hyper_block::buf::Alignment;
 use hyper_log::{Config as LogConfig, Facts, LogError, Unfit};
 use hyper_rt::machine::bench::MIN_SAMPLES;
+use mantle_chunk::layout::{self as volume_layout, Geometry};
+use mantle_chunk::{ChunkError, Config as VolumeConfig, Limits, Reads, index};
 use mantle_ec::durability::{self, Burst, Rates};
 use mantle_engine::store::Config as StoreConfig;
 use mantle_engine::trunk::TrunkConfig;
@@ -65,6 +67,15 @@ const QUANTUM: Duration = Duration::from_micros(93_750);
 /// Elsewhere, the longest of those.
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 const QUANTUM: Duration = Duration::from_micros(93_750);
+
+/// The largest checksum block a volume's records take, as a shift: 16 KiB, the length up to which
+/// CRC-32C's guaranteed Hamming distances are verified (docs/research/03 §15.8 C2, research 11
+/// §8.2).
+const CHECKSUM_SHIFT_MOST: u8 = 14;
+
+/// How long one scrub of a whole volume takes: research 03 §15.9's target of seven days, of the
+/// fourteen it allows at most.
+const SCRUB: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// The rates a block's scheme is chosen by until mantle measures its own (docs/design/durability.md
 /// §5): each chunk lost at the worst device class's annual rate, since a block's chunks may land
@@ -174,6 +185,12 @@ pub enum DeriveError {
     Extents { share: u64, extent: u64 },
     #[error("the log: {0}")]
     Log(#[from] LogError),
+    #[error("no segment one I/O buffer reads holds a record of a {bytes}-byte chunk")]
+    Chunk { bytes: u64 },
+    #[error("a volume's index of {bytes} bytes holds no fragment")]
+    Index { bytes: u64 },
+    #[error("a volume: {0}")]
+    Volume(#[from] ChunkError),
 }
 
 /// The range's settings and rules, which every member of the cell derives alike, from the
@@ -319,6 +336,132 @@ pub fn log(align: Alignment, settings: &Settings, ranges: usize) -> Result<LogCo
     Ok(LogConfig::derive(&facts(needed))?)
 }
 
+/// What a data device measured (docs/design/chunk-store.md §7; `mantle_disk::calibrate`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Profile {
+    /// Reads at the device at once where throughput stops growing.
+    pub depth: usize,
+    /// Bytes the reads at the device buffer at once where large reads stop gaining.
+    pub read_bytes: u64,
+    /// Bytes a read goes past rather than ask the device a second time.
+    pub read_gap: u64,
+    /// Whether a durable write into never-written space is slower than one over written space.
+    pub prewrite: bool,
+}
+
+/// What a volume laid out already fixed at format, as its superblock records it: where
+/// everything is, and its records' checksum blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Formatted {
+    pub geometry: Geometry,
+    pub checksum_shift: u8,
+}
+
+/// A chunk volume of `size` bytes on a device whose transfers align to `align`, measured as
+/// `profile`, holding chunks of `chunk_bytes` at most, whose index may ask `index_bytes` of the
+/// allocator; `formatted` when it was laid out already, whose choices made at format stand:
+///
+/// - checksum blocks of the volume's block, at most CRC-32C's verified 16 KiB: a read at the
+///   device's alignment then verifies no byte it did not ask for (research 11 §8.2);
+/// - the least segment holding one record of the largest chunk whole (`layout::least_segment`),
+///   since smaller segments clean better (research 11 §7.3–§7.4);
+/// - the standard layout, its superblocks 16 MiB apart beyond the reach of clustered latent
+///   sector errors, or the compact one where the standard leaves fewer than two segments
+///   (chunk-store.md §2);
+/// - batches of one record, a segment's room in bytes, and one fragment a chunk, as the node
+///   puts chunks whole;
+/// - as many fragments as the index's bytes hold (`index::most_fragments`) and the volume holds
+///   at a block each, the least a fragment takes standing for the chunk sizes research 11 §6.2
+///   learns from, within what the log of a volume laid out already holds checkpoints of;
+/// - research 03 §15.9's week a scrub, and the profile's reads and first writes.
+pub fn volume(
+    align: Alignment,
+    size: u64,
+    chunk_bytes: u64,
+    profile: &Profile,
+    index_bytes: u64,
+    formatted: Option<&Formatted>,
+) -> Result<VolumeConfig, DeriveError> {
+    let (block, checksum_shift, segment_size) = match formatted {
+        Some(formatted) => (
+            formatted.geometry.block,
+            formatted.checksum_shift,
+            formatted.geometry.segment_size,
+        ),
+        None => {
+            let block =
+                volume_layout::block(align).ok_or(DeriveError::Overflow("a volume's block"))?;
+            let shift = u8::try_from(block.trailing_zeros())
+                .map_err(|_| DeriveError::Overflow("a volume's block"))?
+                .min(CHECKSUM_SHIFT_MOST);
+            let segment = volume_layout::least_segment(block, shift, chunk_bytes)
+                .ok_or(DeriveError::Chunk { bytes: chunk_bytes })?;
+            (block, shift, segment)
+        }
+    };
+    let batch_bytes = segment_size
+        .checked_sub(block)
+        .and_then(|room| usize::try_from(room).ok())
+        .ok_or(DeriveError::Overflow("a batch"))?;
+    let at_a_block = size.checked_div(block).unwrap_or(0);
+    let mut config = VolumeConfig {
+        segment_size,
+        checksum_shift,
+        max_fragments: index::most_fragments(index_bytes).min(at_a_block),
+        compact: false,
+        scrub_period: Some(SCRUB),
+        limits: Limits {
+            batch_requests: 1,
+            batch_bytes,
+            fragments_per_chunk: 1,
+        },
+        prewrite: profile.prewrite,
+        reads: Reads::measured(profile.depth, profile.read_bytes, profile.read_gap),
+    };
+    if config.max_fragments == 0 {
+        return Err(DeriveError::Index { bytes: index_bytes });
+    }
+    match formatted {
+        Some(formatted) => config.max_fragments = held(&formatted.geometry, &config),
+        None => {
+            if Geometry::plan(size, align, &config).is_err() {
+                config.compact = true;
+                Geometry::plan(size, align, &config)?;
+            }
+        }
+    }
+    config.check()?;
+    Ok(config)
+}
+
+/// The most fragments, at most `config`'s, whose checkpoints and `config`'s batches the log of
+/// the volume laid out in `geometry` holds: what it was sized for at format bounds them since
+/// (`Geometry::holds`). The log needs more as fragments grow, so halving the span between the
+/// most that fits and the least that does not finds it, in a step a bit of the span.
+fn held(geometry: &Geometry, config: &VolumeConfig) -> u64 {
+    let fits = |max_fragments| {
+        geometry
+            .holds(&VolumeConfig {
+                max_fragments,
+                ..*config
+            })
+            .is_ok()
+    };
+    if fits(config.max_fragments) {
+        return config.max_fragments;
+    }
+    let (mut fit, mut over) = (0u64, config.max_fragments);
+    while over.saturating_sub(fit) > 1 {
+        let mid = fit.saturating_add(over.saturating_sub(fit) >> 1);
+        if fits(mid) {
+            fit = mid;
+        } else {
+            over = mid;
+        }
+    }
+    fit
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,5 +589,86 @@ mod tests {
         let log = Log::create(file, config, 1).unwrap();
         let entry = usize::try_from(settings.max_entry_bytes).unwrap();
         assert!(log.entry_room().unwrap() >= entry + hyper_durable::ENTRY_OVERHEAD);
+    }
+
+    const PROFILE: Profile = Profile {
+        depth: 4,
+        read_bytes: 1 << 20,
+        read_gap: 64 << 10,
+        prewrite: true,
+    };
+
+    /// A volume laid out on a device of 4 KiB blocks: checksum blocks of the block, the least
+    /// segment a record of the largest chunk fits whole, batches of one record, the profile's
+    /// reads, and as many fragments as both the volume at a block each and the index's bytes
+    /// hold; the compact layout on a volume too small for the standard one, and a refusal for
+    /// one too small for either, or an index that holds no fragment.
+    #[test]
+    fn a_volume_holds_a_chunk_a_segment_and_the_fragments_its_index_holds() {
+        let align = Alignment::new(4096).unwrap();
+        let chunk = mantle_gateway::layout::CHUNK;
+        let v = volume(align, 1 << 30, chunk, &PROFILE, 1 << 30, None).unwrap();
+        assert_eq!(v.checksum_shift, 12);
+        assert!(volume_layout::record_room(v.segment_size, 4096, 12) >= chunk);
+        assert!(volume_layout::record_room(v.segment_size - 4096, 4096, 12) < chunk);
+        assert!(!v.compact);
+        assert_eq!(
+            (v.limits.batch_requests, v.limits.fragments_per_chunk),
+            (1, 1)
+        );
+        assert_eq!(v.max_fragments, (1 << 30) / 4096);
+        assert_eq!(v.reads, Reads::measured(4, 1 << 20, 64 << 10));
+        assert!(v.prewrite);
+        Geometry::plan(1 << 30, align, &v).unwrap();
+        let bytes = index::most_bytes(1000).unwrap();
+        let few = volume(align, 1 << 30, chunk, &PROFILE, bytes, None).unwrap();
+        assert_eq!(few.max_fragments, 1000);
+        assert!(matches!(
+            volume(align, 1 << 30, chunk, &PROFILE, index::INDEX_BYTES, None),
+            Err(DeriveError::Index { .. })
+        ));
+        let small = volume(align, 64 << 20, chunk, &PROFILE, 1 << 30, None).unwrap();
+        assert!(small.compact);
+        Geometry::plan(64 << 20, align, &small).unwrap();
+        assert!(matches!(
+            volume(align, 16 << 20, chunk, &PROFILE, 1 << 30, None),
+            Err(DeriveError::Volume(_))
+        ));
+        // Checksum blocks stop at CRC-32C's verified 16 KiB on a device of a larger unit.
+        let wide = Alignment::new(64 << 10).unwrap();
+        let w = volume(wide, 1 << 30, chunk, &PROFILE, 1 << 30, None).unwrap();
+        assert_eq!(w.checksum_shift, 14);
+        Geometry::plan(1 << 30, wide, &w).unwrap();
+    }
+
+    /// A volume laid out already keeps its block, segment and checksum blocks, and holds no
+    /// more fragments than its log was laid out for, however many its index's bytes would.
+    #[test]
+    fn a_formatted_volume_keeps_its_layout_and_the_fragments_its_log_holds() {
+        let align = Alignment::new(4096).unwrap();
+        let chunk = mantle_gateway::layout::CHUNK;
+        let bytes = index::most_bytes(1000).unwrap();
+        let first = volume(align, 8 << 30, chunk, &PROFILE, bytes, None).unwrap();
+        let formatted = Formatted {
+            geometry: Geometry::plan(8 << 30, align, &first).unwrap(),
+            checksum_shift: first.checksum_shift,
+        };
+        let wide = Alignment::new(64 << 10).unwrap();
+        let again = volume(wide, 8 << 30, chunk, &PROFILE, 1 << 30, Some(&formatted)).unwrap();
+        assert_eq!(
+            (again.segment_size, again.checksum_shift),
+            (first.segment_size, first.checksum_shift)
+        );
+        assert_eq!(again.limits.batch_bytes, first.limits.batch_bytes);
+        assert!(again.max_fragments >= 1000);
+        assert!(again.max_fragments < (8 << 30) / 4096);
+        formatted.geometry.holds(&again).unwrap();
+        let one_more = VolumeConfig {
+            max_fragments: again.max_fragments + 1,
+            ..again
+        };
+        assert!(formatted.geometry.holds(&one_more).is_err());
+        let fewer = volume(align, 8 << 30, chunk, &PROFILE, bytes / 2, Some(&formatted)).unwrap();
+        assert_eq!(fewer.max_fragments, index::most_fragments(bytes / 2));
     }
 }

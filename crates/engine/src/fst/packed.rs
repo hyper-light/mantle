@@ -84,8 +84,11 @@ impl Packed {
             });
         }
         let len = self.len.checked_add(1).ok_or(corrupt())?;
-        let words = self.words_for(len).ok_or(corrupt())?;
-        self.words.resize(words, 0);
+        // Words held are always those `len` values take, and a value of at most 32 bits takes
+        // at most one word past them.
+        if self.words.len() < self.words_for(len).ok_or(corrupt())? {
+            self.words.push(0);
+        }
         self.len = len;
         self.put(len.saturating_sub(1), v);
         Ok(())

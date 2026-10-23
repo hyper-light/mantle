@@ -294,16 +294,20 @@ when it binds, and is measured then.
      the entries of memtables given back when they are more than half of what it holds. A shard
      sized to the machine (`ShardDb::follow_machine`) has a budget that follows the machine's room,
      what it could give without writing anything out first (`port::memory::room_now`: on Linux
-     `MemAvailable` less dirty and writeback pages and the process's own pages in swap), looked at
-     each rotation, each get cycle and in idle time as workers report: the budget is what the
-     regions and kept memtables hold and the shard's share of that room, less what grew outside
-     its account between two looks, so the kept memtables give memory back, and the caches are
-     trimmed, as the machine runs short (docs/research/65 §2-§5). Such a budget leaves a share to
-     the kernel's page cache, which the workers read their inputs through and which absorbs the
-     store's writes over short-lived extents: a fourth region of the tuner, which no region grants
-     into, its gain the workers' measured read waits on the pages a share a step larger would have
-     held, counted by the extents taken since each input's branch was (`ShardDb::kernel_share`;
-     docs/research/65 §7-§8).
+     `MemAvailable` less the kernel's background dirty threshold, or the dirty and writeback pages
+     past it, and less the process's own pages in swap), looked at each rotation, each get cycle
+     and in idle time as workers report: the budget is what the regions and kept memtables hold
+     and the shard's share of that room, less what grew outside its account between two looks,
+     never above its share of the capacity less its own memtables and branch metadata. It moves by
+     a tuning step or more, or at once when the machine needs memory back, so the kept memtables
+     give memory back, and the caches are trimmed, as the machine runs short, not at every moment
+     between the shard's account and the machine's reading (docs/research/65 §2-§5, §9). Such a
+     budget leaves a share to the kernel's page cache, which the workers read their inputs through
+     and which absorbs the store's writes over short-lived extents: a fourth region of the tuner,
+     which no region grants into, its gain the workers' measured waits on reads the OS did not
+     hold, priced job by job by the pages a share a step larger would have held, counted by the
+     extents taken since each input's branch was (`ShardDb::kernel_share`; docs/research/65
+     §7-§9).
 3. **The tree.** Root to leaf; at each node each branch's filter is asked before its leaf is
    read. With the filters and branch interiors in memory, a cold get costs about one device read
    (research/34 §1).

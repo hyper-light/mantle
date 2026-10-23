@@ -111,7 +111,9 @@ potentially causing reloads down the line"). So the reading fell to nothing only
 cache was nearly gone (§1): it estimates what reclaim could take, not a margin. The kernel's own
 domain for dirty memory inside a cgroup counts only clean file pages as room (mm/page-writeback.c
 `mdtc_calc_avail`: "clean = filepages - min(filepages, mdtc->dirty)"), the rule the follow's
-reading takes on Linux: `MemAvailable` less `Dirty` and `Writeback`.
+reading took on Linux at first: `MemAvailable` less `Dirty` and `Writeback`. It now holds back the
+background threshold those pages build to before the flusher writes them out, or the pages when
+they run past it, since the count at each moment follows the flusher's cycle (§9).
 
 **The kernel keeps little for itself.** `min_free_kbytes = sqrt(lowmem_kbytes * 16)`, clamped to
 128 KiB-256 MiB (mm/page_alloc.c `calculate_min_free_kbytes`), the watermarks' gaps
@@ -373,9 +375,13 @@ the budget's share no region takes.
   is first tried from memory. A read the OS held is a copy from memory, which no larger page cache
   would spare, so a fill whose inputs all stay cached (100M rows in 96 GiB) earns the kernel
   nothing, though its workers still wait on the issuer's answers. A file that cannot tell, direct
-  I/O or a platform without either call, counts no wait, and the share stays none. A cycle's gain
-  is the waits as many times over as `within` is of `past` (`kernel_gain`): of what the reads the
-  share missed cost, what a step would have saved, against a step's bytes. The price is measured,
+  I/O or a platform without either call, counts no wait, and the share stays none. A job taken back
+  adds its waits as many times over as its `within` is of its `past`, both counted when it was
+  planned (`Trunk::note_reuse`), and a cycle's gain is their sum, against a step's bytes: of what
+  the reads the share missed cost, what a step would have saved. Counted at a cycle's end instead,
+  the reads of the jobs planned in it against the waits of those taken back, most cycles held one
+  without the other, a job outlasting several, and the share stood still while the workers missed
+  (§9). The price is measured,
   not modeled: a share past what the kernel's page cache reaches finds no waits to save (§7: it
   reaches further than the bytes written).
 - **A step.** In a fill with no gets the page cache saves nothing and the workers wait on what the
@@ -392,3 +398,66 @@ the budget's share no region takes.
   at 51 GiB) come with the memory the reads earn, unpriced; a rewrite's ghost would count each
   extent reused by its age against the dirty window, `dirty_background_ratio` of the dirtyable
   memory.
+## 9. The share measured at a billion rows
+
+Each case below is one machine-sized 1B run on the VM at 96 GiB through `inside-oomdiag.sh`, a
+diagnostic build with the account line at each rotation (`diag-kernel`, never merged), recovery
+exact over 632,113,920 live keys in each. Single runs on a host whose other sessions' load varies
+(the Mac's load average was 13-20 through E1j): they place the effects, the interleaved release
+gate weighs them.
+
+| 1B, VM 96 GiB | build | fill | gets | seeks | fill s |
+|---|---|---|---|---|---|
+| E1d | the follow, nothing left to the kernel | 2,421,422 | 48,404 | 32,028 | 413 |
+| E1g | the share, priced cycle by cycle (ef42fd49, 6ec7ac90) | 2,865,640 | 23,880 | 12,433 | 349 |
+| E1i | E1g, no memtable kept (`MANTLE_DIAG_KEPT0`) | 3,166,911 | 25,021 | 14,338 | 316 |
+| E1j | the share priced job by job (123df270), the cap (5c5f8085) | 2,617,850 | 29,203 | 15,252 | 382 |
+| E1l | E1j with the cache's churn counted | 2,603,854 | 28,801 | 13,930 | 384 |
+| E1m | the room holding back the background threshold (bb3d5f7f) | 2,539,431 | 26,564 | 15,458 | 394 |
+| E1n | the budget moving by a tuning step (fa294e80) | (1,732 of 1,773 rotations in 347 s) | | | |
+| E1f | fixed 32 GiB cache | 3,796,764 | 24,911 | 15,396 | 263 |
+| E1h | fixed 4.5 GiB cache | 3,770,619 | 33,704 | 19,452 | 265 |
+| E1k | fixed 4.5 GiB cache, E1j's binary | 3,621,038 | 36,823 | 19,183 | 276 |
+
+- **The share.** In E1g the share reached 51-56 GiB and the VM's page cache 58-61 GiB: device reads
+  5.5% of the workers' (E1d 30.7%), 333 GB dirtied (E1d 480). But it grew in fits, standing still
+  for 75 rotations while the workers missed: a job's reads were counted when it was planned and its
+  waits when it came back, often cycles later, so most cycles held one without the other. Priced
+  job by job (E1j), the share began at rotation 400 and held 32 GiB by 550, where E1g's held 18.6 at
+  600.
+- **Kept memtables.** Before any read missed, the kept memtables took the budget's idle part, 41
+  GiB by 84 s in E1g, each a fresh arena faulted in and indexed on the workers, and gave it back as
+  the share grew. Without them (E1i) the first 600 rotations took 96 s, E1g's 112, the fixed arms'
+  82-88, and the fill as a whole 316 s against 349.
+- **Faults.** The account counts the process's minor faults (`/proc/self/stat`): 22-37K a
+  rotation through E1i's fill, 50 million in all, 69.5 million in E1j's, against 4-6K a rotation
+  with E1j's binary on a fixed 4.5 GiB cache (E1k). The fixed cache's limit never moves; the
+  follow's moved with every look. E1j's budget changed by 0.29 GiB a rotation on average after its
+  share settled, a sawtooth: the room jumped 2 GiB every 18 rotations or so and fell 0.1-0.2 GiB a
+  rotation between, and the page cache's share and the cache with it, which gave chunks back on
+  every fall and took fresh memory for its loans after every rise. The room read the dirty and
+  writeback pages at each look, and they follow the kernel's writeback cycle: dirty pages build
+  toward the background threshold, the flusher cleans a few GiB at once, and they build again.
+  That cycle is the kernel's, not a change in what the machine can give, so the room now holds back
+  the background threshold itself (`nr_dirty_background_threshold`, /proc/vmstat), or the dirty
+  pages when they run past it (`port::memory`; mm/page-writeback.c `balance_dirty_pages`).
+- **Churn counted.** E1l counted the page cache's fresh loan memory and the spare memory it gave
+  back on the account line: through E1j's build's fill the cache took 159 GiB fresh, though it never
+  held more than 44 GiB, and gave back 60 GiB as spare and the rest by retiring chunks, their pages
+  dropped. E1m, the room holding the threshold back, took the sawtooth away (the budget's change a
+  rotation 0.12 GiB, from 0.29) but not the churn: 10-11 GiB fresh every 150 rotations with the
+  share settled, about 30 thousand faults a rotation. Its budget still moved with every look, by
+  what lies between the shard's account and the machine's reading taken a moment later: kept
+  memtables swapped one for another, loans out, the kernel's reclaim (its change a rotation had a
+  standard deviation of 0.21 GiB, correlated with none of them alone). A cache whose limit falls
+  retires chunks, dropping their pages, and takes fresh memory for loans when it rises again; a
+  fixed limit does neither. So the budget moves only by a tuning step or more, the granularity the
+  tuner moves memory by, or at once when its target falls below what the shard holds, the machine
+  needing memory back (`follow_step`): E1n. Its budget changed at 2 of 231 looks after rotation
+  500, against every look before, and once the share settled the cache took no fresh memory and
+  gave none back for hundreds of rotations, 6 thousand faults a rotation (E1k's fixed cache: 4-6
+  thousand). The fill as a whole took 29.6 million faults and 43 GiB of fresh loan memory, where
+  E1l took 64.5 million and 159 GiB, and reached rotation 1,732 at 347 s, where E1l and E1m took
+  384 and 394 s for all 1,773 (Docker Desktop stopped the VM at 02:03:49 UTC, its log a requested
+  shutdown with no requester named, and E1n's gets and seeks never ran). What it still lacks of
+  the fixed arms' 263-276 s is mostly the kept memtables' (E1i).

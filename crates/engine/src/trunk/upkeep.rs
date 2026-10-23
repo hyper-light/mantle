@@ -36,13 +36,16 @@ impl Change {
 }
 
 /// A maintenance task: node `node`'s compaction of one pivot's in-flight bundles, or a leaf's
-/// settle, inline or out on a worker; `units` its inputs' entries when planned, its debt.
+/// settle, inline or out on a worker; `units` its inputs' entries when planned, its debt; and,
+/// out on a worker, its reads counted against the kernel's page cache's window when planned,
+/// which price its reads' waits when it comes back ([`Reuse`]).
 #[derive(Debug)]
 pub(super) struct NodeTask {
     node: usize,
     what: What,
     run: Running,
     units: u64,
+    reuse: Reuse,
 }
 
 #[derive(Debug)]
@@ -737,7 +740,6 @@ impl Trunk {
             )))
         };
         let key = pivot.key.clone();
-        self.note_reuse(reuse);
         self.tasks.push(NodeTask {
             node: n,
             what: What::Compact {
@@ -747,6 +749,7 @@ impl Trunk {
             },
             run,
             units,
+            reuse,
         });
         self.stats.plan_ns = self.stats.plan_ns.saturating_add(ns_since(t));
         Ok(())
@@ -978,7 +981,6 @@ impl Trunk {
         } else {
             Running::Inline(Box::new(Compaction::prepare(inputs, from, end, true, per)))
         };
-        self.note_reuse(reuse);
         if settle.was_paid {
             self.spend(n, 0)?;
         }
@@ -1002,6 +1004,7 @@ impl Trunk {
             },
             run,
             units: count,
+            reuse,
         });
         if let Some(c) = self.node_mut(n)?.wants.as_mut() {
             c.started = true;
@@ -1168,7 +1171,11 @@ impl Trunk {
     ) -> Result<(), Error> {
         let t = self.timed.then(std::time::Instant::now);
         let NodeTask {
-            node: n, what, run, ..
+            node: n,
+            what,
+            run,
+            reuse,
+            ..
         } = task;
         let parts = match run {
             Running::Finished(parts) => parts,
@@ -1186,10 +1193,7 @@ impl Trunk {
                 // priced at, measured wherever compactions run; and its reads' waits, what the
                 // kernel's page cache cost it.
                 self.note_merge(out.ns, out.units);
-                self.note_reuse(Reuse {
-                    waited_ns: out.read_wait_ns,
-                    ..Reuse::default()
-                });
+                self.note_reuse(reuse, out.read_wait_ns);
                 out.parts
             }
             _ => return Err(corrupt()),
@@ -1703,6 +1707,41 @@ mod reuse_tests {
     }
 
     #[test]
+    fn each_jobs_waits_are_priced_by_its_own_reads_against_its_window() {
+        let mut trunk = Trunk::new(TrunkConfig {
+            fanout: 4,
+            leaf_entries: 128,
+        })
+        .unwrap();
+        let planned = |past, within| Reuse {
+            past,
+            within,
+            ..Reuse::default()
+        };
+        // A quarter of one job's reads past the share a step more would hold, all of the other's:
+        // a quarter of the first's waits and all of the second's.
+        trunk.note_reuse(planned(100, 25), 1_000);
+        trunk.note_reuse(planned(40, 40), 300);
+        // A job that read nothing past the share, or waited on nothing: nothing spared.
+        trunk.note_reuse(planned(0, 0), 5_000);
+        trunk.note_reuse(planned(10, 10), 0);
+        assert_eq!(
+            trunk.take_reuse(),
+            Reuse {
+                past: 150,
+                within: 75,
+                waited_ns: 6_300,
+                saved_ns: 250 + 300,
+            }
+        );
+        // Taken, the counts start over; every wait at the extremes, in 128 bits, saturates.
+        assert_eq!(trunk.take_reuse(), Reuse::default());
+        trunk.note_reuse(planned(u64::MAX, u64::MAX), u64::MAX);
+        trunk.note_reuse(planned(1, 1), 1);
+        assert_eq!(trunk.take_reuse().saved_ns, u64::MAX);
+    }
+
+    #[test]
     fn a_jobs_reads_are_counted_by_their_branchs_age_against_the_window() {
         let align = Alignment::new(4096).unwrap();
         let file = SimFile::new(align, Alignment::new(512).unwrap(), 7).unwrap();
@@ -1719,7 +1758,7 @@ mod reuse_tests {
         let reuse = |past, within| Reuse {
             past,
             within,
-            waited_ns: 0,
+            ..Reuse::default()
         };
         // Every read counted, the job's pages the sum; no window holds the loaded one's.
         let (all, r) = read((0, u64::MAX));

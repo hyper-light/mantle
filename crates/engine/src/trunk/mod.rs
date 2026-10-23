@@ -465,16 +465,19 @@ pub struct Trunk {
     reuse: Reuse,
 }
 
-/// The kernel's page cache as the shard's workers use it (docs/research/65 §8): the pages their
-/// jobs read whose branch was taken the window's start or more extents before (`past`, what a page
-/// cache of the start would not hold, read as the bytes written since), and of them those taken
-/// fewer than the window's end before (`within`, what one of the end would); and the nanoseconds
-/// the jobs taken back waited on their reads (`waited_ns`).
+/// The kernel's page cache as the shard's workers use it (docs/research/65 §8): the pages a job
+/// reads whose branch was taken the window's start or more extents before when it was planned
+/// (`past`, what a page cache of the start would not hold, read as the bytes written since), and
+/// of them those taken fewer than the window's end before (`within`, what one of the end would);
+/// summed over the jobs taken back, with the nanoseconds they waited on reads the OS did not hold
+/// (`waited_ns`) and what a page cache of the window's end would have spared them (`saved_ns`:
+/// each job's waits as many times over as its `within` is of its `past`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Reuse {
     pub past: u64,
     pub within: u64,
     pub waited_ns: u64,
+    pub saved_ns: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1319,18 +1322,28 @@ impl Trunk {
         self.reuse_window = (from, to.max(from));
     }
 
-    /// The pages workers' jobs planned since the last call read, counted against the window
-    /// ([`Reuse`]); counted again from none.
+    /// The workers' jobs taken back since the last call, their reads counted against the window
+    /// they were planned at and their waits priced by it ([`Reuse`]); counted again from none.
     pub fn take_reuse(&mut self) -> Reuse {
         std::mem::take(&mut self.reuse)
     }
 
-    /// Adds a planned job's reads, or a job's waits taken back, to the counts since the shard
-    /// last took them.
-    fn note_reuse(&mut self, r: Reuse) {
-        self.reuse.past = self.reuse.past.saturating_add(r.past);
-        self.reuse.within = self.reuse.within.saturating_add(r.within);
-        self.reuse.waited_ns = self.reuse.waited_ns.saturating_add(r.waited_ns);
+    /// Adds a job taken back, its reads counted when it was planned (`planned`) and its reads'
+    /// waits (`waited_ns`), to the counts since the shard last took them: what a page cache of the
+    /// window's end would have spared it is its waits as many times over as its `within` is of its
+    /// `past`, none when it read nothing past the window's start.
+    fn note_reuse(&mut self, planned: Reuse, waited_ns: u64) {
+        let saved = u128::from(waited_ns)
+            .saturating_mul(u128::from(planned.within))
+            .checked_div(u128::from(planned.past))
+            .unwrap_or(0);
+        self.reuse.past = self.reuse.past.saturating_add(planned.past);
+        self.reuse.within = self.reuse.within.saturating_add(planned.within);
+        self.reuse.waited_ns = self.reuse.waited_ns.saturating_add(waited_ns);
+        self.reuse.saved_ns = self
+            .reuse
+            .saved_ns
+            .saturating_add(u64::try_from(saved).unwrap_or(u64::MAX));
     }
 
     /// Into `cuts`, the root's pivot keys, at which a packing ends its branches so each is one

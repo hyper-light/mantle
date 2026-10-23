@@ -563,24 +563,6 @@ struct Gain {
     bytes: usize,
 }
 
-/// What a share of the kernel's page cache a `window` larger would have saved the workers in a
-/// cycle (docs/research/65 §8): of the pages they read that the share would not hold (`past`,
-/// read as the bytes written since their branch), those a share a window larger would
-/// (`within`), priced at what the ones it would not hold made them wait, a share of the waits
-/// as `within` is of `past`.
-fn kernel_gain(reuse: crate::trunk::Reuse, window: usize) -> Gain {
-    Gain {
-        saved_ns: u64::try_from(
-            u128::from(reuse.waited_ns)
-                .saturating_mul(u128::from(reuse.within))
-                .checked_div(u128::from(reuse.past))
-                .unwrap_or(0),
-        )
-        .unwrap_or(u64::MAX),
-        bytes: window,
-    }
-}
-
 /// Write memory's next share of `memory` against the page cache alone ([`tune4`] with no record
 /// cache, no kernel's share and no past steps).
 #[cfg(test)]
@@ -1780,13 +1762,16 @@ impl<F: BlockFile> ShardDb<F> {
         // as given, and leaves the kernel nothing of it.
         let step = memory.saturating_mul(TUNE_STEP_PERCENT) / 100;
         let reuse = self.trunk.take_reuse();
-        let kernel = if self.follow.is_some() {
-            kernel_gain(reuse, step)
-        } else {
-            Gain {
-                saved_ns: 0,
-                bytes: step,
-            }
+        // What a share a step larger would have spared the workers' jobs taken back since the
+        // last division: each job's waits on reads the OS did not hold, as many times over as its
+        // reads a step past the share are of those past it (`Trunk::take_reuse`).
+        let kernel = Gain {
+            saved_ns: if self.follow.is_some() {
+                reuse.saved_ns
+            } else {
+                0
+            },
+            bytes: step,
         };
         // Write memory the cycle did not use goes back at once: a share above the most queued
         // spared no wait, and the queue takes buffers only as runs wait.
@@ -5194,28 +5179,6 @@ mod tune_tests {
                 &mut super::Newton::default()
             ),
             [70 * MIB, 10 * MIB, 20 * MIB, 0]
-        );
-    }
-
-    #[test]
-    fn the_kernels_share_is_worth_the_waits_of_the_reads_a_window_more_would_hold() {
-        let reuse = |past, within, waited_ns| crate::trunk::Reuse {
-            past,
-            within,
-            waited_ns,
-        };
-        // A quarter of the reads it missed a window more would hold: a quarter of the waits.
-        assert_eq!(
-            super::kernel_gain(reuse(100, 25, 1_000), MIB),
-            gain(250, MIB)
-        );
-        // Nothing missed, or nothing waited: nothing saved.
-        assert_eq!(super::kernel_gain(reuse(0, 0, 1_000), MIB), gain(0, MIB));
-        assert_eq!(super::kernel_gain(reuse(100, 100, 0), MIB), gain(0, MIB));
-        // Every wait at the extremes, in 128 bits: never overflowed.
-        assert_eq!(
-            super::kernel_gain(reuse(u64::MAX, u64::MAX, u64::MAX), MIB),
-            gain(u64::MAX, MIB)
         );
     }
 

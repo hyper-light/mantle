@@ -241,7 +241,7 @@ fn a_seek_refuses_a_corrupt_leaf_and_a_valid_branch_still_reads() {
         .collect();
     let good = build(&mut s, &entries);
     let broken = build(&mut s, &entries);
-    let page = u64::from(broken.leaf_of(b"key").unwrap());
+    let page = u64::from(broken.leaf_in(b"key").unwrap().unwrap());
     let address = broken.page_address(&s, page).unwrap();
     // A valid store-page checksum around an empty branch payload: corruption must also be
     // refused by the branch's reader, before any entry can be read through the cursor.
@@ -267,7 +267,7 @@ fn stepping_a_cursor_refuses_a_truncated_entry_in_a_valid_leaf_header() {
     .into_iter()
     .collect();
     let b = build(&mut s, &entries);
-    let page = u64::from(b.leaf_of(b"a").unwrap());
+    let page = u64::from(b.leaf_in(b"a").unwrap().unwrap());
     let address = b.page_address(&s, page).unwrap();
     let mut payload = Vec::new();
     s.read_page(address, &mut payload).unwrap();
@@ -292,7 +292,7 @@ fn a_cursor_refuses_a_page_flipped_on_the_medium() {
         .map(|n| (n.to_be_bytes().to_vec(), (Op::Put, vec![3u8; 100])))
         .collect();
     let b = build(&mut s, &entries);
-    let page = u64::from(b.leaf_of(&250u32.to_be_bytes()).unwrap());
+    let page = u64::from(b.leaf_in(&250u32.to_be_bytes()).unwrap().unwrap());
     let address = b.page_address(&s, page).unwrap();
     s.checkpoint(None, 1).unwrap();
     let (file, finished) = finished_file(s.into_file());

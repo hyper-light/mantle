@@ -1,7 +1,9 @@
 //! A point lookup retains its resolved leaf and demand span across a device wait. The
-//! branch's leaf index is in memory: there is no index-page I/O to replay on resumption.
+//! branch's leaf index is in memory, so a lookup reads its leaf alone, but where the index holds
+//! a group of leaves cut short: then it reads down from the root through the index pages, each
+//! read resumed as the leaf's is.
 
-use super::{LEAF, Op, View, corrupt};
+use super::{Descent, LEAF, Op, View, corrupt, descend};
 use crate::error::{Error, Malformed};
 use crate::store::{Span, Store};
 use hyper_block::block::BlockFile;
@@ -19,6 +21,8 @@ pub(crate) enum PointStep {
 #[derive(Debug)]
 pub(crate) struct PointRead {
     address: u64,
+    /// Index pages it may still pass on its way down: none for a read begun at its leaf.
+    levels: usize,
     span: Option<Span>,
     page: Vec<u8>,
     loaded: bool,
@@ -26,9 +30,10 @@ pub(crate) struct PointRead {
 }
 
 impl PointRead {
-    pub(super) fn new(address: u64) -> Self {
+    pub(super) fn new(address: u64, levels: usize) -> Self {
         Self {
             address,
+            levels,
             span: None,
             page: Vec::new(),
             loaded: false,
@@ -49,33 +54,64 @@ impl PointRead {
                 what: "a point cursor stepped after its lookup ended",
             });
         }
-        if !self.loaded {
-            if self.span.is_none() {
-                match store.with_resident_page(self.address, |page| read_value(page, key, value)) {
-                    Ok(Some(found)) => {
-                        self.finished = true;
-                        return Ok(PointStep::Done(found));
+        // A page a pass: the leaf, or an index page above it whose child is read next.
+        loop {
+            if !self.loaded {
+                if self.span.is_none() {
+                    match store.with_resident_page(self.address, |page| visit(page, key, value)) {
+                        Ok(Some(Visit::Found(found))) => {
+                            self.finished = true;
+                            return Ok(PointStep::Done(found));
+                        }
+                        Ok(Some(Visit::Child(child))) => {
+                            self.down(child)?;
+                            continue;
+                        }
+                        Err(error) => {
+                            self.finished = true;
+                            return Err(error);
+                        }
+                        Ok(None) => {}
                     }
-                    Err(error) => {
-                        self.finished = true;
-                        return Err(error);
-                    }
-                    Ok(None) => {}
+                    self.span = Some(store.span()?);
+                    self.page = store.take_page();
                 }
-                self.span = Some(store.span()?);
-                self.page = store.take_page();
+                let span = self.span.as_mut().ok_or(Error::InvalidArgument {
+                    what: "a point cursor stepped after its owners were returned",
+                })?;
+                if !store.read_page_paced(span, self.address, &mut self.page)? {
+                    return Ok(PointStep::Waiting);
+                }
+                self.loaded = true;
             }
-            let span = self.span.as_mut().ok_or(Error::InvalidArgument {
-                what: "a point cursor stepped after its owners were returned",
-            })?;
-            if !store.read_page_paced(span, self.address, &mut self.page)? {
-                return Ok(PointStep::Waiting);
+            // A malformed page is terminal too: retrying never appends/re-reads its bytes.
+            match visit(&self.page, key, value) {
+                Ok(Visit::Found(found)) => {
+                    self.finished = true;
+                    return Ok(PointStep::Done(found));
+                }
+                Ok(Visit::Child(child)) => {
+                    self.down(child)?;
+                    self.loaded = false;
+                }
+                Err(error) => {
+                    self.finished = true;
+                    return Err(error);
+                }
             }
-            self.loaded = true;
         }
-        // A malformed leaf is terminal too: retrying never appends/re-reads its bytes.
-        self.finished = true;
-        read_value(&self.page, key, value).map(PointStep::Done)
+    }
+
+    /// Goes down to `child`, a level of those it may pass spent: the page read next is the
+    /// child's alone, a read appending to what the buffer holds.
+    fn down(&mut self, child: u64) -> Result<(), Error> {
+        self.levels = self.levels.checked_sub(1).ok_or_else(|| {
+            self.finished = true;
+            corrupt(Malformed::CountMismatch)
+        })?;
+        self.address = child;
+        self.page.clear();
+        Ok(())
     }
 
     /// Gives back the cursor's memory and releases, rather than consumes, an unfinished
@@ -126,6 +162,19 @@ impl<'a, F: BlockFile> BorrowedPoint<'a, F> {
 impl<F: BlockFile> Drop for BorrowedPoint<'_, F> {
     fn drop(&mut self) {
         self.read.give_back(self.store);
+    }
+}
+
+/// What a page a point lookup reads tells it: the key's entry, or the child to read next.
+enum Visit {
+    Found(Option<Op>),
+    Child(u64),
+}
+
+fn visit(page: &[u8], key: &[u8], value: &mut Vec<u8>) -> Result<Visit, Error> {
+    match descend(page, key)? {
+        Descent::Leaf => read_value(page, key, value).map(Visit::Found),
+        Descent::Child(child) => Ok(Visit::Child(child)),
     }
 }
 
@@ -448,6 +497,123 @@ mod tests {
             branch.get(&mut reopened, &key(ROWS), &mut value).unwrap(),
             None
         );
+    }
+
+    /// Keys within groups of leaves the leaf index holds cut short: a point read begun at the
+    /// root reads down the index pages, from the device with no cache and resident with one,
+    /// and finds each key's entry, and none for keys never stored (research/67).
+    #[test]
+    fn point_reads_within_groups_go_down_the_index_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = DeviceFile::open(
+            &dir.path().join("store"),
+            true,
+            CachingRequest::Buffered,
+            Alignment::new(CONFIG.page_size).unwrap(),
+        )
+        .unwrap();
+        let mut store = Store::create(file, CONFIG).unwrap();
+        // Pairs of 600-byte keys sharing all but a last byte: a leaf ending inside a pair has a
+        // separator past the leaf index's depth.
+        let pair = |n: u64, last: u8| {
+            let mut k = n.to_be_bytes().to_vec();
+            k.resize(599, b'x');
+            k.push(last);
+            k
+        };
+        let keys: Vec<Vec<u8>> = (0u64..800)
+            .map(|i| pair(i / 2, if i % 2 == 0 { b'a' } else { b'b' }))
+            .collect();
+        let mut builder = Builder::new(
+            &mut store,
+            Keys::Exactly(u64::try_from(keys.len()).unwrap()),
+        )
+        .unwrap();
+        for (i, k) in keys.iter().enumerate() {
+            builder.add(&mut store, k, Op::Put, &expected(i)).unwrap();
+        }
+        let branch = builder.finish(&mut store).unwrap();
+        let grouped: Vec<usize> = (0..keys.len())
+            .filter(|&i| branch.leaf_in(&keys[i]).unwrap().is_none())
+            .collect();
+        assert!(!grouped.is_empty() && branch.height > 1);
+        store.checkpoint(None, 1).unwrap();
+        let issuer = Issuer::start_for(dir.path(), 1, 1).unwrap();
+        store.attach(&issuer, 1).unwrap();
+        let config = RuntimeConfig {
+            shards: 1,
+            tasks_per_shard: 1,
+            timers_per_shard: 1,
+            interests_per_shard: 2,
+            ring_entries: 2,
+            batch: 2,
+            step_budget_ns: 1_000_000_000,
+            timer_tick_ns: 100_000,
+            spin_ns: 0,
+            page_bytes: CONFIG.page_size,
+            wake_tracking: None,
+            latency_objective_ns: None,
+            pin: false,
+            cores: Vec::new(),
+        };
+        let mut runtime = LocalRuntime::new(&config).unwrap();
+        let store = runtime
+            .block_on(async move {
+                let mut store = store;
+                for cache in [0usize, 64] {
+                    store.set_cache(cache);
+                    // Twice with a cache: the second pass finds the index pages resident.
+                    for _ in 0..if cache == 0 { 1 } else { 2 } {
+                        for &i in &grouped {
+                            let mut value = Vec::new();
+                            let mut read = branch.prepare_leaf(&mut store, &keys[i]).unwrap();
+                            let found = loop {
+                                match read.step(&mut store, &keys[i], &mut value).unwrap() {
+                                    PointStep::Done(found) => break found,
+                                    PointStep::Waiting => {
+                                        store.wait_completion().await.unwrap();
+                                    }
+                                }
+                            };
+                            read.give_back(&mut store);
+                            assert_eq!(found, Some(Op::Put), "key {i}");
+                            assert_eq!(value, expected(i), "key {i}");
+                            // The same pair's third last byte, never stored.
+                            let absent = pair(u64::try_from(i / 2).unwrap(), b'c');
+                            let mut read = branch.prepare_leaf(&mut store, &absent).unwrap();
+                            let found = loop {
+                                match read.step(&mut store, &absent, &mut value).unwrap() {
+                                    PointStep::Done(found) => break found,
+                                    PointStep::Waiting => {
+                                        store.wait_completion().await.unwrap();
+                                    }
+                                }
+                            };
+                            read.give_back(&mut store);
+                            assert_eq!(found, None, "absent {i}");
+                            // A cursor sought from either, read down the same way, lands on the
+                            // first key at or after it.
+                            for (from, want) in
+                                [(&keys[i], keys.get(i)), (&absent, keys.get(i / 2 * 2 + 2))]
+                            {
+                                // Past the last key: no key to land on.
+                                let Some(want) = want else {
+                                    continue;
+                                };
+                                let mut c = crate::branch::RunCursor::new(&mut store).unwrap();
+                                c.seek_async(&branch, &mut store, from).await.unwrap();
+                                assert!(c.valid(), "seek {i}");
+                                assert_eq!(c.key(), want.as_slice(), "seek {i}");
+                                c.give_back(&mut store);
+                            }
+                        }
+                    }
+                }
+                store.retire_async().await.unwrap();
+                store
+            })
+            .unwrap();
+        drop(store);
     }
 
     #[test]

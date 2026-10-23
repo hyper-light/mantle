@@ -133,7 +133,7 @@ fn a_failed_single_head_step_can_reopen_over_another_run() {
         .collect();
     let bad_branch = build(&mut store, &entries);
     let good_branch = build(&mut store, &good);
-    let page = u64::from(bad_branch.leaf_of(b"a/0100").unwrap());
+    let page = u64::from(bad_branch.leaf_in(b"a/0100").unwrap().unwrap());
     let address = bad_branch.page_address(&store, page).unwrap();
     store.checkpoint(None, 1).unwrap();
     let (file, landed) = finished_file(store.into_file());

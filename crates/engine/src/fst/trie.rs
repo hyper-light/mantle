@@ -905,10 +905,16 @@ impl Trie {
     /// the leaves' separators. One descent, remembering the nearest smaller branch passed; if
     /// the key's path ends above every key beneath it, the rightmost key under that branch.
     pub fn floor(&self, key: &[u8]) -> Option<u32> {
+        self.floor_with(key).map(|(v, _)| v)
+    }
+
+    /// [`Self::floor`], with whether the key found is a prefix of `key` (or `key` itself): a
+    /// key that stands for every key starting with it holds `key` only then.
+    pub fn floor_with(&self, key: &[u8]) -> Option<(u32, bool)> {
         match self.against(key) {
             Against::Within(rest) => self.floor_rest(rest),
             Against::Below => None,
-            Against::Above => self.greatest(),
+            Against::Above => self.greatest().map(|v| (v, false)),
         }
     }
 
@@ -940,7 +946,7 @@ impl Trie {
 
     /// [`Self::floor`] of the rest of a key past the prefix: a level a byte, the dense levels
     /// first, then the sparse ones with each level's vectors found once (research/62 §2).
-    fn floor_rest(&self, key: &[u8]) -> Option<u32> {
+    fn floor_rest(&self, key: &[u8]) -> Option<(u32, bool)> {
         let mut node = self.root();
         let mut bytes = key.iter();
         // The nearest point below which every key is less than `key`.
@@ -958,11 +964,11 @@ impl Trie {
                 fallback = Some(Fallback::Dense(q));
             }
             if !d.labels.get(pos) {
-                return self.rightmost(fallback?);
+                return self.fall_back(fallback?);
             }
             if !d.has_child.get(pos) {
                 // A key ending here: `key` itself, or a prefix of it.
-                return self.dense_value_at(pos);
+                return self.dense_value_at(pos).map(|v| (v, true));
             }
             node = self.dense_child(pos);
         }
@@ -982,12 +988,12 @@ impl Trie {
                     fallback = Some(Fallback::Sparse(n, start.saturating_add(smaller)));
                 }
                 if !found {
-                    return self.rightmost(fallback?);
+                    return self.fall_back(fallback?);
                 }
                 let p = start.saturating_add(i);
                 if !s.has_child.get(p) {
                     // A key ending here: `key` itself, or a prefix of it.
-                    return s.value_at(n, p);
+                    return s.value_at(n, p).map(|v| (v, true));
                 }
                 n = s.child(p);
             }
@@ -995,9 +1001,16 @@ impl Trie {
         }
         // `key` ends at `node`: its own key, if any, is `key`; every other beneath is greater.
         if self.is_key(node) {
-            return self.value_of(node);
+            return self.value_of(node).map(|v| (v, true));
         }
-        self.rightmost(fallback?)
+        self.fall_back(fallback?)
+    }
+
+    /// The floor where a descent left `key`'s path: a node's own key on the path is a prefix of
+    /// `key`; the greatest key under a smaller branch is not.
+    fn fall_back(&self, at: Fallback) -> Option<(u32, bool)> {
+        let prefix = matches!(at, Fallback::Node(_));
+        self.rightmost(at).map(|v| (v, prefix))
     }
 
     /// Node `n`'s greatest label.
@@ -1518,8 +1531,14 @@ mod tests {
                         map.get(q).copied(),
                         "case {case} cut {cutoff} get {q:?}"
                     );
-                    let want = map.range(..=q.clone()).next_back().map(|(_, v)| *v);
+                    let below = map.range(..=q.clone()).next_back();
+                    let want = below.map(|(_, v)| *v);
                     assert_eq!(t.floor(q), want, "case {case} cut {cutoff} floor {q:?}");
+                    assert_eq!(
+                        t.floor_with(q),
+                        below.map(|(k, v)| (*v, q.starts_with(k))),
+                        "case {case} cut {cutoff} floor_with {q:?}"
+                    );
                 }
             }
         }

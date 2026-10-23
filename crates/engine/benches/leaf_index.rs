@@ -63,7 +63,8 @@ fn probes(keys: u64, count: u64, name: fn(u64) -> Vec<u8>) -> Vec<Vec<u8>> {
 fn lookups(branch: &Branch, probes: &[Vec<u8>]) -> u64 {
     let mut sum = 0u64;
     for key in probes {
-        sum = sum.wrapping_add(u64::from(branch.leaf_of(key).unwrap()));
+        // The keys' separators are never cut short here: every lookup is the index's alone.
+        sum = sum.wrapping_add(u64::from(branch.leaf_in(key).unwrap().unwrap()));
     }
     std::hint::black_box(sum)
 }

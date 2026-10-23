@@ -353,7 +353,7 @@ fn a_failed_required_opening_read_can_be_repaired_and_retried() {
     // The first, newest input opens from memory. The second requires a device read.
     store.set_cache(CONFIG.extent_pages as usize);
     let first = new
-        .page_address(&store, u64::from(new.leaf_of(b"").unwrap()))
+        .page_address(&store, u64::from(new.leaf_in(b"").unwrap().unwrap()))
         .unwrap();
     store.read_page(first, &mut Vec::new()).unwrap();
     let mut trunk = Trunk::new(TrunkConfig {
@@ -426,8 +426,8 @@ fn a_pivot_lower_bound_in_a_leaf_gap_keeps_the_next_leaf_and_end_fence() {
     let cursor = branch.seek(&mut store, b"m0").unwrap();
     assert_eq!(cursor.key(), b"z0");
     assert_ne!(
-        branch.leaf_of(b"z0").unwrap(),
-        branch.leaf_of(b"m0").unwrap()
+        branch.leaf_in(b"z0").unwrap().unwrap(),
+        branch.leaf_in(b"m0").unwrap().unwrap()
     );
     cursor.give_back(&mut store);
     trunk.add(branch);
@@ -469,7 +469,7 @@ fn a_first_input_write_above_the_answered_end_does_not_block_paced_opening() {
     ]);
     let branch = build(&mut store, &oracle);
     let first = branch
-        .page_address(&store, u64::from(branch.leaf_of(b"").unwrap()))
+        .page_address(&store, u64::from(branch.leaf_in(b"").unwrap().unwrap()))
         .unwrap();
     assert!(first * CONFIG.page_size as u64 >= landed);
     while gate.writes_entered.load(Ordering::SeqCst) == 0 {

@@ -166,9 +166,14 @@ fn elapsed_ns(since: Option<std::time::Instant>) -> u64 {
 /// (38-44% at none, 0.2-0.6% at 16).
 pub const RANGE_FILTER_BITS: u32 = 8;
 
-/// PROVISIONAL (measure before commit): the most bytes a range filter's entry runs past where its key parts from the key
-/// before it (`fst::surf`; research/67).
+/// PROVISIONAL (measure before commit): the most bytes a range filter's entry runs past the bytes every key of its
+/// branch shares (`fst::surf`; research/67).
 pub const RANGE_FILTER_DEPTH: usize = 16;
+
+/// PROVISIONAL (measure before commit): the most bytes a leaf index's separator runs past the bytes every key of its
+/// branch shares; leaves whose separators run further are found through the branch's index pages
+/// (`branch::Branch::leaf_in`; research/67).
+pub const LEAF_INDEX_DEPTH: usize = 256;
 
 /// A new store's first segment, when its file grows by segments: the superblocks' extent and the
 /// first checkpoint's map, whose one count takes one page of one extent.

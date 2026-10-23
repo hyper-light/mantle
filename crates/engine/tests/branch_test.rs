@@ -441,8 +441,8 @@ fn a_compaction_of_a_range_writes_no_more_pages_than_its_input_holds_there() {
                 )
             })
             .collect();
-        let first = branch.leaf_of(&from).unwrap();
-        let last = branch.leaf_of(&end).unwrap();
+        let first = branch.leaf_in(&from).unwrap().unwrap();
+        let last = branch.leaf_in(&end).unwrap().unwrap();
         assert!(
             written <= bound,
             "[{a}, {b}): wrote {written} of a bound {bound}: parts (leaves, trailer, height, index) {shape:?}; input pages {first}..={last}, height {}, trailer {}, total {}",
@@ -507,7 +507,7 @@ fn binary_entries_cross_index_levels_and_reopen_with_their_exact_values() {
 
     // The required medium read remains a typed failure after healthy reads reuse buffers.
     let target = key(1024);
-    let page = u64::from(branch.leaf_of(&target).unwrap());
+    let page = u64::from(branch.leaf_in(&target).unwrap().unwrap());
     let address = branch.page_address(&s, page).unwrap();
     let (file, finished) = finished_file(s.into_file());
     finished.unwrap();

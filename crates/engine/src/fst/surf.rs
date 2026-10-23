@@ -214,6 +214,20 @@ impl Surf {
     }
 }
 
+/// The most bytes a range filter holds ([`Surf::held_bytes`]) over at most `keys` keys of at most
+/// `key` bytes, keeping `suffix` bits a key, at most `labels` labels in at most `rises + 1` nodes.
+/// What a key shares with the key after it, past the bytes every key shares and at most the
+/// depth, starts and ends at none; a key's entry runs one byte past the larger of its two, or ends
+/// at the reach or with the key, so past what it shares with the key before it holds at most one
+/// label and the rise to what it shares with the key after: `keys` and the rises at most, a key
+/// whole entries hold among them, holding none. Of a key's labels, those a later key's go on from
+/// lead to a node: at most its rise, so the nodes are at most the rises and the root
+/// (research/68 §2).
+pub fn most_bytes(keys: u64, labels: u64, rises: u64, key: usize, suffix: u32) -> Option<u64> {
+    let key = u64::try_from(key).ok()?;
+    super::trie::most_bytes(labels, rises.checked_add(1)?, keys, suffix, key)
+}
+
 /// Builds a [`Surf`] from keys in strictly ascending order, one held at a time: a key's cut
 /// needs the next key, so each is added to the trie when the next arrives. Reset, it keeps its
 /// buffers, so one used again for a run no larger allocates nothing as keys are added.

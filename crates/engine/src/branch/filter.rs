@@ -53,18 +53,75 @@ fn blocks_for(keys: u64) -> usize {
         .max(1)
 }
 
-/// Blocks for `keys`: an upper bound gets an even count, so the filter can halve to fit
+/// Blocks for `keys`: an upper bound gets the least count at or above it whose divisors are dense
+/// ([`dense_at_least`]), so the filter folds to within twice what the keys it gets need
 /// ([`Filter::fit`]).
 fn blocks_of(keys: Keys) -> usize {
     match keys {
         Keys::Exactly(n) => blocks_for(n),
-        Keys::AtMost(n) => blocks_for(n).saturating_add(blocks_for(n) % 2),
+        Keys::AtMost(n) => dense_at_least(blocks_for(n)),
     }
+}
+
+/// Whether each of `n`'s divisors, in order, is at most twice the one before. Its divisors past
+/// `√n` are the cofactors of those below, their ratios the same in reverse, so the divisors up to
+/// `√n` and the step from the largest of them to its cofactor decide it; a gap past twice the last
+/// divisor found ends the scan.
+fn dense(n: usize) -> bool {
+    let mut last = 1usize;
+    let mut d = 2usize;
+    while d.checked_mul(d).is_some_and(|square| square <= n) {
+        // Nothing divided `n` from past the last divisor through twice it.
+        if last.checked_mul(2).is_none_or(|twice| d > twice) {
+            return false;
+        }
+        if n.checked_rem(d) == Some(0) {
+            last = d;
+        }
+        let Some(next) = d.checked_add(1) else {
+            return false;
+        };
+        d = next;
+    }
+    n.checked_div(last)
+        .zip(last.checked_mul(2))
+        .is_some_and(|(cofactor, twice)| cofactor <= twice)
+}
+
+/// The least count at or above `need` whose divisors are each at most twice the one before
+/// ([`dense`]): a filter of so many blocks folds to any of its divisors ([`Filter::fit`]), so to
+/// less than twice any smaller count. The search ends by `2^a ⌈need / 2^a⌉`, the least `a` with
+/// `⌈need / 2^a⌉ <= 2^(a + 1)`: its powers of two and the quotient's doublings each at most double
+/// the one before, so it is such a count; the search measured 0.1% above `need` on average and at
+/// most 36 counts tried below 20,000 blocks (research/68 §1).
+fn dense_at_least(need: usize) -> usize {
+    let mut bound = need;
+    for a in 0..usize::BITS {
+        let Some(step) = 1usize.checked_shl(a) else {
+            break;
+        };
+        let quotient = need.div_ceil(step);
+        if step.checked_mul(2).is_some_and(|most| quotient <= most) {
+            bound = quotient.checked_mul(step).unwrap_or(need);
+            break;
+        }
+    }
+    (need..=bound).find(|&n| dense(n)).unwrap_or(bound)
 }
 
 /// The bytes a filter made for `keys` holds: its blocks, reserved exactly ([`Filter::try_new`]).
 pub fn most_bytes(keys: Keys) -> Option<usize> {
     blocks_of(keys).checked_mul(BLOCK_WORDS.checked_mul(8)?)
+}
+
+/// The most bytes a branch's filter of `keys` keys holds once fitted to them ([`Filter::fit`]):
+/// twice the blocks they need, a filter made for exactly them holding just those and one made for
+/// a bound folding to fewer than twice. Twice a count is at most the sum of twice its parts', so a
+/// share of the keys states a share of the bytes.
+pub fn fitted_most_bytes(keys: u64) -> Option<usize> {
+    blocks_for(keys)
+        .checked_mul(2)?
+        .checked_mul(BLOCK_WORDS.checked_mul(8)?)
 }
 
 /// The block for a hash: its high 32 bits scaled into the block count (Lemire, "Fast random
@@ -118,8 +175,8 @@ impl Filter {
     }
 
     /// An empty filter for `keys`: sized for them when known exactly; when only bounded, for
-    /// the bound, an even count of blocks, which [`Self::fit`] halves once the count is known if
-    /// half still holds it.
+    /// the bound, at a count of blocks [`Self::fit`] folds to within twice what the keys it gets
+    /// need once their count is known.
     pub fn new(keys: Keys) -> Self {
         Self {
             blocks: vec![[0u64; BLOCK_WORDS]; blocks_of(keys)],
@@ -161,28 +218,59 @@ impl Filter {
         }
     }
 
-    /// Halves the filter while half its blocks still give `keys` keys [`BITS_PER_KEY`] bits
-    /// each: block pairs `2i, 2i + 1` OR into block `i`, in place. A key's block at `n / 2`
-    /// blocks is its block at `n` halved (`⌊⌊h·n / 2^32⌋ / 2⌋ = ⌊h·(n/2) / 2^32⌋`, for any `n`)
-    /// and its probes within a block do not depend on `n`, so every key added is still found.
+    /// Folds the filter to the fewest of its blocks' divisors that still give `keys` keys
+    /// [`BITS_PER_KEY`] bits each: blocks `r i .. r i + r` OR into block `i`, in place, `r` the
+    /// fold. A key's block at `n / r` blocks is its block at `n` divided by `r`
+    /// (`⌊⌊x·n / 2^32⌋ / r⌋ = ⌊x·(n/r) / 2^32⌋`, for any `n` and any `r` dividing it) and its
+    /// probes within a block do not depend on `n`, so the folded filter is the one its keys would
+    /// have made at that size. A bounded filter's divisors are each at most twice the one before
+    /// ([`dense_at_least`]), so it folds to fewer than twice the blocks its keys need.
     pub fn fit(&mut self, keys: u64) {
         let need = blocks_for(keys);
-        while self.blocks.len().is_multiple_of(2) && self.blocks.len() / 2 >= need {
-            let half = self.blocks.len() / 2;
-            for i in 0..half {
-                let pair = (
-                    self.blocks.get(i.saturating_mul(2)).copied(),
-                    self.blocks
-                        .get(i.saturating_mul(2).saturating_add(1))
-                        .copied(),
-                );
-                if let ((Some(lo), Some(hi)), Some(dst)) = (pair, self.blocks.get_mut(i)) {
-                    for ((d, l), h) in dst.iter_mut().zip(lo).zip(hi) {
-                        *d = l | h;
+        let len = self.blocks.len();
+        // No divisor but `len` itself reaches past `len / 2`: a filter made for exactly its keys
+        // folds no further.
+        if need.checked_mul(2).is_none_or(|twice| twice > len) {
+            self.blocks.shrink_to_fit();
+            return;
+        }
+        // The least divisor at or above `need`, from the divisors up to `√len` and their
+        // cofactors.
+        let mut least = len;
+        let mut d = 1usize;
+        while d.checked_mul(d).is_some_and(|square| square <= len) {
+            if len.checked_rem(d) == Some(0) {
+                for divisor in [d, len.checked_div(d).unwrap_or(len)] {
+                    if divisor >= need && divisor < least {
+                        least = divisor;
                     }
                 }
             }
-            self.blocks.truncate(half);
+            let Some(next) = d.checked_add(1) else {
+                break;
+            };
+            d = next;
+        }
+        let fold = len.checked_div(least).unwrap_or(1);
+        if fold > 1 {
+            for i in 0..least {
+                let from = i.saturating_mul(fold);
+                let mut block = [0u64; BLOCK_WORDS];
+                for source in self
+                    .blocks
+                    .get(from..from.saturating_add(fold))
+                    .unwrap_or(&[])
+                {
+                    for (w, s) in block.iter_mut().zip(source) {
+                        *w |= s;
+                    }
+                }
+                // Block `i` is read before it is written: `i <= from`.
+                if let Some(dst) = self.blocks.get_mut(i) {
+                    *dst = block;
+                }
+            }
+            self.blocks.truncate(least);
         }
         self.blocks.shrink_to_fit();
     }
@@ -304,12 +392,39 @@ mod tests {
         );
     }
 
+    /// A filter of `blocks` blocks with `hashes` added, made at that size directly.
+    fn made_at(blocks: usize, hashes: &[u64]) -> Filter {
+        let mut f = Filter {
+            blocks: vec![[0u64; BLOCK_WORDS]; blocks],
+        };
+        for &h in hashes {
+            f.insert(h);
+        }
+        f
+    }
+
     #[test]
-    fn a_bounded_filter_fitted_to_its_keys_finds_every_one_at_no_fewer_bits() {
-        // Bounded at 400,000 keys: 7,813 blocks, made even, 7,814. The 30,000 keys added need
-        // 586: it halves to 3,907, odd, and stops there.
+    fn a_bounded_count_is_the_least_dense_one_at_or_above_the_bound() {
+        // Against every divisor listed: each at most twice the one before, and no count between
+        // the bound and the one chosen so.
+        let listed = |n: usize| (1..=n).filter(|d| n.is_multiple_of(*d)).collect::<Vec<_>>();
+        let dense_listed = |n: usize| listed(n).windows(2).all(|w| w[1] <= 2 * w[0]);
+        for need in 1..2_000usize {
+            let chosen = dense_at_least(need);
+            assert!(chosen >= need && dense_listed(chosen), "{need} -> {chosen}");
+            assert!(
+                (need..chosen).all(|n| !dense_listed(n)),
+                "{need} -> {chosen}"
+            );
+            assert_eq!(dense(need), dense_listed(need), "{need}");
+        }
+    }
+
+    #[test]
+    fn a_bounded_filter_fitted_to_its_keys_is_the_one_they_make_at_under_twice_their_blocks() {
+        // Bounded at 400,000 keys: 7,813 blocks, at least; 30,000 keys added need 586.
         let mut f = Filter::new(Keys::AtMost(400_000));
-        assert_eq!(f.bytes(), 7_814 * 64);
+        assert_eq!(f.bytes(), dense_at_least(7_813) * 64);
         let hashes: Vec<u64> = (0..30_000u32)
             .map(|i| hash(format!("key-{i}").as_bytes()))
             .collect();
@@ -317,26 +432,32 @@ mod tests {
             f.insert(h);
         }
         f.fit(30_000);
-        assert_eq!(f.bytes(), 3_907 * 64);
+        let blocks = f.bytes() / 64;
+        assert!((586..2 * 586).contains(&blocks), "{blocks} blocks");
+        assert_eq!(f, made_at(blocks, &hashes));
         assert!(hashes.iter().all(|&h| f.may_contain(h)));
-        let false_positives = (0..100_000u32)
-            .filter(|i| f.may_contain(hash(format!("other-{i}").as_bytes())))
-            .count();
-        // 66 bits a key here, against 10 in the first test's bound of 2,000.
-        println!("false positives {false_positives} of 100000");
-        assert!(false_positives < 2_000, "{false_positives}");
-        // Fitted to more keys than half holds, it stays.
-        let mut g = Filter::new(Keys::AtMost(1_000));
+        // Every count of keys a bound of 4,000 can get: the fitted filter is the one those keys
+        // make at its size, under twice the blocks they need and within what is stated.
+        let hashes: Vec<u64> = (0..4_000u32).map(|i| hash(&i.to_le_bytes())).collect();
+        for keys in (1..=4_000usize).step_by(7) {
+            let mut f = Filter::new(Keys::AtMost(4_000));
+            for &h in &hashes[..keys] {
+                f.insert(h);
+            }
+            f.fit(keys as u64);
+            let need = blocks_for(keys as u64);
+            let blocks = f.bytes() / 64;
+            assert!(
+                need <= blocks && blocks < 2 * need,
+                "{keys} keys: {blocks} blocks"
+            );
+            assert!(f.bytes() <= fitted_most_bytes(keys as u64).unwrap());
+            assert_eq!(f, made_at(blocks, &hashes[..keys]), "{keys} keys");
+        }
+        // A filter made for exactly its keys stays as it is.
+        let mut g = Filter::new(Keys::Exactly(1_000));
         g.fit(1_000);
         assert_eq!(g.bytes(), 20 * 64);
-        // A filter bounded at twice its keys halves once, to exactly what they need.
-        let mut h = Filter::new(Keys::AtMost(2_048));
-        for i in 0..1_024u32 {
-            h.insert(hash(&i.to_le_bytes()));
-        }
-        h.fit(1_024);
-        assert_eq!(h.bytes(), 20 * 64);
-        assert!((0..1_024u32).all(|i| h.may_contain(hash(&i.to_le_bytes()))));
     }
 
     #[test]

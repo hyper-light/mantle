@@ -76,6 +76,8 @@ const OFFSET: usize = 2;
 const KEY_HEAD: usize = 4;
 /// The table bytes an entry takes: its offset and its head.
 const SLOT: usize = OFFSET + KEY_HEAD;
+/// The least bytes a leaf entry takes: its slot and its fixed bytes, its suffix and value empty.
+const LEAST_ENTRY: usize = SLOT + LEAF_FIXED;
 
 /// A suffix's head: its first 4 bytes, big-endian, zero-padded. Heads that differ order their
 /// suffixes as the suffixes order; equal heads say nothing, and the suffixes are compared.
@@ -298,6 +300,118 @@ pub fn tries_bytes(key: usize, entries: u64, leaves: u64, range_bits: u32) -> Op
         leaves,
         u32::BITS,
     )?)
+}
+
+/// The most entries a leaf of `capacity` payload bytes holds: past its head, each takes at least
+/// [`LEAST_ENTRY`] bytes.
+pub fn most_entries(capacity: usize) -> Option<u64> {
+    u64::try_from(capacity.checked_sub(HEAD)?.checked_div(LEAST_ENTRY)?).ok()
+}
+
+/// A range filter's depth for keys of at most `key` bytes: no entry runs past the key.
+fn range_depth(key: usize) -> Option<u64> {
+    u64::try_from(crate::store::RANGE_FILTER_DEPTH.min(key)).ok()
+}
+
+/// The most a branch's range filter rises ([`crate::fst::surf::most_bytes`]): over `entries`
+/// keys of at most `key` bytes in `leaves` leaves of `capacity` payload bytes. Each key steps from
+/// what it shares with the key before to what it shares with the key after, at most the depth;
+/// with both in its leaf, both are at least the leaf's prefix and at most the key, so the step is
+/// at most the key's suffix there, which the leaf stores past the key's [`LEAST_ENTRY`] bytes. The
+/// steps start and end at none, so they rise half their sum: at most half the steps' depth a key,
+/// and at most half the suffixes the leaves hold and the depth for each leaf's first and last key
+/// (research/68 §2).
+fn range_rises(key: usize, entries: u64, leaves: u64, capacity: usize) -> Option<u64> {
+    let depth = range_depth(key)?;
+    let payload = leaves.checked_mul(u64::try_from(capacity.checked_sub(HEAD)?).ok()?)?;
+    let suffixes = payload.checked_sub(entries.checked_mul(u64::try_from(LEAST_ENTRY).ok()?)?)?;
+    let by_steps = entries.checked_mul(depth)? / 2;
+    let by_suffixes = (suffixes / 2).checked_add(leaves.checked_mul(depth)?)?;
+    Some(by_steps.min(by_suffixes))
+}
+
+/// The most bytes a built branch holds in memory while it lives ([`crate::trunk::Memory`]): of
+/// `entries` keys of at most `key` bytes in `leaves` leaves of `capacity` payload bytes, `pages`
+/// tree pages and `extents` extents, its range filter keeping `range_bits` bits a key. Its point
+/// filter fitted to its keys ([`filter::fitted_most_bytes`]), its range filter of a label a key and
+/// its rises ([`range_rises`], [`crate::fst::surf::most_bytes`]), its leaf index of a separator a
+/// leaf, each at most its depth and a byte past what every key shares, its values of 32 bits
+/// ([`crate::fst::trie::most_bytes`]), its tree pages' entry counts and its extents' numbers taken
+/// at their size, and its record ([`held_most`]). Pinned by `tests/resident_memory.rs` at the
+/// densest keys, the longest, the shapes that most fill each trie and a filter made for more keys
+/// than its branch got.
+pub fn resident_bytes(
+    capacity: usize,
+    key: usize,
+    entries: u64,
+    leaves: u64,
+    pages: u64,
+    extents: u64,
+    range_bits: u32,
+) -> Option<u64> {
+    let rises = range_rises(key, entries, leaves, capacity)?;
+    let range =
+        crate::fst::surf::most_bytes(entries, entries.checked_add(rises)?, rises, key, range_bits)?;
+    held_most(key, entries, range, leaves, pages, extents)
+}
+
+/// The most bytes of resident metadata a branch holds for each extent of `extent_pages` pages of
+/// `capacity` payload bytes it holds, at keys of at most `key` bytes and a range filter keeping
+/// `range_bits` bits a key: each part at its most for any count of entries the extent's pages hold
+/// as leaves ([`most_entries`]). The range filter's rises grow with the entries by half the depth
+/// each and fall by half their [`LEAST_ENTRY`] bytes each from half the pages' payload and the
+/// depth a page ([`range_rises`]): they, and the labels, a key and its rises, are most where the
+/// two meet. Each part of a branch's bound ([`resident_bytes`]) grows at most in proportion to its
+/// entries, leaves, pages and extents, its constants once a branch, so a branch of `n` extents
+/// holds at most `n` times this (research/68 §2).
+pub fn resident_per_extent(
+    capacity: usize,
+    extent_pages: u32,
+    key: usize,
+    range_bits: u32,
+) -> Option<u64> {
+    let pages = u64::from(extent_pages);
+    let entries = most_entries(capacity)?.checked_mul(pages)?;
+    let depth = range_depth(key)?;
+    let payload = pages.checked_mul(u64::try_from(capacity.checked_sub(HEAD)?).ok()?)?;
+    // `n d / 2` meets `(payload - 11 n) / 2 + pages d` at `n = (payload + 2 pages d) / (d + 11)`.
+    let reach = payload.checked_add(pages.checked_mul(depth)?.checked_mul(2)?)?;
+    let over = depth
+        .checked_add(u64::try_from(LEAST_ENTRY).ok()?)?
+        .checked_mul(2)?;
+    let rises = reach.checked_mul(depth)?.checked_div(over)?;
+    let labels = reach
+        .checked_mul(depth.checked_add(2)?)?
+        .checked_div(over)?;
+    let range = crate::fst::surf::most_bytes(entries, labels, rises, key, range_bits)?;
+    held_most(key, entries, range, pages, pages, 1)
+}
+
+/// A branch's resident metadata at most ([`resident_bytes`]), its range filter at most `range`
+/// bytes.
+fn held_most(
+    key: usize,
+    entries: u64,
+    range: u64,
+    leaves: u64,
+    pages: u64,
+    extents: u64,
+) -> Option<u64> {
+    let point = u64::try_from(filter::fitted_most_bytes(entries)?).ok()?;
+    let k = u64::try_from(key).ok()?;
+    let reach = u64::try_from(crate::store::LEAF_INDEX_DEPTH)
+        .ok()?
+        .min(k)
+        .checked_add(1)?
+        .min(k);
+    let separators = leaves.checked_mul(reach)?;
+    let index = crate::fst::trie::most_bytes(separators, separators, leaves, u32::BITS, k)?;
+    point
+        .checked_add(range)?
+        .checked_add(index)?
+        .checked_add(pages.checked_mul(2)?)?
+        .checked_add(extents.checked_mul(8)?)?
+        .checked_add(u64::try_from(size_of::<Branch>()).ok()?)
 }
 
 impl Page {

@@ -805,6 +805,19 @@ pub fn pooled_bytes(
         .checked_add(bytes(builders)?.checked_mul(builder)?)
 }
 
+/// The most bytes of resident metadata a branch holds for each extent of `config`'s it holds, at
+/// keys of at most `key` bytes and a range filter keeping `range_bits` bits a key
+/// ([`crate::branch::resident_per_extent`]). An extent is one branch's, so an engine's branches
+/// hold at most their extents times it.
+pub fn resident_per_extent(config: &Config, key: usize, range_bits: u32) -> Option<u64> {
+    crate::branch::resident_per_extent(
+        crate::store::page::capacity(config.page_size),
+        config.extent_pages,
+        key,
+        range_bits,
+    )
+}
+
 impl<F: BlockFile> ShardDb<F> {
     fn with(store: Store<F>, mem_limit: usize, trunk: Trunk) -> Result<Self, Error> {
         let write_reserved = store.write_reservation_for(None)?;

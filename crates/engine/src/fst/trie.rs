@@ -402,6 +402,65 @@ pub fn builder_bytes(longest: usize, labels: u64, values: u64, width: u32) -> Op
         .checked_add(longest.checked_mul(2)?)
 }
 
+/// The most bytes a finished trie holds ([`Trie::held_bytes`]) of at most `labels` labels in at
+/// most `nodes` nodes and `values` values of `width` bits, the levels its keys share at most
+/// `prefix` bytes. Its sparse levels take each buffer once at its size: a label's byte and its
+/// child and node bits, a node's own-key bit, a rank entry each eight words of each vector, its
+/// node starts (an entry each block of 256 nodes and one past them, and 257 extras a block at
+/// most) and its values packed. Its dense levels hold at most a 64th of the bits the sparse levels
+/// below them would ([`TrieBuilder::cutoff`]), their three vectors and their values grown by
+/// doubling from std's least capacity of four words, with a rank entry each word; its prefix is
+/// collected as it grows, from eight bytes. Pinned by `tests/resident_memory.rs` at the shapes
+/// that fill each part most.
+pub fn most_bytes(labels: u64, nodes: u64, values: u64, width: u32, prefix: u64) -> Option<u64> {
+    let words = |bits: u64| bits.div_ceil(64);
+    let block = u64::try_from(SPARSE_BLOCK / 64).ok()?;
+    // A sparse vector of `bits` bits: its words, and a rank entry each block of them.
+    let vector = |bits: u64| -> Option<u64> {
+        let w = words(bits);
+        w.checked_mul(8)?
+            .checked_add(w.div_ceil(block).checked_mul(4)?)
+    };
+    let sparse = labels
+        .checked_add(vector(labels)?)?
+        .checked_add(vector(labels)?)?
+        .checked_add(vector(nodes)?)?;
+    let blocks = nodes
+        .div_ceil(u64::try_from(STARTS_BLOCK).ok()?)
+        .checked_add(1)?;
+    let starts = blocks.checked_mul(8)?.checked_add(
+        blocks
+            .checked_mul(u64::try_from(STARTS_ENTRIES).ok()?)?
+            .checked_mul(2)?,
+    )?;
+    // The values: the sparse levels' taken at their size, the dense levels' grown by doubling,
+    // each part's last word partly used.
+    let packed = words(values.checked_mul(u64::from(width))?);
+    let held_values = packed
+        .checked_add(1)?
+        .checked_mul(2)?
+        .checked_add(4)?
+        .checked_mul(8)?;
+    // The dense levels' three vectors: their bits at most a 64th of the sparse bits, each
+    // vector's last word partly used, each grown to at most twice its words or four.
+    let dense = words(
+        labels
+            .checked_mul(u64::try_from(SPARSE_LABEL_BITS).ok()?)?
+            .div_ceil(u64::try_from(DENSE_RATIO).ok()?),
+    )
+    .checked_add(3)?;
+    let dense = dense
+        .checked_mul(2)?
+        .checked_add(12)?
+        .checked_mul(8)?
+        .checked_add(dense.checked_mul(4)?)?;
+    sparse
+        .checked_add(starts)?
+        .checked_add(held_values)?
+        .checked_add(dense)?
+        .checked_add(prefix.checked_mul(2)?.checked_add(8)?)
+}
+
 /// Builds a trie of keys given in strictly ascending order, each with a value of at most a
 /// width of bits, one pass and no key held but the last. Its levels keep their buffers when it
 /// is reset, so a builder used again for a trie no larger allocates nothing as keys are added.

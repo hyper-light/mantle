@@ -27,7 +27,10 @@ const CONFIG: Config = Config {
 fn a_file_that_cannot_tell_what_the_os_holds_counts_no_read_wait() {
     let align = Alignment::new(4096).unwrap();
     let file = SimFile::new(align, Alignment::new(512).unwrap(), 5).unwrap();
-    assert!(!file.reads_resident(), "the simulated device tells residency");
+    assert!(
+        !file.reads_resident(),
+        "the simulated device tells residency"
+    );
     let mut store = Store::create(file, CONFIG).unwrap();
     let mut run = store.run().unwrap();
     let mut addresses = Vec::new();

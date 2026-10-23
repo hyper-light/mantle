@@ -254,8 +254,12 @@ pub fn issuer_batches(shard_batches: usize, depth: usize) -> usize {
 /// docs/research/65).
 #[derive(Debug)]
 struct Follow {
-    /// The shard's share of what the machine has for its ranges: the most its budget is.
+    /// The shard's share of what the machine has for its ranges: the most its budget and its
+    /// own holdings outside it are together.
     bound: usize,
+    /// The most its budget was at the last look: the bound less those holdings, its memtables
+    /// and its branches' metadata as held.
+    cap: usize,
     /// The shares the machine's room is divided into.
     shares: usize,
     /// The process's memory outside the shard's account at the last look ([`ShardDb::look_machine`]),
@@ -1356,6 +1360,7 @@ impl<F: BlockFile> ShardDb<F> {
         self.set_memory(bound)?;
         self.follow = Some(Follow {
             bound,
+            cap: bound,
             shares: shares.max(1),
             last: None,
             accepted: 0,
@@ -1372,6 +1377,13 @@ impl<F: BlockFile> ShardDb<F> {
         self.memory
     }
 
+    /// The most a budget that follows the machine was at its last look: its share of the
+    /// machine less its own holdings beside the budget, its memtables and its branches'
+    /// metadata as held; none for a budget given.
+    pub fn budget_cap(&self) -> Option<usize> {
+        self.follow.as_ref().map(|f| f.cap)
+    }
+
     /// The share of the budget the shard leaves to the kernel's page cache for its workers'
     /// reads and its store's writes, tuned with its regions while the budget follows the machine
     /// (docs/research/65 §8); none otherwise.
@@ -1381,10 +1393,11 @@ impl<F: BlockFile> ShardDb<F> {
 
     /// Divides the machine's room again (docs/research/65): the budget becomes what its regions and
     /// kept memtables hold now and this shard's share of the room, less what it leaves free, never
-    /// above its bound nor below what it cannot give back ([`Self::floor_held`]). It leaves free
-    /// the most the process's memory outside the shard's account has grown between two looks
-    /// ([`Follow::grew_most`]): what may grow before the next look with no gate to ask. The gates keep their own steps' room as they admit them (twice a cache chunk, a
-    /// memtable), so the budget does not keep it again: kept twice, the cache's next chunk swung
+    /// above its bound less its own holdings beside it ([`Follow::cap`]) nor below what it cannot
+    /// give back ([`Self::floor_held`]). It leaves free the most the process's memory outside the
+    /// shard's account has grown between two looks ([`Follow::grew_most`]): what may grow before
+    /// the next look with no gate to ask. The gates keep their own steps' room as they admit them
+    /// (twice a cache chunk, a memtable), so the budget does not keep it again: kept twice, the cache's next chunk swung
     /// the budget by itself from look to look (docs/research/65). Other processes' memory lowers
     /// the free memory a look reads, not what the budget leaves. A budget that falls has the kept
     /// memtables give memory back and the caches trimmed to their shares at once, not a few pages
@@ -1398,8 +1411,11 @@ impl<F: BlockFile> ShardDb<F> {
         };
         let free = usize::try_from(free).unwrap_or(usize::MAX);
         let held = self.regions_held().saturating_add(self.kept_held());
+        let memtables = self.memtable_bytes();
         // The process's memory the shard does not account; none without a reading.
-        let accounted = held.saturating_add(self.memtable_bytes());
+        let accounted = held.saturating_add(memtables);
+        // The shard's own holdings beside its budget, which its share of the machine holds too.
+        let own = memtables.saturating_add(self.trunk.memory().total());
         let outside = hyper_rt::machine::facts::Facts::resident_now().map_or(0, |resident| {
             usize::try_from(resident)
                 .unwrap_or(usize::MAX)
@@ -1416,10 +1432,11 @@ impl<F: BlockFile> ShardDb<F> {
         }
         follow.last = Some((outside, now));
         follow.accepted = accepted;
+        follow.cap = follow.bound.saturating_sub(own);
         let budget = held
             .saturating_add(free.checked_div(follow.shares).unwrap_or(0))
             .saturating_sub(follow.grew_most)
-            .min(follow.bound)
+            .min(follow.cap)
             .max(floor);
         let Some(was) = self.memory.filter(|&m| m != budget) else {
             return;

@@ -58,6 +58,18 @@ pub struct Memory {
     pub branches: usize,
 }
 
+impl Memory {
+    /// Every part of it.
+    pub fn total(&self) -> usize {
+        self.filters
+            .saturating_add(self.indexes)
+            .saturating_add(self.counts)
+            .saturating_add(self.ranges)
+            .saturating_add(self.pivots)
+            .saturating_add(self.branches)
+    }
+}
+
 /// The trunk's shape: from measurement, given at creation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrunkConfig {

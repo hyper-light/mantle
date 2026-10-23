@@ -134,7 +134,11 @@ fn a_budget_that_follows_the_machine_gives_memory_back_when_the_machine_runs_sho
     let mut oracle = Oracle::new();
     let mut x = 0x5851_f42d_4c95_7f2du64;
     x = run(&mut db, &mut oracle, x, 40);
-    assert_eq!(db.budget(), Some(BOUND), "a machine with memory to spare");
+    // A machine with memory to spare: the budget is its bound less the shard's own holdings
+    // beside it, its memtables and its branches' metadata.
+    let cap = db.budget_cap().unwrap();
+    assert!(cap < BOUND, "a cap of {cap}: the bound less nothing");
+    assert_eq!(db.budget(), Some(cap), "a machine with memory to spare");
     let kept = db.stats().0.kept;
     assert!(kept > 0, "no memtable was kept");
     assert!(held(&db) < BOUND, "the test's memtables fill the bound");
@@ -172,10 +176,10 @@ fn a_budget_that_follows_the_machine_gives_memory_back_when_the_machine_runs_sho
         db.stats().0.kept
     );
 
-    // The machine frees memory: the budget returns to its bound.
+    // The machine frees memory: the budget returns to its cap.
     FREE.store(1 << 40, Ordering::Relaxed);
     x = run(&mut db, &mut oracle, x, 1);
-    assert_eq!(db.budget(), Some(BOUND), "the machine has memory again");
+    assert_eq!(db.budget(), db.budget_cap(), "the machine has memory again");
 
     // The machine runs short with no write to rotate: idle maintenance looks at it as the
     // workers' results come back, and the budget falls with no rotation.
@@ -188,7 +192,7 @@ fn a_budget_that_follows_the_machine_gives_memory_back_when_the_machine_runs_sho
     }
     assert_eq!(db.stats().0.rotations, rotations, "a rotation in idle time");
     assert!(
-        db.budget().unwrap() < BOUND,
+        db.budget() < db.budget_cap(),
         "idle maintenance never looked at the machine"
     );
     let (cache, write, records) = db.memory_held();

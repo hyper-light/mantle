@@ -116,8 +116,8 @@ pub fn most_bytes(keys: Keys) -> Option<usize> {
 
 /// The most bytes a branch's filter of `keys` keys holds once fitted to them ([`Filter::fit`]):
 /// twice the blocks they need, a filter made for exactly them holding just those and one made for
-/// a bound folding to fewer than twice. Twice a count is at most the sum of twice its parts', so a
-/// share of the keys states a share of the bytes.
+/// a bound folding to fewer than twice. The blocks a count of keys needs are at most the sum of
+/// what its parts need, so twice them, stated for each part, covers the whole.
 pub fn fitted_most_bytes(keys: u64) -> Option<usize> {
     blocks_for(keys)
         .checked_mul(2)?

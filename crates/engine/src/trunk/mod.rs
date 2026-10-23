@@ -1446,6 +1446,12 @@ impl Trunk {
         self.pool.as_mut()
     }
 
+    /// Messages taken from the workers since the pool began, wrapping ([`Pool::accepted`]); none
+    /// without workers.
+    pub(crate) fn pool_accepted(&self) -> u64 {
+        self.pool.as_ref().map_or(0, Pool::accepted)
+    }
+
     /// Every admitted worker has acknowledged its device setup.
     pub(crate) fn workers_prepared(&self) -> bool {
         self.pool.as_ref().is_some_and(Pool::prepared)

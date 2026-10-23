@@ -270,6 +270,9 @@ struct Follow {
     /// the next is due ([`ShardDb::look_when_due`]).
     scans: u64,
     merged: u64,
+    /// The workers' messages taken as of the last look (`Trunk::pool_accepted`): an idle shard
+    /// looks again once one has come back ([`ShardDb::look_when_idle`]).
+    accepted: u64,
     /// The most the process's memory outside the shard's account grew between two looks: its
     /// resident memory less the budget's regions, the kept memtables and the memtables in
     /// flight (the branches' metadata, workers' builders and spans, the allocator's free lists,
@@ -477,6 +480,11 @@ pub struct ShardDb<F: BlockFile> {
     /// Trunk sources scans passed over by their range filters, and sources they opened.
     scan_skipped: u64,
     scan_opened: u64,
+    /// Writes applied and gets made while a budget counts them, scans apart: an idle step looks
+    /// for operations since the last one by them ([`Self::look_when_idle`]), and the made count
+    /// as of the last idle step.
+    ops: u64,
+    idle_ops: u64,
     /// Scans made, the trunk's leaf segments they visited and the sources those listed.
     scans: u64,
     scan_segments: u64,
@@ -881,6 +889,8 @@ impl<F: BlockFile> ShardDb<F> {
             scan_merge: ScanMerge::new(),
             scan_skipped: 0,
             scan_opened: 0,
+            ops: 0,
+            idle_ops: 0,
             scans: 0,
             scan_segments: 0,
             scan_listed: 0,
@@ -1366,6 +1376,7 @@ impl<F: BlockFile> ShardDb<F> {
             last: None,
             scans: self.scans,
             merged: self.trunk.merged(),
+            accepted: self.trunk.pool_accepted(),
             grew_most: 0,
         });
         self.set_reuse_window();
@@ -1406,12 +1417,14 @@ impl<F: BlockFile> ShardDb<F> {
     /// an operation: the machine has no room for them. No reading leaves the budget as it is.
     fn look_machine(&mut self) {
         // The work the next look is due after counts from here, whatever this one reads.
-        let (scans, merged) = (self.scans, self.trunk.merged());
+        let (scans, merged, accepted) =
+            (self.scans, self.trunk.merged(), self.trunk.pool_accepted());
         let Some(follow) = self.follow.as_mut() else {
             return;
         };
         follow.scans = scans;
         follow.merged = merged;
+        follow.accepted = accepted;
         self.flush_stats.looks = self.flush_stats.looks.saturating_add(1);
         if self.memory.is_none() {
             return;
@@ -1485,6 +1498,27 @@ impl<F: BlockFile> ShardDb<F> {
             .1
             .saturating_add(cache_index)
             .saturating_add(records_index)
+    }
+
+    /// In an idle step, looks at the machine ([`Self::look_machine`]) whenever a worker's message
+    /// has come back since the last look, if no client operation came since the shard's last idle
+    /// step: a shard idle but for its maintenance (a flush after a fill, its consolidations growing
+    /// on every worker) follows the memory the workers' jobs move, and gives memory back when the
+    /// machine runs short with no work to pace a look by. While clients work, its looks are paced
+    /// by their work ([`Self::look_when_due`]), and an idle step between their operations reads
+    /// nothing for it.
+    fn look_when_idle(&mut self) {
+        let made = self.ops.wrapping_add(self.scans);
+        let idle = made == self.idle_ops;
+        self.idle_ops = made;
+        let Some(follow) = self.follow.as_ref() else {
+            return;
+        };
+        if idle && self.trunk.pool_accepted() != follow.accepted {
+            self.look_machine();
+        } else {
+            self.look_when_due();
+        }
     }
 
     /// Looks at the machine ([`Self::look_machine`]) once a cycle's worth of work has passed since
@@ -1728,6 +1762,7 @@ impl<F: BlockFile> ShardDb<F> {
         }
         let trimmed = self.trim();
         self.ops_since = self.ops_since.saturating_add(1);
+        self.ops = self.ops.wrapping_add(1);
         let retuned = self.ops_since >= self.cycle_ops;
         if retuned {
             self.ops_since = 0;
@@ -2474,6 +2509,7 @@ impl<F: BlockFile> ShardDb<F> {
         }
         if self.memory.is_some() {
             self.ops_since = self.ops_since.saturating_add(1);
+            self.ops = self.ops.wrapping_add(1);
         }
         self.calm = true;
         Ok(Some(found == Some(Op::Put)))
@@ -3341,6 +3377,7 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     fn pace(&mut self, bytes: usize, paced: bool) -> Result<(), Error> {
+        self.ops = self.ops.wrapping_add(1);
         if !paced {
             self.grow(false)?;
         }
@@ -4390,7 +4427,7 @@ impl<F: BlockFile> ShardDb<F> {
 
     fn idle_step_with(&mut self, keys: u64, paced: bool) -> Result<u64, Error> {
         let done = self.idle_step_inner(keys, paced)?;
-        self.look_when_due();
+        self.look_when_idle();
         // Idle work may have kept a compaction's pages or a page read: the kept memtables give
         // way before the step returns.
         if self.kept_crowded() {

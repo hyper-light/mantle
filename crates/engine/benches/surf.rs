@@ -1,5 +1,5 @@
 //! The range filter's cost and accuracy by suffix bits and by depth, the most bytes an entry runs
-//! past where its key parts from the key before (docs/design/engine-structure.md §5, E6;
+//! past the bytes every key shares (docs/design/engine-structure.md §5, E6;
 //! research/35 §2, research/67): a run of `KEYS` keys of four shapes, 16-byte keys of a random
 //! 64-bit number (the shard benchmark's), object names under a few thousand prefixes (an S3
 //! listing's), paths through two random 32-hex directories (each new directory a long chain no
@@ -199,7 +199,11 @@ fn main() {
             .into_iter()
             .flat_map(|s| depths.map(|d| (s, d)))
         {
-            let mut b = SurfBuilder::new(suffix, depth).unwrap();
+            let shared = match (set.first(), set.last()) {
+                (Some(a), Some(z)) => a.iter().zip(z).take_while(|(x, y)| x == y).count(),
+                _ => 0,
+            };
+            let mut b = SurfBuilder::new(suffix, depth, shared).unwrap();
             let t = Instant::now();
             let mut before: Option<&Vec<u8>> = None;
             for k in &set {

@@ -12,14 +12,13 @@
 //! the rest; each is checked against the range by its bits.
 //!
 //! SuRF's cut has no bound: keys in pairs sharing all but a last byte make a label of each byte
-//! (Zhang et al., TODS 2020 §7, its worst case). So an entry runs at most `depth` bytes past where
-//! its key parts from the key before it, and one cut there is whole: it stands for every key that
-//! starts with it, its value a bit above the suffix's, and the keys after it that start with it are
-//! its own and take no entry. A key so adds at most `depth` labels, and the trie at most one key's
-//! bytes and `depth` labels a key past it (research/67). Cutting a key shorter only widens its
-//! interval, so the filter still lets through every range holding a key; it lets through more that
-//! hold none (Proteus, Knorr et al. SIGMOD 2022 §4.1-§4.2). The first key keeps its cut: it has no
-//! key before it, and keys sharing a long first part would otherwise all fall in one entry.
+//! (Zhang et al., TODS 2020 §7, its worst case). So an entry runs at most `depth` bytes past the
+//! bytes every key of the run shares, which the builder is told, and one cut there is whole: it
+//! stands for every key that starts with it, its value a bit above the suffix's, and the keys after
+//! it that start with it are its own and take no entry. The trie so holds at most `depth` levels
+//! below the shared bytes and `depth` labels a key (research/67). Cutting keys at one depth keeps
+//! their order, so the filter still lets through every range holding a key; it lets through more
+//! that hold none (Proteus, Knorr et al. SIGMOD 2022 §4.1-§4.2).
 
 use std::cmp::Ordering;
 use std::ops::ControlFlow;
@@ -180,32 +179,33 @@ impl Surf {
 pub struct SurfBuilder {
     trie: TrieBuilder,
     suffix: u32,
-    /// The most bytes an entry runs past where its key parts from the key before it.
-    depth: usize,
+    /// The bytes every key shares, as the builder is told, and the most an entry runs: those and
+    /// the depth past them.
+    shared: usize,
+    reach: usize,
     /// The bytes the key held shares with the key before it.
     shared_before: usize,
-    /// Whether a key is held, waiting for the next to be cut; whether any key came; and whether
-    /// the key held is the first, which keeps its cut.
+    /// Whether a key is held, waiting for the next to be cut, and whether any key came.
     pending: bool,
     started: bool,
-    first: bool,
     /// The last entry's length when it is whole: the keys after it that start with it are its
     /// own.
     whole: Option<usize>,
 }
 
 impl SurfBuilder {
-    /// A builder keeping `suffix` bits a key, its entries running at most `depth` bytes past
-    /// where their keys part from the keys before them.
-    pub fn new(suffix: u32, depth: usize) -> Result<Self, Error> {
+    /// A builder keeping `suffix` bits a key, its entries running at most `depth` bytes past the
+    /// `shared` bytes every key will share.
+    pub fn new(suffix: u32, depth: usize, shared: usize) -> Result<Self, Error> {
         let mut b = Self::default();
-        b.reset(suffix, depth)?;
+        b.reset(suffix, depth, shared)?;
         Ok(b)
     }
 
     /// Empties the builder for another run, keeping `suffix` bits a key and entries of at most
-    /// `depth` bytes past their keys' parting (at least one), its buffers kept.
-    pub fn reset(&mut self, suffix: u32, depth: usize) -> Result<(), Error> {
+    /// `depth` bytes (one at least) past the `shared` bytes every key of the run will share, its
+    /// buffers kept.
+    pub fn reset(&mut self, suffix: u32, depth: usize, shared: usize) -> Result<(), Error> {
         if suffix >= MAX_WIDTH || depth == 0 {
             return Err(Error::InvalidArgument {
                 what: "a range filter's suffix past 31 bits or its depth none",
@@ -214,11 +214,11 @@ impl SurfBuilder {
         // Below 32, so the whole bit fits a value.
         self.trie.reset(Width::Bits(suffix.saturating_add(1)))?;
         self.suffix = suffix;
-        self.depth = depth;
+        self.shared = shared;
+        self.reach = shared.saturating_add(depth);
         self.shared_before = 0;
         self.pending = false;
         self.started = false;
-        self.first = false;
         self.whole = None;
         Ok(())
     }
@@ -228,19 +228,23 @@ impl SurfBuilder {
     /// greater, as the branch builder does as it adds an entry, so the filter keeps no copy of
     /// a key. A key goes into the trie once the next is known, cut one byte past what it shares
     /// with either neighbour: here `before`, and the last at [`Self::finish`]. A key starting
-    /// with the last entry when that entry is whole is the entry's own, and is not held.
+    /// with the last entry when that entry is whole is the entry's own, and is not held. Keys
+    /// sharing fewer bytes than every key was to are refused: the depth would not bound them.
     pub fn push(&mut self, before: Option<&[u8]>, shared: usize) -> Result<(), Error> {
         match before {
             None if !self.started => {
                 self.started = true;
-                self.first = true;
                 self.shared_before = 0;
                 self.pending = true;
             }
             Some(key) if self.started => {
+                if shared < self.shared {
+                    return Err(Error::InvalidArgument {
+                        what: "a range filter's key without the bytes every key was to share",
+                    });
+                }
                 if self.pending {
                     self.cut(key, shared)?;
-                    self.first = false;
                 }
                 if self.whole.is_some_and(|len| shared >= len) {
                     self.pending = false;
@@ -261,21 +265,23 @@ impl SurfBuilder {
     }
 
     /// Adds `key`, the held one, to the trie, cut one byte past what it shares with either
-    /// neighbour (`shared_after` with the next), or `depth` bytes past where it parts from the
-    /// key before when that is shorter, whole. Two neighbours cut so differ at the byte the whole
-    /// keys first differ at, `shared_before`, which is so what the trie is told they share: the
-    /// cut runs past it, `depth` being one byte at least.
+    /// neighbour (`shared_after` with the next), or at the reach when that is shorter, whole. Two
+    /// neighbours cut so differ at the byte the whole keys first differ at, `shared_before`, which
+    /// is so what the trie is told they share: a key starting with a whole entry is the entry's
+    /// own, so one that is not parts from it within it.
     fn cut(&mut self, key: &[u8], shared_after: usize) -> Result<(), Error> {
         let natural = self
             .shared_before
             .max(shared_after)
             .saturating_add(1)
             .min(key.len());
-        let len = if self.first {
-            natural
-        } else {
-            natural.min(self.shared_before.saturating_add(self.depth))
-        };
+        let len = natural.min(self.reach);
+        if !self.trie.is_empty() && len <= self.shared_before {
+            // The key shares the reach with the key before, which is this key cut there: that
+            // entry turns whole, and holds this key.
+            self.whole = Some(len);
+            return self.trie.set_last(whole_bit(self.suffix));
+        }
         let value = if len < natural {
             self.whole = Some(len);
             whole_bit(self.suffix)
@@ -333,8 +339,16 @@ mod tests {
         a.iter().zip(b).take_while(|(x, y)| x == y).count()
     }
 
+    /// The bytes every key of `set` shares: its first's with its last.
+    fn shared_of(set: &BTreeSet<Vec<u8>>) -> usize {
+        match (set.first(), set.last()) {
+            (Some(a), Some(b)) => lcp(a, b),
+            _ => 0,
+        }
+    }
+
     fn surf_at(set: &BTreeSet<Vec<u8>>, suffix: u32, depth: usize) -> Surf {
-        let mut b = SurfBuilder::new(suffix, depth).unwrap();
+        let mut b = SurfBuilder::new(suffix, depth, shared_of(set)).unwrap();
         let mut before: Option<&Vec<u8>> = None;
         for k in set {
             let shared = before.map_or(0, |p| lcp(p, k));
@@ -349,12 +363,12 @@ mod tests {
         surf_at(set, suffix, usize::MAX)
     }
 
-    /// The filter the rule gives `keys`, cut from the whole keys: each one byte past its longest
-    /// prefix shared with a neighbour, or `depth` bytes past where it parts from the key before
-    /// when that is shorter (the first excepted), whole then; a key after a whole entry that
+    /// The filter the rule gives `keys`, which share their first `shared` bytes, cut from the
+    /// whole keys: each one byte past its longest prefix shared with a neighbour, or `depth` bytes
+    /// past the shared ones when that is shorter, whole then; a key after a whole entry that
     /// starts with it takes none.
-    fn by_rule(keys: &[&Vec<u8>], suffix: u32, depth: usize) -> Surf {
-        let mut t = TrieBuilder::new(Width::Bits(suffix + 1)).unwrap();
+    fn by_rule(keys: &[&Vec<u8>], suffix: u32, depth: usize, shared: usize) -> Surf {
+        let mut entries: Vec<(&[u8], u32)> = Vec::new();
         let mut whole: Option<&[u8]> = None;
         for (i, k) in keys.iter().enumerate() {
             if whole.is_some_and(|p| k.starts_with(p)) {
@@ -364,17 +378,22 @@ mod tests {
             let before = i.checked_sub(1).map_or(0, |j| lcp(keys[j], k));
             let after = keys.get(i + 1).map_or(0, |n| lcp(k, n));
             let natural = before.max(after).saturating_add(1).min(k.len());
-            let len = if i == 0 {
-                natural
+            let len = natural.min(shared.saturating_add(depth));
+            let p = &k[..len];
+            if entries.last().is_some_and(|(q, _)| *q == p) {
+                // The key before cut at the same place: its entry turns whole and holds both.
+                entries.last_mut().unwrap().1 = 1 << suffix;
+                whole = Some(p);
+            } else if len < natural {
+                entries.push((p, 1 << suffix));
+                whole = Some(p);
             } else {
-                natural.min(before.saturating_add(depth))
-            };
-            if len < natural {
-                t.add(&k[..len], 1 << suffix).unwrap();
-                whole = Some(&k[..len]);
-            } else {
-                t.add(&k[..len], suffix_of(k, len, suffix)).unwrap();
+                entries.push((p, suffix_of(k, len, suffix)));
             }
+        }
+        let mut t = TrieBuilder::new(Width::Bits(suffix + 1)).unwrap();
+        for (p, v) in entries {
+            t.add(p, v).unwrap();
         }
         Surf {
             trie: t.finish().unwrap(),
@@ -396,7 +415,7 @@ mod tests {
             for suffix in [0u32, 5, 8, 13] {
                 for depth in [1usize, 2, 3, usize::MAX] {
                     let (mut want, mut got) = (Vec::new(), Vec::new());
-                    by_rule(&keys, suffix, depth).encode(&mut want);
+                    by_rule(&keys, suffix, depth, shared_of(&set)).encode(&mut want);
                     surf_at(&set, suffix, depth).encode(&mut got);
                     assert_eq!(
                         got,
@@ -410,10 +429,11 @@ mod tests {
     }
 
     /// Keys in pairs sharing all but a last byte, each pair parting from the one before at its
-    /// first bytes (SuRF's worst case): the first pair keeps its cut, each later pair is one whole
-    /// entry of at most `depth` labels, and a range holding either key of a pair is let through.
+    /// first bytes (SuRF's worst case): cut `depth` bytes past the bytes every key shares, each
+    /// pair is one whole entry, the trie at most `depth` levels and labels a pair deep below them,
+    /// and a range holding either key of a pair is let through.
     #[test]
-    fn pairs_cut_at_a_depth_take_at_most_its_labels_a_pair() {
+    fn pairs_cut_at_a_depth_take_at_most_its_levels_and_labels() {
         let pairs: BTreeSet<Vec<u8>> = (0u64..4_000)
             .map(|i| {
                 let mut k = (i / 2).to_be_bytes().to_vec();
@@ -424,26 +444,28 @@ mod tests {
             .collect();
         assert_eq!(surf(&pairs, 8).len(), 4_000);
         let mut scratch = Vec::new();
-        // Two bytes past a pair's parting reach past its number, so no pair falls in another's
-        // entry.
+        // Two bytes past the shared ones reach past a pair's number, so no pair falls in
+        // another's entry.
         for depth in [2usize, 16, 64] {
             let f = surf_at(&pairs, 8, depth);
-            // The first pair, two entries; each later pair, one.
-            assert_eq!(f.len(), 2 + 1_999, "depth {depth}");
-            // The first key's labels below the shared prefix, its pair's last, and at most
-            // `depth` for each later pair.
-            let first = 2_132 - lcp(pairs.first().unwrap(), pairs.last().unwrap());
-            assert!(
-                f.trie.labels() <= first + 1 + 1_999 * depth,
-                "depth {depth}: {} labels",
-                f.trie.labels()
-            );
+            assert_eq!(f.len(), 2_000, "depth {depth}");
+            assert!(f.trie.sparse_levels() <= depth, "depth {depth}");
+            assert!(f.trie.labels() <= 2_000 * depth, "depth {depth}");
             for k in &pairs {
                 let mut after = k.clone();
                 after.push(0);
                 assert!(f.may_hold(k, Some(&after), &mut scratch), "depth {depth}");
             }
         }
+    }
+
+    /// A key not starting with the bytes every key was to share is refused.
+    #[test]
+    fn a_key_without_the_shared_bytes_is_refused() {
+        let mut b = SurfBuilder::new(8, 4, 3).unwrap();
+        b.push(None, 0).unwrap();
+        assert!(b.push(Some(b"abcd"), 3).is_ok());
+        assert!(b.push(Some(b"abce"), 2).is_err());
     }
 
     #[test]

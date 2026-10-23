@@ -426,6 +426,24 @@ impl TrieBuilder {
         self.push_key(key, lcp, value)
     }
 
+    /// Gives the key added last `value` in place of the one it came with: its value is the last of
+    /// the level its last label is on, or the root's own for the empty key.
+    pub fn set_last(&mut self, value: u32) -> Result<(), Error> {
+        if self.keys == 0 || width_of(value) > self.width {
+            return Err(Error::InvalidArgument {
+                what: "a trie's last value set with no key, or wider than its width",
+            });
+        }
+        let level = self
+            .levels
+            .get_mut(self.prev_len.saturating_sub(1))
+            .ok_or(corrupt())?;
+        level.values.pop().ok_or(corrupt())?;
+        level.values.push(value)?;
+        self.max = self.max.max(value);
+        Ok(())
+    }
+
     /// Adds `key`, sharing `lcp` bytes with the key before it, to the levels it reaches.
     fn push_key(&mut self, key: &[u8], lcp: usize, value: u32) -> Result<(), Error> {
         if width_of(value) > self.width {
@@ -1330,6 +1348,12 @@ impl Trie {
         self.sparse.iter().fold(self.dense.labels.ones(), |n, s| {
             n.saturating_add(s.labels.len())
         })
+    }
+
+    /// The sparse levels below the shared prefix, each a level's records and buffers.
+    #[cfg(test)]
+    pub(crate) fn sparse_levels(&self) -> usize {
+        self.sparse.len()
     }
 
     /// The bits a value takes.

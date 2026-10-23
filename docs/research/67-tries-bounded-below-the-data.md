@@ -177,10 +177,19 @@ how far past the shared bytes each shape's separators reach:
 | paths through two 32-hex directories | 0.01% | 0.07% | 77 |
 | data-lake paths (day and hour partitions, uuid part files), 114 bytes | 0.05% | 0.09% | 25 |
 | 64-byte pairs | 15.13% | 0.20% | 58 |
+| 16-byte pairs a byte apart, no values | 43.87% | 0.13% | 16 |
+| the same, one pair in eight parting at each depth | 83.31% | 0.12% | 16 |
 | 2,132-byte pairs | 0.46% | 0.69% | 2,126 |
 | 2,132-byte pairs, largest values | 0.04% | 0.68% | 2,126 |
 
-The pairs the goal named, a third of their data in the two tries, hold 1.15% of it. Every
+The pairs the goal named, a third of their data in the two tries, hold 1.15% of it. Within the
+depth the range filter's worst is short keys with no values, a key adding as many labels as the
+bytes it shares with the next past what it shares with the one before: 16-byte pairs sharing 15
+bytes, a byte apart, take 8 labels a key and 43.87% of their data. A node's start then costs most:
+a block of 256 node starts keeps its 16-bit extras for every node once any node of it holds two
+labels, and breadth-first numbering keeps such nodes to the levels where keys part; pairs parting
+at every depth put one in every block, 2 bytes a node beside a label's 1.4, and take 83.31%, still
+below the data, every one within `branch::tries_bytes`. Every
 realistic shape's separators stay within the leaf index's depth, so their lookups read no index
 page; 64-byte pairs, shorter than the depth past what they share, keep their cut. The leaf index
 lost its levels' records (paths: 62 → 16 bytes a leaf; 64-byte pairs 454 → 49), and a filter's

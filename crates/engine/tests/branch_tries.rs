@@ -1,8 +1,10 @@
 //! What a branch's two tries hold against the data they cover, at a range's floor (its page sized
 //! by the range's longest key and largest row, mantle_meta's bounds): the range filter and the
 //! leaf index of one branch of each shape, the densest rows, the shard benchmark's, object names,
-//! paths through two random directories, and keys in pairs sharing all but a last byte (SuRF's
-//! worst case) at 64 and at 2,132 bytes (research/67).
+//! paths through two random directories, keys in pairs sharing all but a last byte (SuRF's
+//! worst case) at 64 and at 2,132 bytes, and at 16 bytes with no values, pairs a byte apart, also
+//! with one pair in eight parting at each depth: the range filter's worst within its depth
+//! (research/67).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -42,6 +44,26 @@ fn pairs(n: u64, len: usize) -> Vec<Vec<u8>> {
             let mut k = (i / 2).to_be_bytes().to_vec();
             k.resize(len - 1, b'x');
             k.push(if i % 2 == 0 { b'a' } else { b'b' });
+            k
+        })
+        .collect()
+}
+
+/// 16-byte keys in pairs, each pair's number in its first two bytes, so a pair shares a byte at
+/// most with the next; a pair's two keys part at their last byte, or, one pair in eight, at a
+/// byte from the third to the fifteenth by its number: nodes of two labels at every depth.
+fn pairs_parting_everywhere(n: u64, everywhere: bool) -> Vec<Vec<u8>> {
+    (0..n)
+        .map(|i| {
+            let pair = i / 2;
+            let mut k = vec![b'x'; 16];
+            k[..2].copy_from_slice(&u16::try_from(pair).unwrap().to_be_bytes());
+            let part = if everywhere && pair % 8 == 0 {
+                2 + usize::try_from((pair / 8) % 14).unwrap()
+            } else {
+                15
+            };
+            k[part] = if i % 2 == 0 { b'a' } else { b'b' };
             k
         })
         .collect()
@@ -191,6 +213,16 @@ fn a_branches_tries_against_its_data() {
     );
     measure("data-lake paths, 100 B values", &lake, 100);
     measure("pairs of 64 B, no values", &pairs(20_000, 64), 0);
+    measure(
+        "pairs of 16 B, a byte apart, no values",
+        &pairs_parting_everywhere(20_000, false),
+        0,
+    );
+    measure(
+        "pairs of 16 B parting at every depth, no values",
+        &pairs_parting_everywhere(20_000, true),
+        0,
+    );
     measure("pairs of 2,132 B, no values", &pairs(4_000, KEY), 0);
     measure(
         "pairs of 2,132 B, largest values",

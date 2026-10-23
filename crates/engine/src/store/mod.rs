@@ -123,9 +123,10 @@ pub struct IoStats {
     ///   have saved);
     /// - point reads the device served, and their nanoseconds;
     /// - nanoseconds writers waited because the write budget was spent;
-    /// - nanoseconds span reads waited for their pages: in the file's read call, or from a
-    ///   claim of a read through the issuer until its answer, what a page not in the kernel's
-    ///   page cache costs a worker's merge (docs/research/65 §8).
+    /// - nanoseconds span reads the OS did not hold in memory waited for their pages, asked of a
+    ///   file that can tell: in the file's read call, or from a claim of a read through the issuer
+    ///   until its answer, what a page not in the kernel's page cache costs a worker's merge
+    ///   (docs/research/65 §8).
     pub ghost_misses: u64,
     pub device_reads: u64,
     pub device_read_ns: u64,
@@ -394,6 +395,12 @@ struct Writer {
     reads: Vec<u64>,
     parked: Vec<(u64, Result<Transfers, Error>)>,
     orphans: Vec<u64>,
+    /// Whether the file can tell which of its pages the OS holds in memory
+    /// ([`BlockFile::reads_resident`]: buffered, on Linux or macOS), asked once as attached; and
+    /// the reads handed to the issuer whose extent it did not hold then, which wait on the
+    /// device, timed when claimed ([`IoStats::read_wait_ns`]). At most the batches out.
+    tells: bool,
+    missed: Vec<u64>,
     /// Batches' vectors back from the issuer with their answers, emptied, for the next batch:
     /// at most the batches attached for, since no more are ever out, so a warm submission
     /// allocates nothing.
@@ -2864,11 +2871,10 @@ impl<F: BlockFile> Store<F> {
             .try_reserve_exact(batches)
             .map_err(|error| io("reserve canceled read numbers", error))?;
         self.drain()?;
+        let file = self.file.as_ref().ok_or_else(Self::original_missing)?;
+        let tells = file.reads_resident();
         let attached = attacher
-            .attach_deep(
-                self.file.as_ref().ok_or_else(Self::original_missing)?,
-                batches,
-            )
+            .attach_deep(file, batches)
             .map_err(|e| io("attach a store to its device's issuer", e))?;
         self.writer = Some(Writer {
             attached,
@@ -2878,6 +2884,8 @@ impl<F: BlockFile> Store<F> {
             reads: Vec::with_capacity(batches),
             parked: Vec::with_capacity(batches),
             orphans,
+            tells,
+            missed: Vec::with_capacity(batches),
             transfers: Vec::with_capacity(batches),
             read_wanted: false,
             flush: None,
@@ -3227,6 +3235,9 @@ impl<F: BlockFile> Store<F> {
         let Some(w) = self.writer.as_mut() else {
             return;
         };
+        if let Some(i) = w.missed.iter().position(|&n| n == number) {
+            w.missed.swap_remove(i);
+        }
         match w.parked.iter().position(|&(n, _)| n == number) {
             Some(i) => {
                 if let (_, Ok(batch)) = w.parked.swap_remove(i) {
@@ -3654,8 +3665,23 @@ impl<F: BlockFile> Store<F> {
         let mut buf = self.take_buf()?;
         buf.set_len(bytes)
             .map_err(|e| io("size a store page span read", e))?;
+        let page = self.config.page_size;
         let Some(w) = self.writer.as_mut() else {
             return Ok(());
+        };
+        // Whether the OS holds the extent's first page now, asked of a file that can tell: a read
+        // it does not hold waits on the device, the waits the tuner prices the kernel's page
+        // cache at (`claim`); one it holds is a copy from memory, which no larger page cache
+        // would spare.
+        let missed = match buf.as_mut_slice().get_mut(..page) {
+            Some(first) if w.tells => match w.attached.read_resident_at(first, offset) {
+                Ok(held) => !held,
+                Err(error) => {
+                    self.lent = self.lent.saturating_sub(1);
+                    return Err(io("ask whether a store page span is in memory", error));
+                }
+            },
+            _ => false,
         };
         let mut batch = w.transfers.pop().unwrap_or_default();
         batch.push((buf, offset));
@@ -3668,6 +3694,9 @@ impl<F: BlockFile> Store<F> {
             }
         };
         w.reads.push(number);
+        if missed {
+            w.missed.push(number);
+        }
         w.read_wanted = false;
         span.pending.push_back((number, address, pages, false));
         self.io.prefetches = self.io.prefetches.saturating_add(1);
@@ -3806,7 +3835,7 @@ impl<F: BlockFile> Store<F> {
 
     /// The buffers of read `number`, waiting for its answer if it has not come.
     fn claim(&mut self, number: u64) -> Result<Transfers, Error> {
-        // Timed from its first wait: a read already answered costs no clock.
+        // Timed from its first wait: a read already answered costs no clock read.
         let mut waited = None;
         let claimed = loop {
             let Some(w) = self.writer.as_mut() else {
@@ -3828,7 +3857,17 @@ impl<F: BlockFile> Store<F> {
                 break Err(e);
             }
         };
-        self.io.read_wait_ns = self.io.read_wait_ns.saturating_add(elapsed_ns(waited));
+        // Only a read the OS did not hold when handed over waited on the device.
+        let missed = self.writer.as_mut().is_some_and(|w| {
+            w.missed
+                .iter()
+                .position(|&n| n == number)
+                .map(|i| w.missed.swap_remove(i))
+                .is_some()
+        });
+        if missed {
+            self.io.read_wait_ns = self.io.read_wait_ns.saturating_add(elapsed_ns(waited));
+        }
         claimed
     }
 
@@ -4056,27 +4095,35 @@ impl<F: BlockFile> Store<F> {
         span.pages = 0;
         self.io.reads = self.io.reads.saturating_add(1);
         self.io.pages_read = self.io.pages_read.saturating_add(u64::from(pages));
-        // Timed always, a clock read beside a read of up to an extent: what the tuner prices
-        // the kernel's page cache at (`read_wait_ns`); the scans' rent prices only timed reads.
-        let started = Some(std::time::Instant::now());
-        let read = span
+        let file = self.file.as_mut().ok_or_else(Self::original_missing)?;
+        let b = span
             .buf
             .as_mut_slice()
             .get_mut(..bytes)
-            .ok_or(corrupt(Malformed::TooLarge))
-            .and_then(|b| {
-                self.file
-                    .as_ref()
-                    .ok_or_else(Self::original_missing)?
-                    .read_exact_at(b, offset)
-                    .map_err(|e| io("read a store page span", e))
-            });
-        let ns = elapsed_ns(started);
-        self.io.read_wait_ns = self.io.read_wait_ns.saturating_add(ns);
-        if self.timed {
-            self.io.read_ns = self.io.read_ns.saturating_add(ns);
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        // From memory when the OS holds it, asked of a file that can tell; else a read that waits
+        // on the device, timed always (a clock read beside a read of up to an extent) as what the
+        // tuner prices the kernel's page cache at (`read_wait_ns`); the scans' rent prices only
+        // timed reads.
+        let tells = file.reads_resident();
+        let held = tells
+            && file
+                .read_resident_at(b, offset)
+                .map_err(|e| io("read a store page span from memory", e))?;
+        if !held {
+            let started = Some(std::time::Instant::now());
+            let read = file
+                .read_exact_at(b, offset)
+                .map_err(|e| io("read a store page span", e));
+            let ns = elapsed_ns(started);
+            if tells {
+                self.io.read_wait_ns = self.io.read_wait_ns.saturating_add(ns);
+            }
+            if self.timed {
+                self.io.read_ns = self.io.read_ns.saturating_add(ns);
+            }
+            read?;
         }
-        read?;
         span.first = address;
         span.pages = pages;
         Ok(())

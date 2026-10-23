@@ -365,12 +365,19 @@ the budget's share no region takes.
   measure, `Trunk::take_reuse`): those at or past the share, in extents, which a page cache of the
   share would not hold (`past`), and of them those short of the share and a tuning step, which one
   a step larger would (`within`). A branch loaded at open has no stamp and is past every window.
-- **The cost.** A worker times its reads' waits (`IoStats::read_wait_ns`: a span's read in the
-  file, or a read through the issuer from its claim until its answer) and reports them with each
-  job (`Output::read_wait_ns`). A cycle's gain is the waits as many times over as `within` is of
-  `past` (`kernel_gain`): of what the reads the share missed cost, what a step would have saved,
-  against a step's bytes. The price is measured, not modeled: a share past what the kernel's page
-  cache reaches finds no waits to save (§7: it reaches further than the bytes written).
+- **The cost.** A worker times the waits of its reads the OS did not hold
+  (`IoStats::read_wait_ns`) and reports them with each job (`Output::read_wait_ns`). Before it
+  hands an extent's read to the issuer it asks whether the OS holds the extent's first page
+  (`read_resident_at`: `preadv2(2)` with `RWF_NOWAIT` on Linux, `mincore(2)` on macOS), and only a
+  read it did not hold is timed from its claim until its answer; a read made in the file at once
+  is first tried from memory. A read the OS held is a copy from memory, which no larger page cache
+  would spare, so a fill whose inputs all stay cached (100M rows in 96 GiB) earns the kernel
+  nothing, though its workers still wait on the issuer's answers. A file that cannot tell, direct
+  I/O or a platform without either call, counts no wait, and the share stays none. A cycle's gain
+  is the waits as many times over as `within` is of `past` (`kernel_gain`): of what the reads the
+  share missed cost, what a step would have saved, against a step's bytes. The price is measured,
+  not modeled: a share past what the kernel's page cache reaches finds no waits to save (§7: it
+  reaches further than the bytes written).
 - **A step.** In a fill with no gets the page cache saves nothing and the workers wait on what the
   share misses: the page cache gives the share the paper's step a cycle, 5% of the budget within
   10% of its own, keeping one step itself, as the record cache does, so its ghost gathers the

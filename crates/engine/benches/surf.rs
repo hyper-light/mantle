@@ -1,8 +1,12 @@
-//! The range filter's cost and accuracy by suffix bits (docs/design/engine-structure.md §5, E6;
-//! research/35 §2): a run of `KEYS` keys of two shapes, 16-byte keys of a random 64-bit number
-//! (the shard benchmark's) and object names under a few thousand prefixes (an S3 listing's). For
-//! each, ranges holding no key, as a bounded seek or a listing asks: the share let through (false
-//! positives), bits a key, and nanoseconds a check at p50 and p99, with allocations a check.
+//! The range filter's cost and accuracy by suffix bits and by depth, the most bytes an entry runs
+//! past the bytes every key shares (docs/design/engine-structure.md §5, E6;
+//! research/35 §2, research/67): a run of `KEYS` keys of four shapes, 16-byte keys of a random
+//! 64-bit number (the shard benchmark's), object names under a few thousand prefixes (an S3
+//! listing's), paths through two random 32-hex directories (each new directory a long chain no
+//! key before it shares), and a hundredth as many keys of 2,132 bytes in pairs sharing all but a
+//! last byte (SuRF's worst case, the range's longest keys). For each, ranges holding no key, as a
+//! bounded seek or a listing asks: the share let through (false positives), bits a key, and
+//! nanoseconds a check at p50 and p99, with allocations a check.
 //! `cargo bench -p mantle-engine --bench surf -- [KEYS] [QUERIES] [PASSES]`
 #![allow(
     clippy::unwrap_used,
@@ -51,6 +55,36 @@ fn object(r: &mut Rng) -> Vec<u8> {
         r.next() % 100_000_000
     )
     .into_bytes()
+}
+
+fn hex(r: &mut Rng) -> String {
+    format!("{:016x}{:016x}", r.next(), r.next())
+}
+
+fn uuid_path(r: &mut Rng) -> Vec<u8> {
+    format!(
+        "tenant-{:04}/{}/{}/part-{:05}.parquet",
+        r.next() % 64,
+        hex(&mut Rng(r.next() % 4_000)),
+        hex(&mut Rng(r.next() % 16)),
+        r.next() % 2_000
+    )
+    .into_bytes()
+}
+
+/// A key of 2,132 bytes in a pair sharing all but its last byte: its pair's number `n`, filler,
+/// and `last`.
+fn pair_key(n: u64, last: u8) -> Vec<u8> {
+    let mut k = n.to_be_bytes().to_vec();
+    k.resize(2_131, b'x');
+    k.push(last);
+    k
+}
+
+/// A pair's key drawn over twice the `pairs` stored, with `a`, `b` or `c` last: a stored
+/// pair's `a` and `b`, the rest never stored.
+fn pair(r: &mut Rng, pairs: u64) -> Vec<u8> {
+    pair_key(r.next() % (pairs * 2), b'a' + (r.next() % 3) as u8)
 }
 
 /// A key shape: its name and how a key of it is drawn.
@@ -141,17 +175,35 @@ fn main() {
     let queries: usize = args.get(1).map_or(200_000, |s| s.parse().unwrap());
     // Passes over each kind's ranges, for a profiler to sample a steady loop.
     let passes: usize = args.get(2).map_or(1, |s| s.parse().unwrap());
-    let shapes: [Shape; 2] = [
+    let pairs = (keys / 200).max(1) as u64;
+    let shapes: [Shape; 4] = [
         ("number16", &|r: &mut Rng| number(r.next())),
         ("object", &|r: &mut Rng| object(r)),
+        ("uuidpath", &|r: &mut Rng| uuid_path(r)),
+        ("pairs2132", &|r: &mut Rng| pair(r, pairs)),
     ];
     for (name, make) in shapes {
         let mut r = Rng(7);
-        let set: BTreeSet<Vec<u8>> = (0..keys).map(|_| make(&mut r)).collect();
+        // The pairs whole, each pair's two keys stored.
+        let set: BTreeSet<Vec<u8>> = if name == "pairs2132" {
+            (0..pairs)
+                .flat_map(|n| [pair_key(n, b'a'), pair_key(n, b'b')])
+                .collect()
+        } else {
+            (0..keys).map(|_| make(&mut r)).collect()
+        };
         let kinds = empty_ranges(&set, &mut Rng(11), make, queries);
         let key_bytes: usize = set.iter().map(Vec::len).sum();
-        for suffix in [0u32, 4, 8, 12, 16, 24, 32] {
-            let mut b = SurfBuilder::new(suffix).unwrap();
+        let depths = [2usize, 4, 8, 16, 32, 64, 128, usize::MAX];
+        for (suffix, depth) in [0u32, 8, 16]
+            .into_iter()
+            .flat_map(|s| depths.map(|d| (s, d)))
+        {
+            let shared = match (set.first(), set.last()) {
+                (Some(a), Some(z)) => a.iter().zip(z).take_while(|(x, y)| x == y).count(),
+                _ => 0,
+            };
+            let mut b = SurfBuilder::new(suffix, depth, shared).unwrap();
             let t = Instant::now();
             let mut before: Option<&Vec<u8>> = None;
             for k in &set {
@@ -167,9 +219,15 @@ fn main() {
             let build = added + finish;
             let mut scratch = Vec::with_capacity(64);
             let mut line = format!(
-                "{name} keys {} ({:.1} B) suffix {suffix:2}: {:.2} bits/key, build {:.0} ns/key (finish {:.2} ms) |",
+                "{name} keys {} ({:.1} B) suffix {suffix:2} depth {}: entries {} {:.2} bits/key, build {:.0} ns/key (finish {:.2} ms) |",
                 set.len(),
                 key_bytes as f64 / set.len() as f64,
+                if depth == usize::MAX {
+                    "none".to_string()
+                } else {
+                    depth.to_string()
+                },
+                f.len(),
                 f.bytes() as f64 * 8.0 / set.len() as f64,
                 build * 1e9 / set.len() as f64,
                 finish * 1e3,

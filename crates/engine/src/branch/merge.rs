@@ -319,6 +319,22 @@ pub struct Compaction {
     /// and whether the last step did.
     yield_io: bool,
     waiting: bool,
+    /// With no end to the range, what the inputs' greatest range filter entries share: each is a
+    /// prefix of its input's last key, so every key from the first an output takes up to any
+    /// input's last shares with that first at least what it shares with this.
+    ceiling: Vec<u8>,
+}
+
+/// Folds `branch` into `ceiling`, what the greatest range filter entries of the inputs share,
+/// `scratch` holding each in turn.
+fn fold_ceiling(ceiling: &mut Option<Vec<u8>>, branch: &Branch, scratch: &mut Vec<u8>) {
+    if !branch.range.greatest(scratch) {
+        return;
+    }
+    match ceiling.as_mut() {
+        Some(c) => c.truncate(crate::util::keys::common_prefix(c, scratch)),
+        None => *ceiling = Some(scratch.clone()),
+    }
 }
 
 impl Compaction {
@@ -335,11 +351,16 @@ impl Compaction {
     ) -> Result<Self, Error> {
         let mut remaining = 0u64;
         let mut roots = Vec::new();
+        let (mut ceiling, mut scratch) = (None, Vec::new());
         let counted = branches.into_iter().inspect(|b| {
             remaining = remaining.saturating_add(b.count);
             roots.push(b.root);
+            if end.is_none() {
+                fold_ceiling(&mut ceiling, b, &mut scratch);
+            }
         });
         let merge = Merge::sequential(store, counted, from, end)?;
+        let ceiling = ceiling.unwrap_or_default();
         Ok(Self {
             merge,
             roots,
@@ -351,6 +372,7 @@ impl Compaction {
             remaining,
             yield_io: false,
             waiting: false,
+            ceiling,
         })
     }
 
@@ -365,10 +387,15 @@ impl Compaction {
     ) -> Self {
         let mut remaining = 0u64;
         let mut roots = Vec::new();
+        let (mut ceiling, mut scratch) = (None, Vec::new());
         for branch in branches {
             remaining = remaining.saturating_add(branch.count);
             roots.push(branch.root);
+            if end.is_none() {
+                fold_ceiling(&mut ceiling, branch, &mut scratch);
+            }
         }
+        let ceiling = ceiling.unwrap_or_default();
         let mut merge = Merge::prepared(from, end);
         if roots.is_empty() {
             merge.opening = false;
@@ -386,6 +413,7 @@ impl Compaction {
             remaining,
             yield_io: false,
             waiting: false,
+            ceiling,
         }
     }
 
@@ -522,6 +550,7 @@ impl Compaction {
                 per,
                 remaining,
                 drop_tombstones,
+                ceiling,
                 ..
             } = self;
             let Some((key, op, value)) = merge.entry() else {
@@ -544,11 +573,14 @@ impl Compaction {
                 }
                 let (_, b, n) = match building.as_mut() {
                     Some(b) => b,
-                    None => building.insert((
-                        key.to_vec(),
-                        Builder::new(store, Keys::AtMost((*remaining).min(*per)))?,
-                        0,
-                    )),
+                    None => {
+                        let mut b = Builder::new(store, Keys::AtMost((*remaining).min(*per)))?;
+                        // Every key from this first to the range's end, or to the inputs' last
+                        // keys, shares with it what it shares with that bound.
+                        let bound = merge.end.as_deref().unwrap_or(ceiling.as_slice());
+                        b.set_shared(crate::util::keys::common_prefix(key, bound))?;
+                        building.insert((key.to_vec(), b, 0))
+                    }
                 };
                 b.add(store, key, op, value)?;
                 *n = n.saturating_add(1);

@@ -231,9 +231,13 @@ pub fn page_bytes(capacity: usize) -> Option<usize> {
 /// (at most one a page, a page holding an entry at least: so at most twice as many pages as
 /// entries, the index pages above them counted), in lists grown at most twice over and copied
 /// once exactly into the branch. Its two tries, the range filter of its keys and its leaves'
-/// index, hold a level a key byte and a label a key byte at most ([`trie::builder_bytes`]); the
-/// seal finishes each and encodes it beside its builder, each again at most its builder's bytes.
-/// Pinned by `tests/builder_memory.rs` at the densest keys and the longest.
+/// index, hold a level a key byte ([`trie::builder_bytes`]) and labels the bytes every key shares
+/// once (at most a key's) and past them at most their depth a key or a leaf, a leaf an entry at
+/// least (`fst::surf`, [`crate::store::RANGE_FILTER_DEPTH`],
+/// [`crate::store::LEAF_INDEX_DEPTH`]); the range filter's values its suffix bits. The seal
+/// finishes each and encodes it beside its builder, each again at most its builder's bytes. A
+/// separator cut short is kept, a key buffer more. Pinned by `tests/builder_memory.rs` at the
+/// densest keys and the longest.
 pub fn builder_bytes(
     capacity: usize,
     extent: usize,
@@ -250,23 +254,50 @@ pub fn builder_bytes(
     // Each page's count (two bytes) and extent number (eight), twice over, and once exactly.
     let pages = entries.checked_mul(2)?;
     let lists = pages.checked_mul(30)?;
-    let labels = entries.checked_mul(bytes(key)?)?;
-    let tries = crate::fst::trie::builder_bytes(key, labels, entries, range_bits)?
-        .checked_add(crate::fst::trie::builder_bytes(
-            key,
-            labels,
-            entries,
-            u32::BITS,
-        )?)?
-        .checked_mul(3)?;
+    // A leaf holds an entry at least: as many separators as entries at most.
+    let tries = tries_bytes(key, entries, entries, range_bits)?.checked_mul(3)?;
     levels
         .checked_mul(level)?
+        .checked_add(key_buffer)?
         .checked_add(key_buffer)?
         .checked_add(bytes(capacity)?)?
         .checked_add(bytes(extent)?)?
         .checked_add(bytes(filter::most_bytes(filter::Keys::AtMost(entries))?)?)?
         .checked_add(lists)?
         .checked_add(tries)
+}
+
+/// The most bytes a branch's two tries take, built or as their builders hold them: its range
+/// filter over `entries` keys of at most `key` bytes keeping `range_bits` suffix bits, and its
+/// leaf index over `leaves` separators, its values pages up to 32 bits. Each holds a level a key
+/// byte at most and as labels the bytes every key shares once (at most a key's) and past them at
+/// most its depth a key or a separator, never past the key
+/// ([`crate::store::RANGE_FILTER_DEPTH`], [`crate::store::LEAF_INDEX_DEPTH`];
+/// [`trie::builder_bytes`]). Below the data its branch holds for any keys: a key's or a leaf's
+/// share is bounded by the depth, not by the key's length (research/67). Pinned by
+/// `tests/branch_tries.rs`.
+pub fn tries_bytes(key: usize, entries: u64, leaves: u64, range_bits: u32) -> Option<u64> {
+    let bytes = |n: usize| u64::try_from(n).ok();
+    let labels = |n: u64, depth: usize| -> Option<u64> {
+        let past = n.checked_mul(bytes(depth.min(key))?)?;
+        Some(
+            bytes(key)?
+                .checked_add(past)?
+                .min(n.checked_mul(bytes(key)?)?),
+        )
+    };
+    crate::fst::trie::builder_bytes(
+        key,
+        labels(entries, crate::store::RANGE_FILTER_DEPTH)?,
+        entries,
+        range_bits,
+    )?
+    .checked_add(crate::fst::trie::builder_bytes(
+        key,
+        labels(leaves, crate::store::LEAF_INDEX_DEPTH)?,
+        leaves,
+        u32::BITS,
+    )?)
 }
 
 impl Page {
@@ -514,6 +545,13 @@ pub struct Builder {
     /// What the first key of the leaf being filled shares with the key before it, the last
     /// leaf's last: the leaf's separator keeps one byte more.
     leaf_shared: usize,
+    /// The bytes every key shares, as the builder is told ([`Self::set_shared`]): separators
+    /// run at most [`crate::store::LEAF_INDEX_DEPTH`] bytes past them.
+    shared: usize,
+    /// The last separator when it was cut short, its prefix: the leaves whose first keys start
+    /// with it are in its group, which the index holds as one entry.
+    group: Vec<u8>,
+    in_group: bool,
     count: u64,
     payload: Vec<u8>,
     capacity: usize,
@@ -588,6 +626,21 @@ fn page_needs(key: usize, value: usize) -> Option<usize> {
 }
 
 impl Builder {
+    /// States that every key this builder will take shares its first `shared` bytes, before the
+    /// first is added: the range filter's depth counts past them (`fst::surf`), so keys sharing a
+    /// long first part (a bucket, a directory) keep that depth of their own.
+    pub fn set_shared(&mut self, shared: usize) -> Result<(), Error> {
+        if self.count > 0 {
+            return Err(Error::InvalidArgument {
+                what: "a branch's shared bytes stated after a key",
+            });
+        }
+        self.shared = shared;
+        self.keys.share(shared)
+    }
+}
+
+impl Builder {
     /// A builder in `store`, for `keys` entries: pages of the store's payload capacity, which
     /// offsets of 16 bits must reach.
     pub fn new<F: BlockFile>(store: &mut Store<F>, keys: filter::Keys) -> Result<Self, Error> {
@@ -604,7 +657,11 @@ impl Builder {
         let mut separators = lists.separators;
         separators.reset(Width::Fit)?;
         let mut keys_filter = lists.keys;
-        keys_filter.reset(store.range_filter_bits())?;
+        keys_filter.reset(
+            store.range_filter_bits(),
+            crate::store::RANGE_FILTER_DEPTH,
+            0,
+        )?;
         let mut spare_pages = lists.pages;
         let mut levels = lists.levels;
         levels.push(
@@ -630,6 +687,9 @@ impl Builder {
             last: lists.last,
             last_len: 0,
             leaf_shared: 0,
+            shared: 0,
+            group: Vec::new(),
+            in_group: false,
             count: 0,
             payload,
             capacity,
@@ -930,20 +990,42 @@ impl Builder {
             // The leaf's separator: the shortest prefix of its first key above the last leaf's
             // last key, the empty key for the first leaf.
             // The first leaf's separator is its first key: it shares the prefix every key of the
-            // branch has, so the index keeps that prefix as bytes ([`Branch::leaf_of`] places a
+            // branch has, so the index keeps that prefix as bytes ([`Branch::leaf_in`] places a
             // key below it in the first leaf).
             let mut cut = first.len();
             if !self.separators.is_empty() {
                 cut = self.leaf_shared.saturating_add(1).min(first.len());
             }
-            let page_no = self
-                .issued
-                .checked_sub(1)
-                .ok_or(corrupt(Malformed::CountMismatch))?;
-            self.separators.add(
-                first.get(..cut).ok_or(corrupt(Malformed::TooLarge))?,
-                u32::try_from(page_no).map_err(|_| corrupt(Malformed::TooLarge))?,
-            )?;
+            let page_no = u32::try_from(
+                self.issued
+                    .checked_sub(1)
+                    .ok_or(corrupt(Malformed::CountMismatch))?,
+            )
+            .map_err(|_| corrupt(Malformed::TooLarge))?;
+            // Each entry is its leaf's page, doubled, its low bit set for a separator cut short:
+            // that entry stands for a group of leaves, the last its page, which the index pages
+            // tell apart (`Branch::leaf_in`). A separator runs at most the leaf index's depth past
+            // the bytes every key shares; a leaf whose first key starts with the last group's
+            // prefix joins it.
+            let entry = |page: u32, whole: bool| {
+                page.checked_mul(2)
+                    .and_then(|v| v.checked_add(u32::from(whole)))
+                    .ok_or(corrupt(Malformed::TooLarge))
+            };
+            if self.in_group && first.starts_with(&self.group) {
+                self.separators.set_last(entry(page_no, true)?)?;
+            } else {
+                let reach = self.shared.saturating_add(crate::store::LEAF_INDEX_DEPTH);
+                let whole = cut > reach;
+                let cut = cut.min(reach);
+                let separator = first.get(..cut).ok_or(corrupt(Malformed::TooLarge))?;
+                self.separators.add(separator, entry(page_no, whole)?)?;
+                self.in_group = whole;
+                if whole {
+                    self.group.clear();
+                    self.group.extend_from_slice(separator);
+                }
+            }
         }
         if let Some(page) = self.levels.get_mut(level) {
             page.clear();
@@ -1415,9 +1497,11 @@ impl Branch {
             return Ok(None);
         }
         // The leaf by the index, from memory: the one page read, parsed where the store holds
-        // it, only the value copied out.
-        let page_no = self.leaf_of(key)?;
-        let address = self.page_address(store, u64::from(page_no))?;
+        // it, only the value copied out; within a group cut short, the index pages read first.
+        let address = match self.leaf_in(key)? {
+            Some(page) => self.page_address(store, u64::from(page))?,
+            None => self.descend_from_root(store, key)?,
+        };
         store.with_page(address, |page| point::read_value(page, key, value))
     }
 
@@ -1458,9 +1542,11 @@ impl Branch {
         store: &mut Store<F>,
         key: &[u8],
     ) -> Result<point::PointRead, Error> {
-        let page = self.leaf_of(key)?;
-        let address = self.page_address(store, u64::from(page))?;
-        Ok(point::PointRead::new(address))
+        Ok(match self.leaf_in(key)? {
+            Some(page) => point::PointRead::new(self.page_address(store, u64::from(page))?, 0),
+            // Down from the root: an index page a level above the leaf.
+            None => point::PointRead::new(self.root, usize::from(self.height).saturating_sub(1)),
+        })
     }
 }
 
@@ -1571,7 +1657,7 @@ impl Branch {
             return Err(corrupt(Malformed::CountMismatch));
         }
         let (range, used) = Surf::decode(range_part)?;
-        if used != rb || range.len() != usize::try_from(count).unwrap_or(usize::MAX) {
+        if used != rb || range.keys() != count {
             return Err(corrupt(Malformed::CountMismatch));
         }
         let counts: Vec<u16> = count_part
@@ -1640,14 +1726,100 @@ pub struct RunCursor {
     valid: bool,
 }
 
+/// Where a descent through a branch's index pages goes from a page: the leaf it is, or the
+/// child whose keys a key falls among, by its address.
+pub(crate) enum Descent {
+    Leaf,
+    Child(u64),
+}
+
+/// The step of a descent from `page` for `key`: an index page's child whose first key is the
+/// greatest at most `key`, its first for a key below them all.
+pub(crate) fn descend(page: &[u8], key: &[u8]) -> Result<Descent, Error> {
+    let view = View::new(page)?;
+    if view.kind == LEAF {
+        return Ok(Descent::Leaf);
+    }
+    let i = view.floor(key)?.unwrap_or(0);
+    let (_, rest) = view.entry(i)?;
+    let child = rest
+        .first_chunk::<8>()
+        .map(|b| u64::from_le_bytes(*b))
+        .ok_or(corrupt(Malformed::Truncated))?;
+    Ok(Descent::Child(child))
+}
+
 impl Branch {
-    /// The page number of the leaf `key` falls in: the greatest separator at most `key`, the
-    /// first leaf for a key below every separator.
-    pub fn leaf_of(&self, key: &[u8]) -> Result<u32, Error> {
-        self.index
-            .floor(key)
-            .or_else(|| self.index.least())
-            .ok_or(corrupt(Malformed::CountMismatch))
+    /// The page number of the leaf `key` falls in, from the leaf index in memory: the greatest
+    /// separator at most `key`, the first leaf for a key below every separator. None when `key`
+    /// starts with a separator cut short, which holds a group of leaves: the index pages tell
+    /// which ([`Self::leaf_for`]).
+    pub fn leaf_in(&self, key: &[u8]) -> Result<Option<u32>, Error> {
+        Ok(match self.index.floor_with(key) {
+            Some((v, prefix)) if v & 1 == 1 && prefix => None,
+            Some((v, _)) => Some(v >> 1),
+            // The first leaf is the first page the builder wrote.
+            None => Some(0),
+        })
+    }
+
+    /// The page number of the leaf `key` falls in, reading the index pages down from the root
+    /// when the leaf index holds its group of leaves cut short.
+    pub fn leaf_for<F: BlockFile>(&self, store: &mut Store<F>, key: &[u8]) -> Result<u32, Error> {
+        match self.leaf_in(key)? {
+            Some(page) => Ok(page),
+            None => {
+                let leaf = self.descend_from_root(store, key)?;
+                self.page_of(store, leaf)
+            }
+        }
+    }
+
+    /// The address of the leaf `key` falls in, read down from the root through the index pages:
+    /// one page a level.
+    fn descend_from_root<F: BlockFile>(
+        &self,
+        store: &mut Store<F>,
+        key: &[u8],
+    ) -> Result<u64, Error> {
+        let mut address = self.root;
+        for _ in 0..self.height {
+            match store.with_page(address, |page| descend(page, key))? {
+                Descent::Leaf => return Ok(address),
+                Descent::Child(child) => address = child,
+            }
+        }
+        Err(corrupt(Malformed::CountMismatch))
+    }
+
+    /// The page number of the page at `address`: its extent's place among the branch's extents,
+    /// and its place in the extent.
+    pub(crate) fn page_of<F: BlockFile>(
+        &self,
+        store: &Store<F>,
+        address: u64,
+    ) -> Result<u32, Error> {
+        let per = u64::from(store.extent_pages());
+        let extent = store.extent_of(address);
+        let within = address
+            .checked_rem(per)
+            .ok_or(corrupt(Malformed::OutOfRange))?;
+        let i = self
+            .extents
+            .iter()
+            .position(|&e| e == extent)
+            .ok_or(corrupt(Malformed::OutOfRange))?;
+        u64::try_from(i)
+            .ok()
+            .and_then(|i| i.checked_mul(per))
+            .and_then(|p| p.checked_add(within))
+            .and_then(|p| u32::try_from(p).ok())
+            .ok_or(corrupt(Malformed::TooLarge))
+    }
+
+    /// The last leaf `key` can fall in, from memory alone: a group's last for a key within it.
+    fn leaf_most(&self, key: &[u8]) -> u32 {
+        self.index.floor(key).map_or(0, |v| v >> 1)
     }
 
     /// The pages a merge of `[from, end)` writes from this branch, at most ([`Self::merge_size`]).
@@ -1668,9 +1840,11 @@ impl Branch {
     pub fn merge_size(&self, from: &[u8], end: Option<&[u8]>) -> (usize, u64) {
         let total = self.counts.len();
         let page = |p: Result<u32, Error>| p.ok().and_then(|p| usize::try_from(p).ok());
-        let first = page(self.leaf_of(from)).unwrap_or(0);
+        // Within a group the leaf is one of its leaves or the one before: from memory alone, the
+        // first leaf is the least it can be, and the group's last the most.
+        let first = page(Ok(self.leaf_in(from).ok().flatten().unwrap_or(0))).unwrap_or(0);
         let last = end
-            .and_then(|e| page(self.leaf_of(e)))
+            .and_then(|e| page(Ok(self.leaf_most(e))))
             .unwrap_or(total.saturating_sub(1))
             .min(total.saturating_sub(1));
         let tree = last.saturating_sub(first).saturating_add(1).min(total);
@@ -1752,7 +1926,7 @@ impl Branch {
         from: &[u8],
     ) -> Result<RunCursor, Error> {
         let placed = (|| {
-            let page_no = self.leaf_of(from)?;
+            let page_no = self.leaf_for(store, from)?;
             c.land_page(self, store, u64::from(page_no))?;
             let (i, n) = c.page_lower_bound(store, from)?;
             if i >= n {
@@ -1901,7 +2075,7 @@ impl RunCursor {
         store: &mut Store<F>,
         from: &[u8],
     ) -> Result<Self, Error> {
-        let page = branch.leaf_of(from)?;
+        let page = branch.leaf_for(store, from)?;
         let mut cursor = Self::new_sequential(store)?;
         cursor.page_no = u64::from(page);
         Ok(cursor)
@@ -1945,7 +2119,10 @@ impl RunCursor {
         store: &mut Store<F>,
         from: &[u8],
     ) -> Result<(), Error> {
-        let page = u64::from(branch.leaf_of(from)?);
+        let page = match branch.leaf_in(from)? {
+            Some(page) => u64::from(page),
+            None => self.descend_async(branch, store, from).await?,
+        };
         self.land_async(branch, store, page, 0).await?;
         let (index, entries) = {
             let view = View::new(self.page_in(store)?)?;
@@ -2171,6 +2348,44 @@ impl RunCursor {
             Some(range) => self.span.payload(range),
             None => Some(&self.page),
         }
+    }
+
+    /// The page number of the leaf `key` falls in, read down from the root through the index
+    /// pages, a page a level, into the cursor's own page: it holds no leaf after.
+    async fn descend_async<F: BlockFile>(
+        &mut self,
+        branch: &Branch,
+        store: &mut Store<F>,
+        key: &[u8],
+    ) -> Result<u64, Error> {
+        self.loaded = None;
+        self.prefixed = false;
+        self.valid = false;
+        self.span_page = None;
+        self.cached = None;
+        let mut address = branch.root;
+        for _ in 0..branch.height {
+            let next = match store.cache_lookup(address) {
+                Some(slot) => descend(
+                    store
+                        .cache_page(slot, address)
+                        .ok_or(corrupt(Malformed::Truncated))?,
+                    key,
+                )?,
+                None => {
+                    self.page.clear();
+                    store
+                        .read_page_async(&mut self.span, address, &mut self.page)
+                        .await?;
+                    descend(&self.page, key)?
+                }
+            };
+            match next {
+                Descent::Leaf => return branch.page_of(store, address).map(u64::from),
+                Descent::Child(child) => address = child,
+            }
+        }
+        Err(corrupt(Malformed::CountMismatch))
     }
 
     /// The leaf held: in its cache slot, the span, or the cursor's own page.

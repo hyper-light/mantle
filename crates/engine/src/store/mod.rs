@@ -166,6 +166,22 @@ fn elapsed_ns(since: Option<std::time::Instant>) -> u64 {
 /// (38-44% at none, 0.2-0.6% at 16).
 pub const RANGE_FILTER_BITS: u32 = 8;
 
+/// The most bytes a range filter's entry runs past the bytes every key of its branch shares
+/// (`fst::surf`; research/67): measured, 1 M keys (benches/surf.rs, 2026-10-23), the least depth
+/// at which every shape's listings of empty prefixes are let through as with no depth (numbers
+/// from 4, object names and paths through two random directories from 16); narrower empty ranges
+/// inside deep directories are let through more, precision only. It holds 64-byte pairs' filter
+/// at 15% of their data where it was 62% (tests/branch_tries.rs).
+pub const RANGE_FILTER_DEPTH: usize = 16;
+
+/// The most bytes a leaf index's separator runs past the bytes every key of its branch shares;
+/// the leaves whose separators run further are found through the branch's index pages
+/// (`branch::Branch::leaf_in`; research/67). A bound: a leaf's share of its index is at most this
+/// many labels, 320 bytes, 1.3% of a 24 KiB floor page, while every realistic shape's separators
+/// reach at most 77 bytes past the shared ones (tests/branch_tries.rs, 2026-10-23), so their
+/// lookups stay in memory.
+pub const LEAF_INDEX_DEPTH: usize = 256;
+
 /// A new store's first segment, when its file grows by segments: the superblocks' extent and the
 /// first checkpoint's map, whose one count takes one page of one extent.
 const FIRST_SEGMENT_EXTENTS: u64 = 2;

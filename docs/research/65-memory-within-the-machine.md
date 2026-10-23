@@ -458,8 +458,10 @@ gate weighs them.
   gave none back for hundreds of rotations, 6 thousand faults a rotation (E1k's fixed cache: 4-6
   thousand). The fill as a whole took 29.6 million faults and 43 GiB of fresh loan memory, where
   E1l took 64.5 million and 159 GiB, and reached rotation 1,732 at 347 s, where E1l and E1m took
-  384 and 394 s for all 1,773 (Docker Desktop stopped the VM at 02:03:49 UTC, its log a requested
-  shutdown with no requester named, and E1n's gets and seeks never ran). What it still lacks of
+  384 and 394 s for all 1,773 (Docker Desktop stopped the VM at 02:03:49 UTC, and E1n's gets and
+  seeks never ran: kiln's agent, between this session's turns, stopped what its commands had left
+  running, Docker Desktop among them, which the scripts had started with `open`; its log at that
+  instant, "stopping what agents' commands left running, now that they're between turns"). What it still lacks of
   the fixed arms' 263-276 s is mostly the kept memtables' (E1i).
 - **At 64 GiB.** The release build of the same code (engine-follow 1ba145a5, `ranges-follow`, md5
   04986845, no account line), machine-sized at a billion rows with the VM at 64 GiB (`MemTotal`
@@ -468,7 +470,12 @@ gate weighs them.
   9,704 seeks a second, recovery exact over 632,113,920 live keys. The VM's anonymous memory
   peaked at 50.0 GiB 66 s in, the kept memtables at their fullest, with 11.4 GiB still available;
   the kernel swapped out 770 pages in all and stalled on memory 12.9 s of the run's 681
-  (`/proc/pressure/memory` full).
+  (`/proc/pressure/memory` full). The final build (`ranges-follow` md5 a1780568, the production
+  code of 3cc71771, which later commits keep) completed at 64 GiB too
+  (`diag-runs/n1000000000-e64-4-m_follow`, 2026-10-23): 3,489,672 puts a second, 18,174 gets and
+  10,207 seeks a second, recovery exact over 632,113,920 live keys. Two attempts before it ended
+  when kiln's agent stopped Docker Desktop at the end of a turn (14:11:16 and 14:14:07 UTC); the
+  batches start Docker as a child of their own shell now, which a background task keeps.
 - **Seeks and the cache's memory.** The first release gate (R0 7210-7234, n=4) put the follow's
   seeks at 0.941, 0.960 and 0.929 of data-layer's at 1M, 10M and 100M. Two costs the follow had
   added to the shard's own work went first: looks at the machine paced by the clock, a clock read

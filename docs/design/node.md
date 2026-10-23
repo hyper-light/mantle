@@ -325,9 +325,10 @@ measures the second, and derives the rest by these rules:
   kernel's page cache, which the workers read their inputs through and which absorbs the store's
   rewrites, a share earned by the workers' waits on reads the OS did not hold, and the cache keeps
   its pages on huge pages (`port::mmap::PageBuf`; docs/research/65 §7-§9). Machine-sized, a billion
-  rows completes on the VM at 64 GiB (1ba145a5) and at 96 GiB on the final build, its gets and
-  seeks 1.24 and 1.26 of a fixed 32 GiB cache's and its fill 0.85, the same build at that fixed
-  cache 1.06, 1.34 and 1.13 of data-layer's (docs/research/65 §9). *Open:* kept memtables take the
+  rows completes on the VM at 64 GiB and at 96 GiB on the final build, recovery exact (at 64 GiB
+  3.49 million puts, 18,174 gets and 10,207 seeks a second); at 96 GiB its gets and seeks 1.24 and
+  1.26 of a fixed 32 GiB cache's and its fill 0.85, the same build at that fixed cache 1.06, 1.34
+  and 1.13 of data-layer's (docs/research/65 §9). *Open:* kept memtables take the
   budget's idle part before any read misses, and with the memory moved between the regions cost a
   billion rows' fill 15% against a fixed cache (§9); and hyper-rt reads no process's resident memory
   on Windows, so a shard there leaves nothing free for what grows outside its account (§9).

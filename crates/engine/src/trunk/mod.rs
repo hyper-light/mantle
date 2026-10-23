@@ -79,6 +79,63 @@ pub struct TrunkConfig {
     pub leaf_entries: u64,
 }
 
+impl TrunkConfig {
+    /// The entries a leaf holds before it splits: `fanout` memtables' (SplinterDB's
+    /// `leaf_might_need_to_split`, `incorporation_size_kv_bytes * target_fanout`).
+    pub fn leaf_limit(&self) -> u64 {
+        let fanout = u64::try_from(self.fanout).unwrap_or(u64::MAX);
+        self.leaf_entries.saturating_mul(fanout)
+    }
+
+    /// The most sources a read's path opens through a trunk of `height` levels (1 for a lone
+    /// leaf), one branch an in-flight bundle or packing on it (of a packing's parts, the one
+    /// whose range holds the path's, [`InFlight::within`]): at the root, the packings not yet in
+    /// the tree and its live in-flight bundles, at most `fanout` with the one a rotation waits
+    /// to add (`Trunk::has_room`), and the pivot's bundle, at most `fanout + 1` branches (a flush
+    /// is due past `fanout`, and a pivot whose flush is held makes none); at each level below, a
+    /// pivot's live in-flight bundles, at most `3 fanout + 1` (`Trunk::takes_flush`), and its
+    /// bundle.
+    pub fn sources_most(&self, height: usize) -> usize {
+        let f = self.fanout;
+        let root = f.saturating_mul(2).saturating_add(1);
+        let below = f.saturating_mul(4).saturating_add(2);
+        root.saturating_add(height.saturating_sub(1).saturating_mul(below))
+    }
+
+    /// The most branches a compaction merges: a leaf's settle, the leaf's live in-flight
+    /// bundles, at most `3 fanout + 1`, and its bundle, at most `fanout + 1`; a pivot's
+    /// compaction, its live in-flight bundles alone.
+    pub fn inputs_most(&self) -> usize {
+        self.fanout.saturating_mul(4).saturating_add(2)
+    }
+
+    /// The most cursors an engine through a trunk of `height` levels holds at once across its
+    /// stores: a scan's sources ([`Self::sources_most`]), and each compaction's inputs
+    /// ([`Self::inputs_most`]), at most two on the shard without workers (the root's and one
+    /// below, `Trunk::step_inline`), or one on each of `workers`.
+    pub fn cursors_most(&self, height: usize, workers: usize) -> usize {
+        let compactions = if workers == 0 { 2 } else { workers };
+        self.sources_most(height)
+            .saturating_add(compactions.saturating_mul(self.inputs_most()))
+    }
+
+    /// The most builders an engine holds at once across its stores: the shard's packing's, and
+    /// each compaction's two, the part it builds and the one whose filter it is still writing
+    /// (`Compaction::step`), at most two compactions on the shard without workers, or one on each
+    /// of `workers`.
+    pub fn builders_most(workers: usize) -> usize {
+        let compactions = if workers == 0 { 2 } else { workers };
+        compactions.saturating_mul(2).saturating_add(1)
+    }
+
+    /// The most entries a builder's branch holds: a memtable's packing, at most
+    /// `memtable_entries`; a settle's part and a pivot's compaction, at most a leaf's limit
+    /// ([`Self::leaf_limit`]), as a compaction's inputs are bounded (`Trunk::plan_compact`).
+    pub fn built_most(&self, memtable_entries: u64) -> u64 {
+        self.leaf_limit().max(memtable_entries)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Pivot {
     key: Vec<u8>,
@@ -259,6 +316,126 @@ impl Pending {
             .map(|b| b.count)
             .fold(0, u64::saturating_add)
     }
+
+    /// The branch that holds `key`'s range, if the packing wrote one there.
+    fn part(&self, key: &[u8]) -> Option<&Branch> {
+        let at = self
+            .cuts
+            .get(1..)
+            .map_or(0, |cuts| cuts.partition_point(|c| c.as_slice() <= key));
+        let i = self.parts.partition_point(|(j, _)| *j < at);
+        self.parts.get(i).filter(|(j, _)| *j == at).map(|(_, b)| b)
+    }
+}
+
+/// An in-flight bundle, its node's list oldest first: the branches a parent's flush landed, each
+/// over the node's whole range; or, at the root, a memtable packed in parts at the root's pivot
+/// keys as they were (`cuts`), each part over its cut's range alone, as [`Pending`] holds them. A
+/// read or a compaction of a range takes only the branches whose ranges meet it
+/// ([`Self::within`]): of a packing's parts, one, since a pivot key once made is never taken out
+/// and every range a pivot or a scan's segment covers lies within one cut's.
+#[derive(Clone, Debug, Default)]
+struct InFlight {
+    branches: Vec<Branch>,
+    /// A packing's cut keys and each part's index into them, as [`Pending`] keeps them; empty for
+    /// a flush's branch and for a packing of one part over every key.
+    cuts: Vec<Vec<u8>>,
+    at: Vec<usize>,
+}
+
+impl InFlight {
+    /// A flush's branch, over the node's whole range.
+    fn flushed(b: Branch) -> Self {
+        Self {
+            branches: vec![b],
+            cuts: Vec::new(),
+            at: Vec::new(),
+        }
+    }
+
+    /// A packing's parts at its `cuts`.
+    fn packed(cuts: Vec<Vec<u8>>, parts: Vec<(usize, Branch)>) -> Self {
+        let (at, branches) = parts.into_iter().unzip();
+        Self { branches, cuts, at }
+    }
+
+    /// The branches whose ranges meet `[from, end)`, in the bundle's order.
+    fn within<'a>(
+        &'a self,
+        from: &'a [u8],
+        end: Option<&'a [u8]>,
+    ) -> impl DoubleEndedIterator<Item = &'a Branch> + Clone + 'a {
+        self.branches
+            .iter()
+            .enumerate()
+            .filter(move |&(i, _)| part_meets(&self.cuts, &self.at, i, from, end))
+            .map(|(_, b)| b)
+    }
+
+    /// The branches whose ranges hold `key`, in the bundle's order.
+    fn covering<'a>(&'a self, key: &'a [u8]) -> impl Iterator<Item = &'a Branch> + 'a {
+        self.branches
+            .iter()
+            .enumerate()
+            .filter(move |&(i, _)| part_holds(&self.cuts, &self.at, i, key))
+            .map(|(_, b)| b)
+    }
+
+    /// [`Self::covering`], to change.
+    fn covering_mut<'a>(&'a mut self, key: &'a [u8]) -> impl Iterator<Item = &'a mut Branch> + 'a {
+        let (cuts, at) = (&self.cuts, &self.at);
+        self.branches
+            .iter_mut()
+            .enumerate()
+            .filter(move |(i, _)| part_holds(cuts, at, *i, key))
+            .map(|(_, b)| b)
+    }
+}
+
+impl std::ops::Deref for InFlight {
+    type Target = [Branch];
+    fn deref(&self) -> &[Branch] {
+        &self.branches
+    }
+}
+
+impl<'a> IntoIterator for &'a InFlight {
+    type Item = &'a Branch;
+    type IntoIter = std::slice::Iter<'a, Branch>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.branches.iter()
+    }
+}
+
+/// The range of part `i` of a packing cut at `cuts`, each part at its index into them (`at`): from
+/// its cut key, or below every key for the first, up to the next cut key, or past every key for
+/// the last; every key for a branch with no cut.
+fn part_range<'a>(
+    cuts: &'a [Vec<u8>],
+    at: &[usize],
+    i: usize,
+) -> (Option<&'a [u8]>, Option<&'a [u8]>) {
+    let Some(&j) = at.get(i) else {
+        return (None, None);
+    };
+    let lo = if j == 0 {
+        None
+    } else {
+        cuts.get(j).map(Vec::as_slice)
+    };
+    (lo, cuts.get(j.saturating_add(1)).map(Vec::as_slice))
+}
+
+/// Whether part `i`'s range meets `[from, end)` ([`part_range`]).
+fn part_meets(cuts: &[Vec<u8>], at: &[usize], i: usize, from: &[u8], end: Option<&[u8]>) -> bool {
+    let (lo, hi) = part_range(cuts, at, i);
+    lo.is_none_or(|lo| end.is_none_or(|e| lo < e)) && hi.is_none_or(|hi| from < hi)
+}
+
+/// Whether part `i`'s range holds `key` ([`part_range`]).
+fn part_holds(cuts: &[Vec<u8>], at: &[usize], i: usize, key: &[u8]) -> bool {
+    let (lo, hi) = part_range(cuts, at, i);
+    lo.is_none_or(|lo| lo <= key) && hi.is_none_or(|hi| key < hi)
 }
 
 #[derive(Clone, Debug)]
@@ -266,7 +443,7 @@ struct Node {
     leaf: bool,
     pivots: Vec<Pivot>,
     /// Oldest first.
-    inflight: Vec<Vec<Branch>>,
+    inflight: Vec<InFlight>,
     /// The keys below this, if any bound them: the next node's first pivot.
     end: Option<Vec<u8>>,
     /// The settle or split this node waits to take ([`upkeep::Change`]).
@@ -358,6 +535,12 @@ pub struct TrunkStats {
     /// The most live in-flight bundles a node held for one of its pivots, as a flush landed
     /// them: at most `3 fanout + 1` ([`Trunk::takes_flush`]).
     pub inflight_most: u64,
+    /// The most entries a branch a compaction or a settle built held: at most a leaf's limit or
+    /// a memtable's entries, as a compaction's inputs are bounded (`plan_compact`).
+    pub compacted_most: u64,
+    /// The most inline compactions holding their inputs open at once: at most two, the root's
+    /// and one below (`step_inline`).
+    pub open_most: u64,
     /// Consolidations of every pivot of several sources finished: a drain's, or a quiet shard's
     /// its writes paid for (research/53 §11).
     pub whole_consolidations: u64,
@@ -496,6 +679,16 @@ pub struct Reuse {
     pub within: u64,
     pub waited_ns: u64,
     pub saved_ns: u64,
+}
+
+impl Reuse {
+    /// Adds `other`'s counts to these.
+    pub fn add(&mut self, other: Reuse) {
+        self.past = self.past.saturating_add(other.past);
+        self.within = self.within.saturating_add(other.within);
+        self.waited_ns = self.waited_ns.saturating_add(other.waited_ns);
+        self.saved_ns = self.saved_ns.saturating_add(other.saved_ns);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -733,10 +926,15 @@ impl Trunk {
 
     /// The end of pivot `i`'s range: the next pivot's key, or the node's end.
     fn pivot_end(node: &Node, i: usize) -> Option<Vec<u8>> {
+        Self::pivot_end_of(node, i).map(<[u8]>::to_vec)
+    }
+
+    /// [`Self::pivot_end`], borrowed.
+    fn pivot_end_of(node: &Node, i: usize) -> Option<&[u8]> {
         node.pivots
             .get(i.saturating_add(1))
-            .map(|p| p.key.clone())
-            .or_else(|| node.end.clone())
+            .map(|p| p.key.as_slice())
+            .or(node.end.as_deref())
     }
 
     /// The newest entry for `key` in the trunk: its operation and value into `value`.
@@ -795,7 +993,7 @@ impl Trunk {
                 .get(pivot.start..)
                 .unwrap_or_default()
                 .iter()
-                .flatten()
+                .flat_map(|f| f.covering(key))
                 .chain(pivot.bundle.branches.iter())
             {
                 touched ^= b.filter.touch(hash);
@@ -807,7 +1005,7 @@ impl Trunk {
                 .iter_mut()
                 .rev()
             {
-                for b in bundle.iter_mut() {
+                for b in bundle.covering_mut(key) {
                     b.probes = b.probes.saturating_add(1);
                     if let Some(op) = b.get_hashed_async(store, key, hash, value).await? {
                         return Ok(Some(op));
@@ -862,7 +1060,7 @@ impl Trunk {
                 .get(pivot.start..)
                 .unwrap_or_default()
                 .iter()
-                .flatten()
+                .flat_map(|f| f.covering(key))
                 .chain(pivot.bundle.branches.iter())
             {
                 touched ^= b.filter.touch(hash);
@@ -874,7 +1072,7 @@ impl Trunk {
                 .iter_mut()
                 .rev()
             {
-                for b in bundle.iter_mut() {
+                for b in bundle.covering_mut(key) {
                     b.probes = b.probes.saturating_add(1);
                     if let Some(op) = b.get_hashed(store, key, hash, value)? {
                         return Ok(Some(op));
@@ -992,11 +1190,13 @@ impl Trunk {
         sources.clear();
         end.clear();
         path.clear();
+        // Of each packing not yet in the tree, the part that holds `key`: the segment lies within
+        // one cut's range, since every key a packing was cut at is still a pivot's.
         sources.extend(
             self.pending
                 .iter()
                 .rev()
-                .flat_map(Pending::branches)
+                .filter_map(|p| p.part(key))
                 .map(Source::Branch),
         );
         let mut bound: Option<&[u8]> = None;
@@ -1019,7 +1219,7 @@ impl Trunk {
             }
             let before = sources.len();
             for bundle in node.inflight.get(pivot.start..).unwrap_or(&[]).iter().rev() {
-                sources.extend(bundle.iter().map(Source::Branch));
+                sources.extend(bundle.within(&pivot.key, pivot_end).map(Source::Branch));
             }
             // The pivot's bundle, a branch a source.
             sources.extend(pivot.bundle.branches().iter().map(Source::Branch));
@@ -1135,12 +1335,13 @@ impl Trunk {
             return (u64::MAX, u64::MAX);
         };
         let inflight = node.inflight.get(pivot.start..).unwrap_or(&[]);
+        let end = Self::pivot_end_of(node, step.pivot);
         size_of_branches(
             pivot
                 .bundle
                 .branches()
                 .iter()
-                .chain(inflight.iter().flatten()),
+                .chain(inflight.iter().flat_map(|f| f.within(&pivot.key, end))),
             extent_pages,
         )
     }
@@ -2212,7 +2413,7 @@ impl Trunk {
         if dead == 0 {
             return Ok(());
         }
-        let gone: Vec<Vec<Branch>> = node.inflight.drain(..dead).collect();
+        let gone: Vec<InFlight> = node.inflight.drain(..dead).collect();
         for p in &mut node.pivots {
             p.start = p.start.saturating_sub(dead);
         }
@@ -2409,7 +2610,7 @@ impl Trunk {
             m.pivots = m
                 .pivots
                 .saturating_add(records(n.pivots.capacity(), size_of::<Pivot>()))
-                .saturating_add(records(n.inflight.capacity(), size_of::<Vec<Branch>>()))
+                .saturating_add(records(n.inflight.capacity(), size_of::<InFlight>()))
                 .saturating_add(n.end.as_ref().map_or(0, Vec::capacity));
             for p in &n.pivots {
                 m.pivots = m.pivots.saturating_add(p.key.capacity());
@@ -2420,7 +2621,13 @@ impl Trunk {
             for f in &n.inflight {
                 m.branches = m
                     .branches
-                    .saturating_add(records(f.capacity(), size_of::<Branch>()));
+                    .saturating_add(records(f.branches.capacity(), size_of::<Branch>()));
+                m.pivots = f.cuts.iter().fold(
+                    m.pivots
+                        .saturating_add(records(f.cuts.capacity(), size_of::<Vec<u8>>()))
+                        .saturating_add(records(f.at.capacity(), size_of::<usize>())),
+                    |sum, c| sum.saturating_add(c.capacity()),
+                );
             }
         }
         for p in &self.pending {

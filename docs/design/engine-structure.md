@@ -593,15 +593,28 @@ counted budget; no task waits on another node's:
   alone for input and written it again, 78.8M of the 374.0M entries a 100M fill wrote, all in
   the fill (2026-10-15; research/57 §7). Such a packing keeps its pages in room lent by the
   shard's cache, adopted with its branches when they are placed and given back when they go in
-  flight, so a placed branch is cached where it was written, as a compaction's is. A compaction plans over the in-flight bundles up to `covered`, so later
-  ones land past it. Puts wait only when the root holds more than `fanout` uncompacted in-flight
+  flight, so a placed branch is cached where it was written, as a compaction's is. One that goes
+  in flight keeps its cuts, and a read or a compaction of a range takes only the parts whose
+  ranges meet it (`InFlight::within`): one, since a pivot key once made is never taken out, so
+  every range a pivot or a scan's segment covers lies within one cut's. A scan's path so meets one
+  branch a packing however many pivots the root has. A compaction plans over the in-flight
+  bundles up to `covered`, so later ones land past it. Puts wait only when the root holds more than `fanout` uncompacted in-flight
   bundles, the bound pending has now, so a read probes no more sources than today; this is the
   one stall left, which a node below reaches through its parents' held flushes (Flush, below). Root compactions free it, so they are first among ready tasks, and while a put
   or a pending branch waits, every ready task is admitted within the cores (`Pool::can_take`'s
   rule for a wait).
 - **Compaction**, one task per pivot with live in-flight bundles: it merges them, clipped to the
-  pivot's range, into one branch, on a worker or inline a budget at a time, and its apply puts
-  the branch at the front of the pivot bundle and moves the pivot's start to `covered`.
+  pivot's range, into one branch, on a worker or inline a budget at a time, and its apply puts the
+  branch at the front of the pivot bundle and moves the pivot's start to `covered`. It takes the
+  oldest of them while the entries of their pages in its range stay within a leaf's limit (`fanout`
+  memtables' entries), one at least, and the newer wait above its branch for the next compaction
+  (`Trunk::plan_compact`). Each input was built under the same bound or is a memtable's packing, so
+  every branch a compaction builds holds at most a leaf's limit whatever the keys, and its builder
+  is sized by the entries of its range, not by its inputs' whole counts, each input spanning the
+  node: before the bound, keys in order built branches of 68,184 entries where a leaf holds 15,152
+  (`tests/engine_memory.rs`, `TrunkStats::compacted_most`). Without workers the shard steps one
+  compaction of each pass at a time, the root's and one below, so two hold their inputs open at once
+  (`Trunk::step_inline`, `TrunkStats::open_most`).
 - **Timed where it runs.** A compaction's merging is timed where it runs, an inline task's steps on
   the shard or a worker's job on the worker, and its merged units are counted, so a compacted key's
   measured cost, which seek-paid consolidations are priced at, covers every compaction. Timing the
@@ -633,9 +646,15 @@ counted budget; no task waits on another node's:
 - **Exclusivity, not discard.** A node with a structural task out takes no flush and plans no
   compaction until it applies, so no work is thrown away and no branch is shared; every other
   node proceeds.
-- **Bounds.** At most one compaction and one flush per pivot and one structural task per node:
-  the queue is bounded by the trunk's size, and a step ends on its budget. The debt is the known
-  sum of the queued tasks, so pacing no longer meets work planned only once a chain reaches it.
+- **Bounds.** At most one compaction and one flush per pivot and one structural task per node: the
+  queue is bounded by the trunk's size, and a step ends on its budget. The debt is the known sum of
+  the queued tasks, so pacing no longer meets work planned only once a chain reaches it. What is out
+  at once the fanout `F` and the trunk's height `h` bound: a read's path opens at most `(2F + 1) +
+  (h - 1)(4F + 2)` sources (the root's packings and live bundles, at most `F`, and its pivot's
+  bundle; below, a pivot's live bundles and its bundle), a compaction merges at most `4F + 2`, the
+  shard holds two compactions' and a worker one, each building a branch of at most a leaf's limit,
+  and the shard's packing builds one more (`TrunkConfig::cursors_most`, `builders_most`,
+  `built_most`); `shard_db::pooled_bytes` states their bytes.
 
 Reads are unchanged: every apply runs on the shard's thread between steps, so a read sees each
 node either before or after a task, never half of one. A checkpoint saves the nodes as they are;

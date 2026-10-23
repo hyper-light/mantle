@@ -401,6 +401,11 @@ impl Compaction {
         self.merge.opening
     }
 
+    /// Whether it holds any input open: a cursor's span and pages, kept until it finishes.
+    pub(crate) fn holds_inputs(&self) -> bool {
+        !self.merge.cursors.is_empty()
+    }
+
     /// Whether the last step stopped for a page still being read.
     pub fn waiting(&self) -> bool {
         self.waiting

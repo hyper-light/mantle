@@ -183,7 +183,7 @@ impl Trunk {
     }
 
     /// Appends `bundle` to node `n`'s in-flight list, counting the node among those holding one.
-    fn push_inflight(&mut self, n: usize, bundle: Vec<Branch>) -> Result<(), Error> {
+    fn push_inflight(&mut self, n: usize, bundle: super::InFlight) -> Result<(), Error> {
         let node = self.node_mut(n)?;
         let was_empty = node.inflight.is_empty();
         node.inflight.push(bundle);
@@ -397,8 +397,7 @@ impl Trunk {
                 if let Some(kept) = p.kept {
                     store.unlend_pages(*kept);
                 }
-                let bundle = p.parts.into_iter().map(|(_, b)| b).collect();
-                self.push_inflight(root, bundle)?;
+                self.push_inflight(root, super::InFlight::packed(p.cuts, p.parts))?;
             }
         }
         self.node_mut(root)?.received = true;
@@ -567,7 +566,7 @@ impl Trunk {
         let live = node.inflight.get(pivot.start..).unwrap_or(&[]);
         let live_branches = live
             .iter()
-            .map(Vec::len)
+            .map(|b| b.len())
             .fold(0usize, usize::saturating_add);
         let live_entries = live
             .iter()
@@ -761,43 +760,67 @@ impl Trunk {
         let t = self.timed.then(std::time::Instant::now);
         let node = self.node(n)?;
         let pivot = node.pivots.get(i).ok_or(corrupt())?;
-        let (start, covered) = (pivot.start, node.inflight.len());
-        let live = node.inflight.get(start..covered).ok_or(corrupt())?;
         let (from, end) = (pivot.key.clone(), Self::pivot_end(node, i));
-        let units = live
-            .iter()
-            .flatten()
+        // Its live in-flight bundles, oldest first, while the entries of their pages in its range
+        // stay within a leaf's limit, one bundle at least; the newer wait for its next compaction,
+        // above the branch this one makes. Each input was built under the same bound, or is a
+        // memtable's packing, so every branch a compaction builds holds at most a leaf's limit or
+        // a memtable's entries, whatever the keys, and so does its builder
+        // (`shard_db::pooled_bytes`). The entries of those pages bound what the merge writes, so
+        // its builder is sized by them (its `per`), not by its inputs' whole counts, each input
+        // spanning the node: one branch, never split, since the merge writes no more.
+        let pooled = self.pool.is_some();
+        let limit = self.leaf_limit();
+        let start = pivot.start;
+        let range = (pivot.key.as_slice(), Self::pivot_end_of(node, i));
+        let mut covered = start;
+        let mut held = 0u64;
+        let mut pages = 0usize;
+        let mut reuse = Reuse::default();
+        for bundle in node.inflight.get(start..).unwrap_or(&[]) {
+            let (mut keys, mut read, mut more) = (0u64, 0usize, Reuse::default());
+            for b in bundle.within(range.0, range.1) {
+                let (p, k) = b.merge_size(range.0, range.1);
+                keys = keys.saturating_add(k);
+                read = read.saturating_add(p);
+                if pooled {
+                    more.add(reuse_of(b, p, self.taken, self.reuse_window));
+                }
+            }
+            if covered > start && held.saturating_add(keys) > limit {
+                break;
+            }
+            held = held.saturating_add(keys);
+            pages = pages.saturating_add(read);
+            reuse.add(more);
+            covered = covered.saturating_add(1);
+        }
+        let live = node.inflight.get(start..covered).ok_or(corrupt())?;
+        let inputs = merged_inputs(live, range.0, range.1, None);
+        let units = inputs
+            .clone()
             .map(|b| b.count)
             .fold(0u64, u64::saturating_add);
         // Newest first, the order a merge takes.
-        let mut reuse = Reuse::default();
-        let run = if self.pool.is_some() {
-            let pages;
-            (pages, reuse) = read_pages(
-                live.iter().flatten(),
-                &from,
-                end.as_deref(),
-                self.taken,
-                self.reuse_window,
-            );
+        let run = if pooled {
             Running::Remote {
                 grant: Vec::new(),
                 state: State::Ready(Box::new(Task {
-                    inputs: live.iter().rev().flatten().map(Branch::for_merge).collect(),
+                    inputs: inputs.map(Branch::for_merge).collect(),
                     from,
                     end,
                     drop_tombstones: false,
-                    per: u64::MAX,
+                    per: held.max(1),
                     pages,
                 })),
             }
         } else {
             Running::Inline(Box::new(Compaction::prepare(
-                live.iter().rev().flatten(),
+                inputs,
                 from,
                 end,
                 false,
-                u64::MAX,
+                held.max(1),
             )))
         };
         let key = pivot.key.clone();
@@ -848,7 +871,7 @@ impl Trunk {
         // Oldest first into the child's in-flight list: the bundle is newest first.
         let received = !bundle.is_empty();
         for b in bundle.into_iter().rev() {
-            self.push_inflight(child, vec![b])?;
+            self.push_inflight(child, super::InFlight::flushed(b))?;
         }
         if received {
             self.node_mut(child)?.received = true;
@@ -963,11 +986,9 @@ impl Trunk {
         Ok(self.leaf_parts(self.leaf_settle(n)?.count))
     }
 
-    /// The entries a leaf holds before it splits: `fanout` memtables' (SplinterDB's
-    /// `leaf_might_need_to_split`, `incorporation_size_kv_bytes * target_fanout`).
+    /// The entries a leaf holds before it splits ([`TrunkConfig::leaf_limit`]).
     pub(super) fn leaf_limit(&self) -> u64 {
-        let fanout = u64::try_from(self.config.fanout).unwrap_or(u64::MAX);
-        self.config.leaf_entries.saturating_mul(fanout)
+        self.config.leaf_limit()
     }
 
     /// The leaves a settle of `count` entries makes: one within [`Self::leaf_limit`], else
@@ -1006,7 +1027,12 @@ impl Trunk {
         // ([`Self::flush_due`]), so the range it takes is all there is until it applies.
         let (start, covered) = (pivot.start, node.inflight.len());
         let live = node.inflight.get(start..covered).ok_or(corrupt())?;
-        let inputs = live.iter().rev().flatten().chain(pivot.bundle.branches());
+        let inputs = merged_inputs(
+            live,
+            &pivot.key,
+            node.end.as_deref(),
+            Some(pivot.bundle.branches()),
+        );
         let (from, end) = (pivot.key.clone(), node.end.clone());
         let extents: Vec<u64> = pivot
             .bundle
@@ -1088,6 +1114,15 @@ impl Trunk {
         let root = self.root;
         // Two passes, the root's tasks first: they free room for pending branches.
         'passes: for roots in [true, false] {
+            // One task of a pass holds its inputs open at a time: one holding none opens only
+            // while no other of its pass holds any, so the shard holds two compactions' cursors
+            // and builders at most, the root's and one below (`shard_db::pooled_bytes`). Tasks
+            // step in the order they were planned, so the one holding them is the first of its
+            // pass, unless a lack of room for its output passed it over.
+            let mut holding = self.tasks.iter().any(|t| {
+                (t.node == root) == roots
+                    && matches!(&t.run, Running::Inline(c) if c.holds_inputs())
+            });
             for at in 0..self.tasks.len() {
                 if self.tasks.get(at).is_none_or(|t| (t.node == root) != roots) {
                     continue;
@@ -1102,37 +1137,30 @@ impl Trunk {
                 let Running::Inline(c) = &mut task.run else {
                     continue;
                 };
+                let opens = !c.holds_inputs();
+                if opens && holding {
+                    continue;
+                }
                 let node = self.nodes.get(task.node).ok_or(corrupt())?;
                 // A task about to write takes its output's room first, as a worker's job takes
                 // its grant (`dispatch_tasks`): the inputs' extents and one more a part, the
                 // file grown in place where the shard may, else asked of the shard's growth and
                 // the task stepped once it has grown.
                 if c.opening() && store.segments().is_some() {
-                    let inputs: Vec<&Branch> = match &task.what {
-                        What::Compact { start, covered, .. } => node
-                            .inflight
-                            .get(*start..*covered)
-                            .ok_or(corrupt())?
-                            .iter()
-                            .flatten()
-                            .collect(),
-                        What::Settle { start, covered, .. } => node
-                            .inflight
-                            .get(*start..*covered)
-                            .ok_or(corrupt())?
-                            .iter()
-                            .rev()
-                            .flatten()
-                            .chain(node.pivots.first().ok_or(corrupt())?.bundle.branches())
-                            .collect(),
-                    };
-                    let extents = inputs
-                        .iter()
-                        .map(|b| u64::try_from(b.extents.len()).unwrap_or(u64::MAX))
-                        .fold(0u64, u64::saturating_add);
+                    let (extents, entries) = task_inputs(node, &task.what)?.fold(
+                        (0u64, 0u64),
+                        |(extents, entries), b| {
+                            (
+                                extents.saturating_add(
+                                    u64::try_from(b.extents.len()).unwrap_or(u64::MAX),
+                                ),
+                                entries.saturating_add(b.count),
+                            )
+                        },
+                    );
                     let parts = match &task.what {
                         What::Compact { .. } => 1,
-                        What::Settle { .. } => self.leaf_parts(entries_of_refs(&inputs)),
+                        What::Settle { .. } => self.leaf_parts(entries),
                     };
                     let asked = extents.saturating_add(parts).saturating_add(1);
                     if store.capacity() < asked {
@@ -1155,17 +1183,7 @@ impl Trunk {
                 c.set_yield(yield_io);
                 let left = budget.saturating_sub(used);
                 let merging = std::time::Instant::now();
-                let step = match &task.what {
-                    What::Compact { start, covered, .. } => {
-                        let live = node.inflight.get(*start..*covered).ok_or(corrupt())?;
-                        c.step(store, live.iter().rev().flatten(), left)
-                    }
-                    What::Settle { start, covered, .. } => {
-                        let live = node.inflight.get(*start..*covered).ok_or(corrupt())?;
-                        let bundle = node.pivots.first().ok_or(corrupt())?.bundle.branches();
-                        c.step(store, live.iter().rev().flatten().chain(bundle), left)
-                    }
-                };
+                let step = c.step(store, task_inputs(node, &task.what)?, left);
                 merge_ns = merge_ns.saturating_add(ns_since(Some(merging)));
                 let spent = match step {
                     Ok(spent) => spent,
@@ -1187,6 +1205,16 @@ impl Trunk {
                 };
                 used = used.saturating_add(spent);
                 self.io_waiting |= c.waiting();
+                holding = c.holds_inputs() && !c.is_done();
+                if opens && holding {
+                    self.note_opened();
+                }
+                let Some(task) = self.tasks.get_mut(at) else {
+                    break 'passes;
+                };
+                let Running::Inline(c) = &mut task.run else {
+                    continue;
+                };
                 if c.is_done() {
                     let Running::Inline(c) =
                         std::mem::replace(&mut task.run, Running::Finished(Vec::new()))
@@ -1208,6 +1236,19 @@ impl Trunk {
         }
         self.note_merge(merge_ns, used);
         Ok(used)
+    }
+
+    /// A task opened its inputs: the most holding theirs at once, counted.
+    fn note_opened(&mut self) {
+        let open = self
+            .tasks
+            .iter()
+            .filter(|t| matches!(&t.run, Running::Inline(c) if c.holds_inputs() && !c.is_done()))
+            .count();
+        self.stats.open_most = self
+            .stats
+            .open_most
+            .max(u64::try_from(open).unwrap_or(u64::MAX));
     }
 
     /// Applies every finished task, in plan order: each changes only its own node (and, for a
@@ -1259,6 +1300,8 @@ impl Trunk {
             }
             _ => return Err(corrupt()),
         };
+        let built = parts.iter().map(|(_, b)| b.count).max().unwrap_or(0);
+        self.stats.compacted_most = self.stats.compacted_most.max(built);
         match what {
             What::Compact {
                 key,
@@ -1271,6 +1314,11 @@ impl Trunk {
                     .iter()
                     .position(|p| p.key == key && p.start == start)
                     .ok_or(corrupt())?;
+                // One branch at most: a pivot's compaction never splits (`plan_compact`), and one
+                // that made more would lose the rest here.
+                if parts.len() > 1 {
+                    return Err(corrupt());
+                }
                 let merged = parts.into_iter().next().map(|(_, b)| b);
                 self.apply_pivot(n, i, merged, covered)?;
                 self.drop_dead(store, n)?;
@@ -1664,18 +1712,67 @@ impl Trunk {
 }
 
 /// The entries of `branches`, an upper bound on their keys.
-fn entries_of_refs(branches: &[&Branch]) -> u64 {
+fn entries(branches: &[Branch]) -> u64 {
     branches
         .iter()
         .map(|b| b.count)
         .fold(0u64, u64::saturating_add)
 }
 
-fn entries(branches: &[Branch]) -> u64 {
-    branches
-        .iter()
-        .map(|b| b.count)
-        .fold(0u64, u64::saturating_add)
+/// The inputs task `what` of `node` merges ([`merged_inputs`]): a pivot's compaction over the
+/// pivot's range, a leaf's settle over the leaf's with its bundle.
+fn task_inputs<'a>(
+    node: &'a super::Node,
+    what: &'a What,
+) -> Result<impl Iterator<Item = &'a Branch> + Clone + 'a, Error> {
+    let (start, covered, from, end, bundle) = match what {
+        What::Compact {
+            key,
+            start,
+            covered,
+        } => {
+            let i = node
+                .pivots
+                .iter()
+                .position(|p| p.key == *key)
+                .ok_or(corrupt())?;
+            (
+                *start,
+                *covered,
+                key.as_slice(),
+                Trunk::pivot_end_of(node, i),
+                None,
+            )
+        }
+        What::Settle { start, covered, .. } => {
+            let pivot = node.pivots.first().ok_or(corrupt())?;
+            (
+                *start,
+                *covered,
+                pivot.key.as_slice(),
+                node.end.as_deref(),
+                Some(pivot.bundle.branches()),
+            )
+        }
+    };
+    let live = node.inflight.get(start..covered).ok_or(corrupt())?;
+    Ok(merged_inputs(live, from, end, bundle))
+}
+
+/// The branches a compaction of `[from, end)` over in-flight bundles `live` merges, newest first,
+/// and for a leaf's settle the leaf's `bundle` after them: of a packing's parts, only those whose
+/// ranges meet it ([`super::InFlight::within`]). The same at a task's plan and at each of its
+/// steps, which a compaction checks.
+fn merged_inputs<'a>(
+    live: &'a [super::InFlight],
+    from: &'a [u8],
+    end: Option<&'a [u8]>,
+    bundle: Option<&'a [Branch]>,
+) -> impl Iterator<Item = &'a Branch> + Clone + 'a {
+    live.iter()
+        .rev()
+        .flat_map(move |f| f.within(from, end))
+        .chain(bundle.into_iter().flatten())
 }
 
 /// The pages a merge of `[from, end)` reads from `inputs` at most, each one's
@@ -1694,21 +1791,29 @@ fn read_pages<'a>(
     for b in inputs {
         let read = b.pages_between(from, end);
         pages = pages.saturating_add(read);
-        // A branch loaded at open has no stamp: its age is unknown, so no window holds it.
-        let age = if b.taken == 0 {
-            u64::MAX
-        } else {
-            taken.saturating_sub(b.taken)
-        };
-        if age >= window.0 {
-            let read = u64::try_from(read).unwrap_or(u64::MAX);
-            reuse.past = reuse.past.saturating_add(read);
-            if age < window.1 {
-                reuse.within = reuse.within.saturating_add(read);
-            }
-        }
+        reuse.add(reuse_of(b, read, taken, window));
     }
     (pages, reuse)
+}
+
+/// What branch `b`'s `read` pages add to the kernel's page cache's counts ([`Reuse`]): by the
+/// extents taken since its branch, as of `taken`, against `window`.
+fn reuse_of(b: &Branch, read: usize, taken: u64, window: (u64, u64)) -> Reuse {
+    let mut reuse = Reuse::default();
+    // A branch loaded at open has no stamp: its age is unknown, so no window holds it.
+    let age = if b.taken == 0 {
+        u64::MAX
+    } else {
+        taken.saturating_sub(b.taken)
+    };
+    if age >= window.0 {
+        let read = u64::try_from(read).unwrap_or(u64::MAX);
+        reuse.past = read;
+        if age < window.1 {
+            reuse.within = read;
+        }
+    }
+    reuse
 }
 
 #[cfg(test)]

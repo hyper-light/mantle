@@ -769,18 +769,21 @@ pub fn bounded_bytes(config: &Config, mem_limit: usize) -> Option<u64> {
     memtables.checked_add(store)?.checked_add(allocator)
 }
 
-/// The most bytes an engine's store keeps in its pools, at the pages and extents of `config`, from
-/// the most of each pooled kind it ever had out at once (`peaks`): each extent buffer (a span's, a
-/// run's, an answered write's), each page buffer (a cursor's leaf, key and value copy, a point
-/// read's), each span's list of reads in flight ([`crate::store::span_reads_bytes`], the device's
-/// issuer taking `batches` reads at once), and each builder's working lists, at most a builder's
-/// whole for branches of `entries` entries of keys at most `key` bytes, its range filter keeping
-/// `range_bits` bits a key ([`crate::branch::builder_bytes`]). The pools keep no more than was
-/// ever out at once; how much was out the trunk's in-flight bundles set, measured, not bounded
-/// by rule yet (node.md §1.4).
+/// The most bytes an engine's stores hold in their pools and builders beyond what its
+/// configuration's buffers take ([`bounded_bytes`]), at the pages and extents of `config`: at most
+/// `cursors` cursors at once, each an extent buffer, its span's list of reads in flight, its
+/// three page buffers and a page the span may hold ([`crate::branch::cursor_bytes`], the device's
+/// issuer taking `batches` reads at once), and at most `builders` builders at once, each building a
+/// branch of at most `entries` entries of keys at most `key` bytes, its range filter keeping
+/// `range_bits` bits a key ([`crate::branch::builder_bytes`]: its run, its pages, its working
+/// lists, its filter and its tries). The pools keep no more than was ever out at once, and the
+/// trunk bounds what is out at once by its fanout and its height
+/// ([`crate::trunk::TrunkConfig::cursors_most`], [`crate::trunk::TrunkConfig::builders_most`],
+/// [`crate::trunk::TrunkConfig::built_most`]).
 pub fn pooled_bytes(
     config: &Config,
-    peaks: crate::store::PoolPeaks,
+    cursors: usize,
+    builders: usize,
     key: usize,
     entries: u64,
     batches: usize,
@@ -789,6 +792,7 @@ pub fn pooled_bytes(
     let bytes = |n: usize| u64::try_from(n).ok();
     let page = bytes(config.page_size)?;
     let extent = page.checked_mul(u64::from(config.extent_pages))?;
+    let cursor = crate::branch::cursor_bytes(config.page_size, config.extent_pages, batches)?;
     let builder = crate::branch::builder_bytes(
         crate::store::page::capacity(config.page_size),
         usize::try_from(extent).ok()?,
@@ -796,13 +800,9 @@ pub fn pooled_bytes(
         entries,
         range_bits,
     )?;
-    bytes(peaks.buffers)?
-        .checked_mul(extent)?
-        .checked_add(bytes(peaks.pages)?.checked_mul(page)?)?
-        .checked_add(
-            bytes(peaks.spans)?.checked_mul(bytes(crate::store::span_reads_bytes(batches)?)?)?,
-        )?
-        .checked_add(bytes(peaks.lists)?.checked_mul(builder)?)
+    bytes(cursors)?
+        .checked_mul(cursor)?
+        .checked_add(bytes(builders)?.checked_mul(builder)?)
 }
 
 impl<F: BlockFile> ShardDb<F> {

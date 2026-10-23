@@ -1650,16 +1650,22 @@ impl Branch {
             .ok_or(corrupt(Malformed::CountMismatch))
     }
 
-    /// The pages a merge of `[from, end)` writes from this branch, at most: the tree's pages from
-    /// the leaf `from` falls in to the one `end` does (the last without an end), index pages
-    /// between them included, since keys kept in order pack into no more leaves than held them
-    /// (a page's entries fit again once any are dropped, so filling each page in turn is
-    /// optimal); a part-filled index page at each level above the leaves, which an output however
-    /// small has of its own; and the trailer's pages (filter, entry counts, leaf index, range
-    /// filter) in the share of the keys or of the pages the range holds, whichever is larger,
-    /// since its filters grow with keys and its index with leaves, rounded up, and one more for
-    /// where the trailer's sections fall.
+    /// The pages a merge of `[from, end)` writes from this branch, at most ([`Self::merge_size`]).
     pub fn pages_between(&self, from: &[u8], end: Option<&[u8]>) -> usize {
+        self.merge_size(from, end).0
+    }
+
+    /// What a merge of `[from, end)` takes from this branch at most: the pages it writes, and
+    /// the entries of the pages the range falls in, which hold every entry the branch has in it.
+    /// The pages: the tree's pages from the leaf `from` falls in to the one `end` does (the last
+    /// without an end), index pages between them included, since keys kept in order pack into no
+    /// more leaves than held them (a page's entries fit again once any are dropped, so filling
+    /// each page in turn is optimal); a part-filled index page at each level above the leaves,
+    /// which an output however small has of its own; and the trailer's pages (filter, entry
+    /// counts, leaf index, range filter) in the share of the keys or of the pages the range holds,
+    /// whichever is larger, since its filters grow with keys and its index with leaves, rounded
+    /// up, and one more for where the trailer's sections fall.
+    pub fn merge_size(&self, from: &[u8], end: Option<&[u8]>) -> (usize, u64) {
         let total = self.counts.len();
         let page = |p: Result<u32, Error>| p.ok().and_then(|p| usize::try_from(p).ok());
         let first = page(self.leaf_of(from)).unwrap_or(0);
@@ -1684,9 +1690,11 @@ impl Branch {
             u64::try_from(tree).unwrap_or(u64::MAX),
             u64::try_from(total).unwrap_or(u64::MAX),
         ));
-        tree.saturating_add(usize::from(self.height).saturating_sub(1))
+        let pages = tree
+            .saturating_add(usize::from(self.height).saturating_sub(1))
             .saturating_add(usize::try_from(trailer).unwrap_or(usize::MAX))
-            .saturating_add(1)
+            .saturating_add(1);
+        (pages, keys)
     }
 
     /// The address of page `page_no`, counted through the branch's extents in order.

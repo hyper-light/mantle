@@ -74,16 +74,17 @@ leaf's limit of keys: the bound below the data that node.md §1.4 names open.
 
 ## 6. The release gate
 
-The build of these rules (engine-inflight 3be9ec0e, whose production code 1f951f7b keeps) against
-its base (engine-follow 3cc71771, the production code of 072fed1a), RocksDB and SplinterDB on the
-VM lane (Docker Desktop at 96 GiB, the carryover-balanced order of `run7.sh`), each figure its arm
-over the base in the same round, medians (`paired.py`):
+The build of these rules (engine-inflight 3be9ec0e, whose production code d9d74adf keeps) against
+its base (engine-follow 3cc71771, the production code of data-layer 0dac2e56), RocksDB and
+SplinterDB on the VM lane (Docker Desktop at 96 GiB, the carryover-balanced order of `run7.sh`),
+each figure its arm over the base in the same round, medians (`paired.py`):
 
 | keys | rounds | fill | gets | seeks |
 |---|---|---|---|---|
 | 1M | 4 | 1.012 | 1.066 | 0.999 |
 | 10M | 4 | 1.046 | 1.050 | 1.010 |
 | 100M | 16 | 1.011 | 0.978 | 0.978 |
+| 1B | 2 | 1.016 | 1.328 | 1.175 |
 
 At 100M the Mac ran other sessions' builds at a load of 20-30, and both arms' gets ran from 98
 thousand to 2.2 million a second with the engine in the same state in every case (178 kept
@@ -94,10 +95,23 @@ at once): a round's ratio ran from 0.43 to 22, so twelve rounds (R0 7530) joined
 thousand (711-760 thousand) against 943 thousand (919-993 thousand), 21% fewer, the compactions'
 outputs held to a leaf's limit and one of them opening its inputs at a time.
 
-Against RocksDB and SplinterDB, the gate's rounds (medians of each arm's figures):
+At 1B both arms ran machine-sized (`ShardDb::follow_machine`) in one cycle of two rounds (R0 7510,
+2026-10-23), and each of the four cases recovered and verified every key. The fill's ratios were
+0.992 and 1.040. Gets and seeks moved with the order more than with the arm: in each round the case
+run first read 36,376 to 38,524 keys a second and the case run second 18,539 to 26,693, so a
+round's gets ratio was 0.693 with the base first and 1.962 with this build first (seeks 0.870 and
+1.479). The order balances that; each arm's cases, first and second, were 36,376 and 26,693 gets a
+second here against 38,524 and 18,539 for the base.
+
+Against RocksDB and SplinterDB, the gate's rounds (medians of each arm's figures); at 1B their
+latest cases on the same VM (RocksDB R0 7071 and 7121, SplinterDB R0 7131, 2026-10-22), each at a
+fixed 32 GiB cache, against this build machine-sized:
 
 | keys | over SplinterDB, fill / gets / seeks | over RocksDB, fill / gets / seeks |
 |---|---|---|
 | 1M | 4.74 / 2.44 / 3.56 | 6.59 / 6.94 / 5.69 |
 | 10M | 4.12 / 2.96 / 4.56 | 5.00 / 10.02 / 7.92 |
 | 100M | 3.41 / 3.52 / 11.54 | 4.64 / 4.87 / 7.91 |
+| 1B | 3.73 / 2.06 / 10.13 | 3.96 / 0.90 / 2.27 |
+
+At 1B the gets stay below RocksDB's, as the base's did (0.82 of them at its median).

@@ -359,7 +359,10 @@ impl Level {
     }
 
     /// Adds `key`'s label at depth `d`, the first of a new node when `first`, with `value` when
-    /// the label ends the key.
+    /// the label ends the key. Inlined, as `TrieBuilder::level` and `Packed::push` are: out of
+    /// line, the three calls took 77 of a range filter's 412 instructions a key to build
+    /// (research/67 §7).
+    #[inline(always)]
     fn push(&mut self, key: &[u8], d: usize, first: bool, value: u32) -> Result<(), Error> {
         let last = d.saturating_add(1) == key.len();
         self.labels.push(key.get(d).copied().unwrap_or(0));
@@ -474,6 +477,7 @@ impl TrieBuilder {
     }
 
     /// Level `d`, the levels down to it in use.
+    #[inline(always)]
     fn level(&mut self, d: usize) -> Result<&mut Level, Error> {
         while self.depth <= d {
             if self.levels.len() <= self.depth {

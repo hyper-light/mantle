@@ -76,7 +76,10 @@ impl Packed {
         Ok(())
     }
 
-    /// Appends `v`, which must fit the width.
+    /// Appends `v`, which must fit the width. Written into the words in place, as a builder
+    /// pushes a value a key: sizing the words and placing the value by its index cost a range
+    /// filter's build 18 instructions a key more (research/67 §7).
+    #[inline(always)]
     pub fn push(&mut self, v: u32) -> Result<(), Error> {
         if width_of(v) > self.width {
             return Err(Error::InvalidArgument {
@@ -84,13 +87,24 @@ impl Packed {
             });
         }
         let len = self.len.checked_add(1).ok_or(corrupt())?;
-        // Words held are always those `len` values take, and a value of at most 32 bits takes
-        // at most one word past them.
-        if self.words.len() < self.words_for(len).ok_or(corrupt())? {
-            self.words.push(0);
+        // Words held are always those `len` values take: a value starting a word starts one, and
+        // one past the last word's bits ends in one more, at most 32 bits wide.
+        let w = self.width as usize;
+        let bit = self.len.checked_mul(w).ok_or(corrupt())?;
+        let off = bit % 64;
+        let v = u64::from(v);
+        if off == 0 {
+            if w > 0 {
+                self.words.push(v);
+            }
+        } else {
+            let last = self.words.last_mut().ok_or(corrupt())?;
+            *last |= v << off;
+            if off.saturating_add(w) > 64 {
+                self.words.push(v >> 64usize.saturating_sub(off));
+            }
         }
         self.len = len;
-        self.put(len.saturating_sub(1), v);
         Ok(())
     }
 
@@ -129,22 +143,6 @@ impl Packed {
         }
         self.len = len;
         Ok(())
-    }
-
-    /// Writes value `i`'s bits, all clear before.
-    fn put(&mut self, i: usize, v: u32) {
-        let w = self.width as usize;
-        let Some(bit) = i.checked_mul(w) else { return };
-        let (word, off) = (bit / 64, bit % 64);
-        let v = u64::from(v);
-        if let Some(x) = self.words.get_mut(word) {
-            *x |= v << off;
-        }
-        if off.saturating_add(w) > 64
-            && let Some(x) = self.words.get_mut(word.saturating_add(1))
-        {
-            *x |= v >> (64usize.saturating_sub(off));
-        }
     }
 
     /// Value `i`.

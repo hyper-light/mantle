@@ -563,6 +563,22 @@ struct Gain {
     bytes: usize,
 }
 
+/// The budget a look at the machine leaves a shard whose budget is `current` and which holds
+/// `held`, the machine's room setting its target at `target`: the target when it is below what the
+/// shard holds, the machine needing memory back, or a tuning step or more from the budget; else
+/// the budget as it is. The shard's account and the machine's reading are taken a moment apart,
+/// and a budget that followed every difference between them gave its caches' memory back and took
+/// it fresh again at every look (docs/research/65 §9); the tuner moves memory by steps and makes
+/// no smaller change (research/36: Luo and Carey, PVLDB 2021 §5.4).
+fn follow_step(target: usize, current: usize, held: usize) -> usize {
+    let step = current.saturating_mul(TUNE_STEP_PERCENT) / 100;
+    if target < held || target.abs_diff(current) >= step {
+        target
+    } else {
+        current
+    }
+}
+
 /// Write memory's next share of `memory` against the page cache alone ([`tune4`] with no record
 /// cache, no kernel's share and no past steps).
 #[cfg(test)]
@@ -1415,9 +1431,11 @@ impl<F: BlockFile> ShardDb<F> {
         follow.last = Some((outside, now));
         follow.accepted = accepted;
         follow.cap = follow.bound.saturating_sub(own);
-        let budget = held
+        let target = held
             .saturating_add(free.checked_div(follow.shares).unwrap_or(0))
-            .saturating_sub(follow.grew_most)
+            .saturating_sub(follow.grew_most);
+        let current = self.memory.unwrap_or(target);
+        let budget = follow_step(target, current, held)
             .min(follow.cap)
             .max(floor);
         let Some(was) = self.memory.filter(|&m| m != budget) else {
@@ -5183,6 +5201,35 @@ mod tune_tests {
     }
 
     #[test]
+    fn a_followed_budget_moves_by_a_step_or_to_give_memory_back() {
+        let step = |current: usize| current * super::TUNE_STEP_PERCENT / 100;
+        let (budget, held) = (100 * MIB, 50 * MIB);
+        // Within a step either way: the budget stays.
+        assert_eq!(
+            super::follow_step(budget + step(budget) - 1, budget, held),
+            budget
+        );
+        assert_eq!(
+            super::follow_step(budget - step(budget) + 1, budget, held),
+            budget
+        );
+        // A step either way: to the target.
+        assert_eq!(
+            super::follow_step(budget + step(budget), budget, held),
+            budget + step(budget)
+        );
+        assert_eq!(
+            super::follow_step(budget - step(budget), budget, held),
+            budget - step(budget)
+        );
+        // Below what the shard holds: to the target at once, though within a step.
+        assert_eq!(super::follow_step(budget - 1, budget, budget), budget - 1);
+        // At the extremes nothing overflows.
+        assert_eq!(super::follow_step(usize::MAX, usize::MAX, 0), usize::MAX);
+        assert_eq!(super::follow_step(0, usize::MAX, 0), 0);
+    }
+
+    #[test]
     fn the_kernels_page_cache_takes_memory_the_engines_regions_save_least_with() {
         let m = 100 * MIB;
         // A fill with no gets: the page cache saved nothing, and the workers waited on reads a
@@ -5484,6 +5531,93 @@ mod kernel_share_tests {
             db.cache_share,
             db.records_share,
             db.trimming()
+        );
+    }
+}
+
+#[cfg(test)]
+mod follow_step_tests {
+    //! A budget that follows the machine moves by a tuning step at least (research/36), so the
+    //! moment between the shard's account and the machine's reading moves no memory; the machine
+    //! needing memory back moves it at once (docs/research/65 §9; the rule alone,
+    //! `follow_step`, in the tuner's tests).
+    use super::*;
+    use hyper_block::buf::Alignment;
+    use hyper_block::file::{CachingRequest, DeviceFile};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const STORE: Config = Config {
+        page_size: 4096,
+        extent_pages: 8,
+        max_extents: 1 << 16,
+    };
+    const TRUNK: TrunkConfig = TrunkConfig {
+        fanout: 4,
+        leaf_entries: 128,
+    };
+    const MEM: usize = 8 * 1024;
+    const BOUND: usize = 64 << 20;
+    static FREE: AtomicU64 = AtomicU64::new(0);
+
+    fn free() -> Option<u64> {
+        Some(FREE.load(Ordering::Relaxed))
+    }
+
+    /// A look at the machine with the room that sets the budget's target to `target`, as the
+    /// shard holds and has seen outside memory grow before the look: the budget it leaves, and
+    /// how much the outside memory the look itself saw grew past what the room assumed.
+    fn look(db: &mut ShardDb<DeviceFile>, target: usize) -> (usize, usize) {
+        let held = db.regions_held().saturating_add(db.kept_held());
+        let grew = db.follow.as_ref().unwrap().grew_most;
+        let room = target.saturating_add(grew).saturating_sub(held);
+        FREE.store(u64::try_from(room).unwrap(), Ordering::Relaxed);
+        db.look_machine();
+        let drift = db.follow.as_ref().unwrap().grew_most - grew;
+        (db.memory.unwrap(), drift)
+    }
+
+    #[test]
+    fn a_budget_that_follows_the_machine_moves_by_a_tuning_step_at_least() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = DeviceFile::open(
+            &dir.path().join("store"),
+            true,
+            CachingRequest::Buffered,
+            Alignment::new(4096).unwrap(),
+        )
+        .unwrap();
+        let mut db = ShardDb::create(file, STORE, MEM, TRUNK).unwrap();
+        FREE.store(1 << 40, Ordering::Relaxed);
+        db.follow(BOUND, 1, free).unwrap();
+        for k in 0..5_000u64 {
+            db.put(format!("k{k:08}").as_bytes(), &[7u8; 100]).unwrap();
+        }
+        // The process's memory outside the shard's account may grow between two looks by what a
+        // look allocates: a mebibyte past a step either way keeps every target clear of the
+        // step's edge.
+        let margin = 1 << 20;
+        let start = BOUND / 2;
+        let held = db.regions_held().saturating_add(db.kept_held());
+        assert!(start > held, "the shard holds {held}, past half its bound");
+        let (set, drift) = look(&mut db, start);
+        assert_eq!(set + drift, start, "a move from the bound to half of it");
+        let step = set * TUNE_STEP_PERCENT / 100;
+        // Within a step either way: the budget stays.
+        assert_eq!(look(&mut db, set + step - margin).0, set);
+        assert_eq!(look(&mut db, set - step + margin).0, set);
+        // Past a step: it moves to its target.
+        let (up, drift) = look(&mut db, set + step + margin);
+        assert_eq!(up + drift, set + step + margin);
+        let step = up * TUNE_STEP_PERCENT / 100;
+        let (down, drift) = look(&mut db, up - step - margin);
+        assert_eq!(down + drift, up - step - margin);
+        // The machine needing memory back, its target below what the shard holds: the budget falls
+        // below it.
+        let held = db.regions_held().saturating_add(db.kept_held());
+        let (fell, _) = look(&mut db, held - margin);
+        assert!(
+            fell < held,
+            "the budget stayed at {fell}, the shard holding {held}"
         );
     }
 }

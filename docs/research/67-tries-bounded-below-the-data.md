@@ -300,4 +300,26 @@ figures; at 100M two of the final build's four cases drew the slow mode):
 | 10M | 3.82 / 3.15 / 4.40 | 5.07 / 9.85 / 7.39 |
 | 100M | 3.59 / 3.90 / 10.72 | 4.74 / 6.17 / 6.91 |
 
-*Open:* the final build at a billion rows (R0 7750).
+At a billion rows, machine-sized (`ShardDb::follow_machine`), the VM at 96 GiB, every case
+recovered and verified every key. 147f6149 in a cycle of two rounds (R0 7594) gave fill 0.977,
+gets 1.128 and seeks 1.142, and with the first round of R0 7590 (whose second ended when Docker
+stopped with kiln's restart) 1.031, 1.057 and 1.080. The final build ran two cycles with the arms'
+order swapped between them (R0 7750, 7758), so each arm held each of a batch's four places once:
+a batch's cases slow as it goes, the first after Docker starts filling 3.33-3.52 million keys a
+second and the later ones 2.93-3.18 but for one (2.46, below). Over the base, each round and the
+medians:
+
+| round (the final build's place) | fill | gets | seeks |
+|---|---|---|---|
+| r7751 (first) | 1.107 | 1.209 | 1.137 |
+| r7752 (fourth) | 0.815 | 1.194 | 1.899 |
+| r7759 (second) | 0.911 | 0.801 | 0.673 |
+| r7760 (third) | 1.026 | 1.080 | 1.075 |
+| median of four | 0.969 | 1.137 | 1.106 |
+
+The low fill is one case's: r7752's merges took 3,905 s of the workers' time for 3.93 billion
+entries written, with 29 write stalls, where the other seven cases' took 1,706-2,115 s (the final
+build) and 1,796-2,107 s (the base) for 4.06-4.10 billion, with 10-20 stalls. Against RocksDB
+and SplinterDB at a fixed 32 GiB cache (their latest 1B cases on the VM, R0 7071 and 7121, R0
+7131), the final build's medians are 3.71 / 0.82 / 1.82 and 3.49 / 1.87 / 8.13 fill / gets /
+seeks: its 1B gets stay below RocksDB's, as the base's do (0.76).

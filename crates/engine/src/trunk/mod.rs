@@ -807,8 +807,9 @@ enum State {
 /// descriptor names its range filter's bytes after its leaf index's. Format 4: its maplet
 /// hashes' bytes after those. Format 5: no pivot names a view. Format 6: no descriptor names
 /// maplet hashes. Format 7: a branch's range filter states the keys it filters and its reach, an
-/// entry that long holding every key starting with it; its leaf index's entries are pages
-/// doubled, a group of leaves' last with its low bit set; a trie's sparse levels are one sequence.
+/// entry cut short there, its suffix bits all set, holding every key starting with it; its leaf
+/// index's entries are pages doubled, a group of leaves' last with its low bit set; a trie's
+/// sparse levels are one sequence.
 const IMAGE_FORMAT: u8 = 7;
 /// The saved image header's magic: "mantleTK" in ASCII, little-endian.
 const IMAGE_MAGIC: u64 = u64::from_le_bytes(*b"mantleTK");

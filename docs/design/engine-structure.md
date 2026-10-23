@@ -396,9 +396,10 @@ bounded seek pass over a source with nothing in its range without reading it (cl
 - **SuRF-Real, exact about intervals, cut at a depth.** A key is cut one byte past what it shares
   with either neighbour, or `RANGE_FILTER_DEPTH` (16, measured) bytes past the bytes every key of
   its branch shares when that is shorter, and keeps the next `n` bits as the trie's value
-  (`RANGE_FILTER_BITS = 8`, measured). An entry as long as the depth past the shared bytes, the
+  (`RANGE_FILTER_BITS = 8`, measured). An entry cut short at the depth past the shared bytes, the
   filter's reach, stands for every key starting with it, as a Proteus prefix does, told by its
-  length alone, and the keys after it that start with it take none:
+  length and its suffix bits, all set (research/67 §6), and the keys after it that start with it
+  take none:
   a key adds at most the depth's labels, so keys in pairs sharing all but a last byte, SuRF's worst
   case, no longer take a label a byte (research/67). Each builder is told the shared bytes: a
   packing its memtable's, a compaction's part what its first key shares with the range's end.

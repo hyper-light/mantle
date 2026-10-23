@@ -13,12 +13,14 @@
 //!
 //! SuRF's cut has no bound: keys in pairs sharing all but a last byte make a label of each byte
 //! (Zhang et al., TODS 2020 §7, its worst case). So an entry runs at most `depth` bytes past the
-//! bytes every key of the run shares, which the builder is told, its reach, and one that long is
-//! whole: it stands for every key that starts with it, the filter telling it by its length alone,
-//! and the keys after it that start with it are its own and take no entry. The trie so holds at
-//! most `depth` levels below the shared bytes and `depth` labels a key (research/67). Cutting keys
-//! at one depth keeps their order, so the filter still lets through every range holding a key; it
-//! lets through more that hold none (Proteus, Knorr et al. SIGMOD 2022 §4.1-§4.2).
+//! bytes every key of the run shares, which the builder is told, its reach, and one cut short there
+//! is whole: it stands for every key that starts with it, and the keys after it that start with it
+//! are its own and take no entry. A whole entry is the reach long with every suffix bit set, so the
+//! filter tells it by its length and value: an entry whose own cut falls at the reach with those
+//! bits is read as whole too, the wider interval. The trie so holds at most `depth` levels below the
+//! shared bytes and `depth` labels a key (research/67). Cutting keys at one depth keeps their order,
+//! so the filter still lets through every range holding a key; it lets through more that hold none
+//! (Proteus, Knorr et al. SIGMOD 2022 §4.1-§4.2).
 
 use std::cmp::Ordering;
 use std::ops::ControlFlow;
@@ -71,6 +73,11 @@ fn suffix_bytes(s: u32, n: u32) -> ([u8; SUFFIX_BYTES], usize) {
     (out, len)
 }
 
+/// A value of `n` bits, every one set: a whole entry's.
+fn all_set(n: u32) -> u32 {
+    u32::MAX.checked_shr(32u32.saturating_sub(n)).unwrap_or(0)
+}
+
 /// Whether the least key of the entry `prefix`, `s` is below `end` (no end: always).
 fn starts_below(prefix: &[u8], s: u32, n: u32, end: Option<&[u8]>) -> bool {
     let Some(end) = end else { return true };
@@ -85,8 +92,8 @@ pub struct Surf {
     trie: Trie,
     /// Suffix bits an entry keeps.
     suffix: u32,
-    /// The longest an entry runs, the bytes every key shares and the depth past them: an entry
-    /// this long is whole, standing for every key that starts with it.
+    /// The bytes every key shares and the depth past them: an entry this long with every suffix
+    /// bit set is whole, standing for every key that starts with it.
     reach: usize,
     /// The keys filtered: an entry each, but one for all a whole entry holds.
     keys: u64,
@@ -100,12 +107,15 @@ impl Surf {
             return false;
         }
         let n = self.suffix;
+        let whole = all_set(n);
         let found = self.trie.seek(from, scratch, |len, v| {
             // A stored prefix of `from`: a whole one holds every key starting with it, `from`'s
             // place among them; another holds those at or past `from` whose bits after the prefix
             // are at least `from`'s.
             let p = from.get(..len).unwrap_or(&[]);
-            if len >= self.reach || (v >= suffix_of(from, len, n) && starts_below(p, v, n, end)) {
+            if (len == self.reach && v == whole)
+                || (v >= suffix_of(from, len, n) && starts_below(p, v, n, end))
+            {
                 ControlFlow::Break(())
             } else {
                 ControlFlow::Continue(())
@@ -115,7 +125,7 @@ impl Surf {
             ControlFlow::Break(()) => true,
             ControlFlow::Continue(None) => false,
             // A whole entry's interval starts at its prefix.
-            ControlFlow::Continue(Some(_)) if scratch.len() >= self.reach => {
+            ControlFlow::Continue(Some(v)) if scratch.len() == self.reach && v == whole => {
                 starts_below(scratch, 0, 0, end)
             }
             ControlFlow::Continue(Some(s)) => starts_below(scratch, s, n, end),
@@ -308,19 +318,20 @@ impl SurfBuilder {
     }
 
     /// Adds `key`, the held one, to the trie, cut one byte past what it shares with either
-    /// neighbour (`shared_after` with the next), or at the reach when that is shorter, whole. Two
-    /// neighbours cut so differ at the byte the whole keys first differ at, `shared_before`, which
-    /// is so what the trie is told they share: a key starting with a whole entry is the entry's
-    /// own, so one that is not parts from it within it.
+    /// neighbour (`shared_after` with the next), or at the reach when that is shorter, whole, its
+    /// suffix bits all set. Two neighbours cut so differ at the byte the whole keys first differ
+    /// at, `shared_before`, which is so what the trie is told they share: a key starting with a
+    /// whole entry is the entry's own, so one that is not parts from it within it.
     fn cut(&mut self, key: &[u8], shared_after: usize) -> Result<(), Error> {
-        let natural = self
-            .shared_before
-            .max(shared_after)
-            .saturating_add(1)
-            .min(key.len());
-        // At the reach, whole: its suffix bits are kept but never read.
-        let len = natural.min(self.reach);
-        let value = suffix_of(key, len, self.suffix);
+        // Past the reach only when the next key shares the reach with this one, which it then
+        // starts with: a key the reach long is whole too, as it holds the next.
+        let cut = self.shared_before.max(shared_after).saturating_add(1);
+        let (len, value) = if cut <= self.reach {
+            let natural = cut.min(key.len());
+            (natural, suffix_of(key, natural, self.suffix))
+        } else {
+            (self.reach, all_set(self.suffix))
+        };
         self.trie
             .add_after(key.get(..len).unwrap_or(&[]), self.shared_before, value)
     }
@@ -407,7 +418,7 @@ mod tests {
 
     /// The filter the rule gives `keys`, which share their first `shared` bytes, cut from the
     /// whole keys: each one byte past its longest prefix shared with a neighbour, or `depth` bytes
-    /// past the shared ones, its reach, when that is no longer, whole then; a key after a whole
+    /// past the shared ones, its reach, when that is shorter, whole then; a key after a whole
     /// entry that starts with it takes none.
     fn by_rule(keys: &[&Vec<u8>], suffix: u32, depth: usize, shared: usize) -> Surf {
         let reach = shared.saturating_add(depth);
@@ -420,13 +431,14 @@ mod tests {
             whole = None;
             let before = i.checked_sub(1).map_or(0, |j| lcp(keys[j], k));
             let after = keys.get(i + 1).map_or(0, |n| lcp(k, n));
-            let natural = before.max(after).saturating_add(1).min(k.len());
-            if natural >= reach {
-                // Whole: its suffix bits kept, never read.
+            let cut = before.max(after).saturating_add(1);
+            if cut > reach {
+                // Whole: every suffix bit set.
                 let p = &k[..reach];
-                entries.push((p, suffix_of(k, reach, suffix)));
+                entries.push((p, all_set(suffix)));
                 whole = Some(p);
             } else {
+                let natural = cut.min(k.len());
                 entries.push((&k[..natural], suffix_of(k, natural, suffix)));
             }
         }

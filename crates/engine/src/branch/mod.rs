@@ -235,8 +235,9 @@ pub fn page_bytes(capacity: usize) -> Option<usize> {
 /// once (at most a key's) and past them at most their depth a key or a leaf, a leaf an entry at
 /// least (`fst::surf`, [`crate::store::RANGE_FILTER_DEPTH`],
 /// [`crate::store::LEAF_INDEX_DEPTH`]); the range filter's values its suffix bits. The seal
-/// finishes each and encodes it beside its builder, each again at most its builder's bytes. A separator cut short is kept, a key buffer more. Pinned by
-/// `tests/builder_memory.rs` at the densest keys and the longest.
+/// finishes each and encodes it beside its builder, each again at most its builder's bytes. A
+/// separator cut short is kept, a key buffer more. Pinned by `tests/builder_memory.rs` at the
+/// densest keys and the longest.
 pub fn builder_bytes(
     capacity: usize,
     extent: usize,
@@ -268,8 +269,9 @@ pub fn builder_bytes(
 
 /// The most bytes a branch's two tries take, built or as their builders hold them: its range
 /// filter over `entries` keys of at most `key` bytes keeping `range_bits` suffix bits, and its
-/// leaf index over `leaves` separators, its values pages up to 32 bits. Each holds a level a key byte at most and as labels the bytes every key shares once (at
-/// most a key's) and past them at most its depth a key or a separator, never past the key
+/// leaf index over `leaves` separators, its values pages up to 32 bits. Each holds a level a key
+/// byte at most and as labels the bytes every key shares once (at most a key's) and past them at
+/// most its depth a key or a separator, never past the key
 /// ([`crate::store::RANGE_FILTER_DEPTH`], [`crate::store::LEAF_INDEX_DEPTH`];
 /// [`trie::builder_bytes`]). Below the data its branch holds for any keys: a key's or a leaf's
 /// share is bounded by the depth, not by the key's length (research/67). Pinned by

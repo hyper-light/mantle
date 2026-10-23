@@ -117,14 +117,19 @@ for 2,126 labels (`tests/trie_memory.rs`).
   shares with the range's end, or with what its inputs' greatest entries share (each a prefix of
   its input's last key). Counted from the root instead, 16 bytes cut object names inside their
   agent and paths inside their first directory, the keys past that one entry each (their filters
-  3.03% → 0.29% and 6.06% → 0.02% of the data, precision gone with the bytes). An entry as long
-  as the shared bytes and the depth, the filter's reach, stands for every key starting with it, a
+  3.03% → 0.29% and 6.06% → 0.02% of the data, precision gone with the bytes). An entry cut short
+  at the shared bytes and the depth, the filter's reach, stands for every key starting with it, a
   Proteus prefix (§3; truncation keeps order, §2), and the keys after it starting with it take
-  none. The filter keeps its reach, so it tells such an entry by its length: a value keeps only its
-  suffix bits, where a bit marking an entry whole took a bit a key from every filter (2,000,000
-  16-byte keys: 4,821,275 bytes against 4,570,905 with none). An entry whose cut falls at the
-  reach itself is whole too, precision only. A key so adds at most the depth's labels, and the
-  trie is at most the depth deep past the shared bytes.
+  none. Its suffix bits, which no lookup reads, are all set, and the filter keeps its reach, so it
+  tells a whole entry by its length and value: a value keeps only its suffix bits, where a bit
+  marking an entry whole took a bit a key from every filter (2,000,000 16-byte keys: 4,821,275
+  bytes against 4,570,905 with none). An entry whose own cut falls at the reach with every suffix
+  bit set, one in 2^n of those, is read as whole, its wider interval: no range holding a key is
+  ruled out. Read by length alone, every entry at the reach was whole, and object names at depth
+  16 let 4.35 / 5.11 / 4.10% of empty points, gaps and listings through against 3.91 / 4.38 /
+  3.66% with no depth; an entry cut at the reach keeping a byte more restored that at 32.78 bits a
+  key against 30.28, a quarter of their cuts falling there (§7). A key so adds at most the depth's
+  labels, and the trie is at most the depth deep past the shared bytes.
 - **The leaf index's groups.** A separator past `LEAF_INDEX_DEPTH` bytes beyond the shared ones
   is cut there and stands for the group of leaves whose first keys start with it; its entry is the
   group's last leaf. A key within a group reads down from the root through the branch's index

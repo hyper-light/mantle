@@ -199,16 +199,16 @@ time, the blocks' offsets the difference).
 The work an operation adds, in instructions: on adacachy (AMD Zen 5) exact by `perf stat -e
 instructions:u`, on this Mac (Apple silicon, the release gate's VM's architecture) as macOS
 counts them retired (`/usr/bin/time -l`); two sizes of each bench, so the difference is the
-operation's alone; engine-inflight 0ef22265 against engine-cap 147f6149, 2026-10-23:
+operation's alone; engine-inflight 76e465ee against engine-cap 1ca1b83f, 2026-10-23:
 
 | work | x86_64 before | after | | arm64 before | after | |
 |---|---|---|---|---|---|---|
-| a get of a branch (`benches/point_read.rs`, 1 M entries) | 2,049 | 2,068 | +0.9% | 1,632 | 1,557 | -4.6% |
-| a seek and its nexts (`benches/seek_cursor.rs`) | 28,518 | 28,566 | +0.2% | 28,467 | 28,056 | -1.4% |
-| a leaf lookup and its key, numbers (`benches/leaf_index.rs`) | 2,704 | 2,727 | +0.9% | 2,007 | 1,855 | -7.6% |
-| a leaf lookup and its key, object names | 14,707 | 13,962 | -5.1% | 10,077 | 8,205 | -18.6% |
-| a compaction's round (`benches/compaction.rs`, 2.1 M entries) | 3.403 G | 3.441 G | +1.1% | 3.529 G | 3.579 G | +1.4% |
-| a range filter's build, a key (2 M 16-byte keys) | 328.3 | 348.2 | +6.1% | | | |
+| a get of a branch (`benches/point_read.rs`, 1 M entries) | 2,049 | 2,068 | +0.9% | 1,667 | 1,552 | -6.9% |
+| a seek and its nexts (`benches/seek_cursor.rs`) | 28,518 | 28,566 | +0.2% | 28,368 | 28,167 | -0.7% |
+| a leaf lookup and its key, numbers (`benches/leaf_index.rs`) | 2,704 | 2,727 | +0.9% | 2,013 | 1,848 | -8.2% |
+| a leaf lookup and its key, object names | 14,707 | 13,962 | -5.1% | 10,102 | 8,223 | -18.6% |
+| a compaction's round (`benches/compaction.rs`, 2.1 M entries) | 3.404 G | 3.240 G | -4.8% | 3.571 G | 3.391 G | -5.0% |
+| a range filter's build, a key (`benches/surf_build.rs`, 16-byte keys, less making them) | 314.5 | 231.1 | -26.5% | 300.1 | 202.0 | -32.7% |
 
 The one sequence first cost a leaf lookup 7.0% (numbers) and 8.0% (object names) and a get
 4.8% on x86_64: a node's labels were two node starts, each a block entry, a sentinel test and an
@@ -216,11 +216,15 @@ extra, about 50 instructions a step. A block's extras now run one past its last 
 node's labels are one entry and two adjacent extras, and a rank finds its block by a shift where
 a division by a count read at run time was a division on every rank: lookups that rank most,
 object names', and every lookup on arm64 came out below the per-level layout's. A filter's build
-pays the depth, the shared bytes and the reach checked a key and a whole entry's mark: a first
-form that marked entries with a bit above the suffix bits cost 11.0% a key; one whose cut added
-an entry from two calls left the trie's add out of line; telling the mark and the refusal by one
-compare in `push` cost more, not less (353.2 a key). A value's words grow by a push where they
-were resized each value (-2.7 a key).
+pays the depth, the shared bytes and the reach checked a key and a whole entry's mark: as
+147f6149 built it, 11.7 instructions a key more than the base's on x86_64 and a compaction round
+1.1% more (1.4% on arm64). Its first forms cost more: one that marked entries with a bit above
+the suffix bits, 11.0% a key; one whose cut added an entry from two calls, which left the trie's
+add out of line; one telling the mark and the refusal by one compare in `push`. What the build
+had paid all along, the base's as much, was three calls left out of line, a level's lookup, a
+label's push and a value's push, 77 instructions a key, and a value placed by its index in words
+sized for it, 18 more. Inlined, a value written into its words in place (1ca1b83f), a filter's
+build costs a quarter to a third less than the base's and a compaction round 5% less.
 
 ## 8. The release gate
 

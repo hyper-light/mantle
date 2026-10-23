@@ -1092,13 +1092,13 @@ impl<F: BlockFile> Store<F> {
             .ok_or(corrupt(Malformed::TooLarge))
     }
 
-    /// The store's I/O since it was opened.
     /// Nanoseconds span reads waited for their pages ([`IoStats::read_wait_ns`]), without the
     /// rest of [`Self::io_stats`]: what a worker's job reports.
     pub fn read_wait_ns(&self) -> u64 {
         self.io.read_wait_ns
     }
 
+    /// The store's I/O since it was opened.
     pub fn io_stats(&self) -> IoStats {
         let (cache_hits, cache_misses) = self.cache.as_ref().map_or((0, 0), cache::Cache::stats);
         let (cache_bytes, cache_limit_pages, cache_refused) =

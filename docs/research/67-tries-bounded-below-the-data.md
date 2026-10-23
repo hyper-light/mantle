@@ -212,3 +212,47 @@ form that marked entries with a bit above the suffix bits cost 11.0% a key; one 
 an entry from two calls left the trie's add out of line; telling the mark and the refusal by one
 compare in `push` cost more, not less (353.2 a key). A value's words grow by a push where they
 were resized each value (-2.7 a key).
+
+## 8. The release gate
+
+On the VM lane (Docker Desktop at 96 GiB, the carryover-balanced order of `run7.sh`), each figure
+an arm over the base in the same round, medians (`paired.py`); the base engine-inflight 3be9ec0e,
+whose production code 0ef22265 keeps. The first build (153c1997) carried the lookup cost §7 found
+and gave 1M 1.002 / 0.963 / 1.000, 10M 0.983 / 0.995 / 0.988 and 100M 0.958 / 0.977 / 0.968 for
+fill / gets / seeks (four rounds each, R0 7560-7580), its gets' 99th percentile at 100M 2.37 µs
+against 1.65. With the node starts and the rank fixed (45ca830c, R0 7600-7620, four rounds):
+
+| keys | fill | gets | seeks |
+|---|---|---|---|
+| 1M | 1.010 | 0.972 | 0.992 |
+| 10M | 0.971 | 1.011 | 0.992 |
+| 100M | 0.982 | 1.022 | 0.977 |
+
+The final build (147f6149) beside the base and the base with its layout alone shifted (af047ab5,
+engine-follow's A/A recipe), one cycle of six rounds at each size (R0 7630, 7640):
+
+| keys | final over base | layout alone over base | final over the shifted base |
+|---|---|---|---|
+| 10M | 1.002 / 0.987 / 0.993 | 0.999 / 1.003 / 0.992 | 0.992 / 0.975 / 1.000 |
+| 100M | 0.991 / 0.673 / 0.948 | 1.030 / 1.051 / 0.881 | 0.949 / 0.849 / 1.088 |
+
+At 100M every arm's gets fell into one of two modes, about 2.1 or 1.0 million a second, the
+shifted base's as much as the others' (research/66 §6 saw the same lane run a round's ratio from
+0.43 to 22): the final build drew the fast one in one round of six, the bases in three and two,
+and within a mode it ran as they did (fast 2.16 against 1.71-2.13 million; slow 0.71-1.22 against
+0.85-1.18). Its seeks at 100M averaged 570 thousand a second against 579 and 529 thousand. Its
+fill averaged 4.588 million a second against 4.651 and 4.646 at 10M and 4.075 against 4.143 and
+4.270 at 100M, 1.3-1.6% below the base with the base's two layouts 0.1% and 3.1% apart: the
+compactions' added work (§7, +1.1% of a round's instructions on x86_64, +1.4% on arm64), a range
+filter's build checking the shared bytes and the reach each key and marking its whole entries.
+
+Against RocksDB 11.8.1 and SplinterDB at a fixed 32 GiB cache (45ca830c's rounds):
+
+| keys | over SplinterDB, fill / gets / seeks | over RocksDB, fill / gets / seeks |
+|---|---|---|
+| 1M | 4.47 / 2.30 / 3.59 | 6.13 / 6.28 / 5.59 |
+| 10M | 3.90 / 3.00 / 4.52 | 5.11 / 9.95 / 7.86 |
+| 100M | 3.42 / 4.87 / 11.19 | 4.45 / 6.60 / 7.55 |
+
+*Open:* a billion rows waits for the Mac's disk (a 1B case grows the VM's image about 115 GB;
+the Mac held 108-116 GB free on 2026-10-23).

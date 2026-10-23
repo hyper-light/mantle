@@ -5696,8 +5696,9 @@ mod follow_step_tests {
         let mut db = ShardDb::create(file, STORE, MEM, TRUNK).unwrap();
         FREE.store(1 << 40, Ordering::Relaxed);
         db.follow(BOUND, 1, free).unwrap();
+        // Values whose pages, read back, hold twice the margin below: the fall has them to trim.
         for k in 0..5_000u64 {
-            db.put(format!("k{k:08}").as_bytes(), &[7u8; 100]).unwrap();
+            db.put(format!("k{k:08}").as_bytes(), &[7u8; 400]).unwrap();
         }
         // The process's memory outside the shard's account may grow between two looks by what a
         // look allocates: a mebibyte past a step either way keeps every target clear of the
@@ -5723,8 +5724,10 @@ mod follow_step_tests {
         // grew outside the shard's account between two looks takes the target below what the
         // shard holds; the test states that growth, which a platform with no reading of the
         // process's resident memory (Windows) never sees, and which elsewhere was whatever the
-        // process's other allocations happened to be. Gets of keys long since packed fill the
-        // caches first, so the fall has pages to trim.
+        // process's other allocations happened to be. Every key packed first, then read, fills
+        // the caches, so the fall has pages to trim: gets of keys whose packing had not landed
+        // read the memtables and filled nothing, with the process's other tests at work.
+        db.flush().unwrap();
         let mut value = Vec::new();
         for k in 0..5_000u64 {
             db.get(format!("k{k:08}").as_bytes(), &mut value).unwrap();
@@ -5732,8 +5735,9 @@ mod follow_step_tests {
         let held = db.regions_held().saturating_add(db.kept_held());
         assert!(
             held > db.floor_held() + margin,
-            "the shard holds {held}, no more than it cannot give back, {}",
-            db.floor_held()
+            "the shard holds {held}, no more than it cannot give back, {}, its budget {:?}",
+            db.floor_held(),
+            db.memory
         );
         let follow = db.follow.as_mut().unwrap();
         follow.grew_most = follow.grew_most.max(margin);

@@ -469,3 +469,34 @@ gate weighs them.
   peaked at 50.0 GiB 66 s in, the kept memtables at their fullest, with 11.4 GiB still available;
   the kernel swapped out 770 pages in all and stalled on memory 12.9 s of the run's 681
   (`/proc/pressure/memory` full).
+- **Seeks and the cache's memory.** The first release gate (R0 7210-7234, n=4) put the follow's
+  seeks at 0.941, 0.960 and 0.929 of data-layer's at 1M, 10M and 100M. Two costs the follow had
+  added to the shard's own work went first: looks at the machine paced by the clock, a clock read
+  at every turn of the range's task (one a seek with one client), and in idle steps a look after
+  any worker's message, each reading three /proc files and walking every branch's metadata; and a
+  residency probe and a timed read on every store, where only the workers' waits are priced.
+  Looks are paced by work now (`look_when_due`: a cycle's worth of scans and merged entries; an idle
+  shard looks as its workers report, `look_when_idle`) and only workers' stores probe (768371bc,
+  dae63d2b, 69e010cb): a 1M run looked 6 times, and fills at 10M ran 1.064 of data-layer's (R0
+  7260-7264). The seeks did not move (1M 0.904, 10M 0.930). Every build did the same work a seek
+  (10M, R0 7291-7296): one source opened, no read, 1.31 span hits on the same 199,522 live cache
+  pages. Where those pages lay differed. The VM's anonymous memory peaked 86% on transparent huge
+  pages under data-layer and 51% under the follow (`diag-runs` n10000000-thp-1): since 1fc3342a a
+  loan's fresh memory comes in buffers of one huge page each, so its pages leave the cache an
+  extent at a time (§5), but a buffer of a huge page from the C library's allocator lies on none,
+  its block beginning past the allocator's header and its mapping a page longer than a huge page,
+  which the VM's 6.12 kernel aligns for huge pages only when its length is a whole number of them
+  (mm/mmap.c `__get_unmapped_area`). One buffer a loan, as data-layer lent it, put the memory back
+  at 86% and the seeks at data-layer's (1.015, R0 7301-7306); glibc's mmap threshold left to
+  adjust itself did not (0.874). The cache's buffers are mapped on huge pages' boundaries now
+  (`port::mmap::PageBuf`, 99443a82): 87% on huge pages, and at 10M seeks 1.002, fills 1.004 and
+  gets 0.988 of data-layer's (R0 7321-7326). At 1M the seeks stayed 2-4% below (0.959-0.982 in
+  three batches; 0.956-0.974 with fixed 32 GiB caches, so not the follow's choices), though layout
+  alone moved them 1.003 (an A/A, data-layer with an unused function shifting its code, R0
+  7331-7336), and neither the mmap threshold (0.965) nor the scans' look check (1.002 without it)
+  accounted for it. perf on the VM put the time in the cursors' loads and copies out of the cache's
+  pages: data-layer's cache held them in glibc's blocks, 16 bytes past a boundary, and ours began on
+  one. With the buffer's bytes 16 bytes into its mapping (`PAGE_OFFSET`, 573cf167) the seeks came
+  back, 64 bytes in they did not: at 1M 0.986 of data-layer's at 16, 0.963 at 0 and 0.961 at 64
+  (eight rounds, R0 7381-7388), at 10M 1.000 at 16 and 0.963 at 0 (R0 7391-7396). The page's place
+  within a cache line, not its alignment to a page, is what the decode met.

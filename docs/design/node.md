@@ -301,17 +301,23 @@ measures the second, and derives the rest by these rules:
   (`branch::builder_bytes`, `fst::trie::builder_bytes`); a cursor an extent, four pages and its
   reads in flight (`branch::cursor_bytes`); at most `TrunkConfig::cursors_most` cursors and
   `builders_most` builders at once, each building a branch of at most `built_most` entries, a leaf's
-  limit, stated together by `shard_db::pooled_bytes`; the branches' metadata, the trunk's pivots and
-  the branches' records as held (`ShardDb::memory`: buffers' capacities and records, the tries'
-  exact against the counting allocator). Before the trunk bounded them, a node held 1,468 live
+  limit, stated together by `shard_db::pooled_bytes`; the branches' resident metadata, each
+  branch's filters, tries, page counts, extents' numbers and record, at most the extents they hold
+  times an extent's statement (`shard_db::resident_per_extent`: at the floor 63,698 bytes an extent
+  at 8-byte keys and 87,430 at 2,132, the range filter's labels bounded by its keys' rises and those
+  by the suffixes its leaves store, its nodes by its rises; research/68 §2); and the trunk's own
+  records, its nodes, pivots and lists, as held (`ShardDb::memory`: buffers' capacities and
+  records, exact against the counting allocator). Before the trunk bounded them, a node held 1,468 live
   in-flight bundles at 2,132-byte keys and scans opened each: 189.7 MB held for 32,000 rows. A node
   now takes a flush only below `fanout` live bundles a pivot, a compaction takes its inputs within a
   leaf's limit, the shard steps two compactions at once, and a read's path meets one part of each
   packing in flight; the same fills held 12.9 MB at 8-byte keys for 1.28 million rows (pools' peaks
   37 extents, 108 pages and four builders' lists, against 221 cursors and 5 builders stated at
   height 5) and 11.4 MB at 2,132-byte keys for 32,000 rows (39 extents and 114 pages, against 153
-  cursors at height 3), each within its configured bytes, its pools and builders as stated, and its
-  metadata as held (`tests/engine_memory.rs`). At 2,132-byte keys that statement is 255 MB, its
+  cursors at height 3), each within its configured bytes, its pools and builders as stated, its
+  branches' metadata as stated (5.81 MB held of 85.7 MB stated for 1,346 extents at 8-byte keys,
+  4.3 KB an extent; 264 KB of 2.7 MB for 31 at 2,132-byte keys) and the trunk's records as held
+  (`tests/engine_memory.rs`). At 2,132-byte keys that statement is 255 MB, its
   builders' tries counted by their depths (2.7 GB while they counted a label a key byte). Resident
   metadata per extent of data: 21% at 8-byte keys without values (1.25 bytes of filter and 2.3 of
   range filter a key), 3% at 16-byte keys with 100-byte values. Keys in pairs sharing all but a
@@ -321,7 +327,12 @@ measures the second, and derives the rest by these rules:
   16 bytes past the bytes every key of their branch shares and a leaf index's separators at most
   256, the leaves past that found through the branch's index pages, and a level costs its labels'
   bits; those pairs' two tries hold 1.15% of their data, and a branch's tries are stated from its
-  key bound, entries and leaves (`branch::tries_bytes`; research/67).
+  key bound, entries and leaves (`branch::tries_bytes`; research/67). A compaction's point filter,
+  made for its inputs' entries and halved only while its blocks were even, kept the bound's bits
+  when its merge cut its keys: 40 bits a key at an eighth of its inputs, 312 KB for ten keys left
+  of two million. It is made at the least count of blocks whose divisors each at most double the
+  one before and folds exactly, once its keys are counted, to fewer than twice the blocks they
+  need (research/68 §1).
   And `ShardDb::follow_machine` budgets a range's cache, writes and records from what remains of the
   machine: the budget follows one of `shares` of the machine's room (`port::memory::room_now`: on
   Linux `MemAvailable` less the larger of the kernel's background dirty threshold and its dirty and
@@ -338,7 +349,10 @@ measures the second, and derives the rest by these rules:
   and 1.13 of data-layer's (docs/research/65 §9). *Open:* kept memtables take the
   budget's idle part before any read misses, and with the memory moved between the regions cost a
   billion rows' fill 15% against a fixed cache (§9); and hyper-rt reads no process's resident memory
-  on Windows, so a shard there leaves nothing free for what grows outside its account (§9).
+  on Windows, so a shard there leaves nothing free for what grows outside its account (§9). And the
+  trunk's own records are counted as held, not stated: a node's pivots grow past the fanout while
+  its split waits for its parent's pivot to empty, and nodes never merge, so their count follows
+  the splits a range has seen, not the data it holds (research/68 §3).
 
 | Value (`mantle node`'s key) | Kind | Model and source |
 |---|---|---|

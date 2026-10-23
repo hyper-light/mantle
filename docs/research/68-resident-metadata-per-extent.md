@@ -151,6 +151,16 @@ stated, while realistic shapes hold 1.7-10 KB. Its largest parts are the range f
 starts, about 2 bytes a node where a block of 256 nodes holds more labels than nodes, and the
 record, 1,576 bytes a branch.
 
+In an engine at the floor, filled with paced puts and a scan every 97 (`tests/engine_memory.rs`,
+fedora x86_64, 2026-10-23), the branches held 5,808,443 bytes for 672 branches of 1,346 extents
+at 8-byte keys and 1.28 million rows, 4,315 bytes an extent, against 85,737,508 stated; and
+264,340 bytes for 15 branches of 31 extents at 2,132-byte keys and 32,000 rows, against
+2,710,330. The trunk's own records, its nodes and pivots, their keys and its lists, held 517,752
+and 106,992 bytes there, and are counted as held. A node over the fanout splits only once its
+in-flight bundles are empty and its parent's pivot is (`trunk::upkeep`, `take_change`), so its
+children's splits can add pivots meanwhile; and nodes never merge, so their count follows the
+splits a range has seen, not the data it holds. Stating them waits on a bound for both.
+
 ## Appendix: the 2-dense counts measured
 
 `python3 -I gaps.py 20000` printed "v<20000: search worst gap 35 blocks, worst rel (v>=64) 0.0959,

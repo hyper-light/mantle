@@ -92,6 +92,15 @@ fn huge_pages_on_request() -> bool {
     })
 }
 
+/// The bytes before a page buffer's first in its mapping ([`PageBuf`]), so its pages begin 16 bytes
+/// into a cache line, as a block from the C library's allocator begins (glibc's `MALLOC_ALIGNMENT`
+/// and chunk header, 16 bytes on 64-bit targets) and as data-layer's cache held them. Measured on
+/// the VM (fixed 32 GiB caches, against data-layer): seeks at 1M ran 0.963 of data-layer's with the
+/// pages on a line's start, 0.986 16 bytes in and 0.961 64 bytes in (eight rounds, R0 7381-7388),
+/// and at 10M 0.963 and 1.000 (six rounds, R0 7391-7396) (docs/research/65 §9).
+#[cfg(target_os = "linux")]
+const PAGE_OFFSET: usize = 16;
+
 /// Memory for pages kept in memory: the store's cache's chunks and the room it lends a worker's
 /// pages ([`crate::store::cache`]). A buffer of bytes grown within the capacity it was made with,
 /// as a `Vec<u8>` whose capacity is reserved once, zero until written and resident only where
@@ -150,9 +159,10 @@ impl PageBuf {
             if cap == 0 {
                 return Some(Self::new());
             }
-            let (addr, mapped) = map_on_huge_pages(cap).ok()?;
+            let (addr, mapped) = map_on_huge_pages(cap.checked_add(PAGE_OFFSET)?).ok()?;
+            let bytes = NonNull::new(addr.as_ptr().wrapping_add(PAGE_OFFSET))?;
             Some(Self {
-                addr: Some(addr),
+                addr: Some(bytes),
                 mapped,
                 cap,
                 len: 0,
@@ -248,9 +258,10 @@ impl PageBuf {
     #[cfg(target_os = "linux")]
     fn whole(&mut self) -> &mut [u8] {
         match self.addr {
-            // SAFETY: `addr` is the start of a live mapping of `mapped` bytes, `cap` of them
-            // usable, zero-filled by the OS and written only through these slices, so every byte
-            // is initialized; unmapped only in `drop`, which the borrow of `self` keeps from running.
+            // SAFETY: `addr` is `PAGE_OFFSET` bytes into a live mapping of `mapped` bytes, at
+            // least `cap` of them past it, zero-filled by the OS and written only through these
+            // slices, so every byte is initialized; unmapped only in `drop`, which the borrow of
+            // `self` keeps from running.
             Some(addr) => unsafe { std::slice::from_raw_parts_mut(addr.as_ptr(), self.cap) },
             None => &mut [],
         }
@@ -311,9 +322,11 @@ impl Drop for PageBuf {
         let Some(addr) = self.addr.take() else {
             return;
         };
-        // SAFETY: unmaps exactly the mapping `map_on_huge_pages` left, which no borrow outlives.
-        // A failure leaves the pages mapped: nothing can act on it in a drop.
-        let _ = unsafe { rustix::mm::munmap(addr.as_ptr().cast(), self.mapped) };
+        let start = addr.as_ptr().wrapping_sub(PAGE_OFFSET);
+        // SAFETY: unmaps exactly the mapping `map_on_huge_pages` left, which begins `PAGE_OFFSET`
+        // bytes before the buffer's first and which no borrow outlives. A failure leaves the pages
+        // mapped: nothing can act on it in a drop.
+        let _ = unsafe { rustix::mm::munmap(start.cast(), self.mapped) };
     }
 }
 
@@ -548,8 +561,8 @@ mod page_buf_tests {
         assert!(PageBuf::new().is_empty());
     }
 
-    /// On Linux a buffer begins on a transparent huge page's boundary, whatever the C library's
-    /// allocator would have placed it at.
+    /// On Linux a buffer's mapping begins on a transparent huge page's boundary, whatever the C
+    /// library's allocator would have placed it at, and its bytes `PAGE_OFFSET` past it.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_page_buffer_begins_on_a_huge_page_boundary() {
@@ -559,7 +572,7 @@ mod page_buf_tests {
             let addr = b.addr.unwrap().as_ptr().addr();
             assert_eq!(
                 addr % huge,
-                0,
+                PAGE_OFFSET,
                 "a buffer of {pages} huge pages at {addr:#x}"
             );
             assert_eq!(b.capacity(), pages * huge + 4096);

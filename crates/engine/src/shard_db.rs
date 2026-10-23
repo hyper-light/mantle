@@ -82,6 +82,8 @@ pub struct FlushStats {
     /// A runtime task's idle slices ([`ShardDb::idle_paced_step`]) and the work units they did.
     pub idle_slices: u64,
     pub idle_units: u64,
+    /// Looks a budget that follows the machine took at it ([`ShardDb::look_machine`]).
+    pub looks: u64,
     /// The record cache's gets served and missed, its misses on keys its ghost named, and its
     /// bytes held and allowed, when the shard has one (set as the stats are taken).
     pub record_hits: u64,
@@ -262,11 +264,12 @@ struct Follow {
     cap: usize,
     /// The shares the machine's room is divided into.
     shares: usize,
-    /// The process's memory outside the shard's account at the last look ([`ShardDb::look_machine`]),
-    /// and when it was.
-    last: Option<(usize, std::time::Instant)>,
-    /// The workers' messages taken by the last look (`Trunk::pool_accepted`).
-    accepted: u64,
+    /// The process's memory outside the shard's account at the last look ([`ShardDb::look_machine`]).
+    last: Option<usize>,
+    /// The scans made and the entries the trunk merged as of the last look: the work after which
+    /// the next is due ([`ShardDb::look_when_due`]).
+    scans: u64,
+    merged: u64,
     /// The most the process's memory outside the shard's account grew between two looks: its
     /// resident memory less the budget's regions, the kept memtables and the memtables in
     /// flight (the branches' metadata, workers' builders and spans, the allocator's free lists,
@@ -1361,7 +1364,8 @@ impl<F: BlockFile> ShardDb<F> {
             cap: bound,
             shares: shares.max(1),
             last: None,
-            accepted: 0,
+            scans: self.scans,
+            merged: self.trunk.merged(),
             grew_most: 0,
         });
         self.set_reuse_window();
@@ -1401,7 +1405,15 @@ impl<F: BlockFile> ShardDb<F> {
     /// memtables give memory back and the caches trimmed to their shares at once, not a few pages
     /// an operation: the machine has no room for them. No reading leaves the budget as it is.
     fn look_machine(&mut self) {
-        if self.follow.is_none() || self.memory.is_none() {
+        // The work the next look is due after counts from here, whatever this one reads.
+        let (scans, merged) = (self.scans, self.trunk.merged());
+        let Some(follow) = self.follow.as_mut() else {
+            return;
+        };
+        follow.scans = scans;
+        follow.merged = merged;
+        self.flush_stats.looks = self.flush_stats.looks.saturating_add(1);
+        if self.memory.is_none() {
             return;
         }
         let Some(free) = self.store.machine_free() else {
@@ -1420,16 +1432,13 @@ impl<F: BlockFile> ShardDb<F> {
                 .saturating_sub(accounted)
         });
         let floor = self.floor_held();
-        let now = std::time::Instant::now();
-        let accepted = self.trunk.pool_accepted();
         let Some(follow) = self.follow.as_mut() else {
             return;
         };
-        if let Some((was, _)) = follow.last {
+        if let Some(was) = follow.last {
             follow.grew_most = follow.grew_most.max(outside.saturating_sub(was));
         }
-        follow.last = Some((outside, now));
-        follow.accepted = accepted;
+        follow.last = Some(outside);
         follow.cap = follow.bound.saturating_sub(own);
         let target = held
             .saturating_add(free.checked_div(follow.shares).unwrap_or(0))
@@ -1478,33 +1487,22 @@ impl<F: BlockFile> ShardDb<F> {
             .saturating_add(records_index)
     }
 
-    /// In idle time, looks at the machine ([`Self::look_machine`]) whenever a worker's message
-    /// has come back since the last look, as well as once a fill's time has passed: the workers'
-    /// memory moves with their jobs, and idle time is the shard's own to spend. A flush after a
-    /// fill, with no client work, would otherwise look only at the fill's pace while its
-    /// consolidations grow on every worker (docs/research/65).
-    fn look_when_idle(&mut self) {
+    /// Looks at the machine ([`Self::look_machine`]) once a cycle's worth of work has passed since
+    /// the last look (`cycle_ops`, a memtable's worth of operations): the scans made and the
+    /// entries the trunk merged, inline or on the workers, counted together. Rotations and gets'
+    /// tuning cycles look at their own pace; a phase of scans, or of maintenance alone (a flush
+    /// after a fill, its consolidations growing on every worker), follows the machine at the pace
+    /// its work moves memory. Counted, not timed, so no operation reads the clock for it. Before a
+    /// fill is measured only rotations look.
+    fn look_when_due(&mut self) {
         let Some(follow) = self.follow.as_ref() else {
             return;
         };
-        if follow.last.is_some() && self.trunk.pool_accepted() != follow.accepted {
-            self.look_machine();
-        } else {
-            self.look_when_due();
-        }
-    }
-
-    /// Looks at the machine ([`Self::look_machine`]) once a fill's time has passed since the
-    /// last look, the cycle a rotation measures (`fill_ns`): a phase without rotations, gets
-    /// apart, follows the machine at the pace a fill does. Rotations look at their own pace, and
-    /// before a fill is measured only they do.
-    fn look_when_due(&mut self) {
-        let Some((_, at)) = self.follow.as_ref().and_then(|f| f.last) else {
-            return;
-        };
-        if self.fill_ns > 0
-            && u64::try_from(at.elapsed().as_nanos()).unwrap_or(u64::MAX) >= self.fill_ns
-        {
+        let work = self
+            .scans
+            .saturating_sub(follow.scans)
+            .saturating_add(self.trunk.merged().saturating_sub(follow.merged));
+        if work >= self.cycle_ops {
             self.look_machine();
         }
     }
@@ -2657,6 +2655,7 @@ impl<F: BlockFile> ShardDb<F> {
         next: &mut Vec<u8>,
     ) -> Result<bool, Error> {
         let more = self.scan_inner(from, end, limit, out, next);
+        self.look_when_due();
         // A scan may have read pages into the cache: the kept memtables give way before it
         // returns.
         if self.kept_crowded() {
@@ -2920,6 +2919,7 @@ impl<F: BlockFile> ShardDb<F> {
         next: &mut Vec<u8>,
     ) -> Result<bool, Error> {
         let more = self.scan_async_inner(from, end, limit, out, next).await;
+        self.look_when_due();
         // A scan may have read pages into the cache: the kept memtables give way before it
         // returns.
         if self.kept_crowded() {
@@ -4302,7 +4302,6 @@ impl<F: BlockFile> ShardDb<F> {
         if self.checkpoint_frozen() {
             return Ok(());
         }
-        self.look_when_due();
         self.grow(false)?;
         let bytes = std::mem::take(&mut self.turn_bytes);
         if bytes > 0 {
@@ -4390,8 +4389,8 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     fn idle_step_with(&mut self, keys: u64, paced: bool) -> Result<u64, Error> {
-        self.look_when_idle();
         let done = self.idle_step_inner(keys, paced)?;
+        self.look_when_due();
         // Idle work may have kept a compaction's pages or a page read: the kept memtables give
         // way before the step returns.
         if self.kept_crowded() {
@@ -5531,6 +5530,74 @@ mod kernel_share_tests {
             db.cache_share,
             db.records_share,
             db.trimming()
+        );
+    }
+}
+
+#[cfg(test)]
+mod look_pacing_tests {
+    //! A budget that follows the machine looks at it once a cycle's worth of work has passed since
+    //! the last look, scans and the trunk's merged entries counted together, and no operation reads
+    //! the clock for it (`ShardDb::look_when_due`).
+    use super::*;
+    use hyper_block::buf::Alignment;
+    use hyper_block::file::{CachingRequest, DeviceFile};
+
+    const STORE: Config = Config {
+        page_size: 4096,
+        extent_pages: 8,
+        max_extents: 1 << 16,
+    };
+    const TRUNK: TrunkConfig = TrunkConfig {
+        fanout: 3,
+        leaf_entries: 96,
+    };
+    const MEM: usize = 8 * 1024;
+    const BOUND: usize = 2048 * 4096;
+
+    fn room() -> Option<u64> {
+        Some(1 << 40)
+    }
+
+    #[test]
+    fn a_followed_budget_looks_once_a_cycles_worth_of_scans_has_passed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = DeviceFile::open(
+            &dir.path().join("store"),
+            true,
+            CachingRequest::Buffered,
+            Alignment::new(4096).unwrap(),
+        )
+        .unwrap();
+        let mut db = ShardDb::create(file, STORE, MEM, TRUNK).unwrap();
+        db.follow(BOUND, 1, room).unwrap();
+        for k in 0..20_000u64 {
+            db.put(format!("k{k:08}").as_bytes(), &[7u8; 100]).unwrap();
+        }
+        // Nothing left to merge, so only the scans count from here.
+        db.maintain(u64::MAX).unwrap();
+        let cycle = db.cycle_ops();
+        assert!(cycle > 1 && cycle < u64::MAX, "no cycle measured: {cycle}");
+        db.look_machine();
+        let looks = db.flush_stats.looks;
+        let merged = db.trunk.merged();
+        let (mut rows, mut next) = (crate::rows::Rows::new(), Vec::new());
+        for n in 1..cycle {
+            rows.clear();
+            db.scan(format!("k{n:08}").as_bytes(), None, 4, &mut rows, &mut next)
+                .unwrap();
+            assert_eq!(
+                db.flush_stats.looks, looks,
+                "a look after {n} scans of {cycle}"
+            );
+        }
+        rows.clear();
+        db.scan(b"k", None, 4, &mut rows, &mut next).unwrap();
+        assert_eq!(db.trunk.merged(), merged, "the scans merged entries");
+        assert_eq!(
+            db.flush_stats.looks,
+            looks + 1,
+            "no look after {cycle} scans"
         );
     }
 }

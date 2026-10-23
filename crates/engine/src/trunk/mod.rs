@@ -1136,6 +1136,13 @@ impl Trunk {
         }
     }
 
+    /// The entries its compactions merged since it was made or loaded, inline or on the workers
+    /// ([`Self::note_merge`]): what a budget that follows the machine paces its looks by
+    /// (`ShardDb::look_when_due`).
+    pub fn merged(&self) -> u64 {
+        self.merge_keys
+    }
+
     /// When seeks consolidate a pivot ([`Consolidation`]).
     pub fn set_consolidation(&mut self, choice: Consolidation) {
         self.consolidation = choice;
@@ -1437,12 +1444,6 @@ impl Trunk {
     /// The maintenance workers, for the shard's packing.
     pub fn pool_mut(&mut self) -> Option<&mut Pool> {
         self.pool.as_mut()
-    }
-
-    /// Messages taken from the workers since the pool began, wrapping ([`Pool::accepted`]); none
-    /// without workers.
-    pub(crate) fn pool_accepted(&self) -> u64 {
-        self.pool.as_ref().map_or(0, Pool::accepted)
     }
 
     /// Every admitted worker has acknowledged its device setup.

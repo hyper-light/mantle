@@ -396,8 +396,9 @@ bounded seek pass over a source with nothing in its range without reading it (cl
 - **SuRF-Real, exact about intervals, cut at a depth.** A key is cut one byte past what it shares
   with either neighbour, or `RANGE_FILTER_DEPTH` (16, measured) bytes past the bytes every key of
   its branch shares when that is shorter, and keeps the next `n` bits as the trie's value
-  (`RANGE_FILTER_BITS = 8`, measured). An entry cut at the depth stands for every key starting with
-  it, a bit above its suffix bits marking it, and the keys after it that start with it take none:
+  (`RANGE_FILTER_BITS = 8`, measured). An entry as long as the depth past the shared bytes, the
+  filter's reach, stands for every key starting with it, as a Proteus prefix does, told by its
+  length alone, and the keys after it that start with it take none:
   a key adds at most the depth's labels, so keys in pairs sharing all but a last byte, SuRF's worst
   case, no longer take a label a byte (research/67). Each builder is told the shared bytes: a
   packing its memtable's, a compaction's part what its first key shares with the range's end.
@@ -409,9 +410,10 @@ bounded seek pass over a source with nothing in its range without reading it (cl
 - **The trie under it.** The trie is built in one streaming pass with packed values. Where the
   paper selects on S-LOUDS for a node's first label, the sparse part keeps its nodes' starts. A
   node starts at its block's first node's position (every 256th), plus one label for each node
-  before it in the block, plus those nodes' labels past their first (16 bits). A block whose nodes
-  all hold one label keeps no extras. The starts are built when a trie is built or read
-  (research/62). Dense labels are found by word scans. The sparse part is one sequence across its
+  before it in the block, plus those nodes' labels past their first (16 bits); a block's extras run
+  one past its last node, so a node's labels are its block's entry and two adjacent extras. A
+  block whose nodes all hold one label keeps no extras. The starts are built when a trie is built
+  or read (research/62). A rank's block, a power of two of words, is a shift (research/67 §7). Dense labels are found by word scans. The sparse part is one sequence across its
   levels, as the paper lays it out: labels, branch and node-start bits, a bit a node and values,
   nodes numbered breadth first, so a branch's child is the first level's nodes and the branches
   going on before it, and a value one rank over the part. A level so costs its labels' bits, where

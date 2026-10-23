@@ -234,9 +234,8 @@ pub fn page_bytes(capacity: usize) -> Option<usize> {
 /// index, hold a level a key byte ([`trie::builder_bytes`]) and labels the bytes every key shares
 /// once (at most a key's) and past them at most their depth a key or a leaf, a leaf an entry at
 /// least (`fst::surf`, [`crate::store::RANGE_FILTER_DEPTH`],
-/// [`crate::store::LEAF_INDEX_DEPTH`]); the range filter's values its suffix bits and the bit of
-/// an entry cut short. The seal finishes each and encodes it beside its builder, each again at
-/// most its builder's bytes. A separator cut short is kept, a key buffer more. Pinned by
+/// [`crate::store::LEAF_INDEX_DEPTH`]); the range filter's values its suffix bits. The seal
+/// finishes each and encodes it beside its builder, each again at most its builder's bytes. A separator cut short is kept, a key buffer more. Pinned by
 /// `tests/builder_memory.rs` at the densest keys and the longest.
 pub fn builder_bytes(
     capacity: usize,
@@ -268,9 +267,8 @@ pub fn builder_bytes(
 }
 
 /// The most bytes a branch's two tries take, built or as their builders hold them: its range
-/// filter over `entries` keys of at most `key` bytes keeping `range_bits` suffix bits and a bit for
-/// an entry cut short, and its leaf index over `leaves` separators, its values pages up to 32
-/// bits. Each holds a level a key byte at most and as labels the bytes every key shares once (at
+/// filter over `entries` keys of at most `key` bytes keeping `range_bits` suffix bits, and its
+/// leaf index over `leaves` separators, its values pages up to 32 bits. Each holds a level a key byte at most and as labels the bytes every key shares once (at
 /// most a key's) and past them at most its depth a key or a separator, never past the key
 /// ([`crate::store::RANGE_FILTER_DEPTH`], [`crate::store::LEAF_INDEX_DEPTH`];
 /// [`trie::builder_bytes`]). Below the data its branch holds for any keys: a key's or a leaf's
@@ -290,7 +288,7 @@ pub fn tries_bytes(key: usize, entries: u64, leaves: u64, range_bits: u32) -> Op
         key,
         labels(entries, crate::store::RANGE_FILTER_DEPTH)?,
         entries,
-        range_bits.checked_add(1)?,
+        range_bits,
     )?
     .checked_add(crate::fst::trie::builder_bytes(
         key,

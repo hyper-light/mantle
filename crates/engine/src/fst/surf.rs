@@ -13,12 +13,12 @@
 //!
 //! SuRF's cut has no bound: keys in pairs sharing all but a last byte make a label of each byte
 //! (Zhang et al., TODS 2020 §7, its worst case). So an entry runs at most `depth` bytes past the
-//! bytes every key of the run shares, which the builder is told, and one cut there is whole: it
-//! stands for every key that starts with it, its value a bit above the suffix's, and the keys after
-//! it that start with it are its own and take no entry. The trie so holds at most `depth` levels
-//! below the shared bytes and `depth` labels a key (research/67). Cutting keys at one depth keeps
-//! their order, so the filter still lets through every range holding a key; it lets through more
-//! that hold none (Proteus, Knorr et al. SIGMOD 2022 §4.1-§4.2).
+//! bytes every key of the run shares, which the builder is told, its reach, and one that long is
+//! whole: it stands for every key that starts with it, the filter telling it by its length alone,
+//! and the keys after it that start with it are its own and take no entry. The trie so holds at
+//! most `depth` levels below the shared bytes and `depth` labels a key (research/67). Cutting keys
+//! at one depth keeps their order, so the filter still lets through every range holding a key; it
+//! lets through more that hold none (Proteus, Knorr et al. SIGMOD 2022 §4.1-§4.2).
 
 use std::cmp::Ordering;
 use std::ops::ControlFlow;
@@ -85,14 +85,11 @@ pub struct Surf {
     trie: Trie,
     /// Suffix bits an entry keeps.
     suffix: u32,
+    /// The longest an entry runs, the bytes every key shares and the depth past them: an entry
+    /// this long is whole, standing for every key that starts with it.
+    reach: usize,
     /// The keys filtered: an entry each, but one for all a whole entry holds.
     keys: u64,
-}
-
-/// The bit above an entry's `suffix` bits that marks it whole: it stands for every key starting
-/// with its prefix.
-fn whole_bit(suffix: u32) -> u32 {
-    1u32.checked_shl(suffix).unwrap_or(0)
 }
 
 impl Surf {
@@ -103,13 +100,12 @@ impl Surf {
             return false;
         }
         let n = self.suffix;
-        let whole = whole_bit(n);
         let found = self.trie.seek(from, scratch, |len, v| {
             // A stored prefix of `from`: a whole one holds every key starting with it, `from`'s
             // place among them; another holds those at or past `from` whose bits after the prefix
             // are at least `from`'s.
             let p = from.get(..len).unwrap_or(&[]);
-            if v & whole != 0 || (v >= suffix_of(from, len, n) && starts_below(p, v, n, end)) {
+            if len >= self.reach || (v >= suffix_of(from, len, n) && starts_below(p, v, n, end)) {
                 ControlFlow::Break(())
             } else {
                 ControlFlow::Continue(())
@@ -119,7 +115,9 @@ impl Surf {
             ControlFlow::Break(()) => true,
             ControlFlow::Continue(None) => false,
             // A whole entry's interval starts at its prefix.
-            ControlFlow::Continue(Some(v)) if v & whole != 0 => starts_below(scratch, 0, 0, end),
+            ControlFlow::Continue(Some(_)) if scratch.len() >= self.reach => {
+                starts_below(scratch, 0, 0, end)
+            }
             ControlFlow::Continue(Some(s)) => starts_below(scratch, s, n, end),
         }
     }
@@ -160,10 +158,12 @@ impl Surf {
         self.trie.held_bytes()
     }
 
-    /// Appends the filter to `out`: its suffix bits, the keys it filters, then its trie.
+    /// Appends the filter to `out`: its suffix bits, the keys it filters, its reach, then its
+    /// trie.
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.push(u8::try_from(self.suffix).unwrap_or(u8::MAX));
         out.extend_from_slice(&self.keys.to_le_bytes());
+        out.extend_from_slice(&u64::try_from(self.reach).unwrap_or(u64::MAX).to_le_bytes());
         self.trie.encode(out);
     }
 
@@ -174,23 +174,32 @@ impl Surf {
             why,
         };
         let suffix = u32::from(*bytes.first().ok_or(corrupt(Malformed::Truncated))?);
-        // The whole bit sits above the suffix bits, within a value's width.
-        if suffix >= MAX_WIDTH {
+        if suffix > MAX_WIDTH {
             return Err(corrupt(Malformed::OutOfRange));
         }
-        let keys = bytes
-            .get(1..9)
-            .and_then(|b| b.first_chunk::<8>())
-            .map(|b| u64::from_le_bytes(*b))
-            .ok_or(corrupt(Malformed::Truncated))?;
-        let (trie, used) = Trie::decode(bytes.get(9..).unwrap_or(&[]))?;
+        let word = |at: usize| {
+            bytes
+                .get(at..)
+                .and_then(<[u8]>::first_chunk::<8>)
+                .map(|b| u64::from_le_bytes(*b))
+                .ok_or(corrupt(Malformed::Truncated))
+        };
+        let keys = word(1)?;
+        // A reach past what this machine addresses is past every key's length: no entry is whole.
+        let reach = usize::try_from(word(9)?).unwrap_or(usize::MAX);
+        let (trie, used) = Trie::decode(bytes.get(17..).unwrap_or(&[]))?;
         // Each entry holds one key at least.
         if u64::try_from(trie.len()).map_or(true, |n| n > keys) {
             return Err(corrupt(Malformed::CountMismatch));
         }
         Ok((
-            Self { trie, suffix, keys },
-            used.checked_add(9).ok_or(corrupt(Malformed::TooLarge))?,
+            Self {
+                trie,
+                suffix,
+                reach,
+                keys,
+            },
+            used.checked_add(17).ok_or(corrupt(Malformed::TooLarge))?,
         ))
     }
 }
@@ -206,16 +215,13 @@ pub struct SurfBuilder {
     /// the depth past them.
     shared: usize,
     reach: usize,
-    /// The bytes the key held shares with the key before it.
+    /// The bytes the key held shares with the key before it, always less than the reach: one
+    /// sharing that much is the whole entry's own.
     shared_before: usize,
-    /// Whether a key is held, waiting for the next to be cut, and whether any key came.
+    /// Whether a key is held, waiting for the next to be cut.
     pending: bool,
-    started: bool,
-    /// The keys pushed, those whole entries hold included.
-    keys: u64,
-    /// The last entry's length when it is whole: the keys after it that start with it are its
-    /// own.
-    whole: Option<usize>,
+    /// The keys whole entries hold past the ones they were cut from.
+    absorbed: u64,
 }
 
 impl SurfBuilder {
@@ -231,28 +237,26 @@ impl SurfBuilder {
     /// `depth` bytes (one at least) past the `shared` bytes every key of the run will share, its
     /// buffers kept.
     pub fn reset(&mut self, suffix: u32, depth: usize, shared: usize) -> Result<(), Error> {
-        if suffix >= MAX_WIDTH || depth == 0 {
+        if depth == 0 {
             return Err(Error::InvalidArgument {
-                what: "a range filter's suffix past 31 bits or its depth none",
+                what: "a range filter's depth none",
             });
         }
-        // Below 32, so the whole bit fits a value.
-        self.trie.reset(Width::Bits(suffix.saturating_add(1)))?;
+        // Past 32 suffix bits, refused by the values' width.
+        self.trie.reset(Width::Bits(suffix))?;
         self.suffix = suffix;
         self.shared = shared;
         self.reach = shared.saturating_add(depth);
         self.shared_before = 0;
         self.pending = false;
-        self.started = false;
-        self.keys = 0;
-        self.whole = None;
+        self.absorbed = 0;
         Ok(())
     }
 
     /// States that every key of the run will share its first `shared` bytes, before the first
     /// key comes: the depth counts past them.
     pub fn share(&mut self, shared: usize) -> Result<(), Error> {
-        if self.started {
+        if self.pending || !self.trie.is_empty() {
             return Err(Error::InvalidArgument {
                 what: "a range filter's shared bytes stated after a key",
             });
@@ -266,41 +270,39 @@ impl SurfBuilder {
     /// bytes the two share (`shared`): the caller holds both, and has checked the next is the
     /// greater, as the branch builder does as it adds an entry, so the filter keeps no copy of
     /// a key. A key goes into the trie once the next is known, cut one byte past what it shares
-    /// with either neighbour: here `before`, and the last at [`Self::finish`]. A key starting
-    /// with the last entry when that entry is whole is the entry's own, and is not held. Keys
-    /// sharing fewer bytes than every key was to are refused: the depth would not bound them.
+    /// with either neighbour: here `before`, and the last at [`Self::finish`]. A key sharing the
+    /// reach with the key before starts with the whole entry that key is or is held by, and is
+    /// that entry's own: it is not held. Keys sharing fewer bytes than every key was to are
+    /// refused: the depth would not bound them.
     pub fn push(&mut self, before: Option<&[u8]>, shared: usize) -> Result<(), Error> {
         match before {
-            None if !self.started => {
-                self.keys = 1;
-                self.started = true;
-                self.shared_before = 0;
-                self.pending = true;
-            }
-            Some(key) if self.started => {
+            Some(key) => {
                 if shared < self.shared {
                     return Err(Error::InvalidArgument {
                         what: "a range filter's key without the bytes every key was to share",
                     });
                 }
-                self.keys = self.keys.saturating_add(1);
                 if self.pending {
                     self.cut(key, shared)?;
-                }
-                if self.whole.is_some_and(|len| shared >= len) {
-                    self.pending = false;
-                } else {
-                    // Past the whole entry's interval: no later key starts with it.
-                    self.whole = None;
-                    self.shared_before = shared;
-                    self.pending = true;
+                } else if self.trie.is_empty() {
+                    return Err(Error::InvalidArgument {
+                        what: "a range filter given a key before its first",
+                    });
                 }
             }
-            _ => {
+            None if !self.pending && self.trie.is_empty() => {}
+            None => {
                 return Err(Error::InvalidArgument {
                     what: "a range filter given a key without the one before it",
                 });
             }
+        }
+        if shared >= self.reach {
+            self.pending = false;
+            self.absorbed = self.absorbed.saturating_add(1);
+        } else {
+            self.shared_before = shared;
+            self.pending = true;
         }
         Ok(())
     }
@@ -316,19 +318,9 @@ impl SurfBuilder {
             .max(shared_after)
             .saturating_add(1)
             .min(key.len());
+        // At the reach, whole: its suffix bits are kept but never read.
         let len = natural.min(self.reach);
-        if !self.trie.is_empty() && len <= self.shared_before {
-            // The key shares the reach with the key before, which is this key cut there: that
-            // entry turns whole, and holds this key.
-            self.whole = Some(len);
-            return self.trie.set_last(whole_bit(self.suffix));
-        }
-        let value = if len < natural {
-            self.whole = Some(len);
-            whole_bit(self.suffix)
-        } else {
-            suffix_of(key, len, self.suffix)
-        };
+        let value = suffix_of(key, len, self.suffix);
         self.trie
             .add_after(key.get(..len).unwrap_or(&[]), self.shared_before, value)
     }
@@ -340,19 +332,27 @@ impl SurfBuilder {
                 self.cut(key, 0)?;
                 self.pending = false;
             }
-            // The last key the last entry's own, or no key at all.
-            (Some(_), false) if self.whole.is_some() => {}
-            (None, false) if !self.started => {}
+            // The last key a whole entry's own, or no key at all.
+            (Some(_), false) if !self.trie.is_empty() => {}
+            (None, false) if self.trie.is_empty() => {}
             _ => {
                 return Err(Error::InvalidArgument {
                     what: "a range filter finished without its last key",
                 });
             }
         }
+        let trie = self.trie.finish()?;
+        let keys = u64::try_from(trie.len())
+            .ok()
+            .and_then(|entries| entries.checked_add(self.absorbed))
+            .ok_or(Error::InvalidArgument {
+                what: "a range filter of more keys than a count holds",
+            })?;
         Ok(Surf {
-            trie: self.trie.finish()?,
+            trie,
             suffix: self.suffix,
-            keys: self.keys,
+            reach: self.reach,
+            keys,
         })
     }
 }
@@ -407,9 +407,10 @@ mod tests {
 
     /// The filter the rule gives `keys`, which share their first `shared` bytes, cut from the
     /// whole keys: each one byte past its longest prefix shared with a neighbour, or `depth` bytes
-    /// past the shared ones when that is shorter, whole then; a key after a whole entry that
-    /// starts with it takes none.
+    /// past the shared ones, its reach, when that is no longer, whole then; a key after a whole
+    /// entry that starts with it takes none.
     fn by_rule(keys: &[&Vec<u8>], suffix: u32, depth: usize, shared: usize) -> Surf {
+        let reach = shared.saturating_add(depth);
         let mut entries: Vec<(&[u8], u32)> = Vec::new();
         let mut whole: Option<&[u8]> = None;
         for (i, k) in keys.iter().enumerate() {
@@ -420,26 +421,23 @@ mod tests {
             let before = i.checked_sub(1).map_or(0, |j| lcp(keys[j], k));
             let after = keys.get(i + 1).map_or(0, |n| lcp(k, n));
             let natural = before.max(after).saturating_add(1).min(k.len());
-            let len = natural.min(shared.saturating_add(depth));
-            let p = &k[..len];
-            if entries.last().is_some_and(|(q, _)| *q == p) {
-                // The key before cut at the same place: its entry turns whole and holds both.
-                entries.last_mut().unwrap().1 = 1 << suffix;
-                whole = Some(p);
-            } else if len < natural {
-                entries.push((p, 1 << suffix));
+            if natural >= reach {
+                // Whole: its suffix bits kept, never read.
+                let p = &k[..reach];
+                entries.push((p, suffix_of(k, reach, suffix)));
                 whole = Some(p);
             } else {
-                entries.push((p, suffix_of(k, len, suffix)));
+                entries.push((&k[..natural], suffix_of(k, natural, suffix)));
             }
         }
-        let mut t = TrieBuilder::new(Width::Bits(suffix + 1)).unwrap();
+        let mut t = TrieBuilder::new(Width::Bits(suffix)).unwrap();
         for (p, v) in entries {
             t.add(p, v).unwrap();
         }
         Surf {
             trie: t.finish().unwrap(),
             suffix,
+            reach,
             keys: keys.len() as u64,
         }
     }

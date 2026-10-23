@@ -91,6 +91,43 @@ impl Packed {
         Ok(())
     }
 
+    /// Appends `other`'s values, of the same width, a word at a time: each of its words split
+    /// across the two words it lands in. Bits past either's values are clear, so a word past the
+    /// new length would hold none, and is not taken.
+    pub fn append(&mut self, other: &Packed) -> Result<(), Error> {
+        if other.width != self.width {
+            return Err(Error::InvalidArgument {
+                what: "packed values appended at another width",
+            });
+        }
+        let len = self.len.checked_add(other.len).ok_or(corrupt())?;
+        let need = self.words_for(len).ok_or(corrupt())?;
+        let shift = self
+            .len
+            .checked_mul(usize::try_from(self.width).map_err(|_| corrupt())?)
+            .ok_or(corrupt())?
+            % 64;
+        let words = other
+            .words
+            .get(..other.words_for(other.len).ok_or(corrupt())?)
+            .ok_or(corrupt())?;
+        if shift == 0 {
+            self.words.extend_from_slice(words);
+        } else {
+            let back = 64usize.saturating_sub(shift);
+            for &w in words {
+                if let Some(last) = self.words.last_mut() {
+                    *last |= w << shift;
+                }
+                if self.words.len() < need {
+                    self.words.push(w >> back);
+                }
+            }
+        }
+        self.len = len;
+        Ok(())
+    }
+
     /// Writes value `i`'s bits, all clear before.
     fn put(&mut self, i: usize, v: u32) {
         let w = self.width as usize;
@@ -214,6 +251,33 @@ impl Packed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Values appended a sequence at a time are those pushed one at a time, at every width and
+    /// every offset within a word.
+    #[test]
+    fn appended_values_are_the_values_pushed() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for width in 0..=MAX_WIDTH {
+            let (mut whole, mut pushed) =
+                (Packed::new(width).unwrap(), Packed::new(width).unwrap());
+            for _ in 0..6 {
+                let mut part = Packed::new(width).unwrap();
+                for _ in 0..(next() % 150) {
+                    let v = u32::try_from(next() % (1u64 << width)).unwrap();
+                    part.push(v).unwrap();
+                    pushed.push(v).unwrap();
+                }
+                whole.append(&part).unwrap();
+            }
+            assert_eq!(whole, pushed, "width {width}");
+        }
+    }
 
     #[test]
     #[allow(clippy::cast_possible_truncation)]

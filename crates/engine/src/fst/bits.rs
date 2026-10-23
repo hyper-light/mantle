@@ -236,6 +236,39 @@ impl Bits {
         )
     }
 
+    /// For each of `ranks`, ascending, the position of the set bit of that rank (the `k`th set
+    /// bit for `k`, counted from 0), in one pass over the words: each word's count of set bits
+    /// passed, and the bit found within the word that holds it. A rank past the set bits ends
+    /// the pass.
+    pub fn select_each(
+        &self,
+        ranks: impl IntoIterator<Item = usize>,
+        mut found: impl FnMut(usize, usize),
+    ) {
+        let mut ranks = ranks.into_iter().peekable();
+        let mut seen = 0usize;
+        for (i, &w) in self.words.iter().enumerate() {
+            let ones = w.count_ones() as usize;
+            while let Some(&k) = ranks.peek() {
+                let Some(within) = k.checked_sub(seen).filter(|&r| r < ones) else {
+                    break;
+                };
+                // The `within`th set bit of the word: the lower ones cleared.
+                let mut bits = w;
+                for _ in 0..within {
+                    bits &= bits.wrapping_sub(1);
+                }
+                found(
+                    k,
+                    i.saturating_mul(64)
+                        .saturating_add(bits.trailing_zeros() as usize),
+                );
+                ranks.next();
+            }
+            seen = seen.saturating_add(ones);
+        }
+    }
+
     /// The first set bit at or past `i`, by words: a node's end in LOUDS-Sparse is usually in
     /// the word its start is.
     pub fn next_one(&self, i: usize) -> Option<usize> {

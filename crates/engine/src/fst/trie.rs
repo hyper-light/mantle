@@ -140,11 +140,32 @@ impl Starts {
     /// are counted first, so they are taken once at their size.
     fn of(louds: &Bits, labels: usize) -> Result<Self, Error> {
         let nodes = louds.ones();
-        let mut need = 0usize;
-        Self::each_block(louds, labels, nodes, |_, extras| {
-            need = need.saturating_add(extras.map_or(0, <[u16]>::len));
-            Ok(())
-        })?;
+        let blocks = nodes.saturating_add(1).div_ceil(STARTS_BLOCK);
+        // The extras' length first, from each block's first and last entries' starts alone, in
+        // one pass over the words: a block keeps extras when its entries span more labels than
+        // one each. The last block ends at the part's end.
+        let (mut need, mut first_at) = (0usize, 0usize);
+        let last = STARTS_BLOCK.saturating_sub(1);
+        louds.select_each(
+            (0..blocks)
+                .flat_map(|b| {
+                    let first = b.saturating_mul(STARTS_BLOCK);
+                    [first, first.saturating_add(last)]
+                })
+                .filter(|&rank| rank < nodes),
+            |rank, at| {
+                if rank % STARTS_BLOCK == 0 {
+                    first_at = at;
+                } else if at.saturating_sub(first_at) > last {
+                    need = need.saturating_add(STARTS_BLOCK);
+                }
+            },
+        );
+        let first = blocks.saturating_sub(1).saturating_mul(STARTS_BLOCK);
+        let entries = nodes.saturating_sub(first);
+        if first < nodes && labels.saturating_sub(first_at) > entries {
+            need = need.saturating_add(entries.saturating_add(1));
+        }
         let mut starts = Self {
             nodes,
             blocks: Vec::with_capacity(nodes.div_ceil(STARTS_BLOCK).saturating_add(1)),
@@ -653,8 +674,14 @@ impl TrieBuilder {
             s_child.append(&l.has_child);
             s_louds.append(&l.louds);
             s_prefix.append(&l.prefix);
-            for i in 0..l.values.len() {
-                s_values.push(l.values.get(i).ok_or(corrupt())?)?;
+            if l.values.width() == width {
+                s_values.append(&l.values)?;
+            } else {
+                // A leaf index's page numbers, held at full width until the largest was known:
+                // a value a leaf, few.
+                for i in 0..l.values.len() {
+                    s_values.push(l.values.get(i).ok_or(corrupt())?)?;
+                }
             }
         }
         if d_values.len().saturating_add(s_values.len()) != self.keys {
@@ -1510,6 +1537,12 @@ mod tests {
                     .finish_at(cutoff)
                     .unwrap();
                 assert_eq!(t.len(), map.len());
+                // The node starts' extras counted before they were taken: exactly their room.
+                assert_eq!(
+                    t.sparse.starts.extra.capacity(),
+                    t.sparse.starts.extra.len(),
+                    "case {case} cut {cutoff}"
+                );
                 let mut out = Vec::new();
                 t.encode(&mut out);
                 assert_eq!(Trie::decode(&out).unwrap(), (t.clone(), out.len()));

@@ -531,3 +531,31 @@ gate weighs them.
   what the shard held (1,187,783 bytes on the Mac, none on Windows), and now states that growth
   (072fed1a). The process's working set, which Windows gives (`GetProcessMemoryInfo`), is the
   reading to add to hyper-rt.
+- **The final build's seeks at 1M, after landing.** Its release gate left seeks at 0.967 of
+  data-layer's at 1M (four rounds; 0.986 over eight) and 0.980 at 10M with no A/A beside them.
+  With one (R0 7770 and 7790, twelve rounds, the base shifted by an unused function as its third
+  arm): at 1M the final's seeks 0.983 of the base's (0.965-0.993, every round below one) and the
+  shifted base's 1.000 (0.981-1.013); at 10M 0.996 and 1.007, within the shift's movement. Two
+  bisects over the follow's 35 commits at 1M (R0 7810 and 7830, sixteen rounds each) put the loss
+  on one: 1fc3342a, a loan's fresh memory in buffers of at most a huge page, 0.924 where the commit
+  before it ran 0.996. The VM's kernel gives huge pages to all anonymous memory (`[always]`, a 2
+  MiB page), and a buffer of 2 MiB from glibc's allocator lies on none, so the cache's pages lost
+  them; the commits after it won most back (on huge pages, 99443a82; 16 bytes into a line,
+  573cf167: 0.980). Arms on the final (R0 7850-7924) measured what remains: its buffers kept off
+  huge pages 0.954 at 1M and 0.906 at 10M; a loan in buffers of 32 huge pages 0.990 and 0.993 at
+  1M, 1.015 and 1.002 at 10M; glibc's buffers with those 64 MiB loans 0.984 and 0.997; pages 32
+  bytes into a line 0.985, 48 bytes 0.949. Three shifts of the final's own layout (R0 7930,
+  eighteen rounds) ran 0.965, 0.971 and 0.978 where the final ran 0.975 and the shifted base
+  0.996: the loss is not the layout's. The engine counted the same work in both (1,314,285 cache
+  hits, a source a scan, no device read). On bare-metal x86_64 (adacachy, interleaved, four pairs,
+  `perf record -e cycles:u -k mono` cut to the seek phase by the `profile-phases` stamps) the
+  final drew 0.93 of the base's samples: the loss shows on the VM, an arm64 guest on Apple
+  silicon, and not on bare-metal x86_64. A loan's buffers of 2, 8 and 32 huge pages (R0 7950 and
+  7980) ran 0.985, 0.985 and 0.986 at 1M where the final ran 0.979 (twenty rounds), and 1.026,
+  1.002 and 1.009 at 10M where it ran 0.979 (ten rounds, 0.95-1.28 apart): at 1M within a round's
+  spread. A cache hit's page touch finds its page's chunk by a search over the chunks' first slots,
+  so its overlap with the slot's read needs no slot (`Cache::touch_page`): without the touch the
+  seeks ran 0.993 of the final's, with the chunk taken from the slot 0.989 (R0 8000, twenty
+  rounds), so neither the search nor its depth over the chunks is the cost, and the touch is worth
+  keeping. *Open:* the 1M seeks on the VM run 1.5-2.5% below data-layer's, the same work in the
+  engine's own counts, and no arm here took it back.

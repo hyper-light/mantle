@@ -291,7 +291,14 @@ when it binds, and is measured then.
      memtable's index is sized for the entries the one before it held, so it neither grows nor
      migrates as it fills. Without a memory budget, or without workers to build the index (a get's
      probes would grow with the memtables kept), none is kept; reopened, none is. An index drops
-     the entries of memtables given back when they are more than half of what it holds.
+     the entries of memtables given back when they are more than half of what it holds. A shard
+     sized to the machine (`ShardDb::follow_machine`) has a budget that follows the machine's room,
+     what it could give without writing anything out first (`port::memory::room_now`: on Linux
+     `MemAvailable` less dirty and writeback pages and the process's own pages in swap), looked at
+     each rotation, each get cycle and in idle time as workers report: the budget is what the
+     regions and kept memtables hold and the shard's share of that room, less what grew outside
+     its account between two looks, so the kept memtables give memory back, and the caches are
+     trimmed, as the machine runs short (docs/research/65 §2-§5).
 3. **The tree.** Root to leaf; at each node each branch's filter is asked before its leaf is
    read. With the filters and branch interiors in memory, a cold get costs about one device read
    (research/34 §1).

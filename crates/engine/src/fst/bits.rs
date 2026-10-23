@@ -17,8 +17,11 @@ fn corrupt() -> Error {
 pub struct Bits {
     words: Vec<u64>,
     len: usize,
-    /// Words a rank block holds (`B / 64`), and the set bits before each block.
+    /// Words a rank block holds (`B / 64`), a power of two, and its log: a position's block is a
+    /// shift, where a division by a count read at run time is the slowest step of a rank.
     block_words: usize,
+    block_shift: u32,
+    /// The set bits before each block.
     ranks: Vec<u32>,
     ones: usize,
 }
@@ -155,17 +158,17 @@ impl Bits {
 
     /// The vector a builder filled, its words taken as they are.
     pub fn from_grow(bits: Grow, block_bits: usize) -> Result<Self, Error> {
-        let block_words =
-            block_bits
-                .checked_div(64)
-                .filter(|&w| w > 0)
-                .ok_or(Error::InvalidArgument {
-                    what: "a rank block that is not a whole number of words",
-                })?;
+        let block_words = block_bits
+            .checked_div(64)
+            .filter(|&w| w.is_power_of_two())
+            .ok_or(Error::InvalidArgument {
+                what: "a rank block that is not a power of two of words",
+            })?;
         let mut v = Self {
             words: bits.words,
             len: bits.len,
             block_words,
+            block_shift: block_words.trailing_zeros(),
             ranks: Vec::new(),
             ones: 0,
         };
@@ -219,16 +222,17 @@ impl Bits {
         }
         let i = i.min(self.len.saturating_sub(1));
         let word = i / 64;
-        let block = word.checked_div(self.block_words).unwrap_or(0);
-        let mut r = self.ranks.get(block).map_or(0, |&r| r as usize);
-        for w in block.saturating_mul(self.block_words)..word {
-            r = r.saturating_add(self.words.get(w).map_or(0, |w| w.count_ones() as usize));
-        }
-        let mask = if i % 64 == 63 {
-            u64::MAX
-        } else {
-            (1u64 << ((i % 64).saturating_add(1))).wrapping_sub(1)
-        };
+        // The shift is below 64: the block is a power of two of words.
+        let block = word.wrapping_shr(self.block_shift);
+        let first = word & !self.block_words.wrapping_sub(1);
+        let r = self.ranks.get(block).map_or(0, |&r| r as usize);
+        let r = self.words.get(first..word).map_or(r, |words| {
+            words
+                .iter()
+                .fold(r, |r, w| r.saturating_add(w.count_ones() as usize))
+        });
+        // The bits up to i's within its word: all of them shifted down past the rest.
+        let mask = u64::MAX.wrapping_shr(u32::try_from(63 ^ (i % 64)).unwrap_or(0));
         r.saturating_add(
             self.words
                 .get(word)
@@ -334,7 +338,8 @@ impl Bits {
         };
         let len = usize::try_from(word(0)?).map_err(|_| corrupt())?;
         let block_words = usize::try_from(word(8)?).map_err(|_| corrupt())?;
-        if block_words == 0 {
+        // A block is a power of two of words, as every writer gives it: a rank shifts to it.
+        if !block_words.is_power_of_two() {
             return Err(corrupt());
         }
         let n = len.div_ceil(64);
@@ -355,6 +360,7 @@ impl Bits {
             words,
             len,
             block_words,
+            block_shift: block_words.trailing_zeros(),
             ranks: Vec::new(),
             ones: 0,
         };
@@ -421,6 +427,33 @@ mod tests {
             .count()
     }
 
+    /// A rank block is a power of two of words, as a rank shifts to it: any other is refused,
+    /// built or read.
+    #[test]
+    fn rank_blocks_not_a_power_of_two_of_words_are_refused() {
+        for block in [0, 32, 192, 320] {
+            assert!(matches!(
+                Bits::new(&[true], block),
+                Err(Error::InvalidArgument { .. })
+            ));
+        }
+        let mut out = Vec::new();
+        Bits::new(&[true, false, true], 512)
+            .unwrap()
+            .encode(&mut out);
+        assert_eq!(Bits::decode(&out).unwrap().0.rank1(2), 2);
+        for words in [0u64, 3, 6] {
+            out[8..16].copy_from_slice(&words.to_le_bytes());
+            assert!(matches!(
+                Bits::decode(&out),
+                Err(Error::Corruption {
+                    why: Malformed::OutOfRange,
+                    ..
+                })
+            ));
+        }
+    }
+
     #[test]
     fn rank_and_scans_agree_with_counting_on_every_position() {
         let mut x = 0x9e37_79b9_7f4a_7c15u64;
@@ -434,7 +467,7 @@ mod tests {
                         x % 100 < density
                     })
                     .collect();
-                for block in [64, 512] {
+                for block in [64, 128, 512, 4096] {
                     let v = Bits::new(&bits, block).unwrap();
                     assert_eq!(v.ones(), bits.iter().filter(|&&b| b).count());
                     for i in 0..len {

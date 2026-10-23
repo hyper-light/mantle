@@ -47,9 +47,13 @@ const DENSE_NODE_BITS: usize = 513;
 const SPARSE_LABEL_BITS: usize = 10;
 
 /// Nodes a block of [`Starts`]: the most whose extra labels always fit 16 bits. A node holds at
-/// most 256 labels, one a byte value, so the 255 nodes before another in its block hold at most
-/// 255 × 255 = 65,025 labels past their first.
+/// most 256 labels, one a byte value, so a block's 256 nodes hold at most 256 × 255 = 65,280
+/// labels past their first, where the next block starts included.
 const STARTS_BLOCK: usize = 256;
+
+/// The extras a block keeps: one a node, and where the next block's first node starts, so a
+/// node's labels end within its own block's entries.
+const STARTS_ENTRIES: usize = STARTS_BLOCK + 1;
 
 /// Labels a node can hold: one a byte value.
 const NODE_LABELS: usize = 256;
@@ -115,13 +119,15 @@ struct Sparse {
 const NO_EXTRA: u32 = u32::MAX;
 
 /// The position of each node's first label in the sparse part, and past the last node its end:
-/// a node's labels are two loads, where select on S-LOUDS scanned from a sample every 64 node
-/// starts by popcounts, the most of a leaf lookup's instructions (research/62 §1). A node starts
-/// at its block's first node's position (every [`STARTS_BLOCK`]th), plus one label for each node
-/// before it in the block, plus those nodes' labels past their first, in 16 bits. A block whose
-/// nodes each hold one label, a run of single-child chains, keeps no extras: there a node starts
-/// at its own number past the block's first (research/62 §2). Built from S-LOUDS when the trie is
-/// built or read, so no byte written changes.
+/// a node's labels are its block's entry and two adjacent extras, where select on S-LOUDS scanned
+/// from a sample every 64 node starts by popcounts, the most of a leaf lookup's instructions
+/// (research/62 §1). A node starts at its block's first node's position (every
+/// [`STARTS_BLOCK`]th), plus one label for each node before it in the block, plus those nodes'
+/// labels past their first, in 16 bits; a block's extras run one past its last node, to where the
+/// next block starts, so a node's end is the extra beside its start's. A block whose nodes each
+/// hold one label, a run of single-child chains, keeps no extras: there a node starts at its own
+/// number past the block's first and holds one label (research/62 §2). Built from S-LOUDS when
+/// the trie is built or read, so no byte written changes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Starts {
     /// The nodes, not counting the end past the last.
@@ -129,8 +135,8 @@ struct Starts {
     /// Each block's first node's position, and where its extras begin in `extra` ([`NO_EXTRA`]
     /// for none).
     blocks: Vec<(u32, u32)>,
-    /// Each node's labels past one a node before it in its block, the end's included, for the
-    /// blocks that keep extras.
+    /// Each node's labels past one a node before it in its block, and the next block's first's
+    /// (the last block's: the end's), for the blocks that keep extras.
     extra: Vec<u16>,
 }
 
@@ -141,30 +147,28 @@ impl Starts {
     fn of(louds: &Bits, labels: usize) -> Result<Self, Error> {
         let nodes = louds.ones();
         let blocks = nodes.saturating_add(1).div_ceil(STARTS_BLOCK);
-        // The extras' length first, from each block's first and last entries' starts alone, in
-        // one pass over the words: a block keeps extras when its entries span more labels than
-        // one each. The last block ends at the part's end.
-        let (mut need, mut first_at) = (0usize, 0usize);
-        let last = STARTS_BLOCK.saturating_sub(1);
+        // The extras' length first, from each block's first node's start alone, in one pass over
+        // the words: a block keeps extras when the nodes it holds span more labels than one each,
+        // to where the next block starts, the last block's to the part's end.
+        let (mut need, mut prev) = (0usize, None);
         louds.select_each(
             (0..blocks)
-                .flat_map(|b| {
-                    let first = b.saturating_mul(STARTS_BLOCK);
-                    [first, first.saturating_add(last)]
-                })
+                .map(|b| b.saturating_mul(STARTS_BLOCK))
                 .filter(|&rank| rank < nodes),
-            |rank, at| {
-                if rank % STARTS_BLOCK == 0 {
-                    first_at = at;
-                } else if at.saturating_sub(first_at) > last {
-                    need = need.saturating_add(STARTS_BLOCK);
+            |_, at| {
+                if prev.is_some_and(|p: usize| at.saturating_sub(p) > STARTS_BLOCK) {
+                    need = need.saturating_add(STARTS_ENTRIES);
                 }
+                prev = Some(at);
             },
         );
-        let first = blocks.saturating_sub(1).saturating_mul(STARTS_BLOCK);
-        let entries = nodes.saturating_sub(first);
-        if first < nodes && labels.saturating_sub(first_at) > entries {
-            need = need.saturating_add(entries.saturating_add(1));
+        // The block of the last node runs to the end: it holds its nodes and the end's entry.
+        if let Some(p) = prev {
+            let first = (nodes.saturating_sub(1) / STARTS_BLOCK).saturating_mul(STARTS_BLOCK);
+            let held = nodes.saturating_sub(first);
+            if labels.saturating_sub(p) > held {
+                need = need.saturating_add(held.saturating_add(1));
+            }
         }
         let mut starts = Self {
             nodes,
@@ -188,14 +192,15 @@ impl Starts {
     }
 
     /// Each block of the `nodes` nodes' starts, and the end past the last, in order: its first
-    /// node's position, and its extras when a node of it holds more than one label.
+    /// node's position, and its extras when a node of it holds more than one label, the last of
+    /// them where the next block starts.
     fn each_block(
         louds: &Bits,
         labels: usize,
         nodes: usize,
         mut block: impl FnMut(usize, Option<&[u16]>) -> Result<(), Error>,
     ) -> Result<(), Error> {
-        let mut extras = [0u16; STARTS_BLOCK];
+        let mut extras = [0u16; STARTS_ENTRIES];
         let (mut first, mut held_more) = (0usize, false);
         let mut extra = 0usize;
         let mut prev = None;
@@ -216,6 +221,10 @@ impl Starts {
             let within = n % STARTS_BLOCK;
             if within == 0 {
                 if n > 0 {
+                    // The block before ends where this one starts: its last extra.
+                    let e = u16::try_from(extra).map_err(|_| corrupt())?;
+                    held_more |= e > 0;
+                    *extras.get_mut(STARTS_BLOCK).ok_or(corrupt())? = e;
                     block(first, if held_more { Some(&extras[..]) } else { None })?;
                 }
                 first = at;
@@ -249,6 +258,30 @@ impl Starts {
         (start as usize).checked_add(within)?.checked_add(extra)
     }
 
+    /// Node `n`'s labels, where it starts and where the next node does: its block's entry and two
+    /// adjacent extras, the block's extras running one past its last node.
+    fn range(&self, n: usize) -> Option<(usize, usize)> {
+        if n >= self.nodes {
+            return None;
+        }
+        let (start, extras) = *self.blocks.get(n / STARTS_BLOCK)?;
+        let within = n % STARTS_BLOCK;
+        let start = (start as usize).checked_add(within)?;
+        let next = start.checked_add(1)?;
+        if extras == NO_EXTRA {
+            // Every node of the block holds one label.
+            return Some((start, next));
+        }
+        let [a, b] = *self
+            .extra
+            .get((extras as usize).checked_add(within)?..)?
+            .first_chunk::<2>()?;
+        Some((
+            start.checked_add(usize::from(a))?,
+            next.checked_add(usize::from(b))?,
+        ))
+    }
+
     /// Bytes held.
     fn bytes(&self) -> usize {
         self.blocks
@@ -267,14 +300,11 @@ impl Starts {
 }
 
 impl Sparse {
-    /// Node `n`: its first label's position and the next node's.
+    /// Node `n`: its first label's position and the next node's; none past the last.
     fn range(&self, n: usize) -> (usize, usize) {
-        let start = self.starts.at(n).unwrap_or(self.labels.len());
-        let end = n
-            .checked_add(1)
-            .and_then(|m| self.starts.at(m))
-            .unwrap_or(self.labels.len());
-        (start, end)
+        self.starts
+            .range(n)
+            .unwrap_or((self.labels.len(), self.labels.len()))
     }
 
     /// The node the branch at label `p` goes on to.
@@ -1820,9 +1850,15 @@ mod tests {
         let full = every_two_bytes();
         let t = sparse_from(&full, 0);
         // The root's 256 labels, then the second level's 256 nodes of 256 each: node 255 is the
-        // second level's 255th, its block's extras the 255 labels past one of each node before.
+        // second level's 255th, its block's extras the 255 labels past one of each node before,
+        // and its last extra where node 256, the next block's first, starts.
         assert_eq!(t.sparse.starts.extra.get(255), Some(&65_025));
+        assert_eq!(t.sparse.starts.extra.get(256), Some(&65_280));
         assert_eq!(t.sparse.starts.at(255), Some(65_280));
+        assert_eq!(t.sparse.starts.range(255), Some((65_280, 65_536)));
+        assert_eq!(t.sparse.starts.at(256), Some(65_536));
+        assert_eq!(t.sparse.starts.range(256), Some((65_536, 65_792)));
+        assert_eq!(t.sparse.starts.range(257), None);
         for (i, k) in full.iter().enumerate().step_by(97) {
             assert_eq!(t.floor(k), Some(u32::try_from(i).unwrap()));
         }

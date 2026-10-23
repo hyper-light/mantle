@@ -461,3 +461,11 @@ gate weighs them.
   384 and 394 s for all 1,773 (Docker Desktop stopped the VM at 02:03:49 UTC, its log a requested
   shutdown with no requester named, and E1n's gets and seeks never ran). What it still lacks of
   the fixed arms' 263-276 s is mostly the kept memtables' (E1i).
+- **At 64 GiB.** The release build of the same code (engine-follow 1ba145a5, `ranges-follow`, md5
+  04986845, no account line), machine-sized at a billion rows with the VM at 64 GiB (`MemTotal`
+  62.7 GiB), where data-layer was OOM-killed at about 52 GB written: it completed
+  (`diag-runs/n1000000000-e64-1-m_follow`), 3,269,119 puts a second over 306 s, 16,189 gets and
+  9,704 seeks a second, recovery exact over 632,113,920 live keys. The VM's anonymous memory
+  peaked at 50.0 GiB 66 s in, the kept memtables at their fullest, with 11.4 GiB still available;
+  the kernel swapped out 770 pages in all and stalled on memory 12.9 s of the run's 681
+  (`/proc/pressure/memory` full).

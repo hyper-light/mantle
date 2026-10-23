@@ -2,10 +2,13 @@
 //! what `mantle_engine` states from its configuration and its trunk's height: its configured bytes
 //! (`shard_db::bounded_bytes`), its pools and builders at the most the trunk lets be out at once
 //! (`shard_db::pooled_bytes` over `TrunkConfig::cursors_most`, `builders_most` and `built_most`),
-//! and its branches' metadata as held (`ShardDb::memory`). Filled with paced puts and a scan of ten
-//! rows every 97, at the range's densest rows and its longest keys, with and without its largest
-//! values; each pool's peak is checked against its kind's count, each branch a compaction built
-//! against a leaf's limit, and the compactions holding their inputs at once against two.
+//! its branches' resident metadata at most the extents they hold times what an extent's is stated
+//! (`shard_db::resident_per_extent`; research/68), and the trunk's own records, its nodes, pivots
+//! and lists, as held (`ShardDb::memory`; node.md §1.4 names them open). Filled with paced puts
+//! and a scan of ten rows every 97, at the range's densest rows and its longest keys, with and
+//! without its largest values; each pool's peak is checked against its kind's count, each branch a
+//! compaction built against a leaf's limit, the compactions holding their inputs at once against
+//! two, and the branches' metadata held against its statement.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -123,18 +126,28 @@ fn fill(key_bytes: usize, value_bytes: usize, rows: u64) {
         peaks.buffers <= cursors + builders + 1,
         "{peaks:?} past {cursors} cursors and {builders} builders"
     );
-    let metadata = (memory.filters
-        + memory.indexes
-        + memory.counts
-        + memory.ranges
-        + memory.pivots
-        + memory.branches) as u64;
+    // The branches' resident metadata, each branch's filters, tries, counts, extents' numbers and
+    // record, against the extents they hold times an extent's statement; the trunk's lists' room
+    // past their branches' records, and its nodes' and pivots' records, as held.
+    let bits = mantle_engine::store::RANGE_FILTER_BITS;
+    let (branches, extents) = db.branch_counts();
+    let record = std::mem::size_of::<mantle_engine::branch::Branch>() as u64;
+    let branch_held = (memory.filters + memory.indexes + memory.counts + memory.ranges) as u64
+        + branches * record
+        + extents * 8;
+    let per_extent = shard_db::resident_per_extent(&config, key_bytes, bits).unwrap();
+    let branch_stated = per_extent * extents;
+    assert!(
+        branch_held <= branch_stated,
+        "{key_bytes}-byte keys: the branches' metadata held {branch_held} past {branch_stated} stated for {extents} extents"
+    );
+    let trunk_held = (memory.pivots + memory.branches) as u64 - branches * record - extents * 8;
     let bounded = shard_db::bounded_bytes(&config, memtable).unwrap();
     let pooled =
-        shard_db::pooled_bytes(&config, cursors, builders, key_bytes, entries, 1, 8).unwrap();
-    let stated = bounded + pooled + metadata;
+        shard_db::pooled_bytes(&config, cursors, builders, key_bytes, entries, 1, bits).unwrap();
+    let stated = bounded + pooled + branch_stated + trunk_held;
     eprintln!(
-        "keys {key_bytes} values {value_bytes} rows {rows}: held {held} of {stated} stated (configured {bounded}, pooled {pooled} for {cursors} cursors and {builders} builders of {entries} entries at height {height}, peaks {peaks:?}, metadata {metadata} {memory:?}, inflight_most {}, open_most {}, compacted_most {})",
+        "keys {key_bytes} values {value_bytes} rows {rows}: held {held} of {stated} stated (configured {bounded}, pooled {pooled} for {cursors} cursors and {builders} builders of {entries} entries at height {height}, peaks {peaks:?}, branches' metadata {branch_held} of {branch_stated} stated for {branches} branches of {extents} extents at {per_extent} an extent, trunk's records {trunk_held} {memory:?}, inflight_most {}, open_most {}, compacted_most {})",
         stats.inflight_most, stats.open_most, stats.compacted_most
     );
     assert!(

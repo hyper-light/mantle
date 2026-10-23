@@ -2748,6 +2748,27 @@ impl Trunk {
         &self.saved
     }
 
+    /// The branches the trunk names, each once, and the extents they hold: what their resident
+    /// metadata is stated for ([`crate::branch::resident_per_extent`]).
+    pub fn branch_counts(&self) -> (u64, u64) {
+        let (mut branches, mut extents) = (0u64, 0u64);
+        let mut count = |b: &Branch| {
+            branches = branches.saturating_add(1);
+            extents = extents.saturating_add(u64::try_from(b.extents.len()).unwrap_or(u64::MAX));
+        };
+        self.pending
+            .iter()
+            .flat_map(Pending::branches)
+            .for_each(&mut count);
+        for n in &self.nodes {
+            n.inflight.iter().flatten().for_each(&mut count);
+            for p in &n.pivots {
+                p.bundle.branches().iter().for_each(&mut count);
+            }
+        }
+        (branches, extents)
+    }
+
     /// The trunk's branches, for checks: every branch a node names, each naming once.
     pub fn branches(&self) -> Vec<Branch> {
         let mut out: Vec<Branch> = self

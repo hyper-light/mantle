@@ -5167,6 +5167,11 @@ impl<F: BlockFile> ShardDb<F> {
     pub fn shape(&self) -> Result<(usize, usize, usize), Error> {
         self.trunk.shape()
     }
+
+    /// The branches the trunk names and the extents they hold ([`crate::trunk::Trunk::branch_counts`]).
+    pub fn branch_counts(&self) -> (u64, u64) {
+        self.trunk.branch_counts()
+    }
 }
 
 #[cfg(test)]

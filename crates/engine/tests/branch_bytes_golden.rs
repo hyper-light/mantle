@@ -229,8 +229,12 @@ fn built_and_compacted_branches_write_the_bytes_they_always_have() {
     );
 }
 
-/// Recorded from main 9ccd216's builder and merge.
+/// Recorded from engine-cap's builder and merge, the trunk image's format 7 (research/67): range
+/// filters that state the keys they filter and cut their entries at a depth past the bytes every
+/// key shares, leaf indexes whose entries are pages doubled (a group's last leaf, its low bit set),
+/// and tries whose sparse levels are one sequence each. Main 9ccd216's: image digest
+/// 9_631_384_443_531_559_731, descriptors' 996_053_338_898_882_066.
 const BRANCHES: usize = 9;
 const IMAGE_BYTES: usize = 15_994_880;
-const IMAGE_DIGEST: u64 = 9_631_384_443_531_559_731;
-const DESCRIPTOR_DIGEST: u64 = 996_053_338_898_882_066;
+const IMAGE_DIGEST: u64 = 9_523_341_439_271_300_356;
+const DESCRIPTOR_DIGEST: u64 = 6_416_923_564_006_784_624;

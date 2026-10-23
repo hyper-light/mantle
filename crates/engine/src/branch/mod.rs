@@ -990,7 +990,7 @@ impl Builder {
             // The leaf's separator: the shortest prefix of its first key above the last leaf's
             // last key, the empty key for the first leaf.
             // The first leaf's separator is its first key: it shares the prefix every key of the
-            // branch has, so the index keeps that prefix as bytes ([`Branch::leaf_of`] places a
+            // branch has, so the index keeps that prefix as bytes ([`Branch::leaf_in`] places a
             // key below it in the first leaf).
             let mut cut = first.len();
             if !self.separators.is_empty() {

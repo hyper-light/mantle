@@ -1,12 +1,12 @@
-//! A branch's leaf index alone (`Branch::leaf_of`, the trie's `floor`; research/61 §2): the step
-//! of a seek's placing that finds the leaf a key falls in. A branch of `KEYS` keys is built with
-//! its leaf index as a seek finds it, in two shapes: the shard benchmark's 16-byte keys, a
+//! A branch's leaf index alone (`Branch::leaf_in`, the trie's `floor_with`; research/61 §2): the
+//! step of a seek's placing that finds the leaf a key falls in. A branch of `KEYS` keys is built
+//! with its leaf index as a seek finds it, in two shapes: the shard benchmark's 16-byte keys, a
 //! big-endian number padded with '0' bytes as RocksDB's db_bench writes them (every other number,
-//! so half the lookups fall between keys, as the seek benchmark's draws do), and
-//! object names under a few thousand prefixes, an S3 listing's. Each shape is looked up `LOOKUPS`
-//! times at keys drawn over twice its range, once to warm and once timed: nanoseconds and
-//! instructions a lookup, and the index's bytes written and held in memory. A fourth argument
-//! names one shape to run alone, so a profiler sees one shape's lookups.
+//! so half the lookups fall between keys, as the seek benchmark's draws do), and object names under
+//! a few thousand prefixes, an S3 listing's. Each shape is looked up `LOOKUPS` times at keys drawn
+//! over twice its range, once to warm and once timed: nanoseconds and instructions a lookup, and
+//! the index's bytes written and held in memory. A fourth argument names one shape to run alone, so
+//! a profiler sees one shape's lookups.
 //! `cargo bench -p mantle-engine --bench leaf_index -- DIR KEYS LOOKUPS [number|object]`
 #![allow(
     clippy::unwrap_used,

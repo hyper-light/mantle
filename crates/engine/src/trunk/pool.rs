@@ -496,7 +496,14 @@ fn run<F: BlockFile>(store: &mut Store<F>, job: &mut Job) -> Result<(Parts, u64)
                 if building.is_none() {
                     let n = end_of(part).saturating_sub(walked);
                     let n = u64::try_from(n).unwrap_or(u64::MAX);
-                    building = Some(Builder::new(store, Keys::Exactly(n))?);
+                    let mut b = Builder::new(store, Keys::Exactly(n))?;
+                    // The part's keys share what every key of the memtable does, and what its
+                    // first shares with the next part's cut, which they all lie below.
+                    let below = cuts
+                        .get(part.saturating_add(1))
+                        .map_or(0, |c| crate::util::keys::common_prefix(k, c));
+                    b.set_shared((*skip).max(below))?;
+                    building = Some(b);
                 }
                 let b = building.as_mut().ok_or(Error::Corruption {
                     what: "a memtable's packed parts",

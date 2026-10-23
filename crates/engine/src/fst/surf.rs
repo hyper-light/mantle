@@ -85,6 +85,8 @@ pub struct Surf {
     trie: Trie,
     /// Suffix bits an entry keeps.
     suffix: u32,
+    /// The keys filtered: an entry each, but one for all a whole entry holds.
+    keys: u64,
 }
 
 /// The bit above an entry's `suffix` bits that marks it whole: it stands for every key starting
@@ -122,9 +124,20 @@ impl Surf {
         }
     }
 
+    /// Its greatest entry's prefix, written to `out`, which the greatest key filtered starts
+    /// with (a prefix cut short of the key, or whole and holding it); false with none.
+    pub fn greatest(&self, out: &mut Vec<u8>) -> bool {
+        self.trie.last(out).is_some()
+    }
+
     /// The suffix bits an entry keeps.
     pub fn suffix_bits(&self) -> u32 {
         self.suffix
+    }
+
+    /// The keys filtered.
+    pub fn keys(&self) -> u64 {
+        self.keys
     }
 
     /// Its entries: a key each, but one for all the keys a whole entry holds.
@@ -147,9 +160,10 @@ impl Surf {
         self.trie.held_bytes()
     }
 
-    /// Appends the filter to `out`: its suffix bits, then its trie.
+    /// Appends the filter to `out`: its suffix bits, the keys it filters, then its trie.
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.push(u8::try_from(self.suffix).unwrap_or(u8::MAX));
+        out.extend_from_slice(&self.keys.to_le_bytes());
         self.trie.encode(out);
     }
 
@@ -164,10 +178,19 @@ impl Surf {
         if suffix >= MAX_WIDTH {
             return Err(corrupt(Malformed::OutOfRange));
         }
-        let (trie, used) = Trie::decode(bytes.get(1..).unwrap_or(&[]))?;
+        let keys = bytes
+            .get(1..9)
+            .and_then(|b| b.first_chunk::<8>())
+            .map(|b| u64::from_le_bytes(*b))
+            .ok_or(corrupt(Malformed::Truncated))?;
+        let (trie, used) = Trie::decode(bytes.get(9..).unwrap_or(&[]))?;
+        // Each entry holds one key at least.
+        if u64::try_from(trie.len()).map_or(true, |n| n > keys) {
+            return Err(corrupt(Malformed::CountMismatch));
+        }
         Ok((
-            Self { trie, suffix },
-            used.checked_add(1).ok_or(corrupt(Malformed::TooLarge))?,
+            Self { trie, suffix, keys },
+            used.checked_add(9).ok_or(corrupt(Malformed::TooLarge))?,
         ))
     }
 }
@@ -188,6 +211,8 @@ pub struct SurfBuilder {
     /// Whether a key is held, waiting for the next to be cut, and whether any key came.
     pending: bool,
     started: bool,
+    /// The keys pushed, those whole entries hold included.
+    keys: u64,
     /// The last entry's length when it is whole: the keys after it that start with it are its
     /// own.
     whole: Option<usize>,
@@ -219,6 +244,7 @@ impl SurfBuilder {
         self.shared_before = 0;
         self.pending = false;
         self.started = false;
+        self.keys = 0;
         self.whole = None;
         Ok(())
     }
@@ -246,6 +272,7 @@ impl SurfBuilder {
     pub fn push(&mut self, before: Option<&[u8]>, shared: usize) -> Result<(), Error> {
         match before {
             None if !self.started => {
+                self.keys = 1;
                 self.started = true;
                 self.shared_before = 0;
                 self.pending = true;
@@ -256,6 +283,7 @@ impl SurfBuilder {
                         what: "a range filter's key without the bytes every key was to share",
                     });
                 }
+                self.keys = self.keys.saturating_add(1);
                 if self.pending {
                     self.cut(key, shared)?;
                 }
@@ -324,6 +352,7 @@ impl SurfBuilder {
         Ok(Surf {
             trie: self.trie.finish()?,
             suffix: self.suffix,
+            keys: self.keys,
         })
     }
 }
@@ -411,6 +440,7 @@ mod tests {
         Surf {
             trie: t.finish().unwrap(),
             suffix,
+            keys: keys.len() as u64,
         }
     }
 

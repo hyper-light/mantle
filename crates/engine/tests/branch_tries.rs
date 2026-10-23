@@ -73,6 +73,11 @@ fn measure(name: &str, keys: &[Vec<u8>], value: usize) {
     let mut store = Store::create(file, config).unwrap();
     let value = vec![b'v'; value];
     let mut b = Builder::new(&mut store, Keys::Exactly(keys.len() as u64)).unwrap();
+    // What every key shares: its first's with its last, as a packing states its memtable's.
+    let shared = keys.first().zip(keys.last()).map_or(0, |(a, z)| {
+        a.iter().zip(z).take_while(|(x, y)| x == y).count()
+    });
+    b.set_shared(shared).unwrap();
     for k in keys {
         b.add(&mut store, k, Op::Put, &value).unwrap();
     }

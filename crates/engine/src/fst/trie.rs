@@ -767,6 +767,43 @@ impl Trie {
         }
     }
 
+    /// The greatest key held, written to `out` in place of what it held, and its value; none for
+    /// a trie holding no key. Down the last branch of each node: a node's own key is the least
+    /// beneath it, so it is the greatest only where no branch leaves the node.
+    pub fn last(&self, out: &mut Vec<u8>) -> Option<u32> {
+        out.clear();
+        if self.len == 0 {
+            return None;
+        }
+        out.extend_from_slice(&self.prefix);
+        let mut node = self.root();
+        // A level a step: at most every level, dense and sparse.
+        for _ in 0..=self.sparse.len().saturating_add(self.dense.nodes) {
+            let at = match node {
+                Node::Dense(n) => self
+                    .dense_below(n, n.checked_add(1)?.checked_mul(256)?)
+                    .map(Fallback::Dense),
+                Node::Sparse(l, n) => {
+                    let (start, end) = self.node_range(l, n);
+                    (start < end).then(|| Fallback::Sparse(l, n, end.saturating_sub(1)))
+                }
+            };
+            let Some(at) = at else {
+                return self.value_of(node);
+            };
+            match at {
+                Fallback::Dense(pos) => out.push(u8::try_from(pos % 256).ok()?),
+                Fallback::Sparse(l, _, p) => out.push(self.label(l, p)?),
+                Fallback::Node(_) => {}
+            }
+            match self.step(at) {
+                Ok(child) => node = child,
+                Err(v) => return v,
+            }
+        }
+        None
+    }
+
     /// Where `key` stands against the shared prefix: below every key, past every key, or
     /// starting with the prefix, with the rest of it.
     fn against<'k>(&self, key: &'k [u8]) -> Against<'k> {
@@ -1423,6 +1460,15 @@ mod tests {
                 assert_eq!(Trie::decode(&out).unwrap(), (t.clone(), out.len()));
                 for (k, v) in &map {
                     assert_eq!(t.get(k), Some(*v), "case {case} cut {cutoff} get {k:?}");
+                }
+                let mut last = vec![9u8];
+                assert_eq!(
+                    t.last(&mut last),
+                    map.values().next_back().copied(),
+                    "case {case} cut {cutoff} last"
+                );
+                if let Some(k) = map.keys().next_back() {
+                    assert_eq!(&last, k, "case {case} cut {cutoff} last key");
                 }
                 for q in &queries {
                     assert_eq!(

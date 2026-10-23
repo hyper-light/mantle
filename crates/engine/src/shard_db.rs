@@ -4570,8 +4570,10 @@ impl<F: BlockFile> ShardDb<F> {
                 .saturating_add(1);
             self.keep_sort_pack(pack);
             self.grow_for(u64::try_from(extents).unwrap_or(u64::MAX))?;
-            let builder = Builder::new(&mut self.store, Keys::Exactly(entries))?;
+            let mut builder = Builder::new(&mut self.store, Keys::Exactly(entries))?;
             if let Some(p) = self.packing.as_mut() {
+                // Every key of the memtable shares what it kept of its first key's.
+                builder.set_shared(p.mem.skip())?;
                 p.builder = Some(builder);
             }
         }
@@ -4839,10 +4841,12 @@ impl<F: BlockFile> ShardDb<F> {
     /// A full memtable as the packing one the shard packs itself: its builder now, its order a
     /// debt paid a slice at a time.
     fn packing_of(&mut self, mem: HashMem) -> Result<Packing, Error> {
-        let builder = Builder::new(
+        let mut builder = Builder::new(
             &mut self.store,
             Keys::Exactly(u64::try_from(mem.len()).unwrap_or(u64::MAX)),
         )?;
+        // Every key of the memtable shares what it kept of its first key's.
+        builder.set_shared(mem.skip())?;
         Ok(Packing {
             mem,
             sort: None,

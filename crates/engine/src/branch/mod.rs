@@ -1584,7 +1584,7 @@ impl Branch {
             return Err(corrupt(Malformed::CountMismatch));
         }
         let (range, used) = Surf::decode(range_part)?;
-        if used != rb || range.len() != usize::try_from(count).unwrap_or(usize::MAX) {
+        if used != rb || range.keys() != count {
             return Err(corrupt(Malformed::CountMismatch));
         }
         let counts: Vec<u16> = count_part

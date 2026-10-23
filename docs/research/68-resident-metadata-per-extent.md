@@ -110,7 +110,8 @@ with `n` and one falling, are written for `E` extents as `E` times their per-ext
 are most there too; the per-extent bound takes each part at its own most
 (`branch::resident_per_extent`, `shard_db::resident_per_extent`). An extent is one branch's: a
 branch's extents are taken fresh by its builder and each held once (`store::Store::retain` has no
-caller), so an engine's branches hold at most their extents times it.
+caller; `ShardDb::check_references` holds every extent to one reference, named once by the map,
+the trunk's image or one branch), so an engine's branches hold at most their extents times it.
 
 At the range's floor, 24 KiB pages two an extent (`branch::least_page(4096, 2132, 18699)`), the
 statement and its parts, in bytes an extent:

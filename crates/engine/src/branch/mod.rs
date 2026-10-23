@@ -588,6 +588,15 @@ fn page_needs(key: usize, value: usize) -> Option<usize> {
 }
 
 impl Builder {
+    /// States that every key this builder will take shares its first `shared` bytes, before the
+    /// first is added: the range filter's depth counts past them (`fst::surf`), so keys sharing a
+    /// long first part (a bucket, a directory) keep that depth of their own.
+    pub fn set_shared(&mut self, shared: usize) -> Result<(), Error> {
+        self.keys.share(shared)
+    }
+}
+
+impl Builder {
     /// A builder in `store`, for `keys` entries: pages of the store's payload capacity, which
     /// offsets of 16 bits must reach.
     pub fn new<F: BlockFile>(store: &mut Store<F>, keys: filter::Keys) -> Result<Self, Error> {

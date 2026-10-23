@@ -223,6 +223,19 @@ impl SurfBuilder {
         Ok(())
     }
 
+    /// States that every key of the run will share its first `shared` bytes, before the first
+    /// key comes: the depth counts past them.
+    pub fn share(&mut self, shared: usize) -> Result<(), Error> {
+        if self.started {
+            return Err(Error::InvalidArgument {
+                what: "a range filter's shared bytes stated after a key",
+            });
+        }
+        self.reach = shared.saturating_add(self.reach.saturating_sub(self.shared));
+        self.shared = shared;
+        Ok(())
+    }
+
     /// Takes the next key, given the key before it (`before`, none for the first) and the
     /// bytes the two share (`shared`): the caller holds both, and has checked the next is the
     /// greater, as the branch builder does as it adds an entry, so the filter keeps no copy of

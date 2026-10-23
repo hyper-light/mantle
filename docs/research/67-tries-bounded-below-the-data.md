@@ -267,5 +267,37 @@ Against RocksDB 11.8.1 and SplinterDB at a fixed 32 GiB cache (45ca830c's rounds
 | 10M | 3.90 / 3.00 / 4.52 | 5.11 / 9.95 / 7.86 |
 | 100M | 3.42 / 4.87 / 11.19 | 4.45 / 6.60 / 7.55 |
 
-*Open:* a billion rows waits for the Mac's disk (a 1B case grows the VM's image about 115 GB;
-the Mac held 108-116 GB free on 2026-10-23).
+The final build (1ca1b83f: §7's builder, a compaction round 5% under the base's) against the base,
+RocksDB and SplinterDB, four rounds at each size (R0 7700-7720), then beside the base with its
+layout alone shifted, a cycle of six rounds at 10M and 100M (R0 7730, 7740):
+
+| keys | rounds | fill | gets | seeks |
+|---|---|---|---|---|
+| 1M | 4 | 1.005 | 1.034 | 0.977 |
+| 10M | 4 | 1.001 | 0.995 | 0.956 |
+| 100M | 4 | 1.008 | 0.826 | 0.896 |
+
+| keys | final over base | layout alone over base | final over the shifted base |
+|---|---|---|---|
+| 10M | 1.006 / 1.004 / 0.991 | 1.001 / 1.008 / 0.999 | 1.008 / 0.992 / 0.994 |
+| 100M | 1.011 / 1.001 / 0.996 | 1.004 / 0.929 / 0.925 | 1.017 / 1.080 / 1.022 |
+
+The four rounds' 100M gets and seeks are the lane's two modes again: two of the final build's four
+cases read 1.47 and 0.83 million keys a second against 2.14 and 2.16 in its others, the slow one
+taking 1,200 ns of CPU a get against 460 with the engine in the same state (every key found in its
+178 kept memtables, no device read). Over the cycle of six every arm drew a slower case (the final
+build 1.61, the base 1.87 and 1.95, the shifted base 1.39 and 1.63 million a second), and the final
+build's get takes 6.9% fewer instructions than the base's on the lane's architecture (§7). The
+six rounds put it within the layout's own movement at both sizes, its fill above the base's in
+each.
+
+Against RocksDB 11.8.1 and SplinterDB at a fixed 32 GiB cache (R0 7700-7720, medians of each arm's
+figures; at 100M two of the final build's four cases drew the slow mode):
+
+| keys | over SplinterDB, fill / gets / seeks | over RocksDB, fill / gets / seeks |
+|---|---|---|
+| 1M | 4.34 / 2.23 / 3.35 | 5.92 / 5.84 / 5.04 |
+| 10M | 3.82 / 3.15 / 4.40 | 5.07 / 9.85 / 7.39 |
+| 100M | 3.59 / 3.90 / 10.72 | 4.74 / 6.17 / 6.91 |
+
+*Open:* the final build at a billion rows (R0 7750).

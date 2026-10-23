@@ -311,15 +311,17 @@ measures the second, and derives the rest by these rules:
   37 extents, 108 pages and four builders' lists, against 221 cursors and 5 builders stated at
   height 5) and 11.4 MB at 2,132-byte keys for 32,000 rows (39 extents and 114 pages, against 153
   cursors at height 3), each within its configured bytes, its pools and builders as stated, and its
-  metadata as held (`tests/engine_memory.rs`). *Open:* at 2,132-byte keys that statement is 2.7 GB,
-  its builders' tries counted a level and a label a key byte for a leaf's limit of keys. Resident
-  metadata per extent of data: 21% at 8-byte keys
-  without values (1.25 bytes of filter and 2.3 of range filter a key), 3% at 16-byte keys with
-  100-byte values; but neither trie compresses a key's levels, so their labels are bounded only by
-  the key bytes a branch stores, and keys in pairs sharing all but a last byte, each pair parting
-  from the one before at its first byte, made the range filter and the leaf index a third of the
-  data at 2,132-byte keys: a bound below the data, by a depth past which the range filter
-  truncates and the leaf index finds its leaf another way, is the engine's to research and measure.
+  metadata as held (`tests/engine_memory.rs`). At 2,132-byte keys that statement is 255 MB, its
+  builders' tries counted by their depths (2.7 GB while they counted a label a key byte). Resident
+  metadata per extent of data: 21% at 8-byte keys without values (1.25 bytes of filter and 2.3 of
+  range filter a key), 3% at 16-byte keys with 100-byte values. Keys in pairs sharing all but a
+  last byte, each pair parting from the one before at its first byte, made the range filter and
+  the leaf index a third of the data at 2,132-byte keys, their labels bounded only by the key
+  bytes a branch stores. They are bounded below the data now: a range filter's entries run at most
+  16 bytes past the bytes every key of their branch shares and a leaf index's separators at most
+  256, the leaves past that found through the branch's index pages, and a level costs its labels'
+  bits; those pairs' two tries hold 1.15% of their data, and a branch's tries are stated from its
+  key bound, entries and leaves (`branch::tries_bytes`; research/67).
   And `ShardDb::follow_machine` budgets a range's cache, writes and records from what remains of the
   machine: the budget follows one of `shares` of the machine's room (`port::memory::room_now`: on
   Linux `MemAvailable` less the larger of the kernel's background dirty threshold and its dirty and

@@ -444,6 +444,10 @@ pub struct ShardDb<F: BlockFile> {
     trim_records: usize,
     /// The page cache's share in bytes, the record cache's being `records_share`.
     cache_share: usize,
+    /// The budget's share no region takes, left to the kernel's page cache for the workers'
+    /// reads and the store's writes, which go through it (docs/research/65 §8): tuned with the
+    /// regions while the budget follows the machine, none otherwise.
+    kernel_share: usize,
     /// The page cache's and record cache's index and ghost bytes when last granted: what their
     /// shares pay for besides data.
     charged: (usize, usize),
@@ -555,39 +559,57 @@ struct Gain {
     bytes: usize,
 }
 
-/// Write memory's next share of `memory` against the page cache alone ([`tune3`] with no record
-/// cache and no past steps).
+/// What a share of the kernel's page cache a `window` larger would have saved the workers in a
+/// cycle (docs/research/65 §8): of the pages they read that the share would not hold (`past`,
+/// read as the bytes written since their branch), those a share a window larger would
+/// (`within`), priced at what the ones it would not hold made them wait, a share of the waits
+/// as `within` is of `past`.
+fn kernel_gain(reuse: crate::trunk::Reuse, window: usize) -> Gain {
+    Gain {
+        saved_ns: u64::try_from(
+            u128::from(reuse.waited_ns)
+                .saturating_mul(u128::from(reuse.within))
+                .checked_div(u128::from(reuse.past))
+                .unwrap_or(0),
+        )
+        .unwrap_or(u64::MAX),
+        bytes: window,
+    }
+}
+
+/// Write memory's next share of `memory` against the page cache alone ([`tune4`] with no record
+/// cache, no kernel's share and no past steps).
 #[cfg(test)]
 fn tune(memory: usize, share: usize, written: usize, read: Gain, write: Gain) -> usize {
     let none = Gain {
         saved_ns: 0,
         bytes: 0,
     };
-    let shares = [memory.saturating_sub(share), share, 0];
-    tune3(
+    let shares = [memory.saturating_sub(share), share, 0, 0];
+    tune4(
         memory,
         shares,
         written,
-        [read, write, none],
+        [read, write, none, none],
         &mut Newton::default(),
     )[1]
 }
 
-/// The shard's memory divided again among the page cache, write memory and the record cache
-/// (`shares`, in that order): a step moves toward the region whose bytes saved the most a byte,
-/// from the region with memory that saved the least, the gains compared exactly by cross
-/// products without dividing. The step is the Newton step on the pair's past steps (`newton`)
-/// when their fit shows returns diminishing, the paper's fixed step otherwise, and takes at
-/// most the donor bound either way. Write memory never passes the last cycle's writes,
-/// `written`, since a queue past a cycle's writes spares no wait; the page cache takes the
-/// rest. Equal gains, or nothing saved, change nothing.
-fn tune3(
+/// The shard's memory divided again among the page cache, write memory, the record cache and
+/// the kernel's page cache (`shares`, in that order; research/36, docs/research/65 §8): a step
+/// moves toward the region whose bytes saved the most a byte, from the region with memory that
+/// saved the least, the gains compared exactly by cross products without dividing. The step is
+/// the Newton step on the pair's past steps (`newton`) when their fit shows returns diminishing,
+/// the paper's fixed step otherwise, and takes at most the donor bound either way. Write memory
+/// never passes the last cycle's writes, `written`, since a queue past a cycle's writes spares
+/// no wait; the page cache takes the rest. Equal gains, or nothing saved, change nothing.
+fn tune4(
     memory: usize,
-    shares: [usize; 3],
+    shares: [usize; 4],
     written: usize,
-    gains: [Gain; 3],
+    gains: [Gain; 4],
     newton: &mut Newton,
-) -> [usize; 3] {
+) -> [usize; 4] {
     let step = memory.saturating_mul(TUNE_STEP_PERCENT) / 100;
     let rate = |i: usize| {
         gains.get(i).copied().unwrap_or(Gain {
@@ -604,13 +626,13 @@ fn tune3(
         per(a, b) > per(b, a)
     };
     let mut to = 0usize;
-    for i in 1..3 {
+    for i in 1..shares.len() {
         if more(rate(i), rate(to)) {
             to = i;
         }
     }
     let mut from: Option<usize> = None;
-    for i in 0..3 {
+    for i in 0..shares.len() {
         if i == to || shares.get(i).copied().unwrap_or(0) == 0 {
             continue;
         }
@@ -652,13 +674,18 @@ fn tune3(
         }
     }
     // Write memory within a cycle's writes and the budget; the page cache has the rest.
-    let [_, write, records] = next;
+    let [_, write, records, kernel] = next;
     let write = write.min(written).min(memory);
     let records = records.min(memory.saturating_sub(write));
+    let kernel = kernel.min(memory.saturating_sub(write).saturating_sub(records));
     [
-        memory.saturating_sub(write).saturating_sub(records),
+        memory
+            .saturating_sub(write)
+            .saturating_sub(records)
+            .saturating_sub(kernel),
         write,
         records,
+        kernel,
     ]
 }
 
@@ -836,6 +863,7 @@ impl<F: BlockFile> ShardDb<F> {
             trim_cache: 0,
             trim_records: 0,
             cache_share: 0,
+            kernel_share: 0,
             charged: (0, 0),
             scan_key: Vec::new(),
             scan_from: Vec::new(),
@@ -1333,13 +1361,22 @@ impl<F: BlockFile> ShardDb<F> {
             accepted: 0,
             grew_most: 0,
         });
+        self.set_reuse_window();
         Ok(())
     }
 
-    /// The memory budget the shard holds its page cache, write memory, record cache and kept
-    /// memtables within now; none without one.
+    /// The memory budget now, none without one: the kernel's share of it
+    /// ([`Self::kernel_share`]) left to the kernel's page cache, the rest what the shard holds its
+    /// page cache, write memory, record cache and kept memtables within.
     pub fn budget(&self) -> Option<usize> {
         self.memory
+    }
+
+    /// The share of the budget the shard leaves to the kernel's page cache for its workers'
+    /// reads and its store's writes, tuned with its regions while the budget follows the machine
+    /// (docs/research/65 §8); none otherwise.
+    pub fn kernel_share(&self) -> usize {
+        self.kernel_share
     }
 
     /// Divides the machine's room again (docs/research/65): the budget becomes what its regions and
@@ -1473,8 +1510,10 @@ impl<F: BlockFile> ShardDb<F> {
             return Err(Self::write_limit(bytes));
         }
         // Validate before changing any share or cache: held output buffers cannot be reclaimed.
-        // A budget given stands as given: it no longer follows the machine.
+        // A budget given stands as given: it no longer follows the machine, and leaves the
+        // kernel no share of it.
         self.follow = None;
+        self.kernel_share = 0;
         self.memory = Some(bytes);
         self.write_share = self.store.warm_write_bytes();
         self.write_cap = available;
@@ -1545,9 +1584,15 @@ impl<F: BlockFile> ShardDb<F> {
         self.records_share = self
             .records_share
             .min(available.saturating_sub(self.write_share));
+        self.kernel_share = self.kernel_share.min(
+            available
+                .saturating_sub(self.write_share)
+                .saturating_sub(self.records_share),
+        );
         self.cache_share = available
             .saturating_sub(self.write_share)
-            .saturating_sub(self.records_share);
+            .saturating_sub(self.records_share)
+            .saturating_sub(self.kernel_share);
         // The shares changed: what each region holds above its new limit is trimmed afresh.
         self.trim_cache = 0;
         self.trim_records = 0;
@@ -1714,46 +1759,103 @@ impl<F: BlockFile> ShardDb<F> {
             saved_ns: std::mem::take(&mut self.record_ghost_ns),
             bytes: self.records_share,
         };
+        // The kernel's page cache, while the budget follows the machine; a budget given stands
+        // as given, and leaves the kernel nothing of it.
+        let step = memory.saturating_mul(TUNE_STEP_PERCENT) / 100;
+        let reuse = self.trunk.take_reuse();
+        let kernel = if self.follow.is_some() {
+            kernel_gain(reuse, step)
+        } else {
+            Gain {
+                saved_ns: 0,
+                bytes: step,
+            }
+        };
         // Write memory the cycle did not use goes back at once: a share above the most queued
         // spared no wait, and the queue takes buffers only as runs wait.
         let warm = self.store.warm_write_bytes();
         self.write_share = self.write_share.min(self.store.take_queue_peak()).max(warm);
         let cache = memory
             .saturating_sub(self.write_share)
-            .saturating_sub(self.records_share);
-        let [cache, write_share, records_share] = tune3(
+            .saturating_sub(self.records_share)
+            .saturating_sub(self.kernel_share);
+        let [cache, write_share, records_share, kernel_share] = tune4(
             memory,
-            [cache, self.write_share, self.records_share],
+            [
+                cache,
+                self.write_share,
+                self.records_share,
+                self.kernel_share,
+            ],
             written,
-            [read, write, records],
+            [read, write, records, kernel],
             &mut self.newton,
         );
         // Warm output buffers remain owned even when admission shrinks: the retained floor
-        // cannot be reassigned to a cache before the store retires.
+        // cannot be reassigned to a cache before the store retires. It comes from the page
+        // cache, then the kernel's share, then the record cache.
         let extra = warm.saturating_sub(write_share);
         let write_share = write_share.max(warm);
-        let records_share = records_share.saturating_sub(extra.saturating_sub(cache));
-        let cache = cache.saturating_sub(extra);
-        // The record cache keeps one step: with none, its ghost would gather no evidence that
-        // it should grow.
-        let floor = (memory.saturating_mul(TUNE_STEP_PERCENT) / 100)
-            .min(memory.saturating_sub(write_share));
-        let (cache, records_share) = if records_share < floor {
-            (
-                cache.saturating_sub(floor.saturating_sub(records_share)),
-                floor,
-            )
-        } else {
-            (cache, records_share)
-        };
+        let from_cache = extra.min(cache);
+        let mut cache = cache.saturating_sub(from_cache);
+        let extra = extra.saturating_sub(from_cache);
+        let from_kernel = extra.min(kernel_share);
+        let mut kernel_share = kernel_share.saturating_sub(from_kernel);
+        let mut records_share = records_share.saturating_sub(extra.saturating_sub(from_kernel));
+        // The record cache and the page cache keep one step each: with none, a ghost would
+        // gather no evidence that its cache should grow. The record cache's comes from the page
+        // cache, then the kernel's share; the page cache's from the kernel's share.
+        let floor = step.min(memory.saturating_sub(write_share));
+        if records_share < floor {
+            let need = floor.saturating_sub(records_share);
+            let from_cache = need.min(cache);
+            cache = cache.saturating_sub(from_cache);
+            kernel_share = kernel_share.saturating_sub(need.saturating_sub(from_cache));
+            records_share = floor;
+        }
+        let floor = step.min(
+            memory
+                .saturating_sub(write_share)
+                .saturating_sub(records_share),
+        );
+        if cache < floor {
+            let need = floor.saturating_sub(cache).min(kernel_share);
+            kernel_share = kernel_share.saturating_sub(need);
+            cache = cache.saturating_add(need);
+        }
         self.write_share = write_share;
         self.store.set_write_budget(write_share.min(self.write_cap));
         self.cache_share = cache;
         self.records_share = records_share;
+        self.kernel_share = kernel_share;
+        self.set_reuse_window();
         // The shares changed: what each region holds above its new limit is trimmed afresh.
         self.trim_cache = 0;
         self.trim_records = 0;
         self.grant();
+    }
+
+    /// Hands the trunk the window its workers' reads are counted against: the kernel's share
+    /// and a tuning step more, in the store's extents ([`Trunk::set_reuse_window`]).
+    fn set_reuse_window(&mut self) {
+        let extent = self
+            .store
+            .page_size()
+            .saturating_mul(usize::try_from(self.store.extent_pages()).unwrap_or(usize::MAX))
+            .max(1);
+        let step = self
+            .memory
+            .unwrap_or(0)
+            .saturating_sub(self.write_reserved)
+            .saturating_mul(TUNE_STEP_PERCENT)
+            / 100;
+        let extents = |bytes: usize| {
+            u64::try_from(bytes.checked_div(extent).unwrap_or(0)).unwrap_or(u64::MAX)
+        };
+        self.trunk.set_reuse_window(
+            extents(self.kernel_share),
+            extents(self.kernel_share.saturating_add(step)),
+        );
     }
 
     /// Sets the page cache's and the record cache's data limits from their shares, each less the
@@ -1772,13 +1874,24 @@ impl<F: BlockFile> ShardDb<F> {
         let page = self.store.page_size().max(1);
         let (cache_index, records_index) = self.index_bytes();
         self.charged = (cache_index, records_index);
+        // A cache holds its index and ghost whatever pages it keeps, and a trim's ghost grows as
+        // it evicts, past the cache's share at times: the kernel's share gives way to what each
+        // cache holds that no trim gives back, so the regions and the share stay within the
+        // budget except while a cache trims down to its share.
+        let (cache_held, write_held, records_held) = self.memory_held();
+        self.kernel_share = self.kernel_share.min(
+            budget
+                .saturating_sub(write_held)
+                .saturating_sub(self.cache_share.max(cache_index))
+                .saturating_sub(self.records_share.max(records_index)),
+        );
         // A region grows past what it holds only into the budget's room now: while another still
         // holds what it is giving back (`trim`), the memory moves as it is freed, never held twice.
-        let (cache_held, write_held, records_held) = self.memory_held();
         let mut room = budget.saturating_sub(
             cache_held
                 .saturating_add(write_held)
-                .saturating_add(records_held),
+                .saturating_add(records_held)
+                .saturating_add(self.kernel_share),
         );
         let cache = Self::sized(
             self.cache_share.saturating_sub(cache_index),
@@ -3920,9 +4033,10 @@ impl<F: BlockFile> ShardDb<F> {
                 || self.store.cache_refused() > self.kept_refused)
     }
 
-    /// The memory kept memtables may hold: the budget less what its regions hold and the most a
-    /// get grows the caches by ([`Self::kept_step`]), so after any operation the regions and the
-    /// kept memtables together hold no more than the budget; none without a budget.
+    /// The memory kept memtables may hold: the budget less what its regions hold, the kernel's
+    /// share and the most a get grows the caches by ([`Self::kept_step`]), so after any
+    /// operation the regions and the kept memtables together hold no more than the budget leaves
+    /// them; none without a budget.
     fn kept_limit(&self) -> usize {
         let Some(budget) = self.memory else {
             return 0;
@@ -3932,6 +4046,7 @@ impl<F: BlockFile> ShardDb<F> {
             .saturating_sub(cache)
             .saturating_sub(write)
             .saturating_sub(records)
+            .saturating_sub(self.kernel_share)
             .saturating_sub(self.kept_step)
     }
 
@@ -5017,51 +5132,120 @@ mod tune_tests {
     }
 
     #[test]
-    fn three_regions_move_memory_from_the_least_to_the_most_saved() {
+    fn regions_move_memory_from_the_least_to_the_most_saved() {
         let m = 100 * MIB;
         // Records saved most, write least: write gives, at most 10% of its 20 MiB.
         assert_eq!(
-            super::tune3(
+            super::tune4(
                 m,
-                [70 * MIB, 20 * MIB, 10 * MIB],
+                [70 * MIB, 20 * MIB, 10 * MIB, 0],
                 m,
-                [gain(5, 1), gain(1, 1), gain(9, 1)],
+                [gain(5, 1), gain(1, 1), gain(9, 1), gain(0, 1)],
                 &mut super::Newton::default()
             ),
-            [70 * MIB, 18 * MIB, 12 * MIB]
+            [70 * MIB, 18 * MIB, 12 * MIB, 0]
         );
         // The least saving region holds nothing: the donor is the least among the rest.
         assert_eq!(
-            super::tune3(
+            super::tune4(
                 m,
-                [90 * MIB, 0, 10 * MIB],
+                [90 * MIB, 0, 10 * MIB, 0],
                 m,
-                [gain(1, 1), gain(0, 1), gain(9, 1)],
+                [gain(1, 1), gain(0, 1), gain(9, 1), gain(0, 1)],
                 &mut super::Newton::default()
             ),
-            [85 * MIB, 0, 15 * MIB]
+            [85 * MIB, 0, 15 * MIB, 0]
         );
         // All equal: nothing moves.
         assert_eq!(
-            super::tune3(
+            super::tune4(
                 m,
-                [50 * MIB, 25 * MIB, 25 * MIB],
+                [50 * MIB, 25 * MIB, 25 * MIB, 0],
                 m,
-                [gain(1, 1), gain(1, 1), gain(1, 1)],
+                [gain(1, 1), gain(1, 1), gain(1, 1), gain(0, 1)],
                 &mut super::Newton::default()
             ),
-            [50 * MIB, 25 * MIB, 25 * MIB]
+            [50 * MIB, 25 * MIB, 25 * MIB, 0]
         );
         // Write past the cycle's writes: the excess goes to the page cache.
         assert_eq!(
-            super::tune3(
+            super::tune4(
                 m,
-                [50 * MIB, 30 * MIB, 20 * MIB],
+                [50 * MIB, 30 * MIB, 20 * MIB, 0],
                 10 * MIB,
-                [gain(1, 1), gain(1, 1), gain(1, 1)],
+                [gain(1, 1), gain(1, 1), gain(1, 1), gain(0, 1)],
                 &mut super::Newton::default()
             ),
-            [70 * MIB, 10 * MIB, 20 * MIB]
+            [70 * MIB, 10 * MIB, 20 * MIB, 0]
+        );
+    }
+
+    #[test]
+    fn the_kernels_share_is_worth_the_waits_of_the_reads_a_window_more_would_hold() {
+        let reuse = |past, within, waited_ns| crate::trunk::Reuse {
+            past,
+            within,
+            waited_ns,
+        };
+        // A quarter of the reads it missed a window more would hold: a quarter of the waits.
+        assert_eq!(
+            super::kernel_gain(reuse(100, 25, 1_000), MIB),
+            gain(250, MIB)
+        );
+        // Nothing missed, or nothing waited: nothing saved.
+        assert_eq!(super::kernel_gain(reuse(0, 0, 1_000), MIB), gain(0, MIB));
+        assert_eq!(super::kernel_gain(reuse(100, 100, 0), MIB), gain(0, MIB));
+        // Every wait at the extremes, in 128 bits: never overflowed.
+        assert_eq!(
+            super::kernel_gain(reuse(u64::MAX, u64::MAX, u64::MAX), MIB),
+            gain(u64::MAX, MIB)
+        );
+    }
+
+    #[test]
+    fn the_kernels_page_cache_takes_memory_the_engines_regions_save_least_with() {
+        let m = 100 * MIB;
+        // A fill with no gets: the page cache saved nothing, and the workers waited on reads a
+        // kernel's share a window larger would have held. The page cache gives a step, 5% of the
+        // budget, within 10% of its own.
+        assert_eq!(
+            super::tune4(
+                m,
+                [95 * MIB, 0, 5 * MIB, 0],
+                m,
+                [
+                    gain(0, 90 * MIB),
+                    gain(0, 1),
+                    gain(0, 5 * MIB),
+                    gain(1_000, 5 * MIB)
+                ],
+                &mut super::Newton::default()
+            ),
+            [90 * MIB, 0, 5 * MIB, 5 * MIB]
+        );
+        // Gets come: the page cache saves the most a byte and the kernel's share the least, which
+        // gives at most 10% of its own.
+        assert_eq!(
+            super::tune4(
+                m,
+                [55 * MIB, 0, 5 * MIB, 40 * MIB],
+                m,
+                [gain(10_000, MIB), gain(0, 1), gain(5, MIB), gain(1, MIB)],
+                &mut super::Newton::default()
+            ),
+            [59 * MIB, 0, 5 * MIB, 36 * MIB]
+        );
+        // A budget that fell: the kernel's share keeps no more than write memory and records
+        // leave, and the page cache what is left after it.
+        assert_eq!(
+            super::tune4(
+                80 * MIB,
+                [10 * MIB, 50 * MIB, 20 * MIB, 20 * MIB],
+                80 * MIB,
+                [gain(1, 1), gain(1, 1), gain(1, 1), gain(1, 1)],
+                &mut super::Newton::default()
+            ),
+            [0, 50 * MIB, 20 * MIB, 10 * MIB]
         );
     }
 
@@ -5090,35 +5274,35 @@ mod tune_tests {
         let m = 1000 * MIB;
         let mut n = super::Newton::default();
         // Records at 10 MiB saved 2 ns a byte, the page cache 1: the fixed step, 5% of 1000.
-        let first = super::tune3(
+        let first = super::tune4(
             m,
-            [990 * MIB, 0, 10 * MIB],
+            [990 * MIB, 0, 10 * MIB, 0],
             m,
-            [gain(990, 990), gain(0, 1), gain(20, 10)],
+            [gain(990, 990), gain(0, 1), gain(20, 10), gain(0, 1)],
             &mut n,
         );
-        assert_eq!(first, [940 * MIB, 0, 60 * MIB]);
+        assert_eq!(first, [940 * MIB, 0, 60 * MIB, 0]);
         // At 60 MiB records saved 1.5 a byte: the line meets the cache's 1 at 110 MiB, 50 on.
-        let second = super::tune3(
+        let second = super::tune4(
             m,
             first,
             m,
-            [gain(940, 940), gain(0, 1), gain(90, 60)],
+            [gain(940, 940), gain(0, 1), gain(90, 60), gain(0, 1)],
             &mut n,
         );
-        assert_eq!(second, [890 * MIB, 0, 110 * MIB]);
+        assert_eq!(second, [890 * MIB, 0, 110 * MIB, 0]);
         // The page cache saved 1001 ns a MiB more at 99 MiB and 1000 more at 100: the line
         // meets at 1100 MiB, past the records' 10%, so the step is 90 MiB.
         let mut n = super::Newton::default();
         n.step((0, 2), 99 * MIB, 1001);
-        let next = super::tune3(
+        let next = super::tune4(
             m,
-            [100 * MIB, 0, 900 * MIB],
+            [100 * MIB, 0, 900 * MIB, 0],
             m,
-            [gain(1000, MIB), gain(0, 1), gain(0, MIB)],
+            [gain(1000, MIB), gain(0, 1), gain(0, MIB), gain(0, 1)],
             &mut n,
         );
-        assert_eq!(next, [190 * MIB, 0, 810 * MIB]);
+        assert_eq!(next, [190 * MIB, 0, 810 * MIB, 0]);
     }
 
     #[test]
@@ -5212,6 +5396,114 @@ mod grant_tests {
         assert!(
             over_seen > 0,
             "no grant left the record cache above its limit"
+        );
+    }
+}
+
+#[cfg(test)]
+mod kernel_share_tests {
+    //! The kernel's share is the budget's last claim on what it holds (docs/research/65 §8):
+    //! when the budget falls to what the regions cannot give back, the share gives way, so the
+    //! regions, the kept memtables and the share hold no more than the budget except while a
+    //! cache trims down to its share.
+    use super::*;
+    use hyper_block::buf::Alignment;
+    use hyper_block::file::{CachingRequest, DeviceFile};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const STORE: Config = Config {
+        page_size: 4096,
+        extent_pages: 8,
+        max_extents: 1 << 16,
+    };
+    const TRUNK: TrunkConfig = TrunkConfig {
+        fanout: 4,
+        leaf_entries: 128,
+    };
+    const MEM: usize = 8 * 1024;
+    const BOUND: usize = 64 << 20;
+    /// The machine's room as the test sets it, read by [`free`] alone.
+    static FREE: AtomicU64 = AtomicU64::new(1 << 40);
+
+    fn free() -> Option<u64> {
+        Some(FREE.load(Ordering::Relaxed))
+    }
+
+    fn within(db: &ShardDb<DeviceFile>) -> bool {
+        let (cache, write, records) = db.memory_held();
+        let held = cache
+            .saturating_add(write)
+            .saturating_add(records)
+            .saturating_add(db.kept_held())
+            .saturating_add(db.kernel_share);
+        db.trimming() || db.memory.is_some_and(|b| held <= b)
+    }
+
+    #[test]
+    fn the_kernels_share_gives_way_to_what_the_regions_cannot_give_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = DeviceFile::open(
+            &dir.path().join("store"),
+            true,
+            CachingRequest::Buffered,
+            Alignment::new(4096).unwrap(),
+        )
+        .unwrap();
+        let mut db = ShardDb::create(file, STORE, MEM, TRUNK).unwrap();
+        db.follow(BOUND, 1, free).unwrap();
+        let mut value = Vec::new();
+        for k in 0..20_000u64 {
+            db.put(format!("k{k:08}").as_bytes(), &[7u8; 100]).unwrap();
+        }
+        // Gets of keys long since packed: from the trunk, into the record cache.
+        for k in 0..20_000u64 {
+            assert!(
+                db.get(format!("k{k:08}").as_bytes(), &mut value).unwrap(),
+                "key {k}"
+            );
+        }
+        // Half the budget left to the kernel, as tuning steps in a fill would leave it.
+        db.kernel_share = BOUND / 2;
+        db.partition_memory();
+        assert_eq!(db.kernel_share, BOUND / 2);
+        while db.trim() {}
+        assert!(within(&db), "a share of half the budget");
+        // The record cache's index grew past its share since the share was set, as the gets that
+        // fill it grow it between grants.
+        let records_index = db.index_bytes().1;
+        assert!(records_index > 0, "the record cache took no record");
+        db.records_share = records_index / 2;
+        // The machine runs short: the budget falls to what the regions cannot give back, and the
+        // share gives way to them.
+        FREE.store(0, Ordering::Relaxed);
+        db.look_machine();
+        let budget = db.memory.unwrap();
+        assert!(budget < BOUND / 2, "the budget {budget} did not fall");
+        assert!(
+            db.kernel_share <= budget.saturating_sub(db.floor_held()),
+            "a share of {} past the budget {budget} less its floor {}: held {:?} index {:?} shares cache {} write {} records {} reserved {} kept {}",
+            db.kernel_share,
+            db.floor_held(),
+            db.memory_held(),
+            db.index_bytes(),
+            db.cache_share,
+            db.write_share,
+            db.records_share,
+            db.write_reserved,
+            db.kept_held()
+        );
+        while db.trim() {}
+        assert!(
+            within(&db),
+            "the budget fell: budget {:?} held {:?} kept {} kernel {} index {:?} shares cache {} records {} trimming {}",
+            db.memory,
+            db.memory_held(),
+            db.kept_held(),
+            db.kernel_share,
+            db.index_bytes(),
+            db.cache_share,
+            db.records_share,
+            db.trimming()
         );
     }
 }

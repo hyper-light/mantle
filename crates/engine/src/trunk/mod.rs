@@ -444,6 +444,25 @@ pub struct Trunk {
     /// The entries every pivot's bundle and every node's in-flight bundles hold, counted as
     /// branches enter and leave them.
     held: u64,
+    /// Extents taken in branches since the trunk was made or opened: the clock each branch is
+    /// stamped with as it is taken ([`Branch::taken`]).
+    taken: u64,
+    /// The window, in extents taken since their branch, that workers' reads are counted against
+    /// ([`Self::set_reuse_window`]), and the counts since the shard last took them.
+    reuse_window: (u64, u64),
+    reuse: Reuse,
+}
+
+/// The kernel's page cache as the shard's workers use it (docs/research/65 §8): the pages their
+/// jobs read whose branch was taken the window's start or more extents before (`past`, what a page
+/// cache of the start would not hold, read as the bytes written since), and of them those taken
+/// fewer than the window's end before (`within`, what one of the end would); and the nanoseconds
+/// the jobs taken back waited on their reads (`waited_ns`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Reuse {
+    pub past: u64,
+    pub within: u64,
+    pub waited_ns: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -657,6 +676,9 @@ impl Trunk {
             entered: 0,
             consolidated_at: (0, 0),
             held: 0,
+            taken: 0,
+            reuse_window: (0, 0),
+            reuse: Reuse::default(),
         })
     }
 
@@ -1243,7 +1265,8 @@ impl Trunk {
 
     /// Takes a packed memtable as pending: read before the tree, taken into the root when the
     /// next step ([`Self::step`]). Its references are the trunk's from here.
-    pub fn add(&mut self, branch: Branch) {
+    pub fn add(&mut self, mut branch: Branch) {
+        self.stamp(&mut branch);
         self.pending.push(Pending {
             cuts: Vec::new(),
             parts: vec![(0, branch)],
@@ -1261,10 +1284,41 @@ impl Trunk {
     pub fn add_parts(
         &mut self,
         cuts: Vec<Vec<u8>>,
-        parts: Vec<(usize, Branch)>,
+        mut parts: Vec<(usize, Branch)>,
         kept: Option<Box<crate::store::cache::Kept>>,
     ) {
+        for (_, b) in &mut parts {
+            self.stamp(b);
+        }
         self.pending.push(Pending { cuts, parts, kept });
+    }
+
+    /// Stamps `b` with the extents taken in branches once it is taken: what a compaction that
+    /// reads it later counts its pages' age from ([`Self::take_reuse`]).
+    fn stamp(&mut self, b: &mut Branch) {
+        let extents = u64::try_from(b.extents.len()).unwrap_or(u64::MAX);
+        self.taken = self.taken.saturating_add(extents);
+        b.taken = self.taken;
+    }
+
+    /// Counts the pages workers' jobs read from here on against `from..to`, in extents taken
+    /// since their branch was ([`Self::take_reuse`]).
+    pub fn set_reuse_window(&mut self, from: u64, to: u64) {
+        self.reuse_window = (from, to.max(from));
+    }
+
+    /// The pages workers' jobs planned since the last call read, counted against the window
+    /// ([`Reuse`]); counted again from none.
+    pub fn take_reuse(&mut self) -> Reuse {
+        std::mem::take(&mut self.reuse)
+    }
+
+    /// Adds a planned job's reads, or a job's waits taken back, to the counts since the shard
+    /// last took them.
+    fn note_reuse(&mut self, r: Reuse) {
+        self.reuse.past = self.reuse.past.saturating_add(r.past);
+        self.reuse.within = self.reuse.within.saturating_add(r.within);
+        self.reuse.waited_ns = self.reuse.waited_ns.saturating_add(r.waited_ns);
     }
 
     /// Into `cuts`, the root's pivot keys, at which a packing ends its branches so each is one
@@ -2066,6 +2120,9 @@ impl Trunk {
             entered: 0,
             consolidated_at: (0, 0),
             held,
+            taken: 0,
+            reuse_window: (0, 0),
+            reuse: Reuse::default(),
         })
     }
 
@@ -2075,11 +2132,12 @@ impl Trunk {
         &mut self,
         n: usize,
         i: usize,
-        merged: Option<Branch>,
+        mut merged: Option<Branch>,
         covered: usize,
     ) -> Result<(), Error> {
         self.stats.pivot_compactions = self.stats.pivot_compactions.saturating_add(1);
-        if let Some(b) = &merged {
+        if let Some(b) = merged.as_mut() {
+            self.stamp(b);
             self.stats.entries_written = self.stats.entries_written.saturating_add(b.count);
             self.stats.pivot_entries = self.stats.pivot_entries.saturating_add(b.count);
             self.held = self.held.saturating_add(b.count);
@@ -2124,10 +2182,13 @@ impl Trunk {
         &mut self,
         store: &mut Store<F>,
         n: usize,
-        parts: Vec<(Vec<u8>, Branch)>,
+        mut parts: Vec<(Vec<u8>, Branch)>,
         extents: &[u64],
         cause: upkeep::Cause,
     ) -> Result<Vec<(Vec<u8>, usize)>, Error> {
+        for (_, b) in &mut parts {
+            self.stamp(b);
+        }
         let node = self.node(n)?;
         let pivot = node.pivots.first().ok_or(corrupt())?;
         let (from, end) = (pivot.key.clone(), node.end.clone());

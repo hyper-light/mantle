@@ -132,10 +132,12 @@ pub struct Job {
 }
 
 /// A job's result: the branches made, each with its first key, in key order; the granted
-/// extents it never wrote; the file's end past its writes; the nanoseconds it ran; and, for a
+/// extents it never wrote; the file's end past its writes; the nanoseconds it ran; for a
 /// compaction, the work units it merged in them, counted as a step on the shard counts its own
 /// (keys merged, leaves opened and filter pages at their worth in keys), so the trunk prices a
-/// compacted key from every compaction wherever it ran ([`super::Trunk::note_merge`]).
+/// compacted key from every compaction wherever it ran ([`super::Trunk::note_merge`]); and the
+/// nanoseconds of them its reads waited for their pages, what its inputs not in the kernel's page
+/// cache cost it ([`crate::store::IoStats::read_wait_ns`]).
 #[derive(Debug)]
 pub struct Output {
     pub parts: Vec<(Vec<u8>, Branch)>,
@@ -143,6 +145,7 @@ pub struct Output {
     pub end: u64,
     pub ns: u64,
     pub units: u64,
+    pub read_wait_ns: u64,
     /// The pages kept in the cache's loan, held with the result until its branches are applied:
     /// set by the owner from the job's [`Back`].
     pub kept: Option<Box<Kept>>,
@@ -310,6 +313,7 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
     })));
     while let Ok(mut job) = jobs.recv() {
         let t = Instant::now();
+        let waited = store.read_wait_ns();
         store.keep_pages(job.keep.take());
         let (ran, unwound) = run_guarded(&mut store, &mut job);
         // Whatever the job's end, every run it handed the device is answered before its result
@@ -336,6 +340,7 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
                 end: store.end(),
                 ns: ns(Instant::now().saturating_duration_since(t)),
                 units,
+                read_wait_ns: store.read_wait_ns().saturating_sub(waited),
                 kept: None,
             })
         });
@@ -1405,6 +1410,7 @@ impl Pool {
                             end: store.end(),
                             ns: 0,
                             units: 0,
+                            read_wait_ns: 0,
                             kept: None,
                         }),
                         kept: None,

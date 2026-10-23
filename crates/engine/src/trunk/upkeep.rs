@@ -706,8 +706,16 @@ impl Trunk {
             .map(|b| b.count)
             .fold(0u64, u64::saturating_add);
         // Newest first, the order a merge takes.
+        let mut reuse = Reuse::default();
         let run = if self.pool.is_some() {
-            let pages = read_pages(live.iter().flatten(), &from, end.as_deref());
+            let pages;
+            (pages, reuse) = read_pages(
+                live.iter().flatten(),
+                &from,
+                end.as_deref(),
+                self.taken,
+                self.reuse_window,
+            );
             Running::Remote {
                 grant: Vec::new(),
                 state: State::Ready(Box::new(Task {
@@ -729,6 +737,7 @@ impl Trunk {
             )))
         };
         let key = pivot.key.clone();
+        self.note_reuse(reuse);
         self.tasks.push(NodeTask {
             node: n,
             what: What::Compact {
@@ -945,8 +954,16 @@ impl Trunk {
         let count = settle.count;
         let parts = self.leaf_parts(count);
         let per = crate::util::div_ceil(count, parts).unwrap_or(count).max(1);
+        let mut reuse = Reuse::default();
         let run = if self.pool.is_some() {
-            let pages = read_pages(inputs.clone(), &from, end.as_deref());
+            let pages;
+            (pages, reuse) = read_pages(
+                inputs.clone(),
+                &from,
+                end.as_deref(),
+                self.taken,
+                self.reuse_window,
+            );
             Running::Remote {
                 grant: Vec::new(),
                 state: State::Ready(Box::new(Task {
@@ -961,6 +978,7 @@ impl Trunk {
         } else {
             Running::Inline(Box::new(Compaction::prepare(inputs, from, end, true, per)))
         };
+        self.note_reuse(reuse);
         if settle.was_paid {
             self.spend(n, 0)?;
         }
@@ -1165,8 +1183,13 @@ impl Trunk {
                 store.grant_back(&out.unused)?;
                 store.extend_end(out.end);
                 // The worker timed its merge: a compacted key's cost, which consolidations are
-                // priced at, measured wherever compactions run.
+                // priced at, measured wherever compactions run; and its reads' waits, what the
+                // kernel's page cache cost it.
                 self.note_merge(out.ns, out.units);
+                self.note_reuse(Reuse {
+                    waited_ns: out.read_wait_ns,
+                    ..Reuse::default()
+                });
                 out.parts
             }
             _ => return Err(corrupt()),
@@ -1588,18 +1611,136 @@ fn entries(branches: &[Branch]) -> u64 {
         .fold(0u64, u64::saturating_add)
 }
 
-/// The pages a merge of `[from, end)` writes from `inputs` at most: each one's
-/// [`Branch::pages_between`], summed.
+/// The pages a merge of `[from, end)` reads from `inputs` at most, each one's
+/// [`Branch::pages_between`] summed; and what they add to the kernel's page cache's counts
+/// ([`Reuse`]), each input's pages by the extents taken since its branch, as of `taken`, against
+/// `window`.
 fn read_pages<'a>(
     inputs: impl Iterator<Item = &'a Branch>,
     from: &[u8],
     end: Option<&[u8]>,
-) -> usize {
-    inputs
-        .map(|b| b.pages_between(from, end))
-        .fold(0usize, usize::saturating_add)
+    taken: u64,
+    window: (u64, u64),
+) -> (usize, Reuse) {
+    let mut pages = 0usize;
+    let mut reuse = Reuse::default();
+    for b in inputs {
+        let read = b.pages_between(from, end);
+        pages = pages.saturating_add(read);
+        // A branch loaded at open has no stamp: its age is unknown, so no window holds it.
+        let age = if b.taken == 0 {
+            u64::MAX
+        } else {
+            taken.saturating_sub(b.taken)
+        };
+        if age >= window.0 {
+            let read = u64::try_from(read).unwrap_or(u64::MAX);
+            reuse.past = reuse.past.saturating_add(read);
+            if age < window.1 {
+                reuse.within = reuse.within.saturating_add(read);
+            }
+        }
+    }
+    (pages, reuse)
 }
 
 #[cfg(test)]
 #[path = "seat_wait.rs"]
 mod seat_wait;
+
+#[cfg(test)]
+mod reuse_tests {
+    //! A job's reads counted for the kernel's page cache's ghost (docs/research/65 §8): each
+    //! input's pages by the extents taken since its branch was, against the shard's window.
+    use super::*;
+    use crate::branch::filter::Keys;
+    use crate::branch::{Builder, Op};
+    use crate::store::Config;
+    use hyper_block::buf::Alignment;
+    use hyper_block::sim::SimFile;
+
+    const CONFIG: Config = Config {
+        page_size: 4096,
+        extent_pages: 8,
+        max_extents: 4096,
+    };
+
+    fn branch(store: &mut Store<SimFile>, first: u32, taken: u64) -> Branch {
+        let mut b = Builder::new(store, Keys::Exactly(500)).unwrap();
+        for k in first..first + 500 {
+            b.add(store, format!("k{k:06}").as_bytes(), Op::Put, &[7u8; 100])
+                .unwrap();
+        }
+        let mut b = b.finish(store).unwrap();
+        b.taken = taken;
+        b
+    }
+
+    #[test]
+    fn the_trunk_stamps_each_branch_it_takes_with_the_extents_taken() {
+        let align = Alignment::new(4096).unwrap();
+        let file = SimFile::new(align, Alignment::new(512).unwrap(), 7).unwrap();
+        let mut store = Store::create(file, CONFIG).unwrap();
+        let mut trunk = Trunk::new(TrunkConfig {
+            fanout: 4,
+            leaf_entries: 128,
+        })
+        .unwrap();
+        let a = branch(&mut store, 0, 0);
+        let b = branch(&mut store, 300, 0);
+        let c = branch(&mut store, 600, 0);
+        let extents = |b: &Branch| u64::try_from(b.extents.len()).unwrap();
+        let (ea, eb, ec) = (extents(&a), extents(&b), extents(&c));
+        trunk.add(a);
+        trunk.add_parts(Vec::new(), vec![(0, b), (0, c)], None);
+        assert_eq!(trunk.taken, ea + eb + ec);
+        let stamps: Vec<u64> = trunk
+            .pending
+            .iter()
+            .flat_map(|p| p.parts.iter().map(|(_, b)| b.taken))
+            .collect();
+        assert_eq!(stamps, [ea, ea + eb, ea + eb + ec]);
+    }
+
+    #[test]
+    fn a_jobs_reads_are_counted_by_their_branchs_age_against_the_window() {
+        let align = Alignment::new(4096).unwrap();
+        let file = SimFile::new(align, Alignment::new(512).unwrap(), 7).unwrap();
+        let mut store = Store::create(file, CONFIG).unwrap();
+        // At 100 extents taken: the old branch was taken 90 before, the young one 10, and the
+        // loaded one has no stamp, its age unknown.
+        let old = branch(&mut store, 0, 10);
+        let young = branch(&mut store, 300, 90);
+        let loaded = branch(&mut store, 600, 0);
+        let pages = |b: &Branch| u64::try_from(b.pages_between(b"", None)).unwrap();
+        let (o, y, l) = (pages(&old), pages(&young), pages(&loaded));
+        assert!(o > 1 && y > 1 && l > 1, "one-page branches: {o} {y} {l}");
+        let read = |window| read_pages([&old, &young, &loaded].into_iter(), b"", None, 100, window);
+        let reuse = |past, within| Reuse {
+            past,
+            within,
+            waited_ns: 0,
+        };
+        // Every read counted, the job's pages the sum; no window holds the loaded one's.
+        let (all, r) = read((0, u64::MAX));
+        assert_eq!(u64::try_from(all).unwrap(), o + y + l);
+        assert_eq!(r, reuse(o + y + l, o + y));
+        // A page cache of 20 extents holds the young one: the old and the loaded are past it,
+        // and one of 91 would hold the old one too.
+        assert_eq!(read((20, 91)).1, reuse(o + l, o));
+        // One of 90 is past the old one as well; its end of 90 holds neither.
+        assert_eq!(read((90, 90)).1, reuse(o + l, 0));
+        // One of 91 holds both: only the loaded one is past it.
+        assert_eq!(read((91, u64::MAX)).1, reuse(l, 0));
+        // A job's reads within the trunk's range only: the young branch's keys past "k000400"
+        // are not read.
+        let (some, _) = read_pages(
+            [&young].into_iter(),
+            b"k000300",
+            Some(b"k000400"),
+            100,
+            (0, u64::MAX),
+        );
+        assert!(u64::try_from(some).unwrap() < y, "{some} of {y}");
+    }
+}

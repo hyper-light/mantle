@@ -107,10 +107,11 @@ fn run(db: &mut ShardDb<DeviceFile>, oracle: &mut Oracle, mut x: u64, rotations:
     x
 }
 
-/// What the budget's regions and the kept memtables hold.
+/// What the budget's regions and the kept memtables hold, with the share of it they leave to
+/// the kernel's page cache (docs/research/65 §8).
 fn held(db: &ShardDb<DeviceFile>) -> usize {
     let (cache, write, records) = db.memory_held();
-    cache + write + records + usize::try_from(db.stats().0.kept_bytes).unwrap()
+    cache + write + records + usize::try_from(db.stats().0.kept_bytes).unwrap() + db.kernel_share()
 }
 
 /// Every key the oracle holds reads back as it was last written.
@@ -147,10 +148,15 @@ fn a_budget_that_follows_the_machine_gives_memory_back_when_the_machine_runs_sho
     let mut short = db.budget().unwrap();
     assert!(short < BOUND, "budget {short} stayed at its bound");
     for _ in 0..4 {
+        let (cache, write, records) = db.memory_held();
         assert!(
             db.trimming() || held(&db) <= short,
-            "held {} above the budget {short}",
-            held(&db)
+            "held {} above the budget {short}: cache {cache} write {write} records {records} kept {} kernel {} index {:?} split {:?}",
+            held(&db),
+            db.stats().0.kept_bytes,
+            db.kernel_share(),
+            db.index_bytes(),
+            db.memory_split()
         );
         x = run(&mut db, &mut oracle, x, 1);
         let now = db.budget().unwrap();
@@ -188,15 +194,19 @@ fn a_budget_that_follows_the_machine_gives_memory_back_when_the_machine_runs_sho
     let (cache, write, records) = db.memory_held();
     assert!(
         db.trimming() || held(&db) <= db.budget().unwrap(),
-        "held {} above the budget {}: cache {cache} write {write} records {records} kept {} ({} memtables) index {:?} split {:?}",
+        "held {} above the budget {}: cache {cache} write {write} records {records} kept {} ({} memtables) kernel {} index {:?} split {:?}",
         held(&db),
         db.budget().unwrap(),
         db.stats().0.kept_bytes,
         db.stats().0.kept,
+        db.kernel_share(),
         db.index_bytes(),
         db.memory_split()
     );
     FREE.store(1 << 40, Ordering::Relaxed);
     run(&mut db, &mut oracle, x, 1);
     exact(&mut db, &oracle);
+    // A budget given stands as given: none of it is left to the kernel.
+    db.set_memory(BOUND).unwrap();
+    assert_eq!(db.kernel_share(), 0);
 }

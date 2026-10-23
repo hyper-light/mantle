@@ -298,7 +298,12 @@ when it binds, and is measured then.
      each rotation, each get cycle and in idle time as workers report: the budget is what the
      regions and kept memtables hold and the shard's share of that room, less what grew outside
      its account between two looks, so the kept memtables give memory back, and the caches are
-     trimmed, as the machine runs short (docs/research/65 §2-§5).
+     trimmed, as the machine runs short (docs/research/65 §2-§5). Such a budget leaves a share to
+     the kernel's page cache, which the workers read their inputs through and which absorbs the
+     store's writes over short-lived extents: a fourth region of the tuner, which no region grants
+     into, its gain the workers' measured read waits on the pages a share a step larger would have
+     held, counted by the extents taken since each input's branch was (`ShardDb::kernel_share`;
+     docs/research/65 §7-§8).
 3. **The tree.** Root to leaf; at each node each branch's filter is asked before its leaf is
    read. With the filters and branch interiors in memory, a cold get costs about one device read
    (research/34 §1).

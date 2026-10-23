@@ -41,6 +41,11 @@ memory its owner spares between its memtables, its page cache and its write runs
 - The read side's marginal benefit comes from the S3-FIFO cache's own ghost queue
   (store/cache.rs), which already keeps the IDs of evicted pages: a miss on a page the ghost
   holds is the paper's `saved` read, with no second structure.
+- The merge reads' term (`saved_m`) goes to the kernel's page cache when the budget follows the
+  machine: the workers' stores have no cache and read through it, so the memory the shard leaves
+  the kernel is a fourth region, its ghost the workers' reads by the extents written since each
+  input's branch, priced at their measured waits (docs/research/65 §8). A budget given leaves the
+  kernel nothing, and the page cache and the record cache keep a step each whatever moves.
 - The write side's derivative is the Bε-tree's: entries written per put as a function of the
   memtable size, measured per cycle from the trunk's `entries_written`, in place of the paper's
   leveled-LSM formula.

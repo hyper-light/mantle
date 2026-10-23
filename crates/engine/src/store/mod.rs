@@ -122,11 +122,15 @@ pub struct IoStats {
     /// - point reads the cache missed whose page its ghost named (reads a larger cache would
     ///   have saved);
     /// - point reads the device served, and their nanoseconds;
-    /// - nanoseconds writers waited because the write budget was spent.
+    /// - nanoseconds writers waited because the write budget was spent;
+    /// - nanoseconds span reads waited for their pages: in the file's read call, or from a
+    ///   claim of a read through the issuer until its answer, what a page not in the kernel's
+    ///   page cache costs a worker's merge (docs/research/65 §8).
     pub ghost_misses: u64,
     pub device_reads: u64,
     pub device_read_ns: u64,
     pub budget_wait_ns: u64,
+    pub read_wait_ns: u64,
     /// Demand pages read from the OS's memory on the store's own thread, none handed to the
     /// device's issuer ([`hyper_block::block::BlockFile::read_resident_at`]): counted among
     /// `device_reads` too, and timed there, since a larger cache would have saved them.
@@ -1082,6 +1086,12 @@ impl<F: BlockFile> Store<F> {
     }
 
     /// The store's I/O since it was opened.
+    /// Nanoseconds span reads waited for their pages ([`IoStats::read_wait_ns`]), without the
+    /// rest of [`Self::io_stats`]: what a worker's job reports.
+    pub fn read_wait_ns(&self) -> u64 {
+        self.io.read_wait_ns
+    }
+
     pub fn io_stats(&self) -> IoStats {
         let (cache_hits, cache_misses) = self.cache.as_ref().map_or((0, 0), cache::Cache::stats);
         let (cache_bytes, cache_limit_pages, cache_refused) =
@@ -3796,19 +3806,30 @@ impl<F: BlockFile> Store<F> {
 
     /// The buffers of read `number`, waiting for its answer if it has not come.
     fn claim(&mut self, number: u64) -> Result<Transfers, Error> {
-        loop {
+        // Timed from its first wait: a read already answered costs no clock.
+        let mut waited = None;
+        let claimed = loop {
             let Some(w) = self.writer.as_mut() else {
-                return Err(io("claim a store page span read", "no issuer attached"));
+                break Err(io("claim a store page span read", "no issuer attached"));
             };
             if let Some(i) = w.parked.iter().position(|&(n, _)| n == number) {
-                return w.parked.swap_remove(i).1;
+                break w.parked.swap_remove(i).1;
             }
             if !w.reads.contains(&number) {
-                return Err(io("claim a store page span read", "no such read is out"));
+                break Err(io("claim a store page span read", "no such read is out"));
             }
-            blocking_allowed("an unanswered span claimed synchronously in a runtime task")?;
-            self.answer(true)?;
-        }
+            if let Err(e) =
+                blocking_allowed("an unanswered span claimed synchronously in a runtime task")
+            {
+                break Err(e);
+            }
+            waited.get_or_insert_with(std::time::Instant::now);
+            if let Err(e) = self.answer(true) {
+                break Err(e);
+            }
+        };
+        self.io.read_wait_ns = self.io.read_wait_ns.saturating_add(elapsed_ns(waited));
+        claimed
     }
 
     /// [`Self::read_page`] for a scan, which reads pages in address order: a page `span` holds
@@ -4035,7 +4056,9 @@ impl<F: BlockFile> Store<F> {
         span.pages = 0;
         self.io.reads = self.io.reads.saturating_add(1);
         self.io.pages_read = self.io.pages_read.saturating_add(u64::from(pages));
-        let started = self.timed.then(std::time::Instant::now);
+        // Timed always, a clock read beside a read of up to an extent: what the tuner prices
+        // the kernel's page cache at (`read_wait_ns`); the scans' rent prices only timed reads.
+        let started = Some(std::time::Instant::now());
         let read = span
             .buf
             .as_mut_slice()
@@ -4048,7 +4071,11 @@ impl<F: BlockFile> Store<F> {
                     .read_exact_at(b, offset)
                     .map_err(|e| io("read a store page span", e))
             });
-        self.io.read_ns = self.io.read_ns.saturating_add(elapsed_ns(started));
+        let ns = elapsed_ns(started);
+        self.io.read_wait_ns = self.io.read_wait_ns.saturating_add(ns);
+        if self.timed {
+            self.io.read_ns = self.io.read_ns.saturating_add(ns);
+        }
         read?;
         span.first = address;
         span.pages = pages;

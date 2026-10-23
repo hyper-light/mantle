@@ -128,6 +128,10 @@ pub struct Branch {
     /// entries set the false-positive rate its filter's memory is worth (research/39 §2).
     /// Not part of its descriptor.
     pub probes: u64,
+    /// The extents its trunk had taken in branches once it took this one, none for a branch
+    /// loaded: what a compaction reading it later counts its pages' age in the kernel's page
+    /// cache from (`Trunk::take_reuse`, docs/research/65 §8). Not part of its descriptor.
+    pub taken: u64,
 }
 
 fn corrupt(why: Malformed) -> Error {
@@ -1163,6 +1167,7 @@ impl Builder {
                 .map_err(|_| corrupt(Malformed::TooLarge))?,
             range: self.range_filter.ok_or(corrupt(Malformed::CountMismatch))?,
             probes: 0,
+            taken: 0,
         });
         // Every level's page back among the spares, for the next builder's levels.
         let mut pages = self.spare_pages;
@@ -1380,6 +1385,7 @@ impl Branch {
             range: Surf::default(),
             range_bytes: self.range_bytes,
             probes: 0,
+            taken: self.taken,
         }
     }
 }
@@ -1592,6 +1598,7 @@ impl Branch {
                 range,
                 range_bytes,
                 probes: 0,
+                taken: 0,
             },
             at,
         ))

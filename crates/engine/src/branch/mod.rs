@@ -604,7 +604,7 @@ impl Builder {
         let mut separators = lists.separators;
         separators.reset(Width::Fit)?;
         let mut keys_filter = lists.keys;
-        keys_filter.reset(store.range_filter_bits())?;
+        keys_filter.reset(store.range_filter_bits(), crate::store::RANGE_FILTER_DEPTH)?;
         let mut spare_pages = lists.pages;
         let mut levels = lists.levels;
         levels.push(

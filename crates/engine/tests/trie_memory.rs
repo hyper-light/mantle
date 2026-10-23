@@ -67,7 +67,7 @@ fn range_filter(keys: &[Vec<u8>]) -> (u64, u64) {
         longest = longest.max(cut);
     }
     alloc::begin();
-    let mut b = SurfBuilder::new(SUFFIX).unwrap();
+    let mut b = SurfBuilder::new(SUFFIX, mantle_engine::store::RANGE_FILTER_DEPTH).unwrap();
     let mut before: Option<&Vec<u8>> = None;
     for k in keys {
         b.push(before.map(Vec::as_slice), before.map_or(0, |p| lcp(p, k)))
@@ -141,7 +141,7 @@ fn a_finished_trie_holds_what_it_counts() {
     ];
     for (name, keys) in &shapes {
         alloc::begin();
-        let mut b = SurfBuilder::new(SUFFIX).unwrap();
+        let mut b = SurfBuilder::new(SUFFIX, mantle_engine::store::RANGE_FILTER_DEPTH).unwrap();
         let mut before: Option<&Vec<u8>> = None;
         for k in keys {
             b.push(before.map(Vec::as_slice), before.map_or(0, |p| lcp(p, k)))

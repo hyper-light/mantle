@@ -1324,6 +1324,14 @@ impl Trie {
         )
     }
 
+    /// The labels held below the shared prefix: the dense part's and every sparse level's.
+    #[cfg(test)]
+    pub(crate) fn labels(&self) -> usize {
+        self.sparse.iter().fold(self.dense.labels.ones(), |n, s| {
+            n.saturating_add(s.labels.len())
+        })
+    }
+
     /// The bits a value takes.
     #[cfg(test)]
     fn value_width(&self) -> u32 {

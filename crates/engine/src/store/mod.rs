@@ -166,6 +166,10 @@ fn elapsed_ns(since: Option<std::time::Instant>) -> u64 {
 /// (38-44% at none, 0.2-0.6% at 16).
 pub const RANGE_FILTER_BITS: u32 = 8;
 
+/// PROVISIONAL (measure before commit): the most bytes a range filter's entry runs past where its key parts from the key
+/// before it (`fst::surf`; research/67).
+pub const RANGE_FILTER_DEPTH: usize = 16;
+
 /// A new store's first segment, when its file grows by segments: the superblocks' extent and the
 /// first checkpoint's map, whose one count takes one page of one extent.
 const FIRST_SEGMENT_EXTENTS: u64 = 2;
@@ -1140,9 +1144,10 @@ impl<F: BlockFile> Store<F> {
     /// Has the branches built from here keep `suffix_bits` of each key past its cut in their
     /// range filters (research/35 §2): more bits rule out more empty ranges, at a bit a key each.
     pub fn set_range_filter(&mut self, suffix_bits: u32) -> Result<(), Error> {
-        if suffix_bits > MAX_WIDTH {
+        // The bit marking an entry whole sits above the suffix bits, within a value's 32.
+        if suffix_bits >= MAX_WIDTH {
             return Err(Error::InvalidArgument {
-                what: "a range filter suffix past 32 bits",
+                what: "a range filter suffix past 31 bits",
             });
         }
         self.range_filter_bits = suffix_bits;

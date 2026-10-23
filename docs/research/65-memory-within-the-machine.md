@@ -262,3 +262,126 @@ the cache shrank to give memory that never left the process. The unlanded branch
 the same at 100M, 1.3-2.8 GiB of freed record lists held in glibc's arenas (its research/64 §6),
 and kept the threshold at its initial value, which mallopt(3) says turns the adjustment off
 (`port::mmap::return_freed_blocks`), called at the start of the node's process and the bench.
+## 7. What the kernel's page cache does for the fill
+
+E1d (`diag-follow` d4f35279: the follow with §5's and §6's fixes, its room read by
+`port::memory::room_now`, nothing left to the kernel by rule; `diag-runs/n1000000000-e1d-1-m_e1d`)
+completed the machine-sized 1B run on the VM at 96 GiB with recovery exact over 632,113,920 live
+keys. Its budget held 83 to 92 GiB from the first minute to the fill's end, and the page cache
+82.1 GiB, 79.7 of it live pages: the memory the allocator kept now came back (§6). Its gets and
+seeks ran at twice and three times the fixed-cache arm's, its fill at two thirds:
+
+| 1B, VM 96 GiB | fill | gets | seeks |
+|---|---|---|---|
+| E1d, machine-sized | 2,421,422 | 48,404 | 32,028 |
+| fixed 32 GiB cache (r7111, r7151, r7191, r7192) | 3,162,508-3,976,777 | 20,238-24,096 | 10,767-13,420 |
+| E1f, fixed 32 GiB cache, E1d's binary | 3,796,764 | 24,911 | 15,396 |
+| E1h, fixed 4.5 GiB cache, E1d's binary | 3,770,619 | 33,704 | 19,452 |
+
+E1f ran E1d's binary with the fixed arm's flags (`inside-fixdiag.sh`: a 32 GiB cache, no budget),
+so the two accounts and the process's I/O counters (`/proc/self/io`) stand side by side. Over the
+fill (GB, decimal):
+
+| 1B fill | seconds | read through the page cache (`rchar`) | of it from the device (`read_bytes`) | written (`wchar`) | pages turned dirty (`write_bytes`) | VM page cache from 100 s, mean (GiB) | dirty, mean (GiB) |
+|---|---|---|---|---|---|---|---|
+| E1d | 413 | 464.9 | 142.6 (30.7%) | 575.2 | 480.2 | 8.3 | 0.47 |
+| E1f | 263 | 465.0 | 12.5 (2.7%) | 576.0 | 307.0 | 50.9 | 4.23 |
+
+The engine asked the same of the kernel in both, to within 0.2% each way. What the kernel did
+with it differed by the page cache it had. `write_bytes` counts a page as it turns dirty
+(`folio_account_dirtied`, mm/page-writeback.c); a write to a page already dirty is not counted and
+is not written again. So with 51 GiB of page cache 269 GB of the 576 written landed on pages still
+dirty and never reached the device as writes of their own, and the workers read 97.3% of their
+inputs from memory; with 8 GiB, 95 GB were absorbed and 30.7% of the reads went to the device. The
+device moved 623 GB in E1d against 320 GB in E1f.
+
+E1d's own account says when (per 150 rotations, `compare-fill.sh`): while the VM had room the
+workers read nothing from the device and 150 rotations took 23 to 29 s; once the page cache fell
+to 6-12 GiB at 100 s the device's share of their reads rose to 20-56% and 150 rotations took 40 to
+54 s, recovering to 29-37 s only as the kept memtables gave their 44 GiB back. In E1f the share
+stayed under 1% until the store outgrew the page cache at 200 s (5-12% after), and 150 rotations
+took 17 to 28 s throughout.
+
+So the kernel's page cache does two things for the fill that the engine's own cache cannot, both
+of them reuse of what the engine has just written. The workers read their inputs through it
+(their files are buffered; the page cache's loans of a job's written pages serve the shard's reads,
+not the workers'), as LSbM found of compactions (Teng et al., ICDCS 2017, §2). And it absorbs the
+writes over short-lived extents: an extent a compaction frees is reused at once (`Allocator`'s
+free list is a stack), and its pages, if still dirty, are written once. How long a page stays
+dirty is the kernel's rule: background writeback starts at `dirty_background_ratio` (10%) of the
+dirtyable memory, the free pages and the file LRU (vm.rst; `global_dirtyable_memory`), and
+anonymous memory the engine holds is no part of that, so a cache grown into the page cache
+shrinks the window in which a rewrite is absorbed along with the page cache itself. The two caches
+also hold the same pages (every written page enters both), so together they act only as large as
+the larger (Wong and Wilkes, USENIX ATC 2002): E1d's 82 GiB served its gets and seeks, and the
+page cache's 8 GiB beside it served the workers only what the engine's cache already held.
+
+How far back the workers reach is the engine's own fact. A diagnostic build (`diag-reuse`
+e7727605, never merged) stamps each branch with the trunk's count of extents taken when the trunk
+takes it, and counts each compaction's and settle's input pages by the extents taken since their
+branch was (`reusediag`); E1e ran it with the fixed arm's flags (`diag-runs/n1000000000-e1e-f-f_e1e`).
+By the fill's rotation 1,600, 383 GiB of inputs, by distance in bytes written since:
+
+| written since (GiB) | < 0.5 | < 1 | < 2 | < 4 | < 8 | < 16 | < 32 | < 64 | < 128 | < 256 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| share of input bytes | 29.2% | 37.8% | 45.7% | 55.0% | 65.3% | 72.5% | 82.6% | 88.2% | 93.6% | 99.8% |
+
+Read as a least-recently-used cache of the bytes written, which serves a read at a reuse distance
+short of its size (Mattson, Gecsei, Slutz and Traiger, *Evaluation techniques for storage
+hierarchies*, IBM Systems Journal 9(2), 1970, the stack property), it predicts 65.7%
+of the inputs from memory at E1d's 8.3 GiB, where 69.3% were, and 86.4% at E1f's 50.9 GiB, where
+97.3% were: the larger the page cache, the more of the writes land on extents it already holds
+(an extent a compaction freed is reused at once, its pages read as inputs just before), so it
+reaches further back than the bytes written. Each doubling from 1 GiB to 32 GiB serves another 8
+to 10% of the inputs, so a byte of page cache serves the most at the smallest sizes and its worth
+falls about as one over its size, which is what the tuner's steps between regions assume
+(research/36 §1).
+
+The two caches hold the same pages, so the larger alone counts. E1h ran E1d's binary with a fixed
+cache of 4.5 GiB, one tuning step of a 90 GiB budget, everything else left to the kernel
+(`diag-runs/n1000000000-e1h-1-f_e1d`, recovery exact): its fill matched E1f's (265 s, 1.4 GB of
+the 465 GB its workers read from the device, 276 GB dirtied, the VM's page cache 80 GiB), and its
+gets and seeks ran 1.35 and 1.26 times E1f's: with the page cache as the cache of record, a get the
+engine's cache misses is a copy from the kernel's memory more often than a device read. E1d's 82
+GiB of its own cache served its gets and seeks faster still, the engine's cache costing no system
+call, but starved its fill.
+
+A budget that follows the machine therefore leaves the kernel the page cache the engine's own
+files reuse, by what it saves against what the engine's own cache would: §8.
+
+## 8. The kernel's share, tuned
+
+The tuner (research/36) divides a budget among regions by what each saved a byte in its last
+cycle. Luo and Carey's read cost counts the merge reads a larger buffer cache would have saved
+beside the queries' (`saved_m`, research/36 §1); mantle's merges run on workers whose stores have no
+cache (`Store::worker`) and read through the kernel's page cache, so that term is the gain of the
+memory the shard leaves the kernel, and the engine's own cache's ghost keeps the queries'. While a
+budget follows the machine, the kernel's page cache is a fourth region (`ShardDb::kernel_share`):
+the budget's share no region takes.
+
+- **The ghost.** The trunk counts the extents of every branch it takes and stamps the branch with
+  the count (`Branch::taken`): packed memtables, compactions' and settles' results. A job a worker
+  is handed counts each input's pages it reads by the extents taken since its branch was (§7's
+  measure, `Trunk::take_reuse`): those at or past the share, in extents, which a page cache of the
+  share would not hold (`past`), and of them those short of the share and a tuning step, which one
+  a step larger would (`within`). A branch loaded at open has no stamp and is past every window.
+- **The cost.** A worker times its reads' waits (`IoStats::read_wait_ns`: a span's read in the
+  file, or a read through the issuer from its claim until its answer) and reports them with each
+  job (`Output::read_wait_ns`). A cycle's gain is the waits as many times over as `within` is of
+  `past` (`kernel_gain`): of what the reads the share missed cost, what a step would have saved,
+  against a step's bytes. The price is measured, not modeled: a share past what the kernel's page
+  cache reaches finds no waits to save (§7: it reaches further than the bytes written).
+- **A step.** In a fill with no gets the page cache saves nothing and the workers wait on what the
+  share misses: the page cache gives the share the paper's step a cycle, 5% of the budget within
+  10% of its own, keeping one step itself, as the record cache does, so its ghost gathers the
+  evidence to grow back. That is E1h's shape at a billion rows. Gets that the page cache's ghost
+  names outweigh the workers' waits and take memory back the same way.
+- **What it gives way to.** The share is the budget's last claim: no region grants into it, the
+  kept memtables leave it, and it gives way to what the caches hold that no trim returns, their
+  indexes and ghosts, which a trim's ghost grows (`grant`; the test
+  `the_kernels_share_gives_way_to_what_the_regions_cannot_give_back`). A budget given
+  (`set_memory`) stands as given and leaves the kernel nothing of it.
+- **Open.** The gain prices the reads alone. The writes the page cache absorbs (§7: 269 of 576 GB
+  at 51 GiB) come with the memory the reads earn, unpriced; a rewrite's ghost would count each
+  extent reused by its age against the dirty window, `dirty_background_ratio` of the dirtyable
+  memory.

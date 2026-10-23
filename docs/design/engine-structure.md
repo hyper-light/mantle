@@ -393,23 +393,40 @@ bounded seek pass over a source with nothing in its range without reading it (cl
   key without allocating) and written after the leaf index in the branch's filter stream. A
   deletion must stay visible to a scan, since it hides older versions, so it is filtered like a
   put.
-- **SuRF-Real, exact about intervals.** A key is cut one byte past what it shares with either
-  neighbour, and keeps the next `n` bits as the trie's value (`RANGE_FILTER_BITS = 8`, measured).
+- **SuRF-Real, exact about intervals, cut at a depth.** A key is cut one byte past what it shares
+  with either neighbour, or `RANGE_FILTER_DEPTH` (16, measured) bytes past the bytes every key of
+  its branch shares when that is shorter, and keeps the next `n` bits as the trie's value
+  (`RANGE_FILTER_BITS = 8`, measured). An entry cut at the depth stands for every key starting with
+  it, a bit above its suffix bits marking it, and the keys after it that start with it take none:
+  a key adds at most the depth's labels, so keys in pairs sharing all but a last byte, SuRF's worst
+  case, no longer take a label a byte (research/67). Each builder is told the shared bytes: a
+  packing its memtable's, a compaction's part what its first key shares with the range's end.
   Where the paper answers with a false-positive flag, an entry is treated here as the interval of
   keys it can stand for: from the prefix followed by the suffix bits, to before the prefix
   followed by the next suffix. `may_hold(from, end)` checks the stored prefixes of `from` (one
   descent reports them) and the ceiling against `[from, end)`. No range holding a key is ruled
   out.
 - **The trie under it.** The trie is built in one streaming pass with packed values. Where the
-  paper selects on S-LOUDS for a node's first label, each sparse level keeps its nodes' starts.
-  A node starts at its block's first node's position (every 256th), plus one label for each
-  node before it in the block, plus those nodes' labels past their first (16 bits). A level
-  whose nodes all hold one label keeps no extras. The starts are built when a level is built or
-  read, so no byte written changes (research/62). Dense labels are found by word scans. The
-  sparse part is kept a level at a time, as the builder lays it out, not assembled into one
-  sequence as the paper does. A level's nodes are the branches going on above it, so rank runs
-  within the level. Finishing copies words, not labels: 0.17 ms for 500 k keys against 3.3 ms
-  assembled, which was the put latency maximum once a flush.
+  paper selects on S-LOUDS for a node's first label, the sparse part keeps its nodes' starts. A
+  node starts at its block's first node's position (every 256th), plus one label for each node
+  before it in the block, plus those nodes' labels past their first (16 bits). A block whose nodes
+  all hold one label keeps no extras. The starts are built when a trie is built or read
+  (research/62). Dense labels are found by word scans. The sparse part is one sequence across its
+  levels, as the paper lays it out: labels, branch and node-start bits, a bit a node and values,
+  nodes numbered breadth first, so a branch's child is the first level's nodes and the branches
+  going on before it, and a value one rank over the part. A level so costs its labels' bits, where
+  a record and buffers of its own cost about 438 bytes whatever it held, hundreds of levels in a
+  small branch whose keys part late (research/67). The levels' bits and values are joined a word
+  at a time and the node starts' extras counted by selects over the words: a finish takes
+  0.47-0.54 ms for 500 k keys, as copying each level's words did; assembling a label at a time
+  took 3.3 ms, which was the put latency maximum once a flush.
+- **The leaf index cut at a depth too.** A leaf's separator past `LEAF_INDEX_DEPTH` (256, a
+  bound) bytes beyond the shared ones is cut there and stands for the group of leaves whose first
+  keys start with it, its entry the group's last leaf. A key within a group reads down from the
+  root through the branch's index pages, a page a level, in a get (sync, or a `PointRead` stepping
+  index pages as it does its leaf), a seek and a compaction's cursor; a merge's bounds take a group
+  whole from memory. Every realistic shape's separators reach at most 77 bytes past the shared
+  ones, so their lookups never read an index page (research/67).
 - **Consulted on bounded scans.** At a segment's open, a branch is passed over when its filter
   rules out `[from, min(end, segment end))`. An open scan does not check, since a leaf's end alone
   almost never rules out a branch above it.

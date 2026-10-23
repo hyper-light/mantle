@@ -87,8 +87,37 @@ fn measure(name: &str, keys: &[Vec<u8>], value: usize) {
     let data = pages * page;
     let key_bytes: usize = keys.iter().map(Vec::len).sum();
     let (range, index) = (branch.range.held_bytes(), branch.index.held_bytes());
+    // How far past the bytes every key shares its leaves' separators reach: each leaf's first key
+    // cut one byte past what it shares with the leaf before's last.
+    let shared = keys.first().zip(keys.last()).map_or(0, |(a, z)| {
+        a.iter().zip(z).take_while(|(x, y)| x == y).count()
+    });
+    let mut at = 0usize;
+    let mut deepest = 0usize;
+    for &n in branch.counts.iter().filter(|&&c| c > 0) {
+        if at > 0 {
+            let (last, first) = (&keys[at - 1], &keys[at]);
+            let lcp = last.iter().zip(first).take_while(|(x, y)| x == y).count();
+            deepest = deepest.max((lcp + 1).min(first.len()).saturating_sub(shared));
+        }
+        at += usize::from(n);
+    }
+    // What the statement says the two tries take for these keys, its key the longest.
+    let longest = keys.iter().map(Vec::len).max().unwrap();
+    let stated = branch::tries_bytes(
+        longest,
+        keys.len() as u64,
+        leaves as u64,
+        store.range_filter_bits(),
+    )
+    .unwrap();
+    assert!(
+        (range + index) as u64 <= stated,
+        "{name}: tries {} past {stated} stated",
+        range + index
+    );
     eprintln!(
-        "{name}: keys {} ({:.0} B avg), page {page}, leaves {leaves}, data {data}: range filter {range} ({:.2}% of data, {:.1} B/key), leaf index {index} ({:.2}% of data, {:.0} B/leaf)",
+        "{name}: keys {} ({:.0} B avg), page {page}, leaves {leaves}, data {data}: range filter {range} ({:.2}% of data, {:.1} B/key), leaf index {index} ({:.2}% of data, {:.0} B/leaf), separators to {deepest} past {shared} shared, stated {stated}",
         keys.len(),
         key_bytes as f64 / keys.len() as f64,
         range as f64 * 100.0 / data as f64,
@@ -144,6 +173,23 @@ fn a_branches_tries_against_its_data() {
             .collect(),
     );
     measure("uuid paths, 100 B values", &paths, 100);
+    // A data lake's: tables, day and hour partitions, part files named by a uuid.
+    let lake = sorted(
+        (0..100_000)
+            .map(|_| {
+                let (day, hour) = (r.next() % 30, r.next() % 24);
+                format!(
+                    "warehouse/events_db/clicks/date=2026-10-{:02}/hour={hour:02}/part-{:05}-{:016x}{:016x}-c000.snappy.parquet",
+                    day + 1,
+                    r.next() % 200,
+                    r.next(),
+                    r.next()
+                )
+                .into_bytes()
+            })
+            .collect(),
+    );
+    measure("data-lake paths, 100 B values", &lake, 100);
     measure("pairs of 64 B, no values", &pairs(20_000, 64), 0);
     measure("pairs of 2,132 B, no values", &pairs(4_000, KEY), 0);
     measure(

@@ -254,24 +254,8 @@ pub fn builder_bytes(
     // Each page's count (two bytes) and extent number (eight), twice over, and once exactly.
     let pages = entries.checked_mul(2)?;
     let lists = pages.checked_mul(30)?;
-    let whole = entries.checked_mul(bytes(key)?)?;
-    let labels = |depth: usize| -> Option<u64> {
-        let past = entries.checked_mul(bytes(depth.min(key))?)?;
-        Some(bytes(key)?.checked_add(past)?.min(whole))
-    };
-    let tries = crate::fst::trie::builder_bytes(
-        key,
-        labels(crate::store::RANGE_FILTER_DEPTH)?,
-        entries,
-        range_bits.checked_add(1)?,
-    )?
-    .checked_add(crate::fst::trie::builder_bytes(
-        key,
-        labels(crate::store::LEAF_INDEX_DEPTH)?,
-        entries,
-        u32::BITS,
-    )?)?
-    .checked_mul(3)?;
+    // A leaf holds an entry at least: as many separators as entries at most.
+    let tries = tries_bytes(key, entries, entries, range_bits)?.checked_mul(3)?;
     levels
         .checked_mul(level)?
         .checked_add(key_buffer)?
@@ -281,6 +265,39 @@ pub fn builder_bytes(
         .checked_add(bytes(filter::most_bytes(filter::Keys::AtMost(entries))?)?)?
         .checked_add(lists)?
         .checked_add(tries)
+}
+
+/// The most bytes a branch's two tries take, built or as their builders hold them: its range
+/// filter over `entries` keys of at most `key` bytes keeping `range_bits` suffix bits and a bit for
+/// an entry cut short, and its leaf index over `leaves` separators, its values pages up to 32
+/// bits. Each holds a level a key byte at most and as labels the bytes every key shares once (at
+/// most a key's) and past them at most its depth a key or a separator, never past the key
+/// ([`crate::store::RANGE_FILTER_DEPTH`], [`crate::store::LEAF_INDEX_DEPTH`];
+/// [`trie::builder_bytes`]). Below the data its branch holds for any keys: a key's or a leaf's
+/// share is bounded by the depth, not by the key's length (research/67). Pinned by
+/// `tests/branch_tries.rs`.
+pub fn tries_bytes(key: usize, entries: u64, leaves: u64, range_bits: u32) -> Option<u64> {
+    let bytes = |n: usize| u64::try_from(n).ok();
+    let labels = |n: u64, depth: usize| -> Option<u64> {
+        let past = n.checked_mul(bytes(depth.min(key))?)?;
+        Some(
+            bytes(key)?
+                .checked_add(past)?
+                .min(n.checked_mul(bytes(key)?)?),
+        )
+    };
+    crate::fst::trie::builder_bytes(
+        key,
+        labels(entries, crate::store::RANGE_FILTER_DEPTH)?,
+        entries,
+        range_bits.checked_add(1)?,
+    )?
+    .checked_add(crate::fst::trie::builder_bytes(
+        key,
+        labels(leaves, crate::store::LEAF_INDEX_DEPTH)?,
+        leaves,
+        u32::BITS,
+    )?)
 }
 
 impl Page {

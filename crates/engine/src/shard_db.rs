@@ -5669,11 +5669,14 @@ mod follow_step_tests {
 
     /// A look at the machine with the room that sets the budget's target to `target`, as the
     /// shard holds and has seen outside memory grow before the look: the budget it leaves, and
-    /// how much the outside memory the look itself saw grew past what the room assumed.
+    /// how much the outside memory the look itself saw grew past what the room assumed. A room is
+    /// never below none, so no target lies below what the shard holds less that growth.
     fn look(db: &mut ShardDb<DeviceFile>, target: usize) -> (usize, usize) {
         let held = db.regions_held().saturating_add(db.kept_held());
         let grew = db.follow.as_ref().unwrap().grew_most;
-        let room = target.saturating_add(grew).saturating_sub(held);
+        let room = (target + grew)
+            .checked_sub(held)
+            .expect("a target below what the shard holds less what grew outside it");
         FREE.store(u64::try_from(room).unwrap(), Ordering::Relaxed);
         db.look_machine();
         let drift = db.follow.as_ref().unwrap().grew_most - grew;
@@ -5716,9 +5719,12 @@ mod follow_step_tests {
         let (down, drift) = look(&mut db, up - step - margin);
         assert_eq!(down + drift, up - step - margin);
         // The machine needing memory back, its target below what the shard holds: the budget falls
-        // below it. Gets of keys long since packed fill the caches first, so the shard holds more
-        // than it cannot give back (its write memory and the caches' indexes, `floor_held`): after
-        // the puts alone it held no more than that on Windows, and a budget never falls past it.
+        // below it at once. A room is never below none (`port::memory::room_now`), so only what
+        // grew outside the shard's account between two looks takes the target below what the
+        // shard holds; the test states that growth, which a platform with no reading of the
+        // process's resident memory (Windows) never sees, and which elsewhere was whatever the
+        // process's other allocations happened to be. Gets of keys long since packed fill the
+        // caches first, so the fall has pages to trim.
         let mut value = Vec::new();
         for k in 0..5_000u64 {
             db.get(format!("k{k:08}").as_bytes(), &mut value).unwrap();
@@ -5729,6 +5735,8 @@ mod follow_step_tests {
             "the shard holds {held}, no more than it cannot give back, {}",
             db.floor_held()
         );
+        let follow = db.follow.as_mut().unwrap();
+        follow.grew_most = follow.grew_most.max(margin);
         let (fell, _) = look(&mut db, held - margin);
         assert!(
             fell < held,

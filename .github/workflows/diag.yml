@@ -1,0 +1,34 @@
+name: diag-objects
+# Scratch: node.rs's suite again and again on the runner whose gates failed the object test with
+# a transport Stalled (engine-inflight 49ccd684, 2026-10-23), with the stall traces of this branch.
+on:
+  push:
+    branches: ["diag/**"]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: "1"
+jobs:
+  objects:
+    runs-on: windows-11-arm
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned Rust
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup target add --toolchain 1.98.1 aarch64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: diag-aarch64-pc-windows-msvc
+          workspaces: |
+            .
+            vendor
+      - name: Build the node suite
+        shell: bash
+        run: cargo test --locked -p mantle --test node --no-run --target aarch64-pc-windows-msvc
+      - name: The node suite, again and again
+        shell: bash
+        run: bash diag-ci-loop.sh 14

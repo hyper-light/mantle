@@ -1562,6 +1562,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.snapshot_done(exchange, false);
                 if let Some(at) = self.chunks_out.iter().position(|c| c.exchange == exchange) {
                     let out = self.chunks_out.swap_remove(at);
+                    eprintln!(
+                        "diag-node {:?} chunk lost wall_ms={} peer={:?} get={} refusal={refusal:?}",
+                        self.id,
+                        diag_wall_ms(),
+                        out.peer,
+                        out.get
+                    );
                     self.chunks_done
                         .push((out.asked, ChunkOutcome::Lost(refusal)));
                 }
@@ -2477,6 +2484,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let endpoint = self.driver.endpoint();
         let status = chunk::read_reply_head(endpoint.head(exchange).unwrap_or_default())
             .unwrap_or(chunk::Status::Malformed);
+        eprintln!(
+            "diag-node {:?} chunk replied wall_ms={} peer={peer:?} get={get} status={status:?}",
+            self.id,
+            diag_wall_ms()
+        );
         match status {
             chunk::Status::Read if get => {
                 self.receiving.push(Receiving {
@@ -2622,6 +2634,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         .encode();
         let clock = self.driver.clock()?;
         let period = Progress::new(bounds::idle_timeout())?;
+        eprintln!(
+            "diag-node {:?} chunk get asked wall_ms={} peer={at:?} len={len}",
+            self.id,
+            diag_wall_ms()
+        );
         match self
             .driver
             .endpoint()
@@ -3432,4 +3449,12 @@ fn open_log(dir: &Path, node: u64, config: LogConfig) -> Result<Log<DeviceFile>,
             .map(|(log, _)| log)
             .map_err(|e| NodeError::Log(e.to_string()))
     }
+}
+
+/// Diagnostic: the wall clock in milliseconds since the Unix epoch.
+fn diag_wall_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }

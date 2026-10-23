@@ -376,6 +376,23 @@ impl Client {
     /// that is gone ends only at its handshake's idle timeout, which a request asked of the nodes
     /// that answer never waits out.
     async fn reach(&mut self, node: PeerId, deadline_ns: u64) -> Result<bool, ClientError> {
+        let diag_start = std::time::Instant::now();
+        let out = self.reach_diag(node, deadline_ns).await;
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        if diag_start.elapsed() > std::time::Duration::from_millis(1) {
+            eprintln!(
+                "diag-client {:?} reach wall_ms={wall} node={node:?} after_ms={} out={out:?}",
+                self.id,
+                diag_start.elapsed().as_millis()
+            );
+        }
+        out
+    }
+
+    async fn reach_diag(&mut self, node: PeerId, deadline_ns: u64) -> Result<bool, ClientError> {
         let Some(known) = self.nodes.iter().find(|n| n.id == node) else {
             return Ok(false);
         };
@@ -410,6 +427,34 @@ impl Client {
 
     /// Asks `node` once: its answers, the leader it names, or the exchange lost.
     async fn ask(
+        &mut self,
+        node: PeerId,
+        kind: Kind,
+        group: u128,
+        (deadline_ns, guarded): (u64, bool),
+    ) -> Result<Asked, ClientError> {
+        let diag_start = std::time::Instant::now();
+        let out = self.ask_diag(node, kind, group, (deadline_ns, guarded)).await;
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let what = match &out {
+            Ok(Asked::Answered(_)) => "answered".to_string(),
+            Ok(Asked::Lost) => "lost".to_string(),
+            Ok(Asked::Leader(l, d)) => format!("leader {l} {d:?}"),
+            Ok(Asked::Refused) => "refused".to_string(),
+            Err(e) => format!("error {e}"),
+        };
+        eprintln!(
+            "diag-client {:?} ask wall_ms={wall} node={node:?} group={group} after_ms={} out={what}",
+            self.id,
+            diag_start.elapsed().as_millis()
+        );
+        out
+    }
+
+    async fn ask_diag(
         &mut self,
         node: PeerId,
         kind: Kind,
@@ -681,6 +726,36 @@ impl Client {
         data: &[u8],
         deadline_ns: u64,
     ) -> Result<ObjectOutcome, ClientError> {
+        let diag_start = std::time::Instant::now();
+        let out = self.object_once_diag(node, op, data, deadline_ns).await;
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        match &out {
+            Err(e) => eprintln!(
+                "diag-client object error wall_ms={wall} node={node:?} after_ms={} error={e}",
+                diag_start.elapsed().as_millis()
+            ),
+            Ok(ObjectOutcome::Lost(r)) => eprintln!(
+                "diag-client object lost wall_ms={wall} node={node:?} after_ms={} refusal={r:?}",
+                diag_start.elapsed().as_millis()
+            ),
+            Ok(_) => eprintln!(
+                "diag-client object done wall_ms={wall} node={node:?} after_ms={}",
+                diag_start.elapsed().as_millis()
+            ),
+        }
+        out
+    }
+
+    async fn object_once_diag(
+        &mut self,
+        node: PeerId,
+        op: &Op,
+        data: &[u8],
+        deadline_ns: u64,
+    ) -> Result<ObjectOutcome, ClientError> {
         let (head, names) = op
             .encode()
             .map_err(|e| ClientError::Bounds(e.to_string()))?;
@@ -896,6 +971,9 @@ impl Client {
             let got = endpoint.read_body(exchange, &mut piece);
             into.extend_from_slice(piece.bytes());
             endpoint.release(piece);
+            if let Err(e) = &got {
+                eprintln!("diag-client read_body error {e:?} with {} bytes read", into.len());
+            }
             if got? == 0 {
                 break;
             }

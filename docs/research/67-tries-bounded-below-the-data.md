@@ -153,14 +153,14 @@ for 2,126 labels (`tests/trie_memory.rs`).
 ## 7. Measured
 
 Range filters by depth (`benches/surf.rs`, 1 M keys, 50,000 empty ranges of each kind, 8 suffix
-bits; Linux x86_64, 2026-10-23): the share let through, points / gaps between keys / listings of
-absent prefixes.
+bits; fedora, Linux x86_64, engine-cap cac4acbc, 2026-10-23): the share let through, points /
+gaps between keys / listings of absent prefixes, and bits a key.
 
 | keys | depth 4 | 8 | 16 | 32 | 64 | none |
 |---|---|---|---|---|---|---|
-| 16-byte numbers | 0.04% all | = | = | = | = | 0.04% all, 21.2 bits a key |
-| object names | 100% | 100% | 3.9 / 4.4 / 3.7%, 31.2 bits | = none | = none | 3.9 / 4.4 / 3.7%, 32.1 bits |
-| paths through two 32-hex directories | 100% | 98 / 99 / 0.8% | 98 / 99 / 0.25%, 47.7 bits | same, 90 bits | 30 / 27 / 0.25% | 28 / 25 / 0.25%, 176 bits |
+| 16-byte numbers | 0.04% all, 20.2 bits | = | = | = | = | 0.04% all, 20.2 bits |
+| object names | 100% | 100% | 3.92 / 4.41 / 3.67%, 30.3 bits | = none | = none | 3.91 / 4.38 / 3.66%, 31.2 bits |
+| paths through two 32-hex directories | 100% | 98 / 99 / 0.79%, 15.6 bits | 98 / 99 / 0.25%, 39.4 bits | same, 82.3 bits | 30 / 27 / 0.25%, 148.6 bits | 28 / 25 / 0.25%, 168.3 bits |
 
 16 is the least depth at which every shape lets its listings through as with no depth; narrow
 empty ranges inside a deep directory are let through more, which costs a scan a branch read, never
@@ -171,12 +171,12 @@ how far past the shared bytes each shape's separators reach:
 
 | keys | range filter | leaf index | separators past the shared bytes |
 |---|---|---|---|
-| 8-byte, no values | 17.78% | 0.03% | 3 |
-| 16-byte numbers | 2.68% | 0.02% | 4 |
-| object names | 3.05% | 0.08% | 16 |
+| 8-byte, no values | 16.86% | 0.03% | 3 |
+| 16-byte numbers | 2.59% | 0.02% | 4 |
+| object names | 2.97% | 0.08% | 16 |
 | paths through two 32-hex directories | 0.01% | 0.07% | 77 |
 | data-lake paths (day and hour partitions, uuid part files), 114 bytes | 0.05% | 0.09% | 25 |
-| 64-byte pairs | 15.22% | 0.20% | 58 |
+| 64-byte pairs | 15.13% | 0.20% | 58 |
 | 2,132-byte pairs | 0.46% | 0.69% | 2,126 |
 | 2,132-byte pairs, largest values | 0.04% | 0.68% | 2,126 |
 
@@ -187,6 +187,28 @@ lost its levels' records (paths: 62 → 16 bytes a leaf; 64-byte pairs 454 → 4
 whole is its labels and bits (100,000 object names: 3,580,679 bytes against 3,575,657 a level at a
 time, the blocks' offsets the difference).
 
-Lookups of the leaf index in memory (`benches/leaf_index.rs`, 1 M keys, interleaved four times on
-the shared Linux runner, no instruction counter there): numbers 86.0-91.9 ns before and
-86.4-102.9 after, object names 412.8-436.2 and 410.6-441.5; within that runner's spread.
+The work an operation adds, in instructions: on adacachy (AMD Zen 5) exact by `perf stat -e
+instructions:u`, on this Mac (Apple silicon, the release gate's VM's architecture) as macOS
+counts them retired (`/usr/bin/time -l`); two sizes of each bench, so the difference is the
+operation's alone; engine-inflight 0ef22265 against engine-cap 147f6149, 2026-10-23:
+
+| work | x86_64 before | after | | arm64 before | after | |
+|---|---|---|---|---|---|---|
+| a get of a branch (`benches/point_read.rs`, 1 M entries) | 2,049 | 2,068 | +0.9% | 1,632 | 1,557 | -4.6% |
+| a seek and its nexts (`benches/seek_cursor.rs`) | 28,518 | 28,566 | +0.2% | 28,467 | 28,056 | -1.4% |
+| a leaf lookup and its key, numbers (`benches/leaf_index.rs`) | 2,704 | 2,727 | +0.9% | 2,007 | 1,855 | -7.6% |
+| a leaf lookup and its key, object names | 14,707 | 13,962 | -5.1% | 10,077 | 8,205 | -18.6% |
+| a compaction's round (`benches/compaction.rs`, 2.1 M entries) | 3.403 G | 3.441 G | +1.1% | 3.529 G | 3.579 G | +1.4% |
+| a range filter's build, a key (2 M 16-byte keys) | 328.3 | 348.2 | +6.1% | | | |
+
+The one sequence first cost a leaf lookup 7.0% (numbers) and 8.0% (object names) and a get
+4.8% on x86_64: a node's labels were two node starts, each a block entry, a sentinel test and an
+extra, about 50 instructions a step. A block's extras now run one past its last node, so a
+node's labels are one entry and two adjacent extras, and a rank finds its block by a shift where
+a division by a count read at run time was a division on every rank: lookups that rank most,
+object names', and every lookup on arm64 came out below the per-level layout's. A filter's build
+pays the depth, the shared bytes and the reach checked a key and a whole entry's mark: a first
+form that marked entries with a bit above the suffix bits cost 11.0% a key; one whose cut added
+an entry from two calls left the trie's add out of line; telling the mark and the refusal by one
+compare in `push` cost more, not less (353.2 a key). A value's words grow by a push where they
+were resized each value (-2.7 a key).

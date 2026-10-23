@@ -5716,8 +5716,19 @@ mod follow_step_tests {
         let (down, drift) = look(&mut db, up - step - margin);
         assert_eq!(down + drift, up - step - margin);
         // The machine needing memory back, its target below what the shard holds: the budget falls
-        // below it.
+        // below it. Gets of keys long since packed fill the caches first, so the shard holds more
+        // than it cannot give back (its write memory and the caches' indexes, `floor_held`): after
+        // the puts alone it held no more than that on Windows, and a budget never falls past it.
+        let mut value = Vec::new();
+        for k in 0..5_000u64 {
+            db.get(format!("k{k:08}").as_bytes(), &mut value).unwrap();
+        }
         let held = db.regions_held().saturating_add(db.kept_held());
+        assert!(
+            held > db.floor_held() + margin,
+            "the shard holds {held}, no more than it cannot give back, {}",
+            db.floor_held()
+        );
         let (fell, _) = look(&mut db, held - margin);
         assert!(
             fell < held,

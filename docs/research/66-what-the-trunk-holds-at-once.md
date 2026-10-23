@@ -71,3 +71,33 @@ still writing (`builders_most`), each building at most the leaf limit's entries 
 pool's peak is checked against its kind's count in the test. At 2,132-byte keys the statement is
 loose by its builders' tries, which `builder_bytes` counts at a level and a label a key byte for a
 leaf's limit of keys: the bound below the data that node.md §1.4 names open.
+
+## 6. The release gate
+
+The build of these rules (engine-inflight 3be9ec0e, whose production code 1f951f7b keeps) against
+its base (engine-follow 3cc71771, the production code of 072fed1a), RocksDB and SplinterDB on the
+VM lane (Docker Desktop at 96 GiB, the carryover-balanced order of `run7.sh`), each figure its arm
+over the base in the same round, medians (`paired.py`):
+
+| keys | rounds | fill | gets | seeks |
+|---|---|---|---|---|
+| 1M | 4 | 1.012 | 1.066 | 0.999 |
+| 10M | 4 | 1.046 | 1.050 | 1.010 |
+| 100M | 16 | 1.011 | 0.978 | 0.978 |
+
+At 100M the Mac ran other sessions' builds at a load of 20-30, and both arms' gets ran from 98
+thousand to 2.2 million a second with the engine in the same state in every case (178 kept
+memtables holding every key found, 13-14 GB of cache, no device read; one case's gets waited 4.6 s
+at once): a round's ratio ran from 0.43 to 22, so twelve rounds (R0 7530) joined the gate's four
+(R0 7460). Their medians lie within what the layout alone moves a 100M phase, 3-4%
+(engine-follow's A/A). The fill took fewer page faults in every one of the sixteen rounds: 741
+thousand (711-760 thousand) against 943 thousand (919-993 thousand), 21% fewer, the compactions'
+outputs held to a leaf's limit and one of them opening its inputs at a time.
+
+Against RocksDB and SplinterDB, the gate's rounds (medians of each arm's figures):
+
+| keys | over SplinterDB, fill / gets / seeks | over RocksDB, fill / gets / seeks |
+|---|---|---|
+| 1M | 4.74 / 2.44 / 3.56 | 6.59 / 6.94 / 5.69 |
+| 10M | 4.12 / 2.96 / 4.56 | 5.00 / 10.02 / 7.92 |
+| 100M | 3.41 / 3.52 / 11.54 | 4.64 / 4.87 / 7.91 |

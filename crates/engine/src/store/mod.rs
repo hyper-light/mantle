@@ -194,6 +194,11 @@ pub struct Store<F: BlockFile> {
     /// A read that would wait is refused rather than made ([`Self::begin_no_wait`]): an inline
     /// operation's, which must finish on its caller's thread without the device.
     no_wait: bool,
+    /// Whether its span reads' waits price the kernel's page cache: a maintenance worker's store
+    /// ([`Self::worker`]), whose compactions read their inputs through it (docs/research/65 §8).
+    /// Only such a store asks the OS which pages it holds before a span read and times the reads
+    /// it does not; the shard's own scans pay no probe and no clock read for it.
+    prices_reads: bool,
     /// A read was refused since the last [`Self::begin_no_wait`].
     would_wait: bool,
     config: Config,
@@ -750,6 +755,7 @@ impl<F: BlockFile> Store<F> {
             file: Some(file),
             original: None,
             no_wait: false,
+            prices_reads: false,
             would_wait: false,
             config,
             alloc: Allocator::new(config.max_extents),
@@ -833,6 +839,7 @@ impl<F: BlockFile> Store<F> {
             file: Some(file),
             original: None,
             no_wait: false,
+            prices_reads: true,
             would_wait: false,
             config,
             alloc: Allocator::granted(),
@@ -970,6 +977,7 @@ impl<F: BlockFile> Store<F> {
                 file: Some(file),
                 original: None,
                 no_wait: false,
+                prices_reads: false,
                 would_wait: false,
                 config,
                 alloc,
@@ -2872,7 +2880,7 @@ impl<F: BlockFile> Store<F> {
             .map_err(|error| io("reserve canceled read numbers", error))?;
         self.drain()?;
         let file = self.file.as_ref().ok_or_else(Self::original_missing)?;
-        let tells = file.reads_resident();
+        let tells = self.prices_reads && file.reads_resident();
         let attached = attacher
             .attach_deep(file, batches)
             .map_err(|e| io("attach a store to its device's issuer", e))?;
@@ -3835,7 +3843,13 @@ impl<F: BlockFile> Store<F> {
 
     /// The buffers of read `number`, waiting for its answer if it has not come.
     fn claim(&mut self, number: u64) -> Result<Transfers, Error> {
-        // Timed from its first wait: a read already answered costs no clock read.
+        // Only a read the OS did not hold when handed over waits on the device, and only its
+        // wait is priced: timed from its first wait, so a read already answered, or one that
+        // prices nothing, costs no clock read.
+        let priced = self
+            .writer
+            .as_ref()
+            .is_some_and(|w| w.missed.contains(&number));
         let mut waited = None;
         let claimed = loop {
             let Some(w) = self.writer.as_mut() else {
@@ -3852,12 +3866,13 @@ impl<F: BlockFile> Store<F> {
             {
                 break Err(e);
             }
-            waited.get_or_insert_with(std::time::Instant::now);
+            if priced {
+                waited.get_or_insert_with(std::time::Instant::now);
+            }
             if let Err(e) = self.answer(true) {
                 break Err(e);
             }
         };
-        // Only a read the OS did not hold when handed over waited on the device.
         let missed = self.writer.as_mut().is_some_and(|w| {
             w.missed
                 .iter()
@@ -4101,17 +4116,18 @@ impl<F: BlockFile> Store<F> {
             .as_mut_slice()
             .get_mut(..bytes)
             .ok_or(corrupt(Malformed::TooLarge))?;
-        // From memory when the OS holds it, asked of a file that can tell; else a read that waits
-        // on the device, timed always (a clock read beside a read of up to an extent) as what the
-        // tuner prices the kernel's page cache at (`read_wait_ns`); the scans' rent prices only
-        // timed reads.
-        let tells = file.reads_resident();
+        // A worker's store asks the OS first, of a file that can tell: from memory when it holds
+        // the span, else a read that waits on the device, timed (a clock read beside a read of up
+        // to an extent) as what the tuner prices the kernel's page cache at (`read_wait_ns`). The
+        // shard's own store reads at once, timed only for diagnosis ([`Self::set_timed`]): the
+        // scans' rent prices only timed reads.
+        let tells = self.prices_reads && file.reads_resident();
         let held = tells
             && file
                 .read_resident_at(b, offset)
                 .map_err(|e| io("read a store page span from memory", e))?;
         if !held {
-            let started = Some(std::time::Instant::now());
+            let started = (tells || self.timed).then(std::time::Instant::now);
             let read = file
                 .read_exact_at(b, offset)
                 .map_err(|e| io("read a store page span", e));

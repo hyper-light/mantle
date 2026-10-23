@@ -315,9 +315,22 @@ measures the second, and derives the rest by these rules:
   from the one before at its first byte, made the range filter and the leaf index a third of the
   data at 2,132-byte keys: a bound below the data, by a depth past which the range filter
   truncates and the leaf index finds its leaf another way, is the engine's to research and measure.
-  And `ShardDb::follow_machine` gives its cache, writes and records the machine's whole capacity,
-  these holdings outside it: machine-sized, an engine was OOM-killed at a billion rows in a 64 GiB
-  VM, and sooner in a 96 GiB one; its budget must leave them room.
+  And `ShardDb::follow_machine` budgets a range's cache, writes and records from what remains of the
+  machine: the budget follows one of `shares` of the machine's room (`port::memory::room_now`: on
+  Linux `MemAvailable` less the larger of the kernel's background dirty threshold and its dirty and
+  writeback pages, and less the process's own swap), looked at each rotation, each get cycle and
+  once a cycle's worth of scans and merged entries has passed, or as an idle shard's workers report;
+  it is capped at its share of the capacity less the range's own memtables and branch metadata, and
+  moves by a tuning step, or at once when the machine needs memory back. Its tuner leaves the
+  kernel's page cache, which the workers read their inputs through and which absorbs the store's
+  rewrites, a share earned by the workers' waits on reads the OS did not hold, and the cache keeps
+  its pages on huge pages (`port::mmap::PageBuf`; docs/research/65 §7-§9). Machine-sized, a billion
+  rows completes on the VM at 64 GiB (1ba145a5) and at 96 GiB on the final build, its gets and
+  seeks 1.24 and 1.26 of a fixed 32 GiB cache's and its fill 0.85, the same build at that fixed
+  cache 1.06, 1.34 and 1.13 of data-layer's (docs/research/65 §9). *Open:* kept memtables take the
+  budget's idle part before any read misses, and with the memory moved between the regions cost a
+  billion rows' fill 15% against a fixed cache (§9); and hyper-rt reads no process's resident memory
+  on Windows, so a shard there leaves nothing free for what grows outside its account (§9).
 
 | Value (`mantle node`'s key) | Kind | Model and source |
 |---|---|---|

@@ -500,3 +500,27 @@ gate weighs them.
   back, 64 bytes in they did not: at 1M 0.986 of data-layer's at 16, 0.963 at 0 and 0.961 at 64
   (eight rounds, R0 7381-7388), at 10M 1.000 at 16 and 0.963 at 0 (R0 7391-7396). The page's place
   within a cache line, not its alignment to a page, is what the decode met.
+- **The final build at a billion rows.** engine-follow 3cc71771 (`ranges-follow`, md5 a1780568,
+  the production code of 072fed1a), interleaved with data-layer bbc73a15 (`ranges-dl`, md5
+  7dd33ec0) on the VM at 96 GiB. Machine-sized, against data-layer with a fixed 32 GiB cache as
+  rocks32's and sdb32's (R0 7500, n=2), every case completed with recovery exact over 632,113,920
+  live keys: the follow's gets 1.24 and seeks 1.26 of the fixed cache's (1.23-1.24, 1.21-1.31),
+  its fill 0.85 (0.83-0.87). Its budget gave the page cache 5.4-14.9 GB, the record cache 5.1 GB
+  and the kept memtables 5.0 GB where the fixed cache held 34.4 GB, and moved memory between them
+  through the fill: 9,819-12,376 loans against 8,098-9,566, and 19.7-22.3 million faults against
+  5.1-8.6 million, the kept memtables' cost to the fill (E1i). The same build with the fixed 32 GiB
+  cache against data-layer's (R0 7520, n=2): fill 1.056 (1.054-1.058), gets 1.341 (1.306-1.377),
+  seeks 1.129 (1.084-1.173), every case exact: the code both run lost nothing, and the fill's cost
+  is the follow's own choice of memory. The fixed cache's build still took twice the faults
+  (14.7-15.3 million against 6.1-7.6 million) without losing throughput.
+- **Windows.** A look's room is never below none, so a budget falls below what the shard holds
+  only by what grew outside its account between two looks (`grew_most`), which the process's
+  resident memory says (`Facts::resident_now`: `/proc/self/statm` on Linux, the task's resident
+  size on macOS). hyper-rt has no such reading on Windows (`resident_bytes` is none there), so a
+  shard there leaves nothing free for that growth: with no room its budget falls to what it holds
+  and grows no further, and what it gives back is only what the budget sets aside within it (the
+  kernel's share, a get's step), never the growth outside its account. The tuning-step
+  test had leaned on whatever the process's other allocations grew to take its target below
+  what the shard held (1,187,783 bytes on the Mac, none on Windows), and now states that growth
+  (072fed1a). The process's working set, which Windows gives (`GetProcessMemoryInfo`), is the
+  reading to add to hyper-rt.

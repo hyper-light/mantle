@@ -85,6 +85,38 @@ impl Grow {
         self.len = 0;
     }
 
+    /// Room for `bits` bits in all, taken once where the total is known.
+    pub fn reserve_bits(&mut self, bits: usize) {
+        self.words
+            .reserve_exact(bits.div_ceil(64).saturating_sub(self.words.len()));
+    }
+
+    /// Appends `other`'s bits, a word at a time: each of its words split across the two words of
+    /// this vector it lands in. Bits past either length are clear, so the words' high parts carry
+    /// none past the new length.
+    pub fn append(&mut self, other: &Grow) {
+        let shift = self.len % 64;
+        let len = self.len.saturating_add(other.len);
+        // The words the new length takes: a word past them would hold only clear bits, and
+        // pushed, would grow a buffer taken at its size.
+        let need = len.div_ceil(64);
+        let words = other.words.get(..other.len.div_ceil(64)).unwrap_or(&[]);
+        if shift == 0 {
+            self.words.extend_from_slice(words);
+        } else {
+            let back = 64usize.saturating_sub(shift);
+            for &w in words {
+                if let Some(last) = self.words.last_mut() {
+                    *last |= w << shift;
+                }
+                if self.words.len() < need {
+                    self.words.push(w >> back);
+                }
+            }
+        }
+        self.len = len;
+    }
+
     /// Grows to `len` bits, the new ones clear.
     pub fn grow_to(&mut self, len: usize) {
         if len > self.len {
@@ -143,6 +175,9 @@ impl Bits {
 
     fn index(&mut self) -> Result<(), Error> {
         let mut ones = 0usize;
+        // A count a block of words: taken once at its size.
+        self.ranks
+            .reserve_exact(self.words.len().div_ceil(self.block_words));
         for (i, w) in self.words.iter().enumerate() {
             if i.checked_rem(self.block_words) == Some(0) {
                 self.ranks.push(u32::try_from(ones).map_err(|_| corrupt())?);
@@ -314,6 +349,37 @@ impl Bits {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Vectors appended one to another hold the bits pushed one at a time, at every length and
+    /// every offset within a word.
+    #[test]
+    fn appended_vectors_hold_their_bits_in_order() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut bit = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for case in 0..200 {
+            let (mut whole, mut pushed, mut all) = (Grow::default(), Grow::default(), Vec::new());
+            for _ in 0..(bit() % 6) {
+                let mut part = Grow::default();
+                for _ in 0..(bit() % 200) {
+                    let b = bit() % 3 == 0;
+                    part.push(b);
+                    pushed.push(b);
+                    all.push(b);
+                }
+                whole.append(&part);
+            }
+            assert_eq!(whole.len(), all.len(), "case {case}");
+            for (i, &b) in all.iter().enumerate() {
+                assert_eq!(whole.get(i), b, "case {case} bit {i}");
+            }
+            assert_eq!(whole.words, pushed.words, "case {case} words");
+        }
+    }
 
     fn naive_rank(bits: &[bool], i: usize) -> usize {
         bits[..=i.min(bits.len() - 1)]

@@ -64,6 +64,18 @@ impl Packed {
             .map(|b| b.div_ceil(64))
     }
 
+    /// Room for `more` values past those held, taken once where the total is known.
+    pub fn reserve(&mut self, more: usize) -> Result<(), Error> {
+        let words = self
+            .len
+            .checked_add(more)
+            .and_then(|n| self.words_for(n))
+            .ok_or(corrupt())?;
+        self.words
+            .reserve_exact(words.saturating_sub(self.words.len()));
+        Ok(())
+    }
+
     /// Appends `v`, which must fit the width.
     pub fn push(&mut self, v: u32) -> Result<(), Error> {
         if width_of(v) > self.width {

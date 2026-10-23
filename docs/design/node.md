@@ -187,7 +187,7 @@ operations, each under a permit.
 | Stated by the operator | Measured by the node | Derived by the node |
 |---|---|---|
 | the node's roles; which devices hold data and which hold metadata | each device's identity (`mantle-disk`), and its calibration: flush cost, durable bandwidth, read depth, read gap, first-write penalty (chunk-store.md §2, §7) | every queue bound, window and budget in §2.6, §3.3 and §4 |
-| listen addresses | the memory the operating system allows the process: cgroup `memory.max` and `memory.high` on Linux, job limits on Windows, physical memory otherwise | the tick period and election timeout (§2.4) |
+| listen addresses | the memory the operating system allows the process: the tightest of cgroup v2's `memory.max` or v1's `memory.limit_in_bytes` up its cgroup path and a finite `RLIMIT_AS` or `RLIMIT_DATA` (hyper-rt's `MemoryFacts::limit`; a Windows job's limit is owed), and physical memory | the tick period and election timeout (§2.4) |
 | the cell to create or join (§1.5), and the node's failure-domain labels: zone, rack | granted cores | the scheme each block is stored in (durability.md §4) |
 | the failures to survive, `f`, and the domain level they are counted at (architecture §11) | each peer's round-trip time and delivery rate, from the transport | the members a range needs and where they go (§6.5) |
 | the durability target: unless stated, a block's annual chance of loss at most 10⁻¹¹, S3's eleven nines applied per block (durability.md §1) | flush, apply, snapshot and scheduling delays; an idle engine instance's cost (12 §6.1) | what the node reports it can survive |
@@ -198,14 +198,18 @@ The two policy shares have no model that storage can supply (11 §18). Until a d
 them, a queue is bounded at the lower bound its own service time sets, and checkpoints are
 triggered by space alone (11 §4.5, §9), as the chunk store does today.
 
-**Memory.** When the operator states no ceiling, the node's budget is the smallest that admits
-one unit of work of every class at once: one PUT's block window and its coding work space, one
-GET's block, one `Ready` of the largest entry for each range with work, the engines' minimum
-write buffers, one transfer slot per peer. That floor is computed from the settings, and the
-node refuses to start, naming the class, when it exceeds what the operating system allows.
-Independent defaults, each safe alone, add up past a laptop's memory: the chunk store's pools
-alone can keep 96 MiB per volume (audit §12.3). A laptop needs the smallest population that
-serves its work (audit §6.3), and more is granted by stating a ceiling.
+**Memory.** The node may hold the operator's ceiling; else the limit the OS sets the process,
+or physical memory where that limit allows more; else physical memory (`derive::allowance`). Its
+floor is the least that admits one unit of work of every class at once: one PUT's block window
+and its coding work space, one GET's block, one `Ready` of the largest entry for each range with
+work, the engines' minimum write buffers, one transfer slot per peer. That floor is computed from
+the settings class by class (`derive::Floor`), and the node refuses to start when it passes what
+the node may hold, naming the class whose bytes take it past (`DeriveError::Memory`), or when a
+ceiling passes what the OS and the machine allow (`DeriveError::Ceiling`). What remains sizes
+each volume's index and each engine's resident metadata, each at most what its device's data
+needs. Independent defaults, each safe alone, add up past a laptop's memory: the chunk store's
+pools alone can keep 96 MiB per volume (audit §12.3). A laptop needs the smallest population that
+serves its work (audit §6.3), and a ceiling holds the node to less.
 
 A configuration key the node does not know is refused, as the S3 layer's readers refuse what
 they do not know. `mantle status` prints every derived value with the input or constraint that
@@ -221,9 +225,12 @@ measures the second, and derives the rest by these rules:
   apply, one chunk ask to each node a block's width needs, the transport funding each peer's
   windows at QUIC's initial window beside the messages' room and each connection's reserve
   (`bounds::least_transport`); a receive chunk past them spares a datagram its copy, which its
-  connection's window already charges, and waits for its knee. The node refuses to start, naming the class, when the floor exceeds the
-  stated ceiling or the limit the OS sets for the process (hyper-rt's `MemoryFacts::limit`:
-  cgroup v2's `memory.max`, a job's limit, `RLIMIT_AS`). A share above a class's floor waits for
+  connection's window already charges, and waits for its knee. The node refuses to start when
+  the floor passes what it may hold, the stated ceiling, else the limit the OS sets the process
+  (hyper-rt's `MemoryFacts::limit`), else physical memory, naming the class whose bytes take the
+  floor's running total past it in the order the classes below are counted (`Floor::admit`,
+  `DeriveError::Memory`); a ceiling past what the OS and the machine allow the process is refused
+  too (`DeriveError::Ceiling`). A share above a class's floor waits for
   its knee, where throughput stops growing as the share grows, measured at the scale step (§9.3):
   until then it has no basis.
 - **Sessions are named by their owner and its run** (the node's id and its run record, §1.6),
@@ -485,7 +492,8 @@ deprecates: the configuration (no such file, a line that does not parse, a key i
 a value out of its bounds), the identity (a file missing, a key that is not PKCS #8, a certificate
 its configured authority did not sign), a root key (not 32 bytes, readable by others than its
 owner), a directory or device another process holds (`LOCK`), a device whose profile no longer
-matches and cannot be measured again, the floor past the memory allowed (§1.4, naming the class),
+matches and cannot be measured again, the floor past the memory allowed (§1.4, naming the class)
+or a ceiling past what the process is allowed,
 an address in use, and a store, log or volume that does not recover (naming its file). **An
 orderly stop** begins at SIGTERM or SIGINT (hyper-rt's signals; Ctrl-C, a console's close and
 shutdown on Windows), as a container's stop sends TERM to its first process and KILL once the grace

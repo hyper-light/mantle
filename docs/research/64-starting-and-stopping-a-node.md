@@ -74,9 +74,11 @@ Linux's cgroup v2 documentation (docs.kernel.org, "Control Group v2", Memory Int
   pressure. Going over the high limit never invokes the OOM killer and under extreme conditions the
   limit may be breached."
 
-A container's memory limit in a pod is its cgroup's `memory.max`. hyper-rt reads the tightest of
-these up the process's cgroup path, and a Windows job's limit, beside the machine's physical memory
-(`hyper_rt::machine::facts::MemoryFacts`).
+A container's memory limit in a pod is its cgroup's `memory.max`. hyper-rt reads the tightest
+`memory.max` (v1's `memory.limit_in_bytes`) up the process's cgroup path and a finite `RLIMIT_AS` or
+`RLIMIT_DATA`, beside the machine's physical memory (`hyper_rt::machine::facts::MemoryFacts`);
+`memory.high` throttles and never kills, so it bounds no admission, and a Windows job's limit is
+owed.
 
 ### How long a scheduler lets a thread wait to run
 
@@ -126,8 +128,9 @@ of each thread ahead of it:
    deprecates it and Windows has no counterpart.
 5. **Memory is the operator's, or the OS's on the operator's behalf.** A stated ceiling governs;
    absent one, a limit the OS sets for the process (cgroup v2, a Windows job), which in an
-   orchestrator is the operator's statement; absent both, node.md §1.4's floor, the smallest
-   budget that admits one unit of every class of work.
+   orchestrator is the operator's statement; absent both, physical memory. node.md §1.4's floor,
+   the least that admits one unit of every class of work, is what the node refuses to start below,
+   and what remains past it sizes the volumes' indexes and the engines' resident metadata.
 6. **A probe's budget is its samples at a quantum each.** hyper-rt's probes stop at 59 samples,
    and each waits at most about one quantum behind a runnable thread ahead of it, so the budget is
    59 of the platform's quanta: 3 ms on Linux, 10 ms on macOS, Microsoft's measured 6 intervals of

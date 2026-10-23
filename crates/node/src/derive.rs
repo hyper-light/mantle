@@ -13,6 +13,7 @@ use hyper_raft::progress::Progress;
 use hyper_raft::proto::{Entry, Message};
 use hyper_raft::read::PendingRead;
 use hyper_rt::machine::bench::MIN_SAMPLES;
+use hyper_rt::machine::facts::{MemoryFacts, effective_capacity};
 use mantle_chunk::layout::{self as volume_layout, Geometry};
 use mantle_chunk::{ChunkError, Config as VolumeConfig, Limits, Reads, index};
 use mantle_ec::durability::{self, Burst, Choice, DurabilityError, Rates, Scheme};
@@ -254,6 +255,17 @@ pub enum DeriveError {
     Volume(#[from] ChunkError),
     #[error("the durability model: {0}")]
     Durability(#[from] DurabilityError),
+    #[error(
+        "the memory floor, {floor} bytes, passes the {basis} of {allowance} bytes at the {class}"
+    )]
+    Memory {
+        class: Holding,
+        floor: u64,
+        allowance: u64,
+        basis: Basis,
+    },
+    #[error("a memory ceiling of {ceiling} bytes, past the {capacity} the process is allowed")]
+    Ceiling { ceiling: u64, capacity: u64 },
 }
 
 /// The range's settings and rules, which every member of the cell derives alike, from the
@@ -685,6 +697,177 @@ pub fn stacks(threads: u64) -> Option<u64> {
     threads.checked_mul(STACK)
 }
 
+/// A class of the node's memory floor (docs/design/node.md §1.4), in the order the floor counts
+/// them: a refusal names the class whose bytes take its running total past what the node may
+/// hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Holding {
+    /// The operations the gateway's drivers hold at once ([`objects`]).
+    Objects,
+    /// Each volume's buffers (`mantle_chunk::layout::most_bytes`).
+    Volumes,
+    /// Each volume's index at its least, a fragment (`mantle_chunk::index::most_bytes`).
+    Indexes,
+    /// Each range engine's buffers (`mantle_engine::shard_db::bounded_bytes`).
+    Engines,
+    /// The stacks of the threads the node starts ([`threads`], [`stacks`]).
+    Threads,
+    /// Each range's member ([`range_bytes`]).
+    Ranges,
+    /// The node's log ([`log_bytes`]).
+    Log,
+    /// The transport's budget at its floor (`bounds::least_transport`) and what it holds beside
+    /// it ([`transport_bytes_beside`]).
+    Transport,
+}
+
+impl Holding {
+    /// Every class, in the order the floor counts them.
+    pub const ALL: [Holding; 8] = [
+        Holding::Objects,
+        Holding::Volumes,
+        Holding::Indexes,
+        Holding::Engines,
+        Holding::Threads,
+        Holding::Ranges,
+        Holding::Log,
+        Holding::Transport,
+    ];
+}
+
+impl std::fmt::Display for Holding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Holding::Objects => "objects",
+            Holding::Volumes => "volumes' buffers",
+            Holding::Indexes => "volumes' indexes",
+            Holding::Engines => "range engines' buffers",
+            Holding::Threads => "threads' stacks",
+            Holding::Ranges => "ranges' members",
+            Holding::Log => "log",
+            Holding::Transport => "transport",
+        })
+    }
+}
+
+/// Where the memory a node may hold comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Basis {
+    /// The operator's ceiling.
+    Stated,
+    /// The limit the OS sets the process, below its physical memory.
+    Limit,
+    /// The machine's physical memory.
+    Physical,
+}
+
+impl std::fmt::Display for Basis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Basis::Stated => "stated ceiling",
+            Basis::Limit => "limit the OS sets the process",
+            Basis::Physical => "machine's physical memory",
+        })
+    }
+}
+
+/// The memory a node may hold, and what it comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Allowance {
+    pub bytes: u64,
+    pub basis: Basis,
+}
+
+/// The memory a node may hold: the operator's ceiling; else the limit the OS sets the process
+/// (hyper-rt's `MemoryFacts::limit`: cgroup `memory.max`, a finite `RLIMIT_AS` or `RLIMIT_DATA`),
+/// physical memory where that limit allows more (`effective_capacity`); else physical memory. A
+/// ceiling past what the OS and the machine allow the process is refused: the node would be
+/// killed before it reached it.
+pub fn allowance(ceiling: Option<u64>, memory: &MemoryFacts) -> Result<Allowance, DeriveError> {
+    let capacity = effective_capacity(memory.total, memory.limit);
+    match ceiling {
+        Some(ceiling) if ceiling > capacity => Err(DeriveError::Ceiling { ceiling, capacity }),
+        Some(bytes) => Ok(Allowance {
+            bytes,
+            basis: Basis::Stated,
+        }),
+        None => Ok(Allowance {
+            bytes: capacity,
+            basis: if memory.limit.is_some_and(|limit| limit < memory.total) {
+                Basis::Limit
+            } else {
+                Basis::Physical
+            },
+        }),
+    }
+}
+
+/// The node's memory floor: what each class holds with one unit of every class's work at once
+/// (node.md §1.4), counted in [`Holding::ALL`]'s order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Floor {
+    parts: [(Holding, u64); 8],
+}
+
+impl Default for Floor {
+    fn default() -> Self {
+        Self {
+            parts: Holding::ALL.map(|class| (class, 0)),
+        }
+    }
+}
+
+impl Floor {
+    /// Adds `bytes` to what `class` holds: a class of many, each volume's or range's, takes each.
+    pub fn add(&mut self, class: Holding, bytes: u64) -> Result<(), DeriveError> {
+        let overflow = DeriveError::Overflow("the memory floor");
+        let (_, held) = self
+            .parts
+            .iter_mut()
+            .find(|(c, _)| *c == class)
+            .ok_or(DeriveError::Overflow("a class of the memory floor"))?;
+        *held = held.checked_add(bytes).ok_or(overflow)?;
+        Ok(())
+    }
+
+    /// What `class` holds at the floor.
+    pub fn of(&self, class: Holding) -> u64 {
+        self.parts
+            .iter()
+            .find(|(c, _)| *c == class)
+            .map_or(0, |&(_, held)| held)
+    }
+
+    /// The floor's bytes, every class's; none past what this machine addresses.
+    pub fn total(&self) -> Option<u64> {
+        self.parts
+            .iter()
+            .try_fold(0u64, |total, &(_, held)| total.checked_add(held))
+    }
+
+    /// What remains of `allowance` past the floor, for what memory sizes beyond it: each volume's
+    /// index and each engine's resident metadata. A floor past the allowance is refused, naming
+    /// the class whose bytes take the running total past it.
+    pub fn admit(&self, allowance: &Allowance) -> Result<u64, DeriveError> {
+        let mut total = 0u64;
+        for &(class, held) in &self.parts {
+            total = total
+                .checked_add(held)
+                .filter(|&total| total <= allowance.bytes)
+                .ok_or_else(|| DeriveError::Memory {
+                    class,
+                    floor: self.total().unwrap_or(u64::MAX),
+                    allowance: allowance.bytes,
+                    basis: allowance.basis,
+                })?;
+        }
+        allowance
+            .bytes
+            .checked_sub(total)
+            .ok_or(DeriveError::Overflow("the memory floor"))
+    }
+}
+
 /// What a data device measured (docs/design/chunk-store.md §7; `mantle_disk::calibrate`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Profile {
@@ -1066,6 +1249,171 @@ mod tests {
         let log = Log::create(file, config, 1).unwrap();
         let entry = usize::try_from(settings.max_entry_bytes).unwrap();
         assert!(log.entry_room().unwrap() >= entry + hyper_durable::ENTRY_OVERHEAD);
+    }
+
+    fn memory(total: u64, limit: Option<u64>) -> MemoryFacts {
+        MemoryFacts {
+            total,
+            available: total,
+            address_bits: 48,
+            limit,
+        }
+    }
+
+    /// The allowance is the stated ceiling, else the OS's limit for the process, else physical
+    /// memory; a limit at or above physical memory leaves it physical memory, and a ceiling a byte
+    /// past what the OS and the machine allow is refused. This host's own reading is at most its
+    /// physical memory.
+    #[test]
+    fn the_allowance_is_the_ceiling_else_the_os_limit_else_physical_memory() {
+        let gib = 1u64 << 30;
+        let at = |bytes, basis| Allowance { bytes, basis };
+        assert_eq!(
+            allowance(None, &memory(64 * gib, None)).unwrap(),
+            at(64 * gib, Basis::Physical)
+        );
+        assert_eq!(
+            allowance(None, &memory(64 * gib, Some(8 * gib))).unwrap(),
+            at(8 * gib, Basis::Limit)
+        );
+        assert_eq!(
+            allowance(None, &memory(64 * gib, Some(64 * gib))).unwrap(),
+            at(64 * gib, Basis::Physical)
+        );
+        assert_eq!(
+            allowance(None, &memory(64 * gib, Some(1 << 40))).unwrap(),
+            at(64 * gib, Basis::Physical)
+        );
+        assert_eq!(
+            allowance(Some(4 * gib), &memory(64 * gib, Some(8 * gib))).unwrap(),
+            at(4 * gib, Basis::Stated)
+        );
+        assert_eq!(
+            allowance(Some(8 * gib), &memory(64 * gib, Some(8 * gib))).unwrap(),
+            at(8 * gib, Basis::Stated)
+        );
+        assert!(matches!(
+            allowance(Some(8 * gib + 1), &memory(64 * gib, Some(8 * gib))),
+            Err(DeriveError::Ceiling { ceiling, capacity })
+                if ceiling == 8 * gib + 1 && capacity == 8 * gib
+        ));
+        assert!(matches!(
+            allowance(Some(64 * gib + 1), &memory(64 * gib, None)),
+            Err(DeriveError::Ceiling { capacity, .. }) if capacity == 64 * gib
+        ));
+        let host = hyper_rt::machine::facts::Facts::query().memory;
+        let a = allowance(None, &host).unwrap();
+        assert_eq!(a.bytes, effective_capacity(host.total, host.limit));
+        assert!(a.bytes <= host.total);
+    }
+
+    /// A node's floor from each class's own statement, with one unit of every class's work at
+    /// once: five ranges of three members with an engine each, a volume of a gibibyte on a device
+    /// of its depth, two peers. It admits at exactly its bytes, leaving nothing, and leaves what an
+    /// allowance holds past it; a byte short of each class's running total is refused there,
+    /// naming that class with the floor's bytes and the allowance's.
+    #[test]
+    fn the_floor_admits_at_its_bytes_and_a_byte_less_names_the_class_it_passes_at() {
+        let (settings, rules) = cell(3).unwrap();
+        let align = Alignment::new(4096).unwrap();
+        let ranges = 5;
+        let mut floor = Floor::default();
+        let g = gateway().unwrap();
+        let s = schemes(3, &rates(), target(None)).unwrap();
+        floor
+            .add(Holding::Objects, objects(&g, &s).unwrap())
+            .unwrap();
+        let least_index = index::most_bytes(1).unwrap();
+        let chunk = mantle_gateway::layout::CHUNK;
+        let v = volume(align, 1 << 30, chunk, &PROFILE, least_index, None).unwrap();
+        let geometry = Geometry::plan(1 << 30, align, &v).unwrap();
+        floor
+            .add(
+                Holding::Volumes,
+                volume_layout::most_bytes(&v, &geometry).unwrap(),
+            )
+            .unwrap();
+        floor.add(Holding::Indexes, least_index).unwrap();
+        let e = engine(4096, 1 << 30, &rules).unwrap();
+        let engine_bytes =
+            mantle_engine::shard_db::bounded_bytes(&e.store, e.memtable_bytes).unwrap();
+        let range = Range {
+            layer: mantle_meta::apply::Layer::Name,
+            rules,
+            boot: mantle_range::ConfState {
+                voters: (1..=3).collect(),
+                ..mantle_range::ConfState::default()
+            },
+            settings,
+        };
+        let member = range_bytes(&range, asks(&g, &s).unwrap().reads).unwrap();
+        for _ in 0..ranges {
+            floor.add(Holding::Engines, engine_bytes).unwrap();
+            floor.add(Holding::Ranges, member).unwrap();
+        }
+        let threads = threads(&[PROFILE.depth], &[true]).unwrap();
+        floor
+            .add(Holding::Threads, stacks(threads).unwrap())
+            .unwrap();
+        floor
+            .add(
+                Holding::Log,
+                log_bytes(&log(align, &settings, ranges).unwrap()).unwrap(),
+            )
+            .unwrap();
+        let stated = crate::bounds::Stated {
+            peers: 2,
+            ranges,
+            inflight: settings.max_inflight_msgs,
+            transfers: 38,
+            transport_bytes: 0,
+            messages: crate::classes::Bounds {
+                replication: settings.max_entry_bytes + 1_024,
+                request: settings.max_entry_bytes + 1_024,
+                transfer: u64::from(u32::MAX),
+                bulk: u64::from(u32::MAX),
+            },
+        };
+        let budget = crate::bounds::least_transport(&stated).unwrap();
+        let beside = transport_bytes_beside(&crate::bounds::Stated {
+            transport_bytes: budget,
+            ..stated
+        })
+        .unwrap();
+        floor.add(Holding::Transport, budget + beside).unwrap();
+
+        assert!(Holding::ALL.iter().all(|&class| floor.of(class) > 0));
+        assert_eq!(floor.of(Holding::Engines), 5 * engine_bytes);
+        let total = floor.total().unwrap();
+        let at = |bytes| Allowance {
+            bytes,
+            basis: Basis::Stated,
+        };
+        assert_eq!(floor.admit(&at(total)).unwrap(), 0);
+        assert_eq!(floor.admit(&at(total + 1_000)).unwrap(), 1_000);
+        let mut running = 0;
+        for class in Holding::ALL {
+            running += floor.of(class);
+            match floor.admit(&at(running - 1)) {
+                Err(DeriveError::Memory {
+                    class: named,
+                    floor: bytes,
+                    allowance,
+                    basis,
+                }) => assert_eq!(
+                    (named, bytes, allowance, basis),
+                    (class, total, running - 1, Basis::Stated),
+                    "{class}"
+                ),
+                other => panic!("{class}: {other:?}"),
+            }
+        }
+        assert_eq!(running, total);
+        let mut past = floor;
+        assert!(matches!(
+            past.add(Holding::Log, u64::MAX),
+            Err(DeriveError::Overflow(_))
+        ));
     }
 
     const PROFILE: Profile = Profile {

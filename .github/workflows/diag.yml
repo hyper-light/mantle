@@ -1,0 +1,40 @@
+name: diag-put-failed
+# Scratch: the serve suite on windows-11-arm as CI runs it (its tests side by side), four rounds,
+# each refused put answer said with the outcome it came from (CI run 40097647853: the stated cell's
+# first 1-byte put answered Failed at the gateway host's put answer).
+on:
+  push:
+    branches: ["diag/**"]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: "1"
+jobs:
+  serve:
+    name: windows-aarch64
+    runs-on: windows-11-arm
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned Rust
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup target add --toolchain 1.98.1 aarch64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: diag-put-aarch64
+          workspaces: |
+            .
+            vendor
+      - name: Build the serve suite
+        shell: bash
+        run: cargo test --locked -p mantle --test serve --no-run --target aarch64-pc-windows-msvc
+      - name: The serve suite, four rounds
+        shell: bash
+        run: |
+          for round in 1 2 3 4; do
+            echo "=== round $round"
+            cargo test --locked -p mantle --test serve --target aarch64-pc-windows-msvc -- --nocapture 2>&1 | grep -aE "^test |test result|DIAG|panicked|the put of|refused" || true
+          done

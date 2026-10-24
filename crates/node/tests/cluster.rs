@@ -1207,6 +1207,18 @@ impl Cell {
         });
     }
 
+    /// Waits until node `from` holds a connection to `to` that it dialed after its dial count to `to`
+    /// passed `dials`: one to `to`'s new process, and not the one it held to its former process,
+    /// whose last report says keyed until `from` learns `to` moved and closes it.
+    fn connected_anew(&mut self, from: u64, to: u64, dials: u64) {
+        self.watch.until(&self.reports, |w| {
+            w.links
+                .get(&(from, to))
+                .filter(|link| link.keyed && link.dials > dials)
+                .map(|_| ())
+        });
+    }
+
     /// What became of the chunk's put or get asked under `tag`, once it is answered.
     fn chunk(&mut self, tag: u64) -> ChunkOutcome {
         self.watch
@@ -2289,9 +2301,10 @@ fn chunks_a_peer_stored_read_back_after_it_stops_and_starts_again() {
         cell.get_chunk(1, 2, volume, chunks[0].0, 0, 1),
         ChunkOutcome::Lost(_)
     ));
+    let dials = cell.watch.links.get(&(1, 2)).map_or(0, |link| link.dials);
     cell.restart(2);
     assert_eq!(cell.volume_of(2), volume, "the same volume, recovered");
-    cell.connected(1, 2);
+    cell.connected_anew(1, 2, dials);
     for (key, bytes) in &chunks {
         let len = u64::try_from(bytes.len()).unwrap();
         assert_eq!(

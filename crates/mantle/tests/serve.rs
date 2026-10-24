@@ -392,7 +392,8 @@ fn a_node_asked_to_stop_hands_its_ranges_over_and_exits_well() {
 
 /// A cell of three made by `mantle init` rolls one node at a time, highest id first as a
 /// StatefulSet rolls (Kubernetes' rolling update): each node stops in order and exits 0, every range
-/// it led handed to a voter whose own status then says it leads, and while it is down every object
+/// it led as its stop began (`handing`) handed to a voter whose own status then says it leads, and
+/// while it is down every object
 /// acknowledged before the roll reads back through the other two; it starts again from its own
 /// directories, enlists with the volume it held, and every range applies as far on it as on the
 /// others before the next stops. From the moment the other members name each handed range's new
@@ -440,13 +441,19 @@ fn a_cell_made_by_init_rolls_one_node_at_a_time_and_reads_every_object_back() {
     let groups: BTreeSet<u128> = cell.status.keys().map(|(_, group)| *group).collect();
     ids.sort_unstable_by(|a, b| b.cmp(a));
     for &stopping in &ids {
-        let ranges = led(&cell, stopping);
         let exited = cell.stop(stopping);
         assert!(exited.success(), "node {stopping} exited {exited}");
         assert!(
             cell.stopped.remove(&stopping),
             "node {stopping} said no stop"
         );
+        // The ranges it led as its stop began, as it said: each handed to a voter that then leads.
+        let ranges: BTreeSet<u128> = cell
+            .handing
+            .iter()
+            .filter(|(node, ..)| *node == stopping)
+            .map(|(_, group, _)| *group)
+            .collect();
         let others: Vec<u64> = ids.iter().copied().filter(|id| *id != stopping).collect();
         for group in &ranges {
             let to = cell

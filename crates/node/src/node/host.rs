@@ -195,7 +195,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             body,
         );
         let work = match (head, self.gateway.as_ref()) {
-            (_, None) => Work::Draining(Reply::status(Status::Failed)),
+            (_, None) => {
+                use std::io::Write as _;
+                let _ = writeln!(std::io::stderr(), "DIAG object asked of a node with no gateway");
+                Work::Draining(Reply::status(Status::Failed))
+            }
             (Err(_), Some(_)) => Work::Draining(Reply::status(Status::Malformed)),
             (Ok(_), Some(g)) if self.jobs.len() >= g.objects => {
                 Work::Draining(Reply::status(Status::SlowDown))
@@ -1234,7 +1238,16 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// Ends job `at` with `status`: what it waits on is let go, and its body, if any is left, read
     /// to its end and dropped before the reply goes.
+    #[track_caller]
     fn fail_job(&mut self, at: usize, status: Status) -> Result<(), NodeError> {
+        {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "DIAG fail_job {status:?} from {}",
+                std::panic::Location::caller()
+            );
+        }
         if let Some(job) = self.jobs.get_mut(at) {
             job.work = Work::Draining(Reply::status(status));
             self.abandoned

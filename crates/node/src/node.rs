@@ -1224,7 +1224,25 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if !own {
             return Err(NodeError::Task);
         }
+        let waited = std::time::Instant::now();
         self.wait().await?;
+        let mut mark = std::time::Instant::now();
+        let id = self.id;
+        let mut slow = |what: &str| {
+            let took = mark.elapsed();
+            if took > std::time::Duration::from_millis(250) {
+                use std::io::Write as _;
+                let _ = writeln!(std::io::stderr(), "DIAG node {id} slow {what} {took:?}");
+            }
+            mark = std::time::Instant::now();
+        };
+        {
+            let took = waited.elapsed();
+            if took > std::time::Duration::from_millis(250) {
+                use std::io::Write as _;
+                let _ = writeln!(std::io::stderr(), "DIAG node {id} waited {took:?}");
+            }
+        }
         self.liveness_written()?;
         let now = hyper_rt::futures::now_ns();
         let emptied = self.drain_plane()?;
@@ -1233,25 +1251,32 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             self.liveness.poll(now, &mut self.asked);
         }
         self.act_on_liveness()?;
+        slow("liveness and plane");
         while let Some(event) = self.driver.endpoint().poll_event() {
             self.events.push(event);
         }
         for event in std::mem::take(&mut self.events) {
             self.on_event(event, now)?;
         }
+        slow("events");
         self.take_stored().await?;
+        slow("take_stored");
         self.dial(now);
         if std::mem::take(&mut self.liveness_moved) {
             self.measure();
         }
         self.schedule_due(now);
         self.drive(now)?;
+        slow("drive");
         self.step_host()?;
+        slow("step_host");
         self.step_asks(now)?;
         self.step_reads(now)?;
+        slow("asks and reads");
         self.step_replacements();
         self.send_plane();
         self.driver.flush()?;
+        slow("send and flush");
         Ok(())
     }
 

@@ -1223,7 +1223,15 @@ async fn serve(
         }
         // The log the ranges share, once after the statuses that moved.
         if said {
+            let asked_at = std::time::Instant::now();
             let log = node.log_stats(stats.take())?;
+            {
+                let took = asked_at.elapsed();
+                if took > std::time::Duration::from_millis(250) {
+                    use std::io::Write as _;
+                    let _ = writeln!(std::io::stderr(), "DIAG log_stats took {took:?}");
+                }
+            }
             let flushing = log.flushing_since.map_or(0, |since| {
                 log.at.saturating_duration_since(since).as_nanos()
             });

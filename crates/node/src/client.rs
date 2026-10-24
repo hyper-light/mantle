@@ -659,6 +659,15 @@ impl Client {
             match self.object_once(node, op, data, deadline_ns).await? {
                 ObjectOutcome::Lost(refusal) if untaken(refusal) => {
                     let pause = bounds::pause(backoff, self.id, self.waits);
+                    {
+                        use std::io::Write as _;
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "DIAG client {} object to {node} untaken {refusal:?}: pause {pause:?} at {}",
+                            self.id,
+                            hyper_rt::futures::now_ns()
+                        );
+                    }
                     self.waits = self.waits.wrapping_add(1);
                     let wait = u64::try_from(pause.as_nanos()).unwrap_or(u64::MAX);
                     self.wait_until(

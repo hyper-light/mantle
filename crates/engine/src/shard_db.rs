@@ -818,6 +818,35 @@ pub fn resident_per_extent(config: &Config, key: usize, range_bits: u32) -> Opti
     )
 }
 
+/// Measured: the resident metadata an engine's branches hold at the densest rows a range admits,
+/// in millionths of the bytes of the extents they hold, the most of three fills. An engine at the
+/// floor's pages filled with 8-byte keys without values and settled held 181,198 bytes for 42
+/// extents of 49,152 bytes at 40,000 rows, 1,442,580 for 329 at 320,000 and 5,808,443 for 1,346 at
+/// 1.28 million: 87,771, 89,208 and 87,795 millionths (`tests/engine_memory.rs`, fedora x86_64,
+/// 2026-10-23; research/68 §3). Keys of the range's longest held 173,494 millionths there and named
+/// objects less; what an engine sized by it holds past it is bounded by its statement
+/// ([`resident_per_extent`]).
+pub const MEASURED_METADATA_PPM: u64 = 89_208;
+
+/// The memory each extent of `config`'s takes as a node sizes an engine's extents by what remains
+/// of its memory: its branches' resident metadata as measured at the densest rows
+/// ([`MEASURED_METADATA_PPM`]) and its allocator's count, its free or pending slot and its map bit
+/// ([`bounded_bytes`]), rounded up.
+pub fn measured_per_extent(config: &Config) -> Option<u64> {
+    let extent = u64::try_from(config.page_size)
+        .ok()?
+        .checked_mul(u64::from(config.extent_pages))?;
+    let metadata = extent
+        .checked_mul(MEASURED_METADATA_PPM)?
+        .div_ceil(1_000_000);
+    let count = u64::try_from(std::mem::size_of::<u32>()).ok()?;
+    let word = u64::try_from(std::mem::size_of::<u64>()).ok()?;
+    metadata
+        .checked_add(count)?
+        .checked_add(word.checked_mul(2)?)?
+        .checked_add(1)
+}
+
 impl<F: BlockFile> ShardDb<F> {
     fn with(store: Store<F>, mem_limit: usize, trunk: Trunk) -> Result<Self, Error> {
         let write_reserved = store.write_reservation_for(None)?;

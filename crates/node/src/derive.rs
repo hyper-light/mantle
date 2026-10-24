@@ -265,6 +265,10 @@ pub enum DeriveError {
         "a stated memory ceiling of {stated} bytes past the {capacity} the OS lets the process hold"
     )]
     Ceiling { stated: u64, capacity: u64 },
+    #[error(
+        "a range's share of the memory left, {bytes} bytes, holds the metadata of no extent of {per_extent}"
+    )]
+    Metadata { bytes: u64, per_extent: u64 },
 }
 
 /// The range's settings and rules, which every member of the cell derives alike, from the
@@ -357,6 +361,39 @@ pub fn engine(block: usize, share: u64, rules: &Rules) -> Result<Engine, DeriveE
             fanout: FANOUT,
             leaf_entries,
         },
+    })
+}
+
+/// What `engine`'s resident metadata takes at its device's full share: each extent its share
+/// holds at the metadata measured at the densest rows and its allocator's own
+/// (`mantle_engine::shard_db::measured_per_extent`), its want in [`shares`].
+pub fn engine_wants(engine: &Engine) -> Option<u64> {
+    engine
+        .store
+        .max_extents
+        .checked_mul(mantle_engine::shard_db::measured_per_extent(&engine.store)?)
+}
+
+/// `engine` with as many extents as `metadata` bytes of the node's memory hold at the metadata
+/// measured at the densest rows and their allocator's own
+/// (`mantle_engine::shard_db::measured_per_extent`), at most its device's share holds, and the
+/// superblocks' extent and one more at least.
+pub fn engine_within(engine: Engine, metadata: u64) -> Result<Engine, DeriveError> {
+    let per_extent = mantle_engine::shard_db::measured_per_extent(&engine.store)
+        .ok_or(DeriveError::Overflow("an extent's metadata"))?;
+    let held = metadata.checked_div(per_extent).unwrap_or(0);
+    if held < 2 {
+        return Err(DeriveError::Metadata {
+            bytes: metadata,
+            per_extent,
+        });
+    }
+    Ok(Engine {
+        store: StoreConfig {
+            max_extents: engine.store.max_extents.min(held),
+            ..engine.store
+        },
+        ..engine
     })
 }
 
@@ -893,6 +930,14 @@ pub fn volume(
     Ok(config)
 }
 
+/// What a volume of `size` bytes on a device whose transfers align to `align` wants of the
+/// node's memory for its index at its full size: a fragment at each of its blocks
+/// (`index::most_bytes`), its want in [`shares`].
+pub fn index_wants(align: Alignment, size: u64) -> Option<u64> {
+    let block = volume_layout::block(align)?;
+    index::most_bytes(size.checked_div(block)?)
+}
+
 /// The most fragments, at most `config`'s, whose checkpoints and `config`'s batches the log of
 /// the volume laid out in `geometry` holds: what it was sized for at format bounds them since
 /// (`Geometry::holds`). The log needs more as fragments grow, so halving the span between the
@@ -1342,5 +1387,55 @@ mod tests {
         assert!(parts.iter().sum::<u64>() <= u64::MAX / 2, "{parts:?}");
         assert_eq!(shares(0, &[5, 5]).ok(), Some(vec![0, 0]));
         assert_eq!(shares(10, &[]).ok(), Some(vec![]));
+    }
+
+    #[test]
+    fn an_engine_takes_the_extents_its_share_of_memory_holds_at_the_measured_metadata() {
+        let (_, rules) = cell(3).unwrap();
+        let full = engine(4096, 1 << 30, &rules).unwrap();
+        let per = mantle_engine::shard_db::measured_per_extent(&full.store).unwrap();
+        let extent = u64::try_from(full.store.page_size).unwrap() * u64::from(EXTENT_PAGES);
+        // An extent's memory is its metadata measured at the densest rows, a tenth of its bytes
+        // or so, and its allocator's few bytes.
+        assert!(per > extent / 20 && per < extent / 5, "{per} of {extent}");
+        assert_eq!(engine_wants(&full), Some(full.store.max_extents * per));
+        let within = |bytes| engine_within(full, bytes).map(|e| e.store.max_extents);
+        assert_eq!(within(10 * per).ok(), Some(10));
+        assert_eq!(within(10 * per + per - 1).ok(), Some(10));
+        assert_eq!(within(2 * per).ok(), Some(2));
+        assert!(matches!(
+            within(2 * per - 1),
+            Err(DeriveError::Metadata { bytes, per_extent }) if bytes == 2 * per - 1 && per_extent == per
+        ));
+        // Never past what its device's share holds.
+        assert_eq!(within(u64::MAX).ok(), Some(full.store.max_extents));
+        let page = engine_within(full, 10 * per).unwrap().store.page_size;
+        assert_eq!(page, full.store.page_size);
+    }
+
+    #[test]
+    fn what_remains_sizes_each_volumes_index_and_each_engines_extents() {
+        let align = Alignment::new(4096).unwrap();
+        let chunk = mantle_gateway::layout::CHUNK;
+        let size = 1u64 << 30;
+        let index = index_wants(align, size).unwrap();
+        // At its want, a volume's index holds a fragment at each of its blocks.
+        let v = volume(align, size, chunk, &PROFILE, index, None).unwrap();
+        assert_eq!(v.max_fragments, size / 4096);
+        let (_, rules) = cell(3).unwrap();
+        let full = engine(4096, 1 << 30, &rules).unwrap();
+        let wants = [index, engine_wants(&full).unwrap()];
+        // A third of what they want remains: each takes a third of its want.
+        let remaining = (wants[0] + wants[1]) / 3;
+        let parts = shares(remaining, &wants).unwrap();
+        assert!(parts[0] + parts[1] <= remaining);
+        let v = volume(align, size, chunk, &PROFILE, parts[0], None).unwrap();
+        assert_eq!(v.max_fragments, index::most_fragments(parts[0]));
+        assert!(v.max_fragments < size / 4096);
+        let e = engine_within(full, parts[1]).unwrap();
+        assert!(e.store.max_extents < full.store.max_extents);
+        let per = mantle_engine::shard_db::measured_per_extent(&e.store).unwrap();
+        assert!(e.store.max_extents * per <= parts[1]);
+        assert!((e.store.max_extents + 1) * per > parts[1]);
     }
 }

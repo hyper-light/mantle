@@ -1,7 +1,8 @@
-name: diag-put-failed
-# Scratch: the serve suite on windows-11-arm as CI runs it (its tests side by side), four rounds,
-# each refused put answer said with the outcome it came from (CI run 40097647853: the stated cell's
-# first 1-byte put answered Failed at the gateway host's put answer).
+name: diag-first-write
+# Scratch: calibration's first writes, each past a stretch never written, three probes on every
+# target's runner where the tests keep their volumes, and the serve suite on both Windows runners as
+# CI runs it, three rounds (CI run 40097647853, diag run 40102138405: a volume's first data write,
+# 64 MiB past what it had written, took 3.2 to 8.0 s on NTFS where calibration said no prewrite).
 on:
   push:
     branches: ["diag/**"]
@@ -11,17 +12,18 @@ env:
   CARGO_TERM_COLOR: never
   RUST_BACKTRACE: "1"
 jobs:
-  serve:
+  probe:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { name: as-measured, prewrite: "" }
-          - { name: prewritten, prewrite: "1" }
-    name: windows-aarch64 ${{ matrix.name }}
-    runs-on: windows-11-arm
-    env:
-      MANTLE_DIAG_PREWRITE: ${{ matrix.prewrite }}
+          - { name: linux-x86_64, runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu, serve: false }
+          - { name: linux-aarch64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, serve: false }
+          - { name: macos-aarch64, runner: macos-15, target: aarch64-apple-darwin, serve: false }
+          - { name: windows-x86_64, runner: windows-2025, target: x86_64-pc-windows-msvc, serve: true }
+          - { name: windows-aarch64, runner: windows-11-arm, target: aarch64-pc-windows-msvc, serve: true }
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v7.0.1
@@ -29,21 +31,34 @@ jobs:
         shell: bash
         run: |
           rustup toolchain install 1.98.1 --profile minimal
-          rustup target add --toolchain 1.98.1 aarch64-pc-windows-msvc
+          rustup target add --toolchain 1.98.1 ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: diag-put-aarch64
+          key: diag-fw-${{ matrix.target }}
           workspaces: |
             .
             vendor
-      - name: Build the serve suite
-        shell: bash
-        run: cargo test --locked -p mantle --test serve --no-run --target aarch64-pc-windows-msvc
-      - name: The serve suite, three rounds
+      - name: Build
         shell: bash
         run: |
-          [ -z "$MANTLE_DIAG_PREWRITE" ] && unset MANTLE_DIAG_PREWRITE
+          cargo build --locked -p mantle --bin mantle --target ${{ matrix.target }}
+          if [ "${{ matrix.serve }}" = "true" ]; then
+            cargo test --locked -p mantle --test serve --no-run --target ${{ matrix.target }}
+          fi
+      - name: Three probes where the tests keep their volumes
+        shell: bash
+        run: |
+          for round in 1 2 3; do
+            dir=$(mktemp -d)
+            echo "=== probe $round in $dir"
+            time target/${{ matrix.target }}/debug/mantle disk probe --measure "$dir" 2>&1
+            rmdir "$dir"
+          done
+      - name: The serve suite, three rounds
+        if: matrix.serve
+        shell: bash
+        run: |
           for round in 1 2 3; do
             echo "=== round $round"
-            cargo test --locked -p mantle --test serve --target aarch64-pc-windows-msvc -- --nocapture 2>&1 | grep -aE "^test .* (ok|FAILED)|test result|DIAG|panicked|the put of" || true
+            cargo test --locked -p mantle --test serve --target ${{ matrix.target }} -- --nocapture 2>&1 | grep -aE "^test .* (ok|FAILED)|test result|DIAG|panicked|the put of" || true
           done

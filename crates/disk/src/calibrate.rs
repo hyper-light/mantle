@@ -170,7 +170,8 @@ pub struct Calibration {
     /// `durable_large` bytes written sequentially, then a full flush, one at a time.
     pub durable_sequential: Point,
     pub durable_large: usize,
-    /// Small durable writes, one at a time, into space preallocated and never written.
+    /// A small durable write a round into space preallocated and never written, each past a
+    /// stretch never written, as a volume's first data write lands.
     pub first_write: Point,
     /// The same writes again, over the space they wrote.
     pub overwrite: Point,
@@ -221,13 +222,15 @@ impl Calibration {
         whole(rate * access)
     }
 
-    /// Whether a durable write into preallocated, never-written space is slower than the same
-    /// write over written space: the first write's throughput interval lies wholly below the
-    /// overwrite's, the test by which Georges, Buytaert and Eeckhout tell two measurements
-    /// apart (OOPSLA 2007, §3.3). Where a file system journals the conversion of an extent on
-    /// its first write, as ext4 does, the flush pays for it (5.7x on ext4;
-    /// docs/measurements/2026-09-28-flush-cost-by-extent-state.md), and the chunk store writes
-    /// a volume once before use (docs/design/chunk-store.md §2).
+    /// Whether a durable write into preallocated, never-written space, past a stretch of it, is
+    /// slower than the same write over written space: the first write's throughput interval lies
+    /// wholly below the overwrite's, the test by which Georges, Buytaert and Eeckhout tell two
+    /// measurements apart (OOPSLA 2007, §3.3). Where a file system journals the conversion of an
+    /// extent on its first write, as ext4 does, the flush pays for it (5.7x on ext4;
+    /// docs/measurements/2026-09-28-flush-cost-by-extent-state.md), and where it fills the
+    /// stretch first, as NTFS does to a write past its valid data length, the write pays for
+    /// the stretch (docs/measurements/2026-10-24-first-writes-past-unwritten-space.md); either
+    /// way the chunk store writes a volume once before use (docs/design/chunk-store.md §2).
     pub fn first_write_penalty(&self) -> bool {
         slower(&self.first_write, &self.overwrite)
     }
@@ -300,14 +303,17 @@ pub fn calibrate(
         None => plan.span,
     };
     let span = align.down_u64(span);
-    // First writes need fresh space for every round they may run.
-    let fresh = u64::try_from(plan.small)
-        .ok()
-        .and_then(|small| small.checked_mul(plan.durable_writes.max(1)))
-        .unwrap_or(u64::MAX);
+    // Each round of first writes takes its share of the span, at least a small write's.
+    let small = u64::try_from(plan.small).unwrap_or(u64::MAX);
+    let rounds = u64::try_from(plan.rounds.limit())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    let stride = align
+        .down_u64(span.checked_div(rounds).unwrap_or(0))
+        .max(small);
     let needed = u64::try_from(plan.large.max(plan.small))
         .unwrap_or(u64::MAX)
-        .max(fresh.saturating_mul(u64::try_from(plan.rounds.limit()).unwrap_or(u64::MAX)));
+        .max(stride.saturating_mul(rounds));
     if span < needed {
         return Err(DiskError::Io {
             op: "calibrate",
@@ -338,7 +344,7 @@ pub fn calibrate(
     let file = DeviceFile::open(scratch.path(), false, CachingRequest::PreferDirect, align)?;
     file.preallocate(span)?;
     measure::with_pool(&file, cap, |pool| {
-        measured(pool, &file, plan, span, fresh, cap, started)
+        measured(pool, &file, plan, span, stride, cap, started)
     })
 }
 
@@ -349,32 +355,36 @@ fn measured(
     file: &DeviceFile,
     plan: &Plan,
     span: u64,
-    fresh: u64,
+    stride: u64,
     cap: usize,
     started: Instant,
 ) -> Result<Calibration, DiskError> {
-    // Before anything is written: each round of first writes takes fresh space, and each
-    // round of overwrites rewrites space a round of first writes wrote, the same way.
-    let durable = |base| Job {
+    // Before anything is written, first writes as a volume makes them, each past a stretch never
+    // written: a volume's first data write lands past the unwritten rest of its log, and a
+    // segment it opens past the unwritten tail of the one before (chunk-store.md §2). NTFS fills
+    // the stretch with zeros before such a write completes, the write being past the file's
+    // valid data length (research/02 §4.7), and ext4 commits the extent's conversion at the
+    // flush (docs/measurements/2026-09-28-flush-cost-by-extent-state.md). Each round writes once,
+    // at the end of its share of the span; each round of overwrites rewrites a place a round of
+    // first writes wrote. Sequential first writes, each at the end of the last, never paid for
+    // a stretch: on windows-11-arm they ran within the overwrites' interval while a volume's
+    // first data write took seconds (docs/measurements/2026-10-24-first-writes-past-unwritten-space.md).
+    let small = u64::try_from(plan.small).unwrap_or(u64::MAX);
+    let once = |round| Job {
         pattern: Pattern::SequentialWrite,
         block: plan.small,
         depth: 1,
-        base,
-        span: fresh,
+        base: first_write_at(round, stride, small),
+        span: small,
         budget: Some(plan.step.saturating_mul(4)),
-        max_ops: plan.durable_writes,
+        max_ops: 1,
         sync_each: true,
         seed: 0,
     };
-    let first_write = point(pool, plan, |round| durable(round.saturating_mul(fresh)))?;
+    let first_write = point(pool, plan, once)?;
     let written = u64::try_from(first_write.rounds.max(1)).unwrap_or(1);
     let overwrite = point(pool, plan, |round| {
-        durable(
-            round
-                .checked_rem(written)
-                .unwrap_or(0)
-                .saturating_mul(fresh),
-        )
+        once(round.checked_rem(written).unwrap_or(0))
     })?;
 
     // Write the whole span first, so reads measure the medium rather than holes, and so
@@ -483,6 +493,15 @@ fn measured(
         overwrite,
         elapsed: started.elapsed(),
     })
+}
+
+/// Where round `round` of first writes writes its one small write: the end of its share of the
+/// span, `stride` bytes, past the rest of that share.
+fn first_write_at(round: u64, stride: u64, small: u64) -> u64 {
+    round
+        .saturating_add(1)
+        .saturating_mul(stride)
+        .saturating_sub(small)
 }
 
 /// Runs a job in rounds, as many as the plan's `Rounds` take.
@@ -681,6 +700,22 @@ mod tests {
         assert!(!slower(&with(380.0, 0.9), &with(2_170.0, 0.9)));
         assert!(!slower(&with(2_170.0, 0.05), &with(380.0, 0.05)));
         assert!(!slower(&with(380.0, f64::INFINITY), &with(2_170.0, 0.05)));
+    }
+
+    /// Every round's first write lands past a stretch never written, a share of the span less
+    /// the write, and the last ends inside the span.
+    #[test]
+    fn each_first_write_lands_past_a_stretch_never_written() {
+        let (span, small) = (256u64 << 20, 4096u64);
+        let rounds = u64::try_from(Rounds::STANDARD.limit()).unwrap();
+        let stride = span / rounds / small * small;
+        let mut written = 0;
+        for round in 0..rounds {
+            let at = first_write_at(round, stride, small);
+            assert_eq!(at - written, stride - small);
+            written = at + small;
+        }
+        assert!(written <= span);
     }
 
     /// A point stops at the minimum once its interval is tight, runs on while it is not, and

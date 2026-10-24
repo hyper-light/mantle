@@ -20,8 +20,10 @@ use crate::identity::Identity;
 pub const PROFILE: &str = "profile";
 
 const MAGIC: [u8; 8] = *b"MNTLPROF";
-/// The layout's version: a record of another is measured again.
-const VERSION: u16 = 1;
+/// The layout's version: a record of another is measured again. 2: `prewrite` decided by first
+/// writes past never-written space (calibrate.rs `measured`), where 1's sequential first writes
+/// missed NTFS's fill of a file up to its valid data length.
+const VERSION: u16 = 2;
 /// The longest key a record carries, its length a u16: a device whose identity's line is longer is
 /// measured at each start, its profile not kept.
 const MAX_KEY: usize = 65_535;
@@ -51,14 +53,15 @@ impl Profile {
     /// asked, as a device not measured does (`mantle_chunk::Reads::default`). None where the bytes
     /// of its large reads in flight pass a u64.
     pub fn of(c: &Calibration) -> Option<Self> {
-        let prewrite = c.first_write_penalty() || std::env::var_os("MANTLE_DIAG_PREWRITE").is_some();
+        let prewrite = c.first_write_penalty();
         {
             use std::io::Write as _;
             let _ = writeln!(
                 std::io::stderr(),
-                "DIAG calibration first_write {:?} overwrite {:?} prewrite {prewrite}",
+                "DIAG calibration first_write {:?} overwrite {:?} prewrite {prewrite} took {:?}",
                 c.first_write,
-                c.overwrite
+                c.overwrite,
+                c.elapsed
             );
         }
         let (Some(random), Some(sequential)) =

@@ -642,7 +642,15 @@ others, as OpenSSH and PostgreSQL refuse a private key; on Windows no allow entr
 principal but its owner and LocalSystem, read from the open handle (GetKernelObjectSecurity), where
 Microsoft's OpenSSH also admits the Administrators group. One readable by others refuses the start
 at its identity, naming the file (`…/identity/node.key: is readable by others than its owner`).
-`mantle init` creates its keys through the same module, owner-only from the moment each exists. A plane port another socket holds is refused at the network step; a QUIC port
+`mantle init` creates its keys through the same module, owner-only from the moment each exists.
+The node's certificate and each pinned peer's are checked against the stated authority as the
+identity is read (`mantle_cert::issued_by`, RFC 5280 §6.1.3 (a) with the authority the trust
+anchor: the certificate's issuer is the authority's subject, its Ed25519 signature verifies under
+the authority's key, and its validity holds by this machine's clock), so a directory holding another
+cell's authority, or a peer pinned from another cell, refuses the start naming the certificate
+(`…/identity/node.der: issued by another authority than the cell's`) rather than failing every
+handshake. `mantle init` dates each certificate from its own machine's clock, so a founder whose
+clock runs behind the one init ran on is refused as not yet valid, as its handshakes would be. A plane port another socket holds is refused at the network step; a QUIC port
 another process of the same user holds is not yet: hyper-rt-transport binds its listener with
 `SO_REUSEPORT` set before the bind, to share the port with a socket for each peer, and a second
 process's bind of a held port with that flag set succeeds on Linux and macOS (measured on Linux

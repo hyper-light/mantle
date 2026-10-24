@@ -28,6 +28,9 @@ mantle-chunk = { path = "../chunk" }
 mantle-codec = { path = "../codec" }
 mantle-crc = { path = "../crc" }
 mantle-disk = { path = "../disk" }
+# A start's check that its cell's authority issued its certificate and each peer's (RFC 5280
+# §6.1.3); the tests issue their nodes' certificates with it.
+mantle-cert = { path = "../cert" }
 # The engine a node keeps its ranges' rows in (`mantle_range::Stored`), its store's settings.
 mantle-engine = { path = "../engine" }
 mantle-meta = { path = "../meta" }
@@ -55,8 +58,6 @@ hyper-block = { path = "../../vendor/hyper-block", features = ["sim"] }
 hyper-measure = { path = "../../vendor/hyper-measure" }
 # The simulation's draws: hyper-sim's generator and named streams (tests/sim.rs).
 hyper-sim = { path = "../../vendor/hyper-sim" }
-# The cell's authority and its nodes' certificates, issued for the tests' nodes.
-mantle-cert = { path = "../cert" }
 tempfile.workspace = true
 
 [lints]

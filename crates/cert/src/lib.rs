@@ -14,8 +14,10 @@
 //! Requirements §7.1 ask, and of one length whatever its bits. A key pair and a serial are drawn
 //! from the operating system's random source, or derived by the caller (a simulation, whose run
 //! is its seed and whose handshakes compress the certificates they carry, RFC 8879: the same
-//! bytes, the same sizes). Nothing here reads a certificate back: the TLS stack verifies what peers
-//! present.
+//! bytes, the same sizes). A certificate is read back only for a start's check that its cell's
+//! authority issued it ([`issued_by`], RFC 5280 §6.1.3 (a)), so a directory holding another cell's
+//! certificates refuses to start rather than failing each handshake; the TLS stack verifies what
+//! peers present.
 
 #![cfg_attr(
     test,
@@ -33,7 +35,7 @@ mod der;
 mod time;
 
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
-use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair as _};
+use aws_lc_rs::signature::{ED25519, Ed25519KeyPair, KeyPair as _, UnparsedPublicKey};
 
 use der::{nested, oid, tlv};
 
@@ -56,6 +58,21 @@ pub enum CertError {
     /// A length or value DER cannot hold on this machine.
     #[error("a value DER cannot encode")]
     Encoding,
+    /// Bytes that are not a certificate of this profile in DER: an Ed25519 v3 certificate whose
+    /// times are RFC 5280's forms.
+    #[error("not a certificate of this profile")]
+    Malformed,
+    /// A certificate whose issuer is not the authority's subject (RFC 5280 §6.1.3 (a)(4)).
+    #[error("issued by another authority than the cell's")]
+    Issuer,
+    /// A certificate whose signature does not verify under the authority's key (RFC 5280 §6.1.3
+    /// (a)(1)).
+    #[error("not signed by the cell's authority's key")]
+    Signature,
+    /// A certificate whose validity does not hold the time it is checked at (RFC 5280 §6.1.3
+    /// (a)(2)).
+    #[error("outside its validity by this machine's clock")]
+    Validity,
 }
 
 /// An Ed25519 key pair, kept with its PKCS#8 encoding (RFC 5958), the form a node stores its key in
@@ -365,6 +382,107 @@ fn extensions(out: &mut Vec<u8>, role: &Role<'_>) -> Result<(), CertError> {
     }
 }
 
+/// What a check of a certificate's issuer reads from it (RFC 5280 §4.1).
+struct Certificate<'a> {
+    /// The TBS certificate's DER, which its issuer signed.
+    tbs: &'a [u8],
+    /// The issuer's and the subject's Name, each its DER whole.
+    issuer: &'a [u8],
+    subject: &'a [u8],
+    validity: Validity,
+    /// The subject's Ed25519 public key, and the issuer's Ed25519 signature over `tbs`.
+    public_key: &'a [u8],
+    signature: &'a [u8],
+}
+
+/// The certificate in `der`, as this profile writes one: v3, Ed25519 throughout (RFC 8410), its
+/// times in RFC 5280's forms; the extensions after its key are not read, the TLS stack checking a
+/// peer's at its handshake. Anything else, and anything after the certificate, is refused.
+fn read(der: &[u8]) -> Result<Certificate<'_>, CertError> {
+    let mut input = der;
+    let mut certificate = der::expect(&mut input, der::SEQUENCE)?.content;
+    if !input.is_empty() {
+        return Err(CertError::Malformed);
+    }
+    let tbs = der::expect(&mut certificate, der::SEQUENCE)?;
+    ed25519_identifier(&mut certificate)?;
+    // An Ed25519 signature is 64 octets and a public key 32 (RFC 8032 §5.1.6, §5.1.5).
+    let signature = whole_octets(der::expect(&mut certificate, der::BIT_STRING)?.content, 64)?;
+    if !certificate.is_empty() {
+        return Err(CertError::Malformed);
+    }
+    let mut fields = tbs.content;
+    // v3 (2), RFC 5280 §4.1.2.1.
+    if der::expect(&mut fields, der::EXPLICIT_0)?.content != [der::INTEGER, 1, 2] {
+        return Err(CertError::Malformed);
+    }
+    der::expect(&mut fields, der::INTEGER)?;
+    ed25519_identifier(&mut fields)?;
+    let issuer = der::expect(&mut fields, der::SEQUENCE)?.whole;
+    let mut span = der::expect(&mut fields, der::SEQUENCE)?.content;
+    let not_before = time::decode(&der::next(&mut span)?)?;
+    let not_after = time::decode(&der::next(&mut span)?)?;
+    if !span.is_empty() {
+        return Err(CertError::Malformed);
+    }
+    let subject = der::expect(&mut fields, der::SEQUENCE)?.whole;
+    let mut key = der::expect(&mut fields, der::SEQUENCE)?.content;
+    ed25519_identifier(&mut key)?;
+    let public_key = whole_octets(der::expect(&mut key, der::BIT_STRING)?.content, 32)?;
+    if !key.is_empty() {
+        return Err(CertError::Malformed);
+    }
+    Ok(Certificate {
+        tbs: tbs.whole,
+        issuer,
+        subject,
+        validity: Validity {
+            not_before,
+            not_after,
+        },
+        public_key,
+        signature,
+    })
+}
+
+/// id-Ed25519's AlgorithmIdentifier at the front of `input`, its parameters absent (RFC 8410 §3).
+fn ed25519_identifier(input: &mut &[u8]) -> Result<(), CertError> {
+    let mut algorithm = der::expect(input, der::SEQUENCE)?.content;
+    if der::expect(&mut algorithm, der::OID)?.content != oid::ED25519 || !algorithm.is_empty() {
+        return Err(CertError::Malformed);
+    }
+    Ok(())
+}
+
+/// A BIT STRING's content holding `octets` whole octets, no bit unused (X.690 §8.6.2).
+fn whole_octets(content: &[u8], octets: usize) -> Result<&[u8], CertError> {
+    match content.split_first() {
+        Some((0, bits)) if bits.len() == octets => Ok(bits),
+        _ => Err(CertError::Malformed),
+    }
+}
+
+/// Whether the authority whose certificate is `authority` issued `certificate`, and it is valid
+/// `now` seconds after the Unix epoch: RFC 5280 §6.1.3 (a)'s checks of a path's one certificate,
+/// the authority its trust anchor (§6.1.1 (d)), whose subject and key are the working issuer name
+/// and key: the certificate's issuer is the authority's subject (a)(4), its signature verifies
+/// under the authority's key (a)(1), and its validity holds `now` (a)(2). Names compare byte for
+/// byte, as this profile encodes an issuer's name the same as its certificate's subject.
+pub fn issued_by(certificate: &[u8], authority: &[u8], now: u64) -> Result<(), CertError> {
+    let issued = read(certificate)?;
+    let anchor = read(authority)?;
+    if issued.issuer != anchor.subject {
+        return Err(CertError::Issuer);
+    }
+    UnparsedPublicKey::new(&ED25519, anchor.public_key)
+        .verify(issued.tbs, issued.signature)
+        .map_err(|_| CertError::Signature)?;
+    if now < issued.validity.not_before || now > issued.validity.not_after {
+        return Err(CertError::Validity);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,6 +601,8 @@ mod tests {
         .unwrap();
         assert!(as_server(&ca, &foreign, "node-1").is_err());
         assert!(as_client(&ca, &foreign).is_err());
+        // The start's check refuses it too: the same name, another key.
+        assert_eq!(issued_by(&foreign, &ca, now()), Err(CertError::Signature));
     }
 
     #[test]
@@ -515,6 +635,77 @@ mod tests {
             )
             .unwrap();
             assert!(as_server(&ca, &cert, "node-1").is_err(), "{validity:?}");
+            assert_eq!(
+                issued_by(&cert, &ca, now()),
+                Err(CertError::Validity),
+                "{validity:?}"
+            );
+        }
+    }
+
+    /// A start's check of its certificate holds for the authority that issued it, at each end of its
+    /// validity, and for that authority's own certificate; it refuses another authority by name or,
+    /// of the same name, by its key, a time outside the validity, each octet of the signature
+    /// flipped and each octet before it flipped, a byte past the certificate, and every truncation
+    /// of either certificate, each typed and none panicking.
+    #[test]
+    fn a_certificate_is_its_authoritys_alone_and_every_other_byte_is_refused() {
+        let ours = KeyPair::generate().unwrap();
+        let span = day_around_now();
+        let ca = authority(&ours, "mantle cell 1", span, Serial::draw().unwrap()).unwrap();
+        let node_key = KeyPair::generate().unwrap();
+        let cert = node(
+            &ours,
+            "mantle cell 1",
+            node_key.public_key(),
+            "node-1",
+            (span, Serial::draw().unwrap()),
+        )
+        .unwrap();
+        issued_by(&cert, &ca, now()).unwrap();
+        issued_by(&cert, &ca, span.not_before).unwrap();
+        issued_by(&cert, &ca, span.not_after).unwrap();
+        issued_by(&ca, &ca, now()).unwrap();
+        let theirs = KeyPair::generate().unwrap();
+        let named = authority(&theirs, "mantle cell 2", span, Serial::draw().unwrap()).unwrap();
+        assert_eq!(issued_by(&cert, &named, now()), Err(CertError::Issuer));
+        let same = authority(&theirs, "mantle cell 1", span, Serial::draw().unwrap()).unwrap();
+        assert_eq!(issued_by(&cert, &same, now()), Err(CertError::Signature));
+        assert_eq!(
+            issued_by(&cert, &ca, span.not_before - 1),
+            Err(CertError::Validity)
+        );
+        assert_eq!(
+            issued_by(&cert, &ca, span.not_after + 1),
+            Err(CertError::Validity)
+        );
+        let signed = cert.len() - 64;
+        for at in 0..cert.len() {
+            let mut flipped = cert.clone();
+            flipped[at] ^= 0x01;
+            let checked = issued_by(&flipped, &ca, now());
+            if at >= signed {
+                assert_eq!(checked, Err(CertError::Signature), "signature octet {at}");
+            } else {
+                assert!(checked.is_err(), "octet {at} flipped");
+            }
+        }
+        let mut longer = cert.clone();
+        longer.push(0);
+        assert_eq!(issued_by(&longer, &ca, now()), Err(CertError::Malformed));
+        for len in 0..cert.len() {
+            assert_eq!(
+                issued_by(&cert[..len], &ca, now()),
+                Err(CertError::Malformed),
+                "{len} of the certificate"
+            );
+        }
+        for len in 0..ca.len() {
+            assert_eq!(
+                issued_by(&cert, &ca[..len], now()),
+                Err(CertError::Malformed),
+                "{len} of the authority"
+            );
         }
     }
 

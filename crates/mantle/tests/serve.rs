@@ -390,6 +390,134 @@ fn a_node_asked_to_stop_hands_its_ranges_over_and_exits_well() {
     done(&made[0], "a bucket made after the stop");
 }
 
+/// A cell of three made by `mantle init` rolls one node at a time, highest id first as a
+/// StatefulSet rolls (Kubernetes' rolling update): each node stops in order and exits 0, every range
+/// it led handed to a voter whose own status then says it leads, and while it is down every object
+/// acknowledged before the roll reads back through the other two; it starts again from its own
+/// directories, enlists with the volume it held, and every range applies as far on it as on the
+/// others before the next stops. From the moment the other members name each handed range's new
+/// leader until that, none of them says any range has no leader. After the last, every object
+/// reads back through every node, and the cell takes a new one.
+#[test]
+fn a_cell_made_by_init_rolls_one_node_at_a_time_and_reads_every_object_back() {
+    let mut cell = Cell::made(three_founders);
+    let mut ids: Vec<u64> = cell.dirs.keys().copied().collect();
+    for &id in &ids {
+        cell.enlisted(id);
+    }
+    let volumes: BTreeMap<u64, u128> = ids.iter().map(|&id| (id, cell.volume(id))).collect();
+    let made = cell.objects(vec![(
+        ids[0],
+        Op::Create { bucket: "b".into() },
+        Vec::new(),
+    )]);
+    done(&made[0], "the bucket");
+    let bytes = |n: usize| object_bytes(u64::try_from(n).unwrap(), 65_537);
+    let put = |n: usize, through: u64| {
+        let data = bytes(n);
+        let op = Op::Put {
+            bucket: "b".into(),
+            key: format!("o{n}"),
+            id: u128::try_from(n).unwrap() + 1,
+            length: data.len() as u64,
+        };
+        (through, op, data)
+    };
+    let get = |n: usize, through: u64| {
+        let op = Op::Get {
+            bucket: "b".into(),
+            key: format!("o{n}"),
+            offset: 0,
+            len: u64::MAX,
+        };
+        (through, op, Vec::new())
+    };
+    let before: Vec<usize> = (0..ids.len()).collect();
+    let puts = before.iter().map(|&n| put(n, ids[n])).collect();
+    for (outcome, n) in cell.objects(puts).iter().zip(&before) {
+        done(outcome, &format!("the put of o{n}"));
+    }
+    let groups: BTreeSet<u128> = cell.status.keys().map(|(_, group)| *group).collect();
+    ids.sort_unstable_by(|a, b| b.cmp(a));
+    for &stopping in &ids {
+        let ranges = led(&cell, stopping);
+        let exited = cell.stop(stopping);
+        assert!(exited.success(), "node {stopping} exited {exited}");
+        assert!(
+            cell.stopped.remove(&stopping),
+            "node {stopping} said no stop"
+        );
+        let others: Vec<u64> = ids.iter().copied().filter(|id| *id != stopping).collect();
+        for group in &ranges {
+            let to = cell
+                .handed
+                .iter()
+                .rev()
+                .find(|(node, handed, _)| *node == stopping && handed == group)
+                .map(|(_, _, to)| *to)
+                .unwrap_or_else(|| panic!("node {stopping} handed {group:x} to no one"));
+            assert!(others.contains(&to), "{group:x} handed to {to}");
+            cell.until(|c| {
+                let leads = others.iter().all(|other| {
+                    matches!(c.status.get(&(*other, *group)), Some(Line::Status { leader, .. }) if *leader == to)
+                });
+                if leads { Some(()) } else { None }
+            });
+        }
+        cell.leaderless.clear();
+        let gets = before
+            .iter()
+            .flat_map(|&n| others.iter().map(move |&through| (n, through)))
+            .collect::<Vec<_>>();
+        let read = cell.objects(gets.iter().map(|&(n, through)| get(n, through)).collect());
+        for (outcome, (n, through)) in read.iter().zip(&gets) {
+            assert_eq!(
+                done(outcome, &format!("o{n} through {through}")),
+                bytes(*n),
+                "o{n} read back through {through} with {stopping} stopped"
+            );
+        }
+        // A founder stated at port 0 listens elsewhere once started again, and its peers, which
+        // learn where on standard input, are told (node.md §1.7).
+        cell.start(stopping);
+        cell.introduce();
+        cell.enlisted(stopping);
+        assert_eq!(
+            cell.volume(stopping),
+            volumes[&stopping],
+            "node {stopping} started again with another volume"
+        );
+        for group in &groups {
+            cell.converged(*group);
+        }
+        let said: Vec<(u64, u128)> = cell
+            .leaderless
+            .iter()
+            .copied()
+            .filter(|(node, _)| *node != stopping)
+            .collect();
+        assert!(
+            said.is_empty(),
+            "with node {stopping} stopped and started again, nodes said ranges had no leader: \
+             {said:x?}"
+        );
+    }
+    let after = before.len();
+    let added = cell.objects(vec![put(after, ids[0])]);
+    done(&added[0], "a put after the roll");
+    let all: Vec<(usize, u64)> = (0..=after)
+        .flat_map(|n| ids.iter().map(move |&through| (n, through)))
+        .collect();
+    let read = cell.objects(all.iter().map(|&(n, through)| get(n, through)).collect());
+    for (outcome, (n, through)) in read.iter().zip(&all) {
+        assert_eq!(
+            done(outcome, &format!("o{n} through {through}")),
+            bytes(*n),
+            "o{n} read back through {through} after the roll"
+        );
+    }
+}
+
 /// A second request to stop, as the node's stop begins, ends its process at once: not well, and
 /// before its stop says it is done.
 #[test]

@@ -1,8 +1,8 @@
-name: diag-cell-of-one
-# Scratch: the serve suite as CI runs it, on the runners where a cell of one's watch went quiet (CI run
-# 40123826080 linux-aarch64: its 3 MiB put moved nothing the watch saw for 1 s). Each node says its
-# host jobs' stages, its puts' answers and its volume batches of 20 ms or more, with the clock and its
-# process; the watch prints the last lines it heard when it gives up.
+name: diag-roll-busy
+# Scratch: the serve suite as CI's busy jobs run it (built with every CPU, then run on the CPUs
+# named beside busy loops), rounds until the roll test says a member had no leader (CI run
+# 40139142704, linux-x86_64-2cpu-busy: both remaining members said every range had no leader after
+# each had named it). The watch keeps term and leader moves and the roll's steps, and prints them.
 on:
   push:
     branches: ["diag/**"]
@@ -12,40 +12,41 @@ env:
   CARGO_TERM_COLOR: never
   RUST_BACKTRACE: "1"
 jobs:
-  serve:
+  busy:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { name: linux-aarch64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, rounds: "1 2 3 4" }
-          - { name: windows-aarch64, runner: windows-11-arm, target: aarch64-pc-windows-msvc, rounds: "1 2 3" }
+          - { name: linux-x86_64-2cpu-busy, runner: ubuntu-24.04, cpus: "0-1", hogs: 2 }
+          - { name: linux-aarch64-1cpu, runner: ubuntu-24.04-arm, cpus: "0", hogs: 0 }
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 150
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Install pinned Rust
         shell: bash
-        run: |
-          rustup toolchain install 1.98.1 --profile minimal
-          rustup target add --toolchain 1.98.1 ${{ matrix.target }}
+        run: rustup toolchain install 1.98.1 --profile minimal
       - uses: Swatinem/rust-cache@v2
         with:
-          key: diag-c1-${{ matrix.target }}
+          key: diag-roll-${{ matrix.name }}
           workspaces: |
             .
             vendor
       - name: Build the serve suite
         shell: bash
-        run: cargo test --locked -p mantle --test serve --no-run --target ${{ matrix.target }}
-      - name: The serve suite, rounds
+        run: cargo test --locked -p mantle --test serve --no-run
+      - name: The serve suite on ${{ matrix.cpus }} beside ${{ matrix.hogs }} busy loops, rounds
         shell: bash
         run: |
-          for round in ${{ matrix.rounds }}; do
+          for _ in $(seq ${{ matrix.hogs }}); do taskset -c ${{ matrix.cpus }} sh -c 'while :; do :; done' & done
+          for round in 1 2 3 4 5 6; do
             echo "=== round $round"
-            cargo test --locked -p mantle --test serve --target ${{ matrix.target }} -- --nocapture > "round-$round.txt" 2>&1 || true
+            taskset -c ${{ matrix.cpus }} cargo test --locked -p mantle --test serve -- --nocapture > "round-$round.txt" 2>&1 || true
             grep -aE "^test .* (ok|FAILED)|test result" "round-$round.txt" || true
             if grep -aq "FAILED" "round-$round.txt"; then
-              grep -aE "DIAG|panicked|quiet for" "round-$round.txt" || true
+              grep -a -A3 "panicked" "round-$round.txt" | cut -c1-400 || true
+              grep -a "DIAG heard" "round-$round.txt" | grep -av "Log(\|Basis(" | cut -c1-260 || true
+              break
             fi
           done

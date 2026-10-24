@@ -443,10 +443,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 }
                 (None, _) => return self.fail_job(at, Status::Failed),
                 (Some(id), outcome) => {
+                    let said = match &outcome {
+                        Outcome::Chunk(c) => format!("chunk {c:?}"),
+                        Outcome::Command(c) => format!("command {c:?}"),
+                        Outcome::Read(_) => "read".to_owned(),
+                    };
                     let answer = put_answer(outcome);
                     if let Some(put) = putting.put.as_mut()
-                        && put.answer(id, answer).is_err()
+                        && let Err(error) = put.answer(id, answer)
                     {
+                        use std::io::Write as _;
+                        let _ = writeln!(std::io::stderr(), "DIAG put answer {id:?} refused: {error:?} from {said}");
                         return self.fail_job(at, Status::Failed);
                     }
                 }

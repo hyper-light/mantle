@@ -71,6 +71,7 @@ mod tests {
     use super::*;
 
     /// A key file in a directory of the test's own, holding `bytes`.
+    #[cfg(unix)]
     fn key(bytes: &[u8]) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("node.key");
@@ -101,14 +102,19 @@ mod tests {
         }
     }
 
-    /// On Windows a key its owner and LocalSystem alone may access is read whole; one whose DACL
-    /// allows Everyone, the Users group or the Administrators group (none of them the file's owner
-    /// here) is refused, and read again once that entry is gone. The test's account is made the
-    /// file's owner and its DACL cut from the directory's entries, which differ from host to host.
+    /// On Windows a key made as `mantle init` makes one ([`create`]: its DACL its owner's and
+    /// LocalSystem's alone, protected) is read whole; one whose DACL also allows Everyone, the
+    /// Users group or Authenticated Users to read it, principals never its owner, is refused, and
+    /// read again once that entry is gone. (A file `icacls` cuts to its owner's entries is no such
+    /// file on an elevated runner: `/inheritance:r` beside `/grant:r` left explicit copies of the
+    /// inherited entries, the Administrators group's among them, which the check rightly refused.)
     #[cfg(windows)]
     #[test]
     fn a_key_others_may_read_is_refused_and_its_owners_alone_is_read() {
-        let (_dir, path) = key(&[7u8; 48]);
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.key");
+        create(&path).unwrap().write_all(&[7u8; 48]).unwrap();
         let icacls = |args: &[&str]| {
             let out = std::process::Command::new("icacls")
                 .arg(&path)
@@ -117,14 +123,6 @@ mod tests {
                 .unwrap();
             assert!(out.status.success(), "icacls {args:?}: {out:?}");
         };
-        let me = format!("*{}", user_sid());
-        icacls(&["/setowner", &me]);
-        icacls(&[
-            "/inheritance:r",
-            "/grant:r",
-            &format!("{me}:F"),
-            "*S-1-5-18:F",
-        ]);
         let owners_alone = |when: &str| {
             let read = read(&path);
             assert!(
@@ -134,7 +132,7 @@ mod tests {
             );
         };
         owners_alone("its owner's and LocalSystem's alone");
-        for other in ["*S-1-1-0", "*S-1-5-32-545", "*S-1-5-32-544"] {
+        for other in ["*S-1-1-0", "*S-1-5-32-545", "*S-1-5-11"] {
             icacls(&["/grant", &format!("{other}:R")]);
             let read = read(&path);
             assert!(
@@ -157,19 +155,6 @@ mod tests {
             .output()
             .unwrap();
         String::from_utf8_lossy(&out.stdout).trim().to_owned()
-    }
-
-    /// The SID of the account the test runs as, the second field of `whoami /user /fo csv /nh`.
-    #[cfg(windows)]
-    fn user_sid() -> String {
-        let out = std::process::Command::new("whoami")
-            .args(["/user", "/fo", "csv", "/nh"])
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "whoami: {out:?}");
-        let line = String::from_utf8(out.stdout).unwrap();
-        let (_, sid) = line.trim().rsplit_once(',').unwrap();
-        sid.trim_matches('"').to_owned()
     }
 
     /// A key file that is not there is refused as the system's error, not as exposed.

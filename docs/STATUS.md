@@ -446,10 +446,17 @@ the founding ranges' groups and each founder's identity with every other founder
 pinned, each founder's directory with its stated configuration (paths relative to it, so it moves
 to its host whole) and owner-only keys (mode 0600; a protected DACL on Windows), and for a cell of one
 its calibration and device profiles measured; a cell of one and a cell of three serve objects from
-what it writes. Remaining: `mantle init client`; the node directory's own `LOCK`; startup in node.md
-§1.7's order with typed failures and an orderly stop on SIGTERM; and a replicated range refusing
-puts at its engine's metadata share where its leader admits a command, since a refusal at apply
-would let members diverge.
+what it writes. A `peer` line may name where the peer listens, by address or by a name the node
+resolves as it starts to its own socket's family. The node directory's `LOCK` is held while the
+process runs; the start runs node.md §1.7's steps in order, a failure naming its step (`mantle: the
+start's locks step: …`). SIGTERM or SIGINT (Ctrl-C or Ctrl-Break on Windows), or a `stop` line,
+stops the node in order within `stop_ms`: new objects answered `SlowDown`, those running ended, each
+led range handed to a caught-up member that then leads, connections closed and left to drain, exit
+0; a second request ends it at once (`crates/mantle/tests/serve.rs`). Remaining: `mantle init
+client`; a held QUIC port refused rather than shared (hyper-rt-transport sets `SO_REUSEPORT` before
+its listener's bind) and Windows' close, logoff and shutdown held through the stop (hyper-rt's
+handler), both hyper-rt's; and a replicated range refusing puts at its engine's metadata share
+where its leader admits a command, since a refusal at apply would let members diverge.
 
 ## Planned, in order
 

@@ -329,6 +329,9 @@ pub(crate) enum Line {
     Moved(u64, Duration),
     /// The node began its orderly stop at a signal.
     Stopping,
+    /// Its orderly stop began to hand a range's lead over: the range's group, and the voter it goes
+    /// to.
+    Handing(u128, u64),
     /// Its orderly stop handed a range's lead over: the range's group, and the member that then
     /// led it.
     Handed(u128, u64),
@@ -352,6 +355,10 @@ pub(crate) fn parse(line: &str) -> Option<Line> {
         ["volume", id] => Some(Line::Volume(u128::from_str_radix(id, 16).ok()?)),
         ["enlisted"] => Some(Line::Enlisted),
         ["stopping"] => Some(Line::Stopping),
+        ["handing", group, to] => Some(Line::Handing(
+            u128::from_str_radix(group, 16).ok()?,
+            to.parse().ok()?,
+        )),
         ["handed", group, leader] => Some(Line::Handed(
             u128::from_str_radix(group, 16).ok()?,
             leader.parse().ok()?,
@@ -429,6 +436,7 @@ pub(crate) fn movement(line: &Line) -> Option<(u64, u64, u64, u64, Duration, Dur
         | Line::Basis(..)
         | Line::Moved(..)
         | Line::Stopping
+        | Line::Handing(..)
         | Line::Handed(..)
         | Line::Stopped => None,
     }
@@ -796,8 +804,10 @@ pub(crate) struct Cell {
     /// with, each with its basis, in the order said.
     pub(crate) serving: bool,
     pub(crate) bases: BTreeMap<u64, Vec<Basis>>,
-    /// Each range whose lead a node's orderly stop handed over: the node, the range's group and
-    /// the member that then led it; and the nodes whose stop said it was done.
+    /// Each range whose lead a node's orderly stop began to hand over: the node, the range's group
+    /// and the voter it goes to; each it handed over: the node, the group and the member that then
+    /// led it; and the nodes whose stop said it was done.
+    pub(crate) handing: Vec<(u64, u128, u64)>,
     pub(crate) handed: Vec<(u64, u128, u64)>,
     pub(crate) stopped: BTreeSet<u64>,
     /// Each node's configuration as `mantle init` wrote it, for a cell it made (`Cell::made`):
@@ -1048,6 +1058,7 @@ impl Cell {
             gateway: true,
             serving: true,
             bases: BTreeMap::new(),
+            handing: Vec::new(),
             handed: Vec::new(),
             stopped: BTreeSet::new(),
             made,
@@ -1171,6 +1182,7 @@ impl Cell {
             gateway,
             serving,
             bases: BTreeMap::new(),
+            handing: Vec::new(),
             handed: Vec::new(),
             stopped: BTreeSet::new(),
             made: BTreeMap::new(),
@@ -1400,6 +1412,7 @@ impl Cell {
                 | Line::Basis(..)
                 | Line::Moved(..)
                 | Line::Stopping
+                | Line::Handing(..)
                 | Line::Handed(..)
                 | Line::Stopped => None,
             })
@@ -1559,6 +1572,7 @@ impl Cell {
                         self.enlisted.insert(id);
                     }
                     Line::Stopping => {}
+                    Line::Handing(group, to) => self.handing.push((id, group, to)),
                     Line::Handed(group, leader) => self.handed.push((id, group, leader)),
                     Line::Stopped => {
                         self.stopped.insert(id);

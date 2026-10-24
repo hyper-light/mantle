@@ -730,7 +730,9 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     abandoned: Vec<host::Pending>,
     /// The orderly stop, once begun ([`Node::stop`]).
     stopping: Option<Stopping>,
-    /// The ranges whose lead the stop handed over, not yet taken ([`Node::take_handed`]).
+    /// The ranges whose lead the stop began to hand over, and those it handed over, not yet taken
+    /// ([`Node::take_handing`], [`Node::take_handed`]).
+    handing: Vec<(u128, u64)>,
     handed: Vec<(u128, u64)>,
     /// The node's TLS without its server side, which the stop runs on to take no connection: made
     /// as the node opens, from the credentials it opened with.
@@ -975,6 +977,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             jobs: Vec::new(),
             abandoned: Vec::new(),
             stopping: None,
+            handing: Vec::new(),
             handed: Vec::new(),
             dial_only: Some(dial_only),
             table: None,

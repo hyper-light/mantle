@@ -650,8 +650,13 @@ the orchestrators' defaults, so a default stop ends before their SIGKILL), and a
 the bound passing, ends the process at once, as a crash would. The node says `stopping`, answers
 each new object exchange `SlowDown` and waits for those running to end; transfers each range it
 leads to the voter caught up with it, else the one whose log holds most, which the core first brings
-up to its own; waits until its member learns another leads (`handed GROUP LEADER`), through an
-election under way to its winner, or until the core gives the transfer up; then takes no connection
+up to its own (`handing GROUP TO`); waits until its member learns another leads (`handed GROUP
+LEADER`), through an election under way to its winner. A transfer the core gives up, its rounds
+passed with this node still leading (Raft §3.10), it begins again, to another voter where there is
+one, until one leads or the stop's bound passes: with four busy loops on two CPUs the core gave a
+stop's every transfer up before its target campaigned, the ranges keeping their term and this node
+as leader (fedora, Linux x86_64), and a range so left elects only after the node is gone, with no
+leader meanwhile. Then it takes no connection
 (its TLS without the server side), dials no peer, closes each connection and waits until each has
 left its closing state, three probe timeouts (hyper-quic's close timer); says `stopped` and ends, its
 log and volumes closed as the node is dropped. `mantle serve` runs on when its standard input

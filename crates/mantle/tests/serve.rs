@@ -294,8 +294,8 @@ fn led(cell: &Cell, id: u64) -> Vec<u128> {
 }
 
 /// A node asked to stop (node.md §1.7: SIGTERM; a `stop` line on Windows, `Cell::stop`) hands each
-/// range it leads to a member caught up with it, which then leads; says so of each, closes its
-/// connections and exits 0. The two others serve on:
+/// range it leads to a member caught up with it, which then leads; says so of each as it begins
+/// and once it is done, closes its connections and exits 0. The two others serve on:
 /// every object acknowledged before the stop reads back whole through them, and the ranges, led by
 /// them, take a bucket made through them. (A new object's chunks go to every node's volume, the
 /// stopped one's too, which the volume table still holds.)
@@ -338,13 +338,26 @@ fn a_node_asked_to_stop_hands_its_ranges_over_and_exits_well() {
         done(outcome, &format!("the put of o{n}"));
     }
     let stopping = *ids.iter().max_by_key(|id| led(&cell, **id).len()).unwrap();
-    let ranges = led(&cell, stopping);
-    assert!(!ranges.is_empty(), "node {stopping} leads no range");
+    assert!(
+        !led(&cell, stopping).is_empty(),
+        "node {stopping} leads no range"
+    );
     let exited = cell.stop(stopping);
     assert!(exited.success(), "node {stopping} exited {exited}");
     assert!(
         cell.stopped.contains(&stopping),
         "node {stopping} said no stop"
+    );
+    // The ranges it led as its stop began, as it said: each handed to a voter that then leads.
+    let ranges: BTreeSet<u128> = cell
+        .handing
+        .iter()
+        .filter(|(node, ..)| *node == stopping)
+        .map(|(_, group, _)| *group)
+        .collect();
+    assert!(
+        !ranges.is_empty(),
+        "node {stopping} began to hand no range over"
     );
     let others: Vec<u64> = ids.iter().copied().filter(|id| *id != stopping).collect();
     for group in &ranges {

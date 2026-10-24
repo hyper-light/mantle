@@ -1529,8 +1529,12 @@ async fn serve(
             say(&mut output, &format!("log {flushing} {longest}\n")).await?;
             stats = Some(log);
         }
-        // The orderly stop: each range whose lead it handed over, to the member that then led it,
-        // and its end, after which the node's log and volumes close as it is dropped.
+        // The orderly stop: each range whose lead it begins to hand over, and to whom (again, after
+        // its core gave a transfer up); each it handed over, to the member that then led it; and
+        // its end, after which the node's log and volumes close as it is dropped.
+        for (group, to) in node.take_handing() {
+            say(&mut output, &format!("handing {group:x} {to}\n")).await?;
+        }
         for (group, leader) in node.take_handed() {
             say(&mut output, &format!("handed {group:x} {leader}\n")).await?;
         }

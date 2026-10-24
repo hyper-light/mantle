@@ -1,15 +1,19 @@
 //! The orderly stop (docs/design/node.md §1.7): begun at its process's first stop signal
 //! ([`Node::stop`]), it begins no object operation (each new one is answered `SlowDown`) and lets
 //! those running end; then hands each range this node leads to a voter caught up with it and waits
-//! until that voter leads, or until the range's core gives the transfer up (Raft §3.10: after about
-//! an election timeout), after which the range elects as after a crash; then takes no connection,
-//! closes each it holds and keeps each in its closing state until it drains (RFC 9000 §10.2: the
-//! node keeps the socket its peers know, and answers their late packets). Each turn steps it
-//! ([`Node::step_stop`]); once it is done ([`Node::stopped`]) nothing the node holds is owed to the
-//! cell, and its process closes its log and volumes and ends.
+//! until that voter leads. A transfer the range's core gives up (Raft §3.10: one not done within
+//! its rounds), the range still this node's, is begun again, to another voter where there is one:
+//! on a loaded host a target can take longer than the core's rounds to campaign, and a range left
+//! as it was would elect only after this node is gone, with no leader meanwhile, the gap the
+//! stop is for. The stop's bound ends the tries. Then it takes no connection, closes each it holds
+//! and keeps each in its closing state until it drains (RFC 9000 §10.2: the node keeps the socket
+//! its peers know, and answers their late packets). Each turn steps it ([`Node::step_stop`]); once
+//! it is done ([`Node::stopped`]) nothing the node holds is owed to the cell, and its process closes
+//! its log and volumes and ends.
 
 use std::net::SocketAddr;
 
+use hyper_durable::Handle;
 use hyper_transport::PeerId;
 use mantle_meta::engine::Engine;
 
@@ -44,6 +48,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// Whether the orderly stop is done.
     pub fn stopped(&self) -> bool {
         matches!(self.stopping, Some(Stopping::Done))
+    }
+
+    /// The ranges whose lead this node began to hand over since the last call, each by its group
+    /// and the voter it goes to: a range handed again, once its core gave a transfer up, is told
+    /// again.
+    pub fn take_handing(&mut self) -> impl Iterator<Item = (u128, u64)> + '_ {
+        self.handing.drain(..)
     }
 
     /// The ranges whose lead this node handed over since the last call, each by its group and the
@@ -87,56 +98,62 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(())
     }
 
-    /// Hands each range this node leads to a voter whose log holds everything committed, or, with
-    /// none such, the voter whose log holds the most, which the core brings up to its own before
-    /// it hands over (Raft §3.10): the ranges whose transfer is out.
+    /// Hands each range this node leads to a voter ([`Node::transfer_lead`]): the ranges whose
+    /// transfer is out, each by its group and the voter it goes to.
     fn hand_over(&mut self) -> Vec<(u128, u64)> {
         let mut out = Vec::with_capacity(self.ranges.len());
         for at in 0..self.ranges.len() {
             let Some((group, handle)) = self.ranges.get(at).map(|k| (k.group, k.handle)) else {
                 continue;
             };
-            let Some(replica) = self.owner.get(handle) else {
-                continue;
-            };
-            if !replica.is_leader() {
+            if !self.owner.get(handle).is_some_and(|r| r.is_leader()) {
                 continue;
             }
-            let tracker = replica.core().raft.tracker();
-            let target = replica
-                .configuration()
-                .voters
-                .iter()
-                .copied()
-                .filter(|voter| *voter != self.id)
-                .max_by_key(|voter| {
-                    (
-                        replica.caught_up(*voter),
-                        tracker.get(*voter).map_or(0, |p| p.matched),
-                    )
-                });
-            let Some(to) = target else {
-                continue;
-            };
-            // A transfer the core refuses leaves the range to elect as after a crash.
-            if let Some(replica) = self.owner.get_mut(handle)
-                && replica.transfer(to).is_ok()
-            {
-                self.owner.schedule(handle);
+            if let Some(to) = self.transfer_lead(handle, None) {
+                self.handing.push((group, to));
                 out.push((group, to));
             }
         }
         out
     }
 
+    /// Begins handing the lead of the range at `handle`, which this node leads, to a voter whose
+    /// log holds everything committed, or, with none such, the voter whose log holds the most,
+    /// which the core brings up to its own before it hands over (Raft §3.10); once a transfer to
+    /// `failed` was given up, to another voter where there is one. The voter it goes to, or `None`
+    /// where the core refuses, after which the range elects as after a crash.
+    fn transfer_lead(&mut self, handle: Handle, failed: Option<u64>) -> Option<u64> {
+        let replica = self.owner.get(handle)?;
+        let tracker = replica.core().raft.tracker();
+        let to = replica
+            .configuration()
+            .voters
+            .iter()
+            .copied()
+            .filter(|voter| *voter != self.id)
+            .max_by_key(|voter| {
+                (
+                    Some(*voter) != failed,
+                    replica.caught_up(*voter),
+                    tracker.get(*voter).map_or(0, |p| p.matched),
+                )
+            })?;
+        self.owner.get_mut(handle)?.transfer(to).ok()?;
+        self.owner.schedule(handle);
+        Some(to)
+    }
+
     /// The transfers still out of `out`. A range whose lead another member now holds, as this
     /// node's member learned from it, is handed over (to the voter it went to, or to one the range
     /// elected instead); one whose member steps down to an election waits for its winner; one whose
-    /// core gave the transfer up waits no more, and elects as after a crash once the node is gone.
+    /// core gave the transfer up, this node still leading, is handed again.
     fn handing(&mut self, out: Vec<(u128, u64)>) -> Vec<(u128, u64)> {
         let mut still = Vec::with_capacity(out.len());
         for (group, to) in out {
-            let Some(replica) = self.kept(group).and_then(|k| self.owner.get(k.handle)) else {
+            let Some(handle) = self.kept(group).map(|k| k.handle) else {
+                continue;
+            };
+            let Some(replica) = self.owner.get(handle) else {
                 continue;
             };
             let leader = replica.leader();
@@ -144,6 +161,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.handed.push((group, leader));
             } else if leader == 0 || replica.core().raft.lead_transferee() == Some(to) {
                 still.push((group, to));
+            } else if let Some(again) = self.transfer_lead(handle, Some(to)) {
+                self.handing.push((group, again));
+                still.push((group, again));
             }
         }
         still

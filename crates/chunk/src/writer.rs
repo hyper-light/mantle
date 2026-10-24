@@ -1318,11 +1318,26 @@ impl<F: BlockFile> Writer<F> {
             writes.push((buf, at));
         }
         writes.extend(frames);
+        let span = writes.iter().fold((u64::MAX, 0u64, 0usize), |(lo, hi, n), (buf, at)| {
+            let end = at.saturating_add(u64::try_from(buf.len()).unwrap_or(0));
+            (lo.min(*at), hi.max(end), n.saturating_add(buf.len()))
+        });
         let written = self.io.write(writes, true).map_err(ChunkError::Device)?;
         for (buf, _) in written {
             self.pool.give(buf);
         }
         let took = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if took > 100_000_000 {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "DIAG write_batch {} ms at {}..{} bytes {}",
+                took / 1_000_000,
+                span.0,
+                span.1,
+                span.2
+            );
+        }
         self.anticipation.served(took);
         let laid: u64 = payloads
             .iter()

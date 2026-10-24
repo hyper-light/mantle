@@ -33,8 +33,8 @@
 //!
 //! **Its talk** is lines. On standard output: `bound QUIC PLANE` once the node listens, and
 //! `volume ID` for each volume it holds, its 128-bit id in hex; then, for each range it hosts,
-//! `status GROUP TERM LEADER COMMIT APPLIED PATIENCE_NS RECONNECT_NS MEASURING_NS HELD`, the group
-//! in hex, each time one of the term, leader, commit or applied index
+//! `status GROUP TERM LEADER COMMIT APPLIED PATIENCE_NS RECONNECT_NS MEASURING_NS ASKING_NS HELD`,
+//! the group in hex, each time one of the term, leader, commit or applied index
 //! moves, its redials to a peer back off further or start over, or the heartbeats it takes from
 //! peers not yet judged move (`Status::measuring`): how long the node states it may go
 //! without moving
@@ -42,8 +42,10 @@
 //! may go without moving should that peer fall silent (`Status::reconnect`, 0 when it dials none);
 //! while
 //! some peer is not yet judged, the longest its stream's heartbeats go between
-//! (`Status::measuring_for`, else 0); and 1 while the node waits on its own device, said each time
-//! that changes (`Status::held`, else 0). After each status, `log FLUSHING_NS LONGEST_NS`: how
+//! (`Status::measuring_for`, else 0); while a command or read the node asks of the range itself
+//! waits paused, the longest the pause may last, its backoff (`Status::asking`, else 0), said each
+//! time it changes; and 1 while the node waits on its own device, said each time that changes
+//! (`Status::held`, else 0). After each status, `log FLUSHING_NS LONGEST_NS`: how
 //! long the log's flush has been out (0 when none is) and the longest an update has waited for
 //! its commit (hyper-log's `LogStats`), since the node moves only as its writes become durable;
 //! and
@@ -1198,6 +1200,7 @@ async fn serve(
                     != (now.term, now.leader, now.commit, now.applied, now.reconnect)
                     || was.measuring != now.measuring
                     || was.held != now.held
+                    || was.asking != now.asking
             });
             if !moved {
                 continue;
@@ -1205,8 +1208,9 @@ async fn serve(
             let patience = now.patience.map_or(0, |p| p.as_nanos());
             let reconnect = now.reconnect.map_or(0, |r| r.as_nanos());
             let measuring = now.measuring_for.map_or(0, |m| m.as_nanos());
+            let asking = now.asking.map_or(0, |a| a.as_nanos());
             let line = format!(
-                "status {group:x} {} {} {} {} {patience} {reconnect} {measuring} {}\n",
+                "status {group:x} {} {} {} {} {patience} {reconnect} {measuring} {asking} {}\n",
                 now.term,
                 now.leader,
                 now.commit,

@@ -64,7 +64,9 @@ use crate::object;
 use crate::read::{Query, Read};
 use crate::storage::{Done, Origin, Storage};
 
+mod answers;
 mod host;
+use answers::Answers;
 pub use host::GatewaySettings;
 
 /// A plane message's first byte: a range's Raft frame. A liveness heartbeat starts with its own,
@@ -354,6 +356,11 @@ pub struct Status {
     /// does, and the next dial follows within the peer's backoff ([`bounds::backed_off`]), until
     /// one connects. `None` when the node dials no peer.
     pub reconnect: Option<Duration>,
+    /// While a command or a read this node asks of the range itself waits paused, the longest the
+    /// pause may last by its own law: its backoff ([`bounds::backed_off`]), which the pause drawn
+    /// never passes. A pause for want of a leader ends sooner, once this node's member names one.
+    /// `None` when none waits paused.
+    pub asking: Option<Duration>,
     /// The reads the range's core holds, as its leader: waiting for its term's first commit,
     /// for a quorum to confirm it leads, or to be taken; and of them, those waiting for that
     /// quorum (hyper-raft's `Raft::reads_held`, `Raft::pending_read_count`).
@@ -604,7 +611,7 @@ const PIECE: u64 = hyper_transport::RECEIVE_CHUNK as u64;
 pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     id: u64,
     log: L,
-    owner: Owner<L::Store, RangeMachine<E>, Unbounded>,
+    owner: Owner<Answers<L::Store>, RangeMachine<E>, Unbounded>,
     ranges: Vec<Kept>,
     deadlines: BTreeSet<(u64, usize)>,
     liveness: Liveness,
@@ -786,7 +793,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if hosted.group == 0 || hosted.group == LIVENESS_GROUP {
                 return Err(NodeError::Reserved(hosted.group));
             }
-            let store = log.claim(hosted.group, &hosted.range)?;
+            let store = Answers::new(log.claim(hosted.group, &hosted.range)?);
             let shell = mantle_range::open_shell(
                 settings.id,
                 store,
@@ -1040,6 +1047,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .filter(|r| self.id < r.id)
                 .map(|r| bounds::idle_timeout().saturating_add(r.backoff))
                 .max(),
+            asking: self
+                .asking
+                .iter()
+                .filter(|a| a.group == group)
+                .filter(|a| matches!(a.out.as_ref().map(|o| o.via), Some(Via::Paused { .. })))
+                .map(|a| a.backoff)
+                .chain(
+                    self.reads_out
+                        .iter()
+                        .filter(|r| r.group == group && matches!(r.via, Via::Paused { .. }))
+                        .map(|r| r.backoff),
+                )
+                .max(),
             reads_held: replica.core().raft.reads_held(),
             reads_confirming: replica.core().raft.pending_read_count(),
             reading: self.reading.iter().filter(|r| r.group == group).count(),
@@ -1261,14 +1281,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// Waits for the first of: the transport's next event, a datagram on the plane, the earliest
-    /// deadline (a replica's, the stream's, a redial), or any other wake of the task (a log's
-    /// answer). Returns at once when replicas are queued.
+    /// deadline (a replica's, the stream's, a redial), or any other wake of the task (a log's or a
+    /// volume's answer). Returns at once when replicas are queued, or when an answer has come
+    /// already ([`Node::answered`]).
     ///
     /// A wait begun before the stream's wake and ended at or past it, whatever ended it, is
     /// reported to the stream as it ends: its lateness is the stream's granularity
     /// (`Liveness::on_wait`).
     async fn wait(&mut self) -> Result<(), NodeError> {
-        if self.owner.has_work() {
+        if self.owner.has_work() || self.answered().await? {
             return Ok(());
         }
         let now = hyper_rt::futures::now_ns();
@@ -1331,6 +1352,42 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Either3::Third(Either::Second(())) => {}
         }
         Ok(())
+    }
+
+    /// Whether an answer came that the turn has yet to take: the stream's write's, taken here; a
+    /// range's write's, which the replica's next drive takes (`Answers`); or a chunk put's or
+    /// get's, kept for [`Node::take_stored`]. Each tells of its answer by waking the task, and a
+    /// wake ends whichever await of the task it finds, so one that came while the process said a
+    /// line between turns ended that await and left the wait nothing to end it: it slept to its
+    /// idle timeout, 3 s, with the answer in hand (CI run 40061578598, a lone node on one CPU;
+    /// node.md §2.2). Nothing awaits between this look and the wait's first poll, so an answer
+    /// that comes after it wakes the wait.
+    async fn answered(&mut self) -> Result<bool, NodeError> {
+        let writing = self.liveness_write.is_some();
+        self.liveness_written()?;
+        if writing && self.liveness_write.is_none() {
+            return Ok(true);
+        }
+        let ranges = &self.ranges;
+        let owner = &mut self.owner;
+        if ranges.iter().any(|kept| {
+            owner
+                .get_mut(kept.handle)
+                .is_some_and(|r| r.in_flight() > 0 && r.log_mut().answered())
+        }) {
+            return Ok(true);
+        }
+        if self.storage.out() > 0 {
+            let Self {
+                storage, stored, ..
+            } = self;
+            poll_fn(|context| {
+                storage.poll_done(context, stored);
+                Poll::Ready(())
+            })
+            .await;
+        }
+        Ok(!self.stored.is_empty())
     }
 
     /// What the stream's own write made durable, before the clock it is polled at. A write the
@@ -2420,11 +2477,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
     }
 
-    /// The puts and gets the storage answered since the last turn: a peer's answered on its
-    /// exchange, this node's own kept for [`Self::take_chunk`]. Registers this task to be woken
-    /// when a get still out is answered.
+    /// The puts and gets the storage answered since the last turn, those the wait found first
+    /// ([`Self::answered`]): a peer's answered on its exchange, this node's own kept for
+    /// [`Self::take_chunk`]. Registers this task to be woken when a get still out is answered.
     async fn take_stored(&mut self) -> Result<(), NodeError> {
-        if self.storage.out() == 0 {
+        if self.storage.out() == 0 && self.stored.is_empty() {
             return Ok(());
         }
         let mut stored = std::mem::take(&mut self.stored);
@@ -2751,9 +2808,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
             let owner = (self.id, self.run, nth);
             asking.next_entry(limits, owner, nonce, &mut self.commands_done);
+            let group = asking.group;
             let due = match asking.out.as_ref().map(|o| o.via) {
                 Some(Via::Unasked) => true,
-                Some(Via::Paused { at_ns }) => at_ns <= now,
+                // A pause for want of a leader ends once this node's own member names one.
+                Some(Via::Paused { at_ns, leaderless }) => {
+                    at_ns <= now || (leaderless && self.leader_of(group) != 0)
+                }
                 Some(Via::Local | Via::Exchange { .. }) | None => false,
             };
             if due {
@@ -2780,7 +2841,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         if asking.tried >= nodes {
             asking.tried = 0;
-            pause(self.id, asking, now);
+            pause(self.id, asking, now, true);
             return Ok(());
         }
         let next = self
@@ -2792,6 +2853,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .filter(|l| *l != 0)
             .or(asking.leader)
             .unwrap_or(next);
+        if target == 0 {
+            // No node to ask: none named a leader, and this node keeps no peer. An exchange to no
+            // one would hold the entry out until its idle timeout; the pause ends as soon as this
+            // node's own member names a leader.
+            asking.tried = 0;
+            pause(self.id, asking, now, true);
+            return Ok(());
+        }
         asking.tried = asking.tried.saturating_add(1);
         let Some(out) = asking.out.as_mut() else {
             return Ok(());
@@ -2868,7 +2937,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
             Err(_) => {
                 asking.out = Some(out);
-                pause(self.id, asking, now);
+                pause(self.id, asking, now, false);
             }
         }
         Ok(())
@@ -2932,7 +3001,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 asking.leader = None;
                 unasked(asking);
             }
-            command::Status::Refused => pause(self.id, asking, now),
+            command::Status::Refused => pause(self.id, asking, now, false),
             status => asking.refused(status, &mut self.commands_done),
         }
         Ok(())
@@ -3026,7 +3095,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if out.deadline_ns > now {
                 let due = match out.via {
                     Via::Unasked => true,
-                    Via::Paused { at_ns } => at_ns <= now,
+                    Via::Paused { at_ns, leaderless } => {
+                        at_ns <= now || (leaderless && self.leader_of(out.group) != 0)
+                    }
                     Via::Local | Via::Exchange { .. } => false,
                 };
                 if due {
@@ -3083,7 +3154,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             } else {
                 // The member takes no read now (it is stepping down): asked again after a pause.
                 let at_ns = paused_until(local, (&mut out.backoff, &mut out.pauses), now);
-                out.via = Via::Paused { at_ns };
+                out.via = Via::Paused {
+                    at_ns,
+                    leaderless: false,
+                };
             }
             return Ok(());
         }
@@ -3095,7 +3169,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if out.tried >= nodes {
             out.tried = 0;
             let at_ns = paused_until(local, (&mut out.backoff, &mut out.pauses), now);
-            out.via = Via::Paused { at_ns };
+            out.via = Via::Paused {
+                at_ns,
+                leaderless: true,
+            };
             return Ok(());
         }
         let next = self
@@ -3107,6 +3184,16 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .filter(|l| *l != 0)
             .or(out.leader)
             .unwrap_or(next);
+        if target == 0 {
+            // No node to ask, as for a command (`ask_entry`).
+            out.tried = 0;
+            let at_ns = paused_until(local, (&mut out.backoff, &mut out.pauses), now);
+            out.via = Via::Paused {
+                at_ns,
+                leaderless: true,
+            };
+            return Ok(());
+        }
         out.tried = out.tried.saturating_add(1);
         let body = out.query.encode();
         let len = u64::try_from(body.len()).unwrap_or(u64::MAX);
@@ -3191,7 +3278,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
             command::Status::Refused => {
                 let at_ns = paused_until(local, (&mut out.backoff, &mut out.pauses), now);
-                out.via = Via::Paused { at_ns };
+                out.via = Via::Paused {
+                    at_ns,
+                    leaderless: false,
+                };
             }
             status => {
                 let out = self.reads_out.swap_remove(at);
@@ -3223,7 +3313,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .map(|r| {
                 let asked = match r.via {
                     Via::Unasked => now,
-                    Via::Paused { at_ns } => at_ns,
+                    Via::Paused { at_ns, .. } => at_ns,
                     Via::Local | Via::Exchange { .. } => r.deadline_ns,
                 };
                 asked.min(r.deadline_ns)
@@ -3239,7 +3329,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .filter_map(|a| {
                 let asked = match a.out.as_ref().map(|o| o.via) {
                     Some(Via::Unasked) => Some(now),
-                    Some(Via::Paused { at_ns }) => Some(at_ns),
+                    Some(Via::Paused { at_ns, .. }) => Some(at_ns),
                     Some(Via::Local | Via::Exchange { .. }) => None,
                     None if a.waiting.is_empty() => None,
                     None => Some(now),
@@ -3380,13 +3470,14 @@ fn names_only_its_sender(command: &Command, sender: PeerId, node: bool) -> bool 
     }
 }
 
-/// Pauses `asking`'s entry out: no node named a leader this round, or the leader refused it for
-/// room. RFC 6298 §5.5's doubling backoff, at most the idle timeout (`bounds::backed_off`), each
-/// pause drawn between its half and its whole (`bounds::pause`) so nodes do not ask again in step.
-fn pause(local: u64, asking: &mut Asking, now: u64) {
+/// Pauses `asking`'s entry out: no node named a leader this round (`leaderless`), or the leader
+/// refused it for room. RFC 6298 §5.5's doubling backoff, at most the idle timeout
+/// (`bounds::backed_off`), each pause drawn between its half and its whole (`bounds::pause`) so
+/// nodes do not ask again in step.
+fn pause(local: u64, asking: &mut Asking, now: u64, leaderless: bool) {
     let at_ns = paused_until(local, (&mut asking.backoff, &mut asking.pauses), now);
     if let Some(out) = asking.out.as_mut() {
-        out.via = Via::Paused { at_ns };
+        out.via = Via::Paused { at_ns, leaderless };
     }
 }
 

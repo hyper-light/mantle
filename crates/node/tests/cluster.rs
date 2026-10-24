@@ -45,7 +45,8 @@
 //! gives up once a quiet period passes with nothing moved: the
 //! longest patience any node states by its own law (`Status::patience`), or the longest a link to
 //! a peer a node dials may go without moving should that peer fall silent (`Status::reconnect`:
-//! a cut's first movement is its connections' idle timeout), or any client gives an exchange by
+//! a cut's first movement is its connections' idle timeout), or an ask the node itself waits on
+//! paused (`Status::asking`), or any client gives an exchange by
 //! its own (`Client::patience`), and never less than RFC 6298's initial retransmission timeout, one
 //! second, before anything is measured. A node
 //! whose log has a flush out extends the watch, since its range moves only as its writes become
@@ -460,7 +461,7 @@ impl Pki {
 enum Report {
     /// Where the node listens, once open: QUIC's address and the plane's.
     Bound(u64, SocketAddr, SocketAddr),
-    Status(u64, Status),
+    Status(u64, Box<Status>),
     /// A registration applied: its serial, its index, its answer.
     Applied(u64, u64, u64, Answer),
     /// What the node's log says of its flushes: how long the one out has been, if one is, and
@@ -772,7 +773,7 @@ async fn run<E: Engine + 'static>(
         if status != told
             && let Some(now) = status
         {
-            if reports.send(Report::Status(id, now)).is_err() {
+            if reports.send(Report::Status(id, Box::new(now))).is_err() {
                 return;
             }
             told = status;
@@ -880,8 +881,9 @@ impl Watch {
                     (was.term, was.leader, was.commit, was.applied)
                         != (now.term, now.leader, now.commit, now.applied)
                         || was.measuring != now.measuring
+                        || was.asking != now.asking
                 });
-                self.status.insert(id, now);
+                self.status.insert(id, *now);
                 // A status that moved nothing may say the node waits on its device, or no
                 // longer does: a stretch held still begins or ends.
                 if moved {
@@ -1039,7 +1041,7 @@ impl Watch {
     fn quiet(&self) -> Duration {
         self.status
             .values()
-            .flat_map(|s| [s.patience, s.reconnect, s.measuring_for])
+            .flat_map(|s| [s.patience, s.reconnect, s.measuring_for, s.asking])
             .flatten()
             .chain(self.clients.values().copied())
             .fold(INITIAL_RTO, Duration::max)

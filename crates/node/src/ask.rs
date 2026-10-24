@@ -94,8 +94,10 @@ pub(crate) enum Via {
     Local,
     /// On an exchange with a peer.
     Exchange { exchange: ExchangeId, peer: PeerId },
-    /// Asked of no one until `at_ns`: no node named a leader, or the leader refused it for room.
-    Paused { at_ns: u64 },
+    /// Asked of no one until `at_ns`: no node named a leader (`leaderless`), which ends too as soon
+    /// as this node's own member of the range names one, or the leader refused it for room, or this
+    /// node's member took it not, which only the pause ends.
+    Paused { at_ns: u64, leaderless: bool },
 }
 
 /// An entry out: what it carries, the entry, and how it is being asked.

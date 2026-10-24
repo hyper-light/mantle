@@ -308,6 +308,9 @@ pub(crate) enum Line {
         reconnect: Duration,
         /// While a peer is not yet judged, the longest its stream's heartbeats go between.
         measuring: Duration,
+        /// While a command or read the node asks of the range itself waits paused, the longest
+        /// the pause may last (`Status::asking`, else zero).
+        asking: Duration,
         /// Whether the node waits on its own device (`Status::held`).
         held: bool,
     },
@@ -366,6 +369,7 @@ pub(crate) fn parse(line: &str) -> Option<Line> {
             patience,
             reconnect,
             measuring,
+            asking,
             held,
         ] => Some(Line::Status {
             group: u128::from_str_radix(group, 16).ok()?,
@@ -376,6 +380,7 @@ pub(crate) fn parse(line: &str) -> Option<Line> {
             patience: Duration::from_nanos(patience.parse().ok()?),
             reconnect: Duration::from_nanos(reconnect.parse().ok()?),
             measuring: Duration::from_nanos(measuring.parse().ok()?),
+            asking: Duration::from_nanos(asking.parse().ok()?),
             held: match *held {
                 "0" => false,
                 "1" => true,
@@ -387,7 +392,7 @@ pub(crate) fn parse(line: &str) -> Option<Line> {
 }
 
 /// What of a status is movement: all of it but whether the node waits on its device.
-pub(crate) fn movement(line: &Line) -> Option<(u64, u64, u64, u64, Duration, Duration)> {
+pub(crate) fn movement(line: &Line) -> Option<(u64, u64, u64, u64, Duration, Duration, Duration)> {
     match line {
         Line::Status {
             term,
@@ -396,8 +401,11 @@ pub(crate) fn movement(line: &Line) -> Option<(u64, u64, u64, u64, Duration, Dur
             applied,
             reconnect,
             measuring,
+            asking,
             ..
-        } => Some((*term, *leader, *commit, *applied, *reconnect, *measuring)),
+        } => Some((
+            *term, *leader, *commit, *applied, *reconnect, *measuring, *asking,
+        )),
         Line::Bound(..)
         | Line::Replaced(..)
         | Line::Link(..)
@@ -899,7 +907,8 @@ impl Cell {
             if let Some(cell) = line.strip_prefix("cell ") {
                 name = Some(cell.to_owned());
             } else if let Some(rest) = line.strip_prefix("authority ") {
-                authority = rest.split_once(':').map(|(dir, _)| PathBuf::from(dir));
+                // A path ends at a colon and a space, never at a drive's colon.
+                authority = rest.split_once(": ").map(|(dir, _)| PathBuf::from(dir));
             } else if let Some(rest) = line.strip_prefix("node ") {
                 let (id, rest) = rest.split_once(' ').unwrap();
                 let (dir, _) = rest.split_once(": ").unwrap();
@@ -1241,9 +1250,9 @@ impl Cell {
         self.hold();
     }
 
-    /// The quiet period: the longest any node states it may go without moving or a link to a peer
-    /// it dials may, should that peer fall silent, or any client gives an exchange, never less than
-    /// the initial RTO.
+    /// The quiet period: the longest any node states it may go without moving, a link to a peer it
+    /// dials may, should that peer fall silent, or a command or read it asks itself may wait
+    /// paused, or any client gives an exchange, never less than the initial RTO.
     pub(crate) fn quiet(&self) -> Duration {
         self.status
             .values()
@@ -1252,8 +1261,9 @@ impl Cell {
                     patience,
                     reconnect,
                     measuring,
+                    asking,
                     ..
-                } => Some((*patience).max(*reconnect).max(*measuring)),
+                } => Some((*patience).max(*reconnect).max(*measuring).max(*asking)),
                 Line::Bound(..)
                 | Line::Replaced(..)
                 | Line::Link(..)

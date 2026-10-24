@@ -740,6 +740,20 @@ turn does this, in order:
    every replica on that log is taken off its shard, the log is reopened, which recovers what
    is durable, and its members open afresh from it.
 
+The node as built gives every range on a shard one waker, its task's, and queues each range with
+a write out at every turn, where its drive takes the answer if it came. A wake is an edge, not a
+state: it ends whichever await of the task it finds, and the process's own awaits between turns
+(a line it says) take some. A lone node pinned to one CPU had its enlistment's answer, and the
+wake for it, arrive 0.2 ms before its wait began, while the process said a line; the wait then
+slept to its idle timeout, 3.07 s, with the answer in hand, past the watch's patience (CI run
+40061578598; traced on a one-CPU Linux pin). So before it waits the shard looks where every
+answer lies (`Node::answered`): the liveness stream's write, each range's oldest write out, and
+the volumes' puts and gets. It waits only when none has come, and nothing awaits between that look
+and the wait's first poll, so an answer that comes after the look wakes the wait. A range's answer
+taken ahead of its replica is kept in front of the store's next (`node::answers`), so the replica
+takes its answers in the order the log gave them. The look costs one check of each range with a
+write out; a waker that named its range (hyper-durable's `Owner::woken`) would spare even that.
+
 A shard drives every runnable range in one pass before any of their flushes completes, so
 their updates meet in one frame on each log, which is what audit §5.1 asks a scheduler to do.
 The shard holds a range's waiting commands and reads in the range's own queue and proposes
@@ -1061,7 +1075,12 @@ dial that failed as the last one had, and a peer cut off for two failed redials 
 Windows runners) was never dialed again (`crates/node/tests/cluster.rs` holds a cut that long).
 A node states how long a link to a peer it dials may go without moving should that peer fall
 silent, which it cannot tell from slow (`Status::reconnect`): its connection's idle timeout and
-the peer's backoff. A peer learned at a new address has its old connection closed at once, since
+the peer's backoff. It states as well how long a command or a read it asks of a range itself may
+wait paused (`Status::asking`, its backoff), and a pause it took because no node named a leader ends
+as soon as its own member of the range names one. A node with no leader named and no peer has no
+node to ask (the one it would ask is node 0), and pauses so rather than open an exchange to no one:
+a lone node's enlistment, asked as its root range elects, waits for that range's leader and no
+longer. A peer learned at a new address has its old connection closed at once, since
 the transport dials no peer it holds a connection to. A node that answers a request without its
 body (with the leader it knows, or a status) first reads the body to its end, keeping none of it:
 ending an exchange whose request half is unread resets that half, and the asker's transport

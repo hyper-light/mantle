@@ -152,22 +152,18 @@ impl UdpSocket {
         }
     }
 
-    /// Binds a non-blocking UDP socket to `addr` that other sockets of this user may bind too
-    /// (`SO_REUSEPORT`): the port a listener shares with the sockets it connects to its peers
-    /// ([`UdpSocket::connect`]), each of which then takes its peer's datagrams into a receive queue
-    /// of its own, as a TCP connection's socket does. Refused `BadConfig` on Windows, where a shared
-    /// port hands a connected socket no peer's datagrams of its own, and on the simulation fabric,
-    /// whose ports are one socket's each.
-    ///
-    /// A port the kernel chooses (`addr`'s port 0) is chosen before the socket shares it. Linux's
-    /// search for one leaves out of the ports in use those held by a socket that shares its port
-    /// with the binder's user (`udp_lib_lport_inuse`, net/ipv4/udp.c), so a socket that asked with
-    /// `SO_REUSEPORT` already set could be handed a port another socket of the user held, in this
-    /// process or another, and the two then took each other's datagrams. Bound first, it is given a
-    /// port no socket holds; shared after, the sockets that bind that port later still join it, as
-    /// each kernel checks the held socket's flag when another binds (Linux `udp_lib_lport_inuse`
-    /// and `udp_reuseport_add_sock`, XNU `in_pcbbind`). A port named shares before its bind, as a
-    /// socket joining a port it names must.
+    /// Binds a non-blocking UDP socket to `addr` whose port the sockets it connects to its peers may
+    /// then bind too ([`UdpSocket::join_shared`], `SO_REUSEPORT`), each of which takes its peer's
+    /// datagrams into a receive queue of its own, as a TCP connection's socket does. The socket is
+    /// bound before its port is shared, so the port is one no other socket holds: a port another
+    /// socket holds is refused `AddrInUse`, where a second listener flagged before its bind bound it
+    /// too and the two split its datagrams (measured on Linux 6.19 and Darwin 25.4), and port 0 is
+    /// given a port of its own. Linux's search for a port leaves out of the ports in use those held
+    /// by a socket that shares its port with the binder's user (`udp_lib_lport_inuse`,
+    /// net/ipv4/udp.c), so a socket asking with `SO_REUSEPORT` already set could be handed a port
+    /// another socket of the user held, in this process or another. Refused `BadConfig` before any
+    /// socket is made on Windows, where a shared port hands a connected socket no peer's datagrams
+    /// of its own, and on the simulation fabric, whose ports are one socket's each.
     pub fn bind_shared(addr: impl Into<SocketAddr>) -> Result<UdpSocket, RtError> {
         let addr = addr.into();
         if on_sim() {
@@ -175,14 +171,31 @@ impl UdpSocket {
                 what: "a shared port on the simulation fabric, whose ports are one socket's",
             });
         }
+        netsys::port_sharing()?;
         let socket = netsys::dgram_socket(Family::of(addr))?;
-        if addr.port() == 0 {
-            netsys::bind(&socket, addr)?;
-            netsys::share_port(&socket)?;
-        } else {
-            netsys::share_port(&socket)?;
-            netsys::bind(&socket, addr)?;
+        netsys::bind(&socket, addr)?;
+        netsys::share_port(&socket)?;
+        Ok(UdpSocket::of(Inner::Real { socket }))
+    }
+
+    /// Binds a non-blocking UDP socket to `addr`, a port a socket of this process bound with
+    /// [`UdpSocket::bind_shared`] holds, to share it: what a listener's socket for one of its peers
+    /// binds before it connects to that peer ([`UdpSocket::connect`]). Its flag is set before its
+    /// bind, as a socket joining a held port's must be, and each kernel checks the held socket's
+    /// flag as it binds (Linux `udp_lib_lport_inuse` and `udp_reuseport_add_sock`, XNU
+    /// `in_pcbbind`). Refused as [`UdpSocket::bind_shared`] is where ports are not shared, and
+    /// `AddrInUse` where the port's holder does not share it.
+    pub fn join_shared(addr: impl Into<SocketAddr>) -> Result<UdpSocket, RtError> {
+        let addr = addr.into();
+        if on_sim() {
+            return Err(RtError::BadConfig {
+                what: "a shared port on the simulation fabric, whose ports are one socket's",
+            });
         }
+        netsys::port_sharing()?;
+        let socket = netsys::dgram_socket(Family::of(addr))?;
+        netsys::share_port(&socket)?;
+        netsys::bind(&socket, addr)?;
         Ok(UdpSocket::of(Inner::Real { socket }))
     }
 

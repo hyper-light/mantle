@@ -396,8 +396,8 @@ impl Batched {
         Self::new(UdpSocket::bind(addr)?, io, stamps)
     }
 
-    /// Binds a socket to `addr` that other sockets of this process may bind too
-    /// ([`UdpSocket::bind_shared`]) and batches it.
+    /// Binds a socket to `addr` whose port its peers' sockets may join ([`UdpSocket::bind_shared`])
+    /// and batches it.
     pub fn bind_shared(addr: impl Into<SocketAddr>, io: Io, stamps: bool) -> Result<Self, RtError> {
         Self::new(UdpSocket::bind_shared(addr)?, io, stamps)
     }
@@ -419,10 +419,16 @@ impl Batched {
         Self::lent(UdpSocket::bind(addr)?, stamps)
     }
 
-    /// Binds a socket to `addr` that other sockets of this process may bind too, lent its receive
-    /// buffers ([`Batched::lent`]).
+    /// Binds a socket to `addr` whose port its peers' sockets may join ([`UdpSocket::bind_shared`]),
+    /// lent its receive buffers ([`Batched::lent`]).
     pub fn bind_shared_lent(addr: impl Into<SocketAddr>, stamps: bool) -> Result<Self, RtError> {
         Self::lent(UdpSocket::bind_shared(addr)?, stamps)
+    }
+
+    /// Binds a socket to `addr`, joining a port a socket of this process shares
+    /// ([`UdpSocket::join_shared`]), lent its receive buffers ([`Batched::lent`]).
+    pub fn join_shared_lent(addr: impl Into<SocketAddr>, stamps: bool) -> Result<Self, RtError> {
+        Self::lent(UdpSocket::join_shared(addr)?, stamps)
     }
 
     /// Batches `udp` without receive buffers of its own: it receives into a [`Ring`] its owner lends

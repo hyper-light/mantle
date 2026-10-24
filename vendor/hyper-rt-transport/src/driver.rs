@@ -1,14 +1,16 @@
 //! The endpoint's driver: one owner, its sockets, one timer.
 //!
 //! **A socket for each peer.** Where the platform lets sockets share a port so that a connected
-//! one takes its peer's datagrams (Linux and the BSDs; `UdpSocket::bind_shared`), the driver's
-//! listener shares its port, and each connection the endpoint identifies gets a socket of its own,
-//! bound to that port and connected to its peer: the peer's datagrams then wait in a receive queue
-//! of their own, as a TCP connection's do, and the connection's windows are funded from that
-//! queue's room alone (hyper-transport's `Endpoint::set_peer_room`). A node's receive capacity so
-//! grows with the connections it holds, at the kernel's default buffer each, with nothing tuned and
-//! no privilege asked: one shared socket of Linux's default 208 KiB held about three connections'
-//! first windows. The listener keeps the handshakes and any peer whose socket could not be made.
+//! one takes its peer's datagrams (Linux and the BSDs), the driver's listener binds a port of its
+//! own and shares it (`UdpSocket::bind_shared`, so a second listener on that port is refused), and
+//! each connection the endpoint identifies gets a socket of its own, joined to that port
+//! (`UdpSocket::join_shared`) and connected to its peer: the peer's datagrams then wait in a
+//! receive queue of their own, as a TCP connection's do, and the connection's windows are funded
+//! from that queue's room alone (hyper-transport's `Endpoint::set_peer_room`). A node's receive
+//! capacity so grows with the connections it holds, at the kernel's default buffer each, with
+//! nothing tuned and no privilege asked: one shared socket of Linux's default 208 KiB held about
+//! three connections' first windows. The listener keeps the handshakes and any peer whose socket
+//! could not be made.
 //! Elsewhere (Windows, the simulation fabric) the listener takes every peer.
 //!
 //! **One set of buffers, and sends straight from the endpoint's.** Every socket receives into one
@@ -456,7 +458,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             {
                 continue;
             }
-            let Ok(mut socket) = Batched::bind_shared_lent(local, true) else {
+            let Ok(mut socket) = Batched::join_shared_lent(local, true) else {
                 continue;
             };
             if socket.connect(remote).is_err() {

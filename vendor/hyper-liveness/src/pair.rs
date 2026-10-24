@@ -16,6 +16,12 @@ pub(crate) fn nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// Format: RFC 8085 §3.1.3 (BCP 145), its second case, nanoseconds: an application that "cannot
+/// maintain an RTT estimate for a destination, because the destination does not send return
+/// traffic", "SHOULD NOT send more than one UDP datagram every 3 seconds". A stream to a peer from
+/// which nothing has come is such a sender, and backs off to it (`Pair::backed_off`).
+const UNANSWERED_NS: u64 = 3_000_000_000;
+
 /// What the node gives every pair's sender at a poll.
 pub(crate) struct Sender {
     pub(crate) local_run: u64,
@@ -159,6 +165,13 @@ struct Stream {
     next: Option<(u64, u64)>,
     /// The interval the next heartbeat is due at, after the one before it; zero before the first.
     interval_ns: u64,
+    /// The interval the floor and the peer's ask give it (`Pair::interval`): the one it sends at
+    /// once the peer is heard, and the one it backs off from while nothing has come
+    /// (`Pair::backed_off`); zero before the first.
+    base_ns: u64,
+    /// The heartbeats sent while nothing has come from the peer: the doublings its interval is
+    /// backed off by, none once it is heard.
+    unanswered: u32,
     /// The interval the peer asked for.
     asked_ns: u64,
     /// The durable count the latest heartbeat carried: the next must carry more.
@@ -172,6 +185,29 @@ struct Stream {
     /// the next, but the path's delay. A heartbeat sent past it, a skipped slot's or its own
     /// lateness, is late by as much at the peer (`docs/timing.md` §2.2).
     expected_ns: Option<u64>,
+}
+
+impl Stream {
+    /// The peer was heard for the first time, at `now_ns`: a stream backed off while it said nothing
+    /// sends its next heartbeat at once, and at the interval the floor and the ask give from then
+    /// on, so the peer, which judges this node from its own start, waits for no backed-off slot.
+    /// That heartbeat starts the schedule anew: it states the interval the stream sends at from
+    /// then on, and a send late past it, waiting on its flush, is late by as much, never slots
+    /// skipped. Stated as its spacing from the one before, a peer heard just after a heartbeat went
+    /// made the slot that short: heard 10 µs past it, an answer proven 500 µs later skipped 50 slots
+    /// (`a_stream_never_heard_backs_off_to_three_seconds_and_answers_its_peer_at_once`).
+    fn heard(&mut self, now_ns: u64) {
+        if std::mem::take(&mut self.unanswered) == 0 {
+            return;
+        }
+        if let Some((seq, due)) = self.next
+            && due > now_ns
+        {
+            self.next = Some((seq, now_ns));
+            self.interval_ns = self.base_ns.max(1);
+            self.expected_ns = Some(now_ns);
+        }
+    }
 }
 
 /// How a peer from which no heartbeat has come is judged: from when the node first attached the
@@ -483,10 +519,10 @@ impl Pair {
     /// minutes (§2.8). The peer asks from what this node's floor was, so once it asks past it the
     /// interval is the peer's again. A change smaller than `G`, the configurator's resolution, is
     /// none.
-    fn interval(&self, sender: &Sender) -> Option<(u64, bool)> {
+    fn interval(&self, sender: &Sender) -> Option<(u64, u64, bool)> {
         let floor = nanos(sender.floor?);
         let asked = self.stream.asked_ns;
-        let current = self.stream.interval_ns;
+        let current = self.stream.base_ns;
         let renewed = sender.durable_count >= self.stream.floor_from.saturating_mul(2);
         let (wanted, from_floor) = if asked >= floor {
             (asked, false)
@@ -496,12 +532,32 @@ impl Pair {
             (current, false)
         };
         let resolution = sender.granularity.map_or(0, nanos);
-        let interval = if current != 0 && wanted.abs_diff(current) <= resolution {
+        let base = if current != 0 && wanted.abs_diff(current) <= resolution {
             current
         } else {
             wanted
         };
-        Some((interval, from_floor))
+        Some((self.backed_off(base), base, from_floor))
+    }
+
+    /// The interval to send at to a peer from which nothing has come: `base` doubled for each
+    /// heartbeat sent it so far, the back-off of a sender whose datagrams go unanswered (RFC 8085
+    /// §3.1.3, its first case: "a predetermined transmission interval that is exponentially backed
+    /// off"; RFC 6298 §5.5's doubling), up to 3 s, the most such a sender may send at (that
+    /// section's second case, [`UNANSWERED_NS`]), and never below `base`, which a floor past 3 s
+    /// keeps (Lindley 1952). Once the peer is heard, `base`. At the floor alone, a node whose peers
+    /// were never heard, started before them or alone, or restarted before it learned where they
+    /// listen, flushed its log for each heartbeat for as long as they said nothing: ten thousand
+    /// times a second at an idle NVMe's floor of 80 to 115 µs (found by mantle).
+    fn backed_off(&self, base: u64) -> u64 {
+        if self.received.run.is_some() {
+            return base;
+        }
+        let doubled = 1u64
+            .checked_shl(self.stream.unanswered)
+            .and_then(|factor| base.checked_mul(factor))
+            .unwrap_or(u64::MAX);
+        doubled.min(UNANSWERED_NS.max(base))
     }
 
     /// Sends the heartbeat due, if a flush proves it: one made durable after the previous
@@ -518,7 +574,7 @@ impl Pair {
         if self.stream.next.is_some_and(|(_, due)| due > now_ns) {
             return Sent::Nothing;
         }
-        let Some((interval, from_floor)) = self.interval(sender) else {
+        let Some((interval, base, from_floor)) = self.interval(sender) else {
             // No flush measured yet: the first proves the first heartbeat and gives the floor.
             return Sent::NeedsFlush;
         };
@@ -548,6 +604,7 @@ impl Pair {
             self.stream.next = Some((seq, due));
             if self.stream.interval_ns == 0 {
                 self.stream.interval_ns = spacing;
+                self.stream.base_ns = base;
             }
             return Sent::NeedsFlush;
         };
@@ -607,6 +664,10 @@ impl Pair {
         self.stream.sent = Some(seq);
         self.stream.proof = sender.durable_count;
         self.stream.interval_ns = interval;
+        self.stream.base_ns = base;
+        if self.received.run.is_none() {
+            self.stream.unanswered = self.stream.unanswered.saturating_add(1);
+        }
         if from_floor {
             self.stream.floor_from = sender.durable_count;
         }
@@ -786,6 +847,7 @@ impl Pair {
         taken: &mut Taken,
     ) -> Result<(), Refusal> {
         changes[0] = self.judge(peer, arrival_ns, &context.local).0;
+        let first_heard = self.received.run.is_none();
         if self.begin_run(beat.run)? {
             // A new incarnation, which the owner's core trusts and holds to lead nothing it led.
             self.told = false;
@@ -794,6 +856,9 @@ impl Pair {
                 peer,
                 at_ns: arrival_ns,
             });
+        }
+        if first_heard {
+            self.stream.heard(arrival_ns);
         }
         if self.received.last.is_some_and(|last| beat.seq <= last.seq) {
             return Err(Refusal::Stale);
@@ -1303,11 +1368,83 @@ mod tests {
         );
     }
 
+    /// A stream to a peer never heard backs off (`Pair::backed_off`): its interval doubles from the
+    /// floor's at each heartbeat sent, to 3 s and no further; the peer's first heartbeat taken ends
+    /// it, and the next heartbeat is due at once, numbered next and stating the floor's interval,
+    /// however soon after the one before the peer was heard. Do: a floor of 1 ms, eighteen
+    /// heartbeats sent unanswered, each proven as it falls due; the peer's first heartbeat taken
+    /// 10 µs past the last one's due, and the answer proven 500 µs later, within the floor. Expect:
+    /// intervals of 1, 2, 4 ... ms to 3 s and then 3 s; the answer numbered next, no slot skipped,
+    /// stating 1 ms, and the stream at 1 ms after it. With the answer's spacing stated from the one
+    /// before, 10 µs, the same answer skipped 50 slots.
+    #[test]
+    fn a_stream_never_heard_backs_off_to_three_seconds_and_answers_its_peer_at_once() {
+        let granularity = Duration::from_micros(50);
+        let floor = Duration::from_millis(1);
+        let mut node = pair();
+        let mut now = 10_000 * MS;
+        let mut durable = 0u64;
+        let sent = |node: &mut Pair, now: u64, durable: &mut u64| {
+            *durable += 1;
+            let sender = Sender {
+                local_run: 1,
+                floor: Some(floor),
+                granularity: Some(granularity),
+                durable_count: *durable,
+                durable_ns: Some(now),
+            };
+            let mut out = [0; MAX_BYTES];
+            match node.send(&sender, now, &mut out) {
+                Sent::Message(length, _) => Heartbeat::decode(&out[..length]).unwrap(),
+                _ => panic!("due and proven at {now}"),
+            }
+        };
+        let mut stated = Vec::new();
+        for _ in 0..18 {
+            let beat = sent(&mut node, now, &mut durable);
+            stated.push(beat.interval_ns);
+            now = node.stream.next.map(|(_, due)| due).unwrap();
+        }
+        let expected: Vec<u64> = (0..18u32)
+            .map(|n| {
+                // The first states the floor's interval; each after it the spacing it was due at.
+                let doublings = n.saturating_sub(1);
+                (MS << doublings).min(UNANSWERED_NS)
+            })
+            .collect();
+        assert_eq!(stated, expected, "the back-off");
+        assert_eq!(node.stream.interval_ns, UNANSWERED_NS);
+        let last_seq = node.stream.sent.unwrap();
+        let last_due = now - UNANSWERED_NS;
+        let skipped = node.counts.skipped;
+        // The peer's first heartbeat, 10 µs past the last one's due.
+        let exposure = exposure();
+        let context = Context {
+            granularity: Some(granularity),
+            exposure: &exposure,
+            evidence: None,
+            local: steady(),
+        };
+        let (mut changes, mut taken) = ([None, None, None], Taken::default());
+        let heard = last_due + 10_000;
+        node.take(2, &beat(1, 0), heard, &context, &mut changes, &mut taken)
+            .unwrap();
+        assert_eq!(node.next_due(), Some(heard), "the answer due at once");
+        let answer = sent(&mut node, heard + MS / 2, &mut durable);
+        assert_eq!(
+            (answer.seq, answer.interval_ns, node.counts.skipped),
+            (last_seq + 1, MS, skipped),
+            "the answer numbered next, at the floor's interval, no slot skipped"
+        );
+        assert_eq!(node.stream.interval_ns, MS, "at the floor after it");
+    }
+
     /// A new log's first flushes are slow and its later ones fast (on a windows-2025 runner the
     /// first took 0.7 to 3.1 s and the floor then fell to 33 to 118 ms): the interval the floor
     /// gave at the first flush is renewed from the floor each time the flushes double, down as well
     /// as up, so it comes down to the floor in one move a doubling. Never followed down, it stayed
-    /// at the first flush's two seconds.
+    /// at the first flush's two seconds. The peer is one the node hears: a stream to one never heard
+    /// backs off from that interval (`Pair::backed_off`).
     #[test]
     fn a_floor_that_fell_is_followed_down_once_its_flushes_have_doubled() {
         let granularity = Duration::from_micros(50);
@@ -1315,6 +1452,7 @@ mod tests {
         // `E[flush] + G` after `n` flushes: the first and `n - 1` later ones.
         let floor = |n: u64| (first + later * (n - 1)) / n + nanos(granularity);
         let mut node = pair();
+        node.received.run = Some(1);
         let mut now = 10_000 * MS;
         let (mut moves, mut last) = (0, 0);
         let flushes = 256u64;

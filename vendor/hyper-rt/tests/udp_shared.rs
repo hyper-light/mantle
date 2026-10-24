@@ -1,6 +1,7 @@
-//! A shared UDP port (`UdpSocket::bind_shared`, docs/runtime.md §5.1): a listener and the sockets it
-//! connects to its peers bind one port with `SO_REUSEPORT`, each connected socket taking its own peer's
-//! datagrams. Unix only: Windows refuses a shared port.
+//! A shared UDP port (`UdpSocket::bind_shared`, docs/runtime.md §5.1): a listener binds a port of its
+//! own and shares it, the sockets it connects to its peers join it (`UdpSocket::join_shared`), each
+//! connected socket taking its own peer's datagrams, and no other listener may take it. Unix only:
+//! Windows refuses a shared port.
 #![cfg(unix)]
 // Test harness code: a panic here is a failed test (CLAUDE.md §1).
 #![allow(
@@ -93,7 +94,7 @@ fn a_socket_joining_a_shared_port_takes_its_connected_peers_datagrams() {
     let shared = listener.local_addr().unwrap();
     let peer = UdpSocket::bind(any()).unwrap();
     let stranger = UdpSocket::bind(any()).unwrap();
-    let mut own = UdpSocket::bind_shared(shared).unwrap();
+    let mut own = UdpSocket::join_shared(shared).unwrap();
     own.connect(peer.local_addr().unwrap()).unwrap();
     assert_eq!(
         own.local_addr().unwrap(),
@@ -109,5 +110,39 @@ fn a_socket_joining_a_shared_port_takes_its_connected_peers_datagrams() {
     assert_eq!(
         received(&listener),
         (b"from a stranger".to_vec(), stranger.local_addr().unwrap())
+    );
+}
+
+/// The OS's error kind of a refused call, where it named one.
+fn kind(error: &hyper_rt::RtError) -> Option<std::io::ErrorKind> {
+    match error {
+        hyper_rt::RtError::DriverRefused {
+            code: Some(code), ..
+        } => Some(std::io::Error::from_raw_os_error(*code).kind()),
+        _ => None,
+    }
+}
+
+/// A port a listener holds is its alone: a second listener asking for it by name is refused, as a
+/// plain bind is, where it bound and split the port's datagrams with the first when its flag was set
+/// before its bind (measured on Linux 6.19 and Darwin 25.4 at `2b13b15`: the second `SO_REUSEPORT`
+/// bind of a held named UDP port succeeded, a plain one failed `EADDRINUSE`). Do: bind a listener
+/// with `bind_shared` at port 0, then bind its port again with `bind_shared` and with a plain bind.
+/// Expect: both refused `AddrInUse`.
+#[test]
+fn a_shared_port_is_refused_to_a_second_listener() {
+    let first = UdpSocket::bind_shared(any()).unwrap();
+    let port = first.local_addr().unwrap();
+    let second = UdpSocket::bind_shared(port).map(|_| ());
+    assert_eq!(
+        second.as_ref().map_err(kind),
+        Err(Some(std::io::ErrorKind::AddrInUse)),
+        "{second:?}"
+    );
+    let plain = UdpSocket::bind(port).map(|_| ());
+    assert_eq!(
+        plain.as_ref().map_err(kind),
+        Err(Some(std::io::ErrorKind::AddrInUse)),
+        "{plain:?}"
     );
 }

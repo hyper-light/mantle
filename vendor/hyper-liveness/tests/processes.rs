@@ -2098,7 +2098,11 @@ const YOUNG_NODES: u64 = 3;
 /// windows, 56 heartbeats at the least): every survivor suspects it, within the bound it states
 /// where it states one, and no later than the first poll once both its freshness point has passed
 /// and a pair of its own has configured, the evidence the young link is judged by
-/// (`docs/timing.md` §2.8, "Judged before its own evidence").
+/// (`docs/timing.md` §2.8, "Judged before its own evidence"). That poll is a wake, which comes up to
+/// the latest its wakes were late past what it asked, whichever of the two came last: bounded with
+/// the lateness on the freshness point alone, a configuration stated after it was told one wake
+/// later on Windows, 15.7 ms past the state that showed it with wakes up to 16.0 and 16.7 ms late
+/// (windows-11-arm, run 40105342844; windows-2025, run 40104910073).
 #[test]
 #[allow(
     clippy::disallowed_methods,
@@ -2148,7 +2152,7 @@ fn a_node_killed_in_its_first_heartbeats_is_suspected_once_a_sibling_has_its_evi
             .copied()
             .unwrap_or(u64::MAX);
         assert!(
-            found.noticed <= (found.at + found.late).max(evidence),
+            found.noticed <= found.at.max(evidence).saturating_add(found.late),
             "member {member} noticed the young victim's death {:?} after the kill: its freshness \
              point {:?} after it, its wakes up to {:?} late, its sibling configured {:?} after it",
             Duration::from_nanos(found.noticed.saturating_sub(killed_at)),

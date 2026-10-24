@@ -86,9 +86,22 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `628111e` (hyper-raft branch `windows-udp-reset`: `2b13b15` and five commits for
-mantle, CI run 40093470660), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`: two
-of hyper-quic's patches on hyper-raft `main` taken to the line mantle vendors, Q25 (main's
+**Every crate at `dd764a0` (hyper-raft branch `windows-udp-reset-next`: `628111e` and three
+branches merged for mantle, CI run 40113149609, green on all 21 jobs), with no local delta**, taken
+by `scripts/snapshot-hyper-raft.py`: hyper-liveness's `f647365`, a heartbeat stream to a peer from
+which nothing has come doubling its interval from the floor to one every 3 s (RFC 8085 §3.1.3) with
+its flush requests, and answering the peer's first heartbeat at once, where a node that knew no
+peer's address heartbeated at its stream's floor with a flush each (9,957 heartbeats a peer and
+2.79 s of CPU a minute on fedora; 27 and 0.01 s after); hyper-rt's and hyper-rt-transport's
+`ab2eb0a` (main's `0802a05`), a listener binding its port before it shares it, so a second
+listener on a held port is refused `AddrInUse`; hyper-rt's `b0dc7a6` and `2921b36`, a console's
+close or a shutdown that a subscriber took held for the owner's orderly stop until it exits or
+the OS's time-out ends it (5 s by default; logoff not held, which only services receive and which
+would hold back the shutdown after it, the OS running one handler call at a time); and tests
+(`b0f6193`, `4397d16`, `0dfc6b3`, `c4be5db`). Before it, every crate was at `628111e` (hyper-raft
+branch `windows-udp-reset`: `2b13b15` and five commits for mantle, CI run 40093470660), with no
+local delta: two of
+hyper-quic's patches on hyper-raft `main` taken to the line mantle vendors, Q25 (main's
 `326ddd7`: a probe of the path's MTU waits for the congestion window and the pacer) and Q26 (main's
 `0427988`: a probe the window and the pacer can carry goes before new data), which end the silences
 of about 1.4 s that mantle's Windows CI found at a cell's first puts, a probe the window could not

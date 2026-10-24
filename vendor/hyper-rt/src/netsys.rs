@@ -513,10 +513,17 @@ mod imp {
         }
     }
 
+    /// Ports are shared here: Linux and the BSDs hand a connected socket its peer's datagrams.
+    pub(crate) fn port_sharing() -> Result<(), RtError> {
+        Ok(())
+    }
+
     /// Lets other sockets bind `socket`'s port as well (`SO_REUSEPORT`; on Linux those of the same
     /// effective user, socket(7)): a listener and the sockets it connects to its peers share one
-    /// port. Set before a bind to a named port, which a socket joining one needs, and after a bind to
-    /// port 0, so the kernel chooses a port no socket holds (`UdpSocket::bind_shared`).
+    /// port. Set on a socket before it joins a shared port (`UdpSocket::join_shared`), and on a
+    /// listener once it is bound to a port of its own (`UdpSocket::bind_shared`): Linux makes the
+    /// port's group when the first joiner binds, and the BSDs judge each bind by both sockets' flags
+    /// at that bind.
     pub(crate) fn share_port(socket: &Socket) -> Result<(), RtError> {
         rustix::net::sockopt::set_socket_reuseport(&socket.fd, true)
             .map_err(|e| refused("setsockopt(SO_REUSEPORT)", e))
@@ -1066,10 +1073,15 @@ pub(crate) mod imp {
 
     /// Sharing a port as the BSDs and Linux do is not Winsock's: `SO_REUSEADDR` there lets a second
     /// socket take the port's datagrams, not those of one peer, so a listener keeps its peers'.
-    pub(crate) fn share_port(_socket: &Socket) -> Result<(), RtError> {
+    pub(crate) fn port_sharing() -> Result<(), RtError> {
         Err(RtError::BadConfig {
             what: "a shared port: Winsock does not hand a connected socket its peer's datagrams",
         })
+    }
+
+    /// Never ([`port_sharing`]).
+    pub(crate) fn share_port(_socket: &Socket) -> Result<(), RtError> {
+        port_sharing()
     }
 
     /// Connects `socket` to `addr`.
@@ -1108,6 +1120,6 @@ pub(crate) use imp as winsock;
 pub(crate) use imp::dont_fragment;
 pub(crate) use imp::{OwnedDatagram, Socket};
 pub(crate) use imp::{
-    adopt, bind, connect, dgram_socket, into_owned, local_addr, path_payload, queued_bytes,
-    recv_buffer_bytes, recv_from, send, send_to, set_recv_buffer, share_port,
+    adopt, bind, connect, dgram_socket, into_owned, local_addr, path_payload, port_sharing,
+    queued_bytes, recv_buffer_bytes, recv_from, send, send_to, set_recv_buffer, share_port,
 };

@@ -1240,7 +1240,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let took = waited.elapsed();
             if took > std::time::Duration::from_millis(250) {
                 use std::io::Write as _;
-                let _ = writeln!(std::io::stderr(), "DIAG node {id} waited {took:?}");
+                let (listener, peers) = (self.driver.stats(), self.driver.peer_stats());
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "DIAG node {id} waited {took:?} astray {} peers' astray {} empty {}",
+                    listener.astray,
+                    peers.astray,
+                    listener.receives_empty
+                );
             }
         }
         self.liveness_written()?;

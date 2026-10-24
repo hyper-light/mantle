@@ -814,6 +814,9 @@ pub(crate) struct Cell {
     pub(crate) handing: Vec<(u64, u128, u64)>,
     pub(crate) handed: Vec<(u64, u128, u64)>,
     pub(crate) stopped: BTreeSet<u64>,
+    /// Each node and range whose status said the range had no leader, since the test last cleared
+    /// these: one entry a pair, however often it said so.
+    pub(crate) leaderless: BTreeSet<(u64, u128)>,
     /// Each node's configuration as `mantle init` wrote it, for a cell it made (`Cell::made`):
     /// its process serves from that file, which the test does not write.
     pub(crate) made: BTreeMap<u64, PathBuf>,
@@ -1064,6 +1067,7 @@ impl Cell {
             bases: BTreeMap::new(),
             handing: Vec::new(),
             handed: Vec::new(),
+            leaderless: BTreeSet::new(),
             stopped: BTreeSet::new(),
             made,
             _root: root,
@@ -1188,6 +1192,7 @@ impl Cell {
             bases: BTreeMap::new(),
             handing: Vec::new(),
             handed: Vec::new(),
+            leaderless: BTreeSet::new(),
             stopped: BTreeSet::new(),
             made: BTreeMap::new(),
             _root: root,
@@ -1554,7 +1559,10 @@ impl Cell {
                     Line::Link(peer, link) => {
                         self.links.insert((id, peer), link);
                     }
-                    Line::Status { group, .. } => {
+                    Line::Status { group, leader, .. } => {
+                        if leader == 0 {
+                            self.leaderless.insert((id, group));
+                        }
                         // A status that says only whether the node waits on its device begins
                         // or ends a stretch held still, and moves nothing.
                         let key = (id, group);

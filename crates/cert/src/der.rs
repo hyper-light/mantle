@@ -1,5 +1,6 @@
 //! DER (ITU-T X.690 §10) of the few types a certificate holds: each value a tag, its length in the
-//! shortest form, and its content.
+//! shortest form, and its content; written for an issue, and read back for the start's check of a
+//! certificate ([`next`]), which refuses any other form.
 
 use crate::CertError;
 
@@ -102,6 +103,72 @@ pub(crate) fn bits(out: &mut Vec<u8>, unused: u8, octets: &[u8]) -> Result<(), C
     tlv(out, BIT_STRING, &content)
 }
 
+/// A value read from DER: its tag, its content, and the whole of it, tag and length included.
+pub(crate) struct Read<'a> {
+    pub(crate) tag: u8,
+    pub(crate) content: &'a [u8],
+    pub(crate) whole: &'a [u8],
+}
+
+/// The value at the front of `input`, which then holds what follows it: a tag of one octet (X.690
+/// §8.1.2.2, every tag this profile's certificates hold) and a length in DER's shortest form (X.690
+/// §10.1), refused in any other, as is BER's indefinite form, which DER forbids.
+pub(crate) fn next<'a>(input: &mut &'a [u8]) -> Result<Read<'a>, CertError> {
+    let all = *input;
+    let (&tag, rest) = all.split_first().ok_or(CertError::Malformed)?;
+    if tag & 0x1f == 0x1f {
+        return Err(CertError::Malformed);
+    }
+    let (&first, mut rest) = rest.split_first().ok_or(CertError::Malformed)?;
+    let len = if first < 0x80 {
+        usize::from(first)
+    } else {
+        let count = usize::from(first & 0x7f);
+        if count == 0 || count > std::mem::size_of::<usize>() {
+            return Err(CertError::Malformed);
+        }
+        let octets = rest.get(..count).ok_or(CertError::Malformed)?;
+        rest = rest.get(count..).ok_or(CertError::Malformed)?;
+        if octets.first() == Some(&0) {
+            return Err(CertError::Malformed);
+        }
+        let mut len = 0usize;
+        for &octet in octets {
+            len = len
+                .checked_mul(256)
+                .and_then(|len| len.checked_add(usize::from(octet)))
+                .ok_or(CertError::Malformed)?;
+        }
+        // A length below 128 takes the one-octet form.
+        if len < 0x80 {
+            return Err(CertError::Malformed);
+        }
+        len
+    };
+    let content = rest.get(..len).ok_or(CertError::Malformed)?;
+    let after = rest.get(len..).ok_or(CertError::Malformed)?;
+    let whole_len = all
+        .len()
+        .checked_sub(after.len())
+        .ok_or(CertError::Malformed)?;
+    let whole = all.get(..whole_len).ok_or(CertError::Malformed)?;
+    *input = after;
+    Ok(Read {
+        tag,
+        content,
+        whole,
+    })
+}
+
+/// The value at the front of `input` as [`next`] reads it, refused unless its tag is `tag`.
+pub(crate) fn expect<'a>(input: &mut &'a [u8], tag: u8) -> Result<Read<'a>, CertError> {
+    let read = next(input)?;
+    if read.tag != tag {
+        return Err(CertError::Malformed);
+    }
+    Ok(read)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +236,39 @@ mod tests {
             unsigned(&mut out, magnitude).unwrap();
             assert_eq!(out, der, "{magnitude:?}");
         }
+    }
+
+    /// What [`next`] reads is what [`tlv`] wrote, in each length form, with what follows left; a
+    /// length not in its shortest form, an indefinite one, a multi-octet tag and a value past the
+    /// input's end are refused.
+    #[test]
+    fn a_value_reads_back_as_written_and_any_other_form_is_refused() {
+        for len in [0usize, 1, 127, 128, 255, 256, 70_000] {
+            let mut out = Vec::new();
+            tlv(&mut out, OCTET_STRING, &vec![9; len]).unwrap();
+            out.extend_from_slice(&[1, 2, 3]);
+            let mut input = out.as_slice();
+            let read = next(&mut input).unwrap();
+            assert_eq!(
+                (read.tag, read.content.len(), input),
+                (OCTET_STRING, len, &[1u8, 2, 3][..])
+            );
+            assert_eq!(read.whole.len(), out.len() - 3);
+        }
+        let refused: [&[u8]; 7] = [
+            &[OCTET_STRING, 0x81, 0x05, 1, 2, 3, 4, 5],
+            &[OCTET_STRING, 0x82, 0x00, 0x80],
+            &[SEQUENCE, 0x80, 0, 0],
+            &[0x1f, 0x01, 0x00],
+            &[OCTET_STRING, 0x03, 1, 2],
+            &[OCTET_STRING],
+            &[],
+        ];
+        for bytes in refused {
+            let mut input = bytes;
+            assert!(next(&mut input).is_err(), "{bytes:?}");
+        }
+        let mut input: &[u8] = &[INTEGER, 1, 5];
+        assert!(expect(&mut input, OCTET_STRING).is_err());
     }
 }

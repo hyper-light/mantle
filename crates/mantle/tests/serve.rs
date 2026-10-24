@@ -427,9 +427,10 @@ fn a_second_request_to_stop_ends_the_process_at_once() {
 /// A start that fails names its step (node.md §1.7), and the node serving on its directory serves
 /// on: a second process on that directory is refused at the locks, one whose key file is missing,
 /// or whose TLS key or root key others than its owner may read, at its identity (read before any
-/// lock; the key closed again, the start goes on to the locks), one whose configuration does not
-/// parse at the configuration, and one on a directory of its own whose plane's port the serving
-/// node holds at the network. Each ends non-zero before it listens.
+/// lock; the key closed again, the start goes on to the locks), as is one that states another
+/// cell's authority or pins a peer from another cell, one whose configuration does not parse at the
+/// configuration, and one on a directory of its own whose plane's port the serving node holds at
+/// the network. Each ends non-zero before it listens.
 #[test]
 fn a_start_that_fails_names_its_step_and_the_node_serving_serves_on() {
     let mut cell = Cell::made(|root| {
@@ -489,6 +490,63 @@ fn a_start_that_fails_names_its_step_and_the_node_serving_serves_on() {
         open_to_others(&key, false);
         refused(&config, "locks", "LOCK");
     }
+    // Another cell's authority, or a peer pinned from another cell, refuses the start at its
+    // identity, naming the certificate the authority stated did not issue.
+    let foreign = root.join("foreign");
+    let foreign_data = root.join("foreign-data");
+    std::fs::create_dir(&foreign_data).unwrap();
+    let made = Command::new(NODE)
+        .arg("init")
+        .arg(&foreign)
+        .args([
+            "--node",
+            &format!(
+                "quic=127.0.0.1:0,plane=127.0.0.1:0,domain=laptop,volume={}:256M",
+                foreign_data.display()
+            ),
+            "--max-nodes",
+            "1",
+            "--max-volumes",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        made.status.success(),
+        "mantle init: {}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    for (name, from) in [
+        ("foreign-authority.der", "authority.der"),
+        ("foreign-peer.der", "node.der"),
+    ] {
+        std::fs::copy(foreign.join("identity").join(from), dir.join(name)).unwrap();
+    }
+    let alien = dir.join("config-foreign-authority");
+    std::fs::write(
+        &alien,
+        text.replace(
+            "authority = identity/authority.der",
+            "authority = foreign-authority.der",
+        ),
+    )
+    .unwrap();
+    refused(
+        &alien,
+        "identity",
+        "identity/node.der: issued by another authority than the cell's",
+    );
+    let pinned = dir.join("config-foreign-peer");
+    std::fs::write(
+        &pinned,
+        format!("{}\npeer = 9 node foreign-peer.der\n", text.trim_end()),
+    )
+    .unwrap();
+    refused(
+        &pinned,
+        "identity",
+        "foreign-peer.der: issued by another authority than the cell's",
+    );
     let missing = dir.join("config-missing-key");
     std::fs::write(
         &missing,

@@ -152,6 +152,9 @@ pub enum ProcessError {
     /// A key file that could not be read, or that others than its owner may read.
     #[error("{}: {}", .0.display(), .1)]
     Secret(PathBuf, SecretError),
+    /// A certificate the cell's authority did not issue, or one outside its validity.
+    #[error("{}: {}", .0.display(), .1)]
+    Certificate(PathBuf, mantle_cert::CertError),
     #[error("the settings: {0}")]
     Derive(#[from] crate::derive::DeriveError),
     #[error("the device under {0}: {1}")]
@@ -229,18 +232,34 @@ struct Identity {
 }
 
 /// Reads the identity the configuration names: the node's `certificate` and `key`, the cell's
-/// `authority`, each of `peers`' certificates and each of `keys`' generations.
+/// `authority`, each of `peers`' certificates and each of `keys`' generations. The node's
+/// certificate and each peer's are refused unless the authority issued them and they are valid by
+/// this machine's clock (`mantle_cert::issued_by`, RFC 5280 §6.1.3 (a)), so a directory holding
+/// another cell's identity, or a peer pinned from another cell, refuses the start rather than
+/// every handshake.
 fn identity(
     (certificate, key, authority): (&Path, &Path, &Path),
     peers: &[PeerLine],
     keys: &[(u32, PathBuf)],
 ) -> Result<Identity, ProcessError> {
+    let authority = read_file(authority)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| ProcessError::Runtime(e.to_string()))?
+        .as_secs();
+    let issued = |path: &Path| -> Result<Vec<u8>, ProcessError> {
+        let der = read_file(path)?;
+        mantle_cert::issued_by(&der, &authority, now)
+            .map_err(|e| ProcessError::Certificate(path.to_path_buf(), e))?;
+        Ok(der)
+    };
+    let chain = vec![CertificateDer::from(issued(certificate)?)];
     let mut known = Vec::with_capacity(peers.len());
     for peer in peers {
         known.push(Peer {
             id: peer.id,
             role: peer.role,
-            certificate: read_file(&peer.certificate)?,
+            certificate: issued(&peer.certificate)?,
         });
     }
     let mut root = Vec::with_capacity(keys.len());
@@ -249,9 +268,9 @@ fn identity(
     }
     Ok(Identity {
         credentials: Credentials {
-            chain: vec![CertificateDer::from(read_file(certificate)?)],
+            chain,
             key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(read_secret(key)?)),
-            roots: vec![CertificateDer::from(read_file(authority)?)],
+            roots: vec![CertificateDer::from(authority)],
         },
         peers: known,
         keys: root,

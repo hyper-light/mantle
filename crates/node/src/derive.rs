@@ -2717,8 +2717,6 @@ mod tests {
         }
     }
 
-    /// A node of a three-node cell hosting its five founding ranges, `volumes` volumes of 8 GiB and,
-    /// with them, objects.
     /// `path`, rooted, as an absolute path on this platform: on Windows one with no drive is the
     /// config's drive's, which a configuration read back resolves it against, so the test names one.
     fn at(path: &str) -> PathBuf {
@@ -2726,6 +2724,8 @@ mod tests {
         PathBuf::from(format!("{root}{path}"))
     }
 
+    /// A node of a three-node cell hosting its five founding ranges, `volumes` volumes of 8 GiB and,
+    /// with them, objects.
     fn stated(volumes: usize) -> Stated {
         Stated {
             id: 1,

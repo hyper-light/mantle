@@ -142,8 +142,8 @@ fn log_id(node: u64) -> u128 {
 }
 
 /// A node's log in the simulation: hyper-log on its simulated device, every write's answer taken as
-/// it is asked, so a run never hangs on when the log's threads answered and a seed runs the same
-/// every time; and the faults the test arms on the device, each armed at the log's next call,
+/// it is asked (a liveness write's once the clock has passed it), so a run never hangs on when the
+/// log's threads answered and a seed runs the same every time; and the faults the test arms on the device, each armed at the log's next call,
 /// between its own writes (hyper-log's `Log::with_file`), at the same point in every run.
 struct SimLog {
     log: Log<SimFile>,
@@ -162,12 +162,22 @@ impl SimLog {
     }
 }
 
-/// A liveness write, answered before it was given.
-struct Answered(Cell<Option<Result<(), LogError>>>);
+/// A liveness write, made durable as it was given, and its answer taken once the shard's clock has
+/// passed that moment, as a device's completion comes after its submission. Taken at the very
+/// instant it was asked, a turn took it with no time passed, and the stream, which asks its next
+/// proof as a heartbeat it sends needs one, asked again at that same instant, again and again.
+struct Answered {
+    answer: Cell<Option<Result<(), LogError>>>,
+    given_ns: u64,
+}
 
 impl Written for Answered {
     fn poll(&self) -> Option<Result<(), LogError>> {
-        self.0.take()
+        if hyper_rt::futures::now_ns() > self.given_ns {
+            self.answer.take()
+        } else {
+            None
+        }
     }
 }
 
@@ -193,7 +203,10 @@ impl NodeLog for SimLog {
             Update::default(),
             Waker::noop().clone(),
         )?;
-        Ok(Answered(Cell::new(Some(pending.wait()))))
+        Ok(Answered {
+            answer: Cell::new(Some(pending.wait())),
+            given_ns: hyper_rt::futures::now_ns(),
+        })
     }
 
     fn stats(&self, into: Option<Box<LogStats>>) -> Result<Box<LogStats>, LogError> {

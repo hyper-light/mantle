@@ -104,6 +104,9 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/disk/src/probe/macos.rs` `MAX_STRING` | bound | 256-byte buffer for IOKit string properties, far above IOKit names and model strings; a longer one fails without writing. |
 | `crates/disk/src/probe/macos.rs` `UTF8` | external | kCFStringEncodingUTF8 (0x08000100), CoreFoundation CFString.h. |
 | `crates/disk/src/probe/windows.rs` `VOLUME_GUID_CHARS` | external | 50 characters, the size GetVolumeNameForVolumeMountPointW's documentation gives for the largest volume GUID path (Microsoft Learn). |
+| `crates/disk/src/profile.rs` `FIXED` | format | A device profile record's bytes beside its key: magic 8, version 2, key length 2, depth, read bytes and read gap 8 each, prewrite 1 (node.md §1.6). |
+| `crates/disk/src/profile.rs` `MAX_KEY` | format | 65,535: the longest key a profile record's u16 length carries; a device whose identity's line is longer is measured at each start. |
+| `crates/disk/src/profile.rs` `VERSION` | format | The device profile record's layout version: a record of another is measured again. |
 | `crates/disk/src/rounds.rs` `MAX_ROUNDS` | bound | 120 rounds, the most for which the exact binomial and runs-test sums fit in u128 (40 · 2^n). |
 | `crates/ec/src/durability.rs` `DISK_FAILURES` | cited | 6.3% a year: the highest per-model annualized failure rate in Backblaze's 2025 Drive Stats (Toshiba MG08ACA16TEY); research/15 §8.1, design/durability.md §5. |
 | `crates/ec/src/durability.rs` `FLASH_FAILURES` | cited | 2.7% a year: Schroeder et al. FAST 2016 Table 5's worst four-year replacement fraction, 10.31%, as a constant hazard; research/15 §8.2. |

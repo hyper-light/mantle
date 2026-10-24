@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use common::device::{Handle, SimDevice};
 use common::{SIZE, config, data, issuer, key, put_retrying, sim};
+use hyper_block::block::BlockFile;
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::sim::Fault;
@@ -984,4 +985,21 @@ fn cleaning_deletes_no_client_chunk() {
     let report = v.clean(1).unwrap();
     assert!(report.segments >= 1, "{report:?}");
     assert_eq!(v.read(&edge, 0, 100).unwrap(), data(77, 100));
+}
+
+/// What a volume fixed at format is read back as its superblocks record it, whatever it is
+/// opened with after: the geometry its configuration planned and its checksum blocks
+/// (`mantle_chunk::formatted`).
+#[test]
+fn a_volumes_format_reads_back_as_its_superblocks_record_it() {
+    let file = sim(3);
+    let v = Volume::format(issuer(), file.clone(), SIZE, config()).unwrap();
+    v.close();
+    let planned = Geometry::plan(SIZE, file.alignment(), &config()).unwrap();
+    assert_eq!(
+        mantle_chunk::formatted(&file).unwrap(),
+        (planned, config().checksum_shift)
+    );
+    // A file holding no volume has none.
+    assert!(mantle_chunk::formatted(&sim(4)).is_err());
 }

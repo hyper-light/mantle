@@ -40,4 +40,4 @@ pub use layout::{Config, Limits, Reads};
 pub use read::ReadStats;
 pub use reader::{ReadAnswer, ReadId, Reader};
 pub use recover::RecoveryReport;
-pub use volume::{Answer, ChunkStat, ReadBuffers, Usage, Volume};
+pub use volume::{Answer, ChunkStat, ReadBuffers, Usage, Volume, formatted};

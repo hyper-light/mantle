@@ -104,6 +104,8 @@ pub struct Storage {
     /// `Busy` anyway (`Volume::queue_bytes`).
     taken: u64,
     room: u64,
+    /// The chunk exchanges the volumes take at once (`mantle_chunk::Config::transfers`).
+    transfers: usize,
 }
 
 struct Held {
@@ -131,17 +133,28 @@ impl Storage {
     /// volumes), and opens its volume, recovering it, or lays it out at its first start. A step
     /// that fails leaves what the steps before it opened to close as `Storage` drops.
     pub fn open(settings: &[VolumeSettings]) -> Result<Self, StorageError> {
+        Self::open_locked(settings, Locks::default())
+    }
+
+    /// [`Storage::open`], each volume under the lock `locks` holds of its device directory, or one
+    /// taken now where it holds none.
+    pub fn open_locked(
+        settings: &[VolumeSettings],
+        mut locks: Locks,
+    ) -> Result<Self, StorageError> {
         let mut storage = Self::none();
         for volume in settings {
-            storage.open_one(volume)?;
+            let lock = match locks.give(&volume.dir) {
+                Some(lock) => lock,
+                None => Locks::take_one(&volume.dir)?,
+            };
+            storage.open_one(volume, lock)?;
         }
         Ok(storage)
     }
 
-    fn open_one(&mut self, settings: &VolumeSettings) -> Result<(), StorageError> {
-        let dir = settings.dir.join(MANTLE);
-        std::fs::create_dir_all(&dir).map_err(io("create", &dir))?;
-        let lock = lock(&dir.join(LOCK))?;
+    fn open_one(&mut self, settings: &VolumeSettings, lock: File) -> Result<(), StorageError> {
+        let dir = mantle_dir(&settings.dir);
         let identity = mantle_disk::probe::identify(&settings.dir);
         let align = identity.transfer_alignment();
         let device = match identity.device {
@@ -183,6 +196,7 @@ impl Storage {
                 source,
             })?;
         self.room = self.room.saturating_add(volume.queue_bytes());
+        self.transfers = self.transfers.saturating_add(settings.config.transfers());
         self.volumes.push(Held {
             id,
             dir: settings.dir.clone(),
@@ -229,16 +243,7 @@ impl Storage {
     /// The chunk exchanges the node's volumes take at once: each one's writer queue and its reads
     /// at the device and waiting, past which it refuses `Busy`.
     pub(crate) fn transfers(&self) -> usize {
-        self.volumes
-            .iter()
-            .map(|h| {
-                let reads = h.reader.reads();
-                h.volume
-                    .queue_requests()
-                    .saturating_add(reads.depth)
-                    .saturating_add(reads.waiting)
-            })
-            .fold(0, usize::saturating_add)
+        self.transfers
     }
 
     /// The largest chunk a record on any of the node's volumes holds, none without volumes.
@@ -334,6 +339,52 @@ impl Storage {
                 }
             }
         }
+    }
+}
+
+/// A device directory's `mantle/`: its lock, its profile (`mantle_disk::profile`) and its volume.
+pub fn mantle_dir(dir: &Path) -> PathBuf {
+    dir.join(MANTLE)
+}
+
+/// A device directory's volume, once laid out.
+pub fn volume_path(dir: &Path) -> PathBuf {
+    mantle_dir(dir).join(VOLUME)
+}
+
+/// Device directories' locks, taken before anything reads or measures their devices (node.md §1.7
+/// step 1): each one's `mantle/LOCK`, held while kept here and then by the volume opened under it
+/// ([`Storage::open_locked`]).
+#[derive(Default)]
+pub struct Locks {
+    held: Vec<(PathBuf, File)>,
+}
+
+impl Locks {
+    /// Takes the lock of each of `dirs`, creating its `mantle/`: refused at the first another
+    /// process holds.
+    pub fn take<'a>(dirs: impl IntoIterator<Item = &'a Path>) -> Result<Self, StorageError> {
+        let mut locks = Self::default();
+        for dir in dirs {
+            if locks.held.iter().any(|(held, _)| held == dir) {
+                continue;
+            }
+            let lock = Self::take_one(dir)?;
+            locks.held.push((dir.to_path_buf(), lock));
+        }
+        Ok(locks)
+    }
+
+    fn take_one(dir: &Path) -> Result<File, StorageError> {
+        let mantle = mantle_dir(dir);
+        std::fs::create_dir_all(&mantle).map_err(io("create", &mantle))?;
+        lock(&mantle.join(LOCK))
+    }
+
+    /// `dir`'s lock, given up by these to the volume opened under it.
+    fn give(&mut self, dir: &Path) -> Option<File> {
+        let at = self.held.iter().position(|(held, _)| held == dir)?;
+        Some(self.held.swap_remove(at).1)
     }
 }
 

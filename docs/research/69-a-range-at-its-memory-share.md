@@ -53,3 +53,20 @@ once its compactions have changed them.
 **Reading:** what a range holds past its share when it refuses is at most the packing of one
 memtable admitted before the check and what its compactions hold of their inputs and outputs at
 once, each within the statement for the extents they hold (`shard_db::resident_per_extent`).
+
+## 4. A replicated range refuses before it proposes
+
+- Raft's replicated state machines: "Each server stores a log containing a series of commands,
+  which its state machine executes in order. Each log contains the same commands in the same order,
+  so each state machine processes the same sequence of commands. Since the state machines are
+  deterministic, each computes the same state and the same sequence of outputs." (Ongaro and
+  Ousterhout, "In Search of an Understandable Consensus Algorithm (Extended Version)", 2014, §2.)
+
+**Reading:** a range's metadata at a moment is what its rows and its compactions' progress leave,
+and each member compacts on its own schedule, so two members applying the same entry may stand on
+either side of their share: a refusal at apply would make one member's state differ from the
+other's, which the paragraph above rules out. A replicated range therefore refuses a put where its
+leader admits a command, before the entry is proposed, its members applying every entry they
+commit; what a member holds past its share is then bounded by the statement for the extents it
+holds (§3). Until the leader's admission is built, a node's engines are sized by their shares
+(`derive::engine_within`) and are given no limit (node.md §1.4).

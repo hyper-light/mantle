@@ -209,6 +209,16 @@ impl Config {
         }
         Ok(())
     }
+
+    /// The chunk exchanges a volume of this configuration takes at once: its writer's queue
+    /// (`Limits::queue_requests`) and its reads at the device and waiting, past which it refuses
+    /// `Busy`.
+    pub fn transfers(&self) -> usize {
+        self.limits
+            .queue_requests()
+            .saturating_add(self.reads.depth)
+            .saturating_add(self.reads.waiting)
+    }
 }
 
 impl Default for Config {

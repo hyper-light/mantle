@@ -18,4 +18,5 @@ pub mod histogram;
 pub mod identity;
 pub mod measure;
 pub mod probe;
+pub mod profile;
 pub mod rounds;

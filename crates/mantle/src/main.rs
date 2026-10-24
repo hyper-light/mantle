@@ -58,6 +58,14 @@ enum Command {
         /// The node's configuration: one `key = value` a line.
         config: PathBuf,
     },
+    /// Run a node from what its operator states alone (mantle_node::process::serve_stated): its
+    /// devices measured, or their kept profiles taken while they match, and every other value
+    /// derived from those and the host's memory, cores and page, each said with its basis, a
+    /// `basis` line each, before it runs as `mantle node` does.
+    Serve {
+        /// The node's configuration: the operator's keys only, one `key = value` a line.
+        config: PathBuf,
+    },
     /// Estimate how likely a block is to be lost in a year under each scheme mantle can store
     /// it in, and the scheme that meets the durability target at least cost.
     Durability {
@@ -264,13 +272,19 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     // A node writes its lines through the runtime's own writer thread: this thread holds no
     // lock on standard output for it.
-    if let Command::Node { config } = &cli.command {
-        return exit(mantle_node::process::run(config).map_err(|e| e.to_string()));
+    match &cli.command {
+        Command::Node { config } => {
+            return exit(mantle_node::process::run(config).map_err(|e| e.to_string()));
+        }
+        Command::Serve { config } => {
+            return exit(mantle_node::process::serve_stated(config).map_err(|e| e.to_string()));
+        }
+        _ => {}
     }
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let result = match cli.command {
-        Command::Node { .. } => Ok(()),
+        Command::Node { .. } | Command::Serve { .. } => Ok(()),
         Command::Disk {
             command:
                 DiskCommand::Probe {

@@ -913,6 +913,14 @@ fn prewrite(
     Ok(())
 }
 
+/// What the volume in `file` fixed at format, as its newest superblock records it: where
+/// everything is, and its records' checksum blocks, which it keeps when opened again with any
+/// configuration (`Volume::open`).
+pub fn formatted<F: BlockFile>(file: &F) -> Result<(Geometry, u8), ChunkError> {
+    let superblock = read_superblock(file)?;
+    Ok((Geometry::of(&superblock), superblock.checksum_shift))
+}
+
 /// The valid superblock copy with the higher sequence. When its twin does not read, it may be
 /// the older copy, one write behind a newer one now damaged or torn, whose reservations it
 /// lacks (writer.rs `reserve`): records may carry numbers past its own. The newer copy's are

@@ -3,7 +3,8 @@
 //! apply through the engine's synchronous calls.
 //!
 //! **The file** states every number the node is run with, one `key = value` a line (`#` begins a
-//! comment): nothing is assumed for the operator. A `peer` line, repeated, names a peer's id, its
+//! comment): nothing is assumed for the operator, and a key it does not know is refused at its
+//! line ([`KEYS`], [`REPEATED`]). A `peer` line, repeated, names a peer's id, its
 //! role (`node`, `gateway` or `client`) and its certificate's file. Certificates and the key are
 //! DER (the key PKCS #8). A `volume` line, repeated, names a chunk volume of the node's storage
 //! role (node.md §1.1): `volume = DIR SIZE DEPTH READ_BYTES READ_GAP PREWRITE`, its device
@@ -20,8 +21,15 @@
 //! bytes only its owner may read (encryption.md §2), and states its `gateway.` and `durability.`
 //! keys: how long a block is held for its file's write, the blocks an object holds going down or
 //! being read, the operations it runs at once, the buckets an owner may have, the rows a bucket's
-//! coordinator passes in a read, and the chunk loss and repair rates, per hour, and the annual
-//! loss probability a block's scheme is chosen to meet.
+//! coordinator passes in a read, and the chunk loss and repair rates, per hour, each event that
+//! strikes chunks across domains at once, `durability.burst = RATE FRACTION` (its rate per hour and
+//! the share of the nodes it destroys; none where no line names one), and the annual loss
+//! probability a block's scheme is chosen to meet.
+//!
+//! **`mantle serve`** ([`serve_stated`]) reads a file of its operator's statements alone
+//! ([`STATED_KEYS`], [`STATED_REPEATED`]), measures what it needs of its host and devices, derives
+//! every other value (`crate::derive::derive`), says each on standard output, `basis KEY = VALUE
+//! (KIND: WHY)`, before anything opens, and runs as `mantle node` does.
 //!
 //! **Its talk** is lines. On standard output: `bound QUIC PLANE` once the node listens, and
 //! `volume ID` for each volume it holds, its 128-bit id in hex; then, for each range it hosts,
@@ -63,6 +71,7 @@
 //! it.
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
@@ -74,8 +83,8 @@ use hyper_rt::combine::{Either, race2};
 use hyper_rt::machine::calibration::{Calibration, Policy};
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
 use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer};
-use mantle_ec::durability::Rates;
-use mantle_engine::store::Config as StoreConfig;
+use mantle_ec::durability::{Burst, Rates};
+use mantle_engine::store::{Config as StoreConfig, Shape, Store};
 use mantle_engine::trunk::TrunkConfig;
 use mantle_meta::apply::Layer;
 use mantle_meta::engine::Engine;
@@ -88,9 +97,10 @@ use mantle_s3::seal::WrappingKey;
 
 use crate::ask::CommandOutcome;
 use crate::classes::Role;
+use crate::derive::{Device, Formatted, Measured, Stated, VolumeFacts};
 use crate::directory::Peer;
 use crate::node::{GatewaySettings, Hosted, Link, Node, NodeError, NodeSettings, Status, Wall};
-use crate::storage::{Storage, StorageError, VolumeSettings};
+use crate::storage::{Locks, Storage, StorageError, VolumeSettings};
 
 /// Why the process stopped.
 #[derive(Debug, thiserror::Error)]
@@ -117,6 +127,12 @@ pub enum ProcessError {
     Enlist(String),
     #[error("the root key {0}: {1}")]
     Key(PathBuf, String),
+    #[error("the settings: {0}")]
+    Derive(#[from] crate::derive::DeriveError),
+    #[error("the device under {0}: {1}")]
+    Device(PathBuf, String),
+    #[error("standard output: {0}")]
+    Say(String),
 }
 
 /// What the file states.
@@ -169,11 +185,14 @@ pub struct GatewayConfig {
     pub scan_rows: u32,
     pub chunk_rate: f64,
     pub repair_rate: f64,
+    /// Events that strike chunks across domains at once (`durability.burst` lines).
+    pub bursts: Vec<Burst>,
     pub target: f64,
 }
 
 /// How a node enlists itself and its volumes in the cell's volume table (node.md §6.6): the root
 /// range it hosts, its failure domain, and the cell's bounds on the table.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Enlisting {
     pub root: u128,
     pub domain: String,
@@ -181,23 +200,112 @@ pub struct Enlisting {
     pub max_volumes: u32,
 }
 
-/// The file's values by key, each with the line it was on; `peer`, `range`, `volume` and
-/// `root_key` lines kept apart.
+/// The keys `mantle node`'s file states once each (node.md §1.4's table): a key it does not know
+/// is refused.
+pub const KEYS: &[&str] = &[
+    "id",
+    "dir",
+    "quic",
+    "plane",
+    "authority",
+    "certificate",
+    "key",
+    "voters",
+    "range.election_tick",
+    "range.heartbeat_tick",
+    "range.max_size_per_msg",
+    "range.max_inflight_msgs",
+    "range.max_uncommitted_size",
+    "range.max_committed_size_per_ready",
+    "range.max_entry_bytes",
+    "rules.lifetime_ns",
+    "rules.max_sessions",
+    "rules.max_answers",
+    "rules.max_answer_bytes",
+    "rules.expiries_per_entry",
+    "rules.max_key_bytes",
+    "rules.max_value_bytes",
+    "log.segment_bytes",
+    "log.max_segments",
+    "log.max_groups",
+    "log.group_entries",
+    "log.group_bytes",
+    "log.group_cache",
+    "log.queue_submissions",
+    "log.waits",
+    "engine.page_size",
+    "engine.extent_pages",
+    "engine.max_extents",
+    "engine.memtable_bytes",
+    "engine.fanout",
+    "engine.leaf_entries",
+    "transport_bytes",
+    "runtime.probe_budget_ms",
+    "chunk_bytes",
+    "chunk_asks",
+    "command_asks",
+    "read_asks",
+    "domain",
+    "root.max_nodes",
+    "root.max_volumes",
+    "volume.segment_bytes",
+    "volume.checksum_shift",
+    "volume.max_fragments",
+    "volume.compact",
+    "volume.scrub_period_s",
+    "volume.batch_requests",
+    "volume.batch_bytes",
+    "volume.fragments_per_chunk",
+    "gateway.handover_ns",
+    "gateway.window",
+    "gateway.objects",
+    "gateway.bucket_quota",
+    "gateway.scan_rows",
+    "durability.chunk_rate",
+    "durability.repair_rate",
+    "durability.target",
+];
+
+/// The lines `mantle node`'s file repeats: its peers, ranges and volumes, its root key's
+/// generations and the durability model's bursts.
+pub const REPEATED: &[&str] = &["peer", "range", "volume", "root_key", "durability.burst"];
+
+/// The keys `mantle serve`'s file states once each, its operator's alone (node.md §1.4's first
+/// column): every other value is measured or derived, and a key of those is refused. `memory`
+/// is the most the node may hold, and `durability.target` a block's annual chance of loss at most,
+/// each where stated.
+pub const STATED_KEYS: &[&str] = &[
+    "id",
+    "dir",
+    "quic",
+    "plane",
+    "authority",
+    "certificate",
+    "key",
+    "voters",
+    "domain",
+    "root.max_nodes",
+    "root.max_volumes",
+    "memory",
+    "durability.target",
+];
+
+/// The lines `mantle serve`'s file repeats: its peers and ranges, its volumes, each `volume = DIR
+/// SIZE`, and its root key's generations.
+pub const STATED_REPEATED: &[&str] = &["peer", "range", "volume", "root_key"];
+
+/// The file's values by key, each with the line it was on, and its repeated lines by their key.
 struct Lines {
     values: BTreeMap<String, (usize, String)>,
-    peers: Vec<(usize, String)>,
-    ranges: Vec<(usize, String)>,
-    volumes: Vec<(usize, String)>,
-    keys: Vec<(usize, String)>,
+    repeated: BTreeMap<&'static str, Vec<(usize, String)>>,
 }
 
 impl Lines {
-    fn parse(text: &str) -> Result<Self, ProcessError> {
+    /// `text`'s lines, each `key = value` (`#` begins a comment): a key of `known` once, one of
+    /// `repeated` any number of times, and any other refused at its line.
+    fn parse(text: &str, known: &[&str], repeated: &[&'static str]) -> Result<Self, ProcessError> {
         let mut values = BTreeMap::new();
-        let mut peers = Vec::new();
-        let mut ranges = Vec::new();
-        let mut volumes = Vec::new();
-        let mut keys = Vec::new();
+        let mut lines: BTreeMap<&'static str, Vec<(usize, String)>> = BTreeMap::new();
         for (at, line) in text.lines().enumerate() {
             let number = at.saturating_add(1);
             let line = line.split('#').next().unwrap_or_default().trim();
@@ -208,25 +316,26 @@ impl Lines {
                 return Err(ProcessError::Line(number, "not key = value".into()));
             };
             let (key, value) = (key.trim(), value.trim().to_owned());
-            if key == "peer" {
-                peers.push((number, value));
-            } else if key == "range" {
-                ranges.push((number, value));
-            } else if key == "volume" {
-                volumes.push((number, value));
-            } else if key == "root_key" {
-                keys.push((number, value));
+            if let Some(&kind) = repeated.iter().find(|kind| **kind == key) {
+                lines.entry(kind).or_default().push((number, value));
+            } else if !known.contains(&key) {
+                return Err(ProcessError::Line(
+                    number,
+                    format!("{key} is not a key this configuration states"),
+                ));
             } else if values.insert(key.to_owned(), (number, value)).is_some() {
                 return Err(ProcessError::Line(number, format!("{key} stated twice")));
             }
         }
         Ok(Self {
             values,
-            peers,
-            ranges,
-            volumes,
-            keys,
+            repeated: lines,
         })
+    }
+
+    /// The repeated lines of `key`, each with the line it was on.
+    fn all(&self, key: &str) -> &[(usize, String)] {
+        self.repeated.get(key).map_or(&[], Vec::as_slice)
     }
 
     fn text(&self, key: &'static str) -> Result<&str, ProcessError> {
@@ -244,6 +353,81 @@ impl Lines {
             .parse()
             .map_err(|e: T::Err| ProcessError::Value(key, e.to_string()))
     }
+
+    /// `key`'s value where stated.
+    fn maybe<T: std::str::FromStr>(&self, key: &'static str) -> Result<Option<T>, ProcessError>
+    where
+        T::Err: std::fmt::Display,
+    {
+        match self.values.contains_key(key) {
+            true => self.get(key).map(Some),
+            false => Ok(None),
+        }
+    }
+}
+
+/// The `peer` lines, each `peer = ID ROLE CERTIFICATE`.
+fn peers(lines: &Lines) -> Result<Vec<(u64, Role, PathBuf)>, ProcessError> {
+    let mut peers = Vec::with_capacity(lines.all("peer").len());
+    for (number, value) in lines.all("peer") {
+        let mut fields = value.split_whitespace();
+        let (Some(id), Some(role), Some(certificate), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(ProcessError::Line(
+                *number,
+                "peer = ID ROLE CERTIFICATE".into(),
+            ));
+        };
+        let id = id
+            .parse()
+            .map_err(|_| ProcessError::Line(*number, "a peer's id".into()))?;
+        let role = match role {
+            "node" => Role::Node,
+            "gateway" => Role::Gateway,
+            "client" => Role::Client,
+            _ => {
+                return Err(ProcessError::Line(
+                    *number,
+                    "a role: node, gateway or client".into(),
+                ));
+            }
+        };
+        peers.push((id, role, PathBuf::from(certificate)));
+    }
+    Ok(peers)
+}
+
+/// The `voters` key: ids, comma-separated.
+fn voters(lines: &Lines) -> Result<Vec<u64>, ProcessError> {
+    lines
+        .text("voters")?
+        .split(',')
+        .map(|v| v.trim().parse())
+        .collect::<Result<Vec<u64>, _>>()
+        .map_err(|e| ProcessError::Value("voters", e.to_string()))
+}
+
+/// The `root_key` lines, each `root_key = GENERATION FILE`, generations in increasing order, the
+/// last the current one.
+fn root_keys(lines: &Lines) -> Result<Vec<(u32, PathBuf)>, ProcessError> {
+    let mut keys: Vec<(u32, PathBuf)> = Vec::with_capacity(lines.all("root_key").len());
+    for (number, value) in lines.all("root_key") {
+        let bad = || ProcessError::Line(*number, "root_key = GENERATION FILE".into());
+        let fields: Vec<&str> = value.split_whitespace().collect();
+        let [generation, file] = fields.as_slice() else {
+            return Err(bad());
+        };
+        let generation: u32 = generation.parse().map_err(|_| bad())?;
+        if keys.last().is_some_and(|(last, _)| *last >= generation) {
+            return Err(ProcessError::Line(
+                *number,
+                "root key generations in increasing order".into(),
+            ));
+        }
+        keys.push((generation, PathBuf::from(file)));
+    }
+    Ok(keys)
 }
 
 impl ProcessConfig {
@@ -251,40 +435,9 @@ impl ProcessConfig {
     pub fn read(path: &Path) -> Result<Self, ProcessError> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| ProcessError::Read(path.to_path_buf(), e.to_string()))?;
-        let lines = Lines::parse(&text)?;
-        let mut peers = Vec::new();
-        for (number, value) in &lines.peers {
-            let mut fields = value.split_whitespace();
-            let (Some(id), Some(role), Some(certificate), None) =
-                (fields.next(), fields.next(), fields.next(), fields.next())
-            else {
-                return Err(ProcessError::Line(
-                    *number,
-                    "peer = ID ROLE CERTIFICATE".into(),
-                ));
-            };
-            let id = id
-                .parse()
-                .map_err(|_| ProcessError::Line(*number, "a peer's id".into()))?;
-            let role = match role {
-                "node" => Role::Node,
-                "gateway" => Role::Gateway,
-                "client" => Role::Client,
-                _ => {
-                    return Err(ProcessError::Line(
-                        *number,
-                        "a role: node, gateway or client".into(),
-                    ));
-                }
-            };
-            peers.push((id, role, PathBuf::from(certificate)));
-        }
-        let voters = lines
-            .text("voters")?
-            .split(',')
-            .map(|v| v.trim().parse())
-            .collect::<Result<Vec<u64>, _>>()
-            .map_err(|e| ProcessError::Value("voters", e.to_string()))?;
+        let lines = Lines::parse(&text, KEYS, REPEATED)?;
+        let peers = peers(&lines)?;
+        let voters = voters(&lines)?;
         let waits = match lines.text("log.waits")? {
             "measured" => Waits::Measured,
             "never" => Waits::Never,
@@ -377,11 +530,11 @@ impl ProcessConfig {
 /// The ranges the `range` lines state, each `range = GROUP LAYER`: its group in hex, as the log
 /// names it, and the layer whose rows it holds, at most one range of each layer.
 fn ranges(lines: &Lines) -> Result<Vec<(u128, Layer)>, ProcessError> {
-    if lines.ranges.is_empty() {
+    if lines.all("range").is_empty() {
         return Err(ProcessError::Missing("range"));
     }
-    let mut ranges: Vec<(u128, Layer)> = Vec::with_capacity(lines.ranges.len());
-    for (number, value) in &lines.ranges {
+    let mut ranges: Vec<(u128, Layer)> = Vec::with_capacity(lines.all("range").len());
+    for (number, value) in lines.all("range") {
         let bad = |what: &str| ProcessError::Line(*number, what.into());
         let fields: Vec<&str> = value.split_whitespace().collect();
         let [group, layer] = fields.as_slice() else {
@@ -413,24 +566,30 @@ fn ranges(lines: &Lines) -> Result<Vec<(u128, Layer)>, ProcessError> {
 /// What a node with `root_key` lines states of its gateway host, each `root_key = GENERATION FILE`
 /// a generation of the root key, the last the current one; none for a node without them.
 fn gateway(lines: &Lines) -> Result<Option<GatewayConfig>, ProcessError> {
-    if lines.keys.is_empty() {
+    let keys = root_keys(lines)?;
+    if keys.is_empty() {
         return Ok(None);
     }
-    let mut keys: Vec<(u32, PathBuf)> = Vec::with_capacity(lines.keys.len());
-    for (number, value) in &lines.keys {
-        let bad = || ProcessError::Line(*number, "root_key = GENERATION FILE".into());
+    let mut bursts = Vec::with_capacity(lines.all("durability.burst").len());
+    for (number, value) in lines.all("durability.burst") {
+        let bad = || {
+            ProcessError::Line(
+                *number,
+                "durability.burst = RATE FRACTION: events an hour, and the share of the nodes \
+                 each destroys"
+                    .into(),
+            )
+        };
         let fields: Vec<&str> = value.split_whitespace().collect();
-        let [generation, file] = fields.as_slice() else {
+        let [rate, fraction] = fields.as_slice() else {
             return Err(bad());
         };
-        let generation: u32 = generation.parse().map_err(|_| bad())?;
-        if keys.last().is_some_and(|(last, _)| *last >= generation) {
-            return Err(ProcessError::Line(
-                *number,
-                "root key generations in increasing order".into(),
-            ));
+        let rate: f64 = rate.parse().map_err(|_| bad())?;
+        let fraction: f64 = fraction.parse().map_err(|_| bad())?;
+        if !(rate.is_finite() && rate >= 0.0 && (0.0..=1.0).contains(&fraction)) {
+            return Err(bad());
         }
-        keys.push((generation, PathBuf::from(file)));
+        bursts.push(Burst { rate, fraction });
     }
     Ok(Some(GatewayConfig {
         keys,
@@ -441,6 +600,7 @@ fn gateway(lines: &Lines) -> Result<Option<GatewayConfig>, ProcessError> {
         scan_rows: lines.get("gateway.scan_rows")?,
         chunk_rate: lines.get("durability.chunk_rate")?,
         repair_rate: lines.get("durability.repair_rate")?,
+        bursts,
         target: lines.get("durability.target")?,
     }))
 }
@@ -479,7 +639,7 @@ fn gateway_settings(config: GatewayConfig) -> Result<GatewaySettings, ProcessErr
         rates: Rates {
             chunk: config.chunk_rate,
             domains: None,
-            bursts: Vec::new(),
+            bursts: config.bursts,
             repair: config.repair_rate,
         },
         target: config.target,
@@ -489,7 +649,7 @@ fn gateway_settings(config: GatewayConfig) -> Result<GatewaySettings, ProcessErr
 /// How a node with `volume` lines enlists them: the root range its `range` lines name, its
 /// `domain`, and the table's `root.` bounds, each required of it; none for a node without volumes.
 fn enlisting(lines: &Lines) -> Result<Option<Enlisting>, ProcessError> {
-    if lines.volumes.is_empty() {
+    if lines.all("volume").is_empty() {
         return Ok(None);
     }
     let root = ranges(lines)?
@@ -518,7 +678,7 @@ fn enlisting(lines: &Lines) -> Result<Option<Enlisting>, ProcessError> {
 /// the payload a read goes past rather than ask twice, and whether it is written once at layout
 /// (1) or not (0). The layout every volume shares is stated once, in the `volume.` keys.
 fn volumes(lines: &Lines) -> Result<Vec<VolumeSettings>, ProcessError> {
-    if lines.volumes.is_empty() {
+    if lines.all("volume").is_empty() {
         return Ok(Vec::new());
     }
     let scrub_s: u64 = lines.get("volume.scrub_period_s")?;
@@ -536,8 +696,8 @@ fn volumes(lines: &Lines) -> Result<Vec<VolumeSettings>, ProcessError> {
         prewrite: false,
         reads: mantle_chunk::Reads::default(),
     };
-    let mut volumes = Vec::with_capacity(lines.volumes.len());
-    for (number, value) in &lines.volumes {
+    let mut volumes = Vec::with_capacity(lines.all("volume").len());
+    for (number, value) in lines.all("volume") {
         let bad = || {
             ProcessError::Line(
                 *number,
@@ -577,16 +737,163 @@ pub fn run(config: &Path) -> Result<(), ProcessError> {
     // Before any thread allocates: a freed large block's memory goes back to the OS, which a range's
     // budget following the machine reads as room (docs/research/65 §6).
     mantle_engine::port::mmap::return_freed_blocks();
-    let mut config = ProcessConfig::read(config)?;
+    start(ProcessConfig::read(config)?, Locks::default())
+}
+
+/// Runs the node whose operator's statements the file at `config` holds (`mantle serve`, node.md
+/// §1.4): each volume's device directory locked, then each device's profile kept or measured, the
+/// node directory's device and the host's memory, cores and page measured; every other value
+/// derived from those (`derive::derive`) and said on standard output, a `basis` line each, before
+/// anything opens; then the node, as `mantle node` runs it, until standard input closes.
+pub fn serve_stated(config: &Path) -> Result<(), ProcessError> {
+    mantle_engine::port::mmap::return_freed_blocks();
+    let stated = read_stated(config)?;
+    let locks = Locks::take(stated.volumes.iter().map(|(dir, _)| dir.as_path()))?;
+    let measured = measure(&stated)?;
+    let dir = stated.dir.clone();
+    let align = measured.meta.align;
+    let mut stores = |group: u128, page: usize| -> Result<Option<Shape>, String> {
+        let path = store_path(&dir, group);
+        if !path.try_exists().map_err(|e| e.to_string())? {
+            return Ok(None);
+        }
+        let file = DeviceFile::open(&path, false, CachingRequest::Buffered, align)
+            .map_err(|e| e.to_string())?;
+        Store::shape(&file, page)
+            .map(Some)
+            .map_err(|e| e.to_string())
+    };
+    let derived = crate::derive::derive(stated, &measured, &mut stores)?;
+    let mut out = std::io::stdout().lock();
+    for basis in &derived.bases {
+        writeln!(out, "basis {basis}").map_err(|e| ProcessError::Say(e.to_string()))?;
+    }
+    out.flush().map_err(|e| ProcessError::Say(e.to_string()))?;
+    // The runtime's writer says the rest: this thread holds no lock on standard output for it.
+    drop(out);
+    start(derived.config, locks)
+}
+
+/// The node of `config`, its volumes under `locks` (any not held taken now), until standard input
+/// closes.
+fn start(mut config: ProcessConfig, locks: Locks) -> Result<(), ProcessError> {
     // The volumes open before the node's runtime starts: an issuer's start and a volume's
     // recovery wait on their device, which no shard may (node.md §1.3).
-    let storage = Storage::open(&config.volumes)?;
+    let storage = Storage::open_locked(&config.volumes, locks)?;
     let gateway = config.gateway.take().map(gateway_settings).transpose()?;
     let runtime = runtime(&config)?;
     let mut rt =
         LocalRuntime::new(&runtime).map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
     rt.block_on(serve(config, storage, gateway))
         .map_err(|e| ProcessError::Runtime(format!("{e:?}")))?
+}
+
+/// What the file at `path` states for `mantle serve`: only [`STATED_KEYS`] and
+/// [`STATED_REPEATED`], each volume `volume = DIR SIZE`.
+pub fn read_stated(path: &Path) -> Result<Stated, ProcessError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| ProcessError::Read(path.to_path_buf(), e.to_string()))?;
+    let lines = Lines::parse(&text, STATED_KEYS, STATED_REPEATED)?;
+    let mut volumes = Vec::with_capacity(lines.all("volume").len());
+    for (number, value) in lines.all("volume") {
+        let bad = || ProcessError::Line(*number, "volume = DIR SIZE".into());
+        let fields: Vec<&str> = value.split_whitespace().collect();
+        let [dir, size] = fields.as_slice() else {
+            return Err(bad());
+        };
+        volumes.push((PathBuf::from(dir), size.parse().map_err(|_| bad())?));
+    }
+    let target = lines.maybe::<f64>("durability.target")?;
+    if target.is_some_and(|t| !(t.is_finite() && t > 0.0 && t < 1.0)) {
+        return Err(ProcessError::Value(
+            "durability.target",
+            "a probability between 0 and 1".into(),
+        ));
+    }
+    Ok(Stated {
+        id: lines.get("id")?,
+        dir: PathBuf::from(lines.text("dir")?),
+        quic: lines.get("quic")?,
+        plane: lines.get("plane")?,
+        authority: PathBuf::from(lines.text("authority")?),
+        certificate: PathBuf::from(lines.text("certificate")?),
+        key: PathBuf::from(lines.text("key")?),
+        peers: peers(&lines)?,
+        ranges: ranges(&lines)?,
+        voters: voters(&lines)?,
+        volumes,
+        enlist: enlisting(&lines)?,
+        keys: root_keys(&lines)?,
+        ceiling: lines.maybe("memory")?,
+        target,
+    })
+}
+
+/// What `mantle serve` measures (node.md §1.7 step 2), each volume's device directory already
+/// locked: the host's memory, cores and page; the node directory's device; and each volume's
+/// device, its profile kept or measured now (`mantle_disk::profile`), and its volume's layout once
+/// laid out (`mantle_chunk::formatted`).
+fn measure(stated: &Stated) -> Result<Measured, ProcessError> {
+    let facts = hyper_rt::machine::facts::Facts::query();
+    std::fs::create_dir_all(&stated.dir)
+        .map_err(|e| ProcessError::Device(stated.dir.clone(), e.to_string()))?;
+    let meta = device(&mantle_disk::probe::identify(&stated.dir));
+    let mut volumes = Vec::with_capacity(stated.volumes.len());
+    for (dir, _) in &stated.volumes {
+        let failed = |e: &dyn std::fmt::Display| ProcessError::Device(dir.clone(), e.to_string());
+        let identity = mantle_disk::probe::identify(dir);
+        let align = identity.transfer_alignment();
+        let mantle = crate::storage::mantle_dir(dir);
+        let plan = mantle_disk::calibrate::Plan::standard(align, identity.queue_depth);
+        let (profile, measured_now) =
+            mantle_disk::profile::load_or_measure(dir, &mantle, &identity, &plan)
+                .map_err(|e| failed(&e))?;
+        let path = crate::storage::volume_path(dir);
+        let formatted = if path.try_exists().map_err(|e| failed(&e))? {
+            let file = DeviceFile::open(&path, false, CachingRequest::PreferDirect, align)
+                .map_err(|e| failed(&e))?;
+            let (geometry, checksum_shift) =
+                mantle_chunk::formatted(&file).map_err(|e| failed(&e))?;
+            Some(Formatted {
+                geometry,
+                checksum_shift,
+            })
+        } else {
+            None
+        };
+        volumes.push(VolumeFacts {
+            device: device(&identity),
+            profile,
+            measured_now,
+            formatted,
+        });
+    }
+    Ok(Measured {
+        memory: facts.memory,
+        cores: facts.cores.len(),
+        page: facts.page.base,
+        meta,
+        volumes,
+    })
+}
+
+/// A device as `identity` describes it: its file system's bytes, or those available to the
+/// process where the OS gives no total.
+fn device(identity: &mantle_disk::identity::Identity) -> Device {
+    Device {
+        name: identity.device.clone(),
+        align: identity.transfer_alignment(),
+        queue: identity.queue_depth,
+        bytes: identity
+            .file_system
+            .total_bytes
+            .or(identity.file_system.available_bytes),
+    }
+}
+
+/// Range `group`'s engine store in the node's directory `dir`.
+fn store_path(dir: &Path, group: u128) -> PathBuf {
+    dir.join(format!("range-{group:032x}.store"))
 }
 
 /// One shard, calibrated on this machine (hyper-rt `RuntimeConfig::from_calibration`), sized by
@@ -623,7 +930,7 @@ fn engine(
     group: u128,
     layer: Layer,
 ) -> Result<Stored<DeviceFile>, ProcessError> {
-    let path = config.dir.join(format!("range-{group:032x}.store"));
+    let path = store_path(&config.dir, group);
     let fresh = !path.exists();
     // The file transfers at its device's alignment, which the engine's pages are a multiple of
     // (`Store::check`): a page derived to hold a row is a multiple of the device's unit, not a
@@ -937,18 +1244,29 @@ mod tests {
 
     #[test]
     fn a_line_is_a_key_and_its_value_and_a_key_is_stated_once() {
+        let parse = |text| Lines::parse(text, KEYS, REPEATED);
         let lines =
-            Lines::parse("# a node\nid = 3\npeer = 2 node a.der\n\npeer = 9 client b.der # x\n")
-                .unwrap();
+            parse("# a node\nid = 3\npeer = 2 node a.der\n\npeer = 9 client b.der # x\n").unwrap();
         assert_eq!(lines.get::<u64>("id").unwrap(), 3);
-        assert_eq!(lines.peers.len(), 2);
+        assert_eq!(lines.all("peer").len(), 2);
         assert!(matches!(
-            Lines::parse("id = 1\nid = 2\n"),
+            parse("id = 1\nid = 2\n"),
+            Err(ProcessError::Line(2, _))
+        ));
+        assert!(matches!(parse("id 1\n"), Err(ProcessError::Line(1, _))));
+        // A key the node does not know is refused at its line, a derived one in a stated-only
+        // file too.
+        assert!(matches!(
+            parse("id = 1\nidd = 2\n"),
             Err(ProcessError::Line(2, _))
         ));
         assert!(matches!(
-            Lines::parse("id 1\n"),
-            Err(ProcessError::Line(1, _))
+            Lines::parse(
+                "id = 1\nengine.page_size = 4096\n",
+                STATED_KEYS,
+                STATED_REPEATED
+            ),
+            Err(ProcessError::Line(2, _))
         ));
         assert!(matches!(
             lines.get::<u64>("dir"),
@@ -958,7 +1276,7 @@ mod tests {
 
     #[test]
     fn ranges_are_a_group_and_a_layer_each_and_one_of_each_layer() {
-        let ranges = |text: &str| super::ranges(&Lines::parse(text).unwrap());
+        let ranges = |text: &str| super::ranges(&Lines::parse(text, KEYS, REPEATED).unwrap());
         assert_eq!(
             ranges("range = 0x72 name\nrange = 9 block\n").unwrap(),
             vec![(0x72, Layer::Name), (9, Layer::Block)]

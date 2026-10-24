@@ -5,6 +5,8 @@
 //! at start.
 
 use std::mem::size_of;
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use hyper_block::buf::Alignment;
@@ -16,15 +18,22 @@ use hyper_rt::machine::bench::MIN_SAMPLES;
 use hyper_rt::machine::facts::{MemoryFacts, effective_capacity};
 use mantle_chunk::layout::{self as volume_layout, Geometry};
 use mantle_chunk::{ChunkError, Config as VolumeConfig, Limits, Reads, index};
+use mantle_disk::profile::Profile;
 use mantle_ec::durability::{self, Burst, Choice, DurabilityError, Rates, Scheme};
-use mantle_engine::store::Config as StoreConfig;
+use mantle_engine::store::{Config as StoreConfig, Shape};
 use mantle_engine::trunk::TrunkConfig;
 use mantle_gateway::layout::Layout;
 use mantle_gateway::{get, put};
+use mantle_meta::apply::Layer;
 use mantle_meta::record::{RecordError, Session};
 use mantle_meta::session::Rules;
 use mantle_meta::{key, wire};
-use mantle_range::{Range, Settings};
+use mantle_range::{ConfState, Range, Settings};
+
+use crate::classes::Role;
+use crate::node::Hosted;
+use crate::process::{Enlisting, GatewayConfig, ProcessConfig};
+use crate::storage::VolumeSettings;
 
 /// focal's election timeout and heartbeat interval in ticks (docs/design/node.md §2.4), which
 /// ranges keep though they elect by suspicion, which takes no ticks.
@@ -269,6 +278,24 @@ pub enum DeriveError {
         "a range's share of the memory left, {bytes} bytes, holds the metadata of no extent of {per_extent}"
     )]
     Metadata { bytes: u64, per_extent: u64 },
+    #[error(
+        "the node directory's file system holds {bytes} bytes, short of the {held} its log's file and the volumes on its device take"
+    )]
+    Space { bytes: u64, held: u64 },
+    #[error("the ranges' stores were made at pages of {first} and {second} bytes; a node runs one")]
+    StorePages { first: usize, second: usize },
+    #[error(
+        "a range's store was made at pages of {page} bytes, which hold no row at the range's bounds or are off its device's {align}-byte unit"
+    )]
+    StorePage { page: usize, align: usize },
+    #[error("the node's bounds: {0}")]
+    Bounds(String),
+    #[error("the node directory's file system does not say its size")]
+    Unsized,
+    #[error("{measured} devices measured for the {stated} volumes stated")]
+    Measurements { stated: usize, measured: usize },
+    #[error("range {group:x}'s store: {why}")]
+    Store { group: u128, why: String },
 }
 
 /// The range's settings and rules, which every member of the cell derives alike, from the
@@ -740,7 +767,9 @@ pub enum Class {
     Objects,
     /// Each volume's buffers (`mantle_chunk::layout::most_bytes`).
     Volumes,
-    /// Each range's engine's configured buffers (`mantle_engine::shard_db::bounded_bytes`).
+    /// Each range's engine's configured buffers (`mantle_engine::shard_db::bounded_bytes`), its
+    /// extents' allocator apart: each extent's is charged with its metadata from what remains
+    /// (`mantle_engine::shard_db::measured_per_extent`).
     Engines,
     /// Each range's member ([`range_bytes`]).
     Ranges,
@@ -830,19 +859,6 @@ pub fn shares(remaining: u64, wants: &[u64]) -> Result<Vec<u64>, DeriveError> {
                 .ok_or_else(overflow)
         })
         .collect()
-}
-
-/// What a data device measured (docs/design/chunk-store.md §7; `mantle_disk::calibrate`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Profile {
-    /// Reads at the device at once where throughput stops growing.
-    pub depth: usize,
-    /// Bytes the reads at the device buffer at once where large reads stop gaining.
-    pub read_bytes: u64,
-    /// Bytes a read goes past rather than ask the device a second time.
-    pub read_gap: u64,
-    /// Whether a durable write into never-written space is slower than one over written space.
-    pub prewrite: bool,
 }
 
 /// What a volume laid out already fixed at format, as its superblock records it: where
@@ -964,6 +980,1243 @@ fn held(geometry: &Geometry, config: &VolumeConfig) -> u64 {
         }
     }
     fit
+}
+
+/// A device as the OS names it and its file system holds (`mantle_disk::probe::identify`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Device {
+    /// The OS's name for it, by which volumes on one device share its issuer; none where the OS
+    /// gives none.
+    pub name: Option<String>,
+    /// The unit its transfers align to (`mantle_disk::identity::Identity::transfer_alignment`).
+    pub align: Alignment,
+    /// The commands the OS queues to it, where it says.
+    pub queue: Option<u32>,
+    /// Bytes its file system holds, where the OS says.
+    pub bytes: Option<u64>,
+}
+
+impl Device {
+    /// Whether `other` may be this device: the same name, or a name either lacks, since a device
+    /// the OS does not name may be any.
+    fn may_be(&self, other: &Device) -> bool {
+        match (&self.name, &other.name) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        }
+    }
+}
+
+/// A data device's facts: the device, its profile, whether that was measured now or kept from a
+/// measurement the device still matches, and its volume's layout once laid out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeFacts {
+    pub device: Device,
+    pub profile: Profile,
+    pub measured_now: bool,
+    pub formatted: Option<Formatted>,
+}
+
+/// What `mantle serve` measures of its host and its devices (node.md §1.4's second column).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Measured {
+    /// The machine's memory and the OS's limit for the process (hyper-rt `MemoryFacts`).
+    pub memory: MemoryFacts,
+    /// The cores the process may run on.
+    pub cores: usize,
+    /// The OS's base page.
+    pub page: u64,
+    /// The node directory's device, which holds its log and its ranges' stores.
+    pub meta: Device,
+    /// Each volume's device, in the volumes' order.
+    pub volumes: Vec<VolumeFacts>,
+}
+
+/// What `mantle serve`'s configuration states (node.md §1.4's first column).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stated {
+    pub id: u64,
+    pub dir: PathBuf,
+    pub quic: SocketAddr,
+    pub plane: SocketAddr,
+    pub authority: PathBuf,
+    pub certificate: PathBuf,
+    pub key: PathBuf,
+    pub peers: Vec<(u64, Role, PathBuf)>,
+    pub ranges: Vec<(u128, Layer)>,
+    pub voters: Vec<u64>,
+    /// Each volume's device directory and bytes.
+    pub volumes: Vec<(PathBuf, u64)>,
+    pub enlist: Option<Enlisting>,
+    /// The root key's generations, for a node that hosts objects.
+    pub keys: Vec<(u32, PathBuf)>,
+    /// The most memory the node may hold, where its operator states it.
+    pub ceiling: Option<u64>,
+    /// A block's annual chance of loss at most, where its operator states it.
+    pub target: Option<f64>,
+}
+
+/// Where a value comes from (node.md §1.4's table).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// The operator's.
+    Stated,
+    /// The host's or a device's, measured.
+    Measured,
+    /// A model's, from stated and measured values and the code's own bounds.
+    Derived,
+    /// A source's: a figure the literature, a standard or a measured system gives.
+    Cited,
+    /// A bound on a measurement.
+    Bound,
+}
+
+impl std::fmt::Display for Kind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Stated => "stated",
+            Self::Measured => "measured",
+            Self::Derived => "derived",
+            Self::Cited => "cited",
+            Self::Bound => "bound",
+        })
+    }
+}
+
+/// A value the node runs with and its basis: the key it goes by, `mantle node`'s where it has
+/// one, a volume's `volume.N.` with N its place among the volumes from 1, and `memory.` for the
+/// floor; what it is; its kind; and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Basis {
+    pub key: String,
+    pub value: String,
+    pub kind: Kind,
+    pub why: String,
+}
+
+impl std::fmt::Display for Basis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} = {} ({}: {})",
+            self.key, self.value, self.kind, self.why
+        )
+    }
+}
+
+/// The configuration `mantle node` runs with, each value with its basis in the order the node
+/// says them.
+pub struct Derived {
+    pub config: ProcessConfig,
+    pub bases: Vec<Basis>,
+}
+
+#[derive(Default)]
+struct Said(Vec<Basis>);
+
+impl Said {
+    fn add(
+        &mut self,
+        key: impl Into<String>,
+        value: impl std::fmt::Display,
+        kind: Kind,
+        why: &str,
+    ) {
+        self.0.push(Basis {
+            key: key.into(),
+            value: value.to_string(),
+            kind,
+            why: why.to_owned(),
+        });
+    }
+}
+
+fn role_name(role: Role) -> &'static str {
+    match role {
+        Role::Node => "node",
+        Role::Gateway => "gateway",
+        Role::Client => "client",
+    }
+}
+
+fn layer_name(layer: Layer) -> &'static str {
+    match layer {
+        Layer::Root => "root",
+        Layer::Bucket => "bucket",
+        Layer::Name => "name",
+        Layer::File => "file",
+        Layer::Block => "block",
+    }
+}
+
+/// Every value `mantle node`'s configuration names, from what `stated` states and what
+/// `measured` measured, by node.md §1.4's rules, each with its basis:
+///
+/// - the cell's settings and rules from its identities ([`cell`]), the log from the node
+///   directory's device and the ranges ([`log`]);
+/// - the objects' floor, a window of one block and two operations, and their asks under the
+///   schemes a block may take in a cell of the volume table's nodes ([`gateway`], [`schemes`],
+///   [`asks`], [`objects`]), for a node that names root keys;
+/// - each volume at its device's measured profile ([`volume`]), its index at first a fragment at
+///   each of its blocks, and a volume laid out already keeping its layout;
+/// - each range's engine at the least page that holds a row at the range's bounds, on its share of
+///   the node directory's file system past the volumes on that device and the log's file
+///   ([`engine`]), a range's store made already keeping its page and extent sizes;
+/// - the transport at its floor (`bounds::least_transport`), for the peers, ranges, transfers and
+///   messages the node opens with as `Node::open_on` states them;
+/// - the floor, class by class, within the allowance ([`allowance`], [`floor`]), and what remains
+///   shared by each volume's index and each engine's resident metadata ([`shares`]): a volume's
+///   fragments and an engine's extents as many as their shares hold ([`volume`],
+///   [`engine_within`]), an engine never fewer than its store holds, which it would not open
+///   below (`Store::open`).
+///
+/// `stores` reads range `group`'s store as it stands, its superblocks read at the page a new store
+/// would take or the one they name (`Store::shape`): none before its first start.
+pub fn derive(
+    stated: Stated,
+    measured: &Measured,
+    stores: &mut dyn FnMut(u128, usize) -> Result<Option<Shape>, String>,
+) -> Result<Derived, DeriveError> {
+    let overflow = DeriveError::Overflow;
+    let mut said = Said::default();
+    say_stated(&mut said, &stated);
+    said.add(
+        "memory.total",
+        measured.memory.total,
+        Kind::Measured,
+        "the machine's physical memory (hyper-rt MemoryFacts::total)",
+    );
+    said.add(
+        "memory.limit",
+        measured
+            .memory
+            .limit
+            .map_or_else(|| "none".to_owned(), |limit| limit.to_string()),
+        Kind::Measured,
+        "the tightest limit the OS sets on the process: cgroup v2's memory.max, a job's limit, \
+         RLIMIT_AS (hyper-rt MemoryFacts::limit)",
+    );
+    said.add(
+        "cores",
+        measured.cores,
+        Kind::Measured,
+        "the cores the process may run on (hyper-rt Facts::cores); the node runs its ranges on \
+         one shard (node.md §1.2)",
+    );
+    said.add(
+        "page",
+        measured.page,
+        Kind::Measured,
+        "the OS's base page (hyper-rt PageFacts::base): the node's talk takes a buffer of one \
+         each way",
+    );
+    said.add(
+        "dir.unit",
+        measured.meta.align.get(),
+        Kind::Measured,
+        "the unit the node directory's device transfers in (mantle_disk::probe::identify), the \
+         log's block and the engine pages' multiple",
+    );
+    let dir_bytes = measured.meta.bytes.ok_or(DeriveError::Unsized)?;
+    said.add(
+        "dir.bytes",
+        dir_bytes,
+        Kind::Measured,
+        "the bytes the node directory's file system holds, shared by its log, the ranges' \
+         stores and any volume on its device",
+    );
+
+    let identities = u64::try_from(stated.peers.len())
+        .ok()
+        .and_then(|peers| peers.checked_add(1))
+        .ok_or(overflow("the cell's identities"))?;
+    let (settings, rules) = cell(identities)?;
+    say_cell(&mut said, &settings, &rules);
+
+    // The objects a node with root keys hosts, at the floor.
+    let hosts = !stated.keys.is_empty();
+    let rates = rates();
+    let target = target(stated.target);
+    let gateway = gateway()?;
+    let widest = durability::candidates()
+        .iter()
+        .map(|s| s.width())
+        .max()
+        .unwrap_or(0);
+    let domains = stated.enlist.as_ref().map_or(widest, |e| {
+        usize::try_from(e.max_nodes).unwrap_or(usize::MAX)
+    });
+    let (asked, objects_bytes) = if hosts {
+        let schemes = schemes(domains, &rates, target)?;
+        (asks(&gateway, &schemes)?, objects(&gateway, &schemes)?)
+    } else {
+        let enlists = usize::from(stated.enlist.is_some());
+        (
+            Asks {
+                chunks: 0,
+                commands: enlists,
+                reads: 0,
+            },
+            0,
+        )
+    };
+    say_objects(
+        &mut said,
+        hosts,
+        stated.enlist.is_some(),
+        &asked,
+        &gateway,
+        &rates,
+        (target, stated.target.is_some()),
+    );
+
+    // Each volume as its index's whole want would have it: its buffers, its transfers, its want.
+    if stated.volumes.len() != measured.volumes.len() {
+        return Err(DeriveError::Measurements {
+            stated: stated.volumes.len(),
+            measured: measured.volumes.len(),
+        });
+    }
+    let chunk = mantle_gateway::layout::CHUNK;
+    let mut volume_bytes = 0u64;
+    let mut transfers = 0usize;
+    let mut wants = Vec::with_capacity(stated.volumes.len());
+    for ((_, size), facts) in stated.volumes.iter().zip(&measured.volumes) {
+        let block = match &facts.formatted {
+            Some(formatted) => formatted.geometry.block,
+            None => volume_layout::block(facts.device.align).ok_or(overflow("a volume's block"))?,
+        };
+        let want = size
+            .checked_div(block)
+            .and_then(index::most_bytes)
+            .ok_or(overflow("a volume's index"))?;
+        let whole = volume(
+            facts.device.align,
+            *size,
+            chunk,
+            &facts.profile,
+            want,
+            facts.formatted.as_ref(),
+        )?;
+        let geometry = match &facts.formatted {
+            Some(formatted) => formatted.geometry,
+            None => Geometry::plan(*size, facts.device.align, &whole)?,
+        };
+        volume_bytes = volume_layout::most_bytes(&whole, &geometry)
+            .and_then(|bytes| volume_bytes.checked_add(bytes))
+            .ok_or(overflow("the volumes' buffers"))?;
+        transfers = transfers
+            .checked_add(whole.transfers())
+            .ok_or(overflow("the volumes' transfers"))?;
+        wants.push(want);
+    }
+
+    // The log, and each range's engine on its share of what the log and the volumes on the node
+    // directory's device leave of its file system.
+    let ranges = stated.ranges.len();
+    let log_config = log(measured.meta.align, &settings, ranges)?;
+    let log_file = log_config
+        .segment_bytes
+        .checked_mul(u64::from(log_config.max_segments))
+        .ok_or(overflow("the log's file"))?;
+    let mut held = log_file;
+    for ((_, size), facts) in stated.volumes.iter().zip(&measured.volumes) {
+        if facts.device.may_be(&measured.meta) {
+            held = held
+                .checked_add(*size)
+                .ok_or(overflow("the node directory's device"))?;
+        }
+    }
+    let space = dir_bytes.checked_sub(held).ok_or(DeriveError::Space {
+        bytes: dir_bytes,
+        held,
+    })?;
+    let share = u64::try_from(ranges)
+        .ok()
+        .and_then(|ranges| space.checked_div(ranges))
+        .ok_or(overflow("a range's share of the node directory's device"))?;
+    let made = engine(measured.meta.align.get(), share, &rules)?;
+    let mut shapes = Vec::with_capacity(ranges);
+    for &(group, _) in &stated.ranges {
+        shapes.push(
+            stores(group, made.store.page_size).map_err(|why| DeriveError::Store { group, why })?,
+        );
+    }
+    let (made, held_extents) = founded(made, &shapes, share, &rules, measured.meta.align)?;
+
+    // The transport at its floor, for what the node opens with (`Node::open_on`).
+    let hosted: Vec<Hosted<()>> = stated
+        .ranges
+        .iter()
+        .map(|&(group, layer)| Hosted {
+            group,
+            range: Range {
+                layer,
+                rules,
+                boot: ConfState {
+                    voters: stated.voters.clone(),
+                    ..ConfState::default()
+                },
+                settings,
+            },
+            engine: (),
+        })
+        .collect();
+    let messages = crate::node::message_bounds(&hosted, chunk)
+        .map_err(|e| DeriveError::Bounds(e.to_string()))?;
+    let mut bounds = crate::bounds::Stated {
+        peers: stated.peers.len(),
+        ranges,
+        inflight: settings.max_inflight_msgs,
+        transfers: transfers
+            .checked_add(asked.chunks)
+            .ok_or(overflow("the node's transfers"))?,
+        transport_bytes: 0,
+        messages,
+    };
+    let transport_bytes =
+        crate::bounds::least_transport(&bounds).map_err(|e| DeriveError::Bounds(e.to_string()))?;
+    bounds.transport_bytes = transport_bytes;
+    let limits = crate::bounds::limits(&bounds).map_err(|e| DeriveError::Bounds(e.to_string()))?;
+    let beside = transport_bytes_beside(&bounds).ok_or(overflow("the transport"))?;
+
+    // The floor, class by class.
+    let engines_bytes = mantle_engine::shard_db::bounded_bytes(
+        &StoreConfig {
+            max_extents: 0,
+            ..made.store
+        },
+        made.memtable_bytes,
+    )
+    .and_then(|each| each.checked_mul(u64::try_from(ranges).ok()?))
+    .ok_or(overflow("the engines' buffers"))?;
+    let reads = asked
+        .reads
+        .checked_add(limits.exchanges)
+        .ok_or(overflow("a range's reads"))?;
+    let mut ranges_bytes = 0u64;
+    for hosted in &hosted {
+        ranges_bytes = range_bytes(&hosted.range, reads)
+            .and_then(|bytes| ranges_bytes.checked_add(bytes))
+            .ok_or(overflow("the ranges' members"))?;
+    }
+    // A device's issuer, one a device the OS names, started by its first volume.
+    let mut devices: Vec<(&Option<String>, usize)> = Vec::new();
+    for facts in &measured.volumes {
+        let name = &facts.device.name;
+        if name.is_none() || !devices.iter().any(|(held, _)| *held == name) {
+            devices.push((name, issuer_depth(facts)));
+        }
+    }
+    let depths: Vec<usize> = devices.iter().map(|&(_, depth)| depth).collect();
+    let scrubs = vec![true; stated.volumes.len()];
+    let started = threads(&depths, &scrubs).ok_or(overflow("the node's threads"))?;
+    let classes = [
+        (Class::Objects, objects_bytes),
+        (Class::Volumes, volume_bytes),
+        (Class::Engines, engines_bytes),
+        (Class::Ranges, ranges_bytes),
+        (
+            Class::Log,
+            log_bytes(&log_config).ok_or(overflow("the log's memory"))?,
+        ),
+        (
+            Class::Transport,
+            transport_bytes
+                .checked_add(beside)
+                .ok_or(overflow("the transport's memory"))?,
+        ),
+        (
+            Class::Threads,
+            stacks(started).ok_or(overflow("the threads' stacks"))?,
+        ),
+    ];
+    let allowed = allowance(stated.ceiling, &measured.memory)?;
+    let remaining = floor(&classes, allowed)?;
+    say_floor(
+        &mut said,
+        stated.ceiling,
+        measured,
+        allowed,
+        &classes,
+        remaining,
+    );
+
+    // What remains, shared.
+    let engine_want = engine_wants(&made).ok_or(overflow("an engine's metadata"))?;
+    let mut all = wants;
+    all.resize(
+        stated
+            .volumes
+            .len()
+            .checked_add(ranges)
+            .ok_or(overflow("the floor's shares"))?,
+        engine_want,
+    );
+    let parts = shares(remaining, &all)?;
+    let (indexes, metadata) = parts.split_at(stated.volumes.len());
+    let metadata = metadata.iter().copied().min().unwrap_or(0);
+    let mut volumes = Vec::with_capacity(stated.volumes.len());
+    for (n, (((dir, size), facts), &index_bytes)) in stated
+        .volumes
+        .iter()
+        .zip(&measured.volumes)
+        .zip(indexes)
+        .enumerate()
+    {
+        let config = volume(
+            facts.device.align,
+            *size,
+            chunk,
+            &facts.profile,
+            index_bytes,
+            facts.formatted.as_ref(),
+        )?;
+        say_volume(&mut said, n.saturating_add(1), facts, &config, index_bytes);
+        volumes.push(VolumeSettings {
+            dir: dir.clone(),
+            size: *size,
+            config,
+            depth: issuer_depth(facts),
+        });
+    }
+    let within = engine_within(made, metadata)?;
+    let engine = Engine {
+        store: StoreConfig {
+            max_extents: within.store.max_extents.max(held_extents),
+            ..within.store
+        },
+        ..within
+    };
+    say_engine(
+        &mut said,
+        &engine,
+        metadata,
+        held_extents,
+        shapes.iter().any(Option::is_some),
+    );
+    let config = log_config;
+    say_log(&mut said, &config);
+    said.add(
+        "transport_bytes",
+        transport_bytes,
+        Kind::Derived,
+        "the transport's floor: what it holds besides QUIC's windows, and each share at QUIC's \
+         initial window, for the node's peers, ranges, transfers and messages \
+         (bounds::least_transport)",
+    );
+    // In whole milliseconds, as the key states it, rounded up: a bound on a starved host only.
+    let budget_ms = u64::try_from(probe_budget()?.as_nanos().div_ceil(1_000_000))
+        .map_err(|_| overflow("the probe budget"))?;
+    let probe_budget = Duration::from_millis(budget_ms);
+    said.add(
+        "runtime.probe_budget_ms",
+        budget_ms,
+        Kind::Bound,
+        "Wilks' 59 samples a probe at the platform's longest wait behind another runnable \
+         thread: 3 ms on Linux, 10 ms on macOS, 93.75 ms on Windows (research 64; \
+         derive::probe_budget)",
+    );
+    let gateway_config = hosts.then(|| GatewayConfig {
+        keys: stated.keys.clone(),
+        handover_ns: gateway.handover_ns,
+        window: gateway.window,
+        objects: gateway.objects,
+        bucket_quota: gateway.bucket_quota,
+        scan_rows: gateway.scan_rows,
+        chunk_rate: rates.chunk,
+        repair_rate: rates.repair,
+        bursts: rates.bursts.clone(),
+        target,
+    });
+    Ok(Derived {
+        config: ProcessConfig {
+            id: stated.id,
+            dir: stated.dir,
+            quic: stated.quic,
+            plane: stated.plane,
+            authority: stated.authority,
+            certificate: stated.certificate,
+            key: stated.key,
+            peers: stated.peers,
+            ranges: stated.ranges,
+            voters: stated.voters,
+            settings,
+            rules,
+            log: config,
+            store: engine.store,
+            memtable_bytes: engine.memtable_bytes,
+            trunk: engine.trunk,
+            transport_bytes,
+            probe_budget,
+            volumes,
+            chunk_bytes: chunk,
+            chunk_asks: asked.chunks,
+            command_asks: asked.commands,
+            read_asks: asked.reads,
+            enlist: stated.enlist,
+            gateway: gateway_config,
+        },
+        bases: said.0,
+    })
+}
+
+/// The transfers a volume's device's issuer keeps in flight: the smaller of the queue the OS
+/// reports and the depth its profile measured (`hyper_block::issuer::depth`).
+fn issuer_depth(facts: &VolumeFacts) -> usize {
+    hyper_block::issuer::depth(facts.device.queue, Some(facts.profile.depth))
+}
+
+/// `made` on the stores the ranges hold already, each made at one page and extent size it opens
+/// only at (`Store::open`): those sizes, which must hold a row at the range's bounds and be a
+/// multiple of the device's unit, and as many extents as `share` holds of them; and the most
+/// extents a store holds, which the engine never admits fewer than.
+fn founded(
+    made: Engine,
+    stores: &[Option<Shape>],
+    share: u64,
+    rules: &Rules,
+    align: Alignment,
+) -> Result<(Engine, u64), DeriveError> {
+    let mut found: Option<Shape> = None;
+    let mut held = 0u64;
+    for shape in stores.iter().flatten() {
+        if let Some(first) = found
+            && (first.page_size, first.extent_pages) != (shape.page_size, shape.extent_pages)
+        {
+            return Err(DeriveError::StorePages {
+                first: first.page_size,
+                second: shape.page_size,
+            });
+        }
+        found = Some(*shape);
+        held = held.max(shape.extents);
+    }
+    let Some(shape) = found else {
+        return Ok((made, held));
+    };
+    if !mantle_range::holds_rows(shape.page_size, made.memtable_bytes, rules)
+        || !align.is_aligned(shape.page_size)
+        || shape.extent_pages < 2
+    {
+        return Err(DeriveError::StorePage {
+            page: shape.page_size,
+            align: align.get(),
+        });
+    }
+    let extent = u64::try_from(shape.page_size)
+        .ok()
+        .and_then(|page| page.checked_mul(u64::from(shape.extent_pages)))
+        .ok_or(DeriveError::Overflow("an extent"))?;
+    let max_extents = share.checked_div(extent).unwrap_or(0);
+    if max_extents < 2 {
+        return Err(DeriveError::Extents { share, extent });
+    }
+    Ok((
+        Engine {
+            store: StoreConfig {
+                page_size: shape.page_size,
+                extent_pages: shape.extent_pages,
+                max_extents,
+            },
+            ..made
+        },
+        held,
+    ))
+}
+
+fn say_stated(said: &mut Said, stated: &Stated) {
+    said.add(
+        "id",
+        stated.id,
+        Kind::Stated,
+        "the node's identity (node.md §1.5)",
+    );
+    said.add(
+        "dir",
+        stated.dir.display(),
+        Kind::Stated,
+        "the node's directory: its log, its run record and its ranges' stores (node.md §1.6)",
+    );
+    said.add(
+        "quic",
+        stated.quic,
+        Kind::Stated,
+        "where the node's QUIC endpoint listens",
+    );
+    said.add(
+        "plane",
+        stated.plane,
+        Kind::Stated,
+        "where the node's datagram plane listens",
+    );
+    said.add(
+        "authority",
+        stated.authority.display(),
+        Kind::Stated,
+        "the cell authority's certificate, which signs every member's (node.md §1.5)",
+    );
+    said.add(
+        "certificate",
+        stated.certificate.display(),
+        Kind::Stated,
+        "the node's certificate, which the cell's authority signed",
+    );
+    said.add(
+        "key",
+        stated.key.display(),
+        Kind::Stated,
+        "the node's private key, PKCS #8 DER",
+    );
+    for (id, role, certificate) in &stated.peers {
+        said.add(
+            "peer",
+            format!("{id} {} {}", role_name(*role), certificate.display()),
+            Kind::Stated,
+            "a peer, by the certificate the cell's authority issued it (node.md §3.6)",
+        );
+    }
+    let voters: Vec<String> = stated.voters.iter().map(u64::to_string).collect();
+    said.add(
+        "voters",
+        voters.join(","),
+        Kind::Stated,
+        "the founding ranges' voters, drawn with the cell's authority (node.md §1.5)",
+    );
+    for (group, layer) in &stated.ranges {
+        said.add(
+            "range",
+            format!("{group:x} {}", layer_name(*layer)),
+            Kind::Stated,
+            "a founding range: its group and the layer whose rows it holds (node.md §1.5)",
+        );
+    }
+    for (generation, file) in &stated.keys {
+        said.add(
+            "root_key",
+            format!("{generation} {}", file.display()),
+            Kind::Stated,
+            "a generation of the root key, 32 bytes only its owner may read (encryption.md §2)",
+        );
+    }
+    if let Some(enlist) = &stated.enlist {
+        said.add(
+            "domain",
+            &enlist.domain,
+            Kind::Stated,
+            "the node's failure domain",
+        );
+        said.add(
+            "root.max_nodes",
+            enlist.max_nodes,
+            Kind::Stated,
+            "the cell's bound on its volume table's nodes (architecture §11)",
+        );
+        said.add(
+            "root.max_volumes",
+            enlist.max_volumes,
+            Kind::Stated,
+            "the cell's bound on its volume table's volumes (architecture §11)",
+        );
+    }
+    for (n, (dir, size)) in stated.volumes.iter().enumerate() {
+        let n = n.saturating_add(1);
+        said.add(
+            format!("volume.{n}.dir"),
+            dir.display(),
+            Kind::Stated,
+            "a device directory that holds data: the volume is mantle/volume in it",
+        );
+        said.add(
+            format!("volume.{n}.size"),
+            size,
+            Kind::Stated,
+            "the volume's bytes, laid out at its first start",
+        );
+    }
+}
+
+fn say_cell(said: &mut Said, settings: &Settings, rules: &Rules) {
+    let ready = "the floor's Ready: an entry of the range's largest (derive::cell)";
+    said.add(
+        "range.election_tick",
+        settings.election_tick,
+        Kind::Cited,
+        "focal's 10 ticks (node.md §2.4), checked though ranges elect by suspicion, which takes \
+         no ticks",
+    );
+    said.add(
+        "range.heartbeat_tick",
+        settings.heartbeat_tick,
+        Kind::Cited,
+        "focal's 2 ticks (node.md §2.4)",
+    );
+    said.add(
+        "range.max_entry_bytes",
+        settings.max_entry_bytes,
+        Kind::Derived,
+        "the range's largest entry (mantle_meta::wire::largest_entry_bytes, replica.md §7)",
+    );
+    said.add(
+        "range.max_size_per_msg",
+        settings.max_size_per_msg,
+        Kind::Derived,
+        ready,
+    );
+    said.add(
+        "range.max_inflight_msgs",
+        settings.max_inflight_msgs,
+        Kind::Derived,
+        "the floor's Ready: one append out to a follower (derive::cell)",
+    );
+    said.add(
+        "range.max_uncommitted_size",
+        settings.max_uncommitted_size,
+        Kind::Derived,
+        ready,
+    );
+    said.add(
+        "range.max_committed_size_per_ready",
+        settings.max_committed_size_per_ready,
+        Kind::Derived,
+        ready,
+    );
+    said.add(
+        "rules.lifetime_ns",
+        rules.lifetime_ns,
+        Kind::Derived,
+        "no session expires by time: a registration ends its owner's last \
+         (mantle_meta::session::register, node.md §1.4)",
+    );
+    said.add(
+        "rules.max_sessions",
+        rules.max_sessions,
+        Kind::Derived,
+        "a session for each identity the configuration names, the node's and each peer's, for \
+         good",
+    );
+    said.add(
+        "rules.max_answers",
+        rules.max_answers,
+        Kind::Derived,
+        "one command an entry, its answer kept until the next entry acknowledges it",
+    );
+    said.add(
+        "rules.max_answer_bytes",
+        rules.max_answer_bytes,
+        Kind::Derived,
+        "the largest answer a node's command gets (mantle_meta::wire::largest_answer_bytes)",
+    );
+    said.add(
+        "rules.expiries_per_entry",
+        rules.expiries_per_entry,
+        Kind::Derived,
+        "nothing expires by time: the least work an entry's expiry may do",
+    );
+    said.add(
+        "rules.max_key_bytes",
+        rules.max_key_bytes,
+        Kind::Derived,
+        "the longest key S3's names give a row (mantle_meta::key::largest_bytes)",
+    );
+    said.add(
+        "rules.max_value_bytes",
+        rules.max_value_bytes,
+        Kind::Derived,
+        "the largest value a request S3 admits, or a session at its bounds, gives a row \
+         (mantle_meta::wire::largest_row_bytes)",
+    );
+}
+
+fn say_objects(
+    said: &mut Said,
+    hosts: bool,
+    enlists: bool,
+    asked: &Asks,
+    gateway: &Gateway,
+    rates: &Rates,
+    (target, stated): (f64, bool),
+) {
+    said.add(
+        "chunk_bytes",
+        mantle_gateway::layout::CHUNK,
+        Kind::Cited,
+        "the largest chunk a gateway writes, Tectonic's 8 MiB (mantle_gateway::layout::CHUNK)",
+    );
+    let (chunks, commands, reads) = if hosts {
+        (
+            "the floor's two operations, each at its most chunks under the schemes a block may \
+             take in a cell of the volume table's nodes (derive::asks)",
+            "a put of the largest body's commands for each of the two operations, and the node's \
+             enlistment (derive::asks)",
+            "one read for each of the two operations (derive::asks)",
+        )
+    } else if enlists {
+        (
+            "none: the node hosts no objects",
+            "the node's enlistment of its volumes (node.md §6.6)",
+            "none: the node hosts no objects",
+        )
+    } else {
+        (
+            "none: the node hosts no objects",
+            "none: the node asks no range itself",
+            "none: the node hosts no objects",
+        )
+    };
+    said.add("chunk_asks", asked.chunks, Kind::Derived, chunks);
+    said.add("command_asks", asked.commands, Kind::Derived, commands);
+    said.add("read_asks", asked.reads, Kind::Derived, reads);
+    if !hosts {
+        return;
+    }
+    said.add(
+        "gateway.window",
+        gateway.window,
+        Kind::Derived,
+        "the floor: a window of one block (node.md §1.4)",
+    );
+    said.add(
+        "gateway.objects",
+        gateway.objects,
+        Kind::Derived,
+        "the floor: two operations at once of any kind, a put and a get (node.md §1.4)",
+    );
+    said.add(
+        "gateway.bucket_quota",
+        gateway.bucket_quota,
+        Kind::Cited,
+        "S3's 10,000 buckets an owner (research 05 §10.4)",
+    );
+    said.add(
+        "gateway.scan_rows",
+        gateway.scan_rows,
+        Kind::Derived,
+        "one row each step of a bucket's attempt passes or removes, the least that moves it, \
+         until deletion's throughput is measured",
+    );
+    said.add(
+        "gateway.handover_ns",
+        gateway.handover_ns,
+        Kind::Cited,
+        "HDFS's 60 s soft limit (research 22 §3.6), until the gateway measures research 22 \
+         §10.2's D_b; it bounds how long a leftover waits, not correctness",
+    );
+    said.add(
+        "durability.chunk_rate",
+        rates.chunk,
+        Kind::Cited,
+        "the worst device class's annual failure rate, an hour, since a block's chunks may land \
+         on any device of the cell (mantle_ec::durability's disk rate; durability.md §5)",
+    );
+    said.add(
+        "durability.repair_rate",
+        rates.repair,
+        Kind::Cited,
+        "repair in a day, the longest research 15 §8.4 gives, until repair is built and measured",
+    );
+    for burst in &rates.bursts {
+        said.add(
+            "durability.burst",
+            format!("{} {}", burst.rate, burst.fraction),
+            Kind::Cited,
+            "a power-on restart a year, taking a hundredth of the nodes (durability.md §5)",
+        );
+    }
+    if stated {
+        said.add(
+            "durability.target",
+            target,
+            Kind::Stated,
+            "the operator's annual chance of losing a block at most",
+        );
+    } else {
+        said.add(
+            "durability.target",
+            target,
+            Kind::Cited,
+            "S3's eleven nines a year, applied to each block (durability.md §1)",
+        );
+    }
+}
+
+fn say_floor(
+    said: &mut Said,
+    ceiling: Option<u64>,
+    measured: &Measured,
+    allowed: u64,
+    classes: &[(Class, u64)],
+    remaining: u64,
+) {
+    let why = match (ceiling, measured.memory.limit) {
+        (Some(_), _) => "the operator's ceiling, within what the OS lets the process hold",
+        (None, Some(limit)) if limit < measured.memory.total => {
+            "the OS's limit for the process, the operator's statement in an orchestrator \
+             (research 64 §5)"
+        }
+        _ => "the machine's physical memory, with no ceiling stated and no tighter limit set",
+    };
+    let kind = if ceiling.is_some() {
+        Kind::Stated
+    } else {
+        Kind::Measured
+    };
+    said.add("memory.allowance", allowed, kind, why);
+    for &(class, bytes) in classes {
+        said.add(
+            format!("memory.floor.{class}"),
+            bytes,
+            Kind::Derived,
+            match class {
+                Class::Objects => {
+                    "two operations of the largest blocks the schemes make (derive::objects)"
+                }
+                Class::Volumes => "each volume's buffers (mantle_chunk::layout::most_bytes)",
+                Class::Engines => {
+                    "each engine's memtables and store buffers \
+                     (mantle_engine::shard_db::bounded_bytes); its extents' from what remains"
+                }
+                Class::Ranges => {
+                    "each range's member at hyper-raft's limits, its reads the node's own and \
+                     its exchanges' (derive::range_bytes)"
+                }
+                Class::Log => "the node's shared log (derive::log_bytes)",
+                Class::Transport => {
+                    "the transport's budget and what it holds beside it, its plane and its \
+                     liveness stream (derive::transport_bytes_beside)"
+                }
+                Class::Threads => {
+                    "the threads the node starts, each a 2 MiB stack reserved whole \
+                     (derive::threads)"
+                }
+            },
+        );
+    }
+    said.add(
+        "memory.remaining",
+        remaining,
+        Kind::Derived,
+        "the allowance past the floor: each volume's index and each engine's resident metadata, \
+         in proportion to what each wants (derive::shares)",
+    );
+}
+
+fn say_volume(
+    said: &mut Said,
+    n: usize,
+    facts: &VolumeFacts,
+    config: &VolumeConfig,
+    index_bytes: u64,
+) {
+    let profile = if facts.measured_now {
+        "the device's calibration, measured now and kept in its profile (chunk-store.md §7)"
+    } else {
+        "the device's calibration, kept in its profile, which the device still matches \
+         (chunk-store.md §7, node.md §1.6)"
+    };
+    let p = &facts.profile;
+    said.add(
+        format!("volume.{n}.depth"),
+        p.depth,
+        Kind::Measured,
+        profile,
+    );
+    said.add(
+        format!("volume.{n}.issuer_depth"),
+        issuer_depth(facts),
+        Kind::Derived,
+        "the transfers the device's issuer keeps in flight: the smaller of the queue the OS \
+         reports and the depth measured (hyper_block::issuer::depth)",
+    );
+    said.add(
+        format!("volume.{n}.read_bytes"),
+        p.read_bytes,
+        Kind::Measured,
+        profile,
+    );
+    said.add(
+        format!("volume.{n}.read_gap"),
+        p.read_gap,
+        Kind::Measured,
+        profile,
+    );
+    said.add(
+        format!("volume.{n}.prewrite"),
+        u8::from(p.prewrite),
+        Kind::Measured,
+        profile,
+    );
+    let laid = facts.formatted.is_some();
+    said.add(
+        format!("volume.{n}.segment_bytes"),
+        config.segment_size,
+        Kind::Derived,
+        if laid {
+            "as laid out: a volume keeps its segments (mantle_chunk::formatted)"
+        } else {
+            "the least segment holding a record of the largest chunk whole, smaller segments \
+             cleaning better (research 11 §7.3–§7.4)"
+        },
+    );
+    said.add(
+        format!("volume.{n}.checksum_shift"),
+        config.checksum_shift,
+        Kind::Derived,
+        if laid {
+            "as laid out: a volume keeps its checksum blocks (mantle_chunk::formatted)"
+        } else {
+            "checksum blocks of the volume's block, at most CRC-32C's verified 16 KiB \
+             (research 11 §8.2)"
+        },
+    );
+    said.add(
+        format!("volume.{n}.index_bytes"),
+        index_bytes,
+        Kind::Derived,
+        "the volume's share of what remains of memory past the floor (derive::shares)",
+    );
+    said.add(
+        format!("volume.{n}.max_fragments"),
+        config.max_fragments,
+        Kind::Derived,
+        "as many fragments as the index's share holds at its measured peak \
+         (index::most_fragments) and the volume holds at a block each, within what a laid-out \
+         volume's log holds checkpoints of",
+    );
+    said.add(
+        format!("volume.{n}.compact"),
+        u8::from(config.compact),
+        Kind::Derived,
+        "the standard layout, or the compact one where the standard leaves fewer than two \
+         segments (chunk-store.md §2)",
+    );
+    said.add(
+        format!("volume.{n}.scrub_period_s"),
+        config.scrub_period.map_or(0, |period| period.as_secs()),
+        Kind::Cited,
+        "a week a scrub, research 03 §15.9's target of the fourteen days it allows",
+    );
+    said.add(
+        format!("volume.{n}.batch_requests"),
+        config.limits.batch_requests,
+        Kind::Derived,
+        "one record a batch, as the node puts chunks whole",
+    );
+    said.add(
+        format!("volume.{n}.batch_bytes"),
+        config.limits.batch_bytes,
+        Kind::Derived,
+        "a segment's room, a record of the largest chunk",
+    );
+    said.add(
+        format!("volume.{n}.fragments_per_chunk"),
+        config.limits.fragments_per_chunk,
+        Kind::Derived,
+        "one fragment a chunk, as the node puts chunks whole",
+    );
+}
+
+fn say_engine(said: &mut Said, engine: &Engine, metadata: u64, held_extents: u64, founded: bool) {
+    said.add(
+        "engine.page_size",
+        engine.store.page_size,
+        Kind::Derived,
+        if founded {
+            "as the ranges' stores were made: a store opens only at its page (Store::shape)"
+        } else {
+            "the least page whose branch pages hold a row at the range's bounds, a multiple of \
+             the device's unit (mantle_engine::branch::least_page, replica.md §2)"
+        },
+    );
+    said.add(
+        "engine.extent_pages",
+        engine.store.extent_pages,
+        Kind::Derived,
+        "the least pages the store takes an extent, the superblocks' two in extent 0",
+    );
+    said.add(
+        "engine.metadata_bytes",
+        metadata,
+        Kind::Derived,
+        "each range's share of what remains of memory past the floor, for its engine's resident \
+         metadata (derive::shares)",
+    );
+    said.add(
+        "engine.max_extents",
+        engine.store.max_extents,
+        Kind::Derived,
+        if held_extents >= engine.store.max_extents && held_extents > 0 {
+            "as many extents as a range's store holds already, past what its share holds: a \
+             store opens only admitting its extents (Store::open)"
+        } else {
+            "as many extents as the range's share of memory holds at the metadata measured at the \
+             densest rows and its share of the node directory's device holds \
+             (derive::engine_within, shard_db::MEASURED_METADATA_PPM)"
+        },
+    );
+    said.add(
+        "engine.memtable_bytes",
+        engine.memtable_bytes,
+        Kind::Derived,
+        "the least write buffer, one row at the range's bounds whole \
+         (mantle_engine::memtable::hashed::entry_bytes)",
+    );
+    said.add(
+        "engine.fanout",
+        engine.trunk.fanout,
+        Kind::Cited,
+        "SplinterDB's 8, at which the engine's measurements ran (engine-structure.md §5–§6)",
+    );
+    said.add(
+        "engine.leaf_entries",
+        engine.trunk.leaf_entries,
+        Kind::Derived,
+        "every row one memtable gives a leaf, the most a memtable holds being rows of the \
+         shortest key and no value (mantle_meta::key::least_bytes)",
+    );
+}
+
+fn say_log(said: &mut Said, config: &LogConfig) {
+    let why = "hyper_log::Config::derive from the log's block, its largest entry with the shell's \
+               bytes, its groups, a group's retention of two cadences and a Ready, and a file \
+               holding every group's retention at once (derive::log)";
+    said.add(
+        "log.segment_bytes",
+        config.segment_bytes,
+        Kind::Derived,
+        why,
+    );
+    said.add("log.max_segments", config.max_segments, Kind::Derived, why);
+    said.add(
+        "log.max_groups",
+        config.max_groups,
+        Kind::Derived,
+        "a group for each range and the liveness stream's",
+    );
+    said.add(
+        "log.group_entries",
+        config.group_entries,
+        Kind::Derived,
+        why,
+    );
+    said.add("log.group_bytes", config.group_bytes, Kind::Derived, why);
+    said.add("log.group_cache", config.group_cache, Kind::Derived, why);
+    said.add(
+        "log.queue_submissions",
+        config.queue_submissions,
+        Kind::Derived,
+        why,
+    );
+    said.add(
+        "log.waits",
+        match config.waits {
+            hyper_log::Waits::Measured => "measured",
+            hyper_log::Waits::Never => "never",
+        },
+        Kind::Cited,
+        "the writer waits for the replicas it just answered while that is expected to lower \
+         total latency (raft-log.md §3, hyper-log's Waits::Measured)",
+    );
 }
 
 #[cfg(test)]
@@ -1437,5 +2690,364 @@ mod tests {
         let per = mantle_engine::shard_db::measured_per_extent(&e.store).unwrap();
         assert!(e.store.max_extents * per <= parts[1]);
         assert!((e.store.max_extents + 1) * per > parts[1]);
+    }
+
+    /// A host of 16 GiB with no OS limit, a node directory on a 4 KiB-unit device of a terabyte, and
+    /// each volume on a device of its own, measured as `PROFILE`.
+    fn facts(volumes: usize) -> Measured {
+        let device = |name: String| Device {
+            name: Some(name),
+            align: Alignment::new(4096).unwrap(),
+            queue: Some(32),
+            bytes: Some(1 << 40),
+        };
+        Measured {
+            memory: machine(16 << 30, None),
+            cores: 8,
+            page: 16_384,
+            meta: device("meta".into()),
+            volumes: (0..volumes)
+                .map(|n| VolumeFacts {
+                    device: device(format!("data{n}")),
+                    profile: PROFILE,
+                    measured_now: true,
+                    formatted: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// A node of a three-node cell hosting its five founding ranges, `volumes` volumes of 8 GiB and,
+    /// with them, objects.
+    fn stated(volumes: usize) -> Stated {
+        Stated {
+            id: 1,
+            dir: PathBuf::from("/node"),
+            quic: "127.0.0.1:7000".parse().unwrap(),
+            plane: "127.0.0.1:7001".parse().unwrap(),
+            authority: PathBuf::from("/node/identity/authority.der"),
+            certificate: PathBuf::from("/node/identity/node.der"),
+            key: PathBuf::from("/node/identity/node.key"),
+            peers: vec![
+                (2, Role::Node, PathBuf::from("/node/identity/2.der")),
+                (3, Role::Node, PathBuf::from("/node/identity/3.der")),
+                (9, Role::Client, PathBuf::from("/node/identity/9.der")),
+            ],
+            ranges: vec![
+                (0x10, Layer::Root),
+                (0x11, Layer::Bucket),
+                (0x12, Layer::Name),
+                (0x13, Layer::File),
+                (0x14, Layer::Block),
+            ],
+            voters: vec![1, 2, 3],
+            volumes: (0..volumes)
+                .map(|n| (PathBuf::from(format!("/data{n}")), 8 << 30))
+                .collect(),
+            enlist: (volumes > 0).then(|| Enlisting {
+                root: 0x10,
+                domain: "rack-1".into(),
+                max_nodes: 3,
+                max_volumes: 3,
+            }),
+            keys: if volumes > 0 {
+                vec![(1, PathBuf::from("/node/keys/1"))]
+            } else {
+                Vec::new()
+            },
+            ceiling: None,
+            target: None,
+        }
+    }
+
+    fn fresh(_: u128, _: usize) -> Result<Option<Shape>, String> {
+        Ok(None)
+    }
+
+    /// The bases as `mantle node`'s file: each key `mantle node` names and each line it repeats as
+    /// said, the volume's `volume.1.` keys its `volume.` ones and its line.
+    fn node_file(bases: &[Basis]) -> String {
+        use crate::process::{KEYS, REPEATED};
+        let mut text = String::new();
+        let mut line = Vec::new();
+        for basis in bases {
+            if let Some(field) = basis.key.strip_prefix("volume.1.") {
+                match field {
+                    "dir" | "size" | "depth" | "read_bytes" | "read_gap" | "prewrite" => {
+                        line.push(basis.value.clone());
+                    }
+                    "index_bytes" | "issuer_depth" => {}
+                    _ => text.push_str(&format!("volume.{field} = {}\n", basis.value)),
+                }
+            } else if KEYS.contains(&basis.key.as_str()) || REPEATED.contains(&basis.key.as_str()) {
+                text.push_str(&format!("{} = {}\n", basis.key, basis.value));
+            }
+        }
+        if !line.is_empty() {
+            text.push_str(&format!("volume = {}\n", line.join(" ")));
+        }
+        text
+    }
+
+    /// Every value `mantle node`'s configuration names is derived with its basis, each key once and
+    /// each repeated line as often as it repeats; written as `mantle node`'s file, they read back as
+    /// exactly what the node runs with, and pass the node's own checks.
+    #[test]
+    fn every_value_mantle_node_names_is_derived_with_its_basis() {
+        let derived = derive(stated(1), &facts(1), &mut fresh).unwrap();
+        let said = |key: &str| derived.bases.iter().filter(|b| b.key == key).count();
+        for key in crate::process::KEYS {
+            let key = key
+                .strip_prefix("volume.")
+                .map_or_else(|| (*key).to_owned(), |field| format!("volume.1.{field}"));
+            assert_eq!(said(&key), 1, "{key}");
+        }
+        for (key, lines) in [
+            ("peer", 3),
+            ("range", 5),
+            ("root_key", 1),
+            ("durability.burst", 1),
+        ] {
+            assert_eq!(said(key), lines, "{key}");
+        }
+        for key in ["dir", "size", "depth", "read_bytes", "read_gap", "prewrite"] {
+            assert_eq!(said(&format!("volume.1.{key}")), 1, "{key}");
+        }
+        // Each says where it comes from, and why.
+        for basis in &derived.bases {
+            assert!(!basis.value.is_empty() && !basis.why.is_empty(), "{basis}");
+        }
+        let kind = |key: &str| derived.bases.iter().find(|b| b.key == key).unwrap().kind;
+        assert_eq!(kind("id"), Kind::Stated);
+        assert_eq!(kind("volume.1.depth"), Kind::Measured);
+        assert_eq!(kind("engine.page_size"), Kind::Derived);
+        assert_eq!(kind("engine.fanout"), Kind::Cited);
+        assert_eq!(kind("runtime.probe_budget_ms"), Kind::Bound);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.conf");
+        std::fs::write(&path, node_file(&derived.bases)).unwrap();
+        let read = ProcessConfig::read(&path).unwrap();
+        let config = &derived.config;
+        assert_eq!(
+            (read.id, &read.dir, read.quic, read.plane),
+            (config.id, &config.dir, config.quic, config.plane)
+        );
+        assert_eq!(
+            (&read.authority, &read.certificate, &read.key),
+            (&config.authority, &config.certificate, &config.key)
+        );
+        assert_eq!(read.peers, config.peers);
+        assert_eq!(read.ranges, config.ranges);
+        assert_eq!(read.voters, config.voters);
+        assert_eq!(read.settings, config.settings);
+        assert_eq!(read.rules, config.rules);
+        assert_eq!(read.log, config.log);
+        assert_eq!(read.store, config.store);
+        assert_eq!(read.memtable_bytes, config.memtable_bytes);
+        assert_eq!(read.trunk, config.trunk);
+        assert_eq!(read.transport_bytes, config.transport_bytes);
+        assert_eq!(read.probe_budget, config.probe_budget);
+        assert_eq!(
+            format!("{:?}", read.volumes),
+            format!("{:?}", config.volumes)
+        );
+        assert_eq!(read.chunk_bytes, config.chunk_bytes);
+        assert_eq!(
+            (read.chunk_asks, read.command_asks, read.read_asks),
+            (config.chunk_asks, config.command_asks, config.read_asks)
+        );
+        assert_eq!(read.enlist, config.enlist);
+        let (read, config) = (read.gateway.unwrap(), config.gateway.as_ref().unwrap());
+        assert_eq!(read.keys, config.keys);
+        assert_eq!(
+            (
+                read.handover_ns,
+                read.window,
+                read.objects,
+                read.bucket_quota,
+                read.scan_rows
+            ),
+            (
+                config.handover_ns,
+                config.window,
+                config.objects,
+                config.bucket_quota,
+                config.scan_rows
+            )
+        );
+        assert_eq!(
+            (read.chunk_rate, read.repair_rate, read.target),
+            (config.chunk_rate, config.repair_rate, config.target)
+        );
+        assert_eq!(read.bursts, config.bursts);
+    }
+
+    /// The floor's allowance is a stated ceiling where one is: the node refuses one past what the OS
+    /// lets it hold, and one below its floor, naming the class that crosses it; past the floor, the
+    /// less that remains, the fewer fragments and extents its volumes and engines take.
+    #[test]
+    fn a_stated_ceiling_bounds_the_floor_and_what_remains() {
+        let full = derive(stated(1), &facts(1), &mut fresh).unwrap();
+        let bytes = |derived: &Derived, key: &str| -> u64 {
+            let basis = derived.bases.iter().find(|b| b.key == key).unwrap();
+            basis.value.parse().unwrap()
+        };
+        let floor: u64 = [
+            "objects",
+            "volumes",
+            "engines",
+            "ranges",
+            "log",
+            "transport",
+            "threads",
+        ]
+        .iter()
+        .map(|class| bytes(&full, &format!("memory.floor.{class}")))
+        .sum();
+        assert_eq!(bytes(&full, "memory.allowance"), 16 << 30);
+        assert_eq!(bytes(&full, "memory.remaining"), (16 << 30) - floor);
+        let ceiling = |bytes| Stated {
+            ceiling: Some(bytes),
+            ..stated(1)
+        };
+        assert!(matches!(
+            derive(ceiling((16 << 30) + 1), &facts(1), &mut fresh),
+            Err(DeriveError::Ceiling { .. })
+        ));
+        assert!(matches!(
+            derive(ceiling(floor - 1), &facts(1), &mut fresh),
+            Err(DeriveError::Memory { floor: f, .. }) if f == floor
+        ));
+        // A twentieth past the floor: less for each index and each engine.
+        let tight = derive(ceiling(floor + floor / 20), &facts(1), &mut fresh).unwrap();
+        assert_eq!(bytes(&tight, "memory.remaining"), floor / 20);
+        assert_eq!(
+            tight
+                .bases
+                .iter()
+                .find(|b| b.key == "memory.allowance")
+                .unwrap()
+                .kind,
+            Kind::Stated
+        );
+        assert!(
+            tight.config.volumes[0].config.max_fragments
+                < full.config.volumes[0].config.max_fragments
+        );
+        assert!(tight.config.store.max_extents < full.config.store.max_extents);
+        let shared =
+            bytes(&tight, "volume.1.index_bytes") + 5 * bytes(&tight, "engine.metadata_bytes");
+        assert!(shared <= floor / 20);
+    }
+
+    /// A node restarted on stores it made keeps their page and extent sizes, and admits the extents
+    /// they hold however few its share now holds; stores of two shapes, or of a page that holds no
+    /// row at the bounds, are refused.
+    #[test]
+    fn stores_made_already_keep_their_shape_and_their_extents() {
+        let derived = derive(stated(1), &facts(1), &mut fresh).unwrap();
+        let page = derived.config.store.page_size;
+        let wider = page + 4096;
+        let held = derived.config.store.max_extents + 10;
+        let mut made = |group: u128, asked: usize| -> Result<Option<Shape>, String> {
+            assert_eq!(asked, page);
+            let shape = Shape {
+                page_size: wider,
+                extent_pages: 2,
+                extents: held,
+            };
+            Ok(if group == 0x14 { None } else { Some(shape) })
+        };
+        let again = derive(stated(1), &facts(1), &mut made).unwrap();
+        assert_eq!(again.config.store.page_size, wider);
+        assert_eq!(again.config.store.max_extents, held);
+        let mut two = |group: u128, _: usize| -> Result<Option<Shape>, String> {
+            Ok(Some(Shape {
+                page_size: if group == 0x10 { page } else { wider },
+                extent_pages: 2,
+                extents: 3,
+            }))
+        };
+        assert!(matches!(
+            derive(stated(1), &facts(1), &mut two),
+            Err(DeriveError::StorePages { .. })
+        ));
+        let mut small = |_: u128, _: usize| -> Result<Option<Shape>, String> {
+            Ok(Some(Shape {
+                page_size: 4096,
+                extent_pages: 2,
+                extents: 3,
+            }))
+        };
+        assert!(matches!(
+            derive(stated(1), &facts(1), &mut small),
+            Err(DeriveError::StorePage { page: 4096, .. })
+        ));
+        let mut unread = |group: u128, _: usize| -> Result<Option<Shape>, String> {
+            Err(format!("store {group:x} does not read"))
+        };
+        assert!(matches!(
+            derive(stated(1), &facts(1), &mut unread),
+            Err(DeriveError::Store { group: 0x10, .. })
+        ));
+    }
+
+    /// A volume laid out already keeps its layout; a node of no volumes and no root keys hosts no
+    /// objects and asks nothing itself; and a node directory too small for its log is refused.
+    #[test]
+    fn a_laid_out_volume_keeps_its_layout_and_a_bare_node_asks_nothing() {
+        let align = Alignment::new(4096).unwrap();
+        let first = volume(
+            align,
+            8 << 30,
+            mantle_gateway::layout::CHUNK,
+            &PROFILE,
+            1 << 20,
+            None,
+        )
+        .unwrap();
+        let wider = VolumeConfig {
+            segment_size: first.segment_size * 2,
+            ..first
+        };
+        let mut laid = facts(1);
+        laid.volumes[0].formatted = Some(Formatted {
+            geometry: Geometry::plan(8 << 30, align, &wider).unwrap(),
+            checksum_shift: 12,
+        });
+        laid.volumes[0].measured_now = false;
+        let derived = derive(stated(1), &laid, &mut fresh).unwrap();
+        assert_eq!(
+            derived.config.volumes[0].config.segment_size,
+            wider.segment_size
+        );
+        let depth = derived
+            .bases
+            .iter()
+            .find(|b| b.key == "volume.1.depth")
+            .unwrap();
+        assert!(depth.why.contains("kept"), "{depth}");
+
+        let bare = derive(stated(0), &facts(0), &mut fresh).unwrap();
+        let config = &bare.config;
+        assert!(config.gateway.is_none() && config.enlist.is_none() && config.volumes.is_empty());
+        assert_eq!(
+            (config.chunk_asks, config.command_asks, config.read_asks),
+            (0, 0, 0)
+        );
+        assert!(!bare.bases.iter().any(|b| b.key.starts_with("gateway.")));
+
+        let mut small = facts(0);
+        small.meta.bytes = Some(1 << 20);
+        assert!(matches!(
+            derive(stated(0), &small, &mut fresh),
+            Err(DeriveError::Space { .. })
+        ));
+        small.meta.bytes = None;
+        assert!(matches!(
+            derive(stated(0), &small, &mut fresh),
+            Err(DeriveError::Unsized)
+        ));
     }
 }

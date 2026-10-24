@@ -262,9 +262,10 @@ measures the second, and derives the rest by these rules:
   bytes; a checkpoint's largest frame thrice or recovery's window; each segment's state thrice),
   its index apart (`index::most_bytes`, from what memory remains); a range engine's buffers its
   configuration bounds (`mantle_engine::shard_db::bounded_bytes`: two memtables' arenas, reserved
-  whole; a page buffer, a point read's page, a checkpoint page and an extent's run; for each
-  extent its file may hold its allocator's count, its free or pending slot, its map bit and a map
-  word); and the threads the node starts (`derive::threads`: standard input's and output's, the
+  whole; a page buffer, a point read's page, a checkpoint page and an extent's run), each extent's
+  allocator count, free or pending slot, map bit and map word apart, charged with the extent's
+  resident metadata from what memory remains (`shard_db::measured_per_extent`); and the threads
+  the node starts (`derive::threads`: standard input's and output's, the
   log's two, each device's issuer and a worker a read of its depth, each volume's writer, cleaner
   and scrubber), each at Rust's default stack of 2 MiB, reserved whole; and each range's member
   (`derive::range_bytes`, hyper-durable's holds at the bounds hyper-raft's limits put on each:
@@ -370,6 +371,39 @@ measures the second, and derives the rest by these rules:
   trunk's own records are counted as held, not stated: a node's pivots grow past the fanout while
   its split waits for its parent's pivot to empty, and nodes never merge, so their count follows
   the splits a range has seen, not the data it holds (research/68 §3).
+
+*As built (2026-10-23).* `mantle serve CONFIG` reads a file of the first column's keys alone, each
+once (`id`, `dir`, `quic`, `plane`, `authority`, `certificate`, `key`, `voters`, `domain`,
+`root.max_nodes`, `root.max_volumes`, and, where stated, `memory`, the ceiling, and
+`durability.target`) and its repeated `peer`, `range`, `root_key` and `volume = DIR SIZE` lines; a
+key it does not know, a derived one among them, is refused at its line, as `mantle node` now
+refuses one it does not know (`process::STATED_KEYS`, `process::KEYS`). It takes each volume's
+device directory's `LOCK` first (§1.7 step 1; `storage::Locks`, handed to the volumes as they open),
+then measures: the host's memory, the OS's limit and its cores and page (hyper-rt `Facts`); the node
+directory's device, its unit and its file system's bytes (`mantle_disk::probe::identify`); each
+data device's profile, kept in its `mantle/profile` and taken while the device's identity still
+matches it, else measured now (`Plan::standard`) and kept (`mantle_disk::profile`, §1.6); and each
+volume's layout once laid out (`mantle_chunk::formatted`). `derive::derive` assembles every value
+`mantle node`'s configuration names from those, by the rules above and the table below, and each
+range's store as it stands, read at the page a new store would take or the one its superblock names
+(`Store::shape`): a store keeps the page and extent sizes it was made with, and the engine admits
+the extents it holds however few its share now holds, since a store opens only at its sizes and
+admitting its extents (`Store::open`). The node says each value on standard output before anything
+opens, `basis KEY = VALUE (KIND: WHY)`, its kind one of stated, measured, derived, cited and bound,
+a volume's under `volume.N.` (N its place among the `volume` lines from 1) and the floor's under
+`memory.`, then runs as `mantle node` does. `derive::derive`'s values written as `mantle node`'s file
+read back as exactly what the node runs with (`derive::tests`), and a cell of three `mantle serve`
+processes from stated keys alone says every key's basis, enlists, serves objects, and, a node
+killed and started again, takes its kept profile and its stores' and volume's shapes and says the
+same values (`crates/mantle/tests/serve.rs`, a binary of its own: a process states one set of
+message bounds, `classes::state_bounds`, and these nodes derive theirs). The scheme a gateway host
+chooses is the durability model's under the rates `derive` sized its asks by, the yearly power-on
+restart among them (`mantle node`'s `durability.burst` lines, which it took as none before).
+*Open:* a range's engine holds its share of memory itself only alone (`ShardDb::set_metadata_limit`):
+a range's members apply the same entries, and a refusal that turns on each member's own metadata,
+which its compactions' progress moves, would let them diverge, so a replicated range must refuse a
+put where its leader admits a command, before the entry is proposed. Until then a node's engines
+are sized by their shares (`derive::engine_within`) and take no limit.
 
 | Value (`mantle node`'s key) | Kind | Model and source |
 |---|---|---|
@@ -484,15 +518,22 @@ separates the format choices fixed at format from the runtime choices, and it is
 when the device's identity, firmware, file system or topology no longer match it. On a laptop
 the key file and the data share a disk, which the node reports.
 
-*As built, and planned (2026-10-21).* The node's directory holds its metadata today: the shared
-log (`log`), its run record (`run`, §2.4 item 4) and each range's engine store
-(`range-GROUP.store`), and each volume's device directory holds `mantle/LOCK` and `mantle/volume`.
-`mantle init` and `mantle serve` add to the node's directory its `config`, `identity/` (the node's
-key and certificate, the authority's certificate, each pinned peer's certificate), `keys/` (one
-root-key file a generation), hyper-rt's calibration record, and a `LOCK` of its own, held as the
-volumes' are, since its log and stores admit one process as a volume does; and to each device
-directory its `profile`. `meta/` on a metadata device, `DEVICE` and `map` wait for the storage
-graph (§1.7 step 3) and the cell map (architecture §4).
+*As built, and planned (2026-10-21; 2026-10-23).* The node's directory holds its metadata today:
+the shared log (`log`), its run record (`run`, §2.4 item 4) and each range's engine store
+(`range-GROUP.store`), and each volume's device directory holds `mantle/LOCK`, `mantle/volume` and,
+under `mantle serve`, `mantle/profile`: the depth, read bytes, read gap and first-write penalty its
+calibration measured, keyed by the identity facts that decide how the device performs (its model,
+medium and interconnect, its blocks and transfers, its queue, write cache, FUA, zones,
+removability and size, its file system's kind, block and size, and each member's), a hyper-block
+record written whole, flushed and checked by its CRC-32C on read; one of another key, another
+layout version or that does not read is measured again and replaced (`mantle_disk::profile`). The
+OS's names for devices, which a restart may change, are not in the key, and firmware is not yet,
+since no probe reads it. `mantle init` and `mantle serve` add to the node's directory its `config`,
+`identity/` (the node's key and certificate, the authority's certificate, each pinned peer's
+certificate), `keys/` (one root-key file a generation), hyper-rt's calibration record, and a `LOCK`
+of its own, held as the volumes' are, since its log and stores admit one process as a volume does.
+`meta/` on a metadata device, `DEVICE` and `map` wait for the storage graph (§1.7 step 3) and the
+cell map (architecture §4).
 
 ### 1.7 Starting, stopping, rolling back
 

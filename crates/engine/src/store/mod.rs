@@ -48,6 +48,17 @@ pub struct Config {
     pub max_extents: u64,
 }
 
+/// What a store's file was created with and holds now, as its newest superblock names them
+/// ([`Store::shape`]): a store opened on it takes its page and extent sizes and admits at least its
+/// extents ([`Store::open`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shape {
+    pub page_size: usize,
+    pub extent_pages: u32,
+    /// Extents the file holds: its allocator map's length.
+    pub extents: u64,
+}
+
 /// What [`Store::open`] recovered: the newest durable checkpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Recovered {
@@ -962,16 +973,8 @@ impl<F: BlockFile> Store<F> {
         blocking_allowed("a synchronous store recovery in a runtime task")?;
         Self::check(&file, config)?;
         let mut buf = Self::page_buf(&file, config)?;
-        let mut best: Option<Superblock> = None;
-        for slot in 0..2u64 {
-            let Ok(sb) = Self::read_superblock(&file, config, &mut buf, slot) else {
-                continue;
-            };
-            if sb.slot() == slot && best.as_ref().is_none_or(|b| sb.generation > b.generation) {
-                best = Some(sb);
-            }
-        }
-        let sb = best.ok_or(corrupt(Malformed::ChecksumMismatch))?;
+        let sb =
+            Self::newest(&file, config, &mut buf).ok_or(corrupt(Malformed::ChecksumMismatch))?;
         if usize::try_from(sb.page_size).ok() != Some(config.page_size)
             || sb.extent_pages != config.extent_pages
         {
@@ -1041,6 +1044,80 @@ impl<F: BlockFile> Store<F> {
             },
             recovered,
         ))
+    }
+
+    /// The shape of the store in `file` ([`Shape`]), read as [`Store::open`] reads it, the newer
+    /// of its two superblock copies that verify: at the page its first copy names, else at
+    /// `page_size`, so a store whose first copy is torn is read at the page its opener expects.
+    pub fn shape(file: &F, page_size: usize) -> Result<Shape, Error> {
+        blocking_allowed("a synchronous superblock read in a runtime task")?;
+        let named = Self::named_page(file)?;
+        for page in named.into_iter().chain(Some(page_size)) {
+            let config = Config {
+                page_size: page,
+                extent_pages: 2,
+                max_extents: 0,
+            };
+            if Self::check(file, config).is_err() {
+                continue;
+            }
+            let mut buf = Self::page_buf(file, config)?;
+            if let Some(sb) = Self::newest(file, config, &mut buf) {
+                return Ok(Shape {
+                    page_size: usize::try_from(sb.page_size)
+                        .map_err(|_| corrupt(Malformed::TooLarge))?,
+                    extent_pages: sb.extent_pages,
+                    extents: sb.extents,
+                });
+            }
+        }
+        Err(corrupt(Malformed::ChecksumMismatch))
+    }
+
+    /// The page the first superblock copy names before it is verified, which only a copy that
+    /// verifies at it confirms: none where the file's first page holds no superblock's magic, or
+    /// names a page below the least, off the file's alignment, or past half the file, whose
+    /// first extent holds both copies.
+    fn named_page(file: &F) -> Result<Option<usize>, Error> {
+        let first = file.alignment().get().max(MIN_PAGE);
+        let len = file.len().map_err(|e| io("stat a store", e))?;
+        let fits = |bytes: usize| u64::try_from(bytes).is_ok_and(|b| b <= len);
+        if !fits(first) {
+            return Ok(None);
+        }
+        let config = Config {
+            page_size: first,
+            extent_pages: 2,
+            max_extents: 0,
+        };
+        let mut buf = Self::page_buf(file, config)?;
+        file.read_exact_at(buf.as_mut_slice(), 0)
+            .map_err(|e| io("read a superblock", e))?;
+        let named = buf
+            .as_slice()
+            .get(HEADER..)
+            .and_then(superblock::named_page)
+            .and_then(|page| usize::try_from(page).ok());
+        Ok(named.filter(|&page| {
+            page >= MIN_PAGE
+                && file.alignment().is_aligned(page)
+                && page.checked_mul(2).is_some_and(fits)
+        }))
+    }
+
+    /// The newer of the two superblock copies that verify at `config`'s page, each at its own
+    /// slot; none where neither does.
+    fn newest(file: &F, config: Config, buf: &mut AlignedBuf) -> Option<Superblock> {
+        let mut best: Option<Superblock> = None;
+        for slot in 0..2u64 {
+            let Ok(sb) = Self::read_superblock(file, config, buf, slot) else {
+                continue;
+            };
+            if sb.slot() == slot && best.as_ref().is_none_or(|b| sb.generation > b.generation) {
+                best = Some(sb);
+            }
+        }
+        best
     }
 
     fn read_superblock(

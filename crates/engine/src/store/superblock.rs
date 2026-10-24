@@ -56,6 +56,17 @@ pub fn max_map_extents(room: usize) -> usize {
     room.saturating_sub(FIXED) / 8
 }
 
+/// The page size a payload's magic and fixed fields name, before its page is verified: what a
+/// reader that does not know a store's page reads its superblock copies at.
+pub fn named_page(payload: &[u8]) -> Option<u32> {
+    let magic = payload.first_chunk::<8>().map(|b| u64::from_le_bytes(*b))?;
+    let page = payload
+        .get(8..)
+        .and_then(<[u8]>::first_chunk::<4>)
+        .map(|b| u32::from_le_bytes(*b))?;
+    if magic == MAGIC { Some(page) } else { None }
+}
+
 impl Superblock {
     /// The payload's bytes.
     pub fn encoded_len(&self) -> Result<usize, Error> {

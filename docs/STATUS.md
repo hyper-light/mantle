@@ -426,6 +426,26 @@ Remaining before it is done:
   process crashes and disk faults, both in deterministic simulation and with real
   processes.
 
+**Derived settings** ([design](design/node.md) §1.4). `mantle serve CONFIG` runs a node from its
+operator's statements alone: its identity and directory, where it listens, its peers, the cell's
+founding ranges and voters, its volumes' directories and bytes, its failure domain and the cell's
+bounds, its root key's generations, and, where stated, a memory ceiling and the durability
+target; any other key is refused at its line. It locks each volume's device directory, measures
+the host's memory, the OS's limit, cores and page, the node directory's device, and each data
+device, whose profile it keeps in `mantle/profile` and takes again while the device still matches
+it; derives every value `mantle node`'s configuration names (`derive::derive`): the cell's settings
+and rules, the log, the objects' floor and asks, each volume's layout, each engine's page, extents
+and memtable, the transport's floor, the floor class by class within the allowance, and what
+remains shared by each volume's index and each engine's resident metadata; and says each value
+with its basis before it runs as `mantle node` does. A node started again takes its stores' and
+volumes' shapes as they were made. Tested by unit tests of every model and by a cell of three
+`mantle serve` processes that enlists, serves objects, and says the same values after a node is
+killed and started again (`crates/mantle/tests/serve.rs`). Remaining: `mantle init` writing the
+stated configuration and identities; the node directory's own `LOCK`; startup in node.md §1.7's
+order with typed failures and an orderly stop on SIGTERM; and a replicated range refusing puts at
+its engine's metadata share where its leader admits a command, since a refusal at apply would let
+members diverge.
+
 ## Planned, in order
 
 The work the designs of 2026-09-30 create (research notes 26–31, folded into node.md,

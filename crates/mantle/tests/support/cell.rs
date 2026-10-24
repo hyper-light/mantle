@@ -112,6 +112,7 @@ engine.max_extents = 256
 engine.fanout = 3
 engine.leaf_entries = 96
 runtime.probe_budget_ms = 40
+stop_ms = 10000
 chunk_bytes = 8388608
 ";
 
@@ -326,6 +327,13 @@ pub(crate) enum Line {
     /// The bytes the node's transfers moved, said as they move, and its transport's serve period:
     /// the longest an exchange it carries may go without moving before the transport refuses it.
     Moved(u64, Duration),
+    /// The node began its orderly stop at a signal.
+    Stopping,
+    /// Its orderly stop handed a range's lead over: the range's group, and the member that then
+    /// led it.
+    Handed(u128, u64),
+    /// Its orderly stop is done: the process ends.
+    Stopped,
 }
 
 pub(crate) fn parse(line: &str) -> Option<Line> {
@@ -343,6 +351,12 @@ pub(crate) fn parse(line: &str) -> Option<Line> {
         ["link", peer, rest @ ..] => Some(Line::Link(peer.parse().ok()?, rest.join(" "))),
         ["volume", id] => Some(Line::Volume(u128::from_str_radix(id, 16).ok()?)),
         ["enlisted"] => Some(Line::Enlisted),
+        ["stopping"] => Some(Line::Stopping),
+        ["handed", group, leader] => Some(Line::Handed(
+            u128::from_str_radix(group, 16).ok()?,
+            leader.parse().ok()?,
+        )),
+        ["stopped"] => Some(Line::Stopped),
         ["moved", bytes, serve] => Some(Line::Moved(
             bytes.parse().ok()?,
             Duration::from_nanos(serve.parse().ok()?),
@@ -413,7 +427,10 @@ pub(crate) fn movement(line: &Line) -> Option<(u64, u64, u64, u64, Duration, Dur
         | Line::Volume(..)
         | Line::Enlisted
         | Line::Basis(..)
-        | Line::Moved(..) => None,
+        | Line::Moved(..)
+        | Line::Stopping
+        | Line::Handed(..)
+        | Line::Stopped => None,
     }
 }
 
@@ -779,10 +796,23 @@ pub(crate) struct Cell {
     /// with, each with its basis, in the order said.
     pub(crate) serving: bool,
     pub(crate) bases: BTreeMap<u64, Vec<Basis>>,
+    /// Each range whose lead a node's orderly stop handed over: the node, the range's group and
+    /// the member that then led it; and the nodes whose stop said it was done.
+    pub(crate) handed: Vec<(u64, u128, u64)>,
+    pub(crate) stopped: BTreeSet<u64>,
     /// Each node's configuration as `mantle init` wrote it, for a cell it made (`Cell::made`):
     /// its process serves from that file, which the test does not write.
     pub(crate) made: BTreeMap<u64, PathBuf>,
     pub(crate) _root: tempfile::TempDir,
+}
+
+/// Sends `child` the signal that stops a node in order: SIGTERM, by the system's `kill`.
+pub(crate) fn stop_signal(child: &Child) {
+    let sent = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(sent.success(), "kill -TERM {}: {sent}", child.id());
 }
 
 impl Drop for Cell {
@@ -1018,6 +1048,8 @@ impl Cell {
             gateway: true,
             serving: true,
             bases: BTreeMap::new(),
+            handed: Vec::new(),
+            stopped: BTreeSet::new(),
             made,
             _root: root,
         };
@@ -1139,6 +1171,8 @@ impl Cell {
             gateway,
             serving,
             bases: BTreeMap::new(),
+            handed: Vec::new(),
+            stopped: BTreeSet::new(),
             made: BTreeMap::new(),
             _root: root,
         };
@@ -1278,6 +1312,43 @@ impl Cell {
         said
     }
 
+    /// Asks node `id`'s process to stop in order (node.md §1.7) and waits for its end, as the cell
+    /// reports it: how it exited. On Unix the request is SIGTERM; on Windows a `stop` line, since a
+    /// console's Ctrl-Break reaches only a process group sharing the sender's console (Microsoft's
+    /// `GenerateConsoleCtrlEvent`), which a test's process may not have. The cell's watch goes on
+    /// meanwhile, so a stop that holds still past the quiet period fails the test.
+    pub(crate) fn stop(&mut self, id: u64) -> std::process::ExitStatus {
+        self.refusing = Some(id);
+        if cfg!(unix) {
+            stop_signal(&self.running[&id].child);
+        } else {
+            self.say_to(id, b"stop\n");
+        }
+        self.ended()
+    }
+
+    /// Asks node `id`'s process to stop twice in one write, which its input takes whole, so the
+    /// second request comes as the stop begins: how the process exited.
+    pub(crate) fn stop_twice(&mut self, id: u64) -> std::process::ExitStatus {
+        self.refusing = Some(id);
+        self.say_to(id, b"stop\nstop\n");
+        self.ended()
+    }
+
+    /// Writes `bytes` to node `id`'s standard input, in one write.
+    fn say_to(&mut self, id: u64, bytes: &[u8]) {
+        let input = &mut self.running.get_mut(&id).unwrap().input;
+        input.write_all(bytes).unwrap();
+        input.flush().unwrap();
+    }
+
+    /// Waits for the process the test expects to end (`refusing`) to end: how it exited.
+    fn ended(&mut self) -> std::process::ExitStatus {
+        let mut running = self.until(|c| c.refused.take());
+        self.refusing = None;
+        running.child.wait().unwrap()
+    }
+
     /// Overwrites the first two pages of node `id`'s engine store, where both its superblocks
     /// lie, with bytes it never wrote: a device that returned other bytes than it acknowledged.
     pub(crate) fn damage_store(&self, id: u64) {
@@ -1327,7 +1398,10 @@ impl Cell {
                 | Line::Volume(..)
                 | Line::Enlisted
                 | Line::Basis(..)
-                | Line::Moved(..) => None,
+                | Line::Moved(..)
+                | Line::Stopping
+                | Line::Handed(..)
+                | Line::Stopped => None,
             })
             .chain(self.clients.values().copied())
             .chain(self.transfers.values().map(|(_, serve)| *serve))
@@ -1483,6 +1557,11 @@ impl Cell {
                     }
                     Line::Enlisted => {
                         self.enlisted.insert(id);
+                    }
+                    Line::Stopping => {}
+                    Line::Handed(group, leader) => self.handed.push((id, group, leader)),
+                    Line::Stopped => {
+                        self.stopped.insert(id);
                     }
                     Line::Basis(basis) => {
                         self.bases.entry(id).or_default().push(basis);

@@ -197,7 +197,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let work = match (head, self.gateway.as_ref()) {
             (_, None) => Work::Draining(Reply::status(Status::Failed)),
             (Err(_), Some(_)) => Work::Draining(Reply::status(Status::Malformed)),
-            (Ok(_), Some(g)) if self.jobs.len() >= g.objects => {
+            // A node stopping begins no operation (node.md §1.7): its client asks another.
+            (Ok(_), Some(g)) if self.stopping() || self.jobs.len() >= g.objects => {
                 Work::Draining(Reply::status(Status::SlowDown))
             }
             (Ok(head), Some(_)) => {

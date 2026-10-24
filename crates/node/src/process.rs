@@ -69,11 +69,14 @@
 //! (`Node::links`); and `moved BYTES SERVE_NS` as its transfers move:
 //! the bytes of exchanges' bodies it has read and written (`Node::moved`), said at most every half
 //! of the transport's serve period `SERVE_NS`, the longest an exchange it carries may go without
-//! moving before the transport refuses it. On
-//! standard input: `learn ID QUIC PLANE`, where a peer listens, and `replace FAILED JOINING`, a
+//! moving before the transport refuses it; and, in an orderly stop, `stopping` as it begins,
+//! `handed GROUP LEADER` for each range whose lead it handed over, and `stopped` as it ends. On
+//! standard input: `learn ID QUIC PLANE`, where a peer listens, `replace FAILED JOINING`, a
 //! member lost for good and the spare that takes its place in every range the node hosts
-//! (`Node::replace`). A line it cannot read ends the process with the line named; standard input
-//! closing ends it as a stop.
+//! (`Node::replace`), and `stop`, which asks the orderly stop as SIGTERM does. A line it cannot
+//! read ends the process with the line named. Standard input closing ends `mantle node`, its
+//! harness's child, at once, without the orderly stop's steps; `mantle serve` runs on, as under a
+//! service manager, whose input is empty.
 //!
 //! The ranges it hosts are the `range` lines', each `range = GROUP LAYER`: a group of the voters
 //! the file names, holding the rows of one layer (`root`, the cell's volume table; `bucket`,
@@ -93,9 +96,10 @@ use std::time::Duration;
 
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_log::{Config as LogConfig, LogStats, Waits};
-use hyper_rt::combine::{Either, race2};
+use hyper_rt::combine::{Either, Either3, race2, race3};
 use hyper_rt::machine::calibration::{Calibration, Policy};
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
+use hyper_rt::signal::Signal;
 use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer};
 use mantle_ec::durability::{Burst, Rates};
 use mantle_engine::store::{Config as StoreConfig, Shape, Store};
@@ -154,6 +158,46 @@ pub enum ProcessError {
     Resolve(u64, String, String),
     #[error("the start's {0} step: {1}")]
     Start(Step, Box<ProcessError>),
+    #[error("stopped at once: {0}")]
+    Stopped(&'static str),
+}
+
+/// The signals that stop the node in order (node.md §1.7): SIGTERM, which a service manager or a
+/// container's runtime sends, and SIGINT.
+#[cfg(unix)]
+const STOP_SIGNALS: &[Signal] = &[Signal::Terminate, Signal::Interrupt];
+/// The signals that stop the node in order (node.md §1.7): Ctrl-C and Ctrl-Break. A console's
+/// close, a logoff and a shutdown end the process as a crash would: hyper-rt's handler returns as
+/// it delivers them, and Windows then ends the process (node.md §1.7).
+#[cfg(windows)]
+const STOP_SIGNALS: &[Signal] = &[Signal::Interrupt, Signal::Break];
+
+/// The orderly stop as the process is asked it (node.md §1.7), by a signal or a `stop` line: the
+/// first request begins it, to end by its bound; a second ends the process at once.
+struct Stop {
+    bound_ns: u64,
+    /// When the stop ends at the latest, once begun.
+    by: Option<u64>,
+}
+
+impl Stop {
+    fn new(bound: Duration) -> Self {
+        Self {
+            bound_ns: u64::try_from(bound.as_nanos()).unwrap_or(u64::MAX),
+            by: None,
+        }
+    }
+
+    /// A request at `now`: the stop begins, or, begun already, the process ends at once.
+    fn ask(&mut self, now: u64) -> Result<(), ProcessError> {
+        if self.by.is_some() {
+            return Err(ProcessError::Stopped(
+                "a second request to stop came as the node stopped",
+            ));
+        }
+        self.by = Some(now.saturating_add(self.bound_ns));
+        Ok(())
+    }
 }
 
 /// `error` as a failure of the start's `step` (node.md §1.7).
@@ -303,6 +347,9 @@ pub struct ProcessConfig {
     pub transport_bytes: u64,
     /// Each probe of the machine's calibration runs within this (hyper-rt `Calibration::measure`).
     pub probe_budget: Duration,
+    /// The orderly stop's bound, from its first signal (node.md §1.7): past it the process ends as a
+    /// crash would.
+    pub stop: Duration,
     /// The chunk volumes the node keeps (`volume` lines), none for a node with no storage role.
     pub volumes: Vec<VolumeSettings>,
     /// The largest chunk the cell's gateways write, and the chunk puts and gets the node keeps out
@@ -386,6 +433,7 @@ pub const KEYS: &[&str] = &[
     "engine.leaf_entries",
     "transport_bytes",
     "runtime.probe_budget_ms",
+    "stop_ms",
     "chunk_bytes",
     "chunk_asks",
     "command_asks",
@@ -433,6 +481,7 @@ pub const STATED_KEYS: &[&str] = &[
     "root.max_volumes",
     "memory",
     "durability.target",
+    "stop_ms",
 ];
 
 /// The lines `mantle serve`'s file repeats: its peers and ranges, its volumes, each `volume = DIR
@@ -709,6 +758,7 @@ impl ProcessConfig {
             },
             transport_bytes: lines.get("transport_bytes")?,
             probe_budget: Duration::from_millis(lines.get("runtime.probe_budget_ms")?),
+            stop: Duration::from_millis(lines.get("stop_ms")?),
             volumes: volumes(&lines)?,
             chunk_bytes: lines.get("chunk_bytes")?,
             chunk_asks: lines.get("chunk_asks")?,
@@ -926,7 +976,7 @@ fn volumes(lines: &Lines) -> Result<Vec<VolumeSettings>, ProcessError> {
     Ok(volumes)
 }
 
-/// Runs the node the file at `config` states until standard input closes.
+/// Runs the node the file at `config` states until it stops in order or standard input closes.
 pub fn run(config: &Path) -> Result<(), ProcessError> {
     // Before any thread allocates: a freed large block's memory goes back to the OS, which a range's
     // budget following the machine reads as room (docs/research/65 §6).
@@ -945,14 +995,14 @@ pub fn run(config: &Path) -> Result<(), ProcessError> {
     let node = Locks::node(&config.dir).map_err(step(Step::Locks))?;
     let locks =
         Locks::take(config.volumes.iter().map(|v| v.dir.as_path())).map_err(step(Step::Locks))?;
-    start(config, (node, locks), identity)
+    start(config, (node, locks), identity, true)
 }
 
 /// Runs the node whose operator's statements the file at `config` holds (`mantle serve`, node.md
 /// §1.4): each volume's device directory locked, then each device's profile kept or measured, the
 /// node directory's device and the host's memory, cores and page measured; every other value
 /// derived from those (`derive::derive`) and said on standard output, a `basis` line each, before
-/// anything opens; then the node, as `mantle node` runs it, until standard input closes.
+/// anything opens; then the node, as `mantle node` runs it, until it stops in order.
 pub fn serve_stated(config: &Path) -> Result<(), ProcessError> {
     mantle_engine::port::mmap::return_freed_blocks();
     let stated = read_stated(config).map_err(step(Step::Configuration))?;
@@ -988,16 +1038,18 @@ pub fn serve_stated(config: &Path) -> Result<(), ProcessError> {
     out.flush().map_err(|e| ProcessError::Say(e.to_string()))?;
     // The runtime's writer says the rest: this thread holds no lock on standard output for it.
     drop(out);
-    start(derived.config, (node, locks), identity)
+    start(derived.config, (node, locks), identity, false)
 }
 
 /// The node of `config`, its directory and its volumes' devices under `held`'s locks, as
-/// `identity` says it is, until standard input closes: the start's steps after the locks
-/// (node.md §1.7), each failure naming its step. The directory's lock is held until the node ends.
+/// `identity` says it is: the start's steps after the locks (node.md §1.7), each failure naming its
+/// step, then the node until it stops in order at a signal, or, if it `ends_with_input`, until
+/// standard input closes. The directory's lock is held until the node ends.
 fn start(
     mut config: ProcessConfig,
     held: (NodeLock, Locks),
     identity: Identity,
+    ends_with_input: bool,
 ) -> Result<(), ProcessError> {
     let (node, locks) = held;
     // The volumes open before the node's runtime starts: an issuer's start and a volume's
@@ -1020,6 +1072,7 @@ fn start(
             gateway,
             (credentials, peers),
             addresses,
+            ends_with_input,
         ))
         .map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
     drop(node);
@@ -1065,6 +1118,7 @@ pub fn read_stated(path: &Path) -> Result<Stated, ProcessError> {
         enlist: enlisting(&lines)?,
         keys: root_keys(&lines)?,
         ceiling: lines.maybe("memory")?,
+        stop: lines.maybe("stop_ms")?.map(Duration::from_millis),
         target,
     })
 }
@@ -1234,6 +1288,7 @@ async fn serve(
     gateway: Option<GatewaySettings>,
     (credentials, peers): (Credentials, Vec<Peer>),
     addresses: Vec<(u64, SocketAddr, SocketAddr)>,
+    ends_with_input: bool,
 ) -> Result<(), ProcessError> {
     // This process's one shard runs the node's replicas, which apply through the engine's
     // synchronous calls (node.md §1.2).
@@ -1319,20 +1374,48 @@ async fn serve(
     let serve = crate::bounds::idle_timeout();
     let serve_ns = u64::try_from(serve.as_nanos()).unwrap_or(u64::MAX);
     let mut said_moved = (0u64, 0u64);
+    let signals = hyper_rt::signal::subscribe(STOP_SIGNALS).map_err(|e| talk(format!("{e:?}")))?;
+    let mut stop = Stop::new(config.stop);
+    // Whether standard input may say more: a node that does not end with it runs on once it closes,
+    // as `mantle serve` does under a service manager, whose input is empty.
+    let mut input_open = true;
     loop {
         let ended = {
             let turn = pin!(node.turn());
-            let line = pin!(input.read(&mut read));
-            race2(turn, line).await
+            let line = pin!(async {
+                if input_open {
+                    input.read(&mut read).await
+                } else {
+                    std::future::pending().await
+                }
+            });
+            let signal = pin!(signals.recv());
+            let bound = pin!(async {
+                match stop.by {
+                    Some(at) => {
+                        let left = at.saturating_sub(hyper_rt::futures::now_ns());
+                        hyper_rt::futures::sleep(left).await
+                    }
+                    None => std::future::pending().await,
+                }
+            });
+            race3(turn, line, race2(signal, bound)).await
         };
         match ended {
-            Either::First(turned) => turned?,
-            Either::Second(Ok(0)) => return Ok(()),
-            Either::Second(Ok(n)) => {
+            Either3::First(turned) => turned?,
+            Either3::Second(Ok(0)) if ends_with_input => return Ok(()),
+            Either3::Second(Ok(0)) => input_open = false,
+            Either3::Second(Ok(n)) => {
                 pending.extend_from_slice(read.get(..n).unwrap_or_default());
                 while let Some(end) = pending.iter().position(|b| *b == b'\n') {
                     let line: Vec<u8> = pending.drain(..=end).collect();
-                    take_line(&mut node, &config.ranges, &line)?;
+                    if line.trim_ascii() == b"stop" {
+                        stop.ask(hyper_rt::futures::now_ns())?;
+                        node.stop();
+                        say(&mut output, "stopping\n").await?;
+                    } else {
+                        take_line(&mut node, &config.ranges, &line)?;
+                    }
                 }
                 // A line is never longer than the buffer it is read into.
                 if pending.len() > chunk {
@@ -1340,7 +1423,17 @@ async fn serve(
                     return Err(ProcessError::Input(text, "a line longer than a page"));
                 }
             }
-            Either::Second(Err(e)) => return Err(ProcessError::Runtime(format!("{e:?}"))),
+            Either3::Second(Err(e)) => return Err(ProcessError::Runtime(format!("{e:?}"))),
+            Either3::Third(Either::First(signal)) => {
+                signal.map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
+                stop.ask(hyper_rt::futures::now_ns())?;
+                node.stop();
+                say(&mut output, "stopping\n").await?;
+            }
+            Either3::Third(Either::Second(slept)) => {
+                slept.map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
+                return Err(ProcessError::Stopped("the stop's bound passed"));
+            }
         }
         // The node keeps what its ranges answered as they applied for a caller that proposed to
         // them itself (`Node::take_applied`); this process proposes nothing itself, and a client's
@@ -1440,11 +1533,20 @@ async fn serve(
             say(&mut output, &format!("log {flushing} {longest}\n")).await?;
             stats = Some(log);
         }
+        // The orderly stop: each range whose lead it handed over, to the member that then led it,
+        // and its end, after which the node's log and volumes close as it is dropped.
+        for (group, leader) in node.take_handed() {
+            say(&mut output, &format!("handed {group:x} {leader}\n")).await?;
+        }
+        if node.stopped() {
+            say(&mut output, "stopped\n").await?;
+            return Ok(());
+        }
     }
 }
 
 /// Takes a line of the node's input: `learn ID QUIC PLANE` or `replace FAILED JOINING`, a
-/// replacement in each of `ranges`.
+/// replacement in each of `ranges`. (`stop`, the orderly stop a signal asks, the loop takes itself.)
 fn take_line<E: Engine + 'static>(
     node: &mut Node<E>,
     ranges: &[(u128, Layer)],
@@ -1536,6 +1638,20 @@ mod tests {
             lines.get::<u64>("dir"),
             Err(ProcessError::Missing("dir"))
         ));
+    }
+
+    /// The first request to stop begins the stop, to end by its bound; a second ends the process at
+    /// once.
+    #[test]
+    fn a_second_request_to_stop_ends_the_process_at_once() {
+        let mut stop = Stop::new(Duration::from_secs(10));
+        stop.ask(5).unwrap();
+        assert_eq!(stop.by, Some(5 + 10_000_000_000));
+        assert!(matches!(stop.ask(6), Err(ProcessError::Stopped(_))));
+        assert_eq!(stop.by, Some(5 + 10_000_000_000));
+        let mut unbounded = Stop::new(Duration::MAX);
+        unbounded.ask(u64::MAX - 1).unwrap();
+        assert_eq!(unbounded.by, Some(u64::MAX));
     }
 
     /// A peer line may name where the peer listens, by address or by name; a malformed endpoint,

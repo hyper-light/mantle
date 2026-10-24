@@ -643,6 +643,25 @@ process's bind of a held port with that flag set succeeds on Linux and macOS (me
 the port's datagrams. Binding the listener before it shares the port, as hyper-rt already does for
 port 0, refuses it; that change is hyper-rt's.
 
+The orderly stop is built as planned above. SIGTERM and SIGINT (Ctrl-C and Ctrl-Break on Windows),
+and a `stop` line on standard input, each ask it; the first request begins it, to end by `stop_ms`
+(stated; unstated, docker stop's default grace period for a Linux container, 10 s, the shortest of
+the orchestrators' defaults, so a default stop ends before their SIGKILL), and a second request, or
+the bound passing, ends the process at once, as a crash would. The node says `stopping`, answers
+each new object exchange `SlowDown` and waits for those running to end; transfers each range it
+leads to the voter caught up with it, else the one whose log holds most, which the core first brings
+up to its own; waits until its member learns another leads (`handed GROUP LEADER`), through an
+election under way to its winner, or until the core gives the transfer up; then takes no connection
+(its TLS without the server side), dials no peer, closes each connection and waits until each has
+left its closing state, three probe timeouts (hyper-quic's close timer); says `stopped` and ends, its
+log and volumes closed as the node is dropped. `mantle serve` runs on when its standard input
+closes, as it does empty under a service manager; `mantle node`, its harness's child, ends with it.
+On Windows a console's close, a logoff and a shutdown end the process as a crash would: hyper-rt's
+handler returns TRUE as it delivers them, and Windows then ends the process (Microsoft's
+`HandlerRoutine`: "the system terminates the process"); holding the handler through the stop is
+hyper-rt's change. A test asks a node on Windows to stop by its `stop` line, as a console event
+reaches only a process group sharing the sender's console.
+
 **Versions.** Every on-disk format already names its version (a volume's superblock, a log
 segment's header, an entry's format byte in `mantle_meta::wire`), and a connection's first
 exchange names the versions each side speaks, as focal's does (07 §4.1). A binary refuses a

@@ -66,8 +66,10 @@ use crate::storage::{Done, Origin, Storage};
 
 mod answers;
 mod host;
+mod stop;
 use answers::Answers;
 pub use host::GatewaySettings;
+use stop::Stopping;
 
 /// A plane message's first byte: a range's Raft frame. A liveness heartbeat starts with its own,
 /// `hyper_liveness::KIND`.
@@ -726,6 +728,13 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// What jobs that ended asked and was not yet answered: its outcomes are dropped as they come.
     /// At most the node's asks.
     abandoned: Vec<host::Pending>,
+    /// The orderly stop, once begun ([`Node::stop`]).
+    stopping: Option<Stopping>,
+    /// The ranges whose lead the stop handed over, not yet taken ([`Node::take_handed`]).
+    handed: Vec<(u128, u64)>,
+    /// The node's TLS without its server side, which the stop runs on to take no connection: made
+    /// as the node opens, from the credentials it opened with.
+    dial_only: Option<Tls>,
     /// The volume table as this node's member of the root range last held it (`host::Table`).
     table: Option<host::Table>,
     /// Bytes of exchanges' bodies this node has read and written: its transfers' progress
@@ -874,6 +883,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         .map_err(|e| at(Step::Network)(NodeError::Liveness(e)))?;
 
         let tls = Tls::mutual(&settings.credentials, true).map_err(at(Step::Identity))?;
+        let dial_only = Tls::mutual(&settings.credentials, false).map_err(at(Step::Identity))?;
         let config = Config {
             tls,
             role: Role::Node,
@@ -964,6 +974,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             gateway: settings.gateway.take(),
             jobs: Vec::new(),
             abandoned: Vec::new(),
+            stopping: None,
+            handed: Vec::new(),
+            dial_only: Some(dial_only),
             table: None,
             moved: 0,
         };
@@ -1302,6 +1315,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.step_asks(now)?;
         self.step_reads(now)?;
         self.step_replacements();
+        self.step_stop()?;
         self.send_plane();
         self.driver.flush()?;
         Ok(())
@@ -1768,6 +1782,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// Dials each peer whose redial is due; a dial the endpoint refuses is tried again after the
     /// peer's backoff, as a lost connection is.
     fn dial(&mut self, now: u64) {
+        if self.closing() {
+            return;
+        }
         let Ok(clock) = self.driver.clock() else {
             return;
         };

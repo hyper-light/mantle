@@ -117,6 +117,11 @@ pub fn target(stated: Option<f64>) -> f64 {
     stated.unwrap_or(TARGET)
 }
 
+/// The orderly stop's bound where its operator states none (node.md §1.7): docker stop's default
+/// grace period for a Linux container, 10 s, the shortest of the orchestrators' (Kubernetes 30 s,
+/// systemd 90 s; research 64), so a stop ends before their SIGKILL comes.
+pub const DEFAULT_STOP: Duration = Duration::from_secs(10);
+
 /// Each probe of the machine's calibration runs within this: the samples its probes stop at,
 /// Wilks' 59 (hyper-rt `machine::bench::MIN_SAMPLES`), each waiting at most the longest the
 /// platform's scheduler keeps a runnable thread behind another. The budget binds only a starved
@@ -1054,6 +1059,8 @@ pub struct Stated {
     pub ceiling: Option<u64>,
     /// A block's annual chance of loss at most, where its operator states it.
     pub target: Option<f64>,
+    /// The orderly stop's bound, where its operator states it.
+    pub stop: Option<Duration>,
 }
 
 /// Where a value comes from (node.md §1.4's table).
@@ -1517,6 +1524,19 @@ pub fn derive(
          thread: 3 ms on Linux, 10 ms on macOS, 93.75 ms on Windows (research 64; \
          derive::probe_budget)",
     );
+    let (stop, stop_why) = match stated.stop {
+        Some(stop) => (stop, Kind::Stated),
+        None => (DEFAULT_STOP, Kind::Cited),
+    };
+    let stop_ms = u64::try_from(stop.as_millis()).map_err(|_| overflow("the stop's bound"))?;
+    said.add(
+        "stop_ms",
+        stop_ms,
+        stop_why,
+        "the orderly stop's bound, from its first signal: as stated, or docker stop's default grace \
+         period for a Linux container, 10 s, the shortest of the orchestrators' (Kubernetes 30 s, \
+         systemd 90 s), so a stop ends before their SIGKILL (research 64; node.md §1.7)",
+    );
     let gateway_config = hosts.then(|| GatewayConfig {
         keys: stated.keys.clone(),
         handover_ns: gateway.handover_ns,
@@ -1549,6 +1569,7 @@ pub fn derive(
             trunk: engine.trunk,
             transport_bytes,
             probe_budget,
+            stop,
             volumes,
             chunk_bytes: chunk,
             chunk_asks: asked.chunks,
@@ -2796,6 +2817,7 @@ mod tests {
                 Vec::new()
             },
             ceiling: None,
+            stop: None,
             target: None,
         }
     }

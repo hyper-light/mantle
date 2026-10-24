@@ -252,6 +252,160 @@ fn a_cell_of_one_made_by_init_serves_from_what_init_wrote() {
     objects_round_trip(&mut cell, &[id], &|_| id);
 }
 
+/// `mantle init`'s arguments for a cell of three under `root`: a machines file's two founders and a
+/// `--node`'s, each with a volume of its own in a failure domain of its own.
+fn three_founders(root: &Path) -> Vec<String> {
+    let dirs: Vec<PathBuf> = (1..=3)
+        .map(|n| {
+            let dir = root.join(format!("d{n}"));
+            std::fs::create_dir(&dir).unwrap();
+            dir
+        })
+        .collect();
+    let file = root.join("machines.conf");
+    let mut text = String::from("max_nodes = 3\nmax_volumes = 3\n");
+    for (n, dir) in dirs.iter().take(2).enumerate() {
+        text.push_str(&format!(
+            "[node]\nquic = 127.0.0.1:0\nplane = 127.0.0.1:0\ndomain = rack-{n}\nvolume = {} 256M\n",
+            dir.display()
+        ));
+    }
+    std::fs::write(&file, text).unwrap();
+    vec![
+        "--founders".into(),
+        file.display().to_string(),
+        "--node".into(),
+        format!(
+            "quic=127.0.0.1:0,plane=127.0.0.1:0,domain=rack-2,volume={}:256M",
+            dirs[2].display()
+        ),
+    ]
+}
+
+/// The ranges node `id` leads, as it last said.
+fn led(cell: &Cell, id: u64) -> Vec<u128> {
+    cell.status
+        .iter()
+        .filter(|((node, _), line)| {
+            *node == id && matches!(line, Line::Status { leader, .. } if *leader == id)
+        })
+        .map(|((_, group), _)| *group)
+        .collect()
+}
+
+/// A node asked to stop (node.md §1.7: SIGTERM; a `stop` line on Windows, `Cell::stop`) hands each
+/// range it leads to a member caught up with it, which then leads; says so of each, closes its
+/// connections and exits 0. The two others serve on:
+/// every object acknowledged before the stop reads back whole through them, and the ranges, led by
+/// them, take a bucket made through them. (A new object's chunks go to every node's volume, the
+/// stopped one's too, which the volume table still holds.)
+#[test]
+fn a_node_asked_to_stop_hands_its_ranges_over_and_exits_well() {
+    let mut cell = Cell::made(three_founders);
+    let ids: Vec<u64> = cell.dirs.keys().copied().collect();
+    for &id in &ids {
+        cell.enlisted(id);
+    }
+    let made = cell.objects(vec![(
+        ids[0],
+        Op::Create { bucket: "b".into() },
+        Vec::new(),
+    )]);
+    done(&made[0], "the bucket");
+    let bytes = |n: usize| object_bytes(u64::try_from(n).unwrap(), 65_537);
+    let put = |n: usize, through: u64| {
+        let data = bytes(n);
+        let op = Op::Put {
+            bucket: "b".into(),
+            key: format!("o{n}"),
+            id: u128::try_from(n).unwrap() + 1,
+            length: data.len() as u64,
+        };
+        (through, op, data)
+    };
+    let get = |n: usize, through: u64| {
+        let op = Op::Get {
+            bucket: "b".into(),
+            key: format!("o{n}"),
+            offset: 0,
+            len: u64::MAX,
+        };
+        (through, op, Vec::new())
+    };
+    let before: Vec<usize> = (0..3).collect();
+    let puts = before.iter().map(|&n| put(n, ids[n % ids.len()])).collect();
+    for (outcome, n) in cell.objects(puts).iter().zip(&before) {
+        done(outcome, &format!("the put of o{n}"));
+    }
+    let stopping = *ids.iter().max_by_key(|id| led(&cell, **id).len()).unwrap();
+    let ranges = led(&cell, stopping);
+    assert!(!ranges.is_empty(), "node {stopping} leads no range");
+    let exited = cell.stop(stopping);
+    assert!(exited.success(), "node {stopping} exited {exited}");
+    assert!(
+        cell.stopped.contains(&stopping),
+        "node {stopping} said no stop"
+    );
+    let others: Vec<u64> = ids.iter().copied().filter(|id| *id != stopping).collect();
+    for group in &ranges {
+        let to = cell
+            .handed
+            .iter()
+            .find(|(node, handed, _)| *node == stopping && handed == group)
+            .map(|(_, _, to)| *to)
+            .unwrap_or_else(|| panic!("node {stopping} handed {group:x} to no one"));
+        assert!(others.contains(&to), "{group:x} handed to {to}");
+        cell.until(|c| {
+            let leads = others.iter().all(|other| {
+                matches!(c.status.get(&(*other, *group)), Some(Line::Status { leader, .. }) if *leader == to)
+            });
+            if leads { Some(()) } else { None }
+        });
+    }
+    let gets = before
+        .iter()
+        .map(|&n| get(n, others[n % others.len()]))
+        .collect();
+    for (outcome, n) in cell.objects(gets).iter().zip(&before) {
+        assert_eq!(done(outcome, &format!("o{n}")), bytes(*n), "o{n} read back");
+    }
+    let made = cell.objects(vec![(
+        others[0],
+        Op::Create { bucket: "c".into() },
+        Vec::new(),
+    )]);
+    done(&made[0], "a bucket made after the stop");
+}
+
+/// A second request to stop, as the node's stop begins, ends its process at once: not well, and
+/// before its stop says it is done.
+#[test]
+fn a_second_request_to_stop_ends_the_process_at_once() {
+    let mut cell = Cell::made(|root| {
+        let data = root.join("data");
+        std::fs::create_dir(&data).unwrap();
+        vec![
+            "--node".into(),
+            format!(
+                "quic=127.0.0.1:0,plane=127.0.0.1:0,domain=laptop,volume={}:256M",
+                data.display()
+            ),
+            "--max-nodes".into(),
+            "1".into(),
+            "--max-volumes".into(),
+            "1".into(),
+        ]
+    });
+    let id = *cell.dirs.keys().next().unwrap();
+    cell.enlisted(id);
+    let exited = cell.stop_twice(id);
+    assert!(!exited.success(), "node {id} exited {exited}");
+    assert!(
+        !cell.stopped.contains(&id),
+        "node {id} said its stop was done"
+    );
+}
+
 /// A start that fails names its step (node.md §1.7), and the node serving on its directory serves
 /// on: a second process on that directory is refused at the locks, one whose key file is missing at
 /// its identity (read before any lock), one whose configuration does not parse at the
@@ -410,33 +564,7 @@ fn a_peer_whose_name_does_not_resolve_stops_the_start_naming_it() {
 /// address its configuration named, and only where a later peer listens comes on standard input.
 #[test]
 fn a_cell_of_three_made_by_init_from_a_file_and_a_flag_serves_objects() {
-    let mut cell = Cell::made_named(|root| {
-        let dirs: Vec<PathBuf> = (1..=3)
-            .map(|n| {
-                let dir = root.join(format!("d{n}"));
-                std::fs::create_dir(&dir).unwrap();
-                dir
-            })
-            .collect();
-        let file = root.join("machines.conf");
-        let mut text = String::from("max_nodes = 3\nmax_volumes = 3\n");
-        for (n, dir) in dirs.iter().take(2).enumerate() {
-            text.push_str(&format!(
-                "[node]\nquic = 127.0.0.1:0\nplane = 127.0.0.1:0\ndomain = rack-{n}\nvolume = {} 256M\n",
-                dir.display()
-            ));
-        }
-        std::fs::write(&file, text).unwrap();
-        vec![
-            "--founders".into(),
-            file.display().to_string(),
-            "--node".into(),
-            format!(
-                "quic=127.0.0.1:0,plane=127.0.0.1:0,domain=rack-2,volume={}:256M",
-                dirs[2].display()
-            ),
-        ]
-    });
+    let mut cell = Cell::made_named(three_founders);
     let ids: Vec<u64> = cell.dirs.keys().copied().collect();
     assert_eq!(ids.len(), 3);
     for &id in &ids {

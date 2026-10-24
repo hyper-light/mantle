@@ -170,11 +170,11 @@ pub struct Calibration {
     /// `durable_large` bytes written sequentially, then a full flush, one at a time.
     pub durable_sequential: Point,
     pub durable_large: usize,
-    /// A small durable write a round into space preallocated and never written, each past a
-    /// stretch never written, as a volume's first data write lands.
-    pub first_write: Point,
-    /// The same writes again, over the space they wrote.
-    pub overwrite: Point,
+    /// Each round's small durable write into space preallocated and never written, past a
+    /// stretch never written as a volume's first data write lands, against the same write again
+    /// at once over the place it wrote: the natural logarithm of the ratio of their latencies, a
+    /// round each.
+    pub first_write_ratios: Vec<f64>,
     pub elapsed: Duration,
 }
 
@@ -222,17 +222,30 @@ impl Calibration {
         whole(rate * access)
     }
 
+    /// How many times an overwrite's latency a first write's took: the geometric mean of the
+    /// rounds' ratios, none without a round.
+    pub fn first_write_ratio(&self) -> Option<f64> {
+        (!self.first_write_ratios.is_empty()).then(|| mean(&self.first_write_ratios).exp())
+    }
+
     /// Whether a durable write into preallocated, never-written space, past a stretch of it, is
-    /// slower than the same write over written space: the first write's throughput interval lies
-    /// wholly below the overwrite's, the test by which Georges, Buytaert and Eeckhout tell two
-    /// measurements apart (OOPSLA 2007, §3.3). Where a file system journals the conversion of an
-    /// extent on its first write, as ext4 does, the flush pays for it (5.7x on ext4;
-    /// docs/measurements/2026-09-28-flush-cost-by-extent-state.md), and where it fills the
-    /// stretch first, as NTFS does to a write past its valid data length, the write pays for
-    /// the stretch (docs/measurements/2026-10-24-first-writes-past-unwritten-space.md); either
-    /// way the chunk store writes a volume once before use (docs/design/chunk-store.md §2).
+    /// slower than the same write over written space: the 95% confidence interval of the mean of
+    /// the rounds' log ratios lies wholly above zero. A round's two writes are one paired
+    /// observation, the second following the first at once under the same load, so the test is
+    /// of their difference for a zero mean (Jain, "Comparing Systems Using Sample Data", slides
+    /// 13-15 and 13-39; docs/research/11 §13.3); the logarithm weighs a ratio and its reciprocal
+    /// alike. Two unpaired points, one measured after the other, part only while the load holds
+    /// still: beside the serve suite's other cells on windows-x86_64 the overwrites' interval
+    /// spread past ±80% and penalties of 2.8x and 4.5x went unseen
+    /// (docs/measurements/2026-10-24-first-writes-past-unwritten-space.md). Where a file system
+    /// journals the conversion of an extent on its first write, as ext4 does, the flush pays for
+    /// it (5.7x on ext4; docs/measurements/2026-09-28-flush-cost-by-extent-state.md), and where it
+    /// fills the stretch first, as NTFS does to a write past its valid data length, the write pays
+    /// for the stretch; either way the chunk store writes a volume once before use
+    /// (docs/design/chunk-store.md §2).
     pub fn first_write_penalty(&self) -> bool {
-        slower(&self.first_write, &self.overwrite)
+        half_width(&self.first_write_ratios)
+            .is_some_and(|half| mean(&self.first_write_ratios) - half > 0.0)
     }
 }
 
@@ -364,28 +377,35 @@ fn measured(
     // segment it opens past the unwritten tail of the one before (chunk-store.md §2). NTFS fills
     // the stretch with zeros before such a write completes, the write being past the file's
     // valid data length (research/02 §4.7), and ext4 commits the extent's conversion at the
-    // flush (docs/measurements/2026-09-28-flush-cost-by-extent-state.md). Each round writes once,
-    // at the end of its share of the span; each round of overwrites rewrites a place a round of
-    // first writes wrote. Sequential first writes, each at the end of the last, never paid for
-    // a stretch: on windows-11-arm they ran within the overwrites' interval while a volume's
-    // first data write took seconds (docs/measurements/2026-10-24-first-writes-past-unwritten-space.md).
+    // flush (docs/measurements/2026-09-28-flush-cost-by-extent-state.md). Each round writes once
+    // at the end of its share of the span, then the same place again at once: a pair under one
+    // load (`Calibration::first_write_penalty`). Sequential first writes, each at the end of the
+    // last, never paid for a stretch: on windows-11-arm they ran within the overwrites' interval
+    // while a volume's first data write took seconds
+    // (docs/measurements/2026-10-24-first-writes-past-unwritten-space.md).
     let small = u64::try_from(plan.small).unwrap_or(u64::MAX);
-    let once = |round| Job {
+    let once = |base| Job {
         pattern: Pattern::SequentialWrite,
         block: plan.small,
         depth: 1,
-        base: first_write_at(round, stride, small),
+        base,
         span: small,
         budget: Some(plan.step.saturating_mul(4)),
         max_ops: 1,
         sync_each: true,
         seed: 0,
     };
-    let first_write = point(pool, plan, once)?;
-    let written = u64::try_from(first_write.rounds.max(1)).unwrap_or(1);
-    let overwrite = point(pool, plan, |round| {
-        once(round.checked_rem(written).unwrap_or(0))
-    })?;
+    let rounds = plan.rounds.limit();
+    let mut first_write_ratios = Vec::with_capacity(rounds);
+    for round in 0..rounds {
+        let at = first_write_at(u64::try_from(round).unwrap_or(u64::MAX), stride, small);
+        let first = pool.run(&once(at))?.elapsed.as_secs_f64();
+        let again = pool.run(&once(at))?.elapsed.as_secs_f64();
+        let ratio = (first / again).ln();
+        if ratio.is_finite() {
+            first_write_ratios.push(ratio);
+        }
+    }
 
     // Write the whole span first, so reads measure the medium rather than holes, and so
     // later writes overwrite written blocks (docs/measurements/2026-09-28).
@@ -489,8 +509,7 @@ fn measured(
         durable_sequential,
         durable_large,
         workers: pool.workers(),
-        first_write,
-        overwrite,
+        first_write_ratios,
         elapsed: started.elapsed(),
     })
 }
@@ -552,17 +571,24 @@ pub fn mean(xs: &[f64]) -> f64 {
     xs.iter().sum::<f64>() / n
 }
 
-/// The half-width of the 95% confidence interval of the mean of `xs`, over the mean.
-pub fn relative_interval(xs: &[f64]) -> f64 {
-    let Some(df) = xs.len().checked_sub(1).filter(|&d| d > 0) else {
-        return f64::INFINITY;
-    };
+/// The half-width of the 95% confidence interval of the mean of `xs` (Student's t), none for
+/// fewer than two.
+fn half_width(xs: &[f64]) -> Option<f64> {
+    let df = xs.len().checked_sub(1).filter(|&d| d > 0)?;
     let m = mean(xs);
     let n = u32::try_from(xs.len()).map_or(f64::MAX, f64::from);
     let variance = xs.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / (n - 1.0);
     let t = T95.get(df.saturating_sub(1)).copied().unwrap_or(1.96);
-    let half = t * (variance / n).sqrt();
-    if m > 0.0 { half / m } else { f64::INFINITY }
+    Some(t * (variance / n).sqrt())
+}
+
+/// The half-width of the 95% confidence interval of the mean of `xs`, over the mean.
+pub fn relative_interval(xs: &[f64]) -> f64 {
+    let m = mean(xs);
+    match half_width(xs) {
+        Some(half) if m > 0.0 => half / m,
+        _ => f64::INFINITY,
+    }
 }
 
 #[cfg(test)]
@@ -608,8 +634,7 @@ mod tests {
             durable_sequential: durable,
             durable_large: 1 << 20,
             workers: 4,
-            first_write: durable,
-            overwrite: durable,
+            first_write_ratios: Vec::new(),
             elapsed: Duration::ZERO,
         };
         assert_eq!(c.read_gap(), Some(28 << 10));
@@ -687,10 +712,10 @@ mod tests {
         assert_eq!(saturation(&[]), None);
     }
 
-    /// A penalty is measured only when the intervals part: 5.7x with tight intervals is one,
-    /// and a difference inside the noise is none.
+    /// One point is slower than another only when their intervals part: 5.7x with tight
+    /// intervals is, and a difference inside the noise is not.
     #[test]
-    fn a_first_write_penalty_needs_intervals_that_part() {
+    fn a_point_is_slower_only_where_the_intervals_part() {
         let with = |ops: f64, spread: f64| Point {
             spread,
             ..at(1, ops)
@@ -700,6 +725,52 @@ mod tests {
         assert!(!slower(&with(380.0, 0.9), &with(2_170.0, 0.9)));
         assert!(!slower(&with(2_170.0, 0.05), &with(380.0, 0.05)));
         assert!(!slower(&with(380.0, f64::INFINITY), &with(2_170.0, 0.05)));
+    }
+
+    /// A penalty is a paired interval wholly above one: steady 5.7x is one; ratios about one, or
+    /// spread wide, or a single round, are none. A load that changes from round to round, shared
+    /// by a round's two writes, leaves the penalty measured, where the same writes taken as two
+    /// unpaired points do not part.
+    #[test]
+    fn a_first_write_penalty_is_a_paired_interval_above_one() {
+        let with = |ratios: &[f64]| Calibration {
+            caching: Caching::Direct,
+            small: 4096,
+            large: 1 << 20,
+            random_read: Vec::new(),
+            random_read_capped: false,
+            sequential_read: Vec::new(),
+            sequential_write: Vec::new(),
+            durable_write: at(1, 0.0),
+            durable_sequential: at(1, 0.0),
+            durable_large: 1 << 20,
+            workers: 1,
+            first_write_ratios: ratios.iter().map(|r| r.ln()).collect(),
+            elapsed: Duration::ZERO,
+        };
+        assert!(with(&[5.7, 6.1, 5.2, 6.3]).first_write_penalty());
+        assert!(!with(&[1.1, 0.9, 1.05, 0.95]).first_write_penalty());
+        assert!(!with(&[60.0, 0.5, 40.0, 0.6]).first_write_penalty());
+        assert!(!with(&[60.0]).first_write_penalty());
+        assert!(!with(&[]).first_write_penalty());
+        let steady = with(&[5.7, 6.1, 5.2, 6.3]).first_write_ratio().unwrap();
+        assert!((steady - (5.7f64 * 6.1 * 5.2 * 6.3).powf(0.25)).abs() < 1e-9);
+        // Each round's load stretches both of its writes alike: a first write 7.5 times an
+        // overwrite, the load from one to twelve times.
+        let load = [1.0, 8.0, 2.0, 12.0, 1.0, 5.0];
+        let first: Vec<f64> = load.iter().map(|l| 0.3 * l).collect();
+        let again: Vec<f64> = load.iter().map(|l| 0.04 * l).collect();
+        let ratios: Vec<f64> = first.iter().zip(&again).map(|(f, a)| f / a).collect();
+        assert!(with(&ratios).first_write_penalty());
+        let unpaired = |latencies: &[f64]| {
+            let ops: Vec<f64> = latencies.iter().map(|l| 1.0 / l).collect();
+            Point {
+                ops_per_sec: mean(&ops),
+                spread: relative_interval(&ops),
+                ..at(1, 0.0)
+            }
+        };
+        assert!(!slower(&unpaired(&first), &unpaired(&again)));
     }
 
     /// Every round's first write lands past a stretch never written, a share of the span less
@@ -780,8 +851,8 @@ mod tests {
         assert!((2..=3).contains(&c.durable_write.rounds));
         assert!(c.durable_sequential.bytes_per_sec > 0.0);
         assert_eq!(c.durable_large, 2 << 20);
-        assert!(c.first_write.ops_per_sec > 0.0 && c.overwrite.ops_per_sec > 0.0);
-        assert!((2..=3).contains(&c.first_write.rounds));
+        assert_eq!(c.first_write_ratios.len(), 3);
+        assert!(c.first_write_ratios.iter().all(|r| r.is_finite()));
         let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
         assert!(leftovers.is_empty(), "scratch file left behind");
     }

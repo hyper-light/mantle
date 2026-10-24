@@ -58,14 +58,14 @@ impl Profile {
             use std::io::Write as _;
             let _ = writeln!(
                 std::io::stderr(),
-                "DIAG calibration t={} pid={} first_write {:?} overwrite {:?} prewrite {prewrite} took {:?}",
+                "DIAG calibration t={} pid={} first_write_ratios {:?} ratio {:?} prewrite {prewrite} took {:?}",
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis())
                     .unwrap_or(0),
                 std::process::id(),
-                c.first_write,
-                c.overwrite,
+                c.first_write_ratios,
+                c.first_write_ratio(),
                 c.elapsed
             );
         }

@@ -1,9 +1,10 @@
-name: diag-first-write
-# Scratch: the serve suite on both Windows runners as CI runs it, three rounds, with calibration's
-# first writes each past a stretch never written (diag run 40105172243: every calibration chose
-# prewrite, yet some volumes' first batches took 0.3 to 2.45 s and one round's cell of one ended in
-# the watch's quiet panic). Every DIAG line carries the wall clock in ms and its process; each node
-# spawned says its test; each format says whether it prewrote and how long it took.
+name: diag-first-write-paired
+# Scratch: calibration's first writes paired, each round's first write past a stretch never written
+# followed at once by the same write over the place it wrote, the decision the paired interval of
+# their log ratios. Three probes alone and three at once on every target's runner, where the tests
+# keep their volumes, and the serve suite on both Windows runners as CI runs it, three rounds (diag
+# run 40105172243: unpaired points missed a 2.8x and a 4.5x penalty on windows-x86_64 under the
+# suite's load). Every DIAG line carries the wall clock in ms and its process.
 on:
   push:
     branches: ["diag/**"]
@@ -13,13 +14,16 @@ env:
   CARGO_TERM_COLOR: never
   RUST_BACKTRACE: "1"
 jobs:
-  serve:
+  probe:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { name: windows-x86_64, runner: windows-2025, target: x86_64-pc-windows-msvc }
-          - { name: windows-aarch64, runner: windows-11-arm, target: aarch64-pc-windows-msvc }
+          - { name: linux-x86_64, runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu, serve: false }
+          - { name: linux-aarch64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, serve: false }
+          - { name: macos-aarch64, runner: macos-15, target: aarch64-apple-darwin, serve: false }
+          - { name: windows-x86_64, runner: windows-2025, target: x86_64-pc-windows-msvc, serve: true }
+          - { name: windows-aarch64, runner: windows-11-arm, target: aarch64-pc-windows-msvc, serve: true }
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
@@ -36,10 +40,32 @@ jobs:
           workspaces: |
             .
             vendor
-      - name: Build the serve suite
+      - name: Build
         shell: bash
-        run: cargo test --locked -p mantle --test serve --no-run --target ${{ matrix.target }}
+        run: |
+          cargo build --locked -p mantle --bin mantle --target ${{ matrix.target }}
+          if [ "${{ matrix.serve }}" = "true" ]; then
+            cargo test --locked -p mantle --test serve --no-run --target ${{ matrix.target }}
+          fi
+      - name: Three probes alone, then three at once, where the tests keep their volumes
+        shell: bash
+        run: |
+          bin=target/${{ matrix.target }}/debug/mantle
+          for round in 1 2 3; do
+            dir=$(mktemp -d)
+            echo "=== alone $round: $("$bin" disk probe --measure "$dir" 2>&1 | grep -a 'first writes')"
+            rmdir "$dir"
+          done
+          base=$(mktemp -d)
+          for round in 1 2 3; do
+            mkdir "$base/c$round"
+            ( echo "=== at once $round: $("$bin" disk probe --measure "$base/c$round" 2>&1 | grep -a 'first writes')" ) &
+          done
+          wait
+          for round in 1 2 3; do rmdir "$base/c$round"; done
+          rmdir "$base"
       - name: The serve suite, three rounds
+        if: matrix.serve
         shell: bash
         run: |
           for round in 1 2 3; do

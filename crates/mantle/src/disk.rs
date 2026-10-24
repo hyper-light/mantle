@@ -238,10 +238,8 @@ fn report(out: &mut impl Write, c: &Calibration) -> std::io::Result<()> {
 /// What a durable write into never-written space costs against one over written space, and
 /// what the chunk store does about it.
 pub(crate) fn first_writes(c: &Calibration) -> String {
-    let ratio = if c.first_write.ops_per_sec > 0.0 {
-        c.overwrite.ops_per_sec / c.first_write.ops_per_sec
-    } else {
-        f64::INFINITY
+    let Some(ratio) = c.first_write_ratio() else {
+        return "not measured; volumes here are not pre-written".to_owned();
     };
     if c.first_write_penalty() {
         format!(

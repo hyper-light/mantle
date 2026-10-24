@@ -1570,7 +1570,7 @@ impl Cell {
         };
         self.diag_seen
             .push_back((Instant::now(), diag.chars().take(200).collect()));
-        if self.diag_seen.len() > 60 {
+        if self.diag_seen.len() > 400 {
             self.diag_seen.pop_front();
         }
         match heard {

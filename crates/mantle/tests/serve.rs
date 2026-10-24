@@ -511,6 +511,15 @@ fn a_cell_made_by_init_rolls_one_node_at_a_time_and_reads_every_object_back() {
             .copied()
             .filter(|(node, _)| *node != stopping)
             .collect();
+        if !said.is_empty() {
+            let now = std::time::Instant::now();
+            for (at, what) in &cell.diag_seen {
+                eprintln!(
+                    "DIAG heard {:>8.1} ms ago: {what}",
+                    now.saturating_duration_since(*at).as_secs_f64() * 1000.0
+                );
+            }
+        }
         assert!(
             said.is_empty(),
             "with node {stopping} stopped and started again, nodes said ranges had no leader: \

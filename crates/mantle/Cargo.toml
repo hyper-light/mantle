@@ -30,10 +30,6 @@ mantle-meta = { path = "../meta" }
 mantle-node = { path = "../node" }
 mantle-s3 = { path = "../s3" }
 
-[target.'cfg(windows)'.dependencies]
-# The protected DACL of the key files `mantle init` writes (src/files/windows.rs).
-windows-sys.workspace = true
-
 [dev-dependencies]
 # The real-process test of `mantle node` (tests/node.rs): the client's runtime and transport, the
 # cell's certificates, the range's settings the nodes are given, and the CRC-32C the gateway

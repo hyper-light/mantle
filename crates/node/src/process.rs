@@ -120,6 +120,7 @@ use crate::directory::Peer;
 use crate::node::{
     GatewaySettings, Hosted, Link, Node, NodeError, NodeSettings, Status, Step, Wall,
 };
+use crate::secret::{self, SecretError};
 use crate::storage::{Locks, NodeLock, Storage, StorageError, VolumeSettings};
 
 /// Why the process stopped.
@@ -148,6 +149,9 @@ pub enum ProcessError {
     Enlist(String),
     #[error("the root key {0}: {1}")]
     Key(PathBuf, String),
+    /// A key file that could not be read, or that others than its owner may read.
+    #[error("{}: {}", .0.display(), .1)]
+    Secret(PathBuf, SecretError),
     #[error("the settings: {0}")]
     Derive(#[from] crate::derive::DeriveError),
     #[error("the device under {0}: {1}")]
@@ -246,7 +250,7 @@ fn identity(
     Ok(Identity {
         credentials: Credentials {
             chain: vec![CertificateDer::from(read_file(certificate)?)],
-            key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(read_file(key)?)),
+            key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(read_secret(key)?)),
             roots: vec![CertificateDer::from(read_file(authority)?)],
         },
         peers: known,
@@ -256,24 +260,16 @@ fn identity(
 
 /// A root key's generation from its file: 32 bytes only its owner may read (encryption.md §2).
 fn root_key(path: &Path) -> Result<WrappingKey, ProcessError> {
-    let refused = |why: &str| ProcessError::Key(path.to_path_buf(), why.to_owned());
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(path)
-            .map_err(|e| refused(&e.to_string()))?
-            .permissions()
-            .mode();
-        if mode & 0o077 != 0 {
-            return Err(refused("is readable by others than its owner"));
-        }
-    }
-    let bytes = std::fs::read(path).map_err(|e| refused(&e.to_string()))?;
-    let key: [u8; 32] = bytes
+    let key: [u8; 32] = read_secret(path)?
         .as_slice()
         .try_into()
-        .map_err(|_| refused("is not 32 bytes"))?;
+        .map_err(|_| ProcessError::Key(path.to_path_buf(), "is not 32 bytes".to_owned()))?;
     Ok(WrappingKey::new(&key))
+}
+
+/// The key file at `path`, read only where no one but its owner may read it (`crate::secret`).
+fn read_secret(path: &Path) -> Result<Vec<u8>, ProcessError> {
+    secret::read(path).map_err(|e| ProcessError::Secret(path.to_path_buf(), e))
 }
 
 /// Where a peer listens, as its `peer` line names it: a host, an IP address or a name, and a port.

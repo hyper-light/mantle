@@ -635,7 +635,14 @@ A start's failure names its step (`Step`, `ProcessError::Start`): configuration,
 devices, budgets, storage or network, as in `mantle: the start's locks step: …/LOCK: another
 process holds this lock`. The identity (the node's key and certificate, the authority's, each
 peer's and the root keys) is read before any lock, so a missing key file refuses the start without
-touching a directory. A plane port another socket holds is refused at the network step; a QUIC port
+touching a directory. Each key file, the node's TLS key and each root key's generation, is read only
+through a handle whose file no one but its owner may read (`mantle_node::secret`), on every
+platform, the rule hyper-seal's key files keep: on Unix no permission bit for the file's group or
+others, as OpenSSH and PostgreSQL refuse a private key; on Windows no allow entry in its DACL for a
+principal but its owner and LocalSystem, read from the open handle (GetKernelObjectSecurity), where
+Microsoft's OpenSSH also admits the Administrators group. One readable by others refuses the start
+at its identity, naming the file (`…/identity/node.key: is readable by others than its owner`).
+`mantle init` creates its keys through the same module, owner-only from the moment each exists. A plane port another socket holds is refused at the network step; a QUIC port
 another process of the same user holds is not yet: hyper-rt-transport binds its listener with
 `SO_REUSEPORT` set before the bind, to share the port with a socket for each peer, and a second
 process's bind of a held port with that flag set succeeds on Linux and macOS (measured on Linux

@@ -42,6 +42,11 @@ bytes.workspace = true
 getrandom.workspace = true
 thiserror.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+# A key file's protected DACL, written as `mantle init` creates it and read from the handle the
+# start reads it through (src/secret/windows.rs).
+windows-sys.workspace = true
+
 [dev-dependencies]
 # The simulated device a simulated node's log runs on (tests/sim.rs).
 hyper-block = { path = "../../vendor/hyper-block", features = ["sim"] }

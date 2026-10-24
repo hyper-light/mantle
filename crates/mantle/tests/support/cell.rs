@@ -767,6 +767,8 @@ pub(crate) struct Cell {
     pub(crate) generations: u64,
     pub(crate) tell: Sender<Heard>,
     pub(crate) heard: Receiver<Heard>,
+    /// DIAG (scratch): what the cell heard last, and when.
+    pub(crate) diag_seen: std::collections::VecDeque<(Instant, String)>,
     /// Each workload client's operations done, and how long it gives an exchange.
     pub(crate) progress: BTreeMap<u64, u64>,
     pub(crate) clients: BTreeMap<u64, Duration>,
@@ -1043,6 +1045,7 @@ impl Cell {
             generations: 0,
             tell,
             heard,
+            diag_seen: std::collections::VecDeque::new(),
             status: BTreeMap::new(),
             progress: BTreeMap::new(),
             clients: BTreeMap::new(),
@@ -1167,6 +1170,7 @@ impl Cell {
             generations: 0,
             tell,
             heard,
+            diag_seen: std::collections::VecDeque::new(),
             status: BTreeMap::new(),
             progress: BTreeMap::new(),
             clients: BTreeMap::new(),
@@ -1521,11 +1525,26 @@ impl Cell {
                 .saturating_duration_since(Instant::now());
             match self.heard.recv_timeout(left) {
                 Ok(heard) => self.take(heard),
-                Err(_) => panic!(
-                    "quiet for {quiet:?} with nothing moved, besides {:?} held still for the \
-                     devices: {:?}, progress {:?}, links {:?}, log {:?}",
-                    self.held_for, self.status, self.progress, self.links, self.log
-                ),
+                Err(_) => {
+                    let now = Instant::now();
+                    for (at, what) in &self.diag_seen {
+                        eprintln!(
+                            "DIAG heard {:>8.1} ms ago: {what}",
+                            now.saturating_duration_since(*at).as_secs_f64() * 1000.0
+                        );
+                    }
+                    eprintln!(
+                        "DIAG watch: moved_at {:.1} ms ago, transfers {:?}, clients {:?}",
+                        now.saturating_duration_since(self.moved_at).as_secs_f64() * 1000.0,
+                        self.transfers,
+                        self.clients
+                    );
+                    panic!(
+                        "quiet for {quiet:?} with nothing moved, besides {:?} held still for the \
+                         devices: {:?}, progress {:?}, links {:?}, log {:?}",
+                        self.held_for, self.status, self.progress, self.links, self.log
+                    )
+                }
             }
         }
     }
@@ -1541,6 +1560,19 @@ impl Cell {
     }
 
     pub(crate) fn take(&mut self, heard: Heard) {
+        let diag = match &heard {
+            Heard::Line(id, generation, line) => format!("line {id} g{generation} {line:?}"),
+            Heard::Ended(id, generation) => format!("ended {id} g{generation}"),
+            Heard::Told(Told::Progress(client, done, patience)) => {
+                format!("progress {client} {done} {patience:?}")
+            }
+            Heard::Told(Told::Failed(client, _)) => format!("failed {client}"),
+        };
+        self.diag_seen
+            .push_back((Instant::now(), diag.chars().take(200).collect()));
+        if self.diag_seen.len() > 60 {
+            self.diag_seen.pop_front();
+        }
         match heard {
             Heard::Line(id, generation, line) => {
                 // A line its killed process left: the node runs another process now, or none.

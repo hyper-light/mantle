@@ -1,0 +1,51 @@
+name: diag-cell-of-one
+# Scratch: the serve suite as CI runs it, on the runners where a cell of one's watch went quiet (CI run
+# 40123826080 linux-aarch64: its 3 MiB put moved nothing the watch saw for 1 s). Each node says its
+# host jobs' stages, its puts' answers and its volume batches of 20 ms or more, with the clock and its
+# process; the watch prints the last lines it heard when it gives up.
+on:
+  push:
+    branches: ["diag/**"]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: "1"
+jobs:
+  serve:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-aarch64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, rounds: "1 2 3 4" }
+          - { name: windows-aarch64, runner: windows-11-arm, target: aarch64-pc-windows-msvc, rounds: "1 2 3" }
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned Rust
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup target add --toolchain 1.98.1 ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: diag-c1-${{ matrix.target }}
+          workspaces: |
+            .
+            vendor
+      - name: Build the serve suite
+        shell: bash
+        run: cargo test --locked -p mantle --test serve --no-run --target ${{ matrix.target }}
+      - name: The serve suite, rounds
+        shell: bash
+        run: |
+          for round in ${{ matrix.rounds }}; do
+            echo "=== round $round"
+            cargo test --locked -p mantle --test serve --target ${{ matrix.target }} -- --nocapture > "round-$round.txt" 2>&1 || true
+            grep -aE "^test .* (ok|FAILED)|test result" "round-$round.txt" || true
+            if grep -aq "FAILED" "round-$round.txt"; then
+              grep -aE "DIAG|panicked|quiet for" "round-$round.txt" || true
+            fi
+          done

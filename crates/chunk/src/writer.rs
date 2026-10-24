@@ -1323,6 +1323,17 @@ impl<F: BlockFile> Writer<F> {
             self.pool.give(buf);
         }
         let took = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if took >= 20_000_000 {
+            eprintln!(
+                "DIAG write_batch t={} pid={} {} ms",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0),
+                std::process::id(),
+                took / 1_000_000
+            );
+        }
         self.anticipation.served(took);
         let laid: u64 = payloads
             .iter()

@@ -568,8 +568,8 @@ fn a_second_request_to_stop_ends_the_process_at_once() {
 /// lock; the key closed again, the start goes on to the locks), as is one that states another
 /// cell's authority or pins a peer from another cell, one whose configuration does not parse or is
 /// not there at the configuration, one on a directory of its own stating the serving node's volume
-/// at the locks, naming the volume's, and one on a directory of its own whose plane's port the
-/// serving node holds at the network. Each ends non-zero before it listens.
+/// at the locks, naming the volume's, and one on a directory of its own whose plane's port, or
+/// whose QUIC port, the serving node holds at the network. Each ends non-zero before it listens.
 #[test]
 fn a_start_that_fails_names_its_step_and_the_node_serving_serves_on() {
     let mut cell = Cell::made(|root| {
@@ -709,28 +709,44 @@ fn a_start_that_fails_names_its_step_and_the_node_serving_serves_on() {
         "locks",
         "data/mantle/LOCK: another process holds this lock",
     );
-    let other = root.join("other");
-    for sub in ["identity", "keys"] {
-        copy_tree(&dir.join(sub), &other.join(sub));
-    }
-    let data = other.join("data");
-    std::fs::create_dir(&data).unwrap();
-    let (_, plane) = cell.running[&id].bound.unwrap();
-    let moved: Vec<String> = text
-        .lines()
-        .map(|line| {
-            if line.starts_with("plane = ") {
-                format!("plane = {plane}")
-            } else if line.starts_with("volume = ") {
-                let (_, size) = line.rsplit_once(' ').unwrap();
-                format!("volume = {} {size}", data.display())
-            } else {
-                line.to_owned()
-            }
-        })
-        .collect();
-    std::fs::write(other.join("config"), moved.join("\n") + "\n").unwrap();
-    refused(&other.join("config"), "network", "bind");
+    // A directory of its own, its volume its own, stating `key` as `value`: the port the serving
+    // node holds, refused at the network.
+    let own = |name: &str, key: &str, value: String| {
+        let other = root.join(name);
+        for sub in ["identity", "keys"] {
+            copy_tree(&dir.join(sub), &other.join(sub));
+        }
+        let data = other.join("data");
+        std::fs::create_dir(&data).unwrap();
+        let moved: Vec<String> = text
+            .lines()
+            .map(|line| {
+                if line.starts_with(&format!("{key} = ")) {
+                    format!("{key} = {value}")
+                } else if line.starts_with("volume = ") {
+                    let (_, size) = line.rsplit_once(' ').unwrap();
+                    format!("volume = {} {size}", data.display())
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect();
+        std::fs::write(other.join("config"), moved.join("\n") + "\n").unwrap();
+        other.join("config")
+    };
+    let (quic, plane) = cell.running[&id].bound.unwrap();
+    refused(
+        &own("plane-held", "plane", plane.to_string()),
+        "network",
+        "bind",
+    );
+    // The QUIC listener binds its port before it shares it (hyper-rt `Driver::bind`), so a port a
+    // node holds is refused to another as a plane's is.
+    refused(
+        &own("quic-held", "quic", quic.to_string()),
+        "network",
+        "bind",
+    );
     objects_round_trip(&mut cell, &[id], &|_| id);
 }
 

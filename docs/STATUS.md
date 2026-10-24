@@ -460,14 +460,15 @@ readable by others than its owner (the node's TLS key and each root key, on ever
 group or other mode bit on Unix; on Windows no DACL entry for a principal but the owner and
 LocalSystem, read from the handle the key is read through) and a certificate the stated authority
 did not issue (the node's own and each pinned peer's: RFC 5280 §6.1.3 (a)'s issuer, signature and
-validity); and refuses no configuration, and a volume another process holds, at their steps. A cell
+validity); and refuses no configuration, and a volume another process holds, at their steps, and a
+plane or QUIC port another socket holds at its network step (hyper-rt-transport's listener binds its
+port before it shares it). A node whose peers have never answered heartbeats each every 3 s at most,
+not at its stream's floor with a flush each (hyper-liveness `f647365`). A cell
 of three made by `mantle init` rolls one node at a time, each handing its ranges over, started again
 from its directories, with no other member saying a range has no leader, and every object read back
 through every node after the roll, on two CPUs beside four busy loops and on one CPU. Remaining:
-`mantle init client`; a held QUIC port refused rather than shared (hyper-rt-transport sets
-`SO_REUSEPORT` before its listener's bind) and Windows' close, logoff and shutdown held through the
-stop (hyper-rt's handler), both hyper-rt's; a node that knows no peer's address heartbeating at its
-stream's floor until one answers (hyper-liveness's); and a replicated range refusing puts at its
+`mantle init client`; Windows' console close and shutdown taken as requests to stop, which
+hyper-rt's handler now holds for the owner's stop; and a replicated range refusing puts at its
 engine's metadata share where its leader admits a command, since a refusal at apply would let members
 diverge.
 

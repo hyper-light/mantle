@@ -650,13 +650,13 @@ the authority's key, and its validity holds by this machine's clock), so a direc
 cell's authority, or a peer pinned from another cell, refuses the start naming the certificate
 (`…/identity/node.der: issued by another authority than the cell's`) rather than failing every
 handshake. `mantle init` dates each certificate from its own machine's clock, so a founder whose
-clock runs behind the one init ran on is refused as not yet valid, as its handshakes would be. A plane port another socket holds is refused at the network step; a QUIC port
-another process of the same user holds is not yet: hyper-rt-transport binds its listener with
-`SO_REUSEPORT` set before the bind, to share the port with a socket for each peer, and a second
-process's bind of a held port with that flag set succeeds on Linux and macOS (measured on Linux
-6.19 and Darwin 25.4; a plain bind of it fails `EADDRINUSE`), after which the two processes split
-the port's datagrams. Binding the listener before it shares the port, as hyper-rt already does for
-port 0, refuses it; that change is hyper-rt's.
+clock runs behind the one init ran on is refused as not yet valid, as its handshakes would be.
+A plane port or a QUIC port another socket holds is refused at the network step. The QUIC
+listener shares its port with a socket for each peer (`SO_REUSEPORT`), and a bind with that flag
+set before it succeeds on a port another process of the same user holds on Linux and macOS
+(measured on Linux 6.19 and Darwin 25.4), the two processes then splitting the port's datagrams; so
+hyper-rt-transport binds the listener first and sets the flag after (hyper-raft `ab2eb0a`), and a
+held port refuses it `AddrInUse`, as a plain bind does on Windows.
 
 The orderly stop is built as planned above. SIGTERM and SIGINT (Ctrl-C and Ctrl-Break on Windows),
 and a `stop` line on standard input, each ask it; the first request begins it, to end by `stop_ms`

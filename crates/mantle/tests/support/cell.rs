@@ -1559,8 +1559,9 @@ impl Cell {
         }
     }
 
-    pub(crate) fn take(&mut self, heard: Heard) {
-        let diag = match &heard {
+    /// DIAG (scratch): one heard line kept, with when.
+    fn diag_note(&mut self, heard: &Heard) {
+        let diag = match heard {
             Heard::Line(id, generation, line) => format!("line {id} g{generation} {line:?}"),
             Heard::Ended(id, generation) => format!("ended {id} g{generation}"),
             Heard::Told(Told::Progress(client, done, patience)) => {
@@ -1568,10 +1569,39 @@ impl Cell {
             }
             Heard::Told(Told::Failed(client, _)) => format!("failed {client}"),
         };
+        self.diag_mark(diag);
+    }
+
+    /// DIAG (scratch): a note kept in the history, with when.
+    pub(crate) fn diag_mark(&mut self, note: String) {
         self.diag_seen
-            .push_back((Instant::now(), diag.chars().take(200).collect()));
-        if self.diag_seen.len() > 400 {
+            .push_back((Instant::now(), note.chars().take(220).collect()));
+        if self.diag_seen.len() > 3000 {
             self.diag_seen.pop_front();
+        }
+    }
+
+    pub(crate) fn take(&mut self, heard: Heard) {
+        // DIAG (scratch): a status only where its term or leader moved, so the history spans the roll.
+        if let Heard::Line(
+            id,
+            _,
+            Line::Status {
+                group,
+                term,
+                leader,
+                ..
+            },
+        ) = &heard
+            && let Some(Line::Status {
+                term: was_term,
+                leader: was_leader,
+                ..
+            }) = self.status.get(&(*id, *group))
+            && (was_term, was_leader) == (term, leader)
+        {
+        } else {
+            self.diag_note(&heard);
         }
         match heard {
             Heard::Line(id, generation, line) => {

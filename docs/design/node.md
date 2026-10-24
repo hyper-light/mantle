@@ -198,11 +198,13 @@ The two policy shares have no model that storage can supply (11 §18). Until a d
 them, a queue is bounded at the lower bound its own service time sets, and checkpoints are
 triggered by space alone (11 §4.5, §9), as the chunk store does today.
 
-**Memory.** When the operator states no ceiling, the node's budget is the smallest that admits
-one unit of work of every class at once: one PUT's block window and its coding work space, one
-GET's block, one `Ready` of the largest entry for each range with work, the engines' minimum
-write buffers, one transfer slot per peer. That floor is computed from the settings, and the
-node refuses to start, naming the class, when it exceeds what the operating system allows.
+**Memory.** The node's floor is the smallest budget that admits one unit of work of every class
+at once: one PUT's block window and its coding work space, one GET's block, one `Ready` of the
+largest entry for each range with work, the engines' minimum write buffers, one transfer slot per
+peer. That floor is computed from the settings, and the node refuses to start, naming the class,
+when it exceeds its allowance: the operator's ceiling, else the limit the operating system sets
+for the process, else physical memory. What remains past the floor sizes the volumes' indexes and
+the engines' resident metadata.
 Independent defaults, each safe alone, add up past a laptop's memory: the chunk store's pools
 alone can keep 96 MiB per volume (audit §12.3). A laptop needs the smallest population that
 serves its work (audit §6.3), and more is granted by stating a ceiling.
@@ -221,11 +223,26 @@ measures the second, and derives the rest by these rules:
   apply, one chunk ask to each node a block's width needs, the transport funding each peer's
   windows at QUIC's initial window beside the messages' room and each connection's reserve
   (`bounds::least_transport`); a receive chunk past them spares a datagram its copy, which its
-  connection's window already charges, and waits for its knee. The node refuses to start, naming the class, when the floor exceeds the
-  stated ceiling or the limit the OS sets for the process (hyper-rt's `MemoryFacts::limit`:
-  cgroup v2's `memory.max`, a job's limit, `RLIMIT_AS`). A share above a class's floor waits for
-  its knee, where throughput stops growing as the share grows, measured at the scale step (§9.3):
-  until then it has no basis.
+  connection's window already charges, and waits for its knee. The node's allowance is the
+  stated ceiling, else the limit the OS sets for the process (hyper-rt's `MemoryFacts::limit`:
+  cgroup v2's `memory.max`, a job's limit, `RLIMIT_AS`), else physical memory, a ceiling past what
+  the OS lets the process hold refused (`derive::allowance`, `DeriveError::Ceiling`; research 64
+  §5). The floor counts its classes in order and the node refuses to start at the class whose
+  bytes take the count past the allowance, the whole floor named beside it (`derive::floor`,
+  `DeriveError::Memory`). What remains is shared by each volume's index and each range engine's
+  resident metadata, each in proportion to what it wants at its device's full size, so no device
+  fills before the rest (`derive::shares`): a volume's index a fragment at each of its blocks
+  (`derive::index_wants`), and an engine as many extents as its share holds at the metadata
+  measured at the densest rows, 89,208 millionths of an extent's bytes, and its allocator's own
+  (`derive::engine_within`, `shard_db::MEASURED_METADATA_PPM`, the owner's choice of 2026-10-23
+  over its statement for any keys, which holds a twentieth of the rows). Longer keys hold more an
+  extent, so the engine holds its share itself: a put that would pack its memtable while its
+  metadata is at or past its share is refused, typed, as a file system with no room refuses a
+  write; a delete still packs it, as one takes an unlink; and once compactions bring the metadata
+  under, puts are taken again (`ShardDb::set_metadata_limit`; research/69), what it holds past its
+  share bounded by its statement (`shard_db::resident_per_extent`). A share above a class's floor
+  waits for its knee, where throughput stops growing as the share grows, measured at the scale
+  step (§9.3): until then it has no basis.
 - **Sessions are named by their owner and its run** (the node's id and its run record, §1.6),
   and a registration by its place among its run's, which rises with each: a later registration
   ends the session its owner's last one opened, whose process has ended, since a directory holds

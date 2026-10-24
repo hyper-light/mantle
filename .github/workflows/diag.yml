@@ -1,0 +1,51 @@
+name: diag-secret-acl
+# Scratch: the key-file tests on both Windows runners (serve-cell CI run 40096493787 refused a key
+# the test had cut to its owner and LocalSystem), with the runner's token and a fresh file's SDDL.
+on:
+  push:
+    branches: ["diag/**"]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: "1"
+jobs:
+  acl:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows-aarch64, runner: windows-11-arm, target: aarch64-pc-windows-msvc }
+          - { name: windows-x86_64, runner: windows-2025, target: x86_64-pc-windows-msvc }
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: The runner's token and a fresh file's security
+        shell: pwsh
+        run: |
+          whoami /all
+          $f = Join-Path $env:TEMP "probe.key"
+          Set-Content -LiteralPath $f -Value "x"
+          (Get-Acl -LiteralPath $f).Sddl
+          icacls $f
+      - name: Install pinned Rust
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup target add --toolchain 1.98.1 ${{ matrix.target }}
+      - name: Install NASM
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        uses: ilammy/setup-nasm@v1.5.2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: diag-acl-${{ matrix.target }}
+          workspaces: |
+            .
+            vendor
+      - name: The key-file tests
+        shell: bash
+        run: |
+          cargo test --locked -p mantle-node --lib secret --target ${{ matrix.target }} -- --nocapture || true
+          cargo test --locked -p mantle --bin mantle files --target ${{ matrix.target }} -- --nocapture || true

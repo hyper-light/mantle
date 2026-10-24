@@ -572,6 +572,9 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/node/src/read.rs` `PAGE_HEAD_BYTES` | format | A page of the volume table's bytes before its volumes: whether more follow, one byte, and the count, a u32. |
 | `crates/node/src/read.rs` `PLACED_BYTES` | derived | A volume in a page at the longest domain: its id (u128), node (u64) and bytes (u64), its domain's length (u32) and `MAX_DOMAIN` bytes; a page counts each at it so it fits whatever their domains. |
 | `crates/node/src/read.rs` `VOLUMES` | format | A read's kind: a page of the volume table, of the root range. |
+| `crates/node/src/secret/windows.rs` `ACCESS_ALLOWED_ACE_TYPE` | external | 0, winnt.h's `ACCESS_ALLOWED_ACE_TYPE`: an ACE that grants (windows-sys keeps it in a feature the workspace does not enable). |
+| `crates/node/src/secret/windows.rs` `ACCESS_DENIED_ACE_TYPE` | external | 1, winnt.h's `ACCESS_DENIED_ACE_TYPE`: an ACE that denies. |
+| `crates/node/src/secret/windows.rs` `SECURITY_DESCRIPTOR_REVISION` | external | 1, winnt.h's `SECURITY_DESCRIPTOR_REVISION`, the revision `InitializeSecurityDescriptor` takes. |
 | `crates/range/src/conf.rs` `FORMAT` | format | Version byte of the encoded configuration row. |
 | `crates/range/src/image.rs` `FORMAT` | format | Version byte of the encoded snapshot image. |
 | `crates/range/src/replica.rs` `QUIET` | derived | `Duration::MAX`, no quiet write: the durable shell writes a commit no write stated after its owner's period so that a member acting on applied state at its next start reopens with it (hyper-raft docs/durable.md §4.1); no entry of a range is acted on at start (`RangeMachine::acts_at_start`), and the engine's durable index is part of the durable commit, so the write is never due. |
@@ -674,9 +677,6 @@ parameters. The gate does not parse these; they are kept here with the same kind
 | `crates/mantle/src/main.rs` bench rounds default | cited | `Policy::STANDARD.max` = 30, from docs/research/21 §9.5 (crates/disk/src/rounds.rs). |
 | `crates/mantle/src/main.rs:91` bench step seconds (chunk 1, log 1, ec 0.5, hash 0.5, meta 0.5) | open | research/11 §16.3 asks for step length from the samples the reported quantiles need and a steady-state window. |
 | `crates/mantle/src/main.rs:296` ec and hash size ladders | open | 64K–8M chunk and 8K–8M buffer ladders; not derived from the design's chunk and part distributions. |
-| `crates/mantle/src/files/windows.rs` `ACCESS_ALLOWED_ACE_TYPE` | external | 0, winnt.h's `ACCESS_ALLOWED_ACE_TYPE`: an ACE that grants (windows-sys keeps it in a feature the workspace does not enable). |
-| `crates/mantle/src/files/windows.rs` `ACCESS_DENIED_ACE_TYPE` | external | 1, winnt.h's `ACCESS_DENIED_ACE_TYPE`: an ACE that denies. |
-| `crates/mantle/src/files/windows.rs` `SECURITY_DESCRIPTOR_REVISION` | external | 1, winnt.h's `SECURITY_DESCRIPTOR_REVISION`, the revision `InitializeSecurityDescriptor` takes. |
 | `crates/mantle/src/init.rs` `NO_EXPIRY` | external | 253,402,300,799 Unix seconds, 99991231235959Z: RFC 5280 §4.1.2.5's notAfter for a certificate with no well-defined expiration, which init's certificates take until certificates are rotated (node.md §1.5). |
 | `crates/chunk/src/layout.rs:34` Limits default batch_requests 1,024 | open | Audit §12.6: derive n* = F0/c_r or a latency-bounded version from measured per-batch (b, n, S) (research 11 §5.3). |
 | `crates/chunk/src/layout.rs:35` Limits default batch_bytes 32 MiB | open | Research 11 §5 gives b* = F0·BW, which does not set it; audit §12.6 asks for a derivation from a measured T(b). |

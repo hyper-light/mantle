@@ -420,10 +420,11 @@ fn a_second_request_to_stop_ends_the_process_at_once() {
 }
 
 /// A start that fails names its step (node.md §1.7), and the node serving on its directory serves
-/// on: a second process on that directory is refused at the locks, one whose key file is missing at
-/// its identity (read before any lock), one whose configuration does not parse at the
-/// configuration, and one on a directory of its own whose plane's port the serving node holds at
-/// the network. Each ends non-zero before it listens.
+/// on: a second process on that directory is refused at the locks, one whose key file is missing,
+/// or whose TLS key or root key others than its owner may read, at its identity (read before any
+/// lock; the key closed again, the start goes on to the locks), one whose configuration does not
+/// parse at the configuration, and one on a directory of its own whose plane's port the serving
+/// node holds at the network. Each ends non-zero before it listens.
 #[test]
 fn a_start_that_fails_names_its_step_and_the_node_serving_serves_on() {
     let mut cell = Cell::made(|root| {
@@ -454,7 +455,9 @@ fn a_start_that_fails_names_its_step_and_the_node_serving_serves_on() {
             .stdin(Stdio::null())
             .output()
             .unwrap();
-        let said = String::from_utf8_lossy(&served.stderr).into_owned();
+        // A path the node names joins a stated relative path to its directory's, with either
+        // separator on Windows.
+        let said = String::from_utf8_lossy(&served.stderr).replace('\\', "/");
         assert!(!served.status.success(), "{step}: {said}");
         assert!(
             said.contains(&format!("the start's {step} step")) && said.contains(what),
@@ -468,6 +471,19 @@ fn a_start_that_fails_names_its_step_and_the_node_serving_serves_on() {
         );
     };
     refused(&config, "locks", "LOCK");
+    for (key, named) in [
+        (dir.join("identity").join("node.key"), "identity/node.key"),
+        (dir.join("keys").join("1"), "keys/1"),
+    ] {
+        open_to_others(&key, true);
+        refused(
+            &config,
+            "identity",
+            &format!("{named}: is readable by others than its owner"),
+        );
+        open_to_others(&key, false);
+        refused(&config, "locks", "LOCK");
+    }
     let missing = dir.join("config-missing-key");
     std::fs::write(
         &missing,
@@ -503,7 +519,33 @@ fn a_start_that_fails_names_its_step_and_the_node_serving_serves_on() {
     objects_round_trip(&mut cell, &[id], &|_| id);
 }
 
-/// Copies the directory `from` and what it holds to `to`, each file's permissions with it: each
+/// Lets everyone read the key file at `path`, or takes that away again: its mode 0644 or 0600 on
+/// Unix; on Windows an entry allowing Everyone (S-1-1-0) to read it added to its DACL, or removed.
+fn open_to_others(path: &Path, open: bool) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = if open { 0o644 } else { 0o600 };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let change: &[&str] = if open {
+            &["/grant", "*S-1-1-0:R"]
+        } else {
+            &["/remove:g", "*S-1-1-0"]
+        };
+        let out = Command::new("icacls")
+            .arg(path)
+            .args(change)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "icacls {change:?}: {out:?}");
+    }
+}
+
+/// Copies the directory `from` and what it holds to `to`, each file's permissions with it (a key
+/// file written again as its owner's alone, `cell::key_file`): each
 /// directory copied in turn from a list of those found, none waiting on another.
 fn copy_tree(from: &Path, to: &Path) {
     let mut dirs = vec![(from.to_path_buf(), to.to_path_buf())];
@@ -514,6 +556,11 @@ fn copy_tree(from: &Path, to: &Path) {
             let target = to.join(entry.file_name());
             if entry.file_type().unwrap().is_dir() {
                 dirs.push((entry.path(), target));
+            } else if mantle_node::secret::owner_only(&std::fs::File::open(entry.path()).unwrap())
+                .unwrap()
+            {
+                // A key stays its owner's alone: Windows gives a copy its directory's entries.
+                key_file(&target, &std::fs::read(entry.path()).unwrap());
             } else {
                 std::fs::copy(entry.path(), target).unwrap();
             }

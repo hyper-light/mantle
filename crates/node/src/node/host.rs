@@ -694,6 +694,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Ok(())
             }
             Err(error) => {
+                {
+                    use std::io::Write as _;
+                    let _ = writeln!(std::io::stderr(), "DIAG put new failed: {error:?}");
+                }
                 let status = put_status(&error);
                 self.fail_job(at, status)
             }
@@ -724,11 +728,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                             etag: stored.etag.clone(),
                             size: stored.size,
                         },
-                        Err(error) => Reply::status(put_status(error)),
+                        Err(error) => {
+                            use std::io::Write as _;
+                            let _ = writeln!(std::io::stderr(), "DIAG put failed: {error:?}");
+                            Reply::status(put_status(error))
+                        }
                     });
                     match over {
                         Some(reply) => Step::Over(reply),
                         None if put.tick(wall).is_err() => {
+                            use std::io::Write as _;
+                            let _ = writeln!(std::io::stderr(), "DIAG put tick failed");
                             Step::Over(Reply::status(Status::Failed))
                         }
                         None => Step::Go,

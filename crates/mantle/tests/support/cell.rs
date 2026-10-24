@@ -1119,9 +1119,14 @@ impl Cell {
         self.bases.remove(&id);
         let (tell, generation) = (self.tell.clone(), self.generations);
         self.generations += 1;
+        let traced = std::env::var_os("MANTLE_TRACE_LINES").is_some();
+        let started = Instant::now();
         std::thread::spawn(move || {
             for line in BufReader::new(output).lines() {
                 let Ok(line) = line else { break };
+                if traced {
+                    eprintln!("TRACE {:?} node {id}: {line}", started.elapsed());
+                }
                 if let Some(parsed) = parse(&line)
                     && tell.send(Heard::Line(id, generation, parsed)).is_err()
                 {

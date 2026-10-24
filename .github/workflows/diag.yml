@@ -1,0 +1,50 @@
+name: diag-init-windows
+# Scratch: init's serve tests on the Windows runners where they failed (CI run 40074022184,
+# windows-aarch64: a cell of one quiet during its first put, a cell of three's 1-byte put Failed),
+# with every node line traced and each put's error said.
+on:
+  push:
+    branches: ["diag/**"]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: "1"
+  MANTLE_TRACE_LINES: "1"
+jobs:
+  init:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows-aarch64, runner: windows-11-arm, target: aarch64-pc-windows-msvc }
+          - { name: windows-x86_64, runner: windows-2025, target: x86_64-pc-windows-msvc }
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned Rust
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup target add --toolchain 1.98.1 ${{ matrix.target }}
+      - name: Install NASM
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        uses: ilammy/setup-nasm@v1.5.2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: diag-${{ matrix.target }}
+          workspaces: |
+            .
+            vendor
+      - name: Build the serve suite
+        shell: bash
+        run: cargo test --locked -p mantle --test serve --no-run --target ${{ matrix.target }}
+      - name: init's cells, one at a time, twice
+        shell: bash
+        run: |
+          for round in 1 2; do
+            echo "=== round $round"
+            cargo test --locked -p mantle --test serve --target ${{ matrix.target }} -- a_cell_of_ --test-threads 1 --nocapture || true
+          done

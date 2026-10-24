@@ -12,8 +12,16 @@ env:
   RUST_BACKTRACE: "1"
 jobs:
   serve:
-    name: windows-aarch64
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: as-measured, prewrite: "" }
+          - { name: prewritten, prewrite: "1" }
+    name: windows-aarch64 ${{ matrix.name }}
     runs-on: windows-11-arm
+    env:
+      MANTLE_DIAG_PREWRITE: ${{ matrix.prewrite }}
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v7.0.1
@@ -31,10 +39,11 @@ jobs:
       - name: Build the serve suite
         shell: bash
         run: cargo test --locked -p mantle --test serve --no-run --target aarch64-pc-windows-msvc
-      - name: The serve suite, four rounds
+      - name: The serve suite, three rounds
         shell: bash
         run: |
-          for round in 1 2 3 4; do
+          [ -z "$MANTLE_DIAG_PREWRITE" ] && unset MANTLE_DIAG_PREWRITE
+          for round in 1 2 3; do
             echo "=== round $round"
-            cargo test --locked -p mantle --test serve --target aarch64-pc-windows-msvc -- --nocapture 2>&1 | grep -aE "^test |test result|DIAG|panicked|the put of|refused" || true
+            cargo test --locked -p mantle --test serve --target aarch64-pc-windows-msvc -- --nocapture 2>&1 | grep -aE "^test .* (ok|FAILED)|test result|DIAG|panicked|the put of" || true
           done

@@ -18,7 +18,6 @@ jobs:
       matrix:
         include:
           - { name: windows-aarch64, runner: windows-11-arm, target: aarch64-pc-windows-msvc }
-          - { name: windows-x86_64, runner: windows-2025, target: x86_64-pc-windows-msvc }
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
@@ -41,10 +40,10 @@ jobs:
       - name: Build the serve suite
         shell: bash
         run: cargo test --locked -p mantle --test serve --no-run --target ${{ matrix.target }}
-      - name: init's cells, one at a time, twice
+      - name: the serve suite as CI runs it, its tests side by side, three times
         shell: bash
         run: |
-          for round in 1 2; do
+          for round in 1 2 3; do
             echo "=== round $round"
-            cargo test --locked -p mantle --test serve --target ${{ matrix.target }} -- a_cell_of_ --test-threads 1 --nocapture || true
+            cargo test --locked -p mantle --test serve --target ${{ matrix.target }} -- --nocapture || true
           done

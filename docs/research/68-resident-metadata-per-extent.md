@@ -162,6 +162,40 @@ in-flight bundles are empty and its parent's pivot is (`trunk::upkeep`, `take_ch
 children's splits can add pivots meanwhile; and nodes never merge, so their count follows the
 splits a range has seen, not the data it holds. Stating them waits on a bound for both.
 
+## 4. Kept on the release benchmark
+
+The statement changes no path a get, a seek or a packing runs; a compaction makes its filter at
+a 2-dense count and folds it. Exact counts on x86_64 (adacachy, `perf stat -e instructions:u`,
+the difference of two sizes) against data-layer 340e1324: a get 2,068.15 against 2,068.13
+instructions, a seek and its nexts 28,566.08 against 28,566.02, a leaf lookup and a range
+filter's build equal, a compaction round 3,241,781,882 against 3,241,766,710 at 1M entries (median
+of three; the base's own three spread 46,267) and 6,910,937,640 against 6,910,910,655 at 2.1M
+(spread 70,024).
+
+The release benchmark on the VM (data-layer 7bb376ce against 340e1324, RocksDB and SplinterDB;
+then against the base shifted by an unused function, and the final shifted three ways):
+
+| keys | rounds | final over base, fill / gets / seeks | shifted base over base | over RocksDB | over SplinterDB |
+|---|---|---|---|---|---|
+| 1M | 4 (R0 8030) | 0.996 / 0.997 / 0.997 | | 6.10 / 6.42 / 5.49 | 4.42 / 2.33 / 3.36 |
+| 1M | 12 (R0 8060) | 0.987 / 1.014 / 0.999 | 0.972 / 1.014 / 0.999 | | |
+| 10M | 4 (R0 8040) | 0.991 / 0.966 / 0.978 | | 5.07 / 9.86 / 7.43 | 3.88 / 3.23 / 4.53 |
+| 10M | 12 (R0 8080) | 0.977 / 0.975 / 1.000 | 1.003 / 0.995 / 0.991 | | |
+| 10M | 12 (R0 8120) | 0.995 / 1.023 / 1.000 | 1.011 / 1.005 / 1.012 | | |
+| 100M | 4 (R0 8050) | 1.023 / 0.670 / 0.877 | | 5.08 / 5.56 / 6.76 | 3.60 / 3.51 / 10.26 |
+| 100M | 6 (R0 8100) | 0.992 / 0.989 / 0.979 | 0.989 / 0.997 / 1.019 | | |
+| 1B | 4 (R0 8110, 8114) | 1.009 / 1.103 / 1.100 | | | |
+
+At 10M the final's three shifted layouts (R0 8120) ran 1.012-1.017 of the base on fill,
+1.004-1.027 on gets and 1.003-1.006 on seeks: the 0.977 and 0.975 of R0 8080 are within what
+layout and batch move. Two of the final's four rounds at 100M (R0 8050) took the slow mode the
+100M gets have shown before (research/65 §9): 1,150-1,770 ns of CPU a get where the rest took
+460-490, with the same work counted (1.31 million cache hits, 631,247 kept hits, no device read);
+the rounds without it ran 0.974 and 0.928 on gets and 1.019 and 0.952 on seeks. At a billion
+rows, two cycles of two rounds with the arms' order swapped between them, each arm first in a
+round of each (R0 8110 and 8114): fill 0.939-1.070, gets 0.934-1.354, seeks 0.930-1.404 of the
+base's, and every case's recovery exact (632,113,920 live keys, every value).
+
 ## Appendix: the 2-dense counts measured
 
 `python3 -I gaps.py 20000` printed "v<20000: search worst gap 35 blocks, worst rel (v>=64) 0.0959,

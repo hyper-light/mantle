@@ -453,12 +453,23 @@ resolves as it starts to its own socket's family. The node directory's `LOCK` is
 process runs; the start runs node.md §1.7's steps in order, a failure naming its step (`mantle: the
 start's locks step: …`). SIGTERM or SIGINT (Ctrl-C or Ctrl-Break on Windows), or a `stop` line,
 stops the node in order within `stop_ms`: new objects answered `SlowDown`, those running ended, each
-led range handed to a caught-up member that then leads, connections closed and left to drain, exit
-0; a second request ends it at once (`crates/mantle/tests/serve.rs`). Remaining: `mantle init
-client`; a held QUIC port refused rather than shared (hyper-rt-transport sets `SO_REUSEPORT` before
-its listener's bind) and Windows' close, logoff and shutdown held through the stop (hyper-rt's
-handler), both hyper-rt's; and a replicated range refusing puts at its engine's metadata share
-where its leader admits a command, since a refusal at apply would let members diverge.
+led range handed to a caught-up member that then leads (handed again where its core gives a
+transfer up), connections closed and left to drain, exit 0; a second request ends it at once
+(`crates/mantle/tests/serve.rs`). A start refuses, at its identity step and naming the file, a key
+readable by others than its owner (the node's TLS key and each root key, on every platform: no
+group or other mode bit on Unix; on Windows no DACL entry for a principal but the owner and
+LocalSystem, read from the handle the key is read through) and a certificate the stated authority
+did not issue (the node's own and each pinned peer's: RFC 5280 §6.1.3 (a)'s issuer, signature and
+validity); and refuses no configuration, and a volume another process holds, at their steps. A cell
+of three made by `mantle init` rolls one node at a time, each handing its ranges over, started again
+from its directories, with no other member saying a range has no leader, and every object read back
+through every node after the roll, on two CPUs beside four busy loops and on one CPU. Remaining:
+`mantle init client`; a held QUIC port refused rather than shared (hyper-rt-transport sets
+`SO_REUSEPORT` before its listener's bind) and Windows' close, logoff and shutdown held through the
+stop (hyper-rt's handler), both hyper-rt's; a node that knows no peer's address heartbeating at its
+stream's floor until one answers (hyper-liveness's); and a replicated range refusing puts at its
+engine's metadata share where its leader admits a command, since a refusal at apply would let members
+diverge.
 
 ## Planned, in order
 

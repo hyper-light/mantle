@@ -158,10 +158,13 @@ fn an_owner_waits_for_its_oldest_write_whole_and_the_next_drive_takes_it() {
     for i in 0..count {
         r.propose(Vec::new(), vec![i as u8; entry]).unwrap();
     }
+    // The frames flushed are counted from before the drive hands the write to the log, whose own
+    // thread may flush its parts before the drive's caller reads the count (CI run 40090099990,
+    // windows-2025: fewer than two were left to count, and the parts read as one).
+    let before = log.flushed().0;
     let mut out = Output::default();
     r.drive(now(), Waker::noop(), &mut out).unwrap();
     assert_eq!(r.in_flight(), 1);
-    let before = log.flushed().0;
     assert!(r.log_mut().wait());
     assert!(log.flushed().0 - before >= 2, "the write went in parts");
     out.clear();

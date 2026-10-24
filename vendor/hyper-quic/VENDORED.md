@@ -1307,3 +1307,61 @@ again. `Connection::receive_window_debt` returns that debt. hyper-transport sets
 connection's grown window back to its first and gives back what the growth held as the debt is
 paid (`docs/transport.md` §4t): the peer may still send at most the window and the debt beyond what
 was read, so what is held never falls below that.
+
+## 36. A probe of the path's MTU waits for the window and the pacer (2026-10-17)
+
+Patch Q25 departs from upstream's MTU discovery, which sent a probe whenever the connection had
+nothing else to send, past the congestion window and the pacer. Upstream's search stops at 1,452
+bytes by default, where a probe costs a path little. hyper-transport searches up to the path's MTU
+as its kernel holds it (`docs/transport.md` §4q): 65,527 bytes on a loopback. Behind a relay of 128
+kbit/s in front of such a loopback, the search's first step, about 33 KB, held the link two seconds
+and every packet behind it waited: three focal nodes never heard each other's votes and elected no
+leader (`evidence_quic::a_megabyte_chunk_reaches_its_copy_across_128_kbit_per_second`, every run on
+Linux once focal took the search to the path's MTU; a clamp of the ceiling to 1,452 bytes brought the
+leader back). RFC 8899
+§3, item 7 lets a probe be regulated so: "A PL MAY use a congestion controller to decide when to send
+a probe packet", its probes then "delayed or suspended during congestion", and a PL "could need
+transmission of probe packets to be regulated by" its pacing.
+
+A probe is now sent only when it fits the congestion window and the pacer lets it go
+(`write_mtu_probe`), the pacing timer set for when it may. A window of one round trip of the path
+never affords a probe that would take the path longer, so a slow path keeps its MTU and a fast one
+probes as before. The search plans its next size once (`MtuDiscovery::probe_due`, `SearchState::
+planned`) and takes it as sent when its packet exists, under its own number (`probe_sent`): choosing
+a size reads the last probe's fate, so a step held back is not chosen again, and a builder that
+refused no longer left the search waiting on a number the next packet took. A step planned past a
+ceiling lowered meanwhile is planned again from the bounds as they stand.
+
+Test: `tests::an_mtu_probe_waits_for_the_window_on_a_slow_path` (a 128 kbit/s path whose MTU is
+65,527, the search allowed to it: no probe sent, the MTU where it began; without the rule the client
+sent 12 probes, reached 65,527, and its smoothed round trip grew to 4.8 s against 48.5 ms, the
+warm-up's packets of the new MTU growing its window to 393 KB). `tests::mtud_probes_include_immediate_ack`
+and every MTU test pass unchanged.
+
+## 37. A probe the window and the pacer can carry goes before new data (2026-10-20)
+
+Patch Q26 narrows Q25 (§36) for a connection that keeps sending. Q25 holds a probe back as any
+packet is held, by the congestion window and the pacer, and the probe is still sent only in the room
+data leaves (`send_when_idle`, as upstream sends it). A connection that kept sending left it none:
+data filled the window, and the pacer's bucket, as fast as acknowledgements and time freed them, so
+the room a probe needs never came, and the search stayed where it began until the sending stopped.
+On loopback a connection with a window of 130 KB sent no probe in a minute and carried every byte in
+1,200-byte datagrams of the path's 65,507
+(`hyper-rt-transport::peer_sockets::a_connections_mtu_search_ends_at_its_paths_mtu_as_the_kernel_holds_it`,
+7 runs of 40 on arm64 Linux, two arm64 CI runs; the faster x86 runners left gaps between bursts).
+
+Now a probe the search has due that the window could carry with nothing in flight and the pacer's
+bucket could carry full goes before new data (`Connection::probe_goes_first`): new data in the 1-RTT
+space waits, as an application-limited connection's does, until what was in flight drains and the
+bucket refills by the probe's size, and the probe takes the room; acknowledgements, loss probes and a
+PATH_RESPONSE do not wait, nor does the warm-up take the room meanwhile. TCP's probe takes its place
+among its window's segments the same way (Linux, `tcp_mtu_probe`). A probe larger than the window
+or the bucket waits as §36 has it, and data does not wait for it: on a slow path it would hold the
+link past a round trip, which is what Q25 keeps from it.
+
+Test: `tests::an_mtu_search_runs_on_a_connection_that_keeps_sending` (a fast path whose MTU is
+65,527, the search allowed to it, no warm-up and the flow-control windows out of the way, 16 MiB sent
+the moment the idle connection's first window has carried no probe: 318 datagrams, the search run
+during the transfer and ended at 65,527; without Q26, 14,377, its one probe starved by the pacer).
+`tests::an_mtu_probe_waits_for_the_window_on_a_slow_path` and every MTU test pass unchanged; on arm64
+Linux the peer_sockets test passed 40 runs of 40.

@@ -402,6 +402,12 @@ pub struct ShardDb<F: BlockFile> {
     /// Entries the active memtable leaves unsorted at most before it sorts them
     /// ([`Self::set_order_bound`]).
     order_bound: usize,
+    /// The resident metadata its branches may hold before a put that would pack a memtable is
+    /// refused ([`Self::set_metadata_limit`]), none for no limit; and the last look at it: the
+    /// trunk's merged and held entries then and whether it was at or past the limit, looked at
+    /// again only once its branches have changed.
+    metadata_limit: Option<u64>,
+    metadata_look: Option<((u64, u64), bool)>,
     /// Nanoseconds scans have spent on the active memtable's runs being many rather than one,
     /// not yet spent back on merging them. Idle time merges them only once this covers the merge's
     /// measured cost: the ski-rental rule, within twice the cost of the best choice made knowing
@@ -893,6 +899,8 @@ impl<F: BlockFile> ShardDb<F> {
             worker_attach: None,
             trunk_carry: 0,
             order_bound: ORDER_BOUND,
+            metadata_limit: None,
+            metadata_look: None,
             tidy_rent_ns: 0,
             seek_ns: 0,
             seek_cmps: 0,
@@ -1245,6 +1253,47 @@ impl<F: BlockFile> ShardDb<F> {
     /// of puts may sort before it reads, against the merge work more, smaller chunks cost puts.
     pub fn set_order_bound(&mut self, entries: usize) {
         self.order_bound = entries.max(1);
+    }
+
+    /// Holds its branches' resident metadata to `limit` bytes, none for no limit: its share of
+    /// what remains of the node's memory past its floor (`derive::engine_within`). A put that
+    /// finds the memtable full while the trunk's metadata is at or past it is refused,
+    /// [`Error::LimitExceeded`], the memtable kept, as a file system with no room refuses a write;
+    /// a delete still packs it, as one takes an unlink, deleting being how a range's rows shrink;
+    /// and once compactions bring the metadata under the limit, puts are taken again
+    /// (docs/research/69). What it holds past the limit when it refuses is at most one memtable's
+    /// packing and its compactions' inputs and outputs at once, each within its statement
+    /// ([`resident_per_extent`]).
+    pub fn set_metadata_limit(&mut self, limit: Option<u64>) {
+        self.metadata_limit = limit;
+        self.metadata_look = None;
+    }
+
+    /// Whether a put that would pack the memtable is refused for the trunk's metadata
+    /// ([`Self::set_metadata_limit`]): looked at again only once a packing has landed or a
+    /// compaction merged since the last look (the trunk's held and merged entries), so a range
+    /// refusing puts walks its branches once a change, not once a put.
+    fn metadata_full(&mut self) -> bool {
+        let Some(limit) = self.metadata_limit else {
+            return false;
+        };
+        let at = (self.trunk.merged(), self.trunk.held_entries());
+        if let Some((seen, full)) = self.metadata_look
+            && seen == at
+        {
+            return full;
+        }
+        let held = u64::try_from(self.trunk.memory().total()).unwrap_or(u64::MAX);
+        let full = held >= limit;
+        self.metadata_look = Some((at, full));
+        full
+    }
+
+    fn metadata_refusal(&self) -> Error {
+        Error::LimitExceeded {
+            what: "a range's resident metadata",
+            limit: self.metadata_limit.unwrap_or(u64::MAX),
+        }
     }
 
     /// Runs the trunk's compactions on maintenance workers, each over its own handle on the
@@ -2365,6 +2414,9 @@ impl<F: BlockFile> ShardDb<F> {
         let t = self.timed.then(std::time::Instant::now);
         match self.mem.insert_hashed(key, h, op, value) {
             Err(Error::LimitExceeded { .. }) if !self.mem.is_empty() => {
+                if op == Op::Put && self.metadata_full() {
+                    return Err(self.metadata_refusal());
+                }
                 let r = self.timed.then(std::time::Instant::now);
                 self.rotate()?;
                 let ns = ns_since(r);
@@ -2401,6 +2453,9 @@ impl<F: BlockFile> ShardDb<F> {
         let mut before = self.mem.bytes();
         match self.mem.insert_hashed(key, h, op, value) {
             Err(Error::LimitExceeded { .. }) if !self.mem.is_empty() => {
+                if op == Op::Put && self.metadata_full() {
+                    return Err(self.metadata_refusal());
+                }
                 if !self.rotate_paced(keys)? {
                     return Ok(false);
                 }

@@ -1366,6 +1366,13 @@ impl Trunk {
         self.merge_keys
     }
 
+    /// The entries every pivot's bundle and every node's in-flight bundles hold, counted as
+    /// branches enter and leave them: with [`Self::merged`], what moves when its branches change
+    /// (`ShardDb::set_metadata_limit`).
+    pub fn held_entries(&self) -> u64 {
+        self.held
+    }
+
     /// When seeks consolidate a pivot ([`Consolidation`]).
     pub fn set_consolidation(&mut self, choice: Consolidation) {
         self.consolidation = choice;

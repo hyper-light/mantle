@@ -474,6 +474,33 @@ by the same authority (`mantle init client`), and the founders pin those the ope
 Joining by invitation (below) replaces the static founders once the root range keeps the cell's
 membership.
 
+*As built (2026-10-24).* One command makes either, from the founders' statements given as repeated
+`--node quic=ADDR,plane=ADDR,domain=NAME,volume=DIR:SIZE,memory=SIZE` flags, a machines file
+(`--founders FILE`: the cell's `max_nodes`, `max_volumes` and `durability.target`, then a `[node]`
+block a founder, a volume `volume = DIR SIZE`), or both, the file's founders first, as the owner chose
+on 2026-10-24 (`mantle init OUT ...`; `crates/mantle/src/init.rs`). The cell's bounds on its volume
+table are stated (`--max-nodes`, `--max-volumes`, or the file's), since architecture §11 leaves
+their values open, and are required where a founder keeps volumes. One founder makes a cell of one
+in `OUT`, its directory, which keeps the authority's key under `identity/` as a laptop's does; several
+make `OUT/authority` (the authority's certificate and key and the root key) and `OUT/node-ID` for each
+founder. Every id and group is drawn from the OS, nonzero and distinct, refused otherwise; each
+certificate takes RFC 5280 §4.1.2.5's notAfter for no well-defined expiration until certificates are
+rotated. Each founder's `config` holds its stated keys alone (§1.4), every path relative to its
+directory, which `mantle serve` and `mantle node` read from the configuration's own directory, so a
+directory moves to its host whole; `identity/` holds the authority's certificate, the founder's own
+and its key, and each other founder's certificate, pinned by a `peer` line; `keys/1` the root key.
+Keys are created owner-only and kept so: mode 0600 on Unix, and on Windows a protected DACL granting
+the process token's owner and LocalSystem alone, as hyper-seal's check admits, each written whole
+under a temporary name, flushed, renamed and its directory flushed, and checked owner-only after,
+refused on a file system that does not keep it so (`crates/mantle/src/files.rs`). A cell of one is
+measured now: the machine's calibration record in its directory, which `mantle serve` takes again
+while the machine's key matches it (`process::calibration`), and each volume's device into its
+profile under the device directory's lock; founders of a larger cell are measured at their first
+`mantle serve` on their own hosts. Tested by serving from what it writes: a cell of one from one
+`--node`, and a cell of three from a machines file's two founders and a `--node`'s, each enlisting
+and serving objects (`crates/mantle/tests/serve.rs`). Native clients are issued by the authority's
+key and pinned by a `peer` line, as the tests do; `mantle init client` is still to build.
+
 **Joining.** An existing node mints an invitation (`mantle invite`): a one-time token recorded
 in the root range, so the log decides whether it was used. `mantle init --join` sends the token
 and a certificate request over the enrollment protocol, whose key the joining node keeps; the
@@ -528,10 +555,12 @@ removability and size, its file system's kind, block and size, and each member's
 record written whole, flushed and checked by its CRC-32C on read; one of another key, another
 layout version or that does not read is measured again and replaced (`mantle_disk::profile`). The
 OS's names for devices, which a restart may change, are not in the key, and firmware is not yet,
-since no probe reads it. `mantle init` and `mantle serve` add to the node's directory its `config`,
-`identity/` (the node's key and certificate, the authority's certificate, each pinned peer's
-certificate), `keys/` (one root-key file a generation), hyper-rt's calibration record, and a `LOCK`
-of its own, held as the volumes' are, since its log and stores admit one process as a volume does.
+since no probe reads it. `mantle init` adds to the node's directory its `config`, `identity/` (the node's key and
+certificate, the authority's certificate, each pinned peer's certificate under `peers/`), `keys/`
+(one root-key file a generation) and, for a cell of one, `calibration`, hyper-rt's record, which
+`mantle serve` and `mantle node` keep there too and take again while the machine's key matches it.
+A `LOCK` of the directory's own, held as the volumes' are, since its log and stores admit one process
+as a volume does, is still to build.
 `meta/` on a metadata device, `DEVICE` and `map` wait for the storage graph (§1.7 step 3) and the
 cell map (architecture §4).
 

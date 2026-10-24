@@ -294,10 +294,13 @@ pub const STATED_KEYS: &[&str] = &[
 /// SIZE`, and its root key's generations.
 pub const STATED_REPEATED: &[&str] = &["peer", "range", "volume", "root_key"];
 
-/// The file's values by key, each with the line it was on, and its repeated lines by their key.
+/// The file's values by key, each with the line it was on, and its repeated lines by their key; and
+/// the directory the file is in, which a relative path in it names a place from, so a node's
+/// directory, its configuration and identity in it, moves to its host whole (`mantle init`).
 struct Lines {
     values: BTreeMap<String, (usize, String)>,
     repeated: BTreeMap<&'static str, Vec<(usize, String)>>,
+    base: PathBuf,
 }
 
 impl Lines {
@@ -330,7 +333,20 @@ impl Lines {
         Ok(Self {
             values,
             repeated: lines,
+            base: PathBuf::new(),
         })
+    }
+
+    /// These lines read from the file at `path`: a relative path in them names a place from its
+    /// directory.
+    fn of_file(mut self, path: &Path) -> Self {
+        self.base = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        self
+    }
+
+    /// The place `text` names: from the file's directory where it is relative.
+    fn path(&self, text: &str) -> PathBuf {
+        self.base.join(text)
     }
 
     /// The repeated lines of `key`, each with the line it was on.
@@ -393,7 +409,7 @@ fn peers(lines: &Lines) -> Result<Vec<(u64, Role, PathBuf)>, ProcessError> {
                 ));
             }
         };
-        peers.push((id, role, PathBuf::from(certificate)));
+        peers.push((id, role, lines.path(certificate)));
     }
     Ok(peers)
 }
@@ -425,7 +441,7 @@ fn root_keys(lines: &Lines) -> Result<Vec<(u32, PathBuf)>, ProcessError> {
                 "root key generations in increasing order".into(),
             ));
         }
-        keys.push((generation, PathBuf::from(file)));
+        keys.push((generation, lines.path(file)));
     }
     Ok(keys)
 }
@@ -435,7 +451,7 @@ impl ProcessConfig {
     pub fn read(path: &Path) -> Result<Self, ProcessError> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| ProcessError::Read(path.to_path_buf(), e.to_string()))?;
-        let lines = Lines::parse(&text, KEYS, REPEATED)?;
+        let lines = Lines::parse(&text, KEYS, REPEATED)?.of_file(path);
         let peers = peers(&lines)?;
         let voters = voters(&lines)?;
         let waits = match lines.text("log.waits")? {
@@ -445,12 +461,12 @@ impl ProcessConfig {
         };
         let config = Self {
             id: lines.get("id")?,
-            dir: PathBuf::from(lines.text("dir")?),
+            dir: lines.path(lines.text("dir")?),
             quic: lines.get("quic")?,
             plane: lines.get("plane")?,
-            authority: PathBuf::from(lines.text("authority")?),
-            certificate: PathBuf::from(lines.text("certificate")?),
-            key: PathBuf::from(lines.text("key")?),
+            authority: lines.path(lines.text("authority")?),
+            certificate: lines.path(lines.text("certificate")?),
+            key: lines.path(lines.text("key")?),
             peers,
             ranges: ranges(&lines)?,
             voters,
@@ -715,7 +731,7 @@ fn volumes(lines: &Lines) -> Result<Vec<VolumeSettings>, ProcessError> {
             _ => return Err(bad()),
         };
         volumes.push(VolumeSettings {
-            dir: PathBuf::from(dir),
+            dir: lines.path(dir),
             size: size.parse().map_err(|_| bad())?,
             config: mantle_chunk::Config {
                 prewrite,
@@ -793,15 +809,17 @@ fn start(mut config: ProcessConfig, locks: Locks) -> Result<(), ProcessError> {
 pub fn read_stated(path: &Path) -> Result<Stated, ProcessError> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| ProcessError::Read(path.to_path_buf(), e.to_string()))?;
-    let lines = Lines::parse(&text, STATED_KEYS, STATED_REPEATED)?;
+    let lines = Lines::parse(&text, STATED_KEYS, STATED_REPEATED)?.of_file(path);
     let mut volumes = Vec::with_capacity(lines.all("volume").len());
     for (number, value) in lines.all("volume") {
         let bad = || ProcessError::Line(*number, "volume = DIR SIZE".into());
-        let fields: Vec<&str> = value.split_whitespace().collect();
-        let [dir, size] = fields.as_slice() else {
+        // The size after the last space, so a directory with a space in it reads.
+        let (dir, size) = value.rsplit_once(char::is_whitespace).ok_or_else(bad)?;
+        let dir = dir.trim();
+        if dir.is_empty() {
             return Err(bad());
-        };
-        volumes.push((PathBuf::from(dir), size.parse().map_err(|_| bad())?));
+        }
+        volumes.push((lines.path(dir), size.parse().map_err(|_| bad())?));
     }
     let target = lines.maybe::<f64>("durability.target")?;
     if target.is_some_and(|t| !(t.is_finite() && t > 0.0 && t < 1.0)) {
@@ -812,12 +830,12 @@ pub fn read_stated(path: &Path) -> Result<Stated, ProcessError> {
     }
     Ok(Stated {
         id: lines.get("id")?,
-        dir: PathBuf::from(lines.text("dir")?),
+        dir: lines.path(lines.text("dir")?),
         quic: lines.get("quic")?,
         plane: lines.get("plane")?,
-        authority: PathBuf::from(lines.text("authority")?),
-        certificate: PathBuf::from(lines.text("certificate")?),
-        key: PathBuf::from(lines.text("key")?),
+        authority: lines.path(lines.text("authority")?),
+        certificate: lines.path(lines.text("certificate")?),
+        key: lines.path(lines.text("key")?),
         peers: peers(&lines)?,
         ranges: ranges(&lines)?,
         voters: voters(&lines)?,
@@ -896,12 +914,45 @@ fn store_path(dir: &Path, group: u128) -> PathBuf {
     dir.join(format!("range-{group:032x}.store"))
 }
 
+/// The machine's calibration record's file in the node's directory (node.md §1.6).
+const CALIBRATION: &str = "calibration";
+
+/// The longest calibration record: hyper-rt's layout (`hyper_rt::machine::record`) of 137 bytes
+/// beside its key, at most `MAX_KEY` long: magic 8, version 2, key length 2, measured at 8, the
+/// wake's six u64s, three u32s and four bytes, the system call's five u64s, two u32s and a byte,
+/// and its CRC-32C 4.
+const CALIBRATION_BYTES: usize = 137 + hyper_rt::machine::record::MAX_KEY;
+
+/// This machine's calibration (hyper-rt `Calibration::load_or_measure`): the record kept in the node
+/// directory `dir` while the machine's key still matches it (its identity line and power source,
+/// whatever its age: node.md §1.4's `runtime.probe_budget_ms`), else measured now, each probe within
+/// `budget`, and kept in its place. A record that does not read is measured again and replaced.
+pub fn calibration(dir: &Path, budget: Duration) -> Result<Calibration, ProcessError> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| ProcessError::Device(dir.to_path_buf(), e.to_string()))?;
+    let path = dir.join(CALIBRATION);
+    let record = hyper_block::record::read(&path, CALIBRATION_BYTES)
+        .ok()
+        .flatten();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| ProcessError::Runtime(e.to_string()))?
+        .as_secs();
+    let (calibration, fresh) =
+        Calibration::load_or_measure(record.as_deref(), now, u64::MAX, budget, 0)
+            .map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
+    if let Some(fresh) = fresh {
+        hyper_block::record::write(&path, &fresh)
+            .map_err(|e| ProcessError::Device(path.clone(), e.to_string()))?;
+    }
+    Ok(calibration)
+}
+
 /// One shard, calibrated on this machine (hyper-rt `RuntimeConfig::from_calibration`), sized by
 /// what the node holds: its one task, its wait and its driver's QUIC timer, and a socket for its
 /// endpoint, each connection and its plane, each read and written.
 fn runtime(config: &ProcessConfig) -> Result<RuntimeConfig, ProcessError> {
-    let calibration = Calibration::measure(config.probe_budget, 0)
-        .map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
+    let calibration = calibration(&config.dir, config.probe_budget)?;
     let constants = calibration
         .constants(&Policy {
             reserved_cores: 0,
@@ -1272,6 +1323,72 @@ mod tests {
             lines.get::<u64>("dir"),
             Err(ProcessError::Missing("dir"))
         ));
+    }
+
+    /// The machine's calibration is kept in the node's directory and taken again while the
+    /// machine's key matches it; the bound on its record holds hyper-rt's longest.
+    #[test]
+    fn the_calibration_is_kept_in_the_node_directory_and_taken_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let budget = Duration::from_millis(40);
+        let measured = calibration(dir.path(), budget).unwrap();
+        let record = hyper_block::record::read(&dir.path().join(CALIBRATION), CALIBRATION_BYTES)
+            .unwrap()
+            .unwrap();
+        assert!(record.len() <= CALIBRATION_BYTES);
+        // Taken again: the same measurements, the facts queried afresh.
+        let again = calibration(dir.path(), budget).unwrap();
+        assert_eq!(
+            (again.wake, again.syscall),
+            (measured.wake, measured.syscall)
+        );
+        // A record of the longest key is within the bound.
+        let mut longest = measured.clone();
+        longest.facts.identity.cpu = "c".repeat(hyper_rt::machine::record::MAX_KEY);
+        if let Some(encoded) = longest.encode(1) {
+            assert!(encoded.len() <= CALIBRATION_BYTES);
+        }
+    }
+
+    /// A stated volume's directory may hold a space, its size after the last; a relative one is
+    /// from the configuration's directory.
+    #[test]
+    fn a_stated_volumes_directory_may_hold_a_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        std::fs::write(
+            &config,
+            "id = 1\ndir = .\nquic = 127.0.0.1:0\nplane = 127.0.0.1:0\nauthority = a.der\n\
+             certificate = n.der\nkey = n.key\nvoters = 1\nrange = 1 root\n\
+             volume = /my disks/one 1073741824\nvolume = data 4096\ndomain = a\n\
+             root.max_nodes = 1\nroot.max_volumes = 2\n",
+        )
+        .unwrap();
+        let stated = read_stated(&config).unwrap();
+        assert_eq!(
+            stated.volumes,
+            vec![
+                (PathBuf::from("/my disks/one"), 1 << 30),
+                (dir.path().join("data"), 4096)
+            ]
+        );
+        for bad in ["volume = 1024", "volume = /d", "volume = /d big"] {
+            let text = std::fs::read_to_string(&config)
+                .unwrap()
+                .replace("volume = data 4096", bad);
+            std::fs::write(&config, text).unwrap();
+            assert!(
+                matches!(read_stated(&config), Err(ProcessError::Line(..))),
+                "{bad}"
+            );
+            std::fs::write(
+                &config,
+                std::fs::read_to_string(&config)
+                    .unwrap()
+                    .replace(bad, "volume = data 4096"),
+            )
+            .unwrap();
+        }
     }
 
     #[test]

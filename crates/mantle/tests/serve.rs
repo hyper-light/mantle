@@ -31,6 +31,11 @@ mod linear;
 mod relay;
 use cell::*;
 
+/// The peers a node of a stated cell names: the other nodes, the clients and the gateway.
+fn stated_peers() -> usize {
+    usize::try_from(NODES - 1 + CLIENTS + 1 + 1).unwrap()
+}
+
 /// The value `bases` say for `key`, said once.
 fn said<'a>(bases: &'a [Basis], key: &str) -> &'a Basis {
     let found: Vec<&Basis> = bases.iter().filter(|b| b.key == key).collect();
@@ -41,7 +46,7 @@ fn said<'a>(bases: &'a [Basis], key: &str) -> &'a Basis {
 /// Every key `mantle node`'s configuration names said once by node `id`, its volume's as its first
 /// volume's (`volume.1.`), and each line it repeats as often as its file states it, each value of
 /// a kind a basis takes and with its reason.
-fn every_key_said(id: u64, bases: &[Basis]) {
+fn every_key_said(id: u64, bases: &[Basis], peers: usize) {
     for key in mantle_node::process::KEYS {
         let key = key
             .strip_prefix("volume.")
@@ -59,8 +64,7 @@ fn every_key_said(id: u64, bases: &[Basis]) {
     for key in ["dir", "size", "depth", "read_bytes", "read_gap", "prewrite"] {
         said(bases, &format!("volume.1.{key}"));
     }
-    // Its peers, the other nodes, the clients and the gateway; the cell's five ranges; its root key.
-    let peers = usize::try_from(NODES - 1 + CLIENTS + 1 + 1).unwrap();
+    // Its peers; the cell's five ranges; its root key.
     for (key, lines) in [
         ("peer", peers),
         ("range", EVERY_LAYER.len()),
@@ -84,7 +88,7 @@ fn a_cell_served_from_stated_keys_alone_says_each_values_basis_and_serves_object
         eprintln!("node 1: {} = {} ({})", basis.key, basis.value, basis.kind);
     }
     for (id, bases) in &first {
-        every_key_said(*id, bases);
+        every_key_said(*id, bases, stated_peers());
         let depth = said(bases, "volume.1.depth");
         assert!(depth.why.contains("measured now"), "node {id}: {depth:?}");
         assert_eq!(said(bases, "id").value, id.to_string());
@@ -128,7 +132,7 @@ fn a_cell_served_from_stated_keys_alone_says_each_values_basis_and_serves_object
     cell.introduce();
     cell.enlisted(1);
     let again = &cell.bases[&1];
-    every_key_said(1, again);
+    every_key_said(1, again, stated_peers());
     let depth = said(again, "volume.1.depth");
     assert!(depth.why.contains("kept"), "{depth:?}");
     assert!(
@@ -167,4 +171,135 @@ fn a_cell_served_from_stated_keys_alone_says_each_values_basis_and_serves_object
     for (outcome, (key, data)) in cell.objects(gets).iter().zip(&objects) {
         assert!(done(outcome, key) == *data, "{key}: other bytes");
     }
+}
+
+/// Puts objects of a byte to 3 MiB through `through` in turn, into a bucket made through the first,
+/// and reads each back whole through `back`.
+fn objects_round_trip(cell: &mut Cell, through: &[u64], back: &dyn Fn(usize) -> u64) {
+    let made = cell.objects(vec![(
+        through[0],
+        Op::Create { bucket: "b".into() },
+        Vec::new(),
+    )]);
+    done(&made[0], "the bucket");
+    let objects: Vec<(String, Vec<u8>)> = (0u64..)
+        .zip([0usize, 1, 65_537, 3 << 20])
+        .map(|(n, len)| (format!("o{n}"), object_bytes(n, len)))
+        .collect();
+    let puts = objects
+        .iter()
+        .enumerate()
+        .map(|(n, (key, data))| {
+            let op = Op::Put {
+                bucket: "b".into(),
+                key: key.clone(),
+                id: n as u128 + 1,
+                length: data.len() as u64,
+            };
+            (through[n % through.len()], op, data.clone())
+        })
+        .collect();
+    for (outcome, (key, _)) in cell.objects(puts).iter().zip(&objects) {
+        done(outcome, &format!("the put of {key}"));
+    }
+    let gets = objects
+        .iter()
+        .enumerate()
+        .map(|(n, (key, _))| {
+            let get = Op::Get {
+                bucket: "b".into(),
+                key: key.clone(),
+                offset: 0,
+                len: u64::MAX,
+            };
+            (back(n), get, Vec::new())
+        })
+        .collect();
+    for (outcome, (key, data)) in cell.objects(gets).iter().zip(&objects) {
+        assert!(done(outcome, key) == *data, "{key}: other bytes");
+    }
+}
+
+/// `mantle init` makes a cell of one from one `--node`: served from what init wrote alone, the node
+/// says every key's basis, takes the device profile init measured, enlists its volume, and takes
+/// and returns objects.
+#[test]
+fn a_cell_of_one_made_by_init_serves_from_what_init_wrote() {
+    let mut cell = Cell::made(|root| {
+        let data = root.join("data");
+        std::fs::create_dir(&data).unwrap();
+        vec![
+            "--node".into(),
+            format!(
+                "quic=127.0.0.1:0,plane=127.0.0.1:0,domain=laptop,volume={}:256M",
+                data.display()
+            ),
+            "--max-nodes".into(),
+            "1".into(),
+            "--max-volumes".into(),
+            "1".into(),
+        ]
+    });
+    let id = *cell.dirs.keys().next().unwrap();
+    cell.enlisted(id);
+    let bases = cell.bases[&id].clone();
+    // Its peers are the clients the test pinned.
+    every_key_said(id, &bases, usize::try_from(CLIENTS + 1).unwrap());
+    let depth = said(&bases, "volume.1.depth");
+    assert!(depth.why.contains("kept"), "{depth:?}");
+    assert_eq!(said(&bases, "voters").value, id.to_string());
+    objects_round_trip(&mut cell, &[id], &|_| id);
+}
+
+/// `mantle init` makes a cell of three from a machines file's two founders and a `--node`'s, the
+/// file's first: served each from what init wrote, each pinning the others, each measures its device
+/// at its first start, every node enlists, and objects put through each read back through another.
+#[test]
+fn a_cell_of_three_made_by_init_from_a_file_and_a_flag_serves_objects() {
+    let mut cell = Cell::made(|root| {
+        let dirs: Vec<PathBuf> = (1..=3)
+            .map(|n| {
+                let dir = root.join(format!("d{n}"));
+                std::fs::create_dir(&dir).unwrap();
+                dir
+            })
+            .collect();
+        let file = root.join("machines.conf");
+        let mut text = String::from("max_nodes = 3\nmax_volumes = 3\n");
+        for (n, dir) in dirs.iter().take(2).enumerate() {
+            text.push_str(&format!(
+                "[node]\nquic = 127.0.0.1:0\nplane = 127.0.0.1:0\ndomain = rack-{n}\nvolume = {} 256M\n",
+                dir.display()
+            ));
+        }
+        std::fs::write(&file, text).unwrap();
+        vec![
+            "--founders".into(),
+            file.display().to_string(),
+            "--node".into(),
+            format!(
+                "quic=127.0.0.1:0,plane=127.0.0.1:0,domain=rack-2,volume={}:256M",
+                dirs[2].display()
+            ),
+        ]
+    });
+    let ids: Vec<u64> = cell.dirs.keys().copied().collect();
+    assert_eq!(ids.len(), 3);
+    for &id in &ids {
+        cell.enlisted(id);
+    }
+    for &id in &ids {
+        let bases = cell.bases[&id].clone();
+        every_key_said(id, &bases, 2 + usize::try_from(CLIENTS + 1).unwrap());
+        let depth = said(&bases, "volume.1.depth");
+        assert!(depth.why.contains("measured now"), "node {id}: {depth:?}");
+        let voters: BTreeSet<u64> = said(&bases, "voters")
+            .value
+            .split(',')
+            .map(|v| v.parse().unwrap())
+            .collect();
+        assert_eq!(voters, ids.iter().copied().collect());
+    }
+    let back = ids.clone();
+    objects_round_trip(&mut cell, &ids, &|n| back[(n + 1) % back.len()]);
 }

@@ -676,6 +676,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "clap",
+ "getrandom 0.4.3",
  "hyper-block",
  "hyper-log",
  "hyper-rt",
@@ -691,6 +692,7 @@ dependencies = [
  "mantle-range",
  "mantle-s3",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

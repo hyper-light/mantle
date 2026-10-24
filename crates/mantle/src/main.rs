@@ -27,6 +27,8 @@ mod disk;
 mod display;
 mod drive;
 mod durability;
+mod files;
+mod init;
 
 #[derive(Parser)]
 #[command(
@@ -57,6 +59,32 @@ enum Command {
     Node {
         /// The node's configuration: one `key = value` a line.
         config: PathBuf,
+    },
+    /// Make a cell from the machines it starts with, its founders: the cell's authority and root
+    /// key, its founding ranges, and each founder's identity and directory with its configuration
+    /// of the operator's statements (docs/design/node.md §1.5). One founder makes a cell of one in
+    /// OUT, measured now; several make OUT/authority, to keep, and OUT/node-ID for each founder, to
+    /// move to its host.
+    Init {
+        /// An empty or missing directory to make the cell in.
+        out: PathBuf,
+        /// A founder: quic=ADDR,plane=ADDR,domain=NAME,volume=DIR:SIZE,memory=SIZE (a volume
+        /// repeatable, sizes in bytes or with a K, M, G or T suffix). Repeatable, one a founder.
+        #[arg(long = "node")]
+        nodes: Vec<String>,
+        /// A machines file: the cell's statements (max_nodes, max_volumes, durability.target), then
+        /// a [node] block of each founder's (quic, plane, domain, volume = DIR SIZE, memory). Its
+        /// founders come before the --node ones.
+        #[arg(long)]
+        founders: Option<PathBuf>,
+        /// The cell's bounds on its volume table: the most nodes and volumes it names.
+        #[arg(long)]
+        max_nodes: Option<u32>,
+        #[arg(long)]
+        max_volumes: Option<u32>,
+        /// A block's annual chance of loss at most: S3's eleven nines, 1e-11, unless stated.
+        #[arg(long)]
+        target: Option<f64>,
     },
     /// Run a node from what its operator states alone (mantle_node::process::serve_stated): its
     /// devices measured, or their kept profiles taken while they match, and every other value
@@ -223,6 +251,45 @@ enum DiskCommand {
     },
 }
 
+/// The cell `mantle init` makes: the machines file's founders, then the `--node` ones, and the
+/// cell's statements, each from the file or a flag and refused where stated in both.
+fn stated_cell(
+    file: Option<&std::path::Path>,
+    nodes: &[String],
+    (max_nodes, max_volumes, target): (Option<u32>, Option<u32>, Option<f64>),
+) -> Result<init::Cell, init::Error> {
+    let mut cell = match file {
+        Some(path) => {
+            let text = std::fs::read_to_string(path).map_err(init::Error::Output)?;
+            init::parse_file(path, &text)?
+        }
+        None => init::Cell::default(),
+    };
+    for spec in nodes {
+        cell.founders.push(init::parse_node(spec)?);
+    }
+    let twice = |what: &str| init::Error::Cell(format!("{what} stated in the file and as a flag"));
+    if max_nodes.is_some() {
+        if cell.max_nodes.is_some() {
+            return Err(twice("max_nodes"));
+        }
+        cell.max_nodes = max_nodes;
+    }
+    if max_volumes.is_some() {
+        if cell.max_volumes.is_some() {
+            return Err(twice("max_volumes"));
+        }
+        cell.max_volumes = max_volumes;
+    }
+    if target.is_some() {
+        if cell.target.is_some() {
+            return Err(twice("durability.target"));
+        }
+        cell.target = target;
+    }
+    Ok(cell)
+}
+
 /// A byte count, optionally with a K or M suffix (powers of 1024).
 fn parse_size(text: &str) -> Result<usize, String> {
     let text = text.trim();
@@ -285,6 +352,21 @@ fn main() -> ExitCode {
     let mut out = stdout.lock();
     let result = match cli.command {
         Command::Node { .. } | Command::Serve { .. } => Ok(()),
+        Command::Init {
+            out: dir,
+            nodes,
+            founders,
+            max_nodes,
+            max_volumes,
+            target,
+        } => stated_cell(
+            founders.as_deref(),
+            &nodes,
+            (max_nodes, max_volumes, target),
+        )
+        .and_then(|cell| init::init(&mut out, &dir, &cell))
+        .map(|_| ())
+        .map_err(|e| e.to_string()),
         Command::Disk {
             command:
                 DiskCommand::Probe {
@@ -440,5 +522,35 @@ fn exit(result: Result<(), String>) -> ExitCode {
             let _ = writeln!(std::io::stderr().lock(), "mantle: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A machines file's founders come before the flags', and a cell's statement made in both is
+    /// refused.
+    #[test]
+    fn founders_come_from_the_file_then_the_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("machines.conf");
+        std::fs::write(
+            &file,
+            "max_nodes = 2\n[node]\nquic = 127.0.0.1:1\nplane = 127.0.0.1:2\n",
+        )
+        .unwrap();
+        let flag = vec!["quic=127.0.0.1:3,plane=127.0.0.1:4".to_owned()];
+        let cell = stated_cell(Some(&file), &flag, (None, Some(4), None)).unwrap();
+        let quics: Vec<String> = cell.founders.iter().map(|f| f.quic.to_string()).collect();
+        assert_eq!(quics, vec!["127.0.0.1:1", "127.0.0.1:3"]);
+        assert_eq!((cell.max_nodes, cell.max_volumes), (Some(2), Some(4)));
+        assert!(matches!(
+            stated_cell(Some(&file), &flag, (Some(3), None, None)),
+            Err(init::Error::Cell(_))
+        ));
+        let flags_alone = stated_cell(None, &flag, (Some(1), Some(1), Some(1e-9))).unwrap();
+        assert_eq!(flags_alone.founders.len(), 1);
+        assert_eq!(flags_alone.target, Some(1e-9));
     }
 }

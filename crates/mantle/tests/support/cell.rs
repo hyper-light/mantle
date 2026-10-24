@@ -771,6 +771,9 @@ pub(crate) struct Cell {
     /// with, each with its basis, in the order said.
     pub(crate) serving: bool,
     pub(crate) bases: BTreeMap<u64, Vec<Basis>>,
+    /// Each node's configuration as `mantle init` wrote it, for a cell it made (`Cell::made`):
+    /// its process serves from that file, which the test does not write.
+    pub(crate) made: BTreeMap<u64, PathBuf>,
     pub(crate) _root: tempfile::TempDir,
 }
 
@@ -867,6 +870,143 @@ impl Cell {
         })
     }
 
+    /// A cell `mantle init` makes in a directory of the test's from the arguments `args` gives for
+    /// that directory, each founder's directory and identity as init wrote them, run as `mantle
+    /// serve` from the configuration init wrote, its volumes' and objects' roles as stated, each
+    /// told where the others listen. The test's clients are issued by the cell's authority, whose
+    /// key init kept, and pinned in each founder's configuration, a `peer` line each, as an operator
+    /// pins a client; init's own output is what the cell is read from: the authority's name and
+    /// directory, and each founder's id and directory.
+    pub(crate) fn made(args: impl FnOnce(&Path) -> Vec<String>) -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let out = root.path().join("cell");
+        let made = Command::new(NODE)
+            .arg("init")
+            .arg(&out)
+            .args(args(root.path()))
+            .output()
+            .unwrap();
+        let said = String::from_utf8(made.stdout).unwrap();
+        assert!(
+            made.status.success(),
+            "mantle init: {said}{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        let mut name = None;
+        let mut authority = None;
+        let mut founders = Vec::new();
+        for line in said.lines() {
+            if let Some(cell) = line.strip_prefix("cell ") {
+                name = Some(cell.to_owned());
+            } else if let Some(rest) = line.strip_prefix("authority ") {
+                authority = rest.split_once(':').map(|(dir, _)| PathBuf::from(dir));
+            } else if let Some(rest) = line.strip_prefix("node ") {
+                let (id, rest) = rest.split_once(' ').unwrap();
+                let (dir, _) = rest.split_once(": ").unwrap();
+                founders.push((id.parse::<u64>().unwrap(), PathBuf::from(dir)));
+            }
+        }
+        let (name, authority) = (name.unwrap(), authority.unwrap());
+        let authority_der = std::fs::read(authority.join("authority.der")).unwrap();
+        let key =
+            KeyPair::from_pkcs8(&std::fs::read(authority.join("authority.key")).unwrap()).unwrap();
+        let validity = Validity {
+            not_before: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            not_after: NO_EXPIRY,
+        };
+        let issue = |subject: &str| {
+            let own = KeyPair::generate().unwrap();
+            let certificate = mantle_cert::node(
+                &key,
+                &name,
+                own.public_key(),
+                subject,
+                (validity, Serial::draw().unwrap()),
+            )
+            .unwrap();
+            (certificate, own.pkcs8().to_vec())
+        };
+        let mut clients = BTreeMap::new();
+        for id in CLIENT..=CLIENT + CLIENTS {
+            let (certificate, pkcs8) = issue(&format!("client-{id}"));
+            let c = root.path().join(format!("client-{id}.der"));
+            std::fs::write(&c, &certificate).unwrap();
+            clients.insert(id, (c, certificate, pkcs8));
+        }
+        let (certificate, pkcs8) = issue(&format!("gateway-{GATEWAY}"));
+        let gateway_file = root.path().join(format!("gateway-{GATEWAY}.der"));
+        std::fs::write(&gateway_file, &certificate).unwrap();
+        let mut nodes = BTreeMap::new();
+        let mut made = BTreeMap::new();
+        for (id, dir) in &founders {
+            let identity = dir.join("identity");
+            let der = std::fs::read(identity.join("node.der")).unwrap();
+            nodes.insert(
+                *id,
+                (identity.join("node.der"), identity.join("node.key"), der),
+            );
+            let config = dir.join("config");
+            let mut text = std::fs::read_to_string(&config).unwrap();
+            for (client, (c, _, _)) in &clients {
+                text.push_str(&format!("peer = {client} client {}\n", c.display()));
+            }
+            std::fs::write(&config, text).unwrap();
+            made.insert(*id, config);
+        }
+        let pki = Pki {
+            voters: u64::try_from(founders.len()).unwrap(),
+            authority: authority.join("authority.der"),
+            authority_der,
+            nodes,
+            clients,
+            gateway: (gateway_file, certificate, pkcs8),
+            root_key: founders[0].1.join("keys").join("1"),
+            serving: true,
+        };
+        let (tell, heard) = channel();
+        let mut cell = Self {
+            nodes: u64::try_from(founders.len()).unwrap(),
+            pki,
+            dirs: founders.iter().cloned().collect(),
+            running: BTreeMap::new(),
+            generations: 0,
+            tell,
+            heard,
+            status: BTreeMap::new(),
+            progress: BTreeMap::new(),
+            clients: BTreeMap::new(),
+            replaced: BTreeSet::new(),
+            links: BTreeMap::new(),
+            log: BTreeMap::new(),
+            transfers: BTreeMap::new(),
+            relay: None,
+            learns: Vec::new(),
+            moved_at: Instant::now(),
+            held_for: Duration::ZERO,
+            held_since: None,
+            stored: true,
+            volumes: BTreeMap::new(),
+            enlisted: BTreeSet::new(),
+            domains: BTreeMap::new(),
+            refusing: None,
+            refused: None,
+            ranges: EVERY_LAYER,
+            gateway: true,
+            serving: true,
+            bases: BTreeMap::new(),
+            made,
+            _root: root,
+        };
+        for (id, _) in &founders {
+            cell.start(*id);
+        }
+        cell.introduce();
+        cell
+    }
+
     /// A cell of `nodes` nodes hosting a range of each layer, each told where the others listen.
     pub(crate) fn layered(nodes: u64) -> Self {
         Self::shaped(Shape {
@@ -934,6 +1074,7 @@ impl Cell {
             gateway,
             serving,
             bases: BTreeMap::new(),
+            made: BTreeMap::new(),
             _root: root,
         };
         // One at a time, each listening before the next starts (`Cell::start`).
@@ -1038,6 +1179,9 @@ impl Cell {
     /// Node `id`'s configuration file, written for its process: its domain the test's, if it set
     /// one, else its name's.
     pub(crate) fn config_of(&self, id: u64) -> PathBuf {
+        if let Some(config) = self.made.get(&id) {
+            return config.clone();
+        }
         let domain = self
             .domains
             .get(&id)
@@ -1349,7 +1493,7 @@ impl Cell {
     /// Cuts node `id` from every other node, both ways, or joins it to them again.
     pub(crate) fn isolate(&self, id: u64, cut: bool) {
         let relay = self.relay.as_ref().unwrap();
-        for peer in (1..=self.nodes).filter(|peer| *peer != id) {
+        for peer in self.dirs.keys().copied().filter(|peer| *peer != id) {
             relay.join(id, peer, !cut);
         }
     }

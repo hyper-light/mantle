@@ -440,11 +440,16 @@ remains shared by each volume's index and each engine's resident metadata; and s
 with its basis before it runs as `mantle node` does. A node started again takes its stores' and
 volumes' shapes as they were made. Tested by unit tests of every model and by a cell of three
 `mantle serve` processes that enlists, serves objects, and says the same values after a node is
-killed and started again (`crates/mantle/tests/serve.rs`). Remaining: `mantle init` writing the
-stated configuration and identities; the node directory's own `LOCK`; startup in node.md §1.7's
-order with typed failures and an orderly stop on SIGTERM; and a replicated range refusing puts at
-its engine's metadata share where its leader admits a command, since a refusal at apply would let
-members diverge.
+killed and started again (`crates/mantle/tests/serve.rs`). `mantle init` makes a cell from its
+founders' statements, given as `--node` flags, a machines file or both: the authority, the root key,
+the founding ranges' groups and each founder's identity with every other founder's certificate
+pinned, each founder's directory with its stated configuration (paths relative to it, so it moves
+to its host whole) and owner-only keys (mode 0600; a protected DACL on Windows), and for a cell of one
+its calibration and device profiles measured; a cell of one and a cell of three serve objects from
+what it writes. Remaining: `mantle init client`; the node directory's own `LOCK`; startup in node.md
+§1.7's order with typed failures and an orderly stop on SIGTERM; and a replicated range refusing
+puts at its engine's metadata share where its leader admits a command, since a refusal at apply
+would let members diverge.
 
 ## Planned, in order
 

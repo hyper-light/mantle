@@ -560,6 +560,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/node/src/object.rs` `MAX_TAG` | derived | The longest version id or ETag a reply carries: a multipart object's ETag bare of quotes, an MD5's 32 hex digits, `-` and its count of parts at `MAX_PARTS`'s five digits (`mantle_s3::checksum::multipart_etag`); a version id is 13 characters (`mantle_meta::key::version_id`). |
 | `crates/node/src/object.rs` `PUT` | format | An object request's kind: an object put, its bytes on the exchange. |
 | `crates/node/src/object.rs` `REPLY_HEAD_BYTES` | format | An object reply's head: its status, one byte; the object's size, a u64; its version id's and its ETag's lengths, a u32 each. |
+| `crates/node/src/process.rs` `CALIBRATION_BYTES` | derived | 137 bytes beside its key, at most hyper-rt's `MAX_KEY`: the calibration record's layout (`hyper_rt::machine::record`: magic 8, version 2, key length 2, measured at 8, the wake's 64, the system call's 49, its CRC-32C 4), pinned by `the_calibration_is_kept_in_the_node_directory_and_taken_again`. |
 | `crates/node/src/read.rs` `BLOCK` | format | A read's kind: a block's header and its chunks' places, of a Block range. |
 | `crates/node/src/read.rs` `BUCKET` | format | A read's kind: a bucket's row, of a Bucket range. |
 | `crates/node/src/read.rs` `CURRENT` | format | A read's kind: the current version of a key, of a Name range. |
@@ -672,6 +673,10 @@ parameters. The gate does not parse these; they are kept here with the same kind
 | `crates/mantle/src/main.rs` bench rounds default | cited | `Policy::STANDARD.max` = 30, from docs/research/21 §9.5 (crates/disk/src/rounds.rs). |
 | `crates/mantle/src/main.rs:91` bench step seconds (chunk 1, log 1, ec 0.5, hash 0.5, meta 0.5) | open | research/11 §16.3 asks for step length from the samples the reported quantiles need and a steady-state window. |
 | `crates/mantle/src/main.rs:296` ec and hash size ladders | open | 64K–8M chunk and 8K–8M buffer ladders; not derived from the design's chunk and part distributions. |
+| `crates/mantle/src/files/windows.rs` `ACCESS_ALLOWED_ACE_TYPE` | external | 0, winnt.h's `ACCESS_ALLOWED_ACE_TYPE`: an ACE that grants (windows-sys keeps it in a feature the workspace does not enable). |
+| `crates/mantle/src/files/windows.rs` `ACCESS_DENIED_ACE_TYPE` | external | 1, winnt.h's `ACCESS_DENIED_ACE_TYPE`: an ACE that denies. |
+| `crates/mantle/src/files/windows.rs` `SECURITY_DESCRIPTOR_REVISION` | external | 1, winnt.h's `SECURITY_DESCRIPTOR_REVISION`, the revision `InitializeSecurityDescriptor` takes. |
+| `crates/mantle/src/init.rs` `NO_EXPIRY` | external | 253,402,300,799 Unix seconds, 99991231235959Z: RFC 5280 §4.1.2.5's notAfter for a certificate with no well-defined expiration, which init's certificates take until certificates are rotated (node.md §1.5). |
 | `crates/chunk/src/layout.rs:34` Limits default batch_requests 1,024 | open | Audit §12.6: derive n* = F0/c_r or a latency-bounded version from measured per-batch (b, n, S) (research 11 §5.3). |
 | `crates/chunk/src/layout.rs:35` Limits default batch_bytes 32 MiB | open | Research 11 §5 gives b* = F0·BW, which does not set it; audit §12.6 asks for a derivation from a measured T(b). |
 | `crates/chunk/src/layout.rs:36` Limits default fragments_per_chunk 4,096 | open | Research 11 §6.2 finds no source; derive from read amplification f ≤ ε·size/(BW·t_frag) with a measured t_frag. |

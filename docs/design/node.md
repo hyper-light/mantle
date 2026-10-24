@@ -559,8 +559,8 @@ since no probe reads it. `mantle init` adds to the node's directory its `config`
 certificate, the authority's certificate, each pinned peer's certificate under `peers/`), `keys/`
 (one root-key file a generation) and, for a cell of one, `calibration`, hyper-rt's record, which
 `mantle serve` and `mantle node` keep there too and take again while the machine's key matches it.
-A `LOCK` of the directory's own, held as the volumes' are, since its log and stores admit one process
-as a volume does, is still to build.
+The directory's own `LOCK`, held as the volumes' are, since its log and stores admit one process as
+a volume does, is taken at the start's locks step and held while the process runs (2026-10-24).
 `meta/` on a metadata device, `DEVICE` and `map` wait for the storage graph (§1.7 step 3) and the
 cell map (architecture §4).
 
@@ -630,6 +630,18 @@ with no such address, or one the resolver refuses, ends the start naming the pee
 `mantle init` writes each founder's peers with the addresses the founders stated, but for a
 founder stated at port 0 or at no address of its own: where it listens is known only once it
 binds, and its peers learn it on standard input, as of a peer that moved.
+
+A start's failure names its step (`Step`, `ProcessError::Start`): configuration, identity, locks,
+devices, budgets, storage or network, as in `mantle: the start's locks step: …/LOCK: another
+process holds this lock`. The identity (the node's key and certificate, the authority's, each
+peer's and the root keys) is read before any lock, so a missing key file refuses the start without
+touching a directory. A plane port another socket holds is refused at the network step; a QUIC port
+another process of the same user holds is not yet: hyper-rt-transport binds its listener with
+`SO_REUSEPORT` set before the bind, to share the port with a socket for each peer, and a second
+process's bind of a held port with that flag set succeeds on Linux and macOS (measured on Linux
+6.19 and Darwin 25.4; a plain bind of it fails `EADDRINUSE`), after which the two processes split
+the port's datagrams. Binding the listener before it shares the port, as hyper-rt already does for
+port 0, refuses it; that change is hyper-rt's.
 
 **Versions.** Every on-disk format already names its version (a volume's superblock, a log
 segment's header, an entry's format byte in `mantle_meta::wire`), and a connection's first

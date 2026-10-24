@@ -35,6 +35,14 @@
 //! every other value (`crate::derive::derive`), says each on standard output, `basis KEY = VALUE
 //! (KIND: WHY)`, before anything opens, and runs as `mantle node` does.
 //!
+//! **Its start** runs node.md §1.7's steps in order, each owning what it starts: the configuration;
+//! the identity (the node's key and certificate, the authority's and each peer's, the root keys);
+//! the node directory's `LOCK` and each device directory's, held while the process runs; for
+//! `mantle serve`, the devices measured and the budgets derived; the storage (the volumes, the log,
+//! each range's store and replica); the network (the peers' addresses resolved, the runtime, the
+//! QUIC endpoint and the plane bound). A failure ends the start naming its step ([`Step`],
+//! [`ProcessError::Start`]), and the process exits non-zero.
+//!
 //! **Its talk** is lines. On standard output: `bound QUIC PLANE` once the node listens, and
 //! `volume ID` for each volume it holds, its 128-bit id in hex; then, for each range it hosts,
 //! `status GROUP TERM LEADER COMMIT APPLIED PATIENCE_NS RECONNECT_NS MEASURING_NS ASKING_NS HELD`,
@@ -105,13 +113,16 @@ use crate::ask::CommandOutcome;
 use crate::classes::Role;
 use crate::derive::{Device, Formatted, Measured, Stated, VolumeFacts};
 use crate::directory::Peer;
-use crate::node::{GatewaySettings, Hosted, Link, Node, NodeError, NodeSettings, Status, Wall};
-use crate::storage::{Locks, Storage, StorageError, VolumeSettings};
+use crate::node::{
+    GatewaySettings, Hosted, Link, Node, NodeError, NodeSettings, Status, Step, Wall,
+};
+use crate::storage::{Locks, NodeLock, Storage, StorageError, VolumeSettings};
 
 /// Why the process stopped.
 #[derive(Debug, thiserror::Error)]
 pub enum ProcessError {
-    #[error("the configuration {0}: {1}")]
+    /// A file the configuration is, or names, that could not be read.
+    #[error("{}: {}", .0.display(), .1)]
     Read(PathBuf, String),
     #[error("the configuration, line {0}: {1}")]
     Line(usize, String),
@@ -141,6 +152,84 @@ pub enum ProcessError {
     Say(String),
     #[error("peer {0}'s address {1}: {2}")]
     Resolve(u64, String, String),
+    #[error("the start's {0} step: {1}")]
+    Start(Step, Box<ProcessError>),
+}
+
+/// `error` as a failure of the start's `step` (node.md §1.7).
+fn step<T: Into<ProcessError>>(at: Step) -> impl FnOnce(T) -> ProcessError {
+    move |error| ProcessError::Start(at, Box::new(error.into()))
+}
+
+/// A node's failure to open as the process says it: one in a step of its start as that step's.
+fn opened(error: NodeError) -> ProcessError {
+    match error {
+        NodeError::Start(at, inner) => {
+            ProcessError::Start(at, Box::new(ProcessError::Node(*inner)))
+        }
+        other => ProcessError::Node(other),
+    }
+}
+
+/// What the node is and whom it trusts, read at its start's first step (node.md §1.7): its
+/// certificate and key, the cell authority's certificate, each peer's certificate and the root
+/// key's generations.
+struct Identity {
+    credentials: Credentials,
+    peers: Vec<Peer>,
+    keys: Vec<(u32, WrappingKey)>,
+}
+
+/// Reads the identity the configuration names: the node's `certificate` and `key`, the cell's
+/// `authority`, each of `peers`' certificates and each of `keys`' generations.
+fn identity(
+    (certificate, key, authority): (&Path, &Path, &Path),
+    peers: &[PeerLine],
+    keys: &[(u32, PathBuf)],
+) -> Result<Identity, ProcessError> {
+    let mut known = Vec::with_capacity(peers.len());
+    for peer in peers {
+        known.push(Peer {
+            id: peer.id,
+            role: peer.role,
+            certificate: read_file(&peer.certificate)?,
+        });
+    }
+    let mut root = Vec::with_capacity(keys.len());
+    for (generation, path) in keys {
+        root.push((*generation, root_key(path)?));
+    }
+    Ok(Identity {
+        credentials: Credentials {
+            chain: vec![CertificateDer::from(read_file(certificate)?)],
+            key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(read_file(key)?)),
+            roots: vec![CertificateDer::from(read_file(authority)?)],
+        },
+        peers: known,
+        keys: root,
+    })
+}
+
+/// A root key's generation from its file: 32 bytes only its owner may read (encryption.md §2).
+fn root_key(path: &Path) -> Result<WrappingKey, ProcessError> {
+    let refused = |why: &str| ProcessError::Key(path.to_path_buf(), why.to_owned());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .map_err(|e| refused(&e.to_string()))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            return Err(refused("is readable by others than its owner"));
+        }
+    }
+    let bytes = std::fs::read(path).map_err(|e| refused(&e.to_string()))?;
+    let key: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| refused("is not 32 bytes"))?;
+    Ok(WrappingKey::new(&key))
 }
 
 /// Where a peer listens, as its `peer` line names it: a host, an IP address or a name, and a port.
@@ -733,29 +822,8 @@ fn gateway(lines: &Lines) -> Result<Option<GatewayConfig>, ProcessError> {
 
 /// The gateway host's settings, its root keys read from their files: each 32 bytes that only its
 /// owner may read, as `mantle init` makes them (encryption.md §2).
-fn gateway_settings(config: GatewayConfig) -> Result<GatewaySettings, ProcessError> {
-    let mut keys = Vec::with_capacity(config.keys.len());
-    for (generation, path) in &config.keys {
-        let refused = |why: &str| ProcessError::Key(path.clone(), why.to_owned());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(path)
-                .map_err(|e| refused(&e.to_string()))?
-                .permissions()
-                .mode();
-            if mode & 0o077 != 0 {
-                return Err(refused("is readable by others than its owner"));
-            }
-        }
-        let bytes = std::fs::read(path).map_err(|e| refused(&e.to_string()))?;
-        let key: [u8; 32] = bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| refused("is not 32 bytes"))?;
-        keys.push((*generation, WrappingKey::new(&key)));
-    }
-    Ok(GatewaySettings {
+fn gateway_settings(config: GatewayConfig, keys: Vec<(u32, WrappingKey)>) -> GatewaySettings {
+    GatewaySettings {
         keys,
         handover_ns: config.handover_ns,
         window: config.window,
@@ -769,7 +837,7 @@ fn gateway_settings(config: GatewayConfig) -> Result<GatewaySettings, ProcessErr
             repair: config.repair_rate,
         },
         target: config.target,
-    })
+    }
 }
 
 /// How a node with `volume` lines enlists them: the root range its `range` lines name, its
@@ -863,7 +931,21 @@ pub fn run(config: &Path) -> Result<(), ProcessError> {
     // Before any thread allocates: a freed large block's memory goes back to the OS, which a range's
     // budget following the machine reads as room (docs/research/65 §6).
     mantle_engine::port::mmap::return_freed_blocks();
-    start(ProcessConfig::read(config)?, Locks::default())
+    let config = ProcessConfig::read(config).map_err(step(Step::Configuration))?;
+    let keys = config
+        .gateway
+        .as_ref()
+        .map_or(&[][..], |g| g.keys.as_slice());
+    let identity = identity(
+        (&config.certificate, &config.key, &config.authority),
+        &config.peers,
+        keys,
+    )
+    .map_err(step(Step::Identity))?;
+    let node = Locks::node(&config.dir).map_err(step(Step::Locks))?;
+    let locks =
+        Locks::take(config.volumes.iter().map(|v| v.dir.as_path())).map_err(step(Step::Locks))?;
+    start(config, (node, locks), identity)
 }
 
 /// Runs the node whose operator's statements the file at `config` holds (`mantle serve`, node.md
@@ -873,9 +955,17 @@ pub fn run(config: &Path) -> Result<(), ProcessError> {
 /// anything opens; then the node, as `mantle node` runs it, until standard input closes.
 pub fn serve_stated(config: &Path) -> Result<(), ProcessError> {
     mantle_engine::port::mmap::return_freed_blocks();
-    let stated = read_stated(config)?;
-    let locks = Locks::take(stated.volumes.iter().map(|(dir, _)| dir.as_path()))?;
-    let measured = measure(&stated)?;
+    let stated = read_stated(config).map_err(step(Step::Configuration))?;
+    let identity = identity(
+        (&stated.certificate, &stated.key, &stated.authority),
+        &stated.peers,
+        &stated.keys,
+    )
+    .map_err(step(Step::Identity))?;
+    let node = Locks::node(&stated.dir).map_err(step(Step::Locks))?;
+    let locks = Locks::take(stated.volumes.iter().map(|(dir, _)| dir.as_path()))
+        .map_err(step(Step::Locks))?;
+    let measured = measure(&stated).map_err(step(Step::Devices))?;
     let dir = stated.dir.clone();
     let align = measured.meta.align;
     let mut stores = |group: u128, page: usize| -> Result<Option<Shape>, String> {
@@ -889,7 +979,8 @@ pub fn serve_stated(config: &Path) -> Result<(), ProcessError> {
             .map(Some)
             .map_err(|e| e.to_string())
     };
-    let derived = crate::derive::derive(stated, &measured, &mut stores)?;
+    let derived =
+        crate::derive::derive(stated, &measured, &mut stores).map_err(step(Step::Budgets))?;
     let mut out = std::io::stdout().lock();
     for basis in &derived.bases {
         writeln!(out, "basis {basis}").map_err(|e| ProcessError::Say(e.to_string()))?;
@@ -897,22 +988,42 @@ pub fn serve_stated(config: &Path) -> Result<(), ProcessError> {
     out.flush().map_err(|e| ProcessError::Say(e.to_string()))?;
     // The runtime's writer says the rest: this thread holds no lock on standard output for it.
     drop(out);
-    start(derived.config, locks)
+    start(derived.config, (node, locks), identity)
 }
 
-/// The node of `config`, its volumes under `locks` (any not held taken now), until standard input
-/// closes.
-fn start(mut config: ProcessConfig, locks: Locks) -> Result<(), ProcessError> {
+/// The node of `config`, its directory and its volumes' devices under `held`'s locks, as
+/// `identity` says it is, until standard input closes: the start's steps after the locks
+/// (node.md §1.7), each failure naming its step. The directory's lock is held until the node ends.
+fn start(
+    mut config: ProcessConfig,
+    held: (NodeLock, Locks),
+    identity: Identity,
+) -> Result<(), ProcessError> {
+    let (node, locks) = held;
     // The volumes open before the node's runtime starts: an issuer's start and a volume's
     // recovery wait on their device, which no shard may (node.md §1.3).
-    let storage = Storage::open_locked(&config.volumes, locks)?;
-    let gateway = config.gateway.take().map(gateway_settings).transpose()?;
-    let addresses = resolve(&config)?;
-    let runtime = runtime(&config)?;
-    let mut rt =
-        LocalRuntime::new(&runtime).map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
-    rt.block_on(serve(config, storage, gateway, addresses))
-        .map_err(|e| ProcessError::Runtime(format!("{e:?}")))?
+    let storage = Storage::open_locked(&config.volumes, locks).map_err(step(Step::Storage))?;
+    let Identity {
+        credentials,
+        peers,
+        keys,
+    } = identity;
+    let gateway = config.gateway.take().map(|g| gateway_settings(g, keys));
+    let addresses = resolve(&config).map_err(step(Step::Network))?;
+    let runtime = runtime(&config).map_err(step(Step::Network))?;
+    let mut rt = LocalRuntime::new(&runtime)
+        .map_err(|e| step(Step::Network)(ProcessError::Runtime(format!("{e:?}"))))?;
+    let ran = rt
+        .block_on(serve(
+            config,
+            storage,
+            gateway,
+            (credentials, peers),
+            addresses,
+        ))
+        .map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
+    drop(node);
+    ran
 }
 
 /// What the file at `path` states for `mantle serve`: only [`STATED_KEYS`] and
@@ -1121,6 +1232,7 @@ async fn serve(
     config: ProcessConfig,
     storage: Storage,
     gateway: Option<GatewaySettings>,
+    (credentials, peers): (Credentials, Vec<Peer>),
     addresses: Vec<(u64, SocketAddr, SocketAddr)>,
 ) -> Result<(), ProcessError> {
     // This process's one shard runs the node's replicas, which apply through the engine's
@@ -1140,15 +1252,7 @@ async fn serve(
                 },
                 settings: config.settings,
             },
-            engine: engine(&config, *group, *layer)?,
-        });
-    }
-    let mut peers = Vec::with_capacity(config.peers.len());
-    for peer in &config.peers {
-        peers.push(Peer {
-            id: peer.id,
-            role: peer.role,
-            certificate: read_file(&peer.certificate)?,
+            engine: engine(&config, *group, *layer).map_err(step(Step::Storage))?,
         });
     }
     let settings = NodeSettings {
@@ -1156,11 +1260,7 @@ async fn serve(
         dir: config.dir.clone(),
         quic: config.quic,
         plane: config.plane,
-        credentials: Credentials {
-            chain: vec![CertificateDer::from(read_file(&config.certificate)?)],
-            key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(read_file(&config.key)?)),
-            roots: vec![CertificateDer::from(read_file(&config.authority)?)],
-        },
+        credentials,
         peers,
         addresses,
         ranges,
@@ -1175,15 +1275,14 @@ async fn serve(
         wall: Wall::System,
         gateway,
     };
-    let mut node = Node::open(settings).await?;
+    let mut node = Node::open(settings).await.map_err(opened)?;
     // A buffer each way, a page each (hyper-rt `stdio`: a page is the natural chunk): the talk is
     // a line now and then, each far shorter.
+    let talk = |e: String| step(Step::Network)(ProcessError::Runtime(e));
     let chunk = usize::try_from(hyper_rt::machine::facts::Facts::query().page.base)
-        .map_err(|e| ProcessError::Runtime(e.to_string()))?;
-    let mut input =
-        hyper_rt::stdio::stdin(1, chunk).map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
-    let mut output =
-        hyper_rt::stdio::stdout(1, chunk).map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
+        .map_err(|e| talk(e.to_string()))?;
+    let mut input = hyper_rt::stdio::stdin(1, chunk).map_err(|e| talk(format!("{e:?}")))?;
+    let mut output = hyper_rt::stdio::stdout(1, chunk).map_err(|e| talk(format!("{e:?}")))?;
     let (quic, plane) = node.addresses()?;
     say(&mut output, &format!("bound {quic} {plane}\n")).await?;
     let held: Vec<u128> = node.volumes().map(|(id, _)| id).collect();

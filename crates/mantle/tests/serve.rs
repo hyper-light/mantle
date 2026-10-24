@@ -252,6 +252,108 @@ fn a_cell_of_one_made_by_init_serves_from_what_init_wrote() {
     objects_round_trip(&mut cell, &[id], &|_| id);
 }
 
+/// A start that fails names its step (node.md §1.7), and the node serving on its directory serves
+/// on: a second process on that directory is refused at the locks, one whose key file is missing at
+/// its identity (read before any lock), one whose configuration does not parse at the
+/// configuration, and one on a directory of its own whose plane's port the serving node holds at
+/// the network. Each ends non-zero before it listens.
+#[test]
+fn a_start_that_fails_names_its_step_and_the_node_serving_serves_on() {
+    let mut cell = Cell::made(|root| {
+        let data = root.join("data");
+        std::fs::create_dir(&data).unwrap();
+        vec![
+            "--node".into(),
+            format!(
+                "quic=127.0.0.1:0,plane=127.0.0.1:0,domain=laptop,volume={}:256M",
+                data.display()
+            ),
+            "--max-nodes".into(),
+            "1".into(),
+            "--max-volumes".into(),
+            "1".into(),
+        ]
+    });
+    let id = *cell.dirs.keys().next().unwrap();
+    cell.enlisted(id);
+    let dir = cell.dirs[&id].clone();
+    let root = dir.parent().unwrap().to_path_buf();
+    let config = dir.join("config");
+    let text = std::fs::read_to_string(&config).unwrap();
+    let refused = |config: &Path, step: &str, what: &str| {
+        let served = Command::new(NODE)
+            .arg("serve")
+            .arg(config)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&served.stderr).into_owned();
+        assert!(!served.status.success(), "{step}: {said}");
+        assert!(
+            said.contains(&format!("the start's {step} step")) && said.contains(what),
+            "{step}: {said}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&served.stdout)
+                .lines()
+                .any(|line| line.starts_with("bound ")),
+            "{step}: it listened"
+        );
+    };
+    refused(&config, "locks", "LOCK");
+    let missing = dir.join("config-missing-key");
+    std::fs::write(
+        &missing,
+        text.replace("key = identity/node.key", "key = identity/gone.key"),
+    )
+    .unwrap();
+    refused(&missing, "identity", "gone.key");
+    let bad = root.join("bad.conf");
+    std::fs::write(&bad, "id = 1\nthis is no line\n").unwrap();
+    refused(&bad, "configuration", "line 2");
+    let other = root.join("other");
+    for sub in ["identity", "keys"] {
+        copy_tree(&dir.join(sub), &other.join(sub));
+    }
+    let data = other.join("data");
+    std::fs::create_dir(&data).unwrap();
+    let (_, plane) = cell.running[&id].bound.unwrap();
+    let moved: Vec<String> = text
+        .lines()
+        .map(|line| {
+            if line.starts_with("plane = ") {
+                format!("plane = {plane}")
+            } else if line.starts_with("volume = ") {
+                let (_, size) = line.rsplit_once(' ').unwrap();
+                format!("volume = {} {size}", data.display())
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect();
+    std::fs::write(other.join("config"), moved.join("\n") + "\n").unwrap();
+    refused(&other.join("config"), "network", "bind");
+    objects_round_trip(&mut cell, &[id], &|_| id);
+}
+
+/// Copies the directory `from` and what it holds to `to`, each file's permissions with it: each
+/// directory copied in turn from a list of those found, none waiting on another.
+fn copy_tree(from: &Path, to: &Path) {
+    let mut dirs = vec![(from.to_path_buf(), to.to_path_buf())];
+    while let Some((from, to)) = dirs.pop() {
+        std::fs::create_dir_all(&to).unwrap();
+        for entry in std::fs::read_dir(&from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                dirs.push((entry.path(), target));
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+}
+
 /// A peer named by a name that never resolves (the reserved `.invalid` domain, RFC 6761 §6.4) stops
 /// `mantle serve` as it starts, before it listens, naming the peer and the name.
 #[test]

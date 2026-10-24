@@ -22,7 +22,8 @@ use mantle_chunk::{Answer, ChunkError, ChunkKey, Config, ReadId, Reader, Volume}
 /// The directory a device's mantle files sit in, inside the device directory the configuration
 /// names (node.md §1.6).
 const MANTLE: &str = "mantle";
-/// The device directory's lock, held while the node runs: one owner per device (audit §14.1).
+/// A directory's lock, held while the node runs: one owner per device (audit §14.1), and one
+/// process a node directory.
 const LOCK: &str = "LOCK";
 /// The volume's file.
 const VOLUME: &str = "volume";
@@ -45,7 +46,9 @@ pub struct VolumeSettings {
 /// Why the node's storage could not be opened.
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
-    #[error("{path}: another process holds the device directory's lock")]
+    /// A lock another process holds: a device directory's (`mantle/LOCK`) or the node
+    /// directory's own (`LOCK`).
+    #[error("{path}: another process holds this lock")]
     Locked { path: PathBuf },
     #[error("{op} {path}: {source}")]
     Io {
@@ -360,7 +363,18 @@ pub struct Locks {
     held: Vec<(PathBuf, File)>,
 }
 
+/// The node directory's own lock (node.md §1.6), `<dir>/LOCK`: held while it lives, since the
+/// directory's log and stores admit one process as a volume does.
+pub struct NodeLock {
+    _file: File,
+}
+
 impl Locks {
+    /// The node directory `dir`'s lock: refused when another process holds it.
+    pub fn node(dir: &Path) -> Result<NodeLock, StorageError> {
+        lock(&dir.join(LOCK)).map(|file| NodeLock { _file: file })
+    }
+
     /// Takes the lock of each of `dirs`, creating its `mantle/`: refused at the first another
     /// process holds.
     pub fn take<'a>(dirs: impl IntoIterator<Item = &'a Path>) -> Result<Self, StorageError> {

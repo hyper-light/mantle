@@ -180,9 +180,49 @@ pub struct Hosted<E> {
     pub engine: E,
 }
 
+/// A step of a node's start (docs/design/node.md §1.7), which a failure in it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// The configuration, read and checked.
+    Configuration,
+    /// The node's key and certificate, the authority's and each peer's, and the root keys.
+    Identity,
+    /// The node directory's lock and each device directory's.
+    Locks,
+    /// Each device identified, its profile kept or measured again.
+    Devices,
+    /// Every value derived from what is stated and what was measured.
+    Budgets,
+    /// The volumes, the log, the node's records and each range's store and replica, recovered.
+    Storage,
+    /// The runtime, the peers' addresses, the QUIC endpoint and the plane bound, the peers dialed.
+    Network,
+}
+
+impl std::fmt::Display for Step {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Configuration => "configuration",
+            Self::Identity => "identity",
+            Self::Locks => "locks",
+            Self::Devices => "devices",
+            Self::Budgets => "budgets",
+            Self::Storage => "storage",
+            Self::Network => "network",
+        })
+    }
+}
+
+/// `error` as a failure of the start's `step`.
+fn at<T: Into<NodeError>>(step: Step) -> impl FnOnce(T) -> NodeError {
+    move |error| NodeError::Start(step, Box::new(error.into()))
+}
+
 /// Why the node stopped.
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
+    #[error("the start's {0} step: {1}")]
+    Start(Step, Box<NodeError>),
     #[error("the node's records: {0}")]
     Layout(#[from] crate::layout::LayoutError),
     #[error("the node's log: {0}")]
@@ -748,7 +788,7 @@ impl<E: Engine + 'static> Node<E> {
     /// Opens the node on the current hyper-rt shard on its log in its directory, as
     /// [`Node::open_on`] opens it on any.
     pub async fn open(settings: NodeSettings<E>) -> Result<Self, NodeError> {
-        let log = open_log(&settings.dir, settings.id, settings.log)?;
+        let log = open_log(&settings.dir, settings.id, settings.log).map_err(at(Step::Storage))?;
         Self::open_on(settings, log).await
     }
 }
@@ -761,9 +801,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     pub async fn open_on(mut settings: NodeSettings<E>, log: L) -> Result<Self, NodeError> {
         let waker = poll_fn(|context| Poll::Ready(context.waker().clone())).await;
         let layout = Layout::new(&settings.dir);
-        let run = layout.raise_run()?;
-        let messages = message_bounds(&settings.ranges, settings.chunk_bytes)?;
-        classes::state_bounds(messages).map_err(|e| NodeError::Bounds(e.to_string()))?;
+        let run = layout.raise_run().map_err(at(Step::Storage))?;
+        let messages =
+            message_bounds(&settings.ranges, settings.chunk_bytes).map_err(at(Step::Budgets))?;
+        classes::state_bounds(messages)
+            .map_err(|e| at(Step::Budgets)(NodeError::Bounds(e.to_string())))?;
         let inflight = settings
             .ranges
             .iter()
@@ -781,19 +823,24 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             transport_bytes: settings.transport_bytes,
             messages,
         };
-        let limits = bounds::limits(&stated).map_err(|e| NodeError::Bounds(e.to_string()))?;
+        let limits = bounds::limits(&stated)
+            .map_err(|e| at(Step::Budgets)(NodeError::Bounds(e.to_string())))?;
         let lane_window = limits.lane_window;
         let io = bounds::io(&stated);
-        let plane_limits = bounds::plane(&stated).map_err(|e| NodeError::Bounds(e.to_string()))?;
+        let plane_limits = bounds::plane(&stated)
+            .map_err(|e| at(Step::Budgets)(NodeError::Bounds(e.to_string())))?;
 
         let hosting = std::mem::take(&mut settings.ranges);
         let mut owner = Owner::new(vec![waker.clone(); hosting.len()]);
         let mut ranges = Vec::with_capacity(hosting.len());
         for hosted in hosting {
             if hosted.group == 0 || hosted.group == LIVENESS_GROUP {
-                return Err(NodeError::Reserved(hosted.group));
+                return Err(at(Step::Configuration)(NodeError::Reserved(hosted.group)));
             }
-            let store = Answers::new(log.claim(hosted.group, &hosted.range)?);
+            let store = Answers::new(
+                log.claim(hosted.group, &hosted.range)
+                    .map_err(at(Step::Storage))?,
+            );
             let shell = mantle_range::open_shell(
                 settings.id,
                 store,
@@ -801,8 +848,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 &hosted.range,
                 settings.id,
                 Elections::Suspicion,
-            )?;
-            let handle = owner.insert(shell).map_err(|_| NodeError::Full)?;
+            )
+            .map_err(at(Step::Storage))?;
+            let handle = owner
+                .insert(shell)
+                .map_err(|_| at(Step::Budgets)(NodeError::Full))?;
             owner.schedule(handle);
             ranges.push(Kept {
                 group: hosted.group,
@@ -821,9 +871,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             history: Exposure::new(),
             resolution: Duration::from_nanos(hyper_rt::machine::clock::resolution_ns()),
         })
-        .map_err(NodeError::Liveness)?;
+        .map_err(|e| at(Step::Network)(NodeError::Liveness(e)))?;
 
-        let tls = Tls::mutual(&settings.credentials, true)?;
+        let tls = Tls::mutual(&settings.credentials, true).map_err(at(Step::Identity))?;
         let config = Config {
             tls,
             role: Role::Node,
@@ -834,12 +884,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let directory = Peers::new(settings.peers.clone());
         let now = std::time::Instant::now();
         let endpoint = match settings.seed {
-            Some(seed) => Endpoint::new_seeded(config, budget, directory, now, seed)?,
-            None => Endpoint::new(config, budget, directory, now)?,
-        };
-        let driver = Driver::bind(endpoint, settings.quic, io)?;
-        let plane_socket = PlaneSocket::bind(settings.plane, io)?;
-        let plane = Plane::new(settings.id, plane_limits).map_err(NodeError::Plane)?;
+            Some(seed) => Endpoint::new_seeded(config, budget, directory, now, seed),
+            None => Endpoint::new(config, budget, directory, now),
+        }
+        .map_err(at(Step::Network))?;
+        let driver = Driver::bind(endpoint, settings.quic, io).map_err(at(Step::Network))?;
+        let plane_socket = PlaneSocket::bind(settings.plane, io).map_err(at(Step::Network))?;
+        let plane = Plane::new(settings.id, plane_limits)
+            .map_err(|e| at(Step::Network)(NodeError::Plane(e)))?;
         let remotes = settings
             .peers
             .iter()
@@ -918,10 +970,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         for kept in &node.ranges {
             node.owner
                 .pairs(kept.handle, &mut node.liveness, false)
-                .map_err(NodeError::Liveness)?;
+                .map_err(|e| at(Step::Network)(NodeError::Liveness(e)))?;
         }
         for (peer, quic, plane) in settings.addresses {
-            node.learn(peer, quic, plane)?;
+            node.learn(peer, quic, plane).map_err(at(Step::Network))?;
         }
         Ok(node)
     }

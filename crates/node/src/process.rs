@@ -1410,9 +1410,7 @@ async fn serve(
                 while let Some(end) = pending.iter().position(|b| *b == b'\n') {
                     let line: Vec<u8> = pending.drain(..=end).collect();
                     if line.trim_ascii() == b"stop" {
-                        stop.ask(hyper_rt::futures::now_ns())?;
-                        node.stop();
-                        say(&mut output, "stopping\n").await?;
+                        stop_asked(&mut stop, &mut node, &mut output).await?;
                     } else {
                         take_line(&mut node, &config.ranges, &line)?;
                     }
@@ -1426,9 +1424,7 @@ async fn serve(
             Either3::Second(Err(e)) => return Err(ProcessError::Runtime(format!("{e:?}"))),
             Either3::Third(Either::First(signal)) => {
                 signal.map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
-                stop.ask(hyper_rt::futures::now_ns())?;
-                node.stop();
-                say(&mut output, "stopping\n").await?;
+                stop_asked(&mut stop, &mut node, &mut output).await?;
             }
             Either3::Third(Either::Second(slept)) => {
                 slept.map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
@@ -1591,6 +1587,18 @@ fn take_line<E: Engine + 'static>(
         }
     }
     Ok(())
+}
+
+/// A request to stop, by a signal or a line: the node's orderly stop begins, said; begun already,
+/// the process ends at once.
+async fn stop_asked<E: Engine + 'static>(
+    stop: &mut Stop,
+    node: &mut Node<E>,
+    output: &mut hyper_rt::stdio::Stdout,
+) -> Result<(), ProcessError> {
+    stop.ask(hyper_rt::futures::now_ns())?;
+    node.stop();
+    say(output, "stopping\n").await
 }
 
 async fn say(output: &mut hyper_rt::stdio::Stdout, line: &str) -> Result<(), ProcessError> {

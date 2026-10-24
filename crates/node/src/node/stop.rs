@@ -8,10 +8,12 @@
 //! ([`Node::step_stop`]); once it is done ([`Node::stopped`]) nothing the node holds is owed to the
 //! cell, and its process closes its log and volumes and ends.
 
+use std::net::SocketAddr;
+
 use hyper_transport::PeerId;
+use mantle_meta::engine::Engine;
 
 use super::{Node, NodeError, NodeLog};
-use mantle_meta::engine::Engine;
 
 /// Where an orderly stop stands.
 pub(super) enum Stopping {
@@ -165,7 +167,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// handshake was under way, closes too.
     fn close_held(&mut self) -> Result<(), NodeError> {
         let clock = self.driver.clock()?;
-        let mut held: Vec<(PeerId, std::net::SocketAddr)> = Vec::new();
+        let mut held: Vec<(PeerId, SocketAddr)> = Vec::new();
         self.driver.endpoint().established(&mut held);
         for (peer, _) in held {
             self.driver.endpoint().disconnect(clock, peer);

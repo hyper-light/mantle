@@ -1382,13 +1382,16 @@ async fn serve(
     let mut stats: Option<Box<LogStats>> = None;
     // Each peer's link as last said, a peer a slot.
     let mut links: Vec<Link> = Vec::with_capacity(config.peers.len());
-    // The bytes its transfers moved as last said, and when: said again once they move, at most
-    // every half of the transport's serve period, the longest an exchange it carries may go
-    // without moving before the transport refuses it, so while a transfer lives the next is said
-    // within one serve period of the last.
+    // The bytes its transfers moved as last said, and when, none before the first: the first
+    // movement said at once, and the next once they move again, at most every half of the
+    // transport's serve period, the longest an exchange it carries may go without moving before
+    // the transport refuses it, so while a transfer lives the next is said within one serve period
+    // of the last. (The runtime's clock starts at zero, so a first saying stood for one at zero
+    // held back every movement of the runtime's first half period, a cell of one's first objects
+    // among them, and a watcher saw none.)
     let serve = crate::bounds::idle_timeout();
     let serve_ns = u64::try_from(serve.as_nanos()).unwrap_or(u64::MAX);
-    let mut said_moved = (0u64, 0u64);
+    let mut said_moved: Option<(u64, u64)> = None;
     let signals = hyper_rt::signal::subscribe(STOP_SIGNALS).map_err(|e| talk(format!("{e:?}")))?;
     let mut stop = Stop::new(config.stop);
     // Whether standard input may say more: a node that does not end with it runs on once it closes,
@@ -1493,9 +1496,13 @@ async fn serve(
         }
         let moved = node.moved();
         let now = hyper_rt::futures::now_ns();
-        if moved != said_moved.0 && now.saturating_sub(said_moved.1) >= serve_ns / 2 {
+        let due = match said_moved {
+            None => moved > 0,
+            Some((said, at)) => moved != said && now.saturating_sub(at) >= serve_ns / 2,
+        };
+        if due {
             say(&mut output, &format!("moved {moved} {serve_ns}\n")).await?;
-            said_moved = (moved, now);
+            said_moved = Some((moved, now));
         }
         let mut said = false;
         for ((group, _), was) in config.ranges.iter().zip(told.iter_mut()) {

@@ -1,19 +1,17 @@
 //! Files `mantle init` keeps, each written whole and durable under a temporary name, then renamed over
 //! its place and its directory flushed (CLAUDE.md §6). Keys (encryption.md §2: the root key "32
 //! bytes created at initialization with owner-only permissions"; the node's and the authority's
-//! private keys) are never readable by another principal, not even for a moment: on Unix they are
-//! created with mode 0600; on Windows with a protected DACL that grants their owner and LocalSystem
-//! alone and inherits nothing from their directory, the two principals hyper-seal's check of a key
-//! file admits (vendor/hyper-seal `file_windows.rs`).
+//! private keys) are never readable by another principal, not even for a moment: each is created as
+//! `mantle serve` reads it (`mantle_node::secret`), with mode 0600 on Unix, and on Windows with a
+//! protected DACL that grants its owner and LocalSystem alone and inherits nothing from its
+//! directory, the two principals hyper-seal's check of a key file admits (vendor/hyper-seal
+//! `file_windows.rs`).
 
 use std::fs::File;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use hyper_block::DiskError;
-
-#[cfg(windows)]
-mod windows;
 
 fn io(op: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> DiskError {
     let path = path.to_path_buf();
@@ -81,7 +79,7 @@ fn keep(path: &Path, bytes: &[u8], secret: bool) -> Result<(), DiskError> {
     }
     {
         let mut file = if secret {
-            create(&temporary)?
+            mantle_node::secret::create(&temporary).map_err(io("create", &temporary))?
         } else {
             File::create_new(&temporary).map_err(io("create", &temporary))?
         };
@@ -92,39 +90,11 @@ fn keep(path: &Path, bytes: &[u8], secret: bool) -> Result<(), DiskError> {
     hyper_block::file::sync_dir(&parent(path))
 }
 
-/// A new file at `path`, readable and writable by its owner alone from the moment it exists:
-/// refused where a file is there already.
-#[cfg(unix)]
-fn create(path: &Path) -> Result<File, DiskError> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(io("create", path))
-}
-
-#[cfg(windows)]
-fn create(path: &Path) -> Result<File, DiskError> {
-    windows::create(path).map_err(io("create", path))
-}
-
-/// Whether the file at `path` is readable by its owner alone: no permission bit for its group or
-/// others on Unix; on Windows a protected DACL whose every entry grants its owner or LocalSystem.
-#[cfg(unix)]
+/// Whether the file at `path` is readable by its owner alone, by the rule `mantle serve` reads a
+/// key by (`mantle_node::secret`).
 pub fn owner_only(path: &Path) -> Result<bool, DiskError> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let mode = std::fs::metadata(path)
-        .map_err(io("stat", path))?
-        .permissions()
-        .mode();
-    Ok(mode & 0o077 == 0)
-}
-
-#[cfg(windows)]
-pub fn owner_only(path: &Path) -> Result<bool, DiskError> {
-    windows::owner_only(path).map_err(io("read the security of", path))
+    let file = File::open(path).map_err(io("open", path))?;
+    mantle_node::secret::owner_only(&file).map_err(io("read the permissions of", path))
 }
 
 #[cfg(test)]

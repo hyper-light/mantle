@@ -692,7 +692,6 @@ dependencies = [
  "mantle-range",
  "mantle-s3",
  "tempfile",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -831,6 +830,7 @@ dependencies = [
  "mantle-s3",
  "tempfile",
  "thiserror",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

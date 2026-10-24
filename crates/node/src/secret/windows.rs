@@ -1,10 +1,14 @@
-//! Owner-only files on Windows (`crate::files`): created by CreateFileW with an absolute security
-//! descriptor whose DACL grants full access to the process token's default owner, who owns the
-//! file the process creates, and to LocalSystem, and no one else, protected so it inherits nothing
-//! from its directory (`SE_DACL_PROTECTED`; SECURITY_INFORMATION's PROTECTED_DACL_SECURITY_INFORMATION,
-//! "The DACL cannot inherit access control entries (ACEs)", Microsoft Learn). A DACL read back with
-//! GetFileSecurityW is owner-only where each entry that allows anything allows the file's owner or
+//! Key files on Windows (`crate::secret`). A key file is created by CreateFileW with an absolute
+//! security descriptor whose DACL grants full access to the process token's default owner, who
+//! owns the file the process creates, and to LocalSystem, and no one else, protected so it inherits
+//! nothing from its directory (`SE_DACL_PROTECTED`; SECURITY_INFORMATION's
+//! PROTECTED_DACL_SECURITY_INFORMATION, "The DACL cannot inherit access control entries (ACEs)",
+//! Microsoft Learn). A key file is read only once its DACL, read from the open file's handle with
+//! GetKernelObjectSecurity ("the calling process must have been granted READ_CONTROL access when
+//! the handle was opened", Microsoft Learn; GENERIC_READ includes it), lets no one but its owner and
+//! LocalSystem have anything: each entry that allows anything allows the file's owner or
 //! LocalSystem, as hyper-seal's check of a key file reads it (vendor/hyper-seal `file_windows.rs`).
+//! No DACL, which allows everyone everything, or an entry of a kind this does not read, is not.
 #![allow(unsafe_code)]
 
 use std::fs::File;
@@ -17,7 +21,7 @@ use windows_sys::Win32::Foundation::{GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, AclSizeInformation,
     AddAccessAllowedAce, CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
-    GetAclInformation, GetFileSecurityW, GetLengthSid, GetSecurityDescriptorDacl,
+    GetAclInformation, GetKernelObjectSecurity, GetLengthSid, GetSecurityDescriptorDacl,
     GetSecurityDescriptorOwner, GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor,
     IsWellKnownSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
     SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE, SetSecurityDescriptorControl,
@@ -213,20 +217,20 @@ pub(super) fn create(path: &Path) -> Result<File, std::io::Error> {
     Ok(unsafe { File::from_raw_handle(handle.cast()) })
 }
 
-/// Whether the file at `path` is readable by its owner alone: each entry of its DACL that allows
-/// anything allows its owner or LocalSystem; no DACL, which allows everyone everything, or an entry
-/// of a kind this does not read, is not.
-pub(super) fn owner_only(path: &Path) -> Result<bool, std::io::Error> {
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+/// Whether `file` is its owner's alone: each entry of its DACL that allows anything allows its
+/// owner or LocalSystem.
+pub(super) fn owner_only(file: &File) -> Result<bool, std::io::Error> {
+    let handle = file.as_raw_handle().cast();
     let asked = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
     let mut needed = 0u32;
-    // SAFETY: a null descriptor of no length asks only for the length needed, written to `needed`.
-    unsafe { GetFileSecurityW(wide.as_ptr(), asked, null_mut(), 0, &mut needed) };
+    // SAFETY: a null descriptor of no length asks only for the length needed, which the call
+    // writes to `needed`; `handle` is the open file's, alive for the call.
+    unsafe { GetKernelObjectSecurity(handle, asked, null_mut(), 0, &mut needed) };
     let mut buffer = aligned(needed)?;
     let descriptor: PSECURITY_DESCRIPTOR = buffer.as_mut_ptr().cast();
-    // SAFETY: `buffer` holds at least `needed` bytes, word-aligned, for the self-relative
-    // descriptor the call writes.
-    if unsafe { GetFileSecurityW(wide.as_ptr(), asked, descriptor, needed, &mut needed) } == 0 {
+    // SAFETY: `buffer` holds at least `needed` bytes, word-aligned, for the descriptor the call
+    // writes; `handle` is as above.
+    if unsafe { GetKernelObjectSecurity(handle, asked, descriptor, needed, &mut needed) } == 0 {
         return Err(failed());
     }
     let (mut owner, mut defaulted): (PSID, i32) = (null_mut(), 0);
@@ -257,11 +261,11 @@ pub(super) fn owner_only(path: &Path) -> Result<bool, std::io::Error> {
         let mut ace: *mut core::ffi::c_void = null_mut();
         // SAFETY: `index` is below the ACL's count, and GetAce points `ace` at that entry inside
         // the descriptor.
-        if unsafe { GetAce(dacl, index, &mut ace) } == 0 {
+        if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
             return Err(failed());
         }
-        // SAFETY: every entry begins with an ACE_HEADER.
-        let kind = unsafe { (*ace.cast::<ACE_HEADER>()).AceType };
+        // SAFETY: every entry begins with an ACE_HEADER, inside the descriptor.
+        let kind = unsafe { std::ptr::read_unaligned(ace.cast::<ACE_HEADER>()) }.AceType;
         match kind {
             ACCESS_ALLOWED_ACE_TYPE => {
                 // SAFETY: an allow entry is an ACCESS_ALLOWED_ACE whose SID begins at SidStart,

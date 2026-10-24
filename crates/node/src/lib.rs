@@ -40,4 +40,5 @@ pub mod object;
 pub mod place;
 pub mod process;
 pub mod read;
+pub mod secret;
 pub mod storage;

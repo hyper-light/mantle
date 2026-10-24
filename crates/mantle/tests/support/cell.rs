@@ -174,13 +174,17 @@ durability.target = 0.00000000001
 /// The cell's root key file in `dir`: 32 bytes only its owner may read.
 pub(crate) fn root_key(dir: &Path) -> PathBuf {
     let path = dir.join("root.key");
-    std::fs::write(&path, [0x5a; 32]).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    }
+    key_file(&path, &[0x5a; 32]);
     path
+}
+
+/// A key file at `path` holding `bytes`, readable by its owner alone from the moment it exists, as
+/// `mantle init` writes one and `mantle serve` reads one (`mantle_node::secret`).
+pub(crate) fn key_file(path: &Path, bytes: &[u8]) {
+    mantle_node::secret::create(path)
+        .unwrap()
+        .write_all(bytes)
+        .unwrap();
 }
 
 /// The message bounds the nodes state for these settings (`mantle_node::node::message_bounds`):
@@ -505,7 +509,7 @@ impl Pki {
                 dir.join(format!("node-{id}.key")),
             );
             std::fs::write(&c, &certificate).unwrap();
-            std::fs::write(&k, &pkcs8).unwrap();
+            key_file(&k, &pkcs8);
             issued.insert(id, (c, k, certificate));
         }
         let mut clients = BTreeMap::new();

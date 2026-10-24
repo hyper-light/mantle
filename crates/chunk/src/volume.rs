@@ -118,6 +118,7 @@ impl<F: BlockFile + Sync + 'static> Volume<F> {
         config.check()?;
         let geometry = Geometry::plan(size, file.alignment(), &config)?;
         let mut io = issuer.attach(&file).map_err(ChunkError::Device)?;
+        let diag_started = std::time::Instant::now();
         if config.prewrite {
             prewrite(
                 &mut io,
@@ -125,6 +126,21 @@ impl<F: BlockFile + Sync + 'static> Volume<F> {
                 &geometry,
                 config.limits.batch_bytes,
             )?;
+        }
+        {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "DIAG format t={} pid={} prewrite={} end={:?} took {} ms",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0),
+                std::process::id(),
+                config.prewrite,
+                geometry.end(),
+                diag_started.elapsed().as_millis()
+            );
         }
         let volume = random_id()?;
         let created_ns = now_ns();

@@ -1214,6 +1214,15 @@ impl Cell {
             .stderr(stderr)
             .spawn()
             .unwrap();
+        eprintln!(
+            "DIAG spawn t={} test={:?} node={id} pid={}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0),
+            std::thread::current().name(),
+            child.id()
+        );
         let input = child.stdin.take().unwrap();
         let output = child.stdout.take().unwrap();
         self.volumes.remove(&id);

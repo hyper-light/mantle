@@ -453,7 +453,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         && let Err(error) = put.answer(id, answer)
                     {
                         use std::io::Write as _;
-                        let _ = writeln!(std::io::stderr(), "DIAG put answer {id:?} refused: {error:?} from {said}");
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "DIAG put answer t={} pid={} {id:?} refused: {error:?} from {said}",
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis())
+                                .unwrap_or(0),
+                            std::process::id()
+                        );
                         return self.fail_job(at, Status::Failed);
                     }
                 }

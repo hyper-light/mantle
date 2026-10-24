@@ -1318,10 +1318,12 @@ impl<F: BlockFile> Writer<F> {
             writes.push((buf, at));
         }
         writes.extend(frames);
-        let span = writes.iter().fold((u64::MAX, 0u64, 0usize), |(lo, hi, n), (buf, at)| {
-            let end = at.saturating_add(u64::try_from(buf.len()).unwrap_or(0));
-            (lo.min(*at), hi.max(end), n.saturating_add(buf.len()))
-        });
+        let span = writes
+            .iter()
+            .fold((u64::MAX, 0u64, 0usize), |(lo, hi, n), (buf, at)| {
+                let end = at.saturating_add(u64::try_from(buf.len()).unwrap_or(0));
+                (lo.min(*at), hi.max(end), n.saturating_add(buf.len()))
+            });
         let written = self.io.write(writes, true).map_err(ChunkError::Device)?;
         for (buf, _) in written {
             self.pool.give(buf);
@@ -1331,7 +1333,12 @@ impl<F: BlockFile> Writer<F> {
             use std::io::Write as _;
             let _ = writeln!(
                 std::io::stderr(),
-                "DIAG write_batch {} ms at {}..{} bytes {}",
+                "DIAG write_batch t={} pid={} {} ms at {}..{} bytes {}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0),
+                std::process::id(),
                 took / 1_000_000,
                 span.0,
                 span.1,

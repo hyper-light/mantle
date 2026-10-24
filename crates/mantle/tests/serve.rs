@@ -252,6 +252,22 @@ fn a_cell_of_one_made_by_init_serves_from_what_init_wrote() {
     objects_round_trip(&mut cell, &[id], &|_| id);
 }
 
+/// Waits until every node of `others` names one leader of `group`, one of them: a stopped node's
+/// range led on past its stop, by the voter it was handed to or one the others elected since, as
+/// Raft lets them once the stopping node is gone.
+fn led_on(cell: &mut Cell, group: u128, others: &[u64]) {
+    cell.until(|c| {
+        let named: Option<BTreeSet<u64>> = others
+            .iter()
+            .map(|other| match c.status.get(&(*other, group)) {
+                Some(Line::Status { leader, .. }) => Some(*leader),
+                _ => None,
+            })
+            .collect();
+        named.filter(|named| named.len() == 1 && named.iter().all(|l| others.contains(l)))
+    });
+}
+
 /// `mantle init`'s arguments for a cell of three under `root`: a machines file's two founders and a
 /// `--node`'s, each with a volume of its own in a failure domain of its own.
 fn three_founders(root: &Path) -> Vec<String> {
@@ -369,16 +385,7 @@ fn a_node_asked_to_stop_hands_its_ranges_over_and_exits_well() {
             .map(|(_, _, to)| *to)
             .unwrap_or_else(|| panic!("node {stopping} handed {group:x} to no one"));
         assert!(others.contains(&to), "{group:x} handed to {to}");
-        cell.until(|c| {
-            let named: Option<BTreeSet<u64>> = others
-                .iter()
-                .map(|other| match c.status.get(&(*other, *group)) {
-                    Some(Line::Status { leader, .. }) => Some(*leader),
-                    _ => None,
-                })
-                .collect();
-            named.filter(|named| named.len() == 1 && named.iter().all(|l| others.contains(l)))
-        });
+        led_on(&mut cell, *group, &others);
     }
     let gets = before
         .iter()
@@ -452,7 +459,8 @@ fn a_cell_made_by_init_rolls_one_node_at_a_time_and_reads_every_object_back() {
             cell.stopped.remove(&stopping),
             "node {stopping} said no stop"
         );
-        // The ranges it led as its stop began, as it said: each handed to a voter that then leads.
+        // The ranges it led as its stop began, as it said: each handed to another voter, then led
+        // on by the others (`led_on`).
         let ranges: BTreeSet<u128> = cell
             .handing
             .iter()
@@ -469,12 +477,7 @@ fn a_cell_made_by_init_rolls_one_node_at_a_time_and_reads_every_object_back() {
                 .map(|(_, _, to)| *to)
                 .unwrap_or_else(|| panic!("node {stopping} handed {group:x} to no one"));
             assert!(others.contains(&to), "{group:x} handed to {to}");
-            cell.until(|c| {
-                let leads = others.iter().all(|other| {
-                    matches!(c.status.get(&(*other, *group)), Some(Line::Status { leader, .. }) if *leader == to)
-                });
-                if leads { Some(()) } else { None }
-            });
+            led_on(&mut cell, *group, &others);
         }
         cell.leaderless.clear();
         let gets = before

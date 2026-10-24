@@ -428,9 +428,10 @@ fn a_second_request_to_stop_ends_the_process_at_once() {
 /// on: a second process on that directory is refused at the locks, one whose key file is missing,
 /// or whose TLS key or root key others than its owner may read, at its identity (read before any
 /// lock; the key closed again, the start goes on to the locks), as is one that states another
-/// cell's authority or pins a peer from another cell, one whose configuration does not parse at the
-/// configuration, and one on a directory of its own whose plane's port the serving node holds at
-/// the network. Each ends non-zero before it listens.
+/// cell's authority or pins a peer from another cell, one whose configuration does not parse or is
+/// not there at the configuration, one on a directory of its own stating the serving node's volume
+/// at the locks, naming the volume's, and one on a directory of its own whose plane's port the
+/// serving node holds at the network. Each ends non-zero before it listens.
 #[test]
 fn a_start_that_fails_names_its_step_and_the_node_serving_serves_on() {
     let mut cell = Cell::made(|root| {
@@ -557,6 +558,19 @@ fn a_start_that_fails_names_its_step_and_the_node_serving_serves_on() {
     let bad = root.join("bad.conf");
     std::fs::write(&bad, "id = 1\nthis is no line\n").unwrap();
     refused(&bad, "configuration", "line 2");
+    refused(&root.join("absent.conf"), "configuration", "absent.conf: ");
+    // A directory of its own stating the serving node's volume: refused at the locks, naming the
+    // volume's.
+    let held = root.join("held");
+    for sub in ["identity", "keys"] {
+        copy_tree(&dir.join(sub), &held.join(sub));
+    }
+    std::fs::write(held.join("config"), &text).unwrap();
+    refused(
+        &held.join("config"),
+        "locks",
+        "data/mantle/LOCK: another process holds this lock",
+    );
     let other = root.join("other");
     for sub in ["identity", "keys"] {
         copy_tree(&dir.join(sub), &other.join(sub));

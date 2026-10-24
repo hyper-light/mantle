@@ -348,7 +348,8 @@ fn a_node_asked_to_stop_hands_its_ranges_over_and_exits_well() {
         cell.stopped.contains(&stopping),
         "node {stopping} said no stop"
     );
-    // The ranges it led as its stop began, as it said: each handed to a voter that then leads.
+    // The ranges it led as its stop began, as it said: each handed to another voter, then led by
+    // one the others all name, the voter it was handed to or one they elected since.
     let ranges: BTreeSet<u128> = cell
         .handing
         .iter()
@@ -369,10 +370,14 @@ fn a_node_asked_to_stop_hands_its_ranges_over_and_exits_well() {
             .unwrap_or_else(|| panic!("node {stopping} handed {group:x} to no one"));
         assert!(others.contains(&to), "{group:x} handed to {to}");
         cell.until(|c| {
-            let leads = others.iter().all(|other| {
-                matches!(c.status.get(&(*other, *group)), Some(Line::Status { leader, .. }) if *leader == to)
-            });
-            if leads { Some(()) } else { None }
+            let named: Option<BTreeSet<u64>> = others
+                .iter()
+                .map(|other| match c.status.get(&(*other, *group)) {
+                    Some(Line::Status { leader, .. }) => Some(*leader),
+                    _ => None,
+                })
+                .collect();
+            named.filter(|named| named.len() == 1 && named.iter().all(|l| others.contains(l)))
         });
     }
     let gets = before

@@ -480,6 +480,8 @@ fn a_cell_made_by_init_rolls_one_node_at_a_time_and_reads_every_object_back() {
                 .map(|(_, _, to)| *to)
                 .unwrap_or_else(|| panic!("node {stopping} handed {group:x} to no one"));
             assert!(others.contains(&to), "{group:x} handed to {to}");
+        }
+        for group in &groups {
             led_on(&mut cell, *group, &others);
         }
         cell.diag_mark(format!("MARK led on past {stopping}; leaderless cleared"));

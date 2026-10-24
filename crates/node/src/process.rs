@@ -5,7 +5,11 @@
 //! **The file** states every number the node is run with, one `key = value` a line (`#` begins a
 //! comment): nothing is assumed for the operator, and a key it does not know is refused at its
 //! line ([`KEYS`], [`REPEATED`]). A `peer` line, repeated, names a peer's id, its
-//! role (`node`, `gateway` or `client`) and its certificate's file. Certificates and the key are
+//! role (`node`, `gateway` or `client`) and its certificate's file, and may name where it listens,
+//! QUIC's endpoint and the plane's, `peer = ID ROLE CERTIFICATE QUIC PLANE`, each `HOST:PORT` with
+//! the host an address (an IPv6 one in brackets) or a name, resolved as the node starts
+//! ([`resolve`]); a peer named without them is told where it listens on standard input, as one
+//! that moved is. Certificates and the key are
 //! DER (the key PKCS #8). A `volume` line, repeated, names a chunk volume of the node's storage
 //! role (node.md §1.1): `volume = DIR SIZE DEPTH READ_BYTES READ_GAP PREWRITE`, its device
 //! directory, its bytes, and what its device measured (`mantle disk probe --measure`); the layout
@@ -74,7 +78,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::time::Duration;
@@ -135,6 +139,56 @@ pub enum ProcessError {
     Device(PathBuf, String),
     #[error("standard output: {0}")]
     Say(String),
+    #[error("peer {0}'s address {1}: {2}")]
+    Resolve(u64, String, String),
+}
+
+/// Where a peer listens, as its `peer` line names it: a host, an IP address or a name, and a port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoint {
+    pub host: String,
+    pub port: u16,
+}
+
+impl Endpoint {
+    /// `HOST:PORT`, an IPv6 address in brackets (RFC 3986 §3.2.2's form), which is how an address
+    /// with a port is written; a name holds neither a colon nor a bracket.
+    pub fn parse(text: &str) -> Option<Self> {
+        if let Ok(address) = text.parse::<SocketAddr>() {
+            return Some(Self {
+                host: address.ip().to_string(),
+                port: address.port(),
+            });
+        }
+        let (host, port) = text.rsplit_once(':')?;
+        if host.is_empty() || host.contains([':', '[', ']']) {
+            return None;
+        }
+        Some(Self {
+            host: host.to_owned(),
+            port: port.parse().ok()?,
+        })
+    }
+}
+
+impl std::fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.host.contains(':') {
+            write!(f, "[{}]:{}", self.host, self.port)
+        } else {
+            write!(f, "{}:{}", self.host, self.port)
+        }
+    }
+}
+
+/// A peer as its `peer` line names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerLine {
+    pub id: u64,
+    pub role: Role,
+    pub certificate: PathBuf,
+    /// Where it listens, QUIC's endpoint and the plane's, when the line names them.
+    pub at: Option<(Endpoint, Endpoint)>,
 }
 
 /// What the file states.
@@ -146,7 +200,7 @@ pub struct ProcessConfig {
     pub authority: PathBuf,
     pub certificate: PathBuf,
     pub key: PathBuf,
-    pub peers: Vec<(u64, Role, PathBuf)>,
+    pub peers: Vec<PeerLine>,
     /// The ranges the node hosts (`range` lines): each one's group and layer, every one founded
     /// by `voters`.
     pub ranges: Vec<(u128, Layer)>,
@@ -384,18 +438,35 @@ impl Lines {
     }
 }
 
-/// The `peer` lines, each `peer = ID ROLE CERTIFICATE`.
-fn peers(lines: &Lines) -> Result<Vec<(u64, Role, PathBuf)>, ProcessError> {
+/// The `peer` lines, each `peer = ID ROLE CERTIFICATE`, or with where the peer listens,
+/// `peer = ID ROLE CERTIFICATE QUIC PLANE`.
+fn peers(lines: &Lines) -> Result<Vec<PeerLine>, ProcessError> {
     let mut peers = Vec::with_capacity(lines.all("peer").len());
     for (number, value) in lines.all("peer") {
-        let mut fields = value.split_whitespace();
-        let (Some(id), Some(role), Some(certificate), None) =
-            (fields.next(), fields.next(), fields.next(), fields.next())
-        else {
-            return Err(ProcessError::Line(
+        let form = || {
+            ProcessError::Line(
                 *number,
-                "peer = ID ROLE CERTIFICATE".into(),
-            ));
+                "peer = ID ROLE CERTIFICATE, or peer = ID ROLE CERTIFICATE QUIC PLANE".into(),
+            )
+        };
+        let mut fields = value.split_whitespace();
+        let (Some(id), Some(role), Some(certificate)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            return Err(form());
+        };
+        let endpoint = |text: &str| {
+            Endpoint::parse(text).ok_or_else(|| {
+                ProcessError::Line(
+                    *number,
+                    format!("{text}: HOST:PORT, an IPv6 address in brackets"),
+                )
+            })
+        };
+        let at = match (fields.next(), fields.next(), fields.next()) {
+            (None, None, None) => None,
+            (Some(quic), Some(plane), None) => Some((endpoint(quic)?, endpoint(plane)?)),
+            _ => return Err(form()),
         };
         let id = id
             .parse()
@@ -411,9 +482,46 @@ fn peers(lines: &Lines) -> Result<Vec<(u64, Role, PathBuf)>, ProcessError> {
                 ));
             }
         };
-        peers.push((id, role, lines.path(certificate)));
+        peers.push(PeerLine {
+            id,
+            role,
+            certificate: lines.path(certificate),
+            at,
+        });
     }
     Ok(peers)
+}
+
+/// Where each peer whose line names it listens, resolved now (node.md §1.7 step 5) through the
+/// platform's resolver, as hyper-rt's `dns::resolve` does (std's `ToSocketAddrs`: getaddrinfo on
+/// Unix, GetAddrInfoW on Windows): the first of a name's addresses in the family of the node's own
+/// socket, the only family that socket sends to. It runs before the node's runtime starts, so a
+/// lookup's wait holds no shard.
+pub fn resolve(config: &ProcessConfig) -> Result<Vec<(u64, SocketAddr, SocketAddr)>, ProcessError> {
+    let mut addresses = Vec::with_capacity(config.peers.len());
+    for peer in &config.peers {
+        if let Some((quic, plane)) = &peer.at {
+            addresses.push((
+                peer.id,
+                lookup(peer.id, quic, config.quic)?,
+                lookup(peer.id, plane, config.plane)?,
+            ));
+        }
+    }
+    Ok(addresses)
+}
+
+/// The first of `at`'s addresses in `own`'s family.
+fn lookup(peer: u64, at: &Endpoint, own: SocketAddr) -> Result<SocketAddr, ProcessError> {
+    let refused = |why: String| ProcessError::Resolve(peer, at.to_string(), why);
+    (at.host.as_str(), at.port)
+        .to_socket_addrs()
+        .map_err(|e| refused(e.to_string()))?
+        .find(|address| address.is_ipv4() == own.is_ipv4())
+        .ok_or_else(|| {
+            let family = if own.is_ipv4() { "IPv4" } else { "IPv6" };
+            refused(format!("no {family} address, the family the node binds"))
+        })
 }
 
 /// The `voters` key: ids, comma-separated.
@@ -799,10 +907,11 @@ fn start(mut config: ProcessConfig, locks: Locks) -> Result<(), ProcessError> {
     // recovery wait on their device, which no shard may (node.md §1.3).
     let storage = Storage::open_locked(&config.volumes, locks)?;
     let gateway = config.gateway.take().map(gateway_settings).transpose()?;
+    let addresses = resolve(&config)?;
     let runtime = runtime(&config)?;
     let mut rt =
         LocalRuntime::new(&runtime).map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
-    rt.block_on(serve(config, storage, gateway))
+    rt.block_on(serve(config, storage, gateway, addresses))
         .map_err(|e| ProcessError::Runtime(format!("{e:?}")))?
 }
 
@@ -1012,6 +1121,7 @@ async fn serve(
     config: ProcessConfig,
     storage: Storage,
     gateway: Option<GatewaySettings>,
+    addresses: Vec<(u64, SocketAddr, SocketAddr)>,
 ) -> Result<(), ProcessError> {
     // This process's one shard runs the node's replicas, which apply through the engine's
     // synchronous calls (node.md §1.2).
@@ -1034,11 +1144,11 @@ async fn serve(
         });
     }
     let mut peers = Vec::with_capacity(config.peers.len());
-    for (id, role, certificate) in &config.peers {
+    for peer in &config.peers {
         peers.push(Peer {
-            id: *id,
-            role: *role,
-            certificate: read_file(certificate)?,
+            id: peer.id,
+            role: peer.role,
+            certificate: read_file(&peer.certificate)?,
         });
     }
     let settings = NodeSettings {
@@ -1052,7 +1162,7 @@ async fn serve(
             roots: vec![CertificateDer::from(read_file(&config.authority)?)],
         },
         peers,
-        addresses: Vec::new(),
+        addresses,
         ranges,
         log: config.log,
         transport_bytes: config.transport_bytes,
@@ -1326,6 +1436,76 @@ mod tests {
         assert!(matches!(
             lines.get::<u64>("dir"),
             Err(ProcessError::Missing("dir"))
+        ));
+    }
+
+    /// A peer line may name where the peer listens, by address or by name; a malformed endpoint,
+    /// one of the two missing, or a field past them is refused at its line.
+    #[test]
+    fn a_peer_line_names_where_it_listens_by_address_or_name() {
+        let lines = Lines::parse(
+            "peer = 2 node a.der 10.0.0.2:7000 10.0.0.2:7001\n\
+             peer = 3 node b.der node-3.example:7000 [::1]:7001\n\
+             peer = 9 client c.der\n",
+            KEYS,
+            REPEATED,
+        )
+        .unwrap();
+        let read = peers(&lines).unwrap();
+        let said = |peer: &PeerLine| {
+            peer.at
+                .as_ref()
+                .map(|(quic, plane)| (quic.to_string(), plane.to_string()))
+        };
+        assert_eq!(
+            said(&read[0]),
+            Some(("10.0.0.2:7000".into(), "10.0.0.2:7001".into()))
+        );
+        assert_eq!(
+            said(&read[1]),
+            Some(("node-3.example:7000".into(), "[::1]:7001".into()))
+        );
+        assert_eq!(read[2].at, None);
+        assert_eq!(read[2].role, Role::Client);
+        for bad in [
+            "peer = 2 node a.der 10.0.0.2:7000\n",
+            "peer = 2 node a.der host 10.0.0.2:7001\n",
+            "peer = 2 node a.der ::1:7000 [::1]:7001\n",
+            "peer = 2 node a.der h:70000 h:7001\n",
+            "peer = 2 node a.der h:7000 h:7001 h:7002\n",
+        ] {
+            let lines = Lines::parse(bad, KEYS, REPEATED).unwrap();
+            assert!(
+                matches!(peers(&lines), Err(ProcessError::Line(1, _))),
+                "{bad}"
+            );
+        }
+    }
+
+    /// A peer resolves to an address of the family the node binds, since a socket of one family
+    /// sends to no other: `localhost` to the IPv4 loopback for an IPv4 node (RFC 6761 §6.3), and an
+    /// address of the other family is refused naming the peer.
+    #[test]
+    fn a_peer_resolves_to_the_family_the_node_binds() {
+        let at = |text: &str| Endpoint::parse(text).unwrap();
+        let v4: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+        let v6: SocketAddr = "[::1]:7000".parse().unwrap();
+        let address = |text: &str| text.parse::<SocketAddr>().unwrap();
+        assert_eq!(
+            lookup(2, &at("localhost:7100"), v4).unwrap(),
+            address("127.0.0.1:7100")
+        );
+        assert_eq!(
+            lookup(2, &at("[::1]:7100"), v6).unwrap(),
+            address("[::1]:7100")
+        );
+        assert!(matches!(
+            lookup(2, &at("[::1]:7100"), v4),
+            Err(ProcessError::Resolve(2, _, _))
+        ));
+        assert!(matches!(
+            lookup(3, &at("127.0.0.1:7100"), v6),
+            Err(ProcessError::Resolve(3, _, _))
         ));
     }
 

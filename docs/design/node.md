@@ -620,6 +620,17 @@ keeps the socket its peers know); then closes its logs and volumes and exits 0. 
 is stated beside the orchestrator's grace period; a second signal, or the bound passing, ends the
 process as a crash would, which loses nothing acknowledged.
 
+*As built (2026-10-24).* A `peer` line may name where the peer listens, `peer = ID ROLE
+CERTIFICATE QUIC PLANE`, each `HOST:PORT` with the host an address or a name. `mantle serve`
+resolves each name as it starts, once its volumes are open and before its runtime runs, through
+the platform's resolver (std's `ToSocketAddrs`: getaddrinfo, GetAddrInfoW, what hyper-rt's
+`dns::resolve` wraps), taking the first address of the family its own socket binds, the only
+family that socket sends to (`localhost` resolves to `::1` before `127.0.0.1` on macOS); a name
+with no such address, or one the resolver refuses, ends the start naming the peer and the name.
+`mantle init` writes each founder's peers with the addresses the founders stated, but for a
+founder stated at port 0 or at no address of its own: where it listens is known only once it
+binds, and its peers learn it on standard input, as of a peer that moved.
+
 **Versions.** Every on-disk format already names its version (a volume's superblock, a log
 segment's header, an entry's format byte in `mantle_meta::wire`), and a connection's first
 exchange names the versions each side speaks, as focal's does (07 §4.1). A binary refuses a

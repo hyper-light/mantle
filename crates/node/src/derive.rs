@@ -32,7 +32,7 @@ use mantle_range::{ConfState, Range, Settings};
 
 use crate::classes::Role;
 use crate::node::Hosted;
-use crate::process::{Enlisting, GatewayConfig, ProcessConfig};
+use crate::process::{Enlisting, GatewayConfig, PeerLine, ProcessConfig};
 use crate::storage::VolumeSettings;
 
 /// focal's election timeout and heartbeat interval in ticks (docs/design/node.md §2.4), which
@@ -1042,7 +1042,7 @@ pub struct Stated {
     pub authority: PathBuf,
     pub certificate: PathBuf,
     pub key: PathBuf,
-    pub peers: Vec<(u64, Role, PathBuf)>,
+    pub peers: Vec<PeerLine>,
     pub ranges: Vec<(u128, Layer)>,
     pub voters: Vec<u64>,
     /// Each volume's device directory and bytes.
@@ -1668,10 +1668,19 @@ fn say_stated(said: &mut Said, stated: &Stated) {
         Kind::Stated,
         "the node's private key, PKCS #8 DER",
     );
-    for (id, role, certificate) in &stated.peers {
+    for peer in &stated.peers {
+        let at = peer
+            .at
+            .as_ref()
+            .map_or_else(String::new, |(quic, plane)| format!(" {quic} {plane}"));
         said.add(
             "peer",
-            format!("{id} {} {}", role_name(*role), certificate.display()),
+            format!(
+                "{} {} {}{at}",
+                peer.id,
+                role_name(peer.role),
+                peer.certificate.display()
+            ),
             Kind::Stated,
             "a peer, by the certificate the cell's authority issued it (node.md §3.6)",
         );
@@ -2724,6 +2733,20 @@ mod tests {
         PathBuf::from(format!("{root}{path}"))
     }
 
+    fn peer(id: u64, role: Role, certificate: &str, at_: Option<(&str, &str)>) -> PeerLine {
+        PeerLine {
+            id,
+            role,
+            certificate: at(certificate),
+            at: at_.map(|(quic, plane)| {
+                (
+                    crate::process::Endpoint::parse(quic).unwrap(),
+                    crate::process::Endpoint::parse(plane).unwrap(),
+                )
+            }),
+        }
+    }
+
     /// A node of a three-node cell hosting its five founding ranges, `volumes` volumes of 8 GiB and,
     /// with them, objects.
     fn stated(volumes: usize) -> Stated {
@@ -2736,9 +2759,19 @@ mod tests {
             certificate: at("/node/identity/node.der"),
             key: at("/node/identity/node.key"),
             peers: vec![
-                (2, Role::Node, at("/node/identity/2.der")),
-                (3, Role::Node, at("/node/identity/3.der")),
-                (9, Role::Client, at("/node/identity/9.der")),
+                peer(
+                    2,
+                    Role::Node,
+                    "/node/identity/2.der",
+                    Some(("node-2.example:7000", "node-2.example:7001")),
+                ),
+                peer(
+                    3,
+                    Role::Node,
+                    "/node/identity/3.der",
+                    Some(("[::1]:7000", "[::1]:7001")),
+                ),
+                peer(9, Role::Client, "/node/identity/9.der", None),
             ],
             ranges: vec![
                 (0x10, Layer::Root),

@@ -886,6 +886,18 @@ impl Cell {
     /// pins a client; init's own output is what the cell is read from: the authority's name and
     /// directory, and each founder's id and directory.
     pub(crate) fn made(args: impl FnOnce(&Path) -> Vec<String>) -> Self {
+        Self::made_started(args, false)
+    }
+
+    /// A cell `mantle init` made, its founders started highest id first, each one's configuration
+    /// naming the peers already listening by `localhost` and the ports they bound, as an operator
+    /// names a peer by its host: a founder learns on standard input only where the peers started
+    /// after it listen.
+    pub(crate) fn made_named(args: impl FnOnce(&Path) -> Vec<String>) -> Self {
+        Self::made_started(args, true)
+    }
+
+    fn made_started(args: impl FnOnce(&Path) -> Vec<String>, named: bool) -> Self {
         let root = tempfile::tempdir().unwrap();
         let out = root.path().join("cell");
         let made = Command::new(NODE)
@@ -1009,11 +1021,55 @@ impl Cell {
             made,
             _root: root,
         };
-        for (id, _) in &founders {
-            cell.start(*id);
+        if named {
+            cell.start_named();
+        } else {
+            for (id, _) in &founders {
+                cell.start(*id);
+            }
+            cell.introduce();
         }
-        cell.introduce();
         cell
+    }
+
+    /// Starts the founders highest id first, each configuration naming the peers already
+    /// listening; then tells each where the peers started after it listen.
+    fn start_named(&mut self) {
+        let mut order: Vec<u64> = self.made.keys().copied().collect();
+        order.sort_unstable_by(|a, b| b.cmp(a));
+        for &id in &order {
+            let config = self.made[&id].clone();
+            let mut text = std::fs::read_to_string(&config).unwrap();
+            for (peer, running) in &self.running {
+                let (quic, plane) = running.bound.unwrap();
+                let line = format!("peer = {peer} node identity/peers/{peer}.der\n");
+                assert!(
+                    text.contains(&line),
+                    "node {id} names no peer {peer}: {text}"
+                );
+                let named = format!(
+                    "peer = {peer} node identity/peers/{peer}.der localhost:{} localhost:{}\n",
+                    quic.port(),
+                    plane.port()
+                );
+                text = text.replace(&line, &named);
+            }
+            std::fs::write(&config, text).unwrap();
+            self.start(id);
+        }
+        let bound: BTreeMap<u64, (SocketAddr, SocketAddr)> = self
+            .running
+            .iter()
+            .map(|(id, running)| (*id, running.bound.unwrap()))
+            .collect();
+        for (at, id) in order.iter().enumerate() {
+            let running = self.running.get_mut(id).unwrap();
+            for peer in &order[at + 1..] {
+                let (quic, plane) = bound[peer];
+                writeln!(running.input, "learn {peer} {quic} {plane}").unwrap();
+            }
+            running.input.flush().unwrap();
+        }
     }
 
     /// A cell of `nodes` nodes hosting a range of each layer, each told where the others listen.

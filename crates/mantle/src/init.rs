@@ -336,8 +336,22 @@ fn config(id: u64, founder: &Founder, cell: &Cell, ids: &[u64], groups: &[u128])
         text.push_str(&format!("range = {group:x} {}\n", layer_name(layer)));
     }
     text.push_str("root_key = 1 keys/1\n");
-    for peer in ids.iter().filter(|peer| **peer != id) {
-        text.push_str(&format!("peer = {peer} node identity/peers/{peer}.der\n"));
+    for (peer, other) in ids
+        .iter()
+        .zip(&cell.founders)
+        .filter(|(peer, _)| **peer != id)
+    {
+        // A founder stated at port 0, or at no address of its own, learns where it listens only as
+        // it binds: its peers are told then, on standard input, as of a peer that moved.
+        let dialable = |at: &SocketAddr| at.port() != 0 && !at.ip().is_unspecified();
+        let at = if dialable(&other.quic) && dialable(&other.plane) {
+            format!(" {} {}", other.quic, other.plane)
+        } else {
+            String::new()
+        };
+        text.push_str(&format!(
+            "peer = {peer} node identity/peers/{peer}.der{at}\n"
+        ));
     }
     for (dir, bytes) in &founder.volumes {
         text.push_str(&format!("volume = {} {bytes}\n", dir.display()));
@@ -539,6 +553,7 @@ fn measure(said: &mut impl Write, founder: &Founder, dir: &Path) -> Result<(), E
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mantle_node::process::Endpoint;
 
     fn address(text: &str) -> SocketAddr {
         text.parse().unwrap()
@@ -706,13 +721,21 @@ mod tests {
                 );
             }
             assert!(files::owner_only(&stated.key).unwrap());
-            let peers: Vec<u64> = stated.peers.iter().map(|(peer, _, _)| *peer).collect();
+            let peers: Vec<u64> = stated.peers.iter().map(|peer| peer.id).collect();
             assert_eq!(
                 peers,
                 ids.iter().copied().filter(|p| p != id).collect::<Vec<_>>()
             );
-            for (_, _, certificate) in &stated.peers {
-                assert!(certificate.starts_with(&moved) && certificate.is_file());
+            for peer in &stated.peers {
+                assert!(peer.certificate.starts_with(&moved) && peer.certificate.is_file());
+                let (_, founder) = ids
+                    .iter()
+                    .zip(&cell.founders)
+                    .find(|(id, _)| **id == peer.id)
+                    .unwrap();
+                let (quic, plane) = peer.at.clone().unwrap();
+                assert_eq!(quic, Endpoint::parse(&founder.quic.to_string()).unwrap());
+                assert_eq!(plane, Endpoint::parse(&founder.plane.to_string()).unwrap());
             }
             let (generation, key) = &stated.keys[0];
             assert_eq!(*generation, 1);

@@ -30,6 +30,7 @@ mod linear;
 #[path = "../../node/tests/support/relay.rs"]
 mod relay;
 use cell::*;
+use std::process::{Command, Stdio};
 
 /// The peers a node of a stated cell names: the other nodes, the clients and the gateway.
 fn stated_peers() -> usize {
@@ -251,12 +252,63 @@ fn a_cell_of_one_made_by_init_serves_from_what_init_wrote() {
     objects_round_trip(&mut cell, &[id], &|_| id);
 }
 
+/// A peer named by a name that never resolves (the reserved `.invalid` domain, RFC 6761 §6.4) stops
+/// `mantle serve` as it starts, before it listens, naming the peer and the name.
+#[test]
+fn a_peer_whose_name_does_not_resolve_stops_the_start_naming_it() {
+    let root = tempfile::tempdir().unwrap();
+    let out = root.path().join("cell");
+    let data = root.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    let made = Command::new(NODE)
+        .arg("init")
+        .arg(&out)
+        .arg("--node")
+        .arg(format!(
+            "quic=127.0.0.1:0,plane=127.0.0.1:0,domain=laptop,volume={}:256M",
+            data.display()
+        ))
+        .args(["--max-nodes", "1", "--max-volumes", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        made.status.success(),
+        "{}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    let config = out.join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("peer = 77 node identity/node.der peer-77.invalid:7000 peer-77.invalid:7001\n");
+    std::fs::write(&config, text).unwrap();
+    let served = Command::new(NODE)
+        .arg("serve")
+        .arg(&config)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&served.stderr);
+    assert!(!served.status.success(), "{said}");
+    assert!(
+        said.contains("peer 77") && said.contains("peer-77.invalid:7000"),
+        "{said}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&served.stdout)
+            .lines()
+            .any(|line| line.starts_with("bound ")),
+        "it listened"
+    );
+}
+
 /// `mantle init` makes a cell of three from a machines file's two founders and a `--node`'s, the
 /// file's first: served each from what init wrote, each pinning the others, each measures its device
 /// at its first start, every node enlists, and objects put through each read back through another.
+/// The founders start highest id first, each configuration naming the peers already listening by
+/// `localhost` and their ports, which each resolves as it starts: every dial a node makes is to an
+/// address its configuration named, and only where a later peer listens comes on standard input.
 #[test]
 fn a_cell_of_three_made_by_init_from_a_file_and_a_flag_serves_objects() {
-    let mut cell = Cell::made(|root| {
+    let mut cell = Cell::made_named(|root| {
         let dirs: Vec<PathBuf> = (1..=3)
             .map(|n| {
                 let dir = root.join(format!("d{n}"));

@@ -73,8 +73,10 @@ a write queue of two batches that refuses with `Busy` beyond them; cleaning on a
 set by the measured write rate and cleaning time, with writes `Busy` while cleaning can
 still make room and `Full` once it cannot; and an index of where each live record lies,
 so cleaning and scrubbing never walk the whole index. Where calibration finds a durable
-write into never-written space slower than one over written space, as ext4's extent
-journaling makes it, format writes the volume once before use. Tested with
+write past never-written space slower than one over written space, as ext4's extent
+journaling makes it, and on NTFS, whose zeros up to a write past the valid data length are
+documented, format writes the volume once before use
+(measurements/2026-10-24-first-writes-past-unwritten-space.md). Tested with
 randomized workloads, cleaning included, cut by power loss at every point on the
 simulated device (20,000 runs per soak: no acknowledged write lost, no unverified byte
 returned) and with bit flips, read errors, damaged superblocks, damaged log frames and
@@ -565,6 +567,12 @@ passes on all six CI targets.
 8. **Fair-share windows**: a PUT's window from the entitled rate, a GET's from the latency at the
    hedge quantile (node.md §2.6; gateway.md §2–§3). Done when a lone upload's goodput reaches
    `min(client rate, device plateau)` and its window shrinks and regrows across a spike.
+   *Open*: a replica's chunk put waits one idle timeout (3.07 s) for its answer once the peer
+   has the request, whatever the peer's device takes; a durable write slower than that ends the
+   put as stalled, and a cell with no spare volume fails the object (on windows-11-arm a
+   volume's first write took up to 8.0 s before calibration saw NTFS's zeros;
+   measurements/2026-10-24-first-writes-past-unwritten-space.md). The answer's period belongs
+   with the peer's measured write time, as a command ask's comes from its slowest answer.
 9. **Operation identity**: client-drawn identities, `amz-sdk-invocation-id` on the listener,
    operation rows in the Name range with the first answer, the horizon capped by the operation
    table's budget, removal by the collector, carried by splits (gateway.md §2.1; metadata.md §2).

@@ -100,6 +100,13 @@ impl FileSystemKind {
     pub fn is_network(&self) -> bool {
         matches!(self, Self::Nfs | Self::Smb | Self::Ceph)
     }
+
+    /// File systems that keep a valid data length and fill a file with zeros up to a write past
+    /// it before the write completes: NTFS, by SetFileValidData's remarks, KB 156932 and
+    /// `CcZeroData` (docs/research/02 §4.7).
+    pub fn fills_past_valid_data(&self) -> bool {
+        matches!(self, Self::Ntfs)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

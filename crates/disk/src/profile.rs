@@ -14,14 +14,16 @@ use std::path::Path;
 use hyper_block::DiskError;
 
 use crate::calibrate::{self, Calibration, Plan};
-use crate::identity::Identity;
+use crate::identity::{FileSystemKind, Identity};
 
 /// The profile's file in a device directory's `mantle/`.
 pub const PROFILE: &str = "profile";
 
 const MAGIC: [u8; 8] = *b"MNTLPROF";
-/// The layout's version: a record of another is measured again.
-const VERSION: u16 = 1;
+/// The layout's version: a record of another is measured again. 2: `prewrite` decided by first
+/// writes past never-written space (calibrate.rs `measured`), where 1's sequential first writes
+/// missed NTFS's fill of a file up to its valid data length.
+const VERSION: u16 = 2;
 /// The longest key a record carries, its length a u16: a device whose identity's line is longer is
 /// measured at each start, its profile not kept.
 const MAX_KEY: usize = 65_535;
@@ -40,18 +42,18 @@ pub struct Profile {
     /// Bytes a read goes past rather than ask the device a second time
     /// (`Calibration::read_gap`).
     pub read_gap: u64,
-    /// Whether a durable write into never-written space is slower than one over written space
-    /// (`Calibration::first_write_penalty`).
+    /// Whether a volume on the device is written once at format ([`prewrite`]).
     pub prewrite: bool,
 }
 
 impl Profile {
     /// What `c` measured, as `mantle bench chunk` runs a volume on it: a device whose reads did not
     /// come to a point where they stop growing reads one at a time, buffering none past what it
-    /// asked, as a device not measured does (`mantle_chunk::Reads::default`). None where the bytes
-    /// of its large reads in flight pass a u64.
-    pub fn of(c: &Calibration) -> Option<Self> {
-        let prewrite = c.first_write_penalty();
+    /// asked, as a device not measured does (`mantle_chunk::Reads::default`); its volumes written
+    /// once at format as [`prewrite`] decides on a file system of `kind`. None where the bytes of
+    /// its large reads in flight pass a u64.
+    pub fn of(c: &Calibration, kind: &FileSystemKind) -> Option<Self> {
+        let prewrite = prewrite(kind, c);
         let (Some(random), Some(sequential)) =
             (c.random_read_saturation(), c.sequential_read_saturation())
         else {
@@ -191,18 +193,31 @@ pub fn load_or_measure(
         identity.file_system.available_bytes,
         plan,
     )?;
-    let profile = Profile::of(&measured).ok_or_else(|| DiskError::Io {
-        op: "measure",
-        path: dir.to_path_buf(),
-        source: std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "the bytes of the device's large reads in flight pass a u64",
-        ),
-    })?;
+    let profile =
+        Profile::of(&measured, &identity.file_system.kind).ok_or_else(|| DiskError::Io {
+            op: "measure",
+            path: dir.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the bytes of the device's large reads in flight pass a u64",
+            ),
+        })?;
     if let Some(record) = profile.encode(&key) {
         hyper_block::record::write(&path, &record)?;
     }
     Ok((profile, true))
+}
+
+/// Whether a volume on a device whose file system is `kind` is written once at format: where the
+/// file system's documentation says it fills a file with zeros up to a write past its valid data
+/// length (`FileSystemKind::fills_past_valid_data`), or where calibration measured a durable write
+/// past never-written space slower than one over written space
+/// (`Calibration::first_write_penalty`). The identification decides where the documentation
+/// does, whatever the measurement's noise: one of 33 paired calibrations under load on
+/// windows-x86_64 missed NTFS's fill, which a volume's first data write pays for in seconds
+/// (docs/measurements/2026-10-24-first-writes-past-unwritten-space.md).
+pub fn prewrite(kind: &FileSystemKind, c: &Calibration) -> bool {
+    kind.fills_past_valid_data() || c.first_write_penalty()
 }
 
 #[cfg(test)]
@@ -228,6 +243,44 @@ mod tests {
             available_bytes: Some(1 << 30),
         };
         id
+    }
+
+    /// NTFS's volumes are written once at format whatever the measurement says; on other file
+    /// systems the measurement decides.
+    #[test]
+    fn ntfs_prewrites_and_others_follow_the_measurement() {
+        let point = calibrate::Point {
+            depth: 1,
+            ops_per_sec: 0.0,
+            bytes_per_sec: 0.0,
+            spread: 0.0,
+            rounds: 0,
+            p50_ns: None,
+            p99_ns: None,
+            achieved: 0.0,
+        };
+        let measured = |ratios: &[f64]| Calibration {
+            caching: hyper_block::file::Caching::Direct,
+            small: 4096,
+            large: 1 << 20,
+            random_read: Vec::new(),
+            random_read_capped: false,
+            sequential_read: Vec::new(),
+            sequential_write: Vec::new(),
+            durable_write: point,
+            durable_sequential: point,
+            durable_large: 1 << 20,
+            workers: 1,
+            first_write_ratios: ratios.iter().map(|r| r.ln()).collect(),
+            elapsed: std::time::Duration::ZERO,
+        };
+        let (penalty, none) = (measured(&[5.7, 6.1, 5.2, 6.3]), measured(&[1.1, 0.9, 1.05]));
+        assert!(prewrite(&FileSystemKind::Ntfs, &none));
+        assert!(prewrite(&FileSystemKind::Ntfs, &penalty));
+        assert!(!prewrite(&FileSystemKind::Apfs, &none));
+        assert!(prewrite(&FileSystemKind::Ext4, &penalty));
+        assert!(!prewrite(&FileSystemKind::Unknown, &none));
+        assert!(Profile::of(&none, &FileSystemKind::Ntfs).unwrap().prewrite);
     }
 
     /// A record reads back as the profile it keeps for its device's key, and for no other key,

@@ -118,18 +118,28 @@ macOS (where `F_FULLFSYNC` fails on a device node), `IOCTL_DISK_GET_LENGTH_INFO`
 `FlushFileBuffers` on Windows (research/02 §6.4a). Read as a file, a node's length is zero,
 and recovery would find no superblock (audit §6.2).
 
-A volume is laid out at its full size when it is formatted. Where the file system journals
-the conversion of an extent on its first write, a durable write into preallocated space
-that was never written pays for it at the flush: 5.7x the median of an overwrite on ext4,
-nothing on APFS (docs/measurements/2026-09-28-flush-cost-by-extent-state.md). Calibration
-measures it on the device at hand: small durable writes into never-written space, then the
-same writes over the space they wrote, a penalty when the first writes' throughput interval
-lies wholly below the overwrites' (research/11 §13.3, from GBE07 §3.3). Where it finds one, format writes the whole
-volume once with zeros before its superblocks, so every append overwrites written blocks
-[RO92; AWK+19-F6 reuses WAL files for the same reason]; where it finds none, format writes
-only the superblocks. It finds 6.3x on ext4 and none on APFS
-(docs/measurements/2026-09-29-first-write-calibration.md). Raw block devices have no extent
-state.
+A volume is laid out at its full size when it is formatted. A durable write into preallocated
+space that was never written can cost more than an overwrite in two ways. Where the file system
+journals the conversion of an extent on its first write, the flush pays for it: 5.7x the median
+of an overwrite on ext4, nothing on APFS (docs/measurements/2026-09-28-flush-cost-by-extent-state.md).
+Where it keeps a valid data length, as NTFS does, a write past that length waits while the file
+system fills the space before it with zeros (research/02 §4.7). A volume's first data write lands
+past the unwritten rest of its index log, 64 MiB on a standard volume, and a segment it opens past
+the unwritten tail of the one before; on CI's windows-11-arm runner the first took up to 8.0 s,
+long enough to end a replica's chunk put as stalled, where the same volume written whole first
+took at most 148 ms (docs/measurements/2026-10-24-first-writes-past-unwritten-space.md).
+Calibration measures both on the device at hand as a volume makes its first writes: each round a
+small durable write at the end of its share of the scratch span, and so past a stretch never
+written, then at once the same write over the place it wrote; a penalty when the 95% confidence
+interval of the rounds' log latency ratios lies wholly above zero, a round's two writes one paired
+observation under one load (research/11 §13.3, from JAIN17). Where it finds one, or where the file
+system is NTFS, whose fill is documented and which a calibration under load can miss, format writes
+the whole volume once with zeros before its superblocks, so every append overwrites written blocks
+[RO92; AWK+19-F6 reuses WAL files for the same reason]; elsewhere format writes only the
+superblocks. It finds 3.8x to 8.0x on ext4, 3.9x to 131x on NTFS, none on Btrfs, and on APFS
+none alone and up to 1.6x beside other calibrations
+(docs/measurements/2026-10-24-first-writes-past-unwritten-space.md). Raw block devices have no
+extent state.
 
 ## 3. Records
 

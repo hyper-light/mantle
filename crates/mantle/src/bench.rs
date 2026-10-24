@@ -53,6 +53,7 @@ use hyper_block::scratch::Scratch;
 use mantle_chunk::{ChunkError, ChunkKey, Config, ReadBuffers, Reads, Volume};
 use mantle_disk::calibrate::{self, Calibration};
 use mantle_disk::histogram::Histogram;
+use mantle_disk::identity::FileSystemKind;
 use mantle_disk::measure::SplitMix64;
 use mantle_disk::rounds::{self, Order, Policy};
 
@@ -234,8 +235,8 @@ pub fn chunk(out: &mut impl Write, path: &Path, options: &Options) -> Result<(),
             &calibrate::Plan::standard(align, id.queue_depth),
         )
         .map_err(Error::Disk)?;
-        report_device(out, &device)?;
-        prewrite = device.first_write_penalty();
+        report_device(out, &device, &id.file_system.kind)?;
+        prewrite = mantle_disk::profile::prewrite(&id.file_system.kind, &device);
         if let (Some(random), Some(sequential)) = (
             device.random_read_saturation(),
             device.sequential_read_saturation(),
@@ -253,7 +254,11 @@ pub fn chunk(out: &mut impl Write, path: &Path, options: &Options) -> Result<(),
     run(out, path, align, &plan, prewrite, reads, depth)
 }
 
-pub(crate) fn report_device(out: &mut impl Write, c: &Calibration) -> std::io::Result<()> {
+pub(crate) fn report_device(
+    out: &mut impl Write,
+    c: &Calibration,
+    kind: &FileSystemKind,
+) -> std::io::Result<()> {
     let best = |points: &[calibrate::Point]| {
         points
             .iter()
@@ -272,7 +277,11 @@ pub(crate) fn report_device(out: &mut impl Write, c: &Calibration) -> std::io::R
         display::rate(c.durable_sequential.bytes_per_sec),
         display::size(c.durable_large)
     )?;
-    writeln!(out, "  first writes   {}", crate::disk::first_writes(c))?;
+    writeln!(
+        out,
+        "  first writes   {}",
+        crate::disk::first_writes(c, kind)
+    )?;
     writeln!(
         out,
         "  throughput     {} read, {} write ({} transfers, no flush)",

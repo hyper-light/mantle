@@ -84,7 +84,7 @@ pub fn log(out: &mut impl Write, path: &Path, options: &Options) -> Result<(), E
             &calibrate::Plan::standard(align, id.queue_depth),
         )
         .map_err(Error::Disk)?;
-        report_device(out, &device)?;
+        report_device(out, &device, &id.file_system.kind)?;
     }
     let most = replicas.iter().copied().max().unwrap_or(1).max(1);
     writeln!(

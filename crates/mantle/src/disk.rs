@@ -158,11 +158,11 @@ fn measured(out: &mut impl Write, path: &Path, id: &Identity) -> Result<(), Erro
     out.flush()?;
     let c = calibrate::calibrate(path, align, id.file_system.available_bytes, &plan)
         .map_err(Error::Disk)?;
-    report(out, &c)?;
+    report(out, &c, &id.file_system.kind)?;
     Ok(())
 }
 
-fn report(out: &mut impl Write, c: &Calibration) -> std::io::Result<()> {
+fn report(out: &mut impl Write, c: &Calibration, kind: &FileSystemKind) -> std::io::Result<()> {
     writeln!(out, "measured in {:.0} s:", c.elapsed.as_secs_f64())?;
     if let (Some(knee), Some(saturation)) = (c.random_read_knee(), c.random_read_saturation()) {
         field(
@@ -224,7 +224,7 @@ fn report(out: &mut impl Write, c: &Calibration) -> std::io::Result<()> {
             display::size(c.durable_large)
         ),
     )?;
-    field(out, "first writes", &first_writes(c))?;
+    field(out, "first writes", &first_writes(c, kind))?;
     if c.caching == Caching::Buffered {
         field(
             out,
@@ -236,24 +236,27 @@ fn report(out: &mut impl Write, c: &Calibration) -> std::io::Result<()> {
 }
 
 /// What a durable write into never-written space costs against one over written space, and
-/// what the chunk store does about it.
-pub(crate) fn first_writes(c: &Calibration) -> String {
-    let ratio = if c.first_write.ops_per_sec > 0.0 {
-        c.overwrite.ops_per_sec / c.first_write.ops_per_sec
-    } else {
-        f64::INFINITY
+/// what the chunk store does about it on a file system of `kind` (`mantle_disk::profile::prewrite`).
+pub(crate) fn first_writes(c: &Calibration, kind: &FileSystemKind) -> String {
+    let measured = match c.first_write_ratio() {
+        Some(ratio) if c.first_write_penalty() => {
+            format!("a durable write into new space takes {ratio:.1}x one over written space")
+        }
+        Some(ratio) => format!(
+            "a durable write into new space takes {ratio:.2}x one over written space, within the \
+             noise"
+        ),
+        None => "not measured".to_owned(),
     };
-    if c.first_write_penalty() {
-        format!(
-            "a durable write into new space takes {ratio:.1}x one over written space; \
-             volumes here are written once at format"
-        )
+    let done = if c.first_write_penalty() {
+        "volumes here are written once at format"
+    } else if kind.fills_past_valid_data() {
+        "volumes here are written once at format, as the file system fills a file up to a write \
+         past its valid data length"
     } else {
-        format!(
-            "a durable write into new space takes {ratio:.2}x one over written space, \
-             within the noise; volumes here are not pre-written"
-        )
-    }
+        "volumes here are not pre-written"
+    };
+    format!("{measured}; {done}")
 }
 
 #[cfg(test)]

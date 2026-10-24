@@ -125,16 +125,38 @@ mod tests {
             &format!("{me}:F"),
             "*S-1-5-18:F",
         ]);
-        assert_eq!(read(&path).unwrap(), vec![7u8; 48]);
+        let owners_alone = |when: &str| {
+            let read = read(&path);
+            assert!(
+                matches!(&read, Ok(bytes) if *bytes == [7u8; 48]),
+                "{when}: {read:?}, the file's security {}",
+                sddl(&path)
+            );
+        };
+        owners_alone("its owner's and LocalSystem's alone");
         for other in ["*S-1-1-0", "*S-1-5-32-545", "*S-1-5-32-544"] {
             icacls(&["/grant", &format!("{other}:R")]);
+            let read = read(&path);
             assert!(
-                matches!(read(&path), Err(SecretError::Exposed)),
-                "{other} refused"
+                matches!(read, Err(SecretError::Exposed)),
+                "{other} allowed to read: {read:?}, the file's security {}",
+                sddl(&path)
             );
             icacls(&["/remove:g", other]);
-            assert_eq!(read(&path).unwrap(), vec![7u8; 48]);
+            owners_alone(&format!("{other} removed"));
         }
+    }
+
+    /// The file's security descriptor as SDDL, its owner and every DACL entry, said when a verdict
+    /// is not the one expected.
+    #[cfg(windows)]
+    fn sddl(path: &std::path::Path) -> String {
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command"])
+            .arg(format!("(Get-Acl -LiteralPath '{}').Sddl", path.display()))
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
     }
 
     /// The SID of the account the test runs as, the second field of `whoami /user /fo csv /nh`.

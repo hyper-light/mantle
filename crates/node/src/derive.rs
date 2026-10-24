@@ -13,6 +13,7 @@ use hyper_raft::progress::Progress;
 use hyper_raft::proto::{Entry, Message};
 use hyper_raft::read::PendingRead;
 use hyper_rt::machine::bench::MIN_SAMPLES;
+use hyper_rt::machine::facts::{MemoryFacts, effective_capacity};
 use mantle_chunk::layout::{self as volume_layout, Geometry};
 use mantle_chunk::{ChunkError, Config as VolumeConfig, Limits, Reads, index};
 use mantle_ec::durability::{self, Burst, Choice, DurabilityError, Rates, Scheme};
@@ -254,6 +255,16 @@ pub enum DeriveError {
     Volume(#[from] ChunkError),
     #[error("the durability model: {0}")]
     Durability(#[from] DurabilityError),
+    #[error("the node's floor of {floor} bytes passes its allowance of {allowance} at its {class}")]
+    Memory {
+        class: Class,
+        floor: u64,
+        allowance: u64,
+    },
+    #[error(
+        "a stated memory ceiling of {stated} bytes past the {capacity} the OS lets the process hold"
+    )]
+    Ceiling { stated: u64, capacity: u64 },
 }
 
 /// The range's settings and rules, which every member of the cell derives alike, from the
@@ -683,6 +694,105 @@ pub fn threads(devices: &[usize], volumes: &[bool]) -> Option<u64> {
 /// The stacks of `threads` threads, each reserved whole at its start.
 pub fn stacks(threads: u64) -> Option<u64> {
     threads.checked_mul(STACK)
+}
+
+/// A class of what a node holds at its floor (node.md §1.4), in the order the floor counts them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Class {
+    /// The objects' put and get, a window of one block ([`objects`]).
+    Objects,
+    /// Each volume's buffers (`mantle_chunk::layout::most_bytes`).
+    Volumes,
+    /// Each range's engine's configured buffers (`mantle_engine::shard_db::bounded_bytes`).
+    Engines,
+    /// Each range's member ([`range_bytes`]).
+    Ranges,
+    /// The node's shared log ([`log_bytes`]).
+    Log,
+    /// The transport beside its budget, its plane and its liveness stream
+    /// ([`transport_bytes_beside`], [`plane_bytes`], [`liveness_bytes`]).
+    Transport,
+    /// The threads the node starts, their stacks reserved whole ([`threads`], [`stacks`]).
+    Threads,
+}
+
+impl std::fmt::Display for Class {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Objects => "objects",
+            Self::Volumes => "volumes",
+            Self::Engines => "engines",
+            Self::Ranges => "ranges",
+            Self::Log => "log",
+            Self::Transport => "transport",
+            Self::Threads => "threads",
+        })
+    }
+}
+
+/// The memory a node may hold (research 64 §5): the ceiling its operator states; else the limit
+/// the OS sets for the process (cgroup v2's `memory.max`, a job's limit, `RLIMIT_AS`), which in an
+/// orchestrator is the operator's statement; else the machine's physical memory
+/// (`hyper_rt::machine::facts::effective_capacity`). A ceiling past what the OS lets the process
+/// hold is refused: the process would be killed, or swapped, before it reached it.
+pub fn allowance(stated: Option<u64>, memory: &MemoryFacts) -> Result<u64, DeriveError> {
+    let capacity = effective_capacity(memory.total, memory.limit);
+    match stated {
+        Some(stated) if stated > capacity => Err(DeriveError::Ceiling { stated, capacity }),
+        Some(stated) => Ok(stated),
+        None => Ok(capacity),
+    }
+}
+
+/// What a node may hold past its floor within `allowance`: the floor, `classes` each at the most
+/// its configuration lets it hold, counted in their order; refused at the class whose bytes take
+/// the count past the allowance, the whole floor named beside it ([`DeriveError::Memory`]). What
+/// remains is each volume's index's and each engine's resident metadata's ([`shares`]).
+pub fn floor(classes: &[(Class, u64)], allowance: u64) -> Result<u64, DeriveError> {
+    let total = classes
+        .iter()
+        .try_fold(0u64, |sum, &(_, bytes)| sum.checked_add(bytes))
+        .ok_or(DeriveError::Overflow("the floor"))?;
+    let mut counted = 0u64;
+    for &(class, bytes) in classes {
+        counted = counted
+            .checked_add(bytes)
+            .ok_or(DeriveError::Overflow("the floor"))?;
+        if counted > allowance {
+            return Err(DeriveError::Memory {
+                class,
+                floor: total,
+                allowance,
+            });
+        }
+    }
+    allowance
+        .checked_sub(total)
+        .ok_or(DeriveError::Overflow("the floor"))
+}
+
+/// What remains past the floor, shared by each volume's index and each engine's resident metadata:
+/// each takes what its device at its full size wants (`wants`), and when less remains than all of
+/// them want, each the same part of its want, so no device fills before the rest.
+pub fn shares(remaining: u64, wants: &[u64]) -> Result<Vec<u64>, DeriveError> {
+    let overflow = || DeriveError::Overflow("the floor's shares");
+    let total = wants
+        .iter()
+        .try_fold(0u64, |sum, &want| sum.checked_add(want))
+        .ok_or_else(overflow)?;
+    if total <= remaining {
+        return Ok(wants.to_vec());
+    }
+    wants
+        .iter()
+        .map(|&want| {
+            u128::from(want)
+                .checked_mul(u128::from(remaining))
+                .and_then(|part| part.checked_div(u128::from(total)))
+                .and_then(|share| u64::try_from(share).ok())
+                .ok_or_else(overflow)
+        })
+        .collect()
 }
 
 /// What a data device measured (docs/design/chunk-store.md §7; `mantle_disk::calibrate`).
@@ -1147,5 +1257,90 @@ mod tests {
         assert!(formatted.geometry.holds(&one_more).is_err());
         let fewer = volume(align, 8 << 30, chunk, &PROFILE, bytes / 2, Some(&formatted)).unwrap();
         assert_eq!(fewer.max_fragments, index::most_fragments(bytes / 2));
+    }
+
+    fn machine(total: u64, limit: Option<u64>) -> MemoryFacts {
+        MemoryFacts {
+            total,
+            available: total / 2,
+            address_bits: 48,
+            limit,
+        }
+    }
+
+    #[test]
+    fn the_allowance_is_the_ceiling_else_the_os_limit_else_physical_memory() {
+        let gib = 1u64 << 30;
+        let ok = |stated, total, limit| allowance(stated, &machine(total, limit)).ok();
+        // Stated, within what the OS lets the process hold.
+        assert_eq!(ok(Some(4 * gib), 16 * gib, Some(8 * gib)), Some(4 * gib));
+        assert_eq!(ok(Some(8 * gib), 16 * gib, Some(8 * gib)), Some(8 * gib));
+        // Stated past it: refused, naming both.
+        assert!(matches!(
+            allowance(Some(8 * gib + 1), &machine(16 * gib, Some(8 * gib))),
+            Err(DeriveError::Ceiling { stated, capacity })
+                if stated == 8 * gib + 1 && capacity == 8 * gib
+        ));
+        assert!(allowance(Some(16 * gib + 1), &machine(16 * gib, None)).is_err());
+        // None stated: the OS's limit, physical memory where that is past it or there is none.
+        assert_eq!(ok(None, 16 * gib, Some(8 * gib)), Some(8 * gib));
+        assert_eq!(ok(None, 16 * gib, Some(32 * gib)), Some(16 * gib));
+        assert_eq!(ok(None, 16 * gib, None), Some(16 * gib));
+    }
+
+    #[test]
+    fn the_floor_admits_up_to_its_allowance_and_names_the_class_past_it() {
+        let classes = [
+            (Class::Objects, 10),
+            (Class::Volumes, 20),
+            (Class::Engines, 30),
+            (Class::Threads, 40),
+        ];
+        let crossed = |allowance| match floor(&classes, allowance) {
+            Err(DeriveError::Memory {
+                class,
+                floor,
+                allowance: named,
+            }) if named == allowance => Some((class, floor)),
+            _ => None,
+        };
+        // At the allowance exactly nothing remains; a byte more remains a byte.
+        assert_eq!(floor(&classes, 100).ok(), Some(0));
+        assert_eq!(floor(&classes, 101).ok(), Some(1));
+        // A byte short: the last class crosses, the whole floor named.
+        assert_eq!(crossed(99), Some((Class::Threads, 100)));
+        // Crossed early: the class whose bytes took the count past the allowance.
+        assert_eq!(crossed(59), Some((Class::Engines, 100)));
+        assert_eq!(crossed(29), Some((Class::Volumes, 100)));
+        assert_eq!(crossed(9), Some((Class::Objects, 100)));
+        assert!(matches!(
+            floor(&[(Class::Log, u64::MAX), (Class::Ranges, 1)], u64::MAX),
+            Err(DeriveError::Overflow("the floor"))
+        ));
+        // The refusal says what the node needs.
+        let refused = floor(&classes, 99).unwrap_err().to_string();
+        assert!(
+            refused.contains("threads") && refused.contains("100"),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn what_remains_is_shared_in_proportion_to_what_each_device_wants() {
+        // Enough for every want: each takes its own.
+        assert_eq!(shares(100, &[30, 70]).ok(), Some(vec![30, 70]));
+        assert_eq!(shares(1_000, &[30, 70]).ok(), Some(vec![30, 70]));
+        // Less: each the same part of its want, rounded down, never past what remains.
+        let parts = shares(50, &[30, 70]).unwrap();
+        assert_eq!(parts, vec![15, 35]);
+        let parts = shares(7, &[1, 2, 4]).unwrap();
+        assert_eq!(parts, vec![1, 2, 4]);
+        let parts = shares(6, &[1, 2, 4]).unwrap();
+        assert!(parts.iter().sum::<u64>() <= 6, "{parts:?}");
+        assert_eq!(parts, vec![0, 1, 3]);
+        let parts = shares(u64::MAX / 2, &[u64::MAX / 2, u64::MAX / 2]).unwrap();
+        assert!(parts.iter().sum::<u64>() <= u64::MAX / 2, "{parts:?}");
+        assert_eq!(shares(0, &[5, 5]).ok(), Some(vec![0, 0]));
+        assert_eq!(shares(10, &[]).ok(), Some(vec![]));
     }
 }

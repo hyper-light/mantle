@@ -1360,19 +1360,27 @@ mod tests {
     fn a_stated_volumes_directory_may_hold_a_space() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config");
+        // Absolute on this platform: on Windows a rooted path with no drive is the config's drive's.
+        let disks = if cfg!(windows) {
+            "C:/my disks/one"
+        } else {
+            "/my disks/one"
+        };
         std::fs::write(
             &config,
-            "id = 1\ndir = .\nquic = 127.0.0.1:0\nplane = 127.0.0.1:0\nauthority = a.der\n\
-             certificate = n.der\nkey = n.key\nvoters = 1\nrange = 1 root\n\
-             volume = /my disks/one 1073741824\nvolume = data 4096\ndomain = a\n\
-             root.max_nodes = 1\nroot.max_volumes = 2\n",
+            format!(
+                "id = 1\ndir = .\nquic = 127.0.0.1:0\nplane = 127.0.0.1:0\nauthority = a.der\n\
+                 certificate = n.der\nkey = n.key\nvoters = 1\nrange = 1 root\n\
+                 volume = {disks} 1073741824\nvolume = data 4096\ndomain = a\n\
+                 root.max_nodes = 1\nroot.max_volumes = 2\n"
+            ),
         )
         .unwrap();
         let stated = read_stated(&config).unwrap();
         assert_eq!(
             stated.volumes,
             vec![
-                (PathBuf::from("/my disks/one"), 1 << 30),
+                (PathBuf::from(disks), 1 << 30),
                 (dir.path().join("data"), 4096)
             ]
         );

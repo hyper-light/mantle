@@ -2719,19 +2719,26 @@ mod tests {
 
     /// A node of a three-node cell hosting its five founding ranges, `volumes` volumes of 8 GiB and,
     /// with them, objects.
+    /// `path`, rooted, as an absolute path on this platform: on Windows one with no drive is the
+    /// config's drive's, which a configuration read back resolves it against, so the test names one.
+    fn at(path: &str) -> PathBuf {
+        let root = if cfg!(windows) { "C:" } else { "" };
+        PathBuf::from(format!("{root}{path}"))
+    }
+
     fn stated(volumes: usize) -> Stated {
         Stated {
             id: 1,
-            dir: PathBuf::from("/node"),
+            dir: at("/node"),
             quic: "127.0.0.1:7000".parse().unwrap(),
             plane: "127.0.0.1:7001".parse().unwrap(),
-            authority: PathBuf::from("/node/identity/authority.der"),
-            certificate: PathBuf::from("/node/identity/node.der"),
-            key: PathBuf::from("/node/identity/node.key"),
+            authority: at("/node/identity/authority.der"),
+            certificate: at("/node/identity/node.der"),
+            key: at("/node/identity/node.key"),
             peers: vec![
-                (2, Role::Node, PathBuf::from("/node/identity/2.der")),
-                (3, Role::Node, PathBuf::from("/node/identity/3.der")),
-                (9, Role::Client, PathBuf::from("/node/identity/9.der")),
+                (2, Role::Node, at("/node/identity/2.der")),
+                (3, Role::Node, at("/node/identity/3.der")),
+                (9, Role::Client, at("/node/identity/9.der")),
             ],
             ranges: vec![
                 (0x10, Layer::Root),
@@ -2742,7 +2749,7 @@ mod tests {
             ],
             voters: vec![1, 2, 3],
             volumes: (0..volumes)
-                .map(|n| (PathBuf::from(format!("/data{n}")), 8 << 30))
+                .map(|n| (at(&format!("/data{n}")), 8 << 30))
                 .collect(),
             enlist: (volumes > 0).then(|| Enlisting {
                 root: 0x10,
@@ -2751,7 +2758,7 @@ mod tests {
                 max_volumes: 3,
             }),
             keys: if volumes > 0 {
-                vec![(1, PathBuf::from("/node/keys/1"))]
+                vec![(1, at("/node/keys/1"))]
             } else {
                 Vec::new()
             },

@@ -459,8 +459,7 @@ fn a_cell_made_by_init_rolls_one_node_at_a_time_and_reads_every_object_back() {
             cell.stopped.remove(&stopping),
             "node {stopping} said no stop"
         );
-        // The ranges it led as its stop began, as it said: each handed to another voter, then led
-        // on by the others (`led_on`).
+        // The ranges it led as its stop began, as it said: each handed to another voter.
         let ranges: BTreeSet<u128> = cell
             .handing
             .iter()
@@ -477,6 +476,14 @@ fn a_cell_made_by_init_rolls_one_node_at_a_time_and_reads_every_object_back() {
                 .map(|(_, _, to)| *to)
                 .unwrap_or_else(|| panic!("node {stopping} handed {group:x} to no one"));
             assert!(others.contains(&to), "{group:x} handed to {to}");
+        }
+        // The watch begins once every remaining member names each range's leader, handed or not,
+        // the moment the step's criterion starts from: a follower that lost sight of its leader
+        // before the stop, as a starved one may without any election, names it again first (on
+        // one CPU a member said no leader 330 ms before the stop and named it 105 ms after; the
+        // stopped node had led none, so no handed range was waited on, and that stale status was
+        // counted after the watch began).
+        for group in &groups {
             led_on(&mut cell, *group, &others);
         }
         cell.leaderless.clear();

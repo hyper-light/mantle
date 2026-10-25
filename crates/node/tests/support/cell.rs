@@ -616,6 +616,9 @@ impl Sim {
             // matter to the commands the simulation runs, and a seed replays them.
             wall: Wall::From(0),
             gateway: None,
+            // The simulated cell keeps no history (its nodes enlist nothing): every start's
+            // detectors begin from what they watch.
+            history: mantle_meta::record::History::default(),
         };
         self.starts += 1;
         let shard = member.shard;

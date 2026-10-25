@@ -229,6 +229,11 @@ impl Exposure {
         }
     }
 
+    /// TEMPORARY (local compile check only; the real one comes with the re-vendor).
+    pub const fn of(exposure: Duration, failures: u64) -> Self {
+        Self { exposure, failures }
+    }
+
     /// Node time run: the sum over nodes of the time each was up. Saturating: past `Duration::MAX`
     /// of exposure, more changes nothing measurable.
     pub fn on_exposure(&mut self, node_time: Duration) {

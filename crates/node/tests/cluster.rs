@@ -452,6 +452,9 @@ impl Pki {
             read_asks: READ_ASKS,
             wall: Wall::System,
             gateway: None,
+            // These nodes enlist nothing, so the cell keeps no history of them: every start's
+            // detectors begin from what they watch.
+            history: mantle_meta::record::History::default(),
         }
     }
 }

@@ -107,7 +107,8 @@ use mantle_engine::trunk::TrunkConfig;
 use mantle_meta::apply::Layer;
 use mantle_meta::engine::Engine;
 use mantle_meta::name;
-use mantle_meta::root::{self, Enlist, MAX_DOMAIN};
+use mantle_meta::record::History;
+use mantle_meta::root::{self, Enlist, Lived, MAX_DOMAIN};
 use mantle_meta::session::Rules;
 use mantle_meta::wire::{Answer, Command};
 use mantle_range::{ConfState, Range, Settings, Stored};
@@ -117,6 +118,8 @@ use crate::ask::CommandOutcome;
 use crate::classes::Role;
 use crate::derive::{Device, Formatted, Measured, Stated, VolumeFacts};
 use crate::directory::Peer;
+use crate::history;
+use crate::layout::{Layout, LayoutError, Stopped};
 use crate::node::{
     GatewaySettings, Hosted, Link, Node, NodeError, NodeSettings, Status, Step, Wall,
 };
@@ -167,6 +170,8 @@ pub enum ProcessError {
     Start(Step, Box<ProcessError>),
     #[error("stopped at once: {0}")]
     Stopped(&'static str),
+    #[error("the node's history: {0}")]
+    History(String),
 }
 
 /// The signals that stop the node in order (node.md §1.7): SIGTERM, which a service manager or a
@@ -1309,8 +1314,19 @@ async fn serve(
     // synchronous calls (node.md §1.2).
     mantle_engine::store::permit_blocking();
     let volumes = storage.enlisting();
+    // The node's history (node.md §2.4, item 7): its last run and last orderly stop as its
+    // directory keeps them, read before the node raises its run, and what the root range's
+    // replica here holds of every node's.
+    let layout = Layout::new(&config.dir);
+    let kept = |e: LayoutError| step(Step::Storage)(ProcessError::History(e.to_string()));
+    let (last_run, last_stop) = (layout.run().map_err(kept)?, layout.stopped().map_err(kept)?);
+    let mut held = (History::default(), History::default());
     let mut ranges = Vec::with_capacity(config.ranges.len());
     for (group, layer) in &config.ranges {
+        let mut engine = engine(&config, *group, *layer).map_err(step(Step::Storage))?;
+        if *layer == Layer::Root {
+            held = cell_history(&mut engine, config.id).map_err(step(Step::Storage))?;
+        }
         ranges.push(Hosted {
             group: *group,
             range: Range {
@@ -1322,9 +1338,12 @@ async fn serve(
                 },
                 settings: config.settings,
             },
-            engine: engine(&config, *group, *layer).map_err(step(Step::Storage))?,
+            engine,
         });
     }
+    let (cell, row) = held;
+    let own = history::at_start(row, last_run, last_stop);
+    let history = history::cell_with(cell, row, own);
     let settings = NodeSettings {
         id: config.id,
         dir: config.dir.clone(),
@@ -1344,8 +1363,14 @@ async fn serve(
         read_asks: config.read_asks,
         wall: Wall::System,
         gateway,
+        history,
     };
     let mut node = Node::open(settings).await.map_err(opened)?;
+    let run = layout
+        .run()
+        .map_err(kept)?
+        .ok_or_else(|| step(Step::Storage)(ProcessError::History("no run kept".into())))?;
+    let started_ns = hyper_rt::futures::now_ns();
     // A buffer each way, a page each (hyper-rt `stdio`: a page is the natural chunk): the talk is
     // a line now and then, each far shorter.
     let talk = |e: String| step(Step::Network)(ProcessError::Runtime(e));
@@ -1355,12 +1380,20 @@ async fn serve(
     let mut output = hyper_rt::stdio::stdout(1, chunk).map_err(|e| talk(format!("{e:?}")))?;
     let (quic, plane) = node.addresses()?;
     say(&mut output, &format!("bound {quic} {plane}\n")).await?;
+    // What the node's failure detectors start from, and this node's part of it.
+    let line = format!(
+        "history {} {} {} {}\n",
+        history.exposure_ns, history.crashes, own.exposure_ns, own.crashes
+    );
+    say(&mut output, &line).await?;
     let held: Vec<u128> = node.volumes().map(|(id, _)| id).collect();
     for volume in held {
         say(&mut output, &format!("volume {volume:032x}\n")).await?;
     }
     // Its volumes enlisted by one command, asked until the root range answers it: the range's
     // laws, not a deadline of the node's, decide when.
+    // The node's statements of its history to the root range, once enlisted (node.md §2.4, item 7).
+    let mut living = Living::default();
     let mut enlisting = match &config.enlist {
         Some(e) => {
             let enlist = Command::Root(root::Command::Enlist(Enlist {
@@ -1463,9 +1496,15 @@ async fn serve(
             match outcome {
                 CommandOutcome::Answered(Answer::Root(root::Outcome::Enlisted)) => {
                     say(&mut output, "enlisted\n").await?;
+                    if let Some(e) = &config.enlist {
+                        living.state(&mut node, e.root, own, started_ns)?;
+                    }
                 }
                 other => return Err(ProcessError::Enlist(format!("{other:?}"))),
             }
+        }
+        if let Some(e) = &config.enlist {
+            living.take(&mut node, e.root, own, started_ns)?;
         }
         for (group, replaced) in node.take_replaced() {
             let line = format!(
@@ -1568,8 +1607,92 @@ async fn serve(
         }
         if node.stopped() {
             say(&mut output, "stopped\n").await?;
+            // Nothing the node holds is owed to the cell: its log and volumes close, and then the
+            // stop is kept, with the node's time run, so its next start counts no crash.
+            let ran_ns = hyper_rt::futures::now_ns().saturating_sub(started_ns);
+            drop(node);
+            let stopped = Stopped {
+                run,
+                exposure_ns: own.exposure_ns.saturating_add(ran_ns),
+                stops: last_stop.map_or(0, |s| s.stops).saturating_add(1),
+            };
+            layout
+                .keep_stopped(stopped)
+                .map_err(|e| ProcessError::History(e.to_string()))?;
             return Ok(());
         }
+    }
+}
+
+/// What the root range's replica holds of the cell's history, and of node `id`'s own: the sum over
+/// every node the table holds, and its row (node.md §2.4, item 7).
+fn cell_history<E: Engine>(engine: &mut E, id: u64) -> Result<(History, History), ProcessError> {
+    let meta = |e: mantle_meta::error::MetaError| ProcessError::History(e.to_string());
+    let nodes = root::census(engine).map_err(meta)?.nodes;
+    let nodes = usize::try_from(nodes).map_err(|e| ProcessError::History(e.to_string()))?;
+    Ok((
+        root::history(engine, nodes).map_err(meta)?,
+        root::history_of(engine, id).map_err(meta)?,
+    ))
+}
+
+/// The node's statements of its history to the root range (node.md §2.4, item 7): its totals once
+/// it has enlisted, and again each time its run's time has doubled since the last statement was
+/// answered, so a crash loses at most half of a run's time and a run of `t` states about
+/// `log2(t / first)` times, the first statement's own wait the unit; one statement out at a time.
+#[derive(Default)]
+struct Living {
+    out: Option<u64>,
+    /// When the next statement is due, in the run's time; none before the first is answered.
+    next_ns: Option<u64>,
+}
+
+impl Living {
+    /// States the node's totals now: what it began this run with, and the run's time so far.
+    fn state<E: Engine + 'static>(
+        &mut self,
+        node: &mut Node<E>,
+        root: u128,
+        own: History,
+        started_ns: u64,
+    ) -> Result<(), ProcessError> {
+        if self.out.is_some() {
+            return Ok(());
+        }
+        let ran_ns = hyper_rt::futures::now_ns().saturating_sub(started_ns);
+        let lived = Command::Root(root::Command::Lived(Lived {
+            node: node.id(),
+            exposure_ns: own.exposure_ns.saturating_add(ran_ns),
+            crashes: own.crashes,
+        }));
+        self.out = Some(node.command(root, lived, u64::MAX)?);
+        Ok(())
+    }
+
+    /// Takes the statement's answer, and states again once the run's time has doubled since.
+    fn take<E: Engine + 'static>(
+        &mut self,
+        node: &mut Node<E>,
+        root: u128,
+        own: History,
+        started_ns: u64,
+    ) -> Result<(), ProcessError> {
+        let ran_ns = hyper_rt::futures::now_ns().saturating_sub(started_ns);
+        if let Some(asked) = self.out
+            && let Some(outcome) = node.take_command(asked)
+        {
+            self.out = None;
+            match outcome {
+                CommandOutcome::Answered(Answer::Root(root::Outcome::Kept)) => {
+                    self.next_ns = Some(ran_ns.saturating_mul(2));
+                }
+                other => return Err(ProcessError::History(format!("{other:?}"))),
+            }
+        }
+        if self.next_ns.is_some_and(|next| ran_ns >= next) {
+            self.state(node, root, own, started_ns)?;
+        }
+        Ok(())
     }
 }
 

@@ -467,13 +467,26 @@ validity); and refuses no configuration, and a volume another process holds, at 
 plane or QUIC port another socket holds at its network step (hyper-rt-transport's listener binds its
 port before it shares it). A node whose peers have never answered heartbeats each every 3 s at most,
 not at its stream's floor with a flush each (hyper-liveness `f647365`). A cell
-of three made by `mantle init` rolls one node at a time, each handing its ranges over, started again
-from its directories, with no other member saying a range has no leader, and every object read back
-through every node after the roll, on two CPUs beside four busy loops and on one CPU. Remaining:
-`mantle init client`; Windows' console close and shutdown taken as requests to stop, which
-hyper-rt's handler now holds for the owner's stop; and a replicated range refusing puts at its
-engine's metadata share where its leader admits a command, since a refusal at apply would let members
-diverge.
+of three made by `mantle init` rolls one node at a time, each handing its ranges over, announcing its
+end to its peers' liveness streams and started again from its directories, with no other member
+saying a range has no leader, and every object read back through every node after the roll, on two
+CPUs beside two or four busy loops and on one CPU: on CI's busy runners 0 of 48 rounds failed of the
+serve suite and 0 of 48 of tests/node.rs (diag run 40170267351), where the roll failed 2 of 16 and the
+objects round trip 4 of 19. Their causes: a false suspicion between the two voters left in a range
+cost its leader, which hyper-raft's core no longer pays where acting on it cannot elect anyone
+(`d97153c`, model-checked); restarted nodes' detectors assumed an MTBF of their own seconds (§2.4
+item 7, the cell's history, now kept); and the transport refused a stream its reader took at its
+own pace as unread (hyper-raft `1912194`, ported)
+([measurements](measurements/2026-10-25-roll-on-a-busy-host.md)). Remaining: `mantle init client`;
+Windows' console close and shutdown taken as requests to stop, which hyper-rt's handler now holds
+for the owner's stop; a replicated range refusing puts at its engine's metadata share where its
+leader admits a command, since a refusal at apply would let members diverge; and hyper-raft's
+`cc5a65b` (a stop suspected as its announcement arrives, and answered, so a stop may announce before
+it hands over): taken by mantle, the roll failed both macOS CI runs (a member naming no leader for
+every range after a stop; branches `cell-land-cc5a65b`, `cell-land-announce-first`), to be traced
+before it lands. On macOS x86_64, which no CI target supports, tests/node.rs's replaced node of five
+fenced once on a snapshot its engine refused (`the engine refused a snapshot`), the engine's error
+not kept by the fence (`crates/range/src/stored.rs`).
 
 ## Planned, in order
 

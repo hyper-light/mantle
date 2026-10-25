@@ -51,7 +51,7 @@ jobs:
             grep -aE "^test .* (ok|FAILED)|test result" "round-$round.txt" || true
             if grep -aq "FAILED" "round-$round.txt"; then
               grep -a -A4 "panicked" "round-$round.txt" | cut -c1-400 || true
-              grep -a "diag-stall\|diag-test\|diag-client" "round-$round.txt" | cut -c1-400 || true
+              grep -a "diag-stall\|diag-test\|diag-client" "round-$round.txt" | grep -av "diag-stall judge\|diag-client [0-9]* ask.*answered" | cut -c1-700 || true
               grep -a "diag-node" "round-$round.txt" | grep -av "chunk replied" | tail -400 | cut -c1-400 || true
               grep -a "diag-node" "round-$round.txt" | grep -a "chunk replied" | tail -100 | cut -c1-300 || true
               break

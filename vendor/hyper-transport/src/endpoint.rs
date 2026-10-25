@@ -1116,10 +1116,13 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             Event::Request { exchange, .. }
             | Event::Reply { exchange, .. }
             | Event::Refused { exchange, .. } => self.core.exchanges.release(exchange.0),
-            Event::BodyReady { exchange } => self
-                .core
-                .exchanges
-                .release_with(exchange.0, |waiting| waiting.ready_waiting = false),
+            Event::BodyReady { exchange } => {
+                self.core.exchanges.release_with(exchange.0, |waiting| {
+                    waiting.ready_waiting = false;
+                    waiting.diag_read.polled = waiting.diag_read.polled.saturating_add(1);
+                    waiting.diag_read.last_polled = Some(std::time::Instant::now());
+                })
+            }
             Event::Writable { exchange } => self
                 .core
                 .exchanges
@@ -2608,6 +2611,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             answered: false,
             ready_sent: false,
             ready_waiting: false,
+            diag_read: crate::exchange::DiagRead::default(),
             wants_write: false,
             writable_sent: false,
             writable_waiting: false,
@@ -2673,9 +2677,16 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             In::Prefix => self.read_prefix(now, conn, id),
             In::Head => self.read_head(now, conn, id),
             In::Body => {
+                exchange.diag_read.readable = exchange.diag_read.readable.saturating_add(1);
+                exchange.diag_read.last_readable = Some(now);
                 if !exchange.ready_sent {
                     exchange.ready_sent = true;
+                    exchange.diag_read.pushed = exchange.diag_read.pushed.saturating_add(1);
+                    exchange.diag_read.last_pushed = Some(now);
                     self.push_body_ready(id);
+                } else {
+                    exchange.diag_read.suppressed =
+                        exchange.diag_read.suppressed.saturating_add(1);
                 }
                 Ok(false)
             }
@@ -2900,6 +2911,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
     ) -> Result<usize, Refusal> {
         let exchange = self.exchanges.get_mut(id).ok_or(Refusal::UnknownExchange)?;
         exchange.ready_sent = false;
+        exchange.diag_read.reads = exchange.diag_read.reads.saturating_add(1);
+        exchange.diag_read.last_read = Some(self.now);
         if exchange.incoming.state != In::Body {
             return match exchange.incoming.state {
                 In::Prefix | In::Head | In::Trailer | In::Whole | In::Finished => Ok(0),
@@ -2919,6 +2932,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             },
         );
         let taken = length(got);
+        if taken > 0 {
+            exchange.diag_read.bytes = exchange.diag_read.bytes.saturating_add(taken);
+            exchange.diag_read.last_took = Some(self.now);
+        } else {
+            exchange.diag_read.zero_reads = exchange.diag_read.zero_reads.saturating_add(1);
+        }
         exchange.starved = got < usize::try_from(room).unwrap_or(usize::MAX);
         incoming.left = incoming.left.saturating_sub(taken);
         exchange.carry.arrived(taken);
@@ -2984,6 +3003,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             answered: false,
             ready_sent: false,
             ready_waiting: false,
+            diag_read: crate::exchange::DiagRead::default(),
             wants_write: false,
             writable_sent: false,
             writable_waiting: false,
@@ -3475,6 +3495,25 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         let Some(exchange) = self.exchanges.remove(id) else {
             return;
         };
+        if let Some((refusal, _)) = failure
+            && matches!(exchange.incoming.state, In::Body | In::Trailer)
+        {
+            eprintln!(
+                "diag-stall reader-ended wall_ms={} pid={} peer={:?} opened={} refusal={refusal:?} began_ms={} in={:?} left={} starved={} ready_sent={} ready_waiting={} ended={} {}",
+                diag_wall_ms(),
+                std::process::id(),
+                exchange.peer,
+                exchange.opened,
+                self.now.saturating_duration_since(exchange.began).as_millis(),
+                exchange.incoming.state,
+                exchange.incoming.left,
+                exchange.starved,
+                exchange.ready_sent,
+                exchange.ready_waiting,
+                exchange.ended,
+                exchange.diag_read.said(std::time::Instant::now())
+            );
+        }
         if exchange.unread_since.is_some() {
             conn.unread = conn.unread.saturating_sub(1);
             conn.unread_ended = Some(self.now);

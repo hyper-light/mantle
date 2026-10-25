@@ -277,6 +277,8 @@ pub(crate) struct Exchange<K> {
     pub(crate) ready_sent: bool,
     /// A [`crate::Event::BodyReady`] waits in the queue, unpolled: another says nothing more.
     pub(crate) ready_waiting: bool,
+    /// DIAG (scratch): how its body's reading went.
+    pub(crate) diag_read: DiagRead,
     /// The owner was told it could not write all it offered; it hears [`crate::Event::Writable`]
     /// when it can write more.
     pub(crate) wants_write: bool,
@@ -300,4 +302,48 @@ pub(crate) struct Exchange<K> {
     /// A peer's exchange whose stream's credit its connection settled with the pool as its reply
     /// was finished (`Endpoint::settle_credit`): its end settles nothing again.
     pub(crate) credit_settled: bool,
+}
+
+/// DIAG (scratch): an exchange's reading, for a post-mortem when a failure ends it mid-body.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct DiagRead {
+    pub(crate) readable: u64,
+    pub(crate) pushed: u64,
+    pub(crate) suppressed: u64,
+    pub(crate) polled: u64,
+    pub(crate) reads: u64,
+    pub(crate) zero_reads: u64,
+    pub(crate) bytes: u64,
+    pub(crate) last_readable: Option<std::time::Instant>,
+    pub(crate) last_pushed: Option<std::time::Instant>,
+    pub(crate) last_polled: Option<std::time::Instant>,
+    pub(crate) last_read: Option<std::time::Instant>,
+    pub(crate) last_took: Option<std::time::Instant>,
+}
+
+impl DiagRead {
+    /// Each moment's age at `now`, in milliseconds.
+    pub(crate) fn said(&self, now: std::time::Instant) -> String {
+        let age = |at: Option<std::time::Instant>| {
+            at.map_or_else(
+                || "-".to_string(),
+                |at| now.saturating_duration_since(at).as_millis().to_string(),
+            )
+        };
+        format!(
+            "readable={} pushed={} suppressed={} polled={} reads={} zero_reads={} bytes={} ago_ms: readable={} pushed={} polled={} read={} took={}",
+            self.readable,
+            self.pushed,
+            self.suppressed,
+            self.polled,
+            self.reads,
+            self.zero_reads,
+            self.bytes,
+            age(self.last_readable),
+            age(self.last_pushed),
+            age(self.last_polled),
+            age(self.last_read),
+            age(self.last_took)
+        )
+    }
 }

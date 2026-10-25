@@ -402,6 +402,44 @@ fn a_node_asked_to_stop_hands_its_ranges_over_and_exits_well() {
     done(&made[0], "a bucket made after the stop");
 }
 
+/// A node's failure detectors start from the cell's history (node.md §2.4, item 7), as each
+/// process says at its start: the cell's node time run and crashes, and its own part, which its
+/// directory and the root range keep. A cell's first starts hold none; a node stopped in order and
+/// started again counts no crash and the time it ran; one killed and started again counts one, and
+/// the cell's history holds at least its own.
+#[test]
+fn a_node_started_again_starts_its_detectors_from_the_cells_history() {
+    let mut cell = Cell::made(three_founders);
+    let ids: Vec<u64> = cell.dirs.keys().copied().collect();
+    for &id in &ids {
+        let (whole, own) = cell.history(id);
+        assert_eq!(own.crashes, 0, "node {id}'s first run");
+        assert_eq!(own.exposure, Duration::ZERO, "node {id}'s first run");
+        assert_eq!(whole.crashes, 0, "node {id}'s first run");
+        cell.enlisted(id);
+    }
+    let (stopped, killed) = (ids[0], ids[1]);
+    let exited = cell.stop(stopped);
+    assert!(exited.success(), "node {stopped} exited {exited}");
+    cell.start(stopped);
+    let (whole, own) = cell.history(stopped);
+    assert_eq!(own.crashes, 0, "node {stopped} stopped in order");
+    assert!(own.exposure > Duration::ZERO, "node {stopped}'s time run");
+    assert!(
+        whole.exposure >= own.exposure && whole.crashes >= own.crashes,
+        "the cell's history {whole:?} holds node {stopped}'s {own:?}"
+    );
+    cell.introduce();
+    cell.kill(killed);
+    cell.start(killed);
+    let (whole, own) = cell.history(killed);
+    assert_eq!(own.crashes, 1, "node {killed} killed once");
+    assert!(
+        whole.crashes >= own.crashes,
+        "the cell's history {whole:?} holds node {killed}'s {own:?}"
+    );
+}
+
 /// A cell of three made by `mantle init` rolls one node at a time, highest id first as a
 /// StatefulSet rolls (Kubernetes' rolling update): each node stops in order and exits 0, every range
 /// it led as its stop began (`handing`) handed to a voter whose own status then says it leads, and

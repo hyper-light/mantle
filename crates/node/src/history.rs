@@ -23,6 +23,19 @@ pub fn at_start(held: History, last_run: Option<u64>, stopped: Option<Stopped>) 
     }
 }
 
+/// The stop record a directory keeps once none is: every start keeps one, so the record a start
+/// reads names the runs its counts begin from. A fresh directory's counts begin before its first
+/// run; one whose runs began before the record was kept counts none of them a crash, their ends
+/// being unknown, and its time run is what the root range holds.
+pub fn first_stop(last_run: Option<u64>, held: History) -> Stopped {
+    let runs = last_run.unwrap_or(0);
+    Stopped {
+        run: runs,
+        exposure_ns: held.exposure_ns,
+        stops: runs,
+    }
+}
+
 /// The cell's history with this node's own as it now stands: the root range's sum `cell`, which
 /// holds this node's row `held`, with `own` for it. Saturating, as the sum is.
 pub fn cell_with(cell: History, held: History, own: History) -> History {
@@ -79,6 +92,18 @@ mod tests {
         assert_eq!(at_start(h(90, 0), Some(2), stopped(1, 30, 1)), h(90, 1));
         // The root range told less than the stop kept: the statement was lost.
         assert_eq!(at_start(h(20, 0), Some(1), stopped(1, 30, 1)), h(30, 0));
+    }
+
+    #[test]
+    fn a_directory_without_a_stop_record_counts_from_its_next_run() {
+        // Fresh: its first run counts from zero, so a crash in it is one.
+        let first = first_stop(None, h(0, 0));
+        assert_eq!(at_start(h(0, 0), None, Some(first)), h(0, 0));
+        assert_eq!(at_start(h(0, 0), Some(1), Some(first)), h(0, 1));
+        // Runs before the record whose ends are unknown are no crashes; later ones count.
+        let older = first_stop(Some(5), h(70, 0));
+        assert_eq!(at_start(h(70, 0), Some(5), Some(older)), h(70, 0));
+        assert_eq!(at_start(h(70, 0), Some(6), Some(older)), h(70, 1));
     }
 
     #[test]

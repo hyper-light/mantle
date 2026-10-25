@@ -379,9 +379,12 @@ Remaining before it is done:
 - Elections by suspicion on hyper-raft's node-pair liveness stream (`hyper-liveness`, L-3): a node
   (`crates/node`) carries the stream for the ranges it hosts, which elect by suspicion over it,
   with the owner that holds its replicas, the datagram plane with kernel receive stamps, a durable
-  run, liveness writes on its log, and shard timers that measure their own lateness. Placement's
-  map of members to nodes and the cell's history for the detectors' prior are left
-  ([design](design/node.md) §2.4). A range hosted by no node elects on ticks.
+  run, liveness writes on its log, and shard timers that measure their own lateness, its detectors
+  starting from the cell's history: each node's time run and crashes in the root range, an orderly
+  stop no crash (node.md §2.4 item 7; before it a restarted node's MTBF was twice the seconds it had
+  run, [measurements](measurements/2026-10-25-roll-on-a-busy-host.md)). Placement's map of members
+  to nodes is left ([design](design/node.md) §2.4), and a node that enlists nothing keeps no history
+  of its own. A range hosted by no node elects on ticks.
 - Chunks a stopped gateway wrote for a block it never recorded, reconciled per volume once
   storage nodes run, and the collector's pacing against foreground latency (design §2, §6;
   docs/research/22 §10).

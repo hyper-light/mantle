@@ -326,6 +326,9 @@ pub(crate) enum Line {
     Volume(u128),
     /// The root range took the node's enlistment of itself and its volumes.
     Enlisted,
+    /// What the node's failure detectors start from (node.md §2.4, item 7): the cell's node time
+    /// run and crashes, and this node's part of them.
+    History(Lived, Lived),
     /// A value a `mantle serve` process runs with, said before it listens.
     Basis(Basis),
     /// The bytes the node's transfers moved, said as they move, and its transport's serve period:
@@ -343,6 +346,13 @@ pub(crate) enum Line {
     Stopped,
 }
 
+/// A history as a node says it: node time run and crashes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Lived {
+    pub(crate) exposure: Duration,
+    pub(crate) crashes: u64,
+}
+
 pub(crate) fn parse(line: &str) -> Option<Line> {
     if let Some(said) = line.strip_prefix("basis ") {
         return Basis::parse(said).map(Line::Basis);
@@ -358,6 +368,16 @@ pub(crate) fn parse(line: &str) -> Option<Line> {
         ["link", peer, rest @ ..] => Some(Line::Link(peer.parse().ok()?, rest.join(" "))),
         ["volume", id] => Some(Line::Volume(u128::from_str_radix(id, 16).ok()?)),
         ["enlisted"] => Some(Line::Enlisted),
+        ["history", cell_ns, cell_crashes, own_ns, own_crashes] => Some(Line::History(
+            Lived {
+                exposure: Duration::from_nanos(cell_ns.parse().ok()?),
+                crashes: cell_crashes.parse().ok()?,
+            },
+            Lived {
+                exposure: Duration::from_nanos(own_ns.parse().ok()?),
+                crashes: own_crashes.parse().ok()?,
+            },
+        )),
         ["stopping"] => Some(Line::Stopping),
         ["handing", group, to] => Some(Line::Handing(
             u128::from_str_radix(group, 16).ok()?,
@@ -437,6 +457,7 @@ pub(crate) fn movement(line: &Line) -> Option<(u64, u64, u64, u64, Duration, Dur
         | Line::Held(..)
         | Line::Volume(..)
         | Line::Enlisted
+        | Line::History(..)
         | Line::Basis(..)
         | Line::Moved(..)
         | Line::Stopping
@@ -798,6 +819,9 @@ pub(crate) struct Cell {
     pub(crate) stored: bool,
     pub(crate) volumes: BTreeMap<u64, u128>,
     pub(crate) enlisted: BTreeSet<u64>,
+    /// What each node's failure detectors started from as its latest process said: the cell's
+    /// history and its own part of it.
+    pub(crate) histories: BTreeMap<u64, (Lived, Lived)>,
     /// Each node's failure domain, where a test states another than its own name's.
     pub(crate) domains: BTreeMap<u64, String>,
     /// The node whose process the test started to be refused, and that process once it ended.
@@ -1061,6 +1085,7 @@ impl Cell {
             stored: true,
             volumes: BTreeMap::new(),
             enlisted: BTreeSet::new(),
+            histories: BTreeMap::new(),
             domains: BTreeMap::new(),
             refusing: None,
             refused: None,
@@ -1187,6 +1212,7 @@ impl Cell {
             stored,
             volumes: BTreeMap::new(),
             enlisted: BTreeSet::new(),
+            histories: BTreeMap::new(),
             domains: BTreeMap::new(),
             refusing: None,
             refused: None,
@@ -1218,6 +1244,8 @@ impl Cell {
     /// Starts node `id`'s process on its directory, its standard error to `stderr`, a thread
     /// forwarding its lines, and waits until it listens.
     pub(crate) fn spawn_process(&mut self, id: u64, stderr: Stdio) {
+        // What its last process said its detectors started from is that process's, not this one's.
+        self.histories.remove(&id);
         let config = self.config_of(id);
         let mut child = Command::new(NODE)
             .arg(if self.serving { "serve" } else { "node" })
@@ -1424,6 +1452,7 @@ impl Cell {
                 | Line::Held(..)
                 | Line::Volume(..)
                 | Line::Enlisted
+                | Line::History(..)
                 | Line::Basis(..)
                 | Line::Moved(..)
                 | Line::Stopping
@@ -1595,6 +1624,9 @@ impl Cell {
                     }
                     Line::Enlisted => {
                         self.enlisted.insert(id);
+                    }
+                    Line::History(cell, own) => {
+                        self.histories.insert(id, (cell, own));
                     }
                     Line::Stopping => {}
                     Line::Handing(group, to) => self.handing.push((id, group, to)),
@@ -1881,6 +1913,12 @@ impl Cell {
     }
 
     /// Waits until node `id`'s running process says the root range took its enlistment.
+    /// Waits until node `id`'s running process says what its failure detectors start from: the
+    /// cell's history and its own part of it.
+    pub(crate) fn history(&mut self, id: u64) -> (Lived, Lived) {
+        self.until(|c| c.histories.get(&id).copied())
+    }
+
     pub(crate) fn enlisted(&mut self, id: u64) {
         self.until(|c| {
             if c.enlisted.contains(&id) {

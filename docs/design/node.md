@@ -926,12 +926,13 @@ seven things the node does not have (§10, phases A and C):
    (`deadline`, `wake`) on the shards' timer wheels, and each wait for the stream's wake
    reported with the time it ended (`Liveness::on_wait`), from which the stream measures the
    owner's lateness `G`, the owner's own stalls included (timing.md §2.9).
-7. **The cell's history.** The restarts and abandoned suspicions of the cell's nodes, the
-   detectors' prior evidence on the time between failures (`Settings::history`), kept with the
-   cell's membership in the root range (§3.5, §7).
+7. **The cell's history.** The time the cell's nodes have run and their crashes, the runs that
+   ended without an orderly stop, the detectors' prior evidence on the time between failures
+   (`Settings::history`), kept with the cell's membership in the root range (§3.5, §7). An
+   orderly stop is not counted: it needs no detection, which is all the MTBF prices.
 
 *As built (2026-10-20).* A node's owner (`crates/node`) carries the stream for the ranges it
-hosts, and they elect by suspicion over it; items 1, 2, 4, 5 and 6 are built, 3 and 7 are not:
+hosts, and they elect by suspicion over it; items 1, 2, 4, 5, 6 and 7 are built, 3 is not:
 
 - (1) One task on a hyper-rt shard holds the shard's replicas in hyper-durable's `Owner`,
   attaches their pairs (`Owner::pairs`), takes each change to them (`Owner::believe`), and after
@@ -953,7 +954,28 @@ hosts, and they elect by suspicion over it; items 1, 2, 4, 5 and 6 are built, 3 
   device failed a write.
 - (6) Each range's next wake and the stream's are the task's deadlines, and a wait that ends at
   or past the stream's wake is reported (`Liveness::on_wait`).
-- (7) Each start begins with no history (`Exposure::new`); the root range does not keep it yet.
+- (7) The root range keeps each enlisted node's history: the time it has run over all its runs and
+  its runs that ended without an orderly stop (`root::Command::Lived`, a node stating its own
+  alone, the greater of each total kept, so a statement applied late or twice takes nothing back).
+  A node keeps its last orderly stop in its directory beside its run (`layout::Stopped`: the run,
+  the node's time run then, and its stops), written whole once the stop is done, its log and
+  volumes closed, and keeps one at a start that finds none, before it raises its run, naming the
+  runs its counts begin from: none for a fresh directory; for one whose runs began before the
+  record was kept, all of them, their ends unknown, so none is counted a crash. Runs are numbered
+  from one, so the runs before a start that did not stop in order, its crashes, are its last run
+  less its stops: exact however many statements crashes lost. At a start the process reads the root range's replica it hosts (an enlisting node hosts
+  the root range), sums every node's history (`root::history`, at most the table's nodes), takes
+  its own as its directory says, and gives the sum to its stream as `Settings::history`; it says
+  what it gave (`history CELL_NS CELL_CRASHES OWN_NS OWN_CRASHES`). Once enlisted it states its
+  totals, and again each time its run's time has doubled since the last statement was answered,
+  so a crash loses at most half a run's time and a run of `t` states about `log2(t/first)` times,
+  the first statement's wait the unit. An orderly stop is no crash: it hands its leadership over
+  and needs no detection, which is what the MTBF prices (hyper-raft `docs/timing.md` §2.2, the
+  crash term of `U`). Without it every start began with none, and a restarted node's MTBF was
+  `2T` over the seconds it had watched: on a busy host hyper-timing's configurator then plans a
+  false suspicion every few seconds a pair (MTBF 2 s: 2.1 to 4.8 s; an hour: 9 to 18 minutes;
+  `docs/measurements/2026-10-25-roll-on-a-busy-host.md`). A node that enlists nothing keeps no
+  history of its own and starts from the cell's where it hosts the root range.
 
 A range hosted by no node still elects on ticks with focal's counts, as above (replica.md §3). SWIM's place (§3.5) does not
 change with it: SWIM's word stays a hint for routing and repair, and the stream's is what a

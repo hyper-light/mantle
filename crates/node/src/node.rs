@@ -48,6 +48,7 @@ use hyper_transport::{
 use mantle_chunk::ChunkKey;
 use mantle_meta::apply::Layer;
 use mantle_meta::engine::Engine;
+use mantle_meta::record::History;
 use mantle_meta::wire::{Answer, Command, Entry, MAX_BUCKET, MAX_KEY};
 use mantle_range::membership::{Next, Replacement};
 use mantle_range::{Applied, Elections, GroupStore, LogStore, Range, RangeMachine, ReplicaError};
@@ -129,6 +130,10 @@ pub struct NodeSettings<E> {
     /// The gateway host's settings, for a node that answers object exchanges (node.md §4–§5);
     /// none for one that refuses them.
     pub gateway: Option<GatewaySettings>,
+    /// The cell's history as the node starts: every node's time run and crashes, its own as its
+    /// directory says (node.md §2.4, item 7), the prior evidence its failure detectors' MTBF starts
+    /// from (`hyper_liveness::Settings::history`).
+    pub history: History,
 }
 
 /// The wall clock a node stamps each entry it proposes with, nanoseconds since the Unix epoch: the
@@ -874,7 +879,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             local: settings.id,
             run,
             max_peers: settings.peers.len().max(1),
-            history: Exposure::new(),
+            history: Exposure::of(
+                Duration::from_nanos(settings.history.exposure_ns),
+                settings.history.crashes,
+            ),
             resolution: Duration::from_nanos(hyper_rt::machine::clock::resolution_ns()),
         })
         .map_err(|e| at(Step::Network)(NodeError::Liveness(e)))?;

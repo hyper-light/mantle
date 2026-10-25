@@ -1627,6 +1627,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.send_waiting(peer);
                 Ok(())
             }
+            // An exchange the transport ended after queueing its request or reply, its connection
+            // lost or its stream stopped by the peer, holds no head: the refusal queued behind the
+            // event ends it, as it ends any exchange lost (hyper-transport: an exchange's events
+            // hold its slot, removed or not). Its head is never read as an empty one.
+            Event::Request { exchange, .. } | Event::Reply { exchange, .. }
+                if self.driver.endpoint().head(exchange).is_none() =>
+            {
+                Ok(())
+            }
             Event::Request {
                 exchange,
                 peer,

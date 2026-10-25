@@ -5,9 +5,15 @@
 //! its rounds), the range still this node's, is begun again, to another voter where there is one:
 //! on a loaded host a target can take longer than the core's rounds to campaign, and a range left
 //! as it was would elect only after this node is gone, with no leader meanwhile, the gap the
-//! stop is for. The stop's bound ends the tries. Then it tells its peers' liveness streams the run
-//! ends in order (hyper-liveness `Liveness::stop`: its restart no failure, the run sent nothing
-//! more), takes no connection, closes each it holds
+//! stop is for. The stop's bound ends the tries. Before it hands anything over, its members still
+//! running, it announces to its peers' liveness streams that the run ends in order (hyper-liveness
+//! `Liveness::stop`) and waits until each peer it shares a group with answered (`stop_taken`) or is
+//! suspected: a peer that answered holds this node out of its groups' quorums, so each group keeps
+//! the degraded group's rule from before its new leader is named, and a false suspicion between the
+//! two voters left costs no leadership (hyper-raft `docs/timing.md` §2.9, "A voter's stop
+//! announced"); its restart counts no failure, and the run is sent nothing more. A peer this node
+//! suspects cannot answer, and the stop does not wait on it. Then it takes no connection, closes
+//! each it holds
 //! and keeps each in its closing state until it drains (RFC 9000 §10.2: the node keeps the socket
 //! its peers know, and answers their late packets). Each turn steps it ([`Node::step_stop`]); once
 //! it is done ([`Node::stopped`]) nothing the node holds is owed to the cell, and its process closes
@@ -16,6 +22,7 @@
 use std::net::SocketAddr;
 
 use hyper_durable::Handle;
+use hyper_timing::Trust;
 use hyper_transport::PeerId;
 use mantle_meta::engine::Engine;
 
@@ -25,6 +32,8 @@ use super::{Node, NodeError, NodeLog};
 pub(super) enum Stopping {
     /// Object operations running end; none begins.
     Objects,
+    /// The run's end announced, each peer it shares a group with yet to answer or be suspected.
+    Announcing,
     /// Each led range's lead handed over: the ranges whose transfer is out, each by its group and
     /// the voter it goes to.
     Handing(Vec<(u128, u64)>),
@@ -76,17 +85,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Ok(());
         };
         let next = match stopping {
-            Stopping::Objects if self.jobs.is_empty() => Stopping::Handing(self.hand_over()),
+            Stopping::Objects if self.jobs.is_empty() => {
+                // Queued now, so this turn's plane sends it.
+                self.liveness
+                    .stop(hyper_rt::futures::now_ns(), &mut self.asked);
+                self.act_on_liveness()?;
+                Stopping::Announcing
+            }
+            Stopping::Announcing if self.announced() => Stopping::Handing(self.hand_over()),
             Stopping::Handing(out) => {
                 let out = self.handing(out);
                 if out.is_empty() {
-                    // Every range handed over: the stop's last act on the plane tells each peer
-                    // this run ends in order, so its next run is no failure in their MTBF's
-                    // evidence and they send this one nothing more (hyper-liveness
-                    // `Liveness::stop`), queued now so this turn's plane sends it.
-                    self.liveness
-                        .stop(hyper_rt::futures::now_ns(), &mut self.asked);
-                    self.act_on_liveness()?;
                     self.refuse_connections()?;
                     Stopping::Closing
                 } else {
@@ -105,6 +114,18 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         self.stopping = Some(next);
         Ok(())
+    }
+
+    /// Whether each peer this node shares a group with answered the run's announced end, or is
+    /// suspected: one judged silent cannot answer, and a stop that waited on it would wait for its
+    /// bound.
+    fn announced(&self) -> bool {
+        self.remotes
+            .iter()
+            .all(|remote| match self.liveness.trust(remote.id) {
+                None | Some(Trust::Suspected) => true,
+                Some(_) => self.liveness.stop_taken(remote.id),
+            })
     }
 
     /// Hands each range this node leads to a voter ([`Node::transfer_lead`]): the ranges whose

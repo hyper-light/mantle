@@ -663,7 +663,15 @@ and a `stop` line on standard input, each ask it; the first request begins it, t
 (stated; unstated, docker stop's default grace period for a Linux container, 10 s, the shortest of
 the orchestrators' defaults, so a default stop ends before their SIGKILL), and a second request, or
 the bound passing, ends the process at once, as a crash would. The node says `stopping`, answers
-each new object exchange `SlowDown` and waits for those running to end; transfers each range it
+each new object exchange `SlowDown` and waits for those running to end; announces to its peers'
+liveness streams that its run ends, its members still running (hyper-liveness `Liveness::stop`),
+and waits until each peer it shares a group with answered (`stop_taken`) or is suspected, a peer
+judged silent being one that cannot answer: a peer that answered holds the node out of its groups'
+quorums, so each group keeps the degraded group's rule from before its new leader is named and a
+false suspicion between the two voters left costs no leadership (hyper-raft `docs/timing.md` §2.9,
+"A voter's stop announced"; its model's stop configurations hold it, and refuse a hand-over made
+before the answers), the node's next run counts no failure in their MTBF's evidence (§2.4 item 7),
+and the run is sent nothing more; transfers each range it
 leads to the voter caught up with it, else the one whose log holds most, which the core first brings
 up to its own (`handing GROUP TO`); waits until its member learns another leads (`handed GROUP
 LEADER`), through an election under way to its winner. A transfer the core gives up, its rounds

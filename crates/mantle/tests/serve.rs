@@ -103,7 +103,14 @@ fn a_cell_served_from_stated_keys_alone_says_each_values_basis_and_serves_object
         );
     }
 
-    let made = cell.objects(vec![(1, Op::Create { bucket: "b".into() }, Vec::new())]);
+    let made = cell.objects(vec![(
+        1,
+        Op::Create {
+            bucket: "b".into(),
+            id: 1,
+        },
+        Vec::new(),
+    )]);
     done(&made[0], "the bucket");
     let objects: Vec<(String, Vec<u8>)> = (0u64..)
         .zip([0usize, 1, 65_537, 3 << 20])
@@ -113,12 +120,7 @@ fn a_cell_served_from_stated_keys_alone_says_each_values_basis_and_serves_object
         .iter()
         .enumerate()
         .map(|(n, (key, data))| {
-            let op = Op::Put {
-                bucket: "b".into(),
-                key: key.clone(),
-                id: n as u128 + 1,
-                length: data.len() as u64,
-            };
+            let op = put_op("b", key, n as u128 + 1, data.len() as u64);
             (1 + n as u64 % NODES, op, data.clone())
         })
         .collect();
@@ -159,15 +161,7 @@ fn a_cell_served_from_stated_keys_alone_says_each_values_basis_and_serves_object
     assert_eq!(values(again), values(&first[&1]));
     let gets = objects
         .iter()
-        .map(|(key, _)| {
-            let get = Op::Get {
-                bucket: "b".into(),
-                key: key.clone(),
-                offset: 0,
-                len: u64::MAX,
-            };
-            (1, get, Vec::new())
-        })
+        .map(|(key, _)| (1, get_op("b", key, None), Vec::new()))
         .collect();
     for (outcome, (key, data)) in cell.objects(gets).iter().zip(&objects) {
         assert!(done(outcome, key) == *data, "{key}: other bytes");
@@ -179,7 +173,10 @@ fn a_cell_served_from_stated_keys_alone_says_each_values_basis_and_serves_object
 fn objects_round_trip(cell: &mut Cell, through: &[u64], back: &dyn Fn(usize) -> u64) {
     let made = cell.objects(vec![(
         through[0],
-        Op::Create { bucket: "b".into() },
+        Op::Create {
+            bucket: "b".into(),
+            id: 1,
+        },
         Vec::new(),
     )]);
     done(&made[0], "the bucket");
@@ -191,12 +188,7 @@ fn objects_round_trip(cell: &mut Cell, through: &[u64], back: &dyn Fn(usize) -> 
         .iter()
         .enumerate()
         .map(|(n, (key, data))| {
-            let op = Op::Put {
-                bucket: "b".into(),
-                key: key.clone(),
-                id: n as u128 + 1,
-                length: data.len() as u64,
-            };
+            let op = put_op("b", key, n as u128 + 1, data.len() as u64);
             (through[n % through.len()], op, data.clone())
         })
         .collect();
@@ -206,15 +198,7 @@ fn objects_round_trip(cell: &mut Cell, through: &[u64], back: &dyn Fn(usize) -> 
     let gets = objects
         .iter()
         .enumerate()
-        .map(|(n, (key, _))| {
-            let get = Op::Get {
-                bucket: "b".into(),
-                key: key.clone(),
-                offset: 0,
-                len: u64::MAX,
-            };
-            (back(n), get, Vec::new())
-        })
+        .map(|(n, (key, _))| (back(n), get_op("b", key, None), Vec::new()))
         .collect();
     for (outcome, (key, data)) in cell.objects(gets).iter().zip(&objects) {
         assert!(done(outcome, key) == *data, "{key}: other bytes");
@@ -324,28 +308,26 @@ fn a_node_asked_to_stop_hands_its_ranges_over_and_exits_well() {
     }
     let made = cell.objects(vec![(
         ids[0],
-        Op::Create { bucket: "b".into() },
+        Op::Create {
+            bucket: "b".into(),
+            id: 1,
+        },
         Vec::new(),
     )]);
     done(&made[0], "the bucket");
     let bytes = |n: usize| object_bytes(u64::try_from(n).unwrap(), 65_537);
     let put = |n: usize, through: u64| {
         let data = bytes(n);
-        let op = Op::Put {
-            bucket: "b".into(),
-            key: format!("o{n}"),
-            id: u128::try_from(n).unwrap() + 1,
-            length: data.len() as u64,
-        };
+        let op = put_op(
+            "b",
+            &format!("o{n}"),
+            u128::try_from(n).unwrap() + 1,
+            data.len() as u64,
+        );
         (through, op, data)
     };
     let get = |n: usize, through: u64| {
-        let op = Op::Get {
-            bucket: "b".into(),
-            key: format!("o{n}"),
-            offset: 0,
-            len: u64::MAX,
-        };
+        let op = get_op("b", &format!("o{n}"), None);
         (through, op, Vec::new())
     };
     let before: Vec<usize> = (0..3).collect();
@@ -396,7 +378,10 @@ fn a_node_asked_to_stop_hands_its_ranges_over_and_exits_well() {
     }
     let made = cell.objects(vec![(
         others[0],
-        Op::Create { bucket: "c".into() },
+        Op::Create {
+            bucket: "c".into(),
+            id: 1,
+        },
         Vec::new(),
     )]);
     done(&made[0], "a bucket made after the stop");
@@ -459,28 +444,26 @@ fn a_cell_made_by_init_rolls_one_node_at_a_time_and_reads_every_object_back() {
     let volumes: BTreeMap<u64, u128> = ids.iter().map(|&id| (id, cell.volume(id))).collect();
     let made = cell.objects(vec![(
         ids[0],
-        Op::Create { bucket: "b".into() },
+        Op::Create {
+            bucket: "b".into(),
+            id: 1,
+        },
         Vec::new(),
     )]);
     done(&made[0], "the bucket");
     let bytes = |n: usize| object_bytes(u64::try_from(n).unwrap(), 65_537);
     let put = |n: usize, through: u64| {
         let data = bytes(n);
-        let op = Op::Put {
-            bucket: "b".into(),
-            key: format!("o{n}"),
-            id: u128::try_from(n).unwrap() + 1,
-            length: data.len() as u64,
-        };
+        let op = put_op(
+            "b",
+            &format!("o{n}"),
+            u128::try_from(n).unwrap() + 1,
+            data.len() as u64,
+        );
         (through, op, data)
     };
     let get = |n: usize, through: u64| {
-        let op = Op::Get {
-            bucket: "b".into(),
-            key: format!("o{n}"),
-            offset: 0,
-            len: u64::MAX,
-        };
+        let op = get_op("b", &format!("o{n}"), None);
         (through, op, Vec::new())
     };
     let before: Vec<usize> = (0..ids.len()).collect();
@@ -920,4 +903,702 @@ fn a_cell_of_three_made_by_init_from_a_file_and_a_flag_serves_objects() {
     }
     let back = ids.clone();
     objects_round_trip(&mut cell, &ids, &|n| back[(n + 1) % back.len()]);
+}
+
+/// One operation asked of `node` by the writer client, and its reply and bytes.
+fn ask(cell: &mut Cell, node: u64, op: Op, data: Vec<u8>) -> (Reply, Vec<u8>) {
+    let got = cell.objects(vec![(node, op, data)]);
+    replied(&got[0], "the operation")
+}
+
+/// The status alone of one operation asked of `node`.
+fn status(cell: &mut Cell, node: u64, op: Op) -> ObjectStatus {
+    ask(cell, node, op, Vec::new()).0.status
+}
+
+/// Headers of S3's preconditions and range, each named or not.
+fn headers(
+    if_match: Option<&str>,
+    if_none_match: Option<&str>,
+    if_modified_since: Option<&str>,
+    if_unmodified_since: Option<&str>,
+    range: Option<&str>,
+) -> Headers {
+    Headers {
+        if_match: if_match.map(Into::into),
+        if_none_match: if_none_match.map(Into::into),
+        if_modified_since: if_modified_since.map(Into::into),
+        if_unmodified_since: if_unmodified_since.map(Into::into),
+        range: range.map(Into::into),
+    }
+}
+
+fn put_with(bucket: &str, key: &str, id: u128, data: &[u8], headers: Headers) -> Op {
+    Op::Put {
+        bucket: bucket.into(),
+        key: key.into(),
+        id,
+        length: data.len() as u64,
+        headers,
+        checksum: None,
+        md5: None,
+    }
+}
+
+fn get_with(bucket: &str, key: &str, headers: Headers) -> Op {
+    Op::Get {
+        bucket: bucket.into(),
+        key: key.into(),
+        headers,
+    }
+}
+
+fn head_with(bucket: &str, key: &str, headers: Headers) -> Op {
+    Op::Head {
+        bucket: bucket.into(),
+        key: key.into(),
+        headers,
+    }
+}
+
+fn delete_with(bucket: &str, key: &str, id: u128, if_match: Option<&str>) -> Op {
+    Op::Delete {
+        bucket: bucket.into(),
+        key: key.into(),
+        id,
+        headers: headers(if_match, None, None, None, None),
+    }
+}
+
+/// S3's ETag of a single PUT's bytes: their MD5, in hex (05 §5.1).
+fn etag_of(data: &[u8]) -> String {
+    let md5 = mantle_s3::checksum::checksum(mantle_s3::checksum::Algorithm::Md5, data).unwrap();
+    mantle_s3::checksum::etag(&md5.bytes.try_into().unwrap())
+}
+
+/// The pages of ListObjectsV2 of `bucket`'s keys under `prefix`, each asked of the next node in
+/// turn and resumed where the last said, and every key and common prefix they listed, in order.
+fn listed(
+    cell: &mut Cell,
+    bucket: &str,
+    prefix: &str,
+    delimiter: &str,
+    max_keys: u32,
+) -> (usize, Vec<String>, Vec<String>) {
+    let (mut pages, mut keys, mut prefixes) = (0, Vec::new(), Vec::new());
+    let mut start = None;
+    loop {
+        let node = 1 + pages as u64 % NODES;
+        let op = Op::List(List {
+            bucket: bucket.into(),
+            prefix: prefix.into(),
+            delimiter: delimiter.into(),
+            start: start.take(),
+            max_keys,
+            fetch_owner: true,
+        });
+        let (reply, _) = ask(cell, node, op, Vec::new());
+        assert_eq!(reply.status, ObjectStatus::Done, "page {pages}");
+        let Some(Listing::Keys(page)) = reply.listing else {
+            panic!("page {pages}: {reply:?}");
+        };
+        assert!(page.contents.len() + page.common_prefixes.len() <= max_keys as usize);
+        assert!(
+            page.contents
+                .iter()
+                .all(|l| l.owner.as_deref() == Some(CLIENT.to_string().as_str())),
+            "page {pages}: owners"
+        );
+        pages += 1;
+        keys.extend(page.contents.into_iter().map(|l| l.key));
+        prefixes.extend(page.common_prefixes);
+        if !page.truncated {
+            return (pages, keys, prefixes);
+        }
+        start = page.next;
+        assert!(
+            start.is_some(),
+            "a truncated page says where the next starts"
+        );
+    }
+}
+
+/// Through each node of a cell of three `mantle serve` processes, S3's object and bucket
+/// operations answer as S3 does for each case research/05 records: a conditional write judged as
+/// it commits (05 §2.2), a conditional read in RFC 9110's order with its 304 and 412 (05 §2.4), a
+/// checksum and a `Content-MD5` checked before anything commits (05 §3.2), ranges (05 §12), heads,
+/// deletes and stacked delete markers in a versioned bucket (05 §7.3–§7.4), `404 NoSuchKey` and
+/// `NoSuchBucket`, another principal's bucket refused, and a bucket deleted only once empty (05
+/// §10.5). A listing of more keys than one page holds, paged by token through every node in turn,
+/// lists every key exactly once.
+#[test]
+fn s3s_operations_answer_as_s3_does_through_every_node() {
+    use mantle_meta::record::{self, Versioning};
+    use mantle_s3::checksum::{self, Algorithm};
+    use mantle_s3::list::Resume;
+
+    let mut cell = Cell::served(NODES);
+    for id in 1..=NODES {
+        cell.enlisted(id);
+    }
+    let other = CLIENT + 1;
+    let create = |bucket: &str| Op::Create {
+        bucket: bucket.into(),
+        id: 0,
+    };
+    let head_bucket = |bucket: &str| Op::HeadBucket {
+        bucket: bucket.into(),
+    };
+    let buckets = || Op::ListBuckets {
+        prefix: String::new(),
+        after: None,
+        max: 10,
+    };
+    let listed_buckets = |reply: Reply| match reply.listing {
+        Some(Listing::Buckets(page)) => page.buckets.into_iter().map(|(n, _)| n).collect(),
+        _ => panic!("{reply:?}"),
+    };
+
+    // Buckets: made once, headed and listed through every node; another principal's refused.
+    assert_eq!(status(&mut cell, 1, create("b")), ObjectStatus::Done);
+    assert_eq!(
+        status(&mut cell, 2, create("b")),
+        ObjectStatus::BucketAlreadyOwnedByYou
+    );
+    for node in 1..=NODES {
+        assert_eq!(
+            status(&mut cell, node, head_bucket("b")),
+            ObjectStatus::Done
+        );
+        assert_eq!(
+            status(&mut cell, node, head_bucket("nope")),
+            ObjectStatus::NoSuchBucket
+        );
+        let names: Vec<String> = listed_buckets(ask(&mut cell, node, buckets(), Vec::new()).0);
+        assert_eq!(names, ["b"]);
+    }
+    let theirs = cell.objects_as(
+        other,
+        vec![
+            (1, create("b"), Vec::new()),
+            (2, head_bucket("b"), Vec::new()),
+            (
+                3,
+                Op::DeleteBucket {
+                    bucket: "b".into(),
+                    id: 1,
+                },
+                Vec::new(),
+            ),
+            (1, buckets(), Vec::new()),
+        ],
+    );
+    let theirs: Vec<Reply> = theirs.iter().map(|o| replied(o, "theirs").0).collect();
+    assert_eq!(theirs[0].status, ObjectStatus::BucketAlreadyExists);
+    assert_eq!(theirs[1].status, ObjectStatus::AccessDenied);
+    assert_eq!(theirs[2].status, ObjectStatus::AccessDenied);
+    assert!(listed_buckets(theirs[3].clone()).is_empty());
+
+    // Conditional writes, judged as each commits, through every node.
+    let bytes = |n: u64, len: usize| object_bytes(n, len);
+    let quoted = |etag: &str| format!("\"{etag}\"");
+    for node in 1..=NODES {
+        let key = format!("c{node}");
+        let first = bytes(node, 1_000);
+        let create_only = headers(None, Some("*"), None, None, None);
+        let (made, _) = ask(
+            &mut cell,
+            node,
+            put_with(
+                "b",
+                &key,
+                u128::from(node) * 10,
+                &first,
+                create_only.clone(),
+            ),
+            first.clone(),
+        );
+        assert_eq!(made.status, ObjectStatus::Done);
+        assert_eq!(made.etag, etag_of(&first));
+        assert_eq!(made.version, "null");
+        let again = put_with("b", &key, u128::from(node) * 10 + 1, &first, create_only);
+        assert_eq!(
+            ask(&mut cell, node, again, first.clone()).0.status,
+            ObjectStatus::PreconditionFailed
+        );
+        let second = bytes(node + 10, 1_000);
+        let wrong = headers(Some("\"0123\""), None, None, None, None);
+        let swap = put_with("b", &key, u128::from(node) * 10 + 2, &second, wrong);
+        assert_eq!(
+            ask(&mut cell, node, swap, second.clone()).0.status,
+            ObjectStatus::PreconditionFailed
+        );
+        let right = headers(Some(&quoted(&made.etag)), None, None, None, None);
+        let swap = put_with("b", &key, u128::from(node) * 10 + 3, &second, right);
+        let (swapped, _) = ask(&mut cell, node, swap, second.clone());
+        assert_eq!(swapped.status, ObjectStatus::Done);
+        assert_eq!(swapped.etag, etag_of(&second));
+        let missing = headers(Some("*"), None, None, None, None);
+        let absent = put_with(
+            "b",
+            &format!("m{node}"),
+            u128::from(node) * 10 + 4,
+            &second,
+            missing,
+        );
+        assert_eq!(
+            ask(&mut cell, node, absent, second.clone()).0.status,
+            ObjectStatus::NoSuchKey
+        );
+        let (_, read) = ask(
+            &mut cell,
+            1 + node % NODES,
+            get_op("b", &key, None),
+            Vec::new(),
+        );
+        assert!(read == second, "{key}: the swapped bytes");
+    }
+
+    // A checksum and a Content-MD5, each checked before anything commits.
+    let summed = bytes(70, 70_000);
+    let crc = checksum::checksum(Algorithm::Crc32c, &summed).unwrap();
+    let with_sum = |id: u128, sum: checksum::Checksum, md5: Option<[u8; 16]>| Op::Put {
+        bucket: "b".into(),
+        key: "sum".into(),
+        id,
+        length: summed.len() as u64,
+        headers: Headers::default(),
+        checksum: Some(sum),
+        md5,
+    };
+    let (kept, _) = ask(
+        &mut cell,
+        2,
+        with_sum(700, crc.clone(), None),
+        summed.clone(),
+    );
+    assert_eq!(kept.status, ObjectStatus::Done);
+    assert_eq!(
+        kept.checksum,
+        Some(record::Checksum {
+            algorithm: Algorithm::Crc32c.code(),
+            parts: 0,
+            value: crc.bytes.clone(),
+        })
+    );
+    let bad = checksum::Checksum {
+        algorithm: Algorithm::Crc32c,
+        bytes: vec![0; 4],
+    };
+    let other_bytes = bytes(71, 70_000);
+    assert_eq!(
+        ask(&mut cell, 3, with_sum(701, bad, None), other_bytes.clone())
+            .0
+            .status,
+        ObjectStatus::BadDigest
+    );
+    let md5 = checksum::checksum(Algorithm::Md5, &summed).unwrap();
+    let wrong_md5 = Some([7u8; 16]);
+    let wrong_sum = checksum::checksum(Algorithm::Crc32c, &other_bytes).unwrap();
+    assert_eq!(
+        ask(
+            &mut cell,
+            1,
+            with_sum(702, wrong_sum, wrong_md5),
+            other_bytes
+        )
+        .0
+        .status,
+        ObjectStatus::BadDigest
+    );
+    let (_, read) = ask(&mut cell, 1, get_op("b", "sum", None), Vec::new());
+    assert!(read == summed, "nothing a refused put sent committed");
+    let right_md5 = Some(<[u8; 16]>::try_from(md5.bytes.as_slice()).unwrap());
+    assert_eq!(
+        ask(
+            &mut cell,
+            3,
+            with_sum(703, crc.clone(), right_md5),
+            summed.clone()
+        )
+        .0
+        .status,
+        ObjectStatus::Done
+    );
+
+    // Heads and conditional reads, in RFC 9110's order, through every node.
+    let (current, _) = ask(
+        &mut cell,
+        1,
+        head_with("b", "c1", Headers::default()),
+        Vec::new(),
+    );
+    assert_eq!(current.status, ObjectStatus::Done);
+    assert_eq!(current.size, 1_000);
+    assert!(current.modified > 0 && current.version == "null" && !current.marker);
+    let etag = quoted(&current.etag);
+    let (past, future) = (
+        "Sat, 01 Jan 1994 00:00:00 GMT",
+        "Fri, 01 Jan 2100 00:00:00 GMT",
+    );
+    let cases = [
+        (
+            headers(None, Some(&etag), None, None, None),
+            ObjectStatus::NotModified,
+        ),
+        (
+            headers(Some("\"0123\""), None, None, None, None),
+            ObjectStatus::PreconditionFailed,
+        ),
+        // AWS's first combination: If-Match true and If-Unmodified-Since false is 200 (05 §2.4).
+        (
+            headers(Some(&etag), None, None, Some(past), None),
+            ObjectStatus::Done,
+        ),
+        // Its second: If-None-Match false and If-Modified-Since true is 304.
+        (
+            headers(None, Some(&etag), Some(past), None, None),
+            ObjectStatus::NotModified,
+        ),
+        (
+            headers(None, None, Some(future), None, None),
+            ObjectStatus::NotModified,
+        ),
+        (
+            headers(None, None, Some(past), None, None),
+            ObjectStatus::Done,
+        ),
+        (
+            headers(None, None, None, Some(past), None),
+            ObjectStatus::PreconditionFailed,
+        ),
+        (
+            headers(None, None, None, Some(future), None),
+            ObjectStatus::Done,
+        ),
+        (
+            headers(None, Some("\"0123\""), None, None, None),
+            ObjectStatus::Done,
+        ),
+    ];
+    for node in 1..=NODES {
+        for (n, (h, expected)) in cases.iter().enumerate() {
+            let (reply, read) = ask(&mut cell, node, get_with("b", "c1", h.clone()), Vec::new());
+            assert_eq!(reply.status, *expected, "node {node}, case {n}");
+            if *expected == ObjectStatus::NotModified {
+                // A 304 carries the ETag (05 §2.4), and no bytes.
+                assert_eq!(reply.etag, current.etag, "node {node}, case {n}");
+                assert!(read.is_empty());
+            }
+            let (headed, _) = ask(&mut cell, node, head_with("b", "c1", h.clone()), Vec::new());
+            assert_eq!(headed.status, *expected, "head: node {node}, case {n}");
+        }
+    }
+
+    // Ranges, resolved against the version's size (05 §12).
+    let ten: Vec<u8> = (0u8..10).collect();
+    assert_eq!(
+        ask(&mut cell, 3, put_op("b", "ten", 800, 10), ten.clone())
+            .0
+            .status,
+        ObjectStatus::Done
+    );
+    assert_eq!(
+        ask(&mut cell, 1, put_op("b", "empty", 801, 0), Vec::new())
+            .0
+            .status,
+        ObjectStatus::Done
+    );
+    let ranged = |range: &str| headers(None, None, None, None, Some(range));
+    for (node, (range, served)) in (1u64..).zip([
+        ("bytes=3-6", Some((3u64, 6u64))),
+        ("bytes=-4", Some((6, 9))),
+        ("bytes=8-", Some((8, 9))),
+        ("bytes=3-99", Some((3, 9))),
+        ("bytes=a-b", None),
+    ]) {
+        let node = 1 + node % NODES;
+        let (reply, read) = ask(
+            &mut cell,
+            node,
+            get_with("b", "ten", ranged(range)),
+            Vec::new(),
+        );
+        assert_eq!(reply.status, ObjectStatus::Done, "{range}");
+        assert_eq!(reply.range, served, "{range}");
+        assert_eq!(reply.size, 10, "{range}");
+        let (first, last) = served.unwrap_or((0, 9));
+        let (first, last) = (
+            usize::try_from(first).unwrap(),
+            usize::try_from(last).unwrap(),
+        );
+        assert_eq!(read, ten[first..=last], "{range}");
+        let (headed, none) = ask(
+            &mut cell,
+            node,
+            head_with("b", "ten", ranged(range)),
+            Vec::new(),
+        );
+        assert_eq!((headed.status, headed.range), (ObjectStatus::Done, served));
+        assert!(none.is_empty());
+    }
+    let (past_end, _) = ask(
+        &mut cell,
+        2,
+        get_with("b", "ten", ranged("bytes=10-")),
+        Vec::new(),
+    );
+    assert_eq!(
+        (past_end.status, past_end.size),
+        (ObjectStatus::InvalidRange, 10)
+    );
+    assert_eq!(
+        ask(
+            &mut cell,
+            2,
+            get_with("b", "empty", ranged("bytes=0-")),
+            Vec::new()
+        )
+        .0
+        .status,
+        ObjectStatus::InvalidRange
+    );
+    let (whole, none) = ask(&mut cell, 2, get_op("b", "empty", None), Vec::new());
+    assert_eq!((whole.status, whole.size), (ObjectStatus::Done, 0));
+    assert!(none.is_empty());
+
+    // A key, or a bucket, that is not there.
+    for node in 1..=NODES {
+        assert_eq!(
+            status(&mut cell, node, get_op("b", "none", None)),
+            ObjectStatus::NoSuchKey
+        );
+        assert_eq!(
+            status(&mut cell, node, head_with("b", "none", Headers::default())),
+            ObjectStatus::NoSuchKey
+        );
+        assert_eq!(
+            status(&mut cell, node, get_op("nope", "k", None)),
+            ObjectStatus::NoSuchBucket
+        );
+        assert_eq!(
+            ask(&mut cell, node, put_op("nope", "k", 900, 1), vec![1])
+                .0
+                .status,
+            ObjectStatus::NoSuchBucket
+        );
+        assert_eq!(
+            status(&mut cell, node, delete_with("nope", "k", 901, None)),
+            ObjectStatus::NoSuchBucket
+        );
+    }
+
+    // Deletes in an unversioned bucket: conditional, then gone, then a delete of nothing done.
+    let c1 = quoted(&current.etag);
+    assert_eq!(
+        status(&mut cell, 1, delete_with("b", "c1", 950, Some("\"0123\""))),
+        ObjectStatus::PreconditionFailed
+    );
+    let (gone, _) = ask(
+        &mut cell,
+        2,
+        delete_with("b", "c1", 951, Some(&c1)),
+        Vec::new(),
+    );
+    assert_eq!((gone.status, gone.marker), (ObjectStatus::Done, false));
+    assert_eq!(
+        status(&mut cell, 3, get_op("b", "c1", None)),
+        ObjectStatus::NoSuchKey
+    );
+    assert_eq!(
+        status(&mut cell, 1, delete_with("b", "c1", 952, None)),
+        ObjectStatus::Done
+    );
+    assert_eq!(
+        status(&mut cell, 1, delete_with("b", "c1", 953, Some("*"))),
+        ObjectStatus::NoSuchKey
+    );
+
+    // A versioned bucket: versions kept, a delete a marker, deletes stacking markers (05 §7.3).
+    assert_eq!(status(&mut cell, 1, create("v")), ObjectStatus::Done);
+    let versioning = |v| Op::PutVersioning {
+        bucket: "v".into(),
+        id: 0,
+        versioning: v,
+    };
+    let state = |cell: &mut Cell| {
+        ask(
+            cell,
+            2,
+            Op::GetVersioning { bucket: "v".into() },
+            Vec::new(),
+        )
+        .0
+        .versioning
+    };
+    assert_eq!(state(&mut cell), Some(Versioning::Unversioned));
+    assert_eq!(
+        status(&mut cell, 3, versioning(Versioning::Enabled)),
+        ObjectStatus::Done
+    );
+    assert_eq!(state(&mut cell), Some(Versioning::Enabled));
+    let theirs = cell.objects_as(
+        other,
+        vec![(1, versioning(Versioning::Suspended), Vec::new())],
+    );
+    assert_eq!(
+        replied(&theirs[0], "theirs").0.status,
+        ObjectStatus::AccessDenied
+    );
+    let (one, _) = ask(&mut cell, 1, put_op("v", "k", 1_000, 3), vec![1, 2, 3]);
+    let (two, _) = ask(&mut cell, 2, put_op("v", "k", 1_001, 2), vec![4, 5]);
+    assert_eq!(
+        (one.status, two.status),
+        (ObjectStatus::Done, ObjectStatus::Done)
+    );
+    assert!(one.version != "null" && two.version != one.version);
+    let (marked, _) = ask(&mut cell, 3, delete_with("v", "k", 1_002, None), Vec::new());
+    assert_eq!((marked.status, marked.marker), (ObjectStatus::Done, true));
+    assert!(
+        ![one.version.as_str(), two.version.as_str(), "", "null"]
+            .contains(&marked.version.as_str())
+    );
+    for node in 1..=NODES {
+        let (read, _) = ask(&mut cell, node, get_op("v", "k", None), Vec::new());
+        assert_eq!((read.status, read.marker), (ObjectStatus::NoSuchKey, true));
+        assert_eq!(read.version, marked.version);
+        let (headed, _) = ask(
+            &mut cell,
+            node,
+            head_with("v", "k", Headers::default()),
+            Vec::new(),
+        );
+        assert_eq!(
+            (headed.status, headed.marker),
+            (ObjectStatus::NoSuchKey, true)
+        );
+    }
+    let (stacked, _) = ask(&mut cell, 1, delete_with("v", "k", 1_003, None), Vec::new());
+    assert_eq!((stacked.status, stacked.marker), (ObjectStatus::Done, true));
+    assert!(stacked.version != marked.version);
+    let (_, keys, _) = listed(&mut cell, "v", "", "", 1000);
+    assert!(
+        keys.is_empty(),
+        "a key whose current version is a marker lists nothing"
+    );
+    assert_eq!(
+        status(
+            &mut cell,
+            2,
+            Op::DeleteBucket {
+                bucket: "v".into(),
+                id: 1_004
+            }
+        ),
+        ObjectStatus::BucketNotEmpty
+    );
+    assert_eq!(status(&mut cell, 3, head_bucket("v")), ObjectStatus::Done);
+
+    // A listing of more keys than one page holds, paged through every node in turn.
+    let many: Vec<String> = (0..1_050).map(|n| format!("l/{n:04}")).collect();
+    let puts = many
+        .iter()
+        .enumerate()
+        .map(|(n, key)| {
+            (
+                1 + n as u64 % NODES,
+                put_op("b", key, 2_000 + n as u128, 0),
+                Vec::new(),
+            )
+        })
+        .collect();
+    for (outcome, key) in cell.objects(puts).iter().zip(&many) {
+        done(outcome, &format!("the put of {key}"));
+    }
+    let (pages, keys, prefixes) = listed(&mut cell, "b", "l/", "", 1000);
+    assert_eq!((pages, prefixes.len()), (2, 0));
+    assert_eq!(keys, many, "every key once, in order");
+    let (pages, keys, _) = listed(&mut cell, "b", "l/", "", 97);
+    assert_eq!(pages, 11);
+    assert_eq!(keys, many, "every key once, in order, by 97s");
+    let (_, keys, prefixes) = listed(&mut cell, "b", "", "/", 2);
+    assert_eq!(prefixes, ["l/"]);
+    assert_eq!(keys, ["c2", "c3", "empty", "sum", "ten"]);
+    let after = Op::List(List {
+        bucket: "b".into(),
+        prefix: "l/".into(),
+        delimiter: String::new(),
+        start: Some(Resume::After("l/0999".into())),
+        max_keys: 1000,
+        fetch_owner: false,
+    });
+    let (reply, _) = ask(&mut cell, 2, after, Vec::new());
+    let Some(Listing::Keys(page)) = reply.listing else {
+        panic!("{reply:?}");
+    };
+    assert!(!page.truncated);
+    assert_eq!(
+        page.contents
+            .iter()
+            .map(|l| l.key.as_str())
+            .collect::<Vec<_>>(),
+        many[1_000..].iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    assert!(
+        page.contents
+            .iter()
+            .all(|l| l.owner.is_none() && l.size == 0)
+    );
+    let missing = Op::List(List {
+        bucket: "nope".into(),
+        prefix: String::new(),
+        delimiter: String::new(),
+        start: None,
+        max_keys: 10,
+        fetch_owner: false,
+    });
+    assert_eq!(status(&mut cell, 1, missing), ObjectStatus::NoSuchBucket);
+
+    // A bucket is deleted only once empty, and its name can be made again.
+    assert_eq!(status(&mut cell, 2, create("gone")), ObjectStatus::Done);
+    assert_eq!(
+        ask(&mut cell, 3, put_op("gone", "x", 3_000, 1), vec![9])
+            .0
+            .status,
+        ObjectStatus::Done
+    );
+    let delete_gone = |id| Op::DeleteBucket {
+        bucket: "gone".into(),
+        id,
+    };
+    assert_eq!(
+        status(&mut cell, 1, delete_gone(3_001)),
+        ObjectStatus::BucketNotEmpty
+    );
+    assert_eq!(
+        status(&mut cell, 1, head_bucket("gone")),
+        ObjectStatus::Done
+    );
+    assert_eq!(
+        status(&mut cell, 2, delete_with("gone", "x", 3_002, None)),
+        ObjectStatus::Done
+    );
+    assert_eq!(status(&mut cell, 3, delete_gone(3_003)), ObjectStatus::Done);
+    for node in 1..=NODES {
+        assert_eq!(
+            status(&mut cell, node, head_bucket("gone")),
+            ObjectStatus::NoSuchBucket
+        );
+    }
+    assert_eq!(
+        status(&mut cell, 1, delete_gone(3_004)),
+        ObjectStatus::NoSuchBucket
+    );
+    let names: Vec<String> = listed_buckets(ask(&mut cell, 2, buckets(), Vec::new()).0);
+    assert_eq!(names, ["b", "v"]);
+    assert_eq!(status(&mut cell, 3, create("gone")), ObjectStatus::Done);
+    assert_eq!(
+        status(&mut cell, 1, get_op("gone", "x", None)),
+        ObjectStatus::NoSuchKey
+    );
 }

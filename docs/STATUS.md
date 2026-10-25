@@ -277,14 +277,23 @@ fails with renewals removed. `mantle bench gateway` measures both paths on one c
 the round trips each waits through.
 
 A node hosts the drivers ([node design §5.1](design/node.md)): a client asks it over mantle's
-protocol on QUIC to create a bucket, put an object with its bytes on the exchange, or get a range
-of one with the bytes on the reply, and the node runs the bucket's coordinator or the `Put` and
-`Get` drivers, placing from its replica of the volume table, writing chunks to its own volume
-in-process and to its peers' over the transfer class, and asking the ranges' leaders through its
-own sessions. A cell of three `mantle node` processes takes objects from empty to three blocks
-through any node, each block's chunks on distinct nodes, and reads every one back whole and in
-part with each node in turn killed by `SIGKILL`, and through that node once started again; it
-passes with a busy loop on every core.
+protocol on QUIC for S3's bucket and object operations (CreateBucket, HeadBucket, ListBuckets,
+DeleteBucket, Put and GetBucketVersioning; PutObject with its bytes on the exchange, GetObject
+with them on the reply, HeadObject, DeleteObject, ListObjectsV2), and the node runs the bucket's
+coordinator, the `Put` and `Get` drivers or the ranges' commands and reads each needs, placing
+from its replica of the volume table, writing chunks to its own volume in-process and to its
+peers' over the transfer class, and asking the ranges' leaders through its own sessions. A put's
+`If-Match` and `If-None-Match` are judged as its version commits, and its checksum and
+`Content-MD5` before anything commits; a get's or head's preconditions in RFC 9110's order and its
+range against the version it reads, by the S3 layer's own judges; a page of ListObjectsV2 is one
+read of the Name range, ended early at its reply's room and resumed exactly. A cell of three
+`mantle node` processes takes objects from empty to three blocks through any node, each block's
+chunks on distinct nodes, and reads every one back whole and in part with each node in turn
+killed by `SIGKILL`, and through that node once started again; it passes with a busy loop on every
+core. Through each node of a cell of three `mantle serve` processes every operation answers as
+S3 does for each case research/05 records, and 1,050 keys list in pages of 1,000 and of 97,
+through the three nodes in turn, every key once and in order (`crates/mantle/tests/serve.rs`).
+The operation identity every mutation carries is not yet recorded by the Name range (item 9).
 
 Remaining before it is done:
 

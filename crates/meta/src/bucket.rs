@@ -494,15 +494,16 @@ pub fn owned_count<E: Rows>(engine: &mut E, owner: &str) -> Result<u32, MetaErro
     }
 }
 
-/// `owner`'s active buckets and those being deleted, by name after `after`, at most `max`:
-/// a page of ListBuckets (05 §10.4).
+/// `owner`'s active buckets and those being deleted whose names begin with `prefix`, by name
+/// after `after`, at most `max`: a page of ListBuckets (05 §10.4).
 pub fn owned<E: Rows>(
     engine: &mut E,
     owner: &str,
+    prefix: &str,
     after: Option<&str>,
     max: usize,
 ) -> Result<Vec<(String, Owned)>, MetaError> {
-    let (mut from, to) = key::owned_rows(owner, after);
+    let (mut from, to) = key::owned_rows(owner, prefix, after);
     let mut out = Vec::new();
     while out.len() < max {
         let Some((k, v)) = engine.next(&from, &to)? else {
@@ -576,7 +577,7 @@ mod tests {
         let mut r = Range::default();
         let (incarnation, attempt) = begun(r.create("b", "o", 100, 10));
         assert_eq!(incarnation, 100);
-        assert!(owned(&mut r.engine, "o", None, 10).unwrap().is_empty());
+        assert!(owned(&mut r.engine, "o", "", None, 10).unwrap().is_empty());
         assert_eq!(owned_count(&mut r.engine, "o").unwrap(), 1);
         // The same create again takes over under a later attempt; the one left behind is
         // refused.
@@ -591,7 +592,7 @@ mod tests {
             location: String::new(),
         };
         assert_eq!(
-            owned(&mut r.engine, "o", None, 10).unwrap(),
+            owned(&mut r.engine, "o", "", None, 10).unwrap(),
             [("b".to_owned(), listed)]
         );
         assert_eq!(owned_count(&mut r.engine, "o").unwrap(), 1);
@@ -614,14 +615,28 @@ mod tests {
         let names =
             |page: Vec<(String, Owned)>| page.into_iter().map(|(n, _)| n).collect::<Vec<_>>();
         assert_eq!(
-            names(owned(&mut r.engine, "o", None, 2).unwrap()),
+            names(owned(&mut r.engine, "o", "", None, 2).unwrap()),
             ["a", "b"]
         );
         assert_eq!(
-            names(owned(&mut r.engine, "o", Some("b"), 2).unwrap()),
+            names(owned(&mut r.engine, "o", "", Some("b"), 2).unwrap()),
             ["c"]
         );
-        assert!(owned(&mut r.engine, "p", None, 2).unwrap().is_empty());
+        assert!(owned(&mut r.engine, "p", "", None, 2).unwrap().is_empty());
+        // A prefix lists the names that begin with it, after `after` where that is later.
+        assert_eq!(
+            names(owned(&mut r.engine, "o", "b", None, 10).unwrap()),
+            ["b"]
+        );
+        assert_eq!(
+            names(owned(&mut r.engine, "o", "c", Some("a"), 10).unwrap()),
+            ["c"]
+        );
+        assert!(
+            owned(&mut r.engine, "o", "b", Some("b"), 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -682,7 +697,7 @@ mod tests {
         assert_eq!(r.run(restore(d2)), Outcome::Conflict);
         assert_eq!(r.run(delete(d3)), Outcome::Deleted);
         assert_eq!(r.run(delete(d3)), Outcome::Deleted);
-        assert!(owned(&mut r.engine, "o", None, 10).unwrap().is_empty());
+        assert!(owned(&mut r.engine, "o", "", None, 10).unwrap().is_empty());
         assert_eq!(owned_count(&mut r.engine, "o").unwrap(), 0);
         assert_eq!(r.engine.get(&key::owner("o")).unwrap(), None);
 

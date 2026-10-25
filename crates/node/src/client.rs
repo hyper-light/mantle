@@ -264,7 +264,7 @@ impl Client {
         deadline_ns: u64,
     ) -> Result<Read, ClientError> {
         self.body.clear();
-        self.body.extend_from_slice(&query.encode());
+        self.body.extend_from_slice(&query.encode()?);
         let reply = self.request(Kind::Read, group, (deadline_ns, true)).await?;
         Ok(Read::decode(query, &reply)?)
     }
@@ -681,7 +681,7 @@ impl Client {
         data: &[u8],
         deadline_ns: u64,
     ) -> Result<ObjectOutcome, ClientError> {
-        let (head, names) = op
+        let (head, fields) = op
             .encode()
             .map_err(|e| ClientError::Bounds(e.to_string()))?;
         if !self.reach(node, deadline_ns).await? {
@@ -706,7 +706,7 @@ impl Client {
             node,
             Kind::Object,
             &head,
-            Some(op.body()),
+            Some(op.body(&fields)),
             period,
         ) {
             Ok(exchange) => exchange,
@@ -716,12 +716,12 @@ impl Client {
             }
             Err(refusal) => return Err(refusal.into()),
         };
-        // The names, then the object's bytes, as the stream takes them.
+        // The fields, then the object's bytes, as the stream takes them.
         let mut written = 0usize;
         let write = |endpoint: &mut Endpoint<NodeClasses, Fixed, Peers>,
                      written: &mut usize|
          -> Result<(), ClientError> {
-            for (from, part) in [(0usize, names.as_slice()), (names.len(), data)] {
+            for (from, part) in [(0usize, fields.as_slice()), (fields.len(), data)] {
                 let end = from.saturating_add(part.len());
                 if *written >= end {
                     continue;
@@ -1028,7 +1028,7 @@ fn finish(head: ReplyHead) -> Result<Asked, ClientError> {
 pub enum ObjectOutcome {
     /// The node's reply, and a get's bytes.
     Replied {
-        reply: object::Reply,
+        reply: Box<object::Reply>,
         bytes: Vec<u8>,
     },
     /// The exchange ended unanswered: its node is unreachable or refused it, or its connection
@@ -1052,7 +1052,8 @@ fn untaken(refusal: Refusal) -> bool {
     )
 }
 
-/// A reply whose body was read whole: its tags taken from the body's start, the rest a get's bytes.
+/// A reply whose body was read whole: its fields taken from the body's start, the rest a get's
+/// bytes, left where they were read.
 fn reply_of(
     head: Option<object::ReplyHead>,
     mut body: Vec<u8>,
@@ -1060,17 +1061,17 @@ fn reply_of(
     let head = head.ok_or(ClientError::Bounds(
         "an object's body before its head".into(),
     ))?;
-    let tags = usize::try_from(head.tags()).unwrap_or(usize::MAX);
-    if tags > body.len() {
-        return Err(ClientError::Bounds(
-            "an object's reply shorter than its tags".into(),
-        ));
-    }
-    let bytes = body.split_off(tags);
+    let fields = usize::try_from(head.fields()).unwrap_or(usize::MAX);
     let reply = head
-        .reply(&body)
+        .reply(body.get(..fields).ok_or(ClientError::Bounds(
+            "an object's reply shorter than its fields".into(),
+        ))?)
         .map_err(|e| ClientError::Bounds(e.to_string()))?;
-    Ok(ObjectOutcome::Replied { reply, bytes })
+    body.drain(..fields);
+    Ok(ObjectOutcome::Replied {
+        reply: Box::new(reply),
+        bytes: body,
+    })
 }
 
 /// Writes what `exchange` takes of `body` past `written`.

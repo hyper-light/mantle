@@ -49,7 +49,7 @@ use mantle_chunk::ChunkKey;
 use mantle_meta::apply::Layer;
 use mantle_meta::engine::Engine;
 use mantle_meta::record::History;
-use mantle_meta::wire::{Answer, Command, Entry, MAX_BUCKET, MAX_KEY};
+use mantle_meta::wire::{Answer, Command, Entry};
 use mantle_range::membership::{Next, Replacement};
 use mantle_range::{Applied, Elections, GroupStore, LogStore, Range, RangeMachine, ReplicaError};
 
@@ -778,11 +778,10 @@ pub fn message_bounds<E>(ranges: &[Hosted<E>], chunk_bytes: u64) -> Result<Bound
     let chunked = chunk_bytes
         .checked_add(u64::try_from(chunk_head).map_err(|_| unfit())?)
         .ok_or_else(unfit)?;
-    // An object's body opens with its names, a reply's with its tags.
+    // An object's body opens with its request's fields, a reply's with the reply's.
     let object_head = object::HEAD_BYTES
-        .saturating_add(MAX_BUCKET)
-        .saturating_add(MAX_KEY)
-        .max(object::REPLY_HEAD_BYTES.saturating_add(object::MAX_TAG.saturating_mul(2)));
+        .saturating_add(object::MAX_FIELDS)
+        .max(object::REPLY_HEAD_BYTES.saturating_add(object::MAX_REPLY_FIELDS));
     let object = mantle_s3::body::MAX_UPLOAD
         .checked_add(u64::try_from(object_head).map_err(|_| unfit())?)
         .ok_or_else(unfit)?;
@@ -3278,7 +3277,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Ok(());
         }
         out.tried = out.tried.saturating_add(1);
-        let body = out.query.encode();
+        let body = out
+            .query
+            .encode()
+            .map_err(|e| NodeError::Bounds(e.to_string()))?;
         let len = u64::try_from(body.len()).unwrap_or(u64::MAX);
         let clock = self.driver.clock()?;
         let period = Progress::new(bounds::idle_timeout())?;

@@ -1088,7 +1088,7 @@ fn queue(now_ns: u64, bucket: &str, key: &str, id: u128, file: bool) -> Result<W
 fn copy(command: &Command, mark: Mark) -> Outcome {
     match (command, mark.how) {
         (Command::Put(_) | Command::Complete(_), How::Version { order, null }) => Outcome::Put {
-            version: id(null, order),
+            version: shown_id(null, order),
         },
         (Command::PutPart(_), How::Part | How::Adopted { .. }) => Outcome::PartWritten,
         _ => Outcome::Expired,
@@ -1371,7 +1371,7 @@ fn put<E: Rows>(engine: &mut E, p: &Put) -> Result<(Outcome, Vec<Write>), MetaEr
     }
     Ok((
         Outcome::Put {
-            version: id(null, order),
+            version: shown_id(null, order),
         },
         writes,
     ))
@@ -1443,7 +1443,7 @@ fn delete<E: Rows>(engine: &mut E, d: &Delete) -> Result<(Outcome, Vec<Write>), 
             Ok((
                 Outcome::Deleted {
                     marker: removed.as_ref().is_some_and(|v| v.marker),
-                    version: Some(id(removed.is_some_and(|v| v.null), order)),
+                    version: Some(shown_id(removed.is_some_and(|v| v.null), order)),
                 },
                 writes,
             ))
@@ -1494,7 +1494,7 @@ fn delete<E: Rows>(engine: &mut E, d: &Delete) -> Result<(Outcome, Vec<Write>), 
                 Ok((
                     Outcome::Deleted {
                         marker: true,
-                        version: Some(id(null, order)),
+                        version: Some(shown_id(null, order)),
                     },
                     writes,
                 ))
@@ -1569,7 +1569,7 @@ fn complete<E: Rows>(engine: &mut E, c: &Complete) -> Result<(Outcome, Vec<Write
             // releases: the version holds the first.
             Some((order, v)) if !v.marker && v.etag == c.etag && v.listing == Some(c.listing) => (
                 Outcome::Completed {
-                    version: id(v.null, order),
+                    version: shown_id(v.null, order),
                     size: v.size,
                     checksum: v.checksum,
                 },
@@ -1955,8 +1955,8 @@ fn remove_null<E: Rows>(
     }
 }
 
-/// A version's ID: "null" for the null version, else its order's.
-fn id(null: bool, order: u64) -> String {
+/// The ID S3 shows for a version: "null" for the null version, else its order's (05 §7.1).
+pub fn shown_id(null: bool, order: u64) -> String {
     if null {
         NULL_VERSION.to_owned()
     } else {
@@ -2045,7 +2045,7 @@ pub struct Versioned {
 impl Versioned {
     /// The ID S3 shows for it: `null` for the null version (05 §7.1).
     pub fn version_id(&self) -> String {
-        id(self.version.null, self.order)
+        shown_id(self.version.null, self.order)
     }
 }
 
@@ -2442,7 +2442,7 @@ mod tests {
                     panic!("not a version row")
                 };
                 let v = Version::decode(&v).unwrap();
-                out.push((id(v.null, order), v.marker, v.etag));
+                out.push((shown_id(v.null, order), v.marker, v.etag));
                 from = after(&k);
             }
             out
@@ -2716,7 +2716,7 @@ mod tests {
         let found = |s: Scan<Versioned>| match s {
             Scan::Found(v) => (
                 v.key.clone(),
-                id(v.version.null, v.order),
+                shown_id(v.version.null, v.order),
                 v.version.marker,
                 v.version.etag,
                 v.latest,
@@ -2726,7 +2726,7 @@ mod tests {
         let mut seen = Vec::new();
         let mut step = scan(VersionFrom::Key(b""), 10);
         while let Scan::Found(v) = &step {
-            let (key, version_id) = (v.key.clone(), id(v.version.null, v.order));
+            let (key, version_id) = (v.key.clone(), shown_id(v.version.null, v.order));
             seen.push(found(step.clone()));
             step = scan(
                 VersionFrom::After {
@@ -3202,7 +3202,10 @@ mod tests {
         assert_eq!((again, late), (Outcome::PartWritten, Outcome::PartWritten));
         // The object keeps its extent: reclaiming the object's file gives the part back.
         let (_, v) = current(&mut r.engine, "b", "k").unwrap().unwrap();
-        assert_eq!(id(v.null, !key::parse_version_id(&u).unwrap()), version);
+        assert_eq!(
+            shown_id(v.null, !key::parse_version_id(&u).unwrap()),
+            version
+        );
         let give_back = Command::Disown(Disown {
             bucket: "b".into(),
             key: "k".into(),

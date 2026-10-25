@@ -1642,6 +1642,17 @@ hyper's defaults are its own choices ("Default is 200, but not part of the stabi
 8. **Respond** with `mantle_s3::response`'s documents, streaming a GET's bytes as the `Get`
    driver gives them out.
 
+*As built (2026-10-25), the native door.* Steps 1 and 3 are the transport's: a connection
+admitted by the node's admission (hyper-transport) and authenticated by the cell's certificates
+(§1.5). Step 2 is the request's kind (`crate::object`). Of step 4, only a bucket's owner is
+judged: a bucket's head, delete and versioning change are refused to any other principal, S3's
+answer where no policy grants them, and a principal's objects are not yet judged beyond the
+cell's certificates; the bucket's policy comes with the listener. Step 5 is the host's bound on
+the operations it runs at once (`gateway.objects`): one past it is answered `SlowDown`, its body
+read and dropped so the exchange ends whole. Steps 7 and 8 are §5.1's: the drivers, the ranges'
+commands and reads, and a typed reply the native protocol encodes, which the listener will render
+as S3's documents.
+
 ### 4.3 Bodies
 
 A body is read only when the `Put` driver `wants_body`, one segment at a time, and backpressure
@@ -1682,6 +1693,12 @@ reported as success or as a refusal with no effect:
 | `BadDigest`, `BadChecksum` | 400 `BadDigest` (05 §3.2) |
 | `InvalidPartNumber` | 400 `InvalidArgument` (`mantle_gateway::put`) |
 | Name refusals: a failed precondition, a missing bucket, a lock | 412 `PreconditionFailed`, 404 `NoSuchBucket`, 403 `AccessDenied`: each the code S3 gives it (05 §11.2) |
+| A read's preconditions (`mantle_s3::conditional::read`, RFC 9110 §13.2.2) | 304 `NotModified` carrying the ETag, or 412 `PreconditionFailed` (05 §2.4) |
+| A key whose current version is a delete marker, read | 404 `NoSuchKey`, `x-amz-delete-marker: true` (05 §7.4) |
+| A range past the object's end, or any range of an empty object (`mantle_s3::range::span`) | 416 `InvalidRange` (05 §12) |
+| DeleteBucket of a bucket holding a version or a delete marker | 409 `BucketNotEmpty` (05 §10.5) |
+| Another principal's bucket headed, deleted or its versioning changed, where no policy grants it | 403 `AccessDenied` |
+| Versioning suspended on a bucket Object Lock holds | 409 `InvalidBucketState` (18 §2.1) |
 | `Unplaced`, admission refused, a range splitting or frozen for a move | 503 `SlowDown` |
 | An internal step whose outcome is unknown after the request's retries (§5.4) | 500 `InternalError`, which clients retry |
 
@@ -1788,37 +1805,72 @@ node learns it and sends again; a node whose descriptors no longer cover a key r
 directory from the root range. A range whose leader has moved answers with the leader it knows.
 A stale route costs a round trip and cannot produce a wrong answer (architecture §5).
 
-*As built (2026-10-21).* A node given a root key and the gateway's settings (`root_key`,
+*As built (2026-10-25).* A node given a root key and the gateway's settings (`root_key`,
 `gateway.*`, `durability.*`) hosts the drivers itself (`crates/node/src/node/host.rs`). A client
-or gateway asks it on an exchange of the transfer class (`crate::object`): create a bucket, put an
-object with its bytes on the exchange, or get a range of one with the bytes on the reply. A
-request's head is a few fixed fields, held for the exchange's life, and its names ride in the body
-ahead of the bytes; a reply's head is its status, size and its tags' lengths, the version id and
-ETag opening its body. Each exchange is a job, at most `gateway.objects` of them, one past answered
-`SlowDown`. A create runs the bucket's coordinator (`mantle_meta::coordinator`): the Bucket range's
-`Create`, the Name range's gate read and opened, the bucket activated. A put reads its bucket's
-row and makes the `Put` driver over it, a data key drawn for the file and wrapped under the root
-key's current generation (encryption.md §2) and the scheme the durability model chooses for the
-cell's domains (`mantle_ec::durability::choose`); a get reads its key's current version and makes
-the `Get` driver. The host serves each driver's requests as the table above routes them: `Place`
-from the node's replica of the volume table (§6.6), read from the root range's rows once for each
-entry that replica applies, the only thing that changes it; a chunk to its volume's node,
-in-process for the node's own; a command or read to its range's leader through the node's own
-sessions (§6.6). A put's body is read only as fast as its driver takes it, a piece at a time, and
-a get's bytes are taken from its driver only as fast as the exchange takes them. The node's asks
-out are bounded (commands, reads, and chunk asks out to its peers): a request that finds them full
-waits in its place and is asked once an answer gives room back. That bound is the node's own, not
-a volume's refusal, which sends the chunk to the next volume offered (§5.2). Each asker takes only
-its own asks' outcomes (`Node::take_command`, `take_read`, `take_chunk`), and the asks of a job that
-ended before they were answered, its exchange lost or its driver failed, are let go, their
-outcomes dropped as they come. The host's asks carry no deadline of their own (§5.4 is to be
-built): a job ends with its exchange. Tested with `mantle node` processes
-(`crates/mantle/tests/node.rs`): a cell of three hosting every layer creates a bucket and takes
-objects of 0 and 1 bytes, either side of a sealed segment's 64 KiB, 3 MiB and 20 MiB (three
-blocks) through each node in turn; every object reads back whole and its middle third through
-another node; each block's chunks are on distinct nodes; and with each node in turn killed by
-`SIGKILL`, every object reads back whole and in part through the other two, and through the node
-once started again. It passes with a busy loop on every core.
+or gateway asks it on an exchange of the transfer class (`crate::object`) for S3's operations:
+CreateBucket, HeadBucket, ListBuckets, DeleteBucket, PutBucketVersioning and GetBucketVersioning;
+PutObject with its bytes on the exchange, GetObject with them on the reply, HeadObject,
+DeleteObject and ListObjectsV2. A request's head is a few fixed fields, held for the exchange's
+life: its kind, its fields' length, the operation's identity, which every mutation carries
+(gateway.md §2.1; the Name range records none yet, STATUS item 9), and a put's length; its fields
+ride in the body ahead of a put's bytes, each bounded by S3's own bound on what it names. A
+reply's head is its status, the object's size and its fields' length, the fields (the version's
+ID and ETag, Last-Modified in whole seconds, the checksum, whether the version is a delete marker,
+the range served, a bucket's versioning, a page) opening its body ahead of a get's bytes. The
+operation is typed on both sides of that encoding, so another door hands the host the same
+operation. Each exchange is a job, at most `gateway.objects` of them, one past answered
+`SlowDown`.
+
+The operations' preconditions and ranges are S3's header texts, judged as the HTTP/1.1 listener
+judges its own, by `mantle_s3::conditional` and `mantle_s3::range`. A put's `If-Match` and
+`If-None-Match` become the Name range's preconditions, judged as the version commits (05 §2.2);
+its checksum and `Content-MD5` are what the `Put` driver checks at the body's end, before anything
+commits (05 §3.2). A get or head reads its key's current version, linearizably (§5.1's reads),
+judges its preconditions against it in RFC 9110's order with the version's time taken in whole
+seconds once, resolves its range against its size, then replies with the version's facts or makes
+the `Get` driver over the range. A delete reads its bucket's row for the incarnation and
+versioning its Name command names, so a versioned bucket's delete makes a marker (05 §7.3). A page
+of ListObjectsV2 is one read of the Name range: `mantle_s3::list::page` runs on the leader's
+engine over the Name layer's scan of current versions, and ends the page early, truncated, at the
+first item its reply has no room for, the next page resuming exactly where it said (s3-protocol.md
+§3). ListBuckets reads a page of the asker's buckets from the Bucket range's owner rows. A create
+or a delete runs the bucket's coordinator (`mantle_meta::coordinator`): a create the Bucket
+range's `Create`, the Name range's gate read and opened, the bucket activated; a delete
+`BeginDelete`, the gate closed, the Name range probed for a version or a delete marker, and then
+either the gate reopened (`BucketNotEmpty`) or the bucket deleted, its rows swept and its name
+forgotten, the reply coming once the coordinator is done. A bucket's head, delete and versioning
+change are refused to another principal than its owner, S3's answer where no policy grants them;
+the policy itself is the listener's step (§4.2). A put reads its bucket's row and makes the `Put`
+driver over it, a data key drawn for the file and wrapped under the root key's current generation
+(encryption.md §2) and the scheme the durability model chooses for the cell's domains
+(`mantle_ec::durability::choose`).
+
+The host serves each driver's requests as the table above routes them: `Place` from the node's
+replica of the volume table (§6.6), read from the root range's rows once for each entry that
+replica applies, the only thing that changes it; a chunk to its volume's node, in-process for the
+node's own; a command or read to its range's leader through the node's own sessions (§6.6). A
+put's body is read only as fast as its driver takes it, a piece at a time, and a get's bytes are
+taken from its driver only as fast as the exchange takes them. The node's asks out are bounded
+(commands, reads, and chunk asks out to its peers): a request that finds them full waits in its
+place and is asked once an answer gives room back. That bound is the node's own, not a volume's
+refusal, which sends the chunk to the next volume offered (§5.2). Each asker takes only its own
+asks' outcomes (`Node::take_command`, `take_read`, `take_chunk`), and the asks of a job that ended
+before they were answered, its exchange lost or its driver failed, are let go, their outcomes
+dropped as they come. The host's asks carry no deadline of their own (§5.4 is to be built): a job
+ends with its exchange. Tested with `mantle node` processes (`crates/mantle/tests/node.rs`): a cell
+of three hosting every layer creates a bucket and takes objects of 0 and 1 bytes, either side of a
+sealed segment's 64 KiB, 3 MiB and 20 MiB (three blocks) through each node in turn; every object
+reads back whole and its middle third through another node; each block's chunks are on distinct
+nodes; and with each node in turn killed by `SIGKILL`, every object reads back whole and in part
+through the other two, and through the node once started again. It passes with a busy loop on
+every core. And with `mantle serve` processes (`crates/mantle/tests/serve.rs`,
+`s3s_operations_answer_as_s3_does_through_every_node`): through each node of a cell of three,
+conditional writes (`If-None-Match: *` twice, `If-Match` right, wrong and on no object),
+conditional reads in each order AWS documents, a checksum and a `Content-MD5` refused with nothing
+committed, ranges, heads, deletes conditional and not, a versioned bucket's stacked delete
+markers, missing keys and buckets, another principal refused, a bucket deleted only once empty and
+made again, and 1,050 keys listed in pages of 1,000 and of 97 through the three nodes in turn, every
+key once and in order.
 
 ### 5.2 Chunks
 

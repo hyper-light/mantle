@@ -34,7 +34,7 @@ pub(crate) use mantle_node::client::{ClientError, ObjectOutcome};
 pub(crate) use mantle_node::command::Status as CommandStatus;
 pub(crate) use mantle_node::directory::{Peer, node_name};
 pub(crate) use mantle_node::node::ChunkOutcome;
-pub(crate) use mantle_node::object::{Op, Status as ObjectStatus};
+pub(crate) use mantle_node::object::{Headers, List, Listing, Op, Reply, Status as ObjectStatus};
 pub(crate) use mantle_node::place;
 pub(crate) use mantle_node::read::{Query, Read};
 
@@ -1890,13 +1890,22 @@ impl Cell {
     /// What `ops` came to, each an object's request asked of a node with its data, which the
     /// writer client asks in turn, knowing every node and told where the running ones listen.
     pub(crate) fn objects(&mut self, ops: Vec<(u64, Op, Vec<u8>)>) -> Vec<ObjectOutcome> {
-        self.client_begins(CLIENT);
+        self.objects_as(CLIENT, ops)
+    }
+
+    /// What `ops` came to, asked as [`Cell::objects`] asks them, by client `client`.
+    pub(crate) fn objects_as(
+        &mut self,
+        client: u64,
+        ops: Vec<(u64, Op, Vec<u8>)>,
+    ) -> Vec<ObjectOutcome> {
+        self.client_begins(client);
         let done = ops.len() as u64;
-        let (settings, bound) = (self.pki.client_settings(CLIENT), self.bound_quic());
+        let (settings, bound) = (self.pki.client_settings(client), self.bound_quic());
         let tell = self.tell.clone();
         let thread = std::thread::spawn(move || objects(settings, bound, ops, tell));
         self.until(|c| {
-            if c.progress.get(&CLIENT).is_some_and(|d| *d >= done) {
+            if c.progress.get(&client).is_some_and(|d| *d >= done) {
                 Some(())
             } else {
                 None
@@ -2258,5 +2267,39 @@ pub(crate) fn done(outcome: &ObjectOutcome, what: &str) -> Vec<u8> {
             bytes.clone()
         }
         other => panic!("{what}: {other:?}"),
+    }
+}
+
+/// The outcome's reply, which must have come, and its bytes.
+pub(crate) fn replied(outcome: &ObjectOutcome, what: &str) -> (Reply, Vec<u8>) {
+    match outcome {
+        ObjectOutcome::Replied { reply, bytes } => ((**reply).clone(), bytes.clone()),
+        other => panic!("{what}: {other:?}"),
+    }
+}
+
+/// A PutObject of `length` bytes at `key` in `bucket`, as operation `id`, unconditional and
+/// with no checksum.
+pub(crate) fn put_op(bucket: &str, key: &str, id: u128, length: u64) -> Op {
+    Op::Put {
+        bucket: bucket.into(),
+        key: key.into(),
+        id,
+        length,
+        headers: Headers::default(),
+        checksum: None,
+        md5: None,
+    }
+}
+
+/// A GetObject of the whole of `key` in `bucket`, or of the range S3's `Range` names.
+pub(crate) fn get_op(bucket: &str, key: &str, range: Option<String>) -> Op {
+    Op::Get {
+        bucket: bucket.into(),
+        key: key.into(),
+        headers: Headers {
+            range,
+            ..Headers::default()
+        },
     }
 }

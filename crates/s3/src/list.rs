@@ -91,6 +91,13 @@ pub trait Keys {
         to: &[u8],
         budget: &mut usize,
     ) -> Result<Step<(String, Self::Value)>, Self::Error>;
+
+    /// Takes the room an item needs in the page's answer: a key listed with its value, or a
+    /// common prefix (`None`). `false` when the answer has no room left for it, which ends the
+    /// page early and truncated, as a full page ends: "The response might contain fewer keys"
+    /// (05 §6.2). An index whose answer is unbounded always has room; one that is bounded has
+    /// room for any one item, so a page lists at least one and a listing always moves.
+    fn room(&mut self, key: &str, value: Option<&Self::Value>) -> bool;
 }
 
 /// What one page of keys asks for.
@@ -171,7 +178,7 @@ pub fn page<K: Keys>(request: &Request<'_>, keys: &mut K) -> Result<Page<K::Valu
                     // since the keys it holds lie ahead. A full page leaves it for the next,
                     // which starts after the last item listed.
                     Some(common) if request.paging == Paging::Marker => {
-                        if page.key_count() < max {
+                        if page.key_count() < max && keys.room(common, None) {
                             page.common_prefixes.push(common.to_owned());
                             Resume::After(common.to_owned())
                         } else {
@@ -183,11 +190,16 @@ pub fn page<K: Keys>(request: &Request<'_>, keys: &mut K) -> Result<Page<K::Valu
                 break;
             }
             Step::Found((key, value)) => {
-                if page.key_count() >= max {
+                let common = rolled_up(&key, prefix, delimiter);
+                let room = match common {
+                    Some(common) => keys.room(common, None),
+                    None => keys.room(&key, Some(&value)),
+                };
+                if page.key_count() >= max || !room {
                     page.truncated = true;
                     break;
                 }
-                if let Some(common) = rolled_up(&key, prefix, delimiter) {
+                if let Some(common) = common {
                     from = beyond(common);
                     last = Some(Resume::After(common.to_owned()));
                     page.common_prefixes.push(common.to_owned());
@@ -465,6 +477,8 @@ mod tests {
         keys: BTreeMap<Vec<u8>, bool>,
         seeks: usize,
         passed: usize,
+        /// The items a page's answer has room for; `None` for no bound.
+        room: Option<usize>,
     }
 
     impl Keys for Index {
@@ -493,6 +507,17 @@ mod tests {
             }
             Ok(Step::End)
         }
+
+        fn room(&mut self, _: &str, _: Option<&()>) -> bool {
+            match self.room.as_mut() {
+                None => true,
+                Some(left) if *left == 0 => false,
+                Some(left) => {
+                    *left -= 1;
+                    true
+                }
+            }
+        }
     }
 
     fn index<S: AsRef<str>>(keys: &[S]) -> Index {
@@ -503,6 +528,7 @@ mod tests {
                 .collect(),
             seeks: 0,
             passed: 0,
+            room: None,
         }
     }
 
@@ -754,6 +780,46 @@ mod tests {
         assert_eq!(p.next_marker(true), Some("a"));
     }
 
+    /// A page whose answer runs out of room ends early and truncated, and the pages a client
+    /// follows by token list every key and common prefix once, at any room.
+    #[test]
+    fn a_page_out_of_room_ends_truncated_and_the_next_resumes_exactly() {
+        let keys = ["a", "b/x", "b/y", "b/z/q", "c", "d/e", "f", "g/h/i", "g/j"];
+        for delimiter in [None, Some("/")] {
+            let whole = list(&mut index(&keys), req("", delimiter, None, 1000));
+            let mut expected: Vec<String> = whole
+                .contents
+                .iter()
+                .map(|(k, _)| k.clone())
+                .chain(whole.common_prefixes.iter().cloned())
+                .collect();
+            expected.sort();
+            for room in 1..=4 {
+                let mut seen = Vec::new();
+                let mut next: Option<Resume> = None;
+                loop {
+                    let mut ix = index(&keys);
+                    ix.room = Some(room);
+                    let r = Request {
+                        start: next.as_ref().map(Resume::start),
+                        ..req("", delimiter, None, 1000)
+                    };
+                    let p = list(&mut ix, r);
+                    assert!(p.key_count() <= room, "{delimiter:?} {room}: {p:?}");
+                    assert!(p.key_count() > 0 || !p.truncated, "{delimiter:?} {room}");
+                    seen.extend(p.contents.iter().map(|(k, _)| k.clone()));
+                    seen.extend(p.common_prefixes.iter().cloned());
+                    if !p.truncated {
+                        break;
+                    }
+                    next = continuation_start(&p.continuation().unwrap());
+                }
+                seen.sort();
+                assert_eq!(seen, expected, "{delimiter:?} room {room}");
+            }
+        }
+    }
+
     #[test]
     fn index_errors_reach_the_caller() {
         struct Broken;
@@ -767,6 +833,10 @@ mod tests {
                 _: &mut usize,
             ) -> Result<Step<(String, ())>, &'static str> {
                 Err("unavailable")
+            }
+
+            fn room(&mut self, _: &str, _: Option<&()>) -> bool {
+                true
             }
         }
         assert_eq!(

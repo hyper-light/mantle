@@ -1584,6 +1584,11 @@ impl Cell {
         let mut stops = Vec::new();
         self.learns.clear();
         for id in CLIENT..CLIENT + CLIENTS {
+            // Until it measures an exchange, a client's patience is the idle timeout, the least
+            // `Client::patience` states once it has (RFC 9000 §10.1).
+            self.watch
+                .clients
+                .insert(id, mantle_node::bounds::idle_timeout());
             let (stop, stopping) = mpsc::channel();
             let (learn, learning) = mpsc::channel();
             let settings = self.pki.client_settings(id, &order);

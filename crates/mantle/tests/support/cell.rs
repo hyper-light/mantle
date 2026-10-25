@@ -1847,11 +1847,22 @@ impl Cell {
         self.until(|c| c.volumes.get(&id).copied())
     }
 
+    /// A client of identity `id` begins anew: what one before it told is forgotten, and until it
+    /// measures an exchange its patience is the idle timeout, three probe timeouts at the initial
+    /// estimates (RFC 9000 §10.1), the least `Client::patience` states once it has measured one.
+    /// Its first exchange is silent past one second when its first flight is lost (RFC 9002's
+    /// initial probe timeout is 1.024 s) or its node waits on a device others share: under two
+    /// serve suites at once, 1% of first operations took more than 2.0 s
+    /// (measurements/2026-10-25-first-operations-on-a-loaded-host.md).
+    fn client_begins(&mut self, id: u64) {
+        self.progress.remove(&id);
+        self.clients.insert(id, mantle_node::bounds::idle_timeout());
+    }
+
     /// Starts the gateway on `ops`, a client of its own knowing every node and told where the
     /// running ones listen.
     pub(crate) fn start_gateway(&mut self, ops: Vec<Chunked>) -> JoinHandle<Vec<ChunkOutcome>> {
-        self.progress.remove(&GATEWAY);
-        self.clients.remove(&GATEWAY);
+        self.client_begins(GATEWAY);
         let (settings, bound) = (self.pki.gateway_settings(), self.bound_quic());
         let tell = self.tell.clone();
         std::thread::spawn(move || gateway(settings, bound, ops, tell))
@@ -1879,8 +1890,7 @@ impl Cell {
     /// What `ops` came to, each an object's request asked of a node with its data, which the
     /// writer client asks in turn, knowing every node and told where the running ones listen.
     pub(crate) fn objects(&mut self, ops: Vec<(u64, Op, Vec<u8>)>) -> Vec<ObjectOutcome> {
-        self.progress.remove(&CLIENT);
-        self.clients.remove(&CLIENT);
+        self.client_begins(CLIENT);
         let done = ops.len() as u64;
         let (settings, bound) = (self.pki.client_settings(CLIENT), self.bound_quic());
         let tell = self.tell.clone();
@@ -1932,8 +1942,7 @@ impl Cell {
     /// What `reads` read, each a query of a range's group, which the writer client asks in turn,
     /// knowing every node and told where the running ones listen.
     pub(crate) fn read(&mut self, reads: Vec<(u128, Query)>) -> Vec<Result<Read, ClientError>> {
-        self.progress.remove(&CLIENT);
-        self.clients.remove(&CLIENT);
+        self.client_begins(CLIENT);
         let done = reads.len() as u64;
         let (settings, bound) = (self.pki.client_settings(CLIENT), self.bound_quic());
         let tell = self.tell.clone();
@@ -1951,8 +1960,7 @@ impl Cell {
     /// The answers to `asks`, each an entry to a range's group, which the writer client asks in
     /// turn, knowing every node and told where the running ones listen.
     pub(crate) fn asked(&mut self, asks: Vec<(u128, Entry)>) -> Vec<Vec<Answer>> {
-        self.progress.remove(&CLIENT);
-        self.clients.remove(&CLIENT);
+        self.client_begins(CLIENT);
         let done = asks.len() as u64;
         let (settings, bound) = (self.pki.client_settings(CLIENT), self.bound_quic());
         let tell = self.tell.clone();

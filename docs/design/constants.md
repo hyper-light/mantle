@@ -470,6 +470,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/meta/src/key.rs` `FLOOR` | format | Marker byte `f` after `LOCAL` for the Name range's gate floor. |
 | `crates/meta/src/key.rs` `GATE` | format | Marker byte `g` after `LOCAL` for gate rows. |
 | `crates/meta/src/key.rs` `HEADER` | format | File-layer row tag 1 for a file's header. |
+| `crates/meta/src/key.rs` `HISTORY` | format | Root-range row tag 3 after `DATA` for a node's history: its time run and its crashes (docs/design/node.md §2.4, item 7). |
 | `crates/meta/src/key.rs` `MEMBER` | format | Root-range row tag 1 after `DATA` for a node's row: its failure domain. |
 | `crates/meta/src/key.rs` `NAMED` | format | File-layer row tag 4 for the row saying a file names a block, after the extents' tag so a scan of extents stops before it. |
 | `crates/meta/src/key.rs` `LINEAGE` | format | Marker byte `l` after `LOCAL` for the Name range's lineage row. |
@@ -551,6 +552,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/node/src/frame.rs` `GROUP_BYTES` | format | A Raft frame's group, a u128 as the log names a range's group (hyper-log). |
 | `crates/node/src/frame.rs` `HEADER_BYTES` | derived | CRC_BYTES plus GROUP_BYTES: the bytes before a frame's message. |
 | `crates/node/src/layout.rs` `RUN_BYTES` | format | The node's run record: one u64 count (hyper-liveness `Settings::run`). |
+| `crates/node/src/layout.rs` `STOPPED_BYTES` | format | The node's stop record: three u64s, the run that stopped in order, the node's time run then and its orderly stops (docs/design/node.md §2.4, item 7). |
 | `crates/node/src/node.rs` `LANE` | format | The one lane a peer's Raft frames take: the node runs its ranges on one shard (docs/design/node.md §3.2's lane a shard). |
 | `crates/node/src/node.rs` `LIVENESS_GROUP` | format | The log group of the liveness stream's own writes, the top of the group space: group 0 holds hyper-log's own key records, and a range named either is refused at open. |
 | `crates/node/src/node.rs` `PIECE` | derived | hyper-transport's `RECEIVE_CHUNK`: a snapshot's or a chunk's body is read a receive chunk at a time. |

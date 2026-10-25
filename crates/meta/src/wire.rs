@@ -204,6 +204,8 @@ impl Answer {
                     root::Outcome::Enlisted => 0,
                     root::Outcome::Conflict => 1,
                     root::Outcome::Full => 2,
+                    root::Outcome::Kept => 3,
+                    root::Outcome::Unknown => 4,
                 });
             }
         }
@@ -253,6 +255,8 @@ impl Answer {
                     0 => root::Outcome::Enlisted,
                     1 => root::Outcome::Conflict,
                     2 => root::Outcome::Full,
+                    3 => root::Outcome::Kept,
+                    4 => root::Outcome::Unknown,
                     _ => return None,
                 }),
                 _ => return None,
@@ -394,6 +398,13 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
             w.u32(e.max_nodes);
             w.u32(e.max_volumes);
         }
+        Command::Root(root::Command::Lived(l)) => {
+            w.u8(5);
+            w.u8(1);
+            w.u64(l.node);
+            w.u64(l.exposure_ns);
+            w.u64(l.crashes);
+        }
     }
     Ok(())
 }
@@ -510,6 +521,11 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
                     max_volumes: r.u32()?,
                 })
             }
+            1 => root::Command::Lived(root::Lived {
+                node: r.u64()?,
+                exposure_ns: r.u64()?,
+                crashes: r.u64()?,
+            }),
             _ => return None,
         }),
         _ => return None,
@@ -2176,6 +2192,16 @@ mod tests {
                 max_nodes: 0,
                 max_volumes: 0,
             })),
+            Command::Root(root::Command::Lived(root::Lived {
+                node: 3,
+                exposure_ns: 1 << 40,
+                crashes: 2,
+            })),
+            Command::Root(root::Command::Lived(root::Lived {
+                node: u64::MAX,
+                exposure_ns: u64::MAX,
+                crashes: u64::MAX,
+            })),
         ]
     }
 
@@ -2373,6 +2399,8 @@ mod tests {
                 root::Outcome::Enlisted,
                 root::Outcome::Conflict,
                 root::Outcome::Full,
+                root::Outcome::Kept,
+                root::Outcome::Unknown,
             ]
             .map(Answer::Root),
         );

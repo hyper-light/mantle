@@ -3534,12 +3534,13 @@ fn take_done<T>(done: &mut Vec<(u64, T)>, ask: u64) -> Option<T> {
     Some(done.swap_remove(at).1)
 }
 
-/// Whether `command` asks nothing its sender may not: an enlistment names the sender, a node, and
-/// a registration names the sender as the session's owner, so no sender ends another's session
-/// (`mantle_meta::session::register`).
+/// Whether `command` asks nothing its sender may not: an enlistment and a history name the sender,
+/// a node, and a registration names the sender as the session's owner, so no sender ends another's
+/// session (`mantle_meta::session::register`) or states another node's history.
 fn names_only_its_sender(command: &Command, sender: PeerId, node: bool) -> bool {
     match command {
         Command::Root(mantle_meta::root::Command::Enlist(e)) => node && e.node == sender,
+        Command::Root(mantle_meta::root::Command::Lived(l)) => node && l.node == sender,
         Command::Register { owner, .. } => *owner == sender,
         _ => true,
     }
@@ -3597,5 +3598,37 @@ fn open_log(dir: &Path, node: u64, config: LogConfig) -> Result<Log<DeviceFile>,
         Log::open(file, config, log_id(node))
             .map(|(log, _)| log)
             .map_err(|e| NodeError::Log(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mantle_meta::root;
+
+    use super::*;
+
+    #[test]
+    fn a_node_enlists_and_states_the_history_of_itself_alone() {
+        let enlist = |node| {
+            Command::Root(root::Command::Enlist(root::Enlist {
+                node,
+                domain: String::new(),
+                volumes: Vec::new(),
+                max_nodes: 3,
+                max_volumes: 3,
+            }))
+        };
+        let lived = |node| {
+            Command::Root(root::Command::Lived(root::Lived {
+                node,
+                exposure_ns: 1,
+                crashes: 0,
+            }))
+        };
+        for command in [enlist(7), lived(7)] {
+            assert!(names_only_its_sender(&command, 7, true));
+            assert!(!names_only_its_sender(&command, 8, true), "another node's");
+            assert!(!names_only_its_sender(&command, 7, false), "a client's");
+        }
     }
 }

@@ -524,6 +524,14 @@ pub struct VolumeRow {
     pub bytes: u64,
 }
 
+/// A node's history in the root range (docs/design/node.md §2.4, item 7): the time it has run, in
+/// nanoseconds, over all its runs, and how many of its runs ended without an orderly stop.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct History {
+    pub exposure_ns: u64,
+    pub crashes: u64,
+}
+
 /// How many nodes and volumes the root range's table holds.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Census {
@@ -1005,6 +1013,29 @@ impl VolumeRow {
             })(),
             &r,
             "volume",
+        )
+    }
+}
+
+impl History {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = start();
+        w.u64(self.exposure_ns);
+        w.u64(self.crashes);
+        finish(w)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "history")?;
+        decoded(
+            (|| {
+                Some(Self {
+                    exposure_ns: r.u64()?,
+                    crashes: r.u64()?,
+                })
+            })(),
+            &r,
+            "history",
         )
     }
 }

@@ -1514,7 +1514,11 @@ impl Cluster {
 
     /// Brings every member up, the network whole and every disk as fast as another's, for the rest
     /// of the run, then runs until a leader commits an entry every member of its configuration
-    /// applies: false when it never does within `rounds`.
+    /// applies and every leader has answered the reads it took in its term: false when the entry is
+    /// never applied within `rounds`, and the reads checked where they are not answered by then
+    /// (`check_reads_answered`). A leader whose detectors left it no quorum leads on with the reads
+    /// it took (`docs/timing.md` §2.9), and a read whose round a cut lost is asked again at its
+    /// next beat once the group is whole: the entry may be applied before then.
     pub fn settles(&mut self, rounds: usize) -> bool {
         self.net.set_path(Path::NONE);
         self.settling = true;
@@ -1537,6 +1541,7 @@ impl Cluster {
             }
         }
         let mut proposed: Option<Vec<u8>> = None;
+        let mut applied = false;
         for round in 0..rounds {
             // The log has room: a refusal the schedule armed before it settled, taken by the
             // replica only now, stalls it, and the owner says room was freed, as it does once a
@@ -1562,9 +1567,14 @@ impl Cluster {
             if let Some(data) = &proposed
                 && self.applied_by_all(leader, data)
             {
-                self.check_reads_answered();
-                return true;
+                applied = true;
+                if self.reads_unanswered().is_empty() {
+                    return true;
+                }
             }
+        }
+        if applied {
+            self.check_reads_answered();
         }
         false
     }
@@ -1573,20 +1583,7 @@ impl Cluster {
     /// crashed or stopped leading the term it took the read in: a leader that keeps leading
     /// confirms what it took, its group whole and its writes durable.
     fn check_reads_answered(&mut self) {
-        let ids: Vec<u64> = self.nodes.iter().map(|n| n.id).collect();
-        let leading: Vec<(u64, u64)> = ids
-            .into_iter()
-            .filter_map(|id| {
-                let r = self.replica(id)?;
-                r.is_leader().then(|| (id, r.term()))
-            })
-            .collect();
-        let held: Vec<(Vec<u8>, u64, u64)> = self
-            .asked_reads
-            .iter()
-            .filter(|(_, (member, term))| leading.contains(&(*member, *term)))
-            .map(|(context, (member, term))| (context.clone(), *member, *term))
-            .collect();
+        let held = self.reads_unanswered();
         for (_, member, _) in &held {
             let r = self.replica(*member).expect("a leader is up");
             let (confirmed, core) = (r.reads_held(), r.core().raft.reads_held());
@@ -1604,6 +1601,24 @@ impl Cluster {
             "reads a leader took in its term and still leads, unanswered once the group settled: \
              {held:?}"
         );
+    }
+
+    /// The reads a member took in a term it still leads and has not answered: context, member,
+    /// term.
+    fn reads_unanswered(&mut self) -> Vec<(Vec<u8>, u64, u64)> {
+        let ids: Vec<u64> = self.nodes.iter().map(|n| n.id).collect();
+        let leading: Vec<(u64, u64)> = ids
+            .into_iter()
+            .filter_map(|id| {
+                let r = self.replica(id)?;
+                r.is_leader().then(|| (id, r.term()))
+            })
+            .collect();
+        self.asked_reads
+            .iter()
+            .filter(|(_, (member, term))| leading.contains(&(*member, *term)))
+            .map(|(context, (member, term))| (context.clone(), *member, *term))
+            .collect()
     }
 
     /// A round with no faults: every member drives, makes its writes durable and drives again,

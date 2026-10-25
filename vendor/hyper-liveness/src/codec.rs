@@ -2,8 +2,13 @@
 //!
 //! ```text
 //! kind (1) version (1) run (8) seq (8) interval (8) floor (8) ask (8) sent (8) late (8)
-//! flushes (8) flush_age (8) echo flag (1) [echo sent (8) echo late (8) echo hold (8)]
+//! flushes (8) flush_age (8) flags (1) [echo sent (8) echo late (8) echo hold (8)]
 //! ```
+//!
+//! The flags: bit 0, an echo follows; bit 1, the run stops here, in order ([`Heartbeat::stopping`]).
+//! Any other bit set is refused. A build that read only bit 0 refuses a stopping heartbeat as
+//! malformed and judges the stop as it judges any silence, which loses it nothing it had: the
+//! version stays, so every other heartbeat of a new build reads as before.
 //!
 //! The plane seals, authenticates and checksums every datagram (CRC-32C under AES-256-GCM), so the
 //! message carries no checksum of its own. Times are nanoseconds on the sender's clock, never
@@ -19,7 +24,7 @@ pub const KIND: u8 = 0x4c;
 /// count the sender raises at every start, where version 1's `boot` was any value its node never
 /// reused, which a receiver could not order; a version 1 heartbeat is refused, not misread.
 pub const VERSION: u8 = 2;
-/// The bytes before the echo: kind, version, nine eight-byte fields and the echo flag.
+/// The bytes before the echo: kind, version, nine eight-byte fields and the flags.
 const HEAD_BYTES: usize = 2 + 9 * 8 + 1;
 /// The echo's three eight-byte fields.
 const ECHO_BYTES: usize = 3 * 8;
@@ -68,7 +73,16 @@ pub struct Heartbeat {
     pub flush_age_ns: u64,
     /// The latest heartbeat the sender had from the receiver, if any.
     pub echo: Option<Echo>,
+    /// The sender's run ends with this heartbeat, in order: its node is stopping and sends no
+    /// more of the run (`Liveness::stop`). No evidence of life, which its proof fields are not
+    /// held to: the receiver takes the run's end from it and nothing else.
+    pub stopping: bool,
 }
+
+/// Format: the flags' bit 0, an echo follows.
+const ECHO: u8 = 1;
+/// Format: the flags' bit 1, the run stops here ([`Heartbeat::stopping`]).
+const STOPPING: u8 = 2;
 
 fn put(out: &mut [u8; MAX_BYTES], at: &mut usize, value: u64) {
     if let Some(slot) = at.checked_add(8).and_then(|end| out.get_mut(*at..end)) {
@@ -103,8 +117,9 @@ impl Heartbeat {
         ] {
             put(out, &mut at, value);
         }
-        if let Some(flag) = out.get_mut(at) {
-            *flag = u8::from(self.echo.is_some());
+        if let Some(flags) = out.get_mut(at) {
+            *flags = if self.echo.is_some() { ECHO } else { 0 }
+                | if self.stopping { STOPPING } else { 0 };
         }
         at = at.saturating_add(1);
         if let Some(echo) = self.echo {
@@ -141,15 +156,18 @@ impl Heartbeat {
             flushes,
             flush_age_ns,
         ] = fields;
-        let (flag, mut rest) = rest.split_first().ok_or(Refusal::Truncated)?;
-        let echo = match flag {
-            0 => None,
-            1 => Some(Echo {
+        let (&flags, mut rest) = rest.split_first().ok_or(Refusal::Truncated)?;
+        if flags & !(ECHO | STOPPING) != 0 {
+            return Err(Refusal::Malformed);
+        }
+        let echo = if flags & ECHO == 0 {
+            None
+        } else {
+            Some(Echo {
                 sent_ns: take(&mut rest)?,
                 late_ns: take(&mut rest)?,
                 hold_ns: take(&mut rest)?,
-            }),
-            _ => return Err(Refusal::Malformed),
+            })
         };
         if !rest.is_empty() {
             return Err(Refusal::Malformed);
@@ -165,6 +183,7 @@ impl Heartbeat {
             flushes,
             flush_age_ns,
             echo,
+            stopping: flags & STOPPING != 0,
         })
     }
 }
@@ -183,8 +202,9 @@ mod tests {
         (
             prop::array::uniform9(any::<u64>()),
             prop::option::of(prop::array::uniform3(any::<u64>())),
+            any::<bool>(),
         )
-            .prop_map(|(f, echo)| Heartbeat {
+            .prop_map(|(f, echo, stopping)| Heartbeat {
                 run: f[0],
                 seq: f[1],
                 interval_ns: f[2],
@@ -199,6 +219,7 @@ mod tests {
                     late_ns: e[1],
                     hold_ns: e[2],
                 }),
+                stopping,
             })
     }
 
@@ -233,8 +254,10 @@ mod tests {
         }
     }
 
+    /// A flag past the two bits is refused; a stopping heartbeat is refused by a build that reads
+    /// only the echo's bit, as this one refuses any flag it does not know.
     #[test]
-    fn an_echo_flag_other_than_zero_or_one_is_malformed() {
+    fn a_flag_past_the_two_bits_is_malformed() {
         let beat = Heartbeat {
             run: 1,
             seq: 2,
@@ -246,10 +269,19 @@ mod tests {
             flushes: 8,
             flush_age_ns: 9,
             echo: None,
+            stopping: false,
         };
         let mut out = [0u8; MAX_BYTES];
         let mut bytes = beat.encode(&mut out).to_vec();
-        *bytes.last_mut().unwrap() = 2;
+        *bytes.last_mut().unwrap() = 4;
         assert_eq!(Heartbeat::decode(&bytes), Err(Refusal::Malformed));
+        *bytes.last_mut().unwrap() = STOPPING;
+        assert_eq!(
+            Heartbeat::decode(&bytes),
+            Ok(Heartbeat {
+                stopping: true,
+                ..beat
+            })
+        );
     }
 }

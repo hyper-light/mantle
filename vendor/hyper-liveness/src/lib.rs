@@ -405,6 +405,8 @@ pub struct Liveness {
     /// heartbeat, it was three maxima a heartbeat that every configured pair threw away
     /// (`docs/benchmarks.md`, "The node's evidence, kept").
     evidence: Option<Arrivals>,
+    /// The node's run stopped in order ([`Liveness::stop`]): it sends nothing more.
+    stopped: bool,
 }
 
 /// The margins a pair that waits for one takes from its node's pool: its own link's, or, for a
@@ -532,6 +534,7 @@ impl Liveness {
             own: Own::default(),
             configured: None,
             evidence: None,
+            stopped: false,
         })
     }
 
@@ -647,12 +650,13 @@ impl Liveness {
     }
 
     /// One group fewer shared with `peer`: with its last the pair's stream ends and its state
-    /// goes. A peer let go while suspected counts as a failure in the MTBF's evidence.
+    /// goes. A peer let go while suspected counts as a failure in the MTBF's evidence, unless its
+    /// run had announced its stop.
     pub fn detach(&mut self, peer: PeerId) -> Result<(), Refusal> {
         let pair = self.pairs.get_mut(&peer).ok_or(Refusal::UnknownPeer)?;
         pair.groups = pair.groups.saturating_sub(1);
         if pair.groups == 0 {
-            if pair.trust() == Trust::Suspected {
+            if pair.trust() == Trust::Suspected && !pair.stopped() {
                 self.exposure.on_failure();
             }
             self.pairs.remove(&peer);
@@ -738,7 +742,10 @@ impl Liveness {
             .into_iter()
             .flatten()
             .min();
-        if taken.restarted {
+        // A restart after a stop the peer announced is its owner's, made in order, not a failure:
+        // the MTBF counts what a detector must catch (`docs/timing.md` §2.2), and an orderly stop
+        // handed over what it led before it ended.
+        if taken.restarted && !taken.after_stop {
             self.exposure.on_failure();
         }
         if taken.configured {
@@ -750,10 +757,38 @@ impl Liveness {
         {
             self.feed_pool(lateness, Duration::from_nanos(beat.interval_ns));
         }
-        if self.evidence.is_none() && outcome.is_ok() {
+        if self.evidence.is_none() && outcome.is_ok() && !taken.stopping {
             self.pool_starves_ns = self.starves(arrival_ns);
         }
         outcome
+    }
+
+    /// This node's run ends in order, at `now_ns` (its owner stops, having handed over what it
+    /// led): each peer it shares a group with is sent a heartbeat that says so
+    /// ([`Heartbeat::stopping`]), and the node sends nothing after it. A peer that takes it counts
+    /// the node's next run, or its letting go of the pair while it suspects the node, as no failure
+    /// in the MTBF's evidence, and sends the run nothing more. Lost, or taken by a build that does
+    /// not read it, it costs what an unannounced stop costs: the peer suspects the node as its
+    /// heartbeats stop, and counts its restart a failure. Call it once, as the stop's last act on
+    /// the plane; a poll after it judges and sends nothing.
+    pub fn stop(&mut self, now_ns: u64, out: &mut impl Output) {
+        if std::mem::replace(&mut self.stopped, true) {
+            return;
+        }
+        let sender = pair::Sender {
+            local_run: self.run,
+            floor: self.floor_at(self.granularity()),
+            granularity: self.granularity(),
+            durable_count: self.durable.count,
+            durable_ns: self.durable.latest_ns,
+        };
+        for (&peer, pair) in &mut self.pairs {
+            let length = pair.goodbye(&sender, now_ns, &mut self.message);
+            if let Some(message) = self.message.get(..length).filter(|bytes| !bytes.is_empty()) {
+                out.heartbeat(peer, message);
+            }
+        }
+        self.next_wake = None;
     }
 
     /// Advances to `now_ns`: suspects peers whose freshness passed, sends the heartbeats due that
@@ -811,9 +846,12 @@ impl Liveness {
             if let Some(change) = change {
                 out.change(change);
             }
-            // Its own stream is read only while the node has no measured evidence.
-            let own = self.evidence.is_none().then_some(&mut self.own);
-            wants_flush |= send(pair, peer, &sender, now_ns, &mut self.message, own, out);
+            // Its own stream is read only while the node has no measured evidence. A node whose run
+            // stopped sends nothing more.
+            if !self.stopped {
+                let own = self.evidence.is_none().then_some(&mut self.own);
+                wants_flush |= send(pair, peer, &sender, now_ns, &mut self.message, own, out);
+            }
             wake = earliest(wake, pair, &local, now_ns);
         }
         // The stream wants a proof it lacks: from now, unless it has waited since earlier.
@@ -961,5 +999,12 @@ impl Liveness {
     /// The MTBF the detectors are configured with, once there is exposure.
     pub fn mtbf(&self) -> Option<Duration> {
         self.exposure.mtbf()
+    }
+
+    /// The failure evidence the MTBF is read from: the history the node started with
+    /// ([`Settings::history`]), the node time watched since, and the failures counted. What an
+    /// owner keeps to start its next run from (`hyper_timing::Exposure::of`).
+    pub fn history(&self) -> Exposure {
+        self.exposure
     }
 }

@@ -673,6 +673,8 @@ fn parse_record(fields: &[&str]) -> Option<(u64, Entry, Option<u64>)> {
                     stamp: number(5)?,
                     due: number(6)?,
                     sent: number(7)?,
+                    // The member processes stop by a signal, never in order.
+                    stopping: false,
                 },
                 refused: parse_refusal(fields.get(8)?)?,
                 holds: parse_trust(fields.get(9)?)?,

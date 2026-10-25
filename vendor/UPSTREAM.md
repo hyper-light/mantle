@@ -86,9 +86,27 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `313ada8` (hyper-raft branch `backoff-announced`: `dd764a0` and four commits,
-CI run 40139950654, green on all 21 jobs; the same code is on hyper-raft `main` at `af01c51`),
-with no local delta**, taken by `scripts/snapshot-hyper-raft.py`: hyper-liveness's `1088cfa`, a
+**Every crate at `e65afff` (hyper-raft branch `degraded-suspicion`: `313ada8` and fifteen
+commits, made for mantle's roll and objects tests on CI's busy runners), with no local delta**,
+taken by `scripts/snapshot-hyper-raft.py`: hyper-raft's `d97153c`, a leader its detectors leave no
+quorum leading on and handing over only to a voter that can be elected without it, and a
+pre-candidate left no quorum no longer asking, so a false suspicion between the two live voters of
+a group with one voter stopped costs no leadership (mantle's roll: terms 5 to 9 in 1.7 s, and a
+livelock of terms 3 to 8 in 100 ms, on two CPUs beside two busy loops), model-checked
+(`Suspicion.tla`, `d0b2b5d`, `378ea46`) with a test that such a leader answers no read without a
+quorum's acknowledgement (`0c38cbb`); hyper-transport's `83f2047` (main's `1912194`), a stream its
+peer reads in steps never refused as unread while it moves, where the unread rule judged a stream
+by its state at each judgement alone (mantle's busy-runner trace: a gateway refused its client
+`Stalled` after a window in which it took 312 of the client's MAX_DATA frames, the client reading
+about 1.2 MB/s throughout), and `b095920` (main's `4da10dd`), a request smaller than a datagram
+given its peer's period to answer; hyper-liveness's `1d35ad7`, an orderly stop announced to its
+peers (`Liveness::stop`), whose MTBF evidence counts no failure at its restart and which send the
+stopped run nothing more, and `85ab02b`, a run that has taken none of this node's heartbeats
+having its ask taken once it has; hyper-timing's `5bccc5a`, stored failure evidence taken whole
+(`Exposure::of`); and docs and tests (`2f7de21`, `49e54aa`, `808d1bd`, `adc0549`, `55d80cf`,
+`e65afff`). Before it, every crate was at `313ada8` (hyper-raft branch `backoff-announced`:
+`dd764a0` and four commits, CI run 40139950654, green on all 21 jobs; the same code is on hyper-raft
+`main` at `af01c51`), with no local delta: hyper-liveness's `1088cfa`, a
 stream that backs off doubling the gap it states and a peer it has not heard expecting each
 doubling, where `f647365`'s back-off doubled the gap unannounced, so each doubling arrived a whole
 gap past the receiver's freshness point and a restarted node that heard no peer was suspected by

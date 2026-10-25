@@ -816,6 +816,12 @@ pub struct Server {
     /// A request body longer than this is never read (0: every body is read): a peer that holds
     /// a stream it accepted, its bytes in its buffer and none of its credit given back.
     pub unread_above: u64,
+    /// The request bodies the server reads, by `now`: `bytes` at the start of each `every` (none:
+    /// all that has arrived, as it arrives). A peer that takes what it is sent at its own pace and
+    /// in its own steps, the credit it gives back coming in those steps.
+    pub pace: Option<(u64, Duration)>,
+    /// When the paced reads began, by `now`, and what they have read since.
+    paced: Option<(Instant, u64)>,
     /// The clock the think time is read against, as the test last set it.
     pub now: Option<Instant>,
     pub answered: u64,
@@ -834,6 +840,8 @@ impl Server {
             hold_bulk: false,
             think: Duration::ZERO,
             unread_above: 0,
+            pace: None,
+            paced: None,
             now: None,
             answered: 0,
             frames: Vec::new(),
@@ -915,6 +923,23 @@ impl Server {
         self.served = served;
     }
 
+    /// The most of a body the server reads now: a piece, or what its pace has left of it.
+    fn piece(&mut self) -> u64 {
+        let (Some((bytes, every)), Some(now)) = (self.pace, self.now) else {
+            return PIECE as u64;
+        };
+        let (from, read) = *self.paced.get_or_insert((now, 0));
+        let steps = u64::try_from(now.duration_since(from).as_nanos() / every.as_nanos()).unwrap();
+        (bytes * (steps + 1)).saturating_sub(read).min(PIECE as u64)
+    }
+
+    /// What a paced read took, counted against the pace.
+    fn paced_read(&mut self, got: &Result<usize, Refusal>) {
+        if let (Some(_), Ok(got), Some((_, read))) = (self.pace, got, self.paced.as_mut()) {
+            *read += *got as u64;
+        }
+    }
+
     /// Moves one exchange on; whether it is done.
     fn advance<C: Classes<Kind = Kind, Class = Class, Role = Role>>(
         &mut self,
@@ -928,10 +953,15 @@ impl Server {
             return false;
         }
         while served.read < served.body {
-            let Ok(mut into) = node.reserve(served.class, PIECE as u64) else {
+            let piece = self.piece();
+            if piece == 0 {
+                return false;
+            }
+            let Ok(mut into) = node.reserve(served.class, piece) else {
                 return false;
             };
             let got = node.read_body(served.exchange, &mut into);
+            self.paced_read(&got);
             for (at, byte) in into.bytes().iter().enumerate() {
                 assert_eq!(
                     *byte,

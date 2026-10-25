@@ -124,6 +124,11 @@ pub(crate) struct Taken {
     pub(crate) own: bool,
     /// Whether it configured the pair's detector anew.
     pub(crate) configured: bool,
+    /// The run before the one it began had announced its stop ([`Heartbeat::stopping`]): the
+    /// restart is no failure.
+    pub(crate) after_stop: bool,
+    /// It was the peer's announcement that its run stops, not a heartbeat taken.
+    pub(crate) stopping: bool,
 }
 
 /// The wider of two behaviours, each measure the larger: an upper bound on both. The bound on a
@@ -221,6 +226,18 @@ impl Stream {
             self.expected_ns = Some(now_ns);
         }
     }
+
+    /// The peer started its next run, at `now_ns`, after announcing the end of the last, and the
+    /// stream sent it nothing since: it sends its next number at once, the schedule starting
+    /// anew there, where the slots of the stop would have been skipped, each the next heartbeat's
+    /// lateness at a peer that judges this node from its own start.
+    fn resume(&mut self, now_ns: u64) {
+        if self.next.is_some() {
+            let seq = self.sent.map_or(0, |sent| sent.saturating_add(1));
+            self.next = Some((seq, now_ns));
+            self.expected_ns = Some(now_ns);
+        }
+    }
 }
 
 /// How a peer from which no heartbeat has come is judged: from when the node first attached the
@@ -290,6 +307,9 @@ struct Received {
     /// The longest gap the peer may leave before its next heartbeat when its latest echoed nothing,
     /// nanoseconds ([`unanswered_next`]); zero once it echoes this node.
     unanswered_next_ns: u64,
+    /// The run taken last announced its stop ([`Heartbeat::stopping`]): it is sent nothing more,
+    /// and its next run's start is no failure.
+    stopped: bool,
 }
 
 /// What a pair counts: the counters of its [`PairReport`], the rest of which is read from the
@@ -458,7 +478,15 @@ impl Pair {
 
     /// When the next heartbeat to the peer is due.
     pub(crate) fn next_due(&self) -> Option<u64> {
+        if self.received.stopped {
+            return None;
+        }
         self.stream.next.map(|(_, due)| due)
+    }
+
+    /// Whether the peer's run taken last announced its stop.
+    pub(crate) fn stopped(&self) -> bool {
+        self.received.stopped
     }
 
     /// The peer's freshness point, while trusted: read at every poll of every pair.
@@ -589,7 +617,9 @@ impl Pair {
     /// its schedule sends the latest heartbeat due; the ones it skipped are never sent, and the
     /// peer takes them as that heartbeat's lateness, the stall's delay (`docs/timing.md` §2.2).
     pub(crate) fn send(&mut self, sender: &Sender, now_ns: u64, out: &mut [u8; MAX_BYTES]) -> Sent {
-        if self.groups == 0 {
+        // A peer whose run announced its stop is sent nothing until its next run is heard: no one
+        // listens, and each heartbeat would ask a flush of its own.
+        if self.groups == 0 || self.received.stopped {
             return Sent::Nothing;
         }
         // Not due: every poll asks every pair, and most have nothing due. A heartbeat is scheduled
@@ -676,6 +706,7 @@ impl Pair {
             flushes: sender.durable_count,
             flush_age_ns: sent_ns.saturating_sub(durable_ns),
             echo,
+            stopping: false,
         };
         let length = beat.encode(out).len();
         let own = self
@@ -703,6 +734,40 @@ impl Pair {
         self.stream.expected_ns = Some(due.saturating_add(interval));
         self.counts.sent = self.counts.sent.saturating_add(1);
         Sent::Message(length, own)
+    }
+
+    /// The heartbeat that ends this node's run, in order ([`Heartbeat::stopping`]), written into
+    /// `out`: its bytes, or none where the pair shares no group. Numbered after the latest sent and
+    /// stated at the stream's interval; no flush proves it, for it claims no life.
+    pub(crate) fn goodbye(
+        &mut self,
+        sender: &Sender,
+        now_ns: u64,
+        out: &mut [u8; MAX_BYTES],
+    ) -> usize {
+        if self.groups == 0 {
+            return 0;
+        }
+        let seq = self.stream.sent.map_or(0, |sent| sent.saturating_add(1));
+        let beat = Heartbeat {
+            run: sender.local_run,
+            seq,
+            interval_ns: self.stream.interval_ns,
+            floor_ns: sender.floor.map_or(0, nanos),
+            ask_ns: 0,
+            sent_ns: now_ns,
+            late_ns: 0,
+            flushes: sender.durable_count,
+            flush_age_ns: sender
+                .durable_ns
+                .map_or(0, |durable| now_ns.saturating_sub(durable)),
+            echo: None,
+            stopping: true,
+        };
+        self.stream.sent = Some(seq);
+        self.stream.next = None;
+        self.counts.sent = self.counts.sent.saturating_add(1);
+        beat.encode(out).len()
     }
 
     /// The peer's freshness at `now_ns`, with the node's own durability: a suspicion when its point
@@ -844,6 +909,7 @@ impl Pair {
             _ => {}
         }
         let restarted = self.received.run.is_some();
+        self.received.stopped = false;
         if restarted && let Some(link) = self.received.link.as_mut() {
             link.estimator.forget_expected();
         }
@@ -875,8 +941,23 @@ impl Pair {
         taken: &mut Taken,
     ) -> Result<(), Refusal> {
         changes[0] = self.judge(peer, arrival_ns, &context.local).0;
+        if beat.stopping {
+            // The run the peer stops, if it is the one taken: no evidence of life, which changes
+            // nothing the detector holds. An announcement of a run not taken announces nothing
+            // known: the restart after it is judged by the run that was.
+            taken.stopping = true;
+            self.received.stopped |= self.received.run == Some(beat.run);
+            return Ok(());
+        }
         let first_heard = self.received.run.is_none();
+        let after_stop = self.received.stopped;
         if self.begin_run(beat.run)? {
+            taken.after_stop = after_stop;
+            if after_stop {
+                // A run started after its peer's announced stop, which was sent nothing since:
+                // the stream goes on from its next number at once, skipping no slot of the stop.
+                self.stream.resume(arrival_ns);
+            }
             // A new incarnation, which the owner's core trusts and holds to lead nothing it led.
             self.told = false;
             taken.restarted = true;
@@ -897,14 +978,7 @@ impl Pair {
             return Err(Refusal::Unproven);
         }
         self.received.flushes = beat.flushes;
-        self.received.floor_ns = beat.floor_ns;
-        self.stream.asked_ns = beat.ask_ns;
-        self.received.echo = Some((beat.sent_ns, beat.late_ns, arrival_ns));
-        if let Some(sum) = self.round_trip_sum(beat, arrival_ns) {
-            self.received
-                .offset
-                .echoed(arrival_ns, beat.sent_ns.saturating_sub(beat.late_ns), sum);
-        }
+        self.keep_said(beat, arrival_ns);
         let granularity = context.granularity.ok_or(Refusal::Unmeasured)?;
         let mapped = self
             .received
@@ -1036,6 +1110,30 @@ impl Pair {
         link.estimator.impose(detector.margin);
         self.received.pooled = Some((behaviour, taken, measured));
         self.received.pooled_ask_ns = ask_ns;
+    }
+
+    /// What a heartbeat taken says of the peer and of this node's stream: the peer's floor, its
+    /// ask, the heartbeat to echo, and the round trip its echo closes.
+    ///
+    /// The interval the peer asks of this node's stream is its detector's choice from that
+    /// stream's heartbeats, and a run that has taken none of them (its heartbeat echoes none) chose
+    /// from nothing of it: its ask is taken once it has. A peer started again at an address its
+    /// peers did not yet know asked no interval for as long as it heard none of theirs, and each
+    /// stream to it, taking that, went to its floor, a flush a heartbeat sent where no one listened
+    /// (mantle's roll: 40 to 200 liveness writes a second against 1 to 2;
+    /// `a_restarted_runs_ask_is_taken_once_it_has_taken_a_heartbeat`). The stream keeps the
+    /// interval it was at; a first run's stream starts from no ask, its floor, as before.
+    fn keep_said(&mut self, beat: &Heartbeat, arrival_ns: u64) {
+        self.received.floor_ns = beat.floor_ns;
+        if beat.echo.is_some() {
+            self.stream.asked_ns = beat.ask_ns;
+        }
+        self.received.echo = Some((beat.sent_ns, beat.late_ns, arrival_ns));
+        if let Some(sum) = self.round_trip_sum(beat, arrival_ns) {
+            self.received
+                .offset
+                .echoed(arrival_ns, beat.sent_ns.saturating_sub(beat.late_ns), sum);
+        }
     }
 
     /// The delay sum of `beat`'s echo (the `bound` module): the round trip on this node's clock,
@@ -1258,6 +1356,7 @@ mod tests {
             flushes: seq + 1,
             flush_age_ns: 0,
             echo: None,
+            stopping: false,
         }
     }
 

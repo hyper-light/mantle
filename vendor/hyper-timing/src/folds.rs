@@ -229,6 +229,14 @@ impl Exposure {
         }
     }
 
+    /// The evidence an owner kept: `exposure` of node time run and `failures` counted over it, as
+    /// stored totals (mantle keeps each node's uptime and its crashes in its root range and gives
+    /// their sums at each start). Taken whole, not rebuilt by a call of [`Exposure::on_failure`]
+    /// for each failure stored, a loop bounded only by a stored value.
+    pub const fn of(exposure: Duration, failures: u64) -> Self {
+        Self { exposure, failures }
+    }
+
     /// Node time run: the sum over nodes of the time each was up. Saturating: past `Duration::MAX`
     /// of exposure, more changes nothing measurable.
     pub fn on_exposure(&mut self, node_time: Duration) {
@@ -361,5 +369,30 @@ mod tests {
         fleet.on_exposure(Duration::from_secs(3_600));
         assert_eq!(fleet.mtbf(), Some(Duration::from_secs(4_800)), "T / 1.5");
         assert_eq!(fleet.failures(), 1);
+    }
+
+    /// Stored totals give the evidence they were taken from: the same MTBF as the folds that made
+    /// them, at once for any count, and none before any exposure.
+    #[test]
+    fn stored_totals_are_the_evidence_they_were_taken_from() {
+        let mut folded = Exposure::new();
+        folded.on_exposure(Duration::from_secs(5_400));
+        for _ in 0..3 {
+            folded.on_failure();
+        }
+        let stored = Exposure::of(Duration::from_secs(5_400), 3);
+        assert_eq!(stored, folded);
+        assert_eq!(
+            stored.mtbf(),
+            Duration::try_from_secs_f64(5_400.0 / 3.5).ok(),
+            "T / (k + 1/2)"
+        );
+        let most = Exposure::of(Duration::from_secs(1), u64::MAX);
+        assert_eq!(most.failures(), u64::MAX);
+        assert!(
+            most.mtbf()
+                .is_some_and(|mtbf| mtbf < Duration::from_nanos(1))
+        );
+        assert_eq!(Exposure::of(Duration::ZERO, 7).mtbf(), None);
     }
 }

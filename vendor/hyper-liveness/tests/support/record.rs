@@ -39,6 +39,8 @@ pub(crate) struct Beat {
     pub(crate) stamp: u64,
     pub(crate) due: u64,
     pub(crate) sent: u64,
+    /// The sender's announcement that its run stops: no heartbeat taken.
+    pub(crate) stopping: bool,
 }
 
 impl Beat {
@@ -51,6 +53,7 @@ impl Beat {
             stamp,
             due: beat.sent_ns.saturating_sub(beat.late_ns),
             sent: beat.sent_ns,
+            stopping: beat.stopping,
         })
     }
 
@@ -128,9 +131,15 @@ impl Record {
                 self.stated.clear();
                 self.own = OwnProof::default();
             }
-            Entry::Fed { peer, refused, .. } => {
+            Entry::Fed {
+                peer,
+                refused,
+                beat,
+                ..
+            } => {
                 let counted = self.counted.entry(peer).or_default();
                 match refused {
+                    None if beat.stopping => {}
                     None => counted.taken += 1,
                     Some(Refusal::Unproven) => counted.unproven += 1,
                     Some(_) => {}
@@ -423,7 +432,7 @@ impl Tracer<'_> {
                     held.run = Some(beat.run);
                     held.last = None;
                 }
-                if refused.is_none() {
+                if refused.is_none() && !beat.stopping {
                     held.last = Some(beat.last());
                 }
                 held.holds = holds;

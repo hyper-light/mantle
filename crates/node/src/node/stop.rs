@@ -5,7 +5,9 @@
 //! its rounds), the range still this node's, is begun again, to another voter where there is one:
 //! on a loaded host a target can take longer than the core's rounds to campaign, and a range left
 //! as it was would elect only after this node is gone, with no leader meanwhile, the gap the
-//! stop is for. The stop's bound ends the tries. Then it takes no connection, closes each it holds
+//! stop is for. The stop's bound ends the tries. Then it tells its peers' liveness streams the run
+//! ends in order (hyper-liveness `Liveness::stop`: its restart no failure, the run sent nothing
+//! more), takes no connection, closes each it holds
 //! and keeps each in its closing state until it drains (RFC 9000 §10.2: the node keeps the socket
 //! its peers know, and answers their late packets). Each turn steps it ([`Node::step_stop`]); once
 //! it is done ([`Node::stopped`]) nothing the node holds is owed to the cell, and its process closes
@@ -78,6 +80,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Stopping::Handing(out) => {
                 let out = self.handing(out);
                 if out.is_empty() {
+                    // Every range handed over: the stop's last act on the plane tells each peer
+                    // this run ends in order, so its next run is no failure in their MTBF's
+                    // evidence and they send this one nothing more (hyper-liveness
+                    // `Liveness::stop`), queued now so this turn's plane sends it.
+                    self.liveness
+                        .stop(hyper_rt::futures::now_ns(), &mut self.asked);
+                    self.act_on_liveness()?;
                     self.refuse_connections()?;
                     Stopping::Closing
                 } else {

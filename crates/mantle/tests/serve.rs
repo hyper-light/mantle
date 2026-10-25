@@ -527,6 +527,13 @@ fn a_cell_made_by_init_rolls_one_node_at_a_time_and_reads_every_object_back() {
             .filter(|(node, _)| *node != stopping)
             .collect();
         if !said.is_empty() {
+            eprintln!(
+                "DIAG wall now {:.1}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64() * 1000.0)
+                    .unwrap_or(0.0)
+            );
             let now = std::time::Instant::now();
             for (at, what) in &cell.diag_seen {
                 eprintln!(

@@ -495,6 +495,24 @@ struct Remote {
     ended: u64,
     suspected: u64,
     refusal: Option<Refusal>,
+    /// DIAG (scratch): whether the owner was last told the peer is suspected, and the latest
+    /// heartbeats from it, each as fed.
+    diag_told: bool,
+    diag_beats: VecDeque<String>,
+}
+
+/// DIAG (scratch): a liveness trace line on standard error with the wall clock, at most 20,000 a
+/// process.
+fn diag_l(local: u64, what: std::fmt::Arguments<'_>) {
+    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 20_000 {
+        return;
+    }
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .unwrap_or(0.0);
+    eprintln!("DIAG-L t={wall:.1} n={local} {what}");
 }
 
 /// A chunk put or get this node asked of a peer, out on an exchange.
@@ -916,6 +934,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 ended: 0,
                 suspected: 0,
                 refusal: None,
+                diag_told: false,
+                diag_beats: VecDeque::new(),
             })
             .collect();
         let mut node = Self {
@@ -1516,9 +1536,46 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Some((first, _)) if *first == hyper_liveness::KIND => {
                     // A heartbeat the stream refuses (stale, malformed) is dropped, as the
                     // network may drop it.
-                    let _ = self
-                        .liveness
-                        .on_heartbeat(sender, &message, arrival, &mut self.asked);
+                    let before = self.liveness.trust(sender);
+                    let outcome =
+                        self.liveness
+                            .on_heartbeat(sender, &message, arrival, &mut self.asked);
+                    let after = self.liveness.trust(sender);
+                    let wall = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs_f64() * 1000.0)
+                        .unwrap_or(0.0);
+                    let beat = match hyper_liveness::Heartbeat::decode(&message) {
+                        Ok(b) => format!(
+                            "run {} seq {} ivl {:.1} floor {:.1} ask {:.1} sent {} late {:.1} \
+                             flushes {} age {:.1} echo {}",
+                            b.run,
+                            b.seq,
+                            b.interval_ns as f64 / 1e6,
+                            b.floor_ns as f64 / 1e6,
+                            b.ask_ns as f64 / 1e6,
+                            b.sent_ns,
+                            b.late_ns as f64 / 1e6,
+                            b.flushes,
+                            b.flush_age_ns as f64 / 1e6,
+                            b.echo.is_some()
+                        ),
+                        Err(e) => format!("undecodable {e:?}"),
+                    };
+                    let note = format!(
+                        "t={wall:.1} arrival {arrival} {beat} -> {outcome:?} trust {before:?} -> \
+                         {after:?}"
+                    );
+                    let id = self.id;
+                    if let Some(remote) = self.remotes.iter_mut().find(|r| r.id == sender) {
+                        if remote.diag_told || outcome.is_err() {
+                            diag_l(id, format_args!("beat from {sender} told {} {note}", remote.diag_told));
+                        }
+                        remote.diag_beats.push_back(note);
+                        if remote.diag_beats.len() > 12 {
+                            remote.diag_beats.pop_front();
+                        }
+                    }
                     self.liveness_moved = true;
                 }
                 _ => {}
@@ -1586,6 +1643,27 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let _ = self.plane.queue(peer, &message);
         }
         for change in std::mem::take(&mut self.asked.changes) {
+            let now_diag = hyper_rt::futures::now_ns();
+            diag_l(
+                self.id,
+                format_args!(
+                    "change at {now_diag} {change:?} own {:?} floor {:?} flush_mean {:?} gran {:?} rep {:?}",
+                    self.liveness.own_proof(),
+                    self.liveness.floor(),
+                    self.liveness.flush_mean(),
+                    self.liveness.granularity(),
+                    self.liveness.report(change.peer())
+                ),
+            );
+            let id = self.id;
+            if let Some(remote) = self.remotes.iter_mut().find(|r| r.id == change.peer()) {
+                remote.diag_told = matches!(change, Change::Suspected(_));
+                if remote.diag_told {
+                    for beat in &remote.diag_beats {
+                        diag_l(id, format_args!("before suspicion of {}: {beat}", remote.id));
+                    }
+                }
+            }
             if let Change::Suspected(suspicion) = &change
                 && let Some(remote) = self.remotes.iter_mut().find(|r| r.id == suspicion.peer)
             {

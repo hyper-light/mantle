@@ -1,4 +1,4 @@
-name: diag-roll-busy
+name: diag-roll-busy-liveness
 # Scratch: the serve suite as CI's busy jobs run it (built with every CPU, then run on the CPUs
 # named beside busy loops), rounds until the roll test says a member had no leader (CI run
 # 40139142704, linux-x86_64-2cpu-busy: both remaining members said every range had no leader after
@@ -49,6 +49,11 @@ jobs:
               grep -a -A3 "panicked" "round-$round.txt" | cut -c1-400 || true
               grep -a "DIAG heard" "round-$round.txt" | grep -av "Log(\|Basis(" | cut -c1-260 || true
               grep -a "DIAG lines over" "round-$round.txt" | grep -a "MARK" | cut -c1-600 || true
+              grep -a "DIAG wall now" "round-$round.txt" || true
+              echo "DIAG-L lines in the round: $(grep -ac 'DIAG-L' "round-$round.txt")"
+              ids=$(grep -a "MARK roll begins" "round-$round.txt" | tail -1 | grep -oE '\[[0-9, ]+\]' | tr -d '[],')
+              echo "=== DIAG-L of the roll's nodes: $ids"
+              for id in $ids; do grep -a "DIAG-L t=[0-9.]* n=$id " "round-$round.txt" || true; done | sort -t= -k2 -n | cut -c1-900 || true
               break
             fi
           done

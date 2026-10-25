@@ -1532,6 +1532,13 @@ impl Cell {
             match self.heard.recv_timeout(left) {
                 Ok(heard) => self.take(heard),
                 Err(_) => {
+                    eprintln!(
+                        "DIAG wall now {:.1}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs_f64() * 1000.0)
+                            .unwrap_or(0.0)
+                    );
                     let now = Instant::now();
                     for (at, what) in &self.diag_seen {
                         eprintln!(
@@ -1641,7 +1648,7 @@ impl Cell {
             }) = self.status.get(&(*id, *group))
             && (was_term, was_leader) == (term, leader)
         {
-        } else if !matches!(&heard, Heard::Line(_, _, Line::Held(..) | Line::Log(..))) {
+        } else if !matches!(&heard, Heard::Line(_, _, Line::Log(..))) {
             self.diag_note(&heard);
         }
         match heard {

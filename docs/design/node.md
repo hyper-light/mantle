@@ -959,9 +959,11 @@ hosts, and they elect by suspicion over it; items 1, 2, 4, 5, 6 and 7 are built,
   alone, the greater of each total kept, so a statement applied late or twice takes nothing back).
   A node keeps its last orderly stop in its directory beside its run (`layout::Stopped`: the run,
   the node's time run then, and its stops), written whole once the stop is done, its log and
-  volumes closed. Runs are numbered from one, so the runs before a start that did not stop in
-  order, its crashes, are its last run less its stops: exact however many statements crashes
-  lost. At a start the process reads the root range's replica it hosts (an enlisting node hosts
+  volumes closed, and keeps one at a start that finds none, before it raises its run, naming the
+  runs its counts begin from: none for a fresh directory; for one whose runs began before the
+  record was kept, all of them, their ends unknown, so none is counted a crash. Runs are numbered
+  from one, so the runs before a start that did not stop in order, its crashes, are its last run
+  less its stops: exact however many statements crashes lost. At a start the process reads the root range's replica it hosts (an enlisting node hosts
   the root range), sums every node's history (`root::history`, at most the table's nodes), takes
   its own as its directory says, and gives the sum to its stream as `Settings::history`; it says
   what it gave (`history CELL_NS CELL_CRASHES OWN_NS OWN_CRASHES`). Once enlisted it states its

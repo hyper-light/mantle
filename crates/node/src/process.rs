@@ -1342,7 +1342,17 @@ async fn serve(
         });
     }
     let (cell, row) = held;
-    let own = history::at_start(row, last_run, last_stop);
+    // Every start reads a stop record: one the directory has not kept yet is kept now, before the
+    // run is raised, naming the runs its counts begin from.
+    let last_stop = match last_stop {
+        Some(stopped) => stopped,
+        None => {
+            let first = history::first_stop(last_run, row);
+            layout.keep_stopped(first).map_err(kept)?;
+            first
+        }
+    };
+    let own = history::at_start(row, last_run, Some(last_stop));
     let history = history::cell_with(cell, row, own);
     let settings = NodeSettings {
         id: config.id,
@@ -1614,7 +1624,7 @@ async fn serve(
             let stopped = Stopped {
                 run,
                 exposure_ns: own.exposure_ns.saturating_add(ran_ns),
-                stops: last_stop.map_or(0, |s| s.stops).saturating_add(1),
+                stops: last_stop.stops.saturating_add(1),
             };
             layout
                 .keep_stopped(stopped)

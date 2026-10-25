@@ -1396,6 +1396,14 @@ impl Cell {
         let mut running = self.running.remove(&id).unwrap();
         running.child.kill().unwrap();
         running.child.wait().unwrap();
+        eprintln!(
+            "diag-test killed node {id} pid {} wall_ms={}",
+            running.child.id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        );
         self.status.retain(|(node, _), _| *node != id);
         self.held.remove(&id);
         self.log.remove(&id);

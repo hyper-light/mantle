@@ -894,7 +894,7 @@ fn report(
             _ => ('U', 0),
         };
         line.push_str(&format!(
-            " {peer}:{trust}:{}:{}:{}:{}:{}:{}:{}:{}:{until}:{}:{}",
+            " {peer}:{trust}:{}:{}:{}:{}:{}:{}:{}:{}:{until}:{}:{}:{}",
             u8::from(report.configured),
             u8::from(report.judged),
             report.suspicions,
@@ -905,6 +905,7 @@ fn report(
             report.freshness.map_or(0, nanos),
             report.skipped,
             report.unproven,
+            report.sending.map_or(0, nanos),
         ));
     }
     text.push_str(&line);
@@ -951,6 +952,9 @@ struct Seen {
     /// The slots it skipped sending, and the heartbeats it refused for their proof.
     skipped: u64,
     unproven: u64,
+    /// The interval the member sends its own heartbeats to the peer at, nanoseconds; zero before
+    /// the first is scheduled.
+    sending: u64,
 }
 
 /// A member's latest state line.
@@ -1025,6 +1029,7 @@ fn parse(line: &str) -> Option<Line> {
                     until,
                     skipped,
                     unproven,
+                    sending,
                 ] = parts[..]
                 else {
                     return None;
@@ -1044,6 +1049,7 @@ fn parse(line: &str) -> Option<Line> {
                         until: until.parse().ok()?,
                         skipped: skipped.parse().ok()?,
                         unproven: unproven.parse().ok()?,
+                        sending: sending.parse().ok()?,
                     },
                 );
             }
@@ -2098,11 +2104,13 @@ const YOUNG_NODES: u64 = 3;
 /// windows, 56 heartbeats at the least): every survivor suspects it, within the bound it states
 /// where it states one, and no later than the first poll once both its freshness point has passed
 /// and a pair of its own has configured, the evidence the young link is judged by
-/// (`docs/timing.md` §2.8, "Judged before its own evidence"). That poll is a wake, which comes up to
-/// the latest its wakes were late past what it asked, whichever of the two came last: bounded with
-/// the lateness on the freshness point alone, a configuration stated after it was told one wake
-/// later on Windows, 15.7 ms past the state that showed it with wakes up to 16.0 and 16.7 ms late
-/// (windows-11-arm, run 40105342844; windows-2025, run 40104910073).
+/// (`docs/timing.md` §2.8, "Judged before its own evidence"). That poll comes a wait past whichever
+/// of the two came last: its wakes' lateness, and for a judge with nothing durable since the point
+/// its next completion, within its longest sending interval and its longest write (main's
+/// `fffebdd`, after macos-15-intel noticed 3.5 ms past the evidence). Bounded with the lateness on
+/// the freshness point alone, a configuration stated after it was told one wake later on Windows,
+/// 15.7 ms past the state that showed it with wakes up to 16.0 and 16.7 ms late (windows-11-arm,
+/// run 40105342844; windows-2025, run 40104910073).
 #[test]
 #[allow(
     clippy::disallowed_methods,
@@ -2151,14 +2159,31 @@ fn a_node_killed_in_its_first_heartbeats_is_suspected_once_a_sibling_has_its_evi
             .get(&(*member, sibling))
             .copied()
             .unwrap_or(u64::MAX);
+        // A poll comes up to its wakes' lateness past what it waits for; and a judge with nothing
+        // durable since the point judges on its next completion, its own stream's within its
+        // sending interval (`docs/timing.md` §2.8, "A judge whose own proof stalls"): at most the
+        // longest interval it sends at and its longest write, as the simulation's bound of the
+        // same scenario has it (`sim::a_peer_dead_before_its_links_have_evidence_...`).
+        let stated = supervisor.latest.get(member).cloned().unwrap_or_default();
+        let sending = stated
+            .peers
+            .values()
+            .map(|seen| seen.sending)
+            .max()
+            .unwrap_or(0);
+        let wait = found.late + sending + stated.flush_most;
         assert!(
-            found.noticed <= found.at.max(evidence).saturating_add(found.late),
+            found.noticed <= found.at.max(evidence).saturating_add(wait),
             "member {member} noticed the young victim's death {:?} after the kill: its freshness \
-             point {:?} after it, its wakes up to {:?} late, its sibling configured {:?} after it",
+             point {:?} after it, its sibling configured {:?} after it, a poll's wait {:?} (wakes \
+             {:?} late, sending every {:?}, longest write {:?})",
             Duration::from_nanos(found.noticed.saturating_sub(killed_at)),
             Duration::from_nanos(found.at.saturating_sub(killed_at)),
-            Duration::from_nanos(found.late),
             Duration::from_nanos(evidence.saturating_sub(killed_at)),
+            Duration::from_nanos(wait),
+            Duration::from_nanos(found.late),
+            Duration::from_nanos(sending),
+            Duration::from_nanos(stated.flush_most),
         );
         noticed.push((
             member,

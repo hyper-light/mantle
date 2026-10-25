@@ -86,9 +86,18 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `dd764a0` (hyper-raft branch `windows-udp-reset-next`: `628111e` and three
-branches merged for mantle, CI run 40113149609, green on all 21 jobs), with no local delta**, taken
-by `scripts/snapshot-hyper-raft.py`: hyper-liveness's `f647365`, a heartbeat stream to a peer from
+**Every crate at `313ada8` (hyper-raft branch `backoff-announced`: `dd764a0` and four commits,
+CI run 40139950654, green on all 21 jobs; the same code is on hyper-raft `main` at `af01c51`),
+with no local delta**, taken by `scripts/snapshot-hyper-raft.py`: hyper-liveness's `1088cfa`, a
+stream that backs off doubling the gap it states and a peer it has not heard expecting each
+doubling, where `f647365`'s back-off doubled the gap unannounced, so each doubling arrived a whole
+gap past the receiver's freshness point and a restarted node that heard no peer was suspected by
+both live peers at every doubling (49 to 91 times a simulated world, 0 to 2 after);
+hyper-quic's `834ea20`, the warm-up tests' endpoints seeded, which raced BBR's plateau against
+their budget on fresh random draws (2 of 1,000 runs failed unseeded, 0 of 1,000 seeded); and
+`60f66fc`, a test bound taken from main. Before it, every crate was at `dd764a0` (hyper-raft
+branch `windows-udp-reset-next`: `628111e` and three branches merged for mantle, CI run
+40113149609, green on all 21 jobs), with no local delta: hyper-liveness's `f647365`, a heartbeat stream to a peer from
 which nothing has come doubling its interval from the floor to one every 3 s (RFC 8085 §3.1.3) with
 its flush requests, and answering the peer's first heartbeat at once, where a node that knew no
 peer's address heartbeated at its stream's floor with a flush each (9,957 heartbeats a peer and

@@ -22,6 +22,19 @@ pub(crate) fn nanos(duration: Duration) -> u64 {
 /// which nothing has come is such a sender, and backs off to it (`Pair::backed_off`).
 const UNANSWERED_NS: u64 = 3_000_000_000;
 
+/// The longest gap a peer that has heard nothing from this node may leave after a heartbeat
+/// stating `interval_ns` and `floor_ns`, nanoseconds: it backs off by twice the gap it stated, never
+/// below its floor, to [`UNANSWERED_NS`] or its floor past it (`Pair::backed_off`). An upper bound
+/// on that rule's next gap for any interval its floor and the ask give: exact while they hold, the
+/// floor read where it rose.
+fn unanswered_next(interval_ns: u64, floor_ns: u64) -> u64 {
+    interval_ns
+        .saturating_mul(2)
+        .min(UNANSWERED_NS)
+        .max(floor_ns)
+        .max(interval_ns)
+}
+
 /// What the node gives every pair's sender at a poll.
 pub(crate) struct Sender {
     pub(crate) local_run: u64,
@@ -274,6 +287,9 @@ struct Received {
     /// the link's own interval that margin promised nothing (`pool_margin`); zero otherwise, and
     /// from the link's first configuration on.
     pooled_ask_ns: u64,
+    /// The longest gap the peer may leave before its next heartbeat when its latest echoed nothing,
+    /// nanoseconds ([`unanswered_next`]); zero once it echoes this node.
+    unanswered_next_ns: u64,
 }
 
 /// What a pair counts: the counters of its [`PairReport`], the rest of which is read from the
@@ -540,12 +556,17 @@ impl Pair {
         Some((self.backed_off(base), base, from_floor))
     }
 
-    /// The interval to send at to a peer from which nothing has come: `base` doubled for each
-    /// heartbeat sent it so far, the back-off of a sender whose datagrams go unanswered (RFC 8085
-    /// §3.1.3, its first case: "a predetermined transmission interval that is exponentially backed
-    /// off"; RFC 6298 §5.5's doubling), up to 3 s, the most such a sender may send at (that
-    /// section's second case, [`UNANSWERED_NS`]), and never below `base`, which a floor past 3 s
-    /// keeps (Lindley 1952). Once the peer is heard, `base`. At the floor alone, a node whose peers
+    /// The interval to send at to a peer from which nothing has come: `base` at the first
+    /// heartbeat, then twice the gap the heartbeat about to go states, the back-off of a sender
+    /// whose datagrams go unanswered (RFC 8085 §3.1.3, its first case: "a predetermined
+    /// transmission interval that is exponentially backed off"; RFC 6298 §5.5's doubling), up to
+    /// 3 s, the most such a sender may send at (that section's second case, [`UNANSWERED_NS`]), and
+    /// never below `base`, which a floor past 3 s keeps (Lindley 1952). Once the peer is heard,
+    /// `base`. Doubled from the stated gap, not from `base`, the rule is one the peer reads off each
+    /// heartbeat ([`unanswered_next`]): a peer that hears this node while this node hears it not
+    /// (its datagrams lost, or sent where this node no longer listens) expects each doubling, where
+    /// a gap it could not foresee came a whole gap past its freshness point and was suspected, at
+    /// every doubling, of a node alive and heard (`a_restarted_node_that_hears_no_peer_is_not_suspected_for_its_back_off`). At the floor alone, a node whose peers
     /// were never heard, started before them or alone, or restarted before it learned where they
     /// listen, flushed its log for each heartbeat for as long as they said nothing: ten thousand
     /// times a second at an idle NVMe's floor of 80 to 115 µs (found by mantle).
@@ -553,10 +574,13 @@ impl Pair {
         if self.received.run.is_some() {
             return base;
         }
-        let doubled = 1u64
-            .checked_shl(self.stream.unanswered)
-            .and_then(|factor| base.checked_mul(factor))
-            .unwrap_or(u64::MAX);
+        // Twice the gap the heartbeat about to go states (`unanswered_next`, which the peer reads
+        // off it), from `base` at the first.
+        let doubled = if self.stream.unanswered == 0 {
+            base
+        } else {
+            self.stream.interval_ns.saturating_mul(2).max(base)
+        };
         doubled.min(UNANSWERED_NS.max(base))
     }
 
@@ -633,9 +657,13 @@ impl Pair {
             .max(self.received.pooled_ask_ns);
         if let Some(link) = self.received.link.as_mut() {
             // The peer moves to what this heartbeat asks, never below its floor, from its next
-            // heartbeat on: this node expects it so, not suspecting it for the move.
-            link.estimator
-                .expect_interval(Duration::from_nanos(ask_ns.max(self.received.floor_ns)));
+            // heartbeat on: this node expects it so, not suspecting it for the move; and a peer
+            // that has heard nothing from this node backs off, which it is expected to as well.
+            link.estimator.expect_interval(Duration::from_nanos(
+                ask_ns
+                    .max(self.received.floor_ns)
+                    .max(self.received.unanswered_next_ns),
+            ));
         }
         let beat = Heartbeat {
             run: sender.local_run,
@@ -894,10 +922,26 @@ impl Pair {
         } else {
             self.promise()
         };
+        // A heartbeat that echoes nothing comes from a peer that has taken none of this node's, and
+        // that backs its interval off (`backed_off`): its next gap is expected as long as that
+        // rule makes it, or each doubling would come a whole gap past the point and be suspected.
+        let unanswered = if beat.echo.is_none() {
+            unanswered_next(beat.interval_ns, beat.floor_ns)
+        } else {
+            0
+        };
+        self.received.unanswered_next_ns = unanswered;
         let link = self.link(beat.interval_ns, granularity)?;
         link.estimator
             .on_heartbeat(mapped, arrival_ns)
             .map_err(|_| Refusal::OutOfRange)?;
+        if unanswered > 0 {
+            let next = link
+                .estimator
+                .next_interval()
+                .max(Duration::from_nanos(unanswered));
+            link.estimator.expect_interval(next);
+        }
         let lateness = link.estimator.latest_lateness();
         self.received.last = Some(Last {
             seq: beat.seq,

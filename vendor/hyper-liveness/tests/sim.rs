@@ -2001,7 +2001,7 @@ fn a_node_whose_peers_never_answer_backs_off_to_a_heartbeat_every_three_seconds(
     const SPAN: u64 = 60_000 * MS;
     for world in [MACOS, BUSY, LINUX, WINDOWS] {
         let name = world.name;
-        for seed in seeds(16, 8) {
+        for seed in seeds(20, 8) {
             let mut sim = Sim::new(3, world, seed);
             sim.nodes[1].alive = false;
             sim.nodes[2].alive = false;
@@ -2068,7 +2068,7 @@ fn a_peer_heard_at_last_is_answered_at_once_and_its_stream_backs_off_no_more() {
     const ALONE: u64 = 20_000 * MS;
     for world in [MACOS, BUSY, LINUX, WINDOWS] {
         let name = world.name;
-        for seed in seeds(17, 8) {
+        for seed in seeds(21, 8) {
             let mut sim = Sim::new(2, world, seed);
             sim.nodes[1].alive = false;
             sim.run_while(|_| true, Some(ALONE));
@@ -2119,6 +2119,77 @@ fn a_peer_heard_at_last_is_answered_at_once_and_its_stream_backs_off_no_more() {
                 later.iter().all(|interval| *interval < BOUND),
                 "{name} seed {seed}: backed off after the peer was heard: {later:?}"
             );
+        }
+    }
+}
+
+/// A node restarted where it hears no peer backs its streams off, and its peers, which hear it,
+/// expect each doubling: no suspicion of it is of a heartbeat its sender had not yet due (mantle's
+/// roll test restarts a founder so: at a new port, which its peers send to at its old one until
+/// they are told). Its streams state each gap and double it (`Pair::backed_off`), and a heartbeat
+/// that echoes nothing tells the peer to expect that (`unanswered_next`). Doubled from the floor, unforeseen, each doubling came a whole
+/// gap past the peers' freshness point: 49 to 91 suspicions of the live node a world, in 8 seeds of
+/// 8 over its 10 s deaf, where the node sending at its floor drew 0 to 2, each a late heartbeat of
+/// its own.
+#[test]
+fn a_restarted_node_that_hears_no_peer_is_not_suspected_for_its_back_off() {
+    // Shape: long enough for its streams to back off to the bound from any floor here.
+    const DEAF: u64 = 10_000 * MS;
+    // Format: RFC 8085 §3.1.3, the second case's bound.
+    const BOUND: u64 = 3_000 * MS;
+    for world in [MACOS, BUSY, LINUX, WINDOWS] {
+        let name = world.name;
+        for seed in seeds(22, 8) {
+            let mut sim = Sim::new(3, world, seed);
+            settled(&mut sim);
+            let before: Vec<usize> = (0..2)
+                .map(|node| sim.nodes[node].suspicions.len())
+                .collect();
+            let mut liveness = Liveness::new(Settings {
+                local: 3,
+                run: 2,
+                max_peers: 2,
+                history: Exposure::new(),
+                resolution: RESOLUTION,
+            })
+            .unwrap();
+            liveness.attach(1).unwrap();
+            liveness.attach(2).unwrap();
+            sim.restart(2, liveness);
+            sim.nodes[2].deaf = true;
+            let start = sim.now;
+            let logged = sim.nodes[2].log.len();
+            sim.poll(2);
+            sim.run_while(|_| true, Some(start + DEAF));
+            let sent = &sim.nodes[2].log[logged..];
+            assert!(
+                sent.iter().any(|(_, _, beat)| beat.interval_ns == BOUND),
+                "{name} seed {seed}: the restarted node never backed off to the bound"
+            );
+            for (node, taken_before) in before.iter().enumerate() {
+                let peer = node as u64 + 1;
+                for suspicion in sim.nodes[node].suspicions[*taken_before..]
+                    .iter()
+                    .filter(|suspicion| suspicion.peer == 3)
+                {
+                    let last = suspicion.last.expect("the run's heartbeats were taken").seq;
+                    // The slot after the last taken, by its sender's schedule: the next heartbeat
+                    // it sent, less the slots it skipped to it at its interval.
+                    let due = sent
+                        .iter()
+                        .find(|(_, to, beat)| *to == peer && beat.seq > last)
+                        .map(|(_, _, beat)| {
+                            beat.sent_ns - beat.late_ns - (beat.seq - last - 1) * beat.interval_ns
+                        });
+                    assert!(
+                        due.is_some_and(|due| due <= suspicion.at_ns),
+                        "{name} seed {seed}: node {peer} suspected the restarted node at {} ms, \
+                         its next heartbeat due at {:?} ms",
+                        (suspicion.at_ns - start) / MS,
+                        due.map(|due| (due - start) / MS)
+                    );
+                }
+            }
         }
     }
 }

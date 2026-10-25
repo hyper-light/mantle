@@ -2612,6 +2612,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             ready_sent: false,
             ready_waiting: false,
             diag_read: crate::exchange::DiagRead::default(),
+            diag_unread_at: [0; 4],
             wants_write: false,
             writable_sent: false,
             writable_waiting: false,
@@ -2935,6 +2936,30 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         if taken > 0 {
             exchange.diag_read.bytes = exchange.diag_read.bytes.saturating_add(taken);
             exchange.diag_read.last_took = Some(self.now);
+            let due = exchange
+                .diag_read
+                .ring
+                .get((exchange.diag_read.ring_at + 15) % 16)
+                .copied()
+                .flatten()
+                .is_none_or(|(t, ..)| {
+                    self.now.saturating_duration_since(t) >= Duration::from_millis(250)
+                });
+            if due {
+                let stats = conn.quic.stats();
+                let sample = (
+                    self.now,
+                    exchange.diag_read.bytes,
+                    stats.frame_tx.max_data,
+                    stats.frame_tx.max_stream_data,
+                    conn.window.window(),
+                    conn.quic.receive_window_debt(),
+                );
+                if let Some(slot) = exchange.diag_read.ring.get_mut(exchange.diag_read.ring_at) {
+                    *slot = Some(sample);
+                }
+                exchange.diag_read.ring_at = (exchange.diag_read.ring_at + 1) % 16;
+            }
         } else {
             exchange.diag_read.zero_reads = exchange.diag_read.zero_reads.saturating_add(1);
         }
@@ -3004,6 +3029,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             ready_sent: false,
             ready_waiting: false,
             diag_read: crate::exchange::DiagRead::default(),
+            diag_unread_at: [0; 4],
             wants_write: false,
             writable_sent: false,
             writable_waiting: false,
@@ -3499,7 +3525,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             && matches!(exchange.incoming.state, In::Body | In::Trailer)
         {
             eprintln!(
-                "diag-stall reader-ended wall_ms={} pid={} peer={:?} opened={} refusal={refusal:?} began_ms={} in={:?} left={} starved={} ready_sent={} ready_waiting={} ended={} {}",
+                "diag-stall reader-ended wall_ms={} pid={} peer={:?} opened={} refusal={refusal:?} began_ms={} in={:?} left={} starved={} ready_sent={} ready_waiting={} ended={} conn: win={} debt={} set_back={} tx_md={} tx_msd={} rx_db={} rx_sdb={} {}",
                 diag_wall_ms(),
                 std::process::id(),
                 exchange.peer,
@@ -3511,6 +3537,13 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 exchange.ready_sent,
                 exchange.ready_waiting,
                 exchange.ended,
+                conn.window.window(),
+                conn.quic.receive_window_debt(),
+                conn.set_back.is_some(),
+                conn.quic.stats().frame_tx.max_data,
+                conn.quic.stats().frame_tx.max_stream_data,
+                conn.quic.stats().frame_rx.data_blocked,
+                conn.quic.stats().frame_rx.stream_data_blocked,
                 exchange.diag_read.said(std::time::Instant::now())
             );
         }
@@ -3680,6 +3713,20 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         let held_unread = conn.unread;
         let unread_ended = conn.unread_ended;
         let mut unread_change = 0i8;
+        let diag_stats = conn.quic.stats();
+        let diag_now = [
+            diag_stats.frame_rx.max_data,
+            diag_stats.frame_rx.max_stream_data,
+            diag_stats.frame_tx.data_blocked,
+            diag_stats.frame_tx.stream_data_blocked,
+        ];
+        let diag_limit = conn.quic.streams().write_limit();
+        let diag_reserve = class_reserve(rank);
+        let diag_written = self
+            .exchanges
+            .get(id)
+            .and_then(|exchange| exchange.stream)
+            .and_then(|stream| conn.quic.send_stream(stream).written().ok());
         let judged = self.exchanges.get_mut(id).map_or(Ok(()), |exchange| {
             if exchange.stream.is_none() {
                 // Queued for a stream (policy C): judged on whether the connection's credit queue moves, not on its
@@ -3699,13 +3746,14 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             match (unread_now, exchange.unread_since) {
                 (true, None) => {
                     exchange.unread_since = Some(now);
+                    exchange.diag_unread_at = diag_now;
                     unread_change = 1;
                 }
                 (true, Some(since))
                     if now.saturating_duration_since(since) >= exchange.carry.window(floor) =>
                 {
                     eprintln!(
-                        "diag-stall unread wall_ms={} pid={} peer={:?} opened={} began_ms={} since_ms={} window_ms={} pending={} out={:?} in={:?} peer_takes={} credit_moved={:?}",
+                        "diag-stall unread wall_ms={} pid={} peer={:?} opened={} began_ms={} since_ms={} window_ms={} pending={} out={:?} in={:?} peer_takes={} credit_moved={:?} rx_md+{} rx_msd+{} tx_db+{} tx_sdb+{} (now {:?}) limit={} reserve={} blocked={} written={:?} out_left={}",
                         diag_wall_ms(),
                         std::process::id(),
                         exchange.peer,
@@ -3718,6 +3766,16 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                         exchange.incoming.state,
                         peer_takes,
                         credit_moved,
+                        diag_now[0].saturating_sub(exchange.diag_unread_at[0]),
+                        diag_now[1].saturating_sub(exchange.diag_unread_at[1]),
+                        diag_now[2].saturating_sub(exchange.diag_unread_at[2]),
+                        diag_now[3].saturating_sub(exchange.diag_unread_at[3]),
+                        diag_now,
+                        diag_limit,
+                        diag_reserve,
+                        exchange.stream_blocked,
+                        diag_written,
+                        exchange.out.left,
                     );
                     return Err(Refusal::Stalled);
                 }

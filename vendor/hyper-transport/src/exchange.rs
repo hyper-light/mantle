@@ -279,6 +279,10 @@ pub(crate) struct Exchange<K> {
     pub(crate) ready_waiting: bool,
     /// DIAG (scratch): how its body's reading went.
     pub(crate) diag_read: DiagRead,
+    /// DIAG (scratch): the connection's credit frames received and blocked frames sent when it was
+    /// first found unread (frame_rx max_data, max_stream_data; frame_tx data_blocked,
+    /// stream_data_blocked).
+    pub(crate) diag_unread_at: [u64; 4],
     /// The owner was told it could not write all it offered; it hears [`crate::Event::Writable`]
     /// when it can write more.
     pub(crate) wants_write: bool,
@@ -319,6 +323,10 @@ pub(crate) struct DiagRead {
     pub(crate) last_polled: Option<std::time::Instant>,
     pub(crate) last_read: Option<std::time::Instant>,
     pub(crate) last_took: Option<std::time::Instant>,
+    /// Samples at most every 250 ms, the latest 16: when, bytes read, the reader's credit frames
+    /// sent (max_data, max_stream_data), its connection's receive window and its debt.
+    pub(crate) ring: [Option<(std::time::Instant, u64, u64, u64, u64, u64)>; 16],
+    pub(crate) ring_at: usize,
 }
 
 impl DiagRead {
@@ -330,8 +338,18 @@ impl DiagRead {
                 |at| now.saturating_duration_since(at).as_millis().to_string(),
             )
         };
+        let mut ring = String::new();
+        for at in 0..self.ring.len() {
+            let slot = (self.ring_at + at) % self.ring.len();
+            if let Some(Some((t, bytes, md, msd, window, debt))) = self.ring.get(slot) {
+                ring.push_str(&format!(
+                    " [{}ms bytes={bytes} tx_md={md} tx_msd={msd} win={window} debt={debt}]",
+                    now.saturating_duration_since(*t).as_millis()
+                ));
+            }
+        }
         format!(
-            "readable={} pushed={} suppressed={} polled={} reads={} zero_reads={} bytes={} ago_ms: readable={} pushed={} polled={} read={} took={}",
+            "ring{ring} readable={} pushed={} suppressed={} polled={} reads={} zero_reads={} bytes={} ago_ms: readable={} pushed={} polled={} read={} took={}",
             self.readable,
             self.pushed,
             self.suppressed,

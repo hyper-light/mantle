@@ -572,17 +572,25 @@ pub fn owned(owner: &str, bucket: &str) -> Vec<u8> {
     out
 }
 
-/// The first key of `owner`'s reverse rows after bucket `after`, or of all of them, and a key
-/// past the last.
-pub fn owned_rows(owner: &str, after: Option<&str>) -> (Vec<u8>, Vec<u8>) {
+/// The first key of `owner`'s reverse rows for the buckets whose names begin with `prefix`,
+/// after bucket `after` where one is named, and a key past the last of them.
+pub fn owned_rows(owner: &str, prefix: &str, after: Option<&str>) -> (Vec<u8>, Vec<u8>) {
     let head = self::owner(owner);
-    let mut past = head.clone();
+    let mut first = head.clone();
+    escape(&mut first, prefix.as_bytes());
+    // UTF-8 never writes 0xFF and an escaped zero is 0x00 0xFF, so every name that begins with
+    // `prefix` sorts before it.
+    let mut past = first.clone();
     past.push(0xFF);
-    let mut from = match after {
-        Some(bucket) => owned(owner, bucket),
-        None => head,
-    };
+    // The owner's count is the row `head` itself; its reverse rows sort after it.
+    let mut from = head;
     from.push(0);
+    from = from.max(first);
+    if let Some(bucket) = after {
+        let mut after = owned(owner, bucket);
+        after.push(0);
+        from = from.max(after);
+    }
     (from, past)
 }
 
@@ -875,7 +883,7 @@ mod tests {
 
     #[test]
     fn owner_rows_list_its_buckets_after_its_count() {
-        let (from, past) = owned_rows("o", None);
+        let (from, past) = owned_rows("o", "", None);
         let head = owner("o");
         assert!(head < from);
         for bucket in ["a", "b\0", "zz"] {
@@ -884,9 +892,24 @@ mod tests {
             assert_eq!(decode_owned(&k), Some(("o".into(), bucket.into())));
         }
         assert!(owned("o\0", "a") >= past);
-        let (after_a, _) = owned_rows("o", Some("a"));
+        let (after_a, _) = owned_rows("o", "", Some("a"));
         assert!(owned("o", "a") < after_a && after_a < owned("o", "a\0"));
         assert_eq!(decode_owned(&head), None);
+        // A prefix spans exactly the names that begin with it, after `after` where that is
+        // later than the prefix's first.
+        let (from, past) = owned_rows("o", "b", None);
+        for bucket in ["b", "b\0", "ba", "bz.z"] {
+            let k = owned("o", bucket);
+            assert!(from <= k && k < past, "{bucket}");
+        }
+        for bucket in ["a", "az", "c", "ab"] {
+            let k = owned("o", bucket);
+            assert!(k < from || k >= past, "{bucket}");
+        }
+        let (after_bb, _) = owned_rows("o", "b", Some("bb"));
+        assert!(owned("o", "bb") < after_bb && after_bb < owned("o", "bc"));
+        let (before, _) = owned_rows("o", "b", Some("a"));
+        assert_eq!(before, from);
     }
 
     #[test]

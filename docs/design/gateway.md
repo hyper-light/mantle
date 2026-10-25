@@ -91,7 +91,10 @@ point:
    the key wrapped, the object key it is for, and a deadline no later than its blocks'
    earliest.
 6. **The version is committed** in the Name range, carrying the file and its deadline.
-   Preconditions, versioning and Object Lock are judged there (metadata.md §2). An empty
+   Preconditions, versioning and Object Lock are judged there (metadata.md §2); a node's host
+   gives the request's `If-Match` and `If-None-Match` to the commit as the tags they name
+   (`mantle_s3::conditional::named`), and its checksum and `Content-MD5` to the body's end, which
+   checks them before the file is written (node.md §5.1, as built). An empty
    object has no file and no File range to give it a deadline: its write carries the file ID
    drawn in step 1 as its own ID, and a deadline of the same handover time from the gateway's
    clock when it commits, so the Name range recognises a copy of it as it would a file's
@@ -309,7 +312,10 @@ from a newer one (audit §16.4).
 ## 3. Reading an object
 
 A GET reads top down (`get.rs`), from the version the Name range read, whose preconditions,
-lock and range the S3 layer has judged:
+lock and range the S3 layer has judged. On a node, the host reads that version by ReadIndex and
+judges the request's preconditions with `mantle_s3::conditional` and its range with
+`mantle_s3::range` before it makes the `Get`; a HEAD stops there, answered with the version's
+facts (node.md §5.1, as built):
 
 1. The version's File header. A file of blocks has its data key, which is unwrapped; a file of
    parts names, by plaintext, the part holding each byte, and each part is read as a file of

@@ -547,7 +547,14 @@ fn objects_round_trip_through_any_node_and_read_back_after_one_is_killed() {
     for id in 1..=NODES {
         cell.enlisted(id);
     }
-    let made = cell.objects(vec![(1, Op::Create { bucket: "b".into() }, Vec::new())]);
+    let made = cell.objects(vec![(
+        1,
+        Op::Create {
+            bucket: "b".into(),
+            id: 1,
+        },
+        Vec::new(),
+    )]);
     done(&made[0], "the bucket");
     // Lengths either side of a sealed segment's 64 KiB and across blocks of 8 MiB chunks.
     let lens = [0usize, 1, 65_535, 65_537, 3 << 20, 20 << 20];
@@ -559,12 +566,7 @@ fn objects_round_trip_through_any_node_and_read_back_after_one_is_killed() {
         .iter()
         .enumerate()
         .map(|(n, (key, data))| {
-            let op = Op::Put {
-                bucket: "b".into(),
-                key: key.clone(),
-                id: n as u128 + 1,
-                length: data.len() as u64,
-            };
+            let op = put_op("b", key, n as u128 + 1, data.len() as u64);
             (1 + n as u64 % NODES, op, data.clone())
         })
         .collect();
@@ -575,16 +577,11 @@ fn objects_round_trip_through_any_node_and_read_back_after_one_is_killed() {
     let reads = |through: &dyn Fn(usize) -> u64| -> Vec<(u64, Op, Vec<u8>)> {
         let mut ops = Vec::new();
         for (n, (key, data)) in objects.iter().enumerate() {
-            let get = |offset: u64, len: u64| Op::Get {
-                bucket: "b".into(),
-                key: key.clone(),
-                offset,
-                len,
-            };
-            ops.push((through(n), get(0, u64::MAX), Vec::new()));
+            ops.push((through(n), get_op("b", key, None), Vec::new()));
             let third = data.len() as u64 / 3;
             if third > 0 {
-                ops.push((through(n), get(third, third), Vec::new()));
+                let range = format!("bytes={third}-{}", 2 * third - 1);
+                ops.push((through(n), get_op("b", key, Some(range)), Vec::new()));
             }
         }
         ops

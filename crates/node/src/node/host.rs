@@ -1,9 +1,16 @@
 //! The gateway host (docs/design/node.md §4.2, §5): for each object exchange a client or gateway
 //! asks of the node (`crate::object`), the node runs the bucket's coordinator
-//! (`mantle_meta::coordinator`) or the gateway's drivers (`mantle_gateway::put`, `get`), and serves
-//! each one's requests itself: a placement from its own replica of the volume table
-//! (`crate::place`), a chunk on its own volume in-process or on a peer's over the transfer class,
-//! and a range's command or read of the range's leader (`Node::command`, `Node::read`).
+//! (`mantle_meta::coordinator`), the gateway's drivers (`mantle_gateway::put`, `get`) or the
+//! ranges' commands and reads an operation needs, and serves each one's requests itself: a
+//! placement from its own replica of the volume table (`crate::place`), a chunk on its own volume
+//! in-process or on a peer's over the transfer class, and a range's command or read of the range's
+//! leader (`Node::command`, `Node::read`).
+//!
+//! An operation is typed (`object::Op`) and answers with a typed reply (`object::Reply`): the
+//! native protocol's encoding is taken where a request's fields are read and given where its
+//! reply's head and fields are written, so another door hands the host the same operation. Its
+//! preconditions and range are judged by `mantle_s3::conditional` and `mantle_s3::range`, a
+//! write's at the Name range's commit (05 §2).
 //!
 //! A put's body is read from its exchange only as fast as the driver takes it, a piece at a time,
 //! and a get's bytes are taken from its driver only as fast as the exchange takes them, so what an
@@ -20,17 +27,22 @@ use mantle_gateway::layout::Layout;
 use mantle_gateway::put::{self, Body, Commit, Expected, Holding, Keys, Put, PutError, Random};
 use mantle_meta::apply::Layer;
 use mantle_meta::coordinator::{self, Coordinator, Settled};
-use mantle_meta::name::{self, Preconditions};
-use mantle_meta::record::{BucketState, Descriptor, Version, WrappedKey, Wrapper};
+use mantle_meta::name::{self, Match, Preconditions};
+use mantle_meta::record::{
+    self, BucketState, Descriptor, Version, Versioning, WrappedKey, Wrapper,
+};
 use mantle_meta::root::{self, Placed};
 use mantle_meta::wire::{Answer, Command};
 use mantle_meta::{bucket, engine::Engine};
+use mantle_s3::checksum;
+use mantle_s3::conditional::{self, Current};
+use mantle_s3::range::{self, Span};
 use mantle_s3::seal::{DataKey, WrappingKey};
 
 use super::{ChunkAsk, ChunkOutcome, Node, NodeError, NodeLog, PIECE, take_done};
 use crate::ask::{CommandAsk, CommandOutcome, ReadAsk, ReadOutcome};
 use crate::classes::Class;
-use crate::object::{Head, Op, Reply, Status};
+use crate::object::{self, Head, Headers, List, Listing, Op, Reply, Status};
 use crate::place;
 use crate::read::{Query, Read};
 
@@ -73,20 +85,32 @@ pub(crate) struct Job {
 }
 
 enum Work {
-    /// The request's names being read from its body's start: the head, the names so far.
-    Naming(Head, Vec<u8>),
+    /// The request's fields being read from its body's start: the head, the fields so far.
+    Fields(Head, Vec<u8>),
     /// A request refused or done: what is left of its body read and dropped, then the reply, so
     /// the exchange ends whole (`Arriving::Redirect`'s reason).
     Draining(Reply),
-    /// A reply's head sent: the tags that open its body, and how much of them is written.
+    /// A reply's head sent: the fields that open its body, and how much of them is written.
     Replying(Vec<u8>, usize),
-    Create(Create),
+    /// CreateBucket or DeleteBucket, through the bucket's coordinator.
+    Bucket(Box<Coordinating>),
     Put(Box<Putting>),
+    /// GetObject, or HeadObject.
     Get(Box<Getting>),
+    /// DeleteObject or PutBucketVersioning: the bucket's row read, then one command made from it.
+    Command(Box<Commanding>),
+    /// An operation one read answers.
+    Read(Box<Single>),
 }
 
-struct Create {
+/// A bucket's create or delete, run by its coordinator.
+struct Coordinating {
     bucket: String,
+    /// A DeleteBucket rather than a CreateBucket.
+    delete: bool,
+    /// A delete's bucket row read and its owner the asker: S3 lets no other principal delete a
+    /// bucket unless a policy grants it (05 §10.5).
+    owned: bool,
     coordinator: Option<Coordinator>,
 }
 
@@ -95,6 +119,9 @@ struct Putting {
     key: String,
     id: u128,
     length: u64,
+    preconditions: Preconditions,
+    /// What the body's end is checked against: its `Content-MD5` and checksum (05 §3.2).
+    expected: Expected,
     /// The driver, once the bucket's row was read.
     put: Option<Put>,
     /// Body bytes read and not yet taken by the driver, and the body's bytes taken so far.
@@ -107,15 +134,52 @@ struct Putting {
 struct Getting {
     bucket: String,
     key: String,
-    offset: u64,
-    len: u64,
+    headers: Headers,
+    /// A HeadObject: the version's facts, and no bytes.
+    head: bool,
     get: Option<Get>,
     /// Plaintext taken from the driver and not yet written to the exchange.
     out: Option<(Bytes, usize)>,
-    /// Bytes of the range written so far, and the range's length.
+    /// Bytes of the reply's body written so far, and the body's length.
     written: u64,
     total: u64,
     waiting: VecDeque<(u64, get::Request)>,
+}
+
+/// An operation whose bucket's row is read first, for the incarnation, versioning and owner its
+/// one command is made from.
+struct Commanding {
+    bucket: String,
+    then: Then,
+    /// The command asked.
+    asked: bool,
+}
+
+/// The command a bucket's row is read for.
+enum Then {
+    /// DeleteObject: the Name range's delete (05 §7.3).
+    Delete {
+        key: String,
+        if_match: Option<Match>,
+    },
+    /// PutBucketVersioning, by the bucket's owner (05 §7.1).
+    Versioning(Versioning),
+}
+
+/// An operation one read answers.
+enum Single {
+    /// HeadBucket: the bucket's row.
+    HeadBucket(String),
+    /// ListObjectsV2: a page of keys.
+    List(List),
+    /// ListBuckets: a page of the asker's buckets.
+    Buckets {
+        prefix: String,
+        after: Option<String>,
+        max: u32,
+    },
+    /// GetBucketVersioning: the bucket's row.
+    Versioning(String),
 }
 
 /// The volume table as this node's member of the root range held it after an entry it applied,
@@ -176,19 +240,66 @@ impl Keyring for RootKeys {
     }
 }
 
-/// The status a put's failure is answered with.
+/// The tags an `If-Match` (`strong`) or `If-None-Match` header names, as the Name range judges
+/// them at commit (`mantle_s3::conditional::named`).
+fn matched(header: Option<&str>, strong: bool) -> Option<Match> {
+    header.map(|list| match conditional::named(list, strong) {
+        None => Match::Any,
+        Some(tags) => Match::Tags(tags),
+    })
+}
+
+/// The status a Name range's refusal of a write is answered with (node.md §4.4).
+fn name_status(outcome: &name::Outcome) -> Status {
+    match outcome {
+        name::Outcome::NoSuchBucket => Status::NoSuchBucket,
+        name::Outcome::NoSuchKey => Status::NoSuchKey,
+        name::Outcome::PreconditionFailed => Status::PreconditionFailed,
+        name::Outcome::Locked => Status::AccessDenied,
+        _ => Status::Failed,
+    }
+}
+
+/// The status a put's failure is answered with (node.md §4.4).
 fn put_status(error: &PutError) -> Status {
     match error {
         PutError::IncompleteBody => Status::IncompleteBody,
         PutError::EntityTooLarge { .. } => Status::EntityTooLarge,
-        PutError::Name(name::Outcome::NoSuchBucket) => Status::NoSuchBucket,
+        PutError::BadDigest | PutError::BadChecksum => Status::BadDigest,
+        PutError::Unplaced(_) => Status::SlowDown,
+        PutError::Name(outcome) => name_status(outcome),
         _ => Status::Failed,
+    }
+}
+
+/// A checksum as the version keeps it: a full-object value (05 §3.3).
+fn kept(c: &checksum::Checksum) -> record::Checksum {
+    record::Checksum {
+        algorithm: c.algorithm.code(),
+        parts: 0,
+        value: c.bytes.clone(),
+    }
+}
+
+/// The reply that states a version's facts, `status` its answer.
+fn facts(status: Status, order: u64, version: &Version) -> Reply {
+    Reply {
+        status,
+        size: version.size,
+        version: name::shown_id(version.null, order),
+        etag: version.etag.clone(),
+        modified: object::seconds(version.modified_ns),
+        checksum: version.checksum.clone(),
+        marker: version.marker,
+        range: None,
+        versioning: None,
+        listing: None,
     }
 }
 
 impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// An object's request arrived on `exchange` from `peer`, its body `body` bytes: a job that
-    /// reads its names first, or the reply it gets at once.
+    /// reads its fields first, or the reply it gets at once.
     pub(super) fn take_object(&mut self, exchange: ExchangeId, peer: PeerId, body: Option<u64>) {
         let head = Head::decode(
             self.driver.endpoint().head(exchange).unwrap_or_default(),
@@ -202,8 +313,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Work::Draining(Reply::status(Status::SlowDown))
             }
             (Ok(head), Some(_)) => {
-                let names = usize::try_from(head.names()).unwrap_or(0);
-                Work::Naming(head, Vec::with_capacity(names))
+                let fields = usize::try_from(head.fields()).unwrap_or(0);
+                Work::Fields(head, Vec::with_capacity(fields))
             }
         };
         self.jobs.push(Job {
@@ -214,78 +325,40 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         });
     }
 
-    /// A job's names read from its body's start, a piece at a time; once whole, the work they
+    /// A job's fields read from its body's start, a piece at a time; once whole, the work they
     /// name, the bytes read past them the start of a put's body.
-    fn read_names(&mut self, at: usize) -> Result<bool, NodeError> {
+    fn read_fields(&mut self, at: usize) -> Result<bool, NodeError> {
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(true);
         };
         let exchange = job.exchange;
-        let Work::Naming(head, names) = &mut job.work else {
+        let Work::Fields(head, fields) = &mut job.work else {
             return Ok(false);
         };
-        let wanted = usize::try_from(head.names()).unwrap_or(usize::MAX);
+        let wanted = usize::try_from(head.fields()).unwrap_or(usize::MAX);
         let endpoint = self.driver.endpoint();
-        while names.len() < wanted {
+        while fields.len() < wanted {
             let Ok(mut piece) = endpoint.reserve(Class::Transfer, PIECE) else {
                 return Ok(false);
             };
             let got = endpoint.read_body(exchange, &mut piece);
-            names.extend_from_slice(piece.bytes());
+            fields.extend_from_slice(piece.bytes());
             self.moved = self
                 .moved
                 .saturating_add(u64::try_from(piece.bytes().len()).unwrap_or(u64::MAX));
             endpoint.release(piece);
             match got {
-                Ok(0) if names.len() < wanted => return Ok(false),
+                Ok(0) if fields.len() < wanted => return Ok(false),
                 Ok(_) => {}
                 // Its asker is gone.
                 Err(_) => return Ok(true),
             }
         }
-        let carry = names.split_off(wanted.min(names.len()));
-        let work = match head.op(names) {
+        let carry = fields.split_off(wanted.min(fields.len()));
+        job.work = match head.op(fields) {
             Err(_) => Work::Draining(Reply::status(Status::Malformed)),
-            Ok(Op::Create { bucket }) => Work::Create(Create {
-                bucket,
-                coordinator: None,
-            }),
-            Ok(Op::Put { length, .. }) if length > mantle_s3::body::MAX_UPLOAD => {
-                Work::Draining(Reply::status(Status::EntityTooLarge))
-            }
-            Ok(Op::Put {
-                bucket,
-                key,
-                id,
-                length,
-            }) => Work::Put(Box::new(Putting {
-                bucket,
-                key,
-                id,
-                length,
-                put: None,
-                taken: 0,
-                carry,
-                waiting: VecDeque::new(),
-            })),
-            Ok(Op::Get {
-                bucket,
-                key,
-                offset,
-                len,
-            }) => Work::Get(Box::new(Getting {
-                bucket,
-                key,
-                offset,
-                len,
-                get: None,
-                out: None,
-                written: 0,
-                total: 0,
-                waiting: VecDeque::new(),
-            })),
+            Ok(op) => work(op, carry),
         };
-        job.work = work;
         Ok(false)
     }
 
@@ -361,12 +434,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Ok(true);
         };
         match job.work {
-            Work::Naming(..) => self.read_names(at),
+            Work::Fields(..) => self.read_fields(at),
             Work::Draining(_) => self.drain_job(at),
-            Work::Replying(..) => self.write_tags(at),
-            Work::Create(_) => self.step_create(at),
+            Work::Replying(..) => self.write_fields(at),
+            Work::Bucket(_) => self.step_bucket(at),
             Work::Put(_) => self.step_put(at),
             Work::Get(_) => self.step_get(at),
+            Work::Command(_) => self.step_command(at),
+            Work::Read(_) => self.step_single(at),
         }
     }
 
@@ -411,13 +486,27 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(());
         };
+        let peer = job.peer;
         match &mut job.work {
-            Work::Naming(..) | Work::Draining(_) | Work::Replying(..) => {}
-            Work::Create(create) => {
+            Work::Fields(..) | Work::Draining(_) | Work::Replying(..) => {}
+            Work::Bucket(coordinating) => {
                 let answer = match outcome {
+                    Outcome::Read(ReadOutcome::Read(read)) if !coordinating.owned => {
+                        let status = match *read {
+                            Read::Bucket(Some(row)) if row.owner == peer.to_string() => None,
+                            Read::Bucket(Some(_)) => Some(Status::AccessDenied),
+                            Read::Bucket(None) => Some(Status::NoSuchBucket),
+                            _ => Some(Status::Failed),
+                        };
+                        coordinating.owned = status.is_none();
+                        return match status {
+                            Some(status) => self.fail_job(at, status),
+                            None => Ok(()),
+                        };
+                    }
                     Outcome::Command(CommandOutcome::Answered(Answer::Bucket(o))) => {
-                        if create.coordinator.is_none() {
-                            return self.created(at, o);
+                        if coordinating.coordinator.is_none() {
+                            return self.begun(at, o);
                         }
                         coordinator::Answer::Bucket(o)
                     }
@@ -426,11 +515,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     }
                     Outcome::Read(ReadOutcome::Read(read)) => match *read {
                         Read::Gate(gate) => coordinator::Answer::Gate(gate),
+                        Read::Probe(probe) => coordinator::Answer::Probe(probe),
                         _ => return self.fail_job(at, Status::Failed),
                     },
                     _ => return self.fail_job(at, Status::Failed),
                 };
-                let Some(c) = create.coordinator.as_mut() else {
+                let Some(c) = coordinating.coordinator.as_mut() else {
                     return self.fail_job(at, Status::Failed);
                 };
                 if c.answer(answer).is_err() {
@@ -443,11 +533,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 }
                 (None, _) => return self.fail_job(at, Status::Failed),
                 (Some(id), outcome) => {
-                    let answer = put_answer(outcome);
-                    if let Some(put) = putting.put.as_mut()
-                        && put.answer(id, answer).is_err()
-                    {
-                        return self.fail_job(at, Status::Failed);
+                    // An answer the driver refuses ends it with that outcome, which its next
+                    // turn replies: a precondition or a lock the Name range judged, say.
+                    if let Some(put) = putting.put.as_mut() {
+                        let _ = put.answer(id, put_answer(outcome));
                     }
                 }
             },
@@ -457,26 +546,60 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 }
                 (None, _) => return self.fail_job(at, Status::Failed),
                 (Some(id), outcome) => {
-                    let answer = get_answer(outcome);
-                    if let Some(get) = getting.get.as_mut()
-                        && get.answer(id, answer).is_err()
-                    {
-                        return self.fail_job(at, Status::Failed);
+                    // An answer the driver refuses ends it with that outcome, which its next
+                    // turn ends the exchange on.
+                    if let Some(get) = getting.get.as_mut() {
+                        let _ = get.answer(id, get_answer(outcome));
                     }
                 }
             },
+            Work::Command(_) => {
+                return match outcome {
+                    Outcome::Read(ReadOutcome::Read(read)) => self.command_read(at, *read),
+                    Outcome::Command(CommandOutcome::Answered(Answer::Name(o))) => {
+                        let reply = match o {
+                            name::Outcome::Deleted { marker, version } => Reply {
+                                version: version.unwrap_or_default(),
+                                marker,
+                                ..Reply::status(Status::Done)
+                            },
+                            refused => Reply::status(name_status(&refused)),
+                        };
+                        self.reply_job(at, reply)
+                    }
+                    Outcome::Command(CommandOutcome::Answered(Answer::Bucket(o))) => {
+                        let status = match o {
+                            bucket::Outcome::Versioned => Status::Done,
+                            bucket::Outcome::VersioningLocked => Status::InvalidBucketState,
+                            bucket::Outcome::NoSuchBucket => Status::NoSuchBucket,
+                            bucket::Outcome::OperationAborted => Status::OperationAborted,
+                            _ => Status::Failed,
+                        };
+                        self.fail_job(at, status)
+                    }
+                    _ => self.fail_job(at, Status::Failed),
+                };
+            }
+            Work::Read(_) => {
+                return match outcome {
+                    Outcome::Read(ReadOutcome::Read(read)) => self.single_read(at, *read),
+                    _ => self.fail_job(at, Status::Failed),
+                };
+            }
         }
         Ok(())
     }
 
-    /// A create's Bucket-range answer to its `Create`: its coordinator, or the reply it gets.
-    fn created(&mut self, at: usize, outcome: bucket::Outcome) -> Result<(), NodeError> {
+    /// A bucket's create or delete answered by the Bucket range's first command: its
+    /// coordinator, or the reply it gets.
+    fn begun(&mut self, at: usize, outcome: bucket::Outcome) -> Result<(), NodeError> {
         let status = match outcome {
-            bucket::Outcome::Creating { .. } => None,
+            bucket::Outcome::Creating { .. } | bucket::Outcome::Deleting { .. } => None,
             bucket::Outcome::AlreadyOwnedByYou => Some(Status::BucketAlreadyOwnedByYou),
             bucket::Outcome::AlreadyExists => Some(Status::BucketAlreadyExists),
             bucket::Outcome::TooManyBuckets => Some(Status::TooManyBuckets),
             bucket::Outcome::OperationAborted => Some(Status::OperationAborted),
+            bucket::Outcome::NoSuchBucket => Some(Status::NoSuchBucket),
             _ => Some(Status::Failed),
         };
         if let Some(status) = status {
@@ -489,40 +612,64 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             budget: gateway.scan_rows,
             ranges: self.ranges.len(),
         };
-        // The cell's first Name range spans every key at its first generation (node.md §1.5).
-        let directory = [Descriptor {
-            id: 1,
-            lo: Vec::new(),
-            hi: None,
-            generation: 1,
-        }];
         let Some(Job {
-            work: Work::Create(create),
+            work: Work::Bucket(coordinating),
             ..
         }) = self.jobs.get_mut(at)
         else {
             return Ok(());
         };
-        match Coordinator::start(&create.bucket, &outcome, &directory, bounds) {
+        match Coordinator::start(&coordinating.bucket, &outcome, &directory(), bounds) {
             Ok(Some(c)) => {
-                create.coordinator = Some(c);
+                coordinating.coordinator = Some(c);
                 Ok(())
             }
             _ => self.fail_job(at, Status::Failed),
         }
     }
 
-    /// A create's turn: its `Create` asked first, then its coordinator's next request, one at a
-    /// time; once the coordinator is done, its answer.
-    fn step_create(&mut self, at: usize) -> Result<bool, NodeError> {
+    /// A bucket's create or delete at a turn: a delete's bucket row read first, its owner checked;
+    /// then its first command; then its coordinator's next request, one at a time; once the
+    /// coordinator is done, its answer.
+    fn step_bucket(&mut self, at: usize) -> Result<bool, NodeError> {
+        let quota = self.gateway.as_ref().map_or(0, |g| g.bucket_quota);
         let Some(job) = self.jobs.get(at) else {
             return Ok(true);
         };
         if !job.pending.is_empty() {
             return Ok(false);
         }
-        let Work::Create(create) = &job.work else {
+        let Work::Bucket(coordinating) = &job.work else {
             return Ok(true);
+        };
+        let bucket = coordinating.bucket.clone();
+        let next = match &coordinating.coordinator {
+            None if coordinating.delete && !coordinating.owned => Next::Owner,
+            None if coordinating.delete => {
+                Next::Request(coordinator::Request::Bucket(bucket::Command::BeginDelete {
+                    bucket: bucket.clone(),
+                    at_ns: 0,
+                }))
+            }
+            None => Next::Request(coordinator::Request::Bucket(bucket::Command::Create(
+                bucket::Create {
+                    bucket: bucket.clone(),
+                    owner: job.peer.to_string(),
+                    location: String::new(),
+                    at_ns: 0,
+                    quota,
+                    lock: false,
+                },
+            ))),
+            Some(c) if c.is_done() => Next::Done(match (c.settled(), coordinating.delete) {
+                (Some(Settled::Created), false) | (Some(Settled::Deleted), true) => Status::Done,
+                (Some(Settled::NotEmpty), true) => Status::BucketNotEmpty,
+                _ => Status::OperationAborted,
+            }),
+            Some(c) => match c.next() {
+                Some(request) => Next::Request(request),
+                None => Next::Done(Status::Failed),
+            },
         };
         let (Some(bucket_group), Some(name_group)) =
             (self.group_of(Layer::Bucket), self.group_of(Layer::Name))
@@ -530,83 +677,76 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             self.fail_job(at, Status::Failed)?;
             return self.drain_job(at);
         };
-        let owner = format!("{}", job.peer);
-        let request = match &create.coordinator {
-            None => {
-                let quota = self.gateway.as_ref().map_or(0, |g| g.bucket_quota);
-                Some(coordinator::Request::Bucket(bucket::Command::Create(
-                    bucket::Create {
-                        bucket: create.bucket.clone(),
-                        owner,
-                        location: String::new(),
-                        at_ns: 0,
-                        quota,
-                        lock: false,
-                    },
-                )))
-            }
-            Some(c) if c.is_done() => {
-                let status = match c.settled() {
-                    Some(Settled::Created) => Status::Done,
-                    _ => Status::OperationAborted,
-                };
+        let asked = match next {
+            Next::Done(status) => {
                 self.fail_job(at, status)?;
                 return self.drain_job(at);
             }
-            Some(c) => c.next(),
-        };
-        let bucket = create.bucket.clone();
-        let asked = match request {
-            Some(coordinator::Request::Bucket(command)) => self
+            Next::Owner => self
+                .read(bucket_group, Query::Bucket { bucket }, u64::MAX)
+                .map(Pending::Read),
+            Next::Request(coordinator::Request::Bucket(command)) => self
                 .command(bucket_group, Command::Bucket(command), u64::MAX)
                 .map(Pending::Command),
-            Some(coordinator::Request::Name { command, .. }) => self
+            Next::Request(coordinator::Request::Name { command, .. }) => self
                 .command(name_group, Command::Name(command), u64::MAX)
                 .map(Pending::Command),
-            Some(coordinator::Request::Gate { generation, .. }) => self
+            Next::Request(coordinator::Request::Gate { generation, .. }) => self
                 .read(name_group, Query::Gate { bucket, generation }, u64::MAX)
                 .map(Pending::Read),
-            // The cell's one Name range is the directory, and a create probes nothing.
-            Some(coordinator::Request::Directory) => {
-                let directory = vec![Descriptor {
-                    id: 1,
-                    lo: Vec::new(),
-                    hi: None,
-                    generation: 1,
-                }];
+            Next::Request(coordinator::Request::Probe {
+                generation,
+                from,
+                budget,
+                ..
+            }) => {
+                let query = Query::Probe {
+                    bucket,
+                    generation,
+                    from,
+                    budget: u32::try_from(budget).unwrap_or(u32::MAX),
+                };
+                self.read(name_group, query, u64::MAX).map(Pending::Read)
+            }
+            // The cell's one Name range is the directory.
+            Next::Request(coordinator::Request::Directory) => {
                 if let Some(Job {
-                    work:
-                        Work::Create(Create {
-                            coordinator: Some(c),
-                            ..
-                        }),
+                    work: Work::Bucket(coordinating),
                     ..
                 }) = self.jobs.get_mut(at)
-                    && c.answer(coordinator::Answer::Directory(directory)).is_err()
+                    && let Some(c) = coordinating.coordinator.as_mut()
+                    && c.answer(coordinator::Answer::Directory(directory()))
+                        .is_err()
                 {
                     self.fail_job(at, Status::Failed)?;
                 }
                 return Ok(false);
             }
-            Some(coordinator::Request::Probe { .. }) | None => {
-                self.fail_job(at, Status::Failed)?;
-                return self.drain_job(at);
-            }
         };
+        self.asked(at, asked, None)
+    }
+
+    /// What job `at` asked, kept to wait on; the asking's failure ends the job. An ask the node
+    /// has no room for is asked again at the next turn.
+    fn asked(
+        &mut self,
+        at: usize,
+        asked: Result<Pending, NodeError>,
+        request: Option<u64>,
+    ) -> Result<bool, NodeError> {
         match asked {
             Ok(pending) => {
                 if let Some(job) = self.jobs.get_mut(at) {
-                    job.pending.push((pending, None));
+                    job.pending.push((pending, request));
                 }
+                Ok(false)
             }
-            // The node holds as many asks as it keeps: asked again at the next turn.
-            Err(NodeError::Asks) => {}
+            Err(NodeError::Asks) => Ok(false),
             Err(_) => {
                 self.fail_job(at, Status::Failed)?;
-                return self.drain_job(at);
+                self.drain_job(at)
             }
         }
-        Ok(false)
     }
 
     /// A put's bucket row, read: its driver made over it, or the reply `NoSuchBucket`.
@@ -663,7 +803,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             incarnation: row.created_ns,
             key: putting.key.clone(),
             versioning: row.versioning,
-            preconditions: Preconditions::default(),
+            preconditions: std::mem::take(&mut putting.preconditions),
             at_ns: 0,
             ordered_ns: None,
             version: Version {
@@ -674,7 +814,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 size: 0,
                 checksum: None,
                 file: None,
-                owner: format!("{peer}"),
+                owner: peer.to_string(),
                 headers: Vec::new(),
                 retention: None,
                 legal_hold: None,
@@ -686,8 +826,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         });
         let body = Body {
             length: putting.length,
-            checksum: None,
-            content_md5: false,
+            checksum: putting.expected.checksum.as_ref().map(|c| c.algorithm),
+            content_md5: putting.expected.md5.is_some(),
         };
         match Put::new(commit, body, keys, layout, holding, Box::new(Random), now) {
             Ok(put) => {
@@ -720,10 +860,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Some(put) => {
                     let over = put.outcome().map(|outcome| match outcome {
                         Ok(stored) => Reply {
-                            status: Status::Done,
                             version: stored.version.clone().unwrap_or_default(),
                             etag: stored.etag.clone(),
                             size: stored.size,
+                            checksum: stored.checksum.as_ref().map(kept),
+                            ..Reply::status(Status::Done)
                         },
                         Err(error) => Reply::status(put_status(error)),
                     });
@@ -750,19 +891,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     self.fail_job(at, Status::Failed)?;
                     return self.drain_job(at);
                 };
-                match self.read(group, Query::Bucket { bucket }, u64::MAX) {
-                    Ok(ask) => {
-                        if let Some(job) = self.jobs.get_mut(at) {
-                            job.pending.push((Pending::Read(ask), None));
-                        }
-                    }
-                    Err(NodeError::Asks) => {}
-                    Err(_) => {
-                        self.fail_job(at, Status::Failed)?;
-                        return self.drain_job(at);
-                    }
-                }
-                return Ok(false);
+                let asked = self
+                    .read(group, Query::Bucket { bucket }, u64::MAX)
+                    .map(Pending::Read);
+                return self.asked(at, asked, None);
             }
             Step::Go => {}
         }
@@ -799,7 +931,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// Reads a put's body into its driver as far as the driver takes it: what it left of the
-    /// last piece first, then a piece at a time; at the body's end, the body ended.
+    /// last piece first, then a piece at a time; at the body's end, the body ended, its digests
+    /// checked against what the request said before anything commits.
     fn feed_put(&mut self, at: usize) -> Result<(), NodeError> {
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(());
@@ -831,7 +964,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
             if putting.taken >= putting.length {
                 if endpoint.body_complete(exchange) || putting.length == 0 {
-                    if put.end(&Expected::default()).is_err() && put.outcome().is_none() {
+                    if put.end(&putting.expected).is_err() && put.outcome().is_none() {
                         return self.fail_job(at, Status::Failed);
                     }
                     // Ended once: nothing more is read, and the outcome answers it.
@@ -877,14 +1010,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     self.fail_job(at, Status::Failed)?;
                     return Ok(None);
                 };
+                // Refused, the driver ends with that outcome, which its next turn replies.
                 if let Some(Job {
                     work: Work::Put(putting),
                     ..
                 }) = self.jobs.get_mut(at)
                     && let Some(put) = putting.put.as_mut()
-                    && put.answer(id, put::Answer::Volumes(volumes)).is_err()
                 {
-                    self.fail_job(at, Status::Failed)?;
+                    let _ = put.answer(id, put::Answer::Volumes(volumes));
                 }
                 return Ok(None);
             }
@@ -905,9 +1038,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         ..
                     }) = self.jobs.get_mut(at)
                         && let Some(put) = putting.put.as_mut()
-                        && put.answer(id, put::Answer::Refused).is_err()
                     {
-                        self.fail_job(at, Status::Failed)?;
+                        let _ = put.answer(id, put::Answer::Refused);
                     }
                     return Ok(None);
                 };
@@ -945,18 +1077,20 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
     }
 
-    /// A get's current version, read: its driver made over it and the reply's head sent, or the
-    /// reply `NoSuchKey` or `InvalidRange`.
+    /// A get's or head's current version, read: its preconditions judged and its range resolved
+    /// against it (05 §2.4, §12); then a head's facts replied, or a get's driver made over the
+    /// range and the reply's head sent.
     fn current_read(&mut self, at: usize, read: Read) -> Result<(), NodeError> {
-        let Read::Current(Some((order, version))) = read else {
-            return self.fail_job(at, Status::NoSuchKey);
+        let (order, version) = match read {
+            Read::NoBucket => return self.fail_job(at, Status::NoSuchBucket),
+            Read::Current(None) => return self.fail_job(at, Status::NoSuchKey),
+            Read::Current(Some(found)) => found,
+            _ => return self.fail_job(at, Status::Failed),
         };
-        if version.marker {
-            return self.fail_job(at, Status::NoSuchKey);
-        }
         let Some(gateway) = self.gateway.as_ref() else {
             return self.fail_job(at, Status::Failed);
         };
+        let window = gateway.window;
         let keyring = RootKeys {
             keys: gateway
                 .keys
@@ -964,7 +1098,6 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .map(|(g, key)| (*g, *key.bytes()))
                 .collect(),
         };
-        let window = gateway.window;
         let Some(Job {
             work: Work::Get(getting),
             exchange,
@@ -974,57 +1107,70 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Ok(());
         };
         let exchange = *exchange;
-        let size = version.size;
-        if getting.offset > size || (getting.offset == size && size > 0) {
-            return self.fail_job(at, Status::InvalidRange);
-        }
-        let end = getting.offset.saturating_add(getting.len).min(size);
-        let total = end.saturating_sub(getting.offset);
-        match Get::new(
-            version.file,
-            size,
-            getting.offset..end,
-            Box::new(keyring),
-            window,
-        ) {
-            Ok(get) => {
-                getting.get = Some(get);
-                getting.total = total;
+        let mut reply = facts(Status::Done, order, &version);
+        let current = if version.marker {
+            Current::DeleteMarker
+        } else {
+            Current::Present {
+                etag: &version.etag,
+                modified: i64::try_from(reply.modified).unwrap_or(i64::MAX),
             }
+        };
+        reply.status = match conditional::read(&getting.headers.conditions(), &current) {
+            conditional::Outcome::Proceed => Status::Done,
+            // A current delete marker is no object: 404 with `x-amz-delete-marker` (05 §7.4).
+            conditional::Outcome::NotFound => Status::NoSuchKey,
+            conditional::Outcome::NotModified => Status::NotModified,
+            conditional::Outcome::Failed => Status::PreconditionFailed,
+        };
+        if reply.status != Status::Done {
+            if reply.status == Status::PreconditionFailed {
+                reply = Reply::status(Status::PreconditionFailed);
+            }
+            return self.reply_job(at, reply);
+        }
+        let size = version.size;
+        let served = match range::span(getting.headers.range.as_deref(), size) {
+            Span::Whole => 0..size,
+            Span::Part { first, last } => {
+                reply.range = Some((first, last));
+                first..last.saturating_add(1)
+            }
+            Span::Unsatisfiable => {
+                let refused = Reply {
+                    size,
+                    ..Reply::status(Status::InvalidRange)
+                };
+                return self.reply_job(at, refused);
+            }
+        };
+        if getting.head {
+            return self.reply_job(at, reply);
+        }
+        let length = served.end.saturating_sub(served.start);
+        match Get::new(version.file, size, served, Box::new(keyring), window) {
+            Ok(get) => getting.get = Some(get),
             Err(_) => return self.fail_job(at, Status::Failed),
         }
-        let reply = Reply {
-            status: Status::Done,
-            version: mantle_meta::key::version_id(order),
-            etag: version.etag,
-            size,
-        };
-        let Ok((head, tags)) = reply.encode() else {
+        let Ok((head, fields)) = reply.encode() else {
             return self.fail_job(at, Status::Failed);
         };
-        // The tags open the body, ahead of the range's bytes.
-        let tagged = u64::try_from(tags.len()).unwrap_or(u64::MAX);
-        if let Some(Job {
-            work: Work::Get(getting),
-            ..
-        }) = self.jobs.get_mut(at)
-        {
-            getting.total = total.saturating_add(tagged);
-            getting.out = Some((Bytes::from(tags), 0));
-        }
-        match self
-            .driver
-            .endpoint()
-            .reply(exchange, &head, Some(total.saturating_add(tagged)))
-        {
+        // The fields open the body, ahead of the range's bytes.
+        let total = u64::try_from(fields.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(length);
+        getting.total = total;
+        getting.out = Some((Bytes::from(fields), 0));
+        match self.driver.endpoint().reply(exchange, &head, Some(total)) {
             Ok(()) => Ok(()),
             // Its asker is gone: the job ends with its exchange.
             Err(_) => self.fail_job(at, Status::Failed),
         }
     }
 
-    /// A get's turn: its current version read first; then its driver's requests asked and its
-    /// bytes written as far as the exchange takes them; once every byte is written, its end.
+    /// A get's or head's turn: its current version read first; then a get's driver's requests
+    /// asked and its bytes written as far as the exchange takes them; once every byte is written,
+    /// its end.
     fn step_get(&mut self, at: usize) -> Result<bool, NodeError> {
         let name = self.group_of(Layer::Name);
         let Some(job) = self.jobs.get_mut(at) else {
@@ -1034,29 +1180,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Ok(true);
         };
         if getting.get.is_none() {
-            if job.pending.is_empty() {
-                let query = Query::Current {
-                    bucket: getting.bucket.clone(),
-                    key: getting.key.clone(),
-                };
-                let Some(group) = name else {
-                    self.fail_job(at, Status::Failed)?;
-                    return self.drain_job(at);
-                };
-                match self.read(group, query, u64::MAX) {
-                    Ok(ask) => {
-                        if let Some(job) = self.jobs.get_mut(at) {
-                            job.pending.push((Pending::Read(ask), None));
-                        }
-                    }
-                    Err(NodeError::Asks) => {}
-                    Err(_) => {
-                        self.fail_job(at, Status::Failed)?;
-                        return self.drain_job(at);
-                    }
-                }
+            if !job.pending.is_empty() {
+                return Ok(false);
             }
-            return Ok(false);
+            let query = Query::Current {
+                bucket: getting.bucket.clone(),
+                key: getting.key.clone(),
+            };
+            let Some(group) = name else {
+                self.fail_job(at, Status::Failed)?;
+                return self.drain_job(at);
+            };
+            let asked = self.read(group, query, u64::MAX).map(Pending::Read);
+            return self.asked(at, asked, None);
         }
         if self.write_get(at)? {
             return Ok(true);
@@ -1193,14 +1329,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     return Ok(None);
                 };
                 let Some(node) = node else {
+                    // A volume the table no longer holds: another copy is read, or the driver
+                    // ends with its outcome.
                     if let Some(Job {
                         work: Work::Get(getting),
                         ..
                     }) = self.jobs.get_mut(at)
                         && let Some(get) = getting.get.as_mut()
-                        && get.answer(id, get::Answer::Unreadable).is_err()
                     {
-                        self.fail_job(at, Status::Failed)?;
+                        let _ = get.answer(id, get::Answer::Unreadable);
                     }
                     return Ok(None);
                 };
@@ -1223,15 +1360,181 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
     }
 
-    /// Ends job `at` with `status`: what it waits on is let go, and its body, if any is left, read
+    /// A commanding operation's turn: its bucket's row read first, then its command; the
+    /// command's answer replies (`answer_job`).
+    fn step_command(&mut self, at: usize) -> Result<bool, NodeError> {
+        let Some(Job {
+            work: Work::Command(commanding),
+            pending,
+            ..
+        }) = self.jobs.get(at)
+        else {
+            return Ok(true);
+        };
+        if !pending.is_empty() || commanding.asked {
+            return Ok(false);
+        }
+        let Some(group) = self.group_of(Layer::Bucket) else {
+            self.fail_job(at, Status::Failed)?;
+            return self.drain_job(at);
+        };
+        let query = Query::Bucket {
+            bucket: commanding.bucket.clone(),
+        };
+        let asked = self.read(group, query, u64::MAX).map(Pending::Read);
+        self.asked(at, asked, None)
+    }
+
+    /// A commanding operation's bucket row, read: its command asked, a delete's under the
+    /// bucket's incarnation and versioning (05 §7.3), a versioning change by the bucket's owner;
+    /// or the reply `NoSuchBucket` or `AccessDenied`.
+    fn command_read(&mut self, at: usize, read: Read) -> Result<(), NodeError> {
+        let Read::Bucket(Some(row)) = read else {
+            return self.fail_job(at, Status::NoSuchBucket);
+        };
+        if row.state != BucketState::Active {
+            return self.fail_job(at, Status::NoSuchBucket);
+        }
+        let (Some(bucket_group), Some(name_group)) =
+            (self.group_of(Layer::Bucket), self.group_of(Layer::Name))
+        else {
+            return self.fail_job(at, Status::Failed);
+        };
+        let Some(Job {
+            work: Work::Command(commanding),
+            peer,
+            ..
+        }) = self.jobs.get_mut(at)
+        else {
+            return Ok(());
+        };
+        let (group, command) = match &mut commanding.then {
+            Then::Delete { key, if_match } => (
+                name_group,
+                Command::Name(Box::new(name::Command::Delete(name::Delete {
+                    bucket: commanding.bucket.clone(),
+                    incarnation: row.created_ns,
+                    key: key.clone(),
+                    versioning: row.versioning,
+                    named: None,
+                    if_match: if_match.take(),
+                    at_ns: 0,
+                    bypass: false,
+                    owner: peer.to_string(),
+                }))),
+            ),
+            // S3 lets no other principal change a bucket's versioning unless a policy grants it.
+            Then::Versioning(_) if row.owner != peer.to_string() => {
+                return self.fail_job(at, Status::AccessDenied);
+            }
+            Then::Versioning(versioning) => (
+                bucket_group,
+                Command::Bucket(bucket::Command::Version {
+                    bucket: commanding.bucket.clone(),
+                    incarnation: row.created_ns,
+                    versioning: *versioning,
+                }),
+            ),
+        };
+        commanding.asked = true;
+        let asked = self.command(group, command, u64::MAX).map(Pending::Command);
+        self.asked(at, asked, None).map(|_| ())
+    }
+
+    /// An operation one read answers, at its turn: its read asked once.
+    fn step_single(&mut self, at: usize) -> Result<bool, NodeError> {
+        let Some(job) = self.jobs.get(at) else {
+            return Ok(true);
+        };
+        if !job.pending.is_empty() {
+            return Ok(false);
+        }
+        let Work::Read(single) = &job.work else {
+            return Ok(true);
+        };
+        let (layer, query) = match single.as_ref() {
+            Single::HeadBucket(bucket) => (
+                Layer::Bucket,
+                Query::Bucket {
+                    bucket: bucket.clone(),
+                },
+            ),
+            Single::List(list) => (Layer::Name, Query::List(list.clone())),
+            Single::Buckets { prefix, after, max } => (
+                Layer::Bucket,
+                Query::Owned {
+                    owner: job.peer.to_string(),
+                    prefix: prefix.clone(),
+                    after: after.clone(),
+                    max: *max,
+                },
+            ),
+            Single::Versioning(bucket) => (
+                Layer::Bucket,
+                Query::Bucket {
+                    bucket: bucket.clone(),
+                },
+            ),
+        };
+        let Some(group) = self.group_of(layer) else {
+            self.fail_job(at, Status::Failed)?;
+            return self.drain_job(at);
+        };
+        let asked = self.read(group, query, u64::MAX).map(Pending::Read);
+        self.asked(at, asked, None)
+    }
+
+    /// The answer of an operation one read answers: its reply.
+    fn single_read(&mut self, at: usize, read: Read) -> Result<(), NodeError> {
+        let Some(job) = self.jobs.get(at) else {
+            return Ok(());
+        };
+        let reply = match (&job.work, read) {
+            (Work::Read(single), Read::Bucket(row)) => match row {
+                Some(row) if row.state != BucketState::Active => {
+                    Reply::status(Status::NoSuchBucket)
+                }
+                // S3 answers another principal's bucket 403 unless a policy grants it.
+                Some(row) if row.owner != job.peer.to_string() => {
+                    Reply::status(Status::AccessDenied)
+                }
+                Some(row) => match **single {
+                    Single::Versioning(_) => Reply {
+                        versioning: Some(row.versioning),
+                        ..Reply::status(Status::Done)
+                    },
+                    _ => Reply::status(Status::Done),
+                },
+                None => Reply::status(Status::NoSuchBucket),
+            },
+            (_, Read::NoBucket) => Reply::status(Status::NoSuchBucket),
+            (_, Read::Keys(page)) => Reply {
+                listing: Some(Listing::Keys(page)),
+                ..Reply::status(Status::Done)
+            },
+            (_, Read::Owned(page)) => Reply {
+                listing: Some(Listing::Buckets(page)),
+                ..Reply::status(Status::Done)
+            },
+            _ => Reply::status(Status::Failed),
+        };
+        self.reply_job(at, reply)
+    }
+
+    /// Ends job `at` with `reply`: what it waits on is let go, and its body, if any is left, read
     /// to its end and dropped before the reply goes.
-    fn fail_job(&mut self, at: usize, status: Status) -> Result<(), NodeError> {
+    fn reply_job(&mut self, at: usize, reply: Reply) -> Result<(), NodeError> {
         if let Some(job) = self.jobs.get_mut(at) {
-            job.work = Work::Draining(Reply::status(status));
+            job.work = Work::Draining(reply);
             self.abandoned
                 .extend(job.pending.drain(..).map(|(pending, _)| pending));
         }
         Ok(())
+    }
+
+    /// Ends job `at` with `status` alone.
+    fn fail_job(&mut self, at: usize, status: Status) -> Result<(), NodeError> {
+        self.reply_job(at, Reply::status(status))
     }
 
     /// The outcomes of asks whose job ended before they came, dropped as they come: an outcome no
@@ -1291,30 +1594,31 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 return Ok(false);
             }
         }
-        let Ok((head, tags)) = reply.encode() else {
+        let Ok((head, fields)) = reply.encode() else {
             return Ok(true);
         };
-        let tagged = u64::try_from(tags.len()).unwrap_or(u64::MAX);
-        if endpoint.reply(exchange, &head, Some(tagged)).is_err() {
+        let length = u64::try_from(fields.len()).unwrap_or(u64::MAX);
+        if endpoint.reply(exchange, &head, Some(length)).is_err() {
             return Ok(true);
         }
         if let Some(job) = self.jobs.get_mut(at) {
-            job.work = Work::Replying(tags, 0);
+            job.work = Work::Replying(fields, 0);
         }
-        self.write_tags(at)
+        self.write_fields(at)
     }
 
-    /// A reply's tags written as far as its exchange takes them; once all are, the exchange ends.
-    fn write_tags(&mut self, at: usize) -> Result<bool, NodeError> {
+    /// A reply's fields written as far as its exchange takes them; once all are, the exchange
+    /// ends.
+    fn write_fields(&mut self, at: usize) -> Result<bool, NodeError> {
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(true);
         };
         let exchange = job.exchange;
-        let Work::Replying(tags, written) = &mut job.work else {
+        let Work::Replying(fields, written) = &mut job.work else {
             return Ok(false);
         };
         let endpoint = self.driver.endpoint();
-        while let Some(rest) = tags.get(*written..)
+        while let Some(rest) = fields.get(*written..)
             && !rest.is_empty()
         {
             match endpoint.write_body(exchange, rest) {
@@ -1379,6 +1683,122 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .min()
             .map(|due| shard.saturating_add(due.saturating_sub(wall)))
     }
+}
+
+/// The cell's first Name range, which spans every key at its first generation (node.md §1.5): the
+/// directory a bucket's coordinator routes by.
+fn directory() -> Vec<Descriptor> {
+    vec![Descriptor {
+        id: 1,
+        lo: Vec::new(),
+        hi: None,
+        generation: 1,
+    }]
+}
+
+/// The work an operation's request names, the bytes read past its fields the start of a put's
+/// body.
+fn work(op: Op, carry: Vec<u8>) -> Work {
+    match op {
+        Op::Create { bucket, .. } => Work::Bucket(Box::new(Coordinating {
+            bucket,
+            delete: false,
+            owned: true,
+            coordinator: None,
+        })),
+        Op::DeleteBucket { bucket, .. } => Work::Bucket(Box::new(Coordinating {
+            bucket,
+            delete: true,
+            owned: false,
+            coordinator: None,
+        })),
+        Op::Put { length, .. } if length > mantle_s3::body::MAX_UPLOAD => {
+            Work::Draining(Reply::status(Status::EntityTooLarge))
+        }
+        Op::Put {
+            bucket,
+            key,
+            id,
+            length,
+            headers,
+            checksum,
+            md5,
+        } => Work::Put(Box::new(Putting {
+            bucket,
+            key,
+            id,
+            length,
+            preconditions: Preconditions {
+                if_match: matched(headers.if_match.as_deref(), true),
+                if_none_match: matched(headers.if_none_match.as_deref(), false),
+            },
+            expected: Expected { md5, checksum },
+            put: None,
+            taken: 0,
+            carry,
+            waiting: VecDeque::new(),
+        })),
+        Op::Get {
+            bucket,
+            key,
+            headers,
+        } => getting(bucket, key, headers, false),
+        Op::Head {
+            bucket,
+            key,
+            headers,
+        } => getting(bucket, key, headers, true),
+        Op::Delete {
+            bucket,
+            key,
+            headers,
+            ..
+        } => Work::Command(Box::new(Commanding {
+            bucket,
+            then: Then::Delete {
+                key,
+                if_match: matched(headers.if_match.as_deref(), true),
+            },
+            asked: false,
+        })),
+        Op::PutVersioning {
+            bucket, versioning, ..
+        } => Work::Command(Box::new(Commanding {
+            bucket,
+            then: Then::Versioning(versioning),
+            asked: false,
+        })),
+        Op::GetVersioning { bucket } => Work::Read(Box::new(Single::Versioning(bucket))),
+        Op::List(list) => Work::Read(Box::new(Single::List(list))),
+        Op::HeadBucket { bucket } => Work::Read(Box::new(Single::HeadBucket(bucket))),
+        Op::ListBuckets { prefix, after, max } => {
+            Work::Read(Box::new(Single::Buckets { prefix, after, max }))
+        }
+    }
+}
+
+fn getting(bucket: String, key: String, headers: Headers, head: bool) -> Work {
+    Work::Get(Box::new(Getting {
+        bucket,
+        key,
+        headers,
+        head,
+        get: None,
+        out: None,
+        written: 0,
+        total: 0,
+        waiting: VecDeque::new(),
+    }))
+}
+
+/// What a bucket's create or delete asks next.
+enum Next {
+    /// A delete's bucket row, whose owner it checks.
+    Owner,
+    /// Its first command, or its coordinator's next request.
+    Request(coordinator::Request),
+    /// Nothing: it is over, with this answer.
+    Done(Status),
 }
 
 /// Where a put is at a turn.

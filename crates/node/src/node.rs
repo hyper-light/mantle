@@ -2205,8 +2205,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let Ok(mut into) = endpoint.reserve(receiving.what.class(), PIECE) else {
                 receiving.diag_refused = receiving.diag_refused.saturating_add(1);
                 if receiving.diag_refused == 1 || receiving.diag_refused % 1000 == 0 {
+                    let stats = endpoint.stats();
                     eprintln!(
-                        "diag-node {:?} reserve-refused wall_ms={} exchange={:?} what={} read={} body={} used={} refused={} times={}",
+                        "diag-node {:?} reserve-refused wall_ms={} exchange={:?} what={} read={} body={} used={} refused={} times={} conns={} exchanges={} granted={} chunks={} reserving={} events={} copied={} set_back={}",
                         self.id,
                         diag_wall_ms(),
                         exchange,
@@ -2215,7 +2216,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         receiving.body,
                         endpoint.budget().used(),
                         endpoint.budget().refused(),
-                        receiving.diag_refused
+                        receiving.diag_refused,
+                        stats.connections,
+                        stats.exchanges,
+                        stats.receive_granted,
+                        stats.receive_chunks,
+                        stats.frames_reserving,
+                        stats.events,
+                        stats.receive_copied,
+                        stats.windows_set_back
                     );
                 }
                 return Ok(());
@@ -3678,6 +3687,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let id = self.id;
         let used = self.driver.endpoint().budget().used();
         let refused = self.driver.endpoint().budget().refused();
+        let stats = self.driver.endpoint().stats();
+        let held = format!(
+            "conns={} exchanges={} granted={} chunks={} reserving={}",
+            stats.connections,
+            stats.exchanges,
+            stats.receive_granted,
+            stats.receive_chunks,
+            stats.frames_reserving
+        );
         for receiving in &mut self.receiving {
             if receiving.read != receiving.diag_moved.0 {
                 receiving.diag_moved = (receiving.read, std::time::Instant::now());
@@ -3688,7 +3706,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if !receiving.diag_said && since >= std::time::Duration::from_secs(1) {
                 receiving.diag_said = true;
                 eprintln!(
-                    "diag-node {id:?} read-stuck wall_ms={} exchange={:?} peer={:?} what={} read={} body={} since_ms={} used={used} refused={refused} its_refusals={}",
+                    "diag-node {id:?} read-stuck wall_ms={} exchange={:?} peer={:?} what={} read={} body={} since_ms={} used={used} refused={refused} its_refusals={} {held}",
                     diag_wall_ms(),
                     receiving.exchange,
                     receiving.peer,

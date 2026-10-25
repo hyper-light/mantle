@@ -316,9 +316,9 @@ pub(crate) enum Line {
         /// While a command or read the node asks of the range itself waits paused, the longest
         /// the pause may last (`Status::asking`, else zero).
         asking: Duration,
-        /// Whether the node waits on its own device (`Status::held`).
-        held: bool,
     },
+    /// Whether the node waits on its own device (`Node::held`), said as it changes.
+    Held(bool),
     /// The node's log as it said with its last status: how long its flush had been out, if one
     /// was, and the longest an update has waited for its commit.
     Log(Option<Duration>, Duration),
@@ -368,6 +368,11 @@ pub(crate) fn parse(line: &str) -> Option<Line> {
             leader.parse().ok()?,
         )),
         ["stopped"] => Some(Line::Stopped),
+        ["held", held] => Some(Line::Held(match *held {
+            "0" => false,
+            "1" => true,
+            _ => return None,
+        })),
         ["moved", bytes, serve] => Some(Line::Moved(
             bytes.parse().ok()?,
             Duration::from_nanos(serve.parse().ok()?),
@@ -395,7 +400,6 @@ pub(crate) fn parse(line: &str) -> Option<Line> {
             reconnect,
             measuring,
             asking,
-            held,
         ] => Some(Line::Status {
             group: u128::from_str_radix(group, 16).ok()?,
             term: term.parse().ok()?,
@@ -406,17 +410,12 @@ pub(crate) fn parse(line: &str) -> Option<Line> {
             reconnect: Duration::from_nanos(reconnect.parse().ok()?),
             measuring: Duration::from_nanos(measuring.parse().ok()?),
             asking: Duration::from_nanos(asking.parse().ok()?),
-            held: match *held {
-                "0" => false,
-                "1" => true,
-                _ => return None,
-            },
         }),
         _ => None,
     }
 }
 
-/// What of a status is movement: all of it but whether the node waits on its device.
+/// What of a status is movement: all of it.
 pub(crate) fn movement(line: &Line) -> Option<(u64, u64, u64, u64, Duration, Duration, Duration)> {
     match line {
         Line::Status {
@@ -435,6 +434,7 @@ pub(crate) fn movement(line: &Line) -> Option<(u64, u64, u64, u64, Duration, Dur
         | Line::Replaced(..)
         | Line::Link(..)
         | Line::Log(..)
+        | Line::Held(..)
         | Line::Volume(..)
         | Line::Enlisted
         | Line::Basis(..)
@@ -791,6 +791,8 @@ pub(crate) struct Cell {
     /// most `Cell::held_bound`, and when the stretch under way began, if one is.
     pub(crate) held_for: Duration,
     pub(crate) held_since: Option<Instant>,
+    /// The running nodes whose last word was that they wait on their own device.
+    pub(crate) held: BTreeSet<u64>,
     /// Whether each node keeps a volume, the volume each running node said it holds, and the
     /// nodes whose running process said the root range took its enlistment.
     pub(crate) stored: bool,
@@ -1055,6 +1057,7 @@ impl Cell {
             moved_at: Instant::now(),
             held_for: Duration::ZERO,
             held_since: None,
+            held: BTreeSet::new(),
             stored: true,
             volumes: BTreeMap::new(),
             enlisted: BTreeSet::new(),
@@ -1180,6 +1183,7 @@ impl Cell {
             moved_at: Instant::now(),
             held_for: Duration::ZERO,
             held_since: None,
+            held: BTreeSet::new(),
             stored,
             volumes: BTreeMap::new(),
             enlisted: BTreeSet::new(),
@@ -1393,6 +1397,7 @@ impl Cell {
         running.child.kill().unwrap();
         running.child.wait().unwrap();
         self.status.retain(|(node, _), _| *node != id);
+        self.held.remove(&id);
         self.log.remove(&id);
         self.transfers.remove(&id);
         self.hold();
@@ -1416,6 +1421,7 @@ impl Cell {
                 | Line::Replaced(..)
                 | Line::Link(..)
                 | Line::Log(..)
+                | Line::Held(..)
                 | Line::Volume(..)
                 | Line::Enlisted
                 | Line::Basis(..)
@@ -1448,11 +1454,7 @@ impl Cell {
         let held = self
             .running
             .keys()
-            .filter(|id| {
-                self.status
-                    .range((**id, 0)..=(**id, u128::MAX))
-                    .any(|(_, line)| matches!(line, Line::Status { held: true, .. }))
-            })
+            .filter(|id| self.held.contains(id))
             .count();
         held > 0 && 2 * held >= self.running.len()
     }
@@ -1563,8 +1565,8 @@ impl Cell {
                         if leader == 0 {
                             self.leaderless.insert((id, group));
                         }
-                        // A status that says only whether the node waits on its device begins
-                        // or ends a stretch held still, and moves nothing.
+                        // A status like the one last said, as a process started again says it
+                        // first, moves nothing.
                         let key = (id, group);
                         let moved = self.status.get(&key).and_then(movement) != movement(&line);
                         self.status.insert(key, line);
@@ -1572,6 +1574,17 @@ impl Cell {
                             self.hold();
                             return;
                         }
+                    }
+                    Line::Held(held) => {
+                        // Whether the node waits on its device begins or ends a stretch held still,
+                        // and moves nothing.
+                        if held {
+                            self.held.insert(id);
+                        } else {
+                            self.held.remove(&id);
+                        }
+                        self.hold();
+                        return;
                     }
                     Line::Log(flushing, longest) => {
                         self.log.insert(id, (Instant::now(), flushing, longest));
@@ -1616,6 +1629,7 @@ impl Cell {
                     }
                     self.refused = self.running.remove(&id);
                     self.status.retain(|(node, _), _| *node != id);
+                    self.held.remove(&id);
                     self.log.remove(&id);
                     self.transfers.remove(&id);
                 }

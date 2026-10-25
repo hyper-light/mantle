@@ -52,7 +52,7 @@
 //! whose log has a flush out extends the watch, since its range moves only as its writes become
 //! durable, until the flush has been out longer than the longest any node's log has taken and the
 //! quiet period besides (hyper-durable-e2e's rule, in one process). A cell no majority of whose
-//! live nodes is free of its own device holds still for its devices (`Status::held`: a node
+//! live nodes is free of its own device holds still for its devices (`Node::held`: a node
 //! judges no peer while its own proof is out, timing.md §2.8), and the watch does not count that
 //! time, each such stretch up to the longest any node's log has taken and the quiet period
 //! besides, as `crates/mantle/tests/node.rs`'s does. A node's shard is its own, as
@@ -462,6 +462,8 @@ enum Report {
     /// Where the node listens, once open: QUIC's address and the plane's.
     Bound(u64, SocketAddr, SocketAddr),
     Status(u64, Box<Status>),
+    /// Whether the node waits on its own device, as it changes (`Node::held`).
+    Held(u64, bool),
     /// A registration applied: its serial, its index, its answer.
     Applied(u64, u64, u64, Answer),
     /// What the node's log says of its flushes: how long the one out has been, if one is, and
@@ -624,6 +626,7 @@ async fn run<E: Engine + 'static>(
         }
     };
     let mut told: Option<Status> = None;
+    let mut told_held: Option<bool> = None;
     let mut stats = None;
     // The test's tag for each chunk asked, and each command, by the number the node asked it under.
     let mut tags: BTreeMap<ChunkAsk, u64> = BTreeMap::new();
@@ -769,6 +772,13 @@ async fn run<E: Engine + 'static>(
                 }
             }
         }
+        let held = node.held();
+        if told_held != Some(held) {
+            if reports.send(Report::Held(id, held)).is_err() {
+                return;
+            }
+            told_held = Some(held);
+        }
         let status = node.status(GROUP);
         if status != told
             && let Some(now) = status
@@ -815,6 +825,8 @@ struct Watch {
     /// The nodes open and not stopped.
     live: BTreeSet<u64>,
     status: BTreeMap<u64, Status>,
+    /// The live nodes whose last word was that they wait on their own device.
+    held: BTreeSet<u64>,
     /// Each node's registrations applied, by serial: the index and the answer.
     applied: BTreeMap<u64, BTreeMap<u64, (u64, Answer)>>,
     /// Each node's log: when it was heard, its flush out and for how long then, and the longest
@@ -884,13 +896,19 @@ impl Watch {
                         || was.asking != now.asking
                 });
                 self.status.insert(id, *now);
-                // A status that moved nothing may say the node waits on its device, or no
-                // longer does: a stretch held still begins or ends.
+                // A status whose change moved nothing (its patience, say) moves nothing.
                 if moved {
                     self.moved();
-                } else {
-                    self.hold();
                 }
+            }
+            Report::Held(id, held) => {
+                // Whether the node waits on its device begins or ends a stretch held still.
+                if held {
+                    self.held.insert(id);
+                } else {
+                    self.held.remove(&id);
+                }
+                self.hold();
             }
             Report::Applied(id, serial, index, answer) => {
                 self.applied
@@ -905,6 +923,7 @@ impl Watch {
             Report::Stopped(id) => {
                 self.live.remove(&id);
                 self.status.remove(&id);
+                self.held.remove(&id);
                 self.log.remove(&id);
                 self.links.retain(|(of, _), _| *of != id);
                 self.moved();
@@ -970,11 +989,7 @@ impl Watch {
     /// Whether no majority of the live nodes is free of its own device: the range's quorum then
     /// waits on the devices of the nodes that wait on theirs.
     fn held_by_devices(&self) -> bool {
-        let held = self
-            .live
-            .iter()
-            .filter(|id| self.status.get(id).is_some_and(|s| s.held))
-            .count();
+        let held = self.live.iter().filter(|id| self.held.contains(id)).count();
         held > 0 && 2 * held >= self.live.len()
     }
 

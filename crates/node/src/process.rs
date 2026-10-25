@@ -1392,6 +1392,8 @@ async fn serve(
     let serve = crate::bounds::idle_timeout();
     let serve_ns = u64::try_from(serve.as_nanos()).unwrap_or(u64::MAX);
     let mut said_moved: Option<(u64, u64)> = None;
+    // Whether the node waits on its own device, as last said, none before the first saying.
+    let mut said_held: Option<bool> = None;
     let signals = hyper_rt::signal::subscribe(STOP_SIGNALS).map_err(|e| talk(format!("{e:?}")))?;
     let mut stop = Stop::new(config.stop);
     // Whether standard input may say more: a node that does not end with it runs on once it closes,
@@ -1504,6 +1506,16 @@ async fn serve(
             say(&mut output, &format!("moved {moved} {serve_ns}\n")).await?;
             said_moved = Some((moved, now));
         }
+        // Whether the node waits on its own device, said as it changes, so a watcher knows it holds
+        // still for its device and not by choice: a fact of the node, said once, where a status
+        // for each range repeated it, and a log line after, at each of the liveness stream's
+        // flushes (12 lines a flush on a node of five ranges; 120 to 560 a second from each
+        // node while a peer of a cell of three was stopped, on this Mac).
+        let held = node.held();
+        if said_held != Some(held) {
+            say(&mut output, &format!("held {}\n", u8::from(held))).await?;
+            said_held = Some(held);
+        }
         let mut said = false;
         for ((group, _), was) in config.ranges.iter().zip(told.iter_mut()) {
             let Some(now) = node.status(*group) else {
@@ -1513,13 +1525,11 @@ async fn serve(
             // the heartbeats it takes from those pairs: said too, so a watcher sees it move before
             // it elects, and sees it stop if a peer it measures goes silent. The reconnect bound
             // is said each time it changes, as a redial's backoff doubles, so a watcher never
-            // holds one shorter than the node's own; and whether the node waits on its own device,
-            // so a watcher knows it holds still for its device and not by choice.
+            // holds one shorter than the node's own.
             let moved = was.is_none_or(|was| {
                 (was.term, was.leader, was.commit, was.applied, was.reconnect)
                     != (now.term, now.leader, now.commit, now.applied, now.reconnect)
                     || was.measuring != now.measuring
-                    || was.held != now.held
                     || was.asking != now.asking
             });
             if !moved {
@@ -1530,12 +1540,8 @@ async fn serve(
             let measuring = now.measuring_for.map_or(0, |m| m.as_nanos());
             let asking = now.asking.map_or(0, |a| a.as_nanos());
             let line = format!(
-                "status {group:x} {} {} {} {} {patience} {reconnect} {measuring} {asking} {}\n",
-                now.term,
-                now.leader,
-                now.commit,
-                now.applied,
-                u8::from(now.held)
+                "status {group:x} {} {} {} {} {patience} {reconnect} {measuring} {asking}\n",
+                now.term, now.leader, now.commit, now.applied
             );
             say(&mut output, &line).await?;
             *was = Some(now);

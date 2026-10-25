@@ -1,6 +1,8 @@
 //! The root range's volume table (docs/design/node.md §1.5, §5.6; architecture §4): the cell's
 //! nodes, each with its failure domain, and its volumes, each with the node that holds it and its
-//! bytes, which placement reads (node.md §7).
+//! bytes, which placement reads (node.md §7); and each node's history, the time it has run and its
+//! runs that ended without an orderly stop, which every node's failure detectors start from
+//! (node.md §2.4, item 7).
 //!
 //! A node enlists itself and its volumes as it starts. What the table does not hold is recorded;
 //! what it holds otherwise, a node in another domain or a volume on another node, is a conflict
@@ -11,7 +13,7 @@
 use crate::engine::{Rows, Write};
 use crate::error::{MetaError, reserved};
 use crate::key;
-use crate::record::{Census, Member, VolumeRow};
+use crate::record::{Census, History, Member, VolumeRow};
 
 /// The longest failure domain a node names, in bytes: a label such as a rack's or a zone's name.
 pub const MAX_DOMAIN: usize = 255;
@@ -19,6 +21,19 @@ pub const MAX_DOMAIN: usize = 255;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Enlist(Enlist),
+    Lived(Lived),
+}
+
+/// A node's history as the node states it: the totals over all its runs (node.md §2.4, item 7).
+/// The table keeps the greater of what it holds and what is stated, for each, so a statement
+/// applied late or twice takes nothing back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lived {
+    pub node: u64,
+    /// The time it has run, in nanoseconds.
+    pub exposure_ns: u64,
+    /// Its runs that ended without an orderly stop.
+    pub crashes: u64,
 }
 
 /// A node and the volumes it holds, as it starts (node.md §5.6).
@@ -44,6 +59,10 @@ pub enum Outcome {
     Conflict,
     /// The table would hold more nodes or volumes than the cell states: nothing changed.
     Full,
+    /// The node's history holds at least what was stated.
+    Kept,
+    /// The table holds no such node, whose history it would keep: nothing changed.
+    Unknown,
 }
 
 /// A volume as the table holds it, with its node's failure domain.
@@ -59,6 +78,7 @@ pub struct Placed {
 pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<Outcome, MetaError> {
     let (outcome, writes) = match command {
         Command::Enlist(e) => enlist(engine, e)?,
+        Command::Lived(l) => lived(engine, l)?,
     };
     engine.apply(index, &writes)?;
     Ok(outcome)
@@ -113,6 +133,54 @@ fn enlist<E: Rows>(engine: &mut E, e: &Enlist) -> Result<(Outcome, Vec<Write>), 
         writes.push(Write::Put(key::census(), census.encode()));
     }
     Ok((Outcome::Enlisted, writes))
+}
+
+/// A node's history kept: only an enlisted node's, so the histories are as many as the table's
+/// nodes.
+fn lived<E: Rows>(engine: &mut E, l: &Lived) -> Result<(Outcome, Vec<Write>), MetaError> {
+    if engine.get(&key::member(l.node))?.is_none() {
+        return Ok((Outcome::Unknown, Vec::new()));
+    }
+    let held = match engine.get(&key::history(l.node))? {
+        Some(bytes) => History::decode(&bytes)?,
+        None => History::default(),
+    };
+    let kept = History {
+        exposure_ns: held.exposure_ns.max(l.exposure_ns),
+        crashes: held.crashes.max(l.crashes),
+    };
+    let mut writes = reserved(1)?;
+    if kept != held {
+        writes.push(Write::Put(key::history(l.node), kept.encode()));
+    }
+    Ok((Outcome::Kept, writes))
+}
+
+/// The cell's history: every node's time run and crashes, summed, read at most `max` nodes'. Sums
+/// saturate: past `u64::MAX` nanoseconds (584 years) of node time or that many crashes, more
+/// changes no estimate made from them.
+pub fn history<E: Rows>(engine: &mut E, max: usize) -> Result<History, MetaError> {
+    let (mut from, to) = key::history_rows();
+    let mut sum = History::default();
+    for _ in 0..max {
+        let Some((k, v)) = engine.next(&from, &to)? else {
+            break;
+        };
+        let row = History::decode(&v)?;
+        sum.exposure_ns = sum.exposure_ns.saturating_add(row.exposure_ns);
+        sum.crashes = sum.crashes.saturating_add(row.crashes);
+        from = k;
+        from.push(0);
+    }
+    Ok(sum)
+}
+
+/// Node `node`'s history as the table holds it: none before it stated one.
+pub fn history_of<E: Rows>(engine: &mut E, node: u64) -> Result<History, MetaError> {
+    match engine.get(&key::history(node))? {
+        Some(bytes) => Ok(History::decode(&bytes)?),
+        None => Ok(History::default()),
+    }
 }
 
 /// How many nodes and volumes the table holds.
@@ -297,5 +365,82 @@ mod tests {
             }
         );
         assert_eq!(volumes(&mut m, None, 10).unwrap().len(), 4);
+    }
+
+    fn lived(node: u64, exposure_ns: u64, crashes: u64) -> Command {
+        Command::Lived(Lived {
+            node,
+            exposure_ns,
+            crashes,
+        })
+    }
+
+    #[test]
+    fn a_nodes_history_keeps_the_greater_of_each_total_and_the_cells_is_their_sum() {
+        let mut m = Model::default();
+        assert_eq!(
+            apply(&mut m, 1, &enlist(1, "d", &[])).unwrap(),
+            Outcome::Enlisted
+        );
+        assert_eq!(
+            apply(&mut m, 2, &enlist(2, "d", &[])).unwrap(),
+            Outcome::Enlisted
+        );
+        assert_eq!(apply(&mut m, 3, &lived(1, 100, 1)).unwrap(), Outcome::Kept);
+        // Stated late or twice: a smaller time takes nothing back, a larger count is kept.
+        assert_eq!(apply(&mut m, 4, &lived(1, 50, 2)).unwrap(), Outcome::Kept);
+        assert_eq!(apply(&mut m, 5, &lived(1, 50, 2)).unwrap(), Outcome::Kept);
+        assert_eq!(apply(&mut m, 6, &lived(2, 30, 0)).unwrap(), Outcome::Kept);
+        assert_eq!(
+            history_of(&mut m, 1).unwrap(),
+            History {
+                exposure_ns: 100,
+                crashes: 2
+            }
+        );
+        assert_eq!(history_of(&mut m, 3).unwrap(), History::default());
+        assert_eq!(
+            history(&mut m, 10).unwrap(),
+            History {
+                exposure_ns: 130,
+                crashes: 2
+            }
+        );
+    }
+
+    #[test]
+    fn the_history_of_a_node_the_table_does_not_hold_is_refused_and_changes_nothing() {
+        let mut m = Model::default();
+        assert_eq!(
+            apply(&mut m, 1, &enlist(1, "d", &[])).unwrap(),
+            Outcome::Enlisted
+        );
+        assert_eq!(
+            apply(&mut m, 2, &lived(9, 100, 1)).unwrap(),
+            Outcome::Unknown
+        );
+        assert_eq!(history(&mut m, 10).unwrap(), History::default());
+        assert_eq!(history_of(&mut m, 9).unwrap(), History::default());
+    }
+
+    #[test]
+    fn the_cells_history_reads_at_most_the_nodes_asked_and_its_sums_saturate() {
+        let mut m = Model::default();
+        for node in 1..=3 {
+            let index = 2 * node;
+            let enlisted = apply(&mut m, index - 1, &enlist(node, "d", &[])).unwrap();
+            assert_eq!(enlisted, Outcome::Enlisted);
+            let kept = apply(&mut m, index, &lived(node, u64::MAX, node)).unwrap();
+            assert_eq!(kept, Outcome::Kept);
+        }
+        assert_eq!(
+            history(&mut m, 2).unwrap(),
+            History {
+                exposure_ns: u64::MAX,
+                crashes: 3
+            }
+        );
+        assert_eq!(history(&mut m, 0).unwrap(), History::default());
+        assert_eq!(history(&mut m, 3).unwrap().crashes, 6);
     }
 }

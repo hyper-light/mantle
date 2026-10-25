@@ -34,6 +34,7 @@ pub mod command;
 pub mod derive;
 pub mod directory;
 pub mod frame;
+pub mod history;
 pub mod layout;
 pub mod node;
 pub mod object;

@@ -541,10 +541,11 @@ pub fn log_bytes(config: &LogConfig) -> Option<u64> {
 pub const LOG_DEPTH: usize = 3;
 
 /// The heap a range's member takes as it opens, beside what it keeps for each member of its
-/// configuration: measured, 1,104 bytes under elections by suspicion, the node's, at one to ten
+/// configuration: measured, 1,128 bytes under elections by suspicion, the node's, at one to ten
 /// members (`tests/range_memory.rs`); 1,080 before hyper-raft's d97153c gave the core's watch its
-/// hand-over order and the voter it left.
-pub const MEMBER_BYTES: u64 = 1_104;
+/// hand-over order and the voter it left, and 1,104 before 4117e35 gave it the list of members
+/// whose stop was announced.
+pub const MEMBER_BYTES: u64 = 1_128;
 
 /// The bytes of the context a node names a read by: the read's number (`Node`'s reads).
 const READ_CONTEXT_BYTES: u64 = 8;

@@ -639,6 +639,13 @@ impl<S: Storage> RawNode<S> {
     pub fn restarted(&mut self, member: NodeId) -> Result<()> {
         self.operate(|raft| raft.restarted(member))
     }
+    /// The owner's detectors took `member`'s node's announcement that its
+    /// run ends ([`Raft::stopped`]): suspected, ordered to campaign never,
+    /// and what it sends that could take the group's leader dropped, until
+    /// its node is heard again.
+    pub fn stopped(&mut self, member: NodeId) -> Result<()> {
+        self.operate(|raft| raft.stopped(member))
+    }
     /// What the owner's measurements give this group's elections
     /// ([`crate::Timing`]).
     pub fn set_timing(&mut self, timing: crate::Timing) -> Result<()> {

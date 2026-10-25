@@ -638,6 +638,9 @@ fn record_lines(me: u64, entries: &[Entry], liveness: &Liveness, out: &mut Strin
             Entry::Told(Change::Restarted { peer, at_ns }) => {
                 writeln!(out, "r {me} n {peer} {at_ns}")
             }
+            Entry::Told(Change::Stopped { peer, at_ns }) => {
+                writeln!(out, "r {me} x {peer} {at_ns}")
+            }
             Entry::Holds { peer, trust } => {
                 writeln!(out, "r {me} h {peer} {}", trust_field(trust))
             }
@@ -726,6 +729,13 @@ fn parse_record(fields: &[&str]) -> Option<(u64, Entry, Option<u64>)> {
         ),
         "n" => (
             Entry::Told(Change::Restarted {
+                peer: number(2)?,
+                at_ns: number(3)?,
+            }),
+            None,
+        ),
+        "x" => (
+            Entry::Told(Change::Stopped {
                 peer: number(2)?,
                 at_ns: number(3)?,
             }),

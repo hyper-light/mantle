@@ -86,9 +86,18 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `e65afff` (hyper-raft branch `degraded-suspicion`: `313ada8` and fifteen
-commits, made for mantle's roll and objects tests on CI's busy runners), with no local delta**,
-taken by `scripts/snapshot-hyper-raft.py`: hyper-raft's `d97153c`, a leader its detectors leave no
+**Every crate at `cc5a65b` (hyper-raft branch `degraded-suspicion`, CI run 40187798823, green on
+all 22 jobs; its port to `main` is `degraded-suspicion-main` at `fbaaa6c`, CI run 40192936129, 23 of
+23), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`: hyper-liveness's and
+hyper-raft's `4117e35`, a voter's announced stop suspected at its arrival (`Change::Stopped`,
+`RawNode::stopped`), the stopping member's vote requests and later-term messages dropped and it
+ordered to campaign never, so from the moment both remaining voters took the announcement a false
+suspicion between them costs no leadership; `a3e10fe` and `cc5a65b`, the announcement answered once
+by each peer that takes it and sent again until answered (`Liveness::stop_taken`), so an owner may
+announce before it hands over and hand over once each peer answered; and the model of both
+(`Suspicion.tla`, `67a7339`, its stop configurations from 5,454,016 to 14,791,288 states). Before
+it, every crate was at `e65afff` (hyper-raft branch `degraded-suspicion`: `313ada8` and fifteen
+commits, made for mantle's roll and objects tests on CI's busy runners), with no local delta: hyper-raft's `d97153c`, a leader its detectors leave no
 quorum leading on and handing over only to a voter that can be elected without it, and a
 pre-candidate left no quorum no longer asking, so a false suspicion between the two live voters of
 a group with one voter stopped costs no leadership (mantle's roll: terms 5 to 9 in 1.7 s, and a

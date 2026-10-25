@@ -54,8 +54,8 @@
 //! attach. A node whose pool starves before it has measured anything, its links silent, judges by
 //! its pool's latenesses at the most correlation they can carry and by its own stream's, which it
 //! keeps sending (`docs/timing.md` §2.8, "Judged with no evidence of its own"). A receiver expects
-//! the interval it asked (`LinkEstimator::expect_interval`), and a peer's new run is reported
-//! ([`Change::Restarted`]).
+//! the interval it asked (`LinkEstimator::expect_interval`), a peer's new run is reported
+//! ([`Change::Restarted`]), and its announced stop at once ([`Change::Stopped`]).
 //!
 //! **The bound.** Each suspicion states when the sender's last heartbeat was due on the sender's
 //! clock and the bound past it within which NFD-E suspected: the difference of the two clocks'
@@ -251,6 +251,16 @@ pub enum Change {
         /// The new run's first heartbeat's arrival.
         at_ns: u64,
     },
+    /// The peer announced that its run ends, in order ([`Heartbeat::stopping`]): suspected at once,
+    /// and until a heartbeat of its next run comes ([`Change::Restarted`]). The owner's core takes
+    /// it as `RawNode::stopped`: it orders the stopping run to campaign never, and drops what the
+    /// run still sends that could take a group's leader from it.
+    Stopped {
+        /// The peer.
+        peer: PeerId,
+        /// The announcement's arrival.
+        at_ns: u64,
+    },
 }
 
 impl Change {
@@ -258,7 +268,9 @@ impl Change {
     pub fn peer(&self) -> PeerId {
         match self {
             Self::Suspected(suspicion) => suspicion.peer,
-            Self::Trusted { peer, .. } | Self::Restarted { peer, .. } => *peer,
+            Self::Trusted { peer, .. }
+            | Self::Restarted { peer, .. }
+            | Self::Stopped { peer, .. } => *peer,
         }
     }
 }
@@ -460,7 +472,8 @@ impl Own {
 }
 
 /// Sends `pair`'s heartbeat due at `now_ns`, if a flush proves it, feeding `own` its lateness where
-/// given. Whether a flush is wanted: one proves the heartbeat due, or the next, already due.
+/// given; a node whose run announced its end sends the announcement again where it is due, and
+/// nothing else. Whether a flush is wanted: one proves the heartbeat due, or the next, already due.
 fn send(
     pair: &mut Pair,
     peer: PeerId,
@@ -470,6 +483,12 @@ fn send(
     own: Option<&mut Own>,
     out: &mut impl Output,
 ) -> bool {
+    if sender.stopped {
+        if pair.goodbye_due(now_ns) {
+            announce(pair, peer, sender, now_ns, message, out);
+        }
+        return false;
+    }
     match pair.send(sender, now_ns, message) {
         pair::Sent::Message(length, lateness) => {
             if let Some(message) = message.get(..length) {
@@ -488,6 +507,22 @@ fn send(
         }
         pair::Sent::NeedsFlush => true,
         pair::Sent::Nothing => false,
+    }
+}
+
+/// Sends `pair` this run's announcement that it ends ([`Pair::goodbye`]), where the pair shares a
+/// group and its peer has not answered.
+fn announce(
+    pair: &mut Pair,
+    peer: PeerId,
+    sender: &pair::Sender,
+    now_ns: u64,
+    message: &mut [u8; MAX_BYTES],
+    out: &mut impl Output,
+) {
+    let length = pair.goodbye(sender, now_ns, message);
+    if let Some(bytes) = message.get(..length).filter(|bytes| !bytes.is_empty()) {
+        out.heartbeat(peer, bytes);
     }
 }
 
@@ -706,8 +741,9 @@ impl Liveness {
     /// stamp where the owner has one). The peer is judged at the arrival first, so a freshness
     /// point that passed before the message came is a suspicion in whatever order messages and
     /// polls are fed; trust changes go to `out`. A heartbeat from a later run of the peer counts
-    /// as a failure in the MTBF's evidence, the peer having restarted, and one from an earlier
-    /// run than the latest taken is refused as stale.
+    /// as a failure in the MTBF's evidence, the peer having restarted, unless the run before
+    /// announced its stop; one from an earlier run than the latest taken, or from a run after its
+    /// announced stop, is refused as stale.
     pub fn on_heartbeat(
         &mut self,
         from: PeerId,
@@ -763,14 +799,20 @@ impl Liveness {
         outcome
     }
 
-    /// This node's run ends in order, at `now_ns` (its owner stops, having handed over what it
-    /// led): each peer it shares a group with is sent a heartbeat that says so
-    /// ([`Heartbeat::stopping`]), and the node sends nothing after it. A peer that takes it counts
-    /// the node's next run, or its letting go of the pair while it suspects the node, as no failure
-    /// in the MTBF's evidence, and sends the run nothing more. Lost, or taken by a build that does
-    /// not read it, it costs what an unannounced stop costs: the peer suspects the node as its
-    /// heartbeats stop, and counts its restart a failure. Call it once, as the stop's last act on
-    /// the plane; a poll after it judges and sends nothing.
+    /// This node's run ends in order, at `now_ns`: each peer it shares a group with is sent a
+    /// heartbeat that says so ([`Heartbeat::stopping`]), and the node sends no other heartbeat
+    /// after it. A peer that takes it suspects the node at once and until its next run is heard
+    /// ([`Change::Stopped`]), counts that run, or its letting go of the pair while it suspects the
+    /// node, as no failure in the MTBF's evidence, answers it once with a heartbeat that echoes it
+    /// ([`Liveness::stop_taken`]), and sends the run nothing more. Until a peer answers, its
+    /// announcement goes again at the stream's interval, at the polls after this call, which judge
+    /// as before; taken by a build that does not read it, it costs what an unannounced stop costs:
+    /// the peer suspects the node once its freshness point passes, counts its restart a failure,
+    /// and never answers. A group's remaining voters hold the stopping voter out from the moment
+    /// both took it (`docs/timing.md` §2.9, "A voter's stop announced"): an owner that announces
+    /// before it hands over the groups it leads, its members still running, and hands over once
+    /// each peer answered, gives each group the degraded group's rule before its new leader is
+    /// named. Call it once.
     pub fn stop(&mut self, now_ns: u64, out: &mut impl Output) {
         if std::mem::replace(&mut self.stopped, true) {
             return;
@@ -781,14 +823,13 @@ impl Liveness {
             granularity: self.granularity(),
             durable_count: self.durable.count,
             durable_ns: self.durable.latest_ns,
+            stopped: true,
         };
         for (&peer, pair) in &mut self.pairs {
-            let length = pair.goodbye(&sender, now_ns, &mut self.message);
-            if let Some(message) = self.message.get(..length).filter(|bytes| !bytes.is_empty()) {
-                out.heartbeat(peer, message);
-            }
+            announce(pair, peer, &sender, now_ns, &mut self.message, out);
         }
-        self.next_wake = None;
+        // Woken to send it again where it is not answered, and to judge as before.
+        self.next_wake = self.wake_after(now_ns);
     }
 
     /// Advances to `now_ns`: suspects peers whose freshness passed, sends the heartbeats due that
@@ -815,6 +856,7 @@ impl Liveness {
             granularity,
             durable_count: self.durable.count,
             durable_ns: self.durable.latest_ns,
+            stopped: self.stopped,
         };
         // The MTBF only for a pair that waits for a margin from the node's evidence, which a
         // configured node has none of: read at every poll, it was a float division and a
@@ -846,12 +888,9 @@ impl Liveness {
             if let Some(change) = change {
                 out.change(change);
             }
-            // Its own stream is read only while the node has no measured evidence. A node whose run
-            // stopped sends nothing more.
-            if !self.stopped {
-                let own = self.evidence.is_none().then_some(&mut self.own);
-                wants_flush |= send(pair, peer, &sender, now_ns, &mut self.message, own, out);
-            }
+            // Its own stream is read only while the node has no measured evidence.
+            let own = self.evidence.is_none().then_some(&mut self.own);
+            wants_flush |= send(pair, peer, &sender, now_ns, &mut self.message, own, out);
             wake = earliest(wake, pair, &local, now_ns);
         }
         // The stream wants a proof it lacks: from now, unless it has waited since earlier.
@@ -961,6 +1000,21 @@ impl Liveness {
         self.pairs
             .get(&peer)
             .map(|pair| pair.trust_at(&local, self.judged_ns))
+    }
+
+    /// Whether `peer`'s run announced its stop and no heartbeat of its next run has come
+    /// ([`Change::Stopped`]): what an owner tells a core it gives the peer anew
+    /// (`RawNode::stopped`).
+    pub fn stopped(&self, peer: PeerId) -> bool {
+        self.pairs.get(&peer).is_some_and(Pair::stopped)
+    }
+
+    /// Whether `peer` took this run's announcement that it ends ([`Liveness::stop`]): a heartbeat
+    /// of the peer's that echoes it came, its answer. From then the peer holds this node out of its
+    /// groups' quorums (`RawNode::stopped`); false before the announcement, for a peer that has not
+    /// answered, and for one this node shares no group with.
+    pub fn stop_taken(&self, peer: PeerId) -> bool {
+        self.pairs.get(&peer).is_some_and(Pair::stop_taken)
     }
 
     /// The peers this node suspects.

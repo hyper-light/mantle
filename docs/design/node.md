@@ -1176,7 +1176,16 @@ server answer early only because its client must keep a complete response, which
 hyper-transport's asker does not yet do. On the Windows runners, where a request's head often
 arrives in a datagram of its own, that turned 1,330 and 1,634 redirects into lost exchanges in
 three rounds of two process tests (one run per Windows target), and 4 and 7 once the body was
-read first. A client cuts an exchange that has not been answered within its
+read first. A request or reply the transport tells after it ended the exchange, its connection
+lost or its stream stopped before the owner took the event, holds no head: an exchange's events
+hold its slot whether or not the exchange is still there, and the refusal queued behind the event
+ends it. A node and its client take such an exchange as that refusal ends it, a command asked
+again, never its missing head as an empty one, which answers the command `Malformed`. Read so, a
+node that asked its statement of its history (§2.4 item 7) of a leader whose stop then closed its
+connections, the reply and the close reaching it in one turn of its driver, refused its own
+statement and ended (`crates/node/tests/transport_ended.rs`;
+measurements/2026-10-25-a-reply-past-its-connection.md). A client cuts an exchange that has not
+been answered within its
 period, and each cut doubles the next period with that node until that node replies (RFC 6298
 §5.5, collapsed only by a new measurement of the same path, §5). A registration, which would
 register again if asked again (the Raft dissertation §6.3), is cut by no period. On the Windows

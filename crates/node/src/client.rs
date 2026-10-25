@@ -459,7 +459,11 @@ impl Client {
                     if let Some(known) = self.nodes.iter_mut().find(|n| n.id == node) {
                         known.stalled = 0;
                     }
-                    let head = self.driver.endpoint().head(exchange).unwrap_or_default();
+                    let Some(head) = self.driver.endpoint().head(exchange) else {
+                        // Ended by the transport after the reply came, its connection lost or
+                        // its stream stopped: the refusal queued behind the reply ends it.
+                        continue;
+                    };
                     let read = command::read_reply_head(head)?;
                     reply = Some(read);
                     if read.status != Status::Answered {
@@ -749,7 +753,11 @@ impl Client {
                     write(self.driver.endpoint(), &mut written)?;
                 }
                 Event::Reply { exchange: e, .. } if e == exchange => {
-                    let head = self.driver.endpoint().head(exchange).unwrap_or_default();
+                    let Some(head) = self.driver.endpoint().head(exchange) else {
+                        // Ended by the transport after the reply came: the refusal queued behind
+                        // the reply ends it.
+                        continue;
+                    };
                     replied = Some(
                         object::ReplyHead::decode(head)
                             .map_err(|e| ClientError::Bounds(e.to_string()))?,
@@ -845,7 +853,11 @@ impl Client {
                     write_body(self.driver.endpoint(), exchange, body, &mut written)?;
                 }
                 Event::Reply { exchange: e, .. } if e == exchange => {
-                    let head = self.driver.endpoint().head(exchange).unwrap_or_default();
+                    let Some(head) = self.driver.endpoint().head(exchange) else {
+                        // Ended by the transport after the reply came: the refusal queued behind
+                        // the reply ends it.
+                        continue;
+                    };
                     let replied = chunk::read_reply_head(head).unwrap_or(chunk::Status::Malformed);
                     if replied != chunk::Status::Read {
                         self.driver.endpoint().end(exchange);

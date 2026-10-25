@@ -491,7 +491,13 @@ cost its leader, which hyper-raft's core no longer pays where acting on it canno
 (`d97153c`, model-checked); restarted nodes' detectors assumed an MTBF of their own seconds (§2.4
 item 7, the cell's history, now kept); and the transport refused a stream its reader took at its
 own pace as unread (hyper-raft `1912194`, ported)
-([measurements](measurements/2026-10-25-roll-on-a-busy-host.md)). Remaining: `mantle init client`;
+([measurements](measurements/2026-10-25-roll-on-a-busy-host.md)). Two later CI runs failed the roll
+once each, on linux-aarch64-1cpu and macos-aarch64 (40161728764, 40223736182): a node that asked its
+statement of its history of a leader whose stop then closed its connections took the reply, told
+after the transport had ended the exchange, as an empty head, refused its own statement `Malformed`
+and ended; a request or reply whose head is gone is now its exchange's end, as the refusal queued
+behind it says ([measurements](measurements/2026-10-25-a-reply-past-its-connection.md)).
+Remaining: `mantle init client`;
 Windows' console close and shutdown taken as requests to stop, which hyper-rt's handler now holds
 for the owner's stop; a replicated range refusing puts at its engine's metadata share where its
 leader admits a command, since a refusal at apply would let members diverge; and hyper-raft's

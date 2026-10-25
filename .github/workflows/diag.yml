@@ -1,0 +1,54 @@
+name: diag-roll-busy
+# Scratch: the serve suite as CI's busy jobs run it (built with every CPU, then run on the CPUs
+# named beside busy loops), rounds until the roll test says a member had no leader (CI run
+# 40139142704, linux-x86_64-2cpu-busy: both remaining members said every range had no leader after
+# each had named it), on hyper-raft 313ada8, whose back-off states its doublings. The watch keeps term and leader moves and the roll's steps, and prints them.
+on:
+  push:
+    branches: ["diag/**"]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: "1"
+jobs:
+  busy:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: busy-a, runner: ubuntu-24.04, cpus: "0-1", hogs: 2 }
+          - { name: busy-b, runner: ubuntu-24.04, cpus: "0-1", hogs: 2 }
+          - { name: busy-c, runner: ubuntu-24.04, cpus: "0-1", hogs: 2 }
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned Rust
+        shell: bash
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: diag-roll-busy
+          workspaces: |
+            .
+            vendor
+      - name: Build the serve suite
+        shell: bash
+        run: cargo test --locked -p mantle --test serve --no-run
+      - name: The serve suite on ${{ matrix.cpus }} beside ${{ matrix.hogs }} busy loops, rounds
+        shell: bash
+        run: |
+          for _ in $(seq ${{ matrix.hogs }}); do taskset -c ${{ matrix.cpus }} sh -c 'while :; do :; done' & done
+          for round in 1 2 3 4 5 6 7 8; do
+            echo "=== round $round"
+            taskset -c ${{ matrix.cpus }} cargo test --locked -p mantle --test serve -- --nocapture > "round-$round.txt" 2>&1 || true
+            grep -aE "^test .* (ok|FAILED)|test result" "round-$round.txt" || true
+            if grep -aq "FAILED" "round-$round.txt"; then
+              grep -a -A3 "panicked" "round-$round.txt" | cut -c1-400 || true
+              grep -a "DIAG heard" "round-$round.txt" | grep -av "Log(\|Basis(" | cut -c1-260 || true
+              grep -a "DIAG lines over" "round-$round.txt" | grep -a "MARK" | cut -c1-600 || true
+              break
+            fi
+          done

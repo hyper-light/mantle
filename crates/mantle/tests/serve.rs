@@ -452,8 +452,11 @@ fn a_cell_made_by_init_rolls_one_node_at_a_time_and_reads_every_object_back() {
     }
     let groups: BTreeSet<u128> = cell.status.keys().map(|(_, group)| *group).collect();
     ids.sort_unstable_by(|a, b| b.cmp(a));
+    cell.diag_mark(format!("MARK roll begins, objects put, ids {ids:?}"));
     for &stopping in &ids {
+        cell.diag_mark(format!("MARK stop {stopping}"));
         let exited = cell.stop(stopping);
+        cell.diag_mark(format!("MARK {stopping} exited {exited}"));
         assert!(exited.success(), "node {stopping} exited {exited}");
         assert!(
             cell.stopped.remove(&stopping),
@@ -486,6 +489,7 @@ fn a_cell_made_by_init_rolls_one_node_at_a_time_and_reads_every_object_back() {
         for group in &groups {
             led_on(&mut cell, *group, &others);
         }
+        cell.diag_mark(format!("MARK led on past {stopping}; leaderless cleared"));
         cell.leaderless.clear();
         let gets = before
             .iter()
@@ -501,9 +505,12 @@ fn a_cell_made_by_init_rolls_one_node_at_a_time_and_reads_every_object_back() {
         }
         // A founder stated at port 0 listens elsewhere once started again, and its peers, which
         // learn where on standard input, are told (node.md §1.7).
+        cell.diag_mark(format!("MARK read back; start {stopping}"));
         cell.start(stopping);
+        cell.diag_mark(format!("MARK {stopping} started; introduce"));
         cell.introduce();
         cell.enlisted(stopping);
+        cell.diag_mark(format!("MARK {stopping} enlisted"));
         assert_eq!(
             cell.volume(stopping),
             volumes[&stopping],
@@ -512,12 +519,22 @@ fn a_cell_made_by_init_rolls_one_node_at_a_time_and_reads_every_object_back() {
         for group in &groups {
             cell.converged(*group);
         }
+        cell.diag_mark(format!("MARK converged after {stopping}"));
         let said: Vec<(u64, u128)> = cell
             .leaderless
             .iter()
             .copied()
             .filter(|(node, _)| *node != stopping)
             .collect();
+        if !said.is_empty() {
+            let now = std::time::Instant::now();
+            for (at, what) in &cell.diag_seen {
+                eprintln!(
+                    "DIAG heard {:>8.1} ms ago: {what}",
+                    now.saturating_duration_since(*at).as_secs_f64() * 1000.0
+                );
+            }
+        }
         assert!(
             said.is_empty(),
             "with node {stopping} stopped and started again, nodes said ranges had no leader: \

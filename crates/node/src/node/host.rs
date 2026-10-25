@@ -343,7 +343,26 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         let mut at = 0;
         while at < self.jobs.len() {
-            if self.step_job(at)? {
+            let diag_before = self.jobs.get(at).map(|j| diag_kind(&j.work));
+            let diag_done = self.step_job(at)?;
+            let diag_after = self.jobs.get(at).map(|j| diag_kind(&j.work));
+            if diag_done || diag_before != diag_after {
+                eprintln!(
+                    "DIAG job t={} pid={} {:?} -> {}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0),
+                    std::process::id(),
+                    diag_before,
+                    if diag_done {
+                        "done"
+                    } else {
+                        diag_after.unwrap_or("gone")
+                    }
+                );
+            }
+            if diag_done {
                 // What it still waits on is let go: an ended get's chunks still out, say.
                 let job = self.jobs.swap_remove(at);
                 self.abandoned
@@ -444,6 +463,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 (None, _) => return self.fail_job(at, Status::Failed),
                 (Some(id), outcome) => {
                     let answer = put_answer(outcome);
+                    eprintln!(
+                        "DIAG put answer t={} pid={} {id:?} {}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0),
+                        std::process::id(),
+                        format!("{answer:?}").chars().take(60).collect::<String>()
+                    );
                     if let Some(put) = putting.put.as_mut()
                         && put.answer(id, answer).is_err()
                     {
@@ -1425,5 +1453,17 @@ fn get_answer(outcome: Outcome) -> get::Answer {
             _ => get::Answer::Unreadable,
         },
         _ => get::Answer::Unreadable,
+    }
+}
+
+/// DIAG (scratch): a job's stage.
+fn diag_kind(work: &Work) -> &'static str {
+    match work {
+        Work::Naming(..) => "naming",
+        Work::Draining(_) => "draining",
+        Work::Replying(..) => "replying",
+        Work::Create(_) => "create",
+        Work::Put(_) => "put",
+        Work::Get(_) => "get",
     }
 }

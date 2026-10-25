@@ -14,13 +14,16 @@ name = "mantle"
 path = "src/main.rs"
 
 [dependencies]
+# The secret of the cell's access key, as base64 (`mantle init`).
+base64.workspace = true
 bytes.workspace = true
 clap.workspace = true
 # The OS's random numbers `mantle init` draws a cell's root key and ids from.
 getrandom.workspace = true
 hyper-block = { path = "../../vendor/hyper-block" }
 hyper-log = { path = "../../vendor/hyper-log" }
-# The cell's authority and its founders' certificates, issued by `mantle init`.
+# The cell's authority and its founders' certificates, and the S3 endpoint's, issued by
+# `mantle init`.
 mantle-cert = { path = "../cert" }
 mantle-chunk = { path = "../chunk" }
 mantle-disk = { path = "../disk" }
@@ -37,6 +40,8 @@ mantle-s3 = { path = "../s3" }
 # cell's certificates, the range's settings the nodes are given, and the CRC-32C the gateway
 # states for each chunk it puts.
 hyper-rt = { path = "../../vendor/hyper-rt" }
+# rustls's verifiers, which `mantle init`'s S3 endpoint certificates are held against.
+hyper-tls = { path = "../../vendor/hyper-tls" }
 hyper-transport = { path = "../../vendor/hyper-transport" }
 mantle-crc = { path = "../crc" }
 mantle-range = { path = "../range" }

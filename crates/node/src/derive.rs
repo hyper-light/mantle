@@ -32,7 +32,7 @@ use mantle_range::{ConfState, Range, Settings};
 
 use crate::classes::Role;
 use crate::node::Hosted;
-use crate::process::{Enlisting, GatewayConfig, PeerLine, ProcessConfig};
+use crate::process::{Enlisting, GatewayConfig, PeerLine, ProcessConfig, S3Stated};
 use crate::storage::VolumeSettings;
 
 /// focal's election timeout and heartbeat interval in ticks (docs/design/node.md §2.4), which
@@ -1062,6 +1062,8 @@ pub struct Stated {
     pub target: Option<f64>,
     /// The orderly stop's bound, where its operator states it.
     pub stop: Option<Duration>,
+    /// The S3 endpoint, where its operator states it (node.md §4).
+    pub s3: Option<S3Stated>,
 }
 
 /// Where a value comes from (node.md §1.4's table).
@@ -2820,6 +2822,7 @@ mod tests {
             ceiling: None,
             stop: None,
             target: None,
+            s3: None,
         }
     }
 

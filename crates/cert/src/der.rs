@@ -20,6 +20,10 @@ pub(crate) const EXPLICIT_0: u8 = 0xa0;
 pub(crate) const EXPLICIT_3: u8 = 0xa3;
 /// `[2] IMPLICIT IA5String`: a `GeneralName`'s `dNSName` (RFC 5280 §4.2.1.6).
 pub(crate) const DNS_NAME: u8 = 0x82;
+/// `[7] IMPLICIT OCTET STRING`: a `GeneralName`'s `iPAddress` (RFC 5280 §4.2.1.6).
+pub(crate) const IP_ADDRESS: u8 = 0x87;
+/// `[0] IMPLICIT OCTET STRING`: an `AuthorityKeyIdentifier`'s `keyIdentifier` (RFC 5280 §4.2.1.1).
+pub(crate) const KEY_IDENTIFIER: u8 = 0x80;
 
 /// Object identifiers, each its content octets (X.690 §8.19), checked against its arcs in the
 /// tests.
@@ -40,6 +44,16 @@ pub(crate) mod oid {
     pub(crate) const SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
     /// id-kp-clientAuth, 1.3.6.1.5.5.7.3.2 (RFC 5280 §4.2.1.12).
     pub(crate) const CLIENT_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
+    /// id-ce-subjectKeyIdentifier, 2.5.29.14 (RFC 5280 §4.2.1.2).
+    pub(crate) const SUBJECT_KEY_IDENTIFIER: &[u8] = &[0x55, 0x1d, 0x0e];
+    /// id-ce-authorityKeyIdentifier, 2.5.29.35 (RFC 5280 §4.2.1.1).
+    pub(crate) const AUTHORITY_KEY_IDENTIFIER: &[u8] = &[0x55, 0x1d, 0x23];
+    /// id-ecPublicKey, 1.2.840.10045.2.1 (RFC 5480 §2.1.1).
+    pub(crate) const EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+    /// secp256r1, the named curve P-256, 1.2.840.10045.3.1.7 (RFC 5480 §2.1.1.1).
+    pub(crate) const PRIME256V1: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+    /// ecdsa-with-SHA256, 1.2.840.10045.4.3.2 (RFC 5758 §3.2).
+    pub(crate) const ECDSA_WITH_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
 }
 
 /// Appends `tag`, the length of `value` in DER's shortest form, and `value`.
@@ -194,7 +208,7 @@ mod tests {
 
     #[test]
     fn each_identifier_is_its_arcs_encoded() {
-        let table: [(&[u8], &[u64]); 8] = [
+        let table: [(&[u8], &[u64]); 13] = [
             (oid::ED25519, &[1, 3, 101, 112]),
             (oid::COMMON_NAME, &[2, 5, 4, 3]),
             (oid::BASIC_CONSTRAINTS, &[2, 5, 29, 19]),
@@ -203,6 +217,11 @@ mod tests {
             (oid::SUBJECT_ALT_NAME, &[2, 5, 29, 17]),
             (oid::SERVER_AUTH, &[1, 3, 6, 1, 5, 5, 7, 3, 1]),
             (oid::CLIENT_AUTH, &[1, 3, 6, 1, 5, 5, 7, 3, 2]),
+            (oid::SUBJECT_KEY_IDENTIFIER, &[2, 5, 29, 14]),
+            (oid::AUTHORITY_KEY_IDENTIFIER, &[2, 5, 29, 35]),
+            (oid::EC_PUBLIC_KEY, &[1, 2, 840, 10045, 2, 1]),
+            (oid::PRIME256V1, &[1, 2, 840, 10045, 3, 1, 7]),
+            (oid::ECDSA_WITH_SHA256, &[1, 2, 840, 10045, 4, 3, 2]),
         ];
         for (encoded, arcs) in table {
             assert_eq!(encoded, encode_arcs(arcs).as_slice(), "{arcs:?}");

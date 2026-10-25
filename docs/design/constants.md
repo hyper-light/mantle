@@ -41,12 +41,17 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/cert/src/der.rs` `EXPLICIT_3` | format | Context tag [3], constructed: a certificate's extensions, EXPLICIT (RFC 5280 §4.1). |
 | `crates/cert/src/der.rs` `GENERALIZED_TIME` | format | Universal tag 24, GeneralizedTime (X.680 table 1), for validity from 2050 (RFC 5280 §4.1.2.5.2). |
 | `crates/cert/src/der.rs` `INTEGER` | format | Universal tag 2, INTEGER (X.680 table 1; X.690 §8.3). |
+| `crates/cert/src/der.rs` `IP_ADDRESS` | format | Context tag [7], primitive: a GeneralName's iPAddress, IMPLICIT OCTET STRING of four or sixteen octets (RFC 5280 §4.2.1.6). |
+| `crates/cert/src/der.rs` `KEY_IDENTIFIER` | format | Context tag [0], primitive: an AuthorityKeyIdentifier's keyIdentifier, IMPLICIT OCTET STRING (RFC 5280 §4.2.1.1). |
 | `crates/cert/src/der.rs` `OCTET_STRING` | format | Universal tag 4, OCTET STRING (X.680 table 1; X.690 §8.7). |
 | `crates/cert/src/der.rs` `OID` | format | Universal tag 6, OBJECT IDENTIFIER (X.680 table 1; X.690 §8.19). |
 | `crates/cert/src/der.rs` `SEQUENCE` | format | Universal tag 16, constructed: SEQUENCE and SEQUENCE OF (X.680 table 1; X.690 §8.9). |
 | `crates/cert/src/der.rs` `SET` | format | Universal tag 17, constructed: SET and SET OF (X.680 table 1; X.690 §8.11). |
 | `crates/cert/src/der.rs` `UTC_TIME` | format | Universal tag 23, UTCTime (X.680 table 1), for validity through 2049 (RFC 5280 §4.1.2.5.1). |
 | `crates/cert/src/der.rs` `UTF8_STRING` | format | Universal tag 12, UTF8String, which RFC 5280 §4.1.2.4 asks of new certificates' names. |
+| `crates/cert/src/lib.rs` `KEY_ID_BYTES` | external | 20: a key identifier of 160 bits, the leftmost of the SHA-256 of the subjectPublicKey's bits (RFC 7093 §2, method 1). |
+| `crates/cert/src/lib.rs` `MAX_ENDPOINT_VALIDITY` | external | 825 days of 86,400 s, 71,280,000 s: Apple's platforms refuse a TLS server's certificate valid longer ("TLS server certificates must have a validity period of 825 days or fewer", support.apple.com/103769; research/71). |
+| `crates/cert/src/lib.rs` `PEM_LINE` | external | 64: the characters of each base64 line of a PEM document but the last (RFC 7468 §2). |
 | `crates/cert/src/time.rs` `FIRST_YEAR` | external | 1950: UTCTime's two-digit years cover 1950-2049 (RFC 5280 §4.1.2.5.1). |
 | `crates/cert/src/time.rs` `GENERALIZED_FROM` | external | 2050: validity from then on is GeneralizedTime (RFC 5280 §4.1.2.5). |
 | `crates/cert/src/time.rs` `LAST_YEAR` | external | 9999: GeneralizedTime's four-digit year (RFC 5280 §4.1.2.5.2). |
@@ -590,6 +595,8 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/node/src/object.rs` `UPLOADS_HEAD_BYTES` | derived | A page of uploads' bytes beside its uploads and common prefixes, at most: whether it is truncated, where the next page starts (its flag, a key at `MAX_KEY` and an ID at `MAX_TAG`, each behind its length) and the two counts (u32 each). |
 | `crates/node/src/object.rs` `UPLOAD_BYTES` | derived | An upload in a page of uploads at its longest: its key at `MAX_KEY`, its ID at `MAX_TAG`, its initiation (u64) and its owner at `MAX_OWNER`, each text behind its length (u32). |
 | `crates/node/src/object.rs` `UPLOAD_PART` | format | An object request's kind: UploadPart, the part's bytes on the exchange. |
+| `crates/node/src/process.rs` `ACCESS_KEY_ID_LEAST` | external | 16: the shortest access key id IAM takes (IAM API Reference, AccessKey: "Minimum length of 16"). |
+| `crates/node/src/process.rs` `ACCESS_KEY_ID_MOST` | external | 128: the longest access key id IAM takes (IAM API Reference, AccessKey: "Maximum length of 128"). |
 | `crates/node/src/process.rs` `CALIBRATION_BYTES` | derived | 137 bytes beside its key, at most hyper-rt's `MAX_KEY`: the calibration record's layout (`hyper_rt::machine::record`: magic 8, version 2, key length 2, measured at 8, the wake's 64, the system call's 49, its CRC-32C 4), pinned by `the_calibration_is_kept_in_the_node_directory_and_taken_again`. |
 | `crates/node/src/read.rs` `BLOCK` | format | A read's kind: a block's header and its chunks' places, of a Block range. |
 | `crates/node/src/read.rs` `BUCKET` | format | A read's kind: a bucket's row, of a Bucket range. |
@@ -717,7 +724,10 @@ parameters. The gate does not parse these; they are kept here with the same kind
 | `crates/mantle/src/main.rs` bench rounds default | cited | `Policy::STANDARD.max` = 30, from docs/research/21 §9.5 (crates/disk/src/rounds.rs). |
 | `crates/mantle/src/main.rs:91` bench step seconds (chunk 1, log 1, ec 0.5, hash 0.5, meta 0.5) | open | research/11 §16.3 asks for step length from the samples the reported quantiles need and a steady-state window. |
 | `crates/mantle/src/main.rs:296` ec and hash size ladders | open | 64K–8M chunk and 8K–8M buffer ladders; not derived from the design's chunk and part distributions. |
+| `crates/mantle/src/init.rs` `ACCOUNTS` | external | 10^12: an account's id is twelve decimal digits (research/17 §2.1; `mantle_s3::account::valid_id`). |
+| `crates/mantle/src/init.rs` `KEY_ID_CHARS` | external | 20: an access key id as long as AWS's own (`AKIAIOSFODNN7EXAMPLE`), within IAM's 16 to 128 word characters (IAM API Reference, AccessKey; research/71). |
 | `crates/mantle/src/init.rs` `NO_EXPIRY` | external | 253,402,300,799 Unix seconds, 99991231235959Z: RFC 5280 §4.1.2.5's notAfter for a certificate with no well-defined expiration, which init's certificates take until certificates are rotated (node.md §1.5). |
+| `crates/mantle/src/init.rs` `SECRET_BYTES` | derived | 30 octets from the OS, 240 bits, as base64's 40 characters with no padding: a secret as long as AWS's (`wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY`; research/71). |
 | `crates/chunk/src/layout.rs:34` Limits default batch_requests 1,024 | open | Audit §12.6: derive n* = F0/c_r or a latency-bounded version from measured per-batch (b, n, S) (research 11 §5.3). |
 | `crates/chunk/src/layout.rs:35` Limits default batch_bytes 32 MiB | open | Research 11 §5 gives b* = F0·BW, which does not set it; audit §12.6 asks for a derivation from a measured T(b). |
 | `crates/chunk/src/layout.rs:36` Limits default fragments_per_chunk 4,096 | open | Research 11 §6.2 finds no source; derive from read amplification f ≤ ε·size/(BW·t_frag) with a measured t_frag. |

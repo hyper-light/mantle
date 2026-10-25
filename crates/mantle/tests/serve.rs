@@ -644,9 +644,29 @@ fn a_start_that_fails_names_its_step_and_the_node_serving_serves_on() {
         );
     };
     refused(&config, "locks", "LOCK");
+    let access = std::fs::read_dir(dir.join("keys").join("s3"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name()
+        .into_string()
+        .unwrap();
     for (key, named) in [
-        (dir.join("identity").join("node.key"), "identity/node.key"),
-        (dir.join("keys").join("1"), "keys/1"),
+        (
+            dir.join("identity").join("node.key"),
+            "identity/node.key".to_owned(),
+        ),
+        (dir.join("keys").join("1"), "keys/1".to_owned()),
+        // The S3 endpoint's key, and the cell's access key (`mantle init`).
+        (
+            dir.join("identity").join("s3.key"),
+            "identity/s3.key".to_owned(),
+        ),
+        (
+            dir.join("keys").join("s3").join(&access),
+            format!("keys/s3/{access}"),
+        ),
     ] {
         open_to_others(&key, true);
         refused(
@@ -900,6 +920,24 @@ fn a_cell_of_three_made_by_init_from_a_file_and_a_flag_serves_objects() {
             .map(|v| v.parse().unwrap())
             .collect();
         assert_eq!(voters, ids.iter().copied().collect());
+    }
+    // Each node read the cell's one access key for its S3 endpoint, the key the operator's profile
+    // holds, at its QUIC address in S3's default region.
+    let out = cell.dirs[&ids[0]].parent().unwrap().to_path_buf();
+    let credentials = std::fs::read_to_string(out.join("s3").join("credentials")).unwrap();
+    let key = credentials
+        .lines()
+        .find_map(|line| line.strip_prefix("aws_access_key_id = "))
+        .unwrap()
+        .to_owned();
+    for &id in &ids {
+        let (listen, region, keys) = cell.s3[&id].clone();
+        assert_eq!(
+            (region.as_str(), keys),
+            ("us-east-1", vec![key.clone()]),
+            "node {id}"
+        );
+        assert!(listen.ip().is_loopback(), "node {id}: {listen}");
     }
     let back = ids.clone();
     objects_round_trip(&mut cell, &ids, &|n| back[(n + 1) % back.len()]);

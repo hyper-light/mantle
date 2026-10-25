@@ -412,6 +412,46 @@ pub struct Enlisting {
     pub max_volumes: u32,
 }
 
+/// The S3 endpoint a node's file states (node.md §4; `mantle init`): where it listens, the region
+/// it serves, its certificate and key, and each of the cell's access keys, by its id and the file
+/// that holds its account and secret (`access_key = ID FILE`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3Stated {
+    pub listen: SocketAddr,
+    pub region: String,
+    pub certificate: PathBuf,
+    pub key: PathBuf,
+    pub access: Vec<(String, PathBuf)>,
+}
+
+/// The S3 endpoint's keys, read at the start's identity step: its certificate and key, and each
+/// access key's account and secret, read only from a file no one but its owner may read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3Keys {
+    pub listen: SocketAddr,
+    pub region: String,
+    pub certificate: Vec<u8>,
+    pub key: Vec<u8>,
+    pub access: Vec<AccessKey>,
+}
+
+/// An access key: its id, the account it acts for (twelve digits), and its secret.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AccessKey {
+    pub id: String,
+    pub account: String,
+    pub secret: String,
+}
+
+impl std::fmt::Debug for AccessKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccessKey")
+            .field("id", &self.id)
+            .field("account", &self.account)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The keys `mantle node`'s file states once each (node.md §1.4's table): a key it does not know
 /// is refused.
 pub const KEYS: &[&str] = &[
@@ -502,11 +542,15 @@ pub const STATED_KEYS: &[&str] = &[
     "memory",
     "durability.target",
     "stop_ms",
+    "s3",
+    "s3.region",
+    "s3.certificate",
+    "s3.key",
 ];
 
 /// The lines `mantle serve`'s file repeats: its peers and ranges, its volumes, each `volume = DIR
-/// SIZE`, and its root key's generations.
-pub const STATED_REPEATED: &[&str] = &["peer", "range", "volume", "root_key"];
+/// SIZE`, its root key's generations, and the cell's access keys, each `access_key = ID FILE`.
+pub const STATED_REPEATED: &[&str] = &["peer", "range", "volume", "root_key", "access_key"];
 
 /// The file's values by key, each with the line it was on, and its repeated lines by their key; and
 /// the directory the file is in, which a relative path in it names a place from, so a node's
@@ -1032,6 +1076,12 @@ pub fn serve_stated(config: &Path) -> Result<(), ProcessError> {
         &stated.keys,
     )
     .map_err(step(Step::Identity))?;
+    let s3 = stated
+        .s3
+        .as_ref()
+        .map(s3_keys)
+        .transpose()
+        .map_err(step(Step::Identity))?;
     let node = Locks::node(&stated.dir).map_err(step(Step::Locks))?;
     let locks = Locks::take(stated.volumes.iter().map(|(dir, _)| dir.as_path()))
         .map_err(step(Step::Locks))?;
@@ -1054,6 +1104,12 @@ pub fn serve_stated(config: &Path) -> Result<(), ProcessError> {
     let mut out = std::io::stdout().lock();
     for basis in &derived.bases {
         writeln!(out, "basis {basis}").map_err(|e| ProcessError::Say(e.to_string()))?;
+    }
+    // The S3 endpoint as its keys were read: where it listens, its region and its keys' ids.
+    if let Some(s3) = &s3 {
+        let ids: Vec<&str> = s3.access.iter().map(|k| k.id.as_str()).collect();
+        writeln!(out, "s3 {} {} {}", s3.listen, s3.region, ids.join(","))
+            .map_err(|e| ProcessError::Say(e.to_string()))?;
     }
     out.flush().map_err(|e| ProcessError::Say(e.to_string()))?;
     // The runtime's writer says the rest: this thread holds no lock on standard output for it.
@@ -1140,6 +1196,105 @@ pub fn read_stated(path: &Path) -> Result<Stated, ProcessError> {
         ceiling: lines.maybe("memory")?,
         stop: lines.maybe("stop_ms")?.map(Duration::from_millis),
         target,
+        s3: s3_stated(&lines)?,
+    })
+}
+
+/// The shortest and longest access key ids IAM takes, word characters each (IAM API Reference,
+/// AccessKey: "Minimum length of 16. Maximum length of 128. Pattern: [\w]+").
+const ACCESS_KEY_ID_LEAST: usize = 16;
+const ACCESS_KEY_ID_MOST: usize = 128;
+
+/// Whether `id` is an access key's id IAM takes: 16 to 128 ASCII word characters.
+fn access_key_id(id: &str) -> bool {
+    (ACCESS_KEY_ID_LEAST..=ACCESS_KEY_ID_MOST).contains(&id.len())
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// The S3 endpoint the file states (node.md §4): none where it states none of it, and where it
+/// states any of it, all of it: `s3`, `s3.region`, `s3.certificate`, `s3.key`, and one
+/// `access_key = ID FILE` line at least. A region is lowercase letters, digits and hyphens, S3's
+/// region codes' alphabet, and holds no `/`, which SigV4's credential scope separates by.
+fn s3_stated(lines: &Lines) -> Result<Option<S3Stated>, ProcessError> {
+    let keys = ["s3", "s3.region", "s3.certificate", "s3.key"];
+    if !keys.iter().any(|key| lines.values.contains_key(*key)) && lines.all("access_key").is_empty()
+    {
+        return Ok(None);
+    }
+    let region = lines.text("s3.region")?;
+    if region.is_empty()
+        || !region
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err(ProcessError::Value(
+            "s3.region",
+            "lowercase letters, digits and hyphens".into(),
+        ));
+    }
+    let mut access = Vec::with_capacity(lines.all("access_key").len());
+    for (number, value) in lines.all("access_key") {
+        let bad = || ProcessError::Line(*number, "access_key = ID FILE".into());
+        let (id, file) = value.split_once(char::is_whitespace).ok_or_else(bad)?;
+        let file = file.trim();
+        if !access_key_id(id) || file.is_empty() {
+            return Err(bad());
+        }
+        access.push((id.to_owned(), lines.path(file)));
+    }
+    if access.is_empty() {
+        return Err(ProcessError::Missing("access_key"));
+    }
+    Ok(Some(S3Stated {
+        listen: lines.get("s3")?,
+        region: region.to_owned(),
+        certificate: lines.path(lines.text("s3.certificate")?),
+        key: lines.path(lines.text("s3.key")?),
+        access,
+    }))
+}
+
+/// The S3 endpoint's keys `s3` names, read at the start's identity step (node.md §1.7): its
+/// certificate; its key; and each access key, from a file holding `account = ACCOUNT` and
+/// `secret = SECRET`, its account twelve digits (`mantle_s3::account::valid_id`). Every key is read
+/// only from a file no one but its owner may read, as the node's own and the root key's are.
+pub fn s3_keys(s3: &S3Stated) -> Result<S3Keys, ProcessError> {
+    let mut access = Vec::with_capacity(s3.access.len());
+    for (id, path) in &s3.access {
+        let bad = |why: &str| ProcessError::Key(path.clone(), why.to_owned());
+        let text = String::from_utf8(read_secret(path)?).map_err(|_| bad("is not UTF-8"))?;
+        let (mut account, mut secret) = (None, None);
+        for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let (key, value) = line
+                .split_once('=')
+                .ok_or_else(|| bad("holds a line that is not key = value"))?;
+            let slot = match key.trim() {
+                "account" => &mut account,
+                "secret" => &mut secret,
+                _ => return Err(bad("states a key other than account and secret")),
+            };
+            if slot.replace(value.trim().to_owned()).is_some() {
+                return Err(bad("states a key twice"));
+            }
+        }
+        let account = account
+            .filter(|a| mantle_s3::account::valid_id(a))
+            .ok_or_else(|| bad("states no account of twelve digits"))?;
+        let secret = secret
+            .filter(|s| !s.is_empty() && !s.contains(char::is_whitespace))
+            .ok_or_else(|| bad("states no secret"))?;
+        access.push(AccessKey {
+            id: id.clone(),
+            account,
+            secret,
+        });
+    }
+    Ok(S3Keys {
+        listen: s3.listen,
+        region: s3.region.clone(),
+        certificate: read_file(&s3.certificate)?,
+        key: read_secret(&s3.key)?,
+        access,
     })
 }
 

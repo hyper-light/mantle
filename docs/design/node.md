@@ -501,6 +501,33 @@ profile under the device directory's lock; founders of a larger cell are measure
 and serving objects (`crates/mantle/tests/serve.rs`). Native clients are issued by the authority's
 key and pinned by a `peer` line, as the tests do; `mantle init client` is still to build.
 
+*As built (2026-10-25): the S3 endpoint's key and certificates.* `mantle init` gives the cell its
+first account, twelve digits, and its one access key, an id of twenty characters of RFC 4648's
+base32 alphabet and a secret of 240 bits as forty characters of base64, drawn from the OS
+(research/71). The key is written on every founder, owner-only, as `keys/s3/ID` holding its account
+and secret, and named by its `access_key = ID FILE` line; `mantle serve` reads each at its identity
+step only from a file no one but its owner may read, refusing the start otherwise as it refuses the
+node's own key, and says `s3 LISTEN REGION IDS` once it has. The endpoint's chain is ECDSA P-256
+throughout, since the AWS CLI's transfer client and Windows' TLS verify no Ed25519 certificate
+(research/71): the endpoint has an authority of its own beside the cell's, kept with it
+(`s3-authority.der`, `s3-authority.key`), which issues each founder's endpoint its certificate and
+key (`identity/s3.der`, `identity/s3.key`) for the DNS names its operator states (`name=HOST`), its
+address unless it listens on every one, and `localhost` on a loopback address; serverAuth alone, the
+key identifiers RFC 5280 asks, and 825 days of validity at most, issuing it again before then still
+to build (`mantle_cert::endpoint`). The endpoint listens where the founder's `s3=ADDR` says, else
+over TCP at its QUIC address, and serves the cell's region (`--region`, or `region` in the machines
+file, else S3's us-east-1). For the operator, `OUT/s3` holds the key as AWS's shared credentials
+file, owner-only; the endpoint's authority as PEM; and, where a founder's endpoint has a port and a
+name init can state, the config of the profile `mantle`: its region, that endpoint's URL, plain HTTP
+on a loopback address and TLS elsewhere, the PEM as its `ca_bundle`, and path-style addressing.
+Tested in `crates/cert` (each stated name and no other verifies, the extensions a strict verifier
+asks, the validity's bound, the PEM, and the cell's own certificates the bytes they were), in
+`init`'s tests (every founder's key the profile's, a request signed with it verified by every
+founder and one signed with another secret refused `SignatureDoesNotMatch`, an exposed key refused,
+every endpoint's certificate verifying under the profile's PEM for each name its clients dial), and
+in `tests/serve.rs` (each node says the profile's key; an exposed one refuses the start at its
+identity step).
+
 **Joining.** An existing node mints an invitation (`mantle invite`): a one-time token recorded
 in the root range, so the log decides whether it was used. `mantle init --join` sends the token
 and a certificate request over the enrollment protocol, whose key the joining node keeps; the
@@ -523,8 +550,10 @@ is in the node's directory.
 ```
 <node directory>/                     not on a data device (encryption.md §2)
   config                              what the operator stated (§1.4)
-  identity/                           node key, certificate, the cell authority's certificate
-  keys/                               root-key file, owner-only, one per generation
+  identity/                           node key, certificate, the cell authority's certificate;
+                                      the S3 endpoint's key and certificate (§1.5)
+  keys/                               root-key file, owner-only, one per generation; s3/, the
+                                      cell's access keys, owner-only, one a file
   map                                 the last cell map and membership, persisted as received
 <device directory>/mantle/            one per device the node uses
   LOCK                                held while the node runs: one owner per device (audit §14.1)
@@ -556,8 +585,9 @@ record written whole, flushed and checked by its CRC-32C on read; one of another
 layout version or that does not read is measured again and replaced (`mantle_disk::profile`). The
 OS's names for devices, which a restart may change, are not in the key, and firmware is not yet,
 since no probe reads it. `mantle init` adds to the node's directory its `config`, `identity/` (the node's key and
-certificate, the authority's certificate, each pinned peer's certificate under `peers/`), `keys/`
-(one root-key file a generation) and, for a cell of one, `calibration`, hyper-rt's record, which
+certificate, the authority's certificate, each pinned peer's certificate under `peers/`, and the S3
+endpoint's key and certificate), `keys/` (one root-key file a generation, and `s3/`, the cell's
+access keys) and, for a cell of one, `calibration`, hyper-rt's record, which
 `mantle serve` and `mantle node` keep there too and take again while the machine's key matches it.
 The directory's own `LOCK`, held as the volumes' are, since its log and stores admit one process as
 a volume does, is taken at the start's locks step and held while the process runs (2026-10-24).
@@ -1615,7 +1645,10 @@ admission authority.
   on hyper-rt's TCP, with TLS through hyper-tls: the owner's decision, no hyper and no tokio
   (research/70). On a laptop it may serve plain HTTP on the loopback address; SigV4 still
   authenticates every request there, and a request carrying SSE-C headers is refused over plain
-  HTTP, as S3 "rejects any requests made over HTTP when using SSE-C" (20 §3.3).
+  HTTP, as S3 "rejects any requests made over HTTP when using SSE-C" (20 §3.3). Elsewhere it serves
+  TLS with the endpoint's ECDSA P-256 chain (§1.5), and TLS 1.2 beside 1.3, with the ECDHE-ECDSA
+  AES-GCM suites: Apple's Secure Transport, under the AWS CLI's transfers on macOS, cannot use
+  TLS 1.3, nor can Windows 10's Schannel (research/71).
 
 The codec does no I/O: the listener reads a connection's octets into buffers of its own and hands
 them over, and the codec parses a request's head where it lies, decodes its body as it streams,
@@ -1657,8 +1690,9 @@ allocations counted exactly (`tests/allocations.rs`). `mantle bench http` measur
    style. A header or query parameter that appears twice is resolved once, the same way for
    routing, signing, policy and the body (audit §9).
 3. **Authenticate** with `mantle_s3::sigv4`: the `Authorization` header, a presigned URL, or
-   anonymous. Owner identity, SSE-C authority and bypass privileges come from what authentication
-   established, never from fields a caller supplies (audit §9).
+   anonymous, against the cell's access keys as `mantle serve` read them (§1.5). Owner identity,
+   SSE-C authority and bypass privileges come from what authentication established, never from
+   fields a caller supplies (audit §9).
 4. **Authorize**: the bucket's row from the Bucket range, through a cache whose staleness is
    bounded (metadata.md §1, §6), and its policy judged by `mantle_s3::policy`.
 5. **Admit the request**: the tenant's share (§4.5) and the request's working set from memory,

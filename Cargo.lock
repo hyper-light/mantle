@@ -680,12 +680,14 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 name = "mantle"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytes",
  "clap",
  "getrandom 0.4.3",
  "hyper-block",
  "hyper-log",
  "hyper-rt",
+ "hyper-tls",
  "hyper-transport",
  "mantle-cert",
  "mantle-chunk",
@@ -706,6 +708,7 @@ name = "mantle-cert"
 version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
+ "base64",
  "hyper-tls",
  "thiserror",
 ]

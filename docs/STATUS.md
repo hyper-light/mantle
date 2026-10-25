@@ -306,7 +306,12 @@ Remaining before it is done:
   measured on an idle machine.
 - The server around it: the HTTP/1.1 listener for stock S3 clients, whose codec is built
   (`crates/http`: each RFC 9112 rule it keeps by a test, generated and mutated requests read or
-  refused typed, its allocations counted, `mantle bench http`; node design §4.1); deadlines and
+  refused typed, its allocations counted, `mantle bench http`; node design §4.1), and whose key
+  and certificates `mantle init` issues (the cell's first account and access key on every founder,
+  owner-only, which `mantle serve` reads and says; the endpoint's own ECDSA P-256 authority and each
+  founder's certificate for the names its clients dial; the operator's AWS profile and CA bundle;
+  node design §1.5, research/71; its certificate's issue again before 825 days still to build);
+  deadlines and
   hedging on the node's asks (node design §5.4); routing by descriptors once ranges split; and
   each request's memory admitted against the gateway's.
 

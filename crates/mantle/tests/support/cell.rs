@@ -324,6 +324,9 @@ pub(crate) enum Line {
     Log(Option<Duration>, Duration),
     /// A volume the node holds.
     Volume(u128),
+    /// The S3 endpoint a node read its keys for: where it listens, the region it serves and its
+    /// access keys' ids.
+    S3(SocketAddr, String, Vec<String>),
     /// The root range took the node's enlistment of itself and its volumes.
     Enlisted,
     /// What the node's failure detectors start from (node.md §2.4, item 7): the cell's node time
@@ -367,6 +370,11 @@ pub(crate) fn parse(line: &str) -> Option<Line> {
         )),
         ["link", peer, rest @ ..] => Some(Line::Link(peer.parse().ok()?, rest.join(" "))),
         ["volume", id] => Some(Line::Volume(u128::from_str_radix(id, 16).ok()?)),
+        ["s3", listen, region, ids] => Some(Line::S3(
+            listen.parse().ok()?,
+            (*region).to_owned(),
+            ids.split(',').map(str::to_owned).collect(),
+        )),
         ["enlisted"] => Some(Line::Enlisted),
         ["history", cell_ns, cell_crashes, own_ns, own_crashes] => Some(Line::History(
             Lived {
@@ -456,6 +464,7 @@ pub(crate) fn movement(line: &Line) -> Option<(u64, u64, u64, u64, Duration, Dur
         | Line::Log(..)
         | Line::Held(..)
         | Line::Volume(..)
+        | Line::S3(..)
         | Line::Enlisted
         | Line::History(..)
         | Line::Basis(..)
@@ -819,6 +828,8 @@ pub(crate) struct Cell {
     pub(crate) stored: bool,
     pub(crate) volumes: BTreeMap<u64, u128>,
     pub(crate) enlisted: BTreeSet<u64>,
+    /// Each running node's S3 endpoint as it said it read its keys.
+    pub(crate) s3: BTreeMap<u64, (SocketAddr, String, Vec<String>)>,
     /// What each node's failure detectors started from as its latest process said: the cell's
     /// history and its own part of it.
     pub(crate) histories: BTreeMap<u64, (Lived, Lived)>,
@@ -1085,6 +1096,7 @@ impl Cell {
             stored: true,
             volumes: BTreeMap::new(),
             enlisted: BTreeSet::new(),
+            s3: BTreeMap::new(),
             histories: BTreeMap::new(),
             domains: BTreeMap::new(),
             refusing: None,
@@ -1212,6 +1224,7 @@ impl Cell {
             stored,
             volumes: BTreeMap::new(),
             enlisted: BTreeSet::new(),
+            s3: BTreeMap::new(),
             histories: BTreeMap::new(),
             domains: BTreeMap::new(),
             refusing: None,
@@ -1451,6 +1464,7 @@ impl Cell {
                 | Line::Log(..)
                 | Line::Held(..)
                 | Line::Volume(..)
+                | Line::S3(..)
                 | Line::Enlisted
                 | Line::History(..)
                 | Line::Basis(..)
@@ -1621,6 +1635,9 @@ impl Cell {
                     }
                     Line::Volume(volume) => {
                         self.volumes.insert(id, volume);
+                    }
+                    Line::S3(listen, region, ids) => {
+                        self.s3.insert(id, (listen, region, ids));
                     }
                     Line::Enlisted => {
                         self.enlisted.insert(id);

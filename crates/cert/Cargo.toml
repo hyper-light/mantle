@@ -1,6 +1,6 @@
 [package]
 name = "mantle-cert"
-description = "X.509 certificates for a cell's authority and its nodes: DER of RFC 5280 v3 certificates signed with Ed25519 (RFC 8410) on AWS-LC"
+description = "X.509 certificates for a cell's authority and its nodes, Ed25519 (RFC 8410), and for its S3 endpoint, ECDSA P-256 (RFC 5480): DER of RFC 5280 v3 certificates on AWS-LC"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -11,6 +11,8 @@ publish.workspace = true
 
 [dependencies]
 aws-lc-rs.workspace = true
+# The PEM an S3 client's CA bundle takes the endpoint's authority in (RFC 7468).
+base64.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

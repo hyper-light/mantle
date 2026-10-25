@@ -261,6 +261,10 @@ pub trait Entries {
         to: &[u8],
         budget: &mut usize,
     ) -> Result<Step<Listed<Self::Value>>, Self::Error>;
+
+    /// Takes the room an item needs in the page's answer, as [`Keys::room`] does: an entry, or
+    /// a common prefix (`None`).
+    fn room(&mut self, item: Result<&Listed<Self::Value>, &str>) -> bool;
 }
 
 /// The ID marker of a page that ended at a key it passed: with that key as the key marker,
@@ -342,11 +346,16 @@ pub fn entries<I: Entries>(
                 break;
             }
             Step::Found(entry) => {
-                if page.count() >= max {
+                let common = rolled_up(&entry.key, prefix, delimiter);
+                let room = match common {
+                    Some(common) => index.room(Err(common)),
+                    None => index.room(Ok(&entry)),
+                };
+                if page.count() >= max || !room {
                     page.truncated = true;
                     break;
                 }
-                if let Some(common) = rolled_up(&entry.key, prefix, delimiter) {
+                if let Some(common) = common {
                     from = EntryFrom::Key(beyond(common));
                     last = Some((common.to_owned(), String::new()));
                     page.common_prefixes.push(common.to_owned());
@@ -866,6 +875,8 @@ mod tests {
     struct Store {
         keys: BTreeMap<String, Vec<String>>,
         seeks: usize,
+        /// The items a page's answer has room for; `None` for no bound.
+        room: Option<usize>,
     }
 
     impl Entries for Store {
@@ -911,6 +922,17 @@ mod tests {
             }
             Ok(Step::End)
         }
+
+        fn room(&mut self, _: Result<&Listed<()>, &str>) -> bool {
+            match self.room.as_mut() {
+                None => true,
+                Some(left) if *left == 0 => false,
+                Some(left) => {
+                    *left -= 1;
+                    true
+                }
+            }
+        }
     }
 
     fn store(entries: &[(&str, &[&str])]) -> Store {
@@ -920,6 +942,7 @@ mod tests {
                 .map(|(k, ids)| (k.to_string(), ids.iter().map(|i| i.to_string()).collect()))
                 .collect(),
             seeks: 0,
+            room: None,
         }
     }
 
@@ -966,6 +989,46 @@ mod tests {
             match p.next {
                 Some(next) => markers = Some(next),
                 None => return out,
+            }
+        }
+    }
+
+    /// A page of entries whose answer runs out of room ends early and truncated, and the pages a
+    /// client follows by its markers list every entry and common prefix once, at any room.
+    #[test]
+    fn entries_out_of_room_end_truncated_and_resume_exactly() {
+        let shape: &[(&str, &[&str])] = &[
+            ("a", &["1", "2", "3"]),
+            ("b/x", &["1"]),
+            ("b/y", &["1", "2"]),
+            ("c", &[]),
+            ("d", &["1"]),
+        ];
+        for delimiter in [None, Some("/")] {
+            let mut whole = every_entry(&mut store(shape), "", delimiter, 1000);
+            whole.sort();
+            for room in 1..=3 {
+                let mut s = store(shape);
+                let mut out = Vec::new();
+                let mut markers: Option<(String, String)> = None;
+                loop {
+                    s.room = Some(room);
+                    let (key, id) = match &markers {
+                        Some((k, i)) => (Some(k.as_str()), Some(i.as_str())),
+                        None => (None, None),
+                    };
+                    let p = entries(&entry_req("", delimiter, key, id, 1000), &mut s).unwrap();
+                    assert!(p.count() <= room, "{delimiter:?} {room}: {p:?}");
+                    assert!(p.count() > 0 || !p.truncated, "{delimiter:?} {room}");
+                    out.extend(listed(&p));
+                    out.extend(p.common_prefixes.iter().map(|c| (c.clone(), String::new())));
+                    match p.next {
+                        Some(next) => markers = Some(next),
+                        None => break,
+                    }
+                }
+                out.sort();
+                assert_eq!(out, whole, "{delimiter:?} room {room}");
             }
         }
     }
@@ -1025,6 +1088,7 @@ mod tests {
         let mut s = Store {
             keys: keys.into_iter().collect(),
             seeks: 0,
+            room: None,
         };
         let p = entries(&entry_req("", Some("/"), None, None, 1000), &mut s).unwrap();
         assert!(p.truncated && p.entries.is_empty() && p.common_prefixes.is_empty());

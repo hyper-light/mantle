@@ -19,6 +19,9 @@
 //! | a page of ListObjectsV2, of a Name range | kind 7; the listing's request as an object's request carries it (`crate::object`) | 0 when the bucket has no gate here, or a condemned one; 1, then the page as an object's reply carries it |
 //! | a page of ListBuckets, of the Bucket range | kind 8; the owner, the prefix, the bucket after which the page starts (optional: a byte, 0 or 1, before it) and the most buckets (u32) | the page as an object's reply carries it |
 //! | whether a bucket's rows remain, of a Name range routed by a descriptor's generation | kind 9; the bucket; the generation (u64); where the read starts (optional, a key behind its length); the most rows it reads (u32) | 0, a version or delete marker is there; 1, none; 2, then the key the next read starts at, behind its length; 3, then the range's lineage |
+//! | a multipart upload's row, of a Name range | kind 10; the bucket, the key and the upload's ID | 0 for none; 1, then the upload (`Upload`); 2 when the bucket has no gate here, or a condemned one |
+//! | an upload's parts after a number, of a Name range | kind 11; the bucket, the key and the upload's ID; the number (u16); the most parts (u32) | 0 when the upload is not there; 1, whether more follow (u8), the count (u32), each part's number (u16) and its row (`Part`) behind its length; 2 when the bucket has no gate here, or a condemned one |
+//! | a page of ListMultipartUploads, of a Name range | kind 12; the bucket, the prefix and the delimiter; the key marker and the upload ID marker, each optional; the most uploads (u32) | 1, then the page as an object's reply carries it; 2 when the bucket has no gate here, or a condemned one |
 //!
 //! A read is answered only by a range of the layer whose rows it reads (`Query::layer`). A page
 //! holds as many volumes as a reply carries, each counted at the longest domain, so it fits
@@ -37,15 +40,16 @@ use mantle_meta::engine::Rows;
 use mantle_meta::error::MetaError;
 use mantle_meta::name::{self, Probe, Routed, Scan};
 use mantle_meta::record::{
-    BlockHeader, Bucket, ChunkPlace, Extent, FileHeader, Gate, GateState, Lineage, Version,
+    BlockHeader, Bucket, ChunkPlace, Extent, FileHeader, Gate, GateState, Lineage, Part, Upload,
+    Version,
 };
 use mantle_meta::root::{self, MAX_DOMAIN, Placed};
 use mantle_meta::wire::{MAX_BUCKET, MAX_KEY, MAX_OWNER};
 use mantle_meta::{block, bucket, file};
 use mantle_s3::checksum::Algorithm;
-use mantle_s3::list::{self, Paging, Resume, Step};
+use mantle_s3::list::{self, EntryFrom, Paging, Resume, Step};
 
-use crate::object::{self, Buckets, List, Listed, Page};
+use crate::object::{self, Buckets, List, Listed, MAX_TAG, Page, UploadListed, Uploads};
 
 /// The query's kind: the current version of a key, or a page of the volume table.
 const CURRENT: u8 = 0;
@@ -58,6 +62,9 @@ const GATE: u8 = 6;
 const LIST: u8 = 7;
 const OWNED: u8 = 8;
 const PROBE: u8 = 9;
+const UPLOAD: u8 = 10;
+const PARTS: u8 = 11;
+const UPLOADS: u8 = 12;
 /// An extent's bytes in an answer, at most: its first byte's offset, its record's length and the
 /// record (`Extent::encode`: the format, the length, the target's kind and id, the CRC-32C).
 const EXTENT_BYTES: usize = 8 + 4 + (1 + 8 + 1 + 16 + 4);
@@ -75,6 +82,13 @@ const OWNED_BYTES: usize = 4 + MAX_BUCKET + 8;
 /// data space's byte, the bucket and the key each escaped, every byte at most doubled, and ended
 /// (`mantle_meta::key`), and the byte past every row of the object.
 const MAX_POSITION: usize = 1 + 2 * MAX_BUCKET + 1 + 2 * MAX_KEY + 1 + 1;
+/// A part in an answer at its longest: its number, and its row (`Part::encode`: the format, its
+/// ETag behind its length at `MAX_TAG`, its size, its checksum's flag and value behind its length,
+/// its file, its time and its deadline, the CRC-32C) behind its length.
+const PART_ROW_BYTES: usize =
+    2 + 4 + (1 + (4 + MAX_TAG) + 8 + (1 + 4 + object::MAX_CHECKSUM) + 16 + 8 + 8 + 4);
+/// A page of parts' bytes beside its parts: its kind's byte, whether more follow, the count.
+const PARTS_ANSWER_BYTES: usize = 1 + 1 + 4;
 
 /// What a read asks of a range.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +127,31 @@ pub enum Query {
         from: Option<Vec<u8>>,
         budget: u32,
     },
+    /// A multipart upload's row: what a completion reads first (`mantle_gateway::complete`).
+    Upload {
+        bucket: String,
+        key: String,
+        upload: String,
+    },
+    /// An upload's parts numbered after `after`, at most `max`: a completion's read and
+    /// ListParts' page (05 §4.6).
+    Parts {
+        bucket: String,
+        key: String,
+        upload: String,
+        after: u16,
+        max: u32,
+    },
+    /// A page of ListMultipartUploads (05 §4.7; s3-protocol.md §3).
+    Uploads {
+        bucket: String,
+        prefix: String,
+        /// No delimiter when empty.
+        delimiter: String,
+        key_marker: Option<String>,
+        id_marker: Option<String>,
+        max: u32,
+    },
 }
 
 /// What a range answered a read.
@@ -140,6 +179,12 @@ pub enum Read {
     Owned(Buckets),
     /// Whether the bucket's rows remain; or where the range's span went.
     Probe(Routed<Probe>),
+    /// The upload's row, or none.
+    Upload(Option<Upload>),
+    /// The upload's parts asked, and whether more follow them; or none for an upload not there.
+    Parts(Option<(Vec<(u16, Part)>, bool)>),
+    /// A page of the bucket's uploads.
+    Uploads(Uploads),
 }
 
 /// Why a read's message was refused.
@@ -266,6 +311,53 @@ impl Query {
                 }
                 w.u32(*budget);
             }
+            Self::Upload {
+                bucket,
+                key,
+                upload,
+            } => {
+                w.u8(UPLOAD);
+                put_text(&mut w, bucket);
+                put_text(&mut w, key);
+                put_text(&mut w, upload);
+            }
+            Self::Parts {
+                bucket,
+                key,
+                upload,
+                after,
+                max,
+            } => {
+                w.u8(PARTS);
+                put_text(&mut w, bucket);
+                put_text(&mut w, key);
+                put_text(&mut w, upload);
+                w.u16(*after);
+                w.u32(*max);
+            }
+            Self::Uploads {
+                bucket,
+                prefix,
+                delimiter,
+                key_marker,
+                id_marker,
+                max,
+            } => {
+                w.u8(UPLOADS);
+                put_text(&mut w, bucket);
+                put_text(&mut w, prefix);
+                put_text(&mut w, delimiter);
+                for marker in [key_marker, id_marker] {
+                    match marker {
+                        None => w.u8(0),
+                        Some(marker) => {
+                            w.u8(1);
+                            put_text(&mut w, marker);
+                        }
+                    }
+                }
+                w.u32(*max);
+            }
         }
         Ok(w.into_vec())
     }
@@ -327,6 +419,39 @@ impl Query {
                 },
                 budget: r.u32()?,
             }),
+            UPLOAD => Some(Self::Upload {
+                bucket: take_text(&mut r, MAX_BUCKET)?,
+                key: take_text(&mut r, MAX_KEY)?,
+                upload: take_text(&mut r, MAX_TAG)?,
+            }),
+            PARTS => Some(Self::Parts {
+                bucket: take_text(&mut r, MAX_BUCKET)?,
+                key: take_text(&mut r, MAX_KEY)?,
+                upload: take_text(&mut r, MAX_TAG)?,
+                after: r.u16()?,
+                max: r.u32()?,
+            }),
+            UPLOADS => {
+                let (bucket, prefix, delimiter) = (
+                    take_text(&mut r, MAX_BUCKET)?,
+                    take_text(&mut r, MAX_KEY)?,
+                    take_text(&mut r, MAX_KEY)?,
+                );
+                let mut marker = |most| match r.u8()? {
+                    0 => Some(None),
+                    1 => Some(Some(take_text(&mut r, most)?)),
+                    _ => None,
+                };
+                let (key_marker, id_marker) = (marker(MAX_KEY)?, marker(MAX_TAG)?);
+                Some(Self::Uploads {
+                    bucket,
+                    prefix,
+                    delimiter,
+                    key_marker,
+                    id_marker,
+                    max: r.u32()?,
+                })
+            }
             _ => None,
         })();
         query.filter(|_| r.remaining() == 0).ok_or(ReadError::Query)
@@ -340,7 +465,12 @@ impl Query {
             Self::Header { .. } | Self::Extents { .. } => Layer::File,
             Self::Block { .. } => Layer::Block,
             Self::Bucket { .. } | Self::Owned { .. } => Layer::Bucket,
-            Self::Gate { .. } | Self::List(_) | Self::Probe { .. } => Layer::Name,
+            Self::Gate { .. }
+            | Self::List(_)
+            | Self::Probe { .. }
+            | Self::Upload { .. }
+            | Self::Parts { .. }
+            | Self::Uploads { .. } => Layer::Name,
         }
     }
 
@@ -468,6 +598,142 @@ impl Query {
                     .map(Read::Probe)
                     .map_err(meta)
             }
+            Self::Upload {
+                bucket,
+                key,
+                upload,
+            } => {
+                if !gated(engine, bucket).map_err(meta)? {
+                    return Ok(Read::NoBucket);
+                }
+                name::upload(engine, bucket, key, upload)
+                    .map(Read::Upload)
+                    .map_err(meta)
+            }
+            Self::Parts {
+                bucket,
+                key,
+                upload,
+                after,
+                max,
+            } => {
+                if !gated(engine, bucket).map_err(meta)? {
+                    return Ok(Read::NoBucket);
+                }
+                if name::upload(engine, bucket, key, upload)
+                    .map_err(meta)?
+                    .is_none()
+                {
+                    return Ok(Read::Parts(None));
+                }
+                let fits = max_bytes.saturating_sub(PARTS_ANSWER_BYTES) / PART_ROW_BYTES;
+                let most = usize::try_from(*max).unwrap_or(usize::MAX).min(fits);
+                if most == 0 {
+                    return Err(ReadError::Page(max_bytes));
+                }
+                // One more than the page holds, read only to learn whether more follow.
+                let mut parts =
+                    name::parts(engine, bucket, key, upload, *after, most.saturating_add(1))
+                        .map_err(meta)?;
+                let more = parts.len() > most;
+                parts.truncate(most);
+                Ok(Read::Parts(Some((parts, more))))
+            }
+            Self::Uploads {
+                bucket,
+                prefix,
+                delimiter,
+                key_marker,
+                id_marker,
+                max,
+            } => {
+                if !gated(engine, bucket).map_err(meta)? {
+                    return Ok(Read::NoBucket);
+                }
+                let room = max_bytes
+                    .checked_sub(1 + object::UPLOADS_HEAD_BYTES)
+                    .filter(|room| *room >= object::UPLOAD_BYTES)
+                    .ok_or(ReadError::Page(max_bytes))?;
+                let mut index = UploadIndex {
+                    engine,
+                    bucket,
+                    room,
+                };
+                let request = list::EntryRequest {
+                    prefix,
+                    delimiter: Some(delimiter.as_str()),
+                    key_marker: key_marker.as_deref(),
+                    id_marker: id_marker.as_deref(),
+                    max: usize::try_from(*max).unwrap_or(usize::MAX),
+                };
+                let page = list::entries(&request, &mut index).map_err(meta)?;
+                Ok(Read::Uploads(Uploads {
+                    uploads: page
+                        .entries
+                        .into_iter()
+                        .map(|e| UploadListed {
+                            key: e.key,
+                            id: e.id,
+                            initiated: object::seconds(e.value.initiated_ns),
+                            owner: e.value.owner,
+                        })
+                        .collect(),
+                    common_prefixes: page.common_prefixes,
+                    truncated: page.truncated,
+                    next: page.next,
+                }))
+            }
+        }
+    }
+}
+
+/// A bucket's multipart uploads in a Name range, as ListMultipartUploads pages them, within a
+/// reply's room.
+struct UploadIndex<'a, E> {
+    engine: &'a mut E,
+    bucket: &'a str,
+    /// The bytes of the reply left for the page's items.
+    room: usize,
+}
+
+impl<E: Rows> list::Entries for UploadIndex<'_, E> {
+    type Value = Upload;
+    type Error = MetaError;
+
+    fn seek(
+        &mut self,
+        from: &EntryFrom,
+        to: &[u8],
+        budget: &mut usize,
+    ) -> Result<Step<list::Listed<Upload>>, MetaError> {
+        let from = match from {
+            EntryFrom::Key(key) => name::UploadFrom::Key(key),
+            EntryFrom::After { key, id } => name::UploadFrom::After { key, id },
+        };
+        Ok(
+            match name::next_upload(self.engine, self.bucket, from, to, budget)? {
+                Scan::End => Step::End,
+                Scan::Paused(key) => Step::Paused(key),
+                Scan::Found(found) => Step::Found(list::Listed {
+                    key: found.key,
+                    id: found.id,
+                    value: found.upload,
+                }),
+            },
+        )
+    }
+
+    fn room(&mut self, item: Result<&list::Listed<Upload>, &str>) -> bool {
+        let bytes = match item {
+            Ok(entry) => object::upload_bytes(&entry.key, &entry.id, &entry.value.owner),
+            Err(prefix) => object::prefix_bytes(prefix),
+        };
+        match self.room.checked_sub(bytes) {
+            Some(left) => {
+                self.room = left;
+                true
+            }
+            None => false,
         }
     }
 }
@@ -607,6 +873,24 @@ impl Read {
                 w.u8(3);
                 w.bytes(&lineage.encode()?);
             }
+            Self::Upload(None) | Self::Parts(None) => w.u8(0),
+            Self::Upload(Some(upload)) => {
+                w.u8(1);
+                w.bytes(&upload.encode()?);
+            }
+            Self::Parts(Some((parts, more))) => {
+                w.u8(1);
+                w.u8(u8::from(*more));
+                w.u32(u32::try_from(parts.len()).map_err(|_| ReadError::Answer)?);
+                for (number, part) in parts {
+                    w.u16(*number);
+                    put_record(&mut w, &part.encode()?)?;
+                }
+            }
+            Self::Uploads(page) => {
+                w.u8(1);
+                object::put_uploads(&mut w, page).map_err(|_| ReadError::Answer)?;
+            }
             Self::Bucket(Some(row)) => {
                 w.u8(1);
                 w.bytes(&row.encode()?);
@@ -668,6 +952,50 @@ impl Read {
                 .filter(|_| r.remaining() == 0)
                 .map(Self::Owned)
                 .ok_or(ReadError::Answer),
+            Query::Upload { .. } => match r.u8() {
+                Some(0) if r.remaining() == 0 => Ok(Self::Upload(None)),
+                Some(1) => {
+                    let rest = r.take(r.remaining()).ok_or(ReadError::Answer)?;
+                    Ok(Self::Upload(Some(Upload::decode(rest)?)))
+                }
+                Some(2) if r.remaining() == 0 => Ok(Self::NoBucket),
+                _ => Err(ReadError::Answer),
+            },
+            Query::Parts { .. } => match r.u8() {
+                Some(0) if r.remaining() == 0 => Ok(Self::Parts(None)),
+                Some(1) => {
+                    let more = match r.u8() {
+                        Some(0) => false,
+                        Some(1) => true,
+                        _ => return Err(ReadError::Answer),
+                    };
+                    let count = usize::try_from(r.u32().ok_or(ReadError::Answer)?)
+                        .map_err(|_| ReadError::Answer)?;
+                    // A part takes 6 bytes at least: the count is no larger than the rest holds.
+                    if count > r.remaining() / 6 {
+                        return Err(ReadError::Answer);
+                    }
+                    let mut parts = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let number = r.u16().ok_or(ReadError::Answer)?;
+                        parts.push((number, Part::decode(take_record(&mut r)?)?));
+                    }
+                    if r.remaining() != 0 {
+                        return Err(ReadError::Answer);
+                    }
+                    Ok(Self::Parts(Some((parts, more))))
+                }
+                Some(2) if r.remaining() == 0 => Ok(Self::NoBucket),
+                _ => Err(ReadError::Answer),
+            },
+            Query::Uploads { .. } => match r.u8() {
+                Some(2) if r.remaining() == 0 => Ok(Self::NoBucket),
+                Some(1) => object::take_uploads(&mut r)
+                    .filter(|_| r.remaining() == 0)
+                    .map(Self::Uploads)
+                    .ok_or(ReadError::Answer),
+                _ => Err(ReadError::Answer),
+            },
             Query::Probe { .. } => match r.u8() {
                 Some(0) if r.remaining() == 0 => Ok(Self::Probe(Routed::Here(Probe::Found))),
                 Some(1) if r.remaining() == 0 => Ok(Self::Probe(Routed::Here(Probe::Clear))),

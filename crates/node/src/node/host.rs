@@ -22,6 +22,7 @@ use std::collections::VecDeque;
 use bytes::Bytes;
 use hyper_transport::{ExchangeId, PeerId, Refusal};
 use mantle_ec::durability::{self, Choice, Rates};
+use mantle_gateway::complete::{self, CompleteError, Completion};
 use mantle_gateway::get::{self, Get, GetError, Keyring};
 use mantle_gateway::layout::Layout;
 use mantle_gateway::put::{self, Body, Commit, Expected, Holding, Keys, Put, PutError, Random};
@@ -29,12 +30,12 @@ use mantle_meta::apply::Layer;
 use mantle_meta::coordinator::{self, Coordinator, Settled};
 use mantle_meta::name::{self, Match, Preconditions};
 use mantle_meta::record::{
-    self, BucketState, Descriptor, Version, Versioning, WrappedKey, Wrapper,
+    self, BucketState, Descriptor, LISTING, Part, Upload, Version, Versioning, WrappedKey, Wrapper,
 };
 use mantle_meta::root::{self, Placed};
 use mantle_meta::wire::{Answer, Command};
 use mantle_meta::{bucket, engine::Engine};
-use mantle_s3::checksum;
+use mantle_s3::checksum::{self, Algorithm};
 use mantle_s3::conditional::{self, Current};
 use mantle_s3::range::{self, Span};
 use mantle_s3::seal::{DataKey, WrappingKey};
@@ -42,7 +43,9 @@ use mantle_s3::seal::{DataKey, WrappingKey};
 use super::{ChunkAsk, ChunkOutcome, Node, NodeError, NodeLog, PIECE, take_done};
 use crate::ask::{CommandAsk, CommandOutcome, ReadAsk, ReadOutcome};
 use crate::classes::Class;
-use crate::object::{self, Head, Headers, List, Listing, Op, Reply, Status};
+use crate::object::{
+    self, Head, Headers, List, Listing, MAX_PAGE_PARTS, Op, PartListed, Parts, Reply, Status,
+};
 use crate::place;
 use crate::read::{Query, Read};
 
@@ -97,8 +100,11 @@ enum Work {
     Put(Box<Putting>),
     /// GetObject, or HeadObject.
     Get(Box<Getting>),
-    /// DeleteObject or PutBucketVersioning: the bucket's row read, then one command made from it.
+    /// DeleteObject, PutBucketVersioning, CreateMultipartUpload or AbortMultipartUpload: the
+    /// bucket's row read, then one command made from it.
     Command(Box<Commanding>),
+    /// CompleteMultipartUpload, run by the `Completion` driver.
+    Complete(Box<Completing>),
     /// An operation one read answers.
     Read(Box<Single>),
 }
@@ -117,6 +123,8 @@ struct Coordinating {
 struct Putting {
     bucket: String,
     key: String,
+    /// An UploadPart's upload and number; a PutObject's none.
+    part: Option<(String, u16)>,
     id: u128,
     length: u64,
     preconditions: Preconditions,
@@ -164,6 +172,27 @@ enum Then {
     },
     /// PutBucketVersioning, by the bucket's owner (05 §7.1).
     Versioning(Versioning),
+    /// CreateMultipartUpload, with the checksum its parts carry (05 §4.2).
+    CreateUpload {
+        key: String,
+        checksum: Option<(Algorithm, bool)>,
+    },
+    /// AbortMultipartUpload (05 §4.8).
+    Abort { key: String, upload: String },
+}
+
+/// A CompleteMultipartUpload: its bucket's row read first, for the incarnation, versioning and
+/// default retention its Complete names; then its driver.
+struct Completing {
+    bucket: String,
+    key: String,
+    upload: String,
+    /// The parts the request lists, each its number and ETag.
+    listed: Vec<(u16, String)>,
+    preconditions: Preconditions,
+    completion: Option<Completion>,
+    /// The driver's requests not yet asked: the node held as many asks as it keeps.
+    waiting: VecDeque<(u64, complete::Request)>,
 }
 
 /// An operation one read answers.
@@ -180,6 +209,16 @@ enum Single {
     },
     /// GetBucketVersioning: the bucket's row.
     Versioning(String),
+    /// ListParts: a page of an upload's parts.
+    Parts {
+        bucket: String,
+        key: String,
+        upload: String,
+        after: u16,
+        max: u32,
+    },
+    /// ListMultipartUploads: a page of the bucket's uploads, its query made from the request.
+    Uploads(Query),
 }
 
 /// The volume table as this node's member of the root range held it after an entry it applied,
@@ -256,6 +295,27 @@ fn name_status(outcome: &name::Outcome) -> Status {
         name::Outcome::NoSuchKey => Status::NoSuchKey,
         name::Outcome::PreconditionFailed => Status::PreconditionFailed,
         name::Outcome::Locked => Status::AccessDenied,
+        name::Outcome::NoSuchUpload => Status::NoSuchUpload,
+        name::Outcome::InvalidPart => Status::InvalidPart,
+        name::Outcome::InvalidPartOrder => Status::InvalidPartOrder,
+        name::Outcome::EntityTooSmall => Status::EntityTooSmall,
+        // A part's number or size outside S3's, which the Name range refuses too.
+        name::Outcome::Invalid => Status::InvalidArgument,
+        _ => Status::Failed,
+    }
+}
+
+/// The status a completion's failure is answered with (05 §4.4).
+fn complete_status(error: &CompleteError) -> Status {
+    match error {
+        CompleteError::NoSuchUpload => Status::NoSuchUpload,
+        // Composite checksums need parts numbered from 1 without a gap: S3 answers 500 for the
+        // gap, and mantle the part it cannot combine (05 §3.3).
+        CompleteError::InvalidPart | CompleteError::NotConsecutive => Status::InvalidPart,
+        CompleteError::InvalidPartOrder => Status::InvalidPartOrder,
+        CompleteError::EntityTooSmall => Status::EntityTooSmall,
+        CompleteError::Name(outcome) => name_status(outcome),
+        // A listed part uploaded again while the completion ran: `500`, which clients retry.
         _ => Status::Failed,
     }
 }
@@ -267,6 +327,7 @@ fn put_status(error: &PutError) -> Status {
         PutError::EntityTooLarge { .. } => Status::EntityTooLarge,
         PutError::BadDigest | PutError::BadChecksum => Status::BadDigest,
         PutError::Unplaced(_) => Status::SlowDown,
+        PutError::InvalidPartNumber(_) => Status::InvalidArgument,
         PutError::Name(outcome) => name_status(outcome),
         _ => Status::Failed,
     }
@@ -293,6 +354,7 @@ fn facts(status: Status, order: u64, version: &Version) -> Reply {
         marker: version.marker,
         range: None,
         versioning: None,
+        upload: String::new(),
         listing: None,
     }
 }
@@ -441,6 +503,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Work::Put(_) => self.step_put(at),
             Work::Get(_) => self.step_get(at),
             Work::Command(_) => self.step_command(at),
+            Work::Complete(_) => self.step_complete(at),
             Work::Read(_) => self.step_single(at),
         }
     }
@@ -563,6 +626,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                                 marker,
                                 ..Reply::status(Status::Done)
                             },
+                            name::Outcome::Created { upload } => Reply {
+                                upload,
+                                ..Reply::status(Status::Done)
+                            },
+                            name::Outcome::Aborted => Reply::status(Status::Done),
                             refused => Reply::status(name_status(&refused)),
                         };
                         self.reply_job(at, reply)
@@ -580,6 +648,24 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     _ => self.fail_job(at, Status::Failed),
                 };
             }
+            Work::Complete(completing) => match (request, outcome) {
+                (None, Outcome::Read(ReadOutcome::Read(read))) => {
+                    return self.complete_read(at, *read);
+                }
+                (None, _) => return self.fail_job(at, Status::Failed),
+                (Some(id), outcome) => {
+                    // A read or command refused, or answered with another kind: `500`, which
+                    // clients retry; never the 404 an upload not found would be.
+                    let Some(answer) = complete_answer(outcome) else {
+                        return self.fail_job(at, Status::Failed);
+                    };
+                    // An answer the driver refuses ends it with that outcome, which its next
+                    // turn replies.
+                    if let Some(completion) = completing.completion.as_mut() {
+                        let _ = completion.answer(id, answer);
+                    }
+                }
+            },
             Work::Read(_) => {
                 return match outcome {
                     Outcome::Read(ReadOutcome::Read(read)) => self.single_read(at, *read),
@@ -798,32 +884,51 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         else {
             return Ok(());
         };
-        let commit = Commit::Object(name::Put {
-            bucket: putting.bucket.clone(),
-            incarnation: row.created_ns,
-            key: putting.key.clone(),
-            versioning: row.versioning,
-            preconditions: std::mem::take(&mut putting.preconditions),
-            at_ns: 0,
-            ordered_ns: None,
-            version: Version {
-                marker: false,
-                null: false,
-                modified_ns: 0,
-                etag: String::new(),
-                size: 0,
-                checksum: None,
-                file: None,
-                owner: peer.to_string(),
-                headers: Vec::new(),
-                retention: None,
-                legal_hold: None,
-                listing: None,
-            },
-            default,
-            id: putting.id,
-            deadline_ns: 0,
-        });
+        let commit = match &putting.part {
+            // The part's ETag, size, checksum, file and deadline are the driver's to fill.
+            Some((upload, number)) => Commit::Part(name::PutPart {
+                bucket: putting.bucket.clone(),
+                incarnation: row.created_ns,
+                key: putting.key.clone(),
+                upload: upload.clone(),
+                number: *number,
+                part: Part {
+                    etag: String::new(),
+                    size: 0,
+                    checksum: None,
+                    file: 0,
+                    modified_ns: 0,
+                    deadline_ns: 0,
+                },
+                at_ns: 0,
+            }),
+            None => Commit::Object(name::Put {
+                bucket: putting.bucket.clone(),
+                incarnation: row.created_ns,
+                key: putting.key.clone(),
+                versioning: row.versioning,
+                preconditions: std::mem::take(&mut putting.preconditions),
+                at_ns: 0,
+                ordered_ns: None,
+                version: Version {
+                    marker: false,
+                    null: false,
+                    modified_ns: 0,
+                    etag: String::new(),
+                    size: 0,
+                    checksum: None,
+                    file: None,
+                    owner: peer.to_string(),
+                    headers: Vec::new(),
+                    retention: None,
+                    legal_hold: None,
+                    listing: None,
+                },
+                default,
+                id: putting.id,
+                deadline_ns: 0,
+            }),
+        };
         let body = Body {
             length: putting.length,
             checksum: putting.expected.checksum.as_ref().map(|c| c.algorithm),
@@ -869,9 +974,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         Err(error) => Reply::status(put_status(error)),
                     });
                     match over {
-                        Some(reply) => Step::Over(reply),
+                        Some(reply) => Step::Over(Box::new(reply)),
                         None if put.tick(wall).is_err() => {
-                            Step::Over(Reply::status(Status::Failed))
+                            Step::Over(Box::new(Reply::status(Status::Failed)))
                         }
                         None => Step::Go,
                     }
@@ -882,7 +987,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Step::Wait => return Ok(false),
             Step::Over(reply) => {
                 if let Some(job) = self.jobs.get_mut(at) {
-                    job.work = Work::Draining(reply);
+                    job.work = Work::Draining(*reply);
                 }
                 return self.drain_job(at);
             }
@@ -1435,10 +1540,241 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     versioning: *versioning,
                 }),
             ),
+            Then::CreateUpload { key, checksum } => (
+                name_group,
+                Command::Name(Box::new(name::Command::CreateUpload(name::CreateUpload {
+                    bucket: commanding.bucket.clone(),
+                    incarnation: row.created_ns,
+                    key: key.clone(),
+                    at_ns: 0,
+                    upload: Upload {
+                        initiated_ns: 0,
+                        owner: peer.to_string(),
+                        headers: Vec::new(),
+                        checksum: checksum.map(|(algorithm, full)| (algorithm.code(), full)),
+                        retention: None,
+                        legal_hold: None,
+                    },
+                }))),
+            ),
+            Then::Abort { key, upload } => (
+                name_group,
+                Command::Name(Box::new(name::Command::Abort(name::Abort {
+                    bucket: commanding.bucket.clone(),
+                    incarnation: row.created_ns,
+                    key: key.clone(),
+                    upload: upload.clone(),
+                    at_ns: 0,
+                }))),
+            ),
         };
         commanding.asked = true;
         let asked = self.command(group, command, u64::MAX).map(Pending::Command);
         self.asked(at, asked, None).map(|_| ())
+    }
+
+    /// A completion's turn: its bucket's row read first; then its driver's requests asked; once
+    /// its outcome is known, its answer.
+    fn step_complete(&mut self, at: usize) -> Result<bool, NodeError> {
+        let Some(Job {
+            work: Work::Complete(completing),
+            pending,
+            ..
+        }) = self.jobs.get_mut(at)
+        else {
+            return Ok(true);
+        };
+        let Some(completion) = completing.completion.as_mut() else {
+            if !pending.is_empty() {
+                return Ok(false);
+            }
+            let query = Query::Bucket {
+                bucket: completing.bucket.clone(),
+            };
+            let Some(group) = self.group_of(Layer::Bucket) else {
+                self.fail_job(at, Status::Failed)?;
+                return self.drain_job(at);
+            };
+            let asked = self.read(group, query, u64::MAX).map(Pending::Read);
+            return self.asked(at, asked, None);
+        };
+        if let Some(outcome) = completion.outcome() {
+            let reply = match outcome {
+                Ok(done) => Reply {
+                    version: done.version.clone(),
+                    etag: done.etag.clone(),
+                    size: done.size,
+                    checksum: done.checksum.clone(),
+                    ..Reply::status(Status::Done)
+                },
+                Err(error) => Reply::status(complete_status(error)),
+            };
+            self.reply_job(at, reply)?;
+            return self.drain_job(at);
+        }
+        loop {
+            let Some(Job {
+                work: Work::Complete(completing),
+                ..
+            }) = self.jobs.get_mut(at)
+            else {
+                return Ok(true);
+            };
+            let next = match completing.waiting.pop_front() {
+                Some(request) => Some(request),
+                None => completing.completion.as_mut().and_then(Completion::poll),
+            };
+            let Some((id, request)) = next else {
+                break;
+            };
+            if let Some(request) = self.ask_complete(at, id, request)? {
+                if let Some(Job {
+                    work: Work::Complete(completing),
+                    ..
+                }) = self.jobs.get_mut(at)
+                {
+                    completing.waiting.push_front((id, request));
+                }
+                break;
+            }
+        }
+        Ok(false)
+    }
+
+    /// A completion's bucket row, read: its driver made over it, or the reply `NoSuchBucket` or
+    /// the refusal its parts' list earns before anything is asked (05 §4.4).
+    fn complete_read(&mut self, at: usize, read: Read) -> Result<(), NodeError> {
+        let Read::Bucket(Some(row)) = read else {
+            return self.fail_job(at, Status::NoSuchBucket);
+        };
+        if row.state != BucketState::Active {
+            return self.fail_job(at, Status::NoSuchBucket);
+        }
+        let Some(handover_ns) = self.gateway.as_ref().map(|g| g.handover_ns) else {
+            return self.fail_job(at, Status::Failed);
+        };
+        let now = self.wall.now_ns();
+        let mut file = [0u8; 16];
+        if getrandom::fill(&mut file).is_err() {
+            return self.fail_job(at, Status::Failed);
+        }
+        let Some(Job {
+            work: Work::Complete(completing),
+            ..
+        }) = self.jobs.get_mut(at)
+        else {
+            return Ok(());
+        };
+        // What the Complete says of the object, its parts, ETag, size, checksum, file, listing,
+        // ID and deadline, the driver derives from the upload's rows.
+        let complete = name::Complete {
+            bucket: completing.bucket.clone(),
+            incarnation: row.created_ns,
+            key: completing.key.clone(),
+            upload: completing.upload.clone(),
+            versioning: row.versioning,
+            preconditions: std::mem::take(&mut completing.preconditions),
+            at_ns: 0,
+            parts: Vec::new(),
+            etag: String::new(),
+            size: 0,
+            checksum: None,
+            file: None,
+            listing: [0; LISTING],
+            default: row.lock.and_then(|lock| lock.default),
+            id: 0,
+            deadline_ns: 0,
+        };
+        let listed = std::mem::take(&mut completing.listed);
+        match Completion::new(
+            complete,
+            listed,
+            u128::from_be_bytes(file),
+            handover_ns,
+            now,
+        ) {
+            Ok(completion) => {
+                completing.completion = Some(completion);
+                Ok(())
+            }
+            Err(error) => {
+                let status = complete_status(&error);
+                self.fail_job(at, status)
+            }
+        }
+    }
+
+    /// Asks a completion's driver's request of what serves it; the request back when the node
+    /// holds as many asks as it keeps.
+    fn ask_complete(
+        &mut self,
+        at: usize,
+        id: u64,
+        request: complete::Request,
+    ) -> Result<Option<complete::Request>, NodeError> {
+        let Some(Job {
+            work: Work::Complete(completing),
+            ..
+        }) = self.jobs.get(at)
+        else {
+            return Ok(None);
+        };
+        let (bucket, key, upload) = (
+            completing.bucket.clone(),
+            completing.key.clone(),
+            completing.upload.clone(),
+        );
+        let asked = match &request {
+            complete::Request::Upload => self
+                .group_of(Layer::Name)
+                .ok_or(NodeError::Bounds("no Name range here".into()))
+                .and_then(|g| {
+                    let query = Query::Upload {
+                        bucket,
+                        key,
+                        upload,
+                    };
+                    self.read(g, query, u64::MAX)
+                })
+                .map(Pending::Read),
+            complete::Request::Parts { after, max } => self
+                .group_of(Layer::Name)
+                .ok_or(NodeError::Bounds("no Name range here".into()))
+                .and_then(|g| {
+                    let query = Query::Parts {
+                        bucket,
+                        key,
+                        upload,
+                        after: *after,
+                        max: u32::try_from(*max).unwrap_or(u32::MAX),
+                    };
+                    self.read(g, query, u64::MAX)
+                })
+                .map(Pending::Read),
+            complete::Request::File(command) => self
+                .group_of(Layer::File)
+                .ok_or(NodeError::Bounds("no File range here".into()))
+                .and_then(|g| self.command(g, Command::File(command.clone()), u64::MAX))
+                .map(Pending::Command),
+            complete::Request::Name(command) => self
+                .group_of(Layer::Name)
+                .ok_or(NodeError::Bounds("no Name range here".into()))
+                .and_then(|g| self.command(g, Command::Name(command.clone()), u64::MAX))
+                .map(Pending::Command),
+        };
+        match asked {
+            Ok(pending) => {
+                if let Some(job) = self.jobs.get_mut(at) {
+                    job.pending.push((pending, Some(id)));
+                }
+                Ok(None)
+            }
+            Err(NodeError::Asks) => Ok(Some(request)),
+            Err(_) => {
+                self.fail_job(at, Status::Failed)?;
+                Ok(None)
+            }
+        }
     }
 
     /// An operation one read answers, at its turn: its read asked once.
@@ -1475,6 +1811,23 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     bucket: bucket.clone(),
                 },
             ),
+            Single::Parts {
+                bucket,
+                key,
+                upload,
+                after,
+                max,
+            } => (
+                Layer::Name,
+                Query::Parts {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    upload: upload.clone(),
+                    after: *after,
+                    max: *max,
+                },
+            ),
+            Single::Uploads(query) => (Layer::Name, query.clone()),
         };
         let Some(group) = self.group_of(layer) else {
             self.fail_job(at, Status::Failed)?;
@@ -1514,6 +1867,36 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             },
             (_, Read::Owned(page)) => Reply {
                 listing: Some(Listing::Buckets(page)),
+                ..Reply::status(Status::Done)
+            },
+            (_, Read::Parts(None)) => Reply::status(Status::NoSuchUpload),
+            (_, Read::Parts(Some((parts, more)))) => {
+                let next = if more {
+                    parts.last().map(|(number, _)| *number)
+                } else {
+                    None
+                };
+                let parts = parts
+                    .into_iter()
+                    .map(|(number, part)| PartListed {
+                        number,
+                        etag: part.etag,
+                        size: part.size,
+                        modified: object::seconds(part.modified_ns),
+                        checksum: part.checksum,
+                    })
+                    .collect();
+                Reply {
+                    listing: Some(Listing::Parts(Parts {
+                        parts,
+                        truncated: more,
+                        next,
+                    })),
+                    ..Reply::status(Status::Done)
+                }
+            }
+            (_, Read::Uploads(page)) => Reply {
+                listing: Some(Listing::Uploads(page)),
                 ..Reply::status(Status::Done)
             },
             _ => Reply::status(Status::Failed),
@@ -1726,6 +2109,7 @@ fn work(op: Op, carry: Vec<u8>) -> Work {
         } => Work::Put(Box::new(Putting {
             bucket,
             key,
+            part: None,
             id,
             length,
             preconditions: Preconditions {
@@ -1769,6 +2153,116 @@ fn work(op: Op, carry: Vec<u8>) -> Work {
             asked: false,
         })),
         Op::GetVersioning { bucket } => Work::Read(Box::new(Single::Versioning(bucket))),
+        // A checksum type its algorithm does not have: a full-object hash or a composite
+        // CRC-64/NVME (05 §3.3), refused before anything is written.
+        Op::CreateUpload {
+            checksum: Some((algorithm, full)),
+            ..
+        } if !(if full {
+            algorithm.full_object()
+        } else {
+            algorithm.composite()
+        }) =>
+        {
+            Work::Draining(Reply::status(Status::InvalidRequest))
+        }
+        Op::CreateUpload {
+            bucket,
+            key,
+            checksum,
+            ..
+        } => Work::Command(Box::new(Commanding {
+            bucket,
+            then: Then::CreateUpload { key, checksum },
+            asked: false,
+        })),
+        Op::UploadPart { length, .. } if length > name::MAX_PART => {
+            Work::Draining(Reply::status(Status::EntityTooLarge))
+        }
+        Op::UploadPart {
+            bucket,
+            key,
+            upload,
+            number,
+            id,
+            length,
+            checksum,
+            md5,
+        } => Work::Put(Box::new(Putting {
+            bucket,
+            key,
+            part: Some((upload, number)),
+            id,
+            length,
+            preconditions: Preconditions::default(),
+            expected: Expected { md5, checksum },
+            put: None,
+            taken: 0,
+            carry,
+            waiting: VecDeque::new(),
+        })),
+        Op::Complete {
+            bucket,
+            key,
+            upload,
+            headers,
+            parts,
+            ..
+        } => Work::Complete(Box::new(Completing {
+            bucket,
+            key,
+            upload,
+            listed: parts,
+            preconditions: Preconditions {
+                if_match: matched(headers.if_match.as_deref(), true),
+                if_none_match: matched(headers.if_none_match.as_deref(), false),
+            },
+            completion: None,
+            waiting: VecDeque::new(),
+        })),
+        Op::Abort {
+            bucket,
+            key,
+            upload,
+            ..
+        } => Work::Command(Box::new(Commanding {
+            bucket,
+            then: Then::Abort { key, upload },
+            asked: false,
+        })),
+        // No part asked: an empty page, the upload not read (05 §4.6).
+        Op::ListParts { max: 0, .. } => Work::Draining(Reply {
+            listing: Some(Listing::Parts(Parts::default())),
+            ..Reply::status(Status::Done)
+        }),
+        Op::ListParts {
+            bucket,
+            key,
+            upload,
+            after,
+            max,
+        } => Work::Read(Box::new(Single::Parts {
+            bucket,
+            key,
+            upload,
+            after,
+            max: max.min(u32::try_from(MAX_PAGE_PARTS).unwrap_or(u32::MAX)),
+        })),
+        Op::ListUploads {
+            bucket,
+            prefix,
+            delimiter,
+            key_marker,
+            id_marker,
+            max,
+        } => Work::Read(Box::new(Single::Uploads(Query::Uploads {
+            bucket,
+            prefix,
+            delimiter,
+            key_marker,
+            id_marker,
+            max,
+        }))),
         Op::List(list) => Work::Read(Box::new(Single::List(list))),
         Op::HeadBucket { bucket } => Work::Read(Box::new(Single::HeadBucket(bucket))),
         Op::ListBuckets { prefix, after, max } => {
@@ -1810,7 +2304,7 @@ enum Step {
     /// Going: its body and requests to move.
     Go,
     /// Over, with its reply.
-    Over(Reply),
+    Over(Box<Reply>),
 }
 
 /// What a job's ask came to.
@@ -1833,6 +2327,28 @@ fn put_answer(outcome: Outcome) -> put::Answer {
     }
 }
 
+/// A completion's driver's answer for what its request came to; none for a read or command
+/// refused or answered with another kind.
+fn complete_answer(outcome: Outcome) -> Option<complete::Answer> {
+    match outcome {
+        Outcome::Read(ReadOutcome::Read(read)) => match *read {
+            Read::Upload(upload) => Some(complete::Answer::Upload(upload)),
+            Read::Parts(Some((parts, _))) => Some(complete::Answer::Parts(parts)),
+            // The upload gone while the completion read it: its parts are none, and the
+            // driver finds the listed parts missing.
+            Read::Parts(None) => Some(complete::Answer::Parts(Vec::new())),
+            _ => None,
+        },
+        Outcome::Command(CommandOutcome::Answered(Answer::File(o))) => {
+            Some(complete::Answer::File(o))
+        }
+        Outcome::Command(CommandOutcome::Answered(Answer::Name(o))) => {
+            Some(complete::Answer::Name(o))
+        }
+        _ => None,
+    }
+}
+
 /// A get's driver's answer for what its request came to.
 fn get_answer(outcome: Outcome) -> get::Answer {
     match outcome {
@@ -1845,5 +2361,77 @@ fn get_answer(outcome: Outcome) -> get::Answer {
             _ => get::Answer::Unreadable,
         },
         _ => get::Answer::Unreadable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refused(work: &Work) -> Option<Status> {
+        match work {
+            Work::Draining(reply) => Some(reply.status),
+            _ => None,
+        }
+    }
+
+    /// What a request's head alone refuses, before anything is read or written: a part declared
+    /// past S3's 5 GiB, an object past a single PUT's, and a checksum type its algorithm does not
+    /// have (05 §3.3, §4.1).
+    #[test]
+    fn a_request_past_s3s_bounds_is_refused_before_anything_is_read() {
+        let part = |length| Op::UploadPart {
+            bucket: "b".into(),
+            key: "k".into(),
+            upload: "0123456789ABC".into(),
+            number: 1,
+            id: 1,
+            length,
+            checksum: None,
+            md5: None,
+        };
+        assert_eq!(
+            refused(&work(part(name::MAX_PART + 1), Vec::new())),
+            Some(Status::EntityTooLarge)
+        );
+        assert_eq!(refused(&work(part(name::MAX_PART), Vec::new())), None);
+        let put = Op::Put {
+            bucket: "b".into(),
+            key: "k".into(),
+            id: 1,
+            length: mantle_s3::body::MAX_UPLOAD + 1,
+            headers: Headers::default(),
+            checksum: None,
+            md5: None,
+        };
+        assert_eq!(
+            refused(&work(put, Vec::new())),
+            Some(Status::EntityTooLarge)
+        );
+        let create = |algorithm, full| Op::CreateUpload {
+            bucket: "b".into(),
+            key: "k".into(),
+            id: 1,
+            checksum: Some((algorithm, full)),
+        };
+        for (algorithm, full, ok) in [
+            (Algorithm::Crc64Nvme, true, true),
+            (Algorithm::Crc64Nvme, false, false),
+            (Algorithm::Sha256, true, false),
+            (Algorithm::Sha256, false, true),
+            (Algorithm::Crc32c, true, true),
+            (Algorithm::Crc32c, false, true),
+        ] {
+            let status = refused(&work(create(algorithm, full), Vec::new()));
+            assert_eq!(
+                status,
+                if ok {
+                    None
+                } else {
+                    Some(Status::InvalidRequest)
+                },
+                "{algorithm:?} full {full}"
+            );
+        }
     }
 }

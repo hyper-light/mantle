@@ -557,7 +557,10 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/node/src/node.rs` `LIVENESS_GROUP` | format | The log group of the liveness stream's own writes, the top of the group space: group 0 holds hyper-log's own key records, and a range named either is refused at open. |
 | `crates/node/src/node.rs` `PIECE` | derived | hyper-transport's `RECEIVE_CHUNK`: a snapshot's or a chunk's body is read a receive chunk at a time. |
 | `crates/node/src/node.rs` `PLANE_RAFT` | format | A plane message's first byte for a range's Raft frame, apart from hyper-liveness's `KIND` for a heartbeat. |
+| `crates/node/src/object.rs` `ABORT` | format | An object request's kind: AbortMultipartUpload. |
+| `crates/node/src/object.rs` `COMPLETE` | format | An object request's kind: CompleteMultipartUpload, its parts listed in its fields. |
 | `crates/node/src/object.rs` `CREATE` | format | An object request's kind: a bucket created. |
+| `crates/node/src/object.rs` `CREATE_UPLOAD` | format | An object request's kind: CreateMultipartUpload. |
 | `crates/node/src/object.rs` `DELETE` | format | An object request's kind: DeleteObject, the key's object removed or, where versioning is on, a delete marker made. |
 | `crates/node/src/object.rs` `DELETE_BUCKET` | format | An object request's kind: DeleteBucket, through the bucket's coordinator, once the bucket is empty. |
 | `crates/node/src/object.rs` `GET` | format | An object request's kind: an object's bytes read, or the range its `Range` names. |
@@ -568,15 +571,24 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/node/src/object.rs` `LIST` | format | An object request's kind: a page of ListObjectsV2. |
 | `crates/node/src/object.rs` `LISTED_BYTES` | derived | A key in a page of keys at its longest: the key behind its length (u32 and `MAX_KEY`), its ETag behind its length (u32 and `MAX_TAG`), its size and Last-Modified (u64 each), its checksum's flag, algorithm and parts (1, 1, 2) and its owner's flag, length and `MAX_OWNER` bytes; a page's room is counted against it. |
 | `crates/node/src/object.rs` `LIST_BUCKETS` | format | An object request's kind: a page of ListBuckets, the asker's buckets. |
+| `crates/node/src/object.rs` `LIST_PARTS` | format | An object request's kind: a page of ListParts. |
+| `crates/node/src/object.rs` `LIST_UPLOADS` | format | An object request's kind: a page of ListMultipartUploads. |
 | `crates/node/src/object.rs` `MAX_BUCKETS` | external | ListBuckets' `max-buckets`, "1–10000" (research/05 §10.4): the most buckets a page lists, and a request's bound. |
 | `crates/node/src/object.rs` `MAX_CHECKSUM` | derived | The longest checksum value, SHA-512's 64 bytes: the widest of S3's ten algorithms (research/05 §3.1; `mantle_s3::checksum::Algorithm::width`). |
 | `crates/node/src/object.rs` `MAX_FIELDS` | derived | A request's fields at most: the longer of a put's (bucket and key behind their lengths, five optional header texts within S3's 8 KB `MAX_HEADERS`, the checksum's flag, code, length and `MAX_CHECKSUM` bytes, `Content-MD5`'s flag and 16 bytes) and a listing's (bucket, prefix, delimiter and start, each behind its length, the most keys and whether owners are listed). |
+| `crates/node/src/object.rs` `MAX_PAGE_PARTS` | external | The most parts a page of ListParts lists and the most uploads a page of ListMultipartUploads does: S3's 1,000 for each (research/05 §4.1, §4.7). |
+| `crates/node/src/object.rs` `MAX_PARTS` | external | The most parts an upload has and a completion lists, S3's 10,000 (research/05 §4.1; `mantle_s3::body::MAX_PARTS`). |
 | `crates/node/src/object.rs` `MAX_REPLY_FIELDS` | derived | A reply's fields at most: the version's facts (its ID and ETag at `MAX_TAG`, Last-Modified, the checksum at `MAX_CHECKSUM`, the marker, the range served and the versioning) and the longer listing, a page of S3's 1,000 keys (`mantle_s3::list::MAX_KEYS`) at `LISTED_BYTES` beside `PAGE_BYTES`, or of `MAX_BUCKETS` buckets at the longest name. |
 | `crates/node/src/object.rs` `MAX_TAG` | derived | The longest version id or ETag a reply carries: a multipart object's ETag bare of quotes, an MD5's 32 hex digits, `-` and its count of parts at `MAX_PARTS`'s five digits (`mantle_s3::checksum::multipart_etag`); a version id is 13 characters (`mantle_meta::key::version_id`). |
 | `crates/node/src/object.rs` `PAGE_BYTES` | derived | A page of keys' bytes beside its keys and common prefixes, at most: whether it is truncated (1), where the next page starts (its flag, tag, length and `MAX_KEY` bytes) and the two counts (u32 each). |
+| `crates/node/src/object.rs` `PARTS_HEAD_BYTES` | derived | A page of parts' bytes beside its parts: whether it is truncated (1), the next marker behind its flag (1 and 2), and the count (u32). |
+| `crates/node/src/object.rs` `PART_BYTES` | derived | A part in a page of parts at its longest: its number (u16), its ETag behind its length at `MAX_TAG`, its size and Last-Modified (u64 each), and its checksum's flag, length and `MAX_CHECKSUM` bytes. |
 | `crates/node/src/object.rs` `PUT` | format | An object request's kind: an object put, its bytes on the exchange. |
 | `crates/node/src/object.rs` `PUT_VERSIONING` | format | An object request's kind: PutBucketVersioning, enabled or suspended. |
 | `crates/node/src/object.rs` `REPLY_HEAD_BYTES` | format | An object reply's head: its status, one byte; the object's size, a u64; its fields' length, a u32. |
+| `crates/node/src/object.rs` `UPLOADS_HEAD_BYTES` | derived | A page of uploads' bytes beside its uploads and common prefixes, at most: whether it is truncated, where the next page starts (its flag, a key at `MAX_KEY` and an ID at `MAX_TAG`, each behind its length) and the two counts (u32 each). |
+| `crates/node/src/object.rs` `UPLOAD_BYTES` | derived | An upload in a page of uploads at its longest: its key at `MAX_KEY`, its ID at `MAX_TAG`, its initiation (u64) and its owner at `MAX_OWNER`, each text behind its length (u32). |
+| `crates/node/src/object.rs` `UPLOAD_PART` | format | An object request's kind: UploadPart, the part's bytes on the exchange. |
 | `crates/node/src/process.rs` `CALIBRATION_BYTES` | derived | 137 bytes beside its key, at most hyper-rt's `MAX_KEY`: the calibration record's layout (`hyper_rt::machine::record`: magic 8, version 2, key length 2, measured at 8, the wake's 64, the system call's 49, its CRC-32C 4), pinned by `the_calibration_is_kept_in_the_node_directory_and_taken_again`. |
 | `crates/node/src/read.rs` `BLOCK` | format | A read's kind: a block's header and its chunks' places, of a Block range. |
 | `crates/node/src/read.rs` `BUCKET` | format | A read's kind: a bucket's row, of a Bucket range. |
@@ -591,8 +603,13 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/node/src/read.rs` `OWNED` | format | A read's kind: a page of an owner's buckets, of the Bucket range. |
 | `crates/node/src/read.rs` `OWNED_BYTES` | derived | A bucket in a page at the longest name: its name behind its length (u32 and `MAX_BUCKET`) and its creation (u64). |
 | `crates/node/src/read.rs` `PAGE_HEAD_BYTES` | format | A page of the volume table's bytes before its volumes: whether more follow, one byte, and the count, a u32. |
+| `crates/node/src/read.rs` `PARTS` | format | A read's kind: an upload's parts after a number, of a Name range. |
+| `crates/node/src/read.rs` `PARTS_ANSWER_BYTES` | format | A page of parts' bytes beside its parts: its kind's byte, whether more follow (u8) and the count (u32). |
+| `crates/node/src/read.rs` `PART_ROW_BYTES` | derived | A part in an answer at its longest: its number (u16) and its row behind its length (u32), the row `Part::encode` writes: the format byte, its ETag behind its length at `MAX_TAG`, its size (u64), its checksum's flag and value behind its length at `MAX_CHECKSUM`, its file (u128), its time and deadline (u64 each), and the CRC-32C (u32). |
 | `crates/node/src/read.rs` `PLACED_BYTES` | derived | A volume in a page at the longest domain: its id (u128), node (u64) and bytes (u64), its domain's length (u32) and `MAX_DOMAIN` bytes; a page counts each at it so it fits whatever their domains. |
 | `crates/node/src/read.rs` `PROBE` | format | A read's kind: whether a bucket's rows remain in a Name range, the delete coordinator's probe (metadata.md §2). |
+| `crates/node/src/read.rs` `UPLOAD` | format | A read's kind: a multipart upload's row, of a Name range. |
+| `crates/node/src/read.rs` `UPLOADS` | format | A read's kind: a page of ListMultipartUploads, of a Name range. |
 | `crates/node/src/read.rs` `VOLUMES` | format | A read's kind: a page of the volume table, of the root range. |
 | `crates/node/src/secret/windows.rs` `ACCESS_ALLOWED_ACE_TYPE` | external | 0, winnt.h's `ACCESS_ALLOWED_ACE_TYPE`: an ACE that grants (windows-sys keeps it in a feature the workspace does not enable). |
 | `crates/node/src/secret/windows.rs` `ACCESS_DENIED_ACE_TYPE` | external | 1, winnt.h's `ACCESS_DENIED_ACE_TYPE`: an ACE that denies. |

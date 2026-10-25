@@ -1810,7 +1810,8 @@ A stale route costs a round trip and cannot produce a wrong answer (architecture
 or gateway asks it on an exchange of the transfer class (`crate::object`) for S3's operations:
 CreateBucket, HeadBucket, ListBuckets, DeleteBucket, PutBucketVersioning and GetBucketVersioning;
 PutObject with its bytes on the exchange, GetObject with them on the reply, HeadObject,
-DeleteObject and ListObjectsV2. A request's head is a few fixed fields, held for the exchange's
+DeleteObject and ListObjectsV2; CreateMultipartUpload, UploadPart with its bytes on the exchange,
+CompleteMultipartUpload, AbortMultipartUpload, ListParts and ListMultipartUploads. A request's head is a few fixed fields, held for the exchange's
 life: its kind, its fields' length, the operation's identity, which every mutation carries
 (gateway.md §2.1; the Name range records none yet, STATUS item 9), and a put's length; its fields
 ride in the body ahead of a put's bytes, each bounded by S3's own bound on what it names. A
@@ -1845,6 +1846,24 @@ driver over it, a data key drawn for the file and wrapped under the root key's c
 (encryption.md §2) and the scheme the durability model chooses for the cell's domains
 (`mantle_ec::durability::choose`).
 
+A multipart upload's create and abort read the bucket's row and ask the Name range's
+`CreateUpload` or `Abort`, the upload's ID its initiation time in the version-ID alphabet, so a
+key's uploads list in the order they began (05 §4.7); a create naming a checksum type its algorithm
+does not have, a full-object hash or a composite CRC-64/NVME, is refused before anything is
+written (05 §3.3). A part streams through the `Put` driver as a file of its own, under its own
+data key, its checksum and `Content-MD5` checked at its end, and is committed by the Name range's
+`PutPart`, which keeps the latest part of a number (05 §4.3). A completion runs the `Completion`
+driver (`mantle_gateway::complete`): it reads the upload's row and its parts a page at a time by
+ReadIndex, derives the object's size, its ETag in S3's multipart form and its full-object or
+composite checksum from the parts' rows, never from the request, writes the object's file of parts
+in the File range, and commits the Name range's `Complete`, which checks the parts against its own
+rows; asked again with the same parts, the Name range answers it from the version it made (05
+§4.4). A read or command the completion's driver asks that is refused fails it `500`, which clients
+retry, never the `404` an upload not found would be. ListParts reads a page of an upload's parts,
+at most S3's 1,000 and as many as the reply has room for, and ListMultipartUploads a page of the
+bucket's uploads through the S3 layer's paging over the Name layer's scan of uploads, ended early at
+the first upload its reply has no room for.
+
 The host serves each driver's requests as the table above routes them: `Place` from the node's
 replica of the volume table (§6.6), read from the root range's rows once for each entry that
 replica applies, the only thing that changes it; a chunk to its volume's node, in-process for the
@@ -1870,7 +1889,15 @@ conditional reads in each order AWS documents, a checksum and a `Content-MD5` re
 committed, ranges, heads, deletes conditional and not, a versioned bucket's stacked delete
 markers, missing keys and buckets, another principal refused, a bucket deleted only once empty and
 made again, and 1,050 keys listed in pages of 1,000 and of 97 through the three nodes in turn, every
-key once and in order.
+key once and in order. And (`a_multipart_upload_completes_through_another_node_with_one_killed_between_parts`):
+an upload whose parts go through different nodes, one node killed by `SIGKILL` and started again
+between parts, a part sent again, completes through another node into an object whose bytes,
+ETag (MD5 of the parts' MD5s, `-3`) and full-object CRC-64/NVME are S3's, asked again with the same
+answer, read back whole and across a part's edge through every node, no block of it with two
+chunks on one node; parts list a page at a time and the upload among the bucket's; every refusal is
+S3's code (a part number of 0 or 10,001, an upload not there, a stale ETag, parts out of order, a
+part not the last under 5 MiB, a checksum type its algorithm lacks); and an upload aborted is
+neither listed nor readable, its second abort finding none.
 
 ### 5.2 Chunks
 

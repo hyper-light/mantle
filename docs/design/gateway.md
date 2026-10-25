@@ -94,7 +94,10 @@ point:
    Preconditions, versioning and Object Lock are judged there (metadata.md §2); a node's host
    gives the request's `If-Match` and `If-None-Match` to the commit as the tags they name
    (`mantle_s3::conditional::named`), and its checksum and `Content-MD5` to the body's end, which
-   checks them before the file is written (node.md §5.1, as built). An empty
+   checks them before the file is written (node.md §5.1, as built). A part goes the same way to
+   the Name range's `PutPart`, and a completion through `mantle_gateway::complete`, its upload's
+   row and parts read by ReadIndex and the object's file of parts written before its `Complete`
+   commits (node.md §5.1, as built). An empty
    object has no file and no File range to give it a deadline: its write carries the file ID
    drawn in step 1 as its own ID, and a deadline of the same handover time from the gateway's
    clock when it commits, so the Name range recognises a copy of it as it would a file's

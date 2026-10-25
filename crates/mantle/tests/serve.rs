@@ -1602,3 +1602,401 @@ fn s3s_operations_answer_as_s3_does_through_every_node() {
         ObjectStatus::NoSuchKey
     );
 }
+
+/// The blocks of `key`'s current version in bucket `bucket`, each with the nodes its chunks are
+/// on, through its file's extents and, for an object of parts, each part's file's.
+fn blocks_of(cell: &mut Cell, bucket: &str, key: &str) -> Vec<(u128, Vec<u64>)> {
+    use mantle_meta::record::Target;
+    let node_of: BTreeMap<u128, u64> = cell.table().iter().map(|p| (p.volume, p.node)).collect();
+    let current = cell.read(vec![(
+        GROUP,
+        Query::Current {
+            bucket: bucket.into(),
+            key: key.into(),
+        },
+    )]);
+    let [Ok(Read::Current(Some((_, version))))] = current.as_slice() else {
+        panic!("{key}: {current:?}");
+    };
+    let mut files: Vec<u128> = version.file.into_iter().collect();
+    let mut blocks = Vec::new();
+    // Each file's extents a page at a time; a part's file is read as its own file (gateway.md §3).
+    while let Some(file) = files.pop() {
+        let mut offset = 0;
+        loop {
+            let extents = cell.read(vec![(
+                FILES,
+                Query::Extents {
+                    file,
+                    offset,
+                    max: 16,
+                },
+            )]);
+            let [Ok(Read::Extents(extents))] = extents.as_slice() else {
+                panic!("{key}'s extents: {extents:?}");
+            };
+            let Some((last, extent)) = extents.last() else {
+                break;
+            };
+            offset = last + extent.length;
+            for (_, extent) in extents {
+                match extent.target {
+                    Target::File(part) => files.push(part),
+                    Target::Block(block) => {
+                        let read = cell.read(vec![(BLOCKS, Query::Block { block })]);
+                        let [Ok(Read::Block(Some((_, places))))] = read.as_slice() else {
+                            panic!("{key}'s block: {read:?}");
+                        };
+                        let nodes = places.iter().map(|p| node_of[&p.volume]).collect();
+                        blocks.push((block, nodes));
+                    }
+                }
+            }
+        }
+    }
+    blocks
+}
+
+/// A multipart upload's parts sent through different nodes, a node killed by `SIGKILL` and started
+/// again between parts, complete through another node into an object whose bytes, ETag and
+/// checksum are S3's for those parts, no block of it with two chunks on one node; a part uploaded
+/// again is the one kept, a completion asked again answers the same, an aborted upload leaves
+/// nothing listed or readable, and each refusal research/05 records is S3's code (05 §4).
+#[test]
+fn a_multipart_upload_completes_through_another_node_with_one_killed_between_parts() {
+    use mantle_meta::record;
+    use mantle_s3::checksum::{self, Algorithm};
+
+    let mut cell = Cell::served(NODES);
+    for id in 1..=NODES {
+        cell.enlisted(id);
+    }
+    assert_eq!(
+        status(
+            &mut cell,
+            1,
+            Op::Create {
+                bucket: "m".into(),
+                id: 1,
+            }
+        ),
+        ObjectStatus::Done
+    );
+    let create = |key: &str, id| Op::CreateUpload {
+        bucket: "m".into(),
+        key: key.into(),
+        id,
+        checksum: Some((Algorithm::Crc64Nvme, true)),
+    };
+    let part = |key: &str, upload: &str, number, id, data: &[u8]| Op::UploadPart {
+        bucket: "m".into(),
+        key: key.into(),
+        upload: upload.into(),
+        number,
+        id,
+        length: data.len() as u64,
+        checksum: Some(checksum::checksum(Algorithm::Crc64Nvme, data).unwrap()),
+        md5: None,
+    };
+    let complete = |key: &str, upload: &str, id, parts: &[(u16, &str)]| Op::Complete {
+        bucket: "m".into(),
+        key: key.into(),
+        upload: upload.into(),
+        id,
+        headers: Headers::default(),
+        parts: parts.iter().map(|(n, e)| (*n, (*e).to_owned())).collect(),
+    };
+    let list_parts = |upload: &str, after, max| Op::ListParts {
+        bucket: "m".into(),
+        key: "big".into(),
+        upload: upload.into(),
+        after,
+        max,
+    };
+    let uploads = || Op::ListUploads {
+        bucket: "m".into(),
+        prefix: String::new(),
+        delimiter: String::new(),
+        key_marker: None,
+        id_marker: None,
+        max: 1000,
+    };
+    let listed_uploads = |reply: Reply| match reply.listing {
+        Some(Listing::Uploads(page)) => page
+            .uploads
+            .into_iter()
+            .map(|u| (u.key, u.id))
+            .collect::<Vec<_>>(),
+        _ => panic!("{reply:?}"),
+    };
+
+    // The upload made through node 1; its first parts through nodes 1 and 2.
+    let (made, _) = ask(&mut cell, 1, create("big", 10), Vec::new());
+    assert_eq!(made.status, ObjectStatus::Done);
+    let upload = made.upload.clone();
+    assert_eq!(upload.len(), 13, "{made:?}");
+    let a = object_bytes(1, 5 << 20);
+    let b_first = object_bytes(2, 5 << 20);
+    let b = object_bytes(3, 5 << 20);
+    let c = object_bytes(4, 1 << 20);
+    let (one, _) = ask(&mut cell, 1, part("big", &upload, 1, 11, &a), a.clone());
+    assert_eq!(
+        (one.status, one.etag.clone()),
+        (ObjectStatus::Done, etag_of(&a))
+    );
+    let (first_two, _) = ask(
+        &mut cell,
+        2,
+        part("big", &upload, 2, 12, &b_first),
+        b_first.clone(),
+    );
+    assert_eq!(first_two.status, ObjectStatus::Done);
+
+    // Node 1 killed and started again between parts: part 2 sent again through node 3 is the one
+    // kept, and part 3 goes through the node started again.
+    cell.kill(1);
+    cell.start(1);
+    cell.introduce();
+    cell.enlisted(1);
+    let (two, _) = ask(&mut cell, 3, part("big", &upload, 2, 13, &b), b.clone());
+    let (three, _) = ask(&mut cell, 1, part("big", &upload, 3, 14, &c), c.clone());
+    assert_eq!(
+        (two.status, three.status),
+        (ObjectStatus::Done, ObjectStatus::Done)
+    );
+    assert_eq!(
+        (two.etag.clone(), three.etag.clone()),
+        (etag_of(&b), etag_of(&c))
+    );
+
+    // Listed a page at a time through node 2, and among the bucket's uploads through node 3.
+    let page = |reply: Reply| match reply.listing {
+        Some(Listing::Parts(page)) => page,
+        _ => panic!("{reply:?}"),
+    };
+    let first = page(ask(&mut cell, 2, list_parts(&upload, 0, 2), Vec::new()).0);
+    assert_eq!(
+        first
+            .parts
+            .iter()
+            .map(|p| (p.number, p.etag.clone(), p.size))
+            .collect::<Vec<_>>(),
+        [(1, etag_of(&a), 5 << 20), (2, etag_of(&b), 5 << 20)]
+    );
+    assert_eq!((first.truncated, first.next), (true, Some(2)));
+    let rest = page(ask(&mut cell, 2, list_parts(&upload, 2, 2), Vec::new()).0);
+    assert_eq!(rest.parts.iter().map(|p| p.number).collect::<Vec<_>>(), [3]);
+    assert!(!rest.truncated && rest.next.is_none());
+    let crc_of = |data: &[u8]| {
+        checksum::checksum(Algorithm::Crc64Nvme, data)
+            .unwrap()
+            .bytes
+    };
+    assert_eq!(rest.parts[0].checksum, Some(crc_of(&c)));
+    assert_eq!(
+        listed_uploads(ask(&mut cell, 3, uploads(), Vec::new()).0),
+        [("big".to_owned(), upload.clone())]
+    );
+
+    // Each refusal S3's (05 §4.3–§4.4): a part number outside 1 to 10,000, an upload not there, a
+    // listed ETag the part does not have, parts out of order, a part not the last under 5 MiB.
+    let small = vec![7u8; 1_000];
+    for number in [0, 10_001] {
+        let (refused, _) = ask(
+            &mut cell,
+            2,
+            part("big", &upload, number, 20, &small),
+            small.clone(),
+        );
+        assert_eq!(
+            refused.status,
+            ObjectStatus::InvalidArgument,
+            "part {number}"
+        );
+    }
+    let none = "0000000000000";
+    let (unknown, _) = ask(
+        &mut cell,
+        3,
+        part("big", none, 1, 21, &small),
+        small.clone(),
+    );
+    assert_eq!(unknown.status, ObjectStatus::NoSuchUpload);
+    let (e1, e2, e3) = (etag_of(&a), etag_of(&b), etag_of(&c));
+    let stale = etag_of(&b_first);
+    let cases = [
+        (
+            vec![(1, e1.as_str()), (2, stale.as_str()), (3, e3.as_str())],
+            ObjectStatus::InvalidPart,
+        ),
+        (
+            vec![(2, e2.as_str()), (1, e1.as_str()), (3, e3.as_str())],
+            ObjectStatus::InvalidPartOrder,
+        ),
+        (
+            vec![(1, e1.as_str()), (9_999, e3.as_str())],
+            ObjectStatus::InvalidPart,
+        ),
+    ];
+    for (n, (parts, expected)) in cases.iter().enumerate() {
+        let node = 1 + n as u64 % NODES;
+        assert_eq!(
+            status(&mut cell, node, complete("big", &upload, 30, parts)),
+            *expected,
+            "case {n}"
+        );
+    }
+    assert_eq!(
+        status(&mut cell, 1, complete("big", none, 31, &[(1, e1.as_str())])),
+        ObjectStatus::NoSuchUpload
+    );
+    let (tiny, _) = ask(&mut cell, 2, create("tiny", 40), Vec::new());
+    for (number, id) in [(1, 41), (2, 42)] {
+        let (sent, _) = ask(
+            &mut cell,
+            3,
+            part("tiny", &tiny.upload, number, id, &small),
+            small.clone(),
+        );
+        assert_eq!(sent.status, ObjectStatus::Done);
+    }
+    let tiny_tag = etag_of(&small);
+    let both = [(1, tiny_tag.as_str()), (2, tiny_tag.as_str())];
+    assert_eq!(
+        status(&mut cell, 1, complete("tiny", &tiny.upload, 43, &both)),
+        ObjectStatus::EntityTooSmall
+    );
+    let hashed_whole = Op::CreateUpload {
+        bucket: "m".into(),
+        key: "hashed".into(),
+        id: 44,
+        checksum: Some((Algorithm::Sha256, true)),
+    };
+    assert_eq!(
+        status(&mut cell, 2, hashed_whole),
+        ObjectStatus::InvalidRequest
+    );
+
+    // Completed through node 2, with node 3 asked again: the same version, ETag and checksum.
+    let listed = [(1, e1.as_str()), (2, e2.as_str()), (3, e3.as_str())];
+    let (done_once, _) = ask(
+        &mut cell,
+        2,
+        complete("big", &upload, 50, &listed),
+        Vec::new(),
+    );
+    assert_eq!(done_once.status, ObjectStatus::Done, "{done_once:?}");
+    let digests: Vec<[u8; 16]> = [&a, &b, &c]
+        .iter()
+        .map(|d| {
+            let md5 = checksum::checksum(Algorithm::Md5, d).unwrap();
+            md5.bytes.try_into().unwrap()
+        })
+        .collect();
+    assert_eq!(done_once.etag, checksum::multipart_etag(&digests).unwrap());
+    assert!(done_once.etag.ends_with("-3"));
+    let whole: Vec<u8> = [a.as_slice(), &b, &c].concat();
+    assert_eq!(
+        done_once.checksum,
+        Some(record::Checksum {
+            algorithm: Algorithm::Crc64Nvme.code(),
+            parts: 0,
+            value: crc_of(&whole),
+        })
+    );
+    let (done_twice, _) = ask(
+        &mut cell,
+        3,
+        complete("big", &upload, 50, &listed),
+        Vec::new(),
+    );
+    assert_eq!(
+        (
+            done_twice.status,
+            &done_twice.version,
+            &done_twice.etag,
+            &done_twice.checksum
+        ),
+        (
+            ObjectStatus::Done,
+            &done_once.version,
+            &done_once.etag,
+            &done_once.checksum
+        )
+    );
+    assert!(
+        listed_uploads(ask(&mut cell, 1, uploads(), Vec::new()).0)
+            .iter()
+            .all(|(key, _)| key != "big")
+    );
+
+    // Read back whole and across a part's edge through each node; no block with two chunks on
+    // one node.
+    for node in 1..=NODES {
+        let (read, bytes) = ask(&mut cell, node, get_op("m", "big", None), Vec::new());
+        assert_eq!(
+            (read.status, read.size),
+            (ObjectStatus::Done, whole.len() as u64)
+        );
+        assert_eq!(read.etag, done_once.etag);
+        assert!(bytes == whole, "node {node}: other bytes");
+        let edge = (5 << 20) - 10;
+        let range = format!("bytes={edge}-{}", edge + 19);
+        let (_, bytes) = ask(&mut cell, node, get_op("m", "big", Some(range)), Vec::new());
+        assert!(bytes == whole[edge..edge + 20], "node {node}: the edge");
+    }
+    let blocks = blocks_of(&mut cell, "m", "big");
+    assert!(!blocks.is_empty());
+    let shared: Vec<&(u128, Vec<u64>)> = blocks
+        .iter()
+        .filter(|(_, nodes)| nodes.iter().collect::<BTreeSet<_>>().len() != nodes.len())
+        .collect();
+    assert!(
+        shared.is_empty(),
+        "blocks with two chunks on one node: {shared:?}"
+    );
+
+    // An upload aborted leaves nothing listed or readable, and a second abort finds none.
+    let (gone, _) = ask(&mut cell, 3, create("gone", 60), Vec::new());
+    let (sent, _) = ask(
+        &mut cell,
+        1,
+        part("gone", &gone.upload, 1, 61, &small),
+        small.clone(),
+    );
+    assert_eq!(sent.status, ObjectStatus::Done);
+    let abort = |id| Op::Abort {
+        bucket: "m".into(),
+        key: "gone".into(),
+        upload: gone.upload.clone(),
+        id,
+    };
+    assert_eq!(status(&mut cell, 2, abort(62)), ObjectStatus::Done);
+    assert_eq!(status(&mut cell, 3, abort(63)), ObjectStatus::NoSuchUpload);
+    let gone_parts = Op::ListParts {
+        bucket: "m".into(),
+        key: "gone".into(),
+        upload: gone.upload.clone(),
+        after: 0,
+        max: 1000,
+    };
+    assert_eq!(status(&mut cell, 1, gone_parts), ObjectStatus::NoSuchUpload);
+    let one_tag = etag_of(&small);
+    assert_eq!(
+        status(
+            &mut cell,
+            2,
+            complete("gone", &gone.upload, 64, &[(1, one_tag.as_str())])
+        ),
+        ObjectStatus::NoSuchUpload
+    );
+    assert!(
+        listed_uploads(ask(&mut cell, 3, uploads(), Vec::new()).0)
+            .iter()
+            .all(|(key, _)| key != "gone")
+    );
+    assert_eq!(
+        status(&mut cell, 1, get_op("m", "gone", None)),
+        ObjectStatus::NoSuchKey
+    );
+}

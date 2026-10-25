@@ -30,6 +30,12 @@
 //! | 8 | DeleteBucket | the bucket |
 //! | 9 | PutBucketVersioning | the bucket; its state (u8): 2 enabled, 3 suspended |
 //! | 10 | GetBucketVersioning | the bucket |
+//! | 11 | CreateMultipartUpload | the bucket and the key; the checksum its parts carry, optional: its algorithm's code (u8) and whether its values combine as one full-object value (u8) |
+//! | 12 | UploadPart | the bucket and the key; the upload's ID; the part's number (u16); the checksum, optional, and `Content-MD5`, optional, as a put's |
+//! | 13 | CompleteMultipartUpload | the bucket and the key; the upload's ID; the headers; the parts it lists (a u32 count), each its number (u16) and the ETag its upload answered, bare of quotes, in ascending order |
+//! | 14 | AbortMultipartUpload | the bucket and the key; the upload's ID |
+//! | 15 | ListParts | the bucket and the key; the upload's ID; the part number after which the page starts (u16); the most parts (u32) |
+//! | 16 | ListMultipartUploads | the bucket; the prefix; the delimiter, empty for none; the key marker and the upload ID marker, each optional; the most uploads (u32) |
 //!
 //! The headers are the values of S3's request headers an object's operation takes as text, each
 //! optional: `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since` and `Range`,
@@ -46,13 +52,19 @@
 //! combines (u16, 0 for a full-object value) and its value, its length (u8) before it; whether the
 //! version is a delete marker (u8); the bytes a range served, optional: its first and last (u64
 //! each), S3's `206 Partial Content`; the bucket's versioning, GetBucketVersioning's (u8): 0 none
-//! asked, 1 never set, 2 enabled, 3 suspended; then the listing, behind a byte: 0 none, 1 a page of
-//! keys, 2 a page of buckets. A page of keys: whether it is truncated (u8); where the next page starts,
+//! asked, 1 never set, 2 enabled, 3 suspended; the upload's ID, CreateMultipartUpload's, a text;
+//! then the listing, behind a byte: 0 none, 1 a page of keys, 2 a page of buckets, 3 a page of
+//! parts, 4 a page of uploads. A page of keys: whether it is truncated (u8); where the next page starts,
 //! optional, as a request names it; the count of keys (u32), each its key, ETag, size (u64),
 //! Last-Modified (u64), checksum algorithm, optional, its code (u8) and parts (u16), and owner,
 //! optional, a text; the count of common prefixes (u32), each a text. A page of buckets: the
 //! count (u32), each its name and creation (u64, whole seconds); the bucket after which the next
-//! page starts, optional.
+//! page starts, optional. A page of parts: whether it is truncated (u8); the part number the next
+//! page starts after, optional (u16); the count (u32), each its number (u16), ETag, size (u64),
+//! Last-Modified (u64) and checksum value, optional, its length (u8) before it. A page of uploads:
+//! whether it is truncated (u8); where the next page starts, optional, a key and an upload's ID;
+//! the count of uploads (u32), each its key, ID, initiation (u64, whole seconds) and owner; the
+//! count of common prefixes (u32), each a text.
 //!
 //! Numbers are little-endian. Every text is within S3's bound on what it names, and every count
 //! within S3's page: a message past them is refused whole.
@@ -74,6 +86,12 @@ const LIST_BUCKETS: u8 = 7;
 const DELETE_BUCKET: u8 = 8;
 const PUT_VERSIONING: u8 = 9;
 const GET_VERSIONING: u8 = 10;
+const CREATE_UPLOAD: u8 = 11;
+const UPLOAD_PART: u8 = 12;
+const COMPLETE: u8 = 13;
+const ABORT: u8 = 14;
+const LIST_PARTS: u8 = 15;
+const LIST_UPLOADS: u8 = 16;
 
 /// The longest version id or ETag a reply carries: a multipart object's ETag, bare of quotes, an
 /// MD5's 32 hex digits, `-` and its count of parts, at most `MAX_PARTS`'s five digits
@@ -85,7 +103,14 @@ pub const MAX_TAG: usize = "d41d8cd98f00b204e9800998ecf8427e-10000".len();
 pub const MAX_BUCKETS: usize = 10_000;
 
 /// The longest checksum value: SHA-512's 64 bytes (05 §3.1).
-const MAX_CHECKSUM: usize = Algorithm::Sha512.width();
+pub(crate) const MAX_CHECKSUM: usize = Algorithm::Sha512.width();
+
+/// The most parts a page of ListParts lists, and the most uploads a page of ListMultipartUploads
+/// does: S3's 1,000 for each (05 §4.1, §4.7).
+pub const MAX_PAGE_PARTS: usize = 1000;
+
+/// The most parts an upload has and a completion lists: S3's 10,000 (05 §4.1).
+const MAX_PARTS: usize = mantle_s3::body::MAX_PARTS as usize;
 
 /// The bytes of an object's request head: the kind, the fields' length, the identity and a put's
 /// length.
@@ -93,16 +118,24 @@ pub const HEAD_BYTES: usize = 1 + 4 + 16 + 8;
 /// The bytes of a reply's head: the status, the size and the fields' length.
 pub const REPLY_HEAD_BYTES: usize = 1 + 8 + 4;
 
-/// A request's fields at most: the longest of a put's (its names, its headers within S3's 8 KB,
-/// a checksum and an MD5) and a listing's (its bucket, prefix, delimiter and start).
+/// A request's fields at most: the longest of a put's or a part's (its names, an upload's ID and a
+/// part's number, its headers within S3's 8 KB, a checksum and an MD5), a listing's (its bucket,
+/// prefix, delimiter and start) and a completion's (its names, the upload's ID, its headers and
+/// S3's 10,000 parts, each its number and ETag).
 pub const MAX_FIELDS: usize = {
     // Each text behind its length, a u32.
     let names = (4 + MAX_BUCKET) + (4 + MAX_KEY);
     // Five optional texts within S3's headers.
     let headers = 5 * (1 + 4) + MAX_HEADERS;
-    let put = names + headers + (1 + 1 + 1 + MAX_CHECKSUM) + (1 + 16);
+    let put = names + (4 + MAX_TAG) + 2 + headers + (1 + 1 + 1 + MAX_CHECKSUM) + (1 + 16);
     let list = (4 + MAX_BUCKET) + 2 * (4 + MAX_KEY) + (1 + 1 + 4 + MAX_KEY) + 4 + 1;
-    if put > list { put } else { list }
+    let complete = names + (4 + MAX_TAG) + headers + 4 + MAX_PARTS * (2 + 4 + MAX_TAG);
+    let longest = if put > list { put } else { list };
+    if complete > longest {
+        complete
+    } else {
+        longest
+    }
 };
 
 /// A key's bytes at most in a page of keys: its key, ETag, size, Last-Modified, checksum
@@ -111,12 +144,27 @@ pub(crate) const LISTED_BYTES: usize =
     (4 + MAX_KEY) + (4 + MAX_TAG) + 8 + 8 + (1 + 1 + 2) + (1 + 4 + MAX_OWNER);
 
 /// A reply's fields at most: the version's facts and the longest listing, a page of S3's 1,000
-/// keys at their longest or of 10,000 buckets.
+/// keys, 1,000 parts or 1,000 uploads at their longest, or of 10,000 buckets.
 pub const MAX_REPLY_FIELDS: usize = {
-    let facts = 2 * (4 + MAX_TAG) + 8 + (1 + 1 + 2 + 1 + MAX_CHECKSUM) + 1 + (1 + 8 + 8) + 1;
+    let facts = 2 * (4 + MAX_TAG)
+        + 8
+        + (1 + 1 + 2 + 1 + MAX_CHECKSUM)
+        + 1
+        + (1 + 8 + 8)
+        + 1
+        + (4 + MAX_TAG);
     let keys = PAGE_BYTES + MAX_KEYS * LISTED_BYTES;
     let buckets = 4 + MAX_BUCKETS * (4 + MAX_BUCKET + 8) + (1 + 4 + MAX_BUCKET);
-    facts + 1 + if keys > buckets { keys } else { buckets }
+    let parts = PARTS_HEAD_BYTES + MAX_PAGE_PARTS * PART_BYTES;
+    let uploads = UPLOADS_HEAD_BYTES + MAX_PAGE_PARTS * UPLOAD_BYTES;
+    let mut longest = if keys > buckets { keys } else { buckets };
+    if parts > longest {
+        longest = parts;
+    }
+    if uploads > longest {
+        longest = uploads;
+    }
+    facts + 1 + longest
 };
 
 /// The values of S3's request headers an object's operation takes as text, as a request sends
@@ -221,6 +269,61 @@ pub enum Op {
     },
     /// GetBucketVersioning.
     GetVersioning { bucket: String },
+    /// CreateMultipartUpload, with the checksum algorithm its parts carry and whether its values
+    /// combine as one full-object value or a composite (05 §3.3).
+    CreateUpload {
+        bucket: String,
+        key: String,
+        id: u128,
+        checksum: Option<(Algorithm, bool)>,
+    },
+    /// UploadPart: part `number` of `upload`, `length` bytes following the fields, checked as a
+    /// put's are.
+    UploadPart {
+        bucket: String,
+        key: String,
+        upload: String,
+        number: u16,
+        id: u128,
+        length: u64,
+        checksum: Option<Checksum>,
+        md5: Option<[u8; 16]>,
+    },
+    /// CompleteMultipartUpload: the parts it lists, each its number and the ETag its upload
+    /// answered, bare of quotes, in ascending order (05 §4.4).
+    Complete {
+        bucket: String,
+        key: String,
+        upload: String,
+        id: u128,
+        headers: Headers,
+        parts: Vec<(u16, String)>,
+    },
+    /// AbortMultipartUpload.
+    Abort {
+        bucket: String,
+        key: String,
+        upload: String,
+        id: u128,
+    },
+    /// ListParts: the upload's parts numbered after `after`, at most `max` (05 §4.6).
+    ListParts {
+        bucket: String,
+        key: String,
+        upload: String,
+        after: u16,
+        max: u32,
+    },
+    /// ListMultipartUploads (05 §4.7).
+    ListUploads {
+        bucket: String,
+        prefix: String,
+        /// No delimiter when empty.
+        delimiter: String,
+        key_marker: Option<String>,
+        id_marker: Option<String>,
+        max: u32,
+    },
 }
 
 /// A versioning state as a message carries it.
@@ -317,6 +420,52 @@ fn take_headers(r: &mut Reader<'_>) -> Option<Headers> {
     if total <= MAX_HEADERS { Some(c) } else { None }
 }
 
+/// A body's checksum and `Content-MD5`, each optional, as a put or a part states them.
+fn put_digests(
+    w: &mut Writer,
+    checksum: Option<&Checksum>,
+    md5: Option<&[u8; 16]>,
+) -> Result<(), ObjectError> {
+    put_flag(w, checksum.is_some());
+    if let Some(c) = checksum {
+        if c.bytes.len() != c.algorithm.width() {
+            return Err(ObjectError::TooLong(c.bytes.len()));
+        }
+        w.u8(c.algorithm.code());
+        w.u8(u8::try_from(c.bytes.len()).map_err(|_| ObjectError::TooLong(0))?);
+        w.bytes(&c.bytes);
+    }
+    put_flag(w, md5.is_some());
+    if let Some(md5) = md5 {
+        w.bytes(md5);
+    }
+    Ok(())
+}
+
+type Digests = (Option<Checksum>, Option<[u8; 16]>);
+
+fn take_digests(r: &mut Reader<'_>) -> Option<Digests> {
+    let checksum = if take_flag(r)? {
+        let algorithm = Algorithm::from_code(r.u8()?)?;
+        let len = usize::from(r.u8()?);
+        if len != algorithm.width() {
+            return None;
+        }
+        Some(Checksum {
+            algorithm,
+            bytes: r.take(len)?.to_vec(),
+        })
+    } else {
+        None
+    };
+    let md5 = if take_flag(r)? {
+        Some(<[u8; 16]>::try_from(r.take(16)?).ok()?)
+    } else {
+        None
+    };
+    Some((checksum, md5))
+}
+
 fn put_resume(w: &mut Writer, start: Option<&Resume>) -> Result<(), ObjectError> {
     put_flag(w, start.is_some());
     match start {
@@ -375,24 +524,7 @@ impl Head {
                 PUT => {
                     let (bucket, key) = object(&mut r)?;
                     let headers = take_headers(&mut r)?;
-                    let checksum = if take_flag(&mut r)? {
-                        let algorithm = Algorithm::from_code(r.u8()?)?;
-                        let len = usize::from(r.u8()?);
-                        if len != algorithm.width() {
-                            return None;
-                        }
-                        Some(Checksum {
-                            algorithm,
-                            bytes: r.take(len)?.to_vec(),
-                        })
-                    } else {
-                        None
-                    };
-                    let md5 = if take_flag(&mut r)? {
-                        Some(<[u8; 16]>::try_from(r.take(16)?).ok()?)
-                    } else {
-                        None
-                    };
+                    let (checksum, md5) = take_digests(&mut r)?;
                     Op::Put {
                         bucket,
                         key,
@@ -451,6 +583,82 @@ impl Head {
                 GET_VERSIONING => Op::GetVersioning {
                     bucket: take_text(&mut r, MAX_BUCKET)?,
                 },
+                CREATE_UPLOAD => {
+                    let (bucket, key) = object(&mut r)?;
+                    let checksum = if take_flag(&mut r)? {
+                        Some((Algorithm::from_code(r.u8()?)?, take_flag(&mut r)?))
+                    } else {
+                        None
+                    };
+                    Op::CreateUpload {
+                        bucket,
+                        key,
+                        id: self.id,
+                        checksum,
+                    }
+                }
+                UPLOAD_PART => {
+                    let (bucket, key) = object(&mut r)?;
+                    let upload = take_text(&mut r, MAX_TAG)?;
+                    let number = r.u16()?;
+                    let (checksum, md5) = take_digests(&mut r)?;
+                    Op::UploadPart {
+                        bucket,
+                        key,
+                        upload,
+                        number,
+                        id: self.id,
+                        length: self.length,
+                        checksum,
+                        md5,
+                    }
+                }
+                COMPLETE => {
+                    let (bucket, key) = object(&mut r)?;
+                    let upload = take_text(&mut r, MAX_TAG)?;
+                    let headers = take_headers(&mut r)?;
+                    // A part takes 6 bytes at least.
+                    let count = take_count(&mut r, MAX_PARTS, 6)?;
+                    let mut parts = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        parts.push((r.u16()?, take_text(&mut r, MAX_TAG)?));
+                    }
+                    Op::Complete {
+                        bucket,
+                        key,
+                        upload,
+                        id: self.id,
+                        headers,
+                        parts,
+                    }
+                }
+                ABORT => {
+                    let (bucket, key) = object(&mut r)?;
+                    Op::Abort {
+                        bucket,
+                        key,
+                        upload: take_text(&mut r, MAX_TAG)?,
+                        id: self.id,
+                    }
+                }
+                LIST_PARTS => {
+                    let (bucket, key) = object(&mut r)?;
+                    Op::ListParts {
+                        bucket,
+                        key,
+                        upload: take_text(&mut r, MAX_TAG)?,
+                        after: r.u16()?,
+                        max: r.u32()?,
+                    }
+                }
+                LIST_UPLOADS => Op::ListUploads {
+                    bucket: take_text(&mut r, MAX_BUCKET)?,
+                    prefix: take_text(&mut r, MAX_KEY)?,
+                    delimiter: take_text(&mut r, MAX_KEY)?,
+                    key_marker: take_optional_text(&mut r, MAX_KEY)?,
+                    id_marker: take_optional_text(&mut r, MAX_TAG)?,
+                    max: r.u32()?,
+                },
                 _ => return None,
             })
         })();
@@ -474,8 +682,8 @@ impl Head {
         let head_of = || ObjectError::Head(head.len());
         let decoded = decoded.ok_or_else(head_of)?;
         let within = usize::try_from(decoded.fields).is_ok_and(|f| f <= MAX_FIELDS)
-            && decoded.kind <= GET_VERSIONING
-            && (decoded.kind == PUT || decoded.length == 0);
+            && decoded.kind <= LIST_UPLOADS
+            && (matches!(decoded.kind, PUT | UPLOAD_PART) || decoded.length == 0);
         if !within || decoded.fields().checked_add(decoded.length) != Some(body.unwrap_or(0)) {
             return Err(head_of());
         }
@@ -507,19 +715,7 @@ impl Op {
             } => {
                 object(&mut f, bucket, key)?;
                 put_headers(&mut f, headers)?;
-                put_flag(&mut f, checksum.is_some());
-                if let Some(c) = checksum {
-                    if c.bytes.len() != c.algorithm.width() {
-                        return Err(ObjectError::TooLong(c.bytes.len()));
-                    }
-                    f.u8(c.algorithm.code());
-                    f.u8(u8::try_from(c.bytes.len()).map_err(|_| ObjectError::TooLong(0))?);
-                    f.bytes(&c.bytes);
-                }
-                put_flag(&mut f, md5.is_some());
-                if let Some(md5) = md5 {
-                    f.bytes(md5);
-                }
+                put_digests(&mut f, checksum.as_ref(), md5.as_ref())?;
                 (PUT, *id, *length)
             }
             Self::Get {
@@ -587,6 +783,96 @@ impl Op {
                 put_text(&mut f, bucket, MAX_BUCKET)?;
                 (GET_VERSIONING, 0, 0)
             }
+            Self::CreateUpload {
+                bucket,
+                key,
+                id,
+                checksum,
+            } => {
+                object(&mut f, bucket, key)?;
+                put_flag(&mut f, checksum.is_some());
+                if let Some((algorithm, full_object)) = checksum {
+                    f.u8(algorithm.code());
+                    put_flag(&mut f, *full_object);
+                }
+                (CREATE_UPLOAD, *id, 0)
+            }
+            Self::UploadPart {
+                bucket,
+                key,
+                upload,
+                number,
+                id,
+                length,
+                checksum,
+                md5,
+            } => {
+                object(&mut f, bucket, key)?;
+                put_text(&mut f, upload, MAX_TAG)?;
+                f.u16(*number);
+                put_digests(&mut f, checksum.as_ref(), md5.as_ref())?;
+                (UPLOAD_PART, *id, *length)
+            }
+            Self::Complete {
+                bucket,
+                key,
+                upload,
+                id,
+                headers,
+                parts,
+            } => {
+                object(&mut f, bucket, key)?;
+                put_text(&mut f, upload, MAX_TAG)?;
+                put_headers(&mut f, headers)?;
+                if parts.len() > MAX_PARTS {
+                    return Err(ObjectError::TooLong(parts.len()));
+                }
+                put_count(&mut f, parts.len())?;
+                for (number, etag) in parts {
+                    f.u16(*number);
+                    put_text(&mut f, etag, MAX_TAG)?;
+                }
+                (COMPLETE, *id, 0)
+            }
+            Self::Abort {
+                bucket,
+                key,
+                upload,
+                id,
+            } => {
+                object(&mut f, bucket, key)?;
+                put_text(&mut f, upload, MAX_TAG)?;
+                (ABORT, *id, 0)
+            }
+            Self::ListParts {
+                bucket,
+                key,
+                upload,
+                after,
+                max,
+            } => {
+                object(&mut f, bucket, key)?;
+                put_text(&mut f, upload, MAX_TAG)?;
+                f.u16(*after);
+                f.u32(*max);
+                (LIST_PARTS, 0, 0)
+            }
+            Self::ListUploads {
+                bucket,
+                prefix,
+                delimiter,
+                key_marker,
+                id_marker,
+                max,
+            } => {
+                put_text(&mut f, bucket, MAX_BUCKET)?;
+                put_text(&mut f, prefix, MAX_KEY)?;
+                put_text(&mut f, delimiter, MAX_KEY)?;
+                put_optional_text(&mut f, key_marker.as_deref(), MAX_KEY)?;
+                put_optional_text(&mut f, id_marker.as_deref(), MAX_TAG)?;
+                f.u32(*max);
+                (LIST_UPLOADS, 0, 0)
+            }
         };
         let fields = f.into_vec();
         if fields.len() > MAX_FIELDS {
@@ -600,11 +886,13 @@ impl Op {
         Ok((w.into_vec(), fields))
     }
 
-    /// The bytes of the request's body: its fields and a put's object.
+    /// The bytes of the request's body: its fields and a put's or a part's bytes.
     pub fn body(&self, fields: &[u8]) -> u64 {
         let fields = u64::try_from(fields.len()).unwrap_or(u64::MAX);
         match self {
-            Self::Put { length, .. } => fields.saturating_add(*length),
+            Self::Put { length, .. } | Self::UploadPart { length, .. } => {
+                fields.saturating_add(*length)
+            }
             _ => fields,
         }
     }
@@ -656,9 +944,23 @@ pub enum Status {
     /// S3's `409 InvalidBucketState`: versioning suspended on a bucket Object Lock holds, which
     /// "can't ... suspend versioning" (18 §2.1).
     InvalidBucketState,
+    /// S3's `404 NoSuchUpload`: no such multipart upload, or it was aborted (05 §4.4).
+    NoSuchUpload,
+    /// S3's `400 InvalidPart`: a listed part was never uploaded or its ETag differs (05 §4.4).
+    InvalidPart,
+    /// S3's `400 InvalidPartOrder`: parts not listed in ascending order, or none (05 §4.4).
+    InvalidPartOrder,
+    /// S3's `400 EntityTooSmall`: a part other than the last under 5 MiB (05 §4.4).
+    EntityTooSmall,
+    /// S3's `400 InvalidArgument`: a part number outside 1 to 10,000, for which AWS names no
+    /// code (05 §4.3).
+    InvalidArgument,
+    /// S3's `400 InvalidRequest`: a checksum type its algorithm does not have, a full-object
+    /// hash or a composite CRC-64/NVME (05 §3.3).
+    InvalidRequest,
 }
 
-const STATUSES: [Status; 19] = [
+const STATUSES: [Status; 25] = [
     Status::Done,
     Status::NoSuchBucket,
     Status::NoSuchKey,
@@ -678,6 +980,12 @@ const STATUSES: [Status; 19] = [
     Status::BucketNotEmpty,
     Status::AccessDenied,
     Status::InvalidBucketState,
+    Status::NoSuchUpload,
+    Status::InvalidPart,
+    Status::InvalidPartOrder,
+    Status::EntityTooSmall,
+    Status::InvalidArgument,
+    Status::InvalidRequest,
 ];
 
 impl Status {
@@ -702,6 +1010,12 @@ impl Status {
             Self::BucketNotEmpty => 16,
             Self::AccessDenied => 17,
             Self::InvalidBucketState => 18,
+            Self::NoSuchUpload => 19,
+            Self::InvalidPart => 20,
+            Self::InvalidPartOrder => 21,
+            Self::EntityTooSmall => 22,
+            Self::InvalidArgument => 23,
+            Self::InvalidRequest => 24,
         }
     }
 
@@ -744,11 +1058,55 @@ pub struct Buckets {
     pub next: Option<String>,
 }
 
+/// A part a page of ListParts lists (05 §4.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartListed {
+    pub number: u16,
+    /// Bare of quotes.
+    pub etag: String,
+    pub size: u64,
+    /// Last-Modified, whole seconds.
+    pub modified: u64,
+    /// The part's checksum value, of the algorithm its upload names.
+    pub checksum: Option<Vec<u8>>,
+}
+
+/// A page of ListParts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Parts {
+    pub parts: Vec<PartListed>,
+    pub truncated: bool,
+    /// The part number the next page starts after, on a truncated page: `NextPartNumberMarker`.
+    pub next: Option<u16>,
+}
+
+/// An upload a page of ListMultipartUploads lists (05 §4.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadListed {
+    pub key: String,
+    pub id: String,
+    /// When it was initiated, whole seconds.
+    pub initiated: u64,
+    pub owner: String,
+}
+
+/// A page of ListMultipartUploads.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Uploads {
+    pub uploads: Vec<UploadListed>,
+    pub common_prefixes: Vec<String>,
+    pub truncated: bool,
+    /// Where the next page starts, on a truncated page: a key marker and an upload ID marker.
+    pub next: Option<(String, String)>,
+}
+
 /// What a reply lists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Listing {
     Keys(Page),
     Buckets(Buckets),
+    Parts(Parts),
+    Uploads(Uploads),
 }
 
 /// A reply: its head's status and size, and the fields its body opens with.
@@ -772,6 +1130,8 @@ pub struct Reply {
     pub range: Option<(u64, u64)>,
     /// The bucket's versioning, GetBucketVersioning's.
     pub versioning: Option<Versioning>,
+    /// The upload's ID, CreateMultipartUpload's; empty where none applies.
+    pub upload: String,
     pub listing: Option<Listing>,
 }
 
@@ -897,6 +1257,149 @@ pub(crate) fn take_page(r: &mut Reader<'_>) -> Option<Page> {
     })
 }
 
+/// A part in a page of parts at its longest: its number, its ETag behind its length, its size and
+/// Last-Modified, and its checksum's flag, length and value.
+pub(crate) const PART_BYTES: usize = 2 + (4 + MAX_TAG) + 8 + 8 + (1 + 1 + MAX_CHECKSUM);
+
+/// A page of parts' bytes beside its parts: whether it is truncated, the next marker behind its
+/// flag, and the count.
+pub(crate) const PARTS_HEAD_BYTES: usize = 1 + (1 + 2) + 4;
+
+pub(crate) fn put_parts(w: &mut Writer, page: &Parts) -> Result<(), ObjectError> {
+    if page.parts.len() > MAX_PAGE_PARTS {
+        return Err(ObjectError::TooLong(page.parts.len()));
+    }
+    put_flag(w, page.truncated);
+    put_flag(w, page.next.is_some());
+    if let Some(next) = page.next {
+        w.u16(next);
+    }
+    put_count(w, page.parts.len())?;
+    for part in &page.parts {
+        w.u16(part.number);
+        put_text(w, &part.etag, MAX_TAG)?;
+        w.u64(part.size);
+        w.u64(part.modified);
+        put_flag(w, part.checksum.is_some());
+        if let Some(c) = &part.checksum {
+            if c.len() > MAX_CHECKSUM {
+                return Err(ObjectError::TooLong(c.len()));
+            }
+            w.u8(u8::try_from(c.len()).map_err(|_| ObjectError::TooLong(c.len()))?);
+            w.bytes(c);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn take_parts(r: &mut Reader<'_>) -> Option<Parts> {
+    let truncated = take_flag(r)?;
+    let next = if take_flag(r)? { Some(r.u16()?) } else { None };
+    // A part takes 27 bytes at least.
+    let count = take_count(r, MAX_PAGE_PARTS, 27)?;
+    let mut parts = Vec::with_capacity(count);
+    for _ in 0..count {
+        parts.push(PartListed {
+            number: r.u16()?,
+            etag: take_text(r, MAX_TAG)?,
+            size: r.u64()?,
+            modified: r.u64()?,
+            checksum: if take_flag(r)? {
+                let len = usize::from(r.u8()?);
+                if len > MAX_CHECKSUM {
+                    return None;
+                }
+                Some(r.take(len)?.to_vec())
+            } else {
+                None
+            },
+        });
+    }
+    Some(Parts {
+        parts,
+        truncated,
+        next,
+    })
+}
+
+/// The bytes an upload takes in a page of uploads, as [`put_uploads`] writes it.
+pub(crate) fn upload_bytes(key: &str, id: &str, owner: &str) -> usize {
+    4usize
+        .saturating_add(key.len())
+        .saturating_add(4)
+        .saturating_add(id.len())
+        .saturating_add(8)
+        .saturating_add(4)
+        .saturating_add(owner.len())
+}
+
+/// An upload in a page of uploads at its longest: its key, ID, initiation and owner.
+pub(crate) const UPLOAD_BYTES: usize = (4 + MAX_KEY) + (4 + MAX_TAG) + 8 + (4 + MAX_OWNER);
+
+/// A page of uploads' bytes beside its uploads and common prefixes, at most: whether it is
+/// truncated, where the next page starts (its flag, a key and an ID), and the two counts.
+pub(crate) const UPLOADS_HEAD_BYTES: usize = 1 + (1 + 4 + MAX_KEY + 4 + MAX_TAG) + 4 + 4;
+
+pub(crate) fn put_uploads(w: &mut Writer, page: &Uploads) -> Result<(), ObjectError> {
+    if page
+        .uploads
+        .len()
+        .saturating_add(page.common_prefixes.len())
+        > MAX_PAGE_PARTS
+    {
+        return Err(ObjectError::TooLong(page.uploads.len()));
+    }
+    put_flag(w, page.truncated);
+    put_flag(w, page.next.is_some());
+    if let Some((key, id)) = &page.next {
+        put_text(w, key, MAX_KEY)?;
+        put_text(w, id, MAX_TAG)?;
+    }
+    put_count(w, page.uploads.len())?;
+    for upload in &page.uploads {
+        put_text(w, &upload.key, MAX_KEY)?;
+        put_text(w, &upload.id, MAX_TAG)?;
+        w.u64(upload.initiated);
+        put_text(w, &upload.owner, MAX_OWNER)?;
+    }
+    put_count(w, page.common_prefixes.len())?;
+    for prefix in &page.common_prefixes {
+        put_text(w, prefix, MAX_KEY)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn take_uploads(r: &mut Reader<'_>) -> Option<Uploads> {
+    let truncated = take_flag(r)?;
+    let next = if take_flag(r)? {
+        Some((take_text(r, MAX_KEY)?, take_text(r, MAX_TAG)?))
+    } else {
+        None
+    };
+    // An upload takes 20 bytes at least, a common prefix 4.
+    let count = take_count(r, MAX_PAGE_PARTS, 20)?;
+    let mut uploads = Vec::with_capacity(count);
+    for _ in 0..count {
+        uploads.push(UploadListed {
+            key: take_text(r, MAX_KEY)?,
+            id: take_text(r, MAX_TAG)?,
+            initiated: r.u64()?,
+            owner: take_text(r, MAX_OWNER)?,
+        });
+    }
+    let prefixes = take_count(r, MAX_PAGE_PARTS.checked_sub(count)?, 4)?;
+    let mut common_prefixes = Vec::with_capacity(prefixes);
+    for _ in 0..prefixes {
+        common_prefixes.push(take_text(r, MAX_KEY)?);
+    }
+    Some(Uploads {
+        uploads,
+        common_prefixes,
+        truncated,
+        next,
+    })
+}
+
 pub(crate) fn put_buckets(w: &mut Writer, page: &Buckets) -> Result<(), ObjectError> {
     if page.buckets.len() > MAX_BUCKETS {
         return Err(ObjectError::TooLong(page.buckets.len()));
@@ -949,6 +1452,7 @@ impl Reply {
             marker: false,
             range: None,
             versioning: None,
+            upload: String::new(),
             listing: None,
         }
     }
@@ -976,6 +1480,7 @@ impl Reply {
             f.u64(last);
         }
         f.u8(self.versioning.map_or(0, versioning_code));
+        put_text(&mut f, &self.upload, MAX_TAG)?;
         match &self.listing {
             None => f.u8(0),
             Some(Listing::Keys(page)) => {
@@ -985,6 +1490,14 @@ impl Reply {
             Some(Listing::Buckets(page)) => {
                 f.u8(2);
                 put_buckets(&mut f, page)?;
+            }
+            Some(Listing::Parts(page)) => {
+                f.u8(3);
+                put_parts(&mut f, page)?;
+            }
+            Some(Listing::Uploads(page)) => {
+                f.u8(4);
+                put_uploads(&mut f, page)?;
             }
         }
         let fields = f.into_vec();
@@ -1062,10 +1575,13 @@ impl ReplyHead {
                 0 => None,
                 code => Some(versioning_of(code)?),
             };
+            let upload = take_text(&mut r, MAX_TAG)?;
             let listing = match r.u8()? {
                 0 => None,
                 1 => Some(Listing::Keys(take_page(&mut r)?)),
                 2 => Some(Listing::Buckets(take_buckets(&mut r)?)),
+                3 => Some(Listing::Parts(take_parts(&mut r)?)),
+                4 => Some(Listing::Uploads(take_uploads(&mut r)?)),
                 _ => return None,
             };
             Some(Reply {
@@ -1078,6 +1594,7 @@ impl ReplyHead {
                 marker,
                 range,
                 versioning,
+                upload,
                 listing,
             })
         })();
@@ -1189,6 +1706,54 @@ mod tests {
                 versioning: Versioning::Suspended,
             },
             Op::GetVersioning { bucket: "b".into() },
+            Op::CreateUpload {
+                bucket: "b".into(),
+                key: "k".into(),
+                id: 6,
+                checksum: Some((Algorithm::Crc64Nvme, true)),
+            },
+            Op::UploadPart {
+                bucket: "b".into(),
+                key: "k".into(),
+                upload: "0123456789ABC".into(),
+                number: 10_000,
+                id: 7,
+                length: 5 << 30,
+                checksum: Some(Checksum {
+                    algorithm: Algorithm::Crc32,
+                    bytes: vec![1; 4],
+                }),
+                md5: Some([2; 16]),
+            },
+            Op::Complete {
+                bucket: "b".into(),
+                key: "k".repeat(MAX_KEY),
+                upload: "0123456789ABC".into(),
+                id: 8,
+                headers: headers(),
+                parts: (1..=10_000u16).map(|n| (n, "e".repeat(MAX_TAG))).collect(),
+            },
+            Op::Abort {
+                bucket: "b".into(),
+                key: "k".into(),
+                upload: "0123456789ABC".into(),
+                id: 9,
+            },
+            Op::ListParts {
+                bucket: "b".into(),
+                key: "k".into(),
+                upload: "0123456789ABC".into(),
+                after: 3,
+                max: 1000,
+            },
+            Op::ListUploads {
+                bucket: "b".into(),
+                prefix: "p".into(),
+                delimiter: "/".into(),
+                key_marker: Some("p/k".into()),
+                id_marker: None,
+                max: 1000,
+            },
         ]
     }
 
@@ -1304,7 +1869,44 @@ mod tests {
             marker: true,
             range: Some((3, 6)),
             versioning: Some(Versioning::Suspended),
+            upload: "0123456789ABC".into(),
             listing: None,
+        });
+        replies.push(Reply {
+            listing: Some(Listing::Parts(Parts {
+                parts: (1..=1000u16)
+                    .map(|number| PartListed {
+                        number,
+                        etag: "0".repeat(32),
+                        size: 5 << 20,
+                        modified: 1_727_179_200,
+                        checksum: if number.is_multiple_of(2) {
+                            Some(vec![9; 64])
+                        } else {
+                            None
+                        },
+                    })
+                    .collect(),
+                truncated: true,
+                next: Some(1000),
+            })),
+            ..Reply::status(Status::Done)
+        });
+        replies.push(Reply {
+            listing: Some(Listing::Uploads(Uploads {
+                uploads: (0..999)
+                    .map(|n| UploadListed {
+                        key: format!("k{n}"),
+                        id: "0123456789ABC".into(),
+                        initiated: n,
+                        owner: "o".repeat(MAX_OWNER),
+                    })
+                    .collect(),
+                common_prefixes: vec!["p/".into()],
+                truncated: true,
+                next: Some(("p/".into(), String::new())),
+            })),
+            ..Reply::status(Status::Done)
         });
         replies.push(Reply {
             listing: Some(Listing::Keys(Page {
@@ -1343,7 +1945,8 @@ mod tests {
             ..Reply::status(Status::Done)
         };
         assert!(over.encode().is_err());
-        assert!(ReplyHead::decode(&[19, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
+        let unknown = u8::try_from(STATUSES.len()).unwrap();
+        assert!(ReplyHead::decode(&[unknown, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
         let mut long = Reply::status(Status::Done).encode().unwrap().0;
         long[9..].copy_from_slice(&(u32::try_from(MAX_REPLY_FIELDS).unwrap() + 1).to_le_bytes());
         assert!(ReplyHead::decode(&long).is_err());

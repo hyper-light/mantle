@@ -279,8 +279,10 @@ the round trips each waits through.
 A node hosts the drivers ([node design §5.1](design/node.md)): a client asks it over mantle's
 protocol on QUIC for S3's bucket and object operations (CreateBucket, HeadBucket, ListBuckets,
 DeleteBucket, Put and GetBucketVersioning; PutObject with its bytes on the exchange, GetObject
-with them on the reply, HeadObject, DeleteObject, ListObjectsV2), and the node runs the bucket's
-coordinator, the `Put` and `Get` drivers or the ranges' commands and reads each needs, placing
+with them on the reply, HeadObject, DeleteObject, ListObjectsV2) and its multipart uploads
+(CreateMultipartUpload, UploadPart, CompleteMultipartUpload, AbortMultipartUpload, ListParts,
+ListMultipartUploads), and the node runs the bucket's coordinator, the `Put`, `Get` and
+`Completion` drivers or the ranges' commands and reads each needs, placing
 from its replica of the volume table, writing chunks to its own volume in-process and to its
 peers' over the transfer class, and asking the ranges' leaders through its own sessions. A put's
 `If-Match` and `If-None-Match` are judged as its version commits, and its checksum and
@@ -292,7 +294,10 @@ chunks on distinct nodes, and reads every one back whole and in part with each n
 killed by `SIGKILL`, and through that node once started again; it passes with a busy loop on every
 core. Through each node of a cell of three `mantle serve` processes every operation answers as
 S3 does for each case research/05 records, and 1,050 keys list in pages of 1,000 and of 97,
-through the three nodes in turn, every key once and in order (`crates/mantle/tests/serve.rs`).
+through the three nodes in turn, every key once and in order; a multipart upload whose parts go
+through different nodes, one node killed and started again between them, completes through
+another into an object whose bytes, multipart ETag and full-object checksum are S3's, the same
+when completed again, each block's chunks on distinct nodes (`crates/mantle/tests/serve.rs`).
 The operation identity every mutation carries is not yet recorded by the Name range (item 9).
 
 Remaining before it is done:

@@ -1611,21 +1611,44 @@ admission authority.
   HTTP/2 by ALPN, its endpoints (`s3.amazonaws.com`, `s3.us-east-1`, `s3.us-west-2`,
   `s3.dualstack.us-east-1` and `s3express-control.us-east-1`) answered `http/1.1`, and none
   advertised HTTP/3 by `Alt-Svc` (checked 2026-09-30; AWS documents HTTP/3 only for CloudFront).
-  HTTP/2 and HTTP/3 are not offered. The listener is hyper's HTTP/1.1 server over TLS from rustls.
-  On a laptop it may serve plain HTTP on the loopback address; SigV4 still authenticates every
-  request there, and a request carrying SSE-C headers is refused over plain HTTP, as S3 "rejects
-  any requests made over HTTP when using SSE-C" (20 §3.3).
+  HTTP/2 and HTTP/3 are not offered. The listener is mantle's own HTTP/1.1 codec (`crates/http`)
+  on hyper-rt's TCP, with TLS through hyper-tls: the owner's decision, no hyper and no tokio
+  (research/70). On a laptop it may serve plain HTTP on the loopback address; SigV4 still
+  authenticates every request there, and a request carrying SSE-C headers is refused over plain
+  HTTP, as S3 "rejects any requests made over HTTP when using SSE-C" (20 §3.3).
 
-hyper's defaults are its own choices ("Default is 200, but not part of the stability of hyper
-... You are encouraged to set your own limit", 25 §2), so the node sets each from its budget:
+The codec does no I/O: the listener reads a connection's octets into buffers of its own and hands
+them over, and the codec parses a request's head where it lies, decodes its body as it streams,
+giving its octets back as spans of that buffer, and writes a response's head and chunked framing
+into the listener's buffer. Its rules are research/70's:
 
-- HTTP/1.1's buffer holds one request head at S3's limit of 8 KB (05 §10.2) and the body
-  segment being read. hyper panics below 8,192 bytes (25 §2), so the node checks the value
-  before the call, as CLAUDE.md §1 requires of any dependency that can panic.
-- Header lists are bounded at S3's 8 KB (05 §10.2).
-- No header timer. hyper's `header_read_timeout` defaults to 30 seconds and panics when set
-  without a timer (25 §2). A slow client holds only its connection's reservation; when the node
-  needs the room, it closes the connection that has made the least progress for longest.
+- A request's head, its request line and field lines through the empty line, is held to S3's
+  8 KB (05 §10.2): past it `400 RequestHeaderSectionTooLarge`, or `414` for a request line not
+  ended within it (RFC 9112 §3). It is the one buffer a connection holds for a head, and the
+  only memory the codec allocates for a request is its list of field lines, once, at its size.
+- The grammar is strict where leniency smuggles: one SP between the request line's parts, no
+  whitespace before a field's colon, no obs-fold, no control octet but HTAB in a value, each
+  refused `400`; a line ends at CRLF or a lone LF; an HTTP/1.1 request has exactly one valid Host.
+- Framing that cannot be trusted is refused and the connection closed: Transfer-Encoding with
+  Content-Length, a coding list not ending in chunked or with chunked twice, Transfer-Encoding on
+  HTTP/1.0, a Content-Length that is not digits, overflows or lists differing values (RFC 9112
+  §6.1, §6.3). A coding other than chunked before it is `501`; neither field is no body.
+- A chunked body is decoded as it streams: each size checked for overflow, extensions passed
+  unread and the trailer section kept apart, each held to the head's bound per request (RFC 9112
+  §7.1).
+- `Expect: 100-continue` is said by the head before any body octet is read, so the listener sends
+  `100 Continue` or its final status first (RFC 9110 §10.1.1; §4.2 step 6); another expectation is
+  `417`.
+- A connection persists by RFC 9112 §9.3's rules; requests on it are taken one at a time, each
+  where the last one's body ended, so responses go in order, and any refusal closes it.
+- No header timer: a slow client holds only its connection's reservation; when the node needs the
+  room, it closes the connection that has made the least progress for longest.
+
+*As built (2026-10-25).* The codec, `crates/http`: each rule above by a test of its own
+(`tests/rules.rs`), generated requests read back whole and in any pieces, mutated and arbitrary
+octets read or refused with a typed error and never a panic (`tests/properties.rs`), and its
+allocations counted exactly (`tests/allocations.rs`). `mantle bench http` measures it on one core
+(measurements/2026-10-25-http-codec.md). The listener that runs it is §4.2's, to be built.
 
 ### 4.2 A request's path
 
@@ -1641,11 +1664,12 @@ hyper's defaults are its own choices ("Default is 200, but not part of the stabi
 5. **Admit the request**: the tenant's share (§4.5) and the request's working set from memory,
    the devices and the peers it will use. A PUT reserves its first block's window and, when its
    scheme is coded, a coder's work space; a GET its first block.
-6. **Answer or continue.** Refusals so far need no body. hyper sends `100 Continue` only when
-   the body is first read (25 §2), and RFC 9110 lets a server answer "with a final status code"
-   in its place (25 §2), so a request refused here is refused before a client using
-   `Expect: 100-continue` sends its body, which is what S3 tells PUT clients to rely on: "If the
-   message is rejected based on the headers, the body of the message is not sent" (25 §3).
+6. **Answer or continue.** Refusals so far need no body. The codec says a request expects
+   `100 Continue` before any of its body is read (§4.1), and the listener sends it only once the
+   steps above have passed; RFC 9110 lets a server answer "with a final status code" in its place
+   (25 §2), so a request refused here is refused before a client using `Expect: 100-continue`
+   sends its body, which is what S3 tells PUT clients to rely on: "If the message is rejected
+   based on the headers, the body of the message is not sent" (25 §3).
 7. **Run the drivers**: a `Put`, `Get` or `Completion` from `mantle-gateway`, and the S3 layer's
    own documents for everything else. Each driver's requests are served as §5 describes.
 8. **Respond** with `mantle_s3::response`'s documents, streaming a GET's bytes as the `Get`

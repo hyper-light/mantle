@@ -1,0 +1,26 @@
+[package]
+name = "mantle-http"
+description = "mantle's HTTP/1.1 codec for the S3 listener: I/O-free and bounded"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The line ends a head is split at, found a word at a time.
+memchr.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# Each allocation a request's way through the codec makes, counted by its allocator
+# (tests/allocations.rs).
+hyper-measure = { path = "../../vendor/hyper-measure" }
+# The oracle a generated or mutated request's head is read against (tests/properties.rs).
+httparse.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true

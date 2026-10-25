@@ -304,10 +304,11 @@ Remaining before it is done:
 
 - The windows a gateway admits, from its memory and measured latency; the rates of the paths
   measured on an idle machine.
-- The server around it: the HTTP/1.1 listener for stock S3 clients; multipart uploads, deletes,
-  listings and conditional requests over mantle's protocol; deadlines and hedging on the node's
-  asks (node design §5.4); routing by descriptors once ranges split; and each request's memory
-  admitted against the gateway's.
+- The server around it: the HTTP/1.1 listener for stock S3 clients, whose codec is built
+  (`crates/http`: each RFC 9112 rule it keeps by a test, generated and mutated requests read or
+  refused typed, its allocations counted, `mantle bench http`; node design §4.1); deadlines and
+  hedging on the node's asks (node design §5.4); routing by descriptors once ranges split; and
+  each request's memory admitted against the gateway's.
 
 The Raft log (`hyper-log`, vendored from hyper-raft with the block layer under it,
 `hyper-block`; [design](design/raft-log.md), vendor/UPSTREAM.md), which every range replica on

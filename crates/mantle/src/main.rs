@@ -21,6 +21,7 @@ mod bench;
 mod bench_ec;
 mod bench_gateway;
 mod bench_hash;
+mod bench_http;
 mod bench_log;
 mod bench_meta;
 mod disk;
@@ -222,6 +223,14 @@ enum BenchCommand {
         /// 8K,64K,1M,8M by default.
         #[arg(long, value_delimiter = ',', value_parser = parse_size)]
         sizes: Vec<usize>,
+    },
+    /// Measure the S3 listener's HTTP/1.1 codec on one core: the request heads stock clients
+    /// send parsed, a mebibyte's body decoded framed by length and chunked, and a response head
+    /// written.
+    Http {
+        /// Seconds each measurement runs.
+        #[arg(long, default_value_t = 0.5)]
+        seconds: f64,
     },
     /// Measure what applying the metadata layers' heaviest commands costs on one core: a
     /// multipart completion of up to 10,000 parts, an entry of many commands from one session,
@@ -478,6 +487,12 @@ fn main() -> ExitCode {
                 };
                 bench_hash::hash(&mut out, &sizes, step).map_err(|e| e.to_string())
             }
+            Err(_) => Err(format!("--seconds {seconds} is not a duration")),
+        },
+        Command::Bench {
+            command: BenchCommand::Http { seconds },
+        } => match std::time::Duration::try_from_secs_f64(seconds) {
+            Ok(step) => bench_http::http(&mut out, step).map_err(|e| e.to_string()),
             Err(_) => Err(format!("--seconds {seconds} is not a duration")),
         },
         Command::Bench {

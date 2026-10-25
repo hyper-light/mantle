@@ -26,6 +26,9 @@ crc-fast = { version = "1.10", default-features = false, features = ["std"] }
 proptest = "1.11"
 reed-solomon-simd = "3.1"
 roxmltree = "0.21"
+# A test oracle only, never production code (owner, 2026-10-25): crates/http's generated and mutated
+# requests are read as hyper's parser reads them or refused (crates/http/tests/properties.rs).
+httparse = "1.10"
 rustix = { version = "1.1", features = ["fs", "mm", "system", "param", "process", "time"] }
 tempfile = "3.20"
 thiserror = "2.0"

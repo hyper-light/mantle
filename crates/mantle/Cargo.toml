@@ -26,6 +26,8 @@ mantle-chunk = { path = "../chunk" }
 mantle-disk = { path = "../disk" }
 mantle-ec = { path = "../ec" }
 mantle-gateway = { path = "../gateway" }
+# The S3 listener's HTTP/1.1 codec, which `mantle bench http` measures.
+mantle-http = { path = "../http" }
 mantle-meta = { path = "../meta" }
 mantle-node = { path = "../node" }
 mantle-s3 = { path = "../s3" }

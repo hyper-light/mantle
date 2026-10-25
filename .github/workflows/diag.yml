@@ -1,0 +1,53 @@
+name: verify-busy
+# Scratch: the landing candidate's serve suite (the roll) and tests/node.rs (objects) as CI's busy
+# job runs them, built with every CPU and run on CPUs 0-1 beside two busy loops, twelve rounds a
+# runner on four runners, every round run whatever the one before did, no diagnostic code: the
+# failures counted, not the first one stopped at.
+on:
+  push:
+    branches: ["diag/**"]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: "1"
+jobs:
+  busy:
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [serve, node]
+        runner: [a, b, c, d]
+    name: ${{ matrix.suite }}-${{ matrix.runner }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned Rust
+        shell: bash
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: verify-busy-${{ matrix.suite }}
+          workspaces: |
+            .
+            vendor
+      - name: Build the suite
+        shell: bash
+        run: cargo test --locked -p mantle --test ${{ matrix.suite }} --no-run
+      - name: The suite on two CPUs beside two busy loops, twelve rounds
+        shell: bash
+        run: |
+          for _ in 1 2; do taskset -c 0-1 sh -c 'while :; do :; done' & done
+          failed=0
+          for round in $(seq 1 12); do
+            taskset -c 0-1 cargo test --locked -p mantle --test ${{ matrix.suite }} > "round-$round.txt" 2>&1 || true
+            result=$(grep -a "^test result" "round-$round.txt" | tail -1)
+            echo "round $round: $result"
+            if grep -aq "FAILED" "round-$round.txt"; then
+              failed=$((failed + 1))
+              grep -aE "^test .* FAILED" "round-$round.txt" || true
+              grep -a -A3 "panicked at" "round-$round.txt" | cut -c1-400 || true
+            fi
+          done
+          echo "rounds failed: $failed of 12"

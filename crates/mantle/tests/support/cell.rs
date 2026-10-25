@@ -767,6 +767,10 @@ pub(crate) struct Cell {
     pub(crate) generations: u64,
     pub(crate) tell: Sender<Heard>,
     pub(crate) heard: Receiver<Heard>,
+    /// DIAG (scratch): what the cell heard last, and when.
+    pub(crate) diag_seen: std::collections::VecDeque<(Instant, String)>,
+    /// DIAG (scratch): lines heard since the last mark, by node and kind, and when that mark was.
+    pub(crate) diag_counts: (Instant, BTreeMap<(u64, &'static str), u64>),
     /// Each workload client's operations done, and how long it gives an exchange.
     pub(crate) progress: BTreeMap<u64, u64>,
     pub(crate) clients: BTreeMap<u64, Duration>,
@@ -1045,6 +1049,8 @@ impl Cell {
             generations: 0,
             tell,
             heard,
+            diag_seen: std::collections::VecDeque::new(),
+            diag_counts: (Instant::now(), BTreeMap::new()),
             status: BTreeMap::new(),
             progress: BTreeMap::new(),
             clients: BTreeMap::new(),
@@ -1170,6 +1176,8 @@ impl Cell {
             generations: 0,
             tell,
             heard,
+            diag_seen: std::collections::VecDeque::new(),
+            diag_counts: (Instant::now(), BTreeMap::new()),
             status: BTreeMap::new(),
             progress: BTreeMap::new(),
             clients: BTreeMap::new(),
@@ -1523,11 +1531,26 @@ impl Cell {
                 .saturating_duration_since(Instant::now());
             match self.heard.recv_timeout(left) {
                 Ok(heard) => self.take(heard),
-                Err(_) => panic!(
-                    "quiet for {quiet:?} with nothing moved, besides {:?} held still for the \
-                     devices: {:?}, progress {:?}, links {:?}, log {:?}",
-                    self.held_for, self.status, self.progress, self.links, self.log
-                ),
+                Err(_) => {
+                    let now = Instant::now();
+                    for (at, what) in &self.diag_seen {
+                        eprintln!(
+                            "DIAG heard {:>8.1} ms ago: {what}",
+                            now.saturating_duration_since(*at).as_secs_f64() * 1000.0
+                        );
+                    }
+                    eprintln!(
+                        "DIAG watch: moved_at {:.1} ms ago, transfers {:?}, clients {:?}",
+                        now.saturating_duration_since(self.moved_at).as_secs_f64() * 1000.0,
+                        self.transfers,
+                        self.clients
+                    );
+                    panic!(
+                        "quiet for {quiet:?} with nothing moved, besides {:?} held still for the \
+                         devices: {:?}, progress {:?}, links {:?}, log {:?}",
+                        self.held_for, self.status, self.progress, self.links, self.log
+                    )
+                }
             }
         }
     }
@@ -1542,7 +1565,85 @@ impl Cell {
         }
     }
 
+    /// DIAG (scratch): one heard line kept, with when.
+    fn diag_note(&mut self, heard: &Heard) {
+        let diag = match heard {
+            Heard::Line(id, generation, line) => format!("line {id} g{generation} {line:?}"),
+            Heard::Ended(id, generation) => format!("ended {id} g{generation}"),
+            Heard::Told(Told::Progress(client, done, patience)) => {
+                format!("progress {client} {done} {patience:?}")
+            }
+            Heard::Told(Told::Failed(client, _)) => format!("failed {client}"),
+        };
+        self.diag_keep(diag);
+    }
+
+    /// DIAG (scratch): a line kept in the history, with when.
+    fn diag_keep(&mut self, note: String) {
+        self.diag_seen
+            .push_back((Instant::now(), note.chars().take(220).collect()));
+        if self.diag_seen.len() > 3000 {
+            self.diag_seen.pop_front();
+        }
+    }
+
+    /// DIAG (scratch): a note kept in the history, with when.
+    pub(crate) fn diag_mark(&mut self, note: String) {
+        let span = self.diag_counts.0.elapsed().as_secs_f64();
+        let counts: Vec<String> = self
+            .diag_counts
+            .1
+            .iter()
+            .map(|((id, kind), n)| {
+                format!(
+                    "{}:{kind} {n} ({:.0}/s)",
+                    id % 100_000,
+                    *n as f64 / span.max(1e-9)
+                )
+            })
+            .collect();
+        eprintln!(
+            "DIAG lines over {span:.3} s before \"{note}\": {}",
+            counts.join(", ")
+        );
+        self.diag_counts = (Instant::now(), BTreeMap::new());
+        self.diag_keep(note);
+    }
+
     pub(crate) fn take(&mut self, heard: Heard) {
+        if let Heard::Line(id, _, line) = &heard {
+            let kind = match line {
+                Line::Status { .. } => "status",
+                Line::Log(..) => "log",
+                Line::Link(..) => "link",
+                Line::Moved(..) => "moved",
+                Line::Held(..) => "held",
+                Line::Basis(..) => "basis",
+                _ => "other",
+            };
+            *self.diag_counts.1.entry((*id, kind)).or_insert(0) += 1;
+        }
+        // DIAG (scratch): a status only where its term or leader moved, so the history spans the roll.
+        if let Heard::Line(
+            id,
+            _,
+            Line::Status {
+                group,
+                term,
+                leader,
+                ..
+            },
+        ) = &heard
+            && let Some(Line::Status {
+                term: was_term,
+                leader: was_leader,
+                ..
+            }) = self.status.get(&(*id, *group))
+            && (was_term, was_leader) == (term, leader)
+        {
+        } else if !matches!(&heard, Heard::Line(_, _, Line::Held(..) | Line::Log(..))) {
+            self.diag_note(&heard);
+        }
         match heard {
             Heard::Line(id, generation, line) => {
                 // A line its killed process left: the node runs another process now, or none.

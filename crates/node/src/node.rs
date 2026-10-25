@@ -538,6 +538,27 @@ struct Receiving {
     read: u64,
     bytes: Vec<u8>,
     what: Arriving,
+    /// DIAG (scratch): the read when it last moved, and when; whether its stop was said.
+    diag_moved: (u64, std::time::Instant),
+    diag_said: bool,
+    diag_refused: u64,
+}
+
+/// DIAG (scratch): what an arriving body is, by name.
+fn diag_arriving(what: Arriving) -> &'static str {
+    match what {
+        Arriving::Snapshot => "snapshot",
+        Arriving::Command(_) => "command",
+        Arriving::Read(_) => "read",
+        Arriving::Redirect(_) => "redirect",
+        Arriving::Status(_) => "status",
+        Arriving::ChunkPut { .. } => "chunk-put",
+        Arriving::ChunkGet { .. } => "chunk-get",
+        Arriving::ChunkStatus(_) => "chunk-status",
+        Arriving::ChunkBytes(_) => "chunk-bytes",
+        Arriving::Answers => "answers",
+        Arriving::ReadAnswer => "read-answer",
+    }
 }
 
 /// What an arriving body is.
@@ -888,6 +909,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             congestion: Default::default(),
         };
         let budget = Fixed::new(settings.transport_bytes, settings.peers.len().max(1));
+        eprintln!(
+            "diag-node {:?} transport_bytes={} wall_ms={}",
+            settings.id,
+            settings.transport_bytes,
+            diag_wall_ms()
+        );
         let directory = Peers::new(settings.peers.clone());
         let now = std::time::Instant::now();
         let endpoint = match settings.seed {
@@ -1318,6 +1345,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.schedule_due(now);
         self.drive(now)?;
         self.step_host()?;
+        self.diag_watch();
         self.step_asks(now)?;
         self.step_reads(now)?;
         self.step_replacements();
@@ -1664,6 +1692,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     body,
                     read: 0,
                     bytes: Vec::with_capacity(usize::try_from(kept).unwrap_or(0)),
+                    diag_moved: (0, std::time::Instant::now()),
+                    diag_said: false,
+                    diag_refused: 0,
                     what,
                 });
                 self.read_exchange(exchange)
@@ -2172,6 +2203,21 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         while receiving.read < receiving.body {
             let Ok(mut into) = endpoint.reserve(receiving.what.class(), PIECE) else {
+                receiving.diag_refused = receiving.diag_refused.saturating_add(1);
+                if receiving.diag_refused == 1 || receiving.diag_refused % 1000 == 0 {
+                    eprintln!(
+                        "diag-node {:?} reserve-refused wall_ms={} exchange={:?} what={} read={} body={} used={} refused={} times={}",
+                        self.id,
+                        diag_wall_ms(),
+                        exchange,
+                        diag_arriving(receiving.what),
+                        receiving.read,
+                        receiving.body,
+                        endpoint.budget().used(),
+                        endpoint.budget().refused(),
+                        receiving.diag_refused
+                    );
+                }
                 return Ok(());
             };
             let got = endpoint.read_body(exchange, &mut into);
@@ -2629,6 +2675,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     body,
                     read: 0,
                     bytes: Vec::with_capacity(usize::try_from(body).unwrap_or(0)),
+                    diag_moved: (0, std::time::Instant::now()),
+                    diag_said: false,
+                    diag_refused: 0,
                     what: Arriving::ChunkBytes(asked),
                 });
                 self.read_exchange(exchange)
@@ -3073,6 +3122,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 body,
                 read: 0,
                 bytes: Vec::with_capacity(usize::try_from(body).unwrap_or(0)),
+                diag_moved: (0, std::time::Instant::now()),
+                diag_said: false,
+                diag_refused: 0,
                 what: Arriving::Answers,
             });
             return self.read_exchange(exchange);
@@ -3353,6 +3405,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 body,
                 read: 0,
                 bytes: Vec::with_capacity(usize::try_from(body).unwrap_or(0)),
+                diag_moved: (0, std::time::Instant::now()),
+                diag_said: false,
+                diag_refused: 0,
                 what: Arriving::ReadAnswer,
             });
             return self.read_exchange(exchange);
@@ -3614,6 +3669,37 @@ fn open_log(dir: &Path, node: u64, config: LogConfig) -> Result<Log<DeviceFile>,
         Log::open(file, config, log_id(node))
             .map(|(log, _)| log)
             .map_err(|e| NodeError::Log(e.to_string()))
+    }
+}
+
+impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
+    /// DIAG (scratch): each arriving body whose read has not moved for a second, said once.
+    fn diag_watch(&mut self) {
+        let id = self.id;
+        let used = self.driver.endpoint().budget().used();
+        let refused = self.driver.endpoint().budget().refused();
+        for receiving in &mut self.receiving {
+            if receiving.read != receiving.diag_moved.0 {
+                receiving.diag_moved = (receiving.read, std::time::Instant::now());
+                receiving.diag_said = false;
+                continue;
+            }
+            let since = receiving.diag_moved.1.elapsed();
+            if !receiving.diag_said && since >= std::time::Duration::from_secs(1) {
+                receiving.diag_said = true;
+                eprintln!(
+                    "diag-node {id:?} read-stuck wall_ms={} exchange={:?} peer={:?} what={} read={} body={} since_ms={} used={used} refused={refused} its_refusals={}",
+                    diag_wall_ms(),
+                    receiving.exchange,
+                    receiving.peer,
+                    diag_arriving(receiving.what),
+                    receiving.read,
+                    receiving.body,
+                    since.as_millis(),
+                    receiving.diag_refused
+                );
+            }
+        }
     }
 }
 

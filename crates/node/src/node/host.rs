@@ -228,6 +228,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let endpoint = self.driver.endpoint();
         while names.len() < wanted {
             let Ok(mut piece) = endpoint.reserve(Class::Transfer, PIECE) else {
+                diag_host_refused(self.id, exchange, endpoint.budget().used());
                 return Ok(false);
             };
             let got = endpoint.read_body(exchange, &mut piece);
@@ -847,6 +848,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 return Ok(());
             }
             let Ok(mut piece) = endpoint.reserve(Class::Transfer, PIECE) else {
+                diag_host_refused(self.id, exchange, endpoint.budget().used());
                 return Ok(());
             };
             let got = endpoint.read_body(exchange, &mut piece);
@@ -1270,6 +1272,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let endpoint = self.driver.endpoint();
         loop {
             let Ok(mut piece) = endpoint.reserve(Class::Transfer, PIECE) else {
+                diag_host_refused(self.id, exchange, endpoint.budget().used());
                 return Ok(false);
             };
             let got = endpoint.read_body(exchange, &mut piece);
@@ -1425,5 +1428,20 @@ fn get_answer(outcome: Outcome) -> get::Answer {
             _ => get::Answer::Unreadable,
         },
         _ => get::Answer::Unreadable,
+    }
+}
+
+/// DIAG (scratch): a host job's piece refused by the budget, at most 2,000 said a process.
+fn diag_host_refused(id: u64, exchange: hyper_transport::ExchangeId, used: u64) {
+    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let said = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if said < 2_000 {
+        eprintln!(
+            "diag-node {id:?} host reserve-refused wall_ms={} exchange={exchange:?} used={used} n={said}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        );
     }
 }

@@ -1,10 +1,12 @@
-name: diag-objects-stall
+name: diag-objects-stall-budget
 # Scratch: tests/node.rs's suite as CI's busy job runs it (built with every CPU, then run on two
 # CPUs beside two busy loops), rounds until a test fails (CI run 40149258394,
 # linux-x86_64-2cpu-busy: objects_round_trip_through_any_node_and_read_back_after_one_is_killed,
 # "client 6 failed: object operation 9: the transport: Stalled"). The transport says which rule
 # judged an exchange stalled (diag-stall), the node its chunk asks (diag-node), the client its
-# operations (diag-client), the test its kills (diag-test), each with the wall clock.
+# operations (diag-client), the test its kills (diag-test), each with the wall clock; and now each
+# read of an arriving body the budget refused a piece (reserve-refused), and each read that has not
+# moved for a second (read-stuck), with the budget's bytes in use.
 on:
   push:
     branches: ["diag/**"]
@@ -50,7 +52,8 @@ jobs:
             if grep -aq "FAILED" "round-$round.txt"; then
               grep -a -A4 "panicked" "round-$round.txt" | cut -c1-400 || true
               grep -a "diag-stall\|diag-test\|diag-client" "round-$round.txt" | cut -c1-400 || true
-              grep -a "diag-node" "round-$round.txt" | tail -200 | cut -c1-300 || true
+              grep -a "diag-node" "round-$round.txt" | grep -av "chunk replied" | tail -400 | cut -c1-400 || true
+              grep -a "diag-node" "round-$round.txt" | grep -a "chunk replied" | tail -100 | cut -c1-300 || true
               break
             fi
           done

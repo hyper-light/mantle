@@ -1748,10 +1748,11 @@ SDK's operation carries, so its retries are one operation (gateway.md §2.1) and
 another's; a request without one is an operation of its own, its identity drawn. 4. A bucket's
 owner is judged by the host as for the native door; bucket policies come with PutBucketPolicy,
 which this path does not serve yet. 5. The operation goes through the door (`crate::door`): a
-bounded channel the node takes at its next turn into the same jobs the native door's requests
-become, with no loopback QUIC hop; the door holds as many as the host runs at once
-(`gateway.objects`), and past either bound the answer is `503 SlowDown`, before any of a body is
-read. 6. A put's body is read only once the host says its driver wants it, after every check that
+bounded channel the node takes into the same jobs the native door's requests become, with no
+loopback QUIC hop. The door holds a request for each connection the listener admits, so it refuses
+none for room, and the node takes them in the order they came while the host has room for another
+operation (`gateway.objects`), the rest waiting there with their bodies unread; a stopping node
+answers `503 SlowDown` before any of a body is read. 6. A put's body is read only once the host says its driver wants it, after every check that
 could refuse it, and `100 Continue` goes then; a refusal goes in its place (§4.5). 7. The host runs
 the drivers as for the native door. 8. `respond.rs` renders the host's typed reply as S3's response:
 §4.4's codes, the listings' and multipart's documents from `mantle_s3::response`, and a get's bytes
@@ -1771,7 +1772,14 @@ through two listeners, listed, completed through a third with S3's ETag, and rea
 by a suffix range through each; objects put through one listener alone held by the other two nodes
 exactly as they received them over QUIC's transfer class, neither putting any itself; and on every
 node, the bytes its volumes hold the bytes its peers put on it over QUIC and those it put itself,
-read by a `chunks` line on standard input, answered `chunks RECEIVED WRITTEN HELD`.
+read by a `chunks` line on standard input, answered `chunks RECEIVED WRITTEN HELD`. Stock clients
+pass against a cell of three in `crates/mantle/tests/stock_clients.rs`, run on every CI target: the
+runner image's AWS CLI v2 (`aws s3 mb`, `cp`, `ls` and `rm`; `aws s3api`'s object, listing and
+multipart commands; `aws s3 cp` past its 8 MiB multipart threshold, from standard input and to
+standard output, its multipart upload committed with S3's ETag form) and boto3 (its object calls,
+a listing and its managed transfers, with the SDK's default checksums), every object read back
+byte-identical; CI installs boto3 pinned with every hash, and the CLI from AWS's installer where an
+image lacks it, test tools the owner approved (`scripts/stock-clients.sh`).
 
 ### 4.3 Bodies
 
@@ -1913,9 +1921,13 @@ credit. A condition that outlasts the retries, such as a cell out of space, is r
 it is, and its remedy is operational. Whether to send `x-amz-retry-after` is open, since whether
 S3 sends it is unverified (25 §3).
 
-*As built (2026-10-25), the S3 listener.* The door holds as many operations as the host runs at once
-and the host refuses one past them, each `503 SlowDown` before any of a body is read, so a refusal
-comes before `100 Continue`. A response sent before its request's body was read says
+*As built (2026-10-25), the S3 listener.* The door holds a request for each connection the listener
+admits, and the node takes them in the order they came while the host has room for another
+operation, so a burst past the host's operations waits at the door, its bodies unread, rather than
+being refused: the AWS CLI's transfers send ten parts at once, against a host floor of two, and its
+multipart uploads failed `SlowDown` after its two retries until requests waited (AWS CLI 2.34.18
+against a cell of one, 2026-10-25). A stopping node's refusal is `503 SlowDown` before any of a
+body is read, so before `100 Continue`. A response sent before its request's body was read says
 `Connection: close`, whether or not its client waited for `100 Continue`, since it may send the body
 anyway (RFC 9110 §10.1.1); the listener then half-closes and reads what comes until the client
 closes, at most the largest body a request may carry, so the response is not lost to a reset
@@ -1924,8 +1936,9 @@ CLI's classic transfers open at their defaults (research/72). Open: the budget g
 floor with the node's memory, which the CLI's CRT transfer client asks, at least ten connections and
 twenty-five at its 10 Gb/s target (research/72); the process's descriptor limit, which the budget
 does not yet read; the reclaim of the connection that has made the least progress for longest when
-the node needs the room (§4.1, §4.3); and the shared admission authority above, of which the door's
-bound is the host's floor.
+the node needs the room (§4.1, §4.3); and the shared admission authority above, whose sojourn test
+would refuse a request that waits at the door past its target, where now it waits as long as the
+host's operations ahead of it take.
 
 ### 4.6 Keys for encryption
 
@@ -2561,6 +2574,10 @@ matrix of audit §13.6 runs on Linux under the container of `scripts/linux-test.
 delays, loss and outages imposed on its links, and records durable progress, tails, memory and
 refusals for each cell of the matrix. Every hot path of the node has a benchmark with a recorded
 baseline, and a performance claim names its run.
+
+*As built (2026-10-25).* The AWS CLI v2's and boto3's suite runs on every CI target and the
+constrained jobs against a cell of three `mantle serve` processes (`crates/mantle/tests/
+stock_clients.rs`, §4.2); the AWS SDK for Rust and ceph's s3-tests are still to run.
 
 Real-process tests count what the design bounds: the process's threads, sampled from the OS
 throughout a measurement at a device's full reported depth and a `bench log` run with logical

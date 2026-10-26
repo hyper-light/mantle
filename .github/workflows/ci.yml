@@ -60,6 +60,12 @@ jobs:
       - name: Production panic policy
         shell: bash
         run: bash scripts/check-production.sh --target ${{ matrix.target }}
+      # The stock S3 clients the suite in crates/mantle/tests/stock_clients.rs runs against a cell:
+      # the AWS CLI v2 (AWS's installer where the image lacks it) and boto3 pinned with every hash,
+      # test tools the owner approved (2026-10-25).
+      - name: Stock S3 clients
+        shell: bash
+        run: bash scripts/stock-clients.sh
       - name: Tests
         run: cargo test --workspace --locked --target ${{ matrix.target }}
       - name: Vendored crates' suites
@@ -95,6 +101,12 @@ jobs:
         run: |
           cargo test --workspace --locked --no-run
           cargo test --manifest-path vendor/Cargo.toml --workspace --locked --no-run
+      # The stock S3 clients the suite in crates/mantle/tests/stock_clients.rs runs against a cell:
+      # the AWS CLI v2 (AWS's installer where the image lacks it) and boto3 pinned with every hash,
+      # test tools the owner approved (2026-10-25).
+      - name: Stock S3 clients
+        shell: bash
+        run: bash scripts/stock-clients.sh
       - name: Suites on ${{ matrix.cpus }}, beside ${{ matrix.hogs }} busy loops
         run: |
           for _ in $(seq ${{ matrix.hogs }}); do taskset -c ${{ matrix.cpus }} sh -c 'while :; do :; done' & done

@@ -124,6 +124,44 @@ fn a_cell_of_three_serves_signed_s3_requests_through_every_nodes_listener() {
         );
     }
 
+    // As many puts at once as the listener takes connections beside the one the first client
+    // holds, past the operations the host runs at once (`gateway.objects`), as the AWS CLI's
+    // transfers send their parts: each waits at the door until the host has room, and every one
+    // commits.
+    let (at, budget) = cell.s3_bound[&ids[0]];
+    let at_once: Vec<(String, Vec<u8>)> = (0..budget - 1)
+        .map(|i| {
+            (
+                format!("at-once/{i}"),
+                bytes(70 + i, 200_001 + usize::try_from(i).unwrap()),
+            )
+        })
+        .collect();
+    let threads: Vec<_> = at_once
+        .iter()
+        .cloned()
+        .map(|(key, data)| {
+            let (key_pair, region) = (clients[0].key.clone(), clients[0].region.clone());
+            std::thread::spawn(move || {
+                let mut client = Client::new(at, key_pair, &region);
+                let put = client.send("PUT", &format!("/photos/{key}"), &[], &data);
+                (key, put.status, put.text())
+            })
+        })
+        .collect();
+    for thread in threads {
+        let (key, status, text) = thread.join().unwrap();
+        assert_eq!(status, 200, "{key}: {text}");
+    }
+    for (key, data) in &at_once {
+        assert!(
+            clients[2]
+                .send("GET", &format!("/photos/{key}"), &[], b"")
+                .body
+                == *data
+        );
+    }
+
     // Objects put through each listener read back whole and by range through the others.
     let objects: Vec<(String, Vec<u8>)> = (0..n)
         .map(|i| {
@@ -170,7 +208,7 @@ fn a_cell_of_three_serves_signed_s3_requests_through_every_nodes_listener() {
         assert_eq!(page.status, 200, "{}", page.text());
         assert_eq!(
             page.element("KeyCount"),
-            Some((alone.len() + n).to_string())
+            Some((alone.len() + at_once.len() + n).to_string())
         );
         for (key, _) in &objects {
             assert!(page.text().contains(&format!("<Key>{key}</Key>")), "{key}");

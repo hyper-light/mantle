@@ -1176,16 +1176,23 @@ fn start(
 /// The S3 listener `keys` state, its door open on `node`: where it listens, its region, keys and
 /// TLS (node.md §4.1). Stated at the QUIC address, it listens on the port QUIC bound, over TCP, as
 /// an https authority serves both (research/71); plain HTTP on a loopback address, TLS with the
-/// endpoint's certificate elsewhere. A node that hosts no objects has no operation to hand it.
+/// endpoint's certificate elsewhere. Its door holds a request for each connection the listener
+/// admits, so it refuses none for room: each waits there until the host has room for it (node.md
+/// §4.5). A node that hosts no objects has no operation to hand it.
 fn listen<E: Engine + 'static>(
     node: &mut Node<E>,
     keys: S3Keys,
     (stated, bound): (SocketAddr, SocketAddr),
-    (id, objects): (u64, Option<usize>),
+    (id, hosts): (u64, bool),
 ) -> Result<crate::listener::Listener, ProcessError> {
     let refused = |e: String| ProcessError::Listener(e);
-    let objects =
-        objects.ok_or_else(|| refused("an S3 endpoint on a node that hosts no objects".into()))?;
+    if !hosts {
+        return Err(refused(
+            "an S3 endpoint on a node that hosts no objects".into(),
+        ));
+    }
+    let waiting = usize::try_from(crate::listener::CONNECTIONS)
+        .map_err(|_| refused("the listener's connections".into()))?;
     let listen = if keys.listen == stated {
         SocketAddr::new(keys.listen.ip(), bound.port())
     } else {
@@ -1196,7 +1203,7 @@ fn listen<E: Engine + 'static>(
     } else {
         Some((keys.certificate, keys.key))
     };
-    let door = node.open_door(objects)?;
+    let door = node.open_door(waiting)?;
     crate::listener::Listener::bind(
         crate::listener::Settings {
             listen,
@@ -1593,10 +1600,8 @@ async fn serve(
     };
     let own = history::at_start(row, last_run, Some(last_stop));
     let history = history::cell_with(cell, row, own);
-    // The door's bound: the operations the host runs at once, past which it answers `SlowDown`
-    // whatever waits at the door, so a door that holds that many refuses nothing the host would
-    // take (node.md §4.5).
-    let objects = gateway.as_ref().map(|g| g.objects);
+    // Whether the node hosts objects, which an S3 listener hands its operations to.
+    let hosts = gateway.is_some();
     let settings = NodeSettings {
         id: config.id,
         dir: config.dir.clone(),
@@ -1635,7 +1640,7 @@ async fn serve(
     say(&mut output, &format!("bound {quic} {plane}\n")).await?;
     let listener = match s3 {
         Some(keys) => {
-            let listener = listen(&mut node, keys, (config.quic, quic), (config.id, objects))
+            let listener = listen(&mut node, keys, (config.quic, quic), (config.id, hosts))
                 .map_err(step(Step::Network))?;
             let at = listener
                 .local_addr()

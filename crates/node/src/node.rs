@@ -1357,8 +1357,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// Opens the S3 listener's door (`crate::door`): `capacity` operations waiting at once, past
-    /// which the listener answers `503 SlowDown` (node.md §4.5), each one this node's task takes
-    /// at its next turn, which the listener wakes. The listener's end; opened once.
+    /// which the listener answers `503 SlowDown` (node.md §4.5), each taken by this node's task at a
+    /// turn the listener wakes, once the host has room for it. The listener's end; opened once.
     pub fn open_door(&mut self, capacity: usize) -> Result<crate::door::Submitter, NodeError> {
         if self.doorway.is_some() {
             return Err(NodeError::Bounds(
@@ -1371,9 +1371,23 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(submitter)
     }
 
-    /// The operations the S3 listener handed over since the last turn, each a job.
+    /// The operations the S3 listener handed over, each a job, in the order they came, while the
+    /// host has room for another (`gateway.objects`): the rest wait at the door, their bodies
+    /// unread, until a job ends and the listener's next answer taken turns the node again. A
+    /// stopping node, or one that hosts no objects, answers each as it comes.
     fn take_door(&mut self) {
-        while let Some(request) = self.doorway.as_mut().and_then(crate::door::Doorway::take) {
+        loop {
+            let room = self.stopping()
+                || self
+                    .gateway
+                    .as_ref()
+                    .is_none_or(|g| self.jobs.len() < g.objects);
+            if !room {
+                return;
+            }
+            let Some(request) = self.doorway.as_mut().and_then(crate::door::Doorway::take) else {
+                return;
+            };
             self.take_local(request);
         }
     }

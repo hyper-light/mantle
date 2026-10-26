@@ -1,0 +1,13 @@
+# boto3 for the stock-client suite (crates/mantle/tests/stock_clients.rs), a test tool only, which
+# the owner approved for CI on 2026-10-25: one version, every package it needs pinned with its
+# wheel's hash (`pip install --require-hashes --only-binary :all: --no-deps`), each wheel pure
+# Python so one hash serves every runner. Pins and hashes from PyPI's JSON API
+# (https://pypi.org/pypi/NAME/VERSION/json): boto3's latest, its botocore, and the latest of each
+# other package within botocore's and boto3's bounds (python-dateutil <3.0.0).
+boto3==1.43.118 --hash=sha256:ab8f3d2c622ef039338b4f228d97ea55f1abd573d84bb9b9a5ee8cb6780c0ccd
+botocore==1.43.118 --hash=sha256:a45d7ae570674161e4a3542d8c68633bf7503f92d1de781ef7361b79488eda6f
+s3transfer==0.19.3 --hash=sha256:24eb7535804306355e31c952a90022bf5b2f9d760f9a11062c7493a217c08553
+jmespath==1.1.0 --hash=sha256:a5663118de4908c91729bea0acadca56526eb2698e83de10cd116ae0f4e97c64
+python-dateutil==2.9.0.post0 --hash=sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427
+urllib3==2.8.0 --hash=sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3
+six==1.17.0 --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274

@@ -1486,15 +1486,10 @@ fn take_name_outcome(r: &mut Reader<'_>) -> Option<name::Outcome> {
     })
 }
 
-/// A bucket's name at most: S3's 63 characters (research/05 §10.3).
-pub const MAX_BUCKET: usize = 63;
-/// An object's key at most: S3's 1,024 bytes (research/05 §10.1).
-pub const MAX_KEY: usize = 1024;
-/// A request's headers at most: S3's 8 KB (research/05 §10.2).
-pub const MAX_HEADERS: usize = 8 << 10;
-/// An owner's name at most: a canonical user ID's 64 hexadecimal digits, the longest form S3
-/// names an owner in (research/13, the ACL grantee); an account ID is 12 digits (research/17 §6).
-pub const MAX_OWNER: usize = 64;
+/// S3's bounds on a bucket's name, an object's key, a request's headers and an owner's name
+/// (research/05 §10.1–§10.3, research/13).
+pub use mantle_s3::account::MAX_OWNER;
+pub use mantle_s3::route::{MAX_BUCKET, MAX_HEADERS, MAX_KEY};
 /// Hexadecimal digits of an MD5, a part's ETag and the stem of a multipart object's.
 const ETAG_HEX: usize = 32;
 /// Parts of a multipart upload at most: S3's 10,000 (research/05 §4.1).

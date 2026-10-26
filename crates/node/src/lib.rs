@@ -2,8 +2,9 @@
 //! transport, QUIC for everything stateful and a sealed UDP datagram plane for consensus control
 //! (node.md §3).
 //!
-//! - [`bounds`]: every bound of the transport, derived from what the node states.
-//! - [`classes`]: the kinds of message QUIC carries, their classes and who may send each.
+//! The native protocol's messages and classes, and the transport's bounds, are
+//! `mantle_protocol`'s, which the node's clients share.
+//!
 //! - [`client`]: a client of the cell's ranges, asking their leaders to apply entries.
 //! - [`command`]: a command for a range as a client asks it and a node answers it.
 //! - [`directory`]: the peers a connection may name, by certificate.
@@ -26,9 +27,7 @@
 )]
 
 pub mod ask;
-pub mod bounds;
 pub mod chunk;
-pub mod classes;
 pub mod client;
 pub mod command;
 pub mod derive;
@@ -39,7 +38,6 @@ pub mod history;
 pub mod layout;
 pub mod listener;
 pub mod node;
-pub mod object;
 pub mod place;
 pub mod process;
 pub mod read;

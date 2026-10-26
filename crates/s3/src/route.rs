@@ -124,6 +124,12 @@ impl RouteError {
 /// maximum length of 1,024 bytes" (05 §10.1).
 pub const MAX_KEY: usize = 1024;
 
+/// A bucket's name at most: S3's 63 characters (05 §10.3).
+pub const MAX_BUCKET: usize = 63;
+
+/// A request's headers at most: S3's 8 KB (05 §10.2).
+pub const MAX_HEADERS: usize = 8 << 10;
+
 /// Bucket subresources S3 defines that mantle does not serve: answered `501 NotImplemented`
 /// rather than taken for another operation.
 const UNSUPPORTED: [&str; 11] = [
@@ -455,7 +461,7 @@ fn strip_port(host: &str) -> &str {
 /// beginning and ending in a letter or digit, which ceph s3-tests expects of S3.
 pub fn bucket_name_valid(name: &str) -> bool {
     let bytes = name.as_bytes();
-    (3..=63).contains(&bytes.len())
+    (3..=MAX_BUCKET).contains(&bytes.len())
         && bytes
             .iter()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'.' || *b == b'-')

@@ -2,7 +2,7 @@
 //! real `mantle node` or `mantle serve` processes on loopback, its authority and identities, the
 //! lines its processes say, the watch that waits on them (node.rs's module comment), and the
 //! clients that drive it. Each test binary is a process of its own, whose message bounds it states
-//! once (`mantle_node::classes::state_bounds`): a cell of `mantle serve` processes, whose bounds
+//! once (`mantle_protocol::classes::state_bounds`): a cell of `mantle serve` processes, whose bounds
 //! its nodes derive, runs in a binary apart from the cells of stated settings.
 
 pub(crate) use std::collections::{BTreeMap, BTreeSet};
@@ -28,15 +28,18 @@ pub(crate) use mantle_chunk::ChunkKey;
 pub(crate) use mantle_meta::root::Placed;
 pub(crate) use mantle_meta::wire::{Answer, Entry};
 pub(crate) use mantle_node::chunk::Status;
-pub(crate) use mantle_node::classes::{Bounds, Role};
 pub(crate) use mantle_node::client::{Client, ClientSettings};
 pub(crate) use mantle_node::client::{ClientError, ObjectOutcome};
 pub(crate) use mantle_node::command::Status as CommandStatus;
-pub(crate) use mantle_node::directory::{Peer, node_name};
+pub(crate) use mantle_node::directory::Peer;
 pub(crate) use mantle_node::node::ChunkOutcome;
-pub(crate) use mantle_node::object::{Headers, List, Listing, Op, Reply, Status as ObjectStatus};
 pub(crate) use mantle_node::place;
 pub(crate) use mantle_node::read::{Query, Read};
+pub(crate) use mantle_protocol::classes::{Bounds, Role};
+pub(crate) use mantle_protocol::object::{
+    Headers, List, Listing, Op, Reply, Status as ObjectStatus,
+};
+pub(crate) use mantle_protocol::{client_name, node_name};
 
 pub(crate) const NODE: &str = env!("CARGO_BIN_EXE_mantle");
 /// The Name range's group, the range most tests write through.
@@ -63,6 +66,7 @@ pub(crate) const NODES: u64 = 3;
 /// The most nodes a cell has: five, the larger of the cells node.md's Phase C asks histories of.
 pub(crate) const MOST_NODES: u64 = 5;
 /// The writer client's id, past every node's of the largest cell; the workload's clients follow.
+/// Each asks the ranges for itself, a gateway's work, and is pinned as one (node.md §3.6).
 pub(crate) const CLIENT: u64 = MOST_NODES + 1;
 /// The workload's clients, each its own identity and session.
 pub(crate) const CLIENTS: u64 = 3;
@@ -122,6 +126,44 @@ pub(crate) const CHUNK_BYTES: u64 = 8 << 20;
 /// The gateway's identity: a client's certificate the nodes of a storage cell name a gateway, which
 /// moves chunks (node.md §3.6).
 pub(crate) const GATEWAY: u64 = CLIENT + CLIENTS + 1;
+/// The clients of objects: client `CLIENT + n`'s object operations are asked by the client
+/// `OBJECT_CLIENT + n`, a certificate the authority issued for the client role, pinned nowhere and
+/// acting for an account of its own (node.md §3.6), its id past every pinned peer's.
+pub(crate) const OBJECT_CLIENT: u64 = GATEWAY + 1;
+
+/// The object client that asks client `client`'s object operations.
+pub(crate) fn object_client(client: u64) -> u64 {
+    OBJECT_CLIENT + (client - CLIENT)
+}
+
+/// The account object client `id` acts for: twelve digits, its own.
+pub(crate) fn account(id: u64) -> String {
+    format!("{id:012}")
+}
+
+/// The object clients' certificates and keys, by id, each issued for the client role by the
+/// authority holding `key` and named `name`.
+pub(crate) fn object_clients(
+    key: &KeyPair,
+    name: &str,
+    validity: Validity,
+) -> BTreeMap<u64, (Vec<u8>, Vec<u8>)> {
+    let mut objects = BTreeMap::new();
+    for client in CLIENT..=CLIENT + CLIENTS {
+        let id = object_client(client);
+        let own = KeyPair::generate().unwrap();
+        let certificate = mantle_cert::client(
+            key,
+            name,
+            own.public_key(),
+            (&client_name(id), &account(id)),
+            (validity, Serial::draw().unwrap()),
+        )
+        .unwrap();
+        objects.insert(id, (certificate, own.pkcs8().to_vec()));
+    }
+    objects
+}
 /// The bytes of the volume each node of a storage cell keeps, in its directory's `device`, read as a
 /// device not measured is (`mantle_chunk::Reads::default`: one read at a time, nothing read past
 /// what is asked) and written with no layout pass; its layout, every volume's, is
@@ -155,8 +197,8 @@ volume.fragments_per_chunk = 64
 ";
 
 /// What a node that hosts objects states (`mantle_node::process`'s gateway keys): a block held 30 s
-/// for its file's write, two blocks going down or being read at once, four operations at once,
-/// S3's 10,000 buckets an owner (research/05 §10.4), 64 rows a coordinator's read; and the
+/// for its file's write, two blocks going down or being read at once, four operations at once, as
+/// many clients as the cell's object clients, S3's 10,000 buckets an owner (research/05 §10.4), 64 rows a coordinator's read; and the
 /// durability a block's scheme meets: Backblaze's 2025 drive AFR, 1.36% a drive-year, per hour;
 /// repair in a day, the slow end research/15 cites ([Cha12]); S3's eleven nines a year
 /// (research/15, "S3's target").
@@ -164,6 +206,7 @@ pub(crate) const GATEWAY_STATED: &str = "\
 gateway.handover_ns = 30000000000
 gateway.window = 2
 gateway.objects = 4
+gateway.clients = 4
 gateway.bucket_quota = 10000
 gateway.scan_rows = 64
 durability.chunk_rate = 0.0000015525114155251142
@@ -510,6 +553,8 @@ pub(crate) struct Pki {
     pub(crate) nodes: BTreeMap<u64, (PathBuf, PathBuf, Vec<u8>)>,
     /// By client id: the certificate's file, the certificate and the key.
     pub(crate) clients: BTreeMap<u64, (PathBuf, Vec<u8>, Vec<u8>)>,
+    /// By object client id: its certificate, the client role's, and its key.
+    pub(crate) objects: BTreeMap<u64, (Vec<u8>, Vec<u8>)>,
     /// The gateway's certificate's file, its certificate and its key.
     pub(crate) gateway: (PathBuf, Vec<u8>, Vec<u8>),
     /// The cell's root key's first generation, which every node that hosts objects holds
@@ -564,6 +609,7 @@ impl Pki {
             std::fs::write(&c, &certificate).unwrap();
             clients.insert(id, (c, certificate, pkcs8));
         }
+        let objects = object_clients(&key, "mantle test cell", validity);
         let (certificate, pkcs8) = issue(&format!("gateway-{GATEWAY}"));
         let c = dir.join(format!("gateway-{GATEWAY}.der"));
         std::fs::write(&c, &certificate).unwrap();
@@ -573,6 +619,7 @@ impl Pki {
             authority_der,
             nodes: issued,
             clients,
+            objects,
             gateway: (c, certificate, pkcs8),
             root_key: root_key(dir),
             serving: false,
@@ -587,13 +634,14 @@ impl Pki {
         } else {
             bounds()
         };
-        let least = mantle_node::bounds::least_transport(&mantle_node::bounds::Stated {
+        let least = mantle_protocol::bounds::least_transport(&mantle_protocol::bounds::Stated {
             peers: self.nodes.len(),
             ranges: 1,
             inflight: 0,
             transfers: usize::from(role == Role::Gateway),
             transport_bytes: 0,
             messages,
+            max_head: mantle_node::node::MAX_HEAD,
         })
         .unwrap();
         (messages, least)
@@ -611,8 +659,10 @@ impl Pki {
         let (certificate, key, _) = &self.nodes[&id];
         let voters: Vec<String> = (1..=self.voters).map(|v| v.to_string()).collect();
         // Each peer's share holds a receive chunk, the largest datagram QUIC carries, for each of
-        // the node's four classes.
-        let peers = self.nodes.len() - 1 + self.clients.len() + usize::from(stored);
+        // the node's four classes: its nodes, the pinned clients and gateway, and the object
+        // clients a node that hosts objects admits.
+        let objects = if gateway { self.objects.len() } else { 0 };
+        let peers = self.nodes.len() - 1 + self.clients.len() + usize::from(stored) + objects;
         let held = held_row();
         let mut text = format!(
             "id = {id}\ndir = {}\nquic = 127.0.0.1:0\nplane = 127.0.0.1:0\nauthority = {}\n\
@@ -648,7 +698,7 @@ impl Pki {
             text.push_str(&format!("peer = {peer} node {}\n", c.display()));
         }
         for (client, (c, _, _)) in &self.clients {
-            text.push_str(&format!("peer = {client} client {}\n", c.display()));
+            text.push_str(&format!("peer = {client} gateway {}\n", c.display()));
         }
         if stored {
             // Its volume, enlisted in the root range in its failure domain; the table holds every
@@ -704,7 +754,7 @@ impl Pki {
             text.push_str(&format!("peer = {peer} node {}\n", c.display()));
         }
         for (client, (c, _, _)) in &self.clients {
-            text.push_str(&format!("peer = {client} client {}\n", c.display()));
+            text.push_str(&format!("peer = {client} gateway {}\n", c.display()));
         }
         if stored {
             let bytes = if gateway {
@@ -725,15 +775,27 @@ impl Pki {
         path
     }
 
-    /// Client `id`'s settings: it knows every node.
+    /// Client `id`'s settings: it knows every node, and asks the ranges as a gateway does.
     pub(crate) fn client_settings(&self, id: u64) -> ClientSettings {
         let (_, certificate, key) = &self.clients[&id];
+        self.settings(id, (certificate, key), Role::Gateway)
+    }
+
+    /// Object client `id`'s settings: it knows every node, and its certificate is the client
+    /// role's, which no node pins.
+    pub(crate) fn object_settings(&self, id: u64) -> ClientSettings {
+        let (certificate, key) = &self.objects[&id];
+        self.settings(id, (certificate, key), Role::Client)
+    }
+
+    /// The settings of `id`, holding `certificate` and its `key`, as `role`.
+    fn settings(&self, id: u64, (certificate, key): (&[u8], &[u8]), role: Role) -> ClientSettings {
         ClientSettings {
             id,
             bind: "127.0.0.1:0".parse().unwrap(),
             credentials: Credentials {
-                chain: vec![CertificateDer::from(certificate.clone())],
-                key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.clone())),
+                chain: vec![CertificateDer::from(certificate.to_vec())],
+                key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.to_vec())),
                 roots: vec![CertificateDer::from(self.authority_der.clone())],
             },
             nodes: self
@@ -745,11 +807,11 @@ impl Pki {
                     certificate: certificate.clone(),
                 })
                 .collect(),
-            role: Role::Client,
-            messages: self.messages(Role::Client).0,
+            role,
+            messages: self.messages(role).0,
             transport_bytes: u64::try_from(self.nodes.len() * 3 * hyper_transport::RECEIVE_CHUNK)
                 .unwrap()
-                .max(self.messages(Role::Client).1),
+                .max(self.messages(role).1),
             seed: None,
         }
     }
@@ -986,8 +1048,9 @@ impl Cell {
     /// that directory, each founder's directory and identity as init wrote them, run as `mantle
     /// serve` from the configuration init wrote, its volumes' and objects' roles as stated, each
     /// told where the others listen. The test's clients are issued by the cell's authority, whose
-    /// key init kept, and pinned in each founder's configuration, a `peer` line each, as an operator
-    /// pins a client; init's own output is what the cell is read from: the authority's name and
+    /// key init kept, and pinned in each founder's configuration as gateways, a `peer` line each,
+    /// as an operator pins a gateway, and its object clients issued for the client role, pinned
+    /// nowhere; init's own output is what the cell is read from: the authority's name and
     /// directory, and each founder's id and directory.
     pub(crate) fn made(args: impl FnOnce(&Path) -> Vec<String>) -> Self {
         Self::made_started(args, false)
@@ -1076,7 +1139,7 @@ impl Cell {
             let config = dir.join("config");
             let mut text = std::fs::read_to_string(&config).unwrap();
             for (client, (c, _, _)) in &clients {
-                text.push_str(&format!("peer = {client} client {}\n", c.display()));
+                text.push_str(&format!("peer = {client} gateway {}\n", c.display()));
             }
             std::fs::write(&config, text).unwrap();
             made.insert(*id, config);
@@ -1087,6 +1150,7 @@ impl Cell {
             authority_der,
             nodes,
             clients,
+            objects: object_clients(&key, &name, validity),
             gateway: (gateway_file, certificate, pkcs8),
             root_key: founders[0].1.join("keys").join("1"),
             serving: true,
@@ -1913,7 +1977,8 @@ impl Cell {
     /// (measurements/2026-10-25-first-operations-on-a-loaded-host.md).
     fn client_begins(&mut self, id: u64) {
         self.progress.remove(&id);
-        self.clients.insert(id, mantle_node::bounds::idle_timeout());
+        self.clients
+            .insert(id, mantle_protocol::bounds::idle_timeout());
     }
 
     /// Starts the gateway on `ops`, a client of its own knowing every node and told where the
@@ -1956,13 +2021,14 @@ impl Cell {
         client: u64,
         ops: Vec<(u64, Op, Vec<u8>)>,
     ) -> Vec<ObjectOutcome> {
-        self.client_begins(client);
+        let id = object_client(client);
+        self.client_begins(id);
         let done = ops.len() as u64;
-        let (settings, bound) = (self.pki.client_settings(client), self.bound_quic());
+        let (settings, bound) = (self.pki.object_settings(id), self.bound_quic());
         let tell = self.tell.clone();
         let thread = std::thread::spawn(move || objects(settings, bound, ops, tell));
         self.until(|c| {
-            if c.progress.get(&client).is_some_and(|d| *d >= done) {
+            if c.progress.get(&id).is_some_and(|d| *d >= done) {
                 Some(())
             } else {
                 None

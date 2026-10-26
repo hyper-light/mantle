@@ -33,7 +33,7 @@ use std::time::Duration;
 use hyper_block::block::BlockFile;
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
-use hyper_datagram::{AdmitAll, EXPORTER_LABEL, ExporterSecret, Plane, SECRET_BYTES};
+use hyper_datagram::{AdmitAll, EXPORTER_LABEL, ExporterSecret, Plane, PlaneLimits, SECRET_BYTES};
 use hyper_durable::{Driven, Handle, Owner, Unbounded};
 use hyper_liveness::{Change, Liveness};
 use hyper_log::{Class as LogClass, Config as LogConfig, Log, LogError, LogStats, Pending, Update};
@@ -54,16 +54,16 @@ use mantle_range::membership::{Next, Replacement};
 use mantle_range::{Applied, Elections, GroupStore, LogStore, Range, RangeMachine, ReplicaError};
 
 use crate::ask::{Asking, CommandAsk, CommandOutcome, ReadAsk, ReadOut, ReadOutcome, Via, Wanted};
-use crate::bounds::{self, Stated};
 use crate::chunk;
-use crate::classes::{self, Bounds, Kind, NodeClasses, Role};
 use crate::command;
 use crate::directory::{Peer, Peers};
 use crate::frame;
 use crate::layout::Layout;
-use crate::object;
 use crate::read::{Query, Read};
 use crate::storage::{Done, Origin, Storage};
+use mantle_protocol::bounds::{self, Stated};
+use mantle_protocol::classes::{self, Bounds, Kind, NodeClasses, Role};
+use mantle_protocol::object;
 
 mod answers;
 mod host;
@@ -749,6 +749,47 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// chunks this node put on its own volumes in-process ([`Node::chunk_bytes`]).
     chunks_received: u64,
     chunks_written: u64,
+    /// The clients the node admits at once (`GatewaySettings::clients`), none where it hosts no
+    /// objects.
+    clients: usize,
+    /// The transport's connection generation when the directory's clients were last kept, and the
+    /// connections it held then, at most its connection bound (`Endpoint::established`).
+    generation: u64,
+    held: Vec<(PeerId, SocketAddr)>,
+}
+
+/// The longest head of a message the node sends or receives: a command's or a read's and its
+/// reply's, a chunk's put, get and reply, and an object's request and reply.
+pub const MAX_HEAD: usize = longer(
+    longer(command::HEAD_BYTES, command::REPLY_HEAD_BYTES),
+    longer(
+        longer(chunk::PUT_HEAD_BYTES, chunk::GET_HEAD_BYTES),
+        longer(chunk::REPLY_HEAD_BYTES, object::MAX_HEAD),
+    ),
+);
+
+const fn longer(a: usize, b: usize) -> usize {
+    if a > b { a } else { b }
+}
+
+/// The plane's bounds: a key for each peer, the epochs of its current connection and the one
+/// replacing it, and a replay window that widens to what one peer's lane may hold in flight.
+pub fn plane(stated: &Stated) -> Result<PlaneLimits, bounds::Unfit> {
+    let window = stated
+        .ranges
+        .max(1)
+        .checked_mul(
+            stated
+                .inflight
+                .checked_add(1)
+                .ok_or(bounds::Unfit("inflight"))?,
+        )
+        .ok_or(bounds::Unfit("plane window"))?;
+    Ok(PlaneLimits {
+        max_peers: stated.peers.max(1),
+        epochs_per_peer: bounds::CONNECTIONS_PER_PEER,
+        window_limit: window.max(hyper_datagram::DEFAULT_WIDTH),
+    })
 }
 
 /// The node's message bounds: a Raft message is at most the larger of a page of entries and one
@@ -829,8 +870,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .map(|h| h.range.settings.max_inflight_msgs)
             .max()
             .unwrap_or(0);
+        let clients = settings.gateway.as_ref().map_or(0, |g| g.clients);
         let stated = Stated {
-            peers: settings.peers.len(),
+            peers: settings
+                .peers
+                .len()
+                .checked_add(clients)
+                .ok_or_else(|| at(Step::Budgets)(NodeError::Bounds("the peers".into())))?,
             ranges: settings.ranges.len(),
             inflight,
             transfers: settings
@@ -839,13 +885,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .saturating_add(settings.chunk_asks),
             transport_bytes: settings.transport_bytes,
             messages,
+            max_head: MAX_HEAD,
         };
         let limits = bounds::limits(&stated)
             .map_err(|e| at(Step::Budgets)(NodeError::Bounds(e.to_string())))?;
         let lane_window = limits.lane_window;
         let io = bounds::io(&stated);
-        let plane_limits = bounds::plane(&stated)
-            .map_err(|e| at(Step::Budgets)(NodeError::Bounds(e.to_string())))?;
+        let plane_limits =
+            plane(&stated).map_err(|e| at(Step::Budgets)(NodeError::Bounds(e.to_string())))?;
 
         let hosting = std::mem::take(&mut settings.ranges);
         let mut owner = Owner::new(vec![waker.clone(); hosting.len()]);
@@ -901,8 +948,18 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             limits,
             congestion: Default::default(),
         };
-        let budget = Fixed::new(settings.transport_bytes, settings.peers.len().max(1));
-        let directory = Peers::new(settings.peers.clone());
+        let budget = Fixed::new(settings.transport_bytes, stated.peers.max(1));
+        // A client is held from its handshake until the next turn finds its connections gone: at
+        // most the identities the transport admits and the handshakes it lets complete meanwhile.
+        let most_clients = if clients == 0 {
+            0
+        } else {
+            limits
+                .admission
+                .identities
+                .saturating_add(limits.admission.pending)
+        };
+        let directory = Peers::new(settings.peers.clone(), most_clients);
         let now = std::time::Instant::now();
         let endpoint = match settings.seed {
             Some(seed) => Endpoint::new_seeded(config, budget, directory, now, seed),
@@ -994,6 +1051,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             moved: 0,
             chunks_received: 0,
             chunks_written: 0,
+            clients,
+            generation: 0,
+            held: Vec::new(),
         };
         for kept in &node.ranges {
             node.owner
@@ -1335,6 +1395,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         while let Some(event) = self.driver.endpoint().poll_event() {
             self.events.push(event);
         }
+        self.keep_clients();
         for event in std::mem::take(&mut self.events) {
             self.on_event(event, now)?;
         }
@@ -1664,12 +1725,24 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     fn on_event(&mut self, event: Event<NodeClasses>, now: u64) -> Result<(), NodeError> {
         match event {
-            // A client's connection carries commands alone; only a node's keys the plane.
+            // Only a node's connection keys the plane; a client past the node's bound is refused
+            // as an identity past the transport's is, which it asks again after.
             Event::Connected {
                 peer,
                 epoch,
                 role: Role::Node,
             } => self.key_plane(peer, epoch, now),
+            Event::Connected {
+                peer,
+                role: Role::Client,
+                ..
+            } if self.driver.endpoint().directory().clients() > self.clients => {
+                let clock = self.driver.clock()?;
+                self.driver
+                    .endpoint()
+                    .refuse(clock, peer, Refusal::Identities);
+                Ok(())
+            }
             Event::Connected { .. } => Ok(()),
             Event::Frame {
                 peer, kind, frame, ..
@@ -1792,6 +1865,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Ok(())
             }
         }
+    }
+
+    /// Forgets the clients whose connections went since the transport's connections last moved, so
+    /// the directory holds the clients connected now (`Peers::keep_clients`).
+    fn keep_clients(&mut self) {
+        let endpoint = self.driver.endpoint();
+        let generation = endpoint.connection_generation();
+        if generation == self.generation {
+            return;
+        }
+        self.generation = generation;
+        endpoint.established(&mut self.held);
+        endpoint.directory_mut().keep_clients(&self.held);
     }
 
     /// Keys the plane for the connection of `epoch` to `peer`: both ends derive the same secret

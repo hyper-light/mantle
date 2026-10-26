@@ -16,7 +16,7 @@
 //! | a block's header and its chunks' places, of a Block range | kind 4; the block (u128) | 0 for none; 1, the header (`BlockHeader`) and the count of places (u32), each record its length (u32) before it |
 //! | a bucket's row, of the Bucket range | kind 5; the bucket's name, its length (u32) before it | 0 for none; 1, then the row (`Bucket`) |
 //! | a bucket's gate, of a Name range routed by a descriptor's generation | kind 6; the bucket's name, its length (u32) before it; the generation (u64) | 0 for no gate; 1, then the gate (`Gate`); 2, then the range's lineage (`Lineage`), where its span went |
-//! | a page of ListObjectsV2, of a Name range | kind 7; the listing's request as an object's request carries it (`crate::object`) | 0 when the bucket has no gate here, or a condemned one; 1, then the page as an object's reply carries it |
+//! | a page of ListObjectsV2, of a Name range | kind 7; the listing's request as an object's request carries it (`mantle_protocol::object`) | 0 when the bucket has no gate here, or a condemned one; 1, then the page as an object's reply carries it |
 //! | a page of ListBuckets, of the Bucket range | kind 8; the owner, the prefix, the bucket after which the page starts (optional: a byte, 0 or 1, before it) and the most buckets (u32) | the page as an object's reply carries it |
 //! | whether a bucket's rows remain, of a Name range routed by a descriptor's generation | kind 9; the bucket; the generation (u64); where the read starts (optional, a key behind its length); the most rows it reads (u32) | 0, a version or delete marker is there; 1, none; 2, then the key the next read starts at, behind its length; 3, then the range's lineage |
 //! | a multipart upload's row, of a Name range | kind 10; the bucket, the key and the upload's ID | 0 for none; 1, then the upload (`Upload`); 2 when the bucket has no gate here, or a condemned one |
@@ -49,7 +49,7 @@ use mantle_meta::{block, bucket, file};
 use mantle_s3::checksum::Algorithm;
 use mantle_s3::list::{self, EntryFrom, Paging, Resume, Step};
 
-use crate::object::{self, Buckets, List, Listed, MAX_TAG, Page, UploadListed, Uploads};
+use mantle_protocol::object::{self, Buckets, List, Listed, MAX_TAG, Page, UploadListed, Uploads};
 
 /// The query's kind: the current version of a key, or a page of the volume table.
 const CURRENT: u8 = 0;

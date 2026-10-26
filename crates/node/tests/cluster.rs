@@ -96,14 +96,15 @@ use mantle_meta::session::Rules;
 use mantle_meta::wire::{Answer, Command, Entry};
 use mantle_node::ask::{CommandOutcome, ReadOutcome};
 use mantle_node::chunk::Status as ChunkStatus;
-use mantle_node::classes::Role;
 use mantle_node::client::{Client, ClientSettings};
-use mantle_node::directory::{Peer, node_name};
+use mantle_node::directory::Peer;
 use mantle_node::node::{
     ChunkAsk, ChunkOutcome, Hosted, Link, Node, NodeSettings, Status, Wall, message_bounds,
 };
 use mantle_node::read::{Query, Read};
 use mantle_node::storage::{Storage, VolumeSettings};
+use mantle_protocol::classes::Role;
+use mantle_protocol::node_name;
 use mantle_range::{ConfState, Range, Settings, Stored};
 
 #[allow(dead_code)]
@@ -401,7 +402,7 @@ impl Pki {
             bind: "127.0.0.1:0".parse().unwrap(),
             credentials: self.credentials(&self.clients[&id]),
             nodes: peers,
-            role: Role::Client,
+            role: Role::Gateway,
             messages: message_bounds(
                 &[hosted(u64::try_from(order.len()).unwrap(), ())],
                 CHUNK_BYTES,
@@ -426,7 +427,7 @@ impl Pki {
         let mut peers = self.node_peers(&others);
         peers.extend(self.clients.iter().map(|(id, (certificate, _))| Peer {
             id: *id,
-            role: Role::Client,
+            role: Role::Gateway,
             certificate: certificate.clone(),
         }));
         // Each peer's share holds a receive chunk, the largest datagram QUIC carries, for each of
@@ -1588,7 +1589,7 @@ impl Cell {
             // `Client::patience` states once it has (RFC 9000 §10.1).
             self.watch
                 .clients
-                .insert(id, mantle_node::bounds::idle_timeout());
+                .insert(id, mantle_protocol::bounds::idle_timeout());
             let (stop, stopping) = mpsc::channel();
             let (learn, learning) = mpsc::channel();
             let settings = self.pki.client_settings(id, &order);

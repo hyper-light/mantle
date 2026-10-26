@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 
 use hyper_measure::alloc;
 use hyper_transport::{ExchangeId, Progress};
-use mantle_node::bounds::{self, Stated};
-use mantle_node::classes::{self, Kind};
 use mantle_node::derive;
+use mantle_protocol::bounds::{self, Stated};
+use mantle_protocol::classes::{self, Kind};
 
 #[path = "support/net.rs"]
 mod net;

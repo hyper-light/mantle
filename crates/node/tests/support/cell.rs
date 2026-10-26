@@ -33,13 +33,14 @@ use mantle_meta::engine::{Engine, Model};
 use mantle_meta::name;
 use mantle_meta::session::Rules;
 use mantle_meta::wire::{Answer, Entry};
-use mantle_node::classes::Role;
 use mantle_node::client::{Asks, Client, ClientSettings};
-use mantle_node::directory::{Peer, node_name};
+use mantle_node::directory::Peer;
 use mantle_node::node::{
     Hosted, Node, NodeLog, NodeSettings, Status, Wall, Written, message_bounds,
 };
 use mantle_node::storage::Storage;
+use mantle_protocol::classes::Role;
+use mantle_protocol::node_name;
 use mantle_range::{ConfState, Range, ReplicaError, Settings};
 
 use crate::history::{Clock, Part, Plan, Steer, Told, open_bucket, work};
@@ -281,7 +282,7 @@ impl Pki {
         let mut peers = self.node_peers(self.nodes.keys().copied().filter(|p| *p != id));
         peers.extend(self.clients.iter().map(|(client, (certificate, _))| Peer {
             id: *client,
-            role: Role::Client,
+            role: Role::Gateway,
             certificate: certificate.clone(),
         }));
         peers
@@ -297,7 +298,7 @@ impl Pki {
             transport_bytes: u64::try_from(nodes.len() * 3 * hyper_transport::RECEIVE_CHUNK)
                 .unwrap(),
             nodes,
-            role: Role::Client,
+            role: Role::Gateway,
             messages: message_bounds(
                 &[Hosted {
                     group: GROUP,

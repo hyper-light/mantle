@@ -13,6 +13,8 @@ publish.workspace = true
 mantle-chunk = { path = "../chunk" }
 mantle-codec = { path = "../codec" }
 mantle-crc = { path = "../crc" }
+# S3's bounds on the names and headers a record holds (src/wire.rs).
+mantle-s3 = { path = "../s3" }
 thiserror.workspace = true
 
 [dev-dependencies]

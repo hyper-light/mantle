@@ -1,0 +1,24 @@
+[package]
+name = "mantle-protocol"
+description = "mantle's native protocol: the kinds of message its QUIC connections carry, their classes, the transport's bounds, and an object's request and reply"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The transport the messages travel on and its driver's socket batching, vendored from hyper-raft
+# (vendor/UPSTREAM.md); hyper-timing's draw is a backoff's jitter.
+hyper-rt-transport = { path = "../../vendor/hyper-rt-transport" }
+hyper-timing = { path = "../../vendor/hyper-timing" }
+hyper-transport = { path = "../../vendor/hyper-transport" }
+mantle-codec = { path = "../codec" }
+# S3's semantics an object's messages carry: its checksums, a listing's start, its bounds.
+mantle-s3 = { path = "../s3" }
+thiserror.workspace = true
+
+[lints]
+workspace = true

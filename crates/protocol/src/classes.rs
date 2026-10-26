@@ -1,14 +1,14 @@
 //! What a node's QUIC connections carry (docs/design/node.md §3.1): each message's kind, the class
 //! it travels in, and the roles that may send it. A class is decided by what a message is and who
 //! sends it, never by the stream a peer chose (audit §13.3). Consensus control that fits a datagram
-//! travels on the sealed plane instead, ahead of everything (`crate::route`).
+//! travels on the sealed plane instead, ahead of everything.
 //!
 //! | Kind | Class | Sent by | Carries |
 //! |---|---|---|---|
 //! | `Raft` | replication, on a lane | nodes | a range's Raft message: appends with entries, and control too large for a datagram |
-//! | `Command` | request, an exchange | anyone | a gateway's or client's commands to a range |
-//! | `ChunkPut`, `ChunkGet` | transfer, an exchange | nodes and gateways | a chunk's bytes to the volume that keeps them, a range of them back (`crate::chunk`) |
-//! | `Object` | transfer, an exchange | anyone | a bucket made, an object's bytes put, a range of them got (`crate::object`) |
+//! | `Command`, `Read` | request, an exchange | nodes and gateways | a gateway's commands to a range, and its reads |
+//! | `ChunkPut`, `ChunkGet` | transfer, an exchange | nodes and gateways | a chunk's bytes to the volume that keeps them, a range of them back (mantle-node's `chunk`) |
+//! | `Object` | transfer, an exchange | anyone | a bucket made, an object's bytes put, a range of them got ([`crate::object`]) |
 //! | `Snapshot` | bulk, an exchange | nodes | a range's snapshot to a member that lags past the log's start |
 //!
 //! The frame bound of each class is the largest message of that kind the node's ranges can make,
@@ -18,6 +18,13 @@
 use std::sync::OnceLock;
 
 use hyper_transport::{Classes, Embedded};
+
+/// Where a Raft frame's own checksum lies, and what it covers: its CRC-32C first, of every byte
+/// after it (mantle-node's `frame`), which the transport checks on a lane.
+pub const RAFT_CHECKSUM: Embedded = Embedded {
+    covered_from: 4,
+    at: 0,
+};
 
 /// A message's kind on the wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -122,14 +129,16 @@ impl Classes for NodeClasses {
         match (kind, role) {
             (Kind::Raft, Role::Node) => Some(Class::Replication),
             (Kind::Snapshot, Role::Node) => Some(Class::Bulk),
-            (Kind::Command | Kind::Read, _) => Some(Class::Request),
+            // A range applies what a command says and answers what a read asks of its rows: a
+            // gateway's to ask, which judges a client's object operation first (node.md §3.6).
+            (Kind::Command | Kind::Read, Role::Node | Role::Gateway) => Some(Class::Request),
             // A chunk is a gateway's to place, a node's gateway's included; a client asks a
             // gateway for objects and never writes a volume (node.md §3.6).
             (Kind::ChunkPut | Kind::ChunkGet, Role::Node | Role::Gateway) => Some(Class::Transfer),
             // An object's body is a large request's: the transfer level (node.md §3.1).
             (Kind::Object, _) => Some(Class::Transfer),
             (Kind::Raft | Kind::Snapshot, Role::Gateway | Role::Client)
-            | (Kind::ChunkPut | Kind::ChunkGet, Role::Client) => None,
+            | (Kind::Command | Kind::Read | Kind::ChunkPut | Kind::ChunkGet, Role::Client) => None,
         }
     }
 
@@ -162,11 +171,11 @@ impl Classes for NodeClasses {
             .find(|kind| Self::kind_code(*kind) == code)
     }
 
-    /// A Raft frame carries its own CRC-32C first, of every byte after it (`crate::frame`): the
-    /// transport verifies it on receipt rather than sum the frame twice.
+    /// A Raft frame carries its own CRC-32C first, of every byte after it ([`RAFT_CHECKSUM`]):
+    /// the transport verifies it on receipt rather than sum the frame twice.
     fn embedded_checksum(kind: Kind) -> Option<Embedded> {
         if kind == Kind::Raft {
-            Some(crate::frame::EMBEDDED)
+            Some(RAFT_CHECKSUM)
         } else {
             None
         }
@@ -212,15 +221,30 @@ mod tests {
         for role in [Role::Gateway, Role::Client] {
             assert_eq!(NodeClasses::class_of(Kind::Raft, role), None);
             assert_eq!(NodeClasses::class_of(Kind::Snapshot, role), None);
-            assert_eq!(
-                NodeClasses::class_of(Kind::Command, role),
-                Some(Class::Request)
-            );
         }
         assert_eq!(
             NodeClasses::class_of(Kind::Raft, Role::Node),
             Some(Class::Replication)
         );
+    }
+
+    /// A client asks for objects and nothing else: a range's commands and reads are a gateway's,
+    /// which judges the client's operation before it asks them.
+    #[test]
+    fn a_client_sends_objects_alone() {
+        for kind in KINDS {
+            let class = NodeClasses::class_of(kind, Role::Client);
+            if kind == Kind::Object {
+                assert_eq!(class, Some(Class::Transfer));
+            } else {
+                assert_eq!(class, None, "{kind:?}");
+            }
+        }
+        for role in [Role::Node, Role::Gateway] {
+            for kind in [Kind::Command, Kind::Read] {
+                assert_eq!(NodeClasses::class_of(kind, role), Some(Class::Request));
+            }
+        }
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! The gateway host (docs/design/node.md §4.2, §5): for each object exchange a client or gateway
-//! asks of the node (`crate::object`), the node runs the bucket's coordinator
+//! asks of the node (`mantle_protocol::object`), the node runs the bucket's coordinator
 //! (`mantle_meta::coordinator`), the gateway's drivers (`mantle_gateway::put`, `get`) or the
 //! ranges' commands and reads an operation needs, and serves each one's requests itself: a
 //! placement from its own replica of the volume table (`crate::place`), a chunk on its own volume
@@ -43,13 +43,14 @@ use mantle_s3::seal::{DataKey, WrappingKey};
 
 use super::{ChunkAsk, ChunkOutcome, Node, NodeError, NodeLog, PIECE, take_done};
 use crate::ask::{CommandAsk, CommandOutcome, ReadAsk, ReadOutcome};
-use crate::classes::Class;
 use crate::door::{self, Piece};
-use crate::object::{
-    self, Head, Headers, List, Listing, MAX_PAGE_PARTS, Op, PartListed, Parts, Reply, Status,
-};
 use crate::place;
 use crate::read::{Query, Read};
+use mantle_protocol::classes::Class;
+use mantle_protocol::object::{
+    self, Head, Headers, List, Listing, MAX_PAGE_PARTS, Op, PartListed, Parts, Reply, Status,
+    Stored,
+};
 
 /// What the gateway host is given (docs/design/node.md §4.6, §5).
 pub struct GatewaySettings {
@@ -62,6 +63,11 @@ pub struct GatewaySettings {
     pub window: usize,
     /// The object operations the host runs at once; one past them is answered `SlowDown`.
     pub objects: usize,
+    /// The clients of the native protocol it admits at once, each by the certificate the cell's
+    /// authority issued it for the client role (node.md §3.6). One past them is refused as the
+    /// transport refuses an identity past its bound (`Refusal::Identities`), which the client asks
+    /// again after.
+    pub clients: usize,
     /// The buckets an owner may have (S3's 10,000, research/05 §10.4).
     pub bucket_quota: u32,
     /// The rows a bucket's coordinator passes in one read or collection (`coordinator::Bounds`).
@@ -92,7 +98,7 @@ pub(crate) struct Job {
 
 /// Where a job's operation came in: its body is read and its reply written there.
 enum Door {
-    /// A native exchange, the operation's fields at its body's start (`crate::object`).
+    /// A native exchange, the operation's fields at its body's start (`mantle_protocol::object`).
     Exchange(ExchangeId),
     /// The S3 listener's, in-process (`crate::door`).
     Local(Box<Local>),
@@ -396,12 +402,30 @@ fn put_status(error: &PutError) -> Status {
     }
 }
 
-/// A checksum as the version keeps it: a full-object value (05 §3.3).
-fn kept(c: &checksum::Checksum) -> record::Checksum {
-    record::Checksum {
+/// A put's checksum as its reply carries it: a full-object value (05 §3.3).
+fn kept(c: &checksum::Checksum) -> Stored {
+    Stored {
         algorithm: c.algorithm.code(),
         parts: 0,
         value: c.bytes.clone(),
+    }
+}
+
+/// A version's checksum as a reply carries it.
+fn shown(c: &record::Checksum) -> Stored {
+    Stored {
+        algorithm: c.algorithm,
+        parts: c.parts,
+        value: c.value.clone(),
+    }
+}
+
+/// A bucket's versioning as GetBucketVersioning answers it: none for a bucket never versioned.
+fn answered(versioning: Versioning) -> Option<mantle_s3::body::Versioning> {
+    match versioning {
+        Versioning::Unversioned => None,
+        Versioning::Enabled => Some(mantle_s3::body::Versioning::Enabled),
+        Versioning::Suspended => Some(mantle_s3::body::Versioning::Suspended),
     }
 }
 
@@ -413,7 +437,7 @@ fn facts(status: Status, order: u64, version: &Version) -> Reply {
         version: name::shown_id(version.null, order),
         etag: version.etag.clone(),
         modified: object::seconds(version.modified_ns),
-        checksum: version.checksum.clone(),
+        checksum: version.checksum.as_ref().map(shown),
         marker: version.marker,
         range: None,
         versioning: None,
@@ -426,6 +450,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// An object's request arrived on `exchange` from `peer`, its body `body` bytes: a job that
     /// reads its fields first, or the reply it gets at once.
     pub(super) fn take_object(&mut self, exchange: ExchangeId, peer: PeerId, body: Option<u64>) {
+        // A client's operations act for the account its certificate names; one whose
+        // connections have all gone since asking is no longer known, and nothing is taken.
+        let Some(principal) = self.driver.endpoint().directory().principal(peer) else {
+            self.driver
+                .endpoint()
+                .refuse_exchange(exchange, Refusal::Identity);
+            return;
+        };
         let head = Head::decode(
             self.driver.endpoint().head(exchange).unwrap_or_default(),
             body,
@@ -444,7 +476,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         self.jobs.push(Job {
             door: Door::Exchange(exchange),
-            principal: peer.to_string(),
+            principal,
             work,
             pending: Vec::new(),
         });
@@ -1847,7 +1879,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     version: done.version.clone(),
                     etag: done.etag.clone(),
                     size: done.size,
-                    checksum: done.checksum.clone(),
+                    checksum: done.checksum.as_ref().map(shown),
                     ..Reply::status(Status::Done)
                 },
                 Err(error) => Reply::status(complete_status(error)),
@@ -2094,7 +2126,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Some(row) if row.owner != job.principal => Reply::status(Status::AccessDenied),
                 Some(row) => match **single {
                     Single::Versioning(_) => Reply {
-                        versioning: Some(row.versioning),
+                        versioning: answered(row.versioning),
                         ..Reply::status(Status::Done)
                     },
                     _ => Reply::status(Status::Done),
@@ -2424,7 +2456,10 @@ fn work(op: Op, carry: Vec<u8>) -> Work {
             bucket, versioning, ..
         } => Work::Command(Box::new(Commanding {
             bucket,
-            then: Then::Versioning(versioning),
+            then: Then::Versioning(match versioning {
+                mantle_s3::body::Versioning::Enabled => Versioning::Enabled,
+                mantle_s3::body::Versioning::Suspended => Versioning::Suspended,
+            }),
             asked: false,
         })),
         Op::GetVersioning { bucket } => Work::Read(Box::new(Single::Versioning(bucket))),

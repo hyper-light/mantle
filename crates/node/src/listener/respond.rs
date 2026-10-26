@@ -4,14 +4,13 @@
 //! outcome is unknown is `500 InternalError`, never a success or a refusal with no effect.
 
 use mantle_http::write::Length;
-use mantle_meta::record::{self, Versioning};
 use mantle_s3::checksum::{Algorithm, Checksum, ChecksumType};
 use mantle_s3::list::{self as s3list, Paging};
 use mantle_s3::response::{self as s3, Entry, Failure};
 use mantle_s3::route::{Operation, Query, Route};
 
 use super::request::Refused;
-use crate::object::{Listing, Reply, Status};
+use mantle_protocol::object::{Listing, Reply, Status, Stored};
 
 /// The region whose buckets S3's `LocationConstraint` names by its empty value (13 §9.5).
 const US_EAST_1: &str = "us-east-1";
@@ -314,12 +313,7 @@ fn done(echo: &Echo<'_>, reply: &Reply, ids: &Ids) -> Result<Response, Refused> 
         Operation::DeleteBucket | Operation::AbortMultipartUpload => empty(204, fields),
         Operation::PutBucketVersioning => empty(200, fields),
         Operation::GetBucketVersioning => {
-            let status = match reply.versioning {
-                Some(Versioning::Enabled) => Some(mantle_s3::body::Versioning::Enabled),
-                Some(Versioning::Suspended) => Some(mantle_s3::body::Versioning::Suspended),
-                Some(Versioning::Unversioned) | None => None,
-            };
-            document(fields, s3::versioning_configuration(status))
+            document(fields, s3::versioning_configuration(reply.versioning))
         }
         Operation::ListBuckets => document(fields, list_buckets(echo, reply)?),
         Operation::ListObjectsV2 => document(fields, list_objects(echo, reply)?),
@@ -436,7 +430,7 @@ fn kind(parts: u16) -> ChecksumType {
 }
 
 /// A kept checksum's value as its header writes it: base64, a composite's followed by `-n`.
-fn checksum_value(kept: &record::Checksum) -> Option<String> {
+fn checksum_value(kept: &Stored) -> Option<String> {
     let algorithm = Algorithm::from_code(kept.algorithm)?;
     let value = Checksum {
         algorithm,
@@ -581,8 +575,8 @@ fn list_parts(echo: &Echo<'_>, reply: &Reply) -> Result<String, Refused> {
     let max_parts = query
         .value("max-parts")
         .and_then(|m| m.trim().parse().ok())
-        .unwrap_or(crate::object::MAX_PAGE_PARTS)
-        .min(crate::object::MAX_PAGE_PARTS);
+        .unwrap_or(mantle_protocol::object::MAX_PAGE_PARTS)
+        .min(mantle_protocol::object::MAX_PAGE_PARTS);
     s3::list_parts(&s3::ListParts {
         bucket: echo.route.bucket.as_deref().unwrap_or_default(),
         key: echo.route.key.as_deref().unwrap_or_default(),

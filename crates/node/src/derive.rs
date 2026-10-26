@@ -30,10 +30,10 @@ use mantle_meta::session::Rules;
 use mantle_meta::{key, wire};
 use mantle_range::{ConfState, Range, Settings};
 
-use crate::classes::Role;
 use crate::node::Hosted;
 use crate::process::{Enlisting, GatewayConfig, PeerLine, ProcessConfig, S3Stated};
 use crate::storage::VolumeSettings;
+use mantle_protocol::classes::Role;
 
 /// focal's election timeout and heartbeat interval in ticks (docs/design/node.md §2.4), which
 /// ranges keep though they elect by suspicion, which takes no ticks.
@@ -134,21 +134,25 @@ pub fn probe_budget() -> Result<Duration, DeriveError> {
 }
 
 /// What a node that hosts objects runs its drivers with, at the floor: a window of one block;
-/// two operations at once, of any kind, so a put and a get; S3's quota of buckets; one row each
-/// step of a bucket's attempt passes or removes, the least that moves it; HDFS's handover.
+/// two operations at once, of any kind, so a put and a get; as many clients of the native protocol
+/// admitted at once, each with an operation it may run; S3's quota of buckets; one row each step
+/// of a bucket's attempt passes or removes, the least that moves it; HDFS's handover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Gateway {
     pub window: usize,
     pub objects: usize,
+    pub clients: usize,
     pub bucket_quota: u32,
     pub scan_rows: u32,
     pub handover_ns: u64,
 }
 
 pub fn gateway() -> Result<Gateway, DeriveError> {
+    let objects = 2;
     Ok(Gateway {
         window: 1,
-        objects: 2,
+        objects,
+        clients: objects,
         bucket_quota: BUCKET_QUOTA,
         scan_rows: 1,
         handover_ns: u64::try_from(HANDOVER.as_nanos())
@@ -691,8 +695,8 @@ const PLANE_PEER_BYTES: u64 = 182;
 /// QUIC's datagrams are none: no node sends them, though hyper-quic's default takes up to
 /// 1,250,000 bytes of them a connection. What aws-lc keeps of keys is in its own heap, which a
 /// counting allocator does not see.
-pub fn transport_bytes_beside(stated: &crate::bounds::Stated) -> Option<u64> {
-    let limits = crate::bounds::limits(stated).ok()?;
+pub fn transport_bytes_beside(stated: &mantle_protocol::bounds::Stated) -> Option<u64> {
+    let limits = mantle_protocol::bounds::limits(stated).ok()?;
     let count = |n: usize| u64::try_from(n).ok();
     let peers = count(stated.peers.max(1))?;
     let connections = count(limits.admission.connections)?;
@@ -708,11 +712,11 @@ pub fn transport_bytes_beside(stated: &crate::bounds::Stated) -> Option<u64> {
         .checked_add(limits.window_ceiling)?;
     let sockets = connections
         .checked_add(2)?
-        .checked_mul(count(crate::bounds::io(stated).held_bound())?)?;
+        .checked_mul(count(mantle_protocol::bounds::io(stated).held_bound())?)?;
     endpoint
         .checked_add(connections.checked_mul(connection)?)?
         .checked_add(sockets)?
-        .checked_add(plane_bytes(&crate::bounds::plane(stated).ok()?)?)?
+        .checked_add(plane_bytes(&crate::node::plane(stated).ok()?)?)?
         .checked_add(liveness_bytes(stated.peers)?)
 }
 
@@ -1374,8 +1378,15 @@ pub fn derive(
         .collect();
     let messages = crate::node::message_bounds(&hosted, chunk)
         .map_err(|e| DeriveError::Bounds(e.to_string()))?;
-    let mut bounds = crate::bounds::Stated {
-        peers: stated.peers.len(),
+    // A node that hosts objects admits its clients beside its pinned peers, each an identity of
+    // its transport (node.md §3.6).
+    let clients = if hosts { gateway.clients } else { 0 };
+    let mut bounds = mantle_protocol::bounds::Stated {
+        peers: stated
+            .peers
+            .len()
+            .checked_add(clients)
+            .ok_or(overflow("the transport's peers"))?,
         ranges,
         inflight: settings.max_inflight_msgs,
         transfers: transfers
@@ -1383,11 +1394,13 @@ pub fn derive(
             .ok_or(overflow("the node's transfers"))?,
         transport_bytes: 0,
         messages,
+        max_head: crate::node::MAX_HEAD,
     };
-    let transport_bytes =
-        crate::bounds::least_transport(&bounds).map_err(|e| DeriveError::Bounds(e.to_string()))?;
+    let transport_bytes = mantle_protocol::bounds::least_transport(&bounds)
+        .map_err(|e| DeriveError::Bounds(e.to_string()))?;
     bounds.transport_bytes = transport_bytes;
-    let limits = crate::bounds::limits(&bounds).map_err(|e| DeriveError::Bounds(e.to_string()))?;
+    let limits =
+        mantle_protocol::bounds::limits(&bounds).map_err(|e| DeriveError::Bounds(e.to_string()))?;
     let beside = transport_bytes_beside(&bounds).ok_or(overflow("the transport"))?;
 
     // The floor, class by class.
@@ -1545,6 +1558,7 @@ pub fn derive(
         handover_ns: gateway.handover_ns,
         window: gateway.window,
         objects: gateway.objects,
+        clients: gateway.clients,
         bucket_quota: gateway.bucket_quota,
         scan_rows: gateway.scan_rows,
         chunk_rate: rates.chunk,
@@ -1914,6 +1928,14 @@ fn say_objects(
         gateway.objects,
         Kind::Derived,
         "the floor: two operations at once of any kind, a put and a get (node.md §1.4)",
+    );
+    said.add(
+        "gateway.clients",
+        gateway.clients,
+        Kind::Derived,
+        "as many clients of the native protocol at once as operations, each with one it may run, \
+         admitted by the certificates the cell's authority issued for the client role (node.md \
+         §3.6)",
     );
     said.add(
         "gateway.bucket_quota",
@@ -2421,20 +2443,21 @@ mod tests {
             Some(datagram + 2 * (datagram + PLANE_PEER_BYTES + 2 * 8))
         );
         let (settings, _) = cell(3).unwrap();
-        let stated = |peers: usize, transport_bytes: u64| crate::bounds::Stated {
+        let stated = |peers: usize, transport_bytes: u64| mantle_protocol::bounds::Stated {
             peers,
             ranges: 5,
             inflight: settings.max_inflight_msgs,
             transfers: 38,
             transport_bytes,
-            messages: crate::classes::Bounds {
+            messages: mantle_protocol::classes::Bounds {
                 replication: settings.max_entry_bytes + 1_024,
                 request: settings.max_entry_bytes + 1_024,
                 transfer: u64::from(u32::MAX),
                 bulk: u64::from(u32::MAX),
             },
+            max_head: crate::node::MAX_HEAD,
         };
-        let least = |peers| crate::bounds::least_transport(&stated(peers, 0)).unwrap();
+        let least = |peers| mantle_protocol::bounds::least_transport(&stated(peers, 0)).unwrap();
         let one = transport_bytes_beside(&stated(1, least(1))).unwrap();
         assert!(one > CERTIFICATE_COMPRESSION_BYTES);
         assert!(transport_bytes_beside(&stated(2, least(2))).unwrap() > one);
@@ -2795,7 +2818,7 @@ mod tests {
                     "/node/identity/3.der",
                     Some(("[::1]:7000", "[::1]:7001")),
                 ),
-                peer(9, Role::Client, "/node/identity/9.der", None),
+                peer(9, Role::Gateway, "/node/identity/9.der", None),
             ],
             ranges: vec![
                 (0x10, Layer::Root),

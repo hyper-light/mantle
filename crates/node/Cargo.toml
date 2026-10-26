@@ -34,6 +34,9 @@ mantle-cert = { path = "../cert" }
 # The engine a node keeps its ranges' rows in (`mantle_range::Stored`), its store's settings.
 mantle-engine = { path = "../engine" }
 mantle-meta = { path = "../meta" }
+# The native protocol: the kinds of message and their classes, the transport's bounds, an
+# object's request and reply, which the node's clients share.
+mantle-protocol = { path = "../protocol" }
 mantle-range = { path = "../range" }
 # What the gateway host runs (node.md §5): the drivers, the S3 layer's limits and sealing, and the
 # durability model a block's scheme is chosen by.

@@ -15,7 +15,7 @@ use hyper_rt::RtError;
 use hyper_rt::sync::{ChannelReceiver, Sender, SyncError, channel};
 use mantle_s3::checksum::{Algorithm, Checksum};
 
-use crate::object::{Op, Reply, Status};
+use mantle_protocol::object::{Op, Reply, Status};
 
 /// An operation the listener hands the host.
 pub struct Request {

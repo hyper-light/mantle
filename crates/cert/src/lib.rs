@@ -8,16 +8,21 @@
 //! cA, both critical: RFC 5280 §4.2.1.3, §4.2.1.9). A node's certificate names it by one DNS name
 //! in its `subjectAltName`, which a dial verifies against the name the peer is known by
 //! (RFC 5280 §4.2.1.6, RFC 6125); it is no authority, signs only (`digitalSignature`), and may
-//! serve either end of a connection (`extKeyUsage` serverAuth and clientAuth, §4.2.1.12). A serial
+//! serve either end of a connection (`extKeyUsage` serverAuth and clientAuth, §4.2.1.12). A client
+//! of the native protocol's certificate names it by its subject's common name and the account it
+//! acts for by its subject's organization (RFC 5280 §4.1.2.6), and serves a connection's client end
+//! alone (`extKeyUsage` clientAuth): a TLS server verifies a client's certificate for clientAuth and
+//! a client a server's for serverAuth (RFC 5280 §4.2.1.12), so a client's never serves as a node's.
+//! [`client_names`] reads those names back from a certificate of exactly that profile. A serial
 //! is 16 octets, 126 bits of them the issuer's draw ([`Serial`]): positive and within the 20
 //! octets RFC 5280 §4.1.2.2 allows, past the 64 random bits the CA/Browser Forum's Baseline
 //! Requirements §7.1 ask, and of one length whatever its bits. A key pair and a serial are drawn
 //! from the operating system's random source, or derived by the caller (a simulation, whose run
 //! is its seed and whose handshakes compress the certificates they carry, RFC 8879: the same
-//! bytes, the same sizes). A certificate is read back only for a start's check that its cell's
+//! bytes, the same sizes). A certificate is read back for a start's check that its cell's
 //! authority issued it ([`issued_by`], RFC 5280 §6.1.3 (a)), so a directory holding another cell's
-//! certificates refuses to start rather than failing each handshake; the TLS stack verifies what
-//! peers present.
+//! certificates refuses to start rather than failing each handshake, and for a client's names; the
+//! TLS stack verifies what peers present.
 //!
 //! The S3 endpoint's certificates are stock clients' to verify, through their platforms' TLS
 //! stacks, and are ECDSA P-256 with SHA-256 throughout (RFC 5480, RFC 5758 §3.2): the one scheme
@@ -241,6 +246,7 @@ pub fn authority(
         &Subject {
             name,
             key: SubjectKey::Ed25519(key.public_key()),
+            organization: None,
         },
         (validity, serial),
         Role::Authority,
@@ -268,10 +274,86 @@ pub fn node(
         &Subject {
             name: dns_name,
             key: SubjectKey::Ed25519(public_key),
+            organization: None,
         },
         (validity, serial),
         Role::Node { dns_name },
     )
+}
+
+/// A client's certificate: issued by the authority holding `authority_key` and named
+/// `authority_name`, for the client whose public key is `public_key`, named `name` (its subject's
+/// common name) and acting for `account` (its subject's organization), each within X.520's 64
+/// characters (RFC 5280 Appendix A.1, `ub-common-name` and `ub-organization-name`).
+pub fn client(
+    authority_key: &KeyPair,
+    authority_name: &str,
+    public_key: &[u8],
+    (name, account): (&str, &str),
+    (validity, serial): (Validity, Serial),
+) -> Result<Vec<u8>, CertError> {
+    check_name(authority_name)?;
+    check_name(name)?;
+    check_name(account)?;
+    if public_key.len() != 32 {
+        return Err(CertError::Key);
+    }
+    issue(
+        Signer::Ed25519(authority_key),
+        authority_name,
+        &Subject {
+            name,
+            key: SubjectKey::Ed25519(public_key),
+            organization: Some(account),
+        },
+        (validity, serial),
+        Role::Client,
+    )
+}
+
+/// What a client's certificate names ([`client`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientNames<'a> {
+    /// Its subject's common name.
+    pub name: &'a str,
+    /// The account it acts for, its subject's organization.
+    pub account: &'a str,
+}
+
+/// The names a client's certificate gives, where `certificate` is one of exactly this profile's:
+/// its subject an organization and a common name, and its extensions a client's alone (no CA, a
+/// signer of handshakes, `extKeyUsage` clientAuth and nothing else), so a node's certificate, which
+/// may serve a connection's server end, names no client. Who issued it is not checked here: the TLS
+/// stack verified the chain at the handshake that presented it.
+pub fn client_names(certificate: &[u8]) -> Result<ClientNames<'_>, CertError> {
+    let read = read(certificate)?;
+    let mut profile = Vec::new();
+    extensions(&mut profile, &Role::Client)?;
+    if read.extensions != profile.as_slice() {
+        return Err(CertError::Malformed);
+    }
+    let mut subject = der::expect(&mut &*read.subject, der::SEQUENCE)?.content;
+    let account = attribute(&mut subject, oid::ORGANIZATION_NAME)?;
+    let name = attribute(&mut subject, oid::COMMON_NAME)?;
+    if !subject.is_empty() {
+        return Err(CertError::Malformed);
+    }
+    Ok(ClientNames { name, account })
+}
+
+/// A relative distinguished name of one attribute at the front of `rdns`, the attribute `id` as a
+/// UTF8String (RFC 5280 §4.1.2.4), its value.
+fn attribute<'a>(rdns: &mut &'a [u8], id: &[u8]) -> Result<&'a str, CertError> {
+    let mut rdn = der::expect(rdns, der::SET)?.content;
+    let mut atv = der::expect(&mut rdn, der::SEQUENCE)?.content;
+    if !rdn.is_empty() || der::expect(&mut atv, der::OID)?.content != id {
+        return Err(CertError::Malformed);
+    }
+    let value = der::expect(&mut atv, der::UTF8_STRING)?.content;
+    if !atv.is_empty() {
+        return Err(CertError::Malformed);
+    }
+    std::str::from_utf8(value).map_err(|_| CertError::Malformed)
 }
 
 /// The longest an S3 endpoint's certificate is valid, in seconds: 825 days of 86,400, past which
@@ -303,6 +385,7 @@ pub fn endpoint_authority(
         &Subject {
             name,
             key: SubjectKey::P256(public_key),
+            organization: None,
         },
         (validity, serial),
         Role::EndpointAuthority {
@@ -350,6 +433,7 @@ pub fn endpoint(
         &Subject {
             name: common,
             key: SubjectKey::P256(public_key),
+            organization: None,
         },
         (validity, serial),
         Role::Endpoint {
@@ -445,6 +529,8 @@ pub fn check_dns_name(name: &str) -> Result<(), CertError> {
 struct Subject<'a> {
     name: &'a str,
     key: SubjectKey<'a>,
+    /// The organization a client's subject names before its common name.
+    organization: Option<&'a str>,
 }
 
 /// A subject's public key, as its certificate states it (RFC 5280 §4.1.2.7).
@@ -495,6 +581,8 @@ enum Role<'a> {
     Node {
         dns_name: &'a str,
     },
+    /// A client of the native protocol: a connection's client end alone.
+    Client,
     /// The S3 endpoint's authority: an authority's extensions, and its key's identifier.
     EndpointAuthority {
         key_id: [u8; KEY_ID_BYTES],
@@ -549,7 +637,10 @@ fn tbs_certificate(
             time::encode(v, validity.not_before)?;
             time::encode(v, validity.not_after)
         })?;
-        name(t, subject.name)?;
+        match subject.organization {
+            Some(organization) => client_name(t, organization, subject.name)?,
+            None => name(t, subject.name)?,
+        }
         nested(t, der::SEQUENCE, |k| match subject.key {
             SubjectKey::Ed25519(key) => {
                 ed25519_algorithm(k)?;
@@ -590,6 +681,25 @@ fn name(out: &mut Vec<u8>, common_name: &str) -> Result<(), CertError> {
     })
 }
 
+/// A client's subject: its organization, then its common name, each a relative distinguished
+/// name of one attribute as a UTF8String (RFC 5280 §4.1.2.4, §4.1.2.6).
+fn client_name(out: &mut Vec<u8>, organization: &str, common_name: &str) -> Result<(), CertError> {
+    nested(out, der::SEQUENCE, |n| {
+        for (id, value) in [
+            (oid::ORGANIZATION_NAME, organization),
+            (oid::COMMON_NAME, common_name),
+        ] {
+            nested(n, der::SET, |rdn| {
+                nested(rdn, der::SEQUENCE, |atv| {
+                    tlv(atv, der::OID, id)?;
+                    tlv(atv, der::UTF8_STRING, value.as_bytes())
+                })
+            })?;
+        }
+        Ok(())
+    })
+}
+
 /// One extension: its identifier, `critical` only where true (DER omits a default), and its
 /// value's DER inside an OCTET STRING (RFC 5280 §4.1).
 fn extension(
@@ -617,6 +727,7 @@ const KEY_CERT_SIGN_AND_CRL_SIGN: (u8, u8) = (1, 0x06);
 fn extensions(out: &mut Vec<u8>, role: &Role<'_>) -> Result<(), CertError> {
     match role {
         Role::Authority => authority_extensions(out),
+        Role::Client => leaf_extensions(out, &[oid::CLIENT_AUTH]),
         Role::Node { dns_name } => {
             leaf_extensions(out, &[oid::SERVER_AUTH, oid::CLIENT_AUTH])?;
             extension(out, oid::SUBJECT_ALT_NAME, false, |v| {
@@ -717,11 +828,13 @@ struct Certificate<'a> {
     /// The subject's Ed25519 public key, and the issuer's Ed25519 signature over `tbs`.
     public_key: &'a [u8],
     signature: &'a [u8],
+    /// Its extensions, the content of their SEQUENCE.
+    extensions: &'a [u8],
 }
 
 /// The certificate in `der`, as this profile writes one: v3, Ed25519 throughout (RFC 8410), its
-/// times in RFC 5280's forms; the extensions after its key are not read, the TLS stack checking a
-/// peer's at its handshake. Anything else, and anything after the certificate, is refused.
+/// times in RFC 5280's forms, its extensions last, which the TLS stack checks of a peer's at its
+/// handshake. Anything else, and anything after the certificate, is refused.
 fn read(der: &[u8]) -> Result<Certificate<'_>, CertError> {
     let mut input = der;
     let mut certificate = der::expect(&mut input, der::SEQUENCE)?.content;
@@ -756,6 +869,11 @@ fn read(der: &[u8]) -> Result<Certificate<'_>, CertError> {
     if !key.is_empty() {
         return Err(CertError::Malformed);
     }
+    let mut explicit = der::expect(&mut fields, der::EXPLICIT_3)?.content;
+    let extensions = der::expect(&mut explicit, der::SEQUENCE)?.content;
+    if !explicit.is_empty() || !fields.is_empty() {
+        return Err(CertError::Malformed);
+    }
     Ok(Certificate {
         tbs: tbs.whole,
         issuer,
@@ -766,6 +884,7 @@ fn read(der: &[u8]) -> Result<Certificate<'_>, CertError> {
         },
         public_key,
         signature,
+        extensions,
     })
 }
 
@@ -907,6 +1026,75 @@ mod tests {
                 "verified under another node's name"
             );
         }
+    }
+
+    /// A client's certificate verifies under its authority at a connection's client end and at no
+    /// server's, names the client and its account, and is the only kind that does: a node's,
+    /// which may serve, names no client, and one another authority issued fails the handshake.
+    #[test]
+    fn a_client_certificate_serves_a_client_end_alone_and_names_its_client() {
+        let authority_key = KeyPair::generate().unwrap();
+        let ca = authority(
+            &authority_key,
+            "mantle cell authority",
+            day_around_now(),
+            Serial::draw().unwrap(),
+        )
+        .unwrap();
+        let client_key = KeyPair::generate().unwrap();
+        let issued = client(
+            &authority_key,
+            "mantle cell authority",
+            client_key.public_key(),
+            ("client-7", "123456789012"),
+            (day_around_now(), Serial::draw().unwrap()),
+        )
+        .unwrap();
+        as_client(&ca, &issued).unwrap();
+        assert!(as_server(&ca, &issued, "client-7").is_err());
+        assert_eq!(
+            client_names(&issued),
+            Ok(ClientNames {
+                name: "client-7",
+                account: "123456789012",
+            })
+        );
+        assert_eq!(issued_by(&issued, &ca, now()), Ok(()));
+        let node_key = KeyPair::generate().unwrap();
+        let node_cert = node(
+            &authority_key,
+            "mantle cell authority",
+            node_key.public_key(),
+            "node-7",
+            (day_around_now(), Serial::draw().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(client_names(&node_cert), Err(CertError::Malformed));
+        assert_eq!(client_names(&ca), Err(CertError::Malformed));
+        let theirs = KeyPair::generate().unwrap();
+        let foreign = client(
+            &theirs,
+            "mantle cell authority",
+            client_key.public_key(),
+            ("client-7", "123456789012"),
+            (day_around_now(), Serial::draw().unwrap()),
+        )
+        .unwrap();
+        assert!(as_client(&ca, &foreign).is_err());
+        assert_eq!(issued_by(&foreign, &ca, now()), Err(CertError::Signature));
+        // Names past X.520's bounds, and an empty account, are refused.
+        let named = |name: &str, account: &str| {
+            client(
+                &authority_key,
+                "mantle cell authority",
+                client_key.public_key(),
+                (name, account),
+                (day_around_now(), Serial::draw().unwrap()),
+            )
+        };
+        assert_eq!(named(&"c".repeat(65), "1"), Err(CertError::Name));
+        assert_eq!(named("client-7", ""), Err(CertError::Name));
+        assert!(named(&"c".repeat(64), &"1".repeat(64)).is_ok());
     }
 
     #[test]

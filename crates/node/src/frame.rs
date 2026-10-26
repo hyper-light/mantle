@@ -17,13 +17,10 @@ use hyper_raft::wire::Record;
 use hyper_transport::Embedded;
 
 /// Where a frame's own checksum lies, and what it covers: the transport checks it on a lane.
-pub const EMBEDDED: Embedded = Embedded {
-    covered_from: CRC_BYTES,
-    at: 0,
-};
+pub const EMBEDDED: Embedded = mantle_protocol::classes::RAFT_CHECKSUM;
 
 /// The bytes the checksum takes.
-const CRC_BYTES: usize = 4;
+const CRC_BYTES: usize = EMBEDDED.covered_from;
 /// The bytes before the message: the checksum and the group.
 pub const HEADER_BYTES: usize = CRC_BYTES + GROUP_BYTES;
 /// The bytes the group takes.

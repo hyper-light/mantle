@@ -10,10 +10,11 @@ use std::time::Instant;
 use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer, Tls};
 use hyper_transport::{Config, Endpoint, Event, Fixed};
 use mantle_cert::{KeyPair, Serial, Validity};
-use mantle_node::bounds::{self, Stated};
-use mantle_node::classes::{Bounds, NodeClasses, Role};
 use mantle_node::derive;
-use mantle_node::directory::{Peer, Peers, node_name};
+use mantle_node::directory::{Peer, Peers};
+use mantle_protocol::bounds::{self, Stated};
+use mantle_protocol::classes::{Bounds, NodeClasses, Role};
+use mantle_protocol::node_name;
 
 const AUTHORITY: &str = "mantle transport test";
 
@@ -66,11 +67,14 @@ pub fn endpoint(
         limits: bounds::limits(stated).unwrap(),
         congestion: Default::default(),
     };
-    let directory = Peers::new(vec![Peer {
-        id: other.0,
-        role: Role::Node,
-        certificate: other.1.to_vec(),
-    }]);
+    let directory = Peers::new(
+        vec![Peer {
+            id: other.0,
+            role: Role::Node,
+            certificate: other.1.to_vec(),
+        }],
+        0,
+    );
     Endpoint::new_seeded(
         config,
         Fixed::new(stated.transport_bytes, stated.peers.max(1)),
@@ -99,6 +103,7 @@ pub fn stated(transport_bytes: u64) -> Stated {
             transfer: u64::from(u32::MAX),
             bulk: u64::from(u32::MAX) + largest,
         },
+        max_head: mantle_node::node::MAX_HEAD,
     }
 }
 

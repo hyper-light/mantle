@@ -5,7 +5,7 @@
 //! **The file** states every number the node is run with, one `key = value` a line (`#` begins a
 //! comment): nothing is assumed for the operator, and a key it does not know is refused at its
 //! line ([`KEYS`], [`REPEATED`]). A `peer` line, repeated, names a peer's id, its
-//! role (`node`, `gateway` or `client`) and its certificate's file, and may name where it listens,
+//! role (`node` or `gateway`) and its certificate's file, and may name where it listens,
 //! QUIC's endpoint and the plane's, `peer = ID ROLE CERTIFICATE QUIC PLANE`, each `HOST:PORT` with
 //! the host an address (an IPv6 one in brackets) or a name, resolved as the node starts
 //! ([`resolve`]); a peer named without them is told where it listens on standard input, as one
@@ -24,7 +24,9 @@
 //! gateways (node.md §4–§5) names its root key's generations, each `root_key = GENERATION FILE`, 32
 //! bytes only its owner may read (encryption.md §2), and states its `gateway.` and `durability.`
 //! keys: how long a block is held for its file's write, the blocks an object holds going down or
-//! being read, the operations it runs at once, the buckets an owner may have, the rows a bucket's
+//! being read, the operations it runs at once, the clients of the native protocol it admits at
+//! once, each by the certificate the cell's authority issued it for the client role and never by a
+//! `peer` line (node.md §3.6), the buckets an owner may have, the rows a bucket's
 //! coordinator passes in a read, and the chunk loss and repair rates, per hour, each event that
 //! strikes chunks across domains at once, `durability.burst = RATE FRACTION` (its rate per hour and
 //! the share of the nodes it destroys; none where no line names one), and the annual loss
@@ -119,7 +121,6 @@ use mantle_range::{ConfState, Range, Settings, Stored};
 use mantle_s3::seal::WrappingKey;
 
 use crate::ask::CommandOutcome;
-use crate::classes::Role;
 use crate::derive::{Device, Formatted, Measured, Stated, VolumeFacts};
 use crate::directory::Peer;
 use crate::history;
@@ -129,6 +130,7 @@ use crate::node::{
 };
 use crate::secret::{self, SecretError};
 use crate::storage::{Locks, NodeLock, Storage, StorageError, VolumeSettings};
+use mantle_protocol::classes::Role;
 
 /// Why the process stopped.
 #[derive(Debug, thiserror::Error)]
@@ -399,6 +401,7 @@ pub struct GatewayConfig {
     pub handover_ns: u64,
     pub window: usize,
     pub objects: usize,
+    pub clients: usize,
     pub bucket_quota: u32,
     pub scan_rows: u32,
     pub chunk_rate: f64,
@@ -521,6 +524,7 @@ pub const KEYS: &[&str] = &[
     "gateway.handover_ns",
     "gateway.window",
     "gateway.objects",
+    "gateway.clients",
     "gateway.bucket_quota",
     "gateway.scan_rows",
     "durability.chunk_rate",
@@ -692,11 +696,18 @@ fn peers(lines: &Lines) -> Result<Vec<PeerLine>, ProcessError> {
         let role = match role {
             "node" => Role::Node,
             "gateway" => Role::Gateway,
-            "client" => Role::Client,
+            "client" => {
+                return Err(ProcessError::Line(
+                    *number,
+                    "a client is admitted by the certificate the cell's authority issued it, \
+                     never pinned (node.md §3.6)"
+                        .into(),
+                ));
+            }
             _ => {
                 return Err(ProcessError::Line(
                     *number,
-                    "a role: node, gateway or client".into(),
+                    "a role: node or gateway".into(),
                 ));
             }
         };
@@ -941,6 +952,7 @@ fn gateway(lines: &Lines) -> Result<Option<GatewayConfig>, ProcessError> {
         handover_ns: lines.get("gateway.handover_ns")?,
         window: lines.get("gateway.window")?,
         objects: lines.get("gateway.objects")?,
+        clients: lines.get("gateway.clients")?,
         bucket_quota: lines.get("gateway.bucket_quota")?,
         scan_rows: lines.get("gateway.scan_rows")?,
         chunk_rate: lines.get("durability.chunk_rate")?,
@@ -958,6 +970,7 @@ fn gateway_settings(config: GatewayConfig, keys: Vec<(u32, WrappingKey)>) -> Gat
         handover_ns: config.handover_ns,
         window: config.window,
         objects: config.objects,
+        clients: config.clients,
         bucket_quota: config.bucket_quota,
         scan_rows: config.scan_rows,
         rates: Rates {
@@ -1697,7 +1710,7 @@ async fn serve(
     // of the last. (The runtime's clock starts at zero, so a first saying stood for one at zero
     // held back every movement of the runtime's first half period, a cell of one's first objects
     // among them, and a watcher saw none.)
-    let serve = crate::bounds::idle_timeout();
+    let serve = mantle_protocol::bounds::idle_timeout();
     let serve_ns = u64::try_from(serve.as_nanos()).unwrap_or(u64::MAX);
     let mut said_moved: Option<(u64, u64)> = None;
     // Whether the node waits on its own device, as last said, none before the first saying.
@@ -2101,13 +2114,14 @@ mod tests {
     }
 
     /// A peer line may name where the peer listens, by address or by name; a malformed endpoint,
-    /// one of the two missing, or a field past them is refused at its line.
+    /// one of the two missing, a field past them, or a client, which no node pins, is refused at
+    /// its line.
     #[test]
     fn a_peer_line_names_where_it_listens_by_address_or_name() {
         let lines = Lines::parse(
             "peer = 2 node a.der 10.0.0.2:7000 10.0.0.2:7001\n\
              peer = 3 node b.der node-3.example:7000 [::1]:7001\n\
-             peer = 9 client c.der\n",
+             peer = 9 gateway c.der\n",
             KEYS,
             REPEATED,
         )
@@ -2127,8 +2141,9 @@ mod tests {
             Some(("node-3.example:7000".into(), "[::1]:7001".into()))
         );
         assert_eq!(read[2].at, None);
-        assert_eq!(read[2].role, Role::Client);
+        assert_eq!(read[2].role, Role::Gateway);
         for bad in [
+            "peer = 9 client c.der\n",
             "peer = 2 node a.der 10.0.0.2:7000\n",
             "peer = 2 node a.der host 10.0.0.2:7001\n",
             "peer = 2 node a.der ::1:7000 [::1]:7001\n",

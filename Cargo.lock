@@ -698,6 +698,7 @@ dependencies = [
  "mantle-http",
  "mantle-meta",
  "mantle-node",
+ "mantle-protocol",
  "mantle-range",
  "mantle-s3",
  "tempfile",
@@ -816,6 +817,7 @@ dependencies = [
  "mantle-chunk",
  "mantle-codec",
  "mantle-crc",
+ "mantle-s3",
  "proptest",
  "thiserror",
 ]
@@ -849,12 +851,25 @@ dependencies = [
  "mantle-gateway",
  "mantle-http",
  "mantle-meta",
+ "mantle-protocol",
  "mantle-range",
  "mantle-s3",
  "rustix",
  "tempfile",
  "thiserror",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mantle-protocol"
+version = "0.1.0"
+dependencies = [
+ "hyper-rt-transport",
+ "hyper-timing",
+ "hyper-transport",
+ "mantle-codec",
+ "mantle-s3",
+ "thiserror",
 ]
 
 [[package]]

@@ -42,7 +42,7 @@ use mantle_cert::{
 };
 use mantle_meta::apply::Layer;
 use mantle_meta::root::MAX_DOMAIN;
-use mantle_node::directory::node_name;
+use mantle_protocol::node_name;
 
 use crate::files;
 

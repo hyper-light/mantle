@@ -1,11 +1,10 @@
-//! Every bound of the node's transport, derived from what the node states (docs/design/node.md §2.6,
-//! §3.3; CLAUDE.md §2): its peers, its ranges and their settings, the memory its transport may hold.
-//! Times the path has not yet measured start from QUIC's own initial estimates (RFC 9002 §6.2.2)
-//! and move once it has.
+//! Every bound of a transport, a node's or a client's, derived from what its owner states
+//! (docs/design/node.md §2.6, §3.3; CLAUDE.md §2): its peers, its ranges and their settings, the
+//! memory its transport may hold. Times the path has not yet measured start from QUIC's own initial
+//! estimates (RFC 9002 §6.2.2) and move once it has.
 
 use std::time::Duration;
 
-use hyper_datagram::PlaneLimits;
 use hyper_rt_transport::{Io, MAX_BATCH};
 use hyper_transport::{
     AdmissionLimits, AskQueue, Classes, Limits, MIN_DATAGRAM, RECEIVE_CHUNK, StreamCredit,
@@ -13,7 +12,6 @@ use hyper_transport::{
 };
 
 use crate::classes::{Bounds, NodeClasses};
-use crate::{chunk, command, object};
 
 /// RFC 9002 §6.2.2: before a path has a sample, its smoothed round trip is `kInitialRtt`, 333 ms,
 /// and its variation half that.
@@ -29,12 +27,13 @@ const IDLE_PTOS: u32 = 3;
 /// The connections one peer may hold at once: its current one and the one that replaces it, for
 /// the handshake's round trip in which both carry traffic (hyper-datagram's `epochs_per_peer` of
 /// two, for the same overlap).
-const CONNECTIONS_PER_PEER: usize = 2;
+pub const CONNECTIONS_PER_PEER: usize = 2;
 
-/// What the node states of itself for its transport's bounds.
+/// What a node or a client states of itself for its transport's bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stated {
-    /// The other nodes it keeps connections to.
+    /// The peers it keeps connections to: a node's other nodes, gateways and clients, a client's
+    /// nodes.
     pub peers: usize,
     /// The ranges it hosts.
     pub ranges: usize,
@@ -47,12 +46,15 @@ pub struct Stated {
     pub transport_bytes: u64,
     /// The largest message of each class (`crate::classes::Bounds`).
     pub messages: Bounds,
+    /// The longest head of a message it sends or receives: a node's, of every kind it serves; a
+    /// client's, an object's request or reply ([`crate::object::MAX_HEAD`]).
+    pub max_head: usize,
 }
 
 /// Why the bounds could not be derived: a statement this machine cannot hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("the node's stated bounds overflow: {0}")]
-pub struct Unfit(&'static str);
+#[error("the stated bounds overflow: {0}")]
+pub struct Unfit(pub &'static str);
 
 /// A path's measured probe timeout, the current retransmission timeout a backoff doubles from
 /// (RFC 6298 §5.5): hyper-quic's, with the peer's whole `max_ack_delay` (RFC 9002 §6.2.1), since
@@ -133,19 +135,7 @@ fn shape(stated: &Stated) -> Result<Shape, Unfit> {
         .max(1)
         .checked_mul(stated.inflight.checked_add(1).ok_or(Unfit("inflight"))?)
         .ok_or(Unfit("lane window"))?;
-    let max_head = [
-        command::HEAD_BYTES,
-        command::REPLY_HEAD_BYTES,
-        chunk::PUT_HEAD_BYTES,
-        chunk::GET_HEAD_BYTES,
-        chunk::REPLY_HEAD_BYTES,
-        object::HEAD_BYTES,
-        object::REPLY_HEAD_BYTES,
-    ]
-    .into_iter()
-    .max()
-    .unwrap_or(0);
-    let max_head = u32::try_from(max_head).map_err(|_| Unfit("head"))?;
+    let max_head = u32::try_from(stated.max_head).map_err(|_| Unfit("head"))?;
     Ok(Shape {
         peers,
         connections,
@@ -315,21 +305,6 @@ pub fn io(stated: &Stated) -> Io {
     }
 }
 
-/// The plane's bounds: a key for each peer, the epochs of its current connection and the one
-/// replacing it, and a replay window that widens to what one peer's lane may hold in flight.
-pub fn plane(stated: &Stated) -> Result<PlaneLimits, Unfit> {
-    let window = stated
-        .ranges
-        .max(1)
-        .checked_mul(stated.inflight.checked_add(1).ok_or(Unfit("inflight"))?)
-        .ok_or(Unfit("plane window"))?;
-    Ok(PlaneLimits {
-        max_peers: stated.peers.max(1),
-        epochs_per_peer: CONNECTIONS_PER_PEER,
-        window_limit: window.max(hyper_datagram::DEFAULT_WIDTH),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,6 +322,7 @@ mod tests {
                 transfer: 1 << 20,
                 bulk: 1 << 24,
             },
+            max_head: crate::object::MAX_HEAD,
         }
     }
 
@@ -406,7 +382,7 @@ mod tests {
         assert_eq!(limits.exchanges, 44);
         assert_eq!(
             limits.max_head,
-            u32::try_from(chunk::GET_HEAD_BYTES).unwrap()
+            u32::try_from(crate::object::MAX_HEAD).unwrap()
         );
         assert_eq!(limits.lane_window, 15);
         assert!(limits.keep_alive.unwrap() < limits.idle_timeout);
@@ -445,6 +421,7 @@ mod tests {
                 replication: 1_200,
                 ..stated().messages
             },
+            max_head: stated().max_head,
         };
         for stated in [stated(), client, node] {
             let limits = limits(&stated).unwrap();

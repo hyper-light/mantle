@@ -1,6 +1,6 @@
 //! The simulated cell (`support/cell.rs`) under settings for requests larger than a connection's
 //! first window, in a process of its own: a process states its message bounds once, from its
-//! ranges' settings (`mantle_node::classes::state_bounds`), and the other simulation tests run the
+//! ranges' settings (`mantle_protocol::classes::state_bounds`), and the other simulation tests run the
 //! cluster test's.
 
 #![allow(
@@ -15,9 +15,9 @@
 use hyper_log::Config as LogConfig;
 use hyper_transport::{Classes, MIN_DATAGRAM, class_reserve, initial_window};
 use mantle_meta::wire::{Command as Op, Entry, Sessioned};
-use mantle_node::classes::NodeClasses;
 use mantle_node::client::{Asks, ClientError};
 use mantle_node::command;
+use mantle_protocol::classes::NodeClasses;
 use mantle_range::Settings;
 
 #[allow(dead_code)]

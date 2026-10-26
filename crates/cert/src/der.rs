@@ -32,6 +32,8 @@ pub(crate) mod oid {
     pub(crate) const ED25519: &[u8] = &[0x2b, 0x65, 0x70];
     /// id-at-commonName, 2.5.4.3 (RFC 5280 Appendix A.1).
     pub(crate) const COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
+    /// id-at-organizationName, 2.5.4.10 (RFC 5280 Appendix A.1).
+    pub(crate) const ORGANIZATION_NAME: &[u8] = &[0x55, 0x04, 0x0a];
     /// id-ce-basicConstraints, 2.5.29.19 (RFC 5280 §4.2.1.9).
     pub(crate) const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
     /// id-ce-keyUsage, 2.5.29.15 (RFC 5280 §4.2.1.3).

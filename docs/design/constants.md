@@ -509,23 +509,13 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/meta/src/record.rs` `SESSION_ANSWER_FIXED` | format | Bytes each answer a session's row holds besides the answer: its serial and its length, as `Session::encode` writes them. |
 | `crates/meta/src/record.rs` `SESSION_FIXED` | format | Bytes of a session's row besides its answers: its format, last use, low serial, count of answers and checksum, as `Session::encode` writes them; `Session::row_bytes` is checked against the encoding. |
 | `crates/meta/src/session.rs` `OWNED_BYTES` | format | Bytes of an owner's row: the session its last registration opened, that registration's run and its place in the run, each a big-endian word (docs/design/node.md §1.4). |
-| `crates/meta/src/wire.rs` `MAX_BUCKET` | external | A bucket name of at most 63 characters (research/05 §10.3). |
-| `crates/meta/src/wire.rs` `MAX_KEY` | external | An object key of at most 1,024 bytes (research/05 §10.1). |
-| `crates/meta/src/wire.rs` `MAX_HEADERS` | external | A request's headers within 8 KB (research/05 §10.2), which bound its preconditions. |
 | `crates/meta/src/wire.rs` `MAX_PARTS` | external | 10,000 parts to an upload (research/05 §4.1). |
-| `crates/meta/src/wire.rs` `MAX_OWNER` | external | An owner's name of at most 64 characters: a canonical user ID's 64 hexadecimal digits, the longest form S3 names an owner in (research/13, the ACL grantee); an account ID is 12 digits (research/17 §6). |
 | `crates/meta/src/wire.rs` `ETAG_HEX` | external | A part's ETag, the hex of its 16-byte MD5 (research/05 §4.5). |
 | `crates/meta/src/wire.rs` `FORMAT` | format | Version byte 6 of an encoded log entry; 6 since a registration names its owner, the owner's run and its place in the run, 5 since a registration refused at the bound of sessions is answered `SessionsFull` with the time a place frees, 4 since a part carries its file's handover deadline in place of the command beside it, 3 since a PUT and a completion carry the ID of their request, which names a write with no file, and a mark kept past an unmark is answered with its deadline, 2 since a completion carries its part listing's digest. |
 | `crates/meta/src/wire.rs` `MAX_COMMANDS` | bound | 2^16 command places per entry, so a session ID is index × 2^16 + place (session.rs `register`); the audit (§12.6) keeps it as a versioned encoding bound with byte and work budgets beside it. |
-| `crates/node/src/bounds.rs` `CONNECTIONS_PER_PEER` | bound | Two connections a peer: its current one and the one replacing it, for the handshake's round trip both carry traffic in (hyper-datagram's two epochs a peer, for the same overlap). |
-| `crates/node/src/bounds.rs` `GRANULARITY` | external | `kGranularity`, 1 ms, the least a probe timeout adds for the timer (RFC 9002 §6.1.2). |
-| `crates/node/src/bounds.rs` `IDLE_PTOS` | external | Three probe timeouts, the least idle timeout RFC 9000 §10.1 allows. |
-| `crates/node/src/bounds.rs` `INITIAL_RTT` | external | `kInitialRtt`, 333 ms, a path's smoothed round trip before any sample (RFC 9002 §6.2.2). |
-| `crates/node/src/bounds.rs` `MAX_ACK_DELAY` | external | `max_ack_delay`'s default, 25 ms, which a probe timeout adds once established (RFC 9000 §18.2). |
 | `crates/node/src/chunk.rs` `GET_HEAD_BYTES` | format | A chunk get's head: the volume, a u128; the chunk's key, `mantle_chunk::ChunkKey::ENCODED_LEN` bytes; the offset and the length asked, a u64 each. |
 | `crates/node/src/chunk.rs` `PUT_HEAD_BYTES` | format | A chunk put's head: the volume, a u128; the chunk's key, `mantle_chunk::ChunkKey::ENCODED_LEN` bytes; the CRC-32C its sender computed, a u32 (CLAUDE.md §6). |
 | `crates/node/src/chunk.rs` `REPLY_HEAD_BYTES` | format | A chunk reply's head: its status, one byte. |
-| `crates/node/src/classes.rs` `RANKS` | format | Four classes on a node's QUIC connections: replication, request, transfer (the request class's lower level, chunk bodies) and bulk (docs/design/node.md §3.1); consensus control that fits a datagram takes the plane. |
 | `crates/node/src/client.rs` `PERSISTENT_CONGESTION_THRESHOLD` | external | `kPersistentCongestionThreshold`, three probe timeouts with no acknowledgement (RFC 9002 §7.6.1): the least an exchange is given once the client has measured its exchanges. |
 | `crates/node/src/client.rs` `PIECE` | derived | hyper-transport's `RECEIVE_CHUNK`: a reply's body is read a receive chunk at a time. |
 | `crates/node/src/command.rs` `HEAD_BYTES` | format | A command's head: the range's group, a u128 as the log names it. |
@@ -571,40 +561,9 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/node/src/listener/request.rs` `MAX_OBJECT` | external | 5 GiB, the largest object one PUT or part carries (`mantle_s3::body::MAX_UPLOAD`; research/05 §4.3). |
 | `crates/node/src/node.rs` `LANE` | format | The one lane a peer's Raft frames take: the node runs its ranges on one shard (docs/design/node.md §3.2's lane a shard). |
 | `crates/node/src/node.rs` `LIVENESS_GROUP` | format | The log group of the liveness stream's own writes, the top of the group space: group 0 holds hyper-log's own key records, and a range named either is refused at open. |
+| `crates/node/src/node.rs` `MAX_HEAD` | derived | The longest head of a message the node sends or receives: the largest of a command's and its reply's, a chunk's put, get and reply, and an object's request and reply (`crates/protocol/src/object.rs` `MAX_HEAD`). |
 | `crates/node/src/node.rs` `PIECE` | derived | hyper-transport's `RECEIVE_CHUNK`: a snapshot's or a chunk's body is read a receive chunk at a time. |
 | `crates/node/src/node.rs` `PLANE_RAFT` | format | A plane message's first byte for a range's Raft frame, apart from hyper-liveness's `KIND` for a heartbeat. |
-| `crates/node/src/object.rs` `ABORT` | format | An object request's kind: AbortMultipartUpload. |
-| `crates/node/src/object.rs` `COMPLETE` | format | An object request's kind: CompleteMultipartUpload, its parts listed in its fields. |
-| `crates/node/src/object.rs` `CREATE` | format | An object request's kind: a bucket created. |
-| `crates/node/src/object.rs` `CREATE_UPLOAD` | format | An object request's kind: CreateMultipartUpload. |
-| `crates/node/src/object.rs` `DELETE` | format | An object request's kind: DeleteObject, the key's object removed or, where versioning is on, a delete marker made. |
-| `crates/node/src/object.rs` `DELETE_BUCKET` | format | An object request's kind: DeleteBucket, through the bucket's coordinator, once the bucket is empty. |
-| `crates/node/src/object.rs` `GET` | format | An object request's kind: an object's bytes read, or the range its `Range` names. |
-| `crates/node/src/object.rs` `GET_VERSIONING` | format | An object request's kind: GetBucketVersioning. |
-| `crates/node/src/object.rs` `HEAD` | format | An object request's kind: HeadObject, the current version's facts. |
-| `crates/node/src/object.rs` `HEAD_BUCKET` | format | An object request's kind: HeadBucket. |
-| `crates/node/src/object.rs` `HEAD_BYTES` | format | An object request's head: its kind, one byte; its fields' length, a u32; the operation's identity, a u128; a put's length, a u64. |
-| `crates/node/src/object.rs` `LIST` | format | An object request's kind: a page of ListObjectsV2. |
-| `crates/node/src/object.rs` `LISTED_BYTES` | derived | A key in a page of keys at its longest: the key behind its length (u32 and `MAX_KEY`), its ETag behind its length (u32 and `MAX_TAG`), its size and Last-Modified (u64 each), its checksum's flag, algorithm and parts (1, 1, 2) and its owner's flag, length and `MAX_OWNER` bytes; a page's room is counted against it. |
-| `crates/node/src/object.rs` `LIST_BUCKETS` | format | An object request's kind: a page of ListBuckets, the asker's buckets. |
-| `crates/node/src/object.rs` `LIST_PARTS` | format | An object request's kind: a page of ListParts. |
-| `crates/node/src/object.rs` `LIST_UPLOADS` | format | An object request's kind: a page of ListMultipartUploads. |
-| `crates/node/src/object.rs` `MAX_BUCKETS` | external | ListBuckets' `max-buckets`, "1–10000" (research/05 §10.4): the most buckets a page lists, and a request's bound. |
-| `crates/node/src/object.rs` `MAX_CHECKSUM` | derived | The longest checksum value, SHA-512's 64 bytes: the widest of S3's ten algorithms (research/05 §3.1; `mantle_s3::checksum::Algorithm::width`). |
-| `crates/node/src/object.rs` `MAX_FIELDS` | derived | A request's fields at most: the longer of a put's (bucket and key behind their lengths, five optional header texts within S3's 8 KB `MAX_HEADERS`, the checksum's flag, code, length and `MAX_CHECKSUM` bytes, `Content-MD5`'s flag and 16 bytes) and a listing's (bucket, prefix, delimiter and start, each behind its length, the most keys and whether owners are listed). |
-| `crates/node/src/object.rs` `MAX_PAGE_PARTS` | external | The most parts a page of ListParts lists and the most uploads a page of ListMultipartUploads does: S3's 1,000 for each (research/05 §4.1, §4.7). |
-| `crates/node/src/object.rs` `MAX_PARTS` | external | The most parts an upload has and a completion lists, S3's 10,000 (research/05 §4.1; `mantle_s3::body::MAX_PARTS`). |
-| `crates/node/src/object.rs` `MAX_REPLY_FIELDS` | derived | A reply's fields at most: the version's facts (its ID and ETag at `MAX_TAG`, Last-Modified, the checksum at `MAX_CHECKSUM`, the marker, the range served and the versioning) and the longer listing, a page of S3's 1,000 keys (`mantle_s3::list::MAX_KEYS`) at `LISTED_BYTES` beside `PAGE_BYTES`, or of `MAX_BUCKETS` buckets at the longest name. |
-| `crates/node/src/object.rs` `MAX_TAG` | derived | The longest version id or ETag a reply carries: a multipart object's ETag bare of quotes, an MD5's 32 hex digits, `-` and its count of parts at `MAX_PARTS`'s five digits (`mantle_s3::checksum::multipart_etag`); a version id is 13 characters (`mantle_meta::key::version_id`). |
-| `crates/node/src/object.rs` `PAGE_BYTES` | derived | A page of keys' bytes beside its keys and common prefixes, at most: whether it is truncated (1), where the next page starts (its flag, tag, length and `MAX_KEY` bytes) and the two counts (u32 each). |
-| `crates/node/src/object.rs` `PARTS_HEAD_BYTES` | derived | A page of parts' bytes beside its parts: whether it is truncated (1), the next marker behind its flag (1 and 2), and the count (u32). |
-| `crates/node/src/object.rs` `PART_BYTES` | derived | A part in a page of parts at its longest: its number (u16), its ETag behind its length at `MAX_TAG`, its size and Last-Modified (u64 each), and its checksum's flag, length and `MAX_CHECKSUM` bytes. |
-| `crates/node/src/object.rs` `PUT` | format | An object request's kind: an object put, its bytes on the exchange. |
-| `crates/node/src/object.rs` `PUT_VERSIONING` | format | An object request's kind: PutBucketVersioning, enabled or suspended. |
-| `crates/node/src/object.rs` `REPLY_HEAD_BYTES` | format | An object reply's head: its status, one byte; the object's size, a u64; its fields' length, a u32. |
-| `crates/node/src/object.rs` `UPLOADS_HEAD_BYTES` | derived | A page of uploads' bytes beside its uploads and common prefixes, at most: whether it is truncated, where the next page starts (its flag, a key at `MAX_KEY` and an ID at `MAX_TAG`, each behind its length) and the two counts (u32 each). |
-| `crates/node/src/object.rs` `UPLOAD_BYTES` | derived | An upload in a page of uploads at its longest: its key at `MAX_KEY`, its ID at `MAX_TAG`, its initiation (u64) and its owner at `MAX_OWNER`, each text behind its length (u32). |
-| `crates/node/src/object.rs` `UPLOAD_PART` | format | An object request's kind: UploadPart, the part's bytes on the exchange. |
 | `crates/node/src/process.rs` `ACCESS_KEY_ID_LEAST` | external | 16: the shortest access key id IAM takes (IAM API Reference, AccessKey: "Minimum length of 16"). |
 | `crates/node/src/process.rs` `ACCESS_KEY_ID_MOST` | external | 128: the longest access key id IAM takes (IAM API Reference, AccessKey: "Maximum length of 128"). |
 | `crates/node/src/process.rs` `CALIBRATION_BYTES` | derived | 137 bytes beside its key, at most hyper-rt's `MAX_KEY`: the calibration record's layout (`hyper_rt::machine::record`: magic 8, version 2, key length 2, measured at 8, the wake's 64, the system call's 49, its CRC-32C 4), pinned by `the_calibration_is_kept_in_the_node_directory_and_taken_again`. |
@@ -632,9 +591,49 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/node/src/secret/windows.rs` `ACCESS_ALLOWED_ACE_TYPE` | external | 0, winnt.h's `ACCESS_ALLOWED_ACE_TYPE`: an ACE that grants (windows-sys keeps it in a feature the workspace does not enable). |
 | `crates/node/src/secret/windows.rs` `ACCESS_DENIED_ACE_TYPE` | external | 1, winnt.h's `ACCESS_DENIED_ACE_TYPE`: an ACE that denies. |
 | `crates/node/src/secret/windows.rs` `SECURITY_DESCRIPTOR_REVISION` | external | 1, winnt.h's `SECURITY_DESCRIPTOR_REVISION`, the revision `InitializeSecurityDescriptor` takes. |
+| `crates/protocol/src/bounds.rs` `CONNECTIONS_PER_PEER` | bound | Two connections a peer: its current one and the one replacing it, for the handshake's round trip both carry traffic in (hyper-datagram's two epochs a peer, for the same overlap). |
+| `crates/protocol/src/bounds.rs` `GRANULARITY` | external | `kGranularity`, 1 ms, the least a probe timeout adds for the timer (RFC 9002 §6.1.2). |
+| `crates/protocol/src/bounds.rs` `IDLE_PTOS` | external | Three probe timeouts, the least idle timeout RFC 9000 §10.1 allows. |
+| `crates/protocol/src/bounds.rs` `INITIAL_RTT` | external | `kInitialRtt`, 333 ms, a path's smoothed round trip before any sample (RFC 9002 §6.2.2). |
+| `crates/protocol/src/bounds.rs` `MAX_ACK_DELAY` | external | `max_ack_delay`'s default, 25 ms, which a probe timeout adds once established (RFC 9000 §18.2). |
+| `crates/protocol/src/classes.rs` `RANKS` | format | Four classes on a node's QUIC connections: replication, request, transfer (the request class's lower level, chunk bodies) and bulk (docs/design/node.md §3.1); consensus control that fits a datagram takes the plane. |
+| `crates/protocol/src/object.rs` `ABORT` | format | An object request's kind: AbortMultipartUpload. |
+| `crates/protocol/src/object.rs` `COMPLETE` | format | An object request's kind: CompleteMultipartUpload, its parts listed in its fields. |
+| `crates/protocol/src/object.rs` `CREATE` | format | An object request's kind: a bucket created. |
+| `crates/protocol/src/object.rs` `CREATE_UPLOAD` | format | An object request's kind: CreateMultipartUpload. |
+| `crates/protocol/src/object.rs` `DELETE` | format | An object request's kind: DeleteObject, the key's object removed or, where versioning is on, a delete marker made. |
+| `crates/protocol/src/object.rs` `DELETE_BUCKET` | format | An object request's kind: DeleteBucket, through the bucket's coordinator, once the bucket is empty. |
+| `crates/protocol/src/object.rs` `GET` | format | An object request's kind: an object's bytes read, or the range its `Range` names. |
+| `crates/protocol/src/object.rs` `GET_VERSIONING` | format | An object request's kind: GetBucketVersioning. |
+| `crates/protocol/src/object.rs` `HEAD` | format | An object request's kind: HeadObject, the current version's facts. |
+| `crates/protocol/src/object.rs` `HEAD_BUCKET` | format | An object request's kind: HeadBucket. |
+| `crates/protocol/src/object.rs` `HEAD_BYTES` | format | An object request's head: its kind, one byte; its fields' length, a u32; the operation's identity, a u128; a put's length, a u64. |
+| `crates/protocol/src/object.rs` `LIST` | format | An object request's kind: a page of ListObjectsV2. |
+| `crates/protocol/src/object.rs` `LISTED_BYTES` | derived | A key in a page of keys at its longest: the key behind its length (u32 and `MAX_KEY`), its ETag behind its length (u32 and `MAX_TAG`), its size and Last-Modified (u64 each), its checksum's flag, algorithm and parts (1, 1, 2) and its owner's flag, length and `MAX_OWNER` bytes; a page's room is counted against it. |
+| `crates/protocol/src/object.rs` `LIST_BUCKETS` | format | An object request's kind: a page of ListBuckets, the asker's buckets. |
+| `crates/protocol/src/object.rs` `LIST_PARTS` | format | An object request's kind: a page of ListParts. |
+| `crates/protocol/src/object.rs` `LIST_UPLOADS` | format | An object request's kind: a page of ListMultipartUploads. |
+| `crates/protocol/src/object.rs` `MAX_BUCKETS` | external | ListBuckets' `max-buckets`, "1–10000" (research/05 §10.4): the most buckets a page lists, and a request's bound. |
+| `crates/protocol/src/object.rs` `MAX_CHECKSUM` | derived | The longest checksum value, SHA-512's 64 bytes: the widest of S3's ten algorithms (research/05 §3.1; `mantle_s3::checksum::Algorithm::width`). |
+| `crates/protocol/src/object.rs` `MAX_FIELDS` | derived | A request's fields at most: the longer of a put's (bucket and key behind their lengths, five optional header texts within S3's 8 KB `MAX_HEADERS`, the checksum's flag, code, length and `MAX_CHECKSUM` bytes, `Content-MD5`'s flag and 16 bytes) and a listing's (bucket, prefix, delimiter and start, each behind its length, the most keys and whether owners are listed). |
+| `crates/protocol/src/object.rs` `MAX_HEAD` | derived | The longer of an object request's head and its reply's: the longest head a client of objects sends or receives. |
+| `crates/protocol/src/object.rs` `MAX_PAGE_PARTS` | external | The most parts a page of ListParts lists and the most uploads a page of ListMultipartUploads does: S3's 1,000 for each (research/05 §4.1, §4.7). |
+| `crates/protocol/src/object.rs` `MAX_PARTS` | external | The most parts an upload has and a completion lists, S3's 10,000 (research/05 §4.1; `mantle_s3::body::MAX_PARTS`). |
+| `crates/protocol/src/object.rs` `MAX_REPLY_FIELDS` | derived | A reply's fields at most: the version's facts (its ID and ETag at `MAX_TAG`, Last-Modified, the checksum at `MAX_CHECKSUM`, the marker, the range served and the versioning) and the longer listing, a page of S3's 1,000 keys (`mantle_s3::list::MAX_KEYS`) at `LISTED_BYTES` beside `PAGE_BYTES`, or of `MAX_BUCKETS` buckets at the longest name. |
+| `crates/protocol/src/object.rs` `MAX_TAG` | derived | The longest version id or ETag a reply carries: a multipart object's ETag bare of quotes, an MD5's 32 hex digits, `-` and its count of parts at `MAX_PARTS`'s five digits (`mantle_s3::checksum::multipart_etag`); a version id is 13 characters (`mantle_meta::key::version_id`). |
+| `crates/protocol/src/object.rs` `PAGE_BYTES` | derived | A page of keys' bytes beside its keys and common prefixes, at most: whether it is truncated (1), where the next page starts (its flag, tag, length and `MAX_KEY` bytes) and the two counts (u32 each). |
+| `crates/protocol/src/object.rs` `PARTS_HEAD_BYTES` | derived | A page of parts' bytes beside its parts: whether it is truncated (1), the next marker behind its flag (1 and 2), and the count (u32). |
+| `crates/protocol/src/object.rs` `PART_BYTES` | derived | A part in a page of parts at its longest: its number (u16), its ETag behind its length at `MAX_TAG`, its size and Last-Modified (u64 each), and its checksum's flag, length and `MAX_CHECKSUM` bytes. |
+| `crates/protocol/src/object.rs` `PUT` | format | An object request's kind: an object put, its bytes on the exchange. |
+| `crates/protocol/src/object.rs` `PUT_VERSIONING` | format | An object request's kind: PutBucketVersioning, enabled or suspended. |
+| `crates/protocol/src/object.rs` `REPLY_HEAD_BYTES` | format | An object reply's head: its status, one byte; the object's size, a u64; its fields' length, a u32. |
+| `crates/protocol/src/object.rs` `UPLOADS_HEAD_BYTES` | derived | A page of uploads' bytes beside its uploads and common prefixes, at most: whether it is truncated, where the next page starts (its flag, a key at `MAX_KEY` and an ID at `MAX_TAG`, each behind its length) and the two counts (u32 each). |
+| `crates/protocol/src/object.rs` `UPLOAD_BYTES` | derived | An upload in a page of uploads at its longest: its key at `MAX_KEY`, its ID at `MAX_TAG`, its initiation (u64) and its owner at `MAX_OWNER`, each text behind its length (u32). |
+| `crates/protocol/src/object.rs` `UPLOAD_PART` | format | An object request's kind: UploadPart, the part's bytes on the exchange. |
 | `crates/range/src/conf.rs` `FORMAT` | format | Version byte of the encoded configuration row. |
 | `crates/range/src/image.rs` `FORMAT` | format | Version byte of the encoded snapshot image. |
 | `crates/range/src/replica.rs` `QUIET` | derived | `Duration::MAX`, no quiet write: the durable shell writes a commit no write stated after its owner's period so that a member acting on applied state at its next start reopens with it (hyper-raft docs/durable.md §4.1); no entry of a range is acted on at start (`RangeMachine::acts_at_start`), and the engine's durable index is part of the durable commit, so the write is never due. |
+| `crates/s3/src/account.rs` `MAX_OWNER` | external | An owner's name of at most 64 characters: a canonical user ID's 64 hexadecimal digits, the longest form S3 names an owner in (research/13, the ACL grantee); an account ID is 12 digits (research/17 §6). |
 | `crates/s3/src/acl.rs` `MAX_GRANTS` | external | AWS S3 API reference via docs/research/13 §6.8: "An ACL can have up to 100 grants". |
 | `crates/s3/src/body.rs` `ACL_LIMIT` | derived | (prolog + owner fields escaped + MAX_GRANTS × GRANT); s3-protocol.md §2 gives 662,054 bytes. |
 | `crates/s3/src/body.rs` `BUCKET_TAGGING_LIMIT` | derived | (TAGGING + 50 bucket tags × TAG). |
@@ -694,6 +693,8 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/s3/src/lock.rs` `MAX_YEARS` | external | S3 Object Lock docs via 18 §2.4: "The maximum retention period is 100 years". |
 | `crates/s3/src/policy/mod.rs` `BODY_LIMIT` | open | Twice the 20 KB compact limit, as a raw bound on a policy kept as sent (17 §2.2); what S3 keeps of a policy's white space is not recorded, and a recording of S3 would settle it. |
 | `crates/s3/src/policy/mod.rs` `MAX_SIZE` | external | S3's 20 KB bucket policy limit; S3 reported "maximum allowed size of 20480 bytes" (docs/research/17 §2.3). |
+| `crates/s3/src/route.rs` `MAX_BUCKET` | external | A bucket name of at most 63 characters (research/05 §10.3). |
+| `crates/s3/src/route.rs` `MAX_HEADERS` | external | A request's headers within 8 KB (research/05 §10.2), which bound its preconditions. |
 | `crates/s3/src/route.rs` `MAX_KEY` | external | AWS S3 object key docs via 05 §10.1: keys are at most 1,024 bytes of UTF-8. |
 | `crates/s3/src/seal.rs` `LAST` | format | 1 << 63, the top bit of the nonce counter that marks a file's last segment (encryption.md nonce layout, STREAM construction). |
 | `crates/s3/src/seal.rs` `PLAIN_SEGMENT` | cited | A second literal copy of SEGMENT's 64 KiB as u64, with the same GFS [GGL03 §5.2] basis; it is not written in terms of SEGMENT. |

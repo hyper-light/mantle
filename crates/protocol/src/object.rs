@@ -51,8 +51,8 @@
 //! take (s3-protocol.md §4); the checksum, optional: its algorithm's code (u8), the parts it
 //! combines (u16, 0 for a full-object value) and its value, its length (u8) before it; whether the
 //! version is a delete marker (u8); the bytes a range served, optional: its first and last (u64
-//! each), S3's `206 Partial Content`; the bucket's versioning, GetBucketVersioning's (u8): 0 none
-//! asked, 1 never set, 2 enabled, 3 suspended; the upload's ID, CreateMultipartUpload's, a text;
+//! each), S3's `206 Partial Content`; the bucket's versioning, GetBucketVersioning's (u8): 0 none,
+//! never set or not asked, 2 enabled, 3 suspended; the upload's ID, CreateMultipartUpload's, a text;
 //! then the listing, behind a byte: 0 none, 1 a page of keys, 2 a page of buckets, 3 a page of
 //! parts, 4 a page of uploads. A page of keys: whether it is truncated (u8); where the next page starts,
 //! optional, as a request names it; the count of keys (u32), each its key, ETag, size (u64),
@@ -70,10 +70,11 @@
 //! within S3's page: a message past them is refused whole.
 
 use mantle_codec::{Reader, Writer};
-use mantle_meta::record::{self, Versioning};
-use mantle_meta::wire::{MAX_BUCKET, MAX_HEADERS, MAX_KEY, MAX_OWNER};
+use mantle_s3::account::MAX_OWNER;
+use mantle_s3::body::Versioning;
 use mantle_s3::checksum::{Algorithm, Checksum};
 use mantle_s3::list::{MAX_KEYS, Resume};
+use mantle_s3::route::{MAX_BUCKET, MAX_HEADERS, MAX_KEY};
 
 const CREATE: u8 = 0;
 const PUT: u8 = 1;
@@ -95,15 +96,15 @@ const LIST_UPLOADS: u8 = 16;
 
 /// The longest version id or ETag a reply carries: a multipart object's ETag, bare of quotes, an
 /// MD5's 32 hex digits, `-` and its count of parts, at most `MAX_PARTS`'s five digits
-/// (`mantle_s3::checksum::multipart_etag`); a version's id is 13 characters
-/// (`mantle_meta::key::version_id`).
+/// (`mantle_s3::checksum::multipart_etag`); a version's id is 13 characters (mantle-meta's
+/// `key::version_id`).
 pub const MAX_TAG: usize = "d41d8cd98f00b204e9800998ecf8427e-10000".len();
 
 /// The most buckets a page of ListBuckets lists: S3's `max-buckets`, "1–10000" (05 §10.4).
 pub const MAX_BUCKETS: usize = 10_000;
 
 /// The longest checksum value: SHA-512's 64 bytes (05 §3.1).
-pub(crate) const MAX_CHECKSUM: usize = Algorithm::Sha512.width();
+pub const MAX_CHECKSUM: usize = Algorithm::Sha512.width();
 
 /// The most parts a page of ListParts lists, and the most uploads a page of ListMultipartUploads
 /// does: S3's 1,000 for each (05 §4.1, §4.7).
@@ -117,6 +118,12 @@ const MAX_PARTS: usize = mantle_s3::body::MAX_PARTS as usize;
 pub const HEAD_BYTES: usize = 1 + 4 + 16 + 8;
 /// The bytes of a reply's head: the status, the size and the fields' length.
 pub const REPLY_HEAD_BYTES: usize = 1 + 8 + 4;
+/// The longer of the two, the longest head a client of objects sends or receives.
+pub const MAX_HEAD: usize = if HEAD_BYTES > REPLY_HEAD_BYTES {
+    HEAD_BYTES
+} else {
+    REPLY_HEAD_BYTES
+};
 
 /// A request's fields at most: the longest of a put's or a part's (its names, an upload's ID and a
 /// part's number, its headers within S3's 8 KB, a checksum and an MD5), a listing's (its bucket,
@@ -140,7 +147,7 @@ pub const MAX_FIELDS: usize = {
 
 /// A key's bytes at most in a page of keys: its key, ETag, size, Last-Modified, checksum
 /// algorithm and owner.
-pub(crate) const LISTED_BYTES: usize =
+pub const LISTED_BYTES: usize =
     (4 + MAX_KEY) + (4 + MAX_TAG) + 8 + 8 + (1 + 1 + 2) + (1 + 4 + MAX_OWNER);
 
 /// A reply's fields at most: the version's facts and the longest listing, a page of S3's 1,000
@@ -326,10 +333,9 @@ pub enum Op {
     },
 }
 
-/// A versioning state as a message carries it.
+/// A versioning state as a message carries it: 2 enabled, 3 suspended.
 fn versioning_code(v: Versioning) -> u8 {
     match v {
-        Versioning::Unversioned => 1,
         Versioning::Enabled => 2,
         Versioning::Suspended => 3,
     }
@@ -337,7 +343,6 @@ fn versioning_code(v: Versioning) -> u8 {
 
 fn versioning_of(code: u8) -> Option<Versioning> {
     match code {
-        1 => Some(Versioning::Unversioned),
         2 => Some(Versioning::Enabled),
         3 => Some(Versioning::Suspended),
         _ => None,
@@ -578,7 +583,7 @@ impl Head {
                 PUT_VERSIONING => Op::PutVersioning {
                     bucket: take_text(&mut r, MAX_BUCKET)?,
                     id: self.id,
-                    versioning: versioning_of(r.u8()?).filter(|v| *v != Versioning::Unversioned)?,
+                    versioning: versioning_of(r.u8()?)?,
                 },
                 GET_VERSIONING => Op::GetVersioning {
                     bucket: take_text(&mut r, MAX_BUCKET)?,
@@ -772,9 +777,6 @@ impl Op {
                 id,
                 versioning,
             } => {
-                if *versioning == Versioning::Unversioned {
-                    return Err(ObjectError::Unversioned);
-                }
                 put_text(&mut f, bucket, MAX_BUCKET)?;
                 f.u8(versioning_code(*versioning));
                 (PUT_VERSIONING, *id, 0)
@@ -1109,6 +1111,16 @@ pub enum Listing {
     Uploads(Uploads),
 }
 
+/// A version's checksum as a reply carries it (05 §3.3): its algorithm's code, as
+/// `mantle_s3::checksum::Algorithm::code` numbers them; the parts a composite value combines, zero
+/// for a full-object value; and its value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stored {
+    pub algorithm: u8,
+    pub parts: u16,
+    pub value: Vec<u8>,
+}
+
 /// A reply: its head's status and size, and the fields its body opens with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reply {
@@ -1122,13 +1134,13 @@ pub struct Reply {
     pub etag: String,
     /// Last-Modified, whole seconds.
     pub modified: u64,
-    pub checksum: Option<record::Checksum>,
+    pub checksum: Option<Stored>,
     /// The version a delete made or removed, or the key's current one a get or head found, is a
     /// delete marker.
     pub marker: bool,
     /// The bytes a get's or head's range served, first and last: S3's `206 Partial Content`.
     pub range: Option<(u64, u64)>,
-    /// The bucket's versioning, GetBucketVersioning's.
+    /// The bucket's versioning, GetBucketVersioning's: none for a bucket never versioned.
     pub versioning: Option<Versioning>,
     /// The upload's ID, CreateMultipartUpload's; empty where none applies.
     pub upload: String,
@@ -1165,7 +1177,7 @@ fn take_listed(r: &mut Reader<'_>) -> Option<Listed> {
 
 /// The bytes a key takes in a page of keys: its key, ETag, size, Last-Modified, checksum
 /// algorithm and owner, as [`put_page`] writes it.
-pub(crate) fn listed_bytes(key: &str, etag: &str, checksum: bool, owner: Option<&str>) -> usize {
+pub fn listed_bytes(key: &str, etag: &str, checksum: bool, owner: Option<&str>) -> usize {
     let checksum = if checksum { 1 + 1 + 2 } else { 1 };
     let owner = owner.map_or(1, |o| 1usize.saturating_add(4).saturating_add(o.len()));
     4usize
@@ -1178,21 +1190,21 @@ pub(crate) fn listed_bytes(key: &str, etag: &str, checksum: bool, owner: Option<
 }
 
 /// The bytes a common prefix takes in a page of keys.
-pub(crate) fn prefix_bytes(prefix: &str) -> usize {
+pub fn prefix_bytes(prefix: &str) -> usize {
     4usize.saturating_add(prefix.len())
 }
 
 /// The bytes a page of keys takes beside its keys and common prefixes, at most: whether it is
 /// truncated, where the next page starts and the two counts.
-pub(crate) const PAGE_BYTES: usize = 1 + (1 + 1 + 4 + MAX_KEY) + 4 + 4;
+pub const PAGE_BYTES: usize = 1 + (1 + 1 + 4 + MAX_KEY) + 4 + 4;
 
 /// Whole seconds of `ns` nanoseconds since the Unix epoch: the one time an object's
 /// Last-Modified header, listing and conditions take (s3-protocol.md §4).
-pub(crate) fn seconds(ns: u64) -> u64 {
+pub fn seconds(ns: u64) -> u64 {
     ns / 1_000_000_000
 }
 
-pub(crate) fn put_list(w: &mut Writer, list: &List) -> Result<(), ObjectError> {
+pub fn put_list(w: &mut Writer, list: &List) -> Result<(), ObjectError> {
     put_text(w, &list.bucket, MAX_BUCKET)?;
     put_text(w, &list.prefix, MAX_KEY)?;
     put_text(w, &list.delimiter, MAX_KEY)?;
@@ -1202,7 +1214,7 @@ pub(crate) fn put_list(w: &mut Writer, list: &List) -> Result<(), ObjectError> {
     Ok(())
 }
 
-pub(crate) fn take_list(r: &mut Reader<'_>) -> Option<List> {
+pub fn take_list(r: &mut Reader<'_>) -> Option<List> {
     Some(List {
         bucket: take_text(r, MAX_BUCKET)?,
         prefix: take_text(r, MAX_KEY)?,
@@ -1213,7 +1225,7 @@ pub(crate) fn take_list(r: &mut Reader<'_>) -> Option<List> {
     })
 }
 
-pub(crate) fn put_page(w: &mut Writer, page: &Page) -> Result<(), ObjectError> {
+pub fn put_page(w: &mut Writer, page: &Page) -> Result<(), ObjectError> {
     if page
         .contents
         .len()
@@ -1235,7 +1247,7 @@ pub(crate) fn put_page(w: &mut Writer, page: &Page) -> Result<(), ObjectError> {
     Ok(())
 }
 
-pub(crate) fn take_page(r: &mut Reader<'_>) -> Option<Page> {
+pub fn take_page(r: &mut Reader<'_>) -> Option<Page> {
     let truncated = take_flag(r)?;
     let next = take_resume(r)?;
     // A key takes 38 bytes at least, a common prefix 4.
@@ -1259,13 +1271,13 @@ pub(crate) fn take_page(r: &mut Reader<'_>) -> Option<Page> {
 
 /// A part in a page of parts at its longest: its number, its ETag behind its length, its size and
 /// Last-Modified, and its checksum's flag, length and value.
-pub(crate) const PART_BYTES: usize = 2 + (4 + MAX_TAG) + 8 + 8 + (1 + 1 + MAX_CHECKSUM);
+pub const PART_BYTES: usize = 2 + (4 + MAX_TAG) + 8 + 8 + (1 + 1 + MAX_CHECKSUM);
 
 /// A page of parts' bytes beside its parts: whether it is truncated, the next marker behind its
 /// flag, and the count.
-pub(crate) const PARTS_HEAD_BYTES: usize = 1 + (1 + 2) + 4;
+pub const PARTS_HEAD_BYTES: usize = 1 + (1 + 2) + 4;
 
-pub(crate) fn put_parts(w: &mut Writer, page: &Parts) -> Result<(), ObjectError> {
+pub fn put_parts(w: &mut Writer, page: &Parts) -> Result<(), ObjectError> {
     if page.parts.len() > MAX_PAGE_PARTS {
         return Err(ObjectError::TooLong(page.parts.len()));
     }
@@ -1292,7 +1304,7 @@ pub(crate) fn put_parts(w: &mut Writer, page: &Parts) -> Result<(), ObjectError>
     Ok(())
 }
 
-pub(crate) fn take_parts(r: &mut Reader<'_>) -> Option<Parts> {
+pub fn take_parts(r: &mut Reader<'_>) -> Option<Parts> {
     let truncated = take_flag(r)?;
     let next = if take_flag(r)? { Some(r.u16()?) } else { None };
     // A part takes 27 bytes at least.
@@ -1323,7 +1335,7 @@ pub(crate) fn take_parts(r: &mut Reader<'_>) -> Option<Parts> {
 }
 
 /// The bytes an upload takes in a page of uploads, as [`put_uploads`] writes it.
-pub(crate) fn upload_bytes(key: &str, id: &str, owner: &str) -> usize {
+pub fn upload_bytes(key: &str, id: &str, owner: &str) -> usize {
     4usize
         .saturating_add(key.len())
         .saturating_add(4)
@@ -1334,13 +1346,13 @@ pub(crate) fn upload_bytes(key: &str, id: &str, owner: &str) -> usize {
 }
 
 /// An upload in a page of uploads at its longest: its key, ID, initiation and owner.
-pub(crate) const UPLOAD_BYTES: usize = (4 + MAX_KEY) + (4 + MAX_TAG) + 8 + (4 + MAX_OWNER);
+pub const UPLOAD_BYTES: usize = (4 + MAX_KEY) + (4 + MAX_TAG) + 8 + (4 + MAX_OWNER);
 
 /// A page of uploads' bytes beside its uploads and common prefixes, at most: whether it is
 /// truncated, where the next page starts (its flag, a key and an ID), and the two counts.
-pub(crate) const UPLOADS_HEAD_BYTES: usize = 1 + (1 + 4 + MAX_KEY + 4 + MAX_TAG) + 4 + 4;
+pub const UPLOADS_HEAD_BYTES: usize = 1 + (1 + 4 + MAX_KEY + 4 + MAX_TAG) + 4 + 4;
 
-pub(crate) fn put_uploads(w: &mut Writer, page: &Uploads) -> Result<(), ObjectError> {
+pub fn put_uploads(w: &mut Writer, page: &Uploads) -> Result<(), ObjectError> {
     if page
         .uploads
         .len()
@@ -1369,7 +1381,7 @@ pub(crate) fn put_uploads(w: &mut Writer, page: &Uploads) -> Result<(), ObjectEr
     Ok(())
 }
 
-pub(crate) fn take_uploads(r: &mut Reader<'_>) -> Option<Uploads> {
+pub fn take_uploads(r: &mut Reader<'_>) -> Option<Uploads> {
     let truncated = take_flag(r)?;
     let next = if take_flag(r)? {
         Some((take_text(r, MAX_KEY)?, take_text(r, MAX_TAG)?))
@@ -1400,7 +1412,7 @@ pub(crate) fn take_uploads(r: &mut Reader<'_>) -> Option<Uploads> {
     })
 }
 
-pub(crate) fn put_buckets(w: &mut Writer, page: &Buckets) -> Result<(), ObjectError> {
+pub fn put_buckets(w: &mut Writer, page: &Buckets) -> Result<(), ObjectError> {
     if page.buckets.len() > MAX_BUCKETS {
         return Err(ObjectError::TooLong(page.buckets.len()));
     }
@@ -1412,7 +1424,7 @@ pub(crate) fn put_buckets(w: &mut Writer, page: &Buckets) -> Result<(), ObjectEr
     put_optional_text(w, page.next.as_deref(), MAX_BUCKET)
 }
 
-pub(crate) fn take_buckets(r: &mut Reader<'_>) -> Option<Buckets> {
+pub fn take_buckets(r: &mut Reader<'_>) -> Option<Buckets> {
     // A bucket takes 12 bytes at least.
     let count = take_count(r, MAX_BUCKETS, 12)?;
     let mut buckets = Vec::with_capacity(count);
@@ -1557,7 +1569,7 @@ impl ReplyHead {
                 if len > MAX_CHECKSUM {
                     return None;
                 }
-                Some(record::Checksum {
+                Some(Stored {
                     algorithm,
                     parts,
                     value: r.take(len)?.to_vec(),
@@ -1613,8 +1625,6 @@ pub enum ObjectError {
     Fields(usize),
     #[error("a field of {0} bytes, past its bound")]
     TooLong(usize),
-    #[error("versioning, once set, is enabled or suspended, never unversioned again")]
-    Unversioned,
 }
 
 #[cfg(test)]
@@ -1782,15 +1792,9 @@ mod tests {
         let (mut get_head, get_fields) = every_op().swap_remove(3).encode().unwrap();
         get_head[HEAD_BYTES - 8..].copy_from_slice(&5u64.to_le_bytes());
         assert!(Head::decode(&get_head, Some(get_fields.len() as u64 + 5)).is_err());
-        // An unknown kind, and versioning set back to never set.
+        // An unknown kind.
         let mut unknown = head.clone();
         unknown[0] = GET_VERSIONING + 1;
-        let unset = Op::PutVersioning {
-            bucket: "b".into(),
-            id: 1,
-            versioning: Versioning::Unversioned,
-        };
-        assert_eq!(unset.encode(), Err(ObjectError::Unversioned));
         assert!(Head::decode(&unknown, Some(put.body(&fields))).is_err());
         // A key past S3's bound, headers past S3's 8 KB, a checksum of the wrong width.
         let long = Op::Head {
@@ -1861,7 +1865,7 @@ mod tests {
             version: "0123456789ABC".into(),
             etag: "d41d8cd98f00b204e9800998ecf8427e-10000".into(),
             modified: u64::MAX,
-            checksum: Some(record::Checksum {
+            checksum: Some(Stored {
                 algorithm: Algorithm::Sha512.code(),
                 parts: 3,
                 value: vec![1; 64],

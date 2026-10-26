@@ -28,8 +28,8 @@ use hyper_tls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned, vers
 use mantle_cert::{EndpointKey, EndpointName, Serial, Validity};
 use mantle_node::door::{self, Answer, Doorway, Piece};
 use mantle_node::listener::{CONNECTIONS, Listener, PIECE, Settings};
-use mantle_node::object::{Op, Reply, Status};
 use mantle_node::process::AccessKey;
+use mantle_protocol::object::{Op, Reply, Status};
 use mantle_s3::checksum::{self, Algorithm};
 use mantle_s3::sigv4;
 

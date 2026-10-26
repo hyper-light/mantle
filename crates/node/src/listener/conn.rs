@@ -20,7 +20,7 @@ use super::io::{Io, IoError};
 use super::request::{self, Parts, Plan, Refused, Streamed, Upload};
 use super::respond::{self, Echo, Ids, Response};
 use crate::door::{self, Answer, Piece, Submitter};
-use crate::object::{Op, Status};
+use mantle_protocol::object::{Op, Status};
 
 /// The octets a connection reads at once, and a body's piece: the native door's, the transport's
 /// receive chunk (`crate::node::PIECE`), so a put's driver takes the same pieces by either door.

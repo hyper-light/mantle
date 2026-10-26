@@ -21,9 +21,9 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use hyper_transport::{Event, ExchangeId, Progress, Refusal, Reservation};
-use mantle_node::bounds;
-use mantle_node::classes::{self, Kind};
 use mantle_node::command::{self, Status};
+use mantle_protocol::bounds;
+use mantle_protocol::classes::{self, Kind};
 
 #[path = "support/net.rs"]
 mod net;

@@ -3,6 +3,10 @@
 //! `x-amz-source-expected-bucket-owner` hold to make a request fail unless its bucket's owner is
 //! the account the client expects.
 
+/// An owner's name at most: a canonical user ID's 64 hexadecimal digits, the longest form S3
+/// names an owner in (research/13, the ACL grantee); an account ID is 12 digits (17 §6).
+pub const MAX_OWNER: usize = 64;
+
 /// Whether `id` is an account ID: twelve decimal digits, the form AWS gives one and a policy
 /// names one in (17 §6).
 pub fn valid_id(id: &str) -> bool {

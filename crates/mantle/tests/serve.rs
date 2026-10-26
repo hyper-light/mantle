@@ -1014,7 +1014,7 @@ fn listed(
         assert!(
             page.contents
                 .iter()
-                .all(|l| l.owner.as_deref() == Some(CLIENT.to_string().as_str())),
+                .all(|l| l.owner.as_deref() == Some(account(object_client(CLIENT)).as_str())),
             "page {pages}: owners"
         );
         pages += 1;
@@ -1041,7 +1041,8 @@ fn listed(
 /// lists every key exactly once.
 #[test]
 fn s3s_operations_answer_as_s3_does_through_every_node() {
-    use mantle_meta::record::{self, Versioning};
+    use mantle_protocol::object::Stored;
+    use mantle_s3::body::Versioning;
     use mantle_s3::checksum::{self, Algorithm};
     use mantle_s3::list::Resume;
 
@@ -1188,7 +1189,7 @@ fn s3s_operations_answer_as_s3_does_through_every_node() {
     assert_eq!(kept.status, ObjectStatus::Done);
     assert_eq!(
         kept.checksum,
-        Some(record::Checksum {
+        Some(Stored {
             algorithm: Algorithm::Crc32c.code(),
             parts: 0,
             value: crc.bytes.clone(),
@@ -1444,7 +1445,7 @@ fn s3s_operations_answer_as_s3_does_through_every_node() {
         .0
         .versioning
     };
-    assert_eq!(state(&mut cell), Some(Versioning::Unversioned));
+    assert_eq!(state(&mut cell), None);
     assert_eq!(
         status(&mut cell, 3, versioning(Versioning::Enabled)),
         ObjectStatus::Done
@@ -1672,7 +1673,7 @@ fn blocks_of(cell: &mut Cell, bucket: &str, key: &str) -> Vec<(u128, Vec<u64>)> 
 /// nothing listed or readable, and each refusal research/05 records is S3's code (05 §4).
 #[test]
 fn a_multipart_upload_completes_through_another_node_with_one_killed_between_parts() {
-    use mantle_meta::record;
+    use mantle_protocol::object::Stored;
     use mantle_s3::checksum::{self, Algorithm};
 
     let mut cell = Cell::served(NODES);
@@ -1906,7 +1907,7 @@ fn a_multipart_upload_completes_through_another_node_with_one_killed_between_par
     let whole: Vec<u8> = [a.as_slice(), &b, &c].concat();
     assert_eq!(
         done_once.checksum,
-        Some(record::Checksum {
+        Some(Stored {
             algorithm: Algorithm::Crc64Nvme.code(),
             parts: 0,
             value: crc_of(&whole),

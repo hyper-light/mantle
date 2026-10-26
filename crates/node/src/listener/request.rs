@@ -6,7 +6,6 @@
 //! another's.
 
 use mantle_http::{Framing, Head};
-use mantle_meta::record::Versioning;
 use mantle_s3::checksum::{self, Algorithm, Checksum};
 use mantle_s3::chunked::Decoder;
 use mantle_s3::list::{self as s3list, Resume};
@@ -14,7 +13,7 @@ use mantle_s3::route::{self, Operation, Query, Route};
 use mantle_s3::sigv4::{self, Body, Verified};
 
 use super::Endpoint;
-use crate::object::{Headers, List, Op};
+use mantle_protocol::object::{Headers, List, Op};
 
 /// The largest object a single PUT or part carries: 5 GiB (05 §4.3).
 const MAX_OBJECT: u64 = mantle_s3::body::MAX_UPLOAD;
@@ -258,7 +257,10 @@ fn plan(
                 .value("continuation-token")
                 .filter(|t| !t.is_empty())
                 .map(str::to_owned),
-            max: count(query.value("max-buckets"), crate::object::MAX_BUCKETS)?,
+            max: count(
+                query.value("max-buckets"),
+                mantle_protocol::object::MAX_BUCKETS,
+            )?,
         }),
         Operation::CreateBucket if has_body(framing) => Ok(Plan::Document {
             limit: mantle_s3::body::CREATE_BUCKET_LIMIT,
@@ -378,7 +380,10 @@ fn plan(
                     Refused::new("InvalidArgument", 400, "part-number-marker is not a number")
                 })?,
             },
-            max: count(query.value("max-parts"), crate::object::MAX_PAGE_PARTS)?,
+            max: count(
+                query.value("max-parts"),
+                mantle_protocol::object::MAX_PAGE_PARTS,
+            )?,
         }),
         Operation::ListMultipartUploads => host(Op::ListUploads {
             bucket: bucket(route)?,
@@ -671,8 +676,7 @@ pub fn made(make: Make, document: &[u8], region: &str) -> Result<Op, Refused> {
                 return Err(not_implemented("MFA delete"));
             }
             let versioning = match configuration.status {
-                Some(mantle_s3::body::Versioning::Enabled) => Versioning::Enabled,
-                Some(mantle_s3::body::Versioning::Suspended) => Versioning::Suspended,
+                Some(versioning) => versioning,
                 None => {
                     return Err(Refused::new(
                         "MalformedXML",

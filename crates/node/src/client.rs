@@ -4,7 +4,7 @@
 //! it is answered or refused (node.md §5.4), and that deadline ends every wait and retry.
 //!
 //! A node that names no leader, its range electing, is asked again after RFC 6298 §5.5's
-//! doubling backoff from QUIC's initial probe timeout (`crate::bounds::initial_pto`); a node the
+//! doubling backoff from QUIC's initial probe timeout (`mantle_protocol::bounds::initial_pto`); a node the
 //! client cannot reach, or whose exchange was refused, is passed over for the next it knows.
 //! An object's request, asked of the node its caller names, is asked again of it after the same
 //! pause when the node cannot have taken it: its connection refused at the node's admission, for
@@ -45,14 +45,14 @@ use hyper_transport::{
 use mantle_chunk::ChunkKey;
 use mantle_meta::wire::{Answer, Entry};
 
-use crate::bounds::{self, Stated};
 use crate::chunk;
-use crate::classes::{self, Bounds, Kind, NodeClasses, Role};
 use crate::command::{self, CommandError, ReplyHead, Status};
 use crate::directory::{Peer, Peers};
 use crate::node::ChunkOutcome;
-use crate::object::{self, Op};
 use crate::read::{Query, Read, ReadError};
+use mantle_protocol::bounds::{self, Stated};
+use mantle_protocol::classes::{self, Bounds, Kind, NodeClasses, Role};
+use mantle_protocol::object::{self, Op};
 
 /// What a client is given.
 pub struct ClientSettings {
@@ -177,6 +177,7 @@ impl Client {
             transfers: usize::from(settings.role == Role::Gateway),
             transport_bytes: settings.transport_bytes,
             messages: settings.messages,
+            max_head: crate::node::MAX_HEAD,
         };
         let limits = bounds::limits(&stated).map_err(|e| ClientError::Bounds(e.to_string()))?;
         let io = bounds::io(&stated);
@@ -200,7 +201,7 @@ impl Client {
                 refused: None,
             })
             .collect();
-        let (directory, now) = (Peers::new(settings.nodes), std::time::Instant::now());
+        let (directory, now) = (Peers::new(settings.nodes, 0), std::time::Instant::now());
         let endpoint = match settings.seed {
             Some(seed) => Endpoint::new_seeded(config, budget, directory, now, seed)?,
             None => Endpoint::new(config, budget, directory, now)?,
@@ -640,7 +641,7 @@ impl Client {
         })
     }
 
-    /// Asks `node` an object's request (`crate::object`): a bucket made, `data` put as the object's
+    /// Asks `node` an object's request (`mantle_protocol::object`): a bucket made, `data` put as the object's
     /// bytes, or a range got. The reply, with a get's bytes, or the refusal that ended the exchange
     /// unanswered, after which a put may still have committed (asking it again with the same
     /// identity is answered from what it made, gateway.md §2.1).

@@ -70,11 +70,15 @@
 //! the bytes of exchanges' bodies it has read and written (`Node::moved`), said at most every half
 //! of the transport's serve period `SERVE_NS`, the longest an exchange it carries may go without
 //! moving before the transport refuses it; and, in an orderly stop, `stopping` as it begins,
-//! `handed GROUP LEADER` for each range whose lead it handed over, and `stopped` as it ends. On
-//! standard input: `learn ID QUIC PLANE`, where a peer listens, `replace FAILED JOINING`, a
-//! member lost for good and the spare that takes its place in every range the node hosts
-//! (`Node::replace`), and `stop`, which asks the orderly stop as SIGTERM does. A line it cannot
-//! read ends the process with the line named. Standard input closing ends `mantle node`, its
+//! `handed GROUP LEADER` for each range whose lead it handed over, and `stopped` as it ends. A
+//! node with an S3 endpoint says `s3-bound ADDR CONNECTIONS` once its listener is bound: where it
+//! listens and the connections it holds at once (node.md §4.1). On standard input:
+//! `learn ID QUIC PLANE`, where a peer listens, `replace FAILED JOINING`, a member lost for good
+//! and the spare that takes its place in every range the node hosts (`Node::replace`), `stop`,
+//! which asks the orderly stop as SIGTERM does, and `chunks`, answered `chunks RECEIVED WRITTEN
+//! HELD`: the bytes of chunks its peers put on it over QUIC, of those it put on its own volumes,
+//! and of those its volumes hold (`Node::chunk_bytes`). A line it cannot read ends the process
+//! with the line named. Standard input closing ends `mantle node`, its
 //! harness's child, at once, without the orderly stop's steps; `mantle serve` runs on, as under a
 //! service manager, whose input is empty.
 //!
@@ -96,7 +100,7 @@ use std::time::Duration;
 
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_log::{Config as LogConfig, LogStats, Waits};
-use hyper_rt::combine::{Either, Either3, race2, race3};
+use hyper_rt::combine::{Either3, race3};
 use hyper_rt::machine::calibration::{Calibration, Policy};
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
 use hyper_rt::signal::Signal;
@@ -172,6 +176,8 @@ pub enum ProcessError {
     Stopped(&'static str),
     #[error("the node's history: {0}")]
     History(String),
+    #[error("the S3 listener: {0}")]
+    Listener(String),
 }
 
 /// The signals that stop the node in order (node.md §1.7): SIGTERM, which a service manager or a
@@ -419,6 +425,8 @@ pub struct Enlisting {
 pub struct S3Stated {
     pub listen: SocketAddr,
     pub region: String,
+    /// The DNS names its clients reach it by (`s3.name`), lowercase.
+    pub names: Vec<String>,
     pub certificate: PathBuf,
     pub key: PathBuf,
     pub access: Vec<(String, PathBuf)>,
@@ -430,6 +438,7 @@ pub struct S3Stated {
 pub struct S3Keys {
     pub listen: SocketAddr,
     pub region: String,
+    pub names: Vec<String>,
     pub certificate: Vec<u8>,
     pub key: Vec<u8>,
     pub access: Vec<AccessKey>,
@@ -550,7 +559,14 @@ pub const STATED_KEYS: &[&str] = &[
 
 /// The lines `mantle serve`'s file repeats: its peers and ranges, its volumes, each `volume = DIR
 /// SIZE`, its root key's generations, and the cell's access keys, each `access_key = ID FILE`.
-pub const STATED_REPEATED: &[&str] = &["peer", "range", "volume", "root_key", "access_key"];
+pub const STATED_REPEATED: &[&str] = &[
+    "peer",
+    "range",
+    "volume",
+    "root_key",
+    "access_key",
+    "s3.name",
+];
 
 /// The file's values by key, each with the line it was on, and its repeated lines by their key; and
 /// the directory the file is in, which a relative path in it names a place from, so a node's
@@ -1059,7 +1075,7 @@ pub fn run(config: &Path) -> Result<(), ProcessError> {
     let node = Locks::node(&config.dir).map_err(step(Step::Locks))?;
     let locks =
         Locks::take(config.volumes.iter().map(|v| v.dir.as_path())).map_err(step(Step::Locks))?;
-    start(config, (node, locks), identity, true)
+    start(config, (node, locks), identity, None, true)
 }
 
 /// Runs the node whose operator's statements the file at `config` holds (`mantle serve`, node.md
@@ -1114,17 +1130,19 @@ pub fn serve_stated(config: &Path) -> Result<(), ProcessError> {
     out.flush().map_err(|e| ProcessError::Say(e.to_string()))?;
     // The runtime's writer says the rest: this thread holds no lock on standard output for it.
     drop(out);
-    start(derived.config, (node, locks), identity, false)
+    start(derived.config, (node, locks), identity, s3, false)
 }
 
 /// The node of `config`, its directory and its volumes' devices under `held`'s locks, as
-/// `identity` says it is: the start's steps after the locks (node.md §1.7), each failure naming its
-/// step, then the node until it stops in order at a signal, or, if it `ends_with_input`, until
-/// standard input closes. The directory's lock is held until the node ends.
+/// `identity` says it is, with the S3 listener its `s3` keys state: the start's steps after the
+/// locks (node.md §1.7), each failure naming its step, then the node until it stops in order at a
+/// signal, or, if it `ends_with_input`, until standard input closes. The directory's lock is held
+/// until the node ends.
 fn start(
     mut config: ProcessConfig,
     held: (NodeLock, Locks),
     identity: Identity,
+    s3: Option<S3Keys>,
     ends_with_input: bool,
 ) -> Result<(), ProcessError> {
     let (node, locks) = held;
@@ -1138,7 +1156,7 @@ fn start(
     } = identity;
     let gateway = config.gateway.take().map(|g| gateway_settings(g, keys));
     let addresses = resolve(&config).map_err(step(Step::Network))?;
-    let runtime = runtime(&config).map_err(step(Step::Network))?;
+    let runtime = runtime(&config, s3.is_some()).map_err(step(Step::Network))?;
     let mut rt = LocalRuntime::new(&runtime)
         .map_err(|e| step(Step::Network)(ProcessError::Runtime(format!("{e:?}"))))?;
     let ran = rt
@@ -1147,12 +1165,50 @@ fn start(
             storage,
             gateway,
             (credentials, peers),
-            addresses,
+            (addresses, s3),
             ends_with_input,
         ))
         .map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
     drop(node);
     ran
+}
+
+/// The S3 listener `keys` state, its door open on `node`: where it listens, its region, keys and
+/// TLS (node.md §4.1). Stated at the QUIC address, it listens on the port QUIC bound, over TCP, as
+/// an https authority serves both (research/71); plain HTTP on a loopback address, TLS with the
+/// endpoint's certificate elsewhere. A node that hosts no objects has no operation to hand it.
+fn listen<E: Engine + 'static>(
+    node: &mut Node<E>,
+    keys: S3Keys,
+    (stated, bound): (SocketAddr, SocketAddr),
+    (id, objects): (u64, Option<usize>),
+) -> Result<crate::listener::Listener, ProcessError> {
+    let refused = |e: String| ProcessError::Listener(e);
+    let objects =
+        objects.ok_or_else(|| refused("an S3 endpoint on a node that hosts no objects".into()))?;
+    let listen = if keys.listen == stated {
+        SocketAddr::new(keys.listen.ip(), bound.port())
+    } else {
+        keys.listen
+    };
+    let tls = if listen.ip().is_loopback() {
+        None
+    } else {
+        Some((keys.certificate, keys.key))
+    };
+    let door = node.open_door(objects)?;
+    crate::listener::Listener::bind(
+        crate::listener::Settings {
+            listen,
+            region: keys.region,
+            domains: keys.names,
+            access: keys.access,
+            tls,
+            node: id,
+        },
+        door,
+    )
+    .map_err(|e| refused(e.to_string()))
 }
 
 /// What the file at `path` states for `mantle serve`: only [`STATED_KEYS`] and
@@ -1213,11 +1269,15 @@ fn access_key_id(id: &str) -> bool {
 
 /// The S3 endpoint the file states (node.md §4): none where it states none of it, and where it
 /// states any of it, all of it: `s3`, `s3.region`, `s3.certificate`, `s3.key`, and one
-/// `access_key = ID FILE` line at least. A region is lowercase letters, digits and hyphens, S3's
-/// region codes' alphabet, and holds no `/`, which SigV4's credential scope separates by.
+/// `access_key = ID FILE` line at least, with an `s3.name = NAME` line for each DNS name its
+/// clients reach it by. A region is lowercase letters, digits and hyphens, S3's region codes'
+/// alphabet, and holds no `/`, which SigV4's credential scope separates by; a name is a DNS name a
+/// certificate may hold (`mantle_cert::check_dns_name`).
 fn s3_stated(lines: &Lines) -> Result<Option<S3Stated>, ProcessError> {
     let keys = ["s3", "s3.region", "s3.certificate", "s3.key"];
-    if !keys.iter().any(|key| lines.values.contains_key(*key)) && lines.all("access_key").is_empty()
+    if !keys.iter().any(|key| lines.values.contains_key(*key))
+        && lines.all("access_key").is_empty()
+        && lines.all("s3.name").is_empty()
     {
         return Ok(None);
     }
@@ -1245,9 +1305,17 @@ fn s3_stated(lines: &Lines) -> Result<Option<S3Stated>, ProcessError> {
     if access.is_empty() {
         return Err(ProcessError::Missing("access_key"));
     }
+    let mut names = Vec::with_capacity(lines.all("s3.name").len());
+    for (number, name) in lines.all("s3.name") {
+        let name = name.trim().to_ascii_lowercase();
+        mantle_cert::check_dns_name(&name)
+            .map_err(|e| ProcessError::Line(*number, format!("s3.name = NAME: {e}")))?;
+        names.push(name);
+    }
     Ok(Some(S3Stated {
         listen: lines.get("s3")?,
         region: region.to_owned(),
+        names,
         certificate: lines.path(lines.text("s3.certificate")?),
         key: lines.path(lines.text("s3.key")?),
         access,
@@ -1292,6 +1360,7 @@ pub fn s3_keys(s3: &S3Stated) -> Result<S3Keys, ProcessError> {
     Ok(S3Keys {
         listen: s3.listen,
         region: s3.region.clone(),
+        names: s3.names.clone(),
         certificate: read_file(&s3.certificate)?,
         key: read_secret(&s3.key)?,
         access,
@@ -1401,8 +1470,9 @@ pub fn calibration(dir: &Path, budget: Duration) -> Result<Calibration, ProcessE
 
 /// One shard, calibrated on this machine (hyper-rt `RuntimeConfig::from_calibration`), sized by
 /// what the node holds: its one task, its wait and its driver's QUIC timer, and a socket for its
-/// endpoint, each connection and its plane, each read and written.
-fn runtime(config: &ProcessConfig) -> Result<RuntimeConfig, ProcessError> {
+/// endpoint, each connection and its plane, each read and written; with an S3 listener, a task for
+/// each connection it holds at once, and a socket for the listener and each of those connections.
+fn runtime(config: &ProcessConfig, s3: bool) -> Result<RuntimeConfig, ProcessError> {
     let calibration = calibration(&config.dir, config.probe_budget)?;
     let constants = calibration
         .constants(&Policy {
@@ -1411,11 +1481,25 @@ fn runtime(config: &ProcessConfig) -> Result<RuntimeConfig, ProcessError> {
             latency_objective_ns: None,
         })
         .map_err(|unmet| ProcessError::Runtime(format!("{unmet:?}")))?;
-    let mut runtime = RuntimeConfig::from_calibration(&calibration, &constants, 1, 2);
+    let connections = if s3 {
+        usize::try_from(crate::listener::CONNECTIONS)
+            .map_err(|_| ProcessError::Runtime("the S3 listener's connections".into()))?
+    } else {
+        0
+    };
+    let tasks = connections
+        .checked_add(1)
+        .ok_or_else(|| ProcessError::Runtime("the node's tasks".into()))?;
+    let mut runtime = RuntimeConfig::from_calibration(&calibration, &constants, tasks, 2);
     runtime.shards = 1;
     runtime.pin = false;
     runtime.cores.clear();
-    let sockets = config.peers.len().saturating_add(2);
+    let listening = if s3 { connections.saturating_add(1) } else { 0 };
+    let sockets = config
+        .peers
+        .len()
+        .saturating_add(2)
+        .saturating_add(listening);
     runtime.interests_per_shard = runtime.interests_per_shard.max(sockets.saturating_mul(2));
     Ok(runtime)
 }
@@ -1456,13 +1540,13 @@ fn engine(
     Ok(stored)
 }
 
-/// The node, its talk on standard input and output.
+/// The node, its talk on standard input and output, and its S3 listener where `s3` states one.
 async fn serve(
     config: ProcessConfig,
     storage: Storage,
     gateway: Option<GatewaySettings>,
     (credentials, peers): (Credentials, Vec<Peer>),
-    addresses: Vec<(u64, SocketAddr, SocketAddr)>,
+    (addresses, s3): (Vec<(u64, SocketAddr, SocketAddr)>, Option<S3Keys>),
     ends_with_input: bool,
 ) -> Result<(), ProcessError> {
     // This process's one shard runs the node's replicas, which apply through the engine's
@@ -1509,6 +1593,10 @@ async fn serve(
     };
     let own = history::at_start(row, last_run, Some(last_stop));
     let history = history::cell_with(cell, row, own);
+    // The door's bound: the operations the host runs at once, past which it answers `SlowDown`
+    // whatever waits at the door, so a door that holds that many refuses nothing the host would
+    // take (node.md §4.5).
+    let objects = gateway.as_ref().map(|g| g.objects);
     let settings = NodeSettings {
         id: config.id,
         dir: config.dir.clone(),
@@ -1545,6 +1633,26 @@ async fn serve(
     let mut output = hyper_rt::stdio::stdout(1, chunk).map_err(|e| talk(format!("{e:?}")))?;
     let (quic, plane) = node.addresses()?;
     say(&mut output, &format!("bound {quic} {plane}\n")).await?;
+    let listener = match s3 {
+        Some(keys) => {
+            let listener = listen(&mut node, keys, (config.quic, quic), (config.id, objects))
+                .map_err(step(Step::Network))?;
+            let at = listener
+                .local_addr()
+                .map_err(|e| step(Step::Network)(ProcessError::Listener(e.to_string())))?;
+            let line = format!("s3-bound {at} {}\n", crate::listener::CONNECTIONS);
+            say(&mut output, &line).await?;
+            Some(listener)
+        }
+        None => None,
+    };
+    let accepting = async {
+        match &listener {
+            Some(listener) => listener.serve().await,
+            None => std::future::pending().await,
+        }
+    };
+    let mut accepting = pin!(accepting);
     // What the node's failure detectors start from, and this node's part of it.
     let line = format!(
         "history {} {} {} {}\n",
@@ -1617,7 +1725,7 @@ async fn serve(
                     None => std::future::pending().await,
                 }
             });
-            race3(turn, line, race2(signal, bound)).await
+            race3(turn, line, race3(signal, bound, accepting.as_mut())).await
         };
         match ended {
             Either3::First(turned) => turned?,
@@ -1629,6 +1737,10 @@ async fn serve(
                     let line: Vec<u8> = pending.drain(..=end).collect();
                     if line.trim_ascii() == b"stop" {
                         stop_asked(&mut stop, &mut node, &mut output).await?;
+                    } else if line.trim_ascii() == b"chunks" {
+                        let (received, written, held) = node.chunk_bytes()?;
+                        let line = format!("chunks {received} {written} {held}\n");
+                        say(&mut output, &line).await?;
                     } else {
                         take_line(&mut node, &config.ranges, &line)?;
                     }
@@ -1640,13 +1752,16 @@ async fn serve(
                 }
             }
             Either3::Second(Err(e)) => return Err(ProcessError::Runtime(format!("{e:?}"))),
-            Either3::Third(Either::First(signal)) => {
+            Either3::Third(Either3::First(signal)) => {
                 signal.map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
                 stop_asked(&mut stop, &mut node, &mut output).await?;
             }
-            Either3::Third(Either::Second(slept)) => {
+            Either3::Third(Either3::Second(slept)) => {
                 slept.map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
                 return Err(ProcessError::Stopped("the stop's bound passed"));
+            }
+            Either3::Third(Either3::Third(ended)) => {
+                return Err(ProcessError::Listener(ended.to_string()));
             }
         }
         // The node keeps what its ranges answered as they applied for a caller that proposed to
@@ -1862,7 +1977,8 @@ impl Living {
 }
 
 /// Takes a line of the node's input: `learn ID QUIC PLANE` or `replace FAILED JOINING`, a
-/// replacement in each of `ranges`. (`stop`, the orderly stop a signal asks, the loop takes itself.)
+/// replacement in each of `ranges`. (`stop`, the orderly stop a signal asks, and `chunks`, whose
+/// answer the node says, the loop takes itself.)
 fn take_line<E: Engine + 'static>(
     node: &mut Node<E>,
     ranges: &[(u128, Layer)],

@@ -463,6 +463,9 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/mantle/src/bench_log.rs` `KEEP` | open | A replica compacts every 64 entries, keeping 64 behind; it stands in for a follower window but lacks a derivation. |
 | `crates/mantle/src/bench_meta.rs` `LARGEST_FILE` | derived | 646 blocks, the most one PUT's file names: 5 GiB in the smallest blocks any layout makes, pinned by `the_largest_upload_fits_a_file_under_every_layout` (`crates/gateway/src/layout.rs`; audit B08). |
 | `crates/mantle/src/bench_meta.rs` `HISTORY` | open | Session answer history of 256; the metadata-apply measurement states it without a derivation. |
+| `crates/mantle/src/bench_s3.rs` `CHUNK` | cited | 1 MiB: botocore's `aws-chunked` chunk (`httpchecksum.py`, `AwsChunkedWrapper._DEFAULT_CHUNK_SIZE = 1024 * 1024`), which boto3 and the AWS CLI's classic transfers send. |
+| `crates/mantle/src/bench_s3.rs` `CONNECTIONS_DOOR` | derived | 1: the bench's one client has one request out at a time. |
+| `crates/mantle/src/bench_s3.rs` `OBJECT` | cited | 8 MiB: the AWS CLI's part, its default `multipart_chunksize` and `multipart_threshold` of `8MB` (AWS CLI S3 configuration reference), a megabyte being 1024² octets to it (`awscli/customizations/s3/utils.py`, `SIZE_SUFFIX`): what one of its requests streams. |
 | `crates/meta/src/collector.rs` `GRACE_NS` | cited | GFS keeps deleted files for three days (GGL03 §4.4, docs/research/22 §1.1). A recovery-point policy, not a safety bound (22 §10.4). |
 | `crates/meta/src/file.rs` `MAX_EXTENTS` | external | The S3 limit of 10,000 parts per upload (docs/research/05 §4.1). Audit §12.6 says single-PUT block manifests reuse this count and need their own derived fanout limit. |
 | `crates/meta/src/key.rs` `ATTEMPT` | format | Marker byte `a` after `LOCAL` for Bucket-range create/delete attempts. |
@@ -559,6 +562,13 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/node/src/frame.rs` `HEADER_BYTES` | derived | CRC_BYTES plus GROUP_BYTES: the bytes before a frame's message. |
 | `crates/node/src/layout.rs` `RUN_BYTES` | format | The node's run record: one u64 count (hyper-liveness `Settings::run`). |
 | `crates/node/src/layout.rs` `STOPPED_BYTES` | format | The node's stop record: three u64s, the run that stopped in order, the node's time run then and its orderly stops (docs/design/node.md §2.4, item 7). |
+| `crates/node/src/listener/conn.rs` `BODY_PIECES` | bound | 2: a put's body pieces in flight to the host, one its driver takes while the next is read, so the two overlap; the body comes no faster than the driver takes it (node.md §4.3). |
+| `crates/node/src/listener/conn.rs` `PIECE` | derived | hyper-transport's `RECEIVE_CHUNK`, the native door's piece (`crates/node/src/node.rs` `PIECE`): a connection's read and a put's body piece, so a driver takes the same pieces by either door. |
+| `crates/node/src/listener/conn.rs` `REPLY_PIECES` | bound | 2: a reply's answers in flight from the host, its head, or a get's piece while the last is written, so the two overlap; the host gives a get's bytes no faster than its client reads them (node.md §4.3). |
+| `crates/node/src/listener/mod.rs` `BACKLOG` | derived | The connection budget, `CONNECTIONS`: the kernel queues no more connections for the listener than it serves at once. |
+| `crates/node/src/listener/mod.rs` `CONNECTIONS` | cited | 10: what stock clients open to an endpoint at their defaults, botocore's `max_pool_connections` and the AWS CLI's `max_concurrent_requests` (research/72); the budget's growth past it with memory, which the CLI's CRT transfers ask, is open (node.md §4.5). |
+| `crates/node/src/listener/request.rs` `MAX_BODY` | derived | S3's largest object framed as `aws-chunked` in its least chunks, each behind its longest size line and its line ends, and a trailer section within a head's bound: the most a request's body may run to, the most a refused request's connection reads before it closes (research/72). |
+| `crates/node/src/listener/request.rs` `MAX_OBJECT` | external | 5 GiB, the largest object one PUT or part carries (`mantle_s3::body::MAX_UPLOAD`; research/05 §4.3). |
 | `crates/node/src/node.rs` `LANE` | format | The one lane a peer's Raft frames take: the node runs its ranges on one shard (docs/design/node.md §3.2's lane a shard). |
 | `crates/node/src/node.rs` `LIVENESS_GROUP` | format | The log group of the liveness stream's own writes, the top of the group space: group 0 holds hyper-log's own key records, and a range named either is refused at open. |
 | `crates/node/src/node.rs` `PIECE` | derived | hyper-transport's `RECEIVE_CHUNK`: a snapshot's or a chunk's body is read a receive chunk at a time. |

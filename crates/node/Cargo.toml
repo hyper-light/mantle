@@ -40,15 +40,25 @@ mantle-range = { path = "../range" }
 mantle-ec = { path = "../ec" }
 mantle-gateway = { path = "../gateway" }
 mantle-s3 = { path = "../s3" }
+# The S3 listener (node.md §4.1): mantle's own HTTP/1.1 codec, and TLS with the endpoint's P-256
+# chain away from loopback.
+hyper-tls = { path = "../../vendor/hyper-tls" }
+mantle-http = { path = "../http" }
 bytes.workspace = true
 # A new file's id, 128 bits from the operating system (metadata.md §1).
 getrandom.workspace = true
 thiserror.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# The errors that say a process is out of descriptors or socket buffers, which the S3 listener's
+# accept waits out (src/listener/mod.rs).
+rustix.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 # A key file's protected DACL, written as `mantle init` creates it and read from the handle the
-# start reads it through (src/secret/windows.rs).
-windows-sys.workspace = true
+# start reads it through (src/secret/windows.rs); WinSock's codes for a process out of sockets or
+# buffers, which the S3 listener's accept waits out (src/listener/mod.rs).
+windows-sys = { workspace = true, features = ["Win32_Networking_WinSock"] }
 
 [dev-dependencies]
 # The simulated device a simulated node's log runs on (tests/sim.rs).

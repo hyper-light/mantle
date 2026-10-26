@@ -299,19 +299,36 @@ through different nodes, one node killed and started again between them, complet
 another into an object whose bytes, multipart ETag and full-object checksum are S3's, the same
 when completed again, each block's chunks on distinct nodes (`crates/mantle/tests/serve.rs`).
 The operation identity every mutation carries is not yet recorded by the Name range (item 9).
+Stock S3 clients reach the same operations through each node's HTTP/1.1 listener, mantle's own
+codec on hyper-rt's TCP, plain on loopback and TLS 1.3 and 1.2 with the endpoint's P-256 chain
+elsewhere, each request routed, its SigV4 signature checked against the cell's access keys, and
+its operation handed to the node's object host in-process through a bounded door, with a put's
+body read only as its driver wants it, `aws-chunked` decoded with each chunk's signature and its
+trailing checksum checked before commit, and `503 SlowDown` before `100 Continue` past the door's
+bound (node design §4.1–§4.5; research/72). Through each listener of a cell of three: buckets,
+puts read back whole and by range and head through the others, ListObjectsV2, conditional writes,
+deletes and a multipart upload spread over the listeners, each read byte-identical; objects put
+through one listener alone held by the other two nodes exactly as received over QUIC, and on every
+node the chunk bytes its volumes hold exactly those its peers sent over QUIC and those it wrote
+itself; a request whose framing cannot be trusted answered 400 and closed, a put refused before
+`100 Continue` sending no body, a connection past the budget closed as it comes, and a bad
+signature `403 SignatureDoesNotMatch` (`crates/mantle/tests/s3.rs`; TLS 1.3 and 1.2 handshakes in
+`crates/node/tests/listener.rs`). `mantle bench s3` measures the listener's own cost
+(measurements/2026-10-25-s3-listener.md).
 
 Remaining before it is done:
 
 - The windows a gateway admits, from its memory and measured latency; the rates of the paths
   measured on an idle machine.
-- The server around it: the HTTP/1.1 listener for stock S3 clients, whose codec is built
-  (`crates/http`: each RFC 9112 rule it keeps by a test, generated and mutated requests read or
-  refused typed, its allocations counted, `mantle bench http`; node design §4.1), and whose key
-  and certificates `mantle init` issues (the cell's first account and access key on every founder,
-  owner-only, which `mantle serve` reads and says; the endpoint's own ECDSA P-256 authority and each
-  founder's certificate for the names its clients dial; the operator's AWS profile and CA bundle;
-  node design §1.5, research/71; its certificate's issue again before 825 days still to build);
-  deadlines and
+- The HTTP/1.1 listener's remaining parts: the AWS CLI and boto3 against a running cell in CI;
+  the operations beyond the node's own set (copies, tags, ACLs, CORS, lifecycle, policies, object
+  lock, encryption settings, DeleteObjects, ListObjects v1 and ListObjectVersions answer `501`
+  there), an object's stored headers (`Content-Type`, `x-amz-meta-*`), bucket policies judged on
+  each request, the connection budget growing past its floor of ten with the node's memory (the
+  AWS CLI's CRT transfers open at least ten and twenty-five at their 10 Gb/s target, research/72)
+  and reading the descriptor limit, the reclaim of the slowest connection when the node needs the
+  room, TLS session resumption, and the endpoint certificate's issue again before 825 days
+  (node design §1.5, §4.1–§4.5); deadlines and
   hedging on the node's asks (node design §5.4); routing by descriptors once ranges split; and
   each request's memory admitted against the gateway's.
 

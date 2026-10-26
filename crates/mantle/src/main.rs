@@ -24,6 +24,7 @@ mod bench_hash;
 mod bench_http;
 mod bench_log;
 mod bench_meta;
+mod bench_s3;
 mod disk;
 mod display;
 mod drive;
@@ -236,6 +237,14 @@ enum BenchCommand {
     Http {
         /// Seconds each measurement runs.
         #[arg(long, default_value_t = 0.5)]
+        seconds: f64,
+    },
+    /// Measure the S3 listener's own cost over loopback, plain and TLS 1.3, its host a stub on
+    /// the door: round trips of a request, and the AWS CLI's 8 MiB part's gets and puts, plain and
+    /// aws-chunked.
+    S3 {
+        /// Seconds each measurement runs.
+        #[arg(long, default_value_t = 2.0)]
         seconds: f64,
     },
     /// Measure what applying the metadata layers' heaviest commands costs on one core: a
@@ -508,6 +517,12 @@ fn main() -> ExitCode {
             command: BenchCommand::Http { seconds },
         } => match std::time::Duration::try_from_secs_f64(seconds) {
             Ok(step) => bench_http::http(&mut out, step).map_err(|e| e.to_string()),
+            Err(_) => Err(format!("--seconds {seconds} is not a duration")),
+        },
+        Command::Bench {
+            command: BenchCommand::S3 { seconds },
+        } => match std::time::Duration::try_from_secs_f64(seconds) {
+            Ok(step) => bench_s3::s3(&mut out, step).map_err(|e| e.to_string()),
             Err(_) => Err(format!("--seconds {seconds} is not a duration")),
         },
         Command::Bench {

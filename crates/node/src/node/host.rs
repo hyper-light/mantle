@@ -20,6 +20,7 @@
 use std::collections::VecDeque;
 
 use bytes::Bytes;
+use hyper_rt::sync::{ChannelReceiver, Sender, SyncError};
 use hyper_transport::{ExchangeId, PeerId, Refusal};
 use mantle_ec::durability::{self, Choice, Rates};
 use mantle_gateway::complete::{self, CompleteError, Completion};
@@ -43,6 +44,7 @@ use mantle_s3::seal::{DataKey, WrappingKey};
 use super::{ChunkAsk, ChunkOutcome, Node, NodeError, NodeLog, PIECE, take_done};
 use crate::ask::{CommandAsk, CommandOutcome, ReadAsk, ReadOutcome};
 use crate::classes::Class;
+use crate::door::{self, Piece};
 use crate::object::{
     self, Head, Headers, List, Listing, MAX_PAGE_PARTS, Op, PartListed, Parts, Reply, Status,
 };
@@ -78,13 +80,70 @@ pub(crate) enum Pending {
     Chunk(ChunkAsk),
 }
 
-/// An object operation the host runs: the exchange it answers, its asker, and where it is.
+/// An object operation the host runs: the door it came in by, its asker, and where it is.
 pub(crate) struct Job {
-    exchange: ExchangeId,
-    peer: PeerId,
+    door: Door,
+    /// Who asks: a native asker's peer id, or the account an S3 request's access key acts for.
+    principal: String,
     work: Work,
     /// What the operation waits on, each with the driver's request it answers, if a driver's.
     pending: Vec<(Pending, Option<u64>)>,
+}
+
+/// Where a job's operation came in: its body is read and its reply written there.
+enum Door {
+    /// A native exchange, the operation's fields at its body's start (`crate::object`).
+    Exchange(ExchangeId),
+    /// The S3 listener's, in-process (`crate::door`).
+    Local(Box<Local>),
+}
+
+/// A local door's ends: the request's body as the listener sends it, and the reply as the host
+/// writes it.
+struct Local {
+    body: ChannelReceiver<Piece>,
+    reply: Sender<door::Answer>,
+    /// The body's end once it came, with the checksum its trailer carried.
+    ended: Option<Option<checksum::Checksum>>,
+    /// Answers the reply's channel had no room for, sent before any other, in order. A stream's
+    /// next piece is taken only once these are sent, so they are at most one piece of bytes and
+    /// the few answers around it.
+    pending: VecDeque<door::Answer>,
+    /// Whether the listener was told the put wants its body.
+    ready: bool,
+}
+
+/// What became of an answer sent on a local door.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sent {
+    Taken,
+    /// The channel is full: the answer is held, and sent first at a later turn.
+    Held,
+    /// The connection is gone.
+    Gone,
+}
+
+impl Local {
+    /// Sends what waits, in order: whether the door takes more now.
+    fn flush(&mut self) -> Sent {
+        while let Some(answer) = self.pending.pop_front() {
+            match self.reply.try_send(answer) {
+                Ok(()) => {}
+                Err(SyncError::Full(answer)) => {
+                    self.pending.push_front(answer);
+                    return Sent::Held;
+                }
+                Err(SyncError::Closed(_) | SyncError::NotOnShardThread(_)) => return Sent::Gone,
+            }
+        }
+        Sent::Taken
+    }
+
+    /// Sends `answer` after what waits, or holds it behind them.
+    fn offer(&mut self, answer: door::Answer) -> Sent {
+        self.pending.push_back(answer);
+        self.flush()
+    }
 }
 
 enum Work {
@@ -95,6 +154,8 @@ enum Work {
     Draining(Reply),
     /// A reply's head sent: the fields that open its body, and how much of them is written.
     Replying(Vec<u8>, usize),
+    /// A local operation's last answers going out, in order: its reply and its end, or its end.
+    Answering(VecDeque<door::Answer>),
     /// CreateBucket or DeleteBucket, through the bucket's coordinator.
     Bucket(Box<Coordinating>),
     Put(Box<Putting>),
@@ -380,8 +441,38 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
         };
         self.jobs.push(Job {
-            exchange,
-            peer,
+            door: Door::Exchange(exchange),
+            principal: peer.to_string(),
+            work,
+            pending: Vec::new(),
+        });
+    }
+
+    /// An operation the S3 listener handed over (`crate::door`): a job of its work, or the reply
+    /// it gets at once, as a native request's.
+    pub(super) fn take_local(&mut self, request: door::Request) {
+        let door::Request {
+            op,
+            principal,
+            body,
+            reply,
+        } = request;
+        let work = match self.gateway.as_ref() {
+            None => Work::Draining(Reply::status(Status::Failed)),
+            Some(g) if self.stopping() || self.jobs.len() >= g.objects => {
+                Work::Draining(Reply::status(Status::SlowDown))
+            }
+            Some(_) => work(op, Vec::new()),
+        };
+        self.jobs.push(Job {
+            door: Door::Local(Box::new(Local {
+                body,
+                reply,
+                ended: None,
+                pending: VecDeque::new(),
+                ready: false,
+            })),
+            principal,
             work,
             pending: Vec::new(),
         });
@@ -393,7 +484,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(true);
         };
-        let exchange = job.exchange;
+        // A local operation comes typed, never as fields to read.
+        let Door::Exchange(exchange) = job.door else {
+            return Ok(true);
+        };
         let Work::Fields(head, fields) = &mut job.work else {
             return Ok(false);
         };
@@ -499,6 +593,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Work::Fields(..) => self.read_fields(at),
             Work::Draining(_) => self.drain_job(at),
             Work::Replying(..) => self.write_fields(at),
+            Work::Answering(_) => self.answer_local(at),
             Work::Bucket(_) => self.step_bucket(at),
             Work::Put(_) => self.step_put(at),
             Work::Get(_) => self.step_get(at),
@@ -549,14 +644,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(());
         };
-        let peer = job.peer;
+        let principal = job.principal.clone();
         match &mut job.work {
-            Work::Fields(..) | Work::Draining(_) | Work::Replying(..) => {}
+            Work::Fields(..) | Work::Draining(_) | Work::Replying(..) | Work::Answering(_) => {}
             Work::Bucket(coordinating) => {
                 let answer = match outcome {
                     Outcome::Read(ReadOutcome::Read(read)) if !coordinating.owned => {
                         let status = match *read {
-                            Read::Bucket(Some(row)) if row.owner == peer.to_string() => None,
+                            Read::Bucket(Some(row)) if row.owner == principal => None,
                             Read::Bucket(Some(_)) => Some(Status::AccessDenied),
                             Read::Bucket(None) => Some(Status::NoSuchBucket),
                             _ => Some(Status::Failed),
@@ -740,7 +835,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             None => Next::Request(coordinator::Request::Bucket(bucket::Command::Create(
                 bucket::Create {
                     bucket: bucket.clone(),
-                    owner: job.peer.to_string(),
+                    owner: job.principal.clone(),
                     location: String::new(),
                     at_ns: 0,
                     quota,
@@ -878,7 +973,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let default = row.lock.and_then(|lock| lock.default);
         let Some(Job {
             work: Work::Put(putting),
-            peer,
+            principal,
             ..
         }) = self.jobs.get_mut(at)
         else {
@@ -918,7 +1013,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     size: 0,
                     checksum: None,
                     file: None,
-                    owner: peer.to_string(),
+                    owner: principal.clone(),
                     headers: Vec::new(),
                     retention: None,
                     legal_hold: None,
@@ -1039,10 +1134,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// last piece first, then a piece at a time; at the body's end, the body ended, its digests
     /// checked against what the request said before anything commits.
     fn feed_put(&mut self, at: usize) -> Result<(), NodeError> {
+        if self
+            .jobs
+            .get(at)
+            .is_some_and(|j| matches!(j.door, Door::Local(_)))
+        {
+            return self.feed_local_put(at);
+        }
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(());
         };
-        let exchange = job.exchange;
+        let Door::Exchange(exchange) = job.door else {
+            return Ok(());
+        };
         let Work::Put(putting) = &mut job.work else {
             return Ok(());
         };
@@ -1096,6 +1200,87 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             match got {
                 Ok(0) if putting.carry.is_empty() => return Ok(()),
                 Ok(_) => {}
+                Err(_) => return self.fail_job(at, Status::IncompleteBody),
+            }
+        }
+    }
+
+    /// A put's body from a local door (`crate::door`): the listener told once the driver first
+    /// wants a byte, so a client that waits for `100 Continue` sends none before every check
+    /// that could refuse it passed; each piece fed to the driver as it wants it, only what it did
+    /// not take kept; and the body's end taken only once the listener checked its signature and
+    /// its digest, its trailer's checksum then the one the end is checked against.
+    fn feed_local_put(&mut self, at: usize) -> Result<(), NodeError> {
+        let Some(job) = self.jobs.get_mut(at) else {
+            return Ok(());
+        };
+        let (Door::Local(local), Work::Put(putting)) = (&mut job.door, &mut job.work) else {
+            return Ok(());
+        };
+        let Some(put) = putting.put.as_mut() else {
+            return Ok(());
+        };
+        if !local.ready && put.wants_body() {
+            local.ready = true;
+            if local.offer(door::Answer::Ready) == Sent::Gone {
+                return self.fail_job(at, Status::IncompleteBody);
+            }
+        }
+        loop {
+            if !putting.carry.is_empty() {
+                if !put.wants_body() {
+                    return Ok(());
+                }
+                let took = match put.feed(&putting.carry) {
+                    Ok(took) => took,
+                    Err(_) => return self.fail_job(at, Status::Failed),
+                };
+                putting.taken = putting
+                    .taken
+                    .saturating_add(u64::try_from(took).unwrap_or(u64::MAX));
+                putting.carry.drain(..took.min(putting.carry.len()));
+                if !putting.carry.is_empty() {
+                    return Ok(());
+                }
+            }
+            if let Some(trailer) = local.ended.take() {
+                // The listener framed the body at its stated length: an end before or past it is
+                // a body that does not hold.
+                if putting.taken != putting.length {
+                    return self.fail_job(at, Status::IncompleteBody);
+                }
+                if let Some(checksum) = trailer {
+                    putting.expected.checksum = Some(checksum);
+                }
+                if put.end(&putting.expected).is_err() && put.outcome().is_none() {
+                    return self.fail_job(at, Status::Failed);
+                }
+                // Ended once: nothing more is read, and the outcome answers it.
+                putting.length = u64::MAX;
+                return Ok(());
+            }
+            if putting.length == u64::MAX || !put.wants_body() {
+                return Ok(());
+            }
+            match local.body.try_recv() {
+                Ok(Some(Piece::Bytes(bytes))) => {
+                    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                    self.moved = self.moved.saturating_add(len);
+                    let took = match put.feed(&bytes) {
+                        Ok(took) => took,
+                        Err(_) => return self.fail_job(at, Status::Failed),
+                    };
+                    putting.taken = putting
+                        .taken
+                        .saturating_add(u64::try_from(took).unwrap_or(u64::MAX));
+                    if let Some(rest) = bytes.get(took..) {
+                        putting.carry.extend_from_slice(rest);
+                    }
+                }
+                Ok(Some(Piece::End(trailer))) => local.ended = Some(trailer),
+                Ok(Some(Piece::Refused(status))) => return self.fail_job(at, status),
+                Ok(None) => return Ok(()),
+                // The connection is gone with the body unfinished.
                 Err(_) => return self.fail_job(at, Status::IncompleteBody),
             }
         }
@@ -1205,13 +1390,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         let Some(Job {
             work: Work::Get(getting),
-            exchange,
+            door,
             ..
         }) = self.jobs.get_mut(at)
         else {
             return Ok(());
         };
-        let exchange = *exchange;
         let mut reply = facts(Status::Done, order, &version);
         let current = if version.marker {
             Current::DeleteMarker
@@ -1257,6 +1441,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Ok(get) => getting.get = Some(get),
             Err(_) => return self.fail_job(at, Status::Failed),
         }
+        let exchange = match door {
+            Door::Exchange(exchange) => *exchange,
+            // The reply goes first, its bytes after it as the driver gives them (`write_get`).
+            Door::Local(local) => {
+                getting.total = length;
+                if local.offer(door::Answer::Head(Box::new(reply))) == Sent::Gone {
+                    return self.fail_job(at, Status::Failed);
+                }
+                return Ok(());
+            }
+        };
         let Ok((head, fields)) = reply.encode() else {
             return self.fail_job(at, Status::Failed);
         };
@@ -1338,12 +1533,46 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(true);
         };
-        let exchange = job.exchange;
         let Work::Get(getting) = &mut job.work else {
             return Ok(true);
         };
         let Some(get) = getting.get.as_mut() else {
             return Ok(false);
+        };
+        let exchange = match &mut job.door {
+            Door::Exchange(exchange) => *exchange,
+            Door::Local(local) => {
+                // A piece is taken from the driver only once the last is sent, so the channel holds
+                // what the client has yet to read and the driver the rest of its window.
+                loop {
+                    match local.flush() {
+                        Sent::Taken => {}
+                        Sent::Held => return Ok(false),
+                        Sent::Gone => return Ok(true),
+                    }
+                    let Some(bytes) = get.take() else {
+                        break;
+                    };
+                    let took = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                    getting.written = getting.written.saturating_add(took);
+                    self.moved = self.moved.saturating_add(took);
+                    if local.offer(door::Answer::Bytes(bytes)) == Sent::Gone {
+                        return Ok(true);
+                    }
+                }
+                let last = match get.outcome() {
+                    Some(Ok(())) if getting.written >= getting.total => door::Answer::End,
+                    // The driver failed past the reply's head: the response ends unfinished.
+                    Some(Err(_)) => door::Answer::Failed,
+                    _ => return Ok(false),
+                };
+                if local.offer(last) == Sent::Held {
+                    // The last answer waits for room: the job sends it before it ends.
+                    job.work = Work::Answering(VecDeque::new());
+                    return Ok(false);
+                }
+                return Ok(true);
+            }
         };
         let endpoint = self.driver.endpoint();
         loop {
@@ -1507,7 +1736,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         let Some(Job {
             work: Work::Command(commanding),
-            peer,
+            principal,
             ..
         }) = self.jobs.get_mut(at)
         else {
@@ -1525,11 +1754,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     if_match: if_match.take(),
                     at_ns: 0,
                     bypass: false,
-                    owner: peer.to_string(),
+                    owner: principal.clone(),
                 }))),
             ),
             // S3 lets no other principal change a bucket's versioning unless a policy grants it.
-            Then::Versioning(_) if row.owner != peer.to_string() => {
+            Then::Versioning(_) if row.owner != *principal => {
                 return self.fail_job(at, Status::AccessDenied);
             }
             Then::Versioning(versioning) => (
@@ -1549,7 +1778,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     at_ns: 0,
                     upload: Upload {
                         initiated_ns: 0,
-                        owner: peer.to_string(),
+                        owner: principal.clone(),
                         headers: Vec::new(),
                         checksum: checksum.map(|(algorithm, full)| (algorithm.code(), full)),
                         retention: None,
@@ -1799,7 +2028,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Single::Buckets { prefix, after, max } => (
                 Layer::Bucket,
                 Query::Owned {
-                    owner: job.peer.to_string(),
+                    owner: job.principal.clone(),
                     prefix: prefix.clone(),
                     after: after.clone(),
                     max: *max,
@@ -1848,9 +2077,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     Reply::status(Status::NoSuchBucket)
                 }
                 // S3 answers another principal's bucket 403 unless a policy grants it.
-                Some(row) if row.owner != job.peer.to_string() => {
-                    Reply::status(Status::AccessDenied)
-                }
+                Some(row) if row.owner != job.principal => Reply::status(Status::AccessDenied),
                 Some(row) => match **single {
                     Single::Versioning(_) => Reply {
                         versioning: Some(row.versioning),
@@ -1946,13 +2173,29 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// A draining job's turn: its body read to its end and dropped, then its reply; whether it is
     /// over.
     fn drain_job(&mut self, at: usize) -> Result<bool, NodeError> {
-        let Some(job) = self.jobs.get(at) else {
+        let Some(job) = self.jobs.get_mut(at) else {
             return Ok(true);
+        };
+        let exchange = match job.door {
+            Door::Exchange(exchange) => exchange,
+            // What is left of the body is the listener's to read or drop (node.md §4.5): the reply
+            // and its end go now.
+            Door::Local(_) => {
+                let Work::Draining(reply) =
+                    std::mem::replace(&mut job.work, Work::Answering(VecDeque::new()))
+                else {
+                    return Ok(false);
+                };
+                job.work = Work::Answering(VecDeque::from([
+                    door::Answer::Head(Box::new(reply)),
+                    door::Answer::End,
+                ]));
+                return self.answer_local(at);
+            }
         };
         let Work::Draining(reply) = &job.work else {
             return Ok(false);
         };
-        let exchange = job.exchange;
         let endpoint = self.driver.endpoint();
         loop {
             let Ok(mut piece) = endpoint.reserve(Class::Transfer, PIECE) else {
@@ -1996,7 +2239,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(true);
         };
-        let exchange = job.exchange;
+        let Door::Exchange(exchange) = job.door else {
+            return Ok(true);
+        };
         let Work::Replying(fields, written) = &mut job.work else {
             return Ok(false);
         };
@@ -2019,9 +2264,24 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(true)
     }
 
+    /// A local job's last answers sent as far as its channel takes them; whether it is over: every
+    /// one sent, or the connection gone.
+    fn answer_local(&mut self, at: usize) -> Result<bool, NodeError> {
+        let Some(job) = self.jobs.get_mut(at) else {
+            return Ok(true);
+        };
+        let (Door::Local(local), Work::Answering(answers)) = (&mut job.door, &mut job.work) else {
+            return Ok(true);
+        };
+        local.pending.extend(answers.drain(..));
+        Ok(local.flush() != Sent::Held)
+    }
+
     /// The jobs whose exchange is `exchange`, for an event on it.
     pub(super) fn job_on(&self, exchange: ExchangeId) -> Option<usize> {
-        self.jobs.iter().position(|j| j.exchange == exchange)
+        self.jobs
+            .iter()
+            .position(|j| matches!(j.door, Door::Exchange(e) if e == exchange))
     }
 
     /// An exchange of a job ended unanswered: the job ends, what it waits on let go.
@@ -2030,7 +2290,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             jobs, abandoned, ..
         } = self;
         jobs.retain_mut(|j| {
-            if j.exchange != exchange {
+            if !matches!(j.door, Door::Exchange(e) if e == exchange) {
                 return true;
             }
             abandoned.extend(j.pending.drain(..).map(|(pending, _)| pending));

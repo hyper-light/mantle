@@ -728,6 +728,9 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// What jobs that ended asked and was not yet answered: its outcomes are dropped as they come.
     /// At most the node's asks.
     abandoned: Vec<host::Pending>,
+    /// The S3 listener's door, once opened (`crate::door`; [`Node::open_door`]): the operations it
+    /// hands over, each taken into a job at the next turn.
+    doorway: Option<crate::door::Doorway>,
     /// The orderly stop, once begun ([`Node::stop`]).
     stopping: Option<Stopping>,
     /// The ranges whose lead the stop began to hand over, and those it handed over, not yet taken
@@ -742,6 +745,10 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// Bytes of exchanges' bodies this node has read and written: its transfers' progress
     /// ([`Node::moved`]).
     moved: u64,
+    /// The bytes of chunks peers put here over QUIC, as their exchanges' bodies were read, and of
+    /// chunks this node put on its own volumes in-process ([`Node::chunk_bytes`]).
+    chunks_received: u64,
+    chunks_written: u64,
 }
 
 /// The node's message bounds: a Raft message is at most the larger of a page of entries and one
@@ -978,12 +985,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             gateway: settings.gateway.take(),
             jobs: Vec::new(),
             abandoned: Vec::new(),
+            doorway: None,
             stopping: None,
             handing: Vec::new(),
             handed: Vec::new(),
             dial_only: Some(dial_only),
             table: None,
             moved: 0,
+            chunks_received: 0,
+            chunks_written: 0,
         };
         for kept in &node.ranges {
             node.owner
@@ -1207,6 +1217,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.moved
     }
 
+    /// The bytes of chunks peers put here over QUIC, of chunks this node put on its own volumes
+    /// in-process, and of the chunks its volumes hold. Nothing removes a chunk yet, so the third
+    /// is the first two's sum unless a chunk received was not kept or was kept twice.
+    pub fn chunk_bytes(&self) -> Result<(u64, u64, u64), crate::storage::StorageError> {
+        Ok((
+            self.chunks_received,
+            self.chunks_written,
+            self.storage.held_bytes()?,
+        ))
+    }
+
     /// Each peer's link as the node keeps it.
     pub fn links(&self) -> impl Iterator<Item = Link> + '_ {
         self.remotes.iter().map(|r| Link {
@@ -1324,6 +1345,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         self.schedule_due(now);
         self.drive(now)?;
+        self.take_door();
         self.step_host()?;
         self.step_asks(now)?;
         self.step_reads(now)?;
@@ -1332,6 +1354,28 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.send_plane();
         self.driver.flush()?;
         Ok(())
+    }
+
+    /// Opens the S3 listener's door (`crate::door`): `capacity` operations waiting at once, past
+    /// which the listener answers `503 SlowDown` (node.md §4.5), each one this node's task takes
+    /// at its next turn, which the listener wakes. The listener's end; opened once.
+    pub fn open_door(&mut self, capacity: usize) -> Result<crate::door::Submitter, NodeError> {
+        if self.doorway.is_some() {
+            return Err(NodeError::Bounds(
+                "the S3 listener's door is open already".into(),
+            ));
+        }
+        let (doorway, submitter) = crate::door::doorway(capacity, self.waker.clone())
+            .map_err(|e| NodeError::Bounds(format!("the S3 listener's door: {e:?}")))?;
+        self.doorway = Some(doorway);
+        Ok(submitter)
+    }
+
+    /// The operations the S3 listener handed over since the last turn, each a job.
+    fn take_door(&mut self) {
+        while let Some(request) = self.doorway.as_mut().and_then(crate::door::Doorway::take) {
+            self.take_local(request);
+        }
     }
 
     /// Each range's timing from what the stream measured, and each pair charged its ranges'
@@ -2188,6 +2232,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let len = u64::try_from(piece.len()).unwrap_or(u64::MAX);
             receiving.read = receiving.read.saturating_add(len);
             self.moved = self.moved.saturating_add(len);
+            if matches!(receiving.what, Arriving::ChunkPut { .. }) {
+                self.chunks_received = self.chunks_received.saturating_add(len);
+            }
             if receiving.what.keeps() {
                 receiving.bytes.extend_from_slice(piece);
             }
@@ -2678,20 +2725,23 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Ok(asked);
         }
         if at == self.id {
+            let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
             let outcome = match self.storage.holds(volume) {
                 None => Some(ChunkOutcome::Refused(chunk::Status::NoVolume)),
-                Some(slot) => self
-                    .storage
-                    .put(
-                        slot,
-                        key,
-                        bytes,
-                        crc32c,
-                        &self.waker,
-                        (Origin::Asked(asked), 0),
-                    )
-                    .err()
-                    .map(|e| ChunkOutcome::Refused(chunk::Status::of_error(&e))),
+                Some(slot) => match self.storage.put(
+                    slot,
+                    key,
+                    bytes,
+                    crc32c,
+                    &self.waker,
+                    (Origin::Asked(asked), 0),
+                ) {
+                    Ok(()) => {
+                        self.chunks_written = self.chunks_written.saturating_add(len);
+                        None
+                    }
+                    Err(e) => Some(ChunkOutcome::Refused(chunk::Status::of_error(&e))),
+                },
             };
             if let Some(outcome) = outcome {
                 self.chunks_done.push((asked, outcome));

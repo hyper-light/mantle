@@ -327,6 +327,11 @@ pub(crate) enum Line {
     /// The S3 endpoint a node read its keys for: where it listens, the region it serves and its
     /// access keys' ids.
     S3(SocketAddr, String, Vec<String>),
+    /// Where the node's S3 listener listens, once bound, and the connections it holds at once.
+    S3Bound(SocketAddr, u64),
+    /// The node's chunk bytes as a `chunks` line asked: received over QUIC, put on its own
+    /// volumes in-process, and held by its volumes.
+    Chunks(u64, u64, u64),
     /// The root range took the node's enlistment of itself and its volumes.
     Enlisted,
     /// What the node's failure detectors start from (node.md §2.4, item 7): the cell's node time
@@ -370,6 +375,14 @@ pub(crate) fn parse(line: &str) -> Option<Line> {
         )),
         ["link", peer, rest @ ..] => Some(Line::Link(peer.parse().ok()?, rest.join(" "))),
         ["volume", id] => Some(Line::Volume(u128::from_str_radix(id, 16).ok()?)),
+        ["chunks", received, written, held] => Some(Line::Chunks(
+            received.parse().ok()?,
+            written.parse().ok()?,
+            held.parse().ok()?,
+        )),
+        ["s3-bound", at, connections] => {
+            Some(Line::S3Bound(at.parse().ok()?, connections.parse().ok()?))
+        }
         ["s3", listen, region, ids] => Some(Line::S3(
             listen.parse().ok()?,
             (*region).to_owned(),
@@ -465,6 +478,8 @@ pub(crate) fn movement(line: &Line) -> Option<(u64, u64, u64, u64, Duration, Dur
         | Line::Held(..)
         | Line::Volume(..)
         | Line::S3(..)
+        | Line::S3Bound(..)
+        | Line::Chunks(..)
         | Line::Enlisted
         | Line::History(..)
         | Line::Basis(..)
@@ -830,6 +845,11 @@ pub(crate) struct Cell {
     pub(crate) enlisted: BTreeSet<u64>,
     /// Each running node's S3 endpoint as it said it read its keys.
     pub(crate) s3: BTreeMap<u64, (SocketAddr, String, Vec<String>)>,
+    /// Where each running node's S3 listener listens, as it said once bound, and the connections
+    /// it holds at once.
+    pub(crate) s3_bound: BTreeMap<u64, (SocketAddr, u64)>,
+    /// Each node's chunk bytes as it last answered a `chunks` line.
+    pub(crate) chunks: BTreeMap<u64, (u64, u64, u64)>,
     /// What each node's failure detectors started from as its latest process said: the cell's
     /// history and its own part of it.
     pub(crate) histories: BTreeMap<u64, (Lived, Lived)>,
@@ -1097,6 +1117,8 @@ impl Cell {
             volumes: BTreeMap::new(),
             enlisted: BTreeSet::new(),
             s3: BTreeMap::new(),
+            s3_bound: BTreeMap::new(),
+            chunks: BTreeMap::new(),
             histories: BTreeMap::new(),
             domains: BTreeMap::new(),
             refusing: None,
@@ -1225,6 +1247,8 @@ impl Cell {
             volumes: BTreeMap::new(),
             enlisted: BTreeSet::new(),
             s3: BTreeMap::new(),
+            s3_bound: BTreeMap::new(),
+            chunks: BTreeMap::new(),
             histories: BTreeMap::new(),
             domains: BTreeMap::new(),
             refusing: None,
@@ -1401,6 +1425,14 @@ impl Cell {
         self.ended()
     }
 
+    /// Node `id`'s chunk bytes, asked now: received over QUIC, put on its own volumes in-process,
+    /// and held by its volumes.
+    pub(crate) fn chunk_bytes(&mut self, id: u64) -> (u64, u64, u64) {
+        self.chunks.remove(&id);
+        self.say_to(id, b"chunks\n");
+        self.until(|c| c.chunks.get(&id).copied())
+    }
+
     /// Writes `bytes` to node `id`'s standard input, in one write.
     fn say_to(&mut self, id: u64, bytes: &[u8]) {
         let input = &mut self.running.get_mut(&id).unwrap().input;
@@ -1465,6 +1497,8 @@ impl Cell {
                 | Line::Held(..)
                 | Line::Volume(..)
                 | Line::S3(..)
+                | Line::S3Bound(..)
+                | Line::Chunks(..)
                 | Line::Enlisted
                 | Line::History(..)
                 | Line::Basis(..)
@@ -1638,6 +1672,12 @@ impl Cell {
                     }
                     Line::S3(listen, region, ids) => {
                         self.s3.insert(id, (listen, region, ids));
+                    }
+                    Line::S3Bound(at, connections) => {
+                        self.s3_bound.insert(id, (at, connections));
+                    }
+                    Line::Chunks(received, written, held) => {
+                        self.chunks.insert(id, (received, written, held));
                     }
                     Line::Enlisted => {
                         self.enlisted.insert(id);
@@ -2252,6 +2292,36 @@ pub(crate) fn chunk_key(n: u64) -> ChunkKey {
         epoch: 1,
         index: 0,
     }
+}
+
+/// `mantle init`'s arguments for a cell of three under `root`: a machines file's two founders and a
+/// `--node`'s, each with a volume of its own in a failure domain of its own.
+pub(crate) fn three_founders(root: &Path) -> Vec<String> {
+    let dirs: Vec<PathBuf> = (1..=3)
+        .map(|n| {
+            let dir = root.join(format!("d{n}"));
+            std::fs::create_dir(&dir).unwrap();
+            dir
+        })
+        .collect();
+    let file = root.join("machines.conf");
+    let mut text = String::from("max_nodes = 3\nmax_volumes = 3\n");
+    for (n, dir) in dirs.iter().take(2).enumerate() {
+        text.push_str(&format!(
+            "[node]\nquic = 127.0.0.1:0\nplane = 127.0.0.1:0\ndomain = rack-{n}\nvolume = {} 256M\n",
+            dir.display()
+        ));
+    }
+    std::fs::write(&file, text).unwrap();
+    vec![
+        "--founders".into(),
+        file.display().to_string(),
+        "--node".into(),
+        format!(
+            "quic=127.0.0.1:0,plane=127.0.0.1:0,domain=rack-2,volume={}:256M",
+            dirs[2].display()
+        ),
+    ]
 }
 
 /// Chunk `n`'s bytes: `len` of them, each a function of `n` and its place, so a chunk read back

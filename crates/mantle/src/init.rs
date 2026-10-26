@@ -566,6 +566,10 @@ fn config(
         founder.s3(),
         cell.region()
     ));
+    // The names its clients reach it by, which its requests' hosts name a bucket under.
+    for name in &founder.names {
+        text.push_str(&format!("s3.name = {name}\n"));
+    }
     let voters: Vec<String> = ids.iter().map(u64::to_string).collect();
     text.push_str(&format!("voters = {}\n", voters.join(",")));
     for (group, layer) in groups.iter().zip(LAYERS) {
@@ -1373,6 +1377,13 @@ mod tests {
                 verify(name).unwrap_or_else(|e| panic!("{name}: {e:?}"));
                 checked += 1;
             }
+            // The node reads the names its config states, which requests' hosts name buckets by.
+            let stated: &[&str] = if founder.listen.ip().is_loopback() {
+                &[]
+            } else {
+                &["s3.example"]
+            };
+            assert_eq!(founder.names, stated);
             assert!(verify("other.example").is_err() && verify("10.9.9.9").is_err());
             mantle_cert::EndpointKey::from_pkcs8(&founder.key).unwrap();
         }

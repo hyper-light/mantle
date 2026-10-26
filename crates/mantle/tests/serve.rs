@@ -252,36 +252,6 @@ fn led_on(cell: &mut Cell, group: u128, others: &[u64]) {
     });
 }
 
-/// `mantle init`'s arguments for a cell of three under `root`: a machines file's two founders and a
-/// `--node`'s, each with a volume of its own in a failure domain of its own.
-fn three_founders(root: &Path) -> Vec<String> {
-    let dirs: Vec<PathBuf> = (1..=3)
-        .map(|n| {
-            let dir = root.join(format!("d{n}"));
-            std::fs::create_dir(&dir).unwrap();
-            dir
-        })
-        .collect();
-    let file = root.join("machines.conf");
-    let mut text = String::from("max_nodes = 3\nmax_volumes = 3\n");
-    for (n, dir) in dirs.iter().take(2).enumerate() {
-        text.push_str(&format!(
-            "[node]\nquic = 127.0.0.1:0\nplane = 127.0.0.1:0\ndomain = rack-{n}\nvolume = {} 256M\n",
-            dir.display()
-        ));
-    }
-    std::fs::write(&file, text).unwrap();
-    vec![
-        "--founders".into(),
-        file.display().to_string(),
-        "--node".into(),
-        format!(
-            "quic=127.0.0.1:0,plane=127.0.0.1:0,domain=rack-2,volume={}:256M",
-            dirs[2].display()
-        ),
-    ]
-}
-
 /// The ranges node `id` leads, as it last said.
 fn led(cell: &Cell, id: u64) -> Vec<u128> {
     cell.status

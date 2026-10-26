@@ -75,6 +75,9 @@ pub enum StorageError {
         first: PathBuf,
         second: PathBuf,
     },
+    /// The chunks the volumes hold count past a `u64` of bytes.
+    #[error("the chunks the volumes hold count past {0} bytes")]
+    Counted(u64),
 }
 
 /// What asked for a chunk's put or get, which its answer goes back to: a peer's exchange, or the
@@ -307,6 +310,26 @@ impl Storage {
         let id = held.reader.submit(&held.volume, key, offset, len)?;
         self.gets.push((slot, id, origin));
         Ok(())
+    }
+
+    /// The bytes of the chunks the volumes hold, each chunk's length as its volume's index keeps
+    /// it: what a chunk's put wrote, whoever asked it.
+    pub(crate) fn held_bytes(&self) -> Result<u64, StorageError> {
+        let mut held = 0u64;
+        for volume in &self.volumes {
+            let read = |source| StorageError::Volume {
+                path: volume.dir.clone(),
+                source,
+            };
+            for key in volume.volume.keys().map_err(read)? {
+                if let Some(stat) = volume.volume.stat(&key).map_err(read)? {
+                    held = held
+                        .checked_add(stat.len)
+                        .ok_or(StorageError::Counted(held))?;
+                }
+            }
+        }
+        Ok(held)
     }
 
     /// Puts and gets out.

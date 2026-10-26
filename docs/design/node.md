@@ -515,8 +515,10 @@ key (`identity/s3.der`, `identity/s3.key`) for the DNS names its operator states
 address unless it listens on every one, and `localhost` on a loopback address; serverAuth alone, the
 key identifiers RFC 5280 asks, and 825 days of validity at most, issuing it again before then still
 to build (`mantle_cert::endpoint`). The endpoint listens where the founder's `s3=ADDR` says, else
-over TCP at its QUIC address, and serves the cell's region (`--region`, or `region` in the machines
-file, else S3's us-east-1). For the operator, `OUT/s3` holds the key as AWS's shared credentials
+over TCP at its QUIC address, on the port QUIC bound where that is stated as 0, and serves the
+cell's region (`--region`, or `region` in the machines file, else S3's us-east-1); its stated names
+are its config's `s3.name` lines, which its requests' hosts name buckets under (§4.2), and once
+bound it says `s3-bound ADDR CONNECTIONS`. For the operator, `OUT/s3` holds the key as AWS's shared credentials
 file, owner-only; the endpoint's authority as PEM; and, where a founder's endpoint has a port and a
 name init can state, the config of the profile `mantle`: its region, that endpoint's URL, plain HTTP
 on a loopback address and TLS elsewhere, the PEM as its `ca_bundle`, and path-style addressing.
@@ -1681,7 +1683,23 @@ into the listener's buffer. Its rules are research/70's:
 (`tests/rules.rs`), generated requests read back whole and in any pieces, mutated and arbitrary
 octets read or refused with a typed error and never a panic (`tests/properties.rs`), and its
 allocations counted exactly (`tests/allocations.rs`). `mantle bench http` measures it on one core
-(measurements/2026-10-25-http-codec.md). The listener that runs it is §4.2's, to be built.
+(measurements/2026-10-25-http-codec.md).
+
+*As built (2026-10-25), the listener* (`crates/node/src/listener`). `mantle serve` binds it where
+its S3 keys say (§1.5) and accepts on the node's one shard beside the node's own task, each
+connection a task of its own, so the runtime wakes the one whose socket or channel moved; the
+runtime holds a task for each connection the budget admits (§4.5). On a loopback address it serves
+plain HTTP; elsewhere TLS 1.3 and 1.2 with the endpoint's P-256 certificate, hyper-tls's default
+suites, of which a P-256 key takes the ECDHE-ECDSA AES-GCM ones for TLS 1.2 (research/71). A
+hyper-tls connection holds no configuration (vendor/hyper-tls/VENDORED.md §2), so each connection
+builds its own around the one certified key the listener loads at its start: it answers HTTP/1.1
+when a client offers ALPN, keeps no sessions and sends no tickets, its configuration ending with
+the connection, and compresses no certificate (RFC 8879), the chain being one leaf. A connection's
+requests are taken one at a time, each at the octet its last one's body ended. Tested in
+`crates/node/tests/listener.rs`: a listener on a real socket reached by hyper-tls's client over
+TLS 1.3 and over TLS 1.2 alone, its certificate verified under the endpoint authority for the name
+dialed, HTTP/1.1 chosen over an offered HTTP/2, an ECDHE-ECDSA AES-GCM suite on TLS 1.2, and a
+request answered over each.
 
 ### 4.2 A request's path
 
@@ -1717,8 +1735,43 @@ answer where no policy grants them, and a principal's objects are not yet judged
 cell's certificates; the bucket's policy comes with the listener. Step 5 is the host's bound on
 the operations it runs at once (`gateway.objects`): one past it is answered `SlowDown`, its body
 read and dropped so the exchange ends whole. Steps 7 and 8 are §5.1's: the drivers, the ranges'
-commands and reads, and a typed reply the native protocol encodes, which the listener will render
-as S3's documents.
+commands and reads, and a typed reply the native protocol encodes.
+
+*As built (2026-10-25), the S3 listener* (`crates/node/src/listener`, `crates/node/src/door.rs`).
+1. A connection past the budget, ten (research/72), is closed as it comes, hyper-rt's refusal by
+close. 2. `mantle_s3::route` names the bucket by the path at the endpoint's stated names, its
+addresses and `localhost`, and by the host under one of its names; any other host is
+`InvalidURI`. 3. `mantle_s3::sigv4` checks the signature, its header's or a presigned URL's,
+against the cell's access keys; who asks is the account the key acts for, and a mutation's identity
+the SHA-256 of that account and the request's `amz-sdk-invocation-id`, which every attempt of an
+SDK's operation carries, so its retries are one operation (gateway.md §2.1) and no account names
+another's; a request without one is an operation of its own, its identity drawn. 4. A bucket's
+owner is judged by the host as for the native door; bucket policies come with PutBucketPolicy,
+which this path does not serve yet. 5. The operation goes through the door (`crate::door`): a
+bounded channel the node takes at its next turn into the same jobs the native door's requests
+become, with no loopback QUIC hop; the door holds as many as the host runs at once
+(`gateway.objects`), and past either bound the answer is `503 SlowDown`, before any of a body is
+read. 6. A put's body is read only once the host says its driver wants it, after every check that
+could refuse it, and `100 Continue` goes then; a refusal goes in its place (§4.5). 7. The host runs
+the drivers as for the native door. 8. `respond.rs` renders the host's typed reply as S3's response:
+§4.4's codes, the listings' and multipart's documents from `mantle_s3::response`, and a get's bytes
+written as the host gives them, its response left unfinished if the host fails past its head.
+Served: CreateBucket, HeadBucket, GetBucketLocation, DeleteBucket, ListBuckets, Put and Get
+BucketVersioning, PutObject, GetObject whole and by range, HeadObject, DeleteObject, ListObjectsV2,
+CreateMultipartUpload, UploadPart, CompleteMultipartUpload, AbortMultipartUpload, ListParts and
+ListMultipartUploads; every other operation `mantle_s3::route` names, and DeleteObject of a version
+by its ID, is `501 NotImplemented` on this path, and an object's stored headers (`Content-Type`,
+`x-amz-meta-*`) are not kept yet, so a get answers `binary/octet-stream`. Tested in
+`crates/mantle/tests/s3.rs` on a cell of three made by `mantle init`, every request signed with the
+operator's key through each node's listener: a bucket made, listed, headed and refused again;
+objects put through each listener read back whole, by range and by head through the others; every
+key listed through every listener; a key made only where none is (`If-None-Match: *`) and replaced
+only at its ETag (`If-Match`); a delete through one seen by all; a multipart upload whose parts go
+through two listeners, listed, completed through a third with S3's ETag, and read back whole and
+by a suffix range through each; objects put through one listener alone held by the other two nodes
+exactly as they received them over QUIC's transfer class, neither putting any itself; and on every
+node, the bytes its volumes hold the bytes its peers put on it over QUIC and those it put itself,
+read by a `chunks` line on standard input, answered `chunks RECEIVED WRITTEN HELD`.
 
 ### 4.3 Bodies
 
@@ -1748,6 +1801,18 @@ sweeps. On the listener's TCP the node also bounds a slow reader's unsent bytes 
 `TCP_NOTSENT_LOWAT` and ends a dead peer with `TCP_USER_TIMEOUT` where the platform offers them
 (research/30 §3.6).
 
+*As built (2026-10-25), the S3 listener's bodies.* The listener reads a put's body in the native
+door's piece, the transport's receive chunk of 65,527 octets, so a driver takes the same pieces by
+either door, and holds two in flight to the host, one taken while the next is read: a body comes no
+faster than the driver takes it, which TCP's window carries to the client. A body framed
+`aws-chunked` is decoded as it streams by `mantle_s3::chunked`, each chunk's signature checked as it
+comes; a body whose SHA-256 the signature covers is hashed as it streams and checked at its end; and
+the body's end goes to the host only once those held, with the checksum its trailer carried, which
+the put's driver checks the object against before anything commits. A body that ends short of its
+length is `IncompleteBody`. A small document's body (CompleteMultipartUpload, PutBucketVersioning,
+CreateBucket's configuration) is read whole, within its `mantle_s3::body` bound, before its
+operation is made. The slow body's reclaim and the socket options above are open.
+
 ### 4.4 Errors
 
 Each driver's error maps to S3's answer, and a failure whose outcome is unknown is never
@@ -1771,6 +1836,19 @@ reported as success or as a refusal with no effect:
 
 A body with both `Transfer-Encoding` and `Content-Length` is refused 400 and the connection
 closed, as RFC 9112 requires for a framing error in a request (25 §2).
+
+*As built (2026-10-25), the S3 listener* (`listener/respond.rs`) answers each host status with the
+code and status above, `Malformed` as `400 InvalidRequest`, and refuses on its own: the codec's
+refusals with their statuses (research/70), the connection closed; the router's `InvalidURI`,
+`KeyTooLongError`, `MethodNotAllowed` and `NotImplemented`; SigV4's `AccessDenied`,
+`InvalidAccessKeyId`, `SignatureDoesNotMatch`, `RequestTimeTooSkewed` and its malformed headers; a
+body whose length is not stated before it, `411 MissingContentLength`; one past S3's largest
+object, `400 EntityTooLarge`, before any of it is read; a document past its bound,
+`MaxMessageLengthExceeded`; a `Content-MD5` that is not 16 octets of base64, `InvalidDigest`; and a
+body whose SHA-256 differs from its signed one, `XAmzContentSHA256Mismatch`, the code S3 is widely
+seen to send and neither of AWS's lists holds (research/05, research/72). Each error is S3's
+`Error` document naming the resource, its request's id and the node as its host; a HEAD's carries
+none.
 
 ### 4.5 Overload
 
@@ -1834,6 +1912,20 @@ an admission queue whose sojourn exceeds its target, a range being split or froz
 credit. A condition that outlasts the retries, such as a cell out of space, is reported as what
 it is, and its remedy is operational. Whether to send `x-amz-retry-after` is open, since whether
 S3 sends it is unverified (25 §3).
+
+*As built (2026-10-25), the S3 listener.* The door holds as many operations as the host runs at once
+and the host refuses one past them, each `503 SlowDown` before any of a body is read, so a refusal
+comes before `100 Continue`. A response sent before its request's body was read says
+`Connection: close`, whether or not its client waited for `100 Continue`, since it may send the body
+anyway (RFC 9110 §10.1.1); the listener then half-closes and reads what comes until the client
+closes, at most the largest body a request may carry, so the response is not lost to a reset
+(RFC 9112 §9.6; research/72). The connection budget is a floor of ten, what botocore and the AWS
+CLI's classic transfers open at their defaults (research/72). Open: the budget growing past its
+floor with the node's memory, which the CLI's CRT transfer client asks, at least ten connections and
+twenty-five at its 10 Gb/s target (research/72); the process's descriptor limit, which the budget
+does not yet read; the reclaim of the connection that has made the least progress for longest when
+the node needs the room (§4.1, §4.3); and the shared admission authority above, of which the door's
+bound is the host's floor.
 
 ### 4.6 Keys for encryption
 

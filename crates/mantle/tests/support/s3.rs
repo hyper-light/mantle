@@ -196,12 +196,25 @@ impl Client {
         body: &[u8],
     ) -> Response {
         let payload = sigv4::hex(&mantle_s3::crypto::sha256(body).unwrap());
+        self.send_as(method, target, headers, body, &payload)
+    }
+
+    /// Sends a request whose `x-amz-content-sha256` is `payload`: a body's hex SHA-256, or one of
+    /// the streaming kinds whose body is `aws-chunked`.
+    pub(crate) fn send_as(
+        &mut self,
+        method: &str,
+        target: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+        payload: &str,
+    ) -> Response {
         let length = body.len().to_string();
         let mut with_length: Vec<(&str, &str)> = headers.to_vec();
         if !body.is_empty() || matches!(method, "PUT" | "POST") {
             with_length.push(("content-length", &length));
         }
-        let head = self.head(method, target, &with_length, &payload);
+        let head = self.head(method, target, &with_length, payload);
         let stream = self.stream();
         stream.write_all(head.as_bytes()).unwrap();
         stream.write_all(body).unwrap();
@@ -281,4 +294,17 @@ impl Client {
             }
         }
     }
+}
+
+/// `data` as `aws-chunked` with unsigned chunks of `chunk` octets, the last of none, and a trailing
+/// checksum field `trailer` (05 §1.8–§1.9).
+pub(crate) fn aws_chunked(data: &[u8], chunk: usize, trailer: (&str, &str)) -> Vec<u8> {
+    let mut out = Vec::new();
+    for piece in data.chunks(chunk) {
+        out.extend_from_slice(format!("{:x}\r\n", piece.len()).as_bytes());
+        out.extend_from_slice(piece);
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(format!("0\r\n{}:{}\r\n\r\n", trailer.0, trailer.1).as_bytes());
+    out
 }

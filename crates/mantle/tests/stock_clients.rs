@@ -55,14 +55,16 @@ fn started(root: &Path) -> (Cell, Vec<(String, String)>) {
     let out = cell.dirs[&ids[0]].parent().unwrap().to_path_buf();
     let (at, _) = cell.s3_bound[&ids[0]];
     let (_, region, _) = &cell.s3[&ids[0]];
-    let config = root.join("config");
-    std::fs::write(
-        &config,
+    // The profile as init writes it, its transfer client named: botocore's here, the CRT's in
+    // `config-crt` beside it, which a run of the CRT's client names as its config.
+    let profile = |client: &str| {
         format!(
-            "[profile mantle]\nregion = {region}\nendpoint_url = http://{at}\ns3 =\n  addressing_style = path\n"
-        ),
-    )
-    .unwrap();
+            "[profile mantle]\nregion = {region}\nendpoint_url = http://{at}\ns3 =\n  addressing_style = path\n  preferred_transfer_client = {client}\n"
+        )
+    };
+    let config = root.join("config");
+    std::fs::write(&config, profile("classic")).unwrap();
+    std::fs::write(root.join("config-crt"), profile("crt")).unwrap();
     let env = vec![
         ("AWS_CONFIG_FILE".into(), config.display().to_string()),
         (
@@ -134,16 +136,66 @@ fn query(args: &[&str], query: &str, env: &[(String, String)]) -> String {
     text(&aws(&all, env))
 }
 
+/// The CLI's version as `aws --version` says it: `aws-cli/2.38.4 Python/...`.
+fn cli_version(said: &str) -> (u32, u32, u32) {
+    let number = said
+        .strip_prefix("aws-cli/")
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_else(|| panic!("not the AWS CLI's version: {said}"));
+    let mut parts = number.split('.').map(|p| p.parse::<u32>().unwrap());
+    (
+        parts.next().unwrap(),
+        parts.next().unwrap(),
+        parts.next().unwrap(),
+    )
+}
+
+/// A small object and a large one up and down by the CLI's CRT transfer client, each read back
+/// byte-identical, then removed.
+fn crt_transfers(dir: &Path, env: &[(String, String)]) {
+    let mut crt = env.to_vec();
+    crt.retain(|(k, _)| k != "AWS_CONFIG_FILE");
+    crt.push((
+        "AWS_CONFIG_FILE".into(),
+        dir.join("config-crt").display().to_string(),
+    ));
+    for (client, data) in [
+        ("crt-small", bytes(7, 333_331)),
+        ("crt-large", bytes(8, THRESHOLD * 2 + 7)),
+    ] {
+        let file = write(dir, &format!("{client}.bin"), &data);
+        let key = format!("s3://stock/{client}.bin");
+        aws(&["s3", "cp", file.to_str().unwrap(), &key], &crt);
+        let back = dir.join(format!("back-{client}.bin"));
+        aws(&["s3", "cp", &key, back.to_str().unwrap()], &crt);
+        assert!(
+            std::fs::read(&back).unwrap() == data,
+            "{client} by the CRT client"
+        );
+        aws(&["s3", "rm", &key], &crt);
+    }
+}
+
 #[test]
 fn the_aws_cli_and_boto3_pass_against_a_cell_of_three() {
     let root = tempfile::tempdir().unwrap();
     let dir = root.path();
     let (_cell, env) = started(dir);
-    let version = aws(&["--version"], &env);
-    println!("{}", text(&version));
+    let version = text(&aws(&["--version"], &env));
+    println!("{version}");
+
+    // aws s3 by each of the CLI's transfer clients, botocore's and the CRT's, named rather than left
+    // to the CLI's choice: a small object and a large one up and down, each read back
+    // byte-identical. The CRT's client takes an http endpoint, and is `aws s3`'s default on every
+    // host, from the CLI's 2.38.0 ("Disable TLS in CRT client when resolved endpoint scheme is
+    // http"; "Enable the CRT S3 transfer client by default on all hosts", the CLI's changelog); an
+    // older CLI's default is botocore's, which the commands below run.
+    aws(&["s3", "mb", "s3://stock"], &env);
+    if cli_version(&version) >= (2, 38, 0) {
+        crt_transfers(dir, &env);
+    }
 
     // aws s3: a bucket, a small object and a large one up, listed, down, compared, and removed.
-    aws(&["s3", "mb", "s3://stock"], &env);
     let small = bytes(1, 100_003);
     let large = bytes(2, THRESHOLD * 2 + 12_345);
     let small_file = write(dir, "small.bin", &small);

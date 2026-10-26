@@ -162,6 +162,44 @@ fn a_cell_of_three_serves_signed_s3_requests_through_every_nodes_listener() {
         );
     }
 
+    // A body framed `aws-chunked` with its checksum in a trailer, as the AWS CLI's CRT transfers and
+    // the SDKs' streaming uploads send one (05 §1.9): the object commits with the trailer's
+    // CRC-32 and reads back whole; a trailer whose value is another's is refused before anything
+    // commits.
+    let trailed = bytes(90, 150_001);
+    let crc = checksum::checksum(Algorithm::Crc32, &trailed)
+        .unwrap()
+        .to_base64();
+    let wrong = checksum::checksum(Algorithm::Crc32, b"another body")
+        .unwrap()
+        .to_base64();
+    let decoded = trailed.len().to_string();
+    let chunked = [
+        ("content-encoding", "aws-chunked"),
+        ("x-amz-decoded-content-length", decoded.as_str()),
+        ("x-amz-trailer", "x-amz-checksum-crc32"),
+    ];
+    let streaming = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
+    let body = s3::aws_chunked(&trailed, 64 << 10, ("x-amz-checksum-crc32", &crc));
+    let put = clients[1].send_as("PUT", "/photos/trailed", &chunked, &body, streaming);
+    assert_eq!(put.status, 200, "{}", put.text());
+    assert_eq!(put.header("x-amz-checksum-crc32"), Some(crc.as_str()));
+    assert!(clients[2].send("GET", "/photos/trailed", &[], b"").body == trailed);
+    let body = s3::aws_chunked(&trailed, 64 << 10, ("x-amz-checksum-crc32", &wrong));
+    let refused = clients[1].send_as("PUT", "/photos/mistrailed", &chunked, &body, streaming);
+    assert_eq!(
+        (refused.status, refused.element("Code").as_deref()),
+        (400, Some("BadDigest")),
+        "{}",
+        refused.text()
+    );
+    assert_eq!(
+        clients[2]
+            .send("HEAD", "/photos/mistrailed", &[], b"")
+            .status,
+        404
+    );
+
     // Objects put through each listener read back whole and by range through the others.
     let objects: Vec<(String, Vec<u8>)> = (0..n)
         .map(|i| {
@@ -208,7 +246,7 @@ fn a_cell_of_three_serves_signed_s3_requests_through_every_nodes_listener() {
         assert_eq!(page.status, 200, "{}", page.text());
         assert_eq!(
             page.element("KeyCount"),
-            Some((alone.len() + at_once.len() + n).to_string())
+            Some((alone.len() + at_once.len() + 1 + n).to_string())
         );
         for (key, _) in &objects {
             assert!(page.text().contains(&format!("<Key>{key}</Key>")), "{key}");

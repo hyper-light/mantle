@@ -191,6 +191,8 @@ struct Putting {
     preconditions: Preconditions,
     /// What the body's end is checked against: its `Content-MD5` and checksum (05 §3.2).
     expected: Expected,
+    /// The algorithm of the checksum a trailer brings with the body's end (`door::Request`).
+    trailing: Option<checksum::Algorithm>,
     /// The driver, once the bucket's row was read.
     put: Option<Put>,
     /// Body bytes read and not yet taken by the driver, and the body's bytes taken so far.
@@ -454,6 +456,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let door::Request {
             op,
             principal,
+            trailing,
             body,
             reply,
         } = request;
@@ -462,7 +465,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Some(g) if self.stopping() || self.jobs.len() >= g.objects => {
                 Work::Draining(Reply::status(Status::SlowDown))
             }
-            Some(_) => work(op, Vec::new()),
+            Some(_) => match work(op, Vec::new()) {
+                Work::Put(mut putting) => {
+                    putting.trailing = trailing;
+                    Work::Put(putting)
+                }
+                work => work,
+            },
         };
         self.jobs.push(Job {
             door: Door::Local(Box::new(Local {
@@ -1026,7 +1035,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         let body = Body {
             length: putting.length,
-            checksum: putting.expected.checksum.as_ref().map(|c| c.algorithm),
+            checksum: putting
+                .expected
+                .checksum
+                .as_ref()
+                .map(|c| c.algorithm)
+                .or(putting.trailing),
             content_md5: putting.expected.md5.is_some(),
         };
         match Put::new(commit, body, keys, layout, holding, Box::new(Random), now) {
@@ -2377,6 +2391,7 @@ fn work(op: Op, carry: Vec<u8>) -> Work {
                 if_none_match: matched(headers.if_none_match.as_deref(), false),
             },
             expected: Expected { md5, checksum },
+            trailing: None,
             put: None,
             taken: 0,
             carry,
@@ -2456,6 +2471,7 @@ fn work(op: Op, carry: Vec<u8>) -> Work {
             length,
             preconditions: Preconditions::default(),
             expected: Expected { md5, checksum },
+            trailing: None,
             put: None,
             taken: 0,
             carry,

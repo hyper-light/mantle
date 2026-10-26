@@ -120,10 +120,14 @@ pub enum Make {
     },
 }
 
+/// An object's body: how it is read, its object's length, and the algorithm of the checksum its
+/// trailer carries, if it has one.
+pub type Streamed = (Upload, u64, Option<Algorithm>);
+
 /// What the request asks of the host.
 pub enum Plan {
     /// `op` handed over now; an object's body, if it has one, read as the host's driver wants it.
-    Host { op: Op, body: Option<(Upload, u64)> },
+    Host { op: Op, body: Option<Streamed> },
     /// A document of at most `limit` octets read whole, then the operation it makes.
     Document {
         limit: usize,
@@ -288,8 +292,9 @@ fn plan(
         }),
         Operation::ListObjectsV2 => host(Op::List(list(route, query)?)),
         Operation::PutObject => {
-            let (upload, length) = upload(parts, verified, framing)?;
+            let (upload, length, trailing) = upload(parts, verified, framing)?;
             let (checksum, md5) = digests(parts)?;
+            single(checksum.as_ref(), trailing)?;
             Ok(Plan::Host {
                 op: Op::Put {
                     bucket: bucket(route)?,
@@ -300,7 +305,7 @@ fn plan(
                     checksum,
                     md5,
                 },
-                body: Some((upload, length)),
+                body: Some((upload, length, trailing)),
             })
         }
         Operation::GetObject => host(Op::Get {
@@ -329,8 +334,9 @@ fn plan(
             checksum: upload_checksum(parts)?,
         }),
         Operation::UploadPart => {
-            let (upload, length) = upload(parts, verified, framing)?;
+            let (upload, length, trailing) = upload(parts, verified, framing)?;
             let (checksum, md5) = digests(parts)?;
+            single(checksum.as_ref(), trailing)?;
             Ok(Plan::Host {
                 op: Op::UploadPart {
                     bucket: bucket(route)?,
@@ -342,7 +348,7 @@ fn plan(
                     checksum,
                     md5,
                 },
-                body: Some((upload, length)),
+                body: Some((upload, length, trailing)),
             })
         }
         Operation::CompleteMultipartUpload => Ok(Plan::Document {
@@ -467,6 +473,18 @@ fn part_number(query: &Query) -> Result<u16, Refused> {
     }
 }
 
+/// A body states one checksum at most, in a header or in its trailer (05 §3.2).
+fn single(header: Option<&Checksum>, trailing: Option<Algorithm>) -> Result<(), Refused> {
+    if header.is_some() && trailing.is_some() {
+        return Err(Refused::new(
+            "InvalidRequest",
+            400,
+            "Expecting a single x-amz-checksum- header",
+        ));
+    }
+    Ok(())
+}
+
 /// The checksum a body's headers state, and its `Content-MD5` (05 §3.2): at most one checksum
 /// header, each value its algorithm's width.
 fn digests(parts: &Parts<'_>) -> Result<(Option<Checksum>, Option<[u8; 16]>), Refused> {
@@ -536,11 +554,7 @@ fn upload_checksum(parts: &Parts<'_>) -> Result<Option<(Algorithm, bool)>, Refus
 /// `x-amz-decoded-content-length` states it, else the framing's. A body whose length is not
 /// stated before it comes is refused, as S3 refuses a PUT without one (`411
 /// MissingContentLength`), and one past S3's largest object is refused before any of it is read.
-fn upload(
-    parts: &Parts<'_>,
-    verified: Verified,
-    framing: Framing,
-) -> Result<(Upload, u64), Refused> {
+fn upload(parts: &Parts<'_>, verified: Verified, framing: Framing) -> Result<Streamed, Refused> {
     let missing = || {
         Refused::new(
             "MissingContentLength",
@@ -549,20 +563,38 @@ fn upload(
         )
     };
     let Verified { body, chain, .. } = verified;
-    let (upload, length) = match body {
+    // The checksum a trailer carries is the one `x-amz-trailer` names, which the decoder holds the
+    // trailer to.
+    let algorithm = |named: &str| {
+        Algorithm::from_header(named).ok_or_else(|| {
+            Refused::new(
+                "InvalidRequest",
+                400,
+                format!("The trailer {named} names no checksum S3 takes."),
+            )
+        })
+    };
+    let (upload, length, trailing) = match body {
         Body::Sha256(sha256) => (
             Upload::Plain(Some(sha256)),
             framed(framing).ok_or_else(missing)?,
+            None,
         ),
-        Body::Unsigned => (Upload::Plain(None), framed(framing).ok_or_else(missing)?),
+        Body::Unsigned => (
+            Upload::Plain(None),
+            framed(framing).ok_or_else(missing)?,
+            None,
+        ),
         Body::SignedChunks { trailer } => {
             let length = decoded(parts).ok_or_else(missing)??;
             let chain = chain
                 .ok_or_else(|| Refused::new("InternalError", 500, "a signed body with no chain"))?;
             let named = trailer.then(|| parts.header("x-amz-trailer")).flatten();
+            let trailing = named.map(algorithm).transpose()?;
             (
                 Upload::Chunked(Box::new(Decoder::signed(chain, named, length))),
                 length,
+                trailing,
             )
         }
         Body::UnsignedChunks => {
@@ -573,6 +605,7 @@ fn upload(
             (
                 Upload::Chunked(Box::new(Decoder::unsigned(named, length))),
                 length,
+                Some(algorithm(named)?),
             )
         }
     };
@@ -583,7 +616,7 @@ fn upload(
             "Your proposed upload exceeds the maximum allowed size",
         ));
     }
-    Ok((upload, length))
+    Ok((upload, length, trailing))
 }
 
 /// The octets the framing states before the body comes.

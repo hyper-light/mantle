@@ -318,7 +318,10 @@ signature `403 SignatureDoesNotMatch` (`crates/mantle/tests/s3.rs`; TLS 1.3 and 
 target: the CLI's bucket, object, listing and multipart commands, its multipart `cp` from standard
 input and to standard output, and boto3's object calls and managed transfers with the SDK's default
 checksums, every object read back byte-identical (`crates/mantle/tests/stock_clients.rs`; CI
-installs boto3 pinned with every hash). `mantle bench s3` measures the listener's own cost
+installs boto3 pinned with every hash). The CLI's CRT transfer client, `aws s3`'s default from CLI
+2.38.0, runs where the image's CLI takes an http endpoint for it, 2.38.0 onward: on the Windows
+images now (2.38.3 and 2.38.4 on 2026-10-26), on Linux (2.37.13) and macOS (2.36.40) as their
+images move past it. `mantle bench s3` measures the listener's own cost
 (measurements/2026-10-25-s3-listener.md).
 
 Remaining before it is done:

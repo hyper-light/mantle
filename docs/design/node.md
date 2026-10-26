@@ -1816,7 +1816,9 @@ faster than the driver takes it, which TCP's window carries to the client. A bod
 `aws-chunked` is decoded as it streams by `mantle_s3::chunked`, each chunk's signature checked as it
 comes; a body whose SHA-256 the signature covers is hashed as it streams and checked at its end; and
 the body's end goes to the host only once those held, with the checksum its trailer carried, which
-the put's driver checks the object against before anything commits. A body that ends short of its
+the put's driver checks the object against before anything commits. The trailer's algorithm, which
+`x-amz-trailer` names, goes to the host with the operation, so the driver hashes the body by it
+from its first byte; a body that states a checksum in a header and in a trailer is refused. A body that ends short of its
 length is `IncompleteBody`. A small document's body (CompleteMultipartUpload, PutBucketVersioning,
 CreateBucket's configuration) is read whole, within its `mantle_s3::body` bound, before its
 operation is made. The slow body's reclaim and the socket options above are open.

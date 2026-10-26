@@ -17,7 +17,7 @@ use mantle_s3::route::Query;
 
 use super::Endpoint;
 use super::io::{Io, IoError};
-use super::request::{self, Parts, Plan, Refused, Upload};
+use super::request::{self, Parts, Plan, Refused, Streamed, Upload};
 use super::respond::{self, Echo, Ids, Response};
 use crate::door::{self, Answer, Piece, Submitter};
 use crate::object::{Op, Status};
@@ -333,7 +333,7 @@ impl Connection {
     async fn exchange(
         &mut self,
         (op, principal): (Op, String),
-        body: Option<(Upload, u64)>,
+        body: Option<Streamed>,
         (framing, continues): (Framing, bool),
         (echo, ids, resource): (&Echo<'_>, &Ids, &str),
         (version, head): (Version, bool),
@@ -351,6 +351,7 @@ impl Connection {
         let request = door::Request {
             op,
             principal,
+            trailing: body.as_ref().and_then(|(_, _, trailing)| *trailing),
             body: taken,
             reply: answers,
         };
@@ -368,7 +369,7 @@ impl Connection {
             self.door.wake();
             match answer {
                 Ok(Answer::Ready) => {
-                    let Some((upload, _)) = body.take() else {
+                    let Some((upload, _, _)) = body.take() else {
                         continue;
                     };
                     if continues && self.io.write(write::CONTINUE).await.is_err() {

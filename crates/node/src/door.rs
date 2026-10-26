@@ -13,7 +13,7 @@ use std::task::Waker;
 use bytes::Bytes;
 use hyper_rt::RtError;
 use hyper_rt::sync::{ChannelReceiver, Sender, SyncError, channel};
-use mantle_s3::checksum::Checksum;
+use mantle_s3::checksum::{Algorithm, Checksum};
 
 use crate::object::{Op, Reply, Status};
 
@@ -22,6 +22,10 @@ pub struct Request {
     pub op: Op,
     /// Who asks: the account its access key acts for (`mantle init`).
     pub principal: String,
+    /// The algorithm of the checksum a put's body carries in its trailer (aws-chunked's
+    /// `x-amz-trailer`, 05 §1.9): its value comes with the body's end, so its driver hashes the
+    /// body by it from the first byte.
+    pub trailing: Option<Algorithm>,
     /// The request's body, as the connection reads it.
     pub body: ChannelReceiver<Piece>,
     /// The reply, as the host writes it.

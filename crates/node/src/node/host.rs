@@ -197,8 +197,11 @@ struct Putting {
     preconditions: Preconditions,
     /// What the body's end is checked against: its `Content-MD5` and checksum (05 §3.2).
     expected: Expected,
-    /// The algorithm of the checksum a trailer brings with the body's end (`door::Request`).
+    /// The algorithm of the checksum a trailer brings with the body's end: aws-chunked's through
+    /// the listener's door, or the value past a native put's bytes (`object::Op::Put`).
     trailing: Option<checksum::Algorithm>,
+    /// A native put's trailer read so far, at most its algorithm's width.
+    trailer: Vec<u8>,
     /// The driver, once the bucket's row was read.
     put: Option<Put>,
     /// Body bytes read and not yet taken by the driver, and the body's bytes taken so far.
@@ -488,7 +491,6 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let door::Request {
             op,
             principal,
-            trailing,
             body,
             reply,
         } = request;
@@ -497,13 +499,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Some(g) if self.stopping() || self.jobs.len() >= g.objects => {
                 Work::Draining(Reply::status(Status::SlowDown))
             }
-            Some(_) => match work(op, Vec::new()) {
-                Work::Put(mut putting) => {
-                    putting.trailing = trailing;
-                    Work::Put(putting)
-                }
-                work => work,
-            },
+            Some(_) => work(op, Vec::new()),
         };
         self.jobs.push(Job {
             door: Door::Local(Box::new(Local {
@@ -1200,25 +1196,44 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Ok(());
         };
         let endpoint = self.driver.endpoint();
+        // A trailer's value follows the object's bytes: the driver is fed those alone.
+        let width = putting.trailing.map_or(0, |a| a.width());
         loop {
-            if !putting.carry.is_empty() {
+            let left = usize::try_from(putting.length.saturating_sub(putting.taken))
+                .unwrap_or(usize::MAX)
+                .min(putting.carry.len());
+            if left > 0 {
                 if !put.wants_body() {
                     return Ok(());
                 }
-                let took = match put.feed(&putting.carry) {
-                    Ok(took) => took,
-                    Err(_) => return self.fail_job(at, Status::Failed),
+                let took = match putting.carry.get(..left).map(|bytes| put.feed(bytes)) {
+                    Some(Ok(took)) => took,
+                    _ => return self.fail_job(at, Status::Failed),
                 };
                 putting.taken = putting
                     .taken
                     .saturating_add(u64::try_from(took).unwrap_or(u64::MAX));
                 putting.carry.drain(..took.min(putting.carry.len()));
-                if !putting.carry.is_empty() {
+                if took < left {
                     return Ok(());
                 }
             }
-            if putting.taken >= putting.length {
-                if endpoint.body_complete(exchange) || putting.length == 0 {
+            if putting.taken >= putting.length && !putting.carry.is_empty() {
+                // Past the object's bytes, the trailer's; the transport holds the body to the
+                // length its head stated, the trailer's width within it.
+                if putting.trailer.len().saturating_add(putting.carry.len()) > width {
+                    return self.fail_job(at, Status::Malformed);
+                }
+                putting.trailer.append(&mut putting.carry);
+            }
+            if putting.taken >= putting.length && putting.trailer.len() == width {
+                if endpoint.body_complete(exchange) || (putting.length == 0 && width == 0) {
+                    if let Some(algorithm) = putting.trailing {
+                        putting.expected.checksum = Some(checksum::Checksum {
+                            algorithm,
+                            bytes: std::mem::take(&mut putting.trailer),
+                        });
+                    }
                     if put.end(&putting.expected).is_err() && put.outcome().is_none() {
                         return self.fail_job(at, Status::Failed);
                     }
@@ -1231,7 +1246,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 }
                 return Ok(());
             }
-            if !put.wants_body() {
+            if putting.taken < putting.length && !put.wants_body() {
                 return Ok(());
             }
             let Ok(mut piece) = endpoint.reserve(Class::Transfer, PIECE) else {
@@ -2404,6 +2419,17 @@ fn work(op: Op, carry: Vec<u8>) -> Work {
         Op::Put { length, .. } if length > mantle_s3::body::MAX_UPLOAD => {
             Work::Draining(Reply::status(Status::EntityTooLarge))
         }
+        // A body states one checksum at most, in its fields or its trailer (05 §3.2).
+        Op::Put {
+            checksum: Some(_),
+            trailing: Some(_),
+            ..
+        }
+        | Op::UploadPart {
+            checksum: Some(_),
+            trailing: Some(_),
+            ..
+        } => Work::Draining(Reply::status(Status::InvalidRequest)),
         Op::Put {
             bucket,
             key,
@@ -2412,6 +2438,7 @@ fn work(op: Op, carry: Vec<u8>) -> Work {
             headers,
             checksum,
             md5,
+            trailing,
         } => Work::Put(Box::new(Putting {
             bucket,
             key,
@@ -2423,7 +2450,8 @@ fn work(op: Op, carry: Vec<u8>) -> Work {
                 if_none_match: matched(headers.if_none_match.as_deref(), false),
             },
             expected: Expected { md5, checksum },
-            trailing: None,
+            trailing,
+            trailer: Vec::new(),
             put: None,
             taken: 0,
             carry,
@@ -2498,6 +2526,7 @@ fn work(op: Op, carry: Vec<u8>) -> Work {
             length,
             checksum,
             md5,
+            trailing,
         } => Work::Put(Box::new(Putting {
             bucket,
             key,
@@ -2506,7 +2535,8 @@ fn work(op: Op, carry: Vec<u8>) -> Work {
             length,
             preconditions: Preconditions::default(),
             expected: Expected { md5, checksum },
-            trailing: None,
+            trailing,
+            trailer: Vec::new(),
             put: None,
             taken: 0,
             carry,
@@ -2700,6 +2730,7 @@ mod tests {
             length,
             checksum: None,
             md5: None,
+            trailing: None,
         };
         assert_eq!(
             refused(&work(part(name::MAX_PART + 1), Vec::new())),
@@ -2714,10 +2745,29 @@ mod tests {
             headers: Headers::default(),
             checksum: None,
             md5: None,
+            trailing: None,
         };
         assert_eq!(
             refused(&work(put, Vec::new())),
             Some(Status::EntityTooLarge)
+        );
+        // A checksum in the fields and a trailer's both.
+        let twice = Op::Put {
+            bucket: "b".into(),
+            key: "k".into(),
+            id: 1,
+            length: 1,
+            headers: Headers::default(),
+            checksum: Some(checksum::Checksum {
+                algorithm: checksum::Algorithm::Crc32,
+                bytes: vec![0; 4],
+            }),
+            md5: None,
+            trailing: Some(checksum::Algorithm::Crc32),
+        };
+        assert_eq!(
+            refused(&work(twice, Vec::new())),
+            Some(Status::InvalidRequest)
         );
         let create = |algorithm, full| Op::CreateUpload {
             bucket: "b".into(),

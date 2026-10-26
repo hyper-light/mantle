@@ -731,6 +731,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mantle-client"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "hyper-measure",
+ "hyper-rt",
+ "hyper-rt-transport",
+ "hyper-transport",
+ "mantle-cert",
+ "mantle-protocol",
+ "mantle-s3",
+ "thiserror",
+]
+
+[[package]]
 name = "mantle-codec"
 version = "0.1.0"
 dependencies = [

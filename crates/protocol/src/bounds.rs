@@ -295,6 +295,74 @@ fn held(stated: &Stated, shape: &Shape) -> Result<(u64, u64), Unfit> {
     Ok((held, shares))
 }
 
+/// A transport endpoint as it opens, its TLS configurations with the node's certificate, key and
+/// authority included, beside the tables its limits size: measured, 59,325 bytes, and 713 for
+/// each peer its directory names, at one, two and four peers (mantle-node's
+/// `tests/transport_memory.rs`).
+const ENDPOINT_BYTES: u64 = 59_325;
+const ENDPOINT_PEER_BYTES: u64 = 713;
+
+/// A slot of an endpoint's table of receive chunks, beside the chunk its budget charges:
+/// measured, 72 bytes.
+const CHUNK_SLOT_BYTES: u64 = 72;
+
+/// A QUIC connection and its TLS session once established, a side's: measured, 122,012 bytes at
+/// the most any window took, and 95 for each stream it may hold.
+const CONNECTION_BYTES: u64 = 122_012;
+const STREAM_BYTES: u64 = 95;
+
+/// An exchange in use, a side's, beside what its budget charges: its stream's state and the
+/// transport's record of it, measured, 2,151 bytes at the most.
+const EXCHANGE_BYTES: u64 = 2_151;
+
+/// What a server's handshake takes, once a certificate, to compress the certificate (RFC 8879):
+/// hyper-tls's brotli at quality 11 and a 4 MiB window, measured, 34,267,200 bytes, given back as
+/// the handshake goes on.
+pub const CERTIFICATE_COMPRESSION_BYTES: u64 = 34_267_200;
+
+/// The most bytes a transport of `stated` holds beside its budget (`transport_bytes`): what the
+/// budget does not charge.
+/// - The endpoint: as it opens, a slot of each exchange in use, a slot of each receive chunk, and,
+///   where it `serves` handshakes, the compression of its certificate as a server's first handshake
+///   makes it.
+/// - Each connection its admission takes: QUIC's and TLS's state with a stream's for each it may
+///   hold, and what QUIC keeps to send, at most what its peer's window takes, `window_ceiling`
+///   (every node of a cell states the same).
+/// - The sockets: the listener's, one for each connection where the platform gives a connection a
+///   socket of its own, and a node's plane's, each at what hyper-rt states one holds
+///   (`Io::held_bound`).
+///
+/// QUIC's datagrams are none: no node or client sends them, though hyper-quic's default takes up to
+/// 1,250,000 bytes of them a connection. What aws-lc keeps of keys is in its own heap, which a
+/// counting allocator does not see.
+pub fn beside(stated: &Stated, serves: bool) -> Option<u64> {
+    let limits = limits(stated).ok()?;
+    let count = |n: usize| u64::try_from(n).ok();
+    let peers = count(stated.peers.max(1))?;
+    let connections = count(limits.admission.connections)?;
+    let compression = if serves {
+        CERTIFICATE_COMPRESSION_BYTES
+    } else {
+        0
+    };
+    let endpoint = peers
+        .checked_mul(ENDPOINT_PEER_BYTES)?
+        .checked_add(ENDPOINT_BYTES)?
+        .checked_add(compression)?
+        .checked_add(count(limits.exchanges)?.checked_mul(EXCHANGE_BYTES)?)?
+        .checked_add(count(limits.receive_chunks)?.checked_mul(CHUNK_SLOT_BYTES)?)?;
+    let connection = u64::from(limits.streams_per_connection)
+        .checked_mul(STREAM_BYTES)?
+        .checked_add(CONNECTION_BYTES)?
+        .checked_add(limits.window_ceiling)?;
+    let sockets = connections
+        .checked_add(2)?
+        .checked_mul(count(io(stated).held_bound())?)?;
+    endpoint
+        .checked_add(connections.checked_mul(connection)?)?
+        .checked_add(sockets)
+}
+
 /// How the node's sockets batch: a system call takes up to one datagram train from each peer, what
 /// arrives at once when every peer's driver sent one transmit (hyper-transport makes one
 /// connection's batch at a time, its `SEGMENTS_A_TRANSMIT`), within `UIO_MAXIOV` (`MAX_BATCH`). On

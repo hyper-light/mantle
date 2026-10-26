@@ -2442,6 +2442,7 @@ pub(crate) fn put_op(bucket: &str, key: &str, id: u128, length: u64) -> Op {
         headers: Headers::default(),
         checksum: None,
         md5: None,
+        trailing: None,
     }
 }
 

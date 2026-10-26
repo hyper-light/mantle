@@ -1,0 +1,32 @@
+[package]
+name = "mantle-client"
+description = "A client of a mantle cell's objects over its native protocol: S3's operations on QUIC, a put's body streamed from a source and a get's into a sink"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The runtime, the transport and its driver on it, vendored from hyper-raft (vendor/UPSTREAM.md).
+hyper-rt = { path = "../../vendor/hyper-rt" }
+hyper-rt-transport = { path = "../../vendor/hyper-rt-transport" }
+hyper-transport = { path = "../../vendor/hyper-transport" }
+# The native protocol's messages, classes and bounds, shared with the node.
+mantle-protocol = { path = "../protocol" }
+# S3's checksums, which a put's trailer and a get's bytes are held to.
+mantle-s3 = { path = "../s3" }
+# An operation's identity, 128 bits from the operating system (gateway.md §2.1).
+getrandom.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# The counting allocator the client's heap is measured by (tests/heap.rs).
+hyper-measure = { path = "../../vendor/hyper-measure" }
+# The test cell's authority and the client's and node's certificates.
+mantle-cert = { path = "../cert" }
+
+[lints]
+workspace = true

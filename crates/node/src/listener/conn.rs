@@ -351,7 +351,6 @@ impl Connection {
         let request = door::Request {
             op,
             principal,
-            trailing: body.as_ref().and_then(|(_, _, trailing)| *trailing),
             body: taken,
             reply: answers,
         };
@@ -369,7 +368,7 @@ impl Connection {
             self.door.wake();
             match answer {
                 Ok(Answer::Ready) => {
-                    let Some((upload, _, _)) = body.take() else {
+                    let Some((upload, _)) = body.take() else {
                         continue;
                     };
                     if continues && self.io.write(write::CONTINUE).await.is_err() {

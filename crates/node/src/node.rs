@@ -818,22 +818,14 @@ pub fn message_bounds<E>(ranges: &[Hosted<E>], chunk_bytes: u64) -> Result<Bound
         .checked_add(u64::try_from(command::HEAD_BYTES).map_err(|_| unfit())?)
         .ok_or_else(unfit)?;
     // A chunk's put carries the chunk behind its head; a get's reply, the bytes asked. An object's
-    // put carries its body, at most a single upload's (S3's 5 GiB), and a get's reply a range of
-    // at most as many bytes.
+    // message is at most `object::MAX_MESSAGE`, a single upload's (S3's 5 GiB) behind its fields.
     let chunk_head = chunk::PUT_HEAD_BYTES
         .max(chunk::GET_HEAD_BYTES)
         .max(chunk::REPLY_HEAD_BYTES);
     let chunked = chunk_bytes
         .checked_add(u64::try_from(chunk_head).map_err(|_| unfit())?)
         .ok_or_else(unfit)?;
-    // An object's body opens with its request's fields, a reply's with the reply's.
-    let object_head = object::HEAD_BYTES
-        .saturating_add(object::MAX_FIELDS)
-        .max(object::REPLY_HEAD_BYTES.saturating_add(object::MAX_REPLY_FIELDS));
-    let object = mantle_s3::body::MAX_UPLOAD
-        .checked_add(u64::try_from(object_head).map_err(|_| unfit())?)
-        .ok_or_else(unfit)?;
-    let transfer = chunked.max(object);
+    let transfer = chunked.max(object::MAX_MESSAGE);
     Ok(Bounds {
         replication: largest,
         request,

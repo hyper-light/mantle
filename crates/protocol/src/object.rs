@@ -11,7 +11,7 @@
 //!
 //! | Message | Head | Body |
 //! |---|---|---|
-//! | request | the kind (u8); the fields' length (u32); the operation's identity (u128), which every attempt of a mutation carries (gateway.md §2.1), else 0; a put's length, else 0 (u64) | the fields; then a put's bytes |
+//! | request | the kind (u8); the fields' length (u32); the operation's identity (u128), which every attempt of a mutation carries (gateway.md §2.1), else 0; a put's length, else 0 (u64); the algorithm of the checksum a put's trailer brings after its bytes (u8), 0 for none, else its code (`mantle_s3::checksum::Algorithm::code`) and one | the fields; then a put's bytes; then its trailer, the checksum's value |
 //! | reply | the status (u8); the object's size, a get's or a head's, else 0 (u64); the fields' length (u32) | the fields; then a get's bytes |
 //!
 //! A request's fields, by its kind. A text is UTF-8 behind its length (u32); an optional field is
@@ -113,9 +113,9 @@ pub const MAX_PAGE_PARTS: usize = 1000;
 /// The most parts an upload has and a completion lists: S3's 10,000 (05 §4.1).
 const MAX_PARTS: usize = mantle_s3::body::MAX_PARTS as usize;
 
-/// The bytes of an object's request head: the kind, the fields' length, the identity and a put's
-/// length.
-pub const HEAD_BYTES: usize = 1 + 4 + 16 + 8;
+/// The bytes of an object's request head: the kind, the fields' length, the identity, a put's
+/// length and its trailer's algorithm.
+pub const HEAD_BYTES: usize = 1 + 4 + 16 + 8 + 1;
 /// The bytes of a reply's head: the status, the size and the fields' length.
 pub const REPLY_HEAD_BYTES: usize = 1 + 8 + 4;
 /// The longer of the two, the longest head a client of objects sends or receives.
@@ -123,6 +123,17 @@ pub const MAX_HEAD: usize = if HEAD_BYTES > REPLY_HEAD_BYTES {
     HEAD_BYTES
 } else {
     REPLY_HEAD_BYTES
+};
+
+/// An object's largest message, head and body: a put of S3's largest single upload behind the
+/// longest fields a request opens its body with and a trailer's checksum, or a get's reply of as
+/// many bytes behind the longest fields a reply opens its body with. The transfer class's bound at
+/// the least, at a node and at its clients.
+pub const MAX_MESSAGE: u64 = {
+    let request = HEAD_BYTES + MAX_FIELDS + MAX_CHECKSUM;
+    let reply = REPLY_HEAD_BYTES + MAX_REPLY_FIELDS;
+    let longest = if request > reply { request } else { reply };
+    mantle_s3::body::MAX_UPLOAD + longest as u64
 };
 
 /// A request's fields at most: the longest of a put's or a part's (its names, an upload's ID and a
@@ -227,7 +238,9 @@ pub enum Op {
     /// CreateBucket, owned by the asker.
     Create { bucket: String, id: u128 },
     /// PutObject: `length` bytes follow the fields, checked against `checksum` and `md5` before
-    /// anything commits.
+    /// anything commits; with `trailing`, its checksum's value follows them, so a client that
+    /// streams its body from a source it reads once states it at the end, as aws-chunked's
+    /// trailer does (05 §3.2).
     Put {
         bucket: String,
         key: String,
@@ -236,6 +249,7 @@ pub enum Op {
         headers: Headers,
         checksum: Option<Checksum>,
         md5: Option<[u8; 16]>,
+        trailing: Option<Algorithm>,
     },
     /// GetObject: the current version's bytes, or the range its `Range` names.
     Get {
@@ -285,7 +299,7 @@ pub enum Op {
         checksum: Option<(Algorithm, bool)>,
     },
     /// UploadPart: part `number` of `upload`, `length` bytes following the fields, checked as a
-    /// put's are.
+    /// put's are, a trailer's checksum after them as a put's.
     UploadPart {
         bucket: String,
         key: String,
@@ -295,6 +309,7 @@ pub enum Op {
         length: u64,
         checksum: Option<Checksum>,
         md5: Option<[u8; 16]>,
+        trailing: Option<Algorithm>,
     },
     /// CompleteMultipartUpload: the parts it lists, each its number and the ETag its upload
     /// answered, bare of quotes, in ascending order (05 §4.4).
@@ -504,6 +519,7 @@ pub struct Head {
     fields: u32,
     id: u128,
     length: u64,
+    trailing: Option<Algorithm>,
 }
 
 impl Head {
@@ -538,6 +554,7 @@ impl Head {
                         headers,
                         checksum,
                         md5,
+                        trailing: self.trailing,
                     }
                 }
                 GET => {
@@ -616,6 +633,7 @@ impl Head {
                         length: self.length,
                         checksum,
                         md5,
+                        trailing: self.trailing,
                     }
                 }
                 COMPLETE => {
@@ -681,15 +699,27 @@ impl Head {
                 fields: r.u32()?,
                 id: r.u128()?,
                 length: r.u64()?,
+                trailing: match r.u8()? {
+                    0 => None,
+                    code => Some(Algorithm::from_code(code.checked_sub(1)?)?),
+                },
             })
         })()
         .filter(|_| r.remaining() == 0);
         let head_of = || ObjectError::Head(head.len());
         let decoded = decoded.ok_or_else(head_of)?;
+        let puts = matches!(decoded.kind, PUT | UPLOAD_PART);
         let within = usize::try_from(decoded.fields).is_ok_and(|f| f <= MAX_FIELDS)
             && decoded.kind <= LIST_UPLOADS
-            && (matches!(decoded.kind, PUT | UPLOAD_PART) || decoded.length == 0);
-        if !within || decoded.fields().checked_add(decoded.length) != Some(body.unwrap_or(0)) {
+            && (puts || (decoded.length == 0 && decoded.trailing.is_none()));
+        let trailer = decoded
+            .trailing
+            .map_or(0, |a| u64::try_from(a.width()).unwrap_or(u64::MAX));
+        let stated = decoded
+            .fields()
+            .checked_add(decoded.length)
+            .and_then(|b| b.checked_add(trailer));
+        if !within || stated != Some(body.unwrap_or(0)) {
             return Err(head_of());
         }
         Ok(decoded)
@@ -704,10 +734,10 @@ impl Op {
             put_text(f, bucket, MAX_BUCKET)?;
             put_text(f, key, MAX_KEY)
         };
-        let (kind, id, length) = match self {
+        let (kind, id, length, trailing) = match self {
             Self::Create { bucket, id } => {
                 put_text(&mut f, bucket, MAX_BUCKET)?;
-                (CREATE, *id, 0)
+                (CREATE, *id, 0, None)
             }
             Self::Put {
                 bucket,
@@ -717,11 +747,12 @@ impl Op {
                 headers,
                 checksum,
                 md5,
+                trailing,
             } => {
                 object(&mut f, bucket, key)?;
                 put_headers(&mut f, headers)?;
                 put_digests(&mut f, checksum.as_ref(), md5.as_ref())?;
-                (PUT, *id, *length)
+                (PUT, *id, *length, *trailing)
             }
             Self::Get {
                 bucket,
@@ -730,7 +761,7 @@ impl Op {
             } => {
                 object(&mut f, bucket, key)?;
                 put_headers(&mut f, headers)?;
-                (GET, 0, 0)
+                (GET, 0, 0, None)
             }
             Self::Head {
                 bucket,
@@ -739,7 +770,7 @@ impl Op {
             } => {
                 object(&mut f, bucket, key)?;
                 put_headers(&mut f, headers)?;
-                (HEAD, 0, 0)
+                (HEAD, 0, 0, None)
             }
             Self::Delete {
                 bucket,
@@ -749,15 +780,15 @@ impl Op {
             } => {
                 object(&mut f, bucket, key)?;
                 put_headers(&mut f, headers)?;
-                (DELETE, *id, 0)
+                (DELETE, *id, 0, None)
             }
             Self::List(list) => {
                 put_list(&mut f, list)?;
-                (LIST, 0, 0)
+                (LIST, 0, 0, None)
             }
             Self::HeadBucket { bucket } => {
                 put_text(&mut f, bucket, MAX_BUCKET)?;
-                (HEAD_BUCKET, 0, 0)
+                (HEAD_BUCKET, 0, 0, None)
             }
             Self::ListBuckets { prefix, after, max } => {
                 put_text(&mut f, prefix, MAX_BUCKET)?;
@@ -766,11 +797,11 @@ impl Op {
                     return Err(ObjectError::TooLong(usize::try_from(*max).unwrap_or(0)));
                 }
                 f.u32(*max);
-                (LIST_BUCKETS, 0, 0)
+                (LIST_BUCKETS, 0, 0, None)
             }
             Self::DeleteBucket { bucket, id } => {
                 put_text(&mut f, bucket, MAX_BUCKET)?;
-                (DELETE_BUCKET, *id, 0)
+                (DELETE_BUCKET, *id, 0, None)
             }
             Self::PutVersioning {
                 bucket,
@@ -779,11 +810,11 @@ impl Op {
             } => {
                 put_text(&mut f, bucket, MAX_BUCKET)?;
                 f.u8(versioning_code(*versioning));
-                (PUT_VERSIONING, *id, 0)
+                (PUT_VERSIONING, *id, 0, None)
             }
             Self::GetVersioning { bucket } => {
                 put_text(&mut f, bucket, MAX_BUCKET)?;
-                (GET_VERSIONING, 0, 0)
+                (GET_VERSIONING, 0, 0, None)
             }
             Self::CreateUpload {
                 bucket,
@@ -797,7 +828,7 @@ impl Op {
                     f.u8(algorithm.code());
                     put_flag(&mut f, *full_object);
                 }
-                (CREATE_UPLOAD, *id, 0)
+                (CREATE_UPLOAD, *id, 0, None)
             }
             Self::UploadPart {
                 bucket,
@@ -808,12 +839,13 @@ impl Op {
                 length,
                 checksum,
                 md5,
+                trailing,
             } => {
                 object(&mut f, bucket, key)?;
                 put_text(&mut f, upload, MAX_TAG)?;
                 f.u16(*number);
                 put_digests(&mut f, checksum.as_ref(), md5.as_ref())?;
-                (UPLOAD_PART, *id, *length)
+                (UPLOAD_PART, *id, *length, *trailing)
             }
             Self::Complete {
                 bucket,
@@ -834,7 +866,7 @@ impl Op {
                     f.u16(*number);
                     put_text(&mut f, etag, MAX_TAG)?;
                 }
-                (COMPLETE, *id, 0)
+                (COMPLETE, *id, 0, None)
             }
             Self::Abort {
                 bucket,
@@ -844,7 +876,7 @@ impl Op {
             } => {
                 object(&mut f, bucket, key)?;
                 put_text(&mut f, upload, MAX_TAG)?;
-                (ABORT, *id, 0)
+                (ABORT, *id, 0, None)
             }
             Self::ListParts {
                 bucket,
@@ -857,7 +889,7 @@ impl Op {
                 put_text(&mut f, upload, MAX_TAG)?;
                 f.u16(*after);
                 f.u32(*max);
-                (LIST_PARTS, 0, 0)
+                (LIST_PARTS, 0, 0, None)
             }
             Self::ListUploads {
                 bucket,
@@ -873,7 +905,7 @@ impl Op {
                 put_optional_text(&mut f, key_marker.as_deref(), MAX_KEY)?;
                 put_optional_text(&mut f, id_marker.as_deref(), MAX_TAG)?;
                 f.u32(*max);
-                (LIST_UPLOADS, 0, 0)
+                (LIST_UPLOADS, 0, 0, None)
             }
         };
         let fields = f.into_vec();
@@ -885,16 +917,22 @@ impl Op {
         w.u32(u32::try_from(fields.len()).map_err(|_| ObjectError::TooLong(fields.len()))?);
         w.u128(id);
         w.u64(length);
+        w.u8(trailing.map_or(0, |a| a.code().saturating_add(1)));
         Ok((w.into_vec(), fields))
     }
 
-    /// The bytes of the request's body: its fields and a put's or a part's bytes.
+    /// The bytes of the request's body: its fields, and a put's or a part's bytes and trailer.
     pub fn body(&self, fields: &[u8]) -> u64 {
         let fields = u64::try_from(fields.len()).unwrap_or(u64::MAX);
         match self {
-            Self::Put { length, .. } | Self::UploadPart { length, .. } => {
-                fields.saturating_add(*length)
+            Self::Put {
+                length, trailing, ..
             }
+            | Self::UploadPart {
+                length, trailing, ..
+            } => fields.saturating_add(*length).saturating_add(
+                trailing.map_or(0, |a| u64::try_from(a.width()).unwrap_or(u64::MAX)),
+            ),
             _ => fields,
         }
     }
@@ -1658,6 +1696,7 @@ mod tests {
                     bytes: vec![7; 64],
                 }),
                 md5: Some([9; 16]),
+                trailing: None,
             },
             Op::Put {
                 bucket: "b".into(),
@@ -1667,6 +1706,7 @@ mod tests {
                 headers: Headers::default(),
                 checksum: None,
                 md5: None,
+                trailing: Some(Algorithm::Crc64Nvme),
             },
             Op::Get {
                 bucket: "b".into(),
@@ -1734,6 +1774,7 @@ mod tests {
                     bytes: vec![1; 4],
                 }),
                 md5: Some([2; 16]),
+                trailing: Some(Algorithm::Sha512),
             },
             Op::Complete {
                 bucket: "b".into(),
@@ -1788,10 +1829,24 @@ mod tests {
         let decoded = Head::decode(&head, Some(put.body(&fields))).unwrap();
         assert!(decoded.op(&fields[1..]).is_err());
         assert!(Head::decode(&head[1..], Some(put.body(&fields))).is_err());
-        // A length on any kind but a put's.
-        let (mut get_head, get_fields) = every_op().swap_remove(3).encode().unwrap();
-        get_head[HEAD_BYTES - 8..].copy_from_slice(&5u64.to_le_bytes());
-        assert!(Head::decode(&get_head, Some(get_fields.len() as u64 + 5)).is_err());
+        // A length or a trailer on any kind but a put's.
+        let (get_head, get_fields) = every_op().swap_remove(3).encode().unwrap();
+        let mut lengthy = get_head.clone();
+        lengthy[HEAD_BYTES - 9..HEAD_BYTES - 1].copy_from_slice(&5u64.to_le_bytes());
+        assert!(Head::decode(&lengthy, Some(get_fields.len() as u64 + 5)).is_err());
+        let mut trailed = get_head.clone();
+        trailed[HEAD_BYTES - 1] = Algorithm::Crc32.code() + 1;
+        assert!(Head::decode(&trailed, Some(get_fields.len() as u64 + 4)).is_err());
+        // A put's trailer: its value's width past the put's bytes, and no code past the
+        // algorithms'.
+        let trailing = every_op().swap_remove(2);
+        let (trailing_head, trailing_fields) = trailing.encode().unwrap();
+        let body = trailing.body(&trailing_fields);
+        assert_eq!(body, trailing_fields.len() as u64 + 8);
+        assert!(Head::decode(&trailing_head, Some(body - 8)).is_err());
+        let mut unnamed = trailing_head.clone();
+        unnamed[HEAD_BYTES - 1] = u8::try_from(Algorithm::ALL.len()).unwrap() + 1;
+        assert!(Head::decode(&unnamed, Some(body)).is_err());
         // An unknown kind.
         let mut unknown = head.clone();
         unknown[0] = GET_VERSIONING + 1;
@@ -1824,6 +1879,7 @@ mod tests {
                 bytes: vec![1; 8],
             }),
             md5: None,
+            trailing: None,
         };
         assert!(narrow.encode().is_err());
         // ListBuckets asks one bucket at least and S3's 10,000 at most.

@@ -121,7 +121,7 @@ pub enum Make {
 
 /// An object's body: how it is read, its object's length, and the algorithm of the checksum its
 /// trailer carries, if it has one.
-pub type Streamed = (Upload, u64, Option<Algorithm>);
+pub type Streamed = (Upload, u64);
 
 /// What the request asks of the host.
 pub enum Plan {
@@ -264,7 +264,7 @@ fn plan(
         }),
         Operation::CreateBucket if has_body(framing) => Ok(Plan::Document {
             limit: mantle_s3::body::CREATE_BUCKET_LIMIT,
-            upload: upload(parts, verified, framing)?.0,
+            upload: upload(parts, verified, framing)?.0.0,
             make: Make::CreateBucket {
                 bucket: bucket(route)?,
                 id,
@@ -283,7 +283,7 @@ fn plan(
         }),
         Operation::PutBucketVersioning => Ok(Plan::Document {
             limit: mantle_s3::body::VERSIONING_LIMIT,
-            upload: upload(parts, verified, framing)?.0,
+            upload: upload(parts, verified, framing)?.0.0,
             make: Make::Versioning {
                 bucket: bucket(route)?,
                 id,
@@ -294,7 +294,7 @@ fn plan(
         }),
         Operation::ListObjectsV2 => host(Op::List(list(route, query)?)),
         Operation::PutObject => {
-            let (upload, length, trailing) = upload(parts, verified, framing)?;
+            let (body, trailing) = upload(parts, verified, framing)?;
             let (checksum, md5) = digests(parts)?;
             single(checksum.as_ref(), trailing)?;
             Ok(Plan::Host {
@@ -302,12 +302,13 @@ fn plan(
                     bucket: bucket(route)?,
                     key: key(route)?,
                     id,
-                    length,
+                    length: body.1,
                     headers: headers(parts, false),
                     checksum,
                     md5,
+                    trailing,
                 },
-                body: Some((upload, length, trailing)),
+                body: Some(body),
             })
         }
         Operation::GetObject => host(Op::Get {
@@ -336,7 +337,7 @@ fn plan(
             checksum: upload_checksum(parts)?,
         }),
         Operation::UploadPart => {
-            let (upload, length, trailing) = upload(parts, verified, framing)?;
+            let (body, trailing) = upload(parts, verified, framing)?;
             let (checksum, md5) = digests(parts)?;
             single(checksum.as_ref(), trailing)?;
             Ok(Plan::Host {
@@ -346,16 +347,17 @@ fn plan(
                     upload: upload_id(query)?,
                     number: part_number(query)?,
                     id,
-                    length,
+                    length: body.1,
                     checksum,
                     md5,
+                    trailing,
                 },
-                body: Some((upload, length, trailing)),
+                body: Some(body),
             })
         }
         Operation::CompleteMultipartUpload => Ok(Plan::Document {
             limit: mantle_s3::body::COMPLETE_LIMIT,
-            upload: upload(parts, verified, framing)?.0,
+            upload: upload(parts, verified, framing)?.0.0,
             make: Make::Complete {
                 bucket: bucket(route)?,
                 key: key(route)?,
@@ -559,7 +561,11 @@ fn upload_checksum(parts: &Parts<'_>) -> Result<Option<(Algorithm, bool)>, Refus
 /// `x-amz-decoded-content-length` states it, else the framing's. A body whose length is not
 /// stated before it comes is refused, as S3 refuses a PUT without one (`411
 /// MissingContentLength`), and one past S3's largest object is refused before any of it is read.
-fn upload(parts: &Parts<'_>, verified: Verified, framing: Framing) -> Result<Streamed, Refused> {
+fn upload(
+    parts: &Parts<'_>,
+    verified: Verified,
+    framing: Framing,
+) -> Result<(Streamed, Option<Algorithm>), Refused> {
     let missing = || {
         Refused::new(
             "MissingContentLength",
@@ -621,7 +627,7 @@ fn upload(parts: &Parts<'_>, verified: Verified, framing: Framing) -> Result<Str
             "Your proposed upload exceeds the maximum allowed size",
         ));
     }
-    Ok((upload, length, trailing))
+    Ok(((upload, length), trailing))
 }
 
 /// The octets the framing states before the body comes.

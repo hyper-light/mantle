@@ -950,6 +950,7 @@ fn put_with(bucket: &str, key: &str, id: u128, data: &[u8], headers: Headers) ->
         headers,
         checksum: None,
         md5: None,
+        trailing: None,
     }
 }
 
@@ -1179,6 +1180,7 @@ fn s3s_operations_answer_as_s3_does_through_every_node() {
         headers: Headers::default(),
         checksum: Some(sum),
         md5,
+        trailing: None,
     };
     let (kept, _) = ask(
         &mut cell,
@@ -1706,6 +1708,7 @@ fn a_multipart_upload_completes_through_another_node_with_one_killed_between_par
         length: data.len() as u64,
         checksum: Some(checksum::checksum(Algorithm::Crc64Nvme, data).unwrap()),
         md5: None,
+        trailing: None,
     };
     let complete = |key: &str, upload: &str, id, parts: &[(u16, &str)]| Op::Complete {
         bucket: "m".into(),

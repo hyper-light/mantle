@@ -515,7 +515,7 @@ key (`identity/s3.der`, `identity/s3.key`) for the DNS names its operator states
 address unless it listens on every one, and `localhost` on a loopback address; serverAuth alone, the
 key identifiers RFC 5280 asks, and 825 days of validity at most, issuing it again before then still
 to build (`mantle_cert::endpoint`). The endpoint listens where the founder's `s3=ADDR` says, else
-over TCP at its QUIC address, on the port QUIC bound where that is stated as 0, and serves the
+over TCP at its QUIC address, a stated port of 0 taking a TCP port of its own, and serves the
 cell's region (`--region`, or `region` in the machines file, else S3's us-east-1); its stated names
 are its config's `s3.name` lines, which its requests' hosts name buckets under (§4.2), and once
 bound it says `s3-bound ADDR CONNECTIONS`. For the operator, `OUT/s3` holds the key as AWS's shared credentials

@@ -1174,15 +1174,16 @@ fn start(
 }
 
 /// The S3 listener `keys` state, its door open on `node`: where it listens, its region, keys and
-/// TLS (node.md §4.1). Stated at the QUIC address, it listens on the port QUIC bound, over TCP, as
-/// an https authority serves both (research/71); plain HTTP on a loopback address, TLS with the
-/// endpoint's certificate elsewhere. Its door holds a request for each connection the listener
-/// admits, so it refuses none for room: each waits there until the host has room for it (node.md
-/// §4.5). A node that hosts no objects has no operation to hand it.
+/// TLS (node.md §4.1). It binds the address the keys state over TCP, a stated port that port, as an
+/// https authority serves TCP and QUIC on one (research/71); a stated port of 0 takes a TCP port
+/// of its own, the UDP port QUIC was given saying nothing of the TCP port of the same number.
+/// Plain HTTP on a loopback address, TLS with the endpoint's certificate elsewhere. Its door holds
+/// a request for each connection the listener admits, so it refuses none for room: each waits
+/// there until the host has room for it (node.md §4.5). A node that hosts no objects has no
+/// operation to hand it.
 fn listen<E: Engine + 'static>(
     node: &mut Node<E>,
     keys: S3Keys,
-    (stated, bound): (SocketAddr, SocketAddr),
     (id, hosts): (u64, bool),
 ) -> Result<crate::listener::Listener, ProcessError> {
     let refused = |e: String| ProcessError::Listener(e);
@@ -1193,11 +1194,7 @@ fn listen<E: Engine + 'static>(
     }
     let waiting = usize::try_from(crate::listener::CONNECTIONS)
         .map_err(|_| refused("the listener's connections".into()))?;
-    let listen = if keys.listen == stated {
-        SocketAddr::new(keys.listen.ip(), bound.port())
-    } else {
-        keys.listen
-    };
+    let listen = keys.listen;
     let tls = if listen.ip().is_loopback() {
         None
     } else {
@@ -1640,8 +1637,8 @@ async fn serve(
     say(&mut output, &format!("bound {quic} {plane}\n")).await?;
     let listener = match s3 {
         Some(keys) => {
-            let listener = listen(&mut node, keys, (config.quic, quic), (config.id, hosts))
-                .map_err(step(Step::Network))?;
+            let listener =
+                listen(&mut node, keys, (config.id, hosts)).map_err(step(Step::Network))?;
             let at = listener
                 .local_addr()
                 .map_err(|e| step(Step::Network)(ProcessError::Listener(e.to_string())))?;

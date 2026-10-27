@@ -1109,3 +1109,138 @@ fn a_copy_through_a_node_killed_mid_run_resumes_from_the_cells_offset_once_it_is
     assert!(done, "{out}{said:?}");
     resumed_whole(&dir, "node", ((2 * run) as u64, 2, 5), &said, &object);
 }
+
+/// Diagnostic (scratch): a copy's read-back get whose standard output is drained slowly, a piece
+/// of `DIAG_PIECE` bytes every `DIAG_PAUSE_MS`: whether a node or the client cuts it.
+#[test]
+#[ignore]
+fn diag_a_slowly_drained_get() {
+    use std::io::Read;
+    let piece: usize = std::env::var("DIAG_PIECE").map_or(4096, |v| v.parse().unwrap());
+    let pause: u64 = std::env::var("DIAG_PAUSE_MS").map_or(10, |v| v.parse().unwrap());
+    let mut cell = Cell::made_alone(three_founders);
+    let dir = made_client(&cell, "client");
+    mantle(&dir, &["mb", &format!("s3://{RESUMED}")], None);
+    let run = 5usize << 20;
+    let file = cell.out().parent().unwrap().join("runs.bin");
+    let object = bytes(10, 4 * run + 77);
+    std::fs::write(&file, &object).unwrap();
+    mantle(
+        &dir,
+        &[
+            "cp",
+            &file.display().to_string(),
+            &format!("s3://{RESUMED}/file"),
+        ],
+        None,
+    );
+    let mut child = Command::new(NODE)
+        .arg("--client")
+        .arg(&dir)
+        .args(["cp", &format!("s3://{RESUMED}/file"), "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let errs = std::thread::spawn(move || {
+        let mut said = Vec::new();
+        stderr.read_to_end(&mut said).unwrap();
+        said
+    });
+    let began = std::time::Instant::now();
+    let mut got = Vec::new();
+    let mut buf = vec![0u8; piece];
+    loop {
+        let n = stdout.read(&mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        got.extend_from_slice(&buf[..n]);
+        std::thread::sleep(std::time::Duration::from_millis(pause));
+    }
+    let status = child.wait().unwrap();
+    let said = errs.join().unwrap();
+    eprintln!(
+        "diag-slow piece={piece} pause_ms={pause} got={} of {} in {:?} status={status:?} said={}",
+        got.len(),
+        object.len(),
+        began.elapsed(),
+        String::from_utf8_lossy(&said)
+    );
+    assert!(status.success() && got == object);
+}
+
+/// Diagnostic (scratch): a read-back get at full speed while node `DIAG_VICTIM` (its place among
+/// the client's config's nodes) is frozen by SIGSTOP for `DIAG_FROZEN_MS`: whether the get is cut.
+#[cfg(unix)]
+#[test]
+#[ignore]
+fn diag_a_get_beside_a_frozen_node() {
+    use std::io::Read;
+    let frozen: u64 = std::env::var("DIAG_FROZEN_MS").map_or(8000, |v| v.parse().unwrap());
+    let place: usize = std::env::var("DIAG_VICTIM").map_or(1, |v| v.parse().unwrap());
+    let mut cell = Cell::made_alone(three_founders);
+    let dir = made_client(&cell, "client");
+    mantle(&dir, &["mb", &format!("s3://{RESUMED}")], None);
+    let run = 5usize << 20;
+    let file = cell.out().parent().unwrap().join("runs.bin");
+    let object = bytes(10, 4 * run + 77);
+    std::fs::write(&file, &object).unwrap();
+    mantle(
+        &dir,
+        &[
+            "cp",
+            &file.display().to_string(),
+            &format!("s3://{RESUMED}/file"),
+        ],
+        None,
+    );
+    let config = std::fs::read_to_string(dir.join("config")).unwrap();
+    let order: Vec<u64> = config
+        .lines()
+        .filter_map(|l| l.strip_prefix("node = "))
+        .map(|l| l.split(' ').next().unwrap().parse().unwrap())
+        .collect();
+    let victim = order[place];
+    let pid = cell.running.get(&victim).unwrap().child.id();
+    eprintln!("diag-frozen order={order:?} victim={victim} pid={pid} frozen_ms={frozen}");
+    assert!(Command::new("kill").args(["-STOP", &pid.to_string()]).status().unwrap().success());
+    let began = std::time::Instant::now();
+    let mut child = Command::new(NODE)
+        .arg("--client")
+        .arg(&dir)
+        .args(["cp", &format!("s3://{RESUMED}/file"), "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let outs = std::thread::spawn(move || {
+        let mut got = Vec::new();
+        stdout.read_to_end(&mut got).unwrap();
+        got
+    });
+    let errs = std::thread::spawn(move || {
+        let mut said = Vec::new();
+        stderr.read_to_end(&mut said).unwrap();
+        said
+    });
+    std::thread::sleep(std::time::Duration::from_millis(frozen));
+    assert!(Command::new("kill").args(["-CONT", &pid.to_string()]).status().unwrap().success());
+    let status = child.wait().unwrap();
+    let got = outs.join().unwrap();
+    let said = errs.join().unwrap();
+    eprintln!(
+        "diag-frozen-end victim={victim} got={} of {} in {:?} status={status:?} said={}",
+        got.len(),
+        object.len(),
+        began.elapsed(),
+        String::from_utf8_lossy(&said)
+    );
+    assert!(status.success() && got == object);
+}

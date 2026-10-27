@@ -88,6 +88,25 @@ answer is the typed one (research/75), and a `SlowDown` counts as refused. The r
 then read through both doors,
 which must answer no such key, and listed by neither, which must list every acknowledged object.
 
+**Each block's placement is read as the cell's gateway reads it.** Before any founder starts, the
+harness issues a gateway's certificate under the cell's authority and pins it in every founder's
+configuration (`peer = ID gateway CERTIFICATE`, node.md §3.6), as an operator pins a gateway; it
+states the cell's message bounds, which its object client's messages fit, and reads, for every
+acknowledged object, its version from the Name range, its file's extents from the File range a
+page at a time, a completed upload's part files after it, each block's chunks' volumes from the
+Block range, and each volume's node from the root range's volume table. A block two of whose
+chunks share a node, or one on a volume the table does not name, is counted (f34). An object's key
+and length are made again from its place in the case, never kept.
+
+**Each founder is killed in turn.** Once a case's chunks are accounted, each founder is SIGKILLed,
+the harness waits until every running node names a running node as every range's leader, the fact
+a read through the others needs, and every acknowledged object is read back natively through
+another node; then the founder is started again on its directory, the others told where it
+listens now, and every object is read back through it once the root range takes its enlistment.
+The first build met reads ended `Stalled` at a block whose copy the killed node held: a node read
+a chunk from a peer until the transport judged it gone, two idle timeouts, as long as the client
+waits. A node now reads nothing from a peer its detectors suspect (gateway.md §3's as-built note).
+
 **Every node's chunk bytes are accounted.** Once a case is done each node is asked its chunk bytes
 on its standard input: received from peers over QUIC, put on its own volumes in-process, held by
 its volumes, and of the first two kept by none, a volume's refusal or a body that ended before it
@@ -105,9 +124,7 @@ its operator runs it: a case fills the volumes it states (f7).
 
 ## Open
 
-- Each block's placement read from the Block range and the volume table; each node SIGKILLed in turn
-  with every object read back through the others, then restarted and read back through it.
 - The controls that must fail: a flipped byte, a chunk moved onto its block's other node, a missing
-  object.
+  object, each through the whole harness.
 - The memory and threads of a case of 100k objects against their stated bounds; the 10 GB and
   100 GB cases on the owner's machines (plan step 10).

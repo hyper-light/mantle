@@ -3,15 +3,20 @@
 //! it and in a failure domain of its own, and each founder run as `mantle serve` from what init
 //! wrote, a child of this process. Each founder states its addresses with port 0, so each binds
 //! what the operating system gives it, and once every one is bound each is told where the others
-//! listen (`learn`), as an operator tells a node its peers. A child's status lines (`bound`,
-//! `s3-bound`, `enlisted`) are read on a thread of its own, one for each node and no more, and every
-//! wait ends on the line it waits for or on the process's output ending, never on a guess of time.
+//! listen (`learn`), as an operator tells a node its peers; every founder pins the harness's gateway
+//! before it starts. A child's status lines (`bound`, `s3-bound`, `enlisted`, each range's
+//! `status`, and `chunks` when asked) are read on a thread of its own, one for each node and no
+//! more, and every wait ends on the line it waits for or on a process's output ending, never on a
+//! guess of time.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender, channel};
+
+use super::place::Gateway;
 
 /// The founders a case's cell has: three, one failure domain each, so a block's three copies sit
 /// on three nodes (durability.md §5; research/76).
@@ -53,6 +58,8 @@ enum Said {
     /// Its chunk bytes, asked: received from peers over QUIC, put on its own volumes in-process,
     /// held by its volumes, and of the first two kept by none.
     Chunks(u64, u64, u64, u64),
+    /// A range's leader as the node knows it now, none while it knows of none.
+    Status(u128, u64),
     /// Its output ended: the process is gone.
     Ended,
 }
@@ -64,6 +71,10 @@ fn said(line: &str) -> Option<Said> {
         ["s3-bound", at, _connections] => at.parse().ok().map(Said::S3),
         ["s3", _listen, region, _ids] => Some(Said::Region((*region).to_owned())),
         ["enlisted"] => Some(Said::Enlisted),
+        ["status", group, _term, leader, ..] => Some(Said::Status(
+            u128::from_str_radix(group, 16).ok()?,
+            leader.parse().ok()?,
+        )),
         ["chunks", received, written, held, unkept] => Some(Said::Chunks(
             received.parse().ok()?,
             written.parse().ok()?,
@@ -89,6 +100,8 @@ struct Node {
     region: Option<String>,
     enlisted: bool,
     chunks: Option<(u64, u64, u64, u64)>,
+    /// Each range's leader as its process last said, zero for none.
+    leaders: BTreeMap<u128, u64>,
 }
 
 /// A running cell of three, its processes this runner's children.
@@ -98,6 +111,8 @@ pub struct Cell {
     nodes: Vec<Node>,
     tell: Sender<(usize, u64, Said)>,
     heard: Receiver<(usize, u64, Said)>,
+    /// The gateway every founder pins, which the harness reads the cell's metadata as.
+    gateway: Gateway,
 }
 
 impl Cell {
@@ -157,6 +172,7 @@ impl Cell {
                 region: None,
                 enlisted: false,
                 chunks: None,
+                leaders: BTreeMap::new(),
             });
         }
         if nodes.len() != FOUNDERS {
@@ -165,6 +181,10 @@ impl Cell {
                 nodes.len()
             )));
         }
+        // Pinned before any founder starts: a founder reads its peers once, at its start.
+        let founders: Vec<(u64, PathBuf)> = nodes.iter().map(|n| (n.id, n.dir.clone())).collect();
+        let gateway = Gateway::pin(&out, &founders)
+            .map_err(|e| CellError::Init(format!("the gateway: {e}")))?;
         let (tell, heard) = channel();
         let mut cell = Self {
             exe,
@@ -172,9 +192,15 @@ impl Cell {
             nodes,
             tell,
             heard,
+            gateway,
         };
+        // Started together, then waited for: each measures its machine and its device at its
+        // first `mantle serve` before it binds (node.md §1.7), and those measurements overlap.
         for at in 0..FOUNDERS {
-            cell.start(at)?;
+            cell.spawn(at)?;
+        }
+        for at in 0..FOUNDERS {
+            cell.listening(at)?;
         }
         cell.introduce()?;
         for at in 0..FOUNDERS {
@@ -186,6 +212,11 @@ impl Cell {
     /// The directory init made the cell in.
     pub fn out(&self) -> &Path {
         &self.out
+    }
+
+    /// The gateway every founder pins.
+    pub fn gateway(&self) -> &Gateway {
+        &self.gateway
     }
 
     /// Each node's id and where its QUIC listener listens.
@@ -204,8 +235,25 @@ impl Cell {
             .collect()
     }
 
-    /// Starts node `at`'s process and waits until both its listeners listen.
-    pub fn start(&mut self, at: usize) -> Result<(), CellError> {
+    /// Starts node `at`'s process again on its directory, tells every running node where the
+    /// others listen now, its own ports chosen anew, and waits until the root range took its
+    /// enlistment.
+    pub fn restart(&mut self, at: usize) -> Result<(), CellError> {
+        self.spawn(at)?;
+        self.listening(at)?;
+        self.introduce()?;
+        self.until(at, |node| node.enlisted)
+    }
+
+    /// Waits until node `at`'s listeners both listen.
+    fn listening(&mut self, at: usize) -> Result<(), CellError> {
+        self.until(at, |node| {
+            node.quic.is_some() && node.s3.is_some() && node.region.is_some()
+        })
+    }
+
+    /// Starts node `at`'s process, its output read on a thread of its own.
+    fn spawn(&mut self, at: usize) -> Result<(), CellError> {
         let tell = self.tell.clone();
         let node = self
             .nodes
@@ -233,6 +281,7 @@ impl Cell {
         node.s3 = None;
         node.region = None;
         node.enlisted = false;
+        node.leaders.clear();
         let generation = node.generation;
         std::thread::Builder::new()
             .name(format!("node-{}", node.id))
@@ -248,13 +297,11 @@ impl Cell {
                 let _ = tell.send((at, generation, Said::Ended));
             })
             .map_err(io("a node's reader thread"))?;
-        self.until(at, |node| {
-            node.quic.is_some() && node.s3.is_some() && node.region.is_some()
-        })
+        Ok(())
     }
 
-    /// Waits until node `at` holds `done`, taking every node's lines meanwhile; its process ending
-    /// first is an error.
+    /// Waits until node `at` holds `done`, taking every node's lines meanwhile; a running node's
+    /// process ending first, its own or another's, is an error.
     fn until(&mut self, at: usize, done: impl Fn(&Node) -> bool) -> Result<(), CellError> {
         loop {
             let node = self
@@ -264,33 +311,7 @@ impl Cell {
             if done(node) {
                 return Ok(());
             }
-            let id = node.id;
-            let (from, generation, said) = self.heard.recv().map_err(|_| CellError::Ended(id))?;
-            let Some(node) = self.nodes.get_mut(from) else {
-                continue;
-            };
-            if generation != node.generation {
-                continue;
-            }
-            match said {
-                Said::Bound(quic, plane) => {
-                    node.quic = Some(quic);
-                    node.plane = Some(plane);
-                }
-                Said::S3(s3) => node.s3 = Some(s3),
-                Said::Region(region) => node.region = Some(region),
-                Said::Enlisted => node.enlisted = true,
-                Said::Chunks(received, written, held, unkept) => {
-                    node.chunks = Some((received, written, held, unkept));
-                }
-                Said::Ended => {
-                    node.child = None;
-                    node.input = None;
-                    if from == at {
-                        return Err(CellError::Ended(node.id));
-                    }
-                }
-            }
+            self.hear()?;
         }
     }
 
@@ -330,6 +351,74 @@ impl Cell {
             .get(at)
             .and_then(|node| node.chunks)
             .ok_or_else(|| CellError::Init(format!("no founder {at}")))
+    }
+
+    /// Waits until every running node names a running node as the leader of every range any of
+    /// them knows: after a kill, until each range the killed node led has elected another, the
+    /// fact a read through the others needs.
+    pub fn led(&mut self) -> Result<(), CellError> {
+        loop {
+            let running: Vec<u64> = self
+                .nodes
+                .iter()
+                .filter(|n| n.child.is_some())
+                .map(|n| n.id)
+                .collect();
+            let groups: std::collections::BTreeSet<u128> = self
+                .nodes
+                .iter()
+                .filter(|n| n.child.is_some())
+                .flat_map(|n| n.leaders.keys().copied())
+                .collect();
+            let led = self.nodes.iter().filter(|n| n.child.is_some()).all(|n| {
+                groups.iter().all(|g| {
+                    n.leaders
+                        .get(g)
+                        .is_some_and(|leader| running.contains(leader))
+                })
+            });
+            if led && !groups.is_empty() {
+                return Ok(());
+            }
+            self.hear()?;
+        }
+    }
+
+    /// Takes the next line any node's process said; a running node's process ending is an
+    /// error.
+    fn hear(&mut self) -> Result<(), CellError> {
+        let (from, generation, said) = self
+            .heard
+            .recv()
+            .map_err(|_| CellError::Init("every node's reader ended".into()))?;
+        let Some(node) = self.nodes.get_mut(from) else {
+            return Ok(());
+        };
+        if generation != node.generation {
+            return Ok(());
+        }
+        match said {
+            Said::Bound(quic, plane) => {
+                node.quic = Some(quic);
+                node.plane = Some(plane);
+            }
+            Said::S3(s3) => node.s3 = Some(s3),
+            Said::Region(region) => node.region = Some(region),
+            Said::Enlisted => node.enlisted = true,
+            Said::Chunks(received, written, held, unkept) => {
+                node.chunks = Some((received, written, held, unkept));
+            }
+            Said::Status(group, leader) => {
+                node.leaders.insert(group, leader);
+            }
+            Said::Ended => {
+                node.input = None;
+                if node.child.take().is_some() {
+                    return Err(CellError::Ended(node.id));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Kills node `at`'s process, `SIGKILL` on Unix and `TerminateProcess` on Windows, and reaps

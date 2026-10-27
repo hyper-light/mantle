@@ -70,6 +70,24 @@ const UPLOADS: u8 = 12;
 const EXTENT_BYTES: usize = 8 + 4 + (1 + 8 + 1 + 16 + 4);
 /// A page's bytes before its volumes: whether more follow, and the count.
 const PAGE_HEAD_BYTES: usize = 1 + 4;
+
+/// What a read's answer fills at most where the request class carries `request` bytes: a reply's
+/// body past its head.
+pub fn reply_room(request: u64) -> usize {
+    let room =
+        request.saturating_sub(u64::try_from(crate::command::REPLY_HEAD_BYTES).unwrap_or(u64::MAX));
+    usize::try_from(room).unwrap_or(usize::MAX)
+}
+
+/// The most extents one read asks where its answer fills at most `room` bytes: as many as fit
+/// behind the count, each at its longest, so the read is never refused whole for its page.
+pub fn extents_page(room: usize) -> u32 {
+    let fits = room
+        .saturating_sub(4)
+        .checked_div(EXTENT_BYTES)
+        .unwrap_or(0);
+    u32::try_from(fits).unwrap_or(u32::MAX)
+}
 /// A volume's bytes in a page at the longest domain: its id, node and bytes, and its domain behind
 /// its length.
 const PLACED_BYTES: usize = 16 + 8 + 8 + 4 + MAX_DOMAIN;

@@ -253,6 +253,16 @@ pub(crate) fn configured(dir: &Path) -> Result<Configured, Error> {
 /// One shard on this machine's calibration, kept in `dir`, its interests the sockets of `clients`
 /// clients of `nodes` nodes, each client's waits a timer and its driver another.
 pub(crate) fn runtime(dir: &Path, nodes: usize, clients: usize) -> Result<LocalRuntime, Error> {
+    let sockets = mantle_client::sockets(nodes)?.saturating_mul(clients);
+    runtime_of(dir, clients, sockets)
+}
+
+/// As [`runtime`], for `clients` clients holding `sockets` sockets in all.
+pub(crate) fn runtime_of(
+    dir: &Path,
+    clients: usize,
+    sockets: usize,
+) -> Result<LocalRuntime, Error> {
     let budget = mantle_node::derive::probe_budget().map_err(|e| Error::Runtime(e.to_string()))?;
     let calibration = mantle_node::process::calibration(dir, budget)
         .map_err(|e| Error::Runtime(e.to_string()))?;
@@ -269,7 +279,6 @@ pub(crate) fn runtime(dir: &Path, nodes: usize, clients: usize) -> Result<LocalR
     config.shards = 1;
     config.pin = false;
     config.cores.clear();
-    let sockets = mantle_client::sockets(nodes)?.saturating_mul(clients);
     config.interests_per_shard = config.interests_per_shard.max(sockets.saturating_mul(2));
     Ok(LocalRuntime::new(&config)?)
 }

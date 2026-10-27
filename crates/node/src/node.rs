@@ -2528,9 +2528,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 continue;
             };
             // An answer fills at most what a reply's body carries, past its head.
-            let room = NodeClasses::frame_bound(classes::Class::Request)
-                .saturating_sub(u64::try_from(command::REPLY_HEAD_BYTES).unwrap_or(u64::MAX));
-            let room = usize::try_from(room).unwrap_or(usize::MAX);
+            let room = crate::read::reply_room(NodeClasses::frame_bound(classes::Class::Request));
             let read = self
                 .owner
                 .get_mut(handle)

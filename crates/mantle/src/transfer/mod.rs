@@ -11,6 +11,7 @@ pub mod cell;
 pub mod generate;
 pub mod large;
 pub mod native;
+pub mod place;
 pub mod stock;
 
 use std::future::Future;
@@ -22,6 +23,7 @@ use std::time::Instant;
 use hyper_rt::runtime::LocalRuntime;
 use mantle_client::{Client, Settings};
 use mantle_disk::histogram::Histogram;
+use mantle_protocol::classes::Bounds;
 use mantle_protocol::object::{Op, Status};
 
 use cell::Cell;
@@ -213,11 +215,14 @@ struct Natives {
 }
 
 impl Natives {
-    fn new(cell: &Cell, dir: &Path) -> Result<Self, TransferError> {
+    /// The case's native door, its runtime's interests the sockets of a client of the cell or of
+    /// its gateway's reader, whichever holds more: one of them runs at a time.
+    fn new(cell: &Cell, dir: &Path, messages: Bounds) -> Result<Self, TransferError> {
         let client = dir.join("client");
         crate::init::client(&mut Vec::new(), &client, cell.out()).map_err(TransferError::Init)?;
         let nodes = cell.quic();
-        let rt = crate::client::runtime(&client, nodes.len(), 1).map_err(TransferError::Client)?;
+        let sockets = mantle_client::sockets(nodes.len())?.max(cell.gateway().sockets(messages)?);
+        let rt = crate::client::runtime_of(&client, 1, sockets).map_err(TransferError::Client)?;
         Ok(Self {
             dir: client,
             nodes,
@@ -238,6 +243,40 @@ impl Natives {
             credentials: configured.credentials,
             transport_bytes: mantle_client::least_transport(nodes.len())?,
             nodes,
+        })
+    }
+
+    /// Learns where the cell's nodes listen now: a node started again chose new ports.
+    fn renew(&mut self, cell: &Cell) {
+        self.nodes = cell.quic();
+    }
+
+    /// Reads every object of a case acknowledged in `oracle`, `count` of them named by `objects`
+    /// and made from `seed`, natively through node `first` first: how many were read, wrong and
+    /// missing.
+    fn read_all(
+        &mut self,
+        first: usize,
+        (objects, oracle, count, seed): (Objects, &Oracle, u64, u64),
+    ) -> Result<(u64, u64, u64), TransferError> {
+        let settings = self.settings(first)?;
+        let acknowledged = oracle.clone();
+        self.block(async move {
+            let generator = Generator::new(seed)?;
+            let sizes = generator.object("sizes")?;
+            let mut client = Client::open(settings).await?;
+            let (mut read, mut wrong, mut missing) = (0u64, 0u64, 0u64);
+            for i in (0..count).filter(|i| acknowledged.has(*i)) {
+                let (key, length) = objects.of(i, &sizes)?;
+                let object = generator.object(&key)?;
+                match native::get(&mut client, (BUCKET, &key), &object, length).await? {
+                    Came::Done => {}
+                    Came::Wrong(_) => wrong = wrong.saturating_add(1),
+                    Came::Refused(_) => missing = missing.saturating_add(1),
+                }
+                read = read.saturating_add(1);
+            }
+            Ok((read, wrong, missing))
         })
     }
 
@@ -275,6 +314,7 @@ impl Natives {
 }
 
 /// Which of a set's objects were put and acknowledged: a bit each, the set's one record of them.
+#[derive(Clone)]
 struct Oracle(Vec<u64>);
 
 impl Oracle {
@@ -323,6 +363,12 @@ fn size(sizes: &Object<'_>, i: u64) -> Result<u64, GenError> {
 
 /// Runs `options`' cases, a row each door to `out`: whether every check of every case was exact.
 pub fn transfer(out: &mut impl Write, options: &Options) -> Result<bool, TransferError> {
+    // The harness asks a cell's ranges as its gateway and its objects as its client, in one
+    // process: it states the cell's message bounds, which the client's object messages fit.
+    let messages = mantle_node::derive::messages()
+        .map_err(|e| TransferError::Io(std::io::Error::other(e.to_string())))?;
+    mantle_protocol::classes::state_bounds(messages)
+        .map_err(|e| TransferError::Io(std::io::Error::other(e.to_string())))?;
     if !options.small.is_empty() {
         writeln!(
             out,
@@ -348,13 +394,23 @@ pub fn transfer(out: &mut impl Write, options: &Options) -> Result<bool, Transfe
         let dir = options.dir.join(format!("small-{count}"));
         std::fs::create_dir(&dir)?;
         let mut cell = Cell::make(&dir, options.volume_bytes)?;
-        let tallies = small(&cell, &dir, options.seed, count)?;
-        exact &= accounted(
+        let mut natives = Natives::new(&cell, &dir, messages)?;
+        let (tallies, oracle) = small(&cell, &mut natives, &dir, options.seed, count)?;
+        let case = format!("small {count}");
+        exact &= placed(
             out,
-            &mut cell,
-            &format!("small {count}"),
-            options.volume_bytes,
+            (&cell, &mut natives, messages),
+            &case,
+            (Objects::Small, &oracle, count, options.seed),
         )?;
+        exact &= accounted(out, &mut cell, &case, options.volume_bytes)?;
+        exact &= killed(
+            out,
+            (&mut cell, &mut natives),
+            &case,
+            (Objects::Small, &oracle, count, options.seed),
+        )?;
+        drop(natives);
         drop(cell);
         for (door, tally) in ["native", "http"].iter().zip(&tallies) {
             writeln!(
@@ -396,18 +452,29 @@ pub fn transfer(out: &mut impl Write, options: &Options) -> Result<bool, Transfe
         let dir = options.dir.join(format!("large-{length}"));
         std::fs::create_dir(&dir)?;
         let mut cell = Cell::make(&dir, options.volume_bytes)?;
-        let done = large::large(
+        let mut natives = Natives::new(&cell, &dir, messages)?;
+        let (done, oracle, budget) = large::large(
             &cell,
+            &mut natives,
             &dir,
             (options.seed, length, options.count),
             options.volume_bytes,
         )?;
-        exact &= accounted(
+        let case = format!("large {length}");
+        exact &= placed(
             out,
-            &mut cell,
-            &format!("large {length}"),
-            options.volume_bytes,
+            (&cell, &mut natives, messages),
+            &case,
+            (Objects::Large(length), &oracle, budget, options.seed),
         )?;
+        exact &= accounted(out, &mut cell, &case, options.volume_bytes)?;
+        exact &= killed(
+            out,
+            (&mut cell, &mut natives),
+            &case,
+            (Objects::Large(length), &oracle, budget, options.seed),
+        )?;
+        drop(natives);
         drop(cell);
         for (way, tally) in large::WAYS.iter().zip(&done.tallies) {
             writeln!(
@@ -438,6 +505,100 @@ pub fn transfer(out: &mut impl Write, options: &Options) -> Result<bool, Transfe
         exact &= done.exact(options.count.is_none());
     }
     Ok(exact)
+}
+
+/// What names a case's objects, so each is made again from its place in the case rather than kept:
+/// a small set's key and drawn size, a large case's key and its one length.
+#[derive(Clone, Copy)]
+enum Objects {
+    Small,
+    Large(u64),
+}
+
+impl Objects {
+    /// Object `i`'s key and length, a small set's size drawn from `sizes`.
+    fn of(self, i: u64, sizes: &Object<'_>) -> Result<(String, u64), GenError> {
+        Ok(match self {
+            Self::Small => (format!("s{i}"), size(sizes, i)?),
+            Self::Large(length) => (large::key(i), length),
+        })
+    }
+}
+
+/// Where the blocks of case `case`'s objects acknowledged in `oracle`, `count` of them named by
+/// `objects` and made from `seed`, sit, read as the cell's gateway on the case's runtime, a line to
+/// `out`: whether every block's chunks are on distinct nodes.
+fn placed(
+    out: &mut impl Write,
+    (cell, natives, messages): (&Cell, &mut Natives, Bounds),
+    case: &str,
+    (objects, oracle, count, seed): (Objects, &Oracle, u64, u64),
+) -> Result<bool, TransferError> {
+    let settings = cell.gateway().settings(messages)?;
+    let bound = cell.quic();
+    let groups = cell.gateway().groups;
+    let page = mantle_node::read::extents_page(mantle_node::read::reply_room(messages.request));
+    let acknowledged = oracle.clone();
+    let placement = natives.block(async move {
+        let mut reader =
+            place::Reader::open(settings, (bound, cell::FOUNDERS), (groups, page)).await?;
+        let generator = Generator::new(seed)?;
+        let sizes = generator.object("sizes")?;
+        let mut placement = place::Placement::default();
+        for i in (0..count).filter(|i| acknowledged.has(*i)) {
+            let (key, length) = objects.of(i, &sizes)?;
+            let (blocks, shared) = reader.object(BUCKET, (&key, length)).await?;
+            placement.objects = placement.objects.saturating_add(1);
+            placement.blocks = placement.blocks.saturating_add(blocks);
+            placement.shared = placement.shared.saturating_add(shared);
+        }
+        Ok(placement)
+    })?;
+    writeln!(
+        out,
+        "  {case} placement: {} blocks of {} objects, each block's chunks on distinct nodes: {}",
+        placement.blocks,
+        placement.objects,
+        if placement.exact() { "yes" } else { "no" },
+    )?;
+    Ok(placement.exact())
+}
+
+/// Each founder of case `case`'s cell killed in turn (SIGKILL), every object the case's `oracle`
+/// acknowledged read back natively through the other two, and the founder started again on its
+/// directory and every object read back through it, a line to `out`: whether every read was exact.
+/// After the chunk bytes are accounted: a node started again counts them from nothing.
+fn killed(
+    out: &mut impl Write,
+    (cell, natives): (&mut Cell, &mut Natives),
+    case: &str,
+    case_objects: (Objects, &Oracle, u64, u64),
+) -> Result<bool, TransferError> {
+    let (mut read, mut wrong, mut missing) = (0u64, 0u64, 0u64);
+    let mut count = |(r, w, m): (u64, u64, u64)| {
+        read = read.saturating_add(r);
+        wrong = wrong.saturating_add(w);
+        missing = missing.saturating_add(m);
+    };
+    for at in 0..cell::FOUNDERS {
+        cell.kill(at)?;
+        // Read once every range the killed founder led has another leader, a running one.
+        cell.led()?;
+        let other = at
+            .checked_add(1)
+            .and_then(|n| n.checked_rem(cell::FOUNDERS))
+            .unwrap_or(0);
+        count(natives.read_all(other, case_objects)?);
+        cell.restart(at)?;
+        natives.renew(cell);
+        count(natives.read_all(at, case_objects)?);
+    }
+    writeln!(
+        out,
+        "  {case} kills: each founder killed in turn and started again, {read} reads through the \
+         others and through it, {wrong} wrong, {missing} missing",
+    )?;
+    Ok(wrong == 0 && missing == 0)
 }
 
 /// Each node's chunk bytes once case `case` is done, a line to `out`: what each holds of its
@@ -495,8 +656,13 @@ fn door(i: u64) -> usize {
 /// listener's put by boto3 through the third node's listener; then every acknowledged object read
 /// back by a native client that asks the second node first; and then each again through the third
 /// node's listener. Every object is so read through another node than it was put through.
-fn small(cell: &Cell, dir: &Path, seed: u64, count: u64) -> Result<[Tally; 2], TransferError> {
-    let mut natives = Natives::new(cell, dir)?;
+fn small(
+    cell: &Cell,
+    natives: &mut Natives,
+    dir: &Path,
+    seed: u64,
+    count: u64,
+) -> Result<([Tally; 2], Oracle), TransferError> {
     let listeners = cell.s3();
     natives.create(BUCKET)?;
 
@@ -584,7 +750,7 @@ fn small(cell: &Cell, dir: &Path, seed: u64, count: u64) -> Result<[Tally; 2], T
             tally.http_came(came, elapsed(began));
         }
     }
-    Ok(tallies)
+    Ok((tallies, oracle))
 }
 
 /// Counts a put of object `i`, `length` bytes, that came to `came` after `took` nanoseconds.
@@ -608,5 +774,41 @@ fn flatten<T>(
     match ran {
         Ok(done) => done,
         Err(e) => Err(TransferError::Io(std::io::Error::other(format!("{e:?}")))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The controls: an acknowledged object read back as no such key counts missing, and one read
+    /// back with a byte not the generator's counts wrong; either leaves the case inexact, as a put
+    /// refused does.
+    #[test]
+    fn a_missing_object_or_a_wrong_byte_leaves_the_case_inexact() {
+        let mut missing = Tally::new();
+        assert!(missing.exact());
+        missing.native_came(Came::Refused(Status::NoSuchKey), 1);
+        assert_eq!(missing.missing, 1);
+        assert!(!missing.exact());
+        let mut wrong = Tally::new();
+        wrong.http_came(Came::Wrong(7), 1);
+        assert_eq!(wrong.wrong, 1);
+        assert!(!wrong.exact());
+        let mut refused = Tally::new();
+        assert!(!refused.put_came(1, Came::Refused(Status::SlowDown), 1));
+        assert!(!refused.exact());
+    }
+
+    /// Object `i`'s bit is the oracle's alone: set ones are held, the rest are not, past the
+    /// last word too.
+    #[test]
+    fn the_oracle_holds_what_was_acknowledged() {
+        let mut oracle = Oracle::new(130).unwrap();
+        for i in [0, 63, 64, 129] {
+            oracle.set(i);
+        }
+        let held: Vec<u64> = (0..140).filter(|i| oracle.has(*i)).collect();
+        assert_eq!(held, [0, 63, 64, 129]);
     }
 }

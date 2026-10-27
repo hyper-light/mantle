@@ -71,7 +71,7 @@ pub struct Large {
 }
 
 /// Object `i`'s key.
-fn key(i: u64) -> String {
+pub(super) fn key(i: u64) -> String {
     format!("l{i}")
 }
 
@@ -79,12 +79,13 @@ fn key(i: u64) -> String {
 /// the cell refuses one as out of space through each door: at most as many as its founders'
 /// volumes of `volume_bytes` hold of one, each node holding a copy of every block (f34), and one
 /// past that through each door.
-pub fn large(
+pub(super) fn large(
     cell: &Cell,
+    natives: &mut Natives,
     dir: &Path,
     (seed, length, count): (u64, u64, Option<u64>),
     volume_bytes: u64,
-) -> Result<Large, TransferError> {
+) -> Result<(Large, Oracle, u64), TransferError> {
     let budget = match count {
         Some(count) => count,
         None => volume_bytes
@@ -92,7 +93,6 @@ pub fn large(
             .and_then(|held| held.checked_add(2))
             .ok_or(GenError::Offset)?,
     };
-    let mut natives = Natives::new(cell, dir)?;
     let listeners = cell.s3();
     let third = listeners
         .get(2)
@@ -221,11 +221,15 @@ pub fn large(
         .collect();
     let acknowledged: BTreeSet<String> = (0..budget).filter(|i| oracle.has(*i)).map(key).collect();
     unlisted &= natively == acknowledged && over_http == acknowledged;
-    Ok(Large {
-        tallies,
-        full,
-        unlisted,
-    })
+    Ok((
+        Large {
+            tallies,
+            full,
+            unlisted,
+        },
+        oracle,
+        budget,
+    ))
 }
 
 impl Large {

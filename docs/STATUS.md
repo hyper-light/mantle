@@ -380,9 +380,13 @@ stated size in four ways in turn, natively in runs and in explicit parts, by the
 standard input and by boto3 in parts, a stated count or until the cell refuses one as out of space
 through each door, typed on both, nothing of a refused object readable or listed by either; every
 node's chunk bytes are accounted, what it received over QUIC and put itself exactly what its volumes
-hold and what none kept (research/76; `crates/mantle/tests/transfer.rs`: the 1,000-object set and
-four 20 MiB objects, and a cell of 96 MiB volumes filled). Placement read from the Block range and
-the volume table, the SIGKILL pass, the controls and the 100k bounds are the step's next pieces.
+hold and what none kept; every block's chunks are on distinct nodes, read as the cell's gateway
+reads them from the Name, File and Block ranges and the volume table; and with each founder
+SIGKILLed in turn every object reads back through the others, and through it started again
+(research/76; `crates/mantle/tests/transfer.rs`: the 1,000-object set and four 20 MiB objects, and
+a cell of 96 MiB volumes filled). The controls and the 100k bounds are the step's next pieces. A
+node reads no chunk from a peer its detectors suspect, so a GET with a copy on a killed node asks
+another at once (gateway.md §3).
 
 Remaining before it is done:
 

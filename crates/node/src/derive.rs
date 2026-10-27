@@ -347,6 +347,27 @@ pub fn cell(identities: u64) -> Result<(Settings, Rules), DeriveError> {
     Ok((settings, rules))
 }
 
+/// The message bounds every node of a cell states, which a client of its ranges states the same:
+/// a range's largest message from the cell's settings, which every range shares, and a chunk at
+/// the largest a gateway writes (`mantle_gateway::layout::CHUNK`).
+pub fn messages() -> Result<mantle_protocol::classes::Bounds, DeriveError> {
+    let (settings, rules) = cell(1)?;
+    crate::node::message_bounds(
+        &[Hosted {
+            group: 0,
+            range: Range {
+                layer: Layer::Name,
+                rules,
+                boot: ConfState::default(),
+                settings,
+            },
+            engine: (),
+        }],
+        mantle_gateway::layout::CHUNK,
+    )
+    .map_err(|e| DeriveError::Bounds(e.to_string()))
+}
+
 /// A range's engine on a node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Engine {
@@ -1325,8 +1346,7 @@ pub fn derive(
             engine: (),
         })
         .collect();
-    let messages = crate::node::message_bounds(&hosted, chunk)
-        .map_err(|e| DeriveError::Bounds(e.to_string()))?;
+    let messages = messages()?;
     // A node that hosts objects admits its clients beside its pinned peers, each an identity of
     // its transport (node.md §3.6).
     let clients = if hosts { gateway.clients } else { 0 };

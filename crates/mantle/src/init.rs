@@ -875,43 +875,13 @@ pub fn init(said: &mut impl Write, out: &Path, cell: &Cell) -> Result<(), Error>
 /// client end alone (`mantle_cert::client`); its key, owner-only; the authority's certificate,
 /// which its nodes' chain to; and its `config`, naming each founder where it listens.
 pub fn client(said: &mut impl Write, out: &Path, cell: &Path) -> Result<(), Error> {
-    let authority_dir = [cell.join("authority"), cell.join("identity")]
-        .into_iter()
-        .find(|dir| dir.join(CELL).is_file())
-        .ok_or_else(|| {
-            Error::Cell(format!(
-                "{}: no cell file beside an authority's key, as `mantle init` writes one in the \
-                 directory it makes a cell in",
-                cell.display()
-            ))
-        })?;
-    let text = std::fs::read_to_string(authority_dir.join(CELL))?;
-    let mut authority_name = None;
-    let mut account = None;
-    let mut nodes: Vec<(u64, SocketAddr)> = Vec::new();
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let bad = || Error::Cell(format!("the cell file's line does not read: {line}"));
-        let (key, value) = line.split_once('=').ok_or_else(bad)?;
-        match key.trim() {
-            "authority" => authority_name = Some(value.trim().to_owned()),
-            "account" => account = Some(value.trim().to_owned()),
-            "node" => {
-                let (id, quic) = value.trim().split_once(' ').ok_or_else(bad)?;
-                let id = id.parse().map_err(|_| bad())?;
-                let quic = quic.trim().parse().map_err(|_| bad())?;
-                nodes.push((id, quic));
-            }
-            _ => return Err(bad()),
-        }
-    }
-    let (Some(authority_name), Some(account)) = (authority_name, account) else {
-        return Err(Error::Cell(
-            "the cell file names no authority or no account".into(),
-        ));
-    };
-    if nodes.is_empty() {
-        return Err(Error::Cell("the cell file names no node".into()));
-    }
+    let Authority {
+        name: authority_name,
+        account,
+        nodes,
+        certificate: authority,
+        key: authority_key,
+    } = Authority::read(cell)?;
     match std::fs::read_dir(out) {
         Ok(mut entries) => {
             if entries.next().is_some() {
@@ -922,10 +892,6 @@ pub fn client(said: &mut impl Write, out: &Path, cell: &Path) -> Result<(), Erro
         Err(e) => return Err(Error::Output(e)),
     }
     let cert = |e: mantle_cert::CertError| Error::Cert(format!("{e:?}"));
-    let authority = std::fs::read(authority_dir.join("authority.der"))?;
-    let authority_key = mantle_node::secret::read(&authority_dir.join("authority.key"))
-        .map_err(|e| Error::Cert(e.to_string()))
-        .and_then(|pkcs8| KeyPair::from_pkcs8(&pkcs8).map_err(cert))?;
     let id = loop {
         let id = u64::from_le_bytes(random::<8>()?);
         if id != 0 && !nodes.iter().any(|(node, _)| *node == id) {
@@ -974,6 +940,107 @@ pub fn client(said: &mut impl Write, out: &Path, cell: &Path) -> Result<(), Erro
         nodes.len()
     )?;
     Ok(())
+}
+
+/// The authority of the cell `mantle init` made in `cell`, as its cell file and key say it: what an
+/// identity issued after init is issued under.
+pub(crate) struct Authority {
+    pub(crate) name: String,
+    /// The account the cell's native clients act for.
+    pub(crate) account: String,
+    /// Each founder's id and QUIC address.
+    pub(crate) nodes: Vec<(u64, SocketAddr)>,
+    pub(crate) certificate: Vec<u8>,
+    pub(crate) key: KeyPair,
+}
+
+impl Authority {
+    pub(crate) fn read(cell: &Path) -> Result<Self, Error> {
+        let authority_dir = [cell.join("authority"), cell.join("identity")]
+            .into_iter()
+            .find(|dir| dir.join(CELL).is_file())
+            .ok_or_else(|| {
+                Error::Cell(format!(
+                    "{}: no cell file beside an authority's key, as `mantle init` writes one in \
+                     the directory it makes a cell in",
+                    cell.display()
+                ))
+            })?;
+        let text = std::fs::read_to_string(authority_dir.join(CELL))?;
+        let mut name = None;
+        let mut account = None;
+        let mut nodes: Vec<(u64, SocketAddr)> = Vec::new();
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let bad = || Error::Cell(format!("the cell file's line does not read: {line}"));
+            let (key, value) = line.split_once('=').ok_or_else(bad)?;
+            match key.trim() {
+                "authority" => name = Some(value.trim().to_owned()),
+                "account" => account = Some(value.trim().to_owned()),
+                "node" => {
+                    let (id, quic) = value.trim().split_once(' ').ok_or_else(bad)?;
+                    let id = id.parse().map_err(|_| bad())?;
+                    let quic = quic.trim().parse().map_err(|_| bad())?;
+                    nodes.push((id, quic));
+                }
+                _ => return Err(bad()),
+            }
+        }
+        let (Some(name), Some(account)) = (name, account) else {
+            return Err(Error::Cell(
+                "the cell file names no authority or no account".into(),
+            ));
+        };
+        if nodes.is_empty() {
+            return Err(Error::Cell("the cell file names no node".into()));
+        }
+        let cert = |e: mantle_cert::CertError| Error::Cert(format!("{e:?}"));
+        let certificate = std::fs::read(authority_dir.join("authority.der"))?;
+        let key = mantle_node::secret::read(&authority_dir.join("authority.key"))
+            .map_err(|e| Error::Cert(e.to_string()))
+            .and_then(|pkcs8| KeyPair::from_pkcs8(&pkcs8).map_err(cert))?;
+        Ok(Self {
+            name,
+            account,
+            nodes,
+            certificate,
+            key,
+        })
+    }
+}
+
+/// A gateway's identity for the cell `mantle init` made in `cell`, which its operator pins in each
+/// founder's configuration (`peer = ID gateway CERTIFICATE`, node.md §3.6): its id drawn from the
+/// OS, nonzero and no founder's, its certificate issued under the cell's authority, and its key.
+pub(crate) fn gateway(cell: &Path) -> Result<(u64, Vec<u8>, KeyPair), Error> {
+    let authority = Authority::read(cell)?;
+    let cert = |e: mantle_cert::CertError| Error::Cert(format!("{e:?}"));
+    let id = loop {
+        let id = u64::from_le_bytes(random::<8>()?);
+        if id != 0 && !authority.nodes.iter().any(|(node, _)| *node == id) {
+            break id;
+        }
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| Error::Cert(e.to_string()))?
+        .as_secs();
+    let own = KeyPair::generate().map_err(cert)?;
+    let certificate = mantle_cert::node(
+        &authority.key,
+        &authority.name,
+        own.public_key(),
+        &format!("gateway-{id}"),
+        (
+            Validity {
+                not_before: now,
+                not_after: NO_EXPIRY,
+            },
+            Serial::draw().map_err(cert)?,
+        ),
+    )
+    .map_err(cert)?;
+    mantle_cert::issued_by(&certificate, &authority.certificate, now).map_err(cert)?;
+    Ok((id, certificate, own))
 }
 
 /// A cell of one's host and devices measured now: the machine's calibration record in its

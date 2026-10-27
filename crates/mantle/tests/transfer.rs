@@ -54,9 +54,11 @@ fn line<'a>(said: &'a str, case: &str) -> &'a str {
 /// below S3's small-object line, half put through each door; and a large case of four 20 MiB
 /// objects, a few runs and parts each, one put natively in runs, one by the AWS CLI from its
 /// standard input, one natively in explicit parts and one by boto3 in parts. Every object reads
-/// back whole through both doors, the large ones listed by both, and every node holds exactly the
-/// chunk bytes it received over QUIC and put itself, none refused. A case's directory is its own:
-/// the same run again is refused, not mixed into the last.
+/// back whole through both doors, the large ones listed by both; every block's chunks sit on
+/// distinct nodes, as the Block range and the volume table say; every node holds exactly the chunk
+/// bytes it received over QUIC and put itself, none refused; and with each founder SIGKILLed in
+/// turn every object reads back through the others, and through it once it is started again. A
+/// case's directory is its own: the same run again is refused, not mixed into the last.
 #[test]
 fn the_small_set_and_large_objects_in_every_way_read_back_exactly() {
     let root = tempfile::tempdir().unwrap();
@@ -87,10 +89,18 @@ fn the_small_set_and_large_objects_in_every_way_read_back_exactly() {
         ),
         "{said}"
     );
-    for case in ["small 1000 chunks", "large 20971520 chunks"] {
-        let chunks = line(&said, case);
+    for case in ["small 1000", "large 20971520"] {
+        let chunks = line(&said, &format!("{case} chunks"));
         assert!(chunks.ends_with("put in-process: yes"), "{said}");
         assert_eq!(chunks.matches("(+0 kept by none)").count(), 3, "{said}");
+        assert!(
+            line(&said, &format!("{case} placement")).ends_with("on distinct nodes: yes"),
+            "{said}"
+        );
+        assert!(
+            line(&said, &format!("{case} kills")).ends_with("0 wrong, 0 missing"),
+            "{said}"
+        );
     }
     let again = Command::new(MANTLE)
         .args(["bench", "transfer"])
@@ -104,8 +114,9 @@ fn the_small_set_and_large_objects_in_every_way_read_back_exactly() {
 /// Large objects put in turn through the four ways into a cell whose 96 MiB volumes hold two of
 /// them: the next is refused as out of space through the native door and through the S3 listener,
 /// typed on each, and nothing of either refused object is readable through either door or listed
-/// by either, while every acknowledged object reads back whole and is listed by both. Every node
-/// holds what it received and put but for what it kept of none, its volume's refusals.
+/// by either, while every acknowledged object reads back whole and is listed by both, its blocks
+/// on distinct nodes, and through the others with each founder killed in turn. Every node holds
+/// what it received and put but for what it kept of none, its volume's refusals.
 #[test]
 fn a_cell_filled_with_large_objects_refuses_the_next_through_both_doors_and_keeps_none_of_it() {
     let root = tempfile::tempdir().unwrap();
@@ -127,6 +138,14 @@ fn a_cell_filled_with_large_objects_refuses_the_next_through_both_doors_and_keep
     assert!(acknowledged > 0, "{said}");
     assert!(
         line(&said, "large 20971520 chunks").ends_with("put in-process: yes"),
+        "{said}"
+    );
+    assert!(
+        line(&said, "large 20971520 placement").ends_with("on distinct nodes: yes"),
+        "{said}"
+    );
+    assert!(
+        line(&said, "large 20971520 kills").ends_with("0 wrong, 0 missing"),
         "{said}"
     );
 }

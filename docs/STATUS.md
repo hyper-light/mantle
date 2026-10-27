@@ -375,10 +375,14 @@ object's bytes AES-256-CTR's keystream from the run's seed and the object's name
 checked by making them again and no copy is kept; a small set's sizes the layout's boundaries and
 then drawn below S3's 128 KiB small-object line; half put through the native door and half by
 boto3 through a node's S3 listener, and every one read back through both doors and another node,
-every byte exact or counted wrong; latency in fixed-size histograms (research/76;
-`crates/mantle/tests/transfer.rs`). The large objects through the AWS CLI's streams and boto3's
-parts, placement and replication checks, the full-cell case and the controls are the step's next
-pieces.
+every byte exact or counted wrong; latency in fixed-size histograms. A large case puts objects of a
+stated size in four ways in turn, natively in runs and in explicit parts, by the AWS CLI from its
+standard input and by boto3 in parts, a stated count or until the cell refuses one as out of space
+through each door, typed on both, nothing of a refused object readable or listed by either; every
+node's chunk bytes are accounted, what it received over QUIC and put itself exactly what its volumes
+hold and what none kept (research/76; `crates/mantle/tests/transfer.rs`: the 1,000-object set and
+four 20 MiB objects, and a cell of 96 MiB volumes filled). Placement read from the Block range and
+the volume table, the SIGKILL pass, the controls and the 100k bounds are the step's next pieces.
 
 Remaining before it is done:
 

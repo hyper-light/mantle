@@ -67,6 +67,36 @@ through; a read is exact or it counts as wrong, a put not acknowledged counts as
 doors run in turn, each phase alone, so the driver's blocking pipes never stall the native
 clients' runtime, and the driver says `ready` before anything is timed, its start-up no put's.
 
+**Large objects go in four ways, two each door.** Object `i` of a large case is put natively in
+the runs the node cuts, as `mantle cp` puts a file (gateway.md §2.1); by the AWS CLI from its
+standard input, its length stated so the CLI sizes its parts for S3's 10,000 (`--expected-size`);
+natively as an explicit multipart upload; or by boto3 as one, for `i` mod 4 in that order. An
+explicit upload's parts are the AWS CLI's 8 MiB where 10,000 of them hold the object, else what
+10,000 need (f27), each part's bytes made as they are sent and a refused part ending the upload,
+aborted. boto3's driver takes a part's bytes only once it said the step before went, so a refusal
+stops the harness making the rest. The CLI is a process a copy and says its failures into a file
+the harness reads once it exits, S3's code taken from botocore's `An error occurred (CODE)`, so no
+pipe it fills can stall a copy; its copy to standard output heads the object first, whose `404`
+names no code and is read as no such key. Every acknowledged object is read back natively through
+the second node and by the CLI through the third node's listener.
+
+**A case fills the cell or puts a count.** With a count, a large case puts that many objects. With
+none it puts until each door has refused one as out of space, typed (node.md §4.4), at most the
+objects a founder's volume holds of one and two past them, a door refused once asked no more.
+Each object is asked once: a full volume holds a put for its cleaner's verdict, so the cell's first
+answer is the typed one (research/75), and a `SlowDown` counts as refused. The refused objects are
+then read through both doors,
+which must answer no such key, and listed by neither, which must list every acknowledged object.
+
+**Every node's chunk bytes are accounted.** Once a case is done each node is asked its chunk bytes
+on its standard input: received from peers over QUIC, put on its own volumes in-process, held by
+its volumes, and of the first two kept by none, a volume's refusal or a body that ended before it
+was whole. Nothing removes a chunk yet, so the first two's sum is exactly the last two's on every
+node, the check the step names (chunk bytes moved equal the chunks held) made exact where a full
+volume refuses some: a filled cell of 96 MiB volumes held 48 MiB a node and kept none of 15.9 MiB,
+the two refused parts' chunks. A volume keeps `CLEANER_RESERVE` free segments past what a client's
+writes take (research/11 §10.3), which is half of so small a volume.
+
 **Bounded by construction.** A case keeps two fixed-size histograms of latency
 (`mantle_disk::histogram`, HdrHistogram's buckets) and counts; a node's status lines are read on a
 thread of its own, three in all; the native door drives its objects on the client's one task
@@ -75,10 +105,9 @@ its operator runs it: a case fills the volumes it states (f7).
 
 ## Open
 
-- The AWS CLI streaming a large object from standard input and to standard output, and boto3's
-  explicit parts, for the 10 GB and 100 GB cases.
 - Each block's placement read from the Block range and the volume table; each node SIGKILLed in turn
-  with every object read back through the others, then restarted and read back through it; the
-  chunk bytes peers received over QUIC against those they hold.
-- Large objects put until the cell refuses one as out of space, and the controls that must fail.
-- The memory and threads of a case of 100k objects against their stated bounds.
+  with every object read back through the others, then restarted and read back through it.
+- The controls that must fail: a flipped byte, a chunk moved onto its block's other node, a missing
+  object.
+- The memory and threads of a case of 100k objects against their stated bounds; the 10 GB and
+  100 GB cases on the owner's machines (plan step 10).

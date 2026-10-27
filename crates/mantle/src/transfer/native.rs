@@ -5,7 +5,7 @@
 //! an object: a piece of it at a time.
 
 use mantle_client::{Client, Native, Rewind, Sink, Source, TRAILER, Watch};
-use mantle_protocol::object::{Headers, Op, Progress, Status};
+use mantle_protocol::object::{Headers, List, Listing, Op, Progress, Status};
 
 use super::generate::{GenError, Object};
 
@@ -22,6 +22,15 @@ impl<'o, 'g> Made<'o, 'g> {
             object,
             at: 0,
             length,
+        }
+    }
+
+    /// The object's bytes from `from` up to `to`: a part of it.
+    pub fn range(object: &'o Object<'g>, from: u64, to: u64) -> Self {
+        Self {
+            object,
+            at: from,
+            length: to,
         }
     }
 }
@@ -141,6 +150,94 @@ pub async fn put(
     })
 }
 
+/// The part an object of `length` bytes is put in: the AWS CLI's 8 MiB (`crate::client::PART`),
+/// or what S3's 10,000 parts need of it where that is more (research/05 §4.1).
+pub fn part_size(length: u64) -> u64 {
+    let parts = u64::from(mantle_s3::body::MAX_PARTS);
+    let whole = length.checked_div(parts).unwrap_or(0);
+    let least = whole.saturating_add(u64::from(length.checked_rem(parts).unwrap_or(0) != 0));
+    least.max(crate::client::PART)
+}
+
+/// Puts `object`, `length` bytes, at `key` in `bucket` as an explicit multipart upload of parts
+/// `part_size` makes, each part's bytes made from the generator at its offset as they are sent. A
+/// part refused ends the upload, aborted, so nothing of the object stays listed.
+pub async fn put_parts(
+    client: &mut Client,
+    (bucket, key): (&str, &str),
+    object: &Object<'_>,
+    length: u64,
+) -> Result<Came, mantle_client::ClientError> {
+    let created = client
+        .call(
+            &Op::CreateUpload {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                id: mantle_client::identity()?,
+                checksum: Some((TRAILER, true)),
+            },
+            u64::MAX,
+        )
+        .await?;
+    if created.status != Status::Done {
+        return Ok(Came::Refused(created.status));
+    }
+    let upload = created.upload;
+    let part = part_size(length);
+    let mut parts = Vec::new();
+    let mut at = 0u64;
+    let mut number = 0u16;
+    while at < length {
+        number = number
+            .checked_add(1)
+            .ok_or(mantle_client::ClientError::Reply("parts past S3's"))?;
+        let to = at.saturating_add(part).min(length);
+        let op = Op::UploadPart {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            upload: upload.clone(),
+            number,
+            id: mantle_client::identity()?,
+            length: to.saturating_sub(at),
+            checksum: None,
+            md5: None,
+            trailing: Some(TRAILER),
+        };
+        let mut made = Made::range(object, at, to);
+        let reply = client.put(&op, &mut made, u64::MAX).await?;
+        if reply.status != Status::Done {
+            let abort = Op::Abort {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                upload,
+                id: mantle_client::identity()?,
+            };
+            client.call(&abort, u64::MAX).await?;
+            return Ok(Came::Refused(reply.status));
+        }
+        parts.push((number, reply.etag.trim_matches('"').to_owned()));
+        at = to;
+    }
+    let done = client
+        .call(
+            &Op::Complete {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                upload,
+                id: mantle_client::identity()?,
+                headers: Headers::default(),
+                parts,
+            },
+            u64::MAX,
+        )
+        .await?;
+    Ok(if done.status == Status::Done {
+        Came::Done
+    } else {
+        Came::Refused(done.status)
+    })
+}
+
 /// Reads `key` in `bucket` back whole and checks it is `object`'s `length` bytes.
 pub async fn get(
     client: &mut Client,
@@ -163,4 +260,39 @@ pub async fn get(
         None if checked.len() != length => Came::Wrong(checked.len().min(length)),
         None => Came::Done,
     })
+}
+
+/// The keys in `bucket`, listed a page at a time, at most `pages` pages: as many as the keys the
+/// case put fill.
+pub async fn list(
+    client: &mut Client,
+    bucket: &str,
+    pages: u64,
+) -> Result<Vec<String>, mantle_client::ClientError> {
+    let mut keys = Vec::new();
+    let mut start = None;
+    for _ in 0..pages {
+        let op = Op::List(List {
+            bucket: bucket.to_owned(),
+            prefix: String::new(),
+            delimiter: String::new(),
+            start: start.take(),
+            max_keys: u32::try_from(mantle_s3::list::MAX_KEYS).unwrap_or(u32::MAX),
+            fetch_owner: false,
+        });
+        let reply = client.call(&op, u64::MAX).await?;
+        let Some(Listing::Keys(page)) = reply.listing else {
+            return Err(mantle_client::ClientError::Reply(
+                "a listing answered no keys",
+            ));
+        };
+        keys.extend(page.contents.into_iter().map(|listed| listed.key));
+        match (page.truncated, page.next) {
+            (true, Some(next)) => start = Some(next),
+            _ => return Ok(keys),
+        }
+    }
+    Err(mantle_client::ClientError::Reply(
+        "a listing past the pages its keys fill",
+    ))
 }

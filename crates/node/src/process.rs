@@ -1753,8 +1753,8 @@ async fn serve(
                     if line.trim_ascii() == b"stop" {
                         stop_asked(&mut stop, &mut node, &mut output).await?;
                     } else if line.trim_ascii() == b"chunks" {
-                        let (received, written, held) = node.chunk_bytes()?;
-                        let line = format!("chunks {received} {written} {held}\n");
+                        let (received, written, held, unkept) = node.chunk_bytes()?;
+                        let line = format!("chunks {received} {written} {held} {unkept}\n");
                         say(&mut output, &line).await?;
                     } else {
                         take_line(&mut node, &config.ranges, &line)?;

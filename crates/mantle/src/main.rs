@@ -338,9 +338,10 @@ enum BenchCommand {
         seconds: f64,
     },
     /// Put objects through a cell of three this program makes and runs under DIR, each read back
-    /// through another node and checked against the bytes its seed and name make (plan step 9):
-    /// a case each small set, each on a cell of its own. Exits non-zero when any check is not
-    /// exact. Never on a shared runner: it fills the volumes it states.
+    /// through both doors and another node and checked against the bytes its seed and name make
+    /// (plan step 9): a case each small set and each large size, each on a cell of its own. Exits
+    /// non-zero when any check is not exact. Never on a shared runner: it fills the volumes it
+    /// states.
     Transfer {
         /// The run's directory: each case's cell in a directory of its own under it, which must
         /// not exist yet.
@@ -349,8 +350,17 @@ enum BenchCommand {
         #[arg(long, default_value_t = 1)]
         seed: u64,
         /// The small sets' sizes, comma-separated, a case each.
-        #[arg(long, value_delimiter = ',', default_value = "1000")]
+        #[arg(long, value_delimiter = ',')]
         small: Vec<u64>,
+        /// The large objects' sizes, comma-separated, in bytes or with a K, M, G or T suffix
+        /// (powers of 1024), a case each: objects put natively in runs and in parts, by the AWS
+        /// CLI from its standard input and by boto3 in parts, in turn.
+        #[arg(long, value_delimiter = ',', value_parser = init::parse_bytes)]
+        large: Vec<u64>,
+        /// The objects of each large case; without it, a large case puts objects until the cell
+        /// refuses one as out of space through each door.
+        #[arg(long)]
+        count: Option<u64>,
         /// Each founder's volume, in bytes or with a K, M, G or T suffix (powers of 1024).
         #[arg(long, value_parser = init::parse_bytes, default_value = "256M")]
         volume: u64,
@@ -757,19 +767,27 @@ fn main() -> ExitCode {
                     dir,
                     seed,
                     small,
+                    large,
+                    count,
                     volume,
                 },
         } => {
-            let options = transfer::Options {
-                dir,
-                seed,
-                small,
-                volume_bytes: volume,
-            };
-            match transfer::transfer(&mut out, &options) {
-                Ok(true) => Ok(()),
-                Ok(false) => Err("a check was not exact: the rows above say which".into()),
-                Err(e) => Err(e.to_string()),
+            if small.is_empty() && large.is_empty() {
+                Err("no case: --small N or --large SIZE".into())
+            } else {
+                let options = transfer::Options {
+                    dir,
+                    seed,
+                    small,
+                    large,
+                    count,
+                    volume_bytes: volume,
+                };
+                match transfer::transfer(&mut out, &options) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => Err("a check was not exact: the rows above say which".into()),
+                    Err(e) => Err(e.to_string()),
+                }
             }
         }
         Command::Durability {

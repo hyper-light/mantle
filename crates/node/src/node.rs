@@ -749,6 +749,9 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// chunks this node put on its own volumes in-process ([`Node::chunk_bytes`]).
     chunks_received: u64,
     chunks_written: u64,
+    /// The bytes of chunks received or put that no volume kept: refused, or a body that ended
+    /// before it was whole.
+    chunks_unkept: u64,
     /// The clients the node admits at once (`GatewaySettings::clients`), none where it hosts no
     /// objects.
     clients: usize,
@@ -1043,6 +1046,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             moved: 0,
             chunks_received: 0,
             chunks_written: 0,
+            chunks_unkept: 0,
             clients,
             generation: 0,
             held: Vec::new(),
@@ -1270,13 +1274,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// The bytes of chunks peers put here over QUIC, of chunks this node put on its own volumes
-    /// in-process, and of the chunks its volumes hold. Nothing removes a chunk yet, so the third
-    /// is the first two's sum unless a chunk received was not kept or was kept twice.
-    pub fn chunk_bytes(&self) -> Result<(u64, u64, u64), crate::storage::StorageError> {
+    /// in-process, of the chunks its volumes hold, and of those of the first two no volume kept:
+    /// refused, or a body that ended before it was whole. Nothing removes a chunk yet, so the
+    /// first two's sum is the last two's unless a chunk was kept twice.
+    pub fn chunk_bytes(&self) -> Result<(u64, u64, u64, u64), crate::storage::StorageError> {
         Ok((
             self.chunks_received,
             self.chunks_written,
             self.storage.held_bytes()?,
+            self.chunks_unkept,
         ))
     }
 
@@ -1828,6 +1834,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 exchange, refusal, ..
             } => {
                 self.snapshot_done(exchange, false);
+                // A chunk's body ended before it was whole: what came of it is kept nowhere.
+                for r in self.receiving.iter().filter(|r| r.exchange == exchange) {
+                    if matches!(r.what, Arriving::ChunkPut { .. }) {
+                        self.chunks_unkept = self.chunks_unkept.saturating_add(r.read);
+                    }
+                }
                 if let Some(at) = self.chunks_out.iter().position(|c| c.exchange == exchange) {
                     let out = self.chunks_out.swap_remove(at);
                     self.chunks_done
@@ -2340,7 +2352,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Err(refusal) => {
                     let lost = self.receiving.swap_remove(at);
                     match lost.what {
-                        Arriving::ChunkPut { .. } => self.storage.give_room(lost.body),
+                        Arriving::ChunkPut { .. } => {
+                            self.chunks_unkept = self.chunks_unkept.saturating_add(lost.read);
+                            self.storage.give_room(lost.body);
+                        }
                         Arriving::ChunkBytes(asked) => {
                             self.chunks_done.push((asked, ChunkOutcome::Lost(refusal)));
                         }
@@ -2391,6 +2406,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 match put {
                     Ok(()) => Ok(()),
                     Err(error) => {
+                        self.chunks_unkept = self.chunks_unkept.saturating_add(room);
                         self.storage.give_room(room);
                         self.answer_chunk(exchange, chunk::Status::of_error(&error), None)
                     }
@@ -2725,20 +2741,26 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         .await;
         for done in stored.drain(..) {
             match done {
-                Done::Put(Origin::Exchange(exchange), Ok(())) => {
+                Done::Put(Origin::Exchange(exchange), _, Ok(())) => {
                     self.answer_chunk(exchange, chunk::Status::Stored, None)?;
                 }
                 Done::Get(Origin::Exchange(exchange), Ok(bytes)) => {
                     self.answer_chunk(exchange, chunk::Status::Read, Some(bytes))?;
                 }
-                Done::Put(Origin::Exchange(exchange), Err(error))
-                | Done::Get(Origin::Exchange(exchange), Err(error)) => {
+                Done::Put(Origin::Exchange(exchange), len, Err(error)) => {
+                    self.chunks_unkept = self.chunks_unkept.saturating_add(len);
                     self.answer_chunk(exchange, chunk::Status::of_error(&error), None)?;
                 }
-                Done::Put(Origin::Asked(asked), answered) => {
+                Done::Get(Origin::Exchange(exchange), Err(error)) => {
+                    self.answer_chunk(exchange, chunk::Status::of_error(&error), None)?;
+                }
+                Done::Put(Origin::Asked(asked), len, answered) => {
                     let outcome = match answered {
                         Ok(()) => ChunkOutcome::Stored,
-                        Err(error) => ChunkOutcome::Refused(chunk::Status::of_error(&error)),
+                        Err(error) => {
+                            self.chunks_unkept = self.chunks_unkept.saturating_add(len);
+                            ChunkOutcome::Refused(chunk::Status::of_error(&error))
+                        }
                     };
                     self.chunks_done.push((asked, outcome));
                 }

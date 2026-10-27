@@ -101,7 +101,7 @@ fn a_cell_of_three_serves_signed_s3_requests_through_every_nodes_listener() {
 
     // Objects put through one listener alone: the listener hands each to its own node's host
     // in-process, and their chunks go to the other two nodes over QUIC's transfer class, each of
-    // which holds exactly what it received and wrote none itself.
+    // which holds exactly what it received and kept and wrote none itself.
     let alone: Vec<Vec<u8>> = (0..2u64)
         .map(|i| bytes(50 + i, 1_000_003 + usize::try_from(i).unwrap()))
         .collect();
@@ -112,15 +112,16 @@ fn a_cell_of_three_serves_signed_s3_requests_through_every_nodes_listener() {
         assert!(clients[1].send("GET", &target, &[], b"").body == *data);
     }
     for &id in &ids[1..] {
-        let (received, written, held) = cell.chunk_bytes(id);
+        let (received, written, held, unkept) = cell.chunk_bytes(id);
         assert_eq!(
             written, 0,
             "node {id} put chunks itself, though its listener took no put"
         );
         assert!(received > 0, "node {id} received no chunk over QUIC");
         assert_eq!(
-            received, held,
-            "node {id}: {received} bytes received over QUIC, {held} held"
+            received,
+            held + unkept,
+            "node {id}: {received} bytes received over QUIC, {held} held, {unkept} kept by none"
         );
     }
 
@@ -340,15 +341,17 @@ fn a_cell_of_three_serves_signed_s3_requests_through_every_nodes_listener() {
     }
 
     // The listeners handed every operation over in-process; the chunks went to the nodes that
-    // hold them over QUIC's transfer class, each byte received held once: on every node, what its
-    // volumes hold is what its peers sent it and what it put on them itself.
+    // hold them over QUIC's transfer class, each byte received held once or kept by none: on every
+    // node, what its volumes hold and what none kept is what its peers sent it and what it put on
+    // them itself.
     let mut received = 0;
     for &id in &ids {
-        let (from_peers, own, held) = cell.chunk_bytes(id);
+        let (from_peers, own, held, unkept) = cell.chunk_bytes(id);
         assert_eq!(
             from_peers + own,
-            held,
-            "node {id}: {from_peers} bytes received over QUIC, {own} put in-process, {held} held"
+            held + unkept,
+            "node {id}: {from_peers} bytes received over QUIC, {own} put in-process, {held} held, \
+             {unkept} kept by none"
         );
         received += from_peers;
     }

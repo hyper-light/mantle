@@ -88,10 +88,10 @@ pub(crate) enum Origin {
     Asked(u64),
 }
 
-/// A put or a get answered.
+/// A put or a get answered: a put with its chunk's length.
 #[derive(Debug)]
 pub(crate) enum Done {
-    Put(Origin, Result<(), ChunkError>),
+    Put(Origin, u64, Result<(), ChunkError>),
     Get(Origin, Result<Vec<u8>, ChunkError>),
 }
 
@@ -102,8 +102,8 @@ pub struct Storage {
     // devices' issuers stop.
     volumes: Vec<Held>,
     devices: Vec<Device>,
-    /// Each put out, with the room it holds of what the node takes.
-    puts: Vec<(Origin, Answer, u64)>,
+    /// Each put out, with the room it holds of what the node takes and its chunk's length.
+    puts: Vec<(Origin, Answer, u64, u64)>,
     gets: Vec<(usize, ReadId, Origin)>,
     /// Bytes of the chunks peers sent being read or queued at a volume, and the most there may
     /// be: what the volumes' writer queues hold together, past which a volume refuses a put
@@ -289,10 +289,11 @@ impl Storage {
         (origin, room): (Origin, u64),
     ) -> Result<(), ChunkError> {
         let held = self.volumes.get(slot).ok_or(ChunkError::Closed)?;
+        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         let answer = held
             .volume
             .put_checked_waking(key, bytes, crc32c, waker.clone())?;
-        self.puts.push((origin, answer, room));
+        self.puts.push((origin, answer, room, len));
         Ok(())
     }
 
@@ -342,10 +343,10 @@ impl Storage {
     /// given).
     pub(crate) fn poll_done(&mut self, cx: &mut Context<'_>, done: &mut Vec<Done>) {
         let mut at = 0;
-        while let Some((origin, answer, room)) = self.puts.get(at) {
+        while let Some((origin, answer, room, len)) = self.puts.get(at) {
             match answer.poll() {
                 Some(answered) => {
-                    done.push(Done::Put(*origin, answered));
+                    done.push(Done::Put(*origin, *len, answered));
                     self.taken = self.taken.saturating_sub(*room);
                     self.puts.swap_remove(at);
                 }

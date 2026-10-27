@@ -373,8 +373,8 @@ pub(crate) enum Line {
     /// Where the node's S3 listener listens, once bound, and the connections it holds at once.
     S3Bound(SocketAddr, u64),
     /// The node's chunk bytes as a `chunks` line asked: received over QUIC, put on its own
-    /// volumes in-process, and held by its volumes.
-    Chunks(u64, u64, u64),
+    /// volumes in-process, held by its volumes, and of the first two kept by none.
+    Chunks(u64, u64, u64, u64),
     /// The root range took the node's enlistment of itself and its volumes.
     Enlisted,
     /// What the node's failure detectors start from (node.md §2.4, item 7): the cell's node time
@@ -418,10 +418,11 @@ pub(crate) fn parse(line: &str) -> Option<Line> {
         )),
         ["link", peer, rest @ ..] => Some(Line::Link(peer.parse().ok()?, rest.join(" "))),
         ["volume", id] => Some(Line::Volume(u128::from_str_radix(id, 16).ok()?)),
-        ["chunks", received, written, held] => Some(Line::Chunks(
+        ["chunks", received, written, held, unkept] => Some(Line::Chunks(
             received.parse().ok()?,
             written.parse().ok()?,
             held.parse().ok()?,
+            unkept.parse().ok()?,
         )),
         ["s3-bound", at, connections] => {
             Some(Line::S3Bound(at.parse().ok()?, connections.parse().ok()?))
@@ -911,7 +912,7 @@ pub(crate) struct Cell {
     /// it holds at once.
     pub(crate) s3_bound: BTreeMap<u64, (SocketAddr, u64)>,
     /// Each node's chunk bytes as it last answered a `chunks` line.
-    pub(crate) chunks: BTreeMap<u64, (u64, u64, u64)>,
+    pub(crate) chunks: BTreeMap<u64, (u64, u64, u64, u64)>,
     /// What each node's failure detectors started from as its latest process said: the cell's
     /// history and its own part of it.
     pub(crate) histories: BTreeMap<u64, (Lived, Lived)>,
@@ -1504,8 +1505,8 @@ impl Cell {
     }
 
     /// Node `id`'s chunk bytes, asked now: received over QUIC, put on its own volumes in-process,
-    /// and held by its volumes.
-    pub(crate) fn chunk_bytes(&mut self, id: u64) -> (u64, u64, u64) {
+    /// held by its volumes, and of the first two kept by none.
+    pub(crate) fn chunk_bytes(&mut self, id: u64) -> (u64, u64, u64, u64) {
         self.chunks.remove(&id);
         self.say_to(id, b"chunks\n");
         self.until(|c| c.chunks.get(&id).copied())
@@ -1754,8 +1755,8 @@ impl Cell {
                     Line::S3Bound(at, connections) => {
                         self.s3_bound.insert(id, (at, connections));
                     }
-                    Line::Chunks(received, written, held) => {
-                        self.chunks.insert(id, (received, written, held));
+                    Line::Chunks(received, written, held, unkept) => {
+                        self.chunks.insert(id, (received, written, held, unkept));
                     }
                     Line::Enlisted => {
                         self.enlisted.insert(id);

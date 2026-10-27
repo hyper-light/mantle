@@ -50,6 +50,9 @@ enum Said {
     Region(String),
     /// The root range took its enlistment.
     Enlisted,
+    /// Its chunk bytes, asked: received from peers over QUIC, put on its own volumes in-process,
+    /// held by its volumes, and of the first two kept by none.
+    Chunks(u64, u64, u64, u64),
     /// Its output ended: the process is gone.
     Ended,
 }
@@ -61,6 +64,12 @@ fn said(line: &str) -> Option<Said> {
         ["s3-bound", at, _connections] => at.parse().ok().map(Said::S3),
         ["s3", _listen, region, _ids] => Some(Said::Region((*region).to_owned())),
         ["enlisted"] => Some(Said::Enlisted),
+        ["chunks", received, written, held, unkept] => Some(Said::Chunks(
+            received.parse().ok()?,
+            written.parse().ok()?,
+            held.parse().ok()?,
+            unkept.parse().ok()?,
+        )),
         _ => None,
     }
 }
@@ -79,6 +88,7 @@ struct Node {
     s3: Option<SocketAddr>,
     region: Option<String>,
     enlisted: bool,
+    chunks: Option<(u64, u64, u64, u64)>,
 }
 
 /// A running cell of three, its processes this runner's children.
@@ -146,6 +156,7 @@ impl Cell {
                 s3: None,
                 region: None,
                 enlisted: false,
+                chunks: None,
             });
         }
         if nodes.len() != FOUNDERS {
@@ -269,6 +280,9 @@ impl Cell {
                 Said::S3(s3) => node.s3 = Some(s3),
                 Said::Region(region) => node.region = Some(region),
                 Said::Enlisted => node.enlisted = true,
+                Said::Chunks(received, written, held, unkept) => {
+                    node.chunks = Some((received, written, held, unkept));
+                }
                 Said::Ended => {
                     node.child = None;
                     node.input = None;
@@ -298,6 +312,24 @@ impl Cell {
             input.flush().map_err(io("a node's input"))?;
         }
         Ok(())
+    }
+
+    /// Node `at`'s chunk bytes, asked now on its standard input: received from peers over QUIC,
+    /// put on its own volumes in-process, held by its volumes, and of the first two kept by none.
+    pub fn chunks(&mut self, at: usize) -> Result<(u64, u64, u64, u64), CellError> {
+        let node = self
+            .nodes
+            .get_mut(at)
+            .ok_or_else(|| CellError::Init(format!("no founder {at}")))?;
+        node.chunks = None;
+        let input = node.input.as_mut().ok_or(CellError::Ended(node.id))?;
+        input.write_all(b"chunks\n").map_err(io("a node's input"))?;
+        input.flush().map_err(io("a node's input"))?;
+        self.until(at, |node| node.chunks.is_some())?;
+        self.nodes
+            .get(at)
+            .and_then(|node| node.chunks)
+            .ok_or_else(|| CellError::Init(format!("no founder {at}")))
     }
 
     /// Kills node `at`'s process, `SIGKILL` on Unix and `TerminateProcess` on Windows, and reaps

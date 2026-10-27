@@ -1335,7 +1335,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                             }),
                             ..Reply::status(Status::Offset)
                         },
-                        Err(error) => Reply::status(put_status(error)),
+                        Err(error) => {
+                            use std::io::Write as _;
+                            let _ = writeln!(std::io::stderr(), "DIAG put ended {error:?}");
+                            Reply::status(put_status(error))
+                        }
                     });
                     match over {
                         Some(reply) => Step::Over(Box::new(reply)),
@@ -2169,7 +2173,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     checksum: done.checksum.as_ref().map(shown),
                     ..Reply::status(Status::Done)
                 },
-                Err(error) => Reply::status(complete_status(error)),
+                Err(error) => {
+                    use std::io::Write as _;
+                    let _ = writeln!(std::io::stderr(), "DIAG completion ended {error:?}");
+                    Reply::status(complete_status(error))
+                }
             };
             self.reply_job(at, reply)?;
             return self.drain_job(at);
@@ -2520,7 +2528,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// Ends job `at` with `status` alone.
+    #[track_caller]
     fn fail_job(&mut self, at: usize, status: Status) -> Result<(), NodeError> {
+        use std::io::Write as _;
+        let caller = std::panic::Location::caller();
+        let _ = writeln!(std::io::stderr(), "DIAG fail_job {status:?} at {caller}");
         self.reply_job(at, Reply::status(status))
     }
 

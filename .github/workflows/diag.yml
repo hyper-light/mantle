@@ -1,0 +1,50 @@
+name: diag-native-put-failed
+# Scratch: the native suite on both Windows runners as CI runs it (its tests side by side), four
+# rounds, every job the gateway host fails said with its call site and every put or completion
+# ending in an error said with the error (CI run 40440922240: windows-x86_64's library test's first
+# PutObject answered Failed).
+on:
+  push:
+    branches: ["diag/**"]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: "1"
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows-x86_64, runner: windows-2025, target: x86_64-pc-windows-msvc }
+          - { name: windows-aarch64, runner: windows-11-arm, target: aarch64-pc-windows-msvc }
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned Rust
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup target add --toolchain 1.98.1 ${{ matrix.target }}
+      - name: Install NASM
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        uses: ilammy/setup-nasm@v1.5.2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: diag-native-${{ matrix.target }}
+          workspaces: |
+            .
+            vendor
+      - name: Build the native suite
+        shell: bash
+        run: cargo test --locked -p mantle --test native --no-run --target ${{ matrix.target }}
+      - name: The native suite, four rounds
+        shell: bash
+        run: |
+          for round in 1 2 3 4; do
+            echo "=== round $round"
+            cargo test --locked -p mantle --test native --target ${{ matrix.target }} -- --nocapture 2>&1 | grep -aE "^test .* (ok|FAILED)|test result|DIAG|panicked|PutObject|Status|mantle: " || true
+          done

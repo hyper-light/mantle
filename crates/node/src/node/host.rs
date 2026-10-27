@@ -720,7 +720,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Ok(());
         }
         let mut answered: Vec<(Option<u64>, Outcome)> = Vec::new();
+        let work = diag_work(&job.work);
         job.pending.retain(|(pending, request)| {
+            let key = diag_key(pending);
+            diag_seen(key);
             let outcome = match pending {
                 Pending::Command(ask) => {
                     take_done(&mut self.commands_done, *ask).map(Outcome::Command)
@@ -730,6 +733,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             };
             match outcome {
                 Some(outcome) => {
+                    diag_taken(key, &outcome, work);
                     answered.push((*request, outcome));
                     false
                 }
@@ -1337,7 +1341,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                             }),
                             ..Reply::status(Status::Offset)
                         },
-                        Err(error) => Reply::status(put_status(error)),
+                        Err(error) => {
+                            use std::io::Write as _;
+                            let _ = writeln!(std::io::stderr(), "DIAG put ended {error:?}");
+                            Reply::status(put_status(error))
+                        }
                     });
                     match over {
                         Some(reply) => Step::Over(Box::new(reply)),
@@ -2171,7 +2179,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     checksum: done.checksum.as_ref().map(shown),
                     ..Reply::status(Status::Done)
                 },
-                Err(error) => Reply::status(complete_status(error)),
+                Err(error) => {
+                    use std::io::Write as _;
+                    let _ = writeln!(std::io::stderr(), "DIAG completion ended {error:?}");
+                    Reply::status(complete_status(error))
+                }
             };
             self.reply_job(at, reply)?;
             return self.drain_job(at);
@@ -2522,7 +2534,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// Ends job `at` with `status` alone.
+    #[track_caller]
     fn fail_job(&mut self, at: usize, status: Status) -> Result<(), NodeError> {
+        use std::io::Write as _;
+        let caller = std::panic::Location::caller();
+        let _ = writeln!(std::io::stderr(), "DIAG fail_job {status:?} at {caller}");
         self.reply_job(at, Reply::status(status))
     }
 
@@ -3225,5 +3241,67 @@ mod tests {
                 "{algorithm:?} full {full}"
             );
         }
+    }
+}
+
+/// Diagnostic: when each pending ask was first seen waiting, by its kind and number.
+static DIAG_WAITS: std::sync::Mutex<Vec<((u8, u64), std::time::Instant)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn diag_key(pending: &Pending) -> (u8, u64) {
+    match pending {
+        Pending::Command(ask) => (0, *ask),
+        Pending::Read(ask) => (1, *ask),
+        Pending::Chunk(ask) => (2, *ask),
+    }
+}
+
+fn diag_work(work: &Work) -> &'static str {
+    match work {
+        Work::Put(_) => "put",
+        Work::Get(_) => "get",
+        Work::Command(_) => "command",
+        Work::Complete(_) => "complete",
+        Work::Read(_) => "read",
+        Work::Bucket(_) => "bucket",
+        _ => "other",
+    }
+}
+
+fn diag_seen(key: (u8, u64)) {
+    if let Ok(mut waits) = DIAG_WAITS.lock()
+        && !waits.iter().any(|(k, _)| *k == key)
+    {
+        waits.push((key, std::time::Instant::now()));
+    }
+}
+
+fn diag_taken(key: (u8, u64), outcome: &Outcome, work: &str) {
+    let Ok(mut waits) = DIAG_WAITS.lock() else {
+        return;
+    };
+    let Some(at) = waits.iter().position(|(k, _)| *k == key) else {
+        return;
+    };
+    let (_, since) = waits.swap_remove(at);
+    let ms = since.elapsed().as_millis();
+    let (kind, plain, said) = match outcome {
+        Outcome::Command(CommandOutcome::Answered(_)) => ("command", true, String::new()),
+        Outcome::Command(other) => ("command", false, format!("{other:?}")),
+        Outcome::Read(ReadOutcome::Read(_)) => ("read", true, String::new()),
+        Outcome::Read(other) => ("read", false, format!("{other:?}")),
+        Outcome::Chunk(ChunkOutcome::Stored | ChunkOutcome::Read(_)) => ("chunk", true, String::new()),
+        Outcome::Chunk(other) => ("chunk", false, format!("{other:?}")),
+    };
+    if ms >= 500 || !plain {
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        eprintln!(
+            "diag-wait wall_ms={wall} pid={} work={work} kind={kind} ask={} ms={ms} outcome={said}",
+            std::process::id(),
+            key.1,
+        );
     }
 }

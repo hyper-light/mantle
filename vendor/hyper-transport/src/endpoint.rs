@@ -4143,9 +4143,27 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 (Some(written), Some((_, mark))) if written > mark => {
                     exchange.unread_since = Some((now, written));
                 }
-                (Some(_), Some((since, _)))
+                (Some(written), Some((since, mark)))
                     if now.saturating_duration_since(since) >= exchange.carry.window(floor) =>
                 {
+                    eprintln!(
+                        "diag-stall unread wall_ms={} pid={} peer={:?} opened={} began_ms={} since_ms={} window_ms={} written={} mark={} pending={} out={:?} in={:?} peer_takes={} credit_moved={:?} floor_ms={}",
+                        diag_wall_ms(),
+                        std::process::id(),
+                        exchange.peer,
+                        exchange.opened,
+                        now.saturating_duration_since(exchange.began).as_millis(),
+                        now.saturating_duration_since(since).as_millis(),
+                        exchange.carry.window(floor).as_millis(),
+                        written,
+                        mark,
+                        exchange.out.pending(),
+                        exchange.out.state,
+                        exchange.incoming.state,
+                        peer_takes,
+                        credit_moved,
+                        floor.as_millis(),
+                    );
                     return Err(Refusal::Stalled);
                 }
                 (None, Some(_)) => {
@@ -4172,9 +4190,32 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 return Ok(());
             }
             let acknowledged = exchange.out.acked;
-            exchange
+            let carry_before = exchange.carry;
+            let judged = exchange
                 .carry
-                .judge(now, at, held, backlog, acknowledged, floor)
+                .judge(now, at, held, backlog, acknowledged, floor);
+            if judged.is_err() {
+                eprintln!(
+                    "diag-stall judge wall_ms={} pid={} peer={:?} opened={} began_ms={} answered={} starved={} carry={:?} at={:?} held={} backlog={} acknowledged={} floor_ms={} out={:?} in={:?} peer_takes={}",
+                    diag_wall_ms(),
+                    std::process::id(),
+                    exchange.peer,
+                    exchange.opened,
+                    now.saturating_duration_since(exchange.began).as_millis(),
+                    exchange.answered,
+                    exchange.starved,
+                    carry_before,
+                    at,
+                    held,
+                    backlog,
+                    acknowledged,
+                    floor.as_millis(),
+                    exchange.out.state,
+                    exchange.incoming.state,
+                    peer_takes,
+                );
+            }
+            judged
         });
         match unread_change {
             1 => conn.unread = conn.unread.saturating_add(1),
@@ -4897,4 +4938,12 @@ fn bind_stream(by_stream: &mut Vec<(StreamId, u64)>, stream: StreamId, id: u64) 
     if let Err(at) = by_stream.binary_search_by_key(&stream, |(held, _)| *held) {
         by_stream.insert(at, (stream, id));
     }
+}
+
+/// Diagnostic: the wall clock in milliseconds since the Unix epoch.
+fn diag_wall_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }

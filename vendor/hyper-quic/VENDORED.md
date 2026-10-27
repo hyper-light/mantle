@@ -1365,3 +1365,274 @@ the moment the idle connection's first window has carried no probe: 318 datagram
 during the transfer and ended at 65,527; without Q26, 14,377, its one probe starved by the pacer).
 `tests::an_mtu_probe_waits_for_the_window_on_a_slow_path` and every MTU test pass unchanged; on arm64
 Linux the peer_sockets test passed 40 runs of 40.
+
+## 38. Loss thresholds that learn a path's reordering, and a probe timeout a loss time held back (2026-10-22)
+
+Patch Q27 departs from upstream's fixed loss thresholds, RFC 9002's three packets
+(`TransportConfig::packet_threshold`) and 9/8 of the round trip (`time_threshold`), which stay the
+floor. RFC 9002 §6.1.1 names RACK's raised threshold as expected to be "at least as useful in QUIC",
+and §6.1.2 lets the time threshold adapt. `connection/reordering.rs` holds one connection's
+tolerance, learned in its Data space from spurious losses, packets declared lost that the peer
+acknowledges afterwards (`PathStats::spurious_losses`; `docs/transport.md` §4ac gives the rules and
+their sources):
+
+- the packet threshold rises to a spurious loss's distance plus one;
+- the time threshold gains a reordering window, a quarter of the least round trip for each round
+  trip with a spurious loss (RACK's `reo_wnd_mult`, the round trip in packet numbers), bounded by
+  the longer of the smoothed round trip and the longest a spurious loss took;
+- sixteen recovery periods begun with no spurious loss return both to the floor (RACK's
+  `reo_wnd_persist`);
+- a declaration is remembered for a probe timeout, no more of them than a window holds for each
+  round trip in it.
+
+The ACK frame's ranges are checked against the remembered declarations before the frame's newly
+acknowledged packets are taken, so an acknowledgement that names only packets already declared
+lost still teaches. A congestion event begins a recovery period as RFC 9002 §7.3.2 has it, a lost
+packet sent after the current period began (`Reordering::on_congestion_event`, beside the
+controller's own); an ECN mark is no loss recovery and begins none.
+
+Patch Q28 changes `on_loss_detection_timeout`. Upstream returns after a time-threshold detection,
+having armed the probe timeout if no loss time remains; a loss time holds the probe timeout back
+(RFC 9002 Appendix A.8), so the probe timeout can then be due already, and the connection asked to be
+woken at the time it was woken, its probe sent only at that second wake. With a reordering window a
+loss time ends after the newest ack-eliciting packet's probe timeout often: the congestion harness's
+`Run::fire` refused a server's wake at ±40 ms of jitter. The probe timeout now fires in the same
+wake.
+
+Measured (`congestion::print_the_reordering_table`, `docs/benchmarks.md`, "hyper-quic: a path that
+reorders"): BBR at 10 Mbit/s and 100 ms carried 69.7%, 44.1%, 21.2% and 6.0% of the link with ±5,
+±10, ±20 and ±40 ms of jitter each way, and now 97.2%, 96.7%, 98.4% and 96.2%, as the same jitter
+kept in order carries (97.1%, 94.5%, 98.1%, 97.4%). slates' bake-off against the parent: 660 of
+672 rows the same byte for byte, every path that does not reorder; its reordering ±10 ms trial
+carried 45.5–46.5% for BBR and 3.9–10.6% for the others, now 93.5–94.9% and 24.2–34.2%.
+
+Tests: `connection::reordering::tests` (a spurious loss widens the tolerance once a round trip, the
+tolerance is bounded by what the path showed, a quiet path returns to the floor with its memory
+bounded, an acknowledgement of nothing declared changes nothing);
+`congestion::a_reordering_path_is_carried_as_its_jitter_kept_in_order` (BBR at ±20 and ±40 ms keeps
+nine tenths of its in-order twin; without Q27, 21.2% and 6.0%);
+`congestion::every_wake_on_a_path_that_reorders_does_what_is_due_at_its_time` (BBR at 10 Mbit/s and
+20 ms with ±10 ms; without Q28 a node woke at 19.65 s and asked to wake then again). The unit tests,
+congestion, e2e, geo and handshake suites pass.
+
+## 39. A connection ID the peer retired routes for three probe timeouts more (2026-10-22)
+
+Patch Q29 departs from upstream's endpoint, which stopped routing a connection ID the moment the
+peer's RETIRE_CONNECTION_ID arrived. The peer sends that frame after its last packet with the ID, but
+a path that reorders delivers such packets after it: the endpoint dropped each, its data to be sent
+again, and answered it with a stateless reset. A server meets this on every connection over such a
+path: at the client's first NEW_CONNECTION_ID it moves off the client's first connection ID, which
+carries no reset token, and retires it (upstream's `on_new_connection_id`), its packets with that ID
+still in flight. In the congestion harness, jitter of ±10 to ±80 ms each way on paths of 20, 100 and
+300 ms, every law, 14 of 84 runs met a stateless reset (`Run::arrive` refuses one), on `25cf889` as
+after Q27 and Q28.
+
+A connection now keeps a retired ID routing for three probe timeouts (`CidState::retire_later`,
+`Timer::RetiredCid`): Chromium's rule (`QuicSelfIssuedConnectionIdManager::OnRetireConnectionIdFrame`,
+`3 * pto_delay`), and the span RFC 9001 §6.5 keeps old read keys for packets still in flight. RFC 9000
+§5.1.1 has an issuer accept an ID until its peer retires it and leaves what comes after to the issuer.
+The connection asks its endpoint for the replacement at once (`NeedIdentifiers`), as upstream did beside
+the unrouting; `EndpointEventInner::RetireConnectionId` now names only the ID to stop routing. No more
+are kept routing than the connection issues (`TransportParameters::issue_cids_limit`, at most
+`LOC_CID_COUNT`); past that the oldest retired stops at once, which costs only what was still on its
+way with it.
+
+A RETIRE_CONNECTION_ID repeated (its packet sent again and both arriving) retires nothing and asks for
+nothing (`CidState::on_cid_retirement` answers `None`). Upstream's endpoint had made a repeat harmless
+by finding the ID already gone and issuing none; asked for at the retirement instead, a repeat that
+came before the first replacement was counted asked for a second, past the peer's limit. Twelve e2e
+handshakes at a time against an upstream server, four rounds: 13 of 48 closed with
+CONNECTION_ID_LIMIT_ERROR without the check, every one a run that took a repeat (26 repeats); none of
+48 with it, 52 repeats taken.
+
+Tests: `connection::cid_state::tests::a_retired_id_routes_until_its_time_and_no_more_are_kept_than_the_cap`
+and `a_repeated_retirement_retires_nothing_and_asks_for_nothing`;
+`tests::a_retired_cid_routes_for_three_probe_timeouts` (a packet held behind its RETIRE_CONNECTION_ID
+reaches its connection, and the ID stops routing after; without Q29 the packet never reached it);
+`congestion::a_path_whose_jitter_passes_its_delay_keeps_what_was_sent_with_a_retired_id` (BBR at ±20 ms
+each way on 20 ms; without Q29 a stateless reset). The 84 runs: none meets a stateless reset.
+
+slates' bake-off against `cd90e5b`: 33 of its 672 rows move, on paths that do not reorder, every law's
+somewhere, the shares in both directions (BBR at 100 Mbit/s and 300 ms the most, 93.4 → 82.4% in one
+seed and 100.2 → 150.6% in another, past 100% the warm-up's, §30). With `Timer::RetiredCid` never
+armed every row is as `cd90e5b`'s: the timer's wakes, one each a retirement, shift each run's events.
+What a wake changes, traced to the event (loss 0%, 1 Mbit/s and 20 ms, seed 3, BBR): a pacer short
+of tokens sleeps until its bucket holds a whole burst (`Pacer::wait`, upstream's rule, to batch its
+wakes), but a connection woken sooner for any reason sends what the bucket holds then. At 462.755 ms
+the client's retirement timer woke it and it sent 6 datagrams that, without the timer, went with a
+seventh at the pacer's own wake, 470.027 ms. A paced sender's bursts follow its wakes: what it sends
+is the same, when the bucket lets it go is not, and each run's later events move with it. Not an
+app-limited mark (§30): with a wake's polls marking none, the same 33 rows move. The bake-off's
+summary is as `cd90e5b`'s within its third decimal (BBR's ping p99 geomean 1.498 → 1.490).
+
+## 40. The time threshold covers the longest a spurious loss took (2026-10-23)
+
+Patch Q30 narrows §38's time threshold. §38 added RACK's reordering window to RFC 9002's threshold,
+9/8 of the larger of the smoothed and latest round trips, in steps of a quarter of the least round
+trip. Where a share of the packets skips the path's delay, as netem's `reorder` sends them (the
+reordering focal's comparison runs apply), both terms rest on the packets that overtook: QUIC samples
+a round trip only from the largest packet acknowledged (RFC 9002 §5.1), and there that is the one
+that skipped, so at 10 Mbit/s and 80 ms with 5% skipping each way the least round trip read 1 ms and
+the smoothed one about 64 ms while the rest took 80 and more. Each later packet acknowledged declared
+the rest lost, and the window, a quarter of a millisecond a round trip, never caught up: BBR declared
+921 packets lost, every one spurious.
+
+The threshold is now RFC 9002's or the longest a spurious loss took, whichever is longer, with the
+reordering window on top (`Reordering::time_threshold`). A packet as late as one that was declared
+lost and arrived is not declared lost again: Chromium's adaptive time threshold raises its fraction
+of the round trip until each spurious loss would not have been declared
+(`GeneralLossAlgorithm::SpuriousLossDetected`); here the time a spurious loss took is the bound
+itself, as QUIC's round trip under reordering is the overtaking packets'. Nothing changes until a
+spurious loss: slates' bake-off against `ea7d228` changes only its reordering trial's rows.
+
+Measured (`congestion::print_the_skipping_table`, `docs/benchmarks.md`): with 5% skipping, declared
+losses BBR 921 → 21, NewReno 120 → 53, CUBIC 170 → 51, every one spurious, and the shares carried
+NewReno 12.1 → 35.6%, CUBIC 13.2 → 51.7%, Copa 11.1 → 22.2%; with 25%, CUBIC 6.0 → 96.7%. BBR stays
+near a quarter (21.8 → 24.0%): its window is twice its bandwidth times the least round trip, a
+millisecond (`docs/STATUS.md`, open defects). Over jitter that reorders, ±40 and ±60 ms each way on
+100 ms, NewReno 19.6 → 26.2% and 3.8 → 18.9%, CUBIC 30.7 → 43.8% and 7.2 → 50.5%; BBR 96.0–100.1%
+where it carried 96.2–98.4% up to ±40 ms. Two cells fell: NewReno at ±20 ms, 41.0 → 34.6%, still cut
+by each of its 16 spurious losses (§38's open item), and Copa at ±40 ms, 20.4 → 1.7%, at its
+two-datagram floor, the jitter read as queue, as its twin kept in order sits at 19.4%.
+
+Tests: `connection::reordering::tests::the_time_threshold_covers_the_longest_a_spurious_loss_took`;
+`tests::a_packet_as_late_as_a_spurious_loss_is_not_declared_lost_again` (a PING held 50 ms is
+declared lost and acknowledged after; one held 40 ms then is not declared; without Q30 it is, two
+spurious losses where one is). hyper-sim's `Path::overtaking` lets a measured path's draws overtake,
+for the table's skipping paths.
+
+## 41. A pacer credits the same bytes however often it is asked (2026-10-23)
+
+Patch Q31 departs from upstream's pacer (`connection/pacing.rs`). Asked whether a datagram may go and
+short of tokens, it refilled its bucket for the time since it last did, truncated the credit to whole
+bytes and moved its clock to the call: what a fraction of a byte took was lost at every call. A
+connection asked again and again while it waited lost up to a byte each time, a share of its rate
+that grows with how often it is asked: at 10 Mbit/s and 100 ms, its window's rule refilling 1.5625
+bytes a microsecond, asked every microsecond for a millisecond it credited 1,000 bytes where 1,562
+were bought (a rate a controller states, 1.25 a microsecond: 1,000 where 1,250). A busy endpoint asks
+its connections often, and a connection woken while it waits for the pacer asks it each time.
+
+The bucket now credits the whole bytes the time bought and moves its clock on by just the time they
+took, rounded up; what a fraction of a byte took waits for the next refill (`Pacer::refill`). A bucket
+that fills keeps nothing past its capacity, as before. A wait is the deficit's time from that clock,
+rounded up, so it is never due before a whole byte more is bought (`Pacer::wait`): the window's rule,
+five quarters of the window a smoothed round trip, and a stated rate share both, in integers, where the
+window's rule computed in floating point.
+
+slates' bake-off against Q30 (`cf9849b`): most rows move, every law's pacing credited exactly; the
+summary is as before or better for every law. Ping p99 against the best, geometric mean: NewReno 1.408
+→ 1.386, CUBIC 1.353 → 1.343, BBR 1.490 → 1.484, Copa 1.035 → 1.036; goodput shortfall NewReno 3.142 →
+3.144, CUBIC 2.780 → 2.780, BBR 1.020 → 1.019, Copa 1.284 → 1.270; Copa's worst p99 3.12 → 2.48;
+CUBIC stalled in 10 runs, where 11.
+
+Tests: `connection::pacing::tests::the_credit_is_the_same_however_often_the_pacer_is_asked` (fails on
+upstream's: 1,000 bytes for 1,562), `a_wait_is_never_due_when_asked`; every pacing test passes as it
+was.
+
+## 42. BBR draws its gain cycle's phases from the connection's seed (2026-10-23)
+
+Patch Q32. BBR drew the phase its ProbeBW cycle starts in from the operating system's generator
+(upstream's `Pcg32::from_rng(&mut rand::rng())`): BBR picks it at random so flows sharing a bottleneck
+cycle apart (the BBR draft's randomized ProbeBW phase). Window-held, BBR's cycle moved nothing (§30),
+so no run showed it; paced at its model's rate (§43), the phase moves what it sends, and a run the
+simulation seeded whole no longer replayed: the same path, 1% of its packets skipping their delay,
+carried 90.7, 90.0 and 89.3% in three runs. A path's controller now draws from the connection's seed,
+its first eight bytes with the path's count added (`Congestion::build`'s `seed`, `Bbr::seeded`), not
+from the connection's generator: a draw from it would move every draw after it. In production the
+connection's seed is the operating system's, so flows still start their cycles apart; `Bbr::new` keeps
+its random draw. The same path now carries 92.5% in every run.
+
+## 43. BBR paced at its model's rate, its least round trip from packets in order (2026-10-23)
+
+Patch Q33, in two parts measured together: each alone was worse than neither.
+
+**BBR states its pacing rate** (`Bbr::pacing_rate`, Chromium's `BbrSender::PacingRate`: the gain of
+its phase times its bandwidth, or, before it has one, the startup gain times the initial window a
+least round trip). The port computed the rate and never gave it to the pacer, which sent five
+quarters of the window a round trip (§30's open item): Drain's gain and ProbeBW's cycle moved
+nothing, and BBR, held by its window of twice its product, kept about a product queued. At a
+drop-tail queue of one product, 10 Mbit/s and 100 ms, it lost 4,978 of 25,476 packets where NewReno
+lost 215, and 2,634 once §41 credited its pacer exactly. Paced, a bulk sender's longest round trip is 1.30 the path's at 1 ms each way where
+window-held it is 2.98 (`a_paced_bulk_sender_keeps_about_its_bandwidth_delay_product_in_flight`, from
+the attempt of 2026-10-15 that did not land for its warm-ups: here the warm-up tests pass 200 runs
+of 200 each, the warm-up's rules changed since).
+
+**A packet acknowledged while one sent before it is not gives BBR no round trip**
+(`RateSample::rtt` zero, its delivery rate standing). On a path that reorders that packet is one that
+overtook the rest, its round trip the fastest route's: with 5% of the packets skipping the delay, as
+netem's `reorder` sends them, BBR's least round trip was a millisecond where the rest took 80, and
+paced it carried 14.6% of the link (window-held, 27.0%). TCP samples the segment that fills a gap,
+the late one, for the same reason (RFC 7323 §4.3). On a path that does not reorder, the packet before
+is lost, and BBR's ten-second filter has the samples around it; the connection's own round trip, RFC
+9002's, is sampled as before, so no other law sees a change. Gated on the tolerance of reordering
+(§38) it was weaker: where reordering comes seldom, as with 1% skipping, the tolerance returns to the
+RFC's between events and the next overtaking sample set the least round trip again (43.8% in a run
+before BBR's draws were seeded, against 92.5%).
+
+Measured, BBR (`congestion::print_the_reordering_table`, `print_the_skipping_table`; `docs/benchmarks.md`):
+
+| Path | before (§41) | paced | paced, round trips in order |
+|---|---|---|---|
+| 10 Mbit/s, 100 ms, no jitter | 96.6% (2,634 lost) | 96.8% (195) | 96.8% (195) |
+| ±20 ms each way | 98.5% (916) | 93.4% (55) | 97.1% (341) |
+| ±40 ms each way | 96.0% (37) | 75.8% (43) | 96.2% (2,619) |
+| ±60 ms each way | 11.2% | 10.3% | 95.0% |
+| 80 ms, 1% skipping | 64.7% | 14.1% | 92.5% |
+| 80 ms, 5% skipping | 27.0% | 14.6% | 96.3% |
+| 80 ms, 25% skipping | 28.8% | 25.6% | 97.3% |
+
+slates' bake-off against §41, every BBR row moved and no other law's: BBR's ping p99 against the best,
+geometric mean, 1.484 → 1.125, its worst 4.00 → 1.81; its goodput shortfall 1.019 → 1.013; Jain's
+index at 20 and 100 ms 0.533 → 0.829, still under slates' floor of 0.9.
+
+Open: at ±40 ms BBR declares 2,619 packets lost where, its least round trip the fast tail's, it
+declared 37. Its least round trip is now near the path's propagation, and BBR v1's window of twice
+its product overflows a queue of one product when jitter bunches its acknowledgements; BBRv2's bound
+on what is in flight after loss (`inflight_hi`, draft-ietf-ccwg-bbr) is the answer.
+
+Tests: `congestion::bbr_at_a_queue_of_one_product_loses_no_more_than_newreno` (195 against 215; 2,634
+before), `congestion::a_path_where_packets_skip_its_delay_is_carried_by_bbr_as_its_delays_kept_in_order`
+(1% and 5% keep nine tenths of the same delays kept in order; 14.1% and 14.6% paced without the
+filter), `congestion::bbr::tests::a_paced_bulk_sender_keeps_about_its_bandwidth_delay_product_in_flight`.
+
+## 44. BBR reports the rate it paces at (2026-10-23)
+
+`congestion/bbr/mod.rs`: `Controller::metrics` gave the model's pacing rate as it stood, zero until
+its model had a bandwidth, where `Controller::pacing_rate`, what the connection paces by (§43), is
+the start-up's until then (its gain times its first window a round trip) and nothing before a round
+trip. The connection's statistics, and hyper-transport's `PathFacts::pacing_rate` through them, said
+a BBR connection paced at zero bits a second while it paced at its start-up's rate. `metrics` now
+gives `pacing_rate`'s. Test: `congestion::bbr::tests::the_rate_reported_is_the_rate_paced_at` (before:
+`(None, Some(0))` where `(None, None)`).
+
+## 45. A client told when its path is degrading (2026-10-25, found by focal)
+
+`connection/mod.rs`, `connection/timer.rs`, `connection/packet_builder.rs`: quinn-proto tells its
+application nothing between a peer that answers and a connection that idles out, so a client whose
+server went without a word (a killed process, a host down, a path cut) learned it only at the idle
+timeout: two minutes at focal's bus, whose client kept sending into a leader killed with kill -9
+while the group had elected another. Chromium's QUIC tells its session (quiche,
+`QuicNetworkBlackholeDetector`): a client's path is degrading once nothing it sent has been
+acknowledged for four probe timeouts (`kNumProbeTimeoutsForPathDegradingDelay`, "kPDE4 is the
+default. We have the experiments with kPDE4."; `GetPathDegradingDelay()`,
+`num_ptos_for_path_degrading_ * GetPtoDelay()`), and the session may move to another path
+(`OnPathDegrading`); it is told when the path makes progress again
+(`OnForwardProgressMadeAfterPathDegrading`), and the connection is not closed. TCP has the same
+step: past R1, at least three retransmissions, "TCP SHOULD inform the application of the delivery
+problem ... when R1 is reached and before R2", the close (RFC 1122 §4.2.3.5).
+
+The connection now runs quiche's detection on a client once its handshake is confirmed (its
+Handshake keys discarded on HANDSHAKE_DONE): `Timer::PathDegrading` is armed when an ack-eliciting
+packet is sent and the timer is not running, at four times the application space's probe timeout at
+its current backoff; any packet newly acknowledged restarts it while ack-eliciting packets are in
+flight, and quiescence stops it, where an acknowledgement leaves none in flight and where packets
+declared lost by time leave none (`set_loss_detection_timer`, quiche's `StopDetection`). On expiry
+the application is told `Event::PathDegrading` and no detection runs until the peer acknowledges a
+packet, which tells `Event::ForwardProgress`. `PathStats::path_degradings` counts them. A server is
+never told, as quiche's is not: it cannot go elsewhere. Tests (`tests/path_degrading.rs`): told
+exactly four probe timeouts after the first packet nothing acknowledged, once however long the
+silence, progress once the server answers and the data delivered, and again on a second silence;
+never over a 100 ms round trip with a server that answers; never on the server; and nothing told
+after a packet lost by time left nothing in flight (without the quiescence stop it told one four
+probe timeouts after the lost packet's send, `(1, 0)`, found by
+`a_retired_cid_routes_for_three_probe_timeouts`, whose drive the running timer kept from idling).

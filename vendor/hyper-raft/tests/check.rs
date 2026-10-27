@@ -408,6 +408,33 @@ fn a_vote_sent_before_it_is_durable_is_caught() {
     );
 }
 
+/// A commit on the leader's own durable log alone, before a quorum's logs hold the entry
+/// (`Mutant::OwnLogCommit`): a persisted acknowledgement before a quorum's flush, the defect Quiver's
+/// simulation plants (CP-T2.2 step 6). The oracles catch it here too.
+#[test]
+fn a_commit_on_the_leaders_own_log_alone_is_caught() {
+    let mix = Mix {
+        leader_leaves: true,
+        bursts: true,
+        windows: true,
+        lag: 35,
+        ..Mix::everything()
+    };
+    let settings = judged_settings(Settings {
+        depth: 2,
+        in_place: true,
+        ..Settings::focal()
+    });
+    let make = |seed| {
+        let mut group: Cluster<Lagged> = Cluster::new(5, &[1, 2, 3], settings, seed);
+        group.stop_who_left = true;
+        group
+    };
+    let (seed, violation) = caught(make, 0, 24, 2_000, &mix, Mutant::OwnLogCommit)
+        .expect("no schedule caught a commit on the leader's own log alone");
+    println!("own log commit: seed {seed}: {violation}");
+}
+
 /// The fast track without its first rule (`docs/raft.md` §3): a member holding the entry beside its
 /// log counted before its log holds an entry of the leader's term. Its original seed, 9843, no
 /// longer reaches the defect on today's core (the reads' rounds and R17 moved its schedule); a

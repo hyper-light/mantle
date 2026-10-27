@@ -315,3 +315,205 @@ fn a_file_on_a_real_disk_is_renamed_into_place_and_reads_back() {
     assert_eq!(out, plain);
     assert!(!temporary.exists());
 }
+
+/// What a reader opened and what a writer sealed are held in the clear in their buffer while they
+/// work; the buffer is wiped when let go, so neither leaves a file's plaintext in memory it gives
+/// back. Do: open a file whose plaintext repeats a marker, and fill a writer's segment with it
+/// unsealed; take each one's buffer and wipe it as its drop does. Expect: the marker is in each
+/// buffer before, and every byte each can hold is zero after.
+#[test]
+fn a_readers_and_a_writers_buffers_are_wiped_when_let_go() {
+    let key = parent();
+    let marker = *b"plaintext a sealed file holds..";
+    let plain: Vec<u8> = marker.iter().copied().cycle().take(3 * SU).collect();
+    let bytes = sealed(&key, &plain, 512);
+    let holds_marker = |buf: &mut Wiped| {
+        buf.as_mut_capacity()
+            .windows(marker.len())
+            .any(|w| w == marker)
+    };
+
+    let mut reader = SealedReader::open(file_of(&bytes, 512), &key, S).unwrap();
+    let mut out = vec![0; plain.len()];
+    reader.read_at(&mut out, 0).unwrap();
+    assert_eq!(out, plain);
+    let SealedReader { buf, .. } = reader;
+    let mut buf = buf.unwrap();
+    assert!(
+        holds_marker(&mut buf),
+        "the reader's buffer held what it opened"
+    );
+    buf.wipe();
+    assert!(buf.as_mut_capacity().iter().all(|byte| *byte == 0));
+
+    let mut writer = SealedWriter::new(sim(512), &key, S).unwrap();
+    writer.write(&plain[..SU / 2]).unwrap();
+    let SealedWriter { mut buf, .. } = writer;
+    assert!(
+        holds_marker(&mut buf),
+        "the writer's buffer held what it had not sealed yet"
+    );
+    buf.wipe();
+    assert!(buf.as_mut_capacity().iter().all(|byte| *byte == 0));
+}
+
+/// A file sealed by its content is the same bytes for the same plaintext under one parent, opens as
+/// any sealed file does, and differs for another plaintext or another parent; the parent it was not
+/// sealed under opens nothing.
+#[test]
+fn a_file_sealed_by_its_content_is_one_file_a_plaintext_and_opens_as_any() {
+    let parent = WrappingKey::generate(0).unwrap();
+    let other = WrappingKey::generate(0).unwrap();
+    for len in [0, 1, SU - 1, SU, SU + 1, 3 * SU + 5] {
+        let plain = plaintext(len);
+        let once = seal_content(sim(512), &parent, &plain, S)
+            .unwrap()
+            .durable_image()
+            .unwrap();
+        let again = seal_content(sim(512), &parent, &plain, S)
+            .unwrap()
+            .durable_image()
+            .unwrap();
+        assert_eq!(once, again, "{len} bytes sealed twice");
+        assert_eq!(open(&once, &parent, 512).unwrap(), plain, "{len}");
+        assert!(
+            open(&once, &other, 512).is_err(),
+            "{len}: another parent opened it"
+        );
+        let elsewhere = seal_content(sim(512), &other, &plain, S)
+            .unwrap()
+            .durable_image()
+            .unwrap();
+        assert_ne!(once, elsewhere, "{len}: two parents, one file");
+        let mut changed = plain.clone();
+        changed.push(1);
+        let different = seal_content(sim(512), &parent, &changed, S)
+            .unwrap()
+            .durable_image()
+            .unwrap();
+        assert_ne!(
+            stream_of(&once)[..HEADER],
+            stream_of(&different)[..HEADER],
+            "{len}"
+        );
+    }
+}
+
+/// A file sealed by its content refuses a flipped byte as any sealed file does, and is written only
+/// into an empty file.
+#[test]
+fn a_file_sealed_by_its_content_refuses_a_change_and_a_used_file() {
+    let parent = WrappingKey::generate(0).unwrap();
+    let plain = plaintext(2 * SU + 3);
+    let image = seal_content(sim(512), &parent, &plain, S)
+        .unwrap()
+        .durable_image()
+        .unwrap();
+    for at in [0, HEADER, seg(1) + 5, image.len() - 9] {
+        let mut flipped = image.clone();
+        flipped[at] ^= 1;
+        assert!(open(&flipped, &parent, 512).is_err(), "flipped at {at}");
+    }
+    let used = file_of(&image, 512);
+    assert!(matches!(
+        seal_content(used, &parent, &plain, S),
+        Err(SealedFileError::Bound(_))
+    ));
+}
+
+/// The 256-bit hash `algorithm` gives of `plain`.
+fn hash_of(algorithm: &'static aws_lc_rs::digest::Algorithm, plain: &[u8]) -> [u8; 32] {
+    aws_lc_rs::digest::digest(algorithm, plain)
+        .as_ref()
+        .try_into()
+        .unwrap()
+}
+
+/// A writer keyed by a hash its caller gives seals as `seal_content` does by that hash: given the
+/// SHA-256 of the plaintext it writes the very file `seal_content` writes, written in uneven pieces
+/// or whole; the same hash twice is one file; another 256-bit hash of the same plaintext (a
+/// store's own, as focal's BLAKE3) is another file, which opens to the same plaintext. A used file
+/// is refused as by every writer.
+#[test]
+fn a_writer_keyed_by_a_given_hash_seals_as_seal_content_does_by_that_hash() {
+    let parent = WrappingKey::generate(0).unwrap();
+    for len in [0, 1, SU - 1, SU, SU + 1, 3 * SU + 5] {
+        let plain = plaintext(len);
+        let keyed = |content: &[u8; 32]| {
+            let mut writer = SealedWriter::content_keyed(sim(512), &parent, content, S).unwrap();
+            for piece in plain.chunks(97) {
+                writer.write(piece).unwrap();
+            }
+            writer.finish().unwrap().durable_image().unwrap()
+        };
+        let by_content = seal_content(sim(512), &parent, &plain, S)
+            .unwrap()
+            .durable_image()
+            .unwrap();
+        let sha = hash_of(&aws_lc_rs::digest::SHA256, &plain);
+        assert_eq!(keyed(&sha), by_content, "{len}: seal_content's file");
+        let other = hash_of(&aws_lc_rs::digest::SHA512_256, &plain);
+        let by_other = keyed(&other);
+        assert_eq!(keyed(&other), by_other, "{len}: one hash, one file");
+        assert_ne!(by_other, by_content, "{len}: two hashes, one file");
+        assert_eq!(open(&by_other, &parent, 512).unwrap(), plain, "{len}");
+    }
+    let used = file_of(&plaintext(512), 512);
+    assert!(matches!(
+        SealedWriter::content_keyed(used, &parent, &[0; 32], S),
+        Err(SealedFileError::Bound(_))
+    ));
+}
+
+/// A file finished unflushed is whole to read and has nothing of it flushed: once its caller
+/// flushes it, it is byte for byte the file `finish` leaves.
+#[test]
+fn a_file_finished_unflushed_is_whole_and_left_for_its_caller_to_flush() {
+    let parent = WrappingKey::generate(0).unwrap();
+    for len in [0, 1, SU, 3 * SU + 5] {
+        let plain = plaintext(len);
+        let sha = hash_of(&aws_lc_rs::digest::SHA256, &plain);
+        let writer = || {
+            let mut writer = SealedWriter::content_keyed(sim(512), &parent, &sha, S).unwrap();
+            writer.write(&plain).unwrap();
+            writer
+        };
+        let flushed = writer().finish().unwrap().durable_image().unwrap();
+        let file = writer().finish_unflushed().unwrap();
+        assert!(
+            file.durable_image().unwrap().is_empty(),
+            "{len}: finish_unflushed flushed"
+        );
+        let mut reader = SealedReader::open(file, &parent, S).unwrap();
+        let mut out = vec![0; len];
+        reader.read_at(&mut out, 0).unwrap();
+        assert_eq!(out, plain, "{len}: read before its flush");
+        let file = reader.into_inner();
+        file.sync_data().unwrap();
+        assert_eq!(file.durable_image().unwrap(), flushed, "{len}");
+    }
+}
+
+/// A reader makes its segment buffer when it first reads a segment: an open checks the header, the
+/// footer and the padding through a probe of public bytes, so a caller that asks only the file's
+/// length, or whether it opens, makes no buffer of a segment and wipes none. Do: open sealed files
+/// of no bytes, one segment and three, ask their length, then read each whole. Expect: no buffer
+/// after the open or the length; one after the read, and the plaintext read back.
+#[test]
+fn a_reader_makes_its_segment_buffer_at_its_first_read() {
+    let key = parent();
+    for len in [0, SU, 3 * SU + 5] {
+        let plain = plaintext(len);
+        let bytes = sealed(&key, &plain, 512);
+        let mut reader = SealedReader::open(file_of(&bytes, 512), &key, S).unwrap();
+        assert_eq!(reader.len(), len as u64);
+        assert!(
+            reader.buf.is_none(),
+            "{len}: an open makes no segment buffer"
+        );
+        let mut out = vec![0; len];
+        reader.read_at(&mut out, 0).unwrap();
+        assert_eq!(out, plain);
+        assert_eq!(reader.buf.is_some(), len > 0, "{len}: a read makes it");
+    }
+}

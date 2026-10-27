@@ -20,6 +20,16 @@ hyper-datagram = { path = "../hyper-datagram" }
 
 [dev-dependencies]
 hyper-measure = { path = "../hyper-measure" }
+# aws-lc's own allocations counted in connection_footprint (CRYPTO_set_mem_functions): the library
+# aws-lc-rs links, at its version.
+aws-lc-sys = "0.45"
+# connection_heap: what a connection costs under mimalloc, focal's allocator (the version focal
+# pins), read from a heap of its own (`mi_heap_new`, `mi_heap_visit_blocks`: the extended API).
+mimalloc = { version = "=0.1.52", default-features = false, features = ["v2"] }
+libmimalloc-sys = { version = "=0.1.49", default-features = false, features = ["v2", "extended"] }
+# ... and the endpoint observed as a node observes it: hyper-heap's account of the heap its work runs on.
+# Not vendored here; hyper-raft's CI runs the tests that take it.
+# hyper-heap = { path = "../hyper-heap" }
 # The transport tests' common helpers take their Instant epoch from simulated time (docs/sim.md §3.2).
 hyper-sim = { path = "../hyper-sim" }
 # Certificates for the tests' mutual TLS (hyper-transport's own dev-dependency).

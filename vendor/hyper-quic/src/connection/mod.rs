@@ -51,6 +51,9 @@ use copies::copy_spacing;
 mod losses;
 pub(crate) use losses::{Ledger, LossFit, LossMemory};
 
+mod reordering;
+use reordering::Reordering;
+
 mod datagrams;
 use datagrams::DatagramState;
 
@@ -207,6 +210,10 @@ pub struct Connection {
     /// What the path's losses say of their bursts: the endpoint's memory of the remote when the
     /// connection began, and what the connection counted since (`losses.rs`)
     ledger: Ledger,
+    /// The loss thresholds widened by the spurious losses the path has shown (`reordering.rs`)
+    reordering: Reordering,
+    /// What a path's congestion controller draws at random is drawn from, with the path's count
+    congestion_seed: u64,
     /// Whether the spin bit is in use for this connection
     spin_enabled: bool,
     /// Outgoing spin bit state
@@ -259,6 +266,9 @@ pub struct Connection {
     //
     /// The number of times a PTO has been sent without receiving an ack.
     pto_count: u32,
+    /// Whether the application was told the path is degrading (`Event::PathDegrading`) and the
+    /// peer has acknowledged nothing since: no detection runs until it does
+    path_degrading: bool,
     /// Whether the congestion window was just reduced by a loss, so that one packet may go past
     /// it (RFC 9002 §7.3.2): the retransmission of what was lost, sent without waiting for the
     /// in-flight bytes to drain below the reduced window
@@ -337,6 +347,13 @@ impl Connection {
             client_hello: None,
         });
         let mut rng = StdRng::from_seed(rng_seed);
+        // The controllers' draws come from the connection's seed, not from its generator, whose
+        // draws would all move
+        let mut seed = [0u8; 8];
+        for (byte, from) in seed.iter_mut().zip(rng_seed.iter()) {
+            *byte = *from;
+        }
+        let congestion_seed = u64::from_le_bytes(seed);
         let mut this = Self {
             grease_quic_bit,
             qlog,
@@ -351,7 +368,8 @@ impl Connection {
                 now,
                 if pref_addr_cid.is_some() { 2 } else { 1 },
             ),
-            path: PathData::new(remote, allow_mtud, None, 0, now, &config),
+            path: PathData::new(remote, allow_mtud, None, 0, now, &config, congestion_seed),
+            congestion_seed,
             path_counter: 0,
             allow_mtud,
             local_ip,
@@ -379,6 +397,7 @@ impl Connection {
             resume,
             received_eliciting: None,
             ledger: Ledger::new(losses),
+            reordering: Reordering::default(),
             spin_enabled: config.allow_spin && rng.random_ratio(7, 8),
             spin: false,
             spaces: Spaces::new(initial_space, PacketSpace::new(now), PacketSpace::new(now)),
@@ -411,6 +430,7 @@ impl Connection {
             next_bundled_ack_time: None,
 
             pto_count: 0,
+            path_degrading: false,
             recovery_packet: false,
 
             app_limited: false,
@@ -1845,6 +1865,8 @@ impl Connection {
                         .push_back(EndpointEventInner::NeedIdentifiers(now, num_new_cid));
                 }
             }
+            Timer::RetiredCid => self.on_retired_cid_timeout(now),
+            Timer::PathDegrading => self.on_path_degrading_timeout(),
             Timer::MaxAckDelay => {
                 trace!("max ack delay reached");
                 // This timer is only armed in the Data space
@@ -2069,7 +2091,11 @@ impl Connection {
     /// faster or reduce loss to settle on optimal values by restarting from the initial
     /// configuration in the [`TransportConfig`].
     pub fn path_changed(&mut self, now: Instant) {
-        self.path.reset(now, &self.config);
+        self.path.reset(
+            now,
+            &self.config,
+            self.congestion_seed.wrapping_add(self.path_counter),
+        );
         self.datagrams().drop_oversized();
     }
 
@@ -2136,11 +2162,25 @@ impl Connection {
 
         // Avoid DoS from unreasonably huge ack ranges by filtering out just the new acks.
         let mut newly_acked = ArrayRangeSet::new();
+        let next_packet = self.spaces.get(space).next_packet_number;
         for range in ack.iter() {
             self.packet_number_filter.check_ack(space, range.clone())?;
             // A packet declared lost that the peer acknowledges was reordered, not lost
             self.ledger
                 .acknowledged(space, *range.start(), *range.end());
+            // ... and widens the tolerance of reordering before this acknowledgement's losses
+            // are looked for
+            if space == SpaceId::Data && self.reordering.remembers_declared_losses() {
+                let spurious = self.reordering.on_acknowledged(
+                    (*range.start(), *range.end()),
+                    now,
+                    ack.largest,
+                    next_packet,
+                    self.config.packet_threshold,
+                );
+                self.stats.path.spurious_losses =
+                    self.stats.path.spurious_losses.saturating_add(spurious);
+            }
             for (&pn, _) in self.spaces.get(space).sent_packets.range(range) {
                 newly_acked.insert_one(pn);
             }
@@ -2158,9 +2198,7 @@ impl Connection {
         // order: the RTT, then the congestion event)
         let sample =
             (new_largest && ack_eliciting_acked).then(|| self.update_rtt(now, space, ack.delay));
-        if let Some(delivered) = self.path.delivery.sample(now, self.path.rtt.min()) {
-            self.path.congestion.on_delivered(now, &delivered);
-        }
+        self.deliver_sample(now, space, ack.largest);
         self.path.congestion.on_end_acks(
             now,
             self.path.in_flight.bytes,
@@ -2208,6 +2246,7 @@ impl Connection {
         if self.peer_completed_address_validation() {
             self.pto_count = 0;
         }
+        self.on_forward_progress(now);
 
         // Explicit congestion notification
         if self.path.sending_ecn {
@@ -2313,6 +2352,34 @@ impl Connection {
         } else {
             rtt
         }
+    }
+
+    /// Hands the acknowledgement's delivery-rate sample, if it gives one, to the controller,
+    /// `largest` the packet it acknowledged last
+    fn deliver_sample(&mut self, now: Instant, space: SpaceId, largest: u64) {
+        let Some(mut delivered) = self.path.delivery.sample(now, self.path.rtt.min()) else {
+            return;
+        };
+        // A packet acknowledged while one sent before it is not gives the controller no round
+        // trip, its delivery rate standing: on a path that reorders it is one that overtook
+        // the rest, its round trip the fastest route's, and BBR's least round trip taken from
+        // it, a millisecond where the rest took 80 with netem's reorder skipping 5% of the
+        // packets, held its window to a fraction of what the path holds. TCP samples the
+        // segment that fills a gap, the late one, for the same reason (RFC 7323 §4.3). On a
+        // path that does not reorder, the packet sent before is lost, and the controller's
+        // filter has the samples before and after it.
+        let overtook = space == SpaceId::Data
+            && self
+                .spaces
+                .get(space)
+                .sent_packets
+                .range(..largest)
+                .next()
+                .is_some();
+        if overtook {
+            delivered.rtt = Duration::ZERO;
+        }
+        self.path.congestion.on_delivered(now, &delivered);
     }
 
     /// Checks the ECN counts an ACK carries
@@ -2453,12 +2520,30 @@ impl Connection {
         (self.pto_count, self.path.in_flight.ack_eliciting)
     }
 
+    /// The application space's probe timeout before backoff: what a test of the path-degrading
+    /// delay measures against.
+    #[cfg(test)]
+    pub(crate) fn data_pto(&self) -> Duration {
+        self.pto(SpaceId::Data)
+    }
+
     fn on_loss_detection_timeout(&mut self, now: Instant) {
         if let Some((_, pn_space)) = self.loss_time_and_space() {
             // Time threshold loss Detection
             self.detect_lost_packets(now, pn_space, false);
             self.set_loss_detection_timer(now);
-            return;
+            // A loss time holds the probe timeout back (RFC 9002 §6.2.1 arms it only once no loss
+            // time is), so the probe timeout armed now may be due already: a loss time later than
+            // it, as the reordering window makes one, ends after it. It fires in this wake, or the
+            // connection would ask to be woken again at the time it was woken.
+            let probe_due = self.loss_time_and_space().is_none()
+                && self
+                    .timers
+                    .get(Timer::LossDetection)
+                    .is_some_and(|due| due <= now);
+            if !probe_due {
+                return;
+            }
         }
 
         let (_, space) = match self.pto_time_and_space(now) {
@@ -2555,12 +2640,38 @@ impl Connection {
             return;
         };
         let rtt = self.path.rtt.conservative();
-        let loss_delay = cmp::max(
-            float::scale_duration(rtt, self.config.time_threshold),
-            TIMER_GRANULARITY,
+        // RFC 9002's time threshold, or the longest a spurious loss took, and the reordering window
+        // spurious losses have added to it (`reordering.rs`)
+        let loss_delay = self.reordering.time_threshold(
+            cmp::max(
+                float::scale_duration(rtt, self.config.time_threshold),
+                TIMER_GRANULARITY,
+            ),
+            self.path.rtt.min(),
+            self.path.rtt.get(),
         );
         let lost =
             self.find_lost_packets(now, pn_space, largest_acked_packet, loss_delay, due_to_ack);
+        if pn_space == SpaceId::Data && !lost.packets.is_empty() {
+            // A declared loss is remembered for a probe timeout, and no more of them than the
+            // packets a window holds for each round trip it spans: no more are sent within it
+            let memory = self.pto(SpaceId::Data);
+            let round_trips = memory
+                .as_nanos()
+                .div_ceil(self.path.rtt.get().as_nanos().max(1));
+            let cap = u128::from(self.window_packets()).saturating_mul(round_trips);
+            // Each is still held: they are taken once their losses are handled, below
+            let sent = &self.spaces.get(SpaceId::Data).sent_packets;
+            self.reordering.on_declared_lost(
+                lost.packets
+                    .iter()
+                    .filter_map(|&packet| sent.get(&packet).map(|info| (packet, info.time_sent))),
+                largest_acked_packet,
+                now,
+                memory,
+                usize::try_from(cap).unwrap_or(usize::MAX),
+            );
+        }
 
         if let Some(largest_lost_sent) = lost.largest_sent {
             self.on_packets_lost(now, pn_space, loss_delay, largest_lost_sent, &lost);
@@ -2597,8 +2708,10 @@ impl Connection {
             persistent_congestion: false,
         };
         let in_flight_mtu_probe = self.path.mtud.in_flight_mtu_probe();
-        // Packet numbers are below 2^62
-        let packet_threshold = u64::from(self.config.packet_threshold);
+        // Packet numbers are below 2^62; RFC 9002's threshold, raised by spurious losses
+        let packet_threshold = self
+            .reordering
+            .packet_threshold(self.config.packet_threshold);
 
         // InPersistentCongestion: Determine if all packets in the time period before the newest
         // lost packet, including the edges, are marked lost. PTO computation must always
@@ -2730,10 +2843,22 @@ impl Connection {
                 lost.bytes,
             );
             self.resume.on_congestion(&mut *self.path.congestion);
+            self.reordering.on_congestion_event(largest_lost_sent, now);
             // Entering recovery reduces the window; a loss within a recovery period does not
             // (RFC 9002 §7.3.2), and gets no extra packet
             self.recovery_packet |= self.path.congestion.window() < window;
         }
+    }
+
+    /// The packets a congestion window holds, one at least: what a round trip sends
+    fn window_packets(&self) -> u64 {
+        let mtu = u64::from(self.path.current_mtu());
+        self.path
+            .congestion
+            .window()
+            .checked_div(mtu)
+            .unwrap_or(0)
+            .max(1)
     }
 
     fn loss_time_and_space(&self) -> Option<(Instant, SpaceId)> {
@@ -2838,6 +2963,12 @@ impl Connection {
             // reordered packet being handled by state-insensitive code.
             return;
         }
+        // Quiescence stops the path-degrading detection (quiche's `StopDetection` where nothing is
+        // in flight): what was declared lost by time, after later packets were acknowledged, is
+        // not waited for
+        if self.path.in_flight.ack_eliciting == 0 {
+            self.timers.stop(Timer::PathDegrading);
+        }
 
         if let Some((loss_time, _)) = self.loss_time_and_space() {
             // Time threshold loss detection.
@@ -2875,6 +3006,72 @@ impl Connection {
         };
         // A delay: saturating can only lengthen it
         self.path.rtt.pto_base().saturating_add(max_ack_delay)
+    }
+
+    /// Whether the path-degrading detection may run (quiche's `ShouldDetectPathDegrading`): on a
+    /// client, the side that can go elsewhere, once its handshake is confirmed (its Handshake keys
+    /// discarded on HANDSHAKE_DONE, RFC 9001 §4.1.2 and §4.9.2), while no degrading path told waits
+    /// for the peer's next acknowledgement
+    fn detects_path_degrading(&self) -> bool {
+        self.side.is_client()
+            && !self.state.is_closed()
+            && !self.path_degrading
+            && self.spaces.get(SpaceId::Handshake).crypto.is_none()
+            && self.spaces.get(SpaceId::Data).crypto.is_some()
+    }
+
+    /// Places the path-degrading deadline [`PATH_DEGRADING_PROBE_TIMEOUTS`] probe timeouts from
+    /// `now`, each the application space's at its current backoff (quiche's
+    /// `GetPathDegradingDelay`, `num_ptos_for_path_degrading_ * GetPtoDelay()`), where the
+    /// detection may run; otherwise none
+    fn arm_path_degrading(&mut self, now: Instant) {
+        let backoff = 2u32.saturating_pow(self.pto_count.min(MAX_BACKOFF_EXPONENT));
+        // A delay: saturating can only lengthen it; a deadline past the clock's range is never
+        // reached, so it is no deadline
+        let deadline = self.detects_path_degrading().then(|| {
+            now.checked_add(
+                self.pto(SpaceId::Data)
+                    .saturating_mul(backoff)
+                    .saturating_mul(PATH_DEGRADING_PROBE_TIMEOUTS),
+            )
+        });
+        match deadline.flatten() {
+            Some(deadline) => self.timers.set(Timer::PathDegrading, deadline),
+            None => self.timers.stop(Timer::PathDegrading),
+        }
+    }
+
+    /// An ack-eliciting packet was sent at `now`: the detection starts unless it runs already,
+    /// for then nothing has been acknowledged since it began (quiche's `OnPacketSent`)
+    pub(super) fn on_ack_eliciting_sent(&mut self, now: Instant) {
+        if self.timers.get(Timer::PathDegrading).is_none() {
+            self.arm_path_degrading(now);
+        }
+    }
+
+    /// The peer acknowledged packets not acknowledged before (quiche's `OnForwardProgressMade`):
+    /// a degrading path told is told progressing, and the detection starts again from `now` while
+    /// ack-eliciting packets are in flight, or stops in quiescence
+    fn on_forward_progress(&mut self, now: Instant) {
+        if self.path_degrading {
+            self.path_degrading = false;
+            self.events.push_back(Event::ForwardProgress);
+        }
+        if self.path.in_flight.ack_eliciting > 0 {
+            self.arm_path_degrading(now);
+        } else {
+            self.timers.stop(Timer::PathDegrading);
+        }
+    }
+
+    /// The path-degrading deadline passed with nothing acknowledged since the detection began
+    /// (quiche's `OnPathDegradingDetected`): the application is told, the connection stays open
+    fn on_path_degrading_timeout(&mut self) {
+        if self.detects_path_degrading() {
+            self.path_degrading = true;
+            self.stats.path.path_degradings = self.stats.path.path_degradings.saturating_add(1);
+            self.events.push_back(Event::PathDegrading);
+        }
     }
 
     fn on_packet_authenticated(
@@ -4205,16 +4402,54 @@ impl Connection {
         now: Instant,
         sequence: u64,
     ) -> Result<(), TransportError> {
-        let allow_more_cids = self
-            .local_cid_state
-            .on_cid_retirement(sequence, self.peer_params.issue_cids_limit())?;
-        self.endpoint_events
-            .push_back(EndpointEventInner::RetireConnectionId(
-                now,
-                sequence,
-                allow_more_cids,
-            ));
+        let limit = self.peer_params.issue_cids_limit();
+        // A frame repeated retires nothing and asks for nothing: a second new CID for one retired
+        // would pass the peer's limit (upstream's endpoint found the ID gone and issued none)
+        let Some(allow_more_cids) = self.local_cid_state.on_cid_retirement(sequence, limit)? else {
+            return Ok(());
+        };
+        if allow_more_cids {
+            self.endpoint_events
+                .push_back(EndpointEventInner::NeedIdentifiers(now, 1));
+        }
+        // The retired ID routes to the connection for three probe timeouts more: what the peer
+        // sent with it before its RETIRE_CONNECTION_ID may arrive after it on a path that reorders,
+        // and unrouted it was dropped and answered with a stateless reset. Chromium keeps a retired
+        // ID so (`QuicSelfIssuedConnectionIdManager`, `3 * pto_delay`), as RFC 9001 §6.5 keeps old
+        // read keys for packets still in flight. No more are kept than the connection issues; the
+        // oldest stops routing past that.
+        match now.checked_add(self.pto(SpaceId::Data).saturating_mul(3)) {
+            Some(until) => {
+                let cap = usize::try_from(limit).unwrap_or(usize::MAX);
+                if let Some(oldest) = self.local_cid_state.retire_later(sequence, until, cap) {
+                    self.endpoint_events
+                        .push_back(EndpointEventInner::RetireConnectionId(oldest));
+                }
+                self.reset_retired_cid_timer();
+            }
+            None => self
+                .endpoint_events
+                .push_back(EndpointEventInner::RetireConnectionId(sequence)),
+        }
         Ok(())
+    }
+
+    /// Stops routing the retired connection IDs whose time has come
+    fn on_retired_cid_timeout(&mut self, now: Instant) {
+        // Bounded by the IDs kept routing, at most what the connection issues
+        while let Some(sequence) = self.local_cid_state.retired_due(now) {
+            self.endpoint_events
+                .push_back(EndpointEventInner::RetireConnectionId(sequence));
+        }
+        self.reset_retired_cid_timer();
+    }
+
+    /// Arms the timer for the next retired connection ID to stop routing, or stops it
+    fn reset_retired_cid_timer(&mut self) {
+        match self.local_cid_state.next_retired() {
+            Some(at) => self.timers.set(Timer::RetiredCid, at),
+            None => self.timers.stop(Timer::RetiredCid),
+        }
     }
 
     fn on_new_connection_id(
@@ -4403,6 +4638,7 @@ impl Connection {
                 self.path_counter,
                 now,
                 &self.config,
+                self.congestion_seed.wrapping_add(self.path_counter),
             )
         };
         new_path.challenge = Some(self.rng.random());
@@ -5155,7 +5391,12 @@ impl Connection {
     pub(crate) fn is_idle(&self) -> bool {
         Timer::VALUES
             .iter()
-            .filter(|&&t| !matches!(t, Timer::KeepAlive | Timer::PushNewCid | Timer::KeyDiscard))
+            .filter(|&&t| {
+                !matches!(
+                    t,
+                    Timer::KeepAlive | Timer::PushNewCid | Timer::KeyDiscard | Timer::RetiredCid
+                )
+            })
             .filter_map(|&t| Some((t, self.timers.get(t)?)))
             .min_by_key(|&(_, time)| time)
             .is_none_or(|(timer, _)| timer == Timer::Idle)
@@ -5583,12 +5824,25 @@ pub enum Event {
     DatagramReceived,
     /// One or more application datagrams have been sent after blocking
     DatagramsUnblocked,
+    /// A client's path is degrading: nothing it sent was acknowledged for
+    /// [`PATH_DEGRADING_PROBE_TIMEOUTS`] probe timeouts. The connection stays open; told once, and
+    /// not again until the peer acknowledges a packet ([`Event::ForwardProgress`]).
+    PathDegrading,
+    /// The peer acknowledged a packet after [`Event::PathDegrading`] was told.
+    ForwardProgress,
 }
 
 fn get_max_ack_delay(params: &TransportParameters) -> Duration {
     // The parameter is in milliseconds
     Duration::from_millis(params.max_ack_delay.0)
 }
+
+/// Cited: the probe timeouts in which nothing a client sent is acknowledged before its path is
+/// degrading: quiche's default (`kNumProbeTimeoutsForPathDegradingDelay`, "The default number of
+/// PTOs to trigger path degrading", 4, quic_sent_packet_manager.cc: "kPDE4 is the default. We
+/// have the experiments with kPDE4."), Chromium's QUIC, whose session is told
+/// (`OnPathDegrading`) and may move to another path.
+pub const PATH_DEGRADING_PROBE_TIMEOUTS: u32 = 4;
 
 // Prevents overflow and improves behavior in extreme circumstances
 /// The largest PTO backoff exponent, which prevents overflow and improves behavior in extreme circumstances (upstream's value)

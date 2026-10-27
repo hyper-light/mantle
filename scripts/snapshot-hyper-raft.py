@@ -229,11 +229,22 @@ def included_benches(root):
 
 
 def uses_selected_cfgs(root):
-    pattern = re.compile(r"cfg\((?:[^()]*\()?\s*(?:" + "|".join(SELECTED_CFGS) + r")\b")
+    """Whether any `cfg(...)` or `cfg_attr(...)` predicate under ROOT names a selected cfg, at any
+    depth of `all`, `any` and `not`: each predicate is read whole, to its balanced parenthesis."""
+    opening = re.compile(r"\bcfg(?:_attr)?\(")
+    name = re.compile(r"\b(?:" + "|".join(SELECTED_CFGS) + r")\b")
     for dirpath, _, files in os.walk(root):
         for f in files:
-            if f.endswith(".rs") and pattern.search(open(os.path.join(dirpath, f), encoding="utf-8").read()):
-                return True
+            if not f.endswith(".rs"):
+                continue
+            text = open(os.path.join(dirpath, f), encoding="utf-8").read()
+            for m in opening.finditer(text):
+                depth, end = 1, m.end()
+                while end < len(text) and depth:
+                    depth += {"(": 1, ")": -1}.get(text[end], 0)
+                    end += 1
+                if name.search(text, m.end(), end):
+                    return True
     return False
 
 

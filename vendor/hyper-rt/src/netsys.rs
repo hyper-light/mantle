@@ -519,14 +519,18 @@ mod imp {
     }
 
     /// Lets other sockets bind `socket`'s port as well (`SO_REUSEPORT`; on Linux those of the same
-    /// effective user, socket(7)): a listener and the sockets it connects to its peers share one
-    /// port. Set on a socket before it joins a shared port (`UdpSocket::join_shared`), and on a
-    /// listener once it is bound to a port of its own (`UdpSocket::bind_shared`): Linux makes the
-    /// port's group when the first joiner binds, and the BSDs judge each bind by both sockets' flags
-    /// at that bind.
+    /// effective user, socket(7)): set on a socket before it joins a shared port, and on a listener
+    /// once it is bound to a port of its own (Linux makes the port's group when the first joiner
+    /// binds, and the BSDs judge each bind by both sockets' flags at that bind; measured on both).
     pub(crate) fn share_port(socket: &Socket) -> Result<(), RtError> {
         rustix::net::sockopt::set_socket_reuseport(&socket.fd, true)
             .map_err(|e| refused("setsockopt(SO_REUSEPORT)", e))
+    }
+
+    /// Whether other sockets may bind `socket`'s port as well (`SO_REUSEPORT`).
+    pub(crate) fn shares_port(socket: &Socket) -> Result<bool, RtError> {
+        rustix::net::sockopt::socket_reuseport(&socket.fd)
+            .map_err(|e| refused("getsockopt(SO_REUSEPORT)", e))
     }
 
     /// Connects `socket` to `addr`: the kernel hands it `addr`'s datagrams to its port, and it
@@ -1084,6 +1088,11 @@ pub(crate) mod imp {
         port_sharing()
     }
 
+    /// Never: no Winsock socket shares its port as [`share_port`] means it.
+    pub(crate) fn shares_port(_socket: &Socket) -> Result<bool, RtError> {
+        Ok(false)
+    }
+
     /// Connects `socket` to `addr`.
     pub(crate) fn connect(socket: &Socket, addr: SocketAddr) -> Result<(), RtError> {
         let (sa, sa_len) = sockaddr(addr);
@@ -1122,4 +1131,5 @@ pub(crate) use imp::{OwnedDatagram, Socket};
 pub(crate) use imp::{
     adopt, bind, connect, dgram_socket, into_owned, local_addr, path_payload, port_sharing,
     queued_bytes, recv_buffer_bytes, recv_from, send, send_to, set_recv_buffer, share_port,
+    shares_port,
 };

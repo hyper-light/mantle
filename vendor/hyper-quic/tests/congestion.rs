@@ -42,9 +42,11 @@ use hyper_quic::{
     ClientConfig, Connection, ConnectionHandle, DatagramEvent, Dir, EcnCodepoint, Endpoint,
     EndpointConfig, Event, ServerConfig, StreamEvent, StreamId, TransportConfig, VarInt,
 };
-use hyper_sim::net::{Fate, Link, Loss, Marking, Net, NetLimits, Path, Ticket};
+use hyper_sim::net::{
+    Fate, Link, Loss, Marking, Measured as Propagation, Net, NetLimits, Path, Ticket,
+};
 use hyper_sim::{
-    Clock, Discipline, Fifo, Limits, NodeId, Record, SimError, Source, Step, World, twice,
+    Clock, Discipline, Fifo, Limits, NodeId, PPM, Record, SimError, Source, Step, World, twice,
 };
 
 const MS: u64 = 1_000_000;
@@ -107,8 +109,14 @@ struct Scenario {
     buffer_permille: u64,
     /// What each direction's path loses.
     loss: Loss,
-    /// Each datagram's propagation varies by up to this either way, and may overtake an earlier one.
+    /// Each datagram's propagation varies by up to this either way.
     jitter_ns: u64,
+    /// Whether a datagram may overtake an earlier one: with jitter, the path reorders; without, it
+    /// keeps each flow's order, its datagrams queued behind a slower one.
+    reorders: bool,
+    /// The share of datagrams, parts per million, that cross with no delay, overtaking the rest,
+    /// as netem's `reorder` sends a share of packets at once (`tc-netem(8)`).
+    skip_ppm: u32,
     /// At this time the bottleneck's rate becomes the second value, both ways.
     step: Option<(u64, u64)>,
     /// Where measurement starts, if not a quarter of the run.
@@ -131,7 +139,8 @@ impl Scenario {
     /// path that draws them, and the datagrams each way no more than the bottleneck carries over
     /// the run at its peak rate, each of the smallest size, beside what it holds at the start.
     fn trace_words(&self) -> usize {
-        let draws = u64::from(self.loss != Loss::NONE) + u64::from(self.jitter_ns != 0);
+        let draws = u64::from(self.loss != Loss::NONE)
+            + u64::from(self.jitter_ns != 0 || self.skip_ppm != 0);
         let carried = u128::from(self.peak_rate()) * u128::from(self.end()) / 8_000_000_000;
         let datagrams =
             (u64::try_from(carried).unwrap() + self.bytes_one_way()) / SMALLEST_DATAGRAM;
@@ -219,6 +228,8 @@ fn scenario(rate_bits_per_second: u64, rtt_ms: u64, seconds: u64) -> Scenario {
         buffer_permille: 1_000,
         loss: Loss::NONE,
         jitter_ns: 0,
+        reorders: true,
+        skip_ppm: 0,
         step: None,
         warm_ns: None,
     }
@@ -559,6 +570,13 @@ struct Measured {
     /// Its samples in the competing mode in the run's last quarter, and all it took there.
     competing_late: u64,
     samples_late: u64,
+    /// The client's packets: sent, declared lost, and declared lost but acknowledged afterwards
+    /// (reordered, not lost).
+    sent_packets: u64,
+    lost_packets: u64,
+    spurious_losses: u64,
+    /// The client's least round trip at the end
+    min_rtt: Duration,
 }
 
 struct Run {
@@ -626,9 +644,21 @@ impl Run {
             .collect();
         for (flow, spec) in flows.iter().zip(specs) {
             let one_way = spec.rtt_ns.unwrap_or(scenario.rtt_ns) / 2;
-            let path = match scenario.jitter_ns {
-                0 => Path::in_order(one_way, 0),
-                jitter => Path::reordering(one_way, jitter),
+            let path = if scenario.skip_ppm != 0 {
+                // A share with no delay, the rest with the path's: a step in the distribution
+                let skip = scenario.skip_ppm.min(PPM - 1);
+                let grid: &'static [u32] = Vec::leak(vec![0, skip, skip + 1, PPM]);
+                let values: &'static [u64] = Vec::leak(vec![0, 0, one_way, one_way]);
+                let measured = Path::measured(Propagation::new(grid, values)?);
+                if scenario.reorders {
+                    measured.overtaking()
+                } else {
+                    measured
+                }
+            } else if scenario.reorders && scenario.jitter_ns != 0 {
+                Path::reordering(one_way, scenario.jitter_ns)
+            } else {
+                Path::in_order(one_way, scenario.jitter_ns)
             }
             .with_loss(scenario.loss);
             net.set_pair_path(flow.client.node, flow.server.node, path.through(up))?;
@@ -959,7 +989,16 @@ impl Run {
             } else {
                 0
             };
+            let path = flow
+                .client
+                .connection
+                .as_ref()
+                .map(|(_, connection)| connection.stats().path);
             let m = Measured {
+                sent_packets: path.as_ref().map_or(0, |path| path.sent_packets),
+                lost_packets: path.as_ref().map_or(0, |path| path.lost_packets),
+                spurious_losses: path.as_ref().map_or(0, |path| path.spurious_losses),
+                min_rtt: path.as_ref().map_or(Duration::ZERO, |path| path.min_rtt),
                 pings,
                 ping_p99_ns,
                 carried_ppm: carried * 1_000_000 / could.max(1),
@@ -1467,6 +1506,240 @@ fn bakeoff_cell(trial: &Trial, law: Law, seed: u64, pki: &Pki) -> Cell {
         carried_ppm: bulk.carried_ppm,
         stalled,
         jain,
+    }
+}
+
+/// A path that reorders is carried as the same path with its jitter kept in order, once the
+/// tolerance of reordering widens (RFC 9002 §6.1.1, RFC 8985 §6.2; `reordering.rs`). Jitter of
+/// ±20 ms and ±40 ms each way on a 100 ms round trip delivers packets out of order by more than
+/// RFC 9002's fixed thresholds, three packets and 9/8 of the round trip, so they declare packets
+/// lost that arrive, and every declaration was a congestion event: BBR carried a fifth of the link
+/// at ±20 ms, and at ±40 ms, its window bounded by the smoothed round trip that QUIC samples from
+/// the packets that overtook, 54.8%. **The rule:** each path keeps nine tenths of what its twin,
+/// the same jitter kept in order, carries (the bar an incumbent keeps nine tenths of beside Copa,
+/// [`harm_bar`]), and it does reorder past the RFC's thresholds.
+#[test]
+fn a_reordering_path_is_carried_as_its_jitter_kept_in_order() {
+    let pki = Pki::new();
+    let mut failed = Vec::new();
+    for jitter in [20, 40] {
+        let path = Scenario {
+            jitter_ns: jitter * MS,
+            ..scenario(10_000_000, 100, 20)
+        };
+        let twin = measure(
+            Scenario {
+                reorders: false,
+                ..path
+            },
+            Law::Bbr,
+            &pki,
+        );
+        let reordering = measure(path, Law::Bbr, &pki);
+        let row = format!(
+            "±{jitter} ms at 100 ms, BBR: carried {:.1}% reordering, {:.1}% in order; \
+             {} packets sent reordering, {} declared lost, {} of them spurious",
+            percent(reordering.carried_ppm),
+            percent(twin.carried_ppm),
+            reordering.sent_packets,
+            reordering.lost_packets,
+            reordering.spurious_losses
+        );
+        println!("{row}");
+        if reordering.closed.is_some() || twin.closed.is_some() {
+            failed.push(format!("closed: {row}"));
+        }
+        if reordering.spurious_losses == 0 {
+            failed.push(format!("no reordering past the thresholds: {row}"));
+        }
+        if reordering.carried_ppm * 10 < twin.carried_ppm * 9 {
+            failed.push(format!("under nine tenths of its twin: {row}"));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
+/// A wake does what is due at its time on a path that reorders. A loss time that the reordering
+/// window lengthens can end after the newest packet's probe timeout, which the loss time held back
+/// (RFC 9002 §6.2.1, Appendix A.8), and the connection then asked to be woken at the time it was
+/// woken, which `Run::fire` refuses: BBR over 10 Mbit/s and 20 ms with ±10 ms of jitter each way did
+/// until the probe timeout fired in the same wake (patch Q28).
+#[test]
+fn every_wake_on_a_path_that_reorders_does_what_is_due_at_its_time() {
+    let pki = Pki::new();
+    let path = Scenario {
+        jitter_ns: 10 * MS,
+        ..scenario(10_000_000, 20, 20)
+    };
+    let measured = measure(path, Law::Bbr, &pki);
+    assert!(measured.closed.is_none(), "{:?}", measured.closed);
+    assert!(
+        measured.spurious_losses > 0,
+        "the path reorders past the RFC's thresholds"
+    );
+}
+
+/// A connection keeps what its peer sent with a connection ID it retired. A server switches from the
+/// client's first connection ID at the client's first NEW_CONNECTION_ID and retires it, and on a
+/// path whose jitter passes its delay, ±20 ms each way on 20 ms, packets the server sent with the
+/// old ID arrive after its RETIRE_CONNECTION_ID: the client's endpoint had unrouted the ID, dropped
+/// them, and answered each with a stateless reset, which `Run::arrive` refuses. A retired ID now
+/// routes for three probe timeouts more (patch Q29).
+#[test]
+fn a_path_whose_jitter_passes_its_delay_keeps_what_was_sent_with_a_retired_id() {
+    let pki = Pki::new();
+    let path = Scenario {
+        jitter_ns: 20 * MS,
+        ..scenario(10_000_000, 20, 20)
+    };
+    let measured = measure(path, Law::Bbr, &pki);
+    assert!(measured.closed.is_none(), "{:?}", measured.closed);
+}
+
+/// BBR paced at its model's rate keeps its queue short: at a drop-tail queue of one bandwidth-delay
+/// product it loses no more than NewReno, which fills the queue by design (BBR's goal, Cardwell et
+/// al., "BBR: Congestion-Based Congestion Control", ACM Queue 2016: deliver at the bottleneck's rate
+/// with the least queue). Paced at five quarters of its window a round trip, its window twice the
+/// product and its queue overflowing, BBR lost 2,634 packets over 10 Mbit/s and 100 ms where
+/// NewReno lost 215.
+#[test]
+fn bbr_at_a_queue_of_one_product_loses_no_more_than_newreno() {
+    let pki = Pki::new();
+    let path = scenario(10_000_000, 100, 20);
+    let bbr = measure(path, Law::Bbr, &pki);
+    let newreno = measure(path, Law::NewReno, &pki);
+    println!(
+        "10M 100ms: BBR lost {} of {} (carried {:.1}%), NewReno {} of {} ({:.1}%)",
+        bbr.lost_packets,
+        bbr.sent_packets,
+        percent(bbr.carried_ppm),
+        newreno.lost_packets,
+        newreno.sent_packets,
+        percent(newreno.carried_ppm)
+    );
+    assert!(bbr.closed.is_none() && newreno.closed.is_none());
+    assert!(
+        bbr.lost_packets <= newreno.lost_packets,
+        "BBR lost {}, NewReno {}",
+        bbr.lost_packets,
+        newreno.lost_packets
+    );
+}
+
+/// A path where a share of the packets skips its delay, as netem's `reorder` sends them, is carried
+/// by BBR as the same delays kept in order. Its least round trip came from the packets that skipped,
+/// a millisecond where the rest took 80, and its window, twice its bandwidth times that, held it to
+/// a seventh of the link paced; a packet acknowledged while one sent before it is not now gives it no
+/// round trip. **The rule:** each path keeps nine tenths of its twin's share (as
+/// [`a_reordering_path_is_carried_as_its_jitter_kept_in_order`]).
+#[test]
+fn a_path_where_packets_skip_its_delay_is_carried_by_bbr_as_its_delays_kept_in_order() {
+    let pki = Pki::new();
+    let mut failed = Vec::new();
+    for skip_ppm in [10_000, 50_000] {
+        let path = Scenario {
+            skip_ppm,
+            ..scenario(10_000_000, 80, 20)
+        };
+        let twin = measure(
+            Scenario {
+                reorders: false,
+                ..path
+            },
+            Law::Bbr,
+            &pki,
+        );
+        let skipping = measure(path, Law::Bbr, &pki);
+        let row = format!(
+            "{}% skipping at 80 ms, BBR: carried {:.1}%, in order {:.1}%; least round trip {:?}",
+            skip_ppm / 10_000,
+            percent(skipping.carried_ppm),
+            percent(twin.carried_ppm),
+            skipping.min_rtt
+        );
+        println!("{row}");
+        if skipping.closed.is_some() || twin.closed.is_some() {
+            failed.push(format!("closed: {row}"));
+        }
+        if skipping.carried_ppm * 10 < twin.carried_ppm * 9 {
+            failed.push(format!("under nine tenths of its twin: {row}"));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
+/// The table of `docs/benchmarks.md`, "A path that reorders": each law over 10 Mbit/s and 100 ms
+/// for 20 s, with jitter each way that reorders and the same jitter kept in order.
+#[test]
+#[ignore = "the reordering table of docs/benchmarks.md: a measurement, run by hand"]
+fn print_the_reordering_table() {
+    let pki = Pki::new();
+    println!(
+        "| Jitter each way | Law | carried reordering (declared lost, spurious) | carried in order |"
+    );
+    println!("|---|---|---|---|");
+    for jitter in [0, 5, 10, 20, 40, 60] {
+        for law in Law::BAKEOFF {
+            let path = Scenario {
+                jitter_ns: jitter * MS,
+                ..scenario(10_000_000, 100, 20)
+            };
+            let reordering = measure(path, law, &pki);
+            let twin = measure(
+                Scenario {
+                    reorders: false,
+                    ..path
+                },
+                law,
+                &pki,
+            );
+            println!(
+                "| ±{jitter} ms | {law:?} | {:.1}% ({}, {}) | {:.1}% |",
+                percent(reordering.carried_ppm),
+                reordering.lost_packets,
+                reordering.spurious_losses,
+                percent(twin.carried_ppm)
+            );
+        }
+    }
+}
+
+/// The table of `docs/benchmarks.md`, "A path where a share of packets skips its delay": each law
+/// over 10 Mbit/s and 80 ms for 20 s, with that share of the datagrams each way crossing with no
+/// delay, as netem's `reorder` sends them, and the same delays kept in order.
+#[test]
+#[ignore = "the skipping table of docs/benchmarks.md: a measurement, run by hand"]
+fn print_the_skipping_table() {
+    let pki = Pki::new();
+    println!(
+        "| Skipping each way | Law | carried (declared lost, spurious; least round trip) | kept in order |"
+    );
+    println!("|---|---|---|---|");
+    for skip in [0, 10_000, 50_000, 250_000] {
+        for law in Law::BAKEOFF {
+            let path = Scenario {
+                skip_ppm: skip,
+                ..scenario(10_000_000, 80, 20)
+            };
+            let skipping = measure(path, law, &pki);
+            let twin = measure(
+                Scenario {
+                    reorders: false,
+                    ..path
+                },
+                law,
+                &pki,
+            );
+            println!(
+                "| {:.0}% | {law:?} | {:.1}% ({}, {}; {:.1} ms) | {:.1}% |",
+                f64::from(skip) / 10_000.0,
+                percent(skipping.carried_ppm),
+                skipping.lost_packets,
+                skipping.spurious_losses,
+                skipping.min_rtt.as_secs_f64() * 1_000.0,
+                percent(twin.carried_ppm)
+            );
+        }
     }
 }
 

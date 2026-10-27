@@ -18,11 +18,21 @@ hyper-seal = { path = "../hyper-seal" }
 hyper-timing = { path = "../hyper-timing" }
 thiserror = "2.0"
 
+# loom builds only for the library's own tests under `RUSTFLAGS="--cfg loom"`, for the owner's
+# wake's interleavings (`src/wake.rs`): a test-only dependency, so no consumer resolves it.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
 [dev-dependencies]
 hyper-block = { path = "../hyper-block", features = ["sim"] }
 hyper-measure = { path = "../hyper-measure" }
 proptest = "1.11"
 tempfile = "3.20"
+
+# hyper-raft's workspace declares the cfgs its interleaving and schedule tests select; the
+# snapshot keeps that declaration alone of the workspace's lints, so `cfg(loom)` is known here.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(shuttle)", "cfg(fuzzing)"] }
 
 # A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside any consumer workspace.
 [workspace]

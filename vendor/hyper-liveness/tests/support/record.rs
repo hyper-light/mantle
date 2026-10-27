@@ -138,11 +138,10 @@ impl Record {
                 ..
             } => {
                 let counted = self.counted.entry(peer).or_default();
-                match refused {
-                    None if beat.stopping => {}
-                    None => counted.taken += 1,
-                    Some(Refusal::Unproven) => counted.unproven += 1,
-                    Some(_) => {}
+                if taken(refused) {
+                    counted.taken += u64::from(!beat.stopping);
+                } else if refused == Some(Refusal::Unproven) {
+                    counted.unproven += 1;
                 }
             }
             Entry::Told(Change::Suspected(suspicion)) => {
@@ -365,9 +364,19 @@ fn judged(refused: Option<Refusal>) -> bool {
     refused.is_none_or(|refusal| {
         matches!(
             refusal,
-            Refusal::Stale | Refusal::Unproven | Refusal::Unmeasured | Refusal::OutOfRange
+            Refusal::Stale
+                | Refusal::Unproven
+                | Refusal::Unmeasured
+                | Refusal::OutOfRange
+                | Refusal::OtherMode
         )
     })
+}
+
+/// Whether the stream took a heartbeat: one refused for its disk mode alone is taken for its
+/// sender's process (`Refusal::OtherMode`, Focal's condition 1's backstop).
+fn taken(refused: Option<Refusal>) -> bool {
+    refused.is_none_or(|refusal| refusal == Refusal::OtherMode)
 }
 
 /// Whether the node's own durability, `own` as the call judged, held a point `point` of a peer last
@@ -432,7 +441,7 @@ impl Tracer<'_> {
                     held.run = Some(beat.run);
                     held.last = None;
                 }
-                if refused.is_none() && !beat.stopping {
+                if taken(refused) && !beat.stopping {
                     held.last = Some(beat.last());
                 }
                 held.holds = holds;
@@ -582,7 +591,7 @@ impl Tracer<'_> {
         }
         // Its heartbeat, and its point.
         let settled = own.and_then(|(beat, refused)| {
-            (refused.is_none() && suspicion.last == Some(beat.last())).then_some(beat)
+            (taken(refused) && suspicion.last == Some(beat.last())).then_some(beat)
         });
         let run = if let Some(beat) = settled {
             // The take restated the point, at or before the heartbeat's own arrival, which the
@@ -637,9 +646,9 @@ impl Tracer<'_> {
                 Entry::Fed {
                     peer: of,
                     beat,
-                    refused: None,
+                    refused,
                     ..
-                } if of == peer => {
+                } if of == peer && taken(refused) => {
                     if beat.stamp < suspicion.at_ns {
                         self.fail(
                             place,

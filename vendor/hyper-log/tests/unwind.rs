@@ -60,6 +60,7 @@ fn small(term: u64) -> Update {
             term,
             vote: 1,
             commit: 0,
+            held: None,
         }),
         ..Update::default()
     }
@@ -87,7 +88,13 @@ impl Wake for Unwinding {
 #[test]
 fn a_waker_that_unwinds_costs_only_its_wake() {
     let (device, holder) = held(sim(71));
-    let log = Log::create(device, config(), ID).unwrap();
+    // Idle, a log under `Waits::Measured` fills its next slot ahead and flushes it, and that
+    // flush may be the one held below in place of the frame before (`Owner::fill_ahead`).
+    let cfg = Config {
+        waits: Waits::Never,
+        ..config()
+    };
+    let log = Log::create(device, cfg, ID).unwrap();
     let unwinding = Arc::new(Unwinding(AtomicU64::new(0)));
     let waker = Waker::from(unwinding.clone());
     let mut woken = 0;

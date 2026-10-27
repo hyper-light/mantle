@@ -16,11 +16,10 @@
 //! before every message it takes, so anything a caller sends after hearing an answer the device
 //! gave is heard after the completion that freed its room, as when the writer answered under its
 //! lock. The thread that did the job wakes the owner only when the completion leaves the owner
-//! something to answer (a frame another frame will confirm, a failure, a sweep, a read, a look);
-//! the owner, when it has work waiting on the device, asks the I/O thread to wake it once the job
-//! is back (`Request::Watch`). So a write whose frame confirms itself, with no one else
-//! submitting, crosses from its caller to the owner and back: the owner sleeps once and the
-//! caller once, as mantle's writer and its caller did.
+//! something to answer (a frame another frame will confirm, a failure, a sweep, a read, a look),
+//! or when the owner waits on the job, which it says through its wake (`wake.rs`). So a write
+//! whose frame confirms itself, with no one else submitting, crosses from its caller to the owner
+//! and back: the owner sleeps once and the caller once, as mantle's writer and its caller did.
 //!
 //! The operations of a frame are mantle's, in mantle's order: the frame, its persist record, then
 //! one flush, nothing after a failed write, and a failed flush never retried (mantle
@@ -57,38 +56,22 @@ pub(crate) const JOBS: usize = 3;
 /// and a stale word about the frame before, which the device drops.
 pub(crate) const MORE: usize = 2;
 
-/// Requests the I/O thread holds at most: the job out, and the owner's ask to be woken once it is
-/// back; the owner has one job out at a time and asks once for it.
-pub(crate) const REQUESTS: usize = 2;
-
-/// Tokens the owner's token channel holds while the owner holds its receiver: the owner empties
-/// it as it takes each job back and as a watch gives it back, one job is out at a time, and a
-/// job's token is sent after the job is back, so the last job's token can follow the emptying and
-/// the next job's join it before the next. While the I/O thread watches, it takes each token as
-/// it comes, so a job's thread that finds the channel full waits only for it.
-pub(crate) const TOKENS: usize = 2;
+/// Jobs the I/O thread's queue holds at most: the owner has one job out at a time, and gives the
+/// next only once the last is back, which the I/O thread took from its queue before doing it.
+pub(crate) const REQUESTS: usize = 1;
 
 /// A look at the file a caller runs on the thread that holds the device.
 pub(crate) type Look<F> = Box<dyn FnOnce(&F) + Send>;
 
-/// What the I/O thread is asked to do.
-pub(crate) enum Request<F> {
-    /// A job, no caller doing it.
-    Job(Box<Carrier<F>>),
-    /// Wake the owner once the job of this sequence is back, the token of each job back coming
-    /// through this receiver; the receiver goes back to the owner with the word.
-    Watch(u64, Receiver<u64>),
-}
-
 /// Where a thread that does the log's jobs reaches the owner: its inbox, the slot for a frame's
 /// word that it is flushed while the device confirms it (`owner::Owner::flushes`), its returns,
-/// and the token of each job back, for a watch (`serve`). Every thread that does jobs holds its own
-/// and lends it to the job (module docs).
+/// and its wake's slot, which the thread fills to wake an owner that waits on the job back
+/// (`wake.rs`). Every thread that does jobs holds its own and lends it to the job (module docs).
 pub(crate) struct Lines<F> {
     pub(crate) inbox: SyncSender<Message<F>>,
     pub(crate) flushed: SyncSender<Completion>,
     pub(crate) returns: SyncSender<Box<Carrier<F>>>,
-    pub(crate) tokens: SyncSender<u64>,
+    pub(crate) wake: SyncSender<()>,
 }
 
 impl<F> Clone for Lines<F> {
@@ -97,7 +80,7 @@ impl<F> Clone for Lines<F> {
             inbox: self.inbox.clone(),
             flushed: self.flushed.clone(),
             returns: self.returns.clone(),
-            tokens: self.tokens.clone(),
+            wake: self.wake.clone(),
         }
     }
 }
@@ -161,17 +144,14 @@ pub(crate) struct Carrier<F> {
     pub(crate) job: Option<Job<F>>,
     pub(crate) device: Option<Device<F>>,
     pub(crate) completion: Option<Completion>,
-    /// The job's place among the jobs the owner has given out.
-    pub(crate) sequence: u64,
 }
 
 impl<F> Carrier<F> {
-    pub(crate) fn new(job: Job<F>, device: Device<F>, sequence: u64) -> Self {
+    pub(crate) fn new(job: Job<F>, device: Device<F>) -> Self {
         Self {
             job: Some(job),
             device: Some(device),
             completion: None,
-            sequence,
         }
     }
 }
@@ -198,15 +178,18 @@ impl<F: BlockFile + Send + 'static> Carrier<F> {
         // A confirmation that held answered every caller it confirms: the owner has only room to
         // give back and the frame to settle, which it does before the next message it takes.
         let tell = !matches!(completion, Completion::Confirm { result: Ok(()), .. });
-        let sequence = self.sequence;
         self.completion = Some(completion);
         self.device = Some(device);
+        #[cfg(test)]
+        pause::here(pause::At::Done);
         // The owner holds the completion before anyone hears an answer the job gave; should the
         // owner have gone, the answers are dropped and each caller hears the log closed.
         if lines.returns.send(self).is_ok() {
-            // Every token is sent, so a watch for this job ends (`TOKENS`).
-            let _ = lines.tokens.send(sequence);
-            if tell {
+            #[cfg(test)]
+            pause::here(pause::At::Back);
+            // Otherwise the owner hears the job back before its next message, unless it waits on
+            // the job, which the thread that fills its wake's slot tells it (`wake.rs`).
+            if tell || crate::wake::claim(|| lines.wake.try_send(()).is_ok()) {
                 let _ = lines.inbox.send(Message::Returned);
             }
             for answering in answers.drain(..) {
@@ -222,27 +205,59 @@ impl<F: BlockFile + Send + 'static> Carrier<F> {
     }
 }
 
-/// The log's I/O thread: it does the jobs no caller does, and wakes the owner when it asks to be
-/// woken for a job back. It ends once the owner has.
+/// The log's I/O thread: it does the jobs no caller does. It ends once the owner has.
 pub(crate) fn serve<F: BlockFile + Send + 'static>(
-    requests: &Receiver<Request<F>>,
+    requests: &Receiver<Box<Carrier<F>>>,
     lines: &Lines<F>,
 ) {
-    while let Ok(request) = requests.recv() {
-        match request {
-            Request::Job(carrier) => carrier.run(lines),
-            Request::Watch(sequence, tokens) => {
-                loop {
-                    match tokens.recv() {
-                        Ok(back) if back >= sequence => break,
-                        Ok(_) => {}
-                        Err(_) => return,
-                    }
-                }
-                if lines.inbox.send(Message::Watched(tokens)).is_err() {
-                    return;
-                }
-            }
+    while let Ok(carrier) = requests.recv() {
+        carrier.run(lines);
+    }
+}
+
+/// A test's pause of a thread's next job where a thread the OS preempts may stop: done with the
+/// device not yet given back, or given back with the owner not yet woken (`wake.rs`).
+#[cfg(test)]
+pub(crate) mod pause {
+    use std::cell::RefCell;
+    use std::sync::mpsc::{Receiver, SyncSender};
+
+    /// Where a job pauses.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum At {
+        /// Done, the device not yet given back.
+        Done,
+        /// Back in the owner's returns, the owner not yet woken.
+        Back,
+    }
+
+    /// A pause: where, where the thread says it paused, and where it hears it may go on.
+    type Pause = (At, SyncSender<()>, Receiver<()>);
+
+    thread_local! {
+        /// This thread's pause for its next job.
+        static NEXT: RefCell<Option<Pause>> = const { RefCell::new(None) };
+    }
+
+    /// Pauses this thread's next job `at`: `paused` hears it, and the thread goes on once `go`
+    /// hears or is gone.
+    pub(crate) fn next(at: At, paused: SyncSender<()>, go: Receiver<()>) {
+        let _ = NEXT.try_with(|next| *next.borrow_mut() = Some((at, paused, go)));
+    }
+
+    /// Pauses here if this thread's next job pauses `at`.
+    pub(super) fn here(at: At) {
+        let pause = NEXT
+            .try_with(|next| {
+                let mut next = next.borrow_mut();
+                let here = next.as_ref().is_some_and(|(when, ..)| *when == at);
+                if here { next.take() } else { None }
+            })
+            .ok()
+            .flatten();
+        if let Some((_, paused, go)) = pause {
+            let _ = paused.send(());
+            let _ = go.recv();
         }
     }
 }
@@ -272,6 +287,22 @@ pub(crate) enum Job<F> {
         record_at: u64,
         these: Vec<Answering>,
     },
+    /// A piece of the slot past the file's last written with zeros ahead of its first frame, while
+    /// the owner has nothing else for the device (`owner::write`'s fill ahead): `len` bytes at
+    /// `at`, then, with `flush`, the slot's last piece, one flush. The slot's blocks are then
+    /// written and the file's length covers them, so every frame in it is an overwrite the file
+    /// system need not log: a flush of the device's cache alone, and a confirmation that is one FUA
+    /// write where the device has FUA. On ext4 and XFS a write into an unwritten extent converts
+    /// it, a change the journal must commit (fallocate(2), "Allocating disk space"; the kernel's
+    /// fs/iomap/direct-io.c takes no FUA path for an unwritten extent or a write past the file's
+    /// size), so allocating the slot is not enough: it is written. Zeros past the last frame read
+    /// as no frame, as the end of the file does (`recover::Reader::frame_at`: neither magic has a
+    /// zero byte).
+    Fill {
+        at: u64,
+        len: u64,
+        flush: bool,
+    },
     /// The tail's frames, read through a window of a segment and decoded.
     Sweep {
         segment: Segment,
@@ -287,17 +318,6 @@ pub(crate) enum Job<F> {
 pub(crate) struct Frame {
     pub(crate) frame: AlignedBuf,
     pub(crate) at: u64,
-    /// Where the frame opens a slot past the file's last: the slot, written whole with zeros
-    /// before the frame, under the frame's own flush. The file's blocks in it are then written and
-    /// its length covers it, so every later frame in the slot is an overwrite the file system need
-    /// not log: a flush of the device's cache alone, and a confirmation that is one FUA write where
-    /// the device has FUA. On ext4 and XFS a write into an unwritten extent converts it, a change
-    /// the journal must commit (fallocate(2), "Allocating disk space"; the kernel's
-    /// fs/iomap/direct-io.c takes no FUA path for an unwritten extent or a write past the file's
-    /// size), so allocating the slot is not enough: it is written. Zeros past the last frame read as
-    /// no frame, as the end of the file does (`recover::Reader::frame_at`: neither magic has a zero
-    /// byte).
-    pub(crate) zero: Option<(u64, u64)>,
     pub(crate) record: AlignedBuf,
     pub(crate) record_at: u64,
     /// The frame's sequence.
@@ -338,6 +358,12 @@ pub(crate) enum Completion {
         timing: Timing,
     },
     Sweep(Result<Vec<Swept>, LogError>),
+    /// A piece of a fill ahead written, flushed with the slot's last piece, or failed.
+    Fill {
+        result: Result<(), LogError>,
+        /// Its write and flush, timed.
+        timing: Timing,
+    },
     Read(Reads),
     Looked,
 }
@@ -440,14 +466,65 @@ pub(crate) struct Device<F> {
     pub(crate) file: F,
     /// Buffers for reading entries back, kept between reads.
     pool: Pool,
-    /// A segment of zeros, written over each slot the file grows by (`Device::zero_fill`): made at
-    /// the first and kept.
+    /// Zeros, written over the pieces of each slot the file grows by (`Device::zero_fill`): made
+    /// at the first piece, grown to the largest asked and kept.
     zeros: Option<AlignedBuf>,
     segment_bytes: u64,
     /// The owner's word that another frame follows the one with this sequence.
     more: Receiver<u64>,
     /// A sealed log's framing MAC, which every frame a sweep reads is checked against.
     mac: Option<hyper_seal::log::FrameMac>,
+    /// What making a record durable has cost this file each way ([`Device::confirm`]).
+    costs: Costs,
+    /// A confirmation is made durable the first way alone, whatever the costs measured: under
+    /// `Waits::Told`, whose caller decides every operation the device makes.
+    steady: bool,
+}
+
+/// A running mean of nanoseconds, of every sample since the log opened: no constant weighs them.
+#[derive(Clone, Copy, Debug, Default)]
+struct Mean {
+    total: u64,
+    count: u64,
+}
+
+impl Mean {
+    fn add(&mut self, ns: u64) {
+        self.total = self.total.saturating_add(ns);
+        self.count = self.count.saturating_add(1);
+    }
+
+    fn get(&self) -> Option<u64> {
+        self.total.checked_div(self.count)
+    }
+}
+
+/// What making a record durable has cost a file each way, as the device measured it: a frame's
+/// flush and its record's write, which every frame makes, and a confirmation's durable write and
+/// its write and flush, each when made.
+#[derive(Clone, Copy, Debug, Default)]
+struct Costs {
+    flush: Mean,
+    record: Mean,
+    durable: Mean,
+    flushed: Mean,
+}
+
+impl Costs {
+    /// Whether a confirmation costs less written and flushed than written durable on its own:
+    /// never before a durable write has been measured, the only way there was; the write and
+    /// flush judged by its own mean once it has one, by a frame's record write and flush before.
+    fn flushing_is_cheaper(&self) -> bool {
+        let Some(durable) = self.durable.get() else {
+            return false;
+        };
+        let flushed = self.flushed.get().or_else(|| {
+            self.flush
+                .get()
+                .and_then(|flush| self.record.get().map(|record| flush.saturating_add(record)))
+        });
+        flushed.is_some_and(|flushed| flushed < durable)
+    }
 }
 
 impl<F: BlockFile> Device<F> {
@@ -459,7 +536,16 @@ impl<F: BlockFile> Device<F> {
             segment_bytes,
             more,
             mac: None,
+            costs: Costs::default(),
+            steady: false,
         }
+    }
+
+    /// The device of a log under `Waits::Told`, whose confirmations are made durable one way,
+    /// never by what it measured, so its operations follow from its frames alone.
+    pub(crate) fn steady(mut self, steady: bool) -> Self {
+        self.steady = steady;
+        self
     }
 
     /// The device of a sealed log, which checks every frame it reads against `mac`.
@@ -488,7 +574,7 @@ impl<F: BlockFile> Device<F> {
                 record_at,
                 mut these,
             } => {
-                let (result, timing) = self.write_durable(&mut record, record_at);
+                let (result, timing) = self.confirm(&mut record, record_at);
                 if result.is_ok() {
                     answers.append(&mut these);
                 }
@@ -504,6 +590,10 @@ impl<F: BlockFile> Device<F> {
                 offset,
                 end,
             } => Completion::Sweep(guarded(|| self.sweep(segment, offset, end))),
+            Job::Fill { at, len, flush } => {
+                let (result, timing) = self.fill(at, len, flush);
+                Completion::Fill { result, timing }
+            }
             Job::Read(reads) => {
                 let group = reads.group;
                 let read = crate::unwind::contained(|| self.read(reads)).unwrap_or_else(|| Reads {
@@ -530,11 +620,8 @@ impl<F: BlockFile> Device<F> {
         answers: &mut Vec<Answering>,
         lines: &Lines<F>,
     ) -> Completion {
-        let (result, timing) = self.write_then_flush(
-            f.zero,
-            (&mut f.frame, f.at),
-            Some((&mut f.record, f.record_at)),
-        );
+        let (result, timing) =
+            self.write_then_flush((&mut f.frame, f.at), Some((&mut f.record, f.record_at)));
         let confirming = result.is_ok() && !(f.more || self.follows(f.sequence));
         if result.is_ok() {
             // This frame's record confirms the frame before.
@@ -578,7 +665,7 @@ impl<F: BlockFile> Device<F> {
                 answering.durable();
             }
         }
-        let (result, timing) = self.write_durable(&mut f.confirm, f.record_at);
+        let (result, timing) = self.confirm(&mut f.confirm, f.record_at);
         if result.is_ok() {
             answers.append(&mut f.these);
         }
@@ -604,29 +691,30 @@ impl<F: BlockFile> Device<F> {
 
     /// Writes `first`, then `second` if there is one, each at its offset, then flushes the file
     /// once: nothing after a failed write, and a failed flush never retried (mantle
-    /// docs/design/raft-log.md §3). The writes and the flush are timed apart.
+    /// docs/design/raft-log.md §3). The writes and the flush are timed apart, and the record's
+    /// write and the flush counted in what a record made durable by a write and a flush costs
+    /// ([`Costs`]).
     fn write_then_flush(
         &mut self,
-        zero: Option<(u64, u64)>,
         first: (&mut AlignedBuf, u64),
         second: Option<(&mut AlignedBuf, u64)>,
     ) -> (Result<(), LogError>, Timing) {
         let started = stats::now();
         let mut bytes = 0u64;
-        // Every call into the file, its asking whether it fills new space included, is inside the
-        // boundary: the file is the caller's code.
+        let mut record_ns = None;
+        // Every call into the file is inside the boundary: the file is the caller's code.
         let wrote = guarded(|| {
-            if let Some((at, len)) = zero
-                && self.file.fills_new_space()
-            {
-                bytes = self.zero_fill(at, len)?;
-            }
-            bytes = bytes.saturating_add(self.write(first.0, first.1)?);
+            bytes = self.write(first.0, first.1)?;
             if let Some((buf, at)) = second {
+                let from = stats::now();
                 bytes = bytes.saturating_add(self.write(buf, at)?);
+                record_ns = Some(stats::nanos(from, stats::now()));
             }
             Ok(())
         });
+        if let Some(ns) = record_ns {
+            self.costs.record.add(ns);
+        }
         let written = stats::now();
         let mut timing = Timing {
             took_ns: stats::nanos(started, written),
@@ -636,9 +724,72 @@ impl<F: BlockFile> Device<F> {
             flushed_at: None,
             durable_write: false,
             durable_fallback: false,
+            flushed_confirmation: false,
+            zeroed: 0,
         };
         if wrote.is_err() {
             return (wrote, timing);
+        }
+        let flushed = guarded(|| self.file.sync_data().map_err(LogError::from));
+        let ended = stats::now();
+        timing.took_ns = stats::nanos(started, ended);
+        timing.flush_ns = Some(stats::nanos(written, ended));
+        timing.flushed_at = flushed.is_ok().then_some(ended);
+        if flushed.is_ok() {
+            self.costs.flush.add(stats::nanos(written, ended));
+        }
+        (flushed, timing)
+    }
+
+    /// Makes a confirmation, `buf` at `at`, durable before it returns, the cheaper of the two ways
+    /// this file has measured: a write made durable on its own ([`Device::write_durable`], a FUA
+    /// write on Linux), or a write and a flush of the device's cache ([`Device::write_flushed`]).
+    /// Which is cheaper is the device's: a drive whose FUA write costs less than a flush of its
+    /// cache takes the first, one whose FUA write costs more (a consumer NVMe drive, measured: a
+    /// 4 KiB `O_DSYNC` write 4.3 ms at the median against a 4 KiB write and `fdatasync` 2.9 ms)
+    /// the second. The durable write is measured first, as it was the only way; the write and
+    /// flush is judged by what every frame's record write and flush cost until it has costs of its
+    /// own. Each mean is of every sample since the log opened, so no constant weighs them; a way
+    /// not taken keeps the mean it had, and is taken again once the other's mean passes it.
+    fn confirm(&mut self, buf: &mut AlignedBuf, at: u64) -> (Result<(), LogError>, Timing) {
+        if !self.steady && self.costs.flushing_is_cheaper() {
+            let (result, timing) = self.write_flushed(buf, at);
+            if result.is_ok() {
+                self.costs.flushed.add(timing.took_ns);
+            }
+            return (result, timing);
+        }
+        let (result, timing) = self.write_durable(buf, at);
+        if result.is_ok() && timing.durable_write {
+            self.costs.durable.add(timing.took_ns);
+        }
+        (result, timing)
+    }
+
+    /// Writes a confirmation, `buf` at `at`, then flushes the file: durable before it returns,
+    /// as a frame is. Counted a flush, and a confirmation flushed.
+    fn write_flushed(&self, buf: &mut AlignedBuf, at: u64) -> (Result<(), LogError>, Timing) {
+        let started = stats::now();
+        let mut timing = Timing {
+            took_ns: 0,
+            write_ns: 0,
+            flush_ns: None,
+            bytes: 0,
+            flushed_at: None,
+            durable_write: false,
+            durable_fallback: false,
+            flushed_confirmation: true,
+            zeroed: 0,
+        };
+        let wrote = guarded(|| self.write(buf, at));
+        let written = stats::now();
+        timing.write_ns = stats::nanos(started, written);
+        match wrote {
+            Ok(bytes) => timing.bytes = bytes,
+            Err(e) => {
+                timing.took_ns = timing.write_ns;
+                return (Err(e), timing);
+            }
         }
         let flushed = guarded(|| self.file.sync_data().map_err(LogError::from));
         let ended = stats::now();
@@ -663,6 +814,8 @@ impl<F: BlockFile> Device<F> {
             flushed_at: None,
             durable_write: false,
             durable_fallback: false,
+            flushed_confirmation: false,
+            zeroed: 0,
         };
         let written = guarded(|| {
             let bytes = buf.padded().map_err(|e| LogError::Disk(e.into()))?;
@@ -690,13 +843,49 @@ impl<F: BlockFile> Device<F> {
         (result, timing)
     }
 
-    /// Writes zeros over `[at, at + len)`, a slot the file grows by (`Frame::zero`), in one write:
-    /// a segment, the log's largest write, from a zeroed buffer of a segment the device makes at the
-    /// first slot it fills and keeps for the log's life, so a slot costs no allocation and no page
-    /// fault after the first. The bytes written.
+    /// A fill ahead's piece ([`Job::Fill`]): its zeros written, then with `flush` the file
+    /// flushed, nothing after a failed write. The write and the flush are timed apart, and the
+    /// zeros counted.
+    fn fill(&mut self, at: u64, len: u64, flush: bool) -> (Result<(), LogError>, Timing) {
+        let started = stats::now();
+        let wrote = guarded(|| self.zero_fill(at, len));
+        let written = stats::now();
+        let mut timing = Timing {
+            took_ns: stats::nanos(started, written),
+            write_ns: stats::nanos(started, written),
+            flush_ns: None,
+            bytes: 0,
+            flushed_at: None,
+            durable_write: false,
+            durable_fallback: false,
+            flushed_confirmation: false,
+            zeroed: 0,
+        };
+        match wrote {
+            Ok(zeroed) => {
+                timing.bytes = zeroed;
+                timing.zeroed = zeroed;
+            }
+            Err(e) => return (Err(e), timing),
+        }
+        if !flush {
+            return (Ok(()), timing);
+        }
+        let flushed = guarded(|| self.file.sync_data().map_err(LogError::from));
+        let ended = stats::now();
+        timing.took_ns = stats::nanos(started, ended);
+        timing.flush_ns = Some(stats::nanos(written, ended));
+        timing.flushed_at = flushed.is_ok().then_some(ended);
+        (flushed, timing)
+    }
+
+    /// Writes zeros over `[at, at + len)`, a piece of a slot the file grows by ([`Job::Fill`]),
+    /// in one write, from a zeroed buffer the device keeps for the log's life, grown to the largest
+    /// piece asked: a piece costs no allocation and no page fault past the first of its size. The
+    /// bytes written.
     fn zero_fill(&mut self, at: u64, len: u64) -> Result<u64, LogError> {
-        let size = usize::try_from(len).map_err(|_| LogError::Damaged("a slot past usize"))?;
-        if self.zeros.as_ref().is_none_or(|zeros| zeros.len() != size) {
+        let size = usize::try_from(len).map_err(|_| LogError::Damaged("a piece past usize"))?;
+        if self.zeros.as_ref().is_none_or(|zeros| zeros.len() < size) {
             let mut zeros = AlignedBuf::zeroed(size, self.file.layout_block())
                 .map_err(|e| LogError::Disk(e.into()))?;
             zeros.set_len(size).map_err(|e| LogError::Disk(e.into()))?;
@@ -705,8 +894,9 @@ impl<F: BlockFile> Device<F> {
         let zeros = self
             .zeros
             .as_ref()
+            .and_then(|zeros| zeros.as_slice().get(..size))
             .ok_or(LogError::Damaged("no zeros to fill a slot with"))?;
-        self.file.write_all_at(zeros.as_slice(), at)?;
+        self.file.write_all_at(zeros, at)?;
         Ok(len)
     }
 

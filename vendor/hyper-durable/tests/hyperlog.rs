@@ -19,7 +19,7 @@ use std::sync::mpsc::{Receiver, sync_channel};
 use std::task::Waker;
 
 use hyper_block::sim::SimFile;
-use hyper_durable::{GroupStore, LogStore, Output, Replica, Unbounded};
+use hyper_durable::{EntryRef, GroupStore, LogStore, Output, Replica, Unbounded};
 use hyper_log::{Config, Log, Waits};
 use hyper_raft::proto::ConfState;
 use support::Kv;
@@ -141,6 +141,61 @@ fn a_refusal_for_the_groups_bound_stalls_until_a_compaction_frees_it() {
     let view = r.core().store().log().view().unwrap();
     assert!(view.hard_state.commit <= view.last);
     assert_eq!(view.last, r.applied().index);
+}
+
+/// A compaction's start, once durable, leaves the replica counting what the log holds past it
+/// without reading an applied entry back. The applied entries its handle's cache let go are the
+/// device's, read on the log owner's thread behind its writes: counted from there, they held
+/// focal's event bus 51 to 637 ms a page on the thread that serves its heartbeats (fedora,
+/// 2026-10-19). Do: a sole member over a log whose handle caches no applied entry (a
+/// `group_cache` of one byte), 24 entries of 512 bytes proposed and applied, then a compaction
+/// that keeps three of them past its start, made durable. Expect: the handle asked the log's owner
+/// nothing from the compaction to its start being durable, and the replica counts the three
+/// entries the log holds past its start, as the core counts an entry's.
+#[test]
+fn a_compactions_start_made_durable_reads_no_applied_entry_back() {
+    let log = Log::create(
+        sim_file(41),
+        Config {
+            group_cache: 1,
+            ..config(16, 1 << 12)
+        },
+        1,
+    )
+    .unwrap();
+    let (mut r, waker, woken) = sole(&log);
+    settle(&mut r, &waker, &woken);
+    let mut out = Output::default();
+    for i in 0..24u64 {
+        r.propose(Vec::new(), i.to_le_bytes().repeat(64)).unwrap();
+        out.clear();
+        r.drive(now(), &waker, &mut out).unwrap();
+        settle(&mut r, &waker, &woken);
+    }
+    let applied = r.applied().index;
+    let asked = r.core().store().log().handle().asked();
+    assert!(r.compact(3, now(), &waker).unwrap(), "a compaction is due");
+    settle(&mut r, &waker, &woken);
+    let (start, _) = r.core().store().log().handle().bounds().unwrap();
+    assert_eq!(
+        start.index,
+        applied - 3,
+        "the start keeps three applied entries"
+    );
+    assert_eq!(
+        r.core().store().log().handle().asked(),
+        asked,
+        "the count read an applied entry back through the log's owner"
+    );
+    let mut held = Vec::new();
+    r.core()
+        .store()
+        .log()
+        .entries(start.index + 1, applied + 1, u64::MAX, &mut held)
+        .unwrap();
+    assert_eq!(held.len(), 3);
+    let counted: u64 = held.iter().map(|e| EntryRef::of(e).encoded_bytes()).sum();
+    assert_eq!(r.compactable_bytes(), counted);
 }
 
 /// An owner with nothing else to do for its group waits for the log's answer to the oldest write

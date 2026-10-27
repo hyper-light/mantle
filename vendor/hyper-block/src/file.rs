@@ -55,6 +55,9 @@ pub struct DeviceFile {
     /// The epoch its kept answers hold in, unless a caller reading through several files
     /// passes its own ([`DeviceFile::read_resident_with`]).
     epoch: crate::resident::Epoch,
+    /// Whether new space is written with zeros before use ([`DeviceFile::fills_new_space`]),
+    /// asked of the file system once, at open.
+    fills: bool,
 }
 
 impl DeviceFile {
@@ -91,6 +94,13 @@ impl DeviceFile {
         };
         let node = crate::node::is_node(&file, path).map_err(wrap("stat"))?;
         refuse_zones(path, &file, node)?;
+        // A file still empty is asked to be written in place where its file system would copy it
+        // on write (`sys::written_in_place`): btrfs takes the mark only now, before the file's
+        // first byte, and a log's file comes here empty whoever made it (a caller may make it
+        // first, and open it without `create`), and grows by writes, never preallocated.
+        if !node && file.metadata().map_err(wrap("stat"))?.len() == 0 {
+            sys::written_in_place(&file);
+        }
         let layout = match caching {
             Caching::Direct => align,
             Caching::Buffered => layout_of(&file, path, align)?,
@@ -102,6 +112,7 @@ impl DeviceFile {
             Caching::Buffered => crate::resident::Resident::probed(&file)
                 .map_err(wrap("ask whether reads from memory are taken"))?,
         };
+        let fills = caching == Caching::Direct && sys::journals_allocation(&file);
         Ok(Self {
             file,
             path: path.to_path_buf(),
@@ -111,6 +122,7 @@ impl DeviceFile {
             node,
             resident,
             epoch: crate::resident::Epoch::new(),
+            fills,
         })
     }
 
@@ -139,6 +151,8 @@ impl DeviceFile {
             // file system's answer to whether it can.
             resident: self.resident.duplicate(),
             epoch: crate::resident::Epoch::new(),
+            // The same file, on the same file system.
+            fills: self.fills,
         })
     }
 
@@ -161,10 +175,15 @@ impl DeviceFile {
     }
 
     /// Whether new space is written with zeros before use (`BlockFile::fills_new_space`): a direct
-    /// file on Linux, where it was measured to remove the journal's flush from every write after a
-    /// slot's first (hyper-raft docs/benchmarks.md, "a slot written whole before its frames").
+    /// file on a file system that allocates in place and commits its allocation in its journal at
+    /// a flush (ext2, ext3, ext4, XFS: [`journals_allocation`]), where it was measured to remove
+    /// the journal's flush from every write after a slot's first (hyper-raft docs/benchmarks.md,
+    /// "a slot written whole before its frames"). Nowhere else: on btrfs, which writes out of
+    /// place, the zeros were a third of an event-bus log's bytes and its commits waited as long
+    /// without them ("zeros on btrfs, measured and dropped"); on macOS's APFS they bought nothing
+    /// either; a device node has no file system to commit for it.
     pub fn fills_new_space(&self) -> bool {
-        cfg!(target_os = "linux") && self.caching == Caching::Direct
+        self.fills
     }
 
     /// Writes all of `buf` at `offset` and makes that write durable before it returns. On Linux a
@@ -355,6 +374,16 @@ impl DeviceFile {
             self.file.sync_data()
         };
         synced.map_err(|e| self.io_error("sync_data", e))
+    }
+
+    /// Whether the file system writes the file in place where it would copy it on write: `Some`
+    /// on btrfs, whether the file is marked (`FS_NOCOW_FL`, asked at [`DeviceFile::open`] of an
+    /// empty file), `None` on a file system that writes every file in place, or that cannot say.
+    pub fn written_in_place(&self) -> Option<bool> {
+        if self.node {
+            return None;
+        }
+        sys::written_in_place_marked(&self.file)
     }
 
     /// Reserves space so the file is `len` bytes long with its blocks allocated. Only for a
@@ -611,6 +640,27 @@ fn options(create: bool) -> OpenOptions {
     options
 }
 
+/// ext2's, ext3's and ext4's statfs(2) `f_type`, one for the three
+/// (include/uapi/linux/magic.h, `EXT2_SUPER_MAGIC`, `EXT3_SUPER_MAGIC`, `EXT4_SUPER_MAGIC`).
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+const EXT_SUPER_MAGIC: i128 = 0xEF53;
+/// XFS's statfs(2) `f_type` (include/uapi/linux/magic.h, `XFS_SUPER_MAGIC`, "XFSB").
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+const XFS_SUPER_MAGIC: i128 = 0x5846_5342;
+
+/// Whether the file system of statfs(2) type `f_type` allocates a file's blocks in place and
+/// commits that allocation in its journal at a flush, so that a write past the file's size or into
+/// an unwritten extent makes the flush commit the journal (fallocate(2); fs/iomap/direct-io.c) and
+/// an overwrite of written blocks does not: ext2, ext3 and ext4 and XFS. Not btrfs, whose log
+/// files are written in place and whose commits were measured to wait as long without the zeros
+/// (hyper-raft docs/benchmarks.md, "zeros on btrfs, measured and dropped"); not a file system that
+/// writes every block out of place by design (f2fs, bcachefs), for which a block written ahead is
+/// written again elsewhere; not one that keeps nothing (tmpfs), which commits nothing.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn journals_allocation(f_type: i128) -> bool {
+    f_type == EXT_SUPER_MAGIC || f_type == XFS_SUPER_MAGIC
+}
+
 #[cfg(unix)]
 mod sys {
     use std::fs::File;
@@ -713,6 +763,66 @@ mod sys {
             .map_err(io::Error::from)
     }
 
+    /// btrfs's statfs(2) `f_type` (include/uapi/linux/magic.h, `BTRFS_SUPER_MAGIC`).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const BTRFS_SUPER_MAGIC: i128 = 0x9123_683E;
+
+    /// Whether the file's file system journals its allocation ([`super::journals_allocation`]),
+    /// by its statfs(2) `f_type`; a file system that does not answer is taken not to.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(super) fn journals_allocation(file: &File) -> bool {
+        rustix::fs::fstatfs(file).is_ok_and(|s| super::journals_allocation(i128::from(s.f_type)))
+    }
+
+    /// Elsewhere no file system focal ships on was measured to pay for the zeros (APFS).
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub(super) fn journals_allocation(_file: &File) -> bool {
+        false
+    }
+
+    /// Asks btrfs to write a still-empty file in place (`FS_NOCOW_FL`, chattr(1)'s `C`), as a
+    /// log's file is written: btrfs copies a file on write by default, so every overwrite of the
+    /// log's written blocks took new extents from its free-space bitmaps and summed its own
+    /// checksums of the data (and, mounted with `compress`, compressed it), where the log sums and
+    /// seals its own. An event-bus node on btrfs spent 6 to 25% of its CPU in
+    /// `_find_next_zero_bit` and `steal_from_bitmap` on its log's I/O thread (focal on fedora
+    /// under perf, 2026-10-19). btrfs takes the flag only on an empty file and leaves a file with
+    /// a byte in it as it is, without an error (`btrfs_fileattr_set` sets `NODATACOW` only at an
+    /// `i_size` of zero), so it is asked as the file is opened empty; systemd's journal asks the
+    /// same of its files. A file system that is not btrfs is left as it is, and a btrfs that
+    /// refuses keeps the file as before: written by copying, and as durable.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(super) fn written_in_place(file: &File) {
+        if !rustix::fs::fstatfs(file).is_ok_and(|s| i128::from(s.f_type) == BTRFS_SUPER_MAGIC) {
+            return;
+        }
+        if let Ok(flags) = rustix::fs::ioctl_getflags(file) {
+            let _ = rustix::fs::ioctl_setflags(file, flags | rustix::fs::IFlags::NOCOW);
+        }
+    }
+
+    /// Elsewhere every file system focal ships on writes a file in place.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub(super) fn written_in_place(_file: &File) {}
+
+    /// Whether the file is marked to be written in place: `None` off btrfs.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(super) fn written_in_place_marked(file: &File) -> Option<bool> {
+        let on_btrfs =
+            rustix::fs::fstatfs(file).is_ok_and(|s| i128::from(s.f_type) == BTRFS_SUPER_MAGIC);
+        if !on_btrfs {
+            return None;
+        }
+        rustix::fs::ioctl_getflags(file)
+            .ok()
+            .map(|flags| flags.contains(rustix::fs::IFlags::NOCOW))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub(super) fn written_in_place_marked(_file: &File) -> Option<bool> {
+        None
+    }
+
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(super) fn open_direct(path: &Path, create: bool) -> io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
@@ -802,6 +912,18 @@ mod sys {
         file.set_len(len)
     }
 
+    /// NTFS writes a file in place: nothing to ask.
+    pub(super) fn written_in_place(_file: &File) {}
+
+    /// NTFS was not measured to pay for the zeros: none are written.
+    pub(super) fn journals_allocation(_file: &File) -> bool {
+        false
+    }
+
+    pub(super) fn written_in_place_marked(_file: &File) -> Option<bool> {
+        None
+    }
+
     pub(super) fn open_direct(path: &Path, create: bool) -> io::Result<File> {
         let mut options = super::options(create);
         options.custom_flags(FILE_FLAG_NO_BUFFERING);
@@ -820,6 +942,87 @@ mod tests {
 
     fn align() -> Alignment {
         Alignment::new(4096).unwrap()
+    }
+
+    /// Do: open an empty file made beforehand without `create`, as a log's owner opens the file
+    /// it made (focal's bus makes it with `File::create`), then write past its end as the log
+    /// grows. Expect: on btrfs it is marked to be written in place (`FS_NOCOW_FL`), and stays
+    /// so; a file opened with a byte in it is left as it was, copied on write, since btrfs takes
+    /// the mark only on an empty file. Elsewhere nothing is asked and nothing is said. Run with
+    /// `TMPDIR` on a btrfs to see the mark.
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test makes its files outside the device layer, as the log's owner may"
+    )]
+    fn a_file_opened_empty_on_btrfs_is_written_in_place_and_one_with_bytes_is_left_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        std::fs::File::create(&path).unwrap();
+        let file = DeviceFile::open(&path, false, CachingRequest::PreferDirect, align()).unwrap();
+        let mut block = AlignedBuf::zeroed(4096, align()).unwrap();
+        block.extend_from_slice(&[7; 4096]).unwrap();
+        file.write_all_at(block.as_slice(), 1 << 20).unwrap();
+        file.sync_data().unwrap();
+        let other = dir.path().join("written");
+        std::fs::write(&other, [1u8]).unwrap();
+        let written = DeviceFile::open(&other, false, CachingRequest::Buffered, align()).unwrap();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if file.written_in_place().is_some() {
+            assert_eq!(
+                file.written_in_place(),
+                Some(true),
+                "a file opened empty on btrfs was left to be copied on write"
+            );
+            assert_eq!(written.written_in_place(), Some(false));
+            return;
+        }
+        assert_eq!(file.written_in_place(), None);
+        assert_eq!(written.written_in_place(), None);
+    }
+
+    /// New space is written with zeros only where the file system allocates in place and journals
+    /// it: the ext family and XFS, never btrfs, f2fs, bcachefs or tmpfs. A direct file answers by
+    /// its own file system's type, a buffered one never fills (`fills_new_space`).
+    #[test]
+    fn zeros_are_written_ahead_only_where_the_file_system_journals_its_allocation() {
+        for (f_type, fills) in [
+            (0xEF53, true),
+            (0x5846_5342, true),
+            (0x9123_683E, false),
+            (0xF2F5_2010, false),
+            (0xCA45_1A4E, false),
+            (0x0102_1994, false),
+        ] {
+            assert_eq!(journals_allocation(f_type), fills, "{f_type:#x}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let direct = DeviceFile::open(
+            &dir.path().join("direct"),
+            true,
+            CachingRequest::PreferDirect,
+            align(),
+        )
+        .unwrap();
+        let buffered = DeviceFile::open(
+            &dir.path().join("buffered"),
+            true,
+            CachingRequest::Buffered,
+            align(),
+        )
+        .unwrap();
+        assert!(!buffered.fills_new_space());
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let f_type = i128::from(rustix::fs::statfs(dir.path()).unwrap().f_type);
+            assert_eq!(
+                direct.fills_new_space(),
+                direct.caching == Caching::Direct && journals_allocation(f_type),
+                "{f_type:#x}"
+            );
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        assert!(!direct.fills_new_space());
     }
 
     /// A transfer of no bytes from an empty buffer, whose address is the empty slice's, is no

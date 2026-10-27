@@ -1856,6 +1856,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.lost(peer, now);
                 Ok(())
             }
+            // A path's degrading and its progress again: the connection stays open either way, and
+            // whether its peer lives the plane's suspicion judges, not the transport's hint.
+            Event::Degrading { .. } | Event::Progressing { .. } => Ok(()),
         }
     }
 

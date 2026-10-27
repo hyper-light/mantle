@@ -80,6 +80,7 @@ fn the_log_at_the_floor_holds_its_groups_retention() {
                     term: 1,
                     vote: 1,
                     commit: next - 1,
+                    held: None,
                 }),
                 ..Update::default()
             };

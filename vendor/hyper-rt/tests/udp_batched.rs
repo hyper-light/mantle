@@ -812,8 +812,8 @@ fn a_drop_is_told_by_the_next_datagram() {
     .unwrap();
 }
 
-/// Do: on Linux, a ring of eight places, three datagrams queued, then one receive of what was
-/// queued. Expect: one call takes the three and says the socket is empty. recvmmsg(2) with
+/// Do: on Linux, a ring grown to eight places, three datagrams queued, then one receive of what
+/// was queued. Expect: one call takes the three and says the socket is empty. recvmmsg(2) with
 /// `MSG_DONTWAIT` returns what is queued, so a call that fills fewer places than it offers found
 /// nothing more, and the receive asks no more. Until 2026-10-16 it asked again for the `EAGAIN`
 /// that said so: a system call a drain, 0.59 a message at 10,000 messages a second (strace of a bus
@@ -827,6 +827,7 @@ fn a_receive_that_fills_fewer_places_than_it_offers_asks_no_more() {
         let sender = UdpSocket::bind(loopback).unwrap();
         let mut receiver = Batched::bind_lent(loopback, true).unwrap();
         let mut ring = Ring::new(Io { batch: 8 }).unwrap();
+        ring.resize(8).unwrap();
         let to = receiver.local_addr().unwrap();
         // A loopback send queues its datagram before it returns.
         for index in 0..3u8 {
@@ -847,6 +848,105 @@ fn a_receive_that_fills_fewer_places_than_it_offers_asks_no_more() {
             0,
             "a call that filled three of eight places asked again"
         );
+    })
+    .unwrap();
+}
+
+/// Queues `count` one-byte datagrams for `receiver` and takes them through `ring` in one drain,
+/// begun at `began_ns`; the messages it took, how it ended, and the receive calls and the empty
+/// ones it made.
+#[cfg(target_os = "linux")]
+fn drained(
+    sender: &UdpSocket,
+    receiver: &mut Batched,
+    ring: &mut Ring,
+    count: u8,
+    began_ns: u64,
+) -> (usize, Queued, u64, u64) {
+    let to = receiver.local_addr().unwrap();
+    // A loopback send queues its datagram before it returns.
+    for index in 0..count {
+        sender.send_to(&[index], to).unwrap();
+    }
+    let before = receiver.stats();
+    let (got, ended) = receiver
+        .receive_queued(ring, began_ns, 16, |_, _| {})
+        .unwrap();
+    let after = receiver.stats();
+    (
+        got.messages,
+        ended,
+        after.receive_calls - before.receive_calls,
+        after.receives_empty - before.receives_empty,
+    )
+}
+
+/// Do: on Linux, a new ring of a batch of eight (one place), five datagrams queued and taken in a
+/// drain that no stamp is past, the ring resized as it then wants, four more queued and taken.
+/// Expect: the first drain takes the five a call each, its sixth call finding the socket empty,
+/// and the ring wants five; resized, it holds five buffers, and the second drain takes the four in
+/// one call that asks no more. A ring holds what its drains needed, not its batch from the start.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_ring_grows_to_what_a_drain_took_and_the_next_takes_one_call() {
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async {
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let sender = UdpSocket::bind(loopback).unwrap();
+        let mut receiver = Batched::bind_lent(loopback, true).unwrap();
+        let io = Io { batch: 8 };
+        let mut ring = Ring::new(io).unwrap();
+        assert_eq!(ring.buffers(), 1);
+        assert_eq!(ring.held_bytes(), Ring::bytes_for(io, 1));
+        assert!(ring.held_bytes() < ring.held_bound());
+        // Begun at the end of time: no kernel stamp, carried late by a busy machine, is past it.
+        assert_eq!(
+            drained(&sender, &mut receiver, &mut ring, 5, u64::MAX),
+            (5, Queued::Emptied, 5, 1)
+        );
+        assert_eq!(ring.wants(), Some(5));
+        ring.resize(5).unwrap();
+        assert_eq!(ring.held_bytes(), Ring::bytes_for(io, 5));
+        assert_eq!(
+            drained(&sender, &mut receiver, &mut ring, 4, u64::MAX),
+            (4, Queued::Emptied, 1, 0)
+        );
+        assert_eq!(ring.wants(), None, "{ring:?}");
+    })
+    .unwrap();
+}
+
+/// Do: on Linux, a socket without the kernel's stamps, which takes one call a drain (its
+/// `FIONREAD` tells only the next datagram), seven datagrams queued, then drains of a new ring of a
+/// batch of eight, resized each time it wants. Expect: each drain fills every place it offers and
+/// leaves more, and the ring doubles, 1, 2, 4, to its batch; the drain after the last takes
+/// nothing, and the ring wants no more.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_drain_that_leaves_more_doubles_the_ring() {
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async {
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let sender = UdpSocket::bind(loopback).unwrap();
+        let mut receiver = Batched::bind_lent(loopback, false).unwrap();
+        let mut ring = Ring::new(Io { batch: 8 }).unwrap();
+        let first = drained(&sender, &mut receiver, &mut ring, 7, now_ns());
+        assert_eq!(first, (1, Queued::More, 1, 0));
+        for (took, wanted) in [(1, 2), (2, 4), (4, 8)] {
+            assert_eq!(
+                ring.wants(),
+                Some(wanted),
+                "after a drain of {took}: {ring:?}"
+            );
+            ring.resize(wanted).unwrap();
+            if wanted < 8 {
+                let next = drained(&sender, &mut receiver, &mut ring, 0, now_ns());
+                assert_eq!(next, (wanted, Queued::More, 1, 0));
+            }
+        }
+        let last = drained(&sender, &mut receiver, &mut ring, 0, now_ns());
+        assert_eq!((last.0, last.1), (0, Queued::Emptied));
+        assert_eq!(ring.wants(), None, "{ring:?}");
     })
     .unwrap();
 }

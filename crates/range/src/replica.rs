@@ -261,6 +261,10 @@ pub fn open_shell<L: LogStore, E: Engine>(
         },
         elections,
         quiet: QUIET,
+        // A leader applies only what a majority's disks hold, its own among them (CLAUDE.md §6):
+        // the disk mode that commits on its followers' disks while its own lags is a durability
+        // decision of its own, not taken here.
+        disk: hyper_durable::Disk::Flushed,
     };
     hyper_durable::Replica::open(&settings, store, machine, Unbounded).map_err(opened)
 }

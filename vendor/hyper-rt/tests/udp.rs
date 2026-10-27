@@ -435,6 +435,41 @@ fn a_simulated_udp_datagram_is_received() {
     }
 }
 
+/// On the simulation fabric a port of the shard's own range asked for by number is the port bound, a
+/// second bind of it is refused while the first holds it, and it is bound again once the first has
+/// closed, as a node started again on its shard binds where its peers dial it; port 0 takes the next
+/// free port, the one asked for passed over.
+#[test]
+fn a_simulated_bind_takes_the_port_asked_for_in_its_shard() {
+    use hyper_rt::sim::SimRuntime;
+
+    let mut sim = SimRuntime::new(&config(), 1).unwrap();
+    let id = sim.shard_ids()[0];
+    let (tx, rx) = channel();
+    sim.spawn_on(id, async move {
+        let at = |port| SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+        let port_of = |socket: &UdpSocket| socket.local_addr().unwrap().port();
+        let any = UdpSocket::bind(at(0)).unwrap();
+        let first = port_of(&any);
+        let asked = first + 5;
+        let held = UdpSocket::bind(at(asked)).unwrap();
+        let bound = port_of(&held);
+        let refused = UdpSocket::bind(at(asked)).is_err();
+        drop(held);
+        let again = UdpSocket::bind(at(asked)).unwrap();
+        let rebound = port_of(&again);
+        let next = port_of(&UdpSocket::bind(at(0)).unwrap());
+        let _ = tx.send((first, asked, bound, refused, rebound, next));
+    })
+    .unwrap();
+    sim.run_until_idle();
+    let (first, asked, bound, refused, rebound, next) = rx.try_recv().unwrap();
+    assert_eq!(bound, asked);
+    assert!(refused, "a bound port is refused");
+    assert_eq!(rebound, asked);
+    assert_eq!(next, first + 1);
+}
+
 // ── The fabric's latency model (§4.8 A-9: "independently delayed … messages") ────────────────────────
 
 /// Shape: the one-way delay of the modelled inter-region path — 80 ms, half the 162 ms P50 round trip
@@ -544,6 +579,95 @@ fn a_reordering_path_overtakes_within_one_flow() {
     assert!(
         overtakes > 0,
         "the reordering model let a later datagram overtake an earlier one at least once"
+    );
+}
+
+/// Sends `FLOW_LENGTH` datagrams `SEND_GAP_NS` apart over `path`, each stamped with its virtual send
+/// time, and returns every datagram the receiver saw by a virtual second after the last send (arrival,
+/// stamp), in arrival order, with the fabric's counts.
+fn run_counted_flow(
+    seed: u64,
+    path: hyper_rt::sim::SimPath,
+) -> (Vec<(u64, u64)>, hyper_rt::sim::SimFabricStats) {
+    use hyper_rt::sim::SimRuntime;
+
+    let mut sim = SimRuntime::new(&config(), seed).unwrap();
+    sim.set_path(path);
+    let id = sim.shard_ids()[0];
+    let (port_tx, port_rx) = channel();
+    let (seen, arrivals) = channel();
+
+    sim.spawn_on(id, async move {
+        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let _ = port_tx.send(socket.local_addr().unwrap().port());
+        let mut buf = [0u8; 8];
+        loop {
+            let (n, _) = socket.recv_from(&mut buf).await.unwrap();
+            assert_eq!(n, 8, "a whole stamp arrived");
+            let stamp = u64::from_le_bytes(buf);
+            let _ = seen.send((hyper_rt::futures::now_ns(), stamp));
+        }
+    })
+    .unwrap();
+
+    sim.spawn_on(id, async move {
+        let port = loop {
+            if let Ok(p) = port_rx.try_recv() {
+                break p;
+            }
+            hyper_rt::futures::sleep(1_000).await.unwrap();
+        };
+        let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let dest = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+        for _ in 0..FLOW_LENGTH {
+            let stamp = hyper_rt::futures::now_ns();
+            let _ = sender.send_to(&stamp.to_le_bytes(), dest);
+            hyper_rt::futures::sleep(SEND_GAP_NS).await.unwrap();
+        }
+    })
+    .unwrap();
+
+    sim.run_until(SEND_GAP_NS * FLOW_LENGTH as u64 + 1_000_000_000);
+    (arrivals.try_iter().collect(), sim.stats())
+}
+
+/// AC (§4.8 A-9 "duplicated messages"; Quiver's CP-T2.2 step 6): a path told to duplicate delivers that
+/// many datagrams in a million twice, each copy after a delay of its own, kept in the flow's order where
+/// the path keeps it, and counted (`SimFabricStats::duplicated`); a path told nothing duplicates nothing.
+#[test]
+fn a_duplicating_path_delivers_datagrams_twice() {
+    use hyper_rt::sim::SimPath;
+
+    let path = SimPath::in_order(ONE_WAY_NS, JITTER_NS);
+    let (always, fabric) = run_counted_flow(7, path.with_duplicates(1_000_000));
+    assert_eq!(fabric.duplicated, FLOW_LENGTH as u64, "{fabric:?}");
+    assert_eq!(
+        always.len(),
+        2 * FLOW_LENGTH,
+        "every datagram arrived twice"
+    );
+    let mut stamps: Vec<u64> = always.iter().map(|(_, stamp)| *stamp).collect();
+    assert!(
+        stamps.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the copies kept the flow in order"
+    );
+    stamps.dedup();
+    assert_eq!(stamps.len(), FLOW_LENGTH, "each datagram twice, none more");
+
+    let reordering = SimPath::reordering(ONE_WAY_NS, JITTER_NS).with_duplicates(300_000);
+    let (some, fabric) = run_counted_flow(7, reordering);
+    assert!(
+        fabric.duplicated > 0 && fabric.duplicated < FLOW_LENGTH as u64,
+        "{fabric:?}"
+    );
+    assert_eq!(some.len(), FLOW_LENGTH + fabric.duplicated as usize);
+
+    let (none, fabric) = run_counted_flow(7, path);
+    assert_eq!(fabric.duplicated, 0);
+    assert_eq!(
+        none.len(),
+        FLOW_LENGTH,
+        "a plain path delivers each datagram once"
     );
 }
 

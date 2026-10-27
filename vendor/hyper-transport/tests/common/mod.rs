@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer, Tls};
 use hyper_transport::{
     AdmissionLimits, Authenticated, Budget, Classes, Config, Directory, Endpoint, Event, Fixed,
-    Limits, PeerId, Refusal, Transmit,
+    Limits, PeerId, Refusal, RestartKey, Transmit,
 };
 
 /// The deployment's authority, issuing one certificate per node.
@@ -281,6 +281,38 @@ impl Classes for Pooled {
     }
 }
 
+/// [`Pooled`] whose snapshots wait on their owner's event, as a long poll does
+/// ([`hyper_transport::Classes::waits`]): parked as they arrive, holding none of the pool.
+pub struct PooledWaits;
+
+impl Classes for PooledWaits {
+    type Class = Class;
+    type Kind = Kind;
+    type Role = Role;
+    const RANKS: u8 = 3;
+    fn rank(class: Class) -> u8 {
+        rank(class)
+    }
+    fn class_of(kind: Kind, role: Role) -> Option<Class> {
+        mantle_class(kind, role)
+    }
+    fn frame_bound(class: Class) -> u64 {
+        Mantle::frame_bound(class)
+    }
+    fn kind_code(kind: Kind) -> u16 {
+        kind_code(kind)
+    }
+    fn kind_of(code: u16) -> Option<Kind> {
+        kind_of(code)
+    }
+    fn pooled(_role: Role) -> bool {
+        true
+    }
+    fn waits(kind: Kind) -> bool {
+        kind == Kind::Snapshot
+    }
+}
+
 /// Which certificate is which peer.
 #[derive(Default)]
 pub struct Book {
@@ -335,6 +367,7 @@ pub fn limits() -> Limits {
         max_responses: 16,
         // A full 16 MiB window of unread data, packed: 16 MiB / 65,527 B, and one.
         receive_chunks: (16 << 20) / hyper_transport::RECEIVE_CHUNK + 1,
+        retry_bytes: None,
     }
 }
 
@@ -757,6 +790,41 @@ impl Pair {
     }
 }
 
+impl Pair {
+    /// [`Pair::node`], keyed by `restart`, the key the node keeps across its restarts
+    /// (`Endpoint::new_restartable`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn restartable<C: Classes<Role = Role>>(
+        &self,
+        which: PeerId,
+        role: Role,
+        book: Book,
+        limits: Limits,
+        budget: u64,
+        now: Instant,
+        restart: &RestartKey,
+    ) -> Node<C> {
+        let (certificate, key) = if which == 1 { &self.one } else { &self.two };
+        let config = Config {
+            tls: Tls::mutual(&credentials(&self.pki.root, certificate, key), true).unwrap(),
+            role,
+            limits,
+            congestion: Default::default(),
+        };
+        let mut node = Endpoint::new_restartable(
+            config,
+            Fixed::new(budget, 64),
+            book,
+            now,
+            restart,
+            Some(seed_of(which)),
+        )
+        .unwrap();
+        node.set_default_path_ceiling(u16::try_from(LINK_PAYLOAD).unwrap());
+        node
+    }
+}
+
 /// The QUIC layer's seed for node `peer` of the tests: its own, the same in every run, so a run's
 /// handshakes take the same sizes from one run to the next (`Endpoint::new_seeded`).
 pub fn seed_of(peer: PeerId) -> [u8; 32] {
@@ -811,6 +879,9 @@ struct Served {
 pub struct Server {
     served: Vec<Served>,
     pub hold_bulk: bool,
+    /// Bulk requests are read whole and their answers held while set: a read that waits for an
+    /// event its owner awaits (a long poll), its request taken, its answer not yet.
+    pub hold_replies: bool,
     /// How long the server takes to answer once it has a request whole, by `now`.
     pub think: Duration,
     /// A request body longer than this is never read (0: every body is read): a peer that holds
@@ -838,6 +909,7 @@ impl Server {
         Self {
             served: Vec::new(),
             hold_bulk: false,
+            hold_replies: false,
             think: Duration::ZERO,
             unread_above: 0,
             pace: None,
@@ -933,6 +1005,22 @@ impl Server {
         (bytes * (steps + 1)).saturating_sub(read).min(PIECE as u64)
     }
 
+    /// Whether a request read whole is answered now: not while its answer is held (a bulk one
+    /// while `hold_replies` is set), and once the server has thought.
+    fn answer_due(&self, served: &mut Served) -> bool {
+        if served.class == Class::Bulk && self.hold_replies {
+            return false;
+        }
+        if self.think.is_zero() {
+            return true;
+        }
+        let Some(now) = self.now else {
+            return false;
+        };
+        let whole = *served.whole.get_or_insert(now);
+        now >= whole + self.think
+    }
+
     /// What a paced read took, counted against the pace.
     fn paced_read(&mut self, got: &Result<usize, Refusal>) {
         if let (Some(_), Ok(got), Some((_, read))) = (self.pace, got, self.paced.as_mut()) {
@@ -983,15 +1071,8 @@ impl Server {
                 return false;
             }
         }
-        if !served.replied && !self.think.is_zero() {
-            // The request is whole: the answer is given once the server has thought.
-            let Some(now) = self.now else {
-                return false;
-            };
-            let whole = *served.whole.get_or_insert(now);
-            if now < whole + self.think {
-                return false;
-            }
+        if !served.replied && !self.answer_due(served) {
+            return false;
         }
         if !served.replied {
             let mut head = b"ok:".to_vec();
@@ -1290,7 +1371,8 @@ impl<N: Drive> Mesh<N> {
         let limits = hyper_sim::Limits {
             events: 1 << 12,
             nodes: count,
-            streams: 8,
+            // One for the schedule and one a node (`hyper_sim::Limits::streams`).
+            streams: count + 1,
             steps: u64::MAX,
             trace_words: 0,
         };

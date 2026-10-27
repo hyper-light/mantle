@@ -203,6 +203,10 @@ pub fn limits(stated: &Stated) -> Result<Limits, Unfit> {
         // One response a peer at a time.
         max_responses: peers,
         receive_chunks,
+        // A handshake from an address not yet proven is answered with a Retry once half the
+        // pending places are taken (RFC 9000 §8.1.2), as before hyper-transport could count
+        // the handshakes' bytes instead.
+        retry_bytes: None,
     })
 }
 

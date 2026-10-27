@@ -331,6 +331,85 @@ fn a_follower_past_its_durable_commit_asks_to_be_driven_when_its_quiet_period_en
     assert_eq!(r.deadline(), None, "nothing left to drive it for");
 }
 
+/// An owner whose period is a measure that moves states it as it moves (`Replica::set_quiet`), as
+/// an event-driven owner's is the interval its liveness stream sends at: a commit that moved alone
+/// is written once the period in force has passed, judged by the period stated last, not by the
+/// one it was opened with.
+#[test]
+fn a_quiet_period_restated_by_the_owner_judges_the_commit_written_alone() {
+    let mut s = settings(1, 7);
+    s.quiet = std::time::Duration::from_nanos(10);
+    let mut r: Sim = Replica::open(
+        &s,
+        SimStore::new(3),
+        Kv::new(voters(&[1, 2, 3]), false),
+        Unbounded,
+    )
+    .unwrap();
+    r.step(Message {
+        msg_type: MessageType::MsgHeartbeat,
+        from: 2,
+        to: 1,
+        term: 1,
+        ..Message::default()
+    })
+    .unwrap();
+    pump(&mut r);
+    let last = r.core().raft.log().last_index().unwrap();
+    let log_term = r.core().raft.log().term(last).unwrap();
+    r.step(Message {
+        msg_type: MessageType::MsgAppend,
+        from: 2,
+        to: 1,
+        term: 1,
+        index: last,
+        log_term,
+        commit: last,
+        entries: vec![Entry {
+            index: last + 1,
+            term: 1,
+            data: b"entry".to_vec(),
+            ..Entry::default()
+        }],
+        ..Message::default()
+    })
+    .unwrap();
+    pump(&mut r);
+    // The owner's period grows before the commit moves alone.
+    let longer = 1_000_000u64;
+    r.set_quiet(std::time::Duration::from_nanos(longer));
+    r.step(Message {
+        msg_type: MessageType::MsgHeartbeat,
+        from: 2,
+        to: 1,
+        term: 1,
+        commit: last + 1,
+        ..Message::default()
+    })
+    .unwrap();
+    pump(&mut r);
+    assert_eq!(r.applied().index, last + 1);
+    assert!(r.durable_commit() < last + 1);
+    let at = now();
+    let due = r
+        .deadline()
+        .expect("a deadline for the commit applied and unwritten");
+    assert!(
+        due > at + 10 && due <= at + longer,
+        "due {due} at {at}: the period stated last"
+    );
+    // Past the period it opened with and short of the one stated: no write of the commit.
+    let mut out = Output::default();
+    r.drive(at + 20, waker(), &mut out).unwrap();
+    assert_eq!(r.writes().quiet, 0);
+    r.drive(due, waker(), &mut out).unwrap();
+    while r.log_mut().make_durable() {}
+    out.clear();
+    r.drive(due + 1, waker(), &mut out).unwrap();
+    assert_eq!(r.writes().quiet, 1);
+    assert!(r.durable_commit() >= r.applied().index);
+}
+
 /// A write refused for room stalls the replica: inputs are refused `Stalled`, its campaigns held
 /// whatever its detectors say, snapshot reports kept (one a member, members only), and the
 /// refused writes are made again, in order, once the log has room; nothing was lost.
@@ -600,6 +679,55 @@ fn the_budget_refuses_what_it_cannot_hold_and_follows_what_is_held() {
     assert_eq!(r.machine().now.entries.len(), 2);
 }
 
+/// A full budget refuses what brings the core something it keeps, and takes what lets it drain
+/// (kiln's CP-T2.2): a proposal and an append with an entry are refused for room, and an
+/// acknowledgement, which carries no entry, snapshot or context and is answered with nothing, is
+/// taken, so a full leader still hears what commits and hands over.
+#[test]
+fn a_full_budget_takes_what_lets_it_drain_and_refuses_what_it_would_keep() {
+    let mut r = sole(2, Bytes::new(1 << 20), |_| {});
+    // Past the room and all the replica holds, which a trim could give back.
+    let room = r.budget_mut().room().unwrap() as u64;
+    let past = room + r.charged() + 1;
+    r.budget_mut().charge(past);
+    assert_eq!(r.budget_mut().room(), Some(0));
+    assert!(matches!(
+        r.propose(Vec::new(), vec![0; 16]),
+        Err(ReplicaError::Budget(_))
+    ));
+    let term = r.term();
+    let append = Message {
+        msg_type: MessageType::MsgAppend,
+        from: 2,
+        to: 1,
+        term: term + 1,
+        entries: vec![Entry {
+            term: term + 1,
+            index: 99,
+            data: vec![1; 16],
+            ..Entry::default()
+        }],
+        ..Message::default()
+    };
+    assert!(matches!(r.step(append), Err(ReplicaError::Budget(_))));
+    for msg_type in [
+        MessageType::MsgAppendResponse,
+        MessageType::MsgHeartbeatResponse,
+    ] {
+        let outcome = r.step(Message {
+            msg_type,
+            from: 2,
+            to: 1,
+            term,
+            ..Message::default()
+        });
+        assert!(
+            !matches!(outcome, Err(ReplicaError::Budget(_))),
+            "{msg_type:?} refused for room: {outcome:?}"
+        );
+    }
+}
+
 /// A state machine that unwinds on an entry.
 struct Boom(Kv);
 impl StateMachine for Boom {
@@ -713,6 +841,8 @@ fn store_with(entries: &[Entry], commit: u64) -> RamStore {
                 term: 2,
                 vote: 1,
                 commit,
+                held_index: 0,
+                held_term: 0,
             }),
             ..Write::default()
         })
@@ -823,6 +953,8 @@ fn marked_store() -> SimStore {
                 term: 1,
                 vote: 1,
                 commit: 1,
+                held_index: 0,
+                held_term: 0,
             }),
             ..Write::default()
         })
@@ -1811,6 +1943,77 @@ fn a_write_made_again_never_starts_the_log_past_the_state_machine() {
     }
     assert_eq!(r.log_mut().disk.start.index, 8, "the snapshot's own write");
     assert_eq!(r.machine().durable.applied.index, 8);
+}
+
+/// A write made again holds what the refused writes held and nothing past it: an entry no write
+/// was issued for waits for the `Ready` that issues it. Written with them, the core issued it
+/// again, its followers took it from that `Ready` and committed it, the leader applied it ahead of
+/// its write, and a compaction bounded by what the store held passed it while the leader stalled
+/// a second time: the store refused it, made again, below its start (the shell's simulation, seed
+/// 9785 of its fourth shape: "refused write: first 9 ... disk start 11").
+#[test]
+fn a_write_made_again_holds_only_what_the_refused_writes_held() {
+    let room = Fault::Room("the group's retained bound");
+    let mut r = led(3, true);
+    acknowledge(&mut r, 2);
+    acknowledge(&mut r, 3);
+    pump(&mut r);
+    // One entry in a write the log refuses, and two proposed before the refusal is taken, which
+    // no write was issued for.
+    r.propose(Vec::new(), b"a".to_vec()).unwrap();
+    let mut out = Output::default();
+    r.drive(now(), waker(), &mut out).unwrap();
+    let a = r.core().raft.log().last_index().unwrap();
+    r.log_mut().refuse = Some(room.clone());
+    assert!(r.log_mut().make_durable(), "refused");
+    r.propose(Vec::new(), b"b".to_vec()).unwrap();
+    r.propose(Vec::new(), b"c".to_vec()).unwrap();
+    let c = r.core().raft.log().last_index().unwrap();
+    out.clear();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert!(r.is_stalled());
+    // Made again: the refused write, then the `Ready` of the two, whose appends leave with it.
+    r.resume();
+    out.clear();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert!(!r.is_stalled());
+    assert_eq!(r.log_mut().pending(), 2);
+    acknowledge(&mut r, 2);
+    acknowledge(&mut r, 3);
+    out.clear();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert_eq!(r.applied().index, c, "applied ahead of its write");
+    assert!(r.log_mut().make_durable());
+    assert_eq!(
+        r.log_mut().disk.last(),
+        a,
+        "the write made again held more than the refused write"
+    );
+    // The write of the two is refused too, and the leader compacts while stalled.
+    r.log_mut().refuse = Some(room);
+    assert!(r.log_mut().make_durable(), "refused");
+    out.clear();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert!(r.is_stalled());
+    assert!(r.compact(0, now(), waker()).unwrap());
+    assert!(r.log_mut().make_durable());
+    let started = r.log_mut().disk.start.index;
+    assert!(
+        started <= a,
+        "compacted past what the store held, to {started}"
+    );
+    pump(&mut r);
+    assert!(!r.is_stalled());
+    assert_eq!(r.log_mut().disk.last(), c);
+    let applied: Vec<&[u8]> = r
+        .machine()
+        .now
+        .entries
+        .iter()
+        .map(|(_, _, data)| data.as_slice())
+        .filter(|data| !data.is_empty())
+        .collect();
+    assert_eq!(applied, [&b"a"[..], b"b", b"c"]);
 }
 
 /// The window a leader keeps in flight to a member is twice what the transport says the path to it

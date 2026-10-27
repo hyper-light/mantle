@@ -243,6 +243,8 @@ pub struct Cluster<R> {
     pub clocks: BTreeMap<u64, u64>,
     /// Faults at rest suffered.
     pub faults: u64,
+    /// Commits a held quorum alone made (core step R-8), not yet durable on a majority.
+    pub held_commits: u64,
     /// Schedules whose group was left waiting on a mark, as the election rule
     /// must (`Cluster::electable`).
     pub waits: u64,
@@ -291,6 +293,7 @@ impl<R: Replica> Cluster<R> {
             stopped: Coverage::default(),
             clocks: BTreeMap::new(),
             faults: 0,
+            held_commits: 0,
             waits: 0,
             repaired: 0,
             marked_steps: 0,
@@ -718,12 +721,58 @@ impl<R: Replica> Cluster<R> {
                             > half.len()
                 })
             };
+            // R-8: or a held quorum holds it: in each half a majority of its voters, the leader
+            // by its disk alone, each other by its log in memory, its disk, or the promise its disk
+            // states; their fates and the leader's spanning what the group asks.
+            let fates = self.settings.fates;
+            let held_in_memory = |conf: &ConfState| {
+                let Some(fating) = fates else {
+                    return false;
+                };
+                [&conf.voters, &conf.voters_outgoing].iter().all(|half| {
+                    if half.is_empty() {
+                        return true;
+                    }
+                    let holders: Vec<u64> = half
+                        .iter()
+                        .copied()
+                        .filter(|voter| {
+                            let disk = self.disk(*voter);
+                            if *voter == id {
+                                return holds(disk, committed);
+                            }
+                            holds(disk, committed)
+                                || disk.promises(committed.index, committed.term)
+                                || kept(disk)
+                                || self
+                                    .peek(*voter)
+                                    .is_some_and(|replica| replica.holds_in_log(committed))
+                        })
+                        .collect();
+                    let mut spanned: Vec<u64> =
+                        holders.iter().map(|voter| fating.of(*voter)).collect();
+                    spanned.push(fating.of(id));
+                    spanned.sort_unstable();
+                    spanned.dedup();
+                    // A holder's disk holding it waives the span: no failure of memory loses it.
+                    let on_disk = holders
+                        .iter()
+                        .any(|voter| holds(self.disk(*voter), committed));
+                    holders.len() * 2 > half.len()
+                        && (on_disk || spanned.len() >= fating.spanning())
+                })
+            };
+            // A durable majority's commit is the classic one; only one it does not hold is counted
+            // as a held quorum's.
+            let classic = held(&conf) || before.as_ref().is_some_and(held);
+            if !classic && (held_in_memory(&conf) || before.as_ref().is_some_and(held_in_memory)) {
+                self.held_commits += 1;
+                continue;
+            }
             assert!(
-                held(&conf) || before.as_ref().is_some_and(held),
+                classic,
                 "seed {}: leader {id} of term {} committed {} that no majority of {conf:?} or {before:?} holds durably",
-                self.seed,
-                led.term,
-                committed.index
+                self.seed, led.term, committed.index
             );
         }
     }
@@ -1116,9 +1165,11 @@ impl<R: Replica> Cluster<R> {
             let conf = self.disk(id).conf.clone();
             let deadline = self.peek(id).map(|node| node.deadline());
             println!(
-                "member {id}: deadline {deadline:?} clock {:?} proposed {proposed:?} {conf:?} mark {:?}\n  {view:?}",
+                "member {id}: deadline {deadline:?} clock {:?} proposed {proposed:?} {conf:?} mark {:?} promise_mark {:?} hard {:?}\n  {view:?}",
                 self.clocks.get(&id),
-                self.disk(id).lost
+                self.disk(id).lost,
+                self.disk(id).promise_mark(),
+                self.disk(id).hard_state
             );
         }
         false
@@ -1140,8 +1191,12 @@ impl<R: Replica> Cluster<R> {
         let claim = |disk: &Disk| {
             let last = disk.last_index();
             let whole = (disk.term(last).unwrap_or(0), last);
-            disk.mark()
-                .map_or(whole, |lost| (lost.term, lost.index).max(whole))
+            let marked = disk
+                .mark()
+                .map_or(whole, |lost| (lost.term, lost.index).max(whole));
+            // A promise its log does not reach is a mark too (core step R-8).
+            disk.promise_mark()
+                .map_or(marked, |mark| (mark.term, mark.index).max(marked))
         };
         self.ids()
             .into_iter()
@@ -1151,7 +1206,7 @@ impl<R: Replica> Cluster<R> {
                 let counted = node.and_then(Replica::counts_by);
                 let conf = counted.as_ref().unwrap_or(&disk.conf);
                 let stands = node.map_or(votes(conf, *candidate), |node| node.view().promotable);
-                let marked = disk.mark().is_some();
+                let marked = disk.mark().is_some() || disk.promise_mark().is_some();
                 if !stands || (marked && self.settings.fast) {
                     return false;
                 }

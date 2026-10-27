@@ -47,7 +47,9 @@ mod lane;
 mod pool;
 mod progress;
 mod receive;
+mod restart;
 mod round;
+mod state;
 mod tally;
 mod timing;
 pub mod tls;
@@ -59,7 +61,10 @@ pub use credit::{
     K_GRANULARITY, MIN_DATAGRAM, STREAM_BYTES_PER_PACKET, class_reserve, initial_window,
     socket_buffer_ask, stream_window_ceiling,
 };
-pub use endpoint::{AskQueue, Config, Endpoint, Limits, PathFacts, Stats, StreamCredit};
+pub use endpoint::{
+    AskQueue, Config, Endpoint, Limits, PathFacts, Stats, StreamCredit, connection_charge,
+    state_charge,
+};
 pub use error::Refusal;
 pub use frame::Embedded;
 /// The congestion controllers a connection may run ([`Config::congestion`]).
@@ -71,7 +76,9 @@ pub use hyper_timing::Lateness;
 pub use pool::PoolStats;
 pub use progress::{LEAST_PROGRESS, Progress};
 pub use receive::RECEIVE_CHUNK;
+pub use restart::RestartKey;
 pub use round::{Round, RoundEnd};
+pub use state::StateStats;
 pub use timing::spread;
 
 use std::fmt::Debug;
@@ -117,6 +124,16 @@ pub trait Classes {
     /// may. None is, unless a side says so.
     fn pooled(role: Self::Role) -> bool {
         let _ = role;
+        false
+    }
+    /// Whether an exchange of `kind` waits on an event its owner awaits rather than on the
+    /// endpoint's service: a read held until something arrives for it or its wait ends (a long
+    /// poll). One a pooled peer opens is parked as its head arrives, holding none of the pool's
+    /// credit while it waits: its connection is granted a stream of its own for it, within the
+    /// streams one connection may hold (`crate::pool`, docs/transport.md §4ab). None does, unless a
+    /// side says so.
+    fn waits(kind: Self::Kind) -> bool {
+        let _ = kind;
         false
     }
     /// Whether a lane frame of `class` is never skipped. A frame whose class bound or budget cannot
@@ -284,6 +301,26 @@ pub enum Event<C: Classes> {
         /// (the path, a timeout, a reset).
         refusal: Option<Refusal>,
     },
+    /// Nothing this side sent on its connection of `epoch` to `peer`, the one it dialed, was
+    /// acknowledged for four probe timeouts (hyper-quic's `PathDegrading`, quiche's default): the
+    /// peer, or the path to it, may be gone. The connection stays open, and its exchanges and lanes
+    /// with it; told once, and not again until the peer acknowledges ([`Event::Progressing`]). Its
+    /// close says more and replaces it. A dialer that can go elsewhere may ask another peer, as
+    /// Chromium's QUIC session moves to another path when told its path is degrading.
+    Degrading {
+        /// The peer.
+        peer: PeerId,
+        /// The epoch of the connection whose path is degrading.
+        epoch: Epoch,
+    },
+    /// The peer acknowledged again on the connection of `epoch` after [`Event::Degrading`] was
+    /// told of it.
+    Progressing {
+        /// The peer.
+        peer: PeerId,
+        /// The epoch of the connection that made progress.
+        epoch: Epoch,
+    },
 }
 
 impl<C: Classes> Debug for Event<C> {
@@ -355,6 +392,12 @@ impl<C: Classes> Debug for Event<C> {
                     formatter,
                     "Unreachable {{ peer: {peer}, refusal: {refusal:?} }}"
                 )
+            }
+            Self::Degrading { peer, epoch } => {
+                write!(formatter, "Degrading {{ peer: {peer}, epoch: {epoch} }}")
+            }
+            Self::Progressing { peer, epoch } => {
+                write!(formatter, "Progressing {{ peer: {peer}, epoch: {epoch} }}")
             }
         }
     }

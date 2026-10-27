@@ -203,6 +203,9 @@ pub struct PathStats {
     pub lost_packets: u64,
     /// The amount of bytes lost on this path
     pub lost_bytes: u64,
+    /// Packets declared lost that the peer acknowledged afterwards: reordered, not lost (RFC 9002
+    /// §6.1.1), what the connection's tolerance of reordering widens to cover
+    pub spurious_losses: u64,
     /// The amount of bytes of this path's packets the peer acknowledged: what has reached it, as
     /// the progress of what it was sent (patch Q6)
     pub acked_bytes: u64,
@@ -227,6 +230,8 @@ pub struct PathStats {
     pub warm_up_pending: bool,
     /// The number of times a black hole was detected in the path
     pub black_holes_detected: u64,
+    /// The number of times the path was found degrading (`Event::PathDegrading`)
+    pub path_degradings: u64,
     /// Largest UDP payload size the path currently supports
     pub current_mtu: u16,
 }

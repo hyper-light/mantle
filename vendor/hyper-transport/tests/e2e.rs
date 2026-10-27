@@ -644,8 +644,8 @@ fn reserve() -> String {
     reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
 )]
 fn refusals() -> String {
-    // A peer with a strict request bound and a budget of its window and a little more, that knows
-    // node 1 as a client.
+    // A peer with a strict request bound and a budget of its connection's window and state and a
+    // little more, that knows node 1 as a client.
     let setup = Setup::new(&[
         (1, Role::Client),
         (3, Role::Node),
@@ -659,7 +659,10 @@ fn refusals() -> String {
     let _ = std::fs::remove_file(&record.0);
     let peer = setup.spawn(&[
         ("HT_CLASSES", "strict".into()),
-        ("HT_BUDGET", (window + 4_000).to_string()),
+        (
+            "HT_BUDGET",
+            (window + hyper_transport::state_charge::<Mantle>(&limits()) + 4_000).to_string(),
+        ),
         ("HT_REFUSALS", record.0.display().to_string()),
     ]);
     let mut tight = limits();

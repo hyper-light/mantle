@@ -116,6 +116,9 @@ pub fn hard_from(hard: &old::HardState) -> HardState {
         term: hard.term,
         vote: hard.vote,
         commit: hard.commit,
+        // raft-rs has no held answers (core step R-8).
+        held_index: 0,
+        held_term: 0,
     }
 }
 pub fn hard_to(hard: &HardState) -> old::HardState {
@@ -300,10 +303,18 @@ pub fn message_from(message: old::Message) -> Message {
         // raft-rs says nothing of a classic commit, and has no fast track whose holdings it
         // would release.
         classic: None,
+        // raft-rs has no held answers, nor marks to narrow (core step R-8).
+        held: false,
+        incarnation: 0,
+        end: 0,
     }
 }
 pub fn message_to(message: &Message) -> old::Message {
     assert!(!message.lost, "raft-rs has no lost refusal (core step R-5)");
+    assert!(
+        !message.held && message.incarnation == 0,
+        "raft-rs has no held answers, nor marks to narrow (core step R-8)"
+    );
     old::Message {
         msg_type: kind_to(message.msg_type),
         to: message.to,

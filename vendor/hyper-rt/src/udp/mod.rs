@@ -85,6 +85,12 @@ pub struct QueueCharge {
     /// mbuf limit `charged` does not read, a datagram's mbufs over `sb_efficiency`; nothing where
     /// `charged` is the kernel's whole account.
     pub message_floor: u64,
+    /// What the kernel holds for the socket's buffers and charges to the process's memory: on Linux
+    /// the queue's charge and the memory reserved ahead of it (`SK_MEMINFO_FWD_ALLOC`), which a
+    /// container's memory limit counts (cgroup v2's `memory.stat` `sock`) though no process's
+    /// footprint holds it. None where the kernel charges the process for no socket buffer (macOS's
+    /// mbufs are the system's), and on the simulation fabric.
+    pub held: Option<u64>,
 }
 
 /// An async UDP socket: a real OS datagram socket, or a port on the simulation's in-memory fabric.
@@ -131,12 +137,13 @@ fn on_sim() -> bool {
 
 impl UdpSocket {
     /// Binds a non-blocking UDP socket to `addr` (use port 0 for an OS-assigned port, then
-    /// [`UdpSocket::local_addr`]). On the simulation runtime the requested address is ignored and a
-    /// fabric port is assigned.
+    /// [`UdpSocket::local_addr`]). On the simulation runtime a port of the shard's own range asked for
+    /// by number is taken if free (refused if bound), and any other request is given the next free
+    /// fabric port.
     pub fn bind(addr: impl Into<SocketAddr>) -> Result<UdpSocket, RtError> {
         let addr = addr.into();
         if on_sim() {
-            let (index, port) = crate::sim::sim_bind()?;
+            let (index, port) = crate::sim::sim_bind(addr.port())?;
             return Ok(UdpSocket::of(Inner::Sim { index, port }));
         }
         let socket = netsys::dgram_socket(Family::of(addr))?;
@@ -155,15 +162,19 @@ impl UdpSocket {
     /// Binds a non-blocking UDP socket to `addr` whose port the sockets it connects to its peers may
     /// then bind too ([`UdpSocket::join_shared`], `SO_REUSEPORT`), each of which takes its peer's
     /// datagrams into a receive queue of its own, as a TCP connection's socket does. The socket is
-    /// bound before its port is shared, so the port is one no other socket holds: a port another
-    /// socket holds is refused `AddrInUse`, where a second listener flagged before its bind bound it
-    /// too and the two split its datagrams (measured on Linux 6.19 and Darwin 25.4), and port 0 is
-    /// given a port of its own. Linux's search for a port leaves out of the ports in use those held
+    /// bound before its port is shared, so the port is one no other socket holds: refused
+    /// `AddrInUse` where one does, and port 0 is given a port of its own. Shared at its bind, a
+    /// socket asking for port 0 on Linux could be given a port another of the user's shared sockets
+    /// held, whatever process held it (the kernel's choice of a free port passes over a port held by
+    /// a socket it may share with), and the two then split one port's datagrams: of 256 clients
+    /// bound so, one to three never heard their server in four runs of five, each sharing its port
+    /// with another client: Linux's search for a free port leaves out of the ports in use those held
     /// by a socket that shares its port with the binder's user (`udp_lib_lport_inuse`,
-    /// net/ipv4/udp.c), so a socket asking with `SO_REUSEPORT` already set could be handed a port
-    /// another socket of the user held, in this process or another. Refused `BadConfig` before any
-    /// socket is made on Windows, where a shared port hands a connected socket no peer's datagrams
-    /// of its own, and on the simulation fabric, whose ports are one socket's each.
+    /// net/ipv4/udp.c). Shared after its bind, the port still takes the sockets that join it, as each
+    /// kernel checks the held socket's flag when another binds (Linux `udp_lib_lport_inuse` and
+    /// `udp_reuseport_add_sock`, XNU `in_pcbbind`). Refused `BadConfig` on Windows, where a shared
+    /// port hands a connected socket no peer's datagrams of its own, and on the simulation fabric,
+    /// whose ports are one socket's each.
     pub fn bind_shared(addr: impl Into<SocketAddr>) -> Result<UdpSocket, RtError> {
         let addr = addr.into();
         if on_sim() {
@@ -180,11 +191,9 @@ impl UdpSocket {
 
     /// Binds a non-blocking UDP socket to `addr`, a port a socket of this process bound with
     /// [`UdpSocket::bind_shared`] holds, to share it: what a listener's socket for one of its peers
-    /// binds before it connects to that peer ([`UdpSocket::connect`]). Its flag is set before its
-    /// bind, as a socket joining a held port's must be, and each kernel checks the held socket's
-    /// flag as it binds (Linux `udp_lib_lport_inuse` and `udp_reuseport_add_sock`, XNU
-    /// `in_pcbbind`). Refused as [`UdpSocket::bind_shared`] is where ports are not shared, and
-    /// `AddrInUse` where the port's holder does not share it.
+    /// binds before it connects to that peer ([`UdpSocket::connect`]). Refused as
+    /// [`UdpSocket::bind_shared`] is where ports are not shared, and `AddrInUse` where the port's
+    /// holder does not share it.
     pub fn join_shared(addr: impl Into<SocketAddr>) -> Result<UdpSocket, RtError> {
         let addr = addr.into();
         if on_sim() {
@@ -192,11 +201,21 @@ impl UdpSocket {
                 what: "a shared port on the simulation fabric, whose ports are one socket's",
             });
         }
-        netsys::port_sharing()?;
         let socket = netsys::dgram_socket(Family::of(addr))?;
         netsys::share_port(&socket)?;
         netsys::bind(&socket, addr)?;
         Ok(UdpSocket::of(Inner::Real { socket }))
+    }
+
+    /// Whether other sockets may bind this socket's port too, as [`UdpSocket::bind_shared`] binds
+    /// one (`SO_REUSEPORT`): what lets a driver given a socket
+    /// already bound share its port with a socket for each peer. Never on Windows, where no socket
+    /// shares a port so, nor on the simulation fabric, whose ports are one socket's.
+    pub fn shares_port(&self) -> Result<bool, RtError> {
+        match &self.inner {
+            Inner::Real { socket } => netsys::shares_port(socket),
+            _ => Ok(false),
+        }
     }
 
     /// Connects the socket to `remote`: the kernel hands it `remote`'s datagrams to its port in
@@ -334,12 +353,10 @@ impl UdpSocket {
         match &self.inner {
             #[cfg(target_os = "linux")]
             Inner::Real { socket } => {
-                let (charged, buffer, drops) =
-                    linux::queue_charge(socket.raw_id()).map_err(|error| {
-                        RtError::DriverRefused {
-                            call: "getsockopt(SO_MEMINFO)",
-                            code: error.raw_os_error(),
-                        }
+                let (charged, buffer, drops, reserved) = linux::queue_charge(socket.raw_id())
+                    .map_err(|error| RtError::DriverRefused {
+                        call: "getsockopt(SO_MEMINFO)",
+                        code: error.raw_os_error(),
                     })?;
                 Ok(Some(QueueCharge {
                     charged: u64::from(charged),
@@ -347,6 +364,8 @@ impl UdpSocket {
                     drops: drops.map(u64::from),
                     release_lag: u64::from(buffer >> 2),
                     message_floor: 0,
+                    held: reserved
+                        .map(|reserved| u64::from(charged).saturating_add(u64::from(reserved))),
                 }))
             }
             // XNU's byte limit counts each datagram's payload, address and control (`sbappendaddr`)
@@ -359,6 +378,7 @@ impl UdpSocket {
                 drops: None,
                 release_lag: 0,
                 message_floor: macos::message_floor(),
+                held: None,
             })),
             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             Inner::Real { .. } => Ok(None),
@@ -370,6 +390,7 @@ impl UdpSocket {
                     drops: None,
                     release_lag: 0,
                     message_floor: 0,
+                    held: None,
                 }))
             }
             Inner::Moved => Err(moved()),
@@ -547,6 +568,28 @@ impl UdpSocket {
     /// through a handle (a kept demultiplexer, AUD-29-08) can await it outside the handle's borrow.
     pub fn readable(&self) -> crate::readiness::Ready {
         ready(self.target(), false)
+    }
+
+    /// Arms a one-shot wait on the socket's read readiness in `group` for the task polling with `cx`, a
+    /// member keyed `key` ([`crate::readiness::ReadyGroup`]): the group tells when it fired, among its
+    /// other members, in what fired alone. As with [`UdpSocket::readable`], a fire may be spurious.
+    pub fn readable_in(
+        &self,
+        group: &mut crate::readiness::ReadyGroup,
+        cx: &std::task::Context<'_>,
+        key: u64,
+    ) -> Result<crate::readiness::Member, RtError> {
+        group.arm(cx, self.target(), false, key)
+    }
+
+    /// [`UdpSocket::readable_in`] for the socket's write readiness (send-buffer space).
+    pub fn writable_in(
+        &self,
+        group: &mut crate::readiness::ReadyGroup,
+        cx: &std::task::Context<'_>,
+        key: u64,
+    ) -> Result<crate::readiness::Member, RtError> {
+        group.arm(cx, self.target(), true, key)
     }
 
     /// Takes one waiting datagram into `buf` without blocking: the byte count and the sender, or `None`

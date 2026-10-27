@@ -17,14 +17,17 @@
 //!   owner polls the peer's frames;
 //! - a peer's lifecycle waits as one event, its latest state with its epoch: a change while it
 //!   waits replaces it and moves it to the back, after the refusals of the exchanges a closed
-//!   connection carried; its entry in the peer table is held until the owner polls it.
+//!   connection carried; its entry in the peer table is held until the owner polls it;
+//! - so does the path of a peer's newest connection, degrading or progressing again
+//!   ([`Event::Degrading`], [`Event::Progressing`]): a change while it waits replaces it, one back
+//!   to what the owner was told takes it away, and the connection's close takes it away.
 //!
 //! A table at its bound refuses, typed, the stream, the connection or the dial that would need one
 //! more seat ([`Refusal::Exchanges`], [`Refusal::Events`]); no event is ever dropped, and nothing
 //! refuses a datagram, whose acknowledgements every connection's loss detection needs (RFC 9002
 //! §6).
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -33,9 +36,10 @@ use std::time::{Duration, Instant};
 use hyper_quic::congestion::Congestion;
 use hyper_quic::rustls::pki_types::CertificateDer;
 use hyper_quic::{
-    ClientConfigHandle, Connection, ConnectionError, DatagramEvent, Dir, EcnCodepoint,
-    EndpointConfig, Event as QuicEvent, IdleTimeout, Incoming as Attempt, MtuDiscoveryConfig,
-    StreamEvent, StreamId, Transmit, TransportConfig, TransportErrorCode, VarInt,
+    ClientConfigHandle, Connection, ConnectionError, ConnectionId, DatagramEvent, Dir,
+    EcnCodepoint, EndpointConfig, Event as QuicEvent, IdleTimeout, Incoming as Attempt,
+    MtuDiscoveryConfig, ServerConfig, StreamEvent, StreamId, Transmit, TransportConfig,
+    TransportErrorCode, VarInt,
 };
 
 use crate::admission::{Admission, AdmissionLimits, AdmissionStats};
@@ -51,6 +55,8 @@ use crate::lane::{LaneIn, LaneOut, OPENER_BYTES, Reading, opened};
 use crate::pool::{Pool, PoolStats, Share};
 use crate::progress::{Carry, Delivered, LEAST_PROGRESS, Moved, Progress};
 use crate::receive::Receive;
+use crate::restart::RestartKey;
+use crate::state::{StateAccount, StateStats};
 use crate::tally::{Table, Tally};
 use crate::timing::PeerTiming;
 use crate::tls::Tls;
@@ -90,7 +96,14 @@ pub struct Limits {
     pub keep_alive: Option<Duration>,
     /// The endpoint's own responses (version negotiation, retries, refusals, stateless resets)
     /// queued for sending; one past the bound is dropped and counted, as RFC 9000 lets an endpoint
-    /// leave any of them unsent.
+    /// leave any of them unsent. Each answers one datagram the endpoint took since its transmits
+    /// were last polled, so an owner that polls them after each of its receives states what one
+    /// receive hands the endpoint, and none of a burst's is dropped: quinn sends each as its
+    /// datagram is handled, dropping it only for a full socket. A dial whose answer is dropped
+    /// hears nothing until its probe timeout, and dials begun together probe again together:
+    /// eight joiners of an enrollment sponsor with one handshake place, answered one at a time
+    /// from a bound of one, failed their joins after 10 s of probes (focal, 2026-10-19). The
+    /// queue grows as responses come and is never laid out at the bound.
     pub max_responses: usize,
     /// The chunks of [`crate::RECEIVE_CHUNK`] bytes received datagrams are cut from, each reserved
     /// from the budget: the chunk memory a peer can pin is at most this many chunks, whatever it
@@ -98,6 +111,14 @@ pub struct Limits {
     /// receive window of unread data, packed, occupies `window_ceiling / RECEIVE_CHUNK` chunks; the
     /// owner sets this from that and its budget.
     pub receive_chunks: usize,
+    /// The bytes the handshakes in progress may hold before one from an address not yet proven is
+    /// answered with a Retry (RFC 9000 §8.1.2), each counted at what a connection is charged as it
+    /// is made ([`Endpoint::connection_charge`], learned where the endpoint runs): an owner states
+    /// it from its memory, as msquic does (`RetryMemoryLimit`, 65/65535 of the memory available by
+    /// default; its `QuicBindingShouldRetryConnection`). None, once half the pending places are
+    /// taken: a rule that tracks a count, which an owner deriving its places from its memory
+    /// would make tens of thousands, the crypto of every one done before the first Retry.
+    pub retry_bytes: Option<u64>,
 }
 
 /// How connections are given the exchanges their peers may open at once (QUIC's bidirectional
@@ -137,17 +158,19 @@ pub enum AskQueue {
 impl Limits {
     /// The most events the endpoint holds for its owner at once: [`EXCHANGE_EVENTS`] for every
     /// exchange the table holds, and, for every entry of the peer table (the larger of the
-    /// identity and connection bounds), its one lifecycle event, its lanes' windows of frames and
-    /// one [`Event::LaneRoom`] a lane.
+    /// identity and connection bounds), its one lifecycle event, its one path event
+    /// ([`Event::Degrading`] or [`Event::Progressing`]), its lanes' windows of frames and one
+    /// [`Event::LaneRoom`] a lane.
     /// The queue never holds more (the module's documentation says how).
     pub fn event_bound(&self) -> usize {
         let peers = self.admission.identities.max(self.admission.connections);
         let lanes = usize::try_from(self.lanes_per_peer).unwrap_or(usize::MAX);
         let frames = lanes.saturating_mul(self.lane_window);
-        // A peer's lifecycle event, its lanes' frames, and a room event of each lane to it.
+        // A peer's lifecycle event and its path event, its lanes' frames, and a room event of each
+        // lane to it.
         EXCHANGE_EVENTS
             .saturating_mul(self.exchanges)
-            .saturating_add(peers.saturating_mul(frames.saturating_add(lanes).saturating_add(1)))
+            .saturating_add(peers.saturating_mul(frames.saturating_add(lanes).saturating_add(2)))
     }
 
     fn validate(&self) -> Result<(), Refusal> {
@@ -235,8 +258,8 @@ pub struct PathFacts {
     pub delivery_rate: u64,
     /// The receive window this side advertises to the peer now, reserve excluded.
     pub receive_window: u64,
-    /// The rate the congestion controller paces at, bytes a second, when it states one (Copa does,
-    /// once it has a round trip; NewReno, CUBIC and BBR keep the connection's rule).
+    /// The rate the congestion controller paces at, bytes a second, when it states one (Copa and
+    /// BBR do, once they have a round trip; NewReno and CUBIC keep the connection's rule).
     pub pacing_rate: Option<u64>,
     /// The controller's slow-start threshold, bytes, when it keeps one.
     pub ssthresh: Option<u64>,
@@ -302,6 +325,9 @@ pub struct Stats {
     pub receive_copied: u64,
     /// The stream pool ([`StreamCredit::Pooled`]).
     pub pool: PoolStats,
+    /// The connections' state as charged, learned from what the owner observes
+    /// ([`Endpoint::observe`]).
+    pub state: StateStats,
 }
 
 /// The QUIC application error code a connection closes with when it ends without a fault.
@@ -324,6 +350,48 @@ struct Ask<'a, K> {
     deadline: Progress,
 }
 
+/// The bytes a connection's exchange tables hold for `streams` exchanges: each exchange's id and its
+/// stream's entry (`Conn::exchanges`, `Conn::by_stream`), reserved to the streams the connection
+/// may have at once as it is made, so no insert allocates.
+fn exchange_tables(streams: u32) -> u64 {
+    let entry = size_of::<u64>().saturating_add(size_of::<(StreamId, u64)>());
+    u64::from(streams).saturating_mul(u64::try_from(entry).unwrap_or(u64::MAX))
+}
+
+/// What a connection of classes `C` is charged for its state under `limits` before its endpoint
+/// has observed what its connections hold (docs/transport.md §4x): its structures' own bytes — the
+/// connection itself, its QUIC state inline among them, and its exchange tables, which
+/// `limits.streams_per_connection` sizes — the least a connection holds on any host. What the
+/// connections hold past that (what the QUIC state allocates, the endpoint's rows for them, the C
+/// library's keys, the allocator's rounding) is learned on the host the endpoint runs on, where its
+/// owner observes it ([`Endpoint::observe`]); measured, 26.6 to 36.6 KB a connection across three
+/// hosts and two allocators (docs/benchmarks.md), which no constant says for a host it was not
+/// measured on.
+pub fn state_charge<C: Classes>(limits: &Limits) -> u64 {
+    u64::try_from(size_of::<Conn<C::Role>>())
+        .unwrap_or(u64::MAX)
+        .saturating_add(exchange_tables(limits.streams_per_connection))
+}
+
+/// What a connection of classes `C` is charged under `limits` as it is made before its endpoint has
+/// observed what its connections hold: its first window, the reserve on top of it, and its state's
+/// least ([`state_charge`]): the least any connection is charged, so a bound an owner divides its
+/// memory by this for is one memory reaches first. An endpoint that has observed says what it
+/// charges now ([`Endpoint::connection_charge`]).
+pub fn connection_charge<C: Classes>(limits: &Limits) -> u64 {
+    let reserve = class_reserve(C::RANKS.saturating_sub(1));
+    initial_window(MIN_DATAGRAM)
+        .saturating_add(reserve)
+        .saturating_add(state_charge::<C>(limits))
+}
+
+/// A connection's first grants: its window's, and its state's (what the endpoint's account of its
+/// connections' state charges one more, [`StateAccount::each`]).
+struct Grant {
+    window: Reservation,
+    state: Reservation,
+}
+
 struct Conn<R> {
     quic: Connection,
     /// The endpoint's key for it: the QUIC layer's handle, which a later connection may reuse.
@@ -335,6 +403,10 @@ struct Conn<R> {
     dialed: Option<PeerId>,
     /// Whether an inbound handshake still holds its pending place.
     pending: bool,
+    /// An inbound handshake's origin: the connection ID its client first sent to, and whether the
+    /// client proved its address with a retry's token, which names that ID (RFC 9000 §8.1.2,
+    /// §7.3). What tells a handshake its client gave up for a retry from the one it went on with.
+    origin: Option<(ConnectionId, bool)>,
     peer: Option<(PeerId, R)>,
     epoch: Epoch,
     /// Its exchanges, oldest first.
@@ -414,6 +486,15 @@ struct PeerEntry<R> {
     reported: Option<Lifecycle>,
     /// The state of the lifecycle event waiting for the owner, if one does.
     waiting: Option<Lifecycle>,
+    /// Whether its newest connection's path is degrading (hyper-quic's `PathDegrading`): nothing
+    /// sent on it acknowledged for the path-degrading delay, until the peer acknowledges again or
+    /// the connection goes.
+    degrading: bool,
+    /// The path state of its newest connection the owner was last told, by the
+    /// [`Event::Degrading`] or [`Event::Progressing`] it polled last: degrading or not.
+    path_reported: bool,
+    /// The path state of the event waiting for the owner, if one does.
+    path_waiting: Option<bool>,
     /// Frames of its lanes waiting for the owner, on any of its connections, live or gone.
     frames: usize,
     /// Its lanes not read for want of a seat for their next frame.
@@ -438,6 +519,9 @@ impl<R> PeerEntry<R> {
             closed: None,
             reported: None,
             waiting: None,
+            degrading: false,
+            path_reported: false,
+            path_waiting: None,
             frames: 0,
             paused: 0,
         }
@@ -454,7 +538,11 @@ impl<R> PeerEntry<R> {
     }
     /// Whether the entry must stay: a connection or a dial needs it, or events wait in it.
     fn pinned(&self) -> bool {
-        self.held > 0 || self.dialing || self.waiting.is_some() || self.frames > 0
+        self.held > 0
+            || self.dialing
+            || self.waiting.is_some()
+            || self.path_waiting.is_some()
+            || self.frames > 0
     }
 }
 
@@ -472,6 +560,12 @@ impl<C: Classes> Waiting<C> {
         matches!(self.event,
             Event::Connected { peer: of, .. } | Event::Closed { peer: of, .. } | Event::Unreachable { peer: of, .. }
                 if of == peer)
+    }
+
+    /// Whether this is a path event of `peer`.
+    fn path_of(&self, peer: PeerId) -> bool {
+        matches!(self.event,
+            Event::Degrading { peer: of, .. } | Event::Progressing { peer: of, .. } if of == peer)
     }
 }
 
@@ -585,6 +679,71 @@ struct Core<C: Classes, B, D> {
     /// By connection key, its lanes counted in `reserving`: what a retry visits, so a budget that
     /// holds more asks again of the connections with a frame waiting, never every connection.
     reserving_at: Vec<u32>,
+    /// The inbound handshakes that hold a pending place, by key: no more than the places.
+    pending_keys: Vec<usize>,
+    /// The attempts the endpoint refused, whose copies are ignored.
+    refused: Refused,
+    /// What the connections' own state is charged, learned from what the owner observes the
+    /// endpoint's work holds (docs/transport.md §4x).
+    state: StateAccount,
+}
+
+/// The attempts an endpoint refused (its places taken, or a bound it holds), each by its client's
+/// address, the connection ID its client first sent to and whether it carried a retry's token,
+/// oldest first. A copy of one, which its client sent a copy spacing behind it (hyper-quic's
+/// handshake copies) and which may come once a place is free, is ignored: its client was told the
+/// attempt was refused and gave it up, and admitted the copy held its place until its idle timeout
+/// (an enrollment joiner's copy of its token's attempt, 10 s in one run of six under CPU
+/// contention, focal 2026-10-19). Its token's flag keeps a refused copy of a ClientHello sent before
+/// a retry from matching the attempt its client made with the token. Kept while a token is valid
+/// (`ServerConfig::retry_token_validity`), after which a copy that carries one is refused as
+/// expired, and as many as the endpoint answers in one turn (`Limits::max_responses`), the oldest
+/// let go first.
+#[derive(Debug, Default)]
+struct Refused {
+    order: VecDeque<(Instant, (SocketAddr, ConnectionId, bool))>,
+    keys: HashSet<(SocketAddr, ConnectionId, bool)>,
+    /// None for an endpoint that takes no connection.
+    lifetime: Option<Duration>,
+}
+
+impl Refused {
+    /// Lets go of the records past the lifetime.
+    fn expire(&mut self, now: Instant) {
+        let Some(lifetime) = self.lifetime else {
+            return;
+        };
+        while let Some(&(at, key)) = self.order.front() {
+            if now.saturating_duration_since(at) <= lifetime {
+                return;
+            }
+            self.order.pop_front();
+            self.keys.remove(&key);
+        }
+    }
+
+    fn holds(&self, key: &(SocketAddr, ConnectionId, bool)) -> bool {
+        self.keys.contains(key)
+    }
+
+    /// Records a refusal, letting go of the oldest past `bound`: a record that finds no room is
+    /// not kept, and its copy is judged as any attempt is.
+    fn remember(&mut self, now: Instant, key: (SocketAddr, ConnectionId, bool), bound: usize) {
+        if self.lifetime.is_none() || self.keys.contains(&key) {
+            return;
+        }
+        while self.order.len() >= bound {
+            let Some((_, oldest)) = self.order.pop_front() else {
+                return;
+            };
+            self.keys.remove(&oldest);
+        }
+        if self.order.try_reserve(1).is_err() || self.keys.try_reserve(1).is_err() {
+            return;
+        }
+        self.order.push_back((now, key));
+        self.keys.insert(key);
+    }
 }
 
 /// What `conn` has moved, as the wait of an exchange of `rank` reads it.
@@ -680,7 +839,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         directory: D,
         now: Instant,
     ) -> Result<Self, Refusal> {
-        Self::build(config, budget, directory, now, None)
+        Self::build(config, budget, directory, now, None, None)
     }
 
     /// [`Endpoint::new`], with the QUIC layer's own randomness drawn from `seed` where the
@@ -696,7 +855,22 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         now: Instant,
         seed: [u8; 32],
     ) -> Result<Self, Refusal> {
-        Self::build(config, budget, directory, now, Some(seed))
+        Self::build(config, budget, directory, now, Some(seed), None)
+    }
+
+    /// [`Endpoint::new`], keyed by the key the endpoint keeps across its restarts at its address
+    /// ([`RestartKey`]): a peer that sends on a connection the endpoint's last run held is answered
+    /// with a reset it verifies, and is told at once that the connection closed (docs/transport.md
+    /// §4ah). `seed`, where given, is [`Endpoint::new_seeded`]'s.
+    pub fn new_restartable(
+        config: Config<C::Role>,
+        budget: B,
+        directory: D,
+        now: Instant,
+        restart: &RestartKey,
+        seed: Option<[u8; 32]>,
+    ) -> Result<Self, Refusal> {
+        Self::build(config, budget, directory, now, seed, Some(restart))
     }
 
     fn build(
@@ -705,10 +879,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         directory: D,
         now: Instant,
         seed: Option<[u8; 32]>,
+        restart: Option<&RestartKey>,
     ) -> Result<Self, Refusal> {
         config.limits.validate()?;
         let transport = config.limits.transport(C::RANKS, &config.congestion)?;
         let (server, client) = config.tls.prepare(&transport)?;
+        let retry_lifetime = server.as_ref().map(ServerConfig::retry_token_validity);
         let mut endpoint = EndpointConfig::default();
         // Peers may send any datagram the receive chunks hold, where quinn's default told them
         // Ethernet's 1,472 bytes whatever the path carried.
@@ -716,16 +892,20 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             .max_udp_payload_size(u16::try_from(crate::RECEIVE_CHUNK).unwrap_or(u16::MAX))
             .map_err(|_| Refusal::Configuration)?;
         endpoint.config_slots(config_slots(&config.limits.admission)?);
+        if let Some(restart) = restart {
+            restart.configure(&mut endpoint);
+        }
         let mut quic =
             hyper_quic::Endpoint::new(endpoint, server, true, seed).map_err(|_| Refusal::Quic)?;
         let client = quic
             .insert_client_config(client)
             .map_err(|_| Refusal::Quic)?;
         let limits = config.limits;
-        let peers = limits
-            .admission
-            .identities
-            .max(limits.admission.connections);
+        // The tables a connection or an identity has a row in start empty and grow with what the
+        // endpoint holds (`Endpoint::reserve_marks`), each connection's rows charged with its state
+        // (what the endpoint learns its connections hold, docs/transport.md §4x): sized to what
+        // admission could hold before any came, they held about 650 bytes for each connection
+        // admitted (docs/benchmarks.md), charged to nothing.
         Ok(Self {
             quic,
             client,
@@ -745,7 +925,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 #[cfg(feature = "oracle")]
                 mismatches: 0,
                 events: VecDeque::new(),
-                peers: Vec::with_capacity(peers),
+                peers: Vec::new(),
                 now,
                 granularity: K_GRANULARITY,
                 tick: 0,
@@ -755,25 +935,31 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 pool: Pool::new(u64::from(limits.streams_per_connection)),
                 room: Room::unbounded(),
                 handshake_room: 0,
-                grown: VecDeque::with_capacity(limits.admission.connections),
+                grown: VecDeque::new(),
                 wanted: Wanted::default(),
                 generation: 0,
                 reserving: 0,
                 reserving_at: Vec::new(),
+                pending_keys: Vec::new(),
+                refused: Refused {
+                    lifetime: retry_lifetime,
+                    ..Refused::default()
+                },
+                state: StateAccount::new(state_charge::<C>(&limits)),
             },
             receive: Receive::new(limits.receive_chunks),
             scratch: Vec::new(),
             path_ceiling: None,
-            responses: VecDeque::with_capacity(limits.max_responses),
-            spare: Vec::with_capacity(limits.max_responses),
-            marks: Vec::with_capacity(peers),
-            touched: Vec::with_capacity(peers),
-            rearm: Vec::with_capacity(peers),
-            sending: VecDeque::with_capacity(peers),
-            deadlines: Vec::with_capacity(peers),
-            positions: Vec::with_capacity(peers),
-            due: Vec::with_capacity(peers),
-            walk: Vec::with_capacity(peers),
+            responses: VecDeque::new(),
+            spare: Vec::new(),
+            marks: Vec::new(),
+            touched: Vec::new(),
+            rearm: Vec::new(),
+            sending: VecDeque::new(),
+            deadlines: Vec::new(),
+            positions: Vec::new(),
+            due: Vec::new(),
+            walk: Vec::new(),
             serials: 0,
             keys: Vec::with_capacity(limits.admission.per_identity),
         })
@@ -827,7 +1013,11 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         out.clear();
         if let Some((transmit, bytes)) = self.responses.pop_front() {
             out.extend_from_slice(&bytes);
-            if self.spare.len() < self.core.limits.max_responses {
+            // A buffer for a later response, as many kept as the handshakes waiting at once:
+            // a burst past them takes its buffers as it comes and gives them up after.
+            if self.spare.len() < self.core.limits.admission.pending
+                && self.spare.try_reserve(1).is_ok()
+            {
                 self.spare.push(bytes);
             }
             return Some(transmit);
@@ -925,10 +1115,14 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 };
                 if let Some(Some(conn)) = self.conns.get_mut(key)
                     && conn.serial == serial
-                    && let Some(granted) = self.core.pool.reclaim(&mut conn.share, conn.served)
+                    && self
+                        .core
+                        .pool
+                        .reclaim(&mut conn.share, conn.served)
+                        .is_some()
                 {
                     conn.quic
-                        .set_max_concurrent_streams(Dir::Bi, VarInt::from_u32(granted));
+                        .set_max_concurrent_streams(Dir::Bi, VarInt::from_u32(conn.share.limit()));
                 }
                 continue;
             };
@@ -938,9 +1132,11 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                         self.core.pool.passed(&mut conn.share);
                         false
                     } else {
-                        let granted = self.core.pool.grant(&mut conn.share, most);
-                        conn.quic
-                            .set_max_concurrent_streams(Dir::Bi, VarInt::from_u32(granted));
+                        self.core.pool.grant(&mut conn.share, most);
+                        conn.quic.set_max_concurrent_streams(
+                            Dir::Bi,
+                            VarInt::from_u32(conn.share.limit()),
+                        );
                         true
                     }
                 }
@@ -1020,10 +1216,23 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     }
 
     /// Room for key `key`'s marks and heap index: the keys are the QUIC endpoint's connection
-    /// handles, bounded by the connections it holds at once.
+    /// handles, bounded by the connections it holds at once. The lists a turn fills with keys grow
+    /// with them, so a turn that lists every key allocates nothing; a reservation the allocator
+    /// refuses leaves a list to grow as it is filled.
     fn reserve_marks(&mut self, key: usize) {
         if self.marks.len() <= key {
             self.marks.resize(key.saturating_add(1), Marks::default());
+            let keys = self.marks.len();
+            for list in [&mut self.touched, &mut self.rearm, &mut self.walk] {
+                let _ = list.try_reserve(keys.saturating_sub(list.len()));
+            }
+            let _ = self.due.try_reserve(keys.saturating_sub(self.due.len()));
+            let _ = self
+                .sending
+                .try_reserve(keys.saturating_sub(self.sending.len()));
+            let _ = self
+                .deadlines
+                .try_reserve(keys.saturating_sub(self.deadlines.len()));
         }
         if self.positions.len() <= key {
             self.positions.resize(key.saturating_add(1), None);
@@ -1129,6 +1338,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             | Event::Unreachable { peer, .. } => {
                 self.core.lifecycle_polled(peer);
             }
+            Event::Degrading { peer, .. } | Event::Progressing { peer, .. } => {
+                self.core.path_polled(peer);
+            }
             Event::Frame { peer, .. } => {
                 if let Some((key, serial, stream)) = lane {
                     self.frame_polled(peer, (key, serial), stream);
@@ -1198,7 +1410,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             }
         };
         self.core.dialing = self.core.dialing.saturating_add(1);
-        self.store(handle.0, quic, Some(peer), grant);
+        self.store(handle.0, quic, Some(peer), None, grant);
         Ok(())
     }
 
@@ -1281,6 +1493,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             .limits
             .transport(C::RANKS, &self.core.congestion)?;
         let (server, client) = tls.prepare(&transport)?;
+        let retry_lifetime = server.as_ref().map(ServerConfig::retry_token_validity);
         let client = self
             .quic
             .insert_client_config(client)
@@ -1289,6 +1502,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             self.quic.retire_client_config(client);
             return Err(Refusal::Quic);
         }
+        // Tokens the earlier configuration issued are still checked by its lifetime, and a record
+        // is kept for the longer of the two.
+        self.core.refused.lifetime = match (self.core.refused.lifetime, retry_lifetime) {
+            (Some(was), Some(now)) => Some(was.max(now)),
+            (was, now) => was.or(now),
+        };
         let replaced = std::mem::replace(&mut self.client, client);
         self.quic.retire_client_config(replaced);
         Ok(())
@@ -1368,6 +1587,14 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     /// into.
     pub fn reserve(&mut self, class: C::Class, bytes: u64) -> Result<Reservation, Refusal> {
         self.core.budget.reserve(bytes, Lane::Class(class))
+    }
+
+    /// Bytes the endpoint's driver holds for its sockets past what its owner charged as it made
+    /// the driver (its receive ring's growth), from the budget on [`Lane::Window`]: accounting
+    /// only, as the windows and the receive pool's chunks are. Given back with
+    /// [`Endpoint::release`].
+    pub fn reserve_own(&mut self, bytes: u64) -> Result<Reservation, Refusal> {
+        self.core.budget.reserve(bytes, Lane::Window)
     }
 
     /// Give a reservation back to the budget: a frame's, or one the owner reserved. A lossless frame
@@ -1582,8 +1809,48 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 .flatten()
                 .filter(|conn| conn.room.is_some())
                 .count(),
+            state: self.core.state.stats(),
             ..self.core.stats
         }
+    }
+
+    /// Whether the endpoint wants its owner to observe what its work holds ([`Endpoint::observe`]):
+    /// its account of its connections' state is due an observation (its first, then each time the
+    /// connections held double or halve or turn over, docs/transport.md §4x) and nothing is in
+    /// flight that an observation would count as state — no exchange open, no handshake pending
+    /// or dial under way, no event waiting, no lane frame queued. The lanes are looked at only
+    /// once the rest holds.
+    pub fn wants_observation(&self) -> bool {
+        self.core.state.due()
+            && self.core.exchanges.len() == 0
+            && self.core.admission.stats().pending == 0
+            && self.core.dialing == 0
+            && self.core.events.is_empty()
+            && self.conns.iter().flatten().all(|conn| {
+                conn.lanes_out.iter().all(|lane| lane.queue.is_empty())
+                    && conn.lanes_in.iter().all(|lane| lane.queued == 0)
+            })
+    }
+
+    /// The owner's observation of what the endpoint's work holds: `held`, the bytes in use on the
+    /// heap that work runs on and nothing else does (hyper-heap's `Held::in_use`), with what the
+    /// kernel holds for the endpoint's sockets where it charges the process for them. Made when
+    /// [`Endpoint::wants_observation`] says so, the first as the endpoint is made: the connections'
+    /// state is charged what the work holds past what it held with none and past the receive pool
+    /// (which is charged as the pool), grown as far as the budget funds it, and one more connection
+    /// what one held on average (docs/transport.md §4x).
+    pub fn observe(&mut self, held: u64) {
+        let pool = u64::try_from(self.receive.chunks().saturating_mul(crate::RECEIVE_CHUNK))
+            .unwrap_or(u64::MAX);
+        let target = self.core.state.observe(held, pool);
+        self.core.true_up_state(target);
+    }
+
+    /// What one more connection is charged as it is made now: its first window, the reserve on top
+    /// of it, and its state as the endpoint has learned it ([`Endpoint::observe`]); before any
+    /// observation, [`connection_charge`].
+    pub fn connection_charge(&self) -> u64 {
+        Core::<C, B, D>::first_window().saturating_add(self.core.state.each())
     }
 
     /// What the endpoint's windows may grant at most, summed, payload bytes: for every connection
@@ -1960,14 +2227,16 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         key: usize,
         mut quic: Connection,
         dialed: Option<PeerId>,
-        grant: Reservation,
+        origin: Option<(ConnectionId, bool)>,
+        grant: Grant,
     ) {
         if let Some(ceiling) = self.path_ceiling {
             quic.set_path_ceiling(self.core.now, ceiling);
         }
         let limits = self.core.limits;
         let initial = initial_window(MIN_DATAGRAM);
-        let grants = vec![grant];
+        let Grant { window, state } = grant;
+        let grants = vec![window];
         let serial = self.serials;
         self.serials = serial.saturating_add(1);
         let conn = Conn {
@@ -1976,6 +2245,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             serial,
             dialed,
             pending: dialed.is_none(),
+            origin,
             peer: None,
             epoch: 0,
             exchanges: Vec::with_capacity(
@@ -2003,13 +2273,56 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             self.conns.resize_with(key.saturating_add(1), || None);
         }
         self.put(key, Box::new(conn));
+        // Its state's grant joins the one reservation the connections' state is charged in.
+        if let Err(state) = self.core.state.made(state) {
+            self.core.budget.release(state);
+        }
     }
 
     fn attempt(&mut self, now: Instant, attempt: Attempt, buffer: &mut Vec<u8>) {
+        let remote = attempt.remote_address();
+        let origin = (*attempt.orig_dst_cid(), attempt.remote_address_validated());
+        // A client that took a retry may have sent its ClientHello again under the connection ID
+        // it first used before the retry reached it (a probe timeout on a slow path, a client
+        // held off its CPU), and one of the two copies may come while every place is taken and
+        // the other once one is free. Admitted, the copy its client gave up holds its place until
+        // its idle timeout, and the client's own attempt with the token is refused for that place:
+        // eight joiners of an enrollment sponsor with one place waited 10 s behind such a copy in
+        // 15 of 15 runs under CPU contention (focal, 2026-10-19). A token names the ID its client
+        // used before the retry, and binds its address (RFC 9000 §8.1.4), so the attempt it
+        // carries closes a handshake pending under that ID from that address without a token, and
+        // an attempt without one under the ID of a handshake pending with a token is that copy.
+        let superseded = self
+            .core
+            .pending_with(remote, origin.0, !origin.1, &self.conns);
+        if !origin.1 && superseded.is_some() {
+            // Answered nothing: its client goes on with the handshake its token began.
+            self.quic.ignore(attempt);
+            return;
+        }
+        if let Some(key) = superseded {
+            self.close(now, key, Refusal::Closed.code());
+        }
+        let record = (remote, origin.0, origin.1);
+        self.core.refused.expire(now);
+        if self.core.refused.holds(&record) {
+            // A copy of an attempt its client was told was refused, and gave up.
+            self.quic.ignore(attempt);
+            return;
+        }
         let admission = self.core.admission.stats();
-        let crowded = admission.pending.saturating_mul(2) >= self.core.admission.limits().pending;
-        // A source that has not proven its address takes no place while half of them are taken
-        // (RFC 9000 §8.1.2, Retry under load; focal `validate_address`).
+        let crowded = match self.core.limits.retry_bytes {
+            Some(limit) => {
+                u64::try_from(admission.pending)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(self.connection_charge())
+                    >= limit
+            }
+            None => admission.pending.saturating_mul(2) >= self.core.admission.limits().pending,
+        };
+        // A source that has not proven its address takes no place while the handshakes in
+        // progress hold what the owner allows them before a Retry, or half the places (RFC 9000
+        // §8.1.2, Retry under load; focal `validate_address`).
         if crowded && !attempt.remote_address_validated() && attempt.may_retry() {
             buffer.clear();
             if let Ok(transmit) = self.quic.retry(attempt, buffer) {
@@ -2028,6 +2341,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 if refusal != Refusal::Pending {
                     self.core.admission.end_pending();
                 }
+                let bound = self.core.limits.max_responses;
+                self.core.refused.remember(now, record, bound);
                 buffer.clear();
                 if let Some(transmit) = self.quic.refuse(attempt, buffer) {
                     self.respond(transmit, buffer);
@@ -2038,7 +2353,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         buffer.clear();
         match self.quic.accept(attempt, now, buffer, None, None) {
             Ok((handle, quic)) => {
-                self.store(handle.0, quic, None, grant);
+                self.store(handle.0, quic, None, Some(origin), grant);
+                self.core.pending_keys.push(handle.0);
                 self.pump(now, handle.0);
             }
             Err(error) => {
@@ -2052,13 +2368,20 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     }
 
     fn respond(&mut self, transmit: Transmit, bytes: &[u8]) {
-        if self.responses.len() >= self.core.limits.max_responses {
+        let response = bytes.get(..transmit.size).unwrap_or(bytes);
+        if self.responses.len() >= self.core.limits.max_responses
+            || self.responses.try_reserve(1).is_err()
+        {
             self.core.stats.responses_dropped = self.core.stats.responses_dropped.saturating_add(1);
             return;
         }
         let mut copy = self.spare.pop().unwrap_or_default();
         copy.clear();
-        copy.extend_from_slice(bytes.get(..transmit.size).unwrap_or(bytes));
+        if copy.try_reserve(response.len()).is_err() {
+            self.core.stats.responses_dropped = self.core.stats.responses_dropped.saturating_add(1);
+            return;
+        }
+        copy.extend_from_slice(response);
         self.responses.push_back((transmit, copy));
     }
 
@@ -2117,18 +2440,43 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
 }
 
 impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D> {
+    /// The handshake pending from `remote` under `id`, admitted with a token if `validated`: one
+    /// at most, the client's one attempt under that ID. A look at the pending places alone.
+    fn pending_with(
+        &self,
+        remote: SocketAddr,
+        id: ConnectionId,
+        validated: bool,
+        conns: &[Option<Box<Conn<C::Role>>>],
+    ) -> Option<usize> {
+        self.pending_keys.iter().copied().find(|&key| {
+            conns.get(key).and_then(Option::as_ref).is_some_and(|conn| {
+                conn.origin == Some((id, validated)) && conn.quic.remote_address() == remote
+            })
+        })
+    }
+
     /// A connection's first window, with the reserve on top of it: room in the socket's queue
     /// first, then the budget's bytes.
-    fn window_grant(&mut self) -> Result<Reservation, Refusal> {
+    fn window_grant(&mut self) -> Result<Grant, Refusal> {
         let bytes = Self::first_window();
         if let Err(refusal) = self.room.first(bytes, self.handshake_room) {
             self.wanted.room = true;
             return Err(refusal);
         }
-        match self.budget.reserve(bytes, Lane::Window) {
-            Ok(grant) => Ok(grant),
+        let window = match self.budget.reserve(bytes, Lane::Window) {
+            Ok(grant) => grant,
             Err(refusal) => {
                 self.room.release(bytes);
+                self.wanted.budget = true;
+                return Err(refusal);
+            }
+        };
+        match self.budget.reserve(self.state.each(), Lane::Window) {
+            Ok(state) => Ok(Grant { window, state }),
+            Err(refusal) => {
+                self.room.release(window.granted());
+                self.budget.release(window);
                 self.wanted.budget = true;
                 Err(refusal)
             }
@@ -2150,10 +2498,31 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         more.saturating_mul(Self::first_window().saturating_add(self.handshake_room))
     }
 
-    /// A window grant given back: its room in the socket's queue and its bytes.
-    fn release_window(&mut self, grant: Reservation) {
-        self.room.release(grant.granted());
-        self.budget.release(grant);
+    /// The connections' state charged `target` bytes: the reservation grown by what it is short,
+    /// as far as the budget funds it (what it cannot is recorded unfunded), or what it holds past
+    /// the target given back.
+    fn true_up_state(&mut self, target: u64) {
+        match self.state.short_of(target) {
+            Some(short) => {
+                let grant = self.budget.reserve(short, Lane::Window).ok();
+                if let Err(grant) = self.state.grown(target, grant) {
+                    self.budget.release(grant);
+                }
+            }
+            None => {
+                if let Some(past) = self.state.shrink(target) {
+                    self.budget.release(past);
+                }
+            }
+        }
+    }
+
+    /// A connection's first grants given back before it was made: its window's room in the
+    /// socket's queue and its bytes, and its state's.
+    fn release_window(&mut self, grant: Grant) {
+        self.room.release(grant.window.granted());
+        self.budget.release(grant.window);
+        self.budget.release(grant.state);
     }
 
     fn connection_of(&self, peer: PeerId) -> Option<usize> {
@@ -2259,6 +2628,61 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         }
     }
 
+    /// The path of `peer`'s newest connection may have changed: the event of it waiting for the
+    /// owner, if any, is replaced by its state now and moved to the back, after every event queued
+    /// before the change; a state the owner was already told waits as nothing.
+    fn report_path(&mut self, peer: PeerId) {
+        let Ok(at) = self.peers.binary_search_by_key(&peer, |entry| entry.peer) else {
+            return;
+        };
+        let Some(entry) = self.peers.get_mut(at) else {
+            return;
+        };
+        let state = entry.degrading;
+        if entry.path_waiting == Some(state) {
+            return;
+        }
+        if entry.path_waiting.take().is_some()
+            && let Some(index) = self.events.iter().position(|waiting| waiting.path_of(peer))
+        {
+            let _ = self.events.remove(index);
+        }
+        if state == entry.path_reported {
+            return;
+        }
+        let epoch = entry.epoch;
+        let event = if state {
+            Event::Degrading { peer, epoch }
+        } else {
+            Event::Progressing { peer, epoch }
+        };
+        entry.path_waiting = Some(state);
+        self.events.push_back(Waiting { event, lane: None });
+    }
+
+    /// The owner polled `peer`'s path event: what it was told is the state that waited.
+    fn path_polled(&mut self, peer: PeerId) {
+        if let Some(entry) = self.peer_entry_mut(peer) {
+            entry.path_reported = entry.path_waiting.take().unwrap_or(entry.path_reported);
+        }
+    }
+
+    /// Connection `key`'s path became degrading, or made progress again: told of the peer's newest
+    /// connection only, the one its exchanges and lanes are on.
+    fn path_changed(&mut self, key: usize, conn: &Conn<C::Role>, degrading: bool) {
+        let Some((peer, _)) = conn.peer else {
+            return;
+        };
+        let Some(entry) = self.peer_entry_mut(peer) else {
+            return;
+        };
+        if entry.connection != Some(key) {
+            return;
+        }
+        entry.degrading = degrading;
+        self.report_path(peer);
+    }
+
     /// Queue an event of exchange `id`, holding its slot; nothing when `id` names no exchange.
     fn push_exchange(&mut self, id: u64, event: Event<C>) {
         if self.exchanges.hold(id) {
@@ -2295,6 +2719,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 self.lost_for(key, conn, refusal);
             }
             QuicEvent::Stream(event) => self.on_stream(now, key, conn, event),
+            QuicEvent::PathDegrading => self.path_changed(key, conn, true),
+            QuicEvent::ForwardProgress => self.path_changed(key, conn, false),
             QuicEvent::HandshakeDataReady
             | QuicEvent::DatagramReceived
             | QuicEvent::DatagramsUnblocked => {}
@@ -2372,6 +2798,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         if conn.pending {
             conn.pending = false;
             self.admission.end_pending();
+            self.pending_keys.retain(|&held| held != key);
         }
         if conn.dialed.is_some() {
             self.dialing = self.dialing.saturating_sub(1);
@@ -2407,12 +2834,13 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             if C::pooled(role) {
                 self.pool
                     .join(&mut conn.share, initial, conn.key, conn.serial);
-                if let Some(granted) = self
+                if self
                     .pool
                     .welcome(&mut conn.share, self.limits.streams_per_connection)
+                    .is_some()
                 {
                     conn.quic
-                        .set_max_concurrent_streams(Dir::Bi, VarInt::from_u32(granted));
+                        .set_max_concurrent_streams(Dir::Bi, VarInt::from_u32(conn.share.limit()));
                 }
             } else {
                 // A role outside the pool holds every stream a connection may from here on.
@@ -2431,6 +2859,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             // A connection the peer opened leaves a dial to it in progress, and its entry held.
             entry.dialing &= !dialed;
             entry.unreachable = None;
+            // A new connection's path is told from its own acknowledgements.
+            entry.degrading = false;
+            entry.path_reported = false;
             entry.epoch
         });
         conn.epoch = epoch;
@@ -2506,8 +2937,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                     if entry.connection == Some(key) {
                         entry.connection = None;
                         entry.closed = refusal;
+                        // Its close says more than its path did: no path event of it waits.
+                        entry.degrading = false;
+                        entry.path_reported = false;
                     }
                 }
+                self.report_path(peer);
                 self.report_lifecycle(peer);
             }
             (None, Some(peer)) => {
@@ -2519,6 +2954,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         if conn.pending {
             conn.pending = false;
             self.admission.end_pending();
+            self.pending_keys.retain(|&held| held != key);
         }
     }
 
@@ -2538,6 +2974,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 self.room.release(grant.granted());
             }
             self.budget.release(grant);
+        }
+        if let Some(share) = self.state.gone() {
+            self.budget.release(share);
         }
         self.generation = self.generation.wrapping_add(1);
     }
@@ -2616,6 +3055,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             starved: false,
             ended: false,
             credit_settled: false,
+            parked: false,
         };
         match self.exchanges.insert(exchange) {
             Ok(id) => {
@@ -2726,15 +3166,18 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         prefix: Prefix,
     ) -> Result<(), Refusal> {
         let exchange = self.exchanges.get_mut(id).ok_or(Refusal::UnknownExchange)?;
-        let class = if exchange.opened {
+        let (class, waits) = if exchange.opened {
             if prefix.kind != 0 {
                 return Err(Refusal::Corrupt);
             }
-            exchange.class.ok_or(Refusal::Order)?
+            (exchange.class.ok_or(Refusal::Order)?, false)
         } else {
             let role = conn.peer.map(|(_, role)| role).ok_or(Refusal::Identity)?;
             let kind = C::kind_of(prefix.kind).ok_or(Refusal::Kind)?;
-            C::class_of(kind, role).ok_or(Refusal::Kind)?
+            (
+                C::class_of(kind, role).ok_or(Refusal::Kind)?,
+                C::waits(kind),
+            )
         };
         if prefix.head > self.limits.max_head || prefix.length() > C::frame_bound(class) {
             return Err(Refusal::FrameBound);
@@ -2755,6 +3198,23 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         let (at, backlog) = (moved(conn, rank), self.backlog(conn, rank));
         let exchange = self.exchanges.get_mut(id).ok_or(Refusal::UnknownExchange)?;
         exchange.carry.answering(now, at, prefix.length(), backlog);
+        // A peer's exchange that waits on its owner's event holds none of the pool's credit while
+        // it waits: parked, it holds a stream of its own (`crate::pool`), and is no open one of its
+        // peer's in the pool's accounts.
+        if waits
+            && let Some(limit) = self.pool.park(
+                &mut conn.share,
+                self.limits.streams_per_connection,
+                conn.served.saturating_sub(1),
+                conn.key,
+                conn.serial,
+            )
+        {
+            exchange.parked = true;
+            conn.served = conn.served.saturating_sub(1);
+            conn.quic
+                .set_max_concurrent_streams(Dir::Bi, VarInt::from_u32(limit));
+        }
         Ok(())
     }
 
@@ -2992,6 +3452,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             starved: false,
             ended: false,
             credit_settled: false,
+            parked: false,
         };
         let id = self.exchanges.insert(exchange)?;
         self.exchanges.place(id, conn.exchanges.len());
@@ -3422,17 +3883,27 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
     /// An exchange on `conn` ended, this side's own if `opened`. A pooled connection's grant
     /// serves the exchanges its peer opens, so one of those ended may give streams back to the
     /// pool (`crate::pool`).
-    fn exchange_ended(&mut self, conn: &mut Conn<C::Role>, opened: bool) {
+    /// A parked one's stream goes with it, granted to no other, and it was no open one in the
+    /// pool's accounts.
+    fn exchange_ended(&mut self, conn: &mut Conn<C::Role>, opened: bool, parked: bool) {
         if opened {
             return;
         }
+        if parked {
+            if self.pool.unpark(&mut conn.share).is_some() {
+                conn.quic
+                    .set_max_concurrent_streams(Dir::Bi, VarInt::from_u32(conn.share.limit()));
+            }
+            return;
+        }
         conn.served = conn.served.saturating_sub(1);
-        if let Some(granted) = self
+        if self
             .pool
             .ended(&mut conn.share, conn.served, conn.key, conn.serial)
+            .is_some()
         {
             conn.quic
-                .set_max_concurrent_streams(Dir::Bi, VarInt::from_u32(granted));
+                .set_max_concurrent_streams(Dir::Bi, VarInt::from_u32(conn.share.limit()));
         }
     }
 
@@ -3448,14 +3919,15 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             return;
         }
         exchange.credit_settled = true;
-        self.exchange_ended(conn, false);
+        let parked = exchange.parked;
+        self.exchange_ended(conn, false, parked);
     }
 
     /// An exchange that ended without its credit settled as its reply finished (one this side
     /// opened, or one refused) settles it now.
     fn unsettled_ended(&mut self, conn: &mut Conn<C::Role>, exchange: &Exchange<C::Class>) {
         if !exchange.credit_settled {
-            self.exchange_ended(conn, exchange.opened);
+            self.exchange_ended(conn, exchange.opened, exchange.parked);
         }
     }
 

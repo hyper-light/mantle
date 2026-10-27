@@ -121,6 +121,7 @@ fn a_sealed_log_reads_back_what_it_was_given_and_holds_none_of_it_in_the_clear()
             term: 2,
             vote: 1,
             commit: 2,
+            held: None,
         }),
         proposals: vec![Proposal {
             index: 7,
@@ -146,7 +147,8 @@ fn a_sealed_log_reads_back_what_it_was_given_and_holds_none_of_it_in_the_clear()
         Some(HardState {
             term: 2,
             vote: 1,
-            commit: 2
+            commit: 2,
+            held: None,
         })
     );
     assert_eq!(view.proposals.len(), 1);
@@ -202,6 +204,7 @@ fn a_sealed_log_opens_only_with_its_own_keys() {
                 term: 1,
                 vote: 1,
                 commit: 1,
+                held: None,
             }),
             ..Update::default()
         },
@@ -424,6 +427,7 @@ fn a_frame_changed_with_its_crc_recomputed_is_tampering() {
                 term: 5,
                 vote: 2,
                 commit: 0,
+                held: None,
             }),
             ..Update::default()
         },
@@ -436,6 +440,7 @@ fn a_frame_changed_with_its_crc_recomputed_is_tampering() {
                 term: 6,
                 vote: 3,
                 commit: 0,
+                held: None,
             }),
             ..Update::default()
         },
@@ -505,6 +510,7 @@ fn every_session_of_a_continued_segment_reads_back() {
                         term: round + 1,
                         vote: 1,
                         commit: first,
+                        held: None,
                     }),
                     proposals: (0..2)
                         .map(|i| Proposal {
@@ -554,6 +560,7 @@ fn sweeps_reseal_what_they_copy() {
                     term: round / 50 + 1,
                     vote: 1,
                     commit: first,
+                    held: None,
                 }),
                 ..Update::default()
             };
@@ -614,6 +621,7 @@ fn a_sealed_entry_changed_with_its_crcs_recomputed_is_tampering() {
                 term: 1,
                 vote: 1,
                 commit: 2,
+                held: None,
             }),
             ..Update::default()
         },

@@ -638,6 +638,21 @@ fn record_lines(me: u64, entries: &[Entry], liveness: &Liveness, out: &mut Strin
             Entry::Told(Change::Restarted { peer, at_ns }) => {
                 writeln!(out, "r {me} n {peer} {at_ns}")
             }
+            Entry::Told(Change::Stopped { peer, at_ns }) => {
+                writeln!(out, "r {me} x {peer} {at_ns}")
+            }
+            Entry::Told(Change::DiskSlow { peer, at_ns }) => {
+                writeln!(out, "r {me} ds {peer} {at_ns}")
+            }
+            Entry::Told(Change::DiskCaughtUp { peer, at_ns }) => {
+                writeln!(out, "r {me} du {peer} {at_ns}")
+            }
+            Entry::Told(Change::ModeDiffers { peer, at_ns }) => {
+                writeln!(out, "r {me} md {peer} {at_ns}")
+            }
+            Entry::Told(Change::ModeAgrees { peer, at_ns }) => {
+                writeln!(out, "r {me} ma {peer} {at_ns}")
+            }
             Entry::Holds { peer, trust } => {
                 writeln!(out, "r {me} h {peer} {}", trust_field(trust))
             }
@@ -726,6 +741,41 @@ fn parse_record(fields: &[&str]) -> Option<(u64, Entry, Option<u64>)> {
         ),
         "n" => (
             Entry::Told(Change::Restarted {
+                peer: number(2)?,
+                at_ns: number(3)?,
+            }),
+            None,
+        ),
+        "x" => (
+            Entry::Told(Change::Stopped {
+                peer: number(2)?,
+                at_ns: number(3)?,
+            }),
+            None,
+        ),
+        "ds" => (
+            Entry::Told(Change::DiskSlow {
+                peer: number(2)?,
+                at_ns: number(3)?,
+            }),
+            None,
+        ),
+        "du" => (
+            Entry::Told(Change::DiskCaughtUp {
+                peer: number(2)?,
+                at_ns: number(3)?,
+            }),
+            None,
+        ),
+        "md" => (
+            Entry::Told(Change::ModeDiffers {
+                peer: number(2)?,
+                at_ns: number(3)?,
+            }),
+            None,
+        ),
+        "ma" => (
+            Entry::Told(Change::ModeAgrees {
                 peer: number(2)?,
                 at_ns: number(3)?,
             }),
@@ -2106,13 +2156,7 @@ const YOUNG_NODES: u64 = 3;
 /// windows, 56 heartbeats at the least): every survivor suspects it, within the bound it states
 /// where it states one, and no later than the first poll once both its freshness point has passed
 /// and a pair of its own has configured, the evidence the young link is judged by
-/// (`docs/timing.md` §2.8, "Judged before its own evidence"). That poll comes a wait past whichever
-/// of the two came last: its wakes' lateness, and for a judge with nothing durable since the point
-/// its next completion, within its longest sending interval and its longest write (main's
-/// `fffebdd`, after macos-15-intel noticed 3.5 ms past the evidence). Bounded with the lateness on
-/// the freshness point alone, a configuration stated after it was told one wake later on Windows,
-/// 15.7 ms past the state that showed it with wakes up to 16.0 and 16.7 ms late (windows-11-arm,
-/// run 40105342844; windows-2025, run 40104910073).
+/// (`docs/timing.md` §2.8, "Judged before its own evidence").
 #[test]
 #[allow(
     clippy::disallowed_methods,

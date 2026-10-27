@@ -92,6 +92,7 @@ fn update(s: Step, start: Start, last: u64, term: &mut u64) -> Update {
         term: *term,
         vote: s.at % 3,
         commit: last.min(s.at),
+        held: None,
     });
     let mut u = Update {
         hard_state: hard,
@@ -250,7 +251,7 @@ proptest! {
         let update = Update {
             start: start.map(|index| Start { index, term: 1 }),
             entries: (count > 0).then(|| entries(start.unwrap_or(0) + 1, count, 1, len)),
-            hard_state: hard.then_some(HardState { term: 1, vote: 0, commit: 0 }),
+            hard_state: hard.then_some(HardState { term: 1, vote: 0, commit: 0, held: None, }),
             proposals: (last + 1..)
                 .zip(&proposals)
                 .map(|(index, &len)| Proposal { index, term: 1, bytes: vec![7; len] })
@@ -617,6 +618,7 @@ fn left_out() -> [(&'static str, Update); 4] {
                     term: 1,
                     vote: 0,
                     commit: 4,
+                    held: None,
                 }),
                 ..Update::default()
             },
@@ -723,6 +725,7 @@ fn a_claim_waits_for_its_groups_write_out_and_holds_the_group_meanwhile() {
                     term: 1,
                     vote: 0,
                     commit: 4,
+                    held: None,
                 }),
                 ..Update::default()
             },

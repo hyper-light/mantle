@@ -256,6 +256,16 @@ fn two_flows_through_one_link_share_its_capacity() {
 /// Sends `count` small datagrams through `loss` (no bottleneck) and returns which sequence numbers were
 /// lost, in order, with the counters.
 fn lost_sequences(seed: u64, loss: SimLoss, count: usize) -> (Vec<u64>, SimFabricStats) {
+    lost_sequences_every(seed, loss, count, MS)
+}
+
+/// [`lost_sequences`], the datagrams sent `every` nanoseconds apart.
+fn lost_sequences_every(
+    seed: u64,
+    loss: SimLoss,
+    count: usize,
+    every: u64,
+) -> (Vec<u64>, SimFabricStats) {
     let mut sim = SimRuntime::new(&config(), seed).unwrap();
     let (ports, arrivals) = spawn_receiver(&mut sim, true);
     let receiver = port(&mut sim, &ports);
@@ -263,7 +273,7 @@ fn lost_sequences(seed: u64, loss: SimLoss, count: usize) -> (Vec<u64>, SimFabri
         sim_udp_set_pair_path(from, to, SimPath::in_order(MS, 0).with_loss(loss));
     };
     // Spaced so the receiver drains between sends and its buffer never drops anything.
-    let schedule: Vec<(u64, usize)> = (0..count).map(|k| (k as u64 * MS, 16)).collect();
+    let schedule: Vec<(u64, usize)> = (0..count).map(|k| (k as u64 * every, 16)).collect();
     spawn_sender(&mut sim, receiver, setup, schedule, 0);
     let (seen, stats) = finish(&mut sim, &arrivals);
     let delivered: std::collections::BTreeSet<u64> = seen.iter().map(|a| a.sequence).collect();
@@ -319,6 +329,43 @@ fn burst_loss_loses_in_runs() {
     assert!(
         (2.5..=6.0).contains(&run),
         "burst losses run about four long (mean run {run})"
+    );
+}
+
+/// AC (Quiver CP-T2.2 step 6, a burst ends in time): stepped per datagram alone, the burst process above
+/// loses the same datagrams sent 100 ms apart as 1 ms apart, in the same runs of about four, so a burst
+/// lasts 400 ms on the quiet flow. Stepped in time as well, once per millisecond slot the flow is quiet,
+/// it loses those 100 ms apart one at a time, each datagram's state all but independent of the last
+/// one's after 99 steps; and those a slot apart exactly as per datagram alone.
+#[test]
+fn a_quiet_flow_leaves_a_burst_in_time() {
+    let burst = SimLoss::bursty(PPM / 400, PPM / 4, PPM);
+    let (dense, _) = lost_sequences(3, burst, LOSS_SAMPLE);
+    let (quiet, _) = lost_sequences_every(3, burst, LOSS_SAMPLE, 100 * MS);
+    assert_eq!(
+        quiet, dense,
+        "per datagram alone, the spacing changes nothing"
+    );
+    let run = mean_run(&quiet);
+    assert!(
+        (2.5..=6.0).contains(&run),
+        "per datagram alone, a quiet flow's bursts run about four long (mean run {run})"
+    );
+    let (in_time, _) = lost_sequences_every(3, burst.in_time(MS), LOSS_SAMPLE, 100 * MS);
+    assert!(
+        in_time.len() > 20,
+        "bursts happened ({} lost)",
+        in_time.len()
+    );
+    assert!(
+        mean_run(&in_time) < 1.5,
+        "stepped in time, a quiet flow's losses are scattered (mean run {})",
+        mean_run(&in_time)
+    );
+    let (in_time_dense, _) = lost_sequences(3, burst.in_time(MS), LOSS_SAMPLE);
+    assert_eq!(
+        in_time_dense, dense,
+        "a flow that sends once a slot steps as it did per datagram"
     );
 }
 

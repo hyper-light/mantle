@@ -43,6 +43,9 @@ mod state;
 mod stats;
 mod ticket;
 mod unwind;
+mod wake;
+#[cfg(test)]
+mod wake_tests;
 mod writer;
 
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
@@ -100,6 +103,17 @@ pub enum Waits {
     /// submitters never return within a wait, as the replica simulation's, which drives each
     /// member's submissions one at a time.
     Never,
+    /// Writes nothing until told: a batch is what was held and queued when the caller cuts
+    /// ([`Log::cut`]), and a submission admitted meanwhile waits for the next cut. It reads entries
+    /// from the device for a fetch only when told too ([`Log::serve`]), or when the fetch's caller
+    /// waits on it (`Log::fetch`, a group's `fetch`). For a
+    /// simulation that decides when each write reaches the device: what one frame holds and when
+    /// it is answered are then the caller's, not the log's threads'. A frame is confirmed on its
+    /// own unless a cut already asks for the next, its confirmation made durable one way rather
+    /// than the way the device measured cheaper, and nothing is filled ahead. The restore of a
+    /// frame lost at open is the log's own, written as the log opens, which waits for it; and a
+    /// caller that waits on its write as it sends it (`write`) tells the writer by waiting.
+    Told,
 }
 
 /// Entries to write from `first` on, replacing any the group holds at or after it.
@@ -351,6 +365,9 @@ pub(crate) struct Params {
     /// Bytes of the tag after each entry's and proposal's bytes: [`format::TAG_LEN`] in a sealed
     /// log, 0 in an unsealed one.
     pub(crate) tag: usize,
+    /// Whether the file writes the slots it grows by with zeros ahead of their frames
+    /// (`BlockFile::fills_new_space`), as its file said when the log's threads started.
+    pub(crate) fills: bool,
 }
 
 /// `update` for `group` in parts that each fit a frame of `room` payload bytes
@@ -805,6 +822,7 @@ impl<F: BlockFile + 'static> Log<F> {
             frame_room: room_bytes,
             queue_bytes,
             tag: if sealed { format::TAG_LEN } else { 0 },
+            fills: false,
         };
         let waiters = config
             .max_groups
@@ -864,7 +882,7 @@ impl<F: BlockFile + 'static> Log<F> {
     )]
     fn spawn(
         file: F,
-        p: Params,
+        mut p: Params,
         state: state::State,
         room: room::Room,
         first: Vec<Submission<F>>,
@@ -873,9 +891,8 @@ impl<F: BlockFile + 'static> Log<F> {
     ) -> Result<Self, Refused<F>> {
         let config = p.config;
         // Everything that may wait in the inbox at once: every submission the queue admits,
-        // every waiter for room, the device's words (its word that a frame is settled, its call
-        // for a completion to be answered, the I/O thread's word that a job is back), and a
-        // release from each group's handle.
+        // every waiter for room, the device's words (its word that a frame is settled, a job's
+        // thread's word that the job is back), and a release from each group's handle.
         let capacity = config
             .queue_submissions
             .max(1)
@@ -888,12 +905,12 @@ impl<F: BlockFile + 'static> Log<F> {
         let (flushed, flushes) = sync_channel(1);
         // One job is out at a time, and comes back before the next goes out.
         let (back, returns) = sync_channel(1);
-        let (token, tokens) = sync_channel(device::TOKENS);
+        let (wake, claim) = wake::Wake::new();
         let lines = Lines {
             inbox,
             flushed,
             returns: back,
-            tokens: token,
+            wake: claim,
         };
         // The owner's thread waits for the owner, which holds the file, until both threads run.
         let (to_owner, owned) = sync_channel::<Box<Owner<F>>>(1);
@@ -919,8 +936,12 @@ impl<F: BlockFile + 'static> Log<F> {
         };
         let largest = usize::try_from(config.segment_bytes).unwrap_or(usize::MAX);
         let pool = Pool::new(p.align, largest.saturating_mul(2), largest);
+        // The file is the caller's code: asked inside the unwind boundary, and an unwinding answer
+        // fills nothing.
+        p.fills = crate::unwind::contained(|| file.fills_new_space()).unwrap_or(false);
         let (more, told) = sync_channel(device::MORE);
         let device = device::Device::new(file, pool, config.segment_bytes, told)
+            .steady(config.waits == Waits::Told)
             .sealed(sealer.as_ref().map(seal::Sealer::frame_mac));
         let wiring = owner::Wiring {
             device,
@@ -928,7 +949,7 @@ impl<F: BlockFile + 'static> Log<F> {
             inbox: messages,
             flushes,
             returns,
-            tokens,
+            wake,
             requests,
         };
         let owner = Box::new(Owner::new(p, state, room, first, wiring, sealer, gate));
@@ -1032,6 +1053,34 @@ impl<F: BlockFile + 'static> Log<F> {
                 hears,
             },
         )
+    }
+
+    /// Under [`Waits::Told`], tells the writer to write what it holds: every submission it has
+    /// admitted, and any held for room, in frames from the next on. The returned handle is
+    /// answered once each of them is answered, durable or refused: `Ok` once the last frame that
+    /// took them is durable and confirmed, or at once when there were none; `Fenced` where the log
+    /// fenced. Under the other waits the writer writes without being told, and the handle is
+    /// answered at once.
+    pub fn cut(&self) -> Result<Pending, LogError> {
+        let (ticket, waiting) = ticket::call(None);
+        self.lines
+            .inbox
+            .send(Message::Cut(ticket))
+            .map_err(|_| LogError::Closed)?;
+        Ok(Pending(waiting))
+    }
+
+    /// Under [`Waits::Told`], tells the owner to read from the device the entries it was asked
+    /// for and holds (`Log::fetch_waking` and a group's fetches), which it reads only when told: the
+    /// returned handle is answered once every fetch held is answered, at once when none is. Under
+    /// the other waits the owner reads as it is asked, and the handle is answered at once.
+    pub fn serve(&self) -> Result<Pending, LogError> {
+        let (ticket, waiting) = ticket::call(None);
+        self.lines
+            .inbox
+            .send(Message::Serve(ticket))
+            .map_err(|_| LogError::Closed)?;
+        Ok(Pending(waiting))
     }
 
     /// Asks the owner and waits for its answer.
@@ -1174,7 +1223,7 @@ impl<F: BlockFile + 'static> Log<F> {
         page: Page,
         into: Fetched,
     ) -> Result<Fetched, LogError> {
-        self.fetch_waking(group, low, high, page, into, None)?
+        self.send_fetch(group, low, high, page, into, (None, true))?
             .wait()
     }
 
@@ -1189,6 +1238,19 @@ impl<F: BlockFile + 'static> Log<F> {
         into: Fetched,
         waker: Option<Waker>,
     ) -> Result<Fetching, LogError> {
+        self.send_fetch(group, low, high, page, into, (waker, false))
+    }
+
+    /// Sends the owner a fetch: whether its caller waits on it as it asks (`Query::Entries`).
+    fn send_fetch(
+        &self,
+        group: u128,
+        low: u64,
+        high: u64,
+        page: Page,
+        into: Fetched,
+        (waker, waits): (Option<Waker>, bool),
+    ) -> Result<Fetching, LogError> {
         let (ticket, waiting) = ticket::call(waker);
         let query = Query::Entries {
             group,
@@ -1196,6 +1258,7 @@ impl<F: BlockFile + 'static> Log<F> {
             high,
             page,
             into,
+            waits,
         };
         self.lines
             .inbox

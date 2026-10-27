@@ -26,8 +26,10 @@
 //!
 //! # Memory
 //!
-//! One aligned buffer per writer or reader, made when it is, reused for every segment: no
-//! allocation after setup. Its size is the segment, its tag, the footer and two alignments.
+//! One aligned buffer per writer or reader, reused for every segment: no allocation after setup.
+//! Its size is the segment, its tag, the footer and two alignments. A writer makes it when it is
+//! made; a reader when it reads its first segment, so a reader that reads no plaintext (a file's
+//! length, or whether it opens) makes none and wipes none.
 
 use hyper_block::DiskError;
 use hyper_block::block::BlockFile;
@@ -60,9 +62,40 @@ pub enum SealedFileError {
     Bound(&'static str),
 }
 
+/// A writer's or reader's buffer, which holds a segment's plaintext as it is sealed or opened in
+/// place: wiped when let go (`memory::wipe`, as a key's slot is), so what a file held in the clear
+/// is never left in memory it gives back.
+pub(crate) struct Wiped(AlignedBuf);
+
+impl Wiped {
+    /// Zeroes every byte the buffer can hold.
+    fn wipe(&mut self) {
+        crate::memory::wipe(self.0.as_mut_capacity());
+    }
+}
+
+impl Drop for Wiped {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
+impl core::ops::Deref for Wiped {
+    type Target = AlignedBuf;
+    fn deref(&self) -> &AlignedBuf {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for Wiped {
+    fn deref_mut(&mut self) -> &mut AlignedBuf {
+        &mut self.0
+    }
+}
+
 /// The buffer a writer or reader keeps: a segment and its tag, the footer, and an alignment
 /// either side, rounded to the alignment.
-fn working_buffer(segment: u32, align: Alignment) -> Result<AlignedBuf, SealedFileError> {
+fn working_buffer(segment: u32, align: Alignment) -> Result<Wiped, SealedFileError> {
     let bytes = usize::try_from(segment)
         .ok()
         .and_then(|s| s.checked_add(TAG))
@@ -73,6 +106,7 @@ fn working_buffer(segment: u32, align: Alignment) -> Result<AlignedBuf, SealedFi
             "a segment past what this machine addresses",
         ))?;
     AlignedBuf::zeroed(bytes, align)
+        .map(Wiped)
         .map_err(|_| SealedFileError::Bound("a segment past the largest buffer"))
 }
 
@@ -91,7 +125,7 @@ pub struct SealedWriter<F: BlockFile> {
     sealer: FileSealer,
     align: Alignment,
     segment: usize,
-    buf: AlignedBuf,
+    buf: Wiped,
     /// Sealed stream bytes at the front of `buf` not yet written: fewer than an alignment once a
     /// segment is done.
     pending: usize,
@@ -113,6 +147,37 @@ impl<F: BlockFile> SealedWriter<F> {
             ));
         }
         let (sealer, header) = FileSealer::new(parent, segment)?;
+        Self::begin(file, sealer, header, segment)
+    }
+
+    /// A writer of a new file in `file`, which must be empty, keyed by its content
+    /// ([`FileSealer::content_keyed`]): its data key and ID derived from `parent` and `content`, on
+    /// the caller's word that `content` is the 256-bit hash of exactly the plaintext it then writes,
+    /// a wrong hash putting two plaintexts under one key and nonce. For a store that names its files
+    /// by a hash it takes of their bytes anyway, so that a file costs it no second pass over them;
+    /// [`seal_content`] takes a SHA-256 of its own, for a caller with no hash at hand.
+    pub fn content_keyed(
+        file: F,
+        parent: &WrappingKey,
+        content: &[u8; 32],
+        segment: u32,
+    ) -> Result<Self, SealedFileError> {
+        if !file.is_empty()? {
+            return Err(SealedFileError::Bound(
+                "a sealed file is written once, into an empty file",
+            ));
+        }
+        let (sealer, header) = FileSealer::content_keyed(parent, content, segment)?;
+        Self::begin(file, sealer, header, segment)
+    }
+
+    /// A writer of `file`, empty, under `sealer`, its header `header` queued first.
+    fn begin(
+        file: F,
+        sealer: FileSealer,
+        header: Header,
+        segment: u32,
+    ) -> Result<Self, SealedFileError> {
         let align = file.alignment();
         let mut buf = working_buffer(segment, align)?;
         let encoded = header.encode();
@@ -238,7 +303,17 @@ impl<F: BlockFile> SealedWriter<F> {
 
     /// Seals the last segment, writes the padding and the footer, and flushes the file. The file
     /// is whole and durable when this returns; the caller then renames it into place.
-    pub fn finish(mut self) -> Result<F, SealedFileError> {
+    pub fn finish(self) -> Result<F, SealedFileError> {
+        let file = self.finish_unflushed()?;
+        file.sync_data()?;
+        Ok(file)
+    }
+
+    /// As [`Self::finish`], the flush left to the caller: the file is whole when this returns, and
+    /// of unknown durability until the caller flushes it, which it does before it renames the file
+    /// into place. For a writer of many files at once, whose flushes overlap and whose renames
+    /// follow them, then one flush of their directory (Pillai et al., OSDI 2014).
+    pub fn finish_unflushed(mut self) -> Result<F, SealedFileError> {
         self.seal_segment(true)?;
         let stream = self.stream;
         let footer_at = self
@@ -266,7 +341,6 @@ impl<F: BlockFile> SealedWriter<F> {
                 "a footer that does not end on the alignment",
             ));
         }
-        self.file.sync_data()?;
         Ok(self.file)
     }
 }
@@ -345,13 +419,43 @@ impl Shape {
     }
 }
 
+/// Seals `plaintext` whole into `file`, which must be empty, keyed by its content (`docs/seal.md`
+/// §4): its data key and its ID derive from `parent` and the SHA-256 of exactly these bytes, taken
+/// here, so the same plaintext under one parent always seals to the same file, two plaintexts share
+/// a key only if their hashes collide, and a caller has no hash to keep paired with the bytes it
+/// seals (`FileSealer::content_keyed`'s contract, kept by construction). Segments of `segment`
+/// bytes; flushed as [`SealedWriter::finish`] flushes, and the file handed back.
+pub fn seal_content<F: BlockFile>(
+    file: F,
+    parent: &WrappingKey,
+    plaintext: &[u8],
+    segment: u32,
+) -> Result<F, SealedFileError> {
+    if !file.is_empty()? {
+        return Err(SealedFileError::Bound(
+            "a sealed file is written once, into an empty file",
+        ));
+    }
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, plaintext);
+    let content: [u8; 32] = digest
+        .as_ref()
+        .try_into()
+        .map_err(|_| SealedFileError::Bound("a SHA-256 digest is 32 bytes"))?;
+    let mut writer = SealedWriter::content_keyed(file, parent, &content, segment)?;
+    writer.write(plaintext)?;
+    writer.finish()
+}
+
 /// Reads any plaintext range of a sealed file through `F`, opening only the segments it covers.
 pub struct SealedReader<F: BlockFile> {
     file: F,
     opener: FileOpener,
     align: Alignment,
     shape: Shape,
-    buf: AlignedBuf,
+    /// The header's segment size, which the buffer is made for.
+    segment: u32,
+    /// The segment buffer, made when the first segment is read.
+    buf: Option<Wiped>,
 }
 
 impl<F: BlockFile> SealedReader<F> {
@@ -375,7 +479,15 @@ impl<F: BlockFile> SealedReader<F> {
         if as_u64(header_span)? > len {
             return Err(SealedFileError::Layout("a file shorter than its header"));
         }
-        let mut probe = working_buffer(crate::stream::MIN_SEGMENT, align)?;
+        // The header's blocks, then the tail's: public bytes (the header, the last ciphertext,
+        // zeros and the footer), so the probe holds nothing to wipe.
+        let tail_most = align
+            .get()
+            .checked_add(FOOTER)
+            .and_then(|span| align.up(span))
+            .ok_or(SealedFileError::Layout("a tail past the alignment bound"))?;
+        let mut probe = AlignedBuf::zeroed(header_span.max(tail_most), align)
+            .map_err(|_| SealedFileError::Bound("a probe past the largest buffer"))?;
         let probe_bytes = probe
             .as_mut_capacity()
             .get_mut(..header_span)
@@ -393,12 +505,7 @@ impl<F: BlockFile> SealedReader<F> {
         }
         // The footer, and the padding before it: less than an alignment of zeros and the footer,
         // so within the last `up(alignment + footer)` bytes, or the whole file where it is shorter.
-        let tail_span = align
-            .get()
-            .checked_add(FOOTER)
-            .and_then(|span| align.up(span))
-            .ok_or(SealedFileError::Layout("a tail past the alignment bound"))?
-            .min(as_usize(len)?);
+        let tail_span = tail_most.min(as_usize(len)?);
         let tail_at = len
             .checked_sub(as_u64(tail_span)?)
             .ok_or(SealedFileError::Layout("a tail before the file"))?;
@@ -436,14 +543,13 @@ impl<F: BlockFile> SealedReader<F> {
         }
         let shape = Shape::of(stream, header.segment)?;
         let opener = FileOpener::new(parent, &header)?;
-        drop(probe);
-        let buf = working_buffer(header.segment, align)?;
         Ok(Self {
             file,
             opener,
             align,
             shape,
-            buf,
+            segment: header.segment,
+            buf: None,
         })
     }
 
@@ -534,7 +640,14 @@ impl<F: BlockFile> SealedReader<F> {
                 .checked_sub(window_at)
                 .ok_or(SealedFileError::Layout("a window inverted"))?,
         )?;
-        let capacity = self.buf.as_mut_capacity();
+        if self.buf.is_none() {
+            self.buf = Some(working_buffer(self.segment, self.align)?);
+        }
+        let capacity = self
+            .buf
+            .as_mut()
+            .ok_or(SealedFileError::Bound("a segment buffer not made"))?
+            .as_mut_capacity();
         let bytes = capacity
             .get_mut(..window)
             .ok_or(SealedFileError::Bound("a segment past the buffer"))?;

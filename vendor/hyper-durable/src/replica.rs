@@ -40,8 +40,8 @@ use std::time::Duration;
 use hyper_liveness::{Liveness, PeerId};
 use hyper_raft::progress::ProgressState;
 use hyper_raft::proto::{
-    self, ConfChange, ConfChangeV2, ConfState, Entry, EntryType, HardState, Message, Snapshot,
-    SnapshotMetadata,
+    self, ConfChange, ConfChangeV2, ConfState, Entry, EntryType, HardState, Message, MessageType,
+    Snapshot, SnapshotMetadata,
 };
 use hyper_raft::wire::Record;
 use hyper_raft::{
@@ -53,6 +53,7 @@ use crate::budget::{Budget, Unbounded};
 use crate::compaction::Compaction;
 use crate::held::Held;
 use crate::machine::{Fatal, StateMachine};
+use crate::patience::{self, Patience};
 use crate::store::{Entries, EntryRef, Fault, Health, LogStore, Point, Write};
 
 /// How a replica runs.
@@ -71,6 +72,37 @@ pub struct Settings {
     /// durable commit for this long is written then, so a member that stops reopens with what it
     /// applied (`docs/durable.md` §4.1; focal F17's period).
     pub quiet: Duration,
+    /// The group's disk mode ([`Disk`]): one setting, the same for every member of the group, from
+    /// which the replica takes the core's `apply_unpersisted` and the law of its patience with its
+    /// own disk (`docs/durable.md` §4.2), and its owner the liveness stream's mode
+    /// ([`Replica::disk`]).
+    pub disk: Disk,
+}
+
+/// How a group's members take their own disks (kiln's CP-T2.2, Focal's condition 1): one setting
+/// for the group, stated by every member's owner from the group's definition, so its members never
+/// differ in it, and a heartbeat says it, so a member of the other mode is refused, typed
+/// (`hyper_liveness::Refusal::OtherMode`), and never misjudged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Disk {
+    /// Today's: each peer's heartbeats wait on its flush proof, and a leader applies only what a
+    /// majority's disks hold with its own among them, as the core's settings say.
+    #[default]
+    Flushed,
+    /// Each member judges its peers' processes apart from their disks
+    /// (`hyper_liveness::Liveness::set_disk_apart`); a leader commits and applies on its followers'
+    /// disks while its own lags (`Config::apply_unpersisted`), and hands the lead on once the
+    /// backlog its disk doesn't hold would fill its budget's room within a hand-over, a voter there
+    /// to take it: a patience by law, no time stated ([`Replica::disk_fill`], `docs/durable.md`
+    /// §4.2).
+    Apart,
+}
+
+impl Disk {
+    /// Whether the mode judges each peer's process apart from its disk.
+    pub const fn apart(self) -> bool {
+        matches!(self, Self::Apart)
+    }
 }
 
 /// Why a replica is fenced: it takes no call until its owner reopens it from what is durable.
@@ -196,6 +228,10 @@ pub struct Driven {
     /// submitted and when its answer was taken. The node's liveness stream takes it as the flush
     /// a heartbeat proves (`hyper_liveness::Liveness::on_durable`, `Write::Log`).
     pub flushed: Option<(u64, u64)>,
+    /// When the oldest write of the replica's still out on the log was submitted, if one is
+    /// ([`Replica::out_since`]): what the node's liveness stream judges its own disk's wait from in
+    /// the disk mode (`hyper_liveness::Liveness::on_pending`, Focal's 5a).
+    pub out_since: Option<u64>,
 }
 
 /// The writes a replica made, by what they were for: what an owner reads to see what its group
@@ -315,6 +351,19 @@ pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> {
     /// entry's ([`EntryRef::encoded_bytes`]): what a compaction frees, and what the compaction
     /// rule weighs ([`Compaction`]).
     compactable: u64,
+    /// What [`Replica::compactable`] counted of each entry, oldest first, the first that of the
+    /// entry at `sizes_from`: the applied entries the log holds past its start. A start made
+    /// durable takes out of the count what it let go of from here, never from the store, which
+    /// holds an applied entry its cache let go only on its device. Read back through the log's
+    /// owner, behind its writes, that count held focal's event bus 51 to 637 ms a page, on the
+    /// thread that serves its heartbeats, and its followers were suspected 23 to 27 times a run
+    /// (fedora, 2026-10-19: a compaction's start leaves the applied entries past the image's
+    /// point, which is the part's window's floor, hundreds of megabytes behind its apply point).
+    /// Each entry's count in four bytes, as the log keeps its entry's length (`hyper_log`'s slot):
+    /// an entry is no larger than a message the transport carries.
+    sizes: VecDeque<u32>,
+    /// The index of the entry whose count `sizes` holds first.
+    sizes_from: u64,
     /// The bytes of the image the log was last compacted to: the one this member made or
     /// installed, or at open, the image of what it opened with; none from a machine that keeps
     /// no image.
@@ -346,6 +395,35 @@ pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> {
     writes_made: Writes,
     /// The latest write made durable since the last drive ended ([`Driven::flushed`]).
     flushed: Option<(u64, u64)>,
+    /// What the replica measures for its patience with its own disk in the disk mode; none in
+    /// today's (`docs/durable.md` §4.2).
+    patience: Option<Patience>,
+    /// The owner's clock at the latest drive: what the patience's end is read at between drives.
+    driven_at: u64,
+    /// The group's disk mode, as the replica was opened with it ([`Settings::disk`]).
+    disk: Disk,
+    /// The hand-overs its patience with its disk began.
+    handed_over: u64,
+    /// The drives at which its patience ended with no voter to hand over to: none trusted whose disk
+    /// isn't slow.
+    heirless: u64,
+    /// Since when, unbroken, a leader has had a voter to hand the lead to: one its detectors trust
+    /// whose disk isn't judged slow; none, no such voter at its last drive.
+    heir_since: Option<u64>,
+    /// The voters whose disks the owner's detectors judge slow, apart from their processes
+    /// (`hyper_liveness::Change::DiskSlow`): at most the group's voters.
+    slow_disks: Vec<u64>,
+}
+
+/// A value no other opening of a member states, with overwhelming likelihood: the keys std's
+/// hasher draws from the operating system once a thread and advances at every draw, so that two
+/// draws in one process differ and draws in two processes are independent
+/// (`hyper_raft::Config::incarnation`). Never zero, which states none.
+fn fresh_incarnation() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u8(0);
+    hasher.finish().max(1)
 }
 
 /// The term of an entry the state machine applied, as a point.
@@ -375,6 +453,23 @@ fn bytes(len: usize) -> u64 {
     u64::try_from(len).unwrap_or(u64::MAX)
 }
 
+/// Whether `message` brings the core something it keeps: entries, a snapshot, or a context (a
+/// read's, which the core holds until it is confirmed).
+fn keeps_something(message: &Message) -> bool {
+    !message.entries.is_empty() || message.snapshot.is_some() || !message.context.is_empty()
+}
+
+/// Whether `message` answers what this member asked, which it answers with nothing.
+fn answers(message: &Message) -> bool {
+    matches!(
+        message.msg_type,
+        MessageType::MsgAppendResponse
+            | MessageType::MsgHeartbeatResponse
+            | MessageType::MsgRequestVoteResponse
+            | MessageType::MsgRequestPreVoteResponse
+    )
+}
+
 /// Every member a configuration names.
 fn names(configuration: &ConfState, member: u64) -> bool {
     [
@@ -397,6 +492,15 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         let depth = log.depth();
         let mut config = settings.core.clone();
         config.applied = durable.index;
+        // The group's disk mode: a leader applies on its followers' disks while its own lags.
+        if settings.disk.apart() {
+            config.apply_unpersisted = true;
+        }
+        // An incarnation no other opening of this member states (core step R-8), unless the
+        // owner gave one.
+        if config.incarnation == 0 {
+            config.incarnation = fresh_incarnation();
+        }
         config.limits.readies_in_flight = depth;
         config.elections = settings.elections;
         // The core keeps what the log may lack and acts on it (`docs/durable.md` §5): it judges
@@ -430,6 +534,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             logged_commit: view.hard_state.commit,
             applied: durable,
             compactable: 0,
+            sizes: VecDeque::new(),
+            sizes_from: durable.index.saturating_add(1),
             imaged: None,
             told_applied: durable.index,
             conf_index: durable.index,
@@ -445,6 +551,13 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             last_durable: None,
             writes_made: Writes::default(),
             flushed: None,
+            patience: settings.disk.apart().then(Patience::default),
+            driven_at: 0,
+            disk: settings.disk,
+            handed_over: 0,
+            heirless: 0,
+            heir_since: None,
+            slow_disks: Vec::new(),
         };
         // A log compacted before the restart serves a lagging member only by snapshot, and its
         // image is what the compaction rule weighs the log against; a log never compacted is
@@ -458,11 +571,19 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         } else {
             replica.machine.image_bytes()
         };
-        replica.compactable = replica
-            .compactable_after(view.start.index)
+        replica
+            .count_applied(view.start.index)
             .map_err(|e| OpenError::Core(hyper_raft::Error::Storage(e)))?;
         replica.settle();
         Ok(replica)
+    }
+
+    /// Plants `mutant` in the replica's core, or takes the one planted out: a defect a test build
+    /// shows its checks catch (`hyper_raft::Mutant`; the `mutants` feature, which no consumer
+    /// enables).
+    #[cfg(feature = "mutants")]
+    pub fn plant(&mut self, mutant: Option<hyper_raft::Mutant>) {
+        self.node.plant(mutant);
     }
 
     /// This member.
@@ -564,6 +685,11 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         &mut self.node.store_mut().log
     }
 
+    /// The group's log, read: its counts, or what a test's device holds.
+    pub fn log(&self) -> &L {
+        &self.node.store().log
+    }
+
     /// The state machine, for its owner's own use of it, between drives.
     pub fn machine_mut(&mut self) -> &mut M {
         &mut self.machine
@@ -572,6 +698,13 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// The writes this replica made since it opened, by what they were for.
     pub fn writes(&self) -> Writes {
         self.writes_made
+    }
+
+    /// The owner's period from now on ([`Settings::quiet`]): for an owner whose period is a
+    /// measure that moves, as an event-driven owner's is the interval its liveness stream sends
+    /// at. A quiet period already begun is judged by the new one at the next drive.
+    pub fn set_quiet(&mut self, quiet: Duration) {
+        self.quiet = quiet;
     }
 
     /// The bytes the budget holds for this replica.
@@ -682,15 +815,32 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         }
     }
 
-    /// Reserves an input's bytes before it changes anything.
+    /// Reserves an input's bytes before it changes anything. One the budget refuses is asked
+    /// again once the core has given back the room it holds spare (`Raft::trim`): a backlog's
+    /// slots, kept empty once it drained, held a member past its budget for good, refusing the
+    /// entries it lacked (kiln's CP-T2.2, every disk held past the patience).
     fn reserve(&mut self, len: u64) -> Result<(), ReplicaError> {
         if B::BOUNDED {
             if !self.budget.reserve(len) {
-                return Err(ReplicaError::Budget(len));
+                self.node.raft.trim();
+                self.settle();
+                if !self.budget.reserve(len) {
+                    return Err(ReplicaError::Budget(len));
+                }
             }
             self.charged = self.charged.saturating_add(len);
         }
         Ok(())
+    }
+
+    /// Whether the replica takes `message` with no room in its budget: an answer to what this
+    /// member asked that brings the core nothing it keeps (no entries, no snapshot, no context),
+    /// which it answers with nothing, and which what it changes the core's `Limits` bound. A request
+    /// is reserved for: its answer waits behind the writes out, and a held disk piled the answers
+    /// to requests taken with no room past the budget (777 KB of a member's 128 KiB, the harness's
+    /// every disk held but the leader's).
+    fn takes_without_room(&self, message: &Message) -> bool {
+        !keeps_something(message) && answers(message)
     }
 
     /// Brings what the budget holds for this replica to what it holds: the core's resident
@@ -709,7 +859,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     }
 
     /// The bytes the replica holds: the core's, and the messages, reads and reports the shell
-    /// keeps.
+    /// keeps, and its count of the applied entries the log holds.
     fn held_bytes(&self) -> u64 {
         let messages = |messages: &[Message]| {
             messages
@@ -732,6 +882,11 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         });
         // What the store keeps for this replica's reads is this replica's to bound.
         let kept = usize::try_from(self.node.store().log.kept_bytes()).unwrap_or(usize::MAX);
+        // The count of each applied entry the log holds, the room it has.
+        let sizes = self
+            .sizes
+            .capacity()
+            .saturating_mul(std::mem::size_of::<u32>());
         bytes(
             self.node
                 .raft
@@ -739,7 +894,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 .saturating_add(writes)
                 .saturating_add(stalled)
                 .saturating_add(reads)
-                .saturating_add(kept),
+                .saturating_add(kept)
+                .saturating_add(sizes),
         )
     }
 
@@ -751,6 +907,9 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// the reopened one what its detectors believe.
     pub fn suspect(&mut self, member: u64) -> Result<(), ReplicaError> {
         self.guarded(|r| {
+            // The same detector decides whose held answers a leader counts (core step R-8).
+            let held = r.node.suspect_held(member);
+            r.heard(held)?;
             let told = r.node.suspect(member);
             r.heard(told)
         })
@@ -759,18 +918,74 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// The owner's detectors trust `member`'s node again.
     pub fn trust(&mut self, member: u64) -> Result<(), ReplicaError> {
         self.guarded(|r| {
+            let held = r.node.trust_held(member);
+            r.heard(held)?;
             let told = r.node.trust(member);
             r.heard(told)
         })
+    }
+
+    /// Judged apart from its disk, `member`'s disk is slow, as its heartbeats say
+    /// (`hyper_liveness::Change::DiskSlow`, kiln's CP-T2.2): what the replica trusts of its process
+    /// is unchanged, and while it is slow it is named heir to no hand-over of the leader's patience
+    /// with its own disk (`docs/durable.md` §4.2). Kept for the members the configuration names and
+    /// let go as one leaves it (Focal's 5b), so bounded by the configuration: a learner's verdict
+    /// stands as it is made a voter.
+    pub fn disk_slow(&mut self, member: u64) -> Result<(), ReplicaError> {
+        if names(self.configuration(), member) && !self.slow_disks.contains(&member) {
+            self.slow_disks.push(member);
+        }
+        Ok(())
+    }
+
+    /// `member`'s disk is no longer slow (`hyper_liveness::Change::DiskCaughtUp`).
+    pub fn disk_caught_up(&mut self, member: u64) -> Result<(), ReplicaError> {
+        self.slow_disks.retain(|slow| *slow != member);
+        Ok(())
+    }
+
+    /// Whether the owner's detectors judge `member`'s disk slow ([`Replica::disk_slow`]).
+    pub fn disk_is_slow(&self, member: u64) -> bool {
+        self.slow_disks.contains(&member)
     }
 
     /// The owner's detectors saw `member`'s node start again, a new incarnation: trusted, and
     /// leading nothing it led before it stopped.
     pub fn restarted(&mut self, member: u64) -> Result<(), ReplicaError> {
         self.guarded(|r| {
+            let held = r.node.trust_held(member);
+            r.heard(held)?;
             let told = r.node.restarted(member);
             r.heard(told)
         })
+    }
+
+    /// The owner's detectors took `member`'s node's announcement that its run ends: suspected at
+    /// once, its held answers not counted (core step R-8), ordered to campaign never, and what it
+    /// sends that could take the group's leader dropped, until its node is heard again
+    /// (`hyper_raft::RawNode::stopped`).
+    pub fn stopped(&mut self, member: u64) -> Result<(), ReplicaError> {
+        self.guarded(|r| {
+            let held = r.node.suspect_held(member);
+            r.heard(held)?;
+            let told = r.node.stopped(member);
+            r.heard(told)
+        })
+    }
+
+    /// Stops this member's held answers ahead of a planned stop (core step R-8): its promise drops
+    /// in a later write once its disk holds what it answered for, and the owner stops it once
+    /// [`Replica::held_settled`], so that it opens unmarked.
+    pub fn quiet_held(&mut self) -> Result<(), ReplicaError> {
+        self.guarded(|r| {
+            let told = r.node.quiet_held();
+            r.heard(told)
+        })
+    }
+
+    /// Whether this member states no promise, durable or out: a quieted member may stop.
+    pub fn held_settled(&self) -> bool {
+        self.node.held_settled()
     }
 
     /// What the path to `member` carries in a round trip, as the node's transport measures it: its
@@ -822,13 +1037,27 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     pub fn believe_all(&mut self, liveness: &Liveness) -> Result<(), ReplicaError> {
         let peers: Vec<PeerId> = self.peers().collect();
         for peer in peers {
-            if liveness.trust(peer) == Some(Trust::Suspected) {
-                self.suspect(peer)?;
-            } else {
-                self.trust(peer)?;
-            }
+            self.believe_of(liveness, peer)?;
         }
         Ok(())
+    }
+
+    /// Tells the core what the node's liveness stream believes of `peer` now: its run's announced
+    /// stop, a suspicion, or trust; and the replica whether the stream judges its disk slow, a
+    /// verdict told while the replica shared no group with the peer having reached it as no change.
+    pub fn believe_of(&mut self, liveness: &Liveness, peer: PeerId) -> Result<(), ReplicaError> {
+        if liveness.disk_slow(peer) == Some(true) {
+            self.disk_slow(peer)?;
+        } else {
+            self.disk_caught_up(peer)?;
+        }
+        if liveness.stopped(peer) {
+            self.stopped(peer)
+        } else if liveness.trust(peer) == Some(Trust::Suspected) {
+            self.suspect(peer)
+        } else {
+            self.trust(peer)
+        }
     }
 
     /// The group's timing by hyper-timing's law over what the node's liveness stream measured
@@ -876,10 +1105,10 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         let quiet = self.quiet_since.filter(|_| self.has_slot()).map(|since| {
             since.saturating_add(u64::try_from(self.quiet.as_nanos()).unwrap_or(u64::MAX))
         });
-        match (self.node.deadline(), quiet) {
-            (Some(core), Some(quiet)) => Some(core.min(quiet)),
-            (core, quiet) => core.or(quiet),
-        }
+        [self.node.deadline(), quiet, self.disk_patience_point()]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// Wakes the core at the owner's clock (timing step L-2): what it armed since the last
@@ -897,11 +1126,18 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.must(woken).map(drop)
     }
 
-    /// A message from the network, bound to its authenticated sender by the transport.
+    /// A message from the network, bound to its authenticated sender by the transport. One the
+    /// replica can take with no room is taken whatever the budget's room (`takes_without_room`):
+    /// what lets a full replica drain, a leader hearing the acknowledgements that commit and hand
+    /// over, a follower its leader's commit. Reserved for as well, a leader whose stalled disk had
+    /// filled its room heard none of them again, and held its lead and its room for good (kiln's
+    /// CP-T2.2, the liveness harness's `judged_apart_no_hand_over_while_every_other_disk_is_slow`).
     pub fn step(&mut self, message: Message) -> Result<(), ReplicaError> {
         self.guarded(|r| {
             r.takes()?;
-            r.reserve(bytes(proto::message_bytes(&message)))?;
+            if !r.takes_without_room(&message) {
+                r.reserve(bytes(proto::message_bytes(&message)))?;
+            }
             let stepped = r.node.step(message);
             let outcome = r.heard(stepped);
             r.settle();
@@ -1095,6 +1331,202 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.reads.len()
     }
 
+    /// The time the room the replica's budget has left takes to fill at its backlog's growth, the
+    /// room less what the backlog's next reallocation takes, as its patience with its own disk read
+    /// them at its latest drive (kiln's CP-T2.2, `docs/durable.md` §4.2): what a leader in the disk
+    /// mode hands the lead on within, a hand-over's time before it ends. None in today's mode, with
+    /// a budget that refuses nothing ([`Budget::room`]), or while nothing grows.
+    pub fn disk_fill(&self) -> Option<Duration> {
+        self.fill_ns().map(Duration::from_nanos)
+    }
+
+    /// The time the replica's patience takes a hand-over to need: the tail of those it timed, from
+    /// its order to the first commit of a later term it saw, or before any the election its timing
+    /// law expects and its round (`hyper_raft::Timing`); none in today's mode.
+    pub fn hand_over_time(&self) -> Option<Duration> {
+        let patience = self.patience.as_ref()?;
+        Some(Duration::from_nanos(
+            patience.hand_over_ns(self.hand_over_prior_ns()),
+        ))
+    }
+
+    /// The hand-overs the replica ordered and timed ([`Replica::hand_over_time`]).
+    pub fn hand_overs_timed(&self) -> u64 {
+        self.patience.as_ref().map_or(0, Patience::hand_overs_timed)
+    }
+
+    /// When the oldest write of the replica's still out on its log was submitted, if one is: what
+    /// the node's liveness stream judges its own disk's wait from in the disk mode, a disk with
+    /// nothing to do being no slow one (`hyper_liveness::Liveness::on_pending`, Focal's 5a).
+    pub fn out_since(&self) -> Option<u64> {
+        self.writes
+            .iter()
+            .find(|write| write.state == State::Submitted)
+            .map(|write| write.submitted)
+    }
+
+    /// The group's disk mode the replica was opened with ([`Settings::disk`]): what its owner sets
+    /// the node's liveness stream to (`hyper_liveness::Liveness::set_disk_apart`), and what
+    /// [`crate::Owner::pairs`] holds every replica it pairs to.
+    pub fn disk(&self) -> Disk {
+        self.disk
+    }
+
+    /// The hand-overs the replica's patience with its disk began (`docs/durable.md` §4.2): one the
+    /// core gives up (its transfer's timeout) is begun again while the patience stays ended.
+    pub fn handed_over(&self) -> u64 {
+        self.handed_over
+    }
+
+    /// The drives at which the replica's patience with its disk ended and no voter was there to
+    /// hand over to: every other voter suspected, or its disk judged slow
+    /// ([`Replica::disk_slow`]). The leader leads on, its writes committing where they can.
+    pub fn heirless(&self) -> u64 {
+        self.heirless
+    }
+
+    /// When a leader's patience with its own disk ends (`patience::point`), in the disk mode with a
+    /// write of its own out, a budget that refuses ([`Budget::room`]) and a backlog that grows: once
+    /// the room it has left would fill within a hand-over, and a hand-over's time after both its
+    /// oldest write out and a voter there to hand over to, if one is.
+    fn disk_patience_point(&self) -> Option<u64> {
+        let patience = self.patience.as_ref()?;
+        if !self.is_leader() {
+            return None;
+        }
+        let oldest = self.writes.front()?;
+        let fill = self.fill_ns()?;
+        let hand_over = patience.hand_over_ns(self.hand_over_prior_ns());
+        let anchor = oldest
+            .submitted
+            .max(self.heir_since.unwrap_or(oldest.submitted));
+        Some(patience::point(self.driven_at, fill, hand_over, anchor))
+    }
+
+    /// The time the room left takes to fill at the backlog's growth, nanoseconds, in the disk mode
+    /// as read at the latest drive: the entries the backlog takes before a proposal is refused
+    /// (`patience::entries_to_fill`), at the growth's tail.
+    fn fill_ns(&self) -> Option<u64> {
+        let patience = self.patience.as_ref()?;
+        let room = u64::try_from(self.budget.room()?).unwrap_or(u64::MAX);
+        let growth = patience.growth(self.driven_at, self.log_end())?;
+        let unstable = self.node.raft.log().unstable();
+        let entries = unstable.entries().len();
+        let slot = std::mem::size_of::<Entry>();
+        // The slots by capacity: what the core counts resident, its entries' payloads and its
+        // snapshot apart.
+        let slots = unstable
+            .resident_bytes()
+            .saturating_sub(unstable.payload())
+            .saturating_sub(unstable.snapshot_bytes())
+            .checked_div(slot)
+            .unwrap_or(0);
+        let backlog = patience::Backlog {
+            room,
+            entries: bytes(entries),
+            slots: bytes(slots),
+            entry_room: bytes(
+                self.node
+                    .raft
+                    .config()
+                    .limits
+                    .unstable_entries
+                    .saturating_sub(entries),
+            ),
+            slot_bytes: bytes(slot),
+            payload: patience.payload(),
+        };
+        patience::fill_ns(patience::entries_to_fill(&backlog), growth)
+    }
+
+    /// The index the core's log ends at: what the backlog's growth is counted in.
+    fn log_end(&self) -> u64 {
+        self.node.raft.log().last_index().unwrap_or(0)
+    }
+
+    /// The bytes an entry the core holds not yet durable takes for its payload, at their mean; none
+    /// while it holds none.
+    fn unstable_payload(&self) -> Option<u64> {
+        let unstable = self.node.raft.log().unstable();
+        bytes(unstable.payload()).checked_div(bytes(unstable.entries().len()))
+    }
+
+    /// Before a hand-over is timed, the time one is taken to need, nanoseconds: the election the
+    /// group's timing law expects and its round; zero before the law measured them.
+    fn hand_over_prior_ns(&self) -> u64 {
+        self.node.raft.timing().map_or(0, |timing| {
+            u64::try_from(timing.election.saturating_add(timing.round).as_nanos())
+                .unwrap_or(u64::MAX)
+        })
+    }
+
+    /// The voter a leader's patience would hand the lead to: of those its detectors trust whose
+    /// disks aren't judged slow ([`Replica::disk_slow`]), the one that holds most of its log.
+    fn disk_heir(&self) -> Option<u64> {
+        let id = self.id();
+        let tracker = self.node.raft.tracker();
+        self.configuration()
+            .voters
+            .iter()
+            .copied()
+            .filter(|&voter| {
+                voter != id && !self.node.raft.suspects(voter) && !self.disk_is_slow(voter)
+            })
+            .filter_map(|voter| tracker.get(voter).map(|p| (p.matched, voter)))
+            .max()
+            .map(|(_, voter)| voter)
+    }
+
+    /// A leader whose patience with its own disk ended (`disk_patience_point`) hands the lead to the
+    /// voter that holds most of its log, of those its detectors trust whose disks aren't judged slow
+    /// ([`Replica::disk_slow`]), unless a hand-over is under way. The heir campaigns on the core's
+    /// word (`TimeoutNow`), which leaves without a write of this member's (`RawNode::light_now`)
+    /// once the core has brought the heir's log up to the leader's (Raft's precondition, thesis
+    /// §3.10). With no such voter, none is named: an heir whose disk is slow could neither hold the
+    /// lead's writes nor win its campaign, whose vote waits on a disk. The patience counts a
+    /// hand-over's time from when a voter could take the lead, so while every other disk is slow
+    /// too, as when the members share one, it waits on its own as long as on theirs (Focal's
+    /// condition 6): one voter's disk caught up a moment before its own is no cause to hand over.
+    /// Counted from its write alone, doc 34's spread with the leader's disk let go last (1 and 3 ms
+    /// after its followers') began a hand-over in 19 seeds of 200 under a publish a millisecond, and
+    /// under one every 100 ms, whose heir catches up at once, spent one to three terms in 20 of 200.
+    /// Each hand-over is timed to the first commit of a later term the member sees: what the next
+    /// patience takes one to need.
+    fn keep_disk_patience(&mut self, now: u64) -> Result<(), ReplicaError> {
+        let log = self.node.raft.log();
+        let committed = log.term(log.committed()).ok();
+        let Some(patience) = self.patience.as_mut() else {
+            self.heir_since = None;
+            return Ok(());
+        };
+        if let Some(term) = committed {
+            patience.committed(now, term);
+        }
+        if !self.is_leader() {
+            self.heir_since = None;
+            return Ok(());
+        }
+        let heir = self.disk_heir();
+        self.heir_since = heir.and(self.heir_since.or(Some(now)));
+        if self.disk_patience_point().is_none_or(|point| now < point)
+            || self.node.raft.lead_transferee().is_some()
+        {
+            return Ok(());
+        }
+        let Some(heir) = heir else {
+            self.heirless = self.heirless.saturating_add(1);
+            return Ok(());
+        };
+        let term = self.term();
+        let told = self.node.transfer_leader(heir);
+        self.heard(told)?;
+        self.handed_over = self.handed_over.saturating_add(1);
+        if let Some(patience) = self.patience.as_mut() {
+            patience.ordered(now, term);
+        }
+        Ok(())
+    }
+
     /// Hands the lead to `to`.
     pub fn transfer(&mut self, to: u64) -> Result<(), ReplicaError> {
         self.guarded(|r| {
@@ -1154,6 +1586,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     ) -> Result<Driven, ReplicaError> {
         self.guarded(|r| {
             r.drive_applied = 0;
+            r.driven_at = now;
             r.take_answers(now, out)?;
             if r.stall.is_some() {
                 r.make_again(now, waker)?;
@@ -1163,11 +1596,17 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 r.take_reports()?;
                 r.release_fence(out)?;
                 r.take_ready(now, waker, out)?;
+                r.keep_disk_patience(now)?;
+                r.take_light(out)?;
                 r.quiet_commit(now, waker)?;
             }
             r.release_reads(out);
             r.keep();
             r.settle();
+            let (end, payload) = (r.log_end(), r.unstable_payload());
+            if let Some(patience) = r.patience.as_mut() {
+                patience.settled(now, end, payload);
+            }
             Ok(r.driven())
         })
     }
@@ -1188,6 +1627,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             stalled: self.stall.as_ref().map(|stall| stall.fault.clone()),
             wake: self.deadline(),
             flushed: self.flushed.take(),
+            out_since: self.out_since(),
         }
     }
 
@@ -1262,6 +1702,12 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         if write.state == State::Submitted {
             self.last_durable = Some(now);
             self.flushed = Some((write.submitted, now));
+            // The wait it ended, a sample of the backlog's growth, measured on the log as the drive
+            // began.
+            let end = self.log_end();
+            if let Some(patience) = self.patience.as_mut() {
+                patience.on_durable(now, end);
+            }
             if write.vote {
                 // A fold that is full keeps its mean: the sample is one of more than it counts.
                 let _ = self.flushes.on_flush(write.submitted, now);
@@ -1282,9 +1728,9 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 // nothing, and is the owner's to ask again (`Replica::make_again`).
                 self.imaged = Some(imaged);
                 let start = self.node.store().log.bounds().map(|(start, _)| start.index);
-                let held = start.and_then(|start| self.compactable_after(start));
-                self.compactable =
-                    held.map_err(|e| self.fence(Cause::Core(hyper_raft::Error::Storage(e))))?;
+                let start =
+                    start.map_err(|e| self.fence(Cause::Core(hyper_raft::Error::Storage(e))))?;
+                self.let_go_through(start);
                 if let Some(stall) = self.stall.as_mut() {
                     stall.freed = true;
                 }
@@ -1296,6 +1742,20 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         let mut light = self.must(persisted)?;
         self.emit(light.take_messages(), out);
         self.tell_durable_commit()?;
+        if let Some((first, last)) = light.committed_range() {
+            self.apply_range(first, last, out)?;
+        }
+        self.tell_applied()
+    }
+
+    /// What the core may apply and send without a write, whatever the writes out
+    /// (`RawNode::light_now`): a leader's appends when it proposes and what it commits when it
+    /// commits, a follower's held answers when it takes the entries (core step R-8). Without it
+    /// they wait for a write of the member's own to free a place for the next `Ready`.
+    fn take_light(&mut self, out: &mut Output<M::Answer>) -> Result<(), ReplicaError> {
+        let light = self.node.light_now(true);
+        let mut light = self.must(light)?;
+        self.emit(light.take_messages(), out);
         if let Some((first, last)) = light.committed_range() {
             self.apply_range(first, last, out)?;
         }
@@ -1340,10 +1800,15 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     }
 
     /// Makes the refused writes again, once every write out has been answered and the log has
-    /// room: one write of everything the core holds not yet durable, laid out from the core
-    /// (R-4 keeps it until its notice), with the latest hard state and the messages of each
-    /// refused write whose log the core still holds (`Out::tip`). Its notice is the last refused
-    /// `Ready`'s, which covers all of them.
+    /// room: one write of everything they held, laid out from the core (R-4 keeps it until its
+    /// notice), with the latest hard state and the messages of each refused write whose log the
+    /// core still holds (`Out::tip`). Its notice is the last refused `Ready`'s, which covers all
+    /// of them, and nothing past them: an entry no write was issued for waits for the `Ready`
+    /// that issues it. Written here as well, the core would issue it again, and a compaction
+    /// bounded by what the store holds could pass it before that write, which the store then
+    /// refuses below its start (the shell's simulation, seed 9785 of its fourth shape: a leader
+    /// applying ahead of its write applied what its followers took from that `Ready`, and
+    /// compacted while the `Ready`'s write stalled).
     fn make_again(&mut self, now: u64, waker: &Waker) -> Result<(), ReplicaError> {
         let freed = self.stall.as_ref().is_some_and(|stall| stall.freed);
         if !freed || !self.writes.is_empty() || !self.node.store().log.room() {
@@ -1373,7 +1838,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             commit: if unissued {
                 self.issued.commit
             } else {
-                stated.max(self.issued.commit)
+                // I7: the core may have committed entries no write was issued for yet.
+                stated.min(self.written_through()).max(self.issued.commit)
             },
             ..self.issued
         };
@@ -1387,7 +1853,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         let held: Vec<Entry> = if unissued {
             Vec::new()
         } else {
-            unstable.entries().to_vec()
+            unstable.issued_entries().to_vec()
         };
         // The fast track's proposals the refused writes held: the core keeps those of every
         // write issued until its notice, and every write out has been answered, so those it
@@ -1570,6 +2036,9 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             self.must(deferred)?;
         }
         self.emit(ready.take_messages(), out);
+        // Held answers (core step R-8) promise memory alone: they leave at once, before this
+        // `Ready`'s write and whatever it holds.
+        self.emit(ready.take_held_messages(), out);
         for read in ready.take_read_states() {
             self.reads.push_back((read.index, read.request_ctx));
         }
@@ -1660,11 +2129,34 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         given: Option<&HardState>,
         carries: bool,
     ) -> Result<(Option<HardState>, bool), ReplicaError> {
-        let (term, vote) = given.map_or((self.issued.term, self.issued.vote), |h| (h.term, h.vote));
+        let (term, vote, held_index, held_term) = given.map_or(
+            (
+                self.issued.term,
+                self.issued.vote,
+                self.issued.held_index,
+                self.issued.held_term,
+            ),
+            |h| (h.term, h.vote, h.held_index, h.held_term),
+        );
         let commit = self.stated_commit()?.max(self.issued.commit);
-        let moved = (term, vote) != (self.issued.term, self.issued.vote);
+        // The promise (core step R-8) is written as a term or a vote is: a member answers for
+        // memory only under one whose write is durable, and lowers it only once its disk holds
+        // what it answered for.
+        let moved = (term, vote, held_index, held_term)
+            != (
+                self.issued.term,
+                self.issued.vote,
+                self.issued.held_index,
+                self.issued.held_term,
+            );
         let states_commit = commit > self.issued.commit && (carries || self.fence_needs_commit());
-        let hard = (moved || states_commit).then_some(HardState { term, vote, commit });
+        let hard = (moved || states_commit).then_some(HardState {
+            term,
+            vote,
+            commit,
+            held_index,
+            held_term,
+        });
         Ok((hard, moved))
     }
 
@@ -1713,6 +2205,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.conf_index = point.index;
         // The log starts at the image's point, holding nothing applied past it.
         self.compactable = 0;
+        self.sizes.clear();
+        self.sizes_from = point.index.saturating_add(1);
         self.imaged = self
             .node
             .store()
@@ -1863,6 +2357,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             machine,
             applied,
             compactable,
+            sizes,
+            sizes_from,
             page,
             drive_applied,
             ..
@@ -1886,6 +2382,18 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             }
             *drive_applied = drive_applied.saturating_add(bytes);
             // Applied from here, or failed, which fences the replica: it counts afresh at open.
+            let Ok(size) = u32::try_from(bytes) else {
+                stop = Stop::Failed(Cause::Invariant("an entry past four gibibytes"));
+                return true;
+            };
+            if sizes.try_reserve(1).is_err() {
+                stop = Stop::Failed(Cause::Core(hyper_raft::Error::Memory));
+                return true;
+            }
+            if sizes.is_empty() {
+                *sizes_from = entry.index;
+            }
+            sizes.push_back(size);
             *compactable = compactable.saturating_add(bytes);
             if entry.changes_configuration() {
                 stop = match change_of(&entry) {
@@ -1942,6 +2450,9 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.machine_did(kept)?;
         self.applied = at;
         self.conf_index = at.index;
+        // A member that left keeps no verdict of its disk (Focal's 5b).
+        self.slow_disks
+            .retain(|member| names(&configuration, *member));
         self.node.store_mut().configuration = configuration;
         Ok(())
     }
@@ -2117,11 +2628,13 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.compactable
     }
 
-    /// The bytes of the applied entries the log holds past `after`, as the core counts them:
-    /// those the store holds, and a leader's own past them, applied before its write is durable
-    /// (`Config::apply_unpersisted`), where the core holds them. An install not yet durable
-    /// starts the log at its point, and what the store holds before it is not counted.
-    fn compactable_after(&self, after: u64) -> Result<u64, StorageError> {
+    /// Counts the applied entries the log holds past `after` into [`Replica::compactable`], each
+    /// into `sizes` as well, as the core counts an entry's: those the store holds, and a leader's
+    /// own past them, applied before its write is durable (`Config::apply_unpersisted`), where the
+    /// core holds them. An install not yet durable starts the log at its point, and what the
+    /// store holds before it is not counted. At open alone: from then on each entry is counted as
+    /// it is applied, and let go of as a start passes it ([`Replica::let_go_through`]).
+    fn count_applied(&mut self, after: u64) -> Result<(), StorageError> {
         let end = self.applied.index.saturating_add(1);
         let unstable = self.node.raft.log().unstable();
         let after = unstable
@@ -2131,21 +2644,72 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         let held = self.node.store();
         let unstable = unstable.entries();
         let tail = unstable.first().map_or(u64::MAX, |e| e.index);
+        let mut sizes = VecDeque::new();
         let mut bytes = 0u64;
+        let mut refused = None;
+        let mut count = |counted: u64| -> bool {
+            let Ok(size) = u32::try_from(counted) else {
+                refused = Some(StorageError::Other("an entry past four gibibytes"));
+                return true;
+            };
+            if sizes.try_reserve(1).is_err() {
+                refused = Some(StorageError::Other(
+                    "no memory to count the applied entries",
+                ));
+                return true;
+            }
+            sizes.push_back(size);
+            bytes = bytes.saturating_add(counted);
+            false
+        };
         if first < end.min(tail) {
             held.log
                 .visit(first, end.min(tail), held.page, &mut |entry| {
-                    bytes = bytes.saturating_add(entry.encoded_bytes());
-                    false
+                    count(entry.encoded_bytes())
                 })?;
         }
         for entry in unstable
             .iter()
             .filter(|e| e.index >= first && e.index < end)
         {
-            bytes = bytes.saturating_add(EntryRef::of(entry).encoded_bytes());
+            if count(EntryRef::of(entry).encoded_bytes()) {
+                break;
+            }
         }
-        Ok(bytes)
+        if let Some(refused) = refused {
+            return Err(refused);
+        }
+        self.compactable = bytes;
+        self.sizes = sizes;
+        self.sizes_from = first;
+        Ok(())
+    }
+
+    /// Takes the entries a start at `start` let go of out of [`Replica::compactable`], each by
+    /// what it was counted, oldest first. What the count keeps of them shrinks by half once a
+    /// quarter of its room is used (a dynamic table's contraction, Cormen, Leiserson, Rivest and
+    /// Stein, *Introduction to Algorithms*, §17.4), so a log that held many entries once does not
+    /// keep their room, and a log that grows and shrinks around one size does not reallocate on
+    /// each turn.
+    fn let_go_through(&mut self, start: u64) {
+        while self.sizes_from <= start {
+            let Some(size) = self.sizes.pop_front() else {
+                break;
+            };
+            self.compactable = self.compactable.saturating_sub(u64::from(size));
+            self.sizes_from = self.sizes_from.saturating_add(1);
+        }
+        self.sizes_from = self.sizes_from.max(start.saturating_add(1));
+        // Moved into room of its own, as the core gives back a queue's room (`Outgoing::recycle`):
+        // a reallocation in place has no refusal to return.
+        let room = self.sizes.capacity();
+        if self.sizes.len() <= room / 4 {
+            let mut smaller = VecDeque::new();
+            if smaller.try_reserve_exact(room / 2).is_ok() {
+                smaller.extend(self.sizes.drain(..));
+                self.sizes = smaller;
+            }
+        }
     }
 }
 

@@ -1261,12 +1261,17 @@ fn log_id(slot: usize) -> u128 {
 
 impl Devices {
     fn new(seed: u64) -> Self {
+        Self::logged(seed, log_config())
+    }
+
+    /// As `new`, each member's log under `config`.
+    fn logged(seed: u64, config: LogConfig) -> Self {
         let files = (0..3).map(|_| None).collect();
         let nodes = (0..3)
             .zip(1u64..)
             .map(|(slot, id)| {
                 let device = sim(seed + u64::try_from(slot).unwrap());
-                let log = Log::create(device, log_config(), log_id(slot)).unwrap();
+                let log = Log::create(device, config, log_id(slot)).unwrap();
                 let replica = open(id, &log, first_range(), &range(), seed + id).unwrap();
                 Node { replica, log }
             })
@@ -1391,7 +1396,15 @@ fn agreed(answers: &Answered) -> std::collections::BTreeMap<u64, Vec<Answer>> {
 fn a_durability_failure_fences(fault: &hyper_block::sim::Fault, failing: u64) {
     use mantle_range::ConfChangeV2;
 
-    let mut d = Devices::new(60 + failing);
+    // Each log writes only frames: a log under `Waits::Measured` writes zeros ahead into the slot
+    // it grows into whenever its device is idle (hyper-log's fill ahead), which the fault, one
+    // write's or one flush's, may meet first, so the failure lands on the entry's frame here only
+    // under `Waits::Never`, where nothing the writer does depends on when its device is idle.
+    let config = LogConfig {
+        waits: Waits::Never,
+        ..log_config()
+    };
+    let mut d = Devices::logged(60 + failing, config);
     let mut answers = Vec::new();
     d.nodes[0].replica.campaign().unwrap();
     d.settle(&[], &mut answers);
@@ -1549,6 +1562,7 @@ fn a_write_refused_for_want_of_a_group_waits_until_one_leaves() {
                     term: 1,
                     vote: 0,
                     commit: 0,
+                    held: None,
                 }),
                 ..hyper_log::Update::default()
             },

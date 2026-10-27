@@ -526,3 +526,36 @@ fn nodes_on_simulated_shards_exchange_requests_frames_and_sealed_datagrams_alike
     }
     eprintln!("ended at {} ns; {:?}", first.ended_ns, first.fabric);
 }
+
+/// Two drivers made on one simulated shard with real time between their making read one clock, and
+/// `shard_instant`, an endpoint's `now` on that shard, reads it too: each anchors to the process's one
+/// instant for the virtual clock's zero (`hyper_rt::sim::anchor`), not to the host's clock when made.
+/// Anchored when made, the second read the first's clock plus the real time between them.
+#[test]
+fn drivers_made_apart_in_real_time_read_one_clock_on_a_simulated_shard() {
+    const AT_NS: u64 = 5_000_000;
+    let issued = Issued::new(3);
+    let mut sim = SimRuntime::new(&config(), SEED).unwrap();
+    let shards = sim.shard_ids();
+    let (first, second) = (endpoint(&issued, 1), endpoint(&issued, 2));
+    let (tell, told) = channel();
+    sim.spawn_on(shards[0], async move {
+        hyper_rt::futures::sleep(AT_NS).await.unwrap();
+        let any: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let a: Drv = Driver::bind(first, any, IO).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let b: Drv = Driver::bind(second, any, IO).unwrap();
+        let readings = (
+            a.clock().unwrap(),
+            b.clock().unwrap(),
+            hyper_rt_transport::shard_instant(),
+        );
+        tell.send(readings).unwrap();
+    })
+    .unwrap();
+    sim.run_until(2 * AT_NS);
+    let (a, b, now) = told.recv().unwrap();
+    assert_eq!(a, b);
+    assert_eq!(a, now);
+    assert_eq!(a, hyper_rt::sim::anchor() + Duration::from_nanos(AT_NS));
+}

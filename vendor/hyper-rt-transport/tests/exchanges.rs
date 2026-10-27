@@ -181,6 +181,19 @@ fn every_class_of_exchange_crosses_on_a_hyper_rt_shard() {
                 assert_eq!(asked.refused, None, "{asked:?}");
                 assert_eq!((asked.reply, asked.read), (Some(asked.body), asked.body), "{asked:?}");
             }
+            // The asker's ring held one buffer to begin with; on Linux, where a call takes as
+            // many messages as it is offered buffers, the megabytes it took grew it, and the
+            // budget is charged what it grew by, no more.
+            let ring = driver.ring();
+            if cfg!(target_os = "linux") {
+                assert!(ring.grown >= 1 && ring.buffers > 1, "{ring:?}");
+            } else {
+                assert_eq!((ring.buffers, ring.grown), (1, 0), "{ring:?}");
+            }
+            let grown = u64::try_from((ring.buffers - 1) * hyper_rt_transport::RECEIVE_BYTES).unwrap();
+            assert_eq!(ring.charged, grown, "{ring:?}");
+            assert!(driver.endpoint().budget().used() >= grown);
+            assert!(ring.buffers <= IO.batch);
             let stats = driver.stats();
             format!(
                 "handshake {handshake:?}; 19 exchanges, 9.0 MiB each way, in {took:?}; the driver's future \

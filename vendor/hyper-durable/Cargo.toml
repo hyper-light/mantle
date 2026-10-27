@@ -8,6 +8,11 @@ license = "MIT"
 repository = "https://github.com/hyper-light/hyper-raft"
 publish = false
 
+[features]
+# A defect planted in the replica's core (`Replica::plant`, `hyper_raft::Mutant`), for a test build
+# that shows its checks catch it; no consumer enables it.
+mutants = ["hyper-raft/mutants"]
+
 [dependencies]
 hyper-block = { path = "../hyper-block" }
 hyper-liveness = { path = "../hyper-liveness" }

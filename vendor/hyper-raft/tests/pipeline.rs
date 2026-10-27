@@ -164,8 +164,11 @@ fn settled(mut group: Cluster<Lagged>, seed: u64, crash: Option<u64>) -> Cluster
         } else {
             group.electable()
         };
+        // With fates, a promise its log does not reach marks a member as a mark at rest does
+        // (core step R-8): where the leader and a quorum stopped with promises out, no log shows
+        // that what they answered for in memory was committed by no one, and the group must wait.
         assert!(
-            group.faults > 0 && electable.is_empty(),
+            (group.faults > 0 || group.settings.fates.is_some()) && electable.is_empty(),
             "seed {seed}, crash {crash:?}: the group did not settle, and {electable:?} could lead"
         );
         group.waits += 1;
@@ -323,7 +326,9 @@ fn schedules_of(name: &str, settings: Settings, voters: &[u64], mix: &Mix) -> (C
     // rarely committed before its write of them: the schedules without
     // faults are the ones that hold applying before durability to its
     // coverage (24 schedules with two marks at once reached none).
-    if settings.apply_unpersisted && mix.corrupt == 0 {
+    // With fates every setting's leader applies its own entries a held quorum committed before
+    // its write (R-8): the fated campaign holds the count over all its settings.
+    if settings.apply_unpersisted && mix.corrupt == 0 && settings.fates.is_none() {
         assert!(coverage.unpersisted > 0, "{name}: {coverage:?}");
     }
     (coverage, committed)
@@ -672,4 +677,114 @@ fn crash_enumeration_costs() {
         forks.report(),
         replays.report()
     );
+}
+
+/// Core step R-8 (`docs/raft.md` §3.7): the four settings' schedules with each member its own fate,
+/// a held commit's holders spanning three, on ticks and by suspicion. Held to every invariant
+/// above, where a held answer leaves at once only under a durable promise and no write lowers the
+/// promise below what was answered for (`Lagged`), and a commit is a durable majority's or, at the
+/// moment it is made, a held quorum's (`Cluster::check_durable`); crashes in the schedules lose
+/// what was not durable, a member that opens with a promise its log does not reach is marked
+/// through it, and once settled every member holds every committed entry as it was committed:
+/// nothing committed on memory is lost.
+#[test]
+fn held_commits_across_fates_keep_every_invariant() {
+    let mut held = 0u64;
+    let mut commits = 0u64;
+    let mut unpersisted = 0u64;
+    let mut slow = (0u64, 0u64);
+    for suspicion in [false, true] {
+        for (name, settings) in settings() {
+            let settings = Settings {
+                fates: Some(support::Fating::Apart(3)),
+                suspicion,
+                ..settings
+            };
+            let mix = mix_for(&settings, 0);
+            let (coverage, _) = schedules_of(name, settings, &[1, 2, 3], &mix);
+            held += coverage.held;
+            unpersisted += coverage.unpersisted;
+            commits += held_commits_of(settings, &[1, 2, 3], &mix);
+            // Disks a third as fast, every invariant held as above. Its proposals are as sparse
+            // as the other schedules' beside heartbeats, so a promise is dropped at most idle
+            // beats and few commits are a held quorum's alone; the mechanisms' coverage is the
+            // schedules' at the usual pace, and the exhaustive model's (hyper-check `tests/held.rs`).
+            let slow_mix = Mix {
+                lag: LAG / 3,
+                ..mix
+            };
+            for seed in 0..count("HYPER_RAFT_SEEDS", 24) {
+                let (group, _) = schedule(settings, &[1, 2, 3], seed, 2_000, &slow_mix, None);
+                slow.0 += group.coverage().held;
+                slow.1 += group.held_commits;
+            }
+        }
+    }
+    println!(
+        "slow disks: held answers {}, commits a held quorum alone made {}",
+        slow.0, slow.1
+    );
+    println!(
+        "held answers {held}, commits a held quorum alone made {commits}, entries a leader applied before its write {unpersisted}"
+    );
+    assert!(
+        held > 0 && commits > 0 && unpersisted > 0 && slow.0 > 0,
+        "{held} {commits} {unpersisted} {slow:?}"
+    );
+}
+
+/// R-8: members of one fate give no held answer and make no held commit, whatever the schedule.
+#[test]
+fn members_of_one_fate_make_no_held_commit_under_any_schedule() {
+    for (name, settings) in settings() {
+        let settings = Settings {
+            fates: Some(support::Fating::One),
+            ..settings
+        };
+        let mix = mix_for(&settings, 0);
+        let (coverage, _) = schedules_of(name, settings, &[1, 2, 3], &mix);
+        assert_eq!(coverage.held, 0, "{name}");
+        assert_eq!(held_commits_of(settings, &[1, 2, 3], &mix), 0, "{name}");
+    }
+}
+
+/// R-8: a crash at every persistence step of the crash campaigns' schedules with each member its own
+/// fate: whatever was answered for in memory and not yet durable when the member stopped, the group
+/// holds every committed entry once settled.
+#[test]
+fn a_crash_at_every_persistence_step_with_held_commits_loses_nothing_committed() {
+    let steps = count("HYPER_RAFT_CRASH_STEPS", 400);
+    let mut held = 0u64;
+    let mut total = 0u64;
+    for (settings, mix, seeds) in crash_campaigns(false) {
+        let settings = Settings {
+            fates: Some(support::Fating::Apart(3)),
+            ..settings
+        };
+        let mut crashes = 0u64;
+        for seed in seeds {
+            forked(settings, &[1, 2, 3], seed, steps, &mix, |_, group| {
+                crashes += 1;
+                held += group.coverage().held;
+            });
+        }
+        assert!(crashes > 0, "{crashes}");
+        total += crashes;
+    }
+    println!("{total} crash points, {held} held answers before them");
+    assert!(held > 0, "{held}");
+}
+
+/// The commits a held quorum alone made in the schedules of `settings`.
+fn held_commits_of(settings: Settings, voters: &[u64], mix: &Mix) -> u64 {
+    let seeds = count("HYPER_RAFT_SEEDS", 24);
+    let steps = count("HYPER_RAFT_STEPS", 2_000);
+    let first = count("HYPER_RAFT_SEED", 0);
+    (first..first + seeds)
+        .map(|seed| {
+            schedule(settings, voters, seed, steps, mix, None)
+                .0
+                .held_commits
+        })
+        .sum()
 }

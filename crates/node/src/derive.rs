@@ -545,10 +545,11 @@ pub fn log_bytes(config: &LogConfig) -> Option<u64> {
 pub const LOG_DEPTH: usize = 3;
 
 /// The heap a range's member takes as it opens, beside what it keeps for each member of its
-/// configuration: measured, 1,104 bytes under elections by suspicion, the node's, at one to ten
-/// members (`tests/range_memory.rs`); 1,080 before hyper-raft's d97153c gave the core's watch its
-/// hand-over order and the voter it left.
-pub const MEMBER_BYTES: u64 = 1_104;
+/// configuration: measured, 1,584 bytes under elections by suspicion, the node's, at one to ten
+/// members (`tests/range_memory.rs`); 1,104 before hyper-raft's core step R-8 (5626e0b) gave a
+/// member its held-commit state, which b5ea01b keeps behind pointers, and 1,080 before d97153c
+/// gave the core's watch its hand-over order and the voter it left.
+pub const MEMBER_BYTES: u64 = 1_584;
 
 /// The bytes of the context a node names a read by: the read's number (`Node`'s reads).
 const READ_CONTEXT_BYTES: u64 = 8;
@@ -2214,6 +2215,7 @@ fn say_log(said: &mut Said, config: &LogConfig) {
         match config.waits {
             hyper_log::Waits::Measured => "measured",
             hyper_log::Waits::Never => "never",
+            hyper_log::Waits::Told => "told",
         },
         Kind::Cited,
         "the writer waits for the replicas it just answered while that is expected to lower \

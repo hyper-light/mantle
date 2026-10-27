@@ -87,9 +87,35 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `e65afff` (hyper-raft branch `degraded-suspicion`: `313ada8` and fifteen
-commits, made for mantle's roll and objects tests on CI's busy runners), with no local delta**,
-taken by `scripts/snapshot-hyper-raft.py`: hyper-raft's `d97153c`, a leader its detectors leave no
+**Every crate at `f2ad9c2` (hyper-raft `main`, its CI run 40466352588 green), with no local
+delta**, taken by `scripts/snapshot-hyper-raft.py` (Python 3.11 or later): main's merge of kiln's
+CP-T2.2 disk mode (`cp/t2.2-mode`) over `degraded-suspicion-main`, which holds `e65afff`'s changes
+as main took them (`fbaaa6c`), and the rest of the 124 commits main holds that `e65afff` does not,
+since `2b13b15`, the base the two share. Mantle's code meets five of them, each kept at its behavior
+before: hyper-durable's `Settings::disk`, which `crates/range` states as `Disk::Flushed`, a leader
+applying only what a majority's disks hold with its own among them (`Disk::Apart`, a leader
+committing on its followers' disks while its own lags, is a durability decision mantle has not
+taken); hyper-transport's `Limits::retry_bytes`, `None` in `mantle_protocol::bounds`, a Retry once
+half the pending places are taken (RFC 9000 §8.1.2), the rule before it; hyper-transport's
+`Event::Degrading` and `Event::Progressing` (`c6baec2`), a dialer told its peer's path may be gone
+and back, which the node takes as hints its plane's suspicion already judges; and hyper-log's
+`HardState::held` and `Waits::Told`, core step R-8's promise and a simulation's writer. R-8 itself
+(`5626e0b`), commits on entries held in memory across failure fates, changes nothing without
+`Config::fates`, which mantle leaves unset (hyper-raft `docs/raft.md` §3.7), and
+`apply_unpersisted` stays off. Beneath them: hyper-log's growth slots zeroed ahead of their first
+frame and a frame's confirmation made durable the cheaper way the device measured (`16e9db2`,
+`088acc1`); hyper-quic's BBR paced at its model's rate, loss thresholds that learn a reordering
+path (`e911aab`, `cd90e5b`, `cf9849b`) and a token log (`a14c9ab`); hyper-transport's connection
+state charged as its host holds it (`64acd86`, `c37c267`) and an exchange waiting on its owner
+holding no stream credit (`d4e8447`); hyper-liveness's stop announced, answered and suspected at
+its arrival (`8cc669a`, `a706c92`, `4367f7a`); hyper-rt's Windows console close held for the
+owner's orderly stop (`04bbbf1`); hyper-block's zeros written only where a file system journals
+the allocation (`e05956a`); hyper-seal's content-keyed sealed files (`5a22c8c`); and hyper-tls's
+Brotli window held to the certificate (`e4bca91`). hyper-transport now names aws-lc-rs itself (its
+restart key, `restart.rs`), which resolves to the copy vendored above. Before it, every crate was at
+`e65afff` (hyper-raft branch `degraded-suspicion`: `313ada8` and fifteen commits, made for mantle's
+roll and objects tests on CI's busy runners), with no local delta, taken by
+`scripts/snapshot-hyper-raft.py`: hyper-raft's `d97153c`, a leader its detectors leave no
 quorum leading on and handing over only to a voter that can be elected without it, and a
 pre-candidate left no quorum no longer asking, so a false suspicion between the two live voters of
 a group with one voter stopped costs no leadership (mantle's roll: terms 5 to 9 in 1.7 s, and a
@@ -191,8 +217,10 @@ vendored beside them; `hyper-block`'s `sim` feature takes it.
 The crates mantle shares with focal and slates come from github.com/hyper-light/hyper-raft:
 - each is a snapshot of one crate taken from a commit's objects (`git archive`), its manifest made
   self-contained: the workspace's package fields and dependency specs written in, its benches and
-  `[[bench]]` tables and its `[lints]` left out, `publish = false` added, and an empty
-  `[workspace]` appended; its source revision is in `SNAPSHOT`. A file under `benches/` that a
+  `[[bench]]` tables and its `[lints]` left out but for the declaration of the cfgs its interleaving
+  tests select (`loom`, `shuttle`, `fuzzing`), kept where any `cfg` or `cfg_attr` predicate of its
+  sources names one at any depth, `publish = false` added, and an empty `[workspace]` appended; its
+  source revision is in `SNAPSHOT`. A file under `benches/` that a
   test includes by `#[path]` stays, since `cargo fmt --all` follows the include:
   `hyper-liveness`'s `benches/support/world.rs`;
 - each is a workspace root of its own, excluded from this workspace;
@@ -206,8 +234,9 @@ The crates mantle shares with focal and slates come from github.com/hyper-light/
   `hyper-liveness`, and for its own tests `hyper-sim`; `hyper-liveness` on `hyper-timing`;
   the transport stack (node.md §3): `hyper-rt-transport` on `hyper-rt`, `hyper-transport` and
   `hyper-datagram`; `hyper-transport` on `hyper-quic` and `hyper-timing`; `hyper-quic` on
-  `hyper-tls`, which it names `rustls`; `hyper-swim` on `hyper-timing`; `hyper-quic`, `hyper-tls`
-  and `hyper-datagram` on aws-lc-rs, which resolves to the copy vendored above;
+  `hyper-tls`, which it names `rustls`; `hyper-swim` on `hyper-timing`; `hyper-transport`,
+  `hyper-quic`, `hyper-tls` and `hyper-datagram` on aws-lc-rs, which resolves to the copy vendored
+  above;
   `hyper-block` with its `sim` feature on `hyper-sim`, which is std only; `hyper-seal` on aws-lc-rs (and `hyper-block` with its `files` feature), which
   resolves to the copy vendored above through the root `Cargo.toml`'s patch, and for its own
   tests `hyper-measure`; and `hyper-rt` on no other snapshot, and for its own tests

@@ -243,6 +243,30 @@ impl Disk {
         self.lost
             .filter(|lost| !lost.resolved_by(last, self.term(last).unwrap_or(0)))
     }
+    /// The mark a member opening on this disk takes from its promise (core step R-8): the promise,
+    /// where the log does not reach it in the log's order.
+    pub fn promise_mark(&self) -> Option<hyper_raft::Lost> {
+        let hard = self.hard_state;
+        if hard.held_term == 0 {
+            return None;
+        }
+        let last = self.last_index();
+        let mark = hyper_raft::Lost {
+            index: hard.held_index.min(u64::MAX - 1),
+            term: hard.held_term,
+        };
+        (!mark.reached_by(last, self.term(last).unwrap_or(0))).then_some(mark)
+    }
+    /// Whether this disk's promise, or its log in the log's order, covers `entry` (core step
+    /// R-8): what a member that answered for it in memory keeps of the answer however it stops.
+    pub fn promises(&self, index: u64, term: u64) -> bool {
+        let hard = self.hard_state;
+        let last = self.last_index();
+        let last_term = self.term(last).unwrap_or(0);
+        let covers = |at: (u64, u64)| at.0 > term || (at.0 == term && at.1 >= index);
+        (hard.held_term != 0 && covers((hard.held_term, hard.held_index)))
+            || covers((last_term, last))
+    }
     /// A fault at rest, while the member is stopped: the bytes change, or
     /// the last entries are gone, and nothing else is told.
     pub fn suffer(&mut self, fault: Fault) {
@@ -657,6 +681,41 @@ pub struct Settings {
     /// as it goes (`Cluster::report`, `Cluster::check_durable`, `Lagged`'s): a run with a planted
     /// defect is judged by the oracles alone, so that what catches the defect is theirs.
     pub judged: bool,
+    /// Core step R-8: each member's fate and the distinct fates a held commit's holders must span
+    /// (`Config::fates`); `None` states no fates, as every setting before R-8.
+    pub fates: Option<Fating>,
+}
+
+/// How a schedule's members stand toward one another (core step R-8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fating {
+    /// Each member its own fate, a held commit's holders spanning this many.
+    Apart(usize),
+    /// Every member one fate: no held commit is ever made.
+    One,
+}
+impl Fating {
+    /// Member `id`'s fate.
+    pub fn of(self, id: u64) -> u64 {
+        match self {
+            Self::Apart(_) => id,
+            Self::One => 7,
+        }
+    }
+    /// The distinct fates a held commit's holders must span.
+    pub fn spanning(self) -> usize {
+        match self {
+            Self::Apart(spanning) => spanning,
+            Self::One => 2,
+        }
+    }
+    /// The core's statement of it for a group of `members` members, numbered from one.
+    pub fn config(self, members: usize) -> hyper_raft::Fates {
+        hyper_raft::Fates {
+            of: (1..=members as u64).map(|id| (id, self.of(id))).collect(),
+            spanning: self.spanning(),
+        }
+    }
 }
 
 /// A member's clock, in the schedule's nanoseconds, by suspicion: the span a
@@ -723,6 +782,7 @@ impl Settings {
             apply_unpersisted: false,
             suspicion: false,
             judged: false,
+            fates: None,
         }
     }
     /// The same, electing by suspicion.
@@ -825,6 +885,12 @@ pub trait Replica: Sized {
     }
     fn view(&self) -> View;
     fn app(&self) -> App;
+    /// Whether the member's log holds `entry` now, in memory or on its disk: what a held commit
+    /// (core step R-8) counts. Only this core's members say; others hold nothing so counted.
+    fn holds_in_log(&self, entry: &Entry) -> bool {
+        let _ = entry;
+        false
+    }
     /// Everything applied becomes the snapshot. False when there is
     /// nothing new to compact.
     fn compact(&mut self) -> bool {
@@ -1333,6 +1399,10 @@ impl Replica for New {
             },
             seed,
             lost: store.0.mark(),
+            fates: settings.fates.map(|fating| fating.config(members)),
+            // Each opening's seed is its own (`Cluster::open`): an incarnation no other opening of
+            // the member states (core step R-8).
+            incarnation: seed.max(1),
             ..hyper_raft::Config::new(id, limits(members, settings.depth))
         };
         let mut raw = hyper_raft::RawNode::new(&config, store).expect("hyper-raft opens");
@@ -1399,12 +1469,16 @@ impl Replica for New {
         self.raw.set_inflight_bytes(member, bytes);
     }
     fn suspect(&mut self, member: u64) {
+        // The same detector decides whose held answers a leader counts (core step R-8).
+        heard(self.raw.suspect_held(member));
         heard(self.raw.suspect(member));
     }
     fn trust(&mut self, member: u64) {
+        heard(self.raw.trust_held(member));
         heard(self.raw.trust(member));
     }
     fn restarted(&mut self, member: u64) {
+        heard(self.raw.trust_held(member));
         heard(self.raw.restarted(member));
     }
     fn wake(&mut self, now: u64) -> bool {
@@ -1475,6 +1549,7 @@ impl Replica for New {
                     self.raw.raft.id()
                 );
             }
+            messages.extend(ready.take_held_messages());
             messages.extend(ready.take_messages());
             messages.extend(ready.take_persisted_messages());
             output.reads.extend(
@@ -1525,6 +1600,17 @@ impl Replica for New {
     fn app(&self) -> App {
         self.app
     }
+    fn holds_in_log(&self, entry: &Entry) -> bool {
+        holds_in(&self.raw, entry)
+    }
+}
+
+/// Whether `raw`'s log holds `entry`, in memory or on its disk (core step R-8's held count).
+pub fn holds_in<S: hyper_raft::Storage>(raw: &hyper_raft::RawNode<S>, entry: &Entry) -> bool {
+    raw.raft
+        .log()
+        .term(entry.index)
+        .is_ok_and(|term| term == entry.term)
 }
 
 /// What a member of this core is.
@@ -1671,6 +1757,9 @@ impl Replica for Either {
     }
     fn app(&self) -> App {
         either!(self, node => node.app())
+    }
+    fn holds_in_log(&self, entry: &Entry) -> bool {
+        either!(self, node => node.holds_in_log(entry))
     }
 }
 

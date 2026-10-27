@@ -42,6 +42,11 @@
 //!   asks, so the leader's appends, heartbeats and snapshots would make it a follower again and
 //!   end its asking; a leader that is up answers a pre-vote with a heartbeat, which can come
 //!   before every grant, ask after ask. They are dropped while it asks, as lost messages are.
+//! - **A member whose node announced its stop** ([`crate::RawNode::stopped`], hyper-liveness's
+//!   `Change::Stopped`) is suspected, and until its node starts again it is ordered to campaign
+//!   never, and its requests for votes and whatever it sends of a later term are dropped: its run
+//!   is ending, and what it sends meanwhile, or sent before and is still in flight, could only
+//!   take the group's leader from it (`docs/timing.md` §2.9, "A voter's stop announced").
 //! - **A leader that trusts a member again** takes what it sent it while it was suspected for lost,
 //!   as raft takes a report that a member is unreachable (`MsgUnreachable`: a window out is given
 //!   up and the member probed from what it is known to hold), and sends it a heartbeat, so a member
@@ -110,6 +115,8 @@ pub(crate) struct Watch {
     /// The members the owner's detectors suspect, in order; at most the members a configuration
     /// names ([`crate::Limits::members`]).
     suspected: Vec<NodeId>,
+    /// Of those, the members whose node announced its run ends (`Raft::stopped`), in order.
+    stopped: Vec<NodeId>,
     /// The span, the round tail and the expected election, nanoseconds, once the owner gave them.
     pub(crate) timing: Option<(u64, u64, u64)>,
     /// The owner's clock at the last wake, nanoseconds: what a learner's catch-up round is timed on
@@ -182,8 +189,30 @@ impl Watch {
             }
         }
     }
-    /// The detectors trust `member` again. False when they did already.
+    /// Whether `member`'s node announced its run ends, and has not been heard since.
+    pub(crate) fn stopped(&self, member: NodeId) -> bool {
+        self.stopped.binary_search(&member).is_ok()
+    }
+    /// `member`'s node announced its run ends: kept until the detectors trust it again. Refused
+    /// past `members`, the most a configuration names.
+    pub(crate) fn stop(&mut self, member: NodeId, members: usize) -> crate::Result<()> {
+        if let Err(position) = self.stopped.binary_search(&member) {
+            if self.stopped.len() >= members {
+                return Err(crate::Error::Capacity("members stopped"));
+            }
+            self.stopped
+                .try_reserve(1)
+                .map_err(|_| crate::Error::Capacity("members stopped"))?;
+            self.stopped.insert(position, member);
+        }
+        Ok(())
+    }
+    /// The detectors trust `member` again, and what its node announced of a run is past. False
+    /// when they did already.
     pub(crate) fn trust(&mut self, member: NodeId) -> bool {
+        if let Ok(position) = self.stopped.binary_search(&member) {
+            self.stopped.remove(position);
+        }
         match self.suspected.binary_search(&member) {
             Ok(position) => {
                 self.suspected.remove(position);
@@ -196,6 +225,7 @@ impl Watch {
     /// configuration no longer names.
     pub(crate) fn forget_unnamed(&mut self, named: impl Fn(NodeId) -> bool) {
         self.suspected.retain(|member| named(*member));
+        self.stopped.retain(|member| named(*member));
     }
     /// The members suspected, in order.
     pub(crate) fn suspected(&self) -> &[NodeId] {
@@ -243,6 +273,7 @@ impl Watch {
         std::mem::size_of::<Self>().saturating_add(
             self.suspected
                 .capacity()
+                .saturating_add(self.stopped.capacity())
                 .saturating_mul(std::mem::size_of::<NodeId>()),
         )
     }

@@ -61,6 +61,8 @@ pub struct Coverage {
     /// Entries a member took into its log from what it kept ahead of a
     /// hole (`Ahead::Kept`, R17), acknowledged with the write that held them.
     pub ahead: u64,
+    /// Held answers sent at once, each covered by a durable promise (core step R-8).
+    pub held: u64,
 }
 impl Coverage {
     pub fn add(&mut self, other: Self) {
@@ -77,6 +79,7 @@ impl Coverage {
         self.fenced += other.fenced;
         self.stated += other.stated;
         self.ahead += other.ahead;
+        self.held += other.held;
     }
 }
 
@@ -117,6 +120,19 @@ pub struct Lagged {
     /// Whether hyper-check's oracles judge the member's outputs in place of the checks here
     /// (`Settings::judged`).
     judged: bool,
+    /// The greatest entry this incarnation answered for in memory under a promise, `(term,
+    /// index)` (core step R-8): from the answer on, the disk's promise or its log covers it.
+    answered: (u64, u64),
+    /// The group states fates (R-8): its leader applies its own entries a held quorum committed
+    /// before its write of them is durable, as `Config::apply_unpersisted` has it do.
+    fated: bool,
+}
+
+/// Whether a held answer of `raw`'s needs a durable promise: everywhere but one half of at most two
+/// voters (core step R-8).
+fn needs_promise(raw: &hyper_raft::RawNode<Store>) -> bool {
+    let configuration = raw.raft.configuration();
+    !(configuration.outgoing().is_empty() && configuration.voters().len() <= 2)
 }
 
 /// R-6: an answer says of its commit only what the disk states, so a
@@ -173,6 +189,8 @@ fn check_message(disk: &Disk, message: &Message, member: u64) -> bool {
             (message.term, message.to),
             "member {member}: a vote given before it was durable"
         ),
+        // R-8: a held answer promises memory alone; `Lagged::take` holds it to its marker.
+        MessageType::MsgAppendResponse if current && !message.reject && message.held => {}
         MessageType::MsgAppendResponse if current && !message.reject => {
             assert!(
                 message.index <= disk.last_index(),
@@ -198,14 +216,64 @@ fn check_message(disk: &Disk, message: &Message, member: u64) -> bool {
 }
 
 impl Lagged {
-    fn take(&mut self) -> bool {
+    /// What the member may apply and send without a write, whatever its writes out
+    /// (`RawNode::light_now`): held to I2 as a notice's messages are, held answers to the disk's
+    /// promise, and what it applies to I4.
+    fn light(&mut self) -> bool {
+        let in_place = self.node.in_place;
+        let promised = needs_promise(&self.node.raw);
         let raw = &mut self.node.raw;
-        if !raw.has_ready() {
+        let mut light = raw.light_now(in_place).expect("a light ready");
+        let id = raw.raft.id();
+        let leads = raw.raft.state() == hyper_raft::StateRole::Leader;
+        let messages = light.take_messages();
+        let committed = committed_of(
+            raw,
+            in_place,
+            light.take_committed_entries(),
+            light.committed_range(),
+        );
+        if messages.is_empty() && committed.is_empty() {
             return false;
+        }
+        for message in messages.iter().filter(|_| !self.judged) {
+            let disk = &raw.store().0;
+            if message.held {
+                if promised {
+                    assert!(
+                        disk.promises(message.index, message.term),
+                        "member {id}: a held answer for {} of term {} left at once with the promise {:?} durable",
+                        message.index,
+                        message.term,
+                        (disk.hard_state.held_index, disk.hard_state.held_term)
+                    );
+                    self.answered = self.answered.max((message.term, message.index));
+                }
+                self.coverage.held += 1;
+            } else if leads {
+                self.coverage.answers += u64::from(check_commit(disk, message, id));
+            } else {
+                self.coverage.answers += u64::from(check_message(disk, message, id));
+            }
+        }
+        self.output.messages.extend(messages);
+        self.apply(committed);
+        self.node
+            .raw
+            .advance_apply_to(self.node.app.index)
+            .expect("applied");
+        true
+    }
+    fn take(&mut self) -> bool {
+        let lit = self.light();
+        let raw = &mut self.node.raw;
+        let promised = needs_promise(raw);
+        if !raw.has_ready() {
+            return lit;
         }
         if raw.in_flight() >= self.depth {
             self.coverage.refused += 1;
-            return false;
+            return lit;
         }
         let behind = raw.in_flight() > 0;
         let in_place = self.node.in_place;
@@ -260,6 +328,23 @@ impl Lagged {
             terms,
             vote,
         };
+        // R-8: a held answer leaves at once, and only for entries the disk's promise covers: a
+        // member that answered for memory and crashed must open marked through them.
+        for message in ready.held_messages().iter().filter(|_| !self.judged) {
+            assert!(message.held, "member {id}: a held answer not flagged held");
+            if promised {
+                assert!(
+                    disk.promises(message.index, message.term),
+                    "member {id}: a held answer for {} of term {} left with the promise {:?} durable",
+                    message.index,
+                    message.term,
+                    (disk.hard_state.held_index, disk.hard_state.held_term)
+                );
+                self.answered = self.answered.max((message.term, message.index));
+            }
+            self.coverage.held += 1;
+        }
+        self.output.messages.extend(ready.take_held_messages());
         self.output.messages.extend(ready.take_messages());
         self.output.reads.extend(
             ready
@@ -292,9 +377,9 @@ impl Lagged {
 
     /// I4: what is given to apply is committed, and durable here, but for a
     /// leader's own entries where it applies before its write is durable
-    /// (`Config::apply_unpersisted`, `docs/durable.md` §4.2), which a majority
-    /// holds durably (`Cluster::check_durable`). Then the commit fence
-    /// ([`Lagged::release`]).
+    /// (`Config::apply_unpersisted`, `docs/durable.md` §4.2, or a group stating
+    /// fates, R-8), which a majority holds durably or a held quorum holds
+    /// (`Cluster::check_durable`). Then the commit fence ([`Lagged::release`]).
     fn apply(&mut self, committed: Vec<Entry>) {
         let raw = &self.node.raw;
         let raft = &raw.raft;
@@ -305,7 +390,9 @@ impl Lagged {
                 self.judged
                     || entry.index <= raft.log().committed()
                         && (durable
-                            || (self.apply_unpersisted && leads && entry.term == raft.term())),
+                            || ((self.apply_unpersisted || self.fated)
+                                && leads
+                                && entry.term == raft.term())),
                 "member {}: {} given to apply before it was committed and durable",
                 raft.id(),
                 entry.index
@@ -381,6 +468,7 @@ impl Lagged {
             writes,
             coverage,
             judged,
+            answered,
             ..
         } = self;
         let id = node.raw.raft.id();
@@ -427,6 +515,15 @@ impl Lagged {
             for message in write.messages.iter().filter(|_| !*judged) {
                 coverage.answers += u64::from(check_message(disk, message, id));
             }
+            // R-8: no write leaves a promise below what was answered for in memory and is not yet
+            // on the disk.
+            let (term, index) = *answered;
+            assert!(
+                *judged || term == 0 || disk.promises(index, term),
+                "member {id}: write {} left the promise {:?} durable below {index} of term {term}, answered for in memory",
+                write.number,
+                (disk.hard_state.held_index, disk.hard_state.held_term)
+            );
         });
         if made {
             coverage.durable += 1;
@@ -531,6 +628,8 @@ impl Replica for Lagged {
             held: Vec::new(),
             apply_unpersisted: settings.apply_unpersisted,
             judged: settings.judged,
+            answered: (0, 0),
+            fated: settings.fates.is_some(),
         }
     }
     fn id(&self) -> u64 {
@@ -697,5 +796,8 @@ impl Replica for Lagged {
     }
     fn app(&self) -> App {
         self.node.app()
+    }
+    fn holds_in_log(&self, entry: &Entry) -> bool {
+        super::holds_in(&self.node.raw, entry)
     }
 }

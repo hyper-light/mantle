@@ -263,6 +263,7 @@ fn hard(term: u64, commit: u64) -> HardState {
         term,
         vote: 1,
         commit,
+        held: None,
     }
 }
 
@@ -584,17 +585,19 @@ fn reclaiming_segments_keeps_every_live_record() {
     let (log, recovery) = Log::open(file, cfg, ID).unwrap();
     assert!(recovery.damaged.is_empty());
     check(&log, &models);
-    // The file never grew past its quota.
+    // The file never grew past its bound: the persist area and `max_segments` slots, the next of
+    // which a fill ahead may write before a frame opens it.
     let len = hyper_block::block::BlockFile::len(&closed(log)).unwrap();
-    assert!(len <= cfg.segment_bytes * u64::from(cfg.max_segments));
+    assert!(len <= AREA + cfg.segment_bytes * u64::from(cfg.max_segments));
 }
 
 /// The statistics count every frame, flush, byte and wait the log made (`docs/durable.md`
 /// §13.1), against the file's own counts: writes one at a time, each a frame of one small update,
-/// its persist record and its confirmation, a block each, and two flushes.
+/// its persist record and its confirmation, a block each, and a flush, and one more for a
+/// confirmation the device flushed.
 #[test]
 fn the_statistics_count_each_frame_flush_byte_and_wait() {
-    let log = Log::create(sim(46), config(16, 8), ID).unwrap();
+    let log = Log::create(sim(46), config_now(16, 8), ID).unwrap();
     let counts = |log: &Log<SimFile>| {
         log.with_file(|f| {
             let s = f.stats().unwrap();
@@ -620,21 +623,31 @@ fn the_statistics_count_each_frame_flush_byte_and_wait() {
     assert_eq!(after.frames - before.frames, n);
     assert_eq!(after.updates - before.updates, n);
     assert_eq!(after.flushes - before.flushes, syncs_after - syncs);
-    // Each frame is flushed, and each, nothing following it, is confirmed by a write made durable
-    // on its own: one flush and one durable write a frame, no second flush.
-    assert_eq!(after.flushes - before.flushes, n);
-    assert_eq!(after.durable_writes - before.durable_writes, n);
+    // Each frame is flushed, and each, nothing following it, is confirmed one of the two ways the
+    // device measured (`Device::confirm`): by a write made durable on its own, no flush with it,
+    // or by a write and a flush of its own, whichever has cost the less on this file so far, which
+    // a busy machine's clock decides. Every confirmation is one or the other, and every flush is
+    // a frame's or a flushed confirmation's.
+    let durable = after.durable_writes - before.durable_writes;
+    let flushed = after.flushed_confirmations - before.flushed_confirmations;
+    // And a slot filled ahead while the device idled is flushed once (`LogStats::fills`): whether
+    // one comes between two frames is the device thread's timing.
+    let fills = after.fills - before.fills;
+    assert_eq!(durable + flushed, n, "{durable} durable, {flushed} flushed");
+    assert_eq!(after.flushes - before.flushes, n + flushed + fills);
     assert_eq!(after.durable_fallbacks - before.durable_fallbacks, 0);
     assert_eq!(
         after.bytes - before.bytes,
         (writes_after - writes) * BLOCK as u64
     );
-    assert_eq!(after.flush.count() - before.flush.count(), n);
+    assert_eq!(
+        after.flush.count() - before.flush.count(),
+        n + flushed + fills
+    );
     assert_eq!(after.write.count() - before.write.count(), n);
     assert_eq!(after.commit_wait.count() - before.commit_wait.count(), n);
     // Each wait runs from its submission past its frame's writes and flush and its
-    // confirmation's durable write, one write at a time, so the waits hold every write and flush
-    // timed.
+    // confirmation, one write at a time, so the waits hold every write and flush timed.
     let waited = after.commit_wait.sum_ns() - before.commit_wait.sum_ns();
     let worked = (after.write.sum_ns() - before.write.sum_ns())
         + (after.flush.sum_ns() - before.flush.sum_ns());
@@ -652,7 +665,7 @@ fn the_statistics_count_each_frame_flush_byte_and_wait() {
 #[test]
 fn a_held_flush_shows_in_the_statistics_without_delaying_them() {
     let (device, gated) = held(sim(47));
-    let log = Log::create(device, config(16, 8), ID).unwrap();
+    let log = Log::create(device, config_now(16, 8), ID).unwrap();
     let before = log.stats(None).unwrap();
     gated.hold();
     let shut = gated.released();
@@ -714,7 +727,10 @@ fn many_submitters_share_flushes() {
     for group in 0..16u128 {
         assert_eq!(log.view(group).unwrap().unwrap().last, 20);
     }
-    assert!(syncs <= 320, "{syncs} flushes for 320 updates");
+    // Each slot filled ahead while the log idled flushes once, apart from the frames.
+    let stats = log.stats(None).unwrap();
+    let frames = syncs - stats.fills - stats.fill_failures;
+    assert!(frames <= 320, "{frames} flushes for 320 updates");
 }
 
 /// A replica's update waits for room rather than being refused: through a queue of one,
@@ -748,7 +764,7 @@ fn waiting_submitters_are_never_refused() {
 fn a_failed_flush_fences_the_log_and_loses_nothing_acknowledged() {
     let file = sim(7);
     let mut models = Models::new();
-    let log = Log::create(file, config(16, 8), ID).unwrap();
+    let log = Log::create(file, config_now(16, 8), ID).unwrap();
     let u = Update {
         entries: Some(entries(1, &[1, 1])),
         ..Update::default()
@@ -770,7 +786,7 @@ fn a_failed_flush_fences_the_log_and_loses_nothing_acknowledged() {
     let file = closed(log);
     file.crash(Crash::LoseAll).unwrap();
     file.clear_faults().unwrap();
-    let (log, recovery) = Log::open(file, config(16, 8), ID).unwrap();
+    let (log, recovery) = Log::open(file, config_now(16, 8), ID).unwrap();
     // Whatever of the lost frame's persist record the failed flush left durable, the frame
     // was never confirmed: nothing of it is restored, and it held no term or vote to keep. A
     // failed flush leaves its writes' durability unknown (Rebello et al., ATC 2020), so the frame
@@ -824,7 +840,7 @@ fn four_frames_with(
     before: u64,
     fault: Fault,
 ) -> Result<(Log<SimFile>, hyper_log::Recovery), LogError> {
-    let cfg = config(16, 8);
+    let cfg = config_now(16, 8);
     let log = Log::create(sim(seed), cfg, ID).unwrap();
     for i in 1..=4u64 {
         if i == before + 1 {
@@ -1010,6 +1026,7 @@ fn a_frame_confirmed_by_a_durable_write_is_restored_and_marked_after_a_power_cut
                     term: 1,
                     vote: 2,
                     commit: i - 1,
+                    held: None,
                 }),
                 ..Update::default()
             },
@@ -1020,6 +1037,7 @@ fn a_frame_confirmed_by_a_durable_write_is_restored_and_marked_after_a_power_cut
         term: 2,
         vote: 3,
         commit: 3,
+        held: None,
     };
     log.write(
         1,
@@ -1030,10 +1048,21 @@ fn a_frame_confirmed_by_a_durable_write_is_restored_and_marked_after_a_power_cut
         },
     )
     .unwrap();
-    // Every frame here was alone: each confirmed by a durable write, none by a flush of its own.
+    // Every frame here was alone: each confirmed on its own, by a durable write or by a write and
+    // a flush of its own as the device measured the cheaper (`Device::confirm`), its persist
+    // record written either way.
     let stats = log.stats(None).unwrap();
-    assert!(stats.durable_writes >= 4, "{stats:?}");
-    assert_eq!(stats.flushes, stats.frames, "{stats:?}");
+    assert!(
+        stats.durable_writes + stats.flushed_confirmations >= 4,
+        "{stats:?}"
+    );
+    // And a slot filled ahead while the device idled is flushed once (`LogStats::fills`): whether
+    // one comes between two frames is the device thread's timing (Linux CI, 2026-10-22: one did).
+    assert_eq!(
+        stats.flushes,
+        stats.frames + stats.flushed_confirmations + stats.fills,
+        "{stats:?}"
+    );
     log.with_file(|f| f.crash(Crash::LoseAll).unwrap()).unwrap();
     let file = closed(log);
     file.clear_faults().unwrap();
@@ -1054,6 +1083,39 @@ fn a_frame_confirmed_by_a_durable_write_is_restored_and_marked_after_a_power_cut
     drop(closed(log));
 }
 
+/// A log under `Waits::Told` opens after its last acknowledged frame is damaged at rest: the
+/// restore the open writes and waits for is the log's own, never held for a cut no caller could make
+/// before the open returns. The frames are written under `Measured`, the damage as the test below
+/// makes it, and the log opened again under `Told`.
+#[test]
+fn a_told_log_opens_and_restores_a_damaged_last_frame() {
+    let file = sim(29);
+    let cfg = config(16, 8);
+    let log = Log::create(file, cfg, ID).unwrap();
+    for i in 1..=4u64 {
+        let update = Update {
+            entries: Some(entries(i, &[1])),
+            ..Update::default()
+        };
+        log.write(1, update).unwrap();
+    }
+    let file = closed(log);
+    file.inject(Fault::BitFlip {
+        offset: AREA + 5 * BLOCK as u64 + 8,
+        bit: 2,
+        stored: true,
+    })
+    .unwrap();
+    let told = Config {
+        waits: Waits::Told,
+        ..cfg
+    };
+    let (log, recovery) = Log::open(file, told, ID).unwrap();
+    assert_eq!(recovery.restored, vec![1]);
+    assert_eq!(log.view(1).unwrap().unwrap().last, 3);
+    drop(closed(log));
+}
+
 #[test]
 fn damage_to_the_last_acknowledged_frame_is_restored_from_its_persist_record() {
     for field in [0u64, 8, 40, 64, 70, 120] {
@@ -1069,6 +1131,7 @@ fn damage_to_the_last_acknowledged_frame_is_restored_from_its_persist_record() {
                         term: 1,
                         vote: 2,
                         commit: i - 1,
+                        held: None,
                     }),
                     ..Update::default()
                 },
@@ -1080,6 +1143,7 @@ fn damage_to_the_last_acknowledged_frame_is_restored_from_its_persist_record() {
             term: 2,
             vote: 3,
             commit: 3,
+            held: None,
         };
         log.write(
             1,
@@ -1142,7 +1206,7 @@ fn damage_to_the_last_acknowledged_frame_is_restored_from_its_persist_record() {
 #[test]
 fn a_lost_frame_with_proposals_leaves_its_group_damaged_until_removed() {
     let file = sim(41);
-    let cfg = config(16, 8);
+    let cfg = config_now(16, 8);
     let (device, gated) = held(file);
     let log = Log::create(device, cfg, ID).unwrap();
     for group in [1, 2] {
@@ -1176,6 +1240,7 @@ fn a_lost_frame_with_proposals_leaves_its_group_damaged_until_removed() {
                     term: 2,
                     vote: 1,
                     commit: 0,
+                    held: None,
                 }),
                 proposals: vec![Proposal {
                     index: 5,
@@ -1190,6 +1255,7 @@ fn a_lost_frame_with_proposals_leaves_its_group_damaged_until_removed() {
         term: 3,
         vote: 2,
         commit: 1,
+        held: None,
     };
     let other = log
         .submit(
@@ -1286,6 +1352,7 @@ fn damaged_group_one(seed: u64, cfg: Config) -> SimFile {
                 term: 2,
                 vote: 1,
                 commit: 0,
+                held: None,
             }),
             proposals: vec![Proposal {
                 index: 2,
@@ -1348,7 +1415,7 @@ fn a_damaged_groups_fence_survives_reclaiming_its_segment() {
 /// it: the open after finds the group damaged still, whatever of the first reached the disk.
 #[test]
 fn power_lost_while_fencing_a_damaged_group_leaves_it_damaged() {
-    let cfg = config(16, 8);
+    let cfg = config_now(16, 8);
     for ops in 0..8 {
         for seed in 0..4 {
             let file = damaged_group_one(47 + seed, cfg);
@@ -1393,6 +1460,7 @@ fn an_uncertainty_mark_survives_reclaiming_its_segment() {
                 term: 2,
                 vote: 1,
                 commit: 2,
+                held: None,
             }),
             ..Update::default()
         },
@@ -1445,7 +1513,7 @@ fn an_uncertainty_mark_survives_reclaiming_its_segment() {
 #[test]
 fn an_unconfirmed_torn_frame_keeps_only_its_term_and_vote() {
     let file = sim(43);
-    let cfg = config(16, 8);
+    let cfg = config_now(16, 8);
     let log = Log::create(file, cfg, ID).unwrap();
     log.write(
         1,
@@ -1455,6 +1523,7 @@ fn an_unconfirmed_torn_frame_keeps_only_its_term_and_vote() {
                 term: 1,
                 vote: 1,
                 commit: 1,
+                held: None,
             }),
             ..Update::default()
         },
@@ -1468,6 +1537,7 @@ fn an_unconfirmed_torn_frame_keeps_only_its_term_and_vote() {
         term: 4,
         vote: 3,
         commit: 2,
+        held: None,
     };
     assert!(matches!(
         log.write(
@@ -1507,6 +1577,7 @@ fn an_unconfirmed_torn_frame_keeps_only_its_term_and_vote() {
             term: 4,
             vote: 3,
             commit: 1,
+            held: None,
         })
     );
 }
@@ -1521,7 +1592,7 @@ fn an_unconfirmed_torn_frame_keeps_only_its_term_and_vote() {
 fn an_update_is_answered_only_once_its_frame_is_confirmed() {
     for confirmed in [false, true] {
         let file = sim(45);
-        let cfg = config(16, 8);
+        let cfg = config_now(16, 8);
         let log = Log::create(file, cfg, ID).unwrap();
         log.write(
             1,
@@ -1531,6 +1602,7 @@ fn an_update_is_answered_only_once_its_frame_is_confirmed() {
                     term: 1,
                     vote: 1,
                     commit: 1,
+                    held: None,
                 }),
                 ..Update::default()
             },
@@ -1540,6 +1612,7 @@ fn an_update_is_answered_only_once_its_frame_is_confirmed() {
             term: 2,
             vote: 2,
             commit: 1,
+            held: None,
         };
         let second = Update {
             entries: Some(entries(2, &[2])),
@@ -1592,7 +1665,7 @@ fn an_update_is_answered_only_once_its_frame_is_confirmed() {
 #[test]
 fn a_torn_frame_without_its_persist_record_is_the_torn_tail() {
     let file = sim(40);
-    let cfg = config(16, 8);
+    let cfg = config_now(16, 8);
     let log = Log::create(file, cfg, ID).unwrap();
     log.write(
         1,
@@ -2009,12 +2082,13 @@ fn entries_not_in_memory_that_lie_together_are_read_at_once() {
 #[test]
 fn a_groups_updates_keep_their_order_when_one_waits_for_room() {
     let (device, gated) = held(sim(40));
-    let cfg = config(4, 8);
+    let cfg = config_now(4, 8);
     let log = Log::create(device, cfg, ID).unwrap();
     let state = |term, vote| HardState {
         term,
         vote,
         commit: 0,
+        held: None,
     };
     gated.hold();
     let shut = gated.released();
@@ -2078,7 +2152,7 @@ fn a_groups_updates_keep_their_order_when_one_waits_for_room() {
 #[test]
 fn the_queue_bounds_every_submission_not_yet_answered() {
     let (device, gated) = held(sim(41));
-    let mut cfg = config(16, 8);
+    let mut cfg = config_now(16, 8);
     cfg.queue_submissions = 2;
     let log = Log::create(device, cfg, ID).unwrap();
     let small = |term| Update {
@@ -2098,7 +2172,7 @@ fn the_queue_bounds_every_submission_not_yet_answered() {
         p.wait().unwrap();
     }
     // A group holds two submissions at most: the one a frame takes and one for the next.
-    let mut cfg = config(16, 8);
+    let mut cfg = config_now(16, 8);
     cfg.queue_submissions = 8;
     let (device, gated) = held(sim(42));
     let log = Log::create(device, cfg, ID).unwrap();
@@ -2572,6 +2646,10 @@ fn a_reopened_log_sweeps_the_segments_it_recovered() {
         write(&log, &mut models, n);
     }
     check(&log, &models);
+    // The sweeps are counted, and the bytes they copied: what the log wrote a second time.
+    let stats = log.stats(None).unwrap();
+    assert!(stats.sweeps > 0, "{stats:?}");
+    assert!(stats.swept_bytes > 0, "{stats:?}");
 }
 
 /// A log that answered `Full` takes any frame that fits a segment once its groups compact:
@@ -2605,6 +2683,7 @@ fn a_full_log_takes_any_frame_once_its_groups_compact() {
                         term: 1,
                         vote: 1,
                         commit: 0,
+                        held: None,
                     }),
                     ..Update::default()
                 },
@@ -3229,7 +3308,10 @@ fn recorded_regressions_hold() {
 }
 
 /// The settings of `config` with a writer that forms each batch from what is queued, so a
-/// test that holds the writer knows which submissions share a frame.
+/// test that holds the writer knows which submissions share a frame; and that, idle, writes
+/// nothing ahead of the next frame (`Owner::fill_ahead` runs only under `Waits::Measured`), so a
+/// test that aims a fault at a frame's write or flush, or counts the file's I/O against the
+/// frames', meets only the frames' and their confirmations'.
 fn config_now(segment_blocks: u64, max_segments: u32) -> Config {
     Config {
         waits: Waits::Never,
@@ -3273,6 +3355,7 @@ fn a_confirmation_outlives_a_torn_record_of_the_next_frame() {
                     term: 1,
                     vote: 1,
                     commit: 1,
+                    held: None,
                 }),
                 ..Update::default()
             },
@@ -3299,6 +3382,7 @@ fn a_confirmation_outlives_a_torn_record_of_the_next_frame() {
                             term: 1,
                             vote: 0,
                             commit: 0,
+                            held: None,
                         }),
                         ..Update::default()
                     },
@@ -3351,6 +3435,7 @@ fn a_confirmation_outlives_a_torn_record_of_the_next_frame() {
                     term: 1,
                     vote: 1,
                     commit: 1,
+                    held: None,
                 })
             ),
             "{at}"
@@ -3380,6 +3465,7 @@ fn a_commit_that_fails_before_its_frame_answers_every_update() {
             term,
             vote: 1,
             commit: 0,
+            held: None,
         }),
         ..Update::default()
     };
@@ -3444,6 +3530,7 @@ fn power_lost_while_restoring_a_lost_frame_loses_nothing_acknowledged() {
                     term: 1,
                     vote: 0,
                     commit: 0,
+                    held: None,
                 };
                 log.write(
                     g,
@@ -3485,6 +3572,7 @@ fn power_lost_while_restoring_a_lost_frame_loses_nothing_acknowledged() {
                             term: 2,
                             vote: 2,
                             commit: 0,
+                            held: None,
                         }),
                         proposals,
                         ..Update::default()
@@ -3957,7 +4045,7 @@ fn a_waker_is_woken_once_for_each_answer() {
 #[test]
 fn a_waking_submitter_does_not_wait_for_its_admission() {
     let (device, holder) = held_telling(sim(52));
-    let mut cfg = config(16, 8);
+    let mut cfg = config_now(16, 8);
     cfg.queue_submissions = 1;
     let log = Log::create(device, cfg, ID).unwrap();
     holder.hold();
@@ -4154,7 +4242,7 @@ fn every_blocking_writer_flushes_its_own_frame() {
 #[test]
 fn a_submission_taken_while_a_frame_confirms_itself_is_written() {
     let (device, holder) = held(sim(50));
-    let log = Log::create(device, config(16, 8), ID).unwrap();
+    let log = Log::create(device, config_now(16, 8), ID).unwrap();
     let small = |term| Update {
         hard_state: Some(hard(term, 0)),
         ..Update::default()

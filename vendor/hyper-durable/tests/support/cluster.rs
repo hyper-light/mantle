@@ -354,6 +354,7 @@ pub fn settings(id: u64, seed: u64) -> Settings {
         },
         quiet: Duration::from_millis(50),
         elections: hyper_raft::Elections::Suspicion,
+        disk: hyper_durable::Disk::Flushed,
     }
 }
 

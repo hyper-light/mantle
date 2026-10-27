@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 
 use common::*;
 use hyper_transport::{
-    Event, ExchangeId, LEAST_PROGRESS, Limits, Progress, Refusal, Unprompted, probes_within,
+    Event, ExchangeId, LEAST_PROGRESS, Limits, Progress, Refusal, RestartKey, Unprompted,
+    probes_within,
 };
 
 const PERIOD: Duration = Duration::from_secs(2);
@@ -460,13 +461,13 @@ fn a_budget_that_cannot_fund_a_head_refuses_it() {
         64 << 20,
         now,
     );
-    // Enough for the connection's window and little else.
+    // Enough for the connection's window and its state, and little else.
     let b = pair.node::<Mantle>(
         2,
         Role::Node,
         pair.book(Role::Node, Role::Node),
         limits(),
-        16_000,
+        16_000 + hyper_transport::state_charge::<Mantle>(&limits()),
         now,
     );
     let mut net = Net::new(now, a, b);
@@ -657,6 +658,97 @@ fn a_pooled_peer_holds_back_what_the_pool_cannot_take() {
     let pool = net.b.stats().pool;
     assert!(pool.grants > 0, "{pool:?}");
     assert!(pool.granted <= 3, "{pool:?}");
+}
+
+/// A pooled server parks an exchange that waits on its owner's event (a long poll,
+/// `Classes::waits`): parked as its head arrives, it holds a stream of its own and none of the
+/// pool's, so a pool of one serves every request its peer asks while the wait is held, and the
+/// wait's stream goes with its answer (docs/transport.md §4ab). The same wait asked of a server
+/// whose classes park nothing holds the pool's one stream, and the requests behind it wait at
+/// their asker: focal's deliver run of 500 agents, each connection's long poll holding the pool,
+/// committed 10 writes a second of the 350 offered.
+#[test]
+fn a_parked_wait_holds_none_of_the_pool() {
+    let pair = Pair::new();
+    let mut pooled = limits();
+    pooled.stream_credit = hyper_transport::StreamCredit::Pooled { initial: 1 };
+    /// One exchange of `kind` asked of node 2: a snapshot, the wait, or a get.
+    fn ask<A, B>(net: &mut Net<Node<A>, Node<B>>, asker: &mut Asker, kind: Kind, seed: u8)
+    where
+        A: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
+        B: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
+    {
+        let class = if kind == Kind::Snapshot {
+            Class::Bulk
+        } else {
+            Class::Request
+        };
+        asker
+            .ask(
+                &mut net.a,
+                net.now,
+                2,
+                (kind, class),
+                seed,
+                Some(100),
+                PERIOD,
+            )
+            .unwrap();
+    }
+    // Parked: the wait is held, and the requests behind it are answered.
+    let mut net = connected_sizing::<PooledWaits, PooledWaits>(&pair, pooled, 256 << 20, 1);
+    let (mut asker, mut server) = (Asker::new(), Server::new());
+    server.hold_replies = true;
+    ask(&mut net, &mut asker, Kind::Snapshot, 0);
+    net.until(TURNS, |net| {
+        asker.drive(&mut net.a);
+        server.serve(&mut net.b);
+        net.b.stats().pool.parked == 1
+    });
+    for seed in 1..6 {
+        ask(&mut net, &mut asker, Kind::Get, seed);
+    }
+    net.until(TURNS, |net| {
+        asker.drive(&mut net.a);
+        server.serve(&mut net.b);
+        server.answered == 5
+    });
+    let pool = net.b.stats().pool;
+    assert_eq!((pool.parked, pool.parks), (1, 1), "{pool:?}");
+    assert!(pool.granted <= 1, "{pool:?}");
+    server.hold_replies = false;
+    net.until(TURNS, |net| {
+        asker.drive(&mut net.a);
+        server.serve(&mut net.b);
+        asker.finished()
+    });
+    assert_eq!(server.answered, 6);
+    assert!(asker.asked.iter().all(|asked| asked.refused.is_none()));
+    assert_eq!(
+        net.b.stats().pool.parked,
+        0,
+        "the wait's stream went with it"
+    );
+    // Not parked: the wait holds the pool's one stream, and nothing behind it is served.
+    let mut net = connected_sizing::<Pooled, Pooled>(&pair, pooled, 256 << 20, 1);
+    let (mut asker, mut server) = (Asker::new(), Server::new());
+    server.hold_replies = true;
+    ask(&mut net, &mut asker, Kind::Snapshot, 0);
+    for seed in 1..6 {
+        ask(&mut net, &mut asker, Kind::Get, seed);
+    }
+    for _ in 0..TURNS {
+        asker.drive(&mut net.a);
+        server.serve(&mut net.b);
+        if !net.exchange() {
+            break;
+        }
+    }
+    assert_eq!(
+        server.answered, 0,
+        "a request was served past the held wait"
+    );
+    assert_eq!(net.b.stats().pool.parked, 0);
 }
 
 /// A pooled server's stream goes back to its peer with the reply that ends its exchange, in the
@@ -2560,24 +2652,28 @@ fn elsewhere() -> std::net::SocketAddr {
 /// for longer than two dials, a node was told its connection closed, its first redial unreachable,
 /// and nothing of its second, which ended in the state the owner had polled from the first; mantle's
 /// node dials again on what it is told, so it never dialed again and the peer stayed unreachable
-/// after the path healed (docs/transport.md §4u). One `Unreachable` waiting unpolled stands for
+/// after the path healed (docs/transport.md §4y). One `Unreachable` waiting unpolled stands for
 /// every dial that ends as it says.
 #[test]
 fn a_dial_failing_as_the_last_one_did_is_told_all_the_same() {
     let pair = Pair::new();
     let mut net = connected::<Mantle, Mantle>(&pair, limits(), 256 << 20);
     let address = net.b_address;
-    // The path is cut: node 2 hears nothing more, and the connection idles out.
+    // The path is cut: node 2 hears nothing more, node 1's keep-alive goes unacknowledged and its
+    // path is degrading (§4ai), and the connection idles out.
     net.b_dead = true;
     let told = told_until_a_holds(&mut net, 0);
     assert!(
         matches!(
             told[..],
-            [Event::Closed {
-                peer: 2,
-                epoch: 1,
-                refusal: None
-            }]
+            [
+                Event::Degrading { peer: 2, epoch: 1 },
+                Event::Closed {
+                    peer: 2,
+                    epoch: 1,
+                    refusal: None
+                }
+            ]
         ),
         "{told:?}"
     );
@@ -2630,6 +2726,195 @@ fn a_dial_failing_as_the_last_one_did_is_told_all_the_same() {
         ),
         "{told:?}"
     );
+}
+
+/// A dialer is told its peer's path is degrading once nothing it sent has been acknowledged for four
+/// probe timeouts (hyper-quic's `PathDegrading`, quiche's rule; docs/transport.md §4ai), long before
+/// its idle timeout ends the connection, and progressing once the peer answers again; a path event
+/// the owner has not polled is taken away by the connection's close, which says more. Before it, an
+/// owner heard nothing of a peer that went until the idle timeout: focal's bus client kept sending
+/// to a leader killed with kill -9 for two minutes, while the group had elected another in a second
+/// (found by focal).
+#[test]
+fn a_dialer_is_told_its_peers_path_degrading_long_before_its_idle_timeout() {
+    let pair = Pair::new();
+    let limits = limits();
+    let mut net = connected::<Mantle, Mantle>(&pair, limits, 256 << 20);
+    let mut server = Server::new();
+    events(&mut net.a);
+    // Node 2 goes, saying nothing, as a killed process does; node 1 sends it a frame.
+    net.b_dead = true;
+    let gone = net.now;
+    net.a.send_frame(2, 0, Kind::Append, b"one").unwrap();
+    let mut told = Vec::new();
+    net.until(TURNS, |net| {
+        told.extend(events(&mut net.a));
+        !told.is_empty()
+    });
+    assert!(
+        matches!(told[..], [Event::Degrading { peer: 2, epoch: 1 }]),
+        "{told:?}"
+    );
+    let took = net.now - gone;
+    assert!(
+        took < limits.keep_alive.unwrap(),
+        "told {took:?} after the peer went"
+    );
+    assert_eq!(net.a.stats().connections, 1, "the connection stays open");
+    // Node 2 answers again: node 1 is told its path makes progress, and the frame arrives.
+    net.b_dead = false;
+    let mut told = Vec::new();
+    net.until(TURNS, |net| {
+        server.serve(&mut net.b);
+        told.extend(events(&mut net.a));
+        !told.is_empty() && server.frames.len() == 1
+    });
+    assert!(
+        matches!(told[..], [Event::Progressing { peer: 2, epoch: 1 }]),
+        "{told:?}"
+    );
+    // Node 2 goes again, and node 1 polls nothing until the connection idles out: the path event
+    // that waited is taken away by the close.
+    net.b_dead = true;
+    net.a.send_frame(2, 0, Kind::Append, b"two").unwrap();
+    net.until(TURNS, |net| net.a.stats().connections == 0);
+    let told = events(&mut net.a);
+    assert!(
+        matches!(
+            told[..],
+            [Event::Closed {
+                peer: 2,
+                epoch: 1,
+                refusal: None
+            }]
+        ),
+        "{told:?}"
+    );
+}
+
+/// An endpoint restarted at its address with the key it keeps across restarts resets each connection
+/// its last run held as a packet on it arrives (RFC 9000 §10.3), as a restarted host's TCP answers
+/// with an RST: node 1, connected to node 2 and sending it only keep-alives, is told the connection
+/// closed within a keep-alive of node 2's restart, and its next dial connects. Restarted with a key
+/// of its own, as an endpoint without one is at every start, node 2 drops what comes on the old
+/// connection, its ID one the new key does not know, and node 1 is told only as the connection idles
+/// out (docs/transport.md §4ah).
+#[test]
+fn a_restarted_endpoint_resets_what_its_last_run_held() {
+    let pair = Pair::new();
+    let kept = RestartKey::from_secret(&[1; 32]).unwrap();
+    let fresh = RestartKey::from_secret(&[2; 32]).unwrap();
+    let limits = limits();
+    let keep_alive = limits.keep_alive.unwrap();
+    for (restarted_with, reset) in [(&kept, true), (&fresh, false)] {
+        let now = hyper_sim::Anchor::new().instant(0).unwrap();
+        let node_2 = |restart: &RestartKey, now| {
+            pair.restartable::<Mantle>(
+                2,
+                Role::Node,
+                pair.book(Role::Node, Role::Node),
+                limits,
+                256 << 20,
+                now,
+                restart,
+            )
+        };
+        let node_1 = pair.node::<Mantle>(
+            1,
+            Role::Node,
+            pair.book(Role::Node, Role::Node),
+            limits,
+            256 << 20,
+            now,
+        );
+        let mut net = Net::new(now, node_1, node_2(&kept, now));
+        let address = net.b_address;
+        net.a.connect(now, 2, address).unwrap();
+        net.until(TURNS, |net| {
+            events(&mut net.b);
+            events(&mut net.a).iter().any(|event| {
+                matches!(
+                    event,
+                    Event::Connected {
+                        peer: 2,
+                        epoch: 1,
+                        ..
+                    }
+                )
+            })
+        });
+        // Node 2's run ends with nothing said, as a process's does when it stops, and the next
+        // starts at its address.
+        net.b = node_2(restarted_with, net.now);
+        let restarted = net.now;
+        let mut told = Vec::new();
+        let mut degraded = None;
+        net.until(TURNS, |net| {
+            for event in events(&mut net.a) {
+                if matches!(event, Event::Degrading { .. }) {
+                    degraded = Some(net.now);
+                }
+                told.push(event);
+            }
+            told.iter()
+                .any(|event| matches!(event, Event::Closed { .. }))
+        });
+        let took = net.now - restarted;
+        if reset {
+            assert!(
+                matches!(
+                    told[..],
+                    [Event::Closed {
+                        peer: 2,
+                        epoch: 1,
+                        ..
+                    }]
+                ),
+                "{told:?}"
+            );
+            assert!(took <= keep_alive, "reset {took:?} after the restart");
+        } else {
+            // Its keep-alive unacknowledged, node 1 is told its path is degrading (§4ai) within a
+            // keep-alive and the zero path's four probe timeouts, long before the close.
+            assert!(
+                matches!(
+                    told[..],
+                    [
+                        Event::Degrading { peer: 2, epoch: 1 },
+                        Event::Closed {
+                            peer: 2,
+                            epoch: 1,
+                            ..
+                        }
+                    ]
+                ),
+                "{told:?}"
+            );
+            let degraded = degraded.unwrap() - restarted;
+            assert!(
+                degraded <= keep_alive * 2,
+                "degrading told {degraded:?} after the restart"
+            );
+            assert!(
+                took >= limits.idle_timeout - keep_alive,
+                "closed {took:?} after a restart that could not reset it"
+            );
+        }
+        net.a.connect(net.now, 2, address).unwrap();
+        net.until(TURNS, |net| {
+            events(&mut net.b);
+            events(&mut net.a).iter().any(|event| {
+                matches!(
+                    event,
+                    Event::Connected {
+                        peer: 2,
+                        epoch: 2,
+                        ..
+                    }
+                )
+            })
+        });
+    }
 }
 
 /// A dial that ends after its peer connected in, and went, while the owner polled nothing is told:
@@ -3277,7 +3562,12 @@ fn a_lossless_frame_waits_for_the_budget_and_is_never_skipped() {
     const FRAMES: u32 = 60;
     const FRAME: usize = 1_000;
     // Room for the connection's first window and its streams' heads, and a dozen frames.
-    let budget = first_window() * 2 + 12 * FRAME as u64;
+    // Two first windows and twelve frames, the frames' room as before a connection's state was
+    // charged; and the state, and the receive chunk a budget past one chunk funds at the handshake.
+    let budget = first_window() * 2
+        + 12 * FRAME as u64
+        + hyper_transport::state_charge::<Mantle>(&limits())
+        + hyper_transport::RECEIVE_CHUNK as u64;
     let pair = Pair::new();
     let mut net = connected_budgets::<Kept, Kept>(&pair, limits(), 256 << 20, budget);
     let body = [9u8; FRAME];
@@ -3338,7 +3628,12 @@ fn a_held_lanes_frame_waits_for_its_owner_not_the_budget() {
     const FRAMES: u32 = 60;
     const FRAME: usize = 1_000;
     // Room for the connection's first window and its streams' heads, and a dozen frames.
-    let budget = first_window() * 2 + 12 * FRAME as u64;
+    // Two first windows and twelve frames, the frames' room as before a connection's state was
+    // charged; and the state, and the receive chunk a budget past one chunk funds at the handshake.
+    let budget = first_window() * 2
+        + 12 * FRAME as u64
+        + hyper_transport::state_charge::<Mantle>(&limits())
+        + hyper_transport::RECEIVE_CHUNK as u64;
     let pair = Pair::new();
     let mut net = connected_budgets::<Kept, Kept>(&pair, limits(), 256 << 20, budget);
     let frame = |sequence: u32| {
@@ -3455,7 +3750,12 @@ fn a_frame_on_an_idle_lane_is_written_straight_into_its_stream() {
 fn a_lossy_frame_the_budget_cannot_hold_is_skipped_and_counted() {
     const FRAMES: u32 = 60;
     const FRAME: usize = 1_000;
-    let budget = first_window() * 2 + 12 * FRAME as u64;
+    // Two first windows and twelve frames, the frames' room as before a connection's state was
+    // charged; and the state, and the receive chunk a budget past one chunk funds at the handshake.
+    let budget = first_window() * 2
+        + 12 * FRAME as u64
+        + hyper_transport::state_charge::<Mantle>(&limits())
+        + hyper_transport::RECEIVE_CHUNK as u64;
     let pair = Pair::new();
     let mut net = connected_budgets::<Mantle, Mantle>(&pair, limits(), 256 << 20, budget);
     let body = [9u8; FRAME];

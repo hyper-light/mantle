@@ -1,17 +1,23 @@
 //! The endpoint's driver: one owner, its sockets, one timer.
 //!
 //! **A socket for each peer.** Where the platform lets sockets share a port so that a connected
-//! one takes its peer's datagrams (Linux and the BSDs), the driver's listener binds a port of its
-//! own and shares it (`UdpSocket::bind_shared`, so a second listener on that port is refused), and
-//! each connection the endpoint identifies gets a socket of its own, joined to that port
-//! (`UdpSocket::join_shared`) and connected to its peer: the peer's datagrams then wait in a
-//! receive queue of their own, as a TCP connection's do, and the connection's windows are funded
-//! from that queue's room alone (hyper-transport's `Endpoint::set_peer_room`). A node's receive
-//! capacity so grows with the connections it holds, at the kernel's default buffer each, with
-//! nothing tuned and no privilege asked: one shared socket of Linux's default 208 KiB held about
-//! three connections' first windows. The listener keeps the handshakes and any peer whose socket
-//! could not be made.
+//! one takes its peer's datagrams (Linux and the BSDs; `UdpSocket::bind_shared`), the driver's
+//! listener shares its port, and each connection the endpoint identifies gets a socket of its own,
+//! bound to that port and connected to its peer: the peer's datagrams then wait in a receive queue
+//! of their own, as a TCP connection's do, and the connection's windows are funded from that
+//! queue's room alone (hyper-transport's `Endpoint::set_peer_room`). A node's receive capacity so
+//! grows with the connections it holds, at the kernel's default buffer each, with nothing tuned and
+//! no privilege asked: one shared socket of Linux's default 208 KiB held about three connections'
+//! first windows. The listener keeps the handshakes and any peer whose socket could not be made.
 //! Elsewhere (Windows, the simulation fabric) the listener takes every peer.
+//!
+//! **What fired, alone.** The peers' sockets wait in one readiness group (hyper-rt's
+//! `ReadyGroup`), which tells the driver which of them fired; the driver drains only those and the
+//! ones its last drain left holding, and arms only those it drained empty. A park so costs what
+//! moved, not every peer held: polling each socket's wait at every park cost an exchange about
+//! 11 ns for each connection the server held (the `connections` bench, 18.2 µs beside 512 against
+//! 12.8 µs beside one, Linux). Matching the sockets to the endpoint's connections, when they
+//! change, is a search a connection, not a pass over all of them for each.
 //!
 //! **One set of buffers, and sends straight from the endpoint's.** Every socket receives into one
 //! [`Ring`] the driver lends whichever it reads, so a socket a peer costs its descriptor and a few
@@ -21,6 +27,15 @@
 //! the kernel segments (`UDP_SEGMENT`), so a peer's bulk leaves, and arrives through `UDP_GRO`, as
 //! a few large messages, where it left a datagram a slot of a two-slot outbox (quinn's driver and
 //! `quinn-udp` send a connection's batch so; measured in `docs/transport.md` §4h).
+//!
+//! **A ring of what its drains need.** The ring starts at one buffer and holds as many as the
+//! drains through it took messages (hyper-rt's `Ring::wants`), up to the batch. The driver makes
+//! each change after a turn's drains and charges what the ring grows by to the endpoint's budget,
+//! giving it back as the ring shrinks. A growth the budget or the allocator refuses leaves the ring
+//! as it was, and its sockets take what they hold in more calls. What a driver holds as it is made
+//! ([`least_bytes`]) is its owner's to charge. Before, every ring held a batch of 64 KiB buffers,
+//! resident and charged from the start: 2 MiB for a client of one connection on Linux
+//! (`docs/transport.md` §4aa).
 
 use std::future::{Future, poll_fn};
 use std::net::SocketAddr;
@@ -30,9 +45,12 @@ use std::time::{Duration, Instant};
 
 use hyper_rt::RtError;
 use hyper_rt::futures::{Sleep, sleep};
-use hyper_rt::readiness::Ready;
-use hyper_rt::udp::{Batched, Io, IoStats, MAX_BATCH, QueueCharge, Queued, Ring, UdpSocket};
-use hyper_transport::{Account, SocketCharge};
+use hyper_rt::readiness::{Member, Ready, ReadyGroup};
+use hyper_rt::shard::ShardContext;
+use hyper_rt::udp::{
+    Batched, Io, IoStats, MAX_BATCH, QueueCharge, Queued, RECEIVE_BYTES, Ring, UdpSocket,
+};
+use hyper_transport::{Account, Reservation, SocketCharge};
 use hyper_transport::{Budget, Classes, Directory, Endpoint, Event, Lateness, PeerId};
 
 /// Derived: the turns one poll of [`Driver::event`] takes before it yields to the shard, the bound
@@ -43,6 +61,29 @@ pub const TURNS: usize = 128;
 /// The shard's clock now, nanoseconds.
 fn shard_now() -> Result<u64, RtError> {
     hyper_rt::registry::with_current(|context| context.now_ns()).ok_or(RtError::NotOnShardThread)
+}
+
+/// Now, as the `Instant` an endpoint made on this thread's shard is to be given (`Endpoint::new`'s
+/// `now`): on a simulated shard the virtual clock's reading from the process's anchor, the clock every
+/// driver there reads (`hyper_rt::sim::anchor`); on any other thread the host's clock, as before.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the runtime adapter's clock: the host's off a simulated shard, as the driver's anchor is"
+)]
+pub fn shard_instant() -> Instant {
+    let simulated = hyper_rt::registry::with_current(|context| {
+        context.driver_is_sim().then(|| context.now_ns())
+    })
+    .flatten();
+    match simulated {
+        Some(ns) => {
+            let anchor = hyper_rt::sim::anchor();
+            anchor
+                .checked_add(Duration::from_nanos(ns))
+                .unwrap_or(anchor)
+        }
+        None => Instant::now(),
+    }
 }
 
 /// Bound: the datagrams one turn takes from the endpoint and sends before the turn's other work:
@@ -103,17 +144,54 @@ impl Rooms {
     }
 }
 
+/// What a driver for sockets batched by `io` holds for them as it is made, bytes: its ring of one
+/// buffer (hyper-rt's `Ring::bytes_for`) and its listener's socket, lent (`Batched::lent_bytes`).
+/// Its owner charges this; what the ring grows by, the driver charges to the endpoint's budget as
+/// it grows ([`Driver::ring`]).
+pub fn least_bytes(io: Io) -> usize {
+    Ring::bytes_for(io, 1).saturating_add(Batched::lent_bytes())
+}
+
+/// A driver's receive ring ([`Driver::ring`]): what it holds and how it came to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RingStats {
+    /// The buffers it holds now.
+    pub buffers: usize,
+    /// The bytes it holds now.
+    pub bytes: usize,
+    /// The bytes of its growth the endpoint's budget is charged now.
+    pub charged: u64,
+    /// Changes that added buffers.
+    pub grown: u64,
+    /// Changes that let buffers go.
+    pub shrunk: u64,
+    /// Growths the budget or the allocator refused.
+    pub refused: u64,
+}
+
 /// A socket connected to one of the endpoint's peers, sharing the listener's port.
 struct PeerSocket {
     peer: PeerId,
     remote: SocketAddr,
+    /// Its name in the driver's readiness group, the driver's for its life.
+    key: u64,
     socket: Batched,
-    readable: Option<Ready>,
-    writable: Option<Ready>,
-    /// Its readiness fired, or it was just made: drained at the next turn.
+    /// Its read readiness, armed in the driver's group while it may be empty.
+    readable: Option<Member>,
+    /// Its write readiness, armed in the group while it holds the transmit the driver waits on.
+    writable: Option<Member>,
+    /// Its readiness fired, it was just made, or its last drain left datagrams: on the driver's
+    /// `ready_peers`, drained at the next turn.
     ready: bool,
+    /// On the driver's `to_arm`: its read readiness is armed when the driver next parks.
+    queued: bool,
     /// What its queue is learned to charge (`docs/transport.md` §4i).
     measure: SocketCharge,
+}
+
+/// A peer socket's member key in the driver's readiness group: its key and the direction awaited.
+fn member_key(key: u64, writable: bool) -> u64 {
+    key.wrapping_shl(1) | u64::from(writable)
 }
 
 /// Drives an [`Endpoint`] on a hyper-rt shard (module doc of the crate).
@@ -131,9 +209,26 @@ pub struct Driver<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>>
     late: Lateness,
     /// The listener's address where its port is shared: the address each peer's socket binds.
     shared: Option<SocketAddr>,
-    /// The peers' sockets, sorted by the address each is connected to; at most the admission's bound
-    /// on connections.
+    /// The peers' sockets, sorted by the address each is connected to, one an address; at most the
+    /// admission's bound on connections.
     peers: Vec<PeerSocket>,
+    /// The peers' sockets' readiness waits, which tell what fired alone: a park costs the peers that
+    /// fired or are to be armed, not every peer held (hyper-rt's `ReadyGroup`).
+    group: ReadyGroup,
+    /// The key the next peer socket is made with.
+    next_key: u64,
+    /// Each peer socket's key and the address it is connected to, sorted by key (keys rise as sockets
+    /// are made): a fired wait's socket, found by its key. One for each of `peers`.
+    keys: Vec<(u64, SocketAddr)>,
+    /// The keys of the peers' sockets that may hold datagrams (`PeerSocket::ready`), drained at the
+    /// next turn: each at most once and only a socket held, so at most `peers`, room for which is
+    /// reserved as each socket is made.
+    ready_peers: Vec<u64>,
+    /// The keys of the peers' sockets whose read readiness is armed when the driver next parks (made,
+    /// or drained empty; `PeerSocket::queued`): at most `peers`, reserved likewise.
+    to_arm: Vec<u64>,
+    /// What `drain` takes `ready_peers` into, kept between turns for its room.
+    draining: Vec<u64>,
     /// The endpoint's connection generation the peers' sockets were last matched to.
     seen: u64,
     /// The endpoint's connections as last listed ([`Endpoint::established`]).
@@ -146,6 +241,10 @@ pub struct Driver<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>>
     outgoing: Vec<u8>,
     /// The receive buffers every socket is lent as it is read.
     ring: Ring,
+    /// What the ring grew by past its first buffer, charged to the endpoint's budget.
+    ring_charge: Reservation,
+    /// The ring's changes: grown, shrunk, refused.
+    ring_changes: (u64, u64, u64),
     /// Whether the listener may hold datagrams: its readiness fired, or its last drain left some.
     listener_ready: bool,
     /// Polls that spent their turns with work still to do and woke their task to come back.
@@ -154,6 +253,9 @@ pub struct Driver<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>>
     measure: SocketCharge,
     /// The rooms its peers' sockets were told.
     rooms: Rooms,
+    /// What the sockets of the peers that went did, summed, flags cleared: kept so no count of
+    /// [`Driver::peer_stats`] goes back when a peer goes.
+    retired: IoStats,
 }
 
 impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B, D> {
@@ -177,13 +279,23 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         }
     }
 
-    /// A driver for `endpoint` on `socket`, whose sockets receive into a ring of `socket`'s batch.
-    /// Called on a shard thread.
-    pub fn new(endpoint: Endpoint<C, B, D>, socket: Batched) -> Result<Self, RtError> {
-        let ring = Ring::new(Io {
-            batch: socket.batch(),
-        })?;
-        Self::with_ring(endpoint, socket, ring)
+    /// A driver for `endpoint` on `socket`, whose sockets receive into a ring of `io`'s batch: the
+    /// socket's own receive buffers, if it holds any, are let go (`Batched::release_buffers`), so a
+    /// socket handed over best comes lent (`Batched::lent`). A socket bound with its port shared
+    /// ([`UdpSocket::bind_shared`]) shares it with a socket for each peer, as [`Driver::bind`]
+    /// does: a caller that holds its port from the moment it learns it (an adopted socket, a
+    /// supervisor's) loses no peer's queue of its own by handing the socket over. Called on a
+    /// shard thread.
+    pub fn new(endpoint: Endpoint<C, B, D>, mut socket: Batched, io: Io) -> Result<Self, RtError> {
+        let ring = Ring::new(io)?;
+        socket.release_buffers();
+        let shared = match socket.socket().shares_port()? {
+            true => Some(socket.local_addr()?),
+            false => None,
+        };
+        let mut driver = Self::with_ring(endpoint, socket, ring)?;
+        driver.shared = shared;
+        Ok(driver)
     }
 
     #[allow(
@@ -207,7 +319,15 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             .set_recv_buffer_bytes(usize::try_from(ask).unwrap_or(usize::MAX))?;
         let unmeasured = endpoint.unmeasured_room();
         endpoint.set_receive_capacity(unmeasured, 0);
-        let anchor = (shard_now()?, Instant::now());
+        // On a simulated shard every driver anchors to the process's one instant for the virtual
+        // clock's zero, so all of a simulation's endpoints read one clock (`hyper_rt::sim::anchor`).
+        let simulated =
+            hyper_rt::registry::with_current(ShardContext::driver_is_sim).unwrap_or(false);
+        let anchor = if simulated {
+            (0, hyper_rt::sim::anchor())
+        } else {
+            (shard_now()?, Instant::now())
+        };
         let resolution = Duration::from_nanos(hyper_rt::machine::clock::resolution_ns());
         Ok(Self {
             endpoint,
@@ -219,16 +339,25 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             late: Lateness::new(resolution),
             shared: None,
             peers: Vec::new(),
+            group: ReadyGroup::new(),
+            next_key: 0,
+            keys: Vec::new(),
+            ready_peers: Vec::new(),
+            to_arm: Vec::new(),
+            draining: Vec::new(),
             seen: 0,
             listed: Vec::new(),
             told: Vec::new(),
             held: None,
             outgoing: Vec::new(),
             ring,
+            ring_charge: Reservation::default(),
+            ring_changes: (0, 0, 0),
             listener_ready: true,
             yields: 0,
             measure: SocketCharge::new(unmeasured),
             rooms: Rooms::default(),
+            retired: IoStats::default(),
         })
     }
 
@@ -268,17 +397,113 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         self.socket.stats()
     }
 
-    /// What the sockets of the peers it holds now have done, summed; a flag is set where any of
-    /// theirs is.
+    /// What its peers' sockets have done since it began, summed: those it holds now and those of
+    /// peers that went, so no count goes back when a peer goes (a counter read from it never runs
+    /// backwards); a flag is set where a socket it holds now has it.
     pub fn peer_stats(&self) -> IoStats {
-        self.peers.iter().fold(IoStats::default(), |sum, peer| {
-            sum.plus(&peer.socket.stats())
-        })
+        self.peers
+            .iter()
+            .fold(self.retired, |sum, peer| sum.plus(&peer.socket.stats()))
     }
 
     /// The sockets the driver holds connected to its peers (the module's doc).
     pub fn peer_sockets(&self) -> usize {
         self.peers.len()
+    }
+
+    /// What the kernel holds for the driver's sockets and charges the process's memory for, summed:
+    /// the listener's and every peer's (`QueueCharge::held`, Linux's `SO_MEMINFO`). None where the
+    /// platform charges the process for no socket buffer, or a socket's account cannot be read.
+    pub fn kernel_held(&self) -> Option<u64> {
+        let held = |socket: &Batched| socket.socket().queue_charge().ok().flatten()?.held;
+        self.peers
+            .iter()
+            .try_fold(held(&self.socket)?, |sum, peer| {
+                Some(sum.saturating_add(held(&peer.socket)?))
+            })
+    }
+
+    /// The owner's observation of what the endpoint's work holds, `user` bytes in use on the heap
+    /// it runs on and nothing else does, made when the endpoint wants one
+    /// ([`Endpoint::wants_observation`]): what the kernel holds for the driver's sockets is added
+    /// where the platform charges the process for it ([`Driver::kernel_held`]), so a connection's
+    /// state on Linux includes its socket's buffers, which a container's limit counts
+    /// (docs/transport.md §4x).
+    pub fn observe(&mut self, user: u64) {
+        // What the ring grew by was allocated as the driver ran, on the heap the owner reads, and
+        // is charged as the ring's ([`Driver::ring`]): no connection's state.
+        let grown = u64::try_from(self.ring.grown_bytes()).unwrap_or(u64::MAX);
+        let held = user
+            .saturating_sub(grown)
+            .saturating_add(self.kernel_held().unwrap_or(0));
+        self.endpoint.observe(held);
+    }
+
+    /// The receive ring every socket is lent: what it holds, what of that the endpoint's budget is
+    /// charged, and its changes.
+    pub fn ring(&self) -> RingStats {
+        let (grown, shrunk, refused) = self.ring_changes;
+        RingStats {
+            buffers: self.ring.buffers(),
+            bytes: self.ring.held_bytes(),
+            charged: self.ring_charge.granted(),
+            grown,
+            shrunk,
+            refused,
+        }
+    }
+
+    /// Holds the ring to what the turn's drains wanted (hyper-rt's `Ring::wants`): the bytes it
+    /// grows by reserved from the endpoint's budget first and taken into its one reservation, the
+    /// bytes it lets go given back. A growth refused, by the budget or by the allocator, leaves it
+    /// as it was until a drain wants more again.
+    fn size_ring(&mut self) {
+        let Some(wanted) = self.ring.wants() else {
+            return;
+        };
+        let held = self.ring.buffers();
+        // A buffer's bytes: the ring's headers and room were made with it, for its whole batch.
+        let buffers =
+            |count: usize| u64::try_from(count.saturating_mul(RECEIVE_BYTES)).unwrap_or(u64::MAX);
+        if wanted < held {
+            let _ = self.ring.resize(wanted);
+            let freed = buffers(held.saturating_sub(self.ring.buffers()));
+            if let Some(part) = self
+                .ring_charge
+                .split(freed.min(self.ring_charge.granted()))
+            {
+                self.endpoint.release(part);
+            }
+            self.ring_changes.1 = self.ring_changes.1.saturating_add(1);
+            return;
+        }
+        let more = buffers(wanted.saturating_sub(held));
+        let grant = match self.endpoint.reserve_own(more) {
+            Ok(grant) => grant,
+            Err(_) => {
+                self.ring.keep();
+                self.ring_changes.2 = self.ring_changes.2.saturating_add(1);
+                return;
+            }
+        };
+        let taken = if self.ring.resize(wanted).is_err() {
+            Err(grant)
+        } else if self.ring_charge.granted() == 0 {
+            self.ring_charge = grant;
+            Ok(())
+        } else {
+            self.ring_charge.absorb(grant)
+        };
+        match taken {
+            Ok(()) => self.ring_changes.0 = self.ring_changes.0.saturating_add(1),
+            Err(grant) => {
+                // The allocator refused the buffers, or the grant is one the charge cannot hold
+                // (another accountant's mark): the ring holds what it is charged for.
+                self.endpoint.release(grant);
+                let _ = self.ring.resize(held);
+                self.ring_changes.2 = self.ring_changes.2.saturating_add(1);
+            }
+        }
     }
 
     /// The rooms its peers' sockets were told since it began (`docs/transport.md` §4i).
@@ -296,8 +521,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
     /// backlog the driver is behind on. It never parks with one: it turns again, or wakes itself
     /// once its turns are spent ([`Driver::yields`]).
     pub fn backlogged(&self) -> usize {
-        let peers = self.peers.iter().filter(|peer| peer.ready).count();
-        peers.saturating_add(usize::from(self.listener_ready))
+        self.ready_peers
+            .len()
+            .saturating_add(usize::from(self.listener_ready))
     }
 
     /// Now on the endpoint's clock: the instant the owner passes to the endpoint's calls (`connect`,
@@ -371,12 +597,31 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         Poll::Pending
     }
 
-    /// Polls the sockets' readiness waits, arming them as needed; whether one fired.
+    /// Polls the sockets' readiness waits, arming them as needed; whether one fired. The listener's
+    /// are waits of their own; the peers' are members of the driver's group, which tells what fired
+    /// alone, so a park costs the peers that fired or are to be armed, not every peer held.
     fn poll_ready(&mut self, context: &mut Context<'_>) -> Result<bool, RtError> {
         // A socket that may hold datagrams is work now: its readiness, one-shot, fires when a
         // datagram arrives, not for one already waiting, so a driver that awaited it would park
         // with them unread.
-        let mut fired = self.listener_ready || self.peers.iter().any(|peer| peer.ready);
+        let mut fired = self.listener_ready || !self.ready_peers.is_empty();
+        // A socket is awaited writable while its outbox holds datagrams or it holds the transmit
+        // the driver waits on.
+        let held_peer = self.held.as_ref().map(|held| {
+            self.peers
+                .binary_search_by_key(&held.to, |peer| peer.remote)
+                .ok()
+        });
+        fired |= self.poll_listener(context, held_peer == Some(None))?;
+        self.arm_peers(context, held_peer.flatten())?;
+        fired |= self.take_fired()?;
+        Ok(fired)
+    }
+
+    /// Polls the listener's readiness waits, arming them as needed (writable while its outbox holds
+    /// datagrams or it `holds` the transmit the driver waits on); whether one fired.
+    fn poll_listener(&mut self, context: &mut Context<'_>, holds: bool) -> Result<bool, RtError> {
+        let mut fired = false;
         if !self.listener_ready {
             let readable = self.readable.get_or_insert_with(|| self.socket.readable());
             if let Poll::Ready(outcome) = Pin::new(readable).poll(context) {
@@ -386,15 +631,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
                 fired = true;
             }
         }
-        // A socket is awaited writable while its outbox holds datagrams or it holds the transmit
-        // the driver waits on.
-        let held = self.held.as_ref().map(|held| held.to);
-        let listener_holds = held.is_some_and(|to| {
-            self.peers
-                .binary_search_by_key(&to, |peer| peer.remote)
-                .is_err()
-        });
-        if self.socket.pending() || listener_holds {
+        if self.socket.pending() || holds {
             let writable = self.writable.get_or_insert_with(|| self.socket.writable());
             if let Poll::Ready(outcome) = Pin::new(writable).poll(context) {
                 self.writable = None;
@@ -402,26 +639,101 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
                 fired = true;
             }
         }
-        for peer in &mut self.peers {
-            if !peer.ready {
-                let readable = peer.readable.get_or_insert_with(|| peer.socket.readable());
-                if let Poll::Ready(outcome) = Pin::new(readable).poll(context) {
-                    peer.readable = None;
-                    outcome?;
+        Ok(fired)
+    }
+
+    /// Arms, in the driver's group, the read readiness of the peers' sockets made or drained empty
+    /// since the last park, and the write readiness of the peer socket at `held`, which holds the
+    /// transmit the driver waits on.
+    fn arm_peers(&mut self, context: &mut Context<'_>, held: Option<usize>) -> Result<(), RtError> {
+        for index in 0..self.to_arm.len() {
+            let Some(&key) = self.to_arm.get(index) else {
+                break;
+            };
+            let Some(peer) = self.peer_at(key).and_then(|at| self.peers.get_mut(at)) else {
+                continue;
+            };
+            peer.queued = false;
+            if peer.ready || peer.readable.is_some() {
+                continue;
+            }
+            let member = peer.socket.socket().readable_in(
+                &mut self.group,
+                context,
+                member_key(key, false),
+            )?;
+            peer.readable = Some(member);
+        }
+        self.to_arm.clear();
+        if let Some(peer) = held.and_then(|at| self.peers.get_mut(at))
+            && peer.writable.is_none()
+        {
+            let member = peer.socket.socket().writable_in(
+                &mut self.group,
+                context,
+                member_key(peer.key, true),
+            )?;
+            peer.writable = Some(member);
+        }
+        Ok(())
+    }
+
+    /// Takes what fired of the peers' sockets, alone, in the order it fired: each of the group's
+    /// members at most once, two a peer. A socket that fired to read may hold datagrams; whether any
+    /// fired.
+    fn take_fired(&mut self) -> Result<bool, RtError> {
+        let mut fired = false;
+        for _ in 0..self.peers.len().saturating_mul(2) {
+            let Some((member, outcome)) = self.group.next_fired()? else {
+                break;
+            };
+            let key = member.wrapping_shr(1);
+            let Some(peer) = self.peer_at(key).and_then(|at| self.peers.get_mut(at)) else {
+                continue;
+            };
+            if member & 1 == 1 {
+                peer.writable = None;
+            } else {
+                peer.readable = None;
+                if !peer.ready {
                     peer.ready = true;
-                    fired = true;
+                    // Room reserved as the socket was made (`reserve_peer`).
+                    self.ready_peers.push(key);
                 }
             }
-            if peer.socket.pending() || held == Some(peer.remote) {
-                let writable = peer.writable.get_or_insert_with(|| peer.socket.writable());
-                if let Poll::Ready(outcome) = Pin::new(writable).poll(context) {
-                    peer.writable = None;
-                    outcome?;
-                    fired = true;
-                }
-            }
+            outcome?;
+            fired = true;
         }
         Ok(fired)
+    }
+
+    /// Where in `peers` the socket `key` names is, while the driver holds it.
+    fn peer_at(&self, key: u64) -> Option<usize> {
+        let at = self.keys.binary_search_by_key(&key, |&(key, _)| key).ok()?;
+        let (_, remote) = *self.keys.get(at)?;
+        let at = self
+            .peers
+            .binary_search_by_key(&remote, |peer| peer.remote)
+            .ok()?;
+        self.peers
+            .get(at)
+            .is_some_and(|peer| peer.key == key)
+            .then_some(at)
+    }
+
+    /// Room in every list a peer socket is on for one more socket, so that nothing is allocated as
+    /// one fires or drains; whether there was.
+    fn reserve_peer(&mut self) -> bool {
+        let want = self.peers.len().saturating_add(1);
+        let more = |len: usize| want.saturating_sub(len);
+        self.peers.try_reserve(1).is_ok()
+            && self.keys.try_reserve(1).is_ok()
+            && self
+                .ready_peers
+                .try_reserve(more(self.ready_peers.len()))
+                .is_ok()
+            && self.to_arm.try_reserve(more(self.to_arm.len())).is_ok()
+            && self.draining.try_reserve(more(self.draining.len())).is_ok()
     }
 
     /// Matches the peers' sockets to the endpoint's connections, when they changed: a socket for
@@ -436,26 +748,61 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         }
         self.seen = generation;
         self.endpoint.established(&mut self.listed);
+        // By address, as the peers' sockets are: each matched by a search, not a pass over all.
+        self.listed
+            .sort_unstable_by_key(|&(peer, remote)| (remote, peer));
         self.tell_ceilings();
         let Some(local) = self.shared else {
             return Ok(());
         };
         let listed = &self.listed;
+        let retired = &mut self.retired;
         self.peers.retain(|socket| {
-            listed
-                .iter()
-                .any(|(peer, remote)| *peer == socket.peer && *remote == socket.remote)
+            let kept = listed
+                .binary_search_by_key(&(socket.remote, socket.peer), |&(peer, remote)| {
+                    (remote, peer)
+                })
+                .is_ok();
+            if !kept {
+                *retired = retired.plus(&IoStats {
+                    gso: false,
+                    gro: false,
+                    kernel_stamps: false,
+                    ..socket.socket.stats()
+                });
+            }
+            kept
         });
+        // A socket gone takes its key, and its place on the lists, with it.
+        let peers = &self.peers;
+        let held = |key: u64, remote: SocketAddr| {
+            peers
+                .binary_search_by_key(&remote, |peer| peer.remote)
+                .ok()
+                .and_then(|at| peers.get(at))
+                .is_some_and(|peer| peer.key == key)
+        };
+        self.keys.retain(|&(key, remote)| held(key, remote));
+        let keys = &self.keys;
+        let kept = |key: &u64| keys.binary_search_by_key(key, |&(key, _)| key).is_ok();
+        self.ready_peers.retain(kept);
+        self.to_arm.retain(kept);
         let ask = usize::try_from(hyper_transport::socket_buffer_ask(
             self.endpoint.peer_demand(),
         ))
         .unwrap_or(usize::MAX);
-        for &(peer, remote) in &self.listed {
-            if self
+        for index in 0..self.listed.len() {
+            let Some(&(peer, remote)) = self.listed.get(index) else {
+                break;
+            };
+            // One socket an address: a second connection from an address held stays the listener's.
+            let Err(at) = self
                 .peers
-                .iter()
-                .any(|socket| socket.peer == peer && socket.remote == remote)
-            {
+                .binary_search_by_key(&remote, |socket| socket.remote)
+            else {
+                continue;
+            };
+            if !self.reserve_peer() {
                 continue;
             }
             let Ok(mut socket) = Batched::join_shared_lent(local, true) else {
@@ -476,22 +823,25 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             {
                 continue;
             }
-            let at = self
-                .peers
-                .binary_search_by_key(&remote, |socket| socket.remote)
-                .unwrap_or_else(|at| at);
+            let key = self.next_key;
+            self.next_key = self.next_key.wrapping_add(1);
+            // Room for each reserved above: none of these allocates.
             self.peers.insert(
                 at,
                 PeerSocket {
                     peer,
                     remote,
+                    key,
                     socket,
                     readable: None,
                     writable: None,
                     ready: true,
+                    queued: false,
                     measure,
                 },
             );
+            self.keys.push((key, remote));
+            self.ready_peers.push(key);
         }
         Ok(())
     }
@@ -503,12 +853,21 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
     /// searched up to the peer's limit, a datagram past it refused at its send and taken as a
     /// lost probe.
     fn tell_ceilings(&mut self) {
+        // Both sorted by address and peer, as `reconcile` sorts the listed: each matched by a search.
+        let by_address = |&(peer, remote): &(PeerId, SocketAddr)| (remote, peer);
         let listed = &self.listed;
-        self.told.retain(|told| listed.contains(told));
-        for &(peer, remote) in &self.listed {
-            if self.told.contains(&(peer, remote)) {
+        self.told.retain(|told| {
+            listed
+                .binary_search_by_key(&by_address(told), by_address)
+                .is_ok()
+        });
+        for index in 0..self.listed.len() {
+            let Some(&(peer, remote)) = self.listed.get(index) else {
+                break;
+            };
+            let Err(at) = self.told.binary_search_by_key(&(remote, peer), by_address) else {
                 continue;
-            }
+            };
             // At most the connections listed, which the admission bounds.
             if self.told.try_reserve(1).is_err() {
                 return;
@@ -516,7 +875,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             if let Ok(Some(payload)) = self.socket.socket().path_payload_to(remote) {
                 let _ = self.endpoint.set_path_ceiling(peer, payload);
             }
-            self.told.push((peer, remote));
+            self.told.insert(at, (peer, remote));
         }
     }
 
@@ -585,10 +944,17 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             self.endpoint.set_receive_capacity(room, handshake);
             self.measure.set_room(room);
         }
-        for peer in &mut self.peers {
-            if !peer.ready {
+        // The peers' sockets that may hold datagrams, and no other: the rest wait in the group.
+        let mut draining = std::mem::take(&mut self.draining);
+        draining.clear();
+        std::mem::swap(&mut draining, &mut self.ready_peers);
+        for index in 0..draining.len() {
+            let Some(&key) = draining.get(index) else {
+                break;
+            };
+            let Some(peer) = self.peer_at(key).and_then(|at| self.peers.get_mut(at)) else {
                 continue;
-            }
+            };
             let id = peer.peer;
             let ended = Self::drain_measured(
                 &mut peer.socket,
@@ -599,6 +965,13 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
                 |endpoint| endpoint.stream_bytes_received(id),
             )?;
             peer.ready = ended == Queued::More;
+            // Room for each reserved as its socket was made (`reserve_peer`).
+            if peer.ready {
+                self.ready_peers.push(key);
+            } else if peer.readable.is_none() && !peer.queued {
+                peer.queued = true;
+                self.to_arm.push(key);
+            }
             let told = self
                 .endpoint
                 .unprompted(id)
@@ -608,6 +981,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             peer.measure.set_room(room);
             self.rooms.told(room, told.is_some());
         }
+        draining.clear();
+        self.draining = draining;
+        self.size_ring();
         Ok(())
     }
 

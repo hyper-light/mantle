@@ -44,14 +44,14 @@ use hyper_block::buf::AlignedBuf;
 use hyper_block::commit::Anticipation;
 
 use crate::codec::Writer as Payload;
-use crate::device::{Answering, Carrier, Completion, Device, Job, Look, Request};
+use crate::device::{Answering, Carrier, Completion, Device, Job, Look};
 use crate::format;
 use crate::room::{Room, Take};
 use crate::state::State;
 use crate::stats::{self, Tally};
 use crate::ticket::{Answer, Reply, Ticket};
 use crate::writer::{Key, Placement, Submission};
-use crate::{LogError, Params};
+use crate::{LogError, Params, Waits};
 
 use read::Fetch;
 pub(crate) use read::Query;
@@ -68,11 +68,9 @@ pub(crate) enum Message<F> {
     Query(Query, Ticket),
     /// A frame's word that it is flushed, when the device's slot for it was taken.
     Done(Completion),
-    /// A job is back in the owner's returns with a completion the owner must answer.
+    /// A job is back in the owner's returns with a completion the owner must answer, or the owner
+    /// waits on it (`wake.rs`).
     Returned,
-    /// The I/O thread saw the job the owner waits for come back; the receiver of the returns'
-    /// tokens comes back with the word.
-    Watched(Receiver<u64>),
     /// A caller's look at the file, run by the thread that holds the device.
     Look(Look<F>),
     /// A group's handle is wanted (`Log::group`).
@@ -81,6 +79,12 @@ pub(crate) enum Message<F> {
     Release(u128),
     /// The log is closing: the owner answers what it holds and ends.
     Close,
+    /// Under `Waits::Told`, the caller's word to write what the owner holds (`Log::cut`),
+    /// answered through its ticket once all of it is.
+    Cut(Ticket),
+    /// Under `Waits::Told`, the caller's word to read the fetches the owner holds (`Log::serve`),
+    /// answered through its ticket once none is left.
+    Serve(Ticket),
 }
 
 /// What the owner hears, in the order it hears it: a message from its inbox, or what came back
@@ -181,16 +185,16 @@ const SPARE_FRAMES: usize = 2;
 const ANSWER_LISTS: usize = SPARE_FRAMES.saturating_add(1);
 
 /// What the owner is wired to: the device, where it tells the device another frame follows,
-/// its inbox, where the device tells it of a flush, where jobs come back and their tokens, and
-/// the I/O thread.
+/// its inbox, where the device tells it of a flush, where jobs come back, its wake, and the I/O
+/// thread.
 pub(crate) struct Wiring<F> {
     pub(crate) device: Device<F>,
     pub(crate) more: SyncSender<u64>,
     pub(crate) inbox: Receiver<Message<F>>,
     pub(crate) flushes: Receiver<Completion>,
     pub(crate) returns: Receiver<Box<Carrier<F>>>,
-    pub(crate) tokens: Receiver<u64>,
-    pub(crate) requests: SyncSender<Request<F>>,
+    pub(crate) wake: crate::wake::Wake,
+    pub(crate) requests: SyncSender<Box<Carrier<F>>>,
 }
 
 /// A job waiting for the device, and the caller who waits on it and may do it.
@@ -233,14 +237,13 @@ pub(crate) struct Owner<F> {
     /// Where jobs come back, with the device, from the thread that did them; read before every
     /// message. It wakes no one.
     returns: Receiver<Box<Carrier<F>>>,
-    /// Each job's sequence once it is back, while the I/O thread does not watch for one.
-    tokens: Option<Receiver<u64>>,
-    /// The I/O thread's requests.
-    requests: SyncSender<Request<F>>,
+    /// The owner's wake for a job back, opened before it sleeps with work waiting on the job out
+    /// (`wake.rs`).
+    wake: crate::wake::Wake,
+    /// The I/O thread's queue of jobs.
+    requests: SyncSender<Box<Carrier<F>>>,
     /// The box jobs travel in, while no job is out.
     carrier: Option<Box<Carrier<F>>>,
-    /// Jobs given out so far: the sequence of the last.
-    jobs: u64,
     /// Where the owner tells the device that another frame follows the one it has.
     more: SyncSender<u64>,
     /// The owner has told the device so for the frame it has, or laid it out knowing.
@@ -268,8 +271,6 @@ pub(crate) struct Owner<F> {
     looks: VecDeque<Look<F>>,
     looking: bool,
     closing: bool,
-    /// The I/O thread watches for the job out to come back.
-    watching: bool,
     /// Groups written through their handles: at most `max_groups`.
     claimed: HashSet<u128>,
     /// For each claimed group whose handle had a write refused, the epoch that write was sent
@@ -283,6 +284,24 @@ pub(crate) struct Owner<F> {
     tally: Box<Tally>,
     /// When the frame or confirmation on the device went to it, while one is there.
     flushing_since: Option<Instant>,
+    /// The slot past the file's last being written with zeros ahead of its first frame, and how
+    /// many of its bytes are (`write::FillAhead`), while one is.
+    fill: Option<write::FillAhead>,
+    /// The slot written with zeros and flushed ahead, its admission held, until a frame opens it.
+    filled: Option<u32>,
+    /// A slot whose fill ahead failed: it is not filled ahead again.
+    unfilled: Option<u32>,
+    /// The bytes the last frame wrote: a fill's piece is no larger, so a frame that waits behind
+    /// one waits no longer than behind another frame.
+    frame_bytes: u64,
+    /// Under `Waits::Told`: the cuts told and not yet taken into a batch, and those the batch on
+    /// the device took, answered with the last frame that holds what they took (`Owner::cut`).
+    cuts: Vec<Ticket>,
+    cutting: Vec<Ticket>,
+    /// Under `Waits::Told`: the serves told and not yet answered (`Owner::serve`); and whether
+    /// the first fetch is on the device.
+    serving: Vec<Ticket>,
+    reading: bool,
 }
 
 impl<F: BlockFile + 'static> Owner<F> {
@@ -306,7 +325,7 @@ impl<F: BlockFile + 'static> Owner<F> {
             inbox,
             flushes,
             returns,
-            tokens,
+            wake,
             requests,
         } = wiring;
         Self {
@@ -327,10 +346,9 @@ impl<F: BlockFile + 'static> Owner<F> {
             gate,
             io: VecDeque::new(),
             returns,
-            tokens: Some(tokens),
+            wake,
             requests,
             carrier: None,
-            jobs: 0,
             more,
             more_told: false,
             inbox,
@@ -346,12 +364,19 @@ impl<F: BlockFile + 'static> Owner<F> {
             looks: VecDeque::new(),
             looking: false,
             closing: false,
-            watching: false,
             claimed: HashSet::new(),
             refused: HashMap::new(),
             releasing: HashMap::new(),
             tally: Tally::new(),
             flushing_since: None,
+            fill: None,
+            filled: None,
+            unfilled: None,
+            frame_bytes: 0,
+            cuts: Vec::new(),
+            cutting: Vec::new(),
+            serving: Vec::new(),
+            reading: false,
         }
     }
 
@@ -384,7 +409,10 @@ impl<F: BlockFile + 'static> Owner<F> {
             if self.finished() {
                 break;
             }
-            self.watch();
+            // With work waiting on the job out, the owner looks once more after opening its wake.
+            if self.watch() && self.arrived() {
+                continue;
+            }
             match self.next() {
                 // What came back before the message is heard first.
                 Ok(Some(m)) => {
@@ -403,7 +431,6 @@ impl<F: BlockFile + 'static> Owner<F> {
 
     /// Hands a job and the device to the caller waiting on it, or else to the I/O thread.
     fn start(&mut self, job: Job<F>, doer: Option<Doer<F>>, device: Device<F>) {
-        self.jobs = self.jobs.wrapping_add(1);
         if matches!(job, Job::Frame(_) | Job::Confirm { .. }) {
             self.flushing_since = Some(stats::now());
         }
@@ -412,10 +439,9 @@ impl<F: BlockFile + 'static> Owner<F> {
                 c.job = Some(job);
                 c.device = Some(device);
                 c.completion = None;
-                c.sequence = self.jobs;
                 c
             }
-            None => Box::new(Carrier::new(job, device, self.jobs)),
+            None => Box::new(Carrier::new(job, device)),
         };
         if let Some(Doer { slot, tell }) = doer {
             match slot.try_send(carrier) {
@@ -429,8 +455,9 @@ impl<F: BlockFile + 'static> Owner<F> {
                 Err(TrySendError::Full(back) | TrySendError::Disconnected(back)) => carrier = back,
             }
         }
-        // Never full: the I/O thread holds at most this job and a watch (`device::REQUESTS`).
-        let _ = self.requests.send(Request::Job(carrier));
+        // Never full: the I/O thread took the last job from its queue before doing it
+        // (`device::REQUESTS`).
+        let _ = self.requests.send(carrier);
     }
 
     /// What came back from the device since the owner last looked, queued to be heard in order:
@@ -450,23 +477,16 @@ impl<F: BlockFile + 'static> Owner<F> {
         came
     }
 
-    /// Asks the I/O thread to wake the owner once the job out is back, when the owner has work
-    /// waiting on the device: the job's thread wakes the owner only for a completion the owner
-    /// must answer.
-    fn watch(&mut self) {
-        if self.device.is_some() || self.watching || !self.waits_on_device() {
-            return;
+    /// Opens the owner's wake before it sleeps, when it has work waiting on the job out: the job's
+    /// thread wakes the owner only for a completion the owner must answer, or through the wake
+    /// (`wake.rs`). Whether it opened it, after which the owner looks at its returns again before
+    /// it sleeps.
+    fn watch(&self) -> bool {
+        if self.device.is_some() || !self.waits_on_device() {
+            return false;
         }
-        if let Some(tokens) = self.tokens.take() {
-            match self.requests.send(Request::Watch(self.jobs, tokens)) {
-                Ok(()) => self.watching = true,
-                Err(e) => {
-                    if let Request::Watch(_, tokens) = e.0 {
-                        self.tokens = Some(tokens);
-                    }
-                }
-            }
-        }
+        self.wake.open();
+        true
     }
 
     /// Whether anything the owner holds waits on the job out to come back: submissions for the
@@ -545,21 +565,86 @@ impl<F: BlockFile + 'static> Owner<F> {
             Message::Query(query, ticket) => self.query(query, ticket),
             Message::Done(word) => return Some(word),
             Message::Returned => {}
-            Message::Watched(tokens) => {
-                // Tokens of jobs back are for a watch: none is wanted until the next.
-                while tokens.try_recv().is_ok() {}
-                self.tokens = Some(tokens);
-                self.watching = false;
-            }
             Message::Look(look) => {
                 self.looks.push_back(look);
                 self.look();
             }
             Message::Claim(group, ticket) => self.claim(group, ticket),
             Message::Release(group) => self.release(group),
-            Message::Close => self.closing = true,
+            Message::Close => {
+                self.closing = true;
+                // Under `Waits::Told` a close writes what the owner holds, as a cut does, and
+                // reads what it was asked, as a serve does.
+                if !self.untold() {
+                    self.parked = false;
+                    self.agenda.step = true;
+                    self.read_if_served();
+                }
+            }
+            Message::Cut(ticket) => self.cut(ticket),
+            Message::Serve(ticket) => self.serve(ticket),
         }
         None
+    }
+
+    /// Whether the writer writes without being told (every waits but `Waits::Told`).
+    fn untold(&self) -> bool {
+        self.p.config.waits != Waits::Told
+    }
+
+    /// Under `Waits::Told`, whether the writer has been told to write what it holds: a cut not
+    /// yet answered, the log closing, which writes what it holds as a cut would, or a caller that
+    /// waits on its write from the moment it sent it (a blocking write, as a replica's open makes),
+    /// which can cut nothing until it is answered, so its waiting tells the writer.
+    pub(super) fn told(&self) -> bool {
+        !self.cuts.is_empty()
+            || !self.cutting.is_empty()
+            || self.closing
+            || self
+                .intake
+                .iter()
+                .chain(&self.schedule.held)
+                .any(|s| s.doer.is_some())
+    }
+
+    /// Whether the first fetch may go to the device: as it comes, but under `Waits::Told` only
+    /// while a serve or a close asks for it, or a caller waits on a fetch held.
+    pub(super) fn serves(&self) -> bool {
+        self.untold()
+            || !self.serving.is_empty()
+            || self.closing
+            || self.fetches.iter().any(|f| f.waits)
+    }
+
+    /// A serve: under `Waits::Told`, the fetches the owner holds are read from the device and the
+    /// serve is answered once none is left; under the other waits, or with none held, at once.
+    fn serve(&mut self, mut ticket: Ticket) {
+        if self.untold() || self.fetches.is_empty() {
+            ticket.answer(Ok(Answer::Durable(Vec::new())));
+            return;
+        }
+        self.serving.push(ticket);
+        self.read_if_served();
+    }
+
+    /// A cut: under `Waits::Told`, the next batch takes what the owner holds and the cut is
+    /// answered once all of it is; under the other waits, at once. A frame on the device that a
+    /// next one now follows leaves its confirmation to that frame's record.
+    fn cut(&mut self, mut ticket: Ticket) {
+        if self.untold() {
+            ticket.answer(Ok(Answer::Durable(Vec::new())));
+            return;
+        }
+        if self.fenced {
+            ticket.answer(Err(LogError::Fenced));
+            return;
+        }
+        self.cuts.push(ticket);
+        if !self.intake.is_empty() || !self.schedule.held.is_empty() {
+            self.tell_more();
+        }
+        self.parked = false;
+        self.agenda.step = true;
     }
 
     /// A job and the device back from the thread that did it: the device is the owner's again,
@@ -568,10 +653,8 @@ impl<F: BlockFile + 'static> Owner<F> {
         let completion = back.completion.take();
         self.device = back.device.take();
         self.carrier = Some(back);
-        // Tokens of jobs back are for a watch; none is wanted once the job is heard.
-        if let Some(tokens) = &self.tokens {
-            while tokens.try_recv().is_ok() {}
-        }
+        // No thread wakes the owner for this job now, nor for the next until the owner waits on it.
+        self.wake.close();
         if let Some(completion) = completion {
             self.done(completion);
         }
@@ -619,7 +702,7 @@ impl<F: BlockFile + 'static> Owner<F> {
                 // them, comes after the word.
                 let admit = s.admit;
                 self.intake.push_back(s);
-                self.tell_more();
+                self.tell_admitted();
                 if admit && let Some(s) = self.intake.back() {
                     s.ticket.admit();
                 }
@@ -642,7 +725,7 @@ impl<F: BlockFile + 'static> Owner<F> {
             if let Some(s) = self.waiting.remove(&seq) {
                 let admit = s.admit;
                 self.intake.push_back(s);
-                self.tell_more();
+                self.tell_admitted();
                 if admit && let Some(s) = self.intake.back() {
                     s.ticket.admit();
                 }
@@ -803,6 +886,7 @@ impl<F: BlockFile + 'static> Owner<F> {
                 self.buffers.frame = Some(frame);
                 self.buffers.record = Some(record);
                 self.tally.job(&timing, true);
+                self.frame_bytes = timing.bytes;
                 // A device that confirms the frame on its own goes on to it as the flush ends.
                 self.flushing_since = timing.flushed_at.filter(|_| confirming);
                 let done = write::Flushed {
@@ -826,6 +910,10 @@ impl<F: BlockFile + 'static> Owner<F> {
                 self.flushing_since = None;
                 self.confirmed(result, these, timing.flushed_at);
             }
+            Completion::Fill { result, timing } => {
+                self.tally.job(&timing, false);
+                self.filled_ahead(result);
+            }
             Completion::Read(reads) => self.read(reads),
             Completion::Looked => {
                 self.looking = false;
@@ -844,6 +932,14 @@ impl<F: BlockFile + 'static> Owner<F> {
         };
         self.io.push_back((Job::Look(look), None));
         self.looking = true;
+    }
+
+    /// A submission admitted: another frame follows the one on the device, unless under
+    /// `Waits::Told` no cut asks for one yet.
+    fn tell_admitted(&mut self) {
+        if self.untold() || self.told() {
+            self.tell_more();
+        }
     }
 
     /// A submission was admitted while a frame is on the device: another frame follows it, so

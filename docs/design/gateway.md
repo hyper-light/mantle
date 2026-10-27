@@ -647,8 +647,11 @@ file or standard input, is a native upload in runs the node cuts (§2.1; `Client
 `upload_once`), of any length, an object one run holds put whole. The library asks again from the
 node's durable offset where a run's exchange ends unanswered, the file read again from there or a
 read-once source's run sent again from what it holds, at most three times in a row without a run
-committing; it tells its caller the upload's ID once opened, before any run, and each run's
-progress (`Watch`). The command line keeps a journal of the uploads it opened (`crate::journal`,
+committing. The offset is a read, asked again where its own answer is lost, at most three times in
+a row: a node whose range lost its leader with the node that died under the run holds the read
+until another leads, which can outlast the client's period (diag run 40479294707, windows-aarch64:
+a copy through a killed node ended `Stalled` on the offset; `tests/resume.rs`). It tells its caller
+the upload's ID once opened, before any run, and each run's progress (`Watch`). The command line keeps a journal of the uploads it opened (`crate::journal`,
 research/74): a record a file under the client's directory, written, flushed, renamed and its
 directory flushed before the first run, checked by its CRC-32C on every read, removed once the
 upload is answered, at most 1,000 at once. A copy run again finds its upload by its destination and

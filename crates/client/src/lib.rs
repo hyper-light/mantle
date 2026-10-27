@@ -804,7 +804,10 @@ impl Client {
         Ok(Ok((upload, at)))
     }
 
-    /// A native upload's progress, as its Offset answers it.
+    /// A native upload's progress, as its Offset answers it. A read, it is asked again where its
+    /// answer was lost, at most [`ATTEMPTS`] times in a row: a node whose range lost its leader
+    /// with the node that died under a run holds the read until another leads, which may outlast
+    /// the client's period, and answers the next ask.
     async fn progress(
         &mut self,
         native: &Native,
@@ -816,7 +819,15 @@ impl Client {
             key: native.key.clone(),
             upload: upload.to_owned(),
         };
-        self.call(&op, deadline_ns).await
+        let mut failures = 0u32;
+        loop {
+            match self.call(&op, deadline_ns).await {
+                Err(error) if resumable(&error) => {
+                    failures = self.again(failures, error, deadline_ns).await?;
+                }
+                asked => return asked,
+            }
+        }
     }
 
     /// Reads `len` bytes of `source` into `whole` and sends none: the committed runs' bytes, read

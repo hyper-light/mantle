@@ -17,7 +17,7 @@ use mantle_cert::{KeyPair, Serial, Validity};
 use mantle_client::{Sink, Source, TRAILER};
 use mantle_protocol::bounds;
 use mantle_protocol::classes::{Class, NodeClasses, Role};
-use mantle_protocol::object::{Head, Op, Reply, Status, Stored};
+use mantle_protocol::object::{Head, Op, Progress, Reply, Status, Stored};
 use mantle_s3::checksum::Hasher;
 
 pub(crate) const NODE: PeerId = 1;
@@ -157,6 +157,45 @@ impl Directory for Clients {
     }
 }
 
+/// What the stub node does to a native upload's exchanges, each counted from 1 by its kind: the
+/// Append it reads whole and never answers, as a node that died under it leaves it, and the
+/// Offset it holds unanswered until its client gives up on it.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Script {
+    pub(crate) lose_append: Option<u32>,
+    pub(crate) hold_offset: Option<u32>,
+}
+
+/// The native upload's requests the stub took, by kind.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Seen {
+    pub(crate) opens: u32,
+    pub(crate) appends: u32,
+    pub(crate) offsets: u32,
+    pub(crate) finishes: u32,
+}
+
+/// The stub's one native upload: its durable offset, its committed runs, and whether the last
+/// one came; its runs are the least part long.
+#[derive(Default)]
+struct Runs {
+    offset: u64,
+    runs: u16,
+    ended: bool,
+}
+
+impl Runs {
+    fn progress(&self, checksum: Option<Vec<u8>>) -> Option<Box<Progress>> {
+        Some(Box::new(Progress {
+            offset: self.offset,
+            runs: self.runs,
+            run: mantle_s3::body::MIN_PART,
+            ended: self.ended,
+            checksum,
+        }))
+    }
+}
+
 /// What the stub node is doing with the exchange it serves.
 enum Serving {
     /// Reading a request: its head, its fields as they come, the object's bytes past them, and a
@@ -176,6 +215,8 @@ enum Serving {
         length: u64,
         written: u64,
     },
+    /// A request read whole and left unanswered.
+    Holding,
 }
 
 type Stub = Driver<NodeClasses, Fixed, Clients>;
@@ -211,6 +252,24 @@ pub(crate) fn stub(
     (length, pause): (u64, Option<Duration>),
     bound: std::sync::mpsc::Sender<SocketAddr>,
 ) {
+    scripted(
+        credentials,
+        transport_bytes,
+        (length, pause),
+        Script::default(),
+        bound,
+    );
+}
+
+/// As [`stub`], answering a native upload's Open, Appends, Offsets and Finish as `script` says,
+/// its object the pattern's bytes: what it took of them, once its client's connection closes.
+pub(crate) fn scripted(
+    credentials: Credentials,
+    transport_bytes: u64,
+    (length, pause): (u64, Option<Duration>),
+    script: Script,
+    bound: std::sync::mpsc::Sender<SocketAddr>,
+) -> Seen {
     let get_crc = crc(length);
     let stated = mantle_client::stated(1, transport_bytes);
     runtime(8)
@@ -236,6 +295,7 @@ pub(crate) fn stub(
             .unwrap();
             bound.send(driver.local_addr().unwrap()).unwrap();
             let mut serving: Option<Serving> = None;
+            let (mut runs, mut seen) = (Runs::default(), Seen::default());
             let mut piece = vec![0u8; mantle_client::PIECE];
             // The shard's time the pause ends, while it holds a put's body unread; once taken, a
             // pause is not taken again.
@@ -256,7 +316,7 @@ pub(crate) fn stub(
                                 trailer: Vec::new(),
                             });
                         }
-                        Event::Closed { .. } => return,
+                        Event::Closed { .. } => return seen,
                         _ => {}
                     }
                 }
@@ -289,12 +349,20 @@ pub(crate) fn stub(
                         let mut pause_now = false;
                         if !bytes.is_empty() {
                             let op = head.op(fields).unwrap();
-                            let Op::Put { length, .. } = op else {
-                                panic!("bytes past a get's fields");
+                            let (length, from) = match op {
+                                Op::Put { length, .. } => (length, None),
+                                Op::Append { length, offset, .. } => (length, Some(offset)),
+                                other => panic!("bytes past the fields of {other:?}"),
                             };
                             let hasher =
                                 hasher.get_or_insert_with(|| Hasher::new(TRAILER).unwrap());
                             let object = (length - *past).min(bytes.len() as u64) as usize;
+                            // A run's bytes are the object's from the run's offset.
+                            if let Some(from) = from {
+                                for (j, byte) in bytes[..object].iter().enumerate() {
+                                    assert_eq!(*byte, pattern(from + *past + j as u64));
+                                }
+                            }
                             hasher.update(&bytes[..object]).unwrap();
                             *past += object as u64;
                             trailer.extend_from_slice(&bytes[object..]);
@@ -316,14 +384,15 @@ pub(crate) fn stub(
                         continue;
                     }
                     let op = head.op(fields).unwrap();
-                    let (reply, length) = match op {
+                    let exchange = *exchange;
+                    let sum = hasher
+                        .take()
+                        .unwrap_or_else(|| Hasher::new(TRAILER).unwrap())
+                        .finish()
+                        .unwrap()
+                        .bytes;
+                    let answer = match op {
                         Op::Put { length, .. } => {
-                            let sum = hasher
-                                .take()
-                                .unwrap_or_else(|| Hasher::new(TRAILER).unwrap())
-                                .finish()
-                                .unwrap()
-                                .bytes;
                             let reply = if sum == *trailer {
                                 Reply {
                                     size: length,
@@ -338,9 +407,9 @@ pub(crate) fn stub(
                             } else {
                                 Reply::status(Status::BadDigest)
                             };
-                            (reply, 0)
+                            Some((reply, 0))
                         }
-                        Op::Get { .. } => (
+                        Op::Get { .. } => Some((
                             Reply {
                                 size: length,
                                 etag: "got".into(),
@@ -352,12 +421,90 @@ pub(crate) fn stub(
                                 ..Reply::status(Status::Done)
                             },
                             length,
-                        ),
-                        Op::HeadBucket { .. } => (Reply::status(Status::Done), 0),
-                        other => panic!("the stub answers puts, gets and bucket heads: {other:?}"),
+                        )),
+                        Op::HeadBucket { .. } => Some((Reply::status(Status::Done), 0)),
+                        Op::Open { .. } => {
+                            seen.opens += 1;
+                            let reply = Reply {
+                                upload: "upload".into(),
+                                progress: runs.progress(None),
+                                ..Reply::status(Status::Done)
+                            };
+                            Some((reply, 0))
+                        }
+                        Op::Append {
+                            offset,
+                            length,
+                            last,
+                            ..
+                        } => {
+                            seen.appends += 1;
+                            if script.lose_append == Some(seen.appends) {
+                                endpoint.end(exchange);
+                                None
+                            } else if offset != runs.offset {
+                                let reply = Reply {
+                                    progress: runs.progress(None),
+                                    ..Reply::status(Status::Offset)
+                                };
+                                Some((reply, 0))
+                            } else if sum != *trailer {
+                                Some((Reply::status(Status::BadDigest), 0))
+                            } else {
+                                runs.offset += length;
+                                runs.runs += 1;
+                                runs.ended = last;
+                                let reply = Reply {
+                                    progress: runs.progress(Some(sum)),
+                                    ..Reply::status(Status::Done)
+                                };
+                                Some((reply, 0))
+                            }
+                        }
+                        Op::Offset { .. } => {
+                            seen.offsets += 1;
+                            if script.hold_offset == Some(seen.offsets) {
+                                None
+                            } else {
+                                let reply = Reply {
+                                    progress: runs.progress(None),
+                                    ..Reply::status(Status::Done)
+                                };
+                                Some((reply, 0))
+                            }
+                        }
+                        Op::Finish {
+                            length, checksum, ..
+                        } => {
+                            seen.finishes += 1;
+                            let whole = runs.ended
+                                && length == runs.offset
+                                && checksum.bytes == crc(length);
+                            let reply = if whole {
+                                Reply {
+                                    size: length,
+                                    etag: "native".into(),
+                                    checksum: Some(Stored {
+                                        algorithm: checksum.algorithm.code(),
+                                        parts: 0,
+                                        value: checksum.bytes,
+                                    }),
+                                    ..Reply::status(Status::Done)
+                                }
+                            } else {
+                                Reply::status(Status::BadDigest)
+                            };
+                            Some((reply, 0))
+                        }
+                        other => panic!("the stub does not answer {other:?}"),
+                    };
+                    // A request lost or held: nothing is written for it.
+                    let Some((reply, length)) = answer else {
+                        serving = Some(Serving::Holding);
+                        driver.flush().unwrap();
+                        continue;
                     };
                     let (reply_head, reply_fields) = reply.encode().unwrap();
-                    let exchange = *exchange;
                     endpoint
                         .reply(
                             exchange,
@@ -407,5 +554,5 @@ pub(crate) fn stub(
                 driver.flush().unwrap();
             }
         })
-        .unwrap();
+        .unwrap()
 }

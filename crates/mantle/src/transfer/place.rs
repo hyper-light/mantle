@@ -23,6 +23,11 @@ use mantle_protocol::classes::{Bounds, Role};
 
 use super::TransferError;
 
+/// The client's pieces a founder the gateway's reader's transport holds, as the cell tests' range
+/// readers hold (`crates/mantle/tests/support/cell.rs`'s `client_settings`), which read through
+/// CI's busy runner where the least transport did not.
+const READER_PIECES: u64 = 3;
+
 /// The groups of the ranges a block's place is read from, as each founder's configuration names
 /// them (`range = GROUP LAYER`).
 #[derive(Clone, Copy)]
@@ -178,10 +183,21 @@ impl Gateway {
             .ok_or_else(|| unread("the gateway's sockets"))
     }
 
-    /// A range client's settings for the gateway, stating `messages`, the cell's bounds.
+    /// A range client's settings for the gateway, stating `messages`, the cell's bounds. Its
+    /// transport holds three of the client's pieces a founder, as the cell tests' range readers
+    /// hold, and no less than its shape's least: a reply is read a piece at a time from the bytes
+    /// its windows share (`mantle_node::client`'s `read_reply`), and at the least, 242,449 bytes
+    /// for a cell of three where a piece is 65,527, a reply in one window left no room for the
+    /// piece it is read into on CI's busy runner (`Budget`, run 40589088028).
     pub fn settings(&self, messages: Bounds) -> Result<ClientSettings, TransferError> {
         let least = mantle_protocol::bounds::least_transport(&self.stated(messages, 0))
             .map_err(|e| unread(&e.to_string()))?;
+        let pieces = u64::try_from(self.founders.len())
+            .ok()
+            .and_then(|founders| founders.checked_mul(READER_PIECES))
+            .and_then(|pieces| pieces.checked_mul(u64::try_from(mantle_client::PIECE).ok()?))
+            .ok_or_else(|| unread("the reader's transport"))?;
+        let transport_bytes = least.max(pieces);
         Ok(ClientSettings {
             id: self.id,
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -201,7 +217,7 @@ impl Gateway {
                 .collect(),
             role: Role::Gateway,
             messages,
-            transport_bytes: least,
+            transport_bytes,
             seed: None,
         })
     }

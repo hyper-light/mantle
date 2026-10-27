@@ -476,6 +476,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/mantle/src/transfer/generate.rs` `BLOCK` | cited | 16 bytes: AES's block, and the counter block that makes one block of keystream (FIPS 197; SP 800-38A §6.5). |
 | `crates/mantle/src/transfer/generate.rs` `BLOCK_BYTES` | derived | `BLOCK`, as an object's offsets count it. |
 | `crates/mantle/src/transfer/mod.rs` `SEGMENT` | derived | `mantle_s3::seal::SEGMENT`, the layout's 64 KiB segment, as an object's sizes count it. |
+| `crates/mantle/src/transfer/place.rs` `READER_PIECES` | measured | 3: the client's pieces a founder the gateway's reader's transport holds, as the cell tests' range readers hold; at its shape's least, 242,449 bytes for three founders where a piece is 65,527, a reply in one window left no room for the piece it is read into on CI's busy runner (`Budget`, run 40589088028), where the tests' readers read through. |
 | `crates/mantle/src/transfer/mod.rs` `SMALL_LINE` | cited | 128 KiB: S3's line for a small object, below which S3 Intelligent-Tiering does not monitor objects and the infrequent-access classes bill them as 128 KiB (research/76). |
 | `crates/meta/src/collector.rs` `GRACE_NS` | cited | GFS keeps deleted files for three days (GGL03 §4.4, docs/research/22 §1.1). A recovery-point policy, not a safety bound (22 §10.4). |
 | `crates/meta/src/file.rs` `MAX_EXTENTS` | external | The S3 limit of 10,000 parts per upload (docs/research/05 §4.1). Audit §12.6 says single-PUT block manifests reuse this count and need their own derived fanout limit. |

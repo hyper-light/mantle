@@ -46,6 +46,8 @@ enum Said {
     Bound(SocketAddr, SocketAddr),
     /// Its S3 listener's address, once bound.
     S3(SocketAddr),
+    /// The region its S3 endpoint serves and its clients sign for.
+    Region(String),
     /// The root range took its enlistment.
     Enlisted,
     /// Its output ended: the process is gone.
@@ -57,6 +59,7 @@ fn said(line: &str) -> Option<Said> {
     match fields.as_slice() {
         ["bound", quic, plane] => Some(Said::Bound(quic.parse().ok()?, plane.parse().ok()?)),
         ["s3-bound", at, _connections] => at.parse().ok().map(Said::S3),
+        ["s3", _listen, region, _ids] => Some(Said::Region((*region).to_owned())),
         ["enlisted"] => Some(Said::Enlisted),
         _ => None,
     }
@@ -74,6 +77,7 @@ struct Node {
     quic: Option<SocketAddr>,
     plane: Option<SocketAddr>,
     s3: Option<SocketAddr>,
+    region: Option<String>,
     enlisted: bool,
 }
 
@@ -140,6 +144,7 @@ impl Cell {
                 quic: None,
                 plane: None,
                 s3: None,
+                region: None,
                 enlisted: false,
             });
         }
@@ -180,6 +185,14 @@ impl Cell {
             .collect()
     }
 
+    /// Each node's S3 listener and the region its endpoint signs for, once bound.
+    pub fn s3(&self) -> Vec<(SocketAddr, String)> {
+        self.nodes
+            .iter()
+            .filter_map(|n| Some((n.s3?, n.region.clone()?)))
+            .collect()
+    }
+
     /// Starts node `at`'s process and waits until both its listeners listen.
     pub fn start(&mut self, at: usize) -> Result<(), CellError> {
         let tell = self.tell.clone();
@@ -207,6 +220,7 @@ impl Cell {
         node.quic = None;
         node.plane = None;
         node.s3 = None;
+        node.region = None;
         node.enlisted = false;
         let generation = node.generation;
         std::thread::Builder::new()
@@ -223,7 +237,9 @@ impl Cell {
                 let _ = tell.send((at, generation, Said::Ended));
             })
             .map_err(io("a node's reader thread"))?;
-        self.until(at, |node| node.quic.is_some() && node.s3.is_some())
+        self.until(at, |node| {
+            node.quic.is_some() && node.s3.is_some() && node.region.is_some()
+        })
     }
 
     /// Waits until node `at` holds `done`, taking every node's lines meanwhile; its process ending
@@ -251,6 +267,7 @@ impl Cell {
                     node.plane = Some(plane);
                 }
                 Said::S3(s3) => node.s3 = Some(s3),
+                Said::Region(region) => node.region = Some(region),
                 Said::Enlisted => node.enlisted = true,
                 Said::Ended => {
                     node.child = None;

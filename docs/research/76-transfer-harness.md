@@ -56,9 +56,16 @@ as `mantle serve`, a child of the harness, and told where the others listen once
 an operator tells a node its peers. A case never reuses a cell: space a delete frees returns only
 after the collector's grace (f8).
 
-**Read back through another node.** Each object is put by one client and read back by another
-whose first node is the next, so every read crosses the cell; a read is exact or it counts as
-wrong, and a put not acknowledged counts as refused.
+**Both doors, each object read back through both.** A set's even objects are put through the
+native door by a client of the first node, as `mantle cp` puts one; its odd ones through the third
+node's S3 listener by boto3, the stock client, in one driver process a case that `mantle init`'s
+profile signs for and the harness feeds and reads over its standard input and output (`boto.py`),
+so neither side holds more than one small object (f55, f67). Every acknowledged object is then read
+back natively by a client whose first node is the second, and through the third node's listener,
+so each is read through another node than it was put through and through the door it was not put
+through; a read is exact or it counts as wrong, a put not acknowledged counts as refused. The
+doors run in turn, each phase alone, so the driver's blocking pipes never stall the native
+clients' runtime, and the driver says `ready` before anything is timed, its start-up no put's.
 
 **Bounded by construction.** A case keeps two fixed-size histograms of latency
 (`mantle_disk::histogram`, HdrHistogram's buckets) and counts; a node's status lines are read on a
@@ -68,7 +75,8 @@ its operator runs it: a case fills the volumes it states (f7).
 
 ## Open
 
-- The HTTP door through stock clients, and every object read back through the other door.
+- The AWS CLI streaming a large object from standard input and to standard output, and boto3's
+  explicit parts, for the 10 GB and 100 GB cases.
 - Each block's placement read from the Block range and the volume table; each node SIGKILLed in turn
   with every object read back through the others, then restarted and read back through it; the
   chunk bytes peers received over QUIC against those they hold.

@@ -63,6 +63,15 @@ error document carries `InsufficientStorage`, the status's own name, where MinIO
 `XMinioStorageFull` [4]. The native protocol's status is a code of its own, 26, beside the others,
 which the client returns as the reply's status, as it does `SlowDown`, without asking again.
 
+**A volume that may still free a segment answers `Busy` first.** A volume out of free segments
+answers a put `Busy` while its cleaner may still free one, which only a pass can tell
+(`mantle_chunk`'s writer, `reclaimable`: a fresh volume's cleaner has given no verdict yet), so the
+first object at a full cell may be answered `SlowDown`, and the cleaner, poked by the put, runs its
+pass; once the pass says it can free nothing, the volume refuses as full and the next ask is
+answered `507`. A client asks a `SlowDown` again, as stock clients do, and so meets the typed answer
+(`tests/serve.rs`'s fill, which asks again at most three times, the SDKs' standard attempts:
+linux-aarch64 and windows-x86_64 met the `SlowDown` first in CI run 40529439899).
+
 **Nothing of the refused object commits.** The refusal comes before the object's file is written
 or its version committed; chunks of its blocks that some volumes took are left to the sweeps, as
 every failed PUT's are (gateway.md §2). A multipart part and a native run are put by the same

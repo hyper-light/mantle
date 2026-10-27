@@ -1988,8 +1988,10 @@ an admission queue whose sojourn exceeds its target, a range being split or froz
 credit. A condition that outlasts the retries, such as a cell out of space, is reported as what
 it is, and its remedy is operational: a PUT, a part or a native run whose block every volume
 refused as full is answered `507 Insufficient Storage`, natively `Status::InsufficientStorage`, a
-status no stock client retries, where `SlowDown` would turn a full cell into retries (research/75;
-`tests/serve.rs`, a cell whose stated volumes fill, through both doors). Whether to send `x-amz-retry-after` is open, since whether
+status no stock client retries, where `SlowDown` would turn a full cell into retries; while a
+volume's cleaner may still free a segment the put is `SlowDown`, and asked again it meets the typed
+answer once the cleaner's pass has said it cannot (research/75; `tests/serve.rs`, a cell whose
+stated volumes fill, through both doors). Whether to send `x-amz-retry-after` is open, since whether
 S3 sends it is unverified (25 §3).
 
 *As built (2026-10-25), the S3 listener.* The door holds a request for each connection the listener

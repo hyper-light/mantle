@@ -2016,13 +2016,53 @@ fn a_multipart_upload_completes_through_another_node_with_one_killed_between_par
     );
 }
 
+/// An object of the fill below: 32 MiB, so a block's whole chunk of 8 MiB at a time fills the cell's
+/// 256 MiB volumes within nine of them.
+const FILL: usize = 32 << 20;
+
+/// What a put of fill object `n` through its door, the native one for an even `n` and the S3
+/// listener for an odd one, of node `at`, came to: `Done`, or its refusal. A `SlowDown` is asked
+/// again as a client asks it, at most `mantle_client::ATTEMPTS` times: a volume out of free segments
+/// answers a put `Busy` while its cleaner may still free one, and the put fails `SlowDown`, until the
+/// cleaner's pass says whether it can; then the volume takes the chunk or refuses it as full
+/// (chunk-store.md §8; `mantle_chunk`'s writer, `reclaimable`).
+fn fill_put(
+    cell: &mut Cell,
+    http: &mut [s3::Client],
+    ids: &[u64],
+    (n, at): (u64, usize),
+) -> String {
+    let data = object_bytes(n, FILL);
+    let key = format!("o{n}");
+    let mut said = String::new();
+    for _ in 0..mantle_client::ATTEMPTS {
+        said = if n % 2 == 0 {
+            let put = put_with("native", &key, u128::from(n) + 1, &data, Headers::default());
+            let (reply, _) = ask(cell, ids[at], put, data.clone());
+            format!("{:?}", reply.status)
+        } else {
+            let put = http[at].send("PUT", &format!("/http/{key}"), &[], &data);
+            if put.status == 200 {
+                "Done".to_owned()
+            } else {
+                format!("{} {:?}", put.status, put.element("Code"))
+            }
+        };
+        if said != "SlowDown" && said != "503 Some(\"SlowDown\")" {
+            break;
+        }
+    }
+    said
+}
+
 /// A cell whose stated volumes fill refuses the object it has no room for with the typed answer on
 /// each door, `InsufficientStorage` natively and `507 Insufficient Storage` on the S3 listener,
 /// which stock clients do not retry, where it answered `SlowDown` before (node.md §4.4,
 /// research/75); nothing of the refused objects is readable or listed, and every object
 /// acknowledged before reads back whole. Objects of 32 MiB go through the two doors in turn, each
 /// door its own bucket, until a volume of the cell has no room; three copies of each, one a node,
-/// fill the three volumes together.
+/// fill the three volumes together. A `SlowDown` while a volume's cleaner has yet to say whether it
+/// can free a segment is asked again, as a client asks it (`fill_put`).
 #[test]
 fn a_cell_whose_volumes_fill_refuses_the_next_object_typed_on_both_doors() {
     let mut cell = Cell::made(three_founders);
@@ -2049,33 +2089,16 @@ fn a_cell_whose_volumes_fill_refuses_the_next_object_typed_on_both_doors() {
 
     // Each object through the next door and node in turn: the cell's volumes are stated at 256
     // MiB, so it takes fewer than nine of 32 MiB before one has no room.
-    const LEN: usize = 32 << 20;
     let mut acknowledged: Vec<(usize, u64)> = Vec::new();
     let mut refused = None;
     for n in 0..9u64 {
-        let data = object_bytes(n, LEN);
         let at = usize::try_from(n).unwrap() % ids.len();
-        let key = format!("o{n}");
-        let typed = if n % 2 == 0 {
-            let put = put_with("native", &key, u128::from(n) + 1, &data, Headers::default());
-            let (reply, _) = ask(&mut cell, ids[at], put, data);
-            match reply.status {
-                ObjectStatus::Done => None,
-                other => Some(format!("{other:?}")),
-            }
+        let said = fill_put(&mut cell, &mut http, &ids, (n, at));
+        if said == "Done" {
+            acknowledged.push((at, n));
         } else {
-            let put = http[at].send("PUT", &format!("/http/{key}"), &[], &data);
-            match put.status {
-                200 => None,
-                code => Some(format!("{code} {:?}", put.element("Code"))),
-            }
-        };
-        match typed {
-            None => acknowledged.push((at, n)),
-            Some(said) => {
-                refused = Some((n, said));
-                break;
-            }
+            refused = Some((n, said));
+            break;
         }
     }
     let Some((full, said)) = refused else {
@@ -2094,28 +2117,19 @@ fn a_cell_whose_volumes_fill_refuses_the_next_object_typed_on_both_doors() {
 
     // The other door finds it full too.
     let next = full + 1;
-    let data = object_bytes(next, LEN);
-    if next % 2 == 0 {
-        let put = put_with(
-            "native",
-            &format!("o{next}"),
-            u128::from(next) + 1,
-            &data,
-            Headers::default(),
-        );
-        let (reply, _) = ask(&mut cell, ids[0], put, data);
-        assert_eq!(reply.status, ObjectStatus::InsufficientStorage);
+    let said = fill_put(&mut cell, &mut http, &ids, (next, 0));
+    let expected = if next % 2 == 0 {
+        "InsufficientStorage"
     } else {
-        let put = http[0].send("PUT", &format!("/http/o{next}"), &[], &data);
-        assert_eq!(put.status, 507);
-        assert_eq!(put.element("Code").as_deref(), Some("InsufficientStorage"));
-    }
+        "507 Some(\"InsufficientStorage\")"
+    };
+    assert_eq!(said, expected, "object {next}");
 
     // Every object acknowledged reads back whole through another node, and neither refused one is
     // readable or listed.
     for &(at, n) in &acknowledged {
         let other = (at + 1) % ids.len();
-        let data = object_bytes(n, LEN);
+        let data = object_bytes(n, FILL);
         if n % 2 == 0 {
             let (reply, got) = ask(
                 &mut cell,

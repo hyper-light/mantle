@@ -369,6 +369,15 @@ between attempts ends in `BadDigest` with nothing committed; and a copy whose no
 mid-run ends `SlowDown`, the cell writing no block while one node of three is gone, and resumes at
 the cell's offset once the node is back (`crates/mantle/tests/native.rs`).
 
+`mantle bench transfer` puts objects through a cell of three it makes with `mantle init` and runs
+as `mantle serve` children, a fresh cell each case under a directory its operator names: each
+object's bytes AES-256-CTR's keystream from the run's seed and the object's name, so a read is
+checked by making them again and no copy is kept; a small set's sizes the layout's boundaries and
+then drawn below S3's 128 KiB small-object line; each object put through the native door and read
+back through a client that asks another node first, every byte exact or counted wrong; latency in
+fixed-size histograms (research/76; `crates/mantle/tests/transfer.rs`). The HTTP door, placement
+and replication checks, the full-cell case and the controls are the step's next pieces.
+
 Remaining before it is done:
 
 - The windows a gateway admits, from its memory and measured latency; the rates of the paths

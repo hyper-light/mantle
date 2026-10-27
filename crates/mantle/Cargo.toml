@@ -14,6 +14,9 @@ name = "mantle"
 path = "src/main.rs"
 
 [dependencies]
+# The keystream `mantle bench transfer` makes each object's bytes from and checks a read against,
+# AES-256-CTR (src/transfer/generate.rs).
+aws-lc-rs.workspace = true
 # The secret of the cell's access key, as base64 (`mantle init`).
 base64.workspace = true
 bytes.workspace = true

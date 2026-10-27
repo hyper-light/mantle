@@ -181,16 +181,16 @@ impl From<hyper_rt::RtError> for Error {
 }
 
 /// A client's directory as its `config` names it.
-struct Configured {
-    dir: PathBuf,
-    id: u64,
-    credentials: Credentials,
-    nodes: Vec<(u64, std::net::SocketAddr)>,
+pub(crate) struct Configured {
+    pub(crate) dir: PathBuf,
+    pub(crate) id: u64,
+    pub(crate) credentials: Credentials,
+    pub(crate) nodes: Vec<(u64, std::net::SocketAddr)>,
 }
 
 /// The client's directory `dir`: its `config`'s id, certificate, key (readable by its owner alone,
 /// as a node's is: `mantle_node::secret`), the authority's certificate and each node.
-fn configured(dir: &Path) -> Result<Configured, Error> {
+pub(crate) fn configured(dir: &Path) -> Result<Configured, Error> {
     let path = dir.join("config");
     let bad = |why: String| Error::Config(path.clone(), why);
     let text = std::fs::read_to_string(&path).map_err(|e| bad(e.to_string()))?;
@@ -250,8 +250,9 @@ fn configured(dir: &Path) -> Result<Configured, Error> {
     })
 }
 
-/// One shard on this machine's calibration, kept in `dir`, its interests the client's sockets'.
-fn runtime(dir: &Path, nodes: usize) -> Result<LocalRuntime, Error> {
+/// One shard on this machine's calibration, kept in `dir`, its interests the sockets of `clients`
+/// clients of `nodes` nodes, each client's waits a timer and its driver another.
+pub(crate) fn runtime(dir: &Path, nodes: usize, clients: usize) -> Result<LocalRuntime, Error> {
     let budget = mantle_node::derive::probe_budget().map_err(|e| Error::Runtime(e.to_string()))?;
     let calibration = mantle_node::process::calibration(dir, budget)
         .map_err(|e| Error::Runtime(e.to_string()))?;
@@ -262,12 +263,13 @@ fn runtime(dir: &Path, nodes: usize) -> Result<LocalRuntime, Error> {
             latency_objective_ns: None,
         })
         .map_err(|unmet| Error::Runtime(format!("{unmet:?}")))?;
-    // The client's one task, its waits' timer and its driver's.
-    let mut config = RuntimeConfig::from_calibration(&calibration, &constants, 1, 2);
+    // One task drives the clients; each client's waits take a timer and its driver another.
+    let timers = clients.saturating_mul(2);
+    let mut config = RuntimeConfig::from_calibration(&calibration, &constants, 1, timers);
     config.shards = 1;
     config.pin = false;
     config.cores.clear();
-    let sockets = mantle_client::sockets(nodes)?;
+    let sockets = mantle_client::sockets(nodes)?.saturating_mul(clients);
     config.interests_per_shard = config.interests_per_shard.max(sockets.saturating_mul(2));
     Ok(LocalRuntime::new(&config)?)
 }
@@ -275,7 +277,7 @@ fn runtime(dir: &Path, nodes: usize) -> Result<LocalRuntime, Error> {
 /// Runs `command` as the client of the directory `dir`, its lines to `out`.
 pub fn run(dir: &Path, command: Command, mut out: impl Write + 'static) -> Result<(), Error> {
     let configured = configured(dir)?;
-    let mut rt = runtime(&configured.dir, configured.nodes.len())?;
+    let mut rt = runtime(&configured.dir, configured.nodes.len(), 1)?;
     blocking::start(blocking::Config {
         workers: 1,
         shares: vec![blocking::Share::new(FILES, 1)],

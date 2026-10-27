@@ -33,6 +33,7 @@ mod durability;
 mod files;
 mod init;
 mod journal;
+mod transfer;
 
 #[derive(Parser)]
 #[command(
@@ -335,6 +336,24 @@ enum BenchCommand {
         /// Seconds each measurement runs.
         #[arg(long, default_value_t = 0.5)]
         seconds: f64,
+    },
+    /// Put objects through a cell of three this program makes and runs under DIR, each read back
+    /// through another node and checked against the bytes its seed and name make (plan step 9):
+    /// a case each small set, each on a cell of its own. Exits non-zero when any check is not
+    /// exact. Never on a shared runner: it fills the volumes it states.
+    Transfer {
+        /// The run's directory: each case's cell in a directory of its own under it, which must
+        /// not exist yet.
+        dir: PathBuf,
+        /// The seed every object's bytes and the small sets' sizes come from.
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// The small sets' sizes, comma-separated, a case each.
+        #[arg(long, value_delimiter = ',', default_value = "1000")]
+        small: Vec<u64>,
+        /// Each founder's volume, in bytes or with a K, M, G or T suffix (powers of 1024).
+        #[arg(long, value_parser = init::parse_bytes, default_value = "256M")]
+        volume: u64,
     },
 }
 
@@ -732,6 +751,27 @@ fn main() -> ExitCode {
             Ok(step) => bench_meta::meta(&mut out, step).map_err(|e| e.to_string()),
             Err(_) => Err(format!("--seconds {seconds} is not a duration")),
         },
+        Command::Bench {
+            command:
+                BenchCommand::Transfer {
+                    dir,
+                    seed,
+                    small,
+                    volume,
+                },
+        } => {
+            let options = transfer::Options {
+                dir,
+                seed,
+                small,
+                volume_bytes: volume,
+            };
+            match transfer::transfer(&mut out, &options) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err("a check was not exact: the rows above say which".into()),
+                Err(e) => Err(e.to_string()),
+            }
+        }
         Command::Durability {
             domains,
             afr,

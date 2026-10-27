@@ -391,6 +391,15 @@ latency at that quantile, `w = ⌈R·T_q/B⌉`, so a block at the hedge point do
 client (research/31 §4.8). The chunks a GET reads arrive with their stored CRCs, which it
 verifies before decoding or opening (node.md §5.6).
 
+*As built (2026-10-27).* Hedging is not built; a node reads no chunk from a peer its failure
+detectors suspect. A chunk read to a peer suspected, or announced stopping, is answered lost at
+once, and a read out to a peer as its detectors come to suspect it ends then, so the GET asks
+another copy rather than waiting out the transport's judgement of a peer that may be gone, two
+idle timeouts, as long as the GET's own client waits for its answer: with a founder SIGKILLed,
+`mantle bench transfer`'s reads through the others ended `Stalled` at their first block on the
+killed node, and read back whole once the node read no more from it. A put waits on its peer as
+before: ended by a detector's mistake, which a loaded host makes, it would be an object refused.
+
 **Checked** (`crates/gateway/tests/object_path.rs`): objects under copies and codes read back
 whole and in ranges across segment and block boundaries, with requests answered in either
 order, and any range of generated objects; a chunk a volume cannot read is read from another

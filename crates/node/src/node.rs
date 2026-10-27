@@ -500,6 +500,9 @@ struct Remote {
     ended: u64,
     suspected: u64,
     refusal: Option<Refusal>,
+    /// Whether the detectors suspect it now: suspected, or its stop announced, until a heartbeat
+    /// trusts it or its next run's comes (hyper-liveness's changes).
+    suspect: bool,
 }
 
 /// A chunk put or get this node asked of a peer, out on an exchange.
@@ -982,6 +985,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 ended: 0,
                 suspected: 0,
                 refusal: None,
+                suspect: false,
             })
             .collect();
         let mut node = Self {
@@ -1714,6 +1718,22 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 && let Some(remote) = self.remotes.iter_mut().find(|r| r.id == suspicion.peer)
             {
                 remote.suspected = remote.suspected.saturating_add(1);
+            }
+            let judged = match &change {
+                Change::Suspected(suspicion) => Some((suspicion.peer, true)),
+                Change::Stopped { peer, .. } => Some((*peer, true)),
+                Change::Trusted { peer, .. } | Change::Restarted { peer, .. } => {
+                    Some((*peer, false))
+                }
+                _ => None,
+            };
+            if let Some((peer, suspect)) = judged {
+                if let Some(remote) = self.remotes.iter_mut().find(|r| r.id == peer) {
+                    remote.suspect = suspect;
+                }
+                if suspect {
+                    self.end_chunk_gets(peer);
+                }
             }
             self.owner.believe(&change);
             self.liveness_moved = true;
@@ -2718,6 +2738,29 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// Gives back the room a chunk put being read on `exchange` held, the exchange gone.
+    /// Ends the chunk reads out to `peer`, which the detectors now suspect: each read lost at once,
+    /// so its get asks another copy rather than waiting out the transport's judgement of a peer
+    /// that may be gone, two idle timeouts, as long as its client waits for the object (node.md
+    /// §2.4). Puts wait on: a put a suspicion ended would be one lost to a detector's mistake,
+    /// which a loaded host makes, and its object refused.
+    fn end_chunk_gets(&mut self, peer: PeerId) {
+        let mut ended = Vec::new();
+        self.chunks_out.retain(|c| {
+            let read = c.get && c.peer == peer;
+            if read {
+                ended.push((c.exchange, c.asked));
+            }
+            !read
+        });
+        for (exchange, asked) in ended {
+            self.chunks_done
+                .push((asked, ChunkOutcome::Lost(Refusal::Closed)));
+            self.give_back(exchange);
+            self.receiving.retain(|r| r.exchange != exchange);
+            self.driver.endpoint().end(exchange);
+        }
+    }
+
     fn give_back(&mut self, exchange: ExchangeId) {
         for receiving in self.receiving.iter().filter(|r| r.exchange == exchange) {
             if matches!(receiving.what, Arriving::ChunkPut { .. }) {
@@ -2914,6 +2957,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         let asked = self.next_chunk;
         self.next_chunk = asked.wrapping_add(1);
+        // A peer the detectors suspect is read from no more: the chunk is lost at once, and its
+        // get asks another copy (`end_chunk_gets`).
+        if at != self.id && self.remotes.iter().any(|r| r.id == at && r.suspect) {
+            self.chunks_done
+                .push((asked, ChunkOutcome::Lost(Refusal::Closed)));
+            return Ok(asked);
+        }
         if at == self.id {
             let outcome = match self.storage.holds(volume) {
                 None => Some(ChunkOutcome::Refused(chunk::Status::NoVolume)),

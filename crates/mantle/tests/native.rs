@@ -123,7 +123,10 @@ fn mantle_status(dir: &Path, args: &[&str], input: Option<&[u8]>) -> (bool, Vec<
         .unwrap();
     if let Some(input) = input {
         let mut stdin = child.stdin.take().unwrap();
-        stdin.write_all(input).unwrap();
+        // A command that ended before reading all of it closed the pipe: what it said tells why.
+        if let Err(e) = stdin.write_all(input) {
+            assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "{e}");
+        }
     }
     let output = child.wait_with_output().unwrap();
     (output.status.success(), output.stdout, output.stderr)

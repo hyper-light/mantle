@@ -1803,7 +1803,12 @@ answers `503 SlowDown` before any of a body is read. 6. A put's body is read onl
 could refuse it, and `100 Continue` goes then; a refusal goes in its place (§4.5). 7. The host runs
 the drivers as for the native door. 8. `respond.rs` renders the host's typed reply as S3's response:
 §4.4's codes, the listings' and multipart's documents from `mantle_s3::response`, and a get's bytes
-written as the host gives them, its response left unfinished if the host fails past its head.
+written as the host gives them, its response left unfinished if the host fails past its head. A
+job's answers go into the door's channel as it has room: a get whose end finds the channel full,
+the listener behind on its connection, holds the end and goes on answering until it went, and a job
+a refusal moves to draining replies at once (`moved_on`, 2026-10-27; before, a step that found its
+job no longer its own kind ended it, and the listener closed the connection under a response whose
+every byte it had sent, in 4 of 12 runs of `tests/s3.rs` with each process on one CPU).
 Served: CreateBucket, HeadBucket, GetBucketLocation, DeleteBucket, ListBuckets, Put and Get
 BucketVersioning, PutObject, GetObject whole and by range, HeadObject, DeleteObject, ListObjectsV2,
 CreateMultipartUpload, UploadPart, CompleteMultipartUpload, AbortMultipartUpload, ListParts and

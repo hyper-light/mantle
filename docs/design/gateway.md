@@ -594,7 +594,12 @@ alone: a put and a get of 64 and of 1,024 windows peaked at 406,095 and 408,996 
 3,821,063 stated). Every mutation carries its operation's identity, 128 bits from the OS; a request
 is asked again, after RFC 6298's doubling from the measured probe timeout with equal jitter, only
 where no node can have taken it, at most three attempts (the AWS SDKs' standard mode), and one
-whose exchange ended otherwise is the caller's, told whether it was sent whole. A put states its
+whose exchange ended otherwise is the caller's, told whether it was sent whole. An exchange is
+given at least the node's own serve period, the idle timeout a node judges its exchanges stalled by,
+however fast the exchanges the client measured before it: a node may leave a put's body unread that
+long while its driver waits on durable writes (`tests/progress.rs`: a put held a quarter of it is
+answered; under the range client's law alone it was cut `Stalled` within a third of a second, as CI
+found on every target). A put states its
 CRC-64/NVME in a trailer (node.md §4.1), the checksum S3 keeps for an object uploaded without one
 and a full-object value across a multipart upload's parts, and holds the value the node kept to
 it; a get of a whole object is held to a full-object checksum as its bytes arrive, a composite one

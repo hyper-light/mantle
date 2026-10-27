@@ -1143,12 +1143,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.feed_put(at)?;
         // The driver's requests, each asked of what serves it.
         loop {
-            let Some(Job {
-                work: Work::Put(putting),
-                ..
-            }) = self.jobs.get_mut(at)
-            else {
+            let Some(job) = self.jobs.get_mut(at) else {
                 return Ok(true);
+            };
+            let Work::Put(putting) = &mut job.work else {
+                return self.moved_on(at);
             };
             let next = match putting.waiting.pop_front() {
                 Some(request) => Some(request),
@@ -1559,12 +1558,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Ok(true);
         }
         loop {
-            let Some(Job {
-                work: Work::Get(getting),
-                ..
-            }) = self.jobs.get_mut(at)
-            else {
+            let Some(job) = self.jobs.get_mut(at) else {
                 return Ok(true);
+            };
+            let Work::Get(getting) = &mut job.work else {
+                return self.moved_on(at);
             };
             let next = match getting.waiting.pop_front() {
                 Some(request) => Some(request),
@@ -1903,12 +1901,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return self.drain_job(at);
         }
         loop {
-            let Some(Job {
-                work: Work::Complete(completing),
-                ..
-            }) = self.jobs.get_mut(at)
-            else {
+            let Some(job) = self.jobs.get_mut(at) else {
                 return Ok(true);
+            };
+            let Work::Complete(completing) = &mut job.work else {
+                return self.moved_on(at);
             };
             let next = match completing.waiting.pop_front() {
                 Some(request) => Some(request),
@@ -2201,6 +2198,21 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .extend(job.pending.drain(..).map(|(pending, _)| pending));
         }
         Ok(())
+    }
+
+    /// A job a callee moved on within its turn, to draining a refusal (`reply_job`) or to answering
+    /// its last answers while its door's channel has no room for them (`write_get`): that work's turn
+    /// now, so a refusal's reply goes at once, and a job ends only once its last answer went;
+    /// whether it is over. A step that found its job no longer its own kind and ended it dropped
+    /// that reply, and a get's end its channel held: the listener then closed the connection under
+    /// a response whose every byte it had sent.
+    fn moved_on(&mut self, at: usize) -> Result<bool, NodeError> {
+        match self.jobs.get(at).map(|job| &job.work) {
+            None => Ok(true),
+            Some(Work::Draining(_)) => self.drain_job(at),
+            Some(Work::Answering(_)) => self.answer_local(at),
+            Some(_) => Ok(false),
+        }
     }
 
     /// Ends job `at` with `status` alone.

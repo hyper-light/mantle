@@ -965,16 +965,21 @@ impl Client {
         most.unwrap_or_else(bounds::initial_pto)
     }
 
-    /// The progress period an exchange with `node` is given (mantle-node's client's law): the
-    /// time left before `deadline_ns` while nothing is measured, else the slowest exchange measured
-    /// or the path's persistent-congestion duration (RFC 9002 §7.6.1), whichever is longer,
-    /// doubled for each exchange with the node cut by its period since its last reply, within that
-    /// time.
+    /// The progress period an exchange with `node` is given: the time left before `deadline_ns`
+    /// while nothing is measured, else the slowest exchange measured or the path's
+    /// persistent-congestion duration (RFC 9002 §7.6.1), whichever is longer, doubled for each
+    /// exchange with the node cut by its period since its last reply (mantle-node's client's
+    /// law), and never less than the node's own serve period, within that time. A node judges an
+    /// exchange stalled only once it moved nothing for as long as a connection may stay silent, the
+    /// idle timeout (`bounds::limits`), and may pause an object's body that long while its driver
+    /// waits on durable writes: a client cutting it sooner abandons an operation the node would
+    /// finish, and a node that died is found by its connection's idle timeout all the same.
     fn period_ns(&mut self, node: PeerId, deadline_ns: u64, now_ns: u64) -> u64 {
         let left = deadline_ns.saturating_sub(now_ns).max(1);
         let Some(slowest) = self.slowest_ns else {
             return left;
         };
+        let served = u64::try_from(bounds::idle_timeout().as_nanos()).unwrap_or(u64::MAX);
         let congested = self.driver.endpoint().path(node).map_or(0, |path| {
             u64::try_from(
                 bounds::measured_pto(&path)
@@ -989,7 +994,11 @@ impl Client {
             .find(|n| n.id == node)
             .map_or(0, |n| n.stalled);
         let doubling = 1u64.checked_shl(stalled).unwrap_or(u64::MAX);
-        slowest.max(congested).saturating_mul(doubling).min(left)
+        slowest
+            .max(congested)
+            .saturating_mul(doubling)
+            .max(served)
+            .min(left)
     }
 
     fn lost(&mut self, peer: PeerId) {

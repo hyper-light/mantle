@@ -1053,7 +1053,7 @@ impl Cell {
     /// nowhere; init's own output is what the cell is read from: the authority's name and
     /// directory, and each founder's id and directory.
     pub(crate) fn made(args: impl FnOnce(&Path) -> Vec<String>) -> Self {
-        Self::made_started(args, false)
+        Self::made_started(args, false, true)
     }
 
     /// A cell `mantle init` made, its founders started highest id first, each one's configuration
@@ -1061,10 +1061,22 @@ impl Cell {
     /// names a peer by its host: a founder learns on standard input only where the peers started
     /// after it listen.
     pub(crate) fn made_named(args: impl FnOnce(&Path) -> Vec<String>) -> Self {
-        Self::made_started(args, true)
+        Self::made_started(args, true, true)
     }
 
-    fn made_started(args: impl FnOnce(&Path) -> Vec<String>, named: bool) -> Self {
+    /// A cell `mantle init` made, its founders started as [`Cell::made`] starts them, each
+    /// configuration as init wrote it: its nodes pinned and nothing else, so no driver of the
+    /// harness's runs, and its clients are the native protocol's, made by `mantle init client`.
+    pub(crate) fn made_alone(args: impl FnOnce(&Path) -> Vec<String>) -> Self {
+        Self::made_started(args, false, false)
+    }
+
+    /// The directory the cell was made in, `mantle init`'s OUT.
+    pub(crate) fn out(&self) -> PathBuf {
+        self._root.path().join("cell")
+    }
+
+    fn made_started(args: impl FnOnce(&Path) -> Vec<String>, named: bool, drivers: bool) -> Self {
         let root = tempfile::tempdir().unwrap();
         let out = root.path().join("cell");
         let made = Command::new(NODE)
@@ -1137,11 +1149,13 @@ impl Cell {
                 (identity.join("node.der"), identity.join("node.key"), der),
             );
             let config = dir.join("config");
-            let mut text = std::fs::read_to_string(&config).unwrap();
-            for (client, (c, _, _)) in &clients {
-                text.push_str(&format!("peer = {client} gateway {}\n", c.display()));
+            if drivers {
+                let mut text = std::fs::read_to_string(&config).unwrap();
+                for (client, (c, _, _)) in &clients {
+                    text.push_str(&format!("peer = {client} gateway {}\n", c.display()));
+                }
+                std::fs::write(&config, text).unwrap();
             }
-            std::fs::write(&config, text).unwrap();
             made.insert(*id, config);
         }
         let pki = Pki {

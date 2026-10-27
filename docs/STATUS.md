@@ -324,10 +324,36 @@ images now (2.38.3 and 2.38.4 on 2026-10-26), on Linux (2.37.13) and macOS (2.36
 images move past it. `mantle bench s3` measures the listener's own cost
 (measurements/2026-10-25-s3-listener.md).
 
+Clients of mantle's own protocol reach the same operations over QUIC through the native client
+library, `mantle-client`, and `mantle`'s object commands, its command line (gateway design §6). The
+native protocol's messages, classes and transport bounds are a crate of their own,
+`mantle-protocol`, which the node and the client share; the client depends on none of the engine,
+the ranges or the chunk store (`cargo tree -p mantle-client`). A client is made by `mantle init
+client NAME --cell OUT`: a certificate under the cell's authority for the client role, `client-ID`
+acting for the cell's account with `extKeyUsage` clientAuth alone, and an owner-only key; nodes admit
+it by that certificate and pin no client, its operations acting for the account the cell's access
+keys act for, a node that hosts objects admitting `gateway.clients` of them at once beside its pinned
+peers and refusing one past them as an identity past its transport's bound, and a client sending
+objects alone, never a range's command (node design §3.6; research/73). A put streams from a source
+and a get into a sink a piece at a time within the client's stated memory (a put and a get of 1,024
+windows peaked at 408,996 bytes of the 3,821,063 stated, `crates/client/tests/heap.rs`); every
+mutation carries its identity, a request is asked again only where no node can have taken it, at
+most three attempts, and a put states its CRC-64/NVME in a trailer the node checks before commit,
+a whole get held to the full-object checksum kept. Through the library and the command line,
+against a cell of three `mantle init` made whose nodes pin each other alone: buckets made, headed,
+listed, versioned and removed; objects put from memory, files and standard input (in 8 MiB parts
+past one), got whole, by range, to files and to standard output, headed, listed with the account as
+their owner and removed; multipart uploads created, their parts put from files and standard input,
+listed, completed into one full-object checksum and aborted, each byte read back identical; and a
+client certificate another authority issued, or the cell's for a node presented as a client's,
+refused at its handshake (`crates/mantle/tests/native.rs`).
+
 Remaining before it is done:
 
 - The windows a gateway admits, from its memory and measured latency; the rates of the paths
   measured on an idle machine.
+- The native client's journal and resumable uploads in server-cut runs (gateway design §2.1, §6),
+  and the rest of planned item 12.
 - The HTTP/1.1 listener's remaining parts: the operations beyond the node's own set (copies, tags, ACLs, CORS, lifecycle, policies, object
   lock, encryption settings, DeleteObjects, ListObjects v1 and ListObjectVersions answer `501`
   there), an object's stored headers (`Content-Type`, `x-amz-meta-*`), bucket policies judged on
@@ -670,7 +696,9 @@ passes on all six CI targets.
 
 ### Third: establish a real laptop serving baseline
 
-12. **The native protocol and the client library and CLI**: S3's operations natively, credits,
+12. **The native protocol and the client library and CLI**, of which S3's operations natively,
+    streamed within the client's memory, and the client admitted by its certificate are built
+    (above); the rest: credits,
     typed refusals and the admission level, the server's upload plan, per-block GET streams with
     CRC-64/NVME, migration on interface change, TLS session resumption without early data, the
     TLS-over-TCP route, and the journal with its flush rules (node.md §3.9, §4.1; gateway.md §3,

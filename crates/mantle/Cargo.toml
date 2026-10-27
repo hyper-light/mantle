@@ -36,7 +36,10 @@ hyper-rt = { path = "../../vendor/hyper-rt" }
 hyper-tls = { path = "../../vendor/hyper-tls" }
 mantle-meta = { path = "../meta" }
 mantle-node = { path = "../node" }
-# The native protocol's object messages, which `mantle bench s3`'s stub host answers.
+# The native protocol's client, whose command line the object commands are (src/client.rs).
+mantle-client = { path = "../client" }
+# The native protocol's object messages, which `mantle bench s3`'s stub host answers and the object
+# commands ask.
 mantle-protocol = { path = "../protocol" }
 mantle-s3 = { path = "../s3" }
 

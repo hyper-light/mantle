@@ -25,6 +25,7 @@ mod bench_http;
 mod bench_log;
 mod bench_meta;
 mod bench_s3;
+mod client;
 mod disk;
 mod display;
 mod drive;
@@ -41,6 +42,10 @@ mod init;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// The client directory `mantle init client` made, whose client the object commands ask the
+    /// cell as; `MANTLE_CLIENT` where none is given.
+    #[arg(long, global = true)]
+    client: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -67,9 +72,13 @@ enum Command {
     /// of the operator's statements (docs/design/node.md §1.5). One founder makes a cell of one in
     /// OUT, measured now; several make OUT/authority, to keep, and OUT/node-ID for each founder, to
     /// move to its host.
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
     Init {
+        #[command(subcommand)]
+        what: Option<InitCommand>,
         /// An empty or missing directory to make the cell in.
-        out: PathBuf,
+        #[arg(required = true)]
+        out: Option<PathBuf>,
         /// A founder: quic=ADDR,plane=ADDR,s3=ADDR,name=HOST,domain=NAME,volume=DIR:SIZE,
         /// memory=SIZE (s3 its S3 endpoint's address, its QUIC address unless stated; a name, a
         /// DNS name its S3 clients dial, and a volume repeatable; sizes in bytes or with a K, M, G
@@ -102,6 +111,26 @@ enum Command {
         /// The node's configuration: the operator's keys only, one `key = value` a line.
         config: PathBuf,
     },
+    /// Make a bucket, s3://BUCKET, asked of the cell over its native protocol as the client of
+    /// --client (each object command does).
+    Mb { bucket: String },
+    /// Remove a bucket, s3://BUCKET, once it holds nothing.
+    Rb { bucket: String },
+    /// List the buckets, or a bucket's keys under a prefix a level of `/` at a time:
+    /// [s3://BUCKET[/PREFIX]].
+    Ls { at: Option<String> },
+    /// Copy an object's bytes from a file or standard input (-) to s3://BUCKET/KEY, or back to a
+    /// file or standard output (-). A file is the whole object or untouched.
+    Cp { from: String, to: String },
+    /// Remove an object, s3://BUCKET/KEY.
+    Rm { at: String },
+    /// An object's facts, s3://BUCKET/KEY: its size, ETag, date, version and checksum.
+    Head { at: String },
+    /// A multipart upload's steps, each one of S3's operations.
+    Multipart {
+        #[command(subcommand)]
+        step: MultipartCommand,
+    },
     /// Estimate how likely a block is to be lost in a year under each scheme mantle can store
     /// it in, and the scheme that meets the durability target at least cost.
     Durability {
@@ -129,6 +158,48 @@ enum Command {
         #[arg(long, default_value_t = 1e-11)]
         target: f64,
     },
+}
+
+#[derive(Subcommand)]
+enum InitCommand {
+    /// A client of the cell's native protocol: its certificate under the cell's authority, a
+    /// client's alone (`client-ID`, acting for the cell's account), its owner-only key, and the
+    /// directory NAME of its identity and config, which the object commands read (--client NAME).
+    Client {
+        /// An empty or missing directory to make the client in.
+        name: PathBuf,
+        /// The directory `mantle init` made the cell in, which holds its authority.
+        #[arg(long)]
+        cell: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum MultipartCommand {
+    /// CreateMultipartUpload of s3://BUCKET/KEY; says the upload's ID.
+    Create { at: String },
+    /// UploadPart: part NUMBER of UPLOAD from a file, or from standard input (-) with its
+    /// --length; says the number and the part's ETag.
+    Put {
+        at: String,
+        upload: String,
+        number: u16,
+        from: String,
+        #[arg(long)]
+        length: Option<u64>,
+    },
+    /// CompleteMultipartUpload of the parts listed, each NUMBER=ETAG, in ascending order.
+    Complete {
+        at: String,
+        upload: String,
+        parts: Vec<String>,
+    },
+    /// AbortMultipartUpload.
+    Abort { at: String, upload: String },
+    /// ListParts of UPLOAD.
+    Parts { at: String, upload: String },
+    /// ListMultipartUploads of s3://BUCKET.
+    Uploads { bucket: String },
 }
 
 #[derive(Subcommand)]
@@ -366,6 +437,97 @@ fn parse_zones(text: &str) -> Result<(usize, f64), String> {
     }
 }
 
+/// The object command `command` names, or none for any other command; refused where its places do
+/// not read.
+fn object_command(command: &Command) -> Option<Result<client::Command, String>> {
+    let at = |text: &str| {
+        client::location(text).ok_or_else(|| format!("{text}: not s3://BUCKET or s3://BUCKET/KEY"))
+    };
+    let object = |text: &str| {
+        at(text).and_then(|l| {
+            if l.key.is_empty() {
+                Err(format!("{text}: names no key"))
+            } else {
+                Ok(l)
+            }
+        })
+    };
+    let bucket = |text: &str| {
+        at(text).and_then(|l| {
+            if l.key.is_empty() {
+                Ok(l.bucket)
+            } else {
+                Err(format!("{text}: a bucket names no key"))
+            }
+        })
+    };
+    Some(match command {
+        Command::Mb { bucket: b } => bucket(b).map(client::Command::MakeBucket),
+        Command::Rb { bucket: b } => bucket(b).map(client::Command::RemoveBucket),
+        Command::Ls { at: None } => Ok(client::Command::List(None)),
+        Command::Ls { at: Some(text) } => at(text).map(|l| client::Command::List(Some(l))),
+        Command::Cp { from, to } => Ok(client::Command::Copy(
+            client::place(from),
+            client::place(to),
+        )),
+        Command::Rm { at: text } => object(text).map(client::Command::Remove),
+        Command::Head { at: text } => object(text).map(client::Command::Head),
+        Command::Multipart { step } => match step {
+            MultipartCommand::Create { at: text } => {
+                object(text).map(client::Command::CreateUpload)
+            }
+            MultipartCommand::Put {
+                at: text,
+                upload,
+                number,
+                from,
+                length,
+            } => object(text).map(|at| client::Command::UploadPart {
+                at,
+                upload: upload.clone(),
+                number: *number,
+                from: client::place(from),
+                length: *length,
+            }),
+            MultipartCommand::Complete {
+                at: text,
+                upload,
+                parts,
+            } => object(text).and_then(|at| {
+                let mut listed = Vec::with_capacity(parts.len());
+                for part in parts {
+                    let (number, etag) = part
+                        .split_once('=')
+                        .ok_or_else(|| format!("{part}: not NUMBER=ETAG"))?;
+                    let number = number
+                        .parse()
+                        .map_err(|_| format!("{part}: a part's number"))?;
+                    listed.push((number, etag.trim_matches('"').to_owned()));
+                }
+                Ok(client::Command::Complete {
+                    at,
+                    upload: upload.clone(),
+                    parts: listed,
+                })
+            }),
+            MultipartCommand::Abort { at: text, upload } => {
+                object(text).map(|at| client::Command::Abort {
+                    at,
+                    upload: upload.clone(),
+                })
+            }
+            MultipartCommand::Parts { at: text, upload } => {
+                object(text).map(|at| client::Command::Parts {
+                    at,
+                    upload: upload.clone(),
+                })
+            }
+            MultipartCommand::Uploads { bucket: b } => bucket(b).map(client::Command::Uploads),
+        },
+        _ => return None,
+    })
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     // A node writes its lines through the runtime's own writer thread: this thread holds no
@@ -379,11 +541,37 @@ fn main() -> ExitCode {
         }
         _ => {}
     }
+    // An object command writes its lines a lock at a time: a copy to standard output writes its
+    // bytes through the runtime's own writer thread.
+    if let Some(command) = object_command(&cli.command) {
+        let ran = command.and_then(|command| {
+            let dir = cli
+                .client
+                .clone()
+                .or_else(|| std::env::var_os("MANTLE_CLIENT").map(PathBuf::from))
+                .ok_or_else(|| "no client: --client DIR or MANTLE_CLIENT".to_owned())?;
+            client::run(&dir, command, std::io::stdout()).map_err(|e| e.to_string())
+        });
+        return exit(ran);
+    }
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let result = match cli.command {
-        Command::Node { .. } | Command::Serve { .. } => Ok(()),
+        Command::Node { .. }
+        | Command::Serve { .. }
+        | Command::Mb { .. }
+        | Command::Rb { .. }
+        | Command::Ls { .. }
+        | Command::Cp { .. }
+        | Command::Rm { .. }
+        | Command::Head { .. }
+        | Command::Multipart { .. } => Ok(()),
         Command::Init {
+            what: Some(InitCommand::Client { name, cell }),
+            ..
+        } => init::client(&mut out, &name, &cell).map_err(|e| e.to_string()),
+        Command::Init {
+            what: None,
             out: dir,
             nodes,
             founders,
@@ -391,15 +579,18 @@ fn main() -> ExitCode {
             max_volumes,
             target,
             region,
-        } => stated_cell(
-            founders.as_deref(),
-            &nodes,
-            (max_nodes, max_volumes, target),
-            region.as_deref(),
-        )
-        .and_then(|cell| init::init(&mut out, &dir, &cell))
-        .map(|_| ())
-        .map_err(|e| e.to_string()),
+        } => match dir {
+            Some(dir) => stated_cell(
+                founders.as_deref(),
+                &nodes,
+                (max_nodes, max_volumes, target),
+                region.as_deref(),
+            )
+            .and_then(|cell| init::init(&mut out, &dir, &cell))
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
+            None => Err("init OUT, or init client NAME --cell OUT".to_owned()),
+        },
         Command::Disk {
             command:
                 DiskCommand::Probe {

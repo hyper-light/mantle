@@ -498,8 +498,8 @@ while the machine's key matches it (`process::calibration`), and each volume's d
 profile under the device directory's lock; founders of a larger cell are measured at their first
 `mantle serve` on their own hosts. Tested by serving from what it writes: a cell of one from one
 `--node`, and a cell of three from a machines file's two founders and a `--node`'s, each enlisting
-and serving objects (`crates/mantle/tests/serve.rs`). Native clients are issued by the authority's
-key and pinned by a `peer` line, as the tests do; `mantle init client` is still to build.
+and serving objects (`crates/mantle/tests/serve.rs`). Native clients are made by `mantle init client`
+and pinned by no node (below, 2026-10-26).
 
 *As built (2026-10-25): the S3 endpoint's key and certificates.* `mantle init` gives the cell its
 first account, twelve digits, and its one access key, an id of twenty characters of RFC 4648's
@@ -529,6 +529,19 @@ founder and one signed with another secret refused `SignatureDoesNotMatch`, an e
 every endpoint's certificate verifying under the profile's PEM for each name its clients dial), and
 in `tests/serve.rs` (each node says the profile's key; an exposed one refuses the start at its
 identity step).
+
+*As built (2026-10-26): clients of the native protocol.* `mantle init` keeps beside the authority's
+key a `cell` file of what a client needs: the authority's name, the account its clients act for
+(the cell's access keys' account) and each founder's id and QUIC address. `mantle init client NAME
+--cell OUT` draws the client's id from the OS, nonzero and no founder's, issues its certificate
+under the authority (`mantle_cert::client`: its subject's common name `client-ID`, its organization
+the account, `extKeyUsage` clientAuth alone, §3.6), checks it issued by that authority as a start
+checks a node's, and writes NAME: `identity/` (the authority's certificate, the client's and its
+key, owner-only as a node's) and `config` (its id, those files and a `node = ID ADDR` line for each
+founder), which `mantle`'s object commands read (gateway.md §6). No node's configuration names a
+client: a `peer` line naming one is refused at its line. Tested by a cell of three `mantle init`
+made, whose configurations pin their nodes alone, served by a client it made, through the library
+and the command line (`crates/mantle/tests/native.rs`).
 
 **Joining.** An existing node mints an invitation (`mantle invite`): a one-time token recorded
 in the root range, so the log decides whether it was used. `mantle init --join` sends the token
@@ -1464,12 +1477,36 @@ connections, as focal re-checks its registry (07 §4.1).
 
 A role permits classes: a range host sends control and replication for ranges it hosts; a
 gateway sends requests to ranges and volumes and never a Raft message; a storage node answers
-chunk requests. A Raft message's sender must be the node its certificate names, as focal's
+chunk requests; a client asks for objects alone, never a range's command or read, which write and
+read metadata rows directly and are a gateway's to send once it has judged the client's operation. A Raft message's sender must be the node its certificate names, as focal's
 `step_authenticated` binds `from` to the certificate (07 §2.2), and must be a member of the
 range's configuration or a learner it is adding. Node identity authenticates the peer; the
 range, its descriptor generation and the operation's identity in each frame decide whether a
 message may act (audit §11.8), and a range refuses a frame from a term or generation it has
 left (architecture §5).
+
+**Decided (2026-10-26): a client is known by its name under the authority, pinned by no node**
+(research/73, closing §11's open item for clients). A client's certificate is the authority's
+leaf for a connection's client end alone (`extKeyUsage` clientAuth): RFC 5280 §4.2.1.12 lets a
+certificate listing purposes serve those alone, and webpki refuses at a server's verification one
+whose list omits serverAuth, so it never serves as a node's. Its subject names it: its common name
+`client-ID`, the transport's identity, and its organization the account it acts for, as Kubernetes
+names a user and its groups. A node's directory pins nodes and gateways by certificate as before,
+and takes a certificate it does not pin, verified for clientAuth under the authority at the
+handshake, as a client's when its extensions are exactly the client profile's and its names read
+(`mantle_cert::client_names`), unless its id is a pinned peer's or one held under another account.
+A client's object operations act for that account, the principal the cell's access keys act for on
+the S3 listener, so a bucket either door makes is the account's (S3 owns buckets by account); the
+directory keeps each admitted client's account while the transport holds a connection of it,
+pruned whenever the node's connections move, within the identities and handshakes the transport
+admits. A node that hosts objects admits `gateway.clients` clients at once (at the floor, as many
+as its operations, §1.4), each an identity of its transport beside its pinned peers, so clients
+cannot take a node's identity from its cell; `Directory::identify` can refuse only as a certificate
+refused, which a client cannot tell from one another authority issued, so the node closes a client
+past its bound once its connection is up, refused `Identities`, which a client asks again after
+(`crates/node/src/directory.rs`, `node.rs`). Tested by a cell of three (`crates/mantle/tests/
+native.rs`): a client certificate another authority issued is refused at its handshake, and so is
+the cell's authority's certificate for a node presented as a client's.
 
 ### 3.7 Defenses
 
@@ -1700,6 +1737,16 @@ requests are taken one at a time, each at the octet its last one's body ended. T
 TLS 1.3 and over TLS 1.2 alone, its certificate verified under the endpoint authority for the name
 dialed, HTTP/1.1 chosen over an offered HTTP/2, an ECDHE-ECDSA AES-GCM suite on TLS 1.2, and a
 request answered over each.
+
+*As built (2026-10-26), the native protocol's messages* (`crates/protocol`, `mantle-protocol`): the
+kinds of message and their classes, the transport's bounds and an object's request and reply, which
+the node and its clients share, so a client depends on none of the engine, the ranges or the chunk
+store. An object request's head carries, beside its kind, fields' length, identity and a put's
+length, the algorithm of the checksum a put's trailer brings after its bytes (0 for none), so the
+body's exact length is known before any field is read and a client that streams a source it reads
+once states the checksum at its end, as aws-chunked's trailer does; the node feeds its driver the
+object's bytes alone and checks the trailer's value before anything commits (`BadDigest`
+otherwise). The listener's aws-chunked trailer travels on the same field.
 
 ### 4.2 A request's path
 
@@ -2621,8 +2668,9 @@ range's workload (12 §6.6).
 
 - **Each class's share above its floor** (§1.4): the knee where a class's throughput stops growing
   as its share grows, measured at the scale step, decides what a budget above the floor buys.
-- **A peer known by its name under the authority** rather than by its pinned certificate (§1.5,
-  §3.6), once the root range keeps the cell's membership and a join records each new identity.
+- **A node or a gateway known by its name under the authority** rather than by its pinned
+  certificate (§1.5, §3.6), once the root range keeps the cell's membership and a join records
+  each new identity. Clients are so known (§3.6, 2026-10-26).
 - **Cores among pools.** Three pools sized to the granted cores oversubscribe under full load;
   whether dividing cores by measured demand does better is measured once phase A runs.
 - **Quiescing idle ranges**, and the protocol that wakes one without weakening its election or

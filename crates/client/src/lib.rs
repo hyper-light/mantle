@@ -20,9 +20,11 @@
 //! each attempt carries unchanged (gateway.md §2.1). A request is asked again, after a pause, only
 //! when no node can have taken it: its connection refused at the node's admission, or its exchange
 //! given no stream (`Refusal::Unsent`), none of its body taken by the transport; at most
-//! [`ATTEMPTS`] times. An exchange that ended otherwise without a reply is the caller's:
-//! [`ClientError::Lost`] says whether the request was sent whole, after which a mutation may have
-//! been applied, and asking it again with its identity is answered from what it made.
+//! [`ATTEMPTS`] times. A client whose certificate a node refused, or refused at admission once its
+//! body's bytes were handed over, is told so ([`ClientError::Refused`]): nothing was applied. An
+//! exchange that ended otherwise without a reply is the caller's: [`ClientError::Lost`] says
+//! whether the request was sent whole, after which a mutation may have been applied, and asking it
+//! again with its identity is answered from what it made.
 //!
 //! **What it checks.** The transport checks each body's CRC-32C on the way (node.md §3.2). A put
 //! whose op names a trailer states its checksum after its bytes, computed as they are sent, which
@@ -50,15 +52,18 @@ use std::time::Duration;
 
 use hyper_rt::combine::{Either, Either3, race2, race3};
 use hyper_rt_transport::Driver;
-use hyper_transport::tls::{Credentials, Tls};
+use hyper_transport::tls::Tls;
 use hyper_transport::{
-    Authenticated, Config, Directory, Endpoint, Epoch, Event, ExchangeId, Fixed, PeerId, Progress,
-    Refusal,
+    Authenticated, Config, Directory, Endpoint, Epoch, Event, ExchangeId, Fixed, Progress,
 };
 use mantle_protocol::bounds::{self, Stated};
 use mantle_protocol::classes::{self, Bounds, Class, Kind, NodeClasses, Role};
 use mantle_protocol::object::{self, ObjectError, Op, Reply, ReplyHead};
 use mantle_s3::checksum::{Algorithm, Checksum, Hasher};
+
+/// What [`Settings`] and the client's answers name, so a caller needs none of the transport's own.
+pub use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer};
+pub use hyper_transport::{PeerId, Refusal};
 
 /// The piece a body is read and written in: the transport's own receive chunk.
 pub const PIECE: usize = hyper_transport::RECEIVE_CHUNK;
@@ -112,7 +117,7 @@ pub enum ClientError {
     Sink(std::io::Error),
     #[error("the source held {read} bytes or more, not the {stated} stated")]
     Length { stated: u64, read: u64 },
-    #[error("the node refused the connection: {0:?}")]
+    #[error("the node refused the client, and took nothing: {0:?}")]
     Refused(Refusal),
     #[error("asked {ATTEMPTS} times, each refused before a node took it, the last {0:?}")]
     Untaken(Refusal),
@@ -1149,11 +1154,16 @@ fn took_from_source<S>(
 }
 
 /// What an exchange that ended unanswered with `refusal` came to, `sent` of its body's bytes taken
-/// by the transport: asked again where no node can have taken it, none of the source's bytes
-/// handed over; else lost, whole once every byte was.
+/// by the transport. Refused at the node's admission, or its certificate refused, the node took
+/// nothing: TLS 1.3's client authenticates after the server's Finished (RFC 8446 §4.4), so a
+/// connection the client took as up may be refused with its first request sent. Such a request is
+/// asked again where none of the source's bytes were handed over, and else refused, as a once-read
+/// source cannot give them again. Any other end is lost, whole once every byte was sent.
 fn ended(refusal: Refusal, sent: u64, (fields, body): (u64, u64)) -> Attempt {
     if untaken(refusal) && sent <= fields {
         Attempt::Untaken(refusal)
+    } else if untaken(refusal) || refusal == Refusal::Identity {
+        Attempt::Refused(refusal)
     } else {
         Attempt::Lost {
             refusal,
@@ -1194,12 +1204,16 @@ mod tests {
         ] {
             assert!(matches!(ended(refusal, 0, (10, 100)), Attempt::Untaken(_)));
             assert!(matches!(ended(refusal, 10, (10, 100)), Attempt::Untaken(_)));
+            assert!(matches!(ended(refusal, 11, (10, 100)), Attempt::Refused(_)));
+        }
+        // A certificate refused: nothing taken, and asking again changes nothing.
+        for sent in [0, 11, 100] {
             assert!(matches!(
-                ended(refusal, 11, (10, 100)),
-                Attempt::Lost { whole: false, .. }
+                ended(Refusal::Identity, sent, (10, 100)),
+                Attempt::Refused(Refusal::Identity)
             ));
         }
-        for refusal in [Refusal::Closed, Refusal::Stalled, Refusal::Identity] {
+        for refusal in [Refusal::Closed, Refusal::Stalled] {
             assert!(matches!(
                 ended(refusal, 0, (10, 100)),
                 Attempt::Lost { whole: false, .. }

@@ -691,6 +691,7 @@ dependencies = [
  "hyper-transport",
  "mantle-cert",
  "mantle-chunk",
+ "mantle-client",
  "mantle-crc",
  "mantle-disk",
  "mantle-ec",

@@ -581,3 +581,47 @@ the server shows the first had no effect (research/30 §9, D16). A changed sourc
 attempts ends in `BadDigest` or a new operation, never a committed wrong object. A Wi-Fi to
 cellular switch emulated with two interfaces mid-upload continues on the same connection, or
 resumes from the durable offset with no committed run sent again (research/30 D14).
+
+*As built (2026-10-26).* The library is `crates/client` (`mantle-client`), depending on hyper-rt,
+hyper-transport, the native protocol's messages (`mantle-protocol`) and S3's semantics
+(`mantle-s3`), and on none of the engine, the ranges or the chunk store. It asks S3's bucket,
+object and multipart operations of a cell's nodes (`Client::call`, `put`, `get`), one exchange at a
+time on one connection a node. A put's body comes from a `Source` and a get's bytes go to a
+`Sink`, a piece at a time, the transport polled while either waits, so the client's memory is its
+transport's budget, what the transport holds beside it, the longest messages and one piece, and
+does not grow with an object (`mantle_client::memory`; `tests/heap.rs` counts the client's thread
+alone: a put and a get of 64 and of 1,024 windows peaked at 406,095 and 408,996 bytes of the
+3,821,063 stated). Every mutation carries its operation's identity, 128 bits from the OS; a request
+is asked again, after RFC 6298's doubling from the measured probe timeout with equal jitter, only
+where no node can have taken it, at most three attempts (the AWS SDKs' standard mode), and one
+whose exchange ended otherwise is the caller's, told whether it was sent whole. A put states its
+CRC-64/NVME in a trailer (node.md §4.1), the checksum S3 keeps for an object uploaded without one
+and a full-object value across a multipart upload's parts, and holds the value the node kept to
+it; a get of a whole object is held to a full-object checksum as its bytes arrive, a composite one
+passed unchecked as botocore passes it (research/73). It presents its certificate, a client's
+under the cell's authority (node.md §3.6), and neither compresses its certificate nor asks the
+node's compressed.
+
+The CLI is `mantle`'s object commands, run as the client of a directory `mantle init client` made
+(`--client DIR` or `MANTLE_CLIENT`; `crates/mantle/src/client.rs`): `mb` and `rb`, `ls` of the
+buckets or of a bucket's keys a level of `/` at a time, `cp` from a file or standard input to
+`s3://BUCKET/KEY` and back to a file or standard output, `rm`, `head`, and `multipart` `create`,
+`put` (a part from a file, or standard input with its length), `complete`, `abort`, `parts` and
+`uploads`. It runs one shard on the machine's calibration kept in the client's directory, files
+read and written on one worker of hyper-rt's blocking pool and standard input and output on
+hyper-rt's own threads, so a slow disk or pipe stalls no connection. A file is put in one stream,
+or in parts past one put's 5 GiB; standard input, whose length is not known before its bytes, in
+parts of the AWS CLI's 8 MiB, each read whole first, since a part states its length before its
+bytes. A copy to a file is written under a temporary name beside it, flushed, renamed and its
+directory flushed, so the file is the whole object or untouched; an object past one put's bytes is
+got in ranges of its headed version, held together to its full-object checksum. Tested against a
+cell of three `mantle init` made (`crates/mantle/tests/native.rs`): through the library, buckets
+made, headed, listed and versioned, an object streamed and got whole and by range, a multipart
+upload completed and got with one full-object checksum, another aborted, the keys listed with the
+cell's account as their owner, and one removed; through the command line, the same operations
+including copies from and to files, standard input past a part and standard output, each byte
+read back identical.
+
+Not yet built: the journal and resumable uploads in server-cut runs (§2.1; the plan's next
+step), credits and the admission level, the server's upload plan, path adaptation and migration,
+per-block GET streams, the validated caches, and the TLS-over-TCP route.

@@ -2,8 +2,8 @@
 
 Status: research note, 2026-10-26. For the client of mantle's native protocol and its admission at
 a node (gateway.md §6, node.md §3.6; `crates/client`, `crates/node/src/directory.rs`,
-`crates/cert`). Sources [1] to [9] were read from documents and source code, each quoted where it
-was read.
+`crates/cert`, `crates/mantle/src/client.rs`). Sources [1] to [10] were read from documents and
+source code, each quoted where it was read.
 
 ## The questions
 
@@ -80,6 +80,12 @@ uncompressed.
 mantle-node's `tests/transport_memory.rs`; an Ed25519 certificate of this profile is a few hundred
 bytes (`crates/cert`).
 
+[10] AWS CLI Command Reference, "AWS CLI S3 Configuration",
+https://docs.aws.amazon.com/cli/latest/topic/s3-config.html: `multipart_threshold`, "Default -
+`8MB`"; `multipart_chunksize`, "Default - `8MB`", "Minimum For Uploads - `5MB`": "Once the S3
+commands have decided to use multipart operations, the file is divided into chunks. This
+configuration option specifies what the chunk size (also referred to as the part size) should be."
+
 ## Findings and decisions
 
 **A client's certificate is a leaf for clientAuth alone, named by its subject.** [1] lets a
@@ -135,6 +141,11 @@ parts [6], so a multipart object's checksum stays one value of its bytes.
 **A get is held to a full-object checksum, not to a composite one.** A composite value combines the
 parts' checksums and is no checksum of the bytes; botocore passes such a response unchecked [7],
 and so does the client. A range is not checked against the whole object's value.
+
+**Standard input is put in the AWS CLI's parts.** A part states its length before its bytes, so a
+source whose length is unknown until its end is read a part at a time, each whole before it is
+sent: the command line's parts are the AWS CLI's default 8 MB [10], above S3's 5 MB least part
+but the last, and its memory for such a copy one part.
 
 **Certificates are not compressed between a client and a node.** Compression is optional and
 offered by a side's advertisement [8]; brotli's compression of one certificate took 34 MB against a

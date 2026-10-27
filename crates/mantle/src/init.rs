@@ -28,6 +28,15 @@
 //! For the operator it writes OUT/s3: the key as AWS's shared credentials file, a config naming the
 //! endpoint where init can name it, and the endpoint's authority as PEM for that config's
 //! `ca_bundle`.
+//!
+//! Beside the authority's key it keeps `cell`, what a client of the native protocol needs: the
+//! authority's name, the account its clients act for, and each founder's id and QUIC address.
+//! `mantle init client NAME --cell OUT` ([`client`]) issues a client its certificate under the
+//! authority (`mantle_cert::client`: `client-ID`, that account, clientAuth alone) and an owner-only
+//! key, and writes the client's directory NAME: `identity/` (the authority's certificate, the
+//! client's own and its key) and `config` (its id, those files, and a `node = ID ADDR` line for
+//! each founder), which `mantle`'s object commands read. No node's configuration names a client:
+//! nodes admit one by its certificate (node.md §3.6).
 
 use std::fmt;
 use std::io::Write;
@@ -50,6 +59,23 @@ use crate::files;
 /// notAfter SHOULD be assigned the GeneralizedTime value of 99991231235959Z", in Unix seconds.
 /// Certificates are not yet rotated (node.md §1.5): until they are, none expires.
 const NO_EXPIRY: u64 = 253_402_300_799;
+
+/// The file beside the authority's key that says what a client of the native protocol needs: the
+/// authority's name, the account its clients act for, and each founder's id and QUIC address.
+const CELL: &str = "cell";
+
+/// The cell file's text for the authority named `authority`, `account`, and each founder and id.
+fn cell_file<'a>(
+    authority: &str,
+    account: &str,
+    founders: impl Iterator<Item = (&'a Founder, &'a u64)>,
+) -> String {
+    let mut text = format!("authority = {authority}\naccount = {account}\n");
+    for (founder, id) in founders {
+        text.push_str(&format!("node = {id} {}\n", founder.quic));
+    }
+    text
+}
 
 /// The founding ranges' layers, a range of each (node.md §1.5).
 const LAYERS: [Layer; 5] = [
@@ -732,6 +758,15 @@ pub fn init(said: &mut impl Write, out: &Path, cell: &Cell) -> Result<(), Error>
         files::create_dir(&authority_dir.join("keys"))?;
         files::write_secret(&authority_dir.join("keys").join("1"), &root_key)?;
     }
+    files::write(
+        &authority_dir.join(CELL),
+        cell_file(
+            &authority_name,
+            &access.account,
+            cell.founders.iter().zip(&ids),
+        )
+        .as_bytes(),
+    )?;
     writeln!(said, "cell {authority_name}")?;
     writeln!(
         said,
@@ -832,6 +867,113 @@ pub fn init(said: &mut impl Write, out: &Path, cell: &Cell) -> Result<(), Error>
             Ok(())
         }
     }
+}
+
+/// A client of the native protocol for the cell `mantle init` made in `cell`, its directory made at
+/// `out` (node.md §1.5, §3.6): its id drawn from the OS, nonzero and no founder's; its certificate
+/// issued under the cell's authority, `client-ID` acting for the cell's account, a connection's
+/// client end alone (`mantle_cert::client`); its key, owner-only; the authority's certificate,
+/// which its nodes' chain to; and its `config`, naming each founder where it listens.
+pub fn client(said: &mut impl Write, out: &Path, cell: &Path) -> Result<(), Error> {
+    let authority_dir = [cell.join("authority"), cell.join("identity")]
+        .into_iter()
+        .find(|dir| dir.join(CELL).is_file())
+        .ok_or_else(|| {
+            Error::Cell(format!(
+                "{}: no cell file beside an authority's key, as `mantle init` writes one in the \
+                 directory it makes a cell in",
+                cell.display()
+            ))
+        })?;
+    let text = std::fs::read_to_string(authority_dir.join(CELL))?;
+    let mut authority_name = None;
+    let mut account = None;
+    let mut nodes: Vec<(u64, SocketAddr)> = Vec::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let bad = || Error::Cell(format!("the cell file's line does not read: {line}"));
+        let (key, value) = line.split_once('=').ok_or_else(bad)?;
+        match key.trim() {
+            "authority" => authority_name = Some(value.trim().to_owned()),
+            "account" => account = Some(value.trim().to_owned()),
+            "node" => {
+                let (id, quic) = value.trim().split_once(' ').ok_or_else(bad)?;
+                let id = id.parse().map_err(|_| bad())?;
+                let quic = quic.trim().parse().map_err(|_| bad())?;
+                nodes.push((id, quic));
+            }
+            _ => return Err(bad()),
+        }
+    }
+    let (Some(authority_name), Some(account)) = (authority_name, account) else {
+        return Err(Error::Cell(
+            "the cell file names no authority or no account".into(),
+        ));
+    };
+    if nodes.is_empty() {
+        return Err(Error::Cell("the cell file names no node".into()));
+    }
+    match std::fs::read_dir(out) {
+        Ok(mut entries) => {
+            if entries.next().is_some() {
+                return Err(Error::Exists(out.to_path_buf()));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Error::Output(e)),
+    }
+    let cert = |e: mantle_cert::CertError| Error::Cert(format!("{e:?}"));
+    let authority = std::fs::read(authority_dir.join("authority.der"))?;
+    let authority_key = mantle_node::secret::read(&authority_dir.join("authority.key"))
+        .map_err(|e| Error::Cert(e.to_string()))
+        .and_then(|pkcs8| KeyPair::from_pkcs8(&pkcs8).map_err(cert))?;
+    let id = loop {
+        let id = u64::from_le_bytes(random::<8>()?);
+        if id != 0 && !nodes.iter().any(|(node, _)| *node == id) {
+            break id;
+        }
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| Error::Cert(e.to_string()))?
+        .as_secs();
+    let own = KeyPair::generate().map_err(cert)?;
+    let certificate = mantle_cert::client(
+        &authority_key,
+        &authority_name,
+        own.public_key(),
+        (&mantle_protocol::client_name(id), &account),
+        (
+            Validity {
+                not_before: now,
+                not_after: NO_EXPIRY,
+            },
+            Serial::draw().map_err(cert)?,
+        ),
+    )
+    .map_err(cert)?;
+    // Issued under the authority whose certificate the client keeps: the check a node's start
+    // makes of its own (RFC 5280 §6.1.3 (a)).
+    mantle_cert::issued_by(&certificate, &authority, now).map_err(cert)?;
+    let identity = out.join("identity");
+    files::create_dir(&identity)?;
+    files::write(&identity.join("authority.der"), &authority)?;
+    files::write(&identity.join("client.der"), &certificate)?;
+    files::write_secret(&identity.join("client.key"), own.pkcs8())?;
+    let mut config = format!(
+        "id = {id}\nauthority = identity/authority.der\ncertificate = identity/client.der\n\
+         key = identity/client.key\n"
+    );
+    for (node, quic) in &nodes {
+        config.push_str(&format!("node = {node} {quic}\n"));
+    }
+    files::write(&out.join("config"), config.as_bytes())?;
+    writeln!(
+        said,
+        "client {id} {}: account {account}, {} nodes",
+        out.display(),
+        nodes.len()
+    )?;
+    Ok(())
 }
 
 /// A cell of one's host and devices measured now: the machine's calibration record in its

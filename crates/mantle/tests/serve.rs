@@ -29,6 +29,9 @@ mod linear;
 #[allow(dead_code)]
 #[path = "../../node/tests/support/relay.rs"]
 mod relay;
+#[allow(dead_code)]
+#[path = "support/s3.rs"]
+mod s3;
 use cell::*;
 use std::process::{Command, Stdio};
 
@@ -2011,4 +2014,165 @@ fn a_multipart_upload_completes_through_another_node_with_one_killed_between_par
         status(&mut cell, 1, get_op("m", "gone", None)),
         ObjectStatus::NoSuchKey
     );
+}
+
+/// A cell whose stated volumes fill refuses the object it has no room for with the typed answer on
+/// each door, `InsufficientStorage` natively and `507 Insufficient Storage` on the S3 listener,
+/// which stock clients do not retry, where it answered `SlowDown` before (node.md §4.4,
+/// research/75); nothing of the refused objects is readable or listed, and every object
+/// acknowledged before reads back whole. Objects of 32 MiB go through the two doors in turn, each
+/// door its own bucket, until a volume of the cell has no room; three copies of each, one a node,
+/// fill the three volumes together.
+#[test]
+fn a_cell_whose_volumes_fill_refuses_the_next_object_typed_on_both_doors() {
+    let mut cell = Cell::made(three_founders);
+    let ids: Vec<u64> = cell.dirs.keys().copied().collect();
+    for &id in &ids {
+        cell.enlisted(id);
+    }
+    let out = cell.dirs[&ids[0]].parent().unwrap().to_path_buf();
+    let key = s3::Key::of(&out);
+    let mut http: Vec<s3::Client> = ids
+        .iter()
+        .map(|id| {
+            let (at, _) = cell.s3_bound[id];
+            let (_, region, _) = &cell.s3[id];
+            s3::Client::new(at, key.clone(), region)
+        })
+        .collect();
+    let create = Op::Create {
+        bucket: "native".into(),
+        id: 0,
+    };
+    assert_eq!(status(&mut cell, ids[0], create), ObjectStatus::Done);
+    assert_eq!(http[0].send("PUT", "/http", &[], b"").status, 200);
+
+    // Each object through the next door and node in turn: the cell's volumes are stated at 256
+    // MiB, so it takes fewer than nine of 32 MiB before one has no room.
+    const LEN: usize = 32 << 20;
+    let mut acknowledged: Vec<(usize, u64)> = Vec::new();
+    let mut refused = None;
+    for n in 0..9u64 {
+        let data = object_bytes(n, LEN);
+        let at = usize::try_from(n).unwrap() % ids.len();
+        let key = format!("o{n}");
+        let typed = if n % 2 == 0 {
+            let put = put_with("native", &key, u128::from(n) + 1, &data, Headers::default());
+            let (reply, _) = ask(&mut cell, ids[at], put, data);
+            match reply.status {
+                ObjectStatus::Done => None,
+                other => Some(format!("{other:?}")),
+            }
+        } else {
+            let put = http[at].send("PUT", &format!("/http/{key}"), &[], &data);
+            match put.status {
+                200 => None,
+                code => Some(format!("{code} {:?}", put.element("Code"))),
+            }
+        };
+        match typed {
+            None => acknowledged.push((at, n)),
+            Some(said) => {
+                refused = Some((n, said));
+                break;
+            }
+        }
+    }
+    let Some((full, said)) = refused else {
+        panic!("volumes stated at 256 MiB took nine objects of 32 MiB");
+    };
+    let expected = if full % 2 == 0 {
+        "InsufficientStorage".to_owned()
+    } else {
+        "507 Some(\"InsufficientStorage\")".to_owned()
+    };
+    assert_eq!(said, expected, "object {full}, after {acknowledged:?}");
+    assert!(
+        !acknowledged.is_empty(),
+        "the first object found the cell full"
+    );
+
+    // The other door finds it full too.
+    let next = full + 1;
+    let data = object_bytes(next, LEN);
+    if next % 2 == 0 {
+        let put = put_with(
+            "native",
+            &format!("o{next}"),
+            u128::from(next) + 1,
+            &data,
+            Headers::default(),
+        );
+        let (reply, _) = ask(&mut cell, ids[0], put, data);
+        assert_eq!(reply.status, ObjectStatus::InsufficientStorage);
+    } else {
+        let put = http[0].send("PUT", &format!("/http/o{next}"), &[], &data);
+        assert_eq!(put.status, 507);
+        assert_eq!(put.element("Code").as_deref(), Some("InsufficientStorage"));
+    }
+
+    // Every object acknowledged reads back whole through another node, and neither refused one is
+    // readable or listed.
+    for &(at, n) in &acknowledged {
+        let other = (at + 1) % ids.len();
+        let data = object_bytes(n, LEN);
+        if n % 2 == 0 {
+            let (reply, got) = ask(
+                &mut cell,
+                ids[other],
+                get_with("native", &format!("o{n}"), Headers::default()),
+                Vec::new(),
+            );
+            assert_eq!(reply.status, ObjectStatus::Done, "o{n}");
+            assert!(got == data, "o{n} came back otherwise");
+        } else {
+            let got = http[other].send("GET", &format!("/http/o{n}"), &[], b"");
+            assert_eq!(got.status, 200, "o{n}");
+            assert!(got.body == data, "o{n} came back otherwise");
+        }
+    }
+    for n in [full, next] {
+        if n % 2 == 0 {
+            assert_eq!(
+                status(
+                    &mut cell,
+                    ids[1],
+                    get_with("native", &format!("o{n}"), Headers::default())
+                ),
+                ObjectStatus::NoSuchKey,
+                "o{n}"
+            );
+        } else {
+            let got = http[1].send("GET", &format!("/http/o{n}"), &[], b"");
+            assert_eq!(got.status, 404, "o{n}");
+        }
+    }
+    let list = Op::List(List {
+        bucket: "native".into(),
+        prefix: String::new(),
+        delimiter: String::new(),
+        start: None,
+        max_keys: 1000,
+        fetch_owner: false,
+    });
+    let (reply, _) = ask(&mut cell, ids[2], list, Vec::new());
+    let Some(Listing::Keys(page)) = reply.listing else {
+        panic!("{reply:?}");
+    };
+    let native: Vec<String> = page.contents.into_iter().map(|l| l.key).collect();
+    let expected: Vec<String> = acknowledged
+        .iter()
+        .filter(|(_, n)| n % 2 == 0)
+        .map(|(_, n)| format!("o{n}"))
+        .collect();
+    assert_eq!(native, expected);
+    let listed = http[2].send("GET", "/http?list-type=2", &[], b"");
+    assert_eq!(listed.status, 200);
+    let text = listed.text();
+    for n in [full, next] {
+        assert!(!text.contains(&format!("<Key>o{n}</Key>")), "{text}");
+    }
+    for (_, n) in acknowledged.iter().filter(|(_, n)| n % 2 == 1) {
+        assert!(text.contains(&format!("<Key>o{n}</Key>")), "{text}");
+    }
 }

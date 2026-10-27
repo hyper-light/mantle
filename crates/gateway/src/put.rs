@@ -79,8 +79,11 @@ pub enum Answer {
     Volumes(Vec<u128>),
     /// The chunk is durable on its volume.
     Stored,
-    /// The volume refused the chunk, or did not answer in time.
-    Refused,
+    /// The volume refused the chunk, or did not answer in time; `full` where it refused for want
+    /// of room that cleaning cannot make (a volume's `Full`).
+    Refused {
+        full: bool,
+    },
     Block(block::Outcome),
     File(file::Outcome),
     Name(name::Outcome),
@@ -102,6 +105,10 @@ pub enum PutError {
     /// No volume the placement offered took one of the block's chunks: `503 SlowDown`.
     #[error("no volume took a chunk of block {0:032x}")]
     Unplaced(u128),
+    /// As `Unplaced`, every volume that refused the block's chunks refusing them as full: the
+    /// cell is out of space, which outlasts any client's retries (node.md §4.4).
+    #[error("every volume offered a chunk of block {0:032x} is full")]
+    Full(u128),
     /// The sweep released a block before its file was written: a renewal came too late.
     #[error("block {0:032x} was released before its file was written")]
     Released(u128),
@@ -259,6 +266,8 @@ struct Going {
     /// The volumes placement offered, each once, and the first not yet given a chunk.
     volumes: Vec<u128>,
     next: usize,
+    /// Every volume that refused one of its chunks refused it as full.
+    full: bool,
     /// Each chunk's volume, and whether the chunk is durable there.
     at: Vec<Option<(u128, bool)>>,
 }
@@ -768,6 +777,7 @@ impl Put {
                 chunks,
                 volumes: Vec::new(),
                 next: 0,
+                full: true,
                 at: vec![None; width],
             },
         );
@@ -794,7 +804,7 @@ impl Put {
         match (asked, answer) {
             (Asked::Place(index), Answer::Volumes(volumes)) => self.placed(index, volumes),
             (Asked::Chunk(index, i), Answer::Stored) => self.stored(index, i),
-            (Asked::Chunk(index, i), Answer::Refused) => self.refused(index, i),
+            (Asked::Chunk(index, i), Answer::Refused { full }) => self.refused(index, i, full),
             (
                 Asked::Block { index, asked_ns },
                 Answer::Block(block::Outcome::Written { deadline_ns }),
@@ -892,10 +902,15 @@ impl Put {
 
     /// Sends a refused chunk to the next volume the placement offered, which holds none of the
     /// block's chunks.
-    fn refused(&mut self, index: u64, i: usize) -> Result<(), PutError> {
+    fn refused(&mut self, index: u64, i: usize, full: bool) -> Result<(), PutError> {
         let going = self.going.get_mut(&index).ok_or(PutError::Mismatch)?;
+        going.full &= full;
         let Some(&volume) = going.volumes.get(going.next) else {
-            return Err(PutError::Unplaced(going.id));
+            return Err(if going.full {
+                PutError::Full(going.id)
+            } else {
+                PutError::Unplaced(going.id)
+            });
         };
         going.next = going.next.checked_add(1).ok_or(PutError::Overflow)?;
         let (bytes, crc) = going.chunks.get(i).ok_or(PutError::Mismatch)?;

@@ -322,7 +322,12 @@ installs boto3 pinned with every hash). The CLI's CRT transfer client, `aws s3`'
 2.38.0, runs where the image's CLI takes an http endpoint for it, 2.38.0 onward: on the Windows
 images now (2.38.3 and 2.38.4 on 2026-10-26), on Linux (2.37.13) and macOS (2.36.40) as their
 images move past it. `mantle bench s3` measures the listener's own cost
-(measurements/2026-10-25-s3-listener.md).
+(measurements/2026-10-25-s3-listener.md). A cell out of space says so on both doors: an object whose
+block every volume refused as full is answered `507 Insufficient Storage`, natively
+`InsufficientStorage`, which stock clients do not retry, where it was `503 SlowDown`, and nothing of
+it commits; against a cell of three whose stated volumes fill through both doors, the next object is
+refused so on each and every object acknowledged before reads back whole (node design §4.4,
+research/75; `crates/mantle/tests/serve.rs`).
 
 Clients of mantle's own protocol reach the same operations over QUIC through the native client
 library, `mantle-client`, and `mantle`'s object commands, its command line (gateway design §6). The

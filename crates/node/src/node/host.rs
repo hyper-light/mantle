@@ -44,6 +44,7 @@ use mantle_s3::seal::{DataKey, WrappingKey};
 
 use super::{ChunkAsk, ChunkOutcome, Node, NodeError, NodeLog, PIECE, take_done};
 use crate::ask::{CommandAsk, CommandOutcome, ReadAsk, ReadOutcome};
+use crate::chunk;
 use crate::door::{self, Piece};
 use crate::place;
 use crate::read::{Query, Read};
@@ -432,6 +433,7 @@ fn put_status(error: &PutError) -> Status {
         PutError::EntityTooLarge { .. } => Status::EntityTooLarge,
         PutError::BadDigest | PutError::BadChecksum => Status::BadDigest,
         PutError::Unplaced(_) => Status::SlowDown,
+        PutError::Full(_) => Status::InsufficientStorage,
         PutError::InvalidPartNumber(_) => Status::InvalidArgument,
         PutError::Name(outcome) => name_status(outcome),
         _ => Status::Failed,
@@ -1616,7 +1618,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     }) = self.jobs.get_mut(at)
                         && let Some(put) = putting.put.as_mut()
                     {
-                        let _ = put.answer(id, put::Answer::Refused);
+                        let _ = put.answer(id, put::Answer::Refused { full: false });
                     }
                     return Ok(None);
                 };
@@ -3085,12 +3087,15 @@ enum Outcome {
 fn put_answer(outcome: Outcome) -> put::Answer {
     match outcome {
         Outcome::Chunk(ChunkOutcome::Stored) => put::Answer::Stored,
-        Outcome::Chunk(_) => put::Answer::Refused,
+        Outcome::Chunk(ChunkOutcome::Refused(chunk::Status::Full)) => {
+            put::Answer::Refused { full: true }
+        }
+        Outcome::Chunk(_) => put::Answer::Refused { full: false },
         Outcome::Command(CommandOutcome::Answered(Answer::Block(o))) => put::Answer::Block(o),
         Outcome::Command(CommandOutcome::Answered(Answer::File(o))) => put::Answer::File(o),
         Outcome::Command(CommandOutcome::Answered(Answer::Name(o))) => put::Answer::Name(o),
         // Any other: the driver takes it as the wrong kind and fails the put.
-        _ => put::Answer::Refused,
+        _ => put::Answer::Refused { full: false },
     }
 }
 

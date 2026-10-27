@@ -49,6 +49,7 @@ pub fn reason(status: u16) -> &'static str {
         501 => "Not Implemented",
         503 => "Service Unavailable",
         505 => "HTTP Version Not Supported",
+        507 => "Insufficient Storage",
         _ => "",
     }
 }
@@ -151,6 +152,13 @@ pub fn refusal(status: Status) -> Refused {
         ),
         Status::InvalidArgument => ("InvalidArgument", 400, "Invalid Argument"),
         Status::InvalidRequest => ("InvalidRequest", 400, "Invalid Request"),
+        // S3 names no code for a store out of space; the status's own, which stock clients do
+        // not retry (node.md §4.4, research/75).
+        Status::InsufficientStorage => (
+            "InsufficientStorage",
+            507,
+            "The cell has no room for the object: every volume offered its chunks is full.",
+        ),
     };
     Refused::new(code, http, message)
 }

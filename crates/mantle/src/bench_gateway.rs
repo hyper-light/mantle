@@ -201,7 +201,7 @@ impl Cell {
                     chunks.insert(key, bytes);
                     Answer::Stored
                 }
-                None => Answer::Refused,
+                None => Answer::Refused { full: false },
             },
             Request::Block(mut c) => {
                 let index = self.tick()?;

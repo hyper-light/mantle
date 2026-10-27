@@ -44,6 +44,8 @@ struct Cell {
     volumes: BTreeMap<u128, BTreeMap<ChunkKey, Bytes>>,
     /// Volumes that refuse every chunk.
     refusing: BTreeSet<u128>,
+    /// Volumes that refuse every chunk as full.
+    full: BTreeSet<u128>,
     blocks: Model,
     block_index: u64,
     files: Model,
@@ -67,6 +69,7 @@ impl Cell {
         let mut cell = Self {
             volumes: (1..=volumes).map(|v| (v, BTreeMap::new())).collect(),
             refusing: BTreeSet::new(),
+            full: BTreeSet::new(),
             blocks: Model::default(),
             block_index: 0,
             files: Model::default(),
@@ -138,8 +141,11 @@ impl Cell {
                 bytes,
                 crc,
             } => {
+                if self.full.contains(&volume) {
+                    return Answer::Refused { full: true };
+                }
                 if self.refusing.contains(&volume) || mantle_crc::crc32c(&bytes) != crc {
-                    return Answer::Refused;
+                    return Answer::Refused { full: false };
                 }
                 self.volumes.get_mut(&volume).unwrap().insert(key, bytes);
                 Answer::Stored
@@ -839,6 +845,56 @@ fn a_refused_chunk_goes_to_another_volume() {
             .is_none()
     );
     assert!(file::header(&mut cell.files, 10).unwrap().is_none());
+}
+
+/// A block every one of whose refusing volumes refused it as full fails `Full`, `507 Insufficient
+/// Storage`, where a refusal for any other cause leaves it `Unplaced`, `503 SlowDown`, a cause that
+/// may pass; either way nothing commits (node.md §4.4).
+#[test]
+fn a_block_every_volume_refuses_as_full_fails_full_and_commits_nothing() {
+    let wrapping = WrappingKey::generate().unwrap();
+    let layout = Layout::new(Scheme::Copies(3)).unwrap();
+    let bytes = body(70_000, 2);
+    // Five volumes, three full: the other two take a copy each, and the third copy has none.
+    let mut cell = Cell::new(5);
+    cell.full = BTreeSet::from([1, 2, 3]);
+    let mut put = new_put(&cell, object("full"), 70_000, layout, keys(11, &wrapping));
+    let failed = run(
+        &mut cell,
+        &mut put,
+        &bytes,
+        &FAST,
+        &Expected::default(),
+        |_, _| {},
+    );
+    assert!(matches!(failed, Err(PutError::Full(_))), "{failed:?}");
+    assert!(
+        name::current(&mut cell.names, BUCKET, "full")
+            .unwrap()
+            .is_none()
+    );
+    assert!(file::header(&mut cell.files, 11).unwrap().is_none());
+
+    // One full and two refusing for another cause.
+    let mut cell = Cell::new(5);
+    cell.full = BTreeSet::from([1]);
+    cell.refusing = BTreeSet::from([2, 3]);
+    let mut put = new_put(&cell, object("mixed"), 70_000, layout, keys(12, &wrapping));
+    let failed = run(
+        &mut cell,
+        &mut put,
+        &bytes,
+        &FAST,
+        &Expected::default(),
+        |_, _| {},
+    );
+    assert!(matches!(failed, Err(PutError::Unplaced(_))), "{failed:?}");
+    assert!(
+        name::current(&mut cell.names, BUCKET, "mixed")
+            .unwrap()
+            .is_none()
+    );
+    assert!(file::header(&mut cell.files, 12).unwrap().is_none());
 }
 
 /// A body that streams in over many handovers keeps its blocks: the PUT renews each block it

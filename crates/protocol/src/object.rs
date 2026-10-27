@@ -1192,9 +1192,13 @@ pub enum Status {
     /// last run: the reply's progress names the offset, as the resumable-upload draft's `409
     /// Conflict` names it (research/30 §3.5).
     Offset,
+    /// HTTP's `507 Insufficient Storage` (RFC 4918 §11.5): every volume a block's chunks were
+    /// offered refused them as full, so the cell has no room for the object, a condition that
+    /// outlasts a client's retries; nothing of the object commits (node.md §4.4, research/75).
+    InsufficientStorage,
 }
 
-const STATUSES: [Status; 26] = [
+const STATUSES: [Status; 27] = [
     Status::Done,
     Status::NoSuchBucket,
     Status::NoSuchKey,
@@ -1221,6 +1225,7 @@ const STATUSES: [Status; 26] = [
     Status::InvalidArgument,
     Status::InvalidRequest,
     Status::Offset,
+    Status::InsufficientStorage,
 ];
 
 impl Status {
@@ -1252,6 +1257,7 @@ impl Status {
             Self::InvalidArgument => 23,
             Self::InvalidRequest => 24,
             Self::Offset => 25,
+            Self::InsufficientStorage => 26,
         }
     }
 

@@ -105,9 +105,11 @@ point:
 
 **A chunk refused** by its volume, busy, full, failed or unreachable, goes to another volume the
 placement offers that holds none of the block's chunks. When none is left, the PUT fails with
-`503 SlowDown`, and what it wrote is left to the sweeps: blocks and files never handed over
-are found and released (metadata.md §2), and chunks no block names are reconciled per volume
-(STATUS).
+`503 SlowDown`, a cause that may pass, unless every volume that refused the block's chunks refused
+them as full: then the cell has no room for the object, which outlasts any client's retries, and
+the PUT fails `507 Insufficient Storage` (node.md §4.4, research/75). Either way what it wrote is
+left to the sweeps: blocks and files never handed over are found and released (metadata.md §2),
+and chunks no block names are reconciled per volume (STATUS).
 
 **Admission.** A PUT declares its length, and one longer than a single request carries,
 5 GiB (research/05 §4.1), is refused as `EntityTooLarge` when the PUT is made, before a chunk

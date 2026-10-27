@@ -1907,6 +1907,7 @@ reported as success or as a refusal with no effect:
 | Another principal's bucket headed, deleted or its versioning changed, where no policy grants it | 403 `AccessDenied` |
 | Versioning suspended on a bucket Object Lock holds | 409 `InvalidBucketState` (18 §2.1) |
 | `Unplaced`, admission refused, a range splitting or frozen for a move | 503 `SlowDown` |
+| `PutError::Full`: every volume a block's chunks were offered refused them as full | 507 `InsufficientStorage` (RFC 4918 §11.5), which stock clients do not retry (research/75) |
 | An internal step whose outcome is unknown after the request's retries (§5.4) | 500 `InternalError`, which clients retry |
 
 A body with both `Transfer-Encoding` and `Content-Length` is refused 400 and the connection
@@ -1985,7 +1986,10 @@ random delay below one second and then below two (25 §3); SDKs that have not op
 behavior differ in timing (25 §3). So the node refuses for conditions measured in those units:
 an admission queue whose sojourn exceeds its target, a range being split or frozen, a peer out of
 credit. A condition that outlasts the retries, such as a cell out of space, is reported as what
-it is, and its remedy is operational. Whether to send `x-amz-retry-after` is open, since whether
+it is, and its remedy is operational: a PUT, a part or a native run whose block every volume
+refused as full is answered `507 Insufficient Storage`, natively `Status::InsufficientStorage`, a
+status no stock client retries, where `SlowDown` would turn a full cell into retries (research/75;
+`tests/serve.rs`, a cell whose stated volumes fill, through both doors). Whether to send `x-amz-retry-after` is open, since whether
 S3 sends it is unverified (25 §3).
 
 *As built (2026-10-25), the S3 listener.* The door holds a request for each connection the listener

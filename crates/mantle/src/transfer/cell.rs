@@ -286,11 +286,22 @@ impl Cell {
         std::thread::Builder::new()
             .name(format!("node-{}", node.id))
             .spawn(move || {
+                // A node says a range's status each time its commit moves, several times an
+                // object, and the cell takes what its threads tell only as it waits: each range's
+                // leader is told as it changes, the one fact of a status the cell waits on, so what
+                // waits to be taken is bounded by the cell's events, not by its objects.
+                let mut leaders: BTreeMap<u128, u64> = BTreeMap::new();
                 for line in BufReader::new(output).lines() {
                     let Ok(line) = line else { break };
-                    if let Some(said) = said(&line)
-                        && tell.send((at, generation, said)).is_err()
+                    let Some(said) = said(&line) else {
+                        continue;
+                    };
+                    if let Said::Status(group, leader) = said
+                        && leaders.insert(group, leader) == Some(leader)
                     {
+                        continue;
+                    }
+                    if tell.send((at, generation, said)).is_err() {
                         return;
                     }
                 }

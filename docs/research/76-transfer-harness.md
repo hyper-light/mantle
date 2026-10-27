@@ -140,10 +140,13 @@ volume refuses some: a filled cell of 96 MiB volumes held 48 MiB a node and kept
 the two refused parts' chunks. A volume keeps `CLEANER_RESERVE` free segments past what a client's
 writes take (research/11 §10.3), which is half of so small a volume.
 
-**Bounded by construction.** A case keeps two fixed-size histograms of latency
-(`mantle_disk::histogram`, HdrHistogram's buckets) and counts; a node's status lines are read on a
-thread of its own, three in all; the native door drives its objects on the client's one task
-(f33, f67). The harness writes nowhere but the directory its operator names, and
+**Bounded by construction.** A case keeps three fixed-size histograms of latency a door
+(`mantle_disk::histogram`, HdrHistogram's buckets), counts, and a bit an object; a node's lines are
+read on a thread of its own, three in all, each telling the case only what it waits on, a range's
+leader as it changes rather than every `status` a node says, so what waits to be taken is bounded
+by the cell's events and not by its objects (told every status, the harness grew 1.8 KB an
+object, 16.6 MiB at 1k and 29.7 MiB at 10k on adacachy); the native door drives its objects on the
+client's one task (f33, f67). The harness writes nowhere but the directory its operator names, and
 runs only where its operator runs it: a case fills the volumes it states (f7).
 
 ## Open

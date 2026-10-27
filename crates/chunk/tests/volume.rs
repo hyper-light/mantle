@@ -445,6 +445,33 @@ fn reopening_after_many_checkpoints_and_log_wraps_restores_everything() {
     }
 }
 
+/// A fresh volume filled one chunk at a time, nothing deleted, refuses the first chunk it has no
+/// room for as `Full`, never `Busy`: a write that finds no free segment before the cleaner has said
+/// whether a pass can free one waits for its verdict, so no client is told to ask again for space
+/// nothing will free (research/75; CI run 40569188170, windows-x86_64: a cell's object answered
+/// `SlowDown` on each of three asks at the fill point).
+#[test]
+fn a_volume_filled_with_nothing_deleted_refuses_full_and_never_busy() {
+    for seed in 0..4u64 {
+        let v = Volume::format(issuer(), sim(40 + seed), SIZE, config()).unwrap();
+        let mut put = 0u64;
+        loop {
+            match v.put(key(put), &data(put, 64 << 10)) {
+                Ok(()) => put += 1,
+                Err(ChunkError::Full) => break,
+                Err(e) => panic!("seed {seed}, chunk {put}: {e}"),
+            }
+        }
+        assert!(
+            put > 0,
+            "seed {seed}: the first chunk found the volume full"
+        );
+        for n in 0..put {
+            assert_eq!(v.read(&key(n), 0, 64 << 10).unwrap(), data(n, 64 << 10));
+        }
+    }
+}
+
 #[test]
 fn deleted_space_is_reused_and_a_full_volume_refuses_writes() {
     let v = Volume::format(issuer(), sim(6), SIZE, config()).unwrap();

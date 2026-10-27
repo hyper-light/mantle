@@ -280,6 +280,8 @@ impl<F: BlockFile + Sync + 'static> Volume<F> {
             anticipation: hyper_block::commit::Anticipation::new(),
             received: 0,
             unconfirmed: Vec::new(),
+            waiting: Vec::new(),
+            waiting_at: (u64::MAX, 0),
         };
         // Recovery changed the index relative to the log: it put relocations back to the
         // copies they moved, indexed records the log never named, or sealed segments left

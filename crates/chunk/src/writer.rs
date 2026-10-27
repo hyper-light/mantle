@@ -130,6 +130,13 @@ impl Queue {
         Ok(())
     }
 
+    /// Takes back the room of a request the writer holds past its batch (`Writer::waiting`): it
+    /// is the queue's until it is answered, so the queue's bound counts it.
+    pub fn hold(&mut self, bytes: u64) {
+        self.requests = self.requests.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
     /// Gives back the room of a request that left the queue or was never sent.
     pub fn release(&mut self, bytes: u64) {
         self.requests = self.requests.saturating_sub(1);
@@ -226,6 +233,12 @@ pub(crate) struct Writer<F: BlockFile> {
     /// in segments it opened, and every answer that rests on them (`Writer::settle`). At most
     /// one batch's requests and the next one's.
     pub unconfirmed: Vec<Held>,
+    /// Client writes that found no free segment while cleaning may still free one, held for the
+    /// cleaner's verdict, each holding its room of the queue (`Queue::hold`), so the queue's
+    /// bound is theirs too; and the verdict and the free segments when the last was held, since
+    /// the writes are run again once either changes (`Writer::retry_waiting`).
+    pub waiting: Vec<Request>,
+    pub waiting_at: (u64, usize),
 }
 
 /// A chunk as the batch being validated sees it: the index plus earlier requests in the batch.
@@ -491,10 +504,14 @@ impl<F: BlockFile> Writer<F> {
                 }
                 Err(TryRecvError::Empty) => match self.rx.recv() {
                     Ok(first) => first,
-                    Err(_) => return,
+                    Err(_) => {
+                        self.end_waiting(|| ChunkError::Closed);
+                        return;
+                    }
                 },
                 Err(TryRecvError::Disconnected) => {
                     self.confirm();
+                    self.end_waiting(|| ChunkError::Closed);
                     return;
                 }
             };
@@ -517,6 +534,7 @@ impl<F: BlockFile> Writer<F> {
                 for request in batch {
                     reply(request, Err(ChunkError::Fenced));
                 }
+                self.end_waiting(|| ChunkError::Fenced);
             } else {
                 let lsn = self.cursor.lsn;
                 self.process(batch);
@@ -528,6 +546,7 @@ impl<F: BlockFile> Writer<F> {
                     self.confirm();
                 }
                 self.poke_cleaner();
+                self.retry_waiting();
             }
             if self.shared.fenced.load(Ordering::Acquire) {
                 for (tx, _) in std::mem::take(&mut self.unconfirmed) {
@@ -541,6 +560,55 @@ impl<F: BlockFile> Writer<F> {
                 .submitted
                 .load(Ordering::Acquire)
                 .saturating_sub(self.received);
+        }
+    }
+
+    /// Holds a client write past its batch until the cleaner's verdict (`waiting`).
+    fn wait(&mut self, request: Request) {
+        if let Some(bytes) = request.queued
+            && let Ok(mut queue) = self.shared.queue.lock()
+        {
+            queue.hold(bytes);
+        }
+        self.waiting_at = (
+            self.shared.futile_at.load(Ordering::Relaxed),
+            self.segments.free_count(),
+        );
+        self.waiting.push(request);
+    }
+
+    /// Runs the held writes again once the cleaner gave a verdict or a segment was freed since
+    /// the last was held: each written, refused `Full` for good, or held again.
+    fn retry_waiting(&mut self) {
+        let now = (
+            self.shared.futile_at.load(Ordering::Relaxed),
+            self.segments.free_count(),
+        );
+        if self.waiting.is_empty() || now == self.waiting_at {
+            return;
+        }
+        let batch = std::mem::take(&mut self.waiting);
+        for request in &batch {
+            self.release(request);
+        }
+        self.process(batch);
+    }
+
+    /// Answers every held write with the error `error` makes: the volume fenced, or its writer
+    /// stopping.
+    fn end_waiting(&mut self, error: impl Fn() -> ChunkError) {
+        for request in std::mem::take(&mut self.waiting) {
+            self.release(&request);
+            reply(request, Err(error()));
+        }
+    }
+
+    /// Gives back the room a held request took of the queue.
+    fn release(&self, request: &Request) {
+        if let Some(bytes) = request.queued
+            && let Ok(mut queue) = self.shared.queue.lock()
+        {
+            queue.release(bytes);
         }
     }
 
@@ -1108,7 +1176,11 @@ impl<F: BlockFile> Writer<F> {
                     *w = true;
                 }
             };
-            let Request { op, reply: tx, .. } = request;
+            let Request {
+                op,
+                reply: tx,
+                queued,
+            } = request;
             match (op, decision) {
                 (
                     Op::Write {
@@ -1142,10 +1214,25 @@ impl<F: BlockFile> Writer<F> {
                                 ok.push(tx);
                             }
                         }
-                        // No free segment for the client: while cleaning can free one, the
-                        // put is to be retried, not refused for good.
+                        // No free segment for the client while cleaning may free one: the
+                        // put waits for the cleaner's verdict, written once a segment is freed
+                        // or refused `Full` for good, so its answer rests on the volume and not
+                        // on how soon a client asks again (research/75). With no cleaner to
+                        // give a verdict it is to be retried.
                         Err(ChunkError::Full) if self.reclaimable() => {
-                            answer(tx, Err(ChunkError::Busy));
+                            match (payloads.pop(), self.poke.is_some()) {
+                                (Some(payload), true) => self.wait(Request {
+                                    op: Op::Write {
+                                        key,
+                                        offset,
+                                        payload,
+                                        seal,
+                                    },
+                                    reply: tx,
+                                    queued,
+                                }),
+                                _ => answer(tx, Err(ChunkError::Busy)),
+                            }
                         }
                         Err(e) => answer(tx, Err(e)),
                     }

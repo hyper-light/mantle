@@ -646,7 +646,11 @@ client to use, and deleted a client's chunk stored under it. A segment whose dea
 is no victim at all: cleaning it only moves its data, and a volume filled in chunks of
 nearly a segment each, whose only dead bytes are padding, was cleaned victim after victim
 for nothing. A pass that finds no victim is futile as one that gains nothing is (audit P06).
-One pass runs at a time.
+One pass runs at a time. A client's write that finds no free segment while cleaning may still free
+one waits for the pass's verdict rather than being refused `Busy`: the writer holds it, its room of
+the queue held with it, until the cleaner records a verdict or a segment is freed, then runs it
+again, written or refused `Full` for good (research/75); with no cleaner to give one it is
+refused `Busy`.
 
 **A storage class is a second predictor of death.** A write whose object declares a class with
 a minimum duration (STANDARD_IA, ONEZONE_IA and GLACIER_IR for 30 or 90 days; archived classes

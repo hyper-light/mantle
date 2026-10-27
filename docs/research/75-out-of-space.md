@@ -63,14 +63,18 @@ error document carries `InsufficientStorage`, the status's own name, where MinIO
 `XMinioStorageFull` [4]. The native protocol's status is a code of its own, 26, beside the others,
 which the client returns as the reply's status, as it does `SlowDown`, without asking again.
 
-**A volume that may still free a segment answers `Busy` first.** A volume out of free segments
-answers a put `Busy` while its cleaner may still free one, which only a pass can tell
-(`mantle_chunk`'s writer, `reclaimable`: a fresh volume's cleaner has given no verdict yet), so the
-first object at a full cell may be answered `SlowDown`, and the cleaner, poked by the put, runs its
-pass; once the pass says it can free nothing, the volume refuses as full and the next ask is
-answered `507`. A client asks a `SlowDown` again, as stock clients do, and so meets the typed answer
-(`tests/serve.rs`'s fill, which asks again at most three times, the SDKs' standard attempts:
-linux-aarch64 and windows-x86_64 met the `SlowDown` first in CI run 40529439899).
+**A volume that may still free a segment holds the put for its cleaner's verdict.** A volume out
+of free segments while its cleaner may still free one, which only a pass can tell (`mantle_chunk`'s
+writer, `reclaimable`: a fresh volume's cleaner has given no verdict yet), holds the put rather than
+refusing it: the cleaner, poked by the put's batch, runs its pass, records its verdict and has the
+writer run a batch, after which the held puts run again, each written in a segment the pass freed
+or refused `Full`, and the object is answered `507` on its first ask. The writer holds them with
+the room they take of its queue, so the queue's bound is theirs too; a volume fencing or closing
+answers them so. Answered `Busy` instead, the put was a `SlowDown` that lasted as long as the pass,
+which no client's retries are fitted to: `tests/serve.rs`'s fill asked again three times, the SDKs'
+standard attempts, and windows-x86_64 met three `SlowDown`s (CI run 40569188170), as linux-aarch64
+and windows-x86_64 had met the first (CI run 40529439899). A `SlowDown` that lasts as long as the
+work behind it is the condition node.md §4.5 reports as what it is.
 
 **Nothing of the refused object commits.** The refusal comes before the object's file is written
 or its version committed; chunks of its blocks that some volumes took are left to the sweeps, as

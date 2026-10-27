@@ -108,6 +108,9 @@ impl<F: BlockFile> Cleaner<F> {
             if let Ok(Some(report)) = self.pass(&mut reads) {
                 let futile = if report.gained == 0 { dead } else { u64::MAX };
                 self.shared.futile_at.store(futile, Ordering::Relaxed);
+                // The writes the writer holds for this verdict run again after its next batch:
+                // one now. A volume closing refuses it, and its writer answers them itself.
+                let _ = self.flush();
             }
         }
     }

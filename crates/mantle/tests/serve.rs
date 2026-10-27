@@ -2021,11 +2021,10 @@ fn a_multipart_upload_completes_through_another_node_with_one_killed_between_par
 const FILL: usize = 32 << 20;
 
 /// What a put of fill object `n` through its door, the native one for an even `n` and the S3
-/// listener for an odd one, of node `at`, came to: `Done`, or its refusal. A `SlowDown` is asked
-/// again as a client asks it, at most `mantle_client::ATTEMPTS` times: a volume out of free segments
-/// answers a put `Busy` while its cleaner may still free one, and the put fails `SlowDown`, until the
-/// cleaner's pass says whether it can; then the volume takes the chunk or refuses it as full
-/// (chunk-store.md §8; `mantle_chunk`'s writer, `reclaimable`).
+/// listener for an odd one, of node `at`, came to: `Done`, or its refusal, asked once. A volume out
+/// of free segments while its cleaner may still free one holds the put for the cleaner's verdict
+/// rather than refusing it `Busy`, so the cell's first answer is the typed one (chunk-store.md §8;
+/// `mantle_chunk`'s writer, `waiting`).
 fn fill_put(
     cell: &mut Cell,
     http: &mut [s3::Client],
@@ -2034,25 +2033,18 @@ fn fill_put(
 ) -> String {
     let data = object_bytes(n, FILL);
     let key = format!("o{n}");
-    let mut said = String::new();
-    for _ in 0..mantle_client::ATTEMPTS {
-        said = if n % 2 == 0 {
-            let put = put_with("native", &key, u128::from(n) + 1, &data, Headers::default());
-            let (reply, _) = ask(cell, ids[at], put, data.clone());
-            format!("{:?}", reply.status)
+    if n % 2 == 0 {
+        let put = put_with("native", &key, u128::from(n) + 1, &data, Headers::default());
+        let (reply, _) = ask(cell, ids[at], put, data);
+        format!("{:?}", reply.status)
+    } else {
+        let put = http[at].send("PUT", &format!("/http/{key}"), &[], &data);
+        if put.status == 200 {
+            "Done".to_owned()
         } else {
-            let put = http[at].send("PUT", &format!("/http/{key}"), &[], &data);
-            if put.status == 200 {
-                "Done".to_owned()
-            } else {
-                format!("{} {:?}", put.status, put.element("Code"))
-            }
-        };
-        if said != "SlowDown" && said != "503 Some(\"SlowDown\")" {
-            break;
+            format!("{} {:?}", put.status, put.element("Code"))
         }
     }
-    said
 }
 
 /// A cell whose stated volumes fill refuses the object it has no room for with the typed answer on
@@ -2061,8 +2053,8 @@ fn fill_put(
 /// research/75); nothing of the refused objects is readable or listed, and every object
 /// acknowledged before reads back whole. Objects of 32 MiB go through the two doors in turn, each
 /// door its own bucket, until a volume of the cell has no room; three copies of each, one a node,
-/// fill the three volumes together. A `SlowDown` while a volume's cleaner has yet to say whether it
-/// can free a segment is asked again, as a client asks it (`fill_put`).
+/// fill the three volumes together. Each object is asked once: a volume's cleaner gives its verdict
+/// before the put is answered, so no `SlowDown` stands for space nothing will free (`fill_put`).
 #[test]
 fn a_cell_whose_volumes_fill_refuses_the_next_object_typed_on_both_doors() {
     let mut cell = Cell::made(three_founders);

@@ -1,6 +1,7 @@
-//! Logical clients cost no threads: `mantle bench log`, a real process on a real disk, runs as
-//! many threads at ten and a hundred times its drivers' replicas as at once its drivers'
-//! count, as the OS counts them (docs/design/measurement.md §10; research/26 §8, test 2).
+//! Logical clients cost no threads: `mantle bench log`, a real process on a real disk, adds as
+//! many threads above those its process runs idle at ten and a hundred times its drivers' replicas
+//! as at once its drivers' count, as the OS counts them (docs/design/measurement.md §10;
+//! research/26 §8, test 2).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -70,17 +71,20 @@ fn bench_log_runs_the_same_threads_at_ten_and_a_hundred_times_the_replicas() {
     );
     let threads: Vec<usize> = rows.iter().map(|r| r.1).collect();
     assert!(threads[0] > 0, "{text}");
-    assert!(
-        threads.iter().all(|&t| t == threads[0]),
-        "threads {threads:?} at replicas {counts:?}"
-    );
-    // Above what the process runs idle (the main thread, and what the operating system runs in
-    // every process): a driver a core and the log's two, its owner and its device thread
-    // (hyper-log), nothing a replica.
+    // The threads the bench adds above what the process runs idle, the main thread and what the
+    // operating system runs in every process, are the same at every count of replicas: a driver a
+    // core and the log's two, its owner and its device thread (hyper-log), nothing a replica.
+    // What the operating system runs comes and goes on its own (Windows' thread pool retired
+    // three workers between two rows on CI: 10, 10 and 7 threads, idle 4, 4 and 1), so the
+    // process's whole count is not the bench's.
     let added: Vec<usize> = rows.iter().map(|r| r.1.saturating_sub(r.2)).collect();
+    let idle: Vec<usize> = rows.iter().map(|r| r.2).collect();
+    assert!(
+        added.iter().all(|&a| a == added[0]),
+        "added {added:?} above idle {idle:?} at replicas {counts:?}: threads {threads:?}"
+    );
     assert!(
         added.iter().all(|&a| a <= cores + 2),
-        "{added:?} above idle {:?} for {cores} cores",
-        rows.iter().map(|r| r.2).collect::<Vec<_>>()
+        "{added:?} above idle {idle:?} for {cores} cores"
     );
 }

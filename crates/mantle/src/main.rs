@@ -804,6 +804,15 @@ fn exit(result: Result<(), String>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "diag-exit exiting wall_ms={} pid={}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0),
+                std::process::id()
+            );
             // Reporting the failure is best effort: stderr may be closed too.
             let _ = writeln!(std::io::stderr().lock(), "mantle: {e}");
             ExitCode::FAILURE

@@ -410,6 +410,7 @@ fn a_node_started_again_starts_its_detectors_from_the_cells_history() {
 #[test]
 fn a_cell_made_by_init_rolls_one_node_at_a_time_and_reads_every_object_back() {
     let mut cell = Cell::made(three_founders);
+    cell.trace = Some(std::time::Instant::now());
     let mut ids: Vec<u64> = cell.dirs.keys().copied().collect();
     for &id in &ids {
         cell.enlisted(id);
@@ -538,6 +539,13 @@ fn a_cell_made_by_init_rolls_one_node_at_a_time_and_reads_every_object_back() {
 /// before its stop says it is done.
 #[test]
 fn a_second_request_to_stop_ends_the_process_at_once() {
+    eprintln!(
+        "diag-exit test began wall_ms={}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
     let mut cell = Cell::made(|root| {
         let data = root.join("data");
         std::fs::create_dir(&data).unwrap();
@@ -555,6 +563,7 @@ fn a_second_request_to_stop_ends_the_process_at_once() {
     });
     let id = *cell.dirs.keys().next().unwrap();
     cell.enlisted(id);
+    cell.trace = Some(std::time::Instant::now());
     let exited = cell.stop_twice(id);
     assert!(!exited.success(), "node {id} exited {exited}");
     assert!(

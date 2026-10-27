@@ -920,6 +920,8 @@ pub(crate) struct Cell {
     /// The node whose process the test started to be refused, and that process once it ended.
     pub(crate) refusing: Option<u64>,
     pub(crate) refused: Option<Running>,
+    /// Diagnostic: when set, every line heard is said with the milliseconds since.
+    pub(crate) trace: Option<std::time::Instant>,
     /// The ranges every node hosts, and whether each hosts objects.
     pub(crate) ranges: &'static [(u128, &'static str)],
     pub(crate) gateway: bool,
@@ -1201,6 +1203,7 @@ impl Cell {
             domains: BTreeMap::new(),
             refusing: None,
             refused: None,
+            trace: None,
             ranges: EVERY_LAYER,
             gateway: true,
             serving: true,
@@ -1331,6 +1334,7 @@ impl Cell {
             domains: BTreeMap::new(),
             refusing: None,
             refused: None,
+            trace: None,
             ranges,
             gateway,
             serving,
@@ -1700,6 +1704,16 @@ impl Cell {
     pub(crate) fn take(&mut self, heard: Heard) {
         match heard {
             Heard::Line(id, generation, line) => {
+                if let Some(t0) = self.trace {
+                    eprintln!(
+                        "diag-line t_ms={} wall_ms={} node={id:x} gen={generation} {line:?}",
+                        t0.elapsed().as_millis(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0)
+                    );
+                }
                 // A line its killed process left: the node runs another process now, or none.
                 let Some(running) = self
                     .running
@@ -1785,6 +1799,16 @@ impl Cell {
             }
             // A process ended that the cell did not kill: it failed.
             Heard::Ended(id, generation) => {
+                if let Some(t0) = self.trace {
+                    eprintln!(
+                        "diag-line t_ms={} wall_ms={} node={id:x} gen={generation} ended",
+                        t0.elapsed().as_millis(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0)
+                    );
+                }
                 if self
                     .running
                     .get(&id)

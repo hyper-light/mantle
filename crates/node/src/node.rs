@@ -1704,6 +1704,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let _ = self.plane.queue(peer, &message);
         }
         for change in std::mem::take(&mut self.asked.changes) {
+            eprintln!(
+                "diag-live wall_ms={} pid={} change={change:?}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0),
+                std::process::id()
+            );
             if let Change::Suspected(suspicion) = &change
                 && let Some(remote) = self.remotes.iter_mut().find(|r| r.id == suspicion.peer)
             {

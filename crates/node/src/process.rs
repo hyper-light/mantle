@@ -211,6 +211,14 @@ impl Stop {
     /// A request at `now`: the stop begins, or, begun already, the process ends at once.
     fn ask(&mut self, now: u64) -> Result<(), ProcessError> {
         if self.by.is_some() {
+            eprintln!(
+                "diag-exit second-stop wall_ms={} pid={}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0),
+                std::process::id()
+            );
             return Err(ProcessError::Stopped(
                 "a second request to stop came as the node stopped",
             ));
@@ -1182,7 +1190,24 @@ fn start(
             ends_with_input,
         ))
         .map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
+    eprintln!(
+        "diag-exit served wall_ms={} pid={}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+        std::process::id()
+    );
     drop(node);
+    drop(rt);
+    eprintln!(
+        "diag-exit runtime-dropped wall_ms={} pid={}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+        std::process::id()
+    );
     ran
 }
 

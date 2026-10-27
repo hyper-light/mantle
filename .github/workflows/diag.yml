@@ -1,0 +1,51 @@
+name: diag-roll
+# Scratch (never merged): the serve suite as CI's linux-x86_64 job runs it (ubuntu-24.04, four
+# vCPUs, its tests side by side), six rounds a job, three jobs. A failing round's traces are
+# printed whole: the roll test's every line heard with its time, each node's liveness changes,
+# and the steps of a process's exit after a second request to stop (CI run 40524311062: the roll
+# test's remaining voters said every range had no leader; a second stop's process not ended
+# within the one-node cell's quiet second).
+on:
+  push:
+    branches: ["diag/**"]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: "1"
+jobs:
+  roll:
+    strategy:
+      fail-fast: false
+      matrix:
+        job: [a, b, c]
+    name: roll-${{ matrix.job }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: diag-roll
+          workspaces: |
+            .
+            vendor
+      - name: Build the serve suite
+        run: cargo test --locked -p mantle --test serve --no-run
+      - name: The serve suite, six rounds
+        shell: bash
+        run: |
+          failed=0
+          for round in 1 2 3 4 5 6; do
+            echo "=== round $round"
+            if ! cargo test --locked -p mantle --test serve -- --nocapture > round.log 2>&1; then
+              failed=$((failed + 1))
+              grep -aE "^test .* (ok|FAILED)|test result|diag-|panicked|mantle: " round.log | cut -c1-2000 || true
+            else
+              grep -aE "^test .* (ok|FAILED)|test result" round.log || true
+            fi
+          done
+          echo "=== $failed of 6 rounds failed"
+          test "$failed" -eq 0

@@ -629,7 +629,14 @@ given at least the node's own serve period, the idle timeout a node judges its e
 however fast the exchanges the client measured before it: a node may leave a put's body unread that
 long while its driver waits on durable writes (`tests/progress.rs`: a put held a quarter of it is
 answered; under the range client's law alone it was cut `Stalled` within a third of a second, as CI
-found on every target). A put states its
+found on every target). An exchange the client cut by its period with no answer begun, the node
+having had the request whole, says the node's work takes longer than it was given: the next
+period is at least twice that wait (RFC 6298 §5.5's backoff), kept with the slowest exchange
+measured, so a quick answer between the two, the offset a resumed upload asks first, does not undo
+it (`tests/resume.rs`: a run answered half again as late as the client waited on the cut one is
+waited for; with the period as it was, the client cut it too, as the native suite on CI's busy
+Linux runner found: an 8 MiB run's commit outlasted the 3.07 s period on three attempts in a row,
+diag run 40542282673). A put states its
 CRC-64/NVME in a trailer (node.md §4.1), the checksum S3 keeps for an object uploaded without one
 and a full-object value across a multipart upload's parts, and holds the value the node kept to
 it; a get of a whole object is held to a full-object checksum as its bytes arrive, a composite one

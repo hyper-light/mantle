@@ -158,21 +158,26 @@ impl Directory for Clients {
 }
 
 /// What the stub node does to a native upload's exchanges, each counted from 1 by its kind: the
-/// Append it reads whole and never answers, as a node that died under it leaves it, and the
-/// Offset it holds unanswered until its client gives up on it.
+/// Append it reads whole and never answers, as a node that died under it leaves it; the Append and
+/// the Offset it holds unanswered until its client gives up on them; and the Append it answers
+/// only once half again as long has passed as its client waited on the one it gave up on, as a
+/// node whose durable writes take longer than the client gave it answers the run sent again.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Script {
     pub(crate) lose_append: Option<u32>,
+    pub(crate) hold_append: Option<u32>,
+    pub(crate) late_append: Option<u32>,
     pub(crate) hold_offset: Option<u32>,
 }
 
-/// The native upload's requests the stub took, by kind.
+/// The native upload's requests the stub took, by kind, and the exchanges its client cut.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Seen {
     pub(crate) opens: u32,
     pub(crate) appends: u32,
     pub(crate) offsets: u32,
     pub(crate) finishes: u32,
+    pub(crate) cut: u32,
 }
 
 /// The stub's one native upload: its durable offset, its committed runs, and whether the last
@@ -216,7 +221,7 @@ enum Serving {
         written: u64,
     },
     /// A request read whole and left unanswered.
-    Holding,
+    Holding { exchange: ExchangeId },
 }
 
 type Stub = Driver<NodeClasses, Fixed, Clients>;
@@ -300,9 +305,33 @@ pub(crate) fn scripted(
             // The shard's time the pause ends, while it holds a put's body unread; once taken, a
             // pause is not taken again.
             let (mut held, mut paused) = (None::<u64>, false);
+            // When the stub began holding an Append unanswered, how long its client waited on it
+            // before cutting it, and when the late Append is answered.
+            let (mut holding_since, mut waited, mut late) = (None::<u64>, None::<u64>, None::<u64>);
             loop {
                 if let Some(event) = next(&mut driver, held).await {
                     match event {
+                        Event::Refused {
+                            exchange,
+                            by_peer: true,
+                            ..
+                        } => {
+                            seen.cut += 1;
+                            if let Some(since) = holding_since.take() {
+                                waited = Some(hyper_rt::futures::now_ns() - since);
+                            }
+                            let served = match &serving {
+                                Some(
+                                    Serving::Reading { exchange: e, .. }
+                                    | Serving::Writing { exchange: e, .. }
+                                    | Serving::Holding { exchange: e },
+                                ) => *e == exchange,
+                                None => false,
+                            };
+                            if served {
+                                serving = None;
+                            }
+                        }
                         Event::Request { exchange, body, .. } => {
                             let head =
                                 Head::decode(driver.endpoint().head(exchange).unwrap(), body)
@@ -385,6 +414,17 @@ pub(crate) fn scripted(
                     }
                     let op = head.op(fields).unwrap();
                     let exchange = *exchange;
+                    if matches!(op, Op::Append { .. })
+                        && script.late_append == Some(seen.appends + 1)
+                        && late.is_none()
+                    {
+                        let waited = waited.expect("a late Append follows one its client cut");
+                        let until = hyper_rt::futures::now_ns() + waited * 3 / 2;
+                        late = Some(until);
+                        held = Some(until);
+                        driver.flush().unwrap();
+                        continue;
+                    }
                     let sum = hasher
                         .take()
                         .unwrap_or_else(|| Hasher::new(TRAILER).unwrap())
@@ -441,6 +481,9 @@ pub(crate) fn scripted(
                             seen.appends += 1;
                             if script.lose_append == Some(seen.appends) {
                                 endpoint.end(exchange);
+                                None
+                            } else if script.hold_append == Some(seen.appends) {
+                                holding_since = Some(hyper_rt::futures::now_ns());
                                 None
                             } else if offset != runs.offset {
                                 let reply = Reply {
@@ -500,7 +543,7 @@ pub(crate) fn scripted(
                     };
                     // A request lost or held: nothing is written for it.
                     let Some((reply, length)) = answer else {
-                        serving = Some(Serving::Holding);
+                        serving = Some(Serving::Holding { exchange });
                         driver.flush().unwrap();
                         continue;
                     };

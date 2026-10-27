@@ -709,7 +709,10 @@ passes on all six CI targets.
    put as stalled, and a cell with no spare volume fails the object (on windows-11-arm a
    volume's first write took up to 8.0 s before calibration saw NTFS's zeros;
    measurements/2026-10-24-first-writes-past-unwritten-space.md). The answer's period belongs
-   with the peer's measured write time, as a command ask's comes from its slowest answer.
+   with the peer's measured write time, as a command ask's comes from its slowest answer. A
+   native client learns from its own cuts (gateway.md §6's as-built note): a run it cut waiting
+   for the node's answer sets its next period to at least twice that wait; its first run still
+   waits the idle timeout until the node states its write time.
 9. **Operation identity**: client-drawn identities, `amz-sdk-invocation-id` on the listener,
    operation rows in the Name range with the first answer, the horizon capped by the operation
    table's budget, removal by the collector, carried by splits (gateway.md §2.1; metadata.md §2).

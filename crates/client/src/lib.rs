@@ -441,7 +441,8 @@ pub struct Client {
     nodes: Vec<Known>,
     /// The node asked next: its place in `nodes`.
     at: usize,
-    /// The slowest exchange measured, from its opening to its reply, nanoseconds.
+    /// The slowest exchange measured, from its opening to its reply, or twice the longest a node
+    /// held a request whole unanswered before the client cut the exchange, nanoseconds.
     slowest_ns: Option<u64>,
     /// Waits paused for so far: the draw each pause's jitter takes (`bounds::pause`).
     waits: u32,
@@ -1149,10 +1150,15 @@ impl Client {
         let mut sent = 0u64;
         let mut stopped = false;
         let mut reply: Option<Reading> = None;
+        // When the transport had the request whole: from then the node has it to answer.
+        let mut whole_ns: Option<u64> = None;
         self.fields.clear();
         loop {
             if reply.is_none() && !stopped && sent < body {
                 stopped = !self.send(exchange, (fields, &mut upload), &mut sent)?;
+            }
+            if whole_ns.is_none() && sent >= body {
+                whole_ns = Some(hyper_rt::futures::now_ns());
             }
             let wants_source = reply.is_none()
                 && !stopped
@@ -1235,8 +1241,23 @@ impl Client {
                 Event::Refused {
                     exchange: e,
                     refusal,
-                    ..
+                    by_peer,
                 } if e == exchange => {
+                    // Cut by its period with no answer begun, the request whole at the node: what
+                    // the node does for it takes longer than the node was given, so the next
+                    // exchange's period is at least twice that (RFC 6298 §5.5's backoff), kept
+                    // with the slowest measured so that a quick answer to another request between
+                    // the two, the offset a resumed upload asks first, does not undo it.
+                    if refusal == Refusal::Stalled
+                        && !by_peer
+                        && reply.is_none()
+                        && let Some(whole) = whole_ns
+                    {
+                        let went = hyper_rt::futures::now_ns()
+                            .saturating_sub(whole)
+                            .saturating_mul(2);
+                        self.slowest_ns = Some(self.slowest_ns.map_or(went, |s| s.max(went)));
+                    }
                     let mut why = refusal;
                     if refusal == Refusal::Closed {
                         while let Some(event) = self.driver.endpoint().poll_event() {
@@ -1484,14 +1505,14 @@ impl Client {
     }
 
     /// The progress period an exchange with `node` is given: the time left before `deadline_ns`
-    /// while nothing is measured, else the slowest exchange measured or the path's
-    /// persistent-congestion duration (RFC 9002 §7.6.1), whichever is longer, doubled for each
-    /// exchange with the node cut by its period since its last reply (mantle-node's client's
-    /// law), and never less than the node's own serve period, within that time. A node judges an
-    /// exchange stalled only once it moved nothing for as long as a connection may stay silent, the
-    /// idle timeout (`bounds::limits`), and may pause an object's body that long while its driver
-    /// waits on durable writes: a client cutting it sooner abandons an operation the node would
-    /// finish, and a node that died is found by its connection's idle timeout all the same.
+    /// while nothing is measured, else the longest of the slowest exchange measured, the path's
+    /// persistent-congestion duration (RFC 9002 §7.6.1) and the node's own serve period, doubled
+    /// for each exchange with the node cut by its period since its last reply (mantle-node's
+    /// client's law), within that time. A node judges an exchange stalled only once it moved
+    /// nothing for as long as a connection may stay silent, the idle timeout (`bounds::limits`),
+    /// and may pause an object's body that long while its driver waits on durable writes: a client
+    /// cutting it sooner abandons an operation the node would finish, and a node that died is
+    /// found by its connection's idle timeout all the same.
     fn period_ns(&mut self, node: PeerId, deadline_ns: u64, now_ns: u64) -> u64 {
         let left = deadline_ns.saturating_sub(now_ns).max(1);
         let Some(slowest) = self.slowest_ns else {
@@ -1514,8 +1535,8 @@ impl Client {
         let doubling = 1u64.checked_shl(stalled).unwrap_or(u64::MAX);
         slowest
             .max(congested)
-            .saturating_mul(doubling)
             .max(served)
+            .saturating_mul(doubling)
             .min(left)
     }
 

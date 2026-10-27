@@ -265,7 +265,7 @@ measures the second, and derives the rest by these rules:
   whole; a page buffer, a point read's page, a checkpoint page and an extent's run), each extent's
   allocator count, free or pending slot, map bit and map word apart, charged with the extent's
   resident metadata from what memory remains (`shard_db::measured_per_extent`); and the threads
-  the node starts (`derive::threads`: standard input's and output's, the
+  the node starts (`derive::threads`: its shard's, standard input's and output's, the
   log's two, each device's issuer and a worker a read of its depth, each volume's writer, cleaner
   and scrubber), each at Rust's default stack of 2 MiB, reserved whole; and each range's member
   (`derive::range_bytes`, hyper-durable's holds at the bounds hyper-raft's limits put on each:
@@ -707,7 +707,12 @@ The orderly stop is built as planned above. SIGTERM and SIGINT (Ctrl-C and Ctrl-
 and a `stop` line on standard input, each ask it; the first request begins it, to end by `stop_ms`
 (stated; unstated, docker stop's default grace period for a Linux container, 10 s, the shortest of
 the orchestrators' defaults, so a default stop ends before their SIGKILL), and a second request, or
-the bound passing, ends the process at once, as a crash would. The node says `stopping`, answers
+the bound passing, ends the process at once, as a crash would: the node runs on a thread of its
+own, which the process's own waits for, and told of such a stop it returns without waiting for the
+node's teardown, its logs and volumes finishing no device work they began and every write they
+acknowledged already durable (`process::start`; run on the process's own thread, the node finished
+its in-flight writes and flushes as it was dropped, and a second request took more than a second to
+end the process on a loaded runner). The node says `stopping`, answers
 each new object exchange `SlowDown` and waits for those running to end; transfers each range it
 leads to the voter caught up with it, else the one whose log holds most, which the core first brings
 up to its own (`handing GROUP TO`); waits until its member learns another leads (`handed GROUP

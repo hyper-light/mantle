@@ -697,13 +697,14 @@ pub fn liveness_bytes(peers: usize) -> Option<u64> {
         .checked_mul(ring)
 }
 
-/// The threads a node starts beside its shard's, which runs on the process's own: its standard
-/// input's and output's, its log's and its log's device's; for each device holding volumes, its
-/// issuer and a worker for each read its profile measured at the device at once
+/// The threads a node starts beside the process's own, which waits for it to end: its shard's,
+/// which the process's own leaves at once on a stop that ends it so (`process::start`); its
+/// standard input's and output's, its log's and its log's device's; for each device holding
+/// volumes, its issuer and a worker for each read its profile measured at the device at once
 /// (`hyper_block::issuer`); and for each volume its writer and its cleaner, and its scrubber
 /// where it scrubs. `devices` are those devices' depths, `volumes` whether each scrubs.
 pub fn threads(devices: &[usize], volumes: &[bool]) -> Option<u64> {
-    let mut threads = 4u64;
+    let mut threads = 5u64;
     for &depth in devices {
         threads = threads.checked_add(u64::try_from(depth).ok()?.checked_add(1)?)?;
     }
@@ -2332,13 +2333,13 @@ mod tests {
         assert_eq!(a.reads, g.objects);
     }
 
-    /// The node's own four threads, and each device's issuer and workers and each volume's
+    /// The node's own five threads, and each device's issuer and workers and each volume's
     /// writer, cleaner and scrubber where it scrubs, each a 2 MiB stack.
     #[test]
     fn the_threads_are_the_nodes_own_and_its_storages() {
-        assert_eq!(threads(&[], &[]), Some(4));
-        assert_eq!(threads(&[2], &[true]), Some(4 + 3 + 3));
-        assert_eq!(threads(&[1, 4], &[true, false]), Some(4 + 2 + 5 + 3 + 2));
+        assert_eq!(threads(&[], &[]), Some(5));
+        assert_eq!(threads(&[2], &[true]), Some(5 + 3 + 3));
+        assert_eq!(threads(&[1, 4], &[true, false]), Some(5 + 2 + 5 + 3 + 2));
         assert_eq!(stacks(10), Some(20 << 20));
     }
 

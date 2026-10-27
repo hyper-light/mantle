@@ -564,7 +564,8 @@ process runs; the start runs node.md §1.7's steps in order, a failure naming it
 start's locks step: …`). SIGTERM or SIGINT (Ctrl-C or Ctrl-Break on Windows), or a `stop` line,
 stops the node in order within `stop_ms`: new objects answered `SlowDown`, those running ended, each
 led range handed to a caught-up member that then leads (handed again where its core gives a
-transfer up), connections closed and left to drain, exit 0; a second request ends it at once
+transfer up), connections closed and left to drain, exit 0; a second request ends it at once, as a
+crash would, the node's thread left mid-teardown by the process's own, which waits for it
 (`crates/mantle/tests/serve.rs`). A start refuses, at its identity step and naming the file, a key
 readable by others than its owner (the node's TLS key and each root key, on every platform: no
 group or other mode bit on Unix; on Windows no DACL entry for a principal but the owner and

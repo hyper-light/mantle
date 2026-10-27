@@ -56,7 +56,7 @@ fn a_volume_starts_the_threads_the_derivation_counts() {
     let before = threads();
     let storage = Storage::open(&[volume]).unwrap();
     let started = threads() - before;
-    // The node's own four are its process's, not its storage's.
-    assert_eq!(started, derive::threads(&[depth], &[true]).unwrap() - 4);
+    // The node's own five are its process's, not its storage's.
+    assert_eq!(started, derive::threads(&[depth], &[true]).unwrap() - 5);
     drop(storage);
 }

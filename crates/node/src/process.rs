@@ -98,6 +98,7 @@ use std::io::Write;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::pin::pin;
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::time::Duration;
 
 use hyper_block::file::{CachingRequest, DeviceFile};
@@ -208,12 +209,11 @@ impl Stop {
         }
     }
 
-    /// A request at `now`: the stop begins, or, begun already, the process ends at once.
-    fn ask(&mut self, now: u64) -> Result<(), ProcessError> {
+    /// A request at `now`: the stop begins, or, begun already, the process ends at once, for the
+    /// reason said.
+    fn ask(&mut self, now: u64) -> Result<(), &'static str> {
         if self.by.is_some() {
-            return Err(ProcessError::Stopped(
-                "a second request to stop came as the node stopped",
-            ));
+            return Err("a second request to stop came as the node stopped");
         }
         self.by = Some(now.saturating_add(self.bound_ns));
         Ok(())
@@ -1146,17 +1146,66 @@ pub fn serve_stated(config: &Path) -> Result<(), ProcessError> {
     start(derived.config, (node, locks), identity, s3, false)
 }
 
+/// How the node's thread ended, as [`start`] hears it.
+enum Ended {
+    /// The node ran to its end, in order or failing, its teardown done: its result.
+    Ran(Result<(), ProcessError>),
+    /// A stop that ends the process at once, as a crash would: a second request to stop, or the
+    /// stop's bound passing (node.md §1.7), told before the node's teardown begins.
+    AtOnce(&'static str),
+}
+
 /// The node of `config`, its directory and its volumes' devices under `held`'s locks, as
 /// `identity` says it is, with the S3 listener its `s3` keys state: the start's steps after the
 /// locks (node.md §1.7), each failure naming its step, then the node until it stops in order at a
 /// signal, or, if it `ends_with_input`, until standard input closes. The directory's lock is held
 /// until the node ends.
+///
+/// The node runs on a thread of its own, and this one waits for it: told of a stop that ends the
+/// process at once, it returns without waiting for the node's teardown, and the process ends as a
+/// crash would, its logs and volumes finishing no device work they began, every write they
+/// acknowledged already durable. Run on this thread, the node finished its in-flight writes and
+/// flushes as it was dropped, one device's wait after another: a second request to stop took more
+/// than a second on a loaded runner (CI's `a_second_request_to_stop_ends_the_process_at_once`).
 fn start(
-    mut config: ProcessConfig,
+    config: ProcessConfig,
     held: (NodeLock, Locks),
     identity: Identity,
     s3: Option<S3Keys>,
     ends_with_input: bool,
+) -> Result<(), ProcessError> {
+    // Room for both: a stop at once, and the node's end after its teardown, which no one hears.
+    let (tell, heard) = sync_channel::<Ended>(2);
+    let at_once = tell.clone();
+    let thread = std::thread::Builder::new()
+        .name("node".into())
+        .spawn(move || {
+            let ran = run_node(config, held, identity, (s3, ends_with_input), at_once);
+            let _ = tell.send(Ended::Ran(ran));
+        })
+        .map_err(|e| ProcessError::Runtime(format!("the node's thread: {e}")))?;
+    match heard.recv() {
+        Ok(Ended::Ran(ran)) => {
+            thread
+                .join()
+                .map_err(|_| ProcessError::Runtime("the node's thread unwound".into()))?;
+            ran
+        }
+        Ok(Ended::AtOnce(why)) => Err(ProcessError::Stopped(why)),
+        Err(_) => Err(ProcessError::Runtime(
+            "the node's thread ended without saying how".into(),
+        )),
+    }
+}
+
+/// [`start`]'s node, on the node's own thread: `at_once` hears a stop that ends the process at
+/// once before the node's teardown begins.
+fn run_node(
+    mut config: ProcessConfig,
+    held: (NodeLock, Locks),
+    identity: Identity,
+    (s3, ends_with_input): (Option<S3Keys>, bool),
+    at_once: SyncSender<Ended>,
 ) -> Result<(), ProcessError> {
     let (node, locks) = held;
     // The volumes open before the node's runtime starts: an issuer's start and a volume's
@@ -1179,7 +1228,7 @@ fn start(
             gateway,
             (credentials, peers),
             (addresses, s3),
-            ends_with_input,
+            (ends_with_input, at_once),
         ))
         .map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
     drop(node);
@@ -1564,7 +1613,7 @@ async fn serve(
     gateway: Option<GatewaySettings>,
     (credentials, peers): (Credentials, Vec<Peer>),
     (addresses, s3): (Vec<(u64, SocketAddr, SocketAddr)>, Option<S3Keys>),
-    ends_with_input: bool,
+    (ends_with_input, at_once): (bool, SyncSender<Ended>),
 ) -> Result<(), ProcessError> {
     // This process's one shard runs the node's replicas, which apply through the engine's
     // synchronous calls (node.md §1.2).
@@ -1751,7 +1800,7 @@ async fn serve(
                 while let Some(end) = pending.iter().position(|b| *b == b'\n') {
                     let line: Vec<u8> = pending.drain(..=end).collect();
                     if line.trim_ascii() == b"stop" {
-                        stop_asked(&mut stop, &mut node, &mut output).await?;
+                        stop_asked(&mut stop, &mut node, (&mut output, &at_once)).await?;
                     } else if line.trim_ascii() == b"chunks" {
                         let (received, written, held, unkept) = node.chunk_bytes()?;
                         let line = format!("chunks {received} {written} {held} {unkept}\n");
@@ -1769,11 +1818,13 @@ async fn serve(
             Either3::Second(Err(e)) => return Err(ProcessError::Runtime(format!("{e:?}"))),
             Either3::Third(Either3::First(signal)) => {
                 signal.map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
-                stop_asked(&mut stop, &mut node, &mut output).await?;
+                stop_asked(&mut stop, &mut node, (&mut output, &at_once)).await?;
             }
             Either3::Third(Either3::Second(slept)) => {
                 slept.map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
-                return Err(ProcessError::Stopped("the stop's bound passed"));
+                let why = "the stop's bound passed";
+                let _ = at_once.try_send(Ended::AtOnce(why));
+                return Err(ProcessError::Stopped(why));
             }
             Either3::Third(Either3::Third(ended)) => {
                 return Err(ProcessError::Listener(ended.to_string()));
@@ -2042,12 +2093,17 @@ fn take_line<E: Engine + 'static>(
 
 /// A request to stop, by a signal or a line: the node's orderly stop begins, said; begun already,
 /// the process ends at once.
+/// A request to stop: the first begins the orderly stop, and one as it runs ends the process at
+/// once, told to `at_once` before the node's teardown begins.
 async fn stop_asked<E: Engine + 'static>(
     stop: &mut Stop,
     node: &mut Node<E>,
-    output: &mut hyper_rt::stdio::Stdout,
+    (output, at_once): (&mut hyper_rt::stdio::Stdout, &SyncSender<Ended>),
 ) -> Result<(), ProcessError> {
-    stop.ask(hyper_rt::futures::now_ns())?;
+    if let Err(why) = stop.ask(hyper_rt::futures::now_ns()) {
+        let _ = at_once.try_send(Ended::AtOnce(why));
+        return Err(ProcessError::Stopped(why));
+    }
     node.stop();
     say(output, "stopping\n").await
 }
@@ -2106,7 +2162,10 @@ mod tests {
         let mut stop = Stop::new(Duration::from_secs(10));
         stop.ask(5).unwrap();
         assert_eq!(stop.by, Some(5 + 10_000_000_000));
-        assert!(matches!(stop.ask(6), Err(ProcessError::Stopped(_))));
+        assert_eq!(
+            stop.ask(6),
+            Err("a second request to stop came as the node stopped")
+        );
         assert_eq!(stop.by, Some(5 + 10_000_000_000));
         let mut unbounded = Stop::new(Duration::MAX);
         unbounded.ask(u64::MAX - 1).unwrap();

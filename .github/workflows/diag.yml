@@ -1,8 +1,10 @@
 name: diag-native-put-failed
-# Scratch: the native suite on both Windows runners as CI runs it (its tests side by side), four
-# rounds, every job the gateway host fails said with its call site and every put or completion
-# ending in an error said with the error (CI run 40440922240: windows-x86_64's library test's first
-# PutObject answered Failed).
+# Scratch: the native suite on the Windows runners as CI runs it (its tests side by side), six
+# rounds, every job the gateway host fails said with its call site, every put or completion ending
+# in an error said with the error (CI run 40440922240: windows-x86_64's library test's first
+# PutObject answered Failed), every exchange the transport judges stalled said with its rule and
+# state, and every chunk ask slow or lost said with its time (diag run 40458787305: a copy's
+# read-back get ended Stalled on windows-x86_64).
 on:
   push:
     branches: ["diag/**"]
@@ -17,7 +19,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: windows-x86_64, runner: windows-2025, target: x86_64-pc-windows-msvc }
+          - { name: windows-x86_64-a, runner: windows-2025, target: x86_64-pc-windows-msvc }
+          - { name: windows-x86_64-b, runner: windows-2025, target: x86_64-pc-windows-msvc }
           - { name: windows-aarch64, runner: windows-11-arm, target: aarch64-pc-windows-msvc }
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
@@ -41,10 +44,16 @@ jobs:
       - name: Build the native suite
         shell: bash
         run: cargo test --locked -p mantle --test native --no-run --target ${{ matrix.target }}
-      - name: The native suite, four rounds
+      - name: The native suite, six rounds
         shell: bash
         run: |
-          for round in 1 2 3 4; do
+          failed=0
+          for round in 1 2 3 4 5 6; do
             echo "=== round $round"
-            cargo test --locked -p mantle --test native --target ${{ matrix.target }} -- --nocapture 2>&1 | grep -aE "^test .* (ok|FAILED)|test result|DIAG|panicked|PutObject|Status|mantle: " || true
+            if ! cargo test --locked -p mantle --test native --target ${{ matrix.target }} -- --nocapture > round.log 2>&1; then
+              failed=$((failed + 1))
+            fi
+            grep -aE "^test .* (ok|FAILED)|test result|DIAG|diag-|panicked|PutObject|mantle: " round.log | cut -c1-1500 || true
           done
+          echo "=== $failed of 6 rounds failed"
+          test "$failed" -eq 0

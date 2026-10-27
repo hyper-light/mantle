@@ -981,6 +981,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 refusal: None,
             })
             .collect();
+        eprintln!("diag-node pid={} id={}", std::process::id(), settings.id);
         let mut node = Self {
             id: settings.id,
             log,
@@ -2809,6 +2810,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         let asked = self.next_chunk;
         self.next_chunk = asked.wrapping_add(1);
+        diag_asked(asked, false, at, u64::try_from(bytes.len()).unwrap_or(0));
         // A chunk past the largest the cell's gateways write is refused here as a peer refuses
         // it, before it is queued or sent.
         if u64::try_from(bytes.len()).map_or(true, |len| len > self.chunk_bytes) {
@@ -2889,6 +2891,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         let asked = self.next_chunk;
         self.next_chunk = asked.wrapping_add(1);
+        diag_asked(asked, true, at, len);
         if at == self.id {
             let outcome = match self.storage.holds(volume) {
                 None => Some(ChunkOutcome::Refused(chunk::Status::NoVolume)),
@@ -2931,7 +2934,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// Chunk put or get `ask`'s outcome, once answered, taken. Each asker takes its own asks'
     /// outcomes and never another's: the gateway host's asks are the node's too.
     pub fn take_chunk(&mut self, ask: ChunkAsk) -> Option<ChunkOutcome> {
-        take_done(&mut self.chunks_done, ask)
+        let taken = take_done(&mut self.chunks_done, ask);
+        if let Some(outcome) = taken.as_ref() {
+            diag_taken(self.id, ask, outcome);
+        }
+        taken
     }
 
     /// The volumes the node holds: each one's id and its device directory.
@@ -3791,5 +3798,46 @@ mod tests {
             assert!(!names_only_its_sender(&command, 8, true), "another node's");
             assert!(!names_only_its_sender(&command, 7, false), "a client's");
         }
+    }
+}
+
+/// Diagnostic: each chunk ask's start, by its number: (ask, when, get, peer, length).
+static DIAG_ASKS: std::sync::Mutex<Vec<(u64, std::time::Instant, bool, u64, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn diag_wall_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+fn diag_asked(asked: u64, get: bool, peer: PeerId, len: u64) {
+    if let Ok(mut asks) = DIAG_ASKS.lock() {
+        asks.push((asked, std::time::Instant::now(), get, peer, len));
+    }
+}
+
+fn diag_taken(id: PeerId, asked: u64, outcome: &ChunkOutcome) {
+    let Ok(mut asks) = DIAG_ASKS.lock() else {
+        return;
+    };
+    let Some(at) = asks.iter().position(|a| a.0 == asked) else {
+        return;
+    };
+    let (_, when, get, peer, len) = asks.swap_remove(at);
+    let ms = when.elapsed().as_millis();
+    let kind = match outcome {
+        ChunkOutcome::Stored => "Stored".to_owned(),
+        ChunkOutcome::Read(_) => "Read".to_owned(),
+        other => format!("{other:?}"),
+    };
+    let plain = matches!(outcome, ChunkOutcome::Stored | ChunkOutcome::Read(_));
+    if ms >= 500 || !plain {
+        eprintln!(
+            "diag-chunk wall_ms={} pid={} node={id} get={get} peer={peer} len={len} ms={ms} outcome={kind}",
+            diag_wall_ms(),
+            std::process::id(),
+        );
     }
 }

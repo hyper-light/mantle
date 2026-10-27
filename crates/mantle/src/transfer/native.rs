@@ -100,6 +100,68 @@ impl Sink for Checked<'_, '_> {
     }
 }
 
+/// The control of the read check: a get's bytes with the one at `flip` inverted on its way to the
+/// check, as a byte the cell or the wire got wrong would come.
+pub struct Flipped<'o, 'g> {
+    pub checked: Checked<'o, 'g>,
+    at: u64,
+    flip: u64,
+    piece: Vec<u8>,
+}
+
+impl Sink for Flipped<'_, '_> {
+    async fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        let len = u64::try_from(bytes.len()).map_err(|_| io(GenError::Offset))?;
+        let end = self.at.saturating_add(len);
+        let wrote = if (self.at..end).contains(&self.flip) {
+            let i = usize::try_from(self.flip.saturating_sub(self.at))
+                .map_err(|_| io(GenError::Offset))?;
+            self.piece.clear();
+            self.piece.extend_from_slice(bytes);
+            if let Some(byte) = self.piece.get_mut(i) {
+                *byte = !*byte;
+            }
+            let piece = std::mem::take(&mut self.piece);
+            let wrote = self.checked.write(&piece).await;
+            self.piece = piece;
+            wrote
+        } else {
+            self.checked.write(bytes).await
+        };
+        self.at = end;
+        wrote
+    }
+}
+
+/// Reads `key` in `bucket` back as [`get`] does, the byte at `flip` inverted before the check: the
+/// offset the check found wrong, as it must find `flip`.
+pub async fn get_flipped(
+    client: &mut Client,
+    (bucket, key): (&str, &str),
+    object: &Object<'_>,
+    flip: u64,
+) -> Result<Came, mantle_client::ClientError> {
+    let op = Op::Get {
+        bucket: bucket.to_owned(),
+        key: key.to_owned(),
+        headers: Headers::default(),
+    };
+    let mut flipped = Flipped {
+        checked: Checked::new(object, mantle_client::PIECE),
+        at: 0,
+        flip,
+        piece: Vec::with_capacity(mantle_client::PIECE),
+    };
+    let reply = client.get(&op, &mut flipped, u64::MAX).await?;
+    if reply.status != Status::Done {
+        return Ok(Came::Refused(reply.status));
+    }
+    Ok(match flipped.checked.wrong {
+        Some(at) => Came::Wrong(at),
+        None => Came::Done,
+    })
+}
+
 /// An upload's progress, which the harness keeps no record of: a run restarts no copy.
 pub struct Unwatched;
 
@@ -159,28 +221,54 @@ pub fn part_size(length: u64) -> u64 {
     least.max(crate::client::PART)
 }
 
+/// Whether `asked` lost its answer and may be asked again, its `again` asks so far within the
+/// client's attempts: the node answers a request it took from what it made, matched by its
+/// identity, and a part put again replaces the one before (gateway.md §2.1; 05 §4.3).
+fn ask_again<T>(asked: &Result<T, mantle_client::ClientError>, again: u32) -> bool {
+    matches!(asked, Err(mantle_client::ClientError::Lost { .. }))
+        && again.saturating_add(1) < mantle_client::ATTEMPTS
+}
+
+/// Asks `op` of `client` with no body, again where its answer is lost (`ask_again`): its reply,
+/// and the times it was asked again.
+async fn call_again(
+    client: &mut Client,
+    op: &Op,
+) -> Result<(mantle_protocol::object::Reply, u32), mantle_client::ClientError> {
+    let mut again = 0u32;
+    loop {
+        let asked = client.call(op, u64::MAX).await;
+        if ask_again(&asked, again) {
+            again = again.saturating_add(1);
+            continue;
+        }
+        return asked.map(|reply| (reply, again));
+    }
+}
+
 /// Puts `object`, `length` bytes, at `key` in `bucket` as an explicit multipart upload of parts
 /// `part_size` makes, each part's bytes made from the generator at its offset as they are sent. A
-/// part refused ends the upload, aborted, so nothing of the object stays listed.
+/// part refused ends the upload, aborted, so nothing of the object stays listed. Each request whose
+/// answer is lost is asked again, the same request (`ask_again`): what it came to, and the times
+/// its requests were asked again.
 pub async fn put_parts(
     client: &mut Client,
     (bucket, key): (&str, &str),
     object: &Object<'_>,
     length: u64,
-) -> Result<Came, mantle_client::ClientError> {
-    let created = client
-        .call(
-            &Op::CreateUpload {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                id: mantle_client::identity()?,
-                checksum: Some((TRAILER, true)),
-            },
-            u64::MAX,
-        )
-        .await?;
+) -> Result<(Came, u32), mantle_client::ClientError> {
+    let (created, mut again) = call_again(
+        client,
+        &Op::CreateUpload {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            id: mantle_client::identity()?,
+            checksum: Some((TRAILER, true)),
+        },
+    )
+    .await?;
     if created.status != Status::Done {
-        return Ok(Came::Refused(created.status));
+        return Ok((Came::Refused(created.status), again));
     }
     let upload = created.upload;
     let part = part_size(length);
@@ -203,8 +291,17 @@ pub async fn put_parts(
             md5: None,
             trailing: Some(TRAILER),
         };
-        let mut made = Made::range(object, at, to);
-        let reply = client.put(&op, &mut made, u64::MAX).await?;
+        let mut asked = 0u32;
+        let reply = loop {
+            let mut made = Made::range(object, at, to);
+            let put = client.put(&op, &mut made, u64::MAX).await;
+            if ask_again(&put, asked) {
+                asked = asked.saturating_add(1);
+                continue;
+            }
+            break put?;
+        };
+        again = again.saturating_add(asked);
         if reply.status != Status::Done {
             let abort = Op::Abort {
                 bucket: bucket.to_owned(),
@@ -212,54 +309,67 @@ pub async fn put_parts(
                 upload,
                 id: mantle_client::identity()?,
             };
-            client.call(&abort, u64::MAX).await?;
-            return Ok(Came::Refused(reply.status));
+            let (_, aborted) = call_again(client, &abort).await?;
+            return Ok((Came::Refused(reply.status), again.saturating_add(aborted)));
         }
         parts.push((number, reply.etag.trim_matches('"').to_owned()));
         at = to;
     }
-    let done = client
-        .call(
-            &Op::Complete {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                upload,
-                id: mantle_client::identity()?,
-                headers: Headers::default(),
-                parts,
-            },
-            u64::MAX,
-        )
-        .await?;
+    let (done, completed) = call_again(
+        client,
+        &Op::Complete {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            upload,
+            id: mantle_client::identity()?,
+            headers: Headers::default(),
+            parts,
+        },
+    )
+    .await?;
+    let again = again.saturating_add(completed);
     Ok(if done.status == Status::Done {
-        Came::Done
+        (Came::Done, again)
     } else {
-        Came::Refused(done.status)
+        (Came::Refused(done.status), again)
     })
 }
 
-/// Reads `key` in `bucket` back whole and checks it is `object`'s `length` bytes.
+/// Reads `key` in `bucket` back whole and checks it is `object`'s `length` bytes, read again from
+/// its start where the answer is lost (`ask_again`): what it came to, and the times it was asked
+/// again.
 pub async fn get(
     client: &mut Client,
     (bucket, key): (&str, &str),
     object: &Object<'_>,
     length: u64,
-) -> Result<Came, mantle_client::ClientError> {
+) -> Result<(Came, u32), mantle_client::ClientError> {
     let op = Op::Get {
         bucket: bucket.to_owned(),
         key: key.to_owned(),
         headers: Headers::default(),
     };
-    let mut checked = Checked::new(object, mantle_client::PIECE);
-    let reply = client.get(&op, &mut checked, u64::MAX).await?;
-    if reply.status != Status::Done {
-        return Ok(Came::Refused(reply.status));
+    let mut again = 0u32;
+    loop {
+        let mut checked = Checked::new(object, mantle_client::PIECE);
+        let got = client.get(&op, &mut checked, u64::MAX).await;
+        if ask_again(&got, again) {
+            again = again.saturating_add(1);
+            continue;
+        }
+        let reply = got?;
+        if reply.status != Status::Done {
+            return Ok((Came::Refused(reply.status), again));
+        }
+        return Ok((
+            match checked.wrong {
+                Some(at) => Came::Wrong(at),
+                None if checked.len() != length => Came::Wrong(checked.len().min(length)),
+                None => Came::Done,
+            },
+            again,
+        ));
     }
-    Ok(match checked.wrong {
-        Some(at) => Came::Wrong(at),
-        None if checked.len() != length => Came::Wrong(checked.len().min(length)),
-        None => Came::Done,
-    })
 }
 
 /// The keys in `bucket`, listed a page at a time, at most `pages` pages: as many as the keys the

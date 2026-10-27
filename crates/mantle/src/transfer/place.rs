@@ -257,6 +257,74 @@ impl Reader {
         })
     }
 
+    /// The control of the placement check: `key`'s first block, one of its chunks moved onto
+    /// another's node in the volume table as read, judged as every block is. Whether the check
+    /// counts it, as it must; none for an object of no block of two chunks or more. A completed
+    /// upload's first block is its first part's, each part file followed once.
+    pub async fn moved(&mut self, bucket: &str, key: &str) -> Result<Option<bool>, TransferError> {
+        let read = self
+            .client
+            .read(
+                self.groups.name,
+                &Query::Current {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                },
+                u64::MAX,
+            )
+            .await
+            .map_err(failed)?;
+        let Read::Current(Some((_, version))) = read else {
+            return Err(unread(&format!("{key}'s current version")));
+        };
+        let mut file = version.file;
+        for _ in 0..=mantle_s3::body::MAX_PARTS {
+            let Some(at) = file else {
+                return Ok(None);
+            };
+            let read = self
+                .client
+                .read(
+                    self.groups.file,
+                    &Query::Extents {
+                        file: at,
+                        offset: 0,
+                        max: 1,
+                    },
+                    u64::MAX,
+                )
+                .await
+                .map_err(failed)?;
+            let Read::Extents(extents) = read else {
+                return Err(unread(&format!("{key}'s extents")));
+            };
+            match extents.first().map(|(_, extent)| extent.target) {
+                None => return Ok(None),
+                Some(Target::File(part)) => file = Some(part),
+                Some(Target::Block(block)) => {
+                    let read = self
+                        .client
+                        .read(self.groups.block, &Query::Block { block }, u64::MAX)
+                        .await
+                        .map_err(failed)?;
+                    let Read::Block(Some((_, places))) = read else {
+                        return Err(unread(&format!("{key}'s block {block:032x}")));
+                    };
+                    let volumes: Vec<u128> = places.iter().map(|p| p.volume).collect();
+                    let (Some(first), Some(second)) = (volumes.first(), volumes.get(1)) else {
+                        return Ok(None);
+                    };
+                    let mut moved = self.node_of.clone();
+                    if let Some(&node) = self.node_of.get(first) {
+                        moved.insert(*second, node);
+                    }
+                    return Ok(Some(!distinct(&volumes, &moved)));
+                }
+            }
+        }
+        Err(unread(&format!("{key}'s files past S3's parts")))
+    }
+
     /// Where the blocks of `key` in `bucket`, `length` bytes, sit: its blocks, and those two of
     /// whose chunks share a node. Its file's extents are read a page at a time, and a completed
     /// upload's part files after it, each once.

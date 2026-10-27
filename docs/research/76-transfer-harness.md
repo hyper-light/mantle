@@ -107,6 +107,30 @@ The first build met reads ended `Stalled` at a block whose copy the killed node 
 a chunk from a peer until the transport judged it gone, two idle timeouts, as long as the client
 waits. A node now reads nothing from a peer its detectors suspect (gateway.md §3's as-built note).
 
+**A lost answer is asked again, and counted.** The native client asks a request again of itself
+only where no node can have taken it; one whose exchange ended unanswered is its caller's, and
+asked again with its identity it is answered from what the first made (gateway.md §2.1). The
+harness asks an explicit part, an upload's creation and completion, and a read again so, within the
+client's attempts, a part put again replacing the one before and a completion asked again finding
+the version it made (05 §4.3, §4.4), and counts each in its row's `again` and its kill line. On
+CI's busy runner, two CPUs beside two busy loops, a 20 MiB object's first part waited past the
+client's period for its three durable copies, and the case ended there before (CI run
+40580884158): a lost answer is a client's to recover, and a cell slower than its client's period,
+STATUS item 8's open half, shows in the count rather than ending the run.
+
+**Each case runs its controls.** A check that cannot fail checks nothing, so after its real
+checks each case runs three faults through them and says whether each was caught: its first
+acknowledged object of a byte or more read back with its middle byte inverted on the way to the
+check, which must name that byte; that object's first block judged with one of its chunks moved
+onto another's node in the volume table as read, which the placement check must count; and a key
+no case puts, which must read as missing. A control missed leaves the case inexact.
+
+**Volumes can be the machine's.** A case's volumes are stated bytes, or `--volume free`: the run's
+file system's free space at the case's start, as the OS gives an unprivileged writer
+(`mantle_disk::probe`: `statvfs`, `statfs`, `GetDiskFreeSpaceExW`), less the `--reserve` its
+operator keeps free, a third to each founder, each case's line saying which. A capacity case so
+fills what the machine can give after the cell's three copies (plan step 9).
+
 **Every node's chunk bytes are accounted.** Once a case is done each node is asked its chunk bytes
 on its standard input: received from peers over QUIC, put on its own volumes in-process, held by
 its volumes, and of the first two kept by none, a volume's refusal or a body that ended before it
@@ -119,12 +143,15 @@ writes take (research/11 §10.3), which is half of so small a volume.
 **Bounded by construction.** A case keeps two fixed-size histograms of latency
 (`mantle_disk::histogram`, HdrHistogram's buckets) and counts; a node's status lines are read on a
 thread of its own, three in all; the native door drives its objects on the client's one task
-(f33, f67). The harness writes nowhere but the directory its operator names, and runs only where
-its operator runs it: a case fills the volumes it states (f7).
+(f33, f67). The harness writes nowhere but the directory its operator names, and
+runs only where its operator runs it: a case fills the volumes it states (f7).
 
 ## Open
 
-- The controls that must fail: a flipped byte, a chunk moved onto its block's other node, a missing
-  object, each through the whole harness.
+- The harness's waits end on the line they wait for or on a process's end: a node that hangs
+  silent hangs the run. They are to end, too, once the cell has gone quiet for as long as its nodes
+  state they may go without moving (each `status` line's patience, reconnect, measuring and asking,
+  as the tests' cell takes them), a node's first start, measuring its devices before it says
+  anything, included.
 - The memory and threads of a case of 100k objects against their stated bounds; the 10 GB and
   100 GB cases on the owner's machines (plan step 10).

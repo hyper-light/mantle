@@ -58,7 +58,48 @@ pub struct Options {
     /// through each door.
     pub count: Option<u64>,
     /// Each founder's volume.
-    pub volume_bytes: u64,
+    pub volume: Volume,
+}
+
+/// Each founder's volume: stated bytes, or the run's file system's free space at each case's start
+/// less a reserve its operator keeps free, split among the founders (plan step 9: a capacity case
+/// fills what the machine can give).
+#[derive(Clone, Copy, Debug)]
+pub enum Volume {
+    Bytes(u64),
+    Free { reserve: u64 },
+}
+
+impl Volume {
+    /// A founder's volume for the case in `dir`, and how it was come to.
+    fn bytes(self, dir: &Path) -> Result<(u64, String), TransferError> {
+        match self {
+            Self::Bytes(bytes) => Ok((bytes, "stated".to_owned())),
+            Self::Free { reserve } => {
+                let free = mantle_disk::probe::identify(dir)
+                    .file_system
+                    .available_bytes
+                    .ok_or_else(|| {
+                        TransferError::Io(std::io::Error::other(
+                            "the run's file system says no free space",
+                        ))
+                    })?;
+                let bytes = free
+                    .checked_sub(reserve)
+                    .and_then(|room| room.checked_div(u64::try_from(cell::FOUNDERS).ok()?))
+                    .filter(|bytes| *bytes > 0)
+                    .ok_or_else(|| {
+                        TransferError::Io(std::io::Error::other(format!(
+                            "{free} bytes free, no more than the {reserve} kept free"
+                        )))
+                    })?;
+                Ok((
+                    bytes,
+                    format!("{free} free less {reserve} kept, a third each"),
+                ))
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -118,6 +159,9 @@ pub struct Tally {
     pub refused: u64,
     /// Puts refused as out of space: what a filling case puts until.
     pub full: u64,
+    /// Requests asked again, the same, after their answers were lost: an exchange the client gave
+    /// up on before the node answered (gateway.md §2.1).
+    pub again: u64,
     /// Reads back, through either door, with a byte or a length not the generator's.
     pub wrong: u64,
     /// Reads back, through either door, of an acknowledged object not answered with it.
@@ -139,6 +183,7 @@ impl Tally {
             bytes: 0,
             refused: 0,
             full: 0,
+            again: 0,
             wrong: 0,
             missing: 0,
             put: Histogram::new(),
@@ -163,6 +208,11 @@ impl Tally {
             self.refused = self.refused.saturating_add(1);
             false
         }
+    }
+
+    /// Counts `again` requests asked again after their answers were lost.
+    fn asked_again(&mut self, again: u32) {
+        self.again = self.again.saturating_add(u64::from(again));
     }
 
     /// Counts a read back through the native door.
@@ -252,31 +302,34 @@ impl Natives {
     }
 
     /// Reads every object of a case acknowledged in `oracle`, `count` of them named by `objects`
-    /// and made from `seed`, natively through node `first` first: how many were read, wrong and
-    /// missing.
+    /// and made from `seed`, natively through node `first` first: how many were read, wrong,
+    /// missing and asked again.
     fn read_all(
         &mut self,
         first: usize,
         (objects, oracle, count, seed): (Objects, &Oracle, u64, u64),
-    ) -> Result<(u64, u64, u64), TransferError> {
+    ) -> Result<(u64, u64, u64, u64), TransferError> {
         let settings = self.settings(first)?;
         let acknowledged = oracle.clone();
         self.block(async move {
             let generator = Generator::new(seed)?;
             let sizes = generator.object("sizes")?;
             let mut client = Client::open(settings).await?;
-            let (mut read, mut wrong, mut missing) = (0u64, 0u64, 0u64);
+            let (mut read, mut wrong, mut missing, mut asked) = (0u64, 0u64, 0u64, 0u64);
             for i in (0..count).filter(|i| acknowledged.has(*i)) {
                 let (key, length) = objects.of(i, &sizes)?;
                 let object = generator.object(&key)?;
-                match native::get(&mut client, (BUCKET, &key), &object, length).await? {
+                let (came, again) =
+                    native::get(&mut client, (BUCKET, &key), &object, length).await?;
+                match came {
                     Came::Done => {}
                     Came::Wrong(_) => wrong = wrong.saturating_add(1),
                     Came::Refused(_) => missing = missing.saturating_add(1),
                 }
                 read = read.saturating_add(1);
+                asked = asked.saturating_add(u64::from(again));
             }
-            Ok((read, wrong, missing))
+            Ok((read, wrong, missing, asked))
         })
     }
 
@@ -372,7 +425,7 @@ pub fn transfer(out: &mut impl Write, options: &Options) -> Result<bool, Transfe
     if !options.small.is_empty() {
         writeln!(
             out,
-            "  {:<18} {:>8} {:>12} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>7} {:>6} {:>7}",
+            "  {:<18} {:>8} {:>12} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>5} {:>7} {:>6} {:>7}",
             "case",
             "objects",
             "bytes",
@@ -382,6 +435,7 @@ pub fn transfer(out: &mut impl Write, options: &Options) -> Result<bool, Transfe
             "native p99",
             "http p50",
             "http p99",
+            "again",
             "refused",
             "wrong",
             "missing"
@@ -393,20 +447,28 @@ pub fn transfer(out: &mut impl Write, options: &Options) -> Result<bool, Transfe
         // A case's directory is its own: one an earlier run left is refused, not reused.
         let dir = options.dir.join(format!("small-{count}"));
         std::fs::create_dir(&dir)?;
-        let mut cell = Cell::make(&dir, options.volume_bytes)?;
+        let case = format!("small {count}");
+        let (volume_bytes, why) = options.volume.bytes(&dir)?;
+        writeln!(out, "  {case} volumes: {volume_bytes} bytes each ({why})")?;
+        let mut cell = Cell::make(&dir, volume_bytes)?;
         let mut natives = Natives::new(&cell, &dir, messages)?;
         let (tallies, oracle) = small(&cell, &mut natives, &dir, options.seed, count)?;
-        let case = format!("small {count}");
         exact &= placed(
             out,
             (&cell, &mut natives, messages),
             &case,
             (Objects::Small, &oracle, count, options.seed),
         )?;
-        exact &= accounted(out, &mut cell, &case, options.volume_bytes)?;
+        exact &= accounted(out, &mut cell, &case, volume_bytes)?;
         exact &= killed(
             out,
             (&mut cell, &mut natives),
+            &case,
+            (Objects::Small, &oracle, count, options.seed),
+        )?;
+        exact &= controls(
+            out,
+            (&cell, &mut natives, messages),
             &case,
             (Objects::Small, &oracle, count, options.seed),
         )?;
@@ -415,7 +477,7 @@ pub fn transfer(out: &mut impl Write, options: &Options) -> Result<bool, Transfe
         for (door, tally) in ["native", "http"].iter().zip(&tallies) {
             writeln!(
                 out,
-                "  {:<18} {:>8} {:>12} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>7} {:>6} {:>7}",
+                "  {:<18} {:>8} {:>12} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>5} {:>7} {:>6} {:>7}",
                 format!("small {count} {door}"),
                 tally.objects,
                 tally.bytes,
@@ -425,6 +487,7 @@ pub fn transfer(out: &mut impl Write, options: &Options) -> Result<bool, Transfe
                 micros(tally.native.p99()),
                 micros(tally.http.p50()),
                 micros(tally.http.p99()),
+                tally.again,
                 tally.refused,
                 tally.wrong,
                 tally.missing,
@@ -435,13 +498,14 @@ pub fn transfer(out: &mut impl Write, options: &Options) -> Result<bool, Transfe
     if !options.large.is_empty() {
         writeln!(
             out,
-            "  {:<26} {:>8} {:>14} {:>12} {:>12} {:>12} {:>5} {:>7} {:>6} {:>7}",
+            "  {:<26} {:>8} {:>14} {:>12} {:>12} {:>12} {:>5} {:>5} {:>7} {:>6} {:>7}",
             "case",
             "objects",
             "bytes",
             "put",
             "native read",
             "http read",
+            "again",
             "full",
             "refused",
             "wrong",
@@ -451,26 +515,34 @@ pub fn transfer(out: &mut impl Write, options: &Options) -> Result<bool, Transfe
     for &length in &options.large {
         let dir = options.dir.join(format!("large-{length}"));
         std::fs::create_dir(&dir)?;
-        let mut cell = Cell::make(&dir, options.volume_bytes)?;
+        let case = format!("large {length}");
+        let (volume_bytes, why) = options.volume.bytes(&dir)?;
+        writeln!(out, "  {case} volumes: {volume_bytes} bytes each ({why})")?;
+        let mut cell = Cell::make(&dir, volume_bytes)?;
         let mut natives = Natives::new(&cell, &dir, messages)?;
         let (done, oracle, budget) = large::large(
             &cell,
             &mut natives,
             &dir,
             (options.seed, length, options.count),
-            options.volume_bytes,
+            volume_bytes,
         )?;
-        let case = format!("large {length}");
         exact &= placed(
             out,
             (&cell, &mut natives, messages),
             &case,
             (Objects::Large(length), &oracle, budget, options.seed),
         )?;
-        exact &= accounted(out, &mut cell, &case, options.volume_bytes)?;
+        exact &= accounted(out, &mut cell, &case, volume_bytes)?;
         exact &= killed(
             out,
             (&mut cell, &mut natives),
+            &case,
+            (Objects::Large(length), &oracle, budget, options.seed),
+        )?;
+        exact &= controls(
+            out,
+            (&cell, &mut natives, messages),
             &case,
             (Objects::Large(length), &oracle, budget, options.seed),
         )?;
@@ -479,13 +551,14 @@ pub fn transfer(out: &mut impl Write, options: &Options) -> Result<bool, Transfe
         for (way, tally) in large::WAYS.iter().zip(&done.tallies) {
             writeln!(
                 out,
-                "  {:<26} {:>8} {:>14} {:>12} {:>12} {:>12} {:>5} {:>7} {:>6} {:>7}",
+                "  {:<26} {:>8} {:>14} {:>12} {:>12} {:>12} {:>5} {:>5} {:>7} {:>6} {:>7}",
                 format!("large {length} {}", way.name()),
                 tally.objects,
                 tally.bytes,
                 rate(tally.bytes, tally.put_ns),
                 rate(tally.bytes, tally.native_ns),
                 rate(tally.bytes, tally.http_ns),
+                tally.again,
                 tally.full,
                 tally.refused,
                 tally.wrong,
@@ -574,11 +647,12 @@ fn killed(
     case: &str,
     case_objects: (Objects, &Oracle, u64, u64),
 ) -> Result<bool, TransferError> {
-    let (mut read, mut wrong, mut missing) = (0u64, 0u64, 0u64);
-    let mut count = |(r, w, m): (u64, u64, u64)| {
+    let (mut read, mut wrong, mut missing, mut again) = (0u64, 0u64, 0u64, 0u64);
+    let mut count = |(r, w, m, a): (u64, u64, u64, u64)| {
         read = read.saturating_add(r);
         wrong = wrong.saturating_add(w);
         missing = missing.saturating_add(m);
+        again = again.saturating_add(a);
     };
     for at in 0..cell::FOUNDERS {
         cell.kill(at)?;
@@ -596,9 +670,83 @@ fn killed(
     writeln!(
         out,
         "  {case} kills: each founder killed in turn and started again, {read} reads through the \
-         others and through it, {wrong} wrong, {missing} missing",
+         others and through it, {again} asked again, {wrong} wrong, {missing} missing",
     )?;
     Ok(wrong == 0 && missing == 0)
+}
+
+/// The key the missing-object control reads, which no case puts.
+const NEVER_PUT: &str = "control-never-put";
+
+/// The case's controls, each a fault its checks must catch, a line to `out`: the first
+/// acknowledged object of a byte or more read back with its middle byte inverted on its way to the
+/// check, which must find that byte; that object's first block judged with one chunk moved onto
+/// another's node, which the placement check must count; and a key no case puts, which must read
+/// as missing. Whether each was caught: a control the checks miss leaves the case inexact.
+fn controls(
+    out: &mut impl Write,
+    (cell, natives, messages): (&Cell, &mut Natives, Bounds),
+    case: &str,
+    (objects, oracle, count, seed): (Objects, &Oracle, u64, u64),
+) -> Result<bool, TransferError> {
+    let generator = Generator::new(seed)?;
+    let sizes = generator.object("sizes")?;
+    let mut first = None;
+    for i in (0..count).filter(|i| oracle.has(*i)) {
+        let (key, length) = objects.of(i, &sizes)?;
+        if length > 0 {
+            first = Some((key, length));
+            break;
+        }
+    }
+    let Some((key, length)) = first else {
+        writeln!(
+            out,
+            "  {case} controls: no acknowledged object of a byte or more"
+        )?;
+        return Ok(false);
+    };
+    let flip = length.checked_div(2).unwrap_or(0);
+    let settings = natives.settings(0)?;
+    let reader = cell.gateway().settings(messages)?;
+    let bound = cell.quic();
+    let groups = cell.gateway().groups;
+    let page = mantle_node::read::extents_page(mantle_node::read::reply_room(messages.request));
+    let read_key = key.clone();
+    let (flipped, missing, moved) = natives.block(async move {
+        let generator = Generator::new(seed)?;
+        let object = generator.object(&read_key)?;
+        let mut client = Client::open(settings).await?;
+        let flipped = native::get_flipped(&mut client, (BUCKET, &read_key), &object, flip).await?;
+        let never = generator.object(NEVER_PUT)?;
+        let (missing, _) = native::get(&mut client, (BUCKET, NEVER_PUT), &never, 0).await?;
+        let mut reader =
+            place::Reader::open(reader, (bound, cell::FOUNDERS), (groups, page)).await?;
+        let moved = reader.moved(BUCKET, &read_key).await?;
+        Ok((flipped, missing, moved))
+    })?;
+    let found_flip = flipped == Came::Wrong(flip);
+    let found_missing = missing == Came::Refused(Status::NoSuchKey);
+    // An object whose blocks hold one chunk each has none to move: no control to judge.
+    let found_moved = moved.unwrap_or(true);
+    let said = |caught: bool| if caught { "caught" } else { "NOT caught" };
+    writeln!(
+        out,
+        "  {case} controls: {key}'s byte {flip} inverted {}; a chunk of its first block moved \
+         onto another's node {}; a key never put read {}",
+        said(found_flip),
+        match moved {
+            Some(true) => "caught",
+            Some(false) => "NOT caught",
+            None => "not judged, a block of one chunk",
+        },
+        if found_missing {
+            "missing, caught"
+        } else {
+            "NOT missing"
+        },
+    )?;
+    Ok(found_flip && found_missing && found_moved)
 }
 
 /// Each node's chunk bytes once case `case` is done, a line to `out`: what each holds of its
@@ -729,8 +877,9 @@ fn small(
             let name = format!("s{i}");
             let object = generator.object(&name)?;
             let began = Instant::now();
-            let came = native::get(&mut reader, (BUCKET, &name), &object, length).await?;
+            let (came, again) = native::get(&mut reader, (BUCKET, &name), &object, length).await?;
             if let Some(tally) = tallies.get_mut(door(i)) {
+                tally.asked_again(again);
                 tally.native_came(came, elapsed(began));
             }
         }

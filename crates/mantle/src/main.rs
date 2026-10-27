@@ -361,9 +361,14 @@ enum BenchCommand {
         /// refuses one as out of space through each door.
         #[arg(long)]
         count: Option<u64>,
-        /// Each founder's volume, in bytes or with a K, M, G or T suffix (powers of 1024).
-        #[arg(long, value_parser = init::parse_bytes, default_value = "256M")]
-        volume: u64,
+        /// Each founder's volume, in bytes or with a K, M, G or T suffix (powers of 1024), or
+        /// `free`: the run's file system's free space at each case's start, less `--reserve`, a
+        /// third each.
+        #[arg(long, value_parser = volume_arg, default_value = "256M")]
+        volume: VolumeArg,
+        /// The bytes the run's file system keeps free where `--volume free` sizes the volumes.
+        #[arg(long, value_parser = init::parse_bytes)]
+        reserve: Option<u64>,
     },
 }
 
@@ -770,23 +775,32 @@ fn main() -> ExitCode {
                     large,
                     count,
                     volume,
+                    reserve,
                 },
         } => {
-            if small.is_empty() && large.is_empty() {
-                Err("no case: --small N or --large SIZE".into())
-            } else {
-                let options = transfer::Options {
-                    dir,
-                    seed,
-                    small,
-                    large,
-                    count,
-                    volume_bytes: volume,
-                };
-                match transfer::transfer(&mut out, &options) {
-                    Ok(true) => Ok(()),
-                    Ok(false) => Err("a check was not exact: the rows above say which".into()),
-                    Err(e) => Err(e.to_string()),
+            let volume = match (volume.0, reserve) {
+                (Some(bytes), None) => Ok(transfer::Volume::Bytes(bytes)),
+                (None, Some(reserve)) => Ok(transfer::Volume::Free { reserve }),
+                (None, None) => Err("--volume free needs the --reserve kept free"),
+                (Some(_), Some(_)) => Err("--reserve sizes a --volume free, not a stated one"),
+            };
+            match (small.is_empty() && large.is_empty(), volume) {
+                (true, _) => Err("no case: --small N or --large SIZE".into()),
+                (false, Err(why)) => Err(why.into()),
+                (false, Ok(volume)) => {
+                    let options = transfer::Options {
+                        dir,
+                        seed,
+                        small,
+                        large,
+                        count,
+                        volume,
+                    };
+                    match transfer::transfer(&mut out, &options) {
+                        Ok(true) => Ok(()),
+                        Ok(false) => Err("a check was not exact: the rows above say which".into()),
+                        Err(e) => Err(e.to_string()),
+                    }
                 }
             }
         }
@@ -816,6 +830,19 @@ fn main() -> ExitCode {
         }
     };
     exit(result)
+}
+
+/// `mantle bench transfer`'s `--volume`: a size, or none for `free`, the run's free space less its
+/// reserve.
+#[derive(Clone, Copy, Debug)]
+struct VolumeArg(Option<u64>);
+
+fn volume_arg(text: &str) -> Result<VolumeArg, String> {
+    if text == "free" {
+        Ok(VolumeArg(None))
+    } else {
+        init::parse_bytes(text).map(|bytes| VolumeArg(Some(bytes)))
+    }
 }
 
 fn exit(result: Result<(), String>) -> ExitCode {

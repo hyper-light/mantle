@@ -122,7 +122,7 @@ pub(super) fn large(
         let began = Instant::now();
         // Asked once: a full cell's volumes hold a put for their cleaners' verdicts, so its first
         // answer is the typed one (research/75), and a SlowDown is counted as refused.
-        let came = {
+        let (came, again) = {
             match way {
                 Way::Runs | Way::Parts => {
                     let settings = natives.settings(0)?;
@@ -132,22 +132,30 @@ pub(super) fn large(
                         let mut client = mantle_client::Client::open(settings).await?;
                         let at = (BUCKET, key(i));
                         Ok(if way == Way::Runs {
-                            native::put(&mut client, (at.0, &at.1), &object, length).await?
+                            (
+                                native::put(&mut client, (at.0, &at.1), &object, length).await?,
+                                0,
+                            )
                         } else {
                             native::put_parts(&mut client, (at.0, &at.1), &object, length).await?
                         })
                     })?
                 }
-                Way::Cli => cli
-                    .put((BUCKET, &name), &object, length)
-                    .map_err(TransferError::Stock)?,
-                Way::Boto => boto
-                    .mput(&name, &object, (length, part))
-                    .map_err(TransferError::Stock)?,
+                Way::Cli => (
+                    cli.put((BUCKET, &name), &object, length)
+                        .map_err(TransferError::Stock)?,
+                    0,
+                ),
+                Way::Boto => (
+                    boto.mput(&name, &object, (length, part))
+                        .map_err(TransferError::Stock)?,
+                    0,
+                ),
             }
         };
         let took = elapsed(began);
         if let Some(tally) = tallies.get_mut(at) {
+            tally.asked_again(again);
             if came == Came::Refused(Status::InsufficientStorage) {
                 tally.full = tally.full.saturating_add(1);
                 if let Some(door) = full.get_mut(way.door()) {
@@ -165,13 +173,14 @@ pub(super) fn large(
         let (_, at) = Way::of(i);
         let settings = natives.settings(1)?;
         let began = Instant::now();
-        let came = natives.block(async move {
+        let (came, again) = natives.block(async move {
             let generator = Generator::new(seed)?;
             let object = generator.object(&key(i))?;
             let mut client = mantle_client::Client::open(settings).await?;
             Ok(native::get(&mut client, (BUCKET, &key(i)), &object, length).await?)
         })?;
         if let Some(tally) = tallies.get_mut(at) {
+            tally.asked_again(again);
             tally.native_came(came, elapsed(began));
         }
         let object = generator.object(&key(i))?;
@@ -189,7 +198,7 @@ pub(super) fn large(
     let mut unlisted = true;
     for &i in &refused {
         let settings = natives.settings(1)?;
-        let came = natives.block(async move {
+        let (came, _) = natives.block(async move {
             let generator = Generator::new(seed)?;
             let object = generator.object(&key(i))?;
             let mut client = mantle_client::Client::open(settings).await?;

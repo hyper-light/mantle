@@ -56,9 +56,11 @@ fn line<'a>(said: &'a str, case: &str) -> &'a str {
 /// standard input, one natively in explicit parts and one by boto3 in parts. Every object reads
 /// back whole through both doors, the large ones listed by both; every block's chunks sit on
 /// distinct nodes, as the Block range and the volume table say; every node holds exactly the chunk
-/// bytes it received over QUIC and put itself, none refused; and with each founder SIGKILLed in
-/// turn every object reads back through the others, and through it once it is started again. A
-/// case's directory is its own: the same run again is refused, not mixed into the last.
+/// bytes it received over QUIC and put itself, none refused; with each founder SIGKILLed in turn
+/// every object reads back through the others, and through it once it is started again; and each
+/// control is caught: a byte inverted on its way to the check, a chunk moved onto another's node, a
+/// key never put. A case's directory is its own: the same run again is refused, not mixed into the
+/// last.
 #[test]
 fn the_small_set_and_large_objects_in_every_way_read_back_exactly() {
     let root = tempfile::tempdir().unwrap();
@@ -101,6 +103,11 @@ fn the_small_set_and_large_objects_in_every_way_read_back_exactly() {
             line(&said, &format!("{case} kills")).ends_with("0 wrong, 0 missing"),
             "{said}"
         );
+        // The controls, each a fault the checks must catch: a byte inverted on its way to the
+        // check, a chunk moved onto another's node, a key never put.
+        let controls = line(&said, &format!("{case} controls"));
+        assert_eq!(controls.matches("caught").count(), 3, "{said}");
+        assert!(!controls.contains("NOT"), "{said}");
     }
     let again = Command::new(MANTLE)
         .args(["bench", "transfer"])

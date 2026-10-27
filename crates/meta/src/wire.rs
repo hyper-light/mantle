@@ -693,14 +693,20 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
             record::put_bytes(w, &c.upload.encode()?)?;
         }
         name::Command::PutPart(p) => {
-            w.u8(3);
+            // A native upload's run takes a tag of its own, so entries written before runs
+            // decode as they did.
+            w.u8(if p.run.is_some() { 21 } else { 3 });
             put_target(w, &p.bucket, p.incarnation, &p.key)?;
             record::put_str(w, &p.upload)?;
             w.u16(p.number);
             record::put_bytes(w, &p.part.encode()?)?;
+            if let Some(run) = &p.run {
+                put_run(w, run);
+            }
         }
         name::Command::Complete(c) => {
-            w.u8(4);
+            // As a run's: a native upload's completion takes a tag of its own.
+            w.u8(if c.native { 22 } else { 4 });
             put_target(w, &c.bucket, c.incarnation, &c.key)?;
             record::put_str(w, &c.upload)?;
             w.u8(c.versioning.code());
@@ -875,19 +881,24 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
                 upload: Upload::decode(&record::take_bytes(r)?).ok()?,
             })
         }
-        3 => {
+        tag @ (3 | 21) => {
             let (bucket, incarnation, key) = take_target(r)?;
+            let upload = record::take_str(r)?;
+            let number = r.u16()?;
+            let part = Part::decode(&record::take_bytes(r)?).ok()?;
+            let run = if tag == 21 { Some(take_run(r)?) } else { None };
             name::Command::PutPart(name::PutPart {
                 bucket,
                 incarnation,
                 key,
-                upload: record::take_str(r)?,
-                number: r.u16()?,
-                part: Part::decode(&record::take_bytes(r)?).ok()?,
+                upload,
+                number,
+                part,
                 at_ns,
+                run,
             })
         }
-        4 => {
+        tag @ (4 | 22) => {
             let (bucket, incarnation, key) = take_target(r)?;
             let upload = record::take_str(r)?;
             let versioning = Versioning::from_code(r.u8()?)?;
@@ -922,6 +933,7 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
                 default: take_default(r)?,
                 id: r.u128()?,
                 deadline_ns: r.u64()?,
+                native: tag == 22,
             })
         }
         5 => {
@@ -1044,6 +1056,38 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
             })
         }
         _ => return None,
+    })
+}
+
+/// A native upload's run: its offset, then a byte (bit 0 last, bits 1 and 2 the MD5: none,
+/// running or done), then the MD5's 16 bytes if it has one.
+fn put_run(w: &mut Writer, run: &name::Run) {
+    w.u64(run.offset);
+    let md5 = match run.md5 {
+        None => 0u8,
+        Some(record::RunMd5::Running(_)) => 1,
+        Some(record::RunMd5::Done(_)) => 2,
+    };
+    w.u8(u8::from(run.last) | (md5 << 1));
+    if let Some(record::RunMd5::Running(bytes) | record::RunMd5::Done(bytes)) = &run.md5 {
+        w.bytes(bytes);
+    }
+}
+
+fn take_run(r: &mut Reader<'_>) -> Option<name::Run> {
+    let offset = r.u64()?;
+    let flags = r.u8()?;
+    let mut digest = || -> Option<[u8; 16]> { r.take(16)?.try_into().ok() };
+    let md5 = match flags >> 1 {
+        0 => None,
+        1 => Some(record::RunMd5::Running(digest()?)),
+        2 => Some(record::RunMd5::Done(digest()?)),
+        _ => return None,
+    };
+    Some(name::Run {
+        offset,
+        last: flags & 1 == 1,
+        md5,
     })
 }
 
@@ -1261,15 +1305,19 @@ fn put_name_outcome(w: &mut Writer, o: &name::Outcome) -> Result<(), RecordError
             w.u8(0);
             record::put_str(w, version)?;
         }
+        // With its ETag, which a native upload's retry has no listed parts to derive; 37 was
+        // the same without it.
         O::Completed {
             version,
             size,
             checksum,
+            etag,
         } => {
-            w.u8(37);
+            w.u8(40);
             record::put_str(w, version)?;
             w.u64(*size);
             put_checksum(w, checksum.as_ref())?;
+            record::put_str(w, etag)?;
         }
         O::Deleted { marker, version } => {
             w.u8(1);
@@ -1351,6 +1399,11 @@ fn put_name_outcome(w: &mut Writer, o: &name::Outcome) -> Result<(), RecordError
         }
         O::Resolved => w.u8(34),
         O::Miscombined => w.u8(36),
+        O::Offset { offset, ended } => {
+            w.u8(39);
+            w.u64(*offset);
+            w.u8(u8::from(*ended));
+        }
     }
     Ok(())
 }
@@ -1412,10 +1465,15 @@ fn take_name_outcome(r: &mut Reader<'_>) -> Option<name::Outcome> {
         0 => O::Put {
             version: record::take_str(r)?,
         },
-        37 => O::Completed {
+        tag @ (37 | 40) => O::Completed {
             version: record::take_str(r)?,
             size: r.u64()?,
             checksum: take_checksum(r)?,
+            etag: if tag == 40 {
+                record::take_str(r)?
+            } else {
+                String::new()
+            },
         },
         1 => {
             let marker = match r.u8()? {
@@ -1482,6 +1540,10 @@ fn take_name_outcome(r: &mut Reader<'_>) -> Option<name::Outcome> {
         33 => O::Thawed(Box::new(record::take_lineage(r)?)),
         34 => O::Resolved,
         36 => O::Miscombined,
+        39 => O::Offset {
+            offset: r.u64()?,
+            ended: take_bool(r)?,
+        },
         _ => return None,
     })
 }
@@ -1546,6 +1608,7 @@ pub fn largest_entry_bytes() -> Result<usize, RecordError> {
         }),
         id: u128::MAX,
         deadline_ns: u64::MAX,
+        native: false,
     };
     let write = file::Command::Write {
         file: u128::MAX,
@@ -1645,6 +1708,7 @@ pub fn largest_answer_bytes() -> Result<usize, RecordError> {
             version: version.clone(),
             size: u64::MAX,
             checksum: Some(longest_checksum()),
+            etag: longest_etag(),
         }),
         Answer::Name(name::Outcome::Put {
             version: version.clone(),
@@ -1696,6 +1760,14 @@ pub fn largest_row_bytes() -> Result<usize, RecordError> {
         checksum: Some((u8::MAX, true)),
         retention,
         legal_hold: Some(true),
+        runs: Some(record::Runs {
+            length: Some(u64::MAX),
+            run: u64::MAX,
+            offset: u64::MAX,
+            count: u16::MAX,
+            ended: true,
+            md5: Some(record::RunMd5::Done([u8::MAX; 16])),
+        }),
     };
     let part = Part {
         etag: "e".repeat(ETAG_HEX),
@@ -1732,6 +1804,7 @@ mod tests {
                 parts: 2,
                 value: vec![1; 32],
             }),
+            etag: longest_etag(),
         });
         assert!(completed.encode().unwrap().len() <= largest);
         let moved = Answer::Name(name::Outcome::Moved(Box::new(longest_lineage())));
@@ -1789,6 +1862,7 @@ mod tests {
             id: 0,
             deadline_ns: 2,
             listing: [0; crate::record::LISTING],
+            native: false,
         };
         let entry = Entry {
             at_ns: 1,
@@ -1983,6 +2057,29 @@ mod tests {
                         until_ms: 1,
                     }),
                     legal_hold: Some(true),
+                    runs: None,
+                },
+            })),
+            named(name::Command::CreateUpload(name::CreateUpload {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: "k".into(),
+                at_ns,
+                upload: Upload {
+                    initiated_ns: 0,
+                    owner: "o".into(),
+                    headers: Vec::new(),
+                    checksum: Some((4, true)),
+                    retention: None,
+                    legal_hold: None,
+                    runs: Some(record::Runs {
+                        length: None,
+                        run: 8 << 20,
+                        offset: 0,
+                        count: 0,
+                        ended: false,
+                        md5: Some(record::RunMd5::Running([7; 16])),
+                    }),
                 },
             })),
             named(name::Command::PutPart(name::PutPart {
@@ -2000,6 +2097,28 @@ mod tests {
                     deadline_ns: u64::MAX,
                 },
                 at_ns,
+                run: None,
+            })),
+            named(name::Command::PutPart(name::PutPart {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: "k".into(),
+                upload: "u".into(),
+                number: 2,
+                part: Part {
+                    etag: String::new(),
+                    size: 5 << 20,
+                    checksum: Some(vec![1; 8]),
+                    file: 5,
+                    modified_ns: 0,
+                    deadline_ns: u64::MAX,
+                },
+                at_ns,
+                run: Some(name::Run {
+                    offset: 5 << 20,
+                    last: true,
+                    md5: Some(record::RunMd5::Done([9; 16])),
+                }),
             })),
             named(name::Command::Complete(name::Complete {
                 bucket: "b".into(),
@@ -2025,6 +2144,26 @@ mod tests {
                 id: 0,
                 deadline_ns: u64::MAX,
                 listing: [0; crate::record::LISTING],
+                native: false,
+            })),
+            named(name::Command::Complete(name::Complete {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: "k".into(),
+                upload: "u".into(),
+                versioning: Versioning::Unversioned,
+                preconditions: name::Preconditions::default(),
+                at_ns,
+                parts: Vec::new(),
+                etag: "e".into(),
+                size: 10 << 20,
+                checksum: None,
+                file: None,
+                default: None,
+                id: 3,
+                deadline_ns: 9,
+                listing: [1; crate::record::LISTING],
+                native: true,
             })),
             named(name::Command::Abort(name::Abort {
                 bucket: "b".into(),
@@ -2300,10 +2439,12 @@ mod tests {
                     version: "v".into(),
                     size: u64::MAX,
                     checksum: None,
+                    etag: String::new(),
                 },
                 N::Completed {
                     version: "v".into(),
                     size: 5,
+                    etag: "e-2".into(),
                     checksum: Some(Checksum {
                         algorithm: 2,
                         parts: 0,
@@ -2323,6 +2464,10 @@ mod tests {
                 N::PreconditionFailed,
                 N::NoSuchKey,
                 N::PartWritten,
+                N::Offset {
+                    offset: 5 << 20,
+                    ended: true,
+                },
                 N::Aborted,
                 N::NoSuchUpload,
                 N::InvalidPart,

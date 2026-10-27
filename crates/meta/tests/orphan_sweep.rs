@@ -927,6 +927,7 @@ impl World {
                 checksum: None,
                 retention: None,
                 legal_hold: None,
+                runs: None,
             },
         });
         if let Some(name::Outcome::Created { upload }) = self.send(key, &create) {
@@ -1016,6 +1017,7 @@ impl World {
                 deadline_ns,
             },
             at_ns: self.proposed(),
+            run: None,
         });
         // A part refused, or held up by a merge, is released or left to the sweep.
         if let Some(name::Outcome::PartWritten) = self.send(key, &put) {
@@ -1070,6 +1072,7 @@ impl World {
             id: 0,
             deadline_ns,
             listing: [0; mantle_meta::record::LISTING],
+            native: false,
         });
         if let Some(name::Outcome::Put { .. }) = self.send(key, &complete)
             && !retry

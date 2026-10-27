@@ -560,6 +560,7 @@ mod tests {
                 checksum: None,
                 retention: None,
                 legal_hold: None,
+                runs: None,
             },
         }));
         let Outcome::Created { upload } = created else {
@@ -581,6 +582,7 @@ mod tests {
                     deadline_ns: DEADLINE,
                 },
                 at_ns: 2,
+                run: None,
             }));
             assert_eq!(outcome, Outcome::PartWritten);
         }
@@ -619,6 +621,7 @@ mod tests {
             id: 0,
             deadline_ns: DEADLINE,
             listing: [0; crate::record::LISTING],
+            native: false,
         }))
     }
 
@@ -835,6 +838,7 @@ mod tests {
                     checksum: None,
                     retention: None,
                     legal_hold: None,
+                    runs: None,
                 },
             }));
             let Outcome::Created { upload } = created else {
@@ -869,6 +873,7 @@ mod tests {
                         deadline_ns: DEADLINE,
                     },
                     at_ns: 2,
+                    run: None,
                 }));
                 prop_assert_eq!(outcome, Outcome::PartWritten);
                 listed.push(name::Listed {
@@ -897,6 +902,7 @@ mod tests {
                 id: 0,
                 deadline_ns: DEADLINE,
                 listing: [0; crate::record::LISTING],
+                native: false,
             }));
             let committed = matches!(completed, Outcome::Put { .. });
             prop_assert!(committed, "{:?}", completed);

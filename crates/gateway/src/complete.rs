@@ -4,6 +4,10 @@
 //! parts written in the File range, addressed by the parts' plaintext; and the Name range's
 //! Complete, which checks the parts again against its own rows and commits the version.
 //!
+//! A native upload's completion (gateway.md §2.1) takes every run in its order, the client
+//! listing none, and holds the object to the full-object checksum and length its client sent:
+//! a mismatch is `BadDigest` and nothing is written.
+//!
 //! A [`Completion`] names each request and moves on with its answer, doing no I/O, as a PUT
 //! does.
 
@@ -12,7 +16,8 @@ use std::collections::{BTreeMap, VecDeque};
 use mantle_meta::file;
 use mantle_meta::key;
 use mantle_meta::name::{self, Listed, MAX_PART_NUMBER, MIN_PART};
-use mantle_meta::record::{self, Extent, LISTING, Part, Referrer, Target, Upload};
+use mantle_meta::record::{self, Extent, LISTING, Part, Referrer, RunMd5, Target, Upload};
+use mantle_s3::body::MAX_UPLOAD;
 use mantle_s3::checksum::{self, Algorithm, Checksum, Hasher};
 use mantle_s3::crypto::{self, CryptoError};
 
@@ -56,6 +61,14 @@ pub enum CompleteError {
     /// `400 EntityTooSmall`: a part other than the last is under 5 MiB.
     #[error("a part other than the last is under 5 MiB")]
     EntityTooSmall,
+    /// `400 BadDigest`: a native upload's runs combine to another full-object checksum or
+    /// length than its client sent.
+    #[error("the runs are not the object the client sent")]
+    BadDigest,
+    /// `400 IncompleteBody`: a native upload whose last run has not committed, or whose runs
+    /// end short of the length its client sent.
+    #[error("the upload's last run has not committed")]
+    Unended,
     /// The upload names a checksum combination its algorithm does not have: full-object for a
     /// hash, composite for CRC-64/NVME (05 §3.3). Creating the upload refuses these, so this
     /// is a row no request could make (`500 InternalError`).
@@ -107,6 +120,9 @@ enum Asked {
 pub struct Completion {
     /// The Complete to send, which the completion fills with what it derives.
     complete: name::Complete,
+    /// A native upload's object as its client sent it: its length and full-object checksum,
+    /// which its runs must combine to.
+    native: Option<(u64, record::Checksum)>,
     /// The parts the request lists, each with the ETag it sent, in its order.
     listed: Vec<(u16, String)>,
     /// The object's file of parts, a file ID never used before, and how long the File range
@@ -169,7 +185,48 @@ impl Completion {
         };
         let mut completion = Self {
             complete,
+            native: None,
             listed,
+            file,
+            handover_ns,
+            upload: None,
+            rows: BTreeMap::new(),
+            after: 0,
+            passed: 0,
+            ready: VecDeque::new(),
+            asked: BTreeMap::new(),
+            next_id: 0,
+            outcome: None,
+        };
+        completion.ask(Asked::Upload, Request::Upload)?;
+        Ok(completion)
+    }
+
+    /// Completes a native upload, `complete`'s, into file `file` (gateway.md §2.1): every run,
+    /// in order, held to `length` and `checksum`, the full-object value its client sent.
+    pub fn native(
+        complete: name::Complete,
+        (length, checksum): (u64, record::Checksum),
+        file: u128,
+        handover_ns: u64,
+        now_ns: u64,
+    ) -> Result<Self, CompleteError> {
+        if key::parse_version_id(&complete.upload).is_none() {
+            return Err(CompleteError::NoSuchUpload);
+        }
+        let complete = name::Complete {
+            native: true,
+            parts: Vec::new(),
+            id: file,
+            deadline_ns: now_ns
+                .checked_add(handover_ns)
+                .ok_or(CompleteError::Overflow)?,
+            ..complete
+        };
+        let mut completion = Self {
+            complete,
+            native: Some((length, checksum)),
+            listed: Vec::new(),
             file,
             handover_ns,
             upload: None,
@@ -228,6 +285,13 @@ impl Completion {
     fn answered(&mut self, asked: Asked, answer: Answer) -> Result<(), CompleteError> {
         match (asked, answer) {
             (Asked::Upload, Answer::Upload(Some(upload))) => {
+                if let Some((length, _)) = &self.native {
+                    // Every run of the object, its last committed, before any is read.
+                    let runs = upload.runs.ok_or(CompleteError::NoSuchUpload)?;
+                    if !runs.ended || runs.offset != *length {
+                        return Err(CompleteError::Unended);
+                    }
+                }
                 self.upload = Some(upload);
                 self.next_page()
             }
@@ -247,7 +311,10 @@ impl Completion {
     /// Asks for the next page of parts: as many as the parts listed after the last one read,
     /// which the parts not listed between them may push to later pages.
     fn next_page(&mut self) -> Result<(), CompleteError> {
-        let left = self.listed.get(self.passed..).map_or(0, <[_]>::len);
+        let left = match self.upload.as_ref().and_then(|u| u.runs) {
+            Some(runs) => usize::from(runs.count.saturating_sub(self.after)),
+            None => self.listed.get(self.passed..).map_or(0, <[_]>::len),
+        };
         self.ask(
             Asked::Parts,
             Request::Parts {
@@ -260,6 +327,9 @@ impl Completion {
     /// A page of parts: kept where listed, and another page asked for until every listed part
     /// is read or the upload has no more.
     fn page(&mut self, page: Vec<(u16, Part)>) -> Result<(), CompleteError> {
+        if let Some(runs) = self.upload.as_ref().and_then(|u| u.runs) {
+            return self.runs_page(page, runs.count);
+        }
         let last_listed = self.listed.last().map_or(0, |(n, _)| *n);
         let mut ended = page.is_empty();
         for (number, part) in page {
@@ -291,6 +361,74 @@ impl Completion {
         } else {
             self.next_page()
         }
+    }
+
+    /// A page of a native upload's runs, each kept: another page asked for until all `count`
+    /// are read, numbered 1 to `count` with none missing.
+    fn runs_page(&mut self, page: Vec<(u16, Part)>, count: u16) -> Result<(), CompleteError> {
+        let ended = page.is_empty();
+        for (number, part) in page {
+            if Some(number) != self.after.checked_add(1) {
+                return Err(CompleteError::Mismatch);
+            }
+            self.after = number;
+            self.rows.insert(number, part);
+        }
+        if self.after == count {
+            return self.combine_runs();
+        }
+        if ended {
+            return Err(CompleteError::Mismatch);
+        }
+        self.next_page()
+    }
+
+    /// A native upload's object from its runs: its size their sum and its checksum their
+    /// combination, each held to what its client sent, and its ETag the MD5 across them where it
+    /// is at most one PUT's bytes, the multipart ETag of their own MD5s past them (05 §4.5).
+    fn combine_runs(&mut self) -> Result<(), CompleteError> {
+        let upload = self.upload.as_ref().ok_or(CompleteError::Mismatch)?;
+        let (length, sent) = self.native.as_ref().ok_or(CompleteError::Mismatch)?;
+        let parts: Vec<(u16, &Part)> = self.rows.iter().map(|(n, p)| (*n, p)).collect();
+        let size = parts
+            .iter()
+            .try_fold(0u64, |sum, (_, p)| sum.checked_add(p.size))
+            .ok_or(CompleteError::Overflow)?;
+        let (code, full) = upload.checksum.ok_or(CompleteError::ChecksumType)?;
+        let checksum = combined(code, full, &parts)?;
+        if size != *length || checksum != *sent {
+            return Err(CompleteError::BadDigest);
+        }
+        let etag = if size <= MAX_UPLOAD {
+            match upload.runs.and_then(|r| r.md5) {
+                Some(RunMd5::Done(md5)) => checksum::etag(&md5),
+                _ => return Err(CompleteError::Mismatch),
+            }
+        } else {
+            multipart_etag(parts.iter().map(|(_, p)| p.etag.as_str()))?
+        };
+        let listed: Vec<(u16, String)> = parts.iter().map(|(n, p)| (*n, p.etag.clone())).collect();
+        self.complete.listing = listing(&listed)?;
+        self.complete.parts = parts
+            .iter()
+            .map(|(number, p)| Listed {
+                number: *number,
+                etag: p.etag.clone(),
+                file: p.file,
+            })
+            .collect();
+        self.complete.etag = etag;
+        self.complete.size = size;
+        self.complete.checksum = Some(checksum);
+        let extents: Vec<Extent> = parts
+            .iter()
+            .filter(|(_, p)| p.size > 0)
+            .map(|(_, p)| Extent {
+                length: p.size,
+                target: Target::File(p.file),
+            })
+            .collect();
+        self.write_file(extents)
     }
 
     /// Checks the listed parts against their rows, derives the object from them, and writes
@@ -352,6 +490,12 @@ impl Completion {
                 target: Target::File(p.file),
             })
             .collect();
+        self.write_file(extents)
+    }
+
+    /// Writes the object's file of `extents`, its parts' plaintext; with none, commits it with
+    /// no file.
+    fn write_file(&mut self, extents: Vec<Extent>) -> Result<(), CompleteError> {
         if extents.is_empty() {
             return self.commit(None);
         }
@@ -376,7 +520,16 @@ impl Completion {
     /// it made if the parts listed, their numbers and ETags as sent, are those it was made from
     /// (`name::Complete::listing`), or `NoSuchUpload`.
     fn retry(&mut self) -> Result<(), CompleteError> {
-        self.complete.etag = multipart_etag(self.listed.iter().map(|(_, e)| e.as_str()))?;
+        match &self.native {
+            // A native upload's retry is matched by the size and checksum its client sent.
+            Some((length, checksum)) => {
+                self.complete.size = *length;
+                self.complete.checksum = Some(checksum.clone());
+            }
+            None => {
+                self.complete.etag = multipart_etag(self.listed.iter().map(|(_, e)| e.as_str()))?;
+            }
+        }
         self.complete.parts = Vec::new();
         self.complete.file = None;
         self.ask(
@@ -404,9 +557,14 @@ impl Completion {
                 version,
                 size,
                 checksum,
+                etag,
             } => {
                 self.complete.size = size;
                 self.complete.checksum = checksum;
+                // A native upload's retry derives no ETag of its own; the version's is it.
+                if !etag.is_empty() {
+                    self.complete.etag = etag;
+                }
                 version
             }
             name::Outcome::NoSuchUpload => return Err(CompleteError::NoSuchUpload),

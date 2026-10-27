@@ -28,7 +28,8 @@ use mantle_gateway::put::{
 use mantle_meta::engine::{Engine, Model};
 use mantle_meta::name::{self, CreateUpload, GateChange, Preconditions, PutPart};
 use mantle_meta::record::{
-    Extent, GateState, Part, Referrer, Target, Upload, Version, Versioning, WrappedKey, Wrapper,
+    Extent, GateState, Part, Referrer, RunMd5, Target, Upload, Version, Versioning, WrappedKey,
+    Wrapper,
 };
 use mantle_meta::{block, file};
 use mantle_s3::checksum::{self, Algorithm};
@@ -207,6 +208,7 @@ impl Cell {
                 checksum,
                 retention: None,
                 legal_hold: None,
+                runs: None,
             },
         });
         match self.name(create) {
@@ -463,6 +465,7 @@ fn part(key: &str, upload: &str, number: u16) -> Commit {
             deadline_ns: 0,
         },
         at_ns: 0,
+        run: None,
     })
 }
 
@@ -1502,6 +1505,7 @@ fn complete_upload(
         id: 0,
         deadline_ns: 0,
         listing: [0; mantle_meta::record::LISTING],
+        native: false,
     };
     let mut completion = Completion::new(template, listed, file, HANDOVER, cell.clock)?;
     loop {
@@ -1749,6 +1753,7 @@ fn template_complete(key: &str, upload: &str) -> name::Complete {
         id: 0,
         deadline_ns: 0,
         listing: [0; mantle_meta::record::LISTING],
+        native: false,
     }
 }
 
@@ -2071,4 +2076,296 @@ fn a_get_reads_as_many_blocks_at_once_as_its_window() {
         rounds.push(n);
     }
     assert!(rounds[0] > rounds[1] && rounds[1] > rounds[2], "{rounds:?}");
+}
+
+/// A native upload whose runs but the last are `run` bytes, its MD5 across them begun.
+fn open_runs(cell: &mut Cell, key: &str, run: u64) -> String {
+    let begun = mantle_s3::crypto::Digest::new(&mantle_s3::crypto::MD5)
+        .unwrap()
+        .state()
+        .unwrap();
+    let create = name::Command::CreateUpload(CreateUpload {
+        bucket: BUCKET.into(),
+        incarnation: 1,
+        key: key.into(),
+        at_ns: 0,
+        upload: Upload {
+            initiated_ns: 0,
+            owner: "o".into(),
+            headers: Vec::new(),
+            checksum: Some((Algorithm::Crc64Nvme.code(), true)),
+            retention: None,
+            legal_hold: None,
+            runs: Some(mantle_meta::record::Runs {
+                length: None,
+                run,
+                offset: 0,
+                count: 0,
+                ended: false,
+                md5: Some(RunMd5::Running(begun.chaining().try_into().unwrap())),
+            }),
+        },
+    });
+    match cell.name(create) {
+        name::Outcome::Created { upload } => upload,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The upload's next run, `bytes`, written as a gateway writes it: from the offset and MD5 its
+/// row holds, its own MD5 taken with `own`, its CRC-64/NVME checked as a trailer's.
+fn append_run(
+    cell: &mut Cell,
+    (key, upload): (&str, &str),
+    bytes: &[u8],
+    (last, own): (bool, bool),
+    file: u128,
+    wrapping: &WrappingKey,
+) -> Result<Stored, PutError> {
+    let runs = name::upload(&mut cell.names, BUCKET, key, upload)
+        .unwrap()
+        .unwrap()
+        .runs
+        .unwrap();
+    let commit = Commit::Run {
+        part: PutPart {
+            bucket: BUCKET.into(),
+            incarnation: 1,
+            key: key.into(),
+            upload: upload.into(),
+            number: runs.count + 1,
+            part: Part {
+                etag: String::new(),
+                size: 0,
+                checksum: None,
+                file: 0,
+                modified_ns: 0,
+                deadline_ns: 0,
+            },
+            at_ns: 0,
+            run: Some(name::Run {
+                offset: runs.offset,
+                last,
+                md5: runs.md5,
+            }),
+        },
+        own,
+    };
+    let body = Body {
+        length: bytes.len() as u64,
+        checksum: Some(Algorithm::Crc64Nvme),
+        content_md5: false,
+    };
+    let mut put = Put::new(
+        commit,
+        body,
+        keys(file, wrapping),
+        Layout::new(Scheme::Copies(2)).unwrap(),
+        holding(1),
+        Box::new(Counter(file * 1_000)),
+        cell.clock,
+    )
+    .unwrap();
+    let expected = Expected {
+        md5: None,
+        checksum: Some(checksum::checksum(Algorithm::Crc64Nvme, bytes).unwrap()),
+    };
+    run(cell, &mut put, bytes, &FAST, &expected, |_, _| {})
+}
+
+/// A native upload's completion, held to `length` and `crc`, into file `file`.
+fn finish_runs(
+    cell: &mut Cell,
+    (key, upload): (&str, &str),
+    (length, crc): (u64, Vec<u8>),
+    file: u128,
+) -> Result<Completed, CompleteError> {
+    let template = name::Complete {
+        bucket: BUCKET.into(),
+        incarnation: 1,
+        key: key.into(),
+        upload: upload.into(),
+        versioning: Versioning::Unversioned,
+        preconditions: Preconditions::default(),
+        at_ns: 0,
+        parts: Vec::new(),
+        etag: String::new(),
+        size: 0,
+        checksum: None,
+        file: None,
+        default: None,
+        id: 0,
+        deadline_ns: 0,
+        listing: [0; mantle_meta::record::LISTING],
+        native: false,
+    };
+    let sent = mantle_meta::record::Checksum {
+        algorithm: Algorithm::Crc64Nvme.code(),
+        parts: 0,
+        value: crc,
+    };
+    let mut completion = Completion::native(template, (length, sent), file, HANDOVER, cell.clock)?;
+    loop {
+        if let Some(outcome) = completion.outcome() {
+            return outcome.clone();
+        }
+        let (id, request) = completion.poll().expect("a completion waits on nothing");
+        let answer = cell.serve_complete(key, upload, request);
+        completion.answer(id, answer)?;
+    }
+}
+
+/// A native upload streamed in three runs, each from the offset and MD5 the last left, completes
+/// into the object whose ETag is the MD5 of all its bytes, as one PUT's is, and whose
+/// checksum is its full-object CRC-64/NVME; it reads back whole and across a run's end. Held
+/// to another checksum or length it is `BadDigest` and nothing commits; held to its own, a
+/// retry once it is done finds the version.
+#[test]
+fn a_native_upload_completes_into_one_puts_object_from_its_runs() {
+    let mut cell = Cell::new(3);
+    let wrapping = WrappingKey::generate().unwrap();
+    let run = name::MIN_PART;
+    let upload = open_runs(&mut cell, "k", run);
+    let bodies = [body(run as usize, 1), body(run as usize, 2), body(100, 3)];
+    for (i, bytes) in bodies.iter().enumerate() {
+        let last = i == bodies.len() - 1;
+        let stored = append_run(
+            &mut cell,
+            ("k", &upload),
+            bytes,
+            (last, true),
+            200 + i as u128,
+            &wrapping,
+        )
+        .unwrap();
+        assert_eq!(stored.etag, checksum::etag(&md5(bytes)));
+    }
+    let whole: Vec<u8> = bodies.concat();
+    let size = whole.len() as u64;
+    let crc = checksum::checksum(Algorithm::Crc64Nvme, &whole)
+        .unwrap()
+        .bytes;
+    // A source changed between attempts, or a length its runs do not end at.
+    let mut changed = crc.clone();
+    changed[0] ^= 1;
+    assert_eq!(
+        finish_runs(&mut cell, ("k", &upload), (size, changed), 300),
+        Err(CompleteError::BadDigest)
+    );
+    assert_eq!(
+        finish_runs(&mut cell, ("k", &upload), (size + 1, crc.clone()), 301),
+        Err(CompleteError::Unended)
+    );
+    assert!(
+        name::current(&mut cell.names, BUCKET, "k")
+            .unwrap()
+            .is_none()
+    );
+    let done = finish_runs(&mut cell, ("k", &upload), (size, crc.clone()), 302).unwrap();
+    assert_eq!(done.size, size);
+    assert_eq!(done.etag, checksum::etag(&md5(&whole)));
+    assert_eq!(
+        done.checksum.as_ref().map(|c| c.value.clone()),
+        Some(crc.clone())
+    );
+    let v = cell.current("k");
+    assert_eq!((v.size, v.etag.clone()), (size, done.etag.clone()));
+    for range in [0..size, run - 5..run + 5, size - 100..size] {
+        let got = read(&mut cell, v.file, size, range.clone(), &wrapping, false).unwrap();
+        assert!(
+            got == whole[range.start as usize..range.end as usize],
+            "{range:?}"
+        );
+    }
+    let again = finish_runs(&mut cell, ("k", &upload), (size, crc), 303).unwrap();
+    assert_eq!(again, done);
+}
+
+/// A run of an object whose MD5 runs across its runs takes no MD5 of its own; a run that
+/// does not begin at the upload's offset is refused naming it, its file left to the sweeps.
+#[test]
+fn a_run_takes_only_the_md5s_its_object_needs_and_only_at_its_offset() {
+    let mut cell = Cell::new(3);
+    let wrapping = WrappingKey::generate().unwrap();
+    let planned = name::MIN_PART;
+    let upload = open_runs(&mut cell, "k", planned);
+    let first = body(planned as usize, 1);
+    let stored = append_run(
+        &mut cell,
+        ("k", &upload),
+        &first,
+        (false, false),
+        200,
+        &wrapping,
+    )
+    .unwrap();
+    assert_eq!(stored.etag, "");
+    let runs = name::upload(&mut cell.names, BUCKET, "k", &upload)
+        .unwrap()
+        .unwrap()
+        .runs
+        .unwrap();
+    // The MD5's state at the run's end, a whole number of blocks.
+    let mut digest = mantle_s3::crypto::Digest::new(&mantle_s3::crypto::MD5).unwrap();
+    digest.update(&first).unwrap();
+    let state = digest.state().unwrap();
+    assert_eq!(
+        runs.md5,
+        Some(RunMd5::Running(state.chaining().try_into().unwrap()))
+    );
+    assert_eq!((runs.offset, runs.count), (planned, 1));
+    // The same run again, from an offset the upload has passed.
+    let stale = Commit::Run {
+        part: PutPart {
+            bucket: BUCKET.into(),
+            incarnation: 1,
+            key: "k".into(),
+            upload: upload.clone(),
+            number: 2,
+            part: Part {
+                etag: String::new(),
+                size: 0,
+                checksum: None,
+                file: 0,
+                modified_ns: 0,
+                deadline_ns: 0,
+            },
+            at_ns: 0,
+            run: Some(name::Run {
+                offset: 0,
+                last: false,
+                md5: runs.md5,
+            }),
+        },
+        own: false,
+    };
+    let mut put = Put::new(
+        stale,
+        Body {
+            length: planned,
+            checksum: None,
+            content_md5: false,
+        },
+        keys(201, &wrapping),
+        Layout::new(Scheme::Copies(2)).unwrap(),
+        holding(1),
+        Box::new(Counter(201_000)),
+        cell.clock,
+    )
+    .unwrap();
+    let refused = run(
+        &mut cell,
+        &mut put,
+        &first,
+        &FAST,
+        &Expected::default(),
+        |_, _| {},
+    );
+    assert_eq!(
+        refused,
+        Err(PutError::Name(name::Outcome::Offset {
+            offset: planned,
+            ended: false
+        }))
+    );
 }

@@ -180,3 +180,13 @@ computed outside AWS-LC by `twox-hash`, whose streaming state, the accumulators 
 holds back for its last stripe, is recorded whole, since XXH3 keeps its last stripe unprocessed
 even at a block boundary. CRCs need no
 such state: they combine from each run's value and length (`mantle-crc`).
+
+*As built (2026-10-26).* The vendored aws-lc-rs has `digest::State` with `Context::state` and
+`Context::resume`, for MD5, SHA-1 and SHA-2 through AWS-LC's `MD5_CTX`, `SHA_CTX`, `SHA256_CTX`
+and `SHA512_CTX`; both refuse a context with input in its buffer, SHA-3 and a state that is not
+whole blocks, and the tests above hold (`digest/state.rs`; vendor/UPSTREAM.md). mantle-s3 wraps
+them behind its unwind boundary (`crypto::Digest::state`, `resume`). The gateway carries a native
+upload's MD5 across its runs, each run's state kept in the upload's row (`record::RunMd5`) and
+resumed by the next run's put (`mantle_gateway::put::Commit::Run`). A native upload's checksum is a
+CRC, which combines, so no other block hash's state is kept yet, and the XXHash state is not
+recorded.

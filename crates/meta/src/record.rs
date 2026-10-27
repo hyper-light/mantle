@@ -121,6 +121,39 @@ pub struct Upload {
     /// completed version takes (18 §1.3).
     pub retention: Option<Retention>,
     pub legal_hold: Option<bool>,
+    /// A native upload's runs, which the range numbers as the gateway hands them over
+    /// (gateway.md §2.1); `None` for CreateMultipartUpload's, whose parts the client numbers.
+    pub runs: Option<Runs>,
+}
+
+/// A native upload's runs: the plan its runs keep, its durable offset, and the MD5 kept across
+/// them while its object may be one PUT's (gateway.md §2.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Runs {
+    /// The object's length, where the client stated it.
+    pub length: Option<u64>,
+    /// The length of every run but the last (`name::run_length`).
+    pub run: u64,
+    /// The bytes of its committed runs: the offset the next run begins at.
+    pub offset: u64,
+    /// Its committed runs, numbered from 1.
+    pub count: u16,
+    /// Its last run committed: it takes no more.
+    pub ended: bool,
+    /// The plaintext's MD5 across its runs, the ETag of an object of at most one PUT's bytes
+    /// (05 §4.5): running at the offset, or finished once the last run committed; none where
+    /// the object is longer.
+    pub md5: Option<RunMd5>,
+}
+
+/// The MD5 across a native upload's runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunMd5 {
+    /// Its chaining value at the offset, a whole number of MD5's blocks, every run but the last
+    /// being whole 64 KiB segments (docs/design/crypto.md §10).
+    Running([u8; 16]),
+    /// The digest, once the last run committed.
+    Done([u8; 16]),
 }
 
 /// A part of an upload.
@@ -1243,15 +1276,20 @@ impl Upload {
         w.u64(self.initiated_ns);
         put_str(&mut w, &self.owner)?;
         put_pairs(&mut w, &self.headers)?;
-        let lock = lock_flags(self.retention, self.legal_hold) << 2;
+        // Bits 0 and 1 the checksum, 2 to 4 the lock (`lock_flags`), 5 a native upload's runs.
+        let flags = (lock_flags(self.retention, self.legal_hold) << 2)
+            | (u8::from(self.runs.is_some()) << RUNS_FLAG);
         match self.checksum {
-            None => w.u8(lock),
+            None => w.u8(flags),
             Some((algorithm, full)) => {
-                w.u8(1 | (u8::from(full) << 1) | lock);
+                w.u8(1 | (u8::from(full) << 1) | flags);
                 w.u8(algorithm);
             }
         }
         put_retention(&mut w, self.retention);
+        if let Some(runs) = &self.runs {
+            put_runs(&mut w, runs);
+        }
         Ok(finish(w))
     }
 
@@ -1263,10 +1301,17 @@ impl Upload {
                 let owner = take_str(&mut r)?;
                 let headers = take_pairs(&mut r)?;
                 let flags = r.u8()?;
-                let (has_retention, legal_hold) = take_lock_flags(flags >> 2)?;
+                let (has_retention, legal_hold) =
+                    take_lock_flags((flags >> 2) & ((1 << (RUNS_FLAG - 2)) - 1))?;
                 let checksum = match flags & 3 {
                     0 => None,
                     flag @ (1 | 3) => Some((r.u8()?, flag == 3)),
+                    _ => return None,
+                };
+                let retention = take_retention(&mut r, has_retention)?;
+                let runs = match flags >> RUNS_FLAG {
+                    0 => None,
+                    1 => Some(take_runs(&mut r)?),
                     _ => return None,
                 };
                 Some(Self {
@@ -1274,14 +1319,64 @@ impl Upload {
                     owner,
                     headers,
                     checksum,
-                    retention: take_retention(&mut r, has_retention)?,
+                    retention,
                     legal_hold,
+                    runs,
                 })
             })(),
             &r,
             "upload",
         )
     }
+}
+
+/// The bit of an upload row's flags that says a native upload's runs follow.
+const RUNS_FLAG: u8 = 5;
+
+/// A native upload's runs: a flag byte (bit 0 a stated length follows, bit 1 ended, bits 2 and
+/// 3 the MD5: none, running or done), the length, the run, the offset, the count and the MD5.
+fn put_runs(w: &mut Writer, runs: &Runs) {
+    let md5 = match runs.md5 {
+        None => 0u8,
+        Some(RunMd5::Running(_)) => 1,
+        Some(RunMd5::Done(_)) => 2,
+    };
+    w.u8(u8::from(runs.length.is_some()) | (u8::from(runs.ended) << 1) | (md5 << 2));
+    if let Some(length) = runs.length {
+        w.u64(length);
+    }
+    w.u64(runs.run);
+    w.u64(runs.offset);
+    w.u16(runs.count);
+    if let Some(RunMd5::Running(bytes) | RunMd5::Done(bytes)) = &runs.md5 {
+        w.bytes(bytes);
+    }
+}
+
+fn take_runs(r: &mut Reader<'_>) -> Option<Runs> {
+    let flags = r.u8()?;
+    if flags >> 4 != 0 {
+        return None;
+    }
+    let length = if flags & 1 == 1 { Some(r.u64()?) } else { None };
+    let run = r.u64()?;
+    let offset = r.u64()?;
+    let count = r.u16()?;
+    let mut digest = || -> Option<[u8; 16]> { r.take(16)?.try_into().ok() };
+    let md5 = match (flags >> 2) & 3 {
+        0 => None,
+        1 => Some(RunMd5::Running(digest()?)),
+        2 => Some(RunMd5::Done(digest()?)),
+        _ => return None,
+    };
+    Some(Runs {
+        length,
+        run,
+        offset,
+        count,
+        ended: flags & 2 == 2,
+        md5,
+    })
 }
 
 impl Part {
@@ -1610,8 +1705,46 @@ mod tests {
             checksum: Some((2, true)),
             retention: None,
             legal_hold: None,
+            runs: None,
         };
-        assert_eq!(Upload::decode(&u.encode().unwrap()), Ok(u));
+        assert_eq!(Upload::decode(&u.encode().unwrap()), Ok(u.clone()));
+        for runs in [
+            Runs {
+                length: Some(12 << 20),
+                run: 5 << 20,
+                offset: 5 << 20,
+                count: 1,
+                ended: false,
+                md5: Some(RunMd5::Running([3; 16])),
+            },
+            Runs {
+                length: None,
+                run: 8 << 20,
+                offset: (8 << 20) + 9,
+                count: 2,
+                ended: true,
+                md5: Some(RunMd5::Done([4; 16])),
+            },
+            Runs {
+                length: None,
+                run: 5 << 30,
+                offset: 10 << 30,
+                count: 2,
+                ended: false,
+                md5: None,
+            },
+        ] {
+            let native = Upload {
+                runs: Some(runs),
+                retention: Some(Retention {
+                    mode: RetentionMode::Governance,
+                    until_ms: 3,
+                }),
+                legal_hold: Some(true),
+                ..u.clone()
+            };
+            assert_eq!(Upload::decode(&native.encode().unwrap()), Ok(native));
+        }
         let p = Part {
             etag: "e".into(),
             size: 5 << 20,
@@ -1654,6 +1787,7 @@ mod tests {
                         checksum,
                         retention,
                         legal_hold,
+                        runs: None,
                     };
                     assert_eq!(Upload::decode(&u.encode().unwrap()), Ok(u));
                 }

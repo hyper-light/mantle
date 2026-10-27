@@ -263,6 +263,7 @@ fn completion(parts: u16) -> Result<Duration, Error> {
                 checksum: None,
                 retention: None,
                 legal_hold: None,
+                runs: None,
             },
         }),
     )?;
@@ -286,6 +287,7 @@ fn completion(parts: u16) -> Result<Duration, Error> {
                 deadline_ns: u64::MAX,
             },
             at_ns: 20,
+            run: None,
         });
         name::apply(&mut m, index, &part)?;
         index = index.saturating_add(1);
@@ -314,6 +316,7 @@ fn completion(parts: u16) -> Result<Duration, Error> {
         id: 0,
         deadline_ns: u64::MAX,
         listing: [0; mantle_meta::record::LISTING],
+        native: false,
     });
     let started = Instant::now();
     let done = name::apply(&mut m, index, &complete)?;

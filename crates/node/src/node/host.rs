@@ -1033,6 +1033,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     deadline_ns: 0,
                 },
                 at_ns: 0,
+                run: None,
             }),
             None => Commit::Object(name::Put {
                 bucket: putting.bucket.clone(),
@@ -1842,6 +1843,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         checksum: checksum.map(|(algorithm, full)| (algorithm.code(), full)),
                         retention: None,
                         legal_hold: None,
+                        runs: None,
                     },
                 }))),
             ),
@@ -1971,6 +1973,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             default: row.lock.and_then(|lock| lock.default),
             id: 0,
             deadline_ns: 0,
+            native: false,
         };
         let listed = std::mem::take(&mut completing.listed);
         match Completion::new(

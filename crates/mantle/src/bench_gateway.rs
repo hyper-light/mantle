@@ -644,6 +644,7 @@ fn completion(parts: u16) -> Result<Duration, Error> {
         checksum: None,
         retention: None,
         legal_hold: None,
+        runs: None,
     };
     let template = name::Complete {
         bucket: BUCKET.into(),
@@ -662,6 +663,7 @@ fn completion(parts: u16) -> Result<Duration, Error> {
         id: 0,
         deadline_ns: 0,
         listing: [0; mantle_meta::record::LISTING],
+        native: false,
     };
     let started = Instant::now();
     let mut driver = Completion::new(template, listed, u128::MAX, 1_000, 0)?;

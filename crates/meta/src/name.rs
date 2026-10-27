@@ -20,7 +20,7 @@ use crate::error::{MetaError, reserved};
 use crate::key::{self, NULL_VERSION, NameRow};
 use crate::record::{
     self, Checksum, DefaultRetention, Descriptor, Gate, GateState, Holder, How, LISTING, Lineage,
-    Mark, Part, Retention, RetentionMode, Standing, Taken, Upload, Version,
+    Mark, Part, Retention, RetentionMode, RunMd5, Runs, Standing, Taken, Upload, Version,
 };
 
 pub use crate::record::Verdict;
@@ -35,6 +35,42 @@ pub const MIN_PART: u64 = 5 << 20;
 /// too, since every replica applies what reaches the log.
 pub const MAX_PART: u64 = 5 << 30;
 pub const MAX_PART_NUMBER: u16 = 10_000;
+
+/// `a / b` rounded up; none when `b` is zero.
+fn div_ceil(a: u64, b: u64) -> Option<u64> {
+    let q = a.checked_div(b)?;
+    let r = a.checked_rem(b)?;
+    Some(if r == 0 { q } else { q.saturating_add(1) })
+}
+
+/// The length of every run of a native upload but its last (gateway.md §2.1): whole 64 KiB
+/// segments, so a run's file seals whole segments and the MD5 across runs stops at a block
+/// boundary; at least S3's least part and at most its largest, at most the client's `buffer`
+/// where its source cannot be read again; and long enough that 10,000 runs, a file's extents,
+/// hold the object: its stated `length`, or, where none is stated, the most runs of the
+/// buffer's length hold. The plan's measured terms, the run commits the principal's metadata
+/// share admits and Young's interval from goodput, checkpoint cost and interruption rate, are
+/// not yet built, so a run is the smallest these bounds allow. `None` where none fits: a buffer
+/// below the least part, or a length past what 10,000 runs within the buffer hold.
+pub fn run_length(length: Option<u64>, buffer: Option<u64>) -> Option<u64> {
+    let segment = u64::try_from(mantle_s3::seal::SEGMENT).ok()?;
+    let cap = buffer
+        .unwrap_or(MAX_PART)
+        .min(MAX_PART)
+        .checked_div(segment)?
+        .checked_mul(segment)?;
+    let run = match length {
+        Some(length) => div_ceil(div_ceil(length, u64::from(MAX_PART_NUMBER))?, segment)?
+            .checked_mul(segment)?
+            .max(MIN_PART),
+        None => cap,
+    };
+    if (MIN_PART..=cap).contains(&run) {
+        Some(run)
+    } else {
+        None
+    }
+}
 
 /// Entity tags a precondition names, bare of quotes, or `*`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,6 +290,18 @@ pub struct PutPart {
     /// The part, with its file's handover deadline, as the File range answered its write.
     pub part: Part,
     pub at_ns: u64,
+    /// A native upload's run, numbered by the range as the next (gateway.md §2.1); `None` for
+    /// UploadPart's part, numbered by the client.
+    pub run: Option<Run>,
+}
+
+/// A native upload's run as the gateway hands it over (gateway.md §2.1): the offset it begins
+/// at, whether it ends the object, and the MD5 across the object's runs once it is taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Run {
+    pub offset: u64,
+    pub last: bool,
+    pub md5: Option<RunMd5>,
 }
 
 /// CompleteMultipartUpload (05 §4.4).
@@ -288,6 +336,10 @@ pub struct Complete {
     /// As a PUT's: the object file's handover deadline, or the gateway's for a completion
     /// with no file.
     pub deadline_ns: u64,
+    /// A native upload's completion (gateway.md §2.1): every run, its object's ETag the MD5
+    /// across them where it is at most one PUT's bytes, and a retry once the upload is gone
+    /// matched to the version by its size and its full-object checksum, which the client sent.
+    pub native: bool,
 }
 
 /// A part a CompleteMultipartUpload lists.
@@ -550,12 +602,13 @@ pub struct Hold {
 pub enum Outcome {
     /// A version was written; its ID.
     Put { version: String },
-    /// A retried completion found the version the completion made: its ID, and the size and
-    /// checksum the completion gave it.
+    /// A retried completion found the version the completion made: its ID, and the size,
+    /// checksum and ETag the completion gave it.
     Completed {
         version: String,
         size: u64,
         checksum: Option<Checksum>,
+        etag: String,
     },
     /// A delete was done: whether the version it made or removed is a delete marker, and
     /// that version's ID. An unversioned delete names none.
@@ -571,6 +624,9 @@ pub enum Outcome {
     Created { upload: String },
     /// A part's row was written.
     PartWritten,
+    /// A native upload's run that does not begin at the upload's offset, or follows its last
+    /// run: the offset it holds, and whether its last run committed (gateway.md §2.1).
+    Offset { offset: u64, ended: bool },
     /// An upload and its parts were removed.
     Aborted,
     /// `404 NoSuchUpload`.
@@ -1507,11 +1563,24 @@ fn create_upload<E: Rows>(
     engine: &mut E,
     c: &CreateUpload,
 ) -> Result<(Outcome, Vec<Write>), MetaError> {
+    // A native upload begins with no run, its run within S3's part sizes and whole segments,
+    // and as many runs as a file holds enough for its stated length (`run_length`).
+    let runs = match c.upload.runs {
+        None => None,
+        Some(runs) if runs_fit(&runs) => Some(Runs {
+            offset: 0,
+            count: 0,
+            ended: false,
+            ..runs
+        }),
+        Some(_) => return Ok((Outcome::Invalid, Vec::new())),
+    };
     let (time, clock) = clock::tick(engine, c.at_ns)?;
     let mut writes = vec![clock];
     let upload = key::version_id(time);
     let row = Upload {
         initiated_ns: time,
+        runs,
         ..c.upload.clone()
     };
     writes.push(Write::Put(
@@ -1525,19 +1594,76 @@ fn create_upload<E: Rows>(
     Ok((Outcome::Created { upload }, writes))
 }
 
+/// Whether a native upload's runs keep S3's part sizes in whole segments, and as many as a file
+/// holds hold its stated length.
+fn runs_fit(runs: &Runs) -> bool {
+    let whole = u64::try_from(mantle_s3::seal::SEGMENT).is_ok_and(|s| runs.run.is_multiple_of(s));
+    whole
+        && (MIN_PART..=MAX_PART).contains(&runs.run)
+        && runs.length.is_none_or(|length| {
+            div_ceil(length, runs.run).is_some_and(|n| n <= u64::from(MAX_PART_NUMBER))
+        })
+}
+
 fn put_part<E: Rows>(engine: &mut E, p: &PutPart) -> Result<(Outcome, Vec<Write>), MetaError> {
     if !(1..=MAX_PART_NUMBER).contains(&p.number) || p.part.size > MAX_PART {
         return Ok((Outcome::Invalid, Vec::new()));
     }
-    if upload(engine, &p.bucket, &p.key, &p.upload)?.is_none() {
+    let Some(mut held) = upload(engine, &p.bucket, &p.key, &p.upload)? else {
         return Ok((Outcome::NoSuchUpload, Vec::new()));
+    };
+    let mut writes = Vec::new();
+    // A native upload's parts are its runs, numbered here in order of their offsets; a
+    // CreateMultipartUpload's are numbered by its client.
+    match (held.runs.as_mut(), &p.run) {
+        (None, None) => {}
+        (Some(runs), Some(run)) => {
+            if runs.ended || run.offset != runs.offset {
+                let (offset, ended) = (runs.offset, runs.ended);
+                return Ok((Outcome::Offset { offset, ended }, Vec::new()));
+            }
+            let Some(end) = run.offset.checked_add(p.part.size) else {
+                return Ok((Outcome::Invalid, Vec::new()));
+            };
+            // Every run but the last is the plan's; the last is no longer, and ends the
+            // object at its stated length; the MD5 runs on to the end, then finishes.
+            let planned = if run.last {
+                p.part.size <= runs.run && runs.length.is_none_or(|length| end == length)
+            } else {
+                p.part.size == runs.run && runs.length.is_none_or(|length| end < length)
+            };
+            let md5 = match (runs.md5, run.md5) {
+                (_, None) => true,
+                (Some(RunMd5::Running(_)), Some(RunMd5::Running(_))) => !run.last,
+                (Some(RunMd5::Running(_)), Some(RunMd5::Done(_))) => run.last,
+                _ => false,
+            };
+            if p.number != runs.count.saturating_add(1) || !planned || !md5 {
+                return Ok((Outcome::Invalid, Vec::new()));
+            }
+            *runs = Runs {
+                offset: end,
+                count: p.number,
+                ended: run.last,
+                md5: run.md5,
+                ..*runs
+            };
+            writes.push(Write::Put(
+                key::name(
+                    &p.bucket,
+                    &p.key,
+                    &NameRow::Upload(p.upload.clone().into_bytes()),
+                ),
+                held.encode()?,
+            ));
+        }
+        _ => return Ok((Outcome::Invalid, Vec::new())),
     }
     let row = key::name(
         &p.bucket,
         &p.key,
         &NameRow::Part(p.upload.clone().into_bytes(), p.number),
     );
-    let mut writes = Vec::new();
     // A part uploaded again replaces the first (05 §4.3), whose file nothing then references.
     if let Some(replaced) = engine.get(&row)?.map(|b| Part::decode(&b)).transpose()?
         && replaced.file != p.part.file
@@ -1566,15 +1692,27 @@ fn complete<E: Rows>(engine: &mut E, c: &Complete) -> Result<(Outcome, Vec<Write
         };
         return Ok(match made {
             // A retry that carries a file carries one made for it again, which `apply`
-            // releases: the version holds the first.
-            Some((order, v)) if !v.marker && v.etag == c.etag && v.listing == Some(c.listing) => (
-                Outcome::Completed {
-                    version: shown_id(v.null, order),
-                    size: v.size,
-                    checksum: v.checksum,
-                },
-                Vec::new(),
-            ),
+            // releases: the version holds the first. A native upload's retry lists no parts,
+            // and is matched by the object's size and the full-object checksum its client
+            // sent, which the version keeps.
+            Some((order, v))
+                if !v.marker
+                    && if c.native {
+                        v.size == c.size && c.checksum.is_some() && v.checksum == c.checksum
+                    } else {
+                        v.etag == c.etag && v.listing == Some(c.listing)
+                    } =>
+            {
+                (
+                    Outcome::Completed {
+                        version: shown_id(v.null, order),
+                        size: v.size,
+                        checksum: v.checksum,
+                        etag: v.etag,
+                    },
+                    Vec::new(),
+                )
+            }
             _ => (Outcome::NoSuchUpload, Vec::new()),
         });
     };
@@ -1617,8 +1755,24 @@ fn complete<E: Rows>(engine: &mut E, c: &Complete) -> Result<(Outcome, Vec<Write
     }
     // The object is its parts: what the gateway combined from them is checked against the
     // rows here (audit §16.5). The ETag's digest and the checksum need the protocol layer's
-    // hashes, which the gateway's driver derives from these same rows.
-    if c.size != total || !c.etag.ends_with(&format!("-{}", c.parts.len())) {
+    // hashes, which the gateway's driver derives from these same rows. A native upload's
+    // object is every run, its last committed; at most one PUT's bytes, its ETag is the MD5
+    // across them, as one PUT's is (gateway.md §2.1).
+    let etag = match (&upload_row.runs, c.native) {
+        (None, false) => c.etag.ends_with(&format!("-{}", c.parts.len())),
+        (Some(runs), true) => {
+            let every = runs.ended && usize::from(runs.count) == c.parts.len();
+            every
+                && if total <= mantle_s3::body::MAX_UPLOAD {
+                    matches!(runs.md5, Some(RunMd5::Done(md5))
+                        if c.etag == mantle_s3::checksum::etag(&md5))
+                } else {
+                    c.etag.ends_with(&format!("-{}", c.parts.len()))
+                }
+        }
+        _ => return Ok((Outcome::Invalid, Vec::new())),
+    };
+    if c.size != total || !etag {
         return Ok((Outcome::Miscombined, Vec::new()));
     }
     let (outcome, mut writes) = put(
@@ -2861,11 +3015,77 @@ mod tests {
                     checksum: None,
                     retention: None,
                     legal_hold: None,
+                    runs: None,
                 },
             })) {
                 Outcome::Created { upload } => upload,
                 other => panic!("{other:?}"),
             }
+        }
+
+        /// A native upload of `length`, if stated, whose runs but the last are `run` bytes.
+        fn open(&mut self, key: &str, length: Option<u64>, run: u64) -> Outcome {
+            self.clock += 10;
+            self.run(Command::CreateUpload(CreateUpload {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: key.into(),
+                at_ns: self.clock,
+                upload: Upload {
+                    initiated_ns: 0,
+                    owner: "o".into(),
+                    headers: Vec::new(),
+                    checksum: Some((4, true)),
+                    retention: None,
+                    legal_hold: None,
+                    runs: Some(Runs {
+                        length,
+                        run,
+                        // What the range begins every native upload at, whatever is sent.
+                        offset: 7,
+                        count: 7,
+                        ended: true,
+                        md5: Some(RunMd5::Running([1; 16])),
+                    }),
+                },
+            }))
+        }
+
+        /// Run `number` of a native upload, `size` bytes from `offset`, in file `file`.
+        fn append(
+            &mut self,
+            key: &str,
+            upload: &str,
+            (number, offset, size): (u16, u64, u64),
+            (last, md5): (bool, Option<RunMd5>),
+            file: u128,
+        ) -> Outcome {
+            self.clock += 10;
+            self.run(Command::PutPart(PutPart {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: key.into(),
+                upload: upload.into(),
+                number,
+                part: Part {
+                    etag: String::new(),
+                    size,
+                    checksum: Some(vec![1; 8]),
+                    file,
+                    modified_ns: 0,
+                    deadline_ns: u64::MAX,
+                },
+                at_ns: self.clock,
+                run: Some(Run { offset, last, md5 }),
+            }))
+        }
+
+        fn runs(&mut self, key: &str, upload: &str) -> Runs {
+            super::upload(&mut self.engine, "b", key, upload)
+                .unwrap()
+                .unwrap()
+                .runs
+                .unwrap()
         }
 
         fn part(&mut self, key: &str, upload: &str, number: u16, size: u64, file: u128) -> Outcome {
@@ -2884,6 +3104,7 @@ mod tests {
                     deadline_ns: u64::MAX,
                 },
                 at_ns: 0,
+                run: None,
             }))
         }
 
@@ -2934,8 +3155,274 @@ mod tests {
                 id: 0,
                 deadline_ns: u64::MAX,
                 listing: listing(parts),
+                native: false,
             }))
         }
+
+        /// A native upload's completion of its runs, `parts`, as the gateway combines them: the
+        /// size their sum, the checksum the client's.
+        fn finish(
+            &mut self,
+            key: &str,
+            upload: &str,
+            parts: &[(u16, u128)],
+            (size, etag): (u64, &str),
+            checksum: Option<Checksum>,
+        ) -> Outcome {
+            self.clock += 10;
+            let file = self.composite;
+            self.composite += 1;
+            self.sent(Command::Complete(Complete {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: key.into(),
+                upload: upload.into(),
+                versioning: Versioning::Enabled,
+                preconditions: Preconditions::default(),
+                at_ns: self.clock,
+                parts: parts
+                    .iter()
+                    .map(|&(number, file)| Listed {
+                        number,
+                        etag: String::new(),
+                        file,
+                    })
+                    .collect(),
+                etag: etag.into(),
+                size,
+                checksum,
+                file: Some(file),
+                default: None,
+                id: 0,
+                deadline_ns: u64::MAX,
+                listing: [0; crate::record::LISTING],
+                native: true,
+            }))
+        }
+    }
+
+    /// A native upload's runs are as long as 10,000 of them need to hold its stated length,
+    /// within S3's part sizes and whole 64 KiB segments; with no length stated, as long as the
+    /// client's buffer lets them be; and none where no run fits.
+    #[test]
+    fn a_native_uploads_run_fits_s3s_parts_and_the_client() {
+        let segment = mantle_s3::seal::SEGMENT as u64;
+        assert_eq!(run_length(Some(1), None), Some(MIN_PART));
+        // 10,000 runs of the least part hold 48.8 GiB; past it, runs grow a segment at a time.
+        assert_eq!(run_length(Some(48 << 30), None), Some(MIN_PART));
+        assert_eq!(
+            run_length(Some(50 << 30), None),
+            Some(MIN_PART + 2 * segment)
+        );
+        let long = 1u64 << 40;
+        let run = run_length(Some(long), None).unwrap();
+        assert_eq!(run % segment, 0);
+        assert!(long.div_ceil(run) <= 10_000 && long.div_ceil(run - segment) > 10_000);
+        assert_eq!(run_length(None, Some(8 << 20)), Some(8 << 20));
+        assert_eq!(run_length(None, Some((8 << 20) + 5)), Some(8 << 20));
+        assert_eq!(run_length(None, None), Some(MAX_PART));
+        assert_eq!(run_length(None, Some(1 << 20)), None);
+        assert_eq!(run_length(Some(long), Some(8 << 20)), None);
+        let most = MAX_PART * u64::from(MAX_PART_NUMBER);
+        assert_eq!(run_length(Some(most), None), Some(MAX_PART));
+        assert_eq!(run_length(Some(most + 1), None), None);
+    }
+
+    /// A native upload's runs are taken in order, each at the offset the last left: one at
+    /// another offset, or after the last, is refused naming the offset and its file released;
+    /// one of another length than the plan, a part numbered by a client, or a run of an upload
+    /// made by CreateMultipartUpload, are refused, and nothing moves.
+    #[test]
+    fn a_native_uploads_runs_are_taken_in_order_at_its_offset() {
+        let mut r = Range::new();
+        let run = MIN_PART;
+        let Outcome::Created { upload } = r.open("k", Some(2 * run + 9), run) else {
+            panic!("no upload")
+        };
+        let begun = r.runs("k", &upload);
+        assert_eq!((begun.offset, begun.count, begun.ended), (0, 0, false));
+        let going = |b| (false, Some(RunMd5::Running([b; 16])));
+        let done = |b| (true, Some(RunMd5::Done([b; 16])));
+        assert_eq!(
+            r.append("k", &upload, (1, 0, run), going(2), 100),
+            Outcome::PartWritten
+        );
+        // The first run again, as a client resuming from an offset it was not told.
+        assert_eq!(
+            r.append("k", &upload, (2, 0, run), going(3), 101),
+            Outcome::Offset {
+                offset: run,
+                ended: false
+            }
+        );
+        // Of another length than the plan's, or numbered past the next.
+        assert_eq!(
+            r.append("k", &upload, (2, run, run - 1), going(3), 102),
+            Outcome::Invalid
+        );
+        assert_eq!(
+            r.append("k", &upload, (3, run, run), going(3), 103),
+            Outcome::Invalid
+        );
+        // A last run that does not end at the stated length, or a run on whose MD5 finished.
+        assert_eq!(
+            r.append("k", &upload, (2, run, 8), done(3), 104),
+            Outcome::Invalid
+        );
+        assert_eq!(
+            r.append(
+                "k",
+                &upload,
+                (2, run, run),
+                (false, Some(RunMd5::Done([3; 16]))),
+                105
+            ),
+            Outcome::Invalid
+        );
+        let held = r.runs("k", &upload);
+        assert_eq!(
+            (held.offset, held.count, held.md5),
+            (run, 1, Some(RunMd5::Running([2; 16])))
+        );
+        assert_eq!(
+            r.append("k", &upload, (2, run, run), going(3), 106),
+            Outcome::PartWritten
+        );
+        assert_eq!(
+            r.append("k", &upload, (3, 2 * run, 9), done(4), 107),
+            Outcome::PartWritten
+        );
+        let ended = r.runs("k", &upload);
+        assert_eq!(
+            (ended.offset, ended.count, ended.ended, ended.md5),
+            (2 * run + 9, 3, true, Some(RunMd5::Done([4; 16])))
+        );
+        assert_eq!(
+            r.append("k", &upload, (4, 2 * run + 9, 1), (true, None), 108),
+            Outcome::Offset {
+                offset: 2 * run + 9,
+                ended: true
+            }
+        );
+        // Every refused run's file is given back, and no taken one's.
+        let released = queued(&mut r);
+        for file in [101, 102, 103, 104, 105, 108] {
+            assert!(released.contains(&file), "{file} kept");
+        }
+        for file in [100, 106, 107] {
+            assert!(!released.contains(&file), "{file} released");
+        }
+        // A client's numbered part does not go to a native upload, nor a run to an upload
+        // CreateMultipartUpload made.
+        let Outcome::Created { upload: other } = r.open("j", None, run) else {
+            panic!("no upload")
+        };
+        assert_eq!(r.part("j", &other, 1, run, 200), Outcome::Invalid);
+        let stock = r.create("i");
+        assert_eq!(
+            r.append("i", &stock, (1, 0, run), (false, None), 201),
+            Outcome::Invalid
+        );
+        // A plan no file's extents hold, or not whole segments, is no upload.
+        assert_eq!(r.open("h", Some(u64::MAX), run), Outcome::Invalid);
+        assert_eq!(r.open("h", None, run + 1), Outcome::Invalid);
+    }
+
+    /// A native upload completes from every run once its last committed, its ETag at most one
+    /// PUT's bytes the MD5 across them; anything less is refused and the upload kept. A retry
+    /// once the upload is gone is answered from the version by its size and checksum.
+    #[test]
+    fn a_native_upload_completes_from_every_run_and_its_retry_finds_the_version() {
+        let mut r = Range::new();
+        let run = MIN_PART;
+        let Outcome::Created { upload } = r.open("k", None, run) else {
+            panic!("no upload")
+        };
+        let digest = [0xab; 16];
+        let etag = mantle_s3::checksum::etag(&digest);
+        let checksum = Some(Checksum {
+            algorithm: 4,
+            parts: 0,
+            value: vec![5; 8],
+        });
+        assert_eq!(
+            r.append(
+                "k",
+                &upload,
+                (1, 0, run),
+                (false, Some(RunMd5::Running([1; 16]))),
+                10
+            ),
+            Outcome::PartWritten
+        );
+        // Before its last run, or without every run, or with another ETag.
+        let size = run + 3;
+        assert_eq!(
+            r.finish("k", &upload, &[(1, 10)], (run, &etag), checksum.clone()),
+            Outcome::Miscombined
+        );
+        assert_eq!(
+            r.append(
+                "k",
+                &upload,
+                (2, run, 3),
+                (true, Some(RunMd5::Done(digest))),
+                11
+            ),
+            Outcome::PartWritten
+        );
+        assert_eq!(
+            r.finish("k", &upload, &[(1, 10)], (run, &etag), checksum.clone()),
+            Outcome::Miscombined
+        );
+        assert_eq!(
+            r.finish(
+                "k",
+                &upload,
+                &[(1, 10), (2, 11)],
+                (size, "x-2"),
+                checksum.clone()
+            ),
+            Outcome::Miscombined
+        );
+        // A client's completion of a native upload is no completion of it.
+        assert_eq!(
+            r.complete("k", &upload, &[(1, "", 10), (2, "", 11)]),
+            Outcome::Invalid
+        );
+        let Outcome::Put { version } = r.finish(
+            "k",
+            &upload,
+            &[(1, 10), (2, 11)],
+            (size, &etag),
+            checksum.clone(),
+        ) else {
+            panic!("not completed")
+        };
+        let (_, v) = current(&mut r.engine, "b", "k").unwrap().unwrap();
+        assert_eq!((v.size, v.etag.as_str()), (size, etag.as_str()));
+        // Sent again once the upload is gone: the version, for its size and checksum alone.
+        let Outcome::Completed {
+            version: again,
+            size: again_size,
+            ..
+        } = r.finish("k", &upload, &[], (size, &etag), checksum.clone())
+        else {
+            panic!("no retry")
+        };
+        assert_eq!((again, again_size), (version, size));
+        let other = Some(Checksum {
+            value: vec![6; 8],
+            ..checksum.clone().unwrap()
+        });
+        assert_eq!(
+            r.finish("k", &upload, &[], (size, &etag), other),
+            Outcome::NoSuchUpload
+        );
+        assert_eq!(
+            r.finish("k", &upload, &[], (size + 1, &etag), checksum),
+            Outcome::NoSuchUpload
+        );
     }
 
     /// A digest of the parts listed, their numbers and ETags, standing in for the gateway's
@@ -3036,6 +3523,7 @@ mod tests {
                 version,
                 size: v.size,
                 checksum: v.checksum.clone(),
+                etag: v.etag.clone(),
             }
         );
         for other in [
@@ -3180,6 +3668,7 @@ mod tests {
                     deadline_ns,
                 },
                 at_ns,
+                run: None,
             })
         };
         assert_eq!(r.run(sent(r.clock, r.clock + 100)), Outcome::PartWritten);
@@ -3427,6 +3916,7 @@ mod tests {
                 deadline_ns: part_deadline,
             },
             at_ns: r.clock,
+            run: None,
         });
         assert_eq!(r.run(part), Outcome::PartWritten);
         let composite = r.composite;
@@ -3533,6 +4023,7 @@ mod tests {
             id: 600,
             deadline_ns,
             listing: listing(&[(1, "e1", 31)]),
+            native: false,
         });
         let completed = r.run(complete.clone());
         assert!(matches!(completed, Outcome::Put { .. }), "{completed:?}");
@@ -4091,6 +4582,7 @@ mod tests {
                 checksum: None,
                 retention: compliance(50_000),
                 legal_hold: Some(true),
+                runs: None,
             },
         })) else {
             panic!("no upload")
@@ -4340,6 +4832,7 @@ mod tests {
                                 deadline_ns,
                             },
                             at_ns: r.clock,
+                            run: None,
                         }));
                         answered.push(outcome);
                     }
@@ -4383,6 +4876,7 @@ mod tests {
                             id: file,
                             deadline_ns,
                             listing: [0; crate::record::LISTING],
+                            native: false,
                         }));
                         if matches!(outcome, Outcome::Put { .. })
                             && versions_hold(&mut r.engine, file)

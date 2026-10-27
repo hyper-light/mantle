@@ -14,7 +14,7 @@ use aws_lc_rs::error::Unspecified;
 use aws_lc_rs::{constant_time, digest, hmac};
 
 pub use aws_lc_rs::digest::SHA1_FOR_LEGACY_USE_ONLY as SHA1;
-pub use aws_lc_rs::digest::{MD5_FOR_LEGACY_USE_ONLY as MD5, SHA256, SHA512};
+pub use aws_lc_rs::digest::{MD5_FOR_LEGACY_USE_ONLY as MD5, SHA256, SHA512, State};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("the cryptographic library failed")]
@@ -48,6 +48,17 @@ impl Digest {
     pub fn finish_array<const N: usize>(self) -> Result<[u8; N], CryptoError> {
         let digest = guarded(move || self.0.try_finish())?;
         digest.as_ref().try_into().map_err(|_| CryptoError)
+    }
+
+    /// Its state between two blocks, its chaining value and the bytes it took, which it holds
+    /// whole only at a block boundary (docs/design/crypto.md §10).
+    pub fn state(&self) -> Result<digest::State, CryptoError> {
+        guarded(|| self.0.state())
+    }
+
+    /// A digest that goes on from `state` as the one it was taken from would.
+    pub fn resume(state: &digest::State) -> Result<Self, CryptoError> {
+        guarded(|| digest::Context::resume(state)).map(Self)
     }
 }
 
@@ -120,6 +131,26 @@ mod tests {
             Digest::new(&SHA256).unwrap().finish_array::<16>(),
             Err(CryptoError)
         );
+    }
+
+    /// RFC 1321's last test input, its MD5 carried across a block boundary through the state
+    /// a record would keep, and refused between boundaries.
+    #[test]
+    fn an_md5_resumed_from_its_state_is_the_whole_inputs() {
+        let input =
+            b"12345678901234567890123456789012345678901234567890123456789012345678901234567890";
+        let mut first = Digest::new(&MD5).unwrap();
+        first.update(&input[..64]).unwrap();
+        let kept = first.state().unwrap();
+        let state = State::new(&MD5, kept.chaining(), kept.len()).unwrap();
+        let mut rest = Digest::resume(&state).unwrap();
+        rest.update(&input[64..]).unwrap();
+        assert_eq!(
+            hex(&rest.finish().unwrap()),
+            "57edf4a22be3c955ac49da2e2107b67a"
+        );
+        first.update(&input[64..]).unwrap();
+        assert_eq!(first.state().err(), Some(CryptoError));
     }
 
     /// RFC 4231 test cases 1 and 6: a short key, and a key longer than a block.

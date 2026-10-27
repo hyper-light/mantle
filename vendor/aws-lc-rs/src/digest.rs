@@ -33,6 +33,8 @@ use crate::{debug, derive_debug_via_id};
 
 pub(crate) mod digest_ctx;
 mod sha;
+// mantle: a digest's state at a block boundary (vendor/UPSTREAM.md).
+mod state;
 use crate::aws_lc::{
     EVP_DigestFinal, EVP_DigestUpdate, EVP_md5, EVP_sha1, EVP_sha224, EVP_sha256, EVP_sha384,
     EVP_sha3_256, EVP_sha3_384, EVP_sha3_512, EVP_sha512, EVP_sha512_256, EVP_MD,
@@ -42,6 +44,7 @@ use crate::ptr::ConstPointer;
 use core::ffi::c_uint;
 use core::mem::MaybeUninit;
 use digest_ctx::DigestContext;
+pub use state::State;
 pub use sha::{
     MD5_FOR_LEGACY_USE_ONLY, MD5_OUTPUT_LEN, SHA1_FOR_LEGACY_USE_ONLY, SHA1_OUTPUT_LEN, SHA224,
     SHA224_OUTPUT_LEN, SHA256, SHA256_OUTPUT_LEN, SHA384, SHA384_OUTPUT_LEN, SHA3_256, SHA3_384,

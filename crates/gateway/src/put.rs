@@ -19,7 +19,7 @@ use mantle_meta::record::{self, BlockHeader, ChunkPlace, Extent, Referrer, Targe
 use mantle_meta::{block, file, name};
 use mantle_s3::body::{MAX_PARTS, MAX_UPLOAD};
 use mantle_s3::checksum::{self, Algorithm, Hasher};
-use mantle_s3::crypto::CryptoError;
+use mantle_s3::crypto::{self, CryptoError};
 use mantle_s3::seal::{self, DataKey, SealError, Segments};
 
 use crate::layout::{Layout, LayoutError, SEALED};
@@ -154,6 +154,21 @@ pub enum Commit {
     /// UploadPart: the part's row. A part names a file, so an empty part has one, holding one
     /// empty segment, sealed.
     Part(name::PutPart),
+    /// A native upload's run (gateway.md §2.1): a part whose `run` holds where it begins and,
+    /// as handed in, the MD5 across the object's runs at that offset, which the run carries on
+    /// and hands over at its end; with `own`, the run's own MD5 too, its part's ETag, for the
+    /// multipart ETag of an object past one PUT's bytes.
+    Run { part: name::PutPart, own: bool },
+}
+
+impl Commit {
+    /// The part a part or run commits.
+    fn part(&self) -> Option<&name::PutPart> {
+        match self {
+            Self::Object(_) => None,
+            Self::Part(p) | Self::Run { part: p, .. } => Some(p),
+        }
+    }
 }
 
 /// The body a PUT takes.
@@ -360,6 +375,8 @@ pub struct Put {
     /// The stored bytes' MD5, each segment as sealed: the ETag under SSE-C (encryption.md §4;
     /// audit B11).
     sealed_md5: Option<Hasher>,
+    /// A run's MD5 across its object's runs, resumed at the run's offset (crypto.md §10).
+    across: Option<crypto::Digest>,
     sum: Option<Hasher>,
     etag: Option<String>,
     checked: Option<checksum::Checksum>,
@@ -400,7 +417,7 @@ impl Put {
                 max: MAX_UPLOAD,
             });
         }
-        if let Commit::Part(p) = &commit
+        if let Some(p) = commit.part()
             && !(1..=MAX_PARTS).contains(&p.number)
         {
             return Err(PutError::InvalidPartNumber(p.number));
@@ -408,12 +425,32 @@ impl Put {
         let sealer = Segments::new(&keys.data, keys.file)?;
         // An SSE-S3 object's ETag is the MD5 of its plaintext, as S3's is; an SSE-C object's
         // is not (research/20 §5.1), and mantle's is the MD5 of its ciphertext
-        // (encryption.md §4). The key's wrapping names which the object is.
+        // (encryption.md §4). The key's wrapping names which the object is. A run's own MD5
+        // is taken only where its object's ETag may be the multipart one.
         let customer = matches!(keys.wrapped.by, record::Wrapper::Customer);
-        let md5 = if customer && !body.content_md5 {
-            None
-        } else {
-            Some(Hasher::new(Algorithm::Md5)?)
+        let md5 = match &commit {
+            Commit::Run { own: false, .. } if !body.content_md5 => None,
+            _ if customer && !body.content_md5 => None,
+            _ => Some(Hasher::new(Algorithm::Md5)?),
+        };
+        // The MD5 across a native upload's runs goes on from the state its last run left, at
+        // a whole number of MD5's blocks (`record::RunMd5`).
+        let across = match &commit {
+            Commit::Run { part, .. } => match part.run {
+                Some(name::Run {
+                    offset,
+                    md5: Some(record::RunMd5::Running(chaining)),
+                    ..
+                }) => {
+                    let state = crypto::State::new(&crypto::MD5, &chaining, offset)
+                        .map_err(|_| PutError::Mismatch)?;
+                    Some(crypto::Digest::resume(&state)?)
+                }
+                Some(name::Run { md5: None, .. }) => None,
+                // A run hands in a running MD5 or none, never a finished one.
+                _ => return Err(PutError::Mismatch),
+            },
+            _ => None,
         };
         let sealed_md5 = if customer {
             Some(Hasher::new(Algorithm::Md5)?)
@@ -451,6 +488,7 @@ impl Put {
             due: BTreeSet::new(),
             md5,
             sealed_md5,
+            across,
             sum,
             etag: None,
             checked: None,
@@ -565,6 +603,9 @@ impl Put {
             for h in [self.md5.as_mut(), self.sum.as_mut()].into_iter().flatten() {
                 h.update(now)?;
             }
+            if let Some(across) = self.across.as_mut() {
+                across.update(now)?;
+            }
             let n64 = u64::try_from(n).map_err(|_| PutError::Overflow)?;
             self.taken = self.taken.checked_add(n64).ok_or(PutError::Overflow)?;
             took = took.checked_add(n).ok_or(PutError::Overflow)?;
@@ -634,15 +675,17 @@ impl Put {
         self.phase = Phase::Ended;
         // An empty part is one empty segment, sealed now, before its ETag, which may be the
         // MD5 of what is sealed.
-        let empty_part = self.body.length == 0 && matches!(self.commit, Commit::Part(_));
+        let empty_part = self.body.length == 0 && self.commit.part().is_some();
         if empty_part {
             self.seal_segment()?;
         }
-        let etag = match self.sealed_md5.take() {
-            Some(sealed) => md5_of(sealed)?,
-            None => plain.ok_or(PutError::Over)?,
-        };
-        self.etag = Some(checksum::etag(&etag));
+        // A run of an object that keeps the MD5 across its runs needs no ETag of its own.
+        self.etag = Some(match (self.sealed_md5.take(), plain) {
+            (Some(sealed), _) => checksum::etag(&md5_of(sealed)?),
+            (None, Some(plain)) => checksum::etag(&plain),
+            (None, None) if matches!(self.commit, Commit::Run { .. }) => String::new(),
+            (None, None) => return Err(PutError::Over),
+        });
         if self.body.length == 0 && !empty_part {
             return self.commit(None);
         }
@@ -966,7 +1009,7 @@ impl Put {
                 incarnation: p.incarnation,
                 key: p.key.clone(),
             },
-            Commit::Part(p) => Referrer {
+            Commit::Part(p) | Commit::Run { part: p, .. } => Referrer {
                 bucket: p.bucket.clone(),
                 incarnation: p.incarnation,
                 key: p.key.clone(),
@@ -1013,27 +1056,58 @@ impl Put {
                 });
                 name::Command::Put(p)
             }
-            (Commit::Part(p), Some(deadline_ns)) => {
+            (Commit::Part(p) | Commit::Run { part: p, .. }, Some(deadline_ns)) => {
                 let mut p = p.clone();
                 p.part.file = self.file;
                 p.part.size = self.body.length;
                 p.part.etag = etag;
                 p.part.checksum = self.checked.as_ref().map(|c| c.bytes.clone());
                 p.part.deadline_ns = deadline_ns;
+                if let Some(run) = p.run.as_mut() {
+                    run.md5 = self.across_after(run.offset, run.last)?;
+                }
                 name::Command::PutPart(p)
             }
             // A part always has a file.
-            (Commit::Part(_), None) => return Err(PutError::Mismatch),
+            (Commit::Part(_) | Commit::Run { .. }, None) => return Err(PutError::Mismatch),
         };
         self.phase = Phase::Name;
         self.ask(Asked::Name, Request::Name(Box::new(command)));
         Ok(())
     }
 
+    /// The MD5 across a run's object once the run is taken: finished at the last run; at any
+    /// other, its state at the run's end, a whole number of blocks, while the object may still
+    /// be one PUT's bytes, and none past them, where the multipart ETag holds.
+    fn across_after(
+        &mut self,
+        offset: u64,
+        last: bool,
+    ) -> Result<Option<record::RunMd5>, PutError> {
+        let Some(across) = self.across.take() else {
+            return Ok(None);
+        };
+        let end = offset
+            .checked_add(self.body.length)
+            .ok_or(PutError::Overflow)?;
+        if end > MAX_UPLOAD {
+            return Ok(None);
+        }
+        if last {
+            return Ok(Some(record::RunMd5::Done(across.finish_array()?)));
+        }
+        let state = across.state()?;
+        let chaining = state
+            .chaining()
+            .try_into()
+            .map_err(|_| PutError::Mismatch)?;
+        Ok(Some(record::RunMd5::Running(chaining)))
+    }
+
     fn done(&mut self, outcome: name::Outcome) -> Result<(), PutError> {
         let version = match (&self.commit, outcome) {
             (Commit::Object(_), name::Outcome::Put { version }) => Some(version),
-            (Commit::Part(_), name::Outcome::PartWritten) => None,
+            (Commit::Part(_) | Commit::Run { .. }, name::Outcome::PartWritten) => None,
             (_, outcome) => return Err(PutError::Name(outcome)),
         };
         self.outcome = Some(Ok(Stored {

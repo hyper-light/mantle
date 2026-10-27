@@ -28,7 +28,7 @@ pub use crate::record::Verdict;
 pub use crate::record::Versioning;
 
 /// "Part size: 5 MiB to 5 GiB. There is no minimum size limit on the last part" (05 §4.1).
-pub const MIN_PART: u64 = 5 << 20;
+pub use mantle_s3::body::MIN_PART;
 
 /// The most a part holds, 5 GiB (05 §4.1), and the highest part number, 10,000 (05 §4.3). A
 /// gateway refuses more before it writes anything; the range refuses a part row past them

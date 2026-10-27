@@ -781,3 +781,331 @@ fn a_certificate_no_client_of_the_cells_holds_is_refused_at_its_handshake() {
     assert_eq!(served, Status::NoSuchBucket);
     pins_nodes_alone(&cell);
 }
+
+/// A copy from standard input of `size` bytes into `s3://BUCKET/KEY`, a `mantle cp` process whose
+/// input the test writes and whose lines on standard error it reads as they come.
+struct Copying {
+    child: std::process::Child,
+    input: Option<std::process::ChildStdin>,
+    lines: std::sync::mpsc::Receiver<String>,
+    said: Vec<String>,
+}
+
+/// Where the copies of the resumable tests go.
+const RESUMED: &str = "resumed";
+
+impl Copying {
+    fn start(dir: &Path, key: &str, size: usize) -> Self {
+        let mut child = Command::new(NODE)
+            .arg("--client")
+            .arg(dir)
+            .args(["cp", "-", &format!("s3://{RESUMED}/{key}")])
+            .args(["--size", &size.to_string()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take();
+        let err = child.stderr.take().unwrap();
+        let (tell, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(err).lines() {
+                let Ok(line) = line else { return };
+                if tell.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        Self {
+            child,
+            input,
+            lines,
+            said: Vec::new(),
+        }
+    }
+
+    /// Writes `bytes` to its input: returned once the copy read all but what the pipe holds. A
+    /// copy that ended before reading them closed the pipe: what it said, at its finish, tells why.
+    fn write(&mut self, bytes: &[u8]) {
+        if let Err(e) = self.input.as_mut().unwrap().write_all(bytes) {
+            assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "{e}");
+        }
+    }
+
+    /// Takes its lines until one ends with `ending`, the cell's nodes heard meanwhile.
+    fn until_said(&mut self, cell: &mut Cell, ending: &str) {
+        cell.until(|_| {
+            while let Ok(line) = self.lines.try_recv() {
+                self.said.push(line);
+            }
+            if self.said.iter().any(|l| l.ends_with(ending)) {
+                Some(())
+            } else {
+                None
+            }
+        });
+    }
+
+    /// Killed with SIGKILL: nothing of it runs past this.
+    fn kill(mut self) {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+    }
+
+    /// Its input closed, its end: whether it exited well, what it said on standard output and
+    /// every line on standard error.
+    fn finish(mut self, cell: &mut Cell) -> (bool, String, Vec<String>) {
+        drop(self.input.take());
+        let mut out = self.child.stdout.take().unwrap();
+        let read = std::thread::spawn(move || {
+            let mut said = String::new();
+            std::io::Read::read_to_string(&mut out, &mut said).unwrap();
+            said
+        });
+        let status = cell.until(|_| self.child.try_wait().unwrap());
+        while let Ok(line) = self.lines.recv() {
+            self.said.push(line);
+        }
+        (status.success(), read.join().unwrap(), self.said)
+    }
+}
+
+/// The runs of the open upload of `key` as the cell holds them: their sizes, in order, by the
+/// command line's own listings.
+fn runs_held(dir: &Path, key: &str) -> Vec<u64> {
+    let said = |out: Vec<u8>| String::from_utf8(out).unwrap();
+    let uploads = said(mantle(
+        dir,
+        &["multipart", "uploads", &format!("s3://{RESUMED}")],
+        None,
+    ));
+    // Each upload a line: its initiation, its ID and its key.
+    let upload = uploads
+        .lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>())
+        .find(|words| words.get(2) == Some(&key))
+        .map(|words| words[1].to_owned())
+        .unwrap_or_else(|| panic!("no open upload of {key}: {uploads}"));
+    let parts = said(mantle(
+        dir,
+        &[
+            "multipart",
+            "parts",
+            &format!("s3://{RESUMED}/{key}"),
+            &upload,
+        ],
+        None,
+    ));
+    // Each part a line: its number, its size and its ETag.
+    parts
+        .lines()
+        .map(|l| l.split_whitespace().nth(1).unwrap().parse().unwrap())
+        .collect()
+}
+
+/// The runs a copy said it committed, in order.
+fn committed(said: &[String]) -> Vec<u16> {
+    said.iter()
+        .filter_map(|l| l.split(": run ").nth(1))
+        .map(|l| l.split(' ').next().unwrap().parse().unwrap())
+        .collect()
+}
+
+/// `key` holds `object`, read back whole, its ETag the MD5 of its bytes, as one PUT's is.
+fn holds(dir: &Path, key: &str, object: &[u8]) {
+    let got = mantle(dir, &["cp", &format!("s3://{RESUMED}/{key}"), "-"], None);
+    assert!(got == object, "{key} came back otherwise");
+    let head = String::from_utf8(mantle(
+        dir,
+        &["head", &format!("s3://{RESUMED}/{key}")],
+        None,
+    ))
+    .unwrap();
+    let md5 = mantle_s3::checksum::checksum(mantle_s3::checksum::Algorithm::Md5, object).unwrap();
+    assert!(
+        head.contains(&mantle_s3::checksum::etag(
+            md5.bytes.as_slice().try_into().unwrap()
+        )),
+        "{head}"
+    );
+}
+
+/// A copy resumed after a kill: it said it resumed at `offset` after `runs` runs, then committed
+/// every run after them and none before, and its object holds `object` and its MD5 as its ETag.
+fn resumed_whole(
+    dir: &Path,
+    key: &str,
+    (offset, runs, total): (u64, u16, u16),
+    said: &[String],
+    object: &[u8],
+) {
+    let first = said
+        .iter()
+        .position(|l| l.contains("resuming upload "))
+        .unwrap_or_else(|| panic!("no resume: {said:?}"));
+    assert!(
+        said[first].ends_with(&format!(" at {offset} bytes, {runs} runs")),
+        "{said:?}"
+    );
+    assert_eq!(
+        committed(&said[first..]),
+        (runs + 1..=total).collect::<Vec<_>>(),
+        "{said:?}"
+    );
+    holds(dir, key, object);
+}
+
+/// A native upload streamed from standard input in runs the node cuts (gateway.md §2.1): a copy
+/// SIGKILLed once a run committed, and one SIGKILLed with a run half sent, each run again resumes
+/// from the cell's durable offset, its committed runs not sent again, and its object is the bytes
+/// whole, its ETag their MD5; a copy resumed from a source changed below that offset ends in
+/// `BadDigest`, and nothing commits.
+#[test]
+fn a_copy_killed_at_a_run_boundary_or_mid_run_resumes_and_a_changed_source_is_refused() {
+    let mut cell = Cell::made_alone(three_founders);
+    let dir = made_client(&cell, "client");
+    mantle(&dir, &["mb", &format!("s3://{RESUMED}")], None);
+    // With its length stated, a copy's runs are S3's least part.
+    let run = 5usize << 20;
+    let size = 4 * run + (1 << 20);
+    let total = 5u16;
+
+    // A file of several runs, each read again from its offset: committed whole, run by run.
+    let file = cell.out().parent().unwrap().join("runs.bin");
+    let object = bytes(10, 3 * run + 77);
+    std::fs::write(&file, &object).unwrap();
+    let (done, out, err) = mantle_status(
+        &dir,
+        &[
+            "cp",
+            &file.display().to_string(),
+            &format!("s3://{RESUMED}/file"),
+        ],
+        None,
+    );
+    let said: Vec<String> = String::from_utf8_lossy(&err)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert!(done, "{}{said:?}", String::from_utf8_lossy(&out));
+    assert_eq!(committed(&said), [1, 2, 3, 4], "{said:?}");
+    holds(&dir, "file", &object);
+
+    // Killed once its second run committed, waiting on its input for the third.
+    let object = bytes(11, size);
+    let mut copying = Copying::start(&dir, "boundary", size);
+    copying.write(&object[..2 * run]);
+    copying.until_said(
+        &mut cell,
+        &format!("run 2 committed, {} bytes durable", 2 * run),
+    );
+    copying.kill();
+    assert_eq!(runs_held(&dir, "boundary"), [run as u64; 2]);
+    let mut again = Copying::start(&dir, "boundary", size);
+    again.write(&object);
+    let (done, out, said) = again.finish(&mut cell);
+    assert!(done, "{out}{said:?}");
+    resumed_whole(
+        &dir,
+        "boundary",
+        ((2 * run) as u64, 2, total),
+        &said,
+        &object,
+    );
+
+    // Killed with half its third run read and sent: the cell holds two runs, the half lost.
+    let object = bytes(12, size);
+    let mut copying = Copying::start(&dir, "mid", size);
+    copying.write(&object[..2 * run + run / 2]);
+    copying.until_said(
+        &mut cell,
+        &format!("run 2 committed, {} bytes durable", 2 * run),
+    );
+    copying.kill();
+    assert_eq!(runs_held(&dir, "mid"), [run as u64; 2]);
+    let mut again = Copying::start(&dir, "mid", size);
+    again.write(&object);
+    let (done, out, said) = again.finish(&mut cell);
+    assert!(done, "{out}{said:?}");
+    resumed_whole(&dir, "mid", ((2 * run) as u64, 2, total), &said, &object);
+
+    // Resumed from a source whose first run changed: its runs are not the object it now is.
+    let object = bytes(13, size);
+    let mut copying = Copying::start(&dir, "changed", size);
+    copying.write(&object[..2 * run]);
+    copying.until_said(
+        &mut cell,
+        &format!("run 2 committed, {} bytes durable", 2 * run),
+    );
+    copying.kill();
+    let mut changed = object.clone();
+    changed[run / 2] ^= 0xff;
+    let mut again = Copying::start(&dir, "changed", size);
+    again.write(&changed);
+    let (done, out, said) = again.finish(&mut cell);
+    assert!(!done, "{out}{said:?}");
+    assert!(said.iter().any(|l| l.contains("BadDigest")), "{said:?}");
+    let (found, _, err) = mantle_status(&dir, &["head", &format!("s3://{RESUMED}/changed")], None);
+    assert!(
+        !found && String::from_utf8_lossy(&err).contains("NoSuchKey"),
+        "{}",
+        String::from_utf8_lossy(&err)
+    );
+    let uploads = String::from_utf8(mantle(
+        &dir,
+        &["multipart", "uploads", &format!("s3://{RESUMED}")],
+        None,
+    ))
+    .unwrap();
+    assert!(!uploads.contains("changed"), "{uploads}");
+}
+
+/// A node SIGKILLed while a copy's third run streams through it: with one node of three gone the
+/// cell writes no block, every chunk on a volume of its own and none acknowledged short of every
+/// one (CLAUDE.md §6), so the copy, having found the upload's offset through another node, ends
+/// `SlowDown`, its journal keeping the upload and the cell its two runs; once the node is back, its
+/// volume enlisted and every range caught up on it, the copy run again resumes from the cell's
+/// offset, no committed run sent again, its object the bytes whole.
+#[test]
+fn a_copy_through_a_node_killed_mid_run_resumes_from_the_cells_offset_once_it_is_back() {
+    let mut cell = Cell::made_alone(three_founders);
+    let dir = made_client(&cell, "client");
+    let bound = cell.bound_quic();
+    mantle(&dir, &["mb", &format!("s3://{RESUMED}")], None);
+    let run = 5usize << 20;
+    let size = 4 * run + (1 << 20);
+    let object = bytes(14, size);
+    let mut copying = Copying::start(&dir, "node", size);
+    copying.write(&object[..2 * run + run / 2]);
+    copying.until_said(
+        &mut cell,
+        &format!("run 2 committed, {} bytes durable", 2 * run),
+    );
+    // The client asks the nodes in the order its directory names them, the first first.
+    let killed = bound[0].0;
+    cell.kill(killed);
+    copying.write(&object[2 * run + run / 2..]);
+    let (done, out, said) = copying.finish(&mut cell);
+    assert!(
+        !done && said.iter().any(|l| l.ends_with("the upload: SlowDown")),
+        "{out}{said:?}"
+    );
+    assert_eq!(runs_held(&dir, "node"), [run as u64; 2]);
+    // Back on a port of its own (node.md §1.7): its peers and the client are told where, its
+    // volume enlists again, and every range catches up on it, so the cell places blocks again.
+    let groups: std::collections::BTreeSet<u128> =
+        cell.status.keys().map(|(_, group)| *group).collect();
+    cell.start(killed);
+    cell.introduce();
+    cell.enlisted(killed);
+    for group in &groups {
+        cell.converged(*group);
+    }
+    point_at(&dir, &cell.bound_quic());
+    let mut again = Copying::start(&dir, "node", size);
+    again.write(&object);
+    let (done, out, said) = again.finish(&mut cell);
+    assert!(done, "{out}{said:?}");
+    resumed_whole(&dir, "node", ((2 * run) as u64, 2, 5), &said, &object);
+}

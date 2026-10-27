@@ -36,6 +36,10 @@
 //! | 14 | AbortMultipartUpload | the bucket and the key; the upload's ID |
 //! | 15 | ListParts | the bucket and the key; the upload's ID; the part number after which the page starts (u16); the most parts (u32) |
 //! | 16 | ListMultipartUploads | the bucket; the prefix; the delimiter, empty for none; the key marker and the upload ID marker, each optional; the most uploads (u32) |
+//! | 17 | Open, a native upload (gateway.md §2.1) | the bucket and the key; the object's length, optional (u64); the client's buffer, optional (u64); the full-object checksum's algorithm's code (u8) |
+//! | 18 | Append, a native upload's run | the bucket and the key; the upload's ID; the offset it begins at (u64); whether it ends the object (u8) |
+//! | 19 | Offset, a native upload's state | the bucket and the key; the upload's ID |
+//! | 20 | Finish, a native upload's end | the bucket and the key; the upload's ID; the headers; the object's length (u64); its full-object checksum: its algorithm's code (u8) and its value, its length (u8) before it |
 //!
 //! The headers are the values of S3's request headers an object's operation takes as text, each
 //! optional: `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since` and `Range`,
@@ -54,7 +58,9 @@
 //! each), S3's `206 Partial Content`; the bucket's versioning, GetBucketVersioning's (u8): 0 none,
 //! never set or not asked, 2 enabled, 3 suspended; the upload's ID, CreateMultipartUpload's, a text;
 //! then the listing, behind a byte: 0 none, 1 a page of keys, 2 a page of buckets, 3 a page of
-//! parts, 4 a page of uploads. A page of keys: whether it is truncated (u8); where the next page starts,
+//! parts, 4 a page of uploads; then a native upload's progress, optional: its durable offset (u64),
+//! its runs (u16), the length of every run but its last (u64), whether its last run committed (u8)
+//! and a run's checksum, optional, its length (u8) before it. A page of keys: whether it is truncated (u8); where the next page starts,
 //! optional, as a request names it; the count of keys (u32), each its key, ETag, size (u64),
 //! Last-Modified (u64), checksum algorithm, optional, its code (u8) and parts (u16), and owner,
 //! optional, a text; the count of common prefixes (u32), each a text. A page of buckets: the
@@ -93,6 +99,10 @@ const COMPLETE: u8 = 13;
 const ABORT: u8 = 14;
 const LIST_PARTS: u8 = 15;
 const LIST_UPLOADS: u8 = 16;
+const OPEN: u8 = 17;
+const APPEND: u8 = 18;
+const OFFSET: u8 = 19;
+const FINISH: u8 = 20;
 
 /// The longest version id or ETag a reply carries: a multipart object's ETag, bare of quotes, an
 /// MD5's 32 hex digits, `-` and its count of parts, at most `MAX_PARTS`'s five digits
@@ -346,6 +356,53 @@ pub enum Op {
         id_marker: Option<String>,
         max: u32,
     },
+    /// A native upload (gateway.md §2.1): a multipart upload whose runs the node cuts, of
+    /// `length` bytes where the client knows them, held at its end to a full-object checksum in
+    /// `checksum`'s algorithm, a CRC, which combines from the runs'; `buffer`, where the
+    /// client's source cannot be read again, the most of it the client holds, which no run
+    /// passes. Its reply carries the upload's ID and its progress, the length of its runs.
+    Open {
+        bucket: String,
+        key: String,
+        id: u128,
+        length: Option<u64>,
+        buffer: Option<u64>,
+        checksum: Algorithm,
+    },
+    /// A native upload's next run: `length` bytes from `offset`, the upload's durable offset,
+    /// `last` where they end the object; its checksum, in the upload's algorithm, in a trailer
+    /// after them. Its reply is the run's progress frame: the durable offset after it, its
+    /// number and its checksum. One at another offset is refused `Offset`, the progress naming
+    /// the upload's.
+    Append {
+        bucket: String,
+        key: String,
+        upload: String,
+        id: u128,
+        offset: u64,
+        length: u64,
+        last: bool,
+        trailing: Option<Algorithm>,
+    },
+    /// A native upload's progress: its durable offset, its runs and their length, which a client
+    /// resuming appends from (gateway.md §2.1).
+    Offset {
+        bucket: String,
+        key: String,
+        upload: String,
+    },
+    /// A native upload's end: its object committed, under the preconditions `headers` name, if
+    /// its runs are `length` bytes whose full-object checksum is `checksum`; otherwise
+    /// `BadDigest`, and nothing is committed.
+    Finish {
+        bucket: String,
+        key: String,
+        upload: String,
+        id: u128,
+        headers: Headers,
+        length: u64,
+        checksum: Checksum,
+    },
 }
 
 /// A versioning state as a message carries it: 2 enabled, 3 suspended.
@@ -390,6 +447,21 @@ fn take_flag(r: &mut Reader<'_>) -> Option<bool> {
         0 => Some(false),
         1 => Some(true),
         _ => None,
+    }
+}
+
+fn put_optional_u64(w: &mut Writer, value: Option<u64>) {
+    put_flag(w, value.is_some());
+    if let Some(value) = value {
+        w.u64(value);
+    }
+}
+
+fn take_optional_u64(r: &mut Reader<'_>) -> Option<Option<u64>> {
+    if take_flag(r)? {
+        Some(Some(r.u64()?))
+    } else {
+        Some(None)
     }
 }
 
@@ -682,6 +754,61 @@ impl Head {
                     id_marker: take_optional_text(&mut r, MAX_TAG)?,
                     max: r.u32()?,
                 },
+                OPEN => {
+                    let (bucket, key) = object(&mut r)?;
+                    Op::Open {
+                        bucket,
+                        key,
+                        id: self.id,
+                        length: take_optional_u64(&mut r)?,
+                        buffer: take_optional_u64(&mut r)?,
+                        checksum: Algorithm::from_code(r.u8()?)?,
+                    }
+                }
+                APPEND => {
+                    let (bucket, key) = object(&mut r)?;
+                    Op::Append {
+                        bucket,
+                        key,
+                        upload: take_text(&mut r, MAX_TAG)?,
+                        id: self.id,
+                        offset: r.u64()?,
+                        length: self.length,
+                        last: take_flag(&mut r)?,
+                        trailing: self.trailing,
+                    }
+                }
+                OFFSET => {
+                    let (bucket, key) = object(&mut r)?;
+                    Op::Offset {
+                        bucket,
+                        key,
+                        upload: take_text(&mut r, MAX_TAG)?,
+                    }
+                }
+                FINISH => {
+                    let (bucket, key) = object(&mut r)?;
+                    let upload = take_text(&mut r, MAX_TAG)?;
+                    let headers = take_headers(&mut r)?;
+                    let length = r.u64()?;
+                    let algorithm = Algorithm::from_code(r.u8()?)?;
+                    let width = usize::from(r.u8()?);
+                    if width != algorithm.width() {
+                        return None;
+                    }
+                    Op::Finish {
+                        bucket,
+                        key,
+                        upload,
+                        id: self.id,
+                        headers,
+                        length,
+                        checksum: Checksum {
+                            algorithm,
+                            bytes: r.take(width)?.to_vec(),
+                        },
+                    }
+                }
                 _ => return None,
             })
         })();
@@ -708,9 +835,9 @@ impl Head {
         .filter(|_| r.remaining() == 0);
         let head_of = || ObjectError::Head(head.len());
         let decoded = decoded.ok_or_else(head_of)?;
-        let puts = matches!(decoded.kind, PUT | UPLOAD_PART);
+        let puts = matches!(decoded.kind, PUT | UPLOAD_PART | APPEND);
         let within = usize::try_from(decoded.fields).is_ok_and(|f| f <= MAX_FIELDS)
-            && decoded.kind <= LIST_UPLOADS
+            && decoded.kind <= FINISH
             && (puts || (decoded.length == 0 && decoded.trailing.is_none()));
         let trailer = decoded
             .trailing
@@ -907,6 +1034,66 @@ impl Op {
                 f.u32(*max);
                 (LIST_UPLOADS, 0, 0, None)
             }
+            Self::Open {
+                bucket,
+                key,
+                id,
+                length,
+                buffer,
+                checksum,
+            } => {
+                object(&mut f, bucket, key)?;
+                put_optional_u64(&mut f, *length);
+                put_optional_u64(&mut f, *buffer);
+                f.u8(checksum.code());
+                (OPEN, *id, 0, None)
+            }
+            Self::Append {
+                bucket,
+                key,
+                upload,
+                id,
+                offset,
+                length,
+                last,
+                trailing,
+            } => {
+                object(&mut f, bucket, key)?;
+                put_text(&mut f, upload, MAX_TAG)?;
+                f.u64(*offset);
+                put_flag(&mut f, *last);
+                (APPEND, *id, *length, *trailing)
+            }
+            Self::Offset {
+                bucket,
+                key,
+                upload,
+            } => {
+                object(&mut f, bucket, key)?;
+                put_text(&mut f, upload, MAX_TAG)?;
+                (OFFSET, 0, 0, None)
+            }
+            Self::Finish {
+                bucket,
+                key,
+                upload,
+                id,
+                headers,
+                length,
+                checksum,
+            } => {
+                object(&mut f, bucket, key)?;
+                put_text(&mut f, upload, MAX_TAG)?;
+                put_headers(&mut f, headers)?;
+                f.u64(*length);
+                if checksum.bytes.len() != checksum.algorithm.width() {
+                    return Err(ObjectError::TooLong(checksum.bytes.len()));
+                }
+                f.u8(checksum.algorithm.code());
+                f.u8(u8::try_from(checksum.bytes.len()).map_err(|_| ObjectError::TooLong(0))?);
+                f.bytes(&checksum.bytes);
+                (FINISH, *id, 0, None)
+            }
         };
         let fields = f.into_vec();
         if fields.len() > MAX_FIELDS {
@@ -929,6 +1116,9 @@ impl Op {
                 length, trailing, ..
             }
             | Self::UploadPart {
+                length, trailing, ..
+            }
+            | Self::Append {
                 length, trailing, ..
             } => fields.saturating_add(*length).saturating_add(
                 trailing.map_or(0, |a| u64::try_from(a.width()).unwrap_or(u64::MAX)),
@@ -998,9 +1188,13 @@ pub enum Status {
     /// S3's `400 InvalidRequest`: a checksum type its algorithm does not have, a full-object
     /// hash or a composite CRC-64/NVME (05 §3.3).
     InvalidRequest,
+    /// A native upload's run that does not begin at the upload's durable offset, or follows its
+    /// last run: the reply's progress names the offset, as the resumable-upload draft's `409
+    /// Conflict` names it (research/30 §3.5).
+    Offset,
 }
 
-const STATUSES: [Status; 25] = [
+const STATUSES: [Status; 26] = [
     Status::Done,
     Status::NoSuchBucket,
     Status::NoSuchKey,
@@ -1026,6 +1220,7 @@ const STATUSES: [Status; 25] = [
     Status::EntityTooSmall,
     Status::InvalidArgument,
     Status::InvalidRequest,
+    Status::Offset,
 ];
 
 impl Status {
@@ -1056,6 +1251,7 @@ impl Status {
             Self::EntityTooSmall => 22,
             Self::InvalidArgument => 23,
             Self::InvalidRequest => 24,
+            Self::Offset => 25,
         }
     }
 
@@ -1180,9 +1376,27 @@ pub struct Reply {
     pub range: Option<(u64, u64)>,
     /// The bucket's versioning, GetBucketVersioning's: none for a bucket never versioned.
     pub versioning: Option<Versioning>,
-    /// The upload's ID, CreateMultipartUpload's; empty where none applies.
+    /// The upload's ID, CreateMultipartUpload's and Open's; empty where none applies.
     pub upload: String,
     pub listing: Option<Listing>,
+    /// A native upload's progress: Open's, Offset's, a run's frame, and an append refused
+    /// `Offset`. Boxed: few replies carry one, and every reply is moved whole.
+    pub progress: Option<Box<Progress>>,
+}
+
+/// A native upload's progress (gateway.md §2.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Progress {
+    /// The durable offset: the bytes of its committed runs, which the next run begins at.
+    pub offset: u64,
+    /// Its committed runs, the last one's number.
+    pub runs: u16,
+    /// The length of every run but the last, which the node cut.
+    pub run: u64,
+    /// Its last run committed: it takes no more, and is finished.
+    pub ended: bool,
+    /// A run's frame: the run's checksum, as the node kept it.
+    pub checksum: Option<Vec<u8>>,
 }
 
 fn put_listed(w: &mut Writer, l: &Listed) -> Result<(), ObjectError> {
@@ -1504,6 +1718,7 @@ impl Reply {
             versioning: None,
             upload: String::new(),
             listing: None,
+            progress: None,
         }
     }
 
@@ -1548,6 +1763,21 @@ impl Reply {
             Some(Listing::Uploads(page)) => {
                 f.u8(4);
                 put_uploads(&mut f, page)?;
+            }
+        }
+        put_flag(&mut f, self.progress.is_some());
+        if let Some(p) = &self.progress {
+            f.u64(p.offset);
+            f.u16(p.runs);
+            f.u64(p.run);
+            put_flag(&mut f, p.ended);
+            put_flag(&mut f, p.checksum.is_some());
+            if let Some(value) = &p.checksum {
+                if value.len() > MAX_CHECKSUM {
+                    return Err(ObjectError::TooLong(value.len()));
+                }
+                f.u8(u8::try_from(value.len()).map_err(|_| ObjectError::TooLong(0))?);
+                f.bytes(value);
             }
         }
         let fields = f.into_vec();
@@ -1634,6 +1864,30 @@ impl ReplyHead {
                 4 => Some(Listing::Uploads(take_uploads(&mut r)?)),
                 _ => return None,
             };
+            let progress = if take_flag(&mut r)? {
+                let offset = r.u64()?;
+                let runs = r.u16()?;
+                let run = r.u64()?;
+                let ended = take_flag(&mut r)?;
+                let checksum = if take_flag(&mut r)? {
+                    let len = usize::from(r.u8()?);
+                    if len > MAX_CHECKSUM {
+                        return None;
+                    }
+                    Some(r.take(len)?.to_vec())
+                } else {
+                    None
+                };
+                Some(Box::new(Progress {
+                    offset,
+                    runs,
+                    run,
+                    ended,
+                    checksum,
+                }))
+            } else {
+                None
+            };
             Some(Reply {
                 status: self.status,
                 size: self.size,
@@ -1646,6 +1900,7 @@ impl ReplyHead {
                 versioning,
                 upload,
                 listing,
+                progress,
             })
         })();
         reply.filter(|_| r.remaining() == 0).ok_or_else(bad)
@@ -1805,6 +2060,52 @@ mod tests {
                 id_marker: None,
                 max: 1000,
             },
+            Op::Open {
+                bucket: "b".into(),
+                key: "k".into(),
+                id: 9,
+                length: Some(12 << 20),
+                buffer: None,
+                checksum: Algorithm::Crc64Nvme,
+            },
+            Op::Open {
+                bucket: "b".into(),
+                key: "k".into(),
+                id: 10,
+                length: None,
+                buffer: Some(8 << 20),
+                checksum: Algorithm::Crc32c,
+            },
+            Op::Append {
+                bucket: "b".into(),
+                key: "k".into(),
+                upload: "0123456789ABC".into(),
+                id: 9,
+                offset: 5 << 20,
+                length: 5 << 20,
+                last: true,
+                trailing: Some(Algorithm::Crc64Nvme),
+            },
+            Op::Offset {
+                bucket: "b".into(),
+                key: "k".into(),
+                upload: "0123456789ABC".into(),
+            },
+            Op::Finish {
+                bucket: "b".into(),
+                key: "k".into(),
+                upload: "0123456789ABC".into(),
+                id: 9,
+                headers: Headers {
+                    if_none_match: Some("*".into()),
+                    ..Headers::default()
+                },
+                length: 10 << 20,
+                checksum: Checksum {
+                    algorithm: Algorithm::Crc64Nvme,
+                    bytes: vec![7; 8],
+                },
+            },
         ]
     }
 
@@ -1849,7 +2150,7 @@ mod tests {
         assert!(Head::decode(&unnamed, Some(body)).is_err());
         // An unknown kind.
         let mut unknown = head.clone();
-        unknown[0] = GET_VERSIONING + 1;
+        unknown[0] = FINISH + 1;
         assert!(Head::decode(&unknown, Some(put.body(&fields))).is_err());
         // A key past S3's bound, headers past S3's 8 KB, a checksum of the wrong width.
         let long = Op::Head {
@@ -1931,6 +2232,23 @@ mod tests {
             versioning: Some(Versioning::Suspended),
             upload: "0123456789ABC".into(),
             listing: None,
+            progress: Some(Box::new(Progress {
+                offset: 10 << 20,
+                runs: 2,
+                run: 5 << 20,
+                ended: false,
+                checksum: Some(vec![3; 8]),
+            })),
+        });
+        replies.push(Reply {
+            progress: Some(Box::new(Progress {
+                offset: 0,
+                runs: 0,
+                run: 5 << 30,
+                ended: true,
+                checksum: None,
+            })),
+            ..Reply::status(Status::Offset)
         });
         replies.push(Reply {
             listing: Some(Listing::Parts(Parts {

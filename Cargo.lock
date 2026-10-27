@@ -692,6 +692,7 @@ dependencies = [
  "mantle-cert",
  "mantle-chunk",
  "mantle-client",
+ "mantle-codec",
  "mantle-crc",
  "mantle-disk",
  "mantle-ec",

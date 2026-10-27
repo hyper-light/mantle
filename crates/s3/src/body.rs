@@ -33,6 +33,10 @@ const ETAG: usize = "&quot;d41d8cd98f00b204e9800998ecf8427e-10000&quot;".len();
 /// Parts in a multipart upload (05 §4.1).
 pub const MAX_PARTS: u16 = 10_000;
 
+/// The least a part but the last holds: "Part size: 5 MiB to 5 GiB. There is no minimum size
+/// limit on the last part" (05 §4.1).
+pub const MIN_PART: u64 = 5 << 20;
+
 /// Bytes one PutObject or UploadPart carries at most (05 §4.1): a part runs "5 MiB to 5 GiB",
 /// and a single PUT to "5 GB" as the upload guide writes it. The binary figure never refuses
 /// an upload S3 takes.

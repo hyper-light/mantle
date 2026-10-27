@@ -32,6 +32,7 @@ mod drive;
 mod durability;
 mod files;
 mod init;
+mod journal;
 
 #[derive(Parser)]
 #[command(
@@ -120,8 +121,16 @@ enum Command {
     /// [s3://BUCKET[/PREFIX]].
     Ls { at: Option<String> },
     /// Copy an object's bytes from a file or standard input (-) to s3://BUCKET/KEY, or back to a
-    /// file or standard output (-). A file is the whole object or untouched.
-    Cp { from: String, to: String },
+    /// file or standard output (-). A file is the whole object or untouched. A copy into the cell
+    /// is resumed by running it again, from where the cell holds it.
+    Cp {
+        from: String,
+        to: String,
+        /// The bytes standard input holds, where known: each run is then sent as it is read,
+        /// rather than read whole first.
+        #[arg(long)]
+        size: Option<u64>,
+    },
     /// Remove an object, s3://BUCKET/KEY.
     Rm { at: String },
     /// An object's facts, s3://BUCKET/KEY: its size, ETag, date, version and checksum.
@@ -466,9 +475,10 @@ fn object_command(command: &Command) -> Option<Result<client::Command, String>> 
         Command::Rb { bucket: b } => bucket(b).map(client::Command::RemoveBucket),
         Command::Ls { at: None } => Ok(client::Command::List(None)),
         Command::Ls { at: Some(text) } => at(text).map(|l| client::Command::List(Some(l))),
-        Command::Cp { from, to } => Ok(client::Command::Copy(
+        Command::Cp { from, to, size } => Ok(client::Command::Copy(
             client::place(from),
             client::place(to),
+            *size,
         )),
         Command::Rm { at: text } => object(text).map(client::Command::Remove),
         Command::Head { at: text } => object(text).map(client::Command::Head),

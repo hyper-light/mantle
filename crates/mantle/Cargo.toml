@@ -26,6 +26,10 @@ hyper-log = { path = "../../vendor/hyper-log" }
 # `mantle init`.
 mantle-cert = { path = "../cert" }
 mantle-chunk = { path = "../chunk" }
+# The command line's journal of its open uploads (src/journal.rs): its records' fields and the
+# CRC-32C each ends in.
+mantle-codec = { path = "../codec" }
+mantle-crc = { path = "../crc" }
 mantle-disk = { path = "../disk" }
 mantle-ec = { path = "../ec" }
 mantle-gateway = { path = "../gateway" }
@@ -47,7 +51,6 @@ mantle-s3 = { path = "../s3" }
 # The real-process test of `mantle node` (tests/node.rs): the client's transport, the range's
 # settings the nodes are given, and the CRC-32C the gateway states for each chunk it puts.
 hyper-transport = { path = "../../vendor/hyper-transport" }
-mantle-crc = { path = "../crc" }
 mantle-range = { path = "../range" }
 tempfile.workspace = true
 

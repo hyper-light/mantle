@@ -360,7 +360,16 @@ layers removes them, as Tectonic's does [01 §1.6].
   with the upload row's new durable offset and hash states in one transaction, so the offset
   only rises and cannot drift from the runs. A run's commit is a part's: from it the run needs no
   renewal. Abort, expiry and completion release or adopt each run exactly once by the existing
-  rules (below, "Adoption").
+  rules (below, "Adoption"). *As built (2026-10-26):* the upload row keeps `record::Runs`, its
+  stated length, its run length, its offset and count, whether its last run committed and the MD5
+  across its runs (running at the offset, finished at the last run, dropped past one PUT's 5 GiB);
+  `PutPart` carries the run (`name::Run`) and is taken only at the row's offset, as the next number,
+  of the run length or, the last, no longer; any other offset, or a run after the last, is
+  `Outcome::Offset` naming the row's, and the refused run's file is released as any refused
+  write's. A native completion (`Complete::native`) lists every run once the last committed, its
+  ETag the finished MD5 at most 5 GiB and the multipart form past it, and its retry once the upload
+  is gone is matched to the version by its size and full-object checksum. Runs and native
+  completions take log tags of their own (21, 22), so entries written before decode as they did.
 - **Validated reads** (research/31 §3.6, D3; gateway.md §5). A gateway holding a key's row asks
   the range, in a read confirmed by ReadIndex like any other, whether the key's first row is
   still the version it holds; the range answers "unchanged" with no row, or with the current row,

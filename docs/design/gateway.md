@@ -299,6 +299,31 @@ interval applies to runs not yet begun, never to bytes sealed, and changes only 
 interval of the predicted saving excludes zero and exceeds the measured cost of switching, each
 change recorded with its inputs (audit §16.2).
 
+*As built (2026-10-26).* The native protocol's Open, Append, Offset and Finish carry the five steps
+(node.md §4.1). The run length is fixed at the Open from the bounds alone (`name::run_length`):
+whole 64 KiB segments, at least S3's least part and at most its largest and the client's buffer, and
+for a stated length long enough that 10,000 runs hold it; a stream of no stated length is cut into
+runs as long as the client's buffer, so 10,000 of them hold the most it can be, as the AWS CLI cuts
+a stream into its chunk size and asks `--expected-size` past what 10,000 of them hold (research/74).
+The two measured terms, `g/r_meta` and Young's, wait for admission's run-commit share and the
+interruption rate's estimator; until they come a run is the smallest the bounds allow, whatever the
+path, and the interval does not adapt. Every run is its own exchange: the client sends the next run
+once the last's progress frame is in, so a run's commit, a block chain's tail, stalls the stream,
+the cost Young's term exists to weigh, and the next run does not stream while the last commits.
+Each run commits through `PutPart` with the row's offset, the MD5's new state and whether it ends
+the object (metadata.md §2, as built); the gateway resumes the MD5 from the row's state at the run's
+offset and hands back its state, finished at the last run and dropped past 5 GiB
+(`put::Commit::Run`; crypto.md §10), and takes a run's own MD5, its part's ETag, only where the
+object may pass 5 GiB. The Finish reads every run, holds the object to the client's length and
+full-object CRC, `BadDigest` with nothing written on any difference, and gives the finished MD5 as
+the ETag at most 5 GiB and the multipart ETag of the runs' MD5s past it (`complete::Completion::
+native`). An object one run holds is put whole by the client, the same bytes, ETag and checksum in
+one exchange. Not yet built: the operation identity's record (STATUS item 9), so an Open asked
+again after its answer was lost opens a second, empty upload, which the journal never names and an
+abort or the bucket's lifecycle removes; the source's identity, resume horizon and checksum
+algorithms beyond one CRC in the Open; SSE-C, which the native protocol does not carry; and the
+gateway's closing of a stalled run at its last whole segment.
+
 **Stock clients keep S3's own resume** (research/30 §3.6, D17). Through the HTTP/1.1 listener a
 client resumes only by multipart: a committed part is a Name row nothing but abort, completion,
 replacement or lifecycle removes; `ListParts` lists only committed parts, at most 1,000 a page;
@@ -585,15 +610,18 @@ resumes from the durable offset with no committed run sent again (research/30 D1
 *As built (2026-10-26).* The library is `crates/client` (`mantle-client`), depending on hyper-rt,
 hyper-transport, the native protocol's messages (`mantle-protocol`) and S3's semantics
 (`mantle-s3`), and on none of the engine, the ranges or the chunk store. It asks S3's bucket,
-object and multipart operations of a cell's nodes (`Client::call`, `put`, `get`), one exchange at a
-time on one connection a node. A put's body comes from a `Source` and a get's bytes go to a
+object and multipart operations of a cell's nodes (`Client::call`, `put`, `get`), and native
+uploads of any length (`upload` from a source it reads again, `upload_once` from one it reads once,
+§2.1), one exchange at a time on one connection a node. A put's body comes from a `Source` and a get's bytes go to a
 `Sink`, a piece at a time, the transport polled while either waits, so the client's memory is its
 transport's budget, what the transport holds beside it, the longest messages and one piece, and
 does not grow with an object (`mantle_client::memory`; `tests/heap.rs` counts the client's thread
 alone: a put and a get of 64 and of 1,024 windows peaked at 406,095 and 408,996 bytes of the
 3,821,063 stated). Every mutation carries its operation's identity, 128 bits from the OS; a request
-is asked again, after RFC 6298's doubling from the measured probe timeout with equal jitter, only
-where no node can have taken it, at most three attempts (the AWS SDKs' standard mode), and one
+is asked again of the next node, after RFC 6298's doubling from the measured probe timeout with
+equal jitter, only where no node can have taken it, its node not reached among them, a certificate
+or role every node refuses alike excepted, at most three attempts (the AWS SDKs' standard mode),
+and one
 whose exchange ended otherwise is the caller's, told whether it was sent whole. An exchange is
 given at least the node's own serve period, the idle timeout a node judges its exchanges stalled by,
 however fast the exchanges the client measured before it: a node may leave a put's body unread that
@@ -614,10 +642,23 @@ buckets or of a bucket's keys a level of `/` at a time, `cp` from a file or stan
 `put` (a part from a file, or standard input with its length), `complete`, `abort`, `parts` and
 `uploads`. It runs one shard on the machine's calibration kept in the client's directory, files
 read and written on one worker of hyper-rt's blocking pool and standard input and output on
-hyper-rt's own threads, so a slow disk or pipe stalls no connection. A file is put in one stream,
-or in parts past one put's 5 GiB; standard input, whose length is not known before its bytes, in
-parts of the AWS CLI's 8 MiB, each read whole first, since a part states its length before its
-bytes. A copy to a file is written under a temporary name beside it, flushed, renamed and its
+hyper-rt's own threads, so a slow disk or pipe stalls no connection. A copy into the cell, from a
+file or standard input, is a native upload in runs the node cuts (§2.1; `Client::upload` and
+`upload_once`), of any length, an object one run holds put whole. The library asks again from the
+node's durable offset where a run's exchange ends unanswered, the file read again from there or a
+read-once source's run sent again from what it holds, at most three times in a row without a run
+committing; it tells its caller the upload's ID once opened, before any run, and each run's
+progress (`Watch`). The command line keeps a journal of the uploads it opened (`crate::journal`,
+research/74): a record a file under the client's directory, written, flushed, renamed and its
+directory flushed before the first run, checked by its CRC-32C on every read, removed once the
+upload is answered, at most 1,000 at once. A copy run again finds its upload by its destination and
+source and resumes it, re-reading and hashing the committed prefix without sending it; a file whose
+length, time or inode changed is a new copy and its old upload is aborted, and a source changed
+where those checks cannot see ends in `BadDigest`, nothing committed and the upload aborted. Each
+run's commit is told on standard error. Standard input is held a run at a time: with `--size`, as the
+AWS CLI's `--expected-size`, each run is sent as it is read and kept until it commits; without, each
+run is read whole first, a piece past it read ahead to find the end, in runs of the AWS CLI's 8 MiB.
+A copy to a file is written under a temporary name beside it, flushed, renamed and its
 directory flushed, so the file is the whole object or untouched; an object past one put's bytes is
 got in ranges of its headed version, held together to its full-object checksum. Tested against a
 cell of three `mantle init` made (`crates/mantle/tests/native.rs`): through the library, buckets
@@ -625,8 +666,15 @@ made, headed, listed and versioned, an object streamed and got whole and by rang
 upload completed and got with one full-object checksum, another aborted, the keys listed with the
 cell's account as their owner, and one removed; through the command line, the same operations
 including copies from and to files, standard input past a part and standard output, each byte
-read back identical.
+read back identical. Resumed (the same file): a copy SIGKILLed once its second run committed, and
+one SIGKILLed with half its third run sent, each run again, resume at the cell's offset after two
+runs, which the cell's own listing shows held, commit the runs after them and none before, and give
+the object whole with its MD5 as its ETag; one resumed from a source changed below that offset ends
+in `BadDigest`, the key absent and no upload left; and a copy whose node is SIGKILLed mid-run finds
+the upload's offset through another node and ends `SlowDown`, the cell writing no block with one
+node of three gone (CLAUDE.md §6), its journal and the cell's two runs kept, then, run again once the
+node is back, resumes at that offset and commits the runs after it and none before.
 
-Not yet built: the journal and resumable uploads in server-cut runs (§2.1; the plan's next
-step), credits and the admission level, the server's upload plan, path adaptation and migration,
-per-block GET streams, the validated caches, and the TLS-over-TCP route.
+Not yet built: the journal in the library and its power-cut tests, the checkpoint interval's
+measured terms and two runs in flight (§2.1), credits and the admission level, path adaptation and
+migration, per-block GET streams, the validated caches, and the TLS-over-TCP route.

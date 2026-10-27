@@ -470,7 +470,8 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/mantle/src/bench_s3.rs` `CONNECTIONS_DOOR` | derived | 1: the bench's one client has one request out at a time. |
 | `crates/mantle/src/bench_s3.rs` `OBJECT` | cited | 8 MiB: the AWS CLI's part, its default `multipart_chunksize` and `multipart_threshold` of `8MB` (AWS CLI S3 configuration reference), a megabyte being 1024² octets to it (`awscli/customizations/s3/utils.py`, `SIZE_SUFFIX`): what one of its requests streams. |
 | `crates/mantle/src/client.rs` `NO_DEADLINE` | bound | No deadline of the command's own: each wait is the transport's to bound, an exchange by its progress period and a dial by its handshake's idle timeout, and each ask by the client's attempts (`crates/client/src/lib.rs` `ATTEMPTS`). |
-| `crates/mantle/src/client.rs` `PART` | cited | 8 MiB: a part of an object put in parts, the AWS CLI's default `multipart_chunksize` and `multipart_threshold` of `8MB` (AWS CLI S3 configuration reference; docs/research/73), its minimum for uploads `5MB`, S3's smallest part but the last. |
+| `crates/mantle/src/client.rs` `PART` | cited | 8 MiB: the run a copy from standard input holds, its source read once, and so the run a stream of unstated length is cut into: the AWS CLI's default `multipart_chunksize` and `multipart_threshold` of `8MB` (AWS CLI S3 configuration reference; docs/research/73), its minimum for uploads `5MB`, S3's smallest part but the last; 10,000 such runs hold 80 GiB, as the AWS CLI's parts do. |
+| `crates/mantle/src/journal.rs` `MAX_OPEN` | external | Open uploads the command line's journal records at most: S3's 1,000 uploads a page of ListMultipartUploads lists (docs/research/05 §4.7), so one listing shows every upload the journal names (docs/design/gateway.md §6). |
 | `crates/meta/src/collector.rs` `GRACE_NS` | cited | GFS keeps deleted files for three days (GGL03 §4.4, docs/research/22 §1.1). A recovery-point policy, not a safety bound (22 §10.4). |
 | `crates/meta/src/file.rs` `MAX_EXTENTS` | external | The S3 limit of 10,000 parts per upload (docs/research/05 §4.1). Audit §12.6 says single-PUT block manifests reuse this count and need their own derived fanout limit. |
 | `crates/meta/src/key.rs` `ATTEMPT` | format | Marker byte `a` after `LOCAL` for Bucket-range create/delete attempts. |
@@ -506,7 +507,6 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/meta/src/key.rs` `VOLUME` | format | Root-range row tag 2 after `DATA` for a volume's row, keyed by the volume's id so the table reads in id order. |
 | `crates/meta/src/name.rs` `MAX_PART` | external | The S3 maximum part size of 5 GiB (docs/research/05 §4.1, AWS S3 multipart limits). |
 | `crates/meta/src/name.rs` `MAX_PART_NUMBER` | external | S3 part numbers run from 1 to 10,000 (docs/research/05 §4.3, AWS UploadPart reference). |
-| `crates/meta/src/name.rs` `MIN_PART` | external | The S3 minimum part size of 5 MiB, with no minimum for the last part (docs/research/05 §4.1, AWS S3 multipart limits). |
 | `crates/meta/src/record.rs` `DAY_MS` | derived | Unit conversion: 86,400 s × 1,000 ms per day, for S3 Object Lock retention days and years (docs/research/18 §2.4, §2.6). |
 | `crates/meta/src/record.rs` `FORMAT` | format | Version byte 6 that begins every row value written by this code; 6 since a file keeps a row for each block it names, 5 since a part's row records its file's handover deadline, which the completion adopting it gives the part's mark without reading it, 4 since a mark records its write's handover deadline and a queue row whether its ID names a file, 3 since a file's mark records how the range took it (a version's order, a part, an adopting composite, or refused), 2 since a version records its completion's part listing. |
 | `crates/meta/src/record.rs` `LISTING` | external | Bytes of a completion's listing digest: SHA-256's 256-bit output (FIPS 180-4 §1). |
@@ -619,6 +619,10 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/protocol/src/object.rs` `LIST_BUCKETS` | format | An object request's kind: a page of ListBuckets, the asker's buckets. |
 | `crates/protocol/src/object.rs` `LIST_PARTS` | format | An object request's kind: a page of ListParts. |
 | `crates/protocol/src/object.rs` `LIST_UPLOADS` | format | An object request's kind: a page of ListMultipartUploads. |
+| `crates/protocol/src/object.rs` `OPEN` | format | An object request's kind: a native upload's Open (docs/design/gateway.md §2.1). |
+| `crates/protocol/src/object.rs` `APPEND` | format | An object request's kind: a native upload's run, its bytes and trailer after its fields. |
+| `crates/protocol/src/object.rs` `OFFSET` | format | An object request's kind: a native upload's progress, which a resuming client appends from. |
+| `crates/protocol/src/object.rs` `FINISH` | format | An object request's kind: a native upload's end, held to its client's length and full-object checksum. |
 | `crates/protocol/src/object.rs` `MAX_BUCKETS` | external | ListBuckets' `max-buckets`, "1–10000" (research/05 §10.4): the most buckets a page lists, and a request's bound. |
 | `crates/protocol/src/object.rs` `MAX_CHECKSUM` | derived | The longest checksum value, SHA-512's 64 bytes: the widest of S3's ten algorithms (research/05 §3.1; `mantle_s3::checksum::Algorithm::width`). |
 | `crates/protocol/src/object.rs` `MAX_FIELDS` | derived | A request's fields at most: the longer of a put's (bucket and key behind their lengths, five optional header texts within S3's 8 KB `MAX_HEADERS`, the checksum's flag, code, length and `MAX_CHECKSUM` bytes, `Content-MD5`'s flag and 16 bytes) and a listing's (bucket, prefix, delimiter and start, each behind its length, the most keys and whether owners are listed). |
@@ -666,6 +670,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/s3/src/body.rs` `MAX_OBJECTS` | external | AWS S3 API reference, DeleteObjects via 05 §8.1: "a list of up to 1,000 keys". |
 | `crates/s3/src/body.rs` `MAX_PARTS` | external | AWS S3 API reference via docs/research/05 §4.1: a multipart upload holds at most 10,000 parts. |
 | `crates/s3/src/body.rs` `MAX_REGION` | external | A region name is a DNS label, at most 63 octets (RFC 1035 §2.3.4). |
+| `crates/s3/src/body.rs` `MIN_PART` | external | The S3 minimum part size of 5 MiB, with no minimum for the last part (docs/research/05 §4.1, AWS S3 multipart limits); the Name range's (`mantle_meta::name::MIN_PART`) and a client's single run are this. |
 | `crates/s3/src/body.rs` `MAX_UPLOAD` | external | AWS S3 limits via 05 §4.1: a part runs 5 MiB to 5 GiB and a single PUT to 5 GB; 5 << 30 is the binary reading, so it never refuses an upload S3 accepts. |
 | `crates/s3/src/body.rs` `MAX_VERSION_ID` | external | AWS S3 docs via 13 §6.4: version IDs are opaque strings "no more than 1,024 bytes long". |
 | `crates/s3/src/body.rs` `OBJECT_LOCK_LIMIT` | derived | (prolog + ObjectLockConfiguration markup with the longest mode and an `xs:int` period). |

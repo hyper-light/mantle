@@ -31,7 +31,8 @@ use mantle_meta::apply::Layer;
 use mantle_meta::coordinator::{self, Coordinator, Settled};
 use mantle_meta::name::{self, Match, Preconditions};
 use mantle_meta::record::{
-    self, BucketState, Descriptor, LISTING, Part, Upload, Version, Versioning, WrappedKey, Wrapper,
+    self, BucketState, Descriptor, LISTING, Part, RunMd5, Runs, Upload, Version, Versioning,
+    WrappedKey, Wrapper,
 };
 use mantle_meta::root::{self, Placed};
 use mantle_meta::wire::{Answer, Command};
@@ -48,8 +49,8 @@ use crate::place;
 use crate::read::{Query, Read};
 use mantle_protocol::classes::Class;
 use mantle_protocol::object::{
-    self, Head, Headers, List, Listing, MAX_PAGE_PARTS, Op, PartListed, Parts, Reply, Status,
-    Stored,
+    self, Head, Headers, List, Listing, MAX_PAGE_PARTS, Op, PartListed, Parts, Progress, Reply,
+    Status, Stored,
 };
 
 /// What the gateway host is given (docs/design/node.md §4.6, §5).
@@ -156,8 +157,9 @@ enum Work {
     /// The request's fields being read from its body's start: the head, the fields so far.
     Fields(Head, Vec<u8>),
     /// A request refused or done: what is left of its body read and dropped, then the reply, so
-    /// the exchange ends whole (`Arriving::Redirect`'s reason).
-    Draining(Reply),
+    /// the exchange ends whole (`Arriving::Redirect`'s reason). Boxed: a reply is many times any
+    /// other job's state.
+    Draining(Box<Reply>),
     /// A reply's head sent: the fields that open its body, and how much of them is written.
     Replying(Vec<u8>, usize),
     /// A local operation's last answers going out, in order: its reply and its end, or its end.
@@ -167,10 +169,10 @@ enum Work {
     Put(Box<Putting>),
     /// GetObject, or HeadObject.
     Get(Box<Getting>),
-    /// DeleteObject, PutBucketVersioning, CreateMultipartUpload or AbortMultipartUpload: the
-    /// bucket's row read, then one command made from it.
+    /// DeleteObject, PutBucketVersioning, CreateMultipartUpload, a native upload's Open or
+    /// AbortMultipartUpload: the bucket's row read, then one command made from it.
     Command(Box<Commanding>),
-    /// CompleteMultipartUpload, run by the `Completion` driver.
+    /// CompleteMultipartUpload, or a native upload's Finish, run by the `Completion` driver.
     Complete(Box<Completing>),
     /// An operation one read answers.
     Read(Box<Single>),
@@ -209,6 +211,17 @@ struct Putting {
     taken: u64,
     /// The driver's requests not yet asked: the node held as many asks as it keeps.
     waiting: VecDeque<(u64, put::Request)>,
+    /// A native upload's run (an Append): its upload's row read after its bucket's.
+    run: Option<Appending>,
+}
+
+/// A native upload's run as its Append names it, and its upload's runs once read: where the run
+/// begins, whether it ends the object, and the bucket's incarnation its commit is made under.
+struct Appending {
+    offset: u64,
+    last: bool,
+    incarnation: Option<u64>,
+    runs: Option<Runs>,
 }
 
 struct Getting {
@@ -249,6 +262,14 @@ enum Then {
         key: String,
         checksum: Option<(Algorithm, bool)>,
     },
+    /// A native upload's Open (gateway.md §2.1): its object's length where stated, its
+    /// full-object checksum's algorithm, and the length of its runs (`name::run_length`).
+    Open {
+        key: String,
+        length: Option<u64>,
+        checksum: Algorithm,
+        run: u64,
+    },
     /// AbortMultipartUpload (05 §4.8).
     Abort { key: String, upload: String },
 }
@@ -261,6 +282,9 @@ struct Completing {
     upload: String,
     /// The parts the request lists, each its number and ETag.
     listed: Vec<(u16, String)>,
+    /// A native upload's Finish: the length and full-object checksum its client sent, which its
+    /// runs must combine to.
+    native: Option<(u64, record::Checksum)>,
     preconditions: Preconditions,
     completion: Option<Completion>,
     /// The driver's requests not yet asked: the node held as many asks as it keeps.
@@ -291,6 +315,12 @@ enum Single {
     },
     /// ListMultipartUploads: a page of the bucket's uploads, its query made from the request.
     Uploads(Query),
+    /// A native upload's Offset: its row, its progress.
+    Offset {
+        bucket: String,
+        key: String,
+        upload: String,
+    },
 }
 
 /// The volume table as this node's member of the root range held it after an entry it applied,
@@ -373,6 +403,7 @@ fn name_status(outcome: &name::Outcome) -> Status {
         name::Outcome::EntityTooSmall => Status::EntityTooSmall,
         // A part's number or size outside S3's, which the Name range refuses too.
         name::Outcome::Invalid => Status::InvalidArgument,
+        name::Outcome::Offset { .. } => Status::Offset,
         _ => Status::Failed,
     }
 }
@@ -386,6 +417,8 @@ fn complete_status(error: &CompleteError) -> Status {
         CompleteError::InvalidPart | CompleteError::NotConsecutive => Status::InvalidPart,
         CompleteError::InvalidPartOrder => Status::InvalidPartOrder,
         CompleteError::EntityTooSmall => Status::EntityTooSmall,
+        CompleteError::BadDigest => Status::BadDigest,
+        CompleteError::Unended => Status::IncompleteBody,
         CompleteError::Name(outcome) => name_status(outcome),
         // A listed part uploaded again while the completion ran: `500`, which clients retry.
         _ => Status::Failed,
@@ -412,6 +445,41 @@ fn kept(c: &checksum::Checksum) -> Stored {
         parts: 0,
         value: c.bytes.clone(),
     }
+}
+
+/// A part's row, its ETag, size, checksum, file and deadline the put's driver fills.
+fn unfilled_part() -> Part {
+    Part {
+        etag: String::new(),
+        size: 0,
+        checksum: None,
+        file: 0,
+        modified_ns: 0,
+        deadline_ns: 0,
+    }
+}
+
+/// A native upload's progress as its runs stand, with a run's checksum in its frame.
+fn progress(runs: &Runs, checksum: Option<Vec<u8>>) -> Progress {
+    Progress {
+        offset: runs.offset,
+        runs: runs.count,
+        run: runs.run,
+        ended: runs.ended,
+        checksum,
+    }
+}
+
+/// A run's frame, once it committed: the offset after it, its number and its checksum.
+fn run_frame(appending: &Appending, stored: &put::Stored) -> Option<Progress> {
+    let runs = appending.runs?;
+    Some(Progress {
+        offset: appending.offset.checked_add(stored.size)?,
+        runs: runs.count.checked_add(1)?,
+        run: runs.run,
+        ended: appending.last,
+        checksum: stored.checksum.as_ref().map(|c| c.bytes.clone()),
+    })
 }
 
 /// A version's checksum as a reply carries it.
@@ -446,6 +514,7 @@ fn facts(status: Status, order: u64, version: &Version) -> Reply {
         versioning: None,
         upload: String::new(),
         listing: None,
+        progress: None,
     }
 }
 
@@ -466,11 +535,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             body,
         );
         let work = match (head, self.gateway.as_ref()) {
-            (_, None) => Work::Draining(Reply::status(Status::Failed)),
-            (Err(_), Some(_)) => Work::Draining(Reply::status(Status::Malformed)),
+            (_, None) => Work::Draining(Box::new(Reply::status(Status::Failed))),
+            (Err(_), Some(_)) => Work::Draining(Box::new(Reply::status(Status::Malformed))),
             // A node stopping begins no operation (node.md §1.7): its client asks another.
             (Ok(_), Some(g)) if self.stopping() || self.jobs.len() >= g.objects => {
-                Work::Draining(Reply::status(Status::SlowDown))
+                Work::Draining(Box::new(Reply::status(Status::SlowDown)))
             }
             (Ok(head), Some(_)) => {
                 let fields = usize::try_from(head.fields()).unwrap_or(0);
@@ -495,9 +564,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             reply,
         } = request;
         let work = match self.gateway.as_ref() {
-            None => Work::Draining(Reply::status(Status::Failed)),
+            None => Work::Draining(Box::new(Reply::status(Status::Failed))),
             Some(g) if self.stopping() || self.jobs.len() >= g.objects => {
-                Work::Draining(Reply::status(Status::SlowDown))
+                Work::Draining(Box::new(Reply::status(Status::SlowDown)))
             }
             Some(_) => work(op, Vec::new()),
         };
@@ -549,7 +618,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         let carry = fields.split_off(wanted.min(fields.len()));
         job.work = match head.op(fields) {
-            Err(_) => Work::Draining(Reply::status(Status::Malformed)),
+            Err(_) => Work::Draining(Box::new(Reply::status(Status::Malformed))),
             Ok(op) => work(op, carry),
         };
         Ok(false)
@@ -684,6 +753,36 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let principal = job.principal.clone();
         match &mut job.work {
             Work::Fields(..) | Work::Draining(_) | Work::Replying(..) | Work::Answering(_) => {}
+            // A native upload opened: its ID, and its progress, every run but the last as long
+            // as the plan made it.
+            Work::Command(commanding) if matches!(commanding.then, Then::Open { .. }) => {
+                let Then::Open { run, .. } = commanding.then else {
+                    return Ok(());
+                };
+                return match outcome {
+                    Outcome::Read(ReadOutcome::Read(read)) => self.command_read(at, *read),
+                    Outcome::Command(CommandOutcome::Answered(Answer::Name(
+                        name::Outcome::Created { upload },
+                    ))) => {
+                        let reply = Reply {
+                            upload,
+                            progress: Some(Box::new(Progress {
+                                offset: 0,
+                                runs: 0,
+                                run,
+                                ended: false,
+                                checksum: None,
+                            })),
+                            ..Reply::status(Status::Done)
+                        };
+                        self.reply_job(at, reply)
+                    }
+                    Outcome::Command(CommandOutcome::Answered(Answer::Name(refused))) => {
+                        self.fail_job(at, name_status(&refused))
+                    }
+                    _ => self.fail_job(at, Status::Failed),
+                };
+            }
             Work::Bucket(coordinating) => {
                 let answer = match outcome {
                     Outcome::Read(ReadOutcome::Read(read)) if !coordinating.owned => {
@@ -967,14 +1066,175 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
     }
 
-    /// A put's bucket row, read: its driver made over it, or the reply `NoSuchBucket`.
+    /// A put's bucket row, read: its driver made over it, or the reply `NoSuchBucket`. A native
+    /// upload's run asks its upload's row next, which it is checked against (`run_read`).
     fn bucket_read(&mut self, at: usize, read: Read) -> Result<(), NodeError> {
+        let read = match read {
+            Read::Upload(upload) => return self.run_read(at, upload),
+            read => read,
+        };
         let Read::Bucket(Some(row)) = read else {
             return self.fail_job(at, Status::NoSuchBucket);
         };
         if row.state != BucketState::Active {
             return self.fail_job(at, Status::NoSuchBucket);
         }
+        if let Some(Job {
+            work: Work::Put(putting),
+            ..
+        }) = self.jobs.get_mut(at)
+            && let Some(appending) = putting.run.as_mut()
+        {
+            appending.incarnation = Some(row.created_ns);
+            let query = Query::Upload {
+                bucket: putting.bucket.clone(),
+                key: putting.key.clone(),
+                upload: putting
+                    .part
+                    .as_ref()
+                    .map(|(upload, _)| upload.clone())
+                    .unwrap_or_default(),
+            };
+            let Some(group) = self.group_of(Layer::Name) else {
+                return self.fail_job(at, Status::Failed);
+            };
+            let asked = self.read(group, query, u64::MAX).map(Pending::Read);
+            return self.asked(at, asked, None).map(|_| ());
+        }
+        let default = row.lock.and_then(|lock| lock.default);
+        let Some(Job {
+            work: Work::Put(putting),
+            principal,
+            ..
+        }) = self.jobs.get_mut(at)
+        else {
+            return Ok(());
+        };
+        let commit = match &putting.part {
+            // The part's ETag, size, checksum, file and deadline are the driver's to fill.
+            Some((upload, number)) => Commit::Part(name::PutPart {
+                bucket: putting.bucket.clone(),
+                incarnation: row.created_ns,
+                key: putting.key.clone(),
+                upload: upload.clone(),
+                number: *number,
+                part: unfilled_part(),
+                at_ns: 0,
+                run: None,
+            }),
+            None => Commit::Object(name::Put {
+                bucket: putting.bucket.clone(),
+                incarnation: row.created_ns,
+                key: putting.key.clone(),
+                versioning: row.versioning,
+                preconditions: std::mem::take(&mut putting.preconditions),
+                at_ns: 0,
+                ordered_ns: None,
+                version: Version {
+                    marker: false,
+                    null: false,
+                    modified_ns: 0,
+                    etag: String::new(),
+                    size: 0,
+                    checksum: None,
+                    file: None,
+                    owner: principal.clone(),
+                    headers: Vec::new(),
+                    retention: None,
+                    legal_hold: None,
+                    listing: None,
+                },
+                default,
+                id: putting.id,
+                deadline_ns: 0,
+            }),
+        };
+        self.start_put(at, commit)
+    }
+
+    /// A native upload's run, its upload's row read (gateway.md §2.1): begun at the offset the
+    /// row holds, as long as the plan's runs or, the last, no longer, numbered the next; or the
+    /// reply it earns, one at any other offset or after the last run `Offset`, naming the
+    /// upload's.
+    fn run_read(&mut self, at: usize, upload: Option<Upload>) -> Result<(), NodeError> {
+        let Some(Job {
+            work: Work::Put(putting),
+            ..
+        }) = self.jobs.get_mut(at)
+        else {
+            return Ok(());
+        };
+        let Some(upload) = upload else {
+            return self.fail_job(at, Status::NoSuchUpload);
+        };
+        // An upload CreateMultipartUpload made takes its client's parts, never runs.
+        let (Some(runs), Some(appending)) = (upload.runs, putting.run.as_mut()) else {
+            return self.fail_job(at, Status::InvalidRequest);
+        };
+        appending.runs = Some(runs);
+        if runs.ended || appending.offset != runs.offset {
+            let reply = Reply {
+                progress: Some(Box::new(progress(&runs, None))),
+                ..Reply::status(Status::Offset)
+            };
+            return self.reply_job(at, reply);
+        }
+        let (offset, last) = (appending.offset, appending.last);
+        let Some(incarnation) = appending.incarnation else {
+            return self.fail_job(at, Status::Failed);
+        };
+        // The run's checksum is in the algorithm its object is held to at its end.
+        if putting.trailing.map(Algorithm::code) != upload.checksum.map(|(code, _)| code) {
+            return self.fail_job(at, Status::InvalidRequest);
+        }
+        let end = offset.checked_add(putting.length);
+        let planned = match end {
+            None => false,
+            Some(end) if last => {
+                putting.length <= runs.run && runs.length.is_none_or(|length| end == length)
+            }
+            Some(end) => {
+                putting.length == runs.run && runs.length.is_none_or(|length| end < length)
+            }
+        };
+        let number = runs
+            .count
+            .checked_add(1)
+            .filter(|n| *n <= name::MAX_PART_NUMBER);
+        let (true, Some(number), Some((upload_id, numbered))) =
+            (planned, number, putting.part.as_mut())
+        else {
+            return self.fail_job(at, Status::InvalidArgument);
+        };
+        *numbered = number;
+        let commit = Commit::Run {
+            part: name::PutPart {
+                bucket: putting.bucket.clone(),
+                incarnation,
+                key: putting.key.clone(),
+                upload: upload_id.clone(),
+                number,
+                part: unfilled_part(),
+                at_ns: 0,
+                run: Some(name::Run {
+                    offset,
+                    last,
+                    md5: runs.md5,
+                }),
+            },
+            // The run's own MD5, its part's ETag, for the multipart ETag of an object that may
+            // pass one PUT's bytes.
+            own: runs
+                .length
+                .is_none_or(|length| length > mantle_s3::body::MAX_UPLOAD),
+        };
+        self.start_put(at, commit)
+    }
+
+    /// A put's driver, made over `commit`: its file's ID and data key drawn, under the root key's
+    /// current generation, and its blocks laid out by the scheme new blocks take; or the reply
+    /// its failure earns.
+    fn start_put(&mut self, at: usize, commit: Commit) -> Result<(), NodeError> {
         let Ok(Some(scheme)) = self.table().map(|t| t.scheme) else {
             return self.fail_job(at, Status::Failed);
         };
@@ -1007,60 +1267,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some((keys, layout)) = made else {
             return self.fail_job(at, Status::Failed);
         };
-        let default = row.lock.and_then(|lock| lock.default);
         let Some(Job {
             work: Work::Put(putting),
-            principal,
             ..
         }) = self.jobs.get_mut(at)
         else {
             return Ok(());
-        };
-        let commit = match &putting.part {
-            // The part's ETag, size, checksum, file and deadline are the driver's to fill.
-            Some((upload, number)) => Commit::Part(name::PutPart {
-                bucket: putting.bucket.clone(),
-                incarnation: row.created_ns,
-                key: putting.key.clone(),
-                upload: upload.clone(),
-                number: *number,
-                part: Part {
-                    etag: String::new(),
-                    size: 0,
-                    checksum: None,
-                    file: 0,
-                    modified_ns: 0,
-                    deadline_ns: 0,
-                },
-                at_ns: 0,
-                run: None,
-            }),
-            None => Commit::Object(name::Put {
-                bucket: putting.bucket.clone(),
-                incarnation: row.created_ns,
-                key: putting.key.clone(),
-                versioning: row.versioning,
-                preconditions: std::mem::take(&mut putting.preconditions),
-                at_ns: 0,
-                ordered_ns: None,
-                version: Version {
-                    marker: false,
-                    null: false,
-                    modified_ns: 0,
-                    etag: String::new(),
-                    size: 0,
-                    checksum: None,
-                    file: None,
-                    owner: principal.clone(),
-                    headers: Vec::new(),
-                    retention: None,
-                    legal_hold: None,
-                    listing: None,
-                },
-                default,
-                id: putting.id,
-                deadline_ns: 0,
-            }),
         };
         let body = Body {
             length: putting.length,
@@ -1101,13 +1313,27 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 None if pending.is_empty() => Step::Ask(putting.bucket.clone()),
                 None => Step::Wait,
                 Some(put) => {
+                    let run = putting.run.as_ref();
                     let over = put.outcome().map(|outcome| match outcome {
                         Ok(stored) => Reply {
                             version: stored.version.clone().unwrap_or_default(),
                             etag: stored.etag.clone(),
                             size: stored.size,
                             checksum: stored.checksum.as_ref().map(kept),
+                            // A run's reply is its progress frame.
+                            progress: run.and_then(|r| run_frame(r, stored)).map(Box::new),
                             ..Reply::status(Status::Done)
+                        },
+                        // Another run committed at its offset first: the offset it left.
+                        Err(PutError::Name(name::Outcome::Offset { offset, ended })) => Reply {
+                            progress: run.and_then(|r| r.runs).map(|runs| {
+                                Box::new(Progress {
+                                    offset: *offset,
+                                    ended: *ended,
+                                    ..progress(&runs, None)
+                                })
+                            }),
+                            ..Reply::status(Status::Offset)
                         },
                         Err(error) => Reply::status(put_status(error)),
                     });
@@ -1125,7 +1351,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Step::Wait => return Ok(false),
             Step::Over(reply) => {
                 if let Some(job) = self.jobs.get_mut(at) {
-                    job.work = Work::Draining(*reply);
+                    job.work = Work::Draining(reply);
                 }
                 return self.drain_job(at);
             }
@@ -1847,6 +2073,52 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     },
                 }))),
             ),
+            Then::Open {
+                key,
+                length,
+                checksum,
+                run,
+            } => {
+                // The MD5 across the runs is kept while the object may be one PUT's bytes, its
+                // ETag then (gateway.md §2.1), begun from MD5's initial state.
+                let md5 = if length.is_none_or(|l| l <= mantle_s3::body::MAX_UPLOAD) {
+                    let begun = mantle_s3::crypto::Digest::new(&mantle_s3::crypto::MD5)
+                        .and_then(|d| d.state())
+                        .ok()
+                        .and_then(|state| <[u8; 16]>::try_from(state.chaining()).ok());
+                    match begun {
+                        Some(chaining) => Some(RunMd5::Running(chaining)),
+                        None => return self.fail_job(at, Status::Failed),
+                    }
+                } else {
+                    None
+                };
+                (
+                    name_group,
+                    Command::Name(Box::new(name::Command::CreateUpload(name::CreateUpload {
+                        bucket: commanding.bucket.clone(),
+                        incarnation: row.created_ns,
+                        key: key.clone(),
+                        at_ns: 0,
+                        upload: Upload {
+                            initiated_ns: 0,
+                            owner: principal.clone(),
+                            headers: Vec::new(),
+                            checksum: Some((checksum.code(), true)),
+                            retention: None,
+                            legal_hold: None,
+                            runs: Some(Runs {
+                                length: *length,
+                                run: *run,
+                                offset: 0,
+                                count: 0,
+                                ended: false,
+                                md5,
+                            }),
+                        },
+                    }))),
+                )
+            }
             Then::Abort { key, upload } => (
                 name_group,
                 Command::Name(Box::new(name::Command::Abort(name::Abort {
@@ -1976,13 +2248,20 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             native: false,
         };
         let listed = std::mem::take(&mut completing.listed);
-        match Completion::new(
-            complete,
-            listed,
-            u128::from_be_bytes(file),
-            handover_ns,
-            now,
-        ) {
+        let made = match completing.native.take() {
+            // A native upload's Finish: every run, held to what its client sent.
+            Some(sent) => {
+                Completion::native(complete, sent, u128::from_be_bytes(file), handover_ns, now)
+            }
+            None => Completion::new(
+                complete,
+                listed,
+                u128::from_be_bytes(file),
+                handover_ns,
+                now,
+            ),
+        };
+        match made {
             Ok(completion) => {
                 completing.completion = Some(completion);
                 Ok(())
@@ -2118,6 +2397,18 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 },
             ),
             Single::Uploads(query) => (Layer::Name, query.clone()),
+            Single::Offset {
+                bucket,
+                key,
+                upload,
+            } => (
+                Layer::Name,
+                Query::Upload {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    upload: upload.clone(),
+                },
+            ),
         };
         let Some(group) = self.group_of(layer) else {
             self.fail_job(at, Status::Failed)?;
@@ -2187,6 +2478,16 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 listing: Some(Listing::Uploads(page)),
                 ..Reply::status(Status::Done)
             },
+            // A native upload's progress, which a resuming client appends from; an upload
+            // CreateMultipartUpload made has none.
+            (_, Read::Upload(Some(upload))) => match upload.runs {
+                Some(runs) => Reply {
+                    progress: Some(Box::new(progress(&runs, None))),
+                    ..Reply::status(Status::Done)
+                },
+                None => Reply::status(Status::InvalidRequest),
+            },
+            (_, Read::Upload(None)) => Reply::status(Status::NoSuchUpload),
             _ => Reply::status(Status::Failed),
         };
         self.reply_job(at, reply)
@@ -2196,7 +2497,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// to its end and dropped before the reply goes.
     fn reply_job(&mut self, at: usize, reply: Reply) -> Result<(), NodeError> {
         if let Some(job) = self.jobs.get_mut(at) {
-            job.work = Work::Draining(reply);
+            job.work = Work::Draining(Box::new(reply));
             self.abandoned
                 .extend(job.pending.drain(..).map(|(pending, _)| pending));
         }
@@ -2263,7 +2564,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     return Ok(false);
                 };
                 job.work = Work::Answering(VecDeque::from([
-                    door::Answer::Head(Box::new(reply)),
+                    door::Answer::Head(reply),
                     door::Answer::End,
                 ]));
                 return self.answer_local(at);
@@ -2432,7 +2733,7 @@ fn work(op: Op, carry: Vec<u8>) -> Work {
             coordinator: None,
         })),
         Op::Put { length, .. } if length > mantle_s3::body::MAX_UPLOAD => {
-            Work::Draining(Reply::status(Status::EntityTooLarge))
+            Work::Draining(Box::new(Reply::status(Status::EntityTooLarge)))
         }
         // A body states one checksum at most, in its fields or its trailer (05 §3.2).
         Op::Put {
@@ -2444,7 +2745,7 @@ fn work(op: Op, carry: Vec<u8>) -> Work {
             checksum: Some(_),
             trailing: Some(_),
             ..
-        } => Work::Draining(Reply::status(Status::InvalidRequest)),
+        } => Work::Draining(Box::new(Reply::status(Status::InvalidRequest))),
         Op::Put {
             bucket,
             key,
@@ -2471,6 +2772,7 @@ fn work(op: Op, carry: Vec<u8>) -> Work {
             taken: 0,
             carry,
             waiting: VecDeque::new(),
+            run: None,
         })),
         Op::Get {
             bucket,
@@ -2517,7 +2819,7 @@ fn work(op: Op, carry: Vec<u8>) -> Work {
             algorithm.composite()
         }) =>
         {
-            Work::Draining(Reply::status(Status::InvalidRequest))
+            Work::Draining(Box::new(Reply::status(Status::InvalidRequest)))
         }
         Op::CreateUpload {
             bucket,
@@ -2530,7 +2832,7 @@ fn work(op: Op, carry: Vec<u8>) -> Work {
             asked: false,
         })),
         Op::UploadPart { length, .. } if length > name::MAX_PART => {
-            Work::Draining(Reply::status(Status::EntityTooLarge))
+            Work::Draining(Box::new(Reply::status(Status::EntityTooLarge)))
         }
         Op::UploadPart {
             bucket,
@@ -2556,6 +2858,7 @@ fn work(op: Op, carry: Vec<u8>) -> Work {
             taken: 0,
             carry,
             waiting: VecDeque::new(),
+            run: None,
         })),
         Op::Complete {
             bucket,
@@ -2569,6 +2872,7 @@ fn work(op: Op, carry: Vec<u8>) -> Work {
             key,
             upload,
             listed: parts,
+            native: None,
             preconditions: Preconditions {
                 if_match: matched(headers.if_match.as_deref(), true),
                 if_none_match: matched(headers.if_none_match.as_deref(), false),
@@ -2586,11 +2890,118 @@ fn work(op: Op, carry: Vec<u8>) -> Work {
             then: Then::Abort { key, upload },
             asked: false,
         })),
+        // A native upload's object is held to a CRC, which combines from its runs' (05 §3.3).
+        Op::Open { checksum, .. } if !checksum.full_object() => {
+            Work::Draining(Box::new(Reply::status(Status::InvalidRequest)))
+        }
+        Op::Open {
+            bucket,
+            key,
+            length,
+            buffer,
+            checksum,
+            ..
+        } => match name::run_length(length, buffer) {
+            Some(run) => Work::Command(Box::new(Commanding {
+                bucket,
+                then: Then::Open {
+                    key,
+                    length,
+                    checksum,
+                    run,
+                },
+                asked: false,
+            })),
+            // No run fits: an object past what 10,000 runs of S3's largest part hold, or a
+            // buffer below its least part or too small for the length's runs.
+            None if length.is_some_and(|l| {
+                l > name::MAX_PART.saturating_mul(u64::from(name::MAX_PART_NUMBER))
+            }) =>
+            {
+                Work::Draining(Box::new(Reply::status(Status::EntityTooLarge)))
+            }
+            None => Work::Draining(Box::new(Reply::status(Status::InvalidArgument))),
+        },
+        // A run's checksum is its upload's, in a trailer, which the run is checked by.
+        Op::Append { trailing: None, .. } => {
+            Work::Draining(Box::new(Reply::status(Status::InvalidRequest)))
+        }
+        Op::Append { length, .. } if length > name::MAX_PART => {
+            Work::Draining(Box::new(Reply::status(Status::EntityTooLarge)))
+        }
+        Op::Append {
+            bucket,
+            key,
+            upload,
+            id,
+            offset,
+            length,
+            last,
+            trailing,
+        } => Work::Put(Box::new(Putting {
+            bucket,
+            key,
+            // Numbered once its upload's row is read.
+            part: Some((upload, 0)),
+            id,
+            length,
+            preconditions: Preconditions::default(),
+            expected: Expected::default(),
+            trailing,
+            trailer: Vec::new(),
+            put: None,
+            taken: 0,
+            carry,
+            waiting: VecDeque::new(),
+            run: Some(Appending {
+                offset,
+                last,
+                incarnation: None,
+                runs: None,
+            }),
+        })),
+        Op::Offset {
+            bucket,
+            key,
+            upload,
+        } => Work::Read(Box::new(Single::Offset {
+            bucket,
+            key,
+            upload,
+        })),
+        Op::Finish {
+            bucket,
+            key,
+            upload,
+            headers,
+            length,
+            checksum,
+            ..
+        } => Work::Complete(Box::new(Completing {
+            bucket,
+            key,
+            upload,
+            listed: Vec::new(),
+            native: Some((
+                length,
+                record::Checksum {
+                    algorithm: checksum.algorithm.code(),
+                    parts: 0,
+                    value: checksum.bytes,
+                },
+            )),
+            preconditions: Preconditions {
+                if_match: matched(headers.if_match.as_deref(), true),
+                if_none_match: matched(headers.if_none_match.as_deref(), false),
+            },
+            completion: None,
+            waiting: VecDeque::new(),
+        })),
         // No part asked: an empty page, the upload not read (05 §4.6).
-        Op::ListParts { max: 0, .. } => Work::Draining(Reply {
+        Op::ListParts { max: 0, .. } => Work::Draining(Box::new(Reply {
             listing: Some(Listing::Parts(Parts::default())),
             ..Reply::status(Status::Done)
-        }),
+        })),
         Op::ListParts {
             bucket,
             key,

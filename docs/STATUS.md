@@ -348,12 +348,29 @@ listed, completed into one full-object checksum and aborted, each byte read back
 client certificate another authority issued, or the cell's for a node presented as a client's,
 refused at its handshake (`crates/mantle/tests/native.rs`).
 
+A copy into the cell, from a file or standard input, is a native upload of any length in runs the
+node cuts (gateway design §2.1): the run length fixed at its opening from S3's part sizes, the
+client's buffer and the 10,000 runs a stated length must fit; each run its own exchange, committed
+only at the upload's durable offset as its next number and answered with its progress frame; the
+MD5 across the runs kept in the upload's row through a digest state the vendored aws-lc-rs exports
+and resumes (crypto design §10), the object's ETag at most 5 GiB and the multipart ETag past it;
+and the object committed at the end only if the client's length and full-object CRC are the runs',
+`BadDigest` with nothing committed otherwise. The library resumes from the node's offset where a
+run's exchange ends unanswered; the command line keeps a journal of its open uploads and resumes a
+copy run again after a kill, re-reading and hashing what is committed and sending none of it
+(research/74). Against a cell of three: a copy SIGKILLed at a run boundary and one SIGKILLed mid-run
+each resume at the cell's offset, no committed run sent again, the object whole; a source changed
+between attempts ends in `BadDigest` with nothing committed; and a copy whose node is SIGKILLed
+mid-run ends `SlowDown`, the cell writing no block while one node of three is gone, and resumes at
+the cell's offset once the node is back (`crates/mantle/tests/native.rs`).
+
 Remaining before it is done:
 
 - The windows a gateway admits, from its memory and measured latency; the rates of the paths
   measured on an idle machine.
-- The native client's journal and resumable uploads in server-cut runs (gateway design §2.1, §6),
-  and the rest of planned item 12.
+- The native upload's checkpoint interval from its measured terms, two runs in flight, the
+  operation identity's record (item 9), and the journal in the library with its power-cut tests
+  (gateway design §2.1, §6); the rest of planned items 12 and 13.
 - The HTTP/1.1 listener's remaining parts: the operations beyond the node's own set (copies, tags, ACLs, CORS, lifecycle, policies, object
   lock, encryption settings, DeleteObjects, ListObjects v1 and ListObjectVersions answer `501`
   there), an object's stored headers (`Content-Type`, `x-amz-meta-*`), bucket policies judged on
@@ -707,9 +724,13 @@ passes on all six CI targets.
     mid-upload continues or resumes with no committed run sent again.
 13. **Resumable native uploads** in server-cut runs with progress frames, the checkpoint interval
     of gateway.md §2.1, MD5 and block-hash state carried across runs, and digest-state export
-    and import in the vendored aws-lc-rs (gateway.md §2.1; metadata.md §2; crypto.md §10). Done
-    when the six obligations hold under interruption at every frame, a changed source ends in
-    `BadDigest`, and the ETag equals S3's for objects at and above 5 GiB.
+    and import in the vendored aws-lc-rs (gateway.md §2.1; metadata.md §2; crypto.md §10), of
+    which the runs, their frames and the client's resume from the node's offset, the MD5 carried
+    across runs and its state's export and import, the run length from the bounds, and the kills
+    at a run boundary and mid-run of the client and of a node are built (above); the rest: the
+    interval's measured terms, two runs in flight, block hashes besides MD5. Done when the six
+    obligations hold under interruption at every frame, a changed source ends in `BadDigest`, and
+    the ETag equals S3's for objects at and above 5 GiB.
 14. **The HTTP/1.1 listener's resilience**: exact `ListParts`, `AbortIncompleteMultipartUpload`,
     open-upload bytes reported, completion answered directly unless near clients' read
     timeouts, pinned resumed downloads (gateway.md §2.1). Done when the AWS CLI's and boto3's

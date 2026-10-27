@@ -57,6 +57,8 @@ pub fn reason(status: u16) -> &'static str {
 pub fn refusal(status: Status) -> Refused {
     let (code, http, message) = match status {
         Status::Done | Status::NotModified => ("InternalError", 500, "not a refusal"),
+        // A native upload's run at another offset, which no request of this listener makes.
+        Status::Offset => ("InternalError", 500, "a native upload's refusal"),
         Status::NoSuchBucket => ("NoSuchBucket", 404, "The specified bucket does not exist"),
         Status::NoSuchKey => ("NoSuchKey", 404, "The specified key does not exist."),
         Status::BucketAlreadyExists => (

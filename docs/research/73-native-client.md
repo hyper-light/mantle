@@ -125,9 +125,9 @@ at TLS [4]; so the directory admits a client whose names read, and the node, onc
 says the connection is up, closes one past its bound with `Refusal::Identities` (`Endpoint::refuse`
 [4]), the refusal a transport gives an identity past its bound, which a client asks again after.
 
-**What the client asks again.** A request is asked again only where no node can have taken it (the
-transport's admission refused its connection, or its exchange got no stream), with none of its body
-taken; at most three attempts, the AWS SDKs' standard mode's default [5], each after RFC 6298's
+**What the client asks again.** A request is asked again only where no node can have taken it (its
+node not reached, the transport's admission refused its connection, or its exchange got no stream),
+with none of its body taken, of the next node; at most three attempts, the AWS SDKs' standard mode's default [5], each after RFC 6298's
 doubling from the measured probe timeout with equal jitter (node.md §3.8). Anything else is the
 caller's, told whether the request was sent whole.
 

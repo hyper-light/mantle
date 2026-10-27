@@ -17,10 +17,10 @@
 //! compression of one took 34 MB (`mantle_protocol::bounds::CERTIFICATE_COMPRESSION_BYTES`).
 //!
 //! **What it asks again.** Every mutation carries its operation's identity ([`identity`]), which
-//! each attempt carries unchanged (gateway.md §2.1). A request is asked again, after a pause, only
-//! when no node can have taken it: its connection refused at the node's admission, or its exchange
-//! given no stream (`Refusal::Unsent`), none of its body taken by the transport; at most
-//! [`ATTEMPTS`] times. A client whose certificate a node refused, or refused at admission once its
+//! each attempt carries unchanged (gateway.md §2.1). A request is asked again, of the next node,
+//! after a pause, only when no node can have taken it: its node not reached, its connection refused
+//! at the node's admission, or its exchange given no stream (`Refusal::Unsent`), none of its body
+//! taken by the transport; at most [`ATTEMPTS`] times. A client whose certificate a node refused, or refused at admission once its
 //! body's bytes were handed over, is told so ([`ClientError::Refused`]): nothing was applied. An
 //! exchange that ended otherwise without a reply is the caller's: [`ClientError::Lost`] says
 //! whether the request was sent whole, after which a mutation may have been applied, and asking it
@@ -58,7 +58,8 @@ use hyper_transport::{
 };
 use mantle_protocol::bounds::{self, Stated};
 use mantle_protocol::classes::{self, Bounds, Class, Kind, NodeClasses, Role};
-use mantle_protocol::object::{self, ObjectError, Op, Reply, ReplyHead};
+use mantle_protocol::object::{self, Headers, ObjectError, Op, Reply, ReplyHead, Status};
+use mantle_s3::body::MIN_PART;
 use mantle_s3::checksum::{Algorithm, Checksum, Hasher};
 
 /// What [`Settings`] and the client's answers name, so a caller needs none of the transport's own.
@@ -137,6 +138,8 @@ pub enum ClientError {
     Corrupt(&'static str),
     #[error("the deadline passed before the operation was answered")]
     Deadline,
+    #[error("the upload's durable offset is {theirs}, not one the client's runs reach ({ours})")]
+    Offset { ours: u64, theirs: u64 },
 }
 
 impl From<Refusal> for ClientError {
@@ -187,6 +190,40 @@ impl Sink for Vec<u8> {
         self.extend_from_slice(bytes);
         Ok(())
     }
+}
+
+/// A source a native upload reads again from an offset, after an exchange that carried a run
+/// ended unanswered: a file, say.
+pub trait Rewind: Source {
+    /// Positions the source to read from `offset` next.
+    fn rewind(&mut self, offset: u64) -> impl Future<Output = std::io::Result<()>>;
+}
+
+/// What a native upload tells its caller as it goes (gateway.md §6): what a journal keeps.
+pub trait Watch {
+    /// The upload was opened, before any run is sent: its ID, which resuming it after a restart
+    /// needs.
+    fn opened(&mut self, upload: &str) -> impl Future<Output = std::io::Result<()>>;
+    /// Where the upload stands: its progress once a run committed or once read on resuming.
+    fn progressed(
+        &mut self,
+        progress: &object::Progress,
+    ) -> impl Future<Output = std::io::Result<()>>;
+}
+
+/// A native upload's object (gateway.md §2.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Native {
+    pub bucket: String,
+    pub key: String,
+    /// The operation's identity, which its Open, every run and its Finish carry.
+    pub id: u128,
+    /// An upload to resume from the node's offset, as a journal kept it; `None` opens one.
+    pub upload: Option<String>,
+    /// Its full-object checksum's algorithm: a CRC, which combines from its runs'.
+    pub checksum: Algorithm,
+    /// The preconditions its object commits under.
+    pub headers: Headers,
 }
 
 /// No body: the source and the sink of an operation that has neither.
@@ -369,6 +406,34 @@ struct Upload<'a, S> {
     trailer: Option<(Checksum, usize)>,
 }
 
+impl<'a, S> Upload<'a, S> {
+    /// `length` bytes of `source`, with a trailer of `trailing`'s checksum where it names one.
+    fn new(
+        source: &'a mut S,
+        length: u64,
+        trailing: Option<Algorithm>,
+    ) -> Result<Self, ClientError> {
+        Ok(Self {
+            source,
+            length,
+            read: 0,
+            start: 0,
+            end: 0,
+            ended: false,
+            hasher: trailing
+                .map(Hasher::new)
+                .transpose()
+                .map_err(|e| ClientError::Bounds(format!("{e:?}")))?,
+            trailer: None,
+        })
+    }
+
+    /// The trailer's checksum, once every byte was read and it was computed.
+    fn sent(&self) -> Option<&Checksum> {
+        self.trailer.as_ref().map(|(checksum, _)| checksum)
+    }
+}
+
 /// A client of a cell's objects, on the current hyper-rt shard.
 pub struct Client {
     id: PeerId,
@@ -497,16 +562,450 @@ impl Client {
         }
     }
 
+    /// Streams `length` bytes of `source` into `native`'s object as a native upload
+    /// (gateway.md §2.1), resumable: runs of the length the node cuts, each its own exchange
+    /// carrying its checksum in a trailer and answered with its progress once it committed. An
+    /// exchange that ends unanswered is resumed from the node's durable offset, the source read
+    /// again from there, so no committed run is sent again; at most [`ATTEMPTS`] times in a row
+    /// without a run committing. The object commits at the Finish, held to the CRC of every byte,
+    /// which the client computes as it reads them: resuming an upload a journal kept, the bytes
+    /// below the node's offset are read and hashed and not sent, so a source changed since the
+    /// first attempt ends in `BadDigest` and nothing commits. An object one run holds is put
+    /// whole, which a run would be. The reply is the Finish's, or a refusal's.
+    pub async fn upload<S: Rewind, W: Watch>(
+        &mut self,
+        native: &Native,
+        (source, length): (&mut S, u64),
+        watch: &mut W,
+        deadline_ns: u64,
+    ) -> Result<Reply, ClientError> {
+        if native.upload.is_none() && length <= MIN_PART {
+            return self.put_whole(native, source, length, deadline_ns).await;
+        }
+        let (upload, mut at) = match self
+            .begin(native, (Some(length), None), watch, deadline_ns)
+            .await?
+        {
+            Ok(begun) => begun,
+            Err(refused) => return Ok(*refused),
+        };
+        let mut whole = Whole::new(native.checksum);
+        source.rewind(0).await.map_err(ClientError::Source)?;
+        self.hash_prefix(source, at.offset, &mut whole).await?;
+        let mut failures = 0u32;
+        while !at.ended {
+            let run = length
+                .checked_sub(at.offset)
+                .ok_or(ClientError::Offset {
+                    ours: length,
+                    theirs: at.offset,
+                })?
+                .min(at.run);
+            let last = at.offset.checked_add(run) == Some(length);
+            source
+                .rewind(at.offset)
+                .await
+                .map_err(ClientError::Source)?;
+            let op = append(native, &upload, (at.offset, run, last));
+            let mut bounded = Bounded {
+                source: &mut *source,
+                left: run,
+            };
+            let mut body = Upload::new(&mut bounded, run, Some(native.checksum))?;
+            let asked = self
+                .asked(&op, Some(&mut body), None::<&mut Nothing>, deadline_ns)
+                .await;
+            let sent = body.sent().cloned();
+            match self
+                .ran(native, &upload, &mut at, (run, sent), asked, deadline_ns)
+                .await?
+            {
+                Ran::Committed(crc) => {
+                    whole.add(crc, run)?;
+                    failures = 0;
+                    watch.progressed(&at).await.map_err(ClientError::Source)?;
+                }
+                Ran::Again(why) => failures = self.again(failures, why, deadline_ns).await?,
+                Ran::Refused(reply) => return Ok(*reply),
+            }
+        }
+        self.finish(native, &upload, (at.offset, whole), deadline_ns)
+            .await
+    }
+
+    /// As [`upload`](Self::upload), from a `source` read once, standard input say, of `length`
+    /// bytes where the caller knows them: the client holds each run, at most `buffer` bytes, until
+    /// the run commits, and sends it again from there where an exchange ends unanswered. With its
+    /// length known, a run is sent as it is read, each byte kept as it goes; without, a run is read
+    /// whole first, with a piece past it to find the source's end, since a run states whether it is
+    /// the last before its bytes. Resuming an upload a journal kept, the source is read from its
+    /// start again and the bytes below the node's offset hashed and dropped.
+    pub async fn upload_once<S: Source, W: Watch>(
+        &mut self,
+        native: &Native,
+        (source, length): (&mut S, Option<u64>),
+        (buffer, watch): (u64, &mut W),
+        deadline_ns: u64,
+    ) -> Result<Reply, ClientError> {
+        let mut held = Held::new(buffer)?;
+        if native.upload.is_none() && length.is_none_or(|l| l <= MIN_PART) {
+            // An object one run holds is put whole: read up to the least run and a piece past
+            // it, and if the source ends within, it is the object.
+            let first = length.map_or(MIN_PART, |l| l.min(MIN_PART));
+            held.fill(source, first, length.is_none()).await?;
+            if held.ended || length.is_some_and(|l| l <= MIN_PART) {
+                let bytes = held.bytes.len();
+                let mut whole = &held.bytes[..];
+                let length = u64::try_from(bytes).unwrap_or(u64::MAX);
+                return self
+                    .put_whole(native, &mut whole, length, deadline_ns)
+                    .await;
+            }
+        }
+        let (upload, mut at) = match self
+            .begin(native, (length, Some(buffer)), watch, deadline_ns)
+            .await?
+        {
+            Ok(begun) => begun,
+            Err(refused) => return Ok(*refused),
+        };
+        let mut whole = Whole::new(native.checksum);
+        if native.upload.is_some() {
+            self.hash_prefix(source, at.offset, &mut whole).await?;
+        }
+        let mut failures = 0u32;
+        while !at.ended {
+            let left = length.map(|l| l.checked_sub(at.offset));
+            let run = match left {
+                Some(None) => {
+                    return Err(ClientError::Offset {
+                        ours: length.unwrap_or(0),
+                        theirs: at.offset,
+                    });
+                }
+                Some(Some(left)) => left.min(at.run),
+                None => at.run,
+            };
+            let (taken, asked, sent) = match length {
+                // Its length known, the run is sent as it is read, each byte kept as it goes
+                // and given again first where it is sent again.
+                Some(l) => {
+                    let last = at.offset.checked_add(run) == Some(l);
+                    let op = append(native, &upload, (at.offset, run, last));
+                    let mut replay = Replay {
+                        held: &mut held.bytes,
+                        at: 0,
+                        source: &mut *source,
+                        run: usize::try_from(run)
+                            .map_err(|_| ClientError::Bounds("a run past memory".into()))?,
+                    };
+                    let mut body = Upload::new(&mut replay, run, Some(native.checksum))?;
+                    let asked = self
+                        .asked(&op, Some(&mut body), None::<&mut Nothing>, deadline_ns)
+                        .await;
+                    (run, asked, body.sent().cloned())
+                }
+                // A run is the last where the source ends within it: a piece past it is read
+                // ahead to know.
+                None => {
+                    held.fill(source, run, true).await?;
+                    let taken = held.run(run)?;
+                    let last = held.ended && held.ahead() == 0;
+                    let op = append(native, &upload, (at.offset, taken, last));
+                    let mut bytes = held.bytes.get(..held.len(taken)?).unwrap_or_default();
+                    let mut body = Upload::new(&mut bytes, taken, Some(native.checksum))?;
+                    let asked = self
+                        .asked(&op, Some(&mut body), None::<&mut Nothing>, deadline_ns)
+                        .await;
+                    (taken, asked, body.sent().cloned())
+                }
+            };
+            match self
+                .ran(native, &upload, &mut at, (taken, sent), asked, deadline_ns)
+                .await?
+            {
+                Ran::Committed(crc) => {
+                    whole.add(crc, taken)?;
+                    held.drop_run(taken)?;
+                    failures = 0;
+                    watch.progressed(&at).await.map_err(ClientError::Source)?;
+                }
+                Ran::Again(why) => failures = self.again(failures, why, deadline_ns).await?,
+                Ran::Refused(reply) => return Ok(*reply),
+            }
+        }
+        self.finish(native, &upload, (at.offset, whole), deadline_ns)
+            .await
+    }
+
+    /// An object a single run would hold, put whole with its operation's identity and its
+    /// checksum in a trailer: a native upload's object, the same bytes, ETag and checksum.
+    async fn put_whole<S: Source>(
+        &mut self,
+        native: &Native,
+        source: &mut S,
+        length: u64,
+        deadline_ns: u64,
+    ) -> Result<Reply, ClientError> {
+        let op = Op::Put {
+            bucket: native.bucket.clone(),
+            key: native.key.clone(),
+            id: native.id,
+            length,
+            headers: native.headers.clone(),
+            checksum: None,
+            md5: None,
+            trailing: Some(native.checksum),
+        };
+        self.put(&op, source, deadline_ns).await
+    }
+
+    /// A native upload opened, or the one `native` names resumed: its ID and progress, told to
+    /// `watch`; or the refusal the node answered.
+    async fn begin<W: Watch>(
+        &mut self,
+        native: &Native,
+        (length, buffer): (Option<u64>, Option<u64>),
+        watch: &mut W,
+        deadline_ns: u64,
+    ) -> Result<Result<(String, object::Progress), Box<Reply>>, ClientError> {
+        let (upload, reply) = match &native.upload {
+            Some(upload) => (
+                upload.clone(),
+                self.progress(native, upload, deadline_ns).await?,
+            ),
+            None => {
+                let open = Op::Open {
+                    bucket: native.bucket.clone(),
+                    key: native.key.clone(),
+                    id: native.id,
+                    length,
+                    buffer,
+                    checksum: native.checksum,
+                };
+                let reply = self.call(&open, deadline_ns).await?;
+                if reply.status == Status::Done {
+                    watch
+                        .opened(&reply.upload)
+                        .await
+                        .map_err(ClientError::Source)?;
+                }
+                (reply.upload.clone(), reply)
+            }
+        };
+        if reply.status != Status::Done {
+            return Ok(Err(Box::new(reply)));
+        }
+        let at = reply
+            .progress
+            .map(|p| *p)
+            .ok_or(ClientError::Reply("a native upload's progress missing"))?;
+        watch.progressed(&at).await.map_err(ClientError::Source)?;
+        Ok(Ok((upload, at)))
+    }
+
+    /// A native upload's progress, as its Offset answers it.
+    async fn progress(
+        &mut self,
+        native: &Native,
+        upload: &str,
+        deadline_ns: u64,
+    ) -> Result<Reply, ClientError> {
+        let op = Op::Offset {
+            bucket: native.bucket.clone(),
+            key: native.key.clone(),
+            upload: upload.to_owned(),
+        };
+        self.call(&op, deadline_ns).await
+    }
+
+    /// Reads `len` bytes of `source` into `whole` and sends none: the committed runs' bytes, read
+    /// again where an upload is resumed so its checksum is of the source as it is now.
+    async fn hash_prefix<S: Source>(
+        &mut self,
+        source: &mut S,
+        len: u64,
+        whole: &mut Whole,
+    ) -> Result<(), ClientError> {
+        let mut hasher =
+            Hasher::new(whole.algorithm).map_err(|e| ClientError::Bounds(format!("{e:?}")))?;
+        let mut left = len;
+        while left > 0 {
+            let want = usize::try_from(left)
+                .unwrap_or(usize::MAX)
+                .min(self.piece.len());
+            let piece = self
+                .piece
+                .get_mut(..want)
+                .ok_or_else(|| ClientError::Bounds("a read past the piece".into()))?;
+            let n = source.read(piece).await.map_err(ClientError::Source)?;
+            if n == 0 {
+                return Err(ClientError::Length {
+                    stated: len,
+                    read: len.saturating_sub(left),
+                });
+            }
+            let read = piece
+                .get(..n)
+                .ok_or_else(|| ClientError::Bounds("a read past the piece".into()))?;
+            hasher
+                .update(read)
+                .map_err(|e| ClientError::Bounds(format!("{e:?}")))?;
+            left = left.saturating_sub(u64::try_from(n).unwrap_or(u64::MAX));
+        }
+        if len > 0 {
+            let checksum = hasher
+                .finish()
+                .map_err(|e| ClientError::Bounds(format!("{e:?}")))?;
+            whole.add(checksum, len)?;
+        }
+        Ok(())
+    }
+
+    /// What a run's exchange came to: committed, its checksum the trailer the client sent; to be
+    /// sent again from the node's offset, where it ended unanswered and the node holds the offset
+    /// the run began at; committed after all, the node's offset past it, its reply lost; or a
+    /// refusal for the caller. `at` moves to the node's progress.
+    async fn ran(
+        &mut self,
+        native: &Native,
+        upload: &str,
+        at: &mut object::Progress,
+        (run, sent): (u64, Option<Checksum>),
+        asked: Result<Reply, ClientError>,
+        deadline_ns: u64,
+    ) -> Result<Ran, ClientError> {
+        let begun = at.offset;
+        let end = begun.checked_add(run).ok_or(ClientError::Offset {
+            ours: begun,
+            theirs: begun,
+        })?;
+        let (theirs, why) = match asked {
+            Ok(reply) if reply.status == Status::Done => (
+                reply
+                    .progress
+                    .map(|p| *p)
+                    .ok_or(ClientError::Reply("a run's reply without its progress"))?,
+                None,
+            ),
+            // Another run committed at the offset first, or the upload ended: where it stands.
+            Ok(reply) if reply.status == Status::Offset => (
+                reply
+                    .progress
+                    .map(|p| *p)
+                    .ok_or(ClientError::Reply("an offset refused without the upload's"))?,
+                None,
+            ),
+            Ok(reply) => return Ok(Ran::Refused(Box::new(reply))),
+            Err(error) if resumable(&error) => {
+                let reply = self.progress(native, upload, deadline_ns).await?;
+                if reply.status != Status::Done {
+                    return Ok(Ran::Refused(Box::new(reply)));
+                }
+                let theirs = reply
+                    .progress
+                    .map(|p| *p)
+                    .ok_or(ClientError::Reply("a native upload's progress missing"))?;
+                (theirs, Some(error))
+            }
+            Err(error) => return Err(error),
+        };
+        if theirs.offset == begun && !theirs.ended {
+            *at = theirs;
+            let why = why.unwrap_or(ClientError::Offset {
+                ours: begun,
+                theirs: begun,
+            });
+            return Ok(Ran::Again(why));
+        }
+        // The run committed: the node holds what it checked against the trailer sent.
+        let Some(crc) = sent.filter(|_| theirs.offset == end) else {
+            return Err(ClientError::Offset {
+                ours: begun,
+                theirs: theirs.offset,
+            });
+        };
+        *at = theirs;
+        Ok(Ran::Committed(crc))
+    }
+
+    /// One more run that did not commit, for `why`: the pause before it is sent again, or, the
+    /// attempts spent, `why`.
+    async fn again(
+        &mut self,
+        failures: u32,
+        why: ClientError,
+        deadline_ns: u64,
+    ) -> Result<u32, ClientError> {
+        let failures = failures.saturating_add(1);
+        if failures >= ATTEMPTS {
+            return Err(why);
+        }
+        let mut backoff = self.measured_pto();
+        for _ in 1..failures {
+            backoff = bounds::backed_off(backoff);
+        }
+        let pause = bounds::pause(backoff, self.id, self.waits);
+        self.waits = self.waits.wrapping_add(1);
+        let wait = u64::try_from(pause.as_nanos()).unwrap_or(u64::MAX);
+        self.wait_until(
+            hyper_rt::futures::now_ns().saturating_add(wait),
+            deadline_ns,
+        )
+        .await?;
+        Ok(failures)
+    }
+
+    /// The upload's Finish: its object, of `length` bytes held to `whole`, committed, or
+    /// `BadDigest`. Asked again where its answer was lost: the node answers a retry from the
+    /// version the first made, matched by its size and checksum.
+    async fn finish(
+        &mut self,
+        native: &Native,
+        upload: &str,
+        (length, whole): (u64, Whole),
+        deadline_ns: u64,
+    ) -> Result<Reply, ClientError> {
+        let checksum = whole.value()?;
+        let op = Op::Finish {
+            bucket: native.bucket.clone(),
+            key: native.key.clone(),
+            upload: upload.to_owned(),
+            id: native.id,
+            headers: native.headers.clone(),
+            length,
+            checksum: checksum.clone(),
+        };
+        let mut failures = 0u32;
+        loop {
+            match self.call(&op, deadline_ns).await {
+                Ok(reply) => {
+                    if reply.status == Status::Done
+                        && reply.checksum.as_ref().is_some_and(|kept| {
+                            kept.algorithm != checksum.algorithm.code()
+                                || kept.value != checksum.bytes
+                        })
+                    {
+                        return Err(ClientError::Corrupt("the upload"));
+                    }
+                    return Ok(reply);
+                }
+                Err(error) if resumable(&error) => {
+                    failures = self.again(failures, error, deadline_ns).await?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Asks `op` of the nodes in turn, by the module's rules.
     async fn ask<S: Source, K: Sink>(
         &mut self,
         op: &Op,
         source: Option<&mut S>,
-        mut sink: Option<&mut K>,
+        sink: Option<&mut K>,
         deadline_ns: u64,
     ) -> Result<Reply, ClientError> {
-        let (head, fields) = op.encode()?;
-        let body = op.body(&fields);
         let mut upload = match (op, source) {
             (
                 Op::Put {
@@ -514,23 +1013,28 @@ impl Client {
                 }
                 | Op::UploadPart {
                     length, trailing, ..
+                }
+                | Op::Append {
+                    length, trailing, ..
                 },
                 Some(source),
-            ) => Some(Upload {
-                source,
-                length: *length,
-                read: 0,
-                start: 0,
-                end: 0,
-                ended: false,
-                hasher: trailing
-                    .map(Hasher::new)
-                    .transpose()
-                    .map_err(|e| ClientError::Bounds(format!("{e:?}")))?,
-                trailer: None,
-            }),
+            ) => Some(Upload::new(source, *length, *trailing)?),
             _ => None,
         };
+        self.asked(op, upload.as_mut(), sink, deadline_ns).await
+    }
+
+    /// Asks `op` with its body's `upload`, which the caller keeps: a run's trailer is read from it
+    /// once the exchange ends, answered or not.
+    async fn asked<S: Source, K: Sink>(
+        &mut self,
+        op: &Op,
+        mut upload: Option<&mut Upload<'_, S>>,
+        mut sink: Option<&mut K>,
+        deadline_ns: u64,
+    ) -> Result<Reply, ClientError> {
+        let (head, fields) = op.encode()?;
+        let body = op.body(&fields);
         // RFC 6298 §5.5: the wait doubles from the measured probe timeout.
         let mut backoff = self.measured_pto();
         let mut last = Refusal::NotConnected;
@@ -551,14 +1055,14 @@ impl Client {
                 .attempt(
                     node,
                     (&head, &fields, body),
-                    (upload.as_mut(), sink.as_deref_mut()),
+                    (upload.as_deref_mut(), sink.as_deref_mut()),
                     deadline_ns,
                 )
                 .await?;
             match asked {
                 Attempt::Replied(reply) => {
                     let reply = *reply;
-                    if let (Some(upload), Some(kept)) = (&upload, &reply.checksum)
+                    if let (Some(upload), Some(kept)) = (upload.as_deref(), &reply.checksum)
                         && let Some((sent, _)) = &upload.trailer
                         && (kept.algorithm != sent.algorithm.code() || kept.value != sent.bytes)
                     {
@@ -600,10 +1104,13 @@ impl Client {
                 .find(|n| n.id == node)
                 .and_then(|n| n.refused)
                 .unwrap_or(Refusal::NotConnected);
-            return Ok(if untaken(refused) || refused == Refusal::NotConnected {
-                Attempt::Untaken(refused)
-            } else {
+            // No connection came up, so no node took the request: another node is asked, as for
+            // a node gone, unless the refusal is the client's own, its certificate or its role,
+            // which every node of the cell refuses alike.
+            return Ok(if matches!(refused, Refusal::Identity | Refusal::Kind) {
                 Attempt::Refused(refused)
+            } else {
+                Attempt::Untaken(refused)
             });
         }
         let clock = self.driver.clock()?;
@@ -1160,6 +1667,237 @@ fn took_from_source<S>(
     upload.start = 0;
     upload.end = n;
     Ok(())
+}
+
+/// What a run's exchange came to (`Client::ran`): sent again for the error that ended it.
+enum Ran {
+    Committed(Checksum),
+    Again(ClientError),
+    Refused(Box<Reply>),
+}
+
+/// Whether an operation ended so that asking the node's progress and going on may answer it: its
+/// exchange lost, never taken, or refused at admission with bytes a run can give again.
+fn resumable(error: &ClientError) -> bool {
+    match error {
+        ClientError::Lost { .. } | ClientError::Untaken(_) => true,
+        ClientError::Refused(refusal) => untaken(*refusal),
+        _ => false,
+    }
+}
+
+/// A run's Append.
+fn append(native: &Native, upload: &str, (offset, length, last): (u64, u64, bool)) -> Op {
+    Op::Append {
+        bucket: native.bucket.clone(),
+        key: native.key.clone(),
+        upload: upload.to_owned(),
+        id: native.id,
+        offset,
+        length,
+        last,
+        trailing: Some(native.checksum),
+    }
+}
+
+/// The full-object checksum of the bytes so far, combined from each run's as CRCs combine
+/// (05 §3.4).
+struct Whole {
+    algorithm: Algorithm,
+    value: Option<(Checksum, u64)>,
+}
+
+impl Whole {
+    fn new(algorithm: Algorithm) -> Self {
+        Self {
+            algorithm,
+            value: None,
+        }
+    }
+
+    /// The next `len` bytes, whose checksum is `checksum`.
+    fn add(&mut self, checksum: Checksum, len: u64) -> Result<(), ClientError> {
+        self.value = Some(match self.value.take() {
+            None => (checksum, len),
+            Some((so_far, at)) => {
+                let combined = mantle_s3::checksum::full_object(&[(so_far, at), (checksum, len)])
+                    .ok_or(ClientError::Bounds(
+                    "a checksum that does not combine".into(),
+                ))?;
+                let end = at
+                    .checked_add(len)
+                    .ok_or(ClientError::Bounds("an object past u64".into()))?;
+                (combined, end)
+            }
+        });
+        Ok(())
+    }
+
+    /// The object's checksum: an empty one's where it has no byte.
+    fn value(self) -> Result<Checksum, ClientError> {
+        match self.value {
+            Some((checksum, _)) => Ok(checksum),
+            None => Hasher::new(self.algorithm)
+                .and_then(Hasher::finish)
+                .map_err(|e| ClientError::Bounds(format!("{e:?}"))),
+        }
+    }
+}
+
+/// A run of a source read again: `left` more of its bytes, then the run's end, whatever the source
+/// holds past it. The source is never asked for no bytes, which a source whose next bytes have not
+/// come may wait on.
+struct Bounded<'a, S> {
+    source: &'a mut S,
+    left: u64,
+}
+
+impl<S: Source> Source for Bounded<'_, S> {
+    async fn read(&mut self, into: &mut [u8]) -> std::io::Result<usize> {
+        let want = usize::try_from(self.left)
+            .unwrap_or(usize::MAX)
+            .min(into.len());
+        let Some(into) = into.get_mut(..want).filter(|into| !into.is_empty()) else {
+            return Ok(0);
+        };
+        let n = self.source.read(into).await?;
+        self.left = self
+            .left
+            .saturating_sub(u64::try_from(n).unwrap_or(u64::MAX));
+        Ok(n)
+    }
+}
+
+/// A run of a source read once and of a known length, sent as it is read: the bytes `held`
+/// already gives again first, from `at`, then the source's, each kept in `held` as it is read, to
+/// the run's `run` bytes and no further.
+struct Replay<'a, S> {
+    held: &'a mut Vec<u8>,
+    at: usize,
+    source: &'a mut S,
+    run: usize,
+}
+
+impl<S: Source> Source for Replay<'_, S> {
+    async fn read(&mut self, into: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(kept) = self.held.get(self.at..)
+            && !kept.is_empty()
+        {
+            let n = kept.len().min(into.len());
+            if let (Some(into), Some(kept)) = (into.get_mut(..n), kept.get(..n)) {
+                into.copy_from_slice(kept);
+            }
+            self.at = self.at.saturating_add(n);
+            return Ok(n);
+        }
+        // The run's end is the run's own: the source is not asked for no bytes, which a source
+        // whose next bytes have not come waits on (hyper-rt's standard input does).
+        let want = self.run.saturating_sub(self.held.len()).min(into.len());
+        let Some(into) = into.get_mut(..want).filter(|into| !into.is_empty()) else {
+            return Ok(0);
+        };
+        let n = self.source.read(into).await?;
+        let read = into.get(..n).unwrap_or_default();
+        self.held
+            .try_reserve(n)
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
+        self.held.extend_from_slice(read);
+        self.at = self.held.len();
+        Ok(n)
+    }
+}
+
+/// A run of a source read once, held until it commits: its bytes, and those read past it.
+struct Held {
+    bytes: Vec<u8>,
+    /// The source ended: no byte past `bytes` is to come.
+    ended: bool,
+    /// The run a fill read toward: the bytes of `bytes` past it were read ahead.
+    run: usize,
+}
+
+impl Held {
+    /// Room for a run of `buffer` bytes and a piece read ahead past it, reserved at once.
+    fn new(buffer: u64) -> Result<Self, ClientError> {
+        let room = usize::try_from(buffer)
+            .ok()
+            .and_then(|b| b.checked_add(PIECE))
+            .ok_or(ClientError::Bounds(
+                "a buffer past the address space".into(),
+            ))?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(room)
+            .map_err(|_| ClientError::Bounds("the client's buffer".into()))?;
+        Ok(Self {
+            bytes,
+            ended: false,
+            run: 0,
+        })
+    }
+
+    /// Reads `source` until a run of `run` bytes is held, and with `ahead` a piece past it, or
+    /// it ends.
+    async fn fill<S: Source>(
+        &mut self,
+        source: &mut S,
+        run: u64,
+        ahead: bool,
+    ) -> Result<(), ClientError> {
+        let run =
+            usize::try_from(run).map_err(|_| ClientError::Bounds("a run past memory".into()))?;
+        self.run = run;
+        let want = if ahead { run.saturating_add(1) } else { run };
+        while self.bytes.len() < want && !self.ended {
+            let at = self.bytes.len();
+            let room = self.bytes.capacity().saturating_sub(at).min(PIECE);
+            if room == 0 {
+                return Err(ClientError::Bounds("a run past the client's buffer".into()));
+            }
+            self.bytes.resize(at.saturating_add(room), 0);
+            let read = match self.bytes.get_mut(at..) {
+                Some(into) => source.read(into).await,
+                None => Ok(0),
+            };
+            match read {
+                Ok(n) => {
+                    self.bytes.truncate(at.saturating_add(n));
+                    self.ended = n == 0;
+                }
+                Err(e) => {
+                    self.bytes.truncate(at);
+                    return Err(ClientError::Source(e));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The bytes of the run held: the run asked, or fewer where the source ended within it.
+    fn run(&self, run: u64) -> Result<u64, ClientError> {
+        let held = u64::try_from(self.bytes.len()).unwrap_or(u64::MAX);
+        Ok(held.min(run))
+    }
+
+    /// `taken` as an index into the held bytes.
+    fn len(&self, taken: u64) -> Result<usize, ClientError> {
+        usize::try_from(taken)
+            .ok()
+            .filter(|t| *t <= self.bytes.len())
+            .ok_or(ClientError::Bounds("a run past what is held".into()))
+    }
+
+    /// Bytes held past the run: read ahead, the next run's first.
+    fn ahead(&self) -> usize {
+        self.bytes.len().saturating_sub(self.run)
+    }
+
+    /// The run of `taken` bytes committed: what was read past it moves to the front.
+    fn drop_run(&mut self, taken: u64) -> Result<(), ClientError> {
+        let taken = self.len(taken)?;
+        self.bytes.drain(..taken);
+        Ok(())
+    }
 }
 
 /// What an exchange that ended unanswered with `refusal` came to, `sent` of its body's bytes taken

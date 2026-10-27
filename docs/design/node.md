@@ -1748,6 +1748,19 @@ once states the checksum at its end, as aws-chunked's trailer does; the node fee
 object's bytes alone and checks the trailer's value before anything commits (`BadDigest`
 otherwise). The listener's aws-chunked trailer travels on the same field.
 
+*As built (2026-10-26), native uploads* (gateway.md §2.1). Four kinds carry an upload whose runs the
+node cuts: Open (the object's length where known, the client's buffer where its source is read
+once, the full-object checksum's algorithm, a CRC), answered with the upload's ID and its progress;
+Append, a run, its bytes and its CRC trailer after the fields as a put's, at the offset it begins,
+answered with its progress frame, or `Offset`, the progress naming the upload's offset, where it
+begins anywhere else or follows the last run; Offset, the upload's progress, which a resuming client
+appends from; and Finish, the object's length and full-object checksum, answered as a completion,
+or `BadDigest` with nothing committed. A reply's progress is its durable offset, its runs, the
+length of every run but the last, whether the last committed, and a run's frame's CRC. The node
+reads the upload's row before a run's body and refuses a run at another offset, of another length
+than the plan's or past the last, so a stale run never streams; the Name range checks the same at
+the commit, where two runs of one offset race.
+
 ### 4.2 A request's path
 
 1. **Admit the connection** against the connection budget.

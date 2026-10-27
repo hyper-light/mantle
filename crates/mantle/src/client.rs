@@ -10,10 +10,17 @@
 //! connections moving while a disk is slow; standard input and output on hyper-rt's own threads, a
 //! piece a buffer.
 //!
+//! **A copy into the cell** is a native upload (gateway.md §2.1; `mantle_client::Client::upload`):
+//! runs the node cuts, each committed before the next is sent, the object committed at the end
+//! only if every byte's CRC-64/NVME is the one the client read. The upload is kept in the client's
+//! journal (`crate::journal`) before its first run, and a copy run again after a crash or a kill
+//! finds it and goes on from the node's durable offset, no committed run sent again; each run's
+//! commit is told on standard error. An object one run holds is put whole.
+//!
 //! **Its memory** is the client's (`mantle_client::memory`) and a piece a stream, whatever an
-//! object's size, but where an object's length is not known before its bytes are read (standard
-//! input): each part is read whole before it is sent, since a part states its length before its
-//! bytes, so such a copy holds one part, the AWS CLI's `multipart_chunksize` ([`PART`]).
+//! object's size, but where a source is read once (standard input): each run is held until it
+//! commits, to be sent again if its exchange is lost, so such a copy holds one run, of the AWS
+//! CLI's `multipart_chunksize` ([`PART`]), and a piece read past it.
 //!
 //! **A copy to a file** is written under a temporary name beside it, flushed (`sync_data`, the
 //! platform's full flush), renamed over its place and its directory flushed (CLAUDE.md §6), so the
@@ -30,19 +37,22 @@ use hyper_rt::machine::calibration::Policy;
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
 use hyper_rt::sync::OneshotReceiver;
 use mantle_client::{
-    CertificateDer, Client, ClientError, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer, Settings,
-    Sink, Source, TRAILER,
+    CertificateDer, Client, ClientError, Credentials, Native, PrivateKeyDer, PrivatePkcs8KeyDer,
+    Rewind, Settings, Sink, Source, TRAILER, Watch,
 };
-use mantle_protocol::object::{Headers, List, Listing, Op, Reply, Status};
+use mantle_protocol::object::{Headers, List, Listing, Op, Progress, Reply, Status};
+
+use crate::journal::{Journal, JournalError, Origin, Record};
 use mantle_s3::checksum::{Algorithm, Hasher};
 
 /// The blocking pool's share a file's reads and writes run in, one at a time: an operation moves
 /// one piece at a time.
 const FILES: &str = "files";
 
-/// A part's bytes, where an object is put in parts: the AWS CLI's default `multipart_chunksize`
-/// and `multipart_threshold` of 8 MB, a megabyte 1024² octets to it (AWS CLI S3 configuration
-/// reference; docs/research/73).
+/// The run a copy from standard input holds, its source read once: the AWS CLI's default
+/// `multipart_chunksize` and `multipart_threshold` of 8 MB, a megabyte 1024² octets to it (AWS CLI
+/// S3 configuration reference; docs/research/73). Its runs are this long, so a stream of unknown
+/// length holds 10,000 of them, 80 GiB, as the AWS CLI's parts do.
 pub const PART: u64 = 8 << 20;
 
 /// What an object command does.
@@ -53,8 +63,9 @@ pub enum Command {
     RemoveBucket(String),
     /// ListBuckets, or ListObjectsV2 of a bucket's keys under a prefix, a level of `/` at a time.
     List(Option<Location>),
-    /// An object's bytes from one place to another, one of them the cell.
-    Copy(Place, Place),
+    /// An object's bytes from one place to another, one of them the cell; standard input's length
+    /// where stated.
+    Copy(Place, Place, Option<u64>),
     /// DeleteObject.
     Remove(Location),
     /// HeadObject.
@@ -133,6 +144,13 @@ pub enum Error {
     File(PathBuf, std::io::Error),
     Runtime(String),
     Output(std::io::Error),
+    Journal(JournalError),
+}
+
+impl From<JournalError> for Error {
+    fn from(e: JournalError) -> Self {
+        Self::Journal(e)
+    }
 }
 
 impl fmt::Display for Error {
@@ -145,6 +163,7 @@ impl fmt::Display for Error {
             Self::File(path, e) => write!(f, "{}: {e}", path.display()),
             Self::Runtime(why) => write!(f, "the runtime: {why}"),
             Self::Output(e) => write!(f, "writing output: {e}"),
+            Self::Journal(e) => write!(f, "the journal: {e}"),
         }
     }
 }
@@ -264,10 +283,10 @@ pub fn run(dir: &Path, command: Command, mut out: impl Write + 'static) -> Resul
     let ran = rt
         .block_on(async move {
             let Configured {
+                dir,
                 id,
                 credentials,
                 nodes,
-                ..
             } = configured;
             let transport_bytes = mantle_client::least_transport(nodes.len())?;
             let mut client = Client::open(Settings {
@@ -278,7 +297,7 @@ pub fn run(dir: &Path, command: Command, mut out: impl Write + 'static) -> Resul
                 transport_bytes,
             })
             .await?;
-            command_on(&mut client, command, &mut out).await
+            command_on(&mut client, &dir, command, &mut out).await
         })
         .map_err(Error::from);
     blocking::stop()?;
@@ -323,6 +342,7 @@ fn date(seconds: u64) -> String {
 
 async fn command_on(
     client: &mut Client,
+    dir: &Path,
     command: Command,
     out: &mut impl Write,
 ) -> Result<(), Error> {
@@ -345,7 +365,7 @@ async fn command_on(
         }
         Command::List(None) => list_buckets(client, out).await,
         Command::List(Some(at)) => list_keys(client, &at, out).await,
-        Command::Copy(from, to) => copy(client, from, to, out).await,
+        Command::Copy(from, to, size) => copy(client, dir, (from, to), size, out).await,
         Command::Remove(at) => {
             let op = Op::Delete {
                 bucket: at.bucket.clone(),
@@ -616,21 +636,29 @@ async fn complete(
 /// An object's bytes from `from` to `to`, one of them the cell's.
 async fn copy(
     client: &mut Client,
-    from: Place,
-    to: Place,
+    dir: &Path,
+    (from, to): (Place, Place),
+    size: Option<u64>,
     out: &mut impl Write,
 ) -> Result<(), Error> {
+    if size.is_some() && from != Place::Standard {
+        return Err(Error::Usage("--size states standard input's length".into()));
+    }
     match (from, to) {
         (Place::File(path), Place::Cell(at)) => {
-            let length = std::fs::metadata(&path)
-                .map_err(|e| Error::File(path.clone(), e))?
-                .len();
-            let reply = if length <= mantle_s3::body::MAX_UPLOAD {
-                let mut source = FileSource::open(&path, 0, None)?;
-                put_object(client, &at, &mut source, length).await?
-            } else {
-                put_file_in_parts(client, &at, &path, length).await?
+            let origin = Origin::file(&path)?;
+            let Origin::File { length, .. } = origin else {
+                return Err(Error::Usage("a file's copy".into()));
             };
+            let mut source = FileSource::open(&path, 0, None)?;
+            let reply = upload(client, dir, &at, origin, |client, native, watch| {
+                Box::pin(async move {
+                    client
+                        .upload(native, (&mut source, length), watch, NO_DEADLINE)
+                        .await
+                })
+            })
+            .await?;
             line(
                 out,
                 format_args!(
@@ -643,7 +671,21 @@ async fn copy(
             )
         }
         (Place::Standard, Place::Cell(at)) => {
-            let reply = put_stream(client, &at).await?;
+            let mut stdin = Stdin::take()?;
+            let reply = upload(
+                client,
+                dir,
+                &at,
+                Origin::Standard,
+                |client, native, watch| {
+                    Box::pin(async move {
+                        client
+                            .upload_once(native, (&mut stdin, size), (PART, watch), NO_DEADLINE)
+                            .await
+                    })
+                },
+            )
+            .await?;
             line(
                 out,
                 format_args!("- -> s3://{}/{} etag \"{}\"", at.bucket, at.key, reply.etag),
@@ -667,103 +709,137 @@ async fn copy(
     }
 }
 
-async fn put_object<S: Source>(
-    client: &mut Client,
+/// What a copy's upload runs: the client's resumable upload of its source, given the client, the
+/// upload's object and the journal's watch.
+type Uploading<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Reply, ClientError>> + 'a>>;
+
+/// A copy into the cell at `at` from `origin`'s source, as a native upload the journal under `dir`
+/// keeps: the upload it holds for the same destination and source resumed, where the source is as
+/// its record says; one whose source changed aborted and a new one opened. Done or `BadDigest`,
+/// the record goes; any other end leaves it for the copy run again.
+async fn upload<'c, F>(
+    client: &'c mut Client,
+    dir: &Path,
     at: &Location,
-    source: &mut S,
-    length: u64,
-) -> Result<Reply, Error> {
-    let op = Op::Put {
+    origin: Origin,
+    go: F,
+) -> Result<Reply, Error>
+where
+    F: for<'b> FnOnce(&'b mut Client, &'b Native, &'b mut Journaled) -> Uploading<'b>,
+{
+    let journal = Journal::open(dir)?;
+    let found = journal.find(&at.bucket, &at.key, &origin)?;
+    let resumed = match found {
+        Some(record) if record.origin == origin => Some(record),
+        Some(record) => {
+            abort_upload(client, at, &record.upload).await?;
+            journal.forget(&record)?;
+            None
+        }
+        None => None,
+    };
+    let record = match resumed {
+        Some(record) => record,
+        None => Record {
+            bucket: at.bucket.clone(),
+            key: at.key.clone(),
+            origin,
+            id: mantle_client::identity()?,
+            upload: String::new(),
+        },
+    };
+    let native = Native {
         bucket: at.bucket.clone(),
         key: at.key.clone(),
-        id: mantle_client::identity()?,
-        length,
+        id: record.id,
+        upload: (!record.upload.is_empty()).then(|| record.upload.clone()),
+        checksum: TRAILER,
         headers: Headers::default(),
-        checksum: None,
-        md5: None,
-        trailing: Some(TRAILER),
     };
-    done("PutObject", client.put(&op, source, NO_DEADLINE).await?)
+    let mut watch = Journaled {
+        journal,
+        record,
+        at: format!("s3://{}/{}", at.bucket, at.key),
+        resumed: native.upload.is_some(),
+    };
+    let reply = go(client, &native, &mut watch).await?;
+    let Journaled {
+        journal, record, ..
+    } = watch;
+    match reply.status {
+        Status::Done => {
+            journal.forget(&record)?;
+            Ok(reply)
+        }
+        // A source whose bytes are not the runs': nothing committed, and the upload, holding
+        // another source's runs, is aborted.
+        Status::BadDigest => {
+            abort_upload(client, at, &record.upload).await?;
+            journal.forget(&record)?;
+            Err(Error::Answered("the upload".into(), Status::BadDigest))
+        }
+        Status::NoSuchUpload => {
+            journal.forget(&record)?;
+            Err(Error::Answered("the upload".into(), Status::NoSuchUpload))
+        }
+        status => Err(Error::Answered("the upload".into(), status)),
+    }
 }
 
-/// A file past one put's bytes, put in parts streamed from it: each `PART` or more, so S3's 10,000
-/// parts hold it (05 §4.1).
-async fn put_file_in_parts(
-    client: &mut Client,
-    at: &Location,
-    path: &Path,
-    length: u64,
-) -> Result<Reply, Error> {
-    let parts = u64::from(mantle_s3::body::MAX_PARTS);
-    let size = length.div_ceil(parts).max(PART);
-    let upload = create_upload(client, at).await?.upload;
-    let mut listed = Vec::new();
-    let mut offset = 0u64;
-    let mut number = 0u16;
-    while offset < length {
-        number = number
-            .checked_add(1)
-            .ok_or_else(|| Error::Usage("past S3's parts".into()))?;
-        let take = size.min(length.saturating_sub(offset));
-        let mut source = FileSource::open(path, offset, Some(take))?;
-        let reply = put_part(client, at, (&upload, number), &mut source, take).await?;
-        listed.push((number, reply.etag));
-        offset = offset.saturating_add(take);
+/// An upload the journal named, aborted where it is still open.
+async fn abort_upload(client: &mut Client, at: &Location, upload: &str) -> Result<(), Error> {
+    if upload.is_empty() {
+        return Ok(());
     }
-    complete(client, at, &upload, listed).await
+    let op = Op::Abort {
+        bucket: at.bucket.clone(),
+        key: at.key.clone(),
+        upload: upload.to_owned(),
+        id: mantle_client::identity()?,
+    };
+    let reply = client.call(&op, NO_DEADLINE).await?;
+    match reply.status {
+        Status::Done | Status::NoSuchUpload => Ok(()),
+        status => Err(Error::Answered("AbortMultipartUpload".into(), status)),
+    }
 }
 
-/// Standard input put whole: one put where it ends within a part, else in parts, each read whole
-/// first since a part states its length before its bytes.
-async fn put_stream(client: &mut Client, at: &Location) -> Result<Reply, Error> {
-    let mut stdin = Stdin::take()?;
-    let capacity = usize::try_from(PART).map_err(|_| Error::Usage("a part's bytes".into()))?;
-    let mut part = Vec::new();
-    part.try_reserve_exact(capacity)
-        .map_err(|_| Error::Runtime("a part's bytes".into()))?;
-    let mut ended = fill(&mut stdin, &mut part, capacity).await?;
-    if ended {
-        let length = u64::try_from(part.len()).unwrap_or(u64::MAX);
-        return put_object(client, at, &mut part.as_slice(), length).await;
-    }
-    let upload = create_upload(client, at).await?.upload;
-    let mut listed = Vec::new();
-    let mut number = 0u16;
-    loop {
-        number = number
-            .checked_add(1)
-            .ok_or_else(|| Error::Usage("past S3's parts".into()))?;
-        let length = u64::try_from(part.len()).unwrap_or(u64::MAX);
-        let reply = put_part(client, at, (&upload, number), &mut part.as_slice(), length).await?;
-        listed.push((number, reply.etag));
-        if ended {
-            break;
-        }
-        part.clear();
-        ended = fill(&mut stdin, &mut part, capacity).await?;
-        if part.is_empty() {
-            break;
-        }
-    }
-    complete(client, at, &upload, listed).await
+/// The journal's side of an upload: its record kept once the upload is opened, and each run's
+/// commit told on standard error.
+struct Journaled {
+    journal: Journal,
+    record: Record,
+    at: String,
+    resumed: bool,
 }
 
-/// Reads standard input into `part` up to `capacity`: whether it ended.
-async fn fill(stdin: &mut Stdin, part: &mut Vec<u8>, capacity: usize) -> Result<bool, Error> {
-    let mut piece = [0u8; 4096];
-    while part.len() < capacity {
-        let room = capacity.saturating_sub(part.len()).min(piece.len());
-        let into = piece.get_mut(..room).unwrap_or(&mut []);
-        let n = stdin
-            .read(into)
-            .await
-            .map_err(|e| Error::File(PathBuf::from("-"), e))?;
-        if n == 0 {
-            return Ok(true);
-        }
-        part.extend_from_slice(piece.get(..n).unwrap_or(&[]));
+impl Watch for Journaled {
+    async fn opened(&mut self, upload: &str) -> std::io::Result<()> {
+        upload.clone_into(&mut self.record.upload);
+        self.journal
+            .keep(&self.record)
+            .map_err(|e| std::io::Error::other(e.to_string()))
     }
-    Ok(false)
+
+    async fn progressed(&mut self, progress: &Progress) -> std::io::Result<()> {
+        let mut err = std::io::stderr().lock();
+        if self.resumed {
+            self.resumed = false;
+            writeln!(
+                err,
+                "{}: resuming upload {} at {} bytes, {} runs",
+                self.at, self.record.upload, progress.offset, progress.runs
+            )?;
+        } else if progress.runs > 0 {
+            writeln!(
+                err,
+                "{}: run {} committed, {} bytes durable",
+                self.at, progress.runs, progress.offset
+            )?;
+        }
+        Ok(())
+    }
 }
 
 /// An object into `sink`: one get where it is one put's bytes or fewer, else in ranges of that,
@@ -891,6 +967,8 @@ struct FileSource {
     start: usize,
     end: usize,
     left: u64,
+    /// The bytes it reads at most, from its first offset: what a rewind counts from.
+    size: u64,
 }
 
 impl FileSource {
@@ -911,7 +989,28 @@ impl FileSource {
             start: 0,
             end: 0,
             left: length.unwrap_or_else(|| size.saturating_sub(offset)),
+            size,
         })
+    }
+}
+
+impl Rewind for FileSource {
+    /// Waits for a read out, which a dropped read left, then seeks: what it read is the past.
+    async fn rewind(&mut self, offset: u64) -> std::io::Result<()> {
+        if let Some(pending) = self.pending.as_mut() {
+            let finished = pending.await;
+            self.pending = None;
+            let (file, piece, _) = finished.map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+            self.idle = Some((file, piece));
+        }
+        let Some((file, _)) = self.idle.as_mut() else {
+            return Err(std::io::Error::other("a file read lost its file"));
+        };
+        file.seek(SeekFrom::Start(offset))?;
+        self.start = 0;
+        self.end = 0;
+        self.left = self.size.saturating_sub(offset);
+        Ok(())
     }
 }
 

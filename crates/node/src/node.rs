@@ -501,7 +501,7 @@ struct Remote {
     suspected: u64,
     refusal: Option<Refusal>,
     /// Whether the detectors suspect it now: suspected, or its stop announced, until a heartbeat
-    /// trusts it or its next run's comes (hyper-liveness's changes).
+    /// trusts it or its next run's comes (hyper-liveness's changes), or a connection to it is made.
     suspect: bool,
 }
 
@@ -1744,12 +1744,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     fn on_event(&mut self, event: Event<NodeClasses>, now: u64) -> Result<(), NodeError> {
         match event {
             // Only a node's connection keys the plane; a client past the node's bound is refused
-            // as an identity past the transport's is, which it asks again after.
+            // as an identity past the transport's is, which it asks again after. A connection
+            // made to a peer is the read path's own evidence that it is back: its chunks are read
+            // again (`end_chunk_gets`), whatever its detectors have yet to hear of its new run.
             Event::Connected {
                 peer,
                 epoch,
                 role: Role::Node,
-            } => self.key_plane(peer, epoch, now),
+            } => {
+                if let Some(remote) = self.remotes.iter_mut().find(|r| r.id == peer) {
+                    remote.suspect = false;
+                }
+                self.key_plane(peer, epoch, now)
+            }
             Event::Connected {
                 peer,
                 role: Role::Client,

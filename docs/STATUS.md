@@ -387,9 +387,11 @@ SIGKILLed in turn every object reads back through the others, and through it sta
 a cell of 96 MiB volumes filled); each case's controls, a byte inverted on its way to the check, a
 chunk moved onto another's node and a key never put, are each caught; a part, a completion or a
 read whose answer was lost is asked again with its identity and counted (`again`); and `--volume
-free` sizes the volumes from the run's free space less a stated `--reserve`. A node reads no chunk from a peer
-its detectors suspect, so a GET with a copy on a killed node asks another at once (gateway.md
-§3).
+free` sizes the volumes from the run's free space less a stated `--reserve`. A node reads no chunk
+from a peer its detectors suspect, so a GET with a copy on a killed node asks another at once
+(gateway.md §3). On adacachy its small sets of 1k, 10k and 100k objects held every check exact,
+the harness's peak resident set 15.2, 15.1 and 13.2 MiB and its threads four
+(docs/measurements/2026-10-27-transfer-harness.md).
 
 Remaining before it is done:
 

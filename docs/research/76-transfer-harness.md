@@ -144,10 +144,13 @@ writes take (research/11 §10.3), which is half of so small a volume.
 (`mantle_disk::histogram`, HdrHistogram's buckets), counts, and a bit an object; a node's lines are
 read on a thread of its own, three in all, each telling the case only what it waits on, a range's
 leader as it changes rather than every `status` a node says, so what waits to be taken is bounded
-by the cell's events and not by its objects (told every status, the harness grew 1.8 KB an
-object, 16.6 MiB at 1k and 29.7 MiB at 10k on adacachy); the native door drives its objects on the
-client's one task (f33, f67). The harness writes nowhere but the directory its operator names, and
-runs only where its operator runs it: a case fills the volumes it states (f7).
+by the cell's events and not by its objects (told every status, the harness grew 1.5 KB an
+object, its peak resident set 16,640 KiB at 1k and 29,740 KiB at 10k on adacachy); the native door
+drives its objects on the client's one task (f33, f67). Measured on adacachy at 1k, 10k and 100k
+objects, its peak resident set was 15,520, 15,492 and 13,484 KiB and its threads four, the main
+thread and a reader a node (docs/measurements/2026-10-27-transfer-harness.md). The harness writes
+nowhere but the directory its operator names, and runs only where its operator runs it: a case
+fills the volumes it states (f7).
 
 ## Open
 
@@ -156,5 +159,4 @@ runs only where its operator runs it: a case fills the volumes it states (f7).
   state they may go without moving (each `status` line's patience, reconnect, measuring and asking,
   as the tests' cell takes them), a node's first start, measuring its devices before it says
   anything, included.
-- The memory and threads of a case of 100k objects against their stated bounds; the 10 GB and
-  100 GB cases on the owner's machines (plan step 10).
+- The 10 GB and 100 GB cases and the small sets on the owner's machines (plan step 10).

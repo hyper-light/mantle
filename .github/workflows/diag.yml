@@ -1,0 +1,51 @@
+name: diag-cluster-aarch64
+# Scratch (never merged): node's cluster suite as CI's linux-aarch64 job runs it
+# (ubuntu-24.04-arm, its tests side by side), ten rounds a job, three jobs. A failing round's
+# lines are printed: each node's suspicions with their bounds, the chunk gets a suspicion ended,
+# and those refused for a suspected peer (CI run 40672694272, 8729d338: a chunk get read back
+# Lost(Closed) in chunks_put_on_each_nodes_volume_read_back_whole_and_in_part_from_any_node).
+on:
+  push:
+    branches: ["diag/**"]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: "1"
+jobs:
+  cluster:
+    strategy:
+      fail-fast: false
+      matrix:
+        job: [a, b, c]
+    name: cluster-${{ matrix.job }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: diag-cluster-aarch64
+          workspaces: |
+            .
+            vendor
+      - name: Build the cluster suite
+        run: cargo test --locked -p mantle-node --test cluster --no-run
+      - name: The cluster suite, ten rounds
+        shell: bash
+        run: |
+          failed=0
+          for round in 1 2 3 4 5 6 7 8 9 10; do
+            echo "=== round $round"
+            if ! cargo test --locked -p mantle-node --test cluster -- --nocapture > round.log 2>&1; then
+              failed=$((failed + 1))
+              grep -aE "^test .* (ok|FAILED)|test result|diag-|panicked|left:|right:" round.log | cut -c1-600 || true
+            else
+              grep -aE "test result" round.log || true
+              grep -acE "^diag-suspected" round.log | sed 's/^/suspicions this round: /' || true
+            fi
+          done
+          echo "=== $failed of 10 rounds failed"
+          test "$failed" -eq 0

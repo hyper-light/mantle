@@ -1720,6 +1720,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let _ = self.plane.queue(peer, &message);
         }
         for change in std::mem::take(&mut self.asked.changes) {
+            if let Change::Suspected(suspicion) = &change {
+                eprintln!(
+                    "diag-suspected node {} peer {} at_ns {} noticed_ns {} detection {:?} heard {}",
+                    self.id,
+                    suspicion.peer,
+                    suspicion.at_ns,
+                    suspicion.noticed_ns,
+                    suspicion.detection,
+                    suspicion.last.is_some()
+                );
+            }
             if let Change::Suspected(suspicion) = &change
                 && let Some(remote) = self.remotes.iter_mut().find(|r| r.id == suspicion.peer)
             {
@@ -2770,6 +2781,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// §2.4). Puts wait on: a put a suspicion ended would be one lost to a detector's mistake,
     /// which a loaded host makes, and its object refused.
     fn end_chunk_gets(&mut self, peer: PeerId) {
+        eprintln!("diag-end-gets node {} peer {peer}", self.id);
         let mut ended = Vec::new();
         self.chunks_out.retain(|c| {
             let read = c.get && c.peer == peer;
@@ -2987,6 +2999,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         // A peer the detectors suspect is read from no more: the chunk is lost at once, and its
         // get asks another copy (`end_chunk_gets`).
         if at != self.id && self.remotes.iter().any(|r| r.id == at && r.suspect) {
+            eprintln!("diag-get-suspect node {} at {at}", self.id);
             self.chunks_done
                 .push((asked, ChunkOutcome::Lost(Refusal::Closed)));
             return Ok(asked);

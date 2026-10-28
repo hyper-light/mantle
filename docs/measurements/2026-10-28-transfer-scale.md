@@ -210,6 +210,20 @@ In the chunk store's tests a volume filled with records longer than half a segme
 beside it, is cleaned by no pass, background or asked for, and every pass that moves a record gains
 a segment.
 
+The probe again on the planned pass (binary 6118bc8e, fb57d055), 512 MiB objects on stated 2 GiB
+volumes, each way a case of its own, beside the two diagnostic builds and the repro loops below on
+the same machine (load 12 to 23):
+
+| Way | Objects held | Held a node of 2.15 GB | Free segment bytes | Refused | Exact | Seconds |
+|---|---|---|---|---|---|---|
+| cli | 3 | 2,013,757,440 B on each | 8,404,992 | the listener l3 typed, none otherwise | yes | 320 |
+| native-parts | 3 | 2,013,757,440 B on each | 8,404,992 | native l3 typed, none otherwise | yes | 488 |
+| boto-parts | 3 | 2,013,691,888 B on each | 8,404,992 | the listener l3 typed, none otherwise | yes | 516 |
+
+Each held what the morning's probe held, to the segment, and ended at the typed refusal where the
+morning's ended `SlowDown`; every block's chunks on distinct nodes, 18 reads after each founder's
+kill and restart with none wrong, missing or asked again, the controls caught.
+
 **Where a small put's time goes.** A diagnostic build (never merged) timed each put on the node
 that served it, on kiln-a094a12d (300 objects, 170 traced puts): the body is in at 0.4 ms; the
 three chunk copies go in parallel and the slowest is durable at 5.9 ms (each 5.0 ms at the median);

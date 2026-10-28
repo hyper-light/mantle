@@ -575,6 +575,20 @@ pub fn transfer(out: &mut impl Write, options: &Options) -> Result<bool, Transfe
             refused(done.full.get(1).copied().flatten()),
             if done.unlisted { "yes" } else { "no" },
         )?;
+        let otherwise: Vec<String> = done
+            .refused
+            .iter()
+            .map(|(i, status)| format!("l{i} {status:?}"))
+            .collect();
+        writeln!(
+            out,
+            "  large {length} refused otherwise: {}",
+            if otherwise.is_empty() {
+                "none".to_owned()
+            } else {
+                otherwise.join(", ")
+            },
+        )?;
         exact &= done.exact(options.count.is_none());
     }
     Ok(exact)

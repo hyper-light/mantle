@@ -68,6 +68,8 @@ pub struct Large {
     /// Every object refused as out of space read as no such key through both doors and was listed
     /// by neither, and every object acknowledged was listed by both.
     pub unlisted: bool,
+    /// Each object refused for other than space, with the status it was refused with.
+    pub refused: Vec<(u64, Status)>,
 }
 
 /// Object `i`'s key.
@@ -107,6 +109,7 @@ pub(super) fn large(
     let mut tallies = [Tally::new(), Tally::new(), Tally::new(), Tally::new()];
     let mut oracle = Oracle::new(budget)?;
     let mut full: [Option<u64>; 2] = [None, None];
+    let mut refused = Vec::new();
     let part = native::part_size(length);
     for i in 0..budget {
         let (way, at) = Way::of(i);
@@ -160,6 +163,8 @@ pub(super) fn large(
                 }
             } else if tally.put_came(length, came, took) {
                 oracle.set(i);
+            } else if let Came::Refused(status) = came {
+                refused.push((i, status));
             }
         }
     }
@@ -190,10 +195,16 @@ pub(super) fn large(
         }
     }
 
-    // Nothing of a refused object is readable or listed, and every acknowledged one is listed.
-    let refused: Vec<u64> = full.iter().flatten().copied().collect();
+    // Nothing of a refused object is readable or listed, whatever it was refused with, and every
+    // acknowledged one is listed.
+    let gone: Vec<u64> = full
+        .iter()
+        .flatten()
+        .copied()
+        .chain(refused.iter().map(|&(i, _)| i))
+        .collect();
     let mut unlisted = true;
-    for &i in &refused {
+    for &i in &gone {
         let settings = natives.settings(1)?;
         let (came, _) = natives.block(async move {
             let generator = Generator::new(seed)?;
@@ -232,6 +243,7 @@ pub(super) fn large(
             tallies,
             full,
             unlisted,
+            refused,
         },
         oracle,
         budget,

@@ -860,6 +860,14 @@ fn way_arg(text: &str) -> Result<transfer::large::Way, String> {
 }
 
 fn exit(result: Result<(), String>) -> ExitCode {
+    // Scratch (diag/roll-stop-bound): the process's end, stamped.
+    let line = format!(
+        "DIAG-STOP {} pid={} exit ok={}\n",
+        mantle_node::diag::wall_ms(),
+        std::process::id(),
+        result.is_ok()
+    );
+    let _ = std::io::stderr().write_all(line.as_bytes());
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

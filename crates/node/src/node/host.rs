@@ -98,6 +98,17 @@ pub(crate) struct Job {
     pending: Vec<(Pending, Option<u64>)>,
 }
 
+impl Job {
+    /// Scratch (diag/roll-stop-bound): where the job came in and what it waits on.
+    pub(super) fn diag(&self) -> String {
+        let door = match self.door {
+            Door::Exchange(_) => "exchange",
+            Door::Local(_) => "local",
+        };
+        format!("{door}:{:?}", self.pending)
+    }
+}
+
 /// Where a job's operation came in: its body is read and its reply written there.
 enum Door {
     /// A native exchange, the operation's fields at its body's start (`mantle_protocol::object`).

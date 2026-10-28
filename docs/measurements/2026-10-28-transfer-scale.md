@@ -75,6 +75,34 @@ kill and restart (6 reads, 0 wrong or missing), its controls caught; the 100G ca
 unreadable and unlisted, the key never put read missing. At today's free space a volume holds one
 10 GB object after the three copies, whatever the packing, which is what plan step 10 expected.
 
+A case at this Mac's free space holds one 10 GB object, through its first way alone, so each way
+ran a case of its own (`--ways`, binary 57146c75, 28277261, native runs of 5 MiB):
+
+| Way | Volumes (each) | Held | Put / native read / HTTP read (MiB/s) | Refused | Chunks held a node | Exact |
+|---|---|---|---|---|---|---|
+| native (runs) | 17,842,323,456 B | 1 | 33 / 202 / 299 | `InsufficientStorage` (l1) | 10.98 GB, 61.5%, 1 free segment | yes |
+| cli | 17,849,536,512 B | 1 | 62 / 140 / 364 | l1, l2 `SlowDown` | 17.28 GB, 96.8% | no |
+| native-parts | 17,818,162,517 B | 1 | 35 / 167 / 427 | l1, l2 `SlowDown` | 17.06 GB | no |
+| boto-parts | 17,815,586,133 B | 1 | 35 / 136 / 293 | l1, l2 `SlowDown` | 17.39 GB | no |
+
+Every way's object read back exact through both doors and after each founder's kill and restart (6
+reads each, 0 wrong or missing), its blocks' chunks on distinct nodes (2,048 blocks natively in
+runs, 2,560 in 8 MiB parts) and its controls caught. The three ways in 8 MiB parts ended at
+`503 SlowDown`, not the typed refusal: below, where a full cell's room goes.
+
+The box (binary ddaeea3f, dfe7399b, its native runs still S3's least part; under the 64 GB scope):
+
+| Case | Volumes (each) | Held | Put / native read / HTTP read (MiB/s) | Chunks held a node | Seconds |
+|---|---|---|---|---|---|
+| 10G | 295,415,316,480 B (1.986 TB free less 1.1 TB) | 21: native 6, CLI 5, native parts 5, boto3 parts 5 | native 40 / 293 / 565; CLI 65 / 199 / 542; native parts 40 / 218 / 600; boto3 46 / 226 / 593 | 226.3 GB, 76.6% | 11,265 |
+
+Exact: 50,688 blocks, each block's chunks on distinct nodes; every node's chunk bytes what it
+received and put; 126 reads after each founder's kill and restart, 0 wrong or missing; the controls
+caught; refused typed on both doors (native l22, the listener l21), none otherwise; one native part
+asked again. The scope peaked at 54.1 GB, the page cache of the reads (360 MB anonymous), its memory
+PSI at 0 and no OOM event; a node at most 199 MiB resident and 43 threads, the harness 13.6 MiB and
+4. 76.6% is the native objects' 5 MiB chunks at 62.4% of their segments beside the rest's at 99%.
+
 **Where a full cell's room goes.** A cell is full when one block's chunks find no node with room:
 every block needs a chunk on each of the three nodes, so the fullest node decides. A node's
 volume refuses a chunk `Full` for one of two things (chunk-store.md §5, §8): no free segment past
@@ -120,10 +148,25 @@ The cell held a third object more and its nodes 2.1 to 2.3 GB more each, every b
 distinct nodes and every object read back exact after each founder's kill and restart. The case was
 not exact: its three refusals (l3 by boto3, l4 natively in runs, l5 by the CLI) were `503 SlowDown`,
 not the typed `InsufficientStorage`, each node keeping 18 to 24 free segments at the end, past the
-one segment kept from client writes (`CLEANER_RESERVE`). Which path answered `SlowDown` (the
-gateway's admission, a node at its job bound, or a block whose chunk was refused for other than
-`Full`, `PutError::Unplaced`) is being traced; one such refusal had come before in five runs of the
-5 MiB build (a `SlowDown` on l2, native parts).
+one segment kept from client writes (`CLEANER_RESERVE`). A scratch build (never merged; binaries
+fe237607 and 09737e00) printed every refused chunk, every `SlowDown`'s path, each put a volume held
+for its cleaner's verdict and each verdict:
+
+| Probe run | `SlowDown`s by path | Chunk refusals | Puts held | Cleaner passes |
+|---|---|---|---|---|
+| fe237607 | 16 `Unplaced`, 0 admission | 14 `Busy`, 2 `Lost(Stalled)`, 0 `Full` | (not printed) | (not printed) |
+| 09737e00 | 12 `Unplaced`, 0 admission | 9 `Busy`, 7 `Lost(Budget)`, 2 `Lost(Stalled)`, 0 `Full` | 7,508 | each gained 1 to 45 segments, relocating 2 records a segment, in 45 ms to 2.9 s; no dead bytes |
+
+The cell was not full when it answered `SlowDown`: its cleaners kept freeing segments. An S3 part of
+8 MiB is cut into a 127-segment block and a 64 KiB block; a segment holding a few 64 KiB records
+cannot take the next 8.3 MB record, so it is sealed nearly empty, and near full each pass frees
+such segments by moving their small records, gaining space, so the volume never comes to the
+verdict `Full` and holds each put for the next pass (research/75). The writer holds them with the
+room they take of its queue: the chunks past that room are refused `Busy`, those past the
+transport's chunk budget `Lost(Budget)`, and those held past the transfer's progress period
+`Lost(Stalled)`; the put's driver takes each for a cause that may pass, and with no other volume
+for the block's chunk fails it `Unplaced`, answered `503 SlowDown` (node.md §4.4). The 5 MiB build
+met it once in five runs: its native records, one to a segment, leave nothing a pass can pack.
 
 **Where a small put's time goes.** A diagnostic build (never merged) timed each put on the node
 that served it, on kiln-a094a12d (300 objects, 170 traced puts): the body is in at 0.4 ms; the

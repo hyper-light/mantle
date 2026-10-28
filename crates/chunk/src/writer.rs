@@ -16,10 +16,15 @@
 //! the measured service time and the learned share of submitters that return
 //! (`hyper_block::commit`).
 //!
-//! Records go to one of two streams, each with its own open segment: new writes, and the
-//! cleaner's relocations. Keeping relocated data apart groups data by age, which is what
-//! lets later cleaning find segments that are mostly dead (Rosenblum and Ousterhout, TOCS
-//! 1992, §3.6).
+//! Records go to one of three streams, each with its own open segment: new writes, new writes
+//! too large to share a segment with another of their size, and the cleaner's relocations.
+//! Keeping relocated data apart groups data by age, which is what lets later cleaning find
+//! segments that are mostly dead (Rosenblum and Ousterhout, TOCS 1992, §3.6). A record longer
+//! than half a segment shares one with no record of its own size, so among small ones it only
+//! sealed a segment they had begun nearly empty when it did not fit after them: a 64 KiB record
+//! ahead of an 8 MiB one sealed a segment of 8 MiB with 64 KiB in it, and near full the cleaner
+//! won such segments back a pass at a time, holding new writes for each pass, so a full volume
+//! answered them `Busy` rather than `Full` (docs/measurements/2026-10-28-transfer-scale.md).
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -199,6 +204,19 @@ pub(crate) struct Shared<F> {
 pub(crate) enum Stream {
     Client = 0,
     Clean = 1,
+    /// New writes whose record is longer than half a segment: one to a segment.
+    Whole = 2,
+}
+
+impl Stream {
+    /// The stream a new write's record of `len` bytes goes to in segments of `segment` bytes.
+    fn of_write(len: u64, segment: u64) -> Self {
+        if len > segment / 2 {
+            Self::Whole
+        } else {
+            Self::Client
+        }
+    }
 }
 
 /// The writer's state, owned by its thread.
@@ -208,7 +226,7 @@ pub(crate) struct Writer<F: BlockFile> {
     pub rx: Receiver<Request>,
     pub segments: Segments,
     /// The open segment of each stream.
-    pub opens: [Option<u32>; 2],
+    pub opens: [Option<u32>; 3],
     pub incarnation: u64,
     pub sequence: u64,
     pub cursor: Cursor,
@@ -328,7 +346,7 @@ struct Layout {
     clean_opened: u64,
     sealed: Vec<(u32, u32)>,
     freed: Vec<u32>,
-    opens: [Option<u32>; 2],
+    opens: [Option<u32>; 3],
     incarnation: u64,
     /// The free segments this batch may open, lowest last.
     free: Vec<u32>,
@@ -375,10 +393,10 @@ impl Layout {
                 *o = None;
             }
         }
-        let reserve = if stream == Stream::Client {
-            CLEANER_RESERVE
-        } else {
+        let reserve = if stream == Stream::Clean {
             0
+        } else {
+            CLEANER_RESERVE
         };
         if self.free_left <= reserve {
             return None;
@@ -1739,6 +1757,11 @@ fn place_record(
     let len = record::record_len(payload_len, shift)
         .and_then(|l| u64::try_from(l).ok())
         .ok_or(ChunkError::Full)?;
+    // A new write's record goes to the stream its length takes; a relocation keeps the cleaner's.
+    let stream = match stream {
+        Stream::Clean => Stream::Clean,
+        Stream::Client | Stream::Whole => Stream::of_write(len, layout.geometry.segment_size),
+    };
     let (segment, at) = layout.place(stream, len).ok_or(ChunkError::Full)?;
     let header = RecordHeader {
         flags: put.flags,

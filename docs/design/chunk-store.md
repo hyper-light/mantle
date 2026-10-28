@@ -241,7 +241,11 @@ than the byte bound is admitted into a queue holding no other payload, and one n
 can hold is refused as `TooLarge` before it is queued. The cleaner's relocations, one batch
 at a time, pass beside the bound. The loop takes every request that arrived while the
 previous batch was being made durable,
-lays the data records into the open segment for their stream, encodes one index frame,
+lays the data records into the open segment for their stream (a new write whose record is
+longer than half a segment has a stream of its own: it shares a segment with no record of its
+size, and among smaller ones it sealed a segment they had begun nearly empty whenever it did not
+fit after them, which near full the cleaner won back a pass at a time while new writes waited,
+answered `Busy`; measurements/2026-10-28-transfer-scale.md), encodes one index frame,
 issues all of the batch's writes at once, then **one** flush of the volume (`sync_data`:
 `fdatasync`, `F_FULLFSYNC`, `FlushFileBuffers`), and only then acknowledges the batch's
 writes and publishes the new index entries to readers. Some of a batch's requests it
@@ -412,7 +416,7 @@ records, each segment's state and then each fragment, into frames in order, stre
 fragments from the index; recovery replays any frame's records alike, so a checkpoint of
 any size reads back whole. The writer refuses to write a frame past the bound, failing
 its batch, so a fault in this accounting loses nothing. Segments recovery finds open
-beyond the writer's two streams are sealed when the volume starts and recorded by a
+beyond the writer's three streams are sealed when the volume starts and recorded by a
 checkpoint then.
 
 `L` holds three checkpoints of the full budget `C_max`, one batch frame, and the wraps
@@ -625,7 +629,7 @@ the mean time client segments lived before they were cleaned, taken over each 16
 These are SepBIT's classes of rewritten data [WLL+22 §3.4], deployed at Alibaba Cloud;
 data written once and deleted later, as chunks are, has only its age to predict when it will
 die, and grouping data of like age makes segments that die together. The client's writes
-keep their own stream, as LFS kept cleaned data apart [RO92 §3.6]. Until ℓ is known, all go
+keep streams of their own (§4), as LFS kept cleaned data apart [RO92 §3.6]. Until ℓ is known, all go
 to the youngest's stream. Each segment's stream is in its segment record, so recovery
 continues each stream's newest open segment. A model of the volume's cleaning measured the
 choices against each other, uniform, hot-and-cold and heavy-tailed lifetimes at 75–90% live

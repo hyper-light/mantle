@@ -212,7 +212,7 @@ impl<F: BlockFile + Sync + 'static> Volume<F> {
         // sealed where recovery left its end, and the checkpoint below records it, so no
         // batch's frame carries more than its requests do (layout::batch_frame_payload).
         let mut opens = std::mem::take(&mut recovered.open).into_iter();
-        let (client, clean) = (opens.next(), opens.next());
+        let (client, clean, whole) = (opens.next(), opens.next(), opens.next());
         let mut sealed = 0usize;
         for segment in opens {
             if let Some(info) = usize::try_from(segment)
@@ -262,7 +262,7 @@ impl<F: BlockFile + Sync + 'static> Volume<F> {
             config,
             rx,
             segments,
-            opens: [client, clean],
+            opens: [client, clean, whole],
             incarnation: recovered.incarnation,
             sequence: recovered.sequence,
             cursor: recovered.cursor,
@@ -1576,9 +1576,37 @@ mod tests {
         assert_eq!(volume.read(&key(1), 0, 4).unwrap(), b"kept");
     }
 
-    /// Segments recovery finds open beyond the writer's two streams, which no writer of this
+    /// A new write whose record is longer than half a segment goes to a stream of its own, so the
+    /// smaller ones keep the segment they began: two records of 60 KiB, one of 200 KiB that does
+    /// not fit after them in 256 KiB, and a third of 60 KiB fill two segments, both still open,
+    /// where the 200 KiB record sealed the first with 136 KiB of it empty and the third sealed
+    /// the second with 52 KiB.
+    #[test]
+    fn a_record_longer_than_half_a_segment_takes_a_segment_of_its_own() {
+        let mut settings = config();
+        settings.scrub_period = None;
+        let volume = Volume::format(issuer(), sim(14), 8 << 20, settings).unwrap();
+        let sizes = [60usize << 10, 60 << 10, 200 << 10, 60 << 10];
+        for (n, size) in (1u64..).zip(sizes) {
+            volume.put(key(n), &vec![n as u8; size]).unwrap();
+        }
+        let used: Vec<SegmentState> = volume
+            .segments()
+            .unwrap()
+            .into_iter()
+            .map(|(state, ..)| state)
+            .filter(|state| *state != SegmentState::Free)
+            .collect();
+        assert_eq!(used, [SegmentState::Open, SegmentState::Open], "{used:?}");
+        for (n, size) in (1u64..).zip(sizes) {
+            let len = size as u64;
+            assert_eq!(volume.read(&key(n), 0, len).unwrap(), vec![n as u8; size]);
+        }
+    }
+
+    /// Segments recovery finds open beyond the writer's three streams, which no writer of this
     /// format leaves, are sealed when the volume starts and recorded by a checkpoint, so no
-    /// batch carries them (audit S13). The log here is given a frame opening two more.
+    /// batch carries them (audit S13). The log here is given a frame opening three more.
     #[test]
     fn open_segments_beyond_the_streams_are_sealed_at_start() {
         let mut settings = config();
@@ -1593,7 +1621,7 @@ mod tests {
         let recovered =
             recover::recover(&file, &mut pool, &superblock, &geometry, &settings).unwrap();
         let last = geometry.segments - 1;
-        let opened: Vec<LogRecord> = [last, last - 1]
+        let opened: Vec<LogRecord> = [last, last - 1, last - 2]
             .into_iter()
             .zip(1u64..)
             .map(|(segment, i)| {
@@ -1629,10 +1657,10 @@ mod tests {
                 .count()
         };
         let (volume, _) = Volume::open(issuer(), file.clone(), settings).unwrap();
-        assert_eq!(open(&volume), 2);
+        assert_eq!(open(&volume), 3);
         volume.close();
         let (volume, _) = Volume::open(issuer(), file.clone(), settings).unwrap();
-        assert_eq!(open(&volume), 2);
+        assert_eq!(open(&volume), 3);
         assert_eq!(volume.read(&key(1), 0, 4).unwrap(), b"kept");
     }
 

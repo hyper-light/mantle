@@ -168,6 +168,19 @@ transport's chunk budget `Lost(Budget)`, and those held past the transfer's prog
 for the block's chunk fails it `Unplaced`, answered `503 SlowDown` (node.md §4.4). The 5 MiB build
 met it once in five runs: its native records, one to a segment, leave nothing a pass can pack.
 
+**A record longer than half a segment in a stream of its own.** Such a record shares a segment with
+no record of its size, so the writer now gives it a stream of its own, and small records keep the
+segment they began. The same probe (binary 7563025f, 36f8912e):
+
+| Build | Objects held | Held a node (GB) of 8.59 | Free segments | Refused |
+|---|---|---|---|---|
+| runs of 5 MiB | 2 | 5.85 to 6.13 | 1 (fullest) | typed |
+| runs of whole blocks | 3 | 8.16 to 8.21 | 18 to 24 | 3 `SlowDown` |
+| whole blocks and the whole-record stream | 3 | 8.36 on each node (97.3%) | 1 | typed on both doors (native l4, the listener l3), none otherwise |
+
+Exact: 1,283 blocks, each block's chunks on distinct nodes, 18 reads after each founder's kill and
+restart with none wrong or missing, the controls caught.
+
 **Where a small put's time goes.** A diagnostic build (never merged) timed each put on the node
 that served it, on kiln-a094a12d (300 objects, 170 traced puts): the body is in at 0.4 ms; the
 three chunk copies go in parallel and the slowest is durable at 5.9 ms (each 5.0 ms at the median);

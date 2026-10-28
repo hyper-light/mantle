@@ -1500,10 +1500,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         let now = hyper_rt::futures::now_ns();
         let wake = self.liveness.wake();
+        // A closing node dials no peer (`Node::dial`): the redial a connection it closed asks is
+        // never made, and counted due it ended every wait at once, the stop's loop turning without
+        // a pause until its last connection drained (80,000 turns in 3.7 s without a yield, on
+        // macOS; diag/roll-stop-bound).
+        let redial = if self.closing() {
+            None
+        } else {
+            self.remotes.iter().filter_map(|r| r.redial_at).min()
+        };
         let due = [
             self.deadlines.first().map(|(at, _)| *at),
             wake,
-            self.remotes.iter().filter_map(|r| r.redial_at).min(),
+            redial,
             self.asks_due(now),
             self.reads_due(now),
             self.host_due(),

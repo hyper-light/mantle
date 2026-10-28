@@ -186,9 +186,6 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .set_tls(tls)
                 .map_err(NodeError::Transport)?;
         }
-        for remote in &mut self.remotes {
-            remote.redial_at = None;
-        }
         self.close_held()
     }
 

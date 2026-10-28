@@ -56,6 +56,9 @@ struct Asked {
     key: ChunkKey,
     offset: u64,
     len: u64,
+    /// Asked again where the chunk lies now, its first read having found a record the cleaner
+    /// moved (`Reader::take`).
+    again: bool,
 }
 
 /// A read at the device: the issuer's batch it went as, and how its transfers verify.
@@ -64,7 +67,9 @@ struct Out {
     id: ReadId,
     batch: u64,
     key: ChunkKey,
+    offset: u64,
     len: u64,
+    again: bool,
     cost: u64,
     pieces: Vec<Piece>,
 }
@@ -137,6 +142,7 @@ impl Reader {
             key: *key,
             offset,
             len,
+            again: false,
         };
         if self.waiting.is_empty() {
             let planned = plan(volume, &asked, &fragments)?;
@@ -184,8 +190,9 @@ impl Reader {
             };
             match numbered {
                 Ok((batch, answer)) => {
-                    if let Some(taken) = self.take(volume, batch, answer) {
-                        self.send_waiting(volume);
+                    let taken = self.take(volume, batch, answer);
+                    self.send_waiting(volume);
+                    if let Some(taken) = taken {
                         return Poll::Ready(Some(taken));
                     }
                 }
@@ -265,7 +272,9 @@ impl Reader {
             id: asked.id,
             batch,
             key: asked.key,
+            offset: asked.offset,
             len: asked.len,
+            again: asked.again,
             cost: planned.cost,
             pieces: planned.pieces,
         });
@@ -321,6 +330,35 @@ impl Reader {
             )),
             Err(error) => Err(corrupt(&out.key, &format!("read failed: {error}"))),
         };
+        // A record the cleaner moved after the read found it, its segment freed and written
+        // again, fails its check where it was found: no damage (`Volume::read_from`). The chunk
+        // is read again where it lies now, waiting first in line; moved again meanwhile it is
+        // answered `Busy`, a cause that may pass, and gone it is answered so.
+        if matches!(result, Err(ChunkError::Corrupt { .. })) {
+            match volume.fragments(&out.key, out.offset, out.len) {
+                Ok(now)
+                    if !out
+                        .pieces
+                        .iter()
+                        .map(|p| p.fragment)
+                        .eq(now.iter().copied()) =>
+                {
+                    if out.again {
+                        return Some((out.id, Err(ChunkError::Busy)));
+                    }
+                    self.waiting.push_front(Asked {
+                        id: out.id,
+                        key: out.key,
+                        offset: out.offset,
+                        len: out.len,
+                        again: true,
+                    });
+                    return None;
+                }
+                Err(gone) => return Some((out.id, Err(gone))),
+                Ok(_) => {}
+            }
+        }
         Some((out.id, result))
     }
 }
@@ -472,5 +510,143 @@ fn corrupt(key: &ChunkKey, detail: &str) -> ChunkError {
     ChunkError::Corrupt {
         key: *key,
         detail: detail.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device::sim;
+    use crate::layout::{Config, Limits};
+    use hyper_block::issuer::Issuer;
+    use hyper_rt::machine::facts::Facts;
+    use hyper_rt::runtime::{LocalRuntime, RuntimeConfig, interests_for};
+    use std::future::poll_fn;
+
+    /// The issuer of the one device these tests' volumes are on, four transfers in flight.
+    fn issuer() -> &'static Issuer {
+        static ISSUER: std::sync::OnceLock<Issuer> = std::sync::OnceLock::new();
+        ISSUER.get_or_init(|| Issuer::start(std::path::Path::new("test device"), 4).unwrap())
+    }
+
+    fn key(n: u64) -> ChunkKey {
+        ChunkKey {
+            block: u128::from(n),
+            epoch: 1,
+            index: 0,
+        }
+    }
+
+    /// One shard with one task: the reader's owner.
+    fn runtime() -> LocalRuntime {
+        LocalRuntime::new(&RuntimeConfig {
+            shards: 1,
+            tasks_per_shard: 1,
+            timers_per_shard: 1,
+            interests_per_shard: interests_for(1),
+            ring_entries: 1,
+            step_budget_ns: 1_000_000_000,
+            timer_tick_ns: 100_000,
+            batch: 1,
+            pin: false,
+            cores: Vec::new(),
+            page_bytes: usize::try_from(Facts::query().page.base).unwrap(),
+            spin_ns: 0,
+            wake_tracking: None,
+            latency_objective_ns: None,
+        })
+        .unwrap()
+    }
+
+    /// A read at the device whose record the cleaner moved after the read found it, the segment
+    /// then freed and written again, fails its check where it was found: no damage. It was
+    /// answered `Corrupt`, the status a node answers a peer's get with; it is read again where the
+    /// chunk lies now. Its batch's bytes here are what the device holds at the old place.
+    #[test]
+    fn a_read_whose_record_the_cleaner_moved_is_read_again_where_it_lies_now() {
+        let volume = Volume::format(
+            issuer(),
+            sim(18),
+            8 << 20,
+            Config {
+                segment_size: 256 << 10,
+                checksum_shift: 12,
+                max_fragments: 2000,
+                compact: true,
+                scrub_period: None,
+                limits: Limits {
+                    batch_requests: 64,
+                    batch_bytes: 1 << 20,
+                    fragments_per_chunk: 64,
+                },
+                prewrite: false,
+                reads: Reads::default(),
+            },
+        )
+        .unwrap();
+        // Four chunks a segment: the first two segments, half dead, pack into one.
+        let chunk = |n: u64| vec![n as u8; 50 << 10];
+        for n in 0..12 {
+            volume.put(key(n), &chunk(n)).unwrap();
+        }
+        for n in [0, 1, 4, 5] {
+            volume.delete(key(n)).unwrap();
+        }
+        let len = 50u64 << 10;
+        let asked = Asked {
+            id: 7,
+            key: key(2),
+            offset: 0,
+            len,
+            again: false,
+        };
+        let found = volume.fragments(&key(2), 0, len).unwrap();
+        let planned = plan(&volume, &asked, &found).unwrap();
+        assert_eq!(volume.clean(2).unwrap().gained, 1);
+        for n in 100..120 {
+            volume.put(key(n), &chunk(n)).unwrap();
+        }
+        let file = &volume.shared().file;
+        let transfers: Vec<(AlignedBuf, u64)> = planned
+            .spans
+            .iter()
+            .map(|span| {
+                let mut buf = AlignedBuf::zeroed(span.span, file.alignment()).unwrap();
+                buf.set_len(span.span).unwrap();
+                file.read_exact_at(buf.as_mut_slice(), span.at).unwrap();
+                (buf, span.at)
+            })
+            .collect();
+        let mut reader = volume.reader(issuer()).unwrap();
+        reader.out.push(Out {
+            id: asked.id,
+            batch: u64::MAX,
+            key: asked.key,
+            offset: 0,
+            len,
+            again: false,
+            cost: planned.cost,
+            pieces: planned.pieces,
+        });
+        reader.bytes = planned.cost;
+        assert!(reader.take(&volume, u64::MAX, Ok(transfers)).is_none());
+        assert_eq!(reader.waiting.len(), 1);
+        let answers = runtime()
+            .block_on(async move {
+                let mut answers = Vec::new();
+                while let Some(answer) = poll_fn(|cx| reader.poll_next(&volume, cx)).await {
+                    answers.push(answer);
+                }
+                answers
+            })
+            .unwrap();
+        assert!(
+            matches!(answers.as_slice(), [(7, Ok(bytes))] if *bytes == chunk(2)),
+            "{:?}",
+            answers
+                .iter()
+                .map(|(id, a)| (id, a.as_ref().map(Vec::len)))
+                .collect::<Vec<_>>()
+        );
     }
 }

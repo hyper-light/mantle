@@ -478,7 +478,15 @@ fragment's header with its checksum table and the checksum blocks the range touc
 verifies them (§3.1). A checksum, identity or incarnation mismatch, or `EIO`, is one
 condition: a typed `Corrupt` error naming the chunk, returned to the caller (which reads
 another replica or fragment) and reported for repair [GAA17 §4; research/03 X1]. The node
-never crashes and never returns unverified bytes.
+never crashes and never returns unverified bytes. A read finds its fragments in the index and
+reads them later, after its turn at the device, and the cleaner may move a record meanwhile and
+the writer free its segment and write it again: the record then fails its check where the read
+found it, as a damaged one would, and was answered `Corrupt` with the chunk whole elsewhere on
+the volume. A failed check is weighed as the cleaner and the scrubber weigh one (§8): a record moved or
+deleted since the read found it is no damage. The read looks for the chunk again and is made again where
+it lies now, `NotFound` if it is gone; moved again while that read waited, the chunk is answered
+`Busy`, a cause that may pass and that the caller asks again; still where it was found, the
+failure is the record's and `Corrupt` stands (`Volume::read_from`, `Reader::take`).
 
 The header and the blocks are one read when the payload between them is no larger than the
 volume's read gap, and two reads otherwise. A read costs the device an access and then its

@@ -657,12 +657,56 @@ impl<F: BlockFile + Sync + 'static> Volume<F> {
         out: &mut Vec<u8>,
         buffers: &mut ReadBuffers,
     ) -> Result<(), ChunkError> {
+        let found = self.fragments(key, offset, len)?;
+        self.read_from(key, (offset, len), &found, out, buffers)
+    }
+
+    /// Reads bytes `[offset, offset + len)` of `key`'s chunk from the fragments the index named
+    /// when the read began. The cleaner may have moved a record since and the writer freed its
+    /// segment and written it again, so a record that fails its check where it was found is
+    /// looked for again: one moved or deleted since is no damage, as the scrubber judges
+    /// (`scrub::damaged_owner`), and the read is made again where the chunk lies now. Moved
+    /// again while that read waited, the chunk is answered `Busy`, a cause that may pass; still
+    /// where it was found, the failure is the record's.
+    pub(crate) fn read_from(
+        &self,
+        key: &ChunkKey,
+        (offset, len): (u64, u64),
+        found: &[Fragment],
+        out: &mut Vec<u8>,
+        buffers: &mut ReadBuffers,
+    ) -> Result<(), ChunkError> {
+        let failed = match self.read_fragments(key, (offset, len), found, out, buffers) {
+            Err(e @ ChunkError::Corrupt { .. }) => e,
+            read => return read,
+        };
+        let now = self.fragments(key, offset, len)?;
+        if now == found {
+            return Err(failed);
+        }
+        match self.read_fragments(key, (offset, len), &now, out, buffers) {
+            Err(ChunkError::Corrupt { .. }) if self.fragments(key, offset, len)? != now => {
+                Err(ChunkError::Busy)
+            }
+            read => read,
+        }
+    }
+
+    /// Reads bytes `[offset, offset + len)` of `key`'s chunk from `fragments` into `out`,
+    /// verified, taking a turn at the device for them.
+    fn read_fragments(
+        &self,
+        key: &ChunkKey,
+        (offset, len): (u64, u64),
+        fragments: &[Fragment],
+        out: &mut Vec<u8>,
+        buffers: &mut ReadBuffers,
+    ) -> Result<(), ChunkError> {
         out.clear();
-        let fragments = self.fragments(key, offset, len)?;
         let end = offset.saturating_add(len);
         // The fragments are read one at a time, so the read buffers the most any one needs.
         let mut cost = 0u64;
-        for fragment in &fragments {
+        for fragment in fragments {
             let from = offset
                 .max(fragment.chunk_offset)
                 .saturating_sub(fragment.chunk_offset);
@@ -688,7 +732,7 @@ impl<F: BlockFile + Sync + 'static> Volume<F> {
             usize::try_from(len).map_err(|_| ChunkError::TooLarge { len, max: u64::MAX })?;
         out.try_reserve(capacity)
             .map_err(|_| ChunkError::TooLarge { len, max: 0 })?;
-        for fragment in &fragments {
+        for fragment in fragments {
             let from = offset
                 .max(fragment.chunk_offset)
                 .saturating_sub(fragment.chunk_offset);
@@ -1708,6 +1752,45 @@ mod tests {
                 vec![n as u8; len]
             );
         }
+    }
+
+    /// A read that found a chunk's record before the cleaner moved it, its segment then freed and
+    /// written again, reads the chunk where it lies now: the record that fails its check where it
+    /// was found moved, and is no damage. It was answered `Corrupt` ("record identity does not
+    /// match the index"), which the node answers a peer's get with.
+    #[test]
+    fn a_read_whose_record_the_cleaner_moved_reads_it_where_it_lies_now() {
+        let mut settings = config();
+        settings.scrub_period = None;
+        let volume = Volume::format(issuer(), sim(17), 8 << 20, settings).unwrap();
+        // Four chunks a segment: the first two segments, half dead, pack into one.
+        let chunk = |n: u64| vec![n as u8; 50 << 10];
+        for n in 0..12 {
+            volume.put(key(n), &chunk(n)).unwrap();
+        }
+        for n in [0, 1, 4, 5] {
+            volume.delete(key(n)).unwrap();
+        }
+        let len = 50u64 << 10;
+        let found = volume.fragments(&key(2), 0, len).unwrap();
+        let report = volume.clean(2).unwrap();
+        assert_eq!((report.segments, report.gained), (2, 1), "{report:?}");
+        assert_ne!(volume.fragments(&key(2), 0, len).unwrap(), found);
+        // New chunks take the segments the cleaner freed.
+        for n in 100..120 {
+            volume.put(key(n), &chunk(n)).unwrap();
+        }
+        let mut buffers = volume.read_buffers();
+        let mut out = Vec::new();
+        let mut stale = Vec::new();
+        assert!(matches!(
+            volume.read_fragments(&key(2), (0, len), &found, &mut stale, &mut buffers),
+            Err(ChunkError::Corrupt { .. })
+        ));
+        volume
+            .read_from(&key(2), (0, len), &found, &mut out, &mut buffers)
+            .unwrap();
+        assert_eq!(out, chunk(2));
     }
 
     /// Segments recovery finds open beyond the writer's three streams, which no writer of this

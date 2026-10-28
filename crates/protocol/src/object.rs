@@ -136,14 +136,14 @@ pub const MAX_HEAD: usize = if HEAD_BYTES > REPLY_HEAD_BYTES {
 };
 
 /// An object's largest message, head and body: a put of S3's largest single upload behind the
-/// longest fields a request opens its body with and a trailer's checksum, or a get's reply of as
-/// many bytes behind the longest fields a reply opens its body with. The transfer class's bound at
-/// the least, at a node and at its clients.
+/// longest fields a request opens its body with and a trailer's checksum, or a get's reply of S3's
+/// largest single GET behind the longest fields a reply opens its body with (05 §4.1). An object
+/// put in runs or parts passes a single upload's 5 GiB, and one GET returns it whole to 5 TB. The
+/// transfer class's bound at the least, at a node and at its clients.
 pub const MAX_MESSAGE: u64 = {
-    let request = HEAD_BYTES + MAX_FIELDS + MAX_CHECKSUM;
-    let reply = REPLY_HEAD_BYTES + MAX_REPLY_FIELDS;
-    let longest = if request > reply { request } else { reply };
-    mantle_s3::body::MAX_UPLOAD + longest as u64
+    let request = mantle_s3::body::MAX_UPLOAD + (HEAD_BYTES + MAX_FIELDS + MAX_CHECKSUM) as u64;
+    let reply = mantle_s3::body::MAX_GET + (REPLY_HEAD_BYTES + MAX_REPLY_FIELDS) as u64;
+    if request > reply { request } else { reply }
 };
 
 /// A request's fields at most: the longest of a put's or a part's (its names, an upload's ID and a

@@ -345,7 +345,12 @@ A GET reads top down (`get.rs`), from the version the Name range read, whose pre
 lock and range the S3 layer has judged. On a node, the host reads that version by ReadIndex and
 judges the request's preconditions with `mantle_s3::conditional` and its range with
 `mantle_s3::range` before it makes the `Get`; a HEAD stops there, answered with the version's
-facts (node.md §5.1, as built):
+facts (node.md §5.1, as built). One GET returns at most S3's single GET, 5 TB, the object whole or
+its range in one reply on either door; past it the GET is refused `EntityTooLarge`, as S3 answers
+405, and the object, which parts take to 48.8 TiB, is read in ranges (research/05 §4.1). The
+native door's transfer class is bounded for that reply, not for a single upload's 5 GiB: bounded
+so, a GET of an object put in runs past 5 GiB was refused by the transport and failed (plan step
+10's 10 GiB objects, 2026-10-27):
 
 1. The version's File header. A file of blocks has its data key, which is unwrapped; a file of
    parts names, by plaintext, the part holding each byte, and each part is read as a file of

@@ -251,6 +251,15 @@ pub fn reply(echo: &Echo<'_>, reply: &Reply, ids: &Ids) -> Result<Response, Refu
             version(reply, &mut response.fields);
             Ok(response)
         }
+        // A read past S3's single GET: `EntityTooLarge` in its download form (05 §4.1, §11.2).
+        Status::EntityTooLarge if matches!(echo.route.operation, Operation::GetObject) => {
+            let refused = Refused::new(
+                "EntityTooLarge",
+                405,
+                "Your proposed download exceeds the maximum allowed size",
+            );
+            Ok(error(&refused, &resource, ids, echo.head))
+        }
         status => Ok(error(&refusal(status), &resource, ids, echo.head)),
     }
 }
@@ -649,4 +658,49 @@ fn list_uploads(echo: &Echo<'_>, reply: &Reply) -> Result<String, Refused> {
         },
     })
     .map_err(time)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn answered(operation: Operation) -> Response {
+        let route = Route {
+            operation,
+            bucket: Some("bucket".into()),
+            key: Some("key".into()),
+        };
+        let query = Query::parse("");
+        let echo = Echo {
+            route: &route,
+            query: &query,
+            principal: "owner",
+            region: "us-east-1",
+            head: false,
+            checksums: false,
+        };
+        let ids = Ids {
+            request: "request".into(),
+            host: "host".into(),
+        };
+        reply(&echo, &Reply::status(Status::EntityTooLarge), &ids).unwrap()
+    }
+
+    /// A read past S3's single GET is refused in `EntityTooLarge`'s download form, 405, and an
+    /// upload past a single PUT in its upload form, 400 (05 §4.1, §11.2).
+    #[test]
+    fn entity_too_large_answers_a_get_as_a_download_and_a_put_as_an_upload() {
+        let get = answered(Operation::GetObject);
+        assert_eq!(get.status, 405);
+        let document = String::from_utf8(get.document).unwrap();
+        assert!(
+            document.contains("<Code>EntityTooLarge</Code>"),
+            "{document}"
+        );
+        assert!(document.contains("proposed download exceeds"), "{document}");
+        let put = answered(Operation::PutObject);
+        assert_eq!(put.status, 400);
+        let document = String::from_utf8(put.document).unwrap();
+        assert!(document.contains("proposed upload exceeds"), "{document}");
+    }
 }

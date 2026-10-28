@@ -42,6 +42,12 @@ pub const MIN_PART: u64 = 5 << 20;
 /// an upload S3 takes.
 pub const MAX_UPLOAD: u64 = 5 << 30;
 
+/// Bytes one GetObject returns at most (05 §4.1): "Single GET requests are limited to 5 TB, and
+/// you will receive a `405 - Method Not Allowed` error for GET requests beyond 5 TB"; an object of
+/// many parts runs past it, to 48.8 TiB, and is read in ranges. The binary figure never refuses a
+/// read S3 serves.
+pub const MAX_GET: u64 = 5 << 40;
+
 /// "The request can contain a list of up to 1,000 keys" (05 §8.1).
 pub const MAX_OBJECTS: usize = 1000;
 

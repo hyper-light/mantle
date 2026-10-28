@@ -1726,6 +1726,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return self.reply_job(at, reply);
         }
         let length = served.end.saturating_sub(served.start);
+        // One GET returns at most S3's single GET; an object past it is read in ranges (05 §4.1).
+        if length > mantle_s3::body::MAX_GET {
+            return self.fail_job(at, Status::EntityTooLarge);
+        }
         match Get::new(version.file, size, served, Box::new(keyring), window) {
             Ok(get) => getting.get = Some(get),
             Err(_) => return self.fail_job(at, Status::Failed),

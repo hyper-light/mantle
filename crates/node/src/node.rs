@@ -824,7 +824,8 @@ pub fn message_bounds<E>(ranges: &[Hosted<E>], chunk_bytes: u64) -> Result<Bound
         .checked_add(u64::try_from(command::HEAD_BYTES).map_err(|_| unfit())?)
         .ok_or_else(unfit)?;
     // A chunk's put carries the chunk behind its head; a get's reply, the bytes asked. An object's
-    // message is at most `object::MAX_MESSAGE`, a single upload's (S3's 5 GiB) behind its fields.
+    // message is at most `object::MAX_MESSAGE`: a single upload's request (S3's 5 GiB) or a single
+    // GET's reply (S3's 5 TB), behind its fields.
     let chunk_head = chunk::PUT_HEAD_BYTES
         .max(chunk::GET_HEAD_BYTES)
         .max(chunk::REPLY_HEAD_BYTES);

@@ -678,6 +678,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/s3/src/body.rs` `MAX_REGION` | external | A region name is a DNS label, at most 63 octets (RFC 1035 §2.3.4). |
 | `crates/s3/src/body.rs` `MIN_PART` | external | The S3 minimum part size of 5 MiB, with no minimum for the last part (docs/research/05 §4.1, AWS S3 multipart limits); the Name range's (`mantle_meta::name::MIN_PART`) and a client's single run are this. |
 | `crates/s3/src/body.rs` `MAX_UPLOAD` | external | AWS S3 limits via 05 §4.1: a part runs 5 MiB to 5 GiB and a single PUT to 5 GB; 5 << 30 is the binary reading, so it never refuses an upload S3 accepts. |
+| `crates/s3/src/body.rs` `MAX_GET` | external | AWS S3 limits via 05 §4.1: "Single GET requests are limited to 5 TB", 405 past it, an object of many parts running to 48.8 TiB read in ranges; 5 << 40 is the binary reading, so it never refuses a read S3 serves. |
 | `crates/s3/src/body.rs` `MAX_VERSION_ID` | external | AWS S3 docs via 13 §6.4: version IDs are opaque strings "no more than 1,024 bytes long". |
 | `crates/s3/src/body.rs` `OBJECT_LOCK_LIMIT` | derived | (prolog + ObjectLockConfiguration markup with the longest mode and an `xs:int` period). |
 | `crates/s3/src/body.rs` `OBJECT_TAGGING_LIMIT` | derived | (TAGGING + 10 object tags × TAG). |

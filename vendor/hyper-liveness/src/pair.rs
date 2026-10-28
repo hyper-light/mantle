@@ -286,6 +286,25 @@ impl Stream {
         }
     }
 
+    /// The peer can be reached from `now_ns` (`Pair::reachable`): a stream backed off while the peer
+    /// said nothing has its next heartbeat due at once, the schedule starting anew there, sent as a
+    /// flush proves it. Its back-off runs on, each heartbeat stating its gap and the next coming at
+    /// twice that at most, the rule the peer reads off each ([`unanswered_next`]), until the peer's
+    /// first heartbeat answers it (`heard`). Whether one came due.
+    fn reached(&mut self, now_ns: u64) -> bool {
+        if self.unanswered == 0 {
+            return false;
+        }
+        match self.next {
+            Some((seq, due)) if due > now_ns => {
+                self.next = Some((seq, now_ns));
+                self.expected_ns = Some(now_ns);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// The stream sends its next number at once, at `now_ns`, the schedule starting anew there:
     /// the peer started its next run after announcing the end of the last, and was sent nothing
     /// since, where the slots of the stop would have been skipped, each the next heartbeat's
@@ -462,6 +481,24 @@ impl Pair {
     /// judged from the first such poll.
     pub(crate) fn attached(&mut self, now_ns: u64) {
         self.unheard.since_ns.get_or_insert(now_ns);
+    }
+
+    /// The owner can reach the peer from `now_ns`: a connection to it is made, and its path holds
+    /// keys. A peer from which nothing has come is judged from here unless it is suspected already
+    /// (a suspicion told holds until a heartbeat answers it): the silence before, when no heartbeat
+    /// of either side could arrive, is no evidence of its. And a stream backed off while nothing
+    /// came sends at the first flush that proves a heartbeat (`Stream::reached`), not at its
+    /// backed-off slot, which the peer, judging this node from here as well, waited out seconds
+    /// past its freshness point. Whether the pair's judgment or schedule moved, which the next
+    /// poll states.
+    pub(crate) fn reachable(&mut self, now_ns: u64) -> bool {
+        let judged = self.received.link.is_none() && !self.unheard.suspected;
+        if judged {
+            self.unheard.since_ns = Some(now_ns);
+            self.unheard.until_ns = None;
+        }
+        let sends = self.stream.reached(now_ns);
+        judged || sends
     }
 
     /// Whether the pair has heard its peer and judges it by no margin yet: the node's evidence's is

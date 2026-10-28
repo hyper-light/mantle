@@ -994,7 +994,13 @@ hosts, and they elect by suspicion over it; items 1, 2, 4, 5, 6 and 7 are built,
   range never campaigned (its term stayed 0 on one CPU).
 - (2) hyper-rt-transport's `PlaneSocket` stamps each datagram in the kernel where the platform
   does; the owner reads its clock, drains the plane's socket, and polls the stream at that clock
-  only when the drain found the socket empty, so every heartbeat stamped before it was fed.
+  only when the drain found the socket empty, so every heartbeat stamped before it was fed. A
+  connection made to a peer keys its path, and the owner tells the stream the peer is reachable
+  (`Liveness::reachable`): a peer never heard is judged from then, not over the time its path had
+  no keys, and a stream backed off meanwhile sends at its next flush, not at its backed-off slot.
+  Without it, founders started tens of seconds apart on one CPU, each measuring its devices first,
+  suspected each other as soon as the third gave them evidence, and a survivor took the suspicion
+  of its range's next leader into the term (the roll test, 2026-10-28).
 - (3) A member's id is its node's, and a node keeps a pair for each node it is told of; placement's
   map and its bound on pairs are not built (§7).
 - (4) The run is kept as hyper-block's `record` in the node's directory (`crates/node/src/layout.rs`).

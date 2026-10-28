@@ -1920,7 +1920,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// Keys the plane for the connection of `epoch` to `peer`: both ends derive the same secret
     /// and the same epoch number from the connection's TLS exporter, so a datagram one seals the
     /// other opens; each new connection replaces the last one's keys.
-    fn key_plane(&mut self, peer: PeerId, _epoch: u64, _now: u64) -> Result<(), NodeError> {
+    fn key_plane(&mut self, peer: PeerId, _epoch: u64, now: u64) -> Result<(), NodeError> {
         let mut secret = [0u8; SECRET_BYTES];
         let mut number = [0u8; 4];
         let endpoint = self.driver.endpoint();
@@ -1958,7 +1958,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             remote.redial_at = None;
             remote.backoff = backoff;
         }
-        Ok(())
+        // The stream can hear the peer from now: a peer never heard is judged from here, not over
+        // the time its path had no keys, and a stream to it backed off meanwhile sends at its next
+        // flush (`Liveness::reachable`; founders started tens of seconds apart on one CPU suspected
+        // each other at once, the roll test). A peer that shares no range yet has no pair to tell:
+        // its pair, attached later, judges from then.
+        match self.liveness.reachable(peer, now) {
+            Ok(()) | Err(hyper_liveness::Refusal::UnknownPeer) => Ok(()),
+            Err(refusal) => Err(NodeError::Liveness(refusal)),
+        }
     }
 
     /// A peer's connection went: what this node kept for it goes ([`Self::unkey`]), and a peer

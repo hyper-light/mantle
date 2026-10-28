@@ -814,6 +814,20 @@ impl Liveness {
         Ok(())
     }
 
+    /// The owner can reach `peer` from `now_ns`: its path to the peer holds keys, a connection made.
+    /// A pair that has heard nothing from the peer judges its silence from here, and a stream backed
+    /// off while nothing came sends at the first flush that proves a heartbeat, not at its
+    /// backed-off slot (`docs/timing.md` §3, item 10): the time before, a peer not yet started or
+    /// its path not yet up, is no silence of the peer's. Where either moved, [`wake`](Self::wake)
+    /// asks a poll at `now_ns`.
+    pub fn reachable(&mut self, peer: PeerId, now_ns: u64) -> Result<(), Refusal> {
+        let pair = self.pairs.get_mut(&peer).ok_or(Refusal::UnknownPeer)?;
+        if pair.reachable(now_ns) {
+            self.next_wake = Some(self.next_wake.map_or(now_ns, |wake| wake.min(now_ns)));
+        }
+        Ok(())
+    }
+
     /// The expected time from a suspicion of `peer` to a new leader, `T_E`, which its detector is
     /// configured to charge each election (`hyper_timing::Costs::election`): the election law's
     /// span over the groups whose leader that node is (the mean over them minimizes their summed

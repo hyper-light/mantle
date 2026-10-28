@@ -1855,6 +1855,96 @@ fn a_peer_never_heard_from_is_suspected() {
     }
 }
 
+/// Item 10 of `docs/timing.md` §3: nodes that can reach each other only long after they attached
+/// their pairs judge each other by none of the silence before. Two nodes hear nothing for a minute
+/// from their start, as founders started one after another, each measuring its devices first, hear
+/// no peer not yet up, and their streams to each other, unanswered, back off to seconds; then a
+/// third starts and all three can reach each other. Each owner is told so as it keys its path to
+/// the peer (`Liveness::reachable`), the second only once its host, starved as its path came up,
+/// runs again, after the first has the evidence to judge a peer never heard. Every suspicion of a
+/// peer never heard states a point past the moment its node could reach it, and every stream backed
+/// off sends at the first flush after that moment. Judged from the attach, the first suspected the second
+/// at a point a minute before, as soon as the third's heartbeats gave it evidence: mantle's roll test
+/// on one CPU, where a survivor took the suspicion of its range's next leader into the term
+/// (2026-10-28). Sent at the backed-off slot, a peer alive and reachable came seconds past a point
+/// half a second on. A suspicion of a peer heard is the detector's rule's, traced as any
+/// (`Sim::traced`): a young link's margin judges a flush the peer's disk held past it, as at any
+/// start.
+#[test]
+fn nodes_that_reach_each_other_late_judge_no_silence_from_before() {
+    for world in [MACOS, BUSY, LINUX, WINDOWS] {
+        let name = world.name;
+        for seed in seeds(17, 8) {
+            let mut sim = Sim::new(3, world, seed);
+            sim.nodes[0].deaf = true;
+            sim.nodes[1].deaf = true;
+            sim.nodes[2].alive = false;
+            let apart = 60_000 * MS;
+            sim.run_while(|_| true, Some(apart));
+            sim.nodes[0].deaf = false;
+            sim.nodes[1].deaf = false;
+            sim.nodes[2].alive = true;
+            let reached = sim.now;
+            let cap = reached + apart;
+            sim.nodes[1].frozen_until = cap;
+            for (node, peers) in [(0usize, [2u64, 3]), (2, [1, 2])] {
+                for peer in peers {
+                    sim.nodes[node].liveness.reachable(peer, reached).unwrap();
+                }
+                sim.poll(node);
+            }
+            sim.run_while(
+                |sim| !sim.nodes[0].liveness.report(2).unwrap().judged,
+                Some(cap),
+            );
+            assert!(
+                sim.nodes[0].liveness.report(2).unwrap().judged,
+                "{name} seed {seed}: node 1 had no evidence in a minute"
+            );
+            let thawed = sim.now;
+            sim.nodes[1].frozen_until = thawed;
+            for peer in [1, 3] {
+                sim.nodes[1].liveness.reachable(peer, thawed).unwrap();
+            }
+            sim.thaw(1);
+            // Past the backed-off streams' seconds, ten times over.
+            sim.run_while(|_| true, Some(thawed + 30_000 * MS));
+            let reachable = [reached, thawed, reached];
+            for (index, node) in sim.nodes.iter().enumerate() {
+                for suspicion in node.suspicions.iter().filter(|s| s.last.is_none()) {
+                    assert!(
+                        suspicion.at_ns > reachable[index],
+                        "{name} seed {seed}: node {} judged silence from before: {suspicion:?}",
+                        index + 1
+                    );
+                }
+            }
+            // The two nodes heard nothing for the minute: each of their streams backed off, and
+            // each sends at the first flush that proves a heartbeat once its node can reach the peer.
+            for (index, node) in sim.nodes.iter().enumerate().take(2) {
+                let flushed = *node
+                    .durable
+                    .iter()
+                    .find(|at| **at >= reachable[index])
+                    .expect("a flush once reachable");
+                for peer in (1..=3u64).filter(|peer| *peer != node.owner.id) {
+                    let (_, _, beat) = node
+                        .log
+                        .iter()
+                        .find(|(at, to, _)| *to == peer && *at >= reachable[index])
+                        .expect("a heartbeat once reachable");
+                    assert!(
+                        beat.sent_ns <= flushed,
+                        "{name} seed {seed}: node {} flushed at {flushed} and sent {peer} later, at \
+                         a backed-off slot: {beat:?}",
+                        index + 1
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Item 10 of `docs/timing.md` §3, with three nodes: a peer that dies in its links' first
 /// heartbeats, before any pair has its own evidence, leaves each survivor one live link, whose
 /// configuration lengthens its interval to its best (seconds, on Windows' timer), and a pool fed at

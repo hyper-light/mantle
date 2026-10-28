@@ -87,9 +87,17 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `f5a7dbd` (hyper-raft branch `owner-holds-body`: `f2ad9c2` and one commit, made
-for mantle's fill test on windows-x86_64), with no local delta**, taken by
-`scripts/snapshot-hyper-raft.py` (Python 3.11 or later). Its commit changes hyper-transport alone:
+**Every crate at `c68032a` (hyper-raft branch `liveness-reachable`: `f5a7dbd` and one commit, made
+for mantle's roll test), with no local delta**, taken by `scripts/snapshot-hyper-raft.py` (Python
+3.11 or later). Its commit changes hyper-liveness alone: `Liveness::reachable`, which the node
+calls as it keys a peer's path, judges a peer never heard from then rather than from the pair's
+attach, and has a stream backed off while nothing came send at its next flush rather than its
+backed-off slot; founders started tens of seconds apart on one CPU suspected each other at once
+and a survivor took the suspicion of its range's next leader into the term (hyper-raft
+docs/timing.md §3, item 10; mantle CI on linux-x86_64, macos-aarch64 and linux-aarch64 at one
+CPU). Before it, every crate was at `f5a7dbd` (hyper-raft branch `owner-holds-body`: `f2ad9c2` and
+one commit, made for mantle's fill test on windows-x86_64), with no local delta, taken by
+`scripts/snapshot-hyper-raft.py`. Its commit changes hyper-transport alone:
 an owner that read part of a body, its last read wanting more than had arrived, and then holds the
 rest unread while its peer fills the window, is no longer judged against the peer; a node holding a
 PutObject's body while the chunks it carries go durable refused the exchange `Stalled` on its own

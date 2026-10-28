@@ -75,8 +75,8 @@ pub enum StorageError {
         first: PathBuf,
         second: PathBuf,
     },
-    /// The chunks the volumes hold count past a `u64` of bytes.
-    #[error("the chunks the volumes hold count past {0} bytes")]
+    /// What the volumes hold, or the room they have, counts past a `u64`.
+    #[error("what the volumes hold counts past {0}")]
     Counted(u64),
 }
 
@@ -119,7 +119,24 @@ struct Held {
     dir: PathBuf,
     reader: Reader,
     volume: Volume<DeviceFile>,
+    /// The fragments its index may hold (`mantle_chunk::Config::max_fragments`): a put past
+    /// them is refused `Full` whatever its segments hold.
+    budget: u64,
     _lock: File,
+}
+
+/// What a node's volumes hold of chunks and the room they have for more, in the two things that
+/// refuse a put `Full` (docs/design/chunk-store.md §5, §8): free segments and the index's
+/// fragments.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Holding {
+    /// The bytes of the chunks the volumes hold, each chunk's length as its volume's index keeps
+    /// it: what a chunk's put wrote, whoever asked it.
+    pub bytes: u64,
+    /// The fragments those chunks are kept in, and the most the volumes' indexes may hold.
+    pub fragments: (u64, u64),
+    /// The bytes of the volumes' free segments, where chunks are written next.
+    pub free: u64,
 }
 
 /// A device's issuer, and the name the OS gives the device, which its volumes share it by.
@@ -208,6 +225,7 @@ impl Storage {
             dir: settings.dir.clone(),
             reader,
             volume,
+            budget: settings.config.max_fragments,
             _lock: lock,
         });
         Ok(())
@@ -313,10 +331,10 @@ impl Storage {
         Ok(())
     }
 
-    /// The bytes of the chunks the volumes hold, each chunk's length as its volume's index keeps
-    /// it: what a chunk's put wrote, whoever asked it.
-    pub(crate) fn held_bytes(&self) -> Result<u64, StorageError> {
-        let mut held = 0u64;
+    /// What the volumes hold of chunks and the room they have for more ([`Holding`]).
+    pub(crate) fn holding(&self) -> Result<Holding, StorageError> {
+        let mut holding = Holding::default();
+        let add = |sum: u64, more: u64| sum.checked_add(more).ok_or(StorageError::Counted(sum));
         for volume in &self.volumes {
             let read = |source| StorageError::Volume {
                 path: volume.dir.clone(),
@@ -324,13 +342,25 @@ impl Storage {
             };
             for key in volume.volume.keys().map_err(read)? {
                 if let Some(stat) = volume.volume.stat(&key).map_err(read)? {
-                    held = held
-                        .checked_add(stat.len)
-                        .ok_or(StorageError::Counted(held))?;
+                    holding.bytes = add(holding.bytes, stat.len)?;
+                    let fragments = u64::try_from(stat.fragments)
+                        .map_err(|_| StorageError::Counted(holding.fragments.0))?;
+                    holding.fragments.0 = add(holding.fragments.0, fragments)?;
                 }
             }
+            holding.fragments.1 = add(holding.fragments.1, volume.budget)?;
+            let usage = volume.volume.usage().map_err(read)?;
+            let segment = volume
+                .volume
+                .data_bytes()
+                .checked_div(u64::from(usage.segments))
+                .unwrap_or(0);
+            let free = segment
+                .checked_mul(u64::from(usage.free))
+                .ok_or(StorageError::Counted(holding.free))?;
+            holding.free = add(holding.free, free)?;
         }
-        Ok(held)
+        Ok(holding)
     }
 
     /// Puts and gets out.

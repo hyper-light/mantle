@@ -78,8 +78,10 @@
 //! `learn ID QUIC PLANE`, where a peer listens, `replace FAILED JOINING`, a member lost for good
 //! and the spare that takes its place in every range the node hosts (`Node::replace`), `stop`,
 //! which asks the orderly stop as SIGTERM does, and `chunks`, answered `chunks RECEIVED WRITTEN
-//! HELD`: the bytes of chunks its peers put on it over QUIC, of those it put on its own volumes,
-//! and of those its volumes hold (`Node::chunk_bytes`). A line it cannot read ends the process
+//! HELD UNKEPT FRAGMENTS BUDGET FREE`: the bytes of chunks its peers put on it over QUIC, of those
+//! it put on its own volumes, of those its volumes hold and of those of the first two no volume
+//! kept; the fragments its volumes' indexes hold and the most they may; and the bytes of its
+//! volumes' free segments (`Node::chunk_bytes`). A line it cannot read ends the process
 //! with the line named. Standard input closing ends `mantle node`, its
 //! harness's child, at once, without the orderly stop's steps; `mantle serve` runs on, as under a
 //! service manager, whose input is empty.
@@ -1803,7 +1805,11 @@ async fn serve(
                         stop_asked(&mut stop, &mut node, (&mut output, &at_once)).await?;
                     } else if line.trim_ascii() == b"chunks" {
                         let (received, written, held, unkept) = node.chunk_bytes()?;
-                        let line = format!("chunks {received} {written} {held} {unkept}\n");
+                        let (fragments, budget) = held.fragments;
+                        let line = format!(
+                            "chunks {received} {written} {} {unkept} {fragments} {budget} {}\n",
+                            held.bytes, held.free
+                        );
                         say(&mut output, &line).await?;
                     } else {
                         take_line(&mut node, &config.ranges, &line)?;

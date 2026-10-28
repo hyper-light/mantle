@@ -140,7 +140,10 @@ was whole. Nothing removes a chunk yet, so the first two's sum is exactly the la
 node, the check the step names (chunk bytes moved equal the chunks held) made exact where a full
 volume refuses some: a filled cell of 96 MiB volumes held 48 MiB a node and kept none of 15.9 MiB,
 the two refused parts' chunks. A volume keeps `CLEANER_RESERVE` free segments past what a client's
-writes take (research/11 §10.3), which is half of so small a volume.
+writes take (research/11 §10.3), which is half of so small a volume. Each node says too the room
+its volumes have left in the two things that refuse a put `Full` (chunk-store.md §5, §8): the
+fragments their indexes hold against their budget, and the bytes of their free segments; a large
+case's refusal so names which ran out.
 
 **Bounded by construction.** A case keeps three fixed-size histograms of latency a door
 (`mantle_disk::histogram`, HdrHistogram's buckets), counts, and a bit an object; a node's lines are

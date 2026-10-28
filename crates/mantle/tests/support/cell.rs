@@ -418,7 +418,8 @@ pub(crate) fn parse(line: &str) -> Option<Line> {
         )),
         ["link", peer, rest @ ..] => Some(Line::Link(peer.parse().ok()?, rest.join(" "))),
         ["volume", id] => Some(Line::Volume(u128::from_str_radix(id, 16).ok()?)),
-        ["chunks", received, written, held, unkept] => Some(Line::Chunks(
+        // The room past them (fragments, their budget, free segment bytes) no test here reads.
+        ["chunks", received, written, held, unkept, ..] => Some(Line::Chunks(
             received.parse().ok()?,
             written.parse().ok()?,
             held.parse().ok()?,

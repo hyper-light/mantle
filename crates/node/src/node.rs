@@ -1281,14 +1281,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// The bytes of chunks peers put here over QUIC, of chunks this node put on its own volumes
-    /// in-process, of the chunks its volumes hold, and of those of the first two no volume kept:
-    /// refused, or a body that ended before it was whole. Nothing removes a chunk yet, so the
-    /// first two's sum is the last two's unless a chunk was kept twice.
-    pub fn chunk_bytes(&self) -> Result<(u64, u64, u64, u64), crate::storage::StorageError> {
+    /// in-process, what its volumes hold and their room for more (`storage::Holding`), and the
+    /// bytes of the first two no volume kept: refused, or a body that ended before it was whole.
+    /// Nothing removes a chunk yet, so the first two's sum is the held bytes and the unkept
+    /// unless a chunk was kept twice.
+    pub fn chunk_bytes(
+        &self,
+    ) -> Result<(u64, u64, crate::storage::Holding, u64), crate::storage::StorageError> {
         Ok((
             self.chunks_received,
             self.chunks_written,
-            self.storage.held_bytes()?,
+            self.storage.holding()?,
             self.chunks_unkept,
         ))
     }

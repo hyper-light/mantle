@@ -94,7 +94,7 @@ fn the_small_set_and_large_objects_in_every_way_read_back_exactly() {
     for case in ["small 1000", "large 20971520"] {
         let chunks = line(&said, &format!("{case} chunks"));
         assert!(chunks.ends_with("put in-process: yes"), "{said}");
-        assert_eq!(chunks.matches("(+0 kept by none)").count(), 3, "{said}");
+        assert_eq!(chunks.matches("(+0 kept by none;").count(), 3, "{said}");
         assert!(
             line(&said, &format!("{case} placement")).ends_with("on distinct nodes: yes"),
             "{said}"

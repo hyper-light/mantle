@@ -696,7 +696,9 @@ const NEVER_PUT: &str = "control-never-put";
 /// acknowledged object of a byte or more read back with its middle byte inverted on its way to the
 /// check, which must find that byte; that object's first block judged with one chunk moved onto
 /// another's node, which the placement check must count; and a key no case puts, which must read
-/// as missing. Whether each was caught: a control the checks miss leaves the case inexact.
+/// as missing. Whether each was caught: a control the checks miss leaves the case inexact. A case
+/// that acknowledged no such object, a large one whose first object no volume could hold, has no
+/// bytes or placement to judge: the key never put is read all the same.
 fn controls(
     out: &mut impl Write,
     (cell, natives, messages): (&Cell, &mut Natives, Bounds),
@@ -713,15 +715,29 @@ fn controls(
             break;
         }
     }
+    let settings = natives.settings(0)?;
     let Some((key, length)) = first else {
+        let missing = natives.block(async move {
+            let generator = Generator::new(seed)?;
+            let never = generator.object(NEVER_PUT)?;
+            let mut client = Client::open(settings).await?;
+            let (missing, _) = native::get(&mut client, (BUCKET, NEVER_PUT), &never, 0).await?;
+            Ok(missing)
+        })?;
+        let found_missing = missing == Came::Refused(Status::NoSuchKey);
         writeln!(
             out,
-            "  {case} controls: no acknowledged object of a byte or more"
+            "  {case} controls: no acknowledged object of a byte or more, no byte or chunk to \
+             judge; a key never put read {}",
+            if found_missing {
+                "missing, caught"
+            } else {
+                "NOT missing"
+            },
         )?;
-        return Ok(false);
+        return Ok(found_missing);
     };
     let flip = length.checked_div(2).unwrap_or(0);
-    let settings = natives.settings(0)?;
     let reader = cell.gateway().settings(messages)?;
     let bound = cell.quic();
     let groups = cell.gateway().groups;
@@ -764,9 +780,10 @@ fn controls(
 }
 
 /// Each node's chunk bytes once case `case` is done, a line to `out`: what each holds of its
-/// `volume_bytes`, and whether what its peers sent it over QUIC and what it put on its own volumes
-/// is exactly what its volumes hold and what none kept (a full volume's refusals, a body ended
-/// before it was whole), every byte once: nothing removes a chunk yet.
+/// `volume_bytes` and the room its volumes have left, in fragments and free segments (a large
+/// case's refusal names which ran out), and whether what its peers sent it over QUIC and what it
+/// put on its own volumes is exactly what its volumes hold and what none kept (a full volume's
+/// refusals, a body ended before it was whole), every byte once: nothing removes a chunk yet.
 fn accounted(
     out: &mut impl Write,
     cell: &mut Cell,
@@ -776,9 +793,13 @@ fn accounted(
     let mut held = Vec::with_capacity(cell::FOUNDERS);
     let mut exact = true;
     for at in 0..cell::FOUNDERS {
-        let (received, written, holds, unkept) = cell.chunks(at)?;
-        exact &= received.checked_add(written) == holds.checked_add(unkept);
-        held.push(format!("{holds} (+{unkept} kept by none)"));
+        let chunks = cell.chunks(at)?;
+        exact &=
+            chunks.received.checked_add(chunks.written) == chunks.held.checked_add(chunks.unkept);
+        held.push(format!(
+            "{} (+{} kept by none; {} of {} fragments, {} free)",
+            chunks.held, chunks.unkept, chunks.fragments, chunks.budget, chunks.free
+        ));
     }
     writeln!(
         out,

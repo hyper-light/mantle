@@ -45,6 +45,21 @@ fn io(what: &str) -> impl FnOnce(std::io::Error) -> CellError + '_ {
     move |e| CellError::Io(what.to_owned(), e)
 }
 
+/// A node's chunks as it answers `chunks`: the bytes received from peers over QUIC, put on its own
+/// volumes in-process, held by its volumes, and of the first two kept by none; and its volumes'
+/// room, in the two things that refuse a put `Full`: the fragments their indexes hold and the most
+/// they may, and the bytes of their free segments.
+#[derive(Clone, Copy, Debug)]
+pub struct Chunks {
+    pub received: u64,
+    pub written: u64,
+    pub held: u64,
+    pub unkept: u64,
+    pub fragments: u64,
+    pub budget: u64,
+    pub free: u64,
+}
+
 /// What a node's process said, as this runner reads it.
 enum Said {
     /// Its QUIC listener's address and its datagram plane's, once bound.
@@ -55,9 +70,8 @@ enum Said {
     Region(String),
     /// The root range took its enlistment.
     Enlisted,
-    /// Its chunk bytes, asked: received from peers over QUIC, put on its own volumes in-process,
-    /// held by its volumes, and of the first two kept by none.
-    Chunks(u64, u64, u64, u64),
+    /// Its chunks, asked.
+    Chunks(Chunks),
     /// A range's leader as the node knows it now, none while it knows of none.
     Status(u128, u64),
     /// Its output ended: the process is gone.
@@ -75,12 +89,24 @@ fn said(line: &str) -> Option<Said> {
             u128::from_str_radix(group, 16).ok()?,
             leader.parse().ok()?,
         )),
-        ["chunks", received, written, held, unkept] => Some(Said::Chunks(
-            received.parse().ok()?,
-            written.parse().ok()?,
-            held.parse().ok()?,
-            unkept.parse().ok()?,
-        )),
+        [
+            "chunks",
+            received,
+            written,
+            held,
+            unkept,
+            fragments,
+            budget,
+            free,
+        ] => Some(Said::Chunks(Chunks {
+            received: received.parse().ok()?,
+            written: written.parse().ok()?,
+            held: held.parse().ok()?,
+            unkept: unkept.parse().ok()?,
+            fragments: fragments.parse().ok()?,
+            budget: budget.parse().ok()?,
+            free: free.parse().ok()?,
+        })),
         _ => None,
     }
 }
@@ -99,7 +125,7 @@ struct Node {
     s3: Option<SocketAddr>,
     region: Option<String>,
     enlisted: bool,
-    chunks: Option<(u64, u64, u64, u64)>,
+    chunks: Option<Chunks>,
     /// Each range's leader as its process last said, zero for none.
     leaders: BTreeMap<u128, u64>,
 }
@@ -346,9 +372,8 @@ impl Cell {
         Ok(())
     }
 
-    /// Node `at`'s chunk bytes, asked now on its standard input: received from peers over QUIC,
-    /// put on its own volumes in-process, held by its volumes, and of the first two kept by none.
-    pub fn chunks(&mut self, at: usize) -> Result<(u64, u64, u64, u64), CellError> {
+    /// Node `at`'s chunks, asked now on its standard input ([`Chunks`]).
+    pub fn chunks(&mut self, at: usize) -> Result<Chunks, CellError> {
         let node = self
             .nodes
             .get_mut(at)
@@ -416,9 +441,7 @@ impl Cell {
             Said::S3(s3) => node.s3 = Some(s3),
             Said::Region(region) => node.region = Some(region),
             Said::Enlisted => node.enlisted = true,
-            Said::Chunks(received, written, held, unkept) => {
-                node.chunks = Some((received, written, held, unkept));
-            }
+            Said::Chunks(chunks) => node.chunks = Some(chunks),
             Said::Status(group, leader) => {
                 node.leaders.insert(group, leader);
             }

@@ -1848,9 +1848,12 @@ through two listeners, listed, completed through a third with S3's ETag, and rea
 by a suffix range through each; objects put through one listener alone held by the other two nodes
 exactly as they received them over QUIC's transfer class, neither putting any itself; and on every
 node, the bytes its volumes hold the bytes its peers put on it over QUIC and those it put itself,
-read by a `chunks` line on standard input, answered `chunks RECEIVED WRITTEN HELD UNKEPT`, the
-last the bytes of the first two no volume kept: a volume's refusal, or a body that ended before it
-was whole; so a node's received and written bytes are its held and unkept ones exactly. Stock clients
+read by a `chunks` line on standard input, answered `chunks RECEIVED WRITTEN HELD UNKEPT FRAGMENTS
+BUDGET FREE`, `UNKEPT` the bytes of the first two no volume kept: a volume's refusal, or a body that
+ended before it was whole; so a node's received and written bytes are its held and unkept ones
+exactly. The last three are the room its volumes have, the two things that refuse a put `Full`
+(chunk-store.md §5, §8): the fragments their indexes hold, the most they may, and the bytes of their
+free segments. Stock clients
 pass against a cell of three in `crates/mantle/tests/stock_clients.rs`, run on every CI target: the
 runner image's AWS CLI v2 (`aws s3 mb`, `cp`, `ls` and `rm`; `aws s3api`'s object, listing and
 multipart commands; `aws s3 cp` past its 8 MiB multipart threshold, from standard input and to

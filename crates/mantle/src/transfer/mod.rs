@@ -28,6 +28,7 @@ use mantle_protocol::object::{Op, Status};
 
 use cell::Cell;
 use generate::{GenError, Generator, Object};
+use large::Way;
 use native::Came;
 
 /// S3's line for a small object: objects under 128 KiB are not monitored by S3 Intelligent-Tiering
@@ -55,8 +56,10 @@ pub struct Options {
     /// The large objects' sizes, a case each.
     pub large: Vec<u64>,
     /// The objects of a large case; none puts them until the cell refuses one as out of space
-    /// through each door.
+    /// through each door its ways use.
     pub count: Option<u64>,
+    /// The ways a large case puts its objects, in turn; none, all four (`large::WAYS`).
+    pub ways: Vec<Way>,
     /// Each founder's volume.
     pub volume: Volume,
 }
@@ -520,11 +523,16 @@ pub fn transfer(out: &mut impl Write, options: &Options) -> Result<bool, Transfe
         writeln!(out, "  {case} volumes: {volume_bytes} bytes each ({why})")?;
         let mut cell = Cell::make(&dir, volume_bytes)?;
         let mut natives = Natives::new(&cell, &dir, messages)?;
+        let ways: &[Way] = if options.ways.is_empty() {
+            &large::WAYS
+        } else {
+            &options.ways
+        };
         let (done, oracle, budget) = large::large(
             &cell,
             &mut natives,
             &dir,
-            (options.seed, length, options.count),
+            (options.seed, length, options.count, ways),
             volume_bytes,
         )?;
         exact &= placed(
@@ -548,7 +556,11 @@ pub fn transfer(out: &mut impl Write, options: &Options) -> Result<bool, Transfe
         )?;
         drop(natives);
         drop(cell);
-        for (way, tally) in large::WAYS.iter().zip(&done.tallies) {
+        for (way, tally) in large::WAYS
+            .iter()
+            .zip(&done.tallies)
+            .filter(|(way, _)| ways.contains(way))
+        {
             writeln!(
                 out,
                 "  {:<26} {:>8} {:>14} {:>12} {:>12} {:>12} {:>5} {:>5} {:>7} {:>6} {:>7}",
@@ -565,14 +577,17 @@ pub fn transfer(out: &mut impl Write, options: &Options) -> Result<bool, Transfe
                 tally.missing,
             )?;
         }
-        let refused =
-            |door: Option<u64>| door.map_or_else(|| "none".to_owned(), |i| format!("l{i}"));
+        let refused = |door: usize| match (done.doors.get(door), done.full.get(door)) {
+            (Some(true), Some(Some(i))) => format!("l{i}"),
+            (Some(true), _) => "none".to_owned(),
+            _ => "not used".to_owned(),
+        };
         writeln!(
             out,
             "  large {length} out of space: native {}, http {}; refused objects unreadable and \
              unlisted, acknowledged ones listed: {}",
-            refused(done.full.first().copied().flatten()),
-            refused(done.full.get(1).copied().flatten()),
+            refused(0),
+            refused(1),
             if done.unlisted { "yes" } else { "no" },
         )?;
         let otherwise: Vec<String> = done

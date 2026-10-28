@@ -67,26 +67,28 @@ through; a read is exact or it counts as wrong, a put not acknowledged counts as
 doors run in turn, each phase alone, so the driver's blocking pipes never stall the native
 clients' runtime, and the driver says `ready` before anything is timed, its start-up no put's.
 
-**Large objects go in four ways, two each door.** Object `i` of a large case is put natively in
-the runs the node cuts, as `mantle cp` puts a file (gateway.md §2.1); by the AWS CLI from its
-standard input, its length stated so the CLI sizes its parts for S3's 10,000 (`--expected-size`);
-natively as an explicit multipart upload; or by boto3 as one, for `i` mod 4 in that order. An
-explicit upload's parts are the AWS CLI's 8 MiB where 10,000 of them hold the object, else what
-10,000 need (f27), each part's bytes made as they are sent and a refused part ending the upload,
-aborted. boto3's driver takes a part's bytes only once it said the step before went, so a refusal
-stops the harness making the rest. The CLI is a process a copy and says its failures into a file
-the harness reads once it exits, S3's code taken from botocore's `An error occurred (CODE)`, so no
-pipe it fills can stall a copy; its copy to standard output heads the object first, whose `404`
-names no code and is read as no such key. Every acknowledged object is read back natively through
-the second node and by the CLI through the third node's listener.
+**Large objects go in four ways, two each door.** Object `i` of a large case is put natively in the
+runs the node cuts, as `mantle cp` puts a file (gateway.md §2.1); by the AWS CLI from its standard
+input, its length stated so the CLI sizes its parts for S3's 10,000 (`--expected-size`); natively as
+an explicit multipart upload; or by boto3 as one, for `i` mod 4 in that order, or in turn among the
+ways `--ways` names: a cell whose volumes hold one object holds it through its case's first way
+alone, so a machine with room for one a case runs a case for each way. An explicit upload's parts
+are the AWS CLI's 8 MiB where 10,000 of them hold the object, else what 10,000 need (f27), each
+part's bytes made as they are sent and a refused part ending the upload, aborted. boto3's driver
+takes a part's bytes only once it said the step before went, so a refusal stops the harness making
+the rest. The CLI is a process a copy and says its failures into a file the harness reads once it
+exits, S3's code taken from botocore's `An error occurred (CODE)`, so no pipe it fills can stall a
+copy; its copy to standard output heads the object first, whose `404` names no code and is read as
+no such key. Every acknowledged object is read back natively through the second node and by the CLI
+through the third node's listener.
 
 **A case fills the cell or puts a count.** With a count, a large case puts that many objects. With
-none it puts until each door has refused one as out of space, typed (node.md §4.4), at most the
-objects a founder's volume holds of one and two past them, a door refused once asked no more.
-Each object is asked once: a full volume holds a put for its cleaner's verdict, so the cell's first
-answer is the typed one (research/75), and a `SlowDown` counts as refused. The refused objects are
-then read through both doors,
-which must answer no such key, and listed by neither, which must list every acknowledged object.
+none it puts until each door its ways use has refused one as out of space, typed (node.md §4.4), at
+most the objects a founder's volume holds of one and two past them, a door refused once asked no
+more. Each object is asked once: a full volume holds a put for its cleaner's verdict, so the cell's
+first answer is the typed one (research/75), and a `SlowDown` counts as refused. The refused objects
+are then read through both doors, which must answer no such key, and listed by neither, which must
+list every acknowledged object.
 
 **Each block's placement is read as the cell's gateway reads it.** Before any founder starts, the
 harness issues a gateway's certificate under the cell's authority and pins it in every founder's

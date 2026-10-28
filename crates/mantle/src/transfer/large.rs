@@ -20,7 +20,7 @@ use super::stock::{Boto, Cli};
 use super::{BUCKET, Natives, Oracle, Tally, TransferError, elapsed};
 
 /// The four ways a large object goes in, two through each door, taken in turn.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Way {
     /// The native door's upload in runs the node cuts (`mantle cp`'s).
     Runs,
@@ -52,10 +52,18 @@ impl Way {
         }
     }
 
-    /// Object `i`'s way, and its tally's place.
-    fn of(i: u64) -> (Self, usize) {
-        let at = usize::try_from(i.checked_rem(4).unwrap_or(0)).unwrap_or(0);
-        (WAYS.get(at).copied().unwrap_or(Self::Runs), at)
+    /// The way named `name` ([`Way::name`]).
+    pub fn named(name: &str) -> Option<Self> {
+        WAYS.into_iter().find(|way| way.name() == name)
+    }
+
+    /// Object `i`'s way among `ways`, each in turn, and its tally's place in `WAYS`' order.
+    fn of(i: u64, ways: &[Self]) -> (Self, usize) {
+        let turns = u64::try_from(ways.len()).unwrap_or(1).max(1);
+        let turn = usize::try_from(i.checked_rem(turns).unwrap_or(0)).unwrap_or(0);
+        let way = ways.get(turn).copied().unwrap_or(Self::Runs);
+        let at = WAYS.iter().position(|w| *w == way).unwrap_or(0);
+        (way, at)
     }
 }
 
@@ -65,6 +73,9 @@ pub struct Large {
     pub tallies: [Tally; 4],
     /// The object each door refused as out of space, the native door's and the S3 listener's.
     pub full: [Option<u64>; 2],
+    /// Whether the case's ways put objects through each door, the native one and the S3
+    /// listener.
+    pub doors: [bool; 2],
     /// Every object refused as out of space read as no such key through both doors and was listed
     /// by neither, and every object acknowledged was listed by both.
     pub unlisted: bool,
@@ -77,15 +88,15 @@ pub(super) fn key(i: u64) -> String {
     format!("l{i}")
 }
 
-/// The case of `count` objects of `length` bytes on `cell`, or with no count, of objects until
-/// the cell refuses one as out of space through each door: at most as many as its founders'
-/// volumes of `volume_bytes` hold of one, each node holding a copy of every block (f34), and one
-/// past that through each door.
+/// The case of `count` objects of `length` bytes on `cell`, put by `ways` in turn, or with no
+/// count, of objects until the cell refuses one as out of space through each door the ways use:
+/// at most as many as its founders' volumes of `volume_bytes` hold of one, each node holding a copy
+/// of every block (f34), and one past that through each door.
 pub(super) fn large(
     cell: &Cell,
     natives: &mut Natives,
     dir: &Path,
-    (seed, length, count): (u64, u64, Option<u64>),
+    (seed, length, count, ways): (u64, u64, Option<u64>, &[Way]),
     volume_bytes: u64,
 ) -> Result<(Large, Oracle, u64), TransferError> {
     let budget = match count {
@@ -109,13 +120,19 @@ pub(super) fn large(
     let mut tallies = [Tally::new(), Tally::new(), Tally::new(), Tally::new()];
     let mut oracle = Oracle::new(budget)?;
     let mut full: [Option<u64>; 2] = [None, None];
+    let mut doors = [false; 2];
+    for way in ways {
+        if let Some(door) = doors.get_mut(way.door()) {
+            *door = true;
+        }
+    }
     let mut refused = Vec::new();
     let part = native::part_size(length);
     for i in 0..budget {
-        let (way, at) = Way::of(i);
+        let (way, at) = Way::of(i, ways);
         // Filling, a door that refused an object as out of space is asked no more.
         if count.is_none() && full.get(way.door()).is_some_and(Option::is_some) {
-            if full.iter().all(Option::is_some) {
+            if full.iter().zip(doors).all(|(f, used)| f.is_some() || !used) {
                 break;
             }
             continue;
@@ -172,7 +189,7 @@ pub(super) fn large(
     // Every acknowledged object read back natively through the second node, then through the
     // third node's listener by the CLI.
     for i in (0..budget).filter(|i| oracle.has(*i)) {
-        let (_, at) = Way::of(i);
+        let (_, at) = Way::of(i, ways);
         let settings = natives.settings(1)?;
         let began = Instant::now();
         let (came, again) = natives.block(async move {
@@ -242,6 +259,7 @@ pub(super) fn large(
         Large {
             tallies,
             full,
+            doors,
             unlisted,
             refused,
         },
@@ -251,15 +269,54 @@ pub(super) fn large(
 }
 
 impl Large {
-    /// Every object read back exact through both doors, and, filling, each door refused one as
-    /// out of space with nothing of it readable or listed; with a count, none refused.
+    /// Every object read back exact through both doors, and, filling, each door the ways used
+    /// refused one as out of space with nothing of it readable or listed; with a count, none
+    /// refused.
     pub fn exact(&self, filling: bool) -> bool {
         let tallies = self.tallies.iter().all(Tally::exact);
-        let full = if filling {
-            self.full.iter().all(Option::is_some)
-        } else {
-            self.full.iter().all(Option::is_none)
-        };
+        let full = self
+            .full
+            .iter()
+            .zip(self.doors)
+            .all(|(f, used)| f.is_some() == (filling && used));
         tallies && full && self.unlisted
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A case's objects go to its ways in turn, each tallied in its own place, whatever ways it
+    /// was given and in what order.
+    #[test]
+    fn objects_go_to_the_ways_given_in_turn() {
+        assert_eq!(Way::of(0, &WAYS), (Way::Runs, 0));
+        assert_eq!(Way::of(5, &WAYS), (Way::Cli, 1));
+        let ways = [Way::Boto, Way::Cli];
+        assert_eq!(Way::of(0, &ways), (Way::Boto, 3));
+        assert_eq!(Way::of(1, &ways), (Way::Cli, 1));
+        assert_eq!(Way::of(2, &ways), (Way::Boto, 3));
+        assert_eq!(Way::named("native-parts"), Some(Way::Parts));
+        assert_eq!(Way::named("parts"), None);
+    }
+
+    /// Filling, a case is exact only where each door its ways used refused an object as out of
+    /// space and no door it did not use did; with a count, only where none refused.
+    #[test]
+    fn a_filled_case_wants_the_refusal_of_each_door_it_used() {
+        let case = |full: [Option<u64>; 2], doors: [bool; 2]| Large {
+            tallies: [Tally::new(), Tally::new(), Tally::new(), Tally::new()],
+            full,
+            doors,
+            unlisted: true,
+            refused: Vec::new(),
+        };
+        assert!(case([None, Some(1)], [false, true]).exact(true));
+        assert!(!case([None, None], [false, true]).exact(true));
+        assert!(case([Some(2), Some(1)], [true, true]).exact(true));
+        assert!(!case([None, Some(1)], [true, true]).exact(true));
+        assert!(case([None, None], [true, true]).exact(false));
+        assert!(!case([None, Some(1)], [false, true]).exact(false));
     }
 }

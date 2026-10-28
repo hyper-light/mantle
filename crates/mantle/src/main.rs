@@ -354,9 +354,15 @@ enum BenchCommand {
         small: Vec<u64>,
         /// The large objects' sizes, comma-separated, in bytes or with a K, M, G or T suffix
         /// (powers of 1024), a case each: objects put natively in runs and in parts, by the AWS
-        /// CLI from its standard input and by boto3 in parts, in turn.
+        /// CLI from its standard input and by boto3 in parts, in turn (`--ways`).
         #[arg(long, value_delimiter = ',', value_parser = init::parse_bytes)]
         large: Vec<u64>,
+        /// The ways a large case puts its objects, comma-separated, in turn: `native` (the native
+        /// door's upload in runs), `cli` (the AWS CLI from its standard input), `native-parts`
+        /// and `boto-parts`; all four, in that order, without it. A case with volumes that hold
+        /// one object holds it through its first way alone.
+        #[arg(long, value_delimiter = ',', value_parser = way_arg)]
+        ways: Vec<transfer::large::Way>,
         /// The objects of each large case; without it, a large case puts objects until the cell
         /// refuses one as out of space through each door.
         #[arg(long)]
@@ -774,6 +780,7 @@ fn main() -> ExitCode {
                     small,
                     large,
                     count,
+                    ways,
                     volume,
                     reserve,
                 },
@@ -794,6 +801,7 @@ fn main() -> ExitCode {
                         small,
                         large,
                         count,
+                        ways,
                         volume,
                     };
                     match transfer::transfer(&mut out, &options) {
@@ -843,6 +851,12 @@ fn volume_arg(text: &str) -> Result<VolumeArg, String> {
     } else {
         init::parse_bytes(text).map(|bytes| VolumeArg(Some(bytes)))
     }
+}
+
+/// `mantle bench transfer`'s `--ways`: a way by its name.
+fn way_arg(text: &str) -> Result<transfer::large::Way, String> {
+    transfer::large::Way::named(text)
+        .ok_or_else(|| format!("{text} is no way: native, cli, native-parts or boto-parts"))
 }
 
 fn exit(result: Result<(), String>) -> ExitCode {

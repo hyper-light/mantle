@@ -1068,9 +1068,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// Where `peer` listens: QUIC's address and the plane's. A peer that moved started again
     /// elsewhere, so its connection is to a process that is gone: it is closed now, not after its
-    /// idle timeout, since the transport dials no peer it holds a connection to. A peer this node
-    /// dials (its id is above this node's) is dialed now when it moved or has no connection; one
-    /// that dials this node dials it again from where it started.
+    /// idle timeout, since the transport dials no peer it holds a connection to, and what this node
+    /// kept for it goes with it ([`Self::unkey`]). A peer this node dials (its id is above this
+    /// node's) is dialed now when it moved or has no connection; one that dials this node dials it
+    /// again from where it started.
     pub fn learn(
         &mut self,
         peer: PeerId,
@@ -1092,6 +1093,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if moved {
             let clock = self.driver.clock()?;
             self.driver.endpoint().disconnect(clock, peer);
+            self.unkey(peer);
         }
         self.dial(now);
         Ok(())
@@ -1958,10 +1960,21 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(())
     }
 
-    /// A peer's connection went: its plane keys with it, and a peer this node dials is dialed
-    /// again after a pause of its backoff ([`Self::redial_later`]).
+    /// A peer's connection went: what this node kept for it goes ([`Self::unkey`]), and a peer
+    /// this node dials is dialed again after a pause of its backoff ([`Self::redial_later`]).
     fn lost(&mut self, peer: PeerId, now: u64) {
-        let dials = self.id < peer;
+        self.unkey(peer);
+        if self.id < peer
+            && let Some(remote) = self.remotes.iter_mut().find(|r| r.id == peer)
+        {
+            Self::redial_later(self.id, remote, now);
+        }
+    }
+
+    /// What this node kept for `peer`'s connection, which is gone: the plane's keys from it, the
+    /// frames its lane had no room for, and each range's progress to the peer, which Raft probes
+    /// again. The link says unkeyed until a connection is made again (`Event::Connected`).
+    fn unkey(&mut self, peer: PeerId) {
         // A client's connection is its own to make again.
         let Some(remote) = self.remotes.iter_mut().find(|r| r.id == peer) else {
             return;
@@ -1969,9 +1982,6 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.plane.remove_peer(peer);
         remote.keyed = false;
         remote.waiting.clear();
-        if dials {
-            Self::redial_later(self.id, remote, now);
-        }
         for kept in &self.ranges {
             if let Some(shell) = self.owner.get_mut(kept.handle) {
                 let _ = shell.report_unreachable(peer);
@@ -2742,7 +2752,6 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(())
     }
 
-    /// Gives back the room a chunk put being read on `exchange` held, the exchange gone.
     /// Ends the chunk reads out to `peer`, which the detectors now suspect: each read lost at once,
     /// so its get asks another copy rather than waiting out the transport's judgement of a peer
     /// that may be gone, two idle timeouts, as long as its client waits for the object (node.md
@@ -2766,6 +2775,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
     }
 
+    /// Gives back the room a chunk put being read on `exchange` held, the exchange gone.
     fn give_back(&mut self, exchange: ExchangeId) {
         for receiving in self.receiving.iter().filter(|r| r.exchange == exchange) {
             if matches!(receiving.what, Arriving::ChunkPut { .. }) {

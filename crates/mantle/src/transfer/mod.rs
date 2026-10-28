@@ -827,13 +827,16 @@ fn small(
             let name = format!("s{i}");
             let object = generator.object(&name)?;
             let began = Instant::now();
-            let came = native::put(&mut writer, (BUCKET, &name), &object, length).await?;
+            let (came, again) = native::put(&mut writer, (BUCKET, &name), &object, length).await?;
             put_came(
                 &mut tallies,
                 &mut oracle,
                 (i, length),
                 (came, elapsed(began)),
             );
+            if let Some(tally) = tallies.get_mut(door(i)) {
+                tally.asked_again(again);
+            }
         }
         Ok((tallies, oracle))
     })?;

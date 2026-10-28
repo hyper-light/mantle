@@ -385,8 +385,8 @@ reads them from the Name, File and Block ranges and the volume table; and with e
 SIGKILLed in turn every object reads back through the others, and through it started again
 (research/76; `crates/mantle/tests/transfer.rs`: the 1,000-object set and four 20 MiB objects, and
 a cell of 96 MiB volumes filled); each case's controls, a byte inverted on its way to the check, a
-chunk moved onto another's node and a key never put, are each caught; a part, a completion or a
-read whose answer was lost is asked again with its identity and counted (`again`); and `--volume
+chunk moved onto another's node and a key never put, are each caught; a put, a part, a completion
+or a read whose answer was lost is asked again with its identity and counted (`again`); and `--volume
 free` sizes the volumes from the run's free space less a stated `--reserve`. A node reads no chunk
 from a peer its detectors suspect, so a GET with a copy on a killed node asks another at once
 (gateway.md §3). On adacachy its small sets of 1k, 10k and 100k objects held every check exact,

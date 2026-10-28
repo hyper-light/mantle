@@ -186,13 +186,14 @@ pub enum Came {
     Refused(Status),
 }
 
-/// Puts `object`, `length` bytes, at `key` in `bucket`.
+/// Puts `object`, `length` bytes, at `key` in `bucket`, the same upload asked again where its
+/// answer is lost (`ask_again`): what it came to, and the times it was asked again.
 pub async fn put(
     client: &mut Client,
     (bucket, key): (&str, &str),
     object: &Object<'_>,
     length: u64,
-) -> Result<Came, mantle_client::ClientError> {
+) -> Result<(Came, u32), mantle_client::ClientError> {
     let native = Native {
         bucket: bucket.to_owned(),
         key: key.to_owned(),
@@ -201,15 +202,26 @@ pub async fn put(
         checksum: TRAILER,
         headers: Headers::default(),
     };
-    let mut made = Made::new(object, length);
-    let reply = client
-        .upload(&native, (&mut made, length), &mut Unwatched, u64::MAX)
-        .await?;
-    Ok(if reply.status == Status::Done {
-        Came::Done
-    } else {
-        Came::Refused(reply.status)
-    })
+    let mut again = 0u32;
+    let reply = loop {
+        let mut made = Made::new(object, length);
+        let asked = client
+            .upload(&native, (&mut made, length), &mut Unwatched, u64::MAX)
+            .await;
+        if ask_again(&asked, again) {
+            again = again.saturating_add(1);
+            continue;
+        }
+        break asked?;
+    };
+    Ok((
+        if reply.status == Status::Done {
+            Came::Done
+        } else {
+            Came::Refused(reply.status)
+        },
+        again,
+    ))
 }
 
 /// The part an object of `length` bytes is put in: the AWS CLI's 8 MiB (`crate::client::PART`),

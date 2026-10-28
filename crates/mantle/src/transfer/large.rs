@@ -132,10 +132,7 @@ pub(super) fn large(
                         let mut client = mantle_client::Client::open(settings).await?;
                         let at = (BUCKET, key(i));
                         Ok(if way == Way::Runs {
-                            (
-                                native::put(&mut client, (at.0, &at.1), &object, length).await?,
-                                0,
-                            )
+                            native::put(&mut client, (at.0, &at.1), &object, length).await?
                         } else {
                             native::put_parts(&mut client, (at.0, &at.1), &object, length).await?
                         })

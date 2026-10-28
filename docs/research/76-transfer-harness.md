@@ -110,13 +110,15 @@ waits. A node now reads nothing from a peer its detectors suspect (gateway.md §
 **A lost answer is asked again, and counted.** The native client asks a request again of itself
 only where no node can have taken it; one whose exchange ended unanswered is its caller's, and
 asked again with its identity it is answered from what the first made (gateway.md §2.1). The
-harness asks an explicit part, an upload's creation and completion, and a read again so, within the
-client's attempts, a part put again replacing the one before and a completion asked again finding
-the version it made (05 §4.3, §4.4), and counts each in its row's `again` and its kill line. On
-CI's busy runner, two CPUs beside two busy loops, a 20 MiB object's first part waited past the
-client's period for its three durable copies, and the case ended there before (CI run
-40580884158): a lost answer is a client's to recover, and a cell slower than its client's period,
-STATUS item 8's open half, shows in the count rather than ending the run.
+harness asks a native put, an explicit part, an upload's creation and completion, and a read again
+so, within the client's attempts, a put asked again answered from what it made, a part put again
+replacing the one before and a completion asked again finding the version it made (05 §4.3, §4.4),
+and counts each in its row's `again` and its kill line. On CI's busy runner, two CPUs beside two
+busy loops, a 20 MiB object's first part waited past the client's period for its three durable
+copies (CI run 40580884158), and on adacachy at a load average of 150 to 195 a small native put's
+three commits did; each case ended there before: a lost answer is a client's to recover, and a cell
+slower than its client's period, STATUS item 8's open half, shows in the count rather than ending
+the run.
 
 **Each case runs its controls.** A check that cannot fail checks nothing, so after its real
 checks each case runs three faults through them and says whether each was caught: its first

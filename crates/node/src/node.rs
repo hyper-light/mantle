@@ -70,7 +70,7 @@ mod host;
 mod stop;
 use answers::Answers;
 pub use host::GatewaySettings;
-use stop::Stopping;
+use stop::{StopDiag, Stopping};
 
 /// A plane message's first byte: a range's Raft frame. A liveness heartbeat starts with its own,
 /// `hyper_liveness::KIND`.
@@ -740,6 +740,8 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// ([`Node::take_handing`], [`Node::take_handed`]).
     handing: Vec<(u128, u64)>,
     handed: Vec<(u128, u64)>,
+    /// Scratch (diag/roll-stop-bound): what the stop's timed lines remember.
+    stop_diag: StopDiag,
     /// The node's TLS without its server side, which the stop runs on to take no connection: made
     /// as the node opens, from the credentials it opened with.
     dial_only: Option<Tls>,
@@ -1046,6 +1048,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             stopping: None,
             handing: Vec::new(),
             handed: Vec::new(),
+            stop_diag: StopDiag::default(),
             dial_only: Some(dial_only),
             table: None,
             moved: 0,
@@ -1500,17 +1503,28 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         let now = hyper_rt::futures::now_ns();
         let wake = self.liveness.wake();
-        let due = [
+        let dues = [
             self.deadlines.first().map(|(at, _)| *at),
             wake,
             self.remotes.iter().filter_map(|r| r.redial_at).min(),
             self.asks_due(now),
             self.reads_due(now),
             self.host_due(),
-        ]
-        .into_iter()
-        .flatten()
-        .min();
+        ];
+        let due = dues.into_iter().flatten().min();
+        // Scratch (diag/roll-stop-bound): what each wait of a stopping node is due by.
+        let diag = self.stopping.is_some().then(|| {
+            let rel = |at: Option<u64>| at.map(|at| at.saturating_sub(now) / 1_000_000);
+            format!(
+                "deadline={:?} liveness={:?} redial={:?} asks={:?} reads={:?} host={:?}",
+                rel(dues[0]),
+                rel(dues[1]),
+                rel(dues[2]),
+                rel(dues[3]),
+                rel(dues[4]),
+                rel(dues[5])
+            )
+        });
         // With nothing due the turn still comes at the idle timeout: every wait has a bound.
         let idle = u64::try_from(bounds::idle_timeout().as_nanos()).unwrap_or(u64::MAX);
         let sleep_ns = due.map_or(idle, |at| at.saturating_sub(now).min(idle));
@@ -1542,6 +1556,24 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let sleep = pin!(hyper_rt::futures::sleep(sleep_ns));
         let ended = race3(event, receive, race2(sleep, any_wake)).await;
         let woke = hyper_rt::futures::now_ns();
+        if let Some(diag) = diag {
+            let slept = woke.saturating_sub(now) / 1_000_000;
+            if slept >= 200 {
+                let by = match &ended {
+                    Either3::First(_) => "event",
+                    Either3::Second(_) => "plane",
+                    Either3::Third(Either::First(_)) => "sleep",
+                    Either3::Third(Either::Second(())) => "wake",
+                };
+                crate::diag::say(
+                    self.id,
+                    &format!(
+                        "wait slept_ms={slept} by={by} sleep_ms={} {diag}",
+                        sleep_ns / 1_000_000
+                    ),
+                );
+            }
+        }
         if let Some(at) = wake
             && now < at
             && woke >= at

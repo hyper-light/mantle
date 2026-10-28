@@ -31,6 +31,7 @@ pub mod chunk;
 pub mod client;
 pub mod command;
 pub mod derive;
+pub mod diag;
 pub mod directory;
 pub mod door;
 pub mod frame;

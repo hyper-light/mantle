@@ -1,7 +1,7 @@
 name: gates
+# Scratch (diag/roll-stop-bound): dispatch-only on this branch, so a push runs diag.yml alone.
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 env:

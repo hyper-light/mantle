@@ -1,0 +1,57 @@
+name: diag-roll-stop-bound
+# Scratch: the serve suite on the Windows runners as CI runs it (its tests side by side), in rounds,
+# every phase of each orderly stop timed on the node (DIAG-STOP lines: asked, stopping, each range
+# handing and handed with its target and attempts, the waits for running exchanges, the liveness
+# stop, each connection's close and the closing wait, stopped, the exit) and each stop the test asks
+# stamped (DIAG-ROLL), and where a stop's bound passes, the phase and what it still waited on
+# (CI run 40711041054: windows-x86_64's roll test's node ended "stopped at once: the stop's bound
+# passed", exit code 1).
+on:
+  push:
+    branches: ["diag/**"]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: "1"
+jobs:
+  serve:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows-x86_64-a, runner: windows-2025, target: x86_64-pc-windows-msvc }
+          - { name: windows-x86_64-b, runner: windows-2025, target: x86_64-pc-windows-msvc }
+          - { name: windows-aarch64, runner: windows-11-arm, target: aarch64-pc-windows-msvc }
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned Rust
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup target add --toolchain 1.98.1 ${{ matrix.target }}
+      - name: Install NASM
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        uses: ilammy/setup-nasm@v1.5.2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: diag-roll-stop-${{ matrix.target }}
+          workspaces: |
+            .
+      - name: Build the serve suite
+        shell: bash
+        run: cargo test --locked -p mantle --test serve --no-run --target ${{ matrix.target }}
+      - name: The serve suite, in rounds
+        shell: bash
+        timeout-minutes: 290
+        run: bash scripts/diag-serve-rounds.sh ${{ matrix.target }}
+      - name: Keep every round's output
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: rounds-${{ matrix.name }}
+          path: rounds/
+          if-no-files-found: warn

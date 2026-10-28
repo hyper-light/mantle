@@ -1177,6 +1177,7 @@ fn start(
     ends_with_input: bool,
 ) -> Result<(), ProcessError> {
     // Room for both: a stop at once, and the node's end after its teardown, which no one hears.
+    let config_id = config.id;
     let (tell, heard) = sync_channel::<Ended>(2);
     let at_once = tell.clone();
     let thread = std::thread::Builder::new()
@@ -1186,14 +1187,20 @@ fn start(
             let _ = tell.send(Ended::Ran(ran));
         })
         .map_err(|e| ProcessError::Runtime(format!("the node's thread: {e}")))?;
+    let diag_id = config_id;
     match heard.recv() {
         Ok(Ended::Ran(ran)) => {
+            crate::diag::say(diag_id, &format!("heard-ran ok={}", ran.is_ok()));
             thread
                 .join()
                 .map_err(|_| ProcessError::Runtime("the node's thread unwound".into()))?;
+            crate::diag::say(diag_id, "joined");
             ran
         }
-        Ok(Ended::AtOnce(why)) => Err(ProcessError::Stopped(why)),
+        Ok(Ended::AtOnce(why)) => {
+            crate::diag::say(diag_id, &format!("heard-at-once {why}"));
+            Err(ProcessError::Stopped(why))
+        }
         Err(_) => Err(ProcessError::Runtime(
             "the node's thread ended without saying how".into(),
         )),
@@ -1771,7 +1778,13 @@ async fn serve(
     // Whether standard input may say more: a node that does not end with it runs on once it closes,
     // as `mantle serve` does under a service manager, whose input is empty.
     let mut input_open = true;
+    // Scratch (diag/roll-stop-bound): the loop's iterations while stopping, and the slowest.
+    let mut diag_turns: u64 = 0;
+    let mut diag_slowest: (u64, u64, &'static str) = (0, 0, "");
+    let mut diag_after: u64 = hyper_rt::futures::now_ns();
+    let mut diag_progress: u64 = 0;
     loop {
+        let diag_before = hyper_rt::futures::now_ns();
         let ended = {
             let turn = pin!(node.turn());
             let line = pin!(async {
@@ -1793,6 +1806,43 @@ async fn serve(
             });
             race3(turn, line, race3(signal, bound, accepting.as_mut())).await
         };
+        if stop.by.is_some() {
+            let woke = hyper_rt::futures::now_ns();
+            let waited = woke.saturating_sub(diag_before) / 1_000_000;
+            let between = if diag_turns == 0 {
+                0
+            } else {
+                diag_before.saturating_sub(diag_after) / 1_000_000
+            };
+            let what = match &ended {
+                Either3::First(_) => "turn",
+                Either3::Second(_) => "line",
+                Either3::Third(Either3::First(_)) => "signal",
+                Either3::Third(Either3::Second(_)) => "bound",
+                Either3::Third(Either3::Third(_)) => "listener",
+            };
+            diag_turns = diag_turns.saturating_add(1);
+            if waited > diag_slowest.0 {
+                diag_slowest = (waited, diag_turns, what);
+            }
+            if waited >= 250 || between >= 100 {
+                crate::diag::say(
+                    config.id,
+                    &format!(
+                        "slow-loop iteration={diag_turns} waited_ms={waited} by={what} \
+                         body_before_ms={between}"
+                    ),
+                );
+            }
+            diag_after = woke;
+            if woke.saturating_sub(diag_progress) >= 2_000_000_000 {
+                if diag_progress != 0 {
+                    let state = node.stop_diag();
+                    crate::diag::say(config.id, &format!("progress {state}"));
+                }
+                diag_progress = woke;
+            }
+        }
         match ended {
             Either3::First(turned) => turned?,
             Either3::Second(Ok(0)) if ends_with_input => return Ok(()),
@@ -1802,6 +1852,10 @@ async fn serve(
                 while let Some(end) = pending.iter().position(|b| *b == b'\n') {
                     let line: Vec<u8> = pending.drain(..=end).collect();
                     if line.trim_ascii() == b"stop" {
+                        crate::diag::say(
+                            config.id,
+                            &format!("asked by=line pid={}", std::process::id()),
+                        );
                         stop_asked(&mut stop, &mut node, (&mut output, &at_once)).await?;
                     } else if line.trim_ascii() == b"chunks" {
                         let (received, written, held, unkept) = node.chunk_bytes()?;
@@ -1824,11 +1878,23 @@ async fn serve(
             Either3::Second(Err(e)) => return Err(ProcessError::Runtime(format!("{e:?}"))),
             Either3::Third(Either3::First(signal)) => {
                 signal.map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
+                crate::diag::say(
+                    config.id,
+                    &format!("asked by=signal pid={}", std::process::id()),
+                );
                 stop_asked(&mut stop, &mut node, (&mut output, &at_once)).await?;
             }
             Either3::Third(Either3::Second(slept)) => {
                 slept.map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
                 let why = "the stop's bound passed";
+                let state = node.stop_diag();
+                crate::diag::say(
+                    config.id,
+                    &format!(
+                        "BOUND-PASSED loop_iterations={diag_turns} slowest_wait={diag_slowest:?} \
+                         {state}"
+                    ),
+                );
                 let _ = at_once.try_send(Ended::AtOnce(why));
                 return Err(ProcessError::Stopped(why));
             }
@@ -1959,10 +2025,30 @@ async fn serve(
         }
         if node.stopped() {
             say(&mut output, "stopped\n").await?;
+            crate::diag::say(
+                config.id,
+                &format!(
+                    "stopped-said loop_iterations={diag_turns} slowest_wait={diag_slowest:?} \
+                     left_ms={}",
+                    stop.by
+                        .unwrap_or(0)
+                        .saturating_sub(hyper_rt::futures::now_ns())
+                        / 1_000_000
+                ),
+            );
             // Nothing the node holds is owed to the cell: its log and volumes close, and then the
             // stop is kept, with the node's time run, so its next start counts no crash.
             let ran_ns = hyper_rt::futures::now_ns().saturating_sub(started_ns);
+            let diag_id = config.id;
+            let dropping = hyper_rt::futures::now_ns();
             drop(node);
+            crate::diag::say(
+                diag_id,
+                &format!(
+                    "node-dropped took_ms={}",
+                    hyper_rt::futures::now_ns().saturating_sub(dropping) / 1_000_000
+                ),
+            );
             let stopped = Stopped {
                 run,
                 exposure_ns: own.exposure_ns.saturating_add(ran_ns),
@@ -1971,6 +2057,7 @@ async fn serve(
             layout
                 .keep_stopped(stopped)
                 .map_err(|e| ProcessError::History(e.to_string()))?;
+            crate::diag::say(diag_id, "stop-kept");
             return Ok(());
         }
     }
@@ -2111,7 +2198,9 @@ async fn stop_asked<E: Engine + 'static>(
         return Err(ProcessError::Stopped(why));
     }
     node.stop();
-    say(output, "stopping\n").await
+    let said = say(output, "stopping\n").await;
+    crate::diag::say(node.id(), "stopping-said");
+    said
 }
 
 async fn say(output: &mut hyper_rt::stdio::Stdout, line: &str) -> Result<(), ProcessError> {

@@ -944,6 +944,19 @@ pub(crate) struct Cell {
     pub(crate) _root: tempfile::TempDir,
 }
 
+/// Scratch (diag/roll-stop-bound): a stamped line of the test's own, naming its test.
+pub(crate) fn diag_roll(text: &str) {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let thread = std::thread::current();
+    let line = format!(
+        "DIAG-ROLL {ms} test={} {text}\n",
+        thread.name().unwrap_or("?")
+    );
+    let _ = std::io::stderr().write_all(line.as_bytes());
+}
+
 /// Sends `child` the signal that stops a node in order: SIGTERM, by the system's `kill`.
 pub(crate) fn stop_signal(child: &Child) {
     let sent = Command::new("kill")
@@ -1489,12 +1502,20 @@ impl Cell {
     /// meanwhile, so a stop that holds still past the quiet period fails the test.
     pub(crate) fn stop(&mut self, id: u64) -> std::process::ExitStatus {
         self.refusing = Some(id);
+        let pid = self.running[&id].child.id();
+        diag_roll(&format!("stop-ask node={id} pid={pid}"));
+        let asked = std::time::Instant::now();
         if cfg!(unix) {
             stop_signal(&self.running[&id].child);
         } else {
             self.say_to(id, b"stop\n");
         }
-        self.ended()
+        let exited = self.ended();
+        diag_roll(&format!(
+            "stop-end node={id} pid={pid} took_ms={} exited={exited}",
+            asked.elapsed().as_millis()
+        ));
+        exited
     }
 
     /// Asks node `id`'s process to stop twice in one write, which its input takes whole, so the

@@ -87,8 +87,15 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `f2ad9c2` (hyper-raft `main`, its CI run 40466352588 green), with no local
-delta**, taken by `scripts/snapshot-hyper-raft.py` (Python 3.11 or later): main's merge of kiln's
+**Every crate at `f5a7dbd` (hyper-raft branch `owner-holds-body`: `f2ad9c2` and one commit, made
+for mantle's fill test on windows-x86_64), with no local delta**, taken by
+`scripts/snapshot-hyper-raft.py` (Python 3.11 or later). Its commit changes hyper-transport alone:
+an owner that read part of a body, its last read wanting more than had arrived, and then holds the
+rest unread while its peer fills the window, is no longer judged against the peer; a node holding a
+PutObject's body while the chunks it carries go durable refused the exchange `Stalled` on its own
+side (hyper-raft docs/transport.md §4al; mantle CI run 40612231375). Before it, every crate was at
+`f2ad9c2` (hyper-raft `main`, its CI run 40466352588 green), with no local delta, taken by
+`scripts/snapshot-hyper-raft.py`: main's merge of kiln's
 CP-T2.2 disk mode (`cp/t2.2-mode`) over `degraded-suspicion-main`, which holds `e65afff`'s changes
 as main took them (`fbaaa6c`), and the rest of the 124 commits main holds that `e65afff` does not,
 since `2b13b15`, the base the two share. Mantle's code meets five of them, each kept at its behavior

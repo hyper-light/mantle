@@ -4187,12 +4187,17 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
     }
 
     /// Whether a period that moved nothing for `exchange` is this side's doing, not the peer's,
-    /// and so no evidence against the peer: its owner is not reading the body it is answered with,
-    /// or it has bytes to send that the peer's credit would take (`peer_takes`) and this side has
-    /// not sent, because its owner has not offered them or a more urgent class of this side's
-    /// took the credit first. Only a peer that stops taking or answering ends an exchange.
+    /// and so no evidence against the peer: its owner is not reading the body it is answered with
+    /// (its last read had all it asked for, or bytes arrived for it since one that wanted more), or
+    /// it has bytes to send that the peer's credit would take (`peer_takes`) and this side has not
+    /// sent, because its owner has not offered them or a more urgent class of this side's took the
+    /// credit first. Only a peer that stops taking or answering ends an exchange.
     fn ours_to_move(exchange: &Exchange<C::Class>, peer_takes: u64) -> bool {
-        let unread = exchange.incoming.state == In::Body && !exchange.starved;
+        // A read that wanted more holds the sender to account only until more arrives: then the
+        // owner is told (`ready_sent`), and a period that brings nothing is the window it holds,
+        // full (docs/transport.md §4al).
+        let unread =
+            exchange.incoming.state == In::Body && (!exchange.starved || exchange.ready_sent);
         let sending = matches!(exchange.out.state, Out::Head | Out::Body | Out::Trailer);
         let unsent = sending && exchange.stream.is_some() && peer_takes > 0;
         unread || unsent

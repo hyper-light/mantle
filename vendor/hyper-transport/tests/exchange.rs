@@ -1561,7 +1561,15 @@ struct Slow {
 
 impl Slow {
     fn open(net: &mut Net<Node<Mantle>, Node<Mantle>>, kind: Kind, seed: u8, body: u64) -> Self {
-        let progress = hyper_transport::Progress::new(PERIOD).unwrap();
+        Self::open_waiting(net, (kind, seed, body), PERIOD)
+    }
+    /// An exchange whose asker gives its peer `period` to move it.
+    fn open_waiting(
+        net: &mut Net<Node<Mantle>, Node<Mantle>>,
+        (kind, seed, body): (Kind, u8, u64),
+        period: Duration,
+    ) -> Self {
+        let progress = hyper_transport::Progress::new(period).unwrap();
         let exchange = net
             .a
             .open(net.now, 2, kind, &[seed, 1, 2, 3], Some(body), progress)
@@ -1751,6 +1759,58 @@ fn an_owner_late_to_write_is_not_refused_by_its_own_side() {
         bulk.read(&mut net.a);
     }
     assert_eq!(refused, None, "the server saw {:?}", server.refused);
+    assert_eq!(bulk.read, bulk.body);
+}
+
+/// An owner that reads a body as it arrives, each read wanting more than had come, and then holds
+/// the rest unread for three periods while its peer fills the window, as mantle's node holds a
+/// PutObject's body while the chunks it carries go durable: the window the owner holds is this
+/// side's doing, so its side does not refuse the exchange as stalled (docs/transport.md §4al). The
+/// asker gives it eight periods, as a client waiting for its object does; one whose own period is
+/// shorter than the hold ends the exchange itself, as unread (focal's audit F38).
+#[test]
+fn an_owner_that_reads_then_holds_a_body_is_not_refused_by_its_own_side() {
+    let pair = Pair::new();
+    let mut net = connected::<Mantle, Mantle>(&pair, limits(), 1 << 30);
+    let mut server = Server::new();
+    let mut piece = vec![0u8; PIECE];
+    let mut bulk = Slow::open_waiting(&mut net, (Kind::Snapshot, 9, 8 << 20), PERIOD * 8);
+    let mut held_at = None;
+    let mut refused = None;
+    let mut turns = 0u64;
+    while !bulk.done {
+        turns += 1;
+        assert!(turns < 1_000_000, "the exchange never ended");
+        bulk.write(&mut net.a, &mut piece);
+        if held_at.is_none() && bulk.written >= 1 << 20 {
+            server.hold_bulk = true;
+            held_at = Some(net.now);
+        }
+        if held_at.is_some_and(|at| net.now - at >= PERIOD * 3) {
+            server.hold_bulk = false;
+        }
+        net.exchange();
+        server.serve(&mut net.b);
+        if !net.exchange() {
+            net.advance_within(Duration::from_millis(100));
+        }
+        while let Some(event) = net.a.poll_event() {
+            match event {
+                Event::Reply { .. } => bulk.replied = true,
+                Event::Refused {
+                    refusal, by_peer, ..
+                } => {
+                    refused = Some((refusal, by_peer));
+                    bulk.done = true;
+                }
+                _ => {}
+            }
+        }
+        bulk.read(&mut net.a);
+    }
+    assert!(held_at.is_some(), "the server never held the body");
+    assert_eq!(refused, None, "the server saw {:?}", server.refused);
+    assert!(server.refused.is_empty(), "{:?}", server.refused);
     assert_eq!(bulk.read, bulk.body);
 }
 

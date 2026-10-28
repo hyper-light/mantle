@@ -303,10 +303,15 @@ change recorded with its inputs (audit §16.2).
 
 *As built (2026-10-26).* The native protocol's Open, Append, Offset and Finish carry the five steps
 (node.md §4.1). The run length is fixed at the Open from the bounds alone (`name::run_length`):
-whole 64 KiB segments, at least S3's least part and at most its largest and the client's buffer, and
-for a stated length long enough that 10,000 runs hold it; a stream of no stated length is cut into
-runs as long as the client's buffer, so 10,000 of them hold the most it can be, as the AWS CLI cuts
-a stream into its chunk size and asks `--expected-size` past what 10,000 of them hold (research/74).
+whole blocks of the layout new blocks take (§1; 127 segments of 64 KiB under three copies), or
+whole 64 KiB segments where the client's buffer holds no block, at least S3's least part and at most
+its largest and the client's buffer, and for a stated length long enough that 10,000 runs hold it;
+a stream of no stated length is cut into runs as long as the client's buffer, so 10,000 of them hold
+the most it can be, as the AWS CLI cuts a stream into its chunk size and asks `--expected-size` past
+what 10,000 of them hold (research/74). Whole blocks because a run ends its file's last block: runs
+of the least part, 5 MiB, made 5 MiB blocks under three copies, each chunk's record took a segment
+sized for the largest chunk alone, and the cells of `mantle bench transfer` were refused as full
+with 62.4% of their segments holding bytes (docs/measurements/2026-10-28-transfer-scale.md).
 The two measured terms, `g/r_meta` and Young's, wait for admission's run-commit share and the
 interruption rate's estimator; until they come a run is the smallest the bounds allow, whatever the
 path, and the interval does not adapt. Every run is its own exchange: the client sends the next run

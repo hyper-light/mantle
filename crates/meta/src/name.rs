@@ -43,29 +43,41 @@ fn div_ceil(a: u64, b: u64) -> Option<u64> {
     Some(if r == 0 { q } else { q.saturating_add(1) })
 }
 
-/// The length of every run of a native upload but its last (gateway.md §2.1): whole 64 KiB
-/// segments, so a run's file seals whole segments and the MD5 across runs stops at a block
-/// boundary; at least S3's least part and at most its largest, at most the client's `buffer`
-/// where its source cannot be read again; and long enough that 10,000 runs, a file's extents,
-/// hold the object: its stated `length`, or, where none is stated, the most runs of the
-/// buffer's length hold. The plan's measured terms, the run commits the principal's metadata
-/// share admits and Young's interval from goodput, checkpoint cost and interruption rate, are
-/// not yet built, so a run is the smallest these bounds allow. `None` where none fits: a buffer
-/// below the least part, or a length past what 10,000 runs within the buffer hold.
-pub fn run_length(length: Option<u64>, buffer: Option<u64>) -> Option<u64> {
+/// The length of every run of a native upload but its last (gateway.md §2.1): whole blocks of
+/// the layout new blocks take, `block` plaintext bytes each, so that a run's file seals whole
+/// segments, the MD5 across runs stops at a block boundary, and no run cuts a block short; where
+/// the client's `buffer` holds no whole block, whole 64 KiB segments. A short block's chunks fill
+/// their volumes' segments no more than they hold: runs of S3's least part, 5 MiB, made 5 MiB
+/// chunks, and a segment sized for the largest chunk, 8 MiB, held one of them, 62.4% of it
+/// (docs/measurements/2026-10-28-transfer-scale.md). At least S3's least part and at most its
+/// largest, at most the client's `buffer` where its source cannot be read again; and long enough
+/// that 10,000 runs, a file's extents, hold the object: its stated `length`, or, where none is
+/// stated, the most runs of the buffer's length hold. The plan's measured terms, the run commits
+/// the principal's metadata share admits and Young's interval from goodput, checkpoint cost and
+/// interruption rate, are not yet built, so a run is the smallest these bounds allow. `None` where
+/// none fits: a buffer below the least part, or a length past what 10,000 runs within the buffer
+/// hold.
+pub fn run_length(length: Option<u64>, buffer: Option<u64>, block: u64) -> Option<u64> {
     let segment = u64::try_from(mantle_s3::seal::SEGMENT).ok()?;
-    let cap = buffer
+    let held = buffer
         .unwrap_or(MAX_PART)
         .min(MAX_PART)
         .checked_div(segment)?
         .checked_mul(segment)?;
+    let unit = if block >= segment && block.is_multiple_of(segment) && block <= held {
+        block
+    } else {
+        segment
+    };
+    let cap = held.checked_div(unit)?.checked_mul(unit)?;
+    let least = div_ceil(MIN_PART, unit)?.checked_mul(unit)?;
     let run = match length {
-        Some(length) => div_ceil(div_ceil(length, u64::from(MAX_PART_NUMBER))?, segment)?
-            .checked_mul(segment)?
-            .max(MIN_PART),
+        Some(length) => div_ceil(div_ceil(length, u64::from(MAX_PART_NUMBER))?, unit)?
+            .checked_mul(unit)?
+            .max(least),
         None => cap,
     };
-    if (MIN_PART..=cap).contains(&run) {
+    if (least..=cap).contains(&run) {
         Some(run)
     } else {
         None
@@ -3202,30 +3214,37 @@ mod tests {
     }
 
     /// A native upload's runs are as long as 10,000 of them need to hold its stated length,
-    /// within S3's part sizes and whole 64 KiB segments; with no length stated, as long as the
-    /// client's buffer lets them be; and none where no run fits.
+    /// within S3's part sizes, in whole blocks; with no length stated, as long as the client's
+    /// buffer lets them be; in whole 64 KiB segments where the buffer holds no block; and none
+    /// where no run fits.
     #[test]
-    fn a_native_uploads_run_fits_s3s_parts_and_the_client() {
+    fn a_native_uploads_run_fits_s3s_parts_whole_blocks_and_the_client() {
         let segment = mantle_s3::seal::SEGMENT as u64;
-        assert_eq!(run_length(Some(1), None), Some(MIN_PART));
-        // 10,000 runs of the least part hold 48.8 GiB; past it, runs grow a segment at a time.
-        assert_eq!(run_length(Some(48 << 30), None), Some(MIN_PART));
-        assert_eq!(
-            run_length(Some(50 << 30), None),
-            Some(MIN_PART + 2 * segment)
-        );
+        // Three copies' block: 127 segments of a chunk of 8 MiB (gateway layout).
+        let block = 127 * segment;
+        assert_eq!(run_length(Some(1), None, block), Some(block));
+        // 10,000 one-block runs hold 77.5 GiB; past it, runs grow a block at a time.
+        assert_eq!(run_length(Some(77 << 30), None, block), Some(block));
+        assert_eq!(run_length(Some(78 << 30), None, block), Some(2 * block));
         let long = 1u64 << 40;
-        let run = run_length(Some(long), None).unwrap();
-        assert_eq!(run % segment, 0);
-        assert!(long.div_ceil(run) <= 10_000 && long.div_ceil(run - segment) > 10_000);
-        assert_eq!(run_length(None, Some(8 << 20)), Some(8 << 20));
-        assert_eq!(run_length(None, Some((8 << 20) + 5)), Some(8 << 20));
-        assert_eq!(run_length(None, None), Some(MAX_PART));
-        assert_eq!(run_length(None, Some(1 << 20)), None);
-        assert_eq!(run_length(Some(long), Some(8 << 20)), None);
+        let run = run_length(Some(long), None, block).unwrap();
+        assert_eq!(run % block, 0);
+        assert!(long.div_ceil(run) <= 10_000 && long.div_ceil(run - block) > 10_000);
+        // A buffer of the AWS CLI's 8 MiB holds one block; one of 6 MiB none, and its runs are
+        // whole segments, the most it holds.
+        assert_eq!(run_length(None, Some(8 << 20), block), Some(block));
+        assert_eq!(run_length(None, Some(6 << 20), block), Some(6 << 20));
+        assert_eq!(
+            run_length(None, None, block),
+            Some(MAX_PART / block * block)
+        );
+        assert_eq!(run_length(None, Some(1 << 20), block), None);
+        assert_eq!(run_length(Some(long), Some(8 << 20), block), None);
+        // A block of whole segments under S3's least part is run in as many as reach it.
+        assert_eq!(run_length(Some(1), None, 16 * segment), Some(80 * segment));
         let most = MAX_PART * u64::from(MAX_PART_NUMBER);
-        assert_eq!(run_length(Some(most), None), Some(MAX_PART));
-        assert_eq!(run_length(Some(most + 1), None), None);
+        assert_eq!(run_length(Some(most), None, segment), Some(MAX_PART));
+        assert_eq!(run_length(Some(most + 1), None, block), None);
     }
 
     /// A native upload's runs are taken in order, each at the offset the last left: one at

@@ -957,6 +957,17 @@ fn resumed_whole(
 }
 
 /// A native upload streamed from standard input in runs the node cuts (gateway.md §2.1): a copy
+/// The least run of a native upload in a cell of three founders, three copies of each block: one
+/// block of their layout (`mantle_meta::name::run_length`), the run of an object 10,000 such runs
+/// hold.
+fn least_run() -> usize {
+    let layout =
+        mantle_gateway::layout::Layout::new(mantle_ec::durability::Scheme::Copies(3)).unwrap();
+    let segment = u64::try_from(mantle_s3::seal::SEGMENT).unwrap();
+    let block = layout.segments_per_block() * segment;
+    usize::try_from(mantle_meta::name::run_length(Some(1), None, block).unwrap()).unwrap()
+}
+
 /// SIGKILLed once a run committed, and one SIGKILLed with a run half sent, each run again resumes
 /// from the cell's durable offset, its committed runs not sent again, and its object is the bytes
 /// whole, its ETag their MD5; a copy resumed from a source changed below that offset ends in
@@ -966,8 +977,8 @@ fn a_copy_killed_at_a_run_boundary_or_mid_run_resumes_and_a_changed_source_is_re
     let mut cell = Cell::made_alone(three_founders);
     let dir = made_client(&cell, "client");
     mantle(&dir, &["mb", &format!("s3://{RESUMED}")], None);
-    // With its length stated, a copy's runs are S3's least part.
-    let run = 5usize << 20;
+    // With its length stated, a copy's runs are the least whole-block run.
+    let run = least_run();
     let size = 4 * run + (1 << 20);
     let total = 5u16;
 
@@ -1073,7 +1084,7 @@ fn a_copy_through_a_node_killed_mid_run_resumes_from_the_cells_offset_once_it_is
     let dir = made_client(&cell, "client");
     let bound = cell.bound_quic();
     mantle(&dir, &["mb", &format!("s3://{RESUMED}")], None);
-    let run = 5usize << 20;
+    let run = least_run();
     let size = 4 * run + (1 << 20);
     let object = bytes(14, size);
     let mut copying = Copying::start(&dir, "node", size);

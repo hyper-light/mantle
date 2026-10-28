@@ -570,7 +570,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Some(g) if self.stopping() || self.jobs.len() >= g.objects => {
                 Work::Draining(Box::new(Reply::status(Status::SlowDown)))
             }
-            Some(_) => work(op, Vec::new()),
+            Some(_) => {
+                let block = self.open_block(&op);
+                work(op, Vec::new(), block)
+            }
         };
         self.jobs.push(Job {
             door: Door::Local(Box::new(Local {
@@ -619,11 +622,27 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
         }
         let carry = fields.split_off(wanted.min(fields.len()));
-        job.work = match head.op(fields) {
-            Err(_) => Work::Draining(Box::new(Reply::status(Status::Malformed))),
-            Ok(op) => work(op, carry),
-        };
+        let op = head.op(fields);
+        let block = op.as_ref().ok().and_then(|op| self.open_block(op));
+        if let Some(job) = self.jobs.get_mut(at) {
+            job.work = match op {
+                Err(_) => Work::Draining(Box::new(Reply::status(Status::Malformed))),
+                Ok(op) => work(op, carry, block),
+            };
+        }
         Ok(false)
+    }
+
+    /// For a native upload's Open, the plaintext bytes of a whole block of the layout new blocks
+    /// take, the unit its runs are cut in (`name::run_length`); none for any other operation, or
+    /// where the volume table names no scheme yet.
+    fn open_block(&mut self, op: &Op) -> Option<u64> {
+        if !matches!(op, Op::Open { .. }) {
+            return None;
+        }
+        let scheme = self.table().ok()?.scheme?;
+        let segments = Layout::new(scheme).ok()?.segments_per_block();
+        segments.checked_mul(u64::try_from(mantle_s3::seal::SEGMENT).ok()?)
     }
 
     /// The group of the range this node hosts of `layer`: the cell's one range of it.
@@ -2723,8 +2742,8 @@ fn directory() -> Vec<Descriptor> {
 }
 
 /// The work an operation's request names, the bytes read past its fields the start of a put's
-/// body.
-fn work(op: Op, carry: Vec<u8>) -> Work {
+/// body; a native upload's Open cuts its runs in `block`'s whole blocks (`Host::open_block`).
+fn work(op: Op, carry: Vec<u8>, block: Option<u64>) -> Work {
     match op {
         Op::Create { bucket, .. } => Work::Bucket(Box::new(Coordinating {
             bucket,
@@ -2907,27 +2926,33 @@ fn work(op: Op, carry: Vec<u8>) -> Work {
             buffer,
             checksum,
             ..
-        } => match name::run_length(length, buffer) {
-            Some(run) => Work::Command(Box::new(Commanding {
-                bucket,
-                then: Then::Open {
-                    key,
-                    length,
-                    checksum,
-                    run,
-                },
-                asked: false,
-            })),
-            // No run fits: an object past what 10,000 runs of S3's largest part hold, or a
-            // buffer below its least part or too small for the length's runs.
-            None if length.is_some_and(|l| {
-                l > name::MAX_PART.saturating_mul(u64::from(name::MAX_PART_NUMBER))
-            }) =>
-            {
-                Work::Draining(Box::new(Reply::status(Status::EntityTooLarge)))
+        } => {
+            // No scheme to lay its blocks out by: nothing can be put.
+            let Some(block) = block else {
+                return Work::Draining(Box::new(Reply::status(Status::Failed)));
+            };
+            match name::run_length(length, buffer, block) {
+                Some(run) => Work::Command(Box::new(Commanding {
+                    bucket,
+                    then: Then::Open {
+                        key,
+                        length,
+                        checksum,
+                        run,
+                    },
+                    asked: false,
+                })),
+                // No run fits: an object past what 10,000 runs of S3's largest part hold, or a
+                // buffer below its least part or too small for the length's runs.
+                None if length.is_some_and(|l| {
+                    l > name::MAX_PART.saturating_mul(u64::from(name::MAX_PART_NUMBER))
+                }) =>
+                {
+                    Work::Draining(Box::new(Reply::status(Status::EntityTooLarge)))
+                }
+                None => Work::Draining(Box::new(Reply::status(Status::InvalidArgument))),
             }
-            None => Work::Draining(Box::new(Reply::status(Status::InvalidArgument))),
-        },
+        }
         // A run's checksum is its upload's, in a trailer, which the run is checked by.
         Op::Append { trailing: None, .. } => {
             Work::Draining(Box::new(Reply::status(Status::InvalidRequest)))
@@ -3168,10 +3193,10 @@ mod tests {
             trailing: None,
         };
         assert_eq!(
-            refused(&work(part(name::MAX_PART + 1), Vec::new())),
+            refused(&work(part(name::MAX_PART + 1), Vec::new(), None)),
             Some(Status::EntityTooLarge)
         );
-        assert_eq!(refused(&work(part(name::MAX_PART), Vec::new())), None);
+        assert_eq!(refused(&work(part(name::MAX_PART), Vec::new(), None)), None);
         let put = Op::Put {
             bucket: "b".into(),
             key: "k".into(),
@@ -3183,7 +3208,7 @@ mod tests {
             trailing: None,
         };
         assert_eq!(
-            refused(&work(put, Vec::new())),
+            refused(&work(put, Vec::new(), None)),
             Some(Status::EntityTooLarge)
         );
         // A checksum in the fields and a trailer's both.
@@ -3201,7 +3226,7 @@ mod tests {
             trailing: Some(checksum::Algorithm::Crc32),
         };
         assert_eq!(
-            refused(&work(twice, Vec::new())),
+            refused(&work(twice, Vec::new(), None)),
             Some(Status::InvalidRequest)
         );
         let create = |algorithm, full| Op::CreateUpload {
@@ -3218,7 +3243,7 @@ mod tests {
             (Algorithm::Crc32c, true, true),
             (Algorithm::Crc32c, false, true),
         ] {
-            let status = refused(&work(create(algorithm, full), Vec::new()));
+            let status = refused(&work(create(algorithm, full), Vec::new(), None));
             assert_eq!(
                 status,
                 if ok {

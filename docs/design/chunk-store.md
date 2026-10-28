@@ -641,7 +641,21 @@ when deletes are uniform [Des14], is 1–3% better there and 20–95% worse unde
 copies are freed once they are durable and indexed. Victims of live fraction `u` free `1 − u` segments each [RO92 §3.4],
 so a net gain is due once they have held a segment's worth of dead space beyond what
 packing their live data costs; a pass that gains nothing by then stops, and cleaning waits
-until more data is deleted. A pass's gain is the victims it frees less the segments its
+until more data is deleted. Cleaning gains space only by writing live data back to fewer
+segments than it came from [RO92 §3.3], and a record never spans segments, so the room a
+segment leaves beside a record too large to share it is no space cleaning gives back:
+BSD-LFS warned that cleaning a segment can "consume more space than it frees" [SBMS93 §3.5].
+A volume of 8 MiB chunks keeps 77 KiB beside each in segments of 8,404,992 bytes, which the
+victims' estimate counted as dead space, and near full a pass moved record after record, each
+into a segment of its own, for ten seconds before it found nothing gained, while puts waited
+on its verdict ([measurements](../measurements/2026-10-28-transfer-scale.md)). A pass
+therefore lays out its relocations before it moves anything: from the lengths the index keeps
+with its record places (below), each victim's live records are placed as the writer places a
+relocation, where the cleaner's open segment takes its next record, sealing it and opening
+another when one does not fit, each batch padded to a block, and the pass cleans the fewest
+victims, in the order the policy chooses them, whose records open fewer segments than they
+free. With none by the time a segment's worth of gain is due, the pass is futile without a
+byte read or written. A pass's gain is the victims it frees less the segments its
 relocations open, counted by the writer; the change in free segments over the pass counts
 client writes as well, and a pass that freed a segment while a client opened one read as
 futile, which answers writes `Full` while space could be reclaimed. The cleaner has the
@@ -685,18 +699,19 @@ dispatched in the gaps between the writer's bursts on that device, not interleav
 client reads, which cannot wait, are what hedged reads across replicas are for (gateway.md §3).
 
 A client write with no free segment to go to is `Busy`, to be retried, while cleaning may
-still free one, and `Full` once cleaning has been tried on the data deleted so far and
-gained nothing: only trying tells how tightly relocated records pack. A relocation frees
+still free one, and `Full` once a pass over the data deleted so far has gained nothing; the
+pass's layout tells how tightly relocated records pack without moving them. A relocation frees
 no space (an equal copy replaces the old), so only deletes count as new dead data. A relocated record keeps its sequence; the index accepts it only if
 the chunk still points at the old location, so a concurrent delete wins.
 
 The cleaner and the scrubber find a segment's records through the index's record places:
-the `(segment, offset)` of every live record, ordered, kept beside the key map. It is LFS's
-segment summary [RO92 §3.3] held in memory, and it replaces a walk of the whole map, under
-its lock, for every segment cleaned or scrubbed. It costs about 20 bytes a fragment,
-measured with a counting allocator: 19.6 for 4M records appended in order, 15.9 once a
-third are deleted at random. The whole index of chunks of one fragment each, as the node puts
-them, asks 229.6 bytes a fragment once its table has grown, and at most 346 a fragment and 146
+the `(segment, offset)` of every live record with its payload's length, ordered, kept beside
+the key map. It is LFS's segment summary [RO92 §3.3] held in memory, and it replaces a walk of
+the whole map, under its lock, for every segment cleaned or scrubbed. The places cost about 20
+bytes a fragment, measured with a counting allocator: 19.6 for 4M records appended in order,
+15.9 once a third are deleted at random; the lengths, from which a pass lays out its
+relocations, 6.7 more. The whole index of chunks of one fragment each, as the node puts
+them, asks 236.3 bytes a fragment once its table has grown, and at most 352 a fragment and 180
 more, the peak a growth reaches while the table's old and new buckets are both held
 (`index::most_bytes`, counted through twenty doublings by `tests/index_memory.rs`); a volume's
 fragment budget is what its share of memory holds at that peak. Each record
@@ -704,7 +719,8 @@ is read where it lies and verified from its own header, then counted only if the
 still names it; a record too damaged to name itself is attributed by a search of the map,
 which only damage pays for.
 
-References for this section: [RKO14] S. M. Rumble, A. Kejriwal, J. Ousterhout, "Log-structured
+References for this section: [SBMS93] M. Seltzer, K. Bostic, M. K. McKusick, C. Staelin, "An
+Implementation of a Log-Structured File System for UNIX", USENIX Winter 1993, pp. 307–326. [RKO14] S. M. Rumble, A. Kejriwal, J. Ousterhout, "Log-structured
 Memory for DRAM-based Storage", FAST 2014. [WLL+22] Q. Wang, J. Li, P. P. C. Lee, T. Ouyang,
 C. Shi, L. Huang, "Separating Data via Block Invalidation Time Inference for Write
 Amplification Reduction in Log-Structured Storage", FAST 2022. [Des14] P. Desnoyers,

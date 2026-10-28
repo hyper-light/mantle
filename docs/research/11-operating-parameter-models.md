@@ -558,7 +558,10 @@ stop cleaning at      F_stop = F_start + H,  with H large enough to amortize a p
                       (RO92 cleaned "a few tens of segments at a time"); measure the per-pass setup cost
 FUTILE_AFTER          = ⌈1/(1 − ū)⌉, where ū is the mean live fraction of this pass's victims: k victims free
                         k segments while their live data fills up to ⌈k·ū⌉ new ones, so the first net gain comes
-                        at k = ⌈1/(1 − ū)⌉
+                        at k = ⌈1/(1 − ū)⌉. That counts live data packing by the byte; a record never spans
+                        segments, so k victims each holding one record longer than half a segment fill k new
+                        ones whatever ū says, SBMS93's degenerate case. A pass lays out its victims' records
+                        as the writer will before it moves one (chunk-store.md §8), and this bounds the plan
 victim cap            relocation cost per byte freed is u/(1 − u); for a cleaning budget B_c (bytes copied per
                         byte freed), clean only victims with u ≤ B_c/(1 + B_c).  B_c = 3 gives u ≤ 0.75,
                         which is the case where FUTILE_AFTER = 4 is right

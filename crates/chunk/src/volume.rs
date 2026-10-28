@@ -236,6 +236,10 @@ impl<F: BlockFile + Sync + 'static> Volume<F> {
             futile_at: std::sync::atomic::AtomicU64::new(u64::MAX),
             submitted: std::sync::atomic::AtomicU64::new(0),
             clean_opened: std::sync::atomic::AtomicU64::new(0),
+            clean_open: std::sync::atomic::AtomicU64::new(crate::writer::open_at(
+                [client, clean, whole],
+                crate::writer::Stream::Clean,
+            )),
             checkpoints: std::sync::atomic::AtomicU64::new(0),
             queue: std::sync::Mutex::new(crate::writer::Queue::default()),
             peak_rate: std::sync::atomic::AtomicU64::new(0),
@@ -1447,8 +1451,10 @@ mod tests {
 
     /// Every batch frame the writer makes stays within the bound its settings are checked
     /// against (audit S13), under eight writers whose puts each seal a segment and open the
-    /// next, deletes that leave segments to free, and the cleaner's relocations. The log's
-    /// frames are read back from every block where one can start.
+    /// next, deletes that leave segments to free, and the cleaner's passes beside them until
+    /// they finish. No two of the eight's records share a segment, so moving them gains
+    /// nothing; the cleaner's relocations come from small chunks put first, three in four
+    /// deleted. The log's frames are read back from every block where one can start.
     #[test]
     fn batch_frames_stay_within_the_bound_their_settings_are_checked_against() {
         let requests = 8usize;
@@ -1470,30 +1476,50 @@ mod tests {
         let volume = Volume::format(issuer(), file.clone(), 48 << 20, config).unwrap();
         // Two such records never share a segment.
         let len = crate::writer::max_payload(&volume.shared.geometry, 12) as usize / 2 + 1;
-        std::thread::scope(|s| {
-            for t in 0..8u64 {
-                let v = &volume;
-                s.spawn(move || {
-                    for i in 0..150u64 {
-                        let n = t * 1000 + i;
-                        loop {
-                            match v.put(key(n), &vec![n as u8; len]) {
-                                Err(ChunkError::Busy) => std::thread::yield_now(),
-                                other => break other.unwrap(),
+        for i in 0..150u64 {
+            let n = 100_000 + i;
+            volume.put(key(n), &vec![n as u8; len / 8]).unwrap();
+            if i % 4 != 0 {
+                volume.delete(key(n)).unwrap();
+            }
+        }
+        let mut cleaned = std::thread::scope(|s| {
+            let writers: Vec<_> = (0..8u64)
+                .map(|t| {
+                    let v = &volume;
+                    s.spawn(move || {
+                        for i in 0..150u64 {
+                            let n = t * 1000 + i;
+                            loop {
+                                match v.put(key(n), &vec![n as u8; len]) {
+                                    Err(ChunkError::Busy) => std::thread::yield_now(),
+                                    other => break other.unwrap(),
+                                }
+                            }
+                            if i >= 2 {
+                                v.delete(key(n - 2)).unwrap();
                             }
                         }
-                        if i >= 2 {
-                            v.delete(key(n - 2)).unwrap();
-                        }
-                    }
-                });
-            }
-            s.spawn(|| {
-                for _ in 0..40 {
-                    volume.clean(2).unwrap();
+                    })
+                })
+                .collect();
+            let mut cleaned = CleanReport::default();
+            loop {
+                let report = volume.clean(8).unwrap();
+                cleaned.relocated += report.relocated;
+                cleaned.corrupt += report.corrupt;
+                if writers.iter().all(|w| w.is_finished()) {
+                    break cleaned;
                 }
-            });
+                std::thread::yield_now();
+            }
         });
+        let last = volume.clean(64).unwrap();
+        cleaned.relocated += last.relocated;
+        cleaned.corrupt += last.corrupt;
+        // Victims whose records all died while being cleaned, freed and opened again by
+        // another stream, are not corrupt.
+        assert!(cleaned.relocated > 0 && cleaned.corrupt == 0, "{cleaned:?}");
         let geometry = volume.shared.geometry;
         let id = volume.volume_id();
         volume.close();
@@ -1601,6 +1627,86 @@ mod tests {
         for (n, size) in (1u64..).zip(sizes) {
             let len = size as u64;
             assert_eq!(volume.read(&key(n), 0, len).unwrap(), vec![n as u8; size]);
+        }
+    }
+
+    /// A volume filled with records longer than half a segment holds one a segment, each with
+    /// room beside it that no other such record fits. The cleaner's estimate (`Cleaner::gain`)
+    /// counts that room as space packing gives back, and a pass near full moved record after
+    /// record, each into a segment of its own, before it found it had gained nothing, while
+    /// puts waited on it: ten seconds a volume of 8 MiB chunks (2026-10-28). A pass lays out
+    /// its relocations first now, and moves nothing.
+    #[test]
+    fn a_pass_that_could_only_move_records_around_moves_none() {
+        let mut settings = config();
+        settings.scrub_period = None;
+        let volume = Volume::format(issuer(), sim(15), 8 << 20, settings).unwrap();
+        // 200 KiB in 256 KiB segments: one a segment, with 52 KiB beside it.
+        let len = 200usize << 10;
+        let mut written = 0u64;
+        loop {
+            match volume.put(key(written), &vec![written as u8; len]) {
+                Ok(()) => written += 1,
+                Err(ChunkError::Full) => break,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert!(written > 8, "{written} records");
+        let report = volume.clean(64).unwrap();
+        assert_eq!((report.segments, report.relocated), (0, 0), "{report:?}");
+        // Nor did the background cleaner, woken as free segments ran low.
+        assert_eq!(volume.shared.clean_opened.load(Ordering::Relaxed), 0);
+        for n in 0..written {
+            let want = vec![n as u8; len];
+            assert_eq!(volume.read(&key(n), 0, len as u64).unwrap(), want);
+        }
+    }
+
+    /// Every pass that moves a record gains a segment: its plan lays out the relocations as the
+    /// writer does. Chunks from a few hundred bytes to most of a segment, a third of them
+    /// deleted again, fill a volume and leave segments partly dead, cleaned now and then.
+    #[test]
+    fn every_pass_that_moves_records_gains_a_segment() {
+        let mut settings = config();
+        settings.scrub_period = None;
+        let volume = Volume::format(issuer(), sim(16), 8 << 20, settings).unwrap();
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut live: Vec<(u64, usize)> = Vec::new();
+        let (mut cleaned, mut gained) = (0u32, 0u32);
+        for n in 0..2000u64 {
+            let len = match next() % 4 {
+                0 => 200 + (next() % 4000) as usize,
+                1 | 2 => (next() % (100 << 10)) as usize,
+                _ => (130 << 10) + (next() % (100 << 10)) as usize,
+            };
+            match volume.put(key(n), &vec![n as u8; len]) {
+                Ok(()) => live.push((n, len)),
+                Err(ChunkError::Full) => {}
+                Err(e) => panic!("{e}"),
+            }
+            if next() % 3 == 0 && !live.is_empty() {
+                let (dead, _) = live.swap_remove((next() % live.len() as u64) as usize);
+                volume.delete(key(dead)).unwrap();
+            }
+            if n % 50 == 49 {
+                let report = volume.clean(8).unwrap();
+                assert!(report.segments == 0 || report.gained >= 1, "{report:?}");
+                cleaned += report.segments;
+                gained += report.gained;
+            }
+        }
+        assert!(gained > 0, "{cleaned} cleaned, {gained} gained");
+        for (n, len) in live {
+            assert_eq!(
+                volume.read(&key(n), 0, len as u64).unwrap(),
+                vec![n as u8; len]
+            );
         }
     }
 

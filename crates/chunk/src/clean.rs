@@ -3,7 +3,13 @@
 //! A segment whose chunks are all deleted is freed by the writer without copying anything.
 //! One that is partly dead is cleaned: its live fragments are read back, verified, and handed
 //! to the writer as relocations into the cleaner's own stream; once nothing live is left in
-//! it, the writer frees it. Victims are chosen by LFS's cost-benefit ratio
+//! it, the writer frees it. Cleaning gains space only by writing the live data back to fewer
+//! segments than it came from (Rosenblum and Ousterhout, TOCS 1992, §3.3), and a record never
+//! spans segments, so space a segment leaves beside a record too large to share it is not
+//! space cleaning can give back. A pass therefore lays out its victims' relocations first,
+//! from the index's record lengths and by the writer's own rule, and cleans only victims that
+//! pack into fewer segments than they free: one that cannot gain moves nothing. Victims are
+//! chosen by LFS's cost-benefit ratio
 //! `(1 − u) · age / (1 + u)`, where `u` is the fraction still live and `age` the time since
 //! its youngest live record was written (Rosenblum and Ousterhout, TOCS 1992, §3.6): old,
 //! mostly dead segments first, since cold data that survived is likely to stay.
@@ -25,7 +31,7 @@ use hyper_block::block::BlockFile;
 
 use crate::error::ChunkError;
 use crate::frame::SegmentState;
-use crate::record::{FLAG_FINAL, Payload};
+use crate::record::{self, FLAG_FINAL, Payload};
 use crate::recover::{Identity, ReadPool, verify_at};
 use crate::writer::{CLEANER_RESERVE, Move, Op, Reply, Request, Shared};
 
@@ -82,6 +88,37 @@ pub struct CleanReport {
     pub corrupt: u64,
 }
 
+/// The cleaner's stream as relocations would leave it, laid out by the writer's rule
+/// (`Layout::place`): a record goes where the open segment's next one would if it fits there,
+/// or seals the segment and opens another, and a batch ends padded to a block, where the
+/// segment's next batch starts.
+struct Packing {
+    /// Where the open segment's next record goes; none before the stream opens one.
+    at: Option<u64>,
+    /// Segments opened.
+    opened: u64,
+    size: u64,
+    block: u64,
+}
+
+impl Packing {
+    fn place(&mut self, len: u64) {
+        self.at = match self.at {
+            Some(at) if at.saturating_add(len) <= self.size => Some(at.saturating_add(len)),
+            _ => {
+                self.opened = self.opened.saturating_add(1);
+                Some(self.block.saturating_add(len))
+            }
+        };
+    }
+
+    fn end_batch(&mut self) {
+        self.at = self
+            .at
+            .map(|at| at.checked_next_multiple_of(self.block).unwrap_or(at));
+    }
+}
+
 impl<F: BlockFile> Cleaner<F> {
     pub fn run(self) {
         // The cleaner thread's own read buffers.
@@ -135,21 +172,23 @@ impl<F: BlockFile> Cleaner<F> {
         if self.free() >= low {
             return Ok(None);
         }
-        self.clean_until(reads, |cleaner, _| {
+        self.clean_until(reads, u32::MAX, |cleaner| {
             cleaner.free() <= cleaner.shared.low_water.load(Ordering::Relaxed)
         })
         .map(Some)
     }
 
-    /// Cleans the `n` best victims, whatever the free space.
+    /// Cleans at most the `n` best victims, whatever the free space, as many as gain from it.
     pub fn clean_best(&self, reads: &mut ReadPool, n: u32) -> Result<CleanReport, ChunkError> {
-        self.clean_until(reads, |_, report| report.segments < n)
+        self.clean_until(reads, n, |_| true)
     }
 
+    /// Cleans the victims each plan (`plan`) gains from, at most `most`, while `more` holds.
     fn clean_until(
         &self,
         reads: &mut ReadPool,
-        more: impl Fn(&Self, &CleanReport) -> bool,
+        most: u32,
+        more: impl Fn(&Self) -> bool,
     ) -> Result<CleanReport, ChunkError> {
         // One pass at a time, background or asked for, so two never take the same victims.
         let _cleaning = self
@@ -172,39 +211,106 @@ impl<F: BlockFile> Cleaner<F> {
                 .saturating_sub(spent_before);
             freed.saturating_sub(spent)
         };
-        let size = self.shared.geometry.segment_size;
-        // Space the victims cleaned so far should give back once their live data is packed.
-        let mut due = 0u64;
-        while more(self, &report) {
-            let Some(victim) = self.victim(&tried) else {
+        while more(self) {
+            let victims = self.plan(&mut tried, most.saturating_sub(report.segments))?;
+            if victims.is_empty() {
                 break;
-            };
-            tried.insert(victim);
-            let live = self.live(victim);
-            let incarnation = self.incarnation(victim);
-            let started = Instant::now();
-            let (relocated, corrupt) = self.clean(reads, victim)?;
-            report.segments = report.segments.saturating_add(1);
-            report.relocated = report.relocated.saturating_add(relocated);
-            report.corrupt = report.corrupt.saturating_add(corrupt);
-            // The writer frees a segment in the batch after the one that emptied it.
-            self.flush()?;
-            // Freed, and perhaps opened again since by another batch.
-            if self.incarnation(victim) != incarnation {
-                freed = freed.saturating_add(1);
             }
-            self.learn(started.elapsed());
-            // Victims of live fraction u free 1 − u segments each (Rosenblum and Ousterhout,
-            // TOCS 1992, §3.4), so a net gain is due once they have held a segment's worth of
-            // dead space, after ⌈1/(1 − ū)⌉ of them (docs/research/11 §10.3), less what packing
-            // their live data costs. None by then means it packs no tighter, and the pass stops.
-            due = due.saturating_add(self.gain(live));
-            if due >= size && gained(freed) == 0 {
-                break;
+            for victim in victims {
+                let incarnation = self.incarnation(victim);
+                let started = Instant::now();
+                let (relocated, corrupt) = self.clean(reads, victim)?;
+                report.segments = report.segments.saturating_add(1);
+                report.relocated = report.relocated.saturating_add(relocated);
+                report.corrupt = report.corrupt.saturating_add(corrupt);
+                // The writer frees a segment in the batch after the one that emptied it.
+                self.flush()?;
+                // Freed, and perhaps opened again since by another batch.
+                if self.incarnation(victim) != incarnation {
+                    freed = freed.saturating_add(1);
+                }
+                self.learn(started.elapsed());
             }
         }
         report.gained = u32::try_from(gained(freed)).unwrap_or(u32::MAX);
         Ok(report)
+    }
+
+    /// The victims to clean next, in the order `victim` chooses them: the fewest, at most
+    /// `most`, whose live records, laid out as the writer will lay out their relocations, open
+    /// fewer segments than cleaning them frees; none when no such victims come before their
+    /// gains (`gain`) are due a segment. Laid out from the index's record lengths, a plan reads
+    /// and writes nothing, so a pass that could only move data around moves none.
+    fn plan(&self, tried: &mut HashSet<u32>, most: u32) -> Result<Vec<u32>, ChunkError> {
+        let geometry = self.shared.geometry;
+        let mut packing = Packing {
+            at: self.clean_position()?,
+            opened: 0,
+            size: geometry.segment_size,
+            block: geometry.block,
+        };
+        let mut victims = Vec::new();
+        // Space the chosen victims should give back once their live data is packed.
+        let mut due = 0u64;
+        while u32::try_from(victims.len()).is_ok_and(|chosen| chosen < most) {
+            let Some(victim) = self.victim(tried) else {
+                break;
+            };
+            tried.insert(victim);
+            victims.push(victim);
+            self.pack(&mut packing, victim)?;
+            if u64::try_from(victims.len()).is_ok_and(|freed| freed > packing.opened) {
+                return Ok(victims);
+            }
+            // Victims of live fraction u free 1 − u segments each (Rosenblum and Ousterhout,
+            // TOCS 1992, §3.4), so a net gain is due once they have held a segment's worth of
+            // dead space, after ⌈1/(1 − ū)⌉ of them (docs/research/11 §10.3), less what packing
+            // their live data costs. None by then means it packs no tighter.
+            due = due.saturating_add(self.gain(self.live(victim)));
+            if due >= geometry.segment_size {
+                break;
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// Lays `segment`'s live records into `packing` as cleaning it relocates them: in the order
+    /// they lie, in batches of `batch_moves` records or `batch_bytes` of payload and one of
+    /// what is left (`clean`).
+    fn pack(&self, packing: &mut Packing, segment: u32) -> Result<(), ChunkError> {
+        let index = self.shared.index.read().map_err(|_| ChunkError::Fenced)?;
+        let (mut moves, mut bytes) = (0usize, 0usize);
+        for (_, payload) in index.records_in(segment) {
+            let len = record::record_len(payload, self.shared.checksum_shift)
+                .and_then(|len| u64::try_from(len).ok())
+                .ok_or(ChunkError::Internal(
+                    "an indexed record's length overflowed",
+                ))?;
+            packing.place(len);
+            moves = moves.saturating_add(1);
+            bytes = bytes.saturating_add(usize::try_from(payload).unwrap_or(usize::MAX));
+            if moves >= self.batch_moves || bytes >= self.batch_bytes {
+                packing.end_batch();
+                (moves, bytes) = (0, 0);
+            }
+        }
+        if moves > 0 {
+            packing.end_batch();
+        }
+        Ok(())
+    }
+
+    /// Where the cleaner's stream puts its next record, as of the last durable batch: in its
+    /// open segment, or none before it opens one.
+    fn clean_position(&self) -> Result<Option<u64>, ChunkError> {
+        let Ok(open) = u32::try_from(self.shared.clean_open.load(Ordering::Relaxed)) else {
+            return Ok(None);
+        };
+        let usage = self.shared.usage.read().map_err(|_| ChunkError::Fenced)?;
+        Ok(usage
+            .get(open)
+            .filter(|s| s.state == SegmentState::Open)
+            .map(|s| u64::from(s.write_pos).max(self.shared.geometry.block)))
     }
 
     /// Space cleaning a segment holding `live` live bytes gives back: its dead bytes, less
@@ -294,12 +400,14 @@ impl<F: BlockFile> Cleaner<F> {
             .get(segment)
             .map(|s| s.incarnation)
             .ok_or(ChunkError::Fenced)?;
-        let offsets = self
+        let offsets: Vec<u32> = self
             .shared
             .index
             .read()
             .map_err(|_| ChunkError::Fenced)?
-            .placed_in(segment, 0..u32::MAX);
+            .records_in(segment)
+            .map(|(offset, _)| offset)
+            .collect();
         let identity = Identity {
             volume: self.shared.volume,
             checksum_shift: self.shared.checksum_shift,
@@ -320,6 +428,13 @@ impl<F: BlockFile> Cleaner<F> {
             );
             let header = match read {
                 Ok(Some(v)) if v.prefix.header.incarnation == incarnation => v.prefix.header,
+                // Every record of the victim died while it was being cleaned, and the writer
+                // freed it: what lies here now is another incarnation's, or nothing.
+                Ok(_) | Err(ChunkError::Device(DiskError::Io { .. }))
+                    if self.incarnation(segment) != Some(incarnation) =>
+                {
+                    break;
+                }
                 // Left in place: moving bytes that fail verification would launder them.
                 Ok(_) | Err(ChunkError::Device(DiskError::Io { .. })) => {
                     corrupt = corrupt.saturating_add(1);

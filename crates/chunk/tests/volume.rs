@@ -994,7 +994,7 @@ fn reads_hold_their_buffers_to_the_read_bytes() {
 /// Cleaning has the writer run a batch of its own after each victim, to free what it emptied.
 /// It did so by deleting a key no client was meant to use, but clients may use any key: a
 /// chunk stored under it was deleted, acknowledged or not. The cleaner now sends a request
-/// that deletes nothing.
+/// that deletes nothing. Four chunks fill a segment; two segments left half dead pack into one.
 #[test]
 fn cleaning_deletes_no_client_chunk() {
     let file = sim(901);
@@ -1005,12 +1005,15 @@ fn cleaning_deletes_no_client_chunk() {
         index: u16::MAX,
     };
     v.put(edge, &data(77, 100)).unwrap();
-    for n in 0..8u64 {
+    for n in 0..12u64 {
         v.put(key(n), &data(n, 50 << 10)).unwrap();
     }
-    assert!(v.usage().unwrap().sealed >= 1);
-    let report = v.clean(1).unwrap();
-    assert!(report.segments >= 1, "{report:?}");
+    for n in [0, 1, 4, 5] {
+        v.delete(key(n)).unwrap();
+    }
+    assert!(v.usage().unwrap().sealed >= 2);
+    let report = v.clean(2).unwrap();
+    assert_eq!((report.segments, report.gained), (2, 1), "{report:?}");
     assert_eq!(v.read(&edge, 0, 100).unwrap(), data(77, 100));
 }
 

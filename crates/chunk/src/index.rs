@@ -10,7 +10,7 @@
 //! with a counting allocator for 4M records appended in order, 15.9 once a third are
 //! deleted at random (docs/design/chunk-store.md §8).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 
 use crate::frame::{PutRecord, SegmentState};
@@ -109,17 +109,18 @@ pub enum Inconsistent {
 }
 
 /// The bytes an index of chunks of one fragment each asks of its allocator a fragment, at most:
-/// its table's bucket and control byte, its fragment list, and its place, at the peak a table's
-/// growth reaches while it holds its old buckets and its new. Measured with hyper-measure's
-/// counting allocator through twenty doublings (tests/index_memory.rs): 345.3 bytes a fragment at
-/// 917,505 fragments, the first past a growth, which each growth repeats in proportion; 229.6 once
-/// the old buckets go.
-pub const FRAGMENT_BYTES: u64 = 346;
+/// its table's bucket and control byte, its fragment list, and its place with its record's
+/// length, at the peak a table's growth reaches while it holds its old buckets and its new.
+/// Measured with hyper-measure's counting allocator through twenty doublings
+/// (tests/index_memory.rs): 352.0 bytes a fragment at 917,505 fragments, the first past a growth,
+/// which each growth repeats in proportion; 236.3 once the old buckets go. The lengths, which the
+/// cleaner plans its passes from (clean.rs), are 6.7 of those (345.3 and 229.6 without them).
+pub const FRAGMENT_BYTES: u64 = 352;
 
 /// What the index of one fragment asks beyond [`FRAGMENT_BYTES`]: its table's first buckets and
-/// its place set's first node (492 bytes measured for one on x86_64, whose table keeps its control
-/// bytes in SSE2's groups of 16; 484 on aarch64, in groups of 8).
-pub const INDEX_BYTES: u64 = 146;
+/// its place map's first node (532 bytes measured for one on x86_64, whose table keeps its control
+/// bytes in SSE2's groups of 16; 524 on aarch64, in groups of 8).
+pub const INDEX_BYTES: u64 = 180;
 
 /// The most bytes an index of `fragments` fragments, one a chunk, asks of its allocator.
 pub fn most_bytes(fragments: u64) -> Option<u64> {
@@ -139,9 +140,10 @@ pub fn most_fragments(bytes: u64) -> u64 {
 #[derive(Debug, Default)]
 pub struct Index {
     map: HashMap<ChunkKey, Entry>,
-    /// `(segment, offset)` of every fragment's record. A live record's place names it: only
-    /// the current incarnation of a segment holds live records.
-    placed: BTreeSet<(u32, u32)>,
+    /// `(segment, offset)` of every fragment's record, with its payload's length. A live
+    /// record's place names it: only the current incarnation of a segment holds live records.
+    /// The lengths let the cleaner lay out a pass's relocations before it moves a byte.
+    placed: BTreeMap<(u32, u32), u32>,
 }
 
 impl Index {
@@ -165,13 +167,21 @@ impl Index {
     pub fn placed_in(&self, segment: u32, offsets: Range<u32>) -> Vec<u32> {
         self.placed
             .range((segment, offsets.start)..(segment, offsets.end))
-            .map(|&(_, offset)| offset)
+            .map(|(&(_, offset), _)| offset)
             .collect()
+    }
+
+    /// The live records of `segment` in the order they lie: each one's offset and payload
+    /// length.
+    pub fn records_in(&self, segment: u32) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.placed
+            .range((segment, 0)..=(segment, u32::MAX))
+            .map(|(&(_, offset), &len)| (offset, len))
     }
 
     /// Whether a live record starts at `offset` of `segment`.
     pub fn is_placed(&self, segment: u32, offset: u32) -> bool {
-        self.placed.contains(&(segment, offset))
+        self.placed.contains_key(&(segment, offset))
     }
 
     /// The chunk and fragment whose record starts at `offset` of `segment`. It walks the
@@ -240,7 +250,8 @@ impl Index {
             {
                 *slot = fragment;
                 self.placed.remove(&(existing.segment, existing.offset));
-                self.placed.insert((fragment.segment, fragment.offset));
+                self.placed
+                    .insert((fragment.segment, fragment.offset), fragment.payload_len);
                 return Ok(Inserted::Replaced(existing));
             }
             return Ok(Inserted::Unchanged);
@@ -268,7 +279,8 @@ impl Index {
         entry.fragments.push(fragment);
         entry.sealed = sealed;
         entry.time_ns = put.time_ns;
-        self.placed.insert((fragment.segment, fragment.offset));
+        self.placed
+            .insert((fragment.segment, fragment.offset), fragment.payload_len);
         Ok(Inserted::Added)
     }
 
@@ -298,7 +310,8 @@ impl Index {
                     && slot.payload_crc == fragment.payload_crc =>
             {
                 self.placed.remove(&(slot.segment, slot.offset));
-                self.placed.insert((fragment.segment, fragment.offset));
+                self.placed
+                    .insert((fragment.segment, fragment.offset), fragment.payload_len);
                 *slot = *fragment;
                 true
             }
@@ -629,12 +642,16 @@ mod tests {
         );
     }
 
-    /// Checks that `placed` names exactly the records the map holds.
+    /// Checks that `placed` names exactly the records the map holds, with their lengths.
     fn check(index: &Index) {
-        let expected: BTreeSet<(u32, u32)> = index
+        let expected: BTreeMap<(u32, u32), u32> = index
             .map
             .values()
-            .flat_map(|e| e.fragments.iter().map(|f| (f.segment, f.offset)))
+            .flat_map(|e| {
+                e.fragments
+                    .iter()
+                    .map(|f| ((f.segment, f.offset), f.payload_len))
+            })
             .collect();
         assert_eq!(index.placed, expected);
     }

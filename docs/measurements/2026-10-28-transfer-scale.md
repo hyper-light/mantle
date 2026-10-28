@@ -181,6 +181,35 @@ segment they began. The same probe (binary 7563025f, 36f8912e):
 Exact: 1,283 blocks, each block's chunks on distinct nodes, 18 reads after each founder's kill and
 restart with none wrong or missing, the controls caught.
 
+Each way's own 10G case on that build (binary 7563025f, 5e94d09a, this Mac's free space less 30 GB):
+
+| Way | Volumes (each) | Held | Put / native read / HTTP read (MiB/s) | Refused | Chunks held a node |
+|---|---|---|---|---|---|
+| native (whole blocks) | 16,377,375,402 B | 1 | 29 / 142 / 242 | `InsufficientStorage` (l1), exact | 15.98 GB, 97.6%, 1 free segment |
+| cli | 12,679,972,181 B | 1 | 29 / 125 / 370 | l1, l2 `SlowDown` | 12.36 GB, 97.5% |
+| native-parts | 12,625,889,962 B | 1 | 26 / 150 / 286 | l1, l2 `SlowDown` | 12.31 GB, 97.5% |
+| boto-parts | 14,719,268,181 B | | | (hung in the kills, below) | 14.36 GB, 97.5% |
+
+A node holds more than its one object: an upload refused part way keeps what it stored for the
+upload's resumption. Every way's object read back exact after each founder's kill and restart, and
+the parts' ways still ended at `SlowDown`. A scratch build (binary c26d8e6e on 5e94d09a, never
+merged), 512 MiB objects by the CLI on stated 2 GiB volumes, printed why:
+
+| Cleaner passes (one a node) | Puts held for a verdict | Chunks refused | Answer |
+|---|---|---|---|
+| each gained 0 segments, relocated 357 records, took 9.5 / 9.9 / 10.0 s, dead bytes 0 | about 1,530, every one before the first verdict (`futile_at` unset) | 8 `Busy`, 2 `Lost(Budget)`, 2 `Lost(Stalled)`, 2 `Full` | l3 `SlowDown` (9 blocks `Unplaced`), l4 `InsufficientStorage` |
+
+A fresh volume holds puts until its cleaner's first verdict (chunk-store.md §8). A part's 8.3 MB
+record sits alone in its segment with 77 KiB beside it, which the victims' estimate counted as dead
+space, so the first pass near full moved such records one after another, each into a segment of its
+own, for ten seconds before it found nothing gained; the puts it held filled the writer's queue and
+the transport's budget, and those past them were refused as causes that may pass. A pass now lays
+out its relocations from the index's record lengths before it moves one, the writer's own placement
+rule, and cleans only victims whose records take fewer segments than they free (chunk-store.md §8).
+In the chunk store's tests a volume filled with records longer than half a segment, each with room
+beside it, is cleaned by no pass, background or asked for, and every pass that moves a record gains
+a segment.
+
 **Where a small put's time goes.** A diagnostic build (never merged) timed each put on the node
 that served it, on kiln-a094a12d (300 objects, 170 traced puts): the body is in at 0.4 ms; the
 three chunk copies go in parallel and the slowest is durable at 5.9 ms (each 5.0 ms at the median);

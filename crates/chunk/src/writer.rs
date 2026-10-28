@@ -179,6 +179,9 @@ pub(crate) struct Shared<F> {
     /// spend free space during a pass too, so the free count alone does not say what the
     /// pass gained.
     pub clean_opened: std::sync::atomic::AtomicU64,
+    /// The segment the cleaner's stream has open as of the last durable batch, `u64::MAX` when
+    /// none: where the cleaner's next relocation goes, which its plan of a pass starts from.
+    pub clean_open: std::sync::atomic::AtomicU64,
     /// Checkpoints written since the volume opened.
     pub checkpoints: std::sync::atomic::AtomicU64,
     /// The room client requests hold in the writer's queue.
@@ -1615,6 +1618,9 @@ impl<F: BlockFile> Writer<F> {
             });
         }
         self.opens = layout.opens;
+        self.shared
+            .clean_open
+            .store(open_at(self.opens, Stream::Clean), Ordering::Relaxed);
         // Readers get the segments this batch changed, not a copy of the table.
         let changed = self.segments.take_changed();
         if let Ok(mut usage) = self.shared.usage.write() {
@@ -1790,6 +1796,15 @@ fn place_record(
         time_ns: put.time_ns,
         flags: put.flags,
     })
+}
+
+/// The segment `stream` has open among `opens`, as `Shared::clean_open` holds it.
+pub(crate) fn open_at(opens: [Option<u32>; 3], stream: Stream) -> u64 {
+    opens
+        .get(stream as usize)
+        .copied()
+        .flatten()
+        .map_or(u64::MAX, u64::from)
 }
 
 /// Bytes from `from` forward to `to` in a circular region of `size` bytes.

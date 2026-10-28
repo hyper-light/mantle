@@ -643,10 +643,17 @@ is asked again of the next node, after RFC 6298's doubling from the measured pro
 equal jitter, only where no node can have taken it, its node not reached among them, a certificate
 or role every node refuses alike excepted, at most three attempts (the AWS SDKs' standard mode),
 and one
-whose exchange ended otherwise is the caller's, told whether it was sent whole. An exchange is
+whose exchange ended otherwise is the caller's, told whether it was sent whole, and asked again it
+goes to the next node: one that took a request and lost it may still be stuck on the work, as a
+founder just started again was on its first reads, where any other node can answer it, a mutation
+from what its identity made. An exchange is
 given at least the node's own serve period, the idle timeout a node judges its exchanges stalled by,
-however fast the exchanges the client measured before it: a node may leave a put's body unread that
-long while its driver waits on durable writes (`tests/progress.rs`: a put held a quarter of it is
+however fast the exchanges the client measured before it, and before it measured any: a node that
+died is found by its connection's idle timeout, but one alive that never answers keeps its
+connection, and a client with nothing measured once gave its first exchange no period and waited
+on such a node two hours (measurements/2026-10-28-transfer-scale.md; `tests/progress.rs`: a get its
+node never answers is cut, and answered by the next). A node may leave a put's body
+unread that long while its driver waits on durable writes (`tests/progress.rs`: a put held a quarter of it is
 answered; under the range client's law alone it was cut `Stalled` within a third of a second, as CI
 found on every target). An exchange the client cut by its period with no answer begun, the node
 having had the request whole, says the node's work takes longer than it was given: the next

@@ -393,8 +393,9 @@ pub(crate) enum Line {
     /// Its orderly stop handed a range's lead over: the range's group, and the member that then
     /// led it.
     Handed(u128, u64),
-    /// Its orderly stop is done: the process ends.
-    Stopped,
+    /// Its orderly stop is done: the process ends. With the sleeps of the node's loop that found
+    /// every timer of its shard taken.
+    Stopped(u64),
 }
 
 /// A history as a node says it: node time run and crashes.
@@ -453,7 +454,7 @@ pub(crate) fn parse(line: &str) -> Option<Line> {
             u128::from_str_radix(group, 16).ok()?,
             leader.parse().ok()?,
         )),
-        ["stopped"] => Some(Line::Stopped),
+        ["stopped", waits] => Some(Line::Stopped(waits.parse().ok()?)),
         ["held", held] => Some(Line::Held(match *held {
             "0" => false,
             "1" => true,
@@ -532,7 +533,7 @@ pub(crate) fn movement(line: &Line) -> Option<(u64, u64, u64, u64, Duration, Dur
         | Line::Stopping
         | Line::Handing(..)
         | Line::Handed(..)
-        | Line::Stopped => None,
+        | Line::Stopped(..) => None,
     }
 }
 
@@ -1586,7 +1587,7 @@ impl Cell {
                 | Line::Stopping
                 | Line::Handing(..)
                 | Line::Handed(..)
-                | Line::Stopped => None,
+                | Line::Stopped(..) => None,
             })
             .chain(self.clients.values().copied())
             .chain(self.transfers.values().map(|(_, serve)| *serve))
@@ -1768,7 +1769,15 @@ impl Cell {
                     Line::Stopping => {}
                     Line::Handing(group, to) => self.handing.push((id, group, to)),
                     Line::Handed(group, leader) => self.handed.push((id, group, leader)),
-                    Line::Stopped => {
+                    Line::Stopped(waits) => {
+                        // Each wait the node's loop holds at once has a timer of its own: a sleep
+                        // that found none waited for one to free, and each release ended the
+                        // node's turn at once, a stop that turned without pause until it ended
+                        // (`process::TIMERS`).
+                        assert_eq!(
+                            waits, 0,
+                            "node {id}'s stop waited {waits} times for a timer"
+                        );
                         self.stopped.insert(id);
                     }
                     Line::Basis(basis) => {

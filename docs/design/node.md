@@ -726,8 +726,16 @@ streams that its run ends in order (hyper-liveness `Liveness::stop`), so they co
 failure in their MTBF's evidence (§2.4 item 7) and send this run nothing more, where each heartbeat
 to the stopped node asked a flush of its own. Then it takes no connection
 (its TLS without the server side), dials no peer, closes each connection and waits until each has
-left its closing state, three probe timeouts (hyper-quic's close timer); says `stopped` and ends, its
-log and volumes closed as the node is dropped. `mantle serve` runs on when its standard input
+left its closing state, three probe timeouts (hyper-quic's close timer); a redial its closed
+connections ask is never made, so its waits count none due. It says `stopped` with the sleeps of
+its loop that found every timer of its shard taken, and ends, its log and volumes closed as the
+node is dropped. That count is none: the shard holds a timer for each wait the node's task holds at
+once, its turn's, its transport's QUIC timer's and, once a stop is asked, the stop's bound's
+(`process::TIMERS`). Counted two, a stop's every turn ended at once: its third sleep waited for a
+timer, and each release woke the task (8,834 turns in a stop of 346 ms on macOS); and a
+redial counted due while closing ended every wait at once without the task yielding (80,000 turns
+in 3.7 s; diag/roll-stop-bound), each a CPU spent for the stop beside the nodes it hands its ranges
+to. `mantle serve` runs on when its standard input
 closes, as it does empty under a service manager; `mantle node`, its harness's child, ends with it.
 On Windows a console's close, a logoff and a shutdown end the process as a crash would: hyper-rt's
 handler returns TRUE as it delivers them, and Windows then ends the process (Microsoft's

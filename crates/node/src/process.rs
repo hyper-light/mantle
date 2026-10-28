@@ -1536,10 +1536,20 @@ pub fn calibration(dir: &Path, budget: Duration) -> Result<Calibration, ProcessE
     Ok(calibration)
 }
 
+/// The timers the node's task holds at once, one for each sleep pending: its turn's wait, its
+/// transport driver's QUIC timer, and, once a stop is asked, the stop's bound (no task of the S3
+/// listener sleeps). A sleep that finds every timer taken waits for one to free (hyper-rt's
+/// `Counters::timer_waits`), and the release wakes the task, which ends the turn's wait at once
+/// (`Node::wait`: any wake ends it). Counted two, a stopping node turned without pause until it
+/// ended: 8,834 turns and 8,798 timer waits in a stop of 346 ms on macOS (diag/roll-stop-bound),
+/// a CPU spent for the whole stop.
+const TIMERS: usize = 3;
+
 /// One shard, calibrated on this machine (hyper-rt `RuntimeConfig::from_calibration`), sized by
-/// what the node holds: its one task, its wait and its driver's QUIC timer, and a socket for its
-/// endpoint, each connection and its plane, each read and written; with an S3 listener, a task for
-/// each connection it holds at once, and a socket for the listener and each of those connections.
+/// what the node holds: its one task and the timers it holds at once ([`TIMERS`]), and a socket
+/// for its endpoint, each connection and its plane, each read and written; with an S3 listener, a
+/// task for each connection it holds at once, and a socket for the listener and each of those
+/// connections.
 fn runtime(config: &ProcessConfig, s3: bool) -> Result<RuntimeConfig, ProcessError> {
     let calibration = calibration(&config.dir, config.probe_budget)?;
     let constants = calibration
@@ -1558,7 +1568,7 @@ fn runtime(config: &ProcessConfig, s3: bool) -> Result<RuntimeConfig, ProcessErr
     let tasks = connections
         .checked_add(1)
         .ok_or_else(|| ProcessError::Runtime("the node's tasks".into()))?;
-    let mut runtime = RuntimeConfig::from_calibration(&calibration, &constants, tasks, 2);
+    let mut runtime = RuntimeConfig::from_calibration(&calibration, &constants, tasks, TIMERS);
     runtime.shards = 1;
     runtime.pin = false;
     runtime.cores.clear();
@@ -1958,7 +1968,12 @@ async fn serve(
             say(&mut output, &format!("handed {group:x} {leader}\n")).await?;
         }
         if node.stopped() {
-            say(&mut output, "stopped\n").await?;
+            // Said with the sleeps of the node's loop that found every timer taken, none where
+            // the shard holds one for each wait the loop holds at once ([`TIMERS`]).
+            let waits = hyper_rt::futures::shard_counters()
+                .ok_or_else(|| ProcessError::Runtime("the node's loop runs on no shard".into()))?
+                .timer_waits;
+            say(&mut output, &format!("stopped {waits}\n")).await?;
             // Nothing the node holds is owed to the cell: its log and volumes close, and then the
             // stop is kept, with the node's time run, so its next start counts no crash.
             let ran_ns = hyper_rt::futures::now_ns().saturating_sub(started_ns);

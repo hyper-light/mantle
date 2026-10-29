@@ -410,7 +410,14 @@ exchange has no progress period with nothing measured, and an exchange lost is a
 same node. Bounding it with the node's serve period cut slow reads during a founder's kill under
 load and ran the client's transport out of budget (CI's one-CPU job, adacachy's 16 GB pass), and
 was reverted: it needs the node to state its progress (item 8) and to stop asking a dead peer for
-chunks, which a node serving a get does first, 0.5 to 2 s an ask. Open: why that founder never
+chunks, which a node serving a get does first, 0.5 to 2 s an ask. CI's busy job fails the native
+suite on the same cause with the client unchanged, on both arms of an A/B of the chunk store's
+latest changes: a node's own asks are judged by the period its client gives it, so a node whose
+ask of a peer takes most of a period loses to its client (7 of 36 read-backs cut), and a run cut
+while its node wrote is sent again, its first chunks left behind until the suite's small volumes
+refuse a run (2 of 36) ([measurements](measurements/2026-10-29-a-node-cut-while-it-works.md)).
+How a client tells a node at work from a stuck one, whether the node states its progress, a
+deadline is propagated or the bounds compose, is the decision it waits on. Open: why that founder never
 answered, and why on this
 Mac under load a restarted founder's first range reads could not reach their known leader for 12 to
 25 s (not met in 58 rounds on a Mac Studio, quiet and loaded); and the 10G and 100G cases on this Mac

@@ -103,6 +103,57 @@ asked again. The scope peaked at 54.1 GB, the page cache of the reads (360 MB an
 PSI at 0 and no OOM event; a node at most 199 MiB resident and 43 threads, the harness 13.6 MiB and
 4. 76.6% is the native objects' 5 MiB chunks at 62.4% of their segments beside the rest's at 99%.
 
+The box under a 32 GB scope, the owner's first halving: the small sets on 913abd1a (binary
+bd631dac), the 10G case on the planned pass, fb57d055 (binary 63b26d90), the case on 913abd1a
+superseded by it part way through its fill.
+
+| Case | Volume | Objects | Put p50 native/http | Put p99 native/http | Native read p50/p99 | HTTP read p50/p99 | Reads after kills | Asked again | Seconds |
+|---|---|---|---|---|---|---|---|---|---|
+| small 1000 | 256 MiB | 1,000 | 60.8 / 64.0 ms | 146.8 / 111.1 ms | 0.57 / 1.97 ms | 0.87 / 2.16 ms | 6,000 | 0 | 125 |
+| small 10000 | 2 GiB | 10,000 | 66.1 / 69.2 ms | 146.8 / 167.8 ms | 0.57 / 1.31 ms | 0.82 / 2.23 ms | 60,000 | 0 | 878 |
+| small 100000 | 16 GiB | 100,000 | 69.2 / 71.3 ms | 146.8 / 155.2 ms | 0.56 / 1.25 ms | 0.79 / 1.51 ms | 600,000 | 1 | 7,837 |
+
+| Case | Scope peak | Node VmHWM, most | Node threads | Node major faults, most | Harness VmHWM / threads | OOM events |
+|---|---|---|---|---|---|---|
+| small 1000 | 102.4 MiB | 39.1 MiB | 43 | 948 | 13.6 MiB / 4 | 0 |
+| small 10000 | 222.7 MiB | 41.8 MiB | 33 | 3,177 | 14.2 MiB / 4 | 0 |
+| small 100000 | 1,921 MiB | 470.3 MiB | 43 | 240,110 | 13.0 MiB / 4 | 0 |
+
+The 10G case, its volumes 278,787,130,709 bytes each (1.936 TB free less 1.1 TB):
+
+| Way | Held | Put / native read / HTTP read (MiB/s) | Refused |
+|---|---|---|---|
+| native (whole blocks) | 7 | 66 / 347 / 592 | |
+| cli | 6 | 91 / 235 / 539 | the listener l25, typed |
+| native-parts | 6 | 50 / 231 / 579 | native l26, typed |
+| boto-parts | 6 | 52 / 229 / 574 | |
+
+Exact in 11,953 s: 25 objects, 55,117 blocks each on distinct nodes; each node holding
+275,263,860,736 bytes of 278,787,130,709 (98.7%) with one segment free, every byte what it received
+and put; 150 reads after each founder's kill and restart, none wrong, missing or asked again; the
+controls caught; refused typed on both doors and none otherwise. The scope peaked at 1.02 GiB, its
+swap at 405 MB (zram) and no OOM event; a node at most 274 MB resident with 33 threads and 92,568
+major faults, the harness 14 MB and 4 threads, boto3 and the AWS CLI 172 MB. The 64 GB pass's
+10G case, before whole-block runs, the whole-record stream and the planned pass, held 21 objects
+in 76.6% of its volumes.
+
+The 100G case on the same build, its volumes 230,959,255,552 bytes each (1.792 TB free less
+1.1 TB):
+
+| Way | Held | Put / native read / HTTP read (MiB/s) | Refused |
+|---|---|---|---|
+| native (whole blocks) | 1 | 67 / 413 / 665 | |
+| cli | 1 | 90 / 317 / 656 | |
+| native-parts | 0 | | native l2, typed |
+| boto-parts | 0 | | the listener l3, typed |
+
+Exact in 9,027 s: 32,101 blocks each on distinct nodes; each node holding 227.65 GB of 230.96 GB
+(98.6%) with one segment free, every byte what it received and put; 12 reads after each founder's
+kill and restart, none wrong, missing or asked again; the controls caught; refused typed on both
+doors and none otherwise. The scope peaked at 7.8 GB, its swap at 314 MB, no OOM event; a node at
+most 153 MB resident with 43 threads and 21,698 major faults, the harness 13.6 MB. The 64 GB pass's
+100G case held its two objects in 93.3% of 287.9 GB volumes. The 16 GB pass runs on 750a1525.
+
 **Where a full cell's room goes.** A cell is full when one block's chunks find no node with room:
 every block needs a chunk on each of the three nodes, so the fullest node decides. A node's
 volume refuses a chunk `Full` for one of two things (chunk-store.md §5, §8): no free segment past
@@ -223,6 +274,38 @@ the same machine (load 12 to 23):
 Each held what the morning's probe held, to the segment, and ended at the typed refusal where the
 morning's ended `SlowDown`; every block's chunks on distinct nodes, 18 reads after each founder's
 kill and restart with none wrong, missing or asked again, the controls caught.
+
+**A read that waited two hours.** The boto-parts case on the stream build filled its volumes
+(14.36 GB held a node, 97.5%) and then stopped in its kills: the second founder killed and started
+again at 08:22:39, the harness's native read of l0 through it, its first, was still waiting at 10:22.
+The node was idle (1,875 of 1,893 samples parked in its runtime's `kevent`); a fresh client's `head`
+of l0 through it answered at once and its whole read came back in about 40 s. The harness had opened
+a fresh client and asked it with no deadline, and with nothing measured the client gave its first
+exchange no progress period either: a node that dies is found by its connection's idle timeout, but
+one alive that never answers keeps its connection. And an exchange a node took and lost was asked
+again of the same node. Both are mended (750a1525): an exchange is given at least the node's serve
+period whatever was measured, and asked again it goes to the next node (gateway.md §6;
+`crates/client/tests/progress.rs`: a get its node never answers is cut and answered whole by the
+next, and fails without either half).
+
+Why the node never answered is not found. Loops of the case (diagnostic builds of branch
+`diag/kills-hang`, never merged: every slow or unplain ask, every ask held 2 s, each connection's
+events and each read's replies, a trace file a process) on this Mac before 11:51, under load from
+the gates beside them (load 18 to 23), found a founder started again whose first range reads waited
+12 to 25 s with their range's leader known: its exchanges to the leader could not open, and one
+read's three attempts all went to it, the third cut `Stalled` after 40 s, so the harness's read
+failed. On adas-mac-studio-2, about 51 rounds of one 256 MiB object and 7 of 1 GiB objects filled
+to refusal, quiet and beside twelve busy loops (load about 15), met no such wait. The loops after
+11:51 on this Mac are void: its lid closed then ('Clamshell Sleep') and it slept most of every
+quarter hour since ('Dark Wake Thermal Emergency', `pmset -g log`), every process frozen together,
+which a first reading of their traces took for a runtime that lost its wakeups.
+
+**A read racing the cleaner.** A chunk store read finds its fragments in the index and reads them
+after its turn at the device; a record the cleaner moved meanwhile, its segment freed and written
+again, failed its check where the read found it and was answered `Corrupt` with the chunk whole
+elsewhere on the volume (shown in-crate: found at segment 0, moved by a pass to segment 3, segment 0
+written again). A failed check is now weighed as the scrubber weighs one, and the read made again
+where the chunk lies (d5eadd39, chunk-store.md §7).
 
 **Where a small put's time goes.** A diagnostic build (never merged) timed each put on the node
 that served it, on kiln-a094a12d (300 objects, 170 traced puts): the body is in at 0.4 ms; the

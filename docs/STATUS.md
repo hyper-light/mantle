@@ -393,6 +393,26 @@ from a peer its detectors suspect, so a GET with a copy on a killed node asks an
 the harness's peak resident set 15.2, 15.1 and 13.2 MiB and its threads four
 (docs/measurements/2026-10-27-transfer-harness.md).
 
+At scale (plan step 10, docs/measurements/2026-10-28-transfer-scale.md) the small sets of 1k, 10k
+and 100k objects held every check on this Mac and on adacachy under 64 GB and 32 GB memory scopes.
+A full cell first held 62.4% of its volumes: a native run of S3's least part, 5 MiB, put each chunk in
+a segment of its own. Native runs now go in whole blocks; a record longer than half a segment takes a
+stream of its own, so smaller records no longer seal a segment nearly empty ahead of it; and a
+cleaning pass lays out its relocations from the record lengths the index keeps before it moves one,
+so a full volume is no longer held for a first pass that copied whole records for ten seconds to no
+gain, which had ended the S3 ways' cases at `503 SlowDown`. On adacachy under 32 GB the 10G case
+then held 25 objects in 98.7% of each node's volume, every check exact and refused typed on both
+doors, where the 64 GB pass's held 21 in 76.6%, and the 100G case two in 98.6%, exact, its scope
+peaking at 7.8 GB; the 16 GB pass is running. A 100 GB
+object does not fit this Mac's free space (107 GB a node), refused typed. The boto3 10G case on this Mac
+waited two hours in its kills on a read through a founder just started again: a client's first
+exchange had no progress period with nothing measured, and an exchange lost was asked again of the
+same node; both are mended (gateway.md §6). Open: why that founder never answered, and why on this
+Mac under load a restarted founder's first range reads could not reach their known leader for 12 to
+25 s (not met in 58 rounds on a Mac Studio, quiet and loaded); and the 10G and 100G cases on this Mac
+on the mended build, waiting on its lid: closed at 11:51 on 2026-10-28, it has slept most of each
+quarter hour since ('Dark Wake Thermal Emergency'), freezing every run on it.
+
 Remaining before it is done:
 
 - The windows a gateway admits, from its memory and measured latency; the rates of the paths
@@ -600,6 +620,17 @@ statement of its history of a leader whose stop then closed its connections took
 after the transport had ended the exchange, as an empty head, refused its own statement `Malformed`
 and ended; a request or reply whose head is gone is now its exchange's end, as the refusal queued
 behind it says ([measurements](measurements/2026-10-25-a-reply-past-its-connection.md)).
+The roll's next failures on CI (linux-x86_64 at `15d1e2f4`; macos-aarch64 and linux-aarch64-1cpu at
+`1c0096d7`), "nodes said ranges had no leader", had a cause of their own: founders started tens of
+seconds apart on one CPU, each measuring its devices first, judged a peer never heard from their own
+start, and their streams to it had backed off to 3 s while no path had keys, so a survivor given
+evidence by the third node suspected the other at once and took the suspicion of its range's next
+leader into the term. A node now tells its liveness stream a peer is reachable as it keys the peer's
+path (hyper-liveness `Liveness::reachable`, hyper-raft `c68032a`): a peer never heard is judged from
+then, and a stream backed off sends at its next flush. Pinned to one core of kiln's Linux runner, the
+two side by side, the roll failed 3 of 20 rounds without it and 0 of 20 with it. On windows-x86_64 at
+`913abd1a` (CI 40711041054) a node's orderly stop passed its 10 s bound mid-roll and the node ended
+at once, exit 1, a sighting of its own, traced on Windows runners now.
 Remaining: `mantle init client`;
 Windows' console close and shutdown taken as requests to stop, which hyper-rt's handler now holds
 for the owner's stop; a replicated range refusing puts at its engine's metadata share where its

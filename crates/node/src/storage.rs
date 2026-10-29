@@ -331,6 +331,32 @@ impl Storage {
         Ok(())
     }
 
+    /// Diagnostic (scratch, never merged): each volume's segments, chunks and their bytes.
+    pub(crate) fn diag_usage(&self) -> String {
+        let mut said = String::new();
+        for volume in &self.volumes {
+            let usage = volume.volume.usage();
+            let (mut chunks, mut bytes, mut fragments) = (0u64, 0u64, 0u64);
+            if let Ok(keys) = volume.volume.keys() {
+                for key in keys {
+                    if let Ok(Some(stat)) = volume.volume.stat(&key) {
+                        chunks += 1;
+                        bytes += stat.len;
+                        fragments += stat.fragments as u64;
+                    }
+                }
+            }
+            said.push_str(&format!(
+                "[{} segment_bytes {} usage {usage:?} chunks {chunks} bytes {bytes} fragments {fragments} puts_out {} gets_out {}] ",
+                volume.dir.display(),
+                volume.volume.data_bytes() / u64::from(usage.as_ref().map_or(1, |u| u.segments.max(1))),
+                self.puts.len(),
+                self.gets.len()
+            ));
+        }
+        said
+    }
+
     /// What the volumes hold of chunks and the room they have for more ([`Holding`]).
     pub(crate) fn holding(&self) -> Result<Holding, StorageError> {
         let mut holding = Holding::default();

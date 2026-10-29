@@ -1440,6 +1440,20 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return;
         }
         LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+        {
+            static SAID: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+            let usage = self.storage.diag_usage();
+            if let Ok(mut said) = SAID.lock()
+                && *said != usage
+            {
+                diag_line(&format!(
+                    "diag-volume node {:x} pid {} {usage}",
+                    self.id,
+                    std::process::id()
+                ));
+                *said = usage;
+            }
+        }
         let mut live: Vec<(String, String)> = Vec::new();
         for out in &self.reads_out {
             live.push((

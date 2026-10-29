@@ -634,7 +634,14 @@ path (hyper-liveness `Liveness::reachable`, hyper-raft `c68032a`): a peer never 
 then, and a stream backed off sends at its next flush. Pinned to one core of kiln's Linux runner, the
 two side by side, the roll failed 3 of 20 rounds without it and 0 of 20 with it. On windows-x86_64 at
 `913abd1a` (CI 40711041054) a node's orderly stop passed its 10 s bound mid-roll and the node ended
-at once, exit 1, a sighting of its own, traced on Windows runners now.
+at once, exit 1: every stop's loop turned without pause, two ways (diag/roll-stop-bound). The node's
+shard held two timers where a stopping node sleeps three ways, its turn's wait, its driver's QUIC
+timer and the stop's bound, so a sleep waited for a timer and each release ended the turn's wait
+(8,834 turns and 8,798 timer waits in a stop of 346 ms on macOS); and a closing node, which dials no
+peer, counted each closed connection's redial due, which ended every wait at once (80,000 turns in
+3.7 s on macOS). The shard holds three, a closing node counts no redial due, and every orderly stop
+says its loop's timer waits, which the serve harness holds to none (with two timers the stop test
+fails); the serve suite's stops turn 4 to 61 times, where they turned 420 to 85,171.
 Remaining: `mantle init client`;
 Windows' console close and shutdown taken as requests to stop, which hyper-rt's handler now holds
 for the owner's stop; a replicated range refusing puts at its engine's metadata share where its

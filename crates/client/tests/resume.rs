@@ -100,7 +100,6 @@ fn a_lost_runs_offset_held_past_the_clients_period_is_asked_again_and_the_upload
             appends: 4,
             offsets: 2,
             finishes: 1,
-            gets: 0,
             cut: 1,
         }
     );
@@ -163,7 +162,6 @@ fn a_run_the_node_answers_after_the_clients_period_is_waited_for_once_it_was_cut
             appends: 4,
             offsets: 1,
             finishes: 1,
-            gets: 0,
             cut: 1,
         }
     );

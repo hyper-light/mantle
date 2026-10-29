@@ -245,22 +245,6 @@ impl Sink for Nothing {
     }
 }
 
-/// A sink that counts the bytes it passed on, each write once it finished.
-struct Counted<'a, K> {
-    sink: &'a mut K,
-    took: u64,
-}
-
-impl<K: Sink> Sink for Counted<'_, K> {
-    async fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        self.sink.write(bytes).await?;
-        self.took = self
-            .took
-            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-        Ok(())
-    }
-}
-
 /// A new operation's identity: 128 bits from the operating system, which every attempt of a
 /// mutation carries (gateway.md §2.1).
 pub fn identity() -> Result<u128, ClientError> {
@@ -563,35 +547,19 @@ impl Client {
         }
     }
 
-    /// Gets `op`'s bytes, a GetObject's, into `sink`, by `deadline_ns`. One whose exchange ended
-    /// before any of its bytes reached `sink` is asked again, of the next node and with the period
-    /// the cut taught (`asked`, `attempt`), at most [`ATTEMPTS`] times: a node on a busy host may
-    /// still be working toward its answer, one may be stuck, and a get reads what it reads
-    /// wherever it is asked. One that ended with bytes in `sink` is the caller's.
+    /// Gets `op`'s bytes, a GetObject's, into `sink`, by `deadline_ns`.
     pub async fn get<K: Sink>(
         &mut self,
         op: &Op,
         sink: &mut K,
         deadline_ns: u64,
     ) -> Result<Reply, ClientError> {
-        if !matches!(op, Op::Get { .. }) {
-            return Err(ClientError::Operation("not a get"));
-        }
-        let mut failures = 0u32;
-        loop {
-            let mut counted = Counted {
-                sink: &mut *sink,
-                took: 0,
-            };
-            let asked = self
-                .ask(op, None::<&mut Nothing>, Some(&mut counted), deadline_ns)
-                .await;
-            match asked {
-                Err(lost @ ClientError::Lost { .. }) if counted.took == 0 => {
-                    failures = self.again(failures, lost, deadline_ns).await?;
-                }
-                asked => return asked,
+        match op {
+            Op::Get { .. } => {
+                self.ask(op, None::<&mut Nothing>, Some(sink), deadline_ns)
+                    .await
             }
+            _ => Err(ClientError::Operation("not a get")),
         }
     }
 
@@ -1125,15 +1093,6 @@ impl Client {
                 }
                 Attempt::Refused(refusal) => return Err(ClientError::Refused(refusal)),
                 Attempt::Lost { refusal, whole } => {
-                    // Asked again, it goes to the next node: one that took it and lost it may
-                    // still be stuck on the work, as a founder just started again was on its
-                    // first reads, while any other node can answer it, a mutation from what its
-                    // identity made.
-                    self.at = self
-                        .at
-                        .checked_add(1)
-                        .filter(|at| *at < self.nodes.len())
-                        .unwrap_or(0);
                     return Err(ClientError::Lost { refusal, whole });
                 }
             }
@@ -1545,21 +1504,20 @@ impl Client {
         most.unwrap_or_else(bounds::initial_pto)
     }
 
-    /// The progress period an exchange with `node` is given: the longest of the slowest exchange
-    /// measured, none before one is, the path's persistent-congestion duration (RFC 9002 §7.6.1)
-    /// and the node's own serve period, doubled for each exchange with the node cut by its period
-    /// since its last reply (mantle-node's client's law), within the time left before
-    /// `deadline_ns`. A node judges an exchange stalled only once it moved nothing for as long as
-    /// a connection may stay silent, the idle timeout (`bounds::limits`), and may pause an
-    /// object's body that long while its driver waits on durable writes: a client cutting it
-    /// sooner abandons an operation the node would finish. A node that died is found by its
-    /// connection's idle timeout, but one alive that never answers keeps its connection, and with
-    /// no period while nothing was measured a client waited on it for good: a read through a
-    /// founder just started again waited two hours
-    /// (docs/measurements/2026-10-28-transfer-scale.md).
+    /// The progress period an exchange with `node` is given: the time left before `deadline_ns`
+    /// while nothing is measured, else the longest of the slowest exchange measured, the path's
+    /// persistent-congestion duration (RFC 9002 §7.6.1) and the node's own serve period, doubled
+    /// for each exchange with the node cut by its period since its last reply (mantle-node's
+    /// client's law), within that time. A node judges an exchange stalled only once it moved
+    /// nothing for as long as a connection may stay silent, the idle timeout (`bounds::limits`),
+    /// and may pause an object's body that long while its driver waits on durable writes: a client
+    /// cutting it sooner abandons an operation the node would finish, and a node that died is
+    /// found by its connection's idle timeout all the same.
     fn period_ns(&mut self, node: PeerId, deadline_ns: u64, now_ns: u64) -> u64 {
         let left = deadline_ns.saturating_sub(now_ns).max(1);
-        let slowest = self.slowest_ns.unwrap_or(0);
+        let Some(slowest) = self.slowest_ns else {
+            return left;
+        };
         let served = u64::try_from(bounds::idle_timeout().as_nanos()).unwrap_or(u64::MAX);
         let congested = self.driver.endpoint().path(node).map_or(0, |path| {
             u64::try_from(

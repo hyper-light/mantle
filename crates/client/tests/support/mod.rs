@@ -101,13 +101,6 @@ pub(crate) fn runtime(sockets: usize) -> LocalRuntime {
 
 /// The node's and the client's credentials under a cell's authority.
 pub(crate) fn credentials() -> (Credentials, Credentials) {
-    let (mut nodes, client) = credentials_of(&[NODE]);
-    (nodes.remove(0), client)
-}
-
-/// As [`credentials`] for nodes `ids`, each a certificate of its own under one authority, and the
-/// client's.
-pub(crate) fn credentials_of(ids: &[PeerId]) -> (Vec<Credentials>, Credentials) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -124,21 +117,15 @@ pub(crate) fn credentials_of(ids: &[PeerId]) -> (Vec<Credentials>, Credentials) 
         key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.pkcs8().to_vec())),
         roots: vec![CertificateDer::from(authority.clone())],
     };
-    let nodes = ids
-        .iter()
-        .map(|&id| {
-            let node_key = KeyPair::generate().unwrap();
-            let node = mantle_cert::node(
-                &authority_key,
-                "cell",
-                node_key.public_key(),
-                &mantle_protocol::node_name(id),
-                (validity, Serial::draw().unwrap()),
-            )
-            .unwrap();
-            issue(node, &node_key)
-        })
-        .collect();
+    let node_key = KeyPair::generate().unwrap();
+    let node = mantle_cert::node(
+        &authority_key,
+        "cell",
+        node_key.public_key(),
+        &mantle_protocol::node_name(NODE),
+        (validity, Serial::draw().unwrap()),
+    )
+    .unwrap();
     let client_key = KeyPair::generate().unwrap();
     let client = mantle_cert::client(
         &authority_key,
@@ -148,7 +135,7 @@ pub(crate) fn credentials_of(ids: &[PeerId]) -> (Vec<Credentials>, Credentials) 
         (validity, Serial::draw().unwrap()),
     )
     .unwrap();
-    (nodes, issue(client, &client_key))
+    (issue(node, &node_key), issue(client, &client_key))
 }
 
 /// The stub node's directory: a client by its certificate's names, as a node admits one.
@@ -172,17 +159,15 @@ impl Directory for Clients {
 
 /// What the stub node does to a native upload's exchanges, each counted from 1 by its kind: the
 /// Append it reads whole and never answers, as a node that died under it leaves it; the Append and
-/// the Offset it holds unanswered until its client gives up on them; the Append it answers only
-/// once half again as long has passed as its client waited on the one it gave up on, as a node
-/// whose durable writes take longer than the client gave it answers the run sent again; and the
-/// Get it holds unanswered, alive, as a node whose work for it never finishes.
+/// the Offset it holds unanswered until its client gives up on them; and the Append it answers
+/// only once half again as long has passed as its client waited on the one it gave up on, as a
+/// node whose durable writes take longer than the client gave it answers the run sent again.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Script {
     pub(crate) lose_append: Option<u32>,
     pub(crate) hold_append: Option<u32>,
     pub(crate) late_append: Option<u32>,
     pub(crate) hold_offset: Option<u32>,
-    pub(crate) hold_get: Option<u32>,
 }
 
 /// The native upload's requests the stub took, by kind, and the exchanges its client cut.
@@ -192,7 +177,6 @@ pub(crate) struct Seen {
     pub(crate) appends: u32,
     pub(crate) offsets: u32,
     pub(crate) finishes: u32,
-    pub(crate) gets: u32,
     pub(crate) cut: u32,
 }
 
@@ -465,24 +449,19 @@ pub(crate) fn scripted(
                             };
                             Some((reply, 0))
                         }
-                        Op::Get { .. } => {
-                            seen.gets += 1;
-                            (script.hold_get != Some(seen.gets)).then(|| {
-                                (
-                                    Reply {
-                                        size: length,
-                                        etag: "got".into(),
-                                        checksum: Some(Stored {
-                                            algorithm: TRAILER.code(),
-                                            parts: 0,
-                                            value: get_crc.clone(),
-                                        }),
-                                        ..Reply::status(Status::Done)
-                                    },
-                                    length,
-                                )
-                            })
-                        }
+                        Op::Get { .. } => Some((
+                            Reply {
+                                size: length,
+                                etag: "got".into(),
+                                checksum: Some(Stored {
+                                    algorithm: TRAILER.code(),
+                                    parts: 0,
+                                    value: get_crc.clone(),
+                                }),
+                                ..Reply::status(Status::Done)
+                            },
+                            length,
+                        )),
                         Op::HeadBucket { .. } => Some((Reply::status(Status::Done), 0)),
                         Op::Open { .. } => {
                             seen.opens += 1;

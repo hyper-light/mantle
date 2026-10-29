@@ -646,7 +646,11 @@ and one
 whose exchange ended otherwise is the caller's, told whether it was sent whole, and asked again it
 goes to the next node: one that took a request and lost it may still be stuck on the work, as a
 founder just started again was on its first reads, where any other node can answer it, a mutation
-from what its identity made. An exchange is
+from what its identity made. A get the client asks again itself, where its exchange ended before any
+of its bytes reached the caller: of the next node, with the period the cut taught, at most three
+times, since a node on a busy host may still be working toward its answer (the native suite's
+read-back on CI's busy Linux runner was cut so once the client gave a first exchange a period); one
+with bytes delivered is the caller's. An exchange is
 given at least the node's own serve period, the idle timeout a node judges its exchanges stalled by,
 however fast the exchanges the client measured before it, and before it measured any: a node that
 died is found by its connection's idle timeout, but one alive that never answers keeps its

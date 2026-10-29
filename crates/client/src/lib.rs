@@ -245,6 +245,22 @@ impl Sink for Nothing {
     }
 }
 
+/// A sink that counts the bytes it passed on, each write once it finished.
+struct Counted<'a, K> {
+    sink: &'a mut K,
+    took: u64,
+}
+
+impl<K: Sink> Sink for Counted<'_, K> {
+    async fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.sink.write(bytes).await?;
+        self.took = self
+            .took
+            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        Ok(())
+    }
+}
+
 /// A new operation's identity: 128 bits from the operating system, which every attempt of a
 /// mutation carries (gateway.md §2.1).
 pub fn identity() -> Result<u128, ClientError> {
@@ -547,19 +563,35 @@ impl Client {
         }
     }
 
-    /// Gets `op`'s bytes, a GetObject's, into `sink`, by `deadline_ns`.
+    /// Gets `op`'s bytes, a GetObject's, into `sink`, by `deadline_ns`. One whose exchange ended
+    /// before any of its bytes reached `sink` is asked again, of the next node and with the period
+    /// the cut taught (`asked`, `attempt`), at most [`ATTEMPTS`] times: a node on a busy host may
+    /// still be working toward its answer, one may be stuck, and a get reads what it reads
+    /// wherever it is asked. One that ended with bytes in `sink` is the caller's.
     pub async fn get<K: Sink>(
         &mut self,
         op: &Op,
         sink: &mut K,
         deadline_ns: u64,
     ) -> Result<Reply, ClientError> {
-        match op {
-            Op::Get { .. } => {
-                self.ask(op, None::<&mut Nothing>, Some(sink), deadline_ns)
-                    .await
+        if !matches!(op, Op::Get { .. }) {
+            return Err(ClientError::Operation("not a get"));
+        }
+        let mut failures = 0u32;
+        loop {
+            let mut counted = Counted {
+                sink: &mut *sink,
+                took: 0,
+            };
+            let asked = self
+                .ask(op, None::<&mut Nothing>, Some(&mut counted), deadline_ns)
+                .await;
+            match asked {
+                Err(lost @ ClientError::Lost { .. }) if counted.took == 0 => {
+                    failures = self.again(failures, lost, deadline_ns).await?;
+                }
+                asked => return asked,
             }
-            _ => Err(ClientError::Operation("not a get")),
         }
     }
 

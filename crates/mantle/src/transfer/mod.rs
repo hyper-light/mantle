@@ -160,6 +160,9 @@ pub struct Tally {
     pub bytes: u64,
     /// Puts answered other than done or out of space.
     pub refused: u64,
+    /// The statuses those puts were answered with, each with its count: an entry a status, so no
+    /// more entries than there are statuses.
+    pub refusals: Vec<(Status, u64)>,
     /// Puts refused as out of space: what a filling case puts until.
     pub full: u64,
     /// Requests asked again, the same, after their answers were lost: an exchange the client gave
@@ -185,6 +188,7 @@ impl Tally {
             objects: 0,
             bytes: 0,
             refused: 0,
+            refusals: Vec::new(),
             full: 0,
             again: 0,
             wrong: 0,
@@ -209,6 +213,12 @@ impl Tally {
             true
         } else {
             self.refused = self.refused.saturating_add(1);
+            if let Came::Refused(status) = came {
+                match self.refusals.iter_mut().find(|(s, _)| *s == status) {
+                    Some((_, count)) => *count = count.saturating_add(1),
+                    None => self.refusals.push((status, 1)),
+                }
+            }
             false
         }
     }
@@ -495,6 +505,18 @@ pub fn transfer(out: &mut impl Write, options: &Options) -> Result<bool, Transfe
                 tally.wrong,
                 tally.missing,
             )?;
+            if !tally.refusals.is_empty() {
+                let said: Vec<String> = tally
+                    .refusals
+                    .iter()
+                    .map(|(status, n)| format!("{status:?} {n}"))
+                    .collect();
+                writeln!(
+                    out,
+                    "  small {count} {door} refused with: {}",
+                    said.join(", ")
+                )?;
+            }
             exact &= tally.exact();
         }
     }

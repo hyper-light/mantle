@@ -152,7 +152,9 @@ Exact in 9,027 s: 32,101 blocks each on distinct nodes; each node holding 227.65
 kill and restart, none wrong, missing or asked again; the controls caught; refused typed on both
 doors and none otherwise. The scope peaked at 7.8 GB, its swap at 314 MB, no OOM event; a node at
 most 153 MB resident with 43 threads and 21,698 major faults, the harness 13.6 MB. The 64 GB pass's
-100G case held its two objects in 93.3% of 287.9 GB volumes. The 16 GB pass runs on 750a1525.
+100G case held its two objects in 93.3% of 287.9 GB volumes. The 16 GB pass on 750a1525 held its 1k set
+exact and failed its 10k set in the kills (`Budget`, the client change below, reverted); it runs
+again on the build without it.
 
 **Where a full cell's room goes.** A cell is full when one block's chunks find no node with room:
 every block needs a chunk on each of the three nodes, so the fullest node decides. A node's
@@ -283,10 +285,16 @@ of l0 through it answered at once and its whole read came back in about 40 s. Th
 a fresh client and asked it with no deadline, and with nothing measured the client gave its first
 exchange no progress period either: a node that dies is found by its connection's idle timeout, but
 one alive that never answers keeps its connection. And an exchange a node took and lost was asked
-again of the same node. Both are mended (750a1525): an exchange is given at least the node's serve
-period whatever was measured, and asked again it goes to the next node (gateway.md §6;
-`crates/client/tests/progress.rs`: a get its node never answers is cut and answered whole by the
-next, and fails without either half).
+again of the same node. Giving every exchange at least the node's serve period, asking a lost one
+of the next node and a get cut before its bytes came again (750a1525, 2289f3e2; a test of a node
+that holds a get showed each half) did not hold under load: a node serving a get while a peer is
+dead asks that peer for its chunks first, 0.5 to 2 s an ask, so it began its answer after two
+periods, the cuts were asked again elsewhere, and the client's transport was refused `Budget` (CI
+40794052095's linux-aarch64-1cpu, the filled cell of `tests/transfer.rs`; adacachy's 16 GB pass,
+small 10000 in its kills), where the builds before passed. Both are reverted (b9b2a5b8). The wait
+stays open: a client cannot tell a node working toward its answer from a stuck one while the node
+sends nothing as it works and its own asks have no bound; it needs the node to state its progress
+(STATUS item 8) and to stop asking a dead peer for chunks.
 
 Why the node never answered is not found. Loops of the case (diagnostic builds of branch
 `diag/kills-hang`, never merged: every slow or unplain ask, every ask held 2 s, each connection's

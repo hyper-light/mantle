@@ -403,11 +403,15 @@ so a full volume is no longer held for a first pass that copied whole records fo
 gain, which had ended the S3 ways' cases at `503 SlowDown`. On adacachy under 32 GB the 10G case
 then held 25 objects in 98.7% of each node's volume, every check exact and refused typed on both
 doors, where the 64 GB pass's held 21 in 76.6%, and the 100G case two in 98.6%, exact, its scope
-peaking at 7.8 GB; the 16 GB pass is running. A 100 GB
+peaking at 7.8 GB; the 16 GB pass runs again on the build without the client change. A 100 GB
 object does not fit this Mac's free space (107 GB a node), refused typed. The boto3 10G case on this Mac
 waited two hours in its kills on a read through a founder just started again: a client's first
-exchange had no progress period with nothing measured, and an exchange lost was asked again of the
-same node; both are mended (gateway.md §6). Open: why that founder never answered, and why on this
+exchange has no progress period with nothing measured, and an exchange lost is asked again of the
+same node. Bounding it with the node's serve period cut slow reads during a founder's kill under
+load and ran the client's transport out of budget (CI's one-CPU job, adacachy's 16 GB pass), and
+was reverted: it needs the node to state its progress (item 8) and to stop asking a dead peer for
+chunks, which a node serving a get does first, 0.5 to 2 s an ask. Open: why that founder never
+answered, and why on this
 Mac under load a restarted founder's first range reads could not reach their known leader for 12 to
 25 s (not met in 58 rounds on a Mac Studio, quiet and loaded); and the 10G and 100G cases on this Mac
 on the mended build, waiting on its lid: closed at 11:51 on 2026-10-28, it has slept most of each

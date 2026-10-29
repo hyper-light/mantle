@@ -1613,7 +1613,28 @@ impl Shard {
             entry.pulse.record_waits(self.desk.live.waits.get());
         }
         let timeout = deadline_ns.map(|d| d.saturating_sub(self.core.driver.now_ns()));
+        let diag_began = std::time::Instant::now();
         let _ = self.receive_completions(timeout);
+        let took = diag_began.elapsed();
+        if took >= std::time::Duration::from_secs(5) {
+            let counters = self.counters();
+            diag_rt_line(&format!(
+                "diag-park pid {} timeout_ms {:?} took_ms {} free_timers {} timer_waits {} timers_fired {} waiting {} pollers {} wheel_next_in_ms {:?} pending {}",
+                std::process::id(),
+                timeout.map(|t| t / 1_000_000),
+                took.as_millis(),
+                self.desk.free_timers.len(),
+                counters.timer_waits,
+                counters.timers_fired,
+                !self.core.waiting.is_empty(),
+                self.core.pollers.len(),
+                self.core
+                    .timers
+                    .next_deadline_ns()
+                    .map(|d| d.saturating_sub(self.core.driver.now_ns()) / 1_000_000),
+                self.core.driver.has_pending(),
+            ));
+        }
         self.core.driver_lost
     }
 
@@ -2282,5 +2303,37 @@ fn unlink_child(tasks: &mut [TaskSlot], parent: u32, child: u32) {
         && let Some(nx) = slot_mut(tasks, next)
     {
         nx.prev_sibling = prev;
+    }
+}
+
+/// Diagnostic (scratch, never merged): a line to this process's own trace file under
+/// `MANTLE_DIAG_DIR`, one write each.
+fn diag_rt_line(line: &str) {
+    use std::io::Write;
+    static FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let text = format!("{wall} {line}\n");
+    let Ok(mut file) = FILE.lock() else {
+        return;
+    };
+    if file.is_none() {
+        *file = std::env::var_os("MANTLE_DIAG_DIR").and_then(|dir| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(std::path::Path::new(&dir).join(format!("{}.rt.log", std::process::id())))
+                .ok()
+        });
+    }
+    match file.as_mut() {
+        Some(f) => {
+            let _ = f.write_all(text.as_bytes());
+        }
+        None => {
+            let _ = std::io::stderr().write_all(text.as_bytes());
+        }
     }
 }

@@ -322,8 +322,16 @@ impl Natives {
             for i in (0..count).filter(|i| acknowledged.has(*i)) {
                 let (key, length) = objects.of(i, &sizes)?;
                 let object = generator.object(&key)?;
+                let wall = || {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0)
+                };
+                mantle_client::diag_line(&format!("diag-read start {key} first {first} wall {}", wall()));
                 let (came, again) =
                     native::get(&mut client, (BUCKET, &key), &object, length).await?;
+                mantle_client::diag_line(&format!("diag-read end {key} first {first} again {again} wall {}", wall()));
                 match came {
                     Came::Done => {}
                     Came::Wrong(_) => wrong = wrong.saturating_add(1),

@@ -521,6 +521,32 @@ fn facts(status: Status, order: u64, version: &Version) -> Reply {
 }
 
 impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
+    /// Diagnostic (scratch, never merged): each job's door, work and what it waits on.
+    pub(super) fn diag_jobs(&self) -> Vec<(String, String)> {
+        self.jobs
+            .iter()
+            .map(|job| {
+                let key = match &job.door {
+                    Door::Exchange(e) => format!("x{e:?}"),
+                    Door::Local(local) => format!("l{:p}", &**local),
+                };
+                let work = match &job.work {
+                    Work::Fields(..) => "fields",
+                    Work::Draining(_) => "draining",
+                    Work::Replying(..) => "replying",
+                    Work::Answering(_) => "answering",
+                    Work::Bucket(_) => "bucket",
+                    Work::Put(_) => "put",
+                    Work::Get(_) => "get",
+                    Work::Command(_) => "command",
+                    Work::Complete(_) => "complete",
+                    Work::Read(_) => "read",
+                };
+                (key, format!("{work} by {} pending {:?}", job.principal, job.pending))
+            })
+            .collect()
+    }
+
     /// An object's request arrived on `exchange` from `peer`, its body `body` bytes: a job that
     /// reads its fields first, or the reply it gets at once.
     pub(super) fn take_object(&mut self, exchange: ExchangeId, peer: PeerId, body: Option<u64>) {
@@ -739,7 +765,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Ok(());
         }
         let mut answered: Vec<(Option<u64>, Outcome)> = Vec::new();
+        let work = diag_work(&job.work);
         job.pending.retain(|(pending, request)| {
+            let key = diag_key(pending);
+            diag_seen(key);
             let outcome = match pending {
                 Pending::Command(ask) => {
                     take_done(&mut self.commands_done, *ask).map(Outcome::Command)
@@ -749,6 +778,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             };
             match outcome {
                 Some(outcome) => {
+                    diag_taken(key, &outcome, work);
                     answered.push((*request, outcome));
                     false
                 }
@@ -3254,5 +3284,69 @@ mod tests {
                 "{algorithm:?} full {full}"
             );
         }
+    }
+}
+
+/// Diagnostic (scratch, never merged): when each pending ask was first seen waiting.
+static DIAG_WAITS: std::sync::Mutex<Vec<((u8, u64), std::time::Instant)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn diag_key(pending: &Pending) -> (u8, u64) {
+    match pending {
+        Pending::Command(ask) => (0, *ask),
+        Pending::Read(ask) => (1, *ask),
+        Pending::Chunk(ask) => (2, *ask),
+    }
+}
+
+fn diag_work(work: &Work) -> &'static str {
+    match work {
+        Work::Put(_) => "put",
+        Work::Get(_) => "get",
+        Work::Command(_) => "command",
+        Work::Complete(_) => "complete",
+        Work::Read(_) => "read",
+        Work::Bucket(_) => "bucket",
+        _ => "other",
+    }
+}
+
+fn diag_seen(key: (u8, u64)) {
+    if let Ok(mut waits) = DIAG_WAITS.lock()
+        && !waits.iter().any(|(k, _)| *k == key)
+    {
+        waits.push((key, std::time::Instant::now()));
+    }
+}
+
+fn diag_taken(key: (u8, u64), outcome: &Outcome, work: &str) {
+    let Ok(mut waits) = DIAG_WAITS.lock() else {
+        return;
+    };
+    let Some(at) = waits.iter().position(|(k, _)| *k == key) else {
+        return;
+    };
+    let (_, since) = waits.swap_remove(at);
+    let ms = since.elapsed().as_millis();
+    let (kind, plain, said) = match outcome {
+        Outcome::Command(CommandOutcome::Answered(_)) => ("command", true, String::new()),
+        Outcome::Command(other) => ("command", false, format!("{other:?}")),
+        Outcome::Read(ReadOutcome::Read(_)) => ("read", true, String::new()),
+        Outcome::Read(other) => ("read", false, format!("{other:?}")),
+        Outcome::Chunk(ChunkOutcome::Stored | ChunkOutcome::Read(_)) => {
+            ("chunk", true, String::new())
+        }
+        Outcome::Chunk(other) => ("chunk", false, format!("{other:?}")),
+    };
+    if ms >= 500 || !plain {
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        super::diag_line(&format!(
+            "diag-wait wall_ms={wall} pid={} work={work} kind={kind} ask={} ms={ms} outcome={said}",
+            std::process::id(),
+            key.1,
+        ));
     }
 }

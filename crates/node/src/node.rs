@@ -1085,6 +1085,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Ok(());
         };
         let moved = remote.quic.is_some_and(|known| known != quic);
+        diag_line(&format!(
+            "diag-conn node {:x} learn peer {peer:x} at {quic} moved {moved} dials {dials} keyed {}",
+            self.id, remote.keyed
+        ));
         remote.quic = Some(quic);
         remote.plane = Some(plane);
         if dials && (moved || !remote.keyed) {
@@ -1422,7 +1426,81 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.step_stop()?;
         self.send_plane();
         self.driver.flush()?;
+        self.diag_stuck(now);
         Ok(())
+    }
+
+    /// Diagnostic (scratch, never merged): every 10 s, each read, command, chunk ask and job this
+    /// node has held 20 s or more, with how it is being asked.
+    fn diag_stuck(&mut self, now: u64) {
+        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static BORN: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
+        let last = LAST.load(std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(last) < 1_000_000_000 {
+            return;
+        }
+        LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+        let mut live: Vec<(String, String)> = Vec::new();
+        for out in &self.reads_out {
+            live.push((
+                format!("read{}", out.ask),
+                format!("{out:?} leader_of {:x}", self.leader_of(out.group)),
+            ));
+        }
+        for asking in &self.asking {
+            if asking.out.is_some() || !asking.waiting.is_empty() {
+                let first = asking
+                    .waiting
+                    .front()
+                    .map(|w| w.ask)
+                    .unwrap_or(u64::MAX);
+                live.push((
+                    format!("asking{:x}-{}-{first}", asking.group, asking.next_serial),
+                    format!(
+                        "group {:x} session {} out {:?} waiting {} leader {:?} tried {} pauses {} leader_of {:x}",
+                        asking.group,
+                        asking.session,
+                        asking.out.as_ref().map(|o| (&o.carried, o.via)),
+                        asking.waiting.len(),
+                        asking.leader,
+                        asking.tried,
+                        asking.pauses,
+                        self.leader_of(asking.group)
+                    ),
+                ));
+            }
+        }
+        for c in &self.chunks_out {
+            live.push((
+                format!("chunk{}", c.asked),
+                format!("exchange {:?} peer {:?} get {}", c.exchange, c.peer, c.get),
+            ));
+        }
+        for (key, what) in self.diag_jobs() {
+            live.push((format!("job{key}"), what));
+        }
+        let Ok(mut born) = BORN.lock() else {
+            return;
+        };
+        born.retain(|(key, _)| live.iter().any(|(k, _)| k == key));
+        for (key, what) in &live {
+            let since = match born.iter().find(|(k, _)| k == key) {
+                Some((_, at)) => *at,
+                None => {
+                    born.push((key.clone(), now));
+                    now
+                }
+            };
+            let age_ms = now.saturating_sub(since) / 1_000_000;
+            let threshold = if key.starts_with("job") { 20_000 } else { 2_000 };
+            if age_ms >= threshold {
+                diag_line(&format!(
+                    "diag-stuck node {:x} pid {} {key} age_ms {age_ms} {what}",
+                    self.id,
+                    std::process::id()
+                ));
+            }
+        }
     }
 
     /// Opens the S3 listener's door (`crate::door`): `capacity` operations waiting at once, past
@@ -1542,6 +1620,20 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let sleep = pin!(hyper_rt::futures::sleep(sleep_ns));
         let ended = race3(event, receive, race2(sleep, any_wake)).await;
         let woke = hyper_rt::futures::now_ns();
+        if woke.saturating_sub(now) > sleep_ns.saturating_add(2_000_000_000) {
+            diag_line(&format!(
+                "diag-wait-late pid {} asked_ms {} took_ms {} won {}",
+                std::process::id(),
+                sleep_ns / 1_000_000,
+                woke.saturating_sub(now) / 1_000_000,
+                match &ended {
+                    Either3::First(_) => "event",
+                    Either3::Second(_) => "plane",
+                    Either3::Third(Either::First(_)) => "sleep",
+                    Either3::Third(Either::Second(_)) => "wake",
+                }
+            ));
+        }
         if let Some(at) = wake
             && now < at
             && woke >= at
@@ -1758,6 +1850,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 epoch,
                 role: Role::Node,
             } => {
+                diag_line(&format!("diag-conn node {:x} up peer {peer:x} epoch {epoch}", self.id));
                 if let Some(remote) = self.remotes.iter_mut().find(|r| r.id == peer) {
                     remote.suspect = false;
                 }
@@ -1894,6 +1987,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Ok(())
             }
             Event::Closed { peer, refusal, .. } | Event::Unreachable { peer, refusal } => {
+                diag_line(&format!(
+                    "diag-conn node {:x} down peer {peer:x} refusal {refusal:?}",
+                    self.id
+                ));
                 if let Some(remote) = self.remotes.iter_mut().find(|r| r.id == peer) {
                     remote.ended = remote.ended.saturating_add(1);
                     remote.refusal = refusal;
@@ -2023,6 +2120,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 continue;
             };
             let dialed = self.driver.endpoint().connect(clock, id, quic);
+            diag_line(&format!(
+                "diag-conn node {:x} dial peer {id:x} at {quic} result {:?}",
+                self.id,
+                dialed.as_ref().map(|_| ())
+            ));
             if let Some(remote) = self.remotes.get_mut(at) {
                 remote.dials = remote.dials.saturating_add(1);
                 if let Err(refusal) = dialed {
@@ -3538,10 +3640,16 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let clock = self.driver.clock()?;
         let period = Progress::new(bounds::idle_timeout())?;
         let head = command::head(group);
-        match self
+        let diag = (out.ask, out.leader, out.tried);
+        let opened = self
             .driver
             .endpoint()
-            .open(clock, target, Kind::Read, &head, Some(len), period)
+            .open(clock, target, Kind::Read, &head, Some(len), period);
+        diag_read_ask(local, diag, group, known, target, opened.is_ok(), now);
+        let Some(out) = self.reads_out.get_mut(at) else {
+            return Ok(());
+        };
+        match opened
         {
             Ok(exchange) => {
                 out.via = Via::Exchange {
@@ -3604,6 +3712,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return self.read_exchange(exchange);
         }
         endpoint.end(exchange);
+        diag_line(&format!(
+            "diag-read-reply node {:x} ask {} peer {peer:x} status {status:?} named {:x}",
+            local,
+            out.ask,
+            head.as_ref().map_or(0, |h| h.leader)
+        ));
         match status {
             command::Status::Redirect => {
                 let named = head.map_or(0, |h| h.leader);
@@ -3894,4 +4008,66 @@ mod tests {
             assert!(!names_only_its_sender(&command, 7, false), "a client's");
         }
     }
+}
+
+/// Diagnostic (scratch, never merged): a line to this process's own trace file under
+/// `MANTLE_DIAG_DIR`, one write each, so processes sharing an output never interleave.
+pub(crate) fn diag_line(line: &str) {
+    use std::io::Write;
+    static FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let text = format!("{wall} {line}\n");
+    let Ok(mut file) = FILE.lock() else {
+        return;
+    };
+    if file.is_none() {
+        *file = std::env::var_os("MANTLE_DIAG_DIR").and_then(|dir| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(std::path::Path::new(&dir).join(format!("{}.log", std::process::id())))
+                .ok()
+        });
+    }
+    match file.as_mut() {
+        Some(f) => {
+            let _ = f.write_all(text.as_bytes());
+        }
+        None => {
+            let _ = std::io::stderr().write_all(text.as_bytes());
+        }
+    }
+}
+
+/// Diagnostic (scratch): a read's asking of a peer, at most once a second for each read.
+fn diag_read_ask(
+    local: u64,
+    (ask, leader, tried): (u64, Option<u64>, usize),
+    group: u128,
+    known: u64,
+    target: u64,
+    opened: bool,
+    now: u64,
+) {
+    static LAST: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+    let Ok(mut last) = LAST.lock() else {
+        return;
+    };
+    if let Some(at) = last.iter().position(|(a, _)| *a == ask) {
+        if now.saturating_sub(last.get(at).map_or(0, |(_, t)| *t)) < 1_000_000_000 {
+            return;
+        }
+        last.swap_remove(at);
+    }
+    if last.len() >= 4096 {
+        last.clear();
+    }
+    last.push((ask, now));
+    diag_line(&format!(
+        "diag-read-ask node {local:x} ask {ask} group {group:x} known {known:x} named {:?} target {target:x} tried {tried} opened {opened}",
+        leader.map(|l| format!("{l:x}"))
+    ));
 }

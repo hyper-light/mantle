@@ -108,6 +108,21 @@ fn mantle(dir: &Path, args: &[&str], input: Option<&[u8]>) -> Vec<u8> {
 }
 
 fn mantle_status(dir: &Path, args: &[&str], input: Option<&[u8]>) -> (bool, Vec<u8>, Vec<u8>) {
+    // Diagnostic (scratch, never merged): each command's wall time.
+    let diag_began = std::time::Instant::now();
+    let diag_wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let (ok, out, err) = mantle_status_timed(dir, args, input);
+    eprintln!(
+        "diag-cmd wall {diag_wall} took_ms {} ok {ok} {args:?}",
+        diag_began.elapsed().as_millis()
+    );
+    (ok, out, err)
+}
+
+fn mantle_status_timed(dir: &Path, args: &[&str], input: Option<&[u8]>) -> (bool, Vec<u8>, Vec<u8>) {
     let mut child = Command::new(NODE)
         .arg("--client")
         .arg(dir)

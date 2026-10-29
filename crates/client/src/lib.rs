@@ -1063,6 +1063,16 @@ impl Client {
                 backoff = bounds::backed_off(backoff);
             }
             let node = self.nodes.get(self.at).ok_or(ClientError::NoNodes)?.id;
+            let diag_at = hyper_rt::futures::now_ns();
+            let diag_wall = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            diag_line(&format!(
+                "diag-client open wall {diag_wall} node {node:?} attempt {attempt} slowest {:?} head {}",
+                self.slowest_ns,
+                head.len()
+            ));
             let asked = self
                 .attempt(
                     node,
@@ -1070,7 +1080,19 @@ impl Client {
                     (upload.as_deref_mut(), sink.as_deref_mut()),
                     deadline_ns,
                 )
-                .await?;
+                .await;
+            diag_line(&format!(
+                "diag-client ended wall_open {diag_wall} node {node:?} after_ms {} {}",
+                hyper_rt::futures::now_ns().saturating_sub(diag_at) / 1_000_000,
+                match &asked {
+                    Ok(Attempt::Replied(reply)) => format!("replied {:?}", reply.status),
+                    Ok(Attempt::Untaken(r)) => format!("untaken {r:?}"),
+                    Ok(Attempt::Refused(r)) => format!("refused {r:?}"),
+                    Ok(Attempt::Lost { refusal, whole }) => format!("lost {refusal:?} whole {whole}"),
+                    Err(e) => format!("error {e}"),
+                }
+            ));
+            let asked = asked?;
             match asked {
                 Attempt::Replied(reply) => {
                     let reply = *reply;
@@ -2026,5 +2048,37 @@ mod tests {
         ));
         took_from_source(&mut upload, &piece, 0).unwrap();
         assert!(upload.ended);
+    }
+}
+
+/// Diagnostic (scratch, never merged): a line to this process's own trace file under
+/// `MANTLE_DIAG_DIR`, one write each, so processes sharing an output never interleave.
+pub fn diag_line(line: &str) {
+    use std::io::Write;
+    static FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let text = format!("{wall} {line}\n");
+    let Ok(mut file) = FILE.lock() else {
+        return;
+    };
+    if file.is_none() {
+        *file = std::env::var_os("MANTLE_DIAG_DIR").and_then(|dir| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(std::path::Path::new(&dir).join(format!("{}.log", std::process::id())))
+                .ok()
+        });
+    }
+    match file.as_mut() {
+        Some(f) => {
+            let _ = f.write_all(text.as_bytes());
+        }
+        None => {
+            let _ = std::io::stderr().write_all(text.as_bytes());
+        }
     }
 }

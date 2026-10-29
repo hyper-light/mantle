@@ -1,7 +1,6 @@
-# Diagnostic (never merged): CI's busy job's native suite, the change (this tree) against the base
-# (this tree with crates/chunk from 913abd1a), each built once and run in turn on CPUs 0-1 beside
-# two busy loops, with every process's traces under MANTLE_DIAG_DIR kept as an artifact.
-name: diag-native-get
+# Diagnostic (never merged): the native suite (its resumed-copy test refused InsufficientStorage) in rounds on CPUs 0-1 beside two
+# busy loops, every round run, each node's volumes traced as they change (MANTLE_DIAG_DIR, kept).
+name: diag-native-space
 on:
   push:
 permissions:
@@ -23,24 +22,17 @@ jobs:
           fetch-depth: 0
       - name: Install pinned Rust
         run: rustup toolchain install 1.98.1 --profile minimal
-      - name: Build both arms
-        run: |
-          set -eu
-          git worktree add -q --detach ../base HEAD
-          git -C ../base checkout 913abd1a -- crates/chunk
-          git -C ../base status --short | head
-          cargo test -p mantle --locked --test native --no-run
-          (cd ../base && cargo test -p mantle --locked --test native --no-run)
+      - name: Build
+        run: cargo test -p mantle --locked --test native --no-run
       - name: Interleaved rounds on 0-1 beside 2 busy loops
         run: |
-          set -u
+          set +e
           out=$RUNNER_TEMP/out
           mkdir -p "$out"
           for _ in 1 2; do taskset -c 0-1 sh -c 'while :; do :; done' & done
-          for i in 1 2 3; do
-            if [ $(( (i + ${{ matrix.shard }}) % 2 )) -eq 0 ]; then order="head base"; else order="base head"; fi
-            for arm in $order; do
-              if [ "$arm" = head ]; then dir=$PWD; else dir=$(cd ../base && pwd); fi
+          for i in 1 2 3 4 5 6; do
+            for arm in head; do
+              dir=$PWD
               diag=$out/$arm-$i-diag
               mkdir -p "$diag"
               start=$(date +%s)
@@ -53,6 +45,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: native-get-${{ matrix.shard }}
+          name: native-space-${{ matrix.shard }}
           path: ${{ runner.temp }}/out
           retention-days: 7

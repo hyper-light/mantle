@@ -185,7 +185,23 @@ scope each took the whole limit as their allowance (node.md's allowance: a state
 OS's limit), so under 128 and 96 MiB each refused to start, its floor of 825 to 1,382 MB past the
 limit; the harness states no founder its share. And under 1 GiB the floor left each volume's index
 about 33,000 chunks: past them every put was refused `InsufficientStorage` with most of the disk
-free, 16,555 of the native door's 50,000 and all of the listener's, the 33,444 held exact.
+free, 16,555 of the native door's 50,000 and all of the listener's, the 33,444 held exact. The
+floor each founder said on adas-mac-studio-3 (one 2 GiB volume each, no limit):
+
+| Floor class | One founder | The other two | Its basis |
+|---|---|---|---|
+| objects | 83.5 MB | 83.5 MB | two operations of the largest blocks |
+| volumes | 147.1 MB | 147.1 MB | each volume's buffers (`layout::most_bytes`) |
+| engines | 0.8 MB | 0.8 MB | memtables and store buffers |
+| ranges | 279.3 MB | 268.5 MB | each range's member at hyper-raft's limits |
+| log | 225.9 MB | 225.9 MB | the node's shared log |
+| transport | 88.2 MB | 77.0 MB | the transport's budget and what it holds beside it |
+| threads | 549.5 MB | 52.4 MB | each thread's 2 MiB stack, counted reserved whole |
+| total | 1,374 MB | 855 MB | |
+
+The floor is what a node may hold at its bounds, not what it holds: a node's resident peak on the
+box under 16 GB was 466 MB at 100k objects. One founder started 262 threads where the others
+started 25, its device's issuer sized by the depth its own calibration measured of the same SSD.
 
 The 10G case, its volumes 141,446,945,450 bytes each (1.524 TB free less 1.1 TB, the box's free
 space falling with its other work):

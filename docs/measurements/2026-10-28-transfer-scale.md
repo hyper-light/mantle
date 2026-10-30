@@ -177,7 +177,9 @@ chunks on distinct nodes. The run met memory pressure the passes before it did n
 most 8.30 where the 64 GB pass's 100k set saw 0.12, a node's major faults at 577,113 with the
 scope's swap at 1.08 GB, load to 423 from the box's other work. Starved of CPU alone, a cell
 refused no put: the 10k set on adas-mac-studio-2 beside 28 and 70 busy loops (load 33 and 76 on 14
-CPUs) was exact both times.
+CPUs) was exact both times, and on GitHub's 4-CPU runners (branch `diag/refusal-ci`, never merged,
+run 40989666794) beside 16, 32 and 64 busy loops, load 19 to 70, five runs were exact, none asked
+again, the puts' p99 90 to 248 ms.
 
 The 10G case, its volumes 141,446,945,450 bytes each (1.524 TB free less 1.1 TB, the box's free
 space falling with its other work):

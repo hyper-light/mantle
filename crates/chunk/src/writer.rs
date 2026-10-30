@@ -256,10 +256,45 @@ pub(crate) struct Writer<F: BlockFile> {
     pub unconfirmed: Vec<Held>,
     /// Client writes that found no free segment while cleaning may still free one, held for the
     /// cleaner's verdict, each holding its room of the queue (`Queue::hold`), so the queue's
-    /// bound is theirs too; and the verdict and the free segments when the last was held, since
-    /// the writes are run again once either changes (`Writer::retry_waiting`).
-    pub waiting: Vec<Request>,
-    pub waiting_at: (u64, usize),
+    /// bound is theirs too.
+    pub waiting: Waiting,
+}
+
+/// The client writes a writer holds for the cleaner's verdict, and what the first of them was
+/// held against: the verdict and the free segments its hold read. They run again, all of them,
+/// once either differs from that (`Writer::retry_waiting`), so a verdict given at any time after
+/// one of them was found blocked runs it again. Recorded as the latest hold read it, a verdict
+/// given between a write's check and its hold, or before a later write was held, was taken for
+/// one already seen: the write waited for another, the cleaner idle with its verdict given, and
+/// the volume's test of the planned pass hung on CI's one-CPU runner for five hours.
+#[derive(Default)]
+pub(crate) struct Waiting {
+    requests: Vec<Request>,
+    since: (u64, usize),
+}
+
+impl Waiting {
+    /// Holds `request`, found blocked against `seen`, the verdict and the free segments its
+    /// check read.
+    fn hold(&mut self, request: Request, seen: (u64, usize)) {
+        if self.requests.is_empty() {
+            self.since = seen;
+        }
+        self.requests.push(request);
+    }
+
+    /// Every held write, to run again, once `now` differs from what the first was held against.
+    fn due(&mut self, now: (u64, usize)) -> Option<Vec<Request>> {
+        if self.requests.is_empty() || now == self.since {
+            return None;
+        }
+        Some(std::mem::take(&mut self.requests))
+    }
+
+    /// Every held write, the writer ending.
+    fn take(&mut self) -> Vec<Request> {
+        std::mem::take(&mut self.requests)
+    }
 }
 
 /// A chunk as the batch being validated sees it: the index plus earlier requests in the batch.
@@ -584,31 +619,28 @@ impl<F: BlockFile> Writer<F> {
         }
     }
 
-    /// Holds a client write past its batch until the cleaner's verdict (`waiting`).
-    fn wait(&mut self, request: Request) {
+    /// Holds a client write past its batch until the cleaner's verdict (`waiting`), found
+    /// blocked against `verdict`, the one its check read.
+    fn wait(&mut self, request: Request, verdict: u64) {
         if let Some(bytes) = request.queued
             && let Ok(mut queue) = self.shared.queue.lock()
         {
             queue.hold(bytes);
         }
-        self.waiting_at = (
-            self.shared.futile_at.load(Ordering::Relaxed),
-            self.segments.free_count(),
-        );
-        self.waiting.push(request);
+        let free = self.segments.free_count();
+        self.waiting.hold(request, (verdict, free));
     }
 
     /// Runs the held writes again once the cleaner gave a verdict or a segment was freed since
-    /// the last was held: each written, refused `Full` for good, or held again.
+    /// the first was held: each written, refused `Full` for good, or held again.
     fn retry_waiting(&mut self) {
         let now = (
             self.shared.futile_at.load(Ordering::Relaxed),
             self.segments.free_count(),
         );
-        if self.waiting.is_empty() || now == self.waiting_at {
+        let Some(batch) = self.waiting.due(now) else {
             return;
-        }
-        let batch = std::mem::take(&mut self.waiting);
+        };
         for request in &batch {
             self.release(request);
         }
@@ -618,7 +650,7 @@ impl<F: BlockFile> Writer<F> {
     /// Answers every held write with the error `error` makes: the volume fenced, or its writer
     /// stopping.
     fn end_waiting(&mut self, error: impl Fn() -> ChunkError) {
-        for request in std::mem::take(&mut self.waiting) {
+        for request in self.waiting.take() {
             self.release(&request);
             reply(request, Err(error()));
         }
@@ -751,12 +783,16 @@ impl<F: BlockFile> Writer<F> {
         }
     }
 
-    /// Whether cleaning may still free a segment: unless it was tried on exactly the data
-    /// deleted so far and gained nothing. Only trying can tell, since how tightly relocated
-    /// records pack is what decides.
-    fn reclaimable(&self) -> bool {
-        self.shared.futile_at.load(Ordering::Relaxed)
-            != self.shared.dead_bytes.load(Ordering::Relaxed)
+    /// Whether cleaning may still free a segment, and the cleaner's verdict that says so: unless
+    /// it was tried on exactly the data deleted so far and gained nothing. Only trying can tell,
+    /// since how tightly relocated records pack is what decides.
+    fn reclaimable(&self) -> Option<u64> {
+        let verdict = self.shared.futile_at.load(Ordering::Relaxed);
+        if verdict == self.shared.dead_bytes.load(Ordering::Relaxed) {
+            None
+        } else {
+            Some(verdict)
+        }
     }
 
     fn free_segments(&self) -> usize {
@@ -1240,21 +1276,27 @@ impl<F: BlockFile> Writer<F> {
                         // or refused `Full` for good, so its answer rests on the volume and not
                         // on how soon a client asks again (research/75). With no cleaner to
                         // give a verdict it is to be retried.
-                        Err(ChunkError::Full) if self.reclaimable() => {
-                            match (payloads.pop(), self.poke.is_some()) {
-                                (Some(payload), true) => self.wait(Request {
-                                    op: Op::Write {
-                                        key,
-                                        offset,
-                                        payload,
-                                        seal,
+                        // The verdict the check read is the one the write is held against
+                        // (`Waiting`).
+                        Err(ChunkError::Full) => match self.reclaimable() {
+                            Some(verdict) => match (payloads.pop(), self.poke.is_some()) {
+                                (Some(payload), true) => self.wait(
+                                    Request {
+                                        op: Op::Write {
+                                            key,
+                                            offset,
+                                            payload,
+                                            seal,
+                                        },
+                                        reply: tx,
+                                        queued,
                                     },
-                                    reply: tx,
-                                    queued,
-                                }),
+                                    verdict,
+                                ),
                                 _ => answer(tx, Err(ChunkError::Busy)),
-                            }
-                        }
+                            },
+                            None => answer(tx, Err(ChunkError::Full)),
+                        },
                         Err(e) => answer(tx, Err(e)),
                     }
                 }
@@ -1981,5 +2023,35 @@ mod tests {
         q.admit(0, &limits).unwrap();
         q.admit(500, &limits).unwrap();
         assert!(matches!(q.admit(1, &limits), Err(ChunkError::Busy)));
+    }
+
+    /// A held request whose answer goes nowhere.
+    fn held() -> Request {
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        Request {
+            op: Op::Checkpoint,
+            reply: Reply::new(tx, None),
+            queued: None,
+        }
+    }
+
+    /// Writes held for the cleaner's verdict run again, all of them, once a verdict has come
+    /// since the first of them was found blocked, though a later write was held after it came:
+    /// taken as the latest hold read it, that verdict was spent and the first write waited for
+    /// another that never came.
+    #[test]
+    fn writes_held_for_a_verdict_run_again_once_it_comes() {
+        let mut waiting = Waiting::default();
+        waiting.hold(held(), (7, 1));
+        assert!(waiting.due((7, 1)).is_none());
+        assert_eq!(waiting.due((9, 1)).map(|run| run.len()), Some(1));
+        // One held against the verdict 7; the cleaner gives 9; another is held against 9.
+        waiting.hold(held(), (7, 1));
+        waiting.hold(held(), (9, 1));
+        assert_eq!(waiting.due((9, 1)).map(|run| run.len()), Some(2));
+        // A segment freed runs them again as a verdict does; with none held, nothing is due.
+        waiting.hold(held(), (9, 1));
+        assert_eq!(waiting.due((9, 2)).map(|run| run.len()), Some(1));
+        assert!(waiting.due((11, 3)).is_none());
     }
 }

@@ -663,7 +663,15 @@ relocation, where the cleaner's open segment takes its next record, sealing it a
 another when one does not fit, each batch padded to a block, and the pass cleans the fewest
 victims, in the order the policy chooses them, whose records open fewer segments than they
 free. With none by the time a segment's worth of gain is due, the pass is futile without a
-byte read or written. A pass's gain is the victims it frees less the segments its
+byte read or written. A victim is the segment the plan chose in the incarnation it chose it: one
+whose records all died since is freed by the writer, as the plan counted on, and may be opened
+again under its number for the pass's own relocations, so a victim in another incarnation by its
+turn is counted freed and left alone. Taken by its number, a segment empty when planned, freed,
+then opened for the first victim's records was cleaned as the second victim: the pass moved its
+own output into the last free segment, could not free it, and every pass after found no segment
+to move into while a client's write waited on a verdict (the volume's planned-pass test, five
+hours on CI's one-CPU runner). A relocation refused for want of a segment ends the pass with what
+it gained, its verdict given. A pass's gain is the victims it frees less the segments its
 relocations open, counted by the writer; the change in free segments over the pass counts
 client writes as well, and a pass that freed a segment while a client opened one read as
 futile, which answers writes `Full` while space could be reclaimed. The cleaner has the
@@ -676,7 +684,12 @@ One pass runs at a time. A client's write that finds no free segment while clean
 one waits for the pass's verdict rather than being refused `Busy`: the writer holds it, its room of
 the queue held with it, until the cleaner records a verdict or a segment is freed, then runs it
 again, written or refused `Full` for good (research/75); with no cleaner to give one it is
-refused `Busy`.
+refused `Busy`. The verdict a write is held against is the one its check read, and the held writes
+run again once the verdict or the free segments differ from what the first of them was held
+against: recorded as the latest hold read them, a verdict given between a write's check and its
+hold, or before a later write was held, was taken for one already seen, and the write waited, with
+the cleaner idle, for a verdict that never came (the volume's planned-pass test, five hours on CI's
+one-CPU runner).
 
 **A storage class is a second predictor of death.** A write whose object declares a class with
 a minimum duration (STANDARD_IA, ONEZONE_IA and GLACIER_IR for 30 or 90 days; archived classes

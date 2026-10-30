@@ -211,22 +211,37 @@ impl<F: BlockFile> Cleaner<F> {
                 .saturating_sub(spent_before);
             freed.saturating_sub(spent)
         };
-        while more(self) {
+        'pass: while more(self) {
             let victims = self.plan(&mut tried, most.saturating_sub(report.segments))?;
             if victims.is_empty() {
                 break;
             }
-            for victim in victims {
-                let incarnation = self.incarnation(victim);
+            for (victim, incarnation) in victims {
+                // A victim is the segment its plan chose, that incarnation: one whose records all
+                // died since was freed by the writer, which the plan counted on, and may have
+                // been opened again under its number for this pass's own relocations. Cleaned
+                // as the victim, it was the pass's own output, moved again into the last free
+                // segment and never freed, every later pass finding no segment to move into.
+                if self.incarnation(victim) != Some(incarnation) {
+                    freed = freed.saturating_add(1);
+                    continue;
+                }
                 let started = Instant::now();
-                let (relocated, corrupt) = self.clean(reads, victim)?;
+                let (relocated, corrupt) = match self.clean(reads, victim, incarnation) {
+                    Ok(cleaned) => cleaned,
+                    // No segment left for its relocations: the pass ends with what it gained,
+                    // its verdict given, rather than failing with none and holding the writes
+                    // that wait on it.
+                    Err(ChunkError::Full) => break 'pass,
+                    Err(e) => return Err(e),
+                };
                 report.segments = report.segments.saturating_add(1);
                 report.relocated = report.relocated.saturating_add(relocated);
                 report.corrupt = report.corrupt.saturating_add(corrupt);
                 // The writer frees a segment in the batch after the one that emptied it.
                 self.flush()?;
                 // Freed, and perhaps opened again since by another batch.
-                if self.incarnation(victim) != incarnation {
+                if self.incarnation(victim) != Some(incarnation) {
                     freed = freed.saturating_add(1);
                 }
                 self.learn(started.elapsed());
@@ -236,12 +251,13 @@ impl<F: BlockFile> Cleaner<F> {
         Ok(report)
     }
 
-    /// The victims to clean next, in the order `victim` chooses them: the fewest, at most
-    /// `most`, whose live records, laid out as the writer will lay out their relocations, open
-    /// fewer segments than cleaning them frees; none when no such victims come before their
-    /// gains (`gain`) are due a segment. Laid out from the index's record lengths, a plan reads
-    /// and writes nothing, so a pass that could only move data around moves none.
-    fn plan(&self, tried: &mut HashSet<u32>, most: u32) -> Result<Vec<u32>, ChunkError> {
+    /// The victims to clean next, each with the incarnation it was chosen in, in the order
+    /// `victim` chooses them: the fewest, at most `most`, whose live records, laid out as the
+    /// writer will lay out their relocations, open fewer segments than cleaning them frees; none
+    /// when no such victims come before their gains (`gain`) are due a segment. Laid out from the
+    /// index's record lengths, a plan reads and writes nothing, so a pass that could only move
+    /// data around moves none.
+    fn plan(&self, tried: &mut HashSet<u32>, most: u32) -> Result<Vec<(u32, u64)>, ChunkError> {
         let geometry = self.shared.geometry;
         let mut packing = Packing {
             at: self.clean_position()?,
@@ -253,11 +269,11 @@ impl<F: BlockFile> Cleaner<F> {
         // Space the chosen victims should give back once their live data is packed.
         let mut due = 0u64;
         while u32::try_from(victims.len()).is_ok_and(|chosen| chosen < most) {
-            let Some(victim) = self.victim(tried) else {
+            let Some((victim, incarnation)) = self.victim(tried) else {
                 break;
             };
             tried.insert(victim);
-            victims.push(victim);
+            victims.push((victim, incarnation));
             self.pack(&mut packing, victim)?;
             if u64::try_from(victims.len()).is_ok_and(|freed| freed > packing.opened) {
                 return Ok(victims);
@@ -365,7 +381,7 @@ impl<F: BlockFile> Cleaner<F> {
     /// chunks of nearly a segment each leaves, would move every one and gain nothing. Scores
     /// change with the clock, so each victim is chosen over every segment: one pass of the
     /// table against the victim's relocation, which reads and writes what is live in it.
-    fn victim(&self, tried: &HashSet<u32>) -> Option<u32> {
+    fn victim(&self, tried: &HashSet<u32>) -> Option<(u32, u64)> {
         let usage = self.shared.usage.read().ok()?;
         let size = self.shared.geometry.segment_size;
         let now = std::time::SystemTime::now()
@@ -382,24 +398,22 @@ impl<F: BlockFile> Cleaner<F> {
                 // that matters.
                 let u = s.live as f64 / size as f64;
                 let age = now.saturating_sub(s.youngest_ns) as f64;
-                ((1.0 - u) * age / (1.0 + u), i)
+                ((1.0 - u) * age / (1.0 + u), i, s.incarnation)
             })
-            .filter(|(score, _)| score.is_finite())
+            .filter(|(score, _, _)| score.is_finite())
             .max_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(_, i)| i)
+            .map(|(_, i, incarnation)| (i, incarnation))
     }
 
-    /// Relocates every live record of `segment`, found where they lie in the index's record
-    /// places and each checked against the index as it is read; returns (relocated, corrupt).
-    fn clean(&self, reads: &mut ReadPool, segment: u32) -> Result<(u64, u64), ChunkError> {
-        let incarnation = self
-            .shared
-            .usage
-            .read()
-            .map_err(|_| ChunkError::Fenced)?
-            .get(segment)
-            .map(|s| s.incarnation)
-            .ok_or(ChunkError::Fenced)?;
+    /// Relocates every live record of `segment` in its `incarnation`, the one its plan chose,
+    /// found where they lie in the index's record places and each checked against the index as it
+    /// is read; returns (relocated, corrupt).
+    fn clean(
+        &self,
+        reads: &mut ReadPool,
+        segment: u32,
+        incarnation: u64,
+    ) -> Result<(u64, u64), ChunkError> {
         let offsets: Vec<u32> = self
             .shared
             .index

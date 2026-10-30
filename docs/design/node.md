@@ -2250,6 +2250,21 @@ operation's identity: the same session and serial, the same file, the same chunk
 (audit §13.5, §16.4). A retry never draws a new identity for a mutation whose outcome is
 uncertain; only a refusal known to have had no effect starts a new attempt.
 
+**A step's budget.** A range step a request waits on, a read or a command, waits for its range's
+leader only as long as the range should take to have one again: the range's patience (§2.4's law,
+`Node::patience`: the longest a peer's evidence may go unmoved before it is suspected, the judge's
+wait for a completion of its own, the range's expected election and one more round), the node's
+own where it holds a member of the range, else what the members it asked stated in their
+redirects; where nothing is measured yet, the election timeout the configuration's ceiling gives,
+as hyper-timing gives an unmeasured round the whole ceiling. The time counted is the step's
+without a leader: from when every node it asked failed to name or be one until one does. While an
+exchange to a leader is open the transport's progress rules judge it (§3.8), so a slow step that
+moves is never cut. Past its budget the step ends and the request is answered `503 SlowDown`, a
+cause that passes and that clients retry with backoff (§4.5; research/75); a command whose outcome
+is uncertain keeps its identity, so its retry is answered from what it made. Every step was asked
+with no deadline before this, and a read whose range named no leader paused and asked again
+without end (research/77 D2; CLAUDE.md rule 2).
+
 **Hedging, within the principal's share** (research/27 D14; research/31 §3.8, D10). A chunk
 read outstanding past the `q`-quantile of its measured latency is sent again to another copy,
 or its block decoded from others; hedging after the `q`-quantile adds at most `1 − q` of the

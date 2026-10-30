@@ -1,6 +1,7 @@
-# Diagnostic (never merged): the transfer bench's 10k small case, boto3's puts through the S3
-# listener among them, beside busy loops on a 4-CPU runner, each refused put's status said
-# (f89bcd60); the box's 16 GB pass refused 4,705 of 50,000 such puts at load up to 515 on 32 CPUs.
+# Diagnostic (never merged): the transfer bench's small cases under a memory limit below their
+# working set, swap on, so the kernel reclaims and swaps the cell's pages as the box's host did in
+# its 16 GB pass (PSI some to 8.30, a node's major faults at 577,113, 4,705 puts refused through the
+# S3 listener). Each refused put's status said (f89bcd60); the scope's pressure and events sampled.
 name: diag-refusal
 on:
   push:
@@ -14,10 +15,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        hogs: [16, 32, 64]
-        shard: [1, 2]
+        include:
+          - { count: 10000, volume: 2G, memory: 128M, hogs: 16, name: 10k-128M }
+          - { count: 10000, volume: 2G, memory: 96M, hogs: 16, name: 10k-96M }
+          - { count: 100000, volume: 16G, memory: 1G, hogs: 4, name: 100k-1G }
     runs-on: ubuntu-24.04
-    timeout-minutes: 300
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Install pinned Rust
@@ -27,22 +30,38 @@ jobs:
       - name: Stock S3 clients
         shell: bash
         run: bash scripts/stock-clients.sh
-      - name: The 10k case beside ${{ matrix.hogs }} busy loops
+      - name: The ${{ matrix.count }} case under ${{ matrix.memory }} beside ${{ matrix.hogs }} busy loops
         run: |
           set +e
+          out=$RUNNER_TEMP/keep
+          mkdir -p "$out"
           sudo mkdir -p /mnt/run && sudo chown "$(id -u)" /mnt/run
-          df -h /mnt | tail -1
+          if [ -z "$(swapon --show --noheadings)" ]; then
+            sudo fallocate -l 8G /mnt/swapfile && sudo chmod 600 /mnt/swapfile && sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile
+          fi
+          swapon --show | tee "$out/swap.txt"
+          free -m | tee -a "$out/swap.txt"
           for _ in $(seq ${{ matrix.hogs }}); do sh -c 'while :; do :; done' & done
+          vmstat 10 > "$out/vmstat.txt" &
           start=$(date +%s)
-          target/release/mantle bench transfer /mnt/run/small --small 10000 --volume 2G > "$RUNNER_TEMP/out.txt" 2> "$RUNNER_TEMP/err.txt"
-          code=$?
-          echo "exit $code seconds $(( $(date +%s) - start )) hogs ${{ matrix.hogs }} load $(cut -d' ' -f1-3 /proc/loadavg)" | tee -a "$RUNNER_TEMP/out.txt"
-          cut -c1-260 "$RUNNER_TEMP/out.txt"
-          tail -5 "$RUNNER_TEMP/err.txt" | cut -c1-260
-          mkdir -p "$RUNNER_TEMP/keep" && cp "$RUNNER_TEMP/out.txt" "$RUNNER_TEMP/err.txt" "$RUNNER_TEMP/keep/"
+          sudo systemd-run --scope --unit=probe-case -p MemoryMax=${{ matrix.memory }} -p MemorySwapMax=infinity \
+            --uid="$(id -u)" --gid="$(id -g)" --setenv=PATH="$PATH" --setenv=HOME="$HOME" -- \
+            target/release/mantle bench transfer /mnt/run/small --small ${{ matrix.count }} --volume ${{ matrix.volume }} \
+            > "$out/out.txt" 2> "$out/err.txt" &
+          sleep 5
+          cg=/sys/fs/cgroup/system.slice/probe-case.scope
+          while [ -d "$cg" ]; do
+            echo "$(date +%s) current $(cat $cg/memory.current 2>/dev/null) swap $(cat $cg/memory.swap.current 2>/dev/null) $(tr '\n' ' ' < $cg/memory.pressure 2>/dev/null) events $(tr '\n' ' ' < $cg/memory.events 2>/dev/null)" >> "$out/scope.txt"
+            sleep 10
+          done
+          wait
+          echo "seconds $(( $(date +%s) - start )) memory ${{ matrix.memory }} hogs ${{ matrix.hogs }} load $(cut -d' ' -f1-3 /proc/loadavg)" | tee -a "$out/out.txt"
+          cut -c1-260 "$out/out.txt"
+          tail -5 "$out/err.txt" | cut -c1-260
+          tail -3 "$out/scope.txt" | cut -c1-300
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: refusal-${{ matrix.hogs }}-${{ matrix.shard }}
+          name: refusal-${{ matrix.name }}
           path: ${{ runner.temp }}/keep
           retention-days: 7

@@ -179,7 +179,13 @@ scope's swap at 1.08 GB, load to 423 from the box's other work. Starved of CPU a
 refused no put: the 10k set on adas-mac-studio-2 beside 28 and 70 busy loops (load 33 and 76 on 14
 CPUs) was exact both times, and on GitHub's 4-CPU runners (branch `diag/refusal-ci`, never merged,
 run 40989666794) beside 16, 32 and 64 busy loops, load 19 to 70, five runs were exact, none asked
-again, the puts' p99 90 to 248 ms.
+again, the puts' p99 90 to 248 ms. Nor did a memory limit reproduce it (run 41002528646, the cell
+in one systemd scope with swap on), and it showed two things of its own. Three founders in one
+scope each took the whole limit as their allowance (node.md's allowance: a stated ceiling, else the
+OS's limit), so under 128 and 96 MiB each refused to start, its floor of 825 to 1,382 MB past the
+limit; the harness states no founder its share. And under 1 GiB the floor left each volume's index
+about 33,000 chunks: past them every put was refused `InsufficientStorage` with most of the disk
+free, 16,555 of the native door's 50,000 and all of the listener's, the 33,444 held exact.
 
 The 10G case, its volumes 141,446,945,450 bytes each (1.524 TB free less 1.1 TB, the box's free
 space falling with its other work):

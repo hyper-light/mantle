@@ -153,8 +153,51 @@ kill and restart, none wrong, missing or asked again; the controls caught; refus
 doors and none otherwise. The scope peaked at 7.8 GB, its swap at 314 MB, no OOM event; a node at
 most 153 MB resident with 43 threads and 21,698 major faults, the harness 13.6 MB. The 64 GB pass's
 100G case held its two objects in 93.3% of 287.9 GB volumes. The 16 GB pass on 750a1525 held its 1k set
-exact and failed its 10k set in the kills (`Budget`, the client change below, reverted); it runs
-again on the build without it.
+exact and failed its 10k set in the kills (`Budget`, the client change below, reverted), and ran
+again on d5eadd39 (binary 5415eb0a), every case under the same scope:
+
+| Case | Volume | Objects | Put p50 native/http | Put p99 native/http | Native read p50/p99 | HTTP read p50/p99 | Reads after kills | Asked again | Seconds |
+|---|---|---|---|---|---|---|---|---|---|
+| small 1000 | 256 MiB | 1,000 | 66.1 / 54.5 ms | 115.3 / 83.9 ms | 0.54 / 1.34 ms | 0.84 / 1.41 ms | 6,000 | 0 | 120 |
+| small 10000 | 2 GiB | 10,000 | 73.4 / 77.6 ms | 159.4 / 213.9 ms | 0.72 / 2.62 ms | 1.25 / 2.62 ms | 60,000 | 2 | 1,059 |
+| small 100000 | 16 GiB | 95,295 of 100,000 | 69.2 / 113.2 ms | 838.9 / 671.1 ms | 0.90 / 5.51 ms | 1.67 / 9.96 ms | 571,770 | 2 | 16,341 |
+
+| Case | Scope peak | PSI some avg10, most | Load | Node VmHWM, most | Node threads | Node major faults, most | OOM events |
+|---|---|---|---|---|---|---|---|
+| small 1000 | 119.3 MiB | 0.00 | 8-20 | 45.0 MiB | 33 | 2 | 0 |
+| small 10000 | 234.3 MiB | 0.00 | 5-25 | 51.1 MiB | 43 | 16,962 | 0 |
+| small 100000 | 1,846.4 MiB | 8.30 | 7-423 | 466.3 MiB | 43 | 577,113 | 0 |
+
+The 1k and 10k sets were exact. The 100k set was not: the S3 listener refused 4,705 of its 50,000
+puts, and the harness counted them without their status (a small case now says each status with
+its count, f89bcd60). Each node held 293 to 307 MB of chunks no file keeps, the refused puts' bytes
+at the set's 65.6 KB mean (309 MB): their chunks were written and the puts refused after. Every
+acknowledged object read back exact through both doors and after each founder's kill, each block's
+chunks on distinct nodes. The run met memory pressure the passes before it did not: PSI some at
+most 8.30 where the 64 GB pass's 100k set saw 0.12, a node's major faults at 577,113 with the
+scope's swap at 1.08 GB, load to 423 from the box's other work. Starved of CPU alone, a cell
+refused no put: the 10k set on adas-mac-studio-2 beside 28 and 70 busy loops (load 33 and 76 on 14
+CPUs) was exact both times.
+
+The 10G case, its volumes 141,446,945,450 bytes each (1.524 TB free less 1.1 TB, the box's free
+space falling with its other work):
+
+| Way | Held | Put / native read / HTTP read (MiB/s) | Refused |
+|---|---|---|---|
+| native (whole blocks) | 4 | 31 / 138 / 228 | |
+| cli | 3 | 43 / 105 / 248 | the listener l13, typed |
+| native-parts | 3 | 25 / 98 / 261 | native l14, typed |
+| boto-parts | 3 | 27 / 121 / 293 | |
+
+Exact in 11,551 s: 13 objects, 28,204 blocks each on distinct nodes; each node holding
+139,821,891,584 bytes of 141,446,945,450 (98.85%) with one segment free; 78 reads after each
+founder's kill and restart, none wrong, missing or asked again; the controls caught; refused typed on
+both doors and none otherwise. The scope peaked at 1.40 GiB, PSI some at most 0.51; a node at most
+129.7 MiB resident with 43 threads and 254,393 major faults, the AWS CLI 175 MiB. The 100G case's
+volumes were 92,559,448,746 bytes each (1.377 TB free less 1.1 TB), less than one 100 GiB object
+takes a node: none held, both doors refused their first object typed (native l0, the listener l1),
+in 1,855 s, the scope at 505 MiB. By 2026-10-29 the box's free space was 737 GB, under the 1 TB the
+owner keeps: no large case runs there until space frees.
 
 **Where a full cell's room goes.** A cell is full when one block's chunks find no node with room:
 every block needs a chunk on each of the three nodes, so the fullest node decides. A node's

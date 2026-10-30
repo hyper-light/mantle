@@ -403,7 +403,12 @@ so a full volume is no longer held for a first pass that copied whole records fo
 gain, which had ended the S3 ways' cases at `503 SlowDown`. On adacachy under 32 GB the 10G case
 then held 25 objects in 98.7% of each node's volume, every check exact and refused typed on both
 doors, where the 64 GB pass's held 21 in 76.6%, and the 100G case two in 98.6%, exact, its scope
-peaking at 7.8 GB; the 16 GB pass runs again on the build without the client change. A 100 GB
+peaking at 7.8 GB. Under 16 GB the 1k and 10k sets and the 10G case were exact (13 objects in
+98.85% of each node's volume, refused typed), but the 100k set's S3 listener refused 4,705 of
+50,000 puts after writing their chunks, under memory pressure the passes before did not meet (PSI
+some to 8.30, a node's major faults at 577,113, load to 423); the 100G case's volumes, the box's
+free space falling with its other work, held none, refused typed, and the box now has less free
+than the 1 TB the owner keeps. A 100 GB
 object does not fit this Mac's free space (107 GB a node), refused typed. The boto3 10G case on this Mac
 waited two hours in its kills on a read through a founder just started again: a client's first
 exchange has no progress period with nothing measured, and an exchange lost is asked again of the
@@ -421,8 +426,13 @@ deadline is propagated or the bounds compose, is the decision it waits on. Open:
 answered, and why on this
 Mac under load a restarted founder's first range reads could not reach their known leader for 12 to
 25 s (not met in 58 rounds on a Mac Studio, quiet and loaded); and the 10G and 100G cases on this Mac
-on the mended build, waiting on its lid: closed at 11:51 on 2026-10-28, it has slept most of each
-quarter hour since ('Dark Wake Thermal Emergency'), freezing every run on it.
+on the mended build, which wait on its free space (16 GiB on 2026-10-29, other work's builds).
+CI's one-CPU job ran the chunk store's test of the planned pass for five hours: a plan named an
+empty segment by its number, the writer freed it and the pass opened it again for its first
+victim's records, then cleaned it as its second victim, moving its own output into the last free
+segment; and a write held for the cleaner's verdict missed one given between its check and its
+hold. A plan now holds each victim's incarnation and a write the verdict its check read
+(chunk-store.md §7); looped beside fourteen busy loops, 200 rounds where four hangs had come in 40.
 
 Remaining before it is done:
 

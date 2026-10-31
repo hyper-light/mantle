@@ -187,7 +187,7 @@ fn incarnation<F: BlockFile>(shared: &Shared<F>, segment: u32) -> Result<Option<
 
 /// The chunk whose record at `offset` of `segment` failed to verify, if that record is still
 /// live in the same incarnation: one moved or deleted since is not damage.
-fn damaged_owner<F: BlockFile>(
+pub(crate) fn damaged_owner<F: BlockFile>(
     shared: &Shared<F>,
     segment: u32,
     offset: u32,

@@ -671,7 +671,13 @@ then opened for the first victim's records was cleaned as the second victim: the
 own output into the last free segment, could not free it, and every pass after found no segment
 to move into while a client's write waited on a verdict (the volume's planned-pass test, five
 hours on CI's one-CPU runner). A relocation refused for want of a segment ends the pass with what
-it gained, its verdict given. A pass's gain is the victims it frees less the segments its
+it gained, its verdict given. A record that fails its check while its victim is cleaned is damage
+only as the scrubber judges one: while the segment holds live records in the victim's
+incarnation and the index places a record of that incarnation there. One that died after the pass
+listed its place may lie under a later incarnation's bytes, written by a batch that freed the
+segment and opened it again in one frame before it published, and published to the index before
+the segment table; counted corrupt, two such places failed the volume's test on CI's 2-CPU busy
+runner. A pass's gain is the victims it frees less the segments its
 relocations open, counted by the writer; the change in free segments over the pass counts
 client writes as well, and a pass that freed a segment while a client opened one read as
 futile, which answers writes `Full` while space could be reclaimed. The cleaner has the

@@ -441,6 +441,9 @@ victim's records, then cleaned it as its second victim, moving its own output in
 segment; and a write held for the cleaner's verdict missed one given between its check and its
 hold. A plan now holds each victim's incarnation and a write the verdict its check read
 (chunk-store.md §7); looped beside fourteen busy loops, 200 rounds where four hangs had come in 40.
+On CI's 2-CPU busy runner a pass counted corrupt two places whose records had died after it
+listed them, read while a batch that freed their segment and opened it again in one frame wrote
+there: the cleaner now judges damage as the scrubber does (chunk-store.md §8).
 
 Remaining before it is done:
 

@@ -33,6 +33,7 @@ use crate::error::ChunkError;
 use crate::frame::SegmentState;
 use crate::record::{self, FLAG_FINAL, Payload};
 use crate::recover::{Identity, ReadPool, verify_at};
+use crate::scrub::damaged_owner;
 use crate::writer::{CLEANER_RESERVE, Move, Op, Reply, Request, Shared};
 
 pub(crate) struct Cleaner<F> {
@@ -227,7 +228,8 @@ impl<F: BlockFile> Cleaner<F> {
                     continue;
                 }
                 let started = Instant::now();
-                let (relocated, corrupt) = match self.clean(reads, victim, incarnation) {
+                let places = self.places(victim)?;
+                let (relocated, corrupt) = match self.clean(reads, victim, incarnation, places) {
                     Ok(cleaned) => cleaned,
                     // No segment left for its relocations: the pass ends with what it gained,
                     // its verdict given, rather than failing with none and holding the writes
@@ -405,23 +407,29 @@ impl<F: BlockFile> Cleaner<F> {
             .map(|(_, i, incarnation)| (i, incarnation))
     }
 
-    /// Relocates every live record of `segment` in its `incarnation`, the one its plan chose,
-    /// found where they lie in the index's record places and each checked against the index as it
-    /// is read; returns (relocated, corrupt).
-    fn clean(
-        &self,
-        reads: &mut ReadPool,
-        segment: u32,
-        incarnation: u64,
-    ) -> Result<(u64, u64), ChunkError> {
-        let offsets: Vec<u32> = self
+    /// Where `segment`'s live records lie now, by the index's record places: what a clean of it
+    /// reads ([`Self::clean`]).
+    pub(crate) fn places(&self, segment: u32) -> Result<Vec<u32>, ChunkError> {
+        Ok(self
             .shared
             .index
             .read()
             .map_err(|_| ChunkError::Fenced)?
             .records_in(segment)
             .map(|(offset, _)| offset)
-            .collect();
+            .collect())
+    }
+
+    /// Relocates every live record of `segment` in its `incarnation`, the one its plan chose,
+    /// among those at `offsets`, its places as listed before ([`Self::places`]), each checked
+    /// against the index as it is read; returns (relocated, corrupt).
+    pub(crate) fn clean(
+        &self,
+        reads: &mut ReadPool,
+        segment: u32,
+        incarnation: u64,
+        offsets: Vec<u32>,
+    ) -> Result<(u64, u64), ChunkError> {
         let identity = Identity {
             volume: self.shared.volume,
             checksum_shift: self.shared.checksum_shift,
@@ -448,6 +456,14 @@ impl<F: BlockFile> Cleaner<F> {
                     if self.incarnation(segment) != Some(incarnation) =>
                 {
                     break;
+                }
+                // A record that died since its place was listed is no damage, as the scrubber
+                // judges: a batch that frees its segment may open it again in the same frame and
+                // write there before the segment table says so (`Writer::layout`, `publish`).
+                Ok(_) | Err(ChunkError::Device(DiskError::Io { .. }))
+                    if damaged_owner(&self.shared, segment, offset, incarnation)?.is_none() =>
+                {
+                    continue;
                 }
                 // Left in place: moving bytes that fail verification would launder them.
                 Ok(_) | Err(ChunkError::Device(DiskError::Io { .. })) => {

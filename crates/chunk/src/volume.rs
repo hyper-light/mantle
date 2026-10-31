@@ -1305,6 +1305,101 @@ mod tests {
         assert_eq!(report.gained, 1, "{report:?}");
     }
 
+    /// A record that died after a clean listed its place is no damage, whatever lies there now.
+    /// A batch frees a segment whose records all died and may open it again in the same frame,
+    /// writing there before the segment table says so (`Writer::layout`, `Writer::publish`): the
+    /// cleaner read those bytes while the table still named the old incarnation and counted them
+    /// corrupt (CI's 2-CPU busy job, `corrupt: 2`). It judges as the scrubber does.
+    #[test]
+    fn a_place_whose_record_died_is_no_damage_while_its_segment_is_written_again() {
+        let file = Gated::new(sim(912));
+        let config = Config {
+            segment_size: 256 << 10,
+            checksum_shift: 12,
+            max_fragments: 2000,
+            compact: true,
+            scrub_period: None,
+            limits: Limits {
+                batch_requests: 64,
+                batch_bytes: 1 << 20,
+                fragments_per_chunk: 64,
+            },
+            prewrite: false,
+            reads: Reads::default(),
+        };
+        let volume = Volume::format(issuer(), file.clone(), 8 << 20, config).unwrap();
+        let chunk = vec![3u8; 50 << 10];
+        // Four chunks fill the first segment; the fifth opens the next.
+        for n in 0..5 {
+            volume.put(key(n), &chunk).unwrap();
+        }
+        let first = volume
+            .shared
+            .index
+            .read()
+            .unwrap()
+            .get(&key(0))
+            .unwrap()
+            .fragments[0];
+        let (segment, incarnation) = (first.segment, first.incarnation);
+        let cleaner = Cleaner {
+            shared: Arc::clone(&volume.shared),
+            submit: volume.sender.clone().unwrap(),
+            wake: sync_channel(1).1,
+            batch_bytes: volume.limits.batch_bytes,
+            batch_moves: volume.limits.batch_requests,
+        };
+        let places = cleaner.places(segment).unwrap();
+        assert_eq!(places.len(), 4);
+        for n in 0..3 {
+            volume.delete(key(n)).unwrap();
+        }
+        // The last delete's batch held at its flush, a put too large for the open segment queued
+        // behind it: once the delete is out, the next batch frees the segment and opens it again
+        // for the put in one frame, its bytes written, held at its own flush.
+        let _reopen = Gated::reopen_on_drop(&file);
+        file.shut(true);
+        let seen = file.flushes();
+        let delete = queue_delete(&volume, key(3));
+        file.flushing_after(seen);
+        let put = queue_put(&volume, key(100), &vec![5u8; 220 << 10]);
+        file.pass(1);
+        file.flushing_after(seen + 1);
+        let named = volume
+            .shared
+            .usage
+            .read()
+            .unwrap()
+            .get(segment)
+            .map(|s| (s.state, s.incarnation));
+        let mut reads = cleaner.reads();
+        let identity = recover::Identity {
+            volume: volume.shared.volume,
+            checksum_shift: volume.shared.checksum_shift,
+        };
+        let there = recover::verify_at(
+            &volume.shared.file,
+            &mut reads,
+            &volume.shared.geometry,
+            identity,
+            segment,
+            u64::from(places[0]),
+            None,
+        )
+        .unwrap()
+        .map(|v| v.prefix.header.incarnation);
+        let cleaned = cleaner.clean(&mut reads, segment, incarnation, places);
+        file.shut(false);
+        delete.recv().unwrap().unwrap();
+        put.recv().unwrap().unwrap();
+        assert_eq!(named, Some((SegmentState::Sealed, incarnation)));
+        assert!(
+            there.is_some_and(|i| i > incarnation),
+            "the place holds the put's record, of a later incarnation: {there:?}"
+        );
+        assert_eq!(cleaned.unwrap(), (0, 0));
+    }
+
     /// With the newer superblock copy unreadable, the older one opens the volume, and its
     /// reservations may be a write behind: records may carry sequences and incarnations past
     /// them, and resuming at them would issue those numbers again. The reservations read are

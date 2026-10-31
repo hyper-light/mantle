@@ -84,6 +84,7 @@ use hyper_rt::combine::{Either, race2};
 use hyper_rt::machine::facts::Facts;
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig, interests_for};
 use hyper_rt::sync::{ChannelReceiver, Sender, channel};
+use hyper_transport::Refusal;
 use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer};
 use mantle_cert::{KeyPair, Serial, Validity};
 use mantle_chunk::{ChunkKey, Config as VolumeConfig, Limits as VolumeLimits, Reads};
@@ -1238,6 +1239,18 @@ impl Cell {
         });
     }
 
+    /// Waits until node `from` holds a keyed connection to `to` and its detectors trust `to`: what
+    /// a chunk read of `to` needs, one of a peer they suspect being lost at once
+    /// (`Node::end_chunk_gets`).
+    fn trusted(&mut self, from: u64, to: u64) {
+        self.watch.until(&self.reports, |w| {
+            w.links
+                .get(&(from, to))
+                .filter(|link| link.keyed && !link.suspect)
+                .map(|_| ())
+        });
+    }
+
     /// What became of the chunk's put or get asked under `tag`, once it is answered.
     fn chunk(&mut self, tag: u64) -> ChunkOutcome {
         self.watch
@@ -1289,6 +1302,40 @@ impl Cell {
             },
         );
         self.chunk(tag)
+    }
+
+    /// Node `from`'s read of `key` on `at`'s `volume`, as `get_chunk`, once `from` trusts `at`,
+    /// and asked again each time it is lost to a suspicion: on a loaded host the detectors may
+    /// suspect a live peer, a mistake they allow (hyper-liveness's `PairReport::allowance`), and a
+    /// read of a suspected peer is lost at once (`Node::end_chunk_gets`). A loss counts as a
+    /// suspicion's only once `from`'s link to `at` reports one more suspicion than when the read
+    /// was asked; lost for any other cause, it stands.
+    fn read_back(
+        &mut self,
+        from: u64,
+        at: u64,
+        volume: u128,
+        key: ChunkKey,
+        offset: u64,
+        len: u64,
+    ) -> ChunkOutcome {
+        if from == at {
+            return self.get_chunk(from, at, volume, key, offset, len);
+        }
+        loop {
+            self.trusted(from, at);
+            let before = self.watch.links.get(&(from, at)).map_or(0, |l| l.suspected);
+            let outcome = self.get_chunk(from, at, volume, key, offset, len);
+            if outcome != ChunkOutcome::Lost(Refusal::Closed) {
+                return outcome;
+            }
+            self.watch.until(&self.reports, |w| {
+                w.links
+                    .get(&(from, at))
+                    .filter(|link| link.suspected > before)
+                    .map(|_| ())
+            });
+        }
     }
 
     /// Starts node `id` on a thread of its own, its shard, on its directory: the engine is opened
@@ -2256,7 +2303,7 @@ fn chunks_put_on_each_nodes_volume_read_back_whole_and_in_part_from_any_node() {
         let len = u64::try_from(bytes.len()).unwrap();
         for from in [1, 2] {
             assert_eq!(
-                cell.get_chunk(from, *at, *volume, *key, 0, len),
+                cell.read_back(from, *at, *volume, *key, 0, len),
                 ChunkOutcome::Read(bytes.clone())
             );
             if len > 2 {
@@ -2264,7 +2311,7 @@ fn chunks_put_on_each_nodes_volume_read_back_whole_and_in_part_from_any_node() {
                 let range =
                     usize::try_from(offset).unwrap()..usize::try_from(offset + part).unwrap();
                 assert_eq!(
-                    cell.get_chunk(from, *at, *volume, *key, offset, part),
+                    cell.read_back(from, *at, *volume, *key, offset, part),
                     ChunkOutcome::Read(bytes[range].to_vec())
                 );
             }
@@ -2313,7 +2360,7 @@ fn a_chunk_refused_is_answered_why_by_the_node_that_refused_it() {
         );
         // A chunk the volume does not hold, and bytes past one's end.
         assert_eq!(
-            cell.get_chunk(1, at, volume, chunk_key(at), 0, 1),
+            cell.read_back(1, at, volume, chunk_key(at), 0, 1),
             ChunkOutcome::Refused(ChunkStatus::NotFound)
         );
         assert_eq!(
@@ -2321,7 +2368,7 @@ fn a_chunk_refused_is_answered_why_by_the_node_that_refused_it() {
             ChunkOutcome::Stored
         );
         assert_eq!(
-            cell.get_chunk(1, at, volume, chunk_key(at), 9_999, 2),
+            cell.read_back(1, at, volume, chunk_key(at), 9_999, 2),
             ChunkOutcome::Refused(ChunkStatus::Range)
         );
         // The same bytes again are answered as stored; other bytes under the key never replace
@@ -2335,13 +2382,13 @@ fn a_chunk_refused_is_answered_why_by_the_node_that_refused_it() {
             ChunkOutcome::Refused(ChunkStatus::Exists)
         );
         assert_eq!(
-            cell.get_chunk(1, at, volume, chunk_key(at), 0, 10_000),
+            cell.read_back(1, at, volume, chunk_key(at), 0, 10_000),
             ChunkOutcome::Read(bytes.clone())
         );
     }
     // More bytes than the transfer class carries in a reply.
     assert_eq!(
-        cell.get_chunk(1, 2, peer, chunk_key(2), 0, CHUNK_BYTES + 1),
+        cell.read_back(1, 2, peer, chunk_key(2), 0, CHUNK_BYTES + 1),
         ChunkOutcome::Refused(ChunkStatus::TooLarge)
     );
     // A chunk past the largest a node's cell writes: refused by its sender before it goes, and
@@ -2390,7 +2437,7 @@ fn chunks_a_peer_stored_read_back_after_it_stops_and_starts_again() {
     for (key, bytes) in &chunks {
         let len = u64::try_from(bytes.len()).unwrap();
         assert_eq!(
-            cell.get_chunk(1, 2, volume, *key, 0, len),
+            cell.read_back(1, 2, volume, *key, 0, len),
             ChunkOutcome::Read(bytes.clone())
         );
     }

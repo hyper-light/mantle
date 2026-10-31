@@ -419,8 +419,9 @@ pub struct Status {
 
 /// A peer's link as the node keeps it: whether the plane holds keys for its connection, the
 /// dials made to it, the connections and dials to it that ended, the times this node's detectors
-/// came to suspect it, and the last refusal one ended with, as its peer or this side stated it
-/// (`None` when none was stated: a timeout, the path).
+/// came to suspect it and whether they suspect it now, a peer whose chunk reads are lost at once
+/// (`Node::end_chunk_gets`), and the last refusal one ended with, as its peer or this side stated
+/// it (`None` when none was stated: a timeout, the path).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Link {
     pub peer: PeerId,
@@ -428,6 +429,7 @@ pub struct Link {
     pub dials: u64,
     pub ended: u64,
     pub suspected: u64,
+    pub suspect: bool,
     pub refusal: Option<Refusal>,
 }
 
@@ -1320,6 +1322,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             dials: r.dials,
             ended: r.ended,
             suspected: r.suspected,
+            suspect: r.suspect,
             refusal: r.refusal,
         })
     }

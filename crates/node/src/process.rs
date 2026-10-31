@@ -123,7 +123,7 @@ use mantle_meta::wire::{Answer, Command};
 use mantle_range::{ConfState, Range, Settings, Stored};
 use mantle_s3::seal::WrappingKey;
 
-use crate::ask::CommandOutcome;
+use crate::ask::{CommandOutcome, Wait};
 use crate::derive::{Device, Formatted, Measured, Stated, VolumeFacts};
 use crate::directory::Peer;
 use crate::history;
@@ -1752,7 +1752,7 @@ async fn serve(
                 max_nodes: e.max_nodes,
                 max_volumes: e.max_volumes,
             }));
-            Some(node.command(e.root, enlist, u64::MAX)?)
+            Some(node.command(e.root, enlist, u64::MAX, Wait::Answered)?)
         }
         None => None,
     };
@@ -2032,7 +2032,7 @@ impl Living {
             exposure_ns: own.exposure_ns.saturating_add(ran_ns),
             crashes: own.crashes,
         }));
-        self.out = Some(node.command(root, lived, u64::MAX)?);
+        self.out = Some(node.command(root, lived, u64::MAX, Wait::Answered)?);
         Ok(())
     }
 

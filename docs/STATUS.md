@@ -421,8 +421,16 @@ latest changes: a node's own asks are judged by the period its client gives it, 
 ask of a peer takes most of a period loses to its client (7 of 36 read-backs cut), and a run cut
 while its node wrote is sent again, its first chunks left behind until the suite's small volumes
 refuse a run (2 of 36) ([measurements](measurements/2026-10-29-a-node-cut-while-it-works.md)).
-How a client tells a node at work from a stuck one, whether the node states its progress, a
-deadline is propagated or the bounds compose, is the decision it waits on. Open: why that founder never
+The owner chose research/77's design (2026-10-30): a bound on every wait in a node first, then a
+served exchange's progress stated (hyper-transport, with its maintainers), then deadlines carried,
+hedged chunk reads and GET bodies streamed. The first is in: a range step a request waits on ends
+`503 SlowDown` once its range is judged unable to serve it for the step's budget (node.md §5.4):
+where the node holds a member whose detectors judge, while that member and the peers they trust are
+no quorum; elsewhere, by the step's own time. Before it, a node whose range lost its quorum held its
+own reads and commands without end, asking again forever or, as the range's leader, leading on with
+no quorum (hyper-raft hands the range over rather than stepping down). A budget of the range's
+patience counted from the leader's loss cut a failover in a young cell, the patience being the
+election's expected time, so the clock follows the detectors. Open: why that founder never
 answered, and why on this
 Mac under load a restarted founder's first range reads could not reach their known leader for 12 to
 25 s (not met in 58 rounds on a Mac Studio, quiet and loaded); and the 10G and 100G cases on this Mac

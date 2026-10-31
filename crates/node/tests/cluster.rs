@@ -94,7 +94,7 @@ use mantle_meta::engine::{Engine, Model};
 use mantle_meta::name;
 use mantle_meta::session::Rules;
 use mantle_meta::wire::{Answer, Command, Entry};
-use mantle_node::ask::{CommandOutcome, ReadOutcome};
+use mantle_node::ask::{CommandOutcome, ReadOutcome, Wait};
 use mantle_node::chunk::Status as ChunkStatus;
 use mantle_node::client::{Client, ClientSettings};
 use mantle_node::directory::Peer;
@@ -694,7 +694,7 @@ async fn run<E: Engine + 'static>(
                 }
             }
             Either::Second(Ok(Order::Command(tag, command))) => {
-                match node.command(GROUP, command, u64::MAX) {
+                match node.command(GROUP, command, u64::MAX, Wait::Request) {
                     Ok(asked) => {
                         command_tags.insert(asked, tag);
                     }
@@ -705,7 +705,7 @@ async fn run<E: Engine + 'static>(
                 }
             }
             Either::Second(Ok(Order::Read(tag, query))) => {
-                match node.read(GROUP, query, u64::MAX) {
+                match node.read(GROUP, query, u64::MAX, Wait::Request) {
                     Ok(asked) => {
                         read_tags.insert(asked, tag);
                     }
@@ -1421,6 +1421,19 @@ impl Cell {
         self.watch.until(&self.reports, Watch::agreed_leader)
     }
 
+    /// Waits until a margin judges every peer of every live node (`Status::judged`): a failover
+    /// from here is one the nodes' detectors judge, which a node's own steps wait out
+    /// (node.md §5.4).
+    fn judging(&mut self) {
+        self.watch.until(&self.reports, |w| {
+            let all = w
+                .live
+                .iter()
+                .all(|id| w.status.get(id).is_some_and(|s| s.judged));
+            if all { Some(()) } else { None }
+        });
+    }
+
     /// Proposes registration `serial` at the leader and waits until the leader applied it: its
     /// index and answer. A leader that steps down first is asked again where the leader is then,
     /// at most once for each node, since each step down is an election the cell moved through.
@@ -1733,6 +1746,8 @@ fn own_commands(engines: Engines) {
             .into_iter()
             .map(|(key, tag)| (key, cell.commanded(tag)))
             .collect();
+        // The failover these puts wait out is one the nodes' detectors judge.
+        cell.judging();
         let second: Vec<_> = (half..2 * half).map(|n| put_by(&mut cell, n)).collect();
         cell.stop(leader);
         answered.extend(
@@ -1771,6 +1786,39 @@ fn own_commands(engines: Engines) {
     }
 }
 
+/// A node whose range lost its quorum ends a read and a command of its own, both asked with no
+/// deadline, once its detectors leave its member no quorum for the range's patience (node.md
+/// §5.4): each answered as past its deadline, where both waited without end. The survivor
+/// followed, and named no leader that answers; or it led, and leads on with no quorum its
+/// detectors trust (hyper-raft hands over rather than stepping down), committing nothing and
+/// confirming no read.
+fn leaderless_steps_end(engines: Engines, survivor_led: bool) {
+    let mut cell = Cell::start(engines);
+    cell.judging();
+    let leader = cell.leader();
+    let survivor = if survivor_led {
+        leader
+    } else {
+        (1..=cell.nodes).find(|id| *id != leader).unwrap()
+    };
+    for id in (1..=cell.nodes).filter(|id| *id != survivor) {
+        cell.stop(id);
+    }
+    let query = Query::Current {
+        bucket: "b".into(),
+        key: "k".into(),
+    };
+    let read = cell.ask_read(survivor, query);
+    let command = cell.ask_command(survivor, put("k", "e", 1));
+    let outcome = cell.read_of(read);
+    assert!(
+        matches!(outcome, ReadOutcome::Deadline),
+        "the read came to {outcome:?}"
+    );
+    assert_eq!(cell.commanded(command), CommandOutcome::Deadline);
+    cell.close();
+}
+
 fn client_redirected(engines: Engines) {
     {
         let mut cell = Cell::start(engines);
@@ -1793,6 +1841,16 @@ fn client_redirected(engines: Engines) {
 #[test]
 fn a_nodes_own_commands_reach_the_leader_wherever_it_is_and_each_applies_once() {
     own_commands(Engines::Model);
+}
+
+#[test]
+fn a_node_whose_range_lost_its_quorum_ends_its_steps_after_the_ranges_patience() {
+    leaderless_steps_end(Engines::Model, false);
+}
+
+#[test]
+fn a_leader_left_no_quorum_ends_its_own_steps_after_the_ranges_patience() {
+    leaderless_steps_end(Engines::Model, true);
 }
 
 #[test]

@@ -53,7 +53,9 @@ use mantle_meta::wire::{Answer, Command, Entry};
 use mantle_range::membership::{Next, Replacement};
 use mantle_range::{Applied, Elections, GroupStore, LogStore, Range, RangeMachine, ReplicaError};
 
-use crate::ask::{Asking, CommandAsk, CommandOutcome, ReadAsk, ReadOut, ReadOutcome, Via, Wanted};
+use crate::ask::{
+    Asking, CommandAsk, CommandOutcome, ReadAsk, ReadOut, ReadOutcome, Via, Wait, Wanted,
+};
 use crate::chunk;
 use crate::command;
 use crate::directory::{Peer, Peers};
@@ -398,10 +400,11 @@ pub struct Status {
     /// does, and the next dial follows within the peer's backoff ([`bounds::backed_off`]), until
     /// one connects. `None` when the node dials no peer.
     pub reconnect: Option<Duration>,
-    /// While a command or a read this node asks of the range itself waits paused, the longest the
-    /// pause may last by its own law: its backoff ([`bounds::backed_off`]), which the pause drawn
-    /// never passes. A pause for want of a leader ends sooner, once this node's member names one.
-    /// `None` when none waits paused.
+    /// While a command or a read this node asks of the range itself waits paused, or waits
+    /// without a leader that can serve it, the longest it may by its own law: a pause its backoff
+    /// ([`bounds::backed_off`]), which the pause drawn never passes, and a wait without a leader
+    /// its range's budget (node.md §5.4). A pause for want of a leader ends sooner, once this
+    /// node's member names one. `None` when none waits so.
     pub asking: Option<Duration>,
     /// The reads the range's core holds, as its leader: waiting for its term's first commit,
     /// for a quorum to confirm it leads, or to be taken; and of them, those waiting for that
@@ -1202,14 +1205,27 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .asking
                 .iter()
                 .filter(|a| a.group == group)
-                .filter(|a| matches!(a.out.as_ref().map(|o| o.via), Some(Via::Paused { .. })))
-                .map(|a| a.backoff)
-                .chain(
-                    self.reads_out
-                        .iter()
-                        .filter(|r| r.group == group && matches!(r.via, Via::Paused { .. }))
-                        .map(|r| r.backoff),
-                )
+                .filter_map(|a| {
+                    let out = a.out.as_ref()?;
+                    let since = out.leaderless_since.filter(|_| a.holds_request());
+                    Some((out.via, since, a.backoff, a.stated_patience_ns))
+                })
+                .chain(self.reads_out.iter().filter(|r| r.group == group).map(|r| {
+                    let since = r.leaderless_since.filter(|_| r.wait == Wait::Request);
+                    (r.via, since, r.backoff, r.stated_patience_ns)
+                }))
+                .filter_map(|(via, since, backoff, stated_ns)| {
+                    let paused = if matches!(via, Via::Paused { .. }) {
+                        Some(backoff)
+                    } else {
+                        None
+                    };
+                    // A request's wait without a leader that can serve it: its range's budget.
+                    let unled = since
+                        .filter(|_| !matches!(via, Via::Exchange { .. }))
+                        .map(|_| Duration::from_nanos(self.leader_budget_ns(patience, stated_ns)));
+                    paused.into_iter().chain(unled).max()
+                })
                 .max(),
             reads_held: replica.core().raft.reads_held(),
             reads_confirming: replica.core().raft.pending_read_count(),
@@ -2693,6 +2709,69 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .map_or(0, |r| r.leader())
     }
 
+    /// Whether this node's member of `group` and the members its detectors trust are a quorum,
+    /// where it holds a member whose detectors judge (`measured`: the range's patience is known);
+    /// `None` elsewhere. A member left no quorum has a range that cannot elect or commit from
+    /// here: leading, it leads on and hands the range to an heir that can be elected without it
+    /// (hyper-raft `Raft::left_no_quorum`), committing nothing and confirming no read meanwhile
+    /// (Raft dissertation §6.4); a pre-candidate asks no more (`Raft::stop_asking`).
+    fn judged_quorum(&self, group: u128, measured: bool) -> Option<bool> {
+        if !measured {
+            return None;
+        }
+        let replica = self.kept(group).and_then(|k| self.owner.get(k.handle))?;
+        Some(
+            replica
+                .core()
+                .raft
+                .campaign_state()
+                .is_none_or(|state| state.trusted_quorum),
+        )
+    }
+
+    /// A step of `group`'s at a turn at `now`, asked `via` and its clock `since` (node.md §5.4):
+    /// its clock after the turn, and whether its range's budget on it is spent. Where this node's
+    /// member judges, the clock runs exactly while that member and the members its detectors
+    /// trust are no quorum, which a failover keeps. Elsewhere it runs from the step's first round
+    /// of asking that found no node to answer, its own member refusing it, or taking it, and
+    /// nothing short of the step's end stops it: a redirect names a leader that a node cut from
+    /// it may never reach (`Raft::stop_asking`). Out on an exchange, the transport's progress
+    /// rules judge it instead.
+    fn unled(
+        &self,
+        group: u128,
+        via: Via,
+        since: Option<u64>,
+        stated_ns: u64,
+        now: u64,
+    ) -> (Option<u64>, bool) {
+        if matches!(via, Via::Exchange { .. }) {
+            return (since, false);
+        }
+        let patience = self.patience(group);
+        let since = match self.judged_quorum(group, patience.is_some()) {
+            Some(true) => None,
+            Some(false) => Some(since.unwrap_or(now)),
+            None if via == Via::Local => Some(since.unwrap_or(now)),
+            None => since,
+        };
+        let budget = self.leader_budget_ns(patience, stated_ns);
+        (
+            since,
+            since.is_some_and(|since| now >= since.saturating_add(budget)),
+        )
+    }
+
+    /// When a step of `group`'s, asked `via` with its clock `since`, has its range's budget without
+    /// a leader spent; `None` while its clock is stopped or it is out on an exchange.
+    fn unled_end(&self, group: u128, via: Via, since: Option<u64>, stated_ns: u64) -> Option<u64> {
+        if matches!(via, Via::Exchange { .. }) {
+            return None;
+        }
+        let since = since?;
+        Some(since.saturating_add(self.leader_budget_ns(self.patience(group), stated_ns)))
+    }
+
     /// Replies a status alone and ends the exchange.
     /// A chunk put's head, checked before its body is read: what its body is read as, or the
     /// status it is answered with once its body is read and dropped (no such volume here, a head
@@ -3052,14 +3131,16 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// Asks `command` of `group`'s range as a gateway asks one (node.md §6.6): within this node's
     /// session with the range, of its own member when that leads the range, else of the node that
-    /// does, by `deadline_ns` on the shard's clock. Its outcome comes from [`Self::take_command`]
-    /// under the number returned. Refused when the node holds as many commands of its own as it
-    /// keeps, those answered and not yet taken among them.
+    /// does, by `deadline_ns` on the shard's clock, and as `wait` says, past the range's budget
+    /// without a leader or until the range answers (§5.4). Its outcome comes from
+    /// [`Self::take_command`] under the number returned. Refused when the node holds as many
+    /// commands of its own as it keeps, those answered and not yet taken among them.
     pub fn command(
         &mut self,
         group: u128,
         command: Command,
         deadline_ns: u64,
+        wait: Wait,
     ) -> Result<CommandAsk, NodeError> {
         if !names_only_its_sender(&command, self.id, true) {
             return Err(NodeError::Bounds(
@@ -3094,6 +3175,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 ask,
                 command,
                 deadline_ns,
+                wait,
             });
         }
         Ok(ask)
@@ -3152,7 +3234,33 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
             let owner = (self.id, self.run, nth);
             asking.next_entry(limits, owner, nonce, &mut self.commands_done);
+            // Waited the range's budget without a leader that can serve it (node.md §5.4): every
+            // command a request waits on answered as past its deadline, each of which may still
+            // apply, once (`Asking::unled`).
+            let unled = self.asking.get(at).and_then(|a| {
+                let out = a.out.as_ref()?;
+                Some(self.unled(
+                    a.group,
+                    out.via,
+                    out.leaderless_since,
+                    a.stated_patience_ns,
+                    now,
+                ))
+            });
+            let Some(asking) = self.asking.get_mut(at) else {
+                continue;
+            };
             let group = asking.group;
+            if let Some((since, spent)) = unled {
+                let local = asking.out.as_ref().is_some_and(|o| o.via == Via::Local);
+                if let Some(out) = asking.out.as_mut() {
+                    out.leaderless_since = since;
+                }
+                if spent && asking.unled(&mut self.commands_done) && local {
+                    self.commanded
+                        .retain(|c| c.exchange.is_some() || c.group != group);
+                }
+            }
             let due = match asking.out.as_ref().map(|o| o.via) {
                 Some(Via::Unasked) => true,
                 // A pause for want of a leader ends once this node's own member names one.
@@ -3268,6 +3376,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         match proposed {
             Ok(()) => {
                 out.via = Via::Local;
+                // Its wait for a quorum's commit, counted where nothing here judges (`unled`).
+                out.leaderless_since.get_or_insert(now);
                 asking.out = Some(out);
                 self.commanded.push(Commanded {
                     exchange: None,
@@ -3280,6 +3390,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 asking.refused(command::Status::Malformed, &mut self.commands_done);
             }
             Err(_) => {
+                // The member takes no entry now: the time without a leader that serves it counted.
+                out.leaderless_since.get_or_insert(now);
                 asking.out = Some(out);
                 pause(self.id, asking, now, false);
             }
@@ -3337,8 +3449,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         match status {
             command::Status::Redirect => {
-                let named = head.map_or(0, |h| h.leader);
+                let named = head.as_ref().map_or(0, |h| h.leader);
                 asking.leader = Some(named).filter(|l| *l != 0 && *l != peer);
+                asking.stated_patience_ns = head.as_ref().map_or(0, |h| h.patience_ns);
                 unasked(asking);
             }
             command::Status::NoRange => {
@@ -3398,14 +3511,16 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// Reads `query` of `group`'s range as a gateway reads it (node.md §5.1): of this node's own
     /// member when that leads the range, confirmed by a quorum there, else of the node that leads
-    /// it, by `deadline_ns` on the shard's clock. Its outcome comes from [`Self::take_read`] under
-    /// the number returned. Refused when the node holds as many reads of its own as it keeps,
-    /// those answered and not yet taken among them.
+    /// it, by `deadline_ns` on the shard's clock, and as `wait` says, past the range's budget
+    /// without a leader or until the range answers (§5.4). Its outcome comes from
+    /// [`Self::take_read`] under the number returned. Refused when the node holds as many reads of
+    /// its own as it keeps, those answered and not yet taken among them.
     pub fn read(
         &mut self,
         group: u128,
         query: Query,
         deadline_ns: u64,
+        wait: Wait,
     ) -> Result<ReadAsk, NodeError> {
         if self.reads_out.len().saturating_add(self.reads_done.len()) >= self.read_asks {
             return Err(NodeError::Asks);
@@ -3417,11 +3532,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             group,
             query,
             deadline_ns,
+            wait,
             via: Via::Unasked,
             leader: None,
             tried: 0,
             backoff: bounds::initial_pto(),
             pauses: 0,
+            leaderless_since: None,
+            stated_patience_ns: 0,
         });
         Ok(ask)
     }
@@ -3431,16 +3549,47 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         take_done(&mut self.reads_done, ask)
     }
 
+    /// How long a step may wait without a leader that can serve it (node.md §5.4): the range's
+    /// `patience`, where this node's member measured it; else the longer of what the range's
+    /// members stated in a redirect, `stated_ns`, the time they expect it to elect in, and one
+    /// round of asking each node, each given the transport's idle timeout (RFC 9000 §10.1), by
+    /// which every node it could not reach has gone silent that long.
+    fn leader_budget_ns(&self, patience: Option<Duration>, stated_ns: u64) -> u64 {
+        if let Some(patience) = patience {
+            return u64::try_from(patience.as_nanos()).unwrap_or(u64::MAX);
+        }
+        let nodes = u64::try_from(self.remotes.len().max(1)).unwrap_or(u64::MAX);
+        u64::try_from(bounds::idle_timeout().as_nanos())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(nodes)
+            .max(stated_ns)
+    }
+
     /// The reads this node asks itself, at a turn: those past their deadline answered so, and each
     /// not out asked.
     fn step_reads(&mut self, now: u64) -> Result<(), NodeError> {
         let mut at = 0;
         while let Some(out) = self.reads_out.get(at) {
-            if out.deadline_ns > now {
-                let due = match out.via {
+            let (group, via, deadline_ns) = (out.group, out.via, out.deadline_ns);
+            let request = out.wait == Wait::Request;
+            // A request's read that waited its range's budget without a leader that can serve it
+            // (node.md §5.4): ended as one past its deadline is.
+            let (since, spent) = self.unled(
+                group,
+                via,
+                out.leaderless_since,
+                out.stated_patience_ns,
+                now,
+            );
+            let leaderless = request && spent;
+            if let Some(out) = self.reads_out.get_mut(at) {
+                out.leaderless_since = since;
+            }
+            if deadline_ns > now && !leaderless {
+                let due = match via {
                     Via::Unasked => true,
                     Via::Paused { at_ns, leaderless } => {
-                        at_ns <= now || (leaderless && self.leader_of(out.group) != 0)
+                        at_ns <= now || (leaderless && self.leader_of(group) != 0)
                     }
                     Via::Local | Via::Exchange { .. } => false,
                 };
@@ -3489,6 +3638,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if matches!(asked, Some(Ok(()))) {
                 self.owner.schedule(handle);
                 out.via = Via::Local;
+                // Its wait for a quorum's confirmation, counted where nothing here judges (`unled`).
+                out.leaderless_since.get_or_insert(now);
                 self.reading.push(Reading {
                     id,
                     origin: ReadOrigin::Own(out.ask),
@@ -3496,12 +3647,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     query: out.query.clone(),
                 });
             } else {
-                // The member takes no read now (it is stepping down): asked again after a pause.
+                // The member takes no read now (it is stepping down, or has no room): asked again
+                // after a pause, the time without a leader that serves it counted.
                 let at_ns = paused_until(local, (&mut out.backoff, &mut out.pauses), now);
                 out.via = Via::Paused {
                     at_ns,
                     leaderless: false,
                 };
+                out.leaderless_since.get_or_insert(now);
             }
             return Ok(());
         }
@@ -3517,6 +3670,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 at_ns,
                 leaderless: true,
             };
+            out.leaderless_since.get_or_insert(now);
             return Ok(());
         }
         let next = self
@@ -3536,6 +3690,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 at_ns,
                 leaderless: true,
             };
+            out.leaderless_since.get_or_insert(now);
             return Ok(());
         }
         out.tried = out.tried.saturating_add(1);
@@ -3615,8 +3770,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         endpoint.end(exchange);
         match status {
             command::Status::Redirect => {
-                let named = head.map_or(0, |h| h.leader);
+                let named = head.as_ref().map_or(0, |h| h.leader);
                 out.leader = Some(named).filter(|l| *l != 0 && *l != peer);
+                out.stated_patience_ns = head.as_ref().map_or(0, |h| h.patience_ns);
                 out.via = Via::Unasked;
             }
             command::Status::NoRange => {
@@ -3663,7 +3819,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     Via::Paused { at_ns, .. } => at_ns,
                     Via::Local | Via::Exchange { .. } => r.deadline_ns,
                 };
-                asked.min(r.deadline_ns)
+                // Or, a request's, its range's budget spent without a leader that can serve it.
+                let unled = if r.wait == Wait::Request {
+                    self.unled_end(r.group, r.via, r.leaderless_since, r.stated_patience_ns)
+                } else {
+                    None
+                };
+                asked.min(unled.unwrap_or(u64::MAX)).min(r.deadline_ns)
             })
             .min()
     }
@@ -3681,7 +3843,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     None if a.waiting.is_empty() => None,
                     None => Some(now),
                 };
-                [asked, a.next_deadline()].into_iter().flatten().min()
+                // Or the range's budget spent without a leader that can serve its entry, which ends
+                // what requests wait on and starts the clock of the node's own again.
+                let unled = a.out.as_ref().and_then(|o| {
+                    self.unled_end(a.group, o.via, o.leaderless_since, a.stated_patience_ns)
+                });
+                [asked, unled, a.next_deadline()]
+                    .into_iter()
+                    .flatten()
+                    .min()
             })
             .min()
     }
@@ -3826,6 +3996,9 @@ fn pause(local: u64, asking: &mut Asking, now: u64, leaderless: bool) {
     let at_ns = paused_until(local, (&mut asking.backoff, &mut asking.pauses), now);
     if let Some(out) = asking.out.as_mut() {
         out.via = Via::Paused { at_ns, leaderless };
+        if leaderless {
+            out.leaderless_since.get_or_insert(now);
+        }
     }
 }
 

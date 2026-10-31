@@ -37,6 +37,17 @@ pub enum CommandOutcome {
     Refused(command::Status),
 }
 
+/// What a read or a command this node asks of a range waits for (node.md §5.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wait {
+    /// A request waits on it: past its range's budget without a leader that can serve it, it ends
+    /// as one past its deadline does.
+    Request,
+    /// The node's own statement to the range, its enlistment or its history: asked until the
+    /// range answers, the range's laws, not a budget of the node's, deciding when.
+    Answered,
+}
+
 /// The number a read this node asked is answered under (`crate::node::Node::take_read`).
 pub type ReadAsk = u64;
 
@@ -61,11 +72,20 @@ pub(crate) struct ReadOut {
     pub group: u128,
     pub query: Query,
     pub deadline_ns: u64,
+    pub wait: Wait,
     pub via: Via,
     pub leader: Option<PeerId>,
     pub tried: usize,
     pub backoff: Duration,
     pub pauses: u32,
+    /// Its clock without a leader that can serve it (`Node::unled`): where this node's member
+    /// judges, running while that member and the members its detectors trust are no quorum;
+    /// elsewhere from the first round of asking that found no node to answer, or this node's
+    /// member refusing or taking it. Past its range's budget, judged while it is not out on an
+    /// exchange, it ends (node.md §5.4).
+    pub leaderless_since: Option<u64>,
+    /// The patience the members it asked last stated in a redirect, 0 for none.
+    pub stated_patience_ns: u64,
 }
 
 /// A command waiting for its range's next entry.
@@ -74,6 +94,7 @@ pub(crate) struct Wanted {
     pub ask: CommandAsk,
     pub command: Command,
     pub deadline_ns: u64,
+    pub wait: Wait,
 }
 
 /// What an entry out carries: the registration of the node's session with the range, under a
@@ -100,12 +121,16 @@ pub(crate) enum Via {
     Paused { at_ns: u64, leaderless: bool },
 }
 
-/// An entry out: what it carries, the entry, and how it is being asked.
+/// An entry out: what it carries, the entry, how it is being asked, since when it waits without a
+/// leader that can serve it, as a read does ([`ReadOut::leaderless_since`]), and what its commands
+/// wait for, every one the same: a registration's, the first command's that waited for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Out {
     pub carried: Carried,
     pub entry: Entry,
     pub via: Via,
+    pub leaderless_since: Option<u64>,
+    pub wait: Wait,
 }
 
 /// One range's commands: the node's session with it, the commands waiting, the entry out, and the
@@ -123,6 +148,8 @@ pub(crate) struct Asking {
     pub tried: usize,
     pub backoff: Duration,
     pub pauses: u32,
+    /// The patience the members it asked last stated in a redirect, 0 for none.
+    pub stated_patience_ns: u64,
 }
 
 impl Asking {
@@ -137,6 +164,7 @@ impl Asking {
             tried: 0,
             backoff,
             pauses: 0,
+            stated_patience_ns: 0,
         }
     }
 
@@ -149,11 +177,29 @@ impl Asking {
         self.waiting.len().saturating_add(out)
     }
 
+    /// Whether a request waits on what the range holds: the entry out's commands, or one waiting.
+    pub fn holds_request(&self) -> bool {
+        let out = self
+            .out
+            .as_ref()
+            .is_some_and(|o| matches!(o.carried, Carried::Commands(_)) && o.wait == Wait::Request);
+        out || self.waiting.iter().any(|w| w.wait == Wait::Request)
+    }
+
+    /// The waiting commands the next entry may carry: the leading run that waits for the same, at
+    /// most `max_commands`, so that an entry's commands wait for one thing (`Out::wait`).
+    fn run(&self, max_commands: usize) -> (Wait, usize) {
+        let wait = self.waiting.front().map_or(Wait::Request, |w| w.wait);
+        let same = self.waiting.iter().take_while(|w| w.wait == wait).count();
+        (wait, same.min(max_commands.max(1)))
+    }
+
     /// The next entry, when none is out and a command waits: the session's registration first,
     /// as `owner` (the node, as it authenticates) in its `run`, placed at `nth` among the run's
-    /// registrations, under `nonce`; then as many waiting commands as `max_commands` lets one
-    /// entry carry and fit `max_entry_bytes` once encoded, each the next serial. A waiting command
-    /// that fits no entry alone is answered refused, `Malformed`, in `refused`.
+    /// registrations, under `nonce`; then as many of the waiting commands that wait for the same
+    /// as `max_commands` lets one entry carry and fit `max_entry_bytes` once encoded, each the
+    /// next serial. A waiting command that fits no entry alone is answered refused, `Malformed`,
+    /// in `refused`.
     pub fn next_entry(
         &mut self,
         (max_commands, max_entry_bytes): (usize, usize),
@@ -178,11 +224,13 @@ impl Asking {
                 carried: Carried::Registration { nonce },
                 entry,
                 via: Via::Unasked,
+                leaderless_since: None,
+                wait: self.run(max_commands).0,
             });
             return;
         }
         let first = self.next_serial;
-        let mut take = self.waiting.len().min(max_commands.max(1));
+        let (mut wait, mut take) = self.run(max_commands);
         loop {
             let entry = Entry {
                 at_ns: 0,
@@ -209,6 +257,8 @@ impl Asking {
                     carried: Carried::Commands(carried),
                     entry,
                     via: Via::Unasked,
+                    leaderless_since: None,
+                    wait,
                 });
                 return;
             }
@@ -223,7 +273,7 @@ impl Asking {
                 if self.waiting.is_empty() {
                     return;
                 }
-                take = self.waiting.len().min(max_commands.max(1));
+                (wait, take) = self.run(max_commands);
                 continue;
             }
             take = take.saturating_sub(1);
@@ -270,6 +320,7 @@ impl Asking {
                             ask,
                             command: sessioned.command,
                             deadline_ns,
+                            wait: out.wait,
                         });
                     } else {
                         done.push((ask, CommandOutcome::Answered(answer)));
@@ -340,6 +391,46 @@ impl Asking {
         true
     }
 
+    /// Its range's budget without a leader that can serve it spent (node.md §5.4): each command a
+    /// request waits on answered as past its deadline, which may still apply, once, and the entry
+    /// out given up if it carries them, or is a registration no command waits for now. Whether
+    /// the entry out was given up. An entry the node states of its own is asked on, its clock
+    /// started again: the range's laws decide when it is answered.
+    pub fn unled(&mut self, done: &mut Vec<(CommandAsk, CommandOutcome)>) -> bool {
+        let mut kept = VecDeque::with_capacity(self.waiting.len());
+        for wanted in self.waiting.drain(..) {
+            match wanted.wait {
+                Wait::Request => done.push((wanted.ask, CommandOutcome::Deadline)),
+                Wait::Answered => kept.push_back(wanted),
+            }
+        }
+        self.waiting = kept;
+        let given_up = match self.out.as_ref() {
+            Some(Out {
+                carried: Carried::Registration { .. },
+                ..
+            }) => self.waiting.is_empty(),
+            Some(out) => out.wait == Wait::Request,
+            None => false,
+        };
+        if !given_up {
+            if let Some(out) = self.out.as_mut() {
+                out.leaderless_since = None;
+            }
+            return false;
+        }
+        if let Some(Out {
+            carried: Carried::Commands(commands),
+            ..
+        }) = self.out.take()
+        {
+            for (ask, _, _) in commands {
+                done.push((ask, CommandOutcome::Deadline));
+            }
+        }
+        true
+    }
+
     /// The earliest deadline of a command this range holds.
     pub fn next_deadline(&self) -> Option<u64> {
         let out = match self.out.as_ref().map(|o| &o.carried) {
@@ -369,6 +460,7 @@ mod tests {
                 nth: 1,
             },
             deadline_ns,
+            wait: Wait::Request,
         }
     }
 
@@ -414,6 +506,75 @@ mod tests {
                 (2, CommandOutcome::Answered(Answer::WrongLayer)),
             ]
         );
+    }
+
+    fn answered_by(ask: CommandAsk) -> Wanted {
+        Wanted {
+            wait: Wait::Answered,
+            ..wanted(ask, u64::MAX)
+        }
+    }
+
+    #[test]
+    fn an_entrys_commands_wait_for_one_thing() {
+        let mut a = asking(&[
+            wanted(1, 100),
+            wanted(2, 100),
+            answered_by(3),
+            wanted(4, 100),
+        ]);
+        a.session = 5;
+        let mut done = Vec::new();
+        for (carried, wait) in [
+            (vec![(1, 1, 100), (2, 2, 100)], Wait::Request),
+            (vec![(3, 3, u64::MAX)], Wait::Answered),
+            (vec![(4, 4, 100)], Wait::Request),
+        ] {
+            a.next_entry((16, 1 << 20), (1, 1, 0), 0, &mut done);
+            let out = a.out.clone().unwrap();
+            assert_eq!((out.carried, out.wait), (Carried::Commands(carried), wait));
+            let answers = vec![Answer::Repeated; out.entry.commands.len()];
+            a.answered(answers, &mut done);
+        }
+        assert!(a.waiting.is_empty() && a.out.is_none());
+    }
+
+    #[test]
+    fn a_spent_budget_ends_what_requests_wait_on_and_the_nodes_own_statements_are_asked_on() {
+        let mut done = Vec::new();
+        // An entry requests wait on: given up, and the request waiting behind it ended.
+        let mut a = asking(&[wanted(1, 100), answered_by(2), wanted(3, 100)]);
+        a.session = 5;
+        a.next_entry((16, 1 << 20), (1, 1, 0), 0, &mut done);
+        assert!(a.unled(&mut done));
+        assert_eq!(
+            done,
+            vec![(3, CommandOutcome::Deadline), (1, CommandOutcome::Deadline)]
+        );
+        assert_eq!(a.waiting, VecDeque::from([answered_by(2)]));
+        // The node's own statement: asked on, its clock started again, the request behind it ended.
+        done.clear();
+        a.waiting.push_back(wanted(4, 100));
+        a.next_entry((16, 1 << 20), (1, 1, 0), 0, &mut done);
+        if let Some(out) = a.out.as_mut() {
+            out.leaderless_since = Some(7);
+        }
+        assert!(!a.unled(&mut done));
+        assert_eq!(done, vec![(4, CommandOutcome::Deadline)]);
+        let out = a.out.clone().unwrap();
+        assert_eq!(
+            (out.carried, out.leaderless_since),
+            (Carried::Commands(vec![(2, 2, u64::MAX)]), None)
+        );
+        // A registration: given up once no command waits for it.
+        done.clear();
+        let mut b = asking(&[answered_by(5)]);
+        b.next_entry((16, 1 << 20), (1, 1, 0), 0, &mut done);
+        assert!(!b.unled(&mut done) && b.out.is_some());
+        let mut c = asking(&[wanted(6, 100)]);
+        c.next_entry((16, 1 << 20), (1, 1, 0), 0, &mut done);
+        assert!(c.unled(&mut done) && c.out.is_none());
+        assert_eq!(done, vec![(6, CommandOutcome::Deadline)]);
     }
 
     #[test]

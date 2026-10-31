@@ -2250,20 +2250,45 @@ operation's identity: the same session and serial, the same file, the same chunk
 (audit §13.5, §16.4). A retry never draws a new identity for a mutation whose outcome is
 uncertain; only a refusal known to have had no effect starts a new attempt.
 
-**A step's budget.** A range step a request waits on, a read or a command, waits for its range's
-leader only as long as the range should take to have one again: the range's patience (§2.4's law,
-`Node::patience`: the longest a peer's evidence may go unmoved before it is suspected, the judge's
-wait for a completion of its own, the range's expected election and one more round), the node's
-own where it holds a member of the range, else what the members it asked stated in their
-redirects; where nothing is measured yet, the election timeout the configuration's ceiling gives,
-as hyper-timing gives an unmeasured round the whole ceiling. The time counted is the step's
-without a leader: from when every node it asked failed to name or be one until one does. While an
-exchange to a leader is open the transport's progress rules judge it (§3.8), so a slow step that
-moves is never cut. Past its budget the step ends and the request is answered `503 SlowDown`, a
-cause that passes and that clients retry with backoff (§4.5; research/75); a command whose outcome
-is uncertain keeps its identity, so its retry is answered from what it made. Every step was asked
-with no deadline before this, and a read whose range named no leader paused and asked again
-without end (research/77 D2; CLAUDE.md rule 2).
+**A step's budget.** A range step a request waits on, a read or a command, waits without a leader
+that can serve it only as long as its range is judged able to have one again. Where the node holds
+a member of the range whose detectors judge, their judgment decides: the step's clock runs exactly
+while that member and the members its detectors trust are no quorum, leading or following, and the
+step ends once the clock has run the range's patience (§2.4's law, `Node::patience`: the longest a
+peer's evidence may go unmoved before it is suspected, the judge's wait for a completion of its own,
+the range's expected election and one more round). A member left no quorum has a range that cannot
+elect or commit from there: a leader leads on and hands the range to an heir that can be elected
+without it (hyper-raft `Raft::left_no_quorum`), committing nothing and confirming no read meanwhile
+(Raft dissertation §6.4), and a pre-candidate asks no more (`Raft::stop_asking`). A failover keeps a
+trusted quorum, so a step waits out the election however long it takes: the patience is the
+election's expected time, not a bound on it, and a clock counted from the leader's loss cut the
+cluster test's failover in a young cell, whose detectors began to judge 3.5 s after the stop.
+Where nothing here judges (the node holds no member, or its detectors are not yet calibrated, which
+a peer that died before any link was measured leaves so for good), the step's own time decides: its
+clock runs from its first round of asking that found no node to answer, or from its own member
+refusing it (no room) or taking it, and nothing short of the step's end stops it. A redirect that
+names a leader stops nothing there: a member that cannot elect follows the leader it left
+(`Raft::stop_asking`), which a node cut from it never reaches. That budget is the longer of what the
+members stated in their redirects, their expected election, and one round of asking each node, each
+given the transport's idle timeout (RFC 9000 §10.1). While an exchange to a leader is open the
+transport's progress rules judge it (§3.8), so a slow step that moves is never cut. A step the
+node's own member took, leading with a trusted quorum, is the range at work: a leader whose disk or
+connections stop it is suspected by its followers as a crashed one is (hyper-liveness's flush
+proof; the plane is keyed by the connection), so the range elects another and the step follows it.
+Two waits stay bounded only by the deadline a request carries (research/77 D2): a device every node
+of a cell shares, a laptop's cell, that stalls, leaving each judge with its own proof outstanding
+and suspecting no one (hyper-liveness, "A judge whose own proof stalls"); and a node cut from a
+leader that its trusted quorum still follows, in a partition that is not transitive, which neither
+elects nor reaches it. The node's own statements to its ranges, its enlistment and its history
+(§2.4), are no request's: each is asked until its range answers, the range's laws deciding when,
+and a founder's enlistment so waits for the founders its cell needs, which may start tens of
+seconds apart (an enlistment bounded so ended the native suite's founders, exiting, once their
+cells took longer than 6 s to form). Past its budget a request's step ends and the request is
+answered `503 SlowDown`, a cause that passes and that clients retry with backoff (§4.5;
+research/75); a command whose outcome is uncertain keeps its identity, so its retry is answered
+from what it made. Every step was asked with no deadline before this: a read whose range named no
+leader paused and asked again without end, and a node whose own member led with no quorum held its
+own reads and commands without end (research/77 D2; CLAUDE.md rule 2).
 
 **Hedging, within the principal's share** (research/27 D14; research/31 §3.8, D10). A chunk
 read outstanding past the `q`-quantile of its measured latency is sent again to another copy,

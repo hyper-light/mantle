@@ -43,7 +43,7 @@ use mantle_s3::range::{self, Span};
 use mantle_s3::seal::{DataKey, WrappingKey};
 
 use super::{ChunkAsk, ChunkOutcome, Node, NodeError, NodeLog, PIECE, take_done};
-use crate::ask::{CommandAsk, CommandOutcome, ReadAsk, ReadOutcome};
+use crate::ask::{CommandAsk, CommandOutcome, ReadAsk, ReadOutcome, Wait};
 use crate::chunk;
 use crate::door::{self, Piece};
 use crate::place;
@@ -768,6 +768,23 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         request: Option<u64>,
         outcome: Outcome,
     ) -> Result<(), NodeError> {
+        // A range step that waited its range's budget without a leader that can serve it (node.md
+        // §5.4), the only end a job's steps have: the request is answered `SlowDown`, a cause that
+        // passes, which clients retry.
+        let leaderless = matches!(
+            outcome,
+            Outcome::Read(ReadOutcome::Deadline) | Outcome::Command(CommandOutcome::Deadline)
+        );
+        if leaderless
+            && self.jobs.get(at).is_some_and(|job| {
+                !matches!(
+                    job.work,
+                    Work::Fields(..) | Work::Draining(_) | Work::Replying(..) | Work::Answering(_)
+                )
+            })
+        {
+            return self.fail_job(at, Status::SlowDown);
+        }
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(());
         };
@@ -1021,16 +1038,31 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 return self.drain_job(at);
             }
             Next::Owner => self
-                .read(bucket_group, Query::Bucket { bucket }, u64::MAX)
+                .read(
+                    bucket_group,
+                    Query::Bucket { bucket },
+                    u64::MAX,
+                    Wait::Request,
+                )
                 .map(Pending::Read),
             Next::Request(coordinator::Request::Bucket(command)) => self
-                .command(bucket_group, Command::Bucket(command), u64::MAX)
+                .command(
+                    bucket_group,
+                    Command::Bucket(command),
+                    u64::MAX,
+                    Wait::Request,
+                )
                 .map(Pending::Command),
             Next::Request(coordinator::Request::Name { command, .. }) => self
-                .command(name_group, Command::Name(command), u64::MAX)
+                .command(name_group, Command::Name(command), u64::MAX, Wait::Request)
                 .map(Pending::Command),
             Next::Request(coordinator::Request::Gate { generation, .. }) => self
-                .read(name_group, Query::Gate { bucket, generation }, u64::MAX)
+                .read(
+                    name_group,
+                    Query::Gate { bucket, generation },
+                    u64::MAX,
+                    Wait::Request,
+                )
                 .map(Pending::Read),
             Next::Request(coordinator::Request::Probe {
                 generation,
@@ -1044,7 +1076,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     from,
                     budget: u32::try_from(budget).unwrap_or(u32::MAX),
                 };
-                self.read(name_group, query, u64::MAX).map(Pending::Read)
+                self.read(name_group, query, u64::MAX, Wait::Request)
+                    .map(Pending::Read)
             }
             // The cell's one Name range is the directory.
             Next::Request(coordinator::Request::Directory) => {
@@ -1119,7 +1152,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let Some(group) = self.group_of(Layer::Name) else {
                 return self.fail_job(at, Status::Failed);
             };
-            let asked = self.read(group, query, u64::MAX).map(Pending::Read);
+            let asked = self
+                .read(group, query, u64::MAX, Wait::Request)
+                .map(Pending::Read);
             return self.asked(at, asked, None).map(|_| ());
         }
         let default = row.lock.and_then(|lock| lock.default);
@@ -1382,7 +1417,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     return self.drain_job(at);
                 };
                 let asked = self
-                    .read(group, Query::Bucket { bucket }, u64::MAX)
+                    .read(group, Query::Bucket { bucket }, u64::MAX, Wait::Request)
                     .map(Pending::Read);
                 return self.asked(at, asked, None);
             }
@@ -1647,17 +1682,23 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             put::Request::Block(command) => self
                 .group_of(Layer::Block)
                 .ok_or(NodeError::Bounds("no Block range here".into()))
-                .and_then(|g| self.command(g, Command::Block(command.clone()), u64::MAX))
+                .and_then(|g| {
+                    self.command(g, Command::Block(command.clone()), u64::MAX, Wait::Request)
+                })
                 .map(Pending::Command),
             put::Request::File(command) => self
                 .group_of(Layer::File)
                 .ok_or(NodeError::Bounds("no File range here".into()))
-                .and_then(|g| self.command(g, Command::File(command.clone()), u64::MAX))
+                .and_then(|g| {
+                    self.command(g, Command::File(command.clone()), u64::MAX, Wait::Request)
+                })
                 .map(Pending::Command),
             put::Request::Name(command) => self
                 .group_of(Layer::Name)
                 .ok_or(NodeError::Bounds("no Name range here".into()))
-                .and_then(|g| self.command(g, Command::Name(command.clone()), u64::MAX))
+                .and_then(|g| {
+                    self.command(g, Command::Name(command.clone()), u64::MAX, Wait::Request)
+                })
                 .map(Pending::Command),
         };
         match asked {
@@ -1803,7 +1844,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.fail_job(at, Status::Failed)?;
                 return self.drain_job(at);
             };
-            let asked = self.read(group, query, u64::MAX).map(Pending::Read);
+            let asked = self
+                .read(group, query, u64::MAX, Wait::Request)
+                .map(Pending::Read);
             return self.asked(at, asked, None);
         }
         if self.write_get(at)? {
@@ -1942,7 +1985,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             get::Request::Header { file } => self
                 .group_of(Layer::File)
                 .ok_or(NodeError::Bounds("no File range here".into()))
-                .and_then(|g| self.read(g, Query::Header { file: *file }, u64::MAX))
+                .and_then(|g| self.read(g, Query::Header { file: *file }, u64::MAX, Wait::Request))
                 .map(Pending::Read),
             get::Request::Extents { file, offset, max } => {
                 let max = u32::try_from(*max).unwrap_or(u32::MAX);
@@ -1954,14 +1997,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                             offset: *offset,
                             max,
                         };
-                        self.read(g, query, u64::MAX)
+                        self.read(g, query, u64::MAX, Wait::Request)
                     })
                     .map(Pending::Read)
             }
             get::Request::Block { block } => self
                 .group_of(Layer::Block)
                 .ok_or(NodeError::Bounds("no Block range here".into()))
-                .and_then(|g| self.read(g, Query::Block { block: *block }, u64::MAX))
+                .and_then(|g| self.read(g, Query::Block { block: *block }, u64::MAX, Wait::Request))
                 .map(Pending::Read),
             get::Request::Chunk {
                 volume,
@@ -2026,7 +2069,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let query = Query::Bucket {
             bucket: commanding.bucket.clone(),
         };
-        let asked = self.read(group, query, u64::MAX).map(Pending::Read);
+        let asked = self
+            .read(group, query, u64::MAX, Wait::Request)
+            .map(Pending::Read);
         self.asked(at, asked, None)
     }
 
@@ -2156,7 +2201,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             ),
         };
         commanding.asked = true;
-        let asked = self.command(group, command, u64::MAX).map(Pending::Command);
+        let asked = self
+            .command(group, command, u64::MAX, Wait::Request)
+            .map(Pending::Command);
         self.asked(at, asked, None).map(|_| ())
     }
 
@@ -2182,7 +2229,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.fail_job(at, Status::Failed)?;
                 return self.drain_job(at);
             };
-            let asked = self.read(group, query, u64::MAX).map(Pending::Read);
+            let asked = self
+                .read(group, query, u64::MAX, Wait::Request)
+                .map(Pending::Read);
             return self.asked(at, asked, None);
         };
         if let Some(outcome) = completion.outcome() {
@@ -2328,7 +2377,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         key,
                         upload,
                     };
-                    self.read(g, query, u64::MAX)
+                    self.read(g, query, u64::MAX, Wait::Request)
                 })
                 .map(Pending::Read),
             complete::Request::Parts { after, max } => self
@@ -2342,18 +2391,22 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         after: *after,
                         max: u32::try_from(*max).unwrap_or(u32::MAX),
                     };
-                    self.read(g, query, u64::MAX)
+                    self.read(g, query, u64::MAX, Wait::Request)
                 })
                 .map(Pending::Read),
             complete::Request::File(command) => self
                 .group_of(Layer::File)
                 .ok_or(NodeError::Bounds("no File range here".into()))
-                .and_then(|g| self.command(g, Command::File(command.clone()), u64::MAX))
+                .and_then(|g| {
+                    self.command(g, Command::File(command.clone()), u64::MAX, Wait::Request)
+                })
                 .map(Pending::Command),
             complete::Request::Name(command) => self
                 .group_of(Layer::Name)
                 .ok_or(NodeError::Bounds("no Name range here".into()))
-                .and_then(|g| self.command(g, Command::Name(command.clone()), u64::MAX))
+                .and_then(|g| {
+                    self.command(g, Command::Name(command.clone()), u64::MAX, Wait::Request)
+                })
                 .map(Pending::Command),
         };
         match asked {
@@ -2439,7 +2492,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             self.fail_job(at, Status::Failed)?;
             return self.drain_job(at);
         };
-        let asked = self.read(group, query, u64::MAX).map(Pending::Read);
+        let asked = self
+            .read(group, query, u64::MAX, Wait::Request)
+            .map(Pending::Read);
         self.asked(at, asked, None)
     }
 

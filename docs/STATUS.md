@@ -405,10 +405,16 @@ then held 25 objects in 98.7% of each node's volume, every check exact and refus
 doors, where the 64 GB pass's held 21 in 76.6%, and the 100G case two in 98.6%, exact, its scope
 peaking at 7.8 GB. Under 16 GB the 1k and 10k sets and the 10G case were exact (13 objects in
 98.85% of each node's volume, refused typed), but the 100k set's S3 listener refused 4,705 of
-50,000 puts after writing their chunks, under memory pressure the passes before did not meet (PSI
-some to 8.30, a node's major faults at 577,113, load to 423); the 100G case's volumes, the box's
-free space falling with its other work, held none, refused typed, and the box now has less free
-than the 1 TB the owner keeps. A 100 GB
+50,000 puts after writing their chunks; the 100G case's volumes, the box's free space falling with
+its other work, held none, refused typed, and the box now has less free than the 1 TB the owner
+keeps. Run again with each refusal's status, the 100k set's 4,703 listener refusals were the
+volumes' indexes full, 95,297 fragments each with 10.6 GB of free segments: the node's memory past
+its floor is shared in proportion to each part's full-size want, and the five ranges' engines want
+room for metadata across the node directory's whole 8 TB file system, so they took 16.3 GB, room
+for metadata the cell never makes, and each volume's index 33.6 MB. The native door's 11 refusals
+were step 1's `SlowDown`, which its harness does not ask again as stock clients do
+([measurements](measurements/2026-10-28-transfer-scale.md)). Both wait on the owner: how the node
+shares its memory, and when clients' retries (research/77 D4) come. A 100 GB
 object does not fit this Mac's free space (107 GB a node), refused typed. The boto3 10G case on this Mac
 waited two hours in its kills on a read through a founder just started again: a client's first
 exchange has no progress period with nothing measured, and an exchange lost is asked again of the

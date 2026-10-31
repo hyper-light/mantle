@@ -203,6 +203,31 @@ The floor is what a node may hold at its bounds, not what it holds: a node's res
 box under 16 GB was 466 MB at 100k objects. One founder started 262 threads where the others
 started 25, its device's issuer sized by the depth its own calibration measured of the same SSD.
 
+The 100k set again on 9cbe191a (step 1's bound on a node's waits, node.md §5.4; the harness saying
+each refusal's status), 2026-10-30, under the same 16 GB scope, in 21,656 s, the scope's peak
+1,653.3 MiB:
+
+| Door | Objects | Refused | Asked again | Wrong | Missing |
+|---|---|---|---|---|---|
+| native | 50,000 | 11, `SlowDown` | 4 | 0 | 0 |
+| S3 listener | 50,000 | 4,703, `InsufficientStorage` | 0 | 0 | 0 |
+
+Every acknowledged object read back exact through both doors and through each founder killed and
+started again (571,716 reads, 1 asked again), each of 95,284 blocks' chunks on distinct nodes, the
+controls caught. The listener's refusals are the index's: each volume held 95,297 fragments of the
+95,297 it may, with 10.58 GB of free segments, and 100,000 less 95,297 is 4,703. A founder of the
+same cell started under the same scope on the box says why in its basis lines: of the 16.3 GB its
+16 GiB allowance leaves past the floor, each of the five ranges' engines took 3.25 GB for resident
+metadata (`engine.metadata_bytes`), its share of the node directory's whole file system, 8.0 TB
+(`dir.bytes`), and the volume's index 33.6 MB, 95,358 fragments (`volume.1.index_bytes`,
+`max_fragments`). `derive::shares` gives each the same part of its full-size want, the engines' want
+the file system's, which the cell's metadata never fills, and the index's its volume's, which the
+objects fill: the index fills while the engines' 16.3 GB of room holds a few megabytes. The
+volume's log, sized at format for that index, holds it there for the volume's life
+(`derive::held`). The native door's 11 refusals are step 1's `SlowDown`, a range step that waited
+past its budget without a leader to serve it, which the harness's native door returns where boto3
+and the AWS CLI ask again (research/75); before step 1 those steps waited for their leader.
+
 The 10G case, its volumes 141,446,945,450 bytes each (1.524 TB free less 1.1 TB, the box's free
 space falling with its other work):
 

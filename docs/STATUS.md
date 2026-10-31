@@ -413,9 +413,15 @@ its floor is shared in proportion to each part's full-size want, and the five ra
 room for metadata across the node directory's whole 8 TB file system, so they took 16.3 GB, room
 for metadata the cell never makes, and each volume's index 33.6 MB. The native door's 11 refusals
 were step 1's `SlowDown`, which its harness does not ask again as stock clients do
-([measurements](measurements/2026-10-28-transfer-scale.md)). Both wait on the owner: how the node
-shares its memory, and when clients' retries (research/77 D4) come. A 100 GB
-object does not fit this Mac's free space (107 GB a node), refused typed. The boto3 10G case on this Mac
+([measurements](measurements/2026-10-28-transfer-scale.md)). The owner chose both on 2026-10-31:
+the engines' share follows how many objects the cell's volumes hold (open), and mantle's client asks
+a `SlowDown` again as the AWS SDKs ask a throttling error (in, 1ac2509d). The 100G case run again
+below the reserve (161.7 GB volumes) acknowledged none: each way was answered `SlowDown` part way.
+A diagnostic build traced the answer under the same load: a chunk sent to a peer whose device had
+stalled for seconds (a log flush of 5.9 s) was cut `Lost(Stalled)` at its transfer's progress
+period, and a cell of three with three copies has no other volume for it, so the block was
+`Unplaced`. It is the wait below on the write path, and waits on the same step: the node stating
+its progress. A 100 GB object does not fit this Mac's free space (107 GB a node), refused typed. The boto3 10G case on this Mac
 waited two hours in its kills on a read through a founder just started again: a client's first
 exchange has no progress period with nothing measured, and an exchange lost is asked again of the
 same node. Bounding it with the node's serve period cut slow reads during a founder's kill under

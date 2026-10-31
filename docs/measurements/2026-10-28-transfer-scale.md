@@ -248,6 +248,36 @@ takes a node: none held, both doors refused their first object typed (native l0,
 in 1,855 s, the scope at 505 MiB. By 2026-10-29 the box's free space was 737 GB, under the 1 TB the
 owner keeps: no large case runs there until space frees.
 
+The 100G case again below that reserve, as the owner chose on 2026-10-31, on 3e88d710 (binary
+e75c393e), under the same scope, its volumes 161,714,373,973 bytes each (622.6 GB free less
+128 GiB): one object fits a node, so the case asked three (l0 natively in runs, l1 by the CLI, l2 in
+native parts) and boto3 had no turn. None was acknowledged: each was answered `503 SlowDown` part
+way, the nodes keeping 13.4 GB of chunks each that no record keeps, in 1,148 s at load 45 to 95. A
+diagnostic build (branch `diag/large-slowdown`, 5639a8c4 on 1ac2509d, binary d782703c, never
+merged: each `SlowDown`'s path and each refused chunk on a node's standard error, every line a node
+says kept by the harness with the wall clock) put 40 GiB objects on stated 50 GiB volumes beside it:
+
+| Seconds into l0 | What the node serving it said |
+|---|---|
+| 32.5 | a chunk to a peer refused `Lost(Stalled)` |
+| 32.7 | `SlowDown`, block 64e1cbbd `Unplaced` |
+| 116.5 | a chunk to a peer refused `Lost(Stalled)` |
+| 119.0 | `SlowDown`, block aec62ba2 `Unplaced`; the client's third attempt ended `Closed` |
+
+No link changed its judgment in either window. All three nodes were waiting on their own devices
+(`held` turning on and off every 0.1 to 0.6 s), one node's log had been flushing for 5.92 s and the
+longest commit waits were 4.83 to 5.37 s; the box's load was 112 to 189, later 315, from its other
+work. Two small cases run at the same time (10,000 and 30,000 objects) ended at the native door's
+first exchange `Closed`. A node holding a chunk while its device stalls sends nothing, so its
+sender's transport cuts the transfer at its progress period, and a cell of three with three copies
+has no other volume for the chunk: the block is `Unplaced`, answered `SlowDown` (node.md §4.4). It
+is the wait of "a node cut while it works" (2026-10-29) on the write path, and the fix is the
+owner's step 2 of 2026-10-30: a node working on an exchange says so each period (research/77),
+designed in hyper-transport, which waits on that design and the owner's word. The client's
+`SlowDown` retry (1ac2509d) asks again within its three attempts, and each attempt met another
+stall. The 100G case's own refusals were not traced; the same answer at the same place, under the
+same load, is read as the same cause.
+
 **Where a full cell's room goes.** A cell is full when one block's chunks find no node with room:
 every block needs a chunk on each of the three nodes, so the fullest node decides. A node's
 volume refuses a chunk `Full` for one of two things (chunk-store.md §5, §8): no free segment past

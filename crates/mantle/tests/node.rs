@@ -526,7 +526,8 @@ fn each_node_enlists_its_volume_and_placement_offers_one_to_a_domain() {
     cell.enlisted(2);
     assert_eq!(cell.table(), table);
     // Started in another domain, a node is refused, and ends naming the range's answer; in its
-    // own domain again, it enlists.
+    // own domain again, it enlists. Killed once node 2, started again, judges its links.
+    cell.judging();
     cell.kill(3);
     cell.domains.insert(3, "elsewhere".into());
     let said = cell.start_refused(3);
@@ -646,9 +647,10 @@ fn objects_round_trip_through_any_node_and_read_back_after_one_is_killed() {
             );
         }
     }
-    // Each node in turn killed: every object reads back through the other two; started again,
-    // it serves them too.
+    // Each node in turn killed once the cell judges every link, the last one started again's
+    // too: every object reads back through the other two; started again, it serves them too.
     for killed in 1..=NODES {
+        cell.judging();
         cell.kill(killed);
         let others: Vec<u64> = (1..=NODES).filter(|id| *id != killed).collect();
         let got = cell.objects(reads(&|n| others[n % others.len()]));

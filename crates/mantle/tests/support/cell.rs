@@ -2096,6 +2096,27 @@ impl Cell {
         });
     }
 
+    /// Waits until every running node judges each of its peers and has measured each range's
+    /// patience (`patience` stated, `measuring` none): a failover from here is one the nodes'
+    /// detectors judge, which a request's steps wait out (node.md §5.4). A node started again
+    /// measures its links anew and suspects no peer meanwhile, so a leader killed before it judges
+    /// them is not replaced while they are young.
+    pub(crate) fn judging(&mut self) {
+        self.until(|c| {
+            let groups: BTreeSet<u128> = c.status.keys().map(|&(_, group)| group).collect();
+            let judged = c.running.keys().all(|&id| {
+                groups.iter().all(|&group| {
+                    matches!(
+                        c.status.get(&(id, group)),
+                        Some(Line::Status { patience, measuring, .. })
+                            if !patience.is_zero() && measuring.is_zero()
+                    )
+                })
+            });
+            if judged { Some(()) } else { None }
+        });
+    }
+
     /// What `reads` read, each a query of a range's group, which the writer client asks in turn,
     /// knowing every node and told where the running ones listen.
     pub(crate) fn read(&mut self, reads: Vec<(u128, Query)>) -> Vec<Result<Read, ClientError>> {

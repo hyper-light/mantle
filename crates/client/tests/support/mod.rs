@@ -159,15 +159,19 @@ impl Directory for Clients {
 
 /// What the stub node does to a native upload's exchanges, each counted from 1 by its kind: the
 /// Append it reads whole and never answers, as a node that died under it leaves it; the Append and
-/// the Offset it holds unanswered until its client gives up on them; and the Append it answers
-/// only once half again as long has passed as its client waited on the one it gave up on, as a
-/// node whose durable writes take longer than the client gave it answers the run sent again.
+/// the Offset it holds unanswered until its client gives up on them; the Append it answers only
+/// once half again as long has passed as its client waited on the one it gave up on, as a node
+/// whose durable writes take longer than the client gave it answers the run sent again; and the
+/// first Opens and the Append it answers `SlowDown`, its run not committed, as a node whose range
+/// step waited past its budget for a leader answers (node.md §5.4).
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Script {
     pub(crate) lose_append: Option<u32>,
     pub(crate) hold_append: Option<u32>,
     pub(crate) late_append: Option<u32>,
     pub(crate) hold_offset: Option<u32>,
+    pub(crate) slow_opens: u32,
+    pub(crate) slow_append: Option<u32>,
 }
 
 /// The native upload's requests the stub took, by kind, and the exchanges its client cut.
@@ -465,12 +469,16 @@ pub(crate) fn scripted(
                         Op::HeadBucket { .. } => Some((Reply::status(Status::Done), 0)),
                         Op::Open { .. } => {
                             seen.opens += 1;
-                            let reply = Reply {
-                                upload: "upload".into(),
-                                progress: runs.progress(None),
-                                ..Reply::status(Status::Done)
-                            };
-                            Some((reply, 0))
+                            if seen.opens <= script.slow_opens {
+                                Some((Reply::status(Status::SlowDown), 0))
+                            } else {
+                                let reply = Reply {
+                                    upload: "upload".into(),
+                                    progress: runs.progress(None),
+                                    ..Reply::status(Status::Done)
+                                };
+                                Some((reply, 0))
+                            }
                         }
                         Op::Append {
                             offset,
@@ -485,6 +493,8 @@ pub(crate) fn scripted(
                             } else if script.hold_append == Some(seen.appends) {
                                 holding_since = Some(hyper_rt::futures::now_ns());
                                 None
+                            } else if script.slow_append == Some(seen.appends) {
+                                Some((Reply::status(Status::SlowDown), 0))
                             } else if offset != runs.offset {
                                 let reply = Reply {
                                     progress: runs.progress(None),

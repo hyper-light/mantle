@@ -61,7 +61,8 @@ user's request is not to be repeated until the user asks again [1], which is the
 space comes back by an operator's act. S3 names no code for a store out of space; the listener's
 error document carries `InsufficientStorage`, the status's own name, where MinIO carries its own
 `XMinioStorageFull` [4]. The native protocol's status is a code of its own, 26, beside the others,
-which the client returns as the reply's status, as it does `SlowDown`, without asking again.
+which the client returns as the reply's status without asking again (a `SlowDown` it asks again,
+within its attempts and retry quota, since 2026-10-31: research/73).
 
 **A volume that may still free a segment holds the put for its cleaner's verdict.** A volume out
 of free segments while its cleaner may still free one, which only a pass can tell (`mantle_chunk`'s

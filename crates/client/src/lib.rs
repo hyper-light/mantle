@@ -24,7 +24,10 @@
 //! body's bytes were handed over, is told so ([`ClientError::Refused`]): nothing was applied. An
 //! exchange that ended otherwise without a reply is the caller's: [`ClientError::Lost`] says
 //! whether the request was sent whole, after which a mutation may have been applied, and asking it
-//! again with its identity is answered from what it made.
+//! again with its identity is answered from what it made. A node's `SlowDown`, its range out of
+//! reach of a leader for its budget (node.md §5.4), is asked again as the AWS SDKs ask a throttling
+//! error again: of the next node, within the same attempts, after a full-jitter backoff and paid
+//! from a retry quota (botocore's), an upload's run sent again from where it began.
 //!
 //! **What it checks.** The transport checks each body's CRC-32C on the way (node.md §3.2). A put
 //! whose op names a trailer states its checksum after its bytes, computed as they are sent, which
@@ -72,6 +75,22 @@ pub const PIECE: usize = hyper_transport::RECEIVE_CHUNK;
 /// The most times a request is asked when each is refused before any node took it: the AWS SDKs'
 /// standard retry mode's default of three attempts (docs/research/73).
 pub const ATTEMPTS: u32 = 3;
+
+/// A client's retry quota, botocore's standard retry mode's (`botocore/retries/quota.py` and
+/// `standard.py`, develop, read 2026-10-31: `INITIAL_CAPACITY = 500`, a throttling error's retry
+/// costing `_THROTTLING_RETRY_COST = 5`, a request answered without one giving back
+/// `_NO_RETRY_INCREMENT = 1` and one answered after them the units they took, never past the
+/// first): Brooker's local token bucket, so a client whose requests keep being slowed stops asking
+/// again rather than multiply the load (research/77 [5], D4).
+const QUOTA: u32 = 500;
+const SLOWED_RETRY: u32 = 5;
+const UNRETRIED_REFUND: u32 = 1;
+
+/// A slowed request's backoff, botocore's standard mode's for a throttling error
+/// (`ExponentialBackoff`: `throttling_base_scale` 1 second, `_MAX_BACKOFF = 20` seconds): its
+/// `n`-th wait full jitter over `min(2^(n-1) s, 20 s)` (`bounds::full_jitter`).
+const SLOWED_BASE: Duration = Duration::from_secs(1);
+const SLOWED_MOST: Duration = Duration::from_secs(20);
 
 /// The checksum a put states in its trailer unless its caller names another: CRC-64/NVME, the one
 /// S3 keeps for an object uploaded without one, and a full-object value across a multipart
@@ -446,6 +465,8 @@ pub struct Client {
     slowest_ns: Option<u64>,
     /// Waits paused for so far: the draw each pause's jitter takes (`bounds::pause`).
     waits: u32,
+    /// The retry quota ([`QUOTA`]).
+    quota: Quota,
     /// A body's piece, the source's or the reply's: `PIECE` bytes.
     piece: Vec<u8>,
     /// A reply's fields as they arrive.
@@ -505,6 +526,7 @@ impl Client {
             at: 0,
             slowest_ns: None,
             waits: 0,
+            quota: Quota { left: QUOTA },
             piece,
             fields: Vec::new(),
             memory,
@@ -593,7 +615,8 @@ impl Client {
         let mut whole = Whole::new(native.checksum);
         source.rewind(0).await.map_err(ClientError::Source)?;
         self.hash_prefix(source, at.offset, &mut whole).await?;
-        let mut failures = 0u32;
+        // Failures in a row, and the retry quota's units a slowed run's retries took.
+        let (mut failures, mut taken) = (0u32, 0u32);
         while !at.ended {
             let run = length
                 .checked_sub(at.offset)
@@ -624,9 +647,17 @@ impl Client {
                 Ran::Committed(crc) => {
                     whole.add(crc, run)?;
                     failures = 0;
+                    self.quota.give_back(std::mem::take(&mut taken));
                     watch.progressed(&at).await.map_err(ClientError::Source)?;
                 }
                 Ran::Again(why) => failures = self.again(failures, why, deadline_ns).await?,
+                Ran::Slowed(reply) => match self.slowed_again(failures, deadline_ns).await? {
+                    Some(next) => {
+                        failures = next;
+                        taken = taken.saturating_add(SLOWED_RETRY);
+                    }
+                    None => return Ok(*reply),
+                },
                 Ran::Refused(reply) => return Ok(*reply),
             }
         }
@@ -674,7 +705,8 @@ impl Client {
         if native.upload.is_some() {
             self.hash_prefix(source, at.offset, &mut whole).await?;
         }
-        let mut failures = 0u32;
+        // Failures in a row, and the retry quota's units a slowed run's retries took.
+        let (mut failures, mut units) = (0u32, 0u32);
         while !at.ended {
             let left = length.map(|l| l.checked_sub(at.offset));
             let run = match left {
@@ -729,9 +761,17 @@ impl Client {
                     whole.add(crc, taken)?;
                     held.drop_run(taken)?;
                     failures = 0;
+                    self.quota.give_back(std::mem::take(&mut units));
                     watch.progressed(&at).await.map_err(ClientError::Source)?;
                 }
                 Ran::Again(why) => failures = self.again(failures, why, deadline_ns).await?,
+                Ran::Slowed(reply) => match self.slowed_again(failures, deadline_ns).await? {
+                    Some(next) => {
+                        failures = next;
+                        units = units.saturating_add(SLOWED_RETRY);
+                    }
+                    None => return Ok(*reply),
+                },
                 Ran::Refused(reply) => return Ok(*reply),
             }
         }
@@ -908,6 +948,11 @@ impl Client {
                     .ok_or(ClientError::Reply("an offset refused without the upload's"))?,
                 None,
             ),
+            // Slowed: sent again from where it began, the node answering `Offset` if the run
+            // committed after all (node.md §5.4: a step that ended so may still apply, once).
+            Ok(reply) if reply.status == Status::SlowDown => {
+                return Ok(Ran::Slowed(Box::new(reply)));
+            }
             Ok(reply) => return Ok(Ran::Refused(Box::new(reply))),
             Err(error) if resumable(&error) => {
                 let reply = self.progress(native, upload, deadline_ns).await?;
@@ -966,6 +1011,37 @@ impl Client {
         )
         .await?;
         Ok(failures)
+    }
+
+    /// One more run slowed (`SlowDown`, node.md §5.4): asked again after a slowed request's
+    /// backoff while the attempts its failures count and the retry quota allow, the failures and
+    /// the quota's units it took returned; `None` once they do not, the run's reply the caller's.
+    async fn slowed_again(
+        &mut self,
+        failures: u32,
+        deadline_ns: u64,
+    ) -> Result<Option<u32>, ClientError> {
+        let failures = failures.saturating_add(1);
+        if failures >= ATTEMPTS || !self.quota.take() {
+            return Ok(None);
+        }
+        self.slowed_wait(failures, deadline_ns).await?;
+        Ok(Some(failures))
+    }
+
+    /// The wait before a slowed request's `nth` retry, from the first: full jitter over
+    /// `min(2^(nth-1) s, 20 s)` ([`SLOWED_BASE`], [`SLOWED_MOST`]).
+    async fn slowed_wait(&mut self, nth: u32, deadline_ns: u64) -> Result<(), ClientError> {
+        let doubled = 1u32.checked_shl(nth.saturating_sub(1)).unwrap_or(u32::MAX);
+        let cap = SLOWED_BASE.saturating_mul(doubled).min(SLOWED_MOST);
+        let pause = bounds::full_jitter(cap, self.id, self.waits);
+        self.waits = self.waits.wrapping_add(1);
+        let wait = u64::try_from(pause.as_nanos()).unwrap_or(u64::MAX);
+        self.wait_until(
+            hyper_rt::futures::now_ns().saturating_add(wait),
+            deadline_ns,
+        )
+        .await
     }
 
     /// The upload's Finish: its object, of `length` bytes held to `whole`, committed, or
@@ -1050,8 +1126,11 @@ impl Client {
         // RFC 6298 §5.5: the wait doubles from the measured probe timeout.
         let mut backoff = self.measured_pto();
         let mut last = Refusal::NotConnected;
+        // Retries of a slowed request: their count, the quota's units they took, and whether the
+        // last waited its own backoff, past which it is asked again at once.
+        let (mut slowed, mut taken, mut waited) = (0u32, 0u32, false);
         for attempt in 0..ATTEMPTS {
-            if attempt > 0 {
+            if attempt > 0 && !std::mem::take(&mut waited) {
                 let pause = bounds::pause(backoff, self.id, self.waits);
                 self.waits = self.waits.wrapping_add(1);
                 let wait = u64::try_from(pause.as_nanos()).unwrap_or(u64::MAX);
@@ -1074,6 +1153,30 @@ impl Client {
             match asked {
                 Attempt::Replied(reply) => {
                     let reply = *reply;
+                    // Slowed (`SlowDown`, node.md §5.4), a request whose body need not be sent
+                    // again is asked again, its identity with it, as botocore's standard mode
+                    // retries a throttling error: within the attempts and the retry quota, of the
+                    // next node, from which its range's leader may be reached where this one's
+                    // could not. A run's body is gone; its upload sends it again (`Ran::Slowed`).
+                    if reply.status == Status::SlowDown
+                        && upload.is_none()
+                        && attempt.saturating_add(1) < ATTEMPTS
+                        && self.quota.take()
+                    {
+                        slowed = slowed.saturating_add(1);
+                        taken = taken.saturating_add(SLOWED_RETRY);
+                        self.slowed_wait(slowed, deadline_ns).await?;
+                        waited = true;
+                        self.at = self
+                            .at
+                            .checked_add(1)
+                            .filter(|at| *at < self.nodes.len())
+                            .unwrap_or(0);
+                        continue;
+                    }
+                    if matches!(reply.status, Status::Done | Status::Offset) {
+                        self.quota.give_back(taken);
+                    }
                     if let (Some(upload), Some(kept)) = (upload.as_deref(), &reply.checksum)
                         && let Some((sent, _)) = &upload.trailer
                         && (kept.algorithm != sent.algorithm.code() || kept.value != sent.bytes)
@@ -1701,10 +1804,38 @@ fn took_from_source<S>(
     Ok(())
 }
 
-/// What a run's exchange came to (`Client::ran`): sent again for the error that ended it.
+/// A client's retry quota ([`QUOTA`]): the units left.
+struct Quota {
+    left: u32,
+}
+
+impl Quota {
+    /// Whether the quota pays a slowed request's retry, its units taken if it does.
+    fn take(&mut self) -> bool {
+        match self.left.checked_sub(SLOWED_RETRY) {
+            Some(left) => {
+                self.left = left;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A request answered: the units its retries took back, or one where it took none, never
+    /// past the quota's first.
+    fn give_back(&mut self, taken: u32) {
+        let refund = if taken == 0 { UNRETRIED_REFUND } else { taken };
+        self.left = self.left.saturating_add(refund).min(QUOTA);
+    }
+}
+
+/// What a run's exchange came to (`Client::ran`): committed; sent again for the error that ended
+/// it; slowed, sent again after a slowed request's backoff while the attempts and the retry quota
+/// allow (`Client::slowed_again`), its reply the caller's once they do not; or refused.
 enum Ran {
     Committed(Checksum),
     Again(ClientError),
+    Slowed(Box<Reply>),
     Refused(Box<Reply>),
 }
 
@@ -1970,6 +2101,24 @@ fn untaken(refusal: Refusal) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// botocore's quota: a hundred slowed retries spend its 500 units, the next is not paid for;
+    /// an answer after retries gives back what they took, one without them a unit, never past 500.
+    #[test]
+    fn the_retry_quota_pays_slowed_retries_until_spent_and_answers_refill_it() {
+        let mut quota = Quota { left: QUOTA };
+        let paid = (0..).take_while(|_| quota.take()).count();
+        assert_eq!(paid, usize::try_from(QUOTA / SLOWED_RETRY).unwrap());
+        assert_eq!(quota.left, 0);
+        assert!(!quota.take());
+        quota.give_back(SLOWED_RETRY * 2);
+        assert_eq!(quota.left, SLOWED_RETRY * 2);
+        quota.give_back(0);
+        assert_eq!(quota.left, SLOWED_RETRY * 2 + UNRETRIED_REFUND);
+        let mut full = Quota { left: QUOTA };
+        full.give_back(SLOWED_RETRY);
+        assert_eq!(full.left, QUOTA);
+    }
 
     #[test]
     fn a_request_is_asked_again_only_where_no_node_took_any_of_it() {

@@ -129,7 +129,11 @@ says the connection is up, closes one past its bound with `Refusal::Identities` 
 node not reached, the transport's admission refused its connection, or its exchange got no stream),
 with none of its body taken, of the next node; at most three attempts, the AWS SDKs' standard mode's default [5], each after RFC 6298's
 doubling from the measured probe timeout with equal jitter (node.md §3.8). Anything else is the
-caller's, told whether the request was sent whole.
+caller's, told whether the request was sent whole, except a node's `SlowDown`: asked again
+like the SDKs' throttling errors (2026-10-31, research/77 D4), within the same three attempts,
+after botocore's standard mode's throttling backoff (full jitter over `min(2^(n-1) s, 20 s)`) and
+paid from its retry quota (500 units, 5 a retry, refilled by answers), of the next node, its
+identity with it; a run of an upload is sent again from where it began.
 
 **A streamed put states its checksum in a trailer, CRC-64/NVME unless named.** A source read once
 (standard input) cannot state its checksum before its bytes, so the native put carries the

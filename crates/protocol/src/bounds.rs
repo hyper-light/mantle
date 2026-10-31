@@ -96,6 +96,14 @@ pub fn pause(delay: Duration, local: u64, attempt: u32) -> Duration {
     ))
 }
 
+/// One pause of a full-jitter backoff of `cap`: drawn uniformly between none and the whole of
+/// `cap`, by `local`'s `attempt`-th draw as [`pause`] draws, the backoff botocore's standard retry
+/// mode waits before asking a throttled request again (`ExponentialBackoff.delay_amount`:
+/// "t_i = rand(0, 1) * min(2 ** attempt, MAX_BACKOFF)"; research/77 [5]).
+pub fn full_jitter(cap: Duration, local: u64, attempt: u32) -> Duration {
+    hyper_timing::election_delay(cap, local, attempt)
+}
+
 /// What a node of `stated` keeps of the transport's shape: its peers and their connections,
 /// the streams each connection takes and the exchanges all of them hold, a lane's window, and the
 /// largest head a message carries.

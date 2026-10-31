@@ -167,3 +167,117 @@ fn a_run_the_node_answers_after_the_clients_period_is_waited_for_once_it_was_cut
     );
     assert_eq!(watched.0, [0, MIN_PART, 2 * MIN_PART, length]);
 }
+
+/// An upload of `length` bytes through the stub as `script` says: its reply, the offsets the
+/// client said it stood at, and what the stub took.
+fn upload_through(script: Script, length: u64) -> (Status, Vec<u64>, Seen) {
+    let (node, client) = credentials();
+    let transport_bytes = mantle_client::least_transport(1).unwrap();
+    let (tell, bound) = channel();
+    let served =
+        std::thread::spawn(move || scripted(node, transport_bytes, (0, None), script, tell));
+    let address = bound.recv().unwrap();
+    let sockets = mantle_client::sockets(1).unwrap();
+    let (status, watched) = runtime(sockets)
+        .block_on(async move {
+            let mut client = Client::open(Settings {
+                id: CLIENT,
+                bind: "127.0.0.1:0".parse().unwrap(),
+                credentials: client,
+                nodes: vec![(NODE, address)],
+                transport_bytes,
+            })
+            .await
+            .unwrap();
+            let native = Native {
+                bucket: "b".into(),
+                key: "k".into(),
+                id: mantle_client::identity().unwrap(),
+                upload: None,
+                checksum: TRAILER,
+                headers: Headers::default(),
+            };
+            let mut source = Made { at: 0, length };
+            let mut watched = Watched::default();
+            let reply = client
+                .upload(&native, (&mut source, length), &mut watched, u64::MAX)
+                .await
+                .unwrap();
+            (reply.status, watched)
+        })
+        .unwrap();
+    (status, watched.0, served.join().unwrap())
+}
+
+/// The Open is answered `SlowDown` once, as a node whose range step waited past its budget for a
+/// leader answers it (node.md §5.4): the client asks it again, its identity with it, as botocore's
+/// standard mode retries a throttling error, and the upload commits whole.
+#[test]
+fn an_open_slowed_once_is_asked_again_and_the_upload_commits() {
+    let length = 2 * MIN_PART + (64 << 10);
+    let script = Script {
+        slow_opens: 1,
+        ..Script::default()
+    };
+    let (status, watched, seen) = upload_through(script, length);
+    assert_eq!(status, Status::Done);
+    assert_eq!(
+        seen,
+        Seen {
+            opens: 2,
+            appends: 3,
+            offsets: 0,
+            finishes: 1,
+            cut: 0,
+        }
+    );
+    assert_eq!(watched, [0, MIN_PART, 2 * MIN_PART, length]);
+}
+
+/// Run 2 is answered `SlowDown`, not committed: its body gone, the upload sends it again from
+/// where it began after a slowed request's backoff, and commits whole, each run committed once.
+#[test]
+fn a_run_slowed_is_sent_again_and_the_upload_commits() {
+    let length = 2 * MIN_PART + (64 << 10);
+    let script = Script {
+        slow_append: Some(2),
+        ..Script::default()
+    };
+    let (status, watched, seen) = upload_through(script, length);
+    assert_eq!(status, Status::Done);
+    assert_eq!(
+        seen,
+        Seen {
+            opens: 1,
+            appends: 4,
+            offsets: 0,
+            finishes: 1,
+            cut: 0,
+        }
+    );
+    assert_eq!(watched, [0, MIN_PART, 2 * MIN_PART, length]);
+}
+
+/// Every attempt's Open is answered `SlowDown`: the client asks it the standard mode's three
+/// times (`ATTEMPTS`) and answers `SlowDown`, the upload never opened.
+#[test]
+fn an_open_slowed_at_every_attempt_answers_slow_down() {
+    let script = Script {
+        slow_opens: mantle_client::ATTEMPTS,
+        ..Script::default()
+    };
+    // Longer than one run: a part's length or less is put whole, with no Open.
+    let (status, watched, seen) = upload_through(script, 2 * MIN_PART + (64 << 10));
+    assert_eq!(status, Status::SlowDown);
+    assert_eq!(
+        seen,
+        Seen {
+            opens: mantle_client::ATTEMPTS,
+            appends: 0,
+            offsets: 0,
+            finishes: 0,
+            cut: 0,
+        }
+    );
+    assert!(watched.is_empty());
+}

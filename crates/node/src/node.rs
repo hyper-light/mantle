@@ -1909,6 +1909,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     }
                 }
                 if let Some(at) = self.chunks_out.iter().position(|c| c.exchange == exchange) {
+                    if let Some(ms) = crate::diag_since(&format!("out {exchange:?}"), true) {
+                        crate::diag_line!(
+                            "{} chunk out {exchange:?} lost_ms {ms} {refusal:?}",
+                            crate::diag_at()
+                        );
+                    }
                     let out = self.chunks_out.swap_remove(at);
                     self.chunks_done
                         .push((out.asked, ChunkOutcome::Lost(refusal)));
@@ -2365,6 +2371,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.driver.endpoint().end(exchange);
             }
             Some(Then::Asked) if whole => {
+                if let Some(ms) = crate::diag_since(&format!("out {exchange:?}"), false) {
+                    crate::diag_line!("{} chunk out {exchange:?} whole_ms {ms}", crate::diag_at());
+                }
                 self.writing.swap_remove(at);
             }
             // An entry whose bytes could not all go is asked again; one sent whole waits.
@@ -2489,6 +2498,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Arriving::Redirect(group) => self.redirect(exchange, group),
             Arriving::Status(status) => self.answer_status(exchange, status, 0),
             Arriving::ChunkPut { slot, key, crc32c } => {
+                if let Some(ms) = crate::diag_since(&format!("in {exchange:?}"), false) {
+                    crate::diag_line!("{} chunk in {exchange:?} body_ms {ms}", crate::diag_at());
+                }
                 let room = received.body;
                 let put = self.storage.put(
                     slot,
@@ -2813,6 +2825,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if !self.storage.take_room(body) {
             return None;
         }
+        crate::diag_mark(format!("in {exchange:?}"));
         Some(Arriving::ChunkPut {
             slot,
             key: put.key,
@@ -2922,6 +2935,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         for done in stored.drain(..) {
             match done {
                 Done::Put(Origin::Exchange(exchange), _, Ok(())) => {
+                    if let Some(ms) = crate::diag_since(&format!("in {exchange:?}"), true) {
+                        crate::diag_line!("{} chunk in {exchange:?} stored_ms {ms}", crate::diag_at());
+                    }
                     self.answer_chunk(exchange, chunk::Status::Stored, None)?;
                 }
                 Done::Get(Origin::Exchange(exchange), Ok(bytes)) => {
@@ -2990,6 +3006,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.read_exchange(exchange)
             }
             chunk::Status::Stored if !get => {
+                if let Some(ms) = crate::diag_since(&format!("out {exchange:?}"), true) {
+                    crate::diag_line!("{} chunk out {exchange:?} stored_ms {ms}", crate::diag_at());
+                }
                 endpoint.end(exchange);
                 self.chunks_done.push((asked, ChunkOutcome::Stored));
                 Ok(())
@@ -3068,6 +3087,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .open(clock, at, Kind::ChunkPut, &head, Some(body), period)
         {
             Ok(exchange) => {
+                crate::diag_mark(format!("out {exchange:?}"));
                 self.chunks_out.push(ChunkOut {
                     exchange,
                     asked,

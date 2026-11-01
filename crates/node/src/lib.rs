@@ -72,6 +72,24 @@ pub fn diag_write(line: &str) {
     }
 }
 
+/// DIAGNOSTIC (never merged): when each traced transfer began, by name, on the runtime's clock.
+static DIAG_BEGAN: std::sync::Mutex<std::collections::BTreeMap<String, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// DIAGNOSTIC (never merged): marks `key` begun now.
+pub fn diag_mark(key: String) {
+    if let Ok(mut began) = DIAG_BEGAN.lock() {
+        began.insert(key, hyper_rt::futures::now_ns());
+    }
+}
+
+/// DIAGNOSTIC (never merged): the milliseconds since `key` was marked, forgotten if `take`.
+pub fn diag_since(key: &str, take: bool) -> Option<u64> {
+    let mut began = DIAG_BEGAN.lock().ok()?;
+    let at = if take { began.remove(key)? } else { *began.get(key)? };
+    Some(hyper_rt::futures::now_ns().saturating_sub(at) / 1_000_000)
+}
+
 /// DIAGNOSTIC (never merged): [`diag_write`] of a formatted line.
 #[macro_export]
 macro_rules! diag_line {

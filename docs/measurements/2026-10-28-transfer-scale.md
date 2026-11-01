@@ -310,10 +310,16 @@ deadline is to bound.
 | Way | Volumes (each) | Held | Put / native read / HTTP read (MiB/s) | Refused | Chunks held a node | Seconds | Load |
 |---|---|---|---|---|---|---|---|
 | native (whole blocks) | 36,511,648,426 B | 3 | 29 / 70 / 173 | `InsufficientStorage` (l3), none otherwise | 35.72 GB, 97.8%, one segment free | 4,138 | 14 to 25 |
+| cli (2026-11-01) | 15,889,685,162 B | 1 | 54 / 133 / 238 | `InsufficientStorage` at the listener (l1), none otherwise | 15.51 GB, 97.6%, one segment free | 1,306 | 7 to 41 |
 
 Exact: 3,873 blocks, each block's chunks on distinct nodes; every node's chunk bytes what it
 received and put; 18 reads after each founder's kill and restart, none wrong or missing, one asked
-again; the controls caught; the refused object unreadable and unlisted.
+again; the controls caught; the refused object unreadable and unlisted. The CLI's way ran once this
+Mac's disk was cleaned (its free space had fallen to 15 GiB with other work), on volumes a third the
+native way's, so it held one object: exact, 2,560 blocks each on distinct nodes, 6 reads after the
+kills, none asked again, wrong or missing, the controls caught. The two parts' ways wait for the free
+space a 10 GiB object takes beside the 30 GiB kept, about 63 GiB; another session's build took what
+the cleaning freed.
 
 **What an object takes of a range's store.** For the engines' share of a node's memory, sized by
 what the cell's volumes hold (the owner's choice of 2026-10-31, node.md §1.4): the harness's small

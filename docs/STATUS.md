@@ -462,7 +462,9 @@ answered, and why on this
 Mac under load a restarted founder's first range reads could not reach their known leader for 12 to
 25 s (not met in 58 rounds on a Mac Studio, quiet and loaded); and this Mac's 10G cases, one way
 at a time on 1ac2509d: the native way's was exact (3 objects in 97.8% of each node's volume, refused
-typed, 18 reads after the kills), the CLI's and both parts' ways to run. A node started again
+typed, 18 reads after the kills), and the CLI's (1 object on the third-size volumes this Mac's free
+space then gave, 6 reads after the kills); both parts' ways wait for the ~63 GiB free a 10 GiB object
+takes beside the 30 GiB kept. A node started again
 judges no peer until its links are measured, and a leader killed meanwhile is not replaced
 (hyper-liveness's young links, an owner decision since 2026-10-16); step 1 ends a request's step
 there `SlowDown` where it had waited, which CI's windows-aarch64 met in mantle's node tests, which

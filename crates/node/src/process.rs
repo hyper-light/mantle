@@ -1839,9 +1839,13 @@ async fn serve(
             }
             Either3::Third(Either3::Second(slept)) => {
                 slept.map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
-                let why = "the stop's bound passed";
-                let _ = at_once.try_send(Ended::AtOnce(why));
-                return Err(ProcessError::Stopped(why));
+                // Past its bound with only its connections' closing periods left, the stop is
+                // done (`Node::stop_at_bound`), and ends below as one done in time does.
+                if !node.stop_at_bound() {
+                    let why = "the stop's bound passed";
+                    let _ = at_once.try_send(Ended::AtOnce(why));
+                    return Err(ProcessError::Stopped(why));
+                }
             }
             Either3::Third(Either3::Third(ended)) => {
                 return Err(ProcessError::Listener(ended.to_string()));

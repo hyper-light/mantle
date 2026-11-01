@@ -673,7 +673,11 @@ shows it leads, or for an election timeout, after which the range elects as afte
 its connections and answers their late packets for three probe timeouts (RFC 9000 §10.2: a node
 keeps the socket its peers know); then closes its logs and volumes and exits 0. The stop's bound
 is stated beside the orchestrator's grace period; a second signal, or the bound passing, ends the
-process as a crash would, which loses nothing acknowledged.
+process as a crash would, which loses nothing acknowledged, but for the bound passing while only
+those closing periods are left: the stop is done then and exits 0, as nothing it holds is owed to
+the cell and a late packet draws at most a stateless reset (RFC 9000 §10.2's note), where one slow
+round trip on a loaded host stretched a connection's three probe timeouts to 9.5 s, past the 10 s
+bound with the hand-over's 1.5 s (windows-aarch64, diag run 41260378525).
 
 *As built (2026-10-24).* A `peer` line may name where the peer listens, `peer = ID ROLE
 CERTIFICATE QUIC PLANE`, each `HOST:PORT` with the host an address or a name. `mantle serve`

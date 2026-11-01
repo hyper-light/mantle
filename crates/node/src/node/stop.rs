@@ -52,6 +52,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         matches!(self.stopping, Some(Stopping::Done))
     }
 
+    /// Ends the orderly stop at its bound where all it has left is its connections' closing
+    /// periods, and says whether it did: its ranges handed over and each connection closed, nothing
+    /// it holds is owed to the cell, and a closing period, three probe timeouts that one slow round
+    /// trip on a loaded host can stretch past the bound (windows-aarch64, a connection's 9.5 s),
+    /// answers only late packets, which RFC 9000 §10.2 leaves to a stateless reset once its state
+    /// is gone. A stop with more to do ends as a crash would.
+    pub fn stop_at_bound(&mut self) -> bool {
+        if matches!(self.stopping, Some(Stopping::Closing)) {
+            self.stopping = Some(Stopping::Done);
+        }
+        self.stopped()
+    }
+
     /// The ranges whose lead this node began to hand over since the last call, each by its group
     /// and the voter it goes to: a range handed again, once its core gave a transfer up, is told
     /// again.

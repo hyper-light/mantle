@@ -280,6 +280,29 @@ designed in hyper-transport, which waits on that design and the owner's word. Th
 stall. The 100G case's own refusals were not traced; the same answer at the same place, under the
 same load, is read as the same cause.
 
+The same traced case at half size on the progress notes (branch `progress-notes`, e81c9c65, with
+the diagnostic lines of 5639a8c4 and each range step's budget spent and each commit of 250 ms or
+more a node waited on, never merged; binary 2e562ce7): 20 GiB objects on stated 25 GiB volumes, the
+box's load 80 to 346, 266 to 319 while the puts ran. Each way was answered `SlowDown` part way and
+boto3 had no turn; the case ended inexact in 1,142 s with no object acknowledged, nothing read
+wrong or missing, each node holding 641 to 658 MB of the runs and parts acknowledged before the
+refusals, the scope at most 367 MiB:
+
+| Way | Answered | What the node serving it said |
+|---|---|---|
+| native (whole blocks) | `SlowDown` at 59.2 s | a chunk to a peer cut `Lost(Stalled)` at 44.5 s, 49.9 s and 58.6 s, the client's three attempts, each block `Unplaced` |
+| cli | `SlowDown` at 32.4 s | at 24.7 s three chunks cut `Lost(Stalled)`, then within 0.9 s four refused `Lost(Budget)` by its transport and seven `Busy` by its own volume, each block `Unplaced` |
+| native-parts | `SlowDown` at 75.4 s | a chunk cut `Lost(Stalled)` at 38.4 s, `Unplaced`; the client asked three times more |
+
+A node vouches for a peer's chunk each time the volume it waits on answers a put, and a device that
+stalls past the period answers none, so the notes keep a chunk only while its receiver's device
+moves. Behind a stalled receiver the serving node's own volume filled its writer queue and its
+transport its budget for that peer, and the chunks after were refused at once. No request's range
+step ran out its budget, though before the first put the young cell's leader waited up to 4.1 s on
+commits of its own, and its own steps three times outlasted the 6.1 s an unjudged step is given. The large
+cases here wait on how a node waits on a peer whose device stalls, which research/77 D2's carried
+deadline is to bound.
+
 **This Mac's 10G cases, one way at a time** (the owner's choice of 2026-10-31), on 1ac2509d
 (binary 4858a0d7), each a fresh cell under launchd whose volumes are this Mac's free space less
 30 GiB, a third each, deleted once its case ends:

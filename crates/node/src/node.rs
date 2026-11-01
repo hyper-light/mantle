@@ -2327,6 +2327,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let mut failed = false;
         let mut whole = false;
         let mut then = None;
+        let mut sent = false;
         if let Some(writing) = self.writing.get_mut(at) {
             while let Some(rest) = writing.bytes.get(writing.written..)
                 && !rest.is_empty()
@@ -2334,6 +2335,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 match endpoint.write_body(exchange, rest) {
                     Ok(0) => break,
                     Ok(took) => {
+                        sent = true;
                         writing.written = writing.written.saturating_add(took);
                         self.moved = self
                             .moved
@@ -2347,6 +2349,20 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
             whole = writing.written >= writing.bytes.len();
             then = Some(writing.then);
+        }
+        // A piece of a chunk a job asked of a peer going is the job's work moving, as a piece of
+        // one it reads arriving is: its asker is told (research/77 D1), so a copy slower to cross
+        // than the asker's period is not given up while its bytes move.
+        if sent
+            && matches!(then, Some(Then::Asked))
+            && let Some(asked) = self
+                .chunks_out
+                .iter()
+                .find(|c| c.exchange == exchange)
+                .map(|c| c.asked)
+            && let Some(job) = host::waiting_on_chunk(&self.jobs, asked)
+        {
+            self.driver.endpoint().working(job);
         }
         match then {
             Some(Then::Snapshot { .. }) if failed => self.snapshot_done(exchange, false),

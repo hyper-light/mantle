@@ -1591,9 +1591,12 @@ less than a datagram moved, or after the peer had the whole request and a period
    caller's budget, or while its server says its work for it moves (hyper-transport's notes,
    `Endpoint::working`, at most one a beat, a third of the serve period; research/77 D1). A node
    says so as its own work moves, never on a timer: for a request's job, at each of its own asks
-   answered and each piece of a chunk it asked of a peer arriving, so a get paused between blocks
-   while a peer reads its chunk is not cut; for a peer's chunk, at each put that the volume it waits
-   on answers. A volume whose device stalls answers nothing, its chunks' senders hear nothing, and
+   answered and each piece of a chunk it asked of a peer arriving or of one it sends a peer going,
+   so a get paused between blocks while a peer reads its chunk is not cut, nor a run whose copies
+   take their peers longer to receive than its client's period (CI's busy runner, 2026-10-31:
+   sending a run's 8.3 MB copy took up to 7.5 s, and with it the cut runs went from 100 to 1 in 24
+   rounds, measurements/2026-10-29-a-node-cut-while-it-works.md); for a peer's chunk, at each put
+   that the volume it waits on answers. A volume whose device stalls answers nothing, its chunks' senders hear nothing, and
    they give the transfers up at their period as before. Waiting out a stall the request can afford
    is the request's deadline carried (research/77 D2).
 3. **Memory and work held by a stalled upload.** When a native upload makes no progress for the

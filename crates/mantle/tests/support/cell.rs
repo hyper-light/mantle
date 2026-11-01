@@ -1056,7 +1056,7 @@ impl Cell {
     /// nowhere; init's own output is what the cell is read from: the authority's name and
     /// directory, and each founder's id and directory.
     pub(crate) fn made(args: impl FnOnce(&Path) -> Vec<String>) -> Self {
-        Self::made_started(args, false, true)
+        Self::made_started(args, false, true, Network::Direct)
     }
 
     /// A cell `mantle init` made, its founders started highest id first, each one's configuration
@@ -1064,14 +1064,20 @@ impl Cell {
     /// names a peer by its host: a founder learns on standard input only where the peers started
     /// after it listen.
     pub(crate) fn made_named(args: impl FnOnce(&Path) -> Vec<String>) -> Self {
-        Self::made_started(args, true, true)
+        Self::made_started(args, true, true, Network::Direct)
     }
 
     /// A cell `mantle init` made, its founders started as [`Cell::made`] starts them, each
     /// configuration as init wrote it: its nodes pinned and nothing else, so no driver of the
     /// harness's runs, and its clients are the native protocol's, made by `mantle init client`.
     pub(crate) fn made_alone(args: impl FnOnce(&Path) -> Vec<String>) -> Self {
-        Self::made_started(args, false, false)
+        Self::made_started(args, false, false, Network::Direct)
+    }
+
+    /// A cell [`Cell::made_alone`] makes, its founders reaching each other through the test's
+    /// relay.
+    pub(crate) fn made_alone_relayed(args: impl FnOnce(&Path) -> Vec<String>) -> Self {
+        Self::made_started(args, false, false, Network::Relayed)
     }
 
     /// The directory the cell was made in, `mantle init`'s OUT.
@@ -1079,7 +1085,12 @@ impl Cell {
         self._root.path().join("cell")
     }
 
-    fn made_started(args: impl FnOnce(&Path) -> Vec<String>, named: bool, drivers: bool) -> Self {
+    fn made_started(
+        args: impl FnOnce(&Path) -> Vec<String>,
+        named: bool,
+        drivers: bool,
+        network: Network,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let out = root.path().join("cell");
         let made = Command::new(NODE)
@@ -1188,7 +1199,8 @@ impl Cell {
             links: BTreeMap::new(),
             log: BTreeMap::new(),
             transfers: BTreeMap::new(),
-            relay: None,
+            relay: (network == Network::Relayed)
+                .then(|| Relay::start(&founders.iter().map(|(id, _)| *id).collect::<Vec<_>>())),
             learns: Vec::new(),
             moved_at: Instant::now(),
             held_for: Duration::ZERO,
@@ -1851,6 +1863,11 @@ impl Cell {
     /// Drops every datagram the other nodes' planes send node `id`'s, or none.
     pub(crate) fn deafen_plane(&self, id: u64, deaf: bool) {
         self.relay.as_ref().unwrap().deafen_plane(id, deaf);
+    }
+
+    /// Paces the nodes' QUIC links to each other, both ways, as `pace` says, or frees them.
+    pub(crate) fn pace(&self, pace: Option<crate::relay::Pace>) {
+        self.relay.as_ref().unwrap().pace(pace);
     }
 
     /// Cuts node `id` from every other node, both ways, or joins it to them again.

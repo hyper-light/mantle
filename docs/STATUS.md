@@ -431,7 +431,12 @@ device that stalls past the period answers nothing and is still cut, which the c
 (research/77 D2) waits out. Traced on the notes build at half size (20 GiB, load 266 to 319), every
 way was still answered `SlowDown`: chunks cut `Lost(Stalled)` behind stalled receivers, and behind
 them the serving node's own volume refusing `Busy` and its transport `Lost(Budget)`
-([measurements](measurements/2026-10-28-transfer-scale.md)); the box's large cases wait on that wait. A 100 GB object does not fit this Mac's free space (107 GB a node), refused typed. The boto3 10G case on this Mac
+([measurements](measurements/2026-10-28-transfer-scale.md)); the box's large cases wait on that wait.
+On CI's busy runner the notes as built still cut runs whose 8.3 MB copies took their peers up to
+7.5 s to receive, the job saying nothing while the bytes crossed: a copy's pieces now vouch for its
+job as a read's do, and in an A/B on six runners the runs cut fell from 100 to 1 and the failed
+rounds from 12 of 24 to none; a test paces the founders' links to hold it
+([measurements](measurements/2026-10-29-a-node-cut-while-it-works.md)). A 100 GB object does not fit this Mac's free space (107 GB a node), refused typed. The boto3 10G case on this Mac
 waited two hours in its kills on a read through a founder just started again: a client's first
 exchange has no progress period with nothing measured, and an exchange lost is asked again of the
 same node. Bounding it with the node's serve period cut slow reads during a founder's kill under

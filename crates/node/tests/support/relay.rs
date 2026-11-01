@@ -11,14 +11,20 @@
 //! The relay is one hyper-rt shard on a thread of its own, a task a link (a pair's direction and
 //! socket), each link two sockets: its front, which the dialing side sends to, and its back, which
 //! sends to the listening side and takes its replies.
+//!
+//! The nodes' QUIC links may be paced as a bottleneck paces them ([`Relay::pace`]): each datagram,
+//! either way, leaves once the link has sent the ones before it at the pace's rate, through a queue
+//! of the pace's bytes past which a datagram is dropped, as a router's tail drop drops it. The
+//! planes are never paced.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::pin::pin;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 
-use hyper_rt::combine::{Either3, race3};
+use hyper_rt::combine::{Either, Either3, race2, race3};
+use hyper_rt::futures::{now_ns, sleep};
 use hyper_rt::machine::facts::Facts;
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig, interests_for};
 use hyper_rt::sync::{ChannelReceiver, Sender, channel};
@@ -28,13 +34,72 @@ use hyper_rt::udp::UdpSocket;
 /// IPv4's least header of 20. Any datagram a node sends fits.
 const LARGEST: usize = 65_507;
 
-/// What a link is told: where its listening side listens now, whether its pair is joined, or
-/// whether what goes to its listening side, or back to its sender, is dropped.
+/// What a link is told: where its listening side listens now, whether its pair is joined,
+/// whether what goes to its listening side, or back to its sender, is dropped, or the pace it
+/// holds both ways to.
 enum Told {
     To(SocketAddr),
     Joined(bool),
     DropForward(bool),
     DropBack(bool),
+    Pace(Option<Pace>),
+}
+
+/// A bottleneck's pace: `rate` bytes a second, through a queue of at most `queue` bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct Pace {
+    pub rate: u64,
+    pub queue: usize,
+}
+
+/// One way of a paced link: the datagrams waiting their turn and where each goes, their bytes,
+/// and when, on the shard's clock, the link is free to send the next.
+struct Paced {
+    waiting: VecDeque<(Vec<u8>, SocketAddr)>,
+    bytes: usize,
+    free_ns: u64,
+}
+
+impl Paced {
+    fn new() -> Self {
+        Self {
+            waiting: VecDeque::new(),
+            bytes: 0,
+            free_ns: 0,
+        }
+    }
+
+    /// Queues `datagram` for `to`, or drops it where the queue has no room for it.
+    fn take(&mut self, pace: Pace, datagram: &[u8], to: SocketAddr) {
+        if self.bytes + datagram.len() > pace.queue {
+            return;
+        }
+        self.bytes += datagram.len();
+        self.waiting.push_back((datagram.to_vec(), to));
+    }
+
+    /// Moves into `due` each datagram the link may send at `now`, each holding the link for its
+    /// bytes at the pace's rate; when the next may go, if one waits. Unpaced, every one is due.
+    fn due(
+        &mut self,
+        pace: Option<Pace>,
+        now: u64,
+        due: &mut Vec<(Vec<u8>, SocketAddr)>,
+    ) -> Option<u64> {
+        while !self.waiting.is_empty() {
+            if let Some(pace) = pace {
+                if self.free_ns > now {
+                    return Some(self.free_ns);
+                }
+                let len = self.waiting[0].0.len() as u64;
+                self.free_ns = self.free_ns.max(now) + len * 1_000_000_000 / pace.rate;
+            }
+            let (datagram, to) = self.waiting.pop_front().unwrap();
+            self.bytes -= datagram.len();
+            due.push((datagram, to));
+        }
+        None
+    }
 }
 
 /// Orders a link holds before it takes them: the test tells a link at most where its side listens
@@ -49,17 +114,26 @@ async fn link(front: UdpSocket, back: UdpSocket, mut told: ChannelReceiver<Told>
     let mut from: Option<SocketAddr> = None;
     let mut joined = true;
     let (mut drop_forward, mut drop_back) = (false, false);
+    let mut pace: Option<Pace> = None;
+    let (mut forward, mut backward) = (Paced::new(), Paced::new());
+    let mut due = Vec::new();
     let mut datagram = vec![0u8; LARGEST];
     loop {
-        // What waits on either side is forwarded, or dropped while the pair is cut. A datagram the
-        // OS refuses (its destination gone) is lost, as the network loses one.
+        // What waits on either side is forwarded, or dropped while the pair is cut, through each
+        // way's queue. A datagram the OS refuses (its destination gone) is lost, as the network
+        // loses one.
         while let Ok(Some((len, sender))) = front.try_recv_from(&mut datagram) {
             from = Some(sender);
             if joined
                 && !drop_forward
                 && let Some(to) = to
             {
-                let _ = back.send_to_writable(&datagram[..len], to).await;
+                match pace {
+                    Some(pace) => forward.take(pace, &datagram[..len], to),
+                    None => {
+                        let _ = back.send_to_writable(&datagram[..len], to).await;
+                    }
+                }
             }
         }
         while let Ok(Some((len, _))) = back.try_recv_from(&mut datagram) {
@@ -67,25 +141,53 @@ async fn link(front: UdpSocket, back: UdpSocket, mut told: ChannelReceiver<Told>
                 && !drop_back
                 && let Some(from) = from
             {
-                let _ = front.send_to_writable(&datagram[..len], from).await;
+                match pace {
+                    Some(pace) => backward.take(pace, &datagram[..len], from),
+                    None => {
+                        let _ = front.send_to_writable(&datagram[..len], from).await;
+                    }
+                }
             }
         }
+        let now = now_ns();
+        let next_forward = forward.due(pace, now, &mut due);
+        for (datagram, to) in due.drain(..) {
+            let _ = back.send_to_writable(&datagram, to).await;
+        }
+        let next_back = backward.due(pace, now, &mut due);
+        for (datagram, to) in due.drain(..) {
+            let _ = front.send_to_writable(&datagram, to).await;
+        }
+        let next = next_forward.into_iter().chain(next_back).min();
         let woke = {
-            let (front, back, told) = (
-                pin!(front.readable()),
-                pin!(back.readable()),
-                pin!(told.recv()),
-            );
-            race3(front, back, told).await
+            let (front, back) = (pin!(front.readable()), pin!(back.readable()));
+            match next {
+                None => match race3(front, back, told.recv()).await {
+                    Either3::Third(heard) => Some(heard),
+                    Either3::First(_) | Either3::Second(_) => None,
+                },
+                // A queued datagram's turn comes.
+                Some(at) => {
+                    let turn = sleep(at.saturating_sub(now_ns()));
+                    match race3(front, back, race2(told.recv(), turn)).await {
+                        Either3::Third(Either::First(heard)) => Some(heard),
+                        Either3::First(_)
+                        | Either3::Second(_)
+                        | Either3::Third(Either::Second(_)) => None,
+                    }
+                }
+            }
         };
         match woke {
-            Either3::Third(Ok(Told::To(at))) => to = Some(at),
-            Either3::Third(Ok(Told::Joined(now))) => joined = now,
-            Either3::Third(Ok(Told::DropForward(now))) => drop_forward = now,
-            Either3::Third(Ok(Told::DropBack(now))) => drop_back = now,
+            Some(Ok(Told::To(at))) => to = Some(at),
+            Some(Ok(Told::Joined(now))) => joined = now,
+            Some(Ok(Told::DropForward(now))) => drop_forward = now,
+            Some(Ok(Told::DropBack(now))) => drop_back = now,
+            // Unpaced again, what waits goes at once.
+            Some(Ok(Told::Pace(now))) => pace = now,
             // The relay is done.
-            Either3::Third(Err(_)) => return,
-            Either3::First(_) | Either3::Second(_) => {}
+            Some(Err(_)) => return,
+            None => {}
         }
     }
 }
@@ -97,7 +199,7 @@ fn runtime(links: usize) -> LocalRuntime {
     LocalRuntime::new(&RuntimeConfig {
         shards: 1,
         tasks_per_shard: links + 1,
-        timers_per_shard: 1,
+        timers_per_shard: links + 1,
         interests_per_shard: interests_for(1).max(2 * 2 * links),
         ring_entries: 1,
         step_budget_ns: 1_000_000_000,
@@ -203,6 +305,15 @@ impl Relay {
             };
             plane
                 .try_send(told)
+                .map_err(|_| "a link's orders are full")
+                .unwrap();
+        }
+    }
+
+    /// Paces every QUIC link, both ways, as `pace` says, or none: the planes pass as they did.
+    pub fn pace(&self, pace: Option<Pace>) {
+        for [quic, _] in self.links.values() {
+            quic.try_send(Told::Pace(pace))
                 .map_err(|_| "a link's orders are full")
                 .unwrap();
         }

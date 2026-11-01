@@ -106,3 +106,46 @@ evidence each rests on:
 Apart from the decision, a get's node could pass each sealed segment on as it arrives and verifies,
 where it now waits for the block's whole span: the client would hear the bytes moving from the peer
 through the node as they move, and the first byte would come after a segment rather than a block.
+
+## On the progress notes (2026-10-31)
+
+The owner chose the first: the node states its progress (research/77 D1, built on branch
+`progress-notes`, e81c9c65). CI's busy job on it (run 41267125331) failed the same way: the resumed
+copy was refused `InsufficientStorage` where `BadDigest` was due. A diagnostic build of it (branch
+`diag/notes-native`, 37c44102, never merged: each client attempt and each run sent again, each
+node's refused chunks and each job whose client gave up, under `MANTLE_DIAG_DIR`) ran the native
+suite six rounds on each of six runners as the busy job runs it (run 41268668591). 11 of 36 rounds
+failed, all on two runners: six of six on one and five of six on another, the resumed copy refused
+`InsufficientStorage` or the harness finding the cell still past its quiet period; the other four
+passed every round. Every run the client cut was cut `Stalled` with its 8.3 MB body sent whole,
+after 5.2 to 7.2 s, and at that moment the node's job waited on exactly two asks of its own:
+
+| Runner | Runs cut | Runs done | Jobs lost with two asks out |
+|---|---|---|---|
+| 1 | 8 | 192 | 8 |
+| 2 | 38 | 176 | 38 |
+| 3 | 2 | 192 | 2 |
+| 4 | 0 | 192 | 0 |
+| 5 | 5 | 192 | 5 |
+| 6 | 44 | 169 | 44 |
+
+A run is one block of three copies, so its node sends 8.3 MB to each of two peers, and the notes
+vouched for a job only as each of its asks was answered.
+
+An A/B on the same six runners (run 41272233499) timed each copy and alternated four rounds of each
+arm a runner: arm A the notes as built, arm B vouching for a job as each piece of a chunk it sends a
+peer goes, as a piece of one it reads already did. On the three runners where arm A failed, sending
+a copy took 3.4 s at the median, 5.5 s at p90 and 7.5 s at most, and its peer stored it 70 to 100
+ms after its last byte came: the wait was the bytes crossing, CPU-bound in a debug build on two
+busy CPUs, and the job said nothing while they moved.
+
+| Arm | Rounds failed | Runs cut by the client | Runs done | Jobs lost with asks out |
+|---|---|---|---|---|
+| A, the notes as built | 12 of 24 (all on three runners) | 100 | 718 | 100 |
+| B, a copy's pieces vouch | 0 of 24 | 1 | 768 | 0 |
+
+The node vouches so now (node.md §3.8). `native::a_run_whose_copies_cross_slower_than_its_clients_period_is_sent_once`
+holds it on any machine: the test's relay paces the founders' QUIC links, a bottleneck's rate with a
+tail-dropping queue of a fiftieth of a period, so a copy takes four serve periods to cross, and a
+one-block run must be sent once, each founder holding its one copy exactly. On the notes as built
+the copy ended `SlowDown` on this Mac; with the change it committed once, the paced run in 16 s.

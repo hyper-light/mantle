@@ -31,6 +31,7 @@ mod linear;
 #[path = "../../node/tests/support/relay.rs"]
 mod relay;
 use cell::*;
+use relay::Pace;
 use std::process::{Command, Stdio};
 
 use mantle_client::{Client, ClientError, Settings, Sink, Source, TRAILER};
@@ -966,6 +967,64 @@ fn least_run() -> usize {
     let segment = u64::try_from(mantle_s3::seal::SEGMENT).unwrap();
     let block = layout.segments_per_block() * segment;
     usize::try_from(mantle_meta::name::run_length(Some(1), None, block).unwrap()).unwrap()
+}
+
+/// A run whose block's copies take their peers longer to receive than its client gives a node
+/// without word of its work is sent once: the founders' QUIC links paced so a chunk takes four of
+/// the node's serve periods to cross, the node serving the run says it is at work as each piece of
+/// a copy goes (research/77 D1). Saying so only as each copy was stored, it said nothing while they
+/// crossed, and the client gave the run up and sent it again, the first copies left behind
+/// (measurements/2026-10-29-a-node-cut-while-it-works.md). Each founder holds the block's one copy,
+/// and the object reads back whole once the links are free.
+#[test]
+fn a_run_whose_copies_cross_slower_than_its_clients_period_is_sent_once() {
+    let mut cell = Cell::made_alone_relayed(three_founders);
+    let dir = made_client(&cell, "client");
+    mantle(&dir, &["mb", &format!("s3://{RESUMED}")], None);
+    let period = mantle_protocol::bounds::idle_timeout();
+    let rate = u64::try_from(
+        u128::from(mantle_gateway::layout::CHUNK) * 1_000_000_000 / (4 * period.as_nanos()),
+    )
+    .unwrap();
+    // A queue of what crosses a link in a fiftieth of a period: a datagram waits little behind
+    // a chunk's, and the planes are not paced, so no peer is suspected meanwhile.
+    let queue = usize::try_from(u128::from(rate) * period.as_nanos() / 50_000_000_000).unwrap();
+    let object = bytes(14, least_run());
+    let file = cell.out().parent().unwrap().join("paced.bin");
+    std::fs::write(&file, &object).unwrap();
+    cell.pace(Some(Pace { rate, queue }));
+    let (done, out, err) = mantle_status(
+        &dir,
+        &[
+            "cp",
+            &file.display().to_string(),
+            &format!("s3://{RESUMED}/paced"),
+        ],
+        None,
+    );
+    cell.pace(None);
+    let said: Vec<String> = String::from_utf8_lossy(&err)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert!(done, "{}{said:?}", String::from_utf8_lossy(&out));
+    assert_eq!(committed(&said), [1], "{said:?}");
+    let layout =
+        mantle_gateway::layout::Layout::new(mantle_ec::durability::Scheme::Copies(3)).unwrap();
+    let plain = u64::try_from(object.len()).unwrap();
+    let copy = layout
+        .chunk_len(layout.block_len(plain, 0).unwrap())
+        .unwrap();
+    let founders: Vec<u64> = cell.dirs.keys().copied().collect();
+    for id in founders {
+        let (received, written, _, _) = cell.chunk_bytes(id);
+        assert_eq!(
+            received + written,
+            copy,
+            "founder {id} took {received} bytes over QUIC and {written} of its own, not the run's one copy"
+        );
+    }
+    holds(&dir, "paced", &object);
 }
 
 /// SIGKILLed once a run committed, and one SIGKILLed with a run half sent, each run again resumes

@@ -576,6 +576,8 @@ enum Arriving {
         slot: usize,
         key: ChunkKey,
         crc32c: u32,
+        /// When, on the shard's clock, the request the put serves stops waiting.
+        until_ns: u64,
     },
     /// A chunk's get from the volume in this slot; it carries no body.
     ChunkGet {
@@ -700,9 +702,8 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     storage: Storage,
     /// The storage's puts and gets answered, taken each turn (kept for its allocation).
     stored: Vec<Done>,
-    /// The volumes whose writers answered a put since the last turn took them, each once: at most
-    /// the node's volumes.
-    volumes_moved: Vec<usize>,
+    /// Whether a volume answered a put since the host last offered its puts room.
+    room_freed: bool,
     /// The chunk puts and gets this node asked of its peers and not yet answered; at most
     /// `chunk_asks` of them.
     chunks_out: Vec<ChunkOut>,
@@ -1031,7 +1032,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             waker,
             storage: std::mem::take(&mut settings.storage),
             stored: Vec::new(),
-            volumes_moved: Vec::new(),
+            room_freed: false,
             chunks_out: Vec::new(),
             chunk_asks: settings.chunk_asks,
             next_chunk: 0,
@@ -1431,6 +1432,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             self.on_event(event, now)?;
         }
         self.take_stored().await?;
+        self.vouch_held(now);
         self.dial(now);
         if std::mem::take(&mut self.liveness_moved) {
             self.measure();
@@ -1532,6 +1534,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         } else {
             self.remotes.iter().filter_map(|r| r.redial_at).min()
         };
+        // A peer's chunk a volume holds is vouched for each beat while its request waits.
+        let held = self.storage.held(now).next().map(|_| {
+            now.saturating_add(u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX))
+        });
         let due = [
             self.deadlines.first().map(|(at, _)| *at),
             wake,
@@ -1539,6 +1545,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             self.asks_due(now),
             self.reads_due(now),
             self.host_due(),
+            held,
         ]
         .into_iter()
         .flatten()
@@ -1617,13 +1624,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         if self.storage.out() > 0 {
             let Self {
-                storage,
-                stored,
-                volumes_moved,
-                ..
+                storage, stored, ..
             } = self;
             poll_fn(|context| {
-                storage.poll_done(context, stored, volumes_moved);
+                storage.poll_done(context, stored);
                 Poll::Ready(())
             })
             .await;
@@ -2351,8 +2355,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             then = Some(writing.then);
         }
         // A piece of a chunk a job asked of a peer going is the job's work moving, as a piece of
-        // one it reads arriving is: its asker is told (research/77 D1), so a copy slower to cross
-        // than the asker's period is not given up while its bytes move.
+        // one it reads arriving is (research/77 D2).
         if sent
             && matches!(then, Some(Then::Asked))
             && let Some(asked) = self
@@ -2360,9 +2363,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .iter()
                 .find(|c| c.exchange == exchange)
                 .map(|c| c.asked)
-            && let Some(job) = host::waiting_on_chunk(&self.jobs, asked)
         {
-            self.driver.endpoint().working(job);
+            host::chunk_moved(&mut self.jobs, asked);
         }
         match then {
             Some(Then::Snapshot { .. }) if failed => self.snapshot_done(exchange, false),
@@ -2430,10 +2432,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(receiving) = self.receiving.get_mut(at) else {
             return Ok(());
         };
-        // A chunk a job asked of a peer: each piece of it is the job's own work moving, which the
-        // job's asker is told (research/77 D1), a get paused between blocks among them.
-        let waiting = match receiving.what {
-            Arriving::ChunkBytes(asked) => host::waiting_on_chunk(&self.jobs, asked),
+        // A chunk a job asked of a peer: each piece of it is the job's own work moving
+        // (research/77 D2), a get paused between blocks among them.
+        let asked = match receiving.what {
+            Arriving::ChunkBytes(asked) => Some(asked),
             _ => None,
         };
         while receiving.read < receiving.body {
@@ -2446,9 +2448,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             receiving.read = receiving.read.saturating_add(len);
             self.moved = self.moved.saturating_add(len);
             if len > 0
-                && let Some(job) = waiting
+                && let Some(asked) = asked
             {
-                endpoint.working(job);
+                host::chunk_moved(&mut self.jobs, asked);
             }
             if matches!(receiving.what, Arriving::ChunkPut { .. }) {
                 self.chunks_received = self.chunks_received.saturating_add(len);
@@ -2504,7 +2506,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             // Answered now its request was read whole: the leader as this node knows it now.
             Arriving::Redirect(group) => self.redirect(exchange, group),
             Arriving::Status(status) => self.answer_status(exchange, status, 0),
-            Arriving::ChunkPut { slot, key, crc32c } => {
+            Arriving::ChunkPut {
+                slot,
+                key,
+                crc32c,
+                until_ns,
+            } => {
                 let room = received.body;
                 let put = self.storage.put(
                     slot,
@@ -2512,7 +2519,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     received.bytes,
                     crc32c,
                     &self.waker,
-                    (Origin::Exchange(exchange), room),
+                    (Origin::Exchange(exchange), room, until_ns),
                 );
                 match put {
                     Ok(()) => Ok(()),
@@ -2833,6 +2840,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             slot,
             key: put.key,
             crc32c: put.crc32c,
+            until_ns: waits_until(hyper_rt::futures::now_ns(), put.remaining_ns),
         })
     }
 
@@ -2930,11 +2938,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         let mut stored = std::mem::take(&mut self.stored);
         poll_fn(|context| {
-            self.storage
-                .poll_done(context, &mut stored, &mut self.volumes_moved);
+            self.storage.poll_done(context, &mut stored);
             Poll::Ready(())
         })
         .await;
+        self.room_freed |= stored.iter().any(|done| matches!(done, Done::Put(..)));
         for done in stored.drain(..) {
             match done {
                 Done::Put(Origin::Exchange(exchange), _, Ok(())) => {
@@ -2970,15 +2978,18 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
         }
         self.stored = stored;
-        // A peer's chunk still waiting on a volume whose writer answered a put is waiting on work
-        // that moves: its asker is told so, and judges the transfer by it rather than by its clock
-        // (research/77 D1). A volume whose device stalls answers nothing, and says nothing.
+        Ok(())
+    }
+
+    /// Tells the askers of the peers' chunks a volume holds, put and not yet durable, that their
+    /// work is held while their requests wait (research/77 D2): a device slow to make a chunk
+    /// durable is waited on as long as its asker's client would wait, and one that never answers
+    /// is given up once that time has passed.
+    fn vouch_held(&mut self, now: u64) {
         let endpoint = self.driver.endpoint();
-        for exchange in self.storage.served_on(&self.volumes_moved) {
+        for exchange in self.storage.held(now) {
             endpoint.working(exchange);
         }
-        self.volumes_moved.clear();
-        Ok(())
     }
 
     /// A peer's reply to a chunk put or get this node asked: a put's status, or a get's bytes,
@@ -3031,7 +3042,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         volume: u128,
         key: ChunkKey,
         bytes: Vec<u8>,
-        crc32c: u32,
+        (crc32c, remaining_ns): (u32, u64),
     ) -> Result<ChunkAsk, NodeError> {
         if at != self.id && self.chunks_out.len() >= self.chunk_asks {
             return Err(NodeError::Asks);
@@ -3055,7 +3066,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     bytes,
                     crc32c,
                     &self.waker,
-                    (Origin::Asked(asked), 0),
+                    (
+                        Origin::Asked(asked),
+                        0,
+                        waits_until(hyper_rt::futures::now_ns(), remaining_ns),
+                    ),
                 ) {
                     Ok(()) => {
                         self.chunks_written = self.chunks_written.saturating_add(len);
@@ -3073,6 +3088,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             volume,
             key,
             crc32c,
+            remaining_ns,
         }
         .encode();
         let body = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
@@ -3110,8 +3126,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         at: PeerId,
         volume: u128,
         key: ChunkKey,
-        offset: u64,
-        len: u64,
+        (offset, len): (u64, u64),
+        remaining_ns: u64,
     ) -> Result<ChunkAsk, NodeError> {
         if at != self.id && self.chunks_out.len() >= self.chunk_asks {
             return Err(NodeError::Asks);
@@ -3144,6 +3160,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             key,
             offset,
             len,
+            remaining_ns,
         }
         .encode();
         let clock = self.driver.clock()?;
@@ -4038,6 +4055,17 @@ fn names_only_its_sender(command: &Command, sender: PeerId, node: bool) -> bool 
 /// refused it for room. RFC 6298 §5.5's doubling backoff, at most the idle timeout
 /// (`bounds::backed_off`), each pause drawn between its half and its whole (`bounds::pause`) so
 /// nodes do not ask again in step.
+/// When, on the shard's clock at `now`, a request that waits `remaining_ns` more stops waiting;
+/// one that said nothing waits the stock S3 clients' patience (research/77 D2).
+fn waits_until(now: u64, remaining_ns: u64) -> u64 {
+    let wait = if remaining_ns == 0 {
+        u64::try_from(bounds::STOCK_PATIENCE.as_nanos()).unwrap_or(u64::MAX)
+    } else {
+        remaining_ns
+    };
+    now.saturating_add(wait)
+}
+
 fn pause(local: u64, asking: &mut Asking, now: u64, leaderless: bool) {
     let at_ns = paused_until(local, (&mut asking.backoff, &mut asking.pauses), now);
     if let Some(out) = asking.out.as_mut() {

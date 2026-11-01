@@ -46,6 +46,8 @@ struct Cell {
     refusing: BTreeSet<u128>,
     /// Volumes that refuse every chunk as full.
     full: BTreeSet<u128>,
+    /// Volumes that have no room for a chunk the next this many times they are asked one.
+    busy: BTreeMap<u128, u32>,
     blocks: Model,
     block_index: u64,
     files: Model,
@@ -70,6 +72,7 @@ impl Cell {
             volumes: (1..=volumes).map(|v| (v, BTreeMap::new())).collect(),
             refusing: BTreeSet::new(),
             full: BTreeSet::new(),
+            busy: BTreeMap::new(),
             blocks: Model::default(),
             block_index: 0,
             files: Model::default(),
@@ -143,6 +146,10 @@ impl Cell {
             } => {
                 if self.full.contains(&volume) {
                     return Answer::Refused { full: true };
+                }
+                if let Some(times) = self.busy.get_mut(&volume).filter(|t| **t > 0) {
+                    *times -= 1;
+                    return Answer::Busy;
                 }
                 if self.refusing.contains(&volume) || mantle_crc::crc32c(&bytes) != crc {
                     return Answer::Refused { full: false };
@@ -539,6 +546,12 @@ fn run(
             if let Some(outcome) = put.outcome() {
                 return outcome.clone();
             }
+            // A chunk waits for room, which the cell's volumes have once they answered: asked
+            // again, as a node asks it once its volume or transport answers.
+            if put.waits_for_room() {
+                put.room()?;
+                continue;
+            }
             // Nothing to send: time passes to the next renewal.
             let due = put.due_ns().expect("a PUT waits on nothing");
             cell.clock = cell.clock.max(due);
@@ -845,6 +858,41 @@ fn a_refused_chunk_goes_to_another_volume() {
             .is_none()
     );
     assert!(file::header(&mut cell.files, 10).unwrap().is_none());
+}
+
+/// A chunk a volume has no room for now, its writer queue or the transport toward it full, is
+/// asked again of that volume once room frees, not given to another or failed: in a cell of three
+/// with three copies, no other volume could take it, and the block, `Unplaced`, answered `503
+/// SlowDown` (research/77 D2).
+#[test]
+fn a_chunk_a_volume_has_no_room_for_now_is_asked_of_it_again() {
+    let mut cell = Cell::new(3);
+    let wrapping = WrappingKey::generate().unwrap();
+    let layout = Layout::new(Scheme::Copies(3)).unwrap();
+    cell.busy = BTreeMap::from([(2, 3)]);
+    let bytes = body(70_000, 3);
+    let mut put = new_put(&cell, object("busy"), 70_000, layout, keys(13, &wrapping));
+    run(
+        &mut cell,
+        &mut put,
+        &bytes,
+        &FAST,
+        &Expected::default(),
+        |_, _| {},
+    )
+    .unwrap();
+    assert!(cell.read_file(13, 70_000, &wrapping) == bytes);
+    assert_eq!(
+        cell.busy[&2], 0,
+        "the volume was asked again until it had room"
+    );
+    for v in 1..=3 {
+        assert_eq!(
+            cell.volumes[&v].len(),
+            1,
+            "volume {v} holds the block's copy"
+        );
+    }
 }
 
 /// A block every one of whose refusing volumes refused it as full fails `Full`, `507 Insufficient

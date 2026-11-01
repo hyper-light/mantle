@@ -1588,17 +1588,26 @@ less than a datagram moved, or after the peer had the whole request and a period
    seen, since sending more often wastes "unacceptable power usage for power-constrained
    (mobile) devices" (research/30 §4.7, D8).
 2. **Request progress.** An exchange waits while its bytes move, as `carried` does, within its
-   caller's budget, or while its server says its work for it moves (hyper-transport's notes,
-   `Endpoint::working`, at most one a beat, a third of the serve period; research/77 D1). A node
-   says so as its own work moves, never on a timer: for a request's job, at each of its own asks
-   answered and each piece of a chunk it asked of a peer arriving or of one it sends a peer going,
-   so a get paused between blocks while a peer reads its chunk is not cut, nor a run whose copies
-   take their peers longer to receive than its client's period (CI's busy runner, 2026-10-31:
-   sending a run's 8.3 MB copy took up to 7.5 s, and with it the cut runs went from 100 to 1 in 24
-   rounds, measurements/2026-10-29-a-node-cut-while-it-works.md); for a peer's chunk, at each put
-   that the volume it waits on answers. A volume whose device stalls answers nothing, its chunks' senders hear nothing, and
-   they give the transfers up at their period as before. Waiting out a stall the request can afford
-   is the request's deadline carried (research/77 D2).
+   caller's budget, or while its server says its work for it moves or is held (hyper-transport's
+   notes, `Endpoint::working`, at most one a beat, a third of the serve period; research/77 D1,
+   D2). Each request carries how long its client will still wait: the native request head's time
+   left, and for one that says nothing, every S3 request among them, the stock S3 clients' 60 s
+   without its work moving (`bounds::STOCK_PATIENCE`, botocore's and the AWS CLI's default read
+   timeouts). A job's work moves at each of its own asks answered, each piece of a chunk it reads
+   from or sends a peer, and each piece of its own body read or reply written; a job past its
+   client's patience is ended `503 SlowDown` and lets go of what it asked. Within it, the node says
+   its work is held each beat while an ask of its own is out (a peer's transfer its transport keeps,
+   or a write at its own device) or a chunk of it waits for room, and says so of a peer's chunk each
+   beat while a volume holds it, put and not yet durable, within the time the asking job carried
+   in the chunk's head: a device that stalls is waited on as long as the client would wait, and one
+   that never answers is given up then (the owner's choice of 2026-11-01, research/77 D2). A chunk
+   refused for want of room, a volume's `Busy` or the transport's `Budget`, is asked again of the
+   same volume once a chunk is answered or a volume answers a put, not sent on and the block left
+   `Unplaced`. So a get paused between blocks while a peer reads its chunk is not cut, nor a run
+   whose copies take their peers longer to receive than its client's period (CI's busy runner,
+   2026-10-31: sending a run's 8.3 MB copy took up to 7.5 s, and vouched for as its bytes went the
+   cut runs went from 100 to 1 in 24 rounds, measurements/2026-10-29-a-node-cut-while-it-works.md),
+   nor a put whose receivers' shared device stalls for seconds (the box, measurements/2026-10-28).
 3. **Memory and work held by a stalled upload.** When a native upload makes no progress for the
    connection's idle timeout, or the node needs its reservation (least progress for longest,
    §4.3), the gateway closes its current run at the last whole segment, commits it as a

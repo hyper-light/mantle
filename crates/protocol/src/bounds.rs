@@ -24,6 +24,11 @@ pub(crate) const MAX_ACK_DELAY: Duration = Duration::from_millis(25);
 /// RFC 9000 §10.1: an idle timeout of at least three probe timeouts, so a connection whose packets
 /// a loss delays is not taken for idle.
 const IDLE_PTOS: u32 = 3;
+/// How long a request whose client says nothing of its own patience is waited on without its work
+/// moving: the stock S3 clients', 60 s between bytes, botocore's `read_timeout` and the AWS CLI's
+/// `--cli-read-timeout` by default (research/77 [9, 10], D2). A node working longer for such a
+/// request works for a client that has gone.
+pub const STOCK_PATIENCE: Duration = Duration::from_secs(60);
 /// The connections one peer may hold at once: its current one and the one that replaces it, for
 /// the handshake's round trip in which both carry traffic (hyper-datagram's `epochs_per_peer` of
 /// two, for the same overlap).

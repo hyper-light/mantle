@@ -432,6 +432,12 @@ device that stalls past the period answers nothing and is still cut, which the c
 way was still answered `SlowDown`: chunks cut `Lost(Stalled)` behind stalled receivers, and behind
 them the serving node's own volume refusing `Busy` and its transport `Lost(Budget)`
 ([measurements](measurements/2026-10-28-transfer-scale.md)); the box's large cases wait on that wait.
+The owner chose (2026-11-01) that a node waits as long as its client would: built on branch
+`carried-deadlines` (research/77 D2, node.md §3.8), each request carrying its time left, 60 s
+without its work moving where it says none, a node vouching for work its device or a peer holds
+within it and asking again of the same volume a chunk refused for want of room; the box's large
+cases run again on it, and hyper-transport's maintainers review the change to D1's rule before it
+lands.
 On CI's busy runner the notes as built still cut runs whose 8.3 MB copies took their peers up to
 7.5 s to receive, the job saying nothing while the bytes crossed: a copy's pieces now vouch for its
 job as a read's do, and in an A/B on six runners the runs cut fell from 100 to 1 and the failed

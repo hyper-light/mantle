@@ -601,6 +601,7 @@ impl Client {
             volume,
             key,
             crc32c,
+            remaining_ns: remaining_ns(deadline_ns),
         }
         .encode();
         let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
@@ -629,6 +630,7 @@ impl Client {
             key,
             offset,
             len,
+            remaining_ns: remaining_ns(deadline_ns),
         }
         .encode();
         let replied = self
@@ -686,9 +688,16 @@ impl Client {
         data: &[u8],
         deadline_ns: u64,
     ) -> Result<ObjectOutcome, ClientError> {
-        let (head, fields) = op
+        let (mut head, fields) = op
             .encode()
             .map_err(|e| ClientError::Bounds(e.to_string()))?;
+        object::within(
+            &mut head,
+            Some(remaining_ns(deadline_ns))
+                .filter(|ns| *ns != 0)
+                .map(Duration::from_nanos),
+        )
+        .map_err(|e| ClientError::Bounds(e.to_string()))?;
         if !self.reach(node, deadline_ns).await? {
             let refused = self
                 .nodes
@@ -1103,4 +1112,16 @@ fn write_body(
         }
     }
     Ok(())
+}
+
+/// The time a request asked by `deadline_ns` on the shard's clock still waits, in nanoseconds, as
+/// its head carries it (research/77 D2): 0, none, for a request asked with no deadline, and at
+/// least one for one whose deadline passed, as no wait is left of it.
+fn remaining_ns(deadline_ns: u64) -> u64 {
+    if deadline_ns == u64::MAX {
+        return 0;
+    }
+    deadline_ns
+        .saturating_sub(hyper_rt::futures::now_ns())
+        .max(1)
 }

@@ -48,6 +48,7 @@ use crate::chunk;
 use crate::door::{self, Piece};
 use crate::place;
 use crate::read::{Query, Read};
+use mantle_protocol::bounds;
 use mantle_protocol::classes::Class;
 use mantle_protocol::object::{
     self, Head, Headers, List, Listing, MAX_PAGE_PARTS, Op, PartListed, Parts, Progress, Reply,
@@ -96,6 +97,43 @@ pub(crate) struct Job {
     work: Work,
     /// What the operation waits on, each with the driver's request it answers, if a driver's.
     pending: Vec<(Pending, Option<u64>)>,
+    /// When, on the shard's clock, its client stops waiting, where the client said (research/77
+    /// D2).
+    deadline_ns: Option<u64>,
+    /// When its work last moved: begun, an ask of its own answered, a piece of a chunk it reads
+    /// or sends.
+    moved_ns: u64,
+}
+
+impl Job {
+    /// When, on the shard's clock, the operation's client stops waiting: its own deadline, or the
+    /// stock S3 clients' patience past the last time its work moved, whichever comes first
+    /// (research/77 D2).
+    fn bound_ns(&self) -> u64 {
+        let patience = u64::try_from(bounds::STOCK_PATIENCE.as_nanos()).unwrap_or(u64::MAX);
+        let quiet = self.moved_ns.saturating_add(patience);
+        self.deadline_ns
+            .map_or(quiet, |deadline| deadline.min(quiet))
+    }
+
+    /// Whether its work is held, by a peer or a device: an ask of its own out, or a chunk waiting
+    /// for room at a volume or in the transport toward it.
+    fn held(&self) -> bool {
+        !self.pending.is_empty()
+            || matches!(
+                &self.work,
+                Work::Put(putting) if putting.put.as_ref().is_some_and(Put::waits_for_room)
+            )
+    }
+
+    /// Whether the operation still works toward its reply, rather than giving one or reading the
+    /// fields that say what it is.
+    fn working(&self) -> bool {
+        !matches!(
+            self.work,
+            Work::Fields(..) | Work::Draining(_) | Work::Replying(..) | Work::Answering(_)
+        )
+    }
 }
 
 /// Where a job's operation came in: its body is read and its reply written there.
@@ -536,6 +574,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             self.driver.endpoint().head(exchange).unwrap_or_default(),
             body,
         );
+        let now = hyper_rt::futures::now_ns();
+        let deadline_ns = head
+            .as_ref()
+            .ok()
+            .and_then(Head::remaining)
+            .map(|remaining| {
+                now.saturating_add(u64::try_from(remaining.as_nanos()).unwrap_or(u64::MAX))
+            });
         let work = match (head, self.gateway.as_ref()) {
             (_, None) => Work::Draining(Box::new(Reply::status(Status::Failed))),
             (Err(_), Some(_)) => Work::Draining(Box::new(Reply::status(Status::Malformed))),
@@ -553,6 +599,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             principal,
             work,
             pending: Vec::new(),
+            deadline_ns,
+            moved_ns: now,
         });
     }
 
@@ -586,6 +634,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             principal,
             work,
             pending: Vec::new(),
+            // S3 states no patience: its stock clients' is the bound (research/77 D2).
+            deadline_ns: None,
+            moved_ns: hyper_rt::futures::now_ns(),
         });
     }
 
@@ -694,18 +745,89 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         // Every operation's answers taken before any asks again, so each asks with the room
         // that every answer taken this turn gave back.
+        // A chunk answered otherwise than for want of room frees room at its volume and in the
+        // transport toward it, as a volume's put answered does at the volume: each chunk refused
+        // for want of room is asked again then (research/77 D2), and not at its own refusal,
+        // which would ask it again each turn while the room stays taken.
+        let freed = std::mem::take(&mut self.room_freed)
+            || self.chunks_done.iter().any(|(_, outcome)| {
+                !matches!(
+                    outcome,
+                    ChunkOutcome::Refused(chunk::Status::Busy)
+                        | ChunkOutcome::Lost(Refusal::Budget)
+                )
+            });
         for at in 0..self.jobs.len() {
             self.take_answers(at)?;
         }
+        if freed {
+            self.offer_room()?;
+        }
+        self.bound_jobs()?;
         let mut at = 0;
         while at < self.jobs.len() {
-            if self.step_job(at)? {
+            // Bytes of its own body read or of its reply written are its work moving, as its
+            // asks answered are.
+            let before = self.moved;
+            let over = self.step_job(at)?;
+            if self.moved != before
+                && let Some(job) = self.jobs.get_mut(at)
+            {
+                job.moved_ns = hyper_rt::futures::now_ns();
+            }
+            if over {
                 // What it still waits on is let go: an ended get's chunks still out, say.
                 let job = self.jobs.swap_remove(at);
                 self.abandoned
                     .extend(job.pending.into_iter().map(|(pending, _)| pending));
             } else {
                 at = at.saturating_add(1);
+            }
+        }
+        Ok(())
+    }
+
+    /// Asks again each chunk a put's driver holds for want of room, its volume's or the
+    /// transport's; a driver that fails doing so ends its job as its failed answers do.
+    fn offer_room(&mut self) -> Result<(), NodeError> {
+        for at in 0..self.jobs.len() {
+            let Some(Job {
+                work: Work::Put(putting),
+                ..
+            }) = self.jobs.get_mut(at)
+            else {
+                continue;
+            };
+            let Some(put) = putting.put.as_mut() else {
+                continue;
+            };
+            // A driver that fails keeps its error as its outcome, which its job answers.
+            if put.waits_for_room() && put.room().is_err() && put.outcome().is_none() {
+                self.fail_job(at, Status::Failed)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Each operation still at work held to its client's patience (research/77 D2): one past it
+    /// is answered `SlowDown` and lets go of what it asked, its client gone or going; one with an
+    /// ask of its own out, held by a peer whose transfer its transport keeps or by this node's
+    /// device, tells its asker its work is held.
+    fn bound_jobs(&mut self) -> Result<(), NodeError> {
+        let now = hyper_rt::futures::now_ns();
+        for at in 0..self.jobs.len() {
+            let Some(job) = self.jobs.get(at) else {
+                continue;
+            };
+            if !job.working() {
+                continue;
+            }
+            if job.bound_ns() <= now {
+                self.fail_job(at, Status::SlowDown)?;
+            } else if let Door::Exchange(exchange) = job.door
+                && job.held()
+            {
+                self.driver.endpoint().working(exchange);
             }
         }
         Ok(())
@@ -775,30 +897,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             outcome,
             Outcome::Read(ReadOutcome::Deadline) | Outcome::Command(CommandOutcome::Deadline)
         );
-        if leaderless
-            && self.jobs.get(at).is_some_and(|job| {
-                !matches!(
-                    job.work,
-                    Work::Fields(..) | Work::Draining(_) | Work::Replying(..) | Work::Answering(_)
-                )
-            })
-        {
+        if leaderless && self.jobs.get(at).is_some_and(Job::working) {
             return self.fail_job(at, Status::SlowDown);
-        }
-        // One of its own asks answered: the job's work moved, which its asker is told
-        // (`hyper_transport::Endpoint::working`, research/77 D1).
-        if let Some(Job {
-            door: Door::Exchange(exchange),
-            work,
-            ..
-        }) = self.jobs.get(at)
-            && !matches!(work, Work::Draining(_))
-        {
-            self.driver.endpoint().working(*exchange);
         }
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(());
         };
+        // One of its own asks answered: the job's work moved.
+        job.moved_ns = hyper_rt::futures::now_ns();
         let principal = job.principal.clone();
         match &mut job.work {
             Work::Fields(..) | Work::Draining(_) | Work::Replying(..) | Work::Answering(_) => {}
@@ -1687,7 +1793,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     }
                     return Ok(None);
                 };
-                self.put_chunk(node, *volume, *key, bytes.to_vec(), *crc)
+                let remaining = self.remaining_of(at);
+                self.put_chunk(node, *volume, *key, bytes.to_vec(), (*crc, remaining))
                     .map(Pending::Chunk)
             }
             put::Request::Block(command) => self
@@ -2040,7 +2147,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     }
                     return Ok(None);
                 };
-                self.get_chunk(node, *volume, *key, *offset, *len)
+                let remaining = self.remaining_of(at);
+                self.get_chunk(node, *volume, *key, (*offset, *len), remaining)
                     .map(Pending::Chunk)
             }
         };
@@ -2769,6 +2877,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// When the host next needs a turn: at once when what an operation, or one ended, asked is
     /// answered, as one answered after the host's step in a turn (a read this node's own member
     /// answers) waits on no event; else a put's renewal coming due.
+    /// What job `at`'s client will still wait, in nanoseconds, for an ask of the job's own
+    /// (research/77 D2): at least one, as a time that has passed is none to wait on.
+    fn remaining_of(&self, at: usize) -> u64 {
+        let now = hyper_rt::futures::now_ns();
+        self.jobs
+            .get(at)
+            .map_or(1, |job| job.bound_ns().saturating_sub(now).max(1))
+    }
+
     pub(super) fn host_due(&self) -> Option<u64> {
         let shard = hyper_rt::futures::now_ns();
         let answered = |pending: &Pending| match pending {
@@ -2785,14 +2902,34 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Some(shard);
         }
         let wall = self.wall.now_ns();
-        self.jobs
+        let renewal = self
+            .jobs
             .iter()
             .filter_map(|j| match &j.work {
                 Work::Put(putting) => putting.put.as_ref()?.due_ns(),
                 _ => None,
             })
             .min()
-            .map(|due| shard.saturating_add(due.saturating_sub(wall)))
+            .map(|due| shard.saturating_add(due.saturating_sub(wall)));
+        // Each operation at work is ended at its client's patience, and one whose asks are held
+        // says so each beat, a probe timeout, the transport's notes' beat of a third of the serve
+        // period (research/77 D2).
+        let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX);
+        let bound = self
+            .jobs
+            .iter()
+            .filter(|j| j.working())
+            .map(|j| {
+                let held = matches!(j.door, Door::Exchange(_)) && j.held();
+                let bound = j.bound_ns();
+                if held {
+                    bound.min(shard.saturating_add(beat))
+                } else {
+                    bound
+                }
+            })
+            .min();
+        [renewal, bound].into_iter().flatten().min()
     }
 }
 
@@ -3178,19 +3315,17 @@ enum Outcome {
     Chunk(ChunkOutcome),
 }
 
-/// The exchange of the job that waits on chunk ask `ask`, if it came in on one.
-pub(super) fn waiting_on_chunk(jobs: &[Job], ask: u64) -> Option<ExchangeId> {
-    jobs.iter().find_map(|job| match job.door {
-        Door::Exchange(exchange)
-            if job
-                .pending
-                .iter()
-                .any(|(pending, _)| matches!(pending, Pending::Chunk(asked) if *asked == ask)) =>
-        {
-            Some(exchange)
-        }
-        Door::Exchange(_) | Door::Local(_) => None,
-    })
+/// The job of `jobs` waiting on chunk ask `ask`, its work moved now: a piece of the chunk it
+/// reads came, or one of the chunk it sends went (research/77 D2).
+pub(super) fn chunk_moved(jobs: &mut [Job], ask: u64) {
+    let now = hyper_rt::futures::now_ns();
+    if let Some(job) = jobs.iter_mut().find(|job| {
+        job.pending
+            .iter()
+            .any(|(pending, _)| matches!(pending, Pending::Chunk(asked) if *asked == ask))
+    }) {
+        job.moved_ns = now;
+    }
 }
 
 /// A put's driver's answer for what its request came to.
@@ -3200,6 +3335,11 @@ fn put_answer(outcome: Outcome) -> put::Answer {
         Outcome::Chunk(ChunkOutcome::Refused(chunk::Status::Full)) => {
             put::Answer::Refused { full: true }
         }
+        // No room now, at the volume's writer queue or in the transport toward it: asked again
+        // once room frees, within the client's patience (research/77 D2).
+        Outcome::Chunk(
+            ChunkOutcome::Refused(chunk::Status::Busy) | ChunkOutcome::Lost(Refusal::Budget),
+        ) => put::Answer::Busy,
         Outcome::Chunk(_) => put::Answer::Refused { full: false },
         Outcome::Command(CommandOutcome::Answered(Answer::Block(o))) => put::Answer::Block(o),
         Outcome::Command(CommandOutcome::Answered(Answer::File(o))) => put::Answer::File(o),

@@ -197,3 +197,12 @@ it lands.
 - **What it changes of D1.** A statement that work is held, by the node's own device or by a peer's
   that says so, counts as one that it moved. The deadline is what makes it safe: it ends, so no
   statement keeps a stuck job alive past the time its client would wait.
+
+Built on mantle branch `carried-deadlines` (node.md §3.8): the native request head and a chunk's
+put and get heads carry the time left; a job's patience is its client's deadline or 60 s past its
+work's last move, the earlier; past it the job ends `503 SlowDown`; within it the job vouches each
+beat while an ask of its own is out or a chunk waits for room, and a node vouches each beat for a
+peer's chunk its volume holds within the time the chunk's head carried; a chunk refused `Busy` or
+`Lost(Budget)` is asked again of the same volume when room frees (a chunk answered or a volume's put
+answered), not at its own refusal. It replaces D1's vouch on a volume's answered put, which the held
+rule includes.

@@ -1121,7 +1121,7 @@ impl Client {
         mut sink: Option<&mut K>,
         deadline_ns: u64,
     ) -> Result<Reply, ClientError> {
-        let (head, fields) = op.encode()?;
+        let (mut head, fields) = op.encode()?;
         let body = op.body(&fields);
         // RFC 6298 §5.5: the wait doubles from the measured probe timeout.
         let mut backoff = self.measured_pto();
@@ -1142,6 +1142,16 @@ impl Client {
                 backoff = bounds::backed_off(backoff);
             }
             let node = self.nodes.get(self.at).ok_or(ClientError::NoNodes)?.id;
+            // The time this attempt's node may take, as the request's head tells it (research/77
+            // D2): none for a request asked with no deadline.
+            let left = (deadline_ns != u64::MAX).then(|| {
+                Duration::from_nanos(
+                    deadline_ns
+                        .saturating_sub(hyper_rt::futures::now_ns())
+                        .max(1),
+                )
+            });
+            object::within(&mut head, left)?;
             let asked = self
                 .attempt(
                     node,

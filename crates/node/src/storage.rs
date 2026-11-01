@@ -102,8 +102,8 @@ pub struct Storage {
     // devices' issuers stop.
     volumes: Vec<Held>,
     devices: Vec<Device>,
-    /// Each put out, with the room it holds of what the node takes and its chunk's length.
-    puts: Vec<(usize, Origin, Answer, u64, u64)>,
+    /// Each put out.
+    puts: Vec<PutOut>,
     gets: Vec<(usize, ReadId, Origin)>,
     /// Bytes of the chunks peers sent being read or queued at a volume, and the most there may
     /// be: what the volumes' writer queues hold together, past which a volume refuses a put
@@ -112,6 +112,16 @@ pub struct Storage {
     room: u64,
     /// The chunk exchanges the volumes take at once (`mantle_chunk::Config::transfers`).
     transfers: usize,
+}
+
+/// A put out on a volume: who asked it, the volume's answer, the room it holds of what the node
+/// takes, its chunk's length, and until when, on the shard's clock, its request waits on it.
+struct PutOut {
+    origin: Origin,
+    answer: Answer,
+    room: u64,
+    len: u64,
+    until_ns: u64,
 }
 
 struct Held {
@@ -293,10 +303,11 @@ impl Storage {
         self.taken = self.taken.saturating_sub(len);
     }
 
-    /// Puts `bytes`, `key`'s whole chunk, on the volume in `slot`, checked against `crc32c`: its
-    /// answer comes through [`Self::poll_done`], `waker` woken when it has, and the `room` it
-    /// holds is given back then. A refusal before it is queued (`Busy`, `Full`, `TooLarge`,
-    /// `Checksum`) is answered at once, its room still the caller's to give back.
+    /// Puts `bytes`, `key`'s whole chunk, on the volume in `slot`, checked against `crc32c`, for
+    /// a request that waits on it until `until_ns` on the shard's clock: its answer comes through
+    /// [`Self::poll_done`], `waker` woken when it has, and the `room` it holds is given back then.
+    /// A refusal before it is queued (`Busy`, `Full`, `TooLarge`, `Checksum`) is answered at once,
+    /// its room still the caller's to give back.
     pub(crate) fn put(
         &mut self,
         slot: usize,
@@ -304,14 +315,20 @@ impl Storage {
         bytes: Vec<u8>,
         crc32c: u32,
         waker: &Waker,
-        (origin, room): (Origin, u64),
+        (origin, room, until_ns): (Origin, u64, u64),
     ) -> Result<(), ChunkError> {
         let held = self.volumes.get(slot).ok_or(ChunkError::Closed)?;
         let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         let answer = held
             .volume
             .put_checked_waking(key, bytes, crc32c, waker.clone())?;
-        self.puts.push((slot, origin, answer, room, len));
+        self.puts.push(PutOut {
+            origin,
+            answer,
+            room,
+            len,
+            until_ns,
+        });
         Ok(())
     }
 
@@ -363,18 +380,14 @@ impl Storage {
         Ok(holding)
     }
 
-    /// The peers' chunks still out on a volume of `moved`, whose writer answered a put since: the
-    /// work for each moved, as its asker is told (`hyper_transport::Endpoint::working`).
-    pub(crate) fn served_on<'a>(
-        &'a self,
-        moved: &'a [usize],
-    ) -> impl Iterator<Item = ExchangeId> + 'a {
-        self.puts
-            .iter()
-            .filter_map(move |(slot, origin, ..)| match origin {
-                Origin::Exchange(exchange) if moved.contains(slot) => Some(*exchange),
-                Origin::Exchange(_) | Origin::Asked(_) => None,
-            })
+    /// The peers' chunks a volume holds at `now`, put and not yet durable, whose requests still
+    /// wait: work held by the device, as each one's asker is told while its request waits
+    /// (`hyper_transport::Endpoint::working`, research/77 D2).
+    pub(crate) fn held(&self, now: u64) -> impl Iterator<Item = ExchangeId> + '_ {
+        self.puts.iter().filter_map(move |out| match out.origin {
+            Origin::Exchange(exchange) if out.until_ns > now => Some(exchange),
+            Origin::Exchange(_) | Origin::Asked(_) => None,
+        })
     }
 
     /// Puts and gets out.
@@ -382,24 +395,16 @@ impl Storage {
         self.puts.len().saturating_add(self.gets.len())
     }
 
-    /// Moves the puts and gets answered since the last call into `done`, each volume whose writer
-    /// answered a put into `moved` once, and registers the task `cx` names to be woken when a get
-    /// still out is answered (a put wakes the waker it was given).
-    pub(crate) fn poll_done(
-        &mut self,
-        cx: &mut Context<'_>,
-        done: &mut Vec<Done>,
-        moved: &mut Vec<usize>,
-    ) {
+    /// Moves the puts and gets answered since the last call into `done`, and registers the task
+    /// `cx` names to be woken when a get still out is answered (a put wakes the waker it was
+    /// given).
+    pub(crate) fn poll_done(&mut self, cx: &mut Context<'_>, done: &mut Vec<Done>) {
         let mut at = 0;
-        while let Some((slot, origin, answer, room, len)) = self.puts.get(at) {
-            match answer.poll() {
+        while let Some(out) = self.puts.get(at) {
+            match out.answer.poll() {
                 Some(answered) => {
-                    if !moved.contains(slot) {
-                        moved.push(*slot);
-                    }
-                    done.push(Done::Put(*origin, *len, answered));
-                    self.taken = self.taken.saturating_sub(*room);
+                    done.push(Done::Put(out.origin, out.len, answered));
+                    self.taken = self.taken.saturating_sub(out.room);
                     self.puts.swap_remove(at);
                 }
                 None => at = at.saturating_add(1),

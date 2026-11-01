@@ -675,14 +675,15 @@ async fn run<E: Engine + 'static>(
                         key,
                         bytes,
                         crc32c,
-                    } => node.put_chunk(at, volume, key, bytes, crc32c),
+                        // The test's own asks serve no request: none waits on them.
+                    } => node.put_chunk(at, volume, key, bytes, (crc32c, 0)),
                     Chunked::Get {
                         at,
                         volume,
                         key,
                         offset,
                         len,
-                    } => node.get_chunk(at, volume, key, offset, len),
+                    } => node.get_chunk(at, volume, key, (offset, len), 0),
                 };
                 match asked {
                     Ok(asked) => {

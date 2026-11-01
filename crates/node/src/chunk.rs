@@ -6,17 +6,17 @@
 //!
 //! | Message | Head | Body |
 //! |---|---|---|
-//! | put | the volume, u128; the chunk's key (`mantle_chunk::ChunkKey`, 22 bytes); the chunk's CRC-32C, u32; little-endian | the chunk's bytes |
-//! | get | the volume, u128; the chunk's key; the offset and the length of the bytes asked, u64 each; little-endian | none |
+//! | put | the volume, u128; the chunk's key (`mantle_chunk::ChunkKey`, 22 bytes); the chunk's CRC-32C, u32; the time the request it serves will still wait, nanoseconds from its sending, u64, 0 for none (research/77 D2); little-endian | the chunk's bytes |
+//! | get | the volume, u128; the chunk's key; the offset and the length of the bytes asked, u64 each; the time the request it serves will still wait, as a put's; little-endian | none |
 //! | reply | the status, u8 | a get's bytes, when read |
 
 use mantle_chunk::{ChunkError, ChunkKey};
 use mantle_codec::{Reader, Writer};
 
-/// The bytes of a put's head: the volume, the key and the CRC-32C.
-pub const PUT_HEAD_BYTES: usize = 16 + ChunkKey::ENCODED_LEN + 4;
-/// The bytes of a get's head: the volume, the key, the offset and the length.
-pub const GET_HEAD_BYTES: usize = 16 + ChunkKey::ENCODED_LEN + 8 + 8;
+/// The bytes of a put's head: the volume, the key, the CRC-32C and the time left.
+pub const PUT_HEAD_BYTES: usize = 16 + ChunkKey::ENCODED_LEN + 4 + 8;
+/// The bytes of a get's head: the volume, the key, the offset, the length and the time left.
+pub const GET_HEAD_BYTES: usize = 16 + ChunkKey::ENCODED_LEN + 8 + 8 + 8;
 /// The bytes of a reply's head: the status.
 pub const REPLY_HEAD_BYTES: usize = 1;
 
@@ -138,6 +138,9 @@ pub struct Put {
     pub volume: u128,
     pub key: ChunkKey,
     pub crc32c: u32,
+    /// The time the request the put serves will still wait, nanoseconds from its sending; 0 for
+    /// none (research/77 D2).
+    pub remaining_ns: u64,
 }
 
 impl Put {
@@ -146,6 +149,7 @@ impl Put {
         w.u128(self.volume);
         self.key.encode(&mut w);
         w.u32(self.crc32c);
+        w.u64(self.remaining_ns);
         w.into_vec()
     }
 
@@ -158,10 +162,12 @@ impl Put {
         let volume = r.u128().ok_or_else(malformed)?;
         let key = ChunkKey::decode(&mut r).ok_or_else(malformed)?;
         let crc32c = r.u32().ok_or_else(malformed)?;
+        let remaining_ns = r.u64().ok_or_else(malformed)?;
         Ok(Self {
             volume,
             key,
             crc32c,
+            remaining_ns,
         })
     }
 }
@@ -173,6 +179,8 @@ pub struct Get {
     pub key: ChunkKey,
     pub offset: u64,
     pub len: u64,
+    /// The time the request the get serves will still wait, as a put's.
+    pub remaining_ns: u64,
 }
 
 impl Get {
@@ -182,6 +190,7 @@ impl Get {
         self.key.encode(&mut w);
         w.u64(self.offset);
         w.u64(self.len);
+        w.u64(self.remaining_ns);
         w.into_vec()
     }
 
@@ -195,11 +204,13 @@ impl Get {
         let key = ChunkKey::decode(&mut r).ok_or_else(malformed)?;
         let offset = r.u64().ok_or_else(malformed)?;
         let len = r.u64().ok_or_else(malformed)?;
+        let remaining_ns = r.u64().ok_or_else(malformed)?;
         Ok(Self {
             volume,
             key,
             offset,
             len,
+            remaining_ns,
         })
     }
 }
@@ -234,6 +245,7 @@ mod tests {
             volume: 9,
             key: key(),
             crc32c: 0xdead_beef,
+            remaining_ns: 1_500_000_000,
         };
         let bytes = put.encode();
         assert_eq!(bytes.len(), PUT_HEAD_BYTES);
@@ -244,6 +256,7 @@ mod tests {
             key: key(),
             offset: 4096,
             len: 1 << 20,
+            remaining_ns: 0,
         };
         let bytes = get.encode();
         assert_eq!(bytes.len(), GET_HEAD_BYTES);

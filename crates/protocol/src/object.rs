@@ -11,7 +11,7 @@
 //!
 //! | Message | Head | Body |
 //! |---|---|---|
-//! | request | the kind (u8); the fields' length (u32); the operation's identity (u128), which every attempt of a mutation carries (gateway.md §2.1), else 0; a put's length, else 0 (u64); the algorithm of the checksum a put's trailer brings after its bytes (u8), 0 for none, else its code (`mantle_s3::checksum::Algorithm::code`) and one | the fields; then a put's bytes; then its trailer, the checksum's value |
+//! | request | the kind (u8); the fields' length (u32); the operation's identity (u128), which every attempt of a mutation carries (gateway.md §2.1), else 0; the time its client will still wait, nanoseconds from its sending (u64), 0 for none (research/77 D2); a put's length, else 0 (u64); the algorithm of the checksum a put's trailer brings after its bytes (u8), 0 for none, else its code (`mantle_s3::checksum::Algorithm::code`) and one | the fields; then a put's bytes; then its trailer, the checksum's value |
 //! | reply | the status (u8); the object's size, a get's or a head's, else 0 (u64); the fields' length (u32) | the fields; then a get's bytes |
 //!
 //! A request's fields, by its kind. A text is UTF-8 behind its length (u32); an optional field is
@@ -75,6 +75,8 @@
 //! Numbers are little-endian. Every text is within S3's bound on what it names, and every count
 //! within S3's page: a message past them is refused whole.
 
+use std::time::Duration;
+
 use mantle_codec::{Reader, Writer};
 use mantle_s3::account::MAX_OWNER;
 use mantle_s3::body::Versioning;
@@ -123,9 +125,12 @@ pub const MAX_PAGE_PARTS: usize = 1000;
 /// The most parts an upload has and a completion lists: S3's 10,000 (05 §4.1).
 const MAX_PARTS: usize = mantle_s3::body::MAX_PARTS as usize;
 
-/// The bytes of an object's request head: the kind, the fields' length, the identity, a put's
-/// length and its trailer's algorithm.
-pub const HEAD_BYTES: usize = 1 + 4 + 16 + 8 + 1;
+/// The bytes of an object's request head: the kind, the fields' length, the identity, the time
+/// its client will still wait, a put's length and its trailer's algorithm.
+pub const HEAD_BYTES: usize = 1 + 4 + 16 + 8 + 8 + 1;
+/// Where a request's head keeps the time its client will still wait: past the kind, the fields'
+/// length and the identity.
+const REMAINING_AT: usize = 1 + 4 + 16;
 /// The bytes of a reply's head: the status, the size and the fields' length.
 pub const REPLY_HEAD_BYTES: usize = 1 + 8 + 4;
 /// The longer of the two, the longest head a client of objects sends or receives.
@@ -590,6 +595,7 @@ pub struct Head {
     kind: u8,
     fields: u32,
     id: u128,
+    remaining: u64,
     length: u64,
     trailing: Option<Algorithm>,
 }
@@ -598,6 +604,15 @@ impl Head {
     /// The bytes of the fields that open the body.
     pub fn fields(&self) -> u64 {
         u64::from(self.fields)
+    }
+
+    /// The time the request's client will still wait from its sending; none where it gave none.
+    pub fn remaining(&self) -> Option<Duration> {
+        if self.remaining == 0 {
+            None
+        } else {
+            Some(Duration::from_nanos(self.remaining))
+        }
     }
 
     /// The request, once its fields are read.
@@ -825,6 +840,7 @@ impl Head {
                 kind: r.u8()?,
                 fields: r.u32()?,
                 id: r.u128()?,
+                remaining: r.u64()?,
                 length: r.u64()?,
                 trailing: match r.u8()? {
                     0 => None,
@@ -851,6 +867,23 @@ impl Head {
         }
         Ok(decoded)
     }
+}
+
+/// Sets in a request's `head`, as [`Op::encode`] made it, the time its client will still wait,
+/// `remaining` from its sending, none where it gives none (research/77 D2): set at each attempt,
+/// as the time left changes between them.
+pub fn within(head: &mut [u8], remaining: Option<Duration>) -> Result<(), ObjectError> {
+    let len = head.len();
+    let at = head
+        .get_mut(REMAINING_AT..REMAINING_AT + 8)
+        .filter(|_| len == HEAD_BYTES)
+        .ok_or(ObjectError::Head(len))?;
+    // A time too long to count in nanoseconds is one no wait reaches; a zero one is none.
+    let ns = remaining.map_or(0, |r| {
+        u64::try_from(r.as_nanos()).unwrap_or(u64::MAX).max(1)
+    });
+    at.copy_from_slice(&ns.to_le_bytes());
+    Ok(())
 }
 
 impl Op {
@@ -1103,6 +1136,7 @@ impl Op {
         w.u8(kind);
         w.u32(u32::try_from(fields.len()).map_err(|_| ObjectError::TooLong(fields.len()))?);
         w.u128(id);
+        w.u64(0);
         w.u64(length);
         w.u8(trailing.map_or(0, |a| a.code().saturating_add(1)));
         Ok((w.into_vec(), fields))
@@ -2125,6 +2159,33 @@ mod tests {
             assert_eq!(decoded.fields(), fields.len() as u64);
             assert_eq!(decoded.op(&fields), Ok(op));
         }
+    }
+
+    #[test]
+    fn a_requests_time_left_reads_back_as_set_at_each_attempt_and_none_as_none() {
+        let put = every_op().swap_remove(1);
+        let (mut head, fields) = put.encode().unwrap();
+        let body = Some(put.body(&fields));
+        assert_eq!(Head::decode(&head, body).unwrap().remaining(), None);
+        within(&mut head, Some(Duration::from_millis(1500))).unwrap();
+        let decoded = Head::decode(&head, body).unwrap();
+        assert_eq!(decoded.remaining(), Some(Duration::from_millis(1500)));
+        assert_eq!(decoded.op(&fields), Ok(put.clone()));
+        // Set again for the next attempt, less; and none again.
+        within(&mut head, Some(Duration::from_millis(400))).unwrap();
+        assert_eq!(
+            Head::decode(&head, body).unwrap().remaining(),
+            Some(Duration::from_millis(400))
+        );
+        within(&mut head, None).unwrap();
+        assert_eq!(Head::decode(&head, body).unwrap().remaining(), None);
+        // A time past what nanoseconds count waits for as long as any; no head but a request's.
+        within(&mut head, Some(Duration::MAX)).unwrap();
+        assert_eq!(
+            Head::decode(&head, body).unwrap().remaining(),
+            Some(Duration::from_nanos(u64::MAX))
+        );
+        assert!(within(&mut head[1..], None).is_err());
     }
 
     #[test]

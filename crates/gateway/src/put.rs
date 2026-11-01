@@ -84,6 +84,9 @@ pub enum Answer {
     Refused {
         full: bool,
     },
+    /// No room for the chunk now, at the volume's writer queue or in the transport toward it: it
+    /// is asked again of the same volume once room frees ([`Put::room`], research/77 D2).
+    Busy,
     Block(block::Outcome),
     File(file::Outcome),
     Name(name::Outcome),
@@ -391,6 +394,9 @@ pub struct Put {
     checked: Option<checksum::Checksum>,
     ready: VecDeque<(Id, Request)>,
     asked: BTreeMap<Id, Asked>,
+    /// The chunks answered `Busy`, by their block's place in the file and their index, waiting
+    /// for room at the volume they went to: at most every chunk of the blocks going down.
+    roomless: Vec<(u64, usize)>,
     next_id: Id,
     phase: Phase,
     outcome: Option<Result<Stored, PutError>>,
@@ -502,6 +508,7 @@ impl Put {
             etag: None,
             checked: None,
             ready: VecDeque::new(),
+            roomless: Vec::new(),
             asked: BTreeMap::new(),
             next_id: 0,
             phase: Phase::Body,
@@ -558,6 +565,32 @@ impl Put {
     /// Takes the answer to request `id`, and moves on.
     pub fn answer(&mut self, id: Id, answer: Answer) -> Result<(), PutError> {
         self.guard(|put| put.answered(id, answer))
+    }
+
+    /// Room may have freed where its chunks were refused `Busy`: each is asked again of the
+    /// volume it went to (research/77 D2). The caller's patience ends a PUT whose room never
+    /// comes.
+    pub fn room(&mut self) -> Result<(), PutError> {
+        self.guard(|put| {
+            for (index, i) in std::mem::take(&mut put.roomless) {
+                let going = put.going.get(&index).ok_or(PutError::Mismatch)?;
+                let (volume, _) = going
+                    .at
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .ok_or(PutError::Mismatch)?;
+                let (bytes, crc) = going.chunks.get(i).ok_or(PutError::Mismatch)?;
+                let request = chunk(going.id, i, volume, bytes, *crc)?;
+                put.ask(Asked::Chunk(index, i), request);
+            }
+            Ok(())
+        })
+    }
+
+    /// Whether a chunk of it waits for room ([`Put::room`]).
+    pub fn waits_for_room(&self) -> bool {
+        !self.roomless.is_empty()
     }
 
     /// How the PUT ended, once it has.
@@ -805,6 +838,10 @@ impl Put {
             (Asked::Place(index), Answer::Volumes(volumes)) => self.placed(index, volumes),
             (Asked::Chunk(index, i), Answer::Stored) => self.stored(index, i),
             (Asked::Chunk(index, i), Answer::Refused { full }) => self.refused(index, i, full),
+            (Asked::Chunk(index, i), Answer::Busy) => {
+                self.roomless.push((index, i));
+                Ok(())
+            }
             (
                 Asked::Block { index, asked_ns },
                 Answer::Block(block::Outcome::Written { deadline_ns }),

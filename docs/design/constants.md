@@ -530,8 +530,8 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/meta/src/wire.rs` `ETAG_HEX` | external | A part's ETag, the hex of its 16-byte MD5 (research/05 §4.5). |
 | `crates/meta/src/wire.rs` `FORMAT` | format | Version byte 6 of an encoded log entry; 6 since a registration names its owner, the owner's run and its place in the run, 5 since a registration refused at the bound of sessions is answered `SessionsFull` with the time a place frees, 4 since a part carries its file's handover deadline in place of the command beside it, 3 since a PUT and a completion carry the ID of their request, which names a write with no file, and a mark kept past an unmark is answered with its deadline, 2 since a completion carries its part listing's digest. |
 | `crates/meta/src/wire.rs` `MAX_COMMANDS` | bound | 2^16 command places per entry, so a session ID is index × 2^16 + place (session.rs `register`); the audit (§12.6) keeps it as a versioned encoding bound with byte and work budgets beside it. |
-| `crates/node/src/chunk.rs` `GET_HEAD_BYTES` | format | A chunk get's head: the volume, a u128; the chunk's key, `mantle_chunk::ChunkKey::ENCODED_LEN` bytes; the offset and the length asked, a u64 each. |
-| `crates/node/src/chunk.rs` `PUT_HEAD_BYTES` | format | A chunk put's head: the volume, a u128; the chunk's key, `mantle_chunk::ChunkKey::ENCODED_LEN` bytes; the CRC-32C its sender computed, a u32 (CLAUDE.md §6). |
+| `crates/node/src/chunk.rs` `GET_HEAD_BYTES` | format | A chunk get's head: the volume, a u128; the chunk's key, `mantle_chunk::ChunkKey::ENCODED_LEN` bytes; the offset and the length asked, a u64 each; the time the request it serves will still wait, a u64 (research/77 D2). |
+| `crates/node/src/chunk.rs` `PUT_HEAD_BYTES` | format | A chunk put's head: the volume, a u128; the chunk's key, `mantle_chunk::ChunkKey::ENCODED_LEN` bytes; the CRC-32C its sender computed, a u32 (CLAUDE.md §6); the time the request it serves will still wait, a u64 (research/77 D2). |
 | `crates/node/src/chunk.rs` `REPLY_HEAD_BYTES` | format | A chunk reply's head: its status, one byte. |
 | `crates/node/src/client.rs` `PERSISTENT_CONGESTION_THRESHOLD` | external | `kPersistentCongestionThreshold`, three probe timeouts with no acknowledgement (RFC 9002 §7.6.1): the least an exchange is given once the client has measured its exchanges. |
 | `crates/node/src/client.rs` `PIECE` | derived | hyper-transport's `RECEIVE_CHUNK`: a reply's body is read a receive chunk at a time. |
@@ -614,6 +614,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/protocol/src/bounds.rs` `IDLE_PTOS` | external | Three probe timeouts, the least idle timeout RFC 9000 §10.1 allows. |
 | `crates/protocol/src/bounds.rs` `INITIAL_RTT` | external | `kInitialRtt`, 333 ms, a path's smoothed round trip before any sample (RFC 9002 §6.2.2). |
 | `crates/protocol/src/bounds.rs` `MAX_ACK_DELAY` | external | `max_ack_delay`'s default, 25 ms, which a probe timeout adds once established (RFC 9000 §18.2). |
+| `crates/protocol/src/bounds.rs` `STOCK_PATIENCE` | external | 60 s between bytes, the stock S3 clients' patience by default: botocore's `read_timeout` ("The default is 60 seconds") and the AWS CLI's `--cli-read-timeout` ("The default value is 60 seconds"), research/77 [9, 10]; how long a request that states no patience of its own is waited on while its work does not move (D2). |
 | `crates/protocol/src/bounds.rs` `STREAM_BYTES` | measured | 95 bytes a connection keeps for each stream it may hold (`tests/transport_memory.rs`: 3,602 more at 86 streams than at 48). |
 | `crates/protocol/src/classes.rs` `RANKS` | format | Four classes on a node's QUIC connections: replication, request, transfer (the request class's lower level, chunk bodies) and bulk (docs/design/node.md §3.1); consensus control that fits a datagram takes the plane. |
 | `crates/protocol/src/object.rs` `ABORT` | format | An object request's kind: AbortMultipartUpload. |
@@ -626,7 +627,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/protocol/src/object.rs` `GET_VERSIONING` | format | An object request's kind: GetBucketVersioning. |
 | `crates/protocol/src/object.rs` `HEAD` | format | An object request's kind: HeadObject, the current version's facts. |
 | `crates/protocol/src/object.rs` `HEAD_BUCKET` | format | An object request's kind: HeadBucket. |
-| `crates/protocol/src/object.rs` `HEAD_BYTES` | format | An object request's head: its kind, one byte; its fields' length, a u32; the operation's identity, a u128; a put's length, a u64. |
+| `crates/protocol/src/object.rs` `HEAD_BYTES` | format | An object request's head: its kind, one byte; its fields' length, a u32; the operation's identity, a u128; its client's time left, a u64 (research/77 D2); a put's length, a u64; its trailer's algorithm, one byte. |
 | `crates/protocol/src/object.rs` `LIST` | format | An object request's kind: a page of ListObjectsV2. |
 | `crates/protocol/src/object.rs` `LISTED_BYTES` | derived | A key in a page of keys at its longest: the key behind its length (u32 and `MAX_KEY`), its ETag behind its length (u32 and `MAX_TAG`), its size and Last-Modified (u64 each), its checksum's flag, algorithm and parts (1, 1, 2) and its owner's flag, length and `MAX_OWNER` bytes; a page's room is counted against it. |
 | `crates/protocol/src/object.rs` `LIST_BUCKETS` | format | An object request's kind: a page of ListBuckets, the asker's buckets. |
@@ -650,6 +651,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/protocol/src/object.rs` `PART_BYTES` | derived | A part in a page of parts at its longest: its number (u16), its ETag behind its length at `MAX_TAG`, its size and Last-Modified (u64 each), and its checksum's flag, length and `MAX_CHECKSUM` bytes. |
 | `crates/protocol/src/object.rs` `PUT` | format | An object request's kind: an object put, its bytes on the exchange. |
 | `crates/protocol/src/object.rs` `PUT_VERSIONING` | format | An object request's kind: PutBucketVersioning, enabled or suspended. |
+| `crates/protocol/src/object.rs` `REMAINING_AT` | format | Where a request's head keeps its client's time left: past the kind (1 byte), the fields' length (a u32) and the identity (a u128). |
 | `crates/protocol/src/object.rs` `REPLY_HEAD_BYTES` | format | An object reply's head: its status, one byte; the object's size, a u64; its fields' length, a u32. |
 | `crates/protocol/src/object.rs` `UPLOADS_HEAD_BYTES` | derived | A page of uploads' bytes beside its uploads and common prefixes, at most: whether it is truncated, where the next page starts (its flag, a key at `MAX_KEY` and an ID at `MAX_TAG`, each behind its length) and the two counts (u32 each). |
 | `crates/protocol/src/object.rs` `UPLOAD_BYTES` | derived | An upload in a page of uploads at its longest: its key at `MAX_KEY`, its ID at `MAX_TAG`, its initiation (u64) and its owner at `MAX_OWNER`, each text behind its length (u32). |

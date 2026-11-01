@@ -2,9 +2,9 @@
 
 Status: research note, 2026-10-29. For the waits between a client and a node and between nodes
 (node.md §3.8, §5.4; gateway.md §6; `vendor/hyper-transport/src/progress.rs`,
-`crates/client/src/lib.rs`, `crates/node/src/node.rs`). Sources [1] to [6] were read from the
-vendor references, standards and papers named, each quoted where it was read; [7] and [8] are
-quoted from node.md §3.8 and research/04 §A9.1, where they were read.
+`crates/client/src/lib.rs`, `crates/node/src/node.rs`). Sources [1] to [6], [9] and [10] were read
+from the vendor references, standards and papers named, each quoted where it was read; [7] and [8]
+are quoted from node.md §3.8 and research/04 §A9.1, where they were read.
 
 ## The question
 
@@ -72,6 +72,14 @@ its idle timeout is "at least three probe timeouts".
 research/04 §A9.1: hedged requests sent after "the 95th-percentile expected latency"; "Permitting
 more aggressive use of hedged requests with moderate resource consumption requires faster
 cancellation of requests."
+
+[9] botocore, Config reference, https://docs.aws.amazon.com/botocore/latest/reference/config.html
+(read 2026-10-31): "`read_timeout` (float or int) – The time in seconds till a timeout exception is
+thrown when attempting to read from a connection. The default is 60 seconds."
+
+[10] AWS CLI v2, global options, https://docs.aws.amazon.com/cli/latest/reference/index.html (read
+2026-10-31): "`--cli-read-timeout` (int) The maximum socket read time in seconds. If the value is set
+to 0, the socket read will be blocking and not timeout. The default value is 60 seconds."
 
 ## Findings
 
@@ -153,3 +161,39 @@ and a 40 GiB put on the box whose chunk to a peer was cut `Lost(Stalled)` while 
 its own device, the block `Unplaced` and the request answered `503 SlowDown`
 (measurements/2026-10-28-transfer-scale.md). Any server whose answer waits on its own asks would
 use it, focal's seal and slates' included.
+
+The notes were built that day, and on CI's busy runner the node also vouches for a job as each piece
+of a chunk it sends a peer goes (measurements/2026-10-29). On the box they did not close the 20 GiB
+puts: all three nodes keep their volumes on one file system whose flushes stalled 5 to 6 s, a
+receiver whose device holds a chunk answers nothing and says nothing, and behind it the serving
+node's own volume refused `Busy` and its transport `Lost(Budget)` (measurements/2026-10-28).
+
+## D2's design, as the owner chose it
+
+On 2026-11-01 the owner chose that a node waits as long as its client would: "Yes, wait as long as
+the client would", each request carrying how long its client will wait, 60 s if it does not say, and
+a node whose disk is still busy with a write saying so. This changes D1's rule, which vouched only
+for work that advanced, so hyper-transport's maintainers review it and the owner approves it before
+it lands.
+
+- **What carries it.** A native request's head carries the time its client will still wait, in
+  nanoseconds counted from its sending, 0 for none: gRPC's deadline "converted to a timeout from
+  which the already elapsed time is already deducted" [4], so no clock is compared across machines.
+  A chunk's put or get a node asks of a peer for a request carries what remains of the request's
+  time when it is asked.
+- **A request that carries none.** An S3 request, and one whose client gives no deadline, is given
+  the patience of the stock S3 clients, 60 s between bytes, botocore's and the AWS CLI's default
+  read timeout [9, 10]: a node working for it longer works for a client that has gone.
+- **What waits within it.** While its request has time left: a chunk refused for want of room,
+  `Busy` at a volume's full writer queue or `Lost(Budget)` at the transport, is asked again of the
+  same volume once a put there answers or a transfer ends, not sent on to the next volume or ended
+  `Unplaced`; a peer's chunk whose put its device holds, submitted and not yet durable, is vouched
+  for each beat; and a job is vouched for each beat while an ask of its own is held, out on an
+  exchange its transport still keeps (by its server's statements or its moving bytes) or in flight
+  at its own device. A server whose loop stops says nothing, a peer that dies is found by the
+  transport as before, and a device that never answers is given up at the deadline.
+- **Past it.** The job stops: what it asked is let go, its chunks are left to the cleaner (D4's
+  prompt freeing is not built), and its request is answered `503 SlowDown` if its client is there.
+- **What it changes of D1.** A statement that work is held, by the node's own device or by a peer's
+  that says so, counts as one that it moved. The deadline is what makes it safe: it ends, so no
+  statement keeps a stuck job alive past the time its client would wait.

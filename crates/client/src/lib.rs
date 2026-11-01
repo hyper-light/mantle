@@ -951,10 +951,12 @@ impl Client {
             // Slowed: sent again from where it began, the node answering `Offset` if the run
             // committed after all (node.md §5.4: a step that ended so may still apply, once).
             Ok(reply) if reply.status == Status::SlowDown => {
+                diag_line(&format!("diag-client run slowed at {begun}"));
                 return Ok(Ran::Slowed(Box::new(reply)));
             }
             Ok(reply) => return Ok(Ran::Refused(Box::new(reply))),
             Err(error) if resumable(&error) => {
+                diag_line(&format!("diag-client run lost at {begun}: {error}"));
                 let reply = self.progress(native, upload, deadline_ns).await?;
                 if reply.status != Status::Done {
                     return Ok(Ran::Refused(Box::new(reply)));
@@ -1142,6 +1144,8 @@ impl Client {
                 backoff = bounds::backed_off(backoff);
             }
             let node = self.nodes.get(self.at).ok_or(ClientError::NoNodes)?.id;
+            let diag_at = hyper_rt::futures::now_ns();
+            let diag_run = upload.is_some();
             let asked = self
                 .attempt(
                     node,
@@ -1149,7 +1153,20 @@ impl Client {
                     (upload.as_deref_mut(), sink.as_deref_mut()),
                     deadline_ns,
                 )
-                .await?;
+                .await;
+            diag_line(&format!(
+                "diag-client attempt {attempt} node {node:?} run {diag_run} body {} after_ms {} {}",
+                body,
+                hyper_rt::futures::now_ns().saturating_sub(diag_at) / 1_000_000,
+                match &asked {
+                    Ok(Attempt::Replied(reply)) => format!("replied {:?}", reply.status),
+                    Ok(Attempt::Untaken(r)) => format!("untaken {r:?}"),
+                    Ok(Attempt::Refused(r)) => format!("refused {r:?}"),
+                    Ok(Attempt::Lost { refusal, whole }) => format!("lost {refusal:?} whole {whole}"),
+                    Err(e) => format!("error {e}"),
+                }
+            ));
+            let asked = asked?;
             match asked {
                 Attempt::Replied(reply) => {
                     let reply = *reply;
@@ -2175,5 +2192,37 @@ mod tests {
         ));
         took_from_source(&mut upload, &piece, 0).unwrap();
         assert!(upload.ended);
+    }
+}
+
+/// DIAGNOSTIC (never merged): a line to this process's own trace file under `MANTLE_DIAG_DIR`,
+/// one write each, so processes sharing an output never interleave.
+pub fn diag_line(line: &str) {
+    use std::io::Write;
+    static FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let text = format!("{wall} {} {line}\n", std::process::id());
+    let Ok(mut file) = FILE.lock() else {
+        return;
+    };
+    if file.is_none() {
+        *file = std::env::var_os("MANTLE_DIAG_DIR").and_then(|dir| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(std::path::Path::new(&dir).join(format!("{}.log", std::process::id())))
+                .ok()
+        });
+    }
+    match file.as_mut() {
+        Some(f) => {
+            let _ = f.write_all(text.as_bytes());
+        }
+        None => {
+            let _ = std::io::stderr().write_all(text.as_bytes());
+        }
     }
 }

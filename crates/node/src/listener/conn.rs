@@ -344,6 +344,7 @@ impl Connection {
             channel::<Piece>(BODY_PIECES),
             channel::<Answer>(REPLY_PIECES),
         ) else {
+            crate::diag_line!("{} slowdown listener-channels", crate::diag_at());
             return self
                 .refuse(&slow(), resource, ids, (version, head), unread)
                 .await;
@@ -356,6 +357,7 @@ impl Connection {
         };
         // A door at its bound refuses before any of the body is read (node.md §4.5).
         if self.door.submit(request).is_err() {
+            crate::diag_line!("{} slowdown listener-door", crate::diag_at());
             return self
                 .refuse(&slow(), resource, ids, (version, head), unread)
                 .await;

@@ -139,6 +139,7 @@ pub(super) fn large(
         }
         let name = key(i);
         let object = generator.object(&name)?;
+        eprintln!("diag {} bench put {name} way {} began", super::cell::diag_ms(), way.name());
         let began = Instant::now();
         // Asked once: a full cell's volumes hold a put for their cleaners' verdicts, so its first
         // answer is the typed one (research/75), and a SlowDown is counted as refused.
@@ -171,6 +172,10 @@ pub(super) fn large(
             }
         };
         let took = elapsed(began);
+        eprintln!(
+            "diag {} bench put {name} came {came:?} again {again} took {took:?}",
+            super::cell::diag_ms()
+        );
         if let Some(tally) = tallies.get_mut(at) {
             tally.asked_again(again);
             if came == Came::Refused(Status::InsufficientStorage) {

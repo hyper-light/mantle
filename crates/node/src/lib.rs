@@ -43,3 +43,45 @@ pub mod process;
 pub mod read;
 pub mod secret;
 pub mod storage;
+
+/// DIAGNOSTIC (never merged): a line written whole to this process's own file under
+/// `MANTLE_DIAG_DIR`, else to standard error, so processes sharing an output never interleave.
+pub fn diag_write(line: &str) {
+    use std::io::Write;
+    static FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+    let text = format!("{line}\n");
+    let Ok(mut file) = FILE.lock() else {
+        return;
+    };
+    if file.is_none() {
+        *file = std::env::var_os("MANTLE_DIAG_DIR").and_then(|dir| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(std::path::Path::new(&dir).join(format!("{}.log", std::process::id())))
+                .ok()
+        });
+    }
+    match file.as_mut() {
+        Some(f) => {
+            let _ = f.write_all(text.as_bytes());
+        }
+        None => {
+            let _ = std::io::stderr().write_all(text.as_bytes());
+        }
+    }
+}
+
+/// DIAGNOSTIC (never merged): [`diag_write`] of a formatted line.
+#[macro_export]
+macro_rules! diag_line {
+    ($($arg:tt)*) => { $crate::diag_write(&format!($($arg)*)) };
+}
+
+/// DIAGNOSTIC (never merged): wall-clock milliseconds and this process's id, for a stderr line.
+pub fn diag_at() -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    format!("diag {ms} {}", std::process::id())
+}

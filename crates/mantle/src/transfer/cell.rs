@@ -41,6 +41,13 @@ impl std::fmt::Display for CellError {
     }
 }
 
+/// DIAGNOSTIC (never merged): the wall clock's milliseconds.
+pub(super) fn diag_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis())
+}
+
 fn io(what: &str) -> impl FnOnce(std::io::Error) -> CellError + '_ {
     move |e| CellError::Io(what.to_owned(), e)
 }
@@ -281,6 +288,7 @@ impl Cell {
     /// Starts node `at`'s process, its output read on a thread of its own.
     fn spawn(&mut self, at: usize) -> Result<(), CellError> {
         let tell = self.tell.clone();
+        let out = self.out.clone();
         let node = self
             .nodes
             .get_mut(at)
@@ -293,6 +301,7 @@ impl Cell {
             .stderr(Stdio::inherit())
             .spawn()
             .map_err(io("mantle serve"))?;
+        let child_id = child.id();
         let output = child.stdout.take().ok_or_else(|| {
             CellError::Io(
                 "mantle serve's output".into(),
@@ -309,6 +318,12 @@ impl Cell {
         node.enlisted = false;
         node.leaders.clear();
         let generation = node.generation;
+        // DIAGNOSTIC (never merged): every line the node says, kept with the wall clock's ms.
+        let mut said_file = std::io::LineWriter::new(
+            std::fs::File::create(out.join(format!("said-{}-{generation}", node.id)))
+                .map_err(io("a node's said file"))?,
+        );
+        let _ = writeln!(said_file, "{} pid {child_id}", diag_ms());
         std::thread::Builder::new()
             .name(format!("node-{}", node.id))
             .spawn(move || {
@@ -319,6 +334,7 @@ impl Cell {
                 let mut leaders: BTreeMap<u128, u64> = BTreeMap::new();
                 for line in BufReader::new(output).lines() {
                     let Ok(line) = line else { break };
+                    let _ = writeln!(said_file, "{} {line}", diag_ms());
                     let Some(said) = said(&line) else {
                         continue;
                     };

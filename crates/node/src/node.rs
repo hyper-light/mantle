@@ -3277,12 +3277,26 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     now,
                 ))
             });
+            let diag_leader = self
+                .asking
+                .get(at)
+                .map_or(0, |a| self.leader_of(a.group));
+            let diag_remotes = self.remotes.len();
             let Some(asking) = self.asking.get_mut(at) else {
                 continue;
             };
             let group = asking.group;
             if let Some((since, spent)) = unled {
                 let local = asking.out.as_ref().is_some_and(|o| o.via == Via::Local);
+                if spent {
+                    crate::diag_line!(
+                        "{} unled command group {group:x} local {local} since {since:?} now {now} waited_ms {} leader {} remotes {}",
+                        crate::diag_at(),
+                        since.map_or(0, |s| now.saturating_sub(s) / 1_000_000),
+                        diag_leader,
+                        diag_remotes
+                    );
+                }
                 if let Some(out) = asking.out.as_mut() {
                     out.leaderless_since = since;
                 }
@@ -3612,6 +3626,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 now,
             );
             let leaderless = request && spent;
+            if leaderless {
+                crate::diag_line!(
+                    "{} unled read group {group:x} via {via:?} since {since:?} now {now} waited_ms {} leader {} remotes {}",
+                    crate::diag_at(),
+                    since.map_or(0, |s| now.saturating_sub(s) / 1_000_000),
+                    self.leader_of(group),
+                    self.remotes.len()
+                );
+            }
             if let Some(out) = self.reads_out.get_mut(at) {
                 out.leaderless_since = since;
             }
@@ -3942,6 +3965,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 // its serials the same.
                 if let Some(asking) = self.asking.iter_mut().find(|a| a.group == c.group) {
                     if answered {
+                        if let Some(since) = asking.out.as_ref().and_then(|o| o.leaderless_since) {
+                            let waited =
+                                hyper_rt::futures::now_ns().saturating_sub(since) / 1_000_000;
+                            if waited >= 250 {
+                                crate::diag_line!(
+                                    "{} local commit group {:x} waited_ms {waited}",
+                                    crate::diag_at(),
+                                    c.group
+                                );
+                            }
+                        }
                         let answers = c.commands.into_iter().filter_map(|(_, _, a)| a).collect();
                         asking.answered(answers, &mut self.commands_done);
                     } else if let Some(out) = asking.out.as_mut()

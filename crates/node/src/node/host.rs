@@ -432,7 +432,10 @@ fn put_status(error: &PutError) -> Status {
         PutError::IncompleteBody => Status::IncompleteBody,
         PutError::EntityTooLarge { .. } => Status::EntityTooLarge,
         PutError::BadDigest | PutError::BadChecksum => Status::BadDigest,
-        PutError::Unplaced(_) => Status::SlowDown,
+        PutError::Unplaced(block) => {
+            crate::diag_line!("{} slowdown unplaced {block:x}", crate::diag_at());
+            Status::SlowDown
+        }
         PutError::Full(_) => Status::InsufficientStorage,
         PutError::InvalidPartNumber(_) => Status::InvalidArgument,
         PutError::Name(outcome) => name_status(outcome),
@@ -541,6 +544,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             (Err(_), Some(_)) => Work::Draining(Box::new(Reply::status(Status::Malformed))),
             // A node stopping begins no operation (node.md §1.7): its client asks another.
             (Ok(_), Some(g)) if self.stopping() || self.jobs.len() >= g.objects => {
+                crate::diag_line!(
+                    "{} slowdown admission native jobs {} objects {} stopping {}",
+                    crate::diag_at(),
+                    self.jobs.len(),
+                    g.objects,
+                    self.stopping()
+                );
                 Work::Draining(Box::new(Reply::status(Status::SlowDown)))
             }
             (Ok(head), Some(_)) => {
@@ -568,6 +578,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let work = match self.gateway.as_ref() {
             None => Work::Draining(Box::new(Reply::status(Status::Failed))),
             Some(g) if self.stopping() || self.jobs.len() >= g.objects => {
+                crate::diag_line!(
+                    "{} slowdown admission local jobs {} objects {} stopping {}",
+                    crate::diag_at(),
+                    self.jobs.len(),
+                    g.objects,
+                    self.stopping()
+                );
                 Work::Draining(Box::new(Reply::status(Status::SlowDown)))
             }
             Some(_) => {
@@ -783,6 +800,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 )
             })
         {
+            crate::diag_line!("{} slowdown leaderless {outcome:?}", crate::diag_at());
             return self.fail_job(at, Status::SlowDown);
         }
         // One of its own asks answered: the job's work moved, which its asker is told
@@ -1683,6 +1701,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     }) = self.jobs.get_mut(at)
                         && let Some(put) = putting.put.as_mut()
                     {
+                        crate::diag_line!("{} chunk unsent", crate::diag_at());
                         let _ = put.answer(id, put::Answer::Refused { full: false });
                     }
                     return Ok(None);
@@ -2754,6 +2773,16 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// An exchange of a job ended unanswered: the job ends, what it waits on let go.
     pub(super) fn job_lost(&mut self, exchange: ExchangeId) {
+        for j in &self.jobs {
+            if matches!(j.door, Door::Exchange(e) if e == exchange) {
+                crate::diag_line!(
+                    "{} job lost {exchange:?} work {:?} pending {}",
+                    crate::diag_at(),
+                    std::mem::discriminant(&j.work),
+                    j.pending.len()
+                );
+            }
+        }
         let Self {
             jobs, abandoned, ..
         } = self;
@@ -3172,6 +3201,7 @@ enum Step {
 }
 
 /// What a job's ask came to.
+#[derive(Debug)]
 enum Outcome {
     Command(CommandOutcome),
     Read(ReadOutcome),
@@ -3198,14 +3228,21 @@ fn put_answer(outcome: Outcome) -> put::Answer {
     match outcome {
         Outcome::Chunk(ChunkOutcome::Stored) => put::Answer::Stored,
         Outcome::Chunk(ChunkOutcome::Refused(chunk::Status::Full)) => {
+            crate::diag_line!("{} chunk full", crate::diag_at());
             put::Answer::Refused { full: true }
         }
-        Outcome::Chunk(_) => put::Answer::Refused { full: false },
+        Outcome::Chunk(other) => {
+            crate::diag_line!("{} chunk refused {other:?}", crate::diag_at());
+            put::Answer::Refused { full: false }
+        }
         Outcome::Command(CommandOutcome::Answered(Answer::Block(o))) => put::Answer::Block(o),
         Outcome::Command(CommandOutcome::Answered(Answer::File(o))) => put::Answer::File(o),
         Outcome::Command(CommandOutcome::Answered(Answer::Name(o))) => put::Answer::Name(o),
         // Any other: the driver takes it as the wrong kind and fails the put.
-        _ => put::Answer::Refused { full: false },
+        other => {
+            crate::diag_line!("{} put answer other {other:?}", crate::diag_at());
+            put::Answer::Refused { full: false }
+        }
     }
 }
 

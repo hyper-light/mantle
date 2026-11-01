@@ -696,7 +696,11 @@ The roll's Windows failures, a stopping node's "stopped at once: the stop's boun
 40711041054, 41256234352; 2 of 31 rounds on diag run 41260378525), were a connection's closing
 period: one slow round trip on a busy runner stretched its three probe timeouts to 9.5 s, past the
 10 s bound with the hand-over's 1.5 s. A stop whose bound passes with only its connections' closing
-periods left is done and exits 0 (node.md §1.7).
+periods left is done and exits 0 (node.md §1.7). A native client reading a reply's body that its
+transport had just ended took the read's `UnknownExchange` for a transport failure and ended its
+operation (the box's 20 GiB case on 2026-11-01, a read through a founder just started again); it
+now ends the attempt by the refusal queued behind the exchange, as for a reply whose head is gone,
+and a read lost so is asked again.
 The roll's next failures on CI (linux-x86_64 at `15d1e2f4`; macos-aarch64 and linux-aarch64-1cpu at
 `1c0096d7`), "nodes said ranges had no leader", had a cause of their own: founders started tens of
 seconds apart on one CPU, each measuring its devices first, judged a peer never heard from their own

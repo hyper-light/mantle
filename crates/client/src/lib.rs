@@ -1487,8 +1487,14 @@ impl Client {
                 .await;
             self.driver.endpoint().release(piece);
             poured?;
-            if read? == 0 {
-                break;
+            match read {
+                Ok(0) => break,
+                Ok(_) => {}
+                // Ended by the transport while its body was read, its connection closed or its
+                // period cut it: the refusal queued behind it ends the attempt, as for a reply
+                // whose head is gone (`Client::attempt`).
+                Err(Refusal::UnknownExchange) => return Ok(None),
+                Err(refusal) => return Err(refusal.into()),
             }
         }
         if !self.driver.endpoint().body_complete(exchange) {

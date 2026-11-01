@@ -1,7 +1,8 @@
-# Diagnostic (never merged): the native suite on the progress notes (e81c9c65), in rounds on CPUs
-# 0-1 beside two busy loops as CI's busy job runs it, every client attempt and run sent again, each
-# node's SlowDown paths, refused chunks and jobs whose clients gave up traced (MANTLE_DIAG_DIR, kept):
-# why its resumed copy is still refused InsufficientStorage (CI 41267125331).
+# Diagnostic (never merged): A/B of the progress notes on CI's busy shape. Arm A (HEAD^) is the
+# notes as built (e81c9c65) with each chunk transfer timed; arm B (HEAD) also vouches for a job at
+# each piece of a chunk it sends a peer. Each runner builds both and runs the native suite in
+# alternating rounds on CPUs 0-1 beside two busy loops, traced under MANTLE_DIAG_DIR (kept): whether
+# the client still cuts runs whose chunk copies are moving (CI 41267125331, diag run 41268668591).
 name: diag-notes-native
 on:
   push:
@@ -11,37 +12,49 @@ env:
   CARGO_TERM_COLOR: never
   RUST_BACKTRACE: "1"
 jobs:
-  rounds:
+  ab:
     strategy:
       fail-fast: false
       matrix:
         shard: [1, 2, 3, 4, 5, 6]
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 170
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 2
       - name: Install pinned Rust
         run: rustup toolchain install 1.98.1 --profile minimal
-      - name: Build
-        run: cargo test -p mantle --locked --test native --no-run
-      - name: Rounds on 0-1 beside 2 busy loops
+      - name: Build both arms
+        run: |
+          git worktree add -q --detach "$RUNNER_TEMP/arm-a" HEAD^
+          git -C "$RUNNER_TEMP/arm-a" log --oneline -1
+          git log --oneline -1
+          (cd "$RUNNER_TEMP/arm-a" && cargo test -p mantle --locked --test native --no-run)
+          cargo test -p mantle --locked --test native --no-run
+      - name: Alternating rounds on 0-1 beside 2 busy loops
         run: |
           set +e
           out=$RUNNER_TEMP/out
           mkdir -p "$out"
           for _ in 1 2; do taskset -c 0-1 sh -c 'while :; do :; done' & done
-          for i in 1 2 3 4 5 6; do
-            diag=$out/round-$i-diag
-            mkdir -p "$diag"
-            start=$(date +%s)
-            MANTLE_DIAG_DIR=$diag taskset -c 0-1 cargo test -q -p mantle --locked --test native -- --nocapture > "$out/round-$i.log" 2>&1
-            code=$?
-            echo "shard ${{ matrix.shard }} round $i exit $code seconds $(( $(date +%s) - start )) load $(cut -d' ' -f1-3 /proc/loadavg)" | tee -a "$out/rounds.txt"
-            cat "$diag"/*.log 2>/dev/null | grep -h -E 'lost|slowed|refused|slowdown|unsent|job lost|Stalled|Budget|Busy' | sort -n | sed "s/^/  round $i /" | head -40 | tee -a "$out/rounds.txt"
+          for i in 1 2 3 4; do
+            for arm in a b; do
+              if [ "$arm" = a ]; then dir=$RUNNER_TEMP/arm-a; else dir=$PWD; fi
+              diag=$out/$arm-$i-diag
+              mkdir -p "$diag"
+              start=$(date +%s)
+              (cd "$dir" && MANTLE_DIAG_DIR=$diag taskset -c 0-1 cargo test -q -p mantle --locked --test native -- --nocapture > "$out/$arm-$i.log" 2>&1)
+              code=$?
+              cut=$(cat "$diag"/*.log 2>/dev/null | grep -a -c 'run true .* lost Stalled')
+              done_runs=$(cat "$diag"/*.log 2>/dev/null | grep -a -c 'run true .* replied Done')
+              lost=$(cat "$diag"/*.log 2>/dev/null | grep -a -c 'job lost .* pending [1-9]')
+              echo "shard ${{ matrix.shard }} round $i arm $arm exit $code seconds $(( $(date +%s) - start )) runs-cut $cut runs-done $done_runs jobs-lost-pending $lost load $(cut -d' ' -f1-3 /proc/loadavg)" | tee -a "$out/rounds.txt"
+            done
           done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: notes-native-${{ matrix.shard }}
+          name: notes-ab-${{ matrix.shard }}
           path: ${{ runner.temp }}/out
           retention-days: 7

@@ -305,4 +305,9 @@ pub(crate) struct Exchange<K> {
     /// of its own and none of the pool's, and is not one of its peer's open ones in the pool's
     /// accounts (`crate::pool`).
     pub(crate) parked: bool,
+    /// A peer's exchange whose owner said its work for it advanced since its connection's last note
+    /// ([`crate::Endpoint::working`]): the next note names it.
+    pub(crate) vouch: bool,
+    /// An exchange this side asked: when its peer last named it in a note, its owner at work on it.
+    pub(crate) vouched: Option<Instant>,
 }

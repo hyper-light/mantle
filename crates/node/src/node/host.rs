@@ -785,6 +785,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         {
             return self.fail_job(at, Status::SlowDown);
         }
+        // One of its own asks answered: the job's work moved, which its asker is told
+        // (`hyper_transport::Endpoint::working`, research/77 D1).
+        if let Some(Job {
+            door: Door::Exchange(exchange),
+            work,
+            ..
+        }) = self.jobs.get(at)
+            && !matches!(work, Work::Draining(_))
+        {
+            self.driver.endpoint().working(*exchange);
+        }
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(());
         };
@@ -3165,6 +3176,21 @@ enum Outcome {
     Command(CommandOutcome),
     Read(ReadOutcome),
     Chunk(ChunkOutcome),
+}
+
+/// The exchange of the job that waits on chunk ask `ask`, if it came in on one.
+pub(super) fn waiting_on_chunk(jobs: &[Job], ask: u64) -> Option<ExchangeId> {
+    jobs.iter().find_map(|job| match job.door {
+        Door::Exchange(exchange)
+            if job
+                .pending
+                .iter()
+                .any(|(pending, _)| matches!(pending, Pending::Chunk(asked) if *asked == ask)) =>
+        {
+            Some(exchange)
+        }
+        Door::Exchange(_) | Door::Local(_) => None,
+    })
 }
 
 /// A put's driver's answer for what its request came to.

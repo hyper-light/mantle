@@ -251,6 +251,22 @@ impl Carry {
             *had = false;
         }
     }
+    /// The peer said, at `vouched`, that its owner is at work on the exchange (mantle research/77
+    /// D1): the wait starts again from that note, and a request the peer has whole (`acknowledged`)
+    /// is waited on for that window alone, its peer's work stated, not for one more to answer in.
+    /// A window that brings neither another note nor what it is judged on without one ends it.
+    pub(crate) fn vouched(
+        &mut self,
+        vouched: Instant,
+        moved: Moved,
+        backlog: u64,
+        acknowledged: bool,
+    ) {
+        self.hold(vouched, moved, backlog);
+        if let Phase::Asking { had, .. } = &mut self.phase {
+            *had = acknowledged;
+        }
+    }
     /// The wait of an exchange queued for a stream restarts from `since`, when its connection's credit queue last
     /// advanced (policy C: a queued exchange is judged on whether its queue moves, not on its own age).
     pub(crate) fn hold_from(&mut self, since: Instant, moved: Moved, backlog: u64) {

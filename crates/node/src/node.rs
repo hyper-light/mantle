@@ -700,6 +700,9 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     storage: Storage,
     /// The storage's puts and gets answered, taken each turn (kept for its allocation).
     stored: Vec<Done>,
+    /// The volumes whose writers answered a put since the last turn took them, each once: at most
+    /// the node's volumes.
+    volumes_moved: Vec<usize>,
     /// The chunk puts and gets this node asked of its peers and not yet answered; at most
     /// `chunk_asks` of them.
     chunks_out: Vec<ChunkOut>,
@@ -1028,6 +1031,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             waker,
             storage: std::mem::take(&mut settings.storage),
             stored: Vec::new(),
+            volumes_moved: Vec::new(),
             chunks_out: Vec::new(),
             chunk_asks: settings.chunk_asks,
             next_chunk: 0,
@@ -1613,10 +1617,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         if self.storage.out() > 0 {
             let Self {
-                storage, stored, ..
+                storage,
+                stored,
+                volumes_moved,
+                ..
             } = self;
             poll_fn(|context| {
-                storage.poll_done(context, stored);
+                storage.poll_done(context, stored, volumes_moved);
                 Poll::Ready(())
             })
             .await;
@@ -2407,6 +2414,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(receiving) = self.receiving.get_mut(at) else {
             return Ok(());
         };
+        // A chunk a job asked of a peer: each piece of it is the job's own work moving, which the
+        // job's asker is told (research/77 D1), a get paused between blocks among them.
+        let waiting = match receiving.what {
+            Arriving::ChunkBytes(asked) => host::waiting_on_chunk(&self.jobs, asked),
+            _ => None,
+        };
         while receiving.read < receiving.body {
             let Ok(mut into) = endpoint.reserve(receiving.what.class(), PIECE) else {
                 return Ok(());
@@ -2416,6 +2429,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let len = u64::try_from(piece.len()).unwrap_or(u64::MAX);
             receiving.read = receiving.read.saturating_add(len);
             self.moved = self.moved.saturating_add(len);
+            if len > 0
+                && let Some(job) = waiting
+            {
+                endpoint.working(job);
+            }
             if matches!(receiving.what, Arriving::ChunkPut { .. }) {
                 self.chunks_received = self.chunks_received.saturating_add(len);
             }
@@ -2896,7 +2914,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         let mut stored = std::mem::take(&mut self.stored);
         poll_fn(|context| {
-            self.storage.poll_done(context, &mut stored);
+            self.storage
+                .poll_done(context, &mut stored, &mut self.volumes_moved);
             Poll::Ready(())
         })
         .await;
@@ -2935,6 +2954,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
         }
         self.stored = stored;
+        // A peer's chunk still waiting on a volume whose writer answered a put is waiting on work
+        // that moves: its asker is told so, and judges the transfer by it rather than by its clock
+        // (research/77 D1). A volume whose device stalls answers nothing, and says nothing.
+        let endpoint = self.driver.endpoint();
+        for exchange in self.storage.served_on(&self.volumes_moved) {
+            endpoint.working(exchange);
+        }
+        self.volumes_moved.clear();
         Ok(())
     }
 

@@ -33,6 +33,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
+use hyper_quic::coding::Codec;
 use hyper_quic::congestion::Congestion;
 use hyper_quic::rustls::pki_types::CertificateDer;
 use hyper_quic::{
@@ -51,7 +52,7 @@ use crate::credit::{
 use crate::deadlines;
 use crate::exchange::{End, Exchange, In, Incoming, Out, Outgoing, Pushed, abandon, pull, push};
 use crate::frame::{PREFIX_BYTES, Prefix};
-use crate::lane::{LaneIn, LaneOut, OPENER_BYTES, Reading, opened};
+use crate::lane::{LaneIn, LaneOut, NotesOut, OPENER_BYTES, Reading, VARINT_MOST, opened};
 use crate::pool::{Pool, PoolStats, Share};
 use crate::progress::{Carry, Delivered, LEAST_PROGRESS, Moved, Progress};
 use crate::receive::Receive;
@@ -60,7 +61,9 @@ use crate::state::{StateAccount, StateStats};
 use crate::tally::{Table, Tally};
 use crate::timing::PeerTiming;
 use crate::tls::Tls;
-use crate::{Authenticated, Classes, Directory, Epoch, Event, ExchangeId, PeerId, Refusal};
+use crate::{
+    Authenticated, Classes, Directory, Epoch, Event, ExchangeId, NOTES_LANE, PeerId, Refusal,
+};
 
 /// The bounds an endpoint keeps; every one is the owner's configuration, derived by its own law
 /// (CLAUDE.md §1: no arbitrary numbers).
@@ -209,7 +212,8 @@ impl Limits {
         };
         transport
             .max_concurrent_bidi_streams(VarInt::from_u32(handshake))
-            .max_concurrent_uni_streams(VarInt::from_u32(self.lanes_per_peer))
+            // The owner's lanes, and the endpoint's notes to the peer beside them.
+            .max_concurrent_uni_streams(VarInt::from_u32(self.lanes_per_peer.saturating_add(1)))
             .stream_receive_window(varint(stream)?)
             .receive_window(varint(window)?)
             .send_window(self.window_ceiling)
@@ -328,10 +332,19 @@ pub struct Stats {
     /// The connections' state as charged, learned from what the owner observes
     /// ([`Endpoint::observe`]).
     pub state: StateStats,
+    /// Notes made for peers, each naming the exchanges served whose owners said since the last that
+    /// they were at work on them ([`Endpoint::working`]).
+    pub notes_made: u64,
+    /// Exchanges this side asked that a peer's note named, its owner at work on them.
+    pub notes_heard: u64,
 }
 
 /// The QUIC application error code a connection closes with when it ends without a fault.
 const CLOSE_NORMAL: u32 = 0;
+/// Notes a connection may send in a serve period: three, so that two lost to the path still leave
+/// one inside the least period an asker gives, as RFC 9000 §10.1 makes the idle timeout three
+/// probe timeouts (mantle research/77 D1, reviewed by hyper-raft's agent 2026-10-31).
+const NOTES_A_PERIOD: u32 = 3;
 /// The kinds of event an exchange can have waiting at once, each at most once: its head
 /// (`Request` or `Reply`, once in its life), `BodyReady` and `Writable` (each replaced by none
 /// while one waits), and `Refused` (once, as it ends).
@@ -430,6 +443,8 @@ struct Conn<R> {
     unread_ended: Option<Instant>,
     lanes_out: Vec<LaneOut>,
     lanes_in: Vec<LaneIn>,
+    /// Its notes to the peer, of the exchanges it serves whose owners are at work ([`NOTES_LANE`]).
+    notes: NotesOut,
     window: Window,
     /// The stream bytes read on it, by class.
     delivered: Delivered,
@@ -1274,10 +1289,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             Some(Some(conn)) => {
                 let quic = conn.quic.poll_timeout();
                 let waits = self.core.exchanges.first_due(key);
-                match (quic, waits) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (a, b) => a.or(b),
-                }
+                let note = self.core.note_due(conn);
+                [quic, waits, note].into_iter().flatten().min()
             }
             _ => None,
         };
@@ -1295,11 +1308,15 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         if !self.core.oracle {
             return;
         }
+        let core = &self.core;
         let connections = self
             .conns
             .iter_mut()
             .flatten()
-            .filter_map(|conn| conn.quic.poll_timeout())
+            .filter_map(|conn| {
+                let quic = conn.quic.poll_timeout();
+                [quic, core.note_due(conn)].into_iter().flatten().min()
+            })
             .min();
         let exchanges = self
             .core
@@ -1583,6 +1600,20 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         });
     }
 
+    /// Its owner is at work on `exchange`, a peer's: its own work for it advanced since it last said
+    /// so, an ask of its own answered or a byte of its reply made. The peer hears it in the next
+    /// note on their connection ([`NOTES_LANE`]), at most a beat apart, a third of the serve period,
+    /// and its asker judges the exchange by it rather than by its clock (mantle research/77 D1).
+    /// Said as work moves and never on a timer, a stuck owner falls silent and its asker gives it
+    /// up as before. An exchange this side asked, or one whose reply was written whole, is passed
+    /// over.
+    pub fn working(&mut self, exchange: ExchangeId) {
+        let _ = self.with_exchange(exchange, |core, conn, id| {
+            core.vouch(conn, id);
+            Ok(())
+        });
+    }
+
     /// Bytes for a message of `class`, from the endpoint's budget: what the owner reads bodies
     /// into.
     pub fn reserve(&mut self, class: C::Class, bytes: u64) -> Result<Reservation, Refusal> {
@@ -1657,6 +1688,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         kind: C::Kind,
         frame: &[u8],
     ) -> Result<(), Refusal> {
+        if lane == crate::NOTES_LANE {
+            return Err(Refusal::Lanes);
+        }
         let class = C::class_of(kind, self.core.role).ok_or(Refusal::Kind)?;
         if length(frame.len()) > C::frame_bound(class) {
             return Err(Refusal::FrameBound);
@@ -1896,8 +1930,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     /// control holds the peer at the window this side granted (the socket's room). A consumer's
     /// backpressure: a node whose subscribers cannot take more holds the publishers that feed them,
     /// rather than queueing what they send. A lane the peer has not yet opened is held from its
-    /// opening, on this connection or a later one. Refused `Lanes` past the lanes a peer may open.
+    /// opening, on this connection or a later one. Refused `Lanes` past the lanes a peer may open,
+    /// and for its notes' lane ([`crate::NOTES_LANE`]), always read.
     pub fn hold_lane(&mut self, peer: PeerId, lane: crate::LaneId) -> Result<(), Refusal> {
+        if lane == crate::NOTES_LANE {
+            return Err(Refusal::Lanes);
+        }
         let bound = usize::try_from(self.core.limits.lanes_per_peer).unwrap_or(usize::MAX);
         let entry = self
             .core
@@ -2258,6 +2296,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             unread: 0,
             unread_ended: None,
             lanes_out: Vec::new(),
+            notes: NotesOut::default(),
             lanes_in: Vec::new(),
             window: Window::new(initial, limits.window_ceiling),
             delivered: Delivered::new(C::RANKS),
@@ -3056,6 +3095,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             ended: false,
             credit_settled: false,
             parked: false,
+            vouch: false,
+            vouched: None,
         };
         match self.exchanges.insert(exchange) {
             Ok(id) => {
@@ -3453,6 +3494,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             ended: false,
             credit_settled: false,
             parked: false,
+            vouch: false,
+            vouched: None,
         };
         let id = self.exchanges.insert(exchange)?;
         self.exchanges.place(id, conn.exchanges.len());
@@ -4048,8 +4091,112 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             self.judge(now, conn, *id);
         }
         self.ids = ids;
+        self.flush_notes(now, conn);
         self.flush_lanes(conn);
         self.tune(now, conn);
+    }
+
+    /// Exchange `id`'s owner is at work on it ([`Endpoint::working`]): the next note names it, if it
+    /// is a peer's and its reply is not yet written whole.
+    fn vouch(&mut self, conn: &mut Conn<C::Role>, id: u64) {
+        let Some(exchange) = self.exchanges.get_mut(id) else {
+            return;
+        };
+        if exchange.opened
+            || exchange.ended
+            || exchange.stream.is_none()
+            || exchange.out.state == Out::Finished
+        {
+            return;
+        }
+        exchange.vouch = true;
+        conn.notes.pending = true;
+    }
+
+    /// A beat between notes on a connection: the serve period, the least any asker of this
+    /// endpoint's peers gives an exchange, over [`NOTES_A_PERIOD`].
+    fn beat(&self) -> Duration {
+        self.serve
+            .period()
+            .checked_div(NOTES_A_PERIOD)
+            .unwrap_or_default()
+    }
+
+    /// When `conn`'s next note is due: once an owner vouched since the last was made and that one
+    /// is written whole, a beat after it was made.
+    fn note_due(&self, conn: &Conn<C::Role>) -> Option<Instant> {
+        let notes = &conn.notes;
+        if !notes.pending || notes.written < notes.note.len() {
+            return None;
+        }
+        Some(notes.made.map_or(self.now, |made| {
+            made.checked_add(self.beat()).unwrap_or(made)
+        }))
+    }
+
+    /// Make `conn`'s note when it is due, naming every exchange vouched for since the last, and
+    /// write it as credit allows; the next is made only once it is written whole.
+    fn flush_notes(&mut self, now: Instant, conn: &mut Conn<C::Role>) {
+        if conn.notes.written >= conn.notes.note.len() {
+            if self.note_due(conn).is_none_or(|due| due > now) {
+                return;
+            }
+            let bound = usize::try_from(self.limits.streams_per_connection)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(VARINT_MOST);
+            conn.notes.note.clear();
+            conn.notes.written = 0;
+            if conn.notes.note.try_reserve(bound).is_err() {
+                return;
+            }
+            for &id in &conn.exchanges {
+                let Some(exchange) = self.exchanges.get_mut(id) else {
+                    continue;
+                };
+                if !std::mem::replace(&mut exchange.vouch, false) {
+                    continue;
+                }
+                if let Some(stream) = exchange.stream
+                    && !exchange.ended
+                    && exchange.out.state != Out::Finished
+                {
+                    VarInt::from(stream).encode(&mut conn.notes.note);
+                }
+            }
+            conn.notes.pending = false;
+            conn.notes.made = Some(now);
+            if !conn.notes.note.is_empty() {
+                self.stats.notes_made = self.stats.notes_made.saturating_add(1);
+            }
+        }
+        if conn.notes.note.is_empty() {
+            return;
+        }
+        let stream = match conn.notes.stream {
+            Some(stream) => stream,
+            None => {
+                let Some(stream) = conn.quic.streams().open(Dir::Uni) else {
+                    return;
+                };
+                conn.notes.stream = Some(stream);
+                stream
+            }
+        };
+        let opener = crate::lane::opener(NOTES_LANE);
+        if conn.notes.opener_written < opener.len() {
+            let rest = opener.get(conn.notes.opener_written..).unwrap_or(&[]);
+            let Pushed::Took(took) = push(&mut conn.quic, stream, rest, u64::MAX) else {
+                return;
+            };
+            conn.notes.opener_written = conn.notes.opener_written.saturating_add(took);
+            if conn.notes.opener_written < opener.len() {
+                return;
+            }
+        }
+        let rest = conn.notes.note.get(conn.notes.written..).unwrap_or(&[]);
+        if let Pushed::Took(took) = push(&mut conn.quic, stream, rest, u64::MAX) {
+            conn.notes.written = conn.notes.written.saturating_add(took);
+        }
     }
 
     fn wake(&mut self, conn: &mut Conn<C::Role>, id: u64) {
@@ -4153,6 +4300,18 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                     unread_change = -1;
                 }
                 _ => {}
+            }
+            // Its peer's owner said within this window that it is at work on it
+            // (`Endpoint::working`): the peer's statement, not the clock, judges it, its wait
+            // starting again from the note (mantle research/77 D1). Its notes stopping, a window
+            // with no note is judged as before.
+            if let Some(vouched) = exchange
+                .vouched
+                .filter(|&vouched| vouched > exchange.carry.started())
+            {
+                let acknowledged = exchange.out.acked;
+                exchange.carry.vouched(vouched, at, backlog, acknowledged);
+                return Ok(());
             }
             if Self::ours_to_move(exchange, peer_takes) {
                 exchange.carry.hold(now, at, backlog);
@@ -4521,9 +4680,11 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         }
     }
 
-    /// A peer opened a lane.
+    /// A peer opened a lane: its owner's, or its notes ([`crate::NOTES_LANE`]) beside them.
     fn lane_from(&mut self, conn: &mut Conn<C::Role>, stream: StreamId) {
-        let bound = usize::try_from(self.limits.lanes_per_peer).unwrap_or(usize::MAX);
+        let bound = usize::try_from(self.limits.lanes_per_peer)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1);
         if conn.lanes_in.len() >= bound {
             self.stats.streams_refused = self.stats.streams_refused.saturating_add(1);
             let _ = conn
@@ -4576,6 +4737,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         match state {
             Reading::Opener => {
                 let advanced = lane_opener(conn, at)?;
+                self.lane_named(conn, at)?;
                 // The lane named itself: held from now if its owner holds its peer's lane of that name.
                 let opened = conn
                     .lanes_in
@@ -4600,7 +4762,80 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             Reading::Frame => self.lane_frame(conn, at),
             Reading::Skipping => self.lane_skip(conn, at),
             Reading::Reserving => self.lane_reserve(conn, at),
+            Reading::Notes => self.lane_notes(conn, at),
         }
+    }
+
+    /// One step of the peer's notes ([`NOTES_LANE`]): a stream id's first byte, or the rest its
+    /// length names, read; once whole, the exchange this side asked on that stream is vouched for,
+    /// its peer's owner at work on it. A stream with no such exchange, one given up and asked again
+    /// on a stream of its own, is passed over, so a late note revives no attempt given up.
+    fn lane_notes(&mut self, conn: &mut Conn<C::Role>, at: usize) -> Result<bool, Refusal> {
+        let lane = conn.lanes_in.get_mut(at).ok_or(Refusal::Lanes)?;
+        let whole = |first: u8| 1usize << (first >> 6);
+        let want = match lane.prefix.first() {
+            Some(&first) if lane.filled > 0 => whole(first).saturating_sub(lane.filled),
+            _ => 1,
+        };
+        let (got, end) = pull(&mut conn.quic, lane.stream, want, |bytes| {
+            let from = lane.filled;
+            if let Some(into) = lane.prefix.get_mut(from..from.saturating_add(bytes.len())) {
+                into.copy_from_slice(bytes);
+            }
+            lane.filled = from.saturating_add(bytes.len());
+        });
+        conn.window.consumed(length(got));
+        conn.delivered.add(0, length(got));
+        lane_ended(end)?;
+        if got == 0 {
+            return Ok(false);
+        }
+        let len = lane.prefix.first().map_or(1, |&first| whole(first));
+        if lane.filled < len {
+            return Ok(true);
+        }
+        lane.filled = 0;
+        let mut bytes = lane.prefix.get(..len).ok_or(Refusal::Corrupt)?;
+        let stream = StreamId::from(VarInt::decode(&mut bytes).map_err(|_| Refusal::Corrupt)?);
+        let now = self.now;
+        if let Some(id) = self.exchange_on(conn, stream)
+            && let Some(exchange) = self.exchanges.get_mut(id)
+            && exchange.opened
+            && !exchange.ended
+        {
+            exchange.vouched = Some(now);
+            self.stats.notes_heard = self.stats.notes_heard.saturating_add(1);
+        }
+        Ok(true)
+    }
+
+    /// Lane `at` of `conn`, once its opening named it, is within what a peer may open: one notes
+    /// lane ([`crate::NOTES_LANE`]), and its owner's lanes within `Limits::lanes_per_peer`.
+    fn lane_named(&self, conn: &Conn<C::Role>, at: usize) -> Result<(), Refusal> {
+        let Some(lane) = conn
+            .lanes_in
+            .get(at)
+            .filter(|lane| lane.state != Reading::Opener)
+        else {
+            return Ok(());
+        };
+        let notes = lane.lane == crate::NOTES_LANE;
+        let alike = conn
+            .lanes_in
+            .iter()
+            .filter(|other| {
+                other.state != Reading::Opener && (other.lane == crate::NOTES_LANE) == notes
+            })
+            .count();
+        let bound = if notes {
+            1
+        } else {
+            usize::try_from(self.limits.lanes_per_peer).unwrap_or(usize::MAX)
+        };
+        if alike > bound {
+            return Err(Refusal::Lanes);
+        }
+        Ok(())
     }
 
     /// Whether lane `at` of `conn` has seats for its next frame: one of its window, the core's
@@ -4842,7 +5077,11 @@ fn lane_opener<R>(conn: &mut Conn<R>, at: usize) -> Result<bool, Refusal> {
     }
     lane.lane = opened(lane.opener)?;
     lane.filled = 0;
-    lane.state = Reading::Prefix;
+    lane.state = if lane.lane == NOTES_LANE {
+        Reading::Notes
+    } else {
+        Reading::Prefix
+    };
     Ok(true)
 }
 

@@ -101,9 +101,9 @@ D1. Whether a server is at work is stated, not inferred from latency (F1, F5): w
 exchange's owner has work moving for it, it says so at a beat the asker's judgement counts, and an
 asker cuts only an exchange whose statements stopped or a connection that died ([7]). A server stating
 nothing, a lost request among them, is given up within a period of its last statement, as one that
-never made one is. This needs hyper-transport, which
-mantle shares with focal and slates; proposed to its maintainers 2026-10-29 and reviewed 2026-10-31
-(below), awaiting the owner's word.
+never made one is. This needs hyper-transport, which mantle shares with focal and slates: proposed to
+its maintainers 2026-10-29, reviewed 2026-10-31 (below), and built that day on hyper-raft branch
+`progress-notes` and in mantle's node on branch `progress-notes`; it lands on the owner's word.
 
 D2. Every request carries its deadline as time remaining, and every node asks its peers within what
 remains less its own share (F2; node.md §5.4: "A request's deadline is its client's patience");

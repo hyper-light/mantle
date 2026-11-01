@@ -1588,7 +1588,14 @@ less than a datagram moved, or after the peer had the whole request and a period
    seen, since sending more often wastes "unacceptable power usage for power-constrained
    (mobile) devices" (research/30 §4.7, D8).
 2. **Request progress.** An exchange waits while its bytes move, as `carried` does, within its
-   caller's budget.
+   caller's budget, or while its server says its work for it moves (hyper-transport's notes,
+   `Endpoint::working`, at most one a beat, a third of the serve period; research/77 D1). A node
+   says so as its own work moves, never on a timer: for a request's job, at each of its own asks
+   answered and each piece of a chunk it asked of a peer arriving, so a get paused between blocks
+   while a peer reads its chunk is not cut; for a peer's chunk, at each put that the volume it waits
+   on answers. A volume whose device stalls answers nothing, its chunks' senders hear nothing, and
+   they give the transfers up at their period as before. Waiting out a stall the request can afford
+   is the request's deadline carried (research/77 D2).
 3. **Memory and work held by a stalled upload.** When a native upload makes no progress for the
    connection's idle timeout, or the node needs its reservation (least progress for longest,
    §4.3), the gateway closes its current run at the last whole segment, commits it as a

@@ -941,6 +941,160 @@ fn a_peer_that_stops_answering_is_given_up_within_its_period() {
     assert_eq!(net.a.exchange_tail(2, GRANULARITY), Some(tail * 2));
 }
 
+/// What head-only asks of `seeds` came to, of a server that thinks `think` on each and says it is at
+/// work on those of `vouch` (`Endpoint::working`) until `until` after the asks: the asker's records,
+/// how long after the asks the last ended, and the asker's and the server's counts.
+fn asked_of_a_thinking_server(
+    seeds: &[u8],
+    think: Duration,
+    vouch: &[u8],
+    until: Option<Duration>,
+) -> (
+    Vec<Asked>,
+    Duration,
+    hyper_transport::Stats,
+    hyper_transport::Stats,
+) {
+    asked_of_a_working_server(seeds, None, (think, None), vouch, until)
+}
+
+/// As [`asked_of_a_thinking_server`], each ask with a body of `body` bytes, which the server
+/// answers with one as long, and pausing it as `pause` says (`Server::pause_body`).
+fn asked_of_a_working_server(
+    seeds: &[u8],
+    body: Option<u64>,
+    (think, pause): (Duration, Option<(u64, Duration)>),
+    vouch: &[u8],
+    until: Option<Duration>,
+) -> (
+    Vec<Asked>,
+    Duration,
+    hyper_transport::Stats,
+    hyper_transport::Stats,
+) {
+    let pair = Pair::new();
+    let mut net = connected::<Mantle, Mantle>(&pair, limits(), 256 << 20);
+    let (mut asker, mut server) = (Asker::new(), Server::new());
+    server.think = think;
+    server.pause_body = pause;
+    server.vouch_seeds = vouch.iter().map(|&seed| u64::from(seed)).collect();
+    let began = net.now;
+    server.vouch_until = until.map(|until| began + until);
+    for &seed in seeds {
+        asker
+            .ask(
+                &mut net.a,
+                net.now,
+                2,
+                (Kind::Get, Class::Request),
+                seed,
+                body,
+                PERIOD,
+            )
+            .unwrap();
+    }
+    for _ in 0..TURNS {
+        net.exchange();
+        asker.drive(&mut net.a);
+        server.now = Some(net.now);
+        server.serve(&mut net.b);
+        if asker.finished() {
+            break;
+        }
+        net.exchange();
+        net.advance_within(Duration::from_millis(10));
+    }
+    assert!(asker.finished(), "{:?}", asker.asked);
+    (
+        asker.asked.clone(),
+        net.now - began,
+        net.a.stats(),
+        net.b.stats(),
+    )
+}
+
+/// A server at work past its asker's period says so, and is waited for until it answers; one that
+/// says nothing is given up as before (mantle research/77 D1). Do: ask head-only of a server that
+/// thinks five periods, saying at each turn that it is at work, and again of one that does not.
+/// Expect: answered after the five periods, its notes at most one a beat; and refused `Stalled`
+/// within two periods.
+#[test]
+fn a_server_that_says_it_is_at_work_is_waited_for_past_the_period() {
+    let think = PERIOD * 5;
+    let (asked, took, a, b) = asked_of_a_thinking_server(&[1], think, &[1], None);
+    assert_eq!(asked[0].refused, None, "{:?}", asked[0]);
+    assert!(took >= think, "{took:?}");
+    let beat = limits().serve_period / 3;
+    let most = u64::try_from(took.as_nanos() / beat.as_nanos()).unwrap() + 1;
+    assert!(
+        b.notes_made >= 1 && b.notes_made <= most,
+        "{} notes in {took:?}",
+        b.notes_made
+    );
+    assert!(a.notes_heard >= 1);
+    let (asked, took, a, b) = asked_of_a_thinking_server(&[1], think, &[], None);
+    assert_eq!(asked[0].refused, Some((Refusal::Stalled, false)));
+    assert!(took <= PERIOD * 2, "{took:?}");
+    assert_eq!((b.notes_made, a.notes_heard), (0, 0));
+}
+
+/// A server whose notes stop is given up within a period of the last: silence past the bound is
+/// suspicion, and a note keeps an exchange through the window it starts alone (mantle research/77
+/// D1). Do: the server thinks ten periods and says it is at work through the first three. Expect:
+/// refused `Stalled` after the three periods, and before five: the last note comes within a beat
+/// of the third, a third of a period, and the window it starts is the exchange's last. Kept a
+/// window more past the note, as one the peer was just given, it was refused at six.
+#[test]
+fn a_server_whose_notes_stop_is_given_up_within_a_period_of_the_last() {
+    let (asked, took, ..) = asked_of_a_thinking_server(&[1], PERIOD * 10, &[1], Some(PERIOD * 3));
+    assert_eq!(asked[0].refused, Some((Refusal::Stalled, false)));
+    assert!(took >= PERIOD * 3 && took < PERIOD * 5, "{took:?}");
+}
+
+/// A note keeps only the exchanges it names: one beside an exchange vouched for, on the same
+/// connection, is given up as it would be alone, so a late note for an attempt its asker gave up,
+/// on a stream of its own, keeps no other attempt (mantle research/77 D1). Do: ask two of a server
+/// that thinks five periods on both and says it is at work on the first. Expect: the first
+/// answered, the second refused `Stalled`.
+#[test]
+fn a_note_keeps_only_the_exchanges_it_names() {
+    let (asked, ..) = asked_of_a_thinking_server(&[1, 2], PERIOD * 5, &[1], None);
+    assert_eq!(asked[0].refused, None, "{:?}", asked[0]);
+    assert_eq!(asked[1].refused, Some((Refusal::Stalled, false)));
+}
+
+/// A body paused between blocks while its server's own work runs is waited for while the server
+/// says so: the case traced most, a get whose next block waits on a chunk from another node
+/// (mantle measurements/2026-10-29). Do: the server answers a 1 MiB ask at once with as much, writes
+/// 256 KiB of it and pauses four periods before the rest, once saying it is at work at each turn
+/// and once not. Expect: read whole after the pause; and refused `Stalled` within it.
+#[test]
+fn a_body_paused_while_its_server_says_it_is_at_work_is_waited_for() {
+    let pause = Some((256 << 10, PERIOD * 4));
+    let (asked, took, ..) =
+        asked_of_a_working_server(&[1], Some(1 << 20), (Duration::ZERO, pause), &[1], None);
+    assert_eq!(asked[0].refused, None, "{:?}", asked[0]);
+    assert_eq!(asked[0].read, 1 << 20);
+    assert!(took >= PERIOD * 4, "{took:?}");
+    let (asked, took, ..) =
+        asked_of_a_working_server(&[1], Some(1 << 20), (Duration::ZERO, pause), &[], None);
+    assert_eq!(asked[0].refused, Some((Refusal::Stalled, false)));
+    assert!(took < PERIOD * 4, "{took:?}");
+}
+
+/// The notes' lane is the endpoint's own: its owner's frame on it, or a hold of it, is refused.
+#[test]
+fn the_notes_lane_is_refused_to_its_owner() {
+    let pair = Pair::new();
+    let mut net = connected::<Mantle, Mantle>(&pair, limits(), 256 << 20);
+    let notes = hyper_transport::NOTES_LANE;
+    assert_eq!(
+        net.a.send_frame(2, notes, Kind::Append, b"x"),
+        Err(Refusal::Lanes)
+    );
+    assert_eq!(net.a.hold_lane(2, notes), Err(Refusal::Lanes));
+}
+
 /// The peer's time to answer begins when it has the request (focal's audit F38), not when this side
 /// sent it: a request that waits in a bottleneck's queue for longer than a period after it was sent
 /// is answered by a peer that takes four fifths of a period once it has it. Counted from the send,

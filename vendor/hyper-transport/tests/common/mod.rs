@@ -871,6 +871,8 @@ struct Served {
     reply: u64,
     /// When the request was whole, by the server's `now`.
     whole: Option<Instant>,
+    /// When its body's pause began, by the server's `now` ([`Server::pause_body`]).
+    paused: Option<Instant>,
 }
 
 /// A node that answers every request: it reads the request's body, checking every byte, and
@@ -884,6 +886,15 @@ pub struct Server {
     pub hold_replies: bool,
     /// How long the server takes to answer once it has a request whole, by `now`.
     pub think: Duration,
+    /// While it thinks on a request whose seed is one of these, it says at each turn that it is at
+    /// work on it (`Endpoint::working`): its work advancing, as an owner's own asks answering do.
+    pub vouch_seeds: Vec<u64>,
+    /// It says so no more from this, by `now`: an owner whose work stopped moving.
+    pub vouch_until: Option<Instant>,
+    /// Once this much of a reply's body is written, it writes no more of it for this long, by
+    /// `now`, saying meanwhile that it is at work as it does while it thinks: a body paused between
+    /// blocks while its owner's own asks run.
+    pub pause_body: Option<(u64, Duration)>,
     /// A request body longer than this is never read (0: every body is read): a peer that holds
     /// a stream it accepted, its bytes in its buffer and none of its credit given back.
     pub unread_above: u64,
@@ -911,6 +922,9 @@ impl Server {
             hold_bulk: false,
             hold_replies: false,
             think: Duration::ZERO,
+            vouch_seeds: Vec::new(),
+            vouch_until: None,
+            pause_body: None,
             unread_above: 0,
             pace: None,
             paced: None,
@@ -963,6 +977,7 @@ impl Server {
                     written: 0,
                     reply: body.unwrap_or(0),
                     whole: None,
+                    paused: None,
                 });
             }
             Event::Frame {
@@ -993,6 +1008,50 @@ impl Server {
         let mut served = std::mem::take(&mut self.served);
         served.retain_mut(|exchange| !self.advance(node, exchange));
         self.served = served;
+    }
+
+    /// Says it is at work on `served` if it vouches for it now (`Endpoint::working`).
+    fn vouch<C: Classes<Kind = Kind, Class = Class, Role = Role>>(
+        &self,
+        node: &mut Node<C>,
+        served: &Served,
+    ) {
+        if self.vouches(served) {
+            node.working(served.exchange);
+        }
+    }
+
+    /// The most of `served`'s reply body to write now, a piece at most: none while its body is
+    /// paused ([`Server::pause_body`]), saying meanwhile that it is at work as it vouches, and up
+    /// to the pause where the pause is still ahead.
+    fn piece_to_write<C: Classes<Kind = Kind, Class = Class, Role = Role>>(
+        &self,
+        node: &mut Node<C>,
+        served: &mut Served,
+    ) -> Option<usize> {
+        let left = (served.reply - served.written).min(PIECE as u64);
+        let Some((after, pause)) = self.pause_body else {
+            return Some(left as usize);
+        };
+        if served.written < after {
+            return Some(left.min(after - served.written) as usize);
+        }
+        if let Some(now) = self.now
+            && now < *served.paused.get_or_insert(now) + pause
+        {
+            self.vouch(node, served);
+            return None;
+        }
+        Some(left as usize)
+    }
+
+    /// Whether it says now that it is at work on `served` ([`Server::vouch_seeds`]).
+    fn vouches(&self, served: &Served) -> bool {
+        let stopped = self
+            .now
+            .zip(self.vouch_until)
+            .is_some_and(|(now, until)| now >= until);
+        self.vouch_seeds.contains(&served.seed) && !stopped
     }
 
     /// The most of a body the server reads now: a piece, or what its pace has left of it.
@@ -1072,6 +1131,7 @@ impl Server {
             }
         }
         if !served.replied && !self.answer_due(served) {
+            self.vouch(node, served);
             return false;
         }
         if !served.replied {
@@ -1084,7 +1144,9 @@ impl Server {
             served.replied = true;
         }
         while served.written < served.reply {
-            let length = (served.reply - served.written).min(PIECE as u64) as usize;
+            let Some(length) = self.piece_to_write(node, served) else {
+                return false;
+            };
             fill(served.seed, served.written, &mut self.piece[..length]);
             match node.write_body(served.exchange, &self.piece[..length]) {
                 Ok(0) => return false,

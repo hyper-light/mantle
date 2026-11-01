@@ -10,6 +10,7 @@
 //! stream for its shard.
 
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use hyper_quic::StreamId;
 
@@ -18,6 +19,10 @@ use crate::{LaneId, Refusal, Reservation};
 
 /// A lane's opening: its identifier and that identifier's CRC-32C, big-endian.
 pub(crate) const OPENER_BYTES: usize = 8;
+
+/// The most bytes a stream id takes in a note: a QUIC variable-length integer's longest encoding,
+/// 8 bytes for its 62 usable bits (RFC 9000 §16, Table 4).
+pub(crate) const VARINT_MOST: usize = 8;
 
 /// The opening of lane `lane`.
 pub(crate) fn opener(lane: LaneId) -> [u8; OPENER_BYTES] {
@@ -69,6 +74,23 @@ impl LaneOut {
     }
 }
 
+/// The notes this side sends a peer on a connection ([`crate::NOTES_LANE`]): at most one a beat,
+/// each the stream ids of the exchanges it serves whose owners said since the last that their work
+/// advanced ([`crate::Endpoint::working`]).
+#[derive(Debug, Default)]
+pub(crate) struct NotesOut {
+    pub(crate) stream: Option<StreamId>,
+    pub(crate) opener_written: usize,
+    /// The note being written, and how much of it was: a note is made only once the last is
+    /// written whole, so a variable-length integer is never cut.
+    pub(crate) note: Vec<u8>,
+    pub(crate) written: usize,
+    /// When the last note was made: the next waits a beat from it.
+    pub(crate) made: Option<Instant>,
+    /// An owner vouched for an exchange since the last note was made.
+    pub(crate) pending: bool,
+}
+
 /// Where a lane from a peer stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Reading {
@@ -83,6 +105,9 @@ pub(crate) enum Reading {
     /// A lossless frame's prefix is read and its bytes wait for the budget to hold them
     /// ([`crate::Classes::lossless`]): the lane is not read until they can be.
     Reserving,
+    /// The peer's notes ([`crate::NOTES_LANE`]): each the id of a stream it serves, a QUIC variable-
+    /// length integer, accumulated in the lane's prefix until whole.
+    Notes,
 }
 
 /// A lane from a peer.

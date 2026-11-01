@@ -425,7 +425,10 @@ A diagnostic build traced the answer under the same load: a chunk sent to a peer
 stalled for seconds (a log flush of 5.9 s) was cut `Lost(Stalled)` at its transfer's progress
 period, and a cell of three with three copies has no other volume for it, so the block was
 `Unplaced`. It is the wait below on the write path, and waits on the same step: the node stating
-its progress. A 100 GB object does not fit this Mac's free space (107 GB a node), refused typed. The boto3 10G case on this Mac
+its progress, built on branch `progress-notes` (hyper-raft's notes under review, the node saying so
+as its asks answer, a job's chunk arrives and a volume answers the puts ahead of a waiting chunk). A
+device that stalls past the period answers nothing and is still cut, which the carried deadline
+(research/77 D2) waits out. A 100 GB object does not fit this Mac's free space (107 GB a node), refused typed. The boto3 10G case on this Mac
 waited two hours in its kills on a read through a founder just started again: a client's first
 exchange has no progress period with nothing measured, and an exchange lost is asked again of the
 same node. Bounding it with the node's serve period cut slow reads during a founder's kill under

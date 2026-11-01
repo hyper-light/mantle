@@ -87,9 +87,16 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `c68032a` (hyper-raft branch `liveness-reachable`: `f5a7dbd` and one commit, made
-for mantle's roll test), with no local delta**, taken by `scripts/snapshot-hyper-raft.py` (Python
-3.11 or later). Its commit changes hyper-liveness alone: `Liveness::reachable`, which the node
+**Every crate at `0a182ae` (hyper-raft branch `progress-notes-reachable`: `c68032a` and the
+progress notes, branch `progress-notes`' `844cad0` on `liveness-reachable`, for mantle's step 2 of
+its waits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py` (Python 3.11 or
+later). Its commit changes hyper-transport alone: `Endpoint::working`, an owner's statement that its
+work for an exchange it serves advanced, sent at most one note a beat a connection on a lane of its
+own, and an asker's exchange named in a note waited on through the window the note starts
+(hyper-raft docs/transport.md §4am; research/77 D1). Before it, every crate was at `c68032a`
+(hyper-raft branch `liveness-reachable`: `f5a7dbd` and one commit, made for mantle's roll test),
+with no local delta, taken by `scripts/snapshot-hyper-raft.py`. Its commit changes hyper-liveness
+alone: `Liveness::reachable`, which the node
 calls as it keys a peer's path, judges a peer never heard from then rather than from the pair's
 attach, and has a stream backed off while nothing came send at its next flush rather than its
 backed-off slot; founders started tens of seconds apart on one CPU suspected each other at once

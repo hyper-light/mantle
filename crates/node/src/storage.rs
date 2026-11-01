@@ -103,7 +103,7 @@ pub struct Storage {
     volumes: Vec<Held>,
     devices: Vec<Device>,
     /// Each put out, with the room it holds of what the node takes and its chunk's length.
-    puts: Vec<(Origin, Answer, u64, u64)>,
+    puts: Vec<(usize, Origin, Answer, u64, u64)>,
     gets: Vec<(usize, ReadId, Origin)>,
     /// Bytes of the chunks peers sent being read or queued at a volume, and the most there may
     /// be: what the volumes' writer queues hold together, past which a volume refuses a put
@@ -311,7 +311,7 @@ impl Storage {
         let answer = held
             .volume
             .put_checked_waking(key, bytes, crc32c, waker.clone())?;
-        self.puts.push((origin, answer, room, len));
+        self.puts.push((slot, origin, answer, room, len));
         Ok(())
     }
 
@@ -363,19 +363,41 @@ impl Storage {
         Ok(holding)
     }
 
+    /// The peers' chunks still out on a volume of `moved`, whose writer answered a put since: the
+    /// work for each moved, as its asker is told (`hyper_transport::Endpoint::working`).
+    pub(crate) fn served_on<'a>(
+        &'a self,
+        moved: &'a [usize],
+    ) -> impl Iterator<Item = ExchangeId> + 'a {
+        self.puts
+            .iter()
+            .filter_map(move |(slot, origin, ..)| match origin {
+                Origin::Exchange(exchange) if moved.contains(slot) => Some(*exchange),
+                Origin::Exchange(_) | Origin::Asked(_) => None,
+            })
+    }
+
     /// Puts and gets out.
     pub(crate) fn out(&self) -> usize {
         self.puts.len().saturating_add(self.gets.len())
     }
 
-    /// Moves the puts and gets answered since the last call into `done`, and registers the task
-    /// `cx` names to be woken when a get still out is answered (a put wakes the waker it was
-    /// given).
-    pub(crate) fn poll_done(&mut self, cx: &mut Context<'_>, done: &mut Vec<Done>) {
+    /// Moves the puts and gets answered since the last call into `done`, each volume whose writer
+    /// answered a put into `moved` once, and registers the task `cx` names to be woken when a get
+    /// still out is answered (a put wakes the waker it was given).
+    pub(crate) fn poll_done(
+        &mut self,
+        cx: &mut Context<'_>,
+        done: &mut Vec<Done>,
+        moved: &mut Vec<usize>,
+    ) {
         let mut at = 0;
-        while let Some((origin, answer, room, len)) = self.puts.get(at) {
+        while let Some((slot, origin, answer, room, len)) = self.puts.get(at) {
             match answer.poll() {
                 Some(answered) => {
+                    if !moved.contains(slot) {
+                        moved.push(*slot);
+                    }
                     done.push(Done::Put(*origin, *len, answered));
                     self.taken = self.taken.saturating_sub(*room);
                     self.puts.swap_remove(at);

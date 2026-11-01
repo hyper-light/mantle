@@ -100,9 +100,10 @@ not count its own lateness against the peer it waits on.
 D1. Whether a server is at work is stated, not inferred from latency (F1, F5): while a served
 exchange's owner has work moving for it, it says so at a beat the asker's judgement counts, and an
 asker cuts only an exchange whose statements stopped or a connection that died ([7]). A server stating
-nothing, a lost request among them, is found within two beats. This needs hyper-transport, which
-mantle shares with focal and slates; proposed to its maintainers 2026-10-29, awaiting the owner's
-word.
+nothing, a lost request among them, is given up within a period of its last statement, as one that
+never made one is. This needs hyper-transport, which
+mantle shares with focal and slates; proposed to its maintainers 2026-10-29 and reviewed 2026-10-31
+(below), awaiting the owner's word.
 
 D2. Every request carries its deadline as time remaining, and every node asks its peers within what
 remains less its own share (F2; node.md §5.4: "A request's deadline is its client's patience");
@@ -115,3 +116,40 @@ asked of another copy (node.md §5.4), and a timeout that remains is set from th
 D4. A request sent again with its identity joins the work it began or is answered from what that
 work made, and work abandoned frees what it wrote at once (node.md §5.4's identities), so a retry
 never repeats work or leaves chunks behind; retries are held by a token bucket with jitter (F3).
+
+## D1's design, as reviewed
+
+Proposed to hyper-transport's maintainers on 2026-10-29 and reviewed by hyper-raft's agent on
+2026-10-31, which found no hyper-quic blocker; it awaits the owner's word.
+
+- **Wire.** A unidirectional control stream on each connection, which QUIC gives natively, carries
+  notes, each the varint ids of every exchange vouched for since the last: ordered, and a few bytes
+  a note. An interim reply prefix, HTTP's 1xx [2], was the other way: it covers only the asking
+  phase, before a reply's prefix, while the case traced most is a get paused between blocks after
+  its body began.
+- **Serving side.** The owner vouches for a served exchange only when its own work for it advanced:
+  one of its asks completed, or a byte of its reply was made. Never on a timer, which would make a
+  note a keepalive that hides a stuck server. The transport sends at most a note a beat on each
+  connection, naming only exchanges served, not yet replied whole and not refused.
+- **Asking side.** A note is progress in either phase: asking, the window of what the asker has
+  had starts again; answering, the window counts as moved, so a body paused mid-way is judged by
+  the server's statement and not the clock. Silence past the bound is suspicion: an exchange whose
+  notes stop is cut at the end of the window its last note began, within a period of it, and a
+  dead connection is found by the idle timeout as now.
+- **Beat.** A third of the asker's period, so two lost notes still leave margin, as RFC 9000's
+  idle timeout is three probe timeouts [7] and hyper-liveness's silent periods are counted.
+- **Period.** Both sides derive it from what both know rather than a field in the request: one
+  less thing carried, and nothing to get wrong across a restart.
+- **A fresh id for each attempt.** An exchange asked again after a cut is a new exchange with a new
+  id, and a note naming one its asker gave up is ignored, so a late note never revives an orphaned
+  attempt (the runs cut and sent again on CI's busy runner, measurements/2026-10-29).
+- **The owner's bound.** The owner's work is bounded (CLAUDE.md rule 2): past its bound it answers
+  a typed refusal, which ends its notes, so no note keeps a stuck job alive; with D2 the bound is
+  the time its request has left.
+
+What it would close, as traced: a get cut 9 ms after the chunk it waited on came (CI's busy runner,
+measurements/2026-10-29); runs cut while their node wrote, their first chunks orphaned (the same);
+and a 40 GiB put on the box whose chunk to a peer was cut `Lost(Stalled)` while that peer waited on
+its own device, the block `Unplaced` and the request answered `503 SlowDown`
+(measurements/2026-10-28-transfer-scale.md). Any server whose answer waits on its own asks would
+use it, focal's seal and slates' included.

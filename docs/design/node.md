@@ -230,12 +230,22 @@ measures the second, and derives the rest by these rules:
   §5). The floor counts its classes in order and the node refuses to start at the class whose
   bytes take the count past the allowance, the whole floor named beside it (`derive::floor`,
   `DeriveError::Memory`). What remains is shared by each volume's index and each range engine's
-  resident metadata, each in proportion to what it wants at its device's full size, so no device
-  fills before the rest (`derive::shares`): a volume's index a fragment at each of its blocks
-  (`derive::index_wants`), and an engine as many extents as its share holds at the metadata
-  measured at the densest rows, 89,208 millionths of an extent's bytes, and its allocator's own
-  (`derive::engine_within`, `shard_db::MEASURED_METADATA_PPM`, the owner's choice of 2026-10-23
-  over its statement for any keys, which holds a twentieth of the rows). Longer keys hold more an
+  resident metadata, each in proportion to what the objects the cell's volumes hold want of it, so
+  the indexes and the engines fill together (`derive::shares`; the owner's choice of 2026-10-31): a
+  volume's index a fragment at each of its blocks (`derive::index_wants`), and an engine the
+  extents its rows take for the cell's blocks when each node's volumes hold what this node's do, an
+  object a block, each block's chunks on as many nodes as the scheme chosen at the cell's domains
+  (`derive::cell_blocks`), at the most store a range's engine took an object
+  (`derive::STORE_BYTES_AN_OBJECT`, measured), each extent at the metadata measured at the densest
+  rows, 89,208 millionths of an extent's bytes, and its allocator's own (`derive::engine_wants_for`,
+  `shard_db::MEASURED_METADATA_PPM`, the owner's choice of 2026-10-23 over its statement for any
+  keys, which holds a twentieth of the rows); an engine as many extents as its share holds
+  (`derive::engine_within`). What no want takes goes to the engines, each up to what its share of
+  the node directory's device holds: an empty object, a delete marker and an upload in progress
+  make rows that no volume bounds. An engine had wanted its device's whole share: on the box's 8 TB
+  file system the five engines took 16.25 GB of the 16.3 GB a 16 GiB node had past its floor, for
+  rows the cell never made, while each index took 33.6 MB, held 95,297 fragments and refused the
+  rest (measurements/2026-10-28-transfer-scale.md). Longer keys hold more an
   extent, so the engine holds its share itself: a put that would pack its memtable while its
   metadata is at or past its share is refused, typed, as a file system with no room refuses a
   write; a delete still packs it, as one takes an unlink; and once compactions bring the metadata

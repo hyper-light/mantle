@@ -224,9 +224,11 @@ metadata (`engine.metadata_bytes`), its share of the node directory's whole file
 the file system's, which the cell's metadata never fills, and the index's its volume's, which the
 objects fill: the index fills while the engines' 16.3 GB of room holds a few megabytes. The
 volume's log, sized at format for that index, holds it there for the volume's life
-(`derive::held`). The native door's 11 refusals are step 1's `SlowDown`, a range step that waited
-past its budget without a leader to serve it, which the harness's native door returns where boto3
-and the AWS CLI ask again (research/75); before step 1 those steps waited for their leader.
+(`derive::held`). The native door's 11 refusals were `503 SlowDown`, which the harness's native
+door returned where boto3 and the AWS CLI ask again (research/75). Their path was not traced:
+step 1's end of a range step that waited its budget without a leader to serve it, or a block
+`Unplaced` once a chunk was cut `Lost(Stalled)`, which a diagnostic build found under load on
+2026-10-31 (below).
 
 The 10G case, its volumes 141,446,945,450 bytes each (1.524 TB free less 1.1 TB, the box's free
 space falling with its other work):
@@ -277,6 +279,42 @@ designed in hyper-transport, which waits on that design and the owner's word. Th
 `SlowDown` retry (1ac2509d) asks again within its three attempts, and each attempt met another
 stall. The 100G case's own refusals were not traced; the same answer at the same place, under the
 same load, is read as the same cause.
+
+**This Mac's 10G cases, one way at a time** (the owner's choice of 2026-10-31), on 1ac2509d
+(binary 4858a0d7), each a fresh cell under launchd whose volumes are this Mac's free space less
+30 GiB, a third each, deleted once its case ends:
+
+| Way | Volumes (each) | Held | Put / native read / HTTP read (MiB/s) | Refused | Chunks held a node | Seconds | Load |
+|---|---|---|---|---|---|---|---|
+| native (whole blocks) | 36,511,648,426 B | 3 | 29 / 70 / 173 | `InsufficientStorage` (l3), none otherwise | 35.72 GB, 97.8%, one segment free | 4,138 | 14 to 25 |
+
+Exact: 3,873 blocks, each block's chunks on distinct nodes; every node's chunk bytes what it
+received and put; 18 reads after each founder's kill and restart, none wrong or missing, one asked
+again; the controls caught; the refused object unreadable and unlisted.
+
+**What an object takes of a range's store.** For the engines' share of a node's memory, sized by
+what the cell's volumes hold (the owner's choice of 2026-10-31, node.md §1.4): the harness's small
+sets on this Mac (binary 4858a0d7, launchd at the shell's 1,048,576 descriptors), each object a
+block through one of the two doors, every node's five range stores at the case's end, their files'
+lengths (a store grows its file an extent past its end when none is free, so the length is the
+most it held at once). Every node's stores came to the same bytes:
+
+| Objects | Root, bucket | Name | File | Block | Seconds |
+|---|---|---|---|---|---|
+| 10,000 | 73,728 each | 7,766,016 | 11,747,328 | 14,696,448 | 1,902 |
+| 30,000 | 221,184 each | 17,375,232 | 21,479,424 | 51,511,296 | 6,611 |
+
+Both cases were exact: every block's chunks on distinct nodes, 60,000 and 180,000 reads through
+each founder killed and started again with none wrong, missing or asked again, the controls caught.
+The empty store is 73,728 bytes. The Block range's store takes the most, its seven rows a block of
+three copies: past the empty store, 1,462 bytes an object at 10,000 objects, 1,715 at 30,000, and
+1,841 an object between the two. The figure grew with the objects, as a store whose most at once
+holds compaction's room with what it compacts would, so the node takes the slope, the most of the
+three (`derive::STORE_BYTES_AN_OBJECT`). The same set at 100,000 on the box ended at its first native
+exchange `Closed` under load 216, so the figure stands measured to 30,000 objects. The same cases show
+the old split on this Mac too: each 2 GiB volume's index held at most 99,497 fragments of its
+524,288 blocks, 19% of its want, since the engines wanted room across the Mac's 7.3 TB file
+system and what memory remained past the floor went in proportion to the wants.
 
 **Where a full cell's room goes.** A cell is full when one block's chunks find no node with room:
 every block needs a chunk on each of the three nodes, so the fullest node decides. A node's

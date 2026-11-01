@@ -95,6 +95,17 @@ const STACK: u64 = 2 << 20;
 /// fourteen it allows at most.
 const SCRUB: Duration = Duration::from_secs(7 * 24 * 3600);
 
+/// Measured: the most of its store a range's engine took for each object: the Block range's, a
+/// block's header and a chunk row and a reverse row for each of its three copies. The transfer
+/// harness's small sets on an Apple M5 Max (binary 4858a0d7, 2026-10-31), each object a block
+/// through one of the two doors, every node's store files at the case's end (a store grows its file
+/// an extent past its end when none is free, so a file's length is the most it held at once,
+/// compaction's room included): 14,696,448 bytes at 10,000 objects and 51,511,296 at 30,000, past
+/// the empty store's 73,728 1,462 and 1,715 bytes an object, and 1,841 an object between them, the
+/// most of the three (measurements/2026-10-28-transfer-scale.md). Measured to 30,000 objects: the
+/// slope grew with them, and a range at millions waits on a measurement there.
+pub const STORE_BYTES_AN_OBJECT: u64 = 1_841;
+
 /// The rates a block's scheme is chosen by until mantle measures its own (docs/design/durability.md
 /// §5): each chunk lost at the worst device class's annual rate, since a block's chunks may land
 /// on any device of the cell; a power-on restart a year, destroying a hundredth of the nodes;
@@ -187,6 +198,29 @@ pub fn schemes(domains: usize, rates: &Rates, target: f64) -> Result<Vec<Scheme>
     Ok(schemes)
 }
 
+/// The most blocks a cell of `domains` failure domains holds when each of its nodes' volumes holds
+/// `fragments` chunks, as this node's do: each block takes the scheme the durability model chooses
+/// at `domains` (`durability::choose`), a chunk on each of its width's nodes, so the cell's chunks
+/// make a block for each width of them.
+pub fn cell_blocks(
+    fragments: u64,
+    domains: usize,
+    rates: &Rates,
+    target: f64,
+) -> Result<u64, DeriveError> {
+    let width = match durability::choose(&durability::candidates(), domains, rates, target)? {
+        Some(Choice::Meets { scheme, .. } | Choice::Short { scheme, .. }) => scheme.width(),
+        None => return Err(DeriveError::Schemes { domains }),
+    };
+    let overflow = || DeriveError::Overflow("the cell's blocks");
+    let nodes = u64::try_from(domains).map_err(|_| overflow())?;
+    let width = u64::try_from(width).map_err(|_| overflow())?;
+    fragments
+        .checked_mul(nodes)
+        .and_then(|chunks| chunks.checked_div(width))
+        .ok_or_else(overflow)
+}
+
 /// The asks a node of `gateway` holds at most, each operation it hosts the most of the schemes
 /// its blocks may take (`schemes`): a put's window of chunks at their width, or a get's spans and
 /// the whole chunks a failed span adds (`put::most_chunks`, `get::most_chunks`); a put's command
@@ -273,6 +307,8 @@ pub enum DeriveError {
     Volume(#[from] ChunkError),
     #[error("the durability model: {0}")]
     Durability(#[from] DurabilityError),
+    #[error("no scheme the durability model knows fits a cell of {domains} failure domains")]
+    Schemes { domains: usize },
     #[error("the node's floor of {floor} bytes passes its allowance of {allowance} at its {class}")]
     Memory {
         class: Class,
@@ -423,12 +459,27 @@ pub fn engine(block: usize, share: u64, rules: &Rules) -> Result<Engine, DeriveE
 
 /// What `engine`'s resident metadata takes at its device's full share: each extent its share
 /// holds at the metadata measured at the densest rows and its allocator's own
-/// (`mantle_engine::shard_db::measured_per_extent`), its want in [`shares`].
+/// (`mantle_engine::shard_db::measured_per_extent`), the most its share of memory may be.
 pub fn engine_wants(engine: &Engine) -> Option<u64> {
     engine
         .store
         .max_extents
         .checked_mul(mantle_engine::shard_db::measured_per_extent(&engine.store)?)
+}
+
+/// What `engine`'s resident metadata takes for `objects` objects, its want in [`shares`]: the
+/// extents their rows take at the most of its store any range's engine took an object
+/// ([`STORE_BYTES_AN_OBJECT`]), at most its device's share holds, each at the metadata measured at
+/// the densest rows and its allocator's own (`mantle_engine::shard_db::measured_per_extent`).
+pub fn engine_wants_for(engine: &Engine, objects: u64) -> Option<u64> {
+    let extent = u64::try_from(engine.store.page_size)
+        .ok()?
+        .checked_mul(u64::from(engine.store.extent_pages))?;
+    let extents = objects
+        .checked_mul(STORE_BYTES_AN_OBJECT)?
+        .div_ceil(extent)
+        .min(engine.store.max_extents);
+    extents.checked_mul(mantle_engine::shard_db::measured_per_extent(&engine.store)?)
 }
 
 /// `engine` with as many extents as `metadata` bytes of the node's memory hold at the metadata
@@ -818,8 +869,9 @@ pub fn floor(classes: &[(Class, u64)], allowance: u64) -> Result<u64, DeriveErro
 }
 
 /// What remains past the floor, shared by each volume's index and each engine's resident metadata:
-/// each takes what its device at its full size wants (`wants`), and when less remains than all of
-/// them want, each the same part of its want, so no device fills before the rest.
+/// each takes what it wants for the objects the cell's volumes hold (`wants`), and when less
+/// remains than all of them want, each the same part of its want, so the indexes and the engines
+/// fill together.
 pub fn shares(remaining: u64, wants: &[u64]) -> Result<Vec<u64>, DeriveError> {
     let overflow = || DeriveError::Overflow("the floor's shares");
     let total = wants
@@ -1149,8 +1201,10 @@ fn layer_name(layer: Layer) -> &'static str {
 /// - the transport at its floor (`bounds::least_transport`), for the peers, ranges, transfers and
 ///   messages the node opens with as `Node::open_on` states them;
 /// - the floor, class by class, within the allowance ([`allowance`], [`floor`]), and what remains
-///   shared by each volume's index and each engine's resident metadata ([`shares`]): a volume's
-///   fragments and an engine's extents as many as their shares hold ([`volume`],
+///   shared by each volume's index and each engine's resident metadata ([`shares`]), each wanting
+///   what the objects the cell's volumes hold take of it ([`index_wants`], [`cell_blocks`],
+///   [`engine_wants_for`]) and the engines what no want takes, up to their devices' shares: a
+///   volume's fragments and an engine's extents as many as their shares hold ([`volume`],
 ///   [`engine_within`]), an engine never fewer than its store holds, which it would not open
 ///   below (`Store::open`).
 ///
@@ -1264,16 +1318,20 @@ pub fn derive(
     let chunk = mantle_gateway::layout::CHUNK;
     let mut volume_bytes = 0u64;
     let mut transfers = 0usize;
+    let mut fragments = 0u64;
     let mut wants = Vec::with_capacity(stated.volumes.len());
     for ((_, size), facts) in stated.volumes.iter().zip(&measured.volumes) {
         let block = match &facts.formatted {
             Some(formatted) => formatted.geometry.block,
             None => volume_layout::block(facts.device.align).ok_or(overflow("a volume's block"))?,
         };
-        let want = size
+        let at_a_block = size
             .checked_div(block)
-            .and_then(index::most_bytes)
             .ok_or(overflow("a volume's index"))?;
+        fragments = fragments
+            .checked_add(at_a_block)
+            .ok_or(overflow("the volumes' fragments"))?;
+        let want = index::most_bytes(at_a_block).ok_or(overflow("a volume's index"))?;
         let whole = volume(
             facts.device.align,
             *size,
@@ -1434,8 +1492,11 @@ pub fn derive(
         remaining,
     );
 
-    // What remains, shared.
-    let engine_want = engine_wants(&made).ok_or(overflow("an engine's metadata"))?;
+    // What remains, shared: each index wants a fragment at each of its volume's blocks, and each
+    // engine the rows of the objects those fragments make across the cell, so both fill together.
+    let objects = cell_blocks(fragments, domains, &rates, target)?;
+    say_objects_held(&mut said, fragments, objects);
+    let engine_want = engine_wants_for(&made, objects).ok_or(overflow("an engine's metadata"))?;
     let mut all = wants;
     all.resize(
         stated
@@ -1447,7 +1508,25 @@ pub fn derive(
     );
     let parts = shares(remaining, &all)?;
     let (indexes, metadata) = parts.split_at(stated.volumes.len());
-    let metadata = metadata.iter().copied().min().unwrap_or(0);
+    // What no want takes goes to the engines, each up to what its device's share holds: the rows
+    // no volume bounds, an empty object's, a delete marker's, an upload's in progress.
+    let taken = parts
+        .iter()
+        .try_fold(0u64, |sum, &part| sum.checked_add(part))
+        .ok_or(overflow("the floor's shares"))?;
+    let spare = u64::try_from(ranges)
+        .ok()
+        .and_then(|ranges| remaining.checked_sub(taken)?.checked_div(ranges))
+        .unwrap_or(0);
+    let most = engine_wants(&made).ok_or(overflow("an engine's metadata"))?;
+    let metadata = metadata
+        .iter()
+        .copied()
+        .min()
+        .unwrap_or(0)
+        .checked_add(spare)
+        .ok_or(overflow("an engine's metadata"))?
+        .min(most);
     let mut volumes = Vec::with_capacity(stated.volumes.len());
     for (n, (((dir, size), facts), &index_bytes)) in stated
         .volumes
@@ -2021,7 +2100,8 @@ fn say_floor(
         remaining,
         Kind::Derived,
         "the allowance past the floor: each volume's index and each engine's resident metadata, \
-         in proportion to what each wants (derive::shares)",
+         in proportion to what each wants for the objects the cell's volumes hold, what no want \
+         takes the engines' (derive::shares)",
     );
 }
 
@@ -2140,6 +2220,25 @@ fn say_volume(
     );
 }
 
+fn say_objects_held(said: &mut Said, fragments: u64, objects: u64) {
+    said.add(
+        "volumes.fragments",
+        fragments,
+        Kind::Derived,
+        "the chunks the node's volumes hold at most, a fragment at each of their blocks, which \
+         their indexes want (derive::index_wants)",
+    );
+    said.add(
+        "engine.objects",
+        objects,
+        Kind::Derived,
+        "the most objects whose rows each range's engine wants room for: the cell's blocks when \
+         each node's volumes hold what this node's do, an object a block, each block's chunks on \
+         as many nodes as the scheme chosen at the cell's domains, root.max_nodes \
+         (derive::cell_blocks)",
+    );
+}
+
 fn say_engine(said: &mut Said, engine: &Engine, metadata: u64, held_extents: u64, founded: bool) {
     said.add(
         "engine.page_size",
@@ -2163,7 +2262,9 @@ fn say_engine(said: &mut Said, engine: &Engine, metadata: u64, held_extents: u64
         metadata,
         Kind::Derived,
         "each range's share of what remains of memory past the floor, for its engine's resident \
-         metadata (derive::shares)",
+         metadata: the extents its rows of engine.objects take, in proportion with each index's \
+         want when less remains (derive::engine_wants_for, derive::shares), and what no want \
+         takes, up to what its share of the node directory's device holds",
     );
     said.add(
         "engine.max_extents",
@@ -2703,7 +2804,7 @@ mod tests {
         assert_eq!(v.max_fragments, size / 4096);
         let (_, rules) = cell(3).unwrap();
         let full = engine(4096, 1 << 30, &rules).unwrap();
-        let wants = [index, engine_wants(&full).unwrap()];
+        let wants = [index, engine_wants_for(&full, size / 4096).unwrap()];
         // A third of what they want remains: each takes a third of its want.
         let remaining = (wants[0] + wants[1]) / 3;
         let parts = shares(remaining, &wants).unwrap();
@@ -2716,6 +2817,53 @@ mod tests {
         let per = mantle_engine::shard_db::measured_per_extent(&e.store).unwrap();
         assert!(e.store.max_extents * per <= parts[1]);
         assert!((e.store.max_extents + 1) * per > parts[1]);
+    }
+
+    /// An engine wants the extents its rows take for the objects, at the most store a range took an
+    /// object, never past what its device's share holds.
+    #[test]
+    fn an_engine_wants_the_extents_its_rows_take_for_the_objects() {
+        let (_, rules) = cell(3).unwrap();
+        let full = engine(4096, 1 << 30, &rules).unwrap();
+        let per = mantle_engine::shard_db::measured_per_extent(&full.store).unwrap();
+        let extent = u64::try_from(full.store.page_size).unwrap() * u64::from(EXTENT_PAGES);
+        let objects = 100_000;
+        assert_eq!(
+            engine_wants_for(&full, objects),
+            Some((objects * STORE_BYTES_AN_OBJECT).div_ceil(extent) * per)
+        );
+        assert_eq!(engine_wants_for(&full, 0), Some(0));
+        assert_eq!(
+            engine_wants_for(&full, u64::MAX / STORE_BYTES_AN_OBJECT),
+            engine_wants(&full)
+        );
+    }
+
+    /// A cell's blocks are its nodes' chunks over the width of the scheme its domains take: a cell
+    /// of three puts a chunk of every block on each node, and a cell of one each block on its node.
+    #[test]
+    fn a_cells_blocks_are_its_nodes_chunks_over_its_schemes_width() {
+        let (rates, target) = (rates(), target(None));
+        assert_eq!(cell_blocks(1_000, 3, &rates, target).ok(), Some(1_000));
+        assert_eq!(cell_blocks(1_000, 1, &rates, target).ok(), Some(1_000));
+        for domains in [2usize, 5, 9, 20] {
+            let width = match durability::choose(&durability::candidates(), domains, &rates, target)
+            {
+                Ok(Some(Choice::Meets { scheme, .. } | Choice::Short { scheme, .. })) => {
+                    scheme.width()
+                }
+                other => panic!("{domains} domains: {other:?}"),
+            };
+            let blocks = 1_000 * domains as u64 / width as u64;
+            assert_eq!(
+                cell_blocks(1_000, domains, &rates, target).ok(),
+                Some(blocks)
+            );
+        }
+        assert!(matches!(
+            cell_blocks(1_000, 0, &rates, target),
+            Err(DeriveError::Schemes { domains: 0 })
+        ));
     }
 
     /// A host of 16 GiB with no OS limit, a node directory on a 4 KiB-unit device of a terabyte, and
@@ -2998,6 +3146,35 @@ mod tests {
         let shared =
             bytes(&tight, "volume.1.index_bytes") + 5 * bytes(&tight, "engine.metadata_bytes");
         assert!(shared <= floor / 20);
+    }
+
+    /// However large the node directory's file system, each index takes its whole want while what
+    /// remains holds every want: an engine wants the rows of the objects the cell's volumes hold, not
+    /// its device's share, and takes what no want does (the box's 16 GB pass gave each index 33.6 MB
+    /// beside an 8 TB file system, 2026-10-30).
+    #[test]
+    fn each_index_takes_its_whole_want_beside_a_file_system_of_any_size() {
+        let mut measured = facts(1);
+        measured.meta.bytes = Some(8 << 40);
+        let derived = derive(stated(1), &measured, &mut fresh).unwrap();
+        let bytes = |key: &str| -> u64 {
+            let basis = derived.bases.iter().find(|b| b.key == key).unwrap();
+            basis.value.parse().unwrap()
+        };
+        let fragments = (8u64 << 30) / 4096;
+        assert_eq!(bytes("volumes.fragments"), fragments);
+        // A cell of three: a chunk of every block on each node, so a block for each fragment.
+        assert_eq!(bytes("engine.objects"), fragments);
+        let align = Alignment::new(4096).unwrap();
+        assert_eq!(
+            bytes("volume.1.index_bytes"),
+            index_wants(align, 8 << 30).unwrap()
+        );
+        assert_eq!(derived.config.volumes[0].config.max_fragments, fragments);
+        // The engines take the rest, each its want and an equal part of what no want took.
+        let given = bytes("volume.1.index_bytes") + 5 * bytes("engine.metadata_bytes");
+        let remaining = bytes("memory.remaining");
+        assert!(given <= remaining && remaining - given < 5);
     }
 
     /// A node restarted on stores it made keeps their page and extent sizes, and admits the extents

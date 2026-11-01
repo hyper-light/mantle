@@ -412,10 +412,14 @@ volumes' indexes full, 95,297 fragments each with 10.6 GB of free segments: the 
 its floor is shared in proportion to each part's full-size want, and the five ranges' engines want
 room for metadata across the node directory's whole 8 TB file system, so they took 16.3 GB, room
 for metadata the cell never makes, and each volume's index 33.6 MB. The native door's 11 refusals
-were step 1's `SlowDown`, which its harness does not ask again as stock clients do
-([measurements](measurements/2026-10-28-transfer-scale.md)). The owner chose both on 2026-10-31:
-the engines' share follows how many objects the cell's volumes hold (open), and mantle's client asks
-a `SlowDown` again as the AWS SDKs ask a throttling error (in, 1ac2509d). The 100G case run again
+were `SlowDown`, which its harness did not ask again as stock clients do, by a path not traced
+(step 1's end of a leaderless step, or a block `Unplaced` as below)
+([measurements](measurements/2026-10-28-transfer-scale.md)). The owner chose both on 2026-10-31,
+and both are in. An engine wants the extents its rows take for the objects the cell's volumes hold,
+at the most of its store a range took an object, measured (1,841 bytes, the Block range's), each
+index a fragment at each block of its volume, and what no want takes goes to the engines up to their
+devices' shares: a 16 GiB node beside an 8 TB file system gives each index its whole want (node.md
+§1.4). And mantle's client asks a `SlowDown` again as the AWS SDKs ask a throttling error (1ac2509d). The 100G case run again
 below the reserve (161.7 GB volumes) acknowledged none: each way was answered `SlowDown` part way.
 A diagnostic build traced the answer under the same load: a chunk sent to a peer whose device had
 stalled for seconds (a log flush of 5.9 s) was cut `Lost(Stalled)` at its transfer's progress
@@ -445,8 +449,13 @@ patience counted from the leader's loss cut a failover in a young cell, the pati
 election's expected time, so the clock follows the detectors. Open: why that founder never
 answered, and why on this
 Mac under load a restarted founder's first range reads could not reach their known leader for 12 to
-25 s (not met in 58 rounds on a Mac Studio, quiet and loaded); and the 10G and 100G cases on this Mac
-on the mended build, which wait on its free space (16 GiB on 2026-10-29, other work's builds).
+25 s (not met in 58 rounds on a Mac Studio, quiet and loaded); and this Mac's 10G cases, one way
+at a time on 1ac2509d: the native way's was exact (3 objects in 97.8% of each node's volume, refused
+typed, 18 reads after the kills), the CLI's and both parts' ways to run. A node started again
+judges no peer until its links are measured, and a leader killed meanwhile is not replaced
+(hyper-liveness's young links, an owner decision since 2026-10-16); step 1 ends a request's step
+there `SlowDown` where it had waited, which CI's windows-aarch64 met in mantle's node tests, which
+now kill a node once every link is judged.
 CI's one-CPU job ran the chunk store's test of the planned pass for five hours: a plan named an
 empty segment by its number, the writer freed it and the pass opened it again for its first
 victim's records, then cleaned it as its second victim, moving its own output into the last free

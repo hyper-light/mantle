@@ -1598,10 +1598,13 @@ less than a datagram moved, or after the peer had the whole request and a period
    left, and for one that says nothing, every S3 request among them, the stock S3 clients' 60 s
    without its work moving (`bounds::STOCK_PATIENCE`, botocore's and the AWS CLI's default read
    timeouts). A job's work moves at each of its own asks answered, each piece of a chunk it reads
-   from or sends a peer, and each piece of its own body read or reply written; a job past its
-   client's patience is ended `503 SlowDown` and lets go of what it asked. Within it, the node says
-   its work is held each beat while an ask of its own is out (a peer's transfer its transport keeps,
-   or a write at its own device) or a chunk of it waits for room, and says so of a peer's chunk each
+   from or sends a peer, and each piece of its own body read or reply written. A job whose own work
+   is held, an ask of its own out (a peer's transfer its transport keeps, or a write at its own
+   device) or a chunk of it waiting for room, is ended `503 SlowDown` past its client's patience and
+   lets go of what it asked, and within it the node says each beat that its work is held; a get,
+   replied before its body, is ended unfinished as a get is once its transport gives up a chunk read
+   its peer says nothing of, and a job waiting on its own client, for its body or for room to write
+   its reply, is the transport's to judge. The node says so of a peer's chunk each
    beat while a volume holds it, put and not yet durable, within the time the asking job carried
    in the chunk's head: a device that stalls is waited on as long as the client would wait, and one
    that never answers is given up then (the owner's choice of 2026-11-01, research/77 D2). A chunk

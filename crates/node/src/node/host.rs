@@ -809,24 +809,25 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(())
     }
 
-    /// Each operation still at work held to its client's patience (research/77 D2): one past it
-    /// is answered `SlowDown` and lets go of what it asked, its client gone or going; one with an
-    /// ask of its own out, held by a peer whose transfer its transport keeps or by this node's
-    /// device, tells its asker its work is held.
+    /// Each operation whose work is held, by an ask of its own out (a peer's transfer its
+    /// transport keeps, or a write at this node's device) or a chunk waiting for room, held to its
+    /// client's patience (research/77 D2): one past it is answered `SlowDown` and lets go of what
+    /// it asked, its client gone or going; one within it tells its asker its work is held. A get
+    /// replied before its body: its asks, chunk reads, are given up by its transport once their
+    /// peers say nothing, and it ends unfinished as a get does. An operation waiting on its client,
+    /// for its body or room to write its reply, is the transport's to judge.
     fn bound_jobs(&mut self) -> Result<(), NodeError> {
         let now = hyper_rt::futures::now_ns();
         for at in 0..self.jobs.len() {
             let Some(job) = self.jobs.get(at) else {
                 continue;
             };
-            if !job.working() {
+            if !job.working() || !job.held() {
                 continue;
             }
-            if job.bound_ns() <= now {
+            if job.bound_ns() <= now && !matches!(job.work, Work::Get(_)) {
                 self.fail_job(at, Status::SlowDown)?;
-            } else if let Door::Exchange(exchange) = job.door
-                && job.held()
-            {
+            } else if let Door::Exchange(exchange) = job.door {
                 self.driver.endpoint().working(exchange);
             }
         }
@@ -2918,15 +2919,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let bound = self
             .jobs
             .iter()
-            .filter(|j| j.working())
-            .map(|j| {
-                let held = matches!(j.door, Door::Exchange(_)) && j.held();
-                let bound = j.bound_ns();
-                if held {
-                    bound.min(shard.saturating_add(beat))
-                } else {
-                    bound
-                }
+            .filter(|j| j.working() && j.held())
+            .filter_map(|j| {
+                // A native asker is told each beat; an S3 client is told nothing.
+                let told = matches!(j.door, Door::Exchange(_)).then(|| shard.saturating_add(beat));
+                let bounded = (!matches!(j.work, Work::Get(_))).then(|| j.bound_ns());
+                told.into_iter().chain(bounded).min()
             })
             .min();
         [renewal, bound].into_iter().flatten().min()

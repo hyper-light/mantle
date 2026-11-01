@@ -56,3 +56,28 @@ busy-a had run 4 s; the two nodes in busy-c had watched no pair before the cell 
 - Open: why busy-c's suspicions were never withdrawn while both nodes ran (scratch branch
   `diag/roll-busy4` traces every trust change and every heartbeat around it; its first run,
   40152571831, failed no round of sixteen).
+
+## A stop past its bound on Windows (2026-11-01)
+
+CI's Windows runners failed the roll now and then with a stopping node's "stopped at once: the
+stop's bound passed", exit 1 (40711041054, 41256234352). A diagnostic build (branch
+`diag/roll-stop-bound-2`, 80a2c79f, never merged: every phase of the orderly stop timed, the serve
+suite in rounds) failed it in 2 of 31 rounds (run 41260378525, windows-aarch64 and windows-x86_64).
+The stop of the failing round, on windows-aarch64:
+
+| ms into the stop | phase | what the node said |
+|---|---|---|
+| 0 | objects, then hand-over | no job; one range led, handed to a caught-up voter |
+| 190 | closing | handed; three connections closed, none established |
+| 199 | closing | two left |
+| 1,478 | closing | one left, its next timer 9,553 ms on |
+| 10,000 | bound passed | the one connection still closing, its timer 1,031 ms on |
+
+Each connection was closed and kept in its closing state for three probe timeouts, as RFC 9000
+§10.2 asks; one slow round trip on the busy runner had stretched one connection's probe timeout to
+about 3.2 s, so its closing period, 9.5 s, outlasted the 10 s bound with the hand-over's 1.5 s. By
+then nothing the node held was owed to the cell: its ranges were handed over and every connection
+had sent its close, and a late packet draws at most a stateless reset, RFC 9000 §10.2's note on
+state dropped early. A stop whose bound passes with only its connections' closing periods left is
+now done and exits 0 (node.md §1.7); one with more to do still ends as a crash would. The same
+rounds run again on the change (branch `diag/roll-stop-fix`, run 41353171174).

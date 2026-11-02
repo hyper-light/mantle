@@ -519,7 +519,9 @@ started no data job. A fresh overlapping attempt then ran for 316 s before the 4
 guard stopped it, with no final integrity totals. The completed 100 GiB run released its volumes.
 The fresh 10k run passed in 2,153 s: all 10,000 objects, 9,999 distinct-node blocks, 60,000 exact
 native reads after kills, one asked again, no refusals or wrong/missing objects, all controls
-caught. The 100k set now runs before the remaining large ways. The box's fresh 10 GiB native
+caught. The Mac's 100k set then passed in 16,006 s: all 100,000 objects acknowledged,
+99,998 distinct-node blocks, 600,000 exact native reads after kills and restarts, no re-asks,
+refusals, wrong or missing objects, and all controls caught. The box's fresh 10 GiB native
 case passed in 1,129 s with two objects, 2,582 distinct-node blocks, 12 exact native restart reads,
 no re-asks or wrong/missing objects, all controls caught, and typed full on its third key.
 Before the reader buffer fix, four of the 22 host/case slots had verified current-harness
@@ -549,9 +551,13 @@ failed the three unchanged engine `ranges_room` tests at `Too many open files`, 
 unchanged soft limit of 1,024 (hard 1,048,576); packages after that failure were not reached.
 The CLI 10 GiB case with the fixed reader then passed in 1,956 s with one whole object, 2,560 distinct-node blocks and six exact native
 restart reads, no re-asks/wrong/missing, all controls caught and a clean typed full refusal
-for the next key. Its scope peaked at 3,415,420,928 bytes with no max/OOM events. Seven of
-22 slots now have complete current-harness evidence, retaining their recorded builds.
-Native multipart and both 100k sets are active. The Mac's remaining 100 GiB cases now use
+for the next key. Its scope peaked at 3,415,420,928 bytes with no max/OOM events.
+The fresh native multipart rerun then passed in 3,144 s with three 10 GiB objects, 7,680
+distinct-node blocks, 18 exact native restart reads, no re-asks/wrong/missing, all controls
+caught, and typed full for native `l3`. Its scope peaked at 283,058,176 bytes with no max/OOM
+events. The earlier disk-guard stop remains incomplete. Nine of 22 slots now have complete
+current-harness evidence, retaining their recorded builds. The Box's 100k set and the two
+hosts' S3 multipart cases are active. The Mac's remaining 100 GiB cases now use
 the capacity available after the existing reserve. A result with no whole object records
 capacity only. The Scale goal remains active.
 The box's earlier `0100ddd8` 100k set ended exit 0 after 40,804 s: all 100,000 objects acknowledged,

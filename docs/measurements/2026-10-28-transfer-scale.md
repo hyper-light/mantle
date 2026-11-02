@@ -10,9 +10,10 @@ distinct nodes, every acknowledged object read back after each founder is killed
 and each large case ending at the typed refusal with the count held beside the volumes' stated
 capacity?
 
-**Checkpoint, 2026-11-02.** The reader fix is on main at `a57eaea7`. Seven of the 22 host/case
-slots have complete current-harness evidence with their build attribution below; the 100k sets
-and remaining large ways are still running. Capacity-only zero-object results receive no
+**Checkpoint, 2026-11-02.** The reader fix is on main at `a57eaea7`. Nine of the 22 host/case
+slots have complete current-harness evidence with their build attribution below. The Mac's
+100k set and the Box's 10 GiB native multipart case passed; the Box's 100k set and remaining
+large ways are still running. Capacity-only zero-object results receive no
 whole-object readback credit. The full Box workspace gate still has its recorded engine
 file-limit failure; the client, vendor and scale results retain their separate scopes.
 
@@ -407,6 +408,7 @@ missing current-build slots stay pending. The Mac's completed small sets are:
 |---|---|---|---|---|---|---|---|
 | Mac / `17eb8032` | small 1000 | 500 / 500 | 999 | 6,000 | 0 / 0 / 0 / 0 | 3 / 3 | 335 |
 | Mac / `17eb8032` | small 10000 | 5,000 / 5,000 | 9,999 | 60,000 | 1 / 0 / 0 / 0 | 3 / 3 | 2,153 |
+| Mac / `17eb8032` | small 100000 | 50,000 / 50,000 | 99,998 | 600,000 | 0 / 0 / 0 / 0 | 3 / 3 | 16,006 |
 
 Run `mac-small-1000-20261102-011230`, exit 0, empty harness stderr: 65,477,038 object bytes,
 every object read exactly through both APIs before the kills, and natively after each founder's
@@ -424,9 +426,16 @@ the remaining large ways. The fresh 10k run, `mac-small-10000-20261102-034102`, 
 2,153 s with empty stderr: 654,185,067 logical bytes, all objects exact through both APIs
 initially, 9,999 distinct-node blocks, and 60,000 exact native reads after kills with one asked
 again. Each node held 654,424,107 chunk bytes, exactly its received and locally put bytes,
-with none unkept. All controls caught. The 100k run is `mac-small-100000-20261102-041703`.
-At this checkpoint, four of 22 slots are verified under this harness and the other 18 remain open.
-Its replication pass reads natively; S3-after-kill readback is not part of these measured totals.
+with none unkept. All controls caught.
+
+The 100k run, `mac-small-100000-20261102-041703`, ended exit 0 after 16,006 s with empty stderr.
+It acknowledged all 100,000 objects, totaling 6,548,797,886 bytes, and verified 99,998 blocks on
+distinct nodes. All 600,000 native reads after founder kills and restarts were exact, with no
+re-asks, refusals, wrong or missing objects; all three controls caught their faults. Each node
+held 6,551,196,718 chunk bytes, exactly accounted with none unkept, on its 16 GiB volume.
+The volumes were released after success, and the remaining large-case queue started its
+100 GiB S3 multipart case using the fixed reader. The replication pass reads natively;
+S3-after-kill readback is not part of these measured totals.
 
 The box's early 1k run on `17eb8032`, `box-16G-20261102-015302`, failed after 469 s during the
 replication pass with `the native door: the transport: Budget`. Placement and chunk accounting
@@ -548,8 +557,8 @@ native restart reads, no re-asks/refusals/wrong/missing, all three controls and 
 Each node's 654,424,107 chunk bytes were accounted exactly with none unkept. Its 16 GiB scope
 peaked at 263,569,408 bytes with no max/OOM events.
 This result is attributed to the reply-buffer candidate, rather than retroactively changing the
-failed `17eb8032` attempts. The three Mac passes and Box native 10 GiB pass retain their
-`17eb8032` attribution.
+failed `17eb8032` attempts. The Mac small-set and 100 GiB native multipart passes and the
+Box native 10 GiB pass retain their `17eb8032` attribution.
 
 The retained 10k cell then passed on the fixed reader in 397.74 s: all 10,000 initial native
 reads, placement of 9,999 blocks, and 60,000 native restart reads exact, with no re-asks or
@@ -606,7 +615,19 @@ Three later checks found about 144.7 GB available, and the immediate pre-admissi
 145,440,178,176 bytes. The queue resumed in a fresh cell, `box-16G-20261102-075358`, with the
 same binary, 16 GiB memory scope, 32 GiB reserve, disk floor and per-case bound. Its volumes are
 37,026,813,269 bytes each. The verified CLI case was skipped, and the queue now checks the
-complete large-result verification before advancing. The rerun's result remains pending.
+complete large-result verification before advancing.
+
+**Fresh native multipart 10 GiB result.** That rerun ended exit 0 after 3,144 s with empty
+stderr, acknowledging three whole objects (32,212,254,720 bytes). Initial reads through both
+APIs were exact, all 7,680 blocks had chunks on distinct nodes, and all 18 native reads after
+kills and restarts were exact with no re-asks, wrong or missing objects. All three controls
+caught their faults. Native `l3` was refused full, unreadable and unlisted; acknowledged keys
+were listed, with no other refusal. Put/native/S3 rates were 26/159/369 MiB/s.
+
+Each node held 34,552,721,408 chunk bytes plus 8,325,104 unkept bytes, exactly accounted, with
+8,404,992 bytes free. Its 16 GiB scope peaked at 283,058,176 bytes with no max/OOM events.
+The complete result verifier passed before the queue admitted the fresh S3 multipart case.
+This adds one case to acceptance; the earlier guard-stopped attempt remains incomplete.
 
 **What an object takes of a range's store.** For the engines' share of a node's memory, sized by
 what the cell's volumes hold (the owner's choice of 2026-10-31, node.md §1.4): the harness's small

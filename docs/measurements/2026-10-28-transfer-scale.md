@@ -381,8 +381,29 @@ space falls below 30 GiB and reserves 32 GiB, including 2 GiB for metadata outsi
 **Current-build acceptance.** The candidate product is `17eb8032`. Its complete matrix has
 22 slots across the two physical hosts (adacachy is the box): three small sets and four large
 upload ways at each of 10 and 100 GiB per host. Historical passes above remain historical;
-missing current-build slots stay pending. Both hosts now have final-build 1k/10k/100k runs queued
-after their large-case sequences. The Mac also queues final-build reruns of its other three
+missing current-build slots stay pending. The first completed slot is the Mac's 1k set:
+
+| Host / build | Case | Acknowledged native / S3 | Distinct-node blocks | Reads after kills | Again / refused / wrong / missing | Controls caught | Seconds |
+|---|---|---|---|---|---|---|---|
+| Mac / `17eb8032` | small 1000 | 500 / 500 | 999 | 6,000 | 0 / 0 / 0 / 0 | 3 / 3 | 335 |
+
+Run `mac-small-1000-20261102-011230`, exit 0, empty harness stderr: 65,477,038 object bytes,
+every object read exactly through both APIs before and after each founder's kill and restart.
+Each node held 65,500,862 chunk bytes, exactly what it received and put, with no unkept bytes.
+The case used 256 MiB per node while the 100 GiB native multipart case ran on the same filesystem
+(load 10.62, 10.12, 11.20 at start). The 10k case's first preflight refused allocation before any
+data job started as shared free space fell. Run `mac-small-10000-20261102-013310` then started
+after headroom returned, but was stopped after 316 s, exit 143, when free space reached
+45,067,243,520 bytes, below its 42 GiB floor. It published no readback or restart totals and is
+incomplete. Its nodes' `write(stdout)` refusals followed the closed harness pipes. That
+overlapping attempt required 50 GiB free, including a 44 GiB reserve. The 10k and 100k sets now
+wait for the large-case sequence to finish and release its volumes before running sequentially.
+At this checkpoint, one of 22 slots is verified and the other 21 need terminal results.
+
+The box's 1k and 10k sets can run in separate 16 GiB scopes alongside its earlier job while
+128 GiB of filesystem headroom remains; its final 100k set waits for the large-case sequence.
+The Mac also queues reruns
+of its other three
 10 GiB ways after those small sets; its canceled boto3 case is already in the large-case sequence.
 The box's final-build runs use the 16 GiB memory scope. A queue is not a pass: every slot requires
 its terminal result, full acknowledgment/readback and placement totals, restart checks and

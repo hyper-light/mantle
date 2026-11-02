@@ -508,6 +508,15 @@ judges no peer until its links are measured, and a leader killed meanwhile is no
 (hyper-liveness's young links, an owner decision since 2026-10-16); step 1 ends a request's step
 there `SlowDown` where it had waited, which CI's windows-aarch64 met in mantle's node tests, which
 now kill a node once every link is judged.
+On `17eb8032`, the Mac's 1k set then passed in 335 s alongside the active 100 GiB multipart case:
+500 objects put natively and 500 through S3, all read exactly through both APIs, 999 blocks each
+on distinct nodes, 6,000 reads after the founder kills, no retries, refusals, wrong or missing
+objects, and all three controls caught. Its terminal log is `mac-small-1000-20261102-011230`.
+The 10k queue waits for enough space before starting a cell; its first guarded preflight
+started no data job. A fresh overlapping attempt then ran for 316 s before the 42 GiB free-space
+guard stopped it, with no final integrity totals. Both the 10k rerun and 100k set now wait for
+the large cases to release their volumes. One of the candidate's 22
+host/case slots is verified at this checkpoint; the Scale goal remains active.
 CI's one-CPU job ran the chunk store's test of the planned pass for five hours: a plan named an
 empty segment by its number, the writer freed it and the pass opened it again for its first
 victim's records, then cleaned it as its second victim, moving its own output into the last free

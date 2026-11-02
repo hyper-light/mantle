@@ -565,6 +565,14 @@ Windows x86_64 CI's thread-count test rejected `[15, 15, 13]` because it require
 Its contract is no added threads: the first count remains the ceiling, a positive decrease is
 accepted, and an increase or a missing measurement fails. The storage and transport code are
 unchanged by this test correction.
+
+CI `41464781588` also found an obsolete maintenance-budget assertion on the legacy Mac x86
+leg. Its saved seed reproduced on Linux in 2.50 s. `Trunk::step` documents one pass using up to
+its budget: the trace completed one work unit, flushed and split the root, then queued work
+for a later pass. The test now checks the budget ceiling, including when idle, and keeps every
+read-after-step, final drain, zero-debt and extent-ownership check. The saved seed is retained.
+All six trunk tests passed on Linux in 1.18 s and targeted clippy passed. Production maintenance
+code is unchanged; no timeout, retry count, work budget or descriptor limit was increased.
 The corrected test and all 39 CLI unit tests passed on Windows x86_64 with Rust 1.98.1, as did
 the package's clippy check over all targets and features with warnings denied.
 CI's one-CPU job ran the chunk store's test of the planned pass for five hours: a plan named an

@@ -160,8 +160,9 @@ proptest! {
             check_reads(&mut store, &mut trunk, &oracle)?;
             for _ in 0..*steps {
                 let used = trunk.step(&mut store, *budget).unwrap();
-                // A step merges its whole budget unless the maintenance ran out.
-                prop_assert!(used == *budget || trunk.is_idle(), "{} of {}", used, budget);
+                // One bounded pass may flush or split and queue work for the next pass
+                // (`Trunk::step`); every pass still stays within its work budget.
+                prop_assert!(used <= *budget, "{} past the budget of {}", used, budget);
                 check_reads(&mut store, &mut trunk, &oracle)?;
             }
         }

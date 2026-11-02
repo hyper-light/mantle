@@ -596,6 +596,18 @@ object; a free-sized zero-object result is capacity-only. All Mac 10 GiB ways re
 object, clean typed-capacity/listing results and empty stderr before the next case starts.
 This removes an indefinite wait for a preferred size while retaining the full result checks.
 
+**Controlled native multipart stop.** The next attempt, `box-16G-20261102-071744`, was
+incomplete: the existing disk guard stopped it when shared free space reached 19,958,525,952
+bytes, below the unchanged 20,000,000,000-byte floor. The three runtime `write(stdout)` errors
+came during that shutdown. The guard cleaned its disposable cell; raw output, errors and scope
+samples remain. No acknowledged-object or readback totals are inferred from this attempt.
+
+Three later checks found about 144.7 GB available, and the immediate pre-admission check found
+145,440,178,176 bytes. The queue resumed in a fresh cell, `box-16G-20261102-075358`, with the
+same binary, 16 GiB memory scope, 32 GiB reserve, disk floor and per-case bound. Its volumes are
+37,026,813,269 bytes each. The verified CLI case was skipped, and the queue now checks the
+complete large-result verification before advancing. The rerun's result remains pending.
+
 **What an object takes of a range's store.** For the engines' share of a node's memory, sized by
 what the cell's volumes hold (the owner's choice of 2026-10-31, node.md §1.4): the harness's small
 sets on this Mac (binary 4858a0d7, launchd at the shell's 1,048,576 descriptors), each object a

@@ -368,12 +368,20 @@ all three volume headers, with valid CRC-32C, showed only 105,398,599,680 data-r
 the log. Its geometry and logs were retained and its volumes removed; it has no completed-object
 or exactness result.
 
-Run `mac-100G-native-parts-20261102-003931` now retries with 120,259,084,288-byte (112 GiB)
-volumes on the same `17eb8032` binary. This is a revised budget awaiting an actual whole-object
-result. At its start, 389 GiB free less the 32 GiB reserve cannot hold two whole objects in three
-copies (600 GiB before overhead). The queue requires exactly one completed object from this
-fixed-volume case before proceeding. Later ways recalculate capacity; if two whole objects
-might fit, they use free-sized volumes. The runner stops an incomplete case if filesystem free
+Run `mac-100G-native-parts-20261102-003931` completed on `17eb8032` with
+120,259,084,288-byte (112 GiB) volumes: one 107,374,182,400-byte object, exit 0 after 8,446 s.
+Put/native/S3 read rates were 39/123/257 MiB/s. All 20,000 blocks placed their chunks on distinct
+nodes. Six native reads after the founder kills and restarts were exact, with none asked again,
+wrong or missing; the initial reads covered both APIs. All three controls caught. Each node held
+108,775,147,904 chunk bytes, with 8,325,104 bytes kept by none from the refused upload, exactly
+accounting for the received and locally put bytes; 8,404,992 bytes remained free. The next object,
+`l1`, was refused `InsufficientStorage`, unreadable and unlisted, and all acknowledged objects
+were listed. There were no other refusals. At the start, 389 GiB free less the 32 GiB reserve
+could not hold two whole objects in three copies (600 GiB before overhead), so one is the maximum
+whole-object count. Retiring the volumes left 366 GiB free. The next fixed-volume case needs
+368 GiB, so the remaining 10k/100k small sets now run before the remaining large ways; capacity
+waits start no data job. Later large ways recalculate capacity; if two whole objects might fit,
+they use free-sized volumes. The runner stops an incomplete case if filesystem free
 space falls below 30 GiB and reserves 32 GiB, including 2 GiB for metadata outside the volumes
 (about 0.7 GiB measured, with room for a checkpoint being replaced). The earlier finding that
 100 GiB did not fit was specific to the free space then.
@@ -381,14 +389,15 @@ space falls below 30 GiB and reserves 32 GiB, including 2 GiB for metadata outsi
 **Current-build acceptance.** The candidate product is `17eb8032`. Its complete matrix has
 22 slots across the two physical hosts (adacachy is the box): three small sets and four large
 upload ways at each of 10 and 100 GiB per host. Historical passes above remain historical;
-missing current-build slots stay pending. The first completed slot is the Mac's 1k set:
+missing current-build slots stay pending. The Mac's 1k set also completed:
 
-| Host / build | Case | Acknowledged native / S3 | Distinct-node blocks | Reads after kills | Again / refused / wrong / missing | Controls caught | Seconds |
+| Host / build | Case | Acknowledged native / S3 | Distinct-node blocks | Native reads after kills | Again / refused / wrong / missing | Controls caught | Seconds |
 |---|---|---|---|---|---|---|---|
 | Mac / `17eb8032` | small 1000 | 500 / 500 | 999 | 6,000 | 0 / 0 / 0 / 0 | 3 / 3 | 335 |
 
 Run `mac-small-1000-20261102-011230`, exit 0, empty harness stderr: 65,477,038 object bytes,
-every object read exactly through both APIs before and after each founder's kill and restart.
+every object read exactly through both APIs before the kills, and natively after each founder's
+kill and restart. The replication pass does not exercise S3 reads after a kill.
 Each node held 65,500,862 chunk bytes, exactly what it received and put, with no unkept bytes.
 The case used 256 MiB per node while the 100 GiB native multipart case ran on the same filesystem
 (load 10.62, 10.12, 11.20 at start). The 10k case's first preflight refused allocation before any
@@ -396,12 +405,23 @@ data job started as shared free space fell. Run `mac-small-10000-20261102-013310
 after headroom returned, but was stopped after 316 s, exit 143, when free space reached
 45,067,243,520 bytes, below its 42 GiB floor. It published no readback or restart totals and is
 incomplete. Its nodes' `write(stdout)` refusals followed the closed harness pipes. That
-overlapping attempt required 50 GiB free, including a 44 GiB reserve. The 10k and 100k sets now
-wait for the large-case sequence to finish and release its volumes before running sequentially.
-At this checkpoint, one of 22 slots is verified and the other 21 need terminal results.
+overlapping attempt required 50 GiB free, including a 44 GiB reserve. After the 100 GiB native
+multipart case released its volumes, the 10k and 100k sets were scheduled sequentially before
+the remaining large ways. The fresh 10k run is `mac-small-10000-20261102-034102`.
+At this checkpoint, two of 22 slots are verified under this harness and the other 20 remain open.
+Its replication pass reads natively; S3-after-kill readback is not part of these measured totals.
 
-The box's 1k and 10k sets can run in separate 16 GiB scopes alongside its earlier job while
-128 GiB of filesystem headroom remains; its final 100k set waits for the large-case sequence.
+The box's early 1k run on `17eb8032`, `box-16G-20261102-015302`, failed after 469 s during the
+replication pass with `the native door: the transport: Budget`. Placement and chunk accounting
+passed; no completed kill/readback totals were emitted. Its scope recorded no max/OOM events
+and peaked at 115,802,112 bytes, below the 16 GiB limit. The old runner removed the failed cell;
+future failures now retain their cells. A repeat at the original 1k size,
+`box-16G-20261102-031247`, passed in 271 s with 999 distinct-node blocks, 6,000 exact native restart
+reads, no retries/refusals/wrong/missing, and all controls caught. The earlier intermittent refusal
+is still unresolved; the repeat does not close it. Smaller diagnostic sets of 2, 128 and 512
+objects passed in 65, 118 and 177 s and receive no credit for the required case sizes. A separate
+diagnostic build records the local refusal's origin; no product fix or larger limit is asserted.
+The box's remaining official small sets are held pending that diagnosis.
 The Mac also queues reruns
 of its other three
 10 GiB ways after those small sets; its canceled boto3 case is already in the large-case sequence.

@@ -501,22 +501,27 @@ totals were published, so it remains incomplete. Retiring its volumes restored 4
 104 GiB volumes held zero whole 100 GiB objects: the CRC-checked headers reserve only 98.16 GiB
 for data, less than the plaintext object alone. That sizing failure is not a 100 GiB readback
 pass or a conclusion about the Mac's capacity. The follow-on boto3 attempt was canceled and its
-geometry retained. A fresh native parts' case now uses 112 GiB per node and must acknowledge one
-whole object before the queue advances. Its result is pending, followed by the other ways and
-the 10 GiB boto3 rerun ([measurements](measurements/2026-10-28-transfer-scale.md)). A node started again
+geometry retained. The fresh native parts' case on 112 GiB per node passed after 8,446 s: one
+100 GiB object, 20,000 blocks each on distinct nodes, six exact native reads after the founder
+kills, no retries or wrong/missing objects, all controls caught, and a typed full refusal of the
+next key with no other refusals. Its initial reads covered native and S3. The remaining ways and
+the 10 GiB boto3 rerun remain pending ([measurements](measurements/2026-10-28-transfer-scale.md)). A node started again
 judges no peer until its links are measured, and a leader killed meanwhile is not replaced
 (hyper-liveness's young links, an owner decision since 2026-10-16); step 1 ends a request's step
 there `SlowDown` where it had waited, which CI's windows-aarch64 met in mantle's node tests, which
 now kill a node once every link is judged.
 On `17eb8032`, the Mac's 1k set then passed in 335 s alongside the active 100 GiB multipart case:
 500 objects put natively and 500 through S3, all read exactly through both APIs, 999 blocks each
-on distinct nodes, 6,000 reads after the founder kills, no retries, refusals, wrong or missing
+on distinct nodes, 6,000 native reads after the founder kills, no retries, refusals, wrong or missing
 objects, and all three controls caught. Its terminal log is `mac-small-1000-20261102-011230`.
 The 10k queue waits for enough space before starting a cell; its first guarded preflight
 started no data job. A fresh overlapping attempt then ran for 316 s before the 42 GiB free-space
-guard stopped it, with no final integrity totals. Both the 10k rerun and 100k set now wait for
-the large cases to release their volumes. One of the candidate's 22
-host/case slots is verified at this checkpoint; the Scale goal remains active.
+guard stopped it, with no final integrity totals. The completed 100 GiB run released its volumes,
+so the 10k rerun and 100k set now run before the remaining large ways. Two of the candidate's 22
+host/case slots are verified under the current harness; its restart reads are native only.
+The box's early 1k attempt ended during restart reads with native transport `Budget` after 469 s;
+a repeat passed in 271 s, but the intermittent refusal remains under diagnosis and is not
+considered fixed. The Scale goal remains active.
 CI's one-CPU job ran the chunk store's test of the planned pass for five hours: a plan named an
 empty segment by its number, the writer freed it and the pass opened it again for its first
 victim's records, then cleaned it as its second victim, moving its own output into the last free

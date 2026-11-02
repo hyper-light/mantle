@@ -555,9 +555,13 @@ for the next key. Its scope peaked at 3,415,420,928 bytes with no max/OOM events
 The fresh native multipart rerun then passed in 3,144 s with three 10 GiB objects, 7,680
 distinct-node blocks, 18 exact native restart reads, no re-asks/wrong/missing, all controls
 caught, and typed full for native `l3`. Its scope peaked at 283,058,176 bytes with no max/OOM
-events. The earlier disk-guard stop remains incomplete. Nine of 22 slots now have complete
-current-harness evidence, retaining their recorded builds. The Box's 100k set and the two
-hosts' S3 multipart cases are active. The Mac's remaining 100 GiB cases now use
+events. The earlier disk-guard stop remains incomplete. S3 multipart then passed in 6,785 s
+with five 10 GiB objects, 12,800 distinct-node blocks and 30 exact native restart reads, one
+re-ask, no wrong/missing objects, all controls caught, and typed full for HTTP `l5`. Its 16 GiB
+scope reported a 17,180,639,232-byte peak and 10,791 `max` pressure events, with no OOM events.
+All four Box 10 GiB ways now have separate verified cases. Ten of 22 slots have complete
+current-harness evidence, retaining their recorded builds. The Box's 100k set and 100 GiB
+native case and the Mac's 100 GiB S3 multipart case are active. The Mac's remaining 100 GiB cases now use
 the capacity available after the existing reserve. A result with no whole object records
 capacity only. The Scale goal remains active.
 The box's earlier `0100ddd8` 100k set ended exit 0 after 40,804 s: all 100,000 objects acknowledged,

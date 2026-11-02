@@ -10,12 +10,13 @@ distinct nodes, every acknowledged object read back after each founder is killed
 and each large case ending at the typed refusal with the count held beside the volumes' stated
 capacity?
 
-**Checkpoint, 2026-11-02.** The reader fix is on main at `a57eaea7`. Nine of the 22 host/case
+**Checkpoint, 2026-11-02.** The reader fix is on main at `a57eaea7`. Ten of the 22 host/case
 slots have complete current-harness evidence with their build attribution below. The Mac's
 100k set and the Box's 10 GiB native multipart case passed; the Box's 100k set and remaining
 large ways are still running. Capacity-only zero-object results receive no
 whole-object readback credit. The full Box workspace gate still has its recorded engine
 file-limit failure; the client, vendor and scale results retain their separate scopes.
+All four Box 10 GiB upload ways now have complete results from separate cells.
 
 **The machines.** adacachy is the bare-metal box (the owner was told on 2026-10-27 that they are one
 machine): AMD Ryzen 9 9950X3D2, 16 cores and 32 threads, 122 GiB, `/home` on btrfs on a Samsung
@@ -628,6 +629,22 @@ Each node held 34,552,721,408 chunk bytes plus 8,325,104 unkept bytes, exactly a
 8,404,992 bytes free. Its 16 GiB scope peaked at 283,058,176 bytes with no max/OOM events.
 The complete result verifier passed before the queue admitted the fresh S3 multipart case.
 This adds one case to acceptance; the earlier guard-stopped attempt remains incomplete.
+
+**Fresh S3 multipart 10 GiB result.** `box-16G-20261102-084821/large-10G` ended exit 0 after
+6,785 s with empty stderr on the same fixed reader binary. It acknowledged five whole objects
+(53,687,091,200 bytes), read them exactly through native and S3 initially, placed all 12,800
+blocks on distinct nodes, and completed 30 exact native reads after founder kills and restarts.
+There was one re-ask during restart readback, zero wrong or missing objects, and all three
+controls caught their faults. HTTP `l5` was refused full, unreadable and unlisted; acknowledged
+keys were listed, with no other refusal. Put/native/S3 rates were 16/169/306 MiB/s.
+
+The case began with 223,134,056,448 bytes free and the same 34,359,738,368-byte reserve, giving
+62,924,772,693 bytes per node. Each node held 59,112,171,520 chunk bytes plus 8,325,104 unkept
+bytes, exactly accounted, with 8,404,992 bytes free. The 16 GiB memory scope reported a peak
+of 17,180,639,232 bytes and 10,791 `max` pressure events, with zero OOM/OOM-kill events; the
+recorded peak is retained as reported by the kernel. The complete verifier passed before
+the queue admitted its first fresh 100 GiB case. These four Box 10 GiB ways used different
+free-space budgets; their object counts are recorded per case rather than combined.
 
 **What an object takes of a range's store.** For the engines' share of a node's memory, sized by
 what the cell's volumes hold (the owner's choice of 2026-10-31, node.md §1.4): the harness's small

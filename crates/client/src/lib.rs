@@ -1308,7 +1308,7 @@ impl Client {
                         took_from_source(upload, &self.piece, n)?;
                         continue;
                     }
-                    Either3::Second(event) => self.keep(event?),
+                    Either3::Second(event) => Self::keep(&mut self.nodes, event?),
                     Either3::Third(slept) => {
                         slept?;
                         self.driver.endpoint().end(exchange);
@@ -1351,7 +1351,7 @@ impl Client {
                         hasher: None,
                     });
                     if let Some(done) = self
-                        .read_reply(exchange, reading, &mut sink, deadline_ns)
+                        .read_reply(exchange, reading, &mut sink, deadline_ns, upload.is_none())
                         .await?
                     {
                         return Ok(Attempt::Replied(Box::new(done)));
@@ -1360,7 +1360,7 @@ impl Client {
                 Event::BodyReady { exchange: e } if e == exchange => {
                     if let Some(reading) = reply.as_mut()
                         && let Some(done) = self
-                            .read_reply(exchange, reading, &mut sink, deadline_ns)
+                            .read_reply(exchange, reading, &mut sink, deadline_ns, upload.is_none())
                             .await?
                     {
                         return Ok(Attempt::Replied(Box::new(done)));
@@ -1392,7 +1392,8 @@ impl Client {
                     if refusal == Refusal::Closed {
                         while let Some(event) = self.driver.endpoint().poll_event() {
                             if let Event::Closed { peer, refusal, .. }
-                            | Event::Unreachable { peer, refusal } = self.keep(event)
+                            | Event::Unreachable { peer, refusal } =
+                                Self::keep(&mut self.nodes, event)
                                 && peer == node
                                 && let Some(refusal) = refusal
                             {
@@ -1492,6 +1493,7 @@ impl Client {
         reading: &mut Reading,
         sink: &mut Option<&mut K>,
         deadline_ns: u64,
+        use_owned_piece: bool,
     ) -> Result<Option<Reply>, ClientError> {
         let fields = usize::try_from(reading.head.fields()).unwrap_or(usize::MAX);
         loop {
@@ -1499,21 +1501,50 @@ impl Client {
                 self.driver.endpoint().end(exchange);
                 return Err(ClientError::Deadline);
             }
-            let mut piece = self
-                .driver
-                .endpoint()
-                .reserve(Class::Transfer, u64::try_from(PIECE).unwrap_or(u64::MAX))?;
-            let read = self.driver.endpoint().read_body(exchange, &mut piece);
-            let poured = self
-                .take_piece(
-                    exchange,
-                    reading,
-                    piece.bytes(),
-                    (fields, sink),
-                    deadline_ns,
+            // The client's piece is already charged by `memory`. A source may still own
+            // unsent bytes in it, but a get needs no second grant from a busy transport.
+            let mut piece = if use_owned_piece {
+                self.piece
+                    .try_reserve_exact(PIECE.saturating_sub(self.piece.len()))
+                    .map_err(|_| ClientError::Bounds("the client's piece".into()))?;
+                hyper_transport::Reservation::new(
+                    u64::try_from(PIECE).unwrap_or(u64::MAX),
+                    std::mem::take(&mut self.piece),
                 )
-                .await;
-            self.driver.endpoint().release(piece);
+            } else {
+                self.driver
+                    .endpoint()
+                    .reserve(Class::Transfer, u64::try_from(PIECE).unwrap_or(u64::MAX))?
+            };
+            let read = self.driver.endpoint().read_body(exchange, &mut piece);
+            let length = piece.bytes().len();
+            let transport_piece = if use_owned_piece {
+                self.piece = piece.into_buffer();
+                // Restore before awaiting the sink, including when that wait is cancelled.
+                self.piece.resize(PIECE, 0);
+                None
+            } else {
+                Some(piece)
+            };
+            let bytes = match transport_piece.as_ref() {
+                Some(piece) => piece.bytes(),
+                None => self
+                    .piece
+                    .get(..length)
+                    .ok_or(ClientError::Reply("a reply piece past the client's buffer"))?,
+            };
+            let poured = Self::take_piece(
+                (&mut self.driver, &mut self.nodes),
+                exchange,
+                reading,
+                bytes,
+                (&mut self.fields, fields, sink),
+                deadline_ns,
+            )
+            .await;
+            if let Some(piece) = transport_piece {
+                self.driver.endpoint().release(piece);
+            }
             poured?;
             match read {
                 Ok(0) => break,
@@ -1554,21 +1585,21 @@ impl Client {
     /// Takes a piece of a reply's body: its front to the fields, which are decoded once whole, and
     /// the rest, a get's bytes, hashed and poured into the sink.
     async fn take_piece<K: Sink>(
-        &mut self,
+        (driver, nodes): (&mut Driver<NodeClasses, Fixed, Nodes>, &mut [Known]),
         exchange: ExchangeId,
         reading: &mut Reading,
         bytes: &[u8],
-        (fields, sink): (usize, &mut Option<&mut K>),
+        (held, fields, sink): (&mut Vec<u8>, usize, &mut Option<&mut K>),
         deadline_ns: u64,
     ) -> Result<(), ClientError> {
-        let into_fields = fields.saturating_sub(self.fields.len()).min(bytes.len());
+        let into_fields = fields.saturating_sub(held.len()).min(bytes.len());
         let (front, rest) = bytes.split_at(into_fields);
-        self.fields.extend_from_slice(front);
+        held.extend_from_slice(front);
         reading.got = reading
             .got
             .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-        if reading.decoded.is_none() && self.fields.len() == fields {
-            let decoded = reading.head.reply(&self.fields)?;
+        if reading.decoded.is_none() && held.len() == fields {
+            let decoded = reading.head.reply(held)?;
             // A get's bytes, which its sink takes, are held to the checksum kept.
             if sink.is_some() {
                 reading.hasher = hasher_for(&decoded)?;
@@ -1584,7 +1615,7 @@ impl Client {
                 .map_err(|e| ClientError::Bounds(format!("{e:?}")))?;
         }
         let Some(sink) = sink.as_deref_mut() else {
-            self.driver.endpoint().end(exchange);
+            driver.endpoint().end(exchange);
             return Err(ClientError::Reply("bytes after an answer that has none"));
         };
         // The sink's write races the transport and the caller's own deadline: neither a sink
@@ -1593,23 +1624,23 @@ impl Client {
         loop {
             let left = deadline_ns.saturating_sub(hyper_rt::futures::now_ns());
             if left == 0 {
-                self.driver.endpoint().end(exchange);
+                driver.endpoint().end(exchange);
                 return Err(ClientError::Deadline);
             }
             let raced = {
                 let write = pin!(sink.write(rest));
-                let event = pin!(self.driver.event());
+                let event = pin!(driver.event());
                 let sleep = pin!(hyper_rt::futures::sleep(left));
                 race3(write, event, sleep).await
             };
             match raced {
                 Either3::First(wrote) => return wrote.map_err(ClientError::Sink),
                 Either3::Second(event) => {
-                    self.keep(event?);
+                    Self::keep(nodes, event?);
                 }
                 Either3::Third(slept) => {
                     slept?;
-                    self.driver.endpoint().end(exchange);
+                    driver.endpoint().end(exchange);
                     return Err(ClientError::Deadline);
                 }
             }
@@ -1724,7 +1755,7 @@ impl Client {
             return Ok(None);
         }
         if let Some(event) = self.driver.endpoint().poll_event() {
-            return Ok(Some(self.keep(event)));
+            return Ok(Some(Self::keep(&mut self.nodes, event)));
         }
         let ended = {
             let event = pin!(self.driver.event());
@@ -1732,7 +1763,7 @@ impl Client {
             race2(event, sleep).await
         };
         match ended {
-            Either::First(event) => Ok(Some(self.keep(event?))),
+            Either::First(event) => Ok(Some(Self::keep(&mut self.nodes, event?))),
             Either::Second(slept) => {
                 slept?;
                 Ok(None)
@@ -1741,10 +1772,10 @@ impl Client {
     }
 
     /// Keeps what a connection's event says of it.
-    fn keep(&mut self, event: Event<NodeClasses>) -> Event<NodeClasses> {
+    fn keep(nodes: &mut [Known], event: Event<NodeClasses>) -> Event<NodeClasses> {
         match &event {
             Event::Connected { peer, epoch, .. } => {
-                if let Some(node) = self.nodes.iter_mut().find(|n| n.id == *peer) {
+                if let Some(node) = nodes.iter_mut().find(|n| n.id == *peer) {
                     node.connected = true;
                     node.epoch = *epoch;
                     node.refused = None;
@@ -1752,10 +1783,10 @@ impl Client {
             }
             Event::Closed { peer, refusal, .. } | Event::Unreachable { peer, refusal } => {
                 let peer = *peer;
-                if let Some(node) = self.nodes.iter_mut().find(|n| n.id == peer) {
+                if let Some(node) = nodes.iter_mut().find(|n| n.id == peer) {
                     node.refused = *refusal;
+                    node.connected = false;
                 }
-                self.lost(peer);
             }
             _ => {}
         }
@@ -2163,8 +2194,155 @@ fn untaken(refusal: Refusal) -> bool {
 }
 
 #[cfg(test)]
+extern crate self as mantle_client;
+
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+#[allow(
+    dead_code,
+    clippy::large_enum_variant,
+    clippy::cast_possible_truncation
+)]
+mod test_support;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Other connections can occupy the transport while a reply is read. The client's own
+    /// already-accounted piece must still read the reply without a second transport grant.
+    #[test]
+    fn a_get_finishes_with_less_than_a_piece_free_in_the_transport() {
+        let (node, credentials) = crate::test_support::credentials();
+        let capacity = least_transport(1).unwrap();
+        let length = u64::try_from(PIECE / 16).unwrap();
+        let (tell, bound) = std::sync::mpsc::channel();
+        let served = std::thread::spawn(move || {
+            crate::test_support::stub(node, capacity, (length, None), tell)
+        });
+        let address = bound.recv().unwrap();
+        let (answer, read) = crate::test_support::runtime(sockets(1).unwrap())
+            .block_on(async move {
+                let mut client = Client::open(Settings {
+                    id: crate::test_support::CLIENT,
+                    bind: "127.0.0.1:0".parse().unwrap(),
+                    credentials,
+                    nodes: vec![(crate::test_support::NODE, address)],
+                    transport_bytes: capacity,
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    client
+                        .call(&Op::HeadBucket { bucket: "b".into() }, u64::MAX)
+                        .await
+                        .unwrap()
+                        .status,
+                    Status::Done
+                );
+                let used = client.driver.endpoint().budget().used();
+                let left = u64::try_from(PIECE / 2).unwrap();
+                assert!(capacity - used >= u64::try_from(PIECE).unwrap());
+                let occupied = client
+                    .driver
+                    .endpoint()
+                    .reserve(Class::Transfer, capacity - used - left)
+                    .unwrap();
+                let mut sink = crate::test_support::Checked { at: 0 };
+                let get = Op::Get {
+                    bucket: "b".into(),
+                    key: "k".into(),
+                    headers: object::Headers::default(),
+                };
+                let answer = client
+                    .get(&get, &mut sink, u64::MAX)
+                    .await
+                    .map(|r| r.status);
+                client.driver.endpoint().release(occupied);
+                let read = sink.at;
+                drop(client);
+                (answer, read)
+            })
+            .unwrap();
+        served.join().unwrap();
+        assert!(
+            matches!(answer, Ok(Status::Done)),
+            "reply under transport pressure: {answer:?}"
+        );
+        assert_eq!(read, length);
+    }
+
+    /// Cancelling a get while its sink holds a piece leaves that piece available to the
+    /// next upload; no buffer is owned by the cancelled future.
+    #[test]
+    fn a_get_cancelled_at_its_sink_leaves_the_next_puts_piece_intact() {
+        struct Held<'a>(&'a std::cell::Cell<bool>);
+        impl Sink for Held<'_> {
+            async fn write(&mut self, _: &[u8]) -> std::io::Result<()> {
+                self.0.set(true);
+                std::future::pending().await
+            }
+        }
+        let (node, credentials) = crate::test_support::credentials();
+        let capacity = least_transport(1).unwrap();
+        let (tell, bound) = std::sync::mpsc::channel();
+        let served =
+            std::thread::spawn(move || crate::test_support::stub(node, capacity, (1, None), tell));
+        let address = bound.recv().unwrap();
+        crate::test_support::runtime(sockets(1).unwrap())
+            .block_on(async move {
+                let mut client = Client::open(Settings {
+                    id: crate::test_support::CLIENT,
+                    bind: "127.0.0.1:0".parse().unwrap(),
+                    credentials,
+                    nodes: vec![(crate::test_support::NODE, address)],
+                    transport_bytes: capacity,
+                })
+                .await
+                .unwrap();
+                let entered = std::cell::Cell::new(false);
+                let mut held = Held(&entered);
+                let get = Op::Get {
+                    bucket: "b".into(),
+                    key: "k".into(),
+                    headers: object::Headers::default(),
+                };
+                {
+                    let get = pin!(client.get(&get, &mut held, u64::MAX));
+                    let mut get = get;
+                    std::future::poll_fn(|cx| {
+                        assert!(get.as_mut().poll(cx).is_pending());
+                        if entered.get() {
+                            std::task::Poll::Ready(())
+                        } else {
+                            std::task::Poll::Pending
+                        }
+                    })
+                    .await;
+                }
+                let put = Op::Put {
+                    bucket: "b".into(),
+                    key: "next".into(),
+                    id: identity().unwrap(),
+                    length: 1,
+                    headers: object::Headers::default(),
+                    checksum: None,
+                    md5: None,
+                    trailing: Some(TRAILER),
+                };
+                let reply = client
+                    .put(
+                        &put,
+                        &mut crate::test_support::Made { at: 0, length: 1 },
+                        u64::MAX,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(reply.status, Status::Done);
+            })
+            .unwrap();
+        served.join().unwrap();
+    }
 
     /// botocore's quota: a hundred slowed retries spend its 500 units, the next is not paid for;
     /// an answer after retries gives back what they took, one without them a unit, never past 500.

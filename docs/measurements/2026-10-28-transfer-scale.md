@@ -503,8 +503,68 @@ quota, deadline or retry count changed.
 The repeated-restart diagnostic, `box-16G-20261102-040748/small-1000`, then completed 30 kills
 and restarts with 60,000 exact native reads and no retries or wrong/missing objects. The isolated
 probe `budget-reopen-17eb8032.log` created and dropped 10,000 clients on one runtime in 0.29 s
-without a refusal. Neither reproduces or fixes the original intermittent `Budget`, which remains
-open.
+without a refusal. Neither probe reproduced the original intermittent `Budget`.
+
+**Reply-buffer failure isolated, 2026-11-02.** The backtrace-only build of `17eb8032`,
+SHA-256 `ed74f12a1bcbd8496e26af14f47502f4a727ffe8ea4ffcc8b07aa80f785f05f4`, reproduced
+that refusal in `box-16G-20261102-052226/small-10000`, exit 1 after 1,251 s. Placement had
+passed for 9,999 blocks of 10,000 acknowledged objects. The backtrace ends at
+`Client::read_reply` reserving `PIECE` from the local transport after a founder restart.
+This is the reader's scratch-buffer allocation, rather than a peer refusal or an OOM event.
+The client already owns a `PIECE` charged separately in `Client::memory`.
+
+The direct regression uses a live connection and reserves other transport memory until less
+than `PIECE` remains, then reads a real GET into the exact-byte checker. Old code returns
+`Transport(Budget)`; reusing the existing client buffer passes at the same transport capacity.
+Source uploads retain their unsent bytes in that buffer and use their existing reply path.
+The owned buffer is restored before awaiting the sink, including when that wait is cancelled;
+a second regression cancels at the sink and verifies the next upload's checksum and answer.
+Neither the client's stated memory nor its retries, deadlines or transport budget is increased.
+The clean candidate passed all 17 client tests: five unit, two heap, five progress and five
+resume tests. The heap test's peaks were 349,040 and 348,855 bytes against the unchanged
+3,823,855-byte bound. Workspace all-targets/all-features clippy, production checks, contracts,
+formatting and the dependency audit passed. Jupiter's Windows x86_64 run (`r4`, Rust 1.98.1)
+passed all five unit tests and package all-targets/all-features clippy. The Mac also passed all
+17 client tests: its heap peaks were 342,578 and 343,234 bytes against the unchanged 3,821,135-byte
+bound. Fresh Box 1k/10k runs and
+the retained 10k cell's replay use the candidate binary with SHA-256
+`b69e581448d8aac3eb32184096245170e3379e4624b242a50e85b0053036e166`. The vendor suite
+passed. The full workspace run stopped at the same three unchanged engine `ranges_room` tests:
+`Too many open files (os error 24)`, with soft/hard limits still 1,024/1,048,576. Earlier
+native, S3, serve, stock-client and transfer-harness suites passed; packages after the failure
+were not reached. The failed gate remains recorded, with no descriptor limit adjustment. The fresh Box 1k
+case, `box-16G-20261102-061338/small-1000`, then passed in 211 s: 500 native and 500 S3
+objects, 65,477,038 bytes, 999 blocks on distinct nodes, 6,000 exact native restart reads, no
+re-asks/refusals/wrong/missing, all three controls and empty stderr. Its 16 GiB scope peaked
+at 115,527,680 bytes with no max/OOM events. The fresh 10k successor passed in 1,225 s:
+5,000 native and 5,000 S3 objects, 654,185,067 bytes, 9,999 blocks on distinct nodes, 60,000 exact
+native restart reads, no re-asks/refusals/wrong/missing, all three controls and empty stderr.
+Each node's 654,424,107 chunk bytes were accounted exactly with none unkept. Its 16 GiB scope
+peaked at 263,569,408 bytes with no max/OOM events.
+This result is attributed to the reply-buffer candidate, rather than retroactively changing the
+failed `17eb8032` attempts. The three Mac passes and Box native 10 GiB pass retain their
+`17eb8032` attribution.
+
+The retained 10k cell then passed on the fixed reader in 397.74 s: all 10,000 initial native
+reads, placement of 9,999 blocks, and 60,000 native restart reads exact, with no re-asks or
+wrong/missing objects. This recovered-cell replay is additional evidence for the fix, separate
+from the fresh 10k run's full acceptance result.
+
+The retained failed 10 GiB multipart cell also passed on the fixed reader in 799.21 s: both
+10,737,418,240-byte objects read exactly initially, all 5,120 blocks on distinct nodes, and
+12 exact native restart reads with no re-asks/wrong/missing. Its 78 metadata files were archived,
+compared byte for byte and flushed before replay. After the successful replay and verification
+that no node still served the cell, its three chunk volumes were removed; the archive, raw
+failure, replay log and verified result remain. This recovers the acknowledged objects and does
+not relabel the failed fresh multipart case as passed. A fresh Box 100k case then started on
+16 GiB/node volumes in the unchanged 16 GiB memory scope.
+
+After `stat` verified all three 16 GiB files fully allocated, the remaining large-case queue
+resumed on fresh cells with a 32 GiB reserve and the unchanged 20,000,000,000-byte disk floor.
+The reserve leaves room for the active small case's metadata; free space is read for every large
+case. Each 10 GiB way still requires a whole object and full terminal checks. A 100 GiB case
+that cannot hold one is capacity-only evidence. The earlier verified native 10 GiB result keeps
+its `17eb8032` attribution.
 
 **What an object takes of a range's store.** For the engines' share of a node's memory, sized by
 what the cell's volumes hold (the owner's choice of 2026-10-31, node.md §1.4): the harness's small

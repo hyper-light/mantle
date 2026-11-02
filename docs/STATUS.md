@@ -530,7 +530,24 @@ considered fixed. Its 10k set also ended with that refusal after 1,882 s: placem
 accounting passed, but there are no completed restart totals. The failed cell's 86 files were
 copied, byte-compared and flushed before a separate replay read all 10,000 objects and 60,000
 native restart reads exactly in 258.37 s. That replay did not reproduce or fix the refusal.
-The Scale goal remains active.
+A backtrace-only 10k trial then reproduced it after 1,251 s: `Client::read_reply` asked
+its transport for a second piece despite already owning one charged in `Client::memory`.
+The direct regression fails `Transport(Budget)` on old code and passes by reusing that owned
+piece for source-free requests at the same memory budget. Active uploads retain their unsent
+bytes; cancellation at a GET sink leaves the next upload's buffer intact. All 17 client tests,
+workspace clippy, production checks and the dependency audit passed; the Mac passed all 17
+client tests too. Windows x86_64 also passed
+the five unit tests and package clippy. The fresh candidate Box 1k case passed in 211 s with
+all 1,000 objects and 6,000 native restart reads exact, placement and controls caught, no retries
+or refusals. The retained 10k cell also passed 10,000 initial reads and 60,000 restart reads
+exactly in 397.74 s, with no re-asks. The fresh 10k case also passed in 1,225 s: all 10,000
+objects, 9,999 distinct-node blocks and 60,000 native restart reads exact, no re-asks/refusals or
+wrong/missing objects, all controls caught. The retained two-object multipart cell passed all
+12 native restart reads in 799.21 s; its logs and archived metadata remain after releasing its
+chunk volumes. The fresh Box 100k case is active. The vendor suite passed. The full workspace run again
+failed the three unchanged engine `ranges_room` tests at `Too many open files`, under the
+unchanged soft limit of 1,024 (hard 1,048,576); packages after that failure were not reached.
+The client fix is not a full green workspace gate. The Scale goal remains active.
 The box's earlier `0100ddd8` 100k set ended exit 0 after 40,804 s: all 100,000 objects acknowledged,
 99,998 distinct-node blocks, 600,000 exact native reads after kills, no retries, refusals, wrong
 or missing objects, and all controls caught. It is older-build evidence; the candidate's 100k

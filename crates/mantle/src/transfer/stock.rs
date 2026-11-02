@@ -371,6 +371,48 @@ impl Cli {
         }
     }
 
+    /// A successful CLI copy may have skipped the upload: AWS CLI 2.38.5 treats
+    /// PreconditionFailed as a skip and exits 0 without saying it (research/76). A fresh case's
+    /// key must therefore exist at its stated length before it enters the acknowledgment
+    /// oracle. The later exact reads and placement checks still judge all its bytes and blocks.
+    fn uploaded(&self, (bucket, key): (&str, &str), length: u64) -> Result<(), StockError> {
+        let head = self
+            .command(&[
+                "s3api",
+                "head-object",
+                "--bucket",
+                bucket,
+                "--key",
+                key,
+                "--query",
+                "ContentLength",
+                "--output",
+                "text",
+            ])?
+            .stdin(Stdio::null())
+            .output()
+            .map_err(io("the AWS CLI's uploaded-object check"))?;
+        if !head.status.success() {
+            let said = std::fs::read_to_string(&self.errors).map_err(io("the CLI's errors"))?;
+            return Err(StockError::Said(format!(
+                "aws s3 cp exited successfully but its uploaded object {bucket}/{key} failed \
+                 HeadObject ({}): {said}",
+                head.status
+            )));
+        }
+        // The query emits the SDK's integer ContentLength, not an object body or a listing.
+        let held = String::from_utf8(head.stdout)
+            .ok()
+            .and_then(|said| said.trim().parse::<u64>().ok());
+        if held != Some(length) {
+            return Err(StockError::Said(format!(
+                "aws s3 cp exited successfully but its uploaded object {bucket}/{key} has \
+                 length {held:?}, expected {length}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Puts `object`, `length` bytes, at `key` in `bucket` from the CLI's standard input, the
     /// bytes made a piece at a time as they are written to it.
     pub fn put(
@@ -399,6 +441,10 @@ impl Cli {
             // A CLI that refused stopped reading: what it said is the answer.
             (_, refused @ Came::Refused(_)) => Ok(refused),
             (Err(e), _) => Err(e),
+            (Ok(()), Came::Done) => {
+                self.uploaded((bucket, key), length)?;
+                Ok(Came::Done)
+            }
             (Ok(()), came) => Ok(came),
         }
     }
@@ -461,3 +507,7 @@ impl Cli {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "stock/tests.rs"]
+mod tests;

@@ -159,6 +159,24 @@ thread and a reader a node (docs/measurements/2026-10-27-transfer-harness.md). T
 nowhere but the directory its operator names, and runs only where its operator runs it: a case
 fills the volumes it states (f7).
 
+## A successful CLI exit can be a skipped upload (2026-11-02)
+
+[AWS CLI 2.38.5's result subscribers](https://github.com/aws/aws-cli/blob/2.38.5/awscli/customizations/s3/results.py)
+turn `PreconditionFailed` into `SkipFileResult`. That increments the skipped count, while the
+command's failure count includes only failed files and errors. The CLI can therefore abort a
+multipart upload and exit 0 with empty stderr, despite having completed no object. The installed
+CLI reproduced this against a loopback HTTP fixture in 1.35 s; an injected storage refusal instead
+returned exit 1. The harness's regression uses the real CLI and a 9 MiB multipart body: before
+the fix `Cli::put` returned `Done` after the injected 412 and Abort; after it the missing object
+is a typed `StockError`, not an acknowledgment.
+
+For the harness's fresh keys, a successful `aws s3 cp` now has to pass `HeadObject` with the
+stated length before entering the acknowledgment oracle. This does not prove its bytes or
+durability: the existing complete reads through both doors, placement inspection and native
+kill/restart reads still do that. The SDK's retry and timeout settings are unchanged. Neither
+the original Box CLI upload's overwritten error nor the Mac's earlier generic error was recovered;
+the injected-412 reproduction does not establish either original failure's cause.
+
 ## Open
 
 - The harness's waits end on the line they wait for or on a process's end: a node that hangs

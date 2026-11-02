@@ -559,15 +559,42 @@ events. The earlier disk-guard stop remains incomplete. S3 multipart then passed
 with five 10 GiB objects, 12,800 distinct-node blocks and 30 exact native restart reads, one
 re-ask, no wrong/missing objects, all controls caught, and typed full for HTTP `l5`. Its 16 GiB
 scope reported a 17,180,639,232-byte peak and 10,791 `max` pressure events, with no OOM events.
-All four Box 10 GiB ways now have separate verified cases. Ten of 22 slots have complete
-current-harness evidence, retaining their recorded builds. The Box's 100k set and 100 GiB
-native case and the Mac's 100 GiB S3 multipart case are active. The Mac's remaining 100 GiB cases now use
-the capacity available after the existing reserve. A result with no whole object records
-capacity only. The Scale goal remains active.
+All four Box 10 GiB ways now have separate verified cases. The Box's 100k set then passed in
+19,110 s: all 100,000 objects, 99,998 distinct-node blocks and 600,000 native restart reads
+exact, no re-asks/refusals/wrong/missing, all controls caught; scope peak 1,671,155,712 bytes
+with no max/OOM events. Eleven of 22 slots have complete readback evidence with their recorded
+builds. A free-sized Box 100 GiB native case ended with a clean typed full refusal and no whole
+object in 2,845 s; it records capacity only.
+The Mac's 100 GiB S3 multipart case failed after 9,804 s with no whole object, generic
+`l0 Failed`, then typed full for `l1`. A retained-cell probe and a fresh 128 MiB/node probe both
+returned the correct 507 and have not reproduced that failure. The Box's following 100 GiB
+CLI case failed after 2,769 s while reading `l0`'s current version; its acknowledgment and
+readback remain unresolved. The three retained Box logs agree on contiguous Name indexes
+1–5,931: both uploads have Abort commands and neither has a Complete or Put. The original CLI
+receipt was overwritten, so this does not establish a lost committed object. The Box's full
+failed cell is retained. The Mac's metadata, chunk indexes and segment headers are archived
+and verified; its zero-whole-object aborted data was
+then reclaimed to restore the reserve. The large-case queues stopped. These cases receive no
+acceptance credit. A full-sized Mac S3 multipart rerun with raw SDK error capture then ended
+cleanly in 2,540 s: typed 507 on its first object, unreadable and unlisted, zero SDK retries,
+exact chunk accounting and the missing-key control caught. No whole object fit. The matrix
+now has 11 readback cases, two capacity-only results and nine unresolved slots; the earlier
+generic error remains unexplained.
+The Box's native multipart 100 GiB case then ended cleanly in 1,064 s with no whole object,
+typed full for `l0`, exact chunk accounting and the missing-key control caught. Its scope peaked
+at 258,879,488 bytes with no max/OOM events. There are now three capacity-only results and eight
+unresolved slots, alongside the 11 readback cases. A fresh Mac 10 GiB native case is active.
+The real AWS CLI also reproduced a skipped multipart upload returning exit 0 with no object
+after an injected 412. The harness regression went red with `Ok(Done)` and green after requiring
+`HeadObject` at the expected length before counting a CLI copy as acknowledged. This fixes the
+exit-status assumption; the original Box error remains unknown. The Scale goal remains active.
+All 41 command-line unit tests, the real-process four-way capacity test, all-target Clippy and
+the production gate passed for this fix. The recorded full-workspace file-limit failure remains
+separate.
 The box's earlier `0100ddd8` 100k set ended exit 0 after 40,804 s: all 100,000 objects acknowledged,
 99,998 distinct-node blocks, 600,000 exact native reads after kills, no retries, refusals, wrong
-or missing objects, and all controls caught. It is older-build evidence; the candidate's 100k
-slot still needs its own result. That job has advanced to its combined 10 GiB capacity case.
+or missing objects, and all controls caught. It is older-build evidence; the fresh 100k result
+above supplies the later build's evidence. That older job advanced to its combined 10 GiB case.
 The older combined case then passed in 2,887 s with three 10 GiB objects, 6,411 distinct-node
 blocks and 18 exact native restart reads. It held one native, one CLI and one native multipart
 object; boto3 multipart held none. The final build's fresh per-way cells remain separate checks.

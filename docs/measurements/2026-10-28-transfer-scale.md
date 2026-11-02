@@ -10,11 +10,14 @@ distinct nodes, every acknowledged object read back after each founder is killed
 and each large case ending at the typed refusal with the count held beside the volumes' stated
 capacity?
 
-**Checkpoint, 2026-11-02.** The reader fix is on main at `a57eaea7`. Ten of the 22 host/case
-slots have complete current-harness evidence with their build attribution below. The Mac's
-100k set and the Box's 10 GiB native multipart case passed; the Box's 100k set and remaining
-large ways are still running. Capacity-only zero-object results receive no
-whole-object readback credit. The full Box workspace gate still has its recorded engine
+**Checkpoint, 2026-11-02.** The reader fix is on main at `a57eaea7`. Eleven of the 22 host/case
+slots have complete readback evidence with their build attribution below; all six small sets
+and all four Box 10 GiB upload ways passed. Three 100 GiB cases have clean capacity-only results:
+Box native, Box native multipart and the new Mac S3 multipart case. Eight slots remain unresolved. The
+earlier Mac generic refusal and Box CLI failure remain recorded and unexplained; their first
+queues stopped. A fresh Mac 10 GiB native case is now active.
+Capacity-only zero-object results receive no whole-object readback credit.
+The full Box workspace gate still has its recorded engine
 file-limit failure; the client, vendor and scale results retain their separate scopes.
 All four Box 10 GiB upload ways now have complete results from separate cells.
 
@@ -645,6 +648,110 @@ of 17,180,639,232 bytes and 10,791 `max` pressure events, with zero OOM/OOM-kill
 recorded peak is retained as reported by the kernel. The complete verifier passed before
 the queue admitted its first fresh 100 GiB case. These four Box 10 GiB ways used different
 free-space budgets; their object counts are recorded per case rather than combined.
+
+**Fresh Box 100k result on the fixed reader.** `box-16G-20261102-063855/small-100000` ended
+exit 0 after 19,110 s with empty stderr. It acknowledged 50,000 native and 50,000 S3 objects,
+6,548,797,886 bytes total, read them exactly through both APIs initially, and verified all
+99,998 blocks on distinct nodes. All 600,000 native reads after founder kills and restarts
+were exact, with no re-asks, refusals, wrong or missing objects. All three controls caught
+their faults. Each 16 GiB volume held 6,551,196,718 chunk bytes, exactly accounted with none
+unkept. The 16 GiB scope peaked at 1,671,155,712 bytes with no max/OOM events. The independent
+small-result verifier passed; all three small sets now have complete results on each host.
+
+**Box 100 GiB native capacity result.** `box-16G-20261102-104441/large-100G` ended exit 0
+after 2,845 s, empty stderr, on the same fixed binary. It began with 342,674,227,200 bytes free
+less 34,359,738,368 kept, giving 102,771,496,277 bytes per node, below one 100 GiB payload even
+before format overhead. It held no whole object and refused native `l0` full; the refused key
+was unreadable and unlisted, with no other refusal. The missing-key control caught. Each node
+accounted exactly 98,602,531,776 chunk bytes plus 8,325,104 unkept bytes with 8,404,992 free.
+The scope peaked at 266,424,320 bytes with no max/OOM events. The complete verifier passed.
+This resolves that slot as capacity-only; there were no whole-object or restart reads to credit.
+
+**Unresolved 100 GiB S3 failures.** The Mac's fresh free-sized S3 multipart case,
+`mac-100G-boto-parts-20261102-084422`, ended exit 1 after 9,804 s. Its volumes were
+107,047,936,000 bytes each, from 355,503,546,368 bytes free less the same 32 GiB reserve.
+No whole object was acknowledged: placement and acknowledged bytes were both zero. The table's
+one object counts the non-full refusal, `l0 Failed`, before HTTP `l1` was refused full.
+The harness maps unrecognized S3 codes to `Failed`, so this output does not identify the
+original code. The remaining Mac queues stopped.
+
+An APFS diagnostic clone had all 84 metadata files (563,339,504 bytes) compared byte for byte;
+the three volume files were cloned with their sizes and three 4 KiB windows checked, without
+claiming full-volume hashes. The first 8 MiB diagnostic part returned the correct HTTP 507
+`InsufficientStorage`. The original metadata hashes and volume sizes/mtimes remained unchanged.
+A separate fresh 128 MiB/node case kept the same 100 GiB multipart geometry and recorded the
+SDK's raw error: `UploadPart`, HTTP 507, `InsufficientStorage`, zero SDK retries. It ended
+exit 0 in 62.95 s and did not reproduce the original failure. These are diagnostic probes,
+not host-capacity or whole-object acceptance results; no descriptor limit was changed.
+
+When shared Mac free space later fell below 30 GiB, the failed case's 84 metadata files, all
+three complete volume-index regions and the first two blocks of every segment were archived
+and verified against their decompressed copies. The archive totals 276,999,229 compressed bytes;
+it preserves index and header evidence, not the chunk payloads. The case had acknowledged no
+whole object and verified both refused keys unreadable and unlisted. Its aborted chunk data
+was reclaimed only after the corresponding archive verification, while the metadata and raw
+failure logs remain. The Box CLI failure's chunk data remains retained.
+
+The Box's following free-sized CLI case, `box-16G-20261102-113613/large-100G`, ended exit 1
+after 2,769 s with `does not read: l0's current version`. It began with 345,174,036,480 bytes
+free less 34,359,738,368 kept, giving 103,604,766,037 bytes per node. There are no completed
+readback or placement totals. Its full cell is retained; all 84 metadata files (500,265,068
+bytes) were archived, flushed and byte-compared before preparing a metadata-only diagnostic
+copy. The original chunk volumes remain untouched. Whether the CLI's apparent success and
+the unread current version reflect an acknowledgment failure is unresolved. The metadata-only
+recovery copy returned HEAD 404 and an empty listing through all three nodes. A fresh 128 MiB/node
+CLI probe captured AWS CLI exit 1 and `InsufficientStorage` from `UploadPart` and did not reproduce
+the original failure. The queue stopped, and the case receives no acceptance credit.
+
+A read-only decoder then checked the retained log frames and their CRCs on all three Box
+nodes. Each has the same contiguous Name-group history, indexes 1–5,931, with no undecoded
+nonempty normal entry. `l0` has 2,012 part commands followed by Abort at index 2,018; `l1` has
+3,911 followed by Abort at 5,931. Neither has a Complete or Put command in that history.
+This agrees with the recovered empty listing; it does not establish that a committed object
+disappeared. The latest retained Name hard state records commit 5,930, so the decoder does not
+claim the last abort's commit fence. All original log SHA-256 sums matched before and after
+the scan. The raw CLI exit and error for the original upload were overwritten by later CLI
+calls, leaving the apparent acknowledgment unresolved. Ten short probes of the installed
+AWS CLI against a loopback S3 fixture all returned exit 1 after an injected `UploadPart`
+storage refusal and Abort; none reproduced a false success. A full 100 GiB stream with refusal
+at part 2,013 also returned exit 1 correctly in 32.68 s, after feeding the entire input, with
+one Abort and no Complete. These are diagnostic results, with no Scale acceptance credit.
+Three more full streams using the harness's explicit `classic` client profile gave the same
+correct exit 1 in 28.52–29.08 s each. The archived Mac logs were also decoded without opening
+the original cell. Their retained histories have gaps after log reuse, so they cannot establish
+the first failed upload's complete command history; no absence claim is drawn from those gaps.
+
+After the Mac archive and reclamation, a new full-sized S3 multipart case started at
+`mac-100G-boto-parts-20261102-135528`, using the same immutable `a57eaea7` binary and unchanged
+SDK defaults, 32 GiB reserve, 30 GiB guard and 36,000 s bound. Its per-node volumes are
+106,918,025,898 bytes. A diagnostic wrapper records the original SDK operation, error code,
+HTTP status and retry count before the harness maps them to a native status. It remains
+finished exit 0 in 2,540 s. The raw record is `UploadPart`, `InsufficientStorage`, HTTP 507,
+zero SDK retries. No whole object fit; `l0` was unreadable and unlisted through both doors,
+chunk accounting was exact and the missing-key control was caught. Each node held
+96,700,932,233 bytes plus 2,414,939 kept by none, with 8,404,992 bytes free. This is a second
+capacity-only result, bringing the matrix to 11 readback cases, two capacity-only results and
+nine unresolved slots. The earlier Mac generic refusal remains unexplained.
+
+**CLI skip regression.** The same real-CLI fixture given `PreconditionFailed` instead of the
+storage refusal produced exit 0, empty stderr, one Abort and no Complete in 1.35 s. The native
+harness regression with a 9 MiB body failed on the old code with `Ok(Done)` in 5.44 s and passed
+after the uploaded-object check in 1.51 s. A successful CLI copy now has to pass `HeadObject`
+at the stated length before the acknowledgment oracle is set (research/76). The original Box
+error was overwritten, so this identifies and fixes a harness assumption without claiming
+that the original refusal was 412 or that a storage acknowledgment was lost.
+All 41 command-line unit tests passed in 1.89 s, the real-process filling test covering all four
+upload ways in 52.27 s, all-target/all-feature Clippy in 10.02 s and the production gate passed.
+
+**Box 100 GiB native multipart capacity result.** The fresh
+`box-100G-native-parts-20261102-143316` case used the same immutable `b69e5814` binary in a
+16 GiB scope, with unchanged descriptor limits of 1,024 soft and 1,048,576 hard. Its
+81,931,218,944 starting free bytes less the 34,359,738,368-byte reserve gave 15,857,160,192
+bytes per node. It ended exit 0 in 1,064 s: typed full for native `l0`, no whole object,
+unreadable and unlisted, exact chunk accounting and the missing-key control caught. Each node
+held 14,294,997,233 bytes plus 8,325,104 kept by none, with 8,404,992 bytes free. Scope peak was
+258,879,488 bytes, with no max/OOM events. This adds a third capacity-only result; the current
+matrix is 11 readback cases, three capacity-only results and eight unresolved slots.
 
 **What an object takes of a range's store.** For the engines' share of a node's memory, sized by
 what the cell's volumes hold (the owner's choice of 2026-10-31, node.md §1.4): the harness's small

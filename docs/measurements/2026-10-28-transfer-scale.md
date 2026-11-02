@@ -378,10 +378,16 @@ accounting for the received and locally put bytes; 8,404,992 bytes remained free
 `l1`, was refused `InsufficientStorage`, unreadable and unlisted, and all acknowledged objects
 were listed. There were no other refusals. At the start, 389 GiB free less the 32 GiB reserve
 could not hold two whole objects in three copies (600 GiB before overhead), so one is the maximum
-whole-object count. Retiring the volumes left 366 GiB free. The next fixed-volume case needs
-368 GiB, so the remaining 10k/100k small sets now run before the remaining large ways; capacity
-waits start no data job. Later large ways recalculate capacity; if two whole objects might fit,
-they use free-sized volumes. The runner stops an incomplete case if filesystem free
+whole-object count. Retiring the volumes left 366 GiB free. Three 112 GiB volumes plus the reserve
+require 368 GiB, so the remaining 10k/100k small sets were scheduled before the remaining large
+ways. A subsequent calculation using `Geometry::plan`, `log_bytes`, `checkpoint_bytes` and
+`derive::volume` matched both recorded 104 and 112 GiB headers exactly. With the same segment
+and block sizes, 110 GiB per node provides 111,483,813,888 data-region bytes, 2,700,340,880 bytes
+more than the verified case's chunk bytes including the refused partial upload. The remaining
+fixed-volume cases use that budget, require 362 GiB free including the unchanged reserve, and
+must still complete one whole object and all checks. Capacity waits start no data job; the
+calculation alone is not a readback result. Later large ways recalculate capacity; if two whole
+objects might fit, they use free-sized volumes. The runner stops an incomplete case if filesystem free
 space falls below 30 GiB and reserves 32 GiB, including 2 GiB for metadata outside the volumes
 (about 0.7 GiB measured, with room for a checkpoint being replaced). The earlier finding that
 100 GiB did not fit was specific to the free space then.
@@ -389,11 +395,12 @@ space falls below 30 GiB and reserves 32 GiB, including 2 GiB for metadata outsi
 **Current-build acceptance.** The candidate product is `17eb8032`. Its complete matrix has
 22 slots across the two physical hosts (adacachy is the box): three small sets and four large
 upload ways at each of 10 and 100 GiB per host. Historical passes above remain historical;
-missing current-build slots stay pending. The Mac's 1k set also completed:
+missing current-build slots stay pending. The Mac's completed small sets are:
 
 | Host / build | Case | Acknowledged native / S3 | Distinct-node blocks | Native reads after kills | Again / refused / wrong / missing | Controls caught | Seconds |
 |---|---|---|---|---|---|---|---|
 | Mac / `17eb8032` | small 1000 | 500 / 500 | 999 | 6,000 | 0 / 0 / 0 / 0 | 3 / 3 | 335 |
+| Mac / `17eb8032` | small 10000 | 5,000 / 5,000 | 9,999 | 60,000 | 1 / 0 / 0 / 0 | 3 / 3 | 2,153 |
 
 Run `mac-small-1000-20261102-011230`, exit 0, empty harness stderr: 65,477,038 object bytes,
 every object read exactly through both APIs before the kills, and natively after each founder's
@@ -407,8 +414,12 @@ after headroom returned, but was stopped after 316 s, exit 143, when free space 
 incomplete. Its nodes' `write(stdout)` refusals followed the closed harness pipes. That
 overlapping attempt required 50 GiB free, including a 44 GiB reserve. After the 100 GiB native
 multipart case released its volumes, the 10k and 100k sets were scheduled sequentially before
-the remaining large ways. The fresh 10k run is `mac-small-10000-20261102-034102`.
-At this checkpoint, two of 22 slots are verified under this harness and the other 20 remain open.
+the remaining large ways. The fresh 10k run, `mac-small-10000-20261102-034102`, ended exit 0 after
+2,153 s with empty stderr: 654,185,067 logical bytes, all objects exact through both APIs
+initially, 9,999 distinct-node blocks, and 60,000 exact native reads after kills with one asked
+again. Each node held 654,424,107 chunk bytes, exactly its received and locally put bytes,
+with none unkept. All controls caught. The 100k run is `mac-small-100000-20261102-041703`.
+At this checkpoint, three of 22 slots are verified under this harness and the other 19 remain open.
 Its replication pass reads natively; S3-after-kill readback is not part of these measured totals.
 
 The box's early 1k run on `17eb8032`, `box-16G-20261102-015302`, failed after 469 s during the
@@ -421,7 +432,8 @@ reads, no retries/refusals/wrong/missing, and all controls caught. The earlier i
 is still unresolved; the repeat does not close it. Smaller diagnostic sets of 2, 128 and 512
 objects passed in 65, 118 and 177 s and receive no credit for the required case sizes. A separate
 diagnostic build records the local refusal's origin; no product fix or larger limit is asserted.
-The box's remaining official small sets are held pending that diagnosis.
+Three traced 1k trials also passed in 271, 191 and 176 s. The failed 1k slot stays open while
+the independent current-build 10k case proceeds and a diagnostic repeats the restart sequence.
 The Mac also queues reruns
 of its other three
 10 GiB ways after those small sets; its canceled boto3 case is already in the large-case sequence.
@@ -430,6 +442,32 @@ its terminal result, full acknowledgment/readback and placement totals, restart 
 applicable controls. A capacity refusal that holds no whole object is never a successful
 large-object readback; an undersized explicit volume requires a corrected run before drawing a
 conclusion about the host's capacity.
+
+**Older Box 100k completion, 2026-11-02.** The run begun on `0100ddd8`,
+`box-16G-20261101-163809/small-100000`, ended exit 0 after 40,804 s with empty harness stderr:
+
+| Build | Native / S3 objects | Logical bytes | Distinct-node blocks | Exact native reads after kills | Again / refused / wrong / missing | Controls caught |
+|---|---|---|---|---|---|---|
+| `0100ddd8` | 50,000 / 50,000 | 6,548,797,886 | 99,998 | 600,000 | 0 / 0 / 0 / 0 | 3 / 3 |
+
+Each node held 6,551,373,832 chunk bytes, exactly its received and locally put bytes, with none
+kept by no object. Each 16 GiB volume had 100,001 fragments and 9,363,161,088 free bytes.
+The 16 GiB memory scope peaked at 1,769,697,280 bytes and recorded no max/OOM events. The same
+older job then began its combined 10 GiB capacity case with 40 GiB per node; that result is
+pending. These older-build results do not fill missing `17eb8032` slots.
+
+Its three 40 GiB volumes were fully allocated before the next small-case and restart probes
+started. Their temporary 128 GiB headroom guard had stopped the first repeated-restart probe
+after five complete rounds, without reproducing `Budget`. Once that allocation was accounted
+for, about 96 GiB remained free; the independent current-build 10k case and the tiny restart
+probe use the established 20,000,000,000-byte Box floor and unchanged 16 GiB memory scopes.
+The earlier guard stop remains incomplete, not a pass or a `Budget` reproduction. No product
+quota, deadline or retry count changed.
+The repeated-restart diagnostic, `box-16G-20261102-040748/small-1000`, then completed 30 kills
+and restarts with 60,000 exact native reads and no retries or wrong/missing objects. The isolated
+probe `budget-reopen-17eb8032.log` created and dropped 10,000 clients on one runtime in 0.29 s
+without a refusal. Neither reproduces or fixes the original intermittent `Budget`, which remains
+open.
 
 **What an object takes of a range's store.** For the engines' share of a node's memory, sized by
 what the cell's volumes hold (the owner's choice of 2026-10-31, node.md §1.4): the harness's small

@@ -516,12 +516,18 @@ on distinct nodes, 6,000 native reads after the founder kills, no retries, refus
 objects, and all three controls caught. Its terminal log is `mac-small-1000-20261102-011230`.
 The 10k queue waits for enough space before starting a cell; its first guarded preflight
 started no data job. A fresh overlapping attempt then ran for 316 s before the 42 GiB free-space
-guard stopped it, with no final integrity totals. The completed 100 GiB run released its volumes,
-so the 10k rerun and 100k set now run before the remaining large ways. Two of the candidate's 22
+guard stopped it, with no final integrity totals. The completed 100 GiB run released its volumes.
+The fresh 10k run passed in 2,153 s: all 10,000 objects, 9,999 distinct-node blocks, 60,000 exact
+native reads after kills, one asked again, no refusals or wrong/missing objects, all controls
+caught. The 100k set now runs before the remaining large ways. Three of the candidate's 22
 host/case slots are verified under the current harness; its restart reads are native only.
 The box's early 1k attempt ended during restart reads with native transport `Budget` after 469 s;
 a repeat passed in 271 s, but the intermittent refusal remains under diagnosis and is not
 considered fixed. The Scale goal remains active.
+The box's earlier `0100ddd8` 100k set ended exit 0 after 40,804 s: all 100,000 objects acknowledged,
+99,998 distinct-node blocks, 600,000 exact native reads after kills, no retries, refusals, wrong
+or missing objects, and all controls caught. It is older-build evidence; the candidate's 100k
+slot still needs its own result. That job has advanced to its combined 10 GiB capacity case.
 CI's one-CPU job ran the chunk store's test of the planned pass for five hours: a plan named an
 empty segment by its number, the writer freed it and the pass opened it again for its first
 victim's records, then cleaned it as its second victim, moving its own output into the last free

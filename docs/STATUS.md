@@ -436,10 +436,11 @@ The owner chose (2026-11-01) that a node waits as long as its client would: buil
 `carried-deadlines` (research/77 D2, node.md §3.8), each request carrying its time left, 60 s
 without its work moving where it says none, a node vouching for work its device or a peer holds
 within it and asking again of the same volume a chunk refused for want of room; the box's large
-cases run again on it. Quiver, hyper-transport's maintainer, reviewed it (2026-11-01) and found it
-sound; its three server-side cases are met (a vouch rests on an ask out or a device's write in
-flight, a failed write is answered at once, a node waits on a chunk at most the stock patience
-whatever its head carries), two places it found breaking the rule are fixed (a get past its
+cases run again on it. Quiver, hyper-transport's maintainer, approved the design conditionally
+(2026-11-01, reiterated 2026-11-02), explicitly without reviewing its implementation. Our code
+audit maps its three server-side conditions to the implementation (a vouch rests on an ask out
+or a device's write in flight, a failed write is answered at once, a node waits on a chunk at most
+the stock patience whatever its head carries); applying them found two places now fixed (a get past its
 patience was still vouched for, and one still reading its version was never ended `SlowDown`), and
 the native client's supplied deadline now also bounds a stalled GET sink and takes precedence over
 queued events and opening another exchange. Telling held from moved in a note, so an asker with no

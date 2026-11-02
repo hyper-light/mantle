@@ -212,9 +212,11 @@ rule includes.
 
 ## D2's design, as reviewed
 
-Quiver, hyper-transport's maintainer, reviewed D2 on 2026-11-01 and found it sound: proving liveness
-only while real work is in flight, the client's patience the hard bound. Its three server-side cases
-and its one requirement of the asker, as the branch meets them:
+Quiver, hyper-transport's maintainer, reviewed D2's design on 2026-11-01 and reiterated the
+conditions on 2026-11-02: prove liveness only while real work is in flight, with the client's
+original budget as the hard bound across forwarding and retries. Quiver explicitly did not
+review the `f7788c31` implementation. The following mapping to code is our implementation audit,
+separate from that conditional design approval:
 
 - **Vouches bottom out in real work.** A node vouches for a job only while an ask of its own is out
   or a chunk of it waits for room, and for a peer's chunk only while its device holds the put,
@@ -238,8 +240,8 @@ and its one requirement of the asker, as the branch meets them:
   patience to held stretches on its own clock; that is a hyper-transport change, put to its
   maintainers.
 
-The review also found two places that broke the rule: a get past its patience was still vouched for
-while a chunk read was out, though its client had stopped waiting, and a get still reading its
+Applying those conditions found two places that broke the rule: a get past its patience was
+still vouched for while a chunk read was out, though its client had stopped waiting, and a get still reading its
 version was exempt from `SlowDown` before its reply began. The first is now told nothing more and
 the second ends `SlowDown`, as every other job does.
 
@@ -247,3 +249,7 @@ Regression checks cover the GET job before and after its reply begins, the chunk
 and the native client's deadline while a loopback node continues sending working notes. They also
 cover a deadline already expired on a connected client (previously a transport configuration
 refusal) and a GET whose sink stops taking bytes (previously able to finish after its deadline).
+The volume's write/flush-error regression checks fencing and preservation of acknowledged data
+(`mantle_chunk`, `tests/corruption.rs`). A dedicated node-level regression asserting that the
+same device error stops working notes is not yet present; the audit above checks the receipt
+drain before the node's vouch, rather than claiming that combined test has passed.

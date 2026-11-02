@@ -1222,6 +1222,9 @@ impl Client {
         (mut upload, mut sink): (Option<&mut Upload<'_, S>>, Option<&mut K>),
         deadline_ns: u64,
     ) -> Result<Attempt, ClientError> {
+        if hyper_rt::futures::now_ns() >= deadline_ns {
+            return Err(ClientError::Deadline);
+        }
         if !self.reach(node, deadline_ns).await? {
             let refused = self
                 .nodes
@@ -1240,6 +1243,9 @@ impl Client {
         }
         let clock = self.driver.clock()?;
         let opened_ns = hyper_rt::futures::now_ns();
+        if opened_ns >= deadline_ns {
+            return Err(ClientError::Deadline);
+        }
         let period = Progress::new(Duration::from_nanos(self.period_ns(
             node,
             deadline_ns,
@@ -1267,6 +1273,12 @@ impl Client {
         let mut whole_ns: Option<u64> = None;
         self.fields.clear();
         loop {
+            // Bytes and working notes can keep the transport busy; neither extends the caller's
+            // own deadline (research/77 D2, Quiver's review).
+            if hyper_rt::futures::now_ns() >= deadline_ns {
+                self.driver.endpoint().end(exchange);
+                return Err(ClientError::Deadline);
+            }
             if reply.is_none() && !stopped && sent < body {
                 stopped = !self.send(exchange, (fields, &mut upload), &mut sent)?;
             }
@@ -1338,13 +1350,18 @@ impl Client {
                         decoded: None,
                         hasher: None,
                     });
-                    if let Some(done) = self.read_reply(exchange, reading, &mut sink).await? {
+                    if let Some(done) = self
+                        .read_reply(exchange, reading, &mut sink, deadline_ns)
+                        .await?
+                    {
                         return Ok(Attempt::Replied(Box::new(done)));
                     }
                 }
                 Event::BodyReady { exchange: e } if e == exchange => {
                     if let Some(reading) = reply.as_mut()
-                        && let Some(done) = self.read_reply(exchange, reading, &mut sink).await?
+                        && let Some(done) = self
+                            .read_reply(exchange, reading, &mut sink, deadline_ns)
+                            .await?
                     {
                         return Ok(Attempt::Replied(Box::new(done)));
                     }
@@ -1474,16 +1491,27 @@ impl Client {
         exchange: ExchangeId,
         reading: &mut Reading,
         sink: &mut Option<&mut K>,
+        deadline_ns: u64,
     ) -> Result<Option<Reply>, ClientError> {
         let fields = usize::try_from(reading.head.fields()).unwrap_or(usize::MAX);
         loop {
+            if hyper_rt::futures::now_ns() >= deadline_ns {
+                self.driver.endpoint().end(exchange);
+                return Err(ClientError::Deadline);
+            }
             let mut piece = self
                 .driver
                 .endpoint()
                 .reserve(Class::Transfer, u64::try_from(PIECE).unwrap_or(u64::MAX))?;
             let read = self.driver.endpoint().read_body(exchange, &mut piece);
             let poured = self
-                .take_piece(exchange, reading, piece.bytes(), (fields, sink))
+                .take_piece(
+                    exchange,
+                    reading,
+                    piece.bytes(),
+                    (fields, sink),
+                    deadline_ns,
+                )
                 .await;
             self.driver.endpoint().release(piece);
             poured?;
@@ -1531,6 +1559,7 @@ impl Client {
         reading: &mut Reading,
         bytes: &[u8],
         (fields, sink): (usize, &mut Option<&mut K>),
+        deadline_ns: u64,
     ) -> Result<(), ClientError> {
         let into_fields = fields.saturating_sub(self.fields.len()).min(bytes.len());
         let (front, rest) = bytes.split_at(into_fields);
@@ -1558,18 +1587,30 @@ impl Client {
             self.driver.endpoint().end(exchange);
             return Err(ClientError::Reply("bytes after an answer that has none"));
         };
-        // The sink's write raced against the transport, which keeps moving meanwhile; a write the
-        // transport overtook took nothing and is made again.
+        // The sink's write races the transport and the caller's own deadline: neither a sink
+        // that stops taking bytes nor a peer that keeps vouching may extend that deadline. A
+        // write the transport overtook took nothing and is made again.
         loop {
+            let left = deadline_ns.saturating_sub(hyper_rt::futures::now_ns());
+            if left == 0 {
+                self.driver.endpoint().end(exchange);
+                return Err(ClientError::Deadline);
+            }
             let raced = {
                 let write = pin!(sink.write(rest));
                 let event = pin!(self.driver.event());
-                race2(write, event).await
+                let sleep = pin!(hyper_rt::futures::sleep(left));
+                race3(write, event, sleep).await
             };
             match raced {
-                Either::First(wrote) => return wrote.map_err(ClientError::Sink),
-                Either::Second(event) => {
+                Either3::First(wrote) => return wrote.map_err(ClientError::Sink),
+                Either3::Second(event) => {
                     self.keep(event?);
+                }
+                Either3::Third(slept) => {
+                    slept?;
+                    self.driver.endpoint().end(exchange);
+                    return Err(ClientError::Deadline);
                 }
             }
         }
@@ -1678,12 +1719,12 @@ impl Client {
         &mut self,
         deadline_ns: u64,
     ) -> Result<Option<Event<NodeClasses>>, ClientError> {
-        if let Some(event) = self.driver.endpoint().poll_event() {
-            return Ok(Some(self.keep(event)));
-        }
         let left = deadline_ns.saturating_sub(hyper_rt::futures::now_ns());
         if left == 0 {
             return Ok(None);
+        }
+        if let Some(event) = self.driver.endpoint().poll_event() {
+            return Ok(Some(self.keep(event)));
         }
         let ended = {
             let event = pin!(self.driver.event());

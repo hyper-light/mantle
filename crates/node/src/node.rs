@@ -4051,21 +4051,25 @@ fn names_only_its_sender(command: &Command, sender: PeerId, node: bool) -> bool 
     }
 }
 
-/// Pauses `asking`'s entry out: no node named a leader this round (`leaderless`), or the leader
-/// refused it for room. RFC 6298 §5.5's doubling backoff, at most the idle timeout
-/// (`bounds::backed_off`), each pause drawn between its half and its whole (`bounds::pause`) so
-/// nodes do not ask again in step.
-/// When, on the shard's clock at `now`, a request that waits `remaining_ns` more stops waiting;
-/// one that said nothing waits the stock S3 clients' patience (research/77 D2).
+/// When, on the shard's clock at `now`, a chunk whose asker waits `remaining_ns` more stops being
+/// waited on: one that said nothing waits the stock S3 clients' patience, and none waits longer
+/// (research/77 D2). An asking job carries at most that patience past its work's last movement,
+/// so a longer time is no correct node's, and a buggy or hostile one would hold a device's vouch
+/// for it.
 fn waits_until(now: u64, remaining_ns: u64) -> u64 {
+    let patience = u64::try_from(bounds::STOCK_PATIENCE.as_nanos()).unwrap_or(u64::MAX);
     let wait = if remaining_ns == 0 {
-        u64::try_from(bounds::STOCK_PATIENCE.as_nanos()).unwrap_or(u64::MAX)
+        patience
     } else {
-        remaining_ns
+        remaining_ns.min(patience)
     };
     now.saturating_add(wait)
 }
 
+/// Pauses `asking`'s entry out: no node named a leader this round (`leaderless`), or the leader
+/// refused it for room. RFC 6298 §5.5's doubling backoff, at most the idle timeout
+/// (`bounds::backed_off`), each pause drawn between its half and its whole (`bounds::pause`) so
+/// nodes do not ask again in step.
 fn pause(local: u64, asking: &mut Asking, now: u64, leaderless: bool) {
     let at_ns = paused_until(local, (&mut asking.backoff, &mut asking.pauses), now);
     if let Some(out) = asking.out.as_mut() {
@@ -4125,6 +4129,20 @@ mod tests {
     use mantle_meta::root;
 
     use super::*;
+
+    /// A chunk is waited on as long as its asker carried, never past the stock S3 clients'
+    /// patience: none said is that patience, a shorter time is kept, and a longer one, which no
+    /// correct node's job carries, is cut to it (research/77 D2).
+    #[test]
+    fn a_chunk_is_waited_on_at_most_the_stock_patience() {
+        let patience = u64::try_from(bounds::STOCK_PATIENCE.as_nanos()).unwrap();
+        let now = 1_000;
+        assert_eq!(waits_until(now, 0), now + patience);
+        assert_eq!(waits_until(now, 5), now + 5);
+        assert_eq!(waits_until(now, patience), now + patience);
+        assert_eq!(waits_until(now, patience + 1), now + patience);
+        assert_eq!(waits_until(now, u64::MAX), now + patience);
+    }
 
     #[test]
     fn a_node_enlists_and_states_the_history_of_itself_alone() {

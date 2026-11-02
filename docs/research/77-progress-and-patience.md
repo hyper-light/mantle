@@ -201,10 +201,49 @@ it lands.
 Built on mantle branch `carried-deadlines` (node.md §3.8): the native request head and a chunk's
 put and get heads carry the time left; a job's patience is its client's deadline or 60 s past its
 work's last move, the earlier; a job whose own work is held, an ask of its own out or a chunk
-waiting for room, ends `503 SlowDown` past it and vouches each beat within it, but for a get, whose
-reply began before its body and whose chunk reads its transport gives up once their peers say
-nothing, and a job waiting on its own client is the transport's to judge; a node vouches each beat for a
-peer's chunk its volume holds within the time the chunk's head carried; a chunk refused `Busy` or
+waiting for room, ends `503 SlowDown` past it and vouches each beat within it, but a get whose head
+has gone out, its reply begun, is told nothing more past it, its chunk reads given up by its
+transport once their peers say nothing, and a job waiting on its own client is the transport's to
+judge; a node vouches each beat for a peer's chunk its volume holds within the time the chunk's
+head carried and never past the stock patience; a chunk refused `Busy` or
 `Lost(Budget)` is asked again of the same volume when room frees (a chunk answered or a volume's put
 answered), not at its own refusal. It replaces D1's vouch on a volume's answered put, which the held
 rule includes.
+
+## D2's design, as reviewed
+
+Quiver, hyper-transport's maintainer, reviewed D2 on 2026-11-01 and found it sound: proving liveness
+only while real work is in flight, the client's patience the hard bound. Its three server-side cases
+and its one requirement of the asker, as the branch meets them:
+
+- **Vouches bottom out in real work.** A node vouches for a job only while an ask of its own is out
+  or a chunk of it waits for room, and for a peer's chunk only while its device holds the put,
+  submitted and unanswered. A job's patience runs from its work's last movement, an ask answered or
+  a piece of a chunk read or sent, never a note it hears, so no statement extends another and no
+  cycle keeps work alive; a chunk's put or get asks no one.
+- **A failed write is no work held.** A volume answers a write or flush that fails at once and
+  fences itself (chunk-store.md §4; Rebello et al., ATC 2020), and the put leaves what the node
+  vouches for with that answer: the vouch is gated on the I/O in flight, not on "not yet durable".
+- **A cap on the carried time.** A job carries at most the stock patience past its work's last
+  movement, so a node now waits on a chunk at most that long whatever its head says. A client's own
+  deadline needs no cap: a job's patience is its deadline or 60 s past its last movement, the
+  earlier.
+- **The asker bounds itself.** A native client with a deadline checks it before opening an
+  exchange and while reading its reply, and races each source or sink wait against that deadline
+  on its own clock whatever its node says (`mantle_client`'s attempt). Queued transport events
+  cannot outrank an expired deadline. A node ends a held job at
+  its own bound on its own clock whatever its peers say. A request with no deadline is bounded
+  locally by silence, the stock patience without bytes or notes, and a node's notes keep it while
+  its work is held. Telling held from moved in the note itself would let the asker apply the
+  patience to held stretches on its own clock; that is a hyper-transport change, put to its
+  maintainers.
+
+The review also found two places that broke the rule: a get past its patience was still vouched for
+while a chunk read was out, though its client had stopped waiting, and a get still reading its
+version was exempt from `SlowDown` before its reply began. The first is now told nothing more and
+the second ends `SlowDown`, as every other job does.
+
+Regression checks cover the GET job before and after its reply begins, the chunk's capped wait,
+and the native client's deadline while a loopback node continues sending working notes. They also
+cover a deadline already expired on a connected client (previously a transport configuration
+refusal) and a GET whose sink stops taking bytes (previously able to finish after its deadline).

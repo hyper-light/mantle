@@ -126,6 +126,33 @@ impl Job {
             )
     }
 
+    /// What to do while its work is held: vouch within its patience, answer a refusal past it,
+    /// or stop vouching if its reply already began. A get's driver is made with its reply head
+    /// (`current_read`); before that, it can still be answered `SlowDown`.
+    fn bounded(&self, now: u64) -> Bounded {
+        if now < self.bound_ns() {
+            Bounded::Held
+        } else if matches!(&self.work, Work::Get(getting) if getting.get.is_some()) {
+            Bounded::Unvouched
+        } else {
+            Bounded::SlowDown
+        }
+    }
+
+    /// Its next bound or working beat, while its own work is held. A get whose reply began
+    /// and whose patience passed is vouched for no more and needs no beat; a get still reading
+    /// its version must wake at the bound even through the local S3 door.
+    fn due_ns(&self, now: u64, beat: u64) -> Option<u64> {
+        if self.bounded(now) == Bounded::Unvouched {
+            return None;
+        }
+        let bound = self.bound_ns();
+        Some(match self.door {
+            Door::Exchange(_) => bound.min(now.saturating_add(beat)),
+            Door::Local(_) => bound,
+        })
+    }
+
     /// Whether the operation still works toward its reply, rather than giving one or reading the
     /// fields that say what it is.
     fn working(&self) -> bool {
@@ -134,6 +161,17 @@ impl Job {
             Work::Fields(..) | Work::Draining(_) | Work::Replying(..) | Work::Answering(_)
         )
     }
+}
+
+/// What a held job's bound makes of it at a turn (research/77 D2).
+#[derive(Debug, PartialEq, Eq)]
+enum Bounded {
+    /// Within its client's patience: its client is told its work is held.
+    Held,
+    /// Past it, no reply begun: ended `503 SlowDown`, letting go of what it asked.
+    SlowDown,
+    /// Past it, its reply begun: told nothing more, its chunk reads ended by their transport.
+    Unvouched,
 }
 
 /// Where a job's operation came in: its body is read and its reply written there.
@@ -825,10 +863,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if !job.working() || !job.held() {
                 continue;
             }
-            if job.bound_ns() <= now && !matches!(job.work, Work::Get(_)) {
-                self.fail_job(at, Status::SlowDown)?;
-            } else if let Door::Exchange(exchange) = job.door {
-                self.driver.endpoint().working(exchange);
+            match job.bounded(now) {
+                Bounded::SlowDown => self.fail_job(at, Status::SlowDown)?,
+                Bounded::Held => {
+                    if let Door::Exchange(exchange) = job.door {
+                        self.driver.endpoint().working(exchange);
+                    }
+                }
+                Bounded::Unvouched => {}
             }
         }
         Ok(())
@@ -2920,12 +2962,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .jobs
             .iter()
             .filter(|j| j.working() && j.held())
-            .filter_map(|j| {
-                // A native asker is told each beat; an S3 client is told nothing.
-                let told = matches!(j.door, Door::Exchange(_)).then(|| shard.saturating_add(beat));
-                let bounded = (!matches!(j.work, Work::Get(_))).then(|| j.bound_ns());
-                told.into_iter().chain(bounded).min()
-            })
+            .filter_map(|j| j.due_ns(shard, beat))
             .min();
         [renewal, bound].into_iter().flatten().min()
     }
@@ -3387,6 +3424,58 @@ fn get_answer(outcome: Outcome) -> get::Answer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A get blocked before reading its version must still be refused at its own deadline;
+    /// once its reply began, expiry must only stop its notes, preserving the one reply. Neither
+    /// its pending read nor notes from a peer extend its local bound (research/77 D2).
+    #[test]
+    fn a_held_get_stops_vouching_at_its_bound_before_or_after_its_reply() {
+        let patience = u64::try_from(bounds::STOCK_PATIENCE.as_nanos()).unwrap();
+        let (_body, body) = hyper_rt::sync::channel(1).unwrap();
+        let (reply, _answers) = hyper_rt::sync::channel(1).unwrap();
+        let mut job = Job {
+            door: Door::Local(Box::new(Local {
+                body,
+                reply,
+                ended: None,
+                pending: VecDeque::new(),
+                ready: false,
+            })),
+            principal: "client".into(),
+            work: getting("b".into(), "k".into(), Headers::default(), false),
+            pending: vec![(Pending::Read(1), None)],
+            deadline_ns: Some(10),
+            moved_ns: 1,
+        };
+        assert!(job.held());
+        assert_eq!(job.bounded(9), Bounded::Held);
+        assert_eq!(job.bounded(10), Bounded::SlowDown, "no reply has begun");
+        assert_eq!(job.due_ns(9, 2), Some(10), "wake the S3 job at its bound");
+
+        let Work::Get(getting) = &mut job.work else {
+            panic!("the job is a get");
+        };
+        getting.get =
+            Some(Get::new(Some(1), 1, 0..1, Box::new(RootKeys { keys: Vec::new() }), 1).unwrap());
+        assert_eq!(job.bounded(9), Bounded::Held);
+        assert_eq!(job.bounded(10), Bounded::Unvouched, "its reply has begun");
+        assert_eq!(job.bounded(u64::MAX), Bounded::Unvouched);
+        assert_eq!(job.due_ns(9, 2), Some(10));
+        assert_eq!(
+            job.due_ns(10, 2),
+            None,
+            "an expired reply needs no vouch beat"
+        );
+
+        job.deadline_ns = None;
+        assert_eq!(job.bounded(patience), Bounded::Held);
+        assert_eq!(job.bounded(patience + 1), Bounded::Unvouched);
+        // Actual bytes or an answered ask advance the idle bound; a note does not.
+        job.moved_ns = patience;
+        assert_eq!(job.bounded(patience + 1), Bounded::Held);
+        job.deadline_ns = Some(patience + 1);
+        assert_eq!(job.bounded(patience + 1), Bounded::Unvouched);
+    }
 
     fn refused(work: &Work) -> Option<Status> {
         match work {

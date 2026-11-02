@@ -170,6 +170,8 @@ pub(crate) struct Script {
     pub(crate) hold_append: Option<u32>,
     pub(crate) late_append: Option<u32>,
     pub(crate) hold_offset: Option<u32>,
+    /// A bucket head is held unanswered while its owner continues sending working notes.
+    pub(crate) vouch_head: bool,
     pub(crate) slow_opens: u32,
     pub(crate) slow_append: Option<u32>,
 }
@@ -313,7 +315,14 @@ pub(crate) fn scripted(
             // before cutting it, and when the late Append is answered.
             let (mut holding_since, mut waited, mut late) = (None::<u64>, None::<u64>, None::<u64>);
             loop {
-                if let Some(event) = next(&mut driver, held).await {
+                let until = if script.vouch_head && matches!(serving, Some(Serving::Holding { .. }))
+                {
+                    let beat = bounds::idle_timeout() / 3;
+                    Some(hyper_rt::futures::now_ns() + u64::try_from(beat.as_nanos()).unwrap())
+                } else {
+                    held
+                };
+                if let Some(event) = next(&mut driver, until).await {
                     match event {
                         Event::Refused {
                             exchange,
@@ -349,7 +358,15 @@ pub(crate) fn scripted(
                                 trailer: Vec::new(),
                             });
                         }
-                        Event::Closed { .. } => return seen,
+                        Event::Closed { .. } => {
+                            if script.vouch_head {
+                                assert!(
+                                    driver.endpoint().stats().notes_made >= 2,
+                                    "the node kept vouching until its client closed"
+                                );
+                            }
+                            return seen;
+                        }
                         _ => {}
                     }
                 }
@@ -359,6 +376,11 @@ pub(crate) fn scripted(
                 }
                 held = None;
                 let endpoint = driver.endpoint();
+                if script.vouch_head
+                    && let Some(Serving::Holding { exchange }) = serving
+                {
+                    endpoint.working(exchange);
+                }
                 // Read what came of a request, and once whole, answer it.
                 if let Some(Serving::Reading {
                     exchange,
@@ -466,6 +488,7 @@ pub(crate) fn scripted(
                             },
                             length,
                         )),
+                        Op::HeadBucket { .. } if script.vouch_head => None,
                         Op::HeadBucket { .. } => Some((Reply::status(Status::Done), 0)),
                         Op::Open { .. } => {
                             seen.opens += 1;

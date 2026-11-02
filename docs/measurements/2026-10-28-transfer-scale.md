@@ -358,8 +358,8 @@ must run again. The nodes' `write(stdout)` refusals after the stop are their clo
 The 100 GiB multipart ways now run first, one fresh cell a way on the same build. At the first
 start, 411 GiB free less the 30 GiB reserve cannot hold two whole 100 GiB objects in three copies
 (600 GiB before any overhead). The cell therefore uses 104 GiB per node rather than preallocating
-the unusable tail of a second object: the preceding full volume's overhead was about 2.08%, and
-its 4 MiB chunks held 4,195,328 cipher bytes each. This leaves about 100 GiB for the shared file
+the unusable tail of a second object: non-payload space in the preceding full volume was about
+2.08%. The 104 GiB budget targets one object; the case must verify that count. This leaves about 100 GiB for the shared file
 system while preserving the maximum whole-object count of one. A zero-object result at this size
 would require revisiting the sizing; it would not show that this Mac cannot hold a 100 GiB object.
 Run `mac-100G-native-parts-20261101-230335` has started with 111,669,149,696-byte volumes and has no

@@ -334,15 +334,23 @@ nothing (`crates/client/tests/progress.rs`).
 |---|---|---|---|---|---|---|---|
 | native (whole blocks) | 36,511,648,426 B | 3 | 29 / 70 / 173 | `InsufficientStorage` (l3), none otherwise | 35.72 GB, 97.8%, one segment free | 4,138 | 14 to 25 |
 | cli (2026-11-01) | 15,889,685,162 B | 1 | 54 / 133 / 238 | `InsufficientStorage` at the listener (l1), none otherwise | 15.51 GB, 97.6%, one segment free | 1,306 | 7 to 41 |
+| native-parts (2026-11-01) | 148,829,888,512 B | 13 | 23 / 54 / 124 | `InsufficientStorage` (l13), none otherwise | 145.73 GB, 97.9%, one segment free | 18,897 | 9.3 at start |
 
 Exact: 3,873 blocks, each block's chunks on distinct nodes; every node's chunk bytes what it
 received and put; 18 reads after each founder's kill and restart, none wrong or missing, one asked
 again; the controls caught; the refused object unreadable and unlisted. The CLI's way ran once this
 Mac's disk was cleaned (its free space had fallen to 15 GiB with other work), on volumes a third the
 native way's, so it held one object: exact, 2,560 blocks each on distinct nodes, 6 reads after the
-kills, none asked again, wrong or missing, the controls caught. The two parts' ways wait for the free
-space a 10 GiB object takes beside the 30 GiB kept, about 63 GiB; another session's build took what
-the cleaning freed.
+kills, none asked again, wrong or missing, the controls caught. The native parts' way then ran
+after more disk space was freed: 139,586,437,120 bytes in 13 objects, 33,280 blocks, each block's
+chunks on distinct nodes; 78 reads after the kills, none asked again, wrong or missing. All three
+controls caught; the refused object unreadable and unlisted and all acknowledged objects listed.
+Each node held 145,728,913,408 chunk bytes and had 8,404,992 bytes free. Run
+`mac-10G-native-parts-20261101-154857`, exit 0; the volumes were removed after the result was kept,
+leaving 442 GiB free. The boto3 parts' way is running on the later `17eb8032` build (binary
+`dcfa6de03a12b98542ce34515fdafafd`), run `mac-10G-boto-parts-20261101-210926`, with
+147,296,316,074-byte volumes; it has no result yet. The earlier finding that a 100 GiB object did
+not fit is specific to the free space then: capacity must be read again after this case ends.
 
 **What an object takes of a range's store.** For the engines' share of a node's memory, sized by
 what the cell's volumes hold (the owner's choice of 2026-10-31, node.md §1.4): the harness's small

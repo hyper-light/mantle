@@ -444,6 +444,10 @@ patience was still vouched for, and one still reading its version was never ende
 the native client's supplied deadline now also bounds a stalled GET sink and takes precedence over
 queued events and opening another exchange. Telling held from moved in a note, so an asker with no
 deadline bounds held stretches on its own clock, remains open (research/77, D2 as reviewed).
+This fix is on main at `17eb8032`; CI runs `41376146577` and `41376636492` passed every job,
+as did Windows rolling-stop stress run `41353171174`. The separate box workspace gate failed
+three engine `ranges_room` tests when their writers ran out of file descriptors; that gate did
+not reach the vendored suite. Descriptor limits were left unchanged.
 On it the box's 20 GiB case (16 GB scope, load 39 to 74) acknowledged the native way's object
 in two runs, in 1,272 s and 2,268 s, with no `SlowDown`, and refused the CLI's and the native parts'
 typed, the volumes holding one object's three copies: exact as far as each ran, 2,581 blocks each on
@@ -454,7 +458,9 @@ On CI's busy runner the notes as built still cut runs whose 8.3 MB copies took t
 7.5 s to receive, the job saying nothing while the bytes crossed: a copy's pieces now vouch for its
 job as a read's do, and in an A/B on six runners the runs cut fell from 100 to 1 and the failed
 rounds from 12 of 24 to none; a test paces the founders' links to hold it
-([measurements](measurements/2026-10-29-a-node-cut-while-it-works.md)). A 100 GB object does not fit this Mac's free space (107 GB a node), refused typed. The boto3 10G case on this Mac
+([measurements](measurements/2026-10-29-a-node-cut-while-it-works.md)). A 100 GB object was refused
+typed at this Mac's free space then; later cleanup freed enough to require a fresh capacity
+check after the running case. The earlier boto3 10G case on this Mac
 waited two hours in its kills on a read through a founder just started again: a client's first
 exchange has no progress period with nothing measured, and an exchange lost is asked again of the
 same node. Bounding it with the node's serve period cut slow reads during a founder's kill under
@@ -486,8 +492,10 @@ Mac under load a restarted founder's first range reads could not reach their kno
 25 s (not met in 58 rounds on a Mac Studio, quiet and loaded); and this Mac's 10G cases, one way
 at a time on 1ac2509d: the native way's was exact (3 objects in 97.8% of each node's volume, refused
 typed, 18 reads after the kills), and the CLI's (1 object on the third-size volumes this Mac's free
-space then gave, 6 reads after the kills); both parts' ways wait for the ~63 GiB free a 10 GiB object
-takes beside the 30 GiB kept. A node started again
+space then gave, 6 reads after the kills). After disk cleanup the native parts' way held 13 objects
+in 97.9% of each node's volume, 33,280 blocks each on distinct nodes, 78 reads after the kills,
+none wrong or missing, and a typed out-of-space refusal. The boto3 parts' way is running on
+`17eb8032`; it has no result yet. A node started again
 judges no peer until its links are measured, and a leader killed meanwhile is not replaced
 (hyper-liveness's young links, an owner decision since 2026-10-16); step 1 ends a request's step
 there `SlowDown` where it had waited, which CI's windows-aarch64 met in mantle's node tests, which

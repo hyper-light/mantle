@@ -10,6 +10,12 @@ distinct nodes, every acknowledged object read back after each founder is killed
 and each large case ending at the typed refusal with the count held beside the volumes' stated
 capacity?
 
+**Checkpoint, 2026-11-02.** The reader fix is on main at `a57eaea7`. Seven of the 22 host/case
+slots have complete current-harness evidence with their build attribution below; the 100k sets
+and remaining large ways are still running. Capacity-only zero-object results receive no
+whole-object readback credit. The full Box workspace gate still has its recorded engine
+file-limit failure; the client, vendor and scale results retain their separate scopes.
+
 **The machines.** adacachy is the bare-metal box (the owner was told on 2026-10-27 that they are one
 machine): AMD Ryzen 9 9950X3D2, 16 cores and 32 threads, 122 GiB, `/home` on btrfs on a Samsung
 9100 PRO NVMe, Linux 7.2.9-2-cachyos, a kiln runner that other agents' CI shares ("the default is a
@@ -392,7 +398,7 @@ space falls below 30 GiB and reserves 32 GiB, including 2 GiB for metadata outsi
 (about 0.7 GiB measured, with room for a checkpoint being replaced). The earlier finding that
 100 GiB did not fit was specific to the free space then.
 
-**Current-build acceptance.** The candidate product is `17eb8032`. Its complete matrix has
+**Deadline-build acceptance.** These baseline cases used `17eb8032`. Its complete matrix has
 22 slots across the two physical hosts (adacachy is the box): three small sets and four large
 upload ways at each of 10 and 100 GiB per host. Historical passes above remain historical;
 missing current-build slots stay pending. The Mac's completed small sets are:
@@ -565,6 +571,30 @@ The reserve leaves room for the active small case's metadata; free space is read
 case. Each 10 GiB way still requires a whole object and full terminal checks. A 100 GiB case
 that cannot hold one is capacity-only evidence. The earlier verified native 10 GiB result keeps
 its `17eb8032` attribution.
+
+**Fresh CLI 10 GiB case on the fixed reader.** `box-16G-20261102-064320/large-10G`
+completed in 1,956 s, exit 0 with empty stderr. Its binary is the `a57eaea7` reader source
+identified above. The case acknowledged one 10,737,418,240-byte object, read it exactly through
+native and S3 initially, placed its 2,560 blocks on distinct nodes, and completed all six native
+restart reads with no re-asks/wrong/missing objects. All three controls caught their faults.
+The next key, HTTP `l1`, was refused full, unreadable and unlisted; the acknowledged key was
+listed, with no other refusal. Put/native/S3 rates were 24/162/338 MiB/s.
+
+It began with 100,388,159,488 bytes free and a 34,359,738,368-byte reserve, giving
+22,009,473,706 bytes per node. Each held 20,515,153,920 chunk bytes plus 8,325,104 unkept bytes,
+exactly accounted, with 8,404,992 bytes free. Its 16 GiB scope peaked at 3,415,420,928 bytes
+with no max/OOM events. During this case, 27.1 GiB of this session's unused debug artifacts
+were reclaimed after confirming no compiler used the cache; the case's existing volume sizes
+were unchanged. Later cases read the new free-space value. The large-result verifier checked
+all terminal counts and rejected a copied result reporting one incorrect object.
+The next native multipart case started in `box-16G-20261102-071744` alongside the active 100k set.
+
+For the remaining Mac 100 GiB ways, the queue uses 110 GiB/node only when the measured
+one-object budget fits the current free space. Otherwise it free-sizes the volumes after the
+same 32 GiB reserve and measures the outcome. A fixed 110 GiB case still requires one whole
+object; a free-sized zero-object result is capacity-only. All Mac 10 GiB ways require a whole
+object, clean typed-capacity/listing results and empty stderr before the next case starts.
+This removes an indefinite wait for a preferred size while retaining the full result checks.
 
 **What an object takes of a range's store.** For the engines' share of a node's memory, sized by
 what the cell's volumes hold (the owner's choice of 2026-10-31, node.md §1.4): the harness's small

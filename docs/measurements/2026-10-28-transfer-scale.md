@@ -355,17 +355,26 @@ Twelve completed objects were listed by a separate probe; this is not the harnes
 or exactness tally. No placement or restart totals were published, so the case is incomplete and
 must run again. The nodes' `write(stdout)` refusals after the stop are their closed harness pipes.
 
-The 100 GiB multipart ways now run first, one fresh cell a way on the same build. At the first
-start, 411 GiB free less the 30 GiB reserve cannot hold two whole 100 GiB objects in three copies
-(600 GiB before any overhead). The cell therefore uses 104 GiB per node rather than preallocating
-the unusable tail of a second object: non-payload space in the preceding full volume was about
-2.08%. The 104 GiB budget targets one object; the case must verify that count. This leaves about 100 GiB for the shared file
-system while preserving the maximum whole-object count of one. A zero-object result at this size
-would require revisiting the sizing; it would not show that this Mac cannot hold a 100 GiB object.
-Run `mac-100G-native-parts-20261101-230335` has started with 111,669,149,696-byte volumes and has no
-result yet. Later ways recalculate capacity; if two whole objects might fit, they use free-sized
-volumes. The runner now stops an incomplete case if filesystem free space falls below 30 GiB;
-future free-sized cases reserve 32 GiB, including 2 GiB for the cell's metadata outside its volumes
+The first 100 GiB native multipart case, `mac-100G-native-parts-20261101-230335`, used
+111,669,149,696-byte (104 GiB) volumes. It ended after 3,230 s with a typed full refusal at `l0`
+and **zero whole objects**: no placement blocks or restart reads were verified. Each node held
+100,999,364,372 chunk bytes. This was an undersized test volume, not a successful 100 GiB readback
+or proof that the Mac cannot hold one. The estimate based on a preceding build's 2.08% non-payload
+space did not account for this format's log reservation and multipart packing.
+
+The automatically started boto3 case, `mac-100G-boto-parts-20261101-235915`, was canceled after
+all three volume headers, with valid CRC-32C, showed only 105,398,599,680 data-region bytes
+(98.16 GiB): less than the plaintext object alone. Each volume reserved 6,231,248,896 bytes for
+the log. Its geometry and logs were retained and its volumes removed; it has no completed-object
+or exactness result.
+
+Run `mac-100G-native-parts-20261102-003931` now retries with 120,259,084,288-byte (112 GiB)
+volumes on the same `17eb8032` binary. This is a revised budget awaiting an actual whole-object
+result. At its start, 389 GiB free less the 32 GiB reserve cannot hold two whole objects in three
+copies (600 GiB before overhead). The queue requires exactly one completed object from this
+fixed-volume case before proceeding. Later ways recalculate capacity; if two whole objects
+might fit, they use free-sized volumes. The runner stops an incomplete case if filesystem free
+space falls below 30 GiB and reserves 32 GiB, including 2 GiB for metadata outside the volumes
 (about 0.7 GiB measured, with room for a checkpoint being replaced). The earlier finding that
 100 GiB did not fit was specific to the free space then.
 
@@ -377,8 +386,9 @@ after their large-case sequences. The Mac also queues final-build reruns of its 
 10 GiB ways after those small sets; its canceled boto3 case is already in the large-case sequence.
 The box's final-build runs use the 16 GiB memory scope. A queue is not a pass: every slot requires
 its terminal result, full acknowledgment/readback and placement totals, restart checks and
-applicable controls. A capacity refusal that holds no whole object is recorded as not fitting,
-not as a successful large-object readback.
+applicable controls. A capacity refusal that holds no whole object is never a successful
+large-object readback; an undersized explicit volume requires a corrected run before drawing a
+conclusion about the host's capacity.
 
 **What an object takes of a range's store.** For the engines' share of a node's memory, sized by
 what the cell's volumes hold (the owner's choice of 2026-10-31, node.md §1.4): the harness's small

@@ -494,8 +494,13 @@ at a time on 1ac2509d: the native way's was exact (3 objects in 97.8% of each no
 typed, 18 reads after the kills), and the CLI's (1 object on the third-size volumes this Mac's free
 space then gave, 6 reads after the kills). After disk cleanup the native parts' way held 13 objects
 in 97.9% of each node's volume, 33,280 blocks each on distinct nodes, 78 reads after the kills,
-none wrong or missing, and a typed out-of-space refusal. The boto3 parts' way is running on
-`17eb8032`; it has no result yet. A node started again
+none wrong or missing, and a typed out-of-space refusal. The boto3 parts' attempt on `17eb8032`
+was stopped after 6,182 s as shared-filesystem free space fell to 5.8 GiB; no placement or restart
+totals were published, so it remains incomplete. Retiring its volumes restored 417 GiB. The
+100 GiB native parts' way has now started on 104 GiB volumes per node: enough for the maximum one
+whole object in three copies at the measured free space, leaving the unusable tail of a second
+object as filesystem headroom. Its result is pending, followed by the other ways and the 10 GiB
+boto3 rerun ([measurements](measurements/2026-10-28-transfer-scale.md)). A node started again
 judges no peer until its links are measured, and a leader killed meanwhile is not replaced
 (hyper-liveness's young links, an owner decision since 2026-10-16); step 1 ends a request's step
 there `SlowDown` where it had waited, which CI's windows-aarch64 met in mantle's node tests, which

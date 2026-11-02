@@ -347,10 +347,38 @@ chunks on distinct nodes; 78 reads after the kills, none asked again, wrong or m
 controls caught; the refused object unreadable and unlisted and all acknowledged objects listed.
 Each node held 145,728,913,408 chunk bytes and had 8,404,992 bytes free. Run
 `mac-10G-native-parts-20261101-154857`, exit 0; the volumes were removed after the result was kept,
-leaving 442 GiB free. The boto3 parts' way is running on the later `17eb8032` build (binary
+leaving 442 GiB free. The boto3 parts' way ran on the later `17eb8032` build (binary
 `dcfa6de03a12b98542ce34515fdafafd`), run `mac-10G-boto-parts-20261101-210926`, with
-147,296,316,074-byte volumes; it has no result yet. The earlier finding that a 100 GiB object did
-not fit is specific to the free space then: capacity must be read again after this case ends.
+147,296,316,074-byte volumes. It was stopped for shared-filesystem capacity after 6,182 s,
+exit 143: free space had fallen to 5.8 GiB, and retiring its volumes returned it to 417 GiB.
+Twelve completed objects were listed by a separate probe; this is not the harness's acknowledgment
+or exactness tally. No placement or restart totals were published, so the case is incomplete and
+must run again. The nodes' `write(stdout)` refusals after the stop are their closed harness pipes.
+
+The 100 GiB multipart ways now run first, one fresh cell a way on the same build. At the first
+start, 411 GiB free less the 30 GiB reserve cannot hold two whole 100 GiB objects in three copies
+(600 GiB before any overhead). The cell therefore uses 104 GiB per node rather than preallocating
+the unusable tail of a second object: the preceding full volume's overhead was about 2.08%, and
+its 4 MiB chunks held 4,195,328 cipher bytes each. This leaves about 100 GiB for the shared file
+system while preserving the maximum whole-object count of one. A zero-object result at this size
+would require revisiting the sizing; it would not show that this Mac cannot hold a 100 GiB object.
+Run `mac-100G-native-parts-20261101-230335` has started with 111,669,149,696-byte volumes and has no
+result yet. Later ways recalculate capacity; if two whole objects might fit, they use free-sized
+volumes. The runner now stops an incomplete case if filesystem free space falls below 30 GiB;
+future free-sized cases reserve 32 GiB, including 2 GiB for the cell's metadata outside its volumes
+(about 0.7 GiB measured, with room for a checkpoint being replaced). The earlier finding that
+100 GiB did not fit was specific to the free space then.
+
+**Current-build acceptance.** The candidate product is `17eb8032`. Its complete matrix has
+22 slots across the two physical hosts (adacachy is the box): three small sets and four large
+upload ways at each of 10 and 100 GiB per host. Historical passes above remain historical;
+missing current-build slots stay pending. Both hosts now have final-build 1k/10k/100k runs queued
+after their large-case sequences. The Mac also queues final-build reruns of its other three
+10 GiB ways after those small sets; its canceled boto3 case is already in the large-case sequence.
+The box's final-build runs use the 16 GiB memory scope. A queue is not a pass: every slot requires
+its terminal result, full acknowledgment/readback and placement totals, restart checks and
+applicable controls. A capacity refusal that holds no whole object is recorded as not fitting,
+not as a successful large-object readback.
 
 **What an object takes of a range's store.** For the engines' share of a node's memory, sized by
 what the cell's volumes hold (the owner's choice of 2026-10-31, node.md §1.4): the harness's small

@@ -303,6 +303,29 @@ commits of its own, and its own steps three times outlasted the 6.1 s an unjudge
 cases here wait on how a node waits on a peer whose device stalls, which research/77 D2's carried
 deadline is to bound.
 
+The same case on the carried deadlines (branch `carried-deadlines`, f7788c31, with the diagnostic
+lines of 5639a8c4, never merged; binaries bf676bba and 88b49be7, the second naming each `SlowDown`'s
+cause): 20 GiB objects on stated 25 GiB volumes under the 16 GB scope, the box's load 39 to 74.
+Each run acknowledged the native way's object with no `SlowDown` and refused the next two typed,
+the volumes holding one object's three copies:
+
+| Run | Native put | CLI | Native parts | Each node's chunks | Scope at most | Ended |
+|---|---|---|---|---|---|---|
+| 1 (bf676bba) | `Done` in 1,272 s, 16.1 MiB/s | `InsufficientStorage` at 203 s | `InsufficientStorage` at 0.3 s | 25.05 GB of 26.84 GB, 3,431 fragments | 1.76 GB | in its reads after the kills, `the native door: the transport: UnknownExchange` |
+| 2 (88b49be7) | `Done` in 2,268 s, 9.0 MiB/s | `InsufficientStorage` at 241 s | `InsufficientStorage` at 1.0 s | 25.05 GB of 26.84 GB, 3,429 fragments | 1.31 GB | stopped at 2.5 h in its reads after the kills, a get moving nothing |
+
+Exact as far as each ran: 2,581 blocks, each block's chunks on distinct nodes, every node's chunk
+bytes what it received over QUIC and put. The first run's reads ended on a reply body its transport
+had just ended, which the client took for a transport failure (fixed, 412d1676). In the second the
+nodes answered one request `SlowDown` past its patience 347 s after the last put, and the founder
+started again a range step it found leaderless (`Read(Deadline)`) 908 s later; then nothing moved
+for 1.4 hours. The harness reads after each kill through a client it opens, asking with no
+deadline, and a client that has measured nothing gave its first exchange, the one object's get,
+the time to the deadline as its period: none. It now gives at most the stock S3 clients' 60 s
+(research/77 D2), judged once a period as the transport judges every exchange; a test holding a
+put's body three such periods sees it cut `Stalled` at the end of the first period that moved
+nothing (`crates/client/tests/progress.rs`).
+
 **This Mac's 10G cases, one way at a time** (the owner's choice of 2026-10-31), on 1ac2509d
 (binary 4858a0d7), each a fresh cell under launchd whose volumes are this Mac's free space less
 30 GiB, a third each, deleted once its case ends:

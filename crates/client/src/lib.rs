@@ -1631,9 +1631,16 @@ impl Client {
     /// nothing for as long as a connection may stay silent, the idle timeout (`bounds::limits`),
     /// and may pause an object's body that long while its driver waits on durable writes: a client
     /// cutting it sooner abandons an operation the node would finish, and a node that died is
-    /// found by its connection's idle timeout all the same.
+    /// found by its connection's idle timeout all the same. The time is at most the stock S3
+    /// clients' patience (`bounds::STOCK_PATIENCE`, research/77 D2), as long as a node waits on a
+    /// request's work that does not move: a request asked with no deadline is not waited on
+    /// without end where its node says nothing, the node's notes keeping one it works on, and its
+    /// transport, judging the exchange once a period, gives it up at the end of the first period
+    /// that moved nothing (a get read back through a founder just started again waited on a node
+    /// that served nothing, the box's 20 GiB case of 2026-11-01).
     fn period_ns(&mut self, node: PeerId, deadline_ns: u64, now_ns: u64) -> u64 {
-        let left = deadline_ns.saturating_sub(now_ns).max(1);
+        let patience = u64::try_from(bounds::STOCK_PATIENCE.as_nanos()).unwrap_or(u64::MAX);
+        let left = deadline_ns.saturating_sub(now_ns).max(1).min(patience);
         let Some(slowest) = self.slowest_ns else {
             return left;
         };

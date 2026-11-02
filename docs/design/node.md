@@ -1597,7 +1597,10 @@ less than a datagram moved, or after the peer had the whole request and a period
    D2). Each request carries how long its client will still wait: the native request head's time
    left, and for one that says nothing, every S3 request among them, the stock S3 clients' 60 s
    without its work moving (`bounds::STOCK_PATIENCE`, botocore's and the AWS CLI's default read
-   timeouts). A job's work moves at each of its own asks answered, each piece of a chunk it reads
+   timeouts). The native client holds itself to the same: an exchange it asks with no deadline has
+   that patience as its progress period at the most, so a node that says nothing of it, one just
+   started again among them, is given up at the end of the first period that moved nothing, never
+   sooner than the node gives up the work, and not waited on without end. A job's work moves at each of its own asks answered, each piece of a chunk it reads
    from or sends a peer, and each piece of its own body read or reply written. A job whose own work
    is held, an ask of its own out (a peer's transfer its transport keeps, or a write at its own
    device) or a chunk of it waiting for room, is ended `503 SlowDown` past its client's patience and

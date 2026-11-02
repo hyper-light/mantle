@@ -437,7 +437,12 @@ The owner chose (2026-11-01) that a node waits as long as its client would: buil
 without its work moving where it says none, a node vouching for work its device or a peer holds
 within it and asking again of the same volume a chunk refused for want of room; the box's large
 cases run again on it, and hyper-transport's maintainers review the change to D1's rule before it
-lands.
+lands. On it the box's 20 GiB case (16 GB scope, load 39 to 74) acknowledged the native way's object
+in two runs, in 1,272 s and 2,268 s, with no `SlowDown`, and refused the CLI's and the native parts'
+typed, the volumes holding one object's three copies: exact as far as each ran, 2,581 blocks each on
+distinct nodes. The first run's reads after the kills ended on the client's `UnknownExchange`
+(below); the second's waited 1.4 hours on a get through a client asked with no deadline that had
+measured nothing, and was stopped ([measurements](measurements/2026-10-28-transfer-scale.md)).
 On CI's busy runner the notes as built still cut runs whose 8.3 MB copies took their peers up to
 7.5 s to receive, the job saying nothing while the bytes crossed: a copy's pieces now vouch for its
 job as a read's do, and in an A/B on six runners the runs cut fell from 100 to 1 and the failed
@@ -448,7 +453,12 @@ exchange has no progress period with nothing measured, and an exchange lost is a
 same node. Bounding it with the node's serve period cut slow reads during a founder's kill under
 load and ran the client's transport out of budget (CI's one-CPU job, adacachy's 16 GB pass), and
 was reverted: it needs the node to state its progress (item 8) and to stop asking a dead peer for
-chunks, which a node serving a get does first, 0.5 to 2 s an ask. CI's busy job fails the native
+chunks, which a node serving a get does first, 0.5 to 2 s an ask. With the nodes stating their
+progress (D1) and waiting out each request's patience (D2), a client asked with no deadline gives
+its exchange at most the stock S3 clients' 60 s as its period: a node that works for it says so
+each beat, and one that says nothing is given up at the end of the first period that moved nothing,
+never sooner than the node would give up the work (a put held three periods by a test's node is cut
+`Stalled` after two). CI's busy job fails the native
 suite on the same cause with the client unchanged, on both arms of an A/B of the chunk store's
 latest changes: a node's own asks are judged by the period its client gives it, so a node whose
 ask of a peer takes most of a period loses to its client (7 of 36 read-backs cut), and a run cut

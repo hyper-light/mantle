@@ -419,7 +419,7 @@ the remaining large ways. The fresh 10k run, `mac-small-10000-20261102-034102`, 
 initially, 9,999 distinct-node blocks, and 60,000 exact native reads after kills with one asked
 again. Each node held 654,424,107 chunk bytes, exactly its received and locally put bytes,
 with none unkept. All controls caught. The 100k run is `mac-small-100000-20261102-041703`.
-At this checkpoint, three of 22 slots are verified under this harness and the other 19 remain open.
+At this checkpoint, four of 22 slots are verified under this harness and the other 18 remain open.
 Its replication pass reads natively; S3-after-kill readback is not part of these measured totals.
 
 The box's early 1k run on `17eb8032`, `box-16G-20261102-015302`, failed after 469 s during the
@@ -433,7 +433,33 @@ is still unresolved; the repeat does not close it. Smaller diagnostic sets of 2,
 objects passed in 65, 118 and 177 s and receive no credit for the required case sizes. A separate
 diagnostic build records the local refusal's origin; no product fix or larger limit is asserted.
 Three traced 1k trials also passed in 271, 191 and 176 s. The failed 1k slot stays open while
-the independent current-build 10k case proceeds and a diagnostic repeats the restart sequence.
+diagnosis continues. The independent current-build 10k case, `box-16G-20261102-040748/small-10000`,
+also ended with the native transport `Budget` refusal after 1,882 s. Its 9,999 blocks of 10,000
+acknowledged objects were on distinct nodes; chunk accounting matched, but no completed restart
+summary was emitted. Its scope peaked at 145,256,448 bytes with no max/OOM events. The failed
+cell was retained. Its 86 files were copied, compared byte for byte and flushed before a replay
+reopened it. `budget-replay-10k-17eb8032.log` records all 10,000 initial native reads exact,
+placement exact again, and 60,000 exact native reads across the original three-founder restart
+sequence, with no re-asks; exit 0 in 258.37 s. This replay neither reproduces nor fixes the
+original refusal and receives no credit as a completed fresh-cell case.
+
+The box's fresh native 10 GiB case, `box-16G-20261102-044701/large-10G`, passed on `17eb8032`,
+exit 0 after 1,129 s with empty stderr: two objects (21,474,836,480 logical bytes), 2,582
+distinct-node blocks, 12 exact native restart reads with no re-asks or wrong/missing objects,
+all controls caught, and native `l2` refused full, unreadable and unlisted. All acknowledged
+objects were listed; no other refusal occurred. Each 23,344,063,829-byte volume held
+21,771,458,000 chunk bytes plus 8,325,104 unkept bytes, exactly accounted, and 8,404,992 free
+bytes. Initial native and S3 reads were exact; put/native/S3 rates were 46/256/457 MiB/s.
+The 16 GiB scope peaked at 4,690,051,072 bytes with no max/OOM events.
+
+The next CLI attempt, `box-16G-20261102-050550`, saw only 139,682,914,304 bytes free, leaving
+747,986,944 bytes per node after the 128 GiB reserve. It held no whole object and is not a 10 GiB
+readback pass. The next minute, the native-parts case saw 207,058,972,672 bytes free and used
+23,206,673,066 bytes per node. It put two whole objects and passed placement over 5,120 blocks,
+then ended with the native transport `Budget` refusal after 1,441 s during restart checks.
+Its scope peaked at 5,617,119,232 bytes, with no max/OOM events. The failed cell is retained and
+the queue stopped. The CLI slot requires a fresh run with enough room; the multipart slot stays
+open pending diagnosis. A zero-object 10 GiB attempt cannot count as completed readback evidence.
 The Mac also queues reruns
 of its other three
 10 GiB ways after those small sets; its canceled boto3 case is already in the large-case sequence.
@@ -453,8 +479,19 @@ conclusion about the host's capacity.
 Each node held 6,551,373,832 chunk bytes, exactly its received and locally put bytes, with none
 kept by no object. Each 16 GiB volume had 100,001 fragments and 9,363,161,088 free bytes.
 The 16 GiB memory scope peaked at 1,769,697,280 bytes and recorded no max/OOM events. The same
-older job then began its combined 10 GiB capacity case with 40 GiB per node; that result is
-pending. These older-build results do not fill missing `17eb8032` slots.
+older job's combined 10 GiB capacity case on 40 GiB per node then ended exit 0 in 2,887 s:
+
+| Build | Native / CLI / native parts / boto3 parts objects | Logical bytes | Distinct-node blocks | Exact native reads after kills | Again / wrong / missing | Controls caught |
+|---|---|---|---|---|---|---|
+| `0100ddd8` | 1 / 1 / 1 / 0 | 32,212,254,720 | 6,411 | 18 | 0 / 0 / 0 | 3 / 3 |
+
+Native/CLI/native-parts put rates were 37/51/26 MiB/s, native read rates 206/163/159 MiB/s and
+S3 read rates 338/328/320 MiB/s. Native `l4` and HTTP `l3` were refused full; the refused objects
+were unreadable and unlisted, all acknowledged objects listed, and there were no other refusals.
+Each node held 40,098,945,024 chunk bytes plus 16,650,208 unkept bytes, exactly accounted, with
+8,404,992 free bytes. Boto3 multipart held no whole object because the ways shared one cell.
+The final build's queue therefore runs every way on its own fresh cell. These older-build results
+do not fill missing `17eb8032` slots.
 
 Its three 40 GiB volumes were fully allocated before the next small-case and restart probes
 started. Their temporary 128 GiB headroom guard had stopped the first repeated-restart probe

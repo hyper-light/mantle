@@ -1258,8 +1258,8 @@ mod tests {
         );
     }
 
-    /// Clients are records: puts at ten times a driver a core's clients run as many threads, as
-    /// the OS counts them, as at one client a core, and in open loop as in closed. Run in a
+    /// Clients are records: puts at ten times a driver a core's clients add no threads, as
+    /// the OS counts them, over one client a core, and open loop adds none over closed. Run in a
     /// process of its own, so that no other test's threads are counted.
     #[test]
     fn clients_cost_no_threads() {
@@ -1320,7 +1320,12 @@ mod tests {
             seen.push(outcome.threads);
             deletes(&v, &path, &keys, config.limits.queue_requests()).unwrap();
         }
-        assert!(seen.iter().all(|&t| t == seen[0]), "threads {seen:?}");
+        // A process may shed threads: Windows CI measured [15, 15, 13]. The first sample
+        // remains the ceiling; a later sample above it, or no measurement, still fails.
+        assert!(
+            seen.iter().all(|&t| t > 0 && t <= seen[0]),
+            "threads {seen:?}"
+        );
         v.close();
     }
 }

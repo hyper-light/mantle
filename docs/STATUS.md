@@ -519,15 +519,31 @@ started no data job. A fresh overlapping attempt then ran for 316 s before the 4
 guard stopped it, with no final integrity totals. The completed 100 GiB run released its volumes.
 The fresh 10k run passed in 2,153 s: all 10,000 objects, 9,999 distinct-node blocks, 60,000 exact
 native reads after kills, one asked again, no refusals or wrong/missing objects, all controls
-caught. The 100k set now runs before the remaining large ways. Three of the candidate's 22
+caught. The 100k set now runs before the remaining large ways. The box's fresh 10 GiB native
+case passed in 1,129 s with two objects, 2,582 distinct-node blocks, 12 exact native restart reads,
+no re-asks or wrong/missing objects, all controls caught, and typed full on its third key.
+Four of the candidate's 22
 host/case slots are verified under the current harness; its restart reads are native only.
 The box's early 1k attempt ended during restart reads with native transport `Budget` after 469 s;
 a repeat passed in 271 s, but the intermittent refusal remains under diagnosis and is not
-considered fixed. The Scale goal remains active.
+considered fixed. Its 10k set also ended with that refusal after 1,882 s: placement and chunk
+accounting passed, but there are no completed restart totals. The failed cell's 86 files were
+copied, byte-compared and flushed before a separate replay read all 10,000 objects and 60,000
+native restart reads exactly in 258.37 s. That replay did not reproduce or fix the refusal.
+The Scale goal remains active.
 The box's earlier `0100ddd8` 100k set ended exit 0 after 40,804 s: all 100,000 objects acknowledged,
 99,998 distinct-node blocks, 600,000 exact native reads after kills, no retries, refusals, wrong
 or missing objects, and all controls caught. It is older-build evidence; the candidate's 100k
 slot still needs its own result. That job has advanced to its combined 10 GiB capacity case.
+The older combined case then passed in 2,887 s with three 10 GiB objects, 6,411 distinct-node
+blocks and 18 exact native restart reads. It held one native, one CLI and one native multipart
+object; boto3 multipart held none. The final build's fresh per-way cells remain separate checks.
+Windows x86_64 CI's thread-count test rejected `[15, 15, 13]` because it required equality.
+Its contract is no added threads: the first count remains the ceiling, a positive decrease is
+accepted, and an increase or a missing measurement fails. The storage and transport code are
+unchanged by this test correction.
+The corrected test and all 39 CLI unit tests passed on Windows x86_64 with Rust 1.98.1, as did
+the package's clippy check over all targets and features with warnings denied.
 CI's one-CPU job ran the chunk store's test of the planned pass for five hours: a plan named an
 empty segment by its number, the writer freed it and the pass opened it again for its first
 victim's records, then cleaned it as its second victim, moving its own output into the last free

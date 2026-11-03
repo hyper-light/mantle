@@ -215,10 +215,36 @@ impl Client {
             with_length.push(("content-length", &length));
         }
         let head = self.head(method, target, &with_length, payload);
+        self.drop_if_closed();
         let stream = self.stream();
         stream.write_all(head.as_bytes()).unwrap();
         stream.write_all(body).unwrap();
         self.response(method == "HEAD")
+    }
+
+    /// Drops a connection the listener closed while it was quiet, so the next request opens
+    /// another: a stock client checks a pooled connection for its server's close before reusing
+    /// it (urllib3's `is_connection_dropped`), and the listener closes one quiet for a stock
+    /// client's patience (node.md §4.5). Asked only between requests, with no response unread.
+    fn drop_if_closed(&mut self) {
+        let Some(stream) = self.stream.as_ref() else {
+            return;
+        };
+        if !self.read.is_empty() {
+            return;
+        }
+        stream.set_nonblocking(true).unwrap();
+        let mut probe = [0u8; 1];
+        let closed = match stream.peek(&mut probe) {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(_) => true,
+        };
+        stream.set_nonblocking(false).unwrap();
+        if closed {
+            self.drop_connection();
+        }
     }
 
     /// Reads a response whole, the connection dropped after one that closes it.

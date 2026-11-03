@@ -273,11 +273,16 @@ fn a_connection_quiet_for_a_stock_clients_patience_is_let_go() {
             .filter(|&closed| closed)
             .count();
         let fresh = answer(at, &key);
-        (closed, fresh)
+        // A client that finds its pooled connection closed asks on a new one, as stock clients
+        // do, and is served again.
+        let again = held[0].send("GET", "/", &[], b"").status;
+        (closed, (fresh, again))
     });
     assert_eq!(closed, usize::try_from(CONNECTIONS).unwrap());
+    let (fresh, again) = fresh;
     let fresh = fresh.unwrap_or_else(|why| panic!("a connection after the quiet ones: {why}"));
     assert_eq!(fresh.status, 403, "{fresh:?}");
+    assert_eq!(again, 403);
 }
 
 /// One request on a connection of its own, signed with `key`, and the response it gets, read

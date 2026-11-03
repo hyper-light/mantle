@@ -53,7 +53,7 @@ mantle() {
 }
 args=(init /work/cell --max-nodes "$founders" --max-volumes "$founders")
 for n in $(seq 0 $((founders - 1))); do
-  args+=(--node "quic=0.0.0.0:7000,plane=0.0.0.0:7001,s3=0.0.0.0:7480,reach=$release-$n.$namespace.svc.cluster.local,domain=node-$n,volume=/volume:1G")
+  args+=(--node "quic=0.0.0.0:7000,plane=0.0.0.0:7001,s3=0.0.0.0:7480,reach=$release-$n.$namespace.svc.cluster.local,name=$release-$n.$namespace.svc.cluster.local,name=$release-s3.$namespace.svc.cluster.local,domain=node-$n,volume=/volume:1G")
 done
 mantle "${args[@]}" | tee "$work/init.txt"
 mantle init gateway /work/cell/gateway --cell /work/cell

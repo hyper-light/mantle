@@ -30,7 +30,10 @@ its clients' `node` lines name that host on its ports. The per-pod Services publ
 addresses, since a founder is ready only once the cell it forms through those very names enlisted
 it, and the endpoints controllers then count every endpoint ready (research/78 [11]). The
 StatefulSet's governing Service is headless and publishes not-ready addresses too. The cell's S3
-endpoint, `<fullname>-s3`, puts every ready founder's listener behind one address.
+endpoint, `<fullname>-s3`, puts every ready founder's listener behind one address. Off loopback the
+S3 listener speaks TLS with the endpoint's certificate for the names `mantle init` states
+(`name=HOST`, node.md §1.5), so each founder names its own Service and the cell's S3 Service, and a
+stock client takes the endpoint's authority (`OUT/s3/authority.pem`) as its chain.
 
 ## 3. Identity and keys
 

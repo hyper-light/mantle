@@ -5,7 +5,8 @@
 //! generator as they are written to them and checked against the generator as they are read back,
 //! so neither side holds more than a small object or a part at a time. Their credentials are the
 //! profile `mantle init` wrote; their config names the node's endpoint, which init leaves out for a
-//! founder whose port is chosen as it binds (node.md §1.5), as the stock-client tests write it.
+//! founder whose port is chosen as it binds (node.md §1.5), as the stock-client tests write it, over
+//! TLS with the endpoint's authority as its chain where the listener is not on a loopback address.
 
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -41,19 +42,42 @@ fn io(what: &str) -> impl FnOnce(std::io::Error) -> StockError + '_ {
     move |e| StockError::Io(what.to_owned(), e)
 }
 
-/// The operator's S3 profile for the listener at `endpoint`, `HOST:PORT`, written in `dir`: the environment a
-/// stock client runs in, the credentials `mantle init` wrote in `cell` beside a config naming the
-/// endpoint, path-style, and botocore's own transfer client.
+/// The URL of the listener at `endpoint`, `HOST:PORT`: plain HTTP on a loopback address, TLS
+/// elsewhere, as the listener serves it (`mantle_node::listener`; node.md §4.1).
+fn url(endpoint: &str) -> String {
+    let loopback = mantle_node::process::Endpoint::parse(endpoint)
+        .and_then(|at| at.host.parse::<std::net::IpAddr>().ok())
+        .is_some_and(|ip| ip.is_loopback());
+    if loopback {
+        format!("http://{endpoint}")
+    } else {
+        format!("https://{endpoint}")
+    }
+}
+
+/// The operator's S3 profile for the listener at `endpoint`, `HOST:PORT`, written in `dir`: the
+/// environment a stock client runs in, the credentials `mantle init` wrote in `cell` beside a
+/// config naming the endpoint, over TLS the endpoint's authority as its chain (`OUT/s3`'s PEM),
+/// path-style, and botocore's own transfer client.
 fn profile(
     dir: &Path,
     cell: &Path,
     (endpoint, region): (&str, &str),
 ) -> Result<Vec<(&'static str, OsString)>, StockError> {
     let config = dir.join("aws-config");
+    let url = url(endpoint);
+    let chain = if url.starts_with("https://") {
+        format!(
+            "ca_bundle = {}\n",
+            cell.join("s3").join("authority.pem").display()
+        )
+    } else {
+        String::new()
+    };
     std::fs::write(
         &config,
         format!(
-            "[profile mantle]\nregion = {region}\nendpoint_url = http://{endpoint}\ns3 =\n  \
+            "[profile mantle]\nregion = {region}\nendpoint_url = {url}\n{chain}s3 =\n  \
              addressing_style = path\n  preferred_transfer_client = classic\n"
         ),
     )
@@ -154,7 +178,7 @@ impl Boto {
         let mut child = Command::new(PYTHON)
             .arg("-I")
             .arg(&script)
-            .arg(format!("http://{endpoint}"))
+            .arg(url(endpoint))
             .arg(region)
             .arg(bucket)
             .envs(env)

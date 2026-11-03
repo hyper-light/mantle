@@ -598,8 +598,8 @@ the production gate passed for this fix. The recorded full-workspace file-limit 
 separate.
 The fix landed as `a9446d9d` after all nine CI jobs passed. A fresh Box CLI case runs with the
 fixed binary and raw exit receipts. The Mac native 10 GiB case instead stopped at its unchanged
-30 GiB disk guard after 7,529 s, without final integrity totals; it remains incomplete and its
-payloads are retained for recovery. The earlier listing of five 10 GiB keys is not readback
+30 GiB disk guard after 7,529 s, without final integrity totals; it remains incomplete, and its
+payloads were kept for recovery until 2026-11-02. The earlier listing of five 10 GiB keys is not readback
 or acknowledgment evidence. No resource limit was raised and the guard remains unchanged.
 The fresh Box CLI 100 GiB case then passed its capacity checks in 856 s on the fixed harness:
 actual CLI upload exit 1 with typed `InsufficientStorage`, no whole object, unreadable and
@@ -611,12 +611,20 @@ Mac recovery diagnostics exposed an invalid launchd descriptor context, then a m
 root-enlistment readiness barrier. Those failed attempts are preserved. The corrected replay
 uses the existing execution context without changing its limits and has verified its first
 10 GiB native read against the independent generator. It remains uncredited pending all
-required checks, with every payload retained.
+required checks.
 That replay's native read matched all 10,737,418,240 bytes. The following AWS CLI S3 read
 exited 0 with empty stderr after only 8,714,190,848 correct prefix bytes; the length check
 rejected it. A response-code diagnostic stopped at the unchanged disk guard during startup,
-before any S3 request. The short read's cause remains unknown, and the case remains incomplete
-with its chunk payloads retained.
+before any S3 request. The case remains incomplete and uncredited.
+Against a loopback fixture the same CLI ended exit 0 with a copy cut at a part only when that
+part's connection closed with no response; a `412`, a short `206`, a cut body, `503` and `500` all
+ended exit 1 (research/72 [7]). The S3 listener closed connections past its budget of ten that
+way, and the recovery script's idle boto3 connection held one of the ten during the CLI's read.
+The listener now answers past its budget `503 SlowDown` from a reserve of ten and lets a
+connection go after 60 s of quiet (node.md §4.5). A two-node check on the guarded cell, run after
+deleting its volume 0 by the owner's decision, ended at its one-hour bound with neither node done
+starting: a sample showed Raft replay waiting on the log while its I/O thread read. Its other two
+volumes, and the failed Box CLI cell's, were then deleted as decided; metadata and logs remain.
 The box's earlier `0100ddd8` 100k set ended exit 0 after 40,804 s: all 100,000 objects acknowledged,
 99,998 distinct-node blocks, 600,000 exact native reads after kills, no retries, refusals, wrong
 or missing objects, and all controls caught. It is older-build evidence; the fresh 100k result

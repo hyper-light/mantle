@@ -3,8 +3,10 @@
 //! the node's object host in-process ([`crate::door`]), with no loopback QUIC hop.
 //!
 //! The listener accepts on the node's shard under its connection budget, past which a connection
-//! is closed as it comes (hyper-rt's refusal by close), and runs each connection as a task of its
-//! own, so the runtime wakes the one whose socket or channel moved. A connection serves its
+//! is answered `503 SlowDown` and closed from a reserve of its own (never closed with no answer,
+//! which a stock client can take for a part done), and runs each connection as a task of its own,
+//! so the runtime wakes the one whose socket or channel moved. A connection whose client says
+//! nothing for a stock client's patience is let go, its slot with it. A connection serves its
 //! requests one at a time, in order (RFC 9112 §9.3), each through [`conn`]: its head parsed, its
 //! route and signature checked ([`request`]), its operation handed over, its body read only as the
 //! host's driver wants it, and the host's reply written as S3's response ([`respond`]).
@@ -35,11 +37,23 @@ use crate::process::AccessKey;
 
 pub use conn::PIECE;
 
-/// The connections a listener holds at once: what stock clients open to an endpoint by default,
+/// The connections a listener serves at once: what stock clients open to an endpoint by default,
 /// the AWS CLI's `max_concurrent_requests` and botocore's `max_pool_connections`, ten each (the
 /// AWS CLI's S3 configuration reference; botocore's `Config`). A cell's floor serves one such
-/// client; a connection past it is closed as it comes.
+/// client; a connection past it is answered `503 SlowDown` from [`REFUSING`].
 pub const CONNECTIONS: u64 = 10;
+
+/// The connections past [`CONNECTIONS`] the listener answers `503 SlowDown`, `Connection: close`,
+/// rather than closes: as many as one more stock client opens at once (research/72). A connection
+/// closed with no answer is what the AWS CLI's transfers take worst: a ranged GET whose every
+/// attempt met one is dropped, and the copy ends exit 0 with the object short, where a `503` it
+/// retries and then fails loudly (research/72, measured 2026-11-02). Past both budgets a
+/// connection is closed as it comes, the one refusal left that costs nothing to make.
+pub const REFUSING: u64 = CONNECTIONS;
+
+/// The connection tasks a listener runs at once, those it serves and those it answers refused:
+/// the node gives each a task, a timer for its wait on its client (`conn`) and a socket.
+pub const TASKS: u64 = CONNECTIONS + REFUSING;
 
 /// The connections the kernel queues for the listener before it accepts them: the budget, as no
 /// more are served at once.
@@ -136,8 +150,10 @@ pub(crate) fn tls_config(
 /// The S3 listener, bound.
 pub struct Listener {
     socket: TcpListener,
-    /// The socket's budget, read for the connections open.
+    /// The connections served at once ([`CONNECTIONS`]).
     budget: ConnectionBudget,
+    /// The connections past the budget answered `503 SlowDown` at once ([`REFUSING`]).
+    refusing: ConnectionBudget,
     endpoint: &'static Endpoint,
     door: Submitter,
 }
@@ -159,9 +175,10 @@ impl Listener {
             None => None,
         };
         let budget = ConnectionBudget::new(CONNECTIONS).map_err(ListenError::Socket)?;
-        let socket = TcpListener::bind(settings.listen, BACKLOG)
-            .map_err(ListenError::Socket)?
-            .with_budget(budget.clone());
+        let refusing = ConnectionBudget::new(REFUSING).map_err(ListenError::Socket)?;
+        // The listener takes each connection's slot itself (`start`), so a connection past the
+        // budget is answered rather than closed by the accept.
+        let socket = TcpListener::bind(settings.listen, BACKLOG).map_err(ListenError::Socket)?;
         let endpoint = Box::leak(Box::new(Endpoint {
             region: settings.region,
             access: settings.access,
@@ -176,6 +193,7 @@ impl Listener {
         Ok(Self {
             socket,
             budget,
+            refusing,
             endpoint,
             door,
         })
@@ -194,7 +212,7 @@ impl Listener {
         loop {
             match self.socket.accept().await {
                 Ok(stream) => self.start(stream),
-                Err(e) if exhausted(&e) && self.budget.open() > 0 => {
+                Err(e) if exhausted(&e) && (self.budget.open() > 0 || self.refusing.open() > 0) => {
                     if let Err(e) = self.endpoint.closed.notified().await {
                         return ListenError::Socket(e);
                     }
@@ -204,8 +222,16 @@ impl Listener {
         }
     }
 
-    /// A connection's task. One the shard has no room for is closed as it comes, with its slot.
+    /// A connection's task, served within the budget or answered `503 SlowDown` past it. One past
+    /// both budgets, or that the shard has no room for, is closed as it comes, with its slot.
     fn start(&self, stream: TcpStream) {
+        let admitted = match self.budget.try_take() {
+            Some(slot) => (slot, conn::Admitted::Served),
+            None => match self.refusing.try_take() {
+                Some(slot) => (slot, conn::Admitted::Refused),
+                None => return,
+            },
+        };
         let io = match self.endpoint.certified {
             None => io::Io::Plain(stream),
             Some(certified) => match tls_config(certified)
@@ -216,8 +242,12 @@ impl Listener {
                 Err(_) => return,
             },
         };
-        let _ =
-            hyper_rt::futures::spawn_detached(conn::serve(io, self.endpoint, self.door.clone()));
+        let _ = hyper_rt::futures::spawn_detached(conn::serve(
+            io,
+            self.endpoint,
+            self.door.clone(),
+            admitted,
+        ));
     }
 }
 

@@ -811,14 +811,40 @@ The following AWS CLI 2.34.18 S3 read exited 0 with empty stderr after only 8,71
 correct prefix bytes. The length check rejected it. This is an incomplete S3 read, with no
 whole-object or recovery credit. A response-code diagnostic then stopped during node startup
 at the unchanged 30 GiB disk guard, before issuing its S3 request; it collected no response
-code. The cause of the short read remains unestablished. All guarded chunk payloads remain
-retained. Older owned metadata copies were reclaimed only after complete archive comparisons;
+code. The cause of the short read was then unestablished, and the guarded chunk payloads were
+kept (see below). Older owned metadata copies were reclaimed only after complete archive comparisons;
 the original failed Box CLI cell remains intact.
 An isolated control using the same installed CLI and stdout reader delivered all 10 GiB from
 a loopback HTTP fixture, through 1,280 ranged GETs, with exit 0, no wrong bytes and no stderr
 (538.04 s under the shared load). This did not reproduce the short output or establish its
 cause. A two-founder diagnostic, leaving volume 0 offline, also reached the existing disk
 guard during startup before any S3 request. Both diagnostics remain separate from acceptance.
+
+**The short read's likely mechanism (2026-11-02).** The same installed CLI against a loopback
+fixture serving a 64 MiB object in eight 8 MiB parts, one part's ranged GET answered the same
+way on every attempt (research/72 [7]): a `412`, a `206` shorter than asked, a body cut part way,
+a `503 SlowDown` and a `500` each ended exit 1 with the error said. A connection closed with no
+response ended exit 0 with empty stderr and the copy cut at that part: 5 of 8 parts for a middle
+part, 7 of 8 for the last. The CLI sends the HEAD's ETag as `If-Match` on every part and checks
+each `206`'s range, so only a connection closed unanswered leaves it a short copy it reports as
+done. The S3 listener closed connections past its budget of ten exactly that way, and the
+recovery script's boto3 client, its listing done, held one of that listener's ten idle throughout
+the CLI's read, leaving its ten threads nine. That fits the cut 6.9 MB into part 1,038 and the
+read's five minutes; it was not reproduced on the cell. The listener now answers a connection
+past its budget `503 SlowDown` and lets a quiet one go after a stock client's patience
+(research/72; node.md §4.5).
+
+By the owner's decision of 2026-11-02 the guarded cell's volume 0 was deleted and a check ran on
+the other two nodes for its bound of an hour: HEAD each key through each node, then the CLI's
+read of `l0` with only response facts kept. Neither node finished starting within the hour, so
+the check asked nothing. A stack sample after 34 minutes (`mac-10G-native-20261102-145005.
+check-node-sample-20261103.txt`) showed the node's thread in its ranges' open, Raft replay
+waiting on `hyper_log`'s `GroupLog::ask`, and the log's I/O thread in `pread` in every sample,
+at 0.8 s of CPU for the process; its 92 MB log file reads whole in 0.12 s. The earlier response
+diagnostics' long startups may be the same. The volumes 1 and 2 were then deleted too, as
+decided; the cell's metadata, logs, the three metadata archives and the sample remain. The
+original failed Box CLI cell's three chunk volumes (310.8 GB) were also deleted by the owner's
+decision; its 84 metadata files stay in their verified archive.
 
 **What an object takes of a range's store.** For the engines' share of a node's memory, sized by
 what the cell's volumes hold (the owner's choice of 2026-10-31, node.md §1.4): the harness's small

@@ -7,9 +7,18 @@
 //! request (RFC 9112 §6.3, §9.6). A put's body is read only after the host says its driver wants
 //! it, which is after every check that could refuse it, so `100 Continue` goes only then and a
 //! refusal goes in its place (RFC 9110 §10.1.1; node.md §4.5).
+//!
+//! A connection past the listener's budget is answered `503 SlowDown` to its first request, with
+//! `Connection: close`, never closed with no answer (research/72). A client that says nothing for
+//! a stock client's patience is not waited on longer: between requests its connection ends, and
+//! its slot goes to a client that asks.
+
+use std::pin::pin;
 
 use bytes::Bytes;
+use hyper_rt::combine::{Either, race2};
 use hyper_rt::sync::{Sender, channel};
+use hyper_rt::tcp::ConnectionSlot;
 use mantle_http::write::{self, Length};
 use mantle_http::{self as http, Framing, Head, Refusal, Version};
 use mantle_s3::checksum::{Algorithm, Checksum, Hasher};
@@ -20,7 +29,22 @@ use super::io::{Io, IoError};
 use super::request::{self, Parts, Plan, Refused, Streamed, Upload};
 use super::respond::{self, Echo, Ids, Response};
 use crate::door::{self, Answer, Piece, Submitter};
+use mantle_protocol::bounds;
 use mantle_protocol::object::{Op, Status};
+
+/// How the listener took a connection (`Listener::start`).
+pub(super) enum Admitted {
+    /// Within the budget: its requests served.
+    Served,
+    /// Past the budget, from the reserve: its first request answered `503 SlowDown`.
+    Refused,
+}
+
+/// The longest a connection waits on its client for an octet: a stock client's patience, which
+/// is botocore's read timeout and how long one waits on the listener (`bounds::STOCK_PATIENCE`).
+fn patience_ns() -> u64 {
+    u64::try_from(bounds::STOCK_PATIENCE.as_nanos()).unwrap_or(u64::MAX)
+}
 
 /// The octets a connection reads at once, and a body's piece: the native door's, the transport's
 /// receive chunk (`crate::node::PIECE`), so a put's driver takes the same pieces by either door.
@@ -41,6 +65,8 @@ enum Ended {
     Close,
     /// It failed: the socket, TLS, or a reply the host could not finish.
     Broken,
+    /// Its client said nothing for a stock client's patience: closed at once, owed no response.
+    Quiet,
 }
 
 /// The octets read and not yet taken: `buf[start..end]`. Initialized once, so a read needs no
@@ -98,10 +124,17 @@ struct Connection {
     output: Vec<u8>,
     endpoint: &'static Endpoint,
     door: Submitter,
+    admitted: Admitted,
 }
 
-/// Serves `io`'s requests until the connection ends, then gives its descriptor back.
-pub(super) async fn serve(io: Io, endpoint: &'static Endpoint, door: Submitter) {
+/// Serves `io`'s requests until the connection ends, then gives its descriptor back and its slot,
+/// in that order, so an accept waiting for a descriptor finds both free.
+pub(super) async fn serve(
+    io: Io,
+    endpoint: &'static Endpoint,
+    door: Submitter,
+    (slot, admitted): (ConnectionSlot, Admitted),
+) {
     let mut connection = Connection {
         io,
         input: Input {
@@ -112,10 +145,12 @@ pub(super) async fn serve(io: Io, endpoint: &'static Endpoint, door: Submitter) 
         output: Vec::new(),
         endpoint,
         door,
+        admitted,
     };
     let ended = connection.requests().await;
     connection.end(ended).await;
     drop(connection);
+    drop(slot);
     endpoint.closed.notify_one();
 }
 
@@ -161,10 +196,16 @@ impl Connection {
             let head = loop {
                 match http::parse(self.input.unread()) {
                     Ok(Some(head)) => break head,
-                    Ok(None) => match self.input.fill(&mut self.io).await {
-                        Ok(0) if self.input.unread().is_empty() => return Ended::Closed,
-                        Ok(0) | Err(_) => return Ended::Broken,
-                        Ok(_) => {}
+                    Ok(None) => match self.fill_within().await {
+                        Ok(Some(0)) if self.input.unread().is_empty() => return Ended::Closed,
+                        Ok(Some(0)) | Err(_) => return Ended::Broken,
+                        Ok(Some(_)) => {}
+                        // Nothing said for a stock client's patience: the connection closes and its
+                        // slot goes. Between requests no response is owed, so none is lost to a
+                        // reset, and a request that crossed the close is asked again on another
+                        // connection, as stock clients ask again one whose connection closed
+                        // before any response (RFC 9112 §9.3.1).
+                        Ok(None) => return Ended::Quiet,
                     },
                     Err(refusal) => {
                         let ids = self.ids();
@@ -180,6 +221,9 @@ impl Connection {
             octets.clear();
             octets.extend_from_slice(self.input.unread().get(..head.len()).unwrap_or_default());
             self.input.take(head.len());
+            if matches!(self.admitted, Admitted::Refused) {
+                return self.slow_down(&head, &octets).await;
+            }
             match self.request(&head, &octets).await {
                 Ok(true) => {}
                 Ok(false) => return Ended::Close,
@@ -192,6 +236,40 @@ impl Connection {
         Ids {
             request: request_id(),
             host: self.endpoint.host.clone(),
+        }
+    }
+
+    /// More of the client's octets as `fill` reads them, or `None` when it says nothing for a
+    /// stock client's patience.
+    async fn fill_within(&mut self) -> Result<Option<usize>, IoError> {
+        let filled = {
+            let fill = pin!(self.input.fill(&mut self.io));
+            let silence = pin!(hyper_rt::futures::sleep(patience_ns()));
+            race2(fill, silence).await
+        };
+        match filled {
+            Either::First(read) => read.map(Some),
+            Either::Second(slept) => slept.map(|()| None).map_err(IoError::Socket),
+        }
+    }
+
+    /// The answer a connection past the budget gets to its first request: `503 SlowDown`, S3's
+    /// answer to a client asking faster than it serves, which stock clients ask again after a
+    /// backoff, with `Connection: close`, the connection ending in stages (`end`).
+    async fn slow_down(&mut self, head: &Head, octets: &[u8]) -> Ended {
+        let ids = self.ids();
+        let is_head = head.method(octets) == b"HEAD";
+        let resource =
+            Parts::of(head, octets).map_or_else(|_| "/".to_owned(), |p| p.path.to_owned());
+        let response = respond::error(
+            &respond::refusal(Status::SlowDown),
+            &resource,
+            &ids,
+            is_head,
+        );
+        match self.respond(&response, head.version(), true).await {
+            Ok(()) => Ended::Close,
+            Err(()) => Ended::Broken,
         }
     }
 
@@ -636,17 +714,24 @@ impl Connection {
 
     /// Ends the connection as `ended` says. After a response that said `Connection: close`, its
     /// sending half ends and what the client still sends is read and dropped until it closes, at
-    /// most the largest body a request may carry, so the response is not lost to a reset
-    /// (RFC 9112 §9.6).
+    /// most the largest body a request may carry and while it says something within a stock
+    /// client's patience, so the response is not lost to a reset (RFC 9112 §9.6).
     async fn end(&mut self, ended: Ended) {
         if !matches!(ended, Ended::Close) || self.io.close().await.is_err() {
             return;
         }
         let mut drained = 0u64;
         while drained <= request::MAX_BODY {
-            match self.io.read(&mut self.input.buf).await {
-                Ok(0) | Err(_) => return,
-                Ok(n) => drained = drained.saturating_add(u64::try_from(n).unwrap_or(u64::MAX)),
+            let read = {
+                let read = pin!(self.io.read(&mut self.input.buf));
+                let silence = pin!(hyper_rt::futures::sleep(patience_ns()));
+                race2(read, silence).await
+            };
+            match read {
+                Either::First(Ok(0) | Err(_)) | Either::Second(_) => return,
+                Either::First(Ok(n)) => {
+                    drained = drained.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+                }
             }
         }
     }

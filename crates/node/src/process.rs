@@ -1538,19 +1538,20 @@ pub fn calibration(dir: &Path, budget: Duration) -> Result<Calibration, ProcessE
 }
 
 /// The timers the node's task holds at once, one for each sleep pending: its turn's wait, its
-/// transport driver's QUIC timer, and, once a stop is asked, the stop's bound (no task of the S3
-/// listener sleeps). A sleep that finds every timer taken waits for one to free (hyper-rt's
-/// `Counters::timer_waits`), and the release wakes the task, which ends the turn's wait at once
-/// (`Node::wait`: any wake ends it). Counted two, a stopping node turned without pause until it
-/// ended: 8,834 turns and 8,798 timer waits in a stop of 346 ms on macOS (diag/roll-stop-bound),
-/// a CPU spent for the whole stop.
+/// transport driver's QUIC timer, and, once a stop is asked, the stop's bound. A sleep that finds
+/// every timer taken waits for one to free (hyper-rt's `Counters::timer_waits`), and the release
+/// wakes the task, which ends the turn's wait at once (`Node::wait`: any wake ends it). Counted
+/// two, a stopping node turned without pause until it ended: 8,834 turns and 8,798 timer waits in
+/// a stop of 346 ms on macOS (diag/roll-stop-bound), a CPU spent for the whole stop. Each of the
+/// S3 listener's connection tasks holds one more while it waits on its client
+/// (`listener::TASKS`).
 const TIMERS: usize = 3;
 
 /// One shard, calibrated on this machine (hyper-rt `RuntimeConfig::from_calibration`), sized by
 /// what the node holds: its one task and the timers it holds at once ([`TIMERS`]), and a socket
 /// for its endpoint, each connection and its plane, each read and written; with an S3 listener, a
-/// task for each connection it holds at once, and a socket for the listener and each of those
-/// connections.
+/// task and a timer for each connection it holds at once, served or answered refused
+/// (`listener::TASKS`), and a socket for the listener and each of those connections.
 fn runtime(config: &ProcessConfig, s3: bool) -> Result<RuntimeConfig, ProcessError> {
     let calibration = calibration(&config.dir, config.probe_budget)?;
     let constants = calibration
@@ -1561,7 +1562,7 @@ fn runtime(config: &ProcessConfig, s3: bool) -> Result<RuntimeConfig, ProcessErr
         })
         .map_err(|unmet| ProcessError::Runtime(format!("{unmet:?}")))?;
     let connections = if s3 {
-        usize::try_from(crate::listener::CONNECTIONS)
+        usize::try_from(crate::listener::TASKS)
             .map_err(|_| ProcessError::Runtime("the S3 listener's connections".into()))?
     } else {
         0
@@ -1569,7 +1570,10 @@ fn runtime(config: &ProcessConfig, s3: bool) -> Result<RuntimeConfig, ProcessErr
     let tasks = connections
         .checked_add(1)
         .ok_or_else(|| ProcessError::Runtime("the node's tasks".into()))?;
-    let mut runtime = RuntimeConfig::from_calibration(&calibration, &constants, tasks, TIMERS);
+    let timers = TIMERS
+        .checked_add(connections)
+        .ok_or_else(|| ProcessError::Runtime("the node's timers".into()))?;
+    let mut runtime = RuntimeConfig::from_calibration(&calibration, &constants, tasks, timers);
     runtime.shards = 1;
     runtime.pin = false;
     runtime.cores.clear();

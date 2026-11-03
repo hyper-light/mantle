@@ -5,7 +5,8 @@
 //! dials, takes HTTP/1.1 by ALPN where the client offers HTTP/2 beside it, and on TLS 1.2 an
 //! ECDHE-ECDSA AES-GCM suite; and a request is read and answered over it, one signed with another
 //! secret, which the listener refuses itself, `403 SignatureDoesNotMatch`, so no node stands
-//! behind it.
+//! behind it. And the listener's connections (research/72): one past the budget answered `503
+//! SlowDown`, never closed with no answer, and quiet ones let go after a stock client's patience.
 
 #![allow(
     clippy::unwrap_used,
@@ -34,17 +35,18 @@ use hyper_tls::{
 };
 use mantle_cert::{EndpointKey, EndpointName, Serial, Validity};
 use mantle_node::door;
-use mantle_node::listener::{CONNECTIONS, Listener, Settings};
+use mantle_node::listener::{CONNECTIONS, Listener, Settings, TASKS};
 use mantle_node::process::AccessKey;
 
-/// The listener's shard: the root task and a task for each connection it holds, a socket for it
-/// and each, read and written.
+/// The listener's shard: the root task and a task for each connection it holds, served or
+/// answered refused, with a timer for each connection's wait on its client, a socket for it and
+/// each, read and written.
 fn runtime() -> LocalRuntime {
-    let connections = usize::try_from(CONNECTIONS).unwrap();
+    let connections = usize::try_from(TASKS).unwrap();
     LocalRuntime::new(&RuntimeConfig {
         shards: 1,
         tasks_per_shard: connections + 1,
-        timers_per_shard: 1,
+        timers_per_shard: connections + 1,
         interests_per_shard: interests_for(connections + 1),
         ring_entries: 1,
         step_budget_ns: 1_000_000_000,
@@ -101,11 +103,7 @@ fn the_listener_answers_over_tls_1_3_and_1_2_with_the_endpoint_chain() {
         (validity, Serial::draw().unwrap()),
     )
     .unwrap();
-    let access = AccessKey {
-        id: "AKIAIOSFODNN7EXAMPLE".into(),
-        account: "123456789012".into(),
-        secret: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(),
-    };
+    let access = access();
     let pkcs8 = key.pkcs8().to_vec();
     let asked = access.clone();
     let said = runtime()
@@ -156,6 +154,189 @@ fn the_listener_answers_over_tls_1_3_and_1_2_with_the_endpoint_chain() {
             "{said:?}"
         );
     }
+}
+
+/// The cell's access key, as the listener holds it.
+fn access() -> AccessKey {
+    AccessKey {
+        id: "AKIAIOSFODNN7EXAMPLE".into(),
+        account: "123456789012".into(),
+        secret: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(),
+    }
+}
+
+/// `key`'s id signing with another secret: a request the listener refuses itself, `403
+/// SignatureDoesNotMatch`, with no node behind it, and the connection kept, as the request has no
+/// body.
+fn wrong(key: &AccessKey) -> s3::Key {
+    s3::Key {
+        id: key.id.clone(),
+        secret: format!("{}x", key.secret),
+    }
+}
+
+/// A listener in plain HTTP on loopback holding `access`.
+fn plain(access: AccessKey) -> Settings {
+    Settings {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        region: "us-east-1".into(),
+        domains: Vec::new(),
+        access: vec![access],
+        tls: None,
+        node: 1,
+    }
+}
+
+/// What `client` does beside the listener bound in plain HTTP, the listener serving until it
+/// says.
+fn beside<T: Send + 'static>(client: impl FnOnce(SocketAddr) -> T + Send + 'static) -> T {
+    let access = access();
+    runtime()
+        .block_on(async move {
+            // No node takes what the door holds: every request here is refused before it.
+            let (_doorway, submitter) = door::doorway(1, Waker::noop().clone()).unwrap();
+            let listener = Listener::bind(plain(access), submitter).unwrap();
+            let at = listener.local_addr().unwrap();
+            let (told, mut heard) = hyper_rt::sync::channel::<T>(1).unwrap();
+            let thread = std::thread::spawn(move || {
+                let said = client(at);
+                if told.blocking_send(said).is_err() {
+                    panic!("the listener's side ended");
+                }
+            });
+            let said = match race2(listener.serve(), heard.recv()).await {
+                Either::Second(Ok(said)) => said,
+                Either::Second(Err(e)) => panic!("the client: {e:?}"),
+                Either::First(e) => panic!("the listener ended: {e}"),
+            };
+            thread.join().unwrap();
+            said
+        })
+        .unwrap()
+}
+
+/// A connection past the listener's budget is answered, never closed with no answer (node.md
+/// §4.5; research/72). Each of the budget's slots is held by a connection that asked once and
+/// stays open, as a stock client's pooled connection does; the next connection's request is
+/// answered `503 SlowDown` with `Connection: close`. Closed with no answer instead, it is what the
+/// AWS CLI's transfers take worst: a ranged GET whose every attempt met one is dropped, and the
+/// copy ends exit 0 with the object short, where a `503` the CLI asks again after a backoff and
+/// then fails loudly (research/72, measured 2026-11-02).
+#[test]
+fn a_connection_past_the_budget_is_answered_slow_down() {
+    let (held, past) = beside(|at| {
+        let key = wrong(&access());
+        let mut held: Vec<s3::Client> = (0..CONNECTIONS)
+            .map(|_| s3::Client::new(at, key.clone(), "us-east-1"))
+            .collect();
+        let statuses: Vec<u16> = held
+            .iter_mut()
+            .map(|client| client.send("GET", "/", &[], b"").status)
+            .collect();
+        let past = answer(at, &key);
+        drop(held);
+        (statuses, past)
+    });
+    assert!(held.iter().all(|&status| status == 403), "{held:?}");
+    let past = past.unwrap_or_else(|why| panic!("the connection past the budget: {why}"));
+    assert_eq!(past.status, 503, "{past:?}");
+    assert_eq!(
+        past.element("Code").as_deref(),
+        Some("SlowDown"),
+        "{past:?}"
+    );
+    assert!(past.closes(), "{past:?}");
+}
+
+/// A connection whose client says nothing for a stock client's patience is let go, its slot with
+/// it (node.md §4.5): every slot is held by a connection that asked once and went quiet, each is
+/// closed by the listener, and a new connection's request is then served (`403`, the listener's
+/// own answer), not answered refused. Each socket reads at most twice the patience, so a listener
+/// that never lets go fails here rather than hangs.
+#[test]
+fn a_connection_quiet_for_a_stock_clients_patience_is_let_go() {
+    let (closed, fresh) = beside(|at| {
+        let key = wrong(&access());
+        let mut held: Vec<s3::Client> = (0..CONNECTIONS)
+            .map(|_| s3::Client::new(at, key.clone(), "us-east-1"))
+            .collect();
+        for client in &mut held {
+            assert_eq!(client.send("GET", "/", &[], b"").status, 403);
+            client
+                .stream()
+                .set_read_timeout(Some(2 * mantle_protocol::bounds::STOCK_PATIENCE))
+                .unwrap();
+        }
+        let closed = held
+            .iter_mut()
+            .map(|client| client.closed())
+            .filter(|&closed| closed)
+            .count();
+        let fresh = answer(at, &key);
+        (closed, fresh)
+    });
+    assert_eq!(closed, usize::try_from(CONNECTIONS).unwrap());
+    let fresh = fresh.unwrap_or_else(|why| panic!("a connection after the quiet ones: {why}"));
+    assert_eq!(fresh.status, 403, "{fresh:?}");
+}
+
+/// One request on a connection of its own, signed with `key`, and the response it gets, read
+/// whole; or how the connection ended without one.
+fn answer(at: SocketAddr, key: &s3::Key) -> Result<s3::Response, String> {
+    let client = s3::Client::new(at, key.clone(), "us-east-1");
+    let mut stream = TcpStream::connect(at).map_err(|e| format!("connect: {e}"))?;
+    stream
+        .set_read_timeout(Some(mantle_protocol::bounds::STOCK_PATIENCE))
+        .unwrap();
+    let head = client.head("GET", "/", &[], mantle_s3::sigv4::EMPTY_SHA256);
+    stream
+        .write_all(head.as_bytes())
+        .map_err(|e| format!("closed with no answer, the request's write: {e}"))?;
+    let mut read = Vec::new();
+    let mut buf = [0u8; 4096];
+    let end = loop {
+        if let Some(end) = read.windows(4).position(|w| w == b"\r\n\r\n") {
+            break end + 4;
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => return Err("closed with no answer".into()),
+            Ok(n) => read.extend_from_slice(&buf[..n]),
+            Err(e) => return Err(format!("closed with no answer: {e}")),
+        }
+    };
+    let head = String::from_utf8(read[..end].to_vec()).unwrap();
+    let mut lines = head.split("\r\n");
+    let status = lines
+        .next()
+        .unwrap()
+        .split(' ')
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let headers: Vec<(String, String)> = lines
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let (name, value) = l.split_once(':').unwrap();
+            (name.trim().to_owned(), value.trim().to_owned())
+        })
+        .collect();
+    let length: usize = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .map_or(0, |(_, value)| value.parse().unwrap());
+    while read.len() < end + length {
+        match stream.read(&mut buf) {
+            Ok(0) => return Err("the body ended early".into()),
+            Ok(n) => read.extend_from_slice(&buf[..n]),
+            Err(e) => return Err(format!("the body: {e}")),
+        }
+    }
+    Ok(s3::Response {
+        status,
+        headers,
+        body: read[end..end + length].to_vec(),
+    })
 }
 
 /// Asks the listener at `at` over `version` of TLS, its certificate verified under `authority`

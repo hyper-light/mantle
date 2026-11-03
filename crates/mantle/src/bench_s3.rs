@@ -27,7 +27,7 @@ use hyper_tls::pki_types::{CertificateDer, ServerName};
 use hyper_tls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned, version};
 use mantle_cert::{EndpointKey, EndpointName, Serial, Validity};
 use mantle_node::door::{self, Answer, Doorway, Piece};
-use mantle_node::listener::{CONNECTIONS, Listener, PIECE, Settings};
+use mantle_node::listener::{Listener, PIECE, Settings, TASKS};
 use mantle_node::process::AccessKey;
 use mantle_protocol::object::{Op, Reply, Status};
 use mantle_s3::checksum::{self, Algorithm};
@@ -165,14 +165,16 @@ fn host(doorway: &mut Doorway, jobs: &mut Vec<Job>, object: &Bytes) {
 }
 
 /// The listener's shard: the stub's task, the listener's and one for each connection it holds,
-/// and a socket for the listener and each connection, read and written.
+/// served or answered refused, with a timer for each connection's wait on its client, and a socket
+/// for the listener and each connection, read and written.
 fn runtime() -> Result<LocalRuntime, Error> {
-    let connections = usize::try_from(CONNECTIONS).map_err(setup)?;
+    let connections = usize::try_from(TASKS).map_err(setup)?;
     let tasks = connections.checked_add(2).ok_or_else(|| setup("tasks"))?;
+    let timers = connections.checked_add(1).ok_or_else(|| setup("timers"))?;
     LocalRuntime::new(&RuntimeConfig {
         shards: 1,
         tasks_per_shard: tasks,
-        timers_per_shard: 1,
+        timers_per_shard: timers,
         interests_per_shard: interests_for(tasks),
         ring_entries: 1,
         step_budget_ns: 1_000_000_000,

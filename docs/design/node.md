@@ -1861,8 +1861,8 @@ read and dropped so the exchange ends whole. Steps 7 and 8 are §5.1's: the driv
 commands and reads, and a typed reply the native protocol encodes.
 
 *As built (2026-10-25), the S3 listener* (`crates/node/src/listener`, `crates/node/src/door.rs`).
-1. A connection past the budget, ten (research/72), is closed as it comes, hyper-rt's refusal by
-close. 2. `mantle_s3::route` names the bucket by the path at the endpoint's stated names, its
+1. A connection past the budget, ten (research/72), is answered `503 SlowDown` with `Connection:
+close` from a reserve of ten more, and one past both closed as it comes (§4.5, 2026-11-02). 2. `mantle_s3::route` names the bucket by the path at the endpoint's stated names, its
 addresses and `localhost`, and by the host under one of its names; any other host is
 `InvalidURI`. 3. `mantle_s3::sigv4` checks the signature, its header's or a presigned URL's,
 against the cell's access keys; who asks is the account the key acts for, and a mutation's identity
@@ -2073,7 +2073,15 @@ body is read, so before `100 Continue`. A response sent before its request's bod
 anyway (RFC 9110 §10.1.1); the listener then half-closes and reads what comes until the client
 closes, at most the largest body a request may carry, so the response is not lost to a reset
 (RFC 9112 §9.6; research/72). The connection budget is a floor of ten, what botocore and the AWS
-CLI's classic transfers open at their defaults (research/72). Open: the budget growing past its
+CLI's classic transfers open at their defaults (research/72). A connection past it is answered
+`503 SlowDown` with `Connection: close` to its first request, from a reserve of ten more, never
+closed with no answer: the AWS CLI drops a ranged GET whose every attempt met a connection closed
+unanswered and ends its copy exit 0 with the object short, where a `503` it asks again and then
+fails loudly (research/72 [7]). Past both a connection is closed as it comes. A connection waits on
+its client's next octet at most a stock client's patience, 60 s (`bounds::STOCK_PATIENCE`):
+between requests it then closes, owed no response, so a client's idle pooled connections give
+their slots back; and the read after a `Connection: close` ends there too. Each connection task
+holds a timer for that wait, which the node's runtime counts beside its task. Open: the budget growing past its
 floor with the node's memory, which the CLI's CRT transfer client asks, at least ten connections and
 twenty-five at its 10 Gb/s target (research/72); the process's descriptor limit, which the budget
 does not yet read; the reclaim of the connection that has made the least progress for longest when

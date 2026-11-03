@@ -612,6 +612,11 @@ root-enlistment readiness barrier. Those failed attempts are preserved. The corr
 uses the existing execution context without changing its limits and has verified its first
 10 GiB native read against the independent generator. It remains uncredited pending all
 required checks, with every payload retained.
+That replay's native read matched all 10,737,418,240 bytes. The following AWS CLI S3 read
+exited 0 with empty stderr after only 8,714,190,848 correct prefix bytes; the length check
+rejected it. A response-code diagnostic stopped at the unchanged disk guard during startup,
+before any S3 request. The short read's cause remains unknown, and the case remains incomplete
+with its chunk payloads retained.
 The box's earlier `0100ddd8` 100k set ended exit 0 after 40,804 s: all 100,000 objects acknowledged,
 99,998 distinct-node blocks, 600,000 exact native reads after kills, no retries, refusals, wrong
 or missing objects, and all controls caught. It is older-build evidence; the fresh 100k result

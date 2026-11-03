@@ -805,6 +805,21 @@ is claimed yet, and every payload remains retained. Both failed diagnostics and 
 snapshots taken before replay remain available. No descriptor limit, reserve or guard was
 changed.
 
+The corrected replay's native `l0` read returned all 10,737,418,240 bytes in 114.60 s,
+SHA-256 `68542b84c2b715fd43d15d2c601f31e2d6ed135dbf85dbd32e120c27ab11e3eb`.
+The following AWS CLI 2.34.18 S3 read exited 0 with empty stderr after only 8,714,190,848
+correct prefix bytes. The length check rejected it. This is an incomplete S3 read, with no
+whole-object or recovery credit. A response-code diagnostic then stopped during node startup
+at the unchanged 30 GiB disk guard, before issuing its S3 request; it collected no response
+code. The cause of the short read remains unestablished. All guarded chunk payloads remain
+retained. Older owned metadata copies were reclaimed only after complete archive comparisons;
+the original failed Box CLI cell remains intact.
+An isolated control using the same installed CLI and stdout reader delivered all 10 GiB from
+a loopback HTTP fixture, through 1,280 ranged GETs, with exit 0, no wrong bytes and no stderr
+(538.04 s under the shared load). This did not reproduce the short output or establish its
+cause. A two-founder diagnostic, leaving volume 0 offline, also reached the existing disk
+guard during startup before any S3 request. Both diagnostics remain separate from acceptance.
+
 **What an object takes of a range's store.** For the engines' share of a node's memory, sized by
 what the cell's volumes hold (the owner's choice of 2026-10-31, node.md §1.4): the harness's small
 sets on this Mac (binary 4858a0d7, launchd at the shell's 1,048,576 descriptors), each object a

@@ -33,6 +33,7 @@ mod durability;
 mod files;
 mod init;
 mod journal;
+mod pack;
 mod transfer;
 
 #[derive(Parser)]
@@ -113,6 +114,32 @@ enum Command {
         /// The node's configuration: the operator's keys only, one `key = value` a line.
         config: PathBuf,
     },
+    /// Whether the node whose directory is DIR is ready to serve: it exits 0 once the cell's root
+    /// range has enlisted the node in its current run, 1 before, as a supervisor's readiness check
+    /// asks (docs/design/kubernetes.md).
+    Status {
+        /// The node's directory.
+        dir: PathBuf,
+    },
+    /// Pack every file under DIR into FILE, one file of at most a Kubernetes Secret's bytes, each
+    /// key marked (a file its owner alone may read): a founder's directory `mantle init` made, as
+    /// one Secret's value (docs/design/kubernetes.md).
+    Pack {
+        /// The directory to pack.
+        dir: PathBuf,
+        /// The pack to write.
+        file: PathBuf,
+    },
+    /// Install the pack FROM (`mantle pack`) into TO, a node's own directory: each file written
+    /// whole and durable, keys readable by their owner alone, the configuration last. A TO holding
+    /// a configuration already is kept as it is, the node's state beside it
+    /// (docs/design/kubernetes.md).
+    Install {
+        /// The pack, read only: a Secret's projected file.
+        from: PathBuf,
+        /// The directory to install into, where `mantle serve` runs from.
+        to: PathBuf,
+    },
     /// Make a bucket, s3://BUCKET, asked of the cell over its native protocol as the client of
     /// --client (each object command does).
     Mb { bucket: String },
@@ -179,6 +206,17 @@ enum InitCommand {
         /// An empty or missing directory to make the client in.
         name: PathBuf,
         /// The directory `mantle init` made the cell in, which holds its authority.
+        #[arg(long)]
+        cell: PathBuf,
+    },
+    /// A gateway of the cell: its certificate under the cell's authority, its owner-only key, and
+    /// the directory NAME of its identity, pinned in each founder's configuration in the cell's
+    /// directory, as a reader of the cell's metadata connects (the transfer harness's
+    /// `--cell`). Made before any founder first starts.
+    Gateway {
+        /// An empty or missing directory to make the gateway in.
+        name: PathBuf,
+        /// The directory `mantle init` made the cell in, which holds its authority and founders.
         #[arg(long)]
         cell: PathBuf,
     },
@@ -375,6 +413,20 @@ enum BenchCommand {
         /// The bytes the run's file system keeps free where `--volume free` sizes the volumes.
         #[arg(long, value_parser = init::parse_bytes)]
         reserve: Option<u64>,
+        /// A cell running elsewhere instead of a fresh cell of three each case: the directory
+        /// `mantle init` made it in, the harness's gateway pinned in its founders before they first
+        /// started (`mantle init gateway DIR/gateway --cell DIR`), its own volumes taken, each
+        /// case's objects in a bucket of its own; its nodes are not started, killed or counted
+        /// here, and every acknowledged object is read back through each node in turn.
+        #[arg(long)]
+        cell: Option<PathBuf>,
+        /// With --cell, a command run halfway through the first small set's native puts, its
+        /// words split at spaces, such as one that deletes a node's pod and waits until its
+        /// successor is ready: the puts go on beside it, and its end, which must be success, is
+        /// waited for before the set's other puts and every read; puts the cell refuses SlowDown
+        /// meanwhile, short a node, are counted and acknowledged by nothing.
+        #[arg(long, requires = "cell")]
+        disrupt: Option<String>,
     },
 }
 
@@ -607,6 +659,18 @@ fn main() -> ExitCode {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let result = match cli.command {
+        Command::Status { dir } => match mantle_node::layout::Layout::new(&dir).ready() {
+            Ok(true) => writeln!(out, "ready").map_err(|e| e.to_string()),
+            Ok(false) => Err(format!(
+                "{}: not enlisted in its current run",
+                dir.display()
+            )),
+            Err(e) => Err(e.to_string()),
+        },
+        Command::Pack { dir, file } => pack::pack(&mut out, &dir, &file).map_err(|e| e.to_string()),
+        Command::Install { from, to } => {
+            pack::install(&mut out, &from, &to).map_err(|e| e.to_string())
+        }
         Command::Node { .. }
         | Command::Serve { .. }
         | Command::Mb { .. }
@@ -620,6 +684,12 @@ fn main() -> ExitCode {
             what: Some(InitCommand::Client { name, cell }),
             ..
         } => init::client(&mut out, &name, &cell).map_err(|e| e.to_string()),
+        Command::Init {
+            what: Some(InitCommand::Gateway { name, cell }),
+            ..
+        } => init::pin_gateway(&mut out, &name, &cell)
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
         Command::Init {
             what: None,
             out: dir,
@@ -783,6 +853,8 @@ fn main() -> ExitCode {
                     ways,
                     volume,
                     reserve,
+                    cell,
+                    disrupt,
                 },
         } => {
             let volume = match (volume.0, reserve) {
@@ -803,6 +875,12 @@ fn main() -> ExitCode {
                         count,
                         ways,
                         volume,
+                        cell,
+                        disrupt: disrupt
+                            .iter()
+                            .flat_map(|words| words.split_whitespace())
+                            .map(str::to_owned)
+                            .collect(),
                     };
                     match transfer::transfer(&mut out, &options) {
                         Ok(true) => Ok(()),

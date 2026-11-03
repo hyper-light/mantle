@@ -1,0 +1,58 @@
+# Values of the mantle chart (docs/design/kubernetes.md). Each is its operator's statement: a node
+# measures its machine and devices and derives every tuning value from those (docs/design/node.md
+# §1.4), so none here is a tuning constant.
+
+# The cell's founders, one pod each: pod N is founder N in the order `mantle init` was given them.
+# The chart cannot grow a cell; a node joins one by enlisting, not from a template.
+replicas: 3
+
+image:
+  # The image the Dockerfile at the repository root builds: `mantle` alone on distroless, non-root.
+  repository: mantle
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+# The ports every founder binds, as `mantle init` stated them for each (`quic=0.0.0.0:PORT`,
+# `plane=0.0.0.0:PORT`, `s3=0.0.0.0:PORT`): its Service carries the same ones.
+ports:
+  quic: 7000
+  plane: 7001
+  s3: 7480
+
+# Each founder's identity and keys: the Secret `<fullname>-N-founder` for pod N, its key `founder`
+# the pack (`mantle pack`) of founder N's directory `mantle init` made, its reach
+# (`reach=<fullname>-N.<namespace>.svc.<clusterDomain>`) the name of its Service. The operator makes
+# them (docs/design/kubernetes.md §3); the chart never generates one, since an identity changed by a
+# `helm upgrade` would change the node's id and every peer's pin.
+clusterDomain: cluster.local
+
+storage:
+  # The class of the two claims each founder holds, its node directory's and its chunk volume's: the
+  # cluster's default where empty.
+  storageClassName: ""
+  # The claims' sizes. The volume's bytes are stated at `mantle init` (`volume=/volume:SIZE`), which
+  # its claim holds at least: a provisioner that ignores a claim's size, as kind's local-path does,
+  # does not bound the volume, its statement does (research/78).
+  nodeSize: 2Gi
+  volumeSize: 2Gi
+
+resources:
+  # Requests equal limits, so the pod's cgroup bounds the node's memory, which `mantle serve`
+  # derives its budgets within (`memory.max`, node.md §1.4), and the pod is Guaranteed.
+  memory: 2Gi
+  cpu: 1
+
+# The node's orderly stop: the bound its configuration states (`stop_ms`) or, unstated, 10 s
+# (`derive::DEFAULT_STOP`), and the pod's grace, which is held above it so the stop ends before
+# the kubelet's SIGKILL (research/78).
+stopSeconds: 10
+terminationGracePeriodSeconds: 30
+
+readiness:
+  # Readiness is the node's own word (`mantle status`): ready once the cell's root range enlisted it
+  # in its current run. The probe's cadence and its one run's bound, seconds.
+  periodSeconds: 5
+  timeoutSeconds: 3
+
+nodeSelector: {}
+tolerations: []

@@ -15,6 +15,11 @@ use std::path::{Path, PathBuf};
 const RUN: &str = "run";
 /// The run record's bytes: one count.
 const RUN_BYTES: usize = 8;
+/// The readiness record's file: the run in which the cell's root range last enlisted the node, for
+/// a supervisor's readiness check (`mantle status`; research/78).
+const ENLISTED: &str = "enlisted";
+/// Where the readiness record is written before it is renamed over its place.
+const ENLISTED_NEXT: &str = "enlisted.next";
 /// The stop record's file in the node's directory.
 const STOPPED: &str = "stopped";
 /// The stop record's bytes: the run that stopped, the node's time run then in nanoseconds, and its
@@ -84,6 +89,46 @@ impl Layout {
         hyper_block::record::write(&self.dir.join(RUN), &run.to_le_bytes())
             .map_err(|e| LayoutError::Record(e.to_string()))?;
         Ok(run)
+    }
+
+    /// The run in which the cell's root range last enlisted the node, none before it first did.
+    pub fn enlisted(&self) -> Result<Option<u64>, LayoutError> {
+        let path = self.dir.join(ENLISTED);
+        match hyper_block::record::read(&path, RUN_BYTES)
+            .map_err(|e| LayoutError::Record(e.to_string()))?
+        {
+            None => Ok(None),
+            Some(bytes) => {
+                let count: [u8; RUN_BYTES] = bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| LayoutError::Malformed(bytes.len()))?;
+                Ok(Some(u64::from_le_bytes(count)))
+            }
+        }
+    }
+
+    /// Keeps `run` as the run the cell's root range enlisted the node in: the record format's
+    /// bytes and CRC-32C (hyper-block `record`), written under a temporary name and renamed over its
+    /// place, so a reader finds the old record or the new one whole. It is not flushed, since a
+    /// node writes it while it serves and no shard waits on its device (node.md §1.3): lost to a
+    /// crash, the next run is not ready until it enlists, which it would not be anyway.
+    pub fn keep_enlisted(&self, run: u64) -> Result<(), LayoutError> {
+        let count = run.to_le_bytes();
+        let mut record = Vec::with_capacity(RUN_BYTES.saturating_add(4));
+        record.extend_from_slice(&count);
+        record.extend_from_slice(&mantle_crc::crc32c(&count).to_le_bytes());
+        let next = self.dir.join(ENLISTED_NEXT);
+        let kept = |e: std::io::Error| LayoutError::Record(e.to_string());
+        std::fs::write(&next, &record).map_err(kept)?;
+        std::fs::rename(&next, self.dir.join(ENLISTED)).map_err(kept)
+    }
+
+    /// Whether the node is ready to serve: the cell's root range enlisted it in its current run.
+    pub fn ready(&self) -> Result<bool, LayoutError> {
+        Ok(
+            matches!((self.run()?, self.enlisted()?), (Some(run), Some(enlisted)) if run == enlisted),
+        )
     }
 
     /// The run that last ended in an orderly stop, none before the first did.

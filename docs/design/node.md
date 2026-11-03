@@ -553,6 +553,21 @@ client: a `peer` line naming one is refused at its line. Tested by a cell of thr
 made, whose configurations pin their nodes alone, served by a client it made, through the library
 and the command line (`crates/mantle/tests/native.rs`).
 
+*As built (2026-11-03): founders behind names, a gateway pinned, a founder carried whole.* A
+founder may state its reach (`reach=HOST`, an IP address or a DNS name), the host its peers and
+native clients dial on its QUIC and plane ports where it differs from the address it binds, as a
+Kubernetes Service's name in front of a pod (kubernetes.md §2; research/78): its peers' `peer`
+lines and the cell file's `node` lines name that host, a node resolves a peer line's names once at
+its start, and a client resolves its `node` lines' at its own. `mantle init gateway NAME --cell
+OUT` issues a gateway's certificate under the authority and pins it in each founder's
+configuration (`peer = ID gateway identity/peers/gateway-ID.der`, its certificate beside the
+founder's peers'), before any founder starts. `mantle pack DIR FILE` carries a directory as one
+checksummed file, its keys marked, and `mantle install FILE TO` writes it back, each key owner-only
+and the configuration last, keeping a directory that holds a configuration already
+(kubernetes.md §3). Tested in `init`'s and `pack`'s tests (a founder reached at its name on its own
+ports; a founder packed and installed whole, its keys owner-only, its gateway pinned, a changed byte
+or a path out of its directory refused, a second install keeping the first).
+
 **Joining.** An existing node mints an invitation (`mantle invite`): a one-time token recorded
 in the root range, so the log decides whether it was used. `mantle init --join` sends the token
 and a certificate request over the enrollment protocol, whose key the joining node keeps; the
@@ -600,7 +615,10 @@ when the device's identity, firmware, file system or topology no longer match it
 the key file and the data share a disk, which the node reports.
 
 *As built, and planned (2026-10-21; 2026-10-23).* The node's directory holds its metadata today:
-the shared log (`log`), its run record (`run`, §2.4 item 4) and each range's engine store
+the shared log (`log`), its run record (`run`, §2.4 item 4), its readiness record (`enlisted`: the
+run in which the cell's root range last enlisted it, written under a temporary name and renamed
+as it says `enlisted`, unflushed since a crash only leaves the next run not ready until it enlists,
+which `mantle status` compares with its run; kubernetes.md §5) and each range's engine store
 (`range-GROUP.store`), and each volume's device directory holds `mantle/LOCK`, `mantle/volume` and,
 under `mantle serve`, `mantle/profile`: the depth, read bytes, read gap and first-write penalty its
 calibration measured, keyed by the identity facts that decide how the device performs (its model,

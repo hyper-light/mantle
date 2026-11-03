@@ -72,7 +72,10 @@ fn cell_file<'a>(
 ) -> String {
     let mut text = format!("authority = {authority}\naccount = {account}\n");
     for (founder, id) in founders {
-        text.push_str(&format!("node = {id} {}\n", founder.quic));
+        let quic = founder
+            .dialed(founder.quic)
+            .unwrap_or_else(|| founder.quic.to_string());
+        text.push_str(&format!("node = {id} {quic}\n"));
     }
     text
 }
@@ -150,6 +153,9 @@ pub struct Founder {
     pub volumes: Vec<(PathBuf, u64)>,
     /// The most memory the node may hold, where stated.
     pub memory: Option<u64>,
+    /// The host its peers and native clients dial it at, on its QUIC and plane ports, where it
+    /// differs from the address it binds: a Service's name in front of a pod (research/78).
+    pub reach: Option<String>,
 }
 
 /// The cell as stated: its founders, in order, and the cell's own statements.
@@ -171,6 +177,19 @@ impl Founder {
     /// the one port, as an https URI's port is dialed over either (RFC 9114 §3.1).
     pub fn s3(&self) -> SocketAddr {
         self.s3.unwrap_or(self.quic)
+    }
+
+    /// Where its peers and clients dial `bound`, its QUIC or plane address, as `HOST:PORT`: its
+    /// reach on that port where stated, else the address itself where it can be dialed (a port and
+    /// a specified address); none where the founder learns its address only as it binds, its peers
+    /// told then on standard input.
+    pub fn dialed(&self, bound: SocketAddr) -> Option<String> {
+        match &self.reach {
+            Some(host) if host.contains(':') => Some(format!("[{host}]:{}", bound.port())),
+            Some(host) => Some(format!("{host}:{}", bound.port())),
+            None if bound.port() != 0 && !bound.ip().is_unspecified() => Some(bound.to_string()),
+            None => None,
+        }
     }
 }
 
@@ -225,7 +244,7 @@ fn founder<'a>(
     form: char,
 ) -> Result<Founder, String> {
     let (mut quic, mut plane, mut domain, mut memory) = (None, None, None, None);
-    let mut s3 = None;
+    let (mut s3, mut reach) = (None, None);
     let (mut volumes, mut names) = (Vec::new(), Vec::new());
     let once = |slot: &mut Option<String>, key: &str, value: &str| -> Result<(), String> {
         match slot.replace(value.to_owned()) {
@@ -241,6 +260,12 @@ fn founder<'a>(
             "memory" => once(&mut memory, key, value)?,
             "volume" => volumes.push(volume(value, form)?),
             "s3" => once(&mut s3, key, value)?,
+            "reach" => {
+                if value.parse::<IpAddr>().is_err() && check_dns_name(value).is_err() {
+                    return Err(format!("{value:?} is neither an IP address nor a DNS name"));
+                }
+                once(&mut reach, key, value)?;
+            }
             "name" => {
                 check_dns_name(value)
                     .map_err(|_| format!("{value:?} is not a DNS name a certificate may carry"))?;
@@ -248,8 +273,8 @@ fn founder<'a>(
             }
             other => {
                 return Err(format!(
-                    "{other} is not a founder's statement: quic, plane, s3, name, domain, volume \
-                     or memory"
+                    "{other} is not a founder's statement: quic, plane, reach, s3, name, domain, \
+                     volume or memory"
                 ));
             }
         }
@@ -278,7 +303,12 @@ fn founder<'a>(
         domain,
         volumes,
         memory: memory.map(|m| parse_bytes(&m)).transpose()?,
+        reach,
     };
+    // A reach is dialed on the founder's own ports, which a port of 0 leaves unknown until it binds.
+    if founder.reach.is_some() && (founder.quic.port() == 0 || founder.plane.port() == 0) {
+        return Err("a reach and a port of 0: its peers would dial no port".into());
+    }
     // An endpoint at every address has no one address its certificate can name.
     if founder.s3().ip().is_unspecified() && founder.names.is_empty() {
         return Err(
@@ -292,8 +322,9 @@ fn founder<'a>(
 /// A founder in `--node`'s form: comma-separated `key=value`s, `quic=ADDR`, `plane=ADDR`,
 /// `s3=ADDR` (its S3 endpoint's, TCP; its QUIC address unless stated), `name=HOST` (repeatable: a
 /// DNS name its S3 clients dial), `domain=NAME`, `volume=DIR:SIZE` (repeatable, the size after the
-/// path's last colon) and `memory=SIZE`. A directory with a comma in it is stated in a machines
-/// file instead.
+/// path's last colon), `memory=SIZE` and `reach=HOST` (the host its peers and native clients dial
+/// on its QUIC and plane ports, where it differs from the address it binds). A directory with a
+/// comma in it is stated in a machines file instead.
 pub fn parse_node(spec: &str) -> Result<Founder, Error> {
     let mut pairs = Vec::new();
     for part in spec.split(',') {
@@ -607,13 +638,12 @@ fn config(
         .zip(&cell.founders)
         .filter(|(peer, _)| **peer != id)
     {
-        // A founder stated at port 0, or at no address of its own, learns where it listens only as
-        // it binds: its peers are told then, on standard input, as of a peer that moved.
-        let dialable = |at: &SocketAddr| at.port() != 0 && !at.ip().is_unspecified();
-        let at = if dialable(&other.quic) && dialable(&other.plane) {
-            format!(" {} {}", other.quic, other.plane)
-        } else {
-            String::new()
+        // A peer is dialed at its reach where stated. One stated at port 0, or at no address of its
+        // own, learns where it listens only as it binds: its peers are told then, on standard
+        // input, as of a peer that moved.
+        let at = match (other.dialed(other.quic), other.dialed(other.plane)) {
+            (Some(quic), Some(plane)) => format!(" {quic} {plane}"),
+            _ => String::new(),
         };
         text.push_str(&format!(
             "peer = {peer} node identity/peers/{peer}.der{at}\n"
@@ -948,8 +978,8 @@ pub(crate) struct Authority {
     pub(crate) name: String,
     /// The account the cell's native clients act for.
     pub(crate) account: String,
-    /// Each founder's id and QUIC address.
-    pub(crate) nodes: Vec<(u64, SocketAddr)>,
+    /// Each founder's id and the QUIC address its clients dial, `HOST:PORT`.
+    pub(crate) nodes: Vec<(u64, String)>,
     pub(crate) certificate: Vec<u8>,
     pub(crate) key: KeyPair,
 }
@@ -969,7 +999,7 @@ impl Authority {
         let text = std::fs::read_to_string(authority_dir.join(CELL))?;
         let mut name = None;
         let mut account = None;
-        let mut nodes: Vec<(u64, SocketAddr)> = Vec::new();
+        let mut nodes: Vec<(u64, String)> = Vec::new();
         for line in text.lines().filter(|l| !l.trim().is_empty()) {
             let bad = || Error::Cell(format!("the cell file's line does not read: {line}"));
             let (key, value) = line.split_once('=').ok_or_else(bad)?;
@@ -979,7 +1009,9 @@ impl Authority {
                 "node" => {
                     let (id, quic) = value.trim().split_once(' ').ok_or_else(bad)?;
                     let id = id.parse().map_err(|_| bad())?;
-                    let quic = quic.trim().parse().map_err(|_| bad())?;
+                    let quic = mantle_node::process::Endpoint::parse(quic.trim())
+                        .ok_or_else(bad)?
+                        .to_string();
                     nodes.push((id, quic));
                 }
                 _ => return Err(bad()),
@@ -1041,6 +1073,57 @@ pub(crate) fn gateway(cell: &Path) -> Result<(u64, Vec<u8>, KeyPair), Error> {
     .map_err(cert)?;
     mantle_cert::issued_by(&certificate, &authority.certificate, now).map_err(cert)?;
     Ok((id, certificate, own))
+}
+
+/// The directory of founder `id` of the cell `mantle init` made in `cell`, which holds `founders`
+/// founders: the cell's own directory for a cell of one, else `node-ID` in it.
+pub(crate) fn founder_dir(cell: &Path, id: u64, founders: usize) -> PathBuf {
+    if founders == 1 {
+        cell.to_path_buf()
+    } else {
+        cell.join(format!("node-{id}"))
+    }
+}
+
+/// A gateway's identity made in `out`, an empty or missing directory, for the cell `mantle init`
+/// made in `cell`, and pinned in each founder's configuration there (`peer = ID gateway
+/// CERTIFICATE`, node.md §3.6), its certificate beside the founder's peers', so a founder carried
+/// whole to its host (`mantle pack`) carries the pin: what a reader of the cell's metadata, as the
+/// transfer harness is, connects as. Made before any founder starts, since a founder reads its
+/// peers once, at its start.
+pub fn pin_gateway(said: &mut impl Write, out: &Path, cell: &Path) -> Result<u64, Error> {
+    match std::fs::read_dir(out) {
+        Ok(mut entries) => {
+            if entries.next().is_some() {
+                return Err(Error::Exists(out.to_path_buf()));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Error::Output(e)),
+    }
+    let founders = Authority::read(cell)?.nodes;
+    let (id, certificate, own) = gateway(cell)?;
+    let identity = out.join("identity");
+    files::create_dir(&identity)?;
+    files::write(&identity.join("gateway.der"), &certificate)?;
+    files::write_secret(&identity.join("gateway.key"), own.pkcs8())?;
+    files::write(&out.join("config"), format!("id = {id}\n").as_bytes())?;
+    let pinned = format!("identity/peers/gateway-{id}.der");
+    for (founder, _) in &founders {
+        let dir = founder_dir(cell, *founder, founders.len());
+        files::write(&dir.join(&pinned), &certificate)?;
+        let config = dir.join("config");
+        let mut text = std::fs::read_to_string(&config)?;
+        text.push_str(&format!("peer = {id} gateway {pinned}\n"));
+        files::write(&config, text.as_bytes())?;
+    }
+    writeln!(
+        said,
+        "gateway {id} {}: pinned by {} founders",
+        out.display(),
+        founders.len()
+    )?;
+    Ok(id)
 }
 
 /// A cell of one's host and devices measured now: the machine's calibration record in its
@@ -1121,6 +1204,7 @@ mod tests {
                     (PathBuf::from("C:\\d2"), 1 << 30)
                 ],
                 memory: Some(16 << 30),
+                reach: None,
             }
         );
         let bare = parse_node("quic=127.0.0.1:0,plane=127.0.0.1:0").unwrap();
@@ -1165,6 +1249,91 @@ mod tests {
             "d".repeat(MAX_DOMAIN + 1)
         );
         assert!(parse_node(&long).is_err());
+    }
+
+    /// A founder bound at every address is dialed at its reach, on its own ports: a Service's name
+    /// in front of a pod (research/78). Without one, an address that can be dialed is its own, and
+    /// one that cannot is none, its peers told on standard input as it binds.
+    #[test]
+    fn a_founder_is_dialed_at_its_reach_on_its_own_ports() {
+        let pod = parse_node(
+            "quic=0.0.0.0:7000,plane=0.0.0.0:7001,reach=mantle-0.cell.svc.cluster.local,\
+             s3=0.0.0.0:7480,name=s3.cell.svc.cluster.local",
+        )
+        .unwrap();
+        assert_eq!(
+            pod.reach.as_deref(),
+            Some("mantle-0.cell.svc.cluster.local")
+        );
+        assert_eq!(
+            pod.dialed(pod.quic).as_deref(),
+            Some("mantle-0.cell.svc.cluster.local:7000")
+        );
+        assert_eq!(
+            pod.dialed(pod.plane).as_deref(),
+            Some("mantle-0.cell.svc.cluster.local:7001")
+        );
+        let v6 =
+            parse_node("quic=[::]:7000,plane=[::]:7001,reach=fd00::7,name=s3.example").unwrap();
+        assert_eq!(v6.dialed(v6.quic).as_deref(), Some("[fd00::7]:7000"));
+        let own = parse_node("quic=10.0.0.1:7000,plane=10.0.0.1:7001").unwrap();
+        assert_eq!(own.dialed(own.quic).as_deref(), Some("10.0.0.1:7000"));
+        let binding = parse_node("quic=127.0.0.1:0,plane=127.0.0.1:0").unwrap();
+        assert_eq!(binding.dialed(binding.quic), None);
+        for refused in [
+            "quic=0.0.0.0:7000,plane=0.0.0.0:7001,reach=-bad,name=s3.example",
+            "quic=0.0.0.0:7000,plane=0.0.0.0:7001,reach=a.example,reach=b.example,name=s3.example",
+            "quic=127.0.0.1:0,plane=127.0.0.1:7001,reach=a.example",
+        ] {
+            assert!(
+                matches!(parse_node(refused), Err(Error::Founder(..))),
+                "{refused}"
+            );
+        }
+        // Each founder's peers name it at its reach, and its clients do through the cell file.
+        let root = tempfile::tempdir().unwrap();
+        let out = root.path().join("cell");
+        let founders = (0..3)
+            .map(|n| Founder {
+                quic: address("0.0.0.0:7000"),
+                plane: address("0.0.0.0:7001"),
+                s3: Some(address("0.0.0.0:7480")),
+                names: vec![format!("s3-{n}.cell.svc.cluster.local")],
+                domain: None,
+                volumes: Vec::new(),
+                memory: None,
+                reach: Some(format!("mantle-{n}.cell.svc.cluster.local")),
+            })
+            .collect();
+        let cell = Cell {
+            founders,
+            ..Cell::default()
+        };
+        init(&mut Vec::new(), &out, &cell).unwrap();
+        let authority = Authority::read(&out).unwrap();
+        let reached: Vec<&str> = authority.nodes.iter().map(|(_, at)| at.as_str()).collect();
+        assert_eq!(
+            reached,
+            (0..3)
+                .map(|n| format!("mantle-{n}.cell.svc.cluster.local:7000"))
+                .collect::<Vec<_>>()
+        );
+        for (id, _) in &authority.nodes {
+            let config =
+                std::fs::read_to_string(out.join(format!("node-{id}")).join("config")).unwrap();
+            let peers: Vec<&str> = config
+                .lines()
+                .filter(|l| l.starts_with("peer = "))
+                .collect();
+            assert_eq!(peers.len(), 2, "{config}");
+            for line in peers {
+                assert!(
+                    line.contains(".cell.svc.cluster.local:7000 mantle-")
+                        && line.ends_with(".cell.svc.cluster.local:7001"),
+                    "{line}"
+                );
+            }
+        }
     }
 
     /// A machines file states the cell's own keys, then a block a founder; a volume's directory may
@@ -1224,6 +1393,7 @@ mod tests {
                 domain: None,
                 volumes: Vec::new(),
                 memory: if n == 1 { Some(8 << 30) } else { None },
+                reach: None,
             })
             .collect();
         let cell = Cell {

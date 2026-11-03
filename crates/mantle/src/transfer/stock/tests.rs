@@ -1,5 +1,4 @@
 use super::*;
-use std::net::Ipv4Addr;
 
 /// Own the fixture even when an assertion unwinds; it never survives its test.
 struct Server(Child);
@@ -41,7 +40,8 @@ fn a_silently_skipped_cli_upload_is_not_acknowledged() {
         "[mantle]\naws_access_key_id = test\naws_secret_access_key = test\n",
     )
     .unwrap();
-    let mut cli = Cli::new(dir, dir, ((Ipv4Addr::LOCALHOST, port).into(), "us-east-1")).unwrap();
+    let endpoint = format!("127.0.0.1:{port}");
+    let mut cli = Cli::new(dir, dir, (&endpoint, "us-east-1")).unwrap();
     let generator = super::super::generate::Generator::new(5).unwrap();
     let object = generator.object("l0").unwrap();
     let result = cli.put(("transfer", "l0"), &object, 9 << 20);

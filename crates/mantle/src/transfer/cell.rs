@@ -130,6 +130,53 @@ struct Node {
     leaders: BTreeMap<u128, u64>,
 }
 
+/// Where the harness's clients of a cell on loopback bind.
+const LOOPBACK: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
+
+/// What a case's phases reach a cell by: the cell this runner makes and runs ([`Cell`]) or one
+/// running elsewhere (`super::outside::Outside`).
+pub trait Reach {
+    /// The directory `mantle init` made the cell in.
+    fn out(&self) -> &Path;
+    /// The gateway every founder pins.
+    fn gateway(&self) -> &Gateway;
+    /// Each node's id and where its QUIC listener listens.
+    fn quic(&self) -> Vec<(u64, SocketAddr)>;
+    /// Each node's S3 listener, `HOST:PORT`, and the region its endpoint signs for.
+    fn s3(&self) -> Vec<(String, String)>;
+    /// Where the harness's clients bind: an address of the family its nodes are dialed at.
+    fn bind(&self) -> SocketAddr;
+}
+
+impl Reach for Cell {
+    fn out(&self) -> &Path {
+        &self.out
+    }
+
+    fn gateway(&self) -> &Gateway {
+        &self.gateway
+    }
+
+    fn quic(&self) -> Vec<(u64, SocketAddr)> {
+        self.nodes
+            .iter()
+            .filter_map(|n| n.quic.map(|q| (n.id, q)))
+            .collect()
+    }
+
+    fn s3(&self) -> Vec<(String, String)> {
+        self.nodes
+            .iter()
+            .filter_map(|n| Some((n.s3?.to_string(), n.region.clone()?)))
+            .collect()
+    }
+
+    fn bind(&self) -> SocketAddr {
+        LOOPBACK
+    }
+}
+
 /// A running cell of three, its processes this runner's children.
 pub struct Cell {
     exe: PathBuf,
@@ -208,8 +255,9 @@ impl Cell {
             )));
         }
         // Pinned before any founder starts: a founder reads its peers once, at its start.
-        let founders: Vec<(u64, PathBuf)> = nodes.iter().map(|n| (n.id, n.dir.clone())).collect();
-        let gateway = Gateway::pin(&out, &founders)
+        crate::init::pin_gateway(&mut Vec::new(), &out.join(super::place::GATEWAY), &out)
+            .map_err(|e| CellError::Init(format!("the gateway: {e}")))?;
+        let gateway = Gateway::open(&out, LOOPBACK)
             .map_err(|e| CellError::Init(format!("the gateway: {e}")))?;
         let (tell, heard) = channel();
         let mut cell = Self {
@@ -233,32 +281,6 @@ impl Cell {
             cell.until(at, |node| node.enlisted)?;
         }
         Ok(cell)
-    }
-
-    /// The directory init made the cell in.
-    pub fn out(&self) -> &Path {
-        &self.out
-    }
-
-    /// The gateway every founder pins.
-    pub fn gateway(&self) -> &Gateway {
-        &self.gateway
-    }
-
-    /// Each node's id and where its QUIC listener listens.
-    pub fn quic(&self) -> Vec<(u64, SocketAddr)> {
-        self.nodes
-            .iter()
-            .filter_map(|n| n.quic.map(|q| (n.id, q)))
-            .collect()
-    }
-
-    /// Each node's S3 listener and the region its endpoint signs for, once bound.
-    pub fn s3(&self) -> Vec<(SocketAddr, String)> {
-        self.nodes
-            .iter()
-            .filter_map(|n| Some((n.s3?, n.region.clone()?)))
-            .collect()
     }
 
     /// Starts node `at`'s process again on its directory, tells every running node where the

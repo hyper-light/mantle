@@ -1,0 +1,4 @@
+# The harness image's build context: the two files it copies, nothing else.
+*
+!crates/mantle/tests/support/boto3-requirements.txt
+!deploy/kind/disrupt.sh

@@ -7,11 +7,11 @@
 //!
 //! The harness reads as a gateway its founders pin (`peer = ID gateway CERTIFICATE`, node.md
 //! §3.6), its certificate issued under the cell's authority once `mantle init` made the cell and
-//! before any founder starts (`crate::init::gateway`).
+//! before any founder starts (`mantle init gateway`, `crate::init::pin_gateway`).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use mantle_client::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer};
 use mantle_meta::record::Target;
@@ -104,8 +104,12 @@ pub fn distinct(volumes: &[u128], node_of: &BTreeMap<u128, u64>) -> bool {
     nodes.len() == volumes.len()
 }
 
+/// The directory of the gateway `mantle init gateway` pins, in the cell's own directory.
+pub const GATEWAY: &str = "gateway";
+
 /// The gateway the harness reads the cell's metadata as: its identity, pinned in every founder's
-/// configuration, the cell authority's certificate and each founder's, and the groups.
+/// configuration, the cell authority's certificate and each founder's, the groups, and the address
+/// its reader binds.
 pub struct Gateway {
     id: u64,
     certificate: Vec<u8>,
@@ -113,44 +117,49 @@ pub struct Gateway {
     authority: Vec<u8>,
     founders: Vec<(u64, Vec<u8>)>,
     pub groups: Groups,
+    bind: SocketAddr,
 }
 
 impl Gateway {
-    /// The gateway of the cell init made in `cell`, its founders in `founders` (each's id and
-    /// directory), pinned now in each founder's configuration, which no founder has started on.
-    pub fn pin(cell: &Path, founders: &[(u64, PathBuf)]) -> Result<Self, TransferError> {
-        let (id, certificate, key) = crate::init::gateway(cell).map_err(TransferError::Init)?;
-        let pinned = cell.join(format!("gateway-{id}.der"));
-        crate::files::write(&pinned, &certificate)
-            .map_err(|e| TransferError::Io(std::io::Error::other(e.to_string())))?;
-        let mut known = Vec::with_capacity(founders.len());
+    /// The gateway `mantle init gateway` pinned in each founder of the cell init made in `cell`,
+    /// its identity in the cell's [`GATEWAY`], its reader bound at `bind`.
+    pub fn open(cell: &Path, bind: SocketAddr) -> Result<Self, TransferError> {
+        let dir = cell.join(GATEWAY);
+        let config = std::fs::read_to_string(dir.join("config"))?;
+        let id = config
+            .lines()
+            .find_map(|line| line.strip_prefix("id = "))
+            .and_then(|id| id.trim().parse().ok())
+            .ok_or_else(|| unread("the gateway's id"))?;
+        let identity = dir.join("identity");
+        let certificate = std::fs::read(identity.join("gateway.der"))?;
+        let key = mantle_node::secret::read(&identity.join("gateway.key"))
+            .map_err(|e| unread(&e.to_string()))?;
+        let nodes = crate::init::Authority::read(cell)
+            .map_err(TransferError::Init)?
+            .nodes;
+        let mut founders = Vec::with_capacity(nodes.len());
         let mut groups = None;
-        for (founder, dir) in founders {
-            let config = dir.join("config");
-            let mut text = std::fs::read_to_string(&config)?;
-            text.push_str(&format!("peer = {id} gateway {}\n", pinned.display()));
-            std::fs::write(&config, text)?;
-            known.push((
+        let mut authority = None;
+        for (founder, _) in &nodes {
+            let at = crate::init::founder_dir(cell, *founder, nodes.len());
+            founders.push((
                 *founder,
-                std::fs::read(dir.join("identity").join("node.der"))?,
+                std::fs::read(at.join("identity").join("node.der"))?,
             ));
             if groups.is_none() {
-                groups = Some(Groups::read(&config)?);
+                groups = Some(Groups::read(&at.join("config"))?);
+                authority = Some(std::fs::read(at.join("identity").join("authority.der"))?);
             }
         }
-        let authority = std::fs::read(
-            founders
-                .first()
-                .map(|(_, dir)| dir.join("identity").join("authority.der"))
-                .ok_or_else(|| unread("no founder"))?,
-        )?;
         Ok(Self {
             id,
             certificate,
-            key: key.pkcs8().to_vec(),
-            authority,
-            founders: known,
+            key,
+            authority: authority.ok_or_else(|| unread("no founder"))?,
+            founders,
             groups: groups.ok_or_else(|| unread("no founder's ranges"))?,
+            bind,
         })
     }
 
@@ -200,7 +209,7 @@ impl Gateway {
         let transport_bytes = least.max(pieces);
         Ok(ClientSettings {
             id: self.id,
-            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            bind: self.bind,
             credentials: Credentials {
                 chain: vec![CertificateDer::from(self.certificate.clone())],
                 key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.key.clone())),

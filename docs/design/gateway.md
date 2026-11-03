@@ -664,7 +664,9 @@ under the cell's authority (node.md §3.6), and neither compresses its certifica
 node's compressed.
 
 The CLI is `mantle`'s object commands, run as the client of a directory `mantle init client` made
-(`--client DIR` or `MANTLE_CLIENT`; `crates/mantle/src/client.rs`): `mb` and `rb`, `ls` of the
+(`--client DIR` or `MANTLE_CLIENT`; `crates/mantle/src/client.rs`), whose `node` lines name each
+founder's QUIC endpoint by its address or by a name resolved at the command's start (a founder's
+reach, node.md §1.5): `mb` and `rb`, `ls` of the
 buckets or of a bucket's keys a level of `/` at a time, `cp` from a file or standard input to
 `s3://BUCKET/KEY` and back to a file or standard output, `rm`, `head`, and `multipart` `create`,
 `put` (a part from a file, or standard input with its length), `complete`, `abort`, `parts` and

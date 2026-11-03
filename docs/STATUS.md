@@ -901,6 +901,20 @@ before it lands. On macOS x86_64, which no CI target supports, tests/node.rs's r
 fenced once on a snapshot its engine refused (`the engine refused a snapshot`), the engine's error
 not kept by the fence (`crates/range/src/stored.rs`).
 
+**A cell on Kubernetes** ([design](design/kubernetes.md), [research/78](research/78-a-cell-in-kubernetes.md)).
+Built 2026-11-03 for the data layer's plan step 11: the image (`Dockerfile`, `mantle` alone on
+distroless, non-root); the chart (`deploy/helm/mantle`: a StatefulSet of three founders started
+`Parallel`, one to a Kubernetes node by required anti-affinity, two claims each, requests equal to
+limits, the grace held above the node's stop, readiness from `mantle status`, a Service for each
+founder publishing not-ready addresses, a headless one and the cell's S3 Service); founders reached
+at their Services' names (`mantle init --node reach=HOST`, resolved once by peers and clients); a
+gateway pinned before the founders start (`mantle init gateway`); each founder's directory one
+Secret's value (`mantle pack`), installed owner-only by an init container (`mantle install`); and
+the transfer harness on a cell running elsewhere (`mantle bench transfer --cell`, `--disrupt`),
+every acknowledged object read back through each node after a founder's pod is deleted mid-transfer.
+Its proof is the CI job `kind-cell` (`scripts/check-chart.sh`, `scripts/kind-cell.sh`): a kind
+cluster of three workers running the harness's CI scale from a Job; not yet run.
+
 ## Goal stack checked, 2026-11-01
 
 Kiln's Mantle stack has 96 records: 73 met, 20 pending, one active (Scale), two skipped. Parent

@@ -13,11 +13,11 @@ use std::time::Instant;
 
 use mantle_protocol::object::Status;
 
-use super::cell::Cell;
+use super::cell::Reach;
 use super::generate::{GenError, Generator};
 use super::native::{self, Came};
 use super::stock::{Boto, Cli};
-use super::{BUCKET, Natives, Oracle, Tally, TransferError, elapsed};
+use super::{Natives, Oracle, Tally, TransferError, elapsed};
 
 /// The four ways a large object goes in, two through each door, taken in turn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,9 +93,9 @@ pub(super) fn key(i: u64) -> String {
 /// at most as many as its founders' volumes of `volume_bytes` hold of one, each node holding a copy
 /// of every block (f34), and one past that through each door.
 pub(super) fn large(
-    cell: &Cell,
+    cell: &impl Reach,
     natives: &mut Natives,
-    dir: &Path,
+    (dir, bucket): (&Path, &str),
     (seed, length, count, ways): (u64, u64, Option<u64>, &[Way]),
     volume_bytes: u64,
 ) -> Result<(Large, Oracle, u64), TransferError> {
@@ -112,9 +112,9 @@ pub(super) fn large(
         .cloned()
         .ok_or_else(|| TransferError::Io(std::io::Error::other("no third listener")))?;
     let mut boto =
-        Boto::start(dir, cell.out(), (third.0, &third.1), BUCKET).map_err(TransferError::Stock)?;
-    let mut cli = Cli::new(dir, cell.out(), (third.0, &third.1)).map_err(TransferError::Stock)?;
-    natives.create(BUCKET)?;
+        Boto::start(dir, cell.out(), (&third.0, &third.1), bucket).map_err(TransferError::Stock)?;
+    let mut cli = Cli::new(dir, cell.out(), (&third.0, &third.1)).map_err(TransferError::Stock)?;
+    natives.create(bucket)?;
 
     let generator = Generator::new(seed)?;
     let mut tallies = [Tally::new(), Tally::new(), Tally::new(), Tally::new()];
@@ -146,11 +146,12 @@ pub(super) fn large(
             match way {
                 Way::Runs | Way::Parts => {
                     let settings = natives.settings(0)?;
+                    let bucket = bucket.to_owned();
                     natives.block(async move {
                         let generator = Generator::new(seed)?;
                         let object = generator.object(&key(i))?;
                         let mut client = mantle_client::Client::open(settings).await?;
-                        let at = (BUCKET, key(i));
+                        let at = (bucket.as_str(), key(i));
                         Ok(if way == Way::Runs {
                             native::put(&mut client, (at.0, &at.1), &object, length).await?
                         } else {
@@ -159,7 +160,7 @@ pub(super) fn large(
                     })?
                 }
                 Way::Cli => (
-                    cli.put((BUCKET, &name), &object, length)
+                    cli.put((bucket, &name), &object, length)
                         .map_err(TransferError::Stock)?,
                     0,
                 ),
@@ -192,11 +193,12 @@ pub(super) fn large(
         let (_, at) = Way::of(i, ways);
         let settings = natives.settings(1)?;
         let began = Instant::now();
+        let read = bucket.to_owned();
         let (came, again) = natives.block(async move {
             let generator = Generator::new(seed)?;
             let object = generator.object(&key(i))?;
             let mut client = mantle_client::Client::open(settings).await?;
-            Ok(native::get(&mut client, (BUCKET, &key(i)), &object, length).await?)
+            Ok(native::get(&mut client, (&read, &key(i)), &object, length).await?)
         })?;
         if let Some(tally) = tallies.get_mut(at) {
             tally.asked_again(again);
@@ -205,7 +207,7 @@ pub(super) fn large(
         let object = generator.object(&key(i))?;
         let began = Instant::now();
         let came = cli
-            .get((BUCKET, &key(i)), &object, length)
+            .get((bucket, &key(i)), &object, length)
             .map_err(TransferError::Stock)?;
         if let Some(tally) = tallies.get_mut(at) {
             tally.http_came(came, elapsed(began));
@@ -223,15 +225,16 @@ pub(super) fn large(
     let mut unlisted = true;
     for &i in &gone {
         let settings = natives.settings(1)?;
+        let read = bucket.to_owned();
         let (came, _) = natives.block(async move {
             let generator = Generator::new(seed)?;
             let object = generator.object(&key(i))?;
             let mut client = mantle_client::Client::open(settings).await?;
-            Ok(native::get(&mut client, (BUCKET, &key(i)), &object, length).await?)
+            Ok(native::get(&mut client, (&read, &key(i)), &object, length).await?)
         })?;
         let object = generator.object(&key(i))?;
         let over_http = cli
-            .get((BUCKET, &key(i)), &object, length)
+            .get((bucket, &key(i)), &object, length)
             .map_err(TransferError::Stock)?;
         let absent = Came::Refused(Status::NoSuchKey);
         unlisted &= came == absent && over_http == absent;
@@ -241,15 +244,16 @@ pub(super) fn large(
         .checked_div(u64::try_from(mantle_s3::list::MAX_KEYS).unwrap_or(u64::MAX))
         .and_then(|p| p.checked_add(1))
         .ok_or(GenError::Offset)?;
+    let listed = bucket.to_owned();
     let natively: BTreeSet<String> = natives
         .block(async move {
             let mut client = mantle_client::Client::open(settings).await?;
-            Ok(native::list(&mut client, BUCKET, pages).await?)
+            Ok(native::list(&mut client, &listed, pages).await?)
         })?
         .into_iter()
         .collect();
     let over_http: BTreeSet<String> = cli
-        .list(BUCKET)
+        .list(bucket)
         .map_err(TransferError::Stock)?
         .into_iter()
         .collect();
@@ -273,7 +277,7 @@ impl Large {
     /// refused one as out of space with nothing of it readable or listed; with a count, none
     /// refused.
     pub fn exact(&self, filling: bool) -> bool {
-        let tallies = self.tallies.iter().all(Tally::exact);
+        let tallies = self.tallies.iter().all(|tally| tally.exact(false));
         let full = self
             .full
             .iter()

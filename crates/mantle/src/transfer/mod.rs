@@ -11,6 +11,7 @@ pub mod cell;
 pub mod generate;
 pub mod large;
 pub mod native;
+pub mod outside;
 pub mod place;
 pub mod stock;
 
@@ -26,10 +27,11 @@ use mantle_disk::histogram::Histogram;
 use mantle_protocol::classes::Bounds;
 use mantle_protocol::object::{Op, Status};
 
-use cell::Cell;
+use cell::{Cell, Reach};
 use generate::{GenError, Generator, Object};
 use large::Way;
 use native::Came;
+use outside::Outside;
 
 /// S3's line for a small object: objects under 128 KiB are not monitored by S3 Intelligent-Tiering
 /// and are billed as 128 KiB in the infrequent-access classes (research/76).
@@ -42,8 +44,12 @@ const SEGMENT: u64 = mantle_s3::seal::SEGMENT as u64;
 /// segment and a byte either side of it.
 const BOUNDARIES: [u64; 5] = [0, 1, SEGMENT - 1, SEGMENT, SEGMENT + 1];
 
-/// The bucket a case's objects go to.
-const BUCKET: &str = "transfer";
+/// The bucket the objects of the case in the directory named `case` go to, under the run's `seed`:
+/// a bucket a case, so the cases of a run on one cell running elsewhere keep their objects and
+/// listings apart.
+fn bucket(seed: u64, case: &str) -> String {
+    format!("transfer-{seed}-{case}")
+}
 
 /// What a run is asked to do.
 pub struct Options {
@@ -62,6 +68,13 @@ pub struct Options {
     pub ways: Vec<Way>,
     /// Each founder's volume.
     pub volume: Volume,
+    /// A cell running elsewhere, the directory `mantle init` made it in, the harness's gateway
+    /// pinned in its founders (`mantle init gateway`); none makes a fresh cell of three each case.
+    pub cell: Option<PathBuf>,
+    /// The words of a command run, on a cell running elsewhere, halfway through the first small
+    /// set's native puts, whose success is waited for before that set's other puts and its reads;
+    /// none disrupts nothing.
+    pub disrupt: Vec<String>,
 }
 
 /// Each founder's volume: stated bytes, or the run's file system's free space at each case's start
@@ -242,9 +255,22 @@ impl Tally {
         self.read(came);
     }
 
-    /// Every object put was read back through both doors, every byte the generator's.
-    pub fn exact(&self) -> bool {
-        self.refused == 0 && self.wrong == 0 && self.missing == 0
+    /// Every object put was read back through both doors, every byte the generator's, and every
+    /// put acknowledged; but on a cell `short` a node for a while, a disruption's, those it refused
+    /// `SlowDown`, as a cell refuses a block it cannot place on distinct nodes (gateway
+    /// `PutError::Unplaced`): such a put is acknowledged and read by nothing.
+    pub fn exact(&self, short: bool) -> bool {
+        let slowed = self
+            .refusals
+            .iter()
+            .find(|(status, _)| *status == Status::SlowDown)
+            .map_or(0, |(_, count)| *count);
+        let refused = if short {
+            self.refused.saturating_sub(slowed)
+        } else {
+            self.refused
+        };
+        refused == 0 && self.wrong == 0 && self.missing == 0
     }
 
     fn read(&mut self, came: Came) {
@@ -274,13 +300,14 @@ pub fn status_of_code(code: &str) -> Status {
 struct Natives {
     dir: PathBuf,
     nodes: Vec<(u64, SocketAddr)>,
+    bind: SocketAddr,
     rt: LocalRuntime,
 }
 
 impl Natives {
     /// The case's native door, its runtime's interests the sockets of a client of the cell or of
     /// its gateway's reader, whichever holds more: one of them runs at a time.
-    fn new(cell: &Cell, dir: &Path, messages: Bounds) -> Result<Self, TransferError> {
+    fn new(cell: &impl Reach, dir: &Path, messages: Bounds) -> Result<Self, TransferError> {
         let client = dir.join("client");
         crate::init::client(&mut Vec::new(), &client, cell.out()).map_err(TransferError::Init)?;
         let nodes = cell.quic();
@@ -289,6 +316,7 @@ impl Natives {
         Ok(Self {
             dir: client,
             nodes,
+            bind: cell.bind(),
             rt,
         })
     }
@@ -302,7 +330,7 @@ impl Natives {
         nodes.rotate_left(first);
         Ok(Settings {
             id: configured.id,
-            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            bind: self.bind,
             credentials: configured.credentials,
             transport_bytes: mantle_client::least_transport(nodes.len())?,
             nodes,
@@ -310,20 +338,22 @@ impl Natives {
     }
 
     /// Learns where the cell's nodes listen now: a node started again chose new ports.
-    fn renew(&mut self, cell: &Cell) {
+    fn renew(&mut self, cell: &impl Reach) {
         self.nodes = cell.quic();
     }
 
     /// Reads every object of a case acknowledged in `oracle`, `count` of them named by `objects`
-    /// and made from `seed`, natively through node `first` first: how many were read, wrong,
-    /// missing and asked again.
+    /// and made from `seed`, from `bucket`, natively through node `first` first: how many were
+    /// read, wrong, missing and asked again.
     fn read_all(
         &mut self,
         first: usize,
         (objects, oracle, count, seed): (Objects, &Oracle, u64, u64),
+        bucket: &str,
     ) -> Result<(u64, u64, u64, u64), TransferError> {
         let settings = self.settings(first)?;
         let acknowledged = oracle.clone();
+        let bucket = bucket.to_owned();
         self.block(async move {
             let generator = Generator::new(seed)?;
             let sizes = generator.object("sizes")?;
@@ -333,7 +363,7 @@ impl Natives {
                 let (key, length) = objects.of(i, &sizes)?;
                 let object = generator.object(&key)?;
                 let (came, again) =
-                    native::get(&mut client, (BUCKET, &key), &object, length).await?;
+                    native::get(&mut client, (&bucket, &key), &object, length).await?;
                 match came {
                     Came::Done => {}
                     Came::Wrong(_) => wrong = wrong.saturating_add(1),
@@ -355,14 +385,15 @@ impl Natives {
     }
 
     /// Makes the case's bucket through the first node.
-    fn create(&mut self, bucket: &'static str) -> Result<(), TransferError> {
+    fn create(&mut self, bucket: &str) -> Result<(), TransferError> {
         let settings = self.settings(0)?;
+        let bucket = bucket.to_owned();
         self.block(async move {
             let mut client = Client::open(settings).await?;
             let made = client
                 .call(
                     &Op::Create {
-                        bucket: bucket.into(),
+                        bucket: bucket.as_str().into(),
                         id: mantle_client::identity()?,
                     },
                     u64::MAX,
@@ -455,38 +486,67 @@ pub fn transfer(out: &mut impl Write, options: &Options) -> Result<bool, Transfe
         )?;
     }
     std::fs::create_dir_all(&options.dir)?;
+    let outside = options.cell.as_deref().map(Outside::open).transpose()?;
+    if !options.disrupt.is_empty() && (outside.is_none() || options.small.is_empty()) {
+        return Err(TransferError::Io(std::io::Error::other(
+            "a disruption runs halfway through the first small set's native puts, on a cell \
+             running elsewhere: --cell and --small",
+        )));
+    }
+    // The disruption runs once, in the run's first case.
+    let mut disrupt = options.disrupt.as_slice();
     let mut exact = true;
     for &count in &options.small {
         // A case's directory is its own: one an earlier run left is refused, not reused.
-        let dir = options.dir.join(format!("small-{count}"));
+        let name = format!("small-{count}");
+        let dir = options.dir.join(&name);
         std::fs::create_dir(&dir)?;
         let case = format!("small {count}");
-        let (volume_bytes, why) = options.volume.bytes(&dir)?;
-        writeln!(out, "  {case} volumes: {volume_bytes} bytes each ({why})")?;
-        let mut cell = Cell::make(&dir, volume_bytes)?;
-        let mut natives = Natives::new(&cell, &dir, messages)?;
-        let (tallies, oracle) = small(&cell, &mut natives, &dir, options.seed, count)?;
-        exact &= placed(
-            out,
-            (&cell, &mut natives, messages),
-            &case,
-            (Objects::Small, &oracle, count, options.seed),
-        )?;
-        exact &= accounted(out, &mut cell, &case, volume_bytes)?;
-        exact &= killed(
-            out,
-            (&mut cell, &mut natives),
-            &case,
-            (Objects::Small, &oracle, count, options.seed),
-        )?;
-        exact &= controls(
-            out,
-            (&cell, &mut natives, messages),
-            &case,
-            (Objects::Small, &oracle, count, options.seed),
-        )?;
-        drop(natives);
-        drop(cell);
+        let bucket = bucket(options.seed, &name);
+        let (tallies, short) = match &outside {
+            None => {
+                let (volume_bytes, why) = options.volume.bytes(&dir)?;
+                writeln!(out, "  {case} volumes: {volume_bytes} bytes each ({why})")?;
+                let mut cell = Cell::make(&dir, volume_bytes)?;
+                let mut natives = Natives::new(&cell, &dir, messages)?;
+                let (tallies, oracle) = small(
+                    &cell,
+                    &mut natives,
+                    (&dir, &bucket),
+                    (options.seed, count),
+                    &[],
+                )?;
+                let set = (Objects::Small, &oracle, count, options.seed);
+                exact &= placed(out, (&cell, &mut natives, messages), &case, set, &bucket)?;
+                exact &= accounted(out, &mut cell, &case, volume_bytes)?;
+                exact &= killed(out, (&mut cell, &mut natives), &case, set, &bucket)?;
+                exact &= controls(out, (&cell, &mut natives, messages), &case, set, &bucket)?;
+                (tallies, false)
+            }
+            Some(cell) => {
+                writeln!(
+                    out,
+                    "  {case} volumes: {} bytes each (the cell's own)",
+                    cell.volume_bytes()
+                )?;
+                let mut natives = Natives::new(cell, &dir, messages)?;
+                let (tallies, oracle) = small(
+                    cell,
+                    &mut natives,
+                    (&dir, &bucket),
+                    (options.seed, count),
+                    disrupt,
+                )?;
+                let short = !disrupt.is_empty();
+                disrupt = &[];
+                let set = (Objects::Small, &oracle, count, options.seed);
+                exact &= placed(out, (cell, &mut natives, messages), &case, set, &bucket)?;
+                uncounted(out, &case)?;
+                exact &= through_each(out, &mut natives, (&case, short), set, &bucket)?;
+                exact &= controls(out, (cell, &mut natives, messages), &case, set, &bucket)?;
+                (tallies, short)
+            }
+        };
         for (door, tally) in ["native", "http"].iter().zip(&tallies) {
             writeln!(
                 out,
@@ -517,7 +577,7 @@ pub fn transfer(out: &mut impl Write, options: &Options) -> Result<bool, Transfe
                     said.join(", ")
                 )?;
             }
-            exact &= tally.exact();
+            exact &= tally.exact(short);
         }
     }
     if !options.large.is_empty() {
@@ -538,46 +598,58 @@ pub fn transfer(out: &mut impl Write, options: &Options) -> Result<bool, Transfe
         )?;
     }
     for &length in &options.large {
-        let dir = options.dir.join(format!("large-{length}"));
+        let name = format!("large-{length}");
+        let dir = options.dir.join(&name);
         std::fs::create_dir(&dir)?;
         let case = format!("large {length}");
-        let (volume_bytes, why) = options.volume.bytes(&dir)?;
-        writeln!(out, "  {case} volumes: {volume_bytes} bytes each ({why})")?;
-        let mut cell = Cell::make(&dir, volume_bytes)?;
-        let mut natives = Natives::new(&cell, &dir, messages)?;
+        let bucket = bucket(options.seed, &name);
         let ways: &[Way] = if options.ways.is_empty() {
             &large::WAYS
         } else {
             &options.ways
         };
-        let (done, oracle, budget) = large::large(
-            &cell,
-            &mut natives,
-            &dir,
-            (options.seed, length, options.count, ways),
-            volume_bytes,
-        )?;
-        exact &= placed(
-            out,
-            (&cell, &mut natives, messages),
-            &case,
-            (Objects::Large(length), &oracle, budget, options.seed),
-        )?;
-        exact &= accounted(out, &mut cell, &case, volume_bytes)?;
-        exact &= killed(
-            out,
-            (&mut cell, &mut natives),
-            &case,
-            (Objects::Large(length), &oracle, budget, options.seed),
-        )?;
-        exact &= controls(
-            out,
-            (&cell, &mut natives, messages),
-            &case,
-            (Objects::Large(length), &oracle, budget, options.seed),
-        )?;
-        drop(natives);
-        drop(cell);
+        let done = match &outside {
+            None => {
+                let (volume_bytes, why) = options.volume.bytes(&dir)?;
+                writeln!(out, "  {case} volumes: {volume_bytes} bytes each ({why})")?;
+                let mut cell = Cell::make(&dir, volume_bytes)?;
+                let mut natives = Natives::new(&cell, &dir, messages)?;
+                let (done, oracle, budget) = large::large(
+                    &cell,
+                    &mut natives,
+                    (&dir, &bucket),
+                    (options.seed, length, options.count, ways),
+                    volume_bytes,
+                )?;
+                let set = (Objects::Large(length), &oracle, budget, options.seed);
+                exact &= placed(out, (&cell, &mut natives, messages), &case, set, &bucket)?;
+                exact &= accounted(out, &mut cell, &case, volume_bytes)?;
+                exact &= killed(out, (&mut cell, &mut natives), &case, set, &bucket)?;
+                exact &= controls(out, (&cell, &mut natives, messages), &case, set, &bucket)?;
+                done
+            }
+            Some(cell) => {
+                writeln!(
+                    out,
+                    "  {case} volumes: {} bytes each (the cell's own)",
+                    cell.volume_bytes()
+                )?;
+                let mut natives = Natives::new(cell, &dir, messages)?;
+                let (done, oracle, budget) = large::large(
+                    cell,
+                    &mut natives,
+                    (&dir, &bucket),
+                    (options.seed, length, options.count, ways),
+                    cell.volume_bytes(),
+                )?;
+                let set = (Objects::Large(length), &oracle, budget, options.seed);
+                exact &= placed(out, (cell, &mut natives, messages), &case, set, &bucket)?;
+                uncounted(out, &case)?;
+                exact &= through_each(out, &mut natives, (&case, false), set, &bucket)?;
+                exact &= controls(out, (cell, &mut natives, messages), &case, set, &bucket)?;
+                done
+            }
+        };
         for (way, tally) in large::WAYS
             .iter()
             .zip(&done.tallies)
@@ -650,19 +722,21 @@ impl Objects {
 }
 
 /// Where the blocks of case `case`'s objects acknowledged in `oracle`, `count` of them named by
-/// `objects` and made from `seed`, sit, read as the cell's gateway on the case's runtime, a line to
-/// `out`: whether every block's chunks are on distinct nodes.
+/// `objects` and made from `seed`, in `bucket`, sit, read as the cell's gateway on the case's
+/// runtime, a line to `out`: whether every block's chunks are on distinct nodes.
 fn placed(
     out: &mut impl Write,
-    (cell, natives, messages): (&Cell, &mut Natives, Bounds),
+    (cell, natives, messages): (&impl Reach, &mut Natives, Bounds),
     case: &str,
     (objects, oracle, count, seed): (Objects, &Oracle, u64, u64),
+    bucket: &str,
 ) -> Result<bool, TransferError> {
     let settings = cell.gateway().settings(messages)?;
     let bound = cell.quic();
     let groups = cell.gateway().groups;
     let page = mantle_node::read::extents_page(mantle_node::read::reply_room(messages.request));
     let acknowledged = oracle.clone();
+    let bucket = bucket.to_owned();
     let placement = natives.block(async move {
         let mut reader =
             place::Reader::open(settings, (bound, cell::FOUNDERS), (groups, page)).await?;
@@ -671,7 +745,7 @@ fn placed(
         let mut placement = place::Placement::default();
         for i in (0..count).filter(|i| acknowledged.has(*i)) {
             let (key, length) = objects.of(i, &sizes)?;
-            let (blocks, shared) = reader.object(BUCKET, (&key, length)).await?;
+            let (blocks, shared) = reader.object(&bucket, (&key, length)).await?;
             placement.objects = placement.objects.saturating_add(1);
             placement.blocks = placement.blocks.saturating_add(blocks);
             placement.shared = placement.shared.saturating_add(shared);
@@ -697,6 +771,7 @@ fn killed(
     (cell, natives): (&mut Cell, &mut Natives),
     case: &str,
     case_objects: (Objects, &Oracle, u64, u64),
+    bucket: &str,
 ) -> Result<bool, TransferError> {
     let (mut read, mut wrong, mut missing, mut again) = (0u64, 0u64, 0u64, 0u64);
     let mut count = |(r, w, m, a): (u64, u64, u64, u64)| {
@@ -713,10 +788,10 @@ fn killed(
             .checked_add(1)
             .and_then(|n| n.checked_rem(cell::FOUNDERS))
             .unwrap_or(0);
-        count(natives.read_all(other, case_objects)?);
+        count(natives.read_all(other, case_objects, bucket)?);
         cell.restart(at)?;
         natives.renew(cell);
-        count(natives.read_all(at, case_objects)?);
+        count(natives.read_all(at, case_objects, bucket)?);
     }
     writeln!(
         out,
@@ -724,6 +799,43 @@ fn killed(
          others and through it, {again} asked again, {wrong} wrong, {missing} missing",
     )?;
     Ok(wrong == 0 && missing == 0)
+}
+
+/// Every object case `case`'s `oracle` acknowledged read back natively through each node of a cell
+/// running elsewhere in turn, a line to `out`: the counterpart of [`killed`] where the harness
+/// kills no node, after the disruption its operator's command made where one ran (`short`).
+/// Whether every read was exact.
+fn through_each(
+    out: &mut impl Write,
+    natives: &mut Natives,
+    (case, short): (&str, bool),
+    case_objects: (Objects, &Oracle, u64, u64),
+    bucket: &str,
+) -> Result<bool, TransferError> {
+    let (mut read, mut wrong, mut missing, mut again) = (0u64, 0u64, 0u64, 0u64);
+    for at in 0..cell::FOUNDERS {
+        let (r, w, m, a) = natives.read_all(at, case_objects, bucket)?;
+        read = read.saturating_add(r);
+        wrong = wrong.saturating_add(w);
+        missing = missing.saturating_add(m);
+        again = again.saturating_add(a);
+    }
+    writeln!(
+        out,
+        "  {case} through each node{}: {read} reads, {again} asked again, {wrong} wrong, \
+         {missing} missing",
+        if short { " after the disruption" } else { "" },
+    )?;
+    Ok(wrong == 0 && missing == 0)
+}
+
+/// The line of a case on a cell running elsewhere, whose nodes' chunks the harness cannot ask.
+fn uncounted(out: &mut impl Write, case: &str) -> Result<(), TransferError> {
+    writeln!(
+        out,
+        "  {case} chunks held a node: not counted, the cell's nodes are not this run's children"
+    )?;
+    Ok(())
 }
 
 /// The key the missing-object control reads, which no case puts.
@@ -738,10 +850,12 @@ const NEVER_PUT: &str = "control-never-put";
 /// bytes or placement to judge: the key never put is read all the same.
 fn controls(
     out: &mut impl Write,
-    (cell, natives, messages): (&Cell, &mut Natives, Bounds),
+    (cell, natives, messages): (&impl Reach, &mut Natives, Bounds),
     case: &str,
     (objects, oracle, count, seed): (Objects, &Oracle, u64, u64),
+    bucket: &str,
 ) -> Result<bool, TransferError> {
+    let bucket = bucket.to_owned();
     let generator = Generator::new(seed)?;
     let sizes = generator.object("sizes")?;
     let mut first = None;
@@ -758,7 +872,7 @@ fn controls(
             let generator = Generator::new(seed)?;
             let never = generator.object(NEVER_PUT)?;
             let mut client = Client::open(settings).await?;
-            let (missing, _) = native::get(&mut client, (BUCKET, NEVER_PUT), &never, 0).await?;
+            let (missing, _) = native::get(&mut client, (&bucket, NEVER_PUT), &never, 0).await?;
             Ok(missing)
         })?;
         let found_missing = missing == Came::Refused(Status::NoSuchKey);
@@ -784,12 +898,12 @@ fn controls(
         let generator = Generator::new(seed)?;
         let object = generator.object(&read_key)?;
         let mut client = Client::open(settings).await?;
-        let flipped = native::get_flipped(&mut client, (BUCKET, &read_key), &object, flip).await?;
+        let flipped = native::get_flipped(&mut client, (&bucket, &read_key), &object, flip).await?;
         let never = generator.object(NEVER_PUT)?;
-        let (missing, _) = native::get(&mut client, (BUCKET, NEVER_PUT), &never, 0).await?;
+        let (missing, _) = native::get(&mut client, (&bucket, NEVER_PUT), &never, 0).await?;
         let mut reader =
             place::Reader::open(reader, (bound, cell::FOUNDERS), (groups, page)).await?;
-        let moved = reader.moved(BUCKET, &read_key).await?;
+        let moved = reader.moved(&bucket, &read_key).await?;
         Ok((flipped, missing, moved))
     })?;
     let found_flip = flipped == Came::Wrong(flip);
@@ -871,35 +985,46 @@ fn door(i: u64) -> usize {
     usize::from(i.checked_rem(2) == Some(1))
 }
 
-/// The small set of `count` objects through `cell`'s two doors, in four phases so that neither
-/// door waits on the other: the native door's objects put by a client of the first node; the S3
-/// listener's put by boto3 through the third node's listener; then every acknowledged object read
-/// back by a native client that asks the second node first; and then each again through the third
-/// node's listener. Every object is so read through another node than it was put through.
+/// The small set of `count` objects through `cell`'s two doors into `bucket`, in four phases so
+/// that neither door waits on the other: the native door's objects put by a client of the first
+/// node; the S3 listener's put by boto3 through the third node's listener; then every acknowledged
+/// object read back by a native client that asks the second node first; and then each again
+/// through the third node's listener. Every object is so read through another node than it was put
+/// through. With `disrupt`'s words, its command is started halfway through the native door's puts,
+/// which go on beside it, and its end, which must be success, is waited for before the S3
+/// listener's puts and every read.
 fn small(
-    cell: &Cell,
+    cell: &impl Reach,
     natives: &mut Natives,
-    dir: &Path,
-    seed: u64,
-    count: u64,
+    (dir, bucket): (&Path, &str),
+    (seed, count): (u64, u64),
+    disrupt: &[String],
 ) -> Result<([Tally; 2], Oracle), TransferError> {
     let listeners = cell.s3();
-    natives.create(BUCKET)?;
+    natives.create(bucket)?;
 
     // The native door's puts.
     let writer = natives.settings(0)?;
-    let (mut tallies, mut oracle) = natives.block(async move {
+    let written = bucket.to_owned();
+    let words = disrupt.to_vec();
+    let (mut tallies, mut oracle, disruption) = natives.block(async move {
         let generator = Generator::new(seed)?;
         let sizes = generator.object("sizes")?;
         let mut tallies = [Tally::new(), Tally::new()];
         let mut oracle = Oracle::new(count)?;
         let mut writer = Client::open(writer).await?;
+        let half = count.checked_div(2).unwrap_or(0);
+        let mut disruption = None;
         for i in (0..count).filter(|i| door(*i) == 0) {
+            if i >= half && disruption.is_none() && !words.is_empty() {
+                disruption = Some(start(&words)?);
+            }
             let length = size(&sizes, i)?;
             let name = format!("s{i}");
             let object = generator.object(&name)?;
             let began = Instant::now();
-            let (came, again) = native::put(&mut writer, (BUCKET, &name), &object, length).await?;
+            let (came, again) =
+                native::put(&mut writer, (&written, &name), &object, length).await?;
             put_came(
                 &mut tallies,
                 &mut oracle,
@@ -910,8 +1035,11 @@ fn small(
                 tally.asked_again(again);
             }
         }
-        Ok((tallies, oracle))
+        Ok((tallies, oracle, disruption))
     })?;
+    if let Some(child) = disruption {
+        settled(child, disrupt)?;
+    }
     let generator = Generator::new(seed)?;
     let sizes = generator.object("sizes")?;
 
@@ -923,7 +1051,7 @@ fn small(
             .ok_or(TransferError::Cell(cell::CellError::Init(
                 "no third listener".into(),
             )))?;
-    let mut boto = stock::Boto::start(dir, cell.out(), (endpoint, &region), BUCKET)
+    let mut boto = stock::Boto::start(dir, cell.out(), (&endpoint, &region), bucket)
         .map_err(TransferError::Stock)?;
     for i in (0..count).filter(|i| door(*i) == 1) {
         let length = size(&sizes, i)?;
@@ -943,6 +1071,7 @@ fn small(
 
     // Every acknowledged object read back natively through the second node.
     let reader = natives.settings(1)?;
+    let read = bucket.to_owned();
     let (mut tallies, oracle) = natives.block(async move {
         let generator = Generator::new(seed)?;
         let sizes = generator.object("sizes")?;
@@ -952,7 +1081,7 @@ fn small(
             let name = format!("s{i}");
             let object = generator.object(&name)?;
             let began = Instant::now();
-            let (came, again) = native::get(&mut reader, (BUCKET, &name), &object, length).await?;
+            let (came, again) = native::get(&mut reader, (&read, &name), &object, length).await?;
             if let Some(tally) = tallies.get_mut(door(i)) {
                 tally.asked_again(again);
                 tally.native_came(came, elapsed(began));
@@ -991,6 +1120,30 @@ fn put_came(
     }
 }
 
+/// Starts the disruption's command, its words `words`: the first the program, found on the PATH.
+fn start(words: &[String]) -> Result<std::process::Child, TransferError> {
+    let (program, args) = words
+        .split_first()
+        .ok_or_else(|| TransferError::Io(std::io::Error::other("a disruption of no words")))?;
+    Ok(std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .spawn()?)
+}
+
+/// Waits for the disruption's command, its words `words`, to end, which must be in success.
+fn settled(mut child: std::process::Child, words: &[String]) -> Result<(), TransferError> {
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(TransferError::Io(std::io::Error::other(format!(
+            "the disruption `{}` ended {status}",
+            words.join(" ")
+        ))))
+    }
+}
+
 /// A phase's outcome, its runtime's error and its own as one.
 fn flatten<T>(
     ran: Result<Result<T, TransferError>, hyper_rt::error::RtError>,
@@ -1007,21 +1160,26 @@ mod tests {
 
     /// The controls: an acknowledged object read back as no such key counts missing, and one read
     /// back with a byte not the generator's counts wrong; either leaves the case inexact, as a put
-    /// refused does.
+    /// refused does, but for a SlowDown on a cell a disruption left short a node.
     #[test]
     fn a_missing_object_or_a_wrong_byte_leaves_the_case_inexact() {
         let mut missing = Tally::new();
-        assert!(missing.exact());
+        assert!(missing.exact(false));
         missing.native_came(Came::Refused(Status::NoSuchKey), 1);
         assert_eq!(missing.missing, 1);
-        assert!(!missing.exact());
+        assert!(!missing.exact(false));
+        assert!(!missing.exact(true));
         let mut wrong = Tally::new();
         wrong.http_came(Came::Wrong(7), 1);
         assert_eq!(wrong.wrong, 1);
-        assert!(!wrong.exact());
+        assert!(!wrong.exact(true));
         let mut refused = Tally::new();
         assert!(!refused.put_came(1, Came::Refused(Status::SlowDown), 1));
-        assert!(!refused.exact());
+        assert!(!refused.exact(false));
+        // A cell short a node refuses what it cannot place SlowDown, and nothing else.
+        assert!(refused.exact(true));
+        assert!(!refused.put_came(1, Came::Refused(Status::Failed), 1));
+        assert!(!refused.exact(true));
     }
 
     /// Object `i`'s bit is the oracle's alone: set ones are held, the rest are not, past the

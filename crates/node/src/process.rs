@@ -1866,6 +1866,8 @@ async fn serve(
             enlisting = None;
             match outcome {
                 CommandOutcome::Answered(Answer::Root(root::Outcome::Enlisted)) => {
+                    // A supervisor's readiness check reads this run's enlistment (`mantle status`).
+                    layout.keep_enlisted(run).map_err(kept)?;
                     say(&mut output, "enlisted\n").await?;
                     if let Some(e) = &config.enlist {
                         living.state(&mut node, e.root, own, started_ns)?;

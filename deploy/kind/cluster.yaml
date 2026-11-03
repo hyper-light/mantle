@@ -1,0 +1,10 @@
+# The KIND cell's cluster (docs/design/kubernetes.md): a control plane and three workers, one for each
+# founder, since the chart's required anti-affinity puts each founder on a Kubernetes node of its own,
+# its failure domain.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker
+  - role: worker

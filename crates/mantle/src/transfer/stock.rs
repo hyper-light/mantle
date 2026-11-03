@@ -9,7 +9,6 @@
 
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
@@ -42,13 +41,13 @@ fn io(what: &str) -> impl FnOnce(std::io::Error) -> StockError + '_ {
     move |e| StockError::Io(what.to_owned(), e)
 }
 
-/// The operator's S3 profile for the listener at `endpoint`, written in `dir`: the environment a
+/// The operator's S3 profile for the listener at `endpoint`, `HOST:PORT`, written in `dir`: the environment a
 /// stock client runs in, the credentials `mantle init` wrote in `cell` beside a config naming the
 /// endpoint, path-style, and botocore's own transfer client.
 fn profile(
     dir: &Path,
     cell: &Path,
-    (endpoint, region): (SocketAddr, &str),
+    (endpoint, region): (&str, &str),
 ) -> Result<Vec<(&'static str, OsString)>, StockError> {
     let config = dir.join("aws-config");
     std::fs::write(
@@ -146,7 +145,7 @@ impl Boto {
     pub fn start(
         dir: &Path,
         cell: &Path,
-        (endpoint, region): (SocketAddr, &str),
+        (endpoint, region): (&str, &str),
         bucket: &str,
     ) -> Result<Self, StockError> {
         let script = dir.join("boto.py");
@@ -302,7 +301,7 @@ impl Cli {
     pub fn new(
         dir: &Path,
         cell: &Path,
-        (endpoint, region): (SocketAddr, &str),
+        (endpoint, region): (&str, &str),
     ) -> Result<Self, StockError> {
         Ok(Self {
             env: profile(dir, cell, (endpoint, region))?,

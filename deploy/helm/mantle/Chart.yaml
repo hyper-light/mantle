@@ -1,0 +1,18 @@
+apiVersion: v2
+name: mantle
+description: >-
+  A mantle cell on Kubernetes: a StatefulSet of the cell's founders, each `mantle serve` on a
+  Kubernetes node and claims of its own, dialed by its peers and clients at a Service of its own,
+  its identity and keys from `mantle init` installed from a Secret the chart never generates
+  (docs/design/kubernetes.md).
+type: application
+# The chart's version and the binary's are one: bump both with the workspace version.
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.29.0-0"
+keywords:
+  - object-store
+  - s3
+  - filesystem
+sources:
+  - https://github.com/adalundhe/mantle

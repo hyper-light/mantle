@@ -1,0 +1,153 @@
+{{- /*
+The cell's founders: a StatefulSet, so pod N keeps its name, its claims and its Service across
+every deletion, with `podManagementPolicy: Parallel`, since a cell needs a majority of its founders
+to elect and `OrderedReady` would wait for each pod to be ready before starting the next, which a
+founder alone never is (research/78). Each pod installs its founder's pack into its node directory
+once, then runs `mantle serve` there.
+*/ -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "mantle.fullname" . }}
+  labels:
+    {{- include "mantle.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "mantle.fullname" . }}
+  replicas: {{ int .Values.replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "mantle.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mantle.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # The image's non-root user, no capability, no privilege; the root file system read-only, the
+      # node writing only its claims.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          # A Kubernetes node is a failure domain, and a block's chunks sit on distinct mantle
+          # nodes: two founders never share one (required, not preferred).
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  {{- include "mantle.selectorLabels" . | nindent 18 }}
+      terminationGracePeriodSeconds: {{ include "mantle.grace" . }}
+      initContainers:
+        # The founder's pack, its keys installed owner-only: a Secret's projected file takes the
+        # volume's mode, and `mantle serve` reads a key only from a file its owner alone may read.
+        # A node directory holding a configuration already is kept as it is (research/78).
+        - name: install
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["install", "/founder", "/var/lib/mantle"]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: node
+              mountPath: /var/lib/mantle
+            # The pod's own pack alone: `subPathExpr` selects it by the pod's name from the
+            # projected volume of every founder's Secret.
+            - name: founders
+              mountPath: /founder
+              subPathExpr: $(POD_NAME)
+              readOnly: true
+      containers:
+        - name: mantle
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve", "/var/lib/mantle/config"]
+          ports:
+            - name: quic
+              containerPort: {{ int .Values.ports.quic }}
+              protocol: UDP
+            - name: plane
+              containerPort: {{ int .Values.ports.plane }}
+              protocol: UDP
+            - name: s3
+              containerPort: {{ int .Values.ports.s3 }}
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              memory: {{ .Values.resources.memory }}
+              cpu: {{ .Values.resources.cpu }}
+            limits:
+              memory: {{ .Values.resources.memory }}
+              cpu: {{ .Values.resources.cpu }}
+          readinessProbe:
+            exec:
+              command: ["/mantle", "status", "/var/lib/mantle"]
+            periodSeconds: {{ .Values.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.readiness.timeoutSeconds }}
+          # No liveness probe: a node stops itself on what it cannot serve through, and a restart
+          # would end its orderly stop.
+          volumeMounts:
+            - name: node
+              mountPath: /var/lib/mantle
+            - name: volume
+              mountPath: /volume
+      volumes:
+        - name: founders
+          projected:
+            # Owner and group read: the files are root's, in the pod's fsGroup, which its user is in.
+            defaultMode: 0440
+            sources:
+              {{- range $index := until (int .Values.replicas) }}
+              {{- $pod := include "mantle.podName" (dict "root" $ "index" $index) }}
+              - secret:
+                  name: {{ $pod }}-founder
+                  items:
+                    - key: founder
+                      path: {{ $pod }}
+              {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: node
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.storage.storageClassName }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.storage.nodeSize }}
+    - metadata:
+        name: volume
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.storage.storageClassName }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.storage.volumeSize }}

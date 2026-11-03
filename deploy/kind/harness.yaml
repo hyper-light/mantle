@@ -1,0 +1,100 @@
+# The transfer harness against the KIND cell (scripts/kind-cell.sh; docs/design/kubernetes.md): a
+# Job in the cell's namespace that installs the cell's pack (`mantle init`'s directory, its gateway
+# pinned) and runs the harness's CI scale through both doors with `--cell`, deleting founder pod
+# mantle-1 halfway through the small set's native puts (`disrupt`). Its account may delete and
+# watch the namespace's pods and nothing else.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mantle-harness
+  namespace: mantle
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mantle-harness
+  namespace: mantle
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mantle-harness
+  namespace: mantle
+subjects:
+  - kind: ServiceAccount
+    name: mantle-harness
+    namespace: mantle
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: mantle-harness
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mantle-harness
+  namespace: mantle
+spec:
+  # One run: a failed check is the verdict, not something to run again.
+  backoffLimit: 0
+  template:
+    spec:
+      serviceAccountName: mantle-harness
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: install
+          image: mantle-harness:kind
+          imagePullPolicy: IfNotPresent
+          command: ["mantle", "install", "/pack/cell", "/cell"]
+          volumeMounts:
+            - name: pack
+              mountPath: /pack
+              readOnly: true
+            - name: cell
+              mountPath: /cell
+      containers:
+        - name: harness
+          image: mantle-harness:kind
+          imagePullPolicy: IfNotPresent
+          command:
+            - mantle
+            - bench
+            - transfer
+            - /runs/kind
+            - --cell
+            - /cell
+            - --small
+            - "1000"
+            - --large
+            - 20M
+            - --count
+            - "4"
+            - --seed
+            - "5"
+            - --disrupt
+            - disrupt mantle-1 mantle
+          volumeMounts:
+            - name: cell
+              mountPath: /cell
+            - name: runs
+              mountPath: /runs
+      volumes:
+        - name: pack
+          secret:
+            secretName: mantle-harness-cell
+            defaultMode: 0440
+        - name: cell
+          emptyDir: {}
+        - name: runs
+          emptyDir: {}

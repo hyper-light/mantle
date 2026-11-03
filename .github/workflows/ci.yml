@@ -112,3 +112,28 @@ jobs:
           for _ in $(seq ${{ matrix.hogs }}); do taskset -c ${{ matrix.cpus }} sh -c 'while :; do :; done' & done
           taskset -c ${{ matrix.cpus }} cargo test --workspace --locked
           taskset -c ${{ matrix.cpus }} cargo test --manifest-path vendor/Cargo.toml --workspace --locked
+
+  # A cell on Kubernetes (plan step 11; docs/design/kubernetes.md): the chart's gates, helm lint and
+  # its golden render, then scripts/kind-cell.sh: the image built, a kind cluster of three workers,
+  # a cell of three installed by the chart, one founder to a kind node, and the transfer harness's
+  # CI scale through both doors from a Job in the cluster, a founder's pod deleted mid-transfer,
+  # every acknowledged object read back. kind and helm are installed by their actions, pinned to
+  # the versions slates' KIND lane runs; the runner image's kubectl drives the cluster, and the
+  # harness's image takes kubectl at the cluster's own version. The job's timeout bounds its waits.
+  kind:
+    name: kind-cell
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.3.0
+      - uses: helm/kind-action@v1
+        with:
+          version: v0.33.0
+          install_only: true
+      - name: The chart's gates (helm lint; the golden render)
+        run: bash scripts/check-chart.sh
+      - name: The KIND cell, end to end
+        run: bash scripts/kind-cell.sh

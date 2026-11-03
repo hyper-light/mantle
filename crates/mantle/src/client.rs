@@ -188,6 +188,21 @@ pub(crate) struct Configured {
     pub(crate) nodes: Vec<(u64, std::net::SocketAddr)>,
 }
 
+/// A node's address as a `node` line states it, `HOST:PORT`: an address as it is, a name resolved
+/// now through the platform's resolver, its first address, as a node resolves its peers' names at
+/// its start (`mantle_node::process::resolve`). A name is a Service's in front of a pod, whose
+/// address holds across the pod's deletions (research/78).
+fn dialed(text: &str) -> Result<std::net::SocketAddr, String> {
+    use std::net::ToSocketAddrs as _;
+    let at = mantle_node::process::Endpoint::parse(text)
+        .ok_or_else(|| format!("a node's address, HOST:PORT: {text}"))?;
+    (at.host.as_str(), at.port)
+        .to_socket_addrs()
+        .map_err(|e| format!("{text}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("{text}: no address"))
+}
+
 /// The client's directory `dir`: its `config`'s id, certificate, key (readable by its owner alone,
 /// as a node's is: `mantle_node::secret`), the authority's certificate and each node.
 pub(crate) fn configured(dir: &Path) -> Result<Configured, Error> {
@@ -218,9 +233,7 @@ pub(crate) fn configured(dir: &Path) -> Result<Configured, Error> {
                 nodes.push((
                     node.parse()
                         .map_err(|_| bad(format!("a node's id: {node}")))?,
-                    quic.trim()
-                        .parse()
-                        .map_err(|_| bad(format!("a node's address: {quic}")))?,
+                    dialed(quic.trim()).map_err(bad)?,
                 ));
             }
             other => return Err(bad(format!("a key no client states: {other}"))),

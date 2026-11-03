@@ -1,0 +1,6 @@
+The cell's founders are pods {{ include "mantle.fullname" . }}-0 to {{ include "mantle.fullname" . }}-{{ sub (int .Values.replicas) 1 }}, each ready once the cell enlisted it:
+
+  kubectl -n {{ .Release.Namespace }} rollout status statefulset/{{ include "mantle.fullname" . }}
+
+Its S3 endpoint is http://{{ include "mantle.fullname" . }}-s3.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}:{{ .Values.ports.s3 }}; a native client's
+node lines name each founder's Service, {{ include "mantle.fullname" . }}-N.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}:{{ .Values.ports.quic }}.

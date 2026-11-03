@@ -1,0 +1,289 @@
+---
+# Source: mantle/templates/services.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: mantle
+  labels:
+    helm.sh/chart: mantle-0.1.0
+    app.kubernetes.io/name: mantle
+    app.kubernetes.io/instance: mantle
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: mantle
+    app.kubernetes.io/instance: mantle
+
+---
+# Source: mantle/templates/services.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: mantle-0
+  labels:
+    helm.sh/chart: mantle-0.1.0
+    app.kubernetes.io/name: mantle
+    app.kubernetes.io/instance: mantle
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  type: ClusterIP
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: mantle
+    app.kubernetes.io/instance: mantle
+    statefulset.kubernetes.io/pod-name: mantle-0
+  ports:
+    - name: quic
+      port: 7000
+      targetPort: quic
+      protocol: UDP
+    - name: plane
+      port: 7001
+      targetPort: plane
+      protocol: UDP
+    - name: s3
+      port: 7480
+      targetPort: s3
+      protocol: TCP
+
+---
+# Source: mantle/templates/services.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: mantle-1
+  labels:
+    helm.sh/chart: mantle-0.1.0
+    app.kubernetes.io/name: mantle
+    app.kubernetes.io/instance: mantle
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  type: ClusterIP
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: mantle
+    app.kubernetes.io/instance: mantle
+    statefulset.kubernetes.io/pod-name: mantle-1
+  ports:
+    - name: quic
+      port: 7000
+      targetPort: quic
+      protocol: UDP
+    - name: plane
+      port: 7001
+      targetPort: plane
+      protocol: UDP
+    - name: s3
+      port: 7480
+      targetPort: s3
+      protocol: TCP
+
+---
+# Source: mantle/templates/services.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: mantle-2
+  labels:
+    helm.sh/chart: mantle-0.1.0
+    app.kubernetes.io/name: mantle
+    app.kubernetes.io/instance: mantle
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  type: ClusterIP
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: mantle
+    app.kubernetes.io/instance: mantle
+    statefulset.kubernetes.io/pod-name: mantle-2
+  ports:
+    - name: quic
+      port: 7000
+      targetPort: quic
+      protocol: UDP
+    - name: plane
+      port: 7001
+      targetPort: plane
+      protocol: UDP
+    - name: s3
+      port: 7480
+      targetPort: s3
+      protocol: TCP
+
+---
+# Source: mantle/templates/services.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: mantle-s3
+  labels:
+    helm.sh/chart: mantle-0.1.0
+    app.kubernetes.io/name: mantle
+    app.kubernetes.io/instance: mantle
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: mantle
+    app.kubernetes.io/instance: mantle
+  ports:
+    - name: s3
+      port: 7480
+      targetPort: s3
+      protocol: TCP
+
+---
+# Source: mantle/templates/statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mantle
+  labels:
+    helm.sh/chart: mantle-0.1.0
+    app.kubernetes.io/name: mantle
+    app.kubernetes.io/instance: mantle
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  serviceName: mantle
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mantle
+      app.kubernetes.io/instance: mantle
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mantle
+        app.kubernetes.io/instance: mantle
+    spec:
+      # The image's non-root user, no capability, no privilege; the root file system read-only, the
+      # node writing only its claims.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          # A Kubernetes node is a failure domain, and a block's chunks sit on distinct mantle
+          # nodes: two founders never share one (required, not preferred).
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: mantle
+                  app.kubernetes.io/instance: mantle
+      terminationGracePeriodSeconds: 30
+      initContainers:
+        # The founder's pack, its keys installed owner-only: a Secret's projected file takes the
+        # volume's mode, and `mantle serve` reads a key only from a file its owner alone may read.
+        # A node directory holding a configuration already is kept as it is (research/78).
+        - name: install
+          image: "mantle:0.1.0"
+          imagePullPolicy: IfNotPresent
+          args: ["install", "/founder", "/var/lib/mantle"]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: node
+              mountPath: /var/lib/mantle
+            # The pod's own pack alone: `subPathExpr` selects it by the pod's name from the
+            # projected volume of every founder's Secret.
+            - name: founders
+              mountPath: /founder
+              subPathExpr: $(POD_NAME)
+              readOnly: true
+      containers:
+        - name: mantle
+          image: "mantle:0.1.0"
+          imagePullPolicy: IfNotPresent
+          args: ["serve", "/var/lib/mantle/config"]
+          ports:
+            - name: quic
+              containerPort: 7000
+              protocol: UDP
+            - name: plane
+              containerPort: 7001
+              protocol: UDP
+            - name: s3
+              containerPort: 7480
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              memory: 2Gi
+              cpu: 1
+            limits:
+              memory: 2Gi
+              cpu: 1
+          readinessProbe:
+            exec:
+              command: ["/mantle", "status", "/var/lib/mantle"]
+            periodSeconds: 5
+            timeoutSeconds: 3
+          # No liveness probe: a node stops itself on what it cannot serve through, and a restart
+          # would end its orderly stop.
+          volumeMounts:
+            - name: node
+              mountPath: /var/lib/mantle
+            - name: volume
+              mountPath: /volume
+      volumes:
+        - name: founders
+          projected:
+            # Owner and group read: the files are root's, in the pod's fsGroup, which its user is in.
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: mantle-0-founder
+                  items:
+                    - key: founder
+                      path: mantle-0
+              - secret:
+                  name: mantle-1-founder
+                  items:
+                    - key: founder
+                      path: mantle-1
+              - secret:
+                  name: mantle-2-founder
+                  items:
+                    - key: founder
+                      path: mantle-2
+  volumeClaimTemplates:
+    - metadata:
+        name: node
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+    - metadata:
+        name: volume
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi

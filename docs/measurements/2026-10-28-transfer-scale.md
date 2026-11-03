@@ -12,10 +12,11 @@ capacity?
 
 **Checkpoint, 2026-11-02.** The reader fix is on main at `a57eaea7`. Eleven of the 22 host/case
 slots have complete readback evidence with their build attribution below; all six small sets
-and all four Box 10 GiB upload ways passed. Three 100 GiB cases have clean capacity-only results:
-Box native, Box native multipart and the new Mac S3 multipart case. Eight slots remain unresolved. The
+and all four Box 10 GiB upload ways passed. Four 100 GiB cases have clean capacity-only results:
+Box native, native multipart and S3 multipart, and the new Mac S3 multipart case. Seven slots remain unresolved. The
 earlier Mac generic refusal and Box CLI failure remain recorded and unexplained; their first
-queues stopped. A fresh Mac 10 GiB native case is now active.
+queues stopped. A fresh Box CLI case is active with the verified CLI acknowledgment check.
+The Mac 10 GiB native case stopped at its existing disk guard without final integrity totals.
 Capacity-only zero-object results receive no whole-object readback credit.
 The full Box workspace gate still has its recorded engine
 file-limit failure; the client, vendor and scale results retain their separate scopes.
@@ -752,6 +753,32 @@ unreadable and unlisted, exact chunk accounting and the missing-key control caug
 held 14,294,997,233 bytes plus 8,325,104 kept by none, with 8,404,992 bytes free. Scope peak was
 258,879,488 bytes, with no max/OOM events. This adds a third capacity-only result; the current
 matrix is 11 readback cases, three capacity-only results and eight unresolved slots.
+
+**Box 100 GiB S3 multipart capacity result.** `box-100G-boto-parts-20261102-150906` ended
+exit 0 in 1,321 s on the immutable `b69e5814` binary. Its 121,286,602,752 starting free bytes
+less 34,359,738,368 kept gave 28,975,621,461 bytes per node. No whole object fit. The raw SDK
+record is `UploadPart`, `InsufficientStorage`, HTTP 507, zero retries; `l0` was unreadable and
+unlisted, accounting was exact and the missing-key control was caught. Each node held
+26,171,069,852 bytes plus 2,414,939 kept by none, with 8,404,992 free. Scope peak was
+294,195,200 bytes, with no max/OOM events. All 79 metadata files were archived and verified
+against their decompressed copies (12,290,409 compressed bytes) before releasing only this
+successful case's chunk volumes. The original failed CLI cell remains intact. The matrix now
+has 11 readback cases, four capacity-only results and seven unresolved slots.
+
+**CLI fix landed; Mac guard stop retained.** The CLI acknowledgment check landed on main as
+`a9446d9d` after CI `41542855742` passed all nine jobs, including busy Linux. A fresh Box CLI
+100 GiB case uses its immutable binary SHA-256
+`1e0f92734a99abd5c50f5350b9c3d0a88da375a9eb5a41dae19bfc26b30652c0`, with raw CLI receipts
+and the existing 16 GiB memory limit, 32 GiB reserve and descriptor baseline.
+The Mac native 10 GiB case `mac-10G-native-20261102-145005` stopped after 7,529 s when shared
+free space reached 32,187,895,808 bytes, below the existing 32,212,254,720-byte guard. It has no
+final readback, placement, restart or capacity totals and receives no acceptance credit. An
+earlier bounded S3 listing saw five 10 GiB keys; that is visibility evidence only. All three
+chunk volumes remain retained. Its post-stop files outside the volumes occupy 355,725,312
+bytes, so this observation does not establish that its metadata budget needs increasing.
+Recovery is being prepared after preserving its metadata; both the reserve and guard stay
+unchanged. Older verified case metadata is being archived and byte-compared before removing
+those raw metadata copies, while their proof logs and archives remain.
 
 **What an object takes of a range's store.** For the engines' share of a node's memory, sized by
 what the cell's volumes hold (the owner's choice of 2026-10-31, node.md §1.4): the harness's small

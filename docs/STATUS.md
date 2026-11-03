@@ -584,6 +584,11 @@ The Box's native multipart 100 GiB case then ended cleanly in 1,064 s with no wh
 typed full for `l0`, exact chunk accounting and the missing-key control caught. Its scope peaked
 at 258,879,488 bytes with no max/OOM events. There are now three capacity-only results and eight
 unresolved slots, alongside the 11 readback cases. A fresh Mac 10 GiB native case is active.
+The Box S3 multipart 100 GiB case then ended cleanly in 1,321 s with a raw 507 `UploadPart`
+refusal and zero SDK retries, no whole object, exact accounting and the missing-key control
+caught; scope peak 294,195,200 bytes, no max/OOM events. There are now four capacity-only results
+and seven unresolved slots. Its 79 metadata files were archived and verified before releasing
+its chunk volumes. The original failed Box CLI cell remains intact.
 The real AWS CLI also reproduced a skipped multipart upload returning exit 0 with no object
 after an injected 412. The harness regression went red with `Ok(Done)` and green after requiring
 `HeadObject` at the expected length before counting a CLI copy as acknowledged. This fixes the
@@ -591,6 +596,11 @@ exit-status assumption; the original Box error remains unknown. The Scale goal r
 All 41 command-line unit tests, the real-process four-way capacity test, all-target Clippy and
 the production gate passed for this fix. The recorded full-workspace file-limit failure remains
 separate.
+The fix landed as `a9446d9d` after all nine CI jobs passed. A fresh Box CLI case runs with the
+fixed binary and raw exit receipts. The Mac native 10 GiB case instead stopped at its unchanged
+30 GiB disk guard after 7,529 s, without final integrity totals; it remains incomplete and its
+payloads are retained for recovery. The earlier listing of five 10 GiB keys is not readback
+or acknowledgment evidence. No resource limit was raised and the guard remains unchanged.
 The box's earlier `0100ddd8` 100k set ended exit 0 after 40,804 s: all 100,000 objects acknowledged,
 99,998 distinct-node blocks, 600,000 exact native reads after kills, no retries, refusals, wrong
 or missing objects, and all controls caught. It is older-build evidence; the fresh 100k result

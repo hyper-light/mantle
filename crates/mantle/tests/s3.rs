@@ -4,8 +4,8 @@
 //! deletes, ListObjectsV2, conditional writes and multipart uploads through every node's listener,
 //! each read byte-identical to what was put; and what S3 refuses, refused as S3 refuses it: a
 //! request whose body's length cannot be trusted answered 400 and its connection closed, a request
-//! refused before `100 Continue` sending no body, a connection past the budget closed as it comes,
-//! and a bad signature `403 SignatureDoesNotMatch`.
+//! refused before `100 Continue` sending no body, a connection past the budget answered `503
+//! SlowDown` and closed, and a bad signature `403 SignatureDoesNotMatch`.
 //!
 //! A binary of its own (crates/mantle/tests/support/cell.rs's harness, support/s3.rs's client).
 
@@ -362,9 +362,10 @@ fn a_cell_of_three_serves_signed_s3_requests_through_every_nodes_listener() {
 fn the_listener_refuses_what_s3_refuses_and_closes_what_it_cannot_trust() {
     let (cell, ids, mut clients) = started();
 
-    // Past the connection budget a connection is closed as it comes. On a listener no client has
-    // reached yet, each connection within the budget is served (a request answered on it), and
-    // the next, asked the same, is closed with nothing said.
+    // Past the connection budget a connection is answered `503 SlowDown` with `Connection:
+    // close`, never closed with no answer, which the AWS CLI takes for a part done (research/72).
+    // On a listener no client has reached yet, each connection within the budget is served (a
+    // request answered on it), and the next, asked the same, is answered refused.
     let (at, budget) = cell.s3_bound[&ids[0]];
     let mut held = Vec::new();
     for _ in 0..budget {
@@ -372,19 +373,21 @@ fn the_listener_refuses_what_s3_refuses_and_closes_what_it_cannot_trust() {
         assert_eq!(client.send("GET", "/", &[], b"").status, 200);
         held.push(client);
     }
-    let past = Client::new(at, clients[0].key.clone(), &clients[0].region);
-    let head = past.head("GET", "/", &[], mantle_s3::sigv4::EMPTY_SHA256);
-    let mut stream = TcpStream::connect(at).unwrap();
-    // A write to a connection the listener already closed may be refused: what matters is that
-    // nothing comes back.
-    let _ = stream.write_all(head.as_bytes());
-    let mut said = Vec::new();
-    let _ = stream.read_to_end(&mut said);
-    assert!(
-        said.is_empty(),
-        "a connection past the budget of {budget} was served: {}",
-        String::from_utf8_lossy(&said)
+    let mut past = Client::new(at, clients[0].key.clone(), &clients[0].region);
+    let refused = past.send("GET", "/", &[], b"");
+    assert_eq!(
+        refused.status,
+        503,
+        "a connection past the budget of {budget}: {}",
+        refused.text()
     );
+    assert_eq!(
+        refused.element("Code").as_deref(),
+        Some("SlowDown"),
+        "{}",
+        refused.text()
+    );
+    assert!(refused.closes(), "{}", refused.text());
     drop(held);
 
     // The rest through the other listeners, whose connections the budget above did not count.

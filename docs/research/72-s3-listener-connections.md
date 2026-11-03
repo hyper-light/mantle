@@ -139,4 +139,6 @@ and boto3 run against a cell in plan step 6. The classic client's table [7] is o
 the stock-client suite runs the version CI's runners have. A client that stops reading a GET's
 body holds its connection while the listener's writes wait on it, bounded by the transport's user
 timeout only for data sent and unacknowledged; a time bound on a write a zero window holds is
-open.
+open. The patience bounds the wait between a client's octets, as botocore's read timeout bounds
+its wait between the listener's, so a client sending a head an octet a minute holds a slot for as
+long as the head's octets last; a bound on a whole head's time is open.

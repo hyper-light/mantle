@@ -601,6 +601,17 @@ fixed binary and raw exit receipts. The Mac native 10 GiB case instead stopped a
 30 GiB disk guard after 7,529 s, without final integrity totals; it remains incomplete and its
 payloads are retained for recovery. The earlier listing of five 10 GiB keys is not readback
 or acknowledgment evidence. No resource limit was raised and the guard remains unchanged.
+The fresh Box CLI 100 GiB case then passed its capacity checks in 856 s on the fixed harness:
+actual CLI upload exit 1 with typed `InsufficientStorage`, no whole object, unreadable and
+unlisted, exact accounting and the missing-key control caught. Its scope peaked at 520,282,112
+bytes with no max/OOM events. All eleven Box slots now have separate results, seven with
+readback and four capacity only. Overall there are eleven readback cases, five capacity-only
+results and six unresolved Mac slots. The original failed Box cell remains retained.
+Mac recovery diagnostics exposed an invalid launchd descriptor context, then a missing
+root-enlistment readiness barrier. Those failed attempts are preserved. The corrected replay
+uses the existing execution context without changing its limits and has verified its first
+10 GiB native read against the independent generator. It remains uncredited pending all
+required checks, with every payload retained.
 The box's earlier `0100ddd8` 100k set ended exit 0 after 40,804 s: all 100,000 objects acknowledged,
 99,998 distinct-node blocks, 600,000 exact native reads after kills, no retries, refusals, wrong
 or missing objects, and all controls caught. It is older-build evidence; the fresh 100k result

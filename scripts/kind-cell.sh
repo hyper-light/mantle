@@ -81,10 +81,11 @@ fi
 
 kubectl apply -f deploy/kind/harness.yaml
 # The Job's verdict: complete or failed, whichever it comes to first, each waited for as a fact of
-# its own; its log said either way. The waits' bound is the CI job's.
-kubectl -n "$namespace" wait --for=condition=Complete job/mantle-harness --timeout=-1s >/dev/null &
+# its own; its log said either way. kubectl takes no wait without a positive bound: each is the CI
+# job's own timeout, 2 hours, which bounds the run.
+kubectl -n "$namespace" wait --for=condition=Complete job/mantle-harness --timeout=2h >/dev/null &
 complete=$!
-kubectl -n "$namespace" wait --for=condition=Failed job/mantle-harness --timeout=-1s >/dev/null &
+kubectl -n "$namespace" wait --for=condition=Failed job/mantle-harness --timeout=2h >/dev/null &
 failed=$!
 ended=""
 wait -n -p ended "$complete" "$failed" || true

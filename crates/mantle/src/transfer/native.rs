@@ -79,7 +79,15 @@ impl<'o, 'g> Checked<'o, 'g> {
         }
     }
 
-    /// The bytes it took.
+    /// A sink checking `object`'s bytes from `offset` on: a ranged get's.
+    pub fn starting(object: &'o Object<'g>, piece: usize, offset: u64) -> Self {
+        Self {
+            at: offset,
+            ..Self::new(object, piece)
+        }
+    }
+
+    /// The offset past the bytes it took.
     pub fn len(&self) -> u64 {
         self.at
     }
@@ -107,6 +115,19 @@ pub struct Flipped<'o, 'g> {
     at: u64,
     flip: u64,
     piece: Vec<u8>,
+}
+
+impl<'o, 'g> Flipped<'o, 'g> {
+    /// A check of `object`'s bytes a piece of `piece` bytes at a time, the byte at `flip` inverted
+    /// on its way there.
+    pub fn new(object: &'o Object<'g>, piece: usize, flip: u64) -> Self {
+        Self {
+            checked: Checked::new(object, piece),
+            at: 0,
+            flip,
+            piece: Vec::with_capacity(piece),
+        }
+    }
 }
 
 impl Sink for Flipped<'_, '_> {
@@ -146,12 +167,7 @@ pub async fn get_flipped(
         key: key.to_owned(),
         headers: Headers::default(),
     };
-    let mut flipped = Flipped {
-        checked: Checked::new(object, mantle_client::PIECE),
-        at: 0,
-        flip,
-        piece: Vec::with_capacity(mantle_client::PIECE),
-    };
+    let mut flipped = Flipped::new(object, mantle_client::PIECE, flip);
     let reply = client.get(&op, &mut flipped, u64::MAX).await?;
     if reply.status != Status::Done {
         return Ok(Came::Refused(reply.status));

@@ -2248,3 +2248,63 @@ fn a_cell_whose_volumes_fill_refuses_the_next_object_typed_on_both_doors() {
         assert!(text.contains(&format!("<Key>o{n}</Key>")), "{text}");
     }
 }
+
+/// `mantle bench doors --smoke` against a cell of three it makes and runs as `mantle serve`: every
+/// phase through both doors, the native protocol and the S3 listener, its reads checked against the
+/// seed's bytes, and the three controls, a byte flipped on its way to the check, a key never put
+/// and an ETag expected of another object, each reported as a failure through each door. It exits
+/// well only when every check was exact and every control was caught.
+#[test]
+fn bench_doors_smoke_checks_both_doors_and_catches_each_control() {
+    let root = tempfile::tempdir().unwrap();
+    let ran = Command::new(env!("CARGO_BIN_EXE_mantle"))
+        .args(["bench", "doors"])
+        .arg(root.path().join("doors"))
+        .arg("--smoke")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&ran.stdout).into_owned();
+    assert!(
+        ran.status.success(),
+        "{said}{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    for door in ["native", "http"] {
+        for control in ["flipped-byte", "missing-object", "wrong-etag"] {
+            let reported = format!("doors control {door} {control} failed:");
+            assert!(
+                said.lines()
+                    .any(|l| l.starts_with(&reported) && l.ends_with("(caught)")),
+                "{reported}: {said}"
+            );
+        }
+        for op in [
+            "PUT",
+            "PUT-STREAM",
+            "GET",
+            "GET-RANGE",
+            "HEAD",
+            "DELETE",
+            "LIST",
+            "MPU-CREATE",
+            "MPU-PART",
+            "MPU-LIST-PARTS",
+            "MPU-COMPLETE",
+            "MPU-ABORT",
+        ] {
+            let phase = format!("doors {door} {op} ");
+            assert!(
+                said.lines()
+                    .any(|l| l.starts_with(&phase) && l.ends_with(" failed 0")),
+                "{phase}: {said}"
+            );
+        }
+    }
+    assert!(
+        said.lines()
+            .any(|l| l.starts_with("doors verified ")
+                && l.contains(" failed 0 controls caught 6 of 6")),
+        "{said}"
+    );
+}

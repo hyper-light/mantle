@@ -430,10 +430,10 @@ impl Natives {
 
 /// Which of a set's objects were put and acknowledged: a bit each, the set's one record of them.
 #[derive(Clone)]
-struct Oracle(Vec<u64>);
+pub(crate) struct Oracle(Vec<u64>);
 
 impl Oracle {
-    fn new(count: u64) -> Result<Self, GenError> {
+    pub(crate) fn new(count: u64) -> Result<Self, GenError> {
         let whole = count.checked_div(64).ok_or(GenError::Offset)?;
         let part = u64::from(count.checked_rem(64).ok_or(GenError::Offset)? != 0);
         let words = whole.checked_add(part).ok_or(GenError::Offset)?;
@@ -450,7 +450,7 @@ impl Oracle {
         Some((word, bit))
     }
 
-    fn set(&mut self, i: u64) {
+    pub(crate) fn set(&mut self, i: u64) {
         if let Some((word, bit)) = Self::word(i)
             && let Some(slot) = self.0.get_mut(word)
         {
@@ -458,14 +458,14 @@ impl Oracle {
         }
     }
 
-    fn has(&self, i: u64) -> bool {
+    pub(crate) fn has(&self, i: u64) -> bool {
         Self::word(i).is_some_and(|(word, bit)| self.0.get(word).is_some_and(|w| w & bit != 0))
     }
 }
 
 /// Small object `i`'s size: the layout's boundaries first, then each drawn below S3's small-object
 /// line from the run's keystream of sizes.
-fn size(sizes: &Object<'_>, i: u64) -> Result<u64, GenError> {
+pub(crate) fn size(sizes: &Object<'_>, i: u64) -> Result<u64, GenError> {
     if let Some(boundary) = usize::try_from(i).ok().and_then(|i| BOUNDARIES.get(i)) {
         return Ok(*boundary);
     }
@@ -1027,7 +1027,7 @@ fn elapsed(began: Instant) -> u64 {
 
 /// Which door object `i` of a set is put through: the native one for an even `i`, the S3
 /// listener for an odd one; its tally's place.
-fn door(i: u64) -> usize {
+pub(crate) fn door(i: u64) -> usize {
     usize::from(i.checked_rem(2) == Some(1))
 }
 

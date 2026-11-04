@@ -18,6 +18,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 mod bench;
+mod bench_doors;
 mod bench_ec;
 mod bench_gateway;
 mod bench_hash;
@@ -35,6 +36,13 @@ mod init;
 mod journal;
 mod pack;
 mod transfer;
+
+// The allocation counts of `mantle serve`'s `counts` and of `mantle bench doors` are a diagnostic:
+// compiled in only with the `count-allocs` feature, so a timed build allocates through the system
+// allocator with nothing counted.
+#[cfg(feature = "count-allocs")]
+#[global_allocator]
+static ALLOCATOR: hyper_measure::alloc::Counting = hyper_measure::alloc::Counting;
 
 #[derive(Parser)]
 #[command(
@@ -430,6 +438,55 @@ enum BenchCommand {
         #[arg(long, requires = "cell")]
         disrupt: Option<String>,
     },
+    /// Measure each operation through both doors, the native protocol and the S3 listener, against
+    /// a cell of three `mantle serve` processes this program makes and runs under DIR: a line a
+    /// door, operation, size and step, with the servers' allocations (a `count-allocs` build),
+    /// faults, CPU and switches per operation, this program's own, and latency from each
+    /// operation's intended start (docs/design/measurement.md §12). Every read is checked against
+    /// the seed's bytes; three controls must each be reported as failures. Exits non-zero when any
+    /// check is not exact or a control is missed.
+    Doors {
+        /// The run's directory, which must not exist yet: the cell's volumes are made in it.
+        dir: PathBuf,
+        /// The seed every object's bytes and the open loop's arrivals come from.
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// Object sizes, comma-separated, in bytes or with a K, M, G or T suffix: 0, 1, 65535,
+        /// 65536, 65537, 128K, 8M and 64M by default; 5G and a 10 GB stream (10000000000) on
+        /// request, with a --volume and --bytes to hold them.
+        #[arg(long, value_delimiter = ',', value_parser = bench_doors::size_arg)]
+        sizes: Vec<u64>,
+        /// Sets of small objects, comma-separated: each door puts half, lists the set, reads the
+        /// other's half and deletes its own. 100000 by default.
+        #[arg(long, value_delimiter = ',')]
+        objects: Vec<u64>,
+        /// open:RATE, requests a second arriving as a Poisson process, latency from each one's
+        /// intended start; or closed, a ladder of clients doubling while throughput grows.
+        #[arg(long, value_parser = bench_doors::load_arg, default_value = "open:100")]
+        load: bench_doors::Load,
+        /// Logical clients at most, each a task on one thread holding one connection: open loop's
+        /// clients, and the closed ladder's top.
+        #[arg(long)]
+        clients: Option<usize>,
+        /// Operations a phase's step asks at most: 368 by default, a p99's samples.
+        #[arg(long)]
+        ops: Option<u64>,
+        /// Object bytes a phase's step moves at most, in bytes or with a suffix: 256M by default.
+        #[arg(long, value_parser = init::parse_bytes)]
+        bytes: Option<u64>,
+        /// Each founder's volume, preallocated, in bytes or with a suffix: 12G by default.
+        #[arg(long, value_parser = init::parse_bytes)]
+        volume: Option<u64>,
+        /// The condition the run is under, said on each line: quiet, busy1x, busy2x, cpu1, cpu2,
+        /// memfloor or another.
+        #[arg(long, default_value = "quiet")]
+        condition: String,
+        /// A run for CI: a few operations a phase, the small sizes, a set of twenty, two clients
+        /// and small volumes, through both doors with the three controls. The flags given still
+        /// apply.
+        #[arg(long)]
+        smoke: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -641,6 +698,10 @@ fn main() -> ExitCode {
             return exit(mantle_node::process::run(config).map_err(|e| e.to_string()));
         }
         Command::Serve { config } => {
+            if cfg!(feature = "count-allocs") {
+                hyper_measure::alloc::begin_process();
+            }
+            mantle_node::process::answer_counts(bench_doors::counts_line);
             return exit(mantle_node::process::serve_stated(config).map_err(|e| e.to_string()));
         }
         _ => {}
@@ -845,6 +906,16 @@ fn main() -> ExitCode {
             Err(_) => Err(format!("--seconds {seconds} is not a duration")),
         },
         Command::Bench {
+            command: command @ BenchCommand::Doors { .. },
+        } => match doors_options(command) {
+            Some(options) => match bench_doors::doors(&mut out, &options) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err("a check was not exact or a control was not caught".to_owned()),
+                Err(e) => Err(e.to_string()),
+            },
+            None => Ok(()),
+        },
+        Command::Bench {
             command:
                 BenchCommand::Transfer {
                     dir,
@@ -919,6 +990,74 @@ fn main() -> ExitCode {
     };
     exit(result)
 }
+
+/// `mantle bench doors`' sizes, sets, clients, operations, bytes and volumes: the flags given, each
+/// other one `--smoke`'s or the full run's.
+fn doors_options(command: BenchCommand) -> Option<bench_doors::Options> {
+    let BenchCommand::Doors {
+        dir,
+        seed,
+        sizes,
+        objects,
+        load,
+        clients,
+        ops,
+        bytes,
+        volume,
+        condition,
+        smoke,
+    } = command
+    else {
+        return None;
+    };
+    Some(bench_doors::Options {
+        dir,
+        seed,
+        sizes: if sizes.is_empty() {
+            pick(smoke, FULL_SIZES.to_vec(), SMOKE_SIZES.to_vec())
+        } else {
+            sizes
+        },
+        objects: if objects.is_empty() {
+            vec![pick(smoke, FULL_OBJECTS, SMOKE_OBJECTS)]
+        } else {
+            objects
+        },
+        load,
+        clients: clients.unwrap_or(pick(smoke, FULL_CLIENTS, SMOKE_CLIENTS)),
+        ops: ops.unwrap_or(pick(smoke, FULL_OPS, SMOKE_OPS)),
+        bytes: bytes.unwrap_or(STEP_BYTES),
+        volume: volume.unwrap_or(pick(smoke, FULL_VOLUME, SMOKE_VOLUME)),
+        condition,
+    })
+}
+
+/// `quick` for `--smoke`, `full` otherwise.
+fn pick<T>(smoke: bool, full: T, quick: T) -> T {
+    if smoke { quick } else { full }
+}
+
+/// `mantle bench doors`' sizes by default: empty, a byte, a 64 KiB segment's boundaries, S3's
+/// small-object line, the stock clients' part and a large object (measurement.md §12).
+const FULL_SIZES: [u64; 8] = [0, 1, 65_535, 65_536, 65_537, 128 << 10, 8 << 20, 64 << 20];
+/// `--smoke`'s: the sizes up to S3's small-object line.
+const SMOKE_SIZES: [u64; 6] = [0, 1, 65_535, 65_536, 65_537, 128 << 10];
+/// A set of 100,000 small objects by default (measurement.md §12); twenty for `--smoke`.
+const FULL_OBJECTS: u64 = 100_000;
+const SMOKE_OBJECTS: u64 = 20;
+/// Logical clients: sixteen at most by default, two for `--smoke`.
+const FULL_CLIENTS: usize = 16;
+const SMOKE_CLIENTS: usize = 2;
+/// Operations a step: a p99's 368 samples by default (measurement.md §5a), four for `--smoke`.
+const FULL_OPS: u64 = 368;
+const SMOKE_OPS: u64 = 4;
+/// Object bytes a step moves at most: 256 MiB, so a 64 MiB size's steps move four objects.
+const STEP_BYTES: u64 = 256 << 20;
+/// Each founder's volume: 12 GiB by default, holding a full run's objects (about 2 GiB a door of
+/// sizes, and a 100,000-object set's 6.4 GiB at its mean of 64 KiB), every copy on each of the
+/// three; `--smoke`'s the 256 MiB `bench transfer`'s cases run on.
+const FULL_VOLUME: u64 = 12 << 30;
+const SMOKE_VOLUME: u64 = 256 << 20;
 
 /// `mantle bench transfer`'s `--volume`: a size, or none for `free`, the run's free space less its
 /// reserve.

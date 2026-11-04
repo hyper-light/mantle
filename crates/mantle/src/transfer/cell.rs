@@ -5,7 +5,7 @@
 //! what the operating system gives it, and once every one is bound each is told where the others
 //! listen (`learn`), as an operator tells a node its peers; every founder pins the harness's gateway
 //! before it starts. A child's status lines (`bound`, `s3-bound`, `enlisted`, each range's
-//! `status`, and `chunks` when asked) are read on a thread of its own, one for each node and no
+//! `status`, and `chunks` and `counts` when asked) are read on a thread of its own, one for each node and no
 //! more, and every wait ends on the line it waits for or on a process's output ending, never on a
 //! guess of time.
 
@@ -60,6 +60,48 @@ pub struct Chunks {
     pub free: u64,
 }
 
+/// A node's process's own account as it answers `counts` (`mantle_node::process::answer_counts`):
+/// its allocator's counts since it was last asked, none where the build counts no allocations
+/// (only a `count-allocs` build does), and the page faults and context switches its process was
+/// charged since it began, none where the OS does not say them apart.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Counted {
+    pub allocations: Option<u64>,
+    pub reallocations: Option<u64>,
+    pub moved: Option<u64>,
+    pub bytes: Option<u64>,
+    pub live: Option<i64>,
+    pub peak: Option<i64>,
+    pub minor: Option<u64>,
+    pub major: Option<u64>,
+    pub switches: Option<u64>,
+}
+
+impl Counted {
+    /// A `counts` line's fields past its first two words, each a name and a value or `-`.
+    fn parse(fields: &[&str]) -> Option<Self> {
+        let mut counted = Self::default();
+        for pair in fields.chunks(2) {
+            let [name, value] = pair else { return None };
+            let unsigned = || value.parse::<u64>().ok();
+            let signed = || value.parse::<i64>().ok();
+            match *name {
+                "allocs" => counted.allocations = unsigned(),
+                "reallocs" => counted.reallocations = unsigned(),
+                "moved" => counted.moved = unsigned(),
+                "bytes" => counted.bytes = unsigned(),
+                "live" => counted.live = signed(),
+                "peak" => counted.peak = signed(),
+                "minor" => counted.minor = unsigned(),
+                "major" => counted.major = unsigned(),
+                "switches" => counted.switches = unsigned(),
+                _ => {}
+            }
+        }
+        Some(counted)
+    }
+}
+
 /// What a node's process said, as this runner reads it.
 enum Said {
     /// Its QUIC listener's address and its datagram plane's, once bound.
@@ -72,6 +114,8 @@ enum Said {
     Enlisted,
     /// Its chunks, asked.
     Chunks(Chunks),
+    /// Its process's counts, asked.
+    Counts(Counted),
     /// A range's leader as the node knows it now, none while it knows of none.
     Status(u128, u64),
     /// Its output ended: the process is gone.
@@ -85,6 +129,7 @@ fn said(line: &str) -> Option<Said> {
         ["s3-bound", at, _connections] => at.parse().ok().map(Said::S3),
         ["s3", _listen, region, _ids] => Some(Said::Region((*region).to_owned())),
         ["enlisted"] => Some(Said::Enlisted),
+        ["counts", _counting, rest @ ..] => Counted::parse(rest).map(Said::Counts),
         ["status", group, _term, leader, ..] => Some(Said::Status(
             u128::from_str_radix(group, 16).ok()?,
             leader.parse().ok()?,
@@ -126,6 +171,7 @@ struct Node {
     region: Option<String>,
     enlisted: bool,
     chunks: Option<Chunks>,
+    counts: Option<Counted>,
     /// Each range's leader as its process last said, zero for none.
     leaders: BTreeMap<u128, u64>,
 }
@@ -250,6 +296,7 @@ impl Cell {
                 region: None,
                 enlisted: false,
                 chunks: None,
+                counts: None,
                 leaders: BTreeMap::new(),
             });
         }
@@ -416,6 +463,29 @@ impl Cell {
             .ok_or_else(|| CellError::Init(format!("no founder {at}")))
     }
 
+    /// Node `at`'s process's counts, asked now on its standard input ([`Counted`]): a node
+    /// answers with what it counted since it was last asked, and counts afresh from there.
+    pub fn counts(&mut self, at: usize) -> Result<Counted, CellError> {
+        let node = self
+            .nodes
+            .get_mut(at)
+            .ok_or_else(|| CellError::Init(format!("no founder {at}")))?;
+        node.counts = None;
+        let input = node.input.as_mut().ok_or(CellError::Ended(node.id))?;
+        input.write_all(b"counts\n").map_err(io("a node's input"))?;
+        input.flush().map_err(io("a node's input"))?;
+        self.until(at, |node| node.counts.is_some())?;
+        self.nodes
+            .get(at)
+            .and_then(|node| node.counts)
+            .ok_or_else(|| CellError::Init(format!("no founder {at}")))
+    }
+
+    /// Node `at`'s process's id while it runs, which the OS's account of it is read by.
+    pub fn pid(&self, at: usize) -> Option<u32> {
+        self.nodes.get(at)?.child.as_ref().map(Child::id)
+    }
+
     /// Waits until every running node names a running node as the leader of every range any of
     /// them knows: after a kill, until each range the killed node led has elected another, the
     /// fact a read through the others needs.
@@ -469,6 +539,7 @@ impl Cell {
             Said::Region(region) => node.region = Some(region),
             Said::Enlisted => node.enlisted = true,
             Said::Chunks(chunks) => node.chunks = Some(chunks),
+            Said::Counts(counts) => node.counts = Some(counts),
             Said::Status(group, leader) => {
                 node.leaders.insert(group, leader);
             }

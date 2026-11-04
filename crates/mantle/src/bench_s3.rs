@@ -311,7 +311,7 @@ fn connect(at: SocketAddr, authority: Option<&[u8]>) -> Result<Connection, Error
 }
 
 /// `YYYYMMDDTHHMMSSZ` and `YYYYMMDD` now.
-fn timestamp() -> Result<(String, String), Error> {
+pub(crate) fn timestamp() -> Result<(String, String), Error> {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(exchange)?

@@ -25,6 +25,10 @@ clap.workspace = true
 getrandom.workspace = true
 hyper-block = { path = "../../vendor/hyper-block" }
 hyper-log = { path = "../../vendor/hyper-log" }
+# What `mantle bench doors` counts: the servers' processes' CPU, faults and footprint read by pid,
+# the harness thread's allocations, its quantiles' sample counts and its open loop's arrivals; and
+# the counting allocator a `count-allocs` build installs.
+hyper-measure = { path = "../../vendor/hyper-measure" }
 # The cell's authority and its founders' certificates, and the S3 endpoint's, issued by
 # `mantle init`.
 mantle-cert = { path = "../cert" }
@@ -49,6 +53,12 @@ mantle-client = { path = "../client" }
 # commands ask.
 mantle-protocol = { path = "../protocol" }
 mantle-s3 = { path = "../s3" }
+
+[features]
+# hyper-measure's counting allocator as the global allocator, so `mantle serve` answers `counts`
+# with its process's allocations and `mantle bench doors` counts its own: a diagnostic, off by
+# default and never in a timed build, which allocates through the system allocator.
+count-allocs = []
 
 [dev-dependencies]
 # The real-process test of `mantle node` (tests/node.rs): the client's transport, the range's

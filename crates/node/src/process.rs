@@ -82,7 +82,9 @@
 //! HELD UNKEPT FRAGMENTS BUDGET FREE`: the bytes of chunks its peers put on it over QUIC, of those
 //! it put on its own volumes, of those its volumes hold and of those of the first two no volume
 //! kept; the fragments its volumes' indexes hold and the most they may; and the bytes of its
-//! volumes' free segments (`Node::chunk_bytes`). A line it cannot read ends the process
+//! volumes' free segments (`Node::chunk_bytes`); and `counts`, answered with the binary's account
+//! of its own process ([`answer_counts`]: `counts uncounted` where the binary gives none). A line
+//! it cannot read ends the process
 //! with the line named. Standard input closing ends `mantle node`, its
 //! harness's child, at once, without the orderly stop's steps; `mantle serve` runs on, as under a
 //! service manager, whose input is empty.
@@ -102,6 +104,7 @@ use std::io::Write;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::pin::{Pin, pin};
+use std::sync::OnceLock;
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::time::Duration;
 
@@ -1188,6 +1191,17 @@ pub fn run(config: &Path) -> Result<(), ProcessError> {
     start(config, (node, locks), identity, None, true)
 }
 
+/// What a node answers `counts` on its standard input with: the binary's account of its own
+/// process (its allocator's counts, its faults and switches), which only the binary can give, the
+/// global allocator being the binary's choice (`mantle bench doors`). Set once, before the node runs.
+static COUNTS: OnceLock<fn() -> String> = OnceLock::new();
+
+/// Sets what `counts` answers ([`COUNTS`]), a line ended by a newline: false when it was set
+/// already. A node it was never set for answers `counts uncounted`.
+pub fn answer_counts(with: fn() -> String) -> bool {
+    COUNTS.set(with).is_ok()
+}
+
 /// Runs the node whose operator's statements the file at `config` holds (`mantle serve`, node.md
 /// §1.4): each volume's device directory locked, then each device's profile kept or measured, the
 /// node directory's device and the host's memory, cores and page measured; every other value
@@ -1961,6 +1975,11 @@ async fn serve(
                             held.bytes, held.free
                         );
                         say(&mut output, &line).await?;
+                    } else if line.trim_ascii() == b"counts" {
+                        let line = COUNTS
+                            .get()
+                            .map_or_else(|| "counts uncounted\n".to_owned(), |counts| counts());
+                        say(&mut output, &line).await?;
                     } else {
                         take_line(&mut node, &config.ranges, &line)?;
                     }
@@ -2245,8 +2264,8 @@ impl Living {
 }
 
 /// Takes a line of the node's input: `learn ID QUIC PLANE` or `replace FAILED JOINING`, a
-/// replacement in each of `ranges`. (`stop`, the orderly stop a signal asks, and `chunks`, whose
-/// answer the node says, the loop takes itself.)
+/// replacement in each of `ranges`. (`stop`, the orderly stop a signal asks, and `chunks` and
+/// `counts`, whose answers the node says, the loop takes itself.)
 fn take_line<E: Engine + 'static>(
     node: &mut Node<E>,
     ranges: &[(u128, Layer)],

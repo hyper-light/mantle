@@ -278,3 +278,47 @@ recommendations 5–6).
 - **What Apple's SSDs expose**: power states, NPWG-like units, and whether macOS's power
   management is observable from user space (research/29 §11 items 6, 12); C3 and C5 measure
   around the gap.
+
+## 12. The doors
+
+**Decision: both doors are measured per operation, as the engine was: counted in a diagnostic
+build, timed in a release build, two fresh processes a point, in a Williams order beside
+comparators of equal durability** (research/78). `mantle bench doors` drives a cell of three
+`mantle serve` processes through the native protocol (mantle-client) and the S3 listener (requests
+written with mantle's codec and signed with mantle-s3), so the timed load is mantle's own; the
+stock clients stay the correctness suite.
+
+- **Operations**: PUT whole and streamed, GET whole and ranged, HEAD, DELETE, a ListObjectsV2 page
+  of up to 1,000 keys, and multipart create, upload part, complete (up to 10,000 parts), abort and
+  list parts, through both doors (78 [10]).
+- **Sizes**: 0 B, 1 B, 65,535, 65,536 and 65,537 bytes (a 64 KiB segment's boundaries), 128 KiB,
+  8 MiB (the stock clients' threshold and part), 64 MiB, 5 GiB (the single PUT's limit) and a 10 GB
+  stream; sets of 1,000, 10,000 and 100,000 small objects, 100,000 by default with 10,000 beside it
+  (78 [10][14]).
+- **Measures per operation**: allocations, reallocations, moved reallocations, bytes asked, peak
+  live heap per request and per connection, minor and major faults, user and system CPU,
+  instructions and cycles where the OS counts them, context switches, wire bytes, datagrams on the
+  native door, and latency at p50, p99, p99.9, p99.99 and max from each request's intended start;
+  per connection, the memory slope at two connection counts (§10) and the handshake's counts
+  (78 [2][4][5]).
+- **Instruments**: hyper-measure's counting allocator in `count-allocs` builds of `mantle serve`
+  and the harness only, the harness's own work set aside; each server's faults, CPU and footprint
+  read by pid; `perf stat` on the box; aws-lc's own heap seen through the footprint (78 [3][4]).
+- **Load**: open loop with Poisson arrivals by default and a closed ladder doubling while
+  throughput grows up to the node's connection budget; an HTTP connection carries one request at a
+  time; the generator reports its CPU and lateness (§10; 78 [6]).
+- **Rounds**: at least 3,688 transfers behind a p99.9 and 368 behind a p99 (§5a); fewer, and the
+  quantile is a dash.
+- **Trials**: a timed and a counting process a point; Williams order in whole cycles; an A/A beside
+  effects under about 5%; every expected case completed, failed with its reason, or excluded with
+  its reason (78 [9]).
+- **Conditions**: quiet; busy loops at one and two times the cores; one and two CPUs; the node's
+  memory floor as a cgroup limit; and for the native door the 500 ms one-way relay with loss and
+  reordering, its overhead above physics reported (78 [12]).
+- **Machines**: the box (CPUSET 8-15 under a memory scope), the Mac's Linux VM lane and the Mac;
+  Windows runs the correctness suites.
+- **Comparators**: bare hyper-quic, quinn's `perf` at hyper-quic's base revision and msquic's
+  secnetperf for the native door; Garage v2.5.0, SeaweedFS 4.52, RustFS 1.0.4 and MinIO
+  RELEASE.2025-10-15T17-29-55Z for the HTTP door, each configured to flush before acknowledging,
+  pinned and built in a comparison-only workspace, with S3's published bars beside them as
+  references (78 [11][12][13]).

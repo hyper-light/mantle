@@ -117,4 +117,5 @@ go on beside it, and its end, which must be success, is waited for before the se
 every read. A cell short a node refuses a block it cannot place on distinct nodes `SlowDown`
 (gateway `PutError::Unplaced`): such a put is counted and acknowledged by nothing, and every put
 the cell acknowledged must read back exactly through every node after the disruption. The Job
-exits 0 only with every check exact.
+exits 0 only with every check exact; it first did in run 41738909698 (2026-11-03), its rows in
+STATUS.md.

@@ -10,6 +10,12 @@ distinct nodes, every acknowledged object read back after each founder is killed
 and each large case ending at the typed refusal with the count held beside the volumes' stated
 capacity?
 
+**Checkpoint, 2026-11-03.** Every one of the 22 host/case slots has its result: 15 with complete
+readback evidence and 7 capacity-only, none unresolved. The Mac's six open slots ran on the
+listener fix (main `9166554e`, binary `mantle-0988940`): its four 10 GiB ways each held seven
+whole objects with every check exact, and its two 100 GiB ways are capacity-only, each refusing
+its first object as out of space, unreadable and unlisted (the last section below).
+
 **Checkpoint, 2026-11-02.** The reader fix is on main at `a57eaea7`. Eleven of the 22 host/case
 slots have complete readback evidence with their build attribution below; all six small sets
 and all four Box 10 GiB upload ways passed. Five 100 GiB cases have clean capacity-only results:
@@ -841,10 +847,54 @@ the check asked nothing. A stack sample after 34 minutes (`mac-10G-native-202611
 check-node-sample-20261103.txt`) showed the node's thread in its ranges' open, Raft replay
 waiting on `hyper_log`'s `GroupLog::ask`, and the log's I/O thread in `pread` in every sample,
 at 0.8 s of CPU for the process; its 92 MB log file reads whole in 0.12 s. The earlier response
-diagnostics' long startups may be the same. The volumes 1 and 2 were then deleted too, as
+diagnostics' long startups may be the same. Each of those startups began within minutes of
+deleting 100 GB or more of volume files (volume 0 at 21:37, the nodes at 21:41). In that window
+500 unlinks of one-octet files took 8.47 s, 17 ms each, and cargo and git stalled in the kernel
+alike; four hours later the same 500 took 0.03 s. APFS frees a deleted file's extents after the
+unlink returns, so the file system's own reclaim starving the nodes' direct reads is the likelier
+cause than the replay itself; it is not established. The volumes 1 and 2 were then deleted too, as
 decided; the cell's metadata, logs, the three metadata archives and the sample remain. The
 original failed Box CLI cell's three chunk volumes (310.8 GB) were also deleted by the owner's
 decision; its 84 metadata files stay in their verified archive.
+
+**The Mac's open slots on the listener fix (2026-11-03).** The six Mac slots still open ran one
+way at a time under launchd (`com.mantle.mac-open-slots`) on `mantle-0988940`, SHA-256
+`09ae040ebbc4510d29c2ef3685c6e5da2fe1d05085c7b5fcc243e72c29e85bb6`, built from the product
+sources main `9166554e` carries (its commits after `0988940` change tests and docs only). Each
+case's volumes were the free space less a 40 GiB reserve, a third each, so the unchanged 30 GiB
+floor left 10 GiB for other sessions' writes; the 2 GiB margin of the earlier 32 GiB reserve is
+what stopped the earlier native case. Every row passed the complete verifier
+(`verify-large-result.py`): exit 0 with empty stderr, whole objects at the volumes' measured
+capacity, a typed full refusal whose key is unreadable and unlisted, exact native and S3 reads,
+every block's chunks on distinct nodes, every acknowledged object read exactly after each
+founder's kill and restart, and the three controls caught.
+
+| Way | Volumes (each) | Held | Blocks | Put / native read / HTTP read (MiB/s) | Reads after kills | Again / wrong / missing | Refused | Seconds |
+|---|---|---|---|---|---|---|---|---|
+| native (whole blocks) | 85,906,821,120 B | 7 | 9,037 | 37 / 142 / 214 | 42 | 1 / 0 / 0 | native `l7`, full | 6,929 |
+| cli | 86,153,940,992 B | 7 | 17,920 | 49 / 87 / 193 | 42 | 0 / 0 / 0 | the listener `l7`, full | 6,673 |
+| native-parts | 85,489,089,194 B | 7 | 17,920 | 30 / 85 / 202 | 42 | 0 / 0 / 0 | native `l7`, full | 9,831 |
+| boto-parts | 83,624,589,994 B | 7 | 17,920 | 31 / 79 / 169 | 42 | 0 / 0 / 0 | the listener `l7`, full | 9,498 |
+
+The two 100 GiB ways are capacity-only: a founder's volume holds less than one object's copy, so
+each refused its first object, `l0`, as out of space, its key unreadable through both doors and
+listed by neither, with no object acknowledged and the key never put read missing. The first
+native run (15:47) was stopped by the 30 GiB floor 1,373 s in: free space fell 11.1 GB past its
+volumes' bytes, transient writes the volumes' own files do not account (its three node
+directories held 225 MB). Run again with the reserve raised by that measured excursion, the floor
+plus 11.1 GB plus the 10 GiB the 40 GiB reserve left other sessions, 51 GiB, the guard sampling
+the free space every 10 s: free fell to the volumes' line within two minutes of the cell's
+start, then about 0.46 GiB a minute, to 44.28 GiB at its least, and both ways ran to their typed
+refusal.
+
+| Way | Volumes (each) | Held a node at the refusal | Refused | Free at start | Seconds |
+|---|---|---|---|---|---|
+| native | 76,202,748,586 B | 71,221,264,720 B | native `l0`, full | 283,369,078,784 B | 2,197 |
+| cli | 73,739,168,426 B | 68,895,610,864 B | the listener `l0`, full | 275,978,338,304 B | 1,440 |
+
+Each held the chunks of its refused object's blocks written before the refusal (nothing removes a
+chunk yet) and 8,404,992 free bytes a volume; each verified by `verify-large-result.py` (exit 0,
+empty stderr, binary SHA-256 above).
 
 **What an object takes of a range's store.** For the engines' share of a node's memory, sized by
 what the cell's volumes hold (the owner's choice of 2026-10-31, node.md §1.4): the harness's small

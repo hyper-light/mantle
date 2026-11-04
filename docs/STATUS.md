@@ -625,6 +625,16 @@ connection go after 60 s of quiet (node.md §4.5). A two-node check on the guard
 deleting its volume 0 by the owner's decision, ended at its one-hour bound with neither node done
 starting: a sample showed Raft replay waiting on the log while its I/O thread read. Its other two
 volumes, and the failed Box CLI cell's, were then deleted as decided; metadata and logs remain.
+On the listener fix the Mac's six open slots then ran one way at a time (binary `mantle-0988940`,
+main `9166554e`'s product sources), each verified whole: the four 10 GiB ways each held seven
+whole objects, every byte read back exactly through both doors and through the others after each
+founder's kill, every block's chunks on distinct nodes, the controls caught and the next object
+refused as out of space; the two 100 GiB ways are capacity-only, each refusing its first object as
+out of space, unreadable and unlisted. The first 100 GiB native run was stopped by the 30 GiB floor
+after 11.1 GB of transient writes past its volumes; run again with the reserve raised by that
+measured excursion to 51 GiB, its free space traced every 10 s, its least was 44.28 GiB. Every one
+of the 22 slots now has its result: 15 readback cases and 7 capacity-only results
+([measurements](measurements/2026-10-28-transfer-scale.md)).
 The box's earlier `0100ddd8` 100k set ended exit 0 after 40,804 s: all 100,000 objects acknowledged,
 99,998 distinct-node blocks, 600,000 exact native reads after kills, no retries, refusals, wrong
 or missing objects, and all controls caught. It is older-build evidence; the fresh 100k result
@@ -912,8 +922,22 @@ gateway pinned before the founders start (`mantle init gateway`); each founder's
 Secret's value (`mantle pack`), installed owner-only by an init container (`mantle install`); and
 the transfer harness on a cell running elsewhere (`mantle bench transfer --cell`, `--disrupt`),
 every acknowledged object read back through each node after a founder's pod is deleted mid-transfer.
-Its proof is the CI job `kind-cell` (`scripts/check-chart.sh`, `scripts/kind-cell.sh`): a kind
-cluster of three workers running the harness's CI scale from a Job; not yet run.
+Its proof is the CI job `kind-cell` (`scripts/check-chart.sh`, `scripts/kind-cell.sh`), first green
+in run 41738909698 on `bda7218c` (2026-11-03): helm lint and the golden render under helm v4.3.0;
+in a kind cluster of three workers the cell elected with each founder on a kind node of its own and
+every founder ready within 65 s of the install; the harness's CI scale from a Job, founder pod mantle-1
+deleted halfway through the small set's native puts:
+
+| Case | Objects | Bytes acknowledged | Refused | Wrong | Missing | Each block's chunks on distinct nodes | Read through each node after |
+|---|---|---|---|---|---|---|---|
+| small 1000, native | 500 | 17,227,651 | 240 `SlowDown`, while a third of the cell was gone | 0 | 0 | 759 blocks of 760 objects: yes | 2,280 reads, 0 wrong, 0 missing |
+| small 1000, http (boto3, TLS) | 500 | 31,892,035 | 0 | 0 | 0 | (the set's) | (the set's) |
+| large 20 MiB, each of the four ways | 4 | 83,886,080 | 0 | 0 | 0 | 18 blocks of 4 objects: yes | 12 reads, 0 wrong, 0 missing |
+
+Every control was caught (a byte inverted, a chunk moved onto another's node, a key never put), and
+the large objects were listed by both doors. The localkind half (plan step 12: its pipeline, its
+Argo CD app, the cell's one-time init and the scale run with Chaos Mesh) is written on localkind's
+`mantle` branch and waits for this Mac's localkind platform, absent since 2026-10-22.
 
 ## Goal stack checked, 2026-11-01
 

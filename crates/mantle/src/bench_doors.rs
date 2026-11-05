@@ -46,7 +46,7 @@ use std::time::Instant;
 
 use hyper_measure::alloc::{self, Counts};
 use hyper_measure::open_loop::Arrivals;
-use hyper_measure::quantile::{Level, samples_for};
+use hyper_measure::quantile::{Level, ranks, samples_for};
 use hyper_measure::usage::{self, Usage};
 use hyper_rt::combine::TaskSet;
 use hyper_rt::futures::{now_ns, sleep};
@@ -1765,6 +1765,30 @@ fn quantile(latency: &Histogram, level: Level, ppm: u32) -> String {
     }
 }
 
+/// The median's 95% order-statistic interval in microseconds, its two ends (Le Boudec, Theorem
+/// 2.1; `quantile::ranks`), each read from the histogram at its rank; a dash for an end the
+/// samples do not reach.
+fn median_interval(latency: &Histogram) -> String {
+    let n = latency.count();
+    let at = |rank: Option<usize>| {
+        let rank = u64::try_from(rank?).ok()?;
+        let ppm = u32::try_from(rank.checked_mul(1_000_000)?.div_ceil(n.max(1))).ok()?;
+        Some(micros(latency.quantile(ppm)))
+    };
+    match usize::try_from(n)
+        .ok()
+        .zip(coverage())
+        .and_then(|(n, c)| ranks(n, Level::P50, c).ok())
+    {
+        Some(r) => format!(
+            "{} {}",
+            at(r.lower).unwrap_or_else(|| "-".to_owned()),
+            at(r.upper).unwrap_or_else(|| "-".to_owned())
+        ),
+        None => "- -".to_owned(),
+    }
+}
+
 /// A size as a label: 8MiB, 64KiB, 65535B.
 fn label(size: u64) -> String {
     crate::display::size(usize::try_from(size).unwrap_or(usize::MAX)).replace(' ', "")
@@ -2049,7 +2073,7 @@ impl<'o> Bench<'o> {
             out,
             "doors {} {} {} {} clients {} elapsed_ms {} ops {ops} allocs/op {} reallocs/op {} moved/op {} bytes/op {} peak_live/request {} peak_live/connection {} \
              client_allocs/op {} client_bytes/op {} minor_faults/op {} major_faults/op {} user_ns/op {} system_ns/op {} instructions/op {} cycles/op {} switches/op {} \
-             wire_bytes/op {} datagrams/op - latency_us p50 {} p99 {} p99.9 {} p99.99 {} max {} generator_cpu_ns/op {} lateness_us p99 {} again {} failed {}",
+             wire_bytes/op {} datagrams/op - latency_us p50 {} p50_95 {} p99 {} p99.9 {} p99.99 {} max {} generator_cpu_ns/op {} lateness_us p99 {} again {} failed {}",
             self.named(m.door),
             m.kind.name(),
             m.size,
@@ -2076,6 +2100,7 @@ impl<'o> Bench<'o> {
             per(grew(|c| c.switches), ops),
             per(m.wire.map(|w| w as f64), ops),
             quantile(&t.latency, Level::P50, 500_000),
+            median_interval(&t.latency),
             quantile(&t.latency, Level::P99, 990_000),
             quantile(&t.latency, Level::P999, 999_000),
             quantile(&t.latency, Level::P9999, 999_900),

@@ -59,6 +59,8 @@ mantle-s3 = { path = "../s3" }
 # with its process's allocations and `mantle bench doors` counts its own: a diagnostic, off by
 # default and never in a timed build, which allocates through the system allocator.
 count-allocs = []
+# DIAGNOSTIC, branch diag-doors only: every allocation's call stack, window by window.
+diag-stacks = ["count-allocs"]
 
 [dev-dependencies]
 # The real-process test of `mantle node` (tests/node.rs): the client's transport, the range's

@@ -40,9 +40,14 @@ mod transfer;
 // The allocation counts of `mantle serve`'s `counts` and of `mantle bench doors` are a diagnostic:
 // compiled in only with the `count-allocs` feature, so a timed build allocates through the system
 // allocator with nothing counted.
-#[cfg(feature = "count-allocs")]
+#[cfg(all(feature = "count-allocs", not(feature = "diag-stacks")))]
 #[global_allocator]
 static ALLOCATOR: hyper_measure::alloc::Counting = hyper_measure::alloc::Counting;
+#[cfg(feature = "diag-stacks")]
+mod diag_stacks;
+#[cfg(feature = "diag-stacks")]
+#[global_allocator]
+static ALLOCATOR: diag_stacks::Stacks = diag_stacks::Stacks;
 
 #[derive(Parser)]
 #[command(
@@ -724,6 +729,8 @@ fn object_command(command: &Command) -> Option<Result<client::Command, String>> 
 }
 
 fn main() -> ExitCode {
+    #[cfg(feature = "diag-stacks")]
+    diag_stacks::arm();
     let cli = Cli::parse();
     // A node writes its lines through the runtime's own writer thread: this thread holds no
     // lock on standard output for it.
@@ -732,7 +739,8 @@ fn main() -> ExitCode {
             return exit(mantle_node::process::run(config).map_err(|e| e.to_string()));
         }
         Command::Serve { config } => {
-            if cfg!(feature = "count-allocs") {
+            // DIAGNOSTIC: a diag-stacks build began its process count in `diag_stacks::arm`, under its gate.
+            if cfg!(feature = "count-allocs") && !cfg!(feature = "diag-stacks") {
                 hyper_measure::alloc::begin_process();
             }
             mantle_node::process::answer_counts(bench_doors::counts_line);

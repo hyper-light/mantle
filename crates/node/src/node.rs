@@ -1416,6 +1416,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Err(NodeError::Task);
         }
         self.wait().await?;
+        // DIAGNOSTIC (diag-doors): the turn's start, its phases and its end, each turn its id.
+        let diag = crate::diag_trace::id();
+        crate::diag_trace::ev(diag, crate::diag_trace::T_BEGIN, if diag > 0 { crate::diag_trace::cpu() } else { 0 });
         self.liveness_written()?;
         let now = hyper_rt::futures::now_ns();
         let emptied = self.drain_plane()?;
@@ -1424,6 +1427,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             self.liveness.poll(now, &mut self.asked);
         }
         self.act_on_liveness()?;
+        crate::diag_trace::ev(diag, crate::diag_trace::T_PHASE, 1);
         while let Some(event) = self.driver.endpoint().poll_event() {
             self.events.push(event);
         }
@@ -1431,7 +1435,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         for event in std::mem::take(&mut self.events) {
             self.on_event(event, now)?;
         }
+        crate::diag_trace::ev(diag, crate::diag_trace::T_PHASE, 2);
         self.take_stored().await?;
+        crate::diag_trace::ev(diag, crate::diag_trace::T_PHASE, 3);
         self.vouch_held(now);
         self.dial(now);
         if std::mem::take(&mut self.liveness_moved) {
@@ -1439,14 +1445,20 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         self.schedule_due(now);
         self.drive(now)?;
+        crate::diag_trace::ev(diag, crate::diag_trace::T_PHASE, 4);
         self.take_door();
+        crate::diag_trace::ev(diag, crate::diag_trace::T_PHASE, 5);
         self.step_host()?;
+        crate::diag_trace::ev(diag, crate::diag_trace::T_PHASE, 6);
         self.step_asks(now)?;
+        crate::diag_trace::ev(diag, crate::diag_trace::T_PHASE, 7);
         self.step_reads(now)?;
+        crate::diag_trace::ev(diag, crate::diag_trace::T_PHASE, 8);
         self.step_replacements();
         self.step_stop()?;
         self.send_plane();
         self.driver.flush()?;
+        crate::diag_trace::ev(diag, crate::diag_trace::T_END, if diag > 0 { crate::diag_trace::cpu() } else { 0 });
         Ok(())
     }
 

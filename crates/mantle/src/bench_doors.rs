@@ -880,7 +880,12 @@ async fn client(mut conn: Conn, work: Rc<Work>, shared: Rc<RefCell<Shared>>) {
             break;
         }
         let started = now_ns();
+        // DIAGNOSTIC (diag-doors): the request's intended start, send and end on the stall trace.
+        let did = mantle_node::diag_trace::id();
+        mantle_node::diag_trace::ev(did, mantle_node::diag_trace::C_SEND, started.saturating_sub(intended));
+        mantle_node::diag_trace::set_current(did);
         let came = work.run(&mut conn, j).await;
+        mantle_node::diag_trace::ev(did, mantle_node::diag_trace::C_DONE, 0);
         let took = now_ns().saturating_sub(intended);
         let stop = harness(|| {
             let mut shared = shared.borrow_mut();
@@ -1008,6 +1013,7 @@ impl Work {
         let Some((i, key, length)) = self.key(j)? else {
             return Ok(Came::Done);
         };
+        mantle_node::diag_trace::key(mantle_node::diag_trace::current(), &format!("{}:{}", self.door.name(), self.kind.name()), &key);
         let object = harness(|| self.generator.object(&key)).map_err(failed)?;
         let id = mantle_client::identity().map_err(failed)?;
         let mut again = 0u32;
@@ -1731,6 +1737,28 @@ struct Bench<'o> {
     ops: u64,
     failures: u64,
     phases: u64,
+    /// DIAGNOSTIC (diag-doors): counts asked of each server, so the k-th answer closes its window k.
+    asked: [u64; cell::FOUNDERS],
+    /// DIAGNOSTIC: the role of the step under way: plain, warm or measured.
+    role: &'static str,
+    /// DIAGNOSTIC: the last step's elapsed time.
+    last_elapsed: u64,
+}
+
+/// DIAGNOSTIC: whether a phase runs as a warm-up step, an idle window as long, and a measured step.
+fn diag_steady() -> bool {
+    std::env::var_os("MANTLE_DIAG_STEADY").is_some()
+}
+
+/// DIAGNOSTIC: runs `$MANTLE_DIAG_HOOK what label pids...` and waits for it.
+fn diag_hook(what: &str, label: &str, pids: &[u32]) {
+    if let Some(hook) = std::env::var_os("MANTLE_DIAG_HOOK") {
+        let _ = std::process::Command::new(hook)
+            .arg(what)
+            .arg(label)
+            .args(pids.iter().map(|p| p.to_string()))
+            .status();
+    }
 }
 
 /// The servers' account between two reads: each one's counts as it answered, and what its OS
@@ -1820,6 +1848,9 @@ impl<'o> Bench<'o> {
             (Some(cell), _) => {
                 for at in 0..cell::FOUNDERS {
                     counts.push(cell.counts(at).map_err(failed)?);
+                    if let Some(a) = self.asked.get_mut(at) {
+                        *a = a.saturating_add(1);
+                    }
                     usage.push(cell.pid(at).and_then(|pid| usage::of(pid).ok()));
                 }
             }
@@ -1973,6 +2004,11 @@ impl<'o> Bench<'o> {
         } else {
             None
         };
+        let diag_label = format!("{}:{}:{}:{}", self.role, work.door.name(), work.kind.name(), size);
+        let pids: Vec<u32> = self.pids();
+        diag_hook("begin", &diag_label, &pids);
+        #[cfg(feature = "diag-stacks")]
+        crate::diag_stacks::switch(&format!("between:{diag_label}"));
         let began = Instant::now();
         let cpu = drive::cpu();
         alloc::begin();
@@ -1982,6 +2018,9 @@ impl<'o> Bench<'o> {
             (self.options.load, seed, from, end),
         ));
         let total = alloc::end();
+        #[cfg(feature = "diag-stacks")]
+        crate::diag_stacks::switch(&diag_label);
+        diag_hook("end", &diag_label, &pids);
         let aside = alloc::read_aside();
         let generator_ns =
             u64::try_from(drive::cpu().saturating_sub(cpu).as_nanos()).unwrap_or(u64::MAX);
@@ -1989,6 +2028,9 @@ impl<'o> Bench<'o> {
         let perf = perf.map(Perf::end).transpose()?;
         let (conns, tally) = ran.map_err(|e| failed(format!("{e:?}")))??;
         let after = self.servers()?;
+        self.last_elapsed = elapsed_ns;
+        mantle_node::diag_trace::dump(&diag_label);
+        self.diag_windows(out, &diag_label, elapsed_ns, tally.ops)?;
         let wire = conns
             .iter()
             .map(|c| if let Conn::Http(h) = c { h.wire } else { 0 })
@@ -2036,6 +2078,52 @@ impl<'o> Bench<'o> {
         };
         self.line(out, &measured, (&before, &after))?;
         Ok((ops, rate))
+    }
+
+    /// DIAGNOSTIC: a phase's operations `from..end` as one step, or under `MANTLE_DIAG_STEADY` as
+    /// a warm-up step of the first half, an idle window as long, and the measured second half.
+    fn diag_split(
+        &mut self,
+        out: &mut impl Write,
+        work: &Rc<Work>,
+        (size, clients): (&str, usize),
+        (from, end): (u64, u64),
+    ) -> Result<(), Error> {
+        if !diag_steady() || end.saturating_sub(from) < 2 {
+            self.step(out, work, (size, clients), (from, end))?;
+            return Ok(());
+        }
+        let mid = from + (end - from) / 2;
+        self.role = "warm";
+        self.step(out, work, (size, clients), (from, mid))?;
+        let label = format!("idle:{}:{}:{}", work.door.name(), work.kind.name(), size);
+        let pids: Vec<u32> = self.pids();
+        let ns = self.last_elapsed;
+        diag_hook("begin", &label, &pids);
+        let began = Instant::now();
+        self.rt.block_on(sleep(ns)).map_err(|e| failed(format!("{e:?}")))?.map_err(|e| failed(format!("{e:?}")))?;
+        let elapsed = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        diag_hook("end", &label, &pids);
+        self.servers()?;
+        self.diag_windows(out, &label, elapsed, 0)?;
+        self.role = "measured";
+        let ran = self.step(out, work, (size, clients), (mid, end));
+        self.role = "plain";
+        ran.map(|_| ())
+    }
+
+    /// DIAGNOSTIC: the window each server just closed, by its pid and number.
+    fn diag_windows(&self, out: &mut impl Write, label: &str, elapsed_ns: u64, ops: u64) -> Result<(), Error> {
+        for at in 0..cell::FOUNDERS {
+            let window = self.asked.get(at).copied().unwrap_or(0).saturating_sub(1);
+            writeln!(
+                out,
+                "diag window {label} server {at} pid {} window {window} elapsed_ns {elapsed_ns} ops {ops} harness_pid {}",
+                self.cell.as_ref().and_then(|c| c.pid(at)).unwrap_or(0),
+                std::process::id()
+            )?;
+        }
+        Ok(())
     }
 
     fn line(
@@ -2151,7 +2239,7 @@ impl<'o> Bench<'o> {
         let budget = self.clients(work.door);
         if let Load::Open(_) = self.options.load {
             let end = from.saturating_add(n).min(end);
-            self.step(out, work, (size, budget), (from, end))?;
+            self.diag_split(out, work, (size, budget), (from, end))?;
             return Ok(end);
         }
         let (mut at, mut clients, mut best) = (from, 1usize, (1usize, 0.0f64));
@@ -2393,7 +2481,7 @@ impl<'o> Bench<'o> {
                         .checked_div(u64::from(PAGE))
                         .unwrap_or(0)
                         .saturating_add(1);
-                    self.step(out, &work, (&name, 1), (0, pages))?;
+                    self.diag_split(out, &work, (&name, 1), (0, pages))?;
                     continue;
                 }
                 // Each door's half of the set, every object of it: open loop in one step, closed
@@ -2516,6 +2604,7 @@ fn runtime(conns: usize) -> Result<LocalRuntime, Error> {
 /// counting afresh from there (a few events another thread makes between the read and the restart
 /// are counted in neither window); in any build, its faults and context switches since it began.
 pub fn counts_line() -> String {
+    mantle_node::diag_trace::dump("counts");
     let faults = hyper_measure::faults::read().ok();
     let minor = faults
         .map(|f| f.minor.to_string())
@@ -2528,8 +2617,14 @@ pub fn counts_line() -> String {
         .map(|s| s.to_string())
         .unwrap_or_else(|_| "-".to_owned());
     let counted = if cfg!(feature = "count-allocs") {
-        let c = alloc::read_process();
-        alloc::begin_process();
+        #[cfg(feature = "diag-stacks")]
+        let c = crate::diag_stacks::switch("counts");
+        #[cfg(not(feature = "diag-stacks"))]
+        let c = {
+            let c = alloc::read_process();
+            alloc::begin_process();
+            c
+        };
         format!(
             "counted allocs {} reallocs {} moved {} bytes {} live {} peak {}",
             c.allocations, c.reallocations, c.moved, c.bytes, c.live, c.peak
@@ -2632,6 +2727,9 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
         ops: 0,
         failures: 0,
         phases: 0,
+        asked: [0; cell::FOUNDERS],
+        role: "plain",
+        last_elapsed: 0,
     };
     bench.create()?;
     let doors = bench.doors();
@@ -2640,7 +2738,7 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
             bench.sized(out, door, size)?;
         }
     }
-    for &count in &options.objects {
+    for &count in options.objects.iter().filter(|&&c| c > 0) {
         bench.set(out, count)?;
     }
     let mut caught = 0u32;
@@ -2648,7 +2746,9 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
         caught = caught.saturating_add(bench.controls(out, door)?);
     }
     for &door in doors {
-        bench.slope(out, door)?;
+        if !diag_steady() {
+            bench.slope(out, door)?;
+        }
     }
     writeln!(
         out,

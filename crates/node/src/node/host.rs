@@ -103,6 +103,8 @@ pub(crate) struct Job {
     /// When its work last moved: begun, an ask of its own answered, a piece of a chunk it reads
     /// or sends.
     moved_ns: u64,
+    /// DIAGNOSTIC (diag-doors): the stall trace's id.
+    diag: u64,
 }
 
 impl Job {
@@ -632,6 +634,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Work::Fields(head, Vec::with_capacity(fields))
             }
         };
+        let diag = crate::diag_trace::id();
+        crate::diag_trace::ev(diag, crate::diag_trace::N_ARRIVED, self.jobs.len() as u64);
         self.jobs.push(Job {
             door: Door::Exchange(exchange),
             principal,
@@ -639,6 +643,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             pending: Vec::new(),
             deadline_ns,
             moved_ns: now,
+            diag,
         });
     }
 
@@ -650,7 +655,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             principal,
             body,
             reply,
+            diag,
         } = request;
+        crate::diag_trace::ev(diag, crate::diag_trace::J_TAKEN, self.jobs.len() as u64);
         let work = match self.gateway.as_ref() {
             None => Work::Draining(Box::new(Reply::status(Status::Failed))),
             Some(g) if self.stopping() || self.jobs.len() >= g.objects => {
@@ -675,6 +682,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             // S3 states no patience: its stock clients' is the bound (research/77 D2).
             deadline_ns: None,
             moved_ns: hyper_rt::futures::now_ns(),
+            diag,
         });
     }
 
@@ -712,6 +720,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         let carry = fields.split_off(wanted.min(fields.len()));
         let op = head.op(fields);
+        if let (Some(job), Ok(op)) = (self.jobs.get(at), op.as_ref()) {
+            crate::diag_trace::ev(job.diag, crate::diag_trace::N_DECODED, 0);
+            crate::diag_trace::op_key(job.diag, op);
+        }
         let block = op.as_ref().ok().and_then(|op| self.open_block(op));
         if let Some(job) = self.jobs.get_mut(at) {
             job.work = match op {
@@ -816,6 +828,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if over {
                 // What it still waits on is let go: an ended get's chunks still out, say.
                 let job = self.jobs.swap_remove(at);
+                crate::diag_trace::ev(job.diag, crate::diag_trace::J_OVER, 0);
                 self.abandoned
                     .extend(job.pending.into_iter().map(|(pending, _)| pending));
             } else {
@@ -904,6 +917,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Ok(());
         }
         let mut answered: Vec<(Option<u64>, Outcome)> = Vec::new();
+        let diag = job.diag;
         job.pending.retain(|(pending, request)| {
             let outcome = match pending {
                 Pending::Command(ask) => {
@@ -914,6 +928,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             };
             match outcome {
                 Some(outcome) => {
+                    crate::diag_trace::ev(diag, crate::diag_trace::J_DONE, diag_kind(pending));
                     answered.push((*request, outcome));
                     false
                 }
@@ -1268,6 +1283,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         match asked {
             Ok(pending) => {
                 if let Some(job) = self.jobs.get_mut(at) {
+                    crate::diag_trace::ev(job.diag, crate::diag_trace::J_ASK, diag_kind(&pending));
                     job.pending.push((pending, request));
                 }
                 Ok(false)
@@ -1865,6 +1881,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         match asked {
             Ok(pending) => {
                 if let Some(job) = self.jobs.get_mut(at) {
+                    crate::diag_trace::ev(job.diag, crate::diag_trace::J_ASK, diag_kind(&pending));
                     job.pending.push((pending, Some(id)));
                 }
                 Ok(None)
@@ -1901,11 +1918,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(Job {
             work: Work::Get(getting),
             door,
+            diag,
             ..
         }) = self.jobs.get_mut(at)
         else {
             return Ok(());
         };
+        let diag = *diag;
         let mut reply = facts(Status::Done, order, &version);
         let current = if version.marker {
             Current::DeleteMarker
@@ -1959,6 +1978,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Door::Exchange(exchange) => *exchange,
             // The reply goes first, its bytes after it as the driver gives them (`write_get`).
             Door::Local(local) => {
+                crate::diag_trace::ev(diag, crate::diag_trace::J_REPLY, 1);
                 getting.total = length;
                 if local.offer(door::Answer::Head(Box::new(reply))) == Sent::Gone {
                     return self.fail_job(at, Status::Failed);
@@ -1975,6 +1995,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .saturating_add(length);
         getting.total = total;
         getting.out = Some((Bytes::from(fields), 0));
+        crate::diag_trace::ev(diag, crate::diag_trace::J_REPLY, 1);
         match self.driver.endpoint().reply(exchange, &head, Some(total)) {
             Ok(()) => Ok(()),
             // Its asker is gone: the job ends with its exchange.
@@ -2198,6 +2219,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         match asked {
             Ok(pending) => {
                 if let Some(job) = self.jobs.get_mut(at) {
+                    crate::diag_trace::ev(job.diag, crate::diag_trace::J_ASK, diag_kind(&pending));
                     job.pending.push((pending, Some(id)));
                 }
                 Ok(None)
@@ -2574,6 +2596,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         match asked {
             Ok(pending) => {
                 if let Some(job) = self.jobs.get_mut(at) {
+                    crate::diag_trace::ev(job.diag, crate::diag_trace::J_ASK, diag_kind(&pending));
                     job.pending.push((pending, Some(id)));
                 }
                 Ok(None)
@@ -2800,6 +2823,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             // What is left of the body is the listener's to read or drop (node.md §4.5): the reply
             // and its end go now.
             Door::Local(_) => {
+                crate::diag_trace::ev(job.diag, crate::diag_trace::J_REPLY, 0);
                 let Work::Draining(reply) =
                     std::mem::replace(&mut job.work, Work::Answering(VecDeque::new()))
                 else {
@@ -2846,6 +2870,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if endpoint.reply(exchange, &head, Some(length)).is_err() {
             return Ok(true);
         }
+        if let Some(job) = self.jobs.get(at) {
+            crate::diag_trace::ev(job.diag, crate::diag_trace::J_REPLY, 0);
+        }
         if let Some(job) = self.jobs.get_mut(at) {
             job.work = Work::Replying(fields, 0);
         }
@@ -2880,6 +2907,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
         }
         endpoint.end(exchange);
+        if let Some(job) = self.jobs.get(at) {
+            crate::diag_trace::ev(job.diag, crate::diag_trace::J_END, 0);
+        }
         Ok(true)
     }
 
@@ -3562,5 +3592,14 @@ mod tests {
                 "{algorithm:?} full {full}"
             );
         }
+    }
+}
+
+/// DIAGNOSTIC (diag-doors): an ask's kind for the stall trace: 0 a command, 1 a read, 2 a chunk.
+fn diag_kind(pending: &Pending) -> u64 {
+    match pending {
+        Pending::Command(_) => 0,
+        Pending::Read(_) => 1,
+        Pending::Chunk(_) => 2,
     }
 }

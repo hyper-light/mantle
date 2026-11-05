@@ -125,6 +125,8 @@ struct Connection {
     endpoint: &'static Endpoint,
     door: Submitter,
     admitted: Admitted,
+    /// DIAGNOSTIC (diag-doors): the stall trace's id of the request under way.
+    diag: u64,
 }
 
 /// Serves `io`'s requests until the connection ends, then gives its descriptor back and its slot,
@@ -146,6 +148,7 @@ pub(super) async fn serve(
         endpoint,
         door,
         admitted,
+        diag: 0,
     };
     let ended = connection.requests().await;
     connection.end(ended).await;
@@ -217,6 +220,8 @@ impl Connection {
                     }
                 }
             };
+            self.diag = crate::diag_trace::id();
+            crate::diag_trace::ev(self.diag, crate::diag_trace::H_HEAD, 0);
             // The head is kept apart, so the body after it can be read on.
             octets.clear();
             octets.extend_from_slice(self.input.unread().get(..head.len()).unwrap_or_default());
@@ -307,6 +312,7 @@ impl Connection {
             principal,
             plan,
         } = asked;
+        crate::diag_trace::ev(self.diag, crate::diag_trace::H_AUTH, 0);
         let query = Query::parse(parts.query);
         let echo = Echo {
             route: &route,
@@ -426,11 +432,13 @@ impl Connection {
                 .refuse(&slow(), resource, ids, (version, head), unread)
                 .await;
         };
+        crate::diag_trace::op_key(self.diag, &op);
         let request = door::Request {
             op,
             principal,
             body: taken,
             reply: answers,
+            diag: self.diag,
         };
         // A door at its bound refuses before any of the body is read (node.md §4.5).
         if self.door.submit(request).is_err() {
@@ -438,6 +446,7 @@ impl Connection {
                 .refuse(&slow(), resource, ids, (version, head), unread)
                 .await;
         }
+        crate::diag_trace::ev(self.diag, crate::diag_trace::H_SUBMIT, 0);
         let mut body = body;
         let mut refused: Option<Refused> = None;
         loop {
@@ -449,10 +458,13 @@ impl Connection {
                     let Some((upload, _)) = body.take() else {
                         continue;
                     };
+                    crate::diag_trace::ev(self.diag, crate::diag_trace::H_READY, 0);
                     if continues && self.io.write(write::CONTINUE).await.is_err() {
                         return Err(());
                     }
-                    match self.stream(framing, upload, &pieces).await {
+                    let streamed = self.stream(framing, upload, &pieces).await;
+                    crate::diag_trace::ev(self.diag, crate::diag_trace::H_BODY_SENT, 0);
+                    match streamed {
                         Ok(()) => unread = false,
                         Err(Stopped::Refused(why)) => refused = Some(why),
                         // The host ended the job: its reply follows, and the body's rest is unread.
@@ -461,6 +473,7 @@ impl Connection {
                     }
                 }
                 Ok(Answer::Head(reply)) => {
+                    crate::diag_trace::ev(self.diag, crate::diag_trace::H_REPLY, 0);
                     if let Some(why) = refused {
                         // The listener refused the body as it came: its answer, not the host's.
                         return self
@@ -472,9 +485,11 @@ impl Connection {
                         Err(why) => respond::error(&why, resource, ids, head),
                     };
                     self.respond(&response, version, unread).await?;
+                    crate::diag_trace::ev(self.diag, crate::diag_trace::H_RESPONDED, 0);
                     if response.object && !head {
                         self.object(&mut replies, response.length).await?;
                     }
+                    crate::diag_trace::ev(self.diag, crate::diag_trace::H_END, 0);
                     return Ok(!unread);
                 }
                 // A reply's end, or bytes, with no head before them: the host's word is not

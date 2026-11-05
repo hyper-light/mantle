@@ -211,7 +211,10 @@ impl Listener {
     pub async fn serve(&self) -> ListenError {
         loop {
             match self.socket.accept().await {
-                Ok(stream) => self.start(stream),
+                Ok(stream) => {
+                    crate::diag_trace::ev(0, crate::diag_trace::ACCEPT, 0);
+                    self.start(stream)
+                }
                 Err(e) if exhausted(&e) && (self.budget.open() > 0 || self.refusing.open() > 0) => {
                     if let Err(e) = self.endpoint.closed.notified().await {
                         return ListenError::Socket(e);

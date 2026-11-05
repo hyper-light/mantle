@@ -26,6 +26,8 @@ pub struct Request {
     pub body: ChannelReceiver<Piece>,
     /// The reply, as the host writes it.
     pub reply: Sender<Answer>,
+    /// DIAGNOSTIC (diag-doors): the stall trace's id.
+    pub diag: u64,
 }
 
 /// A piece of a request's body.

@@ -230,6 +230,10 @@ pub fn aside() {
 pub fn back() {
     let _ = SET_ASIDE.try_with(|aside| aside.set(false));
 }
+/// DIAGNOSTIC (branch diag-doors): whether this thread's events are set aside now.
+pub fn is_set_aside() -> bool {
+    SET_ASIDE.try_with(Cell::get).unwrap_or(false)
+}
 /// What was set aside so far in this count.
 pub fn read_aside() -> Counts {
     ASIDE.try_with(Cell::get).unwrap_or(Counts::ZERO)

@@ -33,6 +33,7 @@ pub mod client;
 pub mod command;
 pub mod derive;
 pub mod directory;
+pub mod diag_trace;
 pub mod door;
 pub mod frame;
 pub mod history;

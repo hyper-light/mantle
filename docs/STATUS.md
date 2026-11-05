@@ -1,10 +1,43 @@
 # Status
 
-Updated 2026-10-01. A component is complete when its tests pass on all six CI targets
-(Linux, macOS and Windows on x86_64 and arm64) and the evidence listed for it has been
+Updated 2026-11-05. A component is complete when its tests pass on the supported CI targets
+(Linux and Windows on x86_64 and arm64, macOS on arm64) and the evidence listed for it has been
 recorded.
 
 ## Implemented
+
+**The data storage/transfer layer, landed 2026-11-05** (the plan "Data storage/transfer layer:
+S3 HTTP/1.1 and native QUIC doors, a client crate, scale on this Mac and the box, a KIND cell").
+Data crosses hyper-quic between nodes, and every object enters through one of two doors and is read
+back through both:
+
+- *The S3 HTTP/1.1 door*: S3's object, bucket and multipart operations served by each node's
+  listener, on by default, over mantle's own I/O-free, bounded, fuzzed HTTP/1.1 codec
+  ([codec](measurements/2026-10-25-http-codec.md), [listener](measurements/2026-10-25-s3-listener.md)),
+  TLS off loopback with the endpoint's certificate and the cell's first access key from `mantle
+  init`, and the AWS CLI v2 and boto3 passing against a running cell on every supported CI target
+  (below, "S3 protocol").
+- *The native QUIC door*: the `mantle-client` crate and `mantle`'s object commands, for other
+  hyper-light projects, streaming any object in bounded memory, uploads of any size in runs the
+  node cuts, resumable (below, "Clients of mantle's own protocol"; gateway.md §6).
+- *Scale*: the transfer harness (`mantle bench transfer`,
+  [harness](measurements/2026-10-27-transfer-harness.md)) checks every byte against its generator
+  through both doors, every block's chunks on distinct nodes, every acknowledged object read back
+  after each founder is killed and started again, and a full cell's typed refusal. On this Mac and
+  the box (adacachy) all 22 host/case slots have their results
+  ([scale](measurements/2026-10-28-transfer-scale.md)): 15 with complete readback (the 1k, 10k and
+  100k sets on both, every 10 GiB way on both, and one whole 100 GiB object in native parts on this
+  Mac, run `mac-100G-native-parts-20261102-003931`) and 7 capacity-only, each refusing its first
+  object as out of space, unreadable and unlisted (the other 100 GiB ways).
+- *KIND*: the image and the chart, proven in CI's kind cluster (`kind-cell`), and localkind's
+  pipeline and Argo CD app deploying a cell of three into this Mac's Docker Desktop kind cluster,
+  where the scale step's tests passed, each founder's pod killed in turn by Chaos Mesh
+  ([KIND](measurements/2026-11-04-kind-cell.md); below, "A cell on Kubernetes").
+
+Open: a whole 100 GiB object by a streamed single upload, natively in runs or by the AWS CLI, has
+not been read back: one at three copies needs about 353 GiB free on one machine, and neither held it
+at its run; and a node's refusals for the length of a disruption in the kind cluster, ten minutes
+of them with every founder ready, are not yet traced.
 
 `mantle disk probe` reports what the operating system knows about the device that holds a
 directory and, with `--measure`, benchmarks the device. It is built on:

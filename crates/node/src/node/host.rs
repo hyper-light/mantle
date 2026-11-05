@@ -105,6 +105,9 @@ pub(crate) struct Parked {
     window: usize,
     deadline_ns: Option<u64>,
     until_ns: u64,
+    /// DIAGNOSTIC (diag-doors): the stall trace's id, given as it arrived.
+    #[cfg(feature = "diag-trace")]
+    diag: u64,
 }
 
 /// What the host waits on for an operation: a command, a read, or a chunk it asked.
@@ -141,6 +144,9 @@ pub(crate) struct Job {
     /// Its operation's label (`crate::labels::host`), once its operation is known: none while a
     /// native request's fields are read, or for one answered without its operation.
     label: Option<&'static Label>,
+    /// DIAGNOSTIC (diag-doors): the stall trace's id.
+    #[cfg(feature = "diag-trace")]
+    diag: u64,
 }
 
 impl Job {
@@ -1137,6 +1143,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Ok(head) => sized(self.gateway.as_ref(), &self.put_window, head.written()),
             Err(_) => (0, 0),
         };
+        // DIAGNOSTIC (diag-doors): the request arrived, before it is parked or started; its id
+        // rides with it while parked.
+        #[cfg(feature = "diag-trace")]
+        let diag = crate::diag_trace::id();
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::ev(diag, crate::diag_trace::N_ARRIVED, self.jobs.len() as u64);
         let parks = head.is_ok() && self.gateway.is_some() && !self.stopping();
         // Asked even behind parked requests: one the limit turns away tells it its clients ask
         // more than it admits.
@@ -1151,6 +1163,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 window,
                 deadline_ns,
                 until_ns: deadline_ns.unwrap_or_else(|| now.saturating_add(patience)),
+                #[cfg(feature = "diag-trace")]
+                diag,
             });
             return;
         }
@@ -1169,6 +1183,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             head,
             (deadline_ns, now, charge, window),
             slowed,
+            #[cfg(feature = "diag-trace")]
+            diag,
         );
     }
 
@@ -1193,6 +1209,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 return;
             }
             self.parked.pop_front();
+            // DIAGNOSTIC (diag-doors): taken from where it waited, the parked, into a job, as the
+            // S3 door's request is taken from the door (`take_local`).
+            #[cfg(feature = "diag-trace")]
+            crate::diag_trace::ev(
+                first.diag,
+                crate::diag_trace::J_TAKEN,
+                self.jobs.len() as u64,
+            );
             let head = first.head.ok_or(ObjectError::Fields(0));
             let slowed = if !over {
                 None
@@ -1207,6 +1231,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 head,
                 (first.deadline_ns, now, first.charge, first.window),
                 slowed,
+                #[cfg(feature = "diag-trace")]
+                first.diag,
             );
         }
     }
@@ -1239,6 +1265,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         head: Result<Head, ObjectError>,
         (deadline_ns, now, charge, window): (Option<u64>, u64, u64, usize),
         slowed: Option<door::Slowed>,
+        #[cfg(feature = "diag-trace")] diag: u64,
     ) {
         // A client's operations act for the account its certificate names; one whose
         // connections have all gone since asking is no longer known, and nothing is taken.
@@ -1278,6 +1305,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             charge,
             window,
             label: None,
+            #[cfg(feature = "diag-trace")]
+            diag,
         });
     }
 
@@ -1290,7 +1319,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             denied,
             body,
             reply,
+            #[cfg(feature = "diag-trace")]
+            diag,
         } = request;
+        // DIAGNOSTIC (diag-doors): taken from the door into a job.
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::ev(diag, crate::diag_trace::J_TAKEN, self.jobs.len() as u64);
         let now = hyper_rt::futures::now_ns();
         let mut admitted_ns = None;
         let (charge, window) = charged(self.gateway.as_ref(), &self.put_window, &op);
@@ -1337,6 +1371,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             charge,
             window,
             label,
+            #[cfg(feature = "diag-trace")]
+            diag,
         });
     }
 
@@ -1643,6 +1679,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         let carry = fields.split_off(wanted.min(fields.len()));
         let op = head.op(fields);
+        // DIAGNOSTIC (diag-doors): a native request's fields decoded into its operation.
+        #[cfg(feature = "diag-trace")]
+        if let Ok(op) = op.as_ref() {
+            crate::diag_trace::ev(job.diag, crate::diag_trace::N_DECODED, 0);
+            crate::diag_trace::op_key(job.diag, op);
+        }
         let admitted = job.charge;
         let block = op.as_ref().ok().and_then(|op| self.open_block(op));
         // A copy holds a get's window and a put's at once (`charged`), this job admitted at its
@@ -1804,6 +1846,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if over {
                 // What it still waits on is let go: an ended get's chunks still out, say.
                 let job = self.jobs.swap_remove(at);
+                // DIAGNOSTIC (diag-doors): the job over and gone.
+                #[cfg(feature = "diag-trace")]
+                crate::diag_trace::ev(job.diag, crate::diag_trace::J_OVER, 0);
                 self.ended(job.admitted_ns, job.charge);
                 self.abandoned
                     .extend(job.pending.into_iter().map(|(pending, _)| pending));
@@ -1895,6 +1940,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Ok(());
         }
         let mut answered: Vec<(Option<u64>, Outcome)> = Vec::new();
+        #[cfg(feature = "diag-trace")]
+        let diag = job.diag;
         job.pending.retain(|(pending, request)| {
             let outcome = match pending {
                 Pending::Command(ask) => {
@@ -1905,6 +1952,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             };
             match outcome {
                 Some(outcome) => {
+                    // DIAGNOSTIC (diag-doors): an ask of the job's answered.
+                    #[cfg(feature = "diag-trace")]
+                    crate::diag_trace::ev(diag, crate::diag_trace::J_DONE, diag_kind(pending));
                     answered.push((*request, outcome));
                     false
                 }
@@ -2308,6 +2358,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         match asked {
             Ok(pending) => {
                 if let Some(job) = self.jobs.get_mut(at) {
+                    // DIAGNOSTIC (diag-doors): the job asked, and waits on it.
+                    #[cfg(feature = "diag-trace")]
+                    crate::diag_trace::ev(job.diag, crate::diag_trace::J_ASK, diag_kind(&pending));
                     job.pending.push((pending, request));
                 }
                 Ok(false)
@@ -2912,6 +2965,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         match asked {
             Ok(pending) => {
                 if let Some(job) = self.jobs.get_mut(at) {
+                    // DIAGNOSTIC (diag-doors): the job asked, and waits on it.
+                    #[cfg(feature = "diag-trace")]
+                    crate::diag_trace::ev(job.diag, crate::diag_trace::J_ASK, diag_kind(&pending));
                     job.pending.push((pending, Some(kept)));
                 }
                 Ok(None)
@@ -2942,6 +2998,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         match asked {
             Ok(ask) => {
                 if let Some(job) = self.jobs.get_mut(at) {
+                    // DIAGNOSTIC (diag-doors): the job asked, and waits on it.
+                    #[cfg(feature = "diag-trace")]
+                    crate::diag_trace::ev(
+                        job.diag,
+                        crate::diag_trace::J_ASK,
+                        diag_kind(&Pending::Command(ask)),
+                    );
                     job.pending.push((Pending::Command(ask), Some(id)));
                 }
             }
@@ -3050,11 +3113,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(Job {
             work: Work::Get(getting),
             door,
+            #[cfg(feature = "diag-trace")]
+            diag,
             ..
         }) = self.jobs.get_mut(at)
         else {
             return Ok(Some(true));
         };
+        #[cfg(feature = "diag-trace")]
+        let diag = *diag;
         let Some(get) = getting.get.as_ref() else {
             return Ok(Some(false));
         };
@@ -3078,6 +3145,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Door::Exchange(exchange) => *exchange,
             // The reply goes first, its bytes after it as the driver gives them.
             Door::Local(local) => {
+                // DIAGNOSTIC (diag-doors): a get's reply head goes, now that its driver has the
+                // range's first bytes (it was sent from `current_read` before).
+                #[cfg(feature = "diag-trace")]
+                crate::diag_trace::ev(diag, crate::diag_trace::J_REPLY, 1);
                 if local.offer(door::Answer::Head(reply)) == Sent::Gone {
                     self.fail_job(at, Status::Failed)?;
                     return Ok(Some(false));
@@ -3095,6 +3166,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .saturating_add(length);
         getting.total = total;
         getting.out = Some((Bytes::from(fields), 0));
+        // DIAGNOSTIC (diag-doors): as the local door's above.
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::ev(diag, crate::diag_trace::J_REPLY, 1);
         match self.driver.endpoint().reply(exchange, &head, Some(total)) {
             Ok(()) => Ok(None),
             // Its asker is gone: the job ends with its exchange.
@@ -3339,6 +3413,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         match asked {
             Ok(pending) => {
                 if let Some(job) = self.jobs.get_mut(at) {
+                    // DIAGNOSTIC (diag-doors): the job asked, and waits on it.
+                    #[cfg(feature = "diag-trace")]
+                    crate::diag_trace::ev(job.diag, crate::diag_trace::J_ASK, diag_kind(&pending));
                     job.pending.push((pending, Some(kept)));
                 }
                 Ok(None)
@@ -3749,6 +3826,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         match asked {
             Ok(pending) => {
                 if let Some(job) = self.jobs.get_mut(at) {
+                    // DIAGNOSTIC (diag-doors): the job asked, and waits on it.
+                    #[cfg(feature = "diag-trace")]
+                    crate::diag_trace::ev(job.diag, crate::diag_trace::J_ASK, diag_kind(&pending));
                     job.pending.push((pending, Some(id)));
                 }
                 Ok(None)
@@ -3866,9 +3946,18 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     if let Some(Job {
                         work: Work::Deletes(deleting),
                         pending,
+                        #[cfg(feature = "diag-trace")]
+                        diag,
                         ..
                     }) = self.jobs.get_mut(at)
                     {
+                        // DIAGNOSTIC (diag-doors): the job asked, and waits on it.
+                        #[cfg(feature = "diag-trace")]
+                        crate::diag_trace::ev(
+                            *diag,
+                            crate::diag_trace::J_ASK,
+                            diag_kind(&Pending::Command(ask)),
+                        );
                         pending.push((
                             Pending::Command(ask),
                             Some(u64::try_from(index).unwrap_or(u64::MAX)),
@@ -4649,6 +4738,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             // What is left of the body is the listener's to read or drop (node.md §4.5): the reply
             // and its end go now.
             Door::Local(_) => {
+                // DIAGNOSTIC (diag-doors): a drained job's reply goes, a head or a slowing.
+                #[cfg(feature = "diag-trace")]
+                crate::diag_trace::ev(job.diag, crate::diag_trace::J_REPLY, 0);
                 let Work::Draining(reply) =
                     std::mem::replace(&mut job.work, Work::Answering(VecDeque::new()))
                 else {
@@ -4698,6 +4790,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if endpoint.reply(exchange, &head, Some(length)).is_err() {
             return Ok(true);
         }
+        // DIAGNOSTIC (diag-doors): a drained job's reply head sent.
+        #[cfg(feature = "diag-trace")]
+        if let Some(job) = self.jobs.get(at) {
+            crate::diag_trace::ev(job.diag, crate::diag_trace::J_REPLY, 0);
+        }
         // A native request answered `SlowDown`, counted for its cause as it goes: the node says
         // the counts in its lines, as the listener counts the S3 door's.
         if let Some(count) = slowed.and_then(|cause| self.slowed.get_mut(cause.index())) {
@@ -4737,6 +4834,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
         }
         endpoint.end(exchange);
+        // DIAGNOSTIC (diag-doors): the native exchange ended, its reply whole.
+        #[cfg(feature = "diag-trace")]
+        if let Some(job) = self.jobs.get(at) {
+            crate::diag_trace::ev(job.diag, crate::diag_trace::J_END, 0);
+        }
         Ok(true)
     }
 
@@ -5631,6 +5733,16 @@ fn get_answer(outcome: Outcome) -> get::Answer {
     }
 }
 
+/// DIAGNOSTIC (diag-doors): an ask's kind for the stall trace: 0 a command, 1 a read, 2 a chunk.
+#[cfg(feature = "diag-trace")]
+fn diag_kind(pending: &Pending) -> u64 {
+    match pending {
+        Pending::Command(_) => 0,
+        Pending::Read(_) => 1,
+        Pending::Chunk(_) => 2,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5966,6 +6078,8 @@ mod tests {
             charge: 0,
             window: 1,
             label: None,
+            #[cfg(feature = "diag-trace")]
+            diag: 0,
         };
         assert!(job.held());
         assert_eq!(job.bounded(9), Bounded::Held);

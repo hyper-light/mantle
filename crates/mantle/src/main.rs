@@ -44,10 +44,16 @@ mod transfer;
 // The allocation counts of `mantle serve`'s `counts` and of `mantle bench doors` are a diagnostic:
 // compiled in only with the `count-allocs` feature, so a timed build allocates through the system
 // allocator with nothing counted. The unit tests count too, so a test of what the bench's harness
-// allocates reads real counts in every build.
-#[cfg(any(test, feature = "count-allocs"))]
+// allocates reads real counts in every build. DIAGNOSTIC (diag-doors): a `diag-stacks` build
+// installs its recorder instead, which counts through `Counting`.
+#[cfg(all(any(test, feature = "count-allocs"), not(feature = "diag-stacks")))]
 #[global_allocator]
 static ALLOCATOR: hyper_measure::alloc::Counting = hyper_measure::alloc::Counting;
+#[cfg(feature = "diag-stacks")]
+mod diag_stacks;
+#[cfg(feature = "diag-stacks")]
+#[global_allocator]
+static ALLOCATOR: diag_stacks::Stacks = diag_stacks::Stacks;
 
 #[derive(Parser)]
 #[command(
@@ -1057,6 +1063,9 @@ fn object_command(command: &Command) -> Option<Result<client::Command, String>> 
 }
 
 fn main() -> ExitCode {
+    // DIAGNOSTIC (diag-doors): recording armed where MANTLE_DIAG_STACKS names a directory.
+    #[cfg(feature = "diag-stacks")]
+    diag_stacks::arm();
     let cli = Cli::parse();
     // A node writes its lines through the runtime's own writer thread: this thread holds no
     // lock on standard output for it.
@@ -1065,6 +1074,9 @@ fn main() -> ExitCode {
             return exit(mantle_node::process::run(config).map_err(|e| e.to_string()));
         }
         Command::Serve { config, leave } => {
+            // DIAGNOSTIC (diag-doors): a diag-stacks build began its process count in
+            // `diag_stacks::arm`, under its gate.
+            #[cfg(not(feature = "diag-stacks"))]
             if cfg!(feature = "count-allocs") {
                 hyper_measure::alloc::begin_process();
             }

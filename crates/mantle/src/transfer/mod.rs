@@ -178,6 +178,9 @@ pub struct Tally {
     pub refusals: Vec<(Status, u64)>,
     /// Puts refused as out of space: what a filling case puts until.
     pub full: u64,
+    /// Puts no node took, or whose answer the client did not get after asking again, while a
+    /// disruption had the cell short a node: acknowledged by nothing, as a refused put is.
+    pub lost: u64,
     /// Requests asked again, the same, after their answers were lost: an exchange the client gave
     /// up on before the node answered (gateway.md §2.1).
     pub again: u64,
@@ -203,6 +206,7 @@ impl Tally {
             refused: 0,
             refusals: Vec::new(),
             full: 0,
+            lost: 0,
             again: 0,
             wrong: 0,
             missing: 0,
@@ -236,6 +240,14 @@ impl Tally {
         }
     }
 
+    /// Counts a put after `took` nanoseconds that no node took, or whose answer the client did
+    /// not get after asking again, while a disruption had the cell short a node.
+    fn lost_put(&mut self, took: u64) {
+        self.put.record(took);
+        self.objects = self.objects.saturating_add(1);
+        self.lost = self.lost.saturating_add(1);
+    }
+
     /// Counts `again` requests asked again after their answers were lost.
     fn asked_again(&mut self, again: u32) {
         self.again = self.again.saturating_add(u64::from(again));
@@ -258,7 +270,8 @@ impl Tally {
     /// Every object put was read back through both doors, every byte the generator's, and every
     /// put acknowledged; but on a cell `short` a node for a while, a disruption's, those it refused
     /// `SlowDown`, as a cell refuses a block it cannot place on distinct nodes (gateway
-    /// `PutError::Unplaced`): such a put is acknowledged and read by nothing.
+    /// `PutError::Unplaced`), and those no node took or whose answer was lost, its nodes in turn
+    /// gone: such a put is acknowledged and read by nothing.
     pub fn exact(&self, short: bool) -> bool {
         let slowed = self
             .refusals
@@ -270,7 +283,7 @@ impl Tally {
         } else {
             self.refused
         };
-        refused == 0 && self.wrong == 0 && self.missing == 0
+        refused == 0 && (self.lost == 0 || short) && self.wrong == 0 && self.missing == 0
     }
 
     fn read(&mut self, came: Came) {
@@ -575,6 +588,14 @@ pub fn transfer(out: &mut impl Write, options: &Options) -> Result<bool, Transfe
                     out,
                     "  small {count} {door} refused with: {}",
                     said.join(", ")
+                )?;
+            }
+            if tally.lost > 0 {
+                writeln!(
+                    out,
+                    "  small {count} {door} lost: {} puts no node took, or whose answer was lost, \
+                     while the cell was short a node",
+                    tally.lost
                 )?;
             }
             exact &= tally.exact(short);
@@ -1023,8 +1044,23 @@ fn small(
             let name = format!("s{i}");
             let object = generator.object(&name)?;
             let began = Instant::now();
-            let (came, again) =
-                native::put(&mut writer, (&written, &name), &object, length).await?;
+            let put = native::put(&mut writer, (&written, &name), &object, length).await;
+            let (came, again) = match put {
+                Ok(put) => put,
+                // While the disruption has the cell short a node, its nodes in turn gone, a put no
+                // node took, or whose answer the client did not get after asking again, is
+                // acknowledged by nothing, as a refused one is; any other failure ends the run.
+                Err(
+                    mantle_client::ClientError::Untaken(_)
+                    | mantle_client::ClientError::Lost { .. },
+                ) if disruption.is_some() => {
+                    if let Some(tally) = tallies.get_mut(door(i)) {
+                        tally.lost_put(elapsed(began));
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
             put_came(
                 &mut tallies,
                 &mut oracle,
@@ -1180,6 +1216,12 @@ mod tests {
         assert!(refused.exact(true));
         assert!(!refused.put_came(1, Came::Refused(Status::Failed), 1));
         assert!(!refused.exact(true));
+        // A put no node took, or whose answer was lost, counts only on a cell short a node.
+        let mut lost = Tally::new();
+        lost.lost_put(1);
+        assert_eq!((lost.objects, lost.lost), (1, 1));
+        assert!(lost.exact(true));
+        assert!(!lost.exact(false));
     }
 
     /// Object `i`'s bit is the oracle's alone: set ones are held, the rest are not, past the

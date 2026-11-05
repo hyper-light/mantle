@@ -115,7 +115,10 @@ here `disrupt mantle-1 mantle` (`deploy/kind/disrupt.sh`): founder pod mantle-1 
 successor of the same name waited for until it is made and ready, each wait on its fact. The puts
 go on beside it, and its end, which must be success, is waited for before the set's S3 puts and
 every read. A cell short a node refuses a block it cannot place on distinct nodes `SlowDown`
-(gateway `PutError::Unplaced`): such a put is counted and acknowledged by nothing, and every put
-the cell acknowledged must read back exactly through every node after the disruption. The Job
+(gateway `PutError::Unplaced`), and while its nodes are gone in turn the native client may find no
+node to take a put in its attempts (`ClientError::Untaken`) or lose a put's answer
+(`ClientError::Lost`): each such put is counted and acknowledged by nothing, any other failure
+ends the run, and every put the cell acknowledged must read back exactly through every node after
+the disruption. The Job
 exits 0 only with every check exact; it first did in run 41738909698 (2026-11-03), its rows in
 STATUS.md.

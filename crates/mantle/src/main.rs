@@ -424,7 +424,8 @@ enum BenchCommand {
         /// words split at spaces, such as one that deletes a node's pod and waits until its
         /// successor is ready: the puts go on beside it, and its end, which must be success, is
         /// waited for before the set's other puts and every read; puts the cell refuses SlowDown
-        /// meanwhile, short a node, are counted and acknowledged by nothing.
+        /// meanwhile, short a node, and puts no node took or whose answer was lost, its nodes in
+        /// turn gone, are counted and acknowledged by nothing.
         #[arg(long, requires = "cell")]
         disrupt: Option<String>,
     },

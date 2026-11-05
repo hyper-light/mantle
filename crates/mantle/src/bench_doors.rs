@@ -25,15 +25,22 @@
 //!
 //! A measure this build or this OS does not give prints `-`: the allocators' counts outside a
 //! `count-allocs` build, instructions and cycles where the OS does not count them per process
-//! (Linux: `usage::of` reads none), a major fault count on Windows, and the native door's wire
-//! bytes and datagrams, which mantle-client does not say (its endpoint's counters are its own).
+//! (Linux: `usage::of` reads none; `--perf` counts them with `perf stat`, [`Perf`]), a major fault
+//! count on Windows, and the native door's wire bytes and datagrams, which mantle-client does not
+//! say (its endpoint's counters are its own).
 //! A quantile is a dash below the samples that resolve it at 95% (`quantile::samples_for`; §12's
 //! rounds).
+//!
+//! Against an `--endpoint`, an S3 server this program did not start, the HTTP door's phases,
+//! controls and slope run as they do against a cell, the server's faults, CPU and footprint read
+//! by the pids `--server-pid` names, its allocations unknown; a phase it refuses whole is reported
+//! excluded with its answer.
 
 use std::cell::RefCell;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -160,6 +167,37 @@ pub struct Options {
     pub bytes: u64,
     pub volume: u64,
     pub condition: String,
+    /// An S3 server outside this program the HTTP door's phases run against, instead of a cell.
+    pub endpoint: Option<Endpoint>,
+    /// Count the servers' instructions and cycles a phase with `perf stat` ([`Perf`]).
+    pub perf: bool,
+}
+
+/// An S3 server this program did not start (`--endpoint`): the HTTP door's phases, controls and
+/// slope run against it as against a cell's listeners, and its processes' faults, CPU and footprint
+/// are read by their pids. Its lines name the door `http@ARM`.
+pub struct Endpoint {
+    pub arm: String,
+    pub at: SocketAddr,
+    pub bucket: String,
+    pub id: String,
+    pub secret: String,
+    pub region: String,
+    pub pids: Vec<u32>,
+}
+
+/// `--endpoint`: `http://HOST:PORT`, the host a name or an address.
+pub fn endpoint_arg(text: &str) -> Result<SocketAddr, String> {
+    use std::net::ToSocketAddrs;
+    let authority = text
+        .strip_prefix("http://")
+        .ok_or_else(|| format!("{text} is not http://HOST:PORT"))?
+        .trim_end_matches('/');
+    authority
+        .to_socket_addrs()
+        .map_err(|e| format!("{authority}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("{authority} names no address"))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -226,6 +264,9 @@ impl Kind {
 enum Came {
     Done,
     Failed(String),
+    /// The server answered with a refusal (an HTTP status past 2xx), or an operation needed what a
+    /// refused one would have made: a failure, which against an endpoint may exclude its phase.
+    Refused(String),
     /// Refused `SlowDown` (503): asked again as the AWS SDKs ask a throttled request again.
     Slowed,
     /// Its exchange ended unanswered (`ClientError::Lost`): asked again with its identity, which
@@ -399,11 +440,12 @@ struct Http {
     signer: Rc<Signer>,
 }
 
-/// The cell's S3 key and region, which every request is signed with.
+/// The S3 key and region every request is signed with, and the bucket each names.
 struct Signer {
     id: String,
     secret: String,
     region: String,
+    bucket: String,
 }
 
 impl Signer {
@@ -420,6 +462,7 @@ impl Signer {
             id: value("aws_access_key_id").ok_or_else(|| failed("no access key id"))?,
             secret: value("aws_secret_access_key").ok_or_else(|| failed("no secret key"))?,
             region,
+            bucket: BUCKET.to_owned(),
         })
     }
 
@@ -770,6 +813,8 @@ struct Tally {
     lateness: Histogram,
     ops: u64,
     failed: u64,
+    /// Of the failed, those the server refused ([`Came::Refused`]).
+    refused: u64,
     first: Option<String>,
 }
 
@@ -850,6 +895,12 @@ async fn client(mut conn: Conn, work: Rc<Work>, shared: Rc<RefCell<Shared>>) {
                     tally.first.get_or_insert(why);
                     false
                 }
+                Ok(Came::Refused(why)) => {
+                    tally.failed = tally.failed.saturating_add(1);
+                    tally.refused = tally.refused.saturating_add(1);
+                    tally.first.get_or_insert(why);
+                    false
+                }
                 Ok(Came::Slowed | Came::Lost) => {
                     tally.failed = tally.failed.saturating_add(1);
                     tally
@@ -886,6 +937,7 @@ async fn phase(
                 lateness: Histogram::new(),
                 ops: 0,
                 failed: 0,
+                refused: 0,
                 first: None,
             },
             error: None,
@@ -1231,7 +1283,7 @@ impl Work {
             }
             Kind::Part => {
                 let Some(upload) = self.upload(i) else {
-                    return Ok(Came::Failed("no upload created".into()));
+                    return Ok(Came::Refused("no upload created".into()));
                 };
                 let op = Op::UploadPart {
                     bucket,
@@ -1268,7 +1320,7 @@ impl Work {
             }
             Kind::Parts => {
                 let Some(upload) = self.upload(i) else {
-                    return Ok(Came::Failed("no upload created".into()));
+                    return Ok(Came::Refused("no upload created".into()));
                 };
                 let reply = match answered(
                     client
@@ -1299,7 +1351,7 @@ impl Work {
                     part: Some(part),
                 }) = self.upload(i)
                 else {
-                    return Ok(Came::Failed("no part uploaded".into()));
+                    return Ok(Came::Refused("no part uploaded".into()));
                 };
                 let op = Op::Complete {
                     bucket,
@@ -1321,7 +1373,7 @@ impl Work {
             }
             Kind::Abort => {
                 let Some(upload) = self.upload(i) else {
-                    return Ok(Came::Failed("no upload created".into()));
+                    return Ok(Came::Refused("no upload created".into()));
                 };
                 let reply = match answered(
                     client
@@ -1355,15 +1407,22 @@ impl Work {
         (i, key, length): (u64, &str, u64),
         object: &Object<'_>,
     ) -> Result<Came, Error> {
-        let path = format!("/{BUCKET}/{key}");
         let at = http.at;
         let signer = Rc::clone(&http.signer);
+        let path = format!("/{}/{key}", signer.bucket);
         let unsigned = "UNSIGNED-PAYLOAD";
-        let refused = |answer: &Answer| {
+        // A refusal says the server's answer: its status and its error's code and message.
+        let refused = |answer: &Answer, body: &Kept| {
             if answer.status == 503 {
                 Came::Slowed
             } else {
-                Came::Failed(format!("HTTP {}", answer.status))
+                let text = String::from_utf8_lossy(&body.0);
+                Came::Refused(format!(
+                    "HTTP {} {} {}",
+                    answer.status,
+                    element(&text, "Code").unwrap_or_default(),
+                    element(&text, "Message").unwrap_or_default()
+                ))
             }
         };
         let mut dropped = Kept(Vec::new());
@@ -1374,7 +1433,7 @@ impl Work {
                         "partNumber=1&uploadId={}",
                         sigv4::uri_encode(upload.id.as_bytes(), true)
                     ),
-                    (Kind::Part, None) => return Ok(Came::Failed("no upload created".into())),
+                    (Kind::Part, None) => return Ok(Came::Refused("no upload created".into())),
                     _ => String::new(),
                 };
                 let head = signer.head(
@@ -1388,7 +1447,7 @@ impl Work {
                     .await?;
                 let etag = answer.etag.clone().unwrap_or_default();
                 if answer.status != 200 {
-                    refused(&answer)
+                    refused(&answer, &dropped)
                 } else if self.kind == Kind::Part {
                     let came = self.etag_ok(i, &etag, false)?;
                     if let Some(upload) = self.upload(i) {
@@ -1423,7 +1482,7 @@ impl Work {
                     .ask(&head, &Body::Chunked(object, length), false, &mut dropped)
                     .await?;
                 if answer.status != 200 {
-                    refused(&answer)
+                    refused(&answer, &dropped)
                 } else {
                     Came::Done
                 }
@@ -1445,7 +1504,7 @@ impl Work {
                 let end = if length == 0 { 0 } else { to.saturating_add(1) };
                 let expected = if self.kind == Kind::Range { 206 } else { 200 };
                 if answer.status != expected {
-                    refused(&answer)
+                    refused(&answer, &dropped)
                 } else {
                     self.checked(sink.0.wrong, sink.0.len(), end)
                 }
@@ -1454,7 +1513,7 @@ impl Work {
                 let head = signer.head(at, ("HEAD", &path, ""), &[], sigv4::EMPTY_SHA256)?;
                 let answer = http.ask(&head, &Body::None, true, &mut dropped).await?;
                 if answer.status != 200 {
-                    refused(&answer)
+                    refused(&answer, &dropped)
                 } else if answer.length != Some(length) {
                     Came::Failed(format!("size {:?}, not {length}", answer.length))
                 } else {
@@ -1466,13 +1525,13 @@ impl Work {
                     (Kind::Abort, Some(upload)) => {
                         format!("uploadId={}", sigv4::uri_encode(upload.id.as_bytes(), true))
                     }
-                    (Kind::Abort, None) => return Ok(Came::Failed("no upload created".into())),
+                    (Kind::Abort, None) => return Ok(Came::Refused("no upload created".into())),
                     _ => String::new(),
                 };
                 let head = signer.head(at, ("DELETE", &path, &query), &[], sigv4::EMPTY_SHA256)?;
                 let answer = http.ask(&head, &Body::None, false, &mut dropped).await?;
                 if answer.status != 204 {
-                    refused(&answer)
+                    refused(&answer, &dropped)
                 } else {
                     Came::Done
                 }
@@ -1494,20 +1553,23 @@ impl Work {
                         );
                         Came::Done
                     }
-                    _ => refused(&answer),
+                    _ => refused(&answer, &kept),
                 }
             }
             Kind::Parts => {
                 let Some(upload) = self.upload(i) else {
-                    return Ok(Came::Failed("no upload created".into()));
+                    return Ok(Came::Refused("no upload created".into()));
                 };
+                if upload.part.is_none() {
+                    return Ok(Came::Refused("no part uploaded".into()));
+                }
                 let query = format!("uploadId={}", sigv4::uri_encode(upload.id.as_bytes(), true));
                 let head = signer.head(at, ("GET", &path, &query), &[], sigv4::EMPTY_SHA256)?;
                 let mut kept = Kept(Vec::new());
                 let answer = http.ask(&head, &Body::None, false, &mut kept).await?;
                 let parts = String::from_utf8_lossy(&kept.0).matches("<Part>").count();
                 if answer.status != 200 {
-                    refused(&answer)
+                    refused(&answer, &kept)
                 } else if parts != 1 {
                     Came::Failed(format!("{parts} parts listed, not 1"))
                 } else {
@@ -1520,7 +1582,7 @@ impl Work {
                     part: Some(part),
                 }) = self.upload(i)
                 else {
-                    return Ok(Came::Failed("no part uploaded".into()));
+                    return Ok(Came::Refused("no part uploaded".into()));
                 };
                 let query = format!("uploadId={}", sigv4::uri_encode(upload.as_bytes(), true));
                 let body = format!(
@@ -1537,14 +1599,15 @@ impl Work {
                     .ask(&head, &Body::Text(body.as_bytes()), false, &mut kept)
                     .await?;
                 let text = String::from_utf8_lossy(&kept.0);
+                // The ETag's quotes as XML may escape them: `&quot;` or `&#34;`.
+                let unquoted = |etag: &str| etag.replace("&quot;", "").replace("&#34;", "");
                 match element(&text, "ETag") {
-                    Some(etag) if answer.status == 200 => self.etag_ok(
-                        i,
-                        etag.trim_matches('"')
-                            .trim_start_matches("&quot;")
-                            .trim_end_matches("&quot;"),
-                        true,
-                    )?,
+                    Some(etag) if answer.status == 200 => {
+                        self.etag_ok(i, unquoted(etag).trim_matches('"'), true)?
+                    }
+                    _ if answer.status != 200 => {
+                        Came::Refused(format!("HTTP {}: {text}", answer.status))
+                    }
                     _ => Came::Failed(format!("HTTP {}: {text}", answer.status)),
                 }
             }
@@ -1608,7 +1671,7 @@ impl Work {
                 );
                 let head = http.signer.head(
                     http.at,
-                    ("GET", &format!("/{BUCKET}"), &query),
+                    ("GET", &format!("/{}", http.signer.bucket), &query),
                     &[],
                     sigv4::EMPTY_SHA256,
                 )?;
@@ -1616,7 +1679,11 @@ impl Work {
                 let answer = http.ask(&head, &Body::None, false, &mut kept).await?;
                 let text = String::from_utf8_lossy(&kept.0);
                 if answer.status != 200 {
-                    return Ok(Came::Failed(format!("HTTP {}", answer.status)));
+                    return Ok(Came::Refused(format!(
+                        "HTTP {} {}",
+                        answer.status,
+                        element(&text, "Code").unwrap_or_default()
+                    )));
                 }
                 let next = (element(&text, "IsTruncated") == Some("true"))
                     .then(|| {
@@ -1647,7 +1714,8 @@ impl Work {
 /// The cell, its doors, and the connections each door holds between phases.
 struct Bench<'o> {
     options: &'o Options,
-    cell: Cell,
+    /// The cell this program runs, none against an `--endpoint`.
+    cell: Option<Cell>,
     rt: LocalRuntime,
     client_dir: PathBuf,
     listeners: Vec<SocketAddr>,
@@ -1714,6 +1782,9 @@ struct Measured<'a> {
     generator_ns: u64,
     wire: Option<u64>,
     again: u64,
+    /// `perf stat`'s counts across the phase, where `--perf` counted them.
+    perf: Option<Counters>,
+    excluded: bool,
 }
 
 impl<'o> Bench<'o> {
@@ -1721,11 +1792,54 @@ impl<'o> Bench<'o> {
     fn servers(&mut self) -> Result<Servers, Error> {
         let mut counts = Vec::with_capacity(cell::FOUNDERS);
         let mut usage = Vec::with_capacity(cell::FOUNDERS);
-        for at in 0..cell::FOUNDERS {
-            counts.push(self.cell.counts(at).map_err(failed)?);
-            usage.push(self.cell.pid(at).and_then(|pid| usage::of(pid).ok()));
+        match (self.cell.as_mut(), &self.options.endpoint) {
+            (Some(cell), _) => {
+                for at in 0..cell::FOUNDERS {
+                    counts.push(cell.counts(at).map_err(failed)?);
+                    usage.push(cell.pid(at).and_then(|pid| usage::of(pid).ok()));
+                }
+            }
+            (None, Some(endpoint)) => {
+                for &pid in &endpoint.pids {
+                    counts.push(faults_of(pid));
+                    usage.push(usage::of(pid).ok());
+                }
+            }
+            (None, None) => return Err(failed("no cell and no endpoint")),
         }
         Ok(Servers { counts, usage })
+    }
+
+    fn cell(&self) -> Result<&Cell, Error> {
+        self.cell
+            .as_ref()
+            .ok_or_else(|| failed("the native door needs a cell"))
+    }
+
+    /// The servers' processes: the cell's, or the endpoint's as `--server-pid` named them.
+    fn pids(&self) -> Vec<u32> {
+        match (&self.cell, &self.options.endpoint) {
+            (Some(cell), _) => (0..cell::FOUNDERS).filter_map(|at| cell.pid(at)).collect(),
+            (None, Some(endpoint)) => endpoint.pids.clone(),
+            (None, None) => Vec::new(),
+        }
+    }
+
+    /// The doors measured: both through a cell, the HTTP door alone against an endpoint.
+    fn doors(&self) -> &'static [Door] {
+        if self.cell.is_some() {
+            &DOORS
+        } else {
+            &[Door::Http]
+        }
+    }
+
+    /// A door as its lines name it: `http@ARM` against an endpoint.
+    fn named(&self, door: Door) -> String {
+        match (door, &self.options.endpoint) {
+            (Door::Http, Some(endpoint)) => format!("http@{}", endpoint.arm),
+            _ => door.name().to_owned(),
+        }
     }
 
     /// `want` connections of `door` held, more opened as needed, each answered a first request.
@@ -1748,11 +1862,12 @@ impl<'o> Bench<'o> {
     fn open(&mut self, door: Door, n: usize) -> Result<Vec<(Conn, u64)>, Error> {
         let mut made = Vec::with_capacity(n);
         let first = usize::try_from(self.opened.get(door.at()).copied().unwrap_or(0)).unwrap_or(0);
+        let spread = match door {
+            Door::Native => cell::FOUNDERS,
+            Door::Http => self.listeners.len(),
+        };
         for k in 0..n {
-            let at = first
-                .saturating_add(k)
-                .checked_rem(cell::FOUNDERS)
-                .unwrap_or(0);
+            let at = first.saturating_add(k).checked_rem(spread).unwrap_or(0);
             let conn = match door {
                 Door::Native => {
                     // An identity of its own: a node holds two connections of one identity at most
@@ -1761,7 +1876,7 @@ impl<'o> Bench<'o> {
                     let number = self.opened.first().copied().unwrap_or(0);
                     let dir = self.options.dir.join("clients").join(number.to_string());
                     let settings = harness(|| {
-                        crate::init::client(&mut Vec::new(), &dir, self.cell.out())
+                        crate::init::client(&mut Vec::new(), &dir, self.cell()?.out())
                             .map_err(failed)?;
                         self.settings(&dir, at)
                     })?;
@@ -1791,7 +1906,7 @@ impl<'o> Bench<'o> {
     /// first, its key read from the client's directory.
     fn settings(&self, dir: &Path, first: usize) -> Result<Settings, Error> {
         let configured = crate::client::configured(dir).map_err(failed)?;
-        let mut nodes = self.cell.quic();
+        let mut nodes = self.cell()?.quic();
         let first = first.min(nodes.len());
         nodes.rotate_left(first);
         Ok(Settings {
@@ -1823,6 +1938,14 @@ impl<'o> Bench<'o> {
         self.phases = self.phases.saturating_add(1);
         let seed = self.options.seed.wrapping_add(self.phases);
         let before = self.servers()?;
+        let perf = if self.options.perf {
+            Some(Perf::start(
+                &self.pids(),
+                &self.options.dir.join("perf.csv"),
+            )?)
+        } else {
+            None
+        };
         let began = Instant::now();
         let cpu = drive::cpu();
         alloc::begin();
@@ -1836,6 +1959,7 @@ impl<'o> Bench<'o> {
         let generator_ns =
             u64::try_from(drive::cpu().saturating_sub(cpu).as_nanos()).unwrap_or(u64::MAX);
         let elapsed_ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let perf = perf.map(Perf::end).transpose()?;
         let (conns, tally) = ran.map_err(|e| failed(format!("{e:?}")))??;
         let after = self.servers()?;
         let wire = conns
@@ -1856,9 +1980,15 @@ impl<'o> Bench<'o> {
         }
         let ops = tally.ops;
         let rate = ops as f64 / (elapsed_ns.max(1) as f64 / 1e9);
+        // A server outside this program that refuses every operation of a phase does not offer
+        // it: the phase is excluded with the server's answer, not counted as a failed check. A
+        // check that failed on an answer it gave is a failure.
+        let excluded = self.cell.is_none() && ops > 0 && tally.refused == ops;
         self.ops = self.ops.saturating_add(ops);
-        self.failures = self.failures.saturating_add(tally.failed);
-        self.exact &= tally.failed == 0;
+        if !excluded {
+            self.failures = self.failures.saturating_add(tally.failed);
+            self.exact &= tally.failed == 0;
+        }
         let measured = Measured {
             door: work.door,
             kind: work.kind,
@@ -1874,6 +2004,8 @@ impl<'o> Bench<'o> {
                 None
             },
             again: work.again.replace(0),
+            perf,
+            excluded,
         };
         self.line(out, &measured, (&before, &after))?;
         Ok((ops, rate))
@@ -1908,6 +2040,7 @@ impl<'o> Bench<'o> {
             )
         };
         let peak = summed(after.counts.iter().map(|c| c.peak.map(|p| p.max(0) as f64)));
+        let perf = |f: fn(&Counters) -> Option<u64>| m.perf.as_ref().and_then(f).map(|v| v as f64);
         let clients = u64::try_from(m.clients).unwrap_or(u64::MAX);
         let mine = |f: fn(&Counts) -> u64| m.harness.as_ref().map(|c| f(c) as f64);
         let open = matches!(self.options.load, Load::Open(_));
@@ -1917,7 +2050,7 @@ impl<'o> Bench<'o> {
             "doors {} {} {} {} clients {} elapsed_ms {} ops {ops} allocs/op {} reallocs/op {} moved/op {} bytes/op {} peak_live/request {} peak_live/connection {} \
              client_allocs/op {} client_bytes/op {} minor_faults/op {} major_faults/op {} user_ns/op {} system_ns/op {} instructions/op {} cycles/op {} switches/op {} \
              wire_bytes/op {} datagrams/op - latency_us p50 {} p99 {} p99.9 {} p99.99 {} max {} generator_cpu_ns/op {} lateness_us p99 {} again {} failed {}",
-            m.door.name(),
+            self.named(m.door),
             m.kind.name(),
             m.size,
             self.options.condition,
@@ -1935,8 +2068,11 @@ impl<'o> Bench<'o> {
             per(grew(|c| c.major), ops),
             per(charged(|u| Some(u.user_ns)), ops),
             per(charged(|u| Some(u.system_ns)), ops),
-            per(charged(|u| u.instructions), ops),
-            per(charged(|u| u.cycles), ops),
+            per(
+                perf(|p| p.instructions).or(charged(|u| u.instructions)),
+                ops
+            ),
+            per(perf(|p| p.cycles).or(charged(|u| u.cycles)), ops),
             per(grew(|c| c.switches), ops),
             per(m.wire.map(|w| w as f64), ops),
             quantile(&t.latency, Level::P50, 500_000),
@@ -1960,10 +2096,12 @@ impl<'o> Bench<'o> {
         if let Some(first) = &t.first {
             writeln!(
                 out,
-                "doors {} {} {} failure: {first}",
-                m.door.name(),
+                "doors {} {} {} {} {}: {first}",
+                self.named(m.door),
                 m.kind.name(),
-                m.size
+                m.size,
+                self.options.condition,
+                if m.excluded { "excluded" } else { "failure" },
             )?;
         }
         out.flush()?;
@@ -2099,7 +2237,8 @@ impl<'o> Bench<'o> {
         if !whole && door == Door::Http {
             writeln!(
                 out,
-                "doors http {name} {}: past S3's single PUT and part ({} bytes), not asked",
+                "doors {} {name} {}: past S3's single PUT and part ({} bytes), not asked",
+                self.named(door),
                 self.options.condition,
                 mantle_s3::body::MAX_UPLOAD
             )?;
@@ -2199,6 +2338,8 @@ impl<'o> Bench<'o> {
     fn set(&mut self, out: &mut impl Write, count: u64) -> Result<(), Error> {
         let name = format!("set{count}");
         let oracle = Rc::new(RefCell::new(Oracle::new(count).map_err(failed)?));
+        // A door reads the other's half where both run; alone, its own.
+        let both = self.doors().len() > 1;
         let other = |door: Door| {
             if door == Door::Native {
                 Door::Http
@@ -2212,8 +2353,8 @@ impl<'o> Bench<'o> {
             (Kind::Get, true),
             (Kind::Delete, false),
         ] {
-            for door in DOORS {
-                let own = if crossed { other(door) } else { door };
+            for &door in self.doors() {
+                let own = if crossed && both { other(door) } else { door };
                 let work = Rc::new(Work {
                     oracle: Rc::clone(&oracle),
                     ..self.work(door, kind, Keys::Set { count, own })?
@@ -2290,7 +2431,7 @@ impl Opening {
             Self::Http(mut http) => {
                 let head = http.signer.head(
                     http.at,
-                    ("HEAD", &format!("/{BUCKET}/{NEVER_PUT}"), ""),
+                    ("HEAD", &format!("/{}/{NEVER_PUT}", http.signer.bucket), ""),
                     &[],
                     sigv4::EMPTY_SHA256,
                 )?;
@@ -2396,17 +2537,37 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
             "no (a count-allocs build counts allocations)"
         }
     )?;
-    let mut cell = Cell::make(&options.dir, options.volume).map_err(failed)?;
-    // Every range led before the first phase, so no phase measures the cell's first elections.
-    cell.led().map_err(failed)?;
     let client_dir = options.dir.join("client");
-    crate::init::client(&mut Vec::new(), &client_dir, cell.out()).map_err(failed)?;
-    let s3 = cell.s3();
-    let region = s3
-        .first()
-        .map(|(_, r)| r.clone())
-        .ok_or_else(|| failed("no S3 listener"))?;
-    let signer = Rc::new(Signer::read(cell.out(), region)?);
+    let (cell, listeners, signer) = match &options.endpoint {
+        Some(endpoint) => {
+            writeln!(
+                out,
+                "doors endpoint http@{} at {} bucket {} region {} pids {:?}",
+                endpoint.arm, endpoint.at, endpoint.bucket, endpoint.region, endpoint.pids
+            )?;
+            let signer = Signer {
+                id: endpoint.id.clone(),
+                secret: endpoint.secret.clone(),
+                region: endpoint.region.clone(),
+                bucket: endpoint.bucket.clone(),
+            };
+            (None, vec![endpoint.at], signer)
+        }
+        None => {
+            let mut cell = Cell::make(&options.dir, options.volume).map_err(failed)?;
+            // Every range led before the first phase, so no phase measures the cell's first
+            // elections.
+            cell.led().map_err(failed)?;
+            crate::init::client(&mut Vec::new(), &client_dir, cell.out()).map_err(failed)?;
+            let s3 = cell.s3();
+            let region = s3
+                .first()
+                .map(|(_, r)| r.clone())
+                .ok_or_else(|| failed("no S3 listener"))?;
+            let signer = Signer::read(cell.out(), region)?;
+            (Some(cell), s3.iter().map(|(at, _)| *at).collect(), signer)
+        }
+    };
     let most = options
         .clients
         .saturating_mul(2)
@@ -2424,11 +2585,11 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
     )?;
     let mut bench = Bench {
         options,
-        listeners: s3.iter().map(|(at, _)| *at).collect(),
+        listeners,
         cell,
         rt: runtime(most)?,
         client_dir,
-        signer,
+        signer: Rc::new(signer),
         generator: Rc::new(Generator::new(options.seed).map_err(failed)?),
         pools: [Vec::new(), Vec::new()],
         native_most,
@@ -2440,7 +2601,8 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
         phases: 0,
     };
     bench.create()?;
-    for door in DOORS {
+    let doors = bench.doors();
+    for &door in doors {
         for &size in &options.sizes {
             bench.sized(out, door, size)?;
         }
@@ -2449,10 +2611,10 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
         bench.set(out, count)?;
     }
     let mut caught = 0u32;
-    for door in DOORS {
+    for &door in doors {
         caught = caught.saturating_add(bench.controls(out, door)?);
     }
-    for door in DOORS {
+    for &door in doors {
         bench.slope(out, door)?;
     }
     writeln!(
@@ -2460,7 +2622,7 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
         "doors handshakes native {} http {}",
         bench.opened[0], bench.opened[1]
     )?;
-    let controls = u32::try_from(DOORS.len()).unwrap_or(0).saturating_mul(3);
+    let controls = u32::try_from(doors.len()).unwrap_or(0).saturating_mul(3);
     writeln!(
         out,
         "doors verified ops {} failed {} controls caught {caught} of {controls}",
@@ -2470,8 +2632,35 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
 }
 
 impl Bench<'_> {
-    /// The run's bucket, made through the native door.
+    /// The run's bucket, made through the native door; against an endpoint, through the HTTP door,
+    /// a bucket it already holds for this key as good.
     fn create(&mut self) -> Result<(), Error> {
+        if self.cell.is_none() {
+            let at = *self
+                .listeners
+                .first()
+                .ok_or_else(|| failed("no listener"))?;
+            let mut http = Http::new(at, Rc::clone(&self.signer));
+            let head = http.signer.head(
+                at,
+                ("PUT", &format!("/{}", http.signer.bucket), ""),
+                &[("content-length", "0".to_owned())],
+                sigv4::EMPTY_SHA256,
+            )?;
+            let answer = self
+                .rt
+                .block_on(async move {
+                    let mut kept = Kept(Vec::new());
+                    let answer = http.ask(&head, &Body::None, false, &mut kept).await?;
+                    Ok::<_, Error>((answer.status, String::from_utf8_lossy(&kept.0).into_owned()))
+                })
+                .map_err(|e| failed(format!("{e:?}")))??;
+            return match answer {
+                (200, _) => Ok(()),
+                (409, text) if text.contains("BucketAlreadyOwnedByYou") => Ok(()),
+                (status, text) => Err(failed(format!("the bucket: HTTP {status} {text}"))),
+            };
+        }
         let settings = self.settings(&self.client_dir, 0)?;
         let made = self
             .rt
@@ -2541,7 +2730,7 @@ impl Bench<'_> {
                     };
                     match put {
                         Came::Done => {}
-                        Came::Failed(why) => {
+                        Came::Failed(why) | Came::Refused(why) => {
                             return Err(failed(format!("a control's object was not put: {why}")));
                         }
                         Came::Slowed | Came::Lost => {
@@ -2589,13 +2778,13 @@ impl Bench<'_> {
                 writeln!(
                     out,
                     "doors control {} {name} failed: {why} (caught)",
-                    door.name()
+                    self.named(door)
                 )?;
             } else {
                 writeln!(
                     out,
                     "doors control {} {name} NOT caught: {why}",
-                    door.name()
+                    self.named(door)
                 )?;
             }
         }
@@ -2623,7 +2812,7 @@ impl Bench<'_> {
             writeln!(
                 out,
                 "doors {} slope {}: the cell admits {high_count} connections, no second point",
-                door.name(),
+                self.named(door),
                 self.options.condition
             )?;
             return Ok(());
@@ -2657,7 +2846,7 @@ impl Bench<'_> {
         writeln!(
             out,
             "doors {} slope {} connections {low_count} {high_count} server_live_bytes/connection {} server_footprint_bytes/connection {} client_live_bytes/connection {}",
-            door.name(),
+            self.named(door),
             self.options.condition,
             per(live, added),
             per(footprint, added),
@@ -2666,7 +2855,7 @@ impl Bench<'_> {
         writeln!(
             out,
             "doors {} handshake {} handshakes {added} allocs/handshake {} bytes/handshake {} client_allocs/handshake {} client_bytes/handshake {} latency_us p50 {} max {}",
-            door.name(),
+            self.named(door),
             self.options.condition,
             per(counted(|c| c.allocations), added),
             per(counted(|c| c.bytes), added),
@@ -2678,6 +2867,110 @@ impl Bench<'_> {
         let all = low.into_iter().chain(more).map(|(conn, _)| conn).collect();
         self.release(all)
     }
+}
+
+/// A server's faults as Linux's `/proc/PID/stat` counts them for the whole process (proc(5):
+/// `minflt` and `majflt`, its 10th and 12th fields), for a process this program did not start and
+/// cannot ask; none where there is no such file (off Linux). Its switches are not read: `status`
+/// counts them per thread, and a thread that ended takes its own with it.
+fn faults_of(pid: u32) -> Counted {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    // The fields past the command's closing parenthesis, the 3rd (the state) first.
+    let fields: Vec<&str> = stat
+        .rsplit_once(')')
+        .map(|(_, rest)| rest.split_whitespace().collect())
+        .unwrap_or_default();
+    let field = |n: usize| fields.get(n.checked_sub(3)?)?.parse::<u64>().ok();
+    Counted {
+        minor: field(10),
+        major: field(12),
+        ..Counted::default()
+    }
+}
+
+/// `perf stat` counting the servers' user-space instructions and cycles across one phase
+/// (`--perf`, Linux; perf-stat(1)): started on the servers' pids with its events disabled
+/// (`--delay -1`), enabled before the phase and disabled after it through its control descriptors,
+/// its standard input and output (`--control fd:0,1`), each command acknowledged before going on,
+/// so its count spans the phase; then ended with SIGINT, on which it writes its counts to `out`.
+/// The events count user space only (`:u`), which `perf_event_paranoid` 2 lets a user count of
+/// its own processes.
+struct Perf {
+    child: Child,
+    ack: BufReader<ChildStdout>,
+    out: PathBuf,
+}
+
+impl Perf {
+    fn start(pids: &[u32], out: &Path) -> Result<Self, Error> {
+        let pids: Vec<String> = pids.iter().map(u32::to_string).collect();
+        let mut child = Command::new("perf")
+            .args(["stat", "-x,", "-e", "instructions:u,cycles:u", "-D", "-1"])
+            .args(["--control", "fd:0,1", "-o"])
+            .arg(out)
+            .args(["-p", &pids.join(",")])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| failed(format!("perf: {e}")))?;
+        let ack = BufReader::new(child.stdout.take().ok_or_else(|| failed("perf's output"))?);
+        let mut perf = Self {
+            child,
+            ack,
+            out: out.to_owned(),
+        };
+        perf.command("enable")?;
+        Ok(perf)
+    }
+
+    /// Sends a control command and reads its acknowledgement: `ack`, which perf may precede with a
+    /// NUL. Its output ending, perf ended.
+    fn command(&mut self, command: &str) -> Result<(), Error> {
+        let control = self
+            .child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| failed("perf's input"))?;
+        writeln!(control, "{command}")?;
+        control.flush()?;
+        let mut line = String::new();
+        self.ack.read_line(&mut line)?;
+        if line.trim_matches(['\0', '\n']) == "ack" {
+            Ok(())
+        } else {
+            Err(failed(format!("perf answered {command} with {line:?}")))
+        }
+    }
+
+    /// Disables the events, ends perf with SIGINT (by kill(1), this program holding no signal
+    /// call) and reads its instructions and cycles.
+    fn end(mut self) -> Result<Counters, Error> {
+        self.command("disable")?;
+        Command::new("kill")
+            .args(["-INT", &self.child.id().to_string()])
+            .status()?;
+        self.child.wait()?;
+        let text = std::fs::read_to_string(&self.out)?;
+        // A CSV line: the count, its unit, the event, ...; `<not counted>` where none ran.
+        let count = |event: &str| {
+            text.lines().find_map(|line| {
+                let mut fields = line.split(',');
+                let value = fields.next()?;
+                (fields.nth(1)? == event).then(|| value.parse::<u64>().ok())?
+            })
+        };
+        Ok(Counters {
+            instructions: count("instructions:u"),
+            cycles: count("cycles:u"),
+        })
+    }
+}
+
+/// The servers' user-space instructions and cycles across a phase, as `perf stat` counted them.
+struct Counters {
+    instructions: Option<u64>,
+    cycles: Option<u64>,
 }
 
 fn control_key(door: Door, name: char) -> String {
@@ -2731,7 +3024,7 @@ async fn read(
         Conn::Http(http) => {
             let head = http.signer.head(
                 http.at,
-                ("GET", &format!("/{BUCKET}/{key}"), ""),
+                ("GET", &format!("/{}/{key}", http.signer.bucket), ""),
                 &[],
                 sigv4::EMPTY_SHA256,
             )?;
@@ -2769,7 +3062,7 @@ async fn head_etag(conn: &mut Conn, key: &str) -> Result<Read, Error> {
         Conn::Http(http) => {
             let head = http.signer.head(
                 http.at,
-                ("HEAD", &format!("/{BUCKET}/{key}"), ""),
+                ("HEAD", &format!("/{}/{key}", http.signer.bucket), ""),
                 &[],
                 sigv4::EMPTY_SHA256,
             )?;

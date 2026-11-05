@@ -481,12 +481,46 @@ enum BenchCommand {
         /// memfloor or another.
         #[arg(long, default_value = "quiet")]
         condition: String,
+        #[command(flatten)]
+        endpoint: Box<EndpointArgs>,
+        /// Count the servers' user-space instructions and cycles each phase with `perf stat`
+        /// (Linux), which must be on the PATH.
+        #[arg(long)]
+        perf: bool,
         /// A run for CI: a few operations a phase, the small sizes, a set of twenty, two clients
         /// and small volumes, through both doors with the three controls. The flags given still
         /// apply.
         #[arg(long)]
         smoke: bool,
     },
+}
+
+/// `mantle bench doors --endpoint`'s server and its key.
+#[derive(clap::Args)]
+struct EndpointArgs {
+    /// An S3 server this program did not start, http://HOST:PORT: only the HTTP door's phases,
+    /// controls and slope run, against it, and its lines name the door http@ARM.
+    #[arg(long, value_parser = bench_doors::endpoint_arg, requires = "arm")]
+    endpoint: Option<std::net::SocketAddr>,
+    /// The endpoint's name in its lines: garage, seaweedfs, rustfs.
+    #[arg(long, requires = "endpoint")]
+    arm: Option<String>,
+    /// The endpoint's bucket, made if it does not exist.
+    #[arg(long, default_value = "doors", requires = "endpoint")]
+    bucket: String,
+    /// The endpoint's access key id; AWS_ACCESS_KEY_ID by default.
+    #[arg(long, requires = "endpoint")]
+    key: Option<String>,
+    /// The endpoint's secret key; AWS_SECRET_ACCESS_KEY by default.
+    #[arg(long, requires = "endpoint")]
+    secret: Option<String>,
+    /// The endpoint's region; AWS_REGION by default, else us-east-1.
+    #[arg(long, requires = "endpoint")]
+    region: Option<String>,
+    /// A process of the endpoint's server, whose faults, CPU and footprint are read by its pid,
+    /// as a cell's servers' are; repeat for each.
+    #[arg(long = "server-pid", requires = "endpoint")]
+    server_pids: Vec<u32>,
 }
 
 #[derive(Subcommand)]
@@ -908,12 +942,12 @@ fn main() -> ExitCode {
         Command::Bench {
             command: command @ BenchCommand::Doors { .. },
         } => match doors_options(command) {
-            Some(options) => match bench_doors::doors(&mut out, &options) {
+            Ok(options) => match bench_doors::doors(&mut out, &options) {
                 Ok(true) => Ok(()),
                 Ok(false) => Err("a check was not exact or a control was not caught".to_owned()),
                 Err(e) => Err(e.to_string()),
             },
-            None => Ok(()),
+            Err(why) => Err(why),
         },
         Command::Bench {
             command:
@@ -992,8 +1026,8 @@ fn main() -> ExitCode {
 }
 
 /// `mantle bench doors`' sizes, sets, clients, operations, bytes and volumes: the flags given, each
-/// other one `--smoke`'s or the full run's.
-fn doors_options(command: BenchCommand) -> Option<bench_doors::Options> {
+/// other one `--smoke`'s or the full run's; an endpoint's key from the flags or the environment.
+fn doors_options(command: BenchCommand) -> Result<bench_doors::Options, String> {
     let BenchCommand::Doors {
         dir,
         seed,
@@ -1005,12 +1039,40 @@ fn doors_options(command: BenchCommand) -> Option<bench_doors::Options> {
         bytes,
         volume,
         condition,
+        endpoint,
+        perf,
         smoke,
     } = command
     else {
-        return None;
+        return Err("not mantle bench doors".to_owned());
     };
-    Some(bench_doors::Options {
+    let named = |given: Option<String>, variable: &str| {
+        given
+            .or_else(|| std::env::var(variable).ok())
+            .ok_or_else(|| format!("--endpoint needs a key: a flag or {variable}"))
+    };
+    let EndpointArgs {
+        endpoint,
+        arm,
+        bucket,
+        key,
+        secret,
+        region,
+        server_pids,
+    } = *endpoint;
+    let endpoint = match endpoint {
+        Some(at) => Some(bench_doors::Endpoint {
+            arm: arm.unwrap_or_default(),
+            at,
+            bucket,
+            id: named(key, "AWS_ACCESS_KEY_ID")?,
+            secret: named(secret, "AWS_SECRET_ACCESS_KEY")?,
+            region: named(region, "AWS_REGION").unwrap_or_else(|_| "us-east-1".to_owned()),
+            pids: server_pids,
+        }),
+        None => None,
+    };
+    Ok(bench_doors::Options {
         dir,
         seed,
         sizes: if sizes.is_empty() {
@@ -1029,6 +1091,8 @@ fn doors_options(command: BenchCommand) -> Option<bench_doors::Options> {
         bytes: bytes.unwrap_or(STEP_BYTES),
         volume: volume.unwrap_or(pick(smoke, FULL_VOLUME, SMOKE_VOLUME)),
         condition,
+        endpoint,
+        perf,
     })
 }
 

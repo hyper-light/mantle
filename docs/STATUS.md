@@ -935,9 +935,18 @@ deleted halfway through the small set's native puts:
 | large 20 MiB, each of the four ways | 4 | 83,886,080 | 0 | 0 | 0 | 18 blocks of 4 objects: yes | 12 reads, 0 wrong, 0 missing |
 
 Every control was caught (a byte inverted, a chunk moved onto another's node, a key never put), and
-the large objects were listed by both doors. The localkind half (plan step 12: its pipeline, its
-Argo CD app, the cell's one-time init and the scale run with Chaos Mesh) is written on localkind's
-`mantle` branch and waits for this Mac's localkind platform, absent since 2026-10-22.
+the large objects were listed by both doors. The localkind half (plan step 12) ran on this Mac's
+Docker Desktop kind cluster on 2026-11-04 ([measurements](measurements/2026-11-04-kind-cell.md)):
+localkind's pipeline built main `49aa075c`, its suites and lint passing, and published image and
+chart 0.1.0-ci.872; Argo CD showed the app Synced and Healthy at that chart, its three founders one
+to a kind node, the control plane's taint tolerated since the cluster has two workers; and the scale
+step's tests passed from a Job in the cell, every check exact: the 100k, 10k and 1k sets through
+both doors, every block's chunks on distinct nodes, each founder's pod killed in turn by Chaos Mesh
+with every acknowledged object read back through each node (225,030 reads after the kills on the
+100k set), and one 10 GiB object, all this Mac's free space less its 30 GiB reserve held at three
+copies, read back exactly, the next refused as out of space through both doors. Open: the native
+door's puts were refused `SlowDown` for the disruption's length, including ten minutes with all
+three founders ready, while nothing refused was acknowledged.
 
 ## Goal stack checked, 2026-11-01
 

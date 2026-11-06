@@ -24,20 +24,27 @@ back through both:
   [harness](measurements/2026-10-27-transfer-harness.md)) checks every byte against its generator
   through both doors, every block's chunks on distinct nodes, every acknowledged object read back
   after each founder is killed and started again, and a full cell's typed refusal. On this Mac and
-  the box (adacachy) all 22 host/case slots have their results
-  ([scale](measurements/2026-10-28-transfer-scale.md)): 15 with complete readback (the 1k, 10k and
-  100k sets on both, every 10 GiB way on both, and one whole 100 GiB object in native parts on this
-  Mac, run `mac-100G-native-parts-20261102-003931`) and 7 capacity-only, each refusing its first
-  object as out of space, unreadable and unlisted (the other 100 GiB ways).
+  the box (adacachy) the 22 host/case slots ([scale](measurements/2026-10-28-transfer-scale.md))
+  hold 18 with complete readback (the 1k, 10k and 100k sets on both, every 10 GiB way on both, one
+  whole 100 GiB object in native parts on this Mac on 2026-11-02, and on main `7d628026` on
+  2026-11-05 the streamed 100 GiB ways: natively in runs on both, by the AWS CLI from its standard
+  input on the box) and 4 capacity-only: the box's 100 GiB parts ways, whose reruns were exact
+  through placement and chunk accounting when the box stopped answering in their kills, and this
+  Mac's 100 GiB CLI and boto-parts ways, which its free space no longer holds above its reserve.
 - *KIND*: the image and the chart, proven in CI's kind cluster (`kind-cell`), and localkind's
   pipeline and Argo CD app deploying a cell of three into this Mac's Docker Desktop kind cluster,
-  where the scale step's tests passed, each founder's pod killed in turn by Chaos Mesh
-  ([KIND](measurements/2026-11-04-kind-cell.md); below, "A cell on Kubernetes").
+  where the scale step's tests passed, each founder's pod killed in turn by Chaos Mesh, again on the
+  readiness lock (main `72511e15`, run 4) ([KIND](measurements/2026-11-04-kind-cell.md); below, "A
+  cell on Kubernetes").
 
-Open: a whole 100 GiB object by a streamed single upload, natively in runs or by the AWS CLI, has
-not been read back: one at three copies needs about 353 GiB free on one machine, and neither held it
-at its run; and a node's refusals for the length of a disruption in the kind cluster, ten minutes
-of them with every founder ready, are not yet traced.
+Open: a founder its peers dial was out of reach for 3 min 7 s after its pod was replaced in the kind
+cluster, its peers' QUIC flows to its Service's cluster IP still translated to the killed pod and
+renewed by their dials until the stale entries went, one deleted by hand
+([research/78](research/78-a-cell-in-kubernetes.md); its fix, founders reached at their pods'
+addresses by the headless Service's names and each resolved again, is proposed there and not built);
+and the box's 100 GiB parts reruns wait on the box. The disruption's refusals "with every founder
+ready" were the readiness record a killed founder's directory kept: readiness is now the lock its
+living, enlisted process holds (main `72511e15`).
 
 `mantle disk probe` reports what the operating system knows about the device that holds a
 directory and, with `--measure`, benchmarks the device. It is built on:

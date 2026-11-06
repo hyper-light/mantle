@@ -35,6 +35,15 @@ S3 listener speaks TLS with the endpoint's certificate for the names `mantle ini
 (`name=HOST`, node.md §1.5), so each founder names its own Service and the cell's S3 Service, and a
 stock client takes the endpoint's authority (`OUT/s3/authority.pem`) as its chain.
 
+Open: a peer's QUIC and plane reach a founder through its Service's cluster IP, a translation
+kube-proxy keeps in the flow's conntrack entry, and each peer dials from one UDP port within about 3
+s, which renews the entry past the pod it reached. A founder its peers dial (the highest id dials no
+one) was so out of reach for 3 min 7 s after its pod was replaced in the KIND cell, until the
+entries went, one deleted by hand and the other most likely at a kube-proxy sync (research/78, "A
+Service's cluster IP carries a peer's QUIC only until its pod is replaced"). The fix proposed there,
+founders reached at their pods' addresses by the headless Service's per-pod names, each resolved
+again when a link to it ends, is not built.
+
 ## 3. Identity and keys
 
 The chart never generates a key: an identity changed by a `helm upgrade` would change the node's

@@ -10,6 +10,14 @@ distinct nodes, every acknowledged object read back after each founder is killed
 and each large case ending at the typed refusal with the count held beside the volumes' stated
 capacity?
 
+**Checkpoint, 2026-11-05.** The two streamed 100 GiB ways each held one whole object read back
+exactly on the landed product `7d628026`: natively in runs on the box and this Mac, and by the AWS
+CLI from its standard input on the box (below, "The streamed 100 GiB ways with a whole object"). Of
+the 22 host/case slots, 18 now have complete readback and 4 are capacity-only: the box's two 100 GiB
+parts ways, whose reruns placed and accounted their objects exactly before the box stopped answering
+in their kills, and this Mac's 100 GiB CLI and boto-parts ways, which its free space no longer holds
+above the reserve.
+
 **Checkpoint, 2026-11-03.** Every one of the 22 host/case slots has its result: 15 with complete
 readback evidence and 7 capacity-only, none unresolved. The Mac's six open slots ran on the
 listener fix (main `9166554e`, binary `mantle-0988940`): its four 10 GiB ways each held seven
@@ -895,6 +903,51 @@ refusal.
 Each held the chunks of its refused object's blocks written before the refusal (nothing removes a
 chunk yet) and 8,404,992 free bytes a volume; each verified by `verify-large-result.py` (exit 0,
 empty stderr, binary SHA-256 above).
+
+**The streamed 100 GiB ways with a whole object, on the landed product (2026-11-05).** The 100 GiB
+slots that were capacity-only, a founder's volume holding less than one object's copy, ran again on
+main `7d628026`, each a fresh cell on volumes stated at 110 GiB: room for one object at three
+copies, 111,483,813,888 data-region bytes a volume by `Geometry::plan` (above). The box ran its ways
+two at a time, each in a 16 GiB memory scope beside other agents' work (load 11 to 21 at the starts,
+98 at its worst), binary `mantle-7d628026`, SHA-256
+`c464b672d9109aa3d5beb9cac1248c16a4eba47eaf8ed7eabcda42a9b1ec47c3`; this Mac one at a time under
+launchd (`com.mantle.mac-100g-stream`), three volumes beside the 32 GiB reserve, the guard sampling
+free space every 10 s against the 30 GiB floor, binary SHA-256
+`0d2fe76425e2cfbf4375c4918861eb8134c53a7a4cecd3d7ae6cbf5a375f1812`. Each row passed the complete
+check (`verify-large-result.py`, written again on 2026-11-05 with the open slots' checks above, and
+failing both a capacity-only case and the floor-stopped one): exit 0 with empty stderr, one whole
+object, every block's chunks on distinct nodes, each node's chunks what it received, six exact reads
+after each founder's kill and restart, the three controls caught (byte 53,687,091,200 inverted, a
+chunk of the first block moved onto another's node, a key never put), and the next object, `l1`,
+refused as out of space, unreadable and unlisted, the acknowledged one listed.
+
+| Host | Way | Blocks | Held a node | Put / native read / HTTP read (MiB/s) | Reads after kills | Again / wrong / missing | Refused | Seconds |
+|---|---|---|---|---|---|---|---|---|
+| box | native (whole, in runs) | 12,901 | 113,802,401,776 B | 57 / 301 / 492 | 6 | 0 / 0 / 0 | native `l1`, full | 5,878 |
+| box | cli (standard input) | 19,200 | 113,777,295,360 B | 81 / 286 / 436 | 6 | 0 / 0 / 0 | the listener `l1`, full | 5,927 |
+| this Mac | native (whole, in runs) | 12,901 | 110,414,084,448 B | 38 / 64 / 103 | 6 | 0 / 0 / 0 | native `l1`, full | 11,221 |
+
+A node holds the object's chunks and what the refused `l1` stored before its refusal (nothing
+removes a chunk yet), 8,325,104 bytes kept by none and 8,404,992 free a volume. This Mac's free
+space fell to 36.99 GiB at its least during the native case's puts (14:48), above the floor; the
+case's directories outside its volumes held 0.5 GB at its end, and what else took the space on this
+shared file system was not traced (sampled during the next case, free space fell 184 MB a minute
+while the Docker Desktop VM's disk image grew 1.7 MB a minute). Its reads ran at about half its
+2026-11-02 native-parts case's (123 and 257 MiB/s on `17eb8032`), beside the Docker Desktop VM
+running localkind's platform with the KIND cell scaled to none; why is not traced. Its first CLI
+case (15:41) was ended in its kills by the stop signals of a kiln restart on this Mac at 17:36 (its
+nodes: "a second request to stop came as the node stopped"), after its placement (19,200 blocks,
+each on distinct nodes) and its chunk accounting were exact; it holds no verdict, and its volumes
+were freed.
+
+The other four hold no verdict. The box's native-parts and boto-parts cases (15:52, side by side)
+each placed its object's 20,000 blocks on distinct nodes and accounted its chunks exactly
+(110,106,913,236 bytes a node, each what it received), and were in their kills when the box stopped
+answering, between 18:13 and 18:23; they wait on it. This Mac's CLI case is described above; run
+again after the KIND rerun (docs/measurements/2026-11-04-kind-cell.md, run 4), its preflight found
+349,279,723,520 bytes free where three volumes and the reserve need 388,694,540,288, and the
+boto-parts case would need the same: this Mac's shared file system no longer holds one 100 GiB
+object at three copies above its reserve, so both stay the capacity-only results above.
 
 **What an object takes of a range's store.** For the engines' share of a node's memory, sized by
 what the cell's volumes hold (the owner's choice of 2026-10-31, node.md §1.4): the harness's small

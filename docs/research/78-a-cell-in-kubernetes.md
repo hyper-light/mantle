@@ -5,7 +5,8 @@ layer (a container image and a Helm chart for mantle, proven in a kind cluster) 
 docs/design/kubernetes.md. Sources [1] to [6], [10] and [11] were read from the Kubernetes
 documentation on 2026-11-03, each quoted where it was read; [7] to [9] and [12] are mantle's own
 code, read at `9166554e`; [13] to [15] were read on 2026-11-05 from the Linux man-pages, Microsoft's
-Win32 reference and Rust's standard library documentation.
+Win32 reference and Rust's standard library documentation, [16] from Kubernetes' source at the
+kube-proxy the kind cluster runs and [17] from the Linux kernel's documentation.
 
 ## The question
 
@@ -117,6 +118,19 @@ descriptors/handles duplicated or inherited from it) is closed". They correspond
 function on Unix" with `LOCK_EX` or `LOCK_SH` and `LOCK_NB`, "and the LockFileEx function on
 Windows" with `LOCKFILE_FAIL_IMMEDIATELY`, and `LOCKFILE_EXCLUSIVE_LOCK` for the exclusive one.
 
+[16] Kubernetes, `pkg/proxy/conntrack/cleanup.go` at v1.36.4, kube-proxy's cleanup of UDP flows,
+https://github.com/kubernetes/kubernetes/blob/v1.36.4/pkg/proxy/conntrack/cleanup.go. Run after a
+sync, it deletes a UDP flow whose original destination is a Service's cluster IP and port and
+whose reply source is none of the Service's serving endpoints: "We map all the serving endpoints
+of the service and clear all the conntrack entries which are destined for the service and are not
+DNATed to these endpoints." A Service with none is passed over: "a Service without endpoints does
+not require to clean the conntrack entries associated."
+
+[17] Linux kernel documentation, "Netfilter Conntrack Sysfs variables",
+https://docs.kernel.org/networking/nf_conntrack-sysctl.html. "nf_conntrack_udp_timeout - INTEGER
+(seconds) default 30"; "nf_conntrack_udp_timeout_stream - INTEGER (seconds) default 120. This
+extended timeout will be used in case there is an UDP stream detected."
+
 ## What the sources settle
 
 **A founder is named by a Service of its own.** A pod's address is its own and goes with it [2],
@@ -177,10 +191,34 @@ started again at once on the same directory, which takes its directory's lock th
 released on every CI target. A check's shared hold refuses the node's own take for that moment, so
 the node takes it again at its next turn rather than waiting.
 
+**A Service's cluster IP carries a peer's QUIC only until its pod is replaced.** A founder's QUIC
+endpoint is one UDP socket, from which it dials each peer whose id is above its own, so every packet
+of its dials to a peer's Service is one flow, and it dials again within the idle timeout and its
+backoff, each at most three initial probe timeouts (about 3 s): the flow's entry, a stream's, lasts
+120 s past its last packet [17] and never reaches it. A flow is translated to an endpoint when its
+entry is made, and kube-proxy removes an entry whose endpoint is gone only in a sync, and only for a
+Service that then has a serving endpoint [16]. In the KIND cell on 2026-11-05 (kube-proxy v1.36.4,
+iptables mode), the founder of the highest id, which both its peers dial, was not ready for 3 min 7
+s after its pod was killed, its peers' links to it still unkeyed after 20 and 38 dials: on both
+peers' nodes the flow from the peer's port 7000 to its Service's cluster IP was still translated to
+the killed pod's address, assured, its 120 s renewed. Deleting the entry on one node (`conntrack
+-D`) keyed that peer's link 8 s later; the other node's entry was replaced by the next second after
+another founder's pod was killed, a change kube-proxy syncs on, the likelier cause but not traced.
+The founders of the other ids, which dial their peers from the new pod, were ready 7 s after their
+kills. A founder its peers dial is so out of reach once its pod is replaced until kube-proxy happens
+to sync, for as long as its peers keep dialing; the plane's datagrams take the same path.
+
 **Stopped within the grace.** SIGTERM begins the node's orderly stop, bounded by `stop_ms` [7],
 and the pod is killed at its grace [4]: the grace is stated above `stop_ms`.
 
 ## Open
+
+Founders reached without translation: at their pods' addresses by the StatefulSet's governing
+headless Service's per-pod names, so no flow outlives the pod it reached; each name resolved again,
+off the node's shards, when a link to it ends, the changed address taken as `learn` takes one
+(it disconnects and dials again); a start not failed by a peer whose name does not resolve yet,
+since a pod not yet made has no record; clients resolving a node's name again at each connection;
+and the per-pod Services removed. It changes the start's resolution [7] and is not built.
 
 kind's local-path storage does not hold a claim to its stated size (the provisioner's own
 README), so a founder's volume bytes are stated in the chart's values rather than read from its

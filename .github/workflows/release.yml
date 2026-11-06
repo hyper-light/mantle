@@ -1,0 +1,151 @@
+# The release (docs/design/release.md): `mantle`, the one binary that is a cell's node and its
+# client, built in release mode for each supported target on that target's own runner, packed as an
+# archive with its SHA-256, and proven as a user takes it: unpacked, a cell of three made and served
+# by it on loopback, its object commands through the native QUIC door and the AWS CLI through the S3
+# HTTP door, every object read back through both byte for byte, then its own transfer harness
+# (scripts/release.py). A pushed tag `vVERSION`, VERSION the workspace's, publishes the five archives
+# and their checksums as the tag's GitHub Release, once the gates passed for its commit. A push that
+# changes the release's own files, or a manual run, does all of it but publish.
+#
+# The actions are pinned to commits, as GitHub's guide to their secure use asks: a tag can be moved
+# or deleted, a commit cannot (docs/research/85). Only the publishing job may write.
+name: release
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+    # Not evaluated for a tag's push, which always runs (GitHub's workflow syntax).
+    paths:
+      - .github/workflows/release.yml
+      - scripts/release.py
+      - scripts/stock-clients.sh
+      - crates/mantle/tests/support/boto3-requirements.txt
+  workflow_dispatch:
+permissions:
+  contents: read
+# A branch's newer push supersedes its run; a tag's run is never cancelled.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type == 'branch' }}
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The workspace's version, which a tag must name
+        id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          if [ "$REF_TYPE" = tag ] && [ "$REF_NAME" != "v$version" ]; then
+            echo "release: the tag $REF_NAME is not v$version, the workspace's version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built on Ubuntu 22.04, the oldest Ubuntu GitHub runs: the binary takes no glibc symbol
+          # newer than that glibc's, 2.35 (docs/design/release.md).
+          - { name: linux-x86_64, runner: ubuntu-22.04, target: x86_64-unknown-linux-gnu, python: python3 }
+          - { name: linux-aarch64, runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, python: python3 }
+          - { name: macos-aarch64, runner: macos-15, target: aarch64-apple-darwin, python: python3 }
+          # The C runtime linked in, so the binary asks no Visual C++ Redistributable of its host
+          # (docs/design/release.md).
+          - { name: windows-x86_64, runner: windows-2025, target: x86_64-pc-windows-msvc, python: python, rustflags: -C target-feature=+crt-static }
+          - { name: windows-aarch64, runner: windows-11-arm, target: aarch64-pc-windows-msvc, python: python, rustflags: -C target-feature=+crt-static }
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      BINARY: target/${{ matrix.target }}/release/${{ contains(matrix.target, 'windows') && 'mantle.exe' || 'mantle' }}
+      ARCHIVE: dist/mantle-${{ needs.version.outputs.version }}-${{ matrix.target }}.${{ contains(matrix.target, 'windows') && 'zip' || 'tar.gz' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup target add --toolchain 1.98.1 ${{ matrix.target }}
+      # AWS-LC's x86_64 Windows assembly is NASM source, built rather than taken prebuilt
+      # (vendor/UPSTREAM.md).
+      - name: Install NASM
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
+      # From nothing cached: the binary is built from the commit's sources alone.
+      - name: Release build
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --release --locked -p mantle --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: ${{ matrix.python }} scripts/release.py package "$VERSION" ${{ matrix.target }} "$BINARY" dist
+      # The stock S3 clients the check asks the cell through: the AWS CLI v2 and boto3 pinned with
+      # every hash, test tools the owner approved (2026-10-25).
+      - name: Stock S3 clients
+        shell: bash
+        run: bash scripts/stock-clients.sh
+      - name: The archive as a user takes it, the server and the client through both doors
+        shell: bash
+        run: ${{ matrix.python }} scripts/release.py check "$VERSION" ${{ matrix.target }} "$ARCHIVE"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mantle-${{ needs.version.outputs.version }}-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    # A pushed tag alone publishes; a manual run on a tag is a dry run like any other.
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          pattern: mantle-*
+          merge-multiple: true
+      - name: Each archive the bytes its job checked
+        working-directory: dist
+        run: |
+          ls -l
+          sha256sum --check --strict *.sha256
+      # The gates (ci.yml) are the suites on every target; the archives' check is the binary's.
+      - name: The gates passed for the tagged commit
+        run: |
+          passed="$(gh api "repos/$GH_REPO/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&status=success" --jq .total_count)"
+          if [ "$passed" -eq 0 ]; then
+            echo "release: no run of the gates passed for $GITHUB_SHA; once one has, re-run this job" >&2
+            exit 1
+          fi
+      - name: Publish the release
+        run: |
+          prerelease=()
+          case "$VERSION" in *-*) prerelease=(--prerelease) ;; esac
+          design="https://github.com/$GH_REPO/blob/$TAG/docs/design/release.md"
+          gh release create "$TAG" dist/* --verify-tag --title "mantle $VERSION" "${prerelease[@]}" \
+            --notes "Each archive holds \`mantle\`, the node and the client, for its target, with its SHA-256 beside it; [the release's design]($design) says how each was checked." \
+            --generate-notes

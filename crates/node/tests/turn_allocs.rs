@@ -86,16 +86,15 @@ fn serving(seed: u64, ops: u64) -> alloc::Counts {
     counts
 }
 
-/// 77,323 allocations before (the events' buffer 395 of them, `drive`'s lists 19,870, the plane's
-/// copies 11,970); 45,088 or 45,089 now. Not one number: the clients draw their identities and
-/// nonces at random, and an encoding a byte longer moves a buffer's growth by one allocation now
-/// and then (45,088 in six runs of seven, 45,089 in one; reallocations 6,372 to 6,377), so the
-/// count is held within two of those.
+/// 77,323 allocations before the turn kept its buffers (the events' buffer 395 of them, `drive`'s
+/// lists 19,870, the plane's copies 11,970); 45,088 or 45,089 after, and 41,182 since the range's
+/// messages, rows and keys are each made at their lengths, an entry's overlay keeps the rows it
+/// is given and a put's commands go to their ranges moved (reallocations 6,372 to 6,377 before,
+/// 2,303 to 2,307 now). The clients draw their identities and nonces at random, which moved a
+/// buffer's growth by an allocation now and then while encodings grew; made at their lengths,
+/// they no longer do, so the count is exact.
 #[test]
 fn a_cell_serving_writes_turns_without_remaking_what_a_turn_keeps() {
     let counts = serving(1, 40);
-    assert!(
-        (45_086..=45_091).contains(&counts.allocations),
-        "{counts:?}"
-    );
+    assert_eq!(counts.allocations, 41_182, "{counts:?}");
 }

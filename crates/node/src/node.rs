@@ -3326,6 +3326,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// without a leader or until the range answers (§5.4). Its outcome comes from
     /// [`Self::take_command`] under the number returned. Refused when the node holds as many
     /// commands of its own as it keeps, those answered and not yet taken among them.
+    /// Whether the node holds fewer commands than it keeps, those answered and not yet taken
+    /// with them: whether `command` takes one more.
+    pub fn command_room(&self) -> bool {
+        let held = self
+            .asking
+            .iter()
+            .map(Asking::held)
+            .fold(self.commands_done.len(), usize::saturating_add);
+        held < self.command_asks
+    }
+
     pub fn command(
         &mut self,
         group: u128,
@@ -3338,12 +3349,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 "a node's commands name only itself".into(),
             ));
         }
-        let held = self
-            .asking
-            .iter()
-            .map(Asking::held)
-            .fold(self.commands_done.len(), usize::saturating_add);
-        if held >= self.command_asks {
+        if !self.command_room() {
             return Err(NodeError::Asks);
         }
         let at = match self.asking.iter().position(|a| a.group == group) {

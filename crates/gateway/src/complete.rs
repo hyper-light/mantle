@@ -445,20 +445,28 @@ impl Completion {
         }
         let last = self.listed.len().saturating_sub(1);
         // The list is the client's, already parsed and held; a reservation the allocator
-        // refuses is a completion too large to address, not an abort.
+        // refuses is a completion too large to address, not an abort. Its ETags, each the one
+        // its part's row holds, move into the command: a retry, which reads the list again, is
+        // only asked before any part is (`retry`).
+        let listed = std::mem::take(&mut self.listed);
         let mut parts = Vec::new();
         parts
-            .try_reserve_exact(self.listed.len())
+            .try_reserve_exact(listed.len())
             .map_err(|_| CompleteError::Overflow)?;
-        for (i, (number, etag)) in self.listed.iter().enumerate() {
-            let part = self.rows.get(number).ok_or(CompleteError::InvalidPart)?;
-            if part.etag != *etag {
+        let mut etags = Vec::new();
+        etags
+            .try_reserve_exact(listed.len())
+            .map_err(|_| CompleteError::Overflow)?;
+        for (i, (number, etag)) in listed.into_iter().enumerate() {
+            let part = self.rows.get(&number).ok_or(CompleteError::InvalidPart)?;
+            if part.etag != etag {
                 return Err(CompleteError::InvalidPart);
             }
             if i < last && part.size < MIN_PART {
                 return Err(CompleteError::EntityTooSmall);
             }
-            parts.push((*number, part));
+            parts.push((number, part));
+            etags.push(etag);
         }
         let size = parts
             .iter()
@@ -471,9 +479,10 @@ impl Completion {
         };
         self.complete.parts = parts
             .iter()
-            .map(|(number, p)| Listed {
+            .zip(etags)
+            .map(|((number, p), etag)| Listed {
                 number: *number,
-                etag: p.etag.clone(),
+                etag,
                 file: p.file,
             })
             .collect();
@@ -543,9 +552,14 @@ impl Completion {
         if let Some(deadline_ns) = deadline_ns {
             self.complete.deadline_ns = deadline_ns;
         }
+        // The command is asked once, its list of up to 10,000 parts carried into it, not
+        // copied: what `done` reads of it after is its ETag, size and checksum.
+        let parts = std::mem::take(&mut self.complete.parts);
+        let mut command = self.complete.clone();
+        command.parts = parts;
         self.ask(
             Asked::Name,
-            Request::Name(Box::new(name::Command::Complete(self.complete.clone()))),
+            Request::Name(Box::new(name::Command::Complete(command))),
         )
     }
 

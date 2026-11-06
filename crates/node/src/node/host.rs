@@ -1822,6 +1822,20 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         id: u64,
         request: put::Request,
     ) -> Result<Option<put::Request>, NodeError> {
+        // A command goes to its range as the driver made it, moved, once the node has room
+        // for it; without room it waits whole for the next turn.
+        let request = match request {
+            put::Request::Block(command) if self.command_room() => {
+                return self.ask_command(at, id, Layer::Block, Command::Block(command));
+            }
+            put::Request::File(command) if self.command_room() => {
+                return self.ask_command(at, id, Layer::File, Command::File(command));
+            }
+            put::Request::Name(command) if self.command_room() => {
+                return self.ask_command(at, id, Layer::Name, Command::Name(command));
+            }
+            request => request,
+        };
         let asked = match &request {
             put::Request::Place { block, .. } => {
                 let Ok(volumes) = self.table().map(|t| place::order(*block, &t.placed)) else {
@@ -1867,27 +1881,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.put_chunk(node, *volume, *key, bytes.clone(), (*crc, remaining))
                     .map(Pending::Chunk)
             }
-            put::Request::Block(command) => self
-                .group_of(Layer::Block)
-                .ok_or(NodeError::Bounds("no Block range here".into()))
-                .and_then(|g| {
-                    self.command(g, Command::Block(command.clone()), u64::MAX, Wait::Request)
-                })
-                .map(Pending::Command),
-            put::Request::File(command) => self
-                .group_of(Layer::File)
-                .ok_or(NodeError::Bounds("no File range here".into()))
-                .and_then(|g| {
-                    self.command(g, Command::File(command.clone()), u64::MAX, Wait::Request)
-                })
-                .map(Pending::Command),
-            put::Request::Name(command) => self
-                .group_of(Layer::Name)
-                .ok_or(NodeError::Bounds("no Name range here".into()))
-                .and_then(|g| {
-                    self.command(g, Command::Name(command.clone()), u64::MAX, Wait::Request)
-                })
-                .map(Pending::Command),
+            put::Request::Block(_) | put::Request::File(_) | put::Request::Name(_) => {
+                Err(NodeError::Asks)
+            }
         };
         match asked {
             Ok(pending) => {
@@ -1902,6 +1898,32 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Ok(None)
             }
         }
+    }
+
+    /// Asks `command` of `layer`'s range for request `id` of job `at`, the node having room for
+    /// it; a refusal fails the job.
+    fn ask_command<R>(
+        &mut self,
+        at: usize,
+        id: u64,
+        layer: Layer,
+        command: Command,
+    ) -> Result<Option<R>, NodeError> {
+        let asked = self
+            .group_of(layer)
+            .ok_or(NodeError::Bounds(
+                "no range of the command's layer here".into(),
+            ))
+            .and_then(|g| self.command(g, command, u64::MAX, Wait::Request));
+        match asked {
+            Ok(ask) => {
+                if let Some(job) = self.jobs.get_mut(at) {
+                    job.pending.push((Pending::Command(ask), Some(id)));
+                }
+            }
+            Err(_) => self.fail_job(at, Status::Failed)?,
+        }
+        Ok(None)
     }
 
     /// A get's or head's current version, read: its preconditions judged and its range resolved
@@ -2556,6 +2578,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             completing.key.clone(),
             completing.upload.clone(),
         );
+        // A completion's commands, its list of parts among them, go to their ranges moved, as
+        // a put's do (`ask_put`).
+        let request = match request {
+            complete::Request::File(command) if self.command_room() => {
+                return self.ask_command(at, id, Layer::File, Command::File(command));
+            }
+            complete::Request::Name(command) if self.command_room() => {
+                return self.ask_command(at, id, Layer::Name, Command::Name(command));
+            }
+            request => request,
+        };
         let asked = match &request {
             complete::Request::Upload => self
                 .group_of(Layer::Name)
@@ -2583,20 +2616,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     self.read(g, query, u64::MAX, Wait::Request)
                 })
                 .map(Pending::Read),
-            complete::Request::File(command) => self
-                .group_of(Layer::File)
-                .ok_or(NodeError::Bounds("no File range here".into()))
-                .and_then(|g| {
-                    self.command(g, Command::File(command.clone()), u64::MAX, Wait::Request)
-                })
-                .map(Pending::Command),
-            complete::Request::Name(command) => self
-                .group_of(Layer::Name)
-                .ok_or(NodeError::Bounds("no Name range here".into()))
-                .and_then(|g| {
-                    self.command(g, Command::Name(command.clone()), u64::MAX, Wait::Request)
-                })
-                .map(Pending::Command),
+            complete::Request::File(_) | complete::Request::Name(_) => Err(NodeError::Asks),
         };
         match asked {
             Ok(pending) => {

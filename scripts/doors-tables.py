@@ -92,12 +92,13 @@ def read_quic(raw, name):
                       r"99\.9th: ([0-9]+), 99\.99th: ([0-9]+).*Max: ([0-9]+)", text)
         if m:
             run = {"rps": m[1], "p50_us": m[2], "p99_us": m[4], "p99.9_us": m[5], "p99.99_us": m[6], "max_us": m[7]}
-        m = re.search(r"RPS: ([0-9.]+) \(([0-9]+) requests", text)
+        found = re.findall(r"RPS: ([0-9.]+) \(([0-9]+) requests", text)
+        m = found[-1] if found else None
         if m:
-            run = {"rps": m[1], "requests": m[2]}
+            run = {"rps": m[0], "requests": m[1]}
             tail = text[text.find("Stream metrics"):]
             for row in ("P50", "P90", "P100"):
-                r = re.search(r"\b" + row + r"\s+│\s+(\S+)\s+│\s+(\S+)\s+\|\s+(\S+)", tail)
+                r = re.search(r"\b" + row + r"\s+[│|]\s+(\S+)\s+[│|]\s+(\S+)\s+[│|]\s+(\S+)", tail)
                 if r:
                     run[row + "_up"], run[row + "_down"], run[row + "_fbl"] = r[1], r[2], r[3]
         m = re.search(r"open loop, over one RTT \(ms\): n=([0-9]+) p50=(\S+) \[(\S+)\] p99=(\S+) \[\S+\] "
@@ -182,11 +183,14 @@ def main(top):
       "the median of the rounds' values, n summed.\n")
 
     w("## Latency and cost per operation\n")
+    w("ops/s is the phase's operations over its elapsed time; lateness p99 is how late an operation started "
+      "after its intended start (open loop): where it is near the latency, the door ran at its capacity and the "
+      "latency is mostly the queue's.\n")
     w("Arm A1 and A2 are the timed build (the A/A pair), C the counting build; comparators run the HTTP door "
       "with A1 as the harness. cpu = the servers' user+system ns/op (from /proc ticks); instr and cycles = "
       "`perf stat` user-space counts of the servers' processes over the phase; faults = minor faults/op.\n")
-    w("| door | op | size | cond | arm | n | p50 [95%] | p99 | p99.9 | p99.99 | max | cpu ns/op | instr/op | cycles/op | faults/op | failed |")
-    w("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    w("| door | op | size | cond | arm | n | ops/s | lateness p99 | p50 [95%] | p99 | p99.9 | p99.99 | max | cpu ns/op | instr/op | cycles/op | faults/op | failed |")
+    w("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     order = {s: i for i, s in enumerate(SIZES)}
 
     def sort_key(k):
@@ -204,7 +208,10 @@ def main(top):
             p50 = show(median(number(p["p50"]) for p in ps))
         q = {k: show(median(number(p[k]) for p in ps)) for k in ("p99", "p99.9", "p99.99", "max")}
         failed = sum(int(p.get("failed") or 0) for p in ps)
-        w(f"| {door} | {op} | {size} | {cond} | {arm} | {n} | {p50} | {q['p99']} | {q['p99.9']} | {q['p99.99']} | "
+        ms = sum(number(p.get("elapsed_ms")) or 0 for p in ps)
+        rate = show(n / ms * 1000 if ms else None)
+        late = show(median(number(p.get("lateness_p99")) for p in ps))
+        w(f"| {door} | {op} | {size} | {cond} | {arm} | {n} | {rate} | {late} | {p50} | {q['p99']} | {q['p99.9']} | {q['p99.99']} | "
           f"{q['max']} | {show(median(per_op_cpu(p) for p in ps), 0)} | "
           f"{show(median(number(p.get('instructions/op')) for p in ps), 0)} | "
           f"{show(median(number(p.get('cycles/op')) for p in ps), 0)} | "

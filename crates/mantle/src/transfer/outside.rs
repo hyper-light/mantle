@@ -22,6 +22,9 @@ fn unread(what: String) -> TransferError {
 pub struct Outside {
     out: PathBuf,
     gateway: Gateway,
+    /// Each founder's QUIC endpoint as the cell file names it.
+    names: Vec<(u64, Endpoint)>,
+    /// Where each founder's name reached as the run began.
     quic: Vec<(u64, SocketAddr)>,
     s3: Vec<(String, String)>,
     bind: SocketAddr,
@@ -44,6 +47,7 @@ impl Outside {
                 nodes.len()
             )));
         }
+        let mut names = Vec::with_capacity(nodes.len());
         let mut quic = Vec::with_capacity(nodes.len());
         let mut s3 = Vec::with_capacity(nodes.len());
         let mut volume_bytes = None;
@@ -55,6 +59,7 @@ impl Outside {
                 .next()
                 .ok_or_else(|| unread(format!("{reach} resolves to no address")))?;
             quic.push((*id, address));
+            names.push((*id, at.clone()));
             let config = crate::init::founder_dir(out, *id, nodes.len()).join("config");
             let stated = mantle_node::process::read_stated(&config)
                 .map_err(|e| unread(format!("{}: {e}", config.display())))?;
@@ -77,6 +82,7 @@ impl Outside {
         Ok(Self {
             out: out.to_path_buf(),
             gateway: Gateway::open(out, bind)?,
+            names,
             quic,
             s3,
             bind,
@@ -100,8 +106,20 @@ impl Reach for Outside {
         &self.gateway
     }
 
+    /// Each founder's name looked up again, as its pod may have come back at another address
+    /// (research/78); where it does not resolve now, the address it gave as the run began.
     fn quic(&self) -> Vec<(u64, SocketAddr)> {
-        self.quic.clone()
+        self.names
+            .iter()
+            .zip(&self.quic)
+            .map(|((id, at), (_, began))| {
+                let now = (at.host.as_str(), at.port)
+                    .to_socket_addrs()
+                    .ok()
+                    .and_then(|mut found| found.next());
+                (*id, now.unwrap_or(*began))
+            })
+            .collect()
     }
 
     fn s3(&self) -> Vec<(String, String)> {

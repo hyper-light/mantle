@@ -37,14 +37,13 @@ back through both:
   readiness lock (main `72511e15`, run 4) ([KIND](measurements/2026-11-04-kind-cell.md); below, "A
   cell on Kubernetes").
 
-Open: a founder its peers dial was out of reach for 3 min 7 s after its pod was replaced in the kind
-cluster, its peers' QUIC flows to its Service's cluster IP still translated to the killed pod and
-renewed by their dials until the stale entries went, one deleted by hand
-([research/78](research/78-a-cell-in-kubernetes.md); its fix, founders reached at their pods'
-addresses by the headless Service's names and each resolved again, is proposed there and not built);
-and the box's 100 GiB parts reruns wait on the box. The disruption's refusals "with every founder
-ready" were the readiness record a killed founder's directory kept: readiness is now the lock its
-living, enlisted process holds (main `72511e15`).
+Open: the box's 100 GiB parts reruns wait on the box. A founder its peers dial was out of reach for
+3 min 7 s after its pod was replaced in the kind cluster, its peers' QUIC flows to its Service's
+cluster IP still translated to the killed pod ([research/78](research/78-a-cell-in-kubernetes.md));
+founders are now reached at their pods' own names under the headless Service, each looked up again
+when a link to it ends, which the KIND cell is yet to be measured on. The disruption's refusals
+"with every founder ready" were the readiness record a killed founder's directory kept: readiness is
+now the lock its living, enlisted process holds (main `72511e15`).
 
 `mantle disk probe` reports what the operating system knows about the device that holds a
 directory and, with `--measure`, benchmarks the device. It is built on:
@@ -951,22 +950,24 @@ before it lands. On macOS x86_64, which no CI target supports, tests/node.rs's r
 fenced once on a snapshot its engine refused (`the engine refused a snapshot`), the engine's error
 not kept by the fence (`crates/range/src/stored.rs`).
 
-**A cell on Kubernetes** ([design](design/kubernetes.md), [research/78](research/78-a-cell-in-kubernetes.md)).
-Built 2026-11-03 for the data layer's plan step 11: the image (`Dockerfile`, `mantle` alone on
-distroless, non-root); the chart (`deploy/helm/mantle`: a StatefulSet of three founders started
-`Parallel`, one to a Kubernetes node by required anti-affinity, two claims each, requests equal to
-limits, the grace held above the node's stop, readiness from `mantle status`, a Service for each
-founder publishing not-ready addresses, a headless one and the cell's S3 Service); founders reached
-at their Services' names (`mantle init --node reach=HOST`, resolved once by peers and clients); a
-gateway pinned before the founders start (`mantle init gateway`); each founder's directory one
-Secret's value (`mantle pack`), installed owner-only by an init container (`mantle install`); and
-the transfer harness on a cell running elsewhere (`mantle bench transfer --cell`, `--disrupt`),
-every acknowledged object read back through each node after a founder's pod is deleted mid-transfer.
-Its proof is the CI job `kind-cell` (`scripts/check-chart.sh`, `scripts/kind-cell.sh`), first green
-in run 41738909698 on `bda7218c` (2026-11-03): helm lint and the golden render under helm v4.3.0;
-in a kind cluster of three workers the cell elected with each founder on a kind node of its own and
-every founder ready within 65 s of the install; the harness's CI scale from a Job, founder pod mantle-1
-deleted halfway through the small set's native puts:
+**A cell on Kubernetes** ([design](design/kubernetes.md),
+[research/78](research/78-a-cell-in-kubernetes.md)). Built 2026-11-03 for the data layer's plan step
+11: the image (`Dockerfile`, `mantle` alone on distroless, non-root); the chart
+(`deploy/helm/mantle`: a StatefulSet of three founders started `Parallel`, one to a Kubernetes node
+by required anti-affinity, two claims each, requests equal to limits, the grace held above the
+node's stop, readiness from `mantle status`, the governing headless Service publishing not-ready
+addresses and the cell's S3 Service); founders reached at their pods' own names under it (`mantle
+init --node reach=HOST`), each looked up again by its peers when a link to it ends (research/78, "A
+founder is named by its pod's record"); a gateway pinned before the founders start (`mantle init
+gateway`); each founder's directory one Secret's value (`mantle pack`), installed owner-only by an
+init container (`mantle install`); and the transfer harness on a cell running elsewhere (`mantle
+bench transfer --cell`, `--disrupt`), every acknowledged object read back through each node after a
+founder's pod is deleted mid-transfer. Its proof is the CI job `kind-cell`
+(`scripts/check-chart.sh`, `scripts/kind-cell.sh`), first green in run 41738909698 on `bda7218c`
+(2026-11-03): helm lint and the golden render under helm v4.3.0; in a kind cluster of three workers
+the cell elected with each founder on a kind node of its own and every founder ready within 65 s of
+the install; the harness's CI scale from a Job, founder pod mantle-1 deleted halfway through the
+small set's native puts:
 
 | Case | Objects | Bytes acknowledged | Refused | Wrong | Missing | Each block's chunks on distinct nodes | Read through each node after |
 |---|---|---|---|---|---|---|---|

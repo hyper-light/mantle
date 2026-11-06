@@ -861,10 +861,13 @@ fn copy_tree(from: &Path, to: &Path) {
     }
 }
 
-/// A peer named by a name that never resolves (the reserved `.invalid` domain, RFC 6761 §6.4) stops
-/// `mantle serve` as it starts, before it listens, naming the peer and the name.
+/// A peer named by a name that does not resolve (the reserved `.invalid` domain, RFC 6761 §6.4)
+/// does not stop `mantle serve`: a name stands for whatever address its holder has now, and a pod not
+/// yet made again has none (research/78). The node listens and enlists, and says the name unresolved
+/// as it starts and again when it looks it up at the peer's backoff, naming the peer and the name;
+/// asked to stop, it exits well.
 #[test]
-fn a_peer_whose_name_does_not_resolve_stops_the_start_naming_it() {
+fn a_peer_whose_name_does_not_resolve_yet_is_looked_up_again_and_the_start_goes_on() {
     let root = tempfile::tempdir().unwrap();
     let out = root.path().join("cell");
     let data = root.path().join("data");
@@ -889,24 +892,46 @@ fn a_peer_whose_name_does_not_resolve_stops_the_start_naming_it() {
     let mut text = std::fs::read_to_string(&config).unwrap();
     text.push_str("peer = 77 node identity/node.der peer-77.invalid:7000 peer-77.invalid:7001\n");
     std::fs::write(&config, text).unwrap();
-    let served = Command::new(NODE)
+    let mut served = Command::new(NODE)
         .arg("serve")
         .arg(&config)
-        .stdin(Stdio::null())
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
         .unwrap();
-    let said = String::from_utf8_lossy(&served.stderr);
-    assert!(!served.status.success(), "{said}");
-    assert!(
-        said.contains("peer 77") && said.contains("peer-77.invalid:7000"),
-        "{said}"
-    );
-    assert!(
-        !String::from_utf8_lossy(&served.stdout)
-            .lines()
-            .any(|line| line.starts_with("bound ")),
-        "it listened"
-    );
+    let mut input = served.stdin.take().unwrap();
+    let output = served.stdout.take().unwrap();
+    // The node's lines, read to their end on a thread of their own, so the node never waits on a
+    // full pipe; the test takes them until it has what it waits for.
+    let (tell, heard) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in std::io::BufRead::lines(std::io::BufReader::new(output)) {
+            let Ok(line) = line else { break };
+            if tell.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let (mut bound, mut enlisted, mut unresolved) = (false, false, 0);
+    let mut said = Vec::new();
+    while !(bound && enlisted && unresolved >= 2) {
+        let Ok(line) = heard.recv() else {
+            panic!("the node ended its output first: {said:?}");
+        };
+        bound |= line.starts_with("bound ");
+        enlisted |= line == "enlisted";
+        if line.starts_with("unresolved 77 peer-77.invalid:7000 ") {
+            unresolved += 1;
+        }
+        if !line.starts_with("basis ") {
+            said.push(line);
+        }
+    }
+    std::io::Write::write_all(&mut input, b"stop\n").unwrap();
+    let exited = served.wait().unwrap();
+    drop(heard);
+    reader.join().unwrap();
+    assert!(exited.success(), "exited {exited}: {said:?}");
 }
 
 /// `mantle init` makes a cell of three from a machines file's two founders and a `--node`'s, the

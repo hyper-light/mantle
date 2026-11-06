@@ -419,7 +419,7 @@ are sized by their shares (`derive::engine_within`) and take no limit.
 |---|---|---|
 | `id`, `certificate`, `key`, `authority` | stated | written by `mantle init` (§1.5); an id is 64 bits from the OS, as hyper-transport's `PeerId` holds, where §1.5 names 128 |
 | `dir` | stated | the node's directory (§1.6): where `mantle init` writes its `config`, `identity/`, `keys/` and hyper-rt's calibration record, and where the node keeps its log, its run record and each range's engine store, under its own `LOCK` |
-| `quic`, `plane`, `domain`, `peer` lines | stated | the operator's addresses and failure domain; each peer by the certificate its authority issued and where it listens, a name resolved at each dial |
+| `quic`, `plane`, `domain`, `peer` lines | stated | the operator's addresses and failure domain; each peer by the certificate its authority issued and where it listens, a name resolved at the start and again when its link ends |
 | `voters`, `range` lines, `root_key` lines | stated | the cell's founders and founding groups, drawn with its authority, and the root key's generations (§1.5; encryption.md §2) |
 | `root.max_nodes`, `root.max_volumes` | stated | the cell's bounds (architecture §11) |
 | `volume` directory and bytes | stated | the devices that hold data |
@@ -556,9 +556,10 @@ and the command line (`crates/mantle/tests/native.rs`).
 *As built (2026-11-03): founders behind names, a gateway pinned, a founder carried whole.* A
 founder may state its reach (`reach=HOST`, an IP address or a DNS name), the host its peers and
 native clients dial on its QUIC and plane ports where it differs from the address it binds, as a
-Kubernetes Service's name in front of a pod (kubernetes.md §2; research/78): its peers' `peer`
-lines and the cell file's `node` lines name that host, a node resolves a peer line's names once at
-its start, and a client resolves its `node` lines' at its own. `mantle init gateway NAME --cell
+Kubernetes pod's own name under its StatefulSet's governing Service (kubernetes.md §2; research/78):
+its peers' `peer` lines and the cell file's `node` lines name that host, a node resolves a peer
+line's names at its start and again as it runs (§1.7), and a client resolves its `node` lines' when
+it is made. `mantle init gateway NAME --cell
 OUT` issues a gateway's certificate under the authority and pins it in each founder's
 configuration (`peer = ID gateway identity/peers/gateway-ID.der`, its certificate beside the
 founder's peers'), before any founder starts. `mantle pack DIR FILE` carries a directory as one
@@ -697,16 +698,22 @@ the cell and a late packet draws at most a stateless reset (RFC 9000 §10.2's no
 round trip on a loaded host stretched a connection's three probe timeouts to 9.5 s, past the 10 s
 bound with the hand-over's 1.5 s (windows-aarch64, diag run 41260378525).
 
-*As built (2026-10-24).* A `peer` line may name where the peer listens, `peer = ID ROLE
+*As built (2026-10-24; 2026-11-05).* A `peer` line may name where the peer listens, `peer = ID ROLE
 CERTIFICATE QUIC PLANE`, each `HOST:PORT` with the host an address or a name. `mantle serve`
-resolves each name as it starts, once its volumes are open and before its runtime runs, through
-the platform's resolver (std's `ToSocketAddrs`: getaddrinfo, GetAddrInfoW, what hyper-rt's
-`dns::resolve` wraps), taking the first address of the family its own socket binds, the only
-family that socket sends to (`localhost` resolves to `::1` before `127.0.0.1` on macOS); a name
-with no such address, or one the resolver refuses, ends the start naming the peer and the name.
-`mantle init` writes each founder's peers with the addresses the founders stated, but for a
-founder stated at port 0 or at no address of its own: where it listens is known only once it
-binds, and its peers learn it on standard input, as of a peer that moved.
+resolves each name as it starts, once its volumes are open and before its runtime runs, through the
+platform's resolver (std's `ToSocketAddrs`: getaddrinfo, GetAddrInfoW, what hyper-rt's
+`dns::resolve` wraps), taking the first address of the family its own socket binds, the only family
+that socket sends to (`localhost` resolves to `::1` before `127.0.0.1` on macOS); an address of the
+other family ends the start naming the peer. A name stands for whatever address its holder has now,
+and a Kubernetes pod made again comes back at another (research/78): a name that does not resolve as
+the node starts does not end the start, and the node looks each named peer up again as it runs
+(`names`), whenever its link to the peer ends or, while the name does not resolve, at the peer's
+backoff (`bounds::backed_off`, `bounds::pause`), one lookup at a time on hyper-rt's blocking pool
+off the shards, saying `unresolved ID HOST:PORT WHY` and, where the name gives another address than
+it last did, `resolved ID QUIC PLANE` as it dials there (`Node::learn`). `mantle init` writes each
+founder's peers with the addresses the founders stated, but for a founder stated at port 0 or at no
+address of its own: where it listens is known only once it binds, and its peers learn it on standard
+input, as of a peer that moved.
 
 A start's failure names its step (`Step`, `ProcessError::Start`): configuration, identity, locks,
 devices, budgets, storage or network, as in `mantle: the start's locks step: …/LOCK: another

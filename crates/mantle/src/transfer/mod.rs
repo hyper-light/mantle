@@ -552,6 +552,9 @@ pub fn transfer(out: &mut impl Write, options: &Options) -> Result<bool, Transfe
                 )?;
                 let short = !disrupt.is_empty();
                 disrupt = &[];
+                // A founder's pod the disruption made again listens at another address under its
+                // name: every read from here asks the cell where its names reach now.
+                natives.renew(cell);
                 let set = (Objects::Small, &oracle, count, options.seed);
                 exact &= placed(out, (cell, &mut natives, messages), &case, set, &bucket)?;
                 uncounted(out, &case)?;

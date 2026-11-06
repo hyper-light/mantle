@@ -1,6 +1,10 @@
 {{- /*
-The headless Service that governs the StatefulSet: each pod's name under it, published before the
-pod is ready, since a founder is ready only once the cell it forms with its peers enlisted it.
+The headless Service that governs the StatefulSet: each pod's own name under it,
+`<pod>.<fullname>.<namespace>.svc.<clusterDomain>`, is the pod's address, published before the pod is
+ready, since a founder is ready only once the cell it forms with its peers enlisted it. A founder is
+reached there, at its pod's address with no translation, so no peer's flow outlives the pod it
+reached, and each node looks a peer's name up again when its link to it ends, a pod made again
+coming back at another address (research/78).
 */ -}}
 apiVersion: v1
 kind: Service
@@ -13,42 +17,6 @@ spec:
   publishNotReadyAddresses: true
   selector:
     {{- include "mantle.selectorLabels" . | nindent 4 }}
-{{- /*
-A Service for each founder, its pod's alone by the label the StatefulSet gives each pod: its cluster
-IP is assigned once and kept through updates, so the name a founder's peers and clients resolve once
-reaches it across every deletion of its pod, at whatever address the pod comes back; it carries the
-node's QUIC and plane (UDP) and its S3 listener (TCP), and is published before the pod is ready, as
-the peers it must reach to become ready dial it here (research/78).
-*/}}
-{{- range $index := until (int .Values.replicas) }}
-{{- $pod := include "mantle.podName" (dict "root" $ "index" $index) }}
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: {{ $pod }}
-  labels:
-    {{- include "mantle.labels" $ | nindent 4 }}
-spec:
-  type: ClusterIP
-  publishNotReadyAddresses: true
-  selector:
-    {{- include "mantle.selectorLabels" $ | nindent 4 }}
-    statefulset.kubernetes.io/pod-name: {{ $pod }}
-  ports:
-    - name: quic
-      port: {{ int $.Values.ports.quic }}
-      targetPort: quic
-      protocol: UDP
-    - name: plane
-      port: {{ int $.Values.ports.plane }}
-      targetPort: plane
-      protocol: UDP
-    - name: s3
-      port: {{ int $.Values.ports.s3 }}
-      targetPort: s3
-      protocol: TCP
-{{- end }}
 ---
 {{- /*
 The cell's S3 endpoint: every ready founder's listener behind one address, a founder ready once the

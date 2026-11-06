@@ -190,8 +190,8 @@ pub(crate) struct Configured {
 
 /// A node's address as a `node` line states it, `HOST:PORT`: an address as it is, a name resolved
 /// now through the platform's resolver, its first address, as a node resolves its peers' names at
-/// its start (`mantle_node::process::resolve`). A name is a Service's in front of a pod, whose
-/// address holds across the pod's deletions (research/78).
+/// its start (`mantle_node::process::resolve`). A name may stand for a pod's own address, which a
+/// pod made again changes, so a command resolves it as it starts (research/78).
 fn dialed(text: &str) -> Result<std::net::SocketAddr, String> {
     use std::net::ToSocketAddrs as _;
     let at = mantle_node::process::Endpoint::parse(text)

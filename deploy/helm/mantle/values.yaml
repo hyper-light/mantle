@@ -13,7 +13,8 @@ image:
   pullPolicy: IfNotPresent
 
 # The ports every founder binds, as `mantle init` stated them for each (`quic=0.0.0.0:PORT`,
-# `plane=0.0.0.0:PORT`, `s3=0.0.0.0:PORT`): its Service carries the same ones.
+# `plane=0.0.0.0:PORT`, `s3=0.0.0.0:PORT`): its pod's own name reaches them, and the cell's S3
+# Service carries the S3 one.
 ports:
   quic: 7000
   plane: 7001
@@ -21,9 +22,10 @@ ports:
 
 # Each founder's identity and keys: the Secret `<fullname>-N-founder` for pod N, its key `founder`
 # the pack (`mantle pack`) of founder N's directory `mantle init` made, its reach
-# (`reach=<fullname>-N.<namespace>.svc.<clusterDomain>`) the name of its Service. The operator makes
-# them (docs/design/kubernetes.md §3); the chart never generates one, since an identity changed by a
-# `helm upgrade` would change the node's id and every peer's pin.
+# (`reach=<fullname>-N.<fullname>.<namespace>.svc.<clusterDomain>`) its pod's own name under the
+# StatefulSet's headless Service. The operator makes them (docs/design/kubernetes.md §3); the chart
+# never generates one, since an identity changed by a `helm upgrade` would change the node's id and
+# every peer's pin.
 clusterDomain: cluster.local
 
 storage:

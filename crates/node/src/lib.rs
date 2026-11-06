@@ -10,6 +10,7 @@
 //! - [`directory`]: the peers a connection may name, by certificate.
 //! - [`frame`]: a range's Raft message as it travels.
 //! - [`layout`]: what the node keeps beside its log: its run.
+//! - [`names`]: the peers named by a host name, and when each is looked up again.
 //! - [`node`]: the owner: the ranges, their log, the transport, one turn at a time.
 //! - [`process`]: a node as a process, `mantle node`: its configuration and its run.
 //! - [`read`]: a read a range's leader answers by ReadIndex.
@@ -37,6 +38,7 @@ pub mod frame;
 pub mod history;
 pub mod layout;
 pub mod listener;
+pub mod names;
 pub mod node;
 pub mod place;
 pub mod process;

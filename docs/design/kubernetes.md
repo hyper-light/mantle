@@ -18,31 +18,24 @@ is needed; SIGTERM begins its orderly stop (node.md §1.7).
 
 ## 2. Names
 
-A founder is dialed at a Service of its own, `<fullname>-N`, which selects its pod alone by the
-`statefulset.kubernetes.io/pod-name` label the StatefulSet gives each pod and carries its QUIC and
-plane ports (UDP) and its S3 listener (TCP). A pod's address goes with the pod, and a node resolves
-its peers' names once, at its start (`process::resolve`), so a peer deleted and made again would
-come back where its peers never look; a Service's cluster IP is assigned once and kept through
-updates, so the name resolves to the same address across every deletion of the pod behind it
-(research/78). Each founder binds every address on its ports and is reached at its Service's name,
-which `mantle init` states as its reach (`reach=HOST`, node.md §1.5): its peers' `peer` lines and
-its clients' `node` lines name that host on its ports. The per-pod Services publish not-ready
-addresses, since a founder is ready only once the cell it forms through those very names enlisted
-it, and the endpoints controllers then count every endpoint ready (research/78 [11]). The
-StatefulSet's governing Service is headless and publishes not-ready addresses too. The cell's S3
-endpoint, `<fullname>-s3`, puts every ready founder's listener behind one address. Off loopback the
-S3 listener speaks TLS with the endpoint's certificate for the names `mantle init` states
-(`name=HOST`, node.md §1.5), so each founder names its own Service and the cell's S3 Service, and a
-stock client takes the endpoint's authority (`OUT/s3/authority.pem`) as its chain.
-
-Open: a peer's QUIC and plane reach a founder through its Service's cluster IP, a translation
-kube-proxy keeps in the flow's conntrack entry, and each peer dials from one UDP port within about 3
-s, which renews the entry past the pod it reached. A founder its peers dial (the highest id dials no
-one) was so out of reach for 3 min 7 s after its pod was replaced in the KIND cell, until the
-entries went, one deleted by hand and the other most likely at a kube-proxy sync (research/78, "A
-Service's cluster IP carries a peer's QUIC only until its pod is replaced"). The fix proposed there,
-founders reached at their pods' addresses by the headless Service's per-pod names, each resolved
-again when a link to it ends, is not built.
+A founder is reached at its pod's own name under the StatefulSet's governing headless Service,
+`<fullname>-N.<fullname>.<namespace>.svc.<clusterDomain>`, which reports the pod's address itself
+(research/78 [1], [2]): no translation stands between a peer and the pod, so no flow outlives the
+pod it reached, as one through a Service's cluster IP did, held by kube-proxy's conntrack entry for
+3 min 7 s after a founder's pod was replaced in the KIND cell (research/78, "A Service's cluster IP
+carries a peer's QUIC only until its pod is replaced"). A pod made again comes back at another
+address under the same name: a node looks each peer's name up as it starts and again whenever its
+link to the peer ends or, while the name does not resolve (a pod not yet made has no record), at the
+peer's backoff, one lookup at a time off its shards (`mantle_node::names`), and dials the address it
+finds (`Node::learn`). Each founder binds every address on its ports and is reached at its pod's
+name, which `mantle init` states as its reach (`reach=HOST`, node.md §1.5): its peers' `peer` lines
+and its clients' `node` lines name that host on its ports. The governing Service publishes not-ready
+addresses, since a founder is ready only once the cell it forms through those very names enlisted it
+(research/78 [11]). The cell's S3 endpoint, `<fullname>-s3`, puts every ready founder's listener
+behind one address. Off loopback the S3 listener speaks TLS with the endpoint's certificate for the
+names `mantle init` states (`name=HOST`, node.md §1.5), so each founder names its pod's name and the
+cell's S3 Service, and a stock client takes the endpoint's authority (`OUT/s3/authority.pem`) as its
+chain.
 
 ## 3. Identity and keys
 
@@ -120,18 +113,18 @@ HTTP door runs and kubectl at the cluster's version.
 
 The harness runs on a cell running elsewhere with `--cell` (`crates/mantle/src/transfer/
 outside.rs`): the cell's directory, its gateway pinned, each founder reached at the name its cell
-file states, resolved once as the founders resolve their peers, and each case's objects in a bucket
-of its own. It starts, kills and counts the chunks of none of the cell's nodes: every acknowledged
-object is read back through each node in turn, its placement and its controls judged as on a cell
-it made. With `--disrupt`, a command is started halfway through the first small set's native puts,
-here `disrupt mantle-1 mantle` (`deploy/kind/disrupt.sh`): founder pod mantle-1 deleted, and its
-successor of the same name waited for until it is made and ready, each wait on its fact. The puts
-go on beside it, and its end, which must be success, is waited for before the set's S3 puts and
-every read. A cell short a node refuses a block it cannot place on distinct nodes `SlowDown`
-(gateway `PutError::Unplaced`), and while its nodes are gone in turn the native client may find no
-node to take a put in its attempts (`ClientError::Untaken`) or lose a put's answer
-(`ClientError::Lost`): each such put is counted and acknowledged by nothing, any other failure
-ends the run, and every put the cell acknowledged must read back exactly through every node after
-the disruption. The Job
-exits 0 only with every check exact; it first did in run 41738909698 (2026-11-03), its rows in
-STATUS.md.
+file states, resolved as the run begins, and each case's objects in a bucket of its own. It starts,
+kills and counts the chunks of none of the cell's nodes: every acknowledged object is read back
+through each node in turn, its placement and its controls judged as on a cell it made. With
+`--disrupt`, a command is started halfway through the first small set's native puts, here `disrupt
+POD mantle` (`deploy/kind/disrupt.sh`): the founder pod its peers dial deleted, the highest id's
+(`scripts/kind-cell.sh` names it), and its successor of the same name waited for until it is made
+and ready, each wait on its fact; its peers find it at its pod's new address by looking its name up
+again (§2). The puts go on beside it, and its end, which must be success, is waited for before the
+set's S3 puts and every read. A cell short a node refuses a block it cannot place on distinct nodes
+`SlowDown` (gateway `PutError::Unplaced`), and while its nodes are gone in turn the native client
+may find no node to take a put in its attempts (`ClientError::Untaken`) or lose a put's answer
+(`ClientError::Lost`): each such put is counted and acknowledged by nothing, any other failure ends
+the run, and every put the cell acknowledged must read back exactly through every node after the
+disruption. The Job exits 0 only with every check exact; it first did in run 41738909698
+(2026-11-03), its rows in STATUS.md.

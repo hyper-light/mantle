@@ -1,8 +1,8 @@
 # The transfer harness against the KIND cell (scripts/kind-cell.sh; docs/design/kubernetes.md): a
 # Job in the cell's namespace that installs the cell's pack (`mantle init`'s directory, its gateway
-# pinned) and runs the harness's CI scale through both doors with `--cell`, deleting founder pod
-# mantle-1 halfway through the small set's native puts (`disrupt`). Its account may delete and
-# watch the namespace's pods and nothing else.
+# pinned) and runs the harness's CI scale through both doors with `--cell`, deleting the founder pod
+# its peers dial, `__DIALED__` (the script names the highest id's), halfway through the small set's
+# native puts (`disrupt`). Its account may delete and watch the namespace's pods and nothing else.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -83,7 +83,7 @@ spec:
             - --seed
             - "5"
             - --disrupt
-            - disrupt mantle-1 mantle
+            - disrupt __DIALED__ mantle
           volumeMounts:
             - name: cell
               mountPath: /cell

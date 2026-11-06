@@ -1,6 +1,6 @@
 # 78. A cell in Kubernetes: names, keys, readiness and termination
 
-Status: research note, 2026-11-03; readiness revised 2026-11-05. For plan step 11 of the data
+Status: research note, 2026-11-03; readiness and names revised 2026-11-05. For plan step 11 of the data
 layer (a container image and a Helm chart for mantle, proven in a kind cluster) and
 docs/design/kubernetes.md. Sources [1] to [6], [10] and [11] were read from the Kubernetes
 documentation on 2026-11-03, each quoted where it was read; [7] to [9] and [12] are mantle's own
@@ -26,7 +26,14 @@ StatefulSet derives its hostname from the name of the StatefulSet and the ordina
 pattern for the constructed hostname is `$(statefulset name)-$(ordinal)`." "When the StatefulSet
 controller creates a Pod, it adds a label, `statefulset.kubernetes.io/pod-name`, that is set to
 the name of the Pod. This label allows you to attach a Service to a specific Pod in the
-StatefulSet."
+StatefulSet." Read again on 2026-11-05: "A StatefulSet can use a Headless Service to control the
+domain of its Pods. The domain managed by this Service takes the form: `$(service
+name).$(namespace).svc.cluster.local`"; "As each Pod is created, it gets a matching DNS subdomain,
+taking the form: `$(podname).$(governing service domain)`"; "Negative caching (normal in DNS) means
+that the results of previous failed lookups are remembered and reused, even after the Pod is
+running, for at least a few seconds"; and of discovering Pods promptly, "Decrease the time of caching
+in your Kubernetes DNS provider (typically this means editing the config map for CoreDNS, which
+currently caches for 30 seconds)."
 
 [2] Kubernetes, "Service", https://kubernetes.io/docs/concepts/services-networking/service/.
 "Pods are ephemeral resources (you should not expect that an individual Pod is reliable and
@@ -62,11 +69,14 @@ https://kubernetes.io/docs/tasks/configure-pod-container/security-context/. With
 "all processes of the container are also part of the supplementary group ID" and "The owner for
 volume `/data/demo` and any files created in that volume will be Group ID" that group.
 
-[7] mantle, `crates/node/src/process.rs` `resolve`: a peer line's names are resolved once,
-"before the node's runtime starts", and an unresolvable one fails the start
-(`ProcessError::Resolve`). The module's doc: "Standard input closing ends `mantle node`, its
-harness's child, at once ...; `mantle serve` runs on, as under a service manager, whose input is
-empty." A stop is asked by SIGTERM or a `stop` line and bounded by the node's `stop_ms`.
+[7] mantle, `crates/node/src/process.rs` `resolve` and `crates/node/src/names.rs`: a peer line's
+names are resolved as the node starts, "before the node's runtime starts"; read at `9166554e` an
+unresolvable one failed the start (`ProcessError::Resolve`), and since 2026-11-05 one does not: a
+named peer is looked up again as the node runs, when its link to it ends and, while its name does
+not resolve, at the peer's backoff, its new address taken as `learn` takes one. The module's doc:
+"Standard input closing ends `mantle node`, its harness's child, at once ...; `mantle serve` runs
+on, as under a service manager, whose input is empty." A stop is asked by SIGTERM or a `stop` line
+and bounded by the node's `stop_ms`.
 
 [8] mantle, `crates/mantle/src/init.rs`: a founder's `quic` and `plane` are one `SocketAddr`
 each, the address it binds and, where it is dialable (a port and a specified address), the
@@ -133,16 +143,20 @@ extended timeout will be used in case there is an UDP stream detected."
 
 ## What the sources settle
 
-**A founder is named by a Service of its own.** A pod's address is its own and goes with it [2],
-and a node resolves its peers' names once, at its start [7]: a peer deleted and made again comes
-back at another address its peers never look up. A Service selecting one pod by its
-`statefulset.kubernetes.io/pod-name` label [1] has a cluster IP assigned when the Service is made
-and not changed through updates [3], so a name for it resolves to the same address across every
-deletion of the pod behind it, before that pod first runs and after. QUIC and the plane are UDP,
-which a Service carries [2]. Each founder therefore binds `0.0.0.0` and is dialed at its own
-Service's name, which `mantle init` states as the founder's reach (`reach=HOST:PORT`), the address
-its peers' `peer` lines and its clients' `node` lines name where it differs from the one it binds
-[8].
+**A founder is named by its pod's record under the governing Service, looked up again.** A pod's
+address is its own and goes with it [2]. A Service's cluster IP stays across the pod's deletions
+[3], but it reaches the pod by a translation kube-proxy keeps for each flow, and a peer's QUIC
+outlives the pod it reached there (below, "A Service's cluster IP carries a peer's QUIC only until
+its pod is replaced"). The StatefulSet's governing headless Service gives each pod a name of its
+own, `$(podname).$(governing service domain)` [1], which reports the pod's own address [2]: a peer
+reaches the pod with no translation, and a pod made again is found at its new address under the same
+name once its record has it and the resolvers' caches let it through (a failed lookup remembered
+"for at least a few seconds", CoreDNS caching "for 30 seconds" [1]). A node so looks a peer's name
+up as it starts, and again whenever its link to the peer ends or, while the name does not resolve,
+at the peer's backoff, a pod not yet made having no record [7]. QUIC and the plane are UDP, the S3
+listener TCP; each founder binds `0.0.0.0` and is reached at its pod's name, which `mantle init`
+states as the founder's reach (`reach=HOST:PORT`), the address its peers' `peer` lines and its
+clients' `node` lines name where it differs from the one it binds [8].
 
 **Founders start together.** A cell needs a majority to elect, and `OrderedReady` waits for each
 pod to be Ready before the next [1], which a founder alone never is: the StatefulSet's pods start
@@ -160,11 +174,10 @@ carried as one file, `mantle pack`'s, its files' paths and key marks inside it, 
 at most a Secret's 1 MiB [10]; each pod mounts its own by `subPathExpr`, which a later change of
 the Secret does not reach [10], as the install is once.
 
-**Per-pod Services publish not-ready addresses.** A founder becomes ready only once the cell it
-forms with its peers enlisted it, and its peers reach it at its Service; endpoints of a Service
-that publishes not-ready addresses are counted ready [11], so each founder's Service carries its
-traffic before it is ready. The cell's S3 Service does not, so only enlisted founders take
-requests [4].
+**The governing Service publishes not-ready addresses.** A founder becomes ready only once the cell
+it forms with its peers enlisted it, and its peers reach it by its pod's record; the governing
+Service publishes not-ready addresses [11], so the record is there before the pod is ready. The
+cell's S3 Service does not, so only enlisted founders take requests [4].
 
 **A disruption's refusals.** With one of three founders gone, a block cannot be placed on three
 distinct nodes, and the gateway refuses it `SlowDown` [12]: a harness that deletes a founder's pod
@@ -206,19 +219,18 @@ the killed pod's address, assured, its 120 s renewed. Deleting the entry on one 
 another founder's pod was killed, a change kube-proxy syncs on, the likelier cause but not traced.
 The founders of the other ids, which dial their peers from the new pod, were ready 7 s after their
 kills. A founder its peers dial is so out of reach once its pod is replaced until kube-proxy happens
-to sync, for as long as its peers keep dialing; the plane's datagrams take the same path.
+to sync, for as long as its peers keep dialing; the plane's datagrams take the same path. The
+founders are therefore reached at their pods' own names (above).
 
 **Stopped within the grace.** SIGTERM begins the node's orderly stop, bounded by `stop_ms` [7],
 and the pod is killed at its grace [4]: the grace is stated above `stop_ms`.
 
 ## Open
 
-Founders reached without translation: at their pods' addresses by the StatefulSet's governing
-headless Service's per-pod names, so no flow outlives the pod it reached; each name resolved again,
-off the node's shards, when a link to it ends, the changed address taken as `learn` takes one
-(it disconnects and dials again); a start not failed by a peer whose name does not resolve yet,
-since a pod not yet made has no record; clients resolving a node's name again at each connection;
-and the per-pod Services removed. It changes the start's resolution [7] and is not built.
+A client resolves a node's name when it is made: `mantle`'s object commands at each command, the
+transfer harness's whenever it makes its clients, and after its disruption. A `mantle-client` that
+lives across a pod's replacement keeps the old address, its asks to that node not taken, and asks
+the other nodes until it is made again.
 
 kind's local-path storage does not hold a claim to its stated size (the provisioner's own
 README), so a founder's volume bytes are stated in the chart's values rather than read from its

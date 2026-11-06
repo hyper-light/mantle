@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # The KIND cell (plan step 11; docs/design/kubernetes.md): the mantle image built, a kind cluster of
 # a control plane and three workers made, a cell of three made by `mantle init` with each founder
-# reached at its own Service's name, the harness's gateway pinned, each founder's pack and the
-# cell's set as Secrets, the chart installed and waited for until every founder is ready (enlisted
-# in its run), one founder to a kind node checked, and the harness's CI scale run through both doors
-# from a Job in the cluster, founder pod mantle-1 deleted halfway through its small set's native
-# puts. Exits as the harness Job did: 0 only with every check exact. The cluster is deleted at the
-# end, and the work directory with it.
+# reached at its pod's own name under the StatefulSet's headless Service, the harness's gateway
+# pinned, each founder's pack and the cell's set as Secrets, the chart installed and waited for until
+# every founder is ready (enlisted in its run), one founder to a kind node checked, and the harness's
+# CI scale run through both doors from a Job in the cluster, the founder of the highest id deleted
+# halfway through its small set's native puts: its peers dial it, so its successor is reached only at
+# the address they look its name up again to (research/78). Exits as the harness Job did: 0 only with
+# every check exact. The cluster is deleted at the end, and the work directory with it.
 #
 # Needs docker, kind, kubectl and helm on the PATH (the CI job pins them).
 set -euo pipefail
@@ -47,13 +48,14 @@ kind load docker-image --name "$cluster" mantle:kind mantle-harness:kind
 kubectl create namespace "$namespace"
 
 # The cell, made here by the image's own binary as this user: each founder binds every address on
-# its ports and is reached at its Service's name, its volume at the claim the chart mounts.
+# its ports and is reached at its pod's own name, its volume at the claim the chart mounts.
 mantle() {
   docker run --rm --user "$(id -u):$(id -g)" --volume "$work:/work" mantle:kind "$@"
 }
 args=(init /work/cell --max-nodes "$founders" --max-volumes "$founders")
 for n in $(seq 0 $((founders - 1))); do
-  args+=(--node "quic=0.0.0.0:7000,plane=0.0.0.0:7001,s3=0.0.0.0:7480,reach=$release-$n.$namespace.svc.cluster.local,name=$release-$n.$namespace.svc.cluster.local,name=$release-s3.$namespace.svc.cluster.local,domain=node-$n,volume=/volume:1G")
+  pod="$release-$n.$release.$namespace.svc.cluster.local"
+  args+=(--node "quic=0.0.0.0:7000,plane=0.0.0.0:7001,s3=0.0.0.0:7480,reach=$pod,name=$pod,name=$release-s3.$namespace.svc.cluster.local,domain=node-$n,volume=/volume:1G")
 done
 mantle "${args[@]}" | tee "$work/init.txt"
 mantle init gateway /work/cell/gateway --cell /work/cell
@@ -66,6 +68,11 @@ while read -r _ _ dir _; do
   n=$((n + 1))
 done < <(grep '^node ' "$work/init.txt")
 test "$n" -eq "$founders"
+# The founder its peers dial, a node dialing each peer of a higher id: the highest id's, founder N
+# the Nth `node` line. Ids are unsigned 64-bit, past the shell's arithmetic.
+dialed="$release-$(grep '^node ' "$work/init.txt" | awk '{print $2}' \
+  | python3 -c 'import sys; ids = [int(line) for line in sys.stdin]; print(ids.index(max(ids)))')"
+echo "kind-cell: the founder its peers dial is $dialed"
 mantle pack /work/cell /work/cell.pack
 kubectl -n "$namespace" create secret generic mantle-harness-cell --from-file=cell="$work/cell.pack"
 
@@ -79,7 +86,7 @@ if [ "$placed" -ne "$founders" ]; then
   exit 1
 fi
 
-kubectl apply -f deploy/kind/harness.yaml
+sed "s#__DIALED__#$dialed#" deploy/kind/harness.yaml | kubectl apply -f -
 # The Job's verdict: complete or failed, whichever it comes to first, each waited for as a fact of
 # its own; its log said either way. kubectl takes no wait without a positive bound: each is the CI
 # job's own timeout, 2 hours, which bounds the run.

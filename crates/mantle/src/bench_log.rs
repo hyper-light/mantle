@@ -109,6 +109,8 @@ pub fn log(out: &mut impl Write, path: &Path, options: &Options) -> Result<(), E
         "read back"
     )?;
     let mut point = 0u64;
+    // The threads the process ran idle before the last point: none before the first.
+    let mut was_idle: Option<usize> = None;
     for &size in &sizes {
         for &count in &replicas {
             point = point.saturating_add(1);
@@ -116,7 +118,8 @@ pub fn log(out: &mut impl Write, path: &Path, options: &Options) -> Result<(), E
             let file = DeviceFile::open(scratch.path(), false, CachingRequest::PreferDirect, align)
                 .map_err(Error::Disk)?;
             let config = config(most);
-            let idle = drive::thread_count();
+            let idle = settled(was_idle);
+            was_idle = Some(idle);
             let log = Log::create(file, config, u128::from(point)).map_err(log_error)?;
             let outcome = appends(&log, scratch.path(), size, count, options.step)?;
             let (frames, updates) = log.flushed();
@@ -396,6 +399,32 @@ impl Drivers<'_> {
         (latency, drive::cpu().saturating_sub(cpu))
     }
 }
+
+/// The threads the process runs now, once the last point's have left the operating system's list:
+/// a joined thread may still be listed for a moment, since Linux wakes its joiner as the thread
+/// releases its memory, before it takes the thread off the process's list (`CLONE_CHILD_CLEARTID`,
+/// clone(2)), and the next point counted 1 to 2 of the last point's log threads as the process's
+/// idle ones (`tests/clients.rs`, 1 run in 6). Asked again, yielding between, while more run than
+/// before the last point, at most `SETTLE` times: past that the operating system runs more of its
+/// own (Windows' pool), which is idle too.
+fn settled(was_idle: Option<usize>) -> usize {
+    let mut now = drive::thread_count();
+    let Some(was) = was_idle else {
+        return now;
+    };
+    for _ in 0..SETTLE {
+        if now <= was {
+            break;
+        }
+        std::thread::yield_now();
+        now = drive::thread_count();
+    }
+    now
+}
+
+/// The most times the idle count is asked again (`settled`): a thread leaves the list within a few
+/// scheduler passes of its join, and a thousand yields bound the wait for one that never does.
+const SETTLE: usize = 1_000;
 
 #[cfg(test)]
 mod tests {

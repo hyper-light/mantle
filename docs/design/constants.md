@@ -478,6 +478,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/mantle/src/bench_gateway.rs` `HANDOVER` | bound | 2^40 ticks of a cell clock that moves one tick a command, past any number of commands a bounded run applies, so no deadline expires in a benchmark. |
 | `crates/mantle/src/bench_hash.rs` `CHUNKED_BODY` | open | 16 MiB signed-chunk body measured; no derivation in code or the measurement docs. |
 | `crates/mantle/src/bench_hash.rs` `FORM_FILE` | open | 16 MiB form file measured, set equal to CHUNKED_BODY; lacks a derivation. |
+| `crates/mantle/src/bench_log.rs` `SETTLE` | bound | The most times a point's idle thread count is asked again, yielding between, while the last point's joined threads may still be listed (clone(2) `CLONE_CHILD_CLEARTID` wakes the joiner before the thread leaves the list); a bound on the wait, not a tuning. |
 | `crates/mantle/src/bench_log.rs` `KEEP` | open | A replica compacts every 64 entries, keeping 64 behind; it stands in for a follower window but lacks a derivation. |
 | `crates/mantle/src/bench_meta.rs` `LARGEST_FILE` | derived | 646 blocks, the most one PUT's file names: 5 GiB in the smallest blocks any layout makes, pinned by `the_largest_upload_fits_a_file_under_every_layout` (`crates/gateway/src/layout.rs`; audit B08). |
 | `crates/mantle/src/bench_meta.rs` `HISTORY` | open | Session answer history of 256; the metadata-apply measurement states it without a derivation. |

@@ -269,9 +269,9 @@ enum Came {
     Refused(String),
     /// Refused `SlowDown` (503): asked again as the AWS SDKs ask a throttled request again.
     Slowed,
-    /// Its exchange ended unanswered (`ClientError::Lost`): asked again with its identity, which
-    /// the node answers from what it made.
-    Lost,
+    /// Its exchange ended unanswered (`ClientError::Lost`, said): asked again with its identity,
+    /// which the node answers from what it made.
+    Lost(String),
 }
 
 /// A native reply, or what its exchange came to where it is to be asked again.
@@ -281,7 +281,7 @@ fn answered(
     match asked {
         Ok(reply) if reply.status == Status::SlowDown => Ok(Err(Came::Slowed)),
         Ok(reply) => Ok(Ok(reply)),
-        Err(mantle_client::ClientError::Lost { .. }) => Ok(Err(Came::Lost)),
+        Err(e @ mantle_client::ClientError::Lost { .. }) => Ok(Err(Came::Lost(e.to_string()))),
         Err(e) => Err(failed(e)),
     }
 }
@@ -901,11 +901,14 @@ async fn client(mut conn: Conn, work: Rc<Work>, shared: Rc<RefCell<Shared>>) {
                     tally.first.get_or_insert(why);
                     false
                 }
-                Ok(Came::Slowed | Came::Lost) => {
+                Ok(Came::Slowed) => {
                     tally.failed = tally.failed.saturating_add(1);
-                    tally
-                        .first
-                        .get_or_insert_with(|| "slowed or unanswered".to_owned());
+                    tally.first.get_or_insert_with(|| "SlowDown".to_owned());
+                    false
+                }
+                Ok(Came::Lost(why)) => {
+                    tally.failed = tally.failed.saturating_add(1);
+                    tally.first.get_or_insert(format!("unanswered: {why}"));
                     false
                 }
                 Err(e) => {
@@ -1016,7 +1019,7 @@ impl Work {
                 Conn::Native(client) => self.native(client, (i, &key, length, id), &object).await?,
                 Conn::Http(http) => self.http(http, (i, &key, length), &object).await?,
             };
-            let retry = matches!(came, Came::Slowed | Came::Lost);
+            let retry = matches!(came, Came::Slowed | Came::Lost(_));
             if !retry || again.saturating_add(1) >= mantle_client::ATTEMPTS {
                 break came;
             }
@@ -1052,8 +1055,8 @@ impl Work {
             Came::Slowed => {
                 Came::Failed(format!("SlowDown, asked {} times", again.saturating_add(1)))
             }
-            Came::Lost => Came::Failed(format!(
-                "unanswered, asked {} times",
+            Came::Lost(why) => Came::Failed(format!(
+                "unanswered ({why}), asked {} times",
                 again.saturating_add(1)
             )),
             came => came,
@@ -1721,7 +1724,8 @@ struct Bench<'o> {
     listeners: Vec<SocketAddr>,
     signer: Rc<Signer>,
     generator: Rc<Generator>,
-    pools: [Vec<Conn>; 2],
+    /// Each door's connections between the steps that use them, each with when it was put back.
+    pools: [Vec<(Conn, Instant)>; 2],
     /// The native clients the cell admits at once: each node's `gateway.clients` identities.
     native_most: usize,
     /// Connections each door opened: its handshakes.
@@ -1872,7 +1876,25 @@ impl<'o> Bench<'o> {
             .pools
             .get_mut(door.at())
             .ok_or_else(|| failed("a door's pool"))?;
-        let mut conns: Vec<Conn> = pool.drain(..want.min(pool.len())).collect();
+        // A native client is driven only within its own calls (mantle-client runs no task of its
+        // own), so one held in the pool through another door's phases sends no keep-alive, and
+        // the node closes it once it has said nothing for the idle timeout: its next request then
+        // ends unanswered (`ClientError::Lost`, `Closed`), as a control's put did, at random, when
+        // the HTTP door's phases took about the idle timeout (3.07 s). One held past its
+        // keep-alive interval, after which a driven connection would have spoken, is closed here
+        // and another opened. An HTTP connection the server closed is opened again by `Http`.
+        let idle = mantle_protocol::bounds::idle_timeout();
+        let stale = idle.checked_div(2).unwrap_or(idle);
+        let mut conns = Vec::new();
+        let mut closing = Vec::new();
+        for (conn, put_back) in pool.drain(..want.min(pool.len())) {
+            if matches!(conn, Conn::Native(_)) && put_back.elapsed() >= stale {
+                closing.push(conn);
+            } else {
+                conns.push(conn);
+            }
+        }
+        self.release(closing)?;
         let more = want.saturating_sub(conns.len());
         if more > 0 {
             let opened = self.open(door, more)?;
@@ -2003,7 +2025,8 @@ impl<'o> Bench<'o> {
             *count = count.saturating_add(reopened);
         }
         if let Some(pool) = self.pools.get_mut(work.door.at()) {
-            pool.extend(conns);
+            let now = Instant::now();
+            pool.extend(conns.into_iter().map(|conn| (conn, now)));
         }
         let ops = tally.ops;
         let rate = ops as f64 / (elapsed_ns.max(1) as f64 / 1e9);
@@ -2764,12 +2787,22 @@ impl Bench<'_> {
                     match put {
                         Came::Done => {}
                         Came::Failed(why) | Came::Refused(why) => {
-                            return Err(failed(format!("a control's object was not put: {why}")));
+                            return Err(failed(format!(
+                                "a control's object was not put through the {} door: {why}",
+                                door.name()
+                            )));
                         }
-                        Came::Slowed | Came::Lost => {
-                            return Err(failed(
-                                "a control's object was not put: slowed or unanswered",
-                            ));
+                        Came::Slowed => {
+                            return Err(failed(format!(
+                                "a control's object was not put through the {} door: SlowDown",
+                                door.name()
+                            )));
+                        }
+                        Came::Lost(why) => {
+                            return Err(failed(format!(
+                                "a control's object was not put through the {} door: unanswered: {why}",
+                                door.name()
+                            )));
                         }
                     }
                 }
@@ -2783,7 +2816,7 @@ impl Bench<'_> {
             })
             .map_err(|e| failed(format!("{e:?}")))??;
         if let Some(pool) = self.pools.get_mut(door.at()) {
-            pool.push(conn);
+            pool.push((conn, Instant::now()));
         }
         let [flipped, missing, etag] = said;
         let expected = checksum::etag(&other);
@@ -2835,7 +2868,7 @@ impl Bench<'_> {
             .get_mut(door.at())
             .map(std::mem::take)
             .unwrap_or_default();
-        self.release(held)?;
+        self.release(held.into_iter().map(|(conn, _)| conn).collect())?;
         // The native door's points: a client on each node, and as many as the cell admits.
         let (low_count, high_count) = match door {
             Door::Native => (cell::FOUNDERS, self.native_most),

@@ -1,4 +1,4 @@
-# 78. The doors measured: what each operation of the native and S3 doors costs, and how it is counted
+# 79. The doors measured: what each operation of the native and S3 doors costs, and how it is counted
 
 Status: research note, 2026-11-04. For `mantle bench doors` (crates/mantle/src/bench_doors.rs) and
 measurement.md §12. It states how both of mantle's doors, the native protocol over QUIC

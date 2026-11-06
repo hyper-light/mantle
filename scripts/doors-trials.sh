@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The box's trial runner for `mantle bench doors` (docs/design/measurement.md §12; research/78):
+# The box's trial runner for `mantle bench doors` (docs/design/measurement.md §12; research/79):
 # every case a fresh process pinned to CPUSET 8-15 inside a systemd memory scope, its arms in a
 # Williams order in whole cycles, each case's rusage and the host's load kept, and every expected
 # case accounted for as completed, failed with its reason, or excluded with its reason.

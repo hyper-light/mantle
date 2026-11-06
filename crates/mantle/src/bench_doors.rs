@@ -1,6 +1,6 @@
 //! `mantle bench doors`: each operation's cost through both of mantle's doors, the native protocol
 //! (mantle-client) and the S3 listener, against a cell of three `mantle serve` processes this
-//! program makes and runs (docs/design/measurement.md §12; research/78). The load is mantle's own:
+//! program makes and runs (docs/design/measurement.md §12; research/79). The load is mantle's own:
 //! the native door's requests are mantle-client's, and the S3 listener's are written here, framed
 //! with mantle's HTTP codec where a request's framing is the codec's (an `aws-chunked` body's
 //! chunks and trailer; every response body's decoding) and signed with mantle-s3's SigV4. The
@@ -61,7 +61,7 @@ use mantle_s3::list::Resume;
 use mantle_s3::{crypto, sigv4};
 
 use crate::drive;
-use crate::transfer::cell::{self, Cell, Counted};
+use crate::transfer::cell::{self, Cell, Counted, Reach};
 use crate::transfer::generate::{Generator, Object};
 use crate::transfer::native::{Checked, Flipped, Made, Unwatched};
 use crate::transfer::{Oracle, size as small_size};
@@ -1930,7 +1930,9 @@ impl<'o> Bench<'o> {
     /// first, its key read from the client's directory.
     fn settings(&self, dir: &Path, first: usize) -> Result<Settings, Error> {
         let configured = crate::client::configured(dir).map_err(failed)?;
-        let mut nodes = self.cell()?.quic();
+        let cell = self.cell()?;
+        let mut nodes = cell.quic();
+        let names = cell.names();
         let first = first.min(nodes.len());
         nodes.rotate_left(first);
         Ok(Settings {
@@ -1939,6 +1941,7 @@ impl<'o> Bench<'o> {
             credentials: configured.credentials,
             transport_bytes: mantle_client::least_transport(nodes.len()).map_err(failed)?,
             nodes,
+            names,
         })
     }
 
@@ -2590,7 +2593,12 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
                 .map(|(_, r)| r.clone())
                 .ok_or_else(|| failed("no S3 listener"))?;
             let signer = Signer::read(cell.out(), region)?;
-            (Some(cell), s3.iter().map(|(at, _)| *at).collect(), signer)
+            // A cell on loopback says each listener as the address it bound.
+            let listeners = s3
+                .iter()
+                .map(|(at, _)| at.parse::<SocketAddr>().map_err(failed))
+                .collect::<Result<Vec<_>, _>>()?;
+            (Some(cell), listeners, signer)
         }
     };
     let most = options

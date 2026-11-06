@@ -110,7 +110,7 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
             at_ns,
         } => check_blocks(engine, *file, blocks, *at_ns)?,
     };
-    engine.apply(index, &writes)?;
+    engine.apply(index, writes)?;
     Ok(outcome)
 }
 

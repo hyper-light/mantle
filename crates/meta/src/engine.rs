@@ -46,8 +46,9 @@ pub trait Rows {
     /// The first row in `[from, to)`.
     fn next(&mut self, from: &[u8], to: &[u8]) -> Result<Option<Row>, EngineError>;
 
-    /// Applies `writes` atomically as log entry `index`.
-    fn apply(&mut self, index: u64, writes: &[Write]) -> Result<(), EngineError>;
+    /// Applies `writes` atomically as log entry `index`. The writes are given, not lent: a layer
+    /// that keeps them, as an entry's overlay does, moves their rows rather than copying them.
+    fn apply(&mut self, index: u64, writes: Vec<Write>) -> Result<(), EngineError>;
 }
 
 /// A range's rows, and what of them a crash keeps.
@@ -107,7 +108,7 @@ impl Rows for Model {
             .map(|(k, v)| (k.clone(), v.clone())))
     }
 
-    fn apply(&mut self, index: u64, writes: &[Write]) -> Result<(), EngineError> {
+    fn apply(&mut self, index: u64, writes: Vec<Write>) -> Result<(), EngineError> {
         if index <= self.applied {
             return Err(EngineError::OutOfOrder {
                 index,
@@ -117,10 +118,10 @@ impl Rows for Model {
         for write in writes {
             match write {
                 Write::Put(k, v) => {
-                    self.rows.insert(k.clone(), v.clone());
+                    self.rows.insert(k, v);
                 }
                 Write::Delete(k) => {
-                    self.rows.remove(k);
+                    self.rows.remove(&k);
                 }
                 Write::Clear(from, to) => {
                     if from < to {
@@ -182,12 +183,12 @@ mod tests {
     #[test]
     fn a_crash_returns_to_what_was_persisted() {
         let mut m = Model::default();
-        m.apply(1, &[Write::Put(b"a".to_vec(), b"1".to_vec())])
+        m.apply(1, vec![Write::Put(b"a".to_vec(), b"1".to_vec())])
             .unwrap();
         m.persist().unwrap();
         m.apply(
             2,
-            &[
+            vec![
                 Write::Delete(b"a".to_vec()),
                 Write::Put(b"b".to_vec(), b"2".to_vec()),
             ],
@@ -202,13 +203,13 @@ mod tests {
         assert_eq!(m.get(b"a").unwrap(), Some(b"1".to_vec()));
         assert_eq!(m.get(b"b").unwrap(), None);
         assert_eq!(
-            m.apply(1, &[]),
+            m.apply(1, vec![]),
             Err(EngineError::OutOfOrder {
                 index: 1,
                 applied: 1
             })
         );
-        m.apply(5, &[]).unwrap();
+        m.apply(5, vec![]).unwrap();
         assert_eq!(m.applied(), 5);
         assert_eq!(m.next(b"z", b"a").unwrap(), None);
     }

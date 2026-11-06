@@ -78,7 +78,7 @@ pub fn apply_entry<R: Rows>(
         touched.write(&mut overlay, index)?;
         (answers, overlay.into_writes())
     };
-    rows.apply(index, &writes)?;
+    rows.apply(index, writes)?;
     Ok(answers)
 }
 
@@ -567,7 +567,7 @@ mod tests {
                             writes.push(Write::Put(key(c.session), s.encode().unwrap()));
                             writes.push(Write::Put(expiry(entry.at_ns, c.session), Vec::new()));
                         }
-                        overlay.apply(index, &writes).unwrap();
+                        overlay.apply(index, writes).unwrap();
                         given.0
                     }
                 };
@@ -575,7 +575,7 @@ mod tests {
             }
             (answers, overlay.into_writes())
         };
-        rows.apply(index, &writes).unwrap();
+        rows.apply(index, writes).unwrap();
         answers
     }
 

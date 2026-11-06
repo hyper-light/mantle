@@ -117,7 +117,7 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
         Command::Delete { block } => delete(engine, *block)?,
         Command::Settle { blocks } => (Outcome::Settled, settle(engine, blocks)?),
     };
-    engine.apply(index, &writes)?;
+    engine.apply(index, writes)?;
     Ok(outcome)
 }
 

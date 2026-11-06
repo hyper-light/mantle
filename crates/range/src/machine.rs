@@ -76,16 +76,15 @@ impl<E: Rows> Rows for Termed<'_, E> {
         self.engine.next(from, to)
     }
 
-    fn apply(&mut self, index: u64, writes: &[Write]) -> Result<(), EngineError> {
+    fn apply(&mut self, index: u64, mut writes: Vec<Write>) -> Result<(), EngineError> {
         let Some(row) = self.row.take() else {
             return self.engine.apply(index, writes);
         };
-        let mut all = Vec::new();
-        all.try_reserve_exact(writes.len().saturating_add(1))
+        writes
+            .try_reserve_exact(1)
             .map_err(|_| EngineError::Memory)?;
-        all.extend_from_slice(writes);
-        all.push(row);
-        self.engine.apply(index, &all)
+        writes.push(row);
+        self.engine.apply(index, writes)
     }
 }
 
@@ -181,7 +180,7 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
         // A new leader's empty entry changes no row of the range.
         if entry.data.is_empty() {
             engine
-                .apply(entry.index, &[])
+                .apply(entry.index, Vec::new())
                 .map_err(|_| Fatal("the engine refused an entry"))?;
         } else {
             let batch = wire::Entry::decode(entry.data)
@@ -217,7 +216,7 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
         let bytes = conf::encode(configuration).ok_or(Fatal("a configuration past u32 members"))?;
         let mut engine = self.termed(at.term);
         engine
-            .apply(at.index, &[Write::Put(conf::ROW.to_vec(), bytes)])
+            .apply(at.index, vec![Write::Put(conf::ROW.to_vec(), bytes)])
             .map_err(|_| Fatal("the engine refused a change"))?;
         self.configuration = configuration.clone();
         self.applied = at;

@@ -132,14 +132,14 @@ impl<F: BlockFile + 'static> Rows for Stored<F> {
         Ok(self.rows.get(0).map(|(k, v)| (k.to_vec(), v.to_vec())))
     }
 
-    fn apply(&mut self, index: u64, writes: &[Write]) -> Result<(), EngineError> {
+    fn apply(&mut self, index: u64, writes: Vec<Write>) -> Result<(), EngineError> {
         if index <= self.applied {
             return Err(EngineError::OutOfOrder {
                 index,
                 applied: self.applied,
             });
         }
-        for write in writes {
+        for write in &writes {
             match write {
                 Write::Put(k, v) => self.db.put(k, v).map_err(fenced)?,
                 Write::Delete(k) => self.db.delete(k).map_err(fenced)?,
@@ -273,7 +273,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("range.store");
             let mut e = Stored::create(file(&path, true), config, memtable, TRUNK).unwrap();
-            e.apply(1, std::slice::from_ref(&row)).unwrap();
+            e.apply(1, vec![row.clone()]).unwrap();
             if kept {
                 e.persist().unwrap();
                 assert_eq!(e.get(&vec![b'k'; key]).unwrap(), Some(vec![7; value]));
@@ -290,7 +290,7 @@ mod tests {
         let mut e = Stored::create(file(&path, true), CONFIG, CONFIG.page_size, TRUNK).unwrap();
         e.apply(
             1,
-            &[put("a", "1"), put("b", "2"), put("c", "3"), put("d", "4")],
+            vec![put("a", "1"), put("b", "2"), put("c", "3"), put("d", "4")],
         )
         .unwrap();
         assert_eq!(e.get(b"b").unwrap(), Some(b"2".to_vec()));
@@ -302,7 +302,7 @@ mod tests {
         assert_eq!(e.next(b"bb", b"c").unwrap(), None);
         e.apply(
             2,
-            &[
+            vec![
                 Write::Delete(b"a".to_vec()),
                 Write::Clear(b"b".to_vec(), b"d".to_vec()),
             ],
@@ -311,7 +311,7 @@ mod tests {
         assert_eq!(rows(&mut e), vec![("d".into(), "4".into())]);
         assert_eq!(e.applied(), 2);
         assert_eq!(
-            e.apply(2, &[put("e", "5")]),
+            e.apply(2, vec![put("e", "5")]),
             Err(EngineError::OutOfOrder {
                 index: 2,
                 applied: 2
@@ -324,12 +324,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("range.store");
         let mut e = Stored::create(file(&path, true), CONFIG, CONFIG.page_size, TRUNK).unwrap();
-        e.apply(1, &[put("a", "1")]).unwrap();
-        e.apply(2, &[put("b", "2")]).unwrap();
+        e.apply(1, vec![put("a", "1")]).unwrap();
+        e.apply(2, vec![put("b", "2")]).unwrap();
         e.persist().unwrap();
         assert_eq!(e.durable(), 2);
         // Applied past the checkpoint, then lost with the process: the log holds it again.
-        e.apply(3, &[put("c", "3"), Write::Delete(b"a".to_vec())])
+        e.apply(3, vec![put("c", "3"), Write::Delete(b"a".to_vec())])
             .unwrap();
         drop(e);
         let mut e = Stored::open(file(&path, false), CONFIG, CONFIG.page_size, TRUNK).unwrap();
@@ -368,7 +368,7 @@ mod tests {
         let mut e = Stored::create(file(&path, true), CONFIG, CONFIG.page_size, TRUNK).unwrap();
         for i in 0..ROWS {
             let (k, v) = row(i, 1);
-            e.apply(i + 1, &[Write::Put(k, v)]).unwrap();
+            e.apply(i + 1, vec![Write::Put(k, v)]).unwrap();
             e.persist().unwrap();
         }
         let image: Vec<Row> = (0..ROWS).map(|i| row(i, 2)).collect();
@@ -382,7 +382,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("range.store");
         let mut e = Stored::create(file(&path, true), CONFIG, CONFIG.page_size, TRUNK).unwrap();
-        e.apply(1, &[put("a", "1"), put("z", "26")]).unwrap();
+        e.apply(1, vec![put("a", "1"), put("z", "26")]).unwrap();
         e.install(9, vec![(b"m".to_vec(), b"13".to_vec())]).unwrap();
         e.persist().unwrap();
         assert_eq!(rows(&mut e), vec![("m".into(), "13".into())]);

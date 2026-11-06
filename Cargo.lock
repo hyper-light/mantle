@@ -836,6 +836,7 @@ dependencies = [
 name = "mantle-meta"
 version = "0.1.0"
 dependencies = [
+ "hyper-measure",
  "mantle-chunk",
  "mantle-codec",
  "mantle-crc",
@@ -919,6 +920,7 @@ dependencies = [
  "aws-lc-rs",
  "base64",
  "getrandom 0.4.3",
+ "hyper-measure",
  "mantle-crc",
  "memchr",
  "proptest",

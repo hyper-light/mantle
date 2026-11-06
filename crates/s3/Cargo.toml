@@ -21,6 +21,9 @@ unicode-general-category.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+# Each allocation a signature's check, an aws-chunked body's decoding and a listing's document
+# make, counted by its allocator (tests/allocations.rs).
+hyper-measure = { path = "../../vendor/hyper-measure" }
 proptest.workspace = true
 roxmltree.workspace = true
 

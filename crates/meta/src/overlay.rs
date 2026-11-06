@@ -98,7 +98,7 @@ impl<R: Rows> Rows for Overlay<'_, R> {
         })
     }
 
-    fn apply(&mut self, _index: u64, writes: &[Write]) -> Result<(), EngineError> {
+    fn apply(&mut self, _index: u64, writes: Vec<Write>) -> Result<(), EngineError> {
         let (max_key, max_value) = self.bound;
         if let Some((k, v)) = writes.iter().find_map(|w| match w {
             Write::Put(k, v) if k.len() > max_key || v.len() > max_value => Some((k, v)),
@@ -112,17 +112,17 @@ impl<R: Rows> Rows for Overlay<'_, R> {
         for write in writes {
             match write {
                 Write::Put(k, v) => {
-                    self.writes.insert(k.clone(), Some(v.clone()));
+                    self.writes.insert(k, Some(v));
                 }
                 Write::Delete(k) => {
-                    self.writes.insert(k.clone(), None);
+                    self.writes.insert(k, None);
                 }
                 Write::Clear(from, to) => {
                     if from < to {
                         let mut tail = self.writes.split_off(from.as_slice());
                         let mut kept = tail.split_off(to.as_slice());
                         self.writes.append(&mut kept);
-                        self.cleared.push((from.clone(), to.clone()));
+                        self.cleared.push((from, to));
                     }
                 }
             }
@@ -146,12 +146,12 @@ mod tests {
         let put = |k: &[u8], v: &[u8]| Write::Put(k.to_vec(), v.to_vec());
         for row in [put(b"abc", b"v"), put(b"k", b"long")] {
             assert!(matches!(
-                overlay.apply(1, &[put(b"a", b"1"), row]),
+                overlay.apply(1, vec![put(b"a", b"1"), row]),
                 Err(EngineError::RowTooLarge { .. })
             ));
             assert_eq!(overlay.get(b"a").unwrap(), None);
         }
-        overlay.apply(1, &[put(b"ab", b"xyz")]).unwrap();
+        overlay.apply(1, vec![put(b"ab", b"xyz")]).unwrap();
         assert_eq!(overlay.get(b"ab").unwrap(), Some(b"xyz".to_vec()));
     }
 
@@ -178,19 +178,19 @@ mod tests {
             to in key(),
         ) {
             let mut engine = Model::default();
-            engine.apply(1, &before).unwrap();
+            engine.apply(1, before).unwrap();
             let mut expected = engine.clone();
             let mut overlay = Overlay::new(&mut engine, (usize::MAX, usize::MAX));
             for (i, writes) in entry.iter().enumerate() {
-                overlay.apply(2, writes).unwrap();
-                expected.apply(2 + i as u64, writes).unwrap();
+                overlay.apply(2, writes.clone()).unwrap();
+                expected.apply(2 + i as u64, writes.clone()).unwrap();
                 for k in [from.clone(), to.clone()] {
                     prop_assert_eq!(overlay.get(&k).unwrap(), expected.get(&k).unwrap());
                 }
                 prop_assert_eq!(overlay.next(&from, &to).unwrap(), expected.next(&from, &to).unwrap());
             }
             let writes = overlay.into_writes();
-            engine.apply(2, &writes).unwrap();
+            engine.apply(2, writes).unwrap();
             let all = |m: &mut Model| {
                 let mut rows = Vec::new();
                 let mut at = Vec::new();

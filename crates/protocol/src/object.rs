@@ -2261,8 +2261,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn every_reply_reads_back_and_nothing_past_s3s_bounds_does() {
+    /// Every kind of reply this suite writes: each status bare, and the replies that carry an
+    /// object's facts, a native upload's progress and each listing.
+    fn every_reply() -> Vec<Reply> {
         let listed = |n: usize| Listed {
             key: format!("k{n}"),
             etag: "0".repeat(32),
@@ -2371,6 +2372,54 @@ mod tests {
             })),
             ..Reply::status(Status::Done)
         });
+        replies
+    }
+
+    /// Each request and reply's head and fields in hex, a line each.
+    fn object_lines() -> Vec<String> {
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let mut lines = Vec::new();
+        for op in every_op() {
+            let (head, fields) = op.encode().unwrap();
+            lines.push(format!("{} {}", hex(&head), hex(&fields)));
+        }
+        for reply in every_reply() {
+            let (head, fields) = reply.encode().unwrap();
+            lines.push(format!("{} {}", hex(&head), hex(&fields)));
+        }
+        lines
+    }
+
+    /// Every native message this suite writes is the bytes its golden vector holds, which the
+    /// format wrote before its writers were sized (tests/golden/object.txt): none differs.
+    #[test]
+    fn every_request_and_reply_is_its_golden_vector() {
+        let golden: Vec<&str> = include_str!("../tests/golden/object.txt").lines().collect();
+        let lines = object_lines();
+        assert_eq!(lines.len(), golden.len());
+        let differ = lines.iter().zip(&golden).filter(|(l, g)| l != g).count();
+        assert_eq!(differ, 0);
+    }
+
+    #[test]
+    fn every_reply_reads_back_and_nothing_past_s3s_bounds_does() {
+        let listed = |n: usize| Listed {
+            key: format!("k{n}"),
+            etag: "0".repeat(32),
+            size: n as u64,
+            modified: 1_727_179_200,
+            checksum: if n.is_multiple_of(2) {
+                Some((Algorithm::Crc64Nvme, 0))
+            } else {
+                None
+            },
+            owner: if n.is_multiple_of(3) {
+                Some("o".repeat(MAX_OWNER))
+            } else {
+                None
+            },
+        };
+        let replies = every_reply();
         for reply in replies {
             let (head, fields) = reply.encode().unwrap();
             assert_eq!(head.len(), REPLY_HEAD_BYTES);

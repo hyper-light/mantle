@@ -461,22 +461,22 @@ impl Mark {
         if *self == Self::SWEPT {
             return Vec::new();
         }
-        let mut w = start();
-        match self.how {
-            How::Version { order, null } => {
-                w.u8(0);
-                w.u64(order);
-                w.u8(u8::from(null));
+        sealed(|w| {
+            match self.how {
+                How::Version { order, null } => {
+                    w.u8(0);
+                    w.u64(order);
+                    w.u8(u8::from(null));
+                }
+                How::Part => w.u8(1),
+                How::Adopted { by } => {
+                    w.u8(2);
+                    w.u128(by);
+                }
+                How::Refused => w.u8(3),
             }
-            How::Part => w.u8(1),
-            How::Adopted { by } => {
-                w.u8(2);
-                w.u128(by);
-            }
-            How::Refused => w.u8(3),
-        }
-        w.u64(self.deadline_ns);
-        finish(w)
+            w.u64(self.deadline_ns);
+        })
     }
 
     pub fn decode(mark: &[u8]) -> Result<Self, RecordError> {
@@ -580,14 +580,15 @@ pub struct Reverse {
 
 impl FileHeader {
     pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
-        let mut w = start();
-        w.u64(self.length);
-        w.u32(self.extents);
-        w.u64(self.made_ns);
-        w.u64(self.deadline_ns);
-        self.referrer.put(&mut w)?;
-        WrappedKey::put(self.key.as_ref(), &mut w);
-        Ok(finish(w))
+        record(|w| {
+            w.u64(self.length);
+            w.u32(self.extents);
+            w.u64(self.made_ns);
+            w.u64(self.deadline_ns);
+            self.referrer.put(w)?;
+            WrappedKey::put(self.key.as_ref(), w);
+            Ok(())
+        })
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
@@ -608,9 +609,10 @@ impl FileHeader {
 
 impl Referrer {
     pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
-        let mut w = start();
-        self.put(&mut w)?;
-        Ok(finish(w))
+        record(|w| {
+            self.put(w)?;
+            Ok(())
+        })
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
@@ -636,7 +638,11 @@ impl Referrer {
 
 impl Extent {
     pub fn encode(&self) -> Vec<u8> {
-        let mut w = start();
+        sealed(|w| self.put(w))
+    }
+
+    /// Writes the value's fields, which `encode` seals.
+    pub(crate) fn put(&self, w: &mut Writer) {
         w.u64(self.length);
         match self.target {
             Target::Block(id) => {
@@ -648,7 +654,6 @@ impl Extent {
                 w.u128(id);
             }
         }
-        finish(w)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
@@ -668,13 +673,16 @@ impl Extent {
 
 impl BlockHeader {
     pub fn encode(&self) -> Vec<u8> {
-        let mut w = start();
+        sealed(|w| self.put(w))
+    }
+
+    /// Writes the value's fields, which `encode` seals.
+    pub(crate) fn put(&self, w: &mut Writer) {
         w.u64(self.length);
         w.u8(self.data);
         w.u8(self.parity);
         w.u64(self.chunk_len);
         w.u32(self.crc32c);
-        finish(w)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
@@ -802,9 +810,10 @@ pub(crate) fn take_lineage(r: &mut Reader<'_>) -> Option<Lineage> {
 
 impl Lineage {
     pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
-        let mut w = start();
-        put_lineage(&mut w, self)?;
-        Ok(finish(w))
+        record(|w| {
+            put_lineage(w, self)?;
+            Ok(())
+        })
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
@@ -816,11 +825,12 @@ impl Lineage {
 
 impl Holder {
     pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
-        let mut w = start();
-        put_str(&mut w, &self.bucket)?;
-        put_str(&mut w, &self.key)?;
-        w.u8(u8::from(self.file));
-        Ok(finish(w))
+        record(|w| {
+            put_str(w, &self.bucket)?;
+            put_str(w, &self.key)?;
+            w.u8(u8::from(self.file));
+            Ok(())
+        })
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
@@ -842,12 +852,12 @@ impl Holder {
 
 impl BlockOrigin {
     pub fn encode(&self) -> Vec<u8> {
-        let mut w = start();
-        w.u128(self.file);
-        w.u64(self.made_ns);
-        w.u64(self.deadline_ns);
-        w.u8(u8::from(self.released));
-        finish(w)
+        sealed(|w| {
+            w.u128(self.file);
+            w.u64(self.made_ns);
+            w.u64(self.deadline_ns);
+            w.u8(u8::from(self.released));
+        })
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
@@ -870,10 +880,13 @@ impl BlockOrigin {
 
 impl ChunkPlace {
     pub fn encode(&self) -> Vec<u8> {
-        let mut w = start();
+        sealed(|w| self.put(w))
+    }
+
+    /// Writes the value's fields, which `encode` seals.
+    pub(crate) fn put(&self, w: &mut Writer) {
         w.u128(self.volume);
-        self.key.encode(&mut w);
-        finish(w)
+        self.key.encode(w);
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
@@ -930,25 +943,26 @@ impl BucketState {
 
 impl Bucket {
     pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
-        let mut w = start();
-        put_str(&mut w, &self.owner)?;
-        w.u64(self.created_ns);
-        put_str(&mut w, &self.location)?;
-        w.u8(self.versioning.code());
-        w.u8(self.state.code());
-        w.u64(self.attempt);
-        w.u64(self.progress_ns);
-        match self.lock {
-            None => w.u8(0),
-            Some(Lock { default: None }) => w.u8(1),
-            Some(Lock {
-                default: Some(default),
-            }) => {
-                w.u8(2);
-                put_default(&mut w, default);
+        record(|w| {
+            put_str(w, &self.owner)?;
+            w.u64(self.created_ns);
+            put_str(w, &self.location)?;
+            w.u8(self.versioning.code());
+            w.u8(self.state.code());
+            w.u64(self.attempt);
+            w.u64(self.progress_ns);
+            match self.lock {
+                None => w.u8(0),
+                Some(Lock { default: None }) => w.u8(1),
+                Some(Lock {
+                    default: Some(default),
+                }) => {
+                    w.u8(2);
+                    put_default(w, default);
+                }
             }
-        }
-        Ok(finish(w))
+            Ok(())
+        })
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
@@ -981,15 +995,15 @@ impl Bucket {
 
 impl Gate {
     pub fn encode(&self) -> Vec<u8> {
-        let mut w = start();
-        w.u64(self.incarnation);
-        w.u64(self.attempt);
-        w.u8(match self.state {
-            GateState::Open => 0,
-            GateState::Closed => 1,
-            GateState::Condemned => 2,
-        });
-        finish(w)
+        sealed(|w| {
+            w.u64(self.incarnation);
+            w.u64(self.attempt);
+            w.u8(match self.state {
+                GateState::Open => 0,
+                GateState::Closed => 1,
+                GateState::Condemned => 2,
+            });
+        })
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
@@ -1015,9 +1029,10 @@ impl Gate {
 
 impl Member {
     pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
-        let mut w = start();
-        put_str(&mut w, &self.domain)?;
-        Ok(finish(w))
+        record(|w| {
+            put_str(w, &self.domain)?;
+            Ok(())
+        })
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
@@ -1029,10 +1044,10 @@ impl Member {
 
 impl VolumeRow {
     pub fn encode(&self) -> Vec<u8> {
-        let mut w = start();
-        w.u64(self.node);
-        w.u64(self.bytes);
-        finish(w)
+        sealed(|w| {
+            w.u64(self.node);
+            w.u64(self.bytes);
+        })
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
@@ -1052,10 +1067,10 @@ impl VolumeRow {
 
 impl History {
     pub fn encode(&self) -> Vec<u8> {
-        let mut w = start();
-        w.u64(self.exposure_ns);
-        w.u64(self.crashes);
-        finish(w)
+        sealed(|w| {
+            w.u64(self.exposure_ns);
+            w.u64(self.crashes);
+        })
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
@@ -1075,10 +1090,10 @@ impl History {
 
 impl Census {
     pub fn encode(&self) -> Vec<u8> {
-        let mut w = start();
-        w.u32(self.nodes);
-        w.u32(self.volumes);
-        finish(w)
+        sealed(|w| {
+            w.u32(self.nodes);
+            w.u32(self.volumes);
+        })
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
@@ -1098,9 +1113,9 @@ impl Census {
 
 impl Owner {
     pub fn encode(&self) -> Vec<u8> {
-        let mut w = start();
-        w.u32(self.buckets);
-        finish(w)
+        sealed(|w| {
+            w.u32(self.buckets);
+        })
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
@@ -1112,10 +1127,11 @@ impl Owner {
 
 impl Owned {
     pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
-        let mut w = start();
-        w.u64(self.created_ns);
-        put_str(&mut w, &self.location)?;
-        Ok(finish(w))
+        record(|w| {
+            w.u64(self.created_ns);
+            put_str(w, &self.location)?;
+            Ok(())
+        })
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
@@ -1150,15 +1166,16 @@ impl Session {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
-        let mut w = start();
-        w.u64(self.last_ns);
-        w.u64(self.low);
-        put_len(&mut w, self.answers.len())?;
-        for (serial, answer) in &self.answers {
-            w.u64(*serial);
-            put_bytes(&mut w, answer)?;
-        }
-        Ok(finish(w))
+        record(|w| {
+            w.u64(self.last_ns);
+            w.u64(self.low);
+            put_len(w, self.answers.len())?;
+            for (serial, answer) in &self.answers {
+                w.u64(*serial);
+                put_bytes(w, answer)?;
+            }
+            Ok(())
+        })
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
@@ -1187,9 +1204,9 @@ impl Session {
 
 impl Reverse {
     pub fn encode(&self) -> Vec<u8> {
-        let mut w = start();
-        w.u16(self.index);
-        finish(w)
+        sealed(|w| {
+            w.u16(self.index);
+        })
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
@@ -1201,12 +1218,16 @@ impl Reverse {
 
 impl Version {
     pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
-        let mut w = start();
+        record(|w| self.put(w))
+    }
+
+    /// Writes the value's fields, which `encode` seals.
+    pub(crate) fn put(&self, w: &mut Writer) -> Result<(), RecordError> {
         w.u8(u8::from(self.marker)
             | (u8::from(self.null) << 1)
             | lock_flags(self.retention, self.legal_hold) << 2);
         w.u64(self.modified_ns);
-        put_str(&mut w, &self.etag)?;
+        put_str(w, &self.etag)?;
         w.u64(self.size);
         match &self.checksum {
             None => w.u8(0),
@@ -1214,13 +1235,13 @@ impl Version {
                 w.u8(1);
                 w.u8(c.algorithm);
                 w.u16(c.parts);
-                put_bytes(&mut w, &c.value)?;
+                put_bytes(w, &c.value)?;
             }
         }
-        put_file(&mut w, self.file);
-        put_str(&mut w, &self.owner)?;
-        put_pairs(&mut w, &self.headers)?;
-        put_retention(&mut w, self.retention);
+        put_file(w, self.file);
+        put_str(w, &self.owner)?;
+        put_pairs(w, &self.headers)?;
+        put_retention(w, self.retention);
         match &self.listing {
             None => w.u8(0),
             Some(listing) => {
@@ -1228,7 +1249,7 @@ impl Version {
                 w.bytes(listing);
             }
         }
-        Ok(finish(w))
+        Ok(())
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
@@ -1272,10 +1293,14 @@ impl Version {
 
 impl Upload {
     pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
-        let mut w = start();
+        record(|w| self.put(w))
+    }
+
+    /// Writes the value's fields, which `encode` seals.
+    pub(crate) fn put(&self, w: &mut Writer) -> Result<(), RecordError> {
         w.u64(self.initiated_ns);
-        put_str(&mut w, &self.owner)?;
-        put_pairs(&mut w, &self.headers)?;
+        put_str(w, &self.owner)?;
+        put_pairs(w, &self.headers)?;
         // Bits 0 and 1 the checksum, 2 to 4 the lock (`lock_flags`), 5 a native upload's runs.
         let flags = (lock_flags(self.retention, self.legal_hold) << 2)
             | (u8::from(self.runs.is_some()) << RUNS_FLAG);
@@ -1286,11 +1311,11 @@ impl Upload {
                 w.u8(algorithm);
             }
         }
-        put_retention(&mut w, self.retention);
+        put_retention(w, self.retention);
         if let Some(runs) = &self.runs {
-            put_runs(&mut w, runs);
+            put_runs(w, runs);
         }
-        Ok(finish(w))
+        Ok(())
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
@@ -1381,20 +1406,24 @@ fn take_runs(r: &mut Reader<'_>) -> Option<Runs> {
 
 impl Part {
     pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
-        let mut w = start();
-        put_str(&mut w, &self.etag)?;
+        record(|w| self.put(w))
+    }
+
+    /// Writes the value's fields, which `encode` seals.
+    pub(crate) fn put(&self, w: &mut Writer) -> Result<(), RecordError> {
+        put_str(w, &self.etag)?;
         w.u64(self.size);
         match &self.checksum {
             None => w.u8(0),
             Some(value) => {
                 w.u8(1);
-                put_bytes(&mut w, value)?;
+                put_bytes(w, value)?;
             }
         }
         w.u128(self.file);
         w.u64(self.modified_ns);
         w.u64(self.deadline_ns);
-        Ok(finish(w))
+        Ok(())
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
@@ -1422,9 +1451,9 @@ impl Part {
 
 /// A row that holds one number: a range's clock, a key's null-version pointer.
 pub fn encode_number(n: u64) -> Vec<u8> {
-    let mut w = start();
-    w.u64(n);
-    finish(w)
+    sealed(|w| {
+        w.u64(n);
+    })
 }
 
 pub fn decode_number(bytes: &[u8], what: &'static str) -> Result<u64, RecordError> {
@@ -1433,18 +1462,51 @@ pub fn decode_number(bytes: &[u8], what: &'static str) -> Result<u64, RecordErro
     decoded(n, &r, what)
 }
 
-fn start() -> Writer {
-    let mut w = Writer::default();
-    w.u8(FORMAT);
-    w
-}
-
-/// Appends the CRC-32C of everything written.
-fn finish(mut w: Writer) -> Vec<u8> {
+/// A value's bytes: its format, what `put` writes and the CRC-32C of both, in one buffer
+/// allocated at their length, which `put` counts first (`mantle_codec::encode`).
+fn record<E>(put: impl Fn(&mut Writer) -> Result<(), E>) -> Result<Vec<u8>, E> {
+    let mut w = mantle_codec::encode(CRC_BYTES, |w| {
+        w.u8(FORMAT);
+        put(w)
+    })?;
     let crc = mantle_crc::crc32c(w.as_slice());
     w.u32(crc);
-    w.into_vec()
+    Ok(w.into_vec())
 }
+
+/// A value's bytes, as `record` makes them, from a `put` that cannot fail.
+fn sealed(put: impl Fn(&mut Writer)) -> Vec<u8> {
+    let made = record::<std::convert::Infallible>(|w| {
+        put(w);
+        Ok(())
+    });
+    match made {
+        Ok(bytes) => bytes,
+        Err(never) => match never {},
+    }
+}
+
+/// Writes a value as `put_bytes` writes its `record` bytes, their length and then them, with no
+/// buffer of its own: the value counted first, its CRC-32C taken over what `put` wrote.
+pub(crate) fn put_record(
+    w: &mut Writer,
+    put: impl Fn(&mut Writer) -> Result<(), RecordError>,
+) -> Result<(), RecordError> {
+    let mut count = Writer::counting();
+    count.u8(FORMAT);
+    put(&mut count)?;
+    put_len(w, count.len().saturating_add(CRC_BYTES))?;
+    let start = w.len();
+    w.u8(FORMAT);
+    put(w)?;
+    // A writer that only counts holds no bytes, and its count needs only the CRC's width.
+    let crc = mantle_crc::crc32c(w.as_slice().get(start..).unwrap_or_default());
+    w.u32(crc);
+    Ok(())
+}
+
+/// The bytes of a value's CRC-32C.
+const CRC_BYTES: usize = 4;
 
 /// A reader over a value's fields once its checksum and format are verified.
 fn open<'a>(bytes: &'a [u8], what: &'static str) -> Result<Reader<'a>, RecordError> {
@@ -1884,11 +1946,12 @@ mod tests {
             &[4, 0, 0, 0, 0, 0, 0, 0, 0][..],
             &[0, 7, 0, 0, 0, 0, 0, 0, 0, 2],
         ] {
-            let mut w = start();
-            for b in body {
-                w.u8(*b);
-            }
-            assert_eq!(Mark::decode(&finish(w)), Err(RecordError::Corrupt("mark")));
+            let bytes = sealed(|w| {
+                for b in body {
+                    w.u8(*b);
+                }
+            });
+            assert_eq!(Mark::decode(&bytes), Err(RecordError::Corrupt("mark")));
         }
     }
 
@@ -2063,6 +2126,155 @@ mod tests {
     }
 
     /// Every flipped bit and every truncation is refused, never misread.
+    /// One value of each kind of row, in hex, a line each: what a range's engine holds.
+    fn record_lines() -> Vec<String> {
+        let hex = |bytes: Vec<u8>| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let referrer = Referrer {
+            bucket: "b".into(),
+            incarnation: 3,
+            key: "a/\u{0}é".into(),
+        };
+        let header = FileHeader {
+            length: 1 << 40,
+            extents: 10_000,
+            made_ns: 7,
+            deadline_ns: u64::MAX,
+            referrer: referrer.clone(),
+            key: Some(WrappedKey {
+                by: Wrapper::Root(u32::MAX),
+                bytes: [7; 40],
+            }),
+        };
+        let descriptor = Descriptor {
+            id: 1,
+            lo: Vec::new(),
+            hi: Some(vec![b'm', 0, 0]),
+            generation: 2,
+        };
+        let upload = Upload {
+            initiated_ns: 5,
+            owner: "o".into(),
+            headers: vec![("content-type".into(), "a/b".into())],
+            checksum: Some((2, true)),
+            retention: Some(Retention {
+                mode: RetentionMode::Governance,
+                until_ms: 3,
+            }),
+            legal_hold: Some(true),
+            runs: Some(Runs {
+                length: Some(12 << 20),
+                run: 5 << 20,
+                offset: 5 << 20,
+                count: 1,
+                ended: false,
+                md5: Some(RunMd5::Running([3; 16])),
+            }),
+        };
+        vec![
+            hex(Mark {
+                how: How::Version {
+                    order: 7,
+                    null: true,
+                },
+                deadline_ns: 11,
+            }
+            .encode()),
+            hex(header.encode().unwrap()),
+            hex(referrer.encode().unwrap()),
+            hex(Extent {
+                length: 5 << 30,
+                target: Target::File(u128::MAX),
+            }
+            .encode()),
+            hex(BlockHeader {
+                length: 72 << 20,
+                data: 9,
+                parity: 6,
+                chunk_len: 8 << 20,
+                crc32c: 0xDEAD_BEEF,
+            }
+            .encode()),
+            hex(ChunkPlace {
+                volume: 42,
+                key: mantle_chunk::ChunkKey {
+                    block: 7,
+                    epoch: 1,
+                    index: 14,
+                },
+            }
+            .encode()),
+            hex(Reverse { index: 14 }.encode()),
+            hex(Bucket {
+                owner: "o".into(),
+                created_ns: 7,
+                location: "eu-west-1".into(),
+                versioning: Versioning::Enabled,
+                state: BucketState::Active,
+                attempt: 8,
+                lock: None,
+                progress_ns: 0,
+            }
+            .encode()
+            .unwrap()),
+            hex(Gate {
+                incarnation: u64::MAX,
+                attempt: 3,
+                state: GateState::Condemned,
+            }
+            .encode()),
+            hex(Owner { buckets: 10_000 }.encode()),
+            hex(Owned {
+                created_ns: 9,
+                location: "here".into(),
+            }
+            .encode()
+            .unwrap()),
+            hex(encode_number(u64::MAX)),
+            hex(Lineage {
+                now: descriptor.clone(),
+                child: Some(descriptor.clone()),
+                standing: Standing::Serving,
+                into: None,
+                taken: Some(Taken {
+                    from: 9,
+                    generation: 4,
+                }),
+            }
+            .encode()
+            .unwrap()),
+            hex(Session {
+                last_ns: u64::MAX,
+                low: 3,
+                answers: vec![(5, Vec::new()), (9, vec![1; 40])],
+            }
+            .encode()
+            .unwrap()),
+            hex(version().encode().unwrap()),
+            hex(upload.encode().unwrap()),
+            hex(Part {
+                etag: "e".into(),
+                size: 5 << 20,
+                checksum: None,
+                file: 7,
+                modified_ns: 9,
+                deadline_ns: 11,
+            }
+            .encode()
+            .unwrap()),
+        ]
+    }
+
+    /// Every kind of row is the bytes its golden vector holds, which the format wrote before
+    /// its writers were sized (tests/golden/record.txt): none differs.
+    #[test]
+    fn every_row_is_its_golden_vector() {
+        let golden: Vec<&str> = include_str!("../tests/golden/record.txt").lines().collect();
+        let lines = record_lines();
+        assert_eq!(lines.len(), golden.len());
+        let differ = lines.iter().zip(&golden).filter(|(l, g)| l != g).count();
+        assert_eq!(differ, 0);
+    }
+
     #[test]
     fn damage_is_corrupt() {
         let bytes = version().encode().unwrap();

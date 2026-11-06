@@ -543,6 +543,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/meta/src/key.rs` `VOLUME` | format | Root-range row tag 2 after `DATA` for a volume's row, keyed by the volume's id so the table reads in id order. |
 | `crates/meta/src/name.rs` `MAX_PART` | external | The S3 maximum part size of 5 GiB (docs/research/05 §4.1, AWS S3 multipart limits). |
 | `crates/meta/src/name.rs` `MAX_PART_NUMBER` | external | S3 part numbers run from 1 to 10,000 (docs/research/05 §4.3, AWS UploadPart reference). |
+| `crates/meta/src/record.rs` `CRC_BYTES` | format | The 4 bytes of a value's CRC-32C, which ends every record value (`record`, `put_record`). |
 | `crates/meta/src/record.rs` `DAY_MS` | derived | Unit conversion: 86,400 s × 1,000 ms per day, for S3 Object Lock retention days and years (docs/research/18 §2.4, §2.6). |
 | `crates/meta/src/record.rs` `FORMAT` | format | Version byte 6 that begins every row value written by this code; 6 since a file keeps a row for each block it names, 5 since a part's row records its file's handover deadline, which the completion adopting it gives the part's mark without reading it, 4 since a mark records its write's handover deadline and a queue row whether its ID names a file, 3 since a file's mark records how the range took it (a version's order, a part, an adopting composite, or refused), 2 since a version records its completion's part listing. |
 | `crates/meta/src/record.rs` `LISTING` | external | Bytes of a completion's listing digest: SHA-256's 256-bit output (FIPS 180-4 §1). |

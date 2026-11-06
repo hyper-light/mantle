@@ -98,16 +98,18 @@ impl Entry {
         if self.commands.len() > MAX_COMMANDS {
             return Err(too_large(self.commands.len()));
         }
-        let mut w = Writer::default();
-        w.u8(FORMAT);
-        w.u64(self.at_ns);
-        record::put_len(&mut w, self.commands.len())?;
-        for c in &self.commands {
-            w.u64(c.session);
-            w.u64(c.serial);
-            w.u64(c.unanswered);
-            put_command(&mut w, &c.command)?;
-        }
+        let w = mantle_codec::encode(0, |w| {
+            w.u8(FORMAT);
+            w.u64(self.at_ns);
+            record::put_len(w, self.commands.len())?;
+            for c in &self.commands {
+                w.u64(c.session);
+                w.u64(c.serial);
+                w.u64(c.unanswered);
+                put_command(w, &c.command)?;
+            }
+            Ok(())
+        })?;
         Ok(w.into_vec())
     }
 
@@ -140,75 +142,77 @@ impl Entry {
 
 impl Answer {
     pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
-        let mut w = Writer::default();
-        match self {
-            Answer::Registered { session } => {
-                w.u8(0);
-                w.u64(*session);
-            }
-            Answer::SessionExpired => w.u8(1),
-            Answer::SessionsFull { until_ns } => {
-                w.u8(8);
-                w.u64(*until_ns);
-            }
-            Answer::WrongLayer => w.u8(2),
-            Answer::Repeated => w.u8(7),
-            Answer::Superseded => w.u8(10),
-            Answer::RowTooLarge => w.u8(11),
-            Answer::Bucket(o) => {
-                w.u8(3);
-                put_bucket_outcome(&mut w, o);
-            }
-            Answer::Name(o) => {
-                w.u8(4);
-                put_name_outcome(&mut w, o)?;
-            }
-            Answer::File(o) => {
-                w.u8(5);
-                match o {
-                    file::Outcome::Written { deadline_ns } => {
-                        w.u8(0);
-                        w.u64(*deadline_ns);
-                    }
-                    file::Outcome::Deleted => w.u8(1),
-                    file::Outcome::Conflict => w.u8(2),
-                    file::Outcome::Invalid => w.u8(3),
-                    file::Outcome::Settled => w.u8(4),
-                    file::Outcome::Expired => w.u8(5),
-                    file::Outcome::BlocksChecked(verdicts) => {
-                        w.u8(6);
-                        put_verdicts(&mut w, verdicts)?;
+        let w = mantle_codec::encode(0, |w| {
+            match self {
+                Answer::Registered { session } => {
+                    w.u8(0);
+                    w.u64(*session);
+                }
+                Answer::SessionExpired => w.u8(1),
+                Answer::SessionsFull { until_ns } => {
+                    w.u8(8);
+                    w.u64(*until_ns);
+                }
+                Answer::WrongLayer => w.u8(2),
+                Answer::Repeated => w.u8(7),
+                Answer::Superseded => w.u8(10),
+                Answer::RowTooLarge => w.u8(11),
+                Answer::Bucket(o) => {
+                    w.u8(3);
+                    put_bucket_outcome(w, o);
+                }
+                Answer::Name(o) => {
+                    w.u8(4);
+                    put_name_outcome(w, o)?;
+                }
+                Answer::File(o) => {
+                    w.u8(5);
+                    match o {
+                        file::Outcome::Written { deadline_ns } => {
+                            w.u8(0);
+                            w.u64(*deadline_ns);
+                        }
+                        file::Outcome::Deleted => w.u8(1),
+                        file::Outcome::Conflict => w.u8(2),
+                        file::Outcome::Invalid => w.u8(3),
+                        file::Outcome::Settled => w.u8(4),
+                        file::Outcome::Expired => w.u8(5),
+                        file::Outcome::BlocksChecked(verdicts) => {
+                            w.u8(6);
+                            put_verdicts(w, verdicts)?;
+                        }
                     }
                 }
-            }
-            Answer::Block(o) => {
-                w.u8(6);
-                match o {
-                    block::Outcome::Written { deadline_ns } => {
-                        w.u8(0);
-                        w.u64(*deadline_ns);
+                Answer::Block(o) => {
+                    w.u8(6);
+                    match o {
+                        block::Outcome::Written { deadline_ns } => {
+                            w.u8(0);
+                            w.u64(*deadline_ns);
+                        }
+                        block::Outcome::Moved => w.u8(1),
+                        block::Outcome::Deleted => w.u8(2),
+                        block::Outcome::Conflict => w.u8(3),
+                        block::Outcome::Invalid => w.u8(4),
+                        block::Outcome::NoSuchBlock => w.u8(5),
+                        block::Outcome::Settled => w.u8(6),
+                        block::Outcome::Released => w.u8(7),
+                        block::Outcome::Expired => w.u8(8),
                     }
-                    block::Outcome::Moved => w.u8(1),
-                    block::Outcome::Deleted => w.u8(2),
-                    block::Outcome::Conflict => w.u8(3),
-                    block::Outcome::Invalid => w.u8(4),
-                    block::Outcome::NoSuchBlock => w.u8(5),
-                    block::Outcome::Settled => w.u8(6),
-                    block::Outcome::Released => w.u8(7),
-                    block::Outcome::Expired => w.u8(8),
+                }
+                Answer::Root(o) => {
+                    w.u8(9);
+                    w.u8(match o {
+                        root::Outcome::Enlisted => 0,
+                        root::Outcome::Conflict => 1,
+                        root::Outcome::Full => 2,
+                        root::Outcome::Kept => 3,
+                        root::Outcome::Unknown => 4,
+                    });
                 }
             }
-            Answer::Root(o) => {
-                w.u8(9);
-                w.u8(match o {
-                    root::Outcome::Enlisted => 0,
-                    root::Outcome::Conflict => 1,
-                    root::Outcome::Full => 2,
-                    root::Outcome::Kept => 3,
-                    root::Outcome::Unknown => 4,
-                });
-            }
-        }
+            Ok(())
+        })?;
         Ok(w.into_vec())
     }
 
@@ -300,9 +304,12 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
                     w.u128(*file);
                     record::put_len(w, extents.len())?;
                     for e in extents {
-                        record::put_bytes(w, &e.encode())?;
+                        record::put_record(w, |w| {
+                            e.put(w);
+                            Ok(())
+                        })?;
                     }
-                    record::put_bytes(w, &referrer.encode()?)?;
+                    record::put_record(w, |w| referrer.put(w))?;
                     record::WrappedKey::put(key.as_ref(), w);
                     w.u64(*handover_ns);
                     w.u64(*blocks_deadline_ns);
@@ -342,10 +349,16 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
                 } => {
                     w.u8(0);
                     w.u128(*block);
-                    record::put_bytes(w, &header.encode())?;
+                    record::put_record(w, |w| {
+                        header.put(w);
+                        Ok(())
+                    })?;
                     record::put_len(w, chunks.len())?;
                     for c in chunks {
-                        record::put_bytes(w, &c.encode())?;
+                        record::put_record(w, |w| {
+                            c.put(w);
+                            Ok(())
+                        })?;
                     }
                     w.u128(*file);
                     w.u64(*handover_ns);
@@ -673,7 +686,7 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
             w.u8(p.versioning.code());
             put_preconditions(w, &p.preconditions)?;
             put_option(w, p.ordered_ns);
-            record::put_bytes(w, &p.version.encode()?)?;
+            record::put_record(w, |w| p.version.put(w))?;
             put_default(w, p.default);
             w.u128(p.id);
             w.u64(p.deadline_ns);
@@ -690,7 +703,7 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
         name::Command::CreateUpload(c) => {
             w.u8(2);
             put_target(w, &c.bucket, c.incarnation, &c.key)?;
-            record::put_bytes(w, &c.upload.encode()?)?;
+            record::put_record(w, |w| c.upload.put(w))?;
         }
         name::Command::PutPart(p) => {
             // A native upload's run takes a tag of its own, so entries written before runs
@@ -699,7 +712,7 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
             put_target(w, &p.bucket, p.incarnation, &p.key)?;
             record::put_str(w, &p.upload)?;
             w.u16(p.number);
-            record::put_bytes(w, &p.part.encode()?)?;
+            record::put_record(w, |w| p.part.put(w))?;
             if let Some(run) = &p.run {
                 put_run(w, run);
             }
@@ -2363,8 +2376,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn every_answer_round_trips() {
+    /// Every kind of answer, each once.
+    fn every_answer() -> Vec<Answer> {
         let lineage = crate::record::Lineage {
             now: crate::record::Descriptor {
                 id: 1,
@@ -2544,10 +2557,60 @@ mod tests {
             ]
             .map(Answer::Root),
         );
-        for answer in answers {
+        answers
+    }
+
+    #[test]
+    fn every_answer_round_trips() {
+        for answer in every_answer() {
             let bytes = answer.encode().unwrap();
             assert_eq!(Answer::decode(&bytes).unwrap(), answer);
         }
+    }
+
+    /// Each command alone in an entry, the entry of them all, and each answer, in hex: a line
+    /// each, as the format writes them.
+    fn wire_lines() -> Vec<String> {
+        let at_ns = 1_700_000_000_000_000_000;
+        let hex = |bytes: Vec<u8>| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let sessioned = |(i, command): (usize, Command)| Sessioned {
+            session: i as u64,
+            serial: 2 * i as u64,
+            unanswered: 1,
+            command,
+        };
+        let mut lines: Vec<String> = commands(at_ns)
+            .into_iter()
+            .enumerate()
+            .map(|c| {
+                hex(Entry {
+                    at_ns,
+                    commands: vec![sessioned(c)],
+                }
+                .encode()
+                .unwrap())
+            })
+            .collect();
+        lines.push(hex(Entry {
+            at_ns,
+            commands: commands(at_ns).into_iter().enumerate().map(sessioned).collect(),
+        }
+        .encode()
+        .unwrap()));
+        lines.extend(every_answer().iter().map(|a| hex(a.encode().unwrap())));
+        lines
+    }
+
+    /// Every range command and answer is the bytes its golden vector holds, which the format
+    /// wrote before its writers were sized at their messages' lengths (tests/golden/wire.txt):
+    /// none differs.
+    #[test]
+    fn every_command_and_answer_is_its_golden_vector() {
+        let golden: Vec<&str> = include_str!("../tests/golden/wire.txt").lines().collect();
+        let lines = wire_lines();
+        assert_eq!(lines.len(), golden.len());
+        let differ = lines.iter().zip(&golden).filter(|(l, g)| l != g).count();
+        assert_eq!(differ, 0);
     }
 
     proptest! {

@@ -177,7 +177,7 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
             at_ns,
         } => progress(engine, bucket, *attempt, *at_ns)?,
     };
-    engine.apply(index, &writes)?;
+    engine.apply(index, writes)?;
     Ok(outcome)
 }
 

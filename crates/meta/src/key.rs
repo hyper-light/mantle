@@ -94,7 +94,14 @@ pub enum NameRow {
 
 /// The key of a Name-layer row.
 pub fn name(bucket: &str, key: &str, row: &NameRow) -> Vec<u8> {
-    let mut out = object(bucket, key);
+    let suffix = match row {
+        NameRow::Null => 1,
+        NameRow::Version(_) => 1 + 8,
+        NameRow::Upload(upload) => string_len(upload).saturating_add(1),
+        NameRow::Part(upload, _) => string_len(upload).saturating_add(1 + 1 + 2),
+    };
+    let mut out = sized(object_len(bucket, key).saturating_add(suffix));
+    put_object(&mut out, bucket, key);
     match row {
         NameRow::Null => out.push(NULL),
         NameRow::Version(order) => {
@@ -117,14 +124,36 @@ pub fn name(bucket: &str, key: &str, row: &NameRow) -> Vec<u8> {
 
 /// The prefix every row of one object key begins with.
 pub fn object(bucket: &str, key: &str) -> Vec<u8> {
-    let mut out = objects(bucket);
-    put_string(&mut out, key.as_bytes());
+    object_and(bucket, key, &[])
+}
+
+/// `object(bucket, key)` and `then` after it.
+pub fn object_and(bucket: &str, key: &str, then: &[u8]) -> Vec<u8> {
+    let mut out = sized(object_len(bucket, key).saturating_add(then.len()));
+    put_object(&mut out, bucket, key);
+    out.extend_from_slice(then);
     out
+}
+
+/// The bytes of `object(bucket, key)`.
+fn object_len(bucket: &str, key: &str) -> usize {
+    objects_len(bucket).saturating_add(string_len(key.as_bytes()))
+}
+
+fn put_object(out: &mut Vec<u8>, bucket: &str, key: &str) {
+    out.push(DATA);
+    put_string(out, bucket.as_bytes());
+    put_string(out, key.as_bytes());
+}
+
+/// The bytes of `objects(bucket)`.
+fn objects_len(bucket: &str) -> usize {
+    string_len(bucket.as_bytes()).saturating_add(1)
 }
 
 /// The prefix every row of a bucket's objects begins with.
 pub fn objects(bucket: &str) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = sized(objects_len(bucket));
     out.push(DATA);
     put_string(&mut out, bucket.as_bytes());
     out
@@ -136,14 +165,22 @@ pub fn objects(bucket: &str) -> Vec<u8> {
 /// row of a longer bucket name after it.
 pub fn bucket_span(bucket: &str) -> (Vec<u8>, Vec<u8>) {
     let from = objects(bucket);
-    let mut past = from.clone();
-    past.push(0xFF);
+    let past = past(&from);
     (from, past)
+}
+
+/// `from` and 0xFF after it: past every key that begins with `from` and goes on below 0xFF.
+fn past(from: &[u8]) -> Vec<u8> {
+    let mut past = sized(from.len().saturating_add(1));
+    past.extend_from_slice(from);
+    past.push(0xFF);
+    past
 }
 
 /// The key of a Name range's gate for a bucket (docs/design/metadata.md §2).
 pub fn gate(bucket: &str) -> Vec<u8> {
-    let mut out = vec![LOCAL, marker::GATE];
+    let mut out = sized(string_len(bucket.as_bytes()).saturating_add(2));
+    out.extend_from_slice(&[LOCAL, marker::GATE]);
     put_string(&mut out, bucket.as_bytes());
     out
 }
@@ -166,7 +203,7 @@ pub fn decode_gate(k: &[u8]) -> Option<String> {
 /// 0xFF, so a span between two routing keys bounds the rows of its keys by bytes in every
 /// space, and a Name range's span is such a pair (docs/design/metadata.md §3).
 pub fn route(bucket: &str, key: &str) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = sized(string_len(bucket.as_bytes()).saturating_add(string_len(key.as_bytes())));
     put_string(&mut out, bucket.as_bytes());
     put_string(&mut out, key.as_bytes());
     out
@@ -188,9 +225,10 @@ pub fn decode_route(r: &[u8]) -> Option<(String, String)> {
 /// The routing keys of a bucket's object keys lie in `[from, past)`: `from` is its empty
 /// key's, the least, and no routing key of another bucket falls between.
 pub fn bucket_routes(bucket: &str) -> (Vec<u8>, Vec<u8>) {
-    let mut from = Vec::new();
+    let len = string_len(bucket.as_bytes()).saturating_add(1);
+    let (mut from, mut past) = (sized(len), sized(len));
     put_string(&mut from, bucket.as_bytes());
-    let mut past = from.clone();
+    put_string(&mut past, bucket.as_bytes());
     from.push(0x00);
     past.push(0xFF);
     (from, past)
@@ -200,11 +238,14 @@ pub fn bucket_routes(bucket: &str) -> (Vec<u8>, Vec<u8>) {
 /// `[from, to)`, or from `from` on when `to` is `None`.
 pub fn name_spans(from: &[u8], to: Option<&[u8]>) -> [(Vec<u8>, Vec<u8>); 2] {
     [DATA, MARKS].map(|space| {
-        let mut lo = vec![space];
+        let mut lo = sized(from.len().saturating_add(1));
+        lo.push(space);
         lo.extend_from_slice(from);
         // A routing key never begins with 0xFF, so this bounds the whole space.
-        let mut hi = vec![space];
-        hi.extend_from_slice(to.unwrap_or(&[0xFF]));
+        let to = to.unwrap_or(&[0xFF]);
+        let mut hi = sized(to.len().saturating_add(1));
+        hi.push(space);
+        hi.extend_from_slice(to);
         (lo, hi)
     })
 }
@@ -212,8 +253,19 @@ pub fn name_spans(from: &[u8], to: Option<&[u8]>) -> [(Vec<u8>, Vec<u8>); 2] {
 /// The key of a bucket's row in the Bucket range's index of creates and deletes in progress,
 /// which the collector reads for attempts to take over (docs/design/metadata.md §2).
 pub fn attempt(bucket: &str) -> Vec<u8> {
-    let mut out = vec![LOCAL, marker::ATTEMPT];
+    attempt_and(bucket, &[])
+}
+
+/// `attempt(bucket)` and `then` after it.
+fn attempt_and(bucket: &str, then: &[u8]) -> Vec<u8> {
+    let mut out = sized(
+        string_len(bucket.as_bytes())
+            .saturating_add(2)
+            .saturating_add(then.len()),
+    );
+    out.extend_from_slice(&[LOCAL, marker::ATTEMPT]);
     put_string(&mut out, bucket.as_bytes());
+    out.extend_from_slice(then);
     out
 }
 
@@ -221,11 +273,7 @@ pub fn attempt(bucket: &str) -> Vec<u8> {
 /// past its last.
 pub fn attempts_after(after: Option<&str>) -> (Vec<u8>, Vec<u8>) {
     let from = match after {
-        Some(bucket) => {
-            let mut k = attempt(bucket);
-            k.push(0);
-            k
-        }
+        Some(bucket) => attempt_and(bucket, &[0]),
         None => vec![LOCAL, marker::ATTEMPT],
     };
     (from, vec![LOCAL, marker::ATTEMPT.saturating_add(1)])
@@ -243,7 +291,13 @@ pub fn decode_attempt(k: &[u8]) -> Option<String> {
 
 /// The key of the Name range's mark that it took `file`, made for `key` in `bucket`.
 pub fn mark(bucket: &str, key: &str, file: u128) -> Vec<u8> {
-    let mut out = marks_of(bucket);
+    let mut out = sized(
+        objects_len(bucket)
+            .saturating_add(string_len(key.as_bytes()))
+            .saturating_add(1 + 16),
+    );
+    out.push(MARKS);
+    put_string(&mut out, bucket.as_bytes());
     put_string(&mut out, key.as_bytes());
     out.push(MARK);
     out.extend_from_slice(&file.to_be_bytes());
@@ -253,8 +307,7 @@ pub fn mark(bucket: &str, key: &str, file: u128) -> Vec<u8> {
 /// The first key of a bucket's marks, and a key past its last.
 pub fn marks_span(bucket: &str) -> (Vec<u8>, Vec<u8>) {
     let from = marks_of(bucket);
-    let mut past = from.clone();
-    past.push(0xFF);
+    let past = past(&from);
     (from, past)
 }
 
@@ -272,7 +325,7 @@ pub fn decode_mark(k: &[u8]) -> Option<(String, String, u128)> {
 }
 
 fn marks_of(bucket: &str) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = sized(objects_len(bucket));
     out.push(MARKS);
     put_string(&mut out, bucket.as_bytes());
     out
@@ -282,7 +335,7 @@ fn marks_of(bucket: &str) -> Vec<u8> {
 /// of a block in the Block range's: its handover deadline, then its ID, so the sweep takes them
 /// as their deadlines pass (docs/design/metadata.md §2).
 pub fn unsettled(deadline_ns: u64, id: u128) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = sized(2 + 8 + 16);
     out.extend_from_slice(&[LOCAL, marker::UNSETTLED]);
     out.extend_from_slice(&deadline_ns.to_be_bytes());
     out.extend_from_slice(&id.to_be_bytes());
@@ -292,7 +345,8 @@ pub fn unsettled(deadline_ns: u64, id: u128) -> Vec<u8> {
 /// The first key of the unsettled queue, and the first of those whose deadline is at or after
 /// `before_ns`.
 pub fn unsettled_before(before_ns: u64) -> (Vec<u8>, Vec<u8>) {
-    let mut past = vec![LOCAL, marker::UNSETTLED];
+    let mut past = sized(2 + 8);
+    past.extend_from_slice(&[LOCAL, marker::UNSETTLED]);
     past.extend_from_slice(&before_ns.to_be_bytes());
     (vec![LOCAL, marker::UNSETTLED], past)
 }
@@ -313,26 +367,31 @@ const RELEASED: [u8; 2] = [LOCAL, marker::RELEASED];
 /// The key of a released file's row: the range's time when it was released, then the file,
 /// so the collector takes them in the order they were released.
 pub fn released(time_ns: u64, file: u128) -> Vec<u8> {
-    let mut out = Vec::new();
+    released_and(time_ns, file, &[])
+}
+
+/// `released(time_ns, file)` and `then` after it.
+fn released_and(time_ns: u64, file: u128, then: &[u8]) -> Vec<u8> {
+    let mut out = sized((2 + 8 + 16usize).saturating_add(then.len()));
     out.extend_from_slice(&RELEASED);
     out.extend_from_slice(&time_ns.to_be_bytes());
     out.extend_from_slice(&file.to_be_bytes());
+    out.extend_from_slice(then);
     out
 }
 
 /// The first key of the released queue, and the first of those released at or after
 /// `before_ns`.
 pub fn released_before(before_ns: u64) -> (Vec<u8>, Vec<u8>) {
-    let mut past = RELEASED.to_vec();
+    let mut past = sized(RELEASED.len().saturating_add(8));
+    past.extend_from_slice(&RELEASED);
     past.extend_from_slice(&before_ns.to_be_bytes());
     (RELEASED.to_vec(), past)
 }
 
 /// Every key of the released queue: its first, and a key past its last.
 pub fn released_all() -> (Vec<u8>, Vec<u8>) {
-    let mut past = released(u64::MAX, u128::MAX);
-    past.push(0);
-    (RELEASED.to_vec(), past)
+    (RELEASED.to_vec(), released_and(u64::MAX, u128::MAX, &[0]))
 }
 
 /// The time and file a released file's key names; `None` if it is not one.
@@ -350,7 +409,9 @@ pub fn decode_released(k: &[u8]) -> Option<(u64, u128)> {
 /// order and prefixes, so the first row at or after this is the first object key at or after
 /// `from`.
 pub fn position(bucket: &str, from: &[u8]) -> Vec<u8> {
-    let mut out = objects(bucket);
+    let mut out = sized(objects_len(bucket).saturating_add(escaped_len(from)));
+    out.push(DATA);
+    put_string(&mut out, bucket.as_bytes());
     escape(&mut out, from);
     out
 }
@@ -360,8 +421,26 @@ pub fn decode_name(k: &[u8]) -> Option<(String, String, NameRow)> {
     let rest = k.strip_prefix(&[DATA])?;
     let (bucket, rest) = take_string(rest)?;
     let (key, rest) = take_string(rest)?;
-    let (&kind, rest) = rest.split_first()?;
-    let row = match kind {
+    Some((
+        String::from_utf8(bucket).ok()?,
+        String::from_utf8(key).ok()?,
+        name_row(rest)?,
+    ))
+}
+
+/// The object key and row a Name-layer key names, its bucket passed over; `None` if it is not
+/// one.
+pub fn decode_object_row(k: &[u8]) -> Option<(String, NameRow)> {
+    let rest = k.strip_prefix(&[DATA])?;
+    let (_, rest) = split_string(rest)?;
+    let (key, rest) = take_string(rest)?;
+    Some((String::from_utf8(key).ok()?, name_row(rest)?))
+}
+
+/// The row a Name-layer key's suffix names.
+fn name_row(suffix: &[u8]) -> Option<NameRow> {
+    let (&kind, rest) = suffix.split_first()?;
+    Some(match kind {
         NULL if rest.is_empty() => NameRow::Null,
         VERSION => NameRow::Version(u64::from_be_bytes(rest.try_into().ok()?)),
         UPLOAD => {
@@ -375,12 +454,7 @@ pub fn decode_name(k: &[u8]) -> Option<(String, String, NameRow)> {
             }
         }
         _ => return None,
-    };
-    Some((
-        String::from_utf8(bucket).ok()?,
-        String::from_utf8(key).ok()?,
-        row,
-    ))
+    })
 }
 
 /// File-layer rows under a file's ID.
@@ -400,9 +474,7 @@ pub fn file_header(file: u128) -> Vec<u8> {
 /// The key of a file's extent that ends at byte `end` of the file: keyed by its end, a seek
 /// forward from any offset lands on the extent that holds it.
 pub fn file_extent(file: u128, end: u64) -> Vec<u8> {
-    let mut out = id_row(file, EXTENT);
-    out.extend_from_slice(&end.to_be_bytes());
-    out
+    id_row_and(file, EXTENT, &end.to_be_bytes())
 }
 
 /// The key just past a file's last extent row: extents are read up to it, not past it into the
@@ -413,9 +485,7 @@ pub fn file_extents_end(file: u128) -> Vec<u8> {
 
 /// The key of the row saying file `file` names block `block`.
 pub fn file_named(file: u128, block: u128) -> Vec<u8> {
-    let mut out = id_row(file, NAMED);
-    out.extend_from_slice(&block.to_be_bytes());
-    out
+    id_row_and(file, NAMED, &block.to_be_bytes())
 }
 
 /// The end an extent's key names.
@@ -430,9 +500,7 @@ pub fn block_header(block: u128) -> Vec<u8> {
 
 /// The key of the row locating chunk `index` of a block.
 pub fn block_chunk(block: u128, index: u16) -> Vec<u8> {
-    let mut out = id_row(block, CHUNK);
-    out.extend_from_slice(&index.to_be_bytes());
-    out
+    id_row_and(block, CHUNK, &index.to_be_bytes())
 }
 
 /// The key of the row recording where a block came from.
@@ -446,10 +514,16 @@ pub fn id_rows(id: u128) -> (Vec<u8>, Vec<u8>) {
 }
 
 fn id_row(id: u128, kind: u8) -> Vec<u8> {
-    let mut out = Vec::new();
+    id_row_and(id, kind, &[])
+}
+
+/// `id_row(id, kind)` and `then` after it.
+fn id_row_and(id: u128, kind: u8, then: &[u8]) -> Vec<u8> {
+    let mut out = sized((1 + 16 + 1usize).saturating_add(then.len()));
     out.push(DATA);
     out.extend_from_slice(&id.to_be_bytes());
     out.push(kind);
+    out.extend_from_slice(then);
     out
 }
 
@@ -469,18 +543,22 @@ fn id_row_tail(k: &[u8], kind: u8) -> Option<&[u8]> {
 /// `(disk_id, blk_id)` and shards it by block [01 Table 1]; it is kept in the range of its
 /// block, so it changes in the same transaction as the block's rows.
 pub fn reverse(volume: u128, block: u128) -> Vec<u8> {
-    let mut out = Vec::new();
+    reverse_and(volume, block, &[])
+}
+
+/// `reverse(volume, block)` and `then` after it.
+fn reverse_and(volume: u128, block: u128, then: &[u8]) -> Vec<u8> {
+    let mut out = sized((1 + 16 + 16usize).saturating_add(then.len()));
     out.push(REVERSE);
     out.extend_from_slice(&volume.to_be_bytes());
     out.extend_from_slice(&block.to_be_bytes());
+    out.extend_from_slice(then);
     out
 }
 
 /// The first key of `volume`'s reverse rows, and a key past its last.
 pub fn reverse_rows(volume: u128) -> (Vec<u8>, Vec<u8>) {
-    let mut past = reverse(volume, u128::MAX);
-    past.push(0);
-    (reverse(volume, 0), past)
+    (reverse(volume, 0), reverse_and(volume, u128::MAX, &[0]))
 }
 
 /// The volume and block a reverse row's key names.
@@ -504,17 +582,21 @@ pub fn census() -> Vec<u8> {
 
 /// The key of node `node`'s row in the root range's table.
 pub fn member(node: u64) -> Vec<u8> {
-    let mut out = vec![DATA, MEMBER];
-    out.extend_from_slice(&node.to_be_bytes());
+    numbered(MEMBER, &node.to_be_bytes())
+}
+
+/// The root range's row of `kind` under its number's big-endian bytes.
+fn numbered(kind: u8, number: &[u8]) -> Vec<u8> {
+    let mut out = sized(number.len().saturating_add(2));
+    out.extend_from_slice(&[DATA, kind]);
+    out.extend_from_slice(number);
     out
 }
 
 /// The key of node `node`'s history in the root range: the time it has run and its runs that
 /// ended without an orderly stop (docs/design/node.md §2.4, item 7).
 pub fn history(node: u64) -> Vec<u8> {
-    let mut out = vec![DATA, HISTORY];
-    out.extend_from_slice(&node.to_be_bytes());
-    out
+    numbered(HISTORY, &node.to_be_bytes())
 }
 
 /// The first key of the nodes' histories and a key past the last.
@@ -524,16 +606,16 @@ pub fn history_rows() -> (Vec<u8>, Vec<u8>) {
 
 /// The key of volume `volume`'s row in the root range's table: volumes sort by id.
 pub fn volume(volume: u128) -> Vec<u8> {
-    let mut out = vec![DATA, VOLUME];
-    out.extend_from_slice(&volume.to_be_bytes());
-    out
+    numbered(VOLUME, &volume.to_be_bytes())
 }
 
 /// The first key of the volume rows after `after`, or of all of them, and a key past the last.
 pub fn volume_rows(after: Option<u128>) -> (Vec<u8>, Vec<u8>) {
     let from = match after {
         Some(after) => {
-            let mut from = volume(after);
+            let mut from = sized(2 + 16 + 1);
+            from.extend_from_slice(&[DATA, VOLUME]);
+            from.extend_from_slice(&after.to_be_bytes());
             from.push(0);
             from
         }
@@ -550,7 +632,7 @@ pub fn decode_volume(k: &[u8]) -> Option<u128> {
 
 /// The key of a bucket's row in the Bucket layer.
 pub fn bucket(name: &str) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = sized(objects_len(name));
     out.push(DATA);
     put_string(&mut out, name.as_bytes());
     out
@@ -559,37 +641,46 @@ pub fn bucket(name: &str) -> Vec<u8> {
 /// The key of an owner's row, which counts its buckets. The reverse rows of its buckets
 /// follow it.
 pub fn owner(owner: &str) -> Vec<u8> {
-    let mut out = Vec::new();
+    owned_and(owner, None, &[])
+}
+
+/// An owner's row's key, the reverse row of `bucket` where one is named, and `then` after it.
+fn owned_and(owner: &str, bucket: Option<&str>, then: &[u8]) -> Vec<u8> {
+    let bucket_len = bucket.map_or(0, |b| string_len(b.as_bytes()));
+    let mut out = sized(
+        objects_len(owner)
+            .saturating_add(bucket_len)
+            .saturating_add(then.len()),
+    );
     out.push(REVERSE);
     put_string(&mut out, owner.as_bytes());
+    if let Some(bucket) = bucket {
+        put_string(&mut out, bucket.as_bytes());
+    }
+    out.extend_from_slice(then);
     out
 }
 
 /// The key of the reverse row saying `owner` owns `bucket`.
 pub fn owned(owner: &str, bucket: &str) -> Vec<u8> {
-    let mut out = self::owner(owner);
-    put_string(&mut out, bucket.as_bytes());
-    out
+    owned_and(owner, Some(bucket), &[])
 }
 
 /// The first key of `owner`'s reverse rows for the buckets whose names begin with `prefix`,
 /// after bucket `after` where one is named, and a key past the last of them.
 pub fn owned_rows(owner: &str, prefix: &str, after: Option<&str>) -> (Vec<u8>, Vec<u8>) {
-    let head = self::owner(owner);
-    let mut first = head.clone();
+    let head = objects_len(owner);
+    let mut first = sized(head.saturating_add(escaped_len(prefix.as_bytes())));
+    first.push(REVERSE);
+    put_string(&mut first, owner.as_bytes());
     escape(&mut first, prefix.as_bytes());
     // UTF-8 never writes 0xFF and an escaped zero is 0x00 0xFF, so every name that begins with
     // `prefix` sorts before it.
-    let mut past = first.clone();
-    past.push(0xFF);
-    // The owner's count is the row `head` itself; its reverse rows sort after it.
-    let mut from = head;
-    from.push(0);
-    from = from.max(first);
+    let past = past(&first);
+    // The owner's count is the row `owner(owner)` itself; its reverse rows sort after it.
+    let mut from = owned_and(owner, None, &[0]).max(first);
     if let Some(bucket) = after {
-        let mut after = owned(owner, bucket);
-        after.push(0);
-        from = from.max(after);
+        from = from.max(owned_and(owner, Some(bucket), &[0]));
     }
     (from, past)
 }
@@ -608,6 +699,28 @@ pub fn decode_owned(k: &[u8]) -> Option<(String, String)> {
     ))
 }
 
+/// A key's buffer, allocated once at `len`, the key's length, which its maker computes from
+/// what the key holds before writing a byte of it. A reservation the allocator refuses leaves
+/// the buffer empty, to grow as the key is written, where `Vec::with_capacity` would panic.
+pub(crate) fn sized(len: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    if out.try_reserve_exact(len).is_err() {
+        out = Vec::new();
+    }
+    out
+}
+
+/// The bytes `s` takes escaped: each 0x00 doubled.
+fn escaped_len(s: &[u8]) -> usize {
+    s.len()
+        .saturating_add(s.iter().filter(|b| **b == 0x00).count())
+}
+
+/// The bytes `s` takes escaped and ended.
+fn string_len(s: &[u8]) -> usize {
+    escaped_len(s).saturating_add(1)
+}
+
 /// Appends `s` escaped and ended.
 fn put_string(out: &mut Vec<u8>, s: &[u8]) {
     escape(out, s);
@@ -616,33 +729,50 @@ fn put_string(out: &mut Vec<u8>, s: &[u8]) {
 
 /// Appends `s` with each 0x00 written as 0x00 0xFF.
 fn escape(out: &mut Vec<u8>, s: &[u8]) {
-    for &b in s {
-        out.push(b);
-        if b == 0x00 {
-            out.push(0xFF);
-        }
+    let mut runs = s.split(|b| *b == 0x00);
+    if let Some(first) = runs.next() {
+        out.extend_from_slice(first);
+    }
+    for run in runs {
+        out.extend_from_slice(&[0x00, 0xFF]);
+        out.extend_from_slice(run);
     }
 }
 
 /// The string at the start of `k`, and what follows its end.
 fn take_string(k: &[u8]) -> Option<(Vec<u8>, &[u8])> {
-    let mut out = Vec::new();
-    let mut rest = k;
+    let (escaped, rest) = split_string(k)?;
+    Some((unescape(escaped), rest))
+}
+
+/// The string at the start of `k` as it lies, escaped, and what follows its end.
+fn split_string(k: &[u8]) -> Option<(&[u8], &[u8])> {
+    let mut at = 0usize;
     loop {
-        let (&b, tail) = rest.split_first()?;
-        if b != 0x00 {
-            out.push(b);
-            rest = tail;
+        let zero = at.checked_add(k.get(at..)?.iter().position(|b| *b == 0x00)?)?;
+        let next = zero.checked_add(1)?;
+        if k.get(next) == Some(&0xFF) {
+            at = next.checked_add(1)?;
             continue;
         }
-        match tail.split_first() {
-            Some((&0xFF, tail)) => {
-                out.push(0x00);
-                rest = tail;
-            }
-            _ => return Some((out, tail)),
-        }
+        return Some((k.get(..zero)?, k.get(next..)?));
     }
+}
+
+/// An escaped string's bytes, in one buffer at their length: every 0x00 in `escaped` is the
+/// first of an escaped zero's two bytes (`split_string`).
+fn unescape(escaped: &[u8]) -> Vec<u8> {
+    let zeros = escaped.iter().filter(|b| **b == 0x00).count();
+    let mut out = sized(escaped.len().saturating_sub(zeros));
+    let mut runs = escaped.split(|b| *b == 0x00);
+    if let Some(first) = runs.next() {
+        out.extend_from_slice(first);
+    }
+    for run in runs {
+        out.push(0x00);
+        out.extend_from_slice(run.get(1..).unwrap_or_default());
+    }
+    out
 }
 
 /// Bytes of the shortest key a range writes: one of its own rows, its marker after `LOCAL`.

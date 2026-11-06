@@ -285,7 +285,7 @@ impl Touched {
             writes.push(Write::Put(COUNT.to_vec(), record::encode_number(held)));
         }
         if !writes.is_empty() {
-            rows.apply(index, &writes)?;
+            rows.apply(index, writes)?;
         }
         Ok(())
     }
@@ -380,7 +380,7 @@ pub fn register<R: Rows>(
     writes.push(Write::Put(COUNT.to_vec(), record::encode_number(held)));
     let last = [session, run, nth].map(u64::to_be_bytes).concat();
     writes.push(Write::Put(owner_key(owner), last));
-    rows.apply(index, &writes)?;
+    rows.apply(index, writes)?;
     Ok(Registration::Session(session))
 }
 
@@ -454,7 +454,7 @@ pub fn expire<R: Rows>(
         .checked_sub(expired)
         .ok_or(MetaError::Corrupt)?;
     writes.push(Write::Put(COUNT.to_vec(), record::encode_number(held)));
-    rows.apply(index, &writes)?;
+    rows.apply(index, writes)?;
     Ok(())
 }
 

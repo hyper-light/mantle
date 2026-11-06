@@ -80,7 +80,7 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
         Command::Enlist(e) => enlist(engine, e)?,
         Command::Lived(l) => lived(engine, l)?,
     };
-    engine.apply(index, &writes)?;
+    engine.apply(index, writes)?;
     Ok(outcome)
 }
 

@@ -44,16 +44,16 @@ mod tests {
         let mut m = Model::default();
         let (first, write) = tick(&mut m, 100).unwrap();
         assert_eq!(first, 100);
-        m.apply(1, &[write]).unwrap();
+        m.apply(1, vec![write]).unwrap();
         let (second, write) = tick(&mut m, 50).unwrap();
         assert_eq!(
             second, 101,
             "a proposal behind the clock takes the next instant"
         );
-        m.apply(2, &[write]).unwrap();
+        m.apply(2, vec![write]).unwrap();
         let (last, write) = tick(&mut m, u64::MAX).unwrap();
         assert_eq!(last, u64::MAX);
-        m.apply(3, &[write]).unwrap();
+        m.apply(3, vec![write]).unwrap();
         assert_eq!(tick(&mut m, 0).unwrap_err(), MetaError::ClockExhausted);
     }
 }

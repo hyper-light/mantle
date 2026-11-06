@@ -731,7 +731,7 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
         _ => Some((Outcome::Moved(Box::new(lineage.clone())), Vec::new())),
     };
     if let Some((outcome, writes)) = settled {
-        engine.apply(index, &writes)?;
+        engine.apply(index, writes)?;
         return Ok(outcome);
     }
     // A write carrying a file the range has marked, or a write with no file whose ID it has
@@ -743,7 +743,7 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
         && let Some(mark) = engine.get(&key::mark(c.bucket, c.key, c.id))?
     {
         let outcome = copy(command, Mark::decode(&mark)?);
-        engine.apply(index, &[])?;
+        engine.apply(index, vec![])?;
         return Ok(outcome);
     }
     let admitted = match command.write_to() {
@@ -804,7 +804,7 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
             writes.push(Write::Put(key::mark(c.bucket, c.key, file), mark.encode()));
         }
     }
-    engine.apply(index, &writes)?;
+    engine.apply(index, writes)?;
     Ok(outcome)
 }
 
@@ -942,7 +942,7 @@ pub fn merge<E: Rows, F: Rows>(
 ) -> Result<Outcome, MetaError> {
     let lineage = lineage(engine)?;
     if lineage.standing != Standing::Serving || lineage.now.generation != m.generation {
-        engine.apply(index, &[])?;
+        engine.apply(index, vec![])?;
         return Ok(Outcome::Moved(Box::new(lineage)));
     }
     let adjacent = lineage.now.hi.as_ref() == Some(&m.from.lo) && m.from.id != lineage.now.id;
@@ -955,7 +955,7 @@ pub fn merge<E: Rows, F: Rows>(
         Some(taken) => taken,
         None => refuse(lineage)?,
     };
-    engine.apply(index, &writes)?;
+    engine.apply(index, writes)?;
     Ok(outcome)
 }
 
@@ -1347,9 +1347,9 @@ fn collect<E: Rows>(engine: &mut E, c: &Collect) -> Result<(Outcome, Vec<Write>)
         let Some((k, v)) = engine.next(&from, &to)? else {
             return Ok((Outcome::Collected { done: true }, writes));
         };
-        match key::decode_name(&k) {
-            Some((_, _, NameRow::Upload(_))) => {}
-            Some((_, object, NameRow::Part(..))) => {
+        match key::decode_object_row(&k) {
+            Some((_, NameRow::Upload(_))) => {}
+            Some((object, NameRow::Part(..))) => {
                 writes.push(release(now, &c.bucket, &object, Part::decode(&v)?.file)?);
             }
             // A version under a condemned gate: the delete never read this range (§2), and
@@ -1997,7 +1997,7 @@ fn remove_upload<E: Rows>(
         let Some((k, v)) = engine.next(&from, &to)? else {
             break;
         };
-        let Some((_, _, NameRow::Part(_, number))) = key::decode_name(&k) else {
+        let Some((_, NameRow::Part(_, number))) = key::decode_object_row(&k) else {
             return Err(MetaError::Corrupt);
         };
         // `kept` is in ascending order, as a completion's parts must be: a search, not a
@@ -2044,7 +2044,7 @@ pub fn parts<E: Rows>(
         let Some((k, v)) = engine.next(&from, &to)? else {
             break;
         };
-        let Some((_, _, NameRow::Part(_, number))) = key::decode_name(&k) else {
+        let Some((_, NameRow::Part(_, number))) = key::decode_object_row(&k) else {
             return Err(MetaError::Corrupt);
         };
         out.push((number, Part::decode(&v)?));
@@ -2063,8 +2063,8 @@ pub fn current<E: Rows>(
     let to = key::name(bucket, key, &NameRow::Upload(Vec::new()));
     match engine.next(&from, &to)? {
         None => Ok(None),
-        Some((k, v)) => match key::decode_name(&k) {
-            Some((_, _, NameRow::Version(order))) => Ok(Some((order, Version::decode(&v)?))),
+        Some((k, v)) => match key::decode_object_row(&k) {
+            Some((_, NameRow::Version(order))) => Ok(Some((order, Version::decode(&v)?))),
             _ => Err(MetaError::Corrupt),
         },
     }
@@ -2167,7 +2167,7 @@ pub fn next_current<E: Rows>(
         let Some((k, v)) = engine.next(&position, &end)? else {
             return Ok(Scan::End);
         };
-        let Some((_, object, row)) = key::decode_name(&k) else {
+        let Some((object, row)) = key::decode_object_row(&k) else {
             return Err(MetaError::Corrupt);
         };
         match row {
@@ -2261,7 +2261,7 @@ pub fn next_version<E: Rows>(
         let Some((k, v)) = engine.next(&position, &end)? else {
             return Ok(Scan::End);
         };
-        let Some((_, object, row)) = key::decode_name(&k) else {
+        let Some((object, row)) = key::decode_object_row(&k) else {
             return Err(MetaError::Corrupt);
         };
         match row {
@@ -2329,7 +2329,7 @@ pub fn next_upload<E: Rows>(
         let Some((k, v)) = engine.next(&position, &end)? else {
             return Ok(Scan::End);
         };
-        let Some((_, object, row)) = key::decode_name(&k) else {
+        let Some((object, row)) = key::decode_object_row(&k) else {
             return Err(MetaError::Corrupt);
         };
         if let Some(passed) = sought.take()
@@ -2434,9 +2434,9 @@ fn probe_rows<E: Rows>(
         let Some((k, _)) = engine.next(&position, &to)? else {
             return Ok(Probe::Clear);
         };
-        match key::decode_name(&k) {
-            Some((_, _, NameRow::Null | NameRow::Version(_))) => return Ok(Probe::Found),
-            Some((_, object, NameRow::Upload(_) | NameRow::Part(..))) => {
+        match key::decode_object_row(&k) {
+            Some((_, NameRow::Null | NameRow::Version(_))) => return Ok(Probe::Found),
+            Some((object, NameRow::Upload(_) | NameRow::Part(..))) => {
                 position = beyond_rows(bucket, &object);
             }
             None => return Err(MetaError::Corrupt),
@@ -2445,18 +2445,17 @@ fn probe_rows<E: Rows>(
     Ok(Probe::Paused(position))
 }
 
-/// The smallest key after `k`.
+/// The smallest key after `k`, made at its length.
 fn after(k: &[u8]) -> Vec<u8> {
-    let mut next = k.to_vec();
+    let mut next = key::sized(k.len().saturating_add(1));
+    next.extend_from_slice(k);
     next.push(0);
     next
 }
 
 /// A position after every row of `object`: its prefix and a byte past every row kind.
 fn beyond_rows(bucket: &str, object: &str) -> Vec<u8> {
-    let mut next = key::object(bucket, object);
-    next.push(u8::MAX);
-    next
+    key::object_and(bucket, object, &[u8::MAX])
 }
 
 #[cfg(test)]
@@ -2604,7 +2603,7 @@ mod tests {
             let mut from = key::name("b", key, &NameRow::Version(0));
             let to = key::name("b", key, &NameRow::Upload(Vec::new()));
             while let Some((k, v)) = self.engine.next(&from, &to).unwrap() {
-                let Some((_, _, NameRow::Version(order))) = key::decode_name(&k) else {
+                let Some((_, NameRow::Version(order))) = key::decode_object_row(&k) else {
                     panic!("not a version row")
                 };
                 let v = Version::decode(&v).unwrap();
@@ -5749,7 +5748,7 @@ mod tests {
             .map(|&m| Write::Put(vec![key::LOCAL, m], vec![1, 2, 3]))
             .collect();
         r.index += 1;
-        r.engine.apply(r.index, &own).unwrap();
+        r.engine.apply(r.index, own).unwrap();
         r.clock = 10 * MS;
         r.put("a", "e", Versioning::Unversioned);
         r.clock = 20 * MS;

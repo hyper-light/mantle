@@ -392,3 +392,64 @@ Kept under `~/.cache/claude-scratch/doors/ledger/` (not in the repository):
 The bench exits non-zero at the end of every run on its controls ("a control's object was not put:
 slowed or unanswered"), in the diag and the plain build alike and before any diagnostic code ran in
 the first try; every measured phase completed with 0 failed operations.
+
+## Step 5, after
+
+Step 5 cut seven of the sites above at their cause (commits 6cb5eb21 bench, a6d1ad29 node and
+gateway, ea55821d docs, 8d6d9ae6 bench): the turn's events, `drive`'s lists and the plane's
+message copies; the volume table's scheme, carried while its volumes' domains hold; `mantle
+serve`'s lines, written into one kept buffer and said once a turn; a put's chunk, one `Bytes` for
+every copy; and `Get::finish`, each segment opened where it was gathered (one copy of each byte
+read). The vendor sites (hyper-quic, hyper-transport, hyper-durable's `peers().collect()`, 64 a
+second at rest) are hyper-raft's and untouched.
+
+**Counted exactly, before and after** (each test red on the code before, run once against it):
+
+| site | test | before | after |
+|---|---|---:|---:|
+| events, `drive`'s lists, plane copies: a cell of three at rest, 10 s simulated | `crates/node/tests/turn_allocs.rs` | 477,128 allocs (`drive` 189,808, plane 119,301, events 0) | 168,019 |
+| the same serving three clients, 40 ops each | same | 77,323 (events 395, `drive` 19,870, plane 11,970) | 45,088–45,089 (clients' random ids) |
+| scheme over an unchanged table of three domains | `host::tests::the_scheme_is_chosen_again_only_when_the_tables_domains_change` | 4,670 allocs an entry applied | 0 (1,833 when a domain changes) |
+| a turn's two link lines and a status line, buffer grown | `process::tests::a_turns_lines_are_written_into_the_kept_buffer_as_each_was_said` | 4 allocs, 2 reallocs (the link lines' `String`s) and a flush's oneshot a line | 0, one flush a turn, byte-identical |
+| a 60,000-byte chunk put from bytes its copies share | `crates/chunk/tests/volume_memory.rs` `a_chunk_put_from_shared_bytes_copies_none_of_them` | 4 allocs, 60,780 B | 3, 780 B |
+| an 8 MiB GET's own work | `crates/gateway/tests/object_path.rs` `a_get_copies_each_byte_it_reads_once` | 146 allocs, 25,177,456 B | 16, 8,396,144 B |
+
+**`mantle bench doors`, count-allocs release builds** (before b39a1173, after a6d1ad29), CPUs 0-7 in
+a 16G scope, the baseline batch on 8-15. Run A: `--sizes 1,64K,8M,64M --objects 0 --ops 368
+--clients 2 --load open:100` (n 368, 32 at 8 MiB and 4 at 64 MiB by the 256 MB step); run B: `--sizes
+8M --ops 368 --bytes 3G --load open:20 --volume 40G`. Background subtracted as above, the idle rate
+measured on the same cell, servers summed, 60 s after 30 s of settling (`counts` twice): 2,802
+allocations and 638 KB a second before, 1,042 and 55 KB after. Native door, per operation:
+
+| op | size | allocs before → after | bytes before → after | faults before → after |
+|---|---|---:|---:|---:|
+| PUT | 1 B | 1,901 → 1,320 | 367,917 → 273,710 | 8.4 → 8.2 |
+| PUT | 64 KiB | 2,022 → 1,689 | 1,108,162 → 829,204 | 39.6 → 9.9 |
+| PUT | 8 MiB (B, n 368) | 52,114 → 51,175 | 101,905,865 → 75,424,334 | 8,079 → 6,063 |
+| PUT | 64 MiB (n 4) | 445,050 → 614,720 (3 SlowDown asks again after, 1 before) | 815,768,932 → 788,729,408 | 100,769 → 65,280 |
+| GET | 1 B | 390 → 273 | 61,462 → 34,915 | 0.0 → 0.1 |
+| GET | 64 KiB | 542 → 371 | 564,953 → 388,626 | 8.4 → 0.4 |
+| GET | 8 MiB (B, n 368) | 17,964 → 15,660 | 63,167,458 → 45,602,489 | 4,645 → 5,582 |
+| GET | 64 MiB (n 4) | 139,961 → 104,395 | 542,754,146 → 433,443,793 | 74,999 → 58,757 |
+| HEAD | 1 B / 8 MiB (B) | 110 → 81 / 135 → 57 | 18,965 → 12,622 / 28,057 → 11,749 | 0 → 0 |
+| DELETE | 1 B / 8 MiB (B) | 453 → 360 / 487 → 325 | 59,154 → 43,622 / 71,772 → 39,570 | 1.1 → 1.6 / 0.1 → 0.1 |
+
+The 8 MiB PUT keeps its per-datagram vendor sites (the transport's receive copy and QUIC's
+header, about 10,500 each), so its allocations move little; its bytes fall 26.5 MB, the three
+chunk copies. GET 8 MiB falls 17.6 MB, the two copies `Get::finish` no longer makes; its faults did
+not fall in either run (6,463 → 7,214 in A, 4,645 → 5,582 in B), which this step does not explain.
+
+**Latency** (µs, from intended start; open loop past capacity, so writes queue in the generator):
+native GET 1 B p50/p99 754/3,108 → 1,606/4,588 in A, but 2,228/21,496 → 819/3,801 and 999/6,029 →
+1,032/8,651 in two runs with the order reversed (C, D: after first): the harness's own CPU a
+GET (73,873 → 131,007 ns in A; 169,186 → 80,717 in C) moved with it, so the box, not the change,
+set these. Native PUT 1 B p50 8.46 s → 9.66 s (A), 10.2 s → 8.86 s (C): the generator's queue.
+GET 8 MiB (B, n 368) p50/p99 73/478 ms → 115/411 ms; PUT 8 MiB 25.2/54.8 s → 28.5/53.7 s (queued).
+No latency change is claimed either way from these runs.
+
+**The bench's exit.** Every run of the build before ended exit 1 on its controls, "a control's
+object was not put", in A, B, C and D alike; every run of the build after reported the six
+controls as failures (6cb5eb21: a native client held past its keep-alive is opened again). Runs A
+and B after still exit 1, and B before had too, on SlowDown asked three times under the open
+loop's overload (native MPU-PART 8 MiB in both B runs; 157 asks again before, 161 after), which
+step 2's acceptance does not cover.

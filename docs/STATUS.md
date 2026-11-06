@@ -25,25 +25,24 @@ back through both:
   through both doors, every block's chunks on distinct nodes, every acknowledged object read back
   after each founder is killed and started again, and a full cell's typed refusal. On this Mac and
   the box (adacachy) the 22 host/case slots ([scale](measurements/2026-10-28-transfer-scale.md))
-  hold 18 with complete readback (the 1k, 10k and 100k sets on both, every 10 GiB way on both, one
+  hold 20 with complete readback (the 1k, 10k and 100k sets on both, every 10 GiB way on both, one
   whole 100 GiB object in native parts on this Mac on 2026-11-02, and on main `7d628026` on
-  2026-11-05 the streamed 100 GiB ways: natively in runs on both, by the AWS CLI from its standard
-  input on the box) and 4 capacity-only: the box's 100 GiB parts ways, whose reruns were exact
-  through placement and chunk accounting when the box stopped answering in their kills, and this
-  Mac's 100 GiB CLI and boto-parts ways, which its free space no longer holds above its reserve.
+  2026-11-05 every 100 GiB way on the box and natively in runs on this Mac) and 2 capacity-only:
+  this Mac's 100 GiB CLI and boto-parts ways, which its free space no longer holds above its
+  reserve.
 - *KIND*: the image and the chart, proven in CI's kind cluster (`kind-cell`), and localkind's
   pipeline and Argo CD app deploying a cell of three into this Mac's Docker Desktop kind cluster,
   where the scale step's tests passed, each founder's pod killed in turn by Chaos Mesh, again on the
   readiness lock (main `72511e15`, run 4) ([KIND](measurements/2026-11-04-kind-cell.md); below, "A
   cell on Kubernetes").
 
-Open: the box's 100 GiB parts reruns wait on the box. A founder its peers dial was out of reach for
-3 min 7 s after its pod was replaced in the kind cluster, its peers' QUIC flows to its Service's
-cluster IP still translated to the killed pod ([research/78](research/78-a-cell-in-kubernetes.md));
-founders are now reached at their pods' own names under the headless Service, each looked up again
-when a link to it ends, which the KIND cell is yet to be measured on. The disruption's refusals
-"with every founder ready" were the readiness record a killed founder's directory kept: readiness is
-now the lock its living, enlisted process holds (main `72511e15`).
+Open: a founder its peers dial was out of reach for 3 min 7 s after its pod was replaced in the kind
+cluster, its peers' QUIC flows to its Service's cluster IP still translated to the killed pod
+([research/78](research/78-a-cell-in-kubernetes.md)); founders are now reached at their pods' own
+names under the headless Service, each looked up again when a link to it ends, which the KIND cell
+is yet to be measured on. The disruption's refusals "with every founder ready" were the readiness
+record a killed founder's directory kept: readiness is now the lock its living, enlisted process
+holds (main `72511e15`).
 
 `mantle disk probe` reports what the operating system knows about the device that holds a
 directory and, with `--measure`, benchmarks the device. It is built on:

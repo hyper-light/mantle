@@ -10,13 +10,11 @@ distinct nodes, every acknowledged object read back after each founder is killed
 and each large case ending at the typed refusal with the count held beside the volumes' stated
 capacity?
 
-**Checkpoint, 2026-11-05.** The two streamed 100 GiB ways each held one whole object read back
-exactly on the landed product `7d628026`: natively in runs on the box and this Mac, and by the AWS
-CLI from its standard input on the box (below, "The streamed 100 GiB ways with a whole object"). Of
-the 22 host/case slots, 18 now have complete readback and 4 are capacity-only: the box's two 100 GiB
-parts ways, whose reruns placed and accounted their objects exactly before the box stopped answering
-in their kills, and this Mac's 100 GiB CLI and boto-parts ways, which its free space no longer holds
-above the reserve.
+**Checkpoint, 2026-11-05.** Every 100 GiB way held one whole object read back exactly on the landed
+product `7d628026` on the box (native in runs, the AWS CLI from its standard input, native parts,
+boto3's parts), and natively in runs on this Mac (below, "Every 100 GiB way with a whole object on
+the box"). Of the 22 host/case slots, 20 now have complete readback and 2 are capacity-only: this
+Mac's 100 GiB CLI and boto-parts ways, which its free space no longer holds above the reserve.
 
 **Checkpoint, 2026-11-03.** Every one of the 22 host/case slots has its result: 15 with complete
 readback evidence and 7 capacity-only, none unresolved. The Mac's six open slots ran on the
@@ -904,7 +902,7 @@ Each held the chunks of its refused object's blocks written before the refusal (
 chunk yet) and 8,404,992 free bytes a volume; each verified by `verify-large-result.py` (exit 0,
 empty stderr, binary SHA-256 above).
 
-**The streamed 100 GiB ways with a whole object, on the landed product (2026-11-05).** The 100 GiB
+**Every 100 GiB way with a whole object on the box, on the landed product (2026-11-05).** The 100 GiB
 slots that were capacity-only, a founder's volume holding less than one object's copy, ran again on
 main `7d628026`, each a fresh cell on volumes stated at 110 GiB: room for one object at three
 copies, 111,483,813,888 data-region bytes a volume by `Geometry::plan` (above). The box ran its ways
@@ -925,6 +923,8 @@ refused as out of space, unreadable and unlisted, the acknowledged one listed.
 |---|---|---|---|---|---|---|---|---|
 | box | native (whole, in runs) | 12,901 | 113,802,401,776 B | 57 / 301 / 492 | 6 | 0 / 0 / 0 | native `l1`, full | 5,878 |
 | box | cli (standard input) | 19,200 | 113,777,295,360 B | 81 / 286 / 436 | 6 | 0 / 0 / 0 | the listener `l1`, full | 5,927 |
+| box | native-parts | 20,000 | 110,106,913,236 B | 31 / 140 / 279 | 6 | 0 / 0 / 0 | native `l1`, full | 8,776 |
+| box | boto-parts | 20,000 | 110,106,913,236 B | 34 / 147 / 332 | 6 | 0 / 0 / 0 | the listener `l1`, full | 8,491 |
 | this Mac | native (whole, in runs) | 12,901 | 110,414,084,448 B | 38 / 64 / 103 | 6 | 0 / 0 / 0 | native `l1`, full | 11,221 |
 
 A node holds the object's chunks and what the refused `l1` stored before its refusal (nothing
@@ -940,14 +940,13 @@ nodes: "a second request to stop came as the node stopped"), after its placement
 each on distinct nodes) and its chunk accounting were exact; it holds no verdict, and its volumes
 were freed.
 
-The other four hold no verdict. The box's native-parts and boto-parts cases (15:52, side by side)
-each placed its object's 20,000 blocks on distinct nodes and accounted its chunks exactly
-(110,106,913,236 bytes a node, each what it received), and were in their kills when the box stopped
-answering, between 18:13 and 18:23; they wait on it. This Mac's CLI case is described above; run
-again after the KIND rerun (docs/measurements/2026-11-04-kind-cell.md, run 4), its preflight found
-349,279,723,520 bytes free where three volumes and the reserve need 388,694,540,288, and the
-boto-parts case would need the same: this Mac's shared file system no longer holds one 100 GiB
-object at three copies above its reserve, so both stay the capacity-only results above.
+The box's two parts ways ran side by side from 15:52 and ended as the table says; this session lost
+its path to the box between 18:13 and 18:23 (the box itself stayed up) and read them through kiln.
+This Mac's CLI case is described above; run again after the KIND rerun
+(docs/measurements/2026-11-04-kind-cell.md, run 4), its preflight found 349,279,723,520 bytes free
+where three volumes and the reserve need 388,694,540,288, and the boto-parts case would need the
+same: this Mac's shared file system no longer holds one 100 GiB object at three copies above its
+reserve, so both stay the capacity-only results above.
 
 **What an object takes of a range's store.** For the engines' share of a node's memory, sized by
 what the cell's volumes hold (the owner's choice of 2026-10-31, node.md §1.4): the harness's small

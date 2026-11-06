@@ -401,8 +401,9 @@ enum Single {
 }
 
 /// The volume table as this node's member of the root range held it after an entry it applied,
-/// and the scheme new blocks take over it: each derived once per entry the member applies, the
-/// only thing that changes them.
+/// read again once per entry the member applies, the only thing that changes it; and the scheme
+/// new blocks take over it, chosen again only when the table's failure domains changed, the one
+/// thing of the table the choice reads (the gateway's rates and target are the process's own).
 pub(crate) struct Table {
     applied: u64,
     /// In the order of their ids (`root::volumes`).
@@ -437,6 +438,30 @@ fn scheme(gateway: &GatewaySettings, table: &[Placed]) -> Option<durability::Sch
         Ok(Some(Choice::Meets { scheme, .. } | Choice::Short { scheme, .. })) => Some(scheme),
         _ => None,
     }
+}
+
+/// The scheme new blocks take over `placed`, the volume table read again: the one chosen over the
+/// table read before (`was`), carried while every volume keeps its place and its domain, or chosen
+/// again. The durability model's choice so runs once per change of the domains, not once per entry
+/// the root range applies (research/80: 2,448.5 allocations each time it ran).
+fn scheme_over(
+    was: Option<&Table>,
+    placed: &[Placed],
+    gateway: Option<&GatewaySettings>,
+) -> Option<durability::Scheme> {
+    match was.filter(|t| same_domains(&t.placed, placed)) {
+        Some(table) => table.scheme,
+        None => gateway.and_then(|g| scheme(g, placed)),
+    }
+}
+
+/// Whether two readings of the volume table hold the same volumes in the same failure domains.
+fn same_domains(was: &[Placed], now: &[Placed]) -> bool {
+    was.len() == now.len()
+        && was
+            .iter()
+            .zip(now)
+            .all(|(a, b)| a.volume == b.volume && a.domain == b.domain)
 }
 
 /// The data keys of the files a get opens, unwrapped under the root key's generation each names.
@@ -762,7 +787,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let most = usize::try_from(census.volumes).unwrap_or(usize::MAX);
             let placed =
                 root::volumes(engine, None, most).map_err(|e| NodeError::Bounds(e.to_string()))?;
-            let scheme = self.gateway.as_ref().and_then(|g| scheme(g, &placed));
+            let scheme = scheme_over(self.table.as_ref(), &placed, self.gateway.as_ref());
             self.table = Some(Table {
                 applied,
                 placed,
@@ -1837,7 +1862,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     return Ok(None);
                 };
                 let remaining = self.remaining_of(at);
-                self.put_chunk(node, *volume, *key, bytes.to_vec(), (*crc, remaining))
+                // The replicas' one copy of the bytes, shared (a count, not a copy): each
+                // replica's put writes or sends from it.
+                self.put_chunk(node, *volume, *key, bytes.clone(), (*crc, remaining))
                     .map(Pending::Chunk)
             }
             put::Request::Block(command) => self
@@ -3424,6 +3451,64 @@ fn get_answer(outcome: Outcome) -> get::Answer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The volume table read again after an entry that left its volumes and their domains as
+    /// they were takes the scheme chosen before, asking nothing of the allocator; one whose
+    /// domains changed is chosen again (research/80, step 5: the choice ran at each entry the
+    /// root range applied, 2,448.5 allocations each time).
+    #[test]
+    fn the_scheme_is_chosen_again_only_when_the_tables_domains_change() {
+        let gateway = GatewaySettings {
+            keys: Vec::new(),
+            handover_ns: 1,
+            window: 1,
+            objects: 1,
+            clients: 1,
+            bucket_quota: 1,
+            scan_rows: 1,
+            // The rates and target `mantle init`'s cells state (crates/mantle/tests/support).
+            rates: Rates {
+                chunk: 0.000_001_552_511_415_525_114_2,
+                domains: None,
+                bursts: Vec::new(),
+                repair: 0.041_666_666_666_666_664,
+            },
+            target: 1e-11,
+        };
+        let placed = |domains: [&str; 3]| -> Vec<Placed> {
+            domains
+                .iter()
+                .zip(1u128..)
+                .map(|(domain, volume)| Placed {
+                    volume,
+                    node: u64::try_from(volume).unwrap(),
+                    domain: (*domain).to_owned(),
+                    bytes: 1 << 30,
+                })
+                .collect()
+        };
+        let first = placed(["a", "b", "c"]);
+        let chosen = scheme(&gateway, &first);
+        assert!(chosen.is_some());
+        let table = Table {
+            applied: 1,
+            placed: first,
+            scheme: chosen,
+        };
+        let same = placed(["a", "b", "c"]);
+        hyper_measure::alloc::begin();
+        let carried = scheme_over(Some(&table), &same, Some(&gateway));
+        let counts = hyper_measure::alloc::end();
+        assert_eq!(carried, chosen);
+        assert_eq!((counts.allocations, counts.reallocations), (0, 0));
+        // One domain fewer: chosen again, over two domains.
+        let fewer = placed(["a", "b", "b"]);
+        hyper_measure::alloc::begin();
+        let again = scheme_over(Some(&table), &fewer, Some(&gateway));
+        let counts = hyper_measure::alloc::end();
+        assert_eq!(again, scheme(&gateway, &fewer));
+        assert_eq!((counts.allocations, counts.reallocations), (1_833, 3));
+    }
 
     /// A get blocked before reading its version must still be refused at its own deadline;
     /// once its reply began, expiry must only stop its notes, preserving the one reply. Neither

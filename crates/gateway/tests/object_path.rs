@@ -36,6 +36,11 @@ use mantle_s3::checksum::{self, Algorithm};
 use mantle_s3::seal::{self, DataKey, Segments, WrappingKey};
 use proptest::prelude::*;
 
+use hyper_measure::alloc;
+
+#[global_allocator]
+static ALLOCATOR: alloc::Counting = alloc::Counting;
+
 const BUCKET: &str = "b";
 /// How long a block or file is held for the write above it, in the cell's clock.
 const HANDOVER: u64 = 1_000;
@@ -2471,5 +2476,56 @@ fn a_run_takes_only_the_md5s_its_object_needs_and_only_at_its_offset() {
             offset: planned,
             ended: false
         }))
+    );
+}
+
+/// A GET's own allocations and bytes, the cell's answers and the test's keeping of the plaintext
+/// set aside, counted exactly: each block of the range is gathered from its chunk reads into one
+/// buffer, its segments opened where they lie and its plaintext handed out as a slice of it, one
+/// copy of each byte read (research/80, step 5). It copied each byte three times: gathered, each
+/// 64 KiB segment copied out to be opened, its plaintext copied again into the block's output
+/// (146 allocations and 25,177,456 bytes for this GET; 16 and 8,396,144 now, the sealed bytes
+/// gathered once and the GET's own bookkeeping).
+#[test]
+fn a_get_copies_each_byte_it_reads_once() {
+    const SIZE: usize = 8 << 20;
+    let bytes = body(SIZE, 5);
+    let (mut cell, wrapping) = stored(Scheme::Copies(3), &bytes, 9, 3);
+    let root = Root(WrappingKey::new(wrapping.bytes()));
+    let mut out = Vec::with_capacity(SIZE);
+    let mut pending = VecDeque::with_capacity(64);
+    alloc::begin();
+    let mut get = Get::new(Some(9), SIZE as u64, 0..SIZE as u64, Box::new(root), 2).unwrap();
+    loop {
+        while let Some(piece) = get.take() {
+            alloc::aside();
+            out.extend_from_slice(&piece);
+            drop(piece);
+            alloc::back();
+        }
+        if let Some(outcome) = get.outcome() {
+            outcome.clone().unwrap();
+            break;
+        }
+        while let Some(request) = get.poll() {
+            alloc::aside();
+            pending.push_back(request);
+            alloc::back();
+        }
+        alloc::aside();
+        let (id, request) = pending.pop_front().expect("a GET waits on nothing");
+        let answer = cell.serve_get(request);
+        alloc::back();
+        get.answer(id, answer).unwrap();
+    }
+    alloc::aside();
+    drop(get);
+    alloc::back();
+    let counts = alloc::end().less(&alloc::read_aside());
+    assert!(out == bytes, "the plaintext read is the object's");
+    assert_eq!(
+        (counts.allocations, counts.reallocations, counts.bytes),
+        (16, 0, 8_396_144),
+        "{counts:?}"
     );
 }

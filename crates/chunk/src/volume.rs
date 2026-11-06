@@ -7,6 +7,7 @@ use std::sync::{Arc, RwLock};
 use std::task::Waker;
 use std::thread::JoinHandle;
 
+use bytes::Bytes;
 use hyper_block::DiskError;
 use hyper_block::block::BlockFile;
 use hyper_block::buf::{AlignedBuf, Pool};
@@ -421,7 +422,7 @@ impl<F: BlockFile + Sync + 'static> Volume<F> {
         expected: Option<u32>,
     ) -> Result<(Op, Ticket<'_>), ChunkError> {
         let ticket = self.admit_payload(data.len())?;
-        let op = self.write_payload(key, offset, data.to_vec(), seal, expected)?;
+        let op = self.write_payload(key, offset, Bytes::copy_from_slice(data), seal, expected)?;
         Ok((op, ticket))
     }
 
@@ -442,7 +443,7 @@ impl<F: BlockFile + Sync + 'static> Volume<F> {
         &self,
         key: ChunkKey,
         offset: u64,
-        data: Vec<u8>,
+        data: Bytes,
         seal: bool,
         expected: Option<u32>,
     ) -> Result<Op, ChunkError> {
@@ -486,14 +487,14 @@ impl<F: BlockFile + Sync + 'static> Volume<F> {
 
     /// Writes a whole chunk as [`Volume::put_checked`] does, from bytes the caller hands over
     /// rather than lends, and answers as [`Volume::put_waking`] does: a storage node writes a
-    /// chunk it was sent from the buffer the chunk arrived in, checked against the CRC-32C its
-    /// sender computed, without a copy and without its thread waiting for the flush (node.md
-    /// §5.2). Refused before anything is checksummed when no record can hold it or the queue
-    /// has no room.
+    /// chunk it was sent from the buffer the chunk arrived in, and a gateway's own replica from
+    /// the bytes it shares with the others, checked against the CRC-32C its sender computed,
+    /// without a copy and without its thread waiting for the flush (node.md §5.2). Refused before
+    /// anything is checksummed when no record can hold it or the queue has no room.
     pub fn put_checked_waking(
         &self,
         key: ChunkKey,
-        data: Vec<u8>,
+        data: Bytes,
         crc32c: u32,
         waker: Waker,
     ) -> Result<Answer, ChunkError> {

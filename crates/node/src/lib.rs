@@ -27,6 +27,12 @@
     )
 )]
 
+// The unit tests' allocations counted on their own threads, where a path states what it allocates
+// (process.rs: a turn's lines; node/host.rs: the volume table's scheme).
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: hyper_measure::alloc::Counting = hyper_measure::alloc::Counting;
+
 pub mod ask;
 pub mod chunk;
 pub mod client;

@@ -879,10 +879,12 @@ impl Get {
         let plain = self.plain.as_mut().ok_or(GetError::Mismatch)?;
         let segment = u64::try_from(seal::SEGMENT).map_err(|_| GetError::Overflow)?;
         let last = plain.count.checked_sub(1).ok_or(GetError::Overflow)?;
-        let mut out = Vec::new();
-        out.try_reserve_exact(want_len)
-            .map_err(|_| GetError::Overflow)?;
-        let mut rest = sealed.as_slice();
+        // Each segment opened where it lies in `sealed`, its plaintext laid after the range's
+        // part of the one before, over the tags (`Segments::open_within`): the range's plaintext
+        // ends up as one run of the buffer the block was gathered into, handed out as a slice of
+        // it, where each segment was copied out to be opened and its plaintext copied again.
+        let mut sealed = sealed;
+        let (mut at, mut end) = (0usize, 0usize);
         for s in reading.segments.clone() {
             let len = if s == last {
                 plain
@@ -892,29 +894,39 @@ impl Get {
             } else {
                 SEALED
             };
-            let (this, after) = rest
-                .split_at_checked(usize::try_from(len).map_err(|_| GetError::Overflow)?)
-                .ok_or(GetError::Inconsistent("a block shorter than its segments"))?;
-            rest = after;
-            let mut bytes = this.to_vec();
-            plain
+            let len = usize::try_from(len).map_err(|_| GetError::Overflow)?;
+            let to = at.checked_add(len).ok_or(GetError::Overflow)?;
+            if to > sealed.len() {
+                return Err(GetError::Inconsistent("a block shorter than its segments"));
+            }
+            let within = sealed.get_mut(end..to).ok_or(GetError::Overflow)?;
+            let from = at.checked_sub(end).ok_or(GetError::Overflow)?;
+            let opened = plain
                 .segments
-                .open(s, s == last, &mut bytes)
+                .open_within(s, s == last, within, from)
                 .map_err(|_| GetError::Corrupt(block))?;
-            // The segment's plaintext, cut to the range.
+            at = to;
+            // The segment's plaintext, cut to the range: a part that begins past the segment's
+            // start (the range's first, mid-segment) is turned to the front of what it opened.
             let first = s.checked_mul(segment).ok_or(GetError::Overflow)?;
             let take_from = plain.from.saturating_sub(first);
             let take_to = plain.to.checked_sub(first).ok_or(GetError::Overflow)?;
-            let bytes_len = u64::try_from(bytes.len()).map_err(|_| GetError::Overflow)?;
-            let (lo, hi) = (take_from.min(bytes_len), take_to.min(bytes_len));
+            let opened_len = u64::try_from(opened).map_err(|_| GetError::Overflow)?;
+            let (lo, hi) = (take_from.min(opened_len), take_to.min(opened_len));
             let lo = usize::try_from(lo).map_err(|_| GetError::Overflow)?;
             let hi = usize::try_from(hi).map_err(|_| GetError::Overflow)?;
-            out.extend_from_slice(bytes.get(lo..hi).ok_or(GetError::Overflow)?);
+            let cut = hi.checked_sub(lo).ok_or(GetError::Overflow)?;
+            if lo > 0 {
+                let part_end = end.checked_add(hi).ok_or(GetError::Overflow)?;
+                let part = sealed.get_mut(end..part_end).ok_or(GetError::Overflow)?;
+                to_front(part, lo).ok_or(GetError::Overflow)?;
+            }
+            end = end.checked_add(cut).ok_or(GetError::Overflow)?;
         }
-        self.read.insert(
-            reading.segments.start,
-            (reading.segments.end, Bytes::from(out)),
-        );
+        sealed.truncate(end);
+        let out = Bytes::from(sealed);
+        self.read
+            .insert(reading.segments.start, (reading.segments.end, out));
         // Blocks read out of order wait for the ones before them.
         while let Some((end, bytes)) = self.read.remove(&plain.emit) {
             plain.emit = end;
@@ -924,4 +936,15 @@ impl Get {
         }
         Ok(())
     }
+}
+
+/// Moves `bytes[from..]` to the front of `bytes`, a byte at a time from the first, each read before
+/// the write that could overlap it: at most a 64 KiB segment's bytes.
+fn to_front(bytes: &mut [u8], from: usize) -> Option<()> {
+    let len = bytes.len().checked_sub(from)?;
+    for at in 0..len {
+        let byte = *bytes.get(from.checked_add(at)?)?;
+        *bytes.get_mut(at)? = byte;
+    }
+    Some(())
 }

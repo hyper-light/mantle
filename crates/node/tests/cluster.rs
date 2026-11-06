@@ -676,7 +676,7 @@ async fn run<E: Engine + 'static>(
                         bytes,
                         crc32c,
                         // The test's own asks serve no request: none waits on them.
-                    } => node.put_chunk(at, volume, key, bytes, (crc32c, 0)),
+                    } => node.put_chunk(at, volume, key, bytes.into(), (crc32c, 0)),
                     Chunked::Get {
                         at,
                         volume,

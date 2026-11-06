@@ -17,7 +17,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{data, issuer, key, put_retrying};
+use common::{SIZE, config, data, issuer, key, put_retrying, sim};
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_measure::alloc;
@@ -93,4 +93,36 @@ fn a_volume_at_work_holds_at_most_its_stated_bytes() {
         peak as f64 / most as f64
     );
     assert!(peak <= most, "the volume reached {peak} bytes, past {most}");
+}
+
+/// A chunk handed over as the bytes a gateway shares with the chunk's other replicas is put from
+/// them: the putting thread asks the allocator for the chunk's checksum table and its request, and
+/// for none of its bytes, which the writer reads into its aligned buffer (research/80, step 5).
+/// The gateway's host copied a chunk for each replica it asked, the local one included: 25.2 MB
+/// per 8 MiB PUT.
+#[test]
+fn a_chunk_put_from_shared_bytes_copies_none_of_them() {
+    let v = Volume::format(issuer(), sim(47), SIZE, config()).unwrap();
+    let shared = bytes::Bytes::from(data(1, 60_000));
+    let crc = mantle_crc::crc32c(&shared);
+    // The other replicas' shares of the same bytes.
+    let others = [shared.clone(), shared.clone()];
+    alloc::begin();
+    let answer = v
+        .put_checked_waking(
+            key(1),
+            shared.clone(),
+            crc,
+            std::task::Waker::noop().clone(),
+        )
+        .unwrap();
+    let counts = alloc::end();
+    answer.wait().unwrap();
+    assert_eq!(v.read(&key(1), 0, 60_000).unwrap(), shared.as_ref());
+    drop(others);
+    assert_eq!(
+        (counts.allocations, counts.reallocations, counts.bytes),
+        (3, 0, 780),
+        "{counts:?}"
+    );
 }

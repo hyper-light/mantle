@@ -30,6 +30,7 @@ use std::pin::pin;
 use std::task::{Poll, Waker};
 use std::time::Duration;
 
+use bytes::Bytes;
 use hyper_block::block::BlockFile;
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
@@ -524,9 +525,25 @@ struct ChunkOut {
 /// written.
 struct Writing {
     exchange: ExchangeId,
-    bytes: Vec<u8>,
+    bytes: Body,
     written: usize,
     then: Then,
+}
+
+/// A body an exchange writes: bytes the node made for it, or a chunk's bytes the gateway shares
+/// with the chunk's other replicas, each replica's exchange writing from the same bytes.
+enum Body {
+    Made(Vec<u8>),
+    Shared(Bytes),
+}
+
+impl Body {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Made(bytes) => bytes,
+            Self::Shared(bytes) => bytes,
+        }
+    }
 }
 
 /// What a body written whole waits for.
@@ -659,6 +676,84 @@ struct Commanded {
 /// The piece a body is read in: the transport's own receive chunk.
 const PIECE: u64 = hyper_transport::RECEIVE_CHUNK as u64;
 
+/// The parts of a node a plane message or a Raft frame steps, borrowed apart from the plane and its
+/// socket, so a message is taken where its datagram was opened (`Node::drain_plane`).
+struct Taking<'a, E: Engine + 'static, L: NodeLog> {
+    id: u64,
+    owner: &'a mut Owner<Answers<L::Store>, RangeMachine<E>, Unbounded>,
+    ranges: &'a [Kept],
+    liveness: &'a mut Liveness,
+    asked: &'a mut Asked,
+    moved: &'a mut bool,
+    received: &'a mut Received,
+}
+
+impl<E: Engine + 'static, L: NodeLog> Taking<'_, E, L> {
+    /// A plane message: a heartbeat to the stream, a Raft frame to its range, each bound to the
+    /// peer whose keys sealed it.
+    fn message(&mut self, sender: PeerId, arrival: u64, message: &[u8]) {
+        match message.split_first() {
+            Some((&PLANE_RAFT, rest)) => self.frame(sender, rest),
+            Some((first, _)) if *first == hyper_liveness::KIND => {
+                // A heartbeat the stream refuses (stale, malformed) is dropped, as the network
+                // may drop it.
+                let _ = self
+                    .liveness
+                    .on_heartbeat(sender, message, arrival, &mut *self.asked);
+                *self.moved = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// Steps a Raft frame from `sender` into its range, if this node hosts it and `sender` is the
+    /// message's `from`: a message is bound to the peer the transport authenticated.
+    fn frame(&mut self, sender: PeerId, bytes: &[u8]) {
+        let stepped = self.checked(sender, bytes);
+        let counter = if stepped {
+            &mut self.received.stepped
+        } else {
+            &mut self.received.dropped
+        };
+        *counter = counter.saturating_add(1);
+    }
+
+    /// Steps the frame if it may act: whether it was stepped.
+    fn checked(&mut self, sender: PeerId, bytes: &[u8]) -> bool {
+        let Ok((group, message)) = frame::decode(bytes) else {
+            return false;
+        };
+        if message.from != sender || message.to != self.id {
+            return false;
+        }
+        let Some(handle) = self
+            .ranges
+            .iter()
+            .find(|k| k.group == group)
+            .map(|k| k.handle)
+        else {
+            return false;
+        };
+        // Only a member of the range's configuration may act on it (node.md §3.6); a member whose
+        // configuration is still empty, one joining, learns it from its leader.
+        let member = self.owner.get(handle).is_some_and(|r| {
+            let c = r.configuration();
+            let lists = [&c.voters, &c.learners, &c.voters_outgoing, &c.learners_next];
+            lists.iter().all(|ids| ids.is_empty()) || lists.iter().any(|ids| ids.contains(&sender))
+        });
+        if !member {
+            return false;
+        }
+        let Some(shell) = self.owner.get_mut(handle) else {
+            return false;
+        };
+        // A replica waiting for room refuses a message, as the network may drop it.
+        let stepped = shell.step(message).is_ok();
+        self.owner.schedule(handle);
+        stepped
+    }
+}
+
 /// One shard's ranges and the transport they replicate over, on the node's log.
 pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     id: u64,
@@ -683,9 +778,28 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     reading: Vec<Reading>,
     /// The id the next read's context carries.
     next_read: u64,
-    /// Plane messages taken this turn: sender, the kernel's arrival stamp, the bytes.
-    inbox: Vec<(PeerId, u64, Vec<u8>)>,
+    /// The plane's messages the turn's wait took (`Node::wait`): sender, the kernel's arrival stamp
+    /// and where in `inbox_bytes` the message lies. They are taken after the wait ends, in the order
+    /// they came, before the drain's, which are taken where they are opened (`Node::drain_plane`):
+    /// the wait's are copied out of the socket's buffer only because the wait must end, and the
+    /// stream hear of its end and of its own write, before any message is fed (`Node::turn`). Both
+    /// keep their storage across turns, emptied each turn, so a turn regrows neither: no pool, the
+    /// same two buffers of the one loop. Bound: one receive batch of the plane's socket, its ring's
+    /// slots of `hyper_rt::udp::RECEIVE_BYTES` (`PlaneSocket::receive` delivers one batch a wait).
+    inbox: Vec<(PeerId, u64, usize, usize)>,
+    inbox_bytes: Vec<u8>,
+    /// The transport's events a turn takes, then handles. Its storage is kept across turns,
+    /// emptied as they are handled, so a turn regrows nothing: no pool, the one loop's buffer.
+    /// Bound: the endpoint's seats, each event holding one until polled (`Endpoint::poll_event`:
+    /// an exchange's slot, a peer's entry, a lane's window), and the one event the wait took.
     events: Vec<Event<NodeClasses>>,
+    /// The replicas a turn drove, with what each drive said, and the Raft messages they gave, each
+    /// with its range's group (`Node::drive`). Their storage is kept across turns, emptied as each
+    /// is taken, so a turn regrows neither: no pool, the one loop's buffers. Bound: the replicas
+    /// queued at the turn's start, each driven once a turn (hyper-durable's `Owner::turn`), at most
+    /// the ranges the node hosts; and the messages of one `Ready` each of those.
+    driven: Vec<(Handle, Driven)>,
+    sending: Vec<(u128, Message)>,
     out: hyper_durable::Output<Applied>,
     frame: Vec<u8>,
     applied: Vec<(u128, Applied)>,
@@ -1019,7 +1133,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             reading: Vec::new(),
             next_read: 0,
             inbox: Vec::new(),
+            inbox_bytes: Vec::new(),
             events: Vec::new(),
+            driven: Vec::new(),
+            sending: Vec::new(),
             out: hyper_durable::Output::default(),
             frame: Vec::new(),
             applied: Vec::new(),
@@ -1418,8 +1535,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.wait().await?;
         self.liveness_written()?;
         let now = hyper_rt::futures::now_ns();
+        self.take_inbox();
         let emptied = self.drain_plane()?;
-        self.take_inbox()?;
         if emptied {
             self.liveness.poll(now, &mut self.asked);
         }
@@ -1428,9 +1545,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             self.events.push(event);
         }
         self.keep_clients();
-        for event in std::mem::take(&mut self.events) {
+        // Taken out and given back with its storage: nothing a turn handles pushes to `events`.
+        let mut events = std::mem::take(&mut self.events);
+        for event in events.drain(..) {
             self.on_event(event, now)?;
         }
+        self.events = events;
         self.take_stored().await?;
         self.vouch_held(now);
         self.dial(now);
@@ -1558,6 +1678,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             plane,
             plane_socket,
             inbox,
+            inbox_bytes,
             ..
         } = self;
         let mut woken = false;
@@ -1573,7 +1694,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if let Ok(opened) = opened {
                 let sender = opened.sender;
                 for message in opened.messages() {
-                    inbox.push((sender, arrival.at_ns, message.to_vec()));
+                    let from = inbox_bytes.len();
+                    inbox_bytes.extend_from_slice(message);
+                    inbox.push((sender, arrival.at_ns, from, inbox_bytes.len()));
                 }
             }
         }));
@@ -1654,25 +1777,41 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(())
     }
 
-    /// Every datagram already on the plane's socket, opened into the inbox; whether a drain found
-    /// the socket empty. A drain takes at most hyper-rt-transport's `TURNS` batches, so a second
-    /// tells a socket emptied from one that still held datagrams; past that the stream waits for
-    /// the next turn's drain.
+    /// Every datagram already on the plane's socket, each message taken where its datagram was
+    /// opened, in the socket's receive buffer; whether a drain found the socket empty. A drain
+    /// takes at most hyper-rt-transport's `TURNS` batches, so a second tells a socket emptied from
+    /// one that still held datagrams; past that the stream waits for the next turn's drain.
     fn drain_plane(&mut self) -> Result<bool, NodeError> {
-        let inbox = &mut self.inbox;
+        let Self {
+            id,
+            owner,
+            ranges,
+            liveness,
+            asked,
+            liveness_moved,
+            plane,
+            plane_socket,
+            received,
+            ..
+        } = self;
+        let mut taking = Taking::<E, L> {
+            id: *id,
+            owner,
+            ranges,
+            liveness,
+            asked,
+            moved: liveness_moved,
+            received,
+        };
         for _ in 0..2 {
-            let taken = self.plane_socket.receive_ready(
-                &mut self.plane,
-                &AdmitAll,
-                |arrival, opened| {
-                    if let Ok(opened) = opened {
-                        let sender = opened.sender;
-                        for message in opened.messages() {
-                            inbox.push((sender, arrival.at_ns, message.to_vec()));
-                        }
+            let taken = plane_socket.receive_ready(plane, &AdmitAll, |arrival, opened| {
+                if let Ok(opened) = opened {
+                    let sender = opened.sender;
+                    for message in opened.messages() {
+                        taking.message(sender, arrival.at_ns, message);
                     }
-                },
-            )?;
+                }
+            })?;
             if taken == 0 {
                 return Ok(true);
             }
@@ -1680,67 +1819,49 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(false)
     }
 
-    /// The plane's messages: heartbeats to the stream, Raft frames to their ranges, each bound
-    /// to the peer whose keys sealed it.
-    fn take_inbox(&mut self) -> Result<(), NodeError> {
-        for (sender, arrival, message) in std::mem::take(&mut self.inbox) {
-            match message.split_first() {
-                Some((&PLANE_RAFT, rest)) => self.step_frame(sender, rest)?,
-                Some((first, _)) if *first == hyper_liveness::KIND => {
-                    // A heartbeat the stream refuses (stale, malformed) is dropped, as the
-                    // network may drop it.
-                    let _ = self
-                        .liveness
-                        .on_heartbeat(sender, &message, arrival, &mut self.asked);
-                    self.liveness_moved = true;
-                }
-                _ => {}
+    /// The plane's messages the wait took, in the order they came.
+    fn take_inbox(&mut self) {
+        let Self {
+            id,
+            owner,
+            ranges,
+            liveness,
+            asked,
+            liveness_moved,
+            received,
+            inbox,
+            inbox_bytes,
+            ..
+        } = self;
+        let mut taking = Taking::<E, L> {
+            id: *id,
+            owner,
+            ranges,
+            liveness,
+            asked,
+            moved: liveness_moved,
+            received,
+        };
+        for (sender, arrival, from, to) in inbox.drain(..) {
+            if let Some(message) = inbox_bytes.get(from..to) {
+                taking.message(sender, arrival, message);
             }
         }
-        Ok(())
+        inbox_bytes.clear();
     }
 
-    /// Steps a Raft frame from `sender` into its range, if this node hosts it and `sender` is the
-    /// message's `from`: a message is bound to the peer the transport authenticated.
-    fn step_frame(&mut self, sender: PeerId, bytes: &[u8]) -> Result<(), NodeError> {
-        let stepped = self.step_checked(sender, bytes);
-        let counter = if stepped {
-            &mut self.received.stepped
-        } else {
-            &mut self.received.dropped
-        };
-        *counter = counter.saturating_add(1);
-        Ok(())
-    }
-
-    /// Steps the frame if it may act: whether it was stepped.
-    fn step_checked(&mut self, sender: PeerId, bytes: &[u8]) -> bool {
-        let Ok((group, message)) = frame::decode(bytes) else {
-            return false;
-        };
-        if message.from != sender || message.to != self.id {
-            return false;
+    /// Steps a Raft frame from `sender` into its range, as [`Taking::frame`] does.
+    fn step_frame(&mut self, sender: PeerId, bytes: &[u8]) {
+        Taking::<E, L> {
+            id: self.id,
+            owner: &mut self.owner,
+            ranges: &self.ranges,
+            liveness: &mut self.liveness,
+            asked: &mut self.asked,
+            moved: &mut self.liveness_moved,
+            received: &mut self.received,
         }
-        let Some(handle) = self.kept(group).map(|k| k.handle) else {
-            return false;
-        };
-        // Only a member of the range's configuration may act on it (node.md §3.6); a member whose
-        // configuration is still empty, one joining, learns it from its leader.
-        let member = self.owner.get(handle).is_some_and(|r| {
-            let c = r.configuration();
-            let lists = [&c.voters, &c.learners, &c.voters_outgoing, &c.learners_next];
-            lists.iter().all(|ids| ids.is_empty()) || lists.iter().any(|ids| ids.contains(&sender))
-        });
-        if !member {
-            return false;
-        }
-        let Some(shell) = self.owner.get_mut(handle) else {
-            return false;
-        };
-        // A replica waiting for room refuses a message, as the network may drop it.
-        let stepped = shell.step(message).is_ok();
-        self.owner.schedule(handle);
-        stepped
+        .frame(sender, bytes);
     }
 
     /// Carries out what the stream asked: heartbeats onto the plane, a liveness write on the log,
@@ -1819,7 +1940,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             } => {
                 // Stepped from the transport's own buffer, then given back.
                 if kind == Kind::Raft {
-                    self.step_frame(peer, frame.bytes())?;
+                    self.step_frame(peer, frame.bytes());
                 }
                 self.driver.endpoint().release(frame);
                 Ok(())
@@ -2110,18 +2231,20 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// A turn of the owner: each queued replica driven once, its messages sent, its flush shown
     /// to the stream, its next wake kept.
     fn drive(&mut self, now: u64) -> Result<(), NodeError> {
-        let mut driven: Vec<(Handle, Driven)> = Vec::new();
+        // Taken out and given back with their storage (the fields' bounds): nothing the turn
+        // calls below pushes to either.
+        let mut driven = std::mem::take(&mut self.driven);
+        let mut messages = std::mem::take(&mut self.sending);
         let answered_from = self.applied.len();
         let mut served: Vec<(u128, Vec<u8>)> = Vec::new();
         let mut fenced: Option<hyper_durable::ReplicaError> = None;
-        let mut messages: Vec<(u128, Message)> = Vec::new();
-        let groups: Vec<(Handle, u128)> = self.ranges.iter().map(|k| (k.handle, k.group)).collect();
+        let ranges = &self.ranges;
         let applied = &mut self.applied;
         self.owner.turn(now, &mut self.out, |handle, outcome, out| {
-            let group = groups
+            let group = ranges
                 .iter()
-                .find(|(h, _)| *h == handle)
-                .map_or(0, |(_, g)| *g);
+                .find(|k| k.handle == handle)
+                .map_or(0, |k| k.group);
             for message in out.messages.drain(..) {
                 messages.push((group, message));
             }
@@ -2138,7 +2261,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 }
             }
         });
-        for (handle, Driven { wake, flushed, .. }) in driven {
+        for (handle, Driven { wake, flushed, .. }) in driven.drain(..) {
             if let Some((started, durable)) = flushed {
                 self.liveness
                     .on_durable(hyper_liveness::Write::Log, started, durable);
@@ -2159,9 +2282,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .pairs(handle, &mut self.liveness, false)
                 .map_err(NodeError::Liveness)?;
         }
-        for (group, message) in messages {
+        self.driven = driven;
+        for (group, message) in messages.drain(..) {
             self.send(group, message, now)?;
         }
+        self.sending = messages;
         // A fenced range stops the node for now: reopening it from its log or its peers, with the
         // others serving on, is the node's to build (node.md §6.2).
         if let Some(e) = fenced {
@@ -2306,7 +2431,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.sends.snapshots = self.sends.snapshots.saturating_add(1);
                 self.writing.push(Writing {
                     exchange,
-                    bytes: frame,
+                    bytes: Body::Made(frame),
                     written: 0,
                     then: Then::Snapshot { group, to },
                 });
@@ -2333,7 +2458,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let mut then = None;
         let mut sent = false;
         if let Some(writing) = self.writing.get_mut(at) {
-            while let Some(rest) = writing.bytes.get(writing.written..)
+            while let Some(rest) = writing.bytes.as_slice().get(writing.written..)
                 && !rest.is_empty()
             {
                 match endpoint.write_body(exchange, rest) {
@@ -2351,7 +2476,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     }
                 }
             }
-            whole = writing.written >= writing.bytes.len();
+            whole = writing.written >= writing.bytes.as_slice().len();
             then = Some(writing.then);
         }
         // A piece of a chunk a job asked of a peer going is the job's work moving, as a piece of
@@ -2497,7 +2622,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     Err(refusal) => exchange_ended(refusal)?,
                 }
                 self.snapshots_taken = self.snapshots_taken.saturating_add(1);
-                self.step_frame(received.peer, &received.bytes)
+                self.step_frame(received.peer, &received.bytes);
+                Ok(())
             }
             Arriving::Command(group) => {
                 self.propose_command(exchange, received.peer, group, &received.bytes)
@@ -2513,10 +2639,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 until_ns,
             } => {
                 let room = received.body;
+                // The buffer was sized to the body and read whole, so it becomes `Bytes` without a
+                // copy or an allocation (its length is its capacity).
                 let put = self.storage.put(
                     slot,
                     key,
-                    received.bytes,
+                    Bytes::from(received.bytes),
                     crc32c,
                     &self.waker,
                     (Origin::Exchange(exchange), room, until_ns),
@@ -2673,7 +2801,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         self.writing.push(Writing {
             exchange,
-            bytes: body,
+            bytes: Body::Made(body),
             written: 0,
             then: Then::Reply,
         });
@@ -2889,7 +3017,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         self.writing.push(Writing {
             exchange,
-            bytes,
+            bytes: Body::Made(bytes),
             written: 0,
             then: Then::Reply,
         });
@@ -3041,7 +3169,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         at: PeerId,
         volume: u128,
         key: ChunkKey,
-        bytes: Vec<u8>,
+        bytes: Bytes,
         (crc32c, remaining_ns): (u32, u64),
     ) -> Result<ChunkAsk, NodeError> {
         if at != self.id && self.chunks_out.len() >= self.chunk_asks {
@@ -3108,7 +3236,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 });
                 self.writing.push(Writing {
                     exchange,
-                    bytes,
+                    bytes: Body::Shared(bytes),
                     written: 0,
                     then: Then::Asked,
                 });
@@ -3400,7 +3528,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 };
                 self.writing.push(Writing {
                     exchange,
-                    bytes: body,
+                    bytes: Body::Made(body),
                     written: 0,
                     then: Then::Commanded,
                 });
@@ -3777,7 +3905,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 };
                 self.writing.push(Writing {
                     exchange,
-                    bytes: body,
+                    bytes: Body::Made(body),
                     written: 0,
                     then: Then::Commanded,
                 });

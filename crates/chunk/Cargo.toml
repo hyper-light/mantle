@@ -10,6 +10,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# A chunk's bytes, shared with the replicas a gateway sends them to, not copied (record::Payload).
+bytes.workspace = true
 getrandom.workspace = true
 # Block I/O and the device issuer, vendored from hyper-raft (vendor/hyper-block/SNAPSHOT).
 hyper-block = { path = "../../vendor/hyper-block" }

@@ -173,6 +173,36 @@ impl Segments {
         data.truncate(plain);
         Ok(())
     }
+
+    /// Opens segment `index`, whose sealed bytes are `data[from..]`, and leaves its plaintext at
+    /// the front of `data`, as [`Self::open`] opens one: a block's segments are opened one after
+    /// another in the one buffer they were read into, each plaintext laid after the last, over
+    /// the tags. The plaintext's length.
+    pub fn open_within(
+        &self,
+        index: u64,
+        last: bool,
+        data: &mut [u8],
+        from: usize,
+    ) -> Result<usize, SealError> {
+        let sealed = data.len().checked_sub(from).ok_or(SealError::Open)?;
+        let plain = sealed.checked_sub(TAG).ok_or(SealError::Open)?;
+        if plain > SEGMENT {
+            return Err(SealError::Size);
+        }
+        let nonce = nonce(index, last)?;
+        guarded(|| {
+            self.key
+                .open_within(
+                    Nonce::assume_unique_for_key(nonce),
+                    Aad::from(self.file),
+                    data,
+                    from..,
+                )
+                .map(|opened| opened.len())
+        })
+        .map_err(|_| SealError::Open)
+    }
 }
 
 /// A segment's nonce: 32 bits of zero, SP 800-38D §8.2.1's fixed field, which one key per file

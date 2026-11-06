@@ -99,6 +99,7 @@
 //! it.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::future::Future;
 use std::io::Write;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -1919,6 +1920,15 @@ async fn serve(
     // Whether standard input may say more: a node that does not end with it runs on once it closes,
     // as `mantle serve` does under a service manager, whose input is empty.
     let mut input_open = true;
+    // The lines a turn says of the node (its links, ranges, log, movement and stop), written as
+    // they are made into this one buffer and said together at the turn's end: one write and one
+    // flush a turn that says anything, where each line was a `String` and a flush of its own. Its
+    // storage is kept across the loop's turns, emptied each time it is said, so a turn regrows
+    // nothing: no pool, the loop's one buffer. Bound: one turn's lines, a line for each link and
+    // each range at most, and one each for the replaced, the movement, the held state, the log
+    // and the handovers, every line a few numbers long.
+    let mut lines = String::new();
+    let wrote = |e: std::fmt::Error| ProcessError::Runtime(e.to_string());
     loop {
         if looking.is_none()
             && let Some((peer, at, wait)) = names.next(hyper_rt::futures::now_ns())
@@ -2060,12 +2070,13 @@ async fn serve(
             living.take(&mut node, e.root, own, started_ns)?;
         }
         for (group, replaced) in node.take_replaced() {
-            let line = format!(
-                "replaced {group:x} {} {}\n",
+            writeln!(
+                lines,
+                "replaced {group:x} {} {}",
                 replaced.failed(),
                 replaced.joining()
-            );
-            say(&mut output, &line).await?;
+            )
+            .map_err(wrote)?;
         }
         for (at, now) in node.links().enumerate() {
             if links.get(at) == Some(&now) {
@@ -2079,19 +2090,7 @@ async fn serve(
             if link_ended && names.names(now.peer) {
                 names.ended(now.peer, hyper_rt::futures::now_ns());
             }
-            let refusal = now
-                .refusal
-                .map_or_else(|| "none".into(), |r| format!("{r:?}"));
-            let line = format!(
-                "link {} {} {} {} {} {} {refusal}\n",
-                now.peer,
-                if now.keyed { "keyed" } else { "unkeyed" },
-                now.dials,
-                now.ended,
-                now.suspected,
-                if now.suspect { "suspect" } else { "trusted" }
-            );
-            say(&mut output, &line).await?;
+            link_line(&mut lines, &now).map_err(wrote)?;
             match links.get_mut(at) {
                 Some(was) => *was = now,
                 None => links.push(now),
@@ -2104,7 +2103,7 @@ async fn serve(
             Some((said, at)) => moved != said && now.saturating_sub(at) >= serve_ns / 2,
         };
         if due {
-            say(&mut output, &format!("moved {moved} {serve_ns}\n")).await?;
+            writeln!(lines, "moved {moved} {serve_ns}").map_err(wrote)?;
             said_moved = Some((moved, now));
         }
         // Whether the node waits on its own device, said as it changes, so a watcher knows it holds
@@ -2114,7 +2113,7 @@ async fn serve(
         // node while a peer of a cell of three was stopped, on this Mac).
         let held = node.held();
         if said_held != Some(held) {
-            say(&mut output, &format!("held {}\n", u8::from(held))).await?;
+            writeln!(lines, "held {}", u8::from(held)).map_err(wrote)?;
             said_held = Some(held);
         }
         let mut said = false;
@@ -2136,36 +2135,39 @@ async fn serve(
             if !moved {
                 continue;
             }
-            let patience = now.patience.map_or(0, |p| p.as_nanos());
-            let reconnect = now.reconnect.map_or(0, |r| r.as_nanos());
-            let measuring = now.measuring_for.map_or(0, |m| m.as_nanos());
-            let asking = now.asking.map_or(0, |a| a.as_nanos());
-            let line = format!(
-                "status {group:x} {} {} {} {} {patience} {reconnect} {measuring} {asking}\n",
-                now.term, now.leader, now.commit, now.applied
-            );
-            say(&mut output, &line).await?;
+            status_line(&mut lines, *group, &now).map_err(wrote)?;
             *was = Some(now);
             said = true;
         }
         // The log the ranges share, once after the statuses that moved.
         if said {
-            let log = node.log_stats(stats.take())?;
+            // What the turn wrote is said before a failure ends the process, as each line was.
+            let log = match node.log_stats(stats.take()) {
+                Ok(log) => log,
+                Err(e) => {
+                    say(&mut output, &lines).await?;
+                    return Err(e.into());
+                }
+            };
             let flushing = log.flushing_since.map_or(0, |since| {
                 log.at.saturating_duration_since(since).as_nanos()
             });
             let longest = log.commit_wait.quantile(1_000_000).unwrap_or(0);
-            say(&mut output, &format!("log {flushing} {longest}\n")).await?;
+            writeln!(lines, "log {flushing} {longest}").map_err(wrote)?;
             stats = Some(log);
         }
         // The orderly stop: each range whose lead it begins to hand over, and to whom (again, after
         // its core gave a transfer up); each it handed over, to the member that then led it; and
         // its end, after which the node's log and volumes close as it is dropped.
         for (group, to) in node.take_handing() {
-            say(&mut output, &format!("handing {group:x} {to}\n")).await?;
+            writeln!(lines, "handing {group:x} {to}").map_err(wrote)?;
         }
         for (group, leader) in node.take_handed() {
-            say(&mut output, &format!("handed {group:x} {leader}\n")).await?;
+            writeln!(lines, "handed {group:x} {leader}").map_err(wrote)?;
+        }
+        if !lines.is_empty() {
+            say(&mut output, &lines).await?;
+            lines.clear();
         }
         if node.stopped() {
             // Said with the sleeps of the node's loop that found every timer taken, none where
@@ -2329,6 +2331,37 @@ async fn stop_asked<E: Engine + 'static>(
     say(output, "stopping\n").await
 }
 
+/// A peer's `link` line, written onto `lines`.
+fn link_line(lines: &mut String, now: &Link) -> std::fmt::Result {
+    write!(
+        lines,
+        "link {} {} {} {} {} {} ",
+        now.peer,
+        if now.keyed { "keyed" } else { "unkeyed" },
+        now.dials,
+        now.ended,
+        now.suspected,
+        if now.suspect { "suspect" } else { "trusted" }
+    )?;
+    match now.refusal {
+        Some(refusal) => writeln!(lines, "{refusal:?}"),
+        None => writeln!(lines, "none"),
+    }
+}
+
+/// Range `group`'s `status` line, written onto `lines`.
+fn status_line(lines: &mut String, group: u128, now: &Status) -> std::fmt::Result {
+    let patience = now.patience.map_or(0, |p| p.as_nanos());
+    let reconnect = now.reconnect.map_or(0, |r| r.as_nanos());
+    let measuring = now.measuring_for.map_or(0, |m| m.as_nanos());
+    let asking = now.asking.map_or(0, |a| a.as_nanos());
+    writeln!(
+        lines,
+        "status {group:x} {} {} {} {} {patience} {reconnect} {measuring} {asking}",
+        now.term, now.leader, now.commit, now.applied
+    )
+}
+
 async fn say(output: &mut hyper_rt::stdio::Stdout, line: &str) -> Result<(), ProcessError> {
     output
         .write_all(line.as_bytes())
@@ -2343,6 +2376,75 @@ async fn say(output: &mut hyper_rt::stdio::Stdout, line: &str) -> Result<(), Pro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A turn's link and status lines, written into the buffer the serve loop keeps: byte for byte
+    /// the lines each said from a `String` of its own, and once the buffer has grown nothing is
+    /// asked of the allocator, where each line was a `String` and a flush's oneshot (research/80,
+    /// step 5).
+    #[test]
+    fn a_turns_lines_are_written_into_the_kept_buffer_as_each_was_said() {
+        let link = Link {
+            peer: 3,
+            keyed: true,
+            dials: 4,
+            ended: 1,
+            suspected: 2,
+            suspect: false,
+            refusal: Some(hyper_transport::Refusal::Closed),
+        };
+        let quiet = Link {
+            keyed: false,
+            suspect: true,
+            refusal: None,
+            ..link
+        };
+        let status = Status {
+            term: 7,
+            leader: 2,
+            commit: 40,
+            applied: 39,
+            heartbeats: 0,
+            judged: true,
+            measuring: 0,
+            measuring_for: Some(Duration::from_millis(250)),
+            patience: Some(Duration::from_millis(1_500)),
+            snapshots_sent: 0,
+            snapshots_taken: 0,
+            stalled: false,
+            in_flight: 0,
+            writes: hyper_durable::Writes::default(),
+            fenced: false,
+            sends: crate::node::Sends::default(),
+            received: crate::node::Received::default(),
+            reconnect: None,
+            asking: Some(Duration::from_nanos(9)),
+            reads_held: 0,
+            reads_confirming: 0,
+            reading: 0,
+            commanded: 0,
+        };
+        let turn = |lines: &mut String| {
+            lines.clear();
+            link_line(lines, &link).unwrap();
+            link_line(lines, &quiet).unwrap();
+            status_line(lines, 0x2a, &status).unwrap();
+        };
+        let mut lines = String::new();
+        turn(&mut lines);
+        assert_eq!(
+            lines,
+            "link 3 keyed 4 1 2 trusted Closed\n\
+             link 3 unkeyed 4 1 2 suspect none\n\
+             status 2a 7 2 40 39 1500000000 0 250000000 9\n"
+        );
+        hyper_measure::alloc::begin();
+        turn(&mut lines);
+        let counts = hyper_measure::alloc::end();
+        assert_eq!(
+            (counts.allocations, counts.reallocations, counts.bytes),
+            (0, 0, 0)
+        );
+    }
 
     #[test]
     fn a_line_is_a_key_and_its_value_and_a_key_is_stated_once() {

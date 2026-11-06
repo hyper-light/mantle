@@ -723,6 +723,7 @@ dependencies = [
 name = "mantle-chunk"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "getrandom 0.4.3",
  "hyper-block",
  "hyper-measure",
@@ -810,6 +811,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",
+ "hyper-measure",
  "mantle-chunk",
  "mantle-crc",
  "mantle-ec",

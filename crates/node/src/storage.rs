@@ -13,6 +13,7 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::task::{Context, Poll, Waker};
 
+use bytes::Bytes;
 use hyper_block::DiskError;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::issuer::Issuer;
@@ -312,7 +313,7 @@ impl Storage {
         &mut self,
         slot: usize,
         key: ChunkKey,
-        bytes: Vec<u8>,
+        bytes: Bytes,
         crc32c: u32,
         waker: &Waker,
         (origin, room, until_ns): (Origin, u64, u64),

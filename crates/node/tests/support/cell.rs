@@ -868,6 +868,21 @@ impl Sim {
         }
     }
 
+    /// Runs the cell for `ns` on its virtual clock, a step at a time, taking what it reports.
+    pub fn run_for(&mut self, ns: u64) {
+        let end = self.rt.now_ns().saturating_add(ns);
+        while self.rt.now_ns() < end {
+            self.take();
+            let next = self
+                .rt
+                .now_ns()
+                .saturating_add(self.step_ns.max(1))
+                .min(end);
+            self.rt.run_until(next);
+        }
+        self.take();
+    }
+
     /// The leader every running node names, in one term.
     pub fn leader(&mut self) -> u64 {
         self.until("the nodes agree on a leader", |c| {

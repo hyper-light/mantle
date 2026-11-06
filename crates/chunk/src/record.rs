@@ -7,6 +7,7 @@
 //! (Bairavasundaram et al., FAST 2008, §2.2); per-block checksums let a read verify only
 //! the blocks it returns (Ghemawat et al., SOSP 2003, §5.2).
 
+use bytes::Bytes;
 use hyper_block::buf::AlignedBuf;
 
 use crate::key::ChunkKey;
@@ -81,9 +82,12 @@ pub fn record_len(payload_len: u32, shift: u8) -> Option<usize> {
 /// A payload and its checksums, computed by the thread that submits it: the source computes
 /// the checksum, the store verifies it on ingest and on every read (docs/research/03 rule
 /// 10), and the single writer thread is spared the work.
+///
+/// `data` is shared, not copied: a storage node writes a chunk from the bytes the gateway holds
+/// for all its replicas, and the writer thread reads it only to encode it into its aligned buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Payload {
-    pub data: Vec<u8>,
+    pub data: Bytes,
     /// CRC-32C of each checksum block of `data`.
     pub table: Vec<u32>,
     /// CRC-32C of all of `data`.
@@ -92,7 +96,8 @@ pub struct Payload {
 
 impl Payload {
     /// Checksums `data` in blocks of 2^`shift` bytes; `None` for a shift past 30.
-    pub fn new(data: Vec<u8>, shift: u8) -> Option<Self> {
+    pub fn new(data: impl Into<Bytes>, shift: u8) -> Option<Self> {
+        let data = data.into();
         let (table, crc) = checksums(&data, shift)?;
         Some(Self { data, table, crc })
     }

@@ -301,7 +301,7 @@ fn a_chunk_handed_over_is_checked_before_it_is_written_and_answered_once_durable
     let crc = mantle_crc::crc32c(&bytes);
     // Changed on the way: refused before anything reaches the writer.
     assert!(matches!(
-        v.put_checked_waking(key(1), bytes.clone(), crc ^ 1, std::task::Waker::noop().clone()),
+        v.put_checked_waking(key(1), bytes.clone().into(), crc ^ 1, std::task::Waker::noop().clone()),
         Err(ChunkError::Checksum { expected, actual, .. }) if expected == crc ^ 1 && actual == crc
     ));
     assert!(matches!(
@@ -309,7 +309,12 @@ fn a_chunk_handed_over_is_checked_before_it_is_written_and_answered_once_durable
         Err(ChunkError::NotFound(_))
     ));
     let answer = v
-        .put_checked_waking(key(1), bytes.clone(), crc, std::task::Waker::noop().clone())
+        .put_checked_waking(
+            key(1),
+            bytes.clone().into(),
+            crc,
+            std::task::Waker::noop().clone(),
+        )
         .unwrap();
     answer.wait().unwrap();
     assert_eq!(v.read(&key(1), 0, 7000).unwrap(), bytes);

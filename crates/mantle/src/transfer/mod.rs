@@ -313,6 +313,9 @@ pub fn status_of_code(code: &str) -> Status {
 struct Natives {
     dir: PathBuf,
     nodes: Vec<(u64, SocketAddr)>,
+    /// The nodes the cell names by a host name, which a client looks up again when it cannot
+    /// reach one.
+    names: Vec<(u64, String)>,
     bind: SocketAddr,
     rt: LocalRuntime,
 }
@@ -329,6 +332,7 @@ impl Natives {
         Ok(Self {
             dir: client,
             nodes,
+            names: cell.names(),
             bind: cell.bind(),
             rt,
         })
@@ -347,6 +351,7 @@ impl Natives {
             credentials: configured.credentials,
             transport_bytes: mantle_client::least_transport(nodes.len())?,
             nodes,
+            names: self.names.clone(),
         })
     }
 
@@ -473,6 +478,23 @@ fn size(sizes: &Object<'_>, i: u64) -> Result<u64, GenError> {
 
 /// Runs `options`' cases, a row each door to `out`: whether every check of every case was exact.
 pub fn transfer(out: &mut impl Write, options: &Options) -> Result<bool, TransferError> {
+    // A named node's lookup when a client cannot reach it (`mantle_client::Settings::names`): a
+    // cell running elsewhere names its founders, whose pods a disruption makes again at other
+    // addresses. One place, a client asking one lookup at a time; the process's one pool.
+    let pool =
+        |e: hyper_rt::error::RtError| TransferError::Io(std::io::Error::other(format!("{e:?}")));
+    hyper_rt::blocking::start(hyper_rt::blocking::Config {
+        workers: 1,
+        shares: vec![hyper_rt::blocking::Share::new(hyper_rt::dns::SHARE, 1)],
+    })
+    .map_err(pool)?;
+    let ran = cases(out, options);
+    hyper_rt::blocking::stop().map_err(pool)?;
+    ran
+}
+
+/// [`transfer`]'s cases, the blocking pool running.
+fn cases(out: &mut impl Write, options: &Options) -> Result<bool, TransferError> {
     // The harness asks a cell's ranges as its gateway and its objects as its client, in one
     // process: it states the cell's message bounds, which the client's object messages fit.
     let messages = mantle_node::derive::messages()

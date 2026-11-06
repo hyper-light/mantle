@@ -76,6 +76,7 @@ fn settings(dir: &Path, bound: &[(u64, SocketAddr)]) -> Settings {
             )],
         },
         nodes: bound.to_vec(),
+        names: Vec::new(),
         transport_bytes: mantle_client::least_transport(bound.len()).unwrap(),
     }
 }
@@ -532,6 +533,86 @@ async fn through_the_library(mut client: Client, account: String) {
 
 /// S3's operations of a cell of three, through the library and through the command line, as a
 /// client `mantle init client` made, which no node pins.
+/// A client given a node's host name looks the name up again when the address it was given does
+/// not answer, and asks the node at the address the name gives now, as a Kubernetes pod made again
+/// comes back at another address under the same name (research/78). Each node is given at
+/// `127.0.0.2` on its own port, where nothing listens, and named `localhost`, which gives
+/// `127.0.0.1` in the IPv4 family the client dials (RFC 6761 §6.3): the bucket is made, found and
+/// listed, each ask taken.
+#[test]
+fn a_client_looks_a_named_node_up_again_when_its_address_does_not_answer() {
+    let mut cell = Cell::made_alone(three_founders);
+    pins_nodes_alone(&cell);
+    let dir = made_client(&cell, "client");
+    let bound = cell.bound_quic();
+    let stale: Vec<(u64, SocketAddr)> = bound
+        .iter()
+        .map(|(id, at)| (*id, SocketAddr::from(([127, 0, 0, 2], at.port()))))
+        .collect();
+    let mut settings = settings(&dir, &stale);
+    settings.names = bound
+        .iter()
+        .map(|(id, _)| (*id, "localhost".to_owned()))
+        .collect();
+    let sockets = mantle_client::sockets(bound.len()).unwrap();
+    // The lookup is hyper-rt's, on the blocking pool's `dns` share: this test's process's one pool.
+    hyper_rt::blocking::start(hyper_rt::blocking::Config {
+        workers: 1,
+        shares: vec![hyper_rt::blocking::Share::new(hyper_rt::dns::SHARE, 1)],
+    })
+    .unwrap();
+    let library = std::thread::spawn(move || {
+        client_runtime(sockets)
+            .block_on(async move {
+                let mut client = Client::open(settings).await.unwrap();
+                let made = client
+                    .call(
+                        &Op::Create {
+                            bucket: "named".into(),
+                            id: mantle_client::identity().unwrap(),
+                        },
+                        u64::MAX,
+                    )
+                    .await;
+                done("CreateBucket", made);
+                let found = client
+                    .call(
+                        &Op::HeadBucket {
+                            bucket: "named".into(),
+                        },
+                        u64::MAX,
+                    )
+                    .await;
+                done("HeadBucket", found);
+                let listed = client
+                    .call(
+                        &Op::ListBuckets {
+                            prefix: String::new(),
+                            after: None,
+                            max: 100,
+                        },
+                        u64::MAX,
+                    )
+                    .await;
+                let listed = done("ListBuckets", listed);
+                let Some(Listing::Buckets(page)) = listed.listing else {
+                    panic!("ListBuckets: {listed:?}");
+                };
+                assert!(page.buckets.iter().any(|(b, _)| b == "named"));
+            })
+            .unwrap();
+    });
+    cell.until(|_| {
+        if library.is_finished() {
+            Some(())
+        } else {
+            None
+        }
+    });
+    library.join().unwrap();
+    hyper_rt::blocking::stop().unwrap();
+}
+
 #[test]
 fn the_library_and_the_command_line_ask_s3s_operations_of_a_cell_of_three() {
     let mut cell = Cell::made_alone(three_founders);
@@ -748,6 +829,7 @@ fn a_certificate_no_client_of_the_cells_holds_is_refused_at_its_handshake() {
             roots: ours.credentials.roots.clone(),
         },
         nodes: bound.clone(),
+        names: Vec::new(),
         transport_bytes: ours.transport_bytes,
     };
     let refused = [with(foreign), with(nodes)];

@@ -112,6 +112,12 @@ pub struct Settings {
     pub credentials: Credentials,
     /// The nodes it may ask: each one's id and where its QUIC endpoint listens.
     pub nodes: Vec<(PeerId, SocketAddr)>,
+    /// Of those, each known by a host name, with its name: a client that cannot reach one looks its
+    /// name up again and dials the address it finds next, as a Kubernetes pod made again comes back
+    /// at another address under the same name (mantle's research/78). The lookup is hyper-rt's
+    /// (`dns::resolve`, on the blocking pool's `dns::SHARE`, which the consumer starts); without
+    /// that share the client dials the address it was given.
+    pub names: Vec<(PeerId, String)>,
     /// The bytes its transport may hold at once: at least [`least_transport`].
     pub transport_bytes: u64,
 }
@@ -377,6 +383,8 @@ impl Directory for Nodes {
 struct Known {
     id: PeerId,
     quic: SocketAddr,
+    /// Its host name, where it was given one: looked up again when it cannot be reached.
+    name: Option<String>,
     connected: bool,
     /// The epoch of the newest connection to it that came up.
     epoch: Epoch,
@@ -517,6 +525,11 @@ impl Client {
                 .map(|(id, quic)| Known {
                     id,
                     quic,
+                    name: settings
+                        .names
+                        .iter()
+                        .find(|(named, _)| *named == id)
+                        .map(|(_, name)| name.clone()),
                     connected: false,
                     epoch: 0,
                     stalled: 0,
@@ -1650,6 +1663,20 @@ impl Client {
     /// Dials `node` if it has no connection and waits for it, as long as the client gives an
     /// exchange with it: whether it was reached.
     async fn reach(&mut self, node: PeerId, deadline_ns: u64) -> Result<bool, ClientError> {
+        // The address it was given; where that does not answer and its name gives another now, that
+        // one, once.
+        if self.dial(node, deadline_ns).await? {
+            return Ok(true);
+        }
+        if !self.look_up(node).await? {
+            return Ok(false);
+        }
+        self.dial(node, deadline_ns).await
+    }
+
+    /// Dials `node` at the address the client holds for it, until it connects, or until it is
+    /// unreachable, its connection closed, or its period passed with neither.
+    async fn dial(&mut self, node: PeerId, deadline_ns: u64) -> Result<bool, ClientError> {
         let Some(known) = self.nodes.iter().find(|n| n.id == node) else {
             return Ok(false);
         };
@@ -1675,6 +1702,42 @@ impl Client {
                 None => return Ok(false),
             }
         }
+    }
+
+    /// `node` could not be reached: where it has a host name, the name looked up again, and an
+    /// address of its family other than the one dialed taken for its next dial, the connection to
+    /// the old one given up. Whether it took another. A lookup that fails, or a process whose
+    /// blocking pool holds no `dns::SHARE`, leaves the address as it was.
+    async fn look_up(&mut self, node: PeerId) -> Result<bool, ClientError> {
+        let Some((name, quic)) = self
+            .nodes
+            .iter()
+            .find(|n| n.id == node)
+            .and_then(|n| Some((n.name.clone()?, n.quic)))
+        else {
+            return Ok(false);
+        };
+        // Every address the platform's resolver gives, as a node takes its peers' (its start's
+        // `resolve`).
+        let Ok(found) = hyper_rt::dns::resolve(&name, quic.port(), usize::MAX).await else {
+            return Ok(false);
+        };
+        let Some(now) = found
+            .into_iter()
+            .find(|address| address.is_ipv4() == quic.is_ipv4())
+        else {
+            return Ok(false);
+        };
+        if now == quic {
+            return Ok(false);
+        }
+        let clock = self.driver.clock()?;
+        self.driver.endpoint().disconnect(clock, node);
+        if let Some(known) = self.nodes.iter_mut().find(|n| n.id == node) {
+            known.quic = now;
+            known.connected = false;
+        }
+        Ok(true)
     }
 
     /// The probe timeout of the slowest path the client has measured, the current retransmission
@@ -2228,6 +2291,7 @@ mod tests {
                     bind: "127.0.0.1:0".parse().unwrap(),
                     credentials,
                     nodes: vec![(crate::test_support::NODE, address)],
+                    names: Vec::new(),
                     transport_bytes: capacity,
                 })
                 .await
@@ -2296,6 +2360,7 @@ mod tests {
                     bind: "127.0.0.1:0".parse().unwrap(),
                     credentials,
                     nodes: vec![(crate::test_support::NODE, address)],
+                    names: Vec::new(),
                     transport_bytes: capacity,
                 })
                 .await

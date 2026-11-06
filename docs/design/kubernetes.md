@@ -27,15 +27,17 @@ carries a peer's QUIC only until its pod is replaced"). A pod made again comes b
 address under the same name: a node looks each peer's name up as it starts and again whenever its
 link to the peer ends or, while the name does not resolve (a pod not yet made has no record), at the
 peer's backoff, one lookup at a time off its shards (`mantle_node::names`), and dials the address it
-finds (`Node::learn`). Each founder binds every address on its ports and is reached at its pod's
-name, which `mantle init` states as its reach (`reach=HOST`, node.md §1.5): its peers' `peer` lines
-and its clients' `node` lines name that host on its ports. The governing Service publishes not-ready
-addresses, since a founder is ready only once the cell it forms through those very names enlisted it
-(research/78 [11]). The cell's S3 endpoint, `<fullname>-s3`, puts every ready founder's listener
-behind one address. Off loopback the S3 listener speaks TLS with the endpoint's certificate for the
-names `mantle init` states (`name=HOST`, node.md §1.5), so each founder names its pod's name and the
-cell's S3 Service, and a stock client takes the endpoint's authority (`OUT/s3/authority.pem`) as its
-chain.
+finds (`Node::learn`); a client that cannot reach a node it knows by name does the same within the
+attempt (`mantle_client::Settings::names`), the `mantle` command and the transfer harness passing
+the names their `node` lines and cell file state. Each founder binds every address on its ports and
+is reached at its pod's name, which `mantle init` states as its reach (`reach=HOST`, node.md §1.5):
+its peers' `peer` lines and its clients' `node` lines name that host on its ports. The governing
+Service publishes not-ready addresses, since a founder is ready only once the cell it forms through
+those very names enlisted it (research/78 [11]). The cell's S3 endpoint, `<fullname>-s3`, puts every
+ready founder's listener behind one address. Off loopback the S3 listener speaks TLS with the
+endpoint's certificate for the names `mantle init` states (`name=HOST`, node.md §1.5), so each
+founder names its pod's name and the cell's S3 Service, and a stock client takes the endpoint's
+authority (`OUT/s3/authority.pem`) as its chain.
 
 ## 3. Identity and keys
 

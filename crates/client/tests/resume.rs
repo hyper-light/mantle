@@ -71,6 +71,7 @@ fn a_lost_runs_offset_held_past_the_clients_period_is_asked_again_and_the_upload
                 bind: "127.0.0.1:0".parse().unwrap(),
                 credentials: client,
                 nodes: vec![(NODE, address)],
+                names: Vec::new(),
                 transport_bytes,
             })
             .await
@@ -133,6 +134,7 @@ fn a_run_the_node_answers_after_the_clients_period_is_waited_for_once_it_was_cut
                 bind: "127.0.0.1:0".parse().unwrap(),
                 credentials: client,
                 nodes: vec![(NODE, address)],
+                names: Vec::new(),
                 transport_bytes,
             })
             .await
@@ -185,6 +187,7 @@ fn upload_through(script: Script, length: u64) -> (Status, Vec<u64>, Seen) {
                 bind: "127.0.0.1:0".parse().unwrap(),
                 credentials: client,
                 nodes: vec![(NODE, address)],
+                names: Vec::new(),
                 transport_bytes,
             })
             .await

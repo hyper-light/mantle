@@ -147,6 +147,11 @@ pub trait Reach {
     fn s3(&self) -> Vec<(String, String)>;
     /// Where the harness's clients bind: an address of the family its nodes are dialed at.
     fn bind(&self) -> SocketAddr;
+    /// The nodes the cell names by a host name, each with its name: none for a cell on loopback,
+    /// whose nodes are dialed at the addresses they say.
+    fn names(&self) -> Vec<(u64, String)> {
+        Vec::new()
+    }
 }
 
 impl Reach for Cell {

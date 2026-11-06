@@ -47,6 +47,7 @@ fn a_put_its_node_holds_within_its_serve_period_is_answered() {
                 bind: "127.0.0.1:0".parse().unwrap(),
                 credentials: client,
                 nodes: vec![(NODE, address)],
+                names: Vec::new(),
                 transport_bytes,
             })
             .await
@@ -105,6 +106,7 @@ fn a_put_asked_with_no_deadline_is_cut_after_a_stock_patience_unmoved() {
                 bind: "127.0.0.1:0".parse().unwrap(),
                 credentials: client,
                 nodes: vec![(NODE, address)],
+                names: Vec::new(),
                 transport_bytes,
             })
             .await
@@ -172,6 +174,7 @@ fn a_clients_deadline_ends_a_request_while_its_node_keeps_vouching() {
                 bind: "127.0.0.1:0".parse().unwrap(),
                 credentials,
                 nodes: vec![(NODE, address)],
+                names: Vec::new(),
                 transport_bytes,
             })
             .await
@@ -203,6 +206,7 @@ fn an_expired_deadline_is_refused_before_opening_another_exchange() {
                 bind: "127.0.0.1:0".parse().unwrap(),
                 credentials,
                 nodes: vec![(NODE, address)],
+                names: Vec::new(),
                 transport_bytes,
             })
             .await
@@ -244,6 +248,7 @@ fn a_get_deadline_also_bounds_a_sink_that_stops_taking_bytes() {
                 bind: "127.0.0.1:0".parse().unwrap(),
                 credentials,
                 nodes: vec![(NODE, address)],
+                names: Vec::new(),
                 transport_bytes,
             })
             .await

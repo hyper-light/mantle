@@ -186,6 +186,9 @@ pub(crate) struct Configured {
     pub(crate) id: u64,
     pub(crate) credentials: Credentials,
     pub(crate) nodes: Vec<(u64, std::net::SocketAddr)>,
+    /// Each node a `node` line names by a host name, with its name, which the client looks up
+    /// again when it cannot reach it (`mantle_client::Settings::names`).
+    pub(crate) names: Vec<(u64, String)>,
 }
 
 /// A node's address as a `node` line states it, `HOST:PORT`: an address as it is, a name resolved
@@ -211,6 +214,7 @@ pub(crate) fn configured(dir: &Path) -> Result<Configured, Error> {
     let text = std::fs::read_to_string(&path).map_err(|e| bad(e.to_string()))?;
     let (mut id, mut authority, mut certificate, mut key) = (None, None, None, None);
     let mut nodes = Vec::new();
+    let mut names = Vec::new();
     for line in text
         .lines()
         .map(|l| l.split('#').next().unwrap_or("").trim())
@@ -230,11 +234,16 @@ pub(crate) fn configured(dir: &Path) -> Result<Configured, Error> {
                 let (node, quic) = value
                     .split_once(char::is_whitespace)
                     .ok_or_else(|| bad(format!("node = ID ADDRESS: {value}")))?;
-                nodes.push((
-                    node.parse()
-                        .map_err(|_| bad(format!("a node's id: {node}")))?,
-                    dialed(quic.trim()).map_err(bad)?,
-                ));
+                let node: u64 = node
+                    .parse()
+                    .map_err(|_| bad(format!("a node's id: {node}")))?;
+                let quic = quic.trim();
+                nodes.push((node, dialed(quic).map_err(bad)?));
+                if let Some(at) = mantle_node::process::Endpoint::parse(quic)
+                    && at.host.parse::<std::net::IpAddr>().is_err()
+                {
+                    names.push((node, at.host));
+                }
             }
             other => return Err(bad(format!("a key no client states: {other}"))),
         }
@@ -260,6 +269,7 @@ pub(crate) fn configured(dir: &Path) -> Result<Configured, Error> {
             roots: vec![CertificateDer::from(read(&authority)?)],
         },
         nodes,
+        names,
     })
 }
 
@@ -300,9 +310,15 @@ pub(crate) fn runtime_of(
 pub fn run(dir: &Path, command: Command, mut out: impl Write + 'static) -> Result<(), Error> {
     let configured = configured(dir)?;
     let mut rt = runtime(&configured.dir, configured.nodes.len(), 1)?;
+    // A file's reads and writes, and a named node's lookup when it cannot be reached
+    // (`mantle_client::Settings::names`): one place each, and a worker each, so neither waits on
+    // the other.
     blocking::start(blocking::Config {
-        workers: 1,
-        shares: vec![blocking::Share::new(FILES, 1)],
+        workers: 2,
+        shares: vec![
+            blocking::Share::new(FILES, 1),
+            blocking::Share::new(hyper_rt::dns::SHARE, 1),
+        ],
     })?;
     let ran = rt
         .block_on(async move {
@@ -311,6 +327,7 @@ pub fn run(dir: &Path, command: Command, mut out: impl Write + 'static) -> Resul
                 id,
                 credentials,
                 nodes,
+                names,
             } = configured;
             let transport_bytes = mantle_client::least_transport(nodes.len())?;
             let mut client = Client::open(Settings {
@@ -318,6 +335,7 @@ pub fn run(dir: &Path, command: Command, mut out: impl Write + 'static) -> Resul
                 bind: unspecified(&nodes),
                 credentials,
                 nodes,
+                names,
                 transport_bytes,
             })
             .await?;

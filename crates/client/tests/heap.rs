@@ -49,6 +49,7 @@ fn peak_of(windows: u64) -> (u64, u64) {
                 bind: "127.0.0.1:0".parse().unwrap(),
                 credentials: client,
                 nodes: vec![(NODE, address)],
+                names: Vec::new(),
                 transport_bytes,
             })
             .await
@@ -115,6 +116,7 @@ fn a_source_shorter_than_its_stated_length_cuts_the_put_short() {
                 bind: "127.0.0.1:0".parse().unwrap(),
                 credentials: client,
                 nodes: vec![(NODE, address)],
+                names: Vec::new(),
                 transport_bytes,
             })
             .await

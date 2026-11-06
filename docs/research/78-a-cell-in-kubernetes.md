@@ -153,10 +153,12 @@ reaches the pod with no translation, and a pod made again is found at its new ad
 name once its record has it and the resolvers' caches let it through (a failed lookup remembered
 "for at least a few seconds", CoreDNS caching "for 30 seconds" [1]). A node so looks a peer's name
 up as it starts, and again whenever its link to the peer ends or, while the name does not resolve,
-at the peer's backoff, a pod not yet made having no record [7]. QUIC and the plane are UDP, the S3
-listener TCP; each founder binds `0.0.0.0` and is reached at its pod's name, which `mantle init`
-states as the founder's reach (`reach=HOST:PORT`), the address its peers' `peer` lines and its
-clients' `node` lines name where it differs from the one it binds [8].
+at the peer's backoff, a pod not yet made having no record [7]; and a client that cannot reach a
+node it knows by name looks the name up again and dials the address it finds, within the same
+attempt (`mantle_client::Settings::names`), so a client that outlives a pod's replacement finds it.
+QUIC and the plane are UDP, the S3 listener TCP; each founder binds `0.0.0.0` and is reached at its
+pod's name, which `mantle init` states as the founder's reach (`reach=HOST:PORT`), the address its
+peers' `peer` lines and its clients' `node` lines name where it differs from the one it binds [8].
 
 **Founders start together.** A cell needs a majority to elect, and `OrderedReady` waits for each
 pod to be Ready before the next [1], which a founder alone never is: the StatefulSet's pods start
@@ -226,11 +228,6 @@ founders are therefore reached at their pods' own names (above).
 and the pod is killed at its grace [4]: the grace is stated above `stop_ms`.
 
 ## Open
-
-A client resolves a node's name when it is made: `mantle`'s object commands at each command, the
-transfer harness's whenever it makes its clients, and after its disruption. A `mantle-client` that
-lives across a pod's replacement keeps the old address, its asks to that node not taken, and asks
-the other nodes until it is made again.
 
 kind's local-path storage does not hold a claim to its stated size (the provisioner's own
 README), so a founder's volume bytes are stated in the chart's values rather than read from its

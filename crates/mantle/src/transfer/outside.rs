@@ -129,4 +129,12 @@ impl Reach for Outside {
     fn bind(&self) -> SocketAddr {
         self.bind
     }
+
+    fn names(&self) -> Vec<(u64, String)> {
+        self.names
+            .iter()
+            .filter(|(_, at)| at.host.parse::<std::net::IpAddr>().is_err())
+            .map(|(id, at)| (*id, at.host.clone()))
+            .collect()
+    }
 }

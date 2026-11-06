@@ -133,25 +133,31 @@ fn a_row_and_an_answer_are_each_one_buffer() {
     assert_eq!((made, bytes.capacity()), ((1, 0), bytes.len()));
 }
 
+/// A key's maker, named for the failure it reports.
+type Maker<'a> = Box<dyn Fn() -> Vec<u8> + 'a>;
+
 /// Each row's key is one buffer at its length, a key's zeros escaped within it; a key read
 /// back is one buffer for the object key it names, its bucket passed over.
 #[test]
 fn a_key_is_one_buffer_made_at_its_length() {
     let (bucket, object) = ("bucket", "a/b\u{0}c/\u{0}\u{0}d");
     let part = NameRow::Part(b"up\0load".to_vec(), 3);
-    let keys: Vec<(&str, Box<dyn Fn() -> Vec<u8>>)> = vec![
-        ("name null", Box::new(|| key::name(bucket, object, &NameRow::Null))),
+    let keys: Vec<(&str, Maker<'_>)> = vec![
+        (
+            "name null",
+            Box::new(|| key::name(bucket, object, &NameRow::Null)),
+        ),
         (
             "name version",
             Box::new(|| key::name(bucket, object, &NameRow::Version(9))),
         ),
-        (
-            "name part",
-            Box::new(|| key::name(bucket, object, &part)),
-        ),
+        ("name part", Box::new(|| key::name(bucket, object, &part))),
         ("object", Box::new(|| key::object(bucket, object))),
         ("objects", Box::new(|| key::objects(bucket))),
-        ("position", Box::new(|| key::position(bucket, object.as_bytes()))),
+        (
+            "position",
+            Box::new(|| key::position(bucket, object.as_bytes())),
+        ),
         ("mark", Box::new(|| key::mark(bucket, object, 5))),
         ("gate", Box::new(|| key::gate(bucket))),
         ("route", Box::new(|| key::route(bucket, object))),
@@ -169,7 +175,10 @@ fn a_key_is_one_buffer_made_at_its_length() {
         assert_eq!(bytes.capacity(), bytes.len(), "{what}");
     }
     for (what, make) in [
-        ("bucket span", Box::new(|| key::bucket_span(bucket)) as Box<dyn Fn() -> _>),
+        (
+            "bucket span",
+            Box::new(|| key::bucket_span(bucket)) as Box<dyn Fn() -> _>,
+        ),
         ("marks span", Box::new(|| key::marks_span(bucket))),
         ("bucket routes", Box::new(|| key::bucket_routes(bucket))),
     ] {

@@ -2593,7 +2593,11 @@ mod tests {
             .collect();
         lines.push(hex(Entry {
             at_ns,
-            commands: commands(at_ns).into_iter().enumerate().map(sessioned).collect(),
+            commands: commands(at_ns)
+                .into_iter()
+                .enumerate()
+                .map(sessioned)
+                .collect(),
         }
         .encode()
         .unwrap()));

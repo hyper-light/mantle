@@ -65,7 +65,7 @@ fn a_signature_is_checked_in_three_buffers() {
         query: "",
         headers: &headers,
     };
-    let secret = |key: &str| (key == KEY).then_some(SECRET);
+    let secret = |key: &str| if key == KEY { Some(SECRET) } else { None };
     let (verified, made) = counted(|| sigv4::verify(&request, "us-east-1", now(), secret));
     assert_eq!(verified.unwrap().access_key, KEY);
     assert_eq!(made, (3, 0));
@@ -76,8 +76,8 @@ fn a_signature_is_checked_in_three_buffers() {
 /// checked, with no allocation at all.
 #[test]
 fn an_aws_chunked_body_is_decoded_in_place_with_no_allocation() {
-    let seed = sigv4::unhex("4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9")
-        .unwrap();
+    let seed =
+        sigv4::unhex("4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9").unwrap();
     let chain = sigv4::client_chain(SECRET, WHEN, "20130524", "us-east-1", seed).unwrap();
     let mut body = Vec::new();
     for (len, signature) in [
@@ -116,8 +116,8 @@ fn an_aws_chunked_body_is_decoded_in_place_with_no_allocation() {
     // A chunk whose bytes changed fails its signature where it ends.
     let mut changed = body.clone();
     changed[200] = b'b';
-    let seed = sigv4::unhex("4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9")
-        .unwrap();
+    let seed =
+        sigv4::unhex("4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9").unwrap();
     let chain = sigv4::client_chain(SECRET, WHEN, "20130524", "us-east-1", seed).unwrap();
     let mut decoder = Decoder::signed(chain, None, 66560);
     let mut at = 0;
@@ -141,7 +141,7 @@ fn a_listings_document_allocates_nothing_a_key() {
                 (
                     format!("key-{i:04}"),
                     Entry {
-                        modified: 1_727_179_200 + i as i64,
+                        modified: 1_727_179_200 + i64::try_from(i).unwrap(),
                         etag: "6805f2cfc46c0f04559748bb039d69ae".into(),
                         size: i as u64,
                         owner: "owner".into(),

@@ -66,28 +66,82 @@ pub fn parse_http_date(text: &str) -> Option<i64> {
     unix(year, month, number(day)?, h, m, s)
 }
 
+/// A time as text, held where it was written: the longest form here, an IMF-fixdate of a
+/// four-digit year, is 29 bytes, so a time needs no buffer of its own.
+#[derive(Clone, Copy)]
+pub struct Stamp {
+    bytes: [u8; STAMP_BYTES],
+    len: usize,
+}
+
+/// Room for the longest time written here: `Sun, 06 Nov 1994 08:49:37 GMT`, 29 bytes.
+const STAMP_BYTES: usize = 32;
+
+impl Stamp {
+    /// What `write` writes, or `None` if it would not fit.
+    fn of(write: impl FnOnce(&mut &mut [u8]) -> std::io::Result<()>) -> Option<Self> {
+        let mut bytes = [0u8; STAMP_BYTES];
+        let mut room = bytes.as_mut_slice();
+        write(&mut room).ok()?;
+        let len = STAMP_BYTES.checked_sub(room.len())?;
+        Some(Self { bytes, len })
+    }
+
+    pub fn as_str(&self) -> &str {
+        // Only ASCII digits, letters and punctuation are written.
+        self.bytes
+            .get(..self.len)
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .unwrap_or_default()
+    }
+}
+
+impl std::fmt::Debug for Stamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Unix seconds as an HTTP-date's preferred form, IMF-fixdate (RFC 9110 §5.6.7):
 /// `Sun, 06 Nov 1994 08:49:37 GMT`.
 pub fn http_date(seconds: i64) -> Option<String> {
+    http_stamp(seconds).map(|s| s.as_str().to_owned())
+}
+
+/// [`http_date`]'s text, held where it was written.
+pub fn http_stamp(seconds: i64) -> Option<Stamp> {
+    use std::io::Write as _;
     let days = seconds.checked_div_euclid(SECONDS_PER_DAY)?;
     let (year, month, day) = civil(days)?;
     let (h, m, s) = clock(seconds.checked_rem_euclid(SECONDS_PER_DAY)?)?;
     let weekday = DAYS.get(usize::try_from(days.checked_add(4)?.checked_rem_euclid(7)?).ok()?)?;
     let month = MONTHS.get(usize::try_from(month.checked_sub(1)?).ok()?)?;
-    Some(format!(
-        "{weekday}, {day:02} {month} {year:04} {h:02}:{m:02}:{s:02} GMT"
-    ))
+    Stamp::of(|out| {
+        write!(
+            out,
+            "{weekday}, {day:02} {month} {year:04} {h:02}:{m:02}:{s:02} GMT"
+        )
+    })
 }
 
 /// Unix milliseconds as S3 writes a time in XML: `2009-10-12T17:50:30.000Z`.
 pub fn iso8601(millis: i64) -> Option<String> {
+    iso_stamp(millis).map(|s| s.as_str().to_owned())
+}
+
+/// [`iso8601`]'s text, held where it was written.
+pub fn iso_stamp(millis: i64) -> Option<Stamp> {
+    use std::io::Write as _;
     let seconds = millis.checked_div_euclid(1000)?;
     let fraction = millis.checked_rem_euclid(1000)?;
     let (year, month, day) = civil(seconds.checked_div_euclid(SECONDS_PER_DAY)?)?;
     let (h, m, s) = clock(seconds.checked_rem_euclid(SECONDS_PER_DAY)?)?;
-    Some(format!(
-        "{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}.{fraction:03}Z"
-    ))
+    Stamp::of(|out| {
+        write!(
+            out,
+            "{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}.{fraction:03}Z"
+        )
+    })
 }
 
 /// An XML Schema `dateTime` with its time zone, as a lifecycle rule's `Date` carries one:

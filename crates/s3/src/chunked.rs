@@ -6,8 +6,12 @@
 //! the request's seed signature, and a trailing checksum is signed too; with unsigned chunks
 //! the trailing checksum is the only protection of the body, and the caller must verify it.
 //!
-//! The decoder is fed the body as it arrives and holds at most one line of framing, whose
-//! longest legal form bounds it (`MAX_LINE`).
+//! The decoder is fed the body as it arrives and decodes it in place: [`Decoder::step`] gives
+//! each run of payload as a span of its input, so a caller hands the octets on where they lie,
+//! and the decoder holds at most one line of framing, whose longest legal form bounds it
+//! (`MAX_LINE`), in an array of its own.
+
+use std::ops::Range;
 
 use crate::crypto::{self, CryptoError};
 use crate::sigv4::{AuthError, Chain, hex_value, unhex};
@@ -85,7 +89,9 @@ pub struct Decoder {
     declared: u64,
     decoded: u64,
     state: State,
-    line: Vec<u8>,
+    /// A framing line split across inputs, `line[..line_len]`.
+    line: [u8; MAX_LINE],
+    line_len: usize,
     /// The SHA-256 of the current chunk's data, for signed chunks.
     hasher: Option<crypto::Digest>,
     signature: [u8; 32],
@@ -113,7 +119,8 @@ impl Decoder {
             declared,
             decoded: 0,
             state: State::Header,
-            line: Vec::new(),
+            line: [0; MAX_LINE],
+            line_len: 0,
             hasher: None,
             signature: [0; 32],
             short: false,
@@ -124,17 +131,33 @@ impl Decoder {
 
     /// Consumes `input`, appending the payload bytes it carries to `out`.
     pub fn feed(&mut self, mut input: &[u8], out: &mut Vec<u8>) -> Result<(), ChunkError> {
-        while let Some((&first, rest)) = input.split_first() {
+        while !input.is_empty() {
+            let (taken, payload) = self.step(input)?;
+            out.extend_from_slice(input.get(payload).unwrap_or_default());
+            input = input.get(taken..).unwrap_or_default();
+        }
+        Ok(())
+    }
+
+    /// Decodes `input` through its first run of payload, or all of it where it holds framing
+    /// alone: the octets taken, and the payload's span among them, empty where there is none.
+    /// Each step with input takes at least one octet.
+    pub fn step(&mut self, input: &[u8]) -> Result<(usize, Range<usize>), ChunkError> {
+        let mut at = 0usize;
+        while let Some(&first) = input.get(at) {
             match self.state {
                 State::Data(left) => {
-                    let take = usize::try_from(left).unwrap_or(usize::MAX).min(input.len());
-                    let (data, rest) = input
-                        .split_at_checked(take)
+                    let rest = input.len().saturating_sub(at);
+                    let take = usize::try_from(left).unwrap_or(usize::MAX).min(rest);
+                    let end = at
+                        .checked_add(take)
+                        .ok_or(ChunkError::Framing("a chunk's data overran its input"))?;
+                    let data = input
+                        .get(at..end)
                         .ok_or(ChunkError::Framing("a chunk's data overran its input"))?;
                     if let Some(hasher) = &mut self.hasher {
                         hasher.update(data)?;
                     }
-                    out.extend_from_slice(data);
                     let taken = u64::try_from(take).unwrap_or(u64::MAX);
                     self.decoded = self.decoded.saturating_add(taken);
                     if self.decoded > self.declared {
@@ -146,35 +169,36 @@ impl Decoder {
                     } else {
                         State::Data(left)
                     };
-                    input = rest;
+                    return Ok((end, at..end));
                 }
                 State::Done => {
                     // Clients differ in how many line ends close a trailer (05 §1.9).
                     if first != b'\r' && first != b'\n' {
                         return Err(ChunkError::Framing("bytes after the end of the body"));
                     }
-                    input = rest;
+                    at = at.saturating_add(1);
                 }
                 State::Header | State::DataEnd | State::Trailer => {
-                    input = rest;
+                    at = at.saturating_add(1);
                     if first != b'\n' {
-                        if self.line.len() >= MAX_LINE {
-                            return Err(ChunkError::Framing("a framing line is too long"));
-                        }
-                        self.line.push(first);
+                        let slot = self
+                            .line
+                            .get_mut(self.line_len)
+                            .ok_or(ChunkError::Framing("a framing line is too long"))?;
+                        *slot = first;
+                        self.line_len = self.line_len.saturating_add(1);
                         continue;
                     }
-                    let mut line = std::mem::take(&mut self.line);
-                    if line.last() == Some(&b'\r') {
-                        line.pop();
+                    let mut len = std::mem::take(&mut self.line_len);
+                    if len > 0 && self.line.get(len.saturating_sub(1)) == Some(&b'\r') {
+                        len = len.saturating_sub(1);
                     }
-                    self.line_done(&line)?;
-                    line.clear();
-                    self.line = line;
+                    let line = self.line;
+                    self.line_done(line.get(..len).unwrap_or_default())?;
                 }
             }
         }
-        Ok(())
+        Ok((at, at..at))
     }
 
     fn line_done(&mut self, line: &[u8]) -> Result<(), ChunkError> {

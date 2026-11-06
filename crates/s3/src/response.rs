@@ -19,7 +19,7 @@ use crate::cors;
 use crate::lifecycle::{And, Expiration, Filter, Rule, Scope};
 use crate::list::{Page, Request, Start, url_encode};
 use crate::tagging::Tag;
-use crate::time::iso8601;
+use crate::time::{Stamp, iso_stamp};
 use crate::xml::Writer;
 
 /// Every object's storage class: mantle stores objects one way, as S3's default class.
@@ -76,10 +76,10 @@ pub fn list_objects_v2(list: &ListV2<'_>, page: &Page<Entry>) -> Result<String, 
         w.text("Name", list.bucket);
         w.text("Prefix", &encoded(request.prefix, url));
         delimiter(w, request.delimiter, url);
-        w.text("MaxKeys", &request.max_keys.to_string());
+        w.display("MaxKeys", request.max_keys);
         common_prefixes(w, &page.common_prefixes, url);
         encoding_type(w, url);
-        w.text("KeyCount", &page.key_count().to_string());
+        w.display("KeyCount", page.key_count());
         if let Some(token) = list.continuation_token {
             w.text("ContinuationToken", token);
         }
@@ -121,7 +121,7 @@ pub fn list_objects(list: &ListV1<'_>, page: &Page<Entry>) -> Result<String, Tim
         w.text("Name", list.bucket);
         w.text("Prefix", &encoded(request.prefix, url));
         delimiter(w, request.delimiter, url);
-        w.text("MaxKeys", &request.max_keys.to_string());
+        w.display("MaxKeys", request.max_keys);
         common_prefixes(w, &page.common_prefixes, url);
         encoding_type(w, url);
     }))
@@ -184,19 +184,19 @@ pub fn list_object_versions(list: &ListVersions<'_>) -> Result<String, TimeOutOf
                 w.element("DeleteMarker", |w| {
                     w.text("IsLatest", flag(version.latest));
                     w.text("Key", &encoded(&version.key, url));
-                    w.text("LastModified", modified);
+                    w.text("LastModified", modified.as_str());
                     owner(w, "Owner", &entry.owner);
                     w.text("VersionId", &version.version_id);
                 });
             } else {
                 w.element("Version", |w| {
                     checksum_type(w, entry.checksum);
-                    w.text("ETag", &quoted(&entry.etag));
+                    w.quoted("ETag", &entry.etag);
                     w.text("IsLatest", flag(version.latest));
                     w.text("Key", &encoded(&version.key, url));
-                    w.text("LastModified", modified);
+                    w.text("LastModified", modified.as_str());
                     owner(w, "Owner", &entry.owner);
-                    w.text("Size", &entry.size.to_string());
+                    w.display("Size", entry.size);
                     w.text("StorageClass", STORAGE_CLASS);
                     w.text("VersionId", &version.version_id);
                 });
@@ -205,7 +205,7 @@ pub fn list_object_versions(list: &ListVersions<'_>) -> Result<String, TimeOutOf
         w.text("Name", list.bucket);
         w.text("Prefix", &encoded(list.prefix, url));
         delimiter(w, list.delimiter, url);
-        w.text("MaxKeys", &list.max_keys.to_string());
+        w.display("MaxKeys", list.max_keys);
         common_prefixes(w, list.common_prefixes, url);
         encoding_type(w, url);
     }))
@@ -245,7 +245,7 @@ pub fn list_buckets(list: &ListBuckets<'_>) -> Result<String, TimeOutOfRange> {
                     if list.regions {
                         w.text("BucketRegion", &bucket.region);
                     }
-                    w.text("CreationDate", created);
+                    w.text("CreationDate", created.as_str());
                     w.text("Name", &bucket.name);
                 });
             }
@@ -305,12 +305,12 @@ pub fn list_multipart_uploads(list: &ListUploads<'_>) -> Result<String, TimeOutO
         w.text("Prefix", &encoded(list.prefix, url));
         delimiter(w, list.delimiter, url);
         w.text("NextUploadIdMarker", list.next.id);
-        w.text("MaxUploads", &list.max_uploads.to_string());
+        w.display("MaxUploads", list.max_uploads);
         w.text("IsTruncated", flag(list.truncated));
         for (upload, initiated) in list.uploads.iter().zip(&initiated) {
             w.element("Upload", |w| {
                 checksum_type(w, upload.checksum);
-                w.text("Initiated", initiated);
+                w.text("Initiated", initiated.as_str());
                 owner(w, "Initiator", &upload.initiator);
                 w.text("Key", &encoded(&upload.key, url));
                 owner(w, "Owner", &upload.owner);
@@ -362,21 +362,21 @@ pub fn list_parts(list: &ListParts<'_>) -> Result<String, TimeOutOfRange> {
         w.text("Bucket", list.bucket);
         w.text("Key", list.key);
         w.text("UploadId", list.upload_id);
-        w.text("PartNumberMarker", &list.part_number_marker.to_string());
+        w.display("PartNumberMarker", list.part_number_marker);
         if let Some(next) = list.next {
-            w.text("NextPartNumberMarker", &next.to_string());
+            w.display("NextPartNumberMarker", next);
         }
-        w.text("MaxParts", &list.max_parts.to_string());
+        w.display("MaxParts", list.max_parts);
         w.text("IsTruncated", flag(list.next.is_some()));
         for (part, modified) in list.parts.iter().zip(&modified) {
             w.element("Part", |w| {
                 if let Some(checksum) = &part.checksum {
                     w.text(checksum.algorithm.element(), &checksum.to_base64());
                 }
-                w.text("ETag", &quoted(&part.etag));
-                w.text("LastModified", modified);
-                w.text("PartNumber", &part.number.to_string());
-                w.text("Size", &part.size.to_string());
+                w.quoted("ETag", &part.etag);
+                w.text("LastModified", modified.as_str());
+                w.display("PartNumber", part.number);
+                w.display("Size", part.size);
             });
         }
         owner(w, "Initiator", list.initiator);
@@ -422,7 +422,7 @@ pub fn complete_multipart_upload(completed: &Completed<'_>) -> String {
         w.text("Location", completed.location);
         w.text("Bucket", completed.bucket);
         w.text("Key", completed.key);
-        w.text("ETag", &quoted(completed.etag));
+        w.quoted("ETag", completed.etag);
         if let Some(checksum) = completed.checksum {
             w.text(checksum.algorithm.element(), checksum.value);
             w.text("ChecksumType", checksum.kind.name());
@@ -439,8 +439,8 @@ pub fn copy_object(
 ) -> Result<String, TimeOutOfRange> {
     let modified = timestamp(modified)?;
     Ok(Writer::document("CopyObjectResult", true, |w| {
-        w.text("ETag", &quoted(etag));
-        w.text("LastModified", &modified);
+        w.quoted("ETag", etag);
+        w.text("LastModified", modified.as_str());
         if let Some(checksum) = checksum {
             w.text("ChecksumType", checksum.kind.name());
             w.text(checksum.algorithm.element(), checksum.value);
@@ -457,8 +457,8 @@ pub fn copy_part(
 ) -> Result<String, TimeOutOfRange> {
     let modified = timestamp(modified)?;
     Ok(Writer::document("CopyPartResult", true, |w| {
-        w.text("ETag", &quoted(etag));
-        w.text("LastModified", &modified);
+        w.quoted("ETag", etag);
+        w.text("LastModified", modified.as_str());
         if let Some(checksum) = checksum {
             w.text(checksum.algorithm.element(), &checksum.to_base64());
         }
@@ -569,7 +569,7 @@ pub fn post_response(location: &str, bucket: &str, key: &str, etag: &str) -> Str
         w.text("Location", location);
         w.text("Bucket", bucket);
         w.text("Key", key);
-        w.text("ETag", &quoted(etag));
+        w.quoted("ETag", etag);
     })
 }
 
@@ -644,16 +644,19 @@ pub fn ownership_controls() -> String {
 /// the actions, rather than its Response Syntax's. A `Date` is written as every time in a
 /// response is (13 §9.2).
 pub fn lifecycle_configuration(rules: &[Rule]) -> Result<String, TimeOutOfRange> {
-    let mut dates = Vec::new();
+    // Each rule's date, where it expires on one, before any of the document is written.
+    let mut dates = Vec::with_capacity(rules.len());
     for rule in rules {
-        if let Some(Expiration::Date(day)) = rule.expiration {
-            let millis = day.checked_mul(86_400_000).ok_or(TimeOutOfRange(day))?;
-            dates.push(iso8601(millis).ok_or(TimeOutOfRange(day))?);
-        }
+        dates.push(match rule.expiration {
+            Some(Expiration::Date(day)) => {
+                let millis = day.checked_mul(86_400_000).ok_or(TimeOutOfRange(day))?;
+                Some(iso_stamp(millis).ok_or(TimeOutOfRange(day))?)
+            }
+            _ => None,
+        });
     }
-    let mut dates = dates.iter();
     Ok(Writer::document("LifecycleConfiguration", true, |w| {
-        for rule in rules {
+        for (rule, date) in rules.iter().zip(&dates) {
             w.element("Rule", |w| {
                 w.text("ID", &rule.id);
                 match &rule.scope {
@@ -664,9 +667,9 @@ pub fn lifecycle_configuration(rules: &[Rule]) -> Result<String, TimeOutOfRange>
                 if let Some(expiration) = rule.expiration {
                     w.element("Expiration", |w| match expiration {
                         Expiration::Date(_) => {
-                            w.text("Date", dates.next().map_or("", String::as_str));
+                            w.text("Date", date.as_ref().map_or("", Stamp::as_str));
                         }
-                        Expiration::Days(days) => w.text("Days", &days.to_string()),
+                        Expiration::Days(days) => w.display("Days", days),
                         Expiration::Marker(marker) => {
                             w.text(
                                 "ExpiredObjectDeleteMarker",
@@ -678,14 +681,14 @@ pub fn lifecycle_configuration(rules: &[Rule]) -> Result<String, TimeOutOfRange>
                 if let Some(noncurrent) = rule.noncurrent {
                     w.element("NoncurrentVersionExpiration", |w| {
                         if let Some(newer) = noncurrent.newer {
-                            w.text("NewerNoncurrentVersions", &newer.to_string());
+                            w.display("NewerNoncurrentVersions", newer);
                         }
-                        w.text("NoncurrentDays", &noncurrent.days.to_string());
+                        w.display("NoncurrentDays", noncurrent.days);
                     });
                 }
                 if let Some(days) = rule.abort {
                     w.element("AbortIncompleteMultipartUpload", |w| {
-                        w.text("DaysAfterInitiation", &days.to_string());
+                        w.display("DaysAfterInitiation", days);
                     });
                 }
             });
@@ -704,8 +707,8 @@ pub fn object_lock_configuration(configuration: &crate::lock::Configuration) -> 
                 w.element("DefaultRetention", |w| {
                     w.text("Mode", mode.name());
                     match period {
-                        Period::Days(days) => w.text("Days", &days.to_string()),
-                        Period::Years(years) => w.text("Years", &years.to_string()),
+                        Period::Days(days) => w.display("Days", days),
+                        Period::Years(years) => w.display("Years", years),
                     }
                 });
             });
@@ -795,7 +798,7 @@ pub fn cors_configuration(rules: &[cors::Rule]) -> String {
                     w.text("ID", id);
                 }
                 if let Some(age) = rule.max_age {
-                    w.text("MaxAgeSeconds", &age.to_string());
+                    w.display("MaxAgeSeconds", age);
                 }
             });
         }
@@ -813,10 +816,10 @@ fn lifecycle_filter(w: &mut Writer, filter: &Filter) {
             smaller,
         }) => w.element("And", |w| {
             if let Some(size) = larger {
-                w.text("ObjectSizeGreaterThan", &size.to_string());
+                w.display("ObjectSizeGreaterThan", size);
             }
             if let Some(size) = smaller {
-                w.text("ObjectSizeLessThan", &size.to_string());
+                w.display("ObjectSizeLessThan", size);
             }
             if let Some(prefix) = prefix {
                 w.text("Prefix", prefix);
@@ -825,8 +828,8 @@ fn lifecycle_filter(w: &mut Writer, filter: &Filter) {
                 lifecycle_tag(w, tag);
             }
         }),
-        Filter::Larger(size) => w.text("ObjectSizeGreaterThan", &size.to_string()),
-        Filter::Smaller(size) => w.text("ObjectSizeLessThan", &size.to_string()),
+        Filter::Larger(size) => w.display("ObjectSizeGreaterThan", size),
+        Filter::Smaller(size) => w.display("ObjectSizeLessThan", size),
         Filter::Prefix(prefix) => w.text("Prefix", prefix),
         Filter::Tag(tag) => lifecycle_tag(w, tag),
     }
@@ -840,17 +843,17 @@ fn lifecycle_tag(w: &mut Writer, tag: &Tag) {
 }
 
 /// A listing's `Contents`.
-fn contents(w: &mut Writer, page: &Page<Entry>, modified: &[String], owners: bool, url: bool) {
+fn contents(w: &mut Writer, page: &Page<Entry>, modified: &[Stamp], owners: bool, url: bool) {
     for ((key, entry), modified) in page.contents.iter().zip(modified) {
         w.element("Contents", |w| {
             checksum_type(w, entry.checksum);
-            w.text("ETag", &quoted(&entry.etag));
+            w.quoted("ETag", &entry.etag);
             w.text("Key", &encoded(key, url));
-            w.text("LastModified", modified);
+            w.text("LastModified", modified.as_str());
             if owners {
                 owner(w, "Owner", &entry.owner);
             }
-            w.text("Size", &entry.size.to_string());
+            w.display("Size", entry.size);
             w.text("StorageClass", STORAGE_CLASS);
         });
     }
@@ -904,24 +907,25 @@ fn encoded(text: &str, url: bool) -> Cow<'_, str> {
     }
 }
 
-fn quoted(etag: &str) -> String {
-    format!("\"{etag}\"")
-}
-
 fn flag(value: bool) -> &'static str {
     if value { "true" } else { "false" }
 }
 
-/// Each time as a document writes it, before any of the document is written.
-fn times(seconds: impl Iterator<Item = i64>) -> Result<Vec<String>, TimeOutOfRange> {
-    seconds.map(timestamp).collect()
+/// Each time as a document writes it, before any of the document is written: one list for the
+/// page, each time's text held in place (`time::Stamp`).
+fn times(seconds: impl ExactSizeIterator<Item = i64>) -> Result<Vec<Stamp>, TimeOutOfRange> {
+    let mut stamps = Vec::with_capacity(seconds.len());
+    for second in seconds {
+        stamps.push(timestamp(second)?);
+    }
+    Ok(stamps)
 }
 
 /// Unix seconds as S3 writes a time: `2009-10-12T17:50:30.000Z`.
-fn timestamp(seconds: i64) -> Result<String, TimeOutOfRange> {
+fn timestamp(seconds: i64) -> Result<Stamp, TimeOutOfRange> {
     seconds
         .checked_mul(1000)
-        .and_then(iso8601)
+        .and_then(iso_stamp)
         .ok_or(TimeOutOfRange(seconds))
 }
 
@@ -2141,6 +2145,7 @@ mod tests {
 
     #[test]
     fn times_are_whole_seconds_and_a_time_out_of_range_is_refused() {
+        let timestamp = |seconds| timestamp(seconds).map(|s| s.as_str().to_owned());
         assert_eq!(timestamp(0), Ok("1970-01-01T00:00:00.000Z".into()));
         assert_eq!(
             timestamp(1_255_369_830),

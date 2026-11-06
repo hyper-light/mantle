@@ -93,39 +93,85 @@ impl AuthError {
 
 /// The chain of chunk and trailer signatures that starts at a request's seed signature
 /// (S3 developer guide, Transfer Payload in Multiple Chunks; 05 §1.8–§1.9).
+///
+/// Each chunk's string to sign is written into one buffer the chain keeps, made once at its
+/// bound: its first lines, the algorithm's, the request's time and its scope, are the same for
+/// every chunk, and the rest is at most three digests in hex.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Chain {
     key: [u8; 32],
-    timestamp: String,
-    scope: String,
+    /// `AWS4-HMAC-SHA256-PAYLOAD\n<timestamp>\n<scope>\n`, then the string's rest.
+    string: Vec<u8>,
+    /// The bytes of the lines every string to sign shares.
+    lines: usize,
     previous: [u8; 32],
 }
+
+/// The algorithm line of a chunk's string to sign, and a trailer's: the same length, so either
+/// is written over the other.
+const PAYLOAD: &[u8; 24] = b"AWS4-HMAC-SHA256-PAYLOAD";
+const TRAILER: &[u8; 24] = b"AWS4-HMAC-SHA256-TRAILER";
+
+/// The most a chunk's string adds to the shared lines: the previous signature, the empty
+/// string's hash and the chunk's, in hex, each ended.
+const CHAIN_REST: usize = 3 * 64 + 2;
 
 impl std::fmt::Debug for Chain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The signing key is a credential.
-        f.debug_struct("Chain")
-            .field("scope", &self.scope)
-            .finish_non_exhaustive()
+        f.debug_struct("Chain").finish_non_exhaustive()
     }
 }
 
 impl Chain {
+    fn new(key: [u8; 32], timestamp: &str, scope: Scope<'_>, previous: [u8; 32]) -> Self {
+        let lines = PAYLOAD
+            .len()
+            .saturating_add(1)
+            .saturating_add(timestamp.len())
+            .saturating_add(1)
+            .saturating_add(scope.len())
+            .saturating_add(1);
+        let mut string = Vec::with_capacity(lines.saturating_add(CHAIN_REST));
+        string.extend_from_slice(PAYLOAD);
+        string.push(b'\n');
+        string.extend_from_slice(timestamp.as_bytes());
+        string.push(b'\n');
+        scope.put(&mut string);
+        string.push(b'\n');
+        Self {
+            key,
+            string,
+            lines,
+            previous,
+        }
+    }
+
+    /// The string to sign of the next chunk, whose data hashes to `sha256`, or of the trailer
+    /// whose canonical form hashes to it, and its signature.
+    fn signature(&mut self, kind: &[u8; 24], sha256: &[u8; 32]) -> Result<[u8; 32], AuthError> {
+        self.string.truncate(self.lines);
+        if let Some(algorithm) = self.string.get_mut(..kind.len()) {
+            algorithm.copy_from_slice(kind);
+        }
+        self.string.extend_from_slice(&hex_digits(&self.previous));
+        self.string.push(b'\n');
+        if kind == PAYLOAD {
+            self.string.extend_from_slice(EMPTY_SHA256.as_bytes());
+            self.string.push(b'\n');
+        }
+        self.string.extend_from_slice(&hex_digits(sha256));
+        Ok(crypto::hmac_sha256(&self.key, &self.string)?)
+    }
+
     /// Verifies the signature of the next chunk, whose data hashes to `sha256`.
     pub fn verify_chunk(
         &mut self,
         sha256: &[u8; 32],
         signature: &[u8; 32],
     ) -> Result<(), AuthError> {
-        let sts = format!(
-            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{}\n{}",
-            self.timestamp,
-            self.scope,
-            hex(&self.previous),
-            EMPTY_SHA256,
-            hex(sha256)
-        );
-        self.advance(&sts, signature)
+        let expected = self.signature(PAYLOAD, sha256)?;
+        self.advance(expected, signature)
     }
 
     /// Verifies the trailer's signature; `canonical` is each trailing header as
@@ -135,18 +181,11 @@ impl Chain {
         canonical: &[u8],
         signature: &[u8; 32],
     ) -> Result<(), AuthError> {
-        let sts = format!(
-            "AWS4-HMAC-SHA256-TRAILER\n{}\n{}\n{}\n{}",
-            self.timestamp,
-            self.scope,
-            hex(&self.previous),
-            hex(&crypto::sha256(canonical)?)
-        );
-        self.advance(&sts, signature)
+        let expected = self.signature(TRAILER, &crypto::sha256(canonical)?)?;
+        self.advance(expected, signature)
     }
 
-    fn advance(&mut self, string_to_sign: &str, signature: &[u8; 32]) -> Result<(), AuthError> {
-        let expected = crypto::hmac_sha256(&self.key, string_to_sign.as_bytes())?;
+    fn advance(&mut self, expected: [u8; 32], signature: &[u8; 32]) -> Result<(), AuthError> {
         if !crypto::equal(&expected, signature)? {
             return Err(AuthError::Mismatch);
         }
@@ -156,42 +195,60 @@ impl Chain {
 
     /// Signs the next chunk as a client would: for tests and for mantle's own clients.
     pub fn sign_chunk(&mut self, sha256: &[u8; 32]) -> Result<[u8; 32], AuthError> {
-        let sts = format!(
-            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{}\n{}",
-            self.timestamp,
-            self.scope,
-            hex(&self.previous),
-            EMPTY_SHA256,
-            hex(sha256)
-        );
-        let signature = crypto::hmac_sha256(&self.key, sts.as_bytes())?;
+        let signature = self.signature(PAYLOAD, sha256)?;
         self.previous = signature;
         Ok(signature)
     }
 
     /// Signs the trailer as a client would.
     pub fn sign_trailer(&mut self, canonical: &[u8]) -> Result<[u8; 32], AuthError> {
-        let sts = format!(
-            "AWS4-HMAC-SHA256-TRAILER\n{}\n{}\n{}\n{}",
-            self.timestamp,
-            self.scope,
-            hex(&self.previous),
-            hex(&crypto::sha256(canonical)?)
-        );
-        let signature = crypto::hmac_sha256(&self.key, sts.as_bytes())?;
+        let signature = self.signature(TRAILER, &crypto::sha256(canonical)?)?;
         self.previous = signature;
         Ok(signature)
+    }
+}
+
+/// A credential's scope, `date/region/service/aws4_request`, written where it is needed.
+#[derive(Clone, Copy)]
+struct Scope<'a> {
+    date: &'a str,
+    region: &'a str,
+    service: &'a str,
+}
+
+impl Scope<'_> {
+    const END: &'static str = "aws4_request";
+
+    fn len(&self) -> usize {
+        self.date
+            .len()
+            .saturating_add(self.region.len())
+            .saturating_add(self.service.len())
+            .saturating_add(Self::END.len())
+            .saturating_add(3)
+    }
+
+    fn put(&self, out: &mut Vec<u8>) {
+        for (part, end) in [
+            (self.date, "/"),
+            (self.region, "/"),
+            (self.service, "/"),
+            (Self::END, ""),
+        ] {
+            out.extend_from_slice(part.as_bytes());
+            out.extend_from_slice(end.as_bytes());
+        }
     }
 }
 
 /// Verifies a request signed in its `Authorization` header or as a presigned URL. `region`
 /// is the region this endpoint serves; `secret` finds an access key's secret; `now` is Unix
 /// seconds.
-pub fn verify(
+pub fn verify<S: AsRef<str>>(
     request: &Request<'_>,
     region: &str,
     now: i64,
-    secret: impl Fn(&str) -> Option<String>,
+    secret: impl Fn(&str) -> Option<S>,
 ) -> Result<Verified, AuthError> {
     if let Some(authorization) = header(request.headers, "authorization") {
         return verify_header(request, authorization, region, now, &secret);
@@ -208,16 +265,27 @@ struct Claim<'a> {
     date: &'a str,
     region: &'a str,
     service: &'a str,
-    signed_headers: Vec<&'a str>,
+    /// The signed headers' names, `;`-separated, each checked lowercase and not empty.
+    signed_headers: &'a str,
     signature: [u8; 32],
 }
 
-fn verify_header(
+impl Claim<'_> {
+    fn scope(&self) -> Scope<'_> {
+        Scope {
+            date: self.date,
+            region: self.region,
+            service: self.service,
+        }
+    }
+}
+
+fn verify_header<S: AsRef<str>>(
     request: &Request<'_>,
     authorization: &str,
     region: &str,
     now: i64,
-    secret: &impl Fn(&str) -> Option<String>,
+    secret: &impl Fn(&str) -> Option<S>,
 ) -> Result<Verified, AuthError> {
     let malformed = AuthError::HeaderMalformed;
     let rest = match authorization.split_once(|c: char| c.is_ascii_whitespace()) {
@@ -261,22 +329,19 @@ fn verify_header(
     }
     check_signed_amz_headers(
         request,
-        &claim.signed_headers,
+        claim.signed_headers,
         "x-amz-content-sha256",
         malformed,
     )?;
     let payload = header(request.headers, "x-amz-content-sha256")
         .ok_or(malformed("no x-amz-content-sha256"))?;
     let body = body_of(payload).ok_or(malformed("unknown x-amz-content-sha256"))?;
-    let canonical = canonical_request(request, &claim.signed_headers, payload, None)?;
+    let canonical = canonical_hash(request, claim.signed_headers, payload, None)?;
     let key = check_signature(&claim, timestamp, &canonical, secret)?;
     let chain = match body {
-        Body::SignedChunks { .. } => Some(Chain {
-            key,
-            timestamp: timestamp.to_owned(),
-            scope: scope(claim.date, claim.region, claim.service),
-            previous: claim.signature,
-        }),
+        Body::SignedChunks { .. } => {
+            Some(Chain::new(key, timestamp, claim.scope(), claim.signature))
+        }
         _ => None,
     };
     Ok(Verified {
@@ -286,11 +351,11 @@ fn verify_header(
     })
 }
 
-fn verify_presigned(
+fn verify_presigned<S: AsRef<str>>(
     request: &Request<'_>,
     region: &str,
     now: i64,
-    secret: &impl Fn(&str) -> Option<String>,
+    secret: &impl Fn(&str) -> Option<S>,
 ) -> Result<Verified, AuthError> {
     let malformed = AuthError::QueryMalformed;
     let params = query_pairs(request.query).ok_or(malformed("undecodable query"))?;
@@ -330,10 +395,10 @@ fn verify_presigned(
     if now >= time.saturating_add(expires) {
         return Err(AuthError::Expired);
     }
-    check_signed_amz_headers(request, &claim.signed_headers, "", malformed)?;
-    let canonical = canonical_request(
+    check_signed_amz_headers(request, claim.signed_headers, "", malformed)?;
+    let canonical = canonical_hash(
         request,
-        &claim.signed_headers,
+        claim.signed_headers,
         "UNSIGNED-PAYLOAD",
         Some("X-Amz-Signature"),
     )?;
@@ -361,15 +426,15 @@ fn claim<'a>(
     if terminator != "aws4_request" || access_key.is_empty() {
         return Err(malformed("Credential does not end in aws4_request"));
     }
-    let signed_headers: Vec<&str> = signed.split(';').collect();
-    if signed_headers.iter().any(|h| {
+    let signed_headers = signed;
+    if signed_headers.split(';').any(|h| {
         h.is_empty()
             || h.bytes()
                 .any(|b| b.is_ascii_uppercase() || b.is_ascii_whitespace())
     }) {
         return Err(malformed("SignedHeaders are not lowercase names"));
     }
-    if !signed_headers.contains(&"host") {
+    if !signed_headers.split(';').any(|h| h == "host") {
         return Err(malformed("host is not signed"));
     }
     let signature = unhex(signature).ok_or(malformed("Signature is not 64 hex digits"))?;
@@ -408,37 +473,59 @@ fn check_scope(
 /// excepted (05 §1.2.4); an unsigned one could change what the request does.
 fn check_signed_amz_headers(
     request: &Request<'_>,
-    signed: &[&str],
+    signed: &str,
     exempt: &str,
     malformed: fn(&'static str) -> AuthError,
 ) -> Result<(), AuthError> {
+    // Names compared case-insensitively against the signed names, which are lowercase: as the
+    // name lowercased would compare exactly.
     for (name, _) in request.headers {
-        let lower = name.to_ascii_lowercase();
-        if lower.starts_with("x-amz-") && lower != exempt && !signed.contains(&lower.as_str()) {
+        let amz = name
+            .get(..6)
+            .is_some_and(|start| start.eq_ignore_ascii_case("x-amz-"));
+        if amz
+            && !name.eq_ignore_ascii_case(exempt)
+            && !signed.split(';').any(|s| name.eq_ignore_ascii_case(s))
+        {
             return Err(malformed("an x-amz- header is not signed"));
         }
     }
     Ok(())
 }
 
-fn check_signature(
+fn check_signature<S: AsRef<str>>(
     claim: &Claim<'_>,
     timestamp: &str,
-    canonical: &str,
-    secret: &impl Fn(&str) -> Option<String>,
+    canonical: &[u8; 32],
+    secret: &impl Fn(&str) -> Option<S>,
 ) -> Result<[u8; 32], AuthError> {
     let secret = secret(claim.access_key).ok_or(AuthError::UnknownKey)?;
-    let key = signing_key(&secret, claim.date, claim.region, claim.service)?;
-    let sts = string_to_sign(
-        timestamp,
-        &scope(claim.date, claim.region, claim.service),
-        canonical,
-    )?;
-    let expected = crypto::hmac_sha256(&key, sts.as_bytes())?;
+    let key = signing_key(secret.as_ref(), claim.date, claim.region, claim.service)?;
+    let sts = signed_string(timestamp, claim.scope(), canonical);
+    let expected = crypto::hmac_sha256(&key, &sts)?;
     if !crypto::equal(&expected, &claim.signature)? {
         return Err(AuthError::Mismatch);
     }
     Ok(key)
+}
+
+/// The string to sign (05 §1.3): the algorithm, the request's time, its scope and the canonical
+/// request's hash, in one buffer made at their length.
+fn signed_string(timestamp: &str, scope: Scope<'_>, canonical: &[u8; 32]) -> Vec<u8> {
+    let len = ALGORITHM
+        .len()
+        .saturating_add(timestamp.len())
+        .saturating_add(scope.len())
+        .saturating_add(64 + 3);
+    let mut sts = Vec::with_capacity(len);
+    sts.extend_from_slice(ALGORITHM.as_bytes());
+    sts.push(b'\n');
+    sts.extend_from_slice(timestamp.as_bytes());
+    sts.push(b'\n');
+    scope.put(&mut sts);
+    sts.push(b'\n');
+    sts.extend_from_slice(&hex_digits(canonical));
+    sts
 }
 
 /// The canonical request (05 §1.2): method, URI, query, headers, signed headers, payload.
@@ -449,49 +536,256 @@ pub fn canonical_request(
     payload: &str,
     skip: Option<&str>,
 ) -> Result<String, AuthError> {
-    let path = percent_decode(request.path.as_bytes()).ok_or(AuthError::Mismatch)?;
-    let mut uri = uri_encode(&path, false);
-    if uri.is_empty() {
-        uri.push('/');
+    let signed = signed_headers.join(";");
+    let mut text = Vec::new();
+    write_canonical(&mut Text(&mut text), request, &signed, payload, skip)?;
+    String::from_utf8(text).map_err(|_| AuthError::Mismatch)
+}
+
+/// The canonical request's SHA-256, written into the digest as it is formed: no buffer holds
+/// it. `signed` is the signed headers' names as the claim lists them, `;`-separated.
+fn canonical_hash(
+    request: &Request<'_>,
+    signed: &str,
+    payload: &str,
+    skip: Option<&str>,
+) -> Result<[u8; 32], AuthError> {
+    let mut digest = crypto::Digest::new(&crypto::SHA256)?;
+    write_canonical(&mut digest, request, signed, payload, skip)?;
+    Ok(digest.finish_array()?)
+}
+
+/// Where a canonical request is written: a verifier's digest, or a client's text to sign.
+trait Canonical {
+    fn put(&mut self, bytes: &[u8]) -> Result<(), CryptoError>;
+}
+
+impl Canonical for crypto::Digest {
+    fn put(&mut self, bytes: &[u8]) -> Result<(), CryptoError> {
+        self.update(bytes)
     }
-    let mut pairs: Vec<(String, String)> = query_pairs(request.query)
-        .ok_or(AuthError::Mismatch)?
-        .into_iter()
-        .filter(|(n, _)| Some(n.as_str()) != skip)
-        .map(|(n, v)| {
-            (
-                uri_encode(n.as_bytes(), true),
-                uri_encode(v.as_bytes(), true),
-            )
-        })
-        .collect();
-    pairs.sort();
-    let query: Vec<String> = pairs.iter().map(|(n, v)| format!("{n}={v}")).collect();
-    let mut headers = String::new();
-    for name in signed_headers {
-        let values: Vec<String> = request
+}
+
+struct Text<'a>(&'a mut Vec<u8>);
+
+impl Canonical for Text<'_> {
+    fn put(&mut self, bytes: &[u8]) -> Result<(), CryptoError> {
+        self.0.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+fn write_canonical(
+    out: &mut impl Canonical,
+    request: &Request<'_>,
+    signed: &str,
+    payload: &str,
+    skip: Option<&str>,
+) -> Result<(), AuthError> {
+    out.put(request.method.as_bytes())?;
+    out.put(b"\n")?;
+    if request.path.is_empty() {
+        out.put(b"/")?;
+    }
+    for byte in Decoded::of(request.path) {
+        put_encoded(out, byte.ok_or(AuthError::Mismatch)?, false)?;
+    }
+    out.put(b"\n")?;
+    write_query(out, request.query, skip)?;
+    out.put(b"\n")?;
+    for name in signed.split(';') {
+        out.put(name.as_bytes())?;
+        out.put(b":")?;
+        let mut values = request
             .headers
             .iter()
             .filter(|(n, _)| n.eq_ignore_ascii_case(name))
-            .map(|(_, v)| collapse(v))
-            .collect();
-        if values.is_empty() {
+            .map(|(_, v)| *v);
+        let first = values.next().ok_or(AuthError::Mismatch)?;
+        put_collapsed(out, first)?;
+        for value in values {
+            out.put(b",")?;
+            put_collapsed(out, value)?;
+        }
+        out.put(b"\n")?;
+    }
+    out.put(b"\n")?;
+    out.put(signed.as_bytes())?;
+    out.put(b"\n")?;
+    out.put(payload.as_bytes())?;
+    Ok(())
+}
+
+/// The query's parameters, decoded and each re-encoded, sorted by name and then value, `skip`
+/// left out (05 §1.2.3). A query's parameters are read where they lie: a list of where each
+/// lies is the one buffer, made at their count, and only for a request that has a query.
+fn write_query(out: &mut impl Canonical, query: &str, skip: Option<&str>) -> Result<(), AuthError> {
+    if query.is_empty() {
+        return Ok(());
+    }
+    let count = query.split('&').filter(|p| !p.is_empty()).count();
+    let mut pairs = Vec::with_capacity(count);
+    for p in query.split('&').filter(|p| !p.is_empty()) {
+        let (n, v) = p.split_once('=').unwrap_or((p, ""));
+        // A parameter that does not decode, or decodes to a name or value that is not UTF-8,
+        // makes no canonical request.
+        if !utf8(n) || !utf8(v) {
             return Err(AuthError::Mismatch);
         }
-        headers.push_str(name);
-        headers.push(':');
-        headers.push_str(&values.join(","));
-        headers.push('\n');
+        if skip.is_some_and(|skip| {
+            Decoded::of(n)
+                .map(Option::unwrap_or_default)
+                .eq(skip.bytes())
+        }) {
+            continue;
+        }
+        pairs.push((n, v));
     }
-    Ok(format!(
-        "{}\n{}\n{}\n{}\n{}\n{}",
-        request.method,
-        uri,
-        query.join("&"),
-        headers,
-        signed_headers.join(";"),
-        payload
-    ))
+    pairs.sort_by(|(an, av), (bn, bv)| {
+        encoded(an)
+            .cmp(encoded(bn))
+            .then_with(|| encoded(av).cmp(encoded(bv)))
+    });
+    for (i, (n, v)) in pairs.iter().enumerate() {
+        if i > 0 {
+            out.put(b"&")?;
+        }
+        for byte in Decoded::of(n) {
+            put_encoded(out, byte.unwrap_or_default(), true)?;
+        }
+        out.put(b"=")?;
+        for byte in Decoded::of(v) {
+            put_encoded(out, byte.unwrap_or_default(), true)?;
+        }
+    }
+    Ok(())
+}
+
+/// A query parameter's name or value as the canonical request writes it, once it decoded.
+fn encoded(text: &str) -> impl Iterator<Item = u8> + '_ {
+    Decoded::of(text).flat_map(|b| Encoded::of(b.unwrap_or_default(), true))
+}
+
+/// Whether `text` percent-decodes, and to UTF-8.
+fn utf8(text: &str) -> bool {
+    let mut decoded = Decoded::of(text);
+    let mut buf = [0u8; 4];
+    loop {
+        let Some(first) = decoded.next() else {
+            return true;
+        };
+        let Some(first) = first else {
+            return false;
+        };
+        // A sequence's length is its first byte's (RFC 3629 §4); it is checked whole.
+        let len = match first {
+            0x00..=0x7F => 1,
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => return false,
+        };
+        let Some(sequence) = buf.get_mut(..len) else {
+            return false;
+        };
+        let mut bytes = sequence.iter_mut();
+        if let Some(slot) = bytes.next() {
+            *slot = first;
+        }
+        for slot in bytes {
+            match decoded.next() {
+                Some(Some(b)) => *slot = b,
+                _ => return false,
+            }
+        }
+        if std::str::from_utf8(sequence).is_err() {
+            return false;
+        }
+    }
+}
+
+/// A text's bytes percent-decoded as they are read: `None` for a broken escape. `+` stays `+`,
+/// as RFC 3986 reads it.
+struct Decoded<'a> {
+    bytes: std::slice::Iter<'a, u8>,
+}
+
+impl<'a> Decoded<'a> {
+    fn of(text: &'a str) -> Self {
+        Self {
+            bytes: text.as_bytes().iter(),
+        }
+    }
+}
+
+impl Iterator for Decoded<'_> {
+    type Item = Option<u8>;
+
+    fn next(&mut self) -> Option<Option<u8>> {
+        let b = *self.bytes.next()?;
+        if b != b'%' {
+            return Some(Some(b));
+        }
+        let hi = self.bytes.next().and_then(|b| hex_digit(*b));
+        let lo = self.bytes.next().and_then(|b| hex_digit(*b));
+        Some(hi.zip(lo).map(|(hi, lo)| (hi << 4) | lo))
+    }
+}
+
+/// A byte as S3's `UriEncode` writes it: itself, or `%XX` in uppercase hex.
+struct Encoded {
+    bytes: [u8; 3],
+    at: usize,
+    len: usize,
+}
+
+impl Encoded {
+    fn of(b: u8, slash: bool) -> Self {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        let keep = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~');
+        if keep || (b == b'/' && !slash) {
+            return Self {
+                bytes: [b, 0, 0],
+                at: 0,
+                len: 1,
+            };
+        }
+        let digit = |d: u8| HEX.get(usize::from(d)).copied().unwrap_or(b'0');
+        Self {
+            bytes: [b'%', digit(b >> 4), digit(b & 15)],
+            at: 0,
+            len: 3,
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        self.bytes.get(..self.len).unwrap_or_default()
+    }
+}
+
+impl Iterator for Encoded {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<u8> {
+        let b = self.as_bytes().get(self.at).copied()?;
+        self.at = self.at.saturating_add(1);
+        Some(b)
+    }
+}
+
+fn put_encoded(out: &mut impl Canonical, b: u8, slash: bool) -> Result<(), CryptoError> {
+    out.put(Encoded::of(b, slash).as_bytes())
+}
+
+/// A header value trimmed, its runs of white space each written as one space (05 §1.2.4).
+fn put_collapsed(out: &mut impl Canonical, value: &str) -> Result<(), CryptoError> {
+    for (i, word) in value.split_whitespace().enumerate() {
+        if i > 0 {
+            out.put(b" ")?;
+        }
+        out.put(word.as_bytes())?;
+    }
+    Ok(())
 }
 
 pub fn string_to_sign(
@@ -516,7 +810,8 @@ pub fn signing_key(
     region: &str,
     service: &str,
 ) -> Result<[u8; 32], AuthError> {
-    let mut first = b"AWS4".to_vec();
+    let mut first = Vec::with_capacity(secret.len().saturating_add(4));
+    first.extend_from_slice(b"AWS4");
     first.extend_from_slice(secret.as_bytes());
     let date_key = crypto::hmac_sha256(&first, date.as_bytes())?;
     let region_key = crypto::hmac_sha256(&date_key, region.as_bytes())?;
@@ -545,12 +840,17 @@ pub fn client_chain(
     region: &str,
     seed: [u8; 32],
 ) -> Result<Chain, AuthError> {
-    Ok(Chain {
-        key: signing_key(secret, date, region, "s3")?,
-        timestamp: timestamp.to_owned(),
-        scope: scope(date, region, "s3"),
-        previous: seed,
-    })
+    let scope = Scope {
+        date,
+        region,
+        service: "s3",
+    };
+    Ok(Chain::new(
+        signing_key(secret, date, region, "s3")?,
+        timestamp,
+        scope,
+        seed,
+    ))
 }
 
 fn body_of(payload: &str) -> Option<Body> {
@@ -589,11 +889,6 @@ fn query_pairs(query: &str) -> Option<Vec<(String, String)>> {
             Some((n, v))
         })
         .collect()
-}
-
-/// Trims a header value and collapses runs of spaces into one (05 §1.2.4).
-fn collapse(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// S3's `UriEncode`: every byte but `A-Z a-z 0-9 - . _ ~` becomes `%XX` in uppercase hex, and
@@ -655,15 +950,18 @@ pub(crate) fn hex_value(digits: &[u8]) -> Option<u64> {
 }
 
 pub fn hex(bytes: &[u8; 32]) -> String {
+    String::from_utf8_lossy(&hex_digits(bytes)).into_owned()
+}
+
+/// A digest's 64 lowercase hex digits, where they are needed.
+fn hex_digits(bytes: &[u8; 32]) -> [u8; 64] {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::new();
-    for &b in bytes {
-        out.push(char::from(
+    let mut out = [0u8; 64];
+    for (pair, &b) in out.as_chunks_mut::<2>().0.iter_mut().zip(bytes) {
+        *pair = [
             HEX.get(usize::from(b >> 4)).copied().unwrap_or(b'0'),
-        ));
-        out.push(char::from(
             HEX.get(usize::from(b & 15)).copied().unwrap_or(b'0'),
-        ));
+        ];
     }
     out
 }
@@ -850,7 +1148,7 @@ mod tests {
             Err(AuthError::TooSkewed)
         );
         assert_eq!(
-            verify(&request, "us-east-1", now(), |_| None),
+            verify(&request, "us-east-1", now(), |_| None::<String>),
             Err(AuthError::UnknownKey)
         );
         assert!(matches!(

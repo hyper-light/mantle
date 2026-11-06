@@ -3,7 +3,10 @@
 //! is S3's error document, which names its code, its resource and the request; a reply whose
 //! outcome is unknown is `500 InternalError`, never a success or a refusal with no effect.
 
-use mantle_http::write::Length;
+use std::borrow::Cow;
+use std::io::Write as _;
+
+use mantle_http::write::{self, Length, WriteError};
 use mantle_s3::checksum::{Algorithm, Checksum, ChecksumType};
 use mantle_s3::list::{self as s3list, Paging};
 use mantle_s3::response::{self as s3, Entry, Failure};
@@ -18,13 +21,84 @@ const US_EAST_1: &str = "us-east-1";
 /// A response's head, and the document it carries.
 pub struct Response {
     pub status: u16,
-    pub fields: Vec<(&'static str, Vec<u8>)>,
+    pub fields: Fields,
     /// The body written with the head: a document, or nothing.
     pub document: Vec<u8>,
     /// What the head states of the body's length: the document's, or the object's that follows.
     pub length: Length,
     /// An object's bytes follow the head, as the host gives them.
     pub object: bool,
+}
+
+/// A response's field lines, written as they are named into a buffer its connection keeps across
+/// its requests and lends to each response (`conn::Connection::lines`): each line checked as
+/// `mantle_http::write::field` checks it, and the first refused kept, so the head is refused
+/// whole, as a list of fields checked before any was written would be.
+#[derive(Debug)]
+pub struct Fields {
+    lines: Vec<u8>,
+    refused: Option<WriteError>,
+}
+
+/// The longest value written from numbers: `bytes <first>-<last>/<size>`, three of u64's 20
+/// digits and its 8 other bytes.
+const DISPLAYED: usize = 3 * 20 + 8;
+
+impl Fields {
+    /// Fields written into `lines`, emptied first.
+    pub fn new(mut lines: Vec<u8>) -> Self {
+        lines.clear();
+        Self {
+            lines,
+            refused: None,
+        }
+    }
+
+    fn put(&mut self, name: &str, value: &[&[u8]]) {
+        if let Err(why) = write::field(&mut self.lines, name, value) {
+            self.refused.get_or_insert(why);
+        }
+    }
+
+    fn text(&mut self, name: &str, value: &[u8]) {
+        self.put(name, &[value]);
+    }
+
+    /// An ETag, in the double quotes a field carries it in (05 §5.1).
+    fn quoted(&mut self, name: &str, etag: &str) {
+        self.put(name, &[b"\"", etag.as_bytes(), b"\""]);
+    }
+
+    /// A value as it displays: a range's numbers, at most `DISPLAYED` bytes, written on the
+    /// stack and then as a field's.
+    fn display(&mut self, name: &str, value: impl std::fmt::Display) {
+        let mut text = [0u8; DISPLAYED];
+        let mut room = text.as_mut_slice();
+        if write!(room, "{value}").is_err() {
+            self.refused.get_or_insert(WriteError::Value);
+            return;
+        }
+        let len = DISPLAYED.saturating_sub(room.len());
+        self.put(name, &[text.get(..len).unwrap_or_default()]);
+    }
+
+    /// `Connection: close`, for a response after which the connection ends.
+    pub fn close(&mut self) {
+        self.text("Connection", b"close");
+    }
+
+    /// The lines written, or why one was refused.
+    pub fn lines(&self) -> Result<&[u8], WriteError> {
+        match self.refused {
+            Some(why) => Err(why),
+            None => Ok(&self.lines),
+        }
+    }
+
+    /// The buffer, for the connection's next response.
+    pub fn into_buffer(self) -> Vec<u8> {
+        self.lines
+    }
 }
 
 /// The reason phrase of each status the listener answers (RFC 9110 §15).
@@ -164,42 +238,70 @@ pub fn refusal(status: Status) -> Refused {
 }
 
 /// What every response names: the request, and the host that answered it (05 §11.1).
-pub struct Ids {
-    pub request: String,
-    pub host: String,
+pub struct Ids<'h> {
+    /// 16 hexadecimal digits, as S3's are.
+    pub request: [u8; 16],
+    pub host: &'h str,
 }
 
-impl Ids {
-    fn fields(&self, fields: &mut Vec<(&'static str, Vec<u8>)>) {
-        fields.push(("x-amz-request-id", self.request.clone().into_bytes()));
-        fields.push(("x-amz-id-2", self.host.clone().into_bytes()));
+impl Ids<'_> {
+    /// The request's id as text.
+    pub fn request(&self) -> &str {
+        std::str::from_utf8(&self.request).unwrap_or_default()
+    }
+
+    fn fields(&self, fields: &mut Fields) {
+        fields.text("x-amz-request-id", &self.request);
+        fields.text("x-amz-id-2", self.host.as_bytes());
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
             .and_then(|d| i64::try_from(d.as_secs()).ok())
-            .and_then(mantle_s3::time::http_date);
+            .and_then(mantle_s3::time::http_stamp);
         if let Some(date) = now {
-            fields.push(("Date", date.into_bytes()));
+            fields.text("Date", date.as_str().as_bytes());
+        }
+    }
+}
+
+/// The resource an error names, written only when an error names it.
+#[derive(Clone, Copy)]
+pub enum Resource<'a> {
+    Text(&'a str),
+    /// The bucket and key as the request's path names them.
+    Route(&'a Route),
+}
+
+impl Resource<'_> {
+    fn text(&self) -> Cow<'_, str> {
+        match self {
+            Self::Text(text) => Cow::Borrowed(text),
+            Self::Route(route) => Cow::Owned(resource(route)),
         }
     }
 }
 
 /// An error response: S3's `Error` document naming `resource`, none for a HEAD, whose response
 /// has no body (RFC 9110 §9.3.2).
-pub fn error(refused: &Refused, resource: &str, ids: &Ids, head: bool) -> Response {
-    let mut fields = Vec::new();
+pub fn error(
+    refused: &Refused,
+    resource: Resource<'_>,
+    ids: &Ids<'_>,
+    head: bool,
+    mut fields: Fields,
+) -> Response {
     ids.fields(&mut fields);
     let document = if head {
         Vec::new()
     } else {
-        fields.push(("Content-Type", b"application/xml".to_vec()));
+        fields.text("Content-Type", b"application/xml");
         s3::error(&Failure {
             code: refused.code,
             message: &refused.message,
-            resource: Some(resource),
+            resource: Some(&resource.text()),
             details: &[],
-            request_id: &ids.request,
-            host_id: &ids.host,
+            request_id: ids.request(),
+            host_id: ids.host,
         })
         .into_bytes()
     };
@@ -225,15 +327,22 @@ pub struct Echo<'a> {
     pub checksums: bool,
 }
 
-/// The response to the host's `reply`.
-pub fn reply(echo: &Echo<'_>, reply: &Reply, ids: &Ids) -> Result<Response, Refused> {
-    let resource = resource(echo.route);
+/// The response to the host's `reply`, its fields written into `fields`; a refusal of the reply
+/// itself, and the buffer back.
+pub fn reply(
+    echo: &Echo<'_>,
+    reply: Reply,
+    ids: &Ids<'_>,
+    mut fields: Fields,
+) -> Result<Response, (Refused, Fields)> {
+    let resource = Resource::Route(echo.route);
     match reply.status {
-        Status::Done => done(echo, reply, ids),
+        Status::Done => done(echo, reply, ids, fields),
         Status::NotModified => {
-            let mut fields = Vec::new();
             ids.fields(&mut fields);
-            object_facts(reply, &mut fields)?;
+            if let Err(why) = object_facts(&reply, &mut fields) {
+                return Err((why, fields));
+            }
             Ok(Response {
                 status: 304,
                 fields,
@@ -244,11 +353,10 @@ pub fn reply(echo: &Echo<'_>, reply: &Reply, ids: &Ids) -> Result<Response, Refu
         }
         // A key whose current version is a delete marker reads as none, saying so (05 §7.4).
         Status::NoSuchKey if reply.marker => {
-            let mut response = error(&refusal(Status::NoSuchKey), &resource, ids, echo.head);
-            response
-                .fields
-                .push(("x-amz-delete-marker", b"true".to_vec()));
-            version(reply, &mut response.fields);
+            let refused = refusal(Status::NoSuchKey);
+            let mut response = error(&refused, resource, ids, echo.head, fields);
+            response.fields.text("x-amz-delete-marker", b"true");
+            version(&reply, &mut response.fields);
             Ok(response)
         }
         // A read past S3's single GET: `EntityTooLarge` in its download form (05 §4.1, §11.2).
@@ -258,9 +366,9 @@ pub fn reply(echo: &Echo<'_>, reply: &Reply, ids: &Ids) -> Result<Response, Refu
                 405,
                 "Your proposed download exceeds the maximum allowed size",
             );
-            Ok(error(&refused, &resource, ids, echo.head))
+            Ok(error(&refused, resource, ids, echo.head, fields))
         }
-        status => Ok(error(&refusal(status), &resource, ids, echo.head)),
+        status => Ok(error(&refusal(status), resource, ids, echo.head, fields)),
     }
 }
 
@@ -278,7 +386,7 @@ fn internal(why: impl std::fmt::Display) -> Refused {
 }
 
 /// A response of `status` with no body.
-fn empty(status: u16, fields: Vec<(&'static str, Vec<u8>)>) -> Response {
+fn empty(status: u16, fields: Fields) -> Response {
     Response {
         status,
         fields,
@@ -293,8 +401,8 @@ fn empty(status: u16, fields: Vec<(&'static str, Vec<u8>)>) -> Response {
 }
 
 /// A response carrying `document`, S3's XML.
-fn document(mut fields: Vec<(&'static str, Vec<u8>)>, document: String) -> Response {
-    fields.push(("Content-Type", b"application/xml".to_vec()));
+fn document(mut fields: Fields, document: String) -> Response {
+    fields.text("Content-Type", b"application/xml");
     let document = document.into_bytes();
     Response {
         status: 200,
@@ -305,20 +413,49 @@ fn document(mut fields: Vec<(&'static str, Vec<u8>)>, document: String) -> Respo
     }
 }
 
-fn done(echo: &Echo<'_>, reply: &Reply, ids: &Ids) -> Result<Response, Refused> {
-    let mut fields = Vec::new();
+fn done(
+    echo: &Echo<'_>,
+    reply: Reply,
+    ids: &Ids<'_>,
+    mut fields: Fields,
+) -> Result<Response, (Refused, Fields)> {
     ids.fields(&mut fields);
+    match answered(echo, reply, &mut fields) {
+        Ok(Answered::Empty(status)) => Ok(empty(status, fields)),
+        Ok(Answered::Document(text)) => Ok(document(fields, text)),
+        Ok(Answered::Object(status, length)) => Ok(Response {
+            status,
+            fields,
+            document: Vec::new(),
+            length: Length::Known(length),
+            object: echo.route.operation == Operation::GetObject,
+        }),
+        Err(why) => Err((why, fields)),
+    }
+}
+
+/// What a done reply answers, its fields written.
+enum Answered {
+    Empty(u16),
+    Document(String),
+    /// An object's status and length, its bytes to follow on a GET.
+    Object(u16, u64),
+}
+
+fn answered(echo: &Echo<'_>, reply: Reply, fields: &mut Fields) -> Result<Answered, Refused> {
     let route = echo.route;
     let bucket = route.bucket.as_deref().unwrap_or_default();
     let key = route.key.as_deref().unwrap_or_default();
-    Ok(match route.operation {
+    let document = |text| Ok(Answered::Document(text));
+    let empty = |status| Ok(Answered::Empty(status));
+    match route.operation {
         Operation::CreateBucket => {
-            fields.push(("Location", format!("/{bucket}").into_bytes()));
-            empty(200, fields)
+            fields.put("Location", &[b"/", bucket.as_bytes()]);
+            empty(200)
         }
         Operation::HeadBucket => {
-            fields.push(("x-amz-bucket-region", echo.region.as_bytes().to_vec()));
-            empty(200, fields)
+            fields.text("x-amz-bucket-region", echo.region.as_bytes());
+            empty(200)
         }
         // us-east-1 is S3's empty constraint (13 §9.5).
         Operation::GetBucketLocation => {
@@ -327,34 +464,32 @@ fn done(echo: &Echo<'_>, reply: &Reply, ids: &Ids) -> Result<Response, Refused> 
             } else {
                 echo.region
             };
-            document(fields, s3::location_constraint(location))
+            document(s3::location_constraint(location))
         }
-        Operation::DeleteBucket | Operation::AbortMultipartUpload => empty(204, fields),
-        Operation::PutBucketVersioning => empty(200, fields),
-        Operation::GetBucketVersioning => {
-            document(fields, s3::versioning_configuration(reply.versioning))
-        }
-        Operation::ListBuckets => document(fields, list_buckets(echo, reply)?),
-        Operation::ListObjectsV2 => document(fields, list_objects(echo, reply)?),
+        Operation::DeleteBucket | Operation::AbortMultipartUpload => empty(204),
+        Operation::PutBucketVersioning => empty(200),
+        Operation::GetBucketVersioning => document(s3::versioning_configuration(reply.versioning)),
+        Operation::ListBuckets => document(list_buckets(echo, &reply)?),
+        Operation::ListObjectsV2 => document(list_objects(echo, reply)?),
         Operation::PutObject | Operation::UploadPart => {
-            fields.push(("ETag", quoted(&reply.etag)));
-            version(reply, &mut fields);
-            checksum(reply, &mut fields);
-            empty(200, fields)
+            fields.quoted("ETag", &reply.etag);
+            version(&reply, fields);
+            checksum(&reply, fields);
+            empty(200)
         }
         Operation::GetObject | Operation::HeadObject => {
-            object_facts(reply, &mut fields)?;
-            fields.push(("Accept-Ranges", b"bytes".to_vec()));
-            fields.push(("Content-Type", b"binary/octet-stream".to_vec()));
+            object_facts(&reply, fields)?;
+            fields.text("Accept-Ranges", b"bytes");
+            fields.text("Content-Type", b"binary/octet-stream");
             if echo.checksums && reply.range.is_none() {
-                checksum(reply, &mut fields);
+                checksum(&reply, fields);
             }
             let (status, length) = match reply.range {
                 Some((first, last)) => {
-                    fields.push((
+                    fields.display(
                         "Content-Range",
-                        format!("bytes {first}-{last}/{}", reply.size).into_bytes(),
-                    ));
+                        format_args!("bytes {first}-{last}/{}", reply.size),
+                    );
                     let length = last
                         .checked_sub(first)
                         .and_then(|n| n.checked_add(1))
@@ -363,27 +498,20 @@ fn done(echo: &Echo<'_>, reply: &Reply, ids: &Ids) -> Result<Response, Refused> 
                 }
                 None => (200, reply.size),
             };
-            Response {
-                status,
-                fields,
-                document: Vec::new(),
-                length: Length::Known(length),
-                object: route.operation == Operation::GetObject,
-            }
+            Ok(Answered::Object(status, length))
         }
         Operation::DeleteObject => {
             if reply.marker {
-                fields.push(("x-amz-delete-marker", b"true".to_vec()));
+                fields.text("x-amz-delete-marker", b"true");
             }
-            version(reply, &mut fields);
-            empty(204, fields)
+            version(&reply, fields);
+            empty(204)
         }
-        Operation::CreateMultipartUpload => document(
-            fields,
-            s3::initiate_multipart_upload(bucket, key, &reply.upload),
-        ),
+        Operation::CreateMultipartUpload => {
+            document(s3::initiate_multipart_upload(bucket, key, &reply.upload))
+        }
         Operation::CompleteMultipartUpload => {
-            version(reply, &mut fields);
+            version(&reply, fields);
             let value = reply.checksum.as_ref().and_then(checksum_value);
             let object_checksum = match (&reply.checksum, &value) {
                 (Some(kept), Some(value)) => {
@@ -399,42 +527,35 @@ fn done(echo: &Echo<'_>, reply: &Reply, ids: &Ids) -> Result<Response, Refused> 
                 "/{bucket}/{}",
                 mantle_s3::sigv4::uri_encode(key.as_bytes(), false)
             );
-            document(
-                fields,
-                s3::complete_multipart_upload(&s3::Completed {
-                    location: &location,
-                    bucket,
-                    key,
-                    etag: &reply.etag,
-                    checksum: object_checksum,
-                }),
-            )
+            document(s3::complete_multipart_upload(&s3::Completed {
+                location: &location,
+                bucket,
+                key,
+                etag: &reply.etag,
+                checksum: object_checksum,
+            }))
         }
-        Operation::ListParts => document(fields, list_parts(echo, reply)?),
-        Operation::ListMultipartUploads => document(fields, list_uploads(echo, reply)?),
-        other => return Err(internal(format!("a reply to {other:?}"))),
-    })
-}
-
-fn quoted(etag: &str) -> Vec<u8> {
-    format!("\"{etag}\"").into_bytes()
+        Operation::ListParts => document(list_parts(echo, &reply)?),
+        Operation::ListMultipartUploads => document(list_uploads(echo, &reply)?),
+        other => Err(internal(format!("a reply to {other:?}"))),
+    }
 }
 
 /// The version's id, where the bucket names versions: an unversioned bucket's are `null`, which
 /// S3 leaves unsaid.
-fn version(reply: &Reply, fields: &mut Vec<(&'static str, Vec<u8>)>) {
+fn version(reply: &Reply, fields: &mut Fields) {
     if !reply.version.is_empty() && reply.version != "null" {
-        fields.push(("x-amz-version-id", reply.version.clone().into_bytes()));
+        fields.text("x-amz-version-id", reply.version.as_bytes());
     }
 }
 
 /// An object's ETag, Last-Modified and version, as a read's response states them.
-fn object_facts(reply: &Reply, fields: &mut Vec<(&'static str, Vec<u8>)>) -> Result<(), Refused> {
-    fields.push(("ETag", quoted(&reply.etag)));
+fn object_facts(reply: &Reply, fields: &mut Fields) -> Result<(), Refused> {
+    fields.quoted("ETag", &reply.etag);
     let seconds = i64::try_from(reply.modified).map_err(|_| internal("a time past i64"))?;
     let modified =
-        mantle_s3::time::http_date(seconds).ok_or_else(|| internal("a time past 9999"))?;
-    fields.push(("Last-Modified", modified.into_bytes()));
+        mantle_s3::time::http_stamp(seconds).ok_or_else(|| internal("a time past 9999"))?;
+    fields.text("Last-Modified", modified.as_str().as_bytes());
     version(reply, fields);
     Ok(())
 }
@@ -463,7 +584,7 @@ fn checksum_value(kept: &Stored) -> Option<String> {
     })
 }
 
-fn checksum(reply: &Reply, fields: &mut Vec<(&'static str, Vec<u8>)>) {
+fn checksum(reply: &Reply, fields: &mut Fields) {
     let Some(kept) = &reply.checksum else {
         return;
     };
@@ -472,11 +593,8 @@ fn checksum(reply: &Reply, fields: &mut Vec<(&'static str, Vec<u8>)>) {
     else {
         return;
     };
-    fields.push((algorithm.header(), value.into_bytes()));
-    fields.push((
-        "x-amz-checksum-type",
-        kind(kept.parts).name().as_bytes().to_vec(),
-    ));
+    fields.text(algorithm.header(), value.as_bytes());
+    fields.text("x-amz-checksum-type", kind(kept.parts).name().as_bytes());
 }
 
 fn seconds(value: u64) -> Result<i64, Refused> {
@@ -487,19 +605,20 @@ fn time(e: s3::TimeOutOfRange) -> Refused {
     Refused::new(e.code().0, e.code().1, e.to_string())
 }
 
-fn list_objects(echo: &Echo<'_>, reply: &Reply) -> Result<String, Refused> {
-    let Some(Listing::Keys(page)) = &reply.listing else {
+fn list_objects(echo: &Echo<'_>, reply: Reply) -> Result<String, Refused> {
+    let Some(Listing::Keys(page)) = reply.listing else {
         return Err(internal("a listing reply without its page"));
     };
+    // The page's keys, tags and owners move into the document's page, not copied.
     let mut contents = Vec::with_capacity(page.contents.len());
-    for listed in &page.contents {
+    for listed in page.contents {
         contents.push((
-            listed.key.clone(),
+            listed.key,
             Entry {
                 modified: seconds(listed.modified)?,
-                etag: listed.etag.clone(),
+                etag: listed.etag,
                 size: listed.size,
-                owner: listed.owner.clone().unwrap_or_default(),
+                owner: listed.owner.unwrap_or_default(),
                 checksum: listed
                     .checksum
                     .map(|(algorithm, parts)| (algorithm, kind(parts))),
@@ -508,9 +627,9 @@ fn list_objects(echo: &Echo<'_>, reply: &Reply) -> Result<String, Refused> {
     }
     let listed = s3list::Page {
         contents,
-        common_prefixes: page.common_prefixes.clone(),
+        common_prefixes: page.common_prefixes,
         truncated: page.truncated,
-        next: page.next.clone(),
+        next: page.next,
     };
     let query = echo.query;
     let max_keys = s3list::max_keys(query.value("max-keys"))
@@ -680,10 +799,16 @@ mod tests {
             checksums: false,
         };
         let ids = Ids {
-            request: "request".into(),
-            host: "host".into(),
+            request: *b"0123456789ABCDEF",
+            host: "host",
         };
-        reply(&echo, &Reply::status(Status::EntityTooLarge), &ids).unwrap()
+        reply(
+            &echo,
+            Reply::status(Status::EntityTooLarge),
+            &ids,
+            Fields::new(Vec::new()),
+        )
+        .unwrap()
     }
 
     /// A read past S3's single GET is refused in `EntityTooLarge`'s download form, 405, and an

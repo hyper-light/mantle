@@ -598,6 +598,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/node/src/listener/mod.rs` `TASKS` | derived | `CONNECTIONS` plus `REFUSING`: the connection tasks the listener runs at once, each given a task, a timer for its wait on its client and a socket by the node's runtime (`crates/node/src/process.rs` `runtime`). |
 | `crates/node/src/listener/request.rs` `MAX_BODY` | derived | S3's largest object framed as `aws-chunked` in its least chunks, each behind its longest size line and its line ends, and a trailer section within a head's bound: the most a request's body may run to, the most a refused request's connection reads before it closes (research/72). |
 | `crates/node/src/listener/request.rs` `MAX_OBJECT` | external | 5 GiB, the largest object one PUT or part carries (`mantle_s3::body::MAX_UPLOAD`; research/05 §4.3). |
+| `crates/node/src/listener/respond.rs` `DISPLAYED` | derived | The longest field value written from numbers: `bytes <first>-<last>/<size>`, three u64s of 20 digits and 8 other bytes (RFC 9110 §14.4). |
 | `crates/node/src/node.rs` `LANE` | format | The one lane a peer's Raft frames take: the node runs its ranges on one shard (docs/design/node.md §3.2's lane a shard). |
 | `crates/node/src/node.rs` `LIVENESS_GROUP` | format | The log group of the liveness stream's own writes, the top of the group space: group 0 holds hyper-log's own key records, and a range named either is refused at open. |
 | `crates/node/src/node.rs` `MAX_HEAD` | derived | The longest head of a message the node sends or receives: the largest of a command's and its reply's, a chunk's put, get and reply, and an object's request and reply (`crates/protocol/src/object.rs` `MAX_HEAD`). |
@@ -759,11 +760,13 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/s3/src/seal.rs` `TAG` | external | GCM's full 128-bit tag, 16 bytes (NIST SP 800-38D §5.2.1.2). |
 | `crates/s3/src/seal.rs` `TAG_BYTES` | external | GCM's 16-byte tag as u64 (NIST SP 800-38D §5.2.1.2), a second copy of TAG. |
 | `crates/s3/src/seal.rs` `WRAPPED` | external | A 32-byte key plus one 8-byte semiblock under AES key wrap (NIST SP 800-38F §6.2). |
+| `crates/s3/src/sigv4.rs` `CHAIN_REST` | derived | What a chunk's string to sign adds to the lines every chunk shares: the previous signature, the empty string's hash and the chunk's, 64 hex digits each, and two line ends (05 §1.8). |
 | `crates/s3/src/sigv4.rs` `MAX_EXPIRES_SECS` | external | S3 developer guide, Using Query Parameters (05 §1.7): `X-Amz-Expires` runs 1 to 604,800 seconds. |
 | `crates/s3/src/sigv4.rs` `MAX_SKEW_SECS` | external | S3 developer guide, Authenticating Requests (05 §1.6): signed requests are valid within 15 minutes of their timestamp. |
 | `crates/s3/src/tagging.rs` `MAX_KEY` | external | AWS S3 tagging docs via 13 §6.7: a tag key is up to 128 Unicode characters, counted in UTF-16 units. |
 | `crates/s3/src/tagging.rs` `MAX_VALUE` | external | AWS S3 tagging docs via 13 §6.7: a tag value is up to 256 UTF-16 units. |
 | `crates/s3/src/time.rs` `SECONDS_PER_DAY` | derived | 86,400, the seconds in a day. |
+| `crates/s3/src/time.rs` `STAMP_BYTES` | derived | Room for the longest time written: an IMF-fixdate of a four-digit year, `Sun, 06 Nov 1994 08:49:37 GMT`, 29 bytes (RFC 9110 §5.6.7), the years held to 0000–9999. |
 
 ## Parameters that are not constants
 

@@ -130,7 +130,7 @@ pub enum Plan {
     /// A document of at most `limit` octets read whole, then the operation it makes.
     Document {
         limit: usize,
-        upload: Upload,
+        upload: Streamed,
         make: Make,
     },
 }
@@ -264,7 +264,7 @@ fn plan(
         }),
         Operation::CreateBucket if has_body(framing) => Ok(Plan::Document {
             limit: mantle_s3::body::CREATE_BUCKET_LIMIT,
-            upload: upload(parts, verified, framing)?.0.0,
+            upload: upload(parts, verified, framing)?.0,
             make: Make::CreateBucket {
                 bucket: bucket(route)?,
                 id,
@@ -283,7 +283,7 @@ fn plan(
         }),
         Operation::PutBucketVersioning => Ok(Plan::Document {
             limit: mantle_s3::body::VERSIONING_LIMIT,
-            upload: upload(parts, verified, framing)?.0.0,
+            upload: upload(parts, verified, framing)?.0,
             make: Make::Versioning {
                 bucket: bucket(route)?,
                 id,
@@ -357,7 +357,7 @@ fn plan(
         }
         Operation::CompleteMultipartUpload => Ok(Plan::Document {
             limit: mantle_s3::body::COMPLETE_LIMIT,
-            upload: upload(parts, verified, framing)?.0.0,
+            upload: upload(parts, verified, framing)?.0,
             make: Make::Complete {
                 bucket: bucket(route)?,
                 key: key(route)?,

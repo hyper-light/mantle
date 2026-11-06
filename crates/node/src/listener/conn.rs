@@ -27,7 +27,7 @@ use mantle_s3::route::Query;
 use super::Endpoint;
 use super::io::{Io, IoError};
 use super::request::{self, Parts, Plan, Refused, Streamed, Upload};
-use super::respond::{self, Echo, Ids, Response};
+use super::respond::{self, Echo, Fields, Ids, Resource, Response};
 use crate::door::{self, Answer, Piece, Submitter};
 use mantle_protocol::bounds;
 use mantle_protocol::object::{Op, Status};
@@ -120,8 +120,13 @@ enum Stopped {
 struct Connection {
     io: Io,
     input: Input,
-    /// The response being written: its head, and a document.
+    /// The response's head as written. Kept across the connection's requests: a head is its
+    /// status line, the fields `respond` writes, each at most a bucket's, key's or checksum's
+    /// bound, and its length's line.
     output: Vec<u8>,
+    /// The field lines of the response being made, lent to it and given back once its head is
+    /// written; kept across requests as `output` is.
+    lines: Vec<u8>,
     endpoint: &'static Endpoint,
     door: Submitter,
     admitted: Admitted,
@@ -143,6 +148,7 @@ pub(super) async fn serve(
             end: 0,
         },
         output: Vec::new(),
+        lines: Vec::new(),
         endpoint,
         door,
         admitted,
@@ -164,11 +170,20 @@ fn now() -> i64 {
 }
 
 /// A request's id: 16 hexadecimal digits from the OS's random source, as S3's are.
-fn request_id() -> String {
+fn request_id() -> [u8; 16] {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut drawn = [0u8; 8];
     // A draw that fails names the request by zeros: the id is for the client's report only.
     let _ = getrandom::fill(&mut drawn);
-    format!("{:016X}", u64::from_le_bytes(drawn))
+    let digits = u64::from_le_bytes(drawn).to_be_bytes();
+    let mut id = [0u8; 16];
+    for (pair, b) in id.as_chunks_mut::<2>().0.iter_mut().zip(digits) {
+        *pair = [
+            HEX.get(usize::from(b >> 4)).copied().unwrap_or(b'0'),
+            HEX.get(usize::from(b & 15)).copied().unwrap_or(b'0'),
+        ];
+    }
+    id
 }
 
 /// Whether the framing carries a body.
@@ -208,9 +223,15 @@ impl Connection {
                         Ok(None) => return Ended::Quiet,
                     },
                     Err(refusal) => {
-                        let ids = self.ids();
-                        let response = respond::error(&refused_head(refusal), "/", &ids, false);
-                        return match self.respond(&response, Version::Http11, true).await {
+                        let fields = self.fields();
+                        let response = respond::error(
+                            &refused_head(refusal),
+                            Resource::Text("/"),
+                            &self.ids(),
+                            false,
+                            fields,
+                        );
+                        return match self.respond(response, Version::Http11, true).await {
                             Ok(()) => Ended::Close,
                             Err(()) => Ended::Broken,
                         };
@@ -232,11 +253,16 @@ impl Connection {
         }
     }
 
-    fn ids(&self) -> Ids {
+    fn ids(&self) -> Ids<'static> {
         Ids {
             request: request_id(),
-            host: self.endpoint.host.clone(),
+            host: &self.endpoint.host,
         }
+    }
+
+    /// The kept buffer of field lines, lent to the next response.
+    fn fields(&mut self) -> Fields {
+        Fields::new(std::mem::take(&mut self.lines))
     }
 
     /// More of the client's octets as `fill` reads them, or `None` when it says nothing for a
@@ -261,13 +287,15 @@ impl Connection {
         let is_head = head.method(octets) == b"HEAD";
         let resource =
             Parts::of(head, octets).map_or_else(|_| "/".to_owned(), |p| p.path.to_owned());
+        let fields = self.fields();
         let response = respond::error(
             &respond::refusal(Status::SlowDown),
-            &resource,
+            Resource::Text(&resource),
             &ids,
             is_head,
+            fields,
         );
-        match self.respond(&response, head.version(), true).await {
+        match self.respond(response, head.version(), true).await {
             Ok(()) => Ended::Close,
             Err(()) => Ended::Broken,
         }
@@ -283,18 +311,23 @@ impl Connection {
             Ok(parts) => parts,
             Err(refused) => {
                 return self
-                    .refuse(&refused, "/", &ids, (version, is_head), has_body(framing))
+                    .refuse(
+                        &refused,
+                        Resource::Text("/"),
+                        &ids,
+                        (version, is_head),
+                        has_body(framing),
+                    )
                     .await;
             }
         };
         let asked = match request::ask(&parts, self.endpoint, now(), framing) {
             Ok(asked) => asked,
             Err(refused) => {
-                let resource = parts.path.to_owned();
                 return self
                     .refuse(
                         &refused,
-                        &resource,
+                        Resource::Text(parts.path),
                         &ids,
                         (version, is_head),
                         has_body(framing),
@@ -318,7 +351,7 @@ impl Connection {
                 .header("x-amz-checksum-mode")
                 .is_some_and(|m| m.eq_ignore_ascii_case("ENABLED")),
         };
-        let resource = respond::resource(&route);
+        let resource = Resource::Route(&route);
         let persists = head.persists();
         let continues = head.continues();
         let (op, body) = match plan {
@@ -335,7 +368,7 @@ impl Connection {
                     Ok(document) => document,
                     Err(Stopped::Refused(refused)) => {
                         return self
-                            .refuse(&refused, &resource, &ids, (version, is_head), true)
+                            .refuse(&refused, resource, &ids, (version, is_head), true)
                             .await;
                     }
                     Err(Stopped::Host | Stopped::Broken) => return Err(()),
@@ -344,7 +377,7 @@ impl Connection {
                     Ok(op) => (op, None),
                     Err(refused) => {
                         return self
-                            .refuse(&refused, &resource, &ids, (version, is_head), false)
+                            .refuse(&refused, resource, &ids, (version, is_head), false)
                             .await
                             .map(|persisted| persisted && persists);
                     }
@@ -356,7 +389,7 @@ impl Connection {
                 (op, principal.clone()),
                 body,
                 (framing, continues),
-                (&echo, &ids, &resource),
+                (&echo, &ids, resource),
                 (version, is_head),
             )
             .await?;
@@ -367,43 +400,58 @@ impl Connection {
     async fn refuse(
         &mut self,
         refused: &Refused,
-        resource: &str,
-        ids: &Ids,
+        resource: Resource<'_>,
+        ids: &Ids<'_>,
         (version, head): (Version, bool),
         unread: bool,
     ) -> Result<bool, ()> {
-        let response = respond::error(refused, resource, ids, head);
-        self.respond(&response, version, unread).await?;
+        let fields = self.fields();
+        let response = respond::error(refused, resource, ids, head, fields);
+        self.respond(response, version, unread).await?;
         Ok(!unread)
     }
 
-    /// Writes `response`'s head and document, `Connection: close` when `close`.
+    /// Writes `response`'s head and document, `Connection: close` when `close`, in one write.
     async fn respond(
         &mut self,
-        response: &Response,
+        response: Response,
         version: Version,
         close: bool,
     ) -> Result<(), ()> {
+        let length = response.length;
+        self.head(response.status, response.fields, version, close, length)?;
+        self.io
+            .write_pair(&self.output, &response.document)
+            .await
+            .map_err(|_| ())
+    }
+
+    /// Writes a response's head into `output`, its field lines' buffer kept for the next.
+    fn head(
+        &mut self,
+        status: u16,
+        mut fields: Fields,
+        version: Version,
+        close: bool,
+        length: Length,
+    ) -> Result<(), ()> {
         self.output.clear();
-        let mut fields: Vec<(&str, &[u8])> = response
-            .fields
-            .iter()
-            .map(|(name, value)| (*name, value.as_slice()))
-            .collect();
         if close {
-            fields.push(("Connection", b"close"));
+            fields.close();
         }
-        write::head(
-            &mut self.output,
-            version,
-            response.status,
-            respond::reason(response.status),
-            &fields,
-            response.length,
-        )
-        .map_err(|_| ())?;
-        self.output.extend_from_slice(&response.document);
-        self.io.write(&self.output).await.map_err(|_| ())
+        let written = fields.lines().map_err(|_| ()).and_then(|lines| {
+            write::head_lines(
+                &mut self.output,
+                version,
+                status,
+                respond::reason(status),
+                lines,
+                length,
+            )
+            .map_err(|_| ())
+        });
+        self.lines = fields.into_buffer();
+        written
     }
 
     /// Hands `op` to the host and answers what it replies: the body streamed when the host's
@@ -413,7 +461,7 @@ impl Connection {
         (op, principal): (Op, String),
         body: Option<Streamed>,
         (framing, continues): (Framing, bool),
-        (echo, ids, resource): (&Echo<'_>, &Ids, &str),
+        (echo, ids, resource): (&Echo<'_>, &Ids<'_>, Resource<'_>),
         (version, head): (Version, bool),
     ) -> Result<bool, ()> {
         let mut unread = has_body(framing) && body.is_some();
@@ -467,13 +515,23 @@ impl Connection {
                             .refuse(&why, resource, ids, (version, head), true)
                             .await;
                     }
-                    let response = match respond::reply(echo, &reply, ids) {
+                    let fields = self.fields();
+                    let response = match respond::reply(echo, *reply, ids, fields) {
                         Ok(response) => response,
-                        Err(why) => respond::error(&why, resource, ids, head),
+                        Err((why, fields)) => respond::error(&why, resource, ids, head, fields),
                     };
-                    self.respond(&response, version, unread).await?;
                     if response.object && !head {
-                        self.object(&mut replies, response.length).await?;
+                        // An object's head goes with its first bytes, in one write.
+                        let Response {
+                            status,
+                            fields,
+                            length,
+                            ..
+                        } = response;
+                        self.head(status, fields, version, unread, length)?;
+                        self.object(&mut replies, length).await?;
+                    } else {
+                        self.respond(response, version, unread).await?;
                     }
                     return Ok(!unread);
                 }
@@ -490,8 +548,9 @@ impl Connection {
     }
 
     /// A get's bytes, as the host gives them, until their end: `length` of them, as the head
-    /// said. A reply that fails or ends short ends the connection with the response unfinished,
-    /// so no client takes a short body for the object's (node.md §4.4).
+    /// in `output` said, which goes in one write with the first of them. A reply that fails or
+    /// ends short ends the connection with the response unfinished, so no client takes a short
+    /// body for the object's (node.md §4.4).
     async fn object(
         &mut self,
         replies: &mut hyper_rt::sync::ChannelReceiver<Answer>,
@@ -501,6 +560,7 @@ impl Connection {
             return Err(());
         };
         let mut sent = 0u64;
+        let mut head = true;
         loop {
             let answer = replies.recv().await;
             self.door.wake();
@@ -511,9 +571,20 @@ impl Connection {
                         .and_then(|n| sent.checked_add(n))
                         .filter(|sent| *sent <= length)
                         .ok_or(())?;
-                    self.io.write(&bytes).await.map_err(|_| ())?;
+                    let head_bytes: &[u8] = if head { &self.output } else { &[] };
+                    self.io
+                        .write_pair(head_bytes, &bytes)
+                        .await
+                        .map_err(|_| ())?;
+                    head = false;
                 }
-                Ok(Answer::End) if sent == length => return Ok(()),
+                Ok(Answer::End) if sent == length => {
+                    // An empty object's head goes alone.
+                    if head {
+                        self.io.write(&self.output).await.map_err(|_| ())?;
+                    }
+                    return Ok(());
+                }
                 _ => return Err(()),
             }
         }
@@ -542,13 +613,14 @@ impl Connection {
         }
     }
 
-    /// A body's octets as `upload` reads them: given to `out` as they are decoded.
+    /// The next run of a body's payload in `data`, as `upload` reads it, where it lies: the
+    /// octets of `data` taken, and the payload's span among them. A plain body's octets are all
+    /// payload; aws-chunked's are decoded in place, each chunk's signature checked as it ends.
     fn decode(
         upload: &mut Upload,
         data: &[u8],
         sha256: &mut Option<Hasher>,
-        out: &mut Vec<u8>,
-    ) -> Result<(), Refused> {
+    ) -> Result<(usize, std::ops::Range<usize>), Refused> {
         match upload {
             Upload::Plain(_) => {
                 if let Some(hasher) = sha256 {
@@ -556,11 +628,10 @@ impl Connection {
                         .update(data)
                         .map_err(|_| Refused::new("InternalError", 500, "a body's digest"))?;
                 }
-                out.extend_from_slice(data);
-                Ok(())
+                Ok((data.len(), 0..data.len()))
             }
             Upload::Chunked(decoder) => decoder
-                .feed(data, out)
+                .step(data)
                 .map_err(|e| Refused::new(e.code().0, e.code().1, e.to_string())),
         }
     }
@@ -641,29 +712,38 @@ impl Connection {
                 }
                 Err(other) => return Err(other),
             };
-            let mut out = Vec::new();
-            let data = self
-                .input
-                .unread()
-                .get(step.data.clone())
-                .unwrap_or_default();
-            if let Err(why) = Self::decode(&mut upload, data, &mut sha256, &mut out) {
-                self.door.wake();
-                let status = if why.status == 403 {
-                    Status::AccessDenied
-                } else {
-                    Status::BadDigest
+            // Each run of payload goes on as a piece of exactly its octets: one copy, out of the
+            // connection's buffer, which the next read reuses.
+            let mut at = step.data.start;
+            while at < step.data.end {
+                let data = self
+                    .input
+                    .unread()
+                    .get(at..step.data.end)
+                    .unwrap_or_default();
+                let (taken, payload) = match Self::decode(&mut upload, data, &mut sha256) {
+                    Ok(decoded) => decoded,
+                    Err(why) => {
+                        self.door.wake();
+                        let status = if why.status == 403 {
+                            Status::AccessDenied
+                        } else {
+                            Status::BadDigest
+                        };
+                        return refuse(why, status).await;
+                    }
                 };
-                return refuse(why, status).await;
+                at = at.saturating_add(taken);
+                let Some(payload) = data.get(payload).filter(|p| !p.is_empty()) else {
+                    continue;
+                };
+                let piece = Bytes::copy_from_slice(payload);
+                if pieces.send(Piece::Bytes(piece)).await.is_err() {
+                    return Err(Stopped::Host);
+                }
+                self.door.wake();
             }
             self.input.take(step.consumed);
-            if out.is_empty() {
-                continue;
-            }
-            if pieces.send(Piece::Bytes(Bytes::from(out))).await.is_err() {
-                return Err(Stopped::Host);
-            }
-            self.door.wake();
         }
         let end = Self::ended(upload, sha256);
         let piece = match &end {
@@ -684,21 +764,29 @@ impl Connection {
     async fn document(
         &mut self,
         framing: Framing,
-        mut upload: Upload,
+        (mut upload, length): Streamed,
         limit: usize,
     ) -> Result<Vec<u8>, Stopped> {
         let mut sha256 = Self::hasher(&upload)?;
         let mut body = http::Body::new(framing);
-        let mut document = Vec::new();
+        // The document's length is stated before it comes; one past the limit is refused as it
+        // passes it, so the buffer is made once, at the stated length within the limit.
+        let stated = usize::try_from(length).unwrap_or(usize::MAX);
+        let mut document = Vec::with_capacity(stated.min(limit));
         while !body.done() {
             let step = self.step(&mut body).await?;
-            let data = self
-                .input
-                .unread()
-                .get(step.data.clone())
-                .unwrap_or_default();
-            Self::decode(&mut upload, data, &mut sha256, &mut document)
-                .map_err(Stopped::Refused)?;
+            let mut at = step.data.start;
+            while at < step.data.end {
+                let data = self
+                    .input
+                    .unread()
+                    .get(at..step.data.end)
+                    .unwrap_or_default();
+                let (taken, payload) =
+                    Self::decode(&mut upload, data, &mut sha256).map_err(Stopped::Refused)?;
+                document.extend_from_slice(data.get(payload).unwrap_or_default());
+                at = at.saturating_add(taken);
+            }
             self.input.take(step.consumed);
             if document.len() > limit {
                 return Err(Stopped::Refused(Refused::new(

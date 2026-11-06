@@ -5,7 +5,7 @@
 //! the first read; the connection's configuration is its own and lent to each call that can
 //! advance the handshake.
 
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, IoSlice, Read as _, Write as _};
 
 use hyper_rt::RtError;
 use hyper_rt::tcp::{Shutdown, TcpStream};
@@ -139,6 +139,43 @@ impl Io {
                     let took = tls.connection.writer().write(rest).map_err(IoError::Io)?;
                     at = at.checked_add(took).ok_or(IoError::Stalled)?;
                     tls.flush().await?;
+                }
+                tls.flush().await
+            }
+        }
+    }
+
+    /// Writes all of `first` and then all of `second`, a response's head and its body, in as few
+    /// writes as the socket takes: one vectored write each time it is writable, so a head and the
+    /// body after it go out together, neither copied into the other. Under TLS both go into the
+    /// connection's records before they are flushed.
+    pub async fn write_pair(&mut self, first: &[u8], second: &[u8]) -> Result<(), IoError> {
+        match self {
+            Self::Plain(stream) => {
+                let (mut a, mut b) = (first, second);
+                while !a.is_empty() || !b.is_empty() {
+                    let slices = [IoSlice::new(a), IoSlice::new(b)];
+                    let n = stream
+                        .write_vectored(&slices)
+                        .await
+                        .map_err(IoError::Socket)?;
+                    if n == 0 {
+                        return Err(IoError::Stalled);
+                    }
+                    let of_a = n.min(a.len());
+                    a = a.get(of_a..).unwrap_or_default();
+                    b = b.get(n.saturating_sub(of_a)..).unwrap_or_default();
+                }
+                Ok(())
+            }
+            Self::Tls(tls) => {
+                for bytes in [first, second] {
+                    let mut at = 0usize;
+                    while let Some(rest) = bytes.get(at..).filter(|rest| !rest.is_empty()) {
+                        let took = tls.connection.writer().write(rest).map_err(IoError::Io)?;
+                        at = at.checked_add(took).ok_or(IoError::Stalled)?;
+                        tls.flush().await?;
+                    }
                 }
                 tls.flush().await
             }

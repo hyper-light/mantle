@@ -409,17 +409,21 @@ fn rolled_up<'k>(key: &'k str, prefix: &str, delimiter: Option<&str>) -> Option<
 
 /// The smallest byte string after `key`: `key` followed by a zero byte.
 pub fn just_after(key: &str) -> Vec<u8> {
-    let mut next = key.as_bytes().to_vec();
-    next.push(0);
+    and(key, 0)
+}
+
+/// `key`'s bytes and `last` after them, made at their length.
+fn and(key: &str, last: u8) -> Vec<u8> {
+    let mut next = Vec::with_capacity(key.len().saturating_add(1));
+    next.extend_from_slice(key.as_bytes());
+    next.push(last);
     next
 }
 
 /// No UTF-8 string contains the byte 0xFF, so `prefix` followed by it sorts after every key
 /// that starts with `prefix` and before every other key after them.
 pub fn beyond(prefix: &str) -> Vec<u8> {
-    let mut next = prefix.as_bytes().to_vec();
-    next.push(0xFF);
-    next
+    and(prefix, 0xFF)
 }
 
 /// A continuation token: opaque to clients, "not a real key" (05 §6.2). It names where the

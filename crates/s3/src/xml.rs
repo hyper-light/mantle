@@ -680,29 +680,55 @@ fn is_name_char(c: char) -> bool {
         || matches!(c, '-' | '.' | '0'..='9' | '\u{B7}' | '\u{300}'..='\u{36F}' | '\u{203F}'..='\u{2040}')
 }
 
-/// Writes one response document.
+/// Writes one response document, at its length: [`Writer::document`] runs the document's body
+/// once on a writer that only counts its bytes, then once into a buffer of exactly that many, so
+/// the document is allocated once and never grows.
 pub struct Writer {
     out: String,
+    /// The bytes written so far when the writer only counts.
+    counted: Option<usize>,
 }
 
 impl Writer {
     /// A document whose root element is `root`, in S3's namespace when `namespaced`, holding
-    /// what `body` writes.
-    pub fn document(root: &str, namespaced: bool, body: impl FnOnce(&mut Self)) -> String {
-        let mut writer = Self {
-            out: String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"),
+    /// what `body` writes. `body` runs twice, first to count, and writes the same both times.
+    pub fn document(root: &str, namespaced: bool, body: impl Fn(&mut Self)) -> String {
+        let mut count = Self {
+            out: String::new(),
+            counted: Some(0),
         };
-        writer.out.push('<');
-        writer.out.push_str(root);
-        if namespaced {
-            writer.out.push_str(" xmlns=\"");
-            writer.out.push_str(NAMESPACE);
-            writer.out.push('"');
-        }
-        writer.out.push('>');
-        body(&mut writer);
-        writer.end(root);
+        count.whole(root, namespaced, &body);
+        let mut writer = Self {
+            out: String::with_capacity(count.counted.unwrap_or_default()),
+            counted: None,
+        };
+        writer.whole(root, namespaced, &body);
         writer.out
+    }
+
+    fn whole(&mut self, root: &str, namespaced: bool, body: &impl Fn(&mut Self)) {
+        self.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        self.push_str("<");
+        self.push_str(root);
+        if namespaced {
+            self.push_str(" xmlns=\"");
+            self.push_str(NAMESPACE);
+            self.push_str("\"");
+        }
+        self.push_str(">");
+        body(self);
+        self.end(root);
+    }
+
+    fn push_str(&mut self, text: &str) {
+        match &mut self.counted {
+            Some(n) => *n = n.saturating_add(text.len()),
+            None => self.out.push_str(text),
+        }
+    }
+
+    fn push(&mut self, c: char) {
+        self.push_str(c.encode_utf8(&mut [0; 4]));
     }
 
     /// An element holding what `body` writes.
@@ -715,13 +741,13 @@ impl Writer {
     /// An element of the kind `xsi_type` names, holding what `body` writes, with `xsi`
     /// declared on it as AWS's samples declare it on an ACL grantee (13 §6.8).
     pub fn typed(&mut self, name: &str, xsi_type: &str, body: impl FnOnce(&mut Self)) {
-        self.out.push('<');
-        self.out.push_str(name);
-        self.out.push_str(" xmlns:xsi=\"");
-        self.out.push_str(XSI_NAMESPACE);
-        self.out.push_str("\" xsi:type=\"");
-        escape_attribute(&mut self.out, xsi_type);
-        self.out.push_str("\">");
+        self.push_str("<");
+        self.push_str(name);
+        self.push_str(" xmlns:xsi=\"");
+        self.push_str(XSI_NAMESPACE);
+        self.push_str("\" xsi:type=\"");
+        self.escape_attribute(xsi_type);
+        self.push_str("\">");
         body(self);
         self.end(name);
     }
@@ -729,59 +755,114 @@ impl Writer {
     /// An element holding `text`.
     pub fn text(&mut self, name: &str, text: &str) {
         self.start(name);
-        escape(&mut self.out, text);
+        self.escape(text);
+        self.end(name);
+    }
+
+    /// An element holding `text` in double quotes, as S3 writes an ETag.
+    pub fn quoted(&mut self, name: &str, text: &str) {
+        self.start(name);
+        self.push_str("\"");
+        self.escape(text);
+        self.push_str("\"");
+        self.end(name);
+    }
+
+    /// An element holding `value` as it displays, a number's digits written where they go.
+    pub fn display(&mut self, name: &str, value: impl std::fmt::Display) {
+        self.start(name);
+        // Writing into the document cannot fail, so neither can the formatting.
+        let _ = std::fmt::write(&mut Content(self), format_args!("{value}"));
         self.end(name);
     }
 
     /// Text in the element being written, as GetBucketLocation's root holds its region.
     pub fn content(&mut self, text: &str) {
-        escape(&mut self.out, text);
+        self.escape(text);
     }
 
     fn start(&mut self, name: &str) {
-        self.out.push('<');
-        self.out.push_str(name);
-        self.out.push('>');
+        self.push_str("<");
+        self.push_str(name);
+        self.push_str(">");
     }
 
     fn end(&mut self, name: &str) {
-        self.out.push_str("</");
-        self.out.push_str(name);
-        self.out.push('>');
+        self.push_str("</");
+        self.push_str(name);
+        self.push_str(">");
+    }
+
+    /// `text` as a double-quoted attribute value: `&`, `<` and `"` escaped as XML 1.0 [10]
+    /// requires, and white space as character references, which a reader would otherwise
+    /// normalize to spaces (§3.3.3).
+    fn escape_attribute(&mut self, text: &str) {
+        for c in text.chars() {
+            match c {
+                '&' => self.push_str("&amp;"),
+                '<' => self.push_str("&lt;"),
+                '"' => self.push_str("&quot;"),
+                '\t' => self.push_str("&#x9;"),
+                '\n' => self.push_str("&#xa;"),
+                '\r' => self.push_str("&#xd;"),
+                c if is_char(c) => self.push(c),
+                c => self.reference(c),
+            }
+        }
+    }
+
+    /// `text` as element content: `&` and `<` escaped as XML 1.0 §2.4 requires, `>` so that
+    /// `]]>` cannot form, and as character references a carriage return, which a reader would
+    /// turn into a line feed (§2.11), and each character XML 1.0 cannot carry, as S3 writes them
+    /// (13 §7).
+    fn escape(&mut self, text: &str) {
+        for c in text.chars() {
+            match c {
+                '&' => self.push_str("&amp;"),
+                '<' => self.push_str("&lt;"),
+                '>' => self.push_str("&gt;"),
+                '\r' => self.push_str("&#xd;"),
+                c if is_char(c) => self.push(c),
+                c => self.reference(c),
+            }
+        }
+    }
+
+    /// A character reference to `c` in lowercase hex: `&#x1b;`.
+    fn reference(&mut self, c: char) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut digits = [0u8; 8];
+        let mut at = digits.len();
+        let mut rest = u32::from(c);
+        for slot in digits.iter_mut().rev() {
+            *slot = HEX
+                .get(usize::try_from(rest & 15).unwrap_or_default())
+                .copied()
+                .unwrap_or(b'0');
+            at = at.saturating_sub(1);
+            rest = rest.checked_shr(4).unwrap_or_default();
+            if rest == 0 {
+                break;
+            }
+        }
+        self.push_str("&#x");
+        self.push_str(
+            digits
+                .get(at..)
+                .and_then(|d| std::str::from_utf8(d).ok())
+                .unwrap_or_default(),
+        );
+        self.push_str(";");
     }
 }
 
-/// `text` as a double-quoted attribute value: `&`, `<` and `"` escaped as XML 1.0 [10]
-/// requires, and white space as character references, which a reader would otherwise
-/// normalize to spaces (§3.3.3).
-fn escape_attribute(out: &mut String, text: &str) {
-    for c in text.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '"' => out.push_str("&quot;"),
-            '\t' => out.push_str("&#x9;"),
-            '\n' => out.push_str("&#xa;"),
-            '\r' => out.push_str("&#xd;"),
-            c if is_char(c) => out.push(c),
-            c => out.push_str(&format!("&#x{:x};", u32::from(c))),
-        }
-    }
-}
+/// The element being written, as `fmt` writes into it: its text escaped as content.
+struct Content<'w>(&'w mut Writer);
 
-/// `text` as element content: `&` and `<` escaped as XML 1.0 §2.4 requires, `>` so that `]]>`
-/// cannot form, and as character references a carriage return, which a reader would turn into
-/// a line feed (§2.11), and each character XML 1.0 cannot carry, as S3 writes them (13 §7).
-fn escape(out: &mut String, text: &str) {
-    for c in text.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '\r' => out.push_str("&#xd;"),
-            c if is_char(c) => out.push(c),
-            c => out.push_str(&format!("&#x{:x};", u32::from(c))),
-        }
+impl std::fmt::Write for Content<'_> {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        self.0.escape(text);
+        Ok(())
     }
 }
 

@@ -54,6 +54,49 @@ pub fn head(
     fields: &[(&str, &[u8])],
     length: Length,
 ) -> Result<(), WriteError> {
+    check_status(version, status, reason, length)?;
+    for (name, value) in fields {
+        check_field(name, &[value])?;
+    }
+    status_line(out, status, reason);
+    for (name, value) in fields {
+        put_field(out, name, &[value]);
+    }
+    end(out, length);
+    Ok(())
+}
+
+/// Writes a field line, `name: value`, into `lines`, the value given in pieces written one after
+/// another; nothing where the name is not a token or the value holds a control octet.
+pub fn field(lines: &mut Vec<u8>, name: &str, value: &[&[u8]]) -> Result<(), WriteError> {
+    check_field(name, value)?;
+    put_field(lines, name, value);
+    Ok(())
+}
+
+/// Writes a response's head around `lines`, field lines [`field`] wrote: its status line, them,
+/// the length's field, and the empty line that ends it.
+pub fn head_lines(
+    out: &mut Vec<u8>,
+    version: Version,
+    status: u16,
+    reason: &str,
+    lines: &[u8],
+    length: Length,
+) -> Result<(), WriteError> {
+    check_status(version, status, reason, length)?;
+    status_line(out, status, reason);
+    out.extend_from_slice(lines);
+    end(out, length);
+    Ok(())
+}
+
+fn check_status(
+    version: Version,
+    status: u16,
+    reason: &str,
+    length: Length,
+) -> Result<(), WriteError> {
     if !(100..=999).contains(&status) {
         return Err(WriteError::Status);
     }
@@ -67,25 +110,40 @@ pub fn head(
     if version == Version::Http10 && length == Length::Chunked {
         return Err(WriteError::Chunked);
     }
-    for (name, value) in fields {
-        if name.is_empty() || !name.bytes().all(tchar) {
-            return Err(WriteError::Name);
-        }
-        if !value.iter().all(|b| field_octet(*b)) {
-            return Err(WriteError::Value);
-        }
+    Ok(())
+}
+
+fn check_field(name: &str, value: &[&[u8]]) -> Result<(), WriteError> {
+    if name.is_empty() || !name.bytes().all(tchar) {
+        return Err(WriteError::Name);
     }
+    if !value
+        .iter()
+        .all(|piece| piece.iter().all(|b| field_octet(*b)))
+    {
+        return Err(WriteError::Value);
+    }
+    Ok(())
+}
+
+fn status_line(out: &mut Vec<u8>, status: u16, reason: &str) {
     out.extend_from_slice(b"HTTP/1.1 ");
     // A Vec's writes do not fail.
     let _ = write!(out, "{status} ");
     out.extend_from_slice(reason.as_bytes());
     out.extend_from_slice(b"\r\n");
-    for (name, value) in fields {
-        out.extend_from_slice(name.as_bytes());
-        out.extend_from_slice(b": ");
-        out.extend_from_slice(value);
-        out.extend_from_slice(b"\r\n");
+}
+
+fn put_field(out: &mut Vec<u8>, name: &str, value: &[&[u8]]) {
+    out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(b": ");
+    for piece in value {
+        out.extend_from_slice(piece);
     }
+    out.extend_from_slice(b"\r\n");
+}
+
+fn end(out: &mut Vec<u8>, length: Length) {
     match length {
         Length::None => {}
         Length::Known(n) => {
@@ -94,7 +152,6 @@ pub fn head(
         Length::Chunked => out.extend_from_slice(b"Transfer-Encoding: chunked\r\n"),
     }
     out.extend_from_slice(b"\r\n");
-    Ok(())
 }
 
 /// Writes the head of a chunk of `len` octets, which the caller sends after it with

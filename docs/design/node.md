@@ -916,6 +916,18 @@ taken ahead of its replica is kept in front of the store's next (`node::answers`
 takes its answers in the order the log gave them. The look costs one check of each range with a
 write out; a waker that named its range (hyper-durable's `Owner::woken`) would spare even that.
 
+A turn remakes nothing it keeps (research/80, step 5). The transport's events it takes, the
+replicas it drives with what each drive said, and the Raft messages they give each keep their
+storage across turns, emptied as they are handled, and the ranges' groups are looked up where the
+node keeps them; each was a buffer made and dropped every turn, busy or idle. A plane message a
+drain of the socket finds is taken where its datagram was opened, in the socket's receive buffer;
+the batch a turn's wait received is copied into one buffer the node keeps and taken after it, since
+the wait must end, and the stream hear of its end and of its own write, before any message is fed;
+each message was a `Vec` of its own. `mantle serve` writes a turn's lines (its links, ranges, log,
+movement, stop) into one buffer it keeps and says them with one write and one flush, where each was
+a `String` and a flush. A cell of three at rest allocated 477,128 times in ten simulated seconds
+and allocates 168,019 (`tests/turn_allocs.rs`).
+
 A shard drives every runnable range in one pass before any of their flushes completes, so
 their updates meet in one frame on each log, which is what audit §5.1 asks a scheduler to do.
 The shard holds a range's waiting commands and reads in the range's own queue and proposes
@@ -2190,7 +2202,11 @@ change are refused to another principal than its owner, S3's answer where no pol
 the policy itself is the listener's step (§4.2). A put reads its bucket's row and makes the `Put`
 driver over it, a data key drawn for the file and wrapped under the root key's current generation
 (encryption.md §2) and the scheme the durability model chooses for the cell's domains
-(`mantle_ec::durability::choose`).
+(`mantle_ec::durability::choose`), chosen once per change of the volume table's volumes or their
+domains and carried across the entries the root range applies otherwise (`host::scheme_over`;
+it ran at every entry, 2,448.5 allocations each time, research/80 step 5). A put's chunks go to
+their volumes as one buffer the driver sealed, shared by every copy, the node's own volume
+writing from it as a peer's exchange sends from it.
 
 A multipart upload's create and abort read the bucket's row and ask the Name range's
 `CreateUpload` or `Abort`, the upload's ID its initiation time in the version-ID alphabet, so a

@@ -26,7 +26,7 @@ mod head;
 pub mod write;
 
 pub use body::{Body, Step};
-pub use head::{Framing, Head, Span, Version, parse};
+pub use head::{Fields, Framing, Head, Span, Version, parse};
 
 /// A request's head at most, its request line and field lines with their line ends and the empty
 /// line that ends it: S3's "request header and query parameters" bound, 8 KB (research/05 §10.2,

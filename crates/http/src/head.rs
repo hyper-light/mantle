@@ -1,7 +1,8 @@
 //! A request's head (RFC 9112 §2–§3, §5–§6; RFC 9110 §5): parsed where it lies in its caller's
 //! buffer, as spans of it, with what the head decides of the request judged once: how its body is
 //! framed, whether it expects `100 Continue`, its host, and whether the connection persists past
-//! its response.
+//! its response. Its field lines are kept where they lie too, as the span of the field section and
+//! their count, and read from it as they are asked for, so a head is parsed with no allocation.
 //!
 //! The grammar is held strictly where leniency smuggles (research/70): one SP between the request
 //! line's three parts, no whitespace in its target or before a field's colon, no line after the
@@ -62,8 +63,11 @@ pub struct Head {
     /// authority.
     origin: Span,
     version: Version,
-    /// Each field line's name and value, in order, the value bare of its whitespace.
-    fields: Vec<(Span, Span)>,
+    /// The field lines, from the first's start to the empty line that ends the head; each was
+    /// judged a field line when the head was parsed.
+    fields: Span,
+    /// How many field lines the section holds.
+    count: usize,
     /// The Host field's value, or an absolute-form target's authority (RFC 9112 §3.2.2).
     host: Option<Span>,
     framing: Framing,
@@ -103,19 +107,19 @@ impl Head {
         self.version
     }
 
-    /// Each field line's name and value, in order.
-    pub fn fields<'b>(&'b self, buf: &'b [u8]) -> impl Iterator<Item = (&'b [u8], &'b [u8])> + 'b {
-        self.fields
-            .iter()
-            .map(move |(name, value)| (name.of(buf), value.of(buf)))
+    /// Each field line's name and value, in order, the value bare of its whitespace.
+    pub fn fields<'b>(&self, buf: &'b [u8]) -> Fields<'b> {
+        Fields {
+            buf,
+            spans: Spans::of(self.fields, self.count),
+        }
     }
 
     /// The first field named `name`, case-insensitively (RFC 9110 §5.1).
     pub fn field<'b>(&self, buf: &'b [u8], name: &str) -> Option<&'b [u8]> {
-        self.fields
-            .iter()
-            .find(|(n, _)| n.of(buf).eq_ignore_ascii_case(name.as_bytes()))
-            .map(|(_, value)| value.of(buf))
+        self.fields(buf)
+            .find(|(n, _)| n.eq_ignore_ascii_case(name.as_bytes()))
+            .map(|(_, value)| value)
     }
 
     /// The request's host: its Host field's value, or an absolute-form target's authority.
@@ -136,6 +140,71 @@ impl Head {
     /// `Connection: close`, HTTP/1.0 only with `keep-alive`.
     pub fn persists(&self) -> bool {
         self.persists
+    }
+}
+
+/// A head's field lines, read where they lie: each one's name and value, the value bare of its
+/// whitespace. The section was judged line by line when the head was parsed, so reading it again
+/// finds each line's colon and trims its value, and judges nothing.
+#[derive(Debug, Clone)]
+pub struct Fields<'b> {
+    buf: &'b [u8],
+    spans: Spans,
+}
+
+impl<'b> Iterator for Fields<'b> {
+    type Item = (&'b [u8], &'b [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (name, value) = self.spans.next(self.buf)?;
+        Some((name.of(self.buf), value.of(self.buf)))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.spans.left, Some(self.spans.left))
+    }
+}
+
+impl ExactSizeIterator for Fields<'_> {}
+
+/// Where each field line of a judged section lies: its name's span and its value's, bare of its
+/// whitespace.
+#[derive(Debug, Clone)]
+struct Spans {
+    at: usize,
+    end: usize,
+    left: usize,
+}
+
+impl Spans {
+    fn of(section: Span, count: usize) -> Self {
+        Self {
+            at: section.start,
+            end: section.end,
+            left: count,
+        }
+    }
+
+    fn next(&mut self, buf: &[u8]) -> Option<(Span, Span)> {
+        let (found, next) = line(buf.get(..self.end)?, self.at)?;
+        self.at = next;
+        self.left = self.left.saturating_sub(1);
+        let bytes = found.of(buf);
+        let colon = memchr(b':', bytes)?;
+        let value = bytes.get(colon.saturating_add(1)..)?;
+        let first = value
+            .iter()
+            .position(|b| !matches!(b, b' ' | b'\t'))
+            .unwrap_or(value.len());
+        let last = value
+            .iter()
+            .rposition(|b| !matches!(b, b' ' | b'\t'))
+            .map_or(first, |p| p.saturating_add(1));
+        let start = colon.saturating_add(1);
+        Some((
+            found.within(0, colon),
+            found.within(start.saturating_add(first), start.saturating_add(last)),
+        ))
     }
 }
 
@@ -173,7 +242,7 @@ pub fn parse(buf: &[u8]) -> Result<Option<Head>, Refusal> {
         }
     };
     let (method, target, version) = request_line(bounded, request)?;
-    // The field lines counted to the head's end first, so their list is made once, at its size.
+    // The head's end found first: a head not yet whole is waited on, whatever its lines hold.
     let (mut count, mut end) = (0usize, at);
     loop {
         let Some((found, next)) = line(bounded, end) else {
@@ -189,14 +258,18 @@ pub fn parse(buf: &[u8]) -> Result<Option<Head>, Refusal> {
         }
         count = count.saturating_add(1);
     }
-    let mut fields = Vec::with_capacity(count);
+    let first = at;
     while let Some((found, next)) = line(bounded, at)
         && found.start != found.end
     {
-        fields.push(field_line(bounded, found)?);
+        field_line(bounded, found)?;
         at = next;
     }
-    judge(bounded, end, (method, target, version), fields)
+    let fields = Span {
+        start: first,
+        end: at,
+    };
+    judge(bounded, end, (method, target, version), (fields, count))
 }
 
 /// The request line's method, target and version.
@@ -231,10 +304,10 @@ fn request_line(buf: &[u8], line: Span) -> Result<(Span, Span, Version), Refusal
     Ok((method_span, line.within(start, end), version))
 }
 
-/// A field line's name and value, the value bare of its whitespace (RFC 9112 §5, §5.1).
-fn field_line(buf: &[u8], line: Span) -> Result<(Span, Span), Refusal> {
-    let (colon, first, last) = field(line.of(buf)).map_err(Refusal::Grammar)?;
-    Ok((line.within(0, colon), line.within(first, last)))
+/// Judges a field line (RFC 9112 §5, §5.1).
+fn field_line(buf: &[u8], line: Span) -> Result<(), Refusal> {
+    field(line.of(buf)).map_err(Refusal::Grammar)?;
+    Ok(())
 }
 
 /// Where a field line's colon is, and where its value begins and ends bare of its whitespace;
@@ -291,7 +364,7 @@ fn judge(
     buf: &[u8],
     len: usize,
     (method, target, version): (Span, Span, Version),
-    fields: Vec<(Span, Span)>,
+    (fields, count): (Span, usize),
 ) -> Result<Option<Head>, Refusal> {
     let mut host: Option<Span> = None;
     let mut hosts = 0usize;
@@ -301,11 +374,12 @@ fn judge(
     let mut codings = Codings::default();
     let mut continues = false;
     let (mut close, mut keep_alive) = (false, false);
-    for (name, value) in &fields {
+    let mut spans = Spans::of(fields, count);
+    while let Some((name, value)) = spans.next(buf) {
         let (name, bytes) = (name.of(buf), value.of(buf));
         if name.eq_ignore_ascii_case(b"host") {
             hosts = hosts.saturating_add(1);
-            host = Some(*value);
+            host = Some(value);
         } else if name.eq_ignore_ascii_case(b"content-length") {
             // A list of one repeated value is that value; any other is unrecoverable (RFC 9112
             // §6.3 item 5).
@@ -369,6 +443,7 @@ fn judge(
         origin,
         version,
         fields,
+        count,
         host,
         framing,
         // Ignored on HTTP/1.0, as RFC 9110 §10.1.1 requires, and without content to follow,

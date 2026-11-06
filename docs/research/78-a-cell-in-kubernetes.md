@@ -1,9 +1,11 @@
 # 78. A cell in Kubernetes: names, keys, readiness and termination
 
-Status: research note, 2026-11-03. For plan step 11 of the data layer (a container image and a
-Helm chart for mantle, proven in a kind cluster) and docs/design/kubernetes.md. Sources [1] to
-[6], [10] and [11] were read from the Kubernetes documentation on 2026-11-03, each quoted where it
-was read; [7] to [9] and [12] are mantle's own code, read at `9166554e`.
+Status: research note, 2026-11-03; readiness revised 2026-11-05. For plan step 11 of the data
+layer (a container image and a Helm chart for mantle, proven in a kind cluster) and
+docs/design/kubernetes.md. Sources [1] to [6], [10] and [11] were read from the Kubernetes
+documentation on 2026-11-03, each quoted where it was read; [7] to [9] and [12] are mantle's own
+code, read at `9166554e`; [13] to [15] were read on 2026-11-05 from the Linux man-pages, Microsoft's
+Win32 reference and Rust's standard library documentation.
 
 ## The question
 
@@ -90,6 +92,31 @@ considered "ready" even if the Pods themselves are not."
 took is refused `PutError::Unplaced`, answered `503 SlowDown`; a block's chunks go to distinct
 volumes, and a cell of three domains keeps a block's three copies on three nodes.
 
+[13] Linux man-pages, flock(2), https://man7.org/linux/man-pages/man2/flock.2.html. "Only one
+process may hold an exclusive lock for a given file at a given time." "A single file may not
+simultaneously have both shared and exclusive locks." "To make a nonblocking request, include
+LOCK_NB"; it fails `EWOULDBLOCK`: "The file is locked and the LOCK_NB flag was selected." "Locks
+created by flock() are associated with an open file description", and "the lock is released
+either by an explicit LOCK_UN operation on any of these duplicate file descriptors, or when all
+such file descriptors have been closed." macOS's flock(2) (this Mac's man page): "at no time are
+multiple exclusive, or both shared and exclusive, locks allowed simultaneously on a file."
+
+[14] Microsoft, "LockFileEx function (fileapi.h)",
+https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex.
+`LOCKFILE_EXCLUSIVE_LOCK`: "The function requests an exclusive lock. Otherwise, it requests a
+shared lock." `LOCKFILE_FAIL_IMMEDIATELY`: "The function returns immediately if it is unable to
+acquire the requested lock." "If a process terminates with a portion of a file locked or closes a
+file that has outstanding locks, the locks are unlocked by the operating system. However, the time
+it takes for the operating system to unlock these locks depends upon available system resources."
+
+[15] Rust standard library, `std::fs::File::try_lock` and `try_lock_shared` (stable since 1.89.0),
+https://doc.rust-lang.org/std/fs/struct.File.html. `try_lock_shared`: "Returns
+Err(TryLockError::WouldBlock) if a different lock is already held on this file (via another
+handle/descriptor)." "The lock will be released when this file (along with any other file
+descriptors/handles duplicated or inherited from it) is closed". They correspond "to the flock
+function on Unix" with `LOCK_EX` or `LOCK_SH` and `LOCK_NB`, "and the LockFileEx function on
+Windows" with `LOCKFILE_FAIL_IMMEDIATELY`, and `LOCKFILE_EXCLUSIVE_LOCK` for the exclusive one.
+
 ## What the sources settle
 
 **A founder is named by a Service of its own.** A pod's address is its own and goes with it [2],
@@ -130,9 +157,25 @@ distinct nodes, and the gateway refuses it `SlowDown` [12]: a harness that delet
 mid-transfer counts such puts unacknowledged, and judges the cell by every acknowledged object
 reading back exactly through every node once the pod's successor is ready.
 
-**Ready once enlisted.** A pod's readiness decides whether the cell's S3 Service sends it requests
-[4]. A node binds its listener before it has enlisted [7], so a bound port says nothing of whether
-it serves; the node's own word does: it is ready once this run has enlisted.
+**Ready while an enlisted process lives.** A pod's readiness decides whether the cell's S3 Service
+sends it requests [4]. A node binds its listener before it has enlisted [7], so a bound port says
+nothing of whether it serves; the node's own word does: it is ready once this run has enlisted. That
+word cannot be a record alone. The first readiness check compared a record of the run the root range
+last enlisted the node in with its run record, and a node killed by `SIGKILL` leaves both naming its
+last run until its successor raises the run, which it does only after it has recovered its volumes,
+stores and log: on a cell of three on this Mac's loopback (2026-11-05, `mantle-7d628026`), `mantle
+status` said a founder ready 57 ms after it was killed, and the puts asked of the cell in the next
+four seconds were refused `SlowDown`, as a cell short a founder refuses them [12]. A pod so judged
+is ready while its node recovers, and a disruption that waits for each successor to be ready before
+the next kill takes the next founder while the last is still away. The word is therefore a lock the
+living process holds: the node takes its readiness lock exclusively once its run has enlisted, and a
+check asks for it shared without waiting, which is refused while an exclusive lock is held [13, 14,
+15]. A process's locks are released as its descriptors close, which its end does however it ends
+[13, 15], so no record outlives the process it speaks for. Windows unlocks a terminated process's
+locks in a time that "depends upon available system resources" [14]; the start of a node killed and
+started again at once on the same directory, which takes its directory's lock the same way, finds it
+released on every CI target. A check's shared hold refuses the node's own take for that moment, so
+the node takes it again at its next turn rather than waiting.
 
 **Stopped within the grace.** SIGTERM begins the node's orderly stop, bounded by `stop_ms` [7],
 and the pod is killed at its grace [4]: the grace is stated above `stop_ms`.

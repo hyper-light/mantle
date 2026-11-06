@@ -614,28 +614,28 @@ separates the format choices fixed at format from the runtime choices, and it is
 when the device's identity, firmware, file system or topology no longer match it. On a laptop
 the key file and the data share a disk, which the node reports.
 
-*As built, and planned (2026-10-21; 2026-10-23).* The node's directory holds its metadata today:
-the shared log (`log`), its run record (`run`, §2.4 item 4), its readiness record (`enlisted`: the
-run in which the cell's root range last enlisted it, written under a temporary name and renamed
-as it says `enlisted`, unflushed since a crash only leaves the next run not ready until it enlists,
-which `mantle status` compares with its run; kubernetes.md §5) and each range's engine store
+*As built, and planned (2026-10-21; 2026-10-23).* The node's directory holds its metadata today: the
+shared log (`log`), its run record (`run`, §2.4 item 4), its readiness lock (`live`: taken
+exclusively as the cell's root range enlists the node in its run and held until the process ends,
+which releases it however it ends; `mantle status` asks for it shared without waiting, so a check
+finds it held only while an enlisted process lives; kubernetes.md §5) and each range's engine store
 (`range-GROUP.store`), and each volume's device directory holds `mantle/LOCK`, `mantle/volume` and,
 under `mantle serve`, `mantle/profile`: the depth, read bytes, read gap and first-write penalty its
 calibration measured, keyed by the identity facts that decide how the device performs (its model,
-medium and interconnect, its blocks and transfers, its queue, write cache, FUA, zones,
-removability and size, its file system's kind, block and size, and each member's), a hyper-block
-record written whole, flushed and checked by its CRC-32C on read; one of another key, another
-layout version or that does not read is measured again and replaced (`mantle_disk::profile`). The
-OS's names for devices, which a restart may change, are not in the key, and firmware is not yet,
-since no probe reads it. `mantle init` adds to the node's directory its `config`, `identity/` (the node's key and
+medium and interconnect, its blocks and transfers, its queue, write cache, FUA, zones, removability
+and size, its file system's kind, block and size, and each member's), a hyper-block record written
+whole, flushed and checked by its CRC-32C on read; one of another key, another layout version or
+that does not read is measured again and replaced (`mantle_disk::profile`). The OS's names for
+devices, which a restart may change, are not in the key, and firmware is not yet, since no probe
+reads it. `mantle init` adds to the node's directory its `config`, `identity/` (the node's key and
 certificate, the authority's certificate, each pinned peer's certificate under `peers/`, and the S3
 endpoint's key and certificate), `keys/` (one root-key file a generation, and `s3/`, the cell's
-access keys) and, for a cell of one, `calibration`, hyper-rt's record, which
-`mantle serve` and `mantle node` keep there too and take again while the machine's key matches it.
-The directory's own `LOCK`, held as the volumes' are, since its log and stores admit one process as
-a volume does, is taken at the start's locks step and held while the process runs (2026-10-24).
-`meta/` on a metadata device, `DEVICE` and `map` wait for the storage graph (§1.7 step 3) and the
-cell map (architecture §4).
+access keys) and, for a cell of one, `calibration`, hyper-rt's record, which `mantle serve` and
+`mantle node` keep there too and take again while the machine's key matches it. The directory's own
+`LOCK`, held as the volumes' are, since its log and stores admit one process as a volume does, is
+taken at the start's locks step and held while the process runs (2026-10-24). `meta/` on a metadata
+device, `DEVICE` and `map` wait for the storage graph (§1.7 step 3) and the cell map (architecture
+§4).
 
 ### 1.7 Starting, stopping, rolling back
 

@@ -9,17 +9,17 @@
 //! runs have stopped in order. Runs are numbered from one, so the runs before a start that did not
 //! stop in order, its crashes, are its last run less its stops (docs/design/node.md §2.4, item 7).
 
+use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 
 /// The run record's file in the node's directory.
 const RUN: &str = "run";
 /// The run record's bytes: one count.
 const RUN_BYTES: usize = 8;
-/// The readiness record's file: the run in which the cell's root range last enlisted the node, for
-/// a supervisor's readiness check (`mantle status`; research/78).
-const ENLISTED: &str = "enlisted";
-/// Where the readiness record is written before it is renamed over its place.
-const ENLISTED_NEXT: &str = "enlisted.next";
+/// The readiness lock's file: held exclusively by the node from the moment the cell's root range
+/// enlisted it in its run until its process ends, which releases the lock however it ends, for a
+/// supervisor's readiness check (`mantle status`; research/78 [13], [14], [15]).
+const LIVE: &str = "live";
 /// The stop record's file in the node's directory.
 const STOPPED: &str = "stopped";
 /// The stop record's bytes: the run that stopped, the node's time run then in nanoseconds, and its
@@ -46,6 +46,14 @@ pub enum LayoutError {
     MalformedStop(usize),
     #[error("the node's run count cannot rise past {0}")]
     Exhausted(u64),
+    #[error("the node's readiness lock: {0}")]
+    Live(std::io::Error),
+}
+
+/// The node's readiness lock, held: the cell's root range enlisted the node in this run, and the
+/// node lives. It is given up as the process ends, in order or not.
+pub struct Live {
+    _file: File,
 }
 
 /// The node's directory.
@@ -91,44 +99,42 @@ impl Layout {
         Ok(run)
     }
 
-    /// The run in which the cell's root range last enlisted the node, none before it first did.
-    pub fn enlisted(&self) -> Result<Option<u64>, LayoutError> {
-        let path = self.dir.join(ENLISTED);
-        match hyper_block::record::read(&path, RUN_BYTES)
-            .map_err(|e| LayoutError::Record(e.to_string()))?
-        {
-            None => Ok(None),
-            Some(bytes) => {
-                let count: [u8; RUN_BYTES] = bytes
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| LayoutError::Malformed(bytes.len()))?;
-                Ok(Some(u64::from_le_bytes(count)))
-            }
+    /// Takes the readiness lock, once the cell's root range enlisted the node in this run: none
+    /// while a readiness check holds it shared for the moment it looks ([`Layout::ready`]), so the
+    /// node takes it at a later turn. Only the node's process takes it, under the directory's own
+    /// lock, which refuses a second process.
+    pub fn take_live(&self) -> Result<Option<Live>, LayoutError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.dir.join(LIVE))
+            .map_err(LayoutError::Live)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Live { _file: file })),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(e)) => Err(LayoutError::Live(e)),
         }
     }
 
-    /// Keeps `run` as the run the cell's root range enlisted the node in: the record format's
-    /// bytes and CRC-32C (hyper-block `record`), written under a temporary name and renamed over its
-    /// place, so a reader finds the old record or the new one whole. It is not flushed, since a
-    /// node writes it while it serves and no shard waits on its device (node.md §1.3): lost to a
-    /// crash, the next run is not ready until it enlists, which it would not be anyway.
-    pub fn keep_enlisted(&self, run: u64) -> Result<(), LayoutError> {
-        let count = run.to_le_bytes();
-        let mut record = Vec::with_capacity(RUN_BYTES.saturating_add(4));
-        record.extend_from_slice(&count);
-        record.extend_from_slice(&mantle_crc::crc32c(&count).to_le_bytes());
-        let next = self.dir.join(ENLISTED_NEXT);
-        let kept = |e: std::io::Error| LayoutError::Record(e.to_string());
-        std::fs::write(&next, &record).map_err(kept)?;
-        std::fs::rename(&next, self.dir.join(ENLISTED)).map_err(kept)
-    }
-
-    /// Whether the node is ready to serve: the cell's root range enlisted it in its current run.
+    /// Whether the node is ready to serve: a living process of it holds the readiness lock, which
+    /// it takes once the cell's root range enlisted it in its current run. Asked shared and without
+    /// waiting, the lock is refused while the node holds it; granted, no process of the node is
+    /// enlisted, and it is given up at once. A process that ended holds nothing: its records say
+    /// nothing of whether one serves now, and a successor recovering its stores is not ready until
+    /// it enlists.
     pub fn ready(&self) -> Result<bool, LayoutError> {
-        Ok(
-            matches!((self.run()?, self.enlisted()?), (Some(run), Some(enlisted)) if run == enlisted),
-        )
+        let file = match File::open(self.dir.join(LIVE)) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(LayoutError::Live(e)),
+        };
+        match file.try_lock_shared() {
+            Ok(()) => Ok(false),
+            Err(TryLockError::WouldBlock) => Ok(true),
+            Err(TryLockError::Error(e)) => Err(LayoutError::Live(e)),
+        }
     }
 
     /// The run that last ended in an orderly stop, none before the first did.
@@ -219,6 +225,37 @@ mod tests {
         };
         layout.keep_stopped(later).unwrap();
         assert_eq!(layout.stopped().unwrap(), Some(later));
+    }
+
+    #[test]
+    fn a_node_is_ready_while_its_readiness_lock_is_held_and_not_once_it_is_given_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        assert!(
+            !layout.ready().unwrap(),
+            "no process of the node has enlisted"
+        );
+        let live = layout.take_live().unwrap().expect("no check holds it");
+        assert!(layout.ready().unwrap(), "held by the enlisted node");
+        // Asked as a second process would ask, it is refused while held.
+        assert!(layout.take_live().unwrap().is_none());
+        // Given up as the process ends, in order or not: the file stays and says nothing.
+        drop(live);
+        assert!(dir.path().join(LIVE).exists());
+        assert!(!layout.ready().unwrap(), "a node whose process ended");
+    }
+
+    #[test]
+    fn a_take_while_a_check_looks_is_refused_and_granted_once_it_has_looked() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        drop(layout.take_live().unwrap());
+        // A readiness check's shared hold, for the moment it looks.
+        let looking = File::open(dir.path().join(LIVE)).unwrap();
+        looking.try_lock_shared().unwrap();
+        assert!(layout.take_live().unwrap().is_none());
+        drop(looking);
+        assert!(layout.take_live().unwrap().is_some());
     }
 
     #[test]

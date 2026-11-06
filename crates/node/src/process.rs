@@ -128,7 +128,7 @@ use crate::ask::{CommandOutcome, Wait};
 use crate::derive::{Device, Formatted, Measured, Stated, VolumeFacts};
 use crate::directory::Peer;
 use crate::history;
-use crate::layout::{Layout, LayoutError, Stopped};
+use crate::layout::{Layout, LayoutError, Live, Stopped};
 use crate::node::{
     GatewaySettings, Hosted, Link, Node, NodeError, NodeSettings, Status, Step, Wall,
 };
@@ -1748,6 +1748,9 @@ async fn serve(
     // laws, not a deadline of the node's, decide when.
     // The node's statements of its history to the root range, once enlisted (node.md §2.4, item 7).
     let mut living = Living::default();
+    // Whether the root range enlisted the node in this run, and the readiness lock a supervisor's
+    // check asks for (`mantle status`), held from then until the process ends.
+    let (mut enlisted, mut live): (bool, Option<Live>) = (false, None);
     let mut enlisting = match &config.enlist {
         Some(e) => {
             let enlist = Command::Root(root::Command::Enlist(Enlist {
@@ -1866,8 +1869,10 @@ async fn serve(
             enlisting = None;
             match outcome {
                 CommandOutcome::Answered(Answer::Root(root::Outcome::Enlisted)) => {
-                    // A supervisor's readiness check reads this run's enlistment (`mantle status`).
-                    layout.keep_enlisted(run).map_err(kept)?;
+                    // Ready before it says so: a check asked once `enlisted` is said finds the
+                    // lock held.
+                    enlisted = true;
+                    live = layout.take_live().map_err(kept)?;
                     say(&mut output, "enlisted\n").await?;
                     if let Some(e) = &config.enlist {
                         living.state(&mut node, e.root, own, started_ns)?;
@@ -1875,6 +1880,11 @@ async fn serve(
                 }
                 other => return Err(ProcessError::Enlist(format!("{other:?}"))),
             }
+        }
+        // A readiness check holds the lock shared for the moment it looks: a take it refused is
+        // asked again at the next turn.
+        if enlisted && live.is_none() {
+            live = layout.take_live().map_err(kept)?;
         }
         if let Some(e) = &config.enlist {
             living.take(&mut node, e.root, own, started_ns)?;

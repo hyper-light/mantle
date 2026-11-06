@@ -63,7 +63,7 @@ remove.
 ## 4. Storage
 
 Each founder holds two claims from `volumeClaimTemplates`: `node` at `/var/lib/mantle`, its node
-directory (its configuration and keys, log, run and readiness records, calibration and ranges'
+directory (its configuration and keys, log, run record, readiness lock, calibration and ranges'
 stores), and `volume` at `/volume`, its chunk volume, two devices the node identifies and measures
 apart (node.md §1.4). The volume's bytes are its operator's statement at `mantle init`, which its
 claim holds at least: kind's local-path provisioner does not hold a claim to its size (research/78
@@ -71,11 +71,15 @@ Open), so the statement, not the claim, bounds the volume.
 
 ## 5. Readiness, resources and stopping
 
-A pod is ready once the node's own word says so: `mantle status DIR` exits 0 once the cell's root
-range enlisted the node in its current run, which the node keeps as its readiness record
-(`enlisted` beside its run record, written as it says `enlisted`, node.md §1.6) and 1 before. A
-bound port says nothing of whether a node serves, since its listener binds before it enlists.
-Readiness decides whether the S3 Service sends the pod requests (research/78 [4]).
+A pod is ready once the node's own word says so: `mantle status DIR` exits 0 while a living process
+of the node holds its readiness lock (`live`, node.md §1.6), which the node takes exclusively as
+the cell's root range enlists it in its run, before it says `enlisted`, and holds until it ends;
+the check asks for it shared without waiting, and exits 1 when it is granted. A process's locks
+end with it however it ends, so a node killed, its successor still recovering its stores, is not
+ready, where a record compared with the run record said a killed founder ready 57 ms after its
+`SIGKILL` (research/78, "Ready while an enlisted process lives"). A bound port says nothing of
+whether a node serves, since its listener binds before it enlists. Readiness decides whether the
+S3 Service sends the pod requests (research/78 [4]).
 
 Requests equal limits, so the pod is Guaranteed and its cgroup's `memory.max` is the memory the
 node derives its budgets within (node.md §1.4). The chart's 2 GiB holds a founder's floor with room

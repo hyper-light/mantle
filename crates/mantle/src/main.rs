@@ -114,8 +114,9 @@ enum Command {
         /// The node's configuration: the operator's keys only, one `key = value` a line.
         config: PathBuf,
     },
-    /// Whether the node whose directory is DIR is ready to serve: it exits 0 once the cell's root
-    /// range has enlisted the node in its current run, 1 before, as a supervisor's readiness check
+    /// Whether the node whose directory is DIR is ready to serve: it exits 0 while a living process
+    /// of the node holds the readiness lock it takes once the cell's root range enlisted it in its
+    /// run, 1 otherwise, before it enlists or once it has ended, as a supervisor's readiness check
     /// asks (docs/design/kubernetes.md).
     Status {
         /// The node's directory.
@@ -663,7 +664,7 @@ fn main() -> ExitCode {
         Command::Status { dir } => match mantle_node::layout::Layout::new(&dir).ready() {
             Ok(true) => writeln!(out, "ready").map_err(|e| e.to_string()),
             Ok(false) => Err(format!(
-                "{}: not enlisted in its current run",
+                "{}: no living process of the node is enlisted in its run",
                 dir.display()
             )),
             Err(e) => Err(e.to_string()),

@@ -239,6 +239,47 @@ fn a_cell_of_one_made_by_init_serves_from_what_init_wrote() {
     objects_round_trip(&mut cell, &[id], &|_| id);
 }
 
+/// A node is ready to its supervisor's check (`mantle status`, a pod's readiness probe) only while
+/// a living process of it is enlisted: ready once it says `enlisted`, not ready the moment it is
+/// killed, though its directory keeps the run it was enlisted in, and ready again once its
+/// successor enlists.
+#[test]
+fn status_is_ready_only_while_a_living_process_of_the_node_is_enlisted() {
+    let mut cell = Cell::made(|root| {
+        let data = root.join("data");
+        std::fs::create_dir(&data).unwrap();
+        vec![
+            "--node".into(),
+            format!(
+                "quic=127.0.0.1:0,plane=127.0.0.1:0,domain=laptop,volume={}:256M",
+                data.display()
+            ),
+            "--max-nodes".into(),
+            "1".into(),
+            "--max-volumes".into(),
+            "1".into(),
+        ]
+    });
+    let id = *cell.dirs.keys().next().unwrap();
+    let dir = cell.dirs[&id].clone();
+    let ready = |dir: &std::path::Path| {
+        let asked = Command::new(NODE).arg("status").arg(dir).output().unwrap();
+        assert!(
+            asked.status.code().is_some(),
+            "status ended {}",
+            asked.status
+        );
+        asked.status.success()
+    };
+    cell.enlisted(id);
+    assert!(ready(&dir), "node {id} said it enlisted");
+    cell.kill(id);
+    assert!(!ready(&dir), "node {id} killed: no process of it serves");
+    cell.start(id);
+    cell.enlisted(id);
+    assert!(ready(&dir), "node {id} started again and enlisted");
+}
+
 /// Waits until every node of `others` names one leader of `group`, one of them: a stopped node's
 /// range led on past its stop, by the voter it was handed to or one the others elected since, as
 /// Raft lets them once the stopping node is gone.

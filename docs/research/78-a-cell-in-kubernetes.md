@@ -222,7 +222,10 @@ another founder's pod was killed, a change kube-proxy syncs on, the likelier cau
 The founders of the other ids, which dial their peers from the new pod, were ready 7 s after their
 kills. A founder its peers dial is so out of reach once its pod is replaced until kube-proxy happens
 to sync, for as long as its peers keep dialing; the plane's datagrams take the same path. The
-founders are therefore reached at their pods' own names (above).
+founders are therefore reached at their pods' own names (above): in the KIND cell on 2026-11-06
+(main `aa5cbf62`) each founder's successor, the one its peers dial among them, was ready 3.6 to 7.8
+s after its kill, and the transfer harness's clients, made before the kills, found the new addresses
+by looking the names up again (docs/measurements/2026-11-04-kind-cell.md, run 5).
 
 **Stopped within the grace.** SIGTERM begins the node's orderly stop, bounded by `stop_ms` [7],
 and the pod is killed at its grace [4]: the grace is stated above `stop_ms`.

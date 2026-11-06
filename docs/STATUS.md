@@ -36,13 +36,16 @@ back through both:
   readiness lock (main `72511e15`, run 4) ([KIND](measurements/2026-11-04-kind-cell.md); below, "A
   cell on Kubernetes").
 
-Open: a founder its peers dial was out of reach for 3 min 7 s after its pod was replaced in the kind
-cluster, its peers' QUIC flows to its Service's cluster IP still translated to the killed pod
-([research/78](research/78-a-cell-in-kubernetes.md)); founders are now reached at their pods' own
-names under the headless Service, each looked up again when a link to it ends, which the KIND cell
-is yet to be measured on. The disruption's refusals "with every founder ready" were the readiness
-record a killed founder's directory kept: readiness is now the lock its living, enlisted process
-holds (main `72511e15`).
+Open: one test, `objects_round_trip_through_any_node_and_read_back_after_one_is_killed`
+(`crates/mantle/tests/node.rs`), failed once in the gates of `aa5cbf62` on this Mac at load ~70, its
+harness quiet 4.92 s after a kill with nothing moved, and passed twice after at load ~44: under load
+it is a defect, its stall not yet traced. A founder its peers dial was out of reach for 3 min 7 s
+after its pod was replaced in the kind cluster, its peers' QUIC flows to its Service's cluster IP
+still translated to the killed pod ([research/78](research/78-a-cell-in-kubernetes.md)); founders
+are now reached at their pods' own names, each looked up again by its peers and clients when they
+cannot reach it, and every successor was ready in under 8 s (main `aa5cbf62`, KIND run 5). The
+disruption's refusals "with every founder ready" were the readiness record a killed founder's
+directory kept: readiness is now the lock its living, enlisted process holds (main `72511e15`).
 
 `mantle disk probe` reports what the operating system knows about the device that holds a
 directory and, with `--measure`, benchmarks the device. It is built on:

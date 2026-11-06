@@ -178,7 +178,11 @@ part left out, and the Name range's Complete checks the parts again against its 
 refusing a size that is not their sum or an ETag that does not name their number
 (`Miscombined`), and commits (audit §16.5). The pages and the listed parts both ascend by
 number, so the completion matches them in one walk along each, not a search of the list for
-each row.
+each row. The list is built once and carried: the parts' ETags move from the request's list into
+the Complete, each checked equal to its row's, and the Complete is asked once with the list moved
+into it, where both were copied for up to 10,000 parts (research/80, step 7). The node asks every
+command a driver makes the same way, moved to its range once it has room for one more
+(`Node::command_room`), the request waiting whole for the next turn when it has not.
 
 A completion whose upload is gone asks the Name range for the version a completion of the
 same parts made, and gets it or `NoSuchUpload`, the error AWS gives for an upload that "might

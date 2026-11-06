@@ -132,6 +132,12 @@ literal one into a line feed (§2.11), and each character XML 1.0 cannot carry a
 reference, as S3 does (13 §7). A property test reads back exactly whatever text the writer
 was given.
 
+**A document is written at its length.** The writer runs a document's body twice, first on a
+writer that only counts the bytes it would write, then into a buffer of exactly that many, so a
+document is one allocation and never grows; its numbers, quoted ETags and times are written where
+they go, a page's times one list for the page, so a listing allocates nothing a key (research/80,
+step 6; `tests/allocations.rs`).
+
 ## 3. Listing
 
 A page is computed over an ordered index (`crates/s3/src/list.rs`). For keys the index

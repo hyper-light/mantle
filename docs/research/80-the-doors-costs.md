@@ -453,3 +453,186 @@ controls as failures (6cb5eb21: a native client held past its keep-alive is open
 and B after still exit 1, and B before had too, on SlowDown asked three times under the open
 loop's overload (native MPU-PART 8 MiB in both B runs; 157 asks again before, 161 after), which
 step 2's acceptance does not cover.
+
+## Step 6, after
+
+Step 6 cut the HTTP door's sites at their cause (commits e565b1d5 http, cc64cd66 s3 and node),
+every RFC 9112 verdict, refusal, signature and checksum kept and every byte on the wire as it was:
+
+- **The head** is parsed where it lies with no allocation: a head keeps the span of its field
+  section and its count of lines, each judged a field line when the head was parsed, and
+  `Head::fields` reads them from there. The verdicts are the same ones in the same order (the
+  head's end found first, every line judged, then its fields); the rule tests and the oracle
+  property tests pass unchanged.
+- **SigV4**: the canonical request is written into its SHA-256 as it is formed, its path and
+  query decoded and re-encoded byte by byte (a query's parameters sorted where they lie, one list
+  of them, only for a request with a query); the string to sign is one buffer at its length, and
+  a chunked body's chain keeps one, made at its bound (`CHAIN_REST`), for every chunk's and the
+  trailer's string.
+- **aws-chunked** is decoded in place (`Decoder::step`): each run of payload is a span of the
+  connection's buffer, its framing line held in an array of its own, every chunk's signature and
+  the trailing checksum checked as before. Each run goes to the host as a piece of exactly its
+  bytes, one copy, as a plain body's does; a document is read into one buffer at the length its
+  request stated within its limit.
+- **The response**: its field lines are written once, checked as written, into a buffer the
+  connection keeps; its head and its document, or a GET's head and its first bytes, go in one
+  vectored write (`Io::write_pair`). The request id, host id and Date are written where they go
+  (`time::Stamp`); an error's resource only when an error names it.
+- **XML** documents are made at their length (`xml::Writer::document` runs the body once to
+  count), their numbers, quoted ETags and times written in place.
+
+Not done, and why: a plain body's pieces are still copied once out of the connection's buffer,
+not handed on as slices of it. hyper-rt reads only into initialized memory, so a buffer shared
+with the host would have to be made, and zeroed for the read, for every piece it gave away: an
+allocation and a write of every byte per piece where the copy is one of each, so allocations per
+PUT would rise past the ledger's (reasoned from the code, not measured). TLS's records: the
+bench's cells serve plain HTTP on loopback and the ledger attributes no copy to hyper-tls's
+buffered API, so it is unchanged. JSON (bucket policies) has no site in the ledger and is
+unchanged.
+
+**Counted exactly, before and after** (each test red on the code before, run once against it):
+
+| site | test | before | after |
+|---|---|---:|---:|
+| a head parsed (codec), every head shape of the rule tests cut at every length, the 8 KiB head and one octet more, 256 mutated | `crates/http/tests/allocations.rs` `every_head_shape_is_parsed_with_no_allocation`, `a_mutated_head_is_parsed_with_no_allocation` | 1 allocation a head with a field | 0 |
+| SigV4, AWS's GetObject example verified | `crates/s3/tests/allocations.rs` `a_signature_is_checked_in_three_buffers` | 33 allocs, 20 reallocs | 3, 0 (signing key, string to sign, access key) |
+| aws-chunked, AWS's 66,560-byte, three-chunk example decoded and its signatures checked | same, `an_aws_chunked_body_is_decoded_in_place_with_no_allocation` | 11, 32 | 0, 0 |
+| a ListObjectsV2 document | same, `a_listings_document_allocates_nothing_a_key` | 7, 8 at 1 key | 2, 0 at 1, 10 and 1,000 keys |
+
+## Step 7, after
+
+Step 7 made the metadata's messages at their lengths (commits 20f64d90 codec, meta and range,
+77542df9 gateway and node, cc64cd66 for the listing's documents):
+
+- **`mantle_codec::encode`** runs a message's encoder once on a writer that only counts, then
+  into a buffer of exactly that length: every row value, entry and answer is one allocation and
+  never grows. A record inside an entry is written in place behind its length
+  (`record::put_record`), its CRC-32C over what it wrote, with no buffer of its own.
+- **Keys** are made at their lengths, computed from their parts; a key read back is unescaped
+  into one buffer at its length, and the Name layer's scans pass over the bucket they never read
+  (`key::decode_object_row`).
+- **The overlay** keeps the rows it is given, moved: `Rows::apply` takes an entry's writes by
+  value, and the first entry of a term adds its row to its batch instead of copying the batch.
+- **Range commands** go to their ranges moved once the node has room (`Node::command_room`);
+  without it the request waits whole, as before. A completion asks its Name command once, its list
+  of up to 10,000 parts moved into it, the parts' ETags moved from the request's list.
+- **The listing page**: the keys a scan passes are made and read at their lengths, the listener
+  moves a page's keys, ETags and owners into its document's page, and the document allocates
+  nothing a key.
+
+Not done: a listing still allocates per key in the range's scan (`Stored::next` copies each row
+it returns out of the engine's buffer, two a key), in the Name layer's decode of the version
+(its ETag and owner), in the page's own key and its positions, and on the gateway's decode of the
+page (`take_text`): writing the page straight into the reply needs the engine to lend a row and
+the page to be written into the reply as it is scanned, a change of `Rows` and of the native
+page's encoding this step did not make.
+
+**Golden vectors.** `tests/golden/{wire,record,object}.txt` hold the bytes the code before
+wrote of every range command (alone and together), every answer, one row of each kind and every
+native request and reply this suite builds: 216 vectors, generated from 44c6d21e; 0 bytes differ
+(`wire::tests::every_command_and_answer_is_its_golden_vector`,
+`record::tests::every_row_is_its_golden_vector`,
+`object::tests::every_request_and_reply_is_its_golden_vector`).
+
+| site | test | before | after |
+|---|---|---:|---:|
+| an entry of a put's File and Block commands (extents, referrer, block header, chunks) | `crates/meta/tests/encoding_allocs.rs` `an_entry_is_one_buffer_made_at_its_length` | 9 allocs, 27 reallocs | 1, 0 |
+| a file header, an extent, an answer | same, `a_row_and_an_answer_are_each_one_buffer` | file header 1, 4 | 1, 0 each |
+| 16 row keys, 3 key spans, a Name key read back | same, `a_key_is_one_buffer_made_at_its_length` | Name null key 1, 2 | 1, 0 each; spans 2, 0; read back 1, 0 |
+| an overlay given three puts and a delete | same, `an_overlay_keeps_its_rows_by_move` | 8, 0 | 1, 0 (its map's node) |
+| a cell of three serving its clients 40 ops each | `crates/node/tests/turn_allocs.rs` | 45,088–45,089 allocs, 6,372–6,377 reallocs | 41,182 in 7 of 7 runs, 2,303–2,307 |
+
+## Steps 6 and 7, measured
+
+**`mantle bench doors`, count-allocs release builds** (before 44c6d21e, after 77542df9), CPUs 0-7
+in a 16G scope. Run A: `--sizes 1,64K,8M --objects 4000 --ops 368 --clients 2 --load open:100`;
+run B: `--sizes 8M --objects 0 --ops 368 --bytes 3G --clients 2 --load open:20 --volume 40G`.
+Background subtracted as in step 5, the idle rate measured on one smoke cell for each build (60 s
+after 30 s of settling, servers summed): 840.6 allocations and 59,312 bytes a second before,
+642.9 and 42,901 after; reallocations are not subtracted. Servers per operation, before → after:
+
+| door | op | size (run, n) | allocs | reallocs | bytes | faults |
+|---|---|---|---:|---:|---:|---:|
+| http | PUT | 1B (A, n 368) | 1,307 → 1,189 | 493 → 75.5 | 364,741 → 259,674 | 1.8 → 1.5 |
+| http | PUT | 64KiB (A, n 368) | 1,670 → 1,414 | 497 → 79.8 | 867,550 → 801,816 | 4.9 → 5.2 |
+| http | PUT | 8MiB (B, n 368) | 31,153 → 32,947 | 726 → 112 | 73,836,174 → 76,577,902 | 5950.6 → 6189.6 |
+| http | PUT-STREAM | 1B (A, n 368) | 1,346 → 1,205 | 497 → 76.5 | 346,987 → 332,867 | 1.5 → 2.9 |
+| http | PUT-STREAM | 64KiB (A, n 368) | 1,721 → 1,429 | 499 → 77.5 | 917,388 → 807,621 | 5.7 → 2.0 |
+| http | PUT-STREAM | 8MiB (B, n 368) | 30,351 → 31,465 | 736 → 110 | 72,308,845 → 73,133,625 | 5802.5 → 6039.8 |
+| http | GET | 1B (A, n 368) | 280 → 242 | 73.4 → 9.3 | 40,290 → 41,093 | 0.0 → 0.1 |
+| http | GET | 64KiB (A, n 368) | 383 → 330 | 73.7 → 9.4 | 305,167 → 295,528 | 0.1 → 0.1 |
+| http | GET | 8MiB (B, n 368) | 9,114 → 9,603 | 101 → 27.8 | 40,017,847 → 36,916,798 | 5562.3 → 4455.3 |
+| http | GET-RANGE | 1B (A, n 368) | 283 → 244 | 73.7 → 9.4 | 36,000 → 40,111 | 0.0 → 0.1 |
+| http | GET-RANGE | 64KiB (A, n 368) | 378 → 333 | 74.9 → 9.5 | 293,114 → 303,705 | 0.1 → 0.0 |
+| http | GET-RANGE | 8MiB (B, n 368) | 3,423 → 3,433 | 77.6 → 17.7 | 12,715,197 → 13,497,189 | 1987.1 → 2117.4 |
+| http | HEAD | 1B (A, n 368) | 118 → 80.7 | 45.0 → 3.0 | 10,553 → 9,531 | 0.0 → 0.0 |
+| http | HEAD | 64KiB (A, n 368) | 118 → 79.8 | 45.1 → 3.0 | 10,583 → 7,015 | 0.0 → 0.0 |
+| http | HEAD | 8MiB (B, n 368) | 96.7 → 79.4 | 47.7 → 5.7 | 8,915 → 6,295 | 0.0 → 0.0 |
+| http | DELETE | 1B (A, n 368) | 385 → 346 | 131 → 25.3 | 51,464 → 31,012 | 0.1 → 0.1 |
+| http | DELETE | 64KiB (A, n 368) | 392 → 357 | 135 → 26.4 | 53,127 → 76,863 | 0.2 → 0.6 |
+| http | DELETE | 8MiB (B, n 368) | 354 → 328 | 143 → 25.9 | 37,457 → 33,080 | 0.2 → 0.0 |
+| http | MPU-CREATE | 1B (A, n 368) | 365 → 326 | 118 → 25.6 | 53,738 → 49,707 | 0.0 → 0.1 |
+| http | MPU-CREATE | 64KiB (A, n 368) | 378 → 334 | 118 → 25.9 | 61,412 → 35,690 | 0.1 → 0.1 |
+| http | MPU-CREATE | 8MiB (B, n 368) | 331 → 304 | 119 → 26.8 | 38,373 → 34,361 | 0.2 → 0.4 |
+| http | MPU-PART | 1B (A, n 368) | 1,304 → 1,127 | 468 → 77.4 | 323,262 → 252,251 | 3.5 → 2.1 |
+| http | MPU-PART | 64KiB (A, n 368) | 1,671 → 1,386 | 470 → 80.5 | 1,020,868 → 804,067 | 14.0 → 3.8 |
+| http | MPU-PART | 8MiB (B, n 368) | 33,408 → 32,273 | 699 → 115 | 76,204,867 → 74,570,048 | 4885.7 → 5891.7 |
+| http | MPU-LIST-PARTS | 1B (A, n 368) | 152 → 103 | 63.0 → 7.5 | 12,007 → 8,578 | 0.0 → 0.0 |
+| http | MPU-LIST-PARTS | 64KiB (A, n 368) | 152 → 103 | 62.1 → 7.5 | 17,623 → 8,621 | 0.0 → 0.0 |
+| http | MPU-LIST-PARTS | 8MiB (B, n 368) | 126 → 102 | 63.7 → 10.7 | 9,448 → 8,264 | 0.0 → 0.0 |
+| http | MPU-COMPLETE | 1B (A, n 184) | 1,035 → 906 | 400 → 70.3 | 111,879 → 91,858 | 0.2 → 0.1 |
+| http | MPU-COMPLETE | 64KiB (A, n 184) | 1,021 → 897 | 402 → 71.6 | 193,973 → 89,651 | 0.2 → 0.2 |
+| http | MPU-COMPLETE | 8MiB (B, n 184) | 955 → 870 | 408 → 76.7 | 94,202 → 120,034 | 0.2 → 0.6 |
+| http | MPU-ABORT | 1B (A, n 184) | 422 → 388 | 146 → 31.2 | 72,513 → 34,763 | 0.1 → 0.1 |
+| http | MPU-ABORT | 64KiB (A, n 184) | 423 → 383 | 151 → 32.8 | 53,658 → 48,393 | 0.0 → 0.1 |
+| http | MPU-ABORT | 8MiB (B, n 184) | 381 → 346 | 154 → 32.0 | 31,763 → 40,199 | 0.0 → 0.0 |
+| native | HEAD | 1B (A, n 368) | 76.8 → 76.1 | 13.0 → 5.0 | 20,973 → 12,816 | 0.0 → 0.0 |
+| native | HEAD | 64KiB (A, n 368) | 76.0 → 76.2 | 14.7 → 5.0 | 13,335 → 19,833 | 0.0 → 0.0 |
+| native | HEAD | 8MiB (B, n 368) | 52.0 → 76.8 | 15.1 → 7.0 | 12,332 → 26,963 | 0.2 → 0.0 |
+| native | DELETE | 1B (A, n 368) | 354 → 351 | 103 → 26.3 | 44,425 → 37,453 | 1.7 → 1.3 |
+| native | DELETE | 64KiB (A, n 368) | 357 → 361 | 114 → 26.2 | 48,833 → 46,936 | 0.3 → 0.3 |
+| native | DELETE | 8MiB (B, n 368) | 321 → 327 | 114 → 26.2 | 41,750 → 33,886 | 0.1 → 0.1 |
+| native | MPU-CREATE | 1B (A, n 368) | 314 → 308 | 88.3 → 27.8 | 72,853 → 30,931 | 1.0 → 0.3 |
+| native | MPU-CREATE | 64KiB (A, n 368) | 318 → 311 | 88.0 → 27.5 | 49,473 → 33,297 | 0.1 → 0.1 |
+| native | MPU-CREATE | 8MiB (B, n 368) | 283 → 288 | 88.1 → 28.1 | 37,503 → 30,530 | 0.4 → 0.4 |
+| native | MPU-PART | 1B (A, n 368) | 1,186 → 1,055 | 422 → 71.7 | 252,519 → 237,905 | 3.4 → 2.9 |
+| native | MPU-PART | 64KiB (A, n 368) | 1,736 → 1,389 | 427 → 76.0 | 936,377 → 812,710 | 8.5 → 3.9 |
+| native | MPU-PART | 8MiB (B, n 368) | 55,241 → 50,003 | 656 → 111 | 78,958,993 → 75,044,612 | 6064.3 → 6184.1 |
+| native | MPU-LIST-PARTS | 1B (A, n 368) | 83.3 → 82.6 | 21.1 → 7.5 | 17,357 → 11,950 | 0.0 → 0.0 |
+| native | MPU-LIST-PARTS | 64KiB (A, n 368) | 82.2 → 82.0 | 21.7 → 7.5 | 14,265 → 11,601 | 0.0 → 0.0 |
+| native | MPU-LIST-PARTS | 8MiB (B, n 368) | 59.4 → 82.1 | 21.9 → 10.0 | 23,259 → 25,190 | 0.0 → 0.0 |
+| native | MPU-COMPLETE | 1B (A, n 184) | 937 → 840 | 358 → 65.5 | 115,033 → 101,414 | 0.8 → 0.9 |
+| native | MPU-COMPLETE | 64KiB (A, n 184) | 913 → 865 | 364 → 65.0 | 109,717 → 83,993 | 0.5 → 0.3 |
+| native | MPU-COMPLETE | 8MiB (B, n 184) | 874 → 832 | 367 → 70.4 | 93,700 → 82,373 | 0.4 → 0.2 |
+| native | MPU-ABORT | 1B (A, n 184) | 355 → 344 | 111 → 29.2 | 39,126 → 31,248 | 0.4 → 0.3 |
+| native | MPU-ABORT | 64KiB (A, n 184) | 358 → 346 | 118 → 29.2 | 64,500 → 28,566 | 0.8 → 0.1 |
+| native | MPU-ABORT | 8MiB (B, n 184) | 325 → 334 | 117 → 29.2 | 53,833 → 40,824 | 0.2 → 0.3 |
+| http | LIST | page of 1,000 (A, n 5) | 18,170 → 10,894 | 8,883 → 17.8 | 1,406,161 → 644,632 | 79.2 → 61.0 |
+| native | LIST | page of 1,000 (A, n 5) | 14,160 → 10,934 | 5,638 → 18.8 | 1,222,883 → 712,184 | 31.8 → 21.6 |
+
+Every HTTP row's reallocations fall 77–99% (a HEAD 45 → 3, a GET 73 → 9, a PUT 493 → 76, a
+listing page 8,883 → 18); its allocations fall at 1 B and 64 KiB (a HEAD 118 → 81, a GET 280 →
+242, a PUT 1,307 → 1,189, a page of 1,000 keys 18,170 → 10,894). At 8 MiB a PUT's and a GET's
+allocations rose 6% and 5% in run B (31,153 → 32,947; 9,114 → 9,603), within the run-to-run
+spread of the per-datagram sites inside the cell that the ledger shows moving with timing (run A
+had them at 41,843 → 35,116 and 10,033 → 11,117); no stacks were taken to split them, and both
+stay below the ledger's (45,825 and 18,419). 0 reallocations per HTTP request is not reached
+through the cell: 3 to 115 a request remain, outside the door (the node's and hyper-quic's
+tables, the vendor sites step 5 left).
+
+**Latency** (ms, from intended start, open loop past capacity): http PUT 1 B p50/p99 11,006 /
+22,549 → 33,286 / 54,761 (A); GET 1 B 2.6 / 13.9 → 2.4 / 34.6 (A); PUT 8 MiB 44,023 / 68,720 →
+32,212 / 106,811 (B); GET 8 MiB 56.6 / 255.9 → 54.5 / 167.8 (B). The box ran other sessions' builds
+and tests through both runs (load average 37–41 on 32 CPUs, kswapd active), and writes queue in the
+generator, so no latency change is claimed either way; the servers' CPU a write fell (http PUT 1 B:
+user 9.0 → 8.8 ms, system 7.3 → 5.1 ms an operation, A).
+
+**Peak live heap** per request as the bench reads it is the servers' whole (an HTTP HEAD 72 KB →
+4.8 KB, an 8 MiB PUT 26.3 MB either side, B): the door's own bound (one 8 KB head, one body piece,
+one TLS record) is not what it measures, and no test isolates it.
+
+**The bench's exit.** Run A before ended exit 1, as step 5's runs did; A after exit 0. Both B runs
+exit 1 on the open loop's overload: one 8 MiB put asked SlowDown three times (http PUT after,
+http PUT-STREAM and native MPU-PART before) and the reads of its object failed after (404 or
+NoSuchKey; 4 failed of 7,362 after, 11 before); the six controls were caught in every run.
+

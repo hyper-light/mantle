@@ -1797,7 +1797,9 @@ into the listener's buffer. Its rules are research/70's:
 - A request's head, its request line and field lines through the empty line, is held to S3's
   8 KB (05 §10.2): past it `400 RequestHeaderSectionTooLarge`, or `414` for a request line not
   ended within it (RFC 9112 §3). It is the one buffer a connection holds for a head, and the
-  only memory the codec allocates for a request is its list of field lines, once, at its size.
+  codec allocates nothing for a request: a head keeps where its field section lies and how many
+  lines it holds, each judged when the head was parsed, and its fields are read from there as
+  they are asked for (research/80, step 6).
 - The grammar is strict where leniency smuggles: one SP between the request line's parts, no
   whitespace before a field's colon, no obs-fold, no control octet but HTAB in a value, each
   refused `400`; a line ends at CRLF or a lone LF; an HTTP/1.1 request has exactly one valid Host.
@@ -1819,7 +1821,8 @@ into the listener's buffer. Its rules are research/70's:
 *As built (2026-10-25).* The codec, `crates/http`: each rule above by a test of its own
 (`tests/rules.rs`), generated requests read back whole and in any pieces, mutated and arbitrary
 octets read or refused with a typed error and never a panic (`tests/properties.rs`), and its
-allocations counted exactly (`tests/allocations.rs`). `mantle bench http` measures it on one core
+allocations counted exactly (`tests/allocations.rs`: every head shape of the rule tests, cut at
+every length and mutated, parsed with none, since 2026-11-06). `mantle bench http` measures it on one core
 (measurements/2026-10-25-http-codec.md).
 
 *As built (2026-10-25), the listener* (`crates/node/src/listener`). `mantle serve` binds it where
@@ -1991,7 +1994,19 @@ the put's driver checks the object against before anything commits. The trailer'
 from its first byte; a body that states a checksum in a header and in a trailer is refused. A body that ends short of its
 length is `IncompleteBody`. A small document's body (CompleteMultipartUpload, PutBucketVersioning,
 CreateBucket's configuration) is read whole, within its `mantle_s3::body` bound, before its
-operation is made. The slow body's reclaim and the socket options above are open.
+operation is made, into one buffer at the length its request stated within that bound. The slow
+body's reclaim and the socket options above are open.
+
+*Since 2026-11-06 (research/80, step 6).* aws-chunked is decoded in place: `Decoder::step` gives
+each run of payload as a span of the connection's buffer, its framing line held in an array of its
+own, and each run goes to the host as a piece of exactly its bytes, one copy, as a plain body's
+do. The listener still copies each body octet once into its piece: its buffer is read into again
+as soon as a piece leaves, and a piece handed on as a slice of it would need a buffer made, and
+zeroed for the read, for every piece instead. SigV4's canonical request is hashed as it is formed,
+and its string to sign, and a chunked body's for every chunk, is one buffer at its length. A
+response's field lines are written once, checked as written, into a buffer the connection keeps
+across its requests, and its head and its document, or a GET's head and its first bytes, go in one
+vectored write.
 
 ### 4.4 Errors
 

@@ -15,7 +15,8 @@
 # with mantle-A1 as the harness, secnetperf and quinn-perf beside bare hyper-quic for QUIC.
 # Raw outputs go to DIR/raw, named box_CONDITION_ARM_rROUND; each case's data goes under WORK and
 # is removed after the case. Environment: CYCLES (Williams cycles, 1), FULL_CONDITIONS (the
-# conditions that run every size and both sets; the rest run LEAN_*), and the matrices below.
+# conditions that run every size and the set), MID_CONDITIONS (64 KiB, 8 MiB and the
+# set; the rest run LEAN_*), and the matrices below.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -28,30 +29,35 @@ WORK=/home/adalundhe/.cache/claude-scratch/doors/work
 CYCLES=${CYCLES:-1}
 
 CONDITIONS=(quiet busy1x busy2x cpu1 cpu2 memfloor)
-FULL_CONDITIONS=${FULL_CONDITIONS:-"quiet busy2x"}
+FULL_CONDITIONS=${FULL_CONDITIONS:-"quiet"}
+MID_CONDITIONS=${MID_CONDITIONS:-"busy2x"}
 S3_ARMS=(A1 A2 C garage seaweedfs rustfs)
 QUIC_ARMS=(secnetperf quinn hyperquic)
 
 # The node's memory floor, summed over the cell's three nodes: each node's `memory.floor.*` basis
-# lines as `mantle serve` says them on this box (objects 83513198, volumes 147172608, engines
-# 822800, ranges 268862970, log 225853540, transport 70796203, threads 85983232: 883004551 bytes
-# a node; crates/node/src/derive.rs `floor`, `say_floor`), read from a founder of a cell made as
-# `mantle bench doors` makes one (DIR/floor-probe-serve.out).
-FLOOR=$((3 * 883004551))
+# lines as `mantle serve` at 4711a46a says them on this box (objects 83513198, volumes 147172608,
+# engines 822800, ranges 267841530, log 225853540, transport 69725483, threads 27262976: 822192135
+# bytes a node; crates/node/src/derive.rs `floor`, `say_floor`), read from a founder of a cell made
+# as `mantle bench doors` makes one (DIR/floor-probe-serve.out).
+FLOOR=$((3 * 822192135))
 # The scope every other case runs in: the cell's three nodes and the harness, or a comparator and
 # the harness, well within the box's memory; QUIC's two endpoints.
 S3_MEMORY=24G
 QUIC_MEMORY=4G
 
-# The S3 matrix: the full one (every size, the 10,000 and 100,000 sets) under FULL_CONDITIONS,
-# the lean one under the rest. A sized phase asks OPS operations at most (a p99's 368, measurement
+# The S3 matrix: the full one (every size and the 10,000 set) under FULL_CONDITIONS, the mid one
+# under MID_CONDITIONS, the lean one under the rest. The 100,000 set is cut from the box's ten
+# hours: its puts and deletes run at the doors' write capacity here, about 20 a second through the
+# native door, over two hours a mantle case (the dimensioning pass, 2026-11-04). A sized phase asks OPS operations at most (a p99's 368, measurement
 # §5a) and STEP bytes; a set's phases ask every object of a door's half, 5,000 and 50,000.
-FULL_ARGS=${FULL_ARGS:-"--objects 10000,100000 --ops 368"}
-LEAN_ARGS=${LEAN_ARGS:-"--sizes 1,65536,8M --objects 10000 --ops 368"}
+FULL_ARGS=${FULL_ARGS:-"--objects 10000 --ops 368"}
+MID_ARGS=${MID_ARGS:-"--sizes 65536,8M --objects 10000 --ops 368"}
+LEAN_ARGS=${LEAN_ARGS:-"--sizes 65536,8M --objects 0 --ops 368"}
 LOAD_ARGS=${LOAD_ARGS:-"--load open:500 --clients 16"}
 # A case past its deadline is stopped (SIGINT, then SIGKILL) and reported failed.
-FULL_DEADLINE=${FULL_DEADLINE:-5400}
-LEAN_DEADLINE=${LEAN_DEADLINE:-1800}
+FULL_DEADLINE=${FULL_DEADLINE:-3600}
+MID_DEADLINE=${MID_DEADLINE:-2400}
+LEAN_DEADLINE=${LEAN_DEADLINE:-900}
 QUIC_DEADLINE=${QUIC_DEADLINE:-600}
 PORT=39500
 KEY=AKIAIOSFODNN7EXAMPLE
@@ -100,6 +106,7 @@ plan() {
         c=$(((i + cycle - 1) % ${#CONDITIONS[@]}))
         cond=${CONDITIONS[$c]}
         matrix=lean
+        [[ " $MID_CONDITIONS " == *" $cond "* ]] && matrix=mid
         [[ " $FULL_CONDITIONS " == *" $cond "* ]] && matrix=full
         row=${s3_rows[$(((i + (cycle - 1) * ${#CONDITIONS[@]}) % ${#s3_rows[@]}))]}
         for a in $row; do
@@ -196,7 +203,7 @@ endpoint_case() {
 }
 
 matrix_args() {
-  if [ "$1" = full ]; then echo "$FULL_ARGS"; else echo "$LEAN_ARGS"; fi
+  case $1 in full) echo "$FULL_ARGS" ;; mid) echo "$MID_ARGS" ;; *) echo "$LEAN_ARGS" ;; esac
 }
 
 # One QUIC comparator case, inside its scope: the server and its client on loopback, each size.
@@ -231,7 +238,7 @@ quic_case() {
       secnetperf:8MiB) set -- -upload:0 -download:8388608 ;;
       secnetperf:64MiB) set -- -upload:0 -download:67108864 ;;
       quinn:rr100) set -- --upload-size 100 --download-size 100 ;;
-      quinn:64KiB) set -- --upload-size 0 --download-size 64K ;;
+      quinn:64KiB) set -- --upload-size 0 --download-size 65536 ;;
       quinn:8MiB) set -- --upload-size 0 --download-size 8M ;;
       quinn:64MiB) set -- --upload-size 0 --download-size 64M ;;
     esac
@@ -270,7 +277,9 @@ run_case() {
   [ "$kind" = quic ] && memory=$QUIC_MEMORY
   [ "$cond" = memfloor ] && memory=$FLOOR
   deadline=$QUIC_DEADLINE
-  [ "$kind" = s3 ] && { if [ "$matrix" = full ]; then deadline=$FULL_DEADLINE; else deadline=$LEAN_DEADLINE; fi; }
+  if [ "$kind" = s3 ]; then
+    case $matrix in full) deadline=$FULL_DEADLINE ;; mid) deadline=$MID_DEADLINE ;; *) deadline=$LEAN_DEADLINE ;; esac
+  fi
   local free
   free=$(df -Pk /home | awk 'NR == 2 {print $4}')
   if [ "$kind" = s3 ] && [ "$free" -lt "$FREE_FLOOR_KIB" ]; then

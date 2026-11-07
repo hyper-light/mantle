@@ -144,8 +144,15 @@ pub fn probe_budget() -> Result<Duration, DeriveError> {
         .ok_or(DeriveError::Overflow("the probe budget"))
 }
 
-/// What a node that hosts objects runs its drivers with, at the floor: a window of one block;
-/// two operations at once, of any kind, so a put and a get; as many clients of the native protocol
+/// The operations a node that hosts objects runs at once: 8, the knee of the cell's write
+/// throughput measured on the box (research/80, step 9; 64 KiB native PUTs, an open loop past
+/// capacity, three clients an operation, n 300): 30, 39, 72, 79 and 93 a second at 2, 4, 8, 16 and
+/// 32, the doubling past 8 adding 10%, within the run-to-run band, and the one past 16 refused
+/// `SlowDown` for want of a slot. Each costs the objects' class its most bytes (`objects`).
+const OBJECTS: usize = 8;
+
+/// What a node that hosts objects runs its drivers with: a window of one block, the floor;
+/// [`OBJECTS`] operations at once, of any kind; as many clients of the native protocol
 /// admitted at once, each with an operation it may run; S3's quota of buckets; one row each step
 /// of a bucket's attempt passes or removes, the least that moves it; HDFS's handover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,7 +166,7 @@ pub struct Gateway {
 }
 
 pub fn gateway() -> Result<Gateway, DeriveError> {
-    let objects = 2;
+    let objects = OBJECTS;
     Ok(Gateway {
         window: 1,
         objects,
@@ -346,41 +353,74 @@ pub enum DeriveError {
 /// The range's settings and rules, which every member of the cell derives alike, from the
 /// identities the cell's configuration names and the metadata layer's own bounds alone:
 ///
-/// - an entry of the range's largest (`wire::largest_entry_bytes`) is what each append carries,
-///   what a leader holds uncommitted and what one drive applies, with one append out to each
-///   follower: the floor's `Ready`;
+/// - an entry of the range's largest (`wire::largest_entry_bytes`) is what each append carries and
+///   what one drive applies; a leader holds [`IN_FLIGHT`] of them uncommitted, with as many
+///   appends out to each follower, so a follower's next frame is on its way while its last is
+///   confirmed (raft-log.md §6) and its record confirms that one, where with one append out every
+///   frame waited for a confirmation of its own (research/80, step 9);
 /// - a session of each identity, for good: a registration ends its owner's last
 ///   (`mantle_meta::session::register`), so no session waits out a lifetime;
-/// - one command an entry, a session keeping its answer at the largest a node's command gets
-///   (`wire::largest_answer_bytes`) until the next entry acknowledges it;
+/// - as many commands an entry as the node runs operations, each with one command waiting on a
+///   range at a time ([`batch`]), so every command the node's operations wait on goes in its next
+///   entry and shares its flush (replica.md §1; research/80, step 9), where one command an entry
+///   made a range commit one command a Raft round; their answers kept until the next entry
+///   acknowledges them, within the row a session may write, which the largest row S3 admits sets,
+///   so the store's page does not grow for them, and at least one answer at its largest
+///   (`wire::largest_answer_bytes`) among them;
 /// - a row's key and value at most the longest key S3's names give a row
 ///   (`key::largest_bytes`) and the largest value a request S3 admits, or a session at its
 ///   bounds, gives one (`wire::largest_row_bytes`).
 pub fn cell(identities: u64) -> Result<(Settings, Rules), DeriveError> {
     let entry = u64::try_from(wire::largest_entry_bytes()?)
         .map_err(|_| DeriveError::Overflow("the largest entry"))?;
+    let in_flight =
+        u64::try_from(IN_FLIGHT).map_err(|_| DeriveError::Overflow("the appends out"))?;
     let settings = Settings {
         election_tick: ELECTION_TICK,
         heartbeat_tick: HEARTBEAT_TICK,
         max_size_per_msg: entry,
-        max_inflight_msgs: 1,
-        max_uncommitted_size: entry,
+        max_inflight_msgs: IN_FLIGHT,
+        max_uncommitted_size: entry
+            .checked_mul(in_flight)
+            .ok_or(DeriveError::Overflow("the uncommitted entries"))?,
         max_committed_size_per_ready: entry,
         max_entry_bytes: entry,
     };
-    let answer = wire::largest_answer_bytes()?;
-    let session = Session::row_bytes(1, answer).ok_or(DeriveError::Overflow("a session's row"))?;
+    let answers = batch()?;
+    let row = wire::largest_row_bytes()?;
+    let largest = wire::largest_answer_bytes()?;
+    // The answers' bytes are what the row holds past its own fields and each answer's.
+    let answer_bytes = Session::row_bytes(answers, 0)
+        .and_then(|fixed| row.checked_sub(fixed))
+        .filter(|&bytes| bytes >= largest)
+        .ok_or(DeriveError::Overflow("a session's answers within a row"))?;
     let rules = Rules {
         lifetime_ns: u64::MAX,
         max_sessions: identities,
-        max_answers: 1,
-        max_answer_bytes: answer,
+        max_answers: answers,
+        max_answer_bytes: answer_bytes,
         // Nothing expires by time: one is the least work an entry's expiry may do.
         expiries_per_entry: 1,
         max_key_bytes: key::largest_bytes(),
-        max_value_bytes: wire::largest_row_bytes()?.max(session),
+        max_value_bytes: row,
     };
     Ok((settings, rules))
+}
+
+/// Appends a leader keeps out to each follower, and entries uncommitted: two, so a follower's
+/// log has the next frame while it confirms the last, whose record confirms it (raft-log.md §6;
+/// measurements/2026-09-29-log-confirmation.md, finding 2). Derived from the log's one frame on the
+/// device and one queued behind it: a third waits for the second either way.
+pub const IN_FLIGHT: usize = 2;
+
+/// The commands one entry of a node's carries at most: one for each operation the node runs, each
+/// operation waiting on at most a window of blocks' commands of one range at once
+/// (`gateway.objects`, `gateway.window`).
+pub fn batch() -> Result<usize, DeriveError> {
+    let g = gateway()?;
+    g.objects
+        .checked_mul(g.window)
+        .ok_or(DeriveError::Overflow("an entry's commands"))
 }
 
 /// The message bounds every node of a cell states, which a client of its ranges states the same:
@@ -912,8 +952,10 @@ pub struct Formatted {
 /// - the standard layout, its superblocks 16 MiB apart beyond the reach of clustered latent
 ///   sector errors, or the compact one where the standard leaves fewer than two segments
 ///   (chunk-store.md §2);
-/// - batches of one record, a segment's room in bytes, and one fragment a chunk, as the node
-///   puts chunks whole;
+/// - batches of `requests` records, every chunk the cell's operations may write to the volume at
+///   once, so all of them share one flush (Helland et al., Tandem TR 88.1, §2; research/80, step
+///   9: batches of one record flushed each chunk alone), a segment's room in bytes, and one
+///   fragment a chunk, as the node puts chunks whole;
 /// - as many fragments as the index's bytes hold (`index::most_fragments`) and the volume holds
 ///   at a block each, the least a fragment takes standing for the chunk sizes research 11 §6.2
 ///   learns from, within what the log of a volume laid out already holds checkpoints of;
@@ -925,6 +967,7 @@ pub fn volume(
     profile: &Profile,
     index_bytes: u64,
     formatted: Option<&Formatted>,
+    requests: usize,
 ) -> Result<VolumeConfig, DeriveError> {
     let (block, checksum_shift, segment_size) = match formatted {
         Some(formatted) => (
@@ -955,7 +998,7 @@ pub fn volume(
         compact: false,
         scrub_period: Some(SCRUB),
         limits: Limits {
-            batch_requests: 1,
+            batch_requests: requests.max(1),
             batch_bytes,
             fragments_per_chunk: 1,
         },
@@ -1190,7 +1233,7 @@ fn layer_name(layer: Layer) -> &'static str {
 ///
 /// - the cell's settings and rules from its identities ([`cell`]), the log from the node
 ///   directory's device and the ranges ([`log`]);
-/// - the objects' floor, a window of one block and two operations, and their asks under the
+/// - the objects' floor, a window of one block and `OBJECTS` operations, and their asks under the
 ///   schemes a block may take in a cell of the volume table's nodes ([`gateway`], [`schemes`],
 ///   [`asks`], [`objects`]), for a node that names root keys;
 /// - each volume at its device's measured profile ([`volume`]), its index at first a fragment at
@@ -1270,6 +1313,11 @@ pub fn derive(
         .ok_or(overflow("the cell's identities"))?;
     let (settings, rules) = cell(identities)?;
     say_cell(&mut said, &settings, &rules);
+    // Every operation of every node may write a chunk to one volume at once: one batch holds them.
+    let chunk_requests = usize::try_from(identities)
+        .ok()
+        .and_then(|n| n.checked_mul(batch().ok()?))
+        .ok_or(overflow("a volume's batch"))?;
 
     // The objects a node with root keys hosts, at the floor.
     let hosts = !stated.keys.is_empty();
@@ -1339,6 +1387,7 @@ pub fn derive(
             &facts.profile,
             want,
             facts.formatted.as_ref(),
+            chunk_requests,
         )?;
         let geometry = match &facts.formatted {
             Some(formatted) => formatted.geometry,
@@ -1542,6 +1591,7 @@ pub fn derive(
             &facts.profile,
             index_bytes,
             facts.formatted.as_ref(),
+            chunk_requests,
         )?;
         say_volume(&mut said, n.saturating_add(1), facts, &config, index_bytes);
         volumes.push(VolumeSettings {
@@ -1862,13 +1912,14 @@ fn say_cell(said: &mut Said, settings: &Settings, rules: &Rules) {
         "range.max_inflight_msgs",
         settings.max_inflight_msgs,
         Kind::Derived,
-        "the floor's Ready: one append out to a follower (derive::cell)",
+        "two appends out to a follower, one confirmed while the next is written (derive::IN_FLIGHT, \
+         raft-log.md §6)",
     );
     said.add(
         "range.max_uncommitted_size",
         settings.max_uncommitted_size,
         Kind::Derived,
-        ready,
+        "an entry of the range's largest for each append out (derive::cell, derive::IN_FLIGHT)",
     );
     said.add(
         "range.max_committed_size_per_ready",
@@ -1894,13 +1945,15 @@ fn say_cell(said: &mut Said, settings: &Settings, rules: &Rules) {
         "rules.max_answers",
         rules.max_answers,
         Kind::Derived,
-        "one command an entry, its answer kept until the next entry acknowledges it",
+        "a command for each operation the node runs in an entry, their answers kept until the \
+         next entry acknowledges them (derive::batch)",
     );
     said.add(
         "rules.max_answer_bytes",
         rules.max_answer_bytes,
         Kind::Derived,
-        "the largest answer a node's command gets (mantle_meta::wire::largest_answer_bytes)",
+        "what a session's row holds of answers within the largest row S3 admits, past one answer \
+         at the largest a node's command gets (derive::cell)",
     );
     said.add(
         "rules.expiries_per_entry",
@@ -1940,11 +1993,11 @@ fn say_objects(
     );
     let (chunks, commands, reads) = if hosts {
         (
-            "the floor's two operations, each at its most chunks under the schemes a block may \
+            "the `OBJECTS` operations, each at its most chunks under the schemes a block may \
              take in a cell of the volume table's nodes (derive::asks)",
-            "a put of the largest body's commands for each of the two operations, and the node's \
+            "a put of the largest body's commands for each of the `OBJECTS` operations, and the node's \
              enlistment (derive::asks)",
-            "one read for each of the two operations (derive::asks)",
+            "one read for each of the `OBJECTS` operations (derive::asks)",
         )
     } else if enlists {
         (
@@ -1974,8 +2027,9 @@ fn say_objects(
     said.add(
         "gateway.objects",
         gateway.objects,
-        Kind::Derived,
-        "the floor: two operations at once of any kind, a put and a get (node.md §1.4)",
+        Kind::Measured,
+        "operations at once of any kind, the knee of the cell's write throughput measured on \
+         the box (derive::OBJECTS, research/80 step 9)",
     );
     said.add(
         "gateway.clients",
@@ -2072,7 +2126,7 @@ fn say_floor(
             Kind::Derived,
             match class {
                 Class::Objects => {
-                    "two operations of the largest blocks the schemes make (derive::objects)"
+                    "`OBJECTS` operations of the largest blocks the schemes make (derive::objects)"
                 }
                 Class::Volumes => "each volume's buffers (mantle_chunk::layout::most_bytes)",
                 Class::Engines => {
@@ -2362,7 +2416,16 @@ mod tests {
         let entry = u64::try_from(wire::largest_entry_bytes().unwrap()).unwrap();
         assert_eq!(settings.max_entry_bytes, entry);
         assert_eq!(settings.max_size_per_msg, entry);
-        assert_eq!(settings.max_inflight_msgs, 1);
+        assert_eq!(settings.max_inflight_msgs, IN_FLIGHT);
+        assert_eq!(settings.max_uncommitted_size, entry * 2);
+        assert_eq!(rules.max_answers, batch().unwrap());
+        assert!(rules.max_answers > 1);
+        // A session's row at its bounds is a row the range already admits, so no page grows.
+        assert_eq!(
+            rules.largest_session_row(),
+            wire::largest_row_bytes().unwrap()
+        );
+        assert!(rules.max_answer_bytes >= wire::largest_answer_bytes().unwrap());
         assert_eq!(rules.max_sessions, 7);
         assert!(rules.admit_sessions());
         assert!(rules.largest_session_row() <= rules.max_value_bytes);
@@ -2560,22 +2623,23 @@ mod tests {
         assert_eq!(schemes(widest + 10, &r, t).unwrap(), before);
     }
 
-    /// Two operations of the larger of a put and a get each: for one copy, a get's spans and the
+    /// `OBJECTS` operations of the larger of a put and a get each: for one copy, a get's spans and the
     /// other copy, the copy cut, the bytes opened and the host's block taken, past a put's
     /// segment, block filling, block going down, its copy sent and a piece of body; a code adds
     /// the coding library's tables once.
     #[test]
-    fn the_objects_hold_two_operations_of_their_largest_blocks() {
+    fn the_objects_hold_their_operations_of_their_largest_blocks() {
         let g = gateway().unwrap();
+        let n = u64::try_from(OBJECTS).unwrap();
         let sealed = mantle_gateway::layout::SEALED;
         let copies = durability::Scheme::Copies(1);
         let block = Layout::new(copies).unwrap().largest_block().unwrap();
-        assert_eq!(objects(&g, &[copies]).unwrap(), 2 * (5 * block + sealed));
+        assert_eq!(objects(&g, &[copies]).unwrap(), n * (5 * block + sealed));
         let coded = durability::Scheme::Rs(mantle_ec::Code::new(2, 1).unwrap());
         let both = objects(&g, &[copies, coded]).unwrap();
         let alone = objects(&g, &[coded]).unwrap();
         assert_eq!(both, alone);
-        assert!(alone > 2 * (5 * block + sealed) + mantle_ec::TABLE_BYTES);
+        assert!(alone > n * (5 * block + sealed) + mantle_ec::TABLE_BYTES);
     }
 
     /// The log derived takes a frame of the range's largest entry with its shell's bytes; a group
@@ -2590,7 +2654,9 @@ mod tests {
         assert_eq!(config.max_groups, 6);
         let (entries, bytes) = mantle_range::ready_held(&settings).unwrap();
         let least = u64::try_from(wire::least_entry_bytes().unwrap()).unwrap();
-        assert_eq!(entries, settings.max_entry_bytes * 2 / least + 1);
+        // The appends out and one entry past them (`mantle_range::ready_bytes`).
+        let held = u64::try_from(IN_FLIGHT + 1).unwrap();
+        assert_eq!(entries, settings.max_entry_bytes * held / least + 1);
         assert_eq!(config.group_entries, 3 * entries);
         assert_eq!(config.group_bytes, 3 * bytes);
         let retained = 6 * config.group_bytes
@@ -2619,7 +2685,7 @@ mod tests {
     fn a_volume_holds_a_chunk_a_segment_and_the_fragments_its_index_holds() {
         let align = Alignment::new(4096).unwrap();
         let chunk = mantle_gateway::layout::CHUNK;
-        let v = volume(align, 1 << 30, chunk, &PROFILE, 1 << 30, None).unwrap();
+        let v = volume(align, 1 << 30, chunk, &PROFILE, 1 << 30, None, 1).unwrap();
         assert_eq!(v.checksum_shift, 12);
         assert!(volume_layout::record_room(v.segment_size, 4096, 12) >= chunk);
         assert!(volume_layout::record_room(v.segment_size - 4096, 4096, 12) < chunk);
@@ -2628,27 +2694,40 @@ mod tests {
             (v.limits.batch_requests, v.limits.fragments_per_chunk),
             (1, 1)
         );
+        // A batch holds every chunk the cell's operations may write at once.
+        let cell = volume(
+            align,
+            1 << 30,
+            chunk,
+            &PROFILE,
+            1 << 30,
+            None,
+            3 * batch().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cell.limits.batch_requests, 3 * batch().unwrap());
+        Geometry::plan(1 << 30, align, &cell).unwrap();
         assert_eq!(v.max_fragments, (1 << 30) / 4096);
         assert_eq!(v.reads, Reads::measured(4, 1 << 20, 64 << 10));
         assert!(v.prewrite);
         Geometry::plan(1 << 30, align, &v).unwrap();
         let bytes = index::most_bytes(1000).unwrap();
-        let few = volume(align, 1 << 30, chunk, &PROFILE, bytes, None).unwrap();
+        let few = volume(align, 1 << 30, chunk, &PROFILE, bytes, None, 1).unwrap();
         assert_eq!(few.max_fragments, 1000);
         assert!(matches!(
-            volume(align, 1 << 30, chunk, &PROFILE, index::INDEX_BYTES, None),
+            volume(align, 1 << 30, chunk, &PROFILE, index::INDEX_BYTES, None, 1),
             Err(DeriveError::Index { .. })
         ));
-        let small = volume(align, 64 << 20, chunk, &PROFILE, 1 << 30, None).unwrap();
+        let small = volume(align, 64 << 20, chunk, &PROFILE, 1 << 30, None, 1).unwrap();
         assert!(small.compact);
         Geometry::plan(64 << 20, align, &small).unwrap();
         assert!(matches!(
-            volume(align, 16 << 20, chunk, &PROFILE, 1 << 30, None),
+            volume(align, 16 << 20, chunk, &PROFILE, 1 << 30, None, 1),
             Err(DeriveError::Volume(_))
         ));
         // Checksum blocks stop at CRC-32C's verified 16 KiB on a device of a larger unit.
         let wide = Alignment::new(64 << 10).unwrap();
-        let w = volume(wide, 1 << 30, chunk, &PROFILE, 1 << 30, None).unwrap();
+        let w = volume(wide, 1 << 30, chunk, &PROFILE, 1 << 30, None, 1).unwrap();
         assert_eq!(w.checksum_shift, 14);
         Geometry::plan(1 << 30, wide, &w).unwrap();
     }
@@ -2660,13 +2739,13 @@ mod tests {
         let align = Alignment::new(4096).unwrap();
         let chunk = mantle_gateway::layout::CHUNK;
         let bytes = index::most_bytes(1000).unwrap();
-        let first = volume(align, 8 << 30, chunk, &PROFILE, bytes, None).unwrap();
+        let first = volume(align, 8 << 30, chunk, &PROFILE, bytes, None, 1).unwrap();
         let formatted = Formatted {
             geometry: Geometry::plan(8 << 30, align, &first).unwrap(),
             checksum_shift: first.checksum_shift,
         };
         let wide = Alignment::new(64 << 10).unwrap();
-        let again = volume(wide, 8 << 30, chunk, &PROFILE, 1 << 30, Some(&formatted)).unwrap();
+        let again = volume(wide, 8 << 30, chunk, &PROFILE, 1 << 30, Some(&formatted), 1).unwrap();
         assert_eq!(
             (again.segment_size, again.checksum_shift),
             (first.segment_size, first.checksum_shift)
@@ -2680,7 +2759,16 @@ mod tests {
             ..again
         };
         assert!(formatted.geometry.holds(&one_more).is_err());
-        let fewer = volume(align, 8 << 30, chunk, &PROFILE, bytes / 2, Some(&formatted)).unwrap();
+        let fewer = volume(
+            align,
+            8 << 30,
+            chunk,
+            &PROFILE,
+            bytes / 2,
+            Some(&formatted),
+            1,
+        )
+        .unwrap();
         assert_eq!(fewer.max_fragments, index::most_fragments(bytes / 2));
     }
 
@@ -2800,7 +2888,7 @@ mod tests {
         let size = 1u64 << 30;
         let index = index_wants(align, size).unwrap();
         // At its want, a volume's index holds a fragment at each of its blocks.
-        let v = volume(align, size, chunk, &PROFILE, index, None).unwrap();
+        let v = volume(align, size, chunk, &PROFILE, index, None, 1).unwrap();
         assert_eq!(v.max_fragments, size / 4096);
         let (_, rules) = cell(3).unwrap();
         let full = engine(4096, 1 << 30, &rules).unwrap();
@@ -2809,7 +2897,7 @@ mod tests {
         let remaining = (wants[0] + wants[1]) / 3;
         let parts = shares(remaining, &wants).unwrap();
         assert!(parts[0] + parts[1] <= remaining);
-        let v = volume(align, size, chunk, &PROFILE, parts[0], None).unwrap();
+        let v = volume(align, size, chunk, &PROFILE, parts[0], None, 1).unwrap();
         assert_eq!(v.max_fragments, index::most_fragments(parts[0]));
         assert!(v.max_fragments < size / 4096);
         let e = engine_within(full, parts[1]).unwrap();
@@ -3241,6 +3329,7 @@ mod tests {
             &PROFILE,
             1 << 20,
             None,
+            1,
         )
         .unwrap();
         let wider = VolumeConfig {

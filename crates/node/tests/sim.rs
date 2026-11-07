@@ -27,7 +27,8 @@
 use hyper_block::sim::Fault as DeviceFault;
 use hyper_rt::sim::SimPath;
 use hyper_sim::rng::{Seeded, stream_seed};
-use mantle_meta::wire::Answer;
+use mantle_meta::name;
+use mantle_meta::wire::{Answer, Entry, Sessioned};
 
 #[allow(dead_code)]
 #[path = "support/cell.rs"]
@@ -40,7 +41,7 @@ mod linear;
 #[path = "../../range/tests/support/store.rs"]
 mod store;
 use cell::{CLIENT, CLIENTS, GROUP, PROFILES, Sim, log_config};
-use history::{Part, check_histories, registration};
+use history::{Part, check_histories, put, registration};
 
 /// The seeds run when `MANTLE_NODE_SIM_SEEDS` is not set: one cell of three and one of five, each
 /// run twice.
@@ -252,4 +253,105 @@ fn a_leader_deaf_before_it_judges_its_links_steps_down_and_the_others_elect_one_
     others_elect(&mut cell, leader, status.term);
     cell.deafen_plane(leader, false);
     cell.leader();
+}
+
+/// The commands an entry of puts carries, as a node's entry carries the commands its operations
+/// wait on (`mantle_node::derive::batch`): as many as the simulated range's entry of 1 KiB holds.
+const BATCH: u64 = 4;
+
+/// A batched entry is answered only once it is durable on a quorum (CLAUDE.md §6): a client asks
+/// an entry of [`BATCH`] puts, and while it is out every node's power is cut at once, its device
+/// keeping only what it made durable, at a moment the seed draws, from as the entry is sent to past
+/// its answer. Started again, the cell applies at least as far as it had when the client held its
+/// answer, and the entry asked again is answered the same versions from its session, applied once;
+/// where the cut came before the answer, the entry asked again is applied or answered, never lost
+/// halfway (each of its puts answered alike). Were a node to answer before its log's flush, or the
+/// leader before a quorum's, a cut at the answer would leave the cell short of it.
+#[test]
+fn a_batched_entry_is_answered_only_once_durable_and_a_power_cut_at_any_moment_keeps_it_whole() {
+    for seed in 1..=8u64 {
+        let mut cell = Sim::new(seed);
+        cell.leader();
+        cell.open_bucket();
+        let order: Vec<u64> = (1..=cell.nodes).collect();
+        let asking = cell.asking(CLIENT, &order);
+        let (registered, _) = cell.ask(&asking, GROUP, registration(CLIENT, 1, 1));
+        let session = match registered.as_deref() {
+            Ok([Answer::Registered { session }]) => *session,
+            other => panic!("seed {seed}: the registration answered {other:?}"),
+        };
+        let entry = Entry {
+            at_ns: 0,
+            commands: (1..=BATCH)
+                .map(|serial| Sessioned {
+                    session,
+                    serial,
+                    unanswered: 1,
+                    command: put(&format!("{serial}"), "e", u128::from(serial)),
+                })
+                .collect(),
+        };
+        asking
+            .try_send((GROUP, entry.clone()))
+            .map_err(|_| "the client's asks are full")
+            .unwrap();
+        // The cut's moment: up to a few of the LAN path's round trips past the send.
+        let mut draws = Seeded::new(stream_seed(seed, "cut", &[]));
+        cell.run_for(draws.below(4_000_000));
+        let answered = cell.asked.take();
+        let applied = cell
+            .members
+            .values()
+            .filter_map(|m| m.status.as_ref().map(|s| s.applied))
+            .max()
+            .unwrap();
+        for id in 1..=cell.nodes {
+            cell.crash(id);
+        }
+        for id in 1..=cell.nodes {
+            cell.restart(id);
+        }
+        cell.leader();
+        // The nodes listen anew; a second client of the test's, which knows where, asks again. An
+        // entry unanswered at the cut has no answer its first client holds.
+        let early = answered.is_some();
+        let first =
+            answered.map(|(answers, _)| answers.unwrap_or_else(|why| panic!("seed {seed}: {why}")));
+        drop(asking);
+        let asking = cell.asking(CLIENT + 1, &order);
+        if early {
+            // The answered entry's index is what a new leader's first entry commits again: every
+            // node applies through it, which a lost entry never lets it.
+            cell.until("every node applies through the answered entry", |c| {
+                c.members
+                    .values()
+                    .all(|m| m.status.as_ref().is_some_and(|s| s.applied >= applied))
+                    .then_some(())
+            });
+        }
+        // Asked again, the entry is applied once: answered from its session where it applied.
+        let (again, _) = cell.ask(&asking, GROUP, entry);
+        let again = again.unwrap_or_else(|why| panic!("seed {seed}: asked again: {why}"));
+        assert_eq!(
+            again.len(),
+            usize::try_from(BATCH).unwrap(),
+            "seed {seed}: {again:?}"
+        );
+        assert!(
+            again
+                .iter()
+                .all(|a| matches!(a, Answer::Name(name::Outcome::Put { .. }))),
+            "seed {seed}: asked again it answered {again:?}"
+        );
+        if let Some(first) = first {
+            assert_eq!(
+                first, again,
+                "seed {seed}: an answered entry was applied again"
+            );
+        }
+        assert!(
+            cell.members.values().all(|m| m.status.is_some()),
+            "seed {seed}: a node did not come back"
+        );
+    }
 }

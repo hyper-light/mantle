@@ -171,6 +171,9 @@ pub struct Options {
     pub endpoint: Option<Endpoint>,
     /// Count the servers' instructions and cycles a phase with `perf stat` ([`Perf`]).
     pub perf: bool,
+    /// The operations whose phases run; every one when empty. A phase reads the objects the
+    /// phases before it made, so a read or a delete is asked beside the put it reads.
+    pub kinds: Vec<Kind>,
 }
 
 /// An S3 server this program did not start (`--endpoint`): the HTTP door's phases, controls and
@@ -226,7 +229,7 @@ impl Door {
 
 /// An operation a phase asks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind {
+pub enum Kind {
     Put,
     Stream,
     Get,
@@ -258,6 +261,29 @@ impl Kind {
             Self::Abort => "MPU-ABORT",
         }
     }
+
+    const ALL: [Self; 12] = [
+        Self::Put,
+        Self::Stream,
+        Self::Get,
+        Self::Range,
+        Self::Head,
+        Self::Delete,
+        Self::List,
+        Self::Create,
+        Self::Part,
+        Self::Parts,
+        Self::Complete,
+        Self::Abort,
+    ];
+}
+
+/// `--kinds`: an operation by the name its lines give it (`PUT`, `GET-RANGE`, `MPU-PART`, ...).
+pub fn kind_arg(text: &str) -> Result<Kind, String> {
+    Kind::ALL
+        .into_iter()
+        .find(|k| k.name() == text)
+        .ok_or_else(|| format!("{text} is no operation's name"))
 }
 
 /// What an operation came to.
@@ -2260,6 +2286,9 @@ impl<'o> Bench<'o> {
         shared: Common<'_>,
         (name, from, n, end): (&str, u64, u64, u64),
     ) -> Result<u64, Error> {
+        if !self.options.kinds.is_empty() && !self.options.kinds.contains(&kind) {
+            return Ok(0);
+        }
         let work = Rc::new(Work {
             etags: Rc::clone(shared.0),
             uploads: Rc::clone(shared.1),

@@ -492,6 +492,11 @@ enum BenchCommand {
         /// apply.
         #[arg(long)]
         smoke: bool,
+        /// The operations whose phases run, comma-separated by the names the lines give them
+        /// (PUT, PUT-STREAM, GET, ...); every one by default. A read or a delete reads what the
+        /// put before it made, so it is asked beside that put.
+        #[arg(long, value_delimiter = ',', value_parser = bench_doors::kind_arg)]
+        kinds: Vec<bench_doors::Kind>,
     },
 }
 
@@ -1042,6 +1047,7 @@ fn doors_options(command: BenchCommand) -> Result<bench_doors::Options, String> 
         endpoint,
         perf,
         smoke,
+        kinds,
     } = command
     else {
         return Err("not mantle bench doors".to_owned());
@@ -1093,6 +1099,7 @@ fn doors_options(command: BenchCommand) -> Result<bench_doors::Options, String> 
         condition,
         endpoint,
         perf,
+        kinds,
     })
 }
 

@@ -243,13 +243,15 @@ impl PacketBuilder {
             0 => Default::default(),
             _ => conn.path.delivery.on_sent(now, conn.path.in_flight.bytes),
         };
+        let (retransmits, credit, named) = sent.retransmits.into_parts();
         let packet = SentPacket {
             path_generation: conn.path.generation(),
             largest_acked: LargestAcked::new(sent.largest_acked),
             time_sent: now,
             size,
             ack_eliciting,
-            retransmits: sent.retransmits,
+            retransmits,
+            credit,
             stream_frames: sent.stream_frames,
             copied: conn.spaces.get(space_id).sending_copies,
             handshake_flight,
@@ -259,8 +261,9 @@ impl PacketBuilder {
             next: None,
         };
 
-        conn.path
-            .sent(exact_number, packet, conn.spaces.get_mut(space_id));
+        let space = conn.spaces.get_mut(space_id);
+        space.record_streams(exact_number, named);
+        conn.path.sent(exact_number, packet, space);
         conn.stats.path.sent_packets = conn.stats.path.sent_packets.saturating_add(1);
         conn.reset_keep_alive(now);
         if size != 0 {

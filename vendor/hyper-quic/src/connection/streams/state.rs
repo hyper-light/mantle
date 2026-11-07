@@ -10,8 +10,8 @@ use rustc_hash::FxHashMap;
 use tracing::{debug, trace};
 
 use super::{
-    PendingStreamsQueue, Recv, Retransmits, Send, SendState, ShouldTransmit, StreamEvent,
-    StreamHalf, ThinRetransmits,
+    PendingStreamsQueue, Recording, Recv, Retransmits, Send, SendState, ShouldTransmit,
+    StreamEvent, StreamHalf,
 };
 use crate::{
     Dir, MAX_STREAM_COUNT, PerDir, Side, StreamId, TransportError, VarInt,
@@ -494,7 +494,7 @@ impl StreamsState {
         &mut self,
         buf: &mut Vec<u8>,
         pending: &mut Retransmits,
-        retransmits: &mut ThinRetransmits,
+        retransmits: &mut Recording,
         stats: &mut FrameStats,
         max_size: usize,
     ) {
@@ -513,7 +513,7 @@ impl StreamsState {
         &mut self,
         buf: &mut Vec<u8>,
         pending: &mut Retransmits,
-        retransmits: &mut ThinRetransmits,
+        retransmits: &mut Recording,
         stats: &mut FrameStats,
         max_size: usize,
     ) {
@@ -546,7 +546,7 @@ impl StreamsState {
     fn write_stop_sending(
         buf: &mut Vec<u8>,
         pending: &mut Retransmits,
-        retransmits: &mut ThinRetransmits,
+        retransmits: &mut Recording,
         stats: &mut FrameStats,
         max_size: usize,
     ) {
@@ -574,7 +574,7 @@ impl StreamsState {
         &mut self,
         buf: &mut Vec<u8>,
         pending: &mut Retransmits,
-        retransmits: &mut ThinRetransmits,
+        retransmits: &mut Recording,
         stats: &mut FrameStats,
         max_size: usize,
     ) {
@@ -596,7 +596,7 @@ impl StreamsState {
             self.sent_max_data = max;
         }
 
-        retransmits.get_or_create().max_data = true;
+        retransmits.set_max_data();
         buf.write(frame::FrameType::MAX_DATA);
         buf.write(max);
         stats.max_data = stats.max_data.saturating_add(1);
@@ -607,7 +607,7 @@ impl StreamsState {
         &mut self,
         buf: &mut Vec<u8>,
         pending: &mut Retransmits,
-        retransmits: &mut ThinRetransmits,
+        retransmits: &mut Recording,
         stats: &mut FrameStats,
         max_size: usize,
     ) {
@@ -629,7 +629,7 @@ impl StreamsState {
             if !rs.can_send_flow_control() {
                 continue;
             }
-            retransmits.get_or_create().max_stream_data.insert(id);
+            retransmits.add_max_stream_data(id);
 
             let (max, _) = rs.max_stream_data(self.stream_receive_window);
             rs.record_sent_max_stream_data(max);
@@ -647,7 +647,7 @@ impl StreamsState {
         &mut self,
         buf: &mut Vec<u8>,
         pending: &mut Retransmits,
-        retransmits: &mut ThinRetransmits,
+        retransmits: &mut Recording,
         stats: &mut FrameStats,
         max_size: usize,
     ) {
@@ -657,7 +657,7 @@ impl StreamsState {
             }
 
             *pending.max_stream_id.get_mut(dir) = false;
-            *retransmits.get_or_create().max_stream_id.get_mut(dir) = true;
+            retransmits.set_max_stream_id(dir);
             let max_remote = *self.max_remote.get(dir);
             *self.sent_max_remote.get_mut(dir) = max_remote;
             trace!(value = max_remote, "MAX_STREAMS ({:?})", dir);
@@ -678,7 +678,7 @@ impl StreamsState {
         &mut self,
         buf: &mut Vec<u8>,
         pending: &mut Retransmits,
-        retransmits: &mut ThinRetransmits,
+        retransmits: &mut Recording,
         stats: &mut FrameStats,
         max_size: usize,
     ) {
@@ -688,7 +688,7 @@ impl StreamsState {
         pending.data_blocked = false;
         // The peer may have raised the limit since the frame was queued
         if self.can_send_data_blocked() {
-            retransmits.get_or_create().data_blocked = true;
+            retransmits.set_data_blocked();
             trace!(limit = self.max_data, "DATA_BLOCKED");
             buf.write(frame::FrameType::DATA_BLOCKED);
             buf.write_var(self.max_data);
@@ -701,7 +701,7 @@ impl StreamsState {
         &mut self,
         buf: &mut Vec<u8>,
         pending: &mut Retransmits,
-        retransmits: &mut ThinRetransmits,
+        retransmits: &mut Recording,
         stats: &mut FrameStats,
         max_size: usize,
     ) {
@@ -714,7 +714,7 @@ impl StreamsState {
             if !self.can_send_streams_blocked(dir) {
                 continue;
             }
-            *retransmits.get_or_create().streams_blocked.get_mut(dir) = true;
+            retransmits.set_streams_blocked(dir);
             let limit = *self.max.get(dir);
             trace!(limit, "STREAMS_BLOCKED ({:?})", dir);
             buf.write(match dir {
@@ -736,7 +736,7 @@ impl StreamsState {
         &mut self,
         buf: &mut Vec<u8>,
         pending: &mut Retransmits,
-        retransmits: &mut ThinRetransmits,
+        retransmits: &mut Recording,
         stats: &mut FrameStats,
         max_size: usize,
     ) {
@@ -748,7 +748,7 @@ impl StreamsState {
             let Some(limit) = self.stream_data_blocked_limit(id) else {
                 continue;
             };
-            retransmits.get_or_create().stream_data_blocked.insert(id);
+            retransmits.add_stream_data_blocked(id);
 
             trace!(stream = %id, limit, "STREAM_DATA_BLOCKED");
             buf.write(frame::FrameType::STREAM_DATA_BLOCKED);
@@ -758,11 +758,14 @@ impl StreamsState {
         }
     }
 
+    /// Writes stream frames into `buf` up to `max_buf_size`, every frame stating its length where
+    /// `lengths` (`SendBuffer::poll_transmit_framed`)
     pub(crate) fn write_stream_frames(
         &mut self,
         buf: &mut Vec<u8>,
         max_buf_size: usize,
         fair: bool,
+        lengths: bool,
     ) -> StreamMetaVec {
         let mut stream_frames = StreamMetaVec::new();
         while fits(buf, frame::Stream::SIZE_BOUND, max_buf_size) {
@@ -794,7 +797,8 @@ impl StreamsState {
                 .saturating_sub(buf.len())
                 .saturating_sub(1)
                 .saturating_sub(VarInt::from(id).size());
-            let (offsets, encode_length) = stream.pending.poll_transmit(max_buf_size);
+            let (offsets, encode_length) =
+                stream.pending.poll_transmit_framed(max_buf_size, lengths);
             let fin = offsets.end == stream.pending.offset()
                 && matches!(stream.state, SendState::DataSent { .. });
             if fin {
@@ -1324,7 +1328,7 @@ mod tests {
         };
         let written = |streams: &mut StreamsState, pending: &mut Retransmits| {
             let mut buf = Vec::new();
-            let (mut sent, mut stats) = (ThinRetransmits::default(), FrameStats::default());
+            let (mut sent, mut stats) = (Recording::default(), FrameStats::default());
             streams.write_control_frames(&mut buf, pending, &mut sent, &mut stats, usize::MAX);
             if buf.is_empty() {
                 return Vec::new();
@@ -1920,7 +1924,7 @@ mod tests {
         high.write(b"high").unwrap();
 
         let mut buf = Vec::with_capacity(40);
-        let meta = server.write_stream_frames(&mut buf, 40, true);
+        let meta = server.write_stream_frames(&mut buf, 40, true, false);
         assert_eq!(meta[0].id, id_high);
         assert_eq!(meta[1].id, id_mid);
         assert_eq!(meta[2].id, id_low);
@@ -1980,7 +1984,7 @@ mod tests {
         high.set_priority(-1).unwrap();
 
         let mut buf = Vec::with_capacity(1000);
-        let meta = server.write_stream_frames(&mut buf, 40, true);
+        let meta = server.write_stream_frames(&mut buf, 40, true, false);
         assert_eq!(meta.len(), 1);
         assert_eq!(meta[0].id, id_high);
 
@@ -1988,7 +1992,7 @@ mod tests {
         assert_eq!(server.pending.len(), 2);
 
         // Send the remaining data. The initial mid priority one should go first now
-        let meta = server.write_stream_frames(&mut buf, 1000, true);
+        let meta = server.write_stream_frames(&mut buf, 1000, true, false);
         assert_eq!(meta.len(), 2);
         assert_eq!(meta[0].id, id_mid);
         assert_eq!(meta[1].id, id_high);
@@ -2050,7 +2054,7 @@ mod tests {
             // loop until all the streams are written
             loop {
                 let buf_len = buf.len();
-                let meta = server.write_stream_frames(&mut buf, buf_len + 40, fair);
+                let meta = server.write_stream_frames(&mut buf, buf_len + 40, fair, false);
                 if meta.is_empty() {
                     break;
                 }
@@ -2122,7 +2126,7 @@ mod tests {
 
         // Write the first chunk of stream_a
         let buf_len = buf.len();
-        let meta = server.write_stream_frames(&mut buf, buf_len + 40, false);
+        let meta = server.write_stream_frames(&mut buf, buf_len + 40, false, false);
         assert!(!meta.is_empty());
         metas.extend(meta);
 
@@ -2139,7 +2143,7 @@ mod tests {
         // loop until all the streams are written
         loop {
             let buf_len = buf.len();
-            let meta = server.write_stream_frames(&mut buf, buf_len + 40, false);
+            let meta = server.write_stream_frames(&mut buf, buf_len + 40, false, false);
             if meta.is_empty() {
                 break;
             }

@@ -368,6 +368,8 @@ pub fn limits() -> Limits {
         // A full 16 MiB window of unread data, packed: 16 MiB / 65,527 B, and one.
         receive_chunks: (16 << 20) / hyper_transport::RECEIVE_CHUNK + 1,
         retry_bytes: None,
+        acknowledgement: hyper_transport::Acknowledgement::Decimated,
+        fec_window: None,
     }
 }
 
@@ -379,6 +381,16 @@ pub trait Drive {
     fn fire(&mut self, now: Instant);
     /// The driver measured its timer granularity: what has a use for it takes it.
     fn granularity(&mut self, _granularity: Duration) {}
+    /// The address the datagram [`Drive::transmit`] gave last was sent from, for a driver that is
+    /// several endpoints at once ([`Several`]); none, the network's own address for its side.
+    fn source(&self) -> Option<SocketAddr> {
+        None
+    }
+    /// A datagram sent to `to`: a driver that is several endpoints gives it to the one there.
+    fn datagram_to(&mut self, now: Instant, from: SocketAddr, to: SocketAddr, bytes: &[u8]) {
+        let _ = to;
+        self.datagram(now, from, bytes);
+    }
     /// What the scheduling core read that differed from its fold, with the oracle on
     /// (hyper-transport src/tally.rs); a driver without one has none.
     #[cfg(feature = "oracle")]
@@ -412,6 +424,73 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Drive for En
 /// A node of the in-memory network.
 pub type Node<C> = Endpoint<C, Fixed, Book>;
 
+/// Several endpoints on one side of a [`Net`], each at an address of its own: connections of their
+/// own to the other side, as many peers' are. Each sends in turn, and a datagram goes to the one
+/// at the address it was sent to.
+pub struct Several<D> {
+    pub nodes: Vec<(SocketAddr, D)>,
+    next: usize,
+    last: Option<SocketAddr>,
+}
+
+impl<D> Several<D> {
+    pub fn new(nodes: Vec<(SocketAddr, D)>) -> Self {
+        Self {
+            nodes,
+            next: 0,
+            last: None,
+        }
+    }
+}
+
+impl<D: Drive> Drive for Several<D> {
+    fn datagram(&mut self, now: Instant, from: SocketAddr, bytes: &[u8]) {
+        let to = self.nodes[0].0;
+        self.datagram_to(now, from, to, bytes);
+    }
+    fn datagram_to(&mut self, now: Instant, from: SocketAddr, to: SocketAddr, bytes: &[u8]) {
+        if let Some((_, node)) = self.nodes.iter_mut().find(|(at, _)| *at == to) {
+            node.datagram(now, from, bytes);
+        }
+    }
+    fn transmit(&mut self, now: Instant, out: &mut Vec<u8>) -> Option<Transmit> {
+        let count = self.nodes.len();
+        for turn in 0..count {
+            let at = (self.next + turn) % count;
+            let (address, node) = &mut self.nodes[at];
+            if let Some(transmit) = node.transmit(now, out) {
+                self.last = Some(*address);
+                self.next = (at + 1) % count;
+                return Some(transmit);
+            }
+        }
+        None
+    }
+    fn source(&self) -> Option<SocketAddr> {
+        self.last
+    }
+    fn timeout(&mut self) -> Option<Instant> {
+        self.nodes
+            .iter_mut()
+            .filter_map(|(_, node)| node.timeout())
+            .min()
+    }
+    fn fire(&mut self, now: Instant) {
+        for (_, node) in &mut self.nodes {
+            node.fire(now);
+        }
+    }
+    fn granularity(&mut self, granularity: Duration) {
+        for (_, node) in &mut self.nodes {
+            node.granularity(granularity);
+        }
+    }
+    #[cfg(feature = "oracle")]
+    fn mismatches(&self) -> u64 {
+        self.nodes.iter().map(|(_, node)| node.mismatches()).sum()
+    }
+}
+
 /// What the network schedules on the world: a datagram's arrival.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Arrival {
@@ -441,6 +520,10 @@ pub struct Net<A: Drive, B: Drive> {
     wire: hyper_sim::net::Net<Vec<u8>>,
     spare: Vec<Vec<u8>>,
     out: Vec<u8>,
+    /// Where each of `a`'s datagrams in flight came from, and where each of `b`'s goes, in the
+    /// order sent: each way's are delivered in that order, so each is read off as it arrives.
+    sources: std::collections::VecDeque<SocketAddr>,
+    targets: std::collections::VecDeque<SocketAddr>,
 }
 
 /// Format: the most a datagram carries on the links these tests model: Ethernet's MTU (1,500,
@@ -517,13 +600,45 @@ impl<A: Drive, B: Drive> Net<A, B> {
         Self::with_links(now, a, b, source, 0)
     }
 
+    /// The network losing `loss_ppm` of each way's datagrams independently, `one_way` apart, its
+    /// world's draws from seed `seed`: a loss draw for each datagram, no more than `datagrams` each
+    /// way.
+    pub fn lossy(
+        now: Instant,
+        a: A,
+        b: B,
+        loss_ppm: u32,
+        one_way: Duration,
+        seed: u64,
+        datagrams: usize,
+    ) -> Self {
+        let mut net = Self::with_world(now, a, b, hyper_sim::Source::Seed(seed), 0, 2 * datagrams);
+        let one_way = u64::try_from(one_way.as_nanos()).unwrap();
+        let path = hyper_sim::net::Path::in_order(one_way, 0)
+            .with_loss(hyper_sim::net::Loss::random(loss_ppm));
+        net.wire.set_pair_path(A, B, path).unwrap();
+        net.wire.set_pair_path(B, A, path).unwrap();
+        net
+    }
+
     fn with_links(now: Instant, a: A, b: B, source: hyper_sim::Source, links: usize) -> Self {
+        Self::with_world(now, a, b, source, links, 0)
+    }
+
+    fn with_world(
+        now: Instant,
+        a: A,
+        b: B,
+        source: hyper_sim::Source,
+        links: usize,
+        trace_words: usize,
+    ) -> Self {
         let limits = hyper_sim::Limits {
             events: 1 << 12,
             nodes: 2,
             streams: 8,
             steps: u64::MAX,
-            trace_words: 0,
+            trace_words,
         };
         let mut world =
             hyper_sim::World::new(source, hyper_sim::Discipline::Ordered, limits).unwrap();
@@ -551,6 +666,8 @@ impl<A: Drive, B: Drive> Net<A, B> {
             wire,
             spare: Vec::with_capacity(64),
             out: Vec::with_capacity(1500),
+            sources: std::collections::VecDeque::new(),
+            targets: std::collections::VecDeque::new(),
         }
     }
 
@@ -575,7 +692,14 @@ impl<A: Drive, B: Drive> Net<A, B> {
             let mut bytes = self.spare.pop().unwrap_or_default();
             bytes.clear();
             bytes.extend_from_slice(&self.out[..transmit.size]);
-            let pair = if from_a { (A, B) } else { (B, A) };
+            let pair = if from_a {
+                self.sources
+                    .push_back(self.a.source().unwrap_or(self.a_address));
+                (A, B)
+            } else {
+                self.targets.push_back(transmit.destination);
+                (B, A)
+            };
             self.wire
                 .send(
                     &mut self.world,
@@ -610,11 +734,14 @@ impl<A: Drive, B: Drive> Net<A, B> {
                 .unwrap()
                 .unwrap();
             if node == B {
+                let from = self.sources.pop_front().unwrap_or(self.a_address);
                 if !self.b_dead {
-                    self.b.datagram(self.now, self.a_address, &delivery.payload);
+                    self.b.datagram(self.now, from, &delivery.payload);
                 }
             } else {
-                self.a.datagram(self.now, self.b_address, &delivery.payload);
+                let to = self.targets.pop_front().unwrap_or(self.a_address);
+                self.a
+                    .datagram_to(self.now, self.b_address, to, &delivery.payload);
             }
             self.spare.push(delivery.payload);
             any = true;

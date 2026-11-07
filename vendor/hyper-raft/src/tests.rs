@@ -4809,6 +4809,47 @@ fn a_held_quorum_commits_before_any_write_of_it_is_durable() {
     assert_eq!(held(ready.committed_entries()), vec![(1, 1), (2, 1)]);
 }
 
+/// R-8: a leader counts each entry it commits by the quorum that committed it first, so its owner
+/// can say how many of its commits a held quorum made: held answers' entries are held, durable
+/// answers' are classic, and the other quorum reaching an entry after counts it again nowhere.
+#[test]
+fn a_leader_counts_each_commit_by_the_quorum_that_made_it_first() {
+    let mut node = proposing(apart(1));
+    assert_eq!(node.raft.commit_stats(), crate::CommitStats::default());
+    node.step(held_answer(2, 2, 1)).unwrap();
+    node.step(held_answer(3, 2, 1)).unwrap();
+    assert_eq!(node.raft.log().committed(), 2);
+    let both_held = crate::CommitStats {
+        classic: 0,
+        held: 2,
+    };
+    assert_eq!(node.raft.commit_stats(), both_held);
+    let mut durable = answer(MessageType::MsgAppendResponse, 2, 1, 1);
+    durable.index = 2;
+    node.step(durable).unwrap();
+    assert_eq!(
+        node.raft.commit_stats(),
+        both_held,
+        "the classic quorum came after"
+    );
+
+    let mut one = proposing(fated(1, &[(1, 7), (2, 7), (3, 7)], 2));
+    one.step(held_answer(2, 2, 1)).unwrap();
+    one.step(held_answer(3, 2, 1)).unwrap();
+    let mut durable = answer(MessageType::MsgAppendResponse, 2, 1, 1);
+    durable.index = 2;
+    one.step(durable).unwrap();
+    assert_eq!(one.raft.log().committed(), 1);
+    assert_eq!(
+        one.raft.commit_stats(),
+        crate::CommitStats {
+            classic: 1,
+            held: 0,
+        },
+        "one fate: only the classic quorum commits"
+    );
+}
+
 /// R-8: members of one fate fail as one, so their memory never commits; durable answers commit as
 /// they always did. Of two voters, a held quorum counts the leader's disk and the follower's
 /// memory, and the follower answers with no promise: every election asks the leader.

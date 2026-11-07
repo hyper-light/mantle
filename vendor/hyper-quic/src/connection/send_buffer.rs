@@ -4,6 +4,11 @@ use bytes::{Buf, Bytes};
 
 use crate::{VarInt, range_set::RangeSet};
 
+/// Derived: the room a queue of pieces keeps however few it holds, what its first growth takes: the
+/// standard library grows an empty vector of elements of up to 1 KiB to four (`RawVecInner`'s
+/// `min_non_zero_cap`), so a queue shrunk below four is grown back by the writes that follow.
+const KEPT_PIECES: usize = 4;
+
 /// Buffer of outgoing retransmittable stream data
 #[derive(Default, Debug)]
 pub(super) struct SendBuffer {
@@ -101,9 +106,14 @@ impl SendBuffer {
                 self.unacked_segments.pop_front();
                 self.front_trimmed = 0;
 
-                if self.unacked_segments.len().saturating_mul(4) < self.unacked_segments.capacity()
-                {
-                    self.unacked_segments.shrink_to_fit();
+                // Shrunk once it holds under a quarter of its room, so a burst's pieces are not
+                // kept for the stream's life; but never below the room its first growth takes,
+                // which shrinking to nothing as each write's data was all acknowledged gave back
+                // for the next write to allocate again (VENDORED.md §49: one allocation a write,
+                // 1,745 a native PUT of 8 MiB in mantle).
+                let held = self.unacked_segments.len();
+                if held.saturating_mul(4) < self.unacked_segments.capacity() {
+                    self.unacked_segments.shrink_to(held.max(KEPT_PIECES));
                 }
             } else {
                 front.bytes.advance(to_advance);
@@ -131,7 +141,20 @@ impl SendBuffer {
     ///
     /// The room left saturates at zero: metadata that does not fit leaves no room for data, where
     /// upstream's subtraction underflowed (it asserted the guarantee in debug builds only).
-    pub(super) fn poll_transmit(&mut self, mut max_len: usize) -> (Range<u64>, bool) {
+    #[cfg(test)]
+    pub(super) fn poll_transmit(&mut self, max_len: usize) -> (Range<u64>, bool) {
+        self.poll_transmit_framed(max_len, false)
+    }
+
+    /// [`Self::poll_transmit`], every frame stating its length where `lengths`, even one that
+    /// would fill its packet: a frame read past its packet's end then still ends where it was
+    /// sent, as one in a packet an erasure code rebuilds is read with the padding of its repair's
+    /// length after it (`crate::erasure`)
+    pub(super) fn poll_transmit_framed(
+        &mut self,
+        mut max_len: usize,
+        lengths: bool,
+    ) -> (Range<u64>, bool) {
         let mut encode_length = false;
 
         if let Some(range) = self.retransmits.pop_min() {
@@ -142,7 +165,7 @@ impl SendBuffer {
             if range.start != 0 {
                 max_len = max_len.saturating_sub(VarInt::size_of(range.start));
             }
-            if range.end.saturating_sub(range.start) < len_u64(max_len) {
+            if lengths || range.end.saturating_sub(range.start) < len_u64(max_len) {
                 encode_length = true;
                 max_len = max_len.saturating_sub(8);
             }
@@ -161,7 +184,7 @@ impl SendBuffer {
         if self.unsent != 0 {
             max_len = max_len.saturating_sub(VarInt::size_of(self.unsent));
         }
-        if self.offset.saturating_sub(self.unsent) < len_u64(max_len) {
+        if lengths || self.offset.saturating_sub(self.unsent) < len_u64(max_len) {
             encode_length = true;
             max_len = max_len.saturating_sub(8);
         }

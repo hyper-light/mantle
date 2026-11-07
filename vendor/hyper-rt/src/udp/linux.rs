@@ -565,9 +565,12 @@ pub(crate) struct Received {
 /// Receives up to one message into each of `buffers` with one `recvmmsg`, appending what arrived
 /// to `out`. A message from an address that is not an internet one, or one the buffer truncated,
 /// is skipped: QUIC and the plane treat it as lost.
+///
+/// Each buffer is offered its whole room, written or not, and its length is set to what the kernel
+/// wrote into it if that is more than it had: nothing is zeroed ahead of the kernel.
 pub(crate) fn receive(
     fd: RawFd,
-    buffers: &mut [impl AsMut<[u8]>],
+    buffers: &mut [Vec<u8>],
     headers: &mut Headers,
     out: &mut Vec<Received>,
 ) -> io::Result<usize> {
@@ -582,10 +585,9 @@ pub(crate) fn receive(
     iovecs.clear();
     let count = buffers.len().min(names.len());
     for buffer in buffers.iter_mut().take(count) {
-        let buffer = buffer.as_mut();
         iovecs.push(libc::iovec {
             iov_base: buffer.as_mut_ptr().cast(),
-            iov_len: buffer.len(),
+            iov_len: buffer.capacity(),
         });
     }
     for ((iovec, name), control) in iovecs
@@ -605,9 +607,9 @@ pub(crate) fn receive(
     }
     let length = libc::c_uint::try_from(messages.len()).unwrap_or(libc::c_uint::MAX);
     // SAFETY: `messages` holds `length` headers whose names, iovecs and controls point into
-    // `names`, `iovecs`, `controls` and `buffers`, borrowed mutably for this call and not moved
-    // since; recvmmsg writes within the lengths each header gives. The timeout is null: the
-    // socket is non-blocking.
+    // `names`, `iovecs`, `controls` and `buffers`' allocations, each iovec the whole capacity of
+    // its buffer, borrowed mutably for this call and not moved since; recvmmsg writes within the
+    // lengths each header gives. The timeout is null: the socket is non-blocking.
     let received = unsafe {
         libc::syscall(
             libc::SYS_recvmmsg,
@@ -636,6 +638,17 @@ pub(crate) fn receive(
         let Ok(length) = usize::try_from(message.msg_len) else {
             continue;
         };
+        let Some(buffer) = buffers.get_mut(index) else {
+            continue;
+        };
+        let length = length.min(buffer.capacity());
+        if length > buffer.len() {
+            // SAFETY: the kernel wrote this message's `msg_len` bytes from the start of the
+            // buffer's allocation, its iovec, within its capacity (the length is held to it, and a
+            // truncated message was passed over above); the bytes below the buffer's length were
+            // written before. All of `..length` is so initialised.
+            unsafe { buffer.set_len(length) };
+        }
         let (segment, stamp, drops) = controls_of(&message.msg_hdr);
         out.push(Received {
             index,

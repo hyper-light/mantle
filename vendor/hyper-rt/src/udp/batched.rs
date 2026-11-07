@@ -254,7 +254,7 @@ impl Ring {
                 what: "datagram receive buffers",
                 bound,
             })?;
-        buffers.push(zeroed(RECEIVE_BYTES)?);
+        buffers.push(unwritten(RECEIVE_BYTES)?);
         Ok(Self {
             batch: io.batch,
             bound,
@@ -355,7 +355,7 @@ impl Ring {
         (self.drains >= held && most < held).then_some(most)
     }
 
-    /// Holds `buffers` buffers (within one and its bound): those it adds allocated and zeroed here,
+    /// Holds `buffers` buffers (within one and its bound): those it adds allocated here, unwritten,
     /// fallibly, all of them or none (`Capacity`); those it lets go, the last it added. Either way
     /// the drains it served are forgotten, and it wants nothing until those to come say so.
     pub fn resize(&mut self, buffers: usize) -> Result<(), RtError> {
@@ -367,7 +367,7 @@ impl Ring {
             return Ok(());
         }
         for _ in held..buffers {
-            match zeroed(RECEIVE_BYTES) {
+            match unwritten(RECEIVE_BYTES) {
                 Ok(buffer) => self.buffers.push(buffer),
                 Err(error) => {
                     self.buffers.truncate(held);
@@ -472,8 +472,15 @@ impl std::fmt::Debug for Batched {
     }
 }
 
-/// A zeroed buffer of `len` bytes, refused `Capacity` when the allocator has no room for it.
-fn zeroed(len: usize) -> Result<Vec<u8>, RtError> {
+/// A receive buffer with room for `len` bytes and none written, refused `Capacity` when the
+/// allocator has no room for it.
+///
+/// On Linux the kernel writes what it receives into the room and the buffer's length is set to
+/// what it wrote (`linux::receive`), so nothing else touches it: zeroed as it was made, every page
+/// of a ring's growth was faulted in for bytes nothing reads (16 a buffer; mantle's ledger counted
+/// a ring growing 15 buffers an operation through a native PUT of 8 MiB). A receive through a call
+/// that takes an initialised slice zeroes it first, once ([`written`]).
+fn unwritten(len: usize) -> Result<Vec<u8>, RtError> {
     let mut buffer = Vec::new();
     buffer
         .try_reserve_exact(len)
@@ -481,8 +488,17 @@ fn zeroed(len: usize) -> Result<Vec<u8>, RtError> {
             what: "datagram receive buffer bytes",
             bound: len,
         })?;
-    buffer.resize(len, 0);
     Ok(buffer)
+}
+
+/// `buffer`'s whole room as a slice to receive into, zeroed past what was written the first time a
+/// call that takes an initialised slice receives into it (macOS's `recvmsg`, the portable receive).
+fn written(buffer: &mut Vec<u8>) -> &mut [u8] {
+    let room = buffer.capacity();
+    if buffer.len() < room {
+        buffer.resize(room, 0);
+    }
+    buffer
 }
 
 /// The shard's clock now.
@@ -643,7 +659,7 @@ impl Batched {
                 bound: buffer_count,
             })?;
         for _ in 0..buffer_count {
-            buffers.push(zeroed(RECEIVE_BYTES)?);
+            buffers.push(unwritten(RECEIVE_BYTES)?);
         }
         Ok(Self {
             udp,
@@ -1235,7 +1251,7 @@ impl Batched {
         let Some(buffer) = self.buffers.first_mut() else {
             return Ok(ReceiveStep::Empty);
         };
-        let taken = match macos::receive(fd, buffer) {
+        let taken = match macos::receive(fd, written(buffer)) {
             Ok(taken) => taken,
             Err(error) => return receive_failed("recvmsg", &error),
         };
@@ -1279,7 +1295,7 @@ impl Batched {
             return Ok(ReceiveStep::Empty);
         };
         let astray_before = self.udp.astray_reports();
-        match self.udp.recv_once(buffer)? {
+        match self.udp.recv_once(written(buffer))? {
             Outcome::Done((length, from)) => {
                 self.stats.receive_calls = self.stats.receive_calls.saturating_add(1);
                 let now_ns = shard_now()?;

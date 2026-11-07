@@ -77,15 +77,47 @@ mod linux {
         cpu_list(list)
     }
 
-    /// The CPU time this process's cgroup grants as `(quota, period)` microseconds (cgroup v2 `cpu.max`
-    /// at the root of the process's cgroup namespace, where a container sees its own); `None` when the
-    /// quota is `max` or the file is absent.
+    /// The CPU time this process's cgroups grant as `(quota, period)` microseconds: cgroup v2 `cpu.max` at
+    /// the process's own cgroup (`/proc/self/cgroup`) and at every ancestor up to the root of its cgroup
+    /// namespace, the tightest, as the runtime reads it (`machine::facts`); `None` where none states a
+    /// quota. Read at the namespace's root alone, a process on a host whose own cgroup has a quota (a
+    /// systemd unit's `CPUQuota`, as a capped gate runs under) was taken for one with none: the runtime
+    /// saw the quota and fixed no shard, and `on_an_owned_cpuset_each_shard_is_fixed_to_its_own_core_of_the_set`
+    /// failed for a placement that was right.
     fn cpu_budget() -> Option<(u64, u64)> {
-        let text = std::fs::read_to_string("/sys/fs/cgroup/cpu.max").ok()?;
-        let mut fields = text.split_whitespace();
-        let quota = fields.next()?.parse::<u64>().ok()?;
-        let period = fields.next()?.parse::<u64>().ok()?;
-        Some((quota, period))
+        let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+        let path = cgroup.lines().find_map(|line| line.strip_prefix("0::"))?;
+        let mut dir = path.trim_end_matches('/').to_owned();
+        let mut tightest: Option<(u64, u64)> = None;
+        loop {
+            if let Some((quota, period)) =
+                std::fs::read_to_string(format!("/sys/fs/cgroup{dir}/cpu.max"))
+                    .ok()
+                    .and_then(|text| {
+                        let mut fields = text.split_whitespace();
+                        Some((
+                            fields.next()?.parse::<u64>().ok()?,
+                            fields.next()?.parse::<u64>().ok()?,
+                        ))
+                    })
+            {
+                // The smaller share of a CPU: quota over period, compared without dividing.
+                let tighter = tightest.is_none_or(|(q, p)| {
+                    u128::from(quota) * u128::from(p) < u128::from(q) * u128::from(period)
+                });
+                if tighter {
+                    tightest = Some((quota, period));
+                }
+            }
+            if dir.is_empty() {
+                break;
+            }
+            match dir.rfind('/') {
+                Some(cut) => dir.truncate(cut),
+                None => dir.clear(),
+            }
+        }
+        tightest
     }
 
     /// Whether a budget of `(quota, period)` buys every one of `cores` CPUs at once.

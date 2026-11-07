@@ -10,6 +10,7 @@
 
 use std::time::Instant;
 
+use bytes::Bytes;
 use hyper_quic::{Connection, ReadError, StreamId, VarInt, WriteError};
 
 use crate::frame::{BodySum, PREFIX_BYTES, Prefix, TRAILER_BYTES};
@@ -93,6 +94,30 @@ pub(crate) fn push(
     }
     match connection.send_stream(id).write(bytes) {
         Ok(took) => Pushed::Took(took),
+        Err(WriteError::Blocked) => Pushed::Took(0),
+        Err(WriteError::Stopped(code)) => Pushed::Stopped(code.into_inner()),
+        Err(WriteError::ClosedStream) => Pushed::Closed,
+    }
+}
+
+/// Write `bytes` to stream `id`, no more than `allowed`, handing QUIC the owner's buffer rather than
+/// a copy of it (`SendStream::write_chunks`): a borrowed write is copied into a buffer of its own,
+/// an allocation of its bytes a write (mantle's native PUT of 8 MiB: 16.8 MB an operation on its
+/// servers). Fewer taken than offered leave the rest the owner's to offer again.
+pub(crate) fn push_owned(
+    connection: &mut Connection,
+    id: StreamId,
+    bytes: &Bytes,
+    allowed: u64,
+) -> Pushed {
+    let allowed = usize::try_from(allowed).unwrap_or(usize::MAX);
+    let length = bytes.len().min(allowed);
+    if length == 0 {
+        return Pushed::Took(0);
+    }
+    let mut chunks = [bytes.slice(..length)];
+    match connection.send_stream(id).write_chunks(&mut chunks) {
+        Ok(written) => Pushed::Took(written.bytes),
         Err(WriteError::Blocked) => Pushed::Took(0),
         Err(WriteError::Stopped(code)) => Pushed::Stopped(code.into_inner()),
         Err(WriteError::ClosedStream) => Pushed::Closed,

@@ -38,6 +38,9 @@ pub(super) struct PacketSpace {
     pub(super) unacked_non_ack_eliciting_tail: u64,
     /// Transmitted but not acked, in packet number order ([`SentPackets`])
     pub(super) sent_packets: SentPackets,
+    /// The streams named by the MAX_STREAM_DATA and STREAM_DATA_BLOCKED frames of the packets in
+    /// `sent_packets`, in packet number order ([`StreamRecord`])
+    pub(super) stream_records: VecDeque<StreamRecord>,
     /// Number of explicit congestion notification codepoints seen on incoming packets
     pub(super) ecn_counters: frame::EcnCounts,
     /// Recent ECN counters sent by the peer in ACK frames
@@ -90,6 +93,7 @@ impl PacketSpace {
             largest_ack_eliciting_sent: 0,
             unacked_non_ack_eliciting_tail: 0,
             sent_packets: SentPackets::default(),
+            stream_records: VecDeque::new(),
             ecn_counters: frame::EcnCounts::ZERO,
             ecn_feedback: frame::EcnCounts::ZERO,
 
@@ -149,22 +153,31 @@ impl PacketSpace {
         }
 
         // Retransmit the data of the oldest in-flight packet
-        for packet in self.sent_packets.values_mut() {
-            if !packet.retransmits.is_empty(streams)
-                || (streams_too && !packet.stream_frames.is_empty())
-            {
-                // Remove retransmitted data from the old packet so we don't end up retransmitting
-                // it *again* even if the copy we're sending now gets acknowledged. Its STREAM
-                // frames move likewise, so one sent copy of each range is tracked, as after a
-                // loss: the probe's acknowledgement or loss settles them.
+        let records = &self.stream_records;
+        let oldest = self
+            .sent_packets
+            .range(..)
+            .find(|(number, packet)| {
+                !packet_is_empty(records, **number, packet, streams)
+                    || (streams_too && !packet.stream_frames.is_empty())
+            })
+            .map(|(number, _)| *number);
+        if let Some(number) = oldest {
+            // Remove retransmitted data from the old packet so we don't end up retransmitting
+            // it *again* even if the copy we're sending now gets acknowledged. Its STREAM
+            // frames move likewise, so one sent copy of each range is tracked, as after a
+            // loss: the probe's acknowledgement or loss settles them.
+            self.requeue_streams(number, false);
+            if let Some(packet) = self.sent_packets.get_mut(&number) {
+                self.pending |= mem::take(&mut packet.credit);
                 self.pending |= mem::take(&mut packet.retransmits);
                 if streams_too {
                     for frame in mem::take(&mut packet.stream_frames) {
                         streams.retransmit(frame);
                     }
                 }
-                return;
             }
+            return;
         }
 
         // Nothing new to send and nothing to retransmit, so fall back on a ping. This should only
@@ -202,11 +215,12 @@ impl PacketSpace {
         let mut ready = !sending && self.loss_probes == 0 && self.pending.is_empty(streams);
         let mut queued = false;
         let mut waiting: Option<Instant> = None;
-        for (_, packet) in self.sent_packets.range_mut(..self.flights_end) {
+        for (&number, packet) in self.sent_packets.range_mut(..self.flights_end) {
             if packet.copied
                 || !packet.handshake_flight
                 || !packet.ack_eliciting
-                || (packet.retransmits.is_empty(streams) && packet.stream_frames.is_empty())
+                || (packet_is_empty(&self.stream_records, number, packet, streams)
+                    && packet.stream_frames.is_empty())
             {
                 continue;
             }
@@ -225,9 +239,11 @@ impl PacketSpace {
                 continue;
             }
             packet.copied = true;
+            self.pending |= packet.credit;
             if let Some(retransmits) = packet.retransmits.get() {
                 self.pending |= retransmits.clone();
             }
+            copy_streams(&self.stream_records, number, &mut self.pending);
             for frame in packet.stream_frames.iter() {
                 streams.retransmit(frame.clone());
             }
@@ -315,7 +331,78 @@ impl PacketSpace {
     }
 
     /// Stop tracking sent packet `number`, and return what we knew about it
+    /// Takes packet `number` out of those in flight, acknowledged or given up: the streams its
+    /// frames named are forgotten with it.
     pub(super) fn take(&mut self, number: u64) -> Option<SentPacket> {
+        let packet = self.untrack(number)?;
+        if packet.credit.named_streams() {
+            self.drop_streams(number);
+        }
+        Some(packet)
+    }
+
+    /// Takes packet `number` out of those in flight, lost: what it carried of the credit frames,
+    /// the streams named included, is queued to send again. Its other frames are the caller's.
+    pub(super) fn take_lost(&mut self, number: u64) -> Option<SentPacket> {
+        let mut packet = self.untrack(number)?;
+        self.pending |= mem::take(&mut packet.credit);
+        self.requeue_streams(number, false);
+        Some(packet)
+    }
+
+    /// Every packet in flight, taken: the space is discarded, or its packets all sent again
+    /// (0-RTT's). The streams their frames named are queued to send again where `requeue`.
+    pub(super) fn take_all(&mut self, requeue: bool) -> SentPackets {
+        let packets = mem::take(&mut self.sent_packets);
+        if requeue {
+            for record in &self.stream_records {
+                record.requeue(&mut self.pending);
+            }
+        }
+        self.stream_records.clear();
+        packets
+    }
+
+    /// Records that packet `number`, about to be sent, named these streams.
+    pub(super) fn record_streams(&mut self, number: u64, streams: StreamsNamed) {
+        if let Some(stream) = streams.max_stream_data {
+            self.stream_records.push_back(StreamRecord {
+                packet: number,
+                stream,
+                blocked: false,
+            });
+        }
+        if let Some(stream) = streams.stream_data_blocked {
+            self.stream_records.push_back(StreamRecord {
+                packet: number,
+                stream,
+                blocked: true,
+            });
+        }
+    }
+
+    /// Where packet `number`'s stream records are.
+    fn streams_of(&self, number: u64) -> Range<usize> {
+        stream_range(&self.stream_records, number)
+    }
+
+    fn drop_streams(&mut self, number: u64) {
+        let range = self.streams_of(number);
+        self.stream_records.drain(range);
+    }
+
+    /// Queues packet `number`'s stream records to send again: moved, or copied where `keep`.
+    fn requeue_streams(&mut self, number: u64, keep: bool) {
+        let range = self.streams_of(number);
+        for record in self.stream_records.range(range.clone()) {
+            record.requeue(&mut self.pending);
+        }
+        if !keep {
+            self.stream_records.drain(range);
+        }
+    }
+
+    fn untrack(&mut self, number: u64) -> Option<SentPacket> {
         let packet = self.sent_packets.remove(&number)?;
         if !packet.ack_eliciting && number > self.largest_ack_eliciting_sent {
             // The packet taken is one of those counted, so the count is at least one
@@ -363,6 +450,13 @@ impl PacketSpace {
                 .next()
                 .map(|(&oldest, _)| oldest);
             forgotten = oldest.and_then(|oldest| self.sent_packets.remove(&oldest));
+            // A packet that is not ACK-eliciting carries no credit frame, so it names no stream;
+            // were it to, its record goes with it.
+            if let (Some(oldest), Some(packet)) = (oldest, &forgotten)
+                && packet.credit.named_streams()
+            {
+                self.drop_streams(oldest);
+            }
         } else {
             // Bounded by the limit just above
             self.unacked_non_ack_eliciting_tail =
@@ -437,6 +531,8 @@ pub(super) struct SentPacket {
     /// The data is boxed to minimize `SentPacket` size for the typical case of
     /// packets only containing ACKs and STREAM frames.
     pub(super) retransmits: ThinRetransmits,
+    /// The credit frames the packet carried, recorded inline ([`Credit`])
+    pub(super) credit: Credit,
     /// Metadata for stream frames in a packet
     ///
     /// The actual application data is stored with the stream state.
@@ -610,6 +706,211 @@ impl ::std::iter::FromIterator<Self> for Retransmits {
     }
 }
 
+/// The credit frames a sent packet carried, a bit each, held in the room its record has spare.
+///
+/// The frames a receiver sends as it reads, its credit (MAX_DATA, MAX_STREAMS) and its blocked
+/// signals (DATA_BLOCKED, STREAMS_BLOCKED), need no record but that they went; and of
+/// MAX_STREAM_DATA and STREAM_DATA_BLOCKED, the stream each named, which its space keeps in order
+/// beside its packets ([`StreamRecord`]). Upstream boxed a packet's whole record for any of them and
+/// held each stream named in a hash set of its own, so every packet that carried a receiver's credit
+/// back made two allocations, freed at its acknowledgement (VENDORED.md §49; mantle's native PUT of
+/// 8 MiB: 2,608 boxes and 2,629 sets an operation). A record the space keeps grows its queue only
+/// to what is in flight, and the queue is kept.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Credit(u8);
+
+impl Credit {
+    /// Format: a bit of the record's byte, the packet carried a MAX_DATA frame (RFC 9000 §19.9).
+    const MAX_DATA: u8 = 1;
+    /// Format: a DATA_BLOCKED frame (RFC 9000 §19.12).
+    const DATA_BLOCKED: u8 = 1 << 1;
+    /// Format: a MAX_STREAMS frame for bidirectional streams (RFC 9000 §19.11).
+    const MAX_STREAMS_BI: u8 = 1 << 2;
+    /// Format: a MAX_STREAMS frame for unidirectional streams (RFC 9000 §19.11).
+    const MAX_STREAMS_UNI: u8 = 1 << 3;
+    /// Format: a STREAMS_BLOCKED frame for bidirectional streams (RFC 9000 §19.14).
+    const STREAMS_BLOCKED_BI: u8 = 1 << 4;
+    /// Format: a STREAMS_BLOCKED frame for unidirectional streams (RFC 9000 §19.14).
+    const STREAMS_BLOCKED_UNI: u8 = 1 << 5;
+    /// Format: the packet's space holds records of the streams it named.
+    const NAMED_STREAMS: u8 = 1 << 6;
+
+    fn has(self, bit: u8) -> bool {
+        self.0 & bit != 0
+    }
+
+    fn max_streams(dir: Dir) -> u8 {
+        match dir {
+            Dir::Bi => Self::MAX_STREAMS_BI,
+            Dir::Uni => Self::MAX_STREAMS_UNI,
+        }
+    }
+
+    fn streams_blocked(dir: Dir) -> u8 {
+        match dir {
+            Dir::Bi => Self::STREAMS_BLOCKED_BI,
+            Dir::Uni => Self::STREAMS_BLOCKED_UNI,
+        }
+    }
+
+    /// Whether the packet's space holds records of the streams it named.
+    pub(super) fn named_streams(self) -> bool {
+        self.has(Self::NAMED_STREAMS)
+    }
+
+    /// Whether nothing recorded inline is still to send, as `Retransmits::is_empty` judges it.
+    fn is_empty(self, streams: &StreamsState) -> bool {
+        !self.has(Self::MAX_DATA)
+            && !(self.has(Self::DATA_BLOCKED) && streams.can_send_data_blocked())
+            && !self.has(Self::MAX_STREAMS_BI | Self::MAX_STREAMS_UNI)
+            && !Dir::iter().any(|dir| {
+                self.has(Self::streams_blocked(dir)) && streams.can_send_streams_blocked(dir)
+            })
+    }
+}
+
+impl ::std::ops::BitOrAssign<Credit> for Retransmits {
+    fn bitor_assign(&mut self, rhs: Credit) {
+        self.max_data |= rhs.has(Credit::MAX_DATA);
+        self.data_blocked |= rhs.has(Credit::DATA_BLOCKED);
+        for dir in Dir::iter() {
+            *self.max_stream_id.get_mut(dir) |= rhs.has(Credit::max_streams(dir));
+            *self.streams_blocked.get_mut(dir) |= rhs.has(Credit::streams_blocked(dir));
+        }
+    }
+}
+
+/// A stream a sent packet's MAX_STREAM_DATA (or, where `blocked`, STREAM_DATA_BLOCKED) frame
+/// named, kept by its space in packet number order while the packet is in flight.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct StreamRecord {
+    packet: u64,
+    stream: StreamId,
+    blocked: bool,
+}
+
+impl StreamRecord {
+    fn requeue(&self, pending: &mut Retransmits) {
+        if self.blocked {
+            pending.stream_data_blocked.insert(self.stream);
+        } else {
+            pending.max_stream_data.insert(self.stream);
+        }
+    }
+}
+
+/// Where packet `number`'s records are in `records`, which is in packet number order.
+fn stream_range(records: &VecDeque<StreamRecord>, number: u64) -> Range<usize> {
+    let start = records.partition_point(|record| record.packet < number);
+    let end = records.partition_point(|record| record.packet <= number);
+    start..end.max(start)
+}
+
+/// Whether packet `number` carried nothing still to send, as upstream's `is_empty` of its record.
+fn packet_is_empty(
+    records: &VecDeque<StreamRecord>,
+    number: u64,
+    packet: &SentPacket,
+    streams: &StreamsState,
+) -> bool {
+    packet.retransmits.is_empty(streams)
+        && packet.credit.is_empty(streams)
+        && (!packet.credit.named_streams()
+            || records.range(stream_range(records, number)).all(|record| {
+                if record.blocked {
+                    streams.stream_data_blocked_limit(record.stream).is_none()
+                } else {
+                    !streams.can_send_flow_control(record.stream)
+                }
+            }))
+}
+
+/// Adds a copy of packet `number`'s stream records to `pending`.
+fn copy_streams(records: &VecDeque<StreamRecord>, number: u64, pending: &mut Retransmits) {
+    for record in records.range(stream_range(records, number)) {
+        record.requeue(pending);
+    }
+}
+
+/// The streams a packet being built named first, which its space records once it is sent.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct StreamsNamed {
+    max_stream_data: Option<StreamId>,
+    stream_data_blocked: Option<StreamId>,
+}
+
+/// What a packet being built carried that its loss sends again: the credit frames inline
+/// ([`Credit`]), the first stream named by each kind of stream credit frame to be recorded by its
+/// space, and the rest boxed as upstream's record.
+#[derive(Debug, Default)]
+pub(super) struct Recording {
+    credit: Credit,
+    streams: StreamsNamed,
+    retransmits: ThinRetransmits,
+}
+
+impl Recording {
+    fn set(&mut self, bit: u8) {
+        self.credit.0 |= bit;
+    }
+
+    pub(super) fn set_max_data(&mut self) {
+        self.set(Credit::MAX_DATA);
+    }
+
+    pub(super) fn set_data_blocked(&mut self) {
+        self.set(Credit::DATA_BLOCKED);
+    }
+
+    pub(super) fn set_max_stream_id(&mut self, dir: Dir) {
+        self.set(Credit::max_streams(dir));
+    }
+
+    pub(super) fn set_streams_blocked(&mut self, dir: Dir) {
+        self.set(Credit::streams_blocked(dir));
+    }
+
+    /// Records a MAX_STREAM_DATA frame for stream `id`: the packet's first by its space, the
+    /// rest in the box.
+    pub(super) fn add_max_stream_data(&mut self, id: StreamId) {
+        match self.streams.max_stream_data {
+            None => {
+                self.streams.max_stream_data = Some(id);
+                self.set(Credit::NAMED_STREAMS);
+            }
+            Some(first) if first == id => {}
+            Some(_) => {
+                self.get_or_create().max_stream_data.insert(id);
+            }
+        }
+    }
+
+    /// Records a STREAM_DATA_BLOCKED frame for stream `id`: the packet's first by its space, the
+    /// rest in the box.
+    pub(super) fn add_stream_data_blocked(&mut self, id: StreamId) {
+        match self.streams.stream_data_blocked {
+            None => {
+                self.streams.stream_data_blocked = Some(id);
+                self.set(Credit::NAMED_STREAMS);
+            }
+            Some(first) if first == id => {}
+            Some(_) => {
+                self.get_or_create().stream_data_blocked.insert(id);
+            }
+        }
+    }
+
+    /// The frames recorded in collections, boxed as upstream's record
+    pub(super) fn get_or_create(&mut self) -> &mut Retransmits {
+        self.retransmits.get_or_create()
+    }
+
+    /// The packet's record, its credit frames, and the streams its space records once it is sent.
+    pub(super) fn into_parts(self) -> (ThinRetransmits, Credit, StreamsNamed) {
+        (self.retransmits, self.credit, self.streams)
+    }
+}
+
 /// A variant of `Retransmits` which only allocates storage when required
 #[derive(Debug, Default, Clone)]
 pub(super) struct ThinRetransmits {
@@ -628,6 +929,13 @@ impl ThinRetransmits {
     /// Returns a reference to the retransmits stored in this box
     pub(super) fn get(&self) -> Option<&Retransmits> {
         self.retransmits.as_deref()
+    }
+
+    /// The streams whose RESET_STREAM the packet carried, with their codes.
+    pub(super) fn reset_stream(&self) -> &[(StreamId, VarInt)] {
+        self.retransmits
+            .as_ref()
+            .map_or(&[], |retransmits| &retransmits.reset_stream)
     }
 
     /// Returns a mutable reference to the stored retransmits
@@ -1251,11 +1559,6 @@ impl SentPackets {
         self.packets.iter().map(|(_, packet)| packet)
     }
 
-    /// Every packet held, in order, to change.
-    pub(super) fn values_mut(&mut self) -> impl Iterator<Item = &mut SentPacket> {
-        self.packets.iter_mut().map(|(_, packet)| packet)
-    }
-
     /// Every packet held, in order, taken.
     pub(super) fn into_values(self) -> impl Iterator<Item = SentPacket> {
         self.packets.into_iter().map(|(_, packet)| packet)
@@ -1275,6 +1578,7 @@ mod test {
             size: (number % u64::from(u16::MAX)) as u16,
             ack_eliciting: true,
             retransmits: ThinRetransmits::default(),
+            credit: Credit::default(),
             stream_frames: frame::StreamMetaVec::new(),
             copied: false,
             handshake_flight: false,

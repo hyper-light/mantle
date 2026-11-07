@@ -543,6 +543,17 @@ pub struct FastStats {
     pub recovered: u64,
 }
 
+/// The entries a member committed as leader since it opened, by the quorum that committed each
+/// first (core step R-8, `docs/raft.md` §3.7): its owner's count of what held quorums answered
+/// sooner than disks. The fast track's are [`FastStats::committed`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommitStats {
+    /// Committed by a classic quorum, its members' disks.
+    pub classic: u64,
+    /// Committed by a held quorum before the classic one held them.
+    pub held: u64,
+}
+
 /// What decides a member's next campaign when it elects by suspicion ([`Raft::campaign_state`]),
 /// for its owner to report: a campaign that does not come is one of these.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -712,6 +723,8 @@ pub struct Raft<S> {
     pub(crate) voted_to: (u64, NodeId),
     /// What the fast track did here since the member opened.
     pub(crate) fast_stats: FastStats,
+    /// What this member committed as leader since it opened, by quorum.
+    commit_stats: CommitStats,
     pub(crate) holders: Vec<NodeId>,
     /// In a fast group that this member leads: the voters of the
     /// configuration it counted by when it was elected, by which a member
@@ -1389,6 +1402,7 @@ impl<S: Storage> Raft<S> {
             takes_through: None,
             voted_to: (0, 0),
             fast_stats: FastStats::default(),
+            commit_stats: CommitStats::default(),
             holders: Vec::new(),
             term_voters: Vec::new(),
             term_next: Vec::new(),
@@ -1732,6 +1746,11 @@ impl<S: Storage> Raft<S> {
     pub fn has_pending_conf(&self) -> bool {
         self.pending_conf_index > self.log.applied()
     }
+    /// What this member committed as leader since it opened, by the quorum that committed each
+    /// entry first.
+    pub fn commit_stats(&self) -> CommitStats {
+        self.commit_stats
+    }
     /// Whether this leader committed the blank entry it began its term with: it serves reads only
     /// once it has, as then it knows every entry committed before its term (the thesis's §6.4: a
     /// leader "commit[s] a blank no-op entry into the log at the start of its term"). An entry of
@@ -2053,8 +2072,21 @@ impl<S: Storage> Raft<S> {
             self.term
         };
         // The first of the classic quorum and a held one commits (R-8, `docs/raft.md` §3.7).
+        let before = self.log.committed();
         let held = self.held_quorum_index()?;
         let classic = self.log.maybe_commit(index.max(held), term)?;
+        if classic {
+            // What the commit moved through the classic quorum's index it holds; past it, only
+            // the held quorum did.
+            let after = self.log.committed();
+            let stats = &mut self.commit_stats;
+            stats.classic = stats
+                .classic
+                .saturating_add(after.min(index).saturating_sub(before));
+            stats.held = stats
+                .held
+                .saturating_add(after.saturating_sub(before.max(index)));
+        }
         // The quorum holds this leader's entry at `index`, so every later leader's log holds it
         // and every entry before it: what this member holds by itself through it is held no more.
         // A fast quorum may have committed it first. The members learn it with the next append or
@@ -2814,6 +2846,7 @@ impl<S: Storage> Raft<S> {
             return Ok(false);
         };
         watch.now = watch.now.max(now);
+        watch.time_grant();
         if self.state == StateRole::Leader {
             return self.wake_leader(now);
         }
@@ -2927,6 +2960,7 @@ impl<S: Storage> Raft<S> {
             self.stop_asking()?;
         }
         let (promotable, local, term) = (self.promotable(), self.config.seed, self.term);
+        let candidate = self.state == StateRole::Candidate;
         let alone = self.tracker.is_singleton() && self.tracker.configuration().votes(self.id);
         // A sole voter's campaign in its term waits for its own vote to be durable (I9), which
         // alone elects it.
@@ -2958,16 +2992,20 @@ impl<S: Storage> Raft<S> {
             Arm::Off => Arm::Unset { round: true },
             armed => armed,
         };
+        // A round, and at least as long as a grant takes (`Watch::grant_wait`): a candidacy given
+        // up before its voters could grant spends a term and asks them again.
+        let grant_wait = watch.grant_wait;
         watch.campaign = match armed {
             Arm::Unset { round } => match (watch.round(), watch.draw(local)) {
                 (Some(tail), Some(delay)) => Arm::At(
-                    now.saturating_add(if round { tail } else { 0 })
+                    now.saturating_add(if round { tail.max(grant_wait) } else { 0 })
                         .saturating_add(delay),
                 ),
                 _ => armed,
             },
             armed => armed,
         };
+        watch.hold_candidacy(candidate.then_some(term));
         // A sole voter has no one to split a vote with, nor a leader to
         // suspect: it campaigns at once, timed or not.
         let due = (alone && promotable)
@@ -3051,6 +3089,9 @@ impl<S: Storage> Raft<S> {
         self.reset(term)?;
         self.vote = self.id;
         self.state = StateRole::Candidate;
+        if let Some(watch) = self.watch.as_mut() {
+            watch.stand(term);
+        }
         self.refresh_held_promise()
     }
     fn become_pre_candidate(&mut self) -> Result<()> {
@@ -3290,6 +3331,14 @@ impl<S: Storage> Raft<S> {
             return Err(Error::Violation(
                 "a term or an index beyond what is counted",
             ));
+        }
+        if kind == MessageType::MsgRequestVoteResponse
+            && !message.reject
+            && let Some(watch) = self.watch.as_mut()
+        {
+            // A grant, of whatever term and whatever this member is now: timed at the next wake,
+            // on its clock (`Watch::grant_wait`).
+            watch.heard_grant = Some(message.term);
         }
         if self.step_term(kind, &message)? == TermChecked::Done {
             return Ok(());

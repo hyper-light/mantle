@@ -33,6 +33,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use hyper_quic::coding::Codec;
 use hyper_quic::congestion::Congestion;
 use hyper_quic::rustls::pki_types::CertificateDer;
@@ -50,7 +51,9 @@ use crate::credit::{
     K_GRANULARITY, MIN_DATAGRAM, Room, Window, class_reserve, initial_window, stream_window_ceiling,
 };
 use crate::deadlines;
-use crate::exchange::{End, Exchange, In, Incoming, Out, Outgoing, Pushed, abandon, pull, push};
+use crate::exchange::{
+    End, Exchange, In, Incoming, Out, Outgoing, Pushed, abandon, pull, push, push_owned,
+};
 use crate::frame::{PREFIX_BYTES, Prefix};
 use crate::lane::{LaneIn, LaneOut, NotesOut, OPENER_BYTES, Reading, VARINT_MOST, opened};
 use crate::pool::{Pool, PoolStats, Share};
@@ -122,7 +125,33 @@ pub struct Limits {
     /// taken: a rule that tracks a count, which an owner deriving its places from its memory
     /// would make tens of thousands, the crypto of every one done before the first Retry.
     pub retry_bytes: Option<u64>,
+    /// How the endpoint's connections ask their peers to acknowledge what they send.
+    pub acknowledgement: Acknowledgement,
+    /// The forward erasure correction of its connections' stream data, at most this many packets
+    /// wide (hyper-quic's `TransportConfig::fec_window`): `None` codes nothing. A connection codes
+    /// only while its path loses, and what its coding holds is charged to the budget as it is
+    /// held, its coding forgotten where the budget refuses ([`Stats::fec_refused`]).
+    pub fec_window: Option<u32>,
 }
+
+/// How a connection asks its peer to acknowledge its packets, through the acknowledgement
+/// frequency extension every peer takes (draft-ietf-quic-ack-frequency; docs/transport.md §4ak).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Acknowledgement {
+    /// An ACK for every 10 ack-eliciting packets or a quarter of the smoothed round trip after the
+    /// first one waiting, from the 100th packet on, as Google QUIC's receivers do (§4k): for a
+    /// stream of data whose sender's congestion control waits on its acknowledgements.
+    Decimated,
+    /// An ACK for every 10 ack-eliciting packets or within RFC 9000's default max_ack_delay
+    /// ([`REPLY_ACK_DELAY`]), whichever comes first: for requests a reply answers, the reply
+    /// carrying the request's acknowledgement where it goes sooner, so none goes alone.
+    Replies,
+}
+
+/// RFC 9000 §18.2's default max_ack_delay: "If this value is absent, a default of 25 milliseconds
+/// is assumed." What an endpoint whose packets replies answer ([`Acknowledgement::Replies`]) asks
+/// its peer to acknowledge within.
+pub const REPLY_ACK_DELAY: Duration = Duration::from_millis(25);
 
 /// How connections are given the exchanges their peers may open at once (QUIC's bidirectional
 /// stream credit, RFC 9000 §4.6; docs/transport.md §4g).
@@ -219,8 +248,12 @@ impl Limits {
             .send_window(self.window_ceiling)
             .max_idle_timeout(Some(idle))
             .keep_alive_interval(self.keep_alive)
-            .congestion(congestion.clone())
-            .decimate_acks();
+            .fec_window(self.fec_window)
+            .congestion(congestion.clone());
+        match self.acknowledgement {
+            Acknowledgement::Decimated => transport.decimate_acks(),
+            Acknowledgement::Replies => transport.decimate_acks_within(REPLY_ACK_DELAY),
+        };
         // MTU discovery searches up to what the peer takes and the path carries, as the path's
         // socket tells it (`Endpoint::set_path_ceiling`), not to quinn's 1,452-byte default: a
         // jumbo-frame path carried 8,954-byte datagrams, and a bus node at a million messages a
@@ -332,6 +365,11 @@ pub struct Stats {
     /// The connections' state as charged, learned from what the owner observes
     /// ([`Endpoint::observe`]).
     pub state: StateStats,
+    /// Connections whose forward erasure correction the budget could not fund as it grew, and so
+    /// forgot what it held ([`Limits::fec_window`]).
+    pub fec_refused: u64,
+    /// The bytes the connections' forward erasure correction holds now, charged as held.
+    pub fec_charged: u64,
     /// Notes made for peers, each naming the exchanges served whose owners said since the last that
     /// they were at work on them ([`Endpoint::working`]).
     pub notes_made: u64,
@@ -450,6 +488,8 @@ struct Conn<R> {
     delivered: Delivered,
     /// The budget's grants for the receive window: the initial one and one per growth.
     grants: Vec<Reservation>,
+    /// The budget's grant for what its forward erasure correction holds, as it holds it.
+    fec: Reservation,
     /// When its window was set back, while its growth's grants go back as its peer's reads pay
     /// what QUIC still owes of the credit given (`Core::repay`).
     set_back: Option<Instant>,
@@ -1048,6 +1088,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             let sent = conn
                 .quic
                 .poll_transmit(now, max_datagrams.max(1), out, self.quic.configs());
+            // What it sent may be sources its coding keeps
+            self.core.charge_fec(conn);
             // Sending, or finding nothing to send, moves the connection's timers.
             self.rearm_later(key);
             if let Some(transmit) = sent {
@@ -1543,7 +1585,23 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     /// when credit ran out ([`Event::Writable`] says when more can be taken). The last byte
     /// written writes the body's checksum and finishes the message.
     pub fn write_body(&mut self, exchange: ExchangeId, from: &[u8]) -> Result<usize, Refusal> {
-        self.with_exchange(exchange, |core, conn, id| core.write_body(conn, id, from))
+        self.with_exchange(exchange, |core, conn, id| {
+            core.write_body(conn, id, Body::Borrowed(from))
+        })
+    }
+
+    /// [`Endpoint::write_body`] of bytes the owner holds as [`Bytes`], handed to QUIC as they are:
+    /// a borrowed body is copied into a buffer of QUIC's own as it is written, one allocation of its
+    /// bytes a write, where this one is kept by reference until the peer acknowledges it. Returns
+    /// how many were taken; the owner offers the rest (`from.slice(taken..)`) again.
+    pub fn write_body_bytes(
+        &mut self,
+        exchange: ExchangeId,
+        from: &Bytes,
+    ) -> Result<usize, Refusal> {
+        self.with_exchange(exchange, |core, conn, id| {
+            core.write_body(conn, id, Body::Owned(from))
+        })
     }
 
     /// Read the next bytes of the peer's body on `exchange` into `into`, as many as it has room
@@ -1844,6 +1902,11 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 .filter(|conn| conn.room.is_some())
                 .count(),
             state: self.core.state.stats(),
+            fec_charged: self
+                .conns
+                .iter()
+                .flatten()
+                .fold(0u64, |sum, conn| sum.saturating_add(conn.fec.granted())),
             ..self.core.stats
         }
     }
@@ -2301,6 +2364,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             window: Window::new(initial, limits.window_ceiling),
             delivered: Delivered::new(C::RANKS),
             grants,
+            fec: Reservation::default(),
             set_back: None,
             listed: false,
             lost: false,
@@ -2450,6 +2514,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             }
         }
         self.core.progress(now, &mut conn);
+        self.core.charge_fec(&mut conn);
         self.put(key, conn);
         self.endpoint_events(key);
         let drained = self
@@ -2875,7 +2940,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                     .join(&mut conn.share, initial, conn.key, conn.serial);
                 if self
                     .pool
-                    .welcome(&mut conn.share, self.limits.streams_per_connection)
+                    .welcome(
+                        &mut conn.share,
+                        self.limits.streams_per_connection,
+                        conn.key,
+                        conn.serial,
+                    )
                     .is_some()
                 {
                     conn.quic
@@ -3013,6 +3083,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 self.room.release(grant.granted());
             }
             self.budget.release(grant);
+        }
+        let fec = std::mem::take(&mut conn.fec);
+        if fec.granted() > 0 {
+            self.budget.release(fec);
         }
         if let Some(share) = self.state.gone() {
             self.budget.release(share);
@@ -3816,8 +3890,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         &mut self,
         conn: &mut Conn<C::Role>,
         id: u64,
-        from: &[u8],
+        body: Body<'_>,
     ) -> Result<usize, Refusal> {
+        let from = body.bytes();
         let allowed = self.allowed(conn, self.rank_of(id));
         let exchange = self.exchanges.get_mut(id).ok_or(Refusal::UnknownExchange)?;
         match exchange.out.state {
@@ -3832,7 +3907,11 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             return Err(Refusal::Order);
         }
         let stream = exchange.stream.ok_or(Refusal::Order)?;
-        let took = match pushed(push(&mut conn.quic, stream, from, allowed)) {
+        let written = match body {
+            Body::Borrowed(from) => push(&mut conn.quic, stream, from, allowed),
+            Body::Owned(from) => push_owned(&mut conn.quic, stream, from, allowed),
+        };
+        let took = match pushed(written) {
             Ok(took) => took,
             Err(failure) => {
                 self.finish_exchange(conn, id, Some(failure));
@@ -4404,6 +4483,46 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         let reserve = class_reserve(C::RANKS.saturating_sub(1));
         if let Ok(window) = VarInt::from_u64(grown.saturating_add(reserve)) {
             conn.quic.set_receive_window(window);
+        }
+    }
+
+    /// What `conn`'s forward erasure correction holds (hyper-quic's `Connection::fec_held_bytes`),
+    /// charged as it is held: grown from the budget on [`Lane::Window`], accounting only, as it
+    /// grows, and given back as it shrinks. Coding the budget refuses is forgotten
+    /// (`Connection::fec_forget`): its losses are repaired by retransmission, so nothing it held
+    /// was owed.
+    fn charge_fec(&mut self, conn: &mut Conn<C::Role>) {
+        let held = u64::try_from(conn.quic.fec_held_bytes()).unwrap_or(u64::MAX);
+        let charged = conn.fec.granted();
+        if held > charged {
+            let grown = match self
+                .budget
+                .reserve(held.saturating_sub(charged), Lane::Window)
+            {
+                Ok(grant) if charged == 0 => {
+                    conn.fec = grant;
+                    true
+                }
+                Ok(grant) => match conn.fec.absorb(grant) {
+                    Ok(()) => true,
+                    Err(grant) => {
+                        self.budget.release(grant);
+                        false
+                    }
+                },
+                Err(_) => false,
+            };
+            if !grown {
+                conn.quic.fec_forget();
+                self.stats.fec_refused = self.stats.fec_refused.saturating_add(1);
+            }
+        }
+        let held = u64::try_from(conn.quic.fec_held_bytes()).unwrap_or(u64::MAX);
+        let excess = conn.fec.granted().saturating_sub(held);
+        if excess > 0
+            && let Some(part) = conn.fec.split(excess)
+        {
+            self.budget.release(part);
         }
     }
 
@@ -5101,6 +5220,23 @@ fn ended(end: End, short: bool) -> Result<(), (Refusal, bool)> {
         End::Reset(code) => Err((Refusal::from_code(code), true)),
         End::Finished | End::Closed if short => Err((Refusal::Corrupt, false)),
         End::Open | End::Blocked | End::Finished | End::Closed => Ok(()),
+    }
+}
+
+/// A body's next bytes as the owner offers them: borrowed, copied as QUIC takes them, or held as
+/// [`Bytes`], taken by reference.
+#[derive(Clone, Copy)]
+enum Body<'a> {
+    Borrowed(&'a [u8]),
+    Owned(&'a Bytes),
+}
+
+impl Body<'_> {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(from) => from,
+            Self::Owned(from) => from,
+        }
     }
 }
 

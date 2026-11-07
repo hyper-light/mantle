@@ -243,6 +243,38 @@ fn a_connected_socket_on_windows_reads_its_paths_payload() {
     assert!(payload.is_some_and(|bytes| bytes >= 1_200), "{payload:?}");
 }
 
+/// kiln's CP-T2.2 step 7 (Quiver's three-machine lab): on Windows a datagram socket that sent to a
+/// closed port is told nothing of it on its next receive (`SIO_UDP_CONNRESET` off), so a socket
+/// that sent to a peer that went away (a killed process's port) still receives from the peers that
+/// stay. Do: send to a port nothing holds, then have a live peer send; read without waiting. Expect:
+/// the live peer's datagram, and no astray report. Before the fix the read met `WSAECONNRESET` for
+/// the closed port instead, and the lab's publisher on Windows never connected again.
+#[cfg(windows)]
+#[test]
+fn a_socket_that_sent_to_a_closed_port_on_windows_still_receives_from_its_peers() {
+    let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+    // A port nothing holds: bound, then let go.
+    let closed = {
+        let gone = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        gone.local_addr().unwrap()
+    };
+    socket.send_to(b"to nobody", closed).unwrap();
+    // On loopback the port-unreachable for it comes back at once.
+    std::thread::sleep(Duration::from_millis(200));
+    let peer = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+    peer.send_to(b"from a peer", socket.local_addr().unwrap())
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let mut buf = [0u8; 64];
+    let got = socket.try_recv_from(&mut buf).unwrap();
+    assert_eq!(
+        got.map(|(n, _)| buf[..n].to_vec()),
+        Some(b"from a peer".to_vec()),
+        "the peer's datagram, not a reset for the closed port"
+    );
+    assert_eq!(socket.astray_reports(), 0, "no reset reported");
+}
+
 /// A socket that serves many peers (a listener, never connected) reads the payload of the path to
 /// any one of them as a socket connected there would: the same payload, on every platform that can
 /// say, and nothing sent.

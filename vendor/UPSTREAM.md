@@ -87,8 +87,29 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `0a182ae` (hyper-raft branch `progress-notes-reachable`: `c68032a` and the
-progress notes, branch `progress-notes`' `844cad0` on `liveness-reachable`, for mantle's step 2 of
+**Every crate at `3d6640f` (hyper-raft `main`: its merge of `lean-doors`, the cuts of mantle's
+ledger of its native door, docs/research/80 "The sites", on main's `d5d5f8f`), with no local
+delta**, taken by `scripts/snapshot-hyper-raft.py`. The cuts: hyper-durable's `Owner::pairs` tells
+an unchanged configuration in place (`4a6ec51`); hyper-quic's queue of a stream's pieces is never
+shrunk below its first growth, and a sent packet's credit frames are recorded inline and the
+streams its MAX_STREAM_DATA and STREAM_DATA_BLOCKED name by its space (`6406ee5`, hyper-quic
+VENDORED.md §49); hyper-transport's `Endpoint::write_body_bytes` writes a body the owner holds as
+`Bytes` without copying it (`7541647`, docs/transport.md §4ao); hyper-rt's receive buffers are made
+unwritten, the kernel writing them on Linux (`4fcdabc`). Main past `0a182ae` came with them:
+hyper-transport's kept stream of a pooled connection (`57842d3`, §4aj; mantle's credit is
+`StreamCredit::Fixed`, which keeps none), the reply acknowledgement (`b5edd11`, §4ak,
+`Limits::acknowledgement`) and forward erasure correction (`c0d6ca8`, §4al, `Limits::fec_window`;
+hyper-quic §47, with `6e7d184`, `6c375d3`, `62f568d`, `efc16f4`), BBR's recovery window never less
+than the latest round's delivery (`efc16f4`, hyper-quic §48), hyper-raft's candidacy as long as its
+grants take (`831bfd9`, `d804110`) and a leader's commits counted by the quorum that made each first
+(`d5d5f8f`, R-8), hyper-rt's Windows reactor issuing one AFD poll a socket in
+flight (`392407f`, `53a28a0`, `aee1ab6`) and a Windows datagram socket not reporting an earlier
+datagram's ICMP port-unreachable as a reset (`6b5f176`, `22d5037`), and hyper-measure's and
+hyper-rt's test fixes (`178f4e3`, `a66e1c0`). The two `Limits` fields are mantle's to state
+(`crates/protocol/src/bounds.rs`): `Acknowledgement::Decimated` and no erasure code keep its wire as
+it was at `0a182ae`; a member opens on 88 bytes more for `d804110`'s grants
+(`derive::MEMBER_BYTES`), and a turn's allocations fell with the cuts (`tests/turn_allocs.rs`). Before it, every crate was at `0a182ae` (hyper-raft branch
+`progress-notes-reachable`: `c68032a` and the progress notes, branch `progress-notes`' `844cad0` on `liveness-reachable`, for mantle's step 2 of
 its waits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py` (Python 3.11 or
 later). Its commit changes hyper-transport alone: `Endpoint::working`, an owner's statement that its
 work for an exchange it serves advanced, sent at most one note a beat a connection on a lane of its

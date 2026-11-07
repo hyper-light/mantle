@@ -559,13 +559,13 @@ pub(crate) mod imp {
     use windows_sys::Win32::Networking::WinSock::{
         AF_INET, AF_INET6, FIONBIO, FIONREAD, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0,
         INVALID_SOCKET, IP_DONTFRAGMENT, IP_MTU, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_UDP,
-        IPV6_DONTFRAG, IPV6_MTU, IPV6_V6ONLY, SO_RCVBUF, SO_TYPE, SOCK_DGRAM, SOCKADDR,
-        SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR,
-        SOL_SOCKET, WSADATA, WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH, WSAEINTR,
-        WSAEMSGSIZE, WSAENETRESET, WSAENETUNREACH, WSAENOPROTOOPT, WSAENOTCONN, WSAEWOULDBLOCK,
-        WSAGetLastError, WSAStartup, bind as ws_bind, closesocket, connect as ws_connect,
-        getsockname, getsockopt, ioctlsocket, recvfrom as ws_recvfrom, send as ws_send,
-        sendto as ws_sendto, setsockopt, socket as ws_socket,
+        IPV6_DONTFRAG, IPV6_MTU, IPV6_V6ONLY, SIO_UDP_CONNRESET, SO_RCVBUF, SO_TYPE, SOCK_DGRAM,
+        SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKADDR_STORAGE, SOCKET,
+        SOCKET_ERROR, SOL_SOCKET, WSADATA, WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH,
+        WSAEINTR, WSAEMSGSIZE, WSAENETRESET, WSAENETUNREACH, WSAENOPROTOOPT, WSAENOTCONN,
+        WSAEWOULDBLOCK, WSAGetLastError, WSAIoctl, WSAStartup, bind as ws_bind, closesocket,
+        connect as ws_connect, getsockname, getsockopt, ioctlsocket, recvfrom as ws_recvfrom,
+        send as ws_send, sendto as ws_sendto, setsockopt, socket as ws_socket,
     };
 
     use core::net::{Ipv6Addr, SocketAddrV6};
@@ -667,6 +667,7 @@ pub(crate) mod imp {
             family,
         };
         set_nonblocking(socket.socket)?;
+        set_no_connreset(socket.socket)?;
         if family == Family::V6 {
             set_int(
                 socket.socket,
@@ -678,6 +679,37 @@ pub(crate) mod imp {
         }
         set_dont_fragment(&socket)?;
         Ok(socket)
+    }
+
+    /// Tells datagram socket `socket` not to report an ICMP port-unreachable for a datagram it sent
+    /// earlier as a reset on its next receive (`SIO_UDP_CONNRESET` off). Windows otherwise fails
+    /// the next `recvfrom` with `WSAECONNRESET`, and a socket that sends to peers that go away (a
+    /// killed process's closed port) meets it again and again: Quiver's three-machine lab found a
+    /// publisher's socket on Windows that never connected again once its peers were killed
+    /// (kiln's CP-T2.2 step 7). The report says nothing of this socket; a peer that went away is
+    /// found by the transport's own timers.
+    pub(crate) fn set_no_connreset(socket: SOCKET) -> Result<(), RtError> {
+        let off: u32 = 0;
+        let mut returned: u32 = 0;
+        // SAFETY: SIO_UDP_CONNRESET takes one BOOL (4 bytes) by pointer and returns nothing; the
+        // locals outlive the call, and with no OVERLAPPED the call completes before it returns.
+        let done = unsafe {
+            WSAIoctl(
+                socket,
+                SIO_UDP_CONNRESET,
+                (&raw const off).cast(),
+                4,
+                core::ptr::null_mut(),
+                0,
+                &mut returned,
+                core::ptr::null_mut(),
+                None,
+            )
+        };
+        if done == SOCKET_ERROR {
+            return Err(last("WSAIoctl(SIO_UDP_CONNRESET)"));
+        }
+        Ok(())
     }
 
     /// Puts `socket` in non-blocking mode (`FIONBIO`), as every socket hyper-rt drives must be.

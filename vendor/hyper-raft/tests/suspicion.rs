@@ -94,6 +94,9 @@ struct Sim {
     timing: Timing,
     /// Every read a member answered: who, and the read's context.
     answered: Vec<(u64, Vec<u8>)>,
+    /// How much later than its other messages each member's vote answers arrive: its vote's
+    /// write, on a disk slower than the others' (a member grants once its vote is durable).
+    slow_votes: BTreeMap<u64, u64>,
 }
 
 impl Sim {
@@ -128,6 +131,7 @@ impl Sim {
             leaders: BTreeMap::new(),
             timing,
             answered: Vec::new(),
+            slow_votes: BTreeMap::new(),
         }
     }
     fn voters(voters: &[u64]) -> ConfState {
@@ -166,11 +170,16 @@ impl Sim {
             assert_eq!(leader, id, "two leaders of term {}", view.term);
         }
         for message in output.messages {
+            let write = if message.msg_type == MessageType::MsgRequestVoteResponse {
+                self.slow_votes.get(&id).copied().unwrap_or(0)
+            } else {
+                0
+            };
             self.sent.push(message.clone());
             self.sent_at.push(self.now);
             self.sent_count += 1;
             self.flight
-                .insert((self.now + LATENCY, self.sent_count), message);
+                .insert((self.now + LATENCY + write, self.sent_count), message);
         }
     }
     /// The next event: a message arriving, or a member's deadline. False when there is none.
@@ -1604,4 +1613,46 @@ fn ticks_and_suspicion_do_not_mix() {
         config.validate(),
         Err(hyper_raft::Error::Settings(_))
     ));
+}
+
+/// A candidate whose voter writes its vote slower than the candidate writes its own is elected by
+/// that voter's grant: once a grant has come, late or not, it knows how long one takes and gives
+/// each candidacy that long before it asks again (`Watch::grant_wait`). The round counts only the
+/// candidate's own writes (the owner's ballot): asking again a round and a draw on, it moved on
+/// before every grant came and spent a term each time, for ever while the voter's disk stayed slow
+/// (Quiver's lab, kiln's CP-T2.2 step 7: 113 terms for one leader's kill, 70 % of the grants
+/// coming after their candidate had moved on). The candidacies that start before the first grant
+/// can come go, each at least a round and a pre-vote's round trip; the one under way when it
+/// comes waits for its own grant and is elected.
+#[test]
+fn a_candidate_waits_for_a_voter_that_writes_its_vote_slowly() {
+    let (timing, _) = timing_for(3);
+    let slow = 8 * timing.round.as_nanos() as u64;
+    for seed in 0..64 {
+        let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, seed);
+        sim.found(1);
+        // Node 2 grants eight rounds after it is asked, and campaigns not at all: node 3 is the
+        // one candidate.
+        sim.slow_votes.insert(2, slow);
+        sim.node(2).raw.hold_campaigns(true).unwrap();
+        let before = sim.term(3);
+        sim.stop(1);
+        sim.suspect(2, 1);
+        sim.suspect(3, 1);
+        let until = sim.now + 200 * slow;
+        assert!(
+            sim.run_until_time(until, |sim| sim.leader() == Some(3)),
+            "seed {seed}: node 3 not elected within {} ms; in term {}, {} terms on",
+            200 * slow / 1_000_000,
+            sim.term(3),
+            sim.term(3) - before
+        );
+        let terms = sim.term(3) - before;
+        let round = timing.round.as_nanos() as u64;
+        let bound = 1 + (slow + 2 * LATENCY).div_ceil(round + 2 * LATENCY);
+        assert!(
+            terms <= bound,
+            "seed {seed}: {terms} terms to elect node 3, more than {bound}"
+        );
+    }
 }

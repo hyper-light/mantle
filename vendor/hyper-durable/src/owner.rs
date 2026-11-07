@@ -220,6 +220,29 @@ impl<L: LogStore, M: StateMachine, B: Budget> Owner<L, M, B> {
         else {
             return Ok(());
         };
+        // Most calls find the configuration's peers already attached: told so in place, they
+        // allocate nothing, where collecting them each call cost an allocation every turn of a
+        // group whose membership stood (mantle's loop: about 64 a second at rest). `attached` is
+        // sorted and free of repeats, so it equals the peers named when each is among them and
+        // each of them is named.
+        let named = |peer: &PeerId| {
+            entry
+                .replica
+                .as_ref()
+                .is_some_and(|replica| replica.peers().any(|other| other == *peer))
+        };
+        let unchanged = match (&entry.replica, gone) {
+            (Some(replica), false) => {
+                replica
+                    .peers()
+                    .all(|peer| entry.attached.binary_search(&peer).is_ok())
+                    && entry.attached.iter().all(named)
+            }
+            _ => entry.attached.is_empty(),
+        };
+        if unchanged {
+            return Ok(());
+        }
         let mut now: Vec<PeerId> = match (&entry.replica, gone) {
             (Some(replica), false) => replica.peers().collect(),
             _ => Vec::new(),

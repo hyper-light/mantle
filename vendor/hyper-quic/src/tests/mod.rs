@@ -1863,6 +1863,93 @@ fn data_blocked_retransmit() {
     );
 }
 
+/// A lost packet that carried a stream's STREAM_DATA_BLOCKED, the record of which its space keeps
+/// beside its packets (VENDORED.md §49), sends the frame again.
+#[test]
+fn stream_data_blocked_retransmit() {
+    let _guard = subscribe();
+    let server = ServerConfig {
+        transport: TransportConfig {
+            stream_receive_window: 10u32.into(),
+            ..TransportConfig::default()
+        },
+        ..server_config()
+    };
+    let mut pair = Pair::new(Default::default(), server);
+    let (client_ch, server_ch) = pair.connect();
+
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    assert_eq!(
+        pair.client_send(client_ch, s)
+            .write(b"0123456789ab")
+            .unwrap(),
+        10
+    );
+    assert_matches!(
+        pair.client_send(client_ch, s).write(b"c"),
+        Err(WriteError::Blocked)
+    );
+    pair.drive_client();
+    pair.server.inbound.clear(); // Lose the packet carrying the frame
+    pair.drive();
+
+    assert!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .frame_tx
+            .stream_data_blocked
+            > 1
+    );
+    assert!(
+        pair.server_conn_mut(server_ch)
+            .stats()
+            .frame_rx
+            .stream_data_blocked
+            > 0
+    );
+}
+
+/// A lost packet that carried the receiver's credit, MAX_DATA and a stream's MAX_STREAM_DATA,
+/// recorded inline and by its space (VENDORED.md §49), sends both again, and the sender, held
+/// at the old limits until then, finishes what it writes.
+#[test]
+fn credit_retransmit() {
+    let _guard = subscribe();
+    let server = ServerConfig {
+        transport: TransportConfig {
+            stream_receive_window: 10u32.into(),
+            receive_window: 10u32.into(),
+            ..TransportConfig::default()
+        },
+        ..server_config()
+    };
+    let mut pair = Pair::new(Default::default(), server);
+    let (client_ch, server_ch) = pair.connect();
+
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    assert_eq!(
+        pair.client_send(client_ch, s).write(b"0123456789").unwrap(),
+        10
+    );
+    pair.drive();
+    assert_matches!(pair.server_streams(server_ch).accept(Dir::Uni), Some(stream) if stream == s);
+    let mut recv = pair.server_recv(server_ch, s);
+    let mut chunks = recv.read(true).unwrap();
+    assert_matches!(chunks.next(usize::MAX), Ok(Some(chunk)) if chunk.bytes.len() == 10);
+    let _ = chunks.finalize();
+    pair.drive_server();
+    pair.client.inbound.clear(); // Lose the packet carrying the credit
+    pair.drive();
+
+    let stats = pair.server_conn_mut(server_ch).stats();
+    assert!(stats.frame_tx.max_data > 1, "{:?}", stats.frame_tx);
+    assert!(stats.frame_tx.max_stream_data > 1, "{:?}", stats.frame_tx);
+    assert_eq!(
+        pair.client_send(client_ch, s).write(b"0123456789").unwrap(),
+        10
+    );
+}
+
 #[test]
 fn key_update_simple() {
     let _guard = subscribe();
@@ -4485,6 +4572,61 @@ fn decimated_acks_come_from_the_hundredth_packet_every_tenth_or_a_quarter_round_
     );
     assert_eq!(
         server_acks_by(&mut pair, server_ch, Duration::from_millis(1)),
+        1
+    );
+
+    // Nine pings wait; the tenth is acknowledged at once, with the nine
+    for _ in 0..9 {
+        pair.client_conn_mut(client_ch).ping();
+        pair.drive_client();
+    }
+    assert_eq!(server_acks_by(&mut pair, server_ch, latency), 0);
+    pair.client_conn_mut(client_ch).ping();
+    pair.drive_client();
+    assert_eq!(server_acks_by(&mut pair, server_ch, latency), 1);
+}
+
+/// Decimation within a stated delay (`TransportConfig::decimate_acks_within`, VENDORED.md §46): from
+/// the 100th packet on, a packet alone waits the delay asked for its ACK, here 25 ms on a 1 ms
+/// round trip where a quarter of it would have been the peer's 1 ms granularity, and the tenth
+/// ack-eliciting packet is still acknowledged at once.
+#[test]
+fn decimated_acks_within_a_delay_wait_that_delay_and_every_tenth_packet_no_longer() {
+    let _guard = subscribe();
+    let mut client_config = client_config_with_deterministic_pns();
+    client_config
+        .transport
+        .decimate_acks_within(Duration::from_millis(25))
+        .mtu_discovery_config(None);
+    let mut pair = Pair::deterministic_pns(endpoint_config_without_warm_up());
+    let latency = Duration::from_micros(500);
+    pair.latency = latency;
+    let (client_ch, server_ch) = pair.connect_with(client_config);
+    pair.drive();
+    for _ in 0..100 {
+        pair.client_conn_mut(client_ch).ping();
+        pair.drive_client();
+    }
+    pair.drive();
+    assert_eq!(
+        pair.server_conn_mut(server_ch)
+            .stats()
+            .frame_rx
+            .ack_frequency,
+        1
+    );
+
+    // A ping alone waits the 25 ms asked for its ACK, past a quarter of the round trip and past
+    // the granularity
+    pair.client_conn_mut(client_ch).ping();
+    pair.drive_client();
+    assert_eq!(server_acks_by(&mut pair, server_ch, latency), 0);
+    assert_eq!(
+        server_acks_by(&mut pair, server_ch, Duration::from_millis(23)),
+        0
+    );
+    assert_eq!(
+        server_acks_by(&mut pair, server_ch, Duration::from_millis(2)),
         1
     );
 

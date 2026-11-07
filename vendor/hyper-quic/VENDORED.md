@@ -1636,3 +1636,146 @@ never over a 100 ms round trip with a server that answers; never on the server; 
 after a packet lost by time left nothing in flight (without the quiescence stop it told one four
 probe timeouts after the lost packet's send, `(1, 0)`, found by
 `a_retired_cid_routes_for_three_probe_timeouts`, whose drive the running timer kept from idling).
+
+## 46. Decimated acknowledgements within a stated delay (2026-10-27, found by focal)
+
+`config/transport.rs`: `TransportConfig::decimate_acks_within(max_ack_delay)` asks the peer to
+acknowledge as `decimate_acks` does (§33: an ACK for every 10 ack-eliciting packets
+from the 100th packet on, its reordering threshold the loss detector's packet threshold), but within
+`max_ack_delay` rather than a quarter of the smoothed round trip, the `AckFrequencyConfig` request
+clamped as any fixed request is (the peer's `min_ack_delay` below, the greater of the round trip and
+25 ms above). A quarter of a round trip shorter than 4 ms is the peer's 1 ms granularity, so a
+request whose reply came later than that was acknowledged alone ahead of its reply: focal's work
+mode took about 3.5 acknowledgement-only packets a write from its leader at 50 claims a second.
+draft-ietf-quic-ack-frequency-14 §2 names the cost ("Sending UDP datagrams is very CPU intensive on
+some platforms. A data receiver can decrease its CPU usage by reducing the number of
+acknowledgement-only packets sent"), and leaves the sender its choice of delay (§8, "Implementers
+can select an appropriate strategy to meet the needs of their applications"). Test:
+`tests::decimated_acks_within_a_delay_wait_that_delay_and_every_tenth_packet_no_longer` (a ping alone
+waits the 25 ms asked on a 1 ms round trip, where decimation acknowledged it at 1 ms; the tenth
+packet is acknowledged at once).
+
+
+## 47. Forward erasure correction of stream data (2026-10-28, found by focal)
+
+`erasure/`, `connection/fec.rs`: a connection whose endpoints both state a window
+(`TransportConfig::fec_window`; transport parameter 0x3fee, frames FEC_SOURCE 0x3fec and FEC_REPAIR
+0x3fed, none registered, so sent only to a peer that states one) codes its 1-RTT packets of stream
+data while its path loses. The code is RFC 8681's sliding-window random linear code over GF(2^8)
+(x^8 + x^4 + x^3 + x^2 + 1, §3.7.1), its coefficients drawn by each repair's key from TinyMT32
+(RFC 8682, its seed-1 validation vector tested), all nonzero (§3.6, DT 15). A source is a packet's
+frames as sent; a repair combines the sources sent since the oldest the peer has not acknowledged,
+none older than the loss delay (RFC 9002 §6.1.2), at most the span over which three repairs go. It
+sends repairs at three times the loss rate RFC 5348 §5.4's average loss interval measures,
+`3p/(1 − p)`, that factor measured (`fec.rs`'s `REPAIRS_PER_LOSS`), and codes only while the window
+holds that span and a repair falls due within each loss delay: a repair that comes after a loss's
+retransmission rebuilds nothing in time, so a sparse connection (an asker's requests) is not coded.
+A connection that codes stops only once its rule has failed for a whole loss delay, and its
+receiver forgets what it holds only once its packets of stream data have been no sources for one: a
+stop costs every equation still to solve. While a repair is due, the datagrams its window and pacer
+cut are no shorter than the repair's packet, which goes first; and a datagram is begun for a repair
+only where its frames' space holds it whole (`Connection::can_send_1rtt`, as for RFC 9221's
+datagrams upstream): a GSO batch's datagrams after the first are the first's size, so a repair
+larger than that waits for the next batch, which it begins. A repair is dropped, with its window,
+only for a path whose MTU fell below its sources (counted, `ConnectionStats::fec_repairs_dropped`).
+Dropped each time a pacer ran short or a batch began with a smaller datagram, focal's leader sent a
+repair for 4.9% of its sources where 9.6% were due, and its followers rebuilt 16 to 22% of their
+losses; `tests/replication.rs` had asked its connections for one datagram at a time and never made
+a batch, and asked for focal's 64 (`UDP_MAX_SEGMENTS`) it showed the same, a repair for 5.2% of the
+sources and 40% of the losses rebuilt, the commit's median 259 ms against 163 loss-free. A packet
+begun for a repair alone is ack-eliciting, in flight and under the window and the pacer: begun as
+one of acknowledgements, the repair after a burst's last source had been none of them. And a repair
+begins a transmit of its own: in the one that carried the sources it was made after, it shared
+their fate, and netem decides each socket buffer's loss before it segments one
+(`net/sched/sch_netem.c`'s `netem_enqueue`), so the 3% loss of focal's compare runs drops a
+segmented send whole. A path that loses its packets in bursts, consecutive packets lost together,
+spans them so that a burst is in as many repairs' spans for each of its packets as a single loss
+(`fec::Bursts`: the burst a lost packet is in, the last eight bursts' mean weighted by RFC 5348's
+weights and by size; a span of `b` times a single loss's and `b − 1` more, at most the window).
+With each transmit lost or kept whole at 3% (`tests/replication.rs`'s `batch_loss`), the followers
+rebuilt 78% of their losses with single losses' spans and repairs in their sources' transmits
+(focal's: 77 to 82%), now 83 to 84%, and the commit's 90th percentile is 196 to 197 ms where it
+was 229 to 246 (with §48). A receiver keeps the sources it holds and the repairs' equations in reduced row
+echelon form, and rebuilds a lost packet as soon as they are of full rank, taking its STREAM frames;
+a source missing when its window passes it is counted left to retransmission
+(`ConnectionStats::fec_unrebuilt`), which had counted the losses still to rebuild too and fell as
+they were rebuilt.
+The packet stays lost to its sender's loss detection and congestion control and is never
+acknowledged (RFC 9265 §6.3: "a recovered packet must be considered as a lost packet";
+draft-swett-nwcrg-coding-for-quic-04 §4.5). Every STREAM frame of a source states its length
+(`SendBuffer::poll_transmit_framed`): a rebuilt packet is read with its repair's zero padding after
+it (zeros are PADDING frames, RFC 9000 §19.1), and a frame left to run to its packet's end took that
+padding, and the source frame after it, for stream data. Each side holds what it can afford, up to
+its window: the owner charges `Connection::fec_held_bytes` as it is held and may take it back with
+`Connection::fec_forget`, after which losses are repaired by retransmission alone. Found by focal:
+under 80 ms and 3% loss each way, its leader sent each follower about 720 packets a second, about
+twenty lost a second on each ordered stream, each holding the stream a round trip until its
+retransmission came, and the commit, the first follower's answer, took 1.8 times the loss-free
+path's at the median. `tests/replication.rs` reproduces that load on hyper-sim's network, in
+focal's batches of 64 datagrams, measured once every follower has answered its catch-up: the code
+over 128 sources brings the commit to the loss-free path's at 1, 3, 5 and 10% loss (164 to 165 ms
+at 3% against 163 loss-free and 291 to 293 uncoded, its 99th percentile 286 against 440 to 476;
+166 ms at 10% against 433 to 443, its 99th percentile 283 to 299 against 655 to 666), its repairs
+10% of its sources at 3% and 96% of the losses rebuilt. Measured from a fixed ten seconds, the coded
+commit's 99th percentile at 10% loss was 1.1 to 1.3 s: the appends written behind the catch-up were
+still draining, the code's repairs and retransmissions taking half as much of the bottleneck again.
+Tests: `erasure::tests` (the field against shift-and-reduce, RFC 8682's
+outputs, the coefficients, rebuilds of one and of many losses, late sources, the decoder's bound),
+`connection::fec::tests` (the loss rate, the repair rate and span),
+`replication::the_code_repairs_what_replication_loses`, `the_code_repairs_what_a_segmented_send_loses_whole`,
+`a_path_that_loses_nothing_is_not_coded` and `a_coded_run_replays_from_its_seed_and_from_its_trace`.
+
+## 48. A recovery window no less than the latest round's delivery (2026-10-28, found by focal)
+
+`congestion/bbr/mod.rs`'s `calculate_recovery_window`: loss recovery holds BBR to what it had in
+flight at the loss and what each acknowledgement frees (Chromium's `CalculateRecoveryWindow`:
+packet conservation for a round, growth by what is acknowledged after), and now never to less than
+what the path delivered in its latest round trip, as BBRv3 bounds its own loss response
+(draft-ietf-ccwg-bbr-06 §5.5.10.3, `LossLowerBounds`: "BBR.inflight_shortterm =
+max(BBR.inflight_latest, BBR.Beta * BBR.inflight_shortterm)", `inflight_latest` "a 1-round-trip max
+of delivered volume of data"). The port leaves recovery only after a round trip with no loss, rare
+at 3% and a hundred packets a round trip, and enters it again at the next loss, conserved at what
+is then in flight. A sender the application limits had in flight, at a loss, what its last burst
+left, a few packets, and its next burst waited a round trip for acknowledgements: focal's leader,
+its appends bursts of a few datagrams. A sender that keeps its window in flight, two products
+(BBR's cwnd gain), delivers about one a round, so conservation still cuts what it holds past that.
+Measured on hyper-sim at focal's replication load (`tests/replication.rs`, each transmit lost whole
+at 3%): the uncoded commit's median 182 to 208 ms where it now is 166 to 172 (163 loss-free); with
+each datagram lost on its own, the coded commit's 90th percentile 187 to 193 ms where it now is 173
+to 180 (with §47's spans). Test:
+`congestion::bbr::tests::a_loss_holds_an_app_limited_sender_to_no_less_than_its_latest_round_delivered`.
+
+## 49. A stream's writes and a receiver's credit, recorded without allocating (2026-11-06, found by mantle)
+
+mantle's ledger of its native door (mantle `docs/research/80-the-doors-costs.md`, "The sites")
+counted, per native PUT of 8 MiB on its three servers, 1,745 allocations in `SendBuffer::write`,
+2,608 boxes made by `ThinRetransmits::get_or_create` for packets carrying MAX_DATA, and 2,629
+hash tables grown in `write_max_stream_data`, each made again for every write or packet:
+
+- **The queue of a stream's unacknowledged pieces** (`connection/send_buffer.rs`'s `advance`) is
+  shrunk once it holds under a quarter of its room, as before, but never below four pieces' room
+  (`KEPT_PIECES`, what the standard library's first growth of an empty vector takes): shrunk to
+  nothing whenever a write's data was all acknowledged, it was allocated again by the next write,
+  and shrunk below four it was grown back by the writes after.
+- **What a sent packet carried of the credit frames** is recorded inline (`connection/spaces.rs`'s
+  `Credit`): MAX_DATA, DATA_BLOCKED, MAX_STREAMS and STREAMS_BLOCKED a bit each, in the byte
+  `SentPacket` had spare, so its record stays 128 bytes (upstream's `sent_packet_size`). The stream a
+  packet's MAX_STREAM_DATA or STREAM_DATA_BLOCKED frame named, its first of each, is recorded by its
+  space beside its packets, in packet number order (`PacketSpace::stream_records`), and goes when the
+  packet does: acknowledged or given up (`PacketSpace::take`), lost and queued to send again
+  (`take_lost`), sent again by a probe or copied (`maybe_queue_probe`, `queue_copies`), or discarded
+  with its space (`take_all`). A packet's further streams and every other frame go in the boxed
+  record as upstream's did. A packet built records into `Recording`, split as it is sent.
+
+What is sent again for a loss is what upstream sent: the same frames, queued from the same records
+into the same pending set. Measured (`tests/allocs.rs`, a client writing 1 MiB to a server in
+4 KiB pieces through mantle's 12,000-byte windows, after a transfer to warm up): the server's
+transmissions through the transfer, its acknowledgements and the credit they carry, 175 allocations
+and 24,236 bytes before, 0 after (176 MAX_DATA and 174 MAX_STREAM_DATA frames sent over the
+connection); the client's 262 writes after a stream's first, written owned (`write_chunks`), 87
+allocations and 13,920 bytes before, 0 after, and written borrowed, each its copy alone (262
+allocations of 1,044,480 bytes) where 349 had been made. Tests: `allocs.rs`'s
+`credit_sent_back_allocates_nothing`, `an_owned_write_allocates_nothing` and
+`a_borrowed_write_allocates_its_copy_alone` (each fails before the change), and
+`a_received_datagram_is_handled_without_allocating`; `tests::credit_retransmit` and
+`tests::stream_data_blocked_retransmit`, a lost packet's credit and blocked frames sent again.

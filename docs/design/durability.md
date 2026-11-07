@@ -148,6 +148,17 @@ counts such a chunk toward a block's scheme only with the device's loss rate rai
 losses, the yearly event of the table above taken as losing the chunk, and reports the device as
 flush-unverified.
 
+**A copy counts once its own bytes are flushed, whatever shares the flush.** The model's copies
+are chunks and range entries that are durable: a chunk's volume answers it only after the flush
+that covers it, and a range answers a command only once the entry carrying it is durable on a
+quorum and applied (CLAUDE.md §6). Since step 9 of the doors plan a volume's flush covers every
+chunk the cell's operations wrote it meanwhile, and a range's entry carries a command for each
+operation a node runs, two appends out to each follower (node.md §1.4, `derive::batch`,
+`derive::IN_FLIGHT`; research/80, step 9): more writes share each flush, and none is answered
+before the flush that holds its own bytes, which a simulated cell cut from power at any moment
+around a batched entry's answer checks (`crates/node/tests/sim.rs`). Group commit changes how many
+flushes a copy shares, not when it counts.
+
 What the constant-rate chain leaves out, and where the sources show which way it errs
 (15 §8.5):
 

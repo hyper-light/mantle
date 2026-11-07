@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use hyper_rt_transport::{Io, MAX_BATCH};
 use hyper_transport::{
-    AdmissionLimits, AskQueue, Classes, Limits, MIN_DATAGRAM, RECEIVE_CHUNK, StreamCredit,
-    class_reserve, frame_grant, initial_window,
+    Acknowledgement, AdmissionLimits, AskQueue, Classes, Limits, MIN_DATAGRAM, RECEIVE_CHUNK,
+    StreamCredit, class_reserve, frame_grant, initial_window,
 };
 
 use crate::classes::{Bounds, NodeClasses};
@@ -220,6 +220,9 @@ pub fn limits(stated: &Stated) -> Result<Limits, Unfit> {
         // pending places are taken (RFC 9000 §8.1.2), as before hyper-transport could count
         // the handshakes' bytes instead.
         retry_bytes: None,
+        // As before hyper-raft b5edd11 and c0d6ca8: acknowledgements decimated, no erasure code.
+        acknowledgement: Acknowledgement::Decimated,
+        fec_window: None,
     })
 }
 

@@ -636,3 +636,260 @@ exit 1 on the open loop's overload: one 8 MiB put asked SlowDown three times (ht
 http PUT-STREAM and native MPU-PART before) and the reads of its object failed after (404 or
 NoSuchKey; 4 failed of 7,362 after, 11 before); the six controls were caught in every run.
 
+## Step 9, after
+
+Step 9 traced one PUT end to end and the doors' writes under load, asked of each wait whether it is
+needed and how much of it, and removed the causes that keep every durability guarantee: the
+floor's rules that let a range commit one command a Raft round, the floor's one append out, the
+volume's batch of one chunk, and the floor's two operations a node. Every write is still answered
+only once its own bytes are flushed on the replicas the protocol requires. Instruments: diag-doors
+(rebased to bffce343, never merged) stamps every flush (`fdatasync`, `RWF_DSYNC` writes, directory
+syncs, by descriptor and path), hyper-log's frames, confirmations, gathers and commits, the chunk
+writer's batches and waits, the node's Raft messages, proposals and applies, chunk puts out and in,
+and the loop's waits, on CLOCK_MONOTONIC with the stall trace's stages. Scripts and traces:
+`~/.cache/claude-scratch/s9/` (`scripts/`, `traces/`, `trials/`).
+
+**The device's floor.** A 4 KiB write and `fdatasync(2)` on this btrfs, n 3,000 each, CPUs 8-15:
+buffered append p50 12.5 ms, p99 68 ms; O_DIRECT into a NOCOW file p50 12.7 ms appending and 12.1 ms
+overwriting, p99 61–65 ms, p99.9 0.65–1.9 s (load average 32, I/O pressure 17–20%). Again later
+(n 500 to 8,000): 5.6 ms p50 alone, 11.0 and 11.4 ms with 6 and 16 writers at once, 124, 466 and 478
+flushes a second in all: btrfs joins concurrent flushes, so concurrency, not one writer, reaches the
+device's rate. The device's own flush, from `/sys/block/nvme1n1/stat`, takes 1.4 ms; the rest is the
+file system's log commit, which every node of the cell shares on this one file system (one PUT saw
+all three nodes' flushes end within 30 µs after 42 ms, a transaction commit) (fsync(2), fdatasync(2);
+Linux Documentation/filesystems/btrfs).
+
+**One PUT, one client, closed loop** (native door, p50 ms; 40 operations at 1 B and 64 KiB, 32 at
+8 MiB; the stages from the stall trace):
+
+| stage | 1 B | 64 KiB | 8 MiB |
+|---|---:|---:|---:|
+| client to gateway | 0.4 | 0.5 | 0.5 |
+| the bucket's row, read by a quorum (no flush) | 0.7 | 0.3 | 0.4 |
+| the body in, to the first block full | – | – | 62–128 (QUIC's initial window) |
+| chunks to the three replicas, at once (each a volume write and one `fdatasync`) | 20 | 12 | 213 |
+| the Block command: the leader's and followers' frames, each a flush, then a confirmation, a second | 28 | 24 | 2 × 17–19 |
+| the File command, the same | 28 | 27 | 17 |
+| the Name command, the same | 29 | 22 | 18 |
+| the last answer to the client | 0.3 | 0.3 | 0.3 |
+| total | 117 | 93 | 379 |
+
+Flushes a PUT, one client: 6.4 log flushes on each node (3 frames, each flushed and confirmed by a
+second `fdatasync` or an `RWF_DSYNC` write, `hyper_log` device.rs `confirm`) and one volume flush
+(two for a chunk that opens a segment, the 8 MiB block's: chunk-store.md §6), 22 in the cell; 7 on
+the critical path (the slowest replica's chunk, then three commands of two each). Those flushes are
+the path: the waits between them were under 0.6 ms at the median.
+
+**Each wait.**
+
+| wait | needed? | how much? |
+|---|---|---|
+| one command an entry (`rules.max_answers` 1) and one entry out a node a range | the entry is; one command in it is not | 600 proposals for 200 PUTs, 1.00 commands an entry, 1.00–1.4 entries an append, at 1 to 16 clients: a range committed one command a round of two flushes, about 25–40 a second, so the cell's writes stopped at 20–47 a second whatever the clients (1 to 16: 4.6, 10.9, 14.2, 19.0 a second at 1, 2, 4, 6; 23.4 at 8 and 15.9 at 16 with 16 operations a node): as many commands as the node's operations wait on |
+| one append out to a follower (`range.max_inflight_msgs` 1) | an append is | with one out, a follower's frame never had the next to confirm it, so each waited for a confirmation of its own: two |
+| a volume's batch of one chunk (`batch_requests` 1) | the chunk's flush is | 1.00 chunks a flush at every concurrency: every chunk the cell's operations wrote it meanwhile |
+| two operations a node (`gateway.objects` 2), the native door's 6 clients | a bound is | the knee, measured below: 8 |
+| the log's confirmation, a second flush a frame | yes, as hyper-log recovers: a frame's flush alone does not tell a torn frame from a damaged one (raft-log.md §6; AGL+18 §3.3.3) | not built: answering at the frame's own flush changes what is durable when (the owner's decision 2, not approved) |
+| Block, then File, then Name, each after the chunks | yes, as the metadata layer orders its writes bottom up (gateway.md §2) | not built (decision 3, not approved) |
+| hyper-log's gather (`log.waits` measured) | a timer: it waited to its deadline in nearly every gather, p90 6–23 ms a command at one client, 4–8% of the log's time at six | kept: `never` gave 8.1 PUTs a second against 3.6–4.6 at one client and 4.5 against 7.8–10.9 at two in one noisy run each; not resolved |
+| the transport's window at QUIC's initial 12 kB (`least_transport`) | no | not built: a 1 MiB to 4 MiB window cut a chunk's trip to a replica from 47 to 13 ms but the client's body from 62 to about 500 ms, a loss behaviour in hyper-quic, which another agent is changing |
+| a block's window of one (`gateway.window`) | for memory | not measured; an 8 MiB PUT's second block waits a Block command (about 17 ms) |
+| the bucket's quorum read before the chunks | yes | 0.3–0.7 ms |
+
+**What changed** (83aaa47e): an entry carries a command for each operation a node runs
+(`derive::batch`, `gateway.objects` times `gateway.window`), its session keeping their answers
+within the row the range already admits, so no store page grows (a session's row was capped at the
+largest row S3 admits, 18,699 bytes, its answers' share 18,482 at 8 answers, past one at the largest
+a command gets, 12,775); a leader keeps two appends out and two entries uncommitted
+(`derive::IN_FLIGHT`, from the log's one frame on the device and one queued behind it); a volume's
+batch holds every chunk the cell's operations may write it at once (the cell's identities times the
+batch); and a node runs 8 operations (`derive::OBJECTS`), the knee measured: 64 KiB native PUTs, an
+open loop at 500 a second past capacity, three clients an operation, n 300: 30, 39, 72, 79 and 93 a
+second at 2, 4, 8, 16 and 32 operations a node, the doubling past 8 adding 10%, inside the doors'
+13–30% run-to-run band, and the doubling past 16 refused one PUT `SlowDown` three times. Each
+change rests on group commit's rule that one log write and flush commits the group (Helland et al.,
+Tandem TR 88.1, §2; DeWitt et al., SIGMOD 1984, §5.2) and Raft's batching and pipelining of
+entries (Ongaro, "Consensus: Bridging Theory and Practice", 2014, §10.2); none answers a write before the flush that
+holds it. The memory floor grows by six more operations' blocks and a second append a range
+(`memory.floor.objects` and `memory.floor.ranges`).
+
+**Before and after, timed** (trials of 83aaa47e, whose production code 8926aa74 keeps, against 1986f7d9, each with
+`--kinds`; release builds, sha256 004a8e64… before and 1e5e4d4a… after; arms B1 B2 the build before
+twice, N1 N2 the build after twice, RustFS and SeaweedFS through the HTTP door with N's harness;
+one Williams row of the six a condition; each case its own capped scope on CPUs 8-15, busy2x 16
+busy loops beside it, cpu2 CPUs 8-9). A closed ladder to 16 clients, n 100 a step (32 at 8 MiB),
+its best step's PUTs a second; then an open loop below capacity, 4 a second at 1 B and 64 KiB (n
+368) and one every two seconds at 8 MiB (n 32), latency from each PUT's intended start. A p99.9
+needs 3,688 samples (measurement.md §5a): no cell has them. Failed is the ladder's and the open
+loop's PUTs refused three times (SlowDown, the 8 MiB writes' as in the baseline). The box ran other
+sessions' builds and benchmarks throughout (load average 50 to 109, I/O pressure 15–40%), so the
+A/A bands below are wide:
+
+| cond | size | door | arm | ladder ops/s | open n | p50 ms | p99 ms | p99.9 ms | failed |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|
+| busy2x | 1B | http | B1 | 33.0 | 368 | 77.6 | 1610.6 | - | 0/0 |
+| busy2x | 1B | http | B2 | 50.2 | 368 | 77.6 | 1610.6 | - | 0/0 |
+| busy2x | 1B | http | N1 | 130.2 | 368 | 73.4 | 889.2 | - | 0/0 |
+| busy2x | 1B | http | N2 | 151.5 | 368 | 66.1 | 2617.2 | - | 0/0 |
+| busy2x | 1B | http | rustfs | 309.6 | 368 | 28.8 | 922.7 | - | 0/0 |
+| busy2x | 1B | http | seaweedfs | 335.6 | 368 | 19.9 | 1342.2 | - | 0/0 |
+| busy2x | 1B | native | B1 | 36.4 | 368 | 138.4 | 3422.6 | - | 0/0 |
+| busy2x | 1B | native | B2 | 64.4 | 368 | 73.4 | 620.8 | - | 0/0 |
+| busy2x | 1B | native | N1 | 82.5 | 368 | 67.1 | 788.5 | - | 0/0 |
+| busy2x | 1B | native | N2 | 44.1 | 368 | 104.9 | 4093.6 | - | 0/0 |
+| busy2x | 64KiB | http | B1 | 26.7 | 368 | 121.6 | 3892.3 | - | 0/0 |
+| busy2x | 64KiB | http | B2 | 39.9 | 368 | 90.2 | 1946.2 | - | 0/0 |
+| busy2x | 64KiB | http | N1 | 38.8 | 368 | 75.5 | 2348.8 | - | 1/0 |
+| busy2x | 64KiB | http | N2 | 16.8 | 368 | 88.1 | 5368.7 | - | 0/0 |
+| busy2x | 64KiB | http | rustfs | 343.6 | 368 | 30.4 | 822.1 | - | 0/0 |
+| busy2x | 64KiB | http | seaweedfs | 57.4 | 368 | 34.6 | 1275.1 | - | 0/0 |
+| busy2x | 64KiB | native | B1 | 41.1 | 368 | 146.8 | 5100.3 | - | 0/0 |
+| busy2x | 64KiB | native | B2 | 29.7 | 368 | 75.5 | 1241.5 | - | 0/0 |
+| busy2x | 64KiB | native | N1 | 38.7 | 368 | 73.4 | 1057.0 | - | 0/0 |
+| busy2x | 64KiB | native | N2 | 42.3 | 368 | 77.6 | 2885.7 | - | 0/0 |
+| busy2x | 8MiB | http | B1 | 4.3 | 32 | 637.5 | - | - | 2/0 |
+| busy2x | 8MiB | http | B2 | 5.8 | 32 | 461.4 | - | - | 54/0 |
+| busy2x | 8MiB | http | N1 | 3.6 | 32 | 327.2 | - | - | 3/0 |
+| busy2x | 8MiB | http | N2 | 2.8 | 32 | 528.5 | - | - | 6/0 |
+| busy2x | 8MiB | http | rustfs | 57.6 | 32 | 155.2 | - | - | 0/0 |
+| busy2x | 8MiB | http | seaweedfs | 35.5 | 32 | 155.2 | - | - | 0/0 |
+| busy2x | 8MiB | native | B1 | 3.9 | 32 | 587.2 | - | - | 1/1 |
+| busy2x | 8MiB | native | B2 | 1.9 | 32 | 587.2 | - | - | 0/0 |
+| busy2x | 8MiB | native | N1 | 2.1 | 32 | 494.9 | - | - | 0/1 |
+| busy2x | 8MiB | native | N2 | 2.4 | 32 | 721.4 | - | - | 5/1 |
+| cpu2 | 1B | http | B1 | 79.9 | 368 | 45.1 | 587.2 | - | 0/0 |
+| cpu2 | 1B | http | B2 | 24.9 | 368 | 51.4 | 494.9 | - | 0/0 |
+| cpu2 | 1B | http | N1 | 17.4 | 368 | 50.3 | 755.0 | - | 0/0 |
+| cpu2 | 1B | http | N2 | 182.8 | 368 | 48.2 | 1275.1 | - | 0/0 |
+| cpu2 | 1B | http | rustfs | 125.9 | 368 | 14.9 | 478.2 | - | 0/0 |
+| cpu2 | 1B | http | seaweedfs | 350.9 | 368 | 11.5 | 302.0 | - | 0/0 |
+| cpu2 | 1B | native | B1 | 61.6 | 368 | 41.9 | 1006.6 | - | 0/0 |
+| cpu2 | 1B | native | B2 | 80.8 | 368 | 65.0 | 906.0 | - | 0/0 |
+| cpu2 | 1B | native | N1 | 120.0 | 368 | 73.4 | 1107.3 | - | 0/0 |
+| cpu2 | 1B | native | N2 | 68.1 | 368 | 47.2 | 1057.0 | - | 0/0 |
+| cpu2 | 64KiB | http | B1 | 54.4 | 368 | 46.1 | 1040.2 | - | 0/0 |
+| cpu2 | 64KiB | http | B2 | 64.1 | 368 | 52.4 | 1308.6 | - | 0/0 |
+| cpu2 | 64KiB | http | N1 | 42.1 | 368 | 51.4 | 1107.3 | - | 0/0 |
+| cpu2 | 64KiB | http | N2 | 45.9 | 368 | 62.9 | 7247.8 | - | 0/0 |
+| cpu2 | 64KiB | http | rustfs | 704.2 | 368 | 16.5 | 1442.8 | - | 0/0 |
+| cpu2 | 64KiB | http | seaweedfs | 495.0 | 368 | 12.3 | 427.8 | - | 0/0 |
+| cpu2 | 64KiB | native | B1 | 50.9 | 368 | 46.1 | 755.0 | - | 0/0 |
+| cpu2 | 64KiB | native | B2 | 76.6 | 368 | 54.5 | 1778.4 | - | 0/0 |
+| cpu2 | 64KiB | native | N1 | 92.3 | 368 | 53.5 | 704.6 | - | 0/0 |
+| cpu2 | 64KiB | native | N2 | 78.6 | 368 | 49.3 | 453.0 | - | 0/0 |
+| cpu2 | 8MiB | http | B1 | 9.1 | 32 | 102.8 | - | - | 5/0 |
+| cpu2 | 8MiB | http | B2 | 11.5 | 32 | 138.4 | - | - | 1/0 |
+| cpu2 | 8MiB | http | N1 | 11.6 | 32 | 123.7 | - | - | 0/0 |
+| cpu2 | 8MiB | http | N2 | 5.0 | 32 | 146.8 | - | - | 0/0 |
+| cpu2 | 8MiB | http | rustfs | 24.0 | 32 | 51.4 | - | - | 0/0 |
+| cpu2 | 8MiB | http | seaweedfs | 35.4 | 32 | 49.3 | - | - | 0/0 |
+| cpu2 | 8MiB | native | B1 | 6.2 | 32 | 163.6 | - | - | 0/0 |
+| cpu2 | 8MiB | native | B2 | 6.9 | 32 | 172.0 | - | - | 4/0 |
+| cpu2 | 8MiB | native | N1 | 6.8 | 32 | 310.4 | - | - | 0/0 |
+| cpu2 | 8MiB | native | N2 | 6.7 | 32 | 184.5 | - | - | 2/0 |
+| quiet | 1B | http | B1 | 29.0 | 368 | 155.2 | 27380.4 | - | 0/0 |
+| quiet | 1B | http | B2 | 7.9 | 368 | 127.9 | 3959.4 | - | 0/0 |
+| quiet | 1B | http | N1 | 84.7 | 368 | 102.8 | 4160.7 | - | 0/0 |
+| quiet | 1B | http | N2 | 98.1 | 368 | 637.5 | 6442.5 | - | 0/0 |
+| quiet | 1B | http | rustfs | 47.6 | 368 | 44.0 | 2483.0 | - | 0/0 |
+| quiet | 1B | http | seaweedfs | 22.1 | 368 | 41.9 | 5502.9 | - | 0/0 |
+| quiet | 1B | native | B1 | 26.0 | 368 | 293.6 | 10469.0 | - | 0/0 |
+| quiet | 1B | native | B2 | 35.3 | 368 | 117.4 | 5637.1 | - | 0/0 |
+| quiet | 1B | native | N1 | 48.3 | 368 | 123.7 | 2550.1 | - | 0/0 |
+| quiet | 1B | native | N2 | 99.3 | 368 | 132.1 | 1241.5 | - | 0/0 |
+| quiet | 64KiB | http | B1 | 29.7 | 368 | 3087.0 | 16911.4 | - | 0/0 |
+| quiet | 64KiB | http | B2 | 11.6 | 368 | 536.9 | 12079.6 | - | 0/0 |
+| quiet | 64KiB | http | N1 | 15.2 | 368 | 151.0 | 3087.0 | - | 0/0 |
+| quiet | 64KiB | http | N2 | 44.6 | 368 | 239.1 | 2885.7 | - | 0/0 |
+| quiet | 64KiB | http | rustfs | 144.3 | 368 | 75.5 | 3825.2 | - | 0/0 |
+| quiet | 64KiB | http | seaweedfs | 259.1 | 368 | 83.9 | 7918.8 | - | 0/0 |
+| quiet | 64KiB | native | B1 | 29.4 | 368 | 302.0 | 5637.1 | - | 0/0 |
+| quiet | 64KiB | native | B2 | 27.5 | 368 | 134.2 | 4295.0 | - | 0/0 |
+| quiet | 64KiB | native | N1 | 61.6 | 368 | 146.8 | 4026.5 | - | 0/0 |
+| quiet | 64KiB | native | N2 | 48.0 | 368 | 394.3 | 7382.0 | - | 0/0 |
+| quiet | 8MiB | http | B1 | 3.6 | 32 | 369.1 | - | - | 2/0 |
+| quiet | 8MiB | http | B2 | 4.0 | 32 | 369.1 | - | - | 36/0 |
+| quiet | 8MiB | http | N1 | 7.2 | 32 | 486.5 | - | - | 3/0 |
+| quiet | 8MiB | http | N2 | 4.7 | 32 | 218.1 | - | - | 0/0 |
+| quiet | 8MiB | http | rustfs | 46.3 | 32 | 119.5 | - | - | 0/0 |
+| quiet | 8MiB | http | seaweedfs | 42.3 | 32 | 163.6 | - | - | 0/0 |
+| quiet | 8MiB | native | B1 | 5.6 | 32 | 419.4 | - | - | 1/0 |
+| quiet | 8MiB | native | B2 | 1.1 | 32 | 369.1 | - | - | 0/0 |
+| quiet | 8MiB | native | N1 | 7.6 | 32 | 268.4 | - | - | 2/1 |
+| quiet | 8MiB | native | N2 | 4.5 | 32 | 302.0 | - | - | 10/0 |
+
+A/A bands, |second − first| / first, for the ladder's throughput, the open loop's p50 and p99:
+
+``` bands (|2-1|/1): tput, p50, p99
+('busy2x', '1B', 'http') B1/B2 52% 0% 0%
+('busy2x', '1B', 'http') N1/N2 16% 10% 194%
+('busy2x', '1B', 'native') B1/B2 77% 47% 82%
+('busy2x', '1B', 'native') N1/N2 47% 56% 419%
+('busy2x', '64KiB', 'http') B1/B2 50% 26% 50%
+('busy2x', '64KiB', 'http') N1/N2 57% 17% 129%
+('busy2x', '64KiB', 'native') B1/B2 28% 49% 76%
+('busy2x', '64KiB', 'native') N1/N2 9% 6% 173%
+('busy2x', '8MiB', 'http') B1/B2 36% 28% -
+('busy2x', '8MiB', 'http') N1/N2 22% 62% -
+('busy2x', '8MiB', 'native') B1/B2 50% 0% -
+('busy2x', '8MiB', 'native') N1/N2 13% 46% -
+('cpu2', '1B', 'http') B1/B2 69% 14% 16%
+('cpu2', '1B', 'http') N1/N2 953% 4% 69%
+('cpu2', '1B', 'native') B1/B2 31% 55% 10%
+('cpu2', '1B', 'native') N1/N2 43% 36% 5%
+('cpu2', '64KiB', 'http') B1/B2 18% 14% 26%
+('cpu2', '64KiB', 'http') N1/N2 9% 22% 555%
+('cpu2', '64KiB', 'native') B1/B2 50% 18% 136%
+('cpu2', '64KiB', 'native') N1/N2 15% 8% 36%
+('cpu2', '8MiB', 'http') B1/B2 26% 35% -
+('cpu2', '8MiB', 'http') N1/N2 57% 19% -
+('cpu2', '8MiB', 'native') B1/B2 12% 5% -
+('cpu2', '8MiB', 'native') N1/N2 2% 41% -
+('quiet', '1B', 'http') B1/B2 73% 18% 86%
+('quiet', '1B', 'http') N1/N2 16% 520% 55%
+('quiet', '1B', 'native') B1/B2 36% 60% 46%
+('quiet', '1B', 'native') N1/N2 106% 7% 51%
+('quiet', '64KiB', 'http') B1/B2 61% 83% 29%
+('quiet', '64KiB', 'http') N1/N2 194% 58% 7%
+('quiet', '64KiB', 'native') B1/B2 7% 56% 24%
+('quiet', '64KiB', 'native') N1/N2 22% 169% 83%
+('quiet', '8MiB', 'http') B1/B2 10% 0% -
+('quiet', '8MiB', 'http') N1/N2 34% 55% -
+('quiet', '8MiB', 'native') B1/B2 80% 12% -
+('quiet', '8MiB', 'native') N1/N2 41% 12% -
+```
+
+Read against those bands: the small writes' ladder rose beyond both builds' A/A spread where the
+before build stayed near its 25–40 a second (quiet native 1 B 26–35 → 48–99; busy2x HTTP 1 B 33–50 →
+130–152, the HTTP door taking clients past the native door's 24), and fell nowhere beyond it; below
+capacity the p50s moved within their bands in every cell, and the p99s, at n 368 under the load
+above, within bands of 5–555%: no rise is resolved and none is claimed. RustFS and SeaweedFS stay
+3–10 times mantle's small-write rate and a third to a half of its p50, one copy on one node against
+three flushed copies. Step 10's bar on p99.9 under busy loops is not met by these runs and is not
+measurable from them.
+
+**Re-traced** (diag at bffce343, CPUs 0-7 beside the trials): one client is as before, 7 flushes on
+the path (106, 96 and 681 ms at the median at 1 B, 64 KiB and 8 MiB after; 94, 117 and 495 before, on
+the same CPUs in the same hour), as nothing on the one-client path changed. Under load (64 KiB native
+PUTs, an open loop at 500 a second, the native door's clients at their admission): before, 6
+clients, 13.5 a second, p50 12.6 s; after, 24 clients, 50–86 a second, p50 4.0 s, flushes an
+operation on each node 1.8 against 7.1 at one client, 1.63 commands an entry (at most 6), 1.18
+entries an append, 2.81 log updates a frame and 1.81 chunks a volume flush.
+
+**Correctness.** `crates/node/tests/sim.rs`
+`a_batched_entry_is_answered_only_once_durable_and_a_power_cut_at_any_moment_keeps_it_whole`: a
+simulated cell asks an entry of four puts and cuts every node's power at once, its device keeping
+only what it made durable (`Crash::Random`), at a moment the seed draws within four LAN round trips
+of the send, before the answer on 9 of 12 seeds and after it on 3; started again, every node applies
+through the index the answered entry stood on, and asked again the entry is answered the same
+versions from its session, applied once. The cell's linearizability simulation, the node and
+process kill tests (`crates/mantle/tests/node.rs`, `serve.rs`) and the transfer harness's exact
+checks pass: `mantle bench transfer --small 1000 --large 64M` on the after build, each founder
+SIGKILLed in turn and started again, 6,000 and 12 reads, 0 wrong, 0 missing, every control caught.
+
+**Under overload.** Past capacity the after build answers some PUTs `SlowDown`: at 24 native
+clients and an open loop of 500 a second, 4 PUTs of 400 failed after three tries (87 asked again).
+The trace attributes every one to its chunks' exchanges ended `Closed` by the transport while their
+bodies waited on the transfer class's window, so the driver took them for refused and placed the
+block nowhere (`PutError::Unplaced`); the before build, its 6 clients queued at the door, failed
+none of its 64 KiB PUTs at that load, its p50 12.6 s the queue's. Raising the
+transport's window from QUIC's initial one removes the stall, and waits for hyper-quic's loss work.

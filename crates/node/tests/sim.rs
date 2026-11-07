@@ -323,10 +323,11 @@ fn a_batched_entry_is_answered_only_once_durable_and_a_power_cut_at_any_moment_k
             // The answered entry's index is what a new leader's first entry commits again: every
             // node applies through it, which a lost entry never lets it.
             cell.until("every node applies through the answered entry", |c| {
-                c.members
+                let through = c
+                    .members
                     .values()
-                    .all(|m| m.status.as_ref().is_some_and(|s| s.applied >= applied))
-                    .then_some(())
+                    .all(|m| m.status.as_ref().is_some_and(|s| s.applied >= applied));
+                if through { Some(()) } else { None }
             });
         }
         // Asked again, the entry is applied once: answered from its session where it applied.

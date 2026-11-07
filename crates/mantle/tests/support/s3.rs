@@ -303,7 +303,13 @@ impl Client {
     /// Reads more from the connection; the server's close is a test's failure here.
     fn fill(&mut self) {
         let mut buf = vec![0u8; 64 << 10];
-        let n = self.stream().read(&mut buf).unwrap();
+        // A signal the runtime's threads take may end the read with nothing read (read(2), EINTR).
+        let n = loop {
+            match self.stream().read(&mut buf) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                read => break read.unwrap(),
+            }
+        };
         assert!(n > 0, "the listener closed the connection mid-response");
         self.read.extend_from_slice(&buf[..n]);
     }
@@ -316,6 +322,8 @@ impl Client {
                 Ok(0) => return true,
                 Ok(_) => continue,
                 Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return true,
+                // Interrupted by a signal before anything came (read(2), EINTR): read again.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => panic!("reading for the close: {e}"),
             }
         }

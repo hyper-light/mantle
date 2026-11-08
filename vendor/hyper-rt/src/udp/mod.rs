@@ -408,6 +408,18 @@ impl UdpSocket {
         }
     }
 
+    /// Whether [`UdpSocket::queued_bytes`] counts every queued datagram's bytes (at least their
+    /// payloads), so a receive that took that many took all that was queued when it was read:
+    /// on Windows, the BSDs and the simulation fabric, not on Linux, where it counts the next
+    /// datagram's alone.
+    pub(crate) fn queued_bytes_counts_every(&self) -> bool {
+        match &self.inner {
+            Inner::Real { .. } => !cfg!(any(target_os = "linux", target_os = "android")),
+            Inner::Sim { .. } => true,
+            Inner::Moved => false,
+        }
+    }
+
     /// Asks the kernel for a receive buffer of `bytes` (`SO_RCVBUFFORCE` where the process may, on
     /// Linux past `net.core.rmem_max`, else `SO_RCVBUF`; a size the OS refuses outright is halved
     /// and asked again) and returns the buffer it reports after the ask

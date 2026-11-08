@@ -992,7 +992,80 @@ fn a_socket_without_stamps_takes_the_bytes_it_held() {
         (3, 3, 6)
     );
     assert_eq!(first.1, Queued::More);
+    assert!(
+        first.0.whole,
+        "the fabric counts every queued datagram's bytes"
+    );
     assert_eq!((second.0.datagrams, second.1), (0, Queued::Emptied));
+    assert!(second.0.whole);
+}
+
+/// Do: on loopback, five datagrams queued and taken by receives of a ring of one place: one bound
+/// to two calls and begun after every stamp, then one that empties the socket; where the kernel
+/// stamps, three more sent after a receive began; on Linux, a socket without stamps. Expect: a
+/// receive is whole (`Taken::whole`) when it took all that was queued as it began, and only then:
+/// not the one its bound on calls cut, which left what came before it; the one that emptied the
+/// socket; the one that reached a datagram stamped after it began, though it left the rest; not
+/// Linux's unstamped one, whose `FIONREAD` counts the next datagram alone. An owner judges its
+/// timers at the reading a whole receive began (hyper-rt-transport's driver).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_receive_is_whole_when_it_took_all_that_was_queued_as_it_began() {
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async {
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let sender = UdpSocket::bind(loopback).unwrap();
+        let mut receiver = Batched::bind_lent(loopback, true).unwrap();
+        let mut ring = Ring::new(Io { batch: 1 }).unwrap();
+        let to = receiver.local_addr().unwrap();
+        for index in 0..5u8 {
+            sender.send_to(&[index], to).unwrap();
+        }
+        receiver.readable().await.unwrap();
+        let (cut, ended) = receiver
+            .receive_queued(&mut ring, u64::MAX, 2, |_, _| {})
+            .unwrap();
+        assert_eq!((cut.datagrams, ended, cut.whole), (2, Queued::More, false));
+        let (rest, _) = receiver
+            .receive_queued(&mut ring, u64::MAX, 16, |_, _| {})
+            .unwrap();
+        assert_eq!((rest.datagrams, rest.whole), (3, true));
+        if receiver.stats().kernel_stamps {
+            let began = now_ns();
+            for index in 0..3u8 {
+                sender.send_to(&[index], to).unwrap();
+            }
+            receiver.readable().await.unwrap();
+            let (past, ended) = receiver
+                .receive_queued(&mut ring, began, 16, |_, _| {})
+                .unwrap();
+            assert_eq!(
+                (past.datagrams, ended, past.whole),
+                (1, Queued::More, true),
+                "the first datagram it took was stamped after it began"
+            );
+            let (_, ended) = receiver
+                .receive_queued(&mut ring, u64::MAX, 16, |_, _| {})
+                .unwrap();
+            assert_eq!(ended, Queued::Emptied);
+        }
+        if cfg!(target_os = "linux") {
+            let mut unstamped = Batched::bind_lent(loopback, false).unwrap();
+            let to = unstamped.local_addr().unwrap();
+            for index in 0..3u8 {
+                sender.send_to(&[index], to).unwrap();
+            }
+            let (next, ended) = unstamped
+                .receive_queued(&mut ring, now_ns(), 16, |_, _| {})
+                .unwrap();
+            assert_eq!(
+                (next.datagrams, ended, next.whole),
+                (1, Queued::More, false),
+                "Linux's FIONREAD counts the next datagram alone"
+            );
+        }
+    })
+    .unwrap();
 }
 
 /// Do: one datagram of 1,000 bytes queued, its charge read, then the datagram read and the charge

@@ -96,13 +96,26 @@ fn a_volume_at_work_holds_at_most_its_stated_bytes() {
 }
 
 /// A chunk handed over as the bytes a gateway shares with the chunk's other replicas is put from
-/// them: the putting thread asks the allocator for the chunk's checksum table and its request, and
-/// for none of its bytes, which the writer reads into its aligned buffer (research/80, step 5).
-/// The gateway's host copied a chunk for each replica it asked, the local one included: 25.2 MB
-/// per 8 MiB PUT.
+/// them: the putting thread asks the allocator for the chunk's checksum table and its answer's
+/// channel (its counter and its slot), and for none of its bytes, which the writer reads into its
+/// aligned buffer (research/80, step 5). The gateway's host copied a chunk for each replica it
+/// asked, the local one included: 25.2 MB per 8 MiB PUT. The put counted follows the volume's
+/// first: on macOS std's `Mutex` allocates its pthread mutex at its first lock, once a mutex and
+/// not once a put (Linux's futex lock and Windows' SRW lock allocate nothing), and the writer's
+/// queue is first locked by the first put.
 #[test]
 fn a_chunk_put_from_shared_bytes_copies_none_of_them() {
     let v = Volume::format(issuer(), sim(47), SIZE, config()).unwrap();
+    let first = bytes::Bytes::from(data(2, 60_000));
+    v.put_checked_waking(
+        key(2),
+        first.clone(),
+        mantle_crc::crc32c(&first),
+        std::task::Waker::noop().clone(),
+    )
+    .unwrap()
+    .wait()
+    .unwrap();
     let shared = bytes::Bytes::from(data(1, 60_000));
     let crc = mantle_crc::crc32c(&shared);
     // The other replicas' shares of the same bytes.

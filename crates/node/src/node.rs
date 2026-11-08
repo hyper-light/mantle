@@ -1079,6 +1079,18 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 replacing: None,
             });
         }
+        // On a simulated shard the node's times are the simulation's, whole virtual nanoseconds
+        // (hyper-liveness's `Settings::resolution`: "a simulation's stamps are whole nanoseconds,
+        // one"); the host's clock and its resolution would make a seed's run depend on the
+        // machine it runs on.
+        let simulated =
+            hyper_rt::registry::with_current(hyper_rt::shard::ShardContext::driver_is_sim)
+                .unwrap_or(false);
+        let resolution_ns = if simulated {
+            1
+        } else {
+            hyper_rt::machine::clock::resolution_ns()
+        };
         let liveness = Liveness::new(hyper_liveness::Settings {
             local: settings.id,
             run,
@@ -1087,7 +1099,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Duration::from_nanos(settings.history.exposure_ns),
                 settings.history.crashes,
             ),
-            resolution: Duration::from_nanos(hyper_rt::machine::clock::resolution_ns()),
+            resolution: Duration::from_nanos(resolution_ns),
         })
         .map_err(|e| at(Step::Network)(NodeError::Liveness(e)))?;
 
@@ -1111,7 +1123,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .saturating_add(limits.admission.pending)
         };
         let directory = Peers::new(settings.peers.clone(), most_clients);
-        let now = std::time::Instant::now();
+        let now = hyper_rt_transport::shard_instant();
         let endpoint = match settings.seed {
             Some(seed) => Endpoint::new_seeded(config, budget, directory, now, seed),
             None => Endpoint::new(config, budget, directory, now),

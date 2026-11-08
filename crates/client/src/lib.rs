@@ -509,7 +509,13 @@ impl Client {
                 .map(|(id, _)| (*id, mantle_protocol::node_name(*id)))
                 .collect(),
         };
-        let endpoint = Endpoint::new(config, budget, directory, std::time::Instant::now())?;
+        // The driver's clock: a simulation's on a simulated shard (`shard_instant`).
+        let endpoint = Endpoint::new(
+            config,
+            budget,
+            directory,
+            hyper_rt_transport::shard_instant(),
+        )?;
         let driver = Driver::bind(endpoint, settings.bind, bounds::io(&stated))?;
         let mut piece = Vec::new();
         piece

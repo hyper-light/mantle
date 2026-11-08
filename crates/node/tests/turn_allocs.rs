@@ -58,16 +58,20 @@ fn at_rest(seed: u64) -> alloc::Counts {
 }
 
 /// 477,128 allocations before the turn kept its buffers (`drive`'s three lists, 189,808 of
-/// them; the plane's message copies, 119,301); 168,019 after, and 96,388 since hyper-raft 3d6640f
+/// them; the plane's message copies, 119,301); 168,019 after, 96,388 since hyper-raft 3d6640f
 /// (a group's pairs told in place, a packet's credit recorded without allocating, a stream's queue
-/// of pieces kept): the transport's, QUIC's, the stream's and the simulated network's own. The
-/// same every run: nothing at rest draws at random.
+/// of pieces kept), and 96,375 since its fb74b59, whose driver reads its sockets before it judges
+/// its timers: the transport's, QUIC's, the stream's and the simulated network's own. The same
+/// every run and on every host: nothing at rest draws at random, and a node's QUIC endpoint and
+/// its liveness stream keep the simulation's clock. With the host's, read as the endpoint was made
+/// and for the clock's resolution, the count was the machine's: at fb74b59 96,375 on a Linux
+/// x86_64 host, 94,195 on a macOS aarch64 one and 65,102 in a Linux aarch64 VM on that.
 #[test]
 fn a_cell_at_rest_turns_without_remaking_what_a_turn_keeps() {
     let counts = at_rest(1);
     assert_eq!(
         (counts.allocations, counts.reallocations),
-        (96_388, 0),
+        (96_375, 0),
         "{counts:?}"
     );
 }
@@ -92,12 +96,21 @@ fn serving(seed: u64, ops: u64) -> alloc::Counts {
 /// lists 19,870, the plane's copies 11,970); 45,088 or 45,089 after, and 41,182 since the range's
 /// messages, rows and keys are each made at their lengths, an entry's overlay keeps the rows it
 /// is given and a put's commands go to their ranges moved (reallocations 6,372 to 6,377 before,
-/// 2,303 to 2,307 then), and 33,564 since hyper-raft 3d6640f's cuts (2,306 reallocations). The
-/// clients draw their identities and nonces at random, which moved a
-/// buffer's growth by an allocation now and then while encodings grew; made at their lengths,
-/// they no longer do, so the count is exact.
+/// 2,303 to 2,307 then), 33,564 since hyper-raft 3d6640f's cuts (2,306 reallocations), and 34,094
+/// since its fb74b59, whose driver reads its sockets before it judges its timers: the clients'
+/// run sends 502 more datagrams (15,040), each one the simulated network's copy. The clients draw
+/// their identities and nonces at random, which moved a buffer's growth by an allocation now and
+/// then while encodings grew; made at their lengths, they no longer do, so the count is exact.
+/// On Linux each socket, a simulated one too, holds `recvmmsg` and `sendmmsg` headers (hyper-rt's
+/// `Batched`, 11 allocations, and its receive `Ring`, 6), and the three clients make theirs inside
+/// the count: 51 that macOS and Windows, which hold none, do not make.
 #[test]
 fn a_cell_serving_writes_turns_without_remaking_what_a_turn_keeps() {
+    const SERVING: u64 = if cfg!(target_os = "linux") {
+        34_094
+    } else {
+        34_043
+    };
     let counts = serving(1, 40);
-    assert_eq!(counts.allocations, 33_564, "{counts:?}");
+    assert_eq!(counts.allocations, SERVING, "{counts:?}");
 }

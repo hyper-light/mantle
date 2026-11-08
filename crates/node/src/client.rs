@@ -201,7 +201,12 @@ impl Client {
                 refused: None,
             })
             .collect();
-        let (directory, now) = (Peers::new(settings.nodes, 0), std::time::Instant::now());
+        // The driver's clock: a simulation's on a simulated shard, so a seed's run does not
+        // depend on the machine it runs on (`hyper_rt_transport::shard_instant`).
+        let (directory, now) = (
+            Peers::new(settings.nodes, 0),
+            hyper_rt_transport::shard_instant(),
+        );
         let endpoint = match settings.seed {
             Some(seed) => Endpoint::new_seeded(config, budget, directory, now, seed)?,
             None => Endpoint::new(config, budget, directory, now)?,

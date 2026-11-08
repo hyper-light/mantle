@@ -2411,6 +2411,7 @@ mod tests {
             snapshots_sent: 0,
             snapshots_taken: 0,
             stalled: false,
+            liveness_waits: 0,
             in_flight: 0,
             writes: hyper_durable::Writes::default(),
             fenced: false,

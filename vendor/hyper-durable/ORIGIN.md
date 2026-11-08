@@ -273,3 +273,46 @@ slates by the rule inside its own core (`crates/cluster/src/fold.rs`).
   111 bytes by a bound of 110), `a_walk_of_the_store_reads_pages_of_the_cores_rule` (46 reads of the
   log where the rule gives 58) and `a_learner_caught_up_from_the_log_is_sent_appends_within_the_bound`
   (an append of five entries, 325 bytes, against 256).
+
+## A member caught up from the log's file off the owner's thread (2026-11-07)
+
+- **The defect.** A leader sending a member entries its handle no longer held read them through the
+  log's owner and waited on the replica's thread for the read, which was the log's device's one
+  job: the leader's writes and its appends to its other members waited for a reconnecting member's
+  catch-up (kiln, 2026-11-06, which grew the log's cache to hide it).
+- **The change** (`LogStore::catch_up`, `LogStore::entries_or_catch_up`, `docs/durable.md` §8). The
+  core's read of a page at or before the mark that the handle does not hold is answered
+  `LogTemporarilyUnavailable`, and the store opens a run there: the entries one read of the log gives
+  (a segment's bytes), read by hyper-log's fetcher off the device and the owner's thread
+  (`GroupLog::fetch_waking`), one run of the group's at a time, each run `Waiting`, `Reading` or
+  `Read`. The run's answer wakes the owner, and at the end of that drive the replica has the core send
+  each member whose next index a read run holds its page (`RawNode::send_append`); the page the core
+  takes opens the run after it, read while this one is sent, and a run that holds no member's next
+  index goes, its reservation kept for the next run. A run whose last entry's term is no longer the
+  handle's was read before the log there was replaced, and is read again (by Raft's log matching,
+  the last entry agreeing is enough). `entries` itself answers at once for every other reader, as
+  before; a store that takes neither method answers where the core asks, by their defaults.
+  `Replica::catching_up` says whether a run is out, for an owner that waits on nothing else.
+- **Tests** (`tests/catch_up.rs`):
+  `a_leader_writes_and_appends_while_a_members_catch_up_is_read_from_its_file`: a sole voter leads
+  two learners on a log on a file; learner 3 joins 8 MiB behind, in 16 KiB entries, and its first
+  read is held at the file while the leader writes 32 entries, each durable, applied and taken by
+  learner 2 while the read is held; once let go, learner 3 is caught up page by page. At `3d6640f`
+  the leader's writes waited the test's 60 s bound. Measured on adacachy (Ryzen 9 9950X3D2, NVMe,
+  shared with production): a write while the read was held, median 9.3 ms, most 18.1 ms, against a
+  batch of 32 before at 12.0 ms; learner 3 caught up 8 MiB in 182 pages of 64 KiB in 11.7 ms, where a
+  read a page took 43 to 50 ms.
+
+## The run after a member's is kept until it reaches it (2026-11-07)
+
+- **The defect.** The run read while a member was sent the one before it held none of the member's
+  next indexes yet, and was let go at the next drive and read again once the member reached it: a
+  member whose answers come back slower than its window fills, any member across a network, was
+  sent each run after the first read several times over. Measured in kiln's store::group (a runner
+  48 MiB behind, 8 MiB runs, adas-mac-studio-3, 2026-11-07): 47 and 48 reads of the log's file at
+  820346685304, its pages sent over 349 and 510 ms; 6 reads with the change, over 136 and 146 ms.
+- **The change** (`CatchUp::wanted`). A run is kept while it holds a member's next index, waits for
+  one, or begins where a run holding one ends: one run read ahead of each member, at most.
+- **Test** (`tests/catch_up.rs`): `a_learner_that_answers_late_is_sent_each_run_read_once`: a learner
+  8 MiB behind on a log of 1 MiB segments that answers a round late is sent each run read once (9
+  reads at most); at 820346685304 it took 11.

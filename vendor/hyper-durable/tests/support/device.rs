@@ -144,8 +144,9 @@ impl Device {
         }
     }
 
-    /// Waits until every write out is answered, driving as answers come: the log wakes the
-    /// member once for every write it answers, so a wait never outlasts one.
+    /// Waits until every write out is answered and no page of a catch-up is being read, driving as
+    /// answers come: the log wakes the member once for every write it answers and every page it
+    /// reads, so a wait never outlasts one.
     pub fn settle(&mut self, now: u64, wire: &mut Vec<Message>) -> Option<ConfState> {
         loop {
             let cut = self.drive(now, wire);
@@ -153,7 +154,7 @@ impl Device {
                 return cut;
             }
             let replica = self.replica.as_ref()?;
-            if replica.fenced().is_some() || replica.in_flight() == 0 {
+            if replica.fenced().is_some() || (replica.in_flight() == 0 && !replica.catching_up()) {
                 return None;
             }
             self.woken

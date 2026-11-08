@@ -3,6 +3,8 @@
 //! in memory are copied at once; those that are not are read from the file on the device, a run
 //! whose blocks touch in one read, and the fetch is answered when they come back.
 
+use std::sync::mpsc::TrySendError;
+
 use hyper_block::block::BlockFile;
 use hyper_block::buf::Alignment;
 
@@ -171,7 +173,10 @@ impl<F: BlockFile + 'static> Owner<F> {
             ticket.answer(Ok(Answer::Entries(into)));
             return;
         }
-        if self.fetches.len() >= self.p.config.max_groups {
+        // Those whose callers wait and those whose callers do not are bounded apart, each at one a
+        // group: a group's handle that keeps one of the second out (`GroupLog::fetch_waking`) is
+        // never refused for the first.
+        if self.fetches.iter().filter(|f| f.waits == waits).count() >= self.p.config.max_groups {
             self.spare_reads = reads;
             ticket.answer(Err(LogError::Busy));
             return;
@@ -228,14 +233,28 @@ impl<F: BlockFile + 'static> Owner<F> {
         Ok(())
     }
 
-    /// Hands the device the first fetch's reads.
+    /// Hands the first fetch's reads to the thread that reads off the device (`device::Fetcher`),
+    /// so no frame waits behind them, or, for a log with none, to the device. One read is out at a
+    /// time and the fetcher's queue holds one, so it is never full; a fetcher gone (its thread
+    /// ended) is let go, and the device reads from then on.
     fn read_next(&mut self) {
         let Some(fetch) = self.fetches.front_mut() else {
             return;
         };
         let reads = std::mem::replace(&mut fetch.reads, Reads::none());
         self.reading = true;
-        self.io.push_back((Job::Read(reads), None));
+        let Some(fetcher) = self.fetcher.as_ref() else {
+            self.io.push_back((Job::Read(reads), None));
+            return;
+        };
+        match fetcher.try_send(reads) {
+            Ok(()) => {}
+            Err(TrySendError::Full(reads)) => self.io.push_back((Job::Read(reads), None)),
+            Err(TrySendError::Disconnected(reads)) => {
+                self.fetcher = None;
+                self.io.push_back((Job::Read(reads), None));
+            }
+        }
     }
 
     /// A fetch's reads are back: entries that missed their place are looked up again, once, as

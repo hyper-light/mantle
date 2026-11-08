@@ -795,6 +795,20 @@ impl<S: Storage> RawNode<S> {
     pub fn ping(&mut self) -> Result<()> {
         self.operate(Raft::ping)
     }
+    /// A leader sends `member` what follows its progress, if it may be
+    /// sent now: what its owner asks once storage has read the entries it
+    /// said it did not hold yet (`StorageError::LogTemporarilyUnavailable`,
+    /// which leaves the member's progress as it was), as raft-rs's
+    /// `on_entries_fetched` does. Any other role sends nothing.
+    pub fn send_append(&mut self, member: NodeId) -> Result<()> {
+        self.operate(|raft| {
+            if raft.state() == StateRole::Leader && member != raft.id {
+                raft.send_append(member)
+            } else {
+                Ok(())
+            }
+        })
+    }
     /// What a member asks of itself on its owner's word. A refusal is no
     /// one's to hear.
     fn tell(&mut self, message: Message) -> Result<()> {

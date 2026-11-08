@@ -73,6 +73,20 @@ impl<S: LogStore> LogStore for Answers<S> {
         self.store.entries(low, high, max_bytes, into)
     }
 
+    fn entries_or_catch_up(
+        &self,
+        low: u64,
+        high: u64,
+        max_bytes: u64,
+        into: &mut Vec<Entry>,
+    ) -> Result<(), StorageError> {
+        self.store.entries_or_catch_up(low, high, max_bytes, into)
+    }
+
+    fn catch_up(&mut self, waker: &Waker, lows: &[u64], read: &mut Vec<u64>) -> bool {
+        self.store.catch_up(waker, lows, read)
+    }
+
     fn visit(
         &self,
         low: u64,

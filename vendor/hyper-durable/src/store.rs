@@ -266,4 +266,35 @@ pub trait LogStore {
     /// The bytes the store keeps in memory past its own budget for [`LogStore::keep_after`], which
     /// the replica's budget counts with what it holds itself.
     fn kept_bytes(&self) -> u64;
+
+    /// [`LogStore::entries`] as the core reads them (`docs/durable.md` §8): a store that catches
+    /// members up off the replica's thread ([`LogStore::catch_up`]) answers
+    /// `LogTemporarilyUnavailable` for a member's page it does not hold in memory, and reads it
+    /// meanwhile. Every other reader calls `entries`, which always answers. By default `entries`.
+    fn entries_or_catch_up(
+        &self,
+        low: u64,
+        high: u64,
+        max_bytes: u64,
+        into: &mut Vec<Entry>,
+    ) -> Result<(), StorageError> {
+        self.entries(low, high, max_bytes, into)
+    }
+
+    /// The members a leader catches up from what the store no longer holds in memory, read off the
+    /// replica's thread (`docs/durable.md` §8). The replica calls it at the end of every drive with
+    /// its owner's `waker` and `lows`, the next index of every other member (none off the lead); the
+    /// store fills `read` with the first index of every page it has read and holds, and the replica
+    /// has the core send each to the members waiting at it (`RawNode::send_append`). True while a
+    /// page is being read or waits its turn: its answer wakes `waker`.
+    ///
+    /// By default nothing is read off the thread and the core is answered where it asks, as by
+    /// every store before this. hyper-log's store, once called, reads a page at or before the mark
+    /// ([`LogStore::keep_after`]) that its handle does not hold from the log's file, with `waker` to
+    /// wake, and holds it until the core asks again. A wrapper that passes on neither this nor
+    /// [`LogStore::entries_or_catch_up`] leaves its store answering where the core asks.
+    fn catch_up(&mut self, waker: &Waker, lows: &[u64], read: &mut Vec<u64>) -> bool {
+        let _ = (waker, lows, read);
+        false
+    }
 }

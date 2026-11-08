@@ -15,12 +15,14 @@
 //! counts as it chooses the page, before anything is copied. The core takes a page its storage cut
 //! as whole, so a page cut by the stored bytes alone ran past the core's bound on a message
 //! (mantle, 2026-10-19).
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::task::Waker;
 
 use hyper_block::block::BlockFile;
-use hyper_log::{Fetched, GroupLog, Log, LogError, LogOpener, Page, Proposal, Start, Update};
+use hyper_log::{
+    Fetched, Fetching, GroupLog, Log, LogError, LogOpener, Page, Proposal, Start, Update,
+};
 use hyper_raft::StorageError;
 use hyper_raft::proto::{Entry, EntryType, HardState};
 
@@ -68,6 +70,141 @@ pub struct GroupStore<F: BlockFile + 'static> {
     /// Parts not yet sent, in order.
     queued: VecDeque<Update>,
     waker: Option<Waker>,
+    /// The members a leader catches up from the log's file ([`LogStore::catch_up`]).
+    catching: RefCell<CatchUp>,
+    /// Whether the log reads a fetch that no caller waits on without being told to: every log but
+    /// one under `Waits::Told`, whose caller decides when its device reads (`Log::serve`), and where
+    /// the store reads where the core asks, as before.
+    reads_untold: bool,
+}
+
+/// How a leader's store catches up the members whose next page its handle no longer holds in
+/// memory ([`LogStore::catch_up`]). The core asks for a member's next page; the store opens a run of
+/// the log at that index, the entries one read of the log gives, which waits its turn
+/// ([`Step::Waiting`]), is read from the log's file off the replica's thread, one run of the group's
+/// at a time ([`Step::Reading`]), and is held once read ([`Step::Read`]), the core told meanwhile
+/// that the store does not hold the page yet. At the end of every drive the replica has the core
+/// send their pages to the members whose next index a read run holds; each page the core takes
+/// opens the run after it, so the next run is read while this one is sent, and kept until the
+/// member reaches it. Any other run that holds no member's next index is let go.
+#[derive(Default)]
+struct CatchUp {
+    /// The owner's waker, which a run's answer wakes: none until the replica first calls, and
+    /// until then the store answers where the core asks.
+    waker: Option<Waker>,
+    /// The mark after which the replica reads entries back itself ([`LogStore::keep_after`]): an
+    /// entry at or before it no read of the replica's own wants, only a member catching up.
+    mark: u64,
+    /// The runs, in the order asked: those holding a member's next index, the one after each of
+    /// them, and the one being read.
+    runs: VecDeque<Run>,
+}
+
+/// Entries of the log from `low`, as one read of the log gives them, and where its read stands.
+struct Run {
+    low: u64,
+    step: Step,
+}
+
+/// Where a run's read stands.
+enum Step {
+    /// Asked for, behind the run being read.
+    Waiting,
+    /// Being read from the log's file: its answer wakes the owner.
+    Reading(Fetching),
+    /// Read: its entries from `low`, or why the log could not give them.
+    Read(Result<Fetched, StorageError>),
+}
+
+impl Run {
+    /// The index past the entries the run holds, read: one that failed holds its first index,
+    /// whose reader is answered its failure; one not read yet holds nothing.
+    fn end(&self) -> u64 {
+        let held = match &self.step {
+            Step::Read(Ok(fetched)) => u64::try_from(fetched.len()).unwrap_or(u64::MAX),
+            Step::Read(Err(_)) => 1,
+            Step::Waiting | Step::Reading(_) => 0,
+        };
+        self.low.saturating_add(held)
+    }
+
+    /// Whether the run, read, holds the entry at `index`.
+    fn holds(&self, index: u64) -> bool {
+        index >= self.low && index < self.end()
+    }
+}
+
+impl CatchUp {
+    /// Whether `r` is wanted still, the members' next indexes `lows`: being read, waiting for or
+    /// holding a member's next index, or right after a run that holds one, read while that is sent.
+    fn wanted(&self, r: &Run, lows: &[u64]) -> bool {
+        let waits = matches!(r.step, Step::Waiting);
+        matches!(r.step, Step::Reading(_))
+            || lows
+                .iter()
+                .any(|&low| r.holds(low) || (waits && low == r.low))
+            || self
+                .runs
+                .iter()
+                .any(|before| before.end() == r.low && lows.iter().any(|&low| before.holds(low)))
+    }
+
+    /// Opens a run at `low` unless one begins there.
+    fn open(&mut self, low: u64) {
+        if !self.runs.iter().any(|r| r.low == low) {
+            self.runs.push_back(Run {
+                low,
+                step: Step::Waiting,
+            });
+        }
+    }
+
+    /// Takes in the run being read, once its answer has come.
+    fn take_in(&mut self) {
+        for r in &mut self.runs {
+            if let Step::Reading(fetching) = &r.step
+                && let Some(answer) = fetching.poll()
+            {
+                r.step = Step::Read(answer.map_err(|e| storage(&e)));
+            }
+        }
+    }
+
+    /// Asks the log for the first run waiting, unless a run is being read: `bytes` of payload from
+    /// its first index, at most. The owner's waker is woken once it is in.
+    fn read_next<F: BlockFile + 'static>(
+        &mut self,
+        group: &GroupLog<F>,
+        (fetched, bytes): (&Cell<Option<Fetched>>, u64),
+    ) {
+        let Some(waker) = self.waker.as_ref() else {
+            return;
+        };
+        if self.runs.iter().any(|r| matches!(r.step, Step::Reading(_))) {
+            return;
+        }
+        let Some(r) = self
+            .runs
+            .iter_mut()
+            .find(|r| matches!(r.step, Step::Waiting))
+        else {
+            return;
+        };
+        let into = fetched.take().unwrap_or_default();
+        let read = group.bounds().and_then(|(_, last)| {
+            group.fetch_waking(
+                r.low,
+                last.saturating_add(1),
+                Page::payload(bytes),
+                into,
+                waker.clone(),
+            )
+        });
+        r.step = match read {
+            Ok(fetching) => Step::Reading(fetching),
+            Err(e) => Step::Read(Err(storage(&e))),
+        };
+    }
 }
 
 impl<F: BlockFile + 'static> std::fmt::Debug for GroupStore<F> {
@@ -151,6 +288,7 @@ impl<F: BlockFile + 'static> GroupStore<F> {
 
     /// A store over `group`'s handle, reading at most `page` bytes at once.
     pub fn new(group: GroupLog<F>, page: u64) -> Self {
+        let reads_untold = group.reads_untold();
         Self {
             group,
             page,
@@ -158,6 +296,8 @@ impl<F: BlockFile + 'static> GroupStore<F> {
             writes: VecDeque::new(),
             queued: VecDeque::new(),
             waker: None,
+            catching: RefCell::new(CatchUp::default()),
+            reads_untold,
         }
     }
 
@@ -218,6 +358,104 @@ impl<F: BlockFile + 'static> GroupStore<F> {
         }
     }
 
+    /// Whether a read from `low` is a member's catch-up, read off the replica's thread
+    /// ([`LogStore::catch_up`]): the replica has called with its waker, the log reads untold, `low`
+    /// is at or before the mark, so no read of the replica's own wants it, and the handle does not
+    /// hold it in memory.
+    fn catches_up(&self, low: u64) -> bool {
+        self.reads_untold
+            && self
+                .catching
+                .try_borrow()
+                .is_ok_and(|c| c.waker.is_some() && low <= c.mark)
+            && !self.group.holds(low)
+    }
+
+    /// The entries of `[low, high)` within `max_bytes`, as [`LogStore::entries`] gives them, for a
+    /// member catching up: from the read run that holds `low`, the run after it opened; until one
+    /// does, `LogTemporarilyUnavailable`, a run at `low` asked or waiting.
+    fn caught_up(
+        &self,
+        (low, high, max_bytes): (u64, u64, u64),
+        into: &mut Vec<Entry>,
+    ) -> Result<(), StorageError> {
+        let mut c = self
+            .catching
+            .try_borrow_mut()
+            .map_err(|_| StorageError::Other("a read of the store inside another"))?;
+        c.take_in();
+        let read = (&self.fetched, self.page);
+        let Some(at) = c.runs.iter().position(|r| r.holds(low)) else {
+            c.open(low);
+            c.read_next(&self.group, read);
+            return Err(StorageError::LogTemporarilyUnavailable);
+        };
+        let (first, fetched) = match c.runs.get(at).map(|r| (r.low, &r.step)) {
+            Some((first, Step::Read(Ok(fetched)))) => (first, fetched),
+            Some((_, Step::Read(Err(e)))) => {
+                let e = *e;
+                let _ = c.runs.remove(at);
+                return Err(e);
+            }
+            _ => return Err(StorageError::LogTemporarilyUnavailable),
+        };
+        let end = first.saturating_add(u64::try_from(fetched.len()).unwrap_or(u64::MAX));
+        let before = into.len();
+        if self.decode_page(fetched, first, (low, high, max_bytes), into)? {
+            // The next run, while this one is sent: what a member's next read from the file is.
+            if end <= c.mark && !self.group.holds(end) {
+                c.open(end);
+            }
+            c.read_next(&self.group, read);
+            return Ok(());
+        }
+        // Read before the log's entries there were replaced: read again.
+        into.truncate(before);
+        let _ = c.runs.remove(at);
+        c.open(low);
+        c.read_next(&self.group, read);
+        Err(StorageError::LogTemporarilyUnavailable)
+    }
+
+    /// Decodes into `into` the entries of `[low, high)` that `fetched`, read from `first`, holds:
+    /// as many as `max_bytes` admit by the core's count, one at least, as [`LogStore::entries`]
+    /// gives them. False when the last of them is not the entry the handle holds at its index now:
+    /// the run was read before the log's entries there were replaced (a leader that stepped down,
+    /// had its log cut and led again while it was read), and by Raft's log matching the last one
+    /// agreeing is enough for every entry before it.
+    fn decode_page(
+        &self,
+        fetched: &Fetched,
+        first: u64,
+        (low, high, max_bytes): (u64, u64, u64),
+        into: &mut Vec<Entry>,
+    ) -> Result<bool, StorageError> {
+        let page = Page {
+            max_bytes,
+            per_entry: IN_MESSAGE_BEYOND_STORED,
+        };
+        let skip = usize::try_from(low.saturating_sub(first)).unwrap_or(usize::MAX);
+        let mut total = 0u64;
+        let mut last = None;
+        for (index, (term, bytes)) in (low..high).zip((skip..).map_while(|i| fetched.get(i))) {
+            total =
+                total.saturating_add(page.count(u64::try_from(bytes.len()).unwrap_or(u64::MAX)));
+            if last.is_some() && total > max_bytes {
+                break;
+            }
+            let entry = decode_entry(index, term, bytes)
+                .ok_or(StorageError::Other("an entry does not decode"))?;
+            into.try_reserve(1)
+                .map_err(|_| StorageError::Other("no memory for the entries asked"))?;
+            let mut copy = Entry::default();
+            entry.copy_into(&mut copy);
+            into.push(copy);
+            last = Some((index, term));
+        }
+        let (index, term) = last.ok_or(StorageError::Unavailable)?;
+        Ok(self.group.term(index).is_ok_and(|held| held == term))
+    }
+
     /// Sends the parts waiting while the handle has room.
     fn send_queued(&mut self) {
         while self.group.has_room() {
@@ -257,6 +495,8 @@ fn storage(e: &LogError) -> StorageError {
     match e {
         LogError::Compacted { .. } => StorageError::Compacted,
         LogError::Unavailable { .. } => StorageError::Unavailable,
+        // The log's queue of fetches was full: the core asks again when it next sends.
+        LogError::Busy => StorageError::LogTemporarilyUnavailable,
         _ => StorageError::Other("the log failed"),
     }
 }
@@ -463,6 +703,19 @@ impl<F: BlockFile + 'static> LogStore for GroupStore<F> {
         decoded
     }
 
+    fn entries_or_catch_up(
+        &self,
+        low: u64,
+        high: u64,
+        max_bytes: u64,
+        into: &mut Vec<Entry>,
+    ) -> Result<(), StorageError> {
+        if low < high && self.catches_up(low) {
+            return self.caught_up((low, high, max_bytes), into);
+        }
+        self.entries(low, high, max_bytes, into)
+    }
+
     fn visit(
         &self,
         low: u64,
@@ -585,9 +838,47 @@ impl<F: BlockFile + 'static> LogStore for GroupStore<F> {
     /// each entry's bytes back with its write's answer, so nothing is copied to keep them.
     fn keep_after(&mut self, index: u64) {
         self.group.keep_after(index);
+        let catching = self.catching.get_mut();
+        catching.mark = catching.mark.max(index);
     }
 
     fn kept_bytes(&self) -> u64 {
         self.group.kept_bytes()
+    }
+
+    /// A page of what a member the leader catches up lacks that the handle no longer holds is read
+    /// from the log's file off the replica's thread, by hyper-log's fetcher, off the log's device,
+    /// so no write of the leader's and no append to another member waits on it (`CatchUp`).
+    fn catch_up(&mut self, waker: &Waker, lows: &[u64], read: &mut Vec<u64>) -> bool {
+        let c = self.catching.get_mut();
+        match &c.waker {
+            Some(held) if held.will_wake(waker) => {}
+            _ => c.waker = Some(waker.clone()),
+        }
+        c.take_in();
+        let mut at = 0;
+        while let Some(r) = c.runs.get(at) {
+            if c.wanted(r, lows) {
+                at = at.saturating_add(1);
+                continue;
+            }
+            if let Some(Run {
+                step: Step::Read(Ok(fetched)),
+                ..
+            }) = c.runs.remove(at)
+                && self.fetched.get_mut().is_none()
+            {
+                *self.fetched.get_mut() = Some(fetched);
+            }
+        }
+        c.read_next(&self.group, (&self.fetched, self.page));
+        read.extend(lows.iter().filter(|&&low| {
+            c.runs
+                .iter()
+                .any(|r| matches!(r.step, Step::Read(_)) && r.holds(low))
+        }));
+        c.runs
+            .iter()
+            .any(|r| matches!(r.step, Step::Waiting | Step::Reading(_)))
     }
 }

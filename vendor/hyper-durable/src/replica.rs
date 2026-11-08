@@ -413,6 +413,13 @@ pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> {
     /// The voters whose disks the owner's detectors judge slow, apart from their processes
     /// (`hyper_liveness::Change::DiskSlow`): at most the group's voters.
     slow_disks: Vec<u64>,
+    /// The catch-up's lists, kept between drives (`Replica::stream_catch_up`): the members' next
+    /// indexes, the pages the store holds read, and the members waiting at one.
+    lows: Vec<u64>,
+    pages: Vec<u64>,
+    waiting: Vec<u64>,
+    /// A page of a member's catch-up is being read or waits its turn: its answer wakes the owner.
+    catching_up: bool,
 }
 
 /// A value no other opening of a member states, with overwhelming likelihood: the keys std's
@@ -558,6 +565,10 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             heirless: 0,
             heir_since: None,
             slow_disks: Vec::new(),
+            lows: Vec::new(),
+            pages: Vec::new(),
+            waiting: Vec::new(),
+            catching_up: false,
         };
         // A log compacted before the restart serves a lagging member only by snapshot, and its
         // image is what the compaction rule weighs the log against; a log never compacted is
@@ -635,6 +646,12 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// Writes out.
     pub fn in_flight(&self) -> usize {
         self.writes.len()
+    }
+
+    /// Whether a page of a member's catch-up was being read, or waited its turn, as the last drive
+    /// ended: its answer wakes the owner ([`LogStore::catch_up`]).
+    pub fn catching_up(&self) -> bool {
+        self.catching_up
     }
 
     /// Whether a write waits for room.
@@ -1599,6 +1616,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 r.keep_disk_patience(now)?;
                 r.take_light(out)?;
                 r.quiet_commit(now, waker)?;
+                r.stream_catch_up(waker, out)?;
             }
             r.release_reads(out);
             r.keep();
@@ -1746,6 +1764,50 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             self.apply_range(first, last, out)?;
         }
         self.tell_applied()
+    }
+
+    /// Sends each member a leader catches up from its store the page the store has read for it
+    /// (`LogStore::catch_up`, `docs/durable.md` §8): the store reads it off this thread, and the
+    /// core, told meanwhile that the store does not hold it yet, sends it now.
+    fn stream_catch_up(
+        &mut self,
+        waker: &Waker,
+        out: &mut Output<M::Answer>,
+    ) -> Result<(), ReplicaError> {
+        let id = self.id();
+        let mut lows = std::mem::take(&mut self.lows);
+        let mut pages = std::mem::take(&mut self.pages);
+        let mut waiting = std::mem::take(&mut self.waiting);
+        lows.clear();
+        pages.clear();
+        waiting.clear();
+        if self.is_leader() {
+            let others = self
+                .node
+                .raft
+                .tracker()
+                .iter()
+                .filter(|&(member, _)| member != id);
+            lows.extend(others.map(|(_, progress)| progress.next_index));
+        }
+        self.catching_up = self.node.store_mut().log.catch_up(waker, &lows, &mut pages);
+        let read = self
+            .node
+            .raft
+            .tracker()
+            .iter()
+            .filter(|&(member, progress)| member != id && pages.contains(&progress.next_index));
+        waiting.extend(read.map(|(member, _)| member));
+        let sent = waiting
+            .iter()
+            .try_for_each(|&member| self.node.send_append(member));
+        (self.lows, self.pages, self.waiting) = (lows, pages, waiting);
+        self.must(sent)?;
+        if !self.waiting.is_empty() {
+            let messages = self.node.messages_now();
+            self.emit(messages, out);
+        }
+        Ok(())
     }
 
     /// What the core may apply and send without a write, whatever the writes out

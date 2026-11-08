@@ -1017,6 +1017,14 @@ them. slates is read at `ec5e0df` (its `main`, 2026-10-03).
   the snapshot cells 8 bytes a member more a tracker. The schedules of `tests/pipeline.rs` moved,
   R17 reached in every setting that keeps; every other suite's lines are R16's.
 
+### A send once storage has read what it lacked
+
+- `RawNode::send_append(member)`: a leader sends `member` what follows its progress, if it may be
+  sent now; any other role sends nothing. What an owner calls once its storage has read entries it
+  answered `StorageError::LogTemporarilyUnavailable` for, which leaves the member's progress as it was
+  (raft-rs's `on_entries_fetched`): hyper-durable's catch-up from the log's file
+  (`hyper-durable/ORIGIN.md`, 2026-11-07).
+
 ### R13: a learner caught up in rounds before it votes
 
 - **The rule** (Ongaro's thesis §4.2.1, "Catching up new servers"; slates `RaftNode::catch_up`,

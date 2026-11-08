@@ -332,7 +332,7 @@ impl Page {
 
     /// What an entry of `payload` bytes is counted at. A count past `u64` is `u64::MAX`, past every
     /// bound but none.
-    pub(crate) fn count(self, payload: u64) -> u64 {
+    pub fn count(self, payload: u64) -> u64 {
         payload.saturating_add(self.per_entry)
     }
 }
@@ -576,9 +576,10 @@ pub struct Log<F: BlockFile + 'static> {
     /// Where the log's handles reach its owner, and where a caller that does its frame's I/O sends
     /// it back (`device::Lines`).
     lines: Lines<F>,
-    /// The log's two threads: the owner's, which gives back the file when the log closes, and
-    /// the I/O thread.
-    threads: [Option<JoinHandle<Option<F>>>; 2],
+    /// The log's threads: the owner's, which gives back the file when the log closes, the I/O
+    /// thread, and the thread that reads entries back off the device, where the log has one
+    /// (`device::Fetcher`), each joined in that order.
+    threads: [Option<JoinHandle<Option<F>>>; 3],
     p: Params,
 }
 
@@ -892,13 +893,16 @@ impl<F: BlockFile + 'static> Log<F> {
         let config = p.config;
         // Everything that may wait in the inbox at once: every submission the queue admits,
         // every waiter for room, the device's words (its word that a frame is settled, a job's
-        // thread's word that the job is back), and a release from each group's handle.
+        // thread's word that the job is back, or the fetcher's read back in the read job's place:
+        // `device::JOBS`), a release from each group's handle, and the fetch each group's handle
+        // keeps out without waiting on it (`GroupLog::fetch_waking`).
         let capacity = config
             .queue_submissions
             .max(1)
             .saturating_add(config.max_groups.saturating_mul(room::GROUP_SUBMISSIONS))
             .saturating_add(device::JOBS)
             .saturating_add(1)
+            .saturating_add(config.max_groups)
             .saturating_add(config.max_groups);
         let (inbox, messages) = sync_channel(capacity);
         // One frame's flush is told at a time: the owner reads it before the next frame goes out.
@@ -939,6 +943,7 @@ impl<F: BlockFile + 'static> Log<F> {
         // The file is the caller's code: asked inside the unwind boundary, and an unwinding answer
         // fills nothing.
         p.fills = crate::unwind::contained(|| file.fills_new_space()).unwrap_or(false);
+        let (fetcher, reads) = Self::fetcher(&file, &config, p.align, &lines);
         let (more, told) = sync_channel(device::MORE);
         let device = device::Device::new(file, pool, config.segment_bytes, told)
             .steady(config.waits == Waits::Told)
@@ -951,12 +956,13 @@ impl<F: BlockFile + 'static> Log<F> {
             returns,
             wake,
             requests,
+            fetcher,
         };
         let owner = Box::new(Owner::new(p, state, room, first, wiring, sealer, gate));
         // The owner's thread waits with room for the owner. Should the send fail, the owner, and
-        // the file in it, ended with the thread.
+        // the file in it, ended with the thread; the fetcher's thread ends with the owner.
         if to_owner.send(owner).is_err() {
-            let _ = (owner_thread.join(), io.join());
+            let _ = (owner_thread.join(), io.join(), reads.map(JoinHandle::join));
             return Err(Refused {
                 error: LogError::Closed,
                 file: None,
@@ -964,9 +970,52 @@ impl<F: BlockFile + 'static> Log<F> {
         }
         Ok(Self {
             lines,
-            threads: [Some(owner_thread), Some(io)],
+            threads: [Some(owner_thread), Some(io), reads],
             p,
         })
+    }
+
+    /// The thread that reads entries back off the device (`device::Fetcher`), on a second handle to
+    /// `file` with buffers of its own, and where the owner sends it reads: none for a file that has
+    /// no second handle, or under `Waits::Told`, whose caller decides every operation of the device
+    /// and whose reads the device makes, or should the OS refuse the thread. Its reads, sent back
+    /// through the owner's inbox, take the place the device's read job took there
+    /// (`device::JOBS`), one being out at a time. It ends once the owner has.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "hyper-log owns its owner's and its device's threads (CLAUDE.md §1, sans-io's one exception)"
+    )]
+    fn fetcher(
+        file: &F,
+        config: &Config,
+        align: Alignment,
+        lines: &Lines<F>,
+    ) -> (
+        Option<SyncSender<device::Reads>>,
+        Option<JoinHandle<Option<F>>>,
+    ) {
+        if config.waits == Waits::Told {
+            return (None, None);
+        }
+        // The file is the caller's code: asked inside the unwind boundary.
+        let Some(Ok(second)) = crate::unwind::contained(|| file.try_clone()) else {
+            return (None, None);
+        };
+        let largest = usize::try_from(config.segment_bytes).unwrap_or(usize::MAX);
+        let fetcher =
+            device::Fetcher::new(second, Pool::new(align, largest.saturating_mul(2), largest));
+        // One read is out at a time (`owner::read`).
+        let (send, requests) = sync_channel(1);
+        let inbox = lines.inbox.clone();
+        match std::thread::Builder::new()
+            .name("hyper-log-fetch".into())
+            .spawn(move || {
+                fetcher.serve(&requests, &inbox);
+                None
+            }) {
+            Ok(thread) => (Some(send), Some(thread)),
+            Err(_) => (None, None),
+        }
     }
 
     /// Submits `update` for `group`: refused at once with `Busy` when the queue is full, and

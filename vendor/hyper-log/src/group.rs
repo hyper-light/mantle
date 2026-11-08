@@ -677,6 +677,53 @@ impl<F: BlockFile + 'static> GroupLog<F> {
         Ok(into)
     }
 
+    /// Whether a read from `low` is answered by the handle itself, where the replica is, with no
+    /// message to the log's owner ([`GroupLog::fetch`]): false for an entry older than its cache, one
+    /// past its last, and every read after a failure the handle cannot account for.
+    pub fn holds(&self, low: u64) -> bool {
+        let m = &self.mirror;
+        !self.stale && m.exists && low >= m.cache_from && low <= m.last
+    }
+
+    /// Whether the log reads a fetch that no caller waits on ([`GroupLog::fetch_waking`]) without
+    /// being told to: under every waits but `Waits::Told`, whose caller decides when the device
+    /// reads (`Log::serve`).
+    pub fn reads_untold(&self) -> bool {
+        self.p.config.waits != crate::Waits::Told
+    }
+
+    /// [`GroupLog::fetch`] answered later: the entries of `[low, high)` as `Log::fetch` gives them,
+    /// those no longer in memory read from the file off the log's device where the log reads so
+    /// (`device::Fetcher`). Returns at once with the fetch's ticket and wakes `waker` once the
+    /// entries have come ([`crate::Fetching::poll`]): a replica's owner reads what a member it
+    /// catches up lacks without its thread, or any write, waiting on the file (hyper-durable's
+    /// `GroupStore`). The caller keeps one out at a time: the log's inbox counts one for each group
+    /// (`Log::spawn`).
+    pub fn fetch_waking(
+        &self,
+        low: u64,
+        high: u64,
+        page: Page,
+        into: Fetched,
+        waker: Waker,
+    ) -> Result<crate::Fetching, LogError> {
+        self.asked.set(self.asked.get().saturating_add(1));
+        let (ticket, waiting) = ticket::call(Some(waker));
+        let query = Query::Entries {
+            group: self.group,
+            low,
+            high,
+            page,
+            into,
+            waits: false,
+        };
+        self.lines
+            .inbox
+            .send(Message::Query(query, ticket))
+            .map_err(|_| LogError::Closed)?;
+        Ok(crate::Fetching(waiting))
+    }
+
     fn fetch_from_log(
         &self,
         low: u64,

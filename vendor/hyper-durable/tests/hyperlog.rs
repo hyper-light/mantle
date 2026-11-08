@@ -77,7 +77,7 @@ fn settle_sending(
         if driven.more {
             continue;
         }
-        if r.in_flight() == 0 {
+        if r.in_flight() == 0 && !r.catching_up() {
             return;
         }
         woken.recv().unwrap();

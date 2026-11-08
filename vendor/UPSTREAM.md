@@ -87,9 +87,16 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `3d6640f` (hyper-raft `main`: its merge of `lean-doors`, the cuts of mantle's
-ledger of its native door, docs/research/80 "The sites", on main's `d5d5f8f`), with no local
-delta**, taken by `scripts/snapshot-hyper-raft.py`. The cuts: hyper-durable's `Owner::pairs` tells
+**Every crate at `fb74b59` (hyper-raft `main`), with no local delta**, taken by
+`scripts/snapshot-hyper-raft.py`. Past `3d6640f` it brings a member's catch-up read from the log's
+file off the device and off its owner's thread (`8203466`; `Answers` passes on the two methods a
+wrapping store must, `LogStore::catch_up` and `LogStore::entries_or_catch_up`), the run read after
+a member's kept until the member reaches it (`f45fc56`), and a driver reading what its sockets took
+before it judges its timers (`fb74b59`, hyper-raft docs/transport.md §4ap; mantle
+docs/measurements/2026-11-06-node-test-holds.md). Before it, every crate was at `3d6640f`
+(hyper-raft `main`: its merge of `lean-doors`, the cuts of mantle's ledger of its native door,
+docs/research/80 "The sites", on main's `d5d5f8f`), with no local delta, taken by
+`scripts/snapshot-hyper-raft.py`. The cuts: hyper-durable's `Owner::pairs` tells
 an unchanged configuration in place (`4a6ec51`); hyper-quic's queue of a stream's pieces is never
 shrunk below its first growth, and a sent packet's credit frames are recorded inline and the
 streams its MAX_STREAM_DATA and STREAM_DATA_BLOCKED name by its space (`6406ee5`, hyper-quic

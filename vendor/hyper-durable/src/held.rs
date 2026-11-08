@@ -63,7 +63,7 @@ impl<L: LogStore> Storage for Held<L> {
         max_bytes: u64,
         into: &mut Vec<Entry>,
     ) -> Result<(), StorageError> {
-        self.log.entries(low, high, max_bytes, into)
+        self.log.entries_or_catch_up(low, high, max_bytes, into)
     }
 
     fn any_entry(

@@ -943,50 +943,101 @@ impl<F: BlockFile> Device<F> {
     }
 
     /// Reads each run in one read, and copies each entry that verifies as the one asked for
-    /// into the caller's reservation.
-    fn read(&mut self, mut reads: Reads) -> Reads {
-        let runs = std::mem::take(&mut reads.runs);
-        let wanted = std::mem::take(&mut reads.wanted);
-        for run in &runs {
-            let entries = run
-                .first
-                .checked_add(run.count)
-                .and_then(|end| wanted.get(run.first..end))
-                .unwrap_or_default();
-            if let Err(e) = self.read_run(&mut reads, run, entries) {
-                reads.result = Err(e);
-                break;
-            }
+    /// into the caller's reservation: a log whose file has no second handle, or whose caller decides
+    /// every operation of its device (`Waits::Told`), reads on its device ([`Fetcher`]).
+    fn read(&mut self, reads: Reads) -> Reads {
+        read_runs(&self.file, &mut self.pool, reads)
+    }
+}
+
+/// Reads each run of `reads` from `file` in one read, buffers from `pool`, and copies each entry
+/// that verifies as the one asked for into the caller's reservation; one that does not is a miss,
+/// for the owner to look up again where its group now holds it (`owner::read`).
+fn read_runs<F: BlockFile>(file: &F, pool: &mut Pool, mut reads: Reads) -> Reads {
+    let runs = std::mem::take(&mut reads.runs);
+    let wanted = std::mem::take(&mut reads.wanted);
+    for run in &runs {
+        let entries = run
+            .first
+            .checked_add(run.count)
+            .and_then(|end| wanted.get(run.first..end))
+            .unwrap_or_default();
+        if let Err(e) = read_run(file, pool, &mut reads, run, entries) {
+            reads.result = Err(e);
+            break;
         }
-        reads.runs = runs;
-        reads.wanted = wanted;
-        reads
+    }
+    reads.runs = runs;
+    reads.wanted = wanted;
+    reads
+}
+
+fn read_run<F: BlockFile>(
+    file: &F,
+    pool: &mut Pool,
+    reads: &mut Reads,
+    run: &Run,
+    entries: &[Wanted],
+) -> Result<(), LogError> {
+    let size = usize::try_from(run.end.saturating_sub(run.begin))
+        .map_err(|_| LogError::Damaged("a read past usize"))?;
+    let mut buf = pool.take(size).map_err(|e| LogError::Disk(e.into()))?;
+    let read = buf
+        .set_len(size)
+        .map_err(|e| LogError::Disk(e.into()))
+        .and_then(|()| {
+            file.read_exact_at(buf.as_mut_slice(), run.begin)
+                .map_err(LogError::from)
+        });
+    if read.is_ok() {
+        for wanted in entries {
+            take_entry(reads, buf.as_slice(), run.begin, *wanted, run.slot);
+        }
+    }
+    pool.give(buf);
+    read
+}
+
+/// Where a log reads entries back from its file off its device: a second handle to the file
+/// (`BlockFile::try_clone`) and buffers of its own, on a thread of the log's own
+/// ([`Fetcher::serve`]).
+///
+/// A read of entries asks nothing of the file but offsets that hold what was written there: the
+/// log is append-only, so the blocks of an entry are written once, by its frame, and written again
+/// only once a sweep has moved what they hold and its slot is reused. A frame and its record are
+/// laid out in blocks of their own (`BlockFile::layout_block`), so no write the device makes while
+/// the read is out touches the blocks an entry it reads lies in, and an entry's CRC covers its
+/// group, index, term and bytes (`format::entry_slice`): one read where a sweep's reuse of its slot
+/// has written since does not verify, and is looked up again where its group now holds it, as one a
+/// sweep moved since its place was taken always was (`owner::read`). On the device a read was its
+/// one job, and the frame behind it waited for the read (`ORIGIN.md`, 2026-11-07).
+pub(crate) struct Fetcher<F> {
+    file: F,
+    pool: Pool,
+}
+
+impl<F: BlockFile> Fetcher<F> {
+    pub(crate) fn new(file: F, pool: Pool) -> Self {
+        Self { file, pool }
     }
 
-    fn read_run(
-        &mut self,
-        reads: &mut Reads,
-        run: &Run,
-        entries: &[Wanted],
-    ) -> Result<(), LogError> {
-        let size = usize::try_from(run.end.saturating_sub(run.begin))
-            .map_err(|_| LogError::Damaged("a read past usize"))?;
-        let mut buf = self.pool.take(size).map_err(|e| LogError::Disk(e.into()))?;
-        let read = buf
-            .set_len(size)
-            .map_err(|e| LogError::Disk(e.into()))
-            .and_then(|()| {
-                self.file
-                    .read_exact_at(buf.as_mut_slice(), run.begin)
-                    .map_err(LogError::from)
-            });
-        if read.is_ok() {
-            for wanted in entries {
-                take_entry(reads, buf.as_slice(), run.begin, *wanted, run.slot);
+    /// Does the reads the owner sends, one at a time, and sends each back through the owner's
+    /// inbox, as a completion that comes without the device does (`Message::Done`): the inbox wakes
+    /// the owner. The reads are the file's caller's code, done inside an unwind boundary; one that
+    /// unwinds fails its fetch. It ends once the owner has gone.
+    pub(crate) fn serve(mut self, requests: &Receiver<Reads>, inbox: &SyncSender<Message<F>>) {
+        while let Ok(reads) = requests.recv() {
+            let group = reads.group;
+            let read = crate::unwind::contained(|| read_runs(&self.file, &mut self.pool, reads))
+                .unwrap_or_else(|| Reads {
+                    group,
+                    result: Err(unwound("a file operation unwound")),
+                    ..Reads::none()
+                });
+            if inbox.send(Message::Done(Completion::Read(read))).is_err() {
+                return;
             }
         }
-        self.pool.give(buf);
-        read
     }
 }
 

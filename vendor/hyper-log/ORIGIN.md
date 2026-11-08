@@ -527,3 +527,31 @@ start is the log's.
   same within the runs' spread. `hyper-log-compare` builds again: R-8's held fields mapped where
   it converts hard states (it did not build on fate-commit).
 
+
+## A fetch's reads off the device (2026-11-07)
+
+- **The defect.** A fetch of entries no longer in memory was read on the device, as its one job:
+  the frame behind it, and every caller its record answers, waited for the read. A learner's
+  catch-up of megabytes sat behind each of its leader's writes (kiln, 2026-11-06).
+- **The change** (`device::Fetcher`). A log whose file has a second handle (`BlockFile::try_clone`)
+  reads every fetch on a thread of its own, `hyper-log-fetch`, by positioned reads into buffers of
+  its own, and sends each back through the owner's inbox in the place the device's read job took
+  (`device::JOBS`); the device makes the log's writes, sweeps and looks alone. A read asks nothing of
+  the file but the offsets an entry was written at: the log is append-only, and an entry's blocks
+  are written again only once a sweep has moved it and its slot is reused, where its CRC fails and it
+  is looked up again where its group now holds it, as a moved entry always was (`owner::read`). Under
+  `Waits::Told`, whose caller decides every operation of the device, and on a file with no second
+  handle, the device reads, as before. For a reader that does not wait on its fetch,
+  `GroupLog::fetch_waking` answers through a ticket that wakes a waker, `GroupLog::holds` says whether
+  the handle answers a read from its own memory, and `GroupLog::reads_untold` whether the log reads a
+  fetch no one waits on without being told to (hyper-durable's catch-up, `GroupStore`). Fetches whose
+  callers wait and fetches whose callers do not are bounded apart, one group's each, so a handle that
+  keeps one of the second out is never refused for the first, and the inbox counts one for each
+  group. `Page::count` is public, for a reader that cuts a page it fetched by the same rule.
+- **Not done.** On Windows a second handle (`DuplicateHandle`) shares its file object, whose
+  synchronous I/O the system serializes, so a frame's write there can wait for one of the fetcher's
+  positioned reads in the kernel, never for a fetch in the owner's queue; a second open of the file's
+  path would give the fetcher a file object of its own.
+- **Test** (`tests/fetch.rs`): `a_write_is_not_held_behind_a_fetch_read_from_the_file`: 8 MiB in
+  64 KiB entries on a file, fetched with the read held at the file, and another group's write
+  durable while it is held; at `3d6640f` the write waited the test's 60 s bound.

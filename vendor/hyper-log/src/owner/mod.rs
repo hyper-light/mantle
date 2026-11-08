@@ -44,7 +44,7 @@ use hyper_block::buf::AlignedBuf;
 use hyper_block::commit::Anticipation;
 
 use crate::codec::Writer as Payload;
-use crate::device::{Answering, Carrier, Completion, Device, Job, Look};
+use crate::device::{Answering, Carrier, Completion, Device, Job, Look, Reads};
 use crate::format;
 use crate::room::{Room, Take};
 use crate::state::State;
@@ -185,8 +185,9 @@ const SPARE_FRAMES: usize = 2;
 const ANSWER_LISTS: usize = SPARE_FRAMES.saturating_add(1);
 
 /// What the owner is wired to: the device, where it tells the device another frame follows,
-/// its inbox, where the device tells it of a flush, where jobs come back, its wake, and the I/O
-/// thread.
+/// its inbox, where the device tells it of a flush, where jobs come back, its wake, the I/O
+/// thread, and the thread that reads entries back off the device, where the log has one
+/// (`device::Fetcher`).
 pub(crate) struct Wiring<F> {
     pub(crate) device: Device<F>,
     pub(crate) more: SyncSender<u64>,
@@ -195,6 +196,7 @@ pub(crate) struct Wiring<F> {
     pub(crate) returns: Receiver<Box<Carrier<F>>>,
     pub(crate) wake: crate::wake::Wake,
     pub(crate) requests: SyncSender<Box<Carrier<F>>>,
+    pub(crate) fetcher: Option<SyncSender<Reads>>,
 }
 
 /// A job waiting for the device, and the caller who waits on it and may do it.
@@ -242,6 +244,9 @@ pub(crate) struct Owner<F> {
     wake: crate::wake::Wake,
     /// The I/O thread's queue of jobs.
     requests: SyncSender<Box<Carrier<F>>>,
+    /// Where fetches' reads go off the device, one at a time (`device::Fetcher`): none for a log
+    /// whose file has no second handle or under `Waits::Told`, whose reads the device makes.
+    fetcher: Option<SyncSender<Reads>>,
     /// The box jobs travel in, while no job is out.
     carrier: Option<Box<Carrier<F>>>,
     /// Where the owner tells the device that another frame follows the one it has.
@@ -261,8 +266,9 @@ pub(crate) struct Owner<F> {
     /// (`device.rs`). It wakes no one: the owner reads it before every message it takes from the
     /// inbox, since anything a caller sends after hearing of the frame comes after the word.
     flushes: Receiver<Completion>,
-    /// Fetches waiting for the device, the first of them on it: one group's each at most for
-    /// every group the log holds, past which a fetch is refused `Busy`.
+    /// Fetches waiting for their reads, the first of them being read: of those whose callers
+    /// wait on them and of those whose callers do not, one group's each at most for every group
+    /// the log holds, past which a fetch is refused `Busy`.
     fetches: VecDeque<Fetch>,
     /// The lists of a fetch done, kept for the next.
     spare_reads: crate::device::Reads,
@@ -327,6 +333,7 @@ impl<F: BlockFile + 'static> Owner<F> {
             returns,
             wake,
             requests,
+            fetcher,
         } = wiring;
         Self {
             p,
@@ -348,6 +355,7 @@ impl<F: BlockFile + 'static> Owner<F> {
             returns,
             wake,
             requests,
+            fetcher,
             carrier: None,
             more,
             more_told: false,

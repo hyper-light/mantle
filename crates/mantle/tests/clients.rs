@@ -73,7 +73,8 @@ fn bench_log_runs_the_same_threads_at_ten_and_a_hundred_times_the_replicas() {
     assert!(threads[0] > 0, "{text}");
     // The threads the bench adds above what the process runs idle, the main thread and what the
     // operating system runs in every process, are the same at every count of replicas: a driver a
-    // core and the log's two, its owner and its device thread (hyper-log), nothing a replica.
+    // core and the log's three, its owner, its device thread and the thread that reads a member's
+    // catch-up off the device (hyper-log), nothing a replica.
     // What the operating system runs comes and goes on its own (Windows' thread pool retired
     // three workers between two rows on CI: 10, 10 and 7 threads, idle 4, 4 and 1), so the
     // process's whole count is not the bench's.
@@ -84,7 +85,7 @@ fn bench_log_runs_the_same_threads_at_ten_and_a_hundred_times_the_replicas() {
         "added {added:?} above idle {idle:?} at replicas {counts:?}: threads {threads:?}"
     );
     assert!(
-        added.iter().all(|&a| a <= cores + 2),
+        added.iter().all(|&a| a <= cores + 3),
         "{added:?} above idle {idle:?} for {cores} cores"
     );
 }

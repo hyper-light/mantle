@@ -87,10 +87,20 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `0a182ae` (hyper-raft branch `progress-notes-reachable`: `c68032a` and the
-progress notes, branch `progress-notes`' `844cad0` on `liveness-reachable`, for mantle's step 2 of
-its waits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py` (Python 3.11 or
-later). Its commit changes hyper-transport alone: `Endpoint::working`, an owner's statement that its
+**Every crate at `5e40eb9` (hyper-raft branch `progress-notes-reachable-driver`: `0a182ae` and one
+commit, the driver fix landed on hyper-raft main as `fb74b59`), with no local delta**, taken by
+`scripts/snapshot-hyper-raft.py` (Python 3.11 or later). Its commit changes hyper-rt-transport and
+hyper-rt alone: a driver's turn reads the clock, takes the readiness that already fired without
+arming any, drains its sockets up to that reading, and fires its timers only when every drain took
+all that was queued by then (`hyper_rt::udp::Taken::whole`), so a node held still by its host
+reads its peers' datagrams before it judges their connections' idle timers (hyper-raft
+docs/transport.md §4ap; mantle docs/measurements/2026-11-06-node-test-holds.md). Tests:
+hyper-rt-transport `tests/held_still.rs` (a driver held past its idle timeout, and two held
+together, keep their connection; each failed before), hyper-rt
+`a_receive_is_whole_when_it_took_all_that_was_queued_as_it_began`. Before it, every crate was at
+`0a182ae` (hyper-raft branch `progress-notes-reachable`: `c68032a` and the progress notes, branch
+`progress-notes`' `844cad0` on `liveness-reachable`, for mantle's step 2 of its waits), with no
+local delta, taken by `scripts/snapshot-hyper-raft.py`. Its commit changes hyper-transport alone: `Endpoint::working`, an owner's statement that its
 work for an exchange it serves advanced, sent at most one note a beat a connection on a lane of its
 own, and an asker's exchange named in a note waited on through the window the note starts
 (hyper-raft docs/transport.md §4am; research/77 D1). Before it, every crate was at `c68032a`

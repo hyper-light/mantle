@@ -165,6 +165,13 @@ pub struct Taken {
     pub messages: usize,
     /// Their payload bytes.
     pub bytes: usize,
+    /// Whether it took every datagram queued when it began: it emptied the socket, reached one
+    /// the kernel stamped after `began_ns`, or took the bytes the socket counted queued where the
+    /// count covers every queued datagram ([`UdpSocket::queued_bytes`]; not Linux's, the next
+    /// one's). Not when it reached its bound on calls first: what it left had come before it
+    /// began. An owner that judges its timers at `began_ns` judges them after every datagram
+    /// that arrived by then only when each of its sockets' receives was whole.
+    pub whole: bool,
 }
 
 /// How [`Batched::receive_queued`] ended.
@@ -1051,6 +1058,7 @@ impl Batched {
         } else {
             Some(self.udp.queued_bytes()?)
         };
+        let counts_every = self.udp.queued_bytes_counts_every();
         let past = Cell::new(false);
         let bytes_taken = Cell::new(0usize);
         let mut handed = |arrival: Arrival, bytes: &mut [u8]| {
@@ -1093,6 +1101,9 @@ impl Batched {
             }
         }
         taken.bytes = bytes_taken.get();
+        taken.whole = ended == Queued::Emptied
+            || past.get()
+            || (counts_every && held.is_some_and(|held| taken.bytes >= held));
         self.stats.received = self.stats.received.saturating_add(as_u64(taken.datagrams));
         Ok((taken, ended))
     }

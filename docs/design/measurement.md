@@ -291,10 +291,12 @@ stock clients stay the correctness suite.
 - **Operations**: PUT whole and streamed, GET whole and ranged, HEAD, DELETE, a ListObjectsV2 page
   of up to 1,000 keys, and multipart create, upload part, complete (up to 10,000 parts), abort and
   list parts, through both doors (79 [10]).
-- **Sizes**: 0 B, 1 B, 65,535, 65,536 and 65,537 bytes (a 64 KiB segment's boundaries), 128 KiB,
-  8 MiB (the stock clients' threshold and part), 64 MiB, 5 GiB (the single PUT's limit) and a 10 GB
-  stream; sets of 1,000, 10,000 and 100,000 small objects, 100,000 by default with 10,000 beside it
-  (79 [10][14]).
+- **Sizes**: 0 B, 1 B, 65,535, 65,536 and 65,537 bytes (a 64 KiB segment's boundaries, the five
+  objects every set puts first), 128 KiB (S3's small-object line), 8 MiB (the stock clients'
+  threshold and part), 64 MiB (Hadoop S3A's default part), 5 GiB (the single PUT's limit) and a
+  10 GB stream (the owner's agreed scale); sets of 1,000, 10,000 and 100,000 small objects, that
+  scale's sets, 100,000 by default with 10,000 beside it as the engine is reported at 100M and 10M
+  keys (79 [10][14][15][16][17][18]).
 - **Measures per operation**: allocations, reallocations, moved reallocations, bytes asked, peak
   live heap per request and per connection, minor and major faults, user and system CPU,
   instructions and cycles where the OS counts them, context switches, wire bytes, datagrams on the
@@ -314,11 +316,15 @@ stock clients stay the correctness suite.
   its reason (79 [9]).
 - **Conditions**: quiet; busy loops at one and two times the cores; one and two CPUs; the node's
   memory floor as a cgroup limit; and for the native door the 500 ms one-way relay with loss and
-  reordering, its overhead above physics reported (79 [12]).
-- **Machines**: the box (CPUSET 8-15 under a memory scope), the Mac's Linux VM lane and the Mac;
-  Windows runs the correctness suites.
-- **Comparators**: bare hyper-quic, quinn's `perf` at hyper-quic's base revision and msquic's
-  secnetperf for the native door; Garage v2.5.0, SeaweedFS 4.52, RustFS 1.0.4 and MinIO
-  RELEASE.2025-10-15T17-29-55Z for the HTTP door, each configured to flush before acknowledging,
-  pinned and built in a comparison-only workspace, with S3's published bars beside them as
-  references (79 [11][12][13]).
+  reordering, the owner's condition, its overhead above physics reported; one and two CPUs and a
+  busy loop a core as CI's small hosts, twice the cores the plan's harder load, the floor the one
+  `mantle serve` derives (79 [12][19][21][22][23]).
+- **Machines**: the box (CPUSET 8-15, one die's eight cores without their SMT siblings, under a
+  memory scope), the Mac's Linux VM lane and the Mac, never a shared runner; Windows runs the
+  correctness suites (79 [20][23]).
+- **Comparators**: bare hyper-quic, quinn's `perf` at hyper-quic's base revision (quinn-proto
+  0.11.18) and msquic v2.6.3's secnetperf for the native door; Garage v2.5.0, SeaweedFS 4.52,
+  RustFS 1.0.4 and MinIO RELEASE.2025-10-15T17-29-55Z for the HTTP door, each configured to flush
+  before acknowledging (MinIO only by a whole-machine sync, so on the Mac apart), pinned and built
+  in a comparison-only workspace, with S3's published bars beside them as references
+  (79 [11][12][13]).

@@ -38,8 +38,20 @@ back through both:
 
 Open: one test, `objects_round_trip_through_any_node_and_read_back_after_one_is_killed`
 (`crates/mantle/tests/node.rs`), failed once in the gates of `aa5cbf62` on this Mac at load ~70, its
-harness quiet 4.92 s after a kill with nothing moved, and passed twice after at load ~44: under load
-it is a defect, its stall not yet traced. A founder its peers dial was out of reach for 3 min 7 s
+harness quiet 4.92 s after a kill with nothing moved, and passed twice after at load ~44; it failed 2
+of 6 rounds on the box beside a memory-capped 100M bench, and none of 71 since. Traced: a node held
+still by its host past the QUIC idle timeout (3.072 s) is timed out by its client, whose read ends
+`Lost(Closed)` (reproduced exactly, held 4 s; 2 s passes), and the harness's quiet watch fails when
+the test process itself is held still. The trace found hyper-rt-transport's driver firing timers
+before it reads the sockets that became ready in a hold; whether links should outlast longer holds
+is open ([holds](measurements/2026-11-06-node-test-holds.md)). A founder of the KIND cell whose
+log was full of live records when its host stopped started 22 times into "the log is full of
+live records": a liveness write the log refused for room stopped the node. Such a write is now
+owed until the ranges compact; that hyper-log counts a group's retention in payload while its
+frames take whole blocks, so the file fills before any group's bound, is open in hyper-raft, as is
+a file at hyper-log's least of three segments answering `Full` for good once its groups have
+compacted, which stalls that node (none at four segments or more, a founder's log has 237)
+([full log](measurements/2026-11-07-full-log-restart.md)). A founder its peers dial was out of reach for 3 min 7 s
 after its pod was replaced in the kind cluster, its peers' QUIC flows to its Service's cluster IP
 still translated to the killed pod ([research/78](research/78-a-cell-in-kubernetes.md)); founders
 are now reached at their pods' own names, each looked up again by its peers and clients when they

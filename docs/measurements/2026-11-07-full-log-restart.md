@@ -63,3 +63,50 @@ bound (`Backlog`), and mantle's `derive::log`, which sizes the file to hold ever
 retention from that payload, does not hold what the groups keep on disk. Handed to the hyper-raft
 agent on a branch of its own: a group's own bound must come before the file's for any update
 size.
+
+## 2026-11-08: what two seeds hid
+
+**What happened.** Concourse's test job, about 30 minutes through 2026-11-05, ran out its 2-hour
+limit inside this test on both builds of `68c7b831` (`mantle/test` 12 and 13), and GitHub's two
+Windows jobs for the commit ran out the 6-hour limit in their `Tests` step (run 42438332994,
+cancelled), while every Linux and macOS job finished `tests/sim.rs` in 57 to 205 s. A container on
+this Mac reproduced it with the same binary's settings, so it was neither Concourse nor load; the
+box then reproduced it across seeds, as the two the test ran had not.
+
+| Three segments, seeds 1-26, on the box | `68c7b831` | with the fixes below |
+|---|---|---|
+| Spun past 200 s | 11 | 0 |
+| A node fenced, "a write made durable behind a refused one" | 1 | 0 |
+| A node stalled for good, the cell's quiet watch failing | hidden by the spin | 11 |
+| The test's last wait not reached | 2 | 2 |
+| Passed | 12 | 13 |
+
+**The spin.** A range stalled for room with nothing to compact was tried at every turn, and a try
+drives every range again, so the node never parked and the simulated clock could not move: 600,000
+passes at one instant (253,546 ms) with the log's durable writes at 1,182 and the applied entries
+at 1,176 throughout, on a stack that ends in a whole-state copy (`Model::persist`, from
+`Replica::compact`). What the node waited for could not arrive. A real node would have spun a core.
+A stalled range is now tried once for each move of those two counts, the facts the owed stream
+write already waits on, and the count is kept across the turn a try's own write clears the stall
+(a first form reset it there and retried as often as before).
+
+**The fence.** `compact_if_stalled` compacted every range at a stream's refusal, one with writes
+out included. A write out then refused for room left the compaction's start behind it, which
+hyper-log takes even when full, as it frees room: durable behind a refused write, it fenced the
+range, and the node stopped. A range not stalled with writes out now waits for their answers, which
+bring the next try. This is `68c7b831`'s own defect, reached on seed 23 at three segments and seed
+10 at four.
+
+**Still open: a file of three segments.** Parked instead of spinning, 11 of the 26 seeds show what
+the spin hid: a leader stalled with its log compacted to one entry (start 286, last 287, everything
+applied), `Full` answered for good, and no fact left to wait for; the others elect past it and it
+never rejoins. Three segments is hyper-log's least, and the test's choice. At 4, 6 and 10 segments
+none of 78 runs wedged, fenced or spun, and a founder's derived log has 237. Why a file of three
+holds no room once its groups have compacted is hyper-log's to answer (with the frame accounting
+above).
+
+**The tests.** `tight_log` is four segments. A stream's write refused for room no longer depends on
+a run's timing: `a_liveness_write_the_log_refuses_for_room_is_owed_and_the_node_goes_on` has the
+harness refuse a node's next three, whatever its log holds, and fails in 0.12 s with the refusal
+fatal again ("seed 1: 1 stopped: the node's log: the log is full of live records"). The full-log
+test runs seeds 1, 2 and 10, on the box and in the container: `tests/sim.rs` passes in 52 s and 28 s.

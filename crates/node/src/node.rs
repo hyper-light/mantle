@@ -693,6 +693,10 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     liveness_compact: bool,
     /// The range writes the log made durable, counted by `drive`: what an owed write waits on.
     log_durables: u64,
+    /// `log_durables` and the ranges' applied entries when the stalled ranges were last tried
+    /// ([`Node::compact_if_stalled`]), kept when a try's own write clears the stall for a turn:
+    /// refused again with neither moved, it is the same try. None until a range has stalled.
+    stall_tried: Option<(u64, u64)>,
     /// The stream's writes the log refused for room since the node started.
     liveness_waits: u64,
     driver: Driver<NodeClasses, Fixed, Peers>,
@@ -1036,6 +1040,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             liveness_owed: None,
             liveness_compact: false,
             log_durables: 0,
+            stall_tried: None,
             liveness_waits: 0,
             driver,
             plane,
@@ -2265,13 +2270,24 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// can be kept for a member that lags, which a snapshot then catches up; keeping entries while
     /// resending them costs less than a snapshot (node.md §2.6) needs the engine's size, which the
     /// model engine does not state.
+    ///
+    /// Stalled ranges are tried once for what the log and the ranges have reached: tried again
+    /// with neither moved they would be refused the same way, and a try drives every range again,
+    /// so the node would turn without ever parking and nothing it waits for could arrive
+    /// (node.md §6.2).
     fn compact_if_stalled(&mut self, now: u64) -> Result<(), NodeError> {
         let wanted = std::mem::take(&mut self.liveness_compact);
         let any_stalled = self
             .ranges
             .iter()
             .any(|k| self.owner.get(k.handle).is_some_and(|r| r.is_stalled()));
-        if !(wanted || any_stalled) {
+        let mut retry = false;
+        if any_stalled {
+            let reached = (self.log_durables, self.applied_total());
+            retry = self.stall_tried != Some(reached);
+            self.stall_tried = Some(reached);
+        }
+        if !(wanted || retry) {
             return Ok(());
         }
         for kept in &self.ranges {
@@ -2279,6 +2295,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 continue;
             };
             let stalled = shell.is_stalled();
+            // A write out may yet be refused for room, and hyper-log takes a compaction's start
+            // even then, as it frees room: durable behind the refused write, it fences the range.
+            // Its answer brings the next try.
+            if !stalled && shell.in_flight() > 0 {
+                continue;
+            }
             let compacted = shell
                 .compact(0, now, &self.waker)
                 .map_err(mantle_range::ReplicaError::from)?;

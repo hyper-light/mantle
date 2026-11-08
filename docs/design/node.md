@@ -1062,7 +1062,10 @@ hosts, and they elect by suspicion over it; items 1, 2, 4, 5, 6 and 7 are built,
   range applied all its log holds committed past what it had then, a start's replay done, which a
   compaction then frees. While it is owed the node heartbeats no peer, which suspects it as one
   whose disk stalls (hyper-liveness's flush proof), and `Status::liveness_waits` counts the
-  refusals. Every other refusal stops the node, as a fenced range stops it (§6.2): a log whose
+  refusals. A range stalled for room is tried on the same facts: once for each move of the log's
+  durable writes or the ranges' applied entries, as a try with neither moved is refused the same
+  way, and a node that tried at every turn never parked, so what it waited for could not arrive
+  (docs/measurements/2026-11-07-full-log-restart.md). Every other refusal stops the node, as a fenced range stops it (§6.2): a log whose
   device failed a write makes nothing durable again, so the node could prove no heartbeat and
   serve nothing, and its peers would keep its connections up for nothing. The simulation (§9.1)
   found a node going on that way after its device failed a write. Stopping on a room refusal

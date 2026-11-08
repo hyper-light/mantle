@@ -149,6 +149,9 @@ fn log_id(node: u64) -> u128 {
 struct SimLog {
     log: Log<SimFile>,
     faults: mpsc::Receiver<DeviceFault>,
+    /// The stream's next writes the test wants refused for room, whatever the log holds.
+    refusals: mpsc::Receiver<u64>,
+    refusing: Cell<u64>,
 }
 
 impl SimLog {
@@ -159,6 +162,9 @@ impl SimLog {
                 .with_file(move |file| file.inject(fault))
                 .unwrap()
                 .unwrap();
+        }
+        while let Ok(count) = self.refusals.try_recv() {
+            self.refusing.set(self.refusing.get() + count);
         }
     }
 }
@@ -198,6 +204,11 @@ impl NodeLog for SimLog {
     /// and no thread of the log's wakes a simulated shard.
     fn write_liveness(&self, group: u128, _waker: Waker) -> Result<Answered, LogError> {
         self.arm();
+        let refusing = self.refusing.get();
+        if refusing > 0 {
+            self.refusing.set(refusing - 1);
+            return Err(LogError::Full);
+        }
         let pending = self.log.submit_waking(
             group,
             LogClass::Latency,
@@ -434,6 +445,8 @@ pub struct Member {
     pub status: Option<Status>,
     /// The device faults the test arms, while it runs.
     faults: Option<mpsc::Sender<DeviceFault>>,
+    /// The stream writes the test wants refused for room, while it runs.
+    refusals: Option<mpsc::Sender<u64>>,
     /// A fault armed on its device: it may stop on it.
     armed: bool,
 }
@@ -518,6 +531,7 @@ impl Sim {
                     down: None,
                     status: None,
                     faults: None,
+                    refusals: None,
                     armed: false,
                 },
             );
@@ -573,10 +587,17 @@ impl Sim {
     fn spawn(&mut self, id: u64, log: Log<SimFile>, engines: Vec<(u128, Model)>) {
         let (orders, taken) = channel::<Order>(usize::try_from(self.nodes).unwrap() + 2).unwrap();
         let (faults, armed) = mpsc::channel();
-        let log = SimLog { log, faults: armed };
+        let (refusals, refused) = mpsc::channel();
+        let log = SimLog {
+            log,
+            faults: armed,
+            refusals: refused,
+            refusing: Cell::new(0),
+        };
         let member = self.members.get_mut(&id).unwrap();
         member.orders = Some(orders);
         member.faults = Some(faults);
+        member.refusals = Some(refusals);
         member.armed = false;
         member.bound = None;
         let addresses = Vec::new();
@@ -721,6 +742,12 @@ impl Sim {
         member.down = Some((file, engines));
     }
 
+    /// Node `id`'s log refuses its stream's next `count` writes for room, whatever it holds.
+    pub fn refuse_stream_writes(&mut self, id: u64, count: u64) {
+        let member = self.members.get_mut(&id).unwrap();
+        member.refusals.as_ref().unwrap().send(count).unwrap();
+    }
+
     /// Arms `fault` on node `id`'s device, and runs until the node stops on it, as its process
     /// would (a range it hosts fenced by its log's failed write, node.md §6.2).
     pub fn fail_device(&mut self, id: u64, fault: DeviceFault) {
@@ -802,6 +829,7 @@ impl Sim {
                     assert!(member.armed, "seed {}: {id} stopped: {why}", self.seed);
                     member.orders = None;
                     member.faults = None;
+                    member.refusals = None;
                     member.bound = None;
                     member.status = None;
                     member.down = Some((log.log.close().unwrap(), engines));

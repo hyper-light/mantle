@@ -115,31 +115,30 @@ fn run(seed: u64) -> (Vec<(u64, Part)>, u64) {
     (parts, applied)
 }
 
-/// A log of the three segments hyper-log takes at least, its groups bound only by what the file
-/// holds: the clients' puts fill the file again and again, so its writes, the ranges' and the
-/// liveness stream's, are refused for room (`LogError::Full`), and a power cut finds it full of
-/// records its engine applied and did not yet make durable.
+/// A log of four segments, its groups bound only by what the file holds: the clients' puts fill
+/// the file again and again, so the ranges' writes are refused for room (`LogError::Full`), and a
+/// power cut finds it full of records its engine applied and did not yet make durable. One segment
+/// more than hyper-log takes at least: at three, a leader stalled for room with nothing left to
+/// compact cannot free its file and never rejoins
+/// (docs/measurements/2026-11-07-full-log-restart.md).
 fn tight_log() -> LogConfig {
     LogConfig {
-        max_segments: 3,
+        max_segments: 4,
         group_entries: 1 << 20,
         group_bytes: 1 << 30,
         ..log_config()
     }
 }
 
-/// A node whose log fills with live records goes on: the liveness stream's write the log refuses
-/// for room is owed until the ranges compact, instead of stopping the node (node.md §6.2). With
-/// today's sizing the file fills before any group's bound, so the leader's log refuses its
-/// stream's write in the run, which stopped it before; and a follower's power is cut at the turn
-/// its compaction starts, its log out of room, and it is started again on what its device kept. In
-/// the KIND cell on 2026-11-07 a founder whose log was full when its host stopped started 22 times
-/// into "the node's log: the log is full of live records". No node stops, a node's status counts
-/// a refusal (the case the test is for was reached), the histories are linearizable and every
-/// node converges.
+/// A node whose log fills with live records goes on: a range's write the log refuses for room
+/// waits for the ranges to compact, and a follower's power is cut at the turn its compaction
+/// starts, its log out of room, and it is started again on what its device kept. No node stops,
+/// the histories are linearizable and every node converges. A stream's write refused for room is
+/// `a_liveness_write_the_log_refuses_for_room_is_owed_and_the_node_goes_on`.
 #[test]
 fn a_node_whose_log_fills_with_live_records_waits_for_its_ranges_to_compact_and_starts_again() {
-    for seed in [1u64, 2] {
+    // Seed 10 fenced a node before a compaction waited for the writes out (the measurement).
+    for seed in [1u64, 2, 10] {
         let mut cell = Sim::with(seed, SETTINGS, tight_log());
         let leader = cell.leader();
         cell.open_bucket();
@@ -173,16 +172,46 @@ fn a_node_whose_log_fills_with_live_records_waits_for_its_ranges_to_compact_and_
         let parts: Vec<(u64, Part)> = std::mem::take(&mut cell.parts).into_iter().collect();
         check_histories(parts.iter().flat_map(|(_, part)| part.iter().cloned()));
         cell.converged();
-        // The stream asks a write at its own cadence while the cell is idle: a log the workload
-        // left full refuses it (which stopped the node before), and the node goes on. No node
-        // stops (the cell fails on any it did not arm); the quiet watch fails the case not reached.
-        cell.until("a node's log refusing its stream's write for room", |c| {
-            let refused = c
-                .members
-                .values()
-                .filter_map(|m| m.status.as_ref())
-                .any(|s| s.liveness_waits > 0);
-            if refused { Some(()) } else { None }
+    }
+}
+
+/// A liveness write the log refuses for room is owed, not fatal (node.md §6.2): in the KIND cell on
+/// 2026-11-07 a founder whose log was full when its host stopped started 22 times into "the node's
+/// log: the log is full of live records". Here the leader's log and a follower's refuse their
+/// stream's next writes whatever they hold, more than one so that an owed write asked again is
+/// refused as well. No node stops (the cell fails on any it did not arm), each counts its
+/// refusals, the histories are linearizable and every node converges.
+#[test]
+fn a_liveness_write_the_log_refuses_for_room_is_owed_and_the_node_goes_on() {
+    const REFUSED: u64 = 3;
+    for seed in [1u64, 2] {
+        let mut cell = Sim::with(seed, SETTINGS, log_config());
+        let leader = cell.leader();
+        let follower = (1..=cell.nodes).find(|id| *id != leader).unwrap();
+        cell.open_bucket();
+        cell.refuse_stream_writes(leader, REFUSED);
+        cell.refuse_stream_writes(follower, REFUSED);
+        let ops = log_config().group_entries.div_ceil(CLIENTS);
+        let stops = cell.start_workload(ops);
+        cell.done_by(ops, 4);
+        drop(stops);
+        cell.until("every client's part", |c| {
+            if c.parts.len() == usize::try_from(CLIENTS).unwrap() {
+                Some(())
+            } else {
+                None
+            }
+        });
+        let parts: Vec<(u64, Part)> = std::mem::take(&mut cell.parts).into_iter().collect();
+        check_histories(parts.iter().flat_map(|(_, part)| part.iter().cloned()));
+        cell.until("each armed node's refusals counted", |c| {
+            let counted = [leader, follower].iter().all(|id| {
+                c.members[id]
+                    .status
+                    .as_ref()
+                    .is_some_and(|s| s.liveness_waits == REFUSED)
+            });
+            if counted { Some(()) } else { None }
         });
         cell.converged();
     }

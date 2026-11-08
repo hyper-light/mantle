@@ -1053,11 +1053,23 @@ hosts, and they elect by suspicion over it; items 1, 2, 4, 5, 6 and 7 are built,
 - (4) The run is kept as hyper-block's `record` in the node's directory (`crates/node/src/layout.rs`).
 - (5) `Driven::flushed` feeds `Liveness::on_durable`, and a stream that asks for a flush gets an
   empty update of a log group of its own (the top of the group space, since group 0 holds
-  hyper-log's key records), one out at a time. A liveness write the log refuses stops the node,
-  as a fenced range stops it (§6.2): a log whose device failed a write makes nothing durable
-  again, so the node could prove no heartbeat and serve nothing, and its peers would keep its
-  connections up for nothing. The simulation (§9.1) found a node going on that way after its
-  device failed a write.
+  hyper-log's key records), one out at a time. A liveness write the log refuses for room
+  (`LogError::Full`, every segment live at the file's quota, or its queue `Busy`) is owed, not
+  fatal: the stream waits on its answer and asks no other meanwhile, so each refusal asks one
+  compaction of every range through what its engine applied (`Node::compact_if_stalled`, which
+  drives again only the ranges whose compaction started), and the node asks the log again once a
+  range's write became durable since, the log's progress that may have freed room, or once every
+  range applied all its log holds committed past what it had then, a start's replay done, which a
+  compaction then frees. While it is owed the node heartbeats no peer, which suspects it as one
+  whose disk stalls (hyper-liveness's flush proof), and `Status::liveness_waits` counts the
+  refusals. Every other refusal stops the node, as a fenced range stops it (§6.2): a log whose
+  device failed a write makes nothing durable again, so the node could prove no heartbeat and
+  serve nothing, and its peers would keep its connections up for nothing. The simulation (§9.1)
+  found a node going on that way after its device failed a write. Stopping on a room refusal
+  instead stopped a founder of the KIND cell 22 times in a row on 2026-11-07: its log was full of
+  records its engines applied and had not made durable when its host stopped, a start's first
+  liveness write found no room, and each start found the log as full again
+  (`tests/sim.rs`, `a_node_whose_log_fills_with_live_records_waits_for_its_ranges_to_compact_and_starts_again`).
 - (6) Each range's next wake and the stream's are the task's deadlines, and a wait that ends at
   or past the stream's wake is reported (`Liveness::on_wait`).
 - (7) The root range keeps each enlisted node's history: the time it has run over all its runs and

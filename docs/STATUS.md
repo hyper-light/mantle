@@ -44,7 +44,12 @@ still by its host past the QUIC idle timeout (3.072 s) is timed out by its clien
 `Lost(Closed)` (reproduced exactly, held 4 s; 2 s passes), and the harness's quiet watch fails when
 the test process itself is held still. The trace found hyper-rt-transport's driver firing timers
 before it reads the sockets that became ready in a hold; whether links should outlast longer holds
-is open ([holds](measurements/2026-11-06-node-test-holds.md)). A founder its peers dial was out of reach for 3 min 7 s
+is open ([holds](measurements/2026-11-06-node-test-holds.md)). A founder of the KIND cell whose
+log was full of live records when its host stopped started 22 times into "the log is full of
+live records": a liveness write the log refused for room stopped the node. Such a write is now
+owed until the ranges compact; that hyper-log counts a group's retention in payload while its
+frames take whole blocks, so the file fills before any group's bound, is open in hyper-raft
+([full log](measurements/2026-11-07-full-log-restart.md)). A founder its peers dial was out of reach for 3 min 7 s
 after its pod was replaced in the kind cluster, its peers' QUIC flows to its Service's cluster IP
 still translated to the killed pod ([research/78](research/78-a-cell-in-kubernetes.md)); founders
 are now reached at their pods' own names, each looked up again by its peers and clients when they

@@ -653,5 +653,5 @@ idle timeout), `internal/deadlineconn/deadlineconn.go` (a deadline set at each r
 https://docs.ceph.com/en/latest/radosgw/frontends/: `request_timeout_ms`.
 
 [29] mantle: `docs/research/72-s3-listener-connections.md`, `73-native-client.md`,
-`77-progress-and-patience.md` and `79-learned-link-liveness.md`, and the code at `68c7b831`, the
+`77-progress-and-patience.md` and `81-learned-link-liveness.md`, and the code at `68c7b831`, the
 vendored crates' at the snapshot their `SNAPSHOT` files name, cited by file and line above.

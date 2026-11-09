@@ -96,13 +96,15 @@ fn a_volume_at_work_holds_at_most_its_stated_bytes() {
 }
 
 /// A chunk handed over as the bytes a gateway shares with the chunk's other replicas is put from
-/// them: the putting thread asks the allocator for the chunk's checksum table and its answer's
-/// channel (its counter and its slot), and for none of its bytes, which the writer reads into its
-/// aligned buffer (research/80, step 5). The gateway's host copied a chunk for each replica it
-/// asked, the local one included: 25.2 MB per 8 MiB PUT. The put counted follows the volume's
-/// first: on macOS std's `Mutex` allocates its pthread mutex at its first lock, once a mutex and
-/// not once a put (Linux's futex lock and Windows' SRW lock allocate nothing), and the writer's
-/// queue is first locked by the first put.
+/// them: the putting thread asks the allocator for the chunk's checksum table, four bytes a block,
+/// and its answer's channel, and for none of its bytes, which the writer reads into its aligned
+/// buffer (research/80, step 5). The gateway's host copied a chunk for each replica it asked, the
+/// local one included: 25.2 MB per 8 MiB PUT. The channel is measured beside the put, made as the
+/// put makes it: its counter and its slot, whose sizes are the platform's (16 bytes more on
+/// Windows, where the answer's error is larger). The put counted follows the volume's first: on
+/// macOS std's `Mutex` allocates its pthread mutex at its first lock, once a mutex and not once a
+/// put (Linux's futex lock and Windows' SRW lock allocate nothing), and the writer's queue is
+/// first locked by the first put.
 #[test]
 fn a_chunk_put_from_shared_bytes_copies_none_of_them() {
     let v = Volume::format(issuer(), sim(47), SIZE, config()).unwrap();
@@ -133,9 +135,14 @@ fn a_chunk_put_from_shared_bytes_copies_none_of_them() {
     answer.wait().unwrap();
     assert_eq!(v.read(&key(1), 0, 60_000).unwrap(), shared.as_ref());
     drop(others);
+    alloc::begin();
+    let channel = std::sync::mpsc::sync_channel::<Result<(), mantle_chunk::ChunkError>>(1);
+    let made = alloc::end();
+    drop(channel);
+    let table = 4 * 60_000u64.div_ceil(1 << config().checksum_shift);
     assert_eq!(
         (counts.allocations, counts.reallocations, counts.bytes),
-        (3, 0, 780),
-        "{counts:?}"
+        (1 + made.allocations, 0, table + made.bytes),
+        "{counts:?}, the channel {made:?}"
     );
 }

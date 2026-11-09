@@ -54,7 +54,8 @@ fn at_rest(seed: u64) -> alloc::Counts {
     cell.run_for(SECOND);
     alloc::begin();
     cell.run_for(10 * SECOND);
-    alloc::end()
+    let total = alloc::end();
+    total.less(&alloc::read_aside())
 }
 
 /// 477,128 allocations before the turn kept its buffers (`drive`'s three lists, 189,808 of
@@ -87,9 +88,9 @@ fn serving(seed: u64, ops: u64) -> alloc::Counts {
     alloc::begin();
     let stops = cell.start_workload(ops);
     cell.done_by(ops, 4);
-    let counts = alloc::end();
+    let total = alloc::end();
     drop(stops);
-    counts
+    total.less(&alloc::read_aside())
 }
 
 /// 77,323 allocations before the turn kept its buffers (the events' buffer 395 of them, `drive`'s

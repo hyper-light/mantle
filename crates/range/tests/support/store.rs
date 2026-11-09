@@ -112,9 +112,13 @@ impl<F: BlockFile + 'static> LogStore for Synchronous<F> {
                 self.answers.push_back(answer);
                 return Ok(());
             }
-            self.woken
-                .recv()
-                .expect("the log answers every part it takes");
+            // The harness's own wait, set apart from what the store under test allocates: a
+            // blocking receive allocates when it finds the answer not yet come, which depends on
+            // how the log's threads were scheduled (`hyper_measure::alloc::aside`).
+            hyper_measure::alloc::aside();
+            let woken = self.woken.recv();
+            hyper_measure::alloc::back();
+            woken.expect("the log answers every part it takes");
         }
     }
 

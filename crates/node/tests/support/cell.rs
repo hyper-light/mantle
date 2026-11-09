@@ -215,8 +215,14 @@ impl NodeLog for SimLog {
             Update::default(),
             Waker::noop().clone(),
         )?;
+        // The harness's own wait, set apart from what the node allocates: a blocking wait
+        // allocates when the answer has not yet come, which depends on how the log's threads were
+        // scheduled (`hyper_measure::alloc::aside`).
+        hyper_measure::alloc::aside();
+        let answer = pending.wait();
+        hyper_measure::alloc::back();
         Ok(Answered {
-            answer: Cell::new(Some(pending.wait())),
+            answer: Cell::new(Some(answer)),
             given_ns: hyper_rt::futures::now_ns(),
         })
     }

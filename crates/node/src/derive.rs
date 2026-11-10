@@ -149,7 +149,7 @@ pub fn probe_budget() -> Result<Duration, DeriveError> {
 /// capacity, three clients an operation, n 300): 30, 39, 72, 79 and 93 a second at 2, 4, 8, 16 and
 /// 32, the doubling past 8 adding 10%, within the run-to-run band, and the one past 16 refused
 /// `SlowDown` for want of a slot. Each costs the objects' class its most bytes (`objects`).
-const OBJECTS: usize = 8;
+const OBJECTS: usize = 2;
 
 /// What a node that hosts objects runs its drivers with: a window of one block, the floor;
 /// [`OBJECTS`] operations at once, of any kind; as many clients of the native protocol

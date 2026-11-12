@@ -483,6 +483,12 @@ pub struct Client {
     waits: u32,
     /// The retry quota ([`QUOTA`]).
     quota: Quota,
+    /// When, on the shard's clock, the client last drove its endpoint: the end of its last attempt
+    /// or wait. It runs no task of its own, so between its calls its connections send nothing.
+    driven_ns: u64,
+    /// The transport's keep-alive interval, nanoseconds: how long a driven connection stays silent
+    /// at most ([`Client::forget_quiet`]).
+    keep_alive_ns: u64,
     /// A body's piece, the source's or the reply's: `PIECE` bytes.
     piece: Vec<u8>,
     /// A reply's fields as they arrive.
@@ -500,6 +506,9 @@ impl Client {
         let stated = stated(settings.nodes.len(), settings.transport_bytes);
         let limits = bounds::limits(&stated).map_err(|e| ClientError::Bounds(e.to_string()))?;
         let memory = memory(&stated).ok_or(ClientError::Bounds("the client's memory".into()))?;
+        let keep_alive_ns =
+            u64::try_from(limits.keep_alive.unwrap_or(limits.idle_timeout).as_nanos())
+                .map_err(|_| ClientError::Bounds("the keep-alive interval".into()))?;
         let mut tls = Tls::mutual(&settings.credentials, false)?;
         tls.client.cert_compressors.clear();
         tls.client.cert_decompressors.clear();
@@ -554,6 +563,8 @@ impl Client {
             slowest_ns: None,
             waits: 0,
             quota: Quota { left: QUOTA },
+            driven_ns: hyper_rt::futures::now_ns(),
+            keep_alive_ns,
             piece,
             fields: Vec::new(),
             memory,
@@ -1252,8 +1263,40 @@ impl Client {
     }
 
     /// One attempt of a request whose head, fields and body's length are given, with a put's
-    /// upload or a get's sink, of `node`.
+    /// upload or a get's sink, of `node`, on connections that are still the node's.
     async fn attempt<S: Source, K: Sink>(
+        &mut self,
+        node: PeerId,
+        request: (&[u8], &[u8], u64),
+        with: (Option<&mut Upload<'_, S>>, Option<&mut K>),
+        deadline_ns: u64,
+    ) -> Result<Attempt, ClientError> {
+        self.forget_quiet()?;
+        let attempt = self.attempted(node, request, with, deadline_ns).await;
+        self.driven_ns = hyper_rt::futures::now_ns();
+        attempt
+    }
+
+    /// Connections left undriven longer than the transport's keep-alive interval closed here, so
+    /// the next exchange dials anew. A driven connection says something at least that often; one
+    /// that said nothing for the idle timeout its node closed without a word (RFC 9000 §10.1), and
+    /// a packet sent close to that timeout may come after it (§10.1.2): a request on it ends
+    /// unanswered (`Refusal::Closed`) though its node took none of it, as a client idle between
+    /// its calls found (the doors smoke's LIST of 2026-11-10).
+    fn forget_quiet(&mut self) -> Result<(), ClientError> {
+        let undriven = hyper_rt::futures::now_ns().saturating_sub(self.driven_ns);
+        if undriven < self.keep_alive_ns {
+            return Ok(());
+        }
+        let clock = self.driver.clock()?;
+        for known in self.nodes.iter_mut().filter(|n| n.connected) {
+            self.driver.endpoint().disconnect(clock, known.id);
+            known.connected = false;
+        }
+        Ok(())
+    }
+
+    async fn attempted<S: Source, K: Sink>(
         &mut self,
         node: PeerId,
         (head, fields, body): (&[u8], &[u8], u64),
@@ -1850,6 +1893,7 @@ impl Client {
             let sleep = pin!(hyper_rt::futures::sleep(left));
             race2(event, sleep).await
         };
+        self.driven_ns = hyper_rt::futures::now_ns();
         match ended {
             Either::First(event) => Ok(Some(Self::keep(&mut self.nodes, event?))),
             Either::Second(slept) => {

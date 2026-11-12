@@ -2235,8 +2235,8 @@ struct Bench<'o> {
     listeners: Vec<SocketAddr>,
     signer: Rc<Signer>,
     generator: Rc<Generator>,
-    /// Each door's clients between the steps that use them, each with when it was put back.
-    pools: [Vec<(Logical, Instant)>; 2],
+    /// Each door's clients between the steps that use them.
+    pools: [Vec<Logical>; 2],
     /// The native clients the cell admits at once: each node's `gateway.clients` identities.
     native_most: usize,
     /// Connections each door opened: its handshakes.
@@ -2400,25 +2400,10 @@ impl<'o> Bench<'o> {
             .pools
             .get_mut(door.at())
             .ok_or_else(|| failed("a door's pool"))?;
-        // A native client is driven only within its own calls (mantle-client runs no task of its
-        // own), so one held in the pool through another door's phases sends no keep-alive, and
-        // the node closes it once it has said nothing for the idle timeout: its next request then
-        // ends unanswered (`ClientError::Lost`, `Closed`), as a control's put did, at random, when
-        // the HTTP door's phases took about the idle timeout (3.07 s). One held past its
-        // keep-alive interval, after which a driven connection would have spoken, is closed here
-        // and another opened. An HTTP connection the server closed is opened again by `Http`.
-        let idle = mantle_protocol::bounds::idle_timeout();
-        let stale = idle.checked_div(2).unwrap_or(idle);
-        let mut held = Vec::new();
-        let mut closing = Vec::new();
-        for (logical, put_back) in pool.drain(..want.min(pool.len())) {
-            if matches!(logical.conn, Conn::Native(_)) && put_back.elapsed() >= stale {
-                closing.push(logical);
-            } else {
-                held.push(logical);
-            }
-        }
-        self.release(closing)?;
+        // A native client held here past its node's idle timeout dials anew itself
+        // (`mantle_client`'s `forget_quiet`); an HTTP connection the server closed is opened again
+        // by `Http`.
+        let mut held: Vec<Logical> = pool.drain(..want.min(pool.len())).collect();
         let more = want.saturating_sub(held.len());
         if more > 0 {
             let opened = self.open(door, more)?;
@@ -2539,8 +2524,7 @@ impl<'o> Bench<'o> {
             *count = count.saturating_add(reopened);
         }
         if let Some(pool) = self.pools.get_mut(work.door.at()) {
-            let now = Instant::now();
-            pool.extend(held.into_iter().map(|logical| (logical, now)));
+            pool.extend(held);
         }
         let ops = tally.ops;
         let rate = ops as f64 / (elapsed_ns.max(1) as f64 / 1e9);
@@ -3392,7 +3376,7 @@ impl Bench<'_> {
             })
             .map_err(|e| failed(format!("{e:?}")))??;
         if let Some(pool) = self.pools.get_mut(door.at()) {
-            pool.push((logical, Instant::now()));
+            pool.push(logical);
         }
         // Unrun, none of this door's controls is caught, so the run is not exact.
         let [flipped, missing, etag] = match said {
@@ -3451,7 +3435,7 @@ impl Bench<'_> {
             .get_mut(door.at())
             .map(std::mem::take)
             .unwrap_or_default();
-        self.release(held.into_iter().map(|(logical, _)| logical).collect())?;
+        self.release(held)?;
         // The native door's points: a client on each node, and as many as the cell admits.
         let (low_count, high_count) = match door {
             Door::Native => (cell::FOUNDERS, self.native_most),

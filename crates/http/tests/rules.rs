@@ -26,6 +26,14 @@ type Try<'a> = (
     WriteError,
 );
 
+/// A request head's method, target pieces and fields, and the error each earns.
+type Ask<'a> = (
+    &'a str,
+    &'a [&'a [u8]],
+    &'a [(&'a str, &'a [&'a [u8]])],
+    WriteError,
+);
+
 fn head(request: &[u8]) -> Head {
     parse(request).unwrap().expect("a whole head")
 }
@@ -509,4 +517,80 @@ fn responses_and_their_framing() {
     }
     assert!(out.is_empty(), "nothing written for a refused head");
     assert_eq!(write::CONTINUE, b"HTTP/1.1 100 Continue\r\n\r\n");
+}
+
+/// RFC 9112 §3, §5, §6, §11.1: a request's head, its target and values in pieces, its length; the
+/// codec's own parser reads back each part where it was written; and a method, a target or a
+/// value that would end the request line or the head early is refused, nothing written.
+#[test]
+fn requests_and_their_framing() {
+    let mut out = Vec::new();
+    write::request(
+        &mut out,
+        "PUT",
+        &[b"/doors/native/8/p0", b"?", b"partNumber=1&uploadId=a%2Fb"],
+        &[
+            ("host", &[b"127.0.0.1:9000"]),
+            ("authorization", &[b"AWS4-HMAC-SHA256", b" Credential=k/s"]),
+        ],
+        Length::Known(8),
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        b"PUT /doors/native/8/p0?partNumber=1&uploadId=a%2Fb HTTP/1.1\r\nhost: 127.0.0.1:9000\r\nauthorization: AWS4-HMAC-SHA256 Credential=k/s\r\nContent-Length: 8\r\n\r\n"
+    );
+    let read = head(&out);
+    assert_eq!(read.method(&out), b"PUT");
+    assert_eq!(
+        read.target(&out),
+        b"/doors/native/8/p0?partNumber=1&uploadId=a%2Fb"
+    );
+    assert_eq!(read.version(), Version::Http11);
+    assert_eq!(read.host(&out), Some(&b"127.0.0.1:9000"[..]));
+    assert_eq!(
+        read.field(&out, "authorization"),
+        Some(&b"AWS4-HMAC-SHA256 Credential=k/s"[..])
+    );
+    assert_eq!(read.framing(), Framing::Length(8));
+    assert_eq!(
+        read.len(),
+        out.len(),
+        "the head ends where it was written to"
+    );
+    let mut out = Vec::new();
+    write::request(
+        &mut out,
+        "GET",
+        &[b"/doors"],
+        &[("host", &[b"h"])],
+        Length::None,
+    )
+    .unwrap();
+    assert_eq!(out, b"GET /doors HTTP/1.1\r\nhost: h\r\n\r\n");
+    assert_eq!(head(&out).framing(), Framing::None);
+    let mut out = Vec::new();
+    let host: &[(&str, &[&[u8]])] = &[("host", &[b"h"])];
+    let tries: [Ask<'_>; 7] = [
+        ("", &[b"/"], host, WriteError::Method),
+        ("GET /x HTTP/1.1\r\nX:", &[b"/"], host, WriteError::Method),
+        ("GET", &[], host, WriteError::Target),
+        ("GET", &[b"x"], host, WriteError::Target),
+        ("GET", &[b"/a", b" HTTP/1.1\r\n"], host, WriteError::Target),
+        ("GET", &[b"/a#b"], host, WriteError::Target),
+        (
+            "GET",
+            &[b"/"],
+            &[("host", &[b"h", b"\r\nX-Smuggled: 1"])],
+            WriteError::Value,
+        ),
+    ];
+    for (method, target, fields, error) in tries {
+        assert_eq!(
+            write::request(&mut out, method, target, fields, Length::None),
+            Err(error),
+            "{method:?} {target:?}"
+        );
+    }
+    assert!(out.is_empty(), "nothing written for a refused head");
 }

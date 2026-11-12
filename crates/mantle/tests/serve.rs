@@ -2300,11 +2300,41 @@ fn bench_doors_smoke_checks_both_doors_and_catches_each_control() {
                 "{phase}: {said}"
             );
         }
+        // Every phase that asked anything moved bytes on its door's wire, and only the native
+        // door's are datagrams: its clients' sockets' counts, the HTTP door's octets on TCP.
+        // A phase's line is the one whose sixth word is `clients` (scripts/doors-tables.py).
+        for line in said.lines().filter(|l| {
+            l.starts_with(&format!("doors {door} "))
+                && l.split_whitespace().nth(5) == Some("clients")
+        }) {
+            if measure(line, "ops") == Some("0") {
+                continue;
+            }
+            let wire: f64 = measure(line, "wire_bytes/op").unwrap().parse().unwrap();
+            assert!(wire > 0.0, "{line}");
+            let datagrams = measure(line, "datagrams/op").unwrap();
+            if door == "native" {
+                assert!(datagrams.parse::<f64>().unwrap() > 0.0, "{line}");
+            } else {
+                assert_eq!(datagrams, "-", "{line}");
+            }
+        }
     }
     assert!(
-        said.lines()
-            .any(|l| l.starts_with("doors verified ")
-                && l.contains(" failed 0 controls caught 6 of 6")),
+        said.lines().any(|l| l.starts_with("doors verified ")
+            && l.contains(" differed 0 ")
+            && l.contains(" failed 0 controls caught 6 of 6")),
         "{said}"
     );
+}
+
+/// The value that follows `name` in a line of `mantle bench doors`.
+fn measure<'l>(line: &'l str, name: &str) -> Option<&'l str> {
+    let mut words = line.split_whitespace();
+    while let Some(word) = words.next() {
+        if word == name {
+            return words.next();
+        }
+    }
+    None
 }

@@ -59,31 +59,32 @@ impl Rewind for Made<'_, '_> {
     }
 }
 
-/// A get's bytes as a sink: each piece checked against the generator at its offset, the first
-/// wrong offset kept, and the bytes counted.
-pub struct Checked<'o, 'g> {
+/// A get's bytes as a sink: each piece checked against the generator at its offset, made again in
+/// its caller's `scratch` a piece of it at a time, the first wrong offset kept, and the bytes
+/// counted. The scratch is the caller's, made once for all its reads, so a check allocates nothing.
+pub struct Checked<'o, 'g, 's> {
     object: &'o Object<'g>,
     at: u64,
-    scratch: Vec<u8>,
+    scratch: &'s mut [u8],
     pub wrong: Option<u64>,
 }
 
-impl<'o, 'g> Checked<'o, 'g> {
-    /// A sink checking `object`'s bytes a piece of `piece` bytes at a time.
-    pub fn new(object: &'o Object<'g>, piece: usize) -> Self {
+impl<'o, 'g, 's> Checked<'o, 'g, 's> {
+    /// A sink checking `object`'s bytes a piece of `scratch` at a time.
+    pub fn new(object: &'o Object<'g>, scratch: &'s mut [u8]) -> Self {
         Self {
             object,
             at: 0,
-            scratch: vec![0u8; piece.max(1)],
+            scratch,
             wrong: None,
         }
     }
 
     /// A sink checking `object`'s bytes from `offset` on: a ranged get's.
-    pub fn starting(object: &'o Object<'g>, piece: usize, offset: u64) -> Self {
+    pub fn starting(object: &'o Object<'g>, scratch: &'s mut [u8], offset: u64) -> Self {
         Self {
             at: offset,
-            ..Self::new(object, piece)
+            ..Self::new(object, scratch)
         }
     }
 
@@ -93,12 +94,12 @@ impl<'o, 'g> Checked<'o, 'g> {
     }
 }
 
-impl Sink for Checked<'_, '_> {
+impl Sink for Checked<'_, '_, '_> {
     async fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         if self.wrong.is_none() {
             self.wrong = self
                 .object
-                .verify(self.at, bytes, &mut self.scratch)
+                .verify(self.at, bytes, self.scratch)
                 .map_err(io)?;
         }
         self.at = self
@@ -110,27 +111,28 @@ impl Sink for Checked<'_, '_> {
 
 /// The control of the read check: a get's bytes with the one at `flip` inverted on its way to the
 /// check, as a byte the cell or the wire got wrong would come.
-pub struct Flipped<'o, 'g> {
-    pub checked: Checked<'o, 'g>,
+pub struct Flipped<'o, 'g, 's> {
+    pub checked: Checked<'o, 'g, 's>,
     at: u64,
     flip: u64,
     piece: Vec<u8>,
 }
 
-impl<'o, 'g> Flipped<'o, 'g> {
-    /// A check of `object`'s bytes a piece of `piece` bytes at a time, the byte at `flip` inverted
-    /// on its way there.
-    pub fn new(object: &'o Object<'g>, piece: usize, flip: u64) -> Self {
+impl<'o, 'g, 's> Flipped<'o, 'g, 's> {
+    /// A check of `object`'s bytes a piece of `scratch` at a time, the byte at `flip` inverted on
+    /// its way there.
+    pub fn new(object: &'o Object<'g>, scratch: &'s mut [u8], flip: u64) -> Self {
+        let piece = Vec::with_capacity(scratch.len());
         Self {
-            checked: Checked::new(object, piece),
+            checked: Checked::new(object, scratch),
             at: 0,
             flip,
-            piece: Vec::with_capacity(piece),
+            piece,
         }
     }
 }
 
-impl Sink for Flipped<'_, '_> {
+impl Sink for Flipped<'_, '_, '_> {
     async fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         let len = u64::try_from(bytes.len()).map_err(|_| io(GenError::Offset))?;
         let end = self.at.saturating_add(len);
@@ -167,7 +169,8 @@ pub async fn get_flipped(
         key: key.to_owned(),
         headers: Headers::default(),
     };
-    let mut flipped = Flipped::new(object, mantle_client::PIECE, flip);
+    let mut scratch = vec![0u8; mantle_client::PIECE];
+    let mut flipped = Flipped::new(object, &mut scratch, flip);
     let reply = client.get(&op, &mut flipped, u64::MAX).await?;
     if reply.status != Status::Done {
         return Ok(Came::Refused(reply.status));
@@ -378,8 +381,9 @@ pub async fn get(
         headers: Headers::default(),
     };
     let mut again = 0u32;
+    let mut scratch = vec![0u8; mantle_client::PIECE];
     loop {
-        let mut checked = Checked::new(object, mantle_client::PIECE);
+        let mut checked = Checked::new(object, &mut scratch);
         let got = client.get(&op, &mut checked, u64::MAX).await;
         if ask_again(&got, again) {
             again = again.saturating_add(1);

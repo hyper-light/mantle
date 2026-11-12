@@ -284,6 +284,33 @@ fn a_registration_slower_than_every_exchange_its_client_measured_is_applied_once
     assert_eq!(cell.converged(), before + 1);
 }
 
+/// A client left idle between its commands for longer than its connections' idle timeout, as a
+/// caller between its calls leaves one (it runs no task of its own): its nodes close their
+/// connections to it without a word (RFC 9000 §10.1). Its next command goes on a connection dialed
+/// anew, answered with no exchange lost, never first on the one its node closed (the serve suite's
+/// S3 operations through every node, `Lost(Closed)`, on a Mac at load 46 to 140, 2026-11-12).
+#[test]
+fn a_client_idle_past_its_connections_idle_timeout_asks_its_next_command_on_one_dialed_anew() {
+    let mut cell = Sim::new(1);
+    cell.leader();
+    let order: Vec<u64> = (1..=cell.nodes).collect();
+    let asking = cell.asking(CLIENT, &order);
+    let (first, asked) = cell.ask(&asking, GROUP, registration(CLIENT, 1, 1));
+    assert!(
+        matches!(first.as_deref(), Ok([Answer::Registered { .. }])),
+        "the first registration answered {first:?}"
+    );
+    // Four idle timeouts pass on the simulation's clock with the client asking nothing.
+    let idle = u64::try_from(mantle_protocol::bounds::idle_timeout().as_nanos()).unwrap();
+    cell.run_for(4 * idle);
+    let (second, asks) = cell.ask(&asking, GROUP, registration(CLIENT, 1, 2));
+    assert!(
+        matches!(second.as_deref(), Ok([Answer::Registered { .. }])),
+        "the second registration answered {second:?}"
+    );
+    assert_eq!(asks.lost, asked.lost, "an exchange was lost: {asks:?}");
+}
+
 /// Runs until node `leader` names a leader other than itself.
 fn stepped_down(cell: &mut Sim, leader: u64) {
     cell.until("the leader steps down", |c| {

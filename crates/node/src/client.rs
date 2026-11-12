@@ -162,6 +162,13 @@ pub struct Client {
     waits: u32,
     asks: Asks,
     body: Vec<u8>,
+    /// When, on the shard's clock, the client last drove its endpoint: the end of its last wait
+    /// for an event. It runs no task of its own, so between its calls its connections send
+    /// nothing.
+    driven_ns: u64,
+    /// The transport's keep-alive interval, nanoseconds: how long a driven connection stays silent
+    /// at most ([`Client::forget_quiet`]).
+    keep_alive_ns: u64,
 }
 
 impl Client {
@@ -180,6 +187,9 @@ impl Client {
             max_head: crate::node::MAX_HEAD,
         };
         let limits = bounds::limits(&stated).map_err(|e| ClientError::Bounds(e.to_string()))?;
+        let keep_alive_ns =
+            u64::try_from(limits.keep_alive.unwrap_or(limits.idle_timeout).as_nanos())
+                .map_err(|_| ClientError::Bounds("the keep-alive interval".into()))?;
         let io = bounds::io(&stated);
         let tls = Tls::mutual(&settings.credentials, false)?;
         let config = Config {
@@ -216,6 +226,8 @@ impl Client {
             waits: 0,
             asks: Asks::default(),
             body: Vec::new(),
+            driven_ns: hyper_rt::futures::now_ns(),
+            keep_alive_ns,
         })
     }
 
@@ -377,6 +389,7 @@ impl Client {
     /// that is gone ends only at its handshake's idle timeout, which a request asked of the nodes
     /// that answer never waits out.
     async fn reach(&mut self, node: PeerId, deadline_ns: u64) -> Result<bool, ClientError> {
+        self.forget_quiet()?;
         let Some(known) = self.nodes.iter().find(|n| n.id == node) else {
             return Ok(false);
         };
@@ -936,6 +949,26 @@ impl Client {
         self.leaders.retain(|_, leader| *leader != peer);
     }
 
+    /// Connections left undriven longer than the transport's keep-alive interval closed here, so
+    /// the next exchange dials anew. A driven connection says something at least that often; one
+    /// that said nothing for the idle timeout its node closed without a word (RFC 9000 §10.1), and
+    /// a packet sent close to that timeout may come after it (§10.1.2): a request on it ends
+    /// unanswered (`Refusal::Closed`) though its node took none of it, as the serve suite's S3
+    /// operations through every node did on a Mac at load 46 to 140 (2026-11-12), the test's
+    /// thread starved between its asks.
+    fn forget_quiet(&mut self) -> Result<(), ClientError> {
+        let undriven = hyper_rt::futures::now_ns().saturating_sub(self.driven_ns);
+        if undriven < self.keep_alive_ns {
+            return Ok(());
+        }
+        let clock = self.driver.clock()?;
+        for known in self.nodes.iter_mut().filter(|n| n.connected) {
+            self.driver.endpoint().disconnect(clock, known.id);
+            known.connected = false;
+        }
+        Ok(())
+    }
+
     /// The transport's next event, the connections it reports kept; `None` once `deadline_ns`
     /// has passed.
     async fn next_event(
@@ -954,6 +987,7 @@ impl Client {
             let sleep = pin!(hyper_rt::futures::sleep(left));
             race2(event, sleep).await
         };
+        self.driven_ns = hyper_rt::futures::now_ns();
         match ended {
             Either::First(event) => Ok(Some(self.keep(event?))),
             Either::Second(slept) => {

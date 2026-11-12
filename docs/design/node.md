@@ -1259,6 +1259,36 @@ does, is evaluated against the ownership rules it needs (audit §14.4), not adop
 Nothing a later step adds is configured or paid for at an earlier one: with one participant,
 the cell's mechanisms reduce exactly to the local ones (research/27 §7.6).
 
+### 2.8 No fixed counts: admission, batching and sessions
+
+The owner's rule for goal 16 (2026-11-12): "No fixed counts in admission, batching or sessions:
+only learned and data-derived values." Research/87 holds the sources and the plan. Each count
+becomes:
+
+- **The answers a session keeps: bounded by bytes, reached by refusal.** A session keeps an
+  answer while its row, with that answer, fits a row (`Rules::max_value_bytes`, the largest S3
+  admits, so no page grows). A command whose answer would not fit is refused before it takes
+  effect, `Answer::AnswersFull`, its writes undone and its session kept, and so is each later
+  command of that session in the entry. The gateway asks them again in its next entry, which
+  acknowledges the answers before them. A refused command applied nothing and kept nothing. A
+  copy reaching the log later is its first application. Once applied, its answer is kept until
+  acknowledged, and after that a copy is `Repeated`. So a command takes effect once at its
+  serial, and no bound the gateway reaches ends its session. Expiry for room did end it, which
+  left a lost reply's commands to the files that recognise copies (research/87 §1: the
+  dissertation's §6.3, RIFL's §4.2). A gateway never reports `AnswersFull` as a refusal: past its
+  deadline the command is `Deadline`, which may still apply, once.
+- **The commands an entry carries: what waited, within its bytes.** One entry out a range, as
+  now, carries every command waiting that fits `max_entry_bytes`, LogCabin's double buffering,
+  whose batches "dynamically [adjust] to load" (research/87 §1).
+- **The operations a node admits: learned.** A limit `L = ⌈g·X̂·R̂⌉`, Denning and Buzen's
+  saturation point `N* = X_max·R₀` estimated as BBR estimates its bandwidth-delay product: `X̂` the
+  most completions a second over the last ten rounds that were not client-limited, `R̂` the least
+  operation latency in the last ten seconds, `g` BBR's gains. That is `2/ln 2` at the start until
+  three rounds pass without `X̂` growing 1.25×, `ln 2/2` for one round, then `5/4, 3/4` and six
+  rounds of `1`. `L` starts at 1 and never passes the ceiling `C` the node's memory was split for
+  at start. `C`'s rule is chosen by measurement across scales, as the owner asked (research/87
+  §4). Until the experiment ends, each candidate rule is one derived value.
+
 ## 3. Transport
 
 Nodes, and clients through mantle's client library, talk over two layers, as the hecate

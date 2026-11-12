@@ -42,7 +42,7 @@ Two facts shape most of the rows:
 | criterion | evidence | state |
 |---|---|---|
 | Share of the recorded steady-state operation's allocations and reallocations attributed to a named site is 100%, every cell | research/71, "Attribution checks". In 5,130 windows, recorded + recorder = `Counting`'s count, exactly (runs/s-*/attrib.txt). | **met** on the box, for the 8 sizes × 11 operations × 2 doors and the listing. Some sizes were reused from the build before the rebase, as research/71 states. |
-| Page faults in each sampled window (Linux, period 1) with no attributed call stack is 0 | research/71, "Attribution checks". Of the user-mode faults, 99.4% resolve to a mantle or dependency frame. 12,895 end in glibc's `sysmalloc`, where the frame-pointer chain stops in libc. The 13,807 kernel-mode faults have no stack (`perf_event_paranoid` 2), attributed by elimination. In 14 cells perf's count fell short of the kernel's. | **gap.** 13,807 kernel-mode faults are unstacked. 12,895 stop in libc with no caller. The criterion's instrument is DWARF stacks; the run used frame pointers because perf's libdw unwinder stopped at Rust frames. The box now runs `perf_event_paranoid` 1, which allows kernel-mode samples of a user's own processes. |
+| Page faults in each sampled window (Linux, period 1) with no attributed call stack is 0 | research/71, "Attribution checks". Of the user-mode faults, 99.4% resolve to a mantle or dependency frame. 12,895 end in glibc's `sysmalloc`, where the frame-pointer chain stops in libc. The 13,807 kernel-mode faults have no stack (`perf_event_paranoid` 2), attributed by elimination. In 14 cells perf's count fell short of the kernel's. | **gap.** 13,807 kernel-mode faults are unstacked. 12,895 stop in libc with no caller. The criterion's instrument is DWARF stacks; the run used frame pointers because perf's libdw unwinder stopped at Rust frames. The box still runs `perf_event_paranoid` 2 (read 2026-11-12), which keeps perf to user mode; stacking kernel-mode faults needs 1 or less, a root setting that is the owner's. |
 | Requests above the busy run's p99.9 in the traced run with no attributed stage is 0 | research/71, "Tails": 14 requests above p99.9 across two busy runs, 0 unattributed. | **met** on the box. |
 | Every ledger site carries its two answers with measurements; no product code changed | research/71, "The sites" (22 site rows, each with "needed at all?" and "how much?"), "The candidates" (8 verdicts). Instruments on diag-doors fd1aac8d, never merged. | **met.** |
 | Test: the diagnostic build's profiling runs on the box and the VM lane, busy and quiet; raw profiles kept and named | The box: ~/.cache/claude-scratch/doors/ledger/, named in research/71, "What the raw data is". | **gap.** The VM lane has no profile. |
@@ -128,7 +128,7 @@ first window, and 0 allocations under hyper-quic's datagram code.
    completion of 10,000 parts through both doors, and `mantle bench meta`. The 10 GB stream's peak
    against a stated bound. The vendor sites (QUIC's copy per write, the per-packet records, the ring)
    in hyper-raft.
-4. **Step 4.** Kernel-mode faults stacked now that paranoid is 1. The libc-terminated stacks
-   resolved. The VM lane's profile.
+4. **Step 4.** Kernel-mode faults stacked, which needs `perf_event_paranoid` at 1 for the run (the
+   owner's to allow). The libc-terminated stacks resolved. The VM lane's profile.
 5. **Step 9.** The re-traced run's requests above p99.9, tallied by cause. The relay and the engine
    bench go to step 10's batch.

@@ -37,6 +37,7 @@
 
 use crate::port::mmap::PageBuf;
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::shard_db::TUNE_STEP_PERCENT;
 use crate::util::incmap::{IncMap, SWEEP};
@@ -108,6 +109,8 @@ struct Slot {
 /// taken when lent, so keeping a page allocates nothing.
 #[derive(Debug)]
 pub struct Kept {
+    /// The cache that lent it ([`Cache::id`]): its chunks are that cache's, so no other adopts it.
+    lender: u64,
     page: usize,
     /// Fresh pages lent beyond the chunks', which the cache counts until they come back.
     fresh: usize,
@@ -257,7 +260,16 @@ pub struct Cache {
     /// word and bucket are a miss each at scale.
     extent_pages: u64,
     hints: Vec<Option<NonZeroU32>>,
+    /// This cache's identity, which each loan it lends carries ([`Kept`]): a store replaces its
+    /// cache while a worker holds a loan (a budget below a page has none, `Store::resize_cache`),
+    /// and a loan's chunk numbers adopted by the new cache would put its pages in slots the new
+    /// cache's index names for other addresses, and a hit there returns another address's page.
+    id: u64,
 }
+
+/// The source of cache identities. Relaxed suffices: only uniqueness matters, and `fetch_add` on
+/// one atomic is totally ordered.
+static NEXT_CACHE_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Where a cache's memory is, in pages, and what its loans held ([`Cache::memory`]): what
 /// sizes a loan (research/50 §13).
@@ -273,6 +285,9 @@ pub struct Memory {
     pub spare: u64,
     /// Out on loan: chunks lent again, and fresh room (not yet in [`Cache::bytes`]).
     pub lent: u64,
+    /// Of those, the chunks lent again and hollow chunks refilled: a loan out that names this
+    /// cache's chunks.
+    pub relent: u64,
     /// The slot table's entries, hollow chunks' among them: at most twice the largest limit.
     pub slots: u64,
     /// Loans made, the pages of room they held, and of the pages their workers wrote, those
@@ -355,6 +370,7 @@ impl Cache {
             loan_missed: 0,
             extent_pages,
             hints: Vec::new(),
+            id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -736,6 +752,7 @@ impl Cache {
             .saturating_add(u64::try_from(room).unwrap_or(u64::MAX));
         self.out_most = self.out_most.max(self.out_on_loan());
         Some(Kept {
+            lender: self.id,
             page: self.page,
             fresh,
             bufs,
@@ -812,6 +829,11 @@ impl Cache {
     /// address the ghost names); pages past the limit are evicted by the rule an insert meets. A
     /// buffer with no page in it is spare again; a loan back while a chunk retires is given up.
     pub fn adopt(&mut self, kept: Kept) {
+        // Another cache's loan is dropped, its pages uncached: its memory and its counts were
+        // that cache's.
+        if kept.lender != self.id {
+            return;
+        }
         let Kept {
             fresh,
             bufs,
@@ -937,6 +959,9 @@ impl Cache {
 
     /// Takes back a loan its job did not fill: a job abandoned, or ended in error.
     pub fn unlend(&mut self, kept: Kept) {
+        if kept.lender != self.id {
+            return;
+        }
         let Kept { fresh, bufs, .. } = kept;
         self.give_back(bufs, fresh);
     }
@@ -1573,15 +1598,20 @@ impl Cache {
         let pages = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
         let live = self.small_live.saturating_add(self.main_live);
         let (mut kept, mut dead, mut spare, mut lent) = (0usize, 0usize, 0usize, self.lent);
-        for (h, &size) in self.held.iter().zip(&self.sizes) {
+        let mut relent = 0usize;
+        for (c, (h, &size)) in self.held.iter().zip(&self.sizes).enumerate() {
             match *h {
                 Held::Kept(l) => {
                     kept = kept.saturating_add(l);
                     dead = dead.saturating_add(size.saturating_sub(l));
                 }
                 Held::Spare => spare = spare.saturating_add(size),
-                Held::Lent => lent = lent.saturating_add(size),
-                Held::Grown | Held::Hollow | Held::Refilled => {}
+                Held::Lent => {
+                    lent = lent.saturating_add(size);
+                    relent = relent.saturating_add(size);
+                }
+                Held::Refilled => relent = relent.saturating_add(self.span(c)),
+                Held::Grown | Held::Hollow => {}
             }
         }
         Memory {
@@ -1590,6 +1620,7 @@ impl Cache {
             dead: pages(dead),
             spare: pages(spare),
             lent: pages(lent),
+            relent: pages(relent),
             slots: pages(self.slots.len()),
             loans: self.loans,
             loan_room: self.loan_room,
@@ -1724,6 +1755,48 @@ mod tests {
         assert_eq!(named(m), c.bytes() as u64 / 16);
         c.unlend(k);
         assert_eq!(c.memory().spare, 4);
+    }
+
+    /// A loan names its lender's chunks: another cache, as a store's replacement for the lender,
+    /// takes none of its pages, whether it comes back filled or unread, and every page it holds
+    /// reads back as it was.
+    #[test]
+    fn a_cache_takes_no_page_from_another_cache_s_loan() {
+        let mut old = Cache::new(8, 16, EXTENT);
+        let mut k = old.lend(4).unwrap();
+        for a in 0..4u64 {
+            k.keep(a, &page(a));
+        }
+        old.adopt(k);
+        for a in 0..4u64 {
+            old.forget(a);
+        }
+        let mut filled = old.lend(4).unwrap();
+        assert_eq!(filled.fresh, 0, "the spare chunk was not lent");
+        for a in 10..14u64 {
+            filled.keep(a, &page(a));
+        }
+        let unread = old.lend(4).unwrap();
+        let mut new = warm(8, 16);
+        for a in 100..108u64 {
+            new.insert(a, &page(a));
+        }
+        let before = new.memory();
+        new.adopt(filled);
+        new.unlend(unread);
+        assert_eq!(new.memory(), before);
+        let mut out = Vec::new();
+        for a in 100..108u64 {
+            out.clear();
+            assert!(new.get(a, &mut out), "page {a} was dropped");
+            assert_eq!(out, page(a));
+        }
+        for a in 10..14u64 {
+            assert!(
+                !new.get(a, &mut out),
+                "page {a} of another cache's loan was taken"
+            );
+        }
     }
 
     #[test]

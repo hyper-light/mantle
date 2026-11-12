@@ -537,6 +537,50 @@ fn a_workers_pages_are_cached_where_they_were_written() {
     db.check_references().unwrap();
 }
 
+/// A cache replaced while a worker's job holds a loan of the old one's memory takes none of that
+/// loan's pages: the loan names the old cache's chunks, and the new cache adopting it put pages in
+/// slots its index named for other addresses, so a get read another page as its leaf. Each time
+/// the cache has a loan out, a budget below a page drops it and another is given, then keys are
+/// read into the new cache's slots; every read, then and after maintenance, is exact.
+#[test]
+fn a_loan_of_a_replaced_cache_puts_no_page_in_the_new_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let mut db = ShardDb::create(open(&path, true), STORE, MEM, TRUNK).unwrap();
+    db.set_cache(1 << 16);
+    workers(&mut db, &path);
+    let mut oracle: BTreeMap<u64, Option<Vec<u8>>> = BTreeMap::new();
+    let mut replaced = 0u64;
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    for i in 0..OPS {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let k = x % KEYS;
+        let v = format!("v{i}-{}", "x".repeat((x % 40) as usize)).into_bytes();
+        db.put(&key(k), &v).unwrap();
+        oracle.insert(k, Some(v));
+        if db.stats().2.cache_memory.relent > 0 {
+            db.set_cache(0);
+            db.set_cache(1 << 16);
+            replaced += 1;
+        }
+        if replaced > 0 {
+            for &k in oracle.keys() {
+                check(&mut db, &oracle, k);
+            }
+        }
+    }
+    while db.owed() {
+        db.idle_step(64).unwrap();
+    }
+    assert!(replaced > 0, "no loan was out to replace the cache under");
+    for k in 0..KEYS {
+        check(&mut db, &oracle, k);
+    }
+    db.check_references().unwrap();
+}
+
 /// A memtable packed at the root's pivot keys goes into their bundles as written, its pages kept
 /// in the cache where they were written, as a compaction's are (research/57 §7). After a workload
 /// whose maintenance has run to its end, a memtable of twenty keys written nowhere else is

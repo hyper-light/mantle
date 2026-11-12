@@ -1784,7 +1784,6 @@ mod tests {
         let before = new.memory();
         new.adopt(filled);
         new.unlend(unread);
-        assert_eq!(new.memory(), before);
         let mut out = Vec::new();
         for a in 100..108u64 {
             out.clear();
@@ -1797,6 +1796,55 @@ mod tests {
                 "page {a} of another cache's loan was taken"
             );
         }
+        assert_eq!(new.memory(), before);
+    }
+
+    /// A loan naming a chunk past the adopting cache's own, as a cache of thousands of chunks lent
+    /// and its replacement of hundreds adopted on a 36 GB Mac at 100M keys, takes nothing into the
+    /// adopter's first slots, which its index names for the pages they hold.
+    #[test]
+    fn a_loan_naming_a_chunk_past_the_cache_s_own_takes_no_slot() {
+        let mut new = Cache::new(8, 16, EXTENT);
+        for a in 100..102u64 {
+            new.insert(a, &page(a));
+        }
+        let mut out = Vec::new();
+        let mut big = Cache::new(256, 16, EXTENT);
+        for a in 200..264u64 {
+            big.insert(a, &page(a));
+        }
+        let mut k = big.lend(4).unwrap();
+        for a in 300..304u64 {
+            k.keep(a, &page(a));
+        }
+        big.adopt(k);
+        for a in 300..304u64 {
+            big.forget(a);
+        }
+        let mut far = big.lend(4).unwrap();
+        assert!(
+            far.bufs
+                .iter()
+                .any(|l| l.chunk.is_some_and(|c| c >= new.chunks.len())),
+            "no chunk past the new cache's was lent"
+        );
+        for a in 400..404u64 {
+            far.keep(a, &page(a));
+        }
+        let before = new.memory();
+        new.adopt(far);
+        for a in 100..102u64 {
+            out.clear();
+            assert!(new.get(a, &mut out), "page {a} was dropped");
+            assert_eq!(out, page(a));
+        }
+        for a in 400..404u64 {
+            assert!(
+                !new.get(a, &mut out),
+                "page {a} of another cache's loan was taken"
+            );
+        }
+        assert_eq!(new.memory(), before);
     }
 
     #[test]

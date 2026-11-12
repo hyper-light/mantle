@@ -140,11 +140,21 @@ fn a_batch_crosses(loopback: SocketAddr) {
         assert!(received.stats.kernel_stamps, "the kernel stamps receives");
     }
     assert_eq!(received.stats.received, DATAGRAMS as u64);
+    assert_eq!(
+        received.stats.received_bytes,
+        (DATAGRAMS * DATAGRAM_BYTES) as u64,
+        "every payload byte received, counted once"
+    );
     assert!(
         received.stats.receive_calls <= DATAGRAMS as u64,
         "never more calls than datagrams"
     );
     assert_eq!(received.sender_stats.sent, DATAGRAMS as u64);
+    assert_eq!(
+        received.sender_stats.sent_bytes,
+        (DATAGRAMS * DATAGRAM_BYTES) as u64,
+        "every payload byte sent, counted once"
+    );
     if cfg!(target_os = "linux") {
         // The whole batch was queued before either side called: one `sendmmsg` (segmented or not) and
         // one `recvmmsg` (coalesced or not) each carry more than one datagram.
@@ -469,6 +479,12 @@ fn a_segmented_send_crosses_whole_and_in_order_from_the_callers_buffer() {
             assert_eq!(trip.done.iter().sum::<usize>(), count, "{:?}", trip.done);
             assert_eq!(trip.sender.sent, count as u64);
             assert_eq!(trip.receiver.received, count as u64);
+            let payload = ((count - 1) * segment + last) as u64;
+            assert_eq!(
+                trip.sender.sent_bytes, payload,
+                "each segment's bytes once, the short last one's its own"
+            );
+            assert_eq!(trip.receiver.received_bytes, payload);
             let per_message = (65_507 / segment).min(MOST_SEGMENTS);
             if cfg!(target_os = "linux") {
                 assert!(
@@ -731,6 +747,12 @@ fn a_queued_receive_takes_what_was_queued_when_it_began() {
             order,
             vec![0, 1, 2, 3, 4, 5],
             "every datagram once, in order"
+        );
+        assert_eq!(receiver.stats().received, 6);
+        assert_eq!(
+            receiver.stats().received_bytes,
+            6,
+            "a queued receive's bytes counted as its datagrams are, one byte each"
         );
         let first = first.unwrap();
         if receiver.stats().kernel_stamps {

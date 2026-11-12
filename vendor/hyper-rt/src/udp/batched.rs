@@ -84,10 +84,16 @@ impl Io {
 pub struct IoStats {
     /// Datagrams handed to the kernel.
     pub sent: u64,
+    /// Their payload bytes, UDP's and IP's headers not among them: what a protocol above put on the
+    /// wire, read where it is sent so that it never runs backwards as a connection above comes and
+    /// goes.
+    pub sent_bytes: u64,
     /// System calls that sent them.
     pub send_calls: u64,
     /// Datagrams received, each coalesced one counted once per datagram it held.
     pub received: u64,
+    /// Their payload bytes, as [`IoStats::sent_bytes`] counts a datagram's.
+    pub received_bytes: u64,
     /// System calls that received them.
     pub receive_calls: u64,
     /// Receive calls that found nothing queued (`EAGAIN`): a drain's last call, unless the call
@@ -122,8 +128,10 @@ impl IoStats {
     pub fn plus(&self, other: &Self) -> Self {
         Self {
             sent: self.sent.saturating_add(other.sent),
+            sent_bytes: self.sent_bytes.saturating_add(other.sent_bytes),
             send_calls: self.send_calls.saturating_add(other.send_calls),
             received: self.received.saturating_add(other.received),
+            received_bytes: self.received_bytes.saturating_add(other.received_bytes),
             receive_calls: self.receive_calls.saturating_add(other.receive_calls),
             receives_empty: self.receives_empty.saturating_add(other.receives_empty),
             send_errors: self.send_errors.saturating_add(other.send_errors),
@@ -790,8 +798,18 @@ impl Batched {
             match self.send_some() {
                 SendStep::Took(count) => {
                     let count = count.max(1);
-                    self.sent = self.sent.saturating_add(count).min(self.queued);
+                    let through = self.sent.saturating_add(count).min(self.queued);
+                    let bytes = self
+                        .slots
+                        .get(self.sent..through)
+                        .unwrap_or(&[])
+                        .iter()
+                        .fold(0u64, |sum, slot| {
+                            sum.saturating_add(as_u64(slot.bytes.len()))
+                        });
+                    self.sent = through;
                     self.stats.sent = self.stats.sent.saturating_add(as_u64(count));
+                    self.stats.sent_bytes = self.stats.sent_bytes.saturating_add(bytes);
                     self.stats.send_calls = self.stats.send_calls.saturating_add(1);
                     self.astray_at = None;
                 }
@@ -853,6 +871,8 @@ impl Batched {
                 SendStep::Took(_) => {
                     done = done.saturating_add(count);
                     self.stats.sent = self.stats.sent.saturating_add(as_u64(count));
+                    self.stats.sent_bytes =
+                        self.stats.sent_bytes.saturating_add(as_u64(message.len()));
                     self.stats.send_calls = self.stats.send_calls.saturating_add(1);
                     astray_at = None;
                 }
@@ -1094,6 +1114,10 @@ impl Batched {
         }
         taken.bytes = bytes_taken.get();
         self.stats.received = self.stats.received.saturating_add(as_u64(taken.datagrams));
+        self.stats.received_bytes = self
+            .stats
+            .received_bytes
+            .saturating_add(as_u64(taken.bytes));
         Ok((taken, ended))
     }
 
@@ -1113,8 +1137,13 @@ impl Batched {
         mut deliver: impl FnMut(Arrival, &mut [u8]),
     ) -> Result<usize, RtError> {
         let mut delivered = 0usize;
+        let mut bytes_taken = 0u64;
+        let mut handed = |arrival: Arrival, bytes: &mut [u8]| {
+            bytes_taken = bytes_taken.saturating_add(as_u64(bytes.len()));
+            deliver(arrival, bytes);
+        };
         for _ in 0..turns {
-            match self.receive_some(&mut deliver)? {
+            match self.receive_some(&mut handed)? {
                 ReceiveStep::Delivered { datagrams, .. } => {
                     delivered = delivered.saturating_add(datagrams);
                     if self.one_call_takes_the_batch() {
@@ -1128,6 +1157,7 @@ impl Batched {
             }
         }
         self.stats.received = self.stats.received.saturating_add(as_u64(delivered));
+        self.stats.received_bytes = self.stats.received_bytes.saturating_add(bytes_taken);
         Ok(delivered)
     }
 

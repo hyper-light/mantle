@@ -887,16 +887,40 @@ pub fn within(head: &mut [u8], remaining: Option<Duration>) -> Result<(), Object
 }
 
 impl Op {
-    /// The request's head and the fields that open its body.
+    /// The request's head and the fields that open its body: the fields counted first, then
+    /// written into one buffer at their length (`mantle_codec::encode`'s rule), so it never grows.
     pub fn encode(&self) -> Result<(Vec<u8>, Vec<u8>), ObjectError> {
-        let mut f = Writer::default();
+        let mut count = Writer::counting();
+        self.put_fields(&mut count)?;
+        if count.len() > MAX_FIELDS {
+            return Err(ObjectError::TooLong(count.len()));
+        }
+        let mut f = Writer::with_capacity(count.len());
+        let (kind, id, length, trailing) = self.put_fields(&mut f)?;
+        let fields = f.into_vec();
+        let mut w = Writer::with_capacity(HEAD_BYTES);
+        w.u8(kind);
+        w.u32(u32::try_from(fields.len()).map_err(|_| ObjectError::TooLong(fields.len()))?);
+        w.u128(id);
+        w.u64(0);
+        w.u64(length);
+        w.u8(trailing.map_or(0, |a| a.code().saturating_add(1)));
+        Ok((w.into_vec(), fields))
+    }
+
+    /// Writes the request's fields into `f`, and gives its kind, its identity, its body's length
+    /// and its trailer's algorithm.
+    fn put_fields(
+        &self,
+        f: &mut Writer,
+    ) -> Result<(u8, u128, u64, Option<Algorithm>), ObjectError> {
         let object = |f: &mut Writer, bucket: &str, key: &str| -> Result<(), ObjectError> {
             put_text(f, bucket, MAX_BUCKET)?;
             put_text(f, key, MAX_KEY)
         };
-        let (kind, id, length, trailing) = match self {
+        Ok(match self {
             Self::Create { bucket, id } => {
-                put_text(&mut f, bucket, MAX_BUCKET)?;
+                put_text(f, bucket, MAX_BUCKET)?;
                 (CREATE, *id, 0, None)
             }
             Self::Put {
@@ -909,9 +933,9 @@ impl Op {
                 md5,
                 trailing,
             } => {
-                object(&mut f, bucket, key)?;
-                put_headers(&mut f, headers)?;
-                put_digests(&mut f, checksum.as_ref(), md5.as_ref())?;
+                object(f, bucket, key)?;
+                put_headers(f, headers)?;
+                put_digests(f, checksum.as_ref(), md5.as_ref())?;
                 (PUT, *id, *length, *trailing)
             }
             Self::Get {
@@ -919,8 +943,8 @@ impl Op {
                 key,
                 headers,
             } => {
-                object(&mut f, bucket, key)?;
-                put_headers(&mut f, headers)?;
+                object(f, bucket, key)?;
+                put_headers(f, headers)?;
                 (GET, 0, 0, None)
             }
             Self::Head {
@@ -928,8 +952,8 @@ impl Op {
                 key,
                 headers,
             } => {
-                object(&mut f, bucket, key)?;
-                put_headers(&mut f, headers)?;
+                object(f, bucket, key)?;
+                put_headers(f, headers)?;
                 (HEAD, 0, 0, None)
             }
             Self::Delete {
@@ -938,21 +962,21 @@ impl Op {
                 id,
                 headers,
             } => {
-                object(&mut f, bucket, key)?;
-                put_headers(&mut f, headers)?;
+                object(f, bucket, key)?;
+                put_headers(f, headers)?;
                 (DELETE, *id, 0, None)
             }
             Self::List(list) => {
-                put_list(&mut f, list)?;
+                put_list(f, list)?;
                 (LIST, 0, 0, None)
             }
             Self::HeadBucket { bucket } => {
-                put_text(&mut f, bucket, MAX_BUCKET)?;
+                put_text(f, bucket, MAX_BUCKET)?;
                 (HEAD_BUCKET, 0, 0, None)
             }
             Self::ListBuckets { prefix, after, max } => {
-                put_text(&mut f, prefix, MAX_BUCKET)?;
-                put_optional_text(&mut f, after.as_deref(), MAX_BUCKET)?;
+                put_text(f, prefix, MAX_BUCKET)?;
+                put_optional_text(f, after.as_deref(), MAX_BUCKET)?;
                 if !usize::try_from(*max).is_ok_and(|m| (1..=MAX_BUCKETS).contains(&m)) {
                     return Err(ObjectError::TooLong(usize::try_from(*max).unwrap_or(0)));
                 }
@@ -960,7 +984,7 @@ impl Op {
                 (LIST_BUCKETS, 0, 0, None)
             }
             Self::DeleteBucket { bucket, id } => {
-                put_text(&mut f, bucket, MAX_BUCKET)?;
+                put_text(f, bucket, MAX_BUCKET)?;
                 (DELETE_BUCKET, *id, 0, None)
             }
             Self::PutVersioning {
@@ -968,12 +992,12 @@ impl Op {
                 id,
                 versioning,
             } => {
-                put_text(&mut f, bucket, MAX_BUCKET)?;
+                put_text(f, bucket, MAX_BUCKET)?;
                 f.u8(versioning_code(*versioning));
                 (PUT_VERSIONING, *id, 0, None)
             }
             Self::GetVersioning { bucket } => {
-                put_text(&mut f, bucket, MAX_BUCKET)?;
+                put_text(f, bucket, MAX_BUCKET)?;
                 (GET_VERSIONING, 0, 0, None)
             }
             Self::CreateUpload {
@@ -982,11 +1006,11 @@ impl Op {
                 id,
                 checksum,
             } => {
-                object(&mut f, bucket, key)?;
-                put_flag(&mut f, checksum.is_some());
+                object(f, bucket, key)?;
+                put_flag(f, checksum.is_some());
                 if let Some((algorithm, full_object)) = checksum {
                     f.u8(algorithm.code());
-                    put_flag(&mut f, *full_object);
+                    put_flag(f, *full_object);
                 }
                 (CREATE_UPLOAD, *id, 0, None)
             }
@@ -1001,10 +1025,10 @@ impl Op {
                 md5,
                 trailing,
             } => {
-                object(&mut f, bucket, key)?;
-                put_text(&mut f, upload, MAX_TAG)?;
+                object(f, bucket, key)?;
+                put_text(f, upload, MAX_TAG)?;
                 f.u16(*number);
-                put_digests(&mut f, checksum.as_ref(), md5.as_ref())?;
+                put_digests(f, checksum.as_ref(), md5.as_ref())?;
                 (UPLOAD_PART, *id, *length, *trailing)
             }
             Self::Complete {
@@ -1015,16 +1039,16 @@ impl Op {
                 headers,
                 parts,
             } => {
-                object(&mut f, bucket, key)?;
-                put_text(&mut f, upload, MAX_TAG)?;
-                put_headers(&mut f, headers)?;
+                object(f, bucket, key)?;
+                put_text(f, upload, MAX_TAG)?;
+                put_headers(f, headers)?;
                 if parts.len() > MAX_PARTS {
                     return Err(ObjectError::TooLong(parts.len()));
                 }
-                put_count(&mut f, parts.len())?;
+                put_count(f, parts.len())?;
                 for (number, etag) in parts {
                     f.u16(*number);
-                    put_text(&mut f, etag, MAX_TAG)?;
+                    put_text(f, etag, MAX_TAG)?;
                 }
                 (COMPLETE, *id, 0, None)
             }
@@ -1034,8 +1058,8 @@ impl Op {
                 upload,
                 id,
             } => {
-                object(&mut f, bucket, key)?;
-                put_text(&mut f, upload, MAX_TAG)?;
+                object(f, bucket, key)?;
+                put_text(f, upload, MAX_TAG)?;
                 (ABORT, *id, 0, None)
             }
             Self::ListParts {
@@ -1045,8 +1069,8 @@ impl Op {
                 after,
                 max,
             } => {
-                object(&mut f, bucket, key)?;
-                put_text(&mut f, upload, MAX_TAG)?;
+                object(f, bucket, key)?;
+                put_text(f, upload, MAX_TAG)?;
                 f.u16(*after);
                 f.u32(*max);
                 (LIST_PARTS, 0, 0, None)
@@ -1059,11 +1083,11 @@ impl Op {
                 id_marker,
                 max,
             } => {
-                put_text(&mut f, bucket, MAX_BUCKET)?;
-                put_text(&mut f, prefix, MAX_KEY)?;
-                put_text(&mut f, delimiter, MAX_KEY)?;
-                put_optional_text(&mut f, key_marker.as_deref(), MAX_KEY)?;
-                put_optional_text(&mut f, id_marker.as_deref(), MAX_TAG)?;
+                put_text(f, bucket, MAX_BUCKET)?;
+                put_text(f, prefix, MAX_KEY)?;
+                put_text(f, delimiter, MAX_KEY)?;
+                put_optional_text(f, key_marker.as_deref(), MAX_KEY)?;
+                put_optional_text(f, id_marker.as_deref(), MAX_TAG)?;
                 f.u32(*max);
                 (LIST_UPLOADS, 0, 0, None)
             }
@@ -1075,9 +1099,9 @@ impl Op {
                 buffer,
                 checksum,
             } => {
-                object(&mut f, bucket, key)?;
-                put_optional_u64(&mut f, *length);
-                put_optional_u64(&mut f, *buffer);
+                object(f, bucket, key)?;
+                put_optional_u64(f, *length);
+                put_optional_u64(f, *buffer);
                 f.u8(checksum.code());
                 (OPEN, *id, 0, None)
             }
@@ -1091,10 +1115,10 @@ impl Op {
                 last,
                 trailing,
             } => {
-                object(&mut f, bucket, key)?;
-                put_text(&mut f, upload, MAX_TAG)?;
+                object(f, bucket, key)?;
+                put_text(f, upload, MAX_TAG)?;
                 f.u64(*offset);
-                put_flag(&mut f, *last);
+                put_flag(f, *last);
                 (APPEND, *id, *length, *trailing)
             }
             Self::Offset {
@@ -1102,8 +1126,8 @@ impl Op {
                 key,
                 upload,
             } => {
-                object(&mut f, bucket, key)?;
-                put_text(&mut f, upload, MAX_TAG)?;
+                object(f, bucket, key)?;
+                put_text(f, upload, MAX_TAG)?;
                 (OFFSET, 0, 0, None)
             }
             Self::Finish {
@@ -1115,9 +1139,9 @@ impl Op {
                 length,
                 checksum,
             } => {
-                object(&mut f, bucket, key)?;
-                put_text(&mut f, upload, MAX_TAG)?;
-                put_headers(&mut f, headers)?;
+                object(f, bucket, key)?;
+                put_text(f, upload, MAX_TAG)?;
+                put_headers(f, headers)?;
                 f.u64(*length);
                 if checksum.bytes.len() != checksum.algorithm.width() {
                     return Err(ObjectError::TooLong(checksum.bytes.len()));
@@ -1127,19 +1151,7 @@ impl Op {
                 f.bytes(&checksum.bytes);
                 (FINISH, *id, 0, None)
             }
-        };
-        let fields = f.into_vec();
-        if fields.len() > MAX_FIELDS {
-            return Err(ObjectError::TooLong(fields.len()));
-        }
-        let mut w = Writer::with_capacity(HEAD_BYTES);
-        w.u8(kind);
-        w.u32(u32::try_from(fields.len()).map_err(|_| ObjectError::TooLong(fields.len()))?);
-        w.u128(id);
-        w.u64(0);
-        w.u64(length);
-        w.u8(trailing.map_or(0, |a| a.code().saturating_add(1)));
-        Ok((w.into_vec(), fields))
+        })
     }
 
     /// The bytes of the request's body: its fields, and a put's or a part's bytes and trailer.
@@ -1762,13 +1774,23 @@ impl Reply {
         }
     }
 
-    /// The reply's head and the fields that open its body.
+    /// The reply's head and the fields that open its body: the fields counted first, then
+    /// written into one buffer at their length (`mantle_codec::encode`'s rule), so it never grows.
     pub fn encode(&self) -> Result<(Vec<u8>, Vec<u8>), ObjectError> {
-        let mut f = Writer::default();
-        put_text(&mut f, &self.version, MAX_TAG)?;
-        put_text(&mut f, &self.etag, MAX_TAG)?;
+        let fields = mantle_codec::encode(0, |f| self.put_fields(f))?.into_vec();
+        let mut w = Writer::with_capacity(REPLY_HEAD_BYTES);
+        w.u8(self.status.code());
+        w.u64(self.size);
+        w.u32(u32::try_from(fields.len()).map_err(|_| ObjectError::TooLong(fields.len()))?);
+        Ok((w.into_vec(), fields))
+    }
+
+    /// Writes the reply's fields into `f`.
+    fn put_fields(&self, f: &mut Writer) -> Result<(), ObjectError> {
+        put_text(f, &self.version, MAX_TAG)?;
+        put_text(f, &self.etag, MAX_TAG)?;
         f.u64(self.modified);
-        put_flag(&mut f, self.checksum.is_some());
+        put_flag(f, self.checksum.is_some());
         if let Some(c) = &self.checksum {
             if c.value.len() > MAX_CHECKSUM {
                 return Err(ObjectError::TooLong(c.value.len()));
@@ -1778,40 +1800,40 @@ impl Reply {
             f.u8(u8::try_from(c.value.len()).map_err(|_| ObjectError::TooLong(0))?);
             f.bytes(&c.value);
         }
-        put_flag(&mut f, self.marker);
-        put_flag(&mut f, self.range.is_some());
+        put_flag(f, self.marker);
+        put_flag(f, self.range.is_some());
         if let Some((first, last)) = self.range {
             f.u64(first);
             f.u64(last);
         }
         f.u8(self.versioning.map_or(0, versioning_code));
-        put_text(&mut f, &self.upload, MAX_TAG)?;
+        put_text(f, &self.upload, MAX_TAG)?;
         match &self.listing {
             None => f.u8(0),
             Some(Listing::Keys(page)) => {
                 f.u8(1);
-                put_page(&mut f, page)?;
+                put_page(f, page)?;
             }
             Some(Listing::Buckets(page)) => {
                 f.u8(2);
-                put_buckets(&mut f, page)?;
+                put_buckets(f, page)?;
             }
             Some(Listing::Parts(page)) => {
                 f.u8(3);
-                put_parts(&mut f, page)?;
+                put_parts(f, page)?;
             }
             Some(Listing::Uploads(page)) => {
                 f.u8(4);
-                put_uploads(&mut f, page)?;
+                put_uploads(f, page)?;
             }
         }
-        put_flag(&mut f, self.progress.is_some());
+        put_flag(f, self.progress.is_some());
         if let Some(p) = &self.progress {
             f.u64(p.offset);
             f.u16(p.runs);
             f.u64(p.run);
-            put_flag(&mut f, p.ended);
-            put_flag(&mut f, p.checksum.is_some());
+            put_flag(f, p.ended);
+            put_flag(f, p.checksum.is_some());
             if let Some(value) = &p.checksum {
                 if value.len() > MAX_CHECKSUM {
                     return Err(ObjectError::TooLong(value.len()));
@@ -1820,12 +1842,7 @@ impl Reply {
                 f.bytes(value);
             }
         }
-        let fields = f.into_vec();
-        let mut w = Writer::with_capacity(REPLY_HEAD_BYTES);
-        w.u8(self.status.code());
-        w.u64(self.size);
-        w.u32(u32::try_from(fields.len()).map_err(|_| ObjectError::TooLong(fields.len()))?);
-        Ok((w.into_vec(), fields))
+        Ok(())
     }
 }
 
@@ -2147,6 +2164,40 @@ mod tests {
                 },
             },
         ]
+    }
+
+    /// Every request and reply is written into buffers made at their lengths, its head's and its
+    /// fields', counted first (mantle_codec::encode's rule): two allocations, none grown, a
+    /// completion of S3's 10,000 parts among them.
+    #[test]
+    fn every_request_and_reply_is_written_at_its_length() {
+        use hyper_measure::alloc;
+        let parts = (1..=u16::try_from(MAX_PARTS).unwrap())
+            .map(|n| (n, format!("\"{}\"", "0".repeat(32))))
+            .collect();
+        let complete = Op::Complete {
+            bucket: "b".into(),
+            key: "k".into(),
+            upload: "u".repeat(MAX_TAG),
+            id: 9,
+            headers: headers(),
+            parts,
+        };
+        let ops = every_op().into_iter().chain([complete]);
+        for op in ops {
+            alloc::begin();
+            let encoded = op.encode();
+            let c = alloc::end();
+            assert!(encoded.is_ok(), "{op:?}");
+            assert_eq!((c.allocations, c.reallocations), (2, 0), "{op:?}");
+        }
+        for reply in every_reply() {
+            alloc::begin();
+            let encoded = reply.encode();
+            let c = alloc::end();
+            assert!(encoded.is_ok(), "{reply:?}");
+            assert_eq!((c.allocations, c.reallocations), (2, 0), "{reply:?}");
+        }
     }
 
     #[test]

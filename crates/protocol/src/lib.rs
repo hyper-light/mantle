@@ -18,6 +18,12 @@
     )
 )]
 
+// The unit tests count allocations (object.rs's encoding tests); nothing is counted until a test
+// begins a count.
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: hyper_measure::alloc::Counting = hyper_measure::alloc::Counting;
+
 pub mod bounds;
 pub mod classes;
 pub mod object;

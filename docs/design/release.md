@@ -72,26 +72,31 @@ Before its job uploads it, each target's archive is checked as a user takes it, 
    its own. It serves the cell as three `mantle serve` processes from what init wrote, each waited
    for until it says it bound the stated addresses and that the cell's root range enlisted it, and
    then ready to `mantle status`.
-4. Through the native QUIC door, as the client of a directory `mantle init client` made, its object
-   commands: `mb`; `cp` of a 3 MiB object from a file and back to one, and of 9 MiB from standard
-   input, past the 8 MiB runs a copy from standard input is read in, and back to standard output;
-   `head`; `ls` of the buckets, of a prefix's keys with their sizes, and of the bucket's prefixes; a
-   multipart upload's every step (`create`, `put` of a 5 MiB part from a file and the last from
-   standard input, `parts`, `uploads`, `complete`), read back, and another upload aborted. A copy
-   from standard input of a stated length (`--size`), fed a megabyte at a time and fed no more once
-   it says a run committed, is killed (SIGKILL; `TerminateProcess` on Windows): the cell lists its
-   open upload holding exactly the runs and bytes the copy said durable, and the copy run again says
-   it resumes there, commits each later run and none before, and the object reads back whole, its
-   ETag its bytes' MD5 (gateway.md §6). `ls` asked as the client `MANTLE_CLIENT` names, without
-   `--client`.
-5. Through the S3 HTTP door, the AWS CLI v2 with the profile `mantle init` wrote (its environment's
-   own `AWS_*` variables removed, as they outrank a profile): `s3 mb`, `s3 cp` of an object below the
+4. Through each of the client's doors in turn (docs/design/doors.md), `--door native`, the native
+   protocol over QUIC, and `--door s3`, S3's HTTP API SigV4-signed at the endpoint of the S3 profile
+   `mantle init client` gave the client, as the client of a directory `mantle init client` made,
+   every object command into a bucket of the door's own: `mb`; `cp` from a file of 3 MiB, below the
+   AWS CLI's 8 MiB multipart threshold, and of 16 MiB, past it, each back to a file; from standard
+   input of 9 MiB and of 100 KB, each back to standard output; `head`; `ls` of a prefix's keys with
+   their sizes and of the bucket's prefixes; a multipart upload's every step (`create`, `put` of a 5
+   MiB part from a file and the last from standard input, `parts`, `uploads`, `complete`), read
+   back, and another upload aborted. A copy from standard input of a stated length (`--size`), fed a
+   megabyte at a time and fed no more once it says a run (the native door) or a part (the S3 door)
+   committed, is killed (SIGKILL; `TerminateProcess` on Windows): the cell lists its open upload
+   holding exactly the runs or parts and bytes the copy said durable, and the copy run again says it
+   resumes there, commits each later one and none before, and the object reads back whole, its ETag
+   its bytes' MD5 through the native door and its parts' combined MD5 through the S3 door.
+5. Across the doors: each door reads back, to standard output and to a file, every object the other
+   put; both list the buckets, a bucket's keys and its uploads line for line alike, and head the
+   same objects alike; `ls` through the door `MANTLE_DOOR` names, as the client `MANTLE_CLIENT`
+   names, says what `--door s3 --client` says.
+6. The stock client, the AWS CLI v2 with the profile `mantle init` wrote (its environment's own
+   `AWS_*` variables removed, as they outrank a profile): `s3 mb`, `s3 cp` of an object below the
    CLI's 8 MiB multipart threshold and one past it, up and back, `s3 ls` with their sizes and
-   `s3api head-object`.
-6. Across the doors: the AWS CLI reads back the objects the native door put, the native door the
-   one the AWS CLI put, and each lists the other's bucket. Then each door removes its own objects
-   and bucket: `head` of a removed object says `NoSuchKey`, and `rb` of a bucket still holding an
-   object `BucketNotEmpty`.
+   `s3api head-object`; each of the client's doors reads back what it put, and it reads back what
+   each put. Then each door removes its own objects and bucket: `head` of a removed object says
+   `NoSuchKey` through the native door and its bodiless `404` through the S3 door, and `rb` of a
+   bucket still holding an object `BucketNotEmpty` through both.
 7. One founder stops in order at a `stop` line, which asks the orderly stop on every host, its peers
    serving on: it says `stopping` and `stopped` and exits 0.
 8. The binary's transfer harness at the scale CI's suite runs it (`mantle bench transfer --small

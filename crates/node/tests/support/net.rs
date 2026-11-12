@@ -23,38 +23,46 @@ pub type Node = Endpoint<NodeClasses, Fixed, Peers>;
 /// A certificate and its key, both DER.
 pub type Issued = (Vec<u8>, Vec<u8>);
 
+/// The certificates' validity: from the epoch to the last second X.509's GeneralizedTime holds.
+const VALIDITY: Validity = Validity {
+    not_before: 0,
+    not_after: 253_402_300_799,
+};
+
 /// Two nodes' certificates under one authority, each with its key.
 pub fn certificates() -> (Vec<u8>, [Issued; 2]) {
-    let validity = Validity {
-        not_before: 0,
-        not_after: 253_402_300_799,
-    };
     let key = KeyPair::generate().unwrap();
     let authority =
-        mantle_cert::authority(&key, AUTHORITY, validity, Serial::draw().unwrap()).unwrap();
+        mantle_cert::authority(&key, AUTHORITY, VALIDITY, Serial::draw().unwrap()).unwrap();
     let issue = |id: u64| {
         let own = KeyPair::generate().unwrap();
-        let certificate = mantle_cert::node(
-            &key,
-            AUTHORITY,
-            own.public_key(),
-            &node_name(id),
-            (validity, Serial::draw().unwrap()),
-        )
-        .unwrap();
-        (certificate, own.pkcs8().to_vec())
+        (issued(&key, &own, id), own.pkcs8().to_vec())
     };
     (authority, [issue(1), issue(2)])
 }
 
-/// Node `id`'s endpoint, which knows `other` as its one peer.
+/// Node `id`'s certificate, `own` its key, issued by `authority`.
+pub fn issued(authority: &KeyPair, own: &KeyPair, id: u64) -> Vec<u8> {
+    let serial = Serial::draw().unwrap();
+    mantle_cert::node(
+        authority,
+        AUTHORITY,
+        own.public_key(),
+        &node_name(id),
+        (VALIDITY, serial),
+    )
+    .unwrap()
+}
+
+/// A node's endpoint under its certificate `own`, which knows `other` as its one peer, its QUIC
+/// layer drawing from `seed`.
 pub fn endpoint(
-    id: u64,
     authority: &[u8],
     own: &Issued,
     other: (u64, &[u8]),
     stated: &Stated,
     now: Instant,
+    seed: [u8; 32],
 ) -> Node {
     let credentials = Credentials {
         chain: vec![CertificateDer::from(own.0.clone())],
@@ -80,7 +88,7 @@ pub fn endpoint(
         Fixed::new(stated.transport_bytes, stated.peers.max(1)),
         directory,
         now,
-        [u8::try_from(id).unwrap(); 32],
+        seed,
     )
     .unwrap()
 }
@@ -130,8 +138,8 @@ impl Net {
         (wire, out): (VecDeque<(usize, Vec<u8>)>, Vec<u8>),
     ) -> Self {
         let nodes = [
-            endpoint(1, authority, &certs[0], (2, &certs[1].0), stated, now),
-            endpoint(2, authority, &certs[1], (1, &certs[0].0), stated, now),
+            endpoint(authority, &certs[0], (2, &certs[1].0), stated, now, [1; 32]),
+            endpoint(authority, &certs[1], (1, &certs[0].0), stated, now, [2; 32]),
         ];
         Self {
             now,

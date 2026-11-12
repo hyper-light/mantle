@@ -336,9 +336,10 @@ const STREAM_BYTES: u64 = 95;
 const EXCHANGE_BYTES: u64 = 2_151;
 
 /// What a server's handshake takes, once a certificate, to compress the certificate (RFC 8879):
-/// hyper-tls's brotli at quality 11 and a 4 MiB window, measured, 34,267,200 bytes, given back as
-/// the handshake goes on.
-pub const CERTIFICATE_COMPRESSION_BYTES: u64 = 34_267_200;
+/// hyper-tls's brotli at quality 11 with a window the certificate's length (1 KiB), measured,
+/// 721,474 bytes for the longest certificate a node carries (365 bytes, the name of id
+/// `u64::MAX`), given back as the handshake goes on (mantle-node's `tests/transport_memory.rs`).
+pub const CERTIFICATE_COMPRESSION_BYTES: u64 = 721_474;
 
 /// The most bytes a transport of `stated` holds beside its budget (`transport_bytes`): what the
 /// budget does not charge.

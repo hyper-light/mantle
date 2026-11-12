@@ -461,6 +461,14 @@ impl<'a, S> Upload<'a, S> {
     }
 }
 
+/// What a client put on the wire and took from it ([`Client::wire`]): the UDP payload bytes of its
+/// datagrams, QUIC's packets whole and no IP or UDP header, and the datagrams.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Wire {
+    pub bytes: u64,
+    pub datagrams: u64,
+}
+
 /// A client of a cell's objects, on the current hyper-rt shard.
 pub struct Client {
     id: PeerId,
@@ -555,6 +563,17 @@ impl Client {
     /// The most heap the client holds while it puts or gets an object ([`memory`]).
     pub fn memory(&self) -> u64 {
         self.memory
+    }
+
+    /// What the client's sockets have moved since it opened, sent and received together: its
+    /// endpoint's socket and each socket connected to a node, those of nodes it let go among them
+    /// (`Driver::peer_stats`), so a count never goes back as connections come and go.
+    pub fn wire(&self) -> Wire {
+        let stats = self.driver.stats().plus(&self.driver.peer_stats());
+        Wire {
+            bytes: stats.sent_bytes.saturating_add(stats.received_bytes),
+            datagrams: stats.sent.saturating_add(stats.received),
+        }
     }
 
     /// Asks `op`, an operation that sends no object's bytes and gets none back, by `deadline_ns`

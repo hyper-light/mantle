@@ -1,8 +1,9 @@
-//! A response's head and its chunked framing, written into its caller's buffer (RFC 9112 §4, §6,
-//! §7.1). A field's name is a token and its value holds no CR, LF, NUL or other control but HTAB,
-//! so no value a caller passes can end the head early or begin another response (RFC 9112 §11.1;
-//! RFC 9110 §5.5). A body's octets are the caller's to send between a chunk's head and its end, so
-//! nothing here copies them.
+//! A response's head and its chunked framing, and a request's head, written into its caller's
+//! buffer (RFC 9112 §3, §4, §6, §7.1). A field's name is a token and its value holds no CR, LF, NUL
+//! or other control but HTAB, so no value a caller passes can end the head early or begin another
+//! message (RFC 9112 §11.1; RFC 9110 §5.5); a request's method is a token and its target holds no
+//! space or control, so neither can end its request line early. A body's octets are the caller's to
+//! send between a chunk's head and its end, so nothing here copies them.
 
 use std::io::Write as _;
 
@@ -42,6 +43,12 @@ pub enum WriteError {
     /// The chunked coding in a response to an HTTP/1.0 request (RFC 9112 §6.1).
     #[error("the chunked coding to an HTTP/1.0 request")]
     Chunked,
+    /// A request's method that is not a token (RFC 9110 §9.1).
+    #[error("a method that is not a token")]
+    Method,
+    /// A request's target that is empty or holds a space or a control octet (RFC 9112 §3.2).
+    #[error("a request target that is empty or holds a space or a control octet")]
+    Target,
 }
 
 /// Writes a response's head: its status line, `fields` and the length's field, and the empty line
@@ -89,6 +96,69 @@ pub fn head_lines(
     out.extend_from_slice(lines);
     end(out, length);
     Ok(())
+}
+
+/// Writes a request's head: its request line, `method` and its `target` in origin form (a path and
+/// any query after its `?`, given in pieces written one after another), `fields` (each value in
+/// pieces) and the length's field, and the empty line that ends it (RFC 9112 §3, §5, §6). A request
+/// with no body states [`Length::None`], and so no length (RFC 9112 §6.3).
+pub fn request(
+    out: &mut Vec<u8>,
+    method: &str,
+    target: &[&[u8]],
+    fields: &[(&str, &[&[u8]])],
+    length: Length,
+) -> Result<(), WriteError> {
+    if method.is_empty() || !method.bytes().all(tchar) {
+        return Err(WriteError::Method);
+    }
+    let mut octets = target.iter().flat_map(|piece| piece.iter().copied());
+    if octets.next() != Some(b'/') || !octets.all(target_octet) {
+        return Err(WriteError::Target);
+    }
+    for (name, value) in fields {
+        check_field(name, value)?;
+    }
+    out.extend_from_slice(method.as_bytes());
+    out.push(b' ');
+    for piece in target {
+        out.extend_from_slice(piece);
+    }
+    out.extend_from_slice(b" HTTP/1.1\r\n");
+    for (name, value) in fields {
+        put_field(out, name, value);
+    }
+    end(out, length);
+    Ok(())
+}
+
+/// Whether `b` may appear in an origin-form target past its first `/`: a path's or a query's octet,
+/// unreserved, percent-encoded, a sub-delimiter, `:`, `@`, `/` or `?` (RFC 3986 §2.1–§2.3, §3.3,
+/// §3.4, which RFC 9112 §3.2.1 takes).
+fn target_octet(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'-' | b'.'
+                | b'_'
+                | b'~'
+                | b'%'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b':'
+                | b'@'
+                | b'/'
+                | b'?'
+        )
 }
 
 fn check_status(

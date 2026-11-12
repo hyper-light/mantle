@@ -1,10 +1,10 @@
 //! `mantle bench doors`: each operation's cost through both of mantle's doors, the native protocol
 //! (mantle-client) and the S3 listener, against a cell of three `mantle serve` processes this
 //! program makes and runs (docs/design/measurement.md §12; research/70). The load is mantle's own:
-//! the native door's requests are mantle-client's, and the S3 listener's are written here, framed
-//! with mantle's HTTP codec where a request's framing is the codec's (an `aws-chunked` body's
-//! chunks and trailer; every response body's decoding) and signed with mantle-s3's SigV4. The
-//! stock clients stay the correctness suite (`mantle bench transfer`).
+//! the native door's requests are mantle-client's, and the S3 listener's are written here by
+//! mantle's HTTP codec (each request's head, an `aws-chunked` body's chunks and trailer, and every
+//! response body's decoding) and signed with mantle-s3's SigV4. The stock clients stay the
+//! correctness suite (`mantle bench transfer`).
 //!
 //! Every object's bytes are made from the run's seed and the object's name
 //! (`transfer::generate`), and every read is checked by making them again; an ETag is checked
@@ -16,18 +16,25 @@
 //! A phase is one door, one operation and one size, and says one line: what the three servers
 //! counted while it ran, per operation (each answers `counts` on its standard input: its
 //! allocator's counts in a `count-allocs` build, its faults and switches in any), what the OS
-//! charged each server's process (read by pid), what the harness's own thread allocated beside its
-//! own work, which is set aside (`alloc::aside`), and the latency of each operation from its
-//! intended start (measurement.md §10). Logical clients are tasks on one hyper-rt shard, each
-//! holding one connection, an HTTP connection carrying one request at a time; open loop, their
-//! requests arrive as a Poisson process and each waits for a free client; closed, a ladder of
-//! clients doubles while throughput grows by [`GROWTH`], up to `--clients`.
+//! charged each server's process (read by pid), what the harness's own thread allocated for the
+//! doors beside its own work, which is set aside (`alloc::aside`), and the latency of each
+//! operation from its intended start (measurement.md §10). The servers' peak live heap over the
+//! phase, above what they held as it began, is given per request, over the most requests the
+//! harness had out at once, and per connection, over the connections the phase held. Logical
+//! clients are tasks on one hyper-rt shard, each holding one connection and the buffers its
+//! operations work in ([`Logical`]), an HTTP connection carrying one request at a time; open loop,
+//! their requests arrive as a Poisson process and each waits for a free client; closed, a ladder
+//! of clients doubles while throughput grows by [`GROWTH`], up to `--clients`. Each phase says the
+//! threads the process ran as the OS counts them, read as its clients' requests were out, and what
+//! the harness's own work held at its peak: a phase's operations allocate nothing of the
+//! harness's, so neither grows with the clients or the objects.
 //!
 //! A measure this build or this OS does not give prints `-`: the allocators' counts outside a
 //! `count-allocs` build, instructions and cycles where the OS does not count them per process
 //! (Linux: `usage::of` reads none; `--perf` counts them with `perf stat`, [`Perf`]), a major fault
-//! count on Windows, and the native door's wire bytes and datagrams, which mantle-client does not
-//! say (its endpoint's counters are its own).
+//! count on Windows, and datagrams on the HTTP door, which has none of its own. The native door's
+//! wire bytes and datagrams are what its clients' sockets sent and received (`Client::wire`), the
+//! HTTP door's the octets each connection wrote and read.
 //! A quantile is a dash below the samples that resolve it at 95% (`quantile::samples_for`; §12's
 //! rounds).
 //!
@@ -53,8 +60,9 @@ use hyper_rt::futures::{now_ns, sleep};
 use hyper_rt::machine::facts::Facts;
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig, interests_for};
 use hyper_rt::tcp::TcpStream;
-use mantle_client::{Client, Native, Rewind, Settings, Sink, Source, TRAILER};
+use mantle_client::{Client, Native, Rewind, Settings, Sink, Source, TRAILER, Wire};
 use mantle_disk::histogram::Histogram;
+use mantle_http::write::Length;
 use mantle_protocol::object::{Headers, List, Listing, Op, Reply, Status};
 use mantle_s3::checksum::{self, Algorithm, Hasher};
 use mantle_s3::list::Resume;
@@ -290,6 +298,8 @@ pub fn kind_arg(text: &str) -> Result<Kind, String> {
 enum Came {
     Done,
     Failed(String),
+    /// A read whose bytes or length were not what was put: a failure, counted apart as well.
+    Differed(String),
     /// The server answered with a refusal (an HTTP status past 2xx), or an operation needed what a
     /// refused one would have made: a failure, which against an endpoint may exclude its phase.
     Refused(String),
@@ -320,12 +330,34 @@ const SLOWED_MOST_NS: u64 = 20_000_000_000;
 
 /// An object's key and its bytes' name: the same, so a read of one key answered with another's
 /// bytes fails its check.
-fn sized_key(door: Door, size: u64, kind: char, i: u64) -> String {
-    format!("{}/{size}/{kind}{i}", door.name())
+fn sized_key(door: Door, size: u64, kind: char, i: u64) -> Result<String, Error> {
+    let mut key = String::new();
+    write_sized(&mut key, door, (size, kind, i))?;
+    Ok(key)
 }
 
-fn set_key(count: u64, i: u64) -> String {
-    format!("set{count}/{i}")
+/// [`sized_key`] written into `into`.
+fn write_sized(
+    into: &mut String,
+    door: Door,
+    (size, kind, i): (u64, char, u64),
+) -> Result<(), Error> {
+    write_key(into, format_args!("{}/{size}/{kind}{i}", door.name()))
+}
+
+/// Writes a key over what `into` held: a logical client's key buffer, which holds any S3 key
+/// ([`Logical`]), so writing one allocates nothing. A key longer than S3's is refused.
+fn write_key(into: &mut String, key: std::fmt::Arguments<'_>) -> Result<(), Error> {
+    use std::fmt::Write as _;
+    into.clear();
+    into.write_fmt(key).map_err(failed)?;
+    if into.len() > mantle_s3::route::MAX_KEY {
+        return Err(failed(format!(
+            "a key past S3's {} octets",
+            mantle_s3::route::MAX_KEY
+        )));
+    }
+    Ok(())
 }
 
 /// Which keys a phase's operation `j` asks, and of what length.
@@ -360,7 +392,7 @@ struct Work {
 }
 
 /// A listing's place: where its next page starts, whether it ended, and the keys it listed.
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct Paging {
     next: Option<Next>,
     ended: bool,
@@ -368,7 +400,6 @@ struct Paging {
 }
 
 /// Where the next page of a listing starts: the native door's key, the S3 listener's token.
-#[derive(Clone)]
 enum Next {
     Native(Resume),
     Token(String),
@@ -387,6 +418,63 @@ struct Upload {
 enum Conn {
     Native(Box<Client>),
     Http(Box<Http>),
+}
+
+impl Conn {
+    /// What the connection's sockets moved since it opened: the native client's datagrams and
+    /// their payload, the HTTP connection's octets written and read (TCP has no datagrams of its
+    /// own to say).
+    fn wire(&self) -> Wire {
+        match self {
+            Self::Native(client) => client.wire(),
+            Self::Http(http) => Wire {
+                bytes: http.wire,
+                datagrams: 0,
+            },
+        }
+    }
+}
+
+/// A logical client: its connection, and the harness's own buffers its operations work in, made
+/// with the connection and kept with it, so a phase's operations allocate nothing of the
+/// harness's: the key of the operation at hand, written in place (room for any S3 key,
+/// `mantle_s3::route::MAX_KEY`), and the scratch a read's bytes are made again in to be checked
+/// (mantle-client's piece, the most a read hands over at once).
+struct Logical {
+    conn: Conn,
+    key: String,
+    scratch: Vec<u8>,
+}
+
+impl Logical {
+    /// The client of `conn`, its buffers set aside as the harness's own.
+    fn new(conn: Conn) -> Self {
+        harness(|| Self {
+            conn,
+            key: String::with_capacity(mantle_s3::route::MAX_KEY),
+            scratch: vec![0u8; mantle_client::PIECE],
+        })
+    }
+}
+
+/// What `held`'s connections moved since each opened, summed.
+fn wired(held: &[Logical]) -> Wire {
+    held.iter().fold(Wire::default(), |sum, logical| {
+        let wire = logical.conn.wire();
+        Wire {
+            bytes: sum.bytes.saturating_add(wire.bytes),
+            datagrams: sum.datagrams.saturating_add(wire.datagrams),
+        }
+    })
+}
+
+/// The connections `held`'s HTTP clients opened: each one's first, and each opened again after
+/// its listener let one go.
+fn reopened(held: &[Logical]) -> u64 {
+    held.iter().fold(0u64, |sum, logical| match &logical.conn {
+        Conn::Http(http) => sum.saturating_add(http.opened),
+        Conn::Native(_) => sum,
+    })
 }
 
 /// The harness's own work: counted apart from the doors' (`alloc::aside`). What it runs never
@@ -454,6 +542,10 @@ struct Answer {
 /// A connection to an S3 listener, a request at a time.
 struct Http {
     at: SocketAddr,
+    /// The listener as each request's `host` names it.
+    host: String,
+    /// A request's head, written into this before it is sent, the next written over it.
+    head: Vec<u8>,
     stream: Option<TcpStream>,
     /// What was read and not yet taken.
     read: Vec<u8>,
@@ -492,57 +584,94 @@ impl Signer {
         })
     }
 
-    /// A request's head for the listener at `at`, signed now, `payload` as
-    /// `x-amz-content-sha256` names its body (05 §1.2).
-    fn head(
-        &self,
-        at: SocketAddr,
-        (method, path, query): (&str, &str, &str),
-        headers: &[(&str, String)],
-        payload: &str,
-    ) -> Result<Vec<u8>, Error> {
+    /// `request`'s head for the listener named `host`, signed now (05 §1.2), written by mantle's
+    /// codec over what `out` held: every header but a range signed, the length the codec's to
+    /// write (`mantle_http::write::request`).
+    fn head(&self, out: &mut Vec<u8>, host: &str, request: &Request<'_>) -> Result<(), Error> {
         let (stamp, date) = crate::bench_s3::timestamp().map_err(failed)?;
-        let mut all: Vec<(&str, String)> = vec![
-            ("host", at.to_string()),
-            ("x-amz-date", stamp.clone()),
-            ("x-amz-content-sha256", payload.to_owned()),
-        ];
-        all.extend(headers.iter().cloned());
+        let mut all: Vec<(&str, &str)> =
+            Vec::with_capacity(request.headers.len().saturating_add(3));
+        all.extend_from_slice(&[
+            ("host", host),
+            ("x-amz-date", &stamp),
+            ("x-amz-content-sha256", request.payload),
+        ]);
+        all.extend_from_slice(request.headers);
         let mut signed: Vec<&str> = all
             .iter()
             .map(|(n, _)| *n)
-            .filter(|n| *n != "content-length" && *n != "range")
+            .filter(|n| *n != "range")
             .collect();
         signed.sort_unstable();
-        let pairs: Vec<(&str, &str)> = all.iter().map(|(n, v)| (*n, v.as_str())).collect();
-        let request = sigv4::Request {
+        let canonical = sigv4::canonical_request(
+            &sigv4::Request {
+                method: request.method,
+                path: request.path,
+                query: request.query,
+                headers: &all,
+            },
+            &signed,
+            request.payload,
+            None,
+        )
+        .map_err(|e| failed(format!("{e:?}")))?;
+        let signature = sigv4::sign(&self.secret, &stamp, &date, &self.region, &canonical)
+            .map_err(|e| failed(format!("{e:?}")))?;
+        let scope = sigv4::scope(&date, &self.region, "s3");
+        let names = signed.join(";");
+        let hex = sigv4::hex(&signature);
+        let authorization: [&[u8]; 9] = [
+            sigv4::ALGORITHM.as_bytes(),
+            b" Credential=",
+            self.id.as_bytes(),
+            b"/",
+            scope.as_bytes(),
+            b", SignedHeaders=",
+            names.as_bytes(),
+            b", Signature=",
+            hex.as_bytes(),
+        ];
+        let values: Vec<[&[u8]; 1]> = all.iter().map(|(_, v)| [v.as_bytes()]).collect();
+        let mut fields: Vec<(&str, &[&[u8]])> = all
+            .iter()
+            .zip(&values)
+            .map(|((name, _), value)| (*name, &value[..]))
+            .collect();
+        fields.push(("authorization", authorization.as_slice()));
+        let parts: [&[u8]; 3] = [request.path.as_bytes(), b"?", request.query.as_bytes()];
+        let target = if request.query.is_empty() {
+            parts.get(..1).unwrap_or_default()
+        } else {
+            parts.as_slice()
+        };
+        out.clear();
+        mantle_http::write::request(out, request.method, target, &fields, request.length)
+            .map_err(failed)
+    }
+}
+
+/// A request to sign and send: its method, its path and query, the headers it adds to those every
+/// request signs, its payload as `x-amz-content-sha256` names it, and its body's length.
+struct Request<'r> {
+    method: &'r str,
+    path: &'r str,
+    query: &'r str,
+    headers: &'r [(&'r str, &'r str)],
+    payload: &'r str,
+    length: Length,
+}
+
+impl<'r> Request<'r> {
+    /// A request with no body and no header of its own.
+    fn bare(method: &'r str, path: &'r str, query: &'r str) -> Self {
+        Self {
             method,
             path,
             query,
-            headers: &pairs,
-        };
-        let canonical = sigv4::canonical_request(&request, &signed, payload, None)
-            .map_err(|e| failed(format!("{e:?}")))?;
-        let signature = sigv4::sign(&self.secret, &stamp, &date, &self.region, &canonical)
-            .map_err(|e| failed(format!("{e:?}")))?;
-        let target = if query.is_empty() {
-            path.to_owned()
-        } else {
-            format!("{path}?{query}")
-        };
-        let mut text = format!("{method} {target} HTTP/1.1\r\n");
-        for (name, value) in &all {
-            text.push_str(&format!("{name}: {value}\r\n"));
+            headers: &[],
+            payload: sigv4::EMPTY_SHA256,
+            length: Length::None,
         }
-        text.push_str(&format!(
-            "authorization: {} Credential={}/{}, SignedHeaders={}, Signature={}\r\n\r\n",
-            sigv4::ALGORITHM,
-            self.id,
-            sigv4::scope(&date, &self.region, "s3"),
-            signed.join(";"),
-            sigv4::hex(&signature)
-        ));
-        Ok(text.into_bytes())
     }
 }
 
@@ -580,6 +709,8 @@ impl Http {
     fn new(at: SocketAddr, signer: Rc<Signer>) -> Self {
         Self {
             at,
+            host: at.to_string(),
+            head: Vec::new(),
             stream: None,
             read: vec![0u8; mantle_client::PIECE],
             held: 0,
@@ -646,26 +777,34 @@ impl Http {
         self.held = self.held.saturating_sub(n);
     }
 
-    /// Sends a request and reads its response, its body into `sink`: once again on a connection
-    /// opened anew where the listener had let the last one go before answering (a quiet
-    /// connection's end, node.md §4.1), which its octets so far tell.
+    /// Signs `request` and sends it, and reads its response, its body into `sink`: once again on a
+    /// connection opened anew where the listener had let the last one go before answering (a quiet
+    /// connection's end, node.md §4.1), which its octets so far tell. Its head is written into the
+    /// connection's own buffer, which the next request's is written over.
     async fn ask(
         &mut self,
-        head: &[u8],
+        request: &Request<'_>,
         body: &Body<'_>,
         bodiless: bool,
         sink: &mut impl Sink,
     ) -> Result<Answer, Error> {
-        match self.ask_once(head, body, bodiless, sink).await {
+        let mut head = std::mem::take(&mut self.head);
+        if let Err(e) = self.signer.head(&mut head, &self.host, request) {
+            self.head = head;
+            return Err(e);
+        }
+        let asked = match self.ask_once(&head, body, bodiless, sink).await {
             Ok(answer) => Ok(answer),
             Err(Attempt::Failed(e)) => Err(e),
             Err(Attempt::Again(_)) => {
                 self.stream = None;
-                self.ask_once(head, body, bodiless, sink)
+                self.ask_once(&head, body, bodiless, sink)
                     .await
                     .map_err(|(Attempt::Again(e) | Attempt::Failed(e))| e)
             }
-        }
+        };
+        self.head = head;
+        asked
     }
 
     /// One exchange on the connection held, or on one opened for it.
@@ -704,8 +843,8 @@ impl Http {
                 Err(e) => return Err(Attempt::Failed(e)),
             }
         };
-        let text = String::from_utf8_lossy(self.read.get(..end).unwrap_or_default()).into_owned();
-        self.take(end);
+        let text = std::str::from_utf8(self.read.get(..end).unwrap_or_default())
+            .map_err(|_| Attempt::Failed(failed("a response head that is not UTF-8")))?;
         let status: u16 = text
             .split(' ')
             .nth(1)
@@ -714,11 +853,13 @@ impl Http {
         let field = |name: &str| {
             text.lines().find_map(|l| {
                 let (n, v) = l.split_once(':')?;
-                n.eq_ignore_ascii_case(name).then(|| v.trim().to_owned())
+                n.eq_ignore_ascii_case(name).then(|| v.trim())
             })
         };
         let length = field("content-length").and_then(|v| v.parse::<u64>().ok());
         let chunked = field("transfer-encoding").is_some_and(|v| v.eq_ignore_ascii_case("chunked"));
+        let etag = field("etag").map(|e| e.trim_matches('"').to_owned());
+        self.take(end);
         let framing = match (bodiless || status == 204 || status == 304, chunked, length) {
             (true, ..) => mantle_http::Framing::None,
             (false, true, _) => mantle_http::Framing::Chunked,
@@ -749,7 +890,7 @@ impl Http {
         }
         Ok(Answer {
             status,
-            etag: field("etag").map(|e| e.trim_matches('"').to_owned()),
+            etag,
             length,
         })
     }
@@ -841,6 +982,13 @@ struct Tally {
     failed: u64,
     /// Of the failed, those the server refused ([`Came::Refused`]).
     refused: u64,
+    /// Of the failed, the reads whose bytes or length were not what was put ([`Came::Differed`]).
+    differed: u64,
+    /// The most requests out at once.
+    most: usize,
+    /// The most threads the process ran as the OS counted them, read each time more requests
+    /// were out at once than before.
+    threads: usize,
     first: Option<String>,
 }
 
@@ -879,17 +1027,27 @@ impl Schedule {
     }
 }
 
-/// What a phase's tasks share: its schedule and its tally.
+/// What a phase's tasks share: its schedule, its tally and the requests out now.
 struct Shared {
     schedule: Schedule,
     tally: Tally,
+    out: usize,
     error: Option<Error>,
-    done: Vec<Conn>,
+    done: Vec<Logical>,
+}
+
+/// The threads this process runs as the OS counts them, read with this thread's counting paused:
+/// the read is the harness's own, and on Linux it reads a file into a buffer of its own.
+fn threads_now() -> usize {
+    alloc::pause();
+    let threads = drive::thread_count();
+    alloc::resume();
+    threads
 }
 
 /// One client's part of a phase: operations taken from the schedule until it ends, each at its
 /// intended start, its latency from then.
-async fn client(mut conn: Conn, work: Rc<Work>, shared: Rc<RefCell<Shared>>) {
+async fn client(mut logical: Logical, work: Rc<Work>, shared: Rc<RefCell<Shared>>) {
     loop {
         let taken = harness(|| shared.borrow_mut().schedule.take(now_ns()));
         let (j, intended) = match taken {
@@ -906,10 +1064,25 @@ async fn client(mut conn: Conn, work: Rc<Work>, shared: Rc<RefCell<Shared>>) {
             break;
         }
         let started = now_ns();
-        let came = work.run(&mut conn, j).await;
+        let busiest = harness(|| {
+            let mut shared = shared.borrow_mut();
+            shared.out = shared.out.saturating_add(1);
+            let busiest = shared.out > shared.tally.most;
+            shared.tally.most = shared.tally.most.max(shared.out);
+            busiest
+        });
+        if busiest {
+            let threads = threads_now();
+            harness(|| {
+                let tally = &mut shared.borrow_mut().tally;
+                tally.threads = tally.threads.max(threads);
+            });
+        }
+        let came = work.run(&mut logical, j).await;
         let took = now_ns().saturating_sub(intended);
         let stop = harness(|| {
             let mut shared = shared.borrow_mut();
+            shared.out = shared.out.saturating_sub(1);
             let tally = &mut shared.tally;
             tally.latency.record(took);
             tally.lateness.record(started.saturating_sub(intended));
@@ -918,6 +1091,12 @@ async fn client(mut conn: Conn, work: Rc<Work>, shared: Rc<RefCell<Shared>>) {
                 Ok(Came::Done) => false,
                 Ok(Came::Failed(why)) => {
                     tally.failed = tally.failed.saturating_add(1);
+                    tally.first.get_or_insert(why);
+                    false
+                }
+                Ok(Came::Differed(why)) => {
+                    tally.failed = tally.failed.saturating_add(1);
+                    tally.differed = tally.differed.saturating_add(1);
                     tally.first.get_or_insert(why);
                     false
                 }
@@ -947,17 +1126,17 @@ async fn client(mut conn: Conn, work: Rc<Work>, shared: Rc<RefCell<Shared>>) {
             break;
         }
     }
-    harness(|| shared.borrow_mut().done.push(conn));
+    harness(|| shared.borrow_mut().done.push(logical));
 }
 
-/// A phase's operations `from..end` on `conns`, a task each: the connections back, and the tally.
+/// A phase's operations `from..end` on `clients`, a task each: the clients back, and the tally.
 async fn phase(
-    conns: Vec<Conn>,
+    clients: Vec<Logical>,
     work: Rc<Work>,
     schedule: (Load, u64, u64, u64),
-) -> Result<(Vec<Conn>, Tally), Error> {
+) -> Result<(Vec<Logical>, Tally), Error> {
     let (load, seed, from, end) = schedule;
-    let clients = conns.len();
+    let count = clients.len();
     let shared = harness(|| {
         Ok::<_, Error>(Rc::new(RefCell::new(Shared {
             schedule: Schedule::new(load, seed, (from, end), now_ns())?,
@@ -967,16 +1146,20 @@ async fn phase(
                 ops: 0,
                 failed: 0,
                 refused: 0,
+                differed: 0,
+                most: 0,
+                threads: 0,
                 first: None,
             },
+            out: 0,
             error: None,
-            done: Vec::with_capacity(clients),
+            done: Vec::with_capacity(count),
         })))
     })?;
-    let mut tasks = TaskSet::new(clients).map_err(|e| failed(format!("{e:?}")))?;
-    for conn in conns {
-        tasks
-            .spawn(client(conn, Rc::clone(&work), Rc::clone(&shared)))
+    // The clients' tasks are the harness's machinery, set aside as its own work.
+    let mut tasks = harness(|| TaskSet::new(count)).map_err(|e| failed(format!("{e:?}")))?;
+    for logical in clients {
+        harness(|| tasks.spawn(client(logical, Rc::clone(&work), Rc::clone(&shared))))
             .map_err(|e| failed(format!("{e:?}")))?;
     }
     while let Some((_, ended)) = tasks.join_next().await {
@@ -992,9 +1175,9 @@ async fn phase(
 }
 
 impl Work {
-    /// Operation `j`'s key, its object's length, and whether it is to be asked: a set's other
-    /// door's objects are read only where acknowledged.
-    fn key(&self, j: u64) -> Result<Option<(u64, String, u64)>, Error> {
+    /// Operation `j`'s key, written into `into`, its object's index and length, and whether it is
+    /// to be asked: a set's other door's objects are read only where acknowledged.
+    fn key(&self, j: u64, into: &mut String) -> Result<Option<(u64, u64)>, Error> {
         harness(|| match &self.keys {
             Keys::Sized { size, kind, made } => {
                 let i = match made {
@@ -1003,7 +1186,8 @@ impl Work {
                         .ok_or_else(|| failed("no objects to read"))?,
                     None => j,
                 };
-                Ok(Some((i, sized_key(self.door, *size, *kind, i), *size)))
+                write_sized(into, self.door, (*size, *kind, i))?;
+                Ok(Some((i, *size)))
             }
             Keys::Set { count, own } => {
                 let i = j
@@ -1014,11 +1198,8 @@ impl Work {
                     return Ok(None);
                 }
                 let sizes = self.generator.object("sizes").map_err(failed)?;
-                Ok(Some((
-                    i,
-                    set_key(*count, i),
-                    small_size(&sizes, i).map_err(failed)?,
-                )))
+                write_key(into, format_args!("set{count}/{i}"))?;
+                Ok(Some((i, small_size(&sizes, i).map_err(failed)?)))
             }
         })
     }
@@ -1030,20 +1211,25 @@ impl Work {
             .and_then(|i| self.etags.get(i).copied())
     }
 
-    async fn run(&self, conn: &mut Conn, j: u64) -> Result<Came, Error> {
+    async fn run(&self, logical: &mut Logical, j: u64) -> Result<Came, Error> {
+        let Logical { conn, key, scratch } = logical;
         if self.kind == Kind::List {
-            return self.list(conn).await;
+            return self.list(conn, key).await;
         }
-        let Some((i, key, length)) = self.key(j)? else {
+        let Some((i, length)) = self.key(j, key)? else {
             return Ok(Came::Done);
         };
-        let object = harness(|| self.generator.object(&key)).map_err(failed)?;
+        let key = key.as_str();
+        let object = harness(|| self.generator.object(key)).map_err(failed)?;
         let id = mantle_client::identity().map_err(failed)?;
         let mut again = 0u32;
         let came = loop {
             let came = match conn {
-                Conn::Native(client) => self.native(client, (i, &key, length, id), &object).await?,
-                Conn::Http(http) => self.http(http, (i, &key, length), &object).await?,
+                Conn::Native(client) => {
+                    self.native(client, (i, key, length, id), &object, scratch)
+                        .await?
+                }
+                Conn::Http(http) => self.http(http, (i, key, length), &object, scratch).await?,
             };
             let retry = matches!(came, Came::Slowed | Came::Lost(_));
             if !retry || again.saturating_add(1) >= mantle_client::ATTEMPTS {
@@ -1138,8 +1324,8 @@ impl Work {
 
     fn checked(&self, wrong: Option<u64>, took: u64, length: u64) -> Came {
         match wrong {
-            Some(at) => Came::Failed(format!("byte {at} not the generator's")),
-            None if took != length => Came::Failed(format!("{took} bytes, not {length}")),
+            Some(at) => Came::Differed(format!("byte {at} not the generator's")),
+            None if took != length => Came::Differed(format!("{took} bytes, not {length}")),
             None => Came::Done,
         }
     }
@@ -1149,6 +1335,7 @@ impl Work {
         client: &mut Client,
         (i, key, length, id): (u64, &str, u64, u128),
         object: &Object<'_>,
+        scratch: &mut [u8],
     ) -> Result<Came, Error> {
         let bucket = BUCKET.to_owned();
         let refused = |reply: &Reply| Came::Failed(format!("{:?}", reply.status));
@@ -1221,7 +1408,7 @@ impl Work {
                     key: key.to_owned(),
                     headers,
                 };
-                let mut sink = Aside(Checked::starting(object, mantle_client::PIECE, from));
+                let mut sink = Aside(Checked::starting(object, scratch, from));
                 let reply = match answered(client.get(&op, &mut sink, u64::MAX).await)? {
                     Ok(reply) => reply,
                     Err(came) => return Ok(came),
@@ -1435,10 +1622,9 @@ impl Work {
         http: &mut Http,
         (i, key, length): (u64, &str, u64),
         object: &Object<'_>,
+        scratch: &mut [u8],
     ) -> Result<Came, Error> {
-        let at = http.at;
-        let signer = Rc::clone(&http.signer);
-        let path = format!("/{}/{key}", signer.bucket);
+        let path = format!("/{}/{key}", http.signer.bucket);
         let unsigned = "UNSIGNED-PAYLOAD";
         // A refusal says the server's answer: its status and its error's code and message.
         let refused = |answer: &Answer, body: &Kept| {
@@ -1465,14 +1651,18 @@ impl Work {
                     (Kind::Part, None) => return Ok(Came::Refused("no upload created".into())),
                     _ => String::new(),
                 };
-                let head = signer.head(
-                    at,
-                    ("PUT", &path, &query),
-                    &[("content-length", length.to_string())],
-                    unsigned,
-                )?;
+                let request = Request {
+                    payload: unsigned,
+                    length: Length::Known(length),
+                    ..Request::bare("PUT", &path, &query)
+                };
                 let answer = http
-                    .ask(&head, &Body::Made(object, 0, length), false, &mut dropped)
+                    .ask(
+                        &request,
+                        &Body::Made(object, 0, length),
+                        false,
+                        &mut dropped,
+                    )
                     .await?;
                 let etag = answer.etag.clone().unwrap_or_default();
                 if answer.status != 200 {
@@ -1495,20 +1685,25 @@ impl Work {
             }
             Kind::Stream => {
                 let encoded = chunked_length(length, &mut http.piece)?;
+                let decoded = length.to_string();
                 let headers = [
-                    ("content-encoding", "aws-chunked".to_owned()),
-                    ("content-length", encoded.to_string()),
-                    ("x-amz-decoded-content-length", length.to_string()),
-                    ("x-amz-trailer", Algorithm::Crc32.header().to_owned()),
+                    ("content-encoding", "aws-chunked"),
+                    ("x-amz-decoded-content-length", decoded.as_str()),
+                    ("x-amz-trailer", Algorithm::Crc32.header()),
                 ];
-                let head = signer.head(
-                    at,
-                    ("PUT", &path, ""),
-                    &headers,
-                    "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
-                )?;
+                let request = Request {
+                    headers: &headers,
+                    payload: "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+                    length: Length::Known(encoded),
+                    ..Request::bare("PUT", &path, "")
+                };
                 let answer = http
-                    .ask(&head, &Body::Chunked(object, length), false, &mut dropped)
+                    .ask(
+                        &request,
+                        &Body::Chunked(object, length),
+                        false,
+                        &mut dropped,
+                    )
                     .await?;
                 if answer.status != 200 {
                     refused(&answer, &dropped)
@@ -1522,14 +1717,21 @@ impl Work {
                 } else {
                     (0, length.saturating_sub(1))
                 };
-                let headers: Vec<(&str, String)> = if self.kind == Kind::Range {
-                    vec![("range", format!("bytes={from}-{to}"))]
-                } else {
-                    Vec::new()
+                let range = (self.kind == Kind::Range).then(|| format!("bytes={from}-{to}"));
+                let ranged;
+                let headers: &[(&str, &str)] = match &range {
+                    Some(range) => {
+                        ranged = [("range", range.as_str())];
+                        &ranged
+                    }
+                    None => &[],
                 };
-                let head = signer.head(at, ("GET", &path, ""), &headers, sigv4::EMPTY_SHA256)?;
-                let mut sink = Aside(Checked::starting(object, mantle_client::PIECE, from));
-                let answer = http.ask(&head, &Body::None, false, &mut sink).await?;
+                let request = Request {
+                    headers,
+                    ..Request::bare("GET", &path, "")
+                };
+                let mut sink = Aside(Checked::starting(object, scratch, from));
+                let answer = http.ask(&request, &Body::None, false, &mut sink).await?;
                 let end = if length == 0 { 0 } else { to.saturating_add(1) };
                 let expected = if self.kind == Kind::Range { 206 } else { 200 };
                 if answer.status != expected {
@@ -1539,8 +1741,8 @@ impl Work {
                 }
             }
             Kind::Head => {
-                let head = signer.head(at, ("HEAD", &path, ""), &[], sigv4::EMPTY_SHA256)?;
-                let answer = http.ask(&head, &Body::None, true, &mut dropped).await?;
+                let request = Request::bare("HEAD", &path, "");
+                let answer = http.ask(&request, &Body::None, true, &mut dropped).await?;
                 if answer.status != 200 {
                     refused(&answer, &dropped)
                 } else if answer.length != Some(length) {
@@ -1557,8 +1759,8 @@ impl Work {
                     (Kind::Abort, None) => return Ok(Came::Refused("no upload created".into())),
                     _ => String::new(),
                 };
-                let head = signer.head(at, ("DELETE", &path, &query), &[], sigv4::EMPTY_SHA256)?;
-                let answer = http.ask(&head, &Body::None, false, &mut dropped).await?;
+                let request = Request::bare("DELETE", &path, &query);
+                let answer = http.ask(&request, &Body::None, false, &mut dropped).await?;
                 if answer.status != 204 {
                     refused(&answer, &dropped)
                 } else {
@@ -1566,10 +1768,9 @@ impl Work {
                 }
             }
             Kind::Create => {
-                let head =
-                    signer.head(at, ("POST", &path, "uploads="), &[], sigv4::EMPTY_SHA256)?;
+                let request = Request::bare("POST", &path, "uploads=");
                 let mut kept = Kept(Vec::new());
-                let answer = http.ask(&head, &Body::None, false, &mut kept).await?;
+                let answer = http.ask(&request, &Body::None, false, &mut kept).await?;
                 let text = String::from_utf8_lossy(&kept.0);
                 match element(&text, "UploadId") {
                     Some(id) if answer.status == 200 => {
@@ -1593,9 +1794,9 @@ impl Work {
                     return Ok(Came::Refused("no part uploaded".into()));
                 }
                 let query = format!("uploadId={}", sigv4::uri_encode(upload.id.as_bytes(), true));
-                let head = signer.head(at, ("GET", &path, &query), &[], sigv4::EMPTY_SHA256)?;
+                let request = Request::bare("GET", &path, &query);
                 let mut kept = Kept(Vec::new());
-                let answer = http.ask(&head, &Body::None, false, &mut kept).await?;
+                let answer = http.ask(&request, &Body::None, false, &mut kept).await?;
                 let parts = String::from_utf8_lossy(&kept.0).matches("<Part>").count();
                 if answer.status != 200 {
                     refused(&answer, &kept)
@@ -1617,15 +1818,14 @@ impl Work {
                 let body = format!(
                     "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"{part}\"</ETag></Part></CompleteMultipartUpload>"
                 );
-                let head = signer.head(
-                    at,
-                    ("POST", &path, &query),
-                    &[("content-length", body.len().to_string())],
-                    unsigned,
-                )?;
+                let request = Request {
+                    payload: unsigned,
+                    length: Length::Known(u64::try_from(body.len()).map_err(failed)?),
+                    ..Request::bare("POST", &path, &query)
+                };
                 let mut kept = Kept(Vec::new());
                 let answer = http
-                    .ask(&head, &Body::Text(body.as_bytes()), false, &mut kept)
+                    .ask(&request, &Body::Text(body.as_bytes()), false, &mut kept)
                     .await?;
                 let text = String::from_utf8_lossy(&kept.0);
                 // The ETag's quotes as XML may escape them: `&quot;` or `&#34;`.
@@ -1645,23 +1845,27 @@ impl Work {
     }
 
     /// The listing's next page, from where the last one ended; its keys are counted, and once it
-    /// ends their number is checked against the objects acknowledged.
-    async fn list(&self, conn: &mut Conn) -> Result<Came, Error> {
+    /// ends their number is checked against the objects acknowledged. The set's prefix is written
+    /// into the client's key buffer, and where the page starts is moved out of the listing and the
+    /// next page's moved in, so the harness allocates nothing for a page.
+    async fn list(&self, conn: &mut Conn, prefix: &mut String) -> Result<Came, Error> {
         let Keys::Set { count, .. } = self.keys else {
             return Ok(Came::Failed("a listing of no set".into()));
         };
-        let prefix = format!("set{count}/");
-        let Paging {
-            next: start, ended, ..
-        } = self.listing.borrow().clone();
-        if ended {
+        let start = harness(|| {
+            let mut listing = self.listing.borrow_mut();
+            (!listing.ended).then(|| listing.next.take())
+        });
+        let Some(start) = start else {
             return Ok(Came::Done);
-        }
+        };
+        harness(|| write_key(prefix, format_args!("set{count}/")))?;
+        let prefix = prefix.as_str();
         let (keys, next) = match conn {
             Conn::Native(client) => {
                 let op = Op::List(List {
                     bucket: BUCKET.to_owned(),
-                    prefix,
+                    prefix: prefix.to_owned(),
                     delimiter: String::new(),
                     start: match start {
                         Some(Next::Native(resume)) => Some(resume),
@@ -1698,14 +1902,16 @@ impl Work {
                     "list-type=2{token}&max-keys={PAGE}&prefix={}",
                     sigv4::uri_encode(prefix.as_bytes(), true)
                 );
-                let head = http.signer.head(
-                    http.at,
-                    ("GET", &format!("/{}", http.signer.bucket), &query),
-                    &[],
-                    sigv4::EMPTY_SHA256,
-                )?;
+                let path = format!("/{}", http.signer.bucket);
                 let mut kept = Kept(Vec::new());
-                let answer = http.ask(&head, &Body::None, false, &mut kept).await?;
+                let answer = http
+                    .ask(
+                        &Request::bare("GET", &path, &query),
+                        &Body::None,
+                        false,
+                        &mut kept,
+                    )
+                    .await?;
                 let text = String::from_utf8_lossy(&kept.0);
                 if answer.status != 200 {
                     return Ok(Came::Refused(format!(
@@ -1723,15 +1929,17 @@ impl Work {
             }
         };
         let keys = u64::try_from(keys).map_err(failed)?;
-        let Paging { ended, listed, .. } = harness(|| {
+        let (ended, listed, acknowledged) = harness(|| {
             let mut listing = self.listing.borrow_mut();
             listing.listed = listing.listed.saturating_add(keys);
             listing.ended = next.is_none();
             listing.next = next;
-            listing.clone()
+            (
+                listing.ended,
+                listing.listed,
+                self.oracle.borrow().acknowledged(),
+            )
         });
-        let acknowledged = harness(|| (0..count).filter(|i| self.oracle.borrow().has(*i)).count());
-        let acknowledged = u64::try_from(acknowledged).map_err(failed)?;
         Ok(if ended && listed != acknowledged {
             Came::Failed(format!("{listed} keys listed, {acknowledged} acknowledged"))
         } else {
@@ -1750,8 +1958,8 @@ struct Bench<'o> {
     listeners: Vec<SocketAddr>,
     signer: Rc<Signer>,
     generator: Rc<Generator>,
-    /// Each door's connections between the steps that use them, each with when it was put back.
-    pools: [Vec<(Conn, Instant)>; 2],
+    /// Each door's clients between the steps that use them, each with when it was put back.
+    pools: [Vec<(Logical, Instant)>; 2],
     /// The native clients the cell admits at once: each node's `gateway.clients` identities.
     native_most: usize,
     /// Connections each door opened: its handshakes.
@@ -1760,6 +1968,12 @@ struct Bench<'o> {
     exact: bool,
     ops: u64,
     failures: u64,
+    /// Of the failures, the reads whose bytes or length differed from what was put.
+    differed: u64,
+    /// The most the harness's own work held in any phase, set aside (a counting build's).
+    harness_peak: i64,
+    /// The most threads the process ran in any phase.
+    threads: usize,
     phases: u64,
 }
 
@@ -1832,9 +2046,11 @@ struct Measured<'a> {
     clients: usize,
     elapsed_ns: u64,
     tally: Tally,
-    harness: Option<Counts>,
+    /// What the harness's thread allocated for the doors, its own work set aside, and what that
+    /// work came to: in a counting build.
+    harness: Option<(Counts, Counts)>,
     generator_ns: u64,
-    wire: Option<u64>,
+    wire: Wire,
     again: u64,
     /// `perf stat`'s counts across the phase, where `--perf` counted them.
     perf: Option<Counters>,
@@ -1896,8 +2112,8 @@ impl<'o> Bench<'o> {
         }
     }
 
-    /// `want` connections of `door` held, more opened as needed, each answered a first request.
-    fn hold(&mut self, door: Door, want: usize) -> Result<Vec<Conn>, Error> {
+    /// `want` clients of `door` held, more opened as needed, each answered a first request.
+    fn hold(&mut self, door: Door, want: usize) -> Result<Vec<Logical>, Error> {
         let pool = self
             .pools
             .get_mut(door.at())
@@ -1911,27 +2127,27 @@ impl<'o> Bench<'o> {
         // and another opened. An HTTP connection the server closed is opened again by `Http`.
         let idle = mantle_protocol::bounds::idle_timeout();
         let stale = idle.checked_div(2).unwrap_or(idle);
-        let mut conns = Vec::new();
+        let mut held = Vec::new();
         let mut closing = Vec::new();
-        for (conn, put_back) in pool.drain(..want.min(pool.len())) {
-            if matches!(conn, Conn::Native(_)) && put_back.elapsed() >= stale {
-                closing.push(conn);
+        for (logical, put_back) in pool.drain(..want.min(pool.len())) {
+            if matches!(logical.conn, Conn::Native(_)) && put_back.elapsed() >= stale {
+                closing.push(logical);
             } else {
-                conns.push(conn);
+                held.push(logical);
             }
         }
         self.release(closing)?;
-        let more = want.saturating_sub(conns.len());
+        let more = want.saturating_sub(held.len());
         if more > 0 {
             let opened = self.open(door, more)?;
-            conns.extend(opened.into_iter().map(|(conn, _)| conn));
+            held.extend(opened.into_iter().map(|(logical, _)| logical));
         }
-        Ok(conns)
+        Ok(held)
     }
 
-    /// `n` connections of `door` opened in turn, each answered a first request (a HEAD of a key
-    /// never put): each with its time from its opening to that answer.
-    fn open(&mut self, door: Door, n: usize) -> Result<Vec<(Conn, u64)>, Error> {
+    /// `n` clients of `door` opened in turn, each answered a first request (a HEAD of a key never
+    /// put): each with its time from its opening to that answer.
+    fn open(&mut self, door: Door, n: usize) -> Result<Vec<(Logical, u64)>, Error> {
         let mut made = Vec::with_capacity(n);
         let first = usize::try_from(self.opened.get(door.at()).copied().unwrap_or(0)).unwrap_or(0);
         let spread = match door {
@@ -1962,14 +2178,14 @@ impl<'o> Bench<'o> {
                     Opening::Http(Box::new(Http::new(listener, Rc::clone(&self.signer))))
                 }
             };
-            let opened = self
+            let (conn, took) = self
                 .rt
                 .block_on(conn.open())
                 .map_err(|e| failed(format!("{e:?}")))??;
             if let Some(count) = self.opened.get_mut(door.at()) {
                 *count = count.saturating_add(1);
             }
-            made.push(opened);
+            made.push((Logical::new(conn), took));
         }
         Ok(made)
     }
@@ -2001,15 +2217,9 @@ impl<'o> Bench<'o> {
         (size, clients): (&str, usize),
         (from, end): (u64, u64),
     ) -> Result<(u64, f64), Error> {
-        let conns = self.hold(work.door, clients)?;
-        let wire_before: u64 = conns
-            .iter()
-            .map(|c| if let Conn::Http(h) = c { h.wire } else { 0 })
-            .sum();
-        let opened_before: u64 = conns
-            .iter()
-            .map(|c| if let Conn::Http(h) = c { h.opened } else { 0 })
-            .sum();
+        let held = self.hold(work.door, clients)?;
+        let wire_before = wired(&held);
+        let opened_before = reopened(&held);
         self.phases = self.phases.saturating_add(1);
         let seed = self.options.seed.wrapping_add(self.phases);
         let before = self.servers()?;
@@ -2025,7 +2235,7 @@ impl<'o> Bench<'o> {
         let cpu = drive::cpu();
         alloc::begin();
         let ran = self.rt.block_on(phase(
-            conns,
+            held,
             Rc::clone(work),
             (self.options.load, seed, from, end),
         ));
@@ -2035,24 +2245,20 @@ impl<'o> Bench<'o> {
             u64::try_from(drive::cpu().saturating_sub(cpu).as_nanos()).unwrap_or(u64::MAX);
         let elapsed_ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let perf = perf.map(Perf::end).transpose()?;
-        let (conns, tally) = ran.map_err(|e| failed(format!("{e:?}")))??;
+        let (held, tally) = ran.map_err(|e| failed(format!("{e:?}")))??;
         let after = self.servers()?;
-        let wire = conns
-            .iter()
-            .map(|c| if let Conn::Http(h) = c { h.wire } else { 0 })
-            .sum::<u64>()
-            .saturating_sub(wire_before);
-        let reopened = conns
-            .iter()
-            .map(|c| if let Conn::Http(h) = c { h.opened } else { 0 })
-            .sum::<u64>()
-            .saturating_sub(opened_before);
+        let wire_after = wired(&held);
+        let wire = Wire {
+            bytes: wire_after.bytes.saturating_sub(wire_before.bytes),
+            datagrams: wire_after.datagrams.saturating_sub(wire_before.datagrams),
+        };
+        let reopened = reopened(&held).saturating_sub(opened_before);
         if let Some(count) = self.opened.get_mut(work.door.at()) {
             *count = count.saturating_add(reopened);
         }
         if let Some(pool) = self.pools.get_mut(work.door.at()) {
             let now = Instant::now();
-            pool.extend(conns.into_iter().map(|conn| (conn, now)));
+            pool.extend(held.into_iter().map(|logical| (logical, now)));
         }
         let ops = tally.ops;
         let rate = ops as f64 / (elapsed_ns.max(1) as f64 / 1e9);
@@ -2063,7 +2269,12 @@ impl<'o> Bench<'o> {
         self.ops = self.ops.saturating_add(ops);
         if !excluded {
             self.failures = self.failures.saturating_add(tally.failed);
+            self.differed = self.differed.saturating_add(tally.differed);
             self.exact &= tally.failed == 0;
+        }
+        self.threads = self.threads.max(tally.threads);
+        if self.counting {
+            self.harness_peak = self.harness_peak.max(aside.peak);
         }
         let measured = Measured {
             door: work.door,
@@ -2072,13 +2283,9 @@ impl<'o> Bench<'o> {
             clients,
             elapsed_ns,
             tally,
-            harness: self.counting.then(|| total.less(&aside)),
+            harness: self.counting.then(|| (total.less(&aside), aside)),
             generator_ns,
-            wire: if work.door == Door::Http {
-                Some(wire)
-            } else {
-                None
-            },
+            wire,
             again: work.again.replace(0),
             perf,
             excluded,
@@ -2115,17 +2322,33 @@ impl<'o> Bench<'o> {
                     .map(|(a, b)| f(&a.as_ref()?.since(b.as_ref()?)).map(|v| v as f64)),
             )
         };
+        // Each server's peak live heap over the phase, above what it held as the phase began (its
+        // count restarts at each read), summed: the most the cell could have held for the phase
+        // at once, an upper bound.
         let peak = summed(after.counts.iter().map(|c| c.peak.map(|p| p.max(0) as f64)));
+        let footprint = summed(
+            after
+                .usage
+                .iter()
+                .map(|u| u.as_ref().and_then(|u| u.footprint).map(|f| f as f64)),
+        );
         let perf = |f: fn(&Counters) -> Option<u64>| m.perf.as_ref().and_then(f).map(|v| v as f64);
         let clients = u64::try_from(m.clients).unwrap_or(u64::MAX);
-        let mine = |f: fn(&Counts) -> u64| m.harness.as_ref().map(|c| f(c) as f64);
+        let most = u64::try_from(m.tally.most).unwrap_or(u64::MAX);
+        let mine = |f: fn(&Counts) -> u64| m.harness.as_ref().map(|(doors, _)| f(doors) as f64);
+        let own = |f: fn(&Counts) -> i64| {
+            m.harness
+                .as_ref()
+                .map_or_else(|| "-".to_owned(), |(_, own)| f(own).max(0).to_string())
+        };
         let open = matches!(self.options.load, Load::Open(_));
         let t = &m.tally;
         writeln!(
             out,
             "doors {} {} {} {} clients {} elapsed_ms {} ops {ops} allocs/op {} reallocs/op {} moved/op {} bytes/op {} peak_live/request {} peak_live/connection {} \
              client_allocs/op {} client_bytes/op {} minor_faults/op {} major_faults/op {} user_ns/op {} system_ns/op {} instructions/op {} cycles/op {} switches/op {} \
-             wire_bytes/op {} datagrams/op - latency_us p50 {} p50_95 {} p99 {} p99.9 {} p99.99 {} max {} generator_cpu_ns/op {} lateness_us p99 {} again {} failed {}",
+             wire_bytes/op {} datagrams/op {} server_footprint_bytes {} harness_allocs/op {} harness_peak_live_bytes {} out_most {} threads {} \
+             latency_us p50 {} p50_95 {} p99 {} p99.9 {} p99.99 {} max {} generator_cpu_ns/op {} lateness_us p99 {} differed {} again {} failed {}",
             self.named(m.door),
             m.kind.name(),
             m.size,
@@ -2136,7 +2359,7 @@ impl<'o> Bench<'o> {
             per(counted(|c| c.reallocations), ops),
             per(counted(|c| c.moved), ops),
             per(counted(|c| c.bytes), ops),
-            per(peak, clients),
+            per(peak, most),
             per(peak, clients),
             per(mine(|c| c.allocations), ops),
             per(mine(|c| c.bytes), ops),
@@ -2150,7 +2373,19 @@ impl<'o> Bench<'o> {
             ),
             per(perf(|p| p.cycles).or(charged(|u| u.cycles)), ops),
             per(grew(|c| c.switches), ops),
-            per(m.wire.map(|w| w as f64), ops),
+            per(Some(m.wire.bytes as f64), ops),
+            match m.door {
+                Door::Native => per(Some(m.wire.datagrams as f64), ops),
+                Door::Http => "-".to_owned(),
+            },
+            footprint.map_or_else(|| "-".to_owned(), |f| format!("{f:.0}")),
+            per(
+                m.harness.as_ref().map(|(_, own)| own.allocations as f64),
+                ops
+            ),
+            own(|c| c.peak),
+            t.most,
+            t.threads,
             quantile(&t.latency, Level::P50, 500_000),
             median_interval(&t.latency),
             quantile(&t.latency, Level::P99, 990_000),
@@ -2167,6 +2402,7 @@ impl<'o> Bench<'o> {
             } else {
                 "-".to_owned()
             },
+            t.differed,
             m.again,
             t.failed,
         )?;
@@ -2234,11 +2470,11 @@ impl<'o> Bench<'o> {
         .max(1)
     }
 
-    /// Drops `door`'s connections on the runtime, where a native client's drop tells its node it
+    /// Drops `door`'s clients on the runtime, where a native client's drop tells its node it
     /// closed (QUIC's CONNECTION_CLOSE), so the node frees its identity at once.
-    fn release(&mut self, conns: Vec<Conn>) -> Result<(), Error> {
+    fn release(&mut self, clients: Vec<Logical>) -> Result<(), Error> {
         self.rt
-            .block_on(async move { drop(conns) })
+            .block_on(async move { drop(clients) })
             .map_err(|e| failed(format!("{e:?}")))
     }
 
@@ -2269,7 +2505,7 @@ impl<'o> Bench<'o> {
             .map(|i| {
                 let object = self
                     .generator
-                    .object(&sized_key(door, size, kind, i))
+                    .object(&sized_key(door, size, kind, i)?)
                     .map_err(failed)?;
                 md5(&object, size, &mut piece)
             })
@@ -2509,14 +2745,14 @@ impl Opening {
                 Conn::Native(Box::new(client))
             }
             Self::Http(mut http) => {
-                let head = http.signer.head(
-                    http.at,
-                    ("HEAD", &format!("/{}/{NEVER_PUT}", http.signer.bucket), ""),
-                    &[],
-                    sigv4::EMPTY_SHA256,
-                )?;
+                let path = format!("/{}/{NEVER_PUT}", http.signer.bucket);
                 let answer = http
-                    .ask(&head, &Body::None, true, &mut Kept(Vec::new()))
+                    .ask(
+                        &Request::bare("HEAD", &path, ""),
+                        &Body::None,
+                        true,
+                        &mut Kept(Vec::new()),
+                    )
                     .await?;
                 if answer.status != 404 {
                     return Err(failed(format!(
@@ -2683,8 +2919,12 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
         exact: true,
         ops: 0,
         failures: 0,
+        differed: 0,
+        harness_peak: 0,
+        threads: 0,
         phases: 0,
     };
+    let idle = drive::thread_count();
     bench.create()?;
     let doors = bench.doors();
     for &door in doors {
@@ -2707,11 +2947,21 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
         "doors handshakes native {} http {}",
         bench.opened[0], bench.opened[1]
     )?;
+    writeln!(
+        out,
+        "doors harness peak_live_bytes {} threads {} idle_threads {idle}",
+        if bench.counting {
+            bench.harness_peak.max(0).to_string()
+        } else {
+            "-".to_owned()
+        },
+        bench.threads,
+    )?;
     let controls = u32::try_from(doors.len()).unwrap_or(0).saturating_mul(3);
     writeln!(
         out,
-        "doors verified ops {} failed {} controls caught {caught} of {controls}",
-        bench.ops, bench.failures
+        "doors verified ops {} differed {} failed {} controls caught {caught} of {controls}",
+        bench.ops, bench.differed, bench.failures
     )?;
     Ok(bench.exact && caught == controls)
 }
@@ -2726,17 +2976,16 @@ impl Bench<'_> {
                 .first()
                 .ok_or_else(|| failed("no listener"))?;
             let mut http = Http::new(at, Rc::clone(&self.signer));
-            let head = http.signer.head(
-                at,
-                ("PUT", &format!("/{}", http.signer.bucket), ""),
-                &[("content-length", "0".to_owned())],
-                sigv4::EMPTY_SHA256,
-            )?;
+            let path = format!("/{}", http.signer.bucket);
             let answer = self
                 .rt
                 .block_on(async move {
                     let mut kept = Kept(Vec::new());
-                    let answer = http.ask(&head, &Body::None, false, &mut kept).await?;
+                    let request = Request {
+                        length: Length::Known(0),
+                        ..Request::bare("PUT", &path, "")
+                    };
+                    let answer = http.ask(&request, &Body::None, false, &mut kept).await?;
                     Ok::<_, Error>((answer.status, String::from_utf8_lossy(&kept.0).into_owned()))
                 })
                 .map_err(|e| failed(format!("{e:?}")))??;
@@ -2769,8 +3018,8 @@ impl Bench<'_> {
     /// flipped on its way to the check, a key never put, and an ETag expected of another object.
     /// The controls caught.
     fn controls(&mut self, out: &mut impl Write, door: Door) -> Result<u32, Error> {
-        let mut conns = self.hold(door, 1)?;
-        let conn = conns.pop().ok_or_else(|| failed("no connection"))?;
+        let mut held = self.hold(door, 1)?;
+        let logical = held.pop().ok_or_else(|| failed("no connection"))?;
         let generator = Rc::clone(&self.generator);
         let mut piece = vec![0u8; mantle_client::PIECE];
         let other = md5(
@@ -2788,14 +3037,15 @@ impl Bench<'_> {
             },
         )?);
         let flip = CONTROL.checked_div(2).unwrap_or(0);
-        let (conn, said) = self
+        let (logical, said) = self
             .rt
             .block_on(async move {
-                let mut conn = conn;
+                let mut logical = logical;
                 for name in ['a', 'b'] {
                     let key = control_key(door, name);
                     let object = generator.object(&key).map_err(failed)?;
-                    let put = match &mut conn {
+                    let Logical { conn, scratch, .. } = &mut logical;
+                    let put = match conn {
                         Conn::Native(client) => {
                             work.native(
                                 client,
@@ -2806,16 +3056,18 @@ impl Bench<'_> {
                                     mantle_client::identity().map_err(failed)?,
                                 ),
                                 &object,
+                                scratch,
                             )
                             .await?
                         }
                         Conn::Http(http) => {
-                            work.http(http, (u64::MAX, &key, CONTROL), &object).await?
+                            work.http(http, (u64::MAX, &key, CONTROL), &object, scratch)
+                                .await?
                         }
                     };
                     match put {
                         Came::Done => {}
-                        Came::Failed(why) | Came::Refused(why) => {
+                        Came::Failed(why) | Came::Refused(why) | Came::Differed(why) => {
                             return Err(failed(format!(
                                 "a control's object was not put through the {} door: {why}",
                                 door.name()
@@ -2837,15 +3089,16 @@ impl Bench<'_> {
                 }
                 let key = control_key(door, 'a');
                 let object = generator.object(&key).map_err(failed)?;
-                let flipped = read(&mut conn, &key, &object, Some(flip)).await?;
+                let Logical { conn, scratch, .. } = &mut logical;
+                let flipped = read(conn, &key, (&object, scratch), Some(flip)).await?;
                 let never = generator.object(NEVER_PUT).map_err(failed)?;
-                let missing = read(&mut conn, NEVER_PUT, &never, None).await?;
-                let etag = head_etag(&mut conn, &key).await?;
-                Ok((conn, [flipped, missing, etag]))
+                let missing = read(conn, NEVER_PUT, (&never, scratch), None).await?;
+                let etag = head_etag(conn, &key).await?;
+                Ok((logical, [flipped, missing, etag]))
             })
             .map_err(|e| failed(format!("{e:?}")))??;
         if let Some(pool) = self.pools.get_mut(door.at()) {
-            pool.push((conn, Instant::now()));
+            pool.push((logical, Instant::now()));
         }
         let [flipped, missing, etag] = said;
         let expected = checksum::etag(&other);
@@ -2897,7 +3150,7 @@ impl Bench<'_> {
             .get_mut(door.at())
             .map(std::mem::take)
             .unwrap_or_default();
-        self.release(held.into_iter().map(|(conn, _)| conn).collect())?;
+        self.release(held.into_iter().map(|(logical, _)| logical).collect())?;
         // The native door's points: a client on each node, and as many as the cell admits.
         let (low_count, high_count) = match door {
             Door::Native => (cell::FOUNDERS, self.native_most),
@@ -2916,7 +3169,12 @@ impl Bench<'_> {
         let before = self.servers()?;
         alloc::begin();
         let more = self.open(door, high_count.saturating_sub(low_count))?;
-        let client = alloc::end();
+        let total = alloc::end();
+        // The buffers each logical client is made with are the harness's own, set aside: what the
+        // doors' connections hold on this side is the rest.
+        let aside = alloc::read_aside();
+        let client = total.less(&aside);
+        let client_live = total.live.saturating_sub(aside.live);
         let after = self.servers()?;
         let mut took = Histogram::new();
         for (_, ns) in &more {
@@ -2945,7 +3203,7 @@ impl Bench<'_> {
             self.options.condition,
             per(live, added),
             per(footprint, added),
-            per(mine(client.live as f64), added),
+            per(mine(client_live as f64), added),
         )?;
         writeln!(
             out,
@@ -2959,7 +3217,11 @@ impl Bench<'_> {
             quantile(&took, Level::P50, 500_000),
             micros(took.max()),
         )?;
-        let all = low.into_iter().chain(more).map(|(conn, _)| conn).collect();
+        let all = low
+            .into_iter()
+            .chain(more)
+            .map(|(logical, _)| logical)
+            .collect();
         self.release(all)
     }
 }
@@ -3093,15 +3355,15 @@ impl std::fmt::Display for Read {
     }
 }
 
-/// Reads `key` whole through `conn`, checked against `object`, the byte at `flip` inverted on its
-/// way to the check where given.
+/// Reads `key` whole through `conn`, checked against `object` a piece of `scratch` at a time, the
+/// byte at `flip` inverted on its way to the check where given.
 async fn read(
     conn: &mut Conn,
     key: &str,
-    object: &Object<'_>,
+    (object, scratch): (&Object<'_>, &mut [u8]),
     flip: Option<u64>,
 ) -> Result<Read, Error> {
-    let mut sink = Flipped::new(object, mantle_client::PIECE, flip.unwrap_or(u64::MAX));
+    let mut sink = Flipped::new(object, scratch, flip.unwrap_or(u64::MAX));
     let found = match conn {
         Conn::Native(client) => {
             let op = Op::Get {
@@ -3117,14 +3379,16 @@ async fn read(
             }
         }
         Conn::Http(http) => {
-            let head = http.signer.head(
-                http.at,
-                ("GET", &format!("/{}/{key}", http.signer.bucket), ""),
-                &[],
-                sigv4::EMPTY_SHA256,
-            )?;
+            let path = format!("/{}/{key}", http.signer.bucket);
             // A refusal's body goes to the check as well, which judges only a 200's.
-            let answer = http.ask(&head, &Body::None, false, &mut sink).await?;
+            let answer = http
+                .ask(
+                    &Request::bare("GET", &path, ""),
+                    &Body::None,
+                    false,
+                    &mut sink,
+                )
+                .await?;
             match answer.status {
                 200 => None,
                 404 => Some(Read::Missing),
@@ -3155,14 +3419,14 @@ async fn head_etag(conn: &mut Conn, key: &str) -> Result<Read, Error> {
             }
         }
         Conn::Http(http) => {
-            let head = http.signer.head(
-                http.at,
-                ("HEAD", &format!("/{}/{key}", http.signer.bucket), ""),
-                &[],
-                sigv4::EMPTY_SHA256,
-            )?;
+            let path = format!("/{}/{key}", http.signer.bucket);
             let answer = http
-                .ask(&head, &Body::None, true, &mut Kept(Vec::new()))
+                .ask(
+                    &Request::bare("HEAD", &path, ""),
+                    &Body::None,
+                    true,
+                    &mut Kept(Vec::new()),
+                )
                 .await?;
             match answer.etag {
                 Some(etag) if answer.status == 200 => Read::Etag(etag),
@@ -3177,7 +3441,12 @@ mod tests {
     use super::*;
 
     /// A seed and a name make the same bytes each time, and another name other bytes: what every
-    /// read is checked against.
+    /// read is checked against. The bytes are the ones AES-256-CTR makes under the key and counter
+    /// the generator derives (research/76), as another implementation made them (LibreSSL 3.3.6's
+    /// `openssl enc -aes-256-ctr` over zeros, its key SHA-256 of the key domain and the seed's eight
+    /// big-endian octets, its IV the first 16 octets of SHA-256 of the counter domain and the
+    /// name), so every target is held to the same bytes, and a name longer than any S3 key is
+    /// refused.
     #[test]
     fn the_generator_gives_a_seed_and_names_bytes_again() {
         let (a, b) = (Generator::new(5).unwrap(), Generator::new(5).unwrap());
@@ -3192,6 +3461,14 @@ mod tests {
             .fill(0, &mut two)
             .unwrap();
         assert_eq!(one, two);
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        assert_eq!(hex(&one[..16]), "40104471352f49cbc6b0cda094431a47");
+        let mut within = [0u8; 20];
+        a.object("native/65536/p3")
+            .unwrap()
+            .fill(65_530, &mut within)
+            .unwrap();
+        assert_eq!(hex(&within), "4c106b5c6beafe5c3e6b9e4cee828c49c4c64a61");
         b.object("native/65536/p4")
             .unwrap()
             .fill(0, &mut two)
@@ -3199,17 +3476,84 @@ mod tests {
         assert_ne!(one, two);
         let mut piece = vec![0u8; 4096];
         let object = a.object("native/65536/p3").unwrap();
+        let whole = md5(&object, 70_000, &mut piece).unwrap();
+        assert_eq!(hex(&whole), "d3cd765e733efc102a00af6c9ddaa06c");
+        assert_eq!(whole, md5(&object, 70_000, &mut vec![0u8; 999]).unwrap());
+        let longest = "k".repeat(mantle_s3::route::MAX_KEY);
+        assert!(a.object(&longest).is_ok());
+        assert!(matches!(
+            a.object(&format!("{longest}k")),
+            Err(crate::transfer::generate::GenError::Name)
+        ));
+    }
+
+    /// An operation's own work allocates nothing of the harness's, whatever its key: the key is
+    /// written into its client's buffer, its object made from the generator on the stack, and its
+    /// read checked in its client's scratch, so the harness holds no more for a set of 100,000
+    /// objects than for one of 1,000, nor for more clients. Over a size's operations and a
+    /// 100,000-object set's, from their first keys to their last and longest, each read checked
+    /// whole, nothing is allocated.
+    #[test]
+    fn an_operations_own_work_allocates_nothing() {
+        assert!(alloc::installed(), "the unit tests count allocations");
+        let generator = Rc::new(Generator::new(9).unwrap());
+        let mut oracle = Oracle::new(100_000).unwrap();
+        for i in 0..100_000 {
+            oracle.set(i);
+        }
+        assert_eq!(oracle.acknowledged(), 100_000);
+        let work = |keys: Keys| Work {
+            door: Door::Native,
+            kind: Kind::Get,
+            keys,
+            generator: Rc::clone(&generator),
+            etags: Rc::new(Vec::new()),
+            uploads: Rc::new(RefCell::new(Vec::new())),
+            oracle: Rc::new(RefCell::new(oracle.clone())),
+            listing: Rc::new(RefCell::new(Paging::default())),
+            again: std::cell::Cell::new(0),
+        };
+        let sized = work(Keys::Sized {
+            size: 1_000,
+            kind: 'p',
+            made: Some(1_000_000),
+        });
+        let set = work(Keys::Set {
+            count: 100_000,
+            own: Door::Http,
+        });
+        let mut key = String::with_capacity(mantle_s3::route::MAX_KEY);
+        let mut scratch = vec![0u8; mantle_client::PIECE];
+        // A set's objects are below S3's small-object line, 128 KiB (`transfer::size`).
+        let mut bytes = vec![0u8; 128 << 10];
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        alloc::begin();
+        for j in (0..100u64).chain(49_900..50_000) {
+            for work in [&sized, &set] {
+                let (_, length) = work.key(j, &mut key).unwrap().unwrap();
+                let object = work.generator.object(&key).unwrap();
+                let read = bytes.get_mut(..usize::try_from(length).unwrap()).unwrap();
+                object.fill(0, read).unwrap();
+                let mut checked = Checked::new(&object, &mut scratch);
+                let wrote = std::pin::pin!(checked.write(read)).poll(&mut context);
+                assert!(matches!(wrote, std::task::Poll::Ready(Ok(()))));
+                assert_eq!((checked.wrong, checked.len()), (None, length));
+            }
+        }
+        let counted = alloc::end();
         assert_eq!(
-            md5(&object, 70_000, &mut piece).unwrap(),
-            md5(&object, 70_000, &mut vec![0u8; 999]).unwrap()
+            (counted.allocations, counted.reallocations, counted.bytes),
+            (0, 0, 0)
         );
+        assert_eq!(key, "set100000/99999");
     }
 
     /// A latency histogram holds its fixed buckets whatever it records: recording allocates
-    /// nothing (where this build counts allocations), its quantiles stay within the buckets'
-    /// one-sided 2^-5, and a value past its last bucket is held as its maximum.
+    /// nothing, its quantiles stay within the buckets' one-sided 2^-5, and a value past its last
+    /// bucket is held as its maximum.
     #[test]
     fn a_histogram_holds_no_more_than_its_buckets() {
+        assert!(alloc::installed(), "the unit tests count allocations");
         let mut latency = Histogram::new();
         let size = std::mem::size_of_val(&latency);
         alloc::begin();

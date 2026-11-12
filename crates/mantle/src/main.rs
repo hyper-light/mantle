@@ -39,8 +39,9 @@ mod transfer;
 
 // The allocation counts of `mantle serve`'s `counts` and of `mantle bench doors` are a diagnostic:
 // compiled in only with the `count-allocs` feature, so a timed build allocates through the system
-// allocator with nothing counted.
-#[cfg(feature = "count-allocs")]
+// allocator with nothing counted. The unit tests count too, so a test of what the bench's harness
+// allocates reads real counts in every build.
+#[cfg(any(test, feature = "count-allocs"))]
 #[global_allocator]
 static ALLOCATOR: hyper_measure::alloc::Counting = hyper_measure::alloc::Counting;
 

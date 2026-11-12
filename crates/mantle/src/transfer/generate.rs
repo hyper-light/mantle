@@ -31,6 +31,8 @@ const COUNTER_DOMAIN: &[u8] = b"mantle bench transfer: counter";
 pub enum GenError {
     Crypto,
     Offset,
+    /// A name longer than an S3 key may be (`mantle_s3::route::MAX_KEY`).
+    Name,
 }
 
 impl std::fmt::Display for GenError {
@@ -38,6 +40,7 @@ impl std::fmt::Display for GenError {
         f.write_str(match self {
             Self::Crypto => "the cryptographic library failed",
             Self::Offset => "an offset past what an object can address",
+            Self::Name => "a name longer than an S3 key may be",
         })
     }
 }
@@ -70,13 +73,27 @@ impl Generator {
     }
 
     /// The object named `name`: its counter starts at the first 16 bytes of the SHA-256 of the
-    /// name under the counter's domain, as a big-endian number.
+    /// name under the counter's domain, as a big-endian number. The domain and the name are hashed
+    /// from a buffer on the stack that holds any S3 key, so making an object allocates nothing: a
+    /// harness makes one an operation, and what it allocates there would grow with its keys.
     pub fn object(&self, name: &str) -> Result<Object<'_>, GenError> {
+        let mut input = [0u8; COUNTER_DOMAIN.len() + mantle_s3::route::MAX_KEY];
+        let domain = COUNTER_DOMAIN.len();
+        let end = domain
+            .checked_add(name.len())
+            .filter(|end| *end <= input.len())
+            .ok_or(GenError::Name)?;
+        input
+            .get_mut(..domain)
+            .ok_or(GenError::Name)?
+            .copy_from_slice(COUNTER_DOMAIN);
+        input
+            .get_mut(domain..end)
+            .ok_or(GenError::Name)?
+            .copy_from_slice(name.as_bytes());
+        let hashed = input.get(..end).ok_or(GenError::Name)?;
         let start = guarded(|| {
-            let mut input = Vec::with_capacity(COUNTER_DOMAIN.len().saturating_add(name.len()));
-            input.extend_from_slice(COUNTER_DOMAIN);
-            input.extend_from_slice(name.as_bytes());
-            let hashed = digest(&SHA256, &input);
+            let hashed = digest(&SHA256, hashed);
             let first: [u8; BLOCK] = hashed.as_ref().get(..BLOCK)?.try_into().ok()?;
             Some(u128::from_be_bytes(first))
         })?;

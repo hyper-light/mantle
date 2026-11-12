@@ -428,20 +428,28 @@ impl Natives {
     }
 }
 
-/// Which of a set's objects were put and acknowledged: a bit each, the set's one record of them.
+/// Which of a set's objects were put and acknowledged: a bit each, the set's one record of them,
+/// and how many, counted as each is set so a check of the number reads it once.
 #[derive(Clone)]
-pub(crate) struct Oracle(Vec<u64>);
+pub(crate) struct Oracle {
+    bits: Vec<u64>,
+    acknowledged: u64,
+}
 
 impl Oracle {
     pub(crate) fn new(count: u64) -> Result<Self, GenError> {
         let whole = count.checked_div(64).ok_or(GenError::Offset)?;
         let part = u64::from(count.checked_rem(64).ok_or(GenError::Offset)? != 0);
         let words = whole.checked_add(part).ok_or(GenError::Offset)?;
-        Ok(Self(vec![
-            0;
-            usize::try_from(words)
-                .map_err(|_| GenError::Offset)?
-        ]))
+        Ok(Self {
+            bits: vec![0; usize::try_from(words).map_err(|_| GenError::Offset)?],
+            acknowledged: 0,
+        })
+    }
+
+    /// The objects acknowledged.
+    pub(crate) fn acknowledged(&self) -> u64 {
+        self.acknowledged
     }
 
     fn word(i: u64) -> Option<(usize, u64)> {
@@ -452,14 +460,16 @@ impl Oracle {
 
     pub(crate) fn set(&mut self, i: u64) {
         if let Some((word, bit)) = Self::word(i)
-            && let Some(slot) = self.0.get_mut(word)
+            && let Some(slot) = self.bits.get_mut(word)
+            && *slot & bit == 0
         {
             *slot |= bit;
+            self.acknowledged = self.acknowledged.saturating_add(1);
         }
     }
 
     pub(crate) fn has(&self, i: u64) -> bool {
-        Self::word(i).is_some_and(|(word, bit)| self.0.get(word).is_some_and(|w| w & bit != 0))
+        Self::word(i).is_some_and(|(word, bit)| self.bits.get(word).is_some_and(|w| w & bit != 0))
     }
 }
 

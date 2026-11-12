@@ -298,14 +298,18 @@ stock clients stay the correctness suite.
   scale's sets, 100,000 by default with 10,000 beside it as the engine is reported at 100M and 10M
   keys (70 [10][14][15][16][17][18]).
 - **Measures per operation**: allocations, reallocations, moved reallocations, bytes asked, peak
-  live heap per request and per connection, minor and major faults, user and system CPU,
-  instructions and cycles where the OS counts them, context switches, wire bytes, datagrams on the
-  native door, and latency at p50, p99, p99.9, p99.99 and max from each request's intended start;
-  per connection, the memory slope at two connection counts (§10) and the handshake's counts
-  (70 [2][4][5]).
+  live heap per request and per connection (the servers' peak over a phase above what they held
+  as it began, over the most requests out at once and over the connections the phase held), minor
+  and major faults, user and system CPU, instructions and cycles where the OS counts them, context
+  switches, wire bytes (the native door's its clients' sockets' UDP payload, the HTTP door's octets
+  on TCP), datagrams on the native door, and latency at p50, p99, p99.9, p99.99 and max from each
+  request's intended start; per connection, the memory slope at two connection counts (§10) and
+  the handshake's counts (70 [2][4][5]).
 - **Instruments**: hyper-measure's counting allocator in `count-allocs` builds of `mantle serve`
-  and the harness only, the harness's own work set aside; each server's faults, CPU and footprint
-  read by pid; `perf stat` on the box; aws-lc's own heap seen through the footprint (70 [3][4]).
+  and the harness only, the harness's own work set aside, its peak said each phase beside the
+  threads its process runs as the OS counts them, neither growing with clients or objects; each
+  server's faults, CPU and footprint read by pid; `perf stat` on the box; aws-lc's own heap seen
+  through the footprint (70 [3][4]).
 - **Load**: open loop with Poisson arrivals by default and a closed ladder doubling while
   throughput grows up to the node's connection budget; an HTTP connection carries one request at a
   time; the generator reports its CPU and lateness (§10; 70 [6]).

@@ -7,7 +7,7 @@
 //! counted from the clients' start to their last answer, every turn taking the transport's events
 //! of their exchanges and the replicas' messages of their entries.
 //!
-//! A turn keeps the storage of what it takes across turns (research/80, step 5): the transport's
+//! A turn keeps the storage of what it takes across turns (research/71, step 5): the transport's
 //! events, the replicas it drives and the Raft messages they give, and the plane's messages its
 //! wait takes, which it copies into a buffer it keeps; the messages a drain of the plane finds it
 //! takes where they were opened, copying none. Each of those was a buffer taken or made and

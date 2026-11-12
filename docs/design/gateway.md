@@ -84,7 +84,7 @@ point:
    in the pool and the stream the object's storage class plans (storage-classes.md §5). A copy's
    chunks are the same bytes: the node's host hands every volume asked, its own and its peers',
    the one buffer the driver sealed, shared (`bytes::Bytes`), each written or sent from it, where
-   it copied the chunk for each (25.2 MB per 8 MiB PUT under three copies; research/80, step 5).
+   it copied the chunk for each (25.2 MB per 8 MiB PUT under three copies; research/71, step 5).
 4. **The block is recorded** in the Block range once every chunk is durable, with the file it
    was made for and a handover deadline (metadata.md §2, "Blocks never named"). A write is
    acknowledged only once durable on every copy its scheme stores (CLAUDE.md §6): the gateway
@@ -180,7 +180,7 @@ refusing a size that is not their sum or an ETag that does not name their number
 number, so the completion matches them in one walk along each, not a search of the list for
 each row. The list is built once and carried: the parts' ETags move from the request's list into
 the Complete, each checked equal to its row's, and the Complete is asked once with the list moved
-into it, where both were copied for up to 10,000 parts (research/80, step 7). The node asks every
+into it, where both were copied for up to 10,000 parts (research/71, step 7). The node asks every
 command a driver makes the same way, moved to its range once it has room for one more
 (`Node::command_room`), the request waiting whole for the next turn when it has not.
 
@@ -380,7 +380,7 @@ so, a GET of an object put in runs past 5 GiB was refused by the transport and f
    each segment opened where it lies, its plaintext laid after the range's part of the segment
    before over the tags (AWS-LC's `open_within`), so the block's part of the range is one run of
    that buffer, given out without another copy: one copy of each byte read, where each segment
-   was copied out to be opened and its plaintext copied again (three; `Get::finish`, research/80,
+   was copied out to be opened and its plaintext copied again (three; `Get::finish`, research/71,
    step 5).
 
 A GET holds at most `window` blocks, being read or read and waiting to be taken, a number

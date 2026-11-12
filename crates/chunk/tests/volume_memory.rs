@@ -98,7 +98,7 @@ fn a_volume_at_work_holds_at_most_its_stated_bytes() {
 /// A chunk handed over as the bytes a gateway shares with the chunk's other replicas is put from
 /// them: the putting thread asks the allocator for the chunk's checksum table, four bytes a block,
 /// and its answer's channel, and for none of its bytes, which the writer reads into its aligned
-/// buffer (research/80, step 5). The gateway's host copied a chunk for each replica it asked, the
+/// buffer (research/71, step 5). The gateway's host copied a chunk for each replica it asked, the
 /// local one included: 25.2 MB per 8 MiB PUT. The channel is measured beside the put, made as the
 /// put makes it: its counter and its slot, whose sizes are the platform's (16 bytes more on
 /// Windows, where the answer's error is larger). The put counted follows the volume's first: on

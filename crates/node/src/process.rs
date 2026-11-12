@@ -1358,7 +1358,7 @@ fn run_node(
 
 /// The S3 listener `keys` state, its door open on `node`: where it listens, its region, keys and
 /// TLS (node.md §4.1). It binds the address the keys state over TCP, a stated port that port, as an
-/// https authority serves TCP and QUIC on one (research/71); a stated port of 0 takes a TCP port
+/// https authority serves TCP and QUIC on one (research/84); a stated port of 0 takes a TCP port
 /// of its own, the UDP port QUIC was given saying nothing of the TCP port of the same number.
 /// Plain HTTP on a loopback address, TLS with the endpoint's certificate elsewhere. Its door holds
 /// a request for each connection the listener admits, so it refuses none for room: each waits
@@ -2379,7 +2379,7 @@ mod tests {
 
     /// A turn's link and status lines, written into the buffer the serve loop keeps: byte for byte
     /// the lines each said from a `String` of its own, and once the buffer has grown nothing is
-    /// asked of the allocator, where each line was a `String` and a flush's oneshot (research/80,
+    /// asked of the allocator, where each line was a `String` and a flush's oneshot (research/71,
     /// step 5).
     #[test]
     fn a_turns_lines_are_written_into_the_kept_buffer_as_each_was_said() {

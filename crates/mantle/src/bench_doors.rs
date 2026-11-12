@@ -1,6 +1,6 @@
 //! `mantle bench doors`: each operation's cost through both of mantle's doors, the native protocol
 //! (mantle-client) and the S3 listener, against a cell of three `mantle serve` processes this
-//! program makes and runs (docs/design/measurement.md §12; research/79). The load is mantle's own:
+//! program makes and runs (docs/design/measurement.md §12; research/70). The load is mantle's own:
 //! the native door's requests are mantle-client's, and the S3 listener's are written here, framed
 //! with mantle's HTTP codec where a request's framing is the codec's (an `aws-chunked` body's
 //! chunks and trailer; every response body's decoding) and signed with mantle-s3's SigV4. The

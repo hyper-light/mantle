@@ -23,7 +23,7 @@
 //! For S3 (node.md §1.5, §4) it draws the cell's first account, twelve digits, and its one access
 //! key, an id and a secret, from the OS, and writes the key on every founder, owner-only, under
 //! `keys/s3/`; it draws the S3 endpoint's own authority, ECDSA P-256 beside the cell's Ed25519, as
-//! stock clients verify it (`mantle_cert::endpoint_authority`; research/71), kept with the cell's,
+//! stock clients verify it (`mantle_cert::endpoint_authority`; research/84), kept with the cell's,
 //! and issues each founder's endpoint a certificate for the names and the address its clients dial.
 //! For the operator it writes OUT/s3: the key as AWS's shared credentials file, a config naming the
 //! endpoint where init can name it, and the endpoint's authority as PEM for that config's
@@ -195,7 +195,7 @@ impl Founder {
 
 impl Cell {
     /// The region its S3 endpoint serves: as stated, else S3's own default, us-east-1, the region
-    /// a bucket made with no constraint is in (S3 API Reference, CreateBucket; research/71).
+    /// a bucket made with no constraint is in (S3 API Reference, CreateBucket; research/84).
     pub fn region(&self) -> &str {
         self.region.as_deref().unwrap_or(DEFAULT_REGION)
     }
@@ -458,7 +458,7 @@ fn layer_name(layer: Layer) -> &'static str {
     }
 }
 
-/// The cell's first access key (research/71): the account it acts for, twelve decimal digits
+/// The cell's first access key (research/84): the account it acts for, twelve decimal digits
 /// (`mantle_s3::account::valid_id`); its id, twenty characters of RFC 4648's base32 alphabet, an id
 /// IAM takes (16 to 128 word characters) as long as AWS's own, with no `/`, which SigV4's credential
 /// scope separates its parts by; and its secret, 30 octets from the OS as 40 characters of base64,
@@ -557,7 +557,7 @@ fn endpoint_url(founder: &Founder) -> Option<String> {
 /// config and credentials files), named `mantle`.
 const PROFILE: &str = "mantle";
 
-/// The operator's S3 profile in `dir` (OUT/s3; research/71): the access key as AWS's shared
+/// The operator's S3 profile in `dir` (OUT/s3; research/84): the access key as AWS's shared
 /// credentials file, owner-only; the endpoint's authority as PEM; and where `url` names the
 /// endpoint, the config of the profile: its region, its endpoint (`endpoint_url`), for an https
 /// endpoint the PEM as its CA bundle (`ca_bundle`, an absolute path), and path-style addressing,

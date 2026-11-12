@@ -4,7 +4,7 @@
 S3 listener, on the box, before step 4 cuts anything: latency from each request's intended start,
 throughput, the servers' allocations, faults, CPU and instructions per operation, beside Garage,
 SeaweedFS and RustFS through the same HTTP load, and beside msquic, quinn and bare hyper-quic for
-QUIC (measurement.md §12; research/79)?
+QUIC (measurement.md §12; research/70)?
 
 **The run.** `mantle bench doors` at 4711a46a (rebased on main cc720c05) with the trial runner
 `scripts/doors-trials.sh` at 1878a7e0, one Williams cycle, as the systemd user service
@@ -285,7 +285,7 @@ durability setting: mantle-compare/COMPARATORS.md (copied into tables.md).
 
 Amazon S3: "consistent small object latencies ... of roughly 100–200 milliseconds" and "at least
 3,500 PUT/COPY/POST/DELETE or 5,500 GET/HEAD requests per second per partitioned Amazon S3 prefix";
-S3 Express One Zone "consistent, single-digit millisecond data access" (research/79 [11]). Mantle's
+S3 Express One Zone "consistent, single-digit millisecond data access" (research/70 [11]). Mantle's
 small reads (about 1 ms at quiet) sit inside S3 Express's bar; its small writes, 24 to 47 a second
 at seconds of queue under a 500-a-second load, are two orders under S3's per-prefix write rate on
 this box.

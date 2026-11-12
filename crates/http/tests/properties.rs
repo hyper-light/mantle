@@ -1,4 +1,4 @@
-//! Generated and mutated requests (docs/research/70): a request written from a model reads back as
+//! Generated and mutated requests (docs/research/83): a request written from a model reads back as
 //! that model, whole or in any pieces; any octets, a valid request mutated or none at all, are read
 //! or refused with a typed error, never a panic, nothing read past them and nothing held past the
 //! head's bound. Each head is read as `httparse`, hyper's parser, reads it, the oracle the owner

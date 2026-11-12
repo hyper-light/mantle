@@ -1,4 +1,4 @@
-# 71. The S3 endpoint's key, profile and certificate chain
+# 84. The S3 endpoint's key, profile and certificate chain
 
 Status: research note, 2026-10-25. For `mantle init`'s first access key, the S3 endpoint's
 certificates and the operator's profile, and for the endpoint's TLS (node.md §1.5, §4.1). Sources

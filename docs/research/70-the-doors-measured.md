@@ -1,8 +1,8 @@
-# 79. The doors measured: what each operation of the native and S3 doors costs, and how it is counted
+# 70. The doors measured: what each operation of the native and S3 doors costs, and how it is counted
 
 Status: research note, 2026-11-04. For `mantle bench doors` (crates/mantle/src/bench_doors.rs) and
 measurement.md §12. It states how both of mantle's doors, the native protocol over QUIC
-(gateway.md §2, research/73) and the S3 HTTP/1.1 listener (node.md §4, research/70, research/72),
+(gateway.md §2, research/73) and the S3 HTTP/1.1 listener (node.md §4, research/83, research/72),
 are measured before any of their costs is cut: the operations and sizes, the measures, the
 instruments, the load, the trials, the conditions, the machines and the comparators. Each number
 below is cited or measured; the parameters a run takes have their rows in docs/design/constants.md.
@@ -190,7 +190,7 @@ doors' counts.
 request's intended start, since a closed generator understates response time by up to an order of
 magnitude and omits the server's slow periods [6]; a closed ladder of logical clients doubling
 while throughput grows, up to the node's connection budget, for the throughput knee. An HTTP
-connection carries one request at a time, as HTTP/1.1 answers in order (research/70), so
+connection carries one request at a time, as HTTP/1.1 answers in order (research/83), so
 concurrency is connections. Logical clients are records on hyper-rt; the generator reports its CPU
 and lateness [8].
 

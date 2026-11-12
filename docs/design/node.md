@@ -430,15 +430,15 @@ are sized by their shares (`derive::engine_within`) and take no limit.
 | `durability.*` | cited, stated | the worst device class's annual failure rate an hour, since a block's chunks land on any device of the cell (`mantle_ec::durability`'s disk rate), with durability.md §5's yearly power-on restart taking a hundredth of the nodes; repair in research 15's day until repair is built and measured; the target S3's 10⁻¹¹ unless stated (`derive::rates`, `derive::target`) |
 | `range.max_entry_bytes` | derived | `mantle_meta::wire::largest_entry_bytes` (replica.md §7) |
 | `range.election_tick`, `range.heartbeat_tick` | cited | focal's 10 and 2 (§2.4), checked though ranges elect by suspicion, which takes no ticks |
-| `range.max_size_per_msg`, `range.max_uncommitted_size`, `range.max_committed_size_per_ready`, `range.max_inflight_msgs` | derived | an entry of the range's largest each append, apply and `Ready`; two appends out to a follower and two entries uncommitted (`derive::IN_FLIGHT`), so a follower's log holds the next frame while it confirms the last, whose record then confirms it (raft-log.md §6; research/80, step 9), where one append out made every frame wait for a confirmation of its own |
-| `rules.*` | derived | the same on every member, from the cell's identities and the metadata layer's bounds alone (`derive::cell`): a session of each identity for good, as above; as many commands an entry as the node runs operations (`derive::batch`, `gateway.objects` times `gateway.window`), each operation waiting on one command of a range at a time, so every command its operations wait on shares the next entry's flush (replica.md §1; research/80, step 9: one command an entry committed one a Raft round, the cell's writes capped at 20 to 47 a second); their answers kept until the next entry acknowledges them, within the row the largest row S3 admits already sets, so no page grows, and at least one at the largest a node's command gets (`wire::largest_answer_bytes`: a range's lineage at the longest route keys; a sweep sizes its checks to it); a row's key and value at most the longest key S3's names give a row (`key::largest_bytes`) and the largest value a request S3 admits, or a session at its bounds, gives one (`wire::largest_row_bytes`: a version keeping S3's 8 KB of headers at their longest encoding), which every member's engine holds (replica.md §2); the node refuses to start on an engine that does not (`mantle_range::holds_rows`) |
+| `range.max_size_per_msg`, `range.max_uncommitted_size`, `range.max_committed_size_per_ready`, `range.max_inflight_msgs` | derived | an entry of the range's largest each append, apply and `Ready`; two appends out to a follower and two entries uncommitted (`derive::IN_FLIGHT`), so a follower's log holds the next frame while it confirms the last, whose record then confirms it (raft-log.md §6; research/71, step 9), where one append out made every frame wait for a confirmation of its own |
+| `rules.*` | derived | the same on every member, from the cell's identities and the metadata layer's bounds alone (`derive::cell`): a session of each identity for good, as above; as many commands an entry as the node runs operations (`derive::batch`, `gateway.objects` times `gateway.window`), each operation waiting on one command of a range at a time, so every command its operations wait on shares the next entry's flush (replica.md §1; research/71, step 9: one command an entry committed one a Raft round, the cell's writes capped at 20 to 47 a second); their answers kept until the next entry acknowledges them, within the row the largest row S3 admits already sets, so no page grows, and at least one at the largest a node's command gets (`wire::largest_answer_bytes`: a range's lineage at the longest route keys; a sweep sizes its checks to it); a row's key and value at most the longest key S3's names give a row (`key::largest_bytes`) and the largest value a request S3 admits, or a session at its bounds, gives one (`wire::largest_row_bytes`: a version keeping S3's 8 KB of headers at their longest encoding), which every member's engine holds (replica.md §2); the node refuses to start on an engine that does not (`mantle_range::holds_rows`) |
 | `log.*` | derived | `hyper_log::Config::derive` from the log's block, its largest entry with the shell's bytes, its groups (the ranges and the liveness stream's), a checkpoint's cadence and what a group holds uncommitted past it of one `Ready` each (`mantle_range::ready_held`: as many entries as its bytes make of the least entry a range proposes, 13 bytes, and the term's empty first one, and its bytes with each entry's 5-byte shell), a cache of one largest entry a group, and a file holding every group's retention at once beside the least file the log runs in: a `Ready` goes in greedy parts of a frame's room, any two in a row more than a room, each a segment at most (`derive::log`). Before, entries were counted at the shell's 5 bytes, 2.6 times too many, and the file was the least, which one group's retention filled: a write past it is refused `Full`. Its memory: each group's slots, a deque doubled past its retained entries at hyper-log's 56 bytes a slot, its handle's unapplied entries and its cache, one group's slots again while they grow, and ten segments of the log's own buffers (`derive::log_bytes`; `tests/log_memory.rs`: every group at its retention, 112.6 MB at the peak of a 225.9 MB bound) |
 | `log.waits` | cited | `measured`: the log's writer waits for the replicas it just answered while that is expected to lower total latency, ended by the clock or a frame's worth of charged bytes, what a node runs (raft-log.md §3, hyper-log's `Waits::Measured`); `never`, a batch of what is queued when the writer looks, is the replica simulation's, whose members have one update out at a time |
 | `engine.extent_pages`, `engine.max_extents` | derived | the least pages the store takes an extent, two; as many extents as each range's share of the metadata device's space holds (`derive::engine`) |
 | `engine.memtable_bytes`, `engine.fanout`, `engine.leaf_entries` | derived, cited | the least write buffer, one row at the range's bounds whole (`memtable::hashed::entry_bytes`); SplinterDB's fanout of 8, at which the engine's measurements ran (engine-structure.md §5–§6), until the fanout is measured against mantle's key counts as its §4 asks; a leaf holding every row one memtable gives it, the most a memtable holds being rows of the shortest key and no value (`key::least_bytes`; `benches/ranges.rs` sizes a leaf so) |
 | `transport_bytes` | derived | the transport's floor: what it holds besides QUIC's windows, and each share at QUIC's initial window, below which its limits refuse (`bounds::least_transport`) |
-| `volume.*` layout | derived | checksum blocks of the volume's block, at most CRC-32C's verified 16 KiB, so a read at the device's alignment verifies no byte it did not ask for (research 11 §8.2); the least segment holding a record of the largest chunk whole, smaller segments cleaning better (research 11 §7.3–§7.4); the standard layout, or the compact one where the standard leaves fewer than two segments (chunk-store.md §2); batches of as many records as the cell's operations may write to the volume at once, its nodes' identities times `derive::batch`, so they share one flush where batches of one flushed each chunk alone (research/80, step 9), a segment's room in bytes, and one fragment a chunk, as the node puts chunks whole; as many fragments as the volume's share of memory holds at the index's measured peak (`index::most_bytes`) and the volume holds at a block each, the least a fragment takes standing for the chunk sizes research 11 §6.2 learns from; a volume laid out already keeps its block, segment and checksum blocks, and holds no more fragments than its log was laid out for (`Geometry::holds`); research 03 §15.9's week a scrub (`derive::volume`) |
-| `gateway.window`, `gateway.objects`, `chunk_asks`, `command_asks`, `read_asks` | derived, measured | a window of one block, the floor; 8 operations, which the host counts of any kind, the knee of the cell's write throughput on the box (`derive::OBJECTS`: 30, 39, 72, 79 and 93 64 KiB PUTs a second at 2, 4, 8, 16 and 32 a node, research/80 step 9), where two had held the cell's writes at about 25 a second; the asks the operations hold at once, each at its most under the schemes a block may take in a cell of the domains the volume table may name, the durability model's choice at each count of them (`derive::schemes`): a put's chunks at its width, or a get's spans and the whole chunks a failed span adds, twice its data less one, past the width of a code whose parity is less than its data less one (`put::most_chunks`, `get::most_chunks`); a put's command for each block of the largest body S3 takes, its renewals (`put::most_commands`); one read each; and the node's enlistment (`derive::asks`). The memory the operations hold: each the larger of a put and a get of those schemes' largest blocks, the drivers' own (`put::most_bytes`: the segment, the block filling, each block going down with a code's parity and padded chunk, or a block coded with nothing filling beside it; `get::most_bytes`: the spans read, the whole chunks read in a failed span's place, the decoding, the cut bytes and the plaintext opened from them) and the host's, a put's chunks copied to send and a piece of body carried, a get's block taken; the coding's bytes are reed-solomon-simd's work, measured with the call's own (`Code::encode_bytes`, `Code::decode_bytes`), and its tables once a process (`mantle_ec::TABLE_BYTES`) (`derive::objects`) |
+| `volume.*` layout | derived | checksum blocks of the volume's block, at most CRC-32C's verified 16 KiB, so a read at the device's alignment verifies no byte it did not ask for (research 11 §8.2); the least segment holding a record of the largest chunk whole, smaller segments cleaning better (research 11 §7.3–§7.4); the standard layout, or the compact one where the standard leaves fewer than two segments (chunk-store.md §2); batches of as many records as the cell's operations may write to the volume at once, its nodes' identities times `derive::batch`, so they share one flush where batches of one flushed each chunk alone (research/71, step 9), a segment's room in bytes, and one fragment a chunk, as the node puts chunks whole; as many fragments as the volume's share of memory holds at the index's measured peak (`index::most_bytes`) and the volume holds at a block each, the least a fragment takes standing for the chunk sizes research 11 §6.2 learns from; a volume laid out already keeps its block, segment and checksum blocks, and holds no more fragments than its log was laid out for (`Geometry::holds`); research 03 §15.9's week a scrub (`derive::volume`) |
+| `gateway.window`, `gateway.objects`, `chunk_asks`, `command_asks`, `read_asks` | derived, measured | a window of one block, the floor; 8 operations, which the host counts of any kind, the knee of the cell's write throughput on the box (`derive::OBJECTS`: 30, 39, 72, 79 and 93 64 KiB PUTs a second at 2, 4, 8, 16 and 32 a node, research/71 step 9), where two had held the cell's writes at about 25 a second; the asks the operations hold at once, each at its most under the schemes a block may take in a cell of the domains the volume table may name, the durability model's choice at each count of them (`derive::schemes`): a put's chunks at its width, or a get's spans and the whole chunks a failed span adds, twice its data less one, past the width of a code whose parity is less than its data less one (`put::most_chunks`, `get::most_chunks`); a put's command for each block of the largest body S3 takes, its renewals (`put::most_commands`); one read each; and the node's enlistment (`derive::asks`). The memory the operations hold: each the larger of a put and a get of those schemes' largest blocks, the drivers' own (`put::most_bytes`: the segment, the block filling, each block going down with a code's parity and padded chunk, or a block coded with nothing filling beside it; `get::most_bytes`: the spans read, the whole chunks read in a failed span's place, the decoding, the cut bytes and the plaintext opened from them) and the host's, a put's chunks copied to send and a piece of body carried, a get's block taken; the coding's bytes are reed-solomon-simd's work, measured with the call's own (`Code::encode_bytes`, `Code::decode_bytes`), and its tables once a process (`mantle_ec::TABLE_BYTES`) (`derive::objects`) |
 | `gateway.bucket_quota`, `gateway.scan_rows` | cited, derived | S3's 10,000 (research 05 §10.4); one row each step of a bucket's attempt passes or removes, the least that moves it (`coordinator::Bounds`), until deletion's throughput is measured |
 | `gateway.handover_ns` | cited | HDFS's 60 s soft limit (research 22 §3.6), one of the bounds metadata.md §2 names for the same window, until the gateway measures research 22 §10.2's `D_b`: its retry budget for a step times a high quantile of one try, plus the clocks' offset; it bounds how long a leftover waits, not correctness |
 | `runtime.probe_budget_ms` | bound | hyper-rt's probes stop at Wilks' 59 samples (hyper-rt runtime.md §10.2), measured once by `mantle init` and kept as hyper-rt's record, reused while the machine's key matches; the budget bounds a starved host only: 59 wakes at the platform's quantum, 3 ms on Linux, 10 ms on macOS, 93.75 ms on Windows (research 64; `derive::probe_budget`) |
@@ -515,12 +515,12 @@ and pinned by no node (below, 2026-10-26).
 *As built (2026-10-25): the S3 endpoint's key and certificates.* `mantle init` gives the cell its
 first account, twelve digits, and its one access key, an id of twenty characters of RFC 4648's
 base32 alphabet and a secret of 240 bits as forty characters of base64, drawn from the OS
-(research/71). The key is written on every founder, owner-only, as `keys/s3/ID` holding its account
+(research/84). The key is written on every founder, owner-only, as `keys/s3/ID` holding its account
 and secret, and named by its `access_key = ID FILE` line; `mantle serve` reads each at its identity
 step only from a file no one but its owner may read, refusing the start otherwise as it refuses the
 node's own key, and says `s3 LISTEN REGION IDS` once it has. The endpoint's chain is ECDSA P-256
 throughout, since the AWS CLI's transfer client and Windows' TLS verify no Ed25519 certificate
-(research/71): the endpoint has an authority of its own beside the cell's, kept with it
+(research/84): the endpoint has an authority of its own beside the cell's, kept with it
 (`s3-authority.der`, `s3-authority.key`), which issues each founder's endpoint its certificate and
 key (`identity/s3.der`, `identity/s3.key`) for the DNS names its operator states (`name=HOST`), its
 address unless it listens on every one, and `localhost` on a loopback address; serverAuth alone, the
@@ -917,7 +917,7 @@ taken ahead of its replica is kept in front of the store's next (`node::answers`
 takes its answers in the order the log gave them. The look costs one check of each range with a
 write out; a waker that named its range (hyper-durable's `Owner::woken`) would spare even that.
 
-A turn remakes nothing it keeps (research/80, step 5). The transport's events it takes, the
+A turn remakes nothing it keeps (research/71, step 5). The transport's events it takes, the
 replicas it drives with what each drive said, and the Raft messages they give each keep their
 storage across turns, emptied as they are handled, and the ranges' groups are looked up where the
 node keeps them; each was a buffer made and dropped every turn, busy or idle. A plane message a
@@ -1798,24 +1798,24 @@ admission authority.
   advertised HTTP/3 by `Alt-Svc` (checked 2026-09-30; AWS documents HTTP/3 only for CloudFront).
   HTTP/2 and HTTP/3 are not offered. The listener is mantle's own HTTP/1.1 codec (`crates/http`)
   on hyper-rt's TCP, with TLS through hyper-tls: the owner's decision, no hyper and no tokio
-  (research/70). On a laptop it may serve plain HTTP on the loopback address; SigV4 still
+  (research/83). On a laptop it may serve plain HTTP on the loopback address; SigV4 still
   authenticates every request there, and a request carrying SSE-C headers is refused over plain
   HTTP, as S3 "rejects any requests made over HTTP when using SSE-C" (20 §3.3). Elsewhere it serves
   TLS with the endpoint's ECDSA P-256 chain (§1.5), and TLS 1.2 beside 1.3, with the ECDHE-ECDSA
   AES-GCM suites: Apple's Secure Transport, under the AWS CLI's transfers on macOS, cannot use
-  TLS 1.3, nor can Windows 10's Schannel (research/71).
+  TLS 1.3, nor can Windows 10's Schannel (research/84).
 
 The codec does no I/O: the listener reads a connection's octets into buffers of its own and hands
 them over, and the codec parses a request's head where it lies, decodes its body as it streams,
 giving its octets back as spans of that buffer, and writes a response's head and chunked framing
-into the listener's buffer. Its rules are research/70's:
+into the listener's buffer. Its rules are research/83's:
 
 - A request's head, its request line and field lines through the empty line, is held to S3's
   8 KB (05 §10.2): past it `400 RequestHeaderSectionTooLarge`, or `414` for a request line not
   ended within it (RFC 9112 §3). It is the one buffer a connection holds for a head, and the
   codec allocates nothing for a request: a head keeps where its field section lies and how many
   lines it holds, each judged when the head was parsed, and its fields are read from there as
-  they are asked for (research/80, step 6).
+  they are asked for (research/71, step 6).
 - The grammar is strict where leniency smuggles: one SP between the request line's parts, no
   whitespace before a field's colon, no obs-fold, no control octet but HTAB in a value, each
   refused `400`; a line ends at CRLF or a lone LF; an HTTP/1.1 request has exactly one valid Host.
@@ -1846,7 +1846,7 @@ its S3 keys say (§1.5) and accepts on the node's one shard beside the node's ow
 connection a task of its own, so the runtime wakes the one whose socket or channel moved; the
 runtime holds a task for each connection the budget admits (§4.5). On a loopback address it serves
 plain HTTP; elsewhere TLS 1.3 and 1.2 with the endpoint's P-256 certificate, hyper-tls's default
-suites, of which a P-256 key takes the ECDHE-ECDSA AES-GCM ones for TLS 1.2 (research/71). A
+suites, of which a P-256 key takes the ECDHE-ECDSA AES-GCM ones for TLS 1.2 (research/84). A
 hyper-tls connection holds no configuration (vendor/hyper-tls/VENDORED.md §2), so each connection
 builds its own around the one certified key the listener loads at its start: it answers HTTP/1.1
 when a client offers ALPN, keeps no sessions and sends no tickets, its configuration ending with
@@ -2013,7 +2013,7 @@ CreateBucket's configuration) is read whole, within its `mantle_s3::body` bound,
 operation is made, into one buffer at the length its request stated within that bound. The slow
 body's reclaim and the socket options above are open.
 
-*Since 2026-11-06 (research/80, step 6).* aws-chunked is decoded in place: `Decoder::step` gives
+*Since 2026-11-06 (research/71, step 6).* aws-chunked is decoded in place: `Decoder::step` gives
 each run of payload as a span of the connection's buffer, its framing line held in an array of its
 own, and each run goes to the host as a piece of exactly its bytes, one copy, as a plain body's
 do. The listener still copies each body octet once into its piece: its buffer is read into again
@@ -2051,7 +2051,7 @@ closed, as RFC 9112 requires for a framing error in a request (25 §2).
 
 *As built (2026-10-25), the S3 listener* (`listener/respond.rs`) answers each host status with the
 code and status above, `Malformed` as `400 InvalidRequest`, and refuses on its own: the codec's
-refusals with their statuses (research/70), the connection closed; the router's `InvalidURI`,
+refusals with their statuses (research/83), the connection closed; the router's `InvalidURI`,
 `KeyTooLongError`, `MethodNotAllowed` and `NotImplemented`; SigV4's `AccessDenied`,
 `InvalidAccessKeyId`, `SignatureDoesNotMatch`, `RequestTimeTooSkewed` and its malformed headers; a
 body whose length is not stated before it, `411 MissingContentLength`; one past S3's largest
@@ -2235,7 +2235,7 @@ driver over it, a data key drawn for the file and wrapped under the root key's c
 (encryption.md §2) and the scheme the durability model chooses for the cell's domains
 (`mantle_ec::durability::choose`), chosen once per change of the volume table's volumes or their
 domains and carried across the entries the root range applies otherwise (`host::scheme_over`;
-it ran at every entry, 2,448.5 allocations each time, research/80 step 5). A put's chunks go to
+it ran at every entry, 2,448.5 allocations each time, research/71 step 5). A put's chunks go to
 their volumes as one buffer the driver sealed, shared by every copy, the node's own volume
 writing from it as a peer's exchange sends from it.
 

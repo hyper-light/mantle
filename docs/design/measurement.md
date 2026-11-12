@@ -283,48 +283,48 @@ recommendations 5–6).
 
 **Decision: both doors are measured per operation, as the engine was: counted in a diagnostic
 build, timed in a release build, two fresh processes a point, in a Williams order beside
-comparators of equal durability** (research/79). `mantle bench doors` drives a cell of three
+comparators of equal durability** (research/70). `mantle bench doors` drives a cell of three
 `mantle serve` processes through the native protocol (mantle-client) and the S3 listener (requests
 written with mantle's codec and signed with mantle-s3), so the timed load is mantle's own; the
 stock clients stay the correctness suite.
 
 - **Operations**: PUT whole and streamed, GET whole and ranged, HEAD, DELETE, a ListObjectsV2 page
   of up to 1,000 keys, and multipart create, upload part, complete (up to 10,000 parts), abort and
-  list parts, through both doors (79 [10]).
+  list parts, through both doors (70 [10]).
 - **Sizes**: 0 B, 1 B, 65,535, 65,536 and 65,537 bytes (a 64 KiB segment's boundaries, the five
   objects every set puts first), 128 KiB (S3's small-object line), 8 MiB (the stock clients'
   threshold and part), 64 MiB (Hadoop S3A's default part), 5 GiB (the single PUT's limit) and a
   10 GB stream (the owner's agreed scale); sets of 1,000, 10,000 and 100,000 small objects, that
   scale's sets, 100,000 by default with 10,000 beside it as the engine is reported at 100M and 10M
-  keys (79 [10][14][15][16][17][18]).
+  keys (70 [10][14][15][16][17][18]).
 - **Measures per operation**: allocations, reallocations, moved reallocations, bytes asked, peak
   live heap per request and per connection, minor and major faults, user and system CPU,
   instructions and cycles where the OS counts them, context switches, wire bytes, datagrams on the
   native door, and latency at p50, p99, p99.9, p99.99 and max from each request's intended start;
   per connection, the memory slope at two connection counts (§10) and the handshake's counts
-  (79 [2][4][5]).
+  (70 [2][4][5]).
 - **Instruments**: hyper-measure's counting allocator in `count-allocs` builds of `mantle serve`
   and the harness only, the harness's own work set aside; each server's faults, CPU and footprint
-  read by pid; `perf stat` on the box; aws-lc's own heap seen through the footprint (79 [3][4]).
+  read by pid; `perf stat` on the box; aws-lc's own heap seen through the footprint (70 [3][4]).
 - **Load**: open loop with Poisson arrivals by default and a closed ladder doubling while
   throughput grows up to the node's connection budget; an HTTP connection carries one request at a
-  time; the generator reports its CPU and lateness (§10; 79 [6]).
+  time; the generator reports its CPU and lateness (§10; 70 [6]).
 - **Rounds**: at least 3,688 transfers behind a p99.9 and 368 behind a p99 (§5a); fewer, and the
   quantile is a dash.
 - **Trials**: a timed and a counting process a point; Williams order in whole cycles; an A/A beside
   effects under about 5%; every expected case completed, failed with its reason, or excluded with
-  its reason (79 [9]).
+  its reason (70 [9]).
 - **Conditions**: quiet; busy loops at one and two times the cores; one and two CPUs; the node's
   memory floor as a cgroup limit; and for the native door the 500 ms one-way relay with loss and
   reordering, the owner's condition, its overhead above physics reported; one and two CPUs and a
   busy loop a core as CI's small hosts, twice the cores the plan's harder load, the floor the one
-  `mantle serve` derives (79 [12][19][21][22][23]).
+  `mantle serve` derives (70 [12][19][21][22][23]).
 - **Machines**: the box (CPUSET 8-15, one die's eight cores without their SMT siblings, under a
   memory scope), the Mac's Linux VM lane and the Mac, never a shared runner; Windows runs the
-  correctness suites (79 [20][23]).
+  correctness suites (70 [20][23]).
 - **Comparators**: bare hyper-quic, quinn's `perf` at hyper-quic's base revision (quinn-proto
   0.11.18) and msquic v2.6.3's secnetperf for the native door; Garage v2.5.0, SeaweedFS 4.52,
   RustFS 1.0.4 and MinIO RELEASE.2025-10-15T17-29-55Z for the HTTP door, each configured to flush
   before acknowledging (MinIO only by a whole-machine sync, so on the Mac apart), pinned and built
   in a comparison-only workspace, with S3's published bars beside them as references
-  (79 [11][12][13]).
+  (70 [11][12][13]).

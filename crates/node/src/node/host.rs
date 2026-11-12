@@ -443,7 +443,7 @@ fn scheme(gateway: &GatewaySettings, table: &[Placed]) -> Option<durability::Sch
 /// The scheme new blocks take over `placed`, the volume table read again: the one chosen over the
 /// table read before (`was`), carried while every volume keeps its place and its domain, or chosen
 /// again. The durability model's choice so runs once per change of the domains, not once per entry
-/// the root range applies (research/80: 2,448.5 allocations each time it ran).
+/// the root range applies (research/71: 2,448.5 allocations each time it ran).
 fn scheme_over(
     was: Option<&Table>,
     placed: &[Placed],
@@ -3474,7 +3474,7 @@ mod tests {
 
     /// The volume table read again after an entry that left its volumes and their domains as
     /// they were takes the scheme chosen before, asking nothing of the allocator; one whose
-    /// domains changed is chosen again (research/80, step 5: the choice ran at each entry the
+    /// domains changed is chosen again (research/71, step 5: the choice ran at each entry the
     /// root range applied, 2,448.5 allocations each time).
     #[test]
     fn the_scheme_is_chosen_again_only_when_the_tables_domains_change() {

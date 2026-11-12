@@ -1,7 +1,7 @@
-# 80. The doors' costs: every counted cost of both doors at its site, and whether it is needed
+# 71. The doors' costs: every counted cost of both doors at its site, and whether it is needed
 
 Status: research note, 2026-11-06. Step 4 of the doors plan: each allocation, reallocation, page
-fault and instruction that `mantle bench doors` (research/79, measurement.md §12) counts on the
+fault and instruction that `mantle bench doors` (research/70, measurement.md §12) counts on the
 native door and the S3 door is attributed to the call stack that made it, and each site is asked
 two questions with a measurement behind each answer: is this work needed at all, and is this much
 of it needed. No product code changes here; the instruments live on the scratch branch `diag-doors`

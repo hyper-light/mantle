@@ -145,7 +145,7 @@ pub fn probe_budget() -> Result<Duration, DeriveError> {
 }
 
 /// The operations a node that hosts objects runs at once: 8, the knee of the cell's write
-/// throughput measured on the box (research/80, step 9; 64 KiB native PUTs, an open loop past
+/// throughput measured on the box (research/71, step 9; 64 KiB native PUTs, an open loop past
 /// capacity, three clients an operation, n 300): 30, 39, 72, 79 and 93 a second at 2, 4, 8, 16 and
 /// 32, the doubling past 8 adding 10%, within the run-to-run band, and the one past 16 refused
 /// `SlowDown` for want of a slot. Each costs the objects' class its most bytes (`objects`).
@@ -357,12 +357,12 @@ pub enum DeriveError {
 ///   what one drive applies; a leader holds [`IN_FLIGHT`] of them uncommitted, with as many
 ///   appends out to each follower, so a follower's next frame is on its way while its last is
 ///   confirmed (raft-log.md §6) and its record confirms that one, where with one append out every
-///   frame waited for a confirmation of its own (research/80, step 9);
+///   frame waited for a confirmation of its own (research/71, step 9);
 /// - a session of each identity, for good: a registration ends its owner's last
 ///   (`mantle_meta::session::register`), so no session waits out a lifetime;
 /// - as many commands an entry as the node runs operations, each with one command waiting on a
 ///   range at a time ([`batch`]), so every command the node's operations wait on goes in its next
-///   entry and shares its flush (replica.md §1; research/80, step 9), where one command an entry
+///   entry and shares its flush (replica.md §1; research/71, step 9), where one command an entry
 ///   made a range commit one command a Raft round; their answers kept until the next entry
 ///   acknowledges them, within the row a session may write, which the largest row S3 admits sets,
 ///   so the store's page does not grow for them, and at least one answer at its largest
@@ -954,7 +954,7 @@ pub struct Formatted {
 ///   sector errors, or the compact one where the standard leaves fewer than two segments
 ///   (chunk-store.md §2);
 /// - batches of `requests` records, every chunk the cell's operations may write to the volume at
-///   once, so all of them share one flush (Helland et al., Tandem TR 88.1, §2; research/80, step
+///   once, so all of them share one flush (Helland et al., Tandem TR 88.1, §2; research/71, step
 ///   9: batches of one record flushed each chunk alone), a segment's room in bytes, and one
 ///   fragment a chunk, as the node puts chunks whole;
 /// - as many fragments as the index's bytes hold (`index::most_fragments`) and the volume holds
@@ -2030,7 +2030,7 @@ fn say_objects(
         gateway.objects,
         Kind::Measured,
         "operations at once of any kind, the knee of the cell's write throughput measured on \
-         the box (derive::OBJECTS, research/80 step 9)",
+         the box (derive::OBJECTS, research/71 step 9)",
     );
     said.add(
         "gateway.clients",

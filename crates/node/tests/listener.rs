@@ -1,4 +1,4 @@
-//! The S3 listener's TLS (docs/design/node.md §4.1; research/71): a listener bound on a real
+//! The S3 listener's TLS (docs/design/node.md §4.1; research/84): a listener bound on a real
 //! socket with the endpoint's P-256 chain as `mantle init` makes it, reached by a stock client's
 //! TLS (hyper-tls, rustls's webpki verifier against the endpoint authority) over TLS 1.3 and over
 //! TLS 1.2. Asked: each handshake verifies the endpoint's certificate for the name the client

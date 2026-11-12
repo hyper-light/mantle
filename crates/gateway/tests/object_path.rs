@@ -2482,7 +2482,7 @@ fn a_run_takes_only_the_md5s_its_object_needs_and_only_at_its_offset() {
 /// A GET's own allocations and bytes, the cell's answers and the test's keeping of the plaintext
 /// set aside, counted exactly: each block of the range is gathered from its chunk reads into one
 /// buffer, its segments opened where they lie and its plaintext handed out as a slice of it, one
-/// copy of each byte read (research/80, step 5). It copied each byte three times: gathered, each
+/// copy of each byte read (research/71, step 5). It copied each byte three times: gathered, each
 /// 64 KiB segment copied out to be opened, its plaintext copied again into the block's output
 /// (146 allocations and 25,177,456 bytes for this GET; 16 and 8,396,144 now, the sealed bytes
 /// gathered once and the GET's own bookkeeping).

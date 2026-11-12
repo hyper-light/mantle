@@ -27,7 +27,7 @@
 //! The S3 endpoint's certificates are stock clients' to verify, through their platforms' TLS
 //! stacks, and are ECDSA P-256 with SHA-256 throughout (RFC 5480, RFC 5758 §3.2): the one scheme
 //! every TLS 1.3 implementation must verify (RFC 8446 §9.1), where the AWS CLI's transfer client
-//! verifies no Ed25519 certificate on Linux, macOS or Windows (research/71). Their authority is
+//! verifies no Ed25519 certificate on Linux, macOS or Windows (research/84). Their authority is
 //! the endpoint's own, beside the cell's, so no Ed25519 signature is in their chain. They carry
 //! what a verifier holding to RFC 5280 asks (Python's default since 3.13): each its key's
 //! identifier and an issued one its issuer's (§4.2.1.1, §4.2.1.2, RFC 7093 §2's first method). An
@@ -358,7 +358,7 @@ fn attribute<'a>(rdns: &mut &'a [u8], id: &[u8]) -> Result<&'a str, CertError> {
 
 /// The longest an S3 endpoint's certificate is valid, in seconds: 825 days of 86,400, past which
 /// Apple's platforms refuse a TLS server's certificate ("TLS server certificates must have a
-/// validity period of 825 days or fewer", support.apple.com/103769; research/71).
+/// validity period of 825 days or fewer", support.apple.com/103769; research/84).
 pub const MAX_ENDPOINT_VALIDITY: u64 = 71_280_000;
 
 /// A name an S3 endpoint's clients dial it by, as its certificate's `subjectAltName` states it

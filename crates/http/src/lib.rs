@@ -1,4 +1,4 @@
-//! mantle's HTTP/1.1 codec for the S3 listener (docs/design/node.md §4.1; docs/research/70): it
+//! mantle's HTTP/1.1 codec for the S3 listener (docs/design/node.md §4.1; docs/research/83): it
 //! reads requests and writes responses and does no I/O. Its caller reads a connection's octets
 //! into buffers of its own and hands them over: a request's head is parsed where it lies
 //! ([`parse`]), its body decoded as it streams, given back as spans of the caller's input

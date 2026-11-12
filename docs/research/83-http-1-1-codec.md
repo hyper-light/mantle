@@ -1,4 +1,4 @@
-# 70. An HTTP/1.1 codec for the S3 listener
+# 83. An HTTP/1.1 codec for the S3 listener
 
 Status: research note, 2026-10-25. For node.md §4.1 and `crates/http`: what mantle's own HTTP/1.1
 codec must accept and refuse, and within which bounds, now that the S3 listener is mantle's own

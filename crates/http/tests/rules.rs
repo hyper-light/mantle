@@ -1,4 +1,4 @@
-//! Each rule of RFC 9112 and RFC 9110 the codec keeps (docs/research/70), by a request that
+//! Each rule of RFC 9112 and RFC 9110 the codec keeps (docs/research/83), by a request that
 //! breaks it or keeps it, and the answer each gets.
 #![allow(
     clippy::unwrap_used,

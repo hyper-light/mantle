@@ -4,7 +4,7 @@
 //! its response. Its field lines are kept where they lie too, as the span of the field section and
 //! their count, and read from it as they are asked for, so a head is parsed with no allocation.
 //!
-//! The grammar is held strictly where leniency smuggles (research/70): one SP between the request
+//! The grammar is held strictly where leniency smuggles (research/83): one SP between the request
 //! line's three parts, no whitespace in its target or before a field's colon, no line after the
 //! request line that begins with whitespace (obs-fold included), and no control octet but HTAB in
 //! a field's value. A line ends at CRLF or a lone LF, and empty lines before the request line are

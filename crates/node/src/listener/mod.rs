@@ -12,7 +12,7 @@
 //! host's driver wants it, and the host's reply written as S3's response ([`respond`]).
 //!
 //! Plain HTTP on a loopback address, TLS elsewhere with the endpoint's P-256 certificate (node.md
-//! §1.5; research/71), TLS 1.2 beside 1.3. A connection's TLS configuration is its own, as
+//! §1.5; research/84), TLS 1.2 beside 1.3. A connection's TLS configuration is its own, as
 //! hyper-tls's connections hold none (vendor/hyper-tls/VENDORED.md §2): it is built at the
 //! connection's start around the one certified key every connection signs with.
 
@@ -95,7 +95,7 @@ pub(crate) struct Endpoint {
     pub(crate) region: String,
     pub(crate) access: Vec<AccessKey>,
     /// How requests name buckets (`mantle_s3::route`): by path at the endpoint's names, its
-    /// addresses and `localhost`, as the operator's profile addresses them (research/71), and by
+    /// addresses and `localhost`, as the operator's profile addresses them (research/84), and by
     /// the host under one of its names; any other host names nothing.
     pub(crate) addressing: mantle_s3::route::Endpoint,
     pub(crate) certified: Option<&'static CertifiedKey>,
@@ -124,7 +124,7 @@ impl ResolvesServerCert for Certified {
 
 /// aws-lc's provider, hyper-tls's default: TLS 1.3's suites, and TLS 1.2's ECDHE suites, of which
 /// the endpoint's P-256 key takes the ECDHE-ECDSA AES-GCM ones Schannel and Secure Transport offer
-/// (research/71).
+/// (research/84).
 fn provider() -> &'static CryptoProvider {
     &hyper_tls::crypto::aws_lc_rs::DEFAULT_PROVIDER
 }

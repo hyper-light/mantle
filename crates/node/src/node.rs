@@ -2573,7 +2573,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return;
         };
         let endpoint = self.driver.endpoint();
-        let mut failed = false;
+        let mut failed = None;
         let mut whole = false;
         let mut then = None;
         let mut sent = false;
@@ -2590,8 +2590,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                             .moved
                             .saturating_add(u64::try_from(took).unwrap_or(u64::MAX));
                     }
-                    Err(_) => {
-                        failed = true;
+                    Err(refusal) => {
+                        failed = Some(refusal);
                         break;
                     }
                 }
@@ -2612,26 +2612,29 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             host::chunk_moved(&mut self.jobs, asked);
         }
         match then {
-            Some(Then::Snapshot { .. }) if failed => self.snapshot_done(exchange, false),
-            Some(Then::Reply) if failed || whole => {
+            Some(Then::Snapshot { .. }) if failed.is_some() => self.snapshot_done(exchange, false),
+            Some(Then::Reply) if failed.is_some() || whole => {
                 self.writing.swap_remove(at);
                 self.driver.endpoint().end(exchange);
             }
-            // A put whose bytes could not all go is lost; one sent whole waits for its reply.
-            Some(Then::Asked) if failed => {
+            // A put whose bytes could not all go is lost as the transport refused them, unless
+            // the exchange had already ended, whose own refusal says (`chunk_put_refused`); one
+            // sent whole waits for its reply.
+            Some(Then::Asked) if let Some(refusal) = failed => {
                 self.writing.swap_remove(at);
-                if let Some(at) = self.chunks_out.iter().position(|c| c.exchange == exchange) {
-                    let out = self.chunks_out.swap_remove(at);
-                    self.chunks_done
-                        .push((out.asked, ChunkOutcome::Lost(Refusal::Closed)));
+                if let Some(outcome) = chunk_put_refused(refusal) {
+                    if let Some(at) = self.chunks_out.iter().position(|c| c.exchange == exchange) {
+                        let out = self.chunks_out.swap_remove(at);
+                        self.chunks_done.push((out.asked, outcome));
+                    }
+                    self.driver.endpoint().end(exchange);
                 }
-                self.driver.endpoint().end(exchange);
             }
             Some(Then::Asked) if whole => {
                 self.writing.swap_remove(at);
             }
             // An entry whose bytes could not all go is asked again; one sent whole waits.
-            Some(Then::Commanded) if failed => {
+            Some(Then::Commanded) if failed.is_some() => {
                 self.writing.swap_remove(at);
                 self.driver.endpoint().end(exchange);
                 self.ask_lost(exchange);
@@ -4305,6 +4308,18 @@ fn names_only_its_sender(command: &Command, sender: PeerId, node: bool) -> bool 
     }
 }
 
+/// What came of a chunk's put whose write the transport refused with `refusal`: nothing yet where
+/// the exchange had already ended, its own refusal queued behind the event the write answered
+/// (an exchange's events hold its slot, `tests/transport_ended.rs`), which says it, `Budget` among
+/// them asking the chunk again once room frees; else the put is lost as the transport refused it.
+fn chunk_put_refused(refusal: Refusal) -> Option<ChunkOutcome> {
+    if refusal == Refusal::UnknownExchange {
+        None
+    } else {
+        Some(ChunkOutcome::Lost(refusal))
+    }
+}
+
 /// When, on the shard's clock at `now`, a chunk whose asker waits `remaining_ns` more stops being
 /// waited on: one that said nothing waits the stock S3 clients' patience, and none waits longer
 /// (research/77 D2). An asking job carries at most that patience past its work's last movement,
@@ -4387,6 +4402,25 @@ mod tests {
     /// A chunk is waited on as long as its asker carried, never past the stock S3 clients'
     /// patience: none said is that patience, a shorter time is kept, and a longer one, which no
     /// correct node's job carries, is cut to it (research/77 D2).
+    /// A put whose write found its exchange ended is told what came of it by the exchange's
+    /// refusal, which follows (`tests/transport_ended.rs`): nothing is guessed for it; a write the
+    /// transport refused otherwise is lost as it refused it, never as a closed connection.
+    #[test]
+    fn a_put_whose_exchange_ended_waits_for_its_refusal_and_another_is_lost_as_refused() {
+        assert_eq!(chunk_put_refused(Refusal::UnknownExchange), None);
+        for refusal in [
+            Refusal::Budget,
+            Refusal::Closed,
+            Refusal::Stalled,
+            Refusal::Order,
+        ] {
+            assert_eq!(
+                chunk_put_refused(refusal),
+                Some(ChunkOutcome::Lost(refusal))
+            );
+        }
+    }
+
     #[test]
     fn a_chunk_is_waited_on_at_most_the_stock_patience() {
         let patience = u64::try_from(bounds::STOCK_PATIENCE.as_nanos()).unwrap();

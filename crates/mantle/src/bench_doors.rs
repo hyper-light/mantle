@@ -14,7 +14,10 @@
 //! failures, or the run is not exact. A phase's failures are told apart: `refused`, answered with
 //! an error; `unanswered`, throttled or lost on every attempt (each operation asked again as the
 //! AWS SDKs ask one, a listing's page among them); `differed`, a read whose bytes or length were
-//! not what was put; and the checks' others (an ETag, a size, a listing's count), the rest.
+//! not what was put; and the checks' others (an ETag, a size, a listing's count, an acknowledged
+//! object missing), the rest. An operation whose object's put, upload or part failed before it is
+//! not asked at all: `skipped`, counted and timed not at all, so a size's reads, as a set's, read
+//! only what was acknowledged (`transfer::Oracle`, a bit a put).
 //!
 //! A phase is one door, one operation and one size, and says one line: what the three servers
 //! counted while it ran, per operation (each answers `counts` on its standard input: its
@@ -314,6 +317,9 @@ enum Came {
     /// Throttled or lost on every attempt it was given: the server's failure to answer, counted
     /// apart from the checks' failures.
     Unanswered(String),
+    /// Not asked: what it reads or completes was never acknowledged, its put, upload or part
+    /// having failed before it. Counted, and no latency is recorded for it.
+    Skipped,
 }
 
 /// A native reply, or what asking it came to where the server or the wire ended it: one
@@ -433,7 +439,11 @@ enum Next {
 }
 
 /// What a size's phases share: the ETags their objects' bytes give, and their uploads.
-type Common<'a> = (&'a Rc<Vec<[u8; 16]>>, &'a Rc<RefCell<Vec<Upload>>>);
+type Common<'a> = (
+    &'a Rc<Vec<[u8; 16]>>,
+    &'a Rc<RefCell<Vec<Upload>>>,
+    &'a Rc<RefCell<Oracle>>,
+);
 
 #[derive(Clone, Default)]
 struct Upload {
@@ -1016,6 +1026,9 @@ struct Tally {
     /// Of the failed, those never answered, throttled or lost on every attempt
     /// ([`Came::Unanswered`]).
     unanswered: u64,
+    /// Of the operations, those not asked for want of what a failed one before them would have
+    /// made ([`Came::Skipped`]).
+    skipped: u64,
     /// The most requests out at once.
     most: usize,
     /// The most threads the process ran as the OS counted them, read each time more requests
@@ -1155,11 +1168,17 @@ async fn client(mut logical: Logical, work: Rc<Work>, shared: Rc<RefCell<Shared>
             let mut shared = shared.borrow_mut();
             shared.out = shared.out.saturating_sub(1);
             let tally = &mut shared.tally;
-            tally.latency.record(took);
-            tally.lateness.record(started.saturating_sub(intended));
             tally.ops = tally.ops.saturating_add(1);
+            if !matches!(came, Ok(Came::Skipped)) {
+                tally.latency.record(took);
+                tally.lateness.record(started.saturating_sub(intended));
+            }
             match came {
                 Ok(Came::Done) => false,
+                Ok(Came::Skipped) => {
+                    tally.skipped = tally.skipped.saturating_add(1);
+                    false
+                }
                 Ok(Came::Failed(why)) => {
                     tally.failed = tally.failed.saturating_add(1);
                     tally.keep_first(Failure::Check, why);
@@ -1221,6 +1240,7 @@ async fn phase(
                 refused: 0,
                 differed: 0,
                 unanswered: 0,
+                skipped: 0,
                 most: 0,
                 threads: 0,
                 first: [None, None, None],
@@ -1249,8 +1269,9 @@ async fn phase(
 }
 
 impl Work {
-    /// Operation `j`'s key, written into `into`, its object's index and length, and whether it is
-    /// to be asked: a set's other door's objects are read only where acknowledged.
+    /// Operation `j`'s key, written into `into`, and its object's index and length; none where what
+    /// it reads was never acknowledged, so it is not asked: a size's object whose put failed, a
+    /// set's other door's object that was not put.
     fn key(&self, j: u64, into: &mut String) -> Result<Option<(u64, u64)>, Error> {
         harness(|| match &self.keys {
             Keys::Sized { size, kind, made } => {
@@ -1260,6 +1281,10 @@ impl Work {
                         .ok_or_else(|| failed("no objects to read"))?,
                     None => j,
                 };
+                let reads = matches!(self.kind, Kind::Get | Kind::Range | Kind::Head);
+                if reads && !self.oracle.borrow().has(i) {
+                    return Ok(None);
+                }
                 write_sized(into, self.door, (*size, *kind, i))?;
                 Ok(Some((i, *size)))
             }
@@ -1268,7 +1293,10 @@ impl Work {
                     .checked_mul(2)
                     .and_then(|i| i.checked_add(u64::try_from(own.at()).ok()?))
                     .ok_or_else(|| failed("a set's index"))?;
-                if i >= *count || (*own != self.door && !self.oracle.borrow().has(i)) {
+                if i >= *count {
+                    return Err(failed("a set's index past its set"));
+                }
+                if *own != self.door && !self.oracle.borrow().has(i) {
                     return Ok(None);
                 }
                 let sizes = self.generator.object("sizes").map_err(failed)?;
@@ -1298,7 +1326,7 @@ impl Work {
             return Ok(self.settled(came, again));
         }
         let Some((i, length)) = self.key(j, key)? else {
-            return Ok(Came::Done);
+            return Ok(Came::Skipped);
         };
         let key = key.as_str();
         let object = harness(|| self.generator.object(key)).map_err(failed)?;
@@ -1316,10 +1344,9 @@ impl Work {
                 break came;
             }
         };
-        if matches!(came, Came::Done)
-            && self.kind == Kind::Put
-            && matches!(self.keys, Keys::Set { .. })
-        {
+        // An object put is acknowledged where its phase keeps a record of them: a set's, and the
+        // put of a size whose objects its reads read.
+        if matches!(came, Came::Done) && matches!(self.kind, Kind::Put | Kind::Stream) {
             harness(|| self.oracle.borrow_mut().set(i));
         }
         Ok(self.settled(came, again))
@@ -1430,7 +1457,20 @@ impl Work {
         scratch: &mut [u8],
     ) -> Result<Came, Error> {
         let bucket = BUCKET.to_owned();
-        let refused = |reply: &Reply| Came::Failed(format!("{:?}", reply.status));
+        // A read is asked only of an object whose put was acknowledged (`Work::key`), so one with no
+        // such key is an acknowledged object missing: a check's failure. Every other status past
+        // done is the server's refusal.
+        let reads = matches!(self.kind, Kind::Get | Kind::Range | Kind::Head);
+        let refused = |reply: &Reply| {
+            if reads && reply.status == Status::NoSuchKey {
+                Came::Failed(format!(
+                    "an acknowledged object missing: {:?}",
+                    reply.status
+                ))
+            } else {
+                Came::Refused(format!("{:?}", reply.status))
+            }
+        };
         Ok(match self.kind {
             Kind::Put => {
                 let op = Op::Put {
@@ -1591,7 +1631,7 @@ impl Work {
             }
             Kind::Part => {
                 let Some(upload) = self.upload(i) else {
-                    return Ok(Came::Refused("no upload created".into()));
+                    return Ok(Came::Skipped);
                 };
                 let op = Op::UploadPart {
                     bucket,
@@ -1628,8 +1668,11 @@ impl Work {
             }
             Kind::Parts => {
                 let Some(upload) = self.upload(i) else {
-                    return Ok(Came::Refused("no upload created".into()));
+                    return Ok(Came::Skipped);
                 };
+                if upload.part.is_none() {
+                    return Ok(Came::Skipped);
+                }
                 let reply = match answered(
                     client
                         .call(
@@ -1659,7 +1702,7 @@ impl Work {
                     part: Some(part),
                 }) = self.upload(i)
                 else {
-                    return Ok(Came::Refused("no part uploaded".into()));
+                    return Ok(Came::Skipped);
                 };
                 let op = Op::Complete {
                     bucket,
@@ -1681,7 +1724,7 @@ impl Work {
             }
             Kind::Abort => {
                 let Some(upload) = self.upload(i) else {
-                    return Ok(Came::Refused("no upload created".into()));
+                    return Ok(Came::Skipped);
                 };
                 let reply = match answered(
                     client
@@ -1718,18 +1761,25 @@ impl Work {
     ) -> Result<Came, Error> {
         let path = format!("/{}/{key}", http.signer.bucket);
         let unsigned = "UNSIGNED-PAYLOAD";
-        // A refusal says the server's answer: its status and its error's code and message.
+        // A refusal says the server's answer: its status and its error's code and message. A read
+        // is asked only of an object whose put was acknowledged (`Work::key`), so a 404 to one is
+        // an acknowledged object missing: a check's failure, not the server's refusal.
+        let reads = matches!(self.kind, Kind::Get | Kind::Range | Kind::Head);
         let refused = |answer: &Answer, body: &Kept| {
             if answer.status == 503 {
-                Came::Slowed
+                return Came::Slowed;
+            }
+            let text = String::from_utf8_lossy(&body.0);
+            let said = format!(
+                "HTTP {} {} {}",
+                answer.status,
+                element(&text, "Code").unwrap_or_default(),
+                element(&text, "Message").unwrap_or_default()
+            );
+            if reads && answer.status == 404 {
+                Came::Failed(format!("an acknowledged object missing: {said}"))
             } else {
-                let text = String::from_utf8_lossy(&body.0);
-                Came::Refused(format!(
-                    "HTTP {} {} {}",
-                    answer.status,
-                    element(&text, "Code").unwrap_or_default(),
-                    element(&text, "Message").unwrap_or_default()
-                ))
+                Came::Refused(said)
             }
         };
         let mut dropped = Kept(Vec::new());
@@ -1740,7 +1790,7 @@ impl Work {
                         "partNumber=1&uploadId={}",
                         sigv4::uri_encode(upload.id.as_bytes(), true)
                     ),
-                    (Kind::Part, None) => return Ok(Came::Refused("no upload created".into())),
+                    (Kind::Part, None) => return Ok(Came::Skipped),
                     _ => String::new(),
                 };
                 let request = Request {
@@ -1848,7 +1898,7 @@ impl Work {
                     (Kind::Abort, Some(upload)) => {
                         format!("uploadId={}", sigv4::uri_encode(upload.id.as_bytes(), true))
                     }
-                    (Kind::Abort, None) => return Ok(Came::Refused("no upload created".into())),
+                    (Kind::Abort, None) => return Ok(Came::Skipped),
                     _ => String::new(),
                 };
                 let request = Request::bare("DELETE", &path, &query);
@@ -1880,10 +1930,10 @@ impl Work {
             }
             Kind::Parts => {
                 let Some(upload) = self.upload(i) else {
-                    return Ok(Came::Refused("no upload created".into()));
+                    return Ok(Came::Skipped);
                 };
                 if upload.part.is_none() {
-                    return Ok(Came::Refused("no part uploaded".into()));
+                    return Ok(Came::Skipped);
                 }
                 let query = format!("uploadId={}", sigv4::uri_encode(upload.id.as_bytes(), true));
                 let request = Request::bare("GET", &path, &query);
@@ -1904,7 +1954,7 @@ impl Work {
                     part: Some(part),
                 }) = self.upload(i)
                 else {
-                    return Ok(Came::Refused("no part uploaded".into()));
+                    return Ok(Came::Skipped);
                 };
                 let query = format!("uploadId={}", sigv4::uri_encode(upload.as_bytes(), true));
                 let body = format!(
@@ -2082,9 +2132,11 @@ struct Bench<'o> {
     failures: u64,
     /// Of the failures, the reads whose bytes or length differed from what was put.
     differed: u64,
-    /// Of the failures, the operations the server refused, and those it never answered.
+    /// Of the failures, the operations the server refused, and those it never answered; and the
+    /// operations not asked for want of what a failed one would have made.
     refused: u64,
     unanswered: u64,
+    skipped: u64,
     /// The most the harness's own work held in any phase, set aside (a counting build's).
     harness_peak: i64,
     /// The most threads the process ran in any phase.
@@ -2387,6 +2439,7 @@ impl<'o> Bench<'o> {
             self.differed = self.differed.saturating_add(tally.differed);
             self.refused = self.refused.saturating_add(tally.refused);
             self.unanswered = self.unanswered.saturating_add(tally.unanswered);
+            self.skipped = self.skipped.saturating_add(tally.skipped);
             self.exact &= tally.failed == 0;
         }
         self.threads = self.threads.max(tally.threads);
@@ -2465,7 +2518,7 @@ impl<'o> Bench<'o> {
             "doors {} {} {} {} clients {} elapsed_ms {} ops {ops} allocs/op {} reallocs/op {} moved/op {} bytes/op {} peak_live/request {} peak_live/connection {} \
              client_allocs/op {} client_bytes/op {} minor_faults/op {} major_faults/op {} user_ns/op {} system_ns/op {} instructions/op {} cycles/op {} switches/op {} \
              wire_bytes/op {} datagrams/op {} server_footprint_bytes {} harness_allocs/op {} harness_peak_live_bytes {} out_most {} threads {} \
-             latency_us p50 {} p50_95 {} p99 {} p99.9 {} p99.99 {} max {} generator_cpu_ns/op {} lateness_us p99 {} refused {} unanswered {} differed {} again {} failed {}",
+             latency_us p50 {} p50_95 {} p99 {} p99.9 {} p99.99 {} max {} generator_cpu_ns/op {} lateness_us p99 {} refused {} unanswered {} skipped {} differed {} again {} failed {}",
             self.named(m.door),
             m.kind.name(),
             m.size,
@@ -2521,6 +2574,7 @@ impl<'o> Bench<'o> {
             },
             t.refused,
             t.unanswered,
+            t.skipped,
             t.differed,
             m.again,
             t.failed,
@@ -2653,6 +2707,7 @@ impl<'o> Bench<'o> {
         let work = Rc::new(Work {
             etags: Rc::clone(shared.0),
             uploads: Rc::clone(shared.1),
+            oracle: Rc::clone(shared.2),
             ..self.work(door, kind, keys)?
         });
         self.ladder(out, &work, name, (from, n, end, false))
@@ -2692,6 +2747,17 @@ impl<'o> Bench<'o> {
             Rc::new(Vec::new())
         };
         let uploads = Rc::new(RefCell::new(Vec::new()));
+        // The most objects a phase's steps make: one step open loop; closed, a ladder's steps, its
+        // clients doubling up to `--clients`.
+        let steps = match self.options.load {
+            Load::Open(_) => 1,
+            Load::Closed => u64::from(self.options.clients.max(1).ilog2()).saturating_add(1),
+        };
+        let most = n.saturating_mul(steps);
+        // The objects the reads read whose puts were acknowledged, a bit each, which the put that
+        // made them keeps and the reads ask of; every other phase keeps none.
+        let put = Rc::new(RefCell::new(Oracle::new(most).map_err(failed)?));
+        let none = Rc::new(RefCell::new(Oracle::new(0).map_err(failed)?));
         let keyed = |kind: char, made: Option<u64>| Keys::Sized { size, kind, made };
         let phase = |kind: Kind, keys: Keys| (door, kind, keys);
         let mut made = 0;
@@ -2699,14 +2765,14 @@ impl<'o> Bench<'o> {
             made = self.sized_phase(
                 out,
                 phase(Kind::Put, keyed('p', None)),
-                (&etags, &uploads),
+                (&etags, &uploads, &put),
                 (&name, 0, n, u64::MAX),
             )?;
         }
         let streamed = self.sized_phase(
             out,
             phase(Kind::Stream, keyed('s', None)),
-            (&etags, &uploads),
+            (&etags, &uploads, if whole { &none } else { &put }),
             (&name, 0, n, u64::MAX),
         )?;
         let (read, made) = if whole { ('p', made) } else { ('s', streamed) };
@@ -2715,7 +2781,7 @@ impl<'o> Bench<'o> {
                 self.sized_phase(
                     out,
                     phase(kind, keyed(read, Some(made))),
-                    (&etags, &uploads),
+                    (&etags, &uploads, &put),
                     (&name, 0, n, u64::MAX),
                 )?;
             }
@@ -2723,15 +2789,10 @@ impl<'o> Bench<'o> {
         if whole {
             let parts = self.etags(door, (size, 'm'), n)?;
             // A slot for each upload a ladder of creates may make, each create filling its own.
-            let steps = match self.options.load {
-                Load::Open(_) => 1,
-                Load::Closed => u64::from(self.options.clients.max(1).ilog2()).saturating_add(1),
-            };
-            let most = n.saturating_mul(steps);
             uploads
                 .borrow_mut()
                 .resize(usize::try_from(most).map_err(failed)?, Upload::default());
-            let shared = (&parts, &uploads);
+            let shared = (&parts, &uploads, &none);
             let created = self.sized_phase(
                 out,
                 phase(Kind::Create, keyed('m', None)),
@@ -2768,7 +2829,7 @@ impl<'o> Bench<'o> {
         self.sized_phase(
             out,
             phase(Kind::Delete, keyed(read, None)),
-            (&etags, &uploads),
+            (&etags, &uploads, &none),
             (&name, 0, n, made),
         )?;
         Ok(())
@@ -3047,6 +3108,7 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
         differed: 0,
         refused: 0,
         unanswered: 0,
+        skipped: 0,
         harness_peak: 0,
         threads: 0,
         phases: 0,
@@ -3087,8 +3149,8 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
     let controls = u32::try_from(doors.len()).unwrap_or(0).saturating_mul(3);
     writeln!(
         out,
-        "doors verified ops {} differed {} refused {} unanswered {} failed {} controls caught {caught} of {controls}",
-        bench.ops, bench.differed, bench.refused, bench.unanswered, bench.failures
+        "doors verified ops {} differed {} refused {} unanswered {} skipped {} failed {} controls caught {caught} of {controls}",
+        bench.ops, bench.differed, bench.refused, bench.unanswered, bench.skipped, bench.failures
     )?;
     Ok(bench.exact && caught == controls)
 }
@@ -3212,6 +3274,12 @@ impl Bench<'_> {
                         Came::Lost(why) => {
                             return Err(failed(format!(
                                 "a control's object was not put through the {} door: unanswered: {why}",
+                                door.name()
+                            )));
+                        }
+                        Came::Skipped => {
+                            return Err(failed(format!(
+                                "a control's object was not put through the {} door: not asked",
                                 door.name()
                             )));
                         }

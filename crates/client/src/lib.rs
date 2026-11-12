@@ -82,15 +82,15 @@ pub const ATTEMPTS: u32 = 3;
 /// `_NO_RETRY_INCREMENT = 1` and one answered after them the units they took, never past the
 /// first): Brooker's local token bucket, so a client whose requests keep being slowed stops asking
 /// again rather than multiply the load (research/77 [5], D4).
-const QUOTA: u32 = 500;
-const SLOWED_RETRY: u32 = 5;
-const UNRETRIED_REFUND: u32 = 1;
+pub const QUOTA: u32 = 500;
+pub const SLOWED_RETRY: u32 = 5;
+pub const UNRETRIED_REFUND: u32 = 1;
 
 /// A slowed request's backoff, botocore's standard mode's for a throttling error
 /// (`ExponentialBackoff`: `throttling_base_scale` 1 second, `_MAX_BACKOFF = 20` seconds): its
 /// `n`-th wait full jitter over `min(2^(n-1) s, 20 s)` (`bounds::full_jitter`).
-const SLOWED_BASE: Duration = Duration::from_secs(1);
-const SLOWED_MOST: Duration = Duration::from_secs(20);
+pub const SLOWED_BASE: Duration = Duration::from_secs(1);
+pub const SLOWED_MOST: Duration = Duration::from_secs(20);
 
 /// The checksum a put states in its trailer unless its caller names another: CRC-64/NVME, the one
 /// S3 keeps for an object uploaded without one, and a full-object value across a multipart

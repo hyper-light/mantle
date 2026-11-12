@@ -35,8 +35,9 @@
 //! authority (`mantle_cert::client`: `client-ID`, that account, clientAuth alone) and an owner-only
 //! key, and writes the client's directory NAME: `identity/` (the authority's certificate, the
 //! client's own and its key) and `config` (its id, those files, and a `node = ID ADDR` line for
-//! each founder), which `mantle`'s object commands read. No node's configuration names a client:
-//! nodes admit one by its certificate (node.md §3.6).
+//! each founder), which `mantle`'s object commands read through the native door, and `s3/`, its own
+//! copy of the cell's S3 profile, which they read through the S3 door (docs/design/doors.md §2). No
+//! node's configuration names a client: nodes admit one by its certificate (node.md §3.6).
 
 use std::fmt;
 use std::io::Write;
@@ -54,6 +55,7 @@ use mantle_meta::root::MAX_DOMAIN;
 use mantle_protocol::node_name;
 
 use crate::files;
+use crate::profile::PROFILE;
 
 /// RFC 5280 §4.1.2.5: "To indicate that a certificate has no well-defined expiration date, the
 /// notAfter SHOULD be assigned the GeneralizedTime value of 99991231235959Z", in Unix seconds.
@@ -203,7 +205,7 @@ impl Cell {
 
 /// S3's default region (S3 API Reference, CreateBucket: "If you don't specify a Region, the bucket
 /// is created in the US East (N. Virginia) Region (us-east-1) by default").
-const DEFAULT_REGION: &str = "us-east-1";
+pub(crate) const DEFAULT_REGION: &str = "us-east-1";
 
 /// A byte count, with a K, M, G or T suffix for a power of 1024.
 pub fn parse_bytes(text: &str) -> Result<u64, String> {
@@ -552,10 +554,6 @@ fn endpoint_url(founder: &Founder) -> Option<String> {
     };
     Some(format!("{scheme}://{host}:{}", at.port()))
 }
-
-/// The profile stock S3 clients take the cell by (AWS SDKs and Tools Reference Guide, the shared
-/// config and credentials files), named `mantle`.
-const PROFILE: &str = "mantle";
 
 /// The operator's S3 profile in `dir` (OUT/s3; research/71): the access key as AWS's shared
 /// credentials file, owner-only; the endpoint's authority as PEM; and where `url` names the
@@ -963,6 +961,23 @@ pub fn client(said: &mut impl Write, out: &Path, cell: &Path) -> Result<(), Erro
         config.push_str(&format!("node = {node} {quic}\n"));
     }
     files::write(&out.join("config"), config.as_bytes())?;
+    // The cell's S3 profile, the client's own copy: the key, region and endpoint its S3 door signs
+    // for and dials, and the endpoint's authority (`--door s3`, src/door.rs), a profile stock S3
+    // clients take as well.
+    let given =
+        crate::profile::Profile::read(&cell.join("s3")).map_err(|e| Error::Cell(e.to_string()))?;
+    let s3 = out.join("s3");
+    files::create_dir(&s3)?;
+    profile(
+        &s3,
+        &AccessKey {
+            account: account.clone(),
+            id: given.id,
+            secret: given.secret,
+        },
+        (&given.region, given.endpoint.as_deref()),
+        &mantle_cert::pem(&given.authority),
+    )?;
     writeln!(
         said,
         "client {id} {}: account {account}, {} nodes",

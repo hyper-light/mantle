@@ -28,12 +28,15 @@ mod bench_s3;
 mod client;
 mod disk;
 mod display;
+mod door;
 mod drive;
 mod durability;
 mod files;
 mod init;
 mod journal;
 mod pack;
+mod profile;
+mod s3_code;
 mod transfer;
 
 #[derive(Parser)]
@@ -49,6 +52,11 @@ struct Cli {
     /// cell as; `MANTLE_CLIENT` where none is given.
     #[arg(long, global = true)]
     client: Option<PathBuf>,
+    /// The door the object commands ask the cell through: `native`, its own protocol over QUIC,
+    /// or `s3`, S3's HTTP API at the endpoint the client's S3 profile names; `MANTLE_DOOR` where
+    /// none is given, else `native` (docs/design/doors.md).
+    #[arg(long, global = true)]
+    door: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -654,7 +662,18 @@ fn main() -> ExitCode {
                 .clone()
                 .or_else(|| std::env::var_os("MANTLE_CLIENT").map(PathBuf::from))
                 .ok_or_else(|| "no client: --client DIR or MANTLE_CLIENT".to_owned())?;
-            client::run(&dir, command, std::io::stdout()).map_err(|e| e.to_string())
+            // The command line over the environment, as the AWS CLI's own settings rank
+            // (docs/research/86 [1]).
+            let named = cli
+                .door
+                .clone()
+                .or_else(|| std::env::var("MANTLE_DOOR").ok());
+            let door = match named.as_deref() {
+                None => client::Door::Native,
+                Some(text) => client::Door::named(text)
+                    .ok_or_else(|| format!("--door {text}: native or s3"))?,
+            };
+            client::run(&dir, door, command, std::io::stdout()).map_err(|e| e.to_string())
         });
         return exit(ran);
     }

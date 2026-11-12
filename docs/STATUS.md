@@ -20,6 +20,16 @@ back through both:
 - *The native QUIC door*: the `mantle-client` crate and `mantle`'s object commands, for other
   hyper-light projects, streaming any object in bounded memory, uploads of any size in runs the
   node cuts, resumable (below, "Clients of mantle's own protocol"; gateway.md §6).
+- *The client through both doors* (2026-11-12): every object command of `mantle` asks through the
+  door its operator names, `--door native` or `--door s3` (else `MANTLE_DOOR`, else native); the S3
+  door is S3's own operations over mantle's codec, SigV4-signed with the S3 profile `mantle init
+  client` gives the client, TLS off loopback, listings paged, errors typed by S3's 94 codes, copies
+  streamed `aws-chunked` with a trailing CRC-64/NVME and resumed from a journal of their multipart
+  uploads (docs/design/doors.md; research/86).
+- *The release* (docs/design/release.md): one archive a supported target of the one binary, built
+  and checked on its own runner on every push and pull request, every object command through both
+  doors and the AWS CLI against a cell of three, each object read back through the other door byte
+  for byte; a pushed tag publishes them once the gates pass.
 - *Scale*: the transfer harness (`mantle bench transfer`,
   [harness](measurements/2026-10-27-transfer-harness.md)) checks every byte against its generator
   through both doors, every block's chunks on distinct nodes, every acknowledged object read back

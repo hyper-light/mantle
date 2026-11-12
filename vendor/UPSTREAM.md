@@ -87,7 +87,12 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `fb74b59` (hyper-raft `main`), with no local delta**, taken by
+**Every crate at `33733b5` (hyper-raft branch `doors-wire-bytes`: `main`'s `fb74b59` and one
+commit), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. Its commit changes
+hyper-rt alone: a batched socket counts its datagrams' payload bytes, sent and received, beside the
+datagrams (`IoStats::sent_bytes`, `received_bytes`; hyper-raft docs/runtime.md), which
+mantle-client's `Client::wire` sums over its sockets for `mantle bench doors`' native wire bytes.
+Before it, every crate was at `fb74b59` (hyper-raft `main`), with no local delta, taken by
 `scripts/snapshot-hyper-raft.py`. Past `3d6640f` it brings a member's catch-up read from the log's
 file off the device and off its owner's thread (`8203466`; `Answers` passes on the two methods a
 wrapping store must, `LogStore::catch_up` and `LogStore::entries_or_catch_up`), the run read after

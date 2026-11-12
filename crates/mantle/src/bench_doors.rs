@@ -11,7 +11,10 @@
 //! against the MD5 of those bytes for each phase's first [`ETAGS`] keys. A set's acknowledged
 //! objects are a bit each (`transfer::Oracle`). Three controls, a byte flipped on its way to the
 //! check, a key never put and an ETag expected of another object, must each be reported as
-//! failures, or the run is not exact.
+//! failures, or the run is not exact. A phase's failures are told apart: `refused`, answered with
+//! an error; `unanswered`, throttled or lost on every attempt (each operation asked again as the
+//! AWS SDKs ask one, a listing's page among them); `differed`, a read whose bytes or length were
+//! not what was put; and the checks' others (an ETag, a size, a listing's count), the rest.
 //!
 //! A phase is one door, one operation and one size, and says one line: what the three servers
 //! counted while it ran, per operation (each answers `counts` on its standard input: its
@@ -308,6 +311,9 @@ enum Came {
     /// Its exchange ended unanswered (`ClientError::Lost`, said): asked again with its identity,
     /// which the node answers from what it made.
     Lost(String),
+    /// Throttled or lost on every attempt it was given: the server's failure to answer, counted
+    /// apart from the checks' failures.
+    Unanswered(String),
 }
 
 /// A native reply, or what its exchange came to where it is to be asked again.
@@ -984,6 +990,9 @@ struct Tally {
     refused: u64,
     /// Of the failed, the reads whose bytes or length were not what was put ([`Came::Differed`]).
     differed: u64,
+    /// Of the failed, those never answered, throttled or lost on every attempt
+    /// ([`Came::Unanswered`]).
+    unanswered: u64,
     /// The most requests out at once.
     most: usize,
     /// The most threads the process ran as the OS counted them, read each time more requests
@@ -1106,14 +1115,16 @@ async fn client(mut logical: Logical, work: Rc<Work>, shared: Rc<RefCell<Shared>
                     tally.first.get_or_insert(why);
                     false
                 }
-                Ok(Came::Slowed) => {
+                Ok(Came::Unanswered(why) | Came::Lost(why)) => {
                     tally.failed = tally.failed.saturating_add(1);
-                    tally.first.get_or_insert_with(|| "SlowDown".to_owned());
+                    tally.unanswered = tally.unanswered.saturating_add(1);
+                    tally.first.get_or_insert(why);
                     false
                 }
-                Ok(Came::Lost(why)) => {
+                Ok(Came::Slowed) => {
                     tally.failed = tally.failed.saturating_add(1);
-                    tally.first.get_or_insert(format!("unanswered: {why}"));
+                    tally.unanswered = tally.unanswered.saturating_add(1);
+                    tally.first.get_or_insert_with(|| "SlowDown".to_owned());
                     false
                 }
                 Err(e) => {
@@ -1147,6 +1158,7 @@ async fn phase(
                 failed: 0,
                 refused: 0,
                 differed: 0,
+                unanswered: 0,
                 most: 0,
                 threads: 0,
                 first: None,
@@ -1214,7 +1226,14 @@ impl Work {
     async fn run(&self, logical: &mut Logical, j: u64) -> Result<Came, Error> {
         let Logical { conn, key, scratch } = logical;
         if self.kind == Kind::List {
-            return self.list(conn, key).await;
+            let mut again = 0u32;
+            let came = loop {
+                let came = self.list(conn, key).await?;
+                if !self.again_after(&came, j, &mut again).await? {
+                    break came;
+                }
+            };
+            return Ok(self.settled(came, again));
         }
         let Some((i, length)) = self.key(j, key)? else {
             return Ok(Came::Done);
@@ -1231,48 +1250,59 @@ impl Work {
                 }
                 Conn::Http(http) => self.http(http, (i, key, length), &object, scratch).await?,
             };
-            let retry = matches!(came, Came::Slowed | Came::Lost(_));
-            if !retry || again.saturating_add(1) >= mantle_client::ATTEMPTS {
+            if !self.again_after(&came, j, &mut again).await? {
                 break came;
             }
-            again = again.saturating_add(1);
-            if matches!(came, Came::Slowed) {
-                let cap = SLOWED_BASE_NS
-                    .saturating_mul(
-                        1u64.checked_shl(again.saturating_sub(1))
-                            .unwrap_or(u64::MAX),
-                    )
-                    .min(SLOWED_MOST_NS);
-                let pause = mantle_protocol::bounds::full_jitter(
-                    std::time::Duration::from_nanos(cap),
-                    j,
-                    again,
-                );
-                sleep(u64::try_from(pause.as_nanos()).unwrap_or(u64::MAX))
-                    .await
-                    .map_err(|e| failed(format!("{e:?}")))?;
-            }
         };
-        harness(|| {
-            self.again
-                .set(self.again.get().saturating_add(u64::from(again)))
-        });
         if matches!(came, Came::Done)
             && self.kind == Kind::Put
             && matches!(self.keys, Keys::Set { .. })
         {
             harness(|| self.oracle.borrow_mut().set(i));
         }
-        Ok(match came {
-            Came::Slowed => {
-                Came::Failed(format!("SlowDown, asked {} times", again.saturating_add(1)))
-            }
-            Came::Lost(why) => Came::Failed(format!(
-                "unanswered ({why}), asked {} times",
-                again.saturating_add(1)
-            )),
+        Ok(self.settled(came, again))
+    }
+
+    /// Whether operation `j` is asked again after `came`, as the AWS SDKs ask a request again: one
+    /// throttled (`SlowDown`) after a pause drawn as botocore's standard retry mode draws it, one
+    /// whose exchange ended unanswered at once, each up to mantle-client's attempts in all. Counts
+    /// the asking in `again` and in the phase's.
+    async fn again_after(&self, came: &Came, j: u64, again: &mut u32) -> Result<bool, Error> {
+        let retry = matches!(came, Came::Slowed | Came::Lost(_));
+        if !retry || again.saturating_add(1) >= mantle_client::ATTEMPTS {
+            return Ok(false);
+        }
+        *again = again.saturating_add(1);
+        harness(|| self.again.set(self.again.get().saturating_add(1)));
+        if matches!(came, Came::Slowed) {
+            let cap = SLOWED_BASE_NS
+                .saturating_mul(
+                    1u64.checked_shl(again.saturating_sub(1))
+                        .unwrap_or(u64::MAX),
+                )
+                .min(SLOWED_MOST_NS);
+            let pause = mantle_protocol::bounds::full_jitter(
+                std::time::Duration::from_nanos(cap),
+                j,
+                *again,
+            );
+            sleep(u64::try_from(pause.as_nanos()).unwrap_or(u64::MAX))
+                .await
+                .map_err(|e| failed(format!("{e:?}")))?;
+        }
+        Ok(true)
+    }
+
+    /// What an operation came to once it was asked as often as it may be: throttled or lost on its
+    /// every attempt, it was never answered, a failure of the server's to answer rather than of a
+    /// check (`Came::Unanswered`).
+    fn settled(&self, came: Came, again: u32) -> Came {
+        let asked = again.saturating_add(1);
+        match came {
+            Came::Slowed => Came::Unanswered(format!("SlowDown, asked {asked} times")),
+            Came::Lost(why) => Came::Unanswered(format!("unanswered ({why}), asked {asked} times")),
             came => came,
-        })
+        }
     }
 
     /// The range a ranged get reads of an object of `length` bytes: its middle third, a byte at
@@ -1847,7 +1877,8 @@ impl Work {
     /// The listing's next page, from where the last one ended; its keys are counted, and once it
     /// ends their number is checked against the objects acknowledged. The set's prefix is written
     /// into the client's key buffer, and where the page starts is moved out of the listing and the
-    /// next page's moved in, so the harness allocates nothing for a page.
+    /// next page's moved in, so the harness allocates nothing for a page; a page not had puts its
+    /// start back, so asking again asks the same page.
     async fn list(&self, conn: &mut Conn, prefix: &mut String) -> Result<Came, Error> {
         let Keys::Set { count, .. } = self.keys else {
             return Ok(Came::Failed("a listing of no set".into()));
@@ -1860,15 +1891,48 @@ impl Work {
             return Ok(Came::Done);
         };
         harness(|| write_key(prefix, format_args!("set{count}/")))?;
-        let prefix = prefix.as_str();
-        let (keys, next) = match conn {
+        let (keys, next) = match self.page(conn, prefix, start.as_ref()).await? {
+            Ok(page) => page,
+            Err(came) => {
+                harness(|| self.listing.borrow_mut().next = start);
+                return Ok(came);
+            }
+        };
+        let keys = u64::try_from(keys).map_err(failed)?;
+        let (ended, listed, acknowledged) = harness(|| {
+            let mut listing = self.listing.borrow_mut();
+            listing.listed = listing.listed.saturating_add(keys);
+            listing.ended = next.is_none();
+            listing.next = next;
+            (
+                listing.ended,
+                listing.listed,
+                self.oracle.borrow().acknowledged(),
+            )
+        });
+        Ok(if ended && listed != acknowledged {
+            Came::Failed(format!("{listed} keys listed, {acknowledged} acknowledged"))
+        } else {
+            Came::Done
+        })
+    }
+
+    /// A page of the keys under `prefix` from `start`: how many it listed and where the next
+    /// starts, or what asking it came to where it was not had.
+    async fn page(
+        &self,
+        conn: &mut Conn,
+        prefix: &str,
+        start: Option<&Next>,
+    ) -> Result<Result<(usize, Option<Next>), Came>, Error> {
+        match conn {
             Conn::Native(client) => {
                 let op = Op::List(List {
                     bucket: BUCKET.to_owned(),
                     prefix: prefix.to_owned(),
                     delimiter: String::new(),
                     start: match start {
-                        Some(Next::Native(resume)) => Some(resume),
+                        Some(Next::Native(resume)) => Some(resume.clone()),
                         _ => None,
                     },
                     max_keys: PAGE,
@@ -1876,22 +1940,22 @@ impl Work {
                 });
                 let reply = match answered(client.call(&op, u64::MAX).await)? {
                     Ok(reply) => reply,
-                    Err(came) => return Ok(came),
+                    Err(came) => return Ok(Err(came)),
                 };
-                match reply.listing {
-                    Some(Listing::Keys(page)) => (
+                Ok(match reply.listing {
+                    Some(Listing::Keys(page)) => Ok((
                         page.contents.len(),
                         if page.truncated {
                             page.next.map(Next::Native)
                         } else {
                             None
                         },
-                    ),
-                    _ => return Ok(Came::Failed(format!("{:?}", reply.status))),
-                }
+                    )),
+                    _ => Err(Came::Refused(format!("{:?}", reply.status))),
+                })
             }
             Conn::Http(http) => {
-                let token = match &start {
+                let token = match start {
                     Some(Next::Token(token)) => format!(
                         "&continuation-token={}",
                         sigv4::uri_encode(token.as_bytes(), true)
@@ -1913,38 +1977,24 @@ impl Work {
                     )
                     .await?;
                 let text = String::from_utf8_lossy(&kept.0);
+                if answer.status == 503 {
+                    return Ok(Err(Came::Slowed));
+                }
                 if answer.status != 200 {
-                    return Ok(Came::Refused(format!(
+                    return Ok(Err(Came::Refused(format!(
                         "HTTP {} {}",
                         answer.status,
                         element(&text, "Code").unwrap_or_default()
-                    )));
+                    ))));
                 }
                 let next = (element(&text, "IsTruncated") == Some("true"))
                     .then(|| {
                         element(&text, "NextContinuationToken").map(|t| Next::Token(t.to_owned()))
                     })
                     .flatten();
-                (text.matches("<Key>").count(), next)
+                Ok(Ok((text.matches("<Key>").count(), next)))
             }
-        };
-        let keys = u64::try_from(keys).map_err(failed)?;
-        let (ended, listed, acknowledged) = harness(|| {
-            let mut listing = self.listing.borrow_mut();
-            listing.listed = listing.listed.saturating_add(keys);
-            listing.ended = next.is_none();
-            listing.next = next;
-            (
-                listing.ended,
-                listing.listed,
-                self.oracle.borrow().acknowledged(),
-            )
-        });
-        Ok(if ended && listed != acknowledged {
-            Came::Failed(format!("{listed} keys listed, {acknowledged} acknowledged"))
-        } else {
-            Came::Done
-        })
+        }
     }
 }
 
@@ -1970,6 +2020,9 @@ struct Bench<'o> {
     failures: u64,
     /// Of the failures, the reads whose bytes or length differed from what was put.
     differed: u64,
+    /// Of the failures, the operations the server refused, and those it never answered.
+    refused: u64,
+    unanswered: u64,
     /// The most the harness's own work held in any phase, set aside (a counting build's).
     harness_peak: i64,
     /// The most threads the process ran in any phase.
@@ -2270,6 +2323,8 @@ impl<'o> Bench<'o> {
         if !excluded {
             self.failures = self.failures.saturating_add(tally.failed);
             self.differed = self.differed.saturating_add(tally.differed);
+            self.refused = self.refused.saturating_add(tally.refused);
+            self.unanswered = self.unanswered.saturating_add(tally.unanswered);
             self.exact &= tally.failed == 0;
         }
         self.threads = self.threads.max(tally.threads);
@@ -2348,7 +2403,7 @@ impl<'o> Bench<'o> {
             "doors {} {} {} {} clients {} elapsed_ms {} ops {ops} allocs/op {} reallocs/op {} moved/op {} bytes/op {} peak_live/request {} peak_live/connection {} \
              client_allocs/op {} client_bytes/op {} minor_faults/op {} major_faults/op {} user_ns/op {} system_ns/op {} instructions/op {} cycles/op {} switches/op {} \
              wire_bytes/op {} datagrams/op {} server_footprint_bytes {} harness_allocs/op {} harness_peak_live_bytes {} out_most {} threads {} \
-             latency_us p50 {} p50_95 {} p99 {} p99.9 {} p99.99 {} max {} generator_cpu_ns/op {} lateness_us p99 {} differed {} again {} failed {}",
+             latency_us p50 {} p50_95 {} p99 {} p99.9 {} p99.99 {} max {} generator_cpu_ns/op {} lateness_us p99 {} refused {} unanswered {} differed {} again {} failed {}",
             self.named(m.door),
             m.kind.name(),
             m.size,
@@ -2402,6 +2457,8 @@ impl<'o> Bench<'o> {
             } else {
                 "-".to_owned()
             },
+            t.refused,
+            t.unanswered,
             t.differed,
             m.again,
             t.failed,
@@ -2920,6 +2977,8 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
         ops: 0,
         failures: 0,
         differed: 0,
+        refused: 0,
+        unanswered: 0,
         harness_peak: 0,
         threads: 0,
         phases: 0,
@@ -2960,8 +3019,8 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
     let controls = u32::try_from(doors.len()).unwrap_or(0).saturating_mul(3);
     writeln!(
         out,
-        "doors verified ops {} differed {} failed {} controls caught {caught} of {controls}",
-        bench.ops, bench.differed, bench.failures
+        "doors verified ops {} differed {} refused {} unanswered {} failed {} controls caught {caught} of {controls}",
+        bench.ops, bench.differed, bench.refused, bench.unanswered, bench.failures
     )?;
     Ok(bench.exact && caught == controls)
 }
@@ -3067,7 +3126,10 @@ impl Bench<'_> {
                     };
                     match put {
                         Came::Done => {}
-                        Came::Failed(why) | Came::Refused(why) | Came::Differed(why) => {
+                        Came::Failed(why)
+                        | Came::Refused(why)
+                        | Came::Differed(why)
+                        | Came::Unanswered(why) => {
                             return Err(failed(format!(
                                 "a control's object was not put through the {} door: {why}",
                                 door.name()

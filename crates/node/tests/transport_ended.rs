@@ -152,3 +152,104 @@ fn a_reply_told_after_its_connection_was_lost_has_no_head_and_its_refusal_follow
         "{told:?}"
     );
 }
+
+/// A chunk's put that node 2 refuses for room before it reads any of it, as a node does whose
+/// volumes' room for incoming chunks is taken (`Node::on_event`'s `Refusal::Budget`): node 2's
+/// refusal reaches node 1 with its acknowledgement of the put's first bytes, and node 1's
+/// transport, taking both before its owner's turn, tells it first that it may write more and then
+/// the refusal, the exchange ended between them. The owner, taking its events one at a time as a
+/// node does, writes on the first and finds the exchange unknown; the refusal it takes next says
+/// what came of the put, `Budget`, which asks the chunk again once room frees. A node that took the
+/// unknown exchange for a loss of its own, `Closed`, told the gateway's put a volume refused its
+/// chunk, and the put failed `Unplaced`, answered `SlowDown` (the transfer suite's CLI put on
+/// linux-x86_64-2cpu-busy and linux-aarch64-1cpu, 2026-11-11).
+#[test]
+fn a_write_told_before_its_put_was_refused_finds_it_unknown_and_the_refusal_follows() {
+    let least = bounds::least_transport(&stated(0)).unwrap();
+    classes::state_bounds(stated(least).messages).unwrap();
+    let mut net = Net::new(
+        &certificates(),
+        &stated(least),
+        Instant::now(),
+        (VecDeque::new(), Vec::new()),
+    );
+    net.connect();
+    let body = vec![7u8; 8 << 20];
+    let head = mantle_node::chunk::Put {
+        volume: 1,
+        key: mantle_chunk::ChunkKey {
+            block: 1,
+            epoch: 0,
+            index: 0,
+        },
+        crc32c: 0,
+        remaining_ns: 0,
+    }
+    .encode();
+    let deadline = Progress::new(Duration::from_secs(3_600)).unwrap();
+    let put = net.nodes[0]
+        .open(
+            net.now,
+            2,
+            Kind::ChunkPut,
+            &head,
+            Some(body.len() as u64),
+            deadline,
+        )
+        .unwrap();
+    let written = net.nodes[0].write_body(put, &body).unwrap();
+    assert!(
+        written < body.len(),
+        "the body went whole on node 1's first credit"
+    );
+    // Node 1's first bytes reach node 2, which acknowledges them and, at its turn, refuses the
+    // put for room as its request is taken; both reach node 1 before node 1's next turn, as they
+    // do a node starved of its CPU.
+    net.send(0);
+    net.deliver();
+    net.send(1);
+    let taken = std::iter::from_fn(|| net.nodes[1].poll_event())
+        .find_map(|event| match event {
+            Event::Request { exchange, .. } => Some(exchange),
+            _ => None,
+        })
+        .expect("node 2 was told of the put");
+    net.nodes[1].refuse_exchange(taken, Refusal::Budget);
+    net.send(1);
+    // Node 1's turn: what arrived, then its events, each acted on as it is taken.
+    net.deliver();
+    let mut told = Vec::new();
+    while let Some(event) = net.nodes[0].poll_event() {
+        let wrote = match &event {
+            Event::Writable { exchange } if *exchange == put => {
+                Some(net.nodes[0].write_body(put, &body[written..]))
+            }
+            _ => None,
+        };
+        told.push((event, wrote));
+    }
+    let of_put: Vec<&(Event<_>, Option<Result<usize, Refusal>>)> = told
+        .iter()
+        .filter(|(event, _)| {
+            matches!(event, Event::Writable { exchange } | Event::Refused { exchange, .. }
+                if *exchange == put)
+        })
+        .collect();
+    assert!(
+        matches!(
+            of_put.as_slice(),
+            [
+                (Event::Writable { .. }, Some(Err(Refusal::UnknownExchange))),
+                (
+                    Event::Refused {
+                        refusal: Refusal::Budget,
+                        by_peer: true,
+                        ..
+                    },
+                    None
+                )
+            ]
+        ),
+        "{told:?}"
+    );
+}

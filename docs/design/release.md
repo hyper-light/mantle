@@ -34,21 +34,30 @@ mantle archive is built and checked on the kind of machine it is for.
 
 **Linux.** A binary takes each glibc symbol at the version its build host's glibc has, so it runs
 where glibc is at least the newest version among those it takes. The Linux archives are built on
-Ubuntu 22.04, the oldest Ubuntu GitHub runs, whose glibc is 2.35 (research/85 [4], [8]), so they
-take no symbol newer than 2.35's.
+Ubuntu 22.04, the oldest Ubuntu GitHub runs, whose glibc is 2.35 (research/85 [4], [8]). Measured,
+the newest they take is `GLIBC_2.34`, for `__libc_start_main`, `dlsym` and the threads' calls,
+which glibc 2.34 moved into libc, so they run where glibc is 2.34 or newer; beside libc they need
+libm, libgcc_s and the dynamic loader alone (`objdump -T` and `objdump -p` of dry run 42173080345's
+binaries, both architectures). They carry the release profile's line tables, 53 MB of x86_64's 76
+MB (`.debug_*` sections), which macOS and Windows keep outside the binary.
 
 **macOS.** The linker signs an arm64 binary ad hoc, which is all macOS needs to run it; the binary is
 not notarized, so one downloaded by a browser carries the quarantine attribute and Gatekeeper
 refuses it until the attribute is removed (`xattr -d com.apple.quarantine mantle`). It runs on macOS
 11.0 and later (`minos 11.0` in its `LC_BUILD_VERSION`, the least rustc supports on arm64,
 research/85 [11]) and links only the system's libraries: libSystem, libiconv, CoreFoundation and
-IOKit (`otool -L`).
+IOKit (`otool -L` of dry run 42173080345's binary).
 
 **Windows.** The C runtime is linked in (`-C target-feature=+crt-static`, research/85 [9]), the
 release build alone setting it. Linked dynamically, as rustc links it unless told otherwise [9], the
 binary needs Visual C++'s `vcruntime140.dll`, which an application's users "must" be given, since
 "most users probably don't have Visual Studio installed" [10]; the Universal CRT is part of Windows
-10 and later [10]. Linked in, the binary needs no Visual C++ Redistributable on its host.
+10 and later [10]. Linked in, the binary needs no Visual C++ Redistributable on its host: measured,
+each imports Windows' own DLLs alone, `KERNEL32`, `advapi32`, `ntdll`, `ws2_32`,
+`bcryptprimitives` and the core's `realtime` and `synch` API sets (`objdump -p` of dry run
+42173080345's binaries, both architectures). AWS-LC's build sees the choice (`CARGO_ENCODED_RUSTFLAGS`
+in its build log). The Windows archives' `LICENSE` and `README.md` have the CRLF line ends of the
+runner's checkout.
 
 ## 2. How each archive is proven
 

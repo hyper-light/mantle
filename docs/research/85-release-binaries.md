@@ -119,17 +119,16 @@ alone (`crates/node/src/process.rs`; node.md §1.7); `mantle status` exits 0 whi
 process of the node lives (node.md §1.6); the stock clients the gates pin
 (`scripts/stock-clients.sh`); the transfer harness at CI's scale (`crates/mantle/tests/transfer.rs`);
 and `LICENSE`, MIT: "The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software."
-The AWS CLI's multipart threshold, 8 MiB, is research/73 [10]; S3's least part but the last, 5 MiB,
-research/05 §4.1.
+copies or substantial portions of the Software." The AWS CLI's multipart threshold, 8 MiB, is
+research/73 [10]; S3's least part but the last, 5 MiB, research/05 §4.1.
 
 ## What the sources settle
 
 **An archive a target, with its checksum.** vorpal publishes raw binaries [1]. mantle's archive
 carries the license, whose notice must be included in every copy [13], beside the binary and the
 README under one directory, and its SHA-256 lets a download be checked without trusting the
-transport. The
-archive is the target's triple: unambiguous where an OS's name and an architecture's alone are not.
+transport. The archive is named by the target's triple, unambiguous where an OS's name and an
+architecture's alone are not.
 
 **Each target built and checked on its own kind of machine.** GitHub runs every supported target
 natively for a public repository [4], Windows on arm64 included, which vorpal cross-builds [1]. A
@@ -168,8 +167,43 @@ reach scripts through the environment, not the script's text [5].
 **Bounds.** Each check waits on what a process says or on its end; GitHub ends a job at 6 hours
 [12], the bound of every wait the release has.
 
+## Measured in the dry run
+
+Run 42173080345 on `6a8cbe99`, the release branch's first push, built, packed and checked each
+target; its artifacts were then downloaded, each checked against its SHA-256, and read on this Mac
+with Xcode's `objdump` (LLVM's, which reads ELF and PE) and `otool`. Step times are the jobs' own
+(GitHub's API), archive bytes those each `Package` step printed.
+
+| Target | Build | Check | Archive | Binary |
+|---|---|---|---|---|
+| linux-x86_64 | 2.7 min | 4.2 min | 21.1 MB | 75.7 MB |
+| linux-aarch64 | 2.6 min | 3.5 min | 19.7 MB | 76.0 MB |
+| windows-x86_64 | 4.4 min | 5.8 min | 7.2 MB | 20.6 MB |
+| windows-aarch64 | 4.9 min | 8.6 min | 6.9 MB | 18.6 MB |
+| macos-aarch64 | 3.5 min | 3.6 min | 6.6 MB | 19.6 MB |
+
+Build is the release build's step, check the archive's whole check (a cell of three through both
+doors, then the transfer harness), archive and binary their bytes. The Linux binaries' newest glibc
+version is `GLIBC_2.34`, taken by `__libc_start_main`, `dlsym` and seventeen `pthread_*` calls; they
+need `libc.so.6`, `libm.so.6`, `libgcc_s.so.1` and the dynamic loader alone; their `.debug_*`
+sections are 53.0 MB (x86_64) and 55.6 MB (aarch64), the release profile's line tables. Each Windows
+binary imports `KERNEL32.dll`, `advapi32.dll`, `ntdll.dll`, `ws2_32.dll`, `bcryptprimitives.dll`,
+`api-ms-win-core-realtime-l1-1-1.dll` and `api-ms-win-core-synch-l1-2-0.dll`: no Visual C++ runtime
+and no UCRT DLL. The macOS binary takes `minos 11.0` (SDK 15.5), links libSystem, libiconv,
+CoreFoundation and IOKit alone, and is signed ad hoc by the linker (`codesign -dv`: `adhoc,
+linker-signed`). The AWS CLI the check ran was 2.39.0 (macOS), 2.39.1 and 2.39.3, past 2.38.0, from
+which `aws s3` takes the CRT's transfer client by default (the CLI's changelog, as
+crates/mantle/tests/stock_clients.rs cites it); boto3 was 1.43.118 on Python 3.10.12 (Linux),
+3.12.10 and 3.13.17 (Windows) and 3.15.2 (macOS).
+
+The macOS job waited for its runner: created with the others at 06:13:39, it started at 07:24:08,
+70 minutes later, when the other four had been done 56 minutes, and passed at 07:31:56. The gates'
+two macOS jobs from the same push got no runner in the 20 minutes before that run was cancelled.
+
 ## Open
 
 Notarizing the macOS binary and signing the Windows one need the owner's Apple Developer ID and a
 code-signing certificate. Third-party notices for the crates and AWS-LC the binary links in, and
-build provenance attested to GitHub, wait on the owner's choice of tool.
+build provenance attested to GitHub, wait on the owner's choice of tool. Whether the Linux binaries
+keep the release profile's line tables, 53 MB of 76, or ship them apart is the owner's; so is a
+glibc floor below 2.34, or a static musl binary beside the glibc one as vorpal ships [1].

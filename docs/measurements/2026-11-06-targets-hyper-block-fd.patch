@@ -1,0 +1,216 @@
+diff --git a/vendor/hyper-block/src/file.rs b/vendor/hyper-block/src/file.rs
+index b7531e5f..0e72e9a0 100644
+--- a/vendor/hyper-block/src/file.rs
++++ b/vendor/hyper-block/src/file.rs
+@@ -17,6 +17,7 @@
+ use std::fs::{File, OpenOptions};
+ use std::io;
+ use std::path::{Path, PathBuf};
++use std::sync::Arc;
+ 
+ use crate::DiskError;
+ use crate::buf::Alignment;
+@@ -42,7 +43,8 @@ pub enum CachingRequest {
+ /// A file, or a device node, read and written at offsets with the platform's full flush.
+ #[derive(Debug)]
+ pub struct DeviceFile {
+-    file: File,
++    /// The open file, shared with this handle's duplicates ([`DeviceFile::try_clone`]).
++    file: Arc<File>,
+     path: PathBuf,
+     caching: Caching,
+     align: Alignment,
+@@ -114,7 +116,7 @@ impl DeviceFile {
+         };
+         let fills = caching == Caching::Direct && sys::journals_allocation(&file);
+         Ok(Self {
+-            file,
++            file: Arc::new(file),
+             path: path.to_path_buf(),
+             caching,
+             align,
+@@ -126,22 +128,23 @@ impl DeviceFile {
+         })
+     }
+ 
++    /// Whether `other` is a handle of this open file.
++    #[cfg(test)]
++    pub(crate) fn shares_open_file(&self, other: &Self) -> bool {
++        Arc::ptr_eq(&self.file, &other.file)
++    }
++
+     /// The path the file was opened at.
+     pub fn path(&self) -> &Path {
+         &self.path
+     }
+ 
+-    /// A second handle to the same open file (`dup` on Unix, `DuplicateHandle` on Windows,
+-    /// through `File::try_clone`): it shares the open file description, so its direct-I/O
+-    /// setting, and its positional writes and flushes are the file's own.
++    /// A second handle to the same open file, taking no descriptor of its own: it shares the open
++    /// file description, as `dup` and `DuplicateHandle` would, so its direct-I/O setting, and its
++    /// positional writes and flushes are the file's own. The result is the [`BlockFile`] duplicate's.
+     pub fn try_clone(&self) -> Result<Self, DiskError> {
+-        let file = self.file.try_clone().map_err(|source| DiskError::Io {
+-            op: "duplicate",
+-            path: self.path.clone(),
+-            source,
+-        })?;
+         Ok(Self {
+-            file,
++            file: Arc::clone(&self.file),
+             path: self.path.clone(),
+             caching: self.caching,
+             align: self.align,
+diff --git a/vendor/hyper-block/src/segmented.rs b/vendor/hyper-block/src/segmented.rs
+index 7c38cc5a..fe47f114 100644
+--- a/vendor/hyper-block/src/segmented.rs
++++ b/vendor/hyper-block/src/segmented.rs
+@@ -10,13 +10,17 @@
+ //! take overwrites alone.
+ //!
+ //! A segment never changes length once created, so every handle finds the layout from the
+-//! segments' names and lengths alone: a duplicate made before a segment was added opens it when a
+-//! transfer first reaches past the segments it knows, and nothing is shared between handles. A
++//! segments' names and lengths alone: a duplicate made before a segment was added finds it when a
++//! transfer first reaches past the segments it knows. A handle and its duplicates hold one open
++//! file for each segment between them ([`SegmentedFile::family`]), each with its own flags and
++//! read window: a descriptor per duplicate came to 576 a segment on a 32-core host (32 maintenance
++//! workers x 16 device workers and a reader, counted in `/proc/PID/fd`), past a default limit of
++//! 2,048 at the third segment (mantle `docs/measurements/2026-11-06-targets.md`). A
+ //! transfer lies within one segment (a caller lays its blocks out so none crosses a boundary), and
+ //! the segments are at most the bound given at open.
+ 
+ use std::path::{Path, PathBuf};
+-use std::sync::OnceLock;
++use std::sync::{Arc, OnceLock};
+ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+ 
+ use crate::DiskError;
+@@ -165,6 +169,9 @@ pub struct SegmentedFile {
+     align: Alignment,
+     /// The segments this handle knows.
+     slots: Slots,
++    /// The segments opened by this handle or any duplicate of it: a duplicate takes its handle of
++    /// a segment from here, a share of that one open file, and opens it only if none has yet.
++    family: Arc<Slots>,
+     /// Shadow mode for resident reads, given to each segment as it is found
+     /// ([`BlockFile::set_residency_shadow`]).
+     shadow: bool,
+@@ -260,9 +267,11 @@ impl SegmentedFile {
+             caching,
+             align,
+             slots: Slots::new(bound),
++            family: Arc::new(Slots::new(bound)),
+             shadow: false,
+             epoch: crate::resident::Epoch::new(),
+         };
++        let first = file.join_family(0, first)?;
+         file.place(0, 0, len, first)?;
+         // Every segment that exists now, so `len` is the whole file's.
+         while file.find_next()?.is_some() {}
+@@ -314,7 +323,13 @@ impl SegmentedFile {
+         if !path.exists() {
+             return Ok(None);
+         }
+-        let mut file = DeviceFile::open(&path, false, self.caching, self.align)?;
++        let mut file = match self.family.get(index).and_then(OnceLock::get) {
++            Some(opened) => opened.file.try_clone()?,
++            None => self.join_family(
++                index,
++                DeviceFile::open(&path, false, self.caching, self.align)?,
++            )?,
++        };
+         if self.shadow {
+             file.set_residency_shadow(true);
+         }
+@@ -328,6 +343,29 @@ impl SegmentedFile {
+         }
+     }
+ 
++    /// Keeps `file`, segment `index` just opened, for this handle's duplicates, unless one of them
++    /// kept theirs first (its open file then the one kept and this one closed): a handle of the
++    /// kept file.
++    fn join_family(&self, index: usize, file: DeviceFile) -> Result<DeviceFile, DiskError> {
++        self.family
++            .fill(
++                index,
++                Segment {
++                    start: 0,
++                    len: 0,
++                    file,
++                    dirty: AtomicBool::new(false),
++                },
++            )
++            .ok_or_else(|| beyond(&self.base, "segments past the file's bound"))?;
++        self.family
++            .get(index)
++            .and_then(OnceLock::get)
++            .ok_or_else(|| beyond(&self.base, "a segment lost from its slot"))?
++            .file
++            .try_clone()
++    }
++
+     /// The segment holding `[offset, offset + len)` and its index, finding segments added since
+     /// this handle last looked; a transfer across two segments, or past the last, is refused.
+     /// Each pass finds the segment, refuses, or counts one more segment filled, so the passes are
+@@ -363,11 +401,12 @@ impl SegmentedFile {
+             return Err(beyond(&self.base, "segments past the file's bound"));
+         }
+         let path = segment_path(&self.base, index);
+-        let mut file = DeviceFile::open(&path, true, self.caching, self.align)?;
++        let file = DeviceFile::open(&path, true, self.caching, self.align)?;
+         if file.len()? != 0 {
+             return Err(beyond(&path, "a new segment that already holds bytes"));
+         }
+         made_whole(&file, &path, len)?;
++        let mut file = self.join_family(index, file)?;
+         if self.shadow {
+             file.set_residency_shadow(true);
+         }
+@@ -536,6 +575,7 @@ impl BlockFile for SegmentedFile {
+             caching: self.caching,
+             align: self.align,
+             slots: Slots::new(self.slots.bound),
++            family: Arc::clone(&self.family),
+             shadow: self.shadow,
+             epoch: crate::resident::Epoch::new(),
+         };
+@@ -581,6 +621,37 @@ mod tests {
+     /// Segments added after the base are read and written at offsets into the concatenation,
+     /// each byte landing in the segment that holds it; a duplicate made before a segment was
+     /// added finds it on first use; reopened, the file has every segment and its whole length.
++    /// A handle and its duplicates hold one open file a segment, whichever of them reached it
++    /// first and whenever the duplicate was made; each still flushes what it wrote.
++    #[test]
++    fn duplicates_share_one_open_file_for_each_segment() {
++        let dir = tempfile::tempdir().unwrap();
++        let base = dir.path().join("store");
++        let file = create(&base, 8);
++        let early: Vec<SegmentedFile> = (0..4).map(|_| file.try_clone().unwrap()).collect();
++        file.add(2 * 4096).unwrap();
++        let late = early[0].try_clone().unwrap();
++        early[1].add(2 * 4096).unwrap();
++        let other = open(&base, 8);
++        file.write_all_at(page(7).as_slice(), 2 * 4096).unwrap();
++        early[2].write_all_at(page(8).as_slice(), 4096).unwrap();
++        file.sync_data().unwrap();
++        early[2].sync_data().unwrap();
++        assert_eq!(read(&late, 2 * 4096), 7);
++        assert_eq!(read(&other, 4096), 8);
++        for index in 0..3 {
++            let first = file.family.get(index).unwrap().get().unwrap();
++            for handle in early.iter().chain([&file, &late]) {
++                handle.len().unwrap();
++                let held = handle.slots.get(index).unwrap().get().unwrap();
++                assert!(held.file.shares_open_file(&first.file));
++            }
++            // A handle opened on its own holds its own files, as another process's would.
++            let own = other.slots.get(index).unwrap().get().unwrap();
++            assert!(!own.file.shares_open_file(&first.file));
++        }
++    }
++
+     #[test]
+     fn segments_are_one_file_to_every_handle() {
+         let dir = tempfile::tempdir().unwrap();

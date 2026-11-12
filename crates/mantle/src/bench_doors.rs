@@ -11,11 +11,13 @@
 //! against the MD5 of those bytes for each phase's first [`ETAGS`] keys. A set's acknowledged
 //! objects are a bit each (`transfer::Oracle`). Three controls, a byte flipped on its way to the
 //! check, a key never put and an ETag expected of another object, must each be reported as
-//! failures, or the run is not exact. A phase's failures are told apart: `refused`, answered with
-//! an error; `unanswered`, throttled or lost on every attempt (each operation asked again as the
-//! AWS SDKs ask one, a listing's page among them); `differed`, a read whose bytes or length were
-//! not what was put; and the checks' others (an ETag, a size, a listing's count, an acknowledged
-//! object missing), the rest. An operation whose object's put, upload or part failed before it is
+//! failures, or the run is not exact; a door's controls whose objects could not be put are not
+//! run, so not caught. A phase's failures are told apart: `refused`, answered with an error;
+//! `unanswered`, throttled or lost on every attempt (each operation asked again as the AWS SDKs ask
+//! one, a listing's page and a control's put among them), whose outcome is unknown, as S3 leaves a
+//! 5xx's; `differed`, a read whose bytes or length were not what was put; and the checks' others
+//! (an ETag, a size, a listed key not the set's or out of order, an acknowledged object not listed
+//! or missing), the rest. An operation whose object's put, upload or part failed before it is
 //! not asked at all: `skipped`, counted and timed not at all, so a size's reads, as a set's, read
 //! only what was acknowledged (`transfer::Oracle`, a bit a put).
 //!
@@ -424,12 +426,25 @@ struct Work {
     again: std::cell::Cell<u64>,
 }
 
-/// A listing's place: where its next page starts, whether it ended, and the keys it listed.
+/// A listing's place: where its next page starts, whether it ended, the keys it listed, of them
+/// those acknowledged, and the set's index of the last, which the next key must sort after.
 #[derive(Default)]
 struct Paging {
     next: Option<Next>,
     ended: bool,
     listed: u64,
+    acknowledged: u64,
+    last: Option<u64>,
+}
+
+/// What a listing page's keys came to: how many it listed, of them those acknowledged, the set's
+/// index of the last, and the first key that was no key of the set or did not sort after the one
+/// before it.
+struct Page {
+    keys: u64,
+    acknowledged: u64,
+    last: Option<u64>,
+    wrong: Option<String>,
 }
 
 /// Where the next page of a listing starts: the native door's key, the S3 listener's token.
@@ -1986,57 +2001,94 @@ impl Work {
         })
     }
 
-    /// The listing's next page, from where the last one ended; its keys are counted, and once it
-    /// ends their number is checked against the objects acknowledged. The set's prefix is written
-    /// into the client's key buffer, and where the page starts is moved out of the listing and the
-    /// next page's moved in, so the harness allocates nothing for a page; a page not had puts its
-    /// start back, so asking again asks the same page.
+    /// The listing's next page, from where the last one ended. Each key it lists must be one of the
+    /// set's, after the key before it, and once the listing ends every acknowledged object must
+    /// have been listed. A key whose put was not acknowledged may be listed or not: a put throttled
+    /// or unanswered on every attempt may still have been written, as S3 leaves a 5xx's outcome
+    /// unknown. The set's prefix is written into the client's key buffer, and where the page
+    /// starts is moved out of the listing and the next page's moved in, so the harness allocates
+    /// nothing for a page; a page not had puts its start back, so asking again asks the same page.
     async fn list(&self, conn: &mut Conn, prefix: &mut String) -> Result<Came, Error> {
         let Keys::Set { count, .. } = self.keys else {
             return Ok(Came::Failed("a listing of no set".into()));
         };
-        let start = harness(|| {
+        let (start, last) = harness(|| {
             let mut listing = self.listing.borrow_mut();
-            (!listing.ended).then(|| listing.next.take())
+            ((!listing.ended).then(|| listing.next.take()), listing.last)
         });
         let Some(start) = start else {
             return Ok(Came::Done);
         };
         harness(|| write_key(prefix, format_args!("set{count}/")))?;
-        let (keys, next) = match self.page(conn, prefix, start.as_ref()).await? {
+        let (page, next) = match self
+            .page(conn, prefix, start.as_ref(), (last, count))
+            .await?
+        {
             Ok(page) => page,
             Err(came) => {
                 harness(|| self.listing.borrow_mut().next = start);
                 return Ok(came);
             }
         };
-        let keys = u64::try_from(keys).map_err(failed)?;
-        let (ended, listed, acknowledged) = harness(|| {
+        let (ended, listed, seen, acknowledged) = harness(|| {
             let mut listing = self.listing.borrow_mut();
-            listing.listed = listing.listed.saturating_add(keys);
+            listing.listed = listing.listed.saturating_add(page.keys);
+            listing.acknowledged = listing.acknowledged.saturating_add(page.acknowledged);
+            listing.last = page.last;
             listing.ended = next.is_none();
             listing.next = next;
             (
                 listing.ended,
                 listing.listed,
+                listing.acknowledged,
                 self.oracle.borrow().acknowledged(),
             )
         });
-        Ok(if ended && listed != acknowledged {
-            Came::Failed(format!("{listed} keys listed, {acknowledged} acknowledged"))
+        Ok(if let Some(wrong) = page.wrong {
+            Came::Failed(wrong)
+        } else if ended && seen != acknowledged {
+            Came::Failed(format!(
+                "{seen} of the {acknowledged} acknowledged objects listed, {listed} keys in all"
+            ))
         } else {
             Came::Done
         })
     }
 
-    /// A page of the keys under `prefix` from `start`: how many it listed and where the next
-    /// starts, or what asking it came to where it was not had.
+    /// Counts `key`, listed under the set's `prefix`, into `page` ([`set_key`]): the page's first
+    /// key that is wrong is kept, and each right one counted acknowledged or not.
+    fn tally(&self, page: &mut Page, prefix: &str, key: &str, count: u64) {
+        page.keys = page.keys.saturating_add(1);
+        if page.wrong.is_some() {
+            return;
+        }
+        match set_key(prefix, key, count, page.last) {
+            Ok(i) => {
+                page.last = Some(i);
+                if self.oracle.borrow().has(i) {
+                    page.acknowledged = page.acknowledged.saturating_add(1);
+                }
+            }
+            Err(wrong) => page.wrong = Some(wrong),
+        }
+    }
+
+    /// A page of the keys under `prefix` from `start`, each counted into what it came to after the
+    /// set's key `last` of a set of `count` ([`Work::tally`]), and where the next starts; or what
+    /// asking it came to where it was not had.
     async fn page(
         &self,
         conn: &mut Conn,
         prefix: &str,
         start: Option<&Next>,
-    ) -> Result<Result<(usize, Option<Next>), Came>, Error> {
+        (last, count): (Option<u64>, u64),
+    ) -> Result<Result<(Page, Option<Next>), Came>, Error> {
+        let mut tallied = Page {
+            keys: 0,
+            acknowledged: 0,
+            last,
+            wrong: None,
+        };
         match conn {
             Conn::Native(client) => {
                 let op = Op::List(List {
@@ -2055,14 +2107,21 @@ impl Work {
                     Err(came) => return Ok(Err(came)),
                 };
                 Ok(match reply.listing {
-                    Some(Listing::Keys(page)) => Ok((
-                        page.contents.len(),
-                        if page.truncated {
-                            page.next.map(Next::Native)
-                        } else {
-                            None
-                        },
-                    )),
+                    Some(Listing::Keys(page)) => {
+                        harness(|| {
+                            for listed in &page.contents {
+                                self.tally(&mut tallied, prefix, &listed.key, count);
+                            }
+                        });
+                        Ok((
+                            tallied,
+                            if page.truncated {
+                                page.next.map(Next::Native)
+                            } else {
+                                None
+                            },
+                        ))
+                    }
                     _ => Err(Came::Refused(format!("{:?}", reply.status))),
                 })
             }
@@ -2104,10 +2163,66 @@ impl Work {
                         element(&text, "NextContinuationToken").map(|t| Next::Token(t.to_owned()))
                     })
                     .flatten();
-                Ok(Ok((text.matches("<Key>").count(), next)))
+                harness(|| {
+                    for key in keys(&text) {
+                        self.tally(&mut tallied, prefix, key, count);
+                    }
+                });
+                Ok(Ok((tallied, next)))
             }
         }
     }
+}
+
+/// The index in a set of `count` of `key`, listed under the set's `prefix` after the set's key
+/// `last`: `{prefix}{i}` with `i` below `count` in decimal with no leading zero, sorting after
+/// `last`'s key byte by byte, as "List results are always returned in UTF-8 binary order"
+/// (research/05); or what is wrong with it.
+fn set_key(prefix: &str, key: &str, count: u64, last: Option<u64>) -> Result<u64, String> {
+    let digits = key.strip_prefix(prefix).unwrap_or_default();
+    let canonical = !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && (digits == "0" || !digits.starts_with('0'));
+    let Some(i) = canonical
+        .then(|| digits.parse::<u64>().ok())
+        .flatten()
+        .filter(|i| *i < count)
+    else {
+        return Err(format!("{key} listed, no key of the set"));
+    };
+    if let Some(last) = last {
+        let mut before = [0u8; 20];
+        if decimal(last, &mut before).is_none_or(|before| before >= digits.as_bytes()) {
+            return Err(format!("{key} listed after {prefix}{last}"));
+        }
+    }
+    Ok(i)
+}
+
+/// Each `<Key>` element's text in a ListObjectsV2 document, in the document's order.
+fn keys(xml: &str) -> impl Iterator<Item = &str> {
+    const OPEN: &str = "<Key>";
+    const CLOSE: &str = "</Key>";
+    let mut rest = xml;
+    std::iter::from_fn(move || {
+        let start = rest.find(OPEN)?.checked_add(OPEN.len())?;
+        let after = rest.get(start..)?;
+        let end = after.find(CLOSE)?;
+        let key = after.get(..end)?;
+        rest = after.get(end.checked_add(CLOSE.len())?..)?;
+        Some(key)
+    })
+}
+
+/// `v` in decimal, written into `into`: the digits a set's key ends with.
+fn decimal(v: u64, into: &mut [u8; 20]) -> Option<&[u8]> {
+    let room = into.len();
+    let left = {
+        let mut rest: &mut [u8] = into;
+        write!(rest, "{v}").ok()?;
+        rest.len()
+    };
+    into.get(..room.checked_sub(left)?)
 }
 
 /// The cell, its doors, and the connections each door holds between phases.
@@ -3230,60 +3345,41 @@ impl Bench<'_> {
             .rt
             .block_on(async move {
                 let mut logical = logical;
-                for name in ['a', 'b'] {
+                // Each object put as every operation is, asked again where throttled or lost
+                // (`Work::again_after`); one never put leaves this door's controls unrun.
+                for (j, name) in [(0u64, 'a'), (1, 'b')] {
                     let key = control_key(door, name);
                     let object = generator.object(&key).map_err(failed)?;
-                    let Logical { conn, scratch, .. } = &mut logical;
-                    let put = match conn {
-                        Conn::Native(client) => {
-                            work.native(
-                                client,
-                                (
-                                    u64::MAX,
-                                    &key,
-                                    CONTROL,
-                                    mantle_client::identity().map_err(failed)?,
-                                ),
-                                &object,
-                                scratch,
-                            )
-                            .await?
-                        }
-                        Conn::Http(http) => {
-                            work.http(http, (u64::MAX, &key, CONTROL), &object, scratch)
-                                .await?
+                    let id = mantle_client::identity().map_err(failed)?;
+                    let mut again = 0u32;
+                    let put = loop {
+                        let Logical { conn, scratch, .. } = &mut logical;
+                        let came = match conn {
+                            Conn::Native(client) => {
+                                work.native(client, (u64::MAX, &key, CONTROL, id), &object, scratch)
+                                    .await?
+                            }
+                            Conn::Http(http) => {
+                                work.http(http, (u64::MAX, &key, CONTROL), &object, scratch)
+                                    .await?
+                            }
+                        };
+                        if !work.again_after(&came, j, &mut again).await? {
+                            break work.settled(came, again);
                         }
                     };
-                    match put {
-                        Came::Done => {}
+                    let why = match put {
+                        Came::Done => continue,
                         Came::Failed(why)
                         | Came::Refused(why)
                         | Came::Differed(why)
-                        | Came::Unanswered(why) => {
-                            return Err(failed(format!(
-                                "a control's object was not put through the {} door: {why}",
-                                door.name()
-                            )));
-                        }
-                        Came::Slowed => {
-                            return Err(failed(format!(
-                                "a control's object was not put through the {} door: SlowDown",
-                                door.name()
-                            )));
-                        }
-                        Came::Lost(why) => {
-                            return Err(failed(format!(
-                                "a control's object was not put through the {} door: unanswered: {why}",
-                                door.name()
-                            )));
-                        }
-                        Came::Skipped => {
-                            return Err(failed(format!(
-                                "a control's object was not put through the {} door: not asked",
-                                door.name()
-                            )));
-                        }
-                    }
+                        | Came::Unanswered(why)
+                        | Came::Lost(why) => why,
+                        Came::Slowed => "SlowDown".to_owned(),
+                        Came::Skipped => "not asked".to_owned(),
+                    };
+                    let unput = format!("its object {key} was not put: {why}");
+                    return Ok::<_, Error>((logical, Err(unput)));
                 }
                 let key = control_key(door, 'a');
                 let object = generator.object(&key).map_err(failed)?;
@@ -3292,13 +3388,20 @@ impl Bench<'_> {
                 let never = generator.object(NEVER_PUT).map_err(failed)?;
                 let missing = read(conn, NEVER_PUT, (&never, scratch), None).await?;
                 let etag = head_etag(conn, &key).await?;
-                Ok((logical, [flipped, missing, etag]))
+                Ok::<_, Error>((logical, Ok([flipped, missing, etag])))
             })
             .map_err(|e| failed(format!("{e:?}")))??;
         if let Some(pool) = self.pools.get_mut(door.at()) {
             pool.push((logical, Instant::now()));
         }
-        let [flipped, missing, etag] = said;
+        // Unrun, none of this door's controls is caught, so the run is not exact.
+        let [flipped, missing, etag] = match said {
+            Ok(said) => said,
+            Err(why) => {
+                writeln!(out, "doors control {} NOT run: {why}", self.named(door))?;
+                return Ok(0);
+            }
+        };
         let expected = checksum::etag(&other);
         let judged = [
             (
@@ -3819,5 +3922,41 @@ mod tests {
         assert_eq!(size_arg("128K").unwrap(), 128 << 10);
         assert_eq!(Work::range(1), (0, 0));
         assert_eq!(Work::range(65_537), (21_845, 43_689));
+    }
+
+    /// A listing's keys are its set's, each after the one before it as S3 orders keys, byte by
+    /// byte (1, 10, 11, 19, 2, 9); a key of another prefix, with a leading zero or a sign, at or
+    /// past the set's count, repeated or out of order is wrong; and a ListObjectsV2 document's
+    /// keys are read in its order.
+    #[test]
+    fn a_listing_takes_only_its_sets_keys_in_s3s_order() {
+        let prefix = "set20/";
+        let mut last = None;
+        for key in [
+            "set20/0", "set20/1", "set20/10", "set20/11", "set20/19", "set20/2", "set20/9",
+        ] {
+            last = Some(set_key(prefix, key, 20, last).unwrap());
+        }
+        assert_eq!(last, Some(9));
+        for wrong in [
+            "set20/20",
+            "set20/007",
+            "set20/+1",
+            "set20/",
+            "set2/1",
+            "set20/1a",
+        ] {
+            assert!(set_key(prefix, wrong, 20, None).is_err(), "{wrong}");
+        }
+        assert!(set_key(prefix, "set20/1", 20, Some(10)).is_err());
+        assert!(set_key(prefix, "set20/3", 20, Some(3)).is_err());
+        let mut digits = [0u8; 20];
+        assert_eq!(
+            decimal(u64::MAX, &mut digits),
+            Some(&b"18446744073709551615"[..])
+        );
+        let xml = "<ListBucketResult><Name>b</Name><Contents><Key>set20/0</Key><Size>1</Size>\
+                   </Contents><Contents><Key>set20/1</Key></Contents></ListBucketResult>";
+        assert_eq!(keys(xml).collect::<Vec<_>>(), ["set20/0", "set20/1"]);
     }
 }

@@ -316,14 +316,35 @@ enum Came {
     Unanswered(String),
 }
 
-/// A native reply, or what its exchange came to where it is to be asked again.
+/// A native reply, or what asking it came to where the server or the wire ended it: one
+/// operation's outcome, counted, the run going on. Only the harness's own failures, a client's
+/// bounds or runtime, its source or sink, a body out of its stated order, end the run.
 fn answered(
     asked: Result<Reply, mantle_client::ClientError>,
 ) -> Result<Result<Reply, Came>, Error> {
+    use mantle_client::ClientError;
+    use mantle_client::Refusal;
     match asked {
         Ok(reply) if reply.status == Status::SlowDown => Ok(Err(Came::Slowed)),
         Ok(reply) => Ok(Ok(reply)),
-        Err(e @ mantle_client::ClientError::Lost { .. }) => Ok(Err(Came::Lost(e.to_string()))),
+        // Its exchange ended unanswered, or its connection ended under it before it was answered:
+        // asked again with its identity (`Work::again_after`), as the node answers a request
+        // again from what it made.
+        Err(e @ (ClientError::Lost { .. } | ClientError::Transport(_)))
+            if !matches!(e, ClientError::Transport(Refusal::Order)) =>
+        {
+            Ok(Err(Came::Lost(e.to_string())))
+        }
+        // The node refused the client, for a reason asking again does not change.
+        Err(e @ ClientError::Refused(_)) => Ok(Err(Came::Refused(e.to_string()))),
+        // Refused before a node took it on each of the client's own attempts.
+        Err(e @ ClientError::Untaken(_)) => Ok(Err(Came::Unanswered(e.to_string()))),
+        // A reply whose bytes are not those its checksum names: a read not what was put.
+        Err(e @ ClientError::Corrupt(_)) => Ok(Err(Came::Differed(e.to_string()))),
+        // A reply that does not hold, or an upload's offset none of its runs reach: a check.
+        Err(e @ (ClientError::Reply(_) | ClientError::Offset { .. })) => {
+            Ok(Err(Came::Failed(e.to_string())))
+        }
         Err(e) => Err(failed(e)),
     }
 }
@@ -901,37 +922,44 @@ impl Http {
         })
     }
 
+    /// Sends `body`, its bytes made or framed in the connection's own piece, which goes back to the
+    /// connection whatever the send came to: a write the listener refused mid-body would otherwise
+    /// drop it, and the next request make another, the harness's own allocation each time.
     async fn send(&mut self, body: &Body<'_>) -> Result<(), Error> {
+        let mut piece = std::mem::take(&mut self.piece);
+        let sent = self.send_in(body, &mut piece).await;
+        self.piece = piece;
+        sent
+    }
+
+    async fn send_in(&mut self, body: &Body<'_>, piece: &mut Vec<u8>) -> Result<(), Error> {
         match body {
             Body::None => Ok(()),
             Body::Text(text) => self.write(text).await,
             Body::Made(object, from, to) => {
                 let mut at = *from;
-                let mut piece = std::mem::take(&mut self.piece);
                 while at < *to {
                     let n = usize::try_from(to.saturating_sub(at))
                         .unwrap_or(usize::MAX)
                         .min(mantle_client::PIECE);
                     harness(|| {
                         piece.resize(n, 0);
-                        object.fill(at, &mut piece)
+                        object.fill(at, piece)
                     })
                     .map_err(failed)?;
-                    self.write(&piece).await?;
+                    self.write(piece).await?;
                     at = at.saturating_add(u64::try_from(n).map_err(failed)?);
                 }
-                self.piece = piece;
                 Ok(())
             }
             Body::Chunked(object, length) => {
                 let mut crc = Hasher::new(Algorithm::Crc32).map_err(failed)?;
-                let mut piece = std::mem::take(&mut self.piece);
                 let mut at = 0u64;
                 while at < *length {
                     let n =
                         usize::try_from(length.saturating_sub(at).min(CHUNK)).map_err(failed)?;
                     piece.clear();
-                    mantle_http::write::chunk(&mut piece, n);
+                    mantle_http::write::chunk(piece, n);
                     let start = piece.len();
                     harness(|| {
                         piece.resize(start.saturating_add(n), 0);
@@ -941,19 +969,14 @@ impl Http {
                     crc.update(piece.get(start..).unwrap_or_default())
                         .map_err(failed)?;
                     piece.extend_from_slice(mantle_http::write::CHUNK_END);
-                    self.write(&piece).await?;
+                    self.write(piece).await?;
                     at = at.saturating_add(u64::try_from(n).map_err(failed)?);
                 }
                 let value = crc.finish().map_err(failed)?.to_base64();
                 piece.clear();
-                mantle_http::write::last(
-                    &mut piece,
-                    &[(Algorithm::Crc32.header(), value.as_bytes())],
-                )
-                .map_err(failed)?;
-                self.write(&piece).await?;
-                self.piece = piece;
-                Ok(())
+                mantle_http::write::last(piece, &[(Algorithm::Crc32.header(), value.as_bytes())])
+                    .map_err(failed)?;
+                self.write(piece).await
             }
         }
     }
@@ -998,7 +1021,46 @@ struct Tally {
     /// The most threads the process ran as the OS counted them, read each time more requests
     /// were out at once than before.
     threads: usize,
-    first: Option<String>,
+    /// The first failure of each kind's reason: a check's, a refusal's and an unanswered
+    /// operation's, each moved in as it came, so keeping them allocates nothing of the harness's.
+    first: [Option<String>; 3],
+}
+
+/// A failure's kind, its place in [`Tally::first`] and the word its line is tagged with.
+#[derive(Clone, Copy)]
+enum Failure {
+    Check,
+    Refusal,
+    Unanswered,
+}
+
+impl Failure {
+    const ALL: [Self; 3] = [Self::Check, Self::Refusal, Self::Unanswered];
+
+    fn at(self) -> usize {
+        match self {
+            Self::Check => 0,
+            Self::Refusal => 1,
+            Self::Unanswered => 2,
+        }
+    }
+
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Check => "failure",
+            Self::Refusal => "refusal",
+            Self::Unanswered => "unanswered",
+        }
+    }
+}
+
+impl Tally {
+    /// Keeps `why` as its kind's first failure, where there is none yet.
+    fn keep_first(&mut self, kind: Failure, why: String) {
+        if let Some(slot) = self.first.get_mut(kind.at()) {
+            slot.get_or_insert(why);
+        }
+    }
 }
 
 /// When a phase's operations are to start: each one's index, and its intended start on the
@@ -1100,31 +1162,31 @@ async fn client(mut logical: Logical, work: Rc<Work>, shared: Rc<RefCell<Shared>
                 Ok(Came::Done) => false,
                 Ok(Came::Failed(why)) => {
                     tally.failed = tally.failed.saturating_add(1);
-                    tally.first.get_or_insert(why);
+                    tally.keep_first(Failure::Check, why);
                     false
                 }
                 Ok(Came::Differed(why)) => {
                     tally.failed = tally.failed.saturating_add(1);
                     tally.differed = tally.differed.saturating_add(1);
-                    tally.first.get_or_insert(why);
+                    tally.keep_first(Failure::Check, why);
                     false
                 }
                 Ok(Came::Refused(why)) => {
                     tally.failed = tally.failed.saturating_add(1);
                     tally.refused = tally.refused.saturating_add(1);
-                    tally.first.get_or_insert(why);
+                    tally.keep_first(Failure::Refusal, why);
                     false
                 }
                 Ok(Came::Unanswered(why) | Came::Lost(why)) => {
                     tally.failed = tally.failed.saturating_add(1);
                     tally.unanswered = tally.unanswered.saturating_add(1);
-                    tally.first.get_or_insert(why);
+                    tally.keep_first(Failure::Unanswered, why);
                     false
                 }
+                // Settled into `Unanswered` before it is tallied (`Work::settled`): counted so.
                 Ok(Came::Slowed) => {
                     tally.failed = tally.failed.saturating_add(1);
                     tally.unanswered = tally.unanswered.saturating_add(1);
-                    tally.first.get_or_insert_with(|| "SlowDown".to_owned());
                     false
                 }
                 Err(e) => {
@@ -1161,7 +1223,7 @@ async fn phase(
                 unanswered: 0,
                 most: 0,
                 threads: 0,
-                first: None,
+                first: [None, None, None],
             },
             out: 0,
             error: None,
@@ -2463,15 +2525,21 @@ impl<'o> Bench<'o> {
             m.again,
             t.failed,
         )?;
-        if let Some(first) = &t.first {
+        for kind in Failure::ALL {
+            let Some(why) = t.first.get(kind.at()).and_then(Option::as_ref) else {
+                continue;
+            };
+            let tag = match kind {
+                Failure::Refusal if m.excluded => "excluded",
+                kind => kind.tag(),
+            };
             writeln!(
                 out,
-                "doors {} {} {} {} {}: {first}",
+                "doors {} {} {} {} {tag}: {why}",
                 self.named(m.door),
                 m.kind.name(),
                 m.size,
                 self.options.condition,
-                if m.excluded { "excluded" } else { "failure" },
             )?;
         }
         out.flush()?;

@@ -353,9 +353,10 @@ pub const CERTIFICATE_COMPRESSION_BYTES: u64 = 721_474;
 ///   socket of its own, and a node's plane's, each at what hyper-rt states one holds
 ///   (`Io::held_bound`).
 ///
-/// QUIC's datagrams are none: no node or client sends them, though hyper-quic's default takes up to
-/// 1,250,000 bytes of them a connection. What aws-lc keeps of keys is in its own heap, which a
-/// counting allocator does not see.
+/// QUIC's datagrams are none: no node or client sends them, and no endpoint offers to take them
+/// (hyper-transport's `Limits::transport`; hyper-quic's default took up to 1,250,000 bytes of them a
+/// connection). What aws-lc keeps of keys is in its own heap, which a counting allocator does not
+/// see.
 pub fn beside(stated: &Stated, serves: bool) -> Option<u64> {
     let limits = limits(stated).ok()?;
     let count = |n: usize| u64::try_from(n).ok();

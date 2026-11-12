@@ -314,8 +314,8 @@ measures the second, and derives the rest by these rules:
   certificate of a few hundred bytes at quality 11 with a window its own length, 721,474 bytes for
   a moment at a server's first handshake (`CERTIFICATE_COMPRESSION_BYTES`; 34.3 MB with brotli's
   4 MiB window before). hyper-quic took QUIC datagrams, which no consumer sends, up to 1,250,000
-  bytes a connection by default: hyper-raft's doors-step8 branch (c97fb1a) offers none, vendored
-  once it lands. aws-lc keeps keys in its own heap, which a counting allocator does not see.
+  bytes a connection by default; since hyper-raft c97fb1a (branch doors-step8) no endpoint offers
+  to take any. aws-lc keeps keys in its own heap, which a counting allocator does not see.
   *Open:* the snapshot path holds whole images, the one class the floor does not bound yet: a
   range's image is every row scanned and copied (`Stored::image`), encoded again for its message,
   kept by the shell and by the core's log until it is installed, framed and copied again by the

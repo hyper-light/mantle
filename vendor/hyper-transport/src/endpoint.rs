@@ -249,6 +249,11 @@ impl Limits {
             .max_idle_timeout(Some(idle))
             .keep_alive_interval(self.keep_alive)
             .fec_window(self.fec_window)
+            // No owner sends or reads a QUIC DATAGRAM frame (RFC 9221): the transport's messages
+            // travel on streams and the plane's on its own sealed socket. So no endpoint offers to
+            // take them, where hyper-quic's default offered every peer 1,250,000 bytes of them a
+            // connection; a peer that sends one anyway is closed with PROTOCOL_VIOLATION (§3).
+            .datagram_receive_buffer_size(None)
             .congestion(congestion.clone());
         match self.acknowledgement {
             Acknowledgement::Decimated => transport.decimate_acks(),

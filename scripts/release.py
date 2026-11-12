@@ -12,8 +12,9 @@ then the binary it holds, which must say VERSION. That binary makes a cell of th
 (`mantle init`, each founder's ports stated) and serves it (three `mantle serve` processes, each
 waited for until it says the cell's root range enlisted it, and ready to `mantle status`). As the
 client of a directory `mantle init client` made, its object commands ask the native QUIC door:
-`mb`, `ls`, `cp` up and back from a file and from standard input, `head`, a multipart upload's
-every step, `rm` and `rb`. The AWS CLI v2 asks the S3 HTTP door with the profile `mantle init`
+`mb`, `ls`, `cp` up and back from a file and from standard input, a copy killed once a run
+committed and resumed by running it again, `head`, a multipart upload's every step, `rm` and `rb`,
+the client named by `--client` and by `MANTLE_CLIENT`. The AWS CLI v2 asks the S3 HTTP door with the profile `mantle init`
 wrote: `mb`, `cp` of an object below its multipart threshold and one past it, up and back, `ls`,
 `head-object`, `rm` and `rb`. Each object is read back through both doors and compared byte for
 byte with what was put; one node then stops in order. Last, the binary's own transfer harness at
@@ -337,6 +338,113 @@ def session(mantle, root):
             node.end()
 
 
+def committed(lines, at):
+    """Each `AT: run N committed, D bytes durable` a copy said: (N, D), in order."""
+    runs = []
+    for line in lines:
+        words = line.split()
+        if (
+            words[:2] == [f"{at}:", "run"]
+            and len(words) == 7
+            and words[3] == "committed,"
+            and words[5:] == ["bytes", "durable"]
+        ):
+            runs.append((int(words[2]), int(words[4])))
+    return runs
+
+
+def resume(mantle, client, at, data):
+    """A copy of DATA from standard input, its length stated, killed once the cell committed a run
+    (SIGKILL, TerminateProcess on Windows), then run again (docs/design/gateway.md §6): it says it
+    resumes at the offset the cell holds, commits each run after and none before, and AT holds
+    DATA, its ETag DATA's MD5 as one PUT's is. What the killed copy said last it committed is what
+    the cell lists of the open upload and where the copy run again goes on.
+
+    Standard input is fed a piece at a time, and no piece follows once a run is said committed, so
+    the copy holds at most its run and a piece past it (gateway.md §6) when it is killed: far short
+    of DATA, which is four of the AWS CLI's parts long."""
+    # A fifth of S3's least part, the least a run can be (crates/meta/src/name.rs, run_length): the
+    # copy is fed less than one run past its first before the feed stops.
+    piece = LEAST_PART // 5
+    command = [mantle, "--client", client, "cp", "-", at, "--size", len(data)]
+    copying = subprocess.Popen(
+        [str(a) for a in command],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    lines, changed, fed = [], threading.Condition(), threading.Event()
+
+    def heard():
+        for raw in copying.stderr:
+            with changed:
+                lines.append(raw.decode(errors="replace").rstrip())
+                changed.notify_all()
+        with changed:
+            lines.append(None)
+            changed.notify_all()
+
+    def feed():
+        # A write to a copy killed meanwhile fails: that ends the feed.
+        try:
+            for start in range(0, len(data), piece):
+                if fed.is_set():
+                    return
+                copying.stdin.write(data[start : start + piece])
+                copying.stdin.flush()
+        except OSError:
+            return
+
+    hearing = threading.Thread(target=heard, daemon=True)
+    feeding = threading.Thread(target=feed, daemon=True)
+    hearing.start()
+    feeding.start()
+    with changed:
+        while not committed([l for l in lines if l is not None], at):
+            if None in lines:
+                raise Failed(f"the copy into {at} ended before it committed a run: {lines}")
+            changed.wait()
+    fed.set()
+    copying.kill()
+    copying.wait()
+    feeding.join()
+    hearing.join()
+    try:
+        copying.stdin.close()
+    except OSError:
+        pass
+    said_killed = [l for l in lines if l is not None]
+    runs, offset = committed(said_killed, at)[-1]
+
+    # The cell holds the open upload the killed copy left, its parts the runs it said committed.
+    bucket, key = at[len("s3://"):].split("/", 1)
+    uploads = said(run([mantle, "--client", client, "multipart", "uploads", f"s3://{bucket}"]))
+    open_ids = [w[1] for w in (l.split() for l in uploads.splitlines()) if len(w) == 3 and w[2] == key]
+    if len(open_ids) != 1:
+        raise Failed(f"mantle multipart uploads lists {len(open_ids)} open uploads of {key}: {uploads}")
+    parts = said(run([mantle, "--client", client, "multipart", "parts", at, open_ids[0]]))
+    sizes = [int(l.split()[1]) for l in parts.splitlines()]
+    if len(sizes) != runs or sum(sizes) != offset:
+        raise Failed(f"the killed copy said {runs} runs, {offset} bytes durable; the cell lists {parts}")
+
+    again = run(command, input=data)
+    lines = again.stderr.decode(errors="replace").splitlines()
+    first = next((n for n, l in enumerate(lines) if l.startswith(f"{at}: resuming upload ")), None)
+    if first is None or not lines[first].endswith(f" at {offset} bytes, {runs} runs"):
+        raise Failed(f"the copy run again did not resume at {offset} bytes, {runs} runs: {lines}")
+    # Every run the length of the first, the last whatever is left.
+    run_length = sizes[0]
+    total = -(-len(data) // run_length)
+    after = [n for n, _ in committed(lines[first:], at)]
+    if after != list(range(runs + 1, total + 1)):
+        raise Failed(f"the resumed copy committed runs {after}, not {runs + 1} to {total}")
+    same(f"mantle cp of {at}, resumed", run([mantle, "--client", client, "cp", at, "-"]).stdout, data)
+    head = said(run([mantle, "--client", client, "head", at])).splitlines()
+    if f"size {len(data)}" not in head or f'etag "{hashlib.md5(data).hexdigest()}"' not in head:
+        raise Failed(f"mantle head of {at}: {head}")
+    print(f"{at}: killed after {runs} runs, {offset} bytes; resumed there, runs {runs + 1} to {total}")
+
+
 def doors(mantle, client, profile, dir):
     """The native door's object commands and the S3 door's AWS CLI, each object read back through
     both and compared byte for byte."""
@@ -414,7 +522,16 @@ def doors(mantle, client, profile, dir):
     native("multipart", "abort", "s3://native/aborted", aborted)
     if aborted in said(native("multipart", "uploads", "s3://native")):
         raise Failed("mantle multipart uploads lists an aborted upload")
-    print("native door: mb, cp from and to a file and standard input, head, ls, multipart")
+    resumed = object_bytes(7, 4 * CLI_PART + 12_345)
+    resume(mantle, client, "s3://native/resumed", resumed)
+    # The client's directory from MANTLE_CLIENT where no --client names it.
+    named = said(run([mantle, "ls"], env={**os.environ, "MANTLE_CLIENT": str(client)}))
+    if " native" not in named:
+        raise Failed(f"mantle ls as MANTLE_CLIENT's client lists no bucket native: {named}")
+    print(
+        "native door: mb, cp from and to a file and standard input, a copy killed and resumed, "
+        "head, ls, multipart"
+    )
 
     # The S3 door: a bucket, an object below the CLI's multipart threshold and one past it, up and
     # back, listed and headed.
@@ -439,7 +556,7 @@ def doors(mantle, client, profile, dir):
     print("S3 door: aws s3 mb, cp below and past the multipart threshold, ls, s3api head-object")
 
     # One store behind both doors: each door reads what the other put, and lists its bucket.
-    for key, data in (("from/file", from_file), ("parts", first + last)):
+    for key, data in (("from/file", from_file), ("parts", first + last), ("resumed", resumed)):
         back = dir / "across.back"
         aws("s3", "cp", "--no-progress", f"s3://native/{key}", back)
         same(f"aws s3 cp of native/{key}", back.read_bytes(), data)
@@ -458,6 +575,7 @@ def doors(mantle, client, profile, dir):
     if held.returncode == 0 or b"BucketNotEmpty" not in held.stderr:
         raise Failed("mantle rb of a bucket holding an object did not say BucketNotEmpty")
     native("rm", "s3://native/parts")
+    native("rm", "s3://native/resumed")
     native("rb", "s3://native")
     aws("s3", "rm", "s3://stock/small")
     aws("s3", "rm", "s3://stock/large")

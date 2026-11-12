@@ -77,7 +77,13 @@ Before its job uploads it, each target's archive is checked as a user takes it, 
    input, past the 8 MiB runs a copy from standard input is read in, and back to standard output;
    `head`; `ls` of the buckets, of a prefix's keys with their sizes, and of the bucket's prefixes; a
    multipart upload's every step (`create`, `put` of a 5 MiB part from a file and the last from
-   standard input, `parts`, `uploads`, `complete`), read back, and another upload aborted.
+   standard input, `parts`, `uploads`, `complete`), read back, and another upload aborted. A copy
+   from standard input of a stated length (`--size`), fed a megabyte at a time and fed no more once
+   it says a run committed, is killed (SIGKILL; `TerminateProcess` on Windows): the cell lists its
+   open upload holding exactly the runs and bytes the copy said durable, and the copy run again says
+   it resumes there, commits each later run and none before, and the object reads back whole, its
+   ETag its bytes' MD5 (gateway.md §6). `ls` asked as the client `MANTLE_CLIENT` names, without
+   `--client`.
 5. Through the S3 HTTP door, the AWS CLI v2 with the profile `mantle init` wrote (its environment's
    own `AWS_*` variables removed, as they outrank a profile): `s3 mb`, `s3 cp` of an object below the
    CLI's 8 MiB multipart threshold and one past it, up and back, `s3 ls` with their sizes and
@@ -112,14 +118,19 @@ gates, boto3 pinned with every hash. A failed check prints each node's last outp
   draft until every asset is up [7]; a version with a pre-release part (`0.2.0-rc.1`) is marked a
   pre-release. Its notes are GitHub's generated ones after a line naming this document. A publish
   that fails part way leaves at most a draft, deleted before the job is run again.
-- A push that changes the release's own files (the workflow, `scripts/release.py`, the stock
-  clients' script and pins), on any branch, runs everything but `publish`: a branch push is a dry
-  run [2]. So does a manual run (`workflow_dispatch`, once the workflow is on the default branch
-  [3]), even on a tag.
+- Every push to a branch and every pull request runs everything but `publish`, the same check a
+  tag's run makes, so what a tag publishes is what its pull request proved; a pull request's run
+  checks the merge of its branch into its base. A change under `docs/` alone is skipped (research/85
+  [15]): the binary is built from everything else, and the archive's `README.md` and `LICENSE` sit
+  outside `docs/`. A manual run (`workflow_dispatch`, once the workflow is on the default branch
+  [3]) does the same, even on a tag. Its cost is runners held at once, not money (the repository is
+  public, research/85 [14]): six jobs a run, one of them macOS, of the 5 macOS jobs a Free plan runs
+  at once [12], beside the gates' two for each push and pull request.
 - Only `publish` may write, and only the repository's contents, beside reading the gates' runs;
-  every other job reads alone, and `publish` runs no code of the repository's [5]. Each action is
+  every other job reads alone, and `publish` runs no code of the repository's [5]. A pull request
+  from a fork gets a token that reads alone [15], and `publish` never runs for one. Each action is
   pinned to its commit, its version beside it [5], and no job keeps the checkout's credentials. A
-  newer push to a branch cancels its older run; a tag's run is never cancelled.
+  newer push to a branch or a pull request cancels its older run; a tag's run is never cancelled.
 
 The gates run the suites on every target for every push; the release proves the binary it
 publishes. vorpal's release runs its tests itself [1]; mantle's gates take hours on six targets,

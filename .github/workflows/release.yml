@@ -4,8 +4,10 @@
 # by it on loopback, its object commands through the native QUIC door and the AWS CLI through the S3
 # HTTP door, every object read back through both byte for byte, then its own transfer harness
 # (scripts/release.py). A pushed tag `vVERSION`, VERSION the workspace's, publishes the five archives
-# and their checksums as the tag's GitHub Release, once the gates passed for its commit. A push that
-# changes the release's own files, or a manual run, does all of it but publish.
+# and their checksums as the tag's GitHub Release, once the gates passed for its commit. Every push
+# to a branch and every pull request but one changing docs/ alone, and a manual run, does all of it
+# but publish: the same check, so what a tag publishes is what its pull request proved
+# (docs/design/release.md §3).
 #
 # The actions are pinned to commits, as GitHub's guide to their secure use asks: a tag can be moved
 # or deleted, a commit cannot (docs/research/85). Only the publishing job may write.
@@ -15,18 +17,16 @@ on:
     branches: ["**"]
     tags: ["v*"]
     # Not evaluated for a tag's push, which always runs (GitHub's workflow syntax).
-    paths:
-      - .github/workflows/release.yml
-      - scripts/release.py
-      - scripts/stock-clients.sh
-      - crates/mantle/tests/support/boto3-requirements.txt
+    paths-ignore: ["docs/**"]
+  pull_request:
+    paths-ignore: ["docs/**"]
   workflow_dispatch:
 permissions:
   contents: read
-# A branch's newer push supersedes its run; a tag's run is never cancelled.
+# A newer push to a branch or a pull request supersedes its run; a tag's run is never cancelled.
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref_type == 'branch' }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"

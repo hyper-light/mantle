@@ -1544,6 +1544,87 @@ impl<F: BlockFile> ShardDb<F> {
         self.kernel_share
     }
 
+    /// DIAGNOSTIC (g17-memdiag, never merged): the shard's account at each look, its shares, the
+    /// process's resident memory, I/O and faults, and the machine's room (MANTLE_DIAG_MEM).
+    fn diag_account(&self, why: &str) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("MANTLE_DIAG_MEM").is_some()) {
+            return;
+        }
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let start = START.get_or_init(std::time::Instant::now);
+        let (cache, write, records) = self.memory_held();
+        let m = self.trunk.memory();
+        let io = self.store.io_stats();
+        let c = io.cache_memory;
+        let text = std::fs::read_to_string("/proc/self/io").unwrap_or_default();
+        let field = |name: &str| -> u64 {
+            text.lines()
+                .find_map(|l| l.strip_prefix(name))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0)
+        };
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+        let fault = |i: usize| -> u64 {
+            stat.rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().nth(i))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        };
+        let (grew_most, outside, cap) = self
+            .follow
+            .as_ref()
+            .map_or((0, 0, 0), |f| (f.grew_most, f.last.unwrap_or(0), f.cap));
+        let (ci, ri) = self.index_bytes();
+        eprintln!(
+            "memdiag {} rot {} ms {} budget {} cap {} cache {} write {} records {} kept {} kept_n {} memtables {} filters {} indexes {} counts {} ranges {} pivots {} branches {} live {} free {} dead {} spare {} lent {} refused {} limit_pages {} machine_free {} rss {} grew_most {} outside {} rchar {} read_bytes {} wchar {} write_bytes {} share_cache {} share_write {} share_records {} share_kernel {} cache_index {} records_index {} minflt {} majflt {} device_reads {} resident_reads {} cache_hits {} ghost_misses {}",
+            why,
+            self.flush_stats.rotations,
+            start.elapsed().as_millis(),
+            self.memory.unwrap_or(0),
+            cap,
+            cache,
+            write,
+            records,
+            self.kept_held(),
+            self.kept.len(),
+            self.memtable_bytes(),
+            m.filters,
+            m.indexes,
+            m.counts,
+            m.ranges,
+            m.pivots,
+            m.branches,
+            c.live,
+            c.free,
+            c.dead,
+            c.spare,
+            c.lent,
+            self.store.cache_refused(),
+            io.cache_limit_pages,
+            self.store.machine_free().unwrap_or(0),
+            hyper_rt::machine::facts::Facts::resident_now().unwrap_or(0),
+            grew_most,
+            outside,
+            field("rchar:"),
+            field("read_bytes:"),
+            field("wchar:"),
+            field("write_bytes:"),
+            self.cache_share,
+            self.write_share,
+            self.records_share,
+            self.kernel_share,
+            ci,
+            ri,
+            fault(7),
+            fault(9),
+            io.device_reads,
+            io.resident_reads,
+            io.cache_hits,
+            io.ghost_misses,
+        );
+    }
+
     /// Divides the machine's room again (docs/research/65): the budget becomes what its regions and
     /// kept memtables hold now and this shard's share of the room, less what it leaves free, never
     /// above its bound less its own holdings beside it ([`Follow::cap`]) nor below what it cannot
@@ -1601,11 +1682,13 @@ impl<F: BlockFile> ShardDb<F> {
             .min(follow.cap)
             .max(floor);
         let Some(was) = self.memory.filter(|&m| m != budget) else {
+            self.diag_account("look");
             return;
         };
         self.memory = Some(budget);
         self.partition_memory();
         self.fit_kept(false);
+        self.diag_account("moved");
         if budget < was {
             let over = self.store.cache_over();
             if over > 0 && !self.store.trim_cache(over) {
@@ -2026,6 +2109,7 @@ impl<F: BlockFile> ShardDb<F> {
         self.trim_cache = 0;
         self.trim_records = 0;
         self.grant();
+        self.diag_account("tuned");
     }
 
     /// Hands the trunk the window its workers' reads are counted against: the kernel's share

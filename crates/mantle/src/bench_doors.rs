@@ -750,8 +750,7 @@ fn chunked_length(length: u64, scratch: &mut Vec<u8>) -> Result<u64, Error> {
         left = left.saturating_sub(n);
     }
     scratch.clear();
-    mantle_http::write::last(scratch, &[(Algorithm::Crc32.header(), b"AAAAAAAA")])
-        .map_err(failed)?;
+    mantle_s3::chunked::last(scratch, Algorithm::Crc32, "AAAAAAAA");
     total
         .checked_add(u64::try_from(scratch.len()).map_err(failed)?)
         .ok_or_else(|| failed("a body past u64"))
@@ -999,8 +998,7 @@ impl Http {
                 }
                 let value = crc.finish().map_err(failed)?.to_base64();
                 piece.clear();
-                mantle_http::write::last(piece, &[(Algorithm::Crc32.header(), value.as_bytes())])
-                    .map_err(failed)?;
+                mantle_s3::chunked::last(piece, Algorithm::Crc32, &value);
                 self.write(piece).await
             }
         }

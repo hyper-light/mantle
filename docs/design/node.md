@@ -1283,11 +1283,13 @@ becomes:
 - **The operations a node admits: learned.** The limit is the point of greatest power,
   Kleinrock's throughput over delay, which by Little's law rises below Denning and Buzen's
   saturation point and falls past it, so its maximum is the knee. The node finds it as BBR probes
-  its pipe. From one operation it doubles while power grows a quarter. Then it cycles eight phases
-  about a base: a quarter past it, a quarter below, six at it. At each cycle's end the base moves to
-  the limit of greatest power. A phase measures only after the operations admitted before it have
-  completed, and then 267 completions, enough to tell a quarter's change in power from chance at
-  99%. BBR's own estimate, the windowed least latency times the windowed most throughput, fell to
+  its pipe, from above. It starts at the ceiling its memory was split for, where a fixed limit
+  stood, and halves while power does not fall a fifth. Then it cycles eight phases about a base: a
+  quarter past it, a quarter below, six at it. At each cycle's end the base moves to the limit of
+  greatest power among the base's phases and the probes its limit bound; a probe in which no
+  operation was turned away moves nothing. A phase measures only after the operations admitted
+  until its first completion have completed, and then 267 completions, enough to tell a quarter's
+  change in power from chance at 99%. BBR's own estimate, the windowed least latency times the windowed most throughput, fell to
   one or two operations with sizes mixed (research/87 §3). The limit never passes the ceiling `C`
   the node's memory was split for at start. `C`'s rule is chosen by measurement across scales, as
   the owner asked (research/87 §4); until then it is `derive::OBJECTS`.

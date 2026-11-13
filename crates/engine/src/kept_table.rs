@@ -680,9 +680,9 @@ impl RecordTable {
             spill: Vec::new(),
             scratch: Vec::new(),
             shift: self.shift,
-            // Grown, the table learns its group again: how far its misses overlap moves with its
-            // size against the host's caches.
-            grouping: Grouping::new(),
+            // Grown against the host's caches, the table tries its group again, from the size it
+            // had.
+            grouping: Grouping::from(self.grouping.size),
         };
         for i in 0..self.slots {
             let Some(s) = self.at(i) else {
@@ -868,8 +868,10 @@ impl RecordTable {
 /// taken off each), until each side has [`MIN_SAMPLES`] groups (Wilks's sample for a bound on the
 /// 95th percentile, hyper-rt's least) spanning at least [`TIMER_OVERHEAD_FACTOR`] times the clock's
 /// cost per reading (hyper-rt's bound for a sample its clock cannot move out of a converged
-/// interval); the larger size is kept while it places a record in less time, and the search
-/// settles at the first size that does not. A rebuild learns again.
+/// interval); the larger size is kept while its median group placed a record in less time (the
+/// median, as hyper-rt's harness judges, so one group a preemption or an interrupt stretched moves
+/// neither side), and the search settles at the first size that does not. A rebuilt table, grown
+/// against the caches, tries again from the size the table had rather than from one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Grouping {
     /// The size the table holds: settled, or the smaller of the two on trial.
@@ -880,19 +882,50 @@ struct Grouping {
     larger_next: bool,
 }
 
-/// One size's groups, records placed and nanoseconds taken in a trial.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// One size's groups in a trial: each one's nanoseconds a record placed, the first
+/// [`MIN_SAMPLES`] kept, and the nanoseconds they took together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Sample {
+    costs: [u64; MIN_SAMPLES],
     groups: usize,
-    records: u64,
     ns: u64,
+}
+
+impl Default for Sample {
+    fn default() -> Self {
+        Sample {
+            costs: [0; MIN_SAMPLES],
+            groups: 0,
+            ns: 0,
+        }
+    }
+}
+
+impl Sample {
+    /// The median of its groups' costs a record.
+    fn median(&self) -> u64 {
+        let mut sorted = self.costs;
+        let taken = sorted
+            .get_mut(..self.groups.min(MIN_SAMPLES))
+            .unwrap_or(&mut []);
+        taken.sort_unstable();
+        taken
+            .get(taken.len().checked_div(2).unwrap_or(0))
+            .copied()
+            .unwrap_or(u64::MAX)
+    }
 }
 
 impl Grouping {
     /// A table's first: one record a group, its candidate two.
     fn new() -> Self {
+        Self::from(1)
+    }
+
+    /// A trial of `size` records a group against twice it.
+    fn from(size: usize) -> Self {
         Grouping {
-            size: 1,
+            size: size.max(1),
             trial: Some([Sample::default(); 2]),
             larger_next: false,
         }
@@ -915,24 +948,25 @@ impl Grouping {
             return;
         };
         let side = usize::from(size != self.size);
-        if let Some(s) = samples.get_mut(side) {
-            s.groups = s.groups.saturating_add(1);
-            s.records = s
-                .records
-                .saturating_add(u64::try_from(records).unwrap_or(u64::MAX));
+        if let Some(s) = samples.get_mut(side)
+            && records > 0
+        {
+            if let Some(slot) = s.costs.get_mut(s.groups) {
+                *slot = ns
+                    .checked_div(u64::try_from(records).unwrap_or(u64::MAX))
+                    .unwrap_or(ns);
+                s.groups = s.groups.saturating_add(1);
+            }
             s.ns = s.ns.saturating_add(ns);
         }
         self.larger_next = !self.larger_next;
         let span = overhead.max(1).saturating_mul(TIMER_OVERHEAD_FACTOR);
         let [held, larger] = *samples;
-        let enough = |x: &Sample| x.groups >= MIN_SAMPLES && x.ns >= span && x.records > 0;
+        let enough = |x: &Sample| x.groups >= MIN_SAMPLES && x.ns >= span;
         if !enough(&held) || !enough(&larger) {
             return;
         }
-        // Per record, compared without division: held.ns / held.records > larger.ns / larger.records.
-        let faster = u128::from(held.ns).saturating_mul(u128::from(larger.records))
-            > u128::from(larger.ns).saturating_mul(u128::from(held.records));
-        if faster {
+        if larger.median() < held.median() {
             self.size = self.size.saturating_add(self.size);
             *samples = [Sample::default(); 2];
             self.larger_next = false;
@@ -1034,8 +1068,29 @@ mod tests {
         );
     }
 
-    /// A grown table learns its group again, from one record a group: what its misses overlap
-    /// moves with its size against the caches.
+    /// One group a preemption stretched a thousandfold moves neither side's median.
+    #[test]
+    fn one_stretched_group_does_not_stop_the_climb() {
+        let mut g = Grouping::from(2);
+        let mut stretched = false;
+        while g.size == 2 && g.trial.is_some() {
+            let size = g.next_size();
+            // Four records a group cost 20 ns each, two cost 30; the larger side's first group
+            // ran a thousand times longer.
+            let each: u64 = if size == 4 { 20 } else { 30 };
+            let ns = if size == 4 && !stretched {
+                stretched = true;
+                each * 1000 * size as u64
+            } else {
+                each * size as u64
+            };
+            g.observe(size, size, ns, 1);
+        }
+        assert_eq!(g.size, 4);
+    }
+
+    /// A grown table tries its group again from the size it had: what its misses overlap moves
+    /// with its size against the caches.
     #[test]
     fn a_rebuilt_table_learns_its_group_again() {
         let mut t = RecordTable::new();
@@ -1049,10 +1104,10 @@ mod tests {
                 )
             })
             .collect();
-        // Its first records: the empty table grows to take them, and learns from the start.
+        // Its first records: the empty table grows to take them, and tries 16 against 32 again.
         t.merge(1, &list_of(&batch), 1).unwrap();
         assert_eq!(t.len(), 64);
-        assert_eq!(t.grouping.size, 1);
+        assert_eq!(t.grouping.size, 16);
         assert!(t.grouping.trial.is_some());
     }
     use std::collections::BTreeMap;

@@ -9,6 +9,7 @@
 //! The decoder is fed the body as it arrives and holds at most one line of framing, whose
 //! longest legal form bounds it (`MAX_LINE`).
 
+use crate::checksum::Algorithm;
 use crate::crypto::{self, CryptoError};
 use crate::sigv4::{AuthError, Chain, hex_value, unhex};
 
@@ -22,6 +23,18 @@ pub const MIN_CHUNK: u64 = 8192;
 /// field is `x-amz-checksum-crc64nvme:` with 44 base64 characters of SHA-256, and the trailer
 /// signature field 24 + 64 bytes.
 pub const MAX_LINE: usize = 16 + 17 + 64;
+
+/// Writes the end of an unsigned `aws-chunked` body: its last chunk, of no octets, then the
+/// trailing checksum `value` (base64) under `algorithm`'s field, `name:value` with no space after
+/// the colon, as AWS's example sends it and botocore writes it (05 §1.9), and the empty line that
+/// ends the trailer section. [`Decoder`] reads either form, with or without the space.
+pub fn last(out: &mut Vec<u8>, algorithm: Algorithm, value: &str) {
+    out.extend_from_slice(b"0\r\n");
+    out.extend_from_slice(algorithm.header().as_bytes());
+    out.push(b':');
+    out.extend_from_slice(value.as_bytes());
+    out.extend_from_slice(b"\r\n\r\n");
+}
 
 /// The trailing checksum a body ended with, still base64 as sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -476,6 +489,21 @@ mod tests {
             assert_eq!(out.len(), 8197);
             assert_eq!(&out[8192..], b"hello");
         }
+    }
+
+    #[test]
+    fn an_unsigned_body_ends_as_aws_writes_it_and_decodes() {
+        let mut body = b"5\r\nhello\r\n".to_vec();
+        last(&mut body, Algorithm::Crc32, "NhCmhg==");
+        assert_eq!(
+            body,
+            b"5\r\nhello\r\n0\r\nx-amz-checksum-crc32:NhCmhg==\r\n\r\n"
+        );
+        let mut d = Decoder::unsigned("x-amz-checksum-crc32", 5);
+        let mut out = Vec::new();
+        d.feed(&body, &mut out).unwrap();
+        assert_eq!(d.finish().unwrap().unwrap().value, "NhCmhg==");
+        assert_eq!(out, b"hello");
     }
 
     proptest! {

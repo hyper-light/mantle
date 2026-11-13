@@ -166,11 +166,15 @@ pub struct Gateway {
     pub handover_ns: u64,
 }
 
+thread_local! {
+    pub static EXP_CEILING: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
 pub fn gateway() -> Result<Gateway, DeriveError> {
-    // EXPERIMENT ONLY (research/87 §4): the ceiling from the environment.
-    let objects = std::env::var("MANTLE_EXP_CEILING")
-        .ok()
-        .and_then(|v| v.parse().ok())
+    // EXPERIMENT ONLY (research/87 §4): the ceiling from the scales table, else the environment.
+    let objects = EXP_CEILING
+        .with(std::cell::Cell::get)
+        .or_else(|| std::env::var("MANTLE_EXP_CEILING").ok().and_then(|v| v.parse().ok()))
         .unwrap_or(OBJECTS);
     Ok(Gateway {
         window: 1,
@@ -3357,5 +3361,63 @@ mod tests {
             derive(stated(0), &small, &mut fresh),
             Err(DeriveError::Unsized)
         ));
+    }
+
+    /// EXPERIMENT ONLY (research/87 §4): what each ceiling costs the data at each scale.
+    #[test]
+    #[ignore]
+    fn exp_scales() {
+        let gib = 1u64 << 30;
+        let tib = 1u64 << 40;
+        let scales: [(&str, u64, usize, u64); 4] = [
+            ("small", 2 * gib, 1, 4 * gib),
+            ("laptop", 16 * gib, 1, 256 * gib),
+            ("box", 64 * gib, 4, tib),
+            ("massive", 512 * gib, 24, 16 * tib),
+        ];
+        for (name, allowance, volumes, size) in scales {
+            let mut st = stated(volumes);
+            for v in &mut st.volumes {
+                v.1 = size;
+            }
+            st.ceiling = Some(allowance);
+            let mut measured = facts(volumes);
+            measured.memory = machine(allowance, None);
+            measured.meta.bytes = Some(4 * tib);
+            for v in &mut measured.volumes {
+                v.device.bytes = Some(size.max(tib));
+            }
+            println!("scale {name} allowance {allowance} volumes {volumes}x{size}");
+            for c in [1usize, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024] {
+                EXP_CEILING.with(|e| e.set(Some(c)));
+                match derive(st.clone(), &measured, &mut fresh) {
+                    Ok(d) => {
+                        let get = |k: &str| {
+                            d.bases
+                                .iter()
+                                .find(|b| b.key == k)
+                                .map(|b| b.value.clone())
+                                .unwrap_or_default()
+                        };
+                        let floors: Vec<String> = d
+                            .bases
+                            .iter()
+                            .filter(|b| b.key.starts_with("memory.floor."))
+                            .map(|b| format!("{}={}", &b.key[13..], b.value))
+                            .collect();
+                        println!(
+                            "  C {c} frags {} index_bytes {} extents {} metadata {} floors {}",
+                            get("volume.1.max_fragments"),
+                            get("volume.1.index_bytes"),
+                            get("engine.max_extents"),
+                            get("engine.metadata_bytes"),
+                            floors.join(" ")
+                        );
+                    }
+                    Err(e) => println!("  C {c} refused: {e}"),
+                }
+            }
+        }
+        EXP_CEILING.with(|e| e.set(None));
     }
 }

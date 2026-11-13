@@ -169,6 +169,8 @@ impl Gateway {
     fn stated(&self, messages: Bounds, transport_bytes: u64) -> Stated {
         Stated {
             peers: self.founders.len(),
+            clients: 0,
+            pool: 0,
             ranges: 1,
             inflight: 0,
             transfers: 1,

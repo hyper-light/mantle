@@ -3179,12 +3179,10 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
         .saturating_mul(2)
         .saturating_add(SLOPE_HIGH)
         .saturating_add(1);
-    // Each node admits as many native clients at once as its gateway's floor states, so a client
-    // past them is refused at admission (node.md §3.6): the native door's clients stay within.
-    let native_most = mantle_node::derive::gateway()
-        .map_err(failed)?
-        .clients
-        .saturating_mul(cell::FOUNDERS);
+    // Each node admits as many native clients at once as it derived (`gateway.clients`), so a
+    // client past them is refused at admission (node.md §3.6): the native door's clients stay
+    // within. An endpoint this program did not start has no native door.
+    let native_most = cell.as_ref().map_or(0, Cell::native_clients);
     writeln!(
         out,
         "doors native clients at most {native_most}: each node admits gateway.clients identities at once"

@@ -195,8 +195,9 @@ volume.fragments_per_chunk = 64
 ";
 
 /// What a node that hosts objects states (`mantle_node::process`'s gateway keys): a block held 30 s
-/// for its file's write, two blocks going down or being read at once, four operations at once, as
-/// many clients as the cell's object clients, S3's 10,000 buckets an owner (research/05 §10.4), 64 rows a coordinator's read; and the
+/// for its file's write, two blocks going down or being read at once, four operations at once,
+/// their bytes four of the most an operation holds at that window (`gateway_bytes`), as many
+/// clients as the cell's object clients, S3's 10,000 buckets an owner (research/05 §10.4), 64 rows a coordinator's read; and the
 /// durability a block's scheme meets: Backblaze's 2025 drive AFR, 1.36% a drive-year, per hour;
 /// repair in a day, the slow end research/15 cites ([Cha12]); S3's eleven nines a year
 /// (research/15, "S3's target").
@@ -211,6 +212,15 @@ durability.chunk_rate = 0.0000015525114155251142
 durability.repair_rate = 0.041666666666666664
 durability.target = 0.00000000001
 ";
+
+/// The bytes `GATEWAY_STATED`'s four operations hold at its window of two blocks, each at the most
+/// an operation holds under any scheme a block may take (`mantle_node::derive::Charges`).
+pub(crate) fn gateway_bytes() -> u64 {
+    let schemes = mantle_ec::durability::candidates();
+    4 * mantle_node::derive::Charges::new(2, &schemes)
+        .unwrap()
+        .most()
+}
 
 /// The cell's root key file in `dir`: 32 bytes only its owner may read.
 pub(crate) fn root_key(dir: &Path) -> PathBuf {
@@ -633,6 +643,8 @@ impl Pki {
         };
         let least = mantle_protocol::bounds::least_transport(&mantle_protocol::bounds::Stated {
             peers: self.nodes.len(),
+            clients: 0,
+            pool: 0,
             ranges: 1,
             inflight: 0,
             transfers: usize::from(role == Role::Gateway),
@@ -682,8 +694,9 @@ impl Pki {
         if gateway {
             text.push_str(&format!(
                 "chunk_asks = 12\ncommand_asks = 8\nread_asks = 8\nroot_key = 1 {}\n\
-                 {GATEWAY_STATED}",
-                self.root_key.display()
+                 {GATEWAY_STATED}gateway.objects_bytes = {}\n",
+                self.root_key.display(),
+                gateway_bytes(),
             ));
         } else {
             text.push_str("chunk_asks = 0\ncommand_asks = 1\nread_asks = 0\n");

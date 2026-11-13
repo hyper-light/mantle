@@ -333,7 +333,22 @@ pub fn most_commands(layout: &Layout) -> u64 {
 /// one filling was taken whole, or the body stopped for the one waiting, so its coding
 /// (`Code::encode_bytes`) has no block filling beside it, only the others going down.
 pub fn most_bytes(window: usize, layout: &Layout) -> Option<u64> {
-    let block = layout.largest_block()?;
+    holds(window, layout, layout.largest_block()?, SEALED)
+}
+
+/// The bytes a put of a body of `length` bytes holds with `window` blocks going down under
+/// `layout`, as [`most_bytes`] counts them at the body's own sizes: its first segment, sealed, as
+/// the one it seals in, and its first block, the largest of its blocks, as each block. A body
+/// past one block holds what [`most_bytes`] says; one of a few bytes, a few bytes more than they.
+pub fn bytes_for(window: usize, layout: &Layout, length: u64) -> Option<u64> {
+    let block = layout.block_len(length, 0).ok()?;
+    let segment = layout.segment_len(length, 0).ok()?;
+    holds(window, layout, block, segment)
+}
+
+/// What a put holds with `window` blocks of at most `block` stored bytes going down under
+/// `layout`, sealing in a segment of `segment` bytes.
+fn holds(window: usize, layout: &Layout, block: u64, segment: u64) -> Option<u64> {
     let window = u64::try_from(window).ok()?;
     let (going, coding) = match layout.scheme() {
         Scheme::Copies(_) => (block, block),
@@ -351,7 +366,7 @@ pub fn most_bytes(window: usize, layout: &Layout) -> Option<u64> {
     let coded = going
         .checked_mul(window.checked_sub(1)?)?
         .checked_add(coding)?;
-    SEALED.checked_add(sending.max(coded))
+    segment.checked_add(sending.max(coded))
 }
 
 pub struct Put {
@@ -473,10 +488,14 @@ impl Put {
             None
         };
         let sum = body.checksum.map(Hasher::new).transpose()?;
-        let sealed_segment = seal::SEGMENT
-            .checked_add(seal::TAG)
+        // The segment it seals in at the first segment's sealed length, the longest of its
+        // segments, so a body of a few bytes holds a few bytes (`bytes_for`). A reservation the
+        // allocator refuses is an error, not an abort.
+        let sealed_segment = layout
+            .segment_len(body.length, 0)
+            .ok()
+            .and_then(|len| usize::try_from(len).ok())
             .ok_or(PutError::Overflow)?;
-        // A reservation the allocator refuses is an error, not an abort.
         let mut segment = Vec::new();
         segment
             .try_reserve_exact(sealed_segment)

@@ -878,6 +878,13 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// memory was split for.
     gateway: Option<GatewaySettings>,
     admission: Option<crate::admit::Admission>,
+    /// The stream pool the native clients draw from, as last sized: the admission's limit.
+    pooled: usize,
+    /// Native object requests past the admission's room, in the order they came, their bodies
+    /// unread (`host::Parked`): at most `parked_most`, the exchanges the transport holds at once,
+    /// which every parked request's is one of.
+    parked: VecDeque<host::Parked>,
+    parked_most: usize,
     jobs: Vec<host::Job>,
     /// What jobs that ended asked and was not yet answered: its outcomes are dropped as they come.
     /// At most the node's asks.
@@ -1022,11 +1029,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .unwrap_or(0);
         let clients = settings.gateway.as_ref().map_or(0, |g| g.clients);
         let stated = Stated {
-            peers: settings
-                .peers
-                .len()
-                .checked_add(clients)
-                .ok_or_else(|| at(Step::Budgets)(NodeError::Bounds("the peers".into())))?,
+            peers: settings.peers.len(),
+            clients,
+            pool: settings.gateway.as_ref().map_or(0, |g| g.objects),
             ranges: settings.ranges.len(),
             inflight,
             transfers: settings
@@ -1040,6 +1045,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let limits = bounds::limits(&stated)
             .map_err(|e| at(Step::Budgets)(NodeError::Bounds(e.to_string())))?;
         let lane_window = limits.lane_window;
+        let exchanges = limits.exchanges;
         let io = bounds::io(&stated);
         let plane_limits =
             plane(&stated).map_err(|e| at(Step::Budgets)(NodeError::Bounds(e.to_string())))?;
@@ -1109,7 +1115,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             limits,
             congestion: Default::default(),
         };
-        let budget = Fixed::new(settings.transport_bytes, stated.peers.max(1));
+        let budget = Fixed::new(
+            settings.transport_bytes,
+            stated.peers.max(1).saturating_add(stated.clients),
+        );
         // A client is held from its handshake until the next turn finds its connections gone: at
         // most the identities the transport admits and the handshakes it lets complete meanwhile.
         let most_clients = if clients == 0 {
@@ -1127,6 +1136,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             None => Endpoint::new(config, budget, directory, now),
         }
         .map_err(at(Step::Network))?;
+        let mut endpoint = endpoint;
+        // A node's native clients draw their exchanges from a pool as large as the operations it
+        // admits (Breakwater's credit, hyper-transport's `pool`), which follows its learned limit.
+        if clients > 0 {
+            let pool = settings.gateway.as_ref().map_or(0, |g| g.objects);
+            endpoint
+                .set_stream_pool(u32::try_from(pool).unwrap_or(u32::MAX))
+                .map_err(at(Step::Network))?;
+        }
         let driver = Driver::bind(endpoint, settings.quic, io).map_err(at(Step::Network))?;
         let plane_socket = PlaneSocket::bind(settings.plane, io).map_err(at(Step::Network))?;
         let plane = Plane::new(settings.id, plane_limits)
@@ -1210,11 +1228,20 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             next_read_ask: 0,
             reads_done: Vec::new(),
             wall: settings.wall,
-            admission: settings
+            admission: settings.gateway.as_ref().map(|g| {
+                crate::admit::Admission::new(
+                    g.objects,
+                    g.objects_bytes,
+                    hyper_rt::futures::now_ns(),
+                )
+            }),
+            pooled: settings
                 .gateway
                 .as_ref()
-                .map(|g| crate::admit::Admission::new(g.objects, hyper_rt::futures::now_ns())),
+                .map_or(0, |g| if g.clients > 0 { g.objects } else { 0 }),
             gateway: settings.gateway.take(),
+            parked: VecDeque::new(),
+            parked_most: exchanges,
             jobs: Vec::new(),
             abandoned: Vec::new(),
             doorway: None,
@@ -1609,6 +1636,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.schedule_due(now);
         self.drive(now)?;
         self.take_door();
+        self.take_parked();
         self.step_host()?;
         self.step_asks(now)?;
         self.step_reads(now)?;
@@ -1640,17 +1668,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// stopping node, or one that hosts no objects, answers each as it comes.
     fn take_door(&mut self) {
         loop {
-            let room = self.stopping() || self.gateway.is_none() || self.admits();
+            let gateway = self.gateway.as_ref();
+            let Some(charge) = self
+                .doorway
+                .as_mut()
+                .and_then(crate::door::Doorway::waiting)
+                .map(|request| gateway.map_or(0, |g| g.charges.of(request.op.written())))
+            else {
+                return;
+            };
+            // A request left waiting for the limit tells it its clients ask more than it admits
+            // (`admits`); one left waiting for bytes, nothing.
+            let room = self.stopping() || self.gateway.is_none() || self.admits(charge);
             if !room {
-                // A request left waiting tells the limit its clients ask more than it admits.
-                if self
-                    .doorway
-                    .as_mut()
-                    .is_some_and(crate::door::Doorway::waiting)
-                    && let Some(admission) = self.admission.as_mut()
-                {
-                    admission.turned_away();
-                }
                 return;
             }
             let Some(request) = self.doorway.as_mut().and_then(crate::door::Doorway::take) else {
@@ -1719,6 +1749,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             self.asks_due(now),
             self.reads_due(now),
             self.host_due(),
+            self.parked_due(now),
             held,
         ]
         .into_iter()
@@ -2148,6 +2179,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     .retain(|r| r.origin != ReadOrigin::Exchange(exchange));
                 self.ask_lost(exchange);
                 self.job_lost(exchange);
+                self.keep_pool();
                 Ok(())
             }
             Event::Writable { exchange } if self.job_on(exchange).is_some() => Ok(()),

@@ -94,12 +94,13 @@ impl Doorway {
             .or_else(|| self.requests.try_recv().ok().flatten())
     }
 
-    /// Whether a request waits to be taken, which holds it ahead of the rest until it is.
-    pub fn waiting(&mut self) -> bool {
+    /// The request that waits to be taken next, held ahead of the rest until it is; none where
+    /// none waits.
+    pub fn waiting(&mut self) -> Option<&Request> {
         if self.held.is_none() {
             self.held = self.requests.try_recv().ok().flatten();
         }
-        self.held.is_some()
+        self.held.as_ref()
     }
 }
 

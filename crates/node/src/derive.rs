@@ -144,39 +144,187 @@ pub fn probe_budget() -> Result<Duration, DeriveError> {
         .ok_or(DeriveError::Overflow("the probe budget"))
 }
 
-/// The most operations a node that hosts objects runs at once, the ceiling its memory is split
-/// for: within it the node admits as many as it learns its knee is (`crate::admit`, node.md §2.8).
-/// 8, the knee measured on the box (research/71, step 9; 64 KiB native PUTs, an open loop past
-/// capacity, three clients an operation, n 300): 30, 39, 72, 79 and 93 a second at 2, 4, 8, 16 and
-/// 32. It stays until research/87 §4's experiment chooses the ceiling's rule from the memory. Each
-/// costs the objects' class its most bytes (`objects`).
-const OBJECTS: usize = 8;
+/// The share of the memory a node holds at most that its object operations' bytes may take at
+/// once: 3/32, the most Linux lets TCP's buffers hold of the memory free at boot, `tcp_mem`'s third
+/// value (Linux v6.12 `net/ipv4/tcp.c`, `tcp_init_mem`: "sysctl_tcp_mem[2] = sysctl_tcp_mem[0] *
+/// 2; /* 9.37 % */"), the bytes a host keeps in flight on its connections, as an operation's are
+/// on their way between its client and the volumes (research/87 §4, rule C). Within it each
+/// operation is charged what it holds at its own size ([`Charges`]), and the node runs as many as
+/// it learns its knee is (`crate::admit`): `OPERATIONS_SHARE` thirty-seconds of it,
+/// [`OPERATIONS_SHARE_OF`].
+const OPERATIONS_SHARE: u64 = 3;
+const OPERATIONS_SHARE_OF: u64 = 32;
 
-/// What a node that hosts objects runs its drivers with: a window of one block, the floor; at most
-/// [`OBJECTS`] operations at once, of any kind, as many as it learns its knee is within them; as many clients of the native protocol
-/// admitted at once, each with an operation it may run; S3's quota of buckets; one row each step
-/// of a bucket's attempt passes or removes, the least that moves it; HDFS's handover.
+/// What a node that hosts objects runs its drivers with: a window of one block, the floor; its
+/// operations' bytes within [`OPERATIONS_SHARE`] of its memory, and at most as many operations as
+/// those bytes hold at the least an operation holds, as many as it learns its knee is within them;
+/// as many clients of the native protocol admitted at once, each with an operation it may run; S3's
+/// quota of buckets; one row each step of a bucket's attempt passes or removes, the least that
+/// moves it; HDFS's handover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Gateway {
     pub window: usize,
     pub objects: usize,
+    pub objects_bytes: u64,
     pub clients: usize,
     pub bucket_quota: u32,
     pub scan_rows: u32,
     pub handover_ns: u64,
 }
 
-pub fn gateway() -> Result<Gateway, DeriveError> {
-    let objects = OBJECTS;
+/// The bytes a node whose memory holds `allowance` bytes at most ([`allowance`]) gives its object
+/// operations and all they hold besides: [`OPERATIONS_SHARE`] of it.
+pub fn operations_share(allowance: u64) -> Result<u64, DeriveError> {
+    allowance
+        .checked_div(OPERATIONS_SHARE_OF)
+        .and_then(|part| part.checked_mul(OPERATIONS_SHARE))
+        .ok_or(DeriveError::Overflow("the operations' share"))
+}
+
+/// How many operations `share` bytes hold, and the bytes left for what they hold at their own
+/// sizes, where each operation costs its charge and `beside` bytes of the node's other classes
+/// (its exchanges, its client's connections, its read's state): one operation of the largest
+/// blocks, and as many more at the least an operation holds as the share then holds. At least
+/// one, at the most an operation holds, where the share holds less.
+pub fn operations(share: u64, beside: u64, charges: &Charges) -> (usize, u64) {
+    let most = charges.most();
+    let each = charges.least().saturating_add(beside).max(1);
+    let by_least = share.checked_div(each).unwrap_or(0);
+    let by_most = share
+        .checked_sub(most)
+        .and_then(|rest| rest.checked_div(beside.max(1)))
+        .unwrap_or(0);
+    let count = by_least.min(by_most).max(1);
+    let bytes = share.saturating_sub(count.saturating_mul(beside)).max(most);
+    (usize::try_from(count).unwrap_or(usize::MAX), bytes)
+}
+
+/// The gateway of a node that runs `objects` operations at once at most, their bytes at their own
+/// sizes `objects_bytes` ([`operations`]): a window of one block going down or being read, the
+/// floor (node.md §1.4); as many native clients as operations, each with one it may run.
+pub fn gateway(objects: usize, objects_bytes: u64) -> Result<Gateway, DeriveError> {
     Ok(Gateway {
         window: 1,
         objects,
+        objects_bytes,
         clients: objects,
         bucket_quota: BUCKET_QUOTA,
         scan_rows: 1,
         handover_ns: u64::try_from(HANDOVER.as_nanos())
             .map_err(|_| DeriveError::Overflow("the handover"))?,
     })
+}
+
+/// The schemes a node's blocks may take, its operations' charges are reckoned under: those
+/// [`schemes`] gives at the most failure domains its cell's volume table names (`enlist`'s
+/// `max_nodes`), or the widest scheme's width where it names none.
+pub fn charges(
+    window: usize,
+    enlist: Option<&Enlisting>,
+    rates: &Rates,
+    target: f64,
+) -> Result<Charges, DeriveError> {
+    let widest = durability::candidates()
+        .iter()
+        .map(|s| s.width())
+        .max()
+        .unwrap_or(0);
+    let domains = enlist.map_or(widest, |e| {
+        usize::try_from(e.max_nodes).unwrap_or(usize::MAX)
+    });
+    Charges::new(window, &schemes(domains, rates, target)?)
+}
+
+/// The bytes an object operation holds while it runs, at its own size, under each scheme a block
+/// may take ([`charges`]), each the driver's own (`put::bytes_for`, `put::most_bytes`,
+/// `get::most_bytes`) and the host's: a put's chunks copied to send, every chunk of every block
+/// going down, and a piece of its body carried; a get's block taken and written out. A write is
+/// charged at its body's length, known from its head; every other operation at the most any
+/// holds, as a get's object's size is known only once its row is read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Charges {
+    window: usize,
+    layouts: Vec<Layout>,
+    piece: u64,
+    most: u64,
+    least: u64,
+}
+
+impl Charges {
+    /// The charges of operations holding `window` blocks going down or being read at once, their
+    /// blocks under `schemes`.
+    pub fn new(window: usize, schemes: &[Scheme]) -> Result<Self, DeriveError> {
+        let overflow = || DeriveError::Overflow("an operation's bytes");
+        let piece = u64::try_from(hyper_transport::RECEIVE_CHUNK).map_err(|_| overflow())?;
+        let window_n = u64::try_from(window).map_err(|_| overflow())?;
+        let mut layouts = Vec::new();
+        let mut most = 0u64;
+        for &scheme in schemes {
+            let layout = Layout::new(scheme).map_err(|_| overflow())?;
+            let block = layout.largest_block().ok_or_else(overflow)?;
+            let put = put::most_bytes(window, &layout)
+                .and_then(|bytes| bytes.checked_add(copies(&layout, block, window_n)?))
+                .and_then(|bytes| bytes.checked_add(piece))
+                .ok_or_else(overflow)?;
+            let get = get::most_bytes(window, &layout)
+                .and_then(|bytes| bytes.checked_add(block))
+                .ok_or_else(overflow)?;
+            most = most.max(put).max(get);
+            layouts.push(layout);
+        }
+        let mut charges = Self {
+            window,
+            layouts,
+            piece,
+            most,
+            least: most,
+        };
+        charges.least = charges.of(Some(0));
+        Ok(charges)
+    }
+
+    /// What an operation that writes `written` bytes holds, or one that writes none: a write at
+    /// its body's length under the scheme that holds the most of it, every other operation the
+    /// most. A length no layout lays out is charged the most.
+    pub fn of(&self, written: Option<u64>) -> u64 {
+        let Some(length) = written else {
+            return self.most;
+        };
+        let window = u64::try_from(self.window).unwrap_or(u64::MAX);
+        let mut held = 0u64;
+        for layout in &self.layouts {
+            let bytes = layout.block_len(length, 0).ok().and_then(|block| {
+                put::bytes_for(self.window, layout, length)?
+                    .checked_add(copies(layout, block, window)?)?
+                    .checked_add(self.piece)
+            });
+            match bytes {
+                Some(bytes) => held = held.max(bytes),
+                None => return self.most,
+            }
+        }
+        held.min(self.most)
+    }
+
+    /// The most any operation holds.
+    pub fn most(&self) -> u64 {
+        self.most
+    }
+
+    /// The least an operation holds: a write of no bytes.
+    pub fn least(&self) -> u64 {
+        self.least
+    }
+}
+
+/// A put's chunks of a block of `block` stored bytes under `layout`, copied to send, for each of
+/// `window` blocks going down.
+fn copies(layout: &Layout, block: u64, window: u64) -> Option<u64> {
+    let chunk = layout.chunk_len(block).ok()?;
+    u64::try_from(layout.scheme().width())
+        .ok()?
+        .checked_mul(chunk)?
+        .checked_mul(window)
 }
 
 /// What a node holds of its own asks at once.
@@ -259,39 +407,24 @@ pub fn asks(gateway: &Gateway, schemes: &[Scheme]) -> Result<Asks, DeriveError> 
     })
 }
 
-/// The most bytes the objects a node hosts hold at once: `gateway.objects` operations of any
-/// kind, each the larger of a put and a get of the largest blocks the schemes its blocks may take
-/// make. Each is the driver's own (`put::most_bytes`, `get::most_bytes`) and the host's: a put's
-/// chunks copied to send, every chunk of every block going down, and a piece of its body carried;
-/// a get's block taken and written out. A scheme that codes adds the coding library's tables,
-/// once a process (`mantle_ec::TABLE_BYTES`).
+/// The objects' class at the floor: the bytes its operations may hold, and, where a scheme its
+/// blocks may take codes, the coding library's tables, once a process (`mantle_ec::TABLE_BYTES`).
 pub fn objects(gateway: &Gateway, schemes: &[Scheme]) -> Result<u64, DeriveError> {
-    let overflow = || DeriveError::Overflow("an operation's bytes");
-    let piece = u64::try_from(hyper_transport::RECEIVE_CHUNK).map_err(|_| overflow())?;
-    let window = u64::try_from(gateway.window).map_err(|_| overflow())?;
-    let (mut most, mut codes) = (0u64, false);
-    for &scheme in schemes {
-        let layout = Layout::new(scheme).map_err(|_| overflow())?;
-        let block = layout.largest_block().ok_or_else(overflow)?;
-        let chunk = layout.chunk_len(block).map_err(|_| overflow())?;
-        let copies = u64::try_from(scheme.width())
-            .ok()
-            .and_then(|width| width.checked_mul(chunk)?.checked_mul(window))
-            .ok_or_else(overflow)?;
-        let put = put::most_bytes(gateway.window, &layout)
-            .and_then(|bytes| bytes.checked_add(copies)?.checked_add(piece))
-            .ok_or_else(overflow)?;
-        let get = get::most_bytes(gateway.window, &layout)
-            .and_then(|bytes| bytes.checked_add(block))
-            .ok_or_else(overflow)?;
-        most = most.max(put).max(get);
-        codes |= matches!(scheme, Scheme::Rs(_));
-    }
+    let codes = schemes.iter().any(|s| matches!(s, Scheme::Rs(_)));
     let tables = if codes { mantle_ec::TABLE_BYTES } else { 0 };
-    u64::try_from(gateway.objects)
-        .ok()
-        .and_then(|objects| objects.checked_mul(most)?.checked_add(tables))
-        .ok_or_else(overflow)
+    gateway
+        .objects_bytes
+        .checked_add(tables)
+        .ok_or(DeriveError::Overflow("an operation's bytes"))
+}
+
+/// What a node's operations hold at a count of them, beside their charges: their asks, the
+/// transport's bounds at its floor, its bytes beside its budget, and the ranges' members.
+struct Held {
+    asked: Asks,
+    bounds: mantle_protocol::bounds::Stated,
+    beside: u64,
+    ranges_bytes: u64,
 }
 
 /// Why the settings cannot be derived: a fact that admits no unit of some class of work.
@@ -409,15 +542,6 @@ pub fn cell(identities: u64) -> Result<(Settings, Rules), DeriveError> {
 /// measurements/2026-09-29-log-confirmation.md, finding 2). Derived from the log's one frame on the
 /// device and one queued behind it: a third waits for the second either way.
 pub const IN_FLIGHT: usize = 2;
-
-/// The chunks a node's operations may write to one volume at once: each operation a window of
-/// blocks, a chunk of each on any one volume (`gateway.objects`, `gateway.window`).
-pub fn chunk_writes() -> Result<usize, DeriveError> {
-    let g = gateway()?;
-    g.objects
-        .checked_mul(g.window)
-        .ok_or(DeriveError::Overflow("a node's chunk writes"))
-}
 
 /// The message bounds every node of a cell states, which a client of its ranges states the same:
 /// a range's largest message from the cell's settings, which every range shares, and a chunk at
@@ -949,10 +1073,10 @@ pub struct Formatted {
 /// - the standard layout, its superblocks 16 MiB apart beyond the reach of clustered latent
 ///   sector errors, or the compact one where the standard leaves fewer than two segments
 ///   (chunk-store.md §2);
-/// - batches of `requests` records, every chunk the cell's operations may write to the volume at
-///   once, so all of them share one flush (Helland et al., Tandem TR 88.1, §2; research/71, step
-///   9: batches of one record flushed each chunk alone), a segment's room in bytes, and one
-///   fragment a chunk, as the node puts chunks whole;
+/// - batches of every chunk waiting that a segment's room holds, each at least a block, within
+///   the records a batch's frame holds (`layout::most_batch_requests`), so all of them share one
+///   flush (Helland et al., Tandem TR 88.1, §2; research/71, step 9: batches of one record flushed
+///   each chunk alone; research/87 §1), and one fragment a chunk, as the node puts chunks whole;
 /// - as many fragments as the index's bytes hold (`index::most_fragments`) and the volume holds
 ///   at a block each, the least a fragment takes standing for the chunk sizes research 11 §6.2
 ///   learns from, within what the log of a volume laid out already holds checkpoints of;
@@ -964,7 +1088,6 @@ pub fn volume(
     profile: &Profile,
     index_bytes: u64,
     formatted: Option<&Formatted>,
-    requests: usize,
 ) -> Result<VolumeConfig, DeriveError> {
     let (block, checksum_shift, segment_size) = match formatted {
         Some(formatted) => (
@@ -987,6 +1110,15 @@ pub fn volume(
         .checked_sub(block)
         .and_then(|room| usize::try_from(room).ok())
         .ok_or(DeriveError::Overflow("a batch"))?;
+    // A batch carries every chunk waiting that its bytes hold, each at least a block, within what
+    // its frame records: no count besides (group commit's rule, research/87 §1).
+    let batch_requests = u64::try_from(batch_bytes)
+        .ok()
+        .and_then(|bytes| bytes.checked_div(block))
+        .and_then(|n| usize::try_from(n).ok())
+        .zip(volume_layout::most_batch_requests())
+        .map(|(bytes, frame)| bytes.min(frame))
+        .ok_or(DeriveError::Overflow("a batch"))?;
     let at_a_block = size.checked_div(block).unwrap_or(0);
     let mut config = VolumeConfig {
         segment_size,
@@ -995,7 +1127,7 @@ pub fn volume(
         compact: false,
         scrub_period: Some(SCRUB),
         limits: Limits {
-            batch_requests: requests.max(1),
+            batch_requests: batch_requests.max(1),
             batch_bytes,
             fragments_per_chunk: 1,
         },
@@ -1230,8 +1362,9 @@ fn layer_name(layer: Layer) -> &'static str {
 ///
 /// - the cell's settings and rules from its identities ([`cell`]), the log from the node
 ///   directory's device and the ranges ([`log`]);
-/// - the objects' floor, a window of one block and `OBJECTS` operations, and their asks under the
-///   schemes a block may take in a cell of the volume table's nodes ([`gateway`], [`schemes`],
+/// - the objects' floor, a window of one block and the bytes its operations may hold, as many
+///   operations as those bytes hold at the least one holds, and their asks under the schemes a
+///   block may take in a cell of the volume table's nodes ([`gateway`], [`Charges`], [`schemes`],
 ///   [`asks`], [`objects`]), for a node that names root keys;
 /// - each volume at its device's measured profile ([`volume`]), its index at first a fragment at
 ///   each of its blocks, and a volume laid out already keeping its layout;
@@ -1310,17 +1443,12 @@ pub fn derive(
         .ok_or(overflow("the cell's identities"))?;
     let (settings, rules) = cell(identities)?;
     say_cell(&mut said, &settings, &rules);
-    // Every operation of every node may write a chunk to one volume at once: one batch holds them.
-    let chunk_requests = usize::try_from(identities)
-        .ok()
-        .and_then(|n| n.checked_mul(chunk_writes().ok()?))
-        .ok_or(overflow("a volume's batch"))?;
+    let allowed = allowance(stated.ceiling, &measured.memory)?;
 
     // The objects a node with root keys hosts, at the floor.
     let hosts = !stated.keys.is_empty();
     let rates = rates();
     let target = target(stated.target);
-    let gateway = gateway()?;
     let widest = durability::candidates()
         .iter()
         .map(|s| s.width())
@@ -1329,29 +1457,12 @@ pub fn derive(
     let domains = stated.enlist.as_ref().map_or(widest, |e| {
         usize::try_from(e.max_nodes).unwrap_or(usize::MAX)
     });
-    let (asked, objects_bytes) = if hosts {
-        let schemes = schemes(domains, &rates, target)?;
-        (asks(&gateway, &schemes)?, objects(&gateway, &schemes)?)
+    let schemes = if hosts {
+        schemes(domains, &rates, target)?
     } else {
-        let enlists = usize::from(stated.enlist.is_some());
-        (
-            Asks {
-                chunks: 0,
-                commands: enlists,
-                reads: 0,
-            },
-            0,
-        )
+        Vec::new()
     };
-    say_objects(
-        &mut said,
-        hosts,
-        stated.enlist.is_some(),
-        &asked,
-        &gateway,
-        &rates,
-        (target, stated.target.is_some()),
-    );
+    let charges = Charges::new(gateway(0, 0)?.window, &schemes)?;
 
     // Each volume as its index's whole want would have it: its buffers, its transfers, its want.
     if stated.volumes.len() != measured.volumes.len() {
@@ -1384,7 +1495,6 @@ pub fn derive(
             &facts.profile,
             want,
             facts.formatted.as_ref(),
-            chunk_requests,
         )?;
         let geometry = match &facts.formatted {
             Some(formatted) => formatted.geometry,
@@ -1451,30 +1561,98 @@ pub fn derive(
         })
         .collect();
     let messages = messages()?;
-    // A node that hosts objects admits its clients beside its pinned peers, each an identity of
-    // its transport (node.md §3.6).
-    let clients = if hosts { gateway.clients } else { 0 };
-    let mut bounds = mantle_protocol::bounds::Stated {
-        peers: stated
-            .peers
-            .len()
-            .checked_add(clients)
-            .ok_or(overflow("the transport's peers"))?,
-        ranges,
-        inflight: settings.max_inflight_msgs,
-        transfers: transfers
-            .checked_add(asked.chunks)
-            .ok_or(overflow("the node's transfers"))?,
-        transport_bytes: 0,
-        messages,
-        max_head: crate::node::MAX_HEAD,
+    // What `objects` operations at once hold beside their charges: their asks, the transport's
+    // bounds with a native client each beside the pinned peers (node.md §3.6) drawing its
+    // exchanges from a pool of as many, and each range's reads.
+    let held_by = |objects: usize| -> Result<Held, DeriveError> {
+        let gateway = gateway(objects, 0)?;
+        let asked = if hosts {
+            asks(&gateway, &schemes)?
+        } else {
+            Asks {
+                chunks: 0,
+                commands: usize::from(stated.enlist.is_some()),
+                reads: 0,
+            }
+        };
+        let clients = if hosts { gateway.clients } else { 0 };
+        let mut bounds = mantle_protocol::bounds::Stated {
+            peers: stated.peers.len(),
+            clients,
+            pool: if hosts { objects } else { 0 },
+            ranges,
+            inflight: settings.max_inflight_msgs,
+            transfers: transfers
+                .checked_add(asked.chunks)
+                .ok_or(overflow("the node's transfers"))?,
+            transport_bytes: 0,
+            messages,
+            max_head: crate::node::MAX_HEAD,
+        };
+        let transport_bytes = mantle_protocol::bounds::least_transport(&bounds)
+            .map_err(|e| DeriveError::Bounds(e.to_string()))?;
+        bounds.transport_bytes = transport_bytes;
+        let limits = mantle_protocol::bounds::limits(&bounds)
+            .map_err(|e| DeriveError::Bounds(e.to_string()))?;
+        let beside = transport_bytes_beside(&bounds).ok_or(overflow("the transport"))?;
+        let reads = asked
+            .reads
+            .checked_add(limits.exchanges)
+            .ok_or(overflow("a range's reads"))?;
+        let mut ranges_bytes = 0u64;
+        for hosted in &hosted {
+            ranges_bytes = range_bytes(&hosted.range, reads)
+                .and_then(|bytes| ranges_bytes.checked_add(bytes))
+                .ok_or(overflow("the ranges' members"))?;
+        }
+        Ok(Held {
+            asked,
+            bounds,
+            beside,
+            ranges_bytes,
+        })
     };
-    let transport_bytes = mantle_protocol::bounds::least_transport(&bounds)
-        .map_err(|e| DeriveError::Bounds(e.to_string()))?;
-    bounds.transport_bytes = transport_bytes;
-    let limits =
-        mantle_protocol::bounds::limits(&bounds).map_err(|e| DeriveError::Bounds(e.to_string()))?;
-    let beside = transport_bytes_beside(&bounds).ok_or(overflow("the transport"))?;
+    // The operations' share holds as many operations as it holds at what one costs: its charge,
+    // and what one more adds to the transport and the ranges, the model's own difference.
+    let (objects, objects_bytes) = if hosts {
+        let total = |held: &Held| {
+            held.bounds
+                .transport_bytes
+                .checked_add(held.beside)?
+                .checked_add(held.ranges_bytes)
+        };
+        let one = held_by(1)?;
+        let two = held_by(2)?;
+        let each = total(&two)
+            .zip(total(&one))
+            .and_then(|(two, one)| two.checked_sub(one))
+            .ok_or(overflow("an operation's state"))?;
+        operations(operations_share(allowed)?, each, &charges)
+    } else {
+        (0, 0)
+    };
+    let gateway = gateway(objects, objects_bytes)?;
+    let Held {
+        asked,
+        bounds,
+        beside,
+        ranges_bytes,
+    } = held_by(objects)?;
+    let transport_bytes = bounds.transport_bytes;
+    let objects_bytes = if hosts {
+        crate::derive::objects(&gateway, &schemes)?
+    } else {
+        0
+    };
+    say_objects(
+        &mut said,
+        hosts,
+        stated.enlist.is_some(),
+        &asked,
+        &gateway,
+        &rates,
+        (target, stated.target.is_some()),
+    );
 
     // The floor, class by class.
     let engines_bytes = mantle_engine::shard_db::bounded_bytes(
@@ -1486,16 +1664,6 @@ pub fn derive(
     )
     .and_then(|each| each.checked_mul(u64::try_from(ranges).ok()?))
     .ok_or(overflow("the engines' buffers"))?;
-    let reads = asked
-        .reads
-        .checked_add(limits.exchanges)
-        .ok_or(overflow("a range's reads"))?;
-    let mut ranges_bytes = 0u64;
-    for hosted in &hosted {
-        ranges_bytes = range_bytes(&hosted.range, reads)
-            .and_then(|bytes| ranges_bytes.checked_add(bytes))
-            .ok_or(overflow("the ranges' members"))?;
-    }
     // A device's issuer, one a device the OS names, started by its first volume.
     let mut devices: Vec<(&Option<String>, usize)> = Vec::new();
     for facts in &measured.volumes {
@@ -1527,7 +1695,6 @@ pub fn derive(
             stacks(started).ok_or(overflow("the threads' stacks"))?,
         ),
     ];
-    let allowed = allowance(stated.ceiling, &measured.memory)?;
     let remaining = floor(&classes, allowed)?;
     say_floor(
         &mut said,
@@ -1588,7 +1755,6 @@ pub fn derive(
             &facts.profile,
             index_bytes,
             facts.formatted.as_ref(),
-            chunk_requests,
         )?;
         say_volume(&mut said, n.saturating_add(1), facts, &config, index_bytes);
         volumes.push(VolumeSettings {
@@ -1653,6 +1819,7 @@ pub fn derive(
         handover_ns: gateway.handover_ns,
         window: gateway.window,
         objects: gateway.objects,
+        objects_bytes: gateway.objects_bytes,
         clients: gateway.clients,
         bucket_quota: gateway.bucket_quota,
         scan_rows: gateway.scan_rows,
@@ -1976,11 +2143,11 @@ fn say_objects(
     );
     let (chunks, commands, reads) = if hosts {
         (
-            "the `OBJECTS` operations, each at its most chunks under the schemes a block may \
-             take in a cell of the volume table's nodes (derive::asks)",
-            "a put of the largest body's commands for each of the `OBJECTS` operations, and the node's \
-             enlistment (derive::asks)",
-            "one read for each of the `OBJECTS` operations (derive::asks)",
+            "the gateway.objects operations, each at its most chunks under the schemes a block \
+             may take in a cell of the volume table's nodes (derive::asks)",
+            "a put of the largest body's commands for each of the gateway.objects operations, and \
+             the node's enlistment (derive::asks)",
+            "one read for each of the gateway.objects operations (derive::asks)",
         )
     } else if enlists {
         (
@@ -2008,11 +2175,21 @@ fn say_objects(
         "the floor: a window of one block (node.md §1.4)",
     );
     said.add(
+        "gateway.objects_bytes",
+        gateway.objects_bytes,
+        Kind::Cited,
+        "the bytes the operations hold at once, each charged what it holds at its own size: 3/32 \
+         of the memory the node holds at most, the most Linux lets TCP's buffers hold \
+         (tcp_init_mem, net/ipv4/tcp.c; derive::OPERATIONS_SHARE, research/87 §4), and at least \
+         one operation of the largest blocks",
+    );
+    said.add(
         "gateway.objects",
         gateway.objects,
-        Kind::Measured,
-        "operations at once of any kind, the knee of the cell's write throughput measured on \
-         the box (derive::OBJECTS, research/71 step 9)",
+        Kind::Derived,
+        "the most operations at once, those bytes at the least an operation holds, a write of no \
+         bytes (derive::Charges); within it the node runs as many as it learns its knee is \
+         (crate::admit, node.md §2.8)",
     );
     said.add(
         "gateway.clients",
@@ -2109,7 +2286,8 @@ fn say_floor(
             Kind::Derived,
             match class {
                 Class::Objects => {
-                    "`OBJECTS` operations of the largest blocks the schemes make (derive::objects)"
+                    "the bytes the operations hold at once, gateway.objects_bytes, and a coding \
+                     scheme's tables (derive::objects)"
                 }
                 Class::Volumes => "each volume's buffers (mantle_chunk::layout::most_bytes)",
                 Class::Engines => {
@@ -2241,7 +2419,8 @@ fn say_volume(
         format!("volume.{n}.batch_requests"),
         config.limits.batch_requests,
         Kind::Derived,
-        "one record a batch, as the node puts chunks whole",
+        "every chunk waiting a segment's room holds at a block each, within the records a \
+         batch's frame holds (layout::most_batch_requests; research/87 §1)",
     );
     said.add(
         format!("volume.{n}.batch_bytes"),
@@ -2473,7 +2652,7 @@ mod tests {
     /// largest body's commands, one read each, and its enlistment.
     #[test]
     fn the_asks_hold_each_operation_at_its_most_under_any_scheme() {
-        let g = gateway().unwrap();
+        let g = gateway(8, 0).unwrap();
         let schemes = durability::candidates();
         let a = asks(&g, &schemes).unwrap();
         let chunks = schemes
@@ -2558,6 +2737,8 @@ mod tests {
         let (settings, _) = cell(3).unwrap();
         let stated = |peers: usize, transport_bytes: u64| mantle_protocol::bounds::Stated {
             peers,
+            clients: 0,
+            pool: 0,
             ranges: 5,
             inflight: settings.max_inflight_msgs,
             transfers: 38,
@@ -2602,23 +2783,71 @@ mod tests {
         assert_eq!(schemes(widest + 10, &r, t).unwrap(), before);
     }
 
-    /// `OBJECTS` operations of the larger of a put and a get each: for one copy, a get's spans and the
-    /// other copy, the copy cut, the bytes opened and the host's block taken, past a put's
-    /// segment, block filling, block going down, its copy sent and a piece of body; a code adds
-    /// the coding library's tables once.
+    /// An operation of the largest blocks holds the larger of a put and a get: for one copy, a
+    /// get's spans and the other copy, the copy cut, the bytes opened and the host's block taken,
+    /// past a put's segment, block filling, block going down, its copy sent and a piece of body. A
+    /// write of a few bytes holds a few bytes past its piece of body under each scheme, and one past
+    /// a block what the largest put holds; every other operation the most.
     #[test]
-    fn the_objects_hold_their_operations_of_their_largest_blocks() {
-        let g = gateway().unwrap();
-        let n = u64::try_from(OBJECTS).unwrap();
-        let sealed = mantle_gateway::layout::SEALED;
+    fn an_operation_is_charged_what_it_holds_at_its_own_size() {
         let copies = durability::Scheme::Copies(1);
+        let three = durability::Scheme::Copies(3);
+        let charges = Charges::new(1, &[copies, three]).unwrap();
+        let sealed = mantle_gateway::layout::SEALED;
+        let piece = u64::try_from(hyper_transport::RECEIVE_CHUNK).unwrap();
         let block = Layout::new(copies).unwrap().largest_block().unwrap();
-        assert_eq!(objects(&g, &[copies]).unwrap(), n * (5 * block + sealed));
+        assert_eq!(
+            Charges::new(1, &[copies]).unwrap().most(),
+            5 * block + sealed
+        );
+        assert_eq!(charges.of(None), charges.most());
+        assert_eq!(charges.of(Some(u64::MAX)), charges.most());
+        let tag = sealed - u64::try_from(mantle_s3::seal::SEGMENT).unwrap();
+        // Under three copies: the segment it seals in, the block filling and the block going
+        // down, and the three chunks copied to send, each the body and its tag; and a piece of
+        // body.
+        for length in [0u64, 1, 4096] {
+            assert_eq!(
+                charges.of(Some(length)),
+                piece + 6 * (length + tag),
+                "{length}"
+            );
+        }
+        assert_eq!(charges.least(), piece + 6 * tag);
+        assert_eq!(charges.of(Some(1 << 30)), charges.most());
         let coded = durability::Scheme::Rs(mantle_ec::Code::new(2, 1).unwrap());
-        let both = objects(&g, &[copies, coded]).unwrap();
-        let alone = objects(&g, &[coded]).unwrap();
-        assert_eq!(both, alone);
-        assert!(alone > n * (5 * block + sealed) + mantle_ec::TABLE_BYTES);
+        let mixed = Charges::new(1, &[three, coded]).unwrap();
+        assert!(mixed.of(Some(1)) >= charges.of(Some(1)));
+        assert!(mixed.of(Some(1)) < mixed.most());
+    }
+
+    /// The operations' share is 3/32 of the allowance, Linux's `tcp_mem` share. It holds an
+    /// operation of the largest blocks and as many more at the least an operation holds and what
+    /// it adds beside as fit; at least one at the most where it holds less.
+    #[test]
+    fn the_operations_hold_their_share_of_the_memory() {
+        assert_eq!(operations_share(16 << 30).unwrap(), (16u64 << 30) / 32 * 3);
+        let charges = Charges::new(1, &[durability::Scheme::Copies(3)]).unwrap();
+        let share = 1u64 << 30;
+        let beside = 300_000;
+        let (count, bytes) = operations(share, beside, &charges);
+        let count = u64::try_from(count).unwrap();
+        assert_eq!(count, share / (charges.least() + beside));
+        assert_eq!(bytes, share - count * beside);
+        assert!(bytes >= charges.most() && bytes >= count * charges.least());
+        assert_eq!(operations(1, beside, &charges), (1, charges.most()));
+        let g = gateway(7, 9).unwrap();
+        assert_eq!(
+            (g.objects, g.objects_bytes, g.clients, g.window),
+            (7, 9, 7, 1)
+        );
+        let coded = durability::Scheme::Rs(mantle_ec::Code::new(2, 1).unwrap());
+        let copies = durability::Scheme::Copies(1);
+        assert_eq!(objects(&g, &[copies]).unwrap(), 9);
+        assert_eq!(
+            objects(&g, &[copies, coded]).unwrap(),
+            9 + mantle_ec::TABLE_BYTES
+        );
     }
 
     /// The log derived takes a frame of the range's largest entry with its shell's bytes; a group
@@ -2664,49 +2893,44 @@ mod tests {
     fn a_volume_holds_a_chunk_a_segment_and_the_fragments_its_index_holds() {
         let align = Alignment::new(4096).unwrap();
         let chunk = mantle_gateway::layout::CHUNK;
-        let v = volume(align, 1 << 30, chunk, &PROFILE, 1 << 30, None, 1).unwrap();
+        let v = volume(align, 1 << 30, chunk, &PROFILE, 1 << 30, None).unwrap();
         assert_eq!(v.checksum_shift, 12);
         assert!(volume_layout::record_room(v.segment_size, 4096, 12) >= chunk);
         assert!(volume_layout::record_room(v.segment_size - 4096, 4096, 12) < chunk);
         assert!(!v.compact);
+        // A batch holds every chunk waiting its bytes hold at a block each, within its frame.
         assert_eq!(
             (v.limits.batch_requests, v.limits.fragments_per_chunk),
-            (1, 1)
+            (
+                v.limits
+                    .batch_bytes
+                    .div_euclid(4096)
+                    .min(volume_layout::most_batch_requests().unwrap()),
+                1
+            )
         );
-        // A batch holds every chunk the cell's operations may write at once.
-        let cell = volume(
-            align,
-            1 << 30,
-            chunk,
-            &PROFILE,
-            1 << 30,
-            None,
-            3 * chunk_writes().unwrap(),
-        )
-        .unwrap();
-        assert_eq!(cell.limits.batch_requests, 3 * chunk_writes().unwrap());
-        Geometry::plan(1 << 30, align, &cell).unwrap();
+        assert!(v.limits.batch_requests > 1);
         assert_eq!(v.max_fragments, (1 << 30) / 4096);
         assert_eq!(v.reads, Reads::measured(4, 1 << 20, 64 << 10));
         assert!(v.prewrite);
         Geometry::plan(1 << 30, align, &v).unwrap();
         let bytes = index::most_bytes(1000).unwrap();
-        let few = volume(align, 1 << 30, chunk, &PROFILE, bytes, None, 1).unwrap();
+        let few = volume(align, 1 << 30, chunk, &PROFILE, bytes, None).unwrap();
         assert_eq!(few.max_fragments, 1000);
         assert!(matches!(
-            volume(align, 1 << 30, chunk, &PROFILE, index::INDEX_BYTES, None, 1),
+            volume(align, 1 << 30, chunk, &PROFILE, index::INDEX_BYTES, None),
             Err(DeriveError::Index { .. })
         ));
-        let small = volume(align, 64 << 20, chunk, &PROFILE, 1 << 30, None, 1).unwrap();
+        let small = volume(align, 64 << 20, chunk, &PROFILE, 1 << 30, None).unwrap();
         assert!(small.compact);
         Geometry::plan(64 << 20, align, &small).unwrap();
         assert!(matches!(
-            volume(align, 16 << 20, chunk, &PROFILE, 1 << 30, None, 1),
+            volume(align, 16 << 20, chunk, &PROFILE, 1 << 30, None),
             Err(DeriveError::Volume(_))
         ));
         // Checksum blocks stop at CRC-32C's verified 16 KiB on a device of a larger unit.
         let wide = Alignment::new(64 << 10).unwrap();
-        let w = volume(wide, 1 << 30, chunk, &PROFILE, 1 << 30, None, 1).unwrap();
+        let w = volume(wide, 1 << 30, chunk, &PROFILE, 1 << 30, None).unwrap();
         assert_eq!(w.checksum_shift, 14);
         Geometry::plan(1 << 30, wide, &w).unwrap();
     }
@@ -2718,13 +2942,13 @@ mod tests {
         let align = Alignment::new(4096).unwrap();
         let chunk = mantle_gateway::layout::CHUNK;
         let bytes = index::most_bytes(1000).unwrap();
-        let first = volume(align, 8 << 30, chunk, &PROFILE, bytes, None, 1).unwrap();
+        let first = volume(align, 8 << 30, chunk, &PROFILE, bytes, None).unwrap();
         let formatted = Formatted {
             geometry: Geometry::plan(8 << 30, align, &first).unwrap(),
             checksum_shift: first.checksum_shift,
         };
         let wide = Alignment::new(64 << 10).unwrap();
-        let again = volume(wide, 8 << 30, chunk, &PROFILE, 1 << 30, Some(&formatted), 1).unwrap();
+        let again = volume(wide, 8 << 30, chunk, &PROFILE, 1 << 30, Some(&formatted)).unwrap();
         assert_eq!(
             (again.segment_size, again.checksum_shift),
             (first.segment_size, first.checksum_shift)
@@ -2738,16 +2962,7 @@ mod tests {
             ..again
         };
         assert!(formatted.geometry.holds(&one_more).is_err());
-        let fewer = volume(
-            align,
-            8 << 30,
-            chunk,
-            &PROFILE,
-            bytes / 2,
-            Some(&formatted),
-            1,
-        )
-        .unwrap();
+        let fewer = volume(align, 8 << 30, chunk, &PROFILE, bytes / 2, Some(&formatted)).unwrap();
         assert_eq!(fewer.max_fragments, index::most_fragments(bytes / 2));
     }
 
@@ -2867,7 +3082,7 @@ mod tests {
         let size = 1u64 << 30;
         let index = index_wants(align, size).unwrap();
         // At its want, a volume's index holds a fragment at each of its blocks.
-        let v = volume(align, size, chunk, &PROFILE, index, None, 1).unwrap();
+        let v = volume(align, size, chunk, &PROFILE, index, None).unwrap();
         assert_eq!(v.max_fragments, size / 4096);
         let (_, rules) = cell(3).unwrap();
         let full = engine(4096, 1 << 30, &rules).unwrap();
@@ -2876,7 +3091,7 @@ mod tests {
         let remaining = (wants[0] + wants[1]) / 3;
         let parts = shares(remaining, &wants).unwrap();
         assert!(parts[0] + parts[1] <= remaining);
-        let v = volume(align, size, chunk, &PROFILE, parts[0], None, 1).unwrap();
+        let v = volume(align, size, chunk, &PROFILE, parts[0], None).unwrap();
         assert_eq!(v.max_fragments, index::most_fragments(parts[0]));
         assert!(v.max_fragments < size / 4096);
         let e = engine_within(full, parts[1]).unwrap();
@@ -3308,7 +3523,6 @@ mod tests {
             &PROFILE,
             1 << 20,
             None,
-            1,
         )
         .unwrap();
         let wider = VolumeConfig {

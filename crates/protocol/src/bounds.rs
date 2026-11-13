@@ -34,12 +34,27 @@ pub const STOCK_PATIENCE: Duration = Duration::from_secs(60);
 /// two, for the same overlap).
 pub const CONNECTIONS_PER_PEER: usize = 2;
 
+/// The exchanges a pooled client's connection is granted at its handshake and keeps between its
+/// requests: one, as mantle-client asks one object exchange at a time ([`crate::object`]'s
+/// requests, `mantle_client`'s `stated`), and as hyper-transport's pool keeps one a connection
+/// outside its account (Breakwater's demand speculation, its `pool::KEPT`). The rest a client
+/// opens at once comes from the pool ([`Stated::pool`]).
+pub const CLIENT_EXCHANGES: u32 = 1;
+
 /// What a node or a client states of itself for its transport's bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stated {
-    /// The peers it keeps connections to: a node's other nodes, gateways and clients, a client's
-    /// nodes.
+    /// The peers it keeps connections to that replicate, place chunks or ask ranges: a node's
+    /// other nodes and gateways, a client's nodes.
     pub peers: usize,
+    /// The clients of the native protocol it admits at once (a node's `gateway.clients`), each a
+    /// pooled role: its connection holds [`CLIENT_EXCHANGES`] of its own and draws the rest from
+    /// the pool (hyper-transport's `StreamCredit::Pooled`, Breakwater's credit). None for a client.
+    pub clients: usize,
+    /// The exchanges the clients may hold at once past those they keep, all together: the
+    /// operations the node runs at most (`gateway.objects`). The node sizes the pool to what its
+    /// admission learns within it (`Endpoint::set_stream_pool`).
+    pub pool: usize,
     /// The ranges it hosts.
     pub ranges: usize,
     /// The appends a range's leader keeps out to one follower (`Settings::max_inflight_msgs`).
@@ -113,8 +128,11 @@ pub fn full_jitter(cap: Duration, local: u64, attempt: u32) -> Duration {
 /// the streams each connection takes and the exchanges all of them hold, a lane's window, and the
 /// largest head a message carries.
 struct Shape {
+    /// Every identity: the peers and the clients.
     peers: usize,
     connections: usize,
+    /// Of those, the peers' connections, each of which may hold `streams`.
+    peer_connections: usize,
     streams: u32,
     exchanges: usize,
     lane_window: usize,
@@ -122,9 +140,21 @@ struct Shape {
 }
 
 fn shape(stated: &Stated) -> Result<Shape, Unfit> {
-    let peers = stated.peers.max(1);
+    let peers = stated
+        .peers
+        .max(1)
+        .checked_add(stated.clients)
+        .ok_or(Unfit("identities"))?;
     let connections = peers
         .checked_mul(CONNECTIONS_PER_PEER)
+        .ok_or(Unfit("connections"))?;
+    let peer_connections = stated
+        .peers
+        .max(1)
+        .checked_mul(CONNECTIONS_PER_PEER)
+        .ok_or(Unfit("connections"))?;
+    let client_connections = connections
+        .checked_sub(peer_connections)
         .ok_or(Unfit("connections"))?;
     // A peer node opens at most a snapshot for each range it leads to this one, Raft holding
     // replication to a member while its snapshot is out (hyper-raft's `report_snapshot`), and a
@@ -137,9 +167,17 @@ fn shape(stated: &Stated) -> Result<Shape, Unfit> {
         .and_then(|n| n.checked_add(stated.transfers))
         .and_then(|n| u32::try_from(n).ok())
         .ok_or(Unfit("streams"))?;
+    // The peers' connections each their streams; a client's each the exchange it keeps, and the
+    // pool the clients draw the rest from.
     let exchanges = usize::try_from(streams)
         .ok()
-        .and_then(|s| s.checked_mul(connections))
+        .and_then(|s| s.checked_mul(peer_connections))
+        .zip(usize::try_from(CLIENT_EXCHANGES).ok())
+        .and_then(|(peers, kept)| {
+            peers
+                .checked_add(client_connections.checked_mul(kept)?)?
+                .checked_add(stated.pool)
+        })
         .ok_or(Unfit("exchanges"))?;
     // A lane carries every range of a shard to one peer: each range's appends in flight and one
     // control message too large for a datagram.
@@ -152,6 +190,7 @@ fn shape(stated: &Stated) -> Result<Shape, Unfit> {
     Ok(Shape {
         peers,
         connections,
+        peer_connections,
         streams,
         exchanges,
         lane_window,
@@ -184,6 +223,7 @@ pub fn limits(stated: &Stated) -> Result<Limits, Unfit> {
         exchanges,
         lane_window,
         max_head,
+        ..
     } = shape;
     let idle = idle_timeout();
     Ok(Limits {
@@ -194,7 +234,15 @@ pub fn limits(stated: &Stated) -> Result<Limits, Unfit> {
             per_identity: CONNECTIONS_PER_PEER,
         },
         streams_per_connection: streams,
-        stream_credit: StreamCredit::Fixed,
+        // A node's clients draw their exchanges from a pool its admission sizes; a peer's
+        // connection is raised to the streams per connection once its role is known.
+        stream_credit: if stated.clients == 0 {
+            StreamCredit::Fixed
+        } else {
+            StreamCredit::Pooled {
+                initial: CLIENT_EXCHANGES,
+            }
+        },
         ask_queue: AskQueue::Table,
         exchanges,
         // One lane a peer: the node runs its ranges on one shard (node.md §3.2's lane a shard).
@@ -360,7 +408,7 @@ pub const CERTIFICATE_COMPRESSION_BYTES: u64 = 721_474;
 pub fn beside(stated: &Stated, serves: bool) -> Option<u64> {
     let limits = limits(stated).ok()?;
     let count = |n: usize| u64::try_from(n).ok();
-    let peers = count(stated.peers.max(1))?;
+    let peers = count(stated.peers.max(1).checked_add(stated.clients)?)?;
     let connections = count(limits.admission.connections)?;
     let compression = if serves {
         CERTIFICATE_COMPRESSION_BYTES
@@ -373,15 +421,23 @@ pub fn beside(stated: &Stated, serves: bool) -> Option<u64> {
         .checked_add(compression)?
         .checked_add(count(limits.exchanges)?.checked_mul(EXCHANGE_BYTES)?)?
         .checked_add(count(limits.receive_chunks)?.checked_mul(CHUNK_SLOT_BYTES)?)?;
-    let connection = u64::from(limits.streams_per_connection)
-        .checked_mul(STREAM_BYTES)?
-        .checked_add(CONNECTION_BYTES)?
-        .checked_add(limits.window_ceiling)?;
+    let shape = shape(stated).ok()?;
+    let peer_connections = count(shape.peer_connections)?;
+    let client_connections = connections.checked_sub(peer_connections)?;
+    // Each connection's QUIC and TLS state and what QUIC keeps to send; a peer's its streams, a
+    // client's the one it keeps, and the pool's streams wherever the clients hold them.
+    let connection = CONNECTION_BYTES.checked_add(limits.window_ceiling)?;
+    let streams = u64::from(limits.streams_per_connection)
+        .checked_mul(peer_connections)?
+        .checked_add(u64::from(CLIENT_EXCHANGES).checked_mul(client_connections)?)?
+        .checked_add(count(stated.pool)?)?
+        .checked_mul(STREAM_BYTES)?;
     let sockets = connections
         .checked_add(2)?
         .checked_mul(count(io(stated).held_bound())?)?;
     endpoint
         .checked_add(connections.checked_mul(connection)?)?
+        .checked_add(streams)?
         .checked_add(sockets)
 }
 
@@ -391,7 +447,10 @@ pub fn beside(stated: &Stated, serves: bool) -> Option<u64> {
 /// Linux the receive ring holds that many 64 KiB buffers (hyper-rt `Io`), one elsewhere.
 pub fn io(stated: &Stated) -> Io {
     Io {
-        batch: stated.peers.clamp(1, MAX_BATCH),
+        batch: stated
+            .peers
+            .saturating_add(stated.clients)
+            .clamp(1, MAX_BATCH),
     }
 }
 
@@ -402,6 +461,8 @@ mod tests {
     fn stated() -> Stated {
         Stated {
             peers: 2,
+            clients: 0,
+            pool: 0,
             ranges: 3,
             inflight: 4,
             transfers: 5,
@@ -503,6 +564,8 @@ mod tests {
         // queue's transfers.
         let node = Stated {
             peers: 7,
+            clients: 0,
+            pool: 0,
             ranges: 5,
             inflight: 2,
             transfers: 130,
@@ -543,6 +606,52 @@ mod tests {
             ..stated()
         };
         assert!(limits(&starved).is_err());
+    }
+
+    /// A node's clients are pooled: each connection of a client's holds the exchange it keeps,
+    /// the pool the rest, so a client adds what its connections and that exchange hold, not a
+    /// peer's streams; a peer's connections keep theirs. The bytes they cost grow by the same each
+    /// client.
+    #[test]
+    fn a_nodes_clients_are_pooled_and_each_costs_its_own_connections() {
+        let with = |clients: usize, pool: usize| Stated {
+            clients,
+            pool,
+            ..stated()
+        };
+        let none = limits(&with(0, 0)).unwrap();
+        assert_eq!(none.stream_credit, StreamCredit::Fixed);
+        let some = limits(&with(10, 7)).unwrap();
+        assert_eq!(
+            some.stream_credit,
+            StreamCredit::Pooled {
+                initial: CLIENT_EXCHANGES
+            }
+        );
+        assert_eq!(some.streams_per_connection, none.streams_per_connection);
+        assert_eq!(some.admission.identities, 12);
+        assert_eq!(some.admission.connections, 24);
+        // The peers' 4 connections at 11 streams, the clients' 20 at the one they keep, and the
+        // pool's 7.
+        assert_eq!(some.exchanges, 44 + 20 + 7);
+        assert_eq!(some.lane_window, none.lane_window);
+        let cost = |clients| {
+            let s = with(clients, clients);
+            let least = least_transport(&s).unwrap();
+            least
+                + beside(
+                    &Stated {
+                        transport_bytes: least,
+                        ..s
+                    },
+                    true,
+                )
+                .unwrap()
+        };
+        let each = cost(2) - cost(1);
+        assert_eq!(cost(3) - cost(2), each);
+        assert_eq!(cost(101) - cost(1), 100 * each);
+        assert!(each < 2 * (CONNECTION_BYTES + 64 * 1024), "{each}");
     }
 
     #[test]

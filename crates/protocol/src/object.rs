@@ -615,6 +615,13 @@ impl Head {
         }
     }
 
+    /// The bytes of object data the request writes, known from its head before its fields are
+    /// read: a put's, a part's or a native upload's run's body; none for a request that writes
+    /// none.
+    pub fn written(&self) -> Option<u64> {
+        matches!(self.kind, PUT | UPLOAD_PART | APPEND).then(|| self.length)
+    }
+
     /// The request, once its fields are read.
     pub fn op(&self, fields: &[u8]) -> Result<Op, ObjectError> {
         let bad = || ObjectError::Fields(fields.len());
@@ -887,6 +894,17 @@ pub fn within(head: &mut [u8], remaining: Option<Duration>) -> Result<(), Object
 }
 
 impl Op {
+    /// The bytes of object data the operation writes: a put's, a part's or a native upload's
+    /// run's body; none for one that writes none.
+    pub fn written(&self) -> Option<u64> {
+        match self {
+            Self::Put { length, .. }
+            | Self::UploadPart { length, .. }
+            | Self::Append { length, .. } => Some(*length),
+            _ => None,
+        }
+    }
+
     /// The request's head and the fields that open its body: the fields counted first, then
     /// written into one buffer at their length (`mantle_codec::encode`'s rule), so it never grows.
     pub fn encode(&self) -> Result<(Vec<u8>, Vec<u8>), ObjectError> {

@@ -63,11 +63,25 @@ impl Measured {
     }
 }
 
-/// The node's learned limit on the operations it runs at once.
+/// Why an operation is not admitted now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Held {
+    /// The learned limit's operations run.
+    Limit,
+    /// Its bytes would pass what the operations' memory holds (`gateway.objects_bytes`).
+    Bytes,
+}
+
+/// The node's learned limit on the operations it runs at once, and the bytes they hold.
 #[derive(Debug, Clone)]
 pub(crate) struct Admission {
-    /// The most the node's memory was split for (`gateway.objects`).
+    /// The most operations the node's memory holds at once, each at the least an operation holds
+    /// (`gateway.objects`).
     ceiling: usize,
+    /// The bytes the operations' memory holds (`gateway.objects_bytes`), and those its running
+    /// operations hold now, each charged what it holds at its own size.
+    budget: u64,
+    held: u64,
     /// The limit the cycle is about, and the limit now.
     base: usize,
     limit: usize,
@@ -90,13 +104,15 @@ pub(crate) struct Admission {
 }
 
 impl Admission {
-    /// A limit within `ceiling`, starting at it, at `now_ns`: the node admits what its memory was
-    /// split for until it has measured less to be more, so no client is turned away at its start
-    /// that a fixed limit would have taken.
-    pub(crate) fn new(ceiling: usize, now_ns: u64) -> Self {
+    /// A limit within `ceiling`, starting at it, its operations' bytes within `budget`, at
+    /// `now_ns`: the node admits what its memory holds until it has measured less to be more, so
+    /// no client is turned away at its start that its memory would have taken.
+    pub(crate) fn new(ceiling: usize, budget: u64, now_ns: u64) -> Self {
         let ceiling = ceiling.max(1);
         Self {
             ceiling,
+            budget,
+            held: 0,
             base: ceiling,
             limit: ceiling,
             descent: Some(None),
@@ -117,9 +133,22 @@ impl Admission {
         self.limit
     }
 
-    /// Whether one more operation is admitted beside `running`.
-    pub(crate) fn admits(&self, running: usize) -> bool {
-        running < self.limit
+    /// The operations admitted and not yet ended.
+    fn running(&self) -> u64 {
+        self.admitted.saturating_sub(self.completed)
+    }
+
+    /// Whether one more operation, holding `charge` bytes, is admitted beside those running: none
+    /// past the limit, and none whose bytes the operations' memory does not hold beside theirs.
+    pub(crate) fn admits(&self, charge: u64) -> Result<(), Held> {
+        let limit = u64::try_from(self.limit).unwrap_or(u64::MAX);
+        if self.running() >= limit {
+            return Err(Held::Limit);
+        }
+        match self.held.checked_add(charge) {
+            Some(held) if held <= self.budget => Ok(()),
+            _ => Err(Held::Bytes),
+        }
     }
 
     /// An operation was turned away, or left waiting at a door, for want of room.
@@ -127,13 +156,16 @@ impl Admission {
         self.turned_away = true;
     }
 
-    /// An operation was admitted.
-    pub(crate) fn admitted(&mut self) {
+    /// An operation holding `charge` bytes was admitted.
+    pub(crate) fn admitted(&mut self, charge: u64) {
         self.admitted = self.admitted.saturating_add(1);
+        self.held = self.held.saturating_add(charge);
     }
 
-    /// An admitted operation ended at `now_ns`, `latency_ns` after it was admitted.
-    pub(crate) fn completed(&mut self, latency_ns: u64, now_ns: u64) {
+    /// An admitted operation that held `charge` bytes ended at `now_ns`, `latency_ns` after it was
+    /// admitted.
+    pub(crate) fn completed(&mut self, latency_ns: u64, now_ns: u64, charge: u64) {
+        self.held = self.held.saturating_sub(charge);
         self.completed = self.completed.saturating_add(1);
         let settle = *self.settle.get_or_insert(self.admitted);
         if self.completed <= settle {
@@ -305,11 +337,11 @@ mod tests {
             let mut half = (0u64, 0usize);
             for step in 0..steps {
                 while self.running.len() < clients {
-                    if !admission.admits(self.running.len()) {
+                    if admission.admits(0).is_err() {
                         admission.turned_away();
                         break;
                     }
-                    admission.admitted();
+                    admission.admitted(0);
                     let at = (0..servers).min_by_key(|&s| self.free[s]).unwrap();
                     let end = self.free[at].max(self.now) + self.service(means);
                     self.free[at] = end;
@@ -317,7 +349,7 @@ mod tests {
                 }
                 let Reverse((end, admitted)) = self.running.pop().unwrap();
                 self.now = end;
-                admission.completed(end - admitted, end);
+                admission.completed(end - admitted, end, 0);
                 limits.push(admission.limit());
                 if step == steps / 2 {
                     half = (self.now, step);
@@ -349,7 +381,7 @@ mod tests {
             (8, &[500_000, 64_000_000]),
         ] {
             for ceiling in [64, 1_024] {
-                let mut admission = Admission::new(ceiling, 0);
+                let mut admission = Admission::new(ceiling, u64::MAX, 0);
                 let (limits, share) =
                     Closed::new(1).run(&mut admission, servers, means, 1_000, 60_000);
                 let settled = mean(&limits[limits.len() / 2..]);
@@ -366,7 +398,7 @@ mod tests {
     /// The limit never passes its ceiling, however much the system would take, and holds it.
     #[test]
     fn the_limit_stays_within_its_ceiling() {
-        let mut admission = Admission::new(5, 0);
+        let mut admission = Admission::new(5, u64::MAX, 0);
         let (limits, _) = Closed::new(2).run(&mut admission, 64, &[1_000_000], 1_000, 20_000);
         assert!(limits.iter().all(|&l| (1..=5).contains(&l)));
         assert!(mean(&limits[limits.len() / 2..]) >= 4.0);
@@ -377,7 +409,7 @@ mod tests {
     /// it binds no one; once more clients come it finds the knee.
     #[test]
     fn a_limit_its_clients_bound_climbs_once_they_ask_more() {
-        let mut admission = Admission::new(10_000, 0);
+        let mut admission = Admission::new(10_000, u64::MAX, 0);
         let mut system = Closed::new(3);
         let (limits, _) = system.run(&mut admission, 16, &[1_000_000], 4, 20_000);
         let settled = &limits[limits.len() / 2..];
@@ -391,7 +423,7 @@ mod tests {
     /// the knee is learned again, never kept.
     #[test]
     fn the_limit_follows_the_knee_as_it_moves() {
-        let mut admission = Admission::new(10_000, 0);
+        let mut admission = Admission::new(10_000, u64::MAX, 0);
         let mut system = Closed::new(4);
         system.run(&mut admission, 32, &[1_000_000], 1_000, 40_000);
         let (limits, _) = system.run(&mut admission, 4, &[1_000_000], 1_000, 60_000);
@@ -400,6 +432,25 @@ mod tests {
         let (limits, _) = system.run(&mut admission, 32, &[1_000_000], 1_000, 120_000);
         let settled = mean(&limits[limits.len() / 2..]);
         assert!(settled >= 24.0, "back up to {settled:.1}");
+    }
+
+    /// An operation is admitted only where its bytes fit beside those its running operations
+    /// hold, each charged its own, and the bytes an ended one held are free again; the limit
+    /// turns one away before its bytes are asked.
+    #[test]
+    fn operations_are_admitted_by_their_bytes_within_the_limit() {
+        let mut admission = Admission::new(3, 100, 0);
+        assert_eq!(admission.admits(101), Err(Held::Bytes));
+        admission.admitted(60);
+        assert_eq!(admission.admits(41), Err(Held::Bytes));
+        assert_eq!(admission.admits(40), Ok(()));
+        admission.admitted(40);
+        assert_eq!(admission.admits(0), Ok(()));
+        admission.admitted(0);
+        assert_eq!(admission.admits(0), Err(Held::Limit));
+        admission.completed(1, 1, 60);
+        assert_eq!(admission.admits(60), Ok(()));
+        assert_eq!(admission.admits(61), Err(Held::Bytes));
     }
 
     /// The phase's completions are the least that tell a quarter's change in power from chance at

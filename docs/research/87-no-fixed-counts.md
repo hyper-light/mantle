@@ -142,7 +142,7 @@ per-principal shedding stay as §4.5 plans them.
 | `Rules::max_answers` (8) and `max_answer_bytes` (18,482) | a session past either expires as its entry applies | removed. A session keeps answers while its row fits a row, `Rules::max_value_bytes`, the largest S3 admits (`wire::largest_row_bytes`), so no page grows. A command whose answer would pass that is refused before it takes effect, `Answer::AnswersFull`, its session kept, and so is each of the session's later commands in the entry | [1] §6.3, [2] §4.2: bytes are RIFL's own reason; refusal keeps exactly-once (§1) |
 | `derive::batch` (8) and `entry_limits`' commands | an entry carries at most 8 commands | an entry carries every command waiting that fits its bytes, `max_entry_bytes` (`wire::largest_entry_bytes`, 561,804) | [1] §10.2.2, [8]: the batch is what waited |
 | the volume's batch (`identities × batch`) | the chunks the cell's operations may write a volume at once | the cell's identities times each node's admission ceiling times its window | the same rule, now from the ceiling |
-| `derive::OBJECTS` (8) | the operations a node runs at once, and its native clients | a learned limit within `[1, C]`, the point of greatest power found by probing, from the operations' own completions; `C` the ceiling the memory holds (§4) | [3] p. 240, [4], [6], [7] |
+| `derive::OBJECTS` (8) | the operations a node runs at once, and its native clients | a learned limit within `[1, C]`, the point of greatest power found by probing, from the operations' own completions; `C` as many operations as the operations' bytes hold, each charged its own (§4, §4a) | [3] p. 240, [4], [6], [7] |
 
 The window, `gateway.window`, is one block, "the floor" (node.md §1.4). It is not one of the three
 counts; node.md §2.6 plans it as `⌈R·T/B⌉`, and it stays.
@@ -259,6 +259,62 @@ What is measured:
    scale's memory limit, in Docker for the Linux limits. The learned `L` is traced over each run.
 3. **Profiled.** The node's peak resident memory against its derived floor, at the ceiling each
    rule gives, so a rule whose ceiling is real memory is shown to hold within it.
+
+## 4a. Bytes, not a count: each operation charged its own (2026-11-12)
+
+The ceiling `C` stood at `derive::OBJECTS`, 8 operations, each charged the most any operation holds:
+42 MB, a put of the largest blocks under the widest scheme with its copies (`derive::objects` at
+`c1813126`; the doors' baseline's floor, 83.5 MB at two). A PUT of one byte held a few hundred
+kilobytes of that. Every count the node sized from it followed: its native clients, its asks,
+the transport's peers and a volume's batch. Research/71 step 9 measured the cell's writes at
+30–93 a second at 2 to 32 operations a node, so `N = X·R` [7] at the owner's 10,000 a second and
+the 100 ms a PUT takes at one client (seven flushes on its path, research/71) asks about a
+thousand operations in the cell at once. A count of 8 a node, or 42 MB each, holds 24.
+
+What changed:
+
+- **An operation is charged what it holds at its own size.** A write's body length is in its
+  head before its fields are read (`Head::written`, `Op::written`). It is charged its first
+  segment and first block, the largest of its own, each chunk of a block copied to send, and a
+  piece of its body, under the scheme that holds the most of it (`put::bytes_for`,
+  `derive::Charges`). The put driver reserves its segment at the same length, where it reserved a
+  whole 64 KiB segment for any body. Every other operation is charged the most, since a get's
+  object's size is known only once its row is read. A body past one block is charged what the
+  largest put holds.
+- **The operations' memory is bytes**, `gateway.objects_bytes`, and an operation is admitted only
+  where its bytes fit beside the running ones' (`crate::admit`). One turned away for bytes says
+  nothing of the limit. One turned away by the limit tells it its clients ask more.
+- **The ceiling `C` is as many operations as the share holds at what one costs**: the least it
+  is charged, a write of no bytes, and what one more operation adds to the node's other classes,
+  measured on the derivation's own model as the difference between one operation and two
+  (`derive::operations`): its native client's connections and kept exchange, its pooled exchange,
+  its chunk asks' exchanges and each range's state for its read. The share holds one operation
+  of the largest blocks first. The native clients a node admits are as many. No count is stated.
+  A first build counted `C` at the least charge alone, and its clients as peers whose connections
+  each hold every stream a peer node's may: 12 TB of transport at a 16 GiB node, a peer's streams
+  times its clients. So clients became a pooled role (below), and their cost entered `C`.
+- **Native clients draw their exchanges from a pool** the node sizes to its learned limit,
+  hyper-transport's `StreamCredit::Pooled`, Breakwater's credit (Cho et al., OSDI 2020): a
+  client's connection keeps one exchange, mantle-client's one at a time, and draws the rest from
+  the pool, so it costs its own connections and that exchange, and a client past the pool waits
+  at its end, costing the node nothing, as the audit's #1 replacement names.
+- **A native request past the limit waits** with its body unread until room frees, as the S3
+  door's does (node.md §4.5), vouched each beat and answered `SlowDown` only at its client's
+  patience. Answered at once, it cost its client a throttle's backoff, one to twenty seconds of
+  full jitter (mantle-client's botocore-derived `SLOWED_BASE`, `SLOWED_MOST`), a ladder's whole
+  step at a few hundred clients.
+- **A volume's batch** carries every chunk waiting that a segment's room holds at a block each,
+  within the records its frame holds (`layout::most_batch_requests`), where it was the cell's
+  identities times the operations' chunks.
+
+The bytes' rule is §4's experiment. Its first arm is **rule C**, 3/32 of the node's allowance:
+the most Linux lets TCP's buffers hold of the memory free at boot, `tcp_mem[2]` (Linux v6.12
+`net/ipv4/tcp.c`, `tcp_init_mem`: `limit = nr_free_buffer_pages() / 16; ... sysctl_tcp_mem[2] =
+sysctl_tcp_mem[0] * 2; /* 9.37 % */`, read 2026-11-12). Those are the bytes a host keeps in flight
+on its connections, as an operation's are in flight between its client and the volumes. C takes
+its share at the floor, and the indexes and engines share the rest as before: under C a volume's
+index holds up to 3/32 fewer fragments than under D. Rules A and D are built as
+variants beside it and measured as §4 asks. Rule B, borrowing at run time, is not built.
 
 ## 5. What remains unknown
 

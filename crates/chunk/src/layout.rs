@@ -467,6 +467,22 @@ pub fn batch_frame_payload(requests: usize, moves: usize) -> Option<u64> {
         .checked_add(moves.checked_mul(u64::try_from(placed).ok()?)?)
 }
 
+/// The most requests a batch takes whose frame recovery reads back, its cleaner moving as many
+/// fragments in a relocation ([`batch_frame_payload`] at `requests` and `requests` moves within
+/// [`FRAME_PAYLOAD`]).
+pub fn most_batch_requests() -> Option<usize> {
+    let placed = u64::try_from(
+        PUT_LEN
+            .max(DELETE_LEN)
+            .checked_add(SEGMENT_LEN.checked_mul(2)?)?,
+    )
+    .ok()?;
+    let each = placed
+        .checked_mul(2)?
+        .checked_add(u64::try_from(SEGMENT_LEN).ok()?)?;
+    usize::try_from(FRAME_PAYLOAD.checked_div(each)?).ok()
+}
+
 /// Bytes of the largest batch frame, padded to the block.
 pub fn batch_frame_bytes(requests: usize, moves: usize, block: u64) -> Option<u64> {
     (FRAME_HEADER as u64)
@@ -516,6 +532,14 @@ pub fn checkpoint_bytes(fragments: u64, segments: u64, block: u64) -> Option<u64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The most requests a batch takes make a frame recovery reads, and one more would not.
+    #[test]
+    fn the_most_batch_requests_fill_a_frame_recovery_reads() {
+        let n = most_batch_requests().unwrap();
+        assert!(batch_frame_payload(n, n).unwrap() <= FRAME_PAYLOAD);
+        assert!(batch_frame_payload(n + 1, n + 1).unwrap() > FRAME_PAYLOAD);
+    }
 
     /// The least segment holding a payload holds it, the segment a block smaller does not, and
     /// an 8 MiB chunk takes the segment its record's header and table add to it on a 4 KiB

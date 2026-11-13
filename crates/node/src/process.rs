@@ -410,6 +410,7 @@ pub struct GatewayConfig {
     pub handover_ns: u64,
     pub window: usize,
     pub objects: usize,
+    pub objects_bytes: u64,
     pub clients: usize,
     pub bucket_quota: u32,
     pub scan_rows: u32,
@@ -531,6 +532,7 @@ pub const KEYS: &[&str] = &[
     "gateway.handover_ns",
     "gateway.window",
     "gateway.objects",
+    "gateway.objects_bytes",
     "gateway.clients",
     "gateway.bucket_quota",
     "gateway.scan_rows",
@@ -1049,6 +1051,7 @@ fn gateway(lines: &Lines) -> Result<Option<GatewayConfig>, ProcessError> {
         handover_ns: lines.get("gateway.handover_ns")?,
         window: lines.get("gateway.window")?,
         objects: lines.get("gateway.objects")?,
+        objects_bytes: lines.get("gateway.objects_bytes")?,
         clients: lines.get("gateway.clients")?,
         bucket_quota: lines.get("gateway.bucket_quota")?,
         scan_rows: lines.get("gateway.scan_rows")?,
@@ -1060,24 +1063,35 @@ fn gateway(lines: &Lines) -> Result<Option<GatewayConfig>, ProcessError> {
 }
 
 /// The gateway host's settings, its root keys read from their files: each 32 bytes that only its
-/// owner may read, as `mantle init` makes them (encryption.md §2).
-fn gateway_settings(config: GatewayConfig, keys: Vec<(u32, WrappingKey)>) -> GatewaySettings {
-    GatewaySettings {
+/// owner may read, as `mantle init` makes them (encryption.md §2); what each operation holds at
+/// its own size, at the window its file states, under the schemes its blocks may take in a cell
+/// its `enlist` names the most domains of (`derive::charges`), as the node's floor reckoned them.
+fn gateway_settings(
+    config: GatewayConfig,
+    keys: Vec<(u32, WrappingKey)>,
+    enlist: Option<&Enlisting>,
+) -> Result<GatewaySettings, ProcessError> {
+    let rates = Rates {
+        chunk: config.chunk_rate,
+        domains: None,
+        bursts: config.bursts,
+        repair: config.repair_rate,
+    };
+    let charges = crate::derive::charges(config.window, enlist, &rates, config.target)
+        .map_err(|e| ProcessError::Value("gateway.window", e.to_string()))?;
+    Ok(GatewaySettings {
         keys,
         handover_ns: config.handover_ns,
         window: config.window,
         objects: config.objects,
+        objects_bytes: config.objects_bytes,
+        charges,
         clients: config.clients,
         bucket_quota: config.bucket_quota,
         scan_rows: config.scan_rows,
-        rates: Rates {
-            chunk: config.chunk_rate,
-            domains: None,
-            bursts: config.bursts,
-            repair: config.repair_rate,
-        },
+        rates,
         target: config.target,
-    }
+    })
 }
 
 /// How a node with `volume` lines enlists them: the root range its `range` lines name, its
@@ -1324,7 +1338,11 @@ fn run_node(
         peers,
         keys,
     } = identity;
-    let gateway = config.gateway.take().map(|g| gateway_settings(g, keys));
+    let gateway = config
+        .gateway
+        .take()
+        .map(|g| gateway_settings(g, keys, config.enlist.as_ref()))
+        .transpose()?;
     let resolved = resolve(&config).map_err(step(Step::Network))?;
     // A named peer is looked up again as the node runs, on hyper-rt's blocking pool, off its shards:
     // one lookup at a time (`crate::names`), so one place and no line.

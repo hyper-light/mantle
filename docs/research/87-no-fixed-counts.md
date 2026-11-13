@@ -170,28 +170,37 @@ holds for any mix of operations, since `R̄` is every operation's mean and no si
 
 DERIVED from [3], [4] and [6]: the limit climbs to the point of greatest power by BBR's probing:
 
-- **A phase is the limit held, then measured.** It begins once as many operations have completed
-  as had been admitted before it, BBR's packet-timed round [6], so the operations it measures ran
-  under its own limit. It then counts `n` completions and their latencies over its length. Its
-  power is `n²/(length · Σ latency)`, and phases of equal `n` compare by `length · Σ latency`.
+- **A phase is the limit held, then measured.** It begins once the operations admitted until its
+  first completion have completed, BBR's packet-timed round [6]. That covers both those admitted
+  before it and the burst its own limit let in, so the operations it measures ran under its limit.
+  It then counts `n` completions and their latencies over its length. Its power is
+  `n²/(length · Σ latency)`, and phases of equal `n` compare by `length · Σ latency`.
 - **`n` is what tells a probe's change from chance.** A rate over `n` completions has a relative
   error of `1/√n`, and the log ratio of two phases' powers an error of `√(2/n)`. A probe a quarter
   away moves the log of power by `ln(5/4)` at the least. At the normal distribution's two-sided
   99% point, `z` 2.576, `n ≥ 2·(z/ln(5/4))² = 267`.
-- **From one, double while power grows a quarter** (BBR's startup, `bbr_full_bw_thresh` `5/4`). A
-  doubling whose power did not grow is undone. A phase in which no operation was turned away was
-  limited by its clients and ends startup where it is.
+- **From the ceiling, halve while power does not fall a fifth**, the reciprocal of BBR's startup
+  threshold `5/4` (`bbr_full_bw_thresh`). Past the knee halving raises power, or leaves it where
+  the limit did not bind; below it power halves with the limit, and the halving is undone. The
+  node starts where a fixed limit stood, admitting what its memory was split for. A first model
+  started at one and doubled, as BBR does, and failed four of `crates/mantle/tests/serve.rs`'s 14
+  on Studio 3, where lean-doors failed none: a native request past a limit of one at a node's
+  start is refused `SlowDown`, and its client's backoff left the cell quiet past the harness's
+  second.
 - **Then cycle eight phases about a base**: a quarter past it, a quarter below, six at it (BBR's
-  `bbr_pacing_gain` cycle [6]). At each cycle's end the base moves to the limit of greatest power:
-  the six phases at the base pooled, the quarter below, and the quarter past where its clients asked
-  more than the base.
+  `bbr_pacing_gain` cycle [6]). At each cycle's end the base moves to the limit of greatest power
+  among the six phases at the base, pooled, and each probe whose limit bound. A probe in which no
+  operation was turned away measured what its clients asked, not its limit, and moves nothing, so
+  a quiet spell does not walk the limit down below what the next burst asks.
 - **The limit is at least 1, the least that moves, and at most `C`**, the ceiling the memory was
   split for (§4).
 
-The same model, with the limit learned this way (`nfc-proto/power4.py`, n 60,000 completions a
-case, the second half's mean): the limit kept 1.1, 3.0, 8.5 and 40.0 at knees of 1, 3, 8 and 40
-servers, and 3.4, 16.4 and 8.0 at knees of 3, 16 and 8 with sizes mixed a hundredfold. Throughput
-was 100%, 94%, 95% and 96% of the most, and 91%, 85% and 91% mixed. A fixed limit at the knee gets
+The same model, with the limit learned this way (`nfc-proto/power7.py`, n 60,000 completions a
+case, the second half's mean, a thousand clients), at a ceiling of 1,024: the limit kept 1.1, 3.0,
+8.0 and 39.9 at knees of 1, 3, 8 and 40 servers, and 2.9, 17.6 and 8.5 at knees of 3, 16 and 8
+with sizes mixed a hundredfold. Throughput was 100%, 94%, 96% and 96% of the most, and 80%, 92%
+and 93% mixed. At a ceiling of 64 it was the same within a limit's step; at 8 the limit held the
+ceiling wherever the knee lay past it. A fixed limit at the knee gets
 100% in this model, whose knee is a corner, with no gain past it at all. The probes' quarter below
 and chance moves cost the rest. A real cell's knee is rounder: research/71's doubling past 8 still
 added 10%.

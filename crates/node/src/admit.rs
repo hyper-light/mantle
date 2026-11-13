@@ -4,11 +4,12 @@
 //! throughput over delay `P = X/R̄`, which rises with each operation admitted below the knee and
 //! falls past it: "Keep the pipe just full, but no fuller".
 //!
-//! The node climbs to it as BBR probes its pipe (Linux `net/ipv4/tcp_bbr.c`): from one operation it
-//! doubles while power grows a quarter a step; then it cycles its limit over eight phases, a
-//! quarter past its base, a quarter below it, and six at it, and at each cycle's end takes the
-//! limit whose power was greatest. A phase begins once the operations admitted before it have
-//! completed, BBR's packet-timed round, so it measures its own limit, and ends after
+//! The node finds it as BBR probes its pipe (Linux `net/ipv4/tcp_bbr.c`), from above: it starts at
+//! the ceiling its memory was split for, as a fixed limit ran, and halves while power does not fall
+//! by a fifth, the reciprocal of BBR's startup's `5/4`; then it cycles its limit over eight phases,
+//! a quarter past its base, a quarter below it, and six at it, and at each cycle's end takes the
+//! limit whose power was greatest. A phase begins once the operations admitted until its first
+//! completion have completed, BBR's packet-timed round, so it measures its own limit, and ends after
 //! [`PHASE`] completions, enough to tell a quarter's change in power from chance.
 //!
 //! Power, not a bandwidth-delay product of a windowed maximum and minimum as BBR keeps: operations
@@ -70,16 +71,16 @@ pub(crate) struct Admission {
     /// The limit the cycle is about, and the limit now.
     base: usize,
     limit: usize,
-    /// Doubling from one: the measure at the base before this one, while it doubles.
-    startup: Option<Option<(usize, Measured)>>,
+    /// Halving from the ceiling: the measure at the base before this one, while it halves.
+    descent: Option<Option<(usize, Measured)>>,
     /// The cycle's phase, and what each phase measured.
     phase: usize,
     cycle: [Measured; 8],
     admitted: u64,
     completed: u64,
-    /// The completions the phase passes before it measures: those of the operations admitted
-    /// before it began.
-    settle: u64,
+    /// The completions the phase passes before it measures: those of the operations admitted until
+    /// its first completion, before it began and in the burst its limit let in; none yet known.
+    settle: Option<u64>,
     /// The phase under way: when it began measuring, its completions, their latencies, and whether
     /// an operation was turned away meanwhile.
     began_ns: u64,
@@ -89,18 +90,21 @@ pub(crate) struct Admission {
 }
 
 impl Admission {
-    /// A limit within `ceiling`, starting at one, the least that moves, at `now_ns`.
+    /// A limit within `ceiling`, starting at it, at `now_ns`: the node admits what its memory was
+    /// split for until it has measured less to be more, so no client is turned away at its start
+    /// that a fixed limit would have taken.
     pub(crate) fn new(ceiling: usize, now_ns: u64) -> Self {
+        let ceiling = ceiling.max(1);
         Self {
-            ceiling: ceiling.max(1),
-            base: 1,
-            limit: 1,
-            startup: Some(None),
+            ceiling,
+            base: ceiling,
+            limit: ceiling,
+            descent: Some(None),
             phase: 0,
             cycle: [Measured::default(); 8],
             admitted: 0,
             completed: 0,
-            settle: 0,
+            settle: None,
             began_ns: now_ns,
             counted: 0,
             latency_ns: 0,
@@ -131,7 +135,8 @@ impl Admission {
     /// An admitted operation ended at `now_ns`, `latency_ns` after it was admitted.
     pub(crate) fn completed(&mut self, latency_ns: u64, now_ns: u64) {
         self.completed = self.completed.saturating_add(1);
-        if self.completed <= self.settle {
+        let settle = *self.settle.get_or_insert(self.admitted);
+        if self.completed <= settle {
             // An operation admitted before the phase: the phase measures from the next.
             self.began_ns = now_ns;
             self.turned_away = false;
@@ -151,39 +156,38 @@ impl Admission {
         self.latency_ns = 0;
         self.began_ns = now_ns;
         self.turned_away = false;
-        match self.startup {
-            Some(before) => self.double(before, measured),
+        match self.descent {
+            Some(before) => self.halve(before, measured),
             None => self.cycled(measured),
         }
-        self.settle = self.admitted;
+        self.settle = None;
     }
 
-    /// Startup's step: double while power grows a quarter, as BBR's startup doubles until three
-    /// rounds pass without its bandwidth growing `5/4` (`bbr_full_bw_thresh`); past the knee power
-    /// falls, and the base goes back to the limit before. A phase its clients limited ends startup
-    /// where it is: more admitted would not have been asked.
-    fn double(&mut self, before: Option<(usize, Measured)>, measured: Measured) {
-        // Power grew a quarter: `P ≥ 5/4 · P_before`, so `4 · cost_before ≥ 5 · cost`.
-        let grew = before
-            .is_none_or(|(_, b)| b.cost().saturating_mul(4) >= measured.cost().saturating_mul(5));
-        let next = self.base.saturating_mul(2).min(self.ceiling);
-        if grew && measured.turned_away && next > self.base {
-            self.startup = Some(Some((self.base, measured)));
-            self.base = next;
-            self.limit = next;
+    /// The descent's step: halve while power does not fall a fifth, the reciprocal of BBR's startup's
+    /// `5/4` (`bbr_full_bw_thresh`). Past the knee halving raises power, or leaves it where the limit
+    /// did not bind; below it power halves with the limit, and the base goes back to the limit
+    /// before.
+    fn halve(&mut self, before: Option<(usize, Measured)>, measured: Measured) {
+        // Power did not fall a fifth: `P ≥ 4/5 · P_before`, so `4 · cost ≤ 5 · cost_before`.
+        let held = before
+            .is_none_or(|(_, b)| measured.cost().saturating_mul(4) <= b.cost().saturating_mul(5));
+        if held && self.base > 1 {
+            self.descent = Some(Some((self.base, measured)));
+            self.base = (self.base / 2).max(1);
+            self.limit = self.base;
             return;
         }
-        if !grew && let Some((base, _)) = before {
+        if !held && let Some((base, _)) = before {
             self.base = base;
         }
-        self.startup = None;
+        self.descent = None;
         self.phase = 0;
         self.limit = self.at(CYCLE[0]);
     }
 
     /// The cycle's step: the phase's measure kept, and at the cycle's end the base moved to the
-    /// limit of greatest power among its own six phases', pooled, the quarter past it where its
-    /// clients asked more, and the quarter below.
+    /// limit of greatest power among its own six phases', pooled, and each probe its limit bound:
+    /// one in which no operation was turned away measured what its clients asked, not its limit.
     fn cycled(&mut self, measured: Measured) {
         if let Some(slot) = self.cycle.get_mut(self.phase) {
             *slot = measured;
@@ -208,9 +212,10 @@ impl Admission {
                     length = length.saturating_add(measured.length_ns);
                     latency = latency.saturating_add(measured.latency_ns);
                 }
-                Quarter::Up if measured.turned_away => probes.push((*quarter, measured.cost())),
-                Quarter::Up => {}
-                Quarter::Down => probes.push((*quarter, measured.cost())),
+                Quarter::Up | Quarter::Down if measured.turned_away => {
+                    probes.push((*quarter, measured.cost()));
+                }
+                Quarter::Up | Quarter::Down => {}
             }
         }
         let pooled = length.saturating_mul(latency);
@@ -329,9 +334,9 @@ mod tests {
         limits.iter().sum::<usize>() as f64 / limits.len() as f64
     }
 
-    /// From one operation, the limit climbs to a closed system's knee and keeps about it, and the
-    /// system runs within a fifth of its most throughput; operations of a hundredfold different
-    /// lengths side by side are learned alike.
+    /// From its ceiling, the limit comes down to a closed system's knee and keeps about it, and the
+    /// system runs within a fifth of its most throughput, at ceilings near the knee and far past
+    /// it; operations of a hundredfold different lengths side by side are learned alike.
     #[test]
     fn the_limit_learns_the_knee_and_keeps_about_it() {
         for (servers, means) in [
@@ -343,15 +348,18 @@ mod tests {
             (16, &[1_000_000, 100_000_000, 1_000_000, 1_000_000]),
             (8, &[500_000, 64_000_000]),
         ] {
-            let mut admission = Admission::new(10_000, 0);
-            let (limits, share) = Closed::new(1).run(&mut admission, servers, means, 1_000, 60_000);
-            let settled = mean(&limits[limits.len() / 2..]);
-            let knee = servers as f64;
-            assert!(
-                settled >= 0.75 * knee && settled <= 1.5 * knee + 1.0,
-                "{servers} {means:?}: the limit kept {settled:.1}"
-            );
-            assert!(share >= 0.8, "{servers} {means:?}: {share:.2} of the most");
+            for ceiling in [64, 1_024] {
+                let mut admission = Admission::new(ceiling, 0);
+                let (limits, share) =
+                    Closed::new(1).run(&mut admission, servers, means, 1_000, 60_000);
+                let settled = mean(&limits[limits.len() / 2..]);
+                let knee = servers as f64;
+                assert!(
+                    settled >= 0.75 * knee && settled <= 1.5 * knee + 1.0,
+                    "{servers} {means:?}: the limit kept {settled:.1}"
+                );
+                assert!(share >= 0.8, "{servers} {means:?}: {share:.2} of the most");
+            }
         }
     }
 
@@ -364,19 +372,16 @@ mod tests {
         assert!(mean(&limits[limits.len() / 2..]) >= 4.0);
     }
 
-    /// A node whose clients ask fewer operations than its knee is limited by them, and its limit
-    /// does not climb past what they ask on that account; once more clients come it climbs to the
-    /// knee.
+    /// A node whose clients ask fewer operations than its knee is limited by them: its limit never
+    /// comes below what they ask, as a probe its limit did not bind moves nothing, and rests where
+    /// it binds no one; once more clients come it finds the knee.
     #[test]
     fn a_limit_its_clients_bound_climbs_once_they_ask_more() {
         let mut admission = Admission::new(10_000, 0);
         let mut system = Closed::new(3);
-        let (limits, _) = system.run(&mut admission, 16, &[1_000_000], 4, 10_000);
-        assert!(
-            limits.iter().all(|&l| l <= 8),
-            "{:?}",
-            &limits[limits.len() - 20..]
-        );
+        let (limits, _) = system.run(&mut admission, 16, &[1_000_000], 4, 20_000);
+        let settled = &limits[limits.len() / 2..];
+        assert!(settled.iter().all(|&l| l >= 4), "{:?}", &settled[..20]);
         let (limits, share) = system.run(&mut admission, 16, &[1_000_000], 1_000, 60_000);
         assert!(mean(&limits[limits.len() / 2..]) >= 12.0);
         assert!(share >= 0.8, "{share:.2}");

@@ -68,7 +68,8 @@ Before its job uploads it, each target's archive is checked as a user takes it, 
    mode 755, `LICENSE` and `README.md`.
 2. The unpacked binary says `mantle VERSION`.
 3. It makes a cell of three with `mantle init`, each founder's QUIC, plane and S3 ports stated
-   (each one the OS gave free), its volume in a directory of its own and its failure domain its own:
+   (each one the OS gave free), its volume of 512 MiB in a directory of its own (sized from the
+   segments the check writes, `scripts/release.py`) and its failure domain its own:
    all on loopback but the first founder's S3 endpoint, at every address and named `localhost`, which
    init serves under TLS, certifies for that name and writes into both profiles as
    `https://localhost:PORT` with its authority as `ca_bundle`. Every S3 client of the check, the S3

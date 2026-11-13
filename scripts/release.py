@@ -54,9 +54,14 @@ ROOT = Path(__file__).resolve().parent.parent
 CLI_PART = 8 << 20
 # S3's least part but the last, 5 MiB (docs/research/05 §4.1).
 LEAST_PART = 5 << 20
-# Each founder's volume: the bytes crates/mantle/tests/support/cell.rs gives each founder of the
-# suites' cells, and the transfer harness's default.
-VOLUME = "256M"
+# Each founder's volume, a bound argued from what the check writes. A volume keeps whole segments of
+# 8,404,992 bytes (crates/chunk/src/layout.rs, least_segment of the 8 MiB chunk), and a chunk record
+# over half of one takes a segment of its own; under three copies every volume holds a chunk of
+# every block. Both doors' suites, the AWS CLI's objects, the plain-HTTP leg and the runs a killed
+# copy left in flight take about 29 segments of each volume, beside the cleaner's reserve of one,
+# and nothing removed is collected within the check: the suites' 256 MiB, 31 segments, filled on
+# Studio 3 (the AWS CLI's UploadPart answered InsufficientStorage, f704e163). 512 MiB holds 63.
+VOLUME = "512M"
 
 
 class Failed(Exception):

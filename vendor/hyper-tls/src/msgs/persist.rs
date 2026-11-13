@@ -1,5 +1,5 @@
 use alloc::vec::Vec;
-use core::cmp;
+use core::{cmp, fmt};
 
 use pki_types::{DnsName, UnixTime};
 use zeroize::Zeroizing;
@@ -240,7 +240,6 @@ impl core::ops::Deref for Tls12ClientSessionValue {
 }
 
 /// What every client session keeps, whichever the protocol version
-#[derive(Debug)]
 pub struct ClientSessionCommon {
     ticket: PayloadU16,
     secret: Zeroizing<PayloadU8>,
@@ -251,6 +250,31 @@ pub struct ClientSessionCommon {
     server_cert_verifier: Identity,
     /// The client certificate resolver installed when this session was made
     client_creds: Identity,
+}
+
+/// Every field but the resumption secret (RUSTSEC-2026-0346; upstream 0.23.46, VENDORED.md §12):
+/// a derived `Debug` printed the TLS 1.3 resumption PSK or the TLS 1.2 master secret to whatever
+/// formatted a session, a store's log among them.
+impl fmt::Debug for ClientSessionCommon {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            ticket,
+            secret: _,
+            epoch,
+            lifetime_secs,
+            server_cert_chain,
+            server_cert_verifier,
+            client_creds,
+        } = self;
+        f.debug_struct("ClientSessionCommon")
+            .field("ticket", ticket)
+            .field("epoch", epoch)
+            .field("lifetime_secs", lifetime_secs)
+            .field("server_cert_chain", server_cert_chain)
+            .field("server_cert_verifier", server_cert_verifier)
+            .field("client_creds", client_creds)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ClientSessionCommon {
@@ -331,7 +355,6 @@ static MAX_FRESHNESS_SKEW_MS: u32 = 60 * 1000;
 
 // --- Server types ---
 /// What a server keeps of a session to resume it
-#[derive(Debug)]
 pub struct ServerSessionValue {
     pub(crate) sni: Option<DnsName<'static>>,
     pub(crate) version: ProtocolVersion,
@@ -345,6 +368,37 @@ pub struct ServerSessionValue {
     pub creation_time_sec: u64,
     pub(crate) age_obfuscation_offset: u32,
     freshness: Option<bool>,
+}
+
+/// Every field but the master secret (RUSTSEC-2026-0346; upstream 0.23.46, VENDORED.md §12).
+impl fmt::Debug for ServerSessionValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            sni,
+            version,
+            cipher_suite,
+            master_secret: _,
+            extended_ms,
+            client_cert_chain,
+            alpn,
+            application_data,
+            creation_time_sec,
+            age_obfuscation_offset,
+            freshness,
+        } = self;
+        f.debug_struct("ServerSessionValue")
+            .field("sni", sni)
+            .field("version", version)
+            .field("cipher_suite", cipher_suite)
+            .field("extended_ms", extended_ms)
+            .field("client_cert_chain", client_cert_chain)
+            .field("alpn", alpn)
+            .field("application_data", application_data)
+            .field("creation_time_sec", creation_time_sec)
+            .field("age_obfuscation_offset", age_obfuscation_offset)
+            .field("freshness", freshness)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Codec<'_> for ServerSessionValue {
@@ -487,19 +541,40 @@ mod tests {
 
     #[test]
     fn serversessionvalue_is_debug() {
-        use std::{println, vec};
+        use std::{format, println, vec};
         let ssv = ServerSessionValue::new(
             None,
             ProtocolVersion::TLSv1_3,
             CipherSuite::TLS13_AES_128_GCM_SHA256,
-            &[1, 2, 3],
+            &[0xa5; 48],
             None,
             None,
             vec![4, 5, 6],
             UnixTime::now(),
             0x12345678,
         );
-        println!("{ssv:?}");
+        let debug = format!("{ssv:?}");
+        println!("{debug}");
+        assert!(debug.contains("application_data: 040506"));
+        assert!(!debug.contains("a5a5"), "{debug}");
+    }
+
+    /// A client session's `Debug` leaves its resumption secret out (RUSTSEC-2026-0346).
+    #[test]
+    fn clientsessioncommon_debug_leaves_the_secret_out() {
+        use std::{format, vec};
+        let common = ClientSessionCommon::new(
+            PayloadU16::new(vec![4, 5, 6]),
+            &[0xa5; 48],
+            UnixTime::now(),
+            3600,
+            CertificateChain::default(),
+            Identity::fresh(),
+            Identity::fresh(),
+        );
+        let debug = format!("{common:?}");
+        assert!(debug.contains("ticket: 040506"), "{debug}");
+        assert!(!debug.contains("a5a5"), "{debug}");
     }
 
     #[test]

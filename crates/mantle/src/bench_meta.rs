@@ -107,6 +107,10 @@ struct Mark(Instant);
 impl Mark {
     fn begin() -> Self {
         if counting() {
+            // A step's time is its last measured part's, which a setup measured before it (a
+            // file the check reads, written as `write_file` writes one) precedes: only the
+            // part timed is counted.
+            COUNTED.with(|counted| counted.set(Counts::ZERO));
             alloc::begin();
         }
         Self(Instant::now())

@@ -167,7 +167,11 @@ pub struct Gateway {
 }
 
 pub fn gateway() -> Result<Gateway, DeriveError> {
-    let objects = OBJECTS;
+    // EXPERIMENT ONLY (research/87 §4): the ceiling from the environment.
+    let objects = std::env::var("MANTLE_EXP_CEILING")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(OBJECTS);
     Ok(Gateway {
         window: 1,
         objects,

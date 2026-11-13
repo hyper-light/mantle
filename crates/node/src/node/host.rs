@@ -3024,7 +3024,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     fn ended(&mut self, admitted_ns: Option<u64>) {
         let now = hyper_rt::futures::now_ns();
         if let (Some(at), Some(admission)) = (admitted_ns, self.admission.as_mut()) {
+            let before = admission.limit();
             admission.completed(now.saturating_sub(at), now);
+            // EXPERIMENT ONLY (research/87 §4): the limit as it moves.
+            if admission.limit() != before {
+                eprintln!("nfc-admit {} {} {}", std::process::id(), now, admission.limit());
+            }
         }
     }
 

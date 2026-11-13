@@ -164,6 +164,14 @@ pub fn load_arg(text: &str) -> Result<Load, String> {
     Ok(Load::Open(rate))
 }
 
+/// A load as `--load` and `--write-load` take it: `open:RATE` or `closed`.
+fn load_name(load: Load) -> String {
+    match load {
+        Load::Open(rate) => format!("open:{rate}"),
+        Load::Closed => "closed".to_owned(),
+    }
+}
+
 /// `--sizes`: a byte count as `init::parse_bytes` reads one, or 0.
 pub fn size_arg(text: &str) -> Result<u64, String> {
     if text.trim() == "0" {
@@ -178,6 +186,9 @@ pub struct Options {
     pub sizes: Vec<u64>,
     pub objects: Vec<u64>,
     pub load: Load,
+    /// The writes' load where it differs from the reads' (`--write-load`): a PUT, a stream, a
+    /// part, a delete and a multipart upload's create, completion and abort; none, `load`.
+    pub write_load: Option<Load>,
     pub clients: usize,
     pub ops: u64,
     pub bytes: u64,
@@ -190,6 +201,17 @@ pub struct Options {
     /// The operations whose phases run; every one when empty. A phase reads the objects the
     /// phases before it made, so a read or a delete is asked beside the put it reads.
     pub kinds: Vec<Kind>,
+}
+
+impl Options {
+    /// The load `kind`'s phases run under: the writes' where `--write-load` states one, else
+    /// `--load`.
+    pub fn load_of(&self, kind: Kind) -> Load {
+        match self.write_load {
+            Some(load) if kind.writes() => load,
+            _ => self.load,
+        }
+    }
 }
 
 /// An S3 server this program did not start (`--endpoint`): the HTTP door's phases, controls and
@@ -261,6 +283,21 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// Whether the operation changes what the server holds, as a PUT, a stream, a part, a delete
+    /// and a multipart upload's create, completion and abort do, which `--write-load` paces.
+    fn writes(self) -> bool {
+        matches!(
+            self,
+            Self::Put
+                | Self::Stream
+                | Self::Delete
+                | Self::Create
+                | Self::Part
+                | Self::Complete
+                | Self::Abort
+        )
+    }
+
     fn name(self) -> &'static str {
         match self {
             Self::Put => "PUT",
@@ -2502,7 +2539,7 @@ impl<'o> Bench<'o> {
         let ran = self.rt.block_on(phase(
             held,
             Rc::clone(work),
-            (self.options.load, seed, from, end),
+            (self.options.load_of(work.kind), seed, from, end),
         ));
         let total = alloc::end();
         let aside = alloc::read_aside();
@@ -2608,7 +2645,7 @@ impl<'o> Bench<'o> {
                 .as_ref()
                 .map_or_else(|| "-".to_owned(), |(_, own)| f(own).max(0).to_string())
         };
-        let open = matches!(self.options.load, Load::Open(_));
+        let open = matches!(self.options.load_of(m.kind), Load::Open(_));
         let t = &m.tally;
         writeln!(
             out,
@@ -2710,7 +2747,7 @@ impl<'o> Bench<'o> {
         (from, n, end, finish): (u64, u64, u64, bool),
     ) -> Result<u64, Error> {
         let budget = self.clients(work.door);
-        if let Load::Open(_) = self.options.load {
+        if let Load::Open(_) = self.options.load_of(work.kind) {
             let end = from.saturating_add(n).min(end);
             self.step(out, work, (size, budget), (from, end))?;
             return Ok(end);
@@ -2846,7 +2883,7 @@ impl<'o> Bench<'o> {
         let uploads = Rc::new(RefCell::new(Vec::new()));
         // The most objects a phase's steps make: one step open loop; closed, a ladder's steps, its
         // clients doubling up to `--clients`.
-        let steps = match self.options.load {
+        let steps = match self.options.load_of(Kind::Put) {
             Load::Open(_) => 1,
             Load::Closed => u64::from(self.options.clients.max(1).ilog2()).saturating_add(1),
         };
@@ -2972,7 +3009,7 @@ impl<'o> Bench<'o> {
                 let half = count
                     .saturating_sub(u64::try_from(own.at()).map_err(failed)?)
                     .div_ceil(2);
-                let n = match self.options.load {
+                let n = match self.options.load_of(kind) {
                     Load::Open(_) => half,
                     Load::Closed => self.options.ops.max(1),
                 };
@@ -3121,13 +3158,11 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
     let counting = alloc::installed();
     writeln!(
         out,
-        "doors run seed {} condition {} load {} clients {} ops {} counting {}",
+        "doors run seed {} condition {} load {} write_load {} clients {} ops {} counting {}",
         options.seed,
         options.condition,
-        match options.load {
-            Load::Open(rate) => format!("open:{rate}"),
-            Load::Closed => "closed".to_owned(),
-        },
+        load_name(options.load),
+        options.write_load.map_or_else(|| "-".to_owned(), load_name),
         options.clients,
         options.ops,
         if counting {
@@ -3904,6 +3939,51 @@ mod tests {
         assert_eq!(size_arg("128K").unwrap(), 128 << 10);
         assert_eq!(Work::range(1), (0, 0));
         assert_eq!(Work::range(65_537), (21_845, 43_689));
+    }
+
+    /// `--write-load` paces the writes, a PUT, a stream, a part, a delete and a multipart upload's
+    /// create, completion and abort, and `--load` the reads; without it every phase runs under
+    /// `--load`.
+    #[test]
+    fn a_write_load_paces_the_writes_and_the_reads_keep_theirs() {
+        let mut options = Options {
+            dir: PathBuf::new(),
+            seed: 1,
+            sizes: Vec::new(),
+            objects: Vec::new(),
+            load: load_arg("open:100").unwrap(),
+            write_load: None,
+            clients: 1,
+            ops: 1,
+            bytes: 1,
+            volume: 1,
+            condition: String::new(),
+            endpoint: None,
+            perf: false,
+            kinds: Vec::new(),
+        };
+        let writes = [
+            Kind::Put,
+            Kind::Stream,
+            Kind::Delete,
+            Kind::Create,
+            Kind::Part,
+            Kind::Complete,
+            Kind::Abort,
+        ];
+        let reads = [Kind::Get, Kind::Range, Kind::Head, Kind::List, Kind::Parts];
+        for kind in writes.iter().chain(&reads) {
+            assert_eq!(options.load_of(*kind), Load::Open(100.0), "{}", kind.name());
+        }
+        options.write_load = Some(load_arg("closed").unwrap());
+        for kind in writes {
+            assert_eq!(options.load_of(kind), Load::Closed, "{}", kind.name());
+        }
+        for kind in reads {
+            assert_eq!(options.load_of(kind), Load::Open(100.0), "{}", kind.name());
+        }
+        assert_eq!(load_name(Load::Open(50.0)), "open:50");
+        assert_eq!(load_name(Load::Closed), "closed");
     }
 
     /// A listing's keys are its set's, each after the one before it as S3 orders keys, byte by

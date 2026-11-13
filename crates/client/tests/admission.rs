@@ -82,7 +82,7 @@ fn a_put_refused_busy_while_its_identity_holds_every_connection_is_answered_once
     // The holders' connections close as one is replaced or at the node's idle timeout, while the
     // stub goes on serving the asking client.
     let script = Script {
-        outlast: u32::try_from(CONNECTIONS_PER_PEER).unwrap(),
+        outlive: u32::try_from(CONNECTIONS_PER_PEER).unwrap(),
         ..Script::default()
     };
     // The node funds every connection it holds at once: the identity's places, and the connection
@@ -125,7 +125,10 @@ fn a_put_refused_busy_while_its_identity_holds_every_connection_is_answered_once
         })
         .unwrap();
     assert_eq!(status.unwrap(), Status::Done);
-    // The stub serves on until the process ends: which of the holders' connections close, replaced
-    // or at the node's idle timeout, and in what order, is the node's admission's to decide.
+    // The stub serves on until the process ends, telling each close it outlives on `bound`: which of
+    // the holders' connections close, replaced or at the node's idle timeout, and whether a close a
+    // newer connection supersedes is told at all, is the node's to decide, so neither the stub nor
+    // its tellings are waited for: a thread of their own reads them until the stub ends.
     drop(served);
+    std::thread::spawn(move || bound.iter().for_each(drop));
 }

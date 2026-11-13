@@ -174,9 +174,9 @@ pub(crate) struct Script {
     pub(crate) vouch_head: bool,
     pub(crate) slow_opens: u32,
     pub(crate) slow_append: Option<u32>,
-    /// Connections of its clients that close before the one at which the stub ends: one its
-    /// admission replaced, say, while the clients that hold the others go on.
-    pub(crate) outlast: u32,
+    /// Its client's connections it serves on past their close, each close told on `bound` again,
+    /// as a node outlives a client's connection its idle timeout closed.
+    pub(crate) outlive: u32,
 }
 
 /// The native upload's requests the stub took, by kind, and the exchanges its client cut.
@@ -276,7 +276,8 @@ pub(crate) fn stub(
 }
 
 /// As [`stub`], answering a native upload's Open, Appends, Offsets and Finish as `script` says,
-/// its object the pattern's bytes: what it took of them, once its client's connection closes.
+/// its object the pattern's bytes: what it took of them, once its client's connection closes past
+/// the closes it outlives.
 pub(crate) fn scripted(
     credentials: Credentials,
     transport_bytes: u64,
@@ -310,6 +311,7 @@ pub(crate) fn scripted(
             bound.send(driver.local_addr().unwrap()).unwrap();
             let mut serving: Option<Serving> = None;
             let (mut runs, mut seen) = (Runs::default(), Seen::default());
+            let mut outlive = script.outlive;
             let mut piece = vec![0u8; mantle_client::PIECE];
             // The shard's time the pause ends, while it holds a put's body unread; once taken, a
             // pause is not taken again.
@@ -317,7 +319,6 @@ pub(crate) fn scripted(
             // When the stub began holding an Append unanswered, how long its client waited on it
             // before cutting it, and when the late Append is answered.
             let (mut holding_since, mut waited, mut late) = (None::<u64>, None::<u64>, None::<u64>);
-            let mut closes = 0u32;
             loop {
                 let until = if script.vouch_head && matches!(serving, Some(Serving::Holding { .. }))
                 {
@@ -362,7 +363,11 @@ pub(crate) fn scripted(
                                 trailer: Vec::new(),
                             });
                         }
-                        Event::Closed { .. } if closes < script.outlast => closes += 1,
+                        Event::Closed { .. } if outlive > 0 => {
+                            outlive -= 1;
+                            serving = None;
+                            bound.send(driver.local_addr().unwrap()).unwrap();
+                        }
                         Event::Closed { .. } => {
                             if script.vouch_head {
                                 assert!(

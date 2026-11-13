@@ -345,8 +345,9 @@ impl Geometry {
             .and_then(|o| o.checked_add(self.data_offset))
     }
 
-    pub fn block_usize(&self) -> usize {
-        usize::try_from(self.block).unwrap_or(4096)
+    /// The block as a length, or None where it does not fit the platform's lengths.
+    pub fn block_usize(&self) -> Option<usize> {
+        usize::try_from(self.block).ok()
     }
 
     /// Refuses, when a volume is opened, limits its log was not sized for at format (audit

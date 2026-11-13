@@ -1430,7 +1430,7 @@ impl<F: BlockFile> Writer<F> {
     fn write_batch(&mut self, layout: &Layout, payloads: &[Payload]) -> Result<(), ChunkError> {
         let started = std::time::Instant::now();
         let geometry = self.shared.geometry;
-        let block = geometry.block_usize();
+        let block = geometry.block_usize().ok_or(ChunkError::Full)?;
         let group = self.cursor.lsn;
         let placed = self.place_frame(KIND_BATCH, &layout.records, group)?;
         let frames = self.frame_writes(placed)?;
@@ -1539,7 +1539,7 @@ impl<F: BlockFile> Writer<F> {
         group: u64,
     ) -> Result<Placed, ChunkError> {
         let geometry = self.shared.geometry;
-        let block = geometry.block_usize();
+        let block = geometry.block_usize().ok_or(ChunkError::Full)?;
         let probe = frame::encode(kind, 0, 0, self.shared.volume, records, block)
             .ok_or(ChunkError::Full)?;
         let len = u64::try_from(probe.len()).map_err(|_| ChunkError::Full)?;
@@ -1893,7 +1893,7 @@ pub(crate) fn write_superblocks(
 ) -> Result<(), ChunkError> {
     let mut writes = Vec::with_capacity(superblocks.len());
     for sb in superblocks {
-        let bytes = sb.encode();
+        let bytes = sb.encode().ok_or(ChunkError::Full)?;
         let mut buf =
             AlignedBuf::zeroed(bytes.len(), align).map_err(|e| ChunkError::Device(e.into()))?;
         buf.extend_from_slice(&bytes)

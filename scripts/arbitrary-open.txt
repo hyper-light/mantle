@@ -6,7 +6,6 @@ crates/chunk/src/layout.rs Config::default:from_secs(7 * 24 * 3600)
 crates/chunk/src/layout.rs Config::default:max_fragments
 crates/chunk/src/layout.rs Config::default:segment_size
 crates/chunk/src/layout.rs FRAME_PAYLOAD
-crates/chunk/src/layout.rs Geometry::block_usize:unwrap_or(4096)
 crates/chunk/src/layout.rs Geometry::plan:(1u64 << 20)
 crates/chunk/src/layout.rs Geometry::plan:(64u64 << 20)
 crates/chunk/src/layout.rs Limits::default:batch_bytes
@@ -14,7 +13,6 @@ crates/chunk/src/layout.rs Limits::default:batch_requests
 crates/chunk/src/layout.rs Limits::default:fragments_per_chunk
 crates/chunk/src/layout.rs MAX_FRAME_BYTES
 crates/chunk/src/scrub.rs MAX_DAMAGED
-crates/chunk/src/superblock.rs Superblock::encode:unwrap_or(4096)
 crates/chunk/src/writer.rs INCARNATION_RESERVE
 crates/chunk/src/writer.rs SEQUENCE_RESERVE
 crates/client/src/lib.rs ATTEMPTS

@@ -1924,7 +1924,7 @@ mod tests {
             lsn,
             superblock.volume,
             &opened,
-            geometry.block_usize(),
+            geometry.block_usize().unwrap(),
         )
         .unwrap();
         let mut frame_buf = AlignedBuf::zeroed(frame.len(), file.alignment()).unwrap();

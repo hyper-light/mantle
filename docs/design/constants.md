@@ -863,7 +863,6 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/chunk/src/layout.rs` `Config::default:from_secs(7 * 24 * 3600)` | copied | `7 * 24 * 3600` | The chunk bench's scrub period, a week: field practice (Ceph's weekly deep scrub), as `SCRUB` (audit 2026-11-12 §4.2). |
 | `crates/chunk/src/layout.rs` `Config::default:max_fragments` | open | `1 << 22` | The chunk bench's index room, 2^22 fragments: research 11 §6.2 finds no source; derive from capacity, heap a fragment, checkpoint bandwidth and restart deadline. |
 | `crates/chunk/src/layout.rs` `Config::default:segment_size` | picked | `256 << 20` | The chunk bench's 256 MiB segments, picked (audit 2026-11-12 §4.2). Replace: `derive::volume` on the measured device. |
-| `crates/chunk/src/layout.rs` `Geometry::block_usize:unwrap_or(4096)` | picked | `4096` | A block that does not fit usize falls back to 4 KiB, picked. Replace: a typed error; the block is the device's measured alignment. |
 | `crates/chunk/src/layout.rs` `Geometry::plan:(1u64 << 20)` | picked | `1u64 << 20` | The least log of a compact volume, 1 MiB: no derivation stated. Replace: the log the volume's largest batch and its checkpoint need. |
 | `crates/chunk/src/layout.rs` `Geometry::plan:(64u64 << 20)` | picked | `64u64 << 20` | The least log of a standard volume, 64 MiB: no derivation stated. Replace: the log the volume's largest batch and its checkpoint need. |
 | `crates/chunk/src/layout.rs` `Limits::default:batch_bytes` | open | `32 << 20` | The chunk bench's 32 MiB batch: research 11 §5 gives b* = F0·BW, which does not set it; derive from a measured T(b) (audit §12.6). |
@@ -874,7 +873,6 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/chunk/src/record.rs` `peek_lengths:take(4)` | format | `4` | The width of the field the decoder reads, fixed by the encoding it reads. |
 | `crates/chunk/src/superblock.rs` `Superblock::decode:take(3)` | format | `3` | The superblock's three reserved bytes after its version (chunk-store.md §2). |
 | `crates/chunk/src/superblock.rs` `Superblock::decode:take(8)` | format | `8` | The width of the field the decoder reads, fixed by the encoding it reads. |
-| `crates/chunk/src/superblock.rs` `Superblock::encode:unwrap_or(4096)` | picked | `4096` | As `Geometry::block_usize`: a 4 KiB fallback picked where the block does not fit usize. |
 | `crates/chunk/src/volume.rs` `Volume::clean:sync_channel(1)` | derived | `1` | A channel of one slot: one reply, wake or job, taken before the next is sent (a rendezvous). |
 | `crates/chunk/src/volume.rs` `Volume::dispatch:sync_channel(1)` | derived | `1` | A channel of one slot: one reply, wake or job, taken before the next is sent (a rendezvous). |
 | `crates/chunk/src/volume.rs` `Volume::format:end_lsn` | format | `1` | A new volume's log: no checkpoint yet, nothing the replay must reach; LSNs count from one. |

@@ -50,9 +50,10 @@ pub struct Superblock {
 }
 
 impl Superblock {
-    /// Encodes into exactly `block` bytes, the last four being the CRC-32C of the rest.
-    pub fn encode(&self) -> Vec<u8> {
-        let size = usize::try_from(self.block).unwrap_or(4096);
+    /// Encodes into exactly `block` bytes, the last four being the CRC-32C of the rest; None
+    /// where the block does not fit the platform's lengths.
+    pub fn encode(&self) -> Option<Vec<u8>> {
+        let size = usize::try_from(self.block).ok()?;
         let mut w = Writer::with_capacity(size);
         w.bytes(&MAGIC);
         w.u32(VERSION);
@@ -77,7 +78,7 @@ impl Superblock {
         w.zeros(body.saturating_sub(w.len()));
         let crc = mantle_crc::crc32c(w.as_slice());
         w.u32(crc);
-        w.into_vec()
+        Some(w.into_vec())
     }
 
     /// Decodes one copy; `None` for anything that is not a valid, intact superblock.
@@ -160,14 +161,14 @@ mod tests {
     #[test]
     fn round_trips_and_fills_one_block() {
         let sb = sample();
-        let bytes = sb.encode();
+        let bytes = sb.encode().unwrap();
         assert_eq!(bytes.len(), 4096);
         assert_eq!(Superblock::decode(&bytes), Some(sb));
     }
 
     #[test]
     fn any_flipped_bit_invalidates_it() {
-        let bytes = sample().encode();
+        let bytes = sample().encode().unwrap();
         for i in [0usize, 8, 40, 100, 4000, 4095] {
             for bit in 0..8 {
                 let mut copy = bytes.clone();
@@ -181,7 +182,7 @@ mod tests {
     fn a_block_of_another_size_is_refused() {
         let mut sb = sample();
         sb.block = 8192;
-        let mut bytes = sb.encode();
+        let mut bytes = sb.encode().unwrap();
         bytes.truncate(4096);
         assert_eq!(Superblock::decode(&bytes), None);
     }

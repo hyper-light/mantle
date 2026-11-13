@@ -115,7 +115,9 @@ impl<'a, F: BlockFile> Frames<'a, F> {
     /// frame's padded length, when the frame would lie within the log.
     pub fn header(&mut self, pos: u64) -> Result<Option<(FrameHeader, u64)>, DiskError> {
         let (block, log_size, volume) = (self.geometry.block, self.geometry.log_size, self.volume);
-        let block_len = self.geometry.block_usize();
+        let Some(block_len) = self.geometry.block_usize() else {
+            return Ok(None);
+        };
         let Some(first) = self.bytes(pos, block)? else {
             return Ok(None);
         };

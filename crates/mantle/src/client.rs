@@ -1088,6 +1088,8 @@ pub(crate) struct FileSource {
     left: u64,
     /// The bytes it reads at most, from its first offset: what a rewind counts from.
     size: u64,
+    /// Where it was opened at and the bytes it gave from there: where it gives its bytes again.
+    first: (u64, u64),
 }
 
 impl FileSource {
@@ -1109,13 +1111,16 @@ impl FileSource {
             end: 0,
             left: length.unwrap_or_else(|| size.saturating_sub(offset)),
             size,
+            first: (
+                offset,
+                length.unwrap_or_else(|| size.saturating_sub(offset)),
+            ),
         })
     }
-}
 
-impl Rewind for FileSource {
-    /// Waits for a read out, which a dropped read left, then seeks: what it read is the past.
-    async fn rewind(&mut self, offset: u64) -> std::io::Result<()> {
+    /// Waits for a read out, which a dropped read left, then seeks to `offset`, `left` bytes to
+    /// give from there: what it read is the past.
+    async fn seek(&mut self, offset: u64, left: u64) -> std::io::Result<()> {
         if let Some(pending) = self.pending.as_mut() {
             let finished = pending.await;
             self.pending = None;
@@ -1128,12 +1133,24 @@ impl Rewind for FileSource {
         file.seek(SeekFrom::Start(offset))?;
         self.start = 0;
         self.end = 0;
-        self.left = self.size.saturating_sub(offset);
+        self.left = left;
         Ok(())
     }
 }
 
+impl Rewind for FileSource {
+    async fn rewind(&mut self, offset: u64) -> std::io::Result<()> {
+        self.seek(offset, self.size.saturating_sub(offset)).await
+    }
+}
+
 impl Source for FileSource {
+    /// From where it was opened, as many bytes as it gave from there.
+    async fn again(&mut self) -> std::io::Result<bool> {
+        let (offset, left) = self.first;
+        self.seek(offset, left).await.map(|()| true)
+    }
+
     async fn read(&mut self, into: &mut [u8]) -> std::io::Result<usize> {
         loop {
             if self.start < self.end

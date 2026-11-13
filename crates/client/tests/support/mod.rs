@@ -174,6 +174,9 @@ pub(crate) struct Script {
     pub(crate) vouch_head: bool,
     pub(crate) slow_opens: u32,
     pub(crate) slow_append: Option<u32>,
+    /// Connections of its clients that close before the one at which the stub ends: one its
+    /// admission replaced, say, while the clients that hold the others go on.
+    pub(crate) outlast: u32,
 }
 
 /// The native upload's requests the stub took, by kind, and the exchanges its client cut.
@@ -314,6 +317,7 @@ pub(crate) fn scripted(
             // When the stub began holding an Append unanswered, how long its client waited on it
             // before cutting it, and when the late Append is answered.
             let (mut holding_since, mut waited, mut late) = (None::<u64>, None::<u64>, None::<u64>);
+            let mut closes = 0u32;
             loop {
                 let until = if script.vouch_head && matches!(serving, Some(Serving::Holding { .. }))
                 {
@@ -358,6 +362,7 @@ pub(crate) fn scripted(
                                 trailer: Vec::new(),
                             });
                         }
+                        Event::Closed { .. } if closes < script.outlast => closes += 1,
                         Event::Closed { .. } => {
                             if script.vouch_head {
                                 assert!(

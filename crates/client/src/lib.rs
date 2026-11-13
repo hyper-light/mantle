@@ -185,6 +185,33 @@ pub trait Source {
     /// dropped before it is ready, as the client polls its transport meanwhile: one dropped took
     /// nothing from the source.
     fn read(&mut self, into: &mut [u8]) -> impl Future<Output = std::io::Result<usize>>;
+
+    /// Positions the source to give its bytes from its first again, where it can: whether it did.
+    /// A request its node refused at admission took none of its body, so one whose source can give
+    /// it again is asked again (`untaken`); a source read once, standard input say, cannot.
+    fn again(&mut self) -> impl Future<Output = std::io::Result<bool>> {
+        std::future::ready(Ok(false))
+    }
+}
+
+/// Bytes the client holds whole, read from the front, and from their first again.
+struct Holding<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl Source for Holding<'_> {
+    async fn read(&mut self, into: &mut [u8]) -> std::io::Result<usize> {
+        let mut rest = self.bytes.get(self.at..).unwrap_or_default();
+        let n = rest.read(into).await?;
+        self.at = self.at.saturating_add(n);
+        Ok(n)
+    }
+
+    async fn again(&mut self) -> std::io::Result<bool> {
+        self.at = 0;
+        Ok(true)
+    }
 }
 
 /// Where a get's bytes go.
@@ -393,6 +420,11 @@ struct Known {
     stalled: u32,
     /// Why its last connection or dial ended, where it said.
     refused: Option<Refusal>,
+    /// Until when, on the shard's clock, it refuses another connection of the client's: refused
+    /// `Busy`, every connection its admission lets the client hold was carrying traffic, and one is
+    /// replaced only once it is idle, quiet for the node's serve period (hyper-transport's
+    /// admission; `bounds::idle_timeout`).
+    busy_until_ns: u64,
 }
 
 /// What one attempt came to.
@@ -429,6 +461,8 @@ struct Upload<'a, S> {
     end: usize,
     ended: bool,
     hasher: Option<Hasher>,
+    /// The checksum its trailer carries, if it has one.
+    trailing: Option<Algorithm>,
     /// The trailer's value once the source ended, and the bytes of it handed over.
     trailer: Option<(Checksum, usize)>,
 }
@@ -451,8 +485,30 @@ impl<'a, S> Upload<'a, S> {
                 .map(Hasher::new)
                 .transpose()
                 .map_err(|e| ClientError::Bounds(format!("{e:?}")))?,
+            trailing,
             trailer: None,
         })
+    }
+
+    /// The body from its first byte again, where its source can give it again: whether it can.
+    async fn again(&mut self) -> Result<bool, ClientError>
+    where
+        S: Source,
+    {
+        if !self.source.again().await.map_err(ClientError::Source)? {
+            return Ok(false);
+        }
+        self.read = 0;
+        self.start = 0;
+        self.end = 0;
+        self.ended = false;
+        self.hasher = self
+            .trailing
+            .map(Hasher::new)
+            .transpose()
+            .map_err(|e| ClientError::Bounds(format!("{e:?}")))?;
+        self.trailer = None;
+        Ok(true)
     }
 
     /// The trailer's checksum, once every byte was read and it was computed.
@@ -534,6 +590,7 @@ impl Client {
                     epoch: 0,
                     stalled: 0,
                     refused: None,
+                    busy_until_ns: 0,
                 })
                 .collect(),
             at: 0,
@@ -700,7 +757,10 @@ impl Client {
             held.fill(source, first, length.is_none()).await?;
             if held.ended || length.is_some_and(|l| l <= MIN_PART) {
                 let bytes = held.bytes.len();
-                let mut whole = &held.bytes[..];
+                let mut whole = Holding {
+                    bytes: &held.bytes[..],
+                    at: 0,
+                };
                 let length = u64::try_from(bytes).unwrap_or(u64::MAX);
                 return self
                     .put_whole(native, &mut whole, length, deadline_ns)
@@ -1154,7 +1214,16 @@ impl Client {
                 .await?;
                 backoff = bounds::backed_off(backoff);
             }
-            let node = self.nodes.get(self.at).ok_or(ClientError::NoNodes)?.id;
+            let (node, busy_until_ns) = self
+                .nodes
+                .get(self.at)
+                .map(|n| (n.id, n.busy_until_ns))
+                .ok_or(ClientError::NoNodes)?;
+            // A node that refused the client `Busy` is asked again once a connection it holds can
+            // have turned idle, the fact its admission waits on, not before.
+            if busy_until_ns > hyper_rt::futures::now_ns() {
+                self.wait_until(busy_until_ns, deadline_ns).await?;
+            }
             // The time this attempt's node may take, as the request's head tells it (research/77
             // D2): none for a request asked with no deadline.
             let left = (deadline_ns != u64::MAX).then(|| {
@@ -1210,20 +1279,45 @@ impl Client {
                 }
                 Attempt::Untaken(refusal) => {
                     last = refusal;
-                    // The next node is asked: this one may be gone or full.
-                    self.at = self
-                        .at
-                        .checked_add(1)
-                        .filter(|at| *at < self.nodes.len())
-                        .unwrap_or(0);
+                    self.refused_by(refusal);
                 }
-                Attempt::Refused(refusal) => return Err(ClientError::Refused(refusal)),
+                // Refused at the node's admission, the node took none of the body that went out
+                // before the refusal came: one whose source gives it again is asked of the next
+                // node as a request never sent is.
+                Attempt::Refused(refusal) => {
+                    let again = match upload.as_deref_mut() {
+                        Some(upload) if untaken(refusal) => upload.again().await?,
+                        _ => false,
+                    };
+                    if !again {
+                        return Err(ClientError::Refused(refusal));
+                    }
+                    last = refusal;
+                    self.refused_by(refusal);
+                }
                 Attempt::Lost { refusal, whole } => {
                     return Err(ClientError::Lost { refusal, whole });
                 }
             }
         }
         Err(ClientError::Untaken(last))
+    }
+
+    /// The node asked last refused the client before it took the request, `refusal` why: the next
+    /// node is asked, as this one may be gone or full; refused `Busy`, this one is asked again only
+    /// once its serve period has passed.
+    fn refused_by(&mut self, refusal: Refusal) {
+        if refusal == Refusal::Busy
+            && let Some(known) = self.nodes.get_mut(self.at)
+        {
+            let served = u64::try_from(bounds::idle_timeout().as_nanos()).unwrap_or(u64::MAX);
+            known.busy_until_ns = hyper_rt::futures::now_ns().saturating_add(served);
+        }
+        self.at = self
+            .at
+            .checked_add(1)
+            .filter(|at| *at < self.nodes.len())
+            .unwrap_or(0);
     }
 
     /// One attempt of a request whose head, fields and body's length are given, with a put's
@@ -2471,6 +2565,7 @@ mod tests {
             end: 0,
             ended: false,
             hasher: None,
+            trailing: None,
             trailer: None,
         };
         let piece = [9u8; 4];

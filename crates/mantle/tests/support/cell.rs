@@ -72,6 +72,11 @@ pub(crate) const CLIENT: u64 = MOST_NODES + 1;
 pub(crate) const CLIENTS: u64 = 3;
 /// RFC 6298 §2.1: the retransmission timeout before any round trip is measured, one second.
 pub(crate) const INITIAL_RTO: Duration = Duration::from_secs(1);
+/// How long the cell may hold still for its devices, a stretch at a time, and a node's log flush
+/// may be out, before the watch counts it: as long as a node waits on its own busy device, which
+/// is as long as its client waits (`bounds::STOCK_PATIENCE`, research/77 D2). Past it the product
+/// itself gives up on the device, so the watch does too.
+pub(crate) const DEVICE_PATIENCE: Duration = mantle_protocol::bounds::STOCK_PATIENCE;
 /// RFC 5280 §4.1.2.5: the notAfter of a certificate with no well-defined expiration.
 pub(crate) const NO_EXPIRY: u64 = 253_402_300_799;
 /// Writes before the leader is killed and after: enough to pass the range's log group's room
@@ -898,7 +903,7 @@ pub(crate) struct Cell {
     pub(crate) learns: Vec<Sender<(u64, SocketAddr)>>,
     pub(crate) moved_at: Instant,
     /// Since the last movement, how long the cell held still for its devices, each stretch at
-    /// most `Cell::held_bound`, and when the stretch under way began, if one is.
+    /// most `DEVICE_PATIENCE`, and when the stretch under way began, if one is.
     pub(crate) held_for: Duration,
     pub(crate) held_since: Option<Instant>,
     /// The running nodes whose last word was that they wait on their own device.
@@ -1606,18 +1611,6 @@ impl Cell {
             .fold(INITIAL_RTO, Duration::max)
     }
 
-    /// How long one stretch of the cell holding still for its devices goes uncounted: the longest
-    /// any node's log has taken and the quiet period besides.
-    pub(crate) fn held_bound(&self, quiet: Duration) -> Duration {
-        let longest = self
-            .log
-            .values()
-            .map(|(_, _, longest)| *longest)
-            .max()
-            .unwrap_or_default();
-        longest + quiet
-    }
-
     /// Whether no majority of the running nodes is free of its own device: the range's quorum then
     /// waits on the devices of the nodes that wait on theirs.
     pub(crate) fn held_by_devices(&self) -> bool {
@@ -1635,8 +1628,7 @@ impl Cell {
         match (self.held_since, self.held_by_devices()) {
             (None, true) => self.held_since = Some(now),
             (Some(since), false) => {
-                let bound = self.held_bound(self.quiet());
-                self.held_for += now.saturating_duration_since(since).min(bound);
+                self.held_for += now.saturating_duration_since(since).min(DEVICE_PATIENCE);
                 self.held_since = None;
             }
             (None, false) | (Some(_), true) => {}
@@ -1658,22 +1650,21 @@ impl Cell {
     /// for its devices, the one under way counted to its bound.
     pub(crate) fn deadline(&self, quiet: Duration) -> Instant {
         let holding = if self.held_since.is_some() {
-            self.held_bound(quiet)
+            DEVICE_PATIENCE
         } else {
             Duration::ZERO
         };
         self.moved_at + quiet + self.held_for + holding
     }
 
-    /// When the watch ends for the flushes out: each running node's, as last said, past the
-    /// longest any node's log has taken and `quiet` besides, as the cluster's watch has it.
-    pub(crate) fn flush_deadline(&self, quiet: Duration) -> Instant {
-        let allowed = self.held_bound(quiet);
+    /// When the watch ends for the flushes out: each running node's, as last said, `DEVICE_PATIENCE`
+    /// past the flush's start, as the cluster's watch has it.
+    pub(crate) fn flush_deadline(&self) -> Instant {
         self.log
             .iter()
             .filter(|(id, _)| self.running.contains_key(id))
             .filter_map(|(_, (heard, flushing, _))| {
-                Some(*heard + allowed.saturating_sub(*flushing.as_ref()?))
+                Some(*heard + DEVICE_PATIENCE.saturating_sub(*flushing.as_ref()?))
             })
             .max()
             .unwrap_or_else(Instant::now)
@@ -1689,7 +1680,7 @@ impl Cell {
             let quiet = self.quiet();
             let left = self
                 .deadline(quiet)
-                .max(self.flush_deadline(quiet))
+                .max(self.flush_deadline())
                 .saturating_duration_since(Instant::now());
             match self.heard.recv_timeout(left) {
                 Ok(heard) => self.take(heard),

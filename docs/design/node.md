@@ -1284,7 +1284,11 @@ becomes:
   Kleinrock's throughput over delay, which by Little's law rises below Denning and Buzen's
   saturation point and falls past it, so its maximum is the knee. The node finds it as BBR probes
   its pipe, from above. It starts at the ceiling its memory was split for, where a fixed limit
-  stood, and halves while power does not fall a fifth. Then it cycles eight phases about a base: a
+  stood, and halves while power does not fall a fifth, counting only phases its limit bound, each
+  judged against one that ran wholly under the limit before it: a phase in which no operation was
+  turned away measured its clients, not its limit, so a limit no client reaches stays where it is.
+  Halving on such phases drove a closed ladder's limit down to its first step's one client, and it
+  climbed back a quarter a cycle while the ladder doubled. Then it cycles eight phases about a base: a
   quarter past it, a quarter below, six at it. At each cycle's end the base moves to the limit of
   greatest power among the base's phases and the probes its limit bound; a probe in which no
   operation was turned away moves nothing. A phase measures only after the operations admitted

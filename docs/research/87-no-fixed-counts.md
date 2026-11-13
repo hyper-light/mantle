@@ -186,7 +186,15 @@ DERIVED from [3], [4] and [6]: the limit climbs to the point of greatest power b
   started at one and doubled, as BBR does, and failed four of `crates/mantle/tests/serve.rs`'s 14
   on Studio 3, where lean-doors failed none: a native request past a limit of one at a node's
   start is refused `SlowDown`, and its client's backoff left the cell quiet past the harness's
-  second.
+  second. Only a phase the limit bound counts: one in which no operation was turned away
+  measured what its clients asked, so the limit stays and the descent waits, as a probe that bound
+  no one moves nothing. Counted, such phases halved a closed ladder's limit down to its first
+  step's one client, and it climbed back a quarter a cycle, 2,136 completions a node, while the
+  ladder doubled its clients every 1,000 operations; requests waited behind it at the higher
+  steps. The phase in which the limit begins to bind ran partly under the clients before it, a
+  ramp, so the first halving is judged against the next phase at the same limit: judged against
+  the ramp's, which queued less, it looked a loss and was undone (`admit.rs`,
+  `a_ladder_from_one_client_is_never_held_below_its_clients`).
 - **Then cycle eight phases about a base**: a quarter past it, a quarter below, six at it (BBR's
   `bbr_pacing_gain` cycle [6]). At each cycle's end the base moves to the limit of greatest power
   among the six phases at the base, pooled, and each probe whose limit bound. A probe in which no

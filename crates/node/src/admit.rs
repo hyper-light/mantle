@@ -37,6 +37,18 @@ const CYCLE: [Quarter; 8] = [
     Quarter::At,
 ];
 
+/// Where the descent from the ceiling stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Descent {
+    /// No phase its limit bound yet.
+    Waiting,
+    /// The limit began to bind in the last phase, which ran partly under what its clients asked
+    /// before: the next phase at the same limit is the one halving is judged against.
+    Binding,
+    /// Halved from `from`, where a phase that ran wholly under its limit measured `measured`.
+    Halved { from: usize, measured: Measured },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Quarter {
     Up,
@@ -85,8 +97,8 @@ pub(crate) struct Admission {
     /// The limit the cycle is about, and the limit now.
     base: usize,
     limit: usize,
-    /// Halving from the ceiling: the measure at the base before this one, while it halves.
-    descent: Option<Option<(usize, Measured)>>,
+    /// Halving from the ceiling, until the cycle takes over.
+    descent: Option<Descent>,
     /// The cycle's phase, and what each phase measured.
     phase: usize,
     cycle: [Measured; 8],
@@ -115,7 +127,7 @@ impl Admission {
             held: 0,
             base: ceiling,
             limit: ceiling,
-            descent: Some(None),
+            descent: Some(Descent::Waiting),
             phase: 0,
             cycle: [Measured::default(); 8],
             admitted: 0,
@@ -189,22 +201,46 @@ impl Admission {
         self.began_ns = now_ns;
         self.turned_away = false;
         match self.descent {
-            Some(before) => self.halve(before, measured),
+            Some(descent) => self.halve(descent, measured),
             None => self.cycled(measured),
         }
         self.settle = None;
     }
 
     /// The descent's step: halve while power does not fall a fifth, the reciprocal of BBR's startup's
-    /// `5/4` (`bbr_full_bw_thresh`). Past the knee halving raises power, or leaves it where the limit
-    /// did not bind; below it power halves with the limit, and the base goes back to the limit
-    /// before.
-    fn halve(&mut self, before: Option<(usize, Measured)>, measured: Measured) {
+    /// `5/4` (`bbr_full_bw_thresh`). Past the knee halving raises power; below it power halves with
+    /// the limit, and the base goes back to the limit before. A phase in which no operation was
+    /// turned away measured what its clients asked, not its limit, as a probe that bound no one
+    /// does: the limit stays, and the descent waits for a phase its limit binds. Halving on such a
+    /// phase drove the limit down to its clients' demand however far below the knee, a closed
+    /// ladder's one client at its first step, and it climbed back a quarter a cycle while the
+    /// ladder doubled its clients a step.
+    ///
+    /// The phase in which the limit begins to bind ran partly under what its clients asked before,
+    /// a ramp: halving is judged against the next phase at the same limit, which ran wholly under
+    /// it. Judged against the ramp's, whose operations queued less, the first halving looked a
+    /// loss and was undone, the limit left at its ceiling past the knee (a ladder's clients jumping
+    /// past the ceiling, `a_ladder_from_one_client_is_never_held_below_its_clients`).
+    fn halve(&mut self, descent: Descent, measured: Measured) {
+        if !measured.turned_away {
+            return;
+        }
+        let before = match descent {
+            Descent::Waiting => {
+                self.descent = Some(Descent::Binding);
+                return;
+            }
+            Descent::Binding => None,
+            Descent::Halved { from, measured } => Some((from, measured)),
+        };
         // Power did not fall a fifth: `P ≥ 4/5 · P_before`, so `4 · cost ≤ 5 · cost_before`.
         let held = before
             .is_none_or(|(_, b)| measured.cost().saturating_mul(4) <= b.cost().saturating_mul(5));
         if held && self.base > 1 {
-            self.descent = Some(Some((self.base, measured)));
+            self.descent = Some(Descent::Halved {
+                from: self.base,
+                measured,
+            });
             self.base = (self.base / 2).max(1);
             self.limit = self.base;
             return;
@@ -366,9 +402,10 @@ mod tests {
         limits.iter().sum::<usize>() as f64 / limits.len() as f64
     }
 
-    /// From its ceiling, the limit comes down to a closed system's knee and keeps about it, and the
-    /// system runs within a fifth of its most throughput, at ceilings near the knee and far past
-    /// it; operations of a hundredfold different lengths side by side are learned alike.
+    /// From its ceiling, the limit comes down to a closed system's knee and keeps about it, where
+    /// its clients ask past the ceiling, and the system runs within a fifth of its most throughput,
+    /// at ceilings near the knee and far past it; operations of a hundredfold different lengths side
+    /// by side are learned alike.
     #[test]
     fn the_limit_learns_the_knee_and_keeps_about_it() {
         for (servers, means) in [
@@ -383,7 +420,7 @@ mod tests {
             for ceiling in [64, 1_024] {
                 let mut admission = Admission::new(ceiling, u64::MAX, 0);
                 let (limits, share) =
-                    Closed::new(1).run(&mut admission, servers, means, 1_000, 60_000);
+                    Closed::new(1).run(&mut admission, servers, means, 2 * ceiling, 60_000);
                 let settled = mean(&limits[limits.len() / 2..]);
                 let knee = servers as f64;
                 assert!(
@@ -393,6 +430,32 @@ mod tests {
                 assert!(share >= 0.8, "{servers} {means:?}: {share:.2} of the most");
             }
         }
+    }
+
+    /// A closed ladder, its clients doubling from one: the limit never falls below what its clients
+    /// ask, so no step's clients wait on it, and the system runs within a fifth of its most at
+    /// every step past the knee; once they ask past the ceiling it finds the knee.
+    #[test]
+    fn a_ladder_from_one_client_is_never_held_below_its_clients() {
+        let mut admission = Admission::new(4_096, u64::MAX, 0);
+        let mut system = Closed::new(5);
+        let mut clients = 1;
+        while clients <= 1_024 {
+            let (limits, share) = system.run(&mut admission, 64, &[1_000_000], clients, 2_000);
+            assert!(
+                limits.iter().all(|&l| l >= clients),
+                "{clients} clients: {:?}",
+                &limits[..20]
+            );
+            if clients >= 64 {
+                assert!(share >= 0.8, "{clients} clients: {share:.2} of the most");
+            }
+            clients *= 2;
+        }
+        let (limits, share) = system.run(&mut admission, 64, &[1_000_000], 8_192, 60_000);
+        let settled = mean(&limits[limits.len() / 2..]);
+        assert!((48.0..=97.0).contains(&settled), "{settled:.1}");
+        assert!(share >= 0.8, "{share:.2}");
     }
 
     /// The limit never passes its ceiling, however much the system would take, and holds it.
@@ -420,10 +483,10 @@ mod tests {
     }
 
     /// When the system's capacity falls, the limit follows it down, and when it rises, back up:
-    /// the knee is learned again, never kept.
+    /// the knee is learned again, never kept. Its clients ask past its ceiling, so its limit binds.
     #[test]
     fn the_limit_follows_the_knee_as_it_moves() {
-        let mut admission = Admission::new(10_000, u64::MAX, 0);
+        let mut admission = Admission::new(512, u64::MAX, 0);
         let mut system = Closed::new(4);
         system.run(&mut admission, 32, &[1_000_000], 1_000, 40_000);
         let (limits, _) = system.run(&mut admission, 4, &[1_000_000], 1_000, 60_000);

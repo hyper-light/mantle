@@ -99,18 +99,20 @@ fn serving(seed: u64, ops: u64) -> alloc::Counts {
 /// is given and a put's commands go to their ranges moved (reallocations 6,372 to 6,377 before,
 /// 2,303 to 2,307 then), 33,564 since hyper-raft 3d6640f's cuts (2,306 reallocations), and 34,094
 /// since its fb74b59, whose driver reads its sockets before it judges its timers: the clients'
-/// run sends 502 more datagrams (15,040), each one the simulated network's copy. The clients draw
-/// their identities and nonces at random, which moved a buffer's growth by an allocation now and
-/// then while encodings grew; made at their lengths, they no longer do, so the count is exact.
+/// run sends 502 more datagrams (15,040), each one the simulated network's copy; 34,034 since its
+/// 294678c, whose certificate decoder streams into the certificate's buffer (hyper-tls VENDORED.md
+/// §11): the run's 12 Brotli decodes of a node's certificate, 5 allocations fewer each. The clients
+/// draw their identities and nonces at random, which moved a buffer's growth by an allocation now
+/// and then while encodings grew; made at their lengths, they no longer do, so the count is exact.
 /// On Linux each socket, a simulated one too, holds `recvmmsg` and `sendmmsg` headers (hyper-rt's
 /// `Batched`, 11 allocations, and its receive `Ring`, 6), and the three clients make theirs inside
 /// the count: 51 that macOS and Windows, which hold none, do not make.
 #[test]
 fn a_cell_serving_writes_turns_without_remaking_what_a_turn_keeps() {
     const SERVING: u64 = if cfg!(target_os = "linux") {
-        34_094
+        34_034
     } else {
-        34_043
+        33_983
     };
     let counts = serving(1, 40);
     assert_eq!(counts.allocations, SERVING, "{counts:?}");

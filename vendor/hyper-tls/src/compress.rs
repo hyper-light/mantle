@@ -109,9 +109,51 @@ pub struct DecompressionFailed;
 #[derive(Debug)]
 pub struct CompressionFailed;
 
+/// Decompresses a peer's certificate with `decompressor` inside an unwind boundary: a decoder
+/// that panics on what the peer sent is that certificate's `DecompressionFailed`, the handshake's
+/// typed refusal, and every other connection goes on (VENDORED.md §11). The decoders are safe Rust,
+/// so a logic bug in one is a panic rather than a write out of bounds, and the peer chooses the
+/// input before it has authenticated: a server reads a client's certificate, and every node's
+/// CertificateRequest offers the decoders.
+pub(crate) fn decompress_contained(
+    decompressor: &dyn CertDecompressor,
+    input: &[u8],
+    output: &mut [u8],
+) -> Result<(), DecompressionFailed> {
+    contained(|| decompressor.decompress(input, output)).unwrap_or(Err(DecompressionFailed))
+}
+
+/// Compresses this side's own certificate message with `compressor` inside an unwind boundary: an
+/// encoder that panics is `CompressionFailed`, which the handshake already answers by sending the
+/// certificate uncompressed (VENDORED.md §11).
+fn compress_contained(
+    compressor: &dyn CertCompressor,
+    input: Vec<u8>,
+    level: CompressionLevel,
+) -> Result<Vec<u8>, CompressionFailed> {
+    contained(|| compressor.compress(input, level)).unwrap_or(Err(CompressionFailed))
+}
+
+/// Runs `op` inside an unwind boundary: `None` if it unwound. The payload is dropped inside a
+/// boundary of its own, and one whose drop unwinds again is leaked, one allocation, rather than
+/// unwound (hyper-rt's `unwind::contained`, the same rule).
+fn contained<R>(op: impl FnOnce() -> R) -> Option<R> {
+    match std::panic::catch_unwind(core::panic::AssertUnwindSafe(op)) {
+        Ok(value) => Some(value),
+        Err(payload) => {
+            if let Err(again) =
+                std::panic::catch_unwind(core::panic::AssertUnwindSafe(move || drop(payload)))
+            {
+                let _ = alloc::boxed::Box::leak(again);
+            }
+            None
+        }
+    }
+}
+
 mod feat_zlib_rs {
     use zlib_rs::{
-        compress_bound, compress_slice, decompress_slice, DeflateConfig, InflateConfig, ReturnCode,
+        compress_bound, compress_slice, DeflateConfig, Inflate, InflateFlush, ReturnCode, Status,
     };
 
     use super::*;
@@ -123,11 +165,18 @@ mod feat_zlib_rs {
     struct ZlibRsDecompressor;
 
     impl CertDecompressor for ZlibRsDecompressor {
+        /// The stream fills `output` exactly and ends where `input` does: upstream 0.23.46's check
+        /// (VENDORED.md §11), where `decompress_slice` took a stream with bytes after its end.
         fn decompress(&self, input: &[u8], output: &mut [u8]) -> Result<(), DecompressionFailed> {
-            let output_len = output.len();
-            match decompress_slice(output, input, InflateConfig::default()) {
-                (output_filled, ReturnCode::Ok) if output_filled.len() == output_len => Ok(()),
-                (_, _) => Err(DecompressionFailed),
+            let (input_len, output_len) = (u64::try_from(input.len()), u64::try_from(output.len()));
+            let mut state = Inflate::new(true, ZLIB_WINDOW_BITS);
+            match state.decompress(input, output, InflateFlush::Finish) {
+                Ok(Status::StreamEnd)
+                    if Ok(state.total_in()) == input_len && Ok(state.total_out()) == output_len =>
+                {
+                    Ok(())
+                }
+                _ => Err(DecompressionFailed),
             }
         }
 
@@ -167,6 +216,10 @@ mod feat_zlib_rs {
             CertificateCompressionAlgorithm::Zlib
         }
     }
+
+    /// The largest LZ77 window, 2^15 bytes (RFC 1950 §2.2: CINFO at most 7), as
+    /// `InflateConfig::default()` takes; upstream 0.23.46's.
+    const ZLIB_WINDOW_BITS: u8 = 15;
 }
 
 pub use feat_zlib_rs::{ZLIB_COMPRESSOR, ZLIB_DECOMPRESSOR};
@@ -175,34 +228,106 @@ pub use feat_zlib_rs::{ZLIB_COMPRESSOR, ZLIB_DECOMPRESSOR};
 mod feat_brotli {
     use std::io::{Cursor, Write};
 
+    use brotli_decompressor::{
+        Allocator, BrotliDecompressStream, BrotliResult, BrotliState, StandardAlloc,
+    };
+
     use super::*;
 
-    /// A certificate decompressor for the brotli algorithm using the `brotli` crate.
+    /// A certificate decompressor for the brotli algorithm using the `brotli-decompressor` crate.
     pub const BROTLI_DECOMPRESSOR: &dyn CertDecompressor = &BrotliDecompressor;
 
     #[derive(Debug)]
     struct BrotliDecompressor;
 
     impl CertDecompressor for BrotliDecompressor {
+        /// Decodes RFC 7932 Brotli only, the format RFC 8879 §3 names, into `output` and no
+        /// further: a stream that asks for the large-window extension, does not fill `output`
+        /// exactly, or goes on past its end is refused. `BrotliDecompress` took the large window,
+        /// so a five-byte header could make it allocate 1 GiB before the peer authenticated
+        /// (RUSTSEC-2026-0348; upstream 0.23.46's fix, VENDORED.md §11).
         fn decompress(&self, input: &[u8], output: &mut [u8]) -> Result<(), DecompressionFailed> {
-            let mut in_cursor = Cursor::new(input);
-            let mut out_cursor = Cursor::new(output);
-
-            brotli::BrotliDecompress(&mut in_cursor, &mut out_cursor)
-                .map_err(|_| DecompressionFailed)?;
-
-            let filled = usize::try_from(out_cursor.position()).ok();
-            if filled != Some(out_cursor.into_inner().len()) {
-                return Err(DecompressionFailed);
+            let mut state = BrotliState::new_strict(
+                Bytes::for_output(output.len()),
+                StandardAlloc::default(),
+                StandardAlloc::default(),
+            );
+            let (mut available_in, mut input_offset) = (input.len(), 0);
+            let (mut available_out, mut output_offset, mut total_out) = (output.len(), 0, 0);
+            match BrotliDecompressStream(
+                &mut available_in,
+                &mut input_offset,
+                input,
+                &mut available_out,
+                &mut output_offset,
+                output,
+                &mut total_out,
+                &mut state,
+            ) {
+                BrotliResult::ResultSuccess if available_out == 0 && available_in == 0 => Ok(()),
+                _ => Err(DecompressionFailed),
             }
-
-            Ok(())
         }
 
         fn algorithm(&self) -> CertificateCompressionAlgorithm {
             CertificateCompressionAlgorithm::Brotli
         }
     }
+
+    /// The decoder's byte allocations for one certificate: none past the most a stream that decodes
+    /// to the certificate's length takes, whatever its header says. A stream names its window (up
+    /// to 2^24, RFC 7932 §9.1) and each metablock its length (up to 2^24, §9.2) before any of its
+    /// data, and brotli-decompressor 6.1.1 sizes its ring buffer to the smallest power of two
+    /// holding what was decoded and the metablock declared, so a four-byte header of a stored
+    /// metablock took 16,780,366 bytes before the peer authenticated, where a whole certificate of
+    /// 1 KiB takes 38,835 (`tests/certificate_decoding.rs`). A refused allocation is the decoder's
+    /// own error: it keeps its state and ends the stream (`BrotliEnsureRingBuffer`,
+    /// `DecodeContextMap`).
+    #[derive(Debug, Clone, Copy)]
+    struct Bytes {
+        most: usize,
+    }
+
+    impl Bytes {
+        /// For a certificate of `len` bytes: its ring buffer, at least
+        /// [`RING_BUFFER_LEAST`] and the least power of two holding `len` (6.1.1's
+        /// `BrotliCalculateRingBufferSize`), and [`RING_BUFFER_SLACK`] past it; or a literal
+        /// context map, whichever is the larger.
+        fn for_output(len: usize) -> Self {
+            let ring = len
+                .max(RING_BUFFER_LEAST)
+                .checked_next_power_of_two()
+                .and_then(|ring| ring.checked_add(RING_BUFFER_SLACK));
+            let most = ring.map_or(CONTEXT_MAP_MOST, |ring| ring.max(CONTEXT_MAP_MOST));
+            Self { most }
+        }
+    }
+
+    impl Allocator<u8> for Bytes {
+        type AllocatedMemory = <StandardAlloc as Allocator<u8>>::AllocatedMemory;
+
+        fn alloc_cell(&mut self, len: usize) -> Self::AllocatedMemory {
+            if len > self.most {
+                return Self::AllocatedMemory::default();
+            }
+            StandardAlloc::default().alloc_cell(len)
+        }
+
+        fn free_cell(&mut self, data: Self::AllocatedMemory) {
+            StandardAlloc::default().free_cell(data);
+        }
+    }
+
+    /// The least ring buffer brotli-decompressor 6.1.1 allocates for a metablock that is not the
+    /// last (`kRingBufferMinSize`, "as in the C decoder").
+    const RING_BUFFER_LEAST: usize = 1024;
+    /// What brotli-decompressor 6.1.1 allocates past a ring buffer (`kRingBufferAllocationSlack`):
+    /// the C decoder's write-ahead slack, 542 bytes (`kRingBufferWriteAheadSlack`), and one more
+    /// dictionary word of the longest, 24 bytes (RFC 7932 Appendix A).
+    const RING_BUFFER_SLACK: usize = 542 + 24;
+    /// The largest context map a stream holds: 64 literal contexts for each of up to 256 literal
+    /// block types (RFC 7932 §7.3, §9.2: NBLTYPESL at most 256).
+    const CONTEXT_MAP_MOST: usize = 64 * 256;
 
     /// A certificate compressor for the brotli algorithm using the `brotli` crate.
     pub const BROTLI_COMPRESSOR: &dyn CertCompressor = &BrotliCompressor;
@@ -345,7 +470,7 @@ impl CompressionCache {
         let encoding = original.get_encoding();
         // CompressedCertificate's uncompressed_length is a uint24 (RFC 8879 §4).
         let uncompressed_len = u32::try_from(encoding.len()).map_err(|_| CompressionFailed)?;
-        let compressed = compressor.compress(encoding, CompressionLevel::Interactive)?;
+        let compressed = compress_contained(compressor, encoding, CompressionLevel::Interactive)?;
 
         // this `CompressionCacheEntry` in fact never makes it into the cache, so
         // `original` is left empty
@@ -393,7 +518,8 @@ impl CompressionCacheInner {
 
         // do compression:
         let uncompressed_len = u32::try_from(encoding.len()).map_err(|_| CompressionFailed)?;
-        let compressed = compressor.compress(encoding.clone(), CompressionLevel::Amortized)?;
+        let compressed =
+            compress_contained(compressor, encoding.clone(), CompressionLevel::Amortized)?;
         let new_entry = CompressionCacheEntry {
             algorithm,
             original: encoding,
@@ -539,13 +665,37 @@ mod tests {
         );
     }
 
+    /// A stream asking for Brotli's large window, which `BrotliDecompress` takes, is refused
+    /// (RUSTSEC-2026-0348; upstream 0.23.46's test).
+    #[test]
+    fn test_brotli_rejects_large_window() {
+        let large_window_empty = [0x11, 0xd0];
+        brotli_decompressor::BrotliDecompress(&mut &large_window_empty[..], &mut Vec::new())
+            .unwrap();
+        BROTLI_DECOMPRESSOR
+            .decompress(&large_window_empty, &mut [])
+            .unwrap_err();
+    }
+
     fn test_compressor(comp: &dyn CertCompressor, decomp: &dyn CertDecompressor) {
         assert_eq!(comp.algorithm(), decomp.algorithm());
         for sz in [16, 64, 512, 2048, 8192, 16384] {
             test_trivial_pairwise(comp, decomp, sz);
         }
         test_decompress_wrong_len(comp, decomp);
+        test_decompress_trailing_data(comp, decomp);
         test_decompress_garbage(decomp);
+    }
+
+    fn test_decompress_trailing_data(comp: &dyn CertCompressor, decomp: &dyn CertDecompressor) {
+        let original = vec![0u8; 2048];
+        let mut compressed = comp
+            .compress(original.clone(), CompressionLevel::Interactive)
+            .unwrap();
+        compressed.extend_from_slice(b"trailing data");
+
+        let mut recovered = vec![0xffu8; original.len()];
+        decomp.decompress(&compressed, &mut recovered).unwrap_err();
     }
 
     fn test_trivial_pairwise(

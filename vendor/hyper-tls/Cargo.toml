@@ -13,8 +13,12 @@ publish = false
 name = "hyper_tls"
 [dependencies]
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+# The encoder only: certificates are decoded by brotli-decompressor 6.1.1, the release beside
+# Google's CVE-2026-111497 fix, called directly (VENDORED.md §11). No brotli release builds on it
+# (9.0 takes `~6.0`, 9.1 takes 6.2 or later), so the encoder stays at 8, whose own
+# brotli-decompressor 5 no certificate reaches.
 brotli = { version = "8", default-features = false, features = ["std"] }
-brotli-decompressor = "5.0.0"
+brotli-decompressor = { version = "=6.1.1", default-features = false, features = ["std"] }
 log = "0.4.8"
 once_cell = { version = "1.16", default-features = false, features = ["alloc", "race", "std"] }
 pki-types = { package = "rustls-pki-types", version = "1.12", features = ["alloc", "std"] }

@@ -1098,9 +1098,11 @@ impl State<ServerConnectionData> for ExpectCompressedCertificate {
         }
 
         let mut decompress_buffer = vec![0u8; compressed_cert.uncompressed_len as usize];
-        if let Err(compress::DecompressionFailed) =
-            decompressor.decompress(compressed_cert.compressed.0.bytes(), &mut decompress_buffer)
-        {
+        if let Err(compress::DecompressionFailed) = compress::decompress_contained(
+            *decompressor,
+            compressed_cert.compressed.0.bytes(),
+            &mut decompress_buffer,
+        ) {
             return Err(cx.common.send_fatal_alert(
                 AlertDescription::BadCertificate,
                 PeerMisbehaved::InvalidCertCompression,

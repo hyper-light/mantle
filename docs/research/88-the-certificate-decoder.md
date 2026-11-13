@@ -86,11 +86,14 @@ types, at most 256. The large window is not RFC 7932. RFC 8879 §3 names RFC 793
   makes, window 2^22 and the certificate's own, 1 to 65,535 bytes, still decodes.
 - Every decoder runs behind an unwind boundary, a panic being the handshake's typed refusal
   (bad_certificate), as CLAUDE.md §1 asks of a dependency that can panic.
-- cargo deny names five more advisories against crates in hyper-raft's lock: RUSTSEC-2026-0346,
-  -0347 and -0349 against rustls 0.23.45 (session values' `Debug`, data sent after an ECH
-  rejection, a key-share downgrade through an unauthenticated ServerHello), -0382 against
-  rustls-webpki 0.103.14 and -0381 against webpki-roots, with -0386 (tokio) and -0486 (rustix).
-  Each is the owner's to weigh; none is in the decoder.
+- cargo deny names more advisories against crates in hyper-raft's lock. hyper-tls takes upstream
+  0.23.46's fixes for the three in its own code, on the goal 16 lead's word (2026-11-13; hyper-raft
+  doors-step8-3, hyper-tls `VENDORED.md` §12): RUSTSEC-2026-0346 (session values' `Debug` printed
+  the resumption PSK and master secret), -0347 (data written before an ECH rejection reached the
+  outer server) and -0349 (a key-share hint kept from an unauthenticated ServerHello), each with a
+  test that fails before it. hyper-raft's lock moves past -0382 (rustls-webpki 0.103.17, and
+  hyper-tls requires 0.103.16), -0381 (webpki-roots 1.0.12), -0386 (tokio 1.54.1) and -0486 (rustix
+  1.1.6). Its oracle, upstream rustls pinned at 0.23.45, a test dependency, keeps its four.
 - An independent decoder, one not from the encoder's crate, has not decoded mantle's
   certificate at its window: every Google decoder on the box is 1.2.0 [3], and another is a new
   tool, the owner's to allow.

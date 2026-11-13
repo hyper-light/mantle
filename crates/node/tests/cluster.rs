@@ -50,12 +50,11 @@
 //! its own (`Client::patience`), and never less than RFC 6298's initial retransmission timeout, one
 //! second, before anything is measured. A node
 //! whose log has a flush out extends the watch, since its range moves only as its writes become
-//! durable, until the flush has been out longer than the longest any node's log has taken and the
-//! quiet period besides (hyper-durable-e2e's rule, in one process). A cell no majority of whose
+//! durable, until the flush has been out as long as a node waits on its own busy device, its
+//! client's patience (`bounds::STOCK_PATIENCE`, research/77 D2). A cell no majority of whose
 //! live nodes is free of its own device holds still for its devices (`Node::held`: a node
 //! judges no peer while its own proof is out, timing.md §2.8), and the watch does not count that
-//! time, each such stretch up to the longest any node's log has taken and the quiet period
-//! besides, as `crates/mantle/tests/node.rs`'s does. A node's shard is its own, as
+//! time, each such stretch up to the same patience, as `crates/mantle/tests/node.rs`'s does. A node's shard is its own, as
 //! its process's would be, so an engine's flush on one node holds up none of the others, nor the
 //! test.
 
@@ -149,6 +148,11 @@ const CLIENTS: u64 = NODES;
 /// RFC 6298 §2.1: the retransmission timeout before any round trip is measured, one second; the
 /// least quiet period the test waits through.
 const INITIAL_RTO: Duration = Duration::from_secs(1);
+/// How long the cell may hold still for its devices, a stretch at a time, and a node's log flush
+/// may be out, before the watch counts it: as long as a node waits on its own busy device, which
+/// is as long as its client waits (`bounds::STOCK_PATIENCE`, research/77 D2). Past it the product
+/// itself gives up on the device, so the watch does too.
+const DEVICE_PATIENCE: Duration = mantle_protocol::bounds::STOCK_PATIENCE;
 /// The authority's name.
 const AUTHORITY: &str = "mantle test cell";
 /// RFC 5280 §4.1.2.5: the notAfter of a certificate with no well-defined expiration,
@@ -851,7 +855,7 @@ struct Watch {
     /// When a node last moved.
     moved_at: Option<Instant>,
     /// Since the last movement, how long the cell held still for its devices, each stretch at
-    /// most `Watch::held_bound`, and when the stretch under way began, if one is.
+    /// most `DEVICE_PATIENCE`, and when the stretch under way began, if one is.
     held_for: Duration,
     held_since: Option<Instant>,
 }
@@ -869,7 +873,7 @@ impl Watch {
                 return found;
             }
             let quiet = self.quiet();
-            let until = self.deadline(quiet).max(self.flush_deadline(quiet));
+            let until = self.deadline(quiet).max(self.flush_deadline());
             // Checked before each report: reports that keep coming with nothing moved in them
             // (a heartbeat's count, a log's stats) end the wait all the same.
             let Some(left) = until.checked_duration_since(Instant::now()) else {
@@ -980,18 +984,6 @@ impl Watch {
         }
     }
 
-    /// How long one stretch of the cell holding still for its devices goes uncounted: the longest
-    /// any node's log has taken and the quiet period besides.
-    fn held_bound(&self, quiet: Duration) -> Duration {
-        let longest = self
-            .log
-            .values()
-            .map(|(_, _, longest)| *longest)
-            .max()
-            .unwrap_or_default();
-        longest + quiet
-    }
-
     /// Whether no majority of the live nodes is free of its own device: the range's quorum then
     /// waits on the devices of the nodes that wait on theirs.
     fn held_by_devices(&self) -> bool {
@@ -1005,8 +997,7 @@ impl Watch {
         match (self.held_since, self.held_by_devices()) {
             (None, true) => self.held_since = Some(now),
             (Some(since), false) => {
-                let bound = self.held_bound(self.quiet());
-                self.held_for += now.saturating_duration_since(since).min(bound);
+                self.held_for += now.saturating_duration_since(since).min(DEVICE_PATIENCE);
                 self.held_since = None;
             }
             (None, false) | (Some(_), true) => {}
@@ -1029,28 +1020,21 @@ impl Watch {
     /// for its devices, the one under way counted to its bound.
     fn deadline(&self, quiet: Duration) -> Instant {
         let holding = if self.held_since.is_some() {
-            self.held_bound(quiet)
+            DEVICE_PATIENCE
         } else {
             Duration::ZERO
         };
         self.moved_at.unwrap_or_else(Instant::now) + quiet + self.held_for + holding
     }
 
-    /// When the watch ends for the flushes out: each live node's, as last heard, past the
-    /// longest any node's log has taken and `quiet` besides.
-    fn flush_deadline(&self, quiet: Duration) -> Instant {
-        let longest = self
-            .log
-            .values()
-            .map(|(_, _, l)| *l)
-            .max()
-            .unwrap_or_default();
-        let allowed = longest + quiet;
+    /// When the watch ends for the flushes out: each live node's, as last heard, `DEVICE_PATIENCE`
+    /// past the flush's start.
+    fn flush_deadline(&self) -> Instant {
         self.log
             .iter()
             .filter(|(id, _)| self.live.contains(id))
             .filter_map(|(_, (heard, flushing, _))| {
-                Some(*heard + allowed.saturating_sub(*flushing.as_ref()?))
+                Some(*heard + DEVICE_PATIENCE.saturating_sub(*flushing.as_ref()?))
             })
             .max()
             .unwrap_or_else(Instant::now)

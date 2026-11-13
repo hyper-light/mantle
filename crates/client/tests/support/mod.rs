@@ -6,8 +6,9 @@ use std::net::SocketAddr;
 use std::pin::pin;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use hyper_rt::combine::{Either, race2};
+use hyper_rt::combine::{Either3, race3};
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig, interests_for};
+use hyper_rt::sync::{OneshotReceiver, OneshotSender};
 use hyper_rt_transport::Driver;
 use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer, Tls};
 use hyper_transport::{
@@ -235,56 +236,152 @@ enum Serving {
 
 type Stub = Driver<NodeClasses, Fixed, Clients>;
 
-/// The stub's next event, or none once `until`, the shard's time a pause ends, has come.
-async fn next(driver: &mut Stub, until: Option<u64>) -> Option<Event<NodeClasses>> {
+/// What the stub hears next.
+enum Heard {
+    Event(Event<NodeClasses>),
+    /// The pause it was given ended.
+    Paused,
+    /// Its client is done.
+    Done,
+}
+
+/// The stub's next event; the end of `until`, the shard's time a pause ends; or, while `done` is
+/// still to come, the word that its client is done.
+async fn next(
+    driver: &mut Stub,
+    until: Option<u64>,
+    done: &mut Option<OneshotReceiver<()>>,
+) -> Heard {
     let now = hyper_rt::futures::now_ns();
-    match until {
-        Some(until) if now < until => {
-            let raced = {
-                let event = pin!(driver.event());
-                let sleep = pin!(hyper_rt::futures::sleep(until - now));
-                race2(event, sleep).await
-            };
-            match raced {
-                Either::First(event) => Some(event.unwrap()),
-                Either::Second(slept) => {
-                    slept.unwrap();
-                    None
-                }
+    let pause = until.filter(|until| now < *until).map(|until| until - now);
+    let raced = {
+        let event = pin!(driver.event());
+        let paused = pin!(async {
+            match pause {
+                Some(pause) => hyper_rt::futures::sleep(pause).await.unwrap(),
+                None => std::future::pending().await,
             }
+        });
+        let finished = pin!(async {
+            match done.as_mut() {
+                // Sent, or its sender dropped: either way the client is done.
+                Some(done) => drop(done.await),
+                None => std::future::pending().await,
+            }
+        });
+        race3(event, paused, finished).await
+    };
+    match raced {
+        Either3::First(event) => Heard::Event(event.unwrap()),
+        Either3::Second(()) => Heard::Paused,
+        Either3::Third(()) => {
+            *done = None;
+            Heard::Done
         }
-        _ => Some(driver.event().await.unwrap()),
     }
 }
 
-/// Runs the stub node until its client's connection closes, telling `bound` where it listens: a
-/// get's object `length` bytes long, and a put's body left unread for `pause`, where given, once
-/// its first bytes came, as a node's driver waiting on durable writes leaves it.
+/// A stub node on a thread of its own ([`serve`]).
+pub(crate) struct Served<T> {
+    /// Sent, or dropped, once its client is done.
+    done: Option<OneshotSender<()>>,
+    thread: Option<std::thread::JoinHandle<T>>,
+}
+
+/// Runs `node` on a thread of its own, handing it the word that its client is done: sent as the node
+/// is joined, or as the test that runs it unwinds.
+pub(crate) fn serve<T: Send + 'static>(
+    node: impl FnOnce(OneshotReceiver<()>) -> T + Send + 'static,
+) -> Served<T> {
+    let (done, finished) = hyper_rt::sync::oneshot().unwrap();
+    Served {
+        done: Some(done),
+        thread: Some(std::thread::spawn(move || node(finished))),
+    }
+}
+
+impl<T> Served<T> {
+    /// Tells the node its client is done, and waits for it to end: what it returned.
+    pub(crate) fn join(mut self) -> std::thread::Result<T> {
+        if let Some(done) = self.done.take() {
+            let _ = done.send(());
+        }
+        let thread = self.thread.take().unwrap();
+        thread.join()
+    }
+}
+
+impl<T> Drop for Served<T> {
+    /// A test that unwinds before joining its node drops the word with it: the node, told its client
+    /// is done, ends rather than holding its thread.
+    fn drop(&mut self) {
+        drop(self.done.take());
+    }
+}
+
+/// Runs the stub node until its client is done and, while a connection of its client's is up at it
+/// (`Event::Connected`), until that connection closes, telling `bound` where it listens: a get's
+/// object `length` bytes long, and a put's body left unread for `pause`, where given, once its
+/// first bytes came, as a node's driver waiting on durable writes leaves it: whether its client's
+/// connection came up at it.
+///
+/// A connection the stub's endpoint never identified, its half of the handshake not finished when
+/// its client went (the client's Finished lost, or the stub's half timed out while its client was
+/// slow to read the stub's flight: RFC 9001 §4.1.1 completes a client's handshake before the
+/// server's), ends with no event, there being no peer to tell of. So the stub waits for a close only
+/// while its client's connection is up, when hyper-transport tells the close at the latest at the
+/// idle timeout ([`bounds::idle_timeout`], three probe timeouts, RFC 9000 §10.1); otherwise its
+/// client being done is all there is to wait for. A stub that waited for a close it would never be
+/// told waited forever (CI windows-x86_64, lean-doors e511ae15).
 pub(crate) fn stub(
     credentials: Credentials,
     transport_bytes: u64,
     (length, pause): (u64, Option<Duration>),
     bound: std::sync::mpsc::Sender<SocketAddr>,
-) {
-    scripted(
+    done: OneshotReceiver<()>,
+) -> bool {
+    let (_, connected) = run(
         credentials,
         transport_bytes,
         (length, pause),
         Script::default(),
         bound,
+        done,
     );
+    connected
 }
 
 /// As [`stub`], answering a native upload's Open, Appends, Offsets and Finish as `script` says,
-/// its object the pattern's bytes: what it took of them, once its client's connection closes past
-/// the closes it outlives.
+/// its object the pattern's bytes: what it took of them, once it ends.
 pub(crate) fn scripted(
     credentials: Credentials,
     transport_bytes: u64,
     (length, pause): (u64, Option<Duration>),
     script: Script,
     bound: std::sync::mpsc::Sender<SocketAddr>,
+    done: OneshotReceiver<()>,
 ) -> Seen {
+    let (seen, _) = run(
+        credentials,
+        transport_bytes,
+        (length, pause),
+        script,
+        bound,
+        done,
+    );
+    seen
+}
+
+/// The stub node ([`stub`], [`scripted`]): what it took, and whether its client's connection came up
+/// at it.
+fn run(
+    credentials: Credentials,
+    transport_bytes: u64,
+    (length, pause): (u64, Option<Duration>),
+    script: Script,
+    bound: std::sync::mpsc::Sender<SocketAddr>,
+    done: OneshotReceiver<()>,
+) -> (Seen, bool) {
     let get_crc = crc(length);
     let stated = mantle_client::stated(1, transport_bytes);
     runtime(8)
@@ -319,6 +416,9 @@ pub(crate) fn scripted(
             // When the stub began holding an Append unanswered, how long its client waited on it
             // before cutting it, and when the late Append is answered.
             let (mut holding_since, mut waited, mut late) = (None::<u64>, None::<u64>, None::<u64>);
+            // The word that its client is done, until it comes; whether a connection of its
+            // client's is up at it now, so that its close is still to be told.
+            let (mut done, mut connected) = (Some(done), false);
             loop {
                 let until = if script.vouch_head && matches!(serving, Some(Serving::Holding { .. }))
                 {
@@ -327,8 +427,15 @@ pub(crate) fn scripted(
                 } else {
                     held
                 };
-                if let Some(event) = next(&mut driver, until).await {
+                let event = match next(&mut driver, until, &mut done).await {
+                    Heard::Event(event) => Some(event),
+                    Heard::Paused => None,
+                    Heard::Done if connected => None,
+                    Heard::Done => return (seen, false),
+                };
+                if let Some(event) = event {
                     match event {
+                        Event::Connected { .. } => connected = true,
                         Event::Refused {
                             exchange,
                             by_peer: true,
@@ -365,6 +472,7 @@ pub(crate) fn scripted(
                         }
                         Event::Closed { .. } if outlive > 0 => {
                             outlive -= 1;
+                            connected = false;
                             serving = None;
                             bound.send(driver.local_addr().unwrap()).unwrap();
                         }
@@ -375,7 +483,7 @@ pub(crate) fn scripted(
                                     "the node kept vouching until its client closed"
                                 );
                             }
-                            return seen;
+                            return (seen, true);
                         }
                         _ => {}
                     }
@@ -641,4 +749,98 @@ pub(crate) fn scripted(
             }
         })
         .unwrap()
+}
+
+/// A relay between a client and the stub node on 127.0.0.1 that passes the stub every datagram of
+/// its client's that carries Initial packets alone, and keeps from it every other: the client
+/// finishes its handshake on the stub's flight, while the stub never hears the client's Finished,
+/// which a Handshake packet carries, nor any 1-RTT packet after it, the client's request and its
+/// CONNECTION_CLOSE among them. So the server's half of a QUIC handshake is left open (RFC 9001
+/// §4.1.1: a client's handshake completes before the server's), as a client's Finished lost, or a
+/// server's half timed out while its client was slow to read its flight, leaves it.
+pub(crate) struct Relay {
+    /// The address the client dials.
+    pub(crate) address: SocketAddr,
+    /// The socket whose datagram tells the relay to end.
+    stop: std::net::UdpSocket,
+    thread: std::thread::JoinHandle<()>,
+}
+
+/// A QUIC variable-length integer at the front of `bytes` (RFC 9000 §16): its value and its
+/// length.
+fn varint(bytes: &[u8]) -> Option<(u64, usize)> {
+    let first = *bytes.first()?;
+    let length = 1usize << (first >> 6);
+    let mut value = u64::from(first & 0x3f);
+    for byte in bytes.get(1..length)? {
+        value = (value << 8) | u64::from(*byte);
+    }
+    Some((value, length))
+}
+
+/// Whether every packet `datagram` carries is a QUIC version 1 Initial (RFC 9000 §17.2: the long
+/// header's form bit, its type bits 0b00, and its Length, which ends a packet a datagram coalesces
+/// with others, §12.2). The fixed bit says nothing: hyper-quic greases it (RFC 9287), so a packet
+/// is known by its form and type bits alone.
+fn initial_alone(datagram: &[u8]) -> bool {
+    let mut rest = datagram;
+    while let Some(&first) = rest.first() {
+        // A short header (1-RTT), or a long one of another type than Initial.
+        if first & 0x80 == 0 || (first >> 4) & 0x03 != 0 {
+            return false;
+        }
+        let Some(after) = (|| {
+            let dcid = usize::from(*rest.get(5)?);
+            let scid_at = 6 + dcid;
+            let scid = usize::from(*rest.get(scid_at)?);
+            let token_at = scid_at + 1 + scid;
+            let (token, token_length) = varint(rest.get(token_at..)?)?;
+            let length_at = token_at + token_length + usize::try_from(token).ok()?;
+            let (length, length_length) = varint(rest.get(length_at..)?)?;
+            Some(length_at + length_length + usize::try_from(length).ok()?)
+        })() else {
+            return false;
+        };
+        rest = rest.get(after..).unwrap_or(&[]);
+    }
+    true
+}
+
+impl Relay {
+    pub(crate) fn to(stub: SocketAddr) -> Relay {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        let stop = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let stopper = stop.local_addr().unwrap();
+        let thread = std::thread::spawn(move || {
+            // A UDP datagram's largest payload (RFC 768: a 16-bit length).
+            let mut datagram = vec![0u8; 65_535];
+            let mut client = None::<SocketAddr>;
+            loop {
+                let (n, from) = socket.recv_from(&mut datagram).unwrap();
+                if from == stopper {
+                    return;
+                }
+                if from == stub {
+                    if let Some(client) = client {
+                        socket.send_to(&datagram[..n], client).unwrap();
+                    }
+                } else if initial_alone(&datagram[..n]) {
+                    client = Some(from);
+                    socket.send_to(&datagram[..n], stub).unwrap();
+                }
+            }
+        });
+        Relay {
+            address,
+            stop,
+            thread,
+        }
+    }
+
+    /// Ends the relay.
+    pub(crate) fn end(self) {
+        self.stop.send_to(&[0], self.address).unwrap();
+        self.thread.join().unwrap()
+    }
 }

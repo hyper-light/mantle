@@ -20,7 +20,7 @@ use mantle_protocol::object::{Op, Status};
 
 #[allow(dead_code)]
 mod support;
-use support::{CLIENT, NODE, Script, credentials, runtime, scripted};
+use support::{CLIENT, NODE, Script, credentials, runtime, scripted, serve};
 
 /// A bucket's head answered, then the client left undriven until its node's idle timeout closed
 /// its connection, which the node tells: the next head is answered, on a connection of its own.
@@ -29,7 +29,7 @@ fn a_request_after_the_node_closed_an_idle_connection_is_answered_on_a_new_one()
     let (node, credentials) = credentials();
     let transport_bytes = mantle_client::least_transport(1).unwrap();
     let (tell, bound) = channel();
-    let served = std::thread::spawn(move || {
+    let served = serve(move |done| {
         scripted(
             node,
             transport_bytes,
@@ -39,6 +39,7 @@ fn a_request_after_the_node_closed_an_idle_connection_is_answered_on_a_new_one()
                 ..Script::default()
             },
             tell,
+            done,
         )
     });
     let address = bound.recv().unwrap();

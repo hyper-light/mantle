@@ -91,6 +91,13 @@ const BUCKET: &str = "b";
 thread_local! {
     /// What the measured parts of the step running now allocated, in a counting build.
     static COUNTED: Cell<Counts> = const { Cell::new(Counts::ZERO) };
+    /// Whether this build counts, read once as the run begins: `alloc::installed` begins and
+    /// ends a count of its own, so asking it within a step would lose the step's.
+    static COUNTING: Cell<bool> = const { Cell::new(false) };
+}
+
+fn counting() -> bool {
+    COUNTING.with(Cell::get)
 }
 
 /// The start of a step's measured part: its time, and in a counting build (`count-allocs`) its
@@ -99,7 +106,7 @@ struct Mark(Instant);
 
 impl Mark {
     fn begin() -> Self {
-        if alloc::installed() {
+        if counting() {
             alloc::begin();
         }
         Self(Instant::now())
@@ -108,7 +115,7 @@ impl Mark {
     /// The measured part's time; its counts added to the step's.
     fn end(self) -> Duration {
         let took = self.0.elapsed();
-        if alloc::installed() {
+        if counting() {
             let c = alloc::end();
             COUNTED.with(|counted| {
                 let k = counted.get();
@@ -157,7 +164,7 @@ fn timed(
 
 fn row(out: &mut impl Write, label: String, runs: &Runs) -> Result<(), Error> {
     let counted = |n: u64| {
-        if alloc::installed() {
+        if counting() {
             n.to_string()
         } else {
             "-".to_owned()
@@ -178,6 +185,7 @@ fn row(out: &mut impl Write, label: String, runs: &Runs) -> Result<(), Error> {
 }
 
 pub fn meta(out: &mut impl Write, step: Duration) -> Result<(), Error> {
+    COUNTING.with(|c| c.set(alloc::installed()));
     writeln!(
         out,
         "metadata commands applied over the model engine, one core; the median and slowest run, \

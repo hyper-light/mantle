@@ -484,9 +484,6 @@ struct Kept {
     layer: Layer,
     handle: Handle,
     max_entry_bytes: u64,
-    /// The answers one session of the range keeps unacknowledged (`Rules::max_answers`): the most
-    /// commands an entry of this node's own carries.
-    max_answers: usize,
     /// The replica's latest wake, held in [`Node::deadlines`].
     wake: Option<u64>,
     /// A member lost for good the node replaces while it leads the range ([`Node::replace`]).
@@ -876,9 +873,11 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     next_read_ask: ReadAsk,
     reads_done: Vec<(ReadAsk, ReadOutcome)>,
     wall: Wall,
-    /// The gateway host's settings, and the object operations it runs, at most
-    /// `GatewaySettings::objects`.
+    /// The gateway host's settings, and the object operations it runs: as many at once as it has
+    /// learned its knee is (`crate::admit`), at most `GatewaySettings::objects`, the ceiling its
+    /// memory was split for.
     gateway: Option<GatewaySettings>,
+    admission: Option<crate::admit::Admission>,
     jobs: Vec<host::Job>,
     /// What jobs that ended asked and was not yet answered: its outcomes are dropped as they come.
     /// At most the node's asks.
@@ -1074,7 +1073,6 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 layer: hosted.range.layer,
                 handle,
                 max_entry_bytes: hosted.range.settings.max_entry_bytes,
-                max_answers: hosted.range.rules.max_answers,
                 wake: None,
                 replacing: None,
             });
@@ -1212,6 +1210,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             next_read_ask: 0,
             reads_done: Vec::new(),
             wall: settings.wall,
+            admission: settings
+                .gateway
+                .as_ref()
+                .map(|g| crate::admit::Admission::new(g.objects, hyper_rt::futures::now_ns())),
             gateway: settings.gateway.take(),
             jobs: Vec::new(),
             abandoned: Vec::new(),
@@ -1633,17 +1635,22 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// The operations the S3 listener handed over, each a job, in the order they came, while the
-    /// host has room for another (`gateway.objects`): the rest wait at the door, their bodies
+    /// host has room for another (`crate::admit`): the rest wait at the door, their bodies
     /// unread, until a job ends and the listener's next answer taken turns the node again. A
     /// stopping node, or one that hosts no objects, answers each as it comes.
     fn take_door(&mut self) {
         loop {
-            let room = self.stopping()
-                || self
-                    .gateway
-                    .as_ref()
-                    .is_none_or(|g| self.jobs.len() < g.objects);
+            let room = self.stopping() || self.gateway.is_none() || self.admits();
             if !room {
+                // A request left waiting tells the limit its clients ask more than it admits.
+                if self
+                    .doorway
+                    .as_mut()
+                    .is_some_and(crate::door::Doorway::waiting)
+                    && let Some(admission) = self.admission.as_mut()
+                {
+                    admission.turned_away();
+                }
                 return;
             }
             let Some(request) = self.doorway.as_mut().and_then(crate::door::Doorway::take) else {
@@ -3496,6 +3503,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 command,
                 deadline_ns,
                 wait,
+                serial: None,
             });
         }
         Ok(ask)
@@ -3506,11 +3514,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         take_done(&mut self.commands_done, ask)
     }
 
-    /// The most commands an entry of this node's own carries, and its most bytes: the least any
-    /// range it hosts takes, the cell's ranges being alike; with none hosted, one command, in what
-    /// a request carries.
-    fn entry_limits(&self) -> (usize, usize) {
-        let commands = self.ranges.iter().map(|k| k.max_answers).min().unwrap_or(1);
+    /// The most bytes an entry of this node's own carries, its commands as many as fit them: the
+    /// least any range it hosts takes, the cell's ranges being alike; with none hosted, what a
+    /// request carries.
+    fn entry_bytes(&self) -> usize {
         let bytes = self
             .ranges
             .iter()
@@ -3520,13 +3527,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 NodeClasses::frame_bound(classes::Class::Request)
                     .saturating_sub(u64::try_from(command::HEAD_BYTES).unwrap_or(u64::MAX))
             });
-        (commands, usize::try_from(bytes).unwrap_or(usize::MAX))
+        usize::try_from(bytes).unwrap_or(usize::MAX)
     }
 
     /// The commands this node asks itself, at a turn: those past their deadline answered so, each
     /// range's next entry made, and each entry not out asked.
     fn step_asks(&mut self, now: u64) -> Result<(), NodeError> {
-        let limits = self.entry_limits();
+        let limits = self.entry_bytes();
         for at in 0..self.asking.len() {
             let Some(asking) = self.asking.get_mut(at) else {
                 continue;

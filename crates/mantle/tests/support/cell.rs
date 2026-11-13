@@ -103,8 +103,6 @@ range.max_committed_size_per_ready = 1048576
 range.max_entry_bytes = 1024
 rules.lifetime_ns = 9223372036854775807
 rules.max_sessions = 64
-rules.max_answers = 16
-rules.max_answer_bytes = 18446744073709551615
 rules.expiries_per_entry = 8
 log.segment_bytes = 65536
 log.max_segments = 64
@@ -239,8 +237,6 @@ pub(crate) fn held_row() -> usize {
     let bound = |x| Rules {
         lifetime_ns: u64::MAX,
         max_sessions: 1,
-        max_answers: 1,
-        max_answer_bytes: 0,
         expiries_per_entry: 1,
         max_key_bytes: x,
         max_value_bytes: x,
@@ -264,8 +260,6 @@ pub(crate) fn bounds() -> Bounds {
                 rules: Rules {
                     lifetime_ns: u64::MAX / 2,
                     max_sessions: 64,
-                    max_answers: 16,
-                    max_answer_bytes: usize::MAX,
                     expiries_per_entry: 8,
                     max_key_bytes: held_row(),
                     max_value_bytes: held_row(),

@@ -33,6 +33,7 @@
 #[global_allocator]
 static ALLOCATOR: hyper_measure::alloc::Counting = hyper_measure::alloc::Counting;
 
+pub mod admit;
 pub mod ask;
 pub mod chunk;
 pub mod client;

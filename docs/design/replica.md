@@ -58,11 +58,28 @@ nothing else may. Commands reach the log in any order, a
 gateway's retries and the fast track's re-proposals among them, so the answer kept longest
 need not be the lowest serial: forgetting it for room, as the range once did, raised the
 watermark past serials still in flight, which were then taken for repeats and never applied.
-A session keeps its unacknowledged answers within a count and a budget of bytes, and past
-either it expires, as the dissertation bounds sessions: the command that passed the bound is
-answered, and every command after, retries and serials still in flight alike, is refused as
-from an expired session, never applied, so the gateway registers anew knowing which commands
-took effect.
+A session keeps its unacknowledged answers while its row, with them, fits a row
+(`Rules::max_value_bytes`, the largest S3 admits, so no page grows): their bytes bound it, no
+count. A command whose answer would not fit is refused before it takes effect,
+`AnswersFull`: it runs over the entry's writes so far, and its own are dropped. So is every
+later command of its session in the entry, so a session's commands take effect in their order.
+The session is kept. The gateway asks them again under the same serials in its next entry, which
+acknowledges the answers before them and so makes the room. A refused command applied nothing
+and kept nothing. A copy reaching the log later, a retry or a re-proposal, is its first
+application. Once applied, its answer is kept until acknowledged, and a copy after that is
+`Repeated`. So a command takes effect once at its serial, and a bound a gateway reaches under
+correct operation never ends its session. Until 2026-11-12 a session past its bounds expired
+instead: a retry of the entry whose reply was lost then met an expired session, and only
+commands carrying a file were recognised as copies in the new one (research/87 §1; the
+dissertation §6.3, RIFL §4.2). Under a new serial, a refused command could apply twice: once
+through a late copy whose answer then fitted, and once as itself. A gateway that sent its serials out of
+order could fill its row with answers above a serial it has no answer for, which it cannot
+acknowledge: that serial is then refused until its deadline. Mantle's gateway never does, since
+one entry out at a time carries serials in order and the refused ones are always the entry's last.
+The gateway never reports
+`AnswersFull` as a refusal; past its deadline the command is `Deadline`, which may still apply,
+once (`a_sessions_commands_take_effect_once_through_lost_replies_late_copies_and_refusals`,
+`crates/node/src/ask.rs`).
 
 Sessions filter duplicates only within a session, and a command can outlive its own: one in
 flight when its session expired has an unknown outcome, and the dissertation leaves the
@@ -624,9 +641,8 @@ change. Membership changes are rare, so this costs one image each.
   moving snapshots out of band with the production engine.
 - Read leases, if a deployment states its clock-drift bound (06 §A1.5); reads are confirmed
   by ReadIndex rounds (§3) until then.
-- The session lifetime and bounds, sessions a range holds and the answers and bytes of
-  answers one keeps, from how long gateways go between commands to a range and how many
-  they keep in flight. Built (2026-10-21): a registration names its owner, its run and its place
+- The session lifetime and the sessions a range holds, from how long gateways go between
+  commands to a range. The answers one keeps are its row's (2026-11-12, research/87). Built (2026-10-21): a registration names its owner, its run and its place
   in the run; it ends the session its owner's last registration opened, the same one delivered
   again is answered that session, and an earlier one is refused `Superseded` (node.md §1.4).
   Planned with `mantle serve`'s derived settings: the sessions a range holds bounded by the

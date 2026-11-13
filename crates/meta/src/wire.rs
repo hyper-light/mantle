@@ -76,6 +76,12 @@ pub enum Answer {
     /// The command's writes hold a row past the range's bounds on a key or a value
     /// (`session::Rules::max_key_bytes`, `max_value_bytes`): nothing of it was written.
     RowTooLarge,
+    /// The command's answer would take its session's row past a row's bound
+    /// (`session::Rules::max_value_bytes`): it was not applied, nor any of the session's commands
+    /// after it in the entry, and the session is kept. Asked again once the gateway has
+    /// acknowledged the answers before it, it is applied; a copy still in flight may apply first,
+    /// once (`session::Touched::fits`).
+    AnswersFull,
     /// The command is for another layer than the range's.
     WrongLayer,
     Bucket(bucket::Outcome),
@@ -91,6 +97,23 @@ fn too_large(len: usize) -> RecordError {
 
 fn corrupt() -> RecordError {
     RecordError::Corrupt("entry")
+}
+
+/// Bytes an entry's encoding takes before its commands: its format, its time and its count.
+pub const ENTRY_HEAD_BYTES: usize = 13;
+
+impl Sessioned {
+    /// Bytes this command takes in an entry's encoding, so an entry of commands takes
+    /// [`ENTRY_HEAD_BYTES`] and theirs: a gateway fills an entry to its bound in one pass.
+    pub fn encoded_len(&self) -> Result<usize, RecordError> {
+        // Counted, not written: nothing is allocated.
+        let mut w = Writer::counting();
+        w.u64(self.session);
+        w.u64(self.serial);
+        w.u64(self.unanswered);
+        put_command(&mut w, &self.command)?;
+        Ok(w.len())
+    }
 }
 
 impl Entry {
@@ -157,6 +180,7 @@ impl Answer {
                 Answer::Repeated => w.u8(7),
                 Answer::Superseded => w.u8(10),
                 Answer::RowTooLarge => w.u8(11),
+                Answer::AnswersFull => w.u8(12),
                 Answer::Bucket(o) => {
                     w.u8(3);
                     put_bucket_outcome(w, o);
@@ -227,6 +251,7 @@ impl Answer {
                 7 => Answer::Repeated,
                 10 => Answer::Superseded,
                 11 => Answer::RowTooLarge,
+                12 => Answer::AnswersFull,
                 3 => Answer::Bucket(take_bucket_outcome(&mut r)?),
                 4 => Answer::Name(take_name_outcome(&mut r)?),
                 5 => Answer::File(match r.u8()? {
@@ -1709,7 +1734,8 @@ fn longest_lineage() -> record::Lineage {
 }
 
 /// Bytes of the largest answer a range gives a command a node sends, which a session keeps until
-/// its gateway acknowledges it (`session::Rules::max_answer_bytes`): a completion's, with its
+/// its gateway acknowledges it, as many as its row holds (`session::Touched::fits`), so a
+/// session's row holds one at least where it keeps no other (`derive::cell`): a completion's, with its
 /// checksum at its longest; one carrying a version or an upload's ID; or one carrying the
 /// range's lineage at its longest, as a range that no longer holds a key answers. A block
 /// check's verdicts and a Name range's checked marks answer a sweep, which sizes its checks to
@@ -1741,7 +1767,7 @@ pub fn largest_answer_bytes() -> Result<usize, RecordError> {
 }
 
 /// Bytes of the largest value a row of a range takes from a request S3 admits, a session's
-/// aside (`session::Rules::largest_session_row`): a version or an upload keeping a request's
+/// aside, which keeps answers while its row stays within this (`session::Touched::fits`): a version or an upload keeping a request's
 /// headers at their longest encoding, its owner a canonical ID and its ETag and checksum at
 /// their longest; a part; or the Name range's lineage at its longest. Every other row holds
 /// fixed fields, IDs, a count or a bucket's name. A command whose row passes the range's bound
@@ -1802,6 +1828,49 @@ pub fn largest_row_bytes() -> Result<usize, RecordError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An entry's encoding is its head and each command's own bytes, from none to many of any
+    /// kind, so an entry filled by those sums is the entry encoded.
+    #[test]
+    fn an_entry_takes_its_head_and_each_commands_bytes() {
+        let commands = [
+            Command::Register {
+                owner: 1,
+                run: 2,
+                nth: 3,
+            },
+            Command::Block(block::Command::Renew {
+                block: 9,
+                file: 7,
+                handover_ns: 5,
+                at_ns: 3,
+            }),
+            Command::Bucket(bucket::Command::Activate {
+                bucket: "b".repeat(MAX_BUCKET),
+                attempt: 1,
+            }),
+            Command::File(file::Command::Delete { file: 7 }),
+        ];
+        for n in 0..=6usize {
+            let entry = Entry {
+                at_ns: u64::MAX,
+                commands: (0..n)
+                    .map(|i| Sessioned {
+                        session: i as u64,
+                        serial: u64::MAX - i as u64,
+                        unanswered: 1,
+                        command: commands[i % commands.len()].clone(),
+                    })
+                    .collect(),
+            };
+            let sum: usize = entry
+                .commands
+                .iter()
+                .map(|c| c.encoded_len().unwrap())
+                .sum();
+            assert_eq!(entry.encode().unwrap().len(), ENTRY_HEAD_BYTES + sum);
+        }
+    }
 
     /// The largest answer covers every answer a node's command gets at its longest, and the
     /// largest row a version's headers in any layout S3's 8 KB of them admits: one long header
@@ -2557,6 +2626,8 @@ mod tests {
             ]
             .map(Answer::Root),
         );
+        // Since 2026-11-12: last, so every earlier answer's vector keeps its line.
+        answers.push(Answer::AnswersFull);
         answers
     }
 

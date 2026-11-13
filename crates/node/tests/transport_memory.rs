@@ -16,7 +16,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use hyper_measure::alloc;
-use hyper_transport::{ExchangeId, Progress};
+use hyper_transport::{Event, ExchangeId, Progress};
 use mantle_node::derive;
 use mantle_protocol::bounds::{self, Stated};
 use mantle_protocol::classes::{self, Kind};
@@ -164,4 +164,124 @@ fn the_plane_and_a_link_hold_what_derive_states() {
     drop(link);
     let ring = derive::liveness_bytes(1).unwrap() / 3;
     assert_eq!(u64::try_from(c.peak).unwrap(), ring);
+}
+
+/// A server compresses its certificate (RFC 8879) at its first handshake and keeps the compression
+/// for the handshakes after it. So the server's peak through its first handshake, above its peak
+/// through its second, is the compression alone: no more than brotli's own state compressing the
+/// certificate at the window its length takes, which `bounds::CERTIFICATE_COMPRESSION_BYTES`
+/// states. Node 1 dials node 2 twice, a new endpoint each time; only node 2's own work is counted,
+/// node 1's and the network's paused.
+#[test]
+fn a_servers_first_handshake_takes_brotlis_state_at_its_certificates_window_and_no_more() {
+    use hyper_tls::compress::{BROTLI_COMPRESSOR, CompressionLevel};
+    let certificates = certificates();
+    let stated = stated(bounds::least_transport(&stated(0)).unwrap());
+    let brotli_of = |certificate: Vec<u8>| {
+        alloc::begin();
+        let compressed = BROTLI_COMPRESSOR.compress(certificate, CompressionLevel::Amortized);
+        let peak = alloc::end().peak;
+        assert!(compressed.is_ok());
+        peak
+    };
+    let length = certificates.1[1].0.len();
+    let brotli = brotli_of(certificates.1[1].0.clone());
+    // The longest certificate a node carries: its name's id at its most digits.
+    let key = || mantle_cert::KeyPair::generate().unwrap();
+    let longest = net::issued(&key(), &key(), u64::MAX);
+    let (longest_length, longest_brotli) = (longest.len(), brotli_of(longest));
+    let mut net = Net::new(
+        &certificates,
+        &stated,
+        Instant::now(),
+        (
+            VecDeque::with_capacity(1 << 16),
+            Vec::with_capacity(1 << 16),
+        ),
+    );
+    let first = server_handshake(&mut net);
+    let (authority, certs) = &certificates;
+    net.nodes[0] = net::endpoint(
+        authority,
+        &certs[0],
+        (2, &certs[1].0),
+        &stated,
+        net.now,
+        [3; 32],
+    );
+    net.wire.clear();
+    let second = server_handshake(&mut net);
+    eprintln!(
+        "certificate {length} bytes: brotli {brotli}; the server's peaks {first} then {second}, {} apart; \
+         the longest, {longest_length} bytes: brotli {longest_brotli}",
+        first - second
+    );
+    assert!(first - second <= brotli, "{first} - {second} past {brotli}");
+    for state in [brotli, longest_brotli] {
+        assert!(u64::try_from(state).unwrap() <= bounds::CERTIFICATE_COMPRESSION_BYTES);
+    }
+}
+
+/// Node 1 dials node 2 and the handshake runs until both are told they are connected, as
+/// `Net::connect` runs it: the peak of node 2's own live bytes over it, everything else uncounted.
+fn server_handshake(net: &mut Net) -> i64 {
+    let [client, server] = [0usize, 1];
+    alloc::begin();
+    alloc::pause();
+    net.nodes[client]
+        .connect(net.now, 2, net.addresses[server])
+        .unwrap();
+    let mut up = [false; 2];
+    for _ in 0..1_000 {
+        loop {
+            for from in [client, server] {
+                loop {
+                    if from == server {
+                        alloc::resume();
+                    }
+                    let sent = net.nodes[from].poll_transmit(net.now, &mut net.out);
+                    alloc::pause();
+                    let Some(t) = sent else { break };
+                    let segment = t.segment_size.unwrap_or(t.size);
+                    for datagram in net.out[..t.size].chunks(segment) {
+                        net.wire.push_back((1 - from, datagram.to_vec()));
+                    }
+                    net.out.clear();
+                }
+            }
+            if net.wire.is_empty() {
+                break;
+            }
+            while let Some((to, datagram)) = net.wire.pop_front() {
+                let from = net.addresses[1 - to];
+                if to == server {
+                    alloc::resume();
+                }
+                net.nodes[to].handle_datagram(net.now, from, None, &datagram);
+                alloc::pause();
+            }
+        }
+        for at in [client, server] {
+            if at == server {
+                alloc::resume();
+            }
+            while let Some(event) = net.nodes[at].poll_event() {
+                up[at] |= matches!(event, Event::Connected { .. });
+            }
+            alloc::pause();
+        }
+        if up == [true; 2] {
+            break;
+        }
+        let next = net.nodes.iter_mut().filter_map(|n| n.poll_timeout()).min();
+        if let Some(next) = next {
+            net.now = net.now.max(next);
+            alloc::resume();
+            net.nodes[server].handle_timeout(net.now);
+            alloc::pause();
+            net.nodes[client].handle_timeout(net.now);
+        }
+    }
+    assert_eq!(up, [true; 2], "the handshake did not end");
+    alloc::end().peak
 }

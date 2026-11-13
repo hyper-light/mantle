@@ -87,8 +87,13 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `33733b5` (hyper-raft branch `doors-wire-bytes`: `main`'s `fb74b59` and one
-commit), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. Its commit changes
+**Every crate at `c97fb1a` (hyper-raft branch `doors-step8`: `doors-wire-bytes`'s `33733b5` and
+one commit), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. Its commit changes
+hyper-transport alone: no endpoint offers to take QUIC DATAGRAM frames (`Limits::transport` sets
+`datagram_receive_buffer_size` to `None`, so no connection sends `max_datagram_frame_size`, RFC
+9221 §3), where hyper-quic's default offered every peer 1,250,000 bytes of them; hyper-raft
+docs/transport.md §4aq, its test `tests/datagrams.rs` (Lean doors step 8). Main takes it once Ada
+says. `33733b5` was `main`'s `fb74b59` and one commit, which changes
 hyper-rt alone: a batched socket counts its datagrams' payload bytes, sent and received, beside the
 datagrams (`IoStats::sent_bytes`, `received_bytes`; hyper-raft docs/runtime.md), which
 mantle-client's `Client::wire` sums over its sockets for `mantle bench doors`' native wire bytes.

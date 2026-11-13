@@ -20,5 +20,10 @@ mantle-codec = { path = "../codec" }
 mantle-s3 = { path = "../s3" }
 thiserror.workspace = true
 
+[dev-dependencies]
+# Each allocation a request's and a reply's encoding make, counted by its allocator (the unit
+# tests' global allocator, object.rs `every_request_and_reply_is_written_at_its_length`).
+hyper-measure = { path = "../../vendor/hyper-measure" }
+
 [lints]
 workspace = true

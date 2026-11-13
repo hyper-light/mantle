@@ -3,11 +3,12 @@
 regenerated from its raw outputs alone: python3 scripts/doors-tables.py DIR writes DIR/tables.md
 and DIR/trial-report.md. Standard library only.
 
-A cell is a door (or comparator) x operation x size x condition x arm. Its n is the transfers its
-cases measured; its quantiles are each case's, from the harness's histogram, and a dash where the
-case's samples do not resolve them at 95% (measurement.md §5a: 6 samples for a median, 368 for a
-p99, 3,688 for a p99.9); across several rounds a cell shows the median of its rounds' values. The
-A/A band is A2's value against A1's, cell by cell."""
+A cell is a machine x door (or comparator) x operation x size x condition x arm; a tail case's arm
+carries -tail, its own cells. Its n is the transfers its cases measured; its quantiles are each
+case's, from the harness's histogram, and a dash where the case's samples do not resolve them at
+95% (measurement.md §5a: 6 samples for a median, 368 for a p99, 3,688 for a p99.9); across several
+rounds a cell shows the median of its rounds' values, and a p99.9 only where every round resolved
+one. The A/A band is A2's value against A1's, cell by cell, and summarized by condition."""
 
 import json
 import re
@@ -15,12 +16,18 @@ import statistics
 import sys
 from pathlib import Path
 
-NAME = re.compile(r"^box_(?P<cond>[a-z0-9]+)_(?P<arm>[A-Za-z0-9-]+)_r(?P<round>[0-9]+)$")
-SIZES = ["0B", "1B", "65535B", "64KiB", "65537B", "128KiB", "8MiB", "64MiB", "set10000", "set100000"]
+NAME = re.compile(r"^(?P<machine>box|mac|vm)_(?P<cond>[a-z0-9]+)_(?P<arm>[A-Za-z0-9-]+)_r(?P<round>[0-9]+)$")
+MACHINES = ["box", "vm", "mac"]
+SIZES = ["0B", "1B", "65535B", "64KiB", "65537B", "128KiB", "8MiB", "64MiB", "set1000", "set10000", "set100000"]
+# The quantile each sample count resolves at 95% (measurement.md §5a).
+P999_N = 3688
 OPS = ["PUT", "PUT-STREAM", "GET", "GET-RANGE", "HEAD", "DELETE", "LIST", "MPU-CREATE", "MPU-PART",
        "MPU-LIST-PARTS", "MPU-COMPLETE", "MPU-ABORT"]
 CONDS = ["quiet", "busy1x", "busy2x", "cpu1", "cpu2", "memfloor"]
-ARMS = ["A1", "A2", "C", "garage", "seaweedfs", "rustfs"]
+ARMS = ["A1", "A2", "C", "minio", "garage", "seaweedfs", "rustfs"]
+ARMS += [a + "-tail" for a in ARMS]
+# The failure kinds a phase's note names (crates/mantle/src/bench_doors.rs `Failure::tag`).
+NOTE_KINDS = ("excluded:", "failure:", "refusal:", "unanswered:")
 
 
 def number(text):
@@ -52,14 +59,15 @@ def phase(tokens):
 
 
 def read_case(path):
-    case = {"phases": [], "notes": [], "slopes": [], "handshakes": [], "verified": None, "controls": []}
+    case = {"phases": [], "notes": [], "slopes": [], "handshakes": [], "verified": None, "controls": [],
+            "harness": {}}
     for line in path.read_text(errors="replace").splitlines():
         tokens = line.split()
         if len(tokens) < 3 or tokens[0] != "doors":
             continue
         if len(tokens) > 5 and tokens[5] == "clients":
             case["phases"].append(phase(tokens))
-        elif len(tokens) > 5 and tokens[5] in ("excluded:", "failure:"):
+        elif len(tokens) > 5 and tokens[5] in NOTE_KINDS:
             case["notes"].append({"door": tokens[1], "op": tokens[2], "size": tokens[3], "cond": tokens[4],
                                   "kind": tokens[5].rstrip(":"), "why": " ".join(tokens[6:])})
         elif tokens[2] == "slope" and "connections" in tokens:
@@ -74,6 +82,9 @@ def read_case(path):
             case["handshakes"].append(f)
         elif tokens[1] == "verified":
             case["verified"] = " ".join(tokens[2:])
+            case["verified_counts"] = dict(zip(tokens[2:12:2], tokens[3:13:2]))
+        elif tokens[1] == "harness":
+            case["harness"] = dict(zip(tokens[2::2], tokens[3::2]))
         elif tokens[1] == "control":
             case["controls"].append(" ".join(tokens[2:]))
     return case
@@ -150,7 +161,7 @@ def main(top):
     header = lines[0].split("\t")
     plan = [dict(zip(header, l.split("\t"))) for l in lines[1:] if l.strip()]
     cases = {}
-    for path in sorted(raw.glob("box_*.status")):
+    for path in sorted(raw.glob("*.status")):
         name = path.name[:-len(".status")]
         m = NAME.match(name)
         if not m:
@@ -158,7 +169,7 @@ def main(top):
         status = path.read_text().strip()
         rusage = raw / (name + ".rusage")
         cases[name] = {
-            "cond": m["cond"], "arm": m["arm"], "round": int(m["round"]), "status": status,
+            "machine": m["machine"], "cond": m["cond"], "arm": m["arm"], "round": int(m["round"]), "status": status,
             "rusage": json.loads(rusage.read_text()) if rusage.exists() and rusage.read_text().strip() else {},
             "host": read_host(raw / (name + ".host")),
             "run": read_case(raw / (name + ".out")) if (raw / (name + ".out")).exists() else None,
@@ -171,7 +182,7 @@ def main(top):
         if not c["run"]:
             continue
         for p in c["run"]["phases"]:
-            key = (p["door"], p["op"], p["size"], p["cond"], c["arm"])
+            key = (c["machine"], p["door"], p["op"], p["size"], p["cond"], c["arm"])
             cells.setdefault(key, []).append(p)
 
     out = []
@@ -180,80 +191,131 @@ def main(top):
     w("Regenerated by `python3 scripts/doors-tables.py` from the raw outputs in `raw/`. Latency in microseconds "
       "from each operation's intended start (open loop); a dash where the case's samples do not resolve the quantile "
       "at 95% (6 samples for a median, 368 for a p99, 3,688 for a p99.9) or the measure is not given. Several rounds: "
-      "the median of the rounds' values, n summed.\n")
+      "the median of the rounds' values, n summed; a p99.9 only where every round resolved one.\n")
+    order = {s: i for i, s in enumerate(SIZES)}
+
+    def sort_key(k):
+        machine, door, op, size, cond, arm = k
+        return (MACHINES.index(machine) if machine in MACHINES else 99, door.startswith("http@"), door,
+                CONDS.index(cond) if cond in CONDS else 99, order.get(size, 99), OPS.index(op) if op in OPS else 99,
+                ARMS.index(arm) if arm in ARMS else 99)
+
+    def med(ps, field):
+        return median(number(p.get(field)) for p in ps)
+
+    def p999(ps):
+        """A cell's p99.9: the median of its rounds' where every round resolved one on 3,688 or more."""
+        values = [number(p.get("p99.9")) for p in ps]
+        if any(v is None for v in values) or any(int(p.get("ops") or 0) < P999_N for p in ps):
+            return None
+        return median(values)
+
+    def total(ps, field):
+        return sum(int(number(p.get(field)) or 0) for p in ps)
 
     w("## Latency and cost per operation\n")
     w("ops/s is the phase's operations over its elapsed time; lateness p99 is how late an operation started "
       "after its intended start (open loop): where it is near the latency, the door ran at its capacity and the "
       "latency is mostly the queue's.\n")
-    w("Arm A1 and A2 are the timed build (the A/A pair), C the counting build; comparators run the HTTP door "
-      "with A1 as the harness. cpu = the servers' user+system ns/op (from /proc ticks); instr and cycles = "
-      "`perf stat` user-space counts of the servers' processes over the phase; faults = minor faults/op.\n")
-    w("| door | op | size | cond | arm | n | ops/s | lateness p99 | p50 [95%] | p99 | p99.9 | p99.99 | max | cpu ns/op | instr/op | cycles/op | faults/op | failed |")
-    w("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
-    order = {s: i for i, s in enumerate(SIZES)}
-
-    def sort_key(k):
-        door, op, size, cond, arm = k
-        return (door.startswith("http@"), door, CONDS.index(cond) if cond in CONDS else 99,
-                order.get(size, 99), OPS.index(op) if op in OPS else 99, ARMS.index(arm) if arm in ARMS else 99)
-
+    w("Arms A1 and A2 are the timed build (the A/A pair), C the counting build; comparators run the HTTP door "
+      "with A1 as the harness; an arm's -tail cases ask 3,688 operations a sized phase. cpu = the servers' "
+      "user+system ns/op (from /proc ticks); instr and cycles = `perf stat` user-space counts of the servers' "
+      "processes over the phase; faults = minor faults/op; wire = the door's wire bytes/op (the native door's UDP "
+      "payloads, the HTTP door's TCP octets); dgrams = the native door's datagrams/op. ref/unans/skip/diff are the "
+      "operations refused, never answered, skipped (their put had failed) and read back differing; failed are the "
+      "checks' failures.\n")
+    w("| machine | door | op | size | cond | arm | n | ops/s | lateness p99 | p50 [95%] | p99 | p99.9 | p99.99 | max "
+      "| cpu ns/op | instr/op | cycles/op | faults/op | wire B/op | dgrams/op | ref | unans | skip | diff | failed |")
+    w("|" + "---|" * 25)
     for key in sorted(cells, key=sort_key):
         ps = cells[key]
-        door, op, size, cond, arm = key
+        machine, door, op, size, cond, arm = key
         n = sum(int(p.get("ops") or 0) for p in ps)
         if len(ps) == 1:
             p50 = f"{ps[0]['p50']} [{ps[0]['p50_lo']}–{ps[0]['p50_hi']}]"
         else:
-            p50 = show(median(number(p["p50"]) for p in ps))
-        q = {k: show(median(number(p[k]) for p in ps)) for k in ("p99", "p99.9", "p99.99", "max")}
-        failed = sum(int(p.get("failed") or 0) for p in ps)
+            p50 = show(med(ps, "p50"))
+        q = {k: show(med(ps, k)) for k in ("p99", "p99.99", "max")}
         ms = sum(number(p.get("elapsed_ms")) or 0 for p in ps)
         rate = show(n / ms * 1000 if ms else None)
-        late = show(median(number(p.get("lateness_p99")) for p in ps))
-        w(f"| {door} | {op} | {size} | {cond} | {arm} | {n} | {rate} | {late} | {p50} | {q['p99']} | {q['p99.9']} | {q['p99.99']} | "
-          f"{q['max']} | {show(median(per_op_cpu(p) for p in ps), 0)} | "
-          f"{show(median(number(p.get('instructions/op')) for p in ps), 0)} | "
-          f"{show(median(number(p.get('cycles/op')) for p in ps), 0)} | "
-          f"{show(median(number(p.get('minor_faults/op')) for p in ps))} | {failed} |")
+        w(f"| {machine} | {door} | {op} | {size} | {cond} | {arm} | {n} | {rate} | {show(med(ps, 'lateness_p99'))} | "
+          f"{p50} | {q['p99']} | {show(p999(ps))} | {q['p99.99']} | {q['max']} | "
+          f"{show(median(per_op_cpu(p) for p in ps), 0)} | {show(med(ps, 'instructions/op'), 0)} | "
+          f"{show(med(ps, 'cycles/op'), 0)} | {show(med(ps, 'minor_faults/op'))} | {show(med(ps, 'wire_bytes/op'), 0)} | "
+          f"{show(med(ps, 'datagrams/op'))} | {total(ps, 'refused')} | {total(ps, 'unanswered')} | "
+          f"{total(ps, 'skipped')} | {total(ps, 'differed')} | {total(ps, 'failed')} |")
 
-    w("\n## Counts per operation (the counting arm, C)\n")
-    w("The servers' allocator counts per operation across the cell's three `mantle serve` processes, and the "
-      "harness thread's own beside its set-aside work.\n")
-    w("| door | op | size | cond | allocs/op | reallocs/op | moved/op | bytes/op | peak_live/request | client allocs/op | client bytes/op |")
-    w("|---|---|---|---|---|---|---|---|---|---|---|")
-    for key in sorted((k for k in cells if k[4] == "C"), key=sort_key):
+    w("\n## Counts per operation (the counting arms, C and C-tail)\n")
+    w("The servers' allocator counts per operation across the cell's three `mantle serve` processes; their peak "
+      "live heap over the phase above what they held as it began, over the most requests out at once (per request) "
+      "and over the connections the phase held (per connection); the client's (mantle-client or the HTTP request "
+      "writer) and the harness's own set-aside work; the servers' footprint; the harness's threads.\n")
+    w("| machine | door | op | size | cond | arm | allocs/op | reallocs/op | moved/op | bytes/op | peak/request | "
+      "peak/connection | client allocs/op | client bytes/op | harness allocs/op | harness peak B | footprint B | threads |")
+    w("|" + "---|" * 18)
+    for key in sorted((k for k in cells if k[5] in ("C", "C-tail")), key=sort_key):
         ps = cells[key]
-        f = {k: show(median(number(p.get(k)) for p in ps)) for k in
-             ("allocs/op", "reallocs/op", "moved/op", "bytes/op", "peak_live/request", "client_allocs/op",
-              "client_bytes/op")}
-        w(f"| {key[0]} | {key[1]} | {key[2]} | {key[3]} | {f['allocs/op']} | {f['reallocs/op']} | {f['moved/op']} | "
-          f"{f['bytes/op']} | {f['peak_live/request']} | {f['client_allocs/op']} | {f['client_bytes/op']} |")
+        f = {k: show(med(ps, k)) for k in
+             ("allocs/op", "reallocs/op", "moved/op", "bytes/op", "peak_live/request", "peak_live/connection",
+              "client_allocs/op", "client_bytes/op", "harness_allocs/op", "harness_peak_live_bytes",
+              "server_footprint_bytes", "threads")}
+        w(f"| {' | '.join(key)} | {f['allocs/op']} | {f['reallocs/op']} | {f['moved/op']} | {f['bytes/op']} | "
+          f"{f['peak_live/request']} | {f['peak_live/connection']} | {f['client_allocs/op']} | {f['client_bytes/op']} | "
+          f"{f['harness_allocs/op']} | {f['harness_peak_live_bytes']} | {f['server_footprint_bytes']} | {f['threads']} |")
 
-    w("\n## A/A band (A2 against A1)\n")
-    w("Per cell, (A2 − A1) / A1 of the median latency, of the p99 where both resolve it, and of the servers' "
-      "instructions/op; then per condition the median and the 90th percentile of the absolute differences. An effect "
-      "under this band is not resolved by this batch.\n")
+    # The A/A band, cell by cell: A2 against A1 (A2-tail against A1-tail), each measure both resolve.
+    measures = ("ops/s", "p50", "p99", "p99.9", "instructions/op")
+
+    def value(ps, measure):
+        if measure == "ops/s":
+            n = sum(int(p.get("ops") or 0) for p in ps)
+            ms = sum(number(p.get("elapsed_ms")) or 0 for p in ps)
+            return n / ms * 1000 if ms else None
+        if measure == "p99.9":
+            return p999(ps)
+        return med(ps, measure)
+
+    w("\n## A/A band, cell by cell (A2 against A1)\n")
+    w("(A2 − A1) / A1 in percent for each measure both arms resolve; a dash where either does not. An effect in a "
+      "cell under its band is not resolved by this batch.\n")
+    w("| machine | door | op | size | cond | arms | " + " | ".join(measures) + " |")
+    w("|" + "---|" * (6 + len(measures)))
     band = {}
-    for key in cells:
-        if key[4] != "A1":
+    for key in sorted(cells, key=sort_key):
+        arm = key[5]
+        if arm not in ("A1", "A1-tail"):
             continue
-        other = cells.get(key[:4] + ("A2",))
+        other = cells.get(key[:5] + (arm.replace("A1", "A2"),))
         if not other:
             continue
-        for measure in ("p50", "p99", "instructions/op"):
-            a = median(number(p.get(measure)) for p in cells[key])
-            b = median(number(p.get(measure)) for p in other)
+        row = []
+        for measure in measures:
+            a, b = value(cells[key], measure), value(other, measure)
             if a and b is not None:
-                band.setdefault((key[3], measure), []).append((b - a) / a * 100)
-    w("| cond | measure | cells | median abs diff % | p90 abs diff % | median signed diff % |")
-    w("|---|---|---|---|---|---|")
-    for (cond, measure) in sorted(band, key=lambda k: (CONDS.index(k[0]) if k[0] in CONDS else 99, k[1])):
-        d = band[(cond, measure)]
+                d = (b - a) / a * 100
+                band.setdefault((key[0], key[4], measure), []).append(d)
+                row.append(f"{d:+.1f}%")
+            else:
+                row.append("-")
+        w(f"| {' | '.join(key[:5])} | {arm}/{arm.replace('A1', 'A2')} | " + " | ".join(row) + " |")
+
+    w("\n## A/A band by condition\n")
+    w("Per machine and condition, the median and the 90th percentile of the cells' absolute differences above.\n")
+    w("| machine | cond | measure | cells | median abs diff % | p90 abs diff % | median signed diff % |")
+    w("|---|---|---|---|---|---|---|")
+    for (machine, cond, measure) in sorted(band, key=lambda k: (MACHINES.index(k[0]) if k[0] in MACHINES else 99,
+                                                                CONDS.index(k[1]) if k[1] in CONDS else 99, k[2])):
+        d = band[(machine, cond, measure)]
         absd = sorted(abs(x) for x in d)
         p90 = absd[min(len(absd) - 1, int(0.9 * len(absd)))]
-        w(f"| {cond} | {measure} | {len(d)} | {show(statistics.median(absd))} | {show(p90)} | "
+        w(f"| {machine} | {cond} | {measure} | {len(d)} | {show(statistics.median(absd))} | {show(p90)} | "
           f"{show(statistics.median(d))} |")
+
+    w("\n## Transfers behind each reported p99.9\n")
+    resolved = [(k, ps) for k, ps in cells.items() if p999(ps) is not None]
+    least = min((min(int(p.get("ops") or 0) for p in ps) for _, ps in resolved), default=None)
+    w(f"Cells with a p99.9: {len(resolved)}; the fewest transfers behind one round's p99.9: {least} "
+      f"(at least {P999_N} required, measurement.md §5a).\n")
 
     w("\n## Per connection: memory slope and handshakes\n")
     w("| case | door | connections | server live B/conn | server footprint B/conn | client live B/conn | handshakes | allocs/handshake | bytes/handshake | p50 us | max us |")
@@ -268,6 +330,17 @@ def main(top):
             w(f"| {name} | {s['door']} | {s['low']}→{s['high']} | {s['server_live']} | {s['server_footprint']} | "
               f"{s['client_live']} | {h.get('handshakes', '-')} | {h.get('allocs/handshake', '-')} | "
               f"{h.get('bytes/handshake', '-')} | {h.get('p50', '-')} | {h.get('max', '-')} |")
+
+    w("\n## The harness: its own peak and threads, and the run's outcome\n")
+    w("| case | harness peak live B | threads | idle threads | verified |")
+    w("|---|---|---|---|---|")
+    for name in sorted(cases):
+        run = cases[name]["run"]
+        if not run or not (run["harness"] or run["verified"]):
+            continue
+        h = run["harness"]
+        w(f"| {name} | {h.get('peak_live_bytes', '-')} | {h.get('threads', '-')} | {h.get('idle_threads', '-')} | "
+          f"{run['verified'] or '-'} |")
 
     w("\n## QUIC: secnetperf, quinn-perf and bare hyper-quic\n")
     w("Loopback, server and client pinned together. secnetperf `-exec:lowlat -rstream:1 -runtime:5s` (latency per "
@@ -288,10 +361,11 @@ def main(top):
         h, r = c["host"], c["rusage"]
         st, en = h.get("start", {}), h.get("end", {})
         mem = number(st.get("memavailable_kib"))
+        rss = r.get("maxrss", r.get("maxrss_kib")) or 0
+        rss_mib = rss / 1048576 if r.get("maxrss_unit") == "B" else rss / 1024
         w(f"| {name} | {c['status'].split()[0]} | {r.get('wall_s', '-')} | {st.get('load', '-')} | {en.get('load', '-')} | "
           f"{show(mem / 1048576 if mem else None)} | {st.get('psi_io_some10', '-')}→{en.get('psi_io_some10', '-')} | "
-          f"{show(r.get('user_s'))} | {show(r.get('system_s'))} | {show((r.get('maxrss_kib') or 0) / 1024)} | "
-          f"{r.get('majflt', '-')} |")
+          f"{show(r.get('user_s'))} | {show(r.get('system_s'))} | {show(rss_mib)} | {r.get('majflt', '-')} |")
 
     compare = Path("/home/adalundhe/Projects/mantle-compare/COMPARATORS.md")
     if compare.exists():
@@ -311,7 +385,9 @@ def main(top):
     rows = []
     for p in plan:
         kind, cond, arm, rnd = p["kind"], p["condition"], p["arm"], p["round"]
-        name = f"box_{cond}_{'quic-' + arm if kind == 'quic' else arm}_r{rnd}"
+        machine = p.get("machine", "box")
+        label = {"quic": "quic-" + arm, "tail": arm + "-tail"}.get(kind, arm)
+        name = f"{machine}_{cond}_{label}_r{rnd}"
         c = cases.get(name)
         if not c:
             tally["not run"] += 1
@@ -324,7 +400,8 @@ def main(top):
         if state == "completed" and c["run"]:
             notes = c["run"]["notes"]
             excl = sorted({f"{n['door']} {n['op']} {n['size']}: {n['why']}" for n in notes if n["kind"] == "excluded"})
-            fail = sorted({f"{n['door']} {n['op']} {n['size']}: {n['why']}" for n in notes if n["kind"] == "failure"})
+            fail = sorted({f"{n['door']} {n['op']} {n['size']} {n['kind']}: {n['why']}" for n in notes
+                           if n["kind"] != "excluded"})
             detail = f"{secs} s; verified {c['run']['verified']}"
             if excl:
                 detail += f"; {len(excl)} phases excluded by the server: " + "; ".join(excl)

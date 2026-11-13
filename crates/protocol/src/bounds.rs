@@ -336,9 +336,10 @@ const STREAM_BYTES: u64 = 95;
 const EXCHANGE_BYTES: u64 = 2_151;
 
 /// What a server's handshake takes, once a certificate, to compress the certificate (RFC 8879):
-/// hyper-tls's brotli at quality 11 and a 4 MiB window, measured, 34,267,200 bytes, given back as
-/// the handshake goes on.
-pub const CERTIFICATE_COMPRESSION_BYTES: u64 = 34_267_200;
+/// hyper-tls's brotli at quality 11 with a window the certificate's length (1 KiB), measured,
+/// 721,474 bytes for the longest certificate a node carries (365 bytes, the name of id
+/// `u64::MAX`), given back as the handshake goes on (mantle-node's `tests/transport_memory.rs`).
+pub const CERTIFICATE_COMPRESSION_BYTES: u64 = 721_474;
 
 /// The most bytes a transport of `stated` holds beside its budget (`transport_bytes`): what the
 /// budget does not charge.
@@ -352,9 +353,10 @@ pub const CERTIFICATE_COMPRESSION_BYTES: u64 = 34_267_200;
 ///   socket of its own, and a node's plane's, each at what hyper-rt states one holds
 ///   (`Io::held_bound`).
 ///
-/// QUIC's datagrams are none: no node or client sends them, though hyper-quic's default takes up to
-/// 1,250,000 bytes of them a connection. What aws-lc keeps of keys is in its own heap, which a
-/// counting allocator does not see.
+/// QUIC's datagrams are none: no node or client sends them, and no endpoint offers to take them
+/// (hyper-transport's `Limits::transport`; hyper-quic's default took up to 1,250,000 bytes of them a
+/// connection). What aws-lc keeps of keys is in its own heap, which a counting allocator does not
+/// see.
 pub fn beside(stated: &Stated, serves: bool) -> Option<u64> {
     let limits = limits(stated).ok()?;
     let count = |n: usize| u64::try_from(n).ok();

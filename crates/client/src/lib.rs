@@ -14,7 +14,7 @@
 //! verifies; it presents its own, which the authority issued for the client role (node.md §3.6),
 //! and takes no connection it did not dial. A certificate is neither compressed nor asked
 //! compressed (RFC 8879 makes compression optional): one is a few hundred bytes, and brotli's
-//! compression of one took 34 MB (`mantle_protocol::bounds::CERTIFICATE_COMPRESSION_BYTES`).
+//! compression of one takes 0.7 MB (`mantle_protocol::bounds::CERTIFICATE_COMPRESSION_BYTES`).
 //!
 //! **What it asks again.** Every mutation carries its operation's identity ([`identity`]), which
 //! each attempt carries unchanged (gateway.md §2.1). A request is asked again, of the next node,

@@ -78,7 +78,9 @@ uncompressed.
 [9] mantle's own measurements: `crates/protocol/src/bounds.rs` `CERTIFICATE_COMPRESSION_BYTES`,
 34,267,200 bytes for hyper-tls's brotli at quality 11 compressing one certificate, measured by
 mantle-node's `tests/transport_memory.rs`; an Ed25519 certificate of this profile is a few hundred
-bytes (`crates/cert`).
+bytes (`crates/cert`). Since 2026-11-12 the constant states 721,474 bytes: hyper-tls takes a window
+of the certificate's length (hyper-raft e4bca91), measured for the longest node certificate, 365
+bytes.
 
 [10] AWS CLI Command Reference, "AWS CLI S3 Configuration",
 https://docs.aws.amazon.com/cli/latest/topic/s3-config.html: `multipart_threshold`, "Default -

@@ -310,12 +310,12 @@ measures the second, and derives the rest by these rules:
   length known before encoding would remove.
   *Open:* the transport's own structures are measured, where hyper-transport and hyper-quic state
   none as hyper-rt states a socket's: asked of hyper-raft's owner, an endpoint's and a
-  connection's bound stated from their limits, as `Io::held_bound` is; hyper-tls compresses a
-  certificate of a few hundred bytes with brotli's 4 MiB window at quality 11, 34.3 MB for a moment
-  at a server's first handshake under it, which a window the size of the certificate would make
-  kilobytes; and hyper-quic takes QUIC datagrams, which no consumer sends, up to 1,250,000 bytes a
-  connection by default. aws-lc keeps keys in its own heap, which a counting allocator does not
-  see.
+  connection's bound stated from their limits, as `Io::held_bound` is. hyper-tls compresses a
+  certificate of a few hundred bytes at quality 11 with a window its own length, 721,474 bytes for
+  a moment at a server's first handshake (`CERTIFICATE_COMPRESSION_BYTES`; 34.3 MB with brotli's
+  4 MiB window before). hyper-quic took QUIC datagrams, which no consumer sends, up to 1,250,000
+  bytes a connection by default; since hyper-raft c97fb1a (branch doors-step8) no endpoint offers
+  to take any. aws-lc keeps keys in its own heap, which a counting allocator does not see.
   *Open:* the snapshot path holds whole images, the one class the floor does not bound yet: a
   range's image is every row scanned and copied (`Stored::image`), encoded again for its message,
   kept by the shell and by the core's log until it is installed, framed and copied again by the

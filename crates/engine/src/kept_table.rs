@@ -16,6 +16,7 @@
 use crate::branch::Op;
 use crate::error::{Error, Malformed};
 use crate::port::mmap::HugeZeroed;
+use hyper_rt::machine::bench::{MIN_SAMPLES, TIMER_OVERHEAD_FACTOR};
 
 /// A slot's header: the memtable's number's low 16 bits (2 bytes; [`older16`]), the displacement
 /// plus one (0: empty), the flags, the record's place (4: the key's 32-bit filter hash, which names
@@ -36,10 +37,6 @@ const LINE: usize = 64;
 /// A record list's header: the 32-bit hash (4), the operation (1), the key's length (4) and the
 /// value's (4).
 const LIST_HEAD: usize = 13;
-/// Records a merge places together, their home slots read first, back to back, so their misses
-/// are out at once rather than each in turn (group prefetching: Chen, Ailamaki, Gibbons and
-/// Mowry, ICDE 2004).
-const GROUP: usize = 16;
 
 /// What a table answers for a key.
 #[derive(Debug, PartialEq, Eq)]
@@ -316,6 +313,8 @@ pub struct RecordTable {
     /// The top bits of a place that chose this table among an index's parts ([`part_of`]): its
     /// records share them, so a home is reduced from the bits below.
     shift: u32,
+    /// How many records a merge places at once, learned on this table ([`Grouping`]).
+    grouping: Grouping,
 }
 
 impl std::fmt::Debug for RecordTable {
@@ -352,6 +351,7 @@ impl RecordTable {
             spill: Vec::new(),
             scratch: Vec::new(),
             shift: bits,
+            grouping: Grouping::new(),
         }
     }
 
@@ -680,6 +680,9 @@ impl RecordTable {
             spill: Vec::new(),
             scratch: Vec::new(),
             shift: self.shift,
+            // Grown, the table learns its group again: how far its misses overlap moves with its
+            // size against the host's caches.
+            grouping: Grouping::new(),
         };
         for i in 0..self.slots {
             let Some(s) = self.at(i) else {
@@ -788,36 +791,54 @@ impl RecordTable {
             self.rebuild(need.saturating_add(need / 2), oldest)?;
         }
         let mut records = list.records();
+        let mut group: Vec<Record<'_>> = Vec::new();
+        let overhead = clock_cost();
+        let mut last = hyper_rt::machine::clock::monotonic_ns();
         loop {
-            let mut group: [Option<Record<'_>>; GROUP] = [None; GROUP];
-            let mut taken = 0usize;
-            for slot in &mut group {
+            let size = self.grouping.next_size();
+            group.clear();
+            if group.try_reserve(size).is_err() {
+                return Err(Error::LimitExceeded {
+                    what: "a kept index merge's group",
+                    limit: u64::try_from(size).unwrap_or(u64::MAX),
+                });
+            }
+            while group.len() < size {
                 match records.next() {
-                    Some(r) => *slot = Some(r?),
+                    Some(r) => group.push(r?),
                     None => break,
                 }
-                taken = taken.saturating_add(1);
             }
-            if taken == 0 {
+            if group.is_empty() {
                 return Ok(());
             }
-            let touched = group
-                .iter()
-                .flatten()
-                .fold(0u8, |t, r| t ^ self.touch(r.hash32));
+            let touched = group.iter().fold(0u8, |t, r| t ^ self.touch(r.hash32));
             std::hint::black_box(touched);
-            for r in group.iter().flatten() {
+            let mut grew = false;
+            for r in &group {
                 self.image(number, r.hash32, r)?;
                 if !self.place_scratch(r.hash32, r.key) {
                     // A run too long: grown, and placed again.
                     let room = self.live.saturating_add(self.live / 2).saturating_add(1);
                     self.rebuild(room, oldest)?;
+                    grew = true;
                     self.image(number, r.hash32, r)?;
                     if !self.place_scratch(r.hash32, r.key) {
                         return Err(corrupt());
                     }
                 }
             }
+            let now = hyper_rt::machine::clock::monotonic_ns();
+            // A group that grew the table timed the rebuild too, and the table learns afresh.
+            if !grew {
+                self.grouping.observe(
+                    size,
+                    group.len(),
+                    now.saturating_sub(last).saturating_sub(overhead),
+                    overhead,
+                );
+            }
+            last = now;
         }
     }
 
@@ -833,6 +854,99 @@ impl RecordTable {
             .count();
         self.rebuild(live, oldest)
     }
+}
+
+/// How many records a merge places at once, learned on the table that merges them. Placing a
+/// record reads its home slot, a miss once the table outgrows the host's caches; a group reads its
+/// records' home slots first, back to back, so their misses are out together (group prefetching:
+/// Chen, Ailamaki, Gibbons and Mowry, ICDE 2004). What a group trades: its probes' misses overlap,
+/// while the lines they touch (a slot's bytes over the host's cache line: 64 on x86_64 and Arm's
+/// cores, 128 on Apple silicon) wait in the core until the group is placed. So a record placed costs
+/// less as the group grows until the core has as many misses out as it can keep, and no less
+/// after. The table measures that point rather than assuming one core's: groups of the size it
+/// holds alternate with groups twice that, each timed on the monotonic clock (its cost per reading
+/// taken off each), until each side has [`MIN_SAMPLES`] groups (Wilks's sample for a bound on the
+/// 95th percentile, hyper-rt's least) spanning at least [`TIMER_OVERHEAD_FACTOR`] times the clock's
+/// cost per reading (hyper-rt's bound for a sample its clock cannot move out of a converged
+/// interval); the larger size is kept while it places a record in less time, and the search
+/// settles at the first size that does not. A rebuild learns again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Grouping {
+    /// The size the table holds: settled, or the smaller of the two on trial.
+    size: usize,
+    /// None once settled; else the two sizes' samples, the held size's first.
+    trial: Option<[Sample; 2]>,
+    /// The next group's side of the trial.
+    larger_next: bool,
+}
+
+/// One size's groups, records placed and nanoseconds taken in a trial.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Sample {
+    groups: usize,
+    records: u64,
+    ns: u64,
+}
+
+impl Grouping {
+    /// A table's first: one record a group, its candidate two.
+    fn new() -> Self {
+        Grouping {
+            size: 1,
+            trial: Some([Sample::default(); 2]),
+            larger_next: false,
+        }
+    }
+
+    /// The size of the next group.
+    fn next_size(&self) -> usize {
+        if self.trial.is_some() && self.larger_next {
+            self.size.saturating_add(self.size)
+        } else {
+            self.size
+        }
+    }
+
+    /// Counts a group of `size` that placed `records` in `ns` toward its side of the trial, the
+    /// clock's cost per reading `overhead`; when both sides have spanned their bound, keeps the
+    /// larger size and tries twice it if a record took less there, else settles.
+    fn observe(&mut self, size: usize, records: usize, ns: u64, overhead: u64) {
+        let Some(samples) = self.trial.as_mut() else {
+            return;
+        };
+        let side = usize::from(size != self.size);
+        if let Some(s) = samples.get_mut(side) {
+            s.groups = s.groups.saturating_add(1);
+            s.records = s
+                .records
+                .saturating_add(u64::try_from(records).unwrap_or(u64::MAX));
+            s.ns = s.ns.saturating_add(ns);
+        }
+        self.larger_next = !self.larger_next;
+        let span = overhead.max(1).saturating_mul(TIMER_OVERHEAD_FACTOR);
+        let [held, larger] = *samples;
+        let enough = |x: &Sample| x.groups >= MIN_SAMPLES && x.ns >= span && x.records > 0;
+        if !enough(&held) || !enough(&larger) {
+            return;
+        }
+        // Per record, compared without division: held.ns / held.records > larger.ns / larger.records.
+        let faster = u128::from(held.ns).saturating_mul(u128::from(larger.records))
+            > u128::from(larger.ns).saturating_mul(u128::from(held.records));
+        if faster {
+            self.size = self.size.saturating_add(self.size);
+            *samples = [Sample::default(); 2];
+            self.larger_next = false;
+        } else {
+            self.trial = None;
+        }
+    }
+}
+
+/// The monotonic clock's cost per reading, measured once in a process (hyper-rt's
+/// `timer_overhead_ns`).
+fn clock_cost() -> u64 {
+    static COST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *COST.get_or_init(hyper_rt::machine::bench::timer_overhead_ns)
 }
 
 fn corrupt() -> Error {
@@ -888,6 +1002,59 @@ fn klen_of(s: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Feeds a learner groups whose record costs `cost(size)` gives, alternating as it asks, and
+    /// returns the size it settles at.
+    fn settle(cost: impl Fn(usize) -> u64) -> usize {
+        let mut g = Grouping::new();
+        // The clock's cost per reading: one nanosecond, so the samples' span is the factor.
+        for _ in 0..1_000_000 {
+            if g.trial.is_none() {
+                return g.size;
+            }
+            let size = g.next_size();
+            g.observe(size, size, cost(size).saturating_mul(size as u64), 1);
+        }
+        panic!("never settled: {g:?}");
+    }
+
+    /// A record placed costs less until the group reaches what overlaps every miss, and the same
+    /// past it: the learner doubles while the larger size is faster and keeps the last that was.
+    #[test]
+    fn a_table_learns_the_group_past_which_a_record_costs_no_less() {
+        // Misses of 100 ns overlapped up to 8 at a time, 5 ns of placing a record.
+        let cost = |size: usize| 5 + 100 / size.min(8) as u64;
+        assert_eq!(settle(cost), 8);
+        // Nothing to overlap (the table in cache): one record a group is as good as any.
+        assert_eq!(settle(|_| 7), 1);
+        // A larger group that costs more past 4 (its lines crowd the core) settles at 4.
+        assert_eq!(
+            settle(|size: usize| if size <= 4 { 100 / size as u64 } else { 30 }),
+            4
+        );
+    }
+
+    /// A grown table learns its group again, from one record a group: what its misses overlap
+    /// moves with its size against the caches.
+    #[test]
+    fn a_rebuilt_table_learns_its_group_again() {
+        let mut t = RecordTable::new();
+        t.grouping.size = 16;
+        t.grouping.trial = None;
+        let batch: BTreeMap<Vec<u8>, (Op, Vec<u8>)> = (0..64u32)
+            .map(|i| {
+                (
+                    format!("key{i:04}").into_bytes(),
+                    (Op::Put, vec![b'v'; 100]),
+                )
+            })
+            .collect();
+        // Its first records: the empty table grows to take them, and learns from the start.
+        t.merge(1, &list_of(&batch), 1).unwrap();
+        assert_eq!(t.len(), 64);
+        assert_eq!(t.grouping.size, 1);
+        assert!(t.grouping.trial.is_some());
+    }
     use std::collections::BTreeMap;
 
     fn h(k: &[u8]) -> u32 {

@@ -67,11 +67,17 @@ Before its job uploads it, each target's archive is checked as a user takes it, 
 1. The archive's SHA-256 is the one beside it, and it holds exactly the directory, the binary at
    mode 755, `LICENSE` and `README.md`.
 2. The unpacked binary says `mantle VERSION`.
-3. It makes a cell of three on loopback with `mantle init`, each founder's QUIC, plane and S3 ports
-   stated (each one the OS gave free), its volume in a directory of its own and its failure domain
-   its own. It serves the cell as three `mantle serve` processes from what init wrote, each waited
-   for until it says it bound the stated addresses and that the cell's root range enlisted it, and
-   then ready to `mantle status`.
+3. It makes a cell of three with `mantle init`, each founder's QUIC, plane and S3 ports stated
+   (each one the OS gave free), its volume in a directory of its own and its failure domain its own:
+   all on loopback but the first founder's S3 endpoint, at every address and named `localhost`, which
+   init serves under TLS, certifies for that name and writes into both profiles as
+   `https://localhost:PORT` with its authority as `ca_bundle`. Every S3 client of the check, the S3
+   door and the AWS CLI alike, dials it by a name of two addresses, `::1` and `127.0.0.1`, which the
+   listener at `0.0.0.0` answers on the second; on Windows the refused first costs about 2 s of SYN
+   retries before the second answers, a cost of the platform, not a wait the check makes. It
+   serves the cell as three `mantle serve` processes from what init wrote, each waited for until it
+   says it bound the stated addresses and that the cell's root range enlisted it, and then ready to
+   `mantle status`.
 4. Through each of the client's doors in turn (docs/design/doors.md), `--door native`, the native
    protocol over QUIC, and `--door s3`, S3's HTTP API SigV4-signed at the endpoint of the S3 profile
    `mantle init client` gave the client, as the client of a directory `mantle init client` made,
@@ -90,6 +96,10 @@ Before its job uploads it, each target's archive is checked as a user takes it, 
    put; both list the buckets, a bucket's keys and its uploads line for line alike, and head the
    same objects alike; `ls` through the door `MANTLE_DOOR` names, as the client `MANTLE_CLIENT`
    names, says what `--door s3 --client` says.
+   The S3 door is asked again over plain HTTP too: a copy of the client whose S3 profile names the
+   second founder's loopback endpoint, `http://127.0.0.1:PORT`, runs `mb`, `cp` from a file and from
+   standard input, up and back, `ls`, `head`, `rm` and `rb`, each object read back through the native
+   door.
 6. The stock client, the AWS CLI v2 with the profile `mantle init` wrote (its environment's own
    `AWS_*` variables removed, as they outrank a profile): `s3 mb`, `s3 cp` of an object below the
    CLI's 8 MiB multipart threshold and one past it, up and back, `s3 ls` with their sizes and

@@ -188,20 +188,26 @@ def same(what, got, want):
 
 
 def free_addresses(count):
-    """COUNT founders' loopback addresses, each a QUIC and a plane port (UDP) and an S3 port (TCP)
-    the operating system gives free, all held until every one is drawn so none repeats."""
+    """COUNT founders' addresses, each a QUIC and a plane port (UDP) and an S3 port (TCP) the
+    operating system gives free, all held until every one is drawn so none repeats: loopback, but
+    the first founder's S3 endpoint, at every address (0.0.0.0), which init serves under TLS
+    (node.md §4.1; docs/design/release.md §2)."""
     held = []
 
-    def port(kind):
+    def port(kind, host="127.0.0.1"):
         s = socket.socket(socket.AF_INET, kind)
         held.append(s)
-        s.bind(("127.0.0.1", 0))
-        return f"127.0.0.1:{s.getsockname()[1]}"
+        s.bind((host, 0))
+        return f"{host}:{s.getsockname()[1]}"
 
     try:
         return [
-            (port(socket.SOCK_DGRAM), port(socket.SOCK_DGRAM), port(socket.SOCK_STREAM))
-            for _ in range(count)
+            (
+                port(socket.SOCK_DGRAM),
+                port(socket.SOCK_DGRAM),
+                port(socket.SOCK_STREAM, "0.0.0.0" if n == 0 else "127.0.0.1"),
+            )
+            for n in range(count)
         ]
     finally:
         for s in held:
@@ -294,7 +300,14 @@ def session(mantle, root):
     out = root / "cell"
     args = ["init", out, "--max-nodes", len(volumes), "--max-volumes", len(volumes)]
     for n, ((quic, plane, s3), volume) in enumerate(zip(addresses, volumes), 1):
-        args += ["--node", f"quic={quic},plane={plane},s3={s3},domain=rack-{n},volume={volume}:{VOLUME}"]
+        # The first founder's endpoint is named `localhost`, which init certifies and its
+        # profiles name, `https://localhost:PORT`: every S3 client of the check dials it under TLS,
+        # by a name that resolves to ::1 and 127.0.0.1 alike.
+        name = ",name=localhost" if n == 1 else ""
+        args += [
+            "--node",
+            f"quic={quic},plane={plane},s3={s3}{name},domain=rack-{n},volume={volume}:{VOLUME}",
+        ]
     made = said(run([mantle, *args]))
     print(made, end="")
     # The Nth `node` line is the Nth --node's founder; a path ends at a colon and a space, never
@@ -327,7 +340,13 @@ def session(mantle, root):
         print("the cell of three serves: each founder enlisted, and ready to `mantle status`")
         client = root / "client"
         print(said(run([mantle, "init", "client", client, "--cell", out])), end="")
+        endpoint = endpoint_url(client / "s3" / "config")
+        port = addresses[0][2].rsplit(":", 1)[1]
+        if endpoint != f"https://localhost:{port}":
+            raise Failed(f"the client's S3 profile names {endpoint}, not https://localhost:{port}")
+        print(f"the S3 door's endpoint: {endpoint}, TLS under the endpoint's authority")
         doors(mantle, client, out / "s3", root / "objects")
+        plain(mantle, client, addresses[1][2], root / "plain")
         # Its peers serving on, a founder stops in order: its ranges handed over, exiting 0.
         status = nodes[0].stop()
         if status != 0:
@@ -672,6 +691,63 @@ def removed(mantle, client, put):
         if set(buckets) & {"native", "s3", "stock"}:
             raise Failed(f"--door {door} ls lists a removed bucket: {buckets}")
     print("removed: mantle rm and rb through each door")
+
+
+def endpoint_url(config):
+    """The `endpoint_url` of the `[profile mantle]` a config file states."""
+    inside = False
+    for line in config.read_text().splitlines():
+        if line.startswith("["):
+            inside = line.strip() == "[profile mantle]"
+        elif inside and not line[:1].isspace() and line.split("=", 1)[0].strip() == "endpoint_url":
+            return line.split("=", 1)[1].strip()
+    raise Failed(f"{config} names no endpoint_url")
+
+
+def plain(mantle, client, s3, dir):
+    """The S3 door over plain HTTP, as a loopback endpoint serves it: a copy of the client whose S3
+    profile names the founder listening at S3, `http://S3`, asks mb, cp from a file and from standard
+    input, up and back, ls, head, rm and rb, each object read back through the native door."""
+    copy = dir / "client"
+    shutil.copytree(client, copy, ignore=shutil.ignore_patterns("journal"))
+    config = copy / "s3" / "config"
+    lines = [
+        f"endpoint_url = http://{s3}" if l.split("=", 1)[0].strip() == "endpoint_url" else l
+        for l in config.read_text().splitlines()
+        if l.split("=", 1)[0].strip() != "ca_bundle"
+    ]
+    config.write_text("\n".join(lines) + "\n")
+    if endpoint_url(config) != f"http://{s3}":
+        raise Failed(f"{config} names {endpoint_url(config)}, not http://{s3}")
+
+    def asked(*args, input=None, ok=True):
+        return run([mantle, "--client", copy, "--door", "s3", *args], input=input, ok=ok)
+
+    if "made s3://plain" not in said(asked("mb", "s3://plain")):
+        raise Failed("mantle --door s3 mb over plain HTTP said no bucket made")
+    from_file, from_stdin = object_bytes(60, (3 << 20) + 5), object_bytes(61, CLI_PART + 7)
+    source = dir / "from-file"
+    source.write_bytes(from_file)
+    asked("cp", source, "s3://plain/file")
+    back = dir / "file.back"
+    asked("cp", "s3://plain/file", back)
+    same("cp over plain HTTP to a file", back.read_bytes(), from_file)
+    asked("cp", "-", "s3://plain/stdin", input=from_stdin)
+    same("cp over plain HTTP to standard output", asked("cp", "s3://plain/stdin", "-").stdout, from_stdin)
+    for key, data in (("file", from_file), ("stdin", from_stdin)):
+        same(f"--door native cp of plain/{key}", through(mantle, client, "native", "cp", f"s3://plain/{key}", "-").stdout, data)
+        if f"size {len(data)}" not in said(asked("head", f"s3://plain/{key}")).splitlines():
+            raise Failed(f"head of plain/{key} over plain HTTP")
+    keys = said(asked("ls", "s3://plain/"))
+    for key, data in (("file", from_file), ("stdin", from_stdin)):
+        if not any(l.split()[1:] == [str(len(data)), key] for l in keys.splitlines()):
+            raise Failed(f"ls over plain HTTP lists no {len(data)} {key}: {keys}")
+    asked("rm", "s3://plain/file")
+    asked("rm", "s3://plain/stdin")
+    if "removed s3://plain" not in said(asked("rb", "s3://plain")):
+        raise Failed("rb over plain HTTP said no bucket removed")
+    print(f"the S3 door over plain HTTP at http://{s3}: mb, cp from a file and standard input, up and "
+          "back, ls, head, rm, rb; each object read back through the native door")
 
 
 def transfer(mantle, root):

@@ -31,29 +31,9 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
 jobs:
-  version:
-    runs-on: ubuntu-24.04
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: The workspace's version, which a tag must name
-        id: version
-        env:
-          REF_TYPE: ${{ github.ref_type }}
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
-          if [ "$REF_TYPE" = tag ] && [ "$REF_NAME" != "v$version" ]; then
-            echo "release: the tag $REF_NAME is not v$version, the workspace's version" >&2
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
+  # No job waits on another to begin: a job that needs another is queued only once that one
+  # completes (docs/research/85 [17]), so each target's job reads the version itself.
   build:
-    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -70,13 +50,20 @@ jobs:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     env:
-      VERSION: ${{ needs.version.outputs.version }}
       BINARY: target/${{ matrix.target }}/release/${{ contains(matrix.target, 'windows') && 'mantle.exe' || 'mantle' }}
-      ARCHIVE: dist/mantle-${{ needs.version.outputs.version }}-${{ matrix.target }}.${{ contains(matrix.target, 'windows') && 'zip' || 'tar.gz' }}
+      EXTENSION: ${{ contains(matrix.target, 'windows') && 'zip' || 'tar.gz' }}
+      TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The workspace's version, which a pushed tag must name (scripts/release.py version).
+      - name: The workspace's version, which a tag must name
+        shell: bash
+        run: |
+          version="$(${{ matrix.python }} scripts/release.py version)"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "ARCHIVE=dist/mantle-$version-$TARGET.$EXTENSION" >> "$GITHUB_ENV"
       - name: Install pinned Rust
         shell: bash
         run: |
@@ -105,14 +92,14 @@ jobs:
         run: ${{ matrix.python }} scripts/release.py check "$VERSION" ${{ matrix.target }} "$ARCHIVE"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: mantle-${{ needs.version.outputs.version }}-${{ matrix.target }}
+          name: mantle-${{ env.VERSION }}-${{ matrix.target }}
           path: dist/
           if-no-files-found: error
 
   publish:
     # A pushed tag alone publishes; a manual run on a tag is a dry run like any other.
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [version, build]
+    needs: [build]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -121,8 +108,11 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       TAG: ${{ github.ref_name }}
-      VERSION: ${{ needs.version.outputs.version }}
     steps:
+      # The version the tag names, which every target's job held to the workspace's before it
+      # built; this job runs no code of the repository's.
+      - name: The version the tag names
+        run: echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist

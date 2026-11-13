@@ -126,13 +126,18 @@ gates, boto3 pinned with every hash. A failed check prints each node's last outp
 
 `.github/workflows/release.yml`:
 
-- A pushed tag `v*` runs everything. The `version` job reads the workspace's version and refuses a
-  tag that names another. One job a target builds, packs and checks its archive, then uploads it as
-  the run's artifact (research/85 [6]). Once all five pass, `publish` downloads them, checks each
+- A pushed tag `v*` runs everything. One job a target reads the workspace's version itself
+  (`scripts/release.py version`), refusing a tag that names another, then builds, packs and checks
+  its archive and uploads it as the run's artifact (research/85 [6]). No target's job waits on
+  another job to begin: a job that needs another is queued only once that one completes (research/85
+  [17]), so under a full queue a job of its own for the version would have the targets wait in line
+  twice, once behind what was queued before the push and again behind what was queued while it
+  waited. Once all five pass, `publish` downloads them, checks each
   archive's SHA-256 again, requires a run of the gates (`ci.yml`) that passed for the tagged commit,
   and creates the tag's release with every archive and checksum, which `gh release create` keeps a
   draft until every asset is up [7]; a version with a pre-release part (`0.2.0-rc.1`) is marked a
-  pre-release. Its notes are GitHub's generated ones after a line naming this document. A publish
+  pre-release; `publish` takes the version from the tag, which every target's job held to the
+  workspace's. Its notes are GitHub's generated ones after a line naming this document. A publish
   that fails part way leaves at most a draft, deleted before the job is run again.
 - Every push to a branch and every pull request runs everything but `publish`, the same check a
   tag's run makes, so what a tag publishes is what its pull request proved; a pull request's run
@@ -140,7 +145,7 @@ gates, boto3 pinned with every hash. A failed check prints each node's last outp
   [15]): the binary is built from everything else, and the archive's `README.md` and `LICENSE` sit
   outside `docs/`. A manual run (`workflow_dispatch`, once the workflow is on the default branch
   [3]) does the same, even on a tag. Its cost is runners held at once, not money (the repository is
-  public, research/85 [14]): six jobs a run, one of them macOS, of the 5 macOS jobs a Free plan runs
+  public, research/85 [14]): five jobs a run, one of them macOS, of the 5 macOS jobs a Free plan runs
   at once [12], beside the gates' two for each push and pull request.
 - Only `publish` may write, and only the repository's contents, beside reading the gates' runs;
   every other job reads alone, and `publish` runs no code of the repository's [5]. A pull request

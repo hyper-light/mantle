@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """The release's archives (docs/design/release.md; .github/workflows/release.yml).
 
+`version` prints the workspace's version (`[workspace.package]` in Cargo.toml), which every archive
+names, and refuses a pushed tag that is not `vVERSION`, as GitHub names the ref a run is for
+(`GITHUB_REF_TYPE`, `GITHUB_REF_NAME`). Each target's job asks it for itself, so no job waits on
+another's to begin (research/85 [17]).
+
 `package VERSION TARGET BINARY OUT` puts the `mantle` binary built for TARGET in OUT as the
 archive `mantle-VERSION-TARGET.tar.gz` (`.zip` for Windows) beside the repository's LICENSE and
 README.md under one directory of the archive's own name, and writes the archive's SHA-256 beside
@@ -789,9 +794,34 @@ def check(version, target, archive):
     print(f"{name}: server and client through both doors, every byte as put")
 
 
+def version():
+    """The workspace's version, read from Cargo.toml's `[workspace.package]` without `tomllib`,
+    which Python 3.10, Ubuntu 22.04's, lacks: the section's `version = "..."` line. Refused where
+    the run is for a tag that does not name it."""
+    inside, found = False, None
+    for line in (ROOT / "Cargo.toml").read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            inside = stripped == "[workspace.package]"
+        elif inside and stripped.split("=", 1)[0].strip() == "version":
+            value = stripped.split("=", 1)[1].strip()
+            if len(value) < 2 or value[0] != '"' or value[-1] != '"':
+                raise Failed(f"Cargo.toml's [workspace.package] version is not a string: {value}")
+            found = value[1:-1]
+            break
+    if not found:
+        raise Failed("Cargo.toml states no [workspace.package] version")
+    if os.environ.get("GITHUB_REF_TYPE") == "tag":
+        tag = os.environ.get("GITHUB_REF_NAME", "")
+        if tag != f"v{found}":
+            raise Failed(f"the tag {tag} is not v{found}, the workspace's version")
+    return found
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     steps = parser.add_subparsers(dest="step", required=True)
+    steps.add_parser("version")
     made = steps.add_parser("package")
     made.add_argument("version")
     made.add_argument("target")
@@ -805,7 +835,9 @@ def main():
     # Each line as it is said, interleaved with the commands' own in the job's log.
     sys.stdout.reconfigure(line_buffering=True)
     try:
-        if args.step == "package":
+        if args.step == "version":
+            print(version())
+        elif args.step == "package":
             package(args.version, args.target, args.binary, args.out)
         else:
             check(args.version, args.target, args.archive)

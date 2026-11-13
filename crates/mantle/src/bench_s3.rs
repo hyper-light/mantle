@@ -27,7 +27,7 @@ use hyper_tls::pki_types::{CertificateDer, ServerName};
 use hyper_tls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned, version};
 use mantle_cert::{EndpointKey, EndpointName, Serial, Validity};
 use mantle_node::door::{self, Answer, Doorway, Piece};
-use mantle_node::listener::{Listener, PIECE, Settings, TASKS};
+use mantle_node::listener::{Listener, PIECE, Settings, tasks};
 use mantle_node::process::AccessKey;
 use mantle_protocol::object::{Op, Reply, Status};
 use mantle_s3::checksum::{self, Algorithm};
@@ -168,7 +168,7 @@ fn host(doorway: &mut Doorway, jobs: &mut Vec<Job>, object: &Bytes) {
 /// served or answered refused, with a timer for each connection's wait on its client, and a socket
 /// for the listener and each connection, read and written.
 fn runtime() -> Result<LocalRuntime, Error> {
-    let connections = usize::try_from(TASKS).map_err(setup)?;
+    let connections = usize::try_from(tasks(SERVED)).map_err(setup)?;
     let tasks = connections.checked_add(2).ok_or_else(|| setup("tasks"))?;
     let timers = connections.checked_add(1).ok_or_else(|| setup("timers"))?;
     LocalRuntime::new(&RuntimeConfig {
@@ -222,6 +222,7 @@ fn serve(tls: Option<(Vec<u8>, Vec<u8>)>) -> Result<Serving, Error> {
                             }],
                             tls,
                             node: 1,
+                            connections: SERVED,
                         },
                         submitter,
                     )
@@ -252,6 +253,9 @@ fn serve(tls: Option<(Vec<u8>, Vec<u8>)>) -> Result<Serving, Error> {
 
 /// The door's bound: one request at a time from the bench's one client.
 const CONNECTIONS_DOOR: usize = 1;
+
+/// The connections the bench's listener serves: its one client's.
+const SERVED: u64 = 1;
 
 /// The key a get of no bytes names.
 const EMPTY: &str = "empty";

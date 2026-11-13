@@ -425,6 +425,9 @@ struct Held {
     bounds: mantle_protocol::bounds::Stated,
     beside: u64,
     ranges_bytes: u64,
+    /// The S3 listener's connections, one an operation, each at what it holds
+    /// (`listener::CONNECTION_BYTES`); none for a node with no S3 endpoint.
+    listener: u64,
 }
 
 /// Why the settings cannot be derived: a fact that admits no unit of some class of work.
@@ -1605,11 +1608,20 @@ pub fn derive(
                 .and_then(|bytes| ranges_bytes.checked_add(bytes))
                 .ok_or(overflow("the ranges' members"))?;
         }
+        let listener = if hosts && stated.s3.is_some() {
+            u64::try_from(objects)
+                .ok()
+                .and_then(|n| n.checked_mul(crate::listener::CONNECTION_BYTES))
+                .ok_or(overflow("the listener's connections"))?
+        } else {
+            0
+        };
         Ok(Held {
             asked,
             bounds,
             beside,
             ranges_bytes,
+            listener,
         })
     };
     // The operations' share holds as many operations as it holds at what one costs: its charge,
@@ -1619,7 +1631,8 @@ pub fn derive(
             held.bounds
                 .transport_bytes
                 .checked_add(held.beside)?
-                .checked_add(held.ranges_bytes)
+                .checked_add(held.ranges_bytes)?
+                .checked_add(held.listener)
         };
         let one = held_by(1)?;
         let two = held_by(2)?;
@@ -1637,6 +1650,7 @@ pub fn derive(
         bounds,
         beside,
         ranges_bytes,
+        listener,
     } = held_by(objects)?;
     let transport_bytes = bounds.transport_bytes;
     let objects_bytes = if hosts {
@@ -1688,6 +1702,7 @@ pub fn derive(
             Class::Transport,
             transport_bytes
                 .checked_add(beside)
+                .and_then(|bytes| bytes.checked_add(listener))
                 .ok_or(overflow("the transport's memory"))?,
         ),
         (
@@ -2301,7 +2316,9 @@ fn say_floor(
                 Class::Log => "the node's shared log (derive::log_bytes)",
                 Class::Transport => {
                     "the transport's budget and what it holds beside it, its plane and its \
-                     liveness stream (derive::transport_bytes_beside)"
+                     liveness stream (derive::transport_bytes_beside), and the S3 listener's \
+                     connections, as many as the operations, each at its measured bytes \
+                     (listener::CONNECTION_BYTES)"
                 }
                 Class::Threads => {
                     "the threads the node starts, each a 2 MiB stack reserved whole \
@@ -3374,7 +3391,9 @@ mod tests {
 
     /// The floor's allowance is a stated ceiling where one is: the node refuses one past what the OS
     /// lets it hold, and one below its floor, naming the class that crosses it; past the floor, the
-    /// less that remains, the fewer fragments and extents its volumes and engines take.
+    /// less that remains, the fewer fragments and extents its volumes and engines take. The
+    /// operations take their share of the allowance (`operations_share`), so a lower ceiling's
+    /// floor is lower too.
     #[test]
     fn a_stated_ceiling_bounds_the_floor_and_what_remains() {
         let full = derive(stated(1), &facts(1), &mut fresh).unwrap();
@@ -3382,20 +3401,23 @@ mod tests {
             let basis = derived.bases.iter().find(|b| b.key == key).unwrap();
             basis.value.parse().unwrap()
         };
-        let floor: u64 = [
-            "objects",
-            "volumes",
-            "engines",
-            "ranges",
-            "log",
-            "transport",
-            "threads",
-        ]
-        .iter()
-        .map(|class| bytes(&full, &format!("memory.floor.{class}")))
-        .sum();
+        let floor = |derived: &Derived| -> u64 {
+            [
+                "objects",
+                "volumes",
+                "engines",
+                "ranges",
+                "log",
+                "transport",
+                "threads",
+            ]
+            .iter()
+            .map(|class| bytes(derived, &format!("memory.floor.{class}")))
+            .sum()
+        };
+        let at_full = floor(&full);
         assert_eq!(bytes(&full, "memory.allowance"), 16 << 30);
-        assert_eq!(bytes(&full, "memory.remaining"), (16 << 30) - floor);
+        assert_eq!(bytes(&full, "memory.remaining"), (16 << 30) - at_full);
         let ceiling = |bytes| Stated {
             ceiling: Some(bytes),
             ..stated(1)
@@ -3405,12 +3427,16 @@ mod tests {
             Err(DeriveError::Ceiling { .. })
         ));
         assert!(matches!(
-            derive(ceiling(floor - 1), &facts(1), &mut fresh),
-            Err(DeriveError::Memory { floor: f, .. }) if f == floor
+            derive(ceiling(1), &facts(1), &mut fresh),
+            Err(DeriveError::Memory { floor, .. }) if floor > 1
         ));
-        // A twentieth past the floor: less for each index and each engine.
-        let tight = derive(ceiling(floor + floor / 20), &facts(1), &mut fresh).unwrap();
-        assert_eq!(bytes(&tight, "memory.remaining"), floor / 20);
+        // A ceiling at the full allowance's floor: its own floor is lower, its operations' share
+        // smaller, and what remains is less for each index and each engine.
+        let tight = derive(ceiling(at_full), &facts(1), &mut fresh).unwrap();
+        let at_tight = floor(&tight);
+        assert!(at_tight < at_full);
+        assert_eq!(bytes(&tight, "memory.remaining"), at_full - at_tight);
+        assert!(bytes(&tight, "gateway.objects") < bytes(&full, "gateway.objects"));
         assert_eq!(
             tight
                 .bases
@@ -3427,7 +3453,7 @@ mod tests {
         assert!(tight.config.store.max_extents < full.config.store.max_extents);
         let shared =
             bytes(&tight, "volume.1.index_bytes") + 5 * bytes(&tight, "engine.metadata_bytes");
-        assert!(shared <= floor / 20);
+        assert!(shared <= at_full - at_tight);
     }
 
     /// However large the node directory's file system, each index takes its whole want while what

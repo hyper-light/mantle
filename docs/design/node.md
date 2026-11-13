@@ -2226,8 +2226,13 @@ body is read, so before `100 Continue`. A response sent before its request's bod
 `Connection: close`, whether or not its client waited for `100 Continue`, since it may send the body
 anyway (RFC 9110 §10.1.1); the listener then half-closes and reads what comes until the client
 closes, at most the largest body a request may carry, so the response is not lost to a reset
-(RFC 9112 §9.6; research/72). The connection budget is a floor of ten, what botocore and the AWS
-CLI's classic transfers open at their defaults (research/72). A connection past it is answered
+(RFC 9112 §9.6; research/72). The connection budget is as many connections as the node runs
+operations at most (`gateway.objects`, §2.8), each carrying one request at a time, so one past them
+would only wait at the door; each connection's bytes, measured with a request in flight (341,668 at
+most over plain HTTP, 295,744 over TLS 1.3; `tests/listener_memory.rs`), enter what an operation
+costs the node and so the count itself. It was ten, what botocore and the AWS CLI's classic
+transfers open at their defaults (research/72), thirty requests in a cell's S3 door at once. The
+kernel queues as many connections as the budget. A connection past it is answered
 `503 SlowDown` with `Connection: close` to its first request, from a reserve of ten more, never
 closed with no answer: the AWS CLI drops a ranged GET whose every attempt met a connection closed
 unanswered and ends its copy exit 0 with the object short, where a `503` it asks again and then
@@ -2235,10 +2240,9 @@ fails loudly (research/72 [7]). Past both a connection is closed as it comes. A 
 its client's next octet at most a stock client's patience, 60 s (`bounds::STOCK_PATIENCE`):
 between requests it then closes, owed no response, so a client's idle pooled connections give
 their slots back; and the read after a `Connection: close` ends there too. Each connection task
-holds a timer for that wait, which the node's runtime counts beside its task. Open: the budget growing past its
-floor with the node's memory, which the CLI's CRT transfer client asks, at least ten connections and
-twenty-five at its 10 Gb/s target (research/72); the process's descriptor limit, which the budget
-does not yet read; the reclaim of the connection that has made the least progress for longest when
+holds a timer for that wait, which the node's runtime counts beside its task. Open: the process's
+descriptor limit, which the budget does not yet read (a connection past it waits for one of the
+node's own to close, `Listener::serve`); the reclaim of the connection that has made the least progress for longest when
 the node needs the room (§4.1, §4.3); and the shared admission authority above, whose sojourn test
 would refuse a request that waits at the door past its target, where now it waits as long as the
 host's operations ahead of it take.

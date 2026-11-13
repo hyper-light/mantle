@@ -3424,8 +3424,8 @@ impl Bench<'_> {
 
     /// Each connection's cost through `door` (measurement.md §10): what the servers and this
     /// thread hold at two connection counts, over the difference ([`SLOPE_LOW`] and
-    /// [`SLOPE_HIGH`] through the S3 listener; a client a node and as many as the cell admits
-    /// through the native door), and the handshake's counts, each connection opened and its first
+    /// [`SLOPE_HIGH`] through the S3 listener; a client a node and [`SLOPE_HIGH`] within what the
+    /// cell admits through the native door), and the handshake's counts, each connection opened and its first
     /// request answered.
     fn slope(&mut self, out: &mut impl Write, door: Door) -> Result<(), Error> {
         let held = self
@@ -3434,9 +3434,11 @@ impl Bench<'_> {
             .map(std::mem::take)
             .unwrap_or_default();
         self.release(held)?;
-        // The native door's points: a client on each node, and as many as the cell admits.
+        // The native door's points: a client on each node, and the S3 door's higher point within
+        // what the cell admits, which the nodes derive from their memory and may be thousands, past
+        // the clients this harness's runtime holds.
         let (low_count, high_count) = match door {
-            Door::Native => (cell::FOUNDERS, self.native_most),
+            Door::Native => (cell::FOUNDERS, SLOPE_HIGH.min(self.native_most)),
             Door::Http => (SLOPE_LOW, SLOPE_HIGH),
         };
         if high_count <= low_count {

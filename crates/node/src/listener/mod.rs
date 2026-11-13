@@ -37,27 +37,33 @@ use crate::process::AccessKey;
 
 pub use conn::PIECE;
 
-/// The connections a listener serves at once: what stock clients open to an endpoint by default,
-/// the AWS CLI's `max_concurrent_requests` and botocore's `max_pool_connections`, ten each (the
-/// AWS CLI's S3 configuration reference; botocore's `Config`). A cell's floor serves one such
-/// client; a connection past it is answered `503 SlowDown` from [`REFUSING`].
-pub const CONNECTIONS: u64 = 10;
+/// The connections one stock client opens to an endpoint at once by default, the AWS CLI's
+/// `max_concurrent_requests` and botocore's `max_pool_connections`, ten each (the AWS CLI's S3
+/// configuration reference; botocore's `Config`).
+const STOCK_CLIENT: u64 = 10;
 
-/// The connections past [`CONNECTIONS`] the listener answers `503 SlowDown`, `Connection: close`,
-/// rather than closes: as many as one more stock client opens at once (research/72). A connection
-/// closed with no answer is what the AWS CLI's transfers take worst: a ranged GET whose every
-/// attempt met one is dropped, and the copy ends exit 0 with the object short, where a `503` it
-/// retries and then fails loudly (research/72, measured 2026-11-02). Past both budgets a
-/// connection is closed as it comes, the one refusal left that costs nothing to make.
-pub const REFUSING: u64 = CONNECTIONS;
+/// What one connection holds with a request in flight, the host holding the pieces of its body it
+/// took: measured by a counting allocator on the listener's thread (`tests/listener_memory.rs`),
+/// 341,668 bytes at the most over plain HTTP and 295,744 over TLS 1.3, at one, two and four
+/// connections, each the same (macOS arm64, Mac Studio, 2026-11-12, n 3 runs). Mostly pieces of
+/// 64 KiB (`PIECE`): two the host took, two waiting in the body's channel, one being read.
+pub const CONNECTION_BYTES: u64 = 341_668;
 
-/// The connection tasks a listener runs at once, those it serves and those it answers refused:
-/// the node gives each a task, a timer for its wait on its client (`conn`) and a socket.
-pub const TASKS: u64 = CONNECTIONS + REFUSING;
+/// The connections past those it serves ([`Settings::connections`]) the listener answers `503
+/// SlowDown`, `Connection: close`, rather than closes: as many as one more stock client opens at
+/// once (research/72). A connection closed with no answer is what the AWS CLI's transfers take
+/// worst: a ranged GET whose every attempt met one is dropped, and the copy ends exit 0 with the
+/// object short, where a `503` it retries and then fails loudly (research/72, measured
+/// 2026-11-02). Past both budgets a connection is closed as it comes, the one refusal left that
+/// costs nothing to make.
+pub const REFUSING: u64 = STOCK_CLIENT;
 
-/// The connections the kernel queues for the listener before it accepts them: the budget, as no
-/// more are served at once.
-const BACKLOG: u32 = 10;
+/// The connection tasks a listener serving `connections` runs at once, those it serves and those
+/// it answers refused: the node gives each a task, a timer for its wait on its client (`conn`) and
+/// a socket.
+pub fn tasks(connections: u64) -> u64 {
+    connections.saturating_add(REFUSING)
+}
 
 /// The application protocol the endpoint answers when a client offers ALPN: HTTP/1.1, the only
 /// version Amazon S3's endpoints answer (node.md §4.1).
@@ -78,6 +84,12 @@ pub struct Settings {
     pub tls: Option<(Vec<u8>, Vec<u8>)>,
     /// This node's id, which each response names as its host.
     pub node: u64,
+    /// The connections it serves at once: as many as the node runs operations at most
+    /// (`gateway.objects`), each carrying one request at a time, so one past them would only wait
+    /// at the door; each charged what it holds ([`CONNECTION_BYTES`]) in what an operation costs
+    /// the node (`derive::operations`). The kernel queues as many before the listener accepts
+    /// them, as no more are served at once.
+    pub connections: u64,
 }
 
 /// Why the listener could not start or ended.
@@ -150,7 +162,7 @@ pub(crate) fn tls_config(
 /// The S3 listener, bound.
 pub struct Listener {
     socket: TcpListener,
-    /// The connections served at once ([`CONNECTIONS`]).
+    /// The connections served at once ([`Settings::connections`]).
     budget: ConnectionBudget,
     /// The connections past the budget answered `503 SlowDown` at once ([`REFUSING`]).
     refusing: ConnectionBudget,
@@ -174,11 +186,12 @@ impl Listener {
             }
             None => None,
         };
-        let budget = ConnectionBudget::new(CONNECTIONS).map_err(ListenError::Socket)?;
+        let budget = ConnectionBudget::new(settings.connections).map_err(ListenError::Socket)?;
         let refusing = ConnectionBudget::new(REFUSING).map_err(ListenError::Socket)?;
         // The listener takes each connection's slot itself (`start`), so a connection past the
         // budget is answered rather than closed by the accept.
-        let socket = TcpListener::bind(settings.listen, BACKLOG).map_err(ListenError::Socket)?;
+        let backlog = u32::try_from(settings.connections).unwrap_or(u32::MAX);
+        let socket = TcpListener::bind(settings.listen, backlog).map_err(ListenError::Socket)?;
         let endpoint = Box::leak(Box::new(Endpoint {
             region: settings.region,
             access: settings.access,

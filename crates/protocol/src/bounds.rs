@@ -397,9 +397,11 @@ pub const CERTIFICATE_COMPRESSION_BYTES: u64 = 721_474;
 /// - Each connection its admission takes: QUIC's and TLS's state with a stream's for each it may
 ///   hold, and what QUIC keeps to send, at most what its peer's window takes, `window_ceiling`
 ///   (every node of a cell states the same).
-/// - The sockets: the listener's, one for each connection where the platform gives a connection a
-///   socket of its own, and a node's plane's, each at what hyper-rt states one holds
-///   (`Io::held_bound`).
+/// - The sockets: the driver's ring of one buffer and its listener's socket, lent
+///   (hyper-rt-transport's `least_bytes`), a lent socket for each connection where the platform
+///   gives a connection one of its own, receiving into that ring (`Batched::lent_bytes`), and a
+///   node's plane's at what hyper-rt states one holds (`Io::held_bound`). The ring grows past one
+///   buffer only within the transport's budget, which charges it.
 ///
 /// QUIC's datagrams are none: no node or client sends them, and no endpoint offers to take them
 /// (hyper-transport's `Limits::transport`; hyper-quic's default took up to 1,250,000 bytes of them a
@@ -432,9 +434,10 @@ pub fn beside(stated: &Stated, serves: bool) -> Option<u64> {
         .checked_add(u64::from(CLIENT_EXCHANGES).checked_mul(client_connections)?)?
         .checked_add(count(stated.pool)?)?
         .checked_mul(STREAM_BYTES)?;
-    let sockets = connections
-        .checked_add(2)?
-        .checked_mul(count(io(stated).held_bound())?)?;
+    let io = io(stated);
+    let sockets = count(hyper_rt_transport::least_bytes(io))?
+        .checked_add(count(io.held_bound())?)?
+        .checked_add(connections.checked_mul(count(hyper_rt::udp::Batched::lent_bytes())?)?)?;
     endpoint
         .checked_add(connections.checked_mul(connection)?)?
         .checked_add(streams)?
@@ -651,7 +654,24 @@ mod tests {
         let each = cost(2) - cost(1);
         assert_eq!(cost(3) - cost(2), each);
         assert_eq!(cost(101) - cost(1), 100 * each);
-        assert!(each < 2 * (CONNECTION_BYTES + 64 * 1024), "{each}");
+        // A peer costs its connections' streams and lanes besides: a client never more.
+        let peer = |peers| {
+            let s = Stated {
+                peers,
+                ..with(0, 0)
+            };
+            let least = least_transport(&s).unwrap();
+            least
+                + beside(
+                    &Stated {
+                        transport_bytes: least,
+                        ..s
+                    },
+                    true,
+                )
+                .unwrap()
+        };
+        assert!(each < peer(3) - peer(2), "{each}");
     }
 
     #[test]

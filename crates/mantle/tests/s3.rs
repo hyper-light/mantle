@@ -125,12 +125,11 @@ fn a_cell_of_three_serves_signed_s3_requests_through_every_nodes_listener() {
         );
     }
 
-    // As many puts at once as the listener takes connections beside the one the first client
-    // holds, past the operations the host runs at once (`gateway.objects`), as the AWS CLI's
-    // transfers send their parts: each waits at the door until the host has room, and every one
-    // commits.
+    // As many puts at once as a stock client's transfers send parts, the AWS CLI's ten, within the
+    // connections the listener takes beside the one the first client holds: any past the
+    // operations the host runs now waits at the door until it has room, and every one commits.
     let (at, budget) = cell.s3_bound[&ids[0]];
-    let at_once: Vec<(String, Vec<u8>)> = (0..budget - 1)
+    let at_once: Vec<(String, Vec<u8>)> = (0..mantle_node::listener::REFUSING.min(budget - 1))
         .map(|i| {
             (
                 format!("at-once/{i}"),

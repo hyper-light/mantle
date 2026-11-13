@@ -198,10 +198,6 @@ crates/node/src/derive.rs SCRUB
 crates/node/src/derive.rs STORE_BYTES_AN_OBJECT
 crates/node/src/derive.rs gateway:scan_rows
 crates/node/src/derive.rs gateway:window
-crates/node/src/listener/mod.rs BACKLOG
-crates/node/src/listener/mod.rs CONNECTIONS
-crates/node/src/listener/mod.rs REFUSING
-crates/node/src/listener/mod.rs TASKS
 crates/node/src/process.rs runtime:shards
 crates/protocol/src/bounds.rs limits:lanes_per_peer
 crates/s3/src/policy/mod.rs BODY_LIMIT

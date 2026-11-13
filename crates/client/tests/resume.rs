@@ -22,7 +22,7 @@ use mantle_s3::body::MIN_PART;
 
 #[allow(dead_code)]
 mod support;
-use support::{CLIENT, Made, NODE, Script, Seen, credentials, runtime, scripted};
+use support::{CLIENT, Made, NODE, Script, Seen, credentials, runtime, scripted, serve};
 
 impl Rewind for Made {
     async fn rewind(&mut self, offset: u64) -> std::io::Result<()> {
@@ -59,8 +59,7 @@ fn a_lost_runs_offset_held_past_the_clients_period_is_asked_again_and_the_upload
         ..Script::default()
     };
     let (tell, bound) = channel();
-    let served =
-        std::thread::spawn(move || scripted(node, transport_bytes, (0, None), script, tell));
+    let served = serve(move |done| scripted(node, transport_bytes, (0, None), script, tell, done));
     let address = bound.recv().unwrap();
     let length = 2 * MIN_PART + (64 << 10);
     let sockets = mantle_client::sockets(1).unwrap();
@@ -122,8 +121,7 @@ fn a_run_the_node_answers_after_the_clients_period_is_waited_for_once_it_was_cut
         ..Script::default()
     };
     let (tell, bound) = channel();
-    let served =
-        std::thread::spawn(move || scripted(node, transport_bytes, (0, None), script, tell));
+    let served = serve(move |done| scripted(node, transport_bytes, (0, None), script, tell, done));
     let address = bound.recv().unwrap();
     let length = 2 * MIN_PART + (64 << 10);
     let sockets = mantle_client::sockets(1).unwrap();
@@ -176,8 +174,7 @@ fn upload_through(script: Script, length: u64) -> (Status, Vec<u64>, Seen) {
     let (node, client) = credentials();
     let transport_bytes = mantle_client::least_transport(1).unwrap();
     let (tell, bound) = channel();
-    let served =
-        std::thread::spawn(move || scripted(node, transport_bytes, (0, None), script, tell));
+    let served = serve(move |done| scripted(node, transport_bytes, (0, None), script, tell, done));
     let address = bound.recv().unwrap();
     let sockets = mantle_client::sockets(1).unwrap();
     let (status, watched) = runtime(sockets)

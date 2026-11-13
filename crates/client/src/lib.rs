@@ -2349,8 +2349,8 @@ mod tests {
         let capacity = least_transport(1).unwrap();
         let length = u64::try_from(PIECE / 16).unwrap();
         let (tell, bound) = std::sync::mpsc::channel();
-        let served = std::thread::spawn(move || {
-            crate::test_support::stub(node, capacity, (length, None), tell)
+        let served = crate::test_support::serve(move |done| {
+            crate::test_support::stub(node, capacity, (length, None), tell, done)
         });
         let address = bound.recv().unwrap();
         let (answer, read) = crate::test_support::runtime(sockets(1).unwrap())
@@ -2419,8 +2419,9 @@ mod tests {
         let (node, credentials) = crate::test_support::credentials();
         let capacity = least_transport(1).unwrap();
         let (tell, bound) = std::sync::mpsc::channel();
-        let served =
-            std::thread::spawn(move || crate::test_support::stub(node, capacity, (1, None), tell));
+        let served = crate::test_support::serve(move |done| {
+            crate::test_support::stub(node, capacity, (1, None), tell, done)
+        });
         let address = bound.recv().unwrap();
         crate::test_support::runtime(sockets(1).unwrap())
             .block_on(async move {

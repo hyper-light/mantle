@@ -24,7 +24,7 @@ use mantle_protocol::object::{Headers, Op, Status};
 
 #[allow(dead_code)]
 mod support;
-use support::{CLIENT, Made, NODE, Script, credentials, runtime, scripted, stub};
+use support::{CLIENT, Made, NODE, Script, credentials, runtime, scripted, serve, stub};
 
 /// A bucket's head answered at once, then a put whose node leaves its body unread for a quarter of
 /// its serve period: the put is answered, taking at least the pause.
@@ -36,8 +36,7 @@ fn a_put_its_node_holds_within_its_serve_period_is_answered() {
     let length = 16 * bounds::limits(&stated).unwrap().window_ceiling;
     let pause = bounds::idle_timeout() / 4;
     let (tell, bound) = channel();
-    let served =
-        std::thread::spawn(move || stub(node, transport_bytes, (length, Some(pause)), tell));
+    let served = serve(move |done| stub(node, transport_bytes, (length, Some(pause)), tell, done));
     let address = bound.recv().unwrap();
     let sockets = mantle_client::sockets(1).unwrap();
     let took = runtime(sockets)
@@ -95,8 +94,7 @@ fn a_put_asked_with_no_deadline_is_cut_after_a_stock_patience_unmoved() {
     let length = 16 * bounds::limits(&stated).unwrap().window_ceiling;
     let pause = bounds::STOCK_PATIENCE * 3;
     let (tell, bound) = channel();
-    let served =
-        std::thread::spawn(move || stub(node, transport_bytes, (length, Some(pause)), tell));
+    let served = serve(move |done| stub(node, transport_bytes, (length, Some(pause)), tell, done));
     let address = bound.recv().unwrap();
     let sockets = mantle_client::sockets(1).unwrap();
     let (took, ended) = runtime(sockets)
@@ -154,7 +152,7 @@ fn a_clients_deadline_ends_a_request_while_its_node_keeps_vouching() {
     let (node, credentials) = credentials();
     let transport_bytes = mantle_client::least_transport(1).unwrap();
     let (tell, bound) = channel();
-    let served = std::thread::spawn(move || {
+    let served = serve(move |done| {
         scripted(
             node,
             transport_bytes,
@@ -164,6 +162,7 @@ fn a_clients_deadline_ends_a_request_while_its_node_keeps_vouching() {
                 ..Script::default()
             },
             tell,
+            done,
         )
     });
     let address = bound.recv().unwrap();
@@ -197,7 +196,7 @@ fn an_expired_deadline_is_refused_before_opening_another_exchange() {
     let (node, credentials) = credentials();
     let transport_bytes = mantle_client::least_transport(1).unwrap();
     let (tell, bound) = channel();
-    let served = std::thread::spawn(move || stub(node, transport_bytes, (0, None), tell));
+    let served = serve(move |done| stub(node, transport_bytes, (0, None), tell, done));
     let address = bound.recv().unwrap();
     runtime(mantle_client::sockets(1).unwrap())
         .block_on(async move {
@@ -239,7 +238,7 @@ fn a_get_deadline_also_bounds_a_sink_that_stops_taking_bytes() {
     let (node, credentials) = credentials();
     let transport_bytes = mantle_client::least_transport(1).unwrap();
     let (tell, bound) = channel();
-    let served = std::thread::spawn(move || stub(node, transport_bytes, (1, None), tell));
+    let served = serve(move |done| stub(node, transport_bytes, (1, None), tell, done));
     let address = bound.recv().unwrap();
     runtime(mantle_client::sockets(1).unwrap())
         .block_on(async move {

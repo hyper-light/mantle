@@ -15,15 +15,18 @@
     clippy::large_enum_variant
 )]
 
+use std::net::SocketAddr;
 use std::sync::mpsc::channel;
 
 use hyper_measure::alloc;
+use hyper_transport::tls::Credentials;
 use mantle_client::{Client, Settings, TRAILER};
 use mantle_protocol::bounds;
 use mantle_protocol::object::{Headers, Op, Status};
 
+#[allow(dead_code)]
 mod support;
-use support::{CLIENT, Checked, Made, NODE, credentials, runtime, stub};
+use support::{CLIENT, Checked, Made, NODE, Relay, credentials, runtime, serve, stub};
 
 #[global_allocator]
 static ALLOCATOR: alloc::Counting = alloc::Counting;
@@ -38,7 +41,7 @@ fn peak_of(windows: u64) -> (u64, u64) {
     let window = bounds::limits(&stated).unwrap().window_ceiling;
     let length = windows * window;
     let (tell, bound) = channel();
-    let served = std::thread::spawn(move || stub(node, transport_bytes, (length, None), tell));
+    let served = serve(move |done| stub(node, transport_bytes, (length, None), tell, done));
     let address = bound.recv().unwrap();
     let sockets = mantle_client::sockets(1).unwrap();
     let (peak, memory) = runtime(sockets)
@@ -106,8 +109,14 @@ fn a_source_shorter_than_its_stated_length_cuts_the_put_short() {
     let (node, client) = credentials();
     let transport_bytes = mantle_client::least_transport(1).unwrap();
     let (tell, bound) = channel();
-    let served = std::thread::spawn(move || stub(node, transport_bytes, (0, None), tell));
+    let served = serve(move |done| stub(node, transport_bytes, (0, None), tell, done));
     let address = bound.recv().unwrap();
+    put_short(client, address, transport_bytes);
+    served.join().unwrap();
+}
+
+/// The put cut short of its stated length, through a node at `address`, refused as such.
+fn put_short(client: Credentials, address: SocketAddr, transport_bytes: u64) {
     let sockets = mantle_client::sockets(1).unwrap();
     runtime(sockets)
         .block_on(async move {
@@ -145,5 +154,25 @@ fn a_source_shorter_than_its_stated_length_cuts_the_put_short() {
             );
         })
         .unwrap();
-    served.join().unwrap();
+}
+
+/// A node whose half of its client's handshake never finished, the client's Finished and all it sent
+/// after kept from it, ends once its client is done: that half goes with no event, there being no
+/// peer identified to tell of, and a node that waited for its client's connection to close waited
+/// forever (CI windows-x86_64, lean-doors e511ae15, the test above for 4 h 46 min, until the job's
+/// limit: the client slow to read the node's flight, the node's half timed out before the client's
+/// Finished came).
+#[test]
+fn a_node_whose_half_of_the_handshake_never_finished_ends_once_its_client_is_done() {
+    let (node, client) = credentials();
+    let transport_bytes = mantle_client::least_transport(1).unwrap();
+    let (tell, bound) = channel();
+    let served = serve(move |done| stub(node, transport_bytes, (0, None), tell, done));
+    let relay = Relay::to(bound.recv().unwrap());
+    put_short(client, relay.address, transport_bytes);
+    relay.end();
+    assert!(
+        !served.join().unwrap(),
+        "the node's half of the handshake finished"
+    );
 }

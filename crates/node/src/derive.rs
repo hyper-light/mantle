@@ -901,14 +901,27 @@ pub struct Formatted {
     pub checksum_shift: u8,
 }
 
+/// The block, checksum shift and segment of a volume laid out on a device whose transfers align
+/// to `align`, holding chunks of `chunk_bytes` at most: the volume's block
+/// (`layout::block`); checksum blocks of that block, at most CRC-32C's verified 16 KiB, so a read
+/// at the device's alignment verifies no byte it did not ask for (research 11 §8.2); and the least
+/// segment holding one record of the largest chunk whole (`layout::least_segment`), since smaller
+/// segments clean better (research 11 §7.3–§7.4).
+pub fn blocks(align: Alignment, chunk_bytes: u64) -> Result<(u64, u8, u64), DeriveError> {
+    let block = volume_layout::block(align).ok_or(DeriveError::Overflow("a volume's block"))?;
+    let shift = u8::try_from(block.trailing_zeros())
+        .map_err(|_| DeriveError::Overflow("a volume's block"))?
+        .min(CHECKSUM_SHIFT_MOST);
+    let segment = volume_layout::least_segment(block, shift, chunk_bytes)
+        .ok_or(DeriveError::Chunk { bytes: chunk_bytes })?;
+    Ok((block, shift, segment))
+}
+
 /// A chunk volume of `size` bytes on a device whose transfers align to `align`, measured as
 /// `profile`, holding chunks of `chunk_bytes` at most, whose index may ask `index_bytes` of the
 /// allocator; `formatted` when it was laid out already, whose choices made at format stand:
 ///
-/// - checksum blocks of the volume's block, at most CRC-32C's verified 16 KiB: a read at the
-///   device's alignment then verifies no byte it did not ask for (research 11 §8.2);
-/// - the least segment holding one record of the largest chunk whole (`layout::least_segment`),
-///   since smaller segments clean better (research 11 §7.3–§7.4);
+/// - the block, checksum blocks and segment [`blocks`] gives;
 /// - the standard layout, its superblocks 16 MiB apart beyond the reach of clustered latent
 ///   sector errors, or the compact one where the standard leaves fewer than two segments
 ///   (chunk-store.md §2);
@@ -932,16 +945,7 @@ pub fn volume(
             formatted.checksum_shift,
             formatted.geometry.segment_size,
         ),
-        None => {
-            let block =
-                volume_layout::block(align).ok_or(DeriveError::Overflow("a volume's block"))?;
-            let shift = u8::try_from(block.trailing_zeros())
-                .map_err(|_| DeriveError::Overflow("a volume's block"))?
-                .min(CHECKSUM_SHIFT_MOST);
-            let segment = volume_layout::least_segment(block, shift, chunk_bytes)
-                .ok_or(DeriveError::Chunk { bytes: chunk_bytes })?;
-            (block, shift, segment)
-        }
+        None => blocks(align, chunk_bytes)?,
     };
     let batch_bytes = segment_size
         .checked_sub(block)

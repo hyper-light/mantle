@@ -67,9 +67,11 @@ Before its job uploads it, each target's archive is checked as a user takes it, 
 1. The archive's SHA-256 is the one beside it, and it holds exactly the directory, the binary at
    mode 755, `LICENSE` and `README.md`.
 2. The unpacked binary says `mantle VERSION`.
-3. It makes a cell of three with `mantle init`, each founder's QUIC, plane and S3 ports stated
-   (each one the OS gave free), its volume of 512 MiB in a directory of its own (sized from the
-   segments the check writes, `scripts/release.py`) and its failure domain its own:
+3. It makes a cell of three with `mantle init`, `2f + 1` founders for `f = 1`, the least cell that
+   keeps a majority with one founder lost, one failure domain each so a block's three copies sit on
+   three nodes (architecture.md, decision 2; durability.md), each founder's QUIC, plane and S3
+   ports stated (each one the OS gave free), and its volume in a directory of its own, sized from
+   the bytes the check writes (constants.md, "The release check's volume"):
    all on loopback but the first founder's S3 endpoint, at every address and named `localhost`, which
    init serves under TLS, certifies for that name and writes into both profiles as
    `https://localhost:PORT` with its authority as `ca_bundle`. Every S3 client of the check, the S3
@@ -78,49 +80,60 @@ Before its job uploads it, each target's archive is checked as a user takes it, 
    retries before the second answers, a cost of the platform, not a wait the check makes. It
    serves the cell as three `mantle serve` processes from what init wrote, each waited for until it
    says it bound the stated addresses and that the cell's root range enlisted it, and then ready to
-   `mantle status`.
+   `mantle status`. Each node then says its volume's segment, which must be the one `mantle disk
+   probe` said, and its free segments, which must hold what the check needs; once the doors' writes
+   are done, what each volume took must be within the model's bound.
 4. Through each of the client's doors in turn (docs/design/doors.md), `--door native`, the native
    protocol over QUIC, and `--door s3`, S3's HTTP API SigV4-signed at the endpoint of the S3 profile
    `mantle init client` gave the client, as the client of a directory `mantle init client` made,
-   every object command into a bucket of the door's own: `mb`; `cp` from a file of 3 MiB, below the
-   AWS CLI's 8 MiB multipart threshold, and of 16 MiB, past it, each back to a file; from standard
-   input of 9 MiB and of 100 KB, each back to standard output; `head`; `ls` of a prefix's keys with
-   their sizes and of the bucket's prefixes; a multipart upload's every step (`create`, `put` of a 5
-   MiB part from a file and the last from standard input, `parts`, `uploads`, `complete`), read
-   back, and another upload aborted. A copy from standard input of a stated length (`--size`), fed a
-   megabyte at a time and fed no more once it says a run (the native door) or a part (the S3 door)
-   committed, is killed (SIGKILL; `TerminateProcess` on Windows): the cell lists its open upload
-   holding exactly the runs or parts and bytes the copy said durable, and the copy run again says it
-   resumes there, commits each later one and none before, and the object reads back whole, its ETag
-   its bytes' MD5 through the native door and its parts' combined MD5 through the S3 door.
+   every object command into a bucket of the door's own. Each object's size is the boundary it
+   exercises, and its bytes are SHAKE-256's output for its name. `mb`; `cp` from a file of the most
+   one request carries, a native run (S3's least part rounded up to whole blocks, 8,323,072 bytes)
+   or a byte short of the AWS CLI's 8 MiB multipart threshold through the S3 door, and of a byte
+   more, the least past it, each back to a file; from standard input of the same two, each back to
+   standard output; `head`; `ls` of a prefix's keys with their sizes and of the bucket's prefixes;
+   a multipart upload's every step (`create`, `put` of S3's least part, 5 MiB, from a file and the
+   last of a byte from standard input, `parts`, `uploads`, `complete`), read back, and another
+   upload aborted. A copy from standard input of two runs or parts and a byte (`--size`), fed in
+   the client's own 65,527-byte pieces and fed no more once it says a run (the native door) or a
+   part (the S3 door) committed, is killed (SIGKILL; `TerminateProcess` on Windows): the cell lists
+   its open upload holding exactly the runs or parts and bytes the copy said durable, each of the
+   door's length, and the copy run again says it resumes there, commits each later one and none
+   before, and the object reads back whole, its ETag its bytes' MD5 through the native door and its
+   parts' combined MD5 through the S3 door.
 5. Across the doors: each door reads back, to standard output and to a file, every object the other
    put; both list the buckets, a bucket's keys and its uploads line for line alike, and head the
    same objects alike; `ls` through the door `MANTLE_DOOR` names, as the client `MANTLE_CLIENT`
    names, says what `--door s3 --client` says.
    The S3 door is asked again over plain HTTP too: a copy of the client whose S3 profile names the
-   second founder's loopback endpoint, `http://127.0.0.1:PORT`, runs `mb`, `cp` from a file and from
-   standard input, up and back, `ls`, `head`, `rm` and `rb`, each object read back through the native
-   door.
+   second founder's loopback endpoint, `http://127.0.0.1:PORT`, runs `mb`, `cp` from a file of the
+   most one PutObject carries and from standard input of a byte more, up and back, `ls`, `head`, `rm`
+   and `rb`, each object read back through the native door.
 6. The stock client, the AWS CLI v2 with the profile `mantle init` wrote (its environment's own
-   `AWS_*` variables removed, as they outrank a profile): `s3 mb`, `s3 cp` of an object below the
-   CLI's 8 MiB multipart threshold and one past it, up and back, `s3 ls` with their sizes and
+   `AWS_*` variables removed, as they outrank a profile): `s3 mb`, `s3 cp` of an object of the most
+   one PutObject carries below the CLI's 8 MiB multipart threshold and one a byte longer, at it, up
+   and back, `s3 ls` with their sizes and
    `s3api head-object`; each of the client's doors reads back what it put, and it reads back what
    each put. Then each door removes its own objects and bucket: `head` of a removed object says
    `NoSuchKey` through the native door and its bodiless `404` through the S3 door, and `rb` of a
    bucket still holding an object `BucketNotEmpty` through both.
 7. One founder stops in order at a `stop` line, which asks the orderly stop on every host, its peers
    serving on: it says `stopping` and `stopped` and exits 0.
-8. The binary's transfer harness at the scale CI's suite runs it (`mantle bench transfer --small
-   1000 --large 20M --count 4 --seed 5`, `crates/mantle/tests/transfer.rs`): cells of three, a
-   thousand small objects half through each door and four 20 MiB objects natively in runs and in
-   parts, by the AWS CLI from its standard input and by boto3 in parts, every byte checked against
-   its generator through both doors and another node while each founder is killed and started
-   again. It exits non-zero when any check is not exact.
+8. The binary's transfer harness at the scale of the plan's smoke, as CI's suite runs it
+   (`mantle bench transfer --small 1000 --large 20M --count 4`, `crates/mantle/tests/transfer.rs`;
+   research/76): cells of three, the least of the small sets the owner agreed, a thousand objects
+   (research/76 [4] f2), half through each door, and one 20 MiB object, three blocks and three of
+   the AWS CLI's parts, the last short of S3's least part, for each of the harness's four ways,
+   natively in runs and in parts, by the AWS CLI from its standard input and by boto3 in parts, all
+   from the harness's own seed; every byte checked against its generator through both doors and
+   another node while each founder is killed and started again. It exits non-zero when any check
+   is not exact.
 
 Every object read back is compared byte for byte with what was put. Every wait ends on what a
 process says or on its end, never on a guess of time; GitHub's 6 hours a job bounds the whole
 (research/85 [12]). The AWS CLI and boto3 are the ones `scripts/stock-clients.sh` installs for the
-gates, boto3 pinned with every hash. A failed check prints each node's last output.
+gates, boto3 pinned with every hash. Every process's whole output, each founder's and the transfer
+harness's, is kept in a directory the job uploads as an artifact when the check fails.
 
 ## 3. How it runs
 

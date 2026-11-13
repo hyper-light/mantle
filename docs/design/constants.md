@@ -792,6 +792,54 @@ parameters. The gate does not parse these; they are kept here with the same kind
 | `crates/disk/src/rounds.rs` Policy STANDARD min 10 | derived | The fewest rounds where the exact runs test has a two-sided 5% rejection region (research 21 §4; measurement.md §5). |
 | `crates/disk/src/rounds.rs:88` Policy STANDARD max 30, precision ±5% | open | The one-fifth minority share it resolves and the ±5% resolution are choices with no source. |
 
+### The release check's volume
+
+`scripts/release.py check` (release.md §2) sizes each founder's volume from the bytes the check
+writes, not by hand. The model, `segments` and `volume_bytes` in the script:
+
+- **What is written.** Every file the check puts, by length (`puts`): through each door an object
+  of the most one request carries and one a byte longer, from a file and from standard input; a
+  multipart upload of S3's least part and a last part of a byte; the killed copy's committed run
+  or part and the one in flight then, counted whole, and the copy run again; the AWS CLI's and the
+  plain-HTTP leg's two objects. A native object is put as runs of `RUN`, an S3 one as one
+  PutObject below 8 MiB and parts of 8 MiB past it.
+- **Every attempt.** Each put is counted `ATTEMPTS` times, the clients' three (research/73 [5]):
+  an attempt answered SlowDown may leave its chunks behind (d0d91066).
+- **Nothing removed is freed.** A released chunk returns only after `GRACE_NS`, three days
+  (crates/meta/src/collector.rs), so removed and replaced objects count whole.
+- **Copies per volume.** A block's three copies sit on three nodes, one volume each, so every
+  volume holds one copy of every block.
+- **Whole segments.** A file is cut into blocks of 127 sealed 64 KiB segments; a block's record is
+  its sealed bytes behind a 96-byte header and a CRC-32C word a checksum block, aligned to 8
+  (crates/chunk/src/record.rs). A record longer than half a segment takes a segment of its own;
+  shorter ones share, each taken to its block's end, and a segment sealed because the next did not
+  fit holds at least its room less the longest of them (crates/chunk/src/writer.rs).
+- **The cleaner's reserve.** One free segment more, which new writes never take
+  (`CLEANER_RESERVE`).
+- **The layout.** The volume's block and segment are `mantle disk probe`'s for its directory, as a
+  node derives them (`mantle_node::derive::blocks`). Its segments begin past its two superblocks and
+  its index log, sized at format for one fragment a block (crates/chunk/src/layout.rs,
+  `Geometry::plan`, `log_bytes`); the volume is the least size, found by doubling then halving
+  over a u64's 64 bits, whose segments number the need.
+
+The model is checked on every run: each node says its volume's segment, which must be the probe's,
+and its free segments once it enlisted, which must hold the need; once the doors' writes are done,
+what each volume took must be within the need less the reserve. On a 4 KiB-block device it is 62
+segments of 8,404,992 bytes and 621,772,800 bytes a volume.
+
+| Where | Kind | Basis |
+|---|---|---|
+| `scripts/release.py` `FOUNDERS` 3, `COPIES` 3 | cited | `2f + 1` voters for `f = 1`, the least cell that keeps a majority with one founder lost (architecture.md, decision 2); one domain each, R3 one copy a domain (durability.md; research/76 [4] f34). |
+| `scripts/release.py` `CLI_PART` 8 MiB | external | The AWS CLI's multipart threshold and part size (research/73 [10]); the S3 door's `PART`. |
+| `scripts/release.py` `LEAST_PART` 5 MiB | external | S3's least part but the last (research/05 §4.1). |
+| `scripts/release.py` `PIECE` 65,527 | derived | `mantle_client::PIECE`, the transport's receive chunk: RFC 9000 §18.2's largest datagram payload. |
+| `scripts/release.py` `SEAL`, `TAG`, `CHUNK`, `BLOCK`, `RUN` | derived | `mantle_s3::seal::{SEGMENT, TAG}`, `mantle_gateway::layout::CHUNK`; a block the sealed segments a chunk holds; a run S3's least part rounded up to whole blocks (`mantle_meta::name::run_length`). |
+| `scripts/release.py` `ATTEMPTS` 3 | external | The AWS SDKs' standard retry mode's attempts, which `mantle_client::ATTEMPTS` keeps (research/73 [5]). |
+| `scripts/release.py` `HEADER_LEN`, `RECORD_ALIGN`, `CHECKSUM_SHIFT_MOST`, `OFFSET_B_STANDARD`, `LEAST_LOG`, `FRAME_HEADER`, `PUT_LEN`, `DELETE_LEN`, `SEGMENT_LEN`, `MAX_FRAME_BYTES`, `CLEANER_RESERVE` | format | The chunk store's, each named in the script by its file; a drift fails the run's segment and room checks. |
+| `scripts/release.py` `SIZE_BITS` 64 | format | The bits of the u64 a volume's size is parsed into: the most steps a doubling or a halving of sizes takes. |
+| `scripts/release.py` object sizes | derived | Each the boundary it exercises: the most one request carries (a run, or 8 MiB less a byte), a byte more, S3's least part, a last part of a byte, two units and a byte for the killed copy. |
+| `scripts/release.py` transfer `--small 1000 --large 20M --count 4` | cited | The plan's smoke as CI runs it (crates/mantle/tests/transfer.rs; research/76): the least small set agreed (research/76 [4] f2), three blocks and three CLI parts the last short of the least part (node.md), one object a way (`WAYS`). |
+
 ## What the open ones need
 
 - The chunk writer's batch shape (`Limits`: 1,024 requests, 32 MiB, 4,096 fragments a chunk)

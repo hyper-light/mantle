@@ -38,8 +38,8 @@ time limit bounds the whole.
 import argparse
 import gzip
 import hashlib
+import io
 import os
-import random
 import shutil
 import socket
 import subprocess
@@ -53,20 +53,159 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# The AWS CLI's multipart threshold and part size, 8 MiB each (docs/research/73 [10]): a file past
-# it goes up in parts. A native copy from standard input is read in runs of the same 8 MiB
-# (docs/design/gateway.md §6).
+# The cell's founders: 2f + 1 voters for f = 1, the least cell that keeps a majority with one
+# founder lost (docs/design/architecture.md, decision 2), as the check stops one and the transfer
+# harness kills each in turn; one failure domain each, so a block's three copies, R3 one copy a
+# domain, sit on three nodes (docs/design/durability.md; research/76 [4] f34).
+FOUNDERS = 3
+COPIES = 3
+
+# The AWS CLI's multipart threshold and part size, 8 MiB each (docs/research/73 [10]), which the S3
+# door's copies take as theirs (crates/mantle/src/door.rs, PART): an object of fewer bytes goes in
+# one PutObject, one of as many or more as a multipart upload in parts of it.
 CLI_PART = 8 << 20
 # S3's least part but the last, 5 MiB (docs/research/05 §4.1).
 LEAST_PART = 5 << 20
-# Each founder's volume, a bound argued from what the check writes. A volume keeps whole segments of
-# 8,404,992 bytes (crates/chunk/src/layout.rs, least_segment of the 8 MiB chunk), and a chunk record
-# over half of one takes a segment of its own; under three copies every volume holds a chunk of
-# every block. Both doors' suites, the AWS CLI's objects, the plain-HTTP leg and the runs a killed
-# copy left in flight take about 29 segments of each volume, beside the cleaner's reserve of one,
-# and nothing removed is collected within the check: the suites' 256 MiB, 31 segments, filled on
-# Studio 3 (the AWS CLI's UploadPart answered InsufficientStorage, f704e163). 512 MiB holds 63.
-VOLUME = "512M"
+# The piece mantle's client reads standard input in (`mantle_client::PIECE`): hyper-transport's
+# receive chunk, the 65,527-byte ceiling of a QUIC datagram's payload (RFC 9000 §18.2).
+PIECE = 65_527
+# How an object lies on a volume (crates/gateway/src/layout.rs; docs/design/gateway.md §1): sealed
+# in 64 KiB segments, each with its 16-byte tag (crates/s3/src/seal.rs, SEGMENT and TAG), and cut
+# into blocks of as many whole sealed segments as the 8 MiB chunk holds (layout.rs, CHUNK), each
+# block one chunk a copy.
+SEAL = 64 << 10
+TAG = 16
+CHUNK = 8 << 20
+BLOCK = CHUNK // (SEAL + TAG) * SEAL
+# The native door's run: S3's least part rounded up to whole blocks (crates/meta/src/name.rs,
+# run_length; crates/mantle/tests/native.rs, least_run). An object a run holds is put whole; a
+# copy from standard input holds a run until it commits (crates/mantle/src/client.rs).
+RUN = -(-LEAST_PART // BLOCK) * BLOCK
+# The attempts each client makes of a request: the AWS SDKs' and CLI's standard retry mode's three,
+# which mantle's own client keeps (`mantle_client::ATTEMPTS`; research/73 [5]). An attempt answered
+# SlowDown may leave its block's chunks on the volumes that took them (d0d91066).
+ATTEMPTS = 3
+
+# A chunk volume's layout (crates/chunk/src): a record's header and its alignment
+# (record.rs, HEADER_LEN, RECORD_ALIGN), a word of CRC-32C a checksum block, at most 16 KiB
+# (crates/node/src/derive.rs, CHECKSUM_SHIFT_MOST); the superblocks' second copy's offset and the
+# least index log of the standard layout (superblock.rs, OFFSET_B_STANDARD; layout.rs,
+# Geometry::plan); the index log's frame and its records (frame.rs, FRAME_HEADER, PUT_LEN,
+# DELETE_LEN, SEGMENT_LEN; layout.rs, MAX_FRAME_BYTES); and the free segments the writer keeps
+# from new writes for its cleaner (writer.rs, CLEANER_RESERVE).
+HEADER_LEN = 96
+RECORD_ALIGN = 8
+CHECKSUM_SHIFT_MOST = 14
+OFFSET_B_STANDARD = 16 << 20
+LEAST_LOG = 64 << 20
+FRAME_HEADER = 48
+PUT_LEN = 1 + 22 + 4 + 8 + 4 + 4 + 8 + 4 + 4 + 8 + 8 + 1
+DELETE_LEN = 1 + 22 + 8 + 8
+SEGMENT_LEN = 1 + 4 + 8 + 1 + 4
+MAX_FRAME_BYTES = 4 << 20
+CLEANER_RESERVE = 1
+# The bits of a volume's size as `mantle init` takes it, a u64: the most halvings a search of
+# sizes makes.
+SIZE_BITS = 64
+
+
+def up(n, to):
+    return -(-n // to) * to
+
+
+def cut(length, unit):
+    """LENGTH bytes in pieces of UNIT, the last what is left: an object's runs or parts, a file's
+    blocks. None of an empty one."""
+    return [min(unit, length - at) for at in range(0, length, unit)]
+
+
+def records(length, block):
+    """The bytes one copy of a file of LENGTH bytes writes on a volume of BLOCK-byte blocks: a record
+    a block, the block's sealed segments behind the record's header and checksum table, aligned."""
+    shift = min(block.bit_length() - 1, CHECKSUM_SHIFT_MOST)
+    out = []
+    for plain in cut(length, BLOCK):
+        sealed = plain + -(-plain // SEAL) * TAG
+        table = -(-sealed // (1 << shift)) * 4
+        out.append(up(HEADER_LEN + table + sealed, RECORD_ALIGN))
+    return out
+
+
+def files(door, length):
+    """The files an object of LENGTH bytes is put as through DOOR: the native door's runs; one
+    PutObject below the S3 door's threshold, its parts past it (the AWS CLI's alike)."""
+    if door == "native":
+        return cut(length, RUN)
+    return [length] if length < CLI_PART else cut(length, CLI_PART)
+
+
+def segments(puts, block, segment):
+    """The segments of each volume the check's puts take, the cleaner's reserve among them.
+
+    PUTS is every file the check puts, by length. Each block's three copies sit on three nodes, a
+    volume each, so every volume holds one copy of every block (COPIES over FOUNDERS). Every attempt
+    of a put may have stored its chunks (ATTEMPTS), and nothing removed or replaced returns within
+    the check: a chunk is freed only a grace after its release, three days (crates/meta/src/
+    collector.rs, GRACE_NS). A record longer than half a segment takes a segment of its own; shorter
+    ones share segments, each taken up to a block past its end, and a segment sealed when the next
+    does not fit holds at least its room less the longest of them (crates/chunk/src/writer.rs,
+    Stream::of_write and place). The writer keeps CLEANER_RESERVE segments from new writes."""
+    copies = -(-COPIES // FOUNDERS) * ATTEMPTS
+    whole, shared, longest = 0, 0, 0
+    for length in puts:
+        for record in records(length, block):
+            if record > segment // 2:
+                whole += copies
+            else:
+                taken = up(record, block)
+                shared += copies * taken
+                longest = max(longest, taken)
+    room = segment - block
+    packed = -(-shared // (room - longest)) if shared else 0
+    return whole + packed + CLEANER_RESERVE
+
+
+def data_offset(size, block, segment):
+    """Where the segments of a standard volume of SIZE bytes begin: past its two superblocks and
+    the index log sized at format (crates/chunk/src/layout.rs, Geometry::plan and log_bytes), its
+    fragments at most one a block, the most a node lets its index hold (derive.rs, volume)."""
+    fragments, upper = size // block, size // segment
+    payload = fragments * PUT_LEN + upper * SEGMENT_LEN
+    frame_payload = MAX_FRAME_BYTES - FRAME_HEADER
+    frames = -(-payload // (frame_payload - PUT_LEN)) + 2
+    checkpoint = payload + frames * (FRAME_HEADER + block)
+    placed = max(PUT_LEN, DELETE_LEN) + 2 * SEGMENT_LEN
+    batch = up(FRAME_HEADER + placed + SEGMENT_LEN + placed, block)
+    largest = max(batch, min(up(FRAME_HEADER + payload, block), MAX_FRAME_BYTES))
+    log = up(max(3 * checkpoint + batch + 2 * largest, LEAST_LOG), block)
+    return up(2 * OFFSET_B_STANDARD + log, block)
+
+
+def volume_bytes(need, block, segment):
+    """The least volume of BLOCK-byte blocks and SEGMENT-byte segments that lays out NEED segments:
+    its size doubled until it holds them, then halved between, a search of SIZE_BITS steps each.
+    A volume's segments only grow with its size, since its log grows by a few bytes a block."""
+
+    def held(size):
+        offset = data_offset(size, block, segment)
+        return (size - offset) // segment if size > offset else 0
+
+    low, high = 0, need * segment
+    for _ in range(SIZE_BITS):
+        if held(high) >= need:
+            break
+        low, high = high, 2 * high
+    else:
+        raise Failed(f"no volume of a u64's bytes holds {need} segments of {segment}")
+    for _ in range(SIZE_BITS):
+        if high - low <= 1:
+            break
+        middle = (low + high) // 2
+        if held(middle) >= need:
+            high = middle
+        else:
+            low = middle
+    return high
 
 
 class Failed(Exception):
@@ -86,7 +225,7 @@ def binary_name(target):
 def sha256(path):
     digest = hashlib.sha256()
     with open(path, "rb") as f:
-        for block in iter(lambda: f.read(1 << 20), b""):
+        for block in iter(lambda: f.read(io.DEFAULT_BUFFER_SIZE), b""):
             digest.update(block)
     return digest.hexdigest()
 
@@ -116,7 +255,7 @@ def package(version, target, binary, out):
                 info.compress_type = zipfile.ZIP_DEFLATED
                 info.external_attr = (0o100000 | mode) << 16
                 with open(source, "rb") as f, z.open(info, "w") as w:
-                    shutil.copyfileobj(f, w, 1 << 20)
+                    shutil.copyfileobj(f, w)
     else:
         with open(archive, "wb") as raw, gzip.GzipFile(
             filename="", mode="wb", fileobj=raw, mtime=epoch
@@ -188,8 +327,10 @@ def said(ran):
     return ran.stdout.decode()
 
 
-def object_bytes(seed, size):
-    return random.Random(seed).randbytes(size)
+def content(name, size):
+    """The SIZE bytes of the object NAME: SHAKE-256's output for its name (FIPS 202 §6.2), so every
+    object's bytes are its own and made again from its name alone."""
+    return hashlib.shake_256(name.encode()).digest(size)
 
 
 def same(what, got, want):
@@ -226,7 +367,8 @@ def free_addresses(count):
 
 class Node:
     """A founder's `mantle serve` process. A thread reads what it says into its log and keeps the
-    facts the check waits on: where it bound, that it enlisted, its orderly stop, and its end."""
+    facts the check waits on: where it bound, that it enlisted, its volume's segment, its chunks'
+    room as last asked, its orderly stop, and its end."""
 
     def __init__(self, mantle, name, config, logs):
         self.name = name
@@ -253,6 +395,10 @@ class Node:
                 fact = None
                 if len(words) == 3 and words[0] in ("bound", "s3-bound"):
                     fact = (words[0], tuple(words[1:]))
+                elif words[:3] == ["basis", "volume.1.segment_bytes", "="] and len(words) > 3:
+                    fact = ("segment", int(words[3]))
+                elif len(words) == 8 and words[0] == "chunks":
+                    fact = ("chunks", tuple(int(w) for w in words[1:]))
                 elif words in (["enlisted"], ["stopping"]):
                     fact = (words[0], True)
                 elif len(words) == 2 and words[0] == "stopped":
@@ -274,6 +420,14 @@ class Node:
                 self.changed.wait()
             return self.facts[fact]
 
+    def free(self):
+        """The bytes of the node's volume's free segments, asked now (`chunks`, its last word)."""
+        with self.changed:
+            self.facts.pop("chunks", None)
+        self.process.stdin.write(b"chunks\n")
+        self.process.stdin.flush()
+        return self.until("chunks")[-1]
+
     def stop(self):
         """Asks the orderly stop with a `stop` line, as on every host (SIGTERM is Unix's alone),
         and waits for its end: its exit status."""
@@ -292,31 +446,50 @@ class Node:
         self.process.stdin.close()
         self.reader.join()
 
-    def said(self):
-        lines = []
-        for path in (self.out, self.err):
-            text = path.read_text(errors="replace") if path.exists() else ""
-            tail = text.splitlines()[-60:]
-            lines.append(f"== {path.name}, its last {len(tail)} lines\n" + "\n".join(tail))
-        return "\n".join(lines)
 
 
-def session(mantle, root):
-    """The cell of three, its doors asked as a user asks them."""
-    volumes = [root / f"volume-{n}" for n in (1, 2, 3)]
+def probed(mantle, volume):
+    """The block and segment a volume in the directory VOLUME is laid out in, as `mantle disk
+    probe` says a node derives them from its device."""
+    found = {}
+    for line in said(run([mantle, "disk", "probe", volume])).splitlines():
+        words = line.split()
+        if len(words) > 2 and words[0] in ("block", "segment") and words[2] == "bytes:":
+            found[words[0]] = int(words[1])
+    if set(found) != {"block", "segment"}:
+        raise Failed(f"mantle disk probe {volume} said no block and segment: {found}")
+    return found["block"], found["segment"]
+
+
+def session(mantle, root, logs):
+    """The cell of three, its doors asked as a user asks them. Each founder's volume holds what the
+    check writes (`segments`), as `mantle disk probe` says it is laid out, which each node then
+    says of its own volume; its free segments, asked of each node once it enlisted and once the
+    doors' writes are done, hold the model to what the volume took."""
+    volumes = [root / f"volume-{n}" for n in range(1, FOUNDERS + 1)]
+    planned = puts()
+    sized = []
     for volume in volumes:
         volume.mkdir(parents=True)
+        block, segment = probed(mantle, volume)
+        need = segments(planned, block, segment)
+        size = volume_bytes(need, block, segment)
+        print(
+            f"{volume.name}: {need} segments of {segment} bytes, {CLEANER_RESERVE} the cleaner's, "
+            f"for {len(planned)} files put up to {ATTEMPTS} times each: {size} bytes"
+        )
+        sized.append((size, segment, need))
     addresses = free_addresses(len(volumes))
     out = root / "cell"
     args = ["init", out, "--max-nodes", len(volumes), "--max-volumes", len(volumes)]
-    for n, ((quic, plane, s3), volume) in enumerate(zip(addresses, volumes), 1):
+    for n, ((quic, plane, s3), volume, (size, _, _)) in enumerate(zip(addresses, volumes, sized), 1):
         # The first founder's endpoint is named `localhost`, which init certifies and its
         # profiles name, `https://localhost:PORT`: every S3 client of the check dials it under TLS,
         # by a name that resolves to ::1 and 127.0.0.1 alike.
         name = ",name=localhost" if n == 1 else ""
         args += [
             "--node",
-            f"quic={quic},plane={plane},s3={s3}{name},domain=rack-{n},volume={volume}:{VOLUME}",
+            f"quic={quic},plane={plane},s3={s3}{name},domain=rack-{n},volume={volume}:{size}",
         ]
     made = said(run([mantle, *args]))
     print(made, end="")
@@ -332,8 +505,7 @@ def session(mantle, root):
     if "s3 profile mantle: AWS_CONFIG_FILE=" not in made:
         raise Failed("mantle init wrote no S3 profile naming the endpoint")
 
-    logs = root / "logs"
-    logs.mkdir()
+    logs.mkdir(parents=True)
     nodes = []
     try:
         for n, d in enumerate(dirs, 1):
@@ -348,6 +520,13 @@ def session(mantle, root):
         for node, d in zip(nodes, dirs):
             run([mantle, "status", d])
         print("the cell of three serves: each founder enlisted, and ready to `mantle status`")
+        free = []
+        for node, (_, segment, need) in zip(nodes, sized):
+            if node.until("segment") != segment:
+                raise Failed(f"{node.name} lays its volume out in segments of {node.facts['segment']}, not {segment}")
+            free.append(node.free())
+            if free[-1] // segment < need:
+                raise Failed(f"{node.name}'s volume has {free[-1] // segment} free segments, not the {need} the check needs")
         client = root / "client"
         print(said(run([mantle, "init", "client", client, "--cell", out])), end="")
         endpoint = endpoint_url(client / "s3" / "config")
@@ -357,14 +536,20 @@ def session(mantle, root):
         print(f"the S3 door's endpoint: {endpoint}, TLS under the endpoint's authority")
         doors(mantle, client, out / "s3", root / "objects")
         plain(mantle, client, addresses[1][2], root / "plain")
+        # Nothing the check removed is freed within it, so what each volume took is what its free
+        # segments fell by, which the model bounds.
+        for node, (_, segment, need), before in zip(nodes, sized, free):
+            took = (before - node.free()) // segment
+            if took > need - CLEANER_RESERVE:
+                raise Failed(f"{node.name}'s volume took {took} segments, past the {need - CLEANER_RESERVE} the model bounds")
+            print(f"{node.name}'s volume took {took} segments of the {need - CLEANER_RESERVE} the model bounds")
         # Its peers serving on, a founder stops in order: its ranges handed over, exiting 0.
         status = nodes[0].stop()
         if status != 0:
             raise Failed(f"{nodes[0].name} stopped in order and exited {status}")
         print(f"{nodes[0].name} stopped in order, exit 0")
     except BaseException:
-        for node in nodes:
-            print(node.said(), file=sys.stderr)
+        print(f"each node's whole output is under {logs}", file=sys.stderr)
         raise
     finally:
         for node in nodes:
@@ -373,6 +558,42 @@ def session(mantle, root):
 
 # The doors a client's object commands ask the cell through (`mantle --door`).
 DOORS = ("native", "s3")
+
+
+def one(door):
+    """The largest object one request through DOOR carries: a native run, which the node takes
+    whole, or a byte short of the S3 door's threshold, one PutObject."""
+    return RUN if door == "native" else CLI_PART - 1
+
+
+def unit(door):
+    """What a copy through DOOR commits at a time: a run, or a part."""
+    return RUN if door == "native" else CLI_PART
+
+
+def resumed(door):
+    """The length of the copy through DOOR the check kills and runs again: its first unit, which
+    commits before the kill; its second, in flight then and never whole, since the feed stops a
+    piece and a pipe's buffer past the first (pipe(7): 65,536 bytes on Linux), far short of a unit;
+    and a byte, a third unit the killed copy never began."""
+    return 2 * unit(door) + 1
+
+
+def puts():
+    """Every file the check puts into the founders' volumes, by length, for `segments`: through each
+    door an object of `one` and one a byte longer, from a file and from standard input; a multipart
+    upload of S3's least part and a last part of a byte; the killed copy's committed unit and the
+    one in flight, then the copy run again; and the AWS CLI's and the plain-HTTP leg's objects of
+    `one` and a byte longer through the S3 door."""
+    out = []
+    for door in DOORS:
+        for length in (one(door), one(door) + 1):
+            out += files(door, length) * 2
+        out += [LEAST_PART, 1]
+        out += [unit(door)] + cut(resumed(door), unit(door))
+    for length in (one("s3"), one("s3") + 1):
+        out += files("s3", length) * 2
+    return out
 
 
 def committed(lines, at):
@@ -399,15 +620,12 @@ def resume(mantle, client, door, at, data):
     holds, commits each run or part after and none before, and AT holds DATA, its ETag DATA's MD5
     as one PUT's is through the native door, the MD5 of its parts' MD5s and their count through the
     S3 door's multipart upload. What the killed copy said last it committed is what the cell lists
-    of the open upload and where the copy run again goes on.
+    of the open upload and where the copy run again goes on; its runs or parts are each `unit`.
 
-    Standard input is fed a piece at a time, and no piece follows once a run or a part is said
-    committed, so the copy holds at most its run or part and a piece past it when it is killed: far
-    short of DATA, which is four of the AWS CLI's parts long."""
-    # A fifth of S3's least part, the least a run can be (crates/meta/src/name.rs, run_length): the
-    # copy is fed less than one run past its first before the feed stops.
-    piece = LEAST_PART // 5
-    unit = "runs" if door == "native" else "parts"
+    Standard input is fed in the client's own pieces (PIECE), and no piece follows once a run or a
+    part is said committed, so the copy holds at most its unit and a piece past it when it is
+    killed (`resumed`)."""
+    units = "runs" if door == "native" else "parts"
     command = [mantle, "--client", client, "--door", door, "cp", "-", at, "--size", len(data)]
     copying = subprocess.Popen(
         [str(a) for a in command],
@@ -429,10 +647,10 @@ def resume(mantle, client, door, at, data):
     def feed():
         # A write to a copy killed meanwhile fails: that ends the feed.
         try:
-            for start in range(0, len(data), piece):
+            for start in range(0, len(data), PIECE):
                 if fed.is_set():
                     return
-                copying.stdin.write(data[start : start + piece])
+                copying.stdin.write(data[start : start + PIECE])
                 copying.stdin.flush()
         except OSError:
             return
@@ -461,7 +679,8 @@ def resume(mantle, client, door, at, data):
     def asked(*args):
         return said(run([mantle, "--client", client, "--door", door, *args]))
 
-    # The cell holds the open upload the killed copy left, its parts what it said committed.
+    # The cell holds the open upload the killed copy left, its parts what it said committed, each
+    # the door's unit.
     bucket, key = at[len("s3://"):].split("/", 1)
     uploads = asked("multipart", "uploads", f"s3://{bucket}")
     open_ids = [w[1] for w in (l.split() for l in uploads.splitlines()) if len(w) == 3 and w[2] == key]
@@ -470,16 +689,16 @@ def resume(mantle, client, door, at, data):
     parts = asked("multipart", "parts", at, open_ids[0])
     sizes = [int(l.split()[1]) for l in parts.splitlines()]
     if len(sizes) != runs or sum(sizes) != offset:
-        raise Failed(f"the killed copy said {runs} {unit}, {offset} bytes durable; the cell lists {parts}")
+        raise Failed(f"the killed copy said {runs} {units}, {offset} bytes durable; the cell lists {parts}")
+    if set(sizes) != {unit(door)}:
+        raise Failed(f"the killed copy's {units} are {sizes} bytes, not the door's {unit(door)}")
 
     again = run(command, input=data)
     lines = again.stderr.decode(errors="replace").splitlines()
     first = next((n for n, l in enumerate(lines) if l.startswith(f"{at}: resuming upload ")), None)
-    if first is None or not lines[first].endswith(f" at {offset} bytes, {runs} {unit}"):
-        raise Failed(f"the copy run again did not resume at {offset} bytes, {runs} {unit}: {lines}")
-    # Every run or part the length of the first, the last whatever is left.
-    length = sizes[0]
-    total = -(-len(data) // length)
+    if first is None or not lines[first].endswith(f" at {offset} bytes, {runs} {units}"):
+        raise Failed(f"the copy run again did not resume at {offset} bytes, {runs} {units}: {lines}")
+    total = len(cut(len(data), unit(door)))
     after = [n for n, _ in committed(lines[first:], at)]
     if after != list(range(runs + 1, total + 1)):
         raise Failed(f"the resumed copy committed {after}, not {runs + 1} to {total}")
@@ -487,21 +706,24 @@ def resume(mantle, client, door, at, data):
     if door == "native":
         etag = hashlib.md5(data).hexdigest()
     else:
-        cut = [data[n : n + length] for n in range(0, len(data), length)]
-        etag = hashlib.md5(b"".join(hashlib.md5(c).digest() for c in cut)).hexdigest() + f"-{len(cut)}"
+        pieces = cut(len(data), unit(door))
+        starts = [sum(pieces[:n]) for n in range(len(pieces))]
+        digests = b"".join(hashlib.md5(data[a : a + n]).digest() for a, n in zip(starts, pieces))
+        etag = hashlib.md5(digests).hexdigest() + f"-{len(pieces)}"
     head = asked("head", at).splitlines()
     if f"size {len(data)}" not in head or f'etag "{etag}"' not in head:
         raise Failed(f"head of {at} through {door}: {head}, not etag {etag}")
-    print(f"{at}: killed after {runs} {unit}, {offset} bytes; resumed there, {runs + 1} to {total}")
+    print(f"{at}: killed after {runs} {units}, {offset} bytes; resumed there, {runs + 1} to {total}")
 
 
-def commands(mantle, client, door, bucket, dir, seed):
-    """Every object command of the client through DOOR, into BUCKET: `mb`; `cp` from a file below
-    the AWS CLI's 8 MiB multipart threshold and one past it, and back to a file; from standard input
-    below it and past it, and back to standard output; `head`; `ls` of a prefix's keys and of the
-    bucket's prefixes; a multipart upload's every step, read back, and another aborted; a copy killed
-    and resumed. The objects it put, by key."""
-    s3 = f"s3://{bucket}"
+def commands(mantle, client, door, dir):
+    """Every object command of the client through DOOR, into a bucket of its name: `mb`; `cp` from a
+    file of `one` bytes, the most one request carries, and of a byte more, the least past it, and
+    back to a file; from standard input of the same two, and back to standard output; `head`; `ls`
+    of a prefix's keys and of the bucket's prefixes; a multipart upload's every step, its first part
+    S3's least and its last a byte, read back, and another aborted; a copy killed and resumed. The
+    objects it put, by key."""
+    s3 = f"s3://{door}"
 
     def asked(*args, input=None, ok=True):
         return run([mantle, "--client", client, "--door", door, *args], input=input, ok=ok)
@@ -514,22 +736,20 @@ def commands(mantle, client, door, bucket, dir, seed):
     objects = {}
     if f"made {s3}" not in said(asked("mb", s3)):
         raise Failed(f"mantle --door {door} mb said no bucket made")
-    for key, size in (("from/file", (3 << 20) + 17), ("from/large", 2 * CLI_PART + 12_345)):
-        data = object_bytes(seed, size)
-        seed += 1
+    for key, size in (("from/file-one", one(door)), ("from/file-past", one(door) + 1)):
+        data = content(f"{s3}/{key}", size)
         asked("cp", file(key.replace("/", "-"), data), f"{s3}/{key}")
         back = dir / f"{door}-back"
         asked("cp", f"{s3}/{key}", back)
         same(f"mantle --door {door} cp of {key} to a file", back.read_bytes(), data)
         objects[key] = data
-    for key, size in (("from/stdin", CLI_PART + (1 << 20) + 3), ("from/small", 100_003)):
-        data = object_bytes(seed, size)
-        seed += 1
+    for key, size in (("from/stdin-one", one(door)), ("from/stdin-past", one(door) + 1)):
+        data = content(f"{s3}/{key}", size)
         asked("cp", "-", f"{s3}/{key}", input=data)
         same(f"mantle --door {door} cp of {key} to standard output", asked("cp", f"{s3}/{key}", "-").stdout, data)
         objects[key] = data
-    head = said(asked("head", f"{s3}/from/stdin")).splitlines()
-    if f"size {len(objects['from/stdin'])}" not in head:
+    head = said(asked("head", f"{s3}/from/stdin-past")).splitlines()
+    if f"size {len(objects['from/stdin-past'])}" not in head:
         raise Failed(f"mantle --door {door} head: {head}")
     keys = said(asked("ls", f"{s3}/from/"))
     for key, data in objects.items():
@@ -538,13 +758,12 @@ def commands(mantle, client, door, bucket, dir, seed):
     if "PRE from/" not in said(asked("ls", s3)).splitlines():
         raise Failed(f"mantle --door {door} ls lists no prefix from/")
 
-    # A multipart upload's steps: a part from a file, the last from standard input, listed,
-    # completed and read back; another aborted.
+    # A multipart upload's steps: S3's least part from a file, the last a byte from standard input,
+    # listed, completed and read back; another aborted.
     upload = said(asked("multipart", "create", f"{s3}/parts")).strip()
-    first, last = object_bytes(seed, LEAST_PART), object_bytes(seed + 1, 4096)
-    seed += 2
-    one = said(asked("multipart", "put", f"{s3}/parts", upload, "1", file("part-1", first)))
-    two = said(
+    first, last = content(f"{s3}/parts#1", LEAST_PART), content(f"{s3}/parts#2", 1)
+    one_put = said(asked("multipart", "put", f"{s3}/parts", upload, "1", file("part-1", first)))
+    two_put = said(
         asked(
             "multipart", "put", f"{s3}/parts", upload, "2", "-", "--length", len(last),
             input=last,
@@ -555,7 +774,7 @@ def commands(mantle, client, door, bucket, dir, seed):
         raise Failed(f"mantle --door {door} multipart parts: {parts}")
     if upload not in said(asked("multipart", "uploads", s3)):
         raise Failed(f"mantle --door {door} multipart uploads lists no open upload")
-    etags = [f"{n}={line.split()[1]}" for n, line in ((1, one), (2, two))]
+    etags = [f"{n}={line.split()[1]}" for n, line in ((1, one_put), (2, two_put))]
     completed = said(asked("multipart", "complete", f"{s3}/parts", upload, *etags))
     if '-2"' not in completed:
         raise Failed(f"mantle --door {door} multipart complete: {completed}")
@@ -565,12 +784,12 @@ def commands(mantle, client, door, bucket, dir, seed):
     asked("multipart", "abort", f"{s3}/aborted", aborted)
     if aborted in said(asked("multipart", "uploads", s3)):
         raise Failed(f"mantle --door {door} multipart uploads lists an aborted upload")
-    resumed = object_bytes(seed, 4 * CLI_PART + 12_345)
-    resume(mantle, client, door, f"{s3}/resumed", resumed)
-    objects["resumed"] = resumed
+    data = content(f"{s3}/resumed", resumed(door))
+    resume(mantle, client, door, f"{s3}/resumed", data)
+    objects["resumed"] = data
     print(
-        f"{door} door: mb, cp from and to a file and standard input below and past the multipart "
-        "threshold, a copy killed and resumed, head, ls, every multipart step"
+        f"{door} door: mb, cp from and to a file and standard input of the most one request carries "
+        "and a byte more, a copy killed and resumed, head, ls, every multipart step"
     )
     return objects
 
@@ -581,7 +800,7 @@ def doors(mantle, client, profile, dir):
     dir.mkdir()
     aws = stock_client(profile)
     print(said(aws("--version")), end="")
-    put = {door: commands(mantle, client, door, door, dir, 10 * n) for n, door in enumerate(DOORS)}
+    put = {door: commands(mantle, client, door, dir) for door in DOORS}
     across(mantle, client, put, dir)
     stock(aws, mantle, client, put, dir)
     removed(mantle, client, put)
@@ -617,13 +836,13 @@ def across(mantle, client, put, dir):
             got = through(mantle, client, door, "cp", f"s3://{other}/{key}", "-").stdout
             same(f"--door {door} cp of {other}/{key}", got, data)
         back = dir / "across.back"
-        through(mantle, client, door, "cp", f"s3://{other}/from/large", back)
-        same(f"--door {door} cp of {other}/from/large to a file", back.read_bytes(), put[other]["from/large"])
+        through(mantle, client, door, "cp", f"s3://{other}/from/file-past", back)
+        same(f"--door {door} cp of {other}/from/file-past to a file", back.read_bytes(), put[other]["from/file-past"])
     for listing in (["ls"], ["ls", "s3://native/from/"], ["ls", "s3://s3/"], ["multipart", "uploads", "s3://s3"]):
         native, s3 = (said(through(mantle, client, d, *listing)) for d in DOORS)
         if native != s3:
             raise Failed(f"{' '.join(listing)}: the native door says\n{native}the S3 door says\n{s3}")
-    for key in ("from/file", "parts", "resumed"):
+    for key in ("from/file-one", "parts", "resumed"):
         heads = [
             [
                 l
@@ -641,26 +860,27 @@ def across(mantle, client, put, dir):
 
 
 def stock(aws, mantle, client, put, dir):
-    """The stock client: a bucket, an object below the CLI's multipart threshold and one past it, up
-    and back, listed and headed, then read back through both of the client's doors; what each door
-    PUT read back by the AWS CLI; and its bucket removed."""
+    """The stock client: a bucket, an object of the most one PutObject carries below the CLI's
+    multipart threshold and one a byte longer, at it, up and back, listed and headed, then read back
+    through both of the client's doors; what each door PUT read back by the AWS CLI; and its bucket
+    removed."""
     aws("s3", "mb", "s3://stock")
-    small, large = object_bytes(50, 100_003), object_bytes(51, 2 * CLI_PART + 12_345)
-    for key, data in (("small", small), ("large", large)):
+    objects = {key: content(f"s3://stock/{key}", size) for key, size in (("one", one("s3")), ("past", one("s3") + 1))}
+    for key, data in objects.items():
         path = dir / key
         path.write_bytes(data)
         aws("s3", "cp", "--no-progress", path, f"s3://stock/{key}")
     listed = said(aws("s3", "ls", "s3://stock/"))
-    for size, key in ((len(small), "small"), (len(large), "large")):
-        if not any(line.split()[-2:] == [str(size), key] for line in listed.splitlines()):
-            raise Failed(f"aws s3 ls lists no {size} {key}: {listed}")
+    for key, data in objects.items():
+        if not any(line.split()[-2:] == [str(len(data)), key] for line in listed.splitlines()):
+            raise Failed(f"aws s3 ls lists no {len(data)} {key}: {listed}")
     length = said(
-        aws("s3api", "head-object", "--bucket", "stock", "--key", "large",
+        aws("s3api", "head-object", "--bucket", "stock", "--key", "past",
             "--query", "ContentLength", "--output", "text")
     ).strip()
-    if length != str(len(large)):
-        raise Failed(f"aws s3api head-object: ContentLength {length}, not {len(large)}")
-    for key, data in (("small", small), ("large", large)):
+    if length != str(len(objects["past"])):
+        raise Failed(f"aws s3api head-object: ContentLength {length}, not {len(objects['past'])}")
+    for key, data in objects.items():
         back = dir / f"{key}.back"
         aws("s3", "cp", "--no-progress", f"s3://stock/{key}", back)
         same(f"aws s3 cp of {key}", back.read_bytes(), data)
@@ -668,14 +888,14 @@ def stock(aws, mantle, client, put, dir):
             got = through(mantle, client, door, "cp", f"s3://stock/{key}", "-").stdout
             same(f"--door {door} cp of stock/{key}", got, data)
     for door in DOORS:
-        for key in ("from/file", "parts", "resumed"):
+        for key in ("from/file-one", "parts", "resumed"):
             back = dir / "aws.back"
             aws("s3", "cp", "--no-progress", f"s3://{door}/{key}", back)
             same(f"aws s3 cp of {door}/{key}", back.read_bytes(), put[door][key])
-    aws("s3", "rm", "s3://stock/small")
-    aws("s3", "rm", "s3://stock/large")
+    for key in objects:
+        aws("s3", "rm", f"s3://stock/{key}")
     aws("s3", "rb", "s3://stock")
-    print("the AWS CLI: s3 mb, cp below and past the multipart threshold, ls, s3api head-object, rm, "
+    print("the AWS CLI: s3 mb, cp below and at the multipart threshold, ls, s3api head-object, rm, "
           "rb; each of the client's doors reads what it put, and it reads what each put")
 
 
@@ -716,8 +936,9 @@ def endpoint_url(config):
 
 def plain(mantle, client, s3, dir):
     """The S3 door over plain HTTP, as a loopback endpoint serves it: a copy of the client whose S3
-    profile names the founder listening at S3, `http://S3`, asks mb, cp from a file and from standard
-    input, up and back, ls, head, rm and rb, each object read back through the native door."""
+    profile names the founder listening at S3, `http://S3`, asks mb, cp from a file of the most one
+    PutObject carries and from standard input of a byte more, a multipart upload, up and back, ls,
+    head, rm and rb, each object read back through the native door."""
     copy = dir / "client"
     shutil.copytree(client, copy, ignore=shutil.ignore_patterns("journal"))
     config = copy / "s3" / "config"
@@ -735,43 +956,61 @@ def plain(mantle, client, s3, dir):
 
     if "made s3://plain" not in said(asked("mb", "s3://plain")):
         raise Failed("mantle --door s3 mb over plain HTTP said no bucket made")
-    from_file, from_stdin = object_bytes(60, (3 << 20) + 5), object_bytes(61, CLI_PART + 7)
+    objects = {key: content(f"s3://plain/{key}", size) for key, size in (("file", one("s3")), ("stdin", one("s3") + 1))}
     source = dir / "from-file"
-    source.write_bytes(from_file)
+    source.write_bytes(objects["file"])
     asked("cp", source, "s3://plain/file")
     back = dir / "file.back"
     asked("cp", "s3://plain/file", back)
-    same("cp over plain HTTP to a file", back.read_bytes(), from_file)
-    asked("cp", "-", "s3://plain/stdin", input=from_stdin)
-    same("cp over plain HTTP to standard output", asked("cp", "s3://plain/stdin", "-").stdout, from_stdin)
-    for key, data in (("file", from_file), ("stdin", from_stdin)):
+    same("cp over plain HTTP to a file", back.read_bytes(), objects["file"])
+    asked("cp", "-", "s3://plain/stdin", input=objects["stdin"])
+    same("cp over plain HTTP to standard output", asked("cp", "s3://plain/stdin", "-").stdout, objects["stdin"])
+    for key, data in objects.items():
         same(f"--door native cp of plain/{key}", through(mantle, client, "native", "cp", f"s3://plain/{key}", "-").stdout, data)
         if f"size {len(data)}" not in said(asked("head", f"s3://plain/{key}")).splitlines():
             raise Failed(f"head of plain/{key} over plain HTTP")
     keys = said(asked("ls", "s3://plain/"))
-    for key, data in (("file", from_file), ("stdin", from_stdin)):
+    for key, data in objects.items():
         if not any(l.split()[1:] == [str(len(data)), key] for l in keys.splitlines()):
             raise Failed(f"ls over plain HTTP lists no {len(data)} {key}: {keys}")
-    asked("rm", "s3://plain/file")
-    asked("rm", "s3://plain/stdin")
+    for key in objects:
+        asked("rm", f"s3://plain/{key}")
     if "removed s3://plain" not in said(asked("rb", "s3://plain")):
         raise Failed("rb over plain HTTP said no bucket removed")
     print(f"the S3 door over plain HTTP at http://{s3}: mb, cp from a file and standard input, up and "
           "back, ls, head, rm, rb; each object read back through the native door")
 
 
-def transfer(mantle, root):
-    """The binary's transfer harness at the scale CI runs it (crates/mantle/tests/transfer.rs): it
-    exits non-zero when any check is not exact."""
-    ran = run(
-        [mantle, "bench", "transfer", root, "--small", "1000", "--large", "20M", "--count", "4",
-         "--seed", "5"]
-    )
-    print(said(ran), end="")
+# The ways the transfer harness puts a large object (`mantle bench transfer --ways`): natively in
+# runs, by the AWS CLI from its standard input, natively in parts and by boto3 in parts.
+WAYS = ("native", "cli", "native-parts", "boto-parts")
 
 
-def check(version, target, archive):
+def transfer(mantle, root, logs):
+    """The binary's transfer harness at the scale of the plan's smoke, as CI's suite runs it
+    (crates/mantle/tests/transfer.rs; research/76): the least of the small sets the owner agreed,
+    1,000 objects (research/76 [4] f2); a large case of 20 MiB objects, three blocks and three of
+    the AWS CLI's parts, the last short of S3's least part (docs/design/node.md), one object for
+    each of the harness's four ways; and the harness's own seed. It exits non-zero when any check is
+    not exact; what it and its nodes said is kept in LOGS."""
+    out, err = logs / "transfer.out", logs / "transfer.err"
+    with open(out, "wb") as o, open(err, "wb") as e:
+        ran = subprocess.run(
+            [str(mantle), "bench", "transfer", str(root), "--small", "1000", "--large", "20M",
+             "--count", str(len(WAYS))],
+            stdin=subprocess.DEVNULL,
+            stdout=o,
+            stderr=e,
+        )
+    print(out.read_text(errors="replace"), end="")
+    if ran.returncode != 0:
+        raise Failed(f"mantle bench transfer exited {ran.returncode}; its output and its nodes' are {out} and {err}")
+
+
+def check(version, target, archive, logs):
     archive = Path(archive).resolve()
+    logs = Path(logs).resolve()
+    logs.mkdir(parents=True, exist_ok=True)
     stem, name = archive_names(version, target)
     if archive.name != name:
         raise Failed(f"{archive.name} is not {name}")
@@ -787,8 +1026,8 @@ def check(version, target, archive):
         if version_said != f"mantle {version}":
             raise Failed(f"the binary says {version_said!r}, not 'mantle {version}'")
         print(version_said)
-        session(mantle, work / "session")
-        transfer(mantle, work / "transfer")
+        session(mantle, work / "session", logs / "session")
+        transfer(mantle, work / "transfer", logs)
     finally:
         shutil.rmtree(work, ignore_errors=True)
     print(f"{name}: server and client through both doors, every byte as put")
@@ -831,6 +1070,9 @@ def main():
     checked.add_argument("version")
     checked.add_argument("target")
     checked.add_argument("archive")
+    checked.add_argument(
+        "--logs", required=True, help="where each process's whole output is kept, for a failure's artifact"
+    )
     args = parser.parse_args()
     # Each line as it is said, interleaved with the commands' own in the job's log.
     sys.stdout.reconfigure(line_buffering=True)
@@ -840,7 +1082,7 @@ def main():
         elif args.step == "package":
             package(args.version, args.target, args.binary, args.out)
         else:
-            check(args.version, args.target, args.archive)
+            check(args.version, args.target, args.archive, args.logs)
     except Failed as e:
         print(f"release: {e}", file=sys.stderr)
         sys.exit(1)

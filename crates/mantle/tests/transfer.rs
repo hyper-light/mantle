@@ -65,12 +65,7 @@ fn line<'a>(said: &'a str, case: &str) -> &'a str {
 fn the_small_set_and_large_objects_in_every_way_read_back_exactly() {
     let root = tempfile::tempdir().unwrap();
     let run = root.path().join("run");
-    let said = transfer(
-        &run,
-        &[
-            "--small", "1000", "--large", "20M", "--count", "4", "--seed", "5",
-        ],
-    );
+    let said = transfer(&run, &["--small", "1000", "--large", "20M", "--count", "4"]);
     for door in ["native", "http"] {
         let row = row(&said, &format!("small 1000 {door}"));
         // case (3 words), objects, bytes, six latencies (2 words each), refused, wrong, missing.

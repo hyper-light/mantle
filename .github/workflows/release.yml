@@ -89,7 +89,16 @@ jobs:
         run: bash scripts/stock-clients.sh
       - name: The archive as a user takes it, the server and the client through both doors
         shell: bash
-        run: ${{ matrix.python }} scripts/release.py check "$VERSION" ${{ matrix.target }} "$ARCHIVE"
+        run: ${{ matrix.python }} scripts/release.py check "$VERSION" ${{ matrix.target }} "$ARCHIVE" --logs check-logs
+      # Every process's whole output, each node's and the transfer harness's, kept where the check
+      # failed.
+      - name: The check's logs, kept on its failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: check-logs-${{ matrix.target }}
+          path: check-logs/
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mantle-${{ env.VERSION }}-${{ matrix.target }}

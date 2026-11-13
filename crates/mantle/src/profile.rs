@@ -14,8 +14,7 @@ use std::path::{Path, PathBuf};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
-/// The profile's name, in both files (`mantle init`).
-pub const PROFILE: &str = "mantle";
+use crate::init::PROFILE;
 
 /// What a client signs with and asks: the cell's access key, its region, its endpoint where the
 /// config names one, and the endpoint's authority, DER.

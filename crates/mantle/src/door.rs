@@ -12,10 +12,12 @@
 //! a stock S3 client's patience, 60 s without a byte (`bounds::STOCK_PATIENCE`).
 //!
 //! **What it asks again.** A request the listener let go of its connection before answering is
-//! asked once more on a new connection, where it is idempotent (RFC 9112 §9.3.1); a `503` is asked
-//! again as the native client asks a `SlowDown` (research/73): at most [`ATTEMPTS`] in all, after
-//! botocore's full-jitter backoff, paid from the same retry quota. A body read once (standard input
-//! streamed to a part) is never sent twice.
+//! asked once more on a new connection, where it is idempotent (RFC 9112 §9.3.1); one that is not
+//! (CreateMultipartUpload, CompleteMultipartUpload) is sent only on a connection that has carried
+//! nothing before, so a kept connection the listener let go as quiet never takes one. A `503` is
+//! asked again as the native client asks a `SlowDown` (research/73): at most [`ATTEMPTS`] in all,
+//! after botocore's full-jitter backoff, paid from the same retry quota. A body read once (standard
+//! input streamed to a part) is never sent twice.
 //!
 //! **A copy into the cell** goes as the AWS CLI's does (research/73 [10]): an object of fewer than
 //! [`PART`] bytes in one PutObject, a larger one as a multipart upload in parts of [`PART`], or of
@@ -540,27 +542,38 @@ impl S3Door {
         })
     }
 
-    /// A connection to the endpoint, its TLS handshake run where it is one.
+    /// A connection to the endpoint, its TLS handshake run where it is one: each address its name
+    /// resolves to tried in the resolver's order, each held to the patience, until one answers, as
+    /// Python's `socket.create_connection` and urllib3's, which botocore's pool dials through, try
+    /// them (research/86 [9]); the last one's failure where none does.
     async fn connect(&self) -> Result<Conn, Error> {
-        let address: SocketAddr = match self.endpoint.host.parse::<std::net::IpAddr>() {
-            Ok(ip) => SocketAddr::new(ip, self.endpoint.port),
-            Err(_) => hyper_rt::dns::resolve(&self.endpoint.host, self.endpoint.port, 1)
+        let addresses: Vec<SocketAddr> = match self.endpoint.host.parse::<std::net::IpAddr>() {
+            Ok(ip) => vec![SocketAddr::new(ip, self.endpoint.port)],
+            Err(_) => hyper_rt::dns::resolve(&self.endpoint.host, self.endpoint.port, usize::MAX)
                 .await
-                .map_err(|e| Error::Http(format!("{}: {e:?}", self.endpoint.host)))?
-                .into_iter()
-                .next()
-                .ok_or_else(|| Error::Http(format!("{}: no address", self.endpoint.host)))?,
+                .map_err(|e| Error::Http(format!("{}: {e:?}", self.endpoint.host)))?,
         };
-        let stream = match race2(TcpStream::connect(address), sleep(patience_ns())).await {
-            Either::First(stream) => {
-                stream.map_err(|e| Error::Http(format!("connecting to {address}: {e:?}")))?
+        let mut failed = Error::Http(format!("{}: no address", self.endpoint.host));
+        let mut dialed = None;
+        for address in addresses {
+            match race2(TcpStream::connect(address), sleep(patience_ns())).await {
+                Either::First(Ok(stream)) => {
+                    dialed = Some(stream);
+                    break;
+                }
+                Either::First(Err(e)) => {
+                    failed = Error::Http(format!("connecting to {address}: {e:?}"));
+                }
+                Either::Second(_) => {
+                    failed = Error::Http(format!(
+                        "connecting to {address}: no answer in {} s",
+                        STOCK_PATIENCE.as_secs()
+                    ));
+                }
             }
-            Either::Second(_) => {
-                return Err(Error::Http(format!(
-                    "connecting to {address}: no answer in {} s",
-                    STOCK_PATIENCE.as_secs()
-                )));
-            }
+        }
+        let Some(stream) = dialed else {
+            return Err(failed);
         };
         if !self.endpoint.tls {
             return Ok(Conn::Plain(stream));
@@ -600,7 +613,7 @@ impl S3Door {
     /// head buffer: every header signed, the length the codec's to write.
     fn sign<B>(&mut self, ask: &Ask<'_>, body: &Sent<'_, B>) -> Result<(), Error> {
         let (stamp, day) =
-            timestamp().ok_or_else(|| Error::Http("the clock is past what S3 dates".into()))?;
+            crate::bench_s3::timestamp().map_err(|e| Error::Http(format!("signing: {e}")))?;
         let mut path = String::from("/");
         path.push_str(&sigv4::uri_encode(ask.bucket.as_bytes(), true));
         if let Some(key) = ask.key {
@@ -711,6 +724,12 @@ impl S3Door {
         let mut stale = false;
         loop {
             attempts = attempts.saturating_add(1);
+            // A request that may not be asked twice (RFC 9112 §9.3.1) goes on a connection that
+            // has carried nothing, which the listener cannot have let go as quiet: a POST is
+            // never left to a kept connection's chance.
+            if !ask.idempotent() {
+                self.drop_conn().await;
+            }
             let reused = self.conn.is_some();
             match self.once(ask, body).await {
                 Ok(answered)
@@ -1030,29 +1049,18 @@ fn crypto(e: impl std::fmt::Debug) -> Error {
     Error::Runtime(format!("{e:?}"))
 }
 
+/// A page whose continuation is the one it was asked from: the next would list it again, and the
+/// listing would never end (CLAUDE.md §2).
+fn repeated(op: &str) -> Error {
+    Error::Http(format!("{op}: a page whose continuation does not move on"))
+}
+
 fn too_large() -> Error {
     Error::Usage("a length past what this platform addresses".into())
 }
 
 fn xml(op: &str) -> impl Fn(mantle_s3::xml::XmlError) -> Error + '_ {
     move |e| Error::Http(format!("{op}: its response's document: {e}"))
-}
-
-/// `YYYYMMDDTHHMMSSZ` and `YYYYMMDD` now, as SigV4 dates a request (research/05 §1.2).
-pub(crate) fn timestamp() -> Option<(String, String)> {
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_millis();
-    let iso = mantle_s3::time::iso8601(i64::try_from(millis).ok()?)?;
-    let compact: String = iso
-        .get(..19)?
-        .chars()
-        .filter(|c| *c != '-' && *c != ':')
-        .collect();
-    let stamp = format!("{compact}Z");
-    let day = stamp.get(..8)?.to_owned();
-    Some((stamp, day))
 }
 
 /// An `aws-chunked` body's octets on the wire for `length` bytes: each piece's chunk head, its
@@ -1456,8 +1464,9 @@ async fn list_buckets(door: &mut S3Door, out: &mut impl Write) -> Result<(), Err
             "max-buckets",
             mantle_protocol::object::MAX_BUCKETS.to_string(),
         );
-        if let Some(token) = token.take() {
-            ask = ask.query("continuation-token", token);
+        let asked = token.take();
+        if let Some(token) = &asked {
+            ask = ask.query("continuation-token", token.clone());
         }
         let doc = door.document(&ask, None).await?;
         let (buckets, next) = list_buckets_document(&doc).map_err(xml(ask.op))?;
@@ -1465,6 +1474,7 @@ async fn list_buckets(door: &mut S3Door, out: &mut impl Write) -> Result<(), Err
             line(out, format_args!("{created} {bucket}"))?;
         }
         match next {
+            Some(next) if Some(&next) == asked.as_ref() => return Err(repeated(ask.op)),
             Some(next) => token = Some(next),
             None => return Ok(()),
         }
@@ -1481,8 +1491,9 @@ async fn list_keys(door: &mut S3Door, at: &Location, out: &mut impl Write) -> Re
             .query("prefix", at.key.clone())
             .query("delimiter", "/")
             .query("max-keys", mantle_s3::list::MAX_KEYS.to_string());
-        if let Some(token) = token.take() {
-            ask = ask.query("continuation-token", token);
+        let asked = token.take();
+        if let Some(token) = &asked {
+            ask = ask.query("continuation-token", token.clone());
         }
         let doc = door.document(&ask, None).await?;
         let page = list_objects_document(&doc).map_err(xml(ask.op))?;
@@ -1493,6 +1504,7 @@ async fn list_keys(door: &mut S3Door, at: &Location, out: &mut impl Write) -> Re
             line(out, format_args!("{modified} {size} {key}"))?;
         }
         match page.next {
+            Some(next) if Some(&next) == asked.as_ref() => return Err(repeated(ask.op)),
             Some(next) => token = Some(next),
             None => return Ok(()),
         }
@@ -1520,11 +1532,7 @@ async fn all_parts(
         all.extend(parts);
         match next {
             Some(next) if next > marker => marker = next,
-            Some(_) => {
-                return Err(Error::Http(
-                    "ListParts: a next marker that does not move on".into(),
-                ));
-            }
+            Some(_) => return Err(repeated(ask.op)),
             None => return Ok(all),
         }
     }
@@ -1540,8 +1548,11 @@ async fn list_uploads(door: &mut S3Door, bucket: &str, out: &mut impl Write) -> 
                 "max-uploads",
                 mantle_protocol::object::MAX_PAGE_PARTS.to_string(),
             );
-        if let Some((key, id)) = markers.take() {
-            ask = ask.query("key-marker", key).query("upload-id-marker", id);
+        let asked = markers.take();
+        if let Some((key, id)) = &asked {
+            ask = ask
+                .query("key-marker", key.clone())
+                .query("upload-id-marker", id.clone());
         }
         let doc = door.document(&ask, None).await?;
         let (uploads, next) = list_uploads_document(&doc).map_err(xml(ask.op))?;
@@ -1549,6 +1560,7 @@ async fn list_uploads(door: &mut S3Door, bucket: &str, out: &mut impl Write) -> 
             line(out, format_args!("{initiated} {id} {key}"))?;
         }
         match next {
+            Some(next) if Some(&next) == asked.as_ref() => return Err(repeated(ask.op)),
             Some(next) => markers = Some(next),
             None => return Ok(()),
         }
@@ -1560,7 +1572,10 @@ async fn head(door: &mut S3Door, at: &Location, out: &mut impl Write) -> Result<
     let ask = Ask::new("HeadObject", "HEAD", &at.bucket, Some(&at.key))
         .header("x-amz-checksum-mode", "ENABLED");
     let answered = door.done::<Nothing>(&ask, &mut Sent::None).await?;
-    let size = answered.field("content-length").unwrap_or("0");
+    let size: u64 = answered
+        .field("content-length")
+        .and_then(|l| l.parse().ok())
+        .ok_or_else(|| Error::Http("HeadObject: no Content-Length".into()))?;
     line(out, format_args!("size {size}"))?;
     line(
         out,

@@ -311,8 +311,24 @@ fn connect(at: SocketAddr, authority: Option<&[u8]>) -> Result<Connection, Error
 }
 
 /// `YYYYMMDDTHHMMSSZ` and `YYYYMMDD` now.
-fn timestamp() -> Result<(String, String), Error> {
-    crate::door::timestamp().ok_or_else(|| exchange("the time"))
+pub(crate) fn timestamp() -> Result<(String, String), Error> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(exchange)?
+        .as_millis();
+    let iso = i64::try_from(millis)
+        .ok()
+        .and_then(mantle_s3::time::iso8601)
+        .ok_or_else(|| exchange("the time"))?;
+    let compact: String = iso
+        .get(..19)
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| *c != '-' && *c != ':')
+        .collect();
+    let stamp = format!("{compact}Z");
+    let date = stamp.get(..8).unwrap_or_default().to_owned();
+    Ok((stamp, date))
 }
 
 /// A request's head, signed for `at` with the bench's key, `payload` as `x-amz-content-sha256`

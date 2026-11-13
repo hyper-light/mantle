@@ -55,7 +55,6 @@ use mantle_meta::root::MAX_DOMAIN;
 use mantle_protocol::node_name;
 
 use crate::files;
-use crate::profile::PROFILE;
 
 /// RFC 5280 §4.1.2.5: "To indicate that a certificate has no well-defined expiration date, the
 /// notAfter SHOULD be assigned the GeneralizedTime value of 99991231235959Z", in Unix seconds.
@@ -554,6 +553,10 @@ fn endpoint_url(founder: &Founder) -> Option<String> {
     };
     Some(format!("{scheme}://{host}:{}", at.port()))
 }
+
+/// The profile stock S3 clients take the cell by (AWS SDKs and Tools Reference Guide, the shared
+/// config and credentials files), named `mantle`.
+pub(crate) const PROFILE: &str = "mantle";
 
 /// The operator's S3 profile in `dir` (OUT/s3; research/71): the access key as AWS's shared
 /// credentials file, owner-only; the endpoint's authority as PEM; and where `url` names the

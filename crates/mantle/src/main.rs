@@ -664,14 +664,22 @@ fn main() -> ExitCode {
                 .ok_or_else(|| "no client: --client DIR or MANTLE_CLIENT".to_owned())?;
             // The command line over the environment, as the AWS CLI's own settings rank
             // (docs/research/86 [1]).
-            let named = cli
-                .door
-                .clone()
-                .or_else(|| std::env::var("MANTLE_DOOR").ok());
-            let door = match named.as_deref() {
+            let named = match &cli.door {
+                Some(text) => Some((text.clone(), "--door")),
+                None => match std::env::var_os("MANTLE_DOOR") {
+                    Some(value) => Some((
+                        value.into_string().map_err(|value| {
+                            format!("MANTLE_DOOR {}: native or s3", value.to_string_lossy())
+                        })?,
+                        "MANTLE_DOOR",
+                    )),
+                    None => None,
+                },
+            };
+            let door = match named {
                 None => client::Door::Native,
-                Some(text) => client::Door::named(text)
-                    .ok_or_else(|| format!("--door {text}: native or s3"))?,
+                Some((text, from)) => client::Door::named(&text)
+                    .ok_or_else(|| format!("{from} {text}: native or s3"))?,
             };
             client::run(&dir, door, command, std::io::stdout()).map_err(|e| e.to_string())
         });

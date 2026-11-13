@@ -58,14 +58,18 @@ branch's own, unchanged), signed with SigV4 by mantle-s3's primitives over every
 §4, §6.3, its body's end judged once) and its body decoded as it streams by the codec's decoder.
 One connection is kept from request to request while the listener keeps it: plain on a loopback
 endpoint, TLS elsewhere, its handshake verified by the endpoint's authority alone (node.md §4.1),
+dialed at each address the endpoint's name resolves to in turn until one answers (research/86 [9]),
 on one hyper-rt shard, as the native door's client runs. Every wait on the socket is a stock S3
 client's patience, 60 s without a byte (research/77 D2).
 
 An idempotent request whose connection the listener let go before any octet of its answer is asked
-once more on a new connection; a `503` is asked again within three attempts after botocore's
+once more on a new connection; one that is not, CreateMultipartUpload and CompleteMultipartUpload,
+is sent only on a new connection, so a connection the listener let go as quiet never takes it; a
+`503` is asked again within three attempts after botocore's
 full-jitter backoff, from the native client's retry quota (research/86 [4], [7]). A body read once,
 a part streamed from standard input with `--length`, is never sent twice.
 
+A listing whose page names the continuation it was asked from is refused, so every listing ends.
 Every error is typed by its S3 code (`crates/mantle/src/s3_code.rs`: the 80 codes of S3's list and
 the 14 its listener adds, research/86 [3]); a code past them is said as it came.
 
@@ -102,7 +106,9 @@ document at most a ListObjectsV2 page's, 7.2 MB (research/86); a part from stand
 ## 4. How it is proven
 
 `scripts/release.py`'s archive check runs every command above through both doors against a cell of
-three, as a user takes the archive (docs/design/release.md §2): each object put through one door is
+three, as a user takes the archive (docs/design/release.md §2), the S3 door under TLS to its first
+founder's endpoint by the name `localhost`, and its plainer commands again over plain HTTP to a
+loopback founder's: each object put through one door is
 read back through the other, to standard output and to a file, byte for byte; each door lists the
 other's keys, buckets and uploads and heads its objects line for line as the other does; a copy
 from standard input is killed once it committed a part and resumed through each door. The codec's

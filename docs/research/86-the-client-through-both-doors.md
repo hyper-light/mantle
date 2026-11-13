@@ -3,7 +3,8 @@
 Status: research note, 2026-11-12. For the S3 door of mantle's object commands
 (docs/design/doors.md, `crates/mantle/src/door.rs`, `crates/mantle/src/profile.rs`,
 `crates/mantle/src/s3_code.rs`, `crates/http/src/response.rs`). Sources [1] to [8] were read on
-2026-11-12: [1] to [3] and [6] are AWS's documentation, [4], [5] and [8] the IETF's.
+2026-11-12: [1] to [3] and [6] are AWS's documentation, [4], [5] and [8] the IETF's, [9] Python's
+and urllib3's.
 
 ## The question
 
@@ -95,6 +96,15 @@ authority).
 [8] RFC 7468, "Textual Encodings of PKIX, PKCS, and CMS Structures": §2, the encapsulation
 boundaries and the base64 between them, white space allowed; §5, the `CERTIFICATE` label.
 
+[9] How stock clients dial a name. Python's library reference, "socket.create_connection",
+https://docs.python.org/3/library/socket.html: "if host is a non-numeric hostname, it will try to
+resolve it for both AF_INET and AF_INET6, and then try to connect to all possible addresses in
+turn until a connection succeeds." urllib3's own `create_connection`
+(`src/urllib3/util/connection.py`, main at `6da1f821`), which botocore's connection pool dials
+through: `for res in socket.getaddrinfo(host, port, family, socket.SOCK_STREAM)`, each address
+tried with the timeout, the last error kept and raised only once every address has failed
+(`raise err`), and `OSError("getaddrinfo returns an empty list")` where there is none.
+
 ## What the sources settle
 
 **The door is chosen as the AWS CLI's settings are.** A command-line option overrides the
@@ -131,7 +141,25 @@ replies carry their status, says `NoSuchKey`.
 **What is asked again.** Only an idempotent request whose connection closed before any octet of
 its answer is asked again, once, on a new connection [4, 5]; a `503` is asked again within the
 SDKs' three attempts after their full-jitter backoff, paid from their retry quota [7], the native
-client's own rule. A body read once is never sent twice.
+client's own rule. A body read once is never sent twice. A request that may not be asked twice,
+CreateMultipartUpload and CompleteMultipartUpload being POSTs [5], is sent only on a connection
+that has carried nothing before: the listener lets a connection go once it has been quiet for a
+stock client's patience (research/72), and a resumed copy reads every held part again before its
+completion, so a kept connection could be let go just before the one request that may not be asked
+again on another. A new connection for each such request, two a multipart copy, makes that
+impossible, where looking at a kept one first, as urllib3's `is_connection_dropped` does, can only
+make it unlikely.
+
+**A name is dialed at each of its addresses** in the resolver's order, each held to the patience,
+the last failure said where none answers, as Python's and urllib3's `create_connection` dial [9]:
+`localhost` resolves to `::1` and `127.0.0.1` on macOS, Windows and most Linux, and a cell's names
+may carry both families. A refused address costs what the platform takes to refuse it: on
+Windows a refused loopback connect is retried by its SYNs for about 2 s before the next address
+is tried.
+
+**A listing ends.** Each page's continuation must move on from the one it was asked from: a page
+naming the same token, the same key and upload-id markers, or for ListParts a marker no further,
+is a typed error, never asked again (CLAUDE.md §2).
 
 **A copy goes as the AWS CLI's does** [7]: below 8 MiB one PutObject, past it a multipart upload in
 8 MiB parts or as many more as 10,000 parts of a file need; standard input in 8 MiB parts, each
@@ -140,6 +168,11 @@ trailing CRC-64/NVME [7], one pass over the source. A resumed copy keeps a held 
 its MD5, the part's ETag, is the source's bytes now, and the parts' CRC-64/NVMEs, combined, are
 held to the full-object value the completion answers, the native door's end-to-end check through
 S3's own operations.
+
+**Both transports are proven.** The archive check serves its first founder's S3 endpoint at
+every address under the name `localhost`, which `mantle init` serves under TLS and certifies, so
+the S3 door's whole suite, the AWS CLI and every read across the doors run under TLS to a name of
+two addresses; and a plain-HTTP leg asks a loopback founder's endpoint (docs/design/release.md §2).
 
 ## Open
 

@@ -153,6 +153,12 @@ const INITIAL_RTO: Duration = Duration::from_secs(1);
 /// is as long as its client waits (`bounds::STOCK_PATIENCE`, research/77 D2). Past it the product
 /// itself gives up on the device, so the watch does too.
 const DEVICE_PATIENCE: Duration = mantle_protocol::bounds::STOCK_PATIENCE;
+/// How often the watch wakes to measure its own process's holds: each timed wake's lateness
+/// against its scheduled instant on the monotonic clock is time the host did not run the watch,
+/// which it counts against the host, not the cell, so a hold is seen to within one interval. One
+/// millisecond is jHiccup's resolution, the interval its meter thread sleeps and times each wake
+/// over (github.com/giltene/jHiccup, `HiccupMeter.java`, `resolutionMs = 1.0`).
+const HOLD_TICK: Duration = Duration::from_millis(1);
 /// The authority's name.
 const AUTHORITY: &str = "mantle test cell";
 /// RFC 5280 §4.1.2.5: the notAfter of a certificate with no well-defined expiration,
@@ -858,10 +864,15 @@ struct Watch {
     /// most `DEVICE_PATIENCE`, and when the stretch under way began, if one is.
     held_for: Duration,
     held_since: Option<Instant>,
+    /// Since the last movement, how long the host held the watch's own process past the wakes it
+    /// scheduled (`HOLD_TICK`): a test judges the cell, not the host's scheduler.
+    host_held: Duration,
 }
 
 impl Watch {
-    /// Takes reports until `done` holds, and fails once a quiet period passes with nothing moved.
+    /// Takes reports until `done` holds, and fails once a quiet period passes with nothing moved,
+    /// past the time the host held the watch: each wait at most `HOLD_TICK`, and a wait that ends
+    /// late moves the watch's end by its lateness, so each spends exactly the span it scheduled.
     fn until<T>(
         &mut self,
         reports: &mpsc::Receiver<Report>,
@@ -873,14 +884,20 @@ impl Watch {
                 return found;
             }
             let quiet = self.quiet();
-            let until = self.deadline(quiet).max(self.flush_deadline());
+            let until = self.deadline(quiet).max(self.flush_deadline()) + self.host_held;
+            let now = Instant::now();
             // Checked before each report: reports that keep coming with nothing moved in them
             // (a heartbeat's count, a log's stats) end the wait all the same.
-            let Some(left) = until.checked_duration_since(Instant::now()) else {
+            let Some(left) = until.checked_duration_since(now) else {
                 panic!("quiet for {quiet:?} with nothing moved: {self:?}")
             };
-            match reports.recv_timeout(left) {
+            let wait = left.min(HOLD_TICK);
+            let woke_by = now + wait;
+            match reports.recv_timeout(wait) {
                 Ok(report) => self.take(report),
+                Err(mpsc::RecvTimeoutError::Timeout) if !left.is_zero() => {
+                    self.host_held += Instant::now().saturating_duration_since(woke_by);
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     panic!("quiet for {quiet:?} with nothing moved: {self:?}")
                 }
@@ -1009,6 +1026,7 @@ impl Watch {
         let now = Instant::now();
         self.moved_at = Some(now);
         self.held_for = Duration::ZERO;
+        self.host_held = Duration::ZERO;
         self.held_since = if self.held_by_devices() {
             Some(now)
         } else {

@@ -273,6 +273,8 @@ struct Going {
     full: bool,
     /// Each chunk's volume, and whether the chunk is durable there.
     at: Vec<Option<(u128, bool)>>,
+    /// When, in the caller's time, it went down.
+    down_ns: u64,
 }
 
 /// A block the Block range recorded.
@@ -415,6 +417,14 @@ pub struct Put {
     next_id: Id,
     phase: Phase,
     outcome: Option<Result<Stored, PutError>>,
+    /// How long, in the caller's time, the last block recorded took from going down to recorded,
+    /// until the caller takes it ([`Put::take_committed`]).
+    committed: Option<u64>,
+    /// When, in the caller's time, the body's first byte was taken; and, for a body of more than
+    /// one block, its first block's bytes and the time they took to arrive, until the caller takes
+    /// them ([`Put::take_filled`]).
+    first_ns: Option<u64>,
+    filled: Option<(u64, u64)>,
 }
 
 impl Put {
@@ -532,6 +542,9 @@ impl Put {
             next_id: 0,
             phase: Phase::Body,
             outcome: None,
+            committed: None,
+            first_ns: None,
+            filled: None,
         })
     }
 
@@ -607,6 +620,21 @@ impl Put {
         })
     }
 
+    /// How long the last block recorded took, in the caller's time, from going down, its chunks
+    /// stored and its Block command written, to recorded; none where none was recorded since the
+    /// caller last took it. The caller sizes the blocks a put holds going down by it.
+    pub fn take_committed(&mut self) -> Option<u64> {
+        self.committed.take()
+    }
+
+    /// For a body of more than one block: its first block's stored bytes and how long, in the
+    /// caller's time, its plaintext took to come from the body's first byte; once, when the caller
+    /// takes it. That block fills before any window holds the body back, so it measures the
+    /// client's pace, which the caller sizes the blocks a put holds going down by.
+    pub fn take_filled(&mut self) -> Option<(u64, u64)> {
+        self.filled.take()
+    }
+
     /// Whether a chunk of it waits for room ([`Put::room`]).
     pub fn waits_for_room(&self) -> bool {
         !self.roomless.is_empty()
@@ -660,6 +688,9 @@ impl Put {
                 .min(room)
                 .min(usize::try_from(left).unwrap_or(usize::MAX));
             let (now, rest) = bytes.split_at_checked(n).ok_or(PutError::Overflow)?;
+            if n > 0 && self.first_ns.is_none() {
+                self.first_ns = Some(self.now_ns);
+            }
             self.segment.extend_from_slice(now);
             for h in [self.md5.as_mut(), self.sum.as_mut()].into_iter().flatten() {
                 h.update(now)?;
@@ -704,6 +735,15 @@ impl Put {
             .block_segments(self.body.length, self.filling_index)?;
         if self.sealed == holds.end {
             let full = std::mem::take(&mut self.filling);
+            // The first block of a longer body fills before any window holds the body back: how
+            // long its bytes took to come is the client's own pace.
+            if self.filling_index == 0 && self.layout.blocks(self.body.length) > 1 {
+                let bytes = u64::try_from(full.len()).map_err(|_| PutError::Overflow)?;
+                let took = self
+                    .now_ns
+                    .saturating_sub(self.first_ns.unwrap_or(self.now_ns));
+                self.filled = Some((bytes, took));
+            }
             if self.going.len() >= self.window {
                 self.waiting = Some(full);
             } else {
@@ -831,6 +871,7 @@ impl Put {
                 next: 0,
                 full: true,
                 at: vec![None; width],
+                down_ns: self.now_ns,
             },
         );
         self.ask(
@@ -983,6 +1024,7 @@ impl Put {
         asked_ns: u64,
     ) -> Result<(), PutError> {
         let going = self.going.remove(&index).ok_or(PutError::Mismatch)?;
+        self.committed = Some(self.now_ns.saturating_sub(going.down_ns));
         self.recorded.insert(
             going.index,
             Recorded {

@@ -885,6 +885,9 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// which every parked request's is one of.
     parked: VecDeque<host::Parked>,
     parked_most: usize,
+    /// What the node measured of its puts' blocks and bodies, the window a put holds
+    /// (`crate::window`).
+    put_window: crate::window::Window,
     jobs: Vec<host::Job>,
     /// What jobs that ended asked and was not yet answered: its outcomes are dropped as they come.
     /// At most the node's asks.
@@ -1034,10 +1037,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             pool: settings.gateway.as_ref().map_or(0, |g| g.objects),
             ranges: settings.ranges.len(),
             inflight,
-            transfers: settings
-                .storage
-                .transfers()
-                .saturating_add(settings.chunk_asks),
+            transfers: settings.storage.transfers(),
+            asked: settings.chunk_asks,
             transport_bytes: settings.transport_bytes,
             messages,
             max_head: MAX_HEAD,
@@ -1242,6 +1243,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             gateway: settings.gateway.take(),
             parked: VecDeque::new(),
             parked_most: exchanges,
+            put_window: crate::window::Window::default(),
             jobs: Vec::new(),
             abandoned: Vec::new(),
             doorway: None,
@@ -1668,12 +1670,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// stopping node, or one that hosts no objects, answers each as it comes.
     fn take_door(&mut self) {
         loop {
-            let gateway = self.gateway.as_ref();
-            let Some(charge) = self
+            let (gateway, learned) = (self.gateway.as_ref(), &self.put_window);
+            let Some((charge, _)) = self
                 .doorway
                 .as_mut()
                 .and_then(crate::door::Doorway::waiting)
-                .map(|request| gateway.map_or(0, |g| g.charges.of(request.op.written())))
+                .map(|request| host::sized(gateway, learned, request.op.written()))
             else {
                 return;
             };

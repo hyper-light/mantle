@@ -1324,6 +1324,16 @@ becomes:
   its streams once its role is known. So a client costs the node its own connections and the
   exchange it keeps, never a peer's streams, and the transport's floor grows by the same bytes a
   client (`bounds::Stated::clients`, `pool`).
+- **The blocks a put holds going down: learned.** A put's body waits while its window is full,
+  each block's chunks stored and its Block command written before the next may go. By Little's
+  law the blocks that keep the body coming at its client's pace are the time a block takes from
+  going down to recorded times the body's rate, over a block's bytes (`crate::window`). The node
+  measures both from its own puts: each block's time to recorded (`Put::take_committed`), and how
+  fast the first block of a longer body filled, which no window holds back, so it is the client's
+  pace (`Put::take_filled`); each smoothed with RFC 6298's gain of 1/8. A put is admitted with
+  that window, at least the floor's one block and no more than its body's own blocks, and charged
+  for it (`derive::Charges::write`). A get still reads a window of one block (`gateway.window`),
+  open until its own rate and its chunks' read time are measured the same way.
 - **A native request past the limit waits, as the S3 door's does.** One the host has no room for,
   or that comes behind requests already waiting, is parked with its body unread, QUIC's flow
   control holding its client's bytes, and taken in the order it came once room frees; each turn it

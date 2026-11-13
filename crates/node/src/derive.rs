@@ -268,23 +268,43 @@ impl Charges {
     /// its body's length under the scheme that holds the most of it, every other operation the
     /// most. A length no layout lays out is charged the most.
     pub fn of(&self, written: Option<u64>) -> u64 {
-        let Some(length) = written else {
-            return self.most;
-        };
-        let window = u64::try_from(self.window).unwrap_or(u64::MAX);
+        match written {
+            Some(length) => self.write(self.window, length).min(self.most),
+            None => self.most,
+        }
+    }
+
+    /// What a write of `length` bytes holds with `window` blocks going down at once, under the
+    /// scheme that holds the most of it: a length no layout lays out, the most a write of `window`
+    /// blocks may hold.
+    pub fn write(&self, window: usize, length: u64) -> u64 {
+        let blocks = u64::try_from(window).unwrap_or(u64::MAX);
         let mut held = 0u64;
         for layout in &self.layouts {
             let bytes = layout.block_len(length, 0).ok().and_then(|block| {
-                put::bytes_for(self.window, layout, length)?
-                    .checked_add(copies(layout, block, window)?)?
+                put::bytes_for(window, layout, length)?
+                    .checked_add(copies(layout, block, blocks)?)?
                     .checked_add(self.piece)
             });
-            match bytes {
-                Some(bytes) => held = held.max(bytes),
-                None => return self.most,
-            }
+            let most = || {
+                layout.largest_block().and_then(|block| {
+                    put::most_bytes(window, layout)?
+                        .checked_add(copies(layout, block, blocks)?)?
+                        .checked_add(self.piece)
+                })
+            };
+            held = held.max(bytes.or_else(most).unwrap_or(u64::MAX));
         }
-        held.min(self.most)
+        held
+    }
+
+    /// The largest block any scheme's layout makes: the fewest blocks a body is cut into.
+    pub fn largest_block(&self) -> u64 {
+        self.layouts
+            .iter()
+            .filter_map(Layout::largest_block)
+            .max()
+            .unwrap_or(0)
     }
 
     /// The most any operation holds.
@@ -1574,9 +1594,8 @@ pub fn derive(
             pool: if hosts { objects } else { 0 },
             ranges,
             inflight: settings.max_inflight_msgs,
-            transfers: transfers
-                .checked_add(asked.chunks)
-                .ok_or(overflow("the node's transfers"))?,
+            transfers,
+            asked: asked.chunks,
             transport_bytes: 0,
             messages,
             max_head: crate::node::MAX_HEAD,
@@ -2780,6 +2799,7 @@ mod tests {
             ranges: 5,
             inflight: settings.max_inflight_msgs,
             transfers: 38,
+            asked: 0,
             transport_bytes,
             messages: mantle_protocol::classes::Bounds {
                 replication: settings.max_entry_bytes + 1_024,
@@ -2853,6 +2873,13 @@ mod tests {
         }
         assert_eq!(charges.least(), piece + 6 * tag);
         assert_eq!(charges.of(Some(1 << 30)), charges.most());
+        // A write holding more blocks going down holds more, a block's copies each; the window
+        // of one is what `of` charges.
+        assert_eq!(charges.write(1, 4096), charges.of(Some(4096)));
+        let long = 64u64 << 20;
+        assert!(charges.write(3, long) > charges.write(1, long));
+        assert!(charges.write(3, long) - charges.write(2, long) >= 4 * block);
+        assert_eq!(charges.largest_block(), block);
         let coded = durability::Scheme::Rs(mantle_ec::Code::new(2, 1).unwrap());
         let mixed = Charges::new(1, &[three, coded]).unwrap();
         assert!(mixed.of(Some(1)) >= charges.of(Some(1)));

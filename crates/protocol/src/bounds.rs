@@ -59,9 +59,12 @@ pub struct Stated {
     pub ranges: usize,
     /// The appends a range's leader keeps out to one follower (`Settings::max_inflight_msgs`).
     pub inflight: usize,
-    /// The chunk exchanges the node keeps open at once: those its volumes take (each volume's
-    /// writer queue and its reads at the device and waiting) and those it asks of its peers.
+    /// The chunk exchanges its volumes take at once, which its peers may open to it: each volume's
+    /// writer queue and its reads at the device and waiting.
     pub transfers: usize,
+    /// The chunk exchanges it asks of its peers at once (a node's `chunk_asks`): opened on its
+    /// peers' credit, each a place in its own table of exchanges, none a stream it grants.
+    pub asked: usize,
     /// The bytes the node's transport may hold at once, its budget's capacity.
     pub transport_bytes: u64,
     /// The largest message of each class (`crate::classes::Bounds`).
@@ -159,7 +162,7 @@ fn shape(stated: &Stated) -> Result<Shape, Unfit> {
     // A peer node opens at most a snapshot for each range it leads to this one, Raft holding
     // replication to a member while its snapshot is out (hyper-raft's `report_snapshot`), and a
     // command for each range besides; every range may be led there. Its chunk exchanges are at
-    // most the node's transfers.
+    // most what the node's volumes take: what this node asks of it opens on its own credit.
     let streams = stated
         .ranges
         .max(1)
@@ -176,7 +179,8 @@ fn shape(stated: &Stated) -> Result<Shape, Unfit> {
         .and_then(|(peers, kept)| {
             peers
                 .checked_add(client_connections.checked_mul(kept)?)?
-                .checked_add(stated.pool)
+                .checked_add(stated.pool)?
+                .checked_add(stated.asked)
         })
         .ok_or(Unfit("exchanges"))?;
     // A lane carries every range of a shard to one peer: each range's appends in flight and one
@@ -469,6 +473,7 @@ mod tests {
             ranges: 3,
             inflight: 4,
             transfers: 5,
+            asked: 0,
             transport_bytes: 64 << 20,
             messages: Bounds {
                 replication: 1 << 16,
@@ -560,6 +565,7 @@ mod tests {
             ranges: 1,
             inflight: 0,
             transfers: 1,
+            asked: 0,
             transport_bytes: 3 * 4 * RECEIVE_CHUNK as u64,
             ..stated()
         };
@@ -572,6 +578,7 @@ mod tests {
             ranges: 5,
             inflight: 2,
             transfers: 130,
+            asked: 0,
             transport_bytes: 7 * 4 * RECEIVE_CHUNK as u64,
             messages: Bounds {
                 replication: 1_200,
@@ -609,6 +616,20 @@ mod tests {
             ..stated()
         };
         assert!(limits(&starved).is_err());
+    }
+
+    /// What a node asks of its peers takes places in its own table of exchanges, never streams it
+    /// grants: a peer may open on its connection only what the node's volumes and ranges take.
+    #[test]
+    fn what_a_node_asks_grants_its_peers_nothing() {
+        let quiet = limits(&stated()).unwrap();
+        let asking = limits(&Stated {
+            asked: 1_000,
+            ..stated()
+        })
+        .unwrap();
+        assert_eq!(asking.streams_per_connection, quiet.streams_per_connection);
+        assert_eq!(asking.exchanges, quiet.exchanges + 1_000);
     }
 
     /// A node's clients are pooled: each connection of a client's holds the exchange it keeps,

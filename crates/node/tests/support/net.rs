@@ -106,6 +106,7 @@ pub fn stated(transport_bytes: u64) -> Stated {
         ranges: 5,
         inflight: settings.max_inflight_msgs,
         transfers: 38,
+        asked: 0,
         transport_bytes,
         messages: Bounds {
             replication: largest,

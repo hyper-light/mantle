@@ -96,6 +96,7 @@ pub(crate) struct Parked {
     peer: PeerId,
     head: Option<Head>,
     charge: u64,
+    window: usize,
     deadline_ns: Option<u64>,
     until_ns: u64,
 }
@@ -128,6 +129,9 @@ pub(crate) struct Job {
     /// The bytes it was charged as it was admitted, what it holds at its own size
     /// (`derive::Charges`); none for one not admitted.
     charge: u64,
+    /// The blocks a put of it holds going down at once, as the node learned them when it was
+    /// admitted (`crate::window`) and charged for them.
+    window: usize,
 }
 
 impl Job {
@@ -619,6 +623,30 @@ fn shown(c: &record::Checksum) -> Stored {
     }
 }
 
+/// What an operation that writes `written` bytes, or none, holds at its own size, and the blocks a
+/// put of it holds going down at once: a write's window as `learned` measured the node's puts
+/// (`crate::window`), at least the floor's (`GatewaySettings::window`), charged for those blocks
+/// (`derive::Charges::write`); every other operation the most, at the floor's window. None on a
+/// node that hosts no objects.
+pub(super) fn sized(
+    gateway: Option<&GatewaySettings>,
+    learned: &crate::window::Window,
+    written: Option<u64>,
+) -> (u64, usize) {
+    let Some(gateway) = gateway else {
+        return (0, 0);
+    };
+    match written {
+        Some(length) => {
+            let window = learned
+                .blocks(length, gateway.charges.largest_block())
+                .max(gateway.window);
+            (gateway.charges.write(window, length), window)
+        }
+        None => (gateway.charges.of(None), gateway.window),
+    }
+}
+
 /// A bucket's versioning as GetBucketVersioning answers it: none for a bucket never versioned.
 fn answered(versioning: Versioning) -> Option<mantle_s3::body::Versioning> {
     match versioning {
@@ -665,9 +693,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 now.saturating_add(u64::try_from(remaining.as_nanos()).unwrap_or(u64::MAX))
             });
         // What it holds at its own size, its body's length known from its head.
-        let charge = match (&head, self.gateway.as_ref()) {
-            (Ok(head), Some(gateway)) => gateway.charges.of(head.written()),
-            _ => 0,
+        let (charge, window) = match &head {
+            Ok(head) => sized(self.gateway.as_ref(), &self.put_window, head.written()),
+            Err(_) => (0, 0),
         };
         let parks = head.is_ok() && self.gateway.is_some() && !self.stopping();
         // Asked even behind parked requests: one the limit turns away tells it its clients ask
@@ -680,12 +708,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 peer,
                 head: head.ok(),
                 charge,
+                window,
                 deadline_ns,
                 until_ns: deadline_ns.unwrap_or_else(|| now.saturating_add(patience)),
             });
             return;
         }
-        self.start_object(exchange, peer, head, (deadline_ns, now, charge), room);
+        self.start_object(
+            exchange,
+            peer,
+            head,
+            (deadline_ns, now, charge, window),
+            room,
+        );
     }
 
     /// The parked requests taken in the order they came while the host has room for the first
@@ -714,7 +749,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 first.exchange,
                 first.peer,
                 head,
-                (first.deadline_ns, now, first.charge),
+                (first.deadline_ns, now, first.charge, first.window),
                 !over,
             );
         }
@@ -745,7 +780,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         exchange: ExchangeId,
         peer: PeerId,
         head: Result<Head, ObjectError>,
-        (deadline_ns, now, charge): (Option<u64>, u64, u64),
+        (deadline_ns, now, charge, window): (Option<u64>, u64, u64, usize),
         room: bool,
     ) {
         // A client's operations act for the account its certificate names; one whose
@@ -783,6 +818,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             moved_ns: now,
             admitted_ns,
             charge,
+            window,
         });
     }
 
@@ -797,7 +833,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         } = request;
         let now = hyper_rt::futures::now_ns();
         let mut admitted_ns = None;
-        let charge = self.charge(&op);
+        let (charge, window) = sized(self.gateway.as_ref(), &self.put_window, op.written());
         // The door holds a request while the host has no room (`take_door`): one taken here past
         // the limit is a stopping node's.
         let room = self.gateway.is_some() && !self.stopping() && self.admits(charge);
@@ -832,6 +868,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             moved_ns: now,
             admitted_ns,
             charge,
+            window,
         });
     }
 
@@ -1621,7 +1658,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         let holding = Holding {
             handover_ns: gateway.handover_ns,
-            window: gateway.window,
+            window: self.jobs.get(at).map_or(gateway.window, |job| job.window),
         };
         let made = (|| {
             let data = DataKey::generate().ok()?;
@@ -1711,6 +1748,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         },
                         Err(error) => Reply::status(put_status(error)),
                     });
+                    // What its blocks took to be recorded and its body to come, for the windows the
+                    // node's next puts hold (`crate::window`).
+                    if let Some(ns) = put.take_committed() {
+                        self.put_window.committed(ns);
+                    }
+                    if let Some((bytes, ns)) = put.take_filled() {
+                        self.put_window.filled(bytes, ns);
+                    }
                     match over {
                         Some(reply) => Step::Over(Box::new(reply)),
                         None if put.tick(wall).is_err() => {
@@ -3111,13 +3156,6 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.admission.as_ref().map(crate::admit::Admission::limit)
     }
 
-    /// What `op` holds at its own size (`derive::Charges`): none on a node that hosts no objects.
-    pub(super) fn charge(&self, op: &Op) -> u64 {
-        self.gateway
-            .as_ref()
-            .map_or(0, |gateway| gateway.charges.of(op.written()))
-    }
-
     /// Whether the host admits one more operation holding `charge` bytes beside those it runs
     /// (`crate::admit`). One the learned limit turns away tells the limit its clients ask more
     /// than it admits; one whose bytes the operations' memory does not hold says nothing of it.
@@ -3752,6 +3790,7 @@ mod tests {
             moved_ns: 1,
             admitted_ns: Some(1),
             charge: 0,
+            window: 1,
         };
         assert!(job.held());
         assert_eq!(job.bounded(9), Bounded::Held);

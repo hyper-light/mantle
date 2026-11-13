@@ -109,13 +109,16 @@ fn serving(seed: u64, ops: u64) -> alloc::Counts {
 /// the count: 51 that macOS and Windows, which hold none, do not make. 360 more since a session
 /// keeps an answer only where its row holds it (research/87 §1): each command applied runs over
 /// its entry's writes in an overlay of its own, taken in once its answer is kept, whose map makes
-/// its first node, one allocation for each of the 120 puts' three commands.
+/// its first node, one allocation for each of the 120 puts' three commands. 6 fewer since a peer's
+/// connection is granted only the streams the node serves it, not the chunks the node asks of
+/// peers itself (`bounds::Stated::asked`): hyper-quic builds a connection's stream tables in fewer
+/// steps of growth.
 #[test]
 fn a_cell_serving_writes_turns_without_remaking_what_a_turn_keeps() {
     const SERVING: u64 = if cfg!(target_os = "linux") {
-        34_394
+        34_388
     } else {
-        34_343
+        34_337
     };
     let counts = serving(1, 40);
     assert_eq!(counts.allocations, SERVING, "{counts:?}");

@@ -647,7 +647,8 @@ impl Pki {
             pool: 0,
             ranges: 1,
             inflight: 0,
-            transfers: usize::from(role == Role::Gateway),
+            transfers: 0,
+            asked: usize::from(role == Role::Gateway),
             transport_bytes: 0,
             messages,
             max_head: mantle_node::node::MAX_HEAD,
@@ -2433,6 +2434,16 @@ pub(crate) fn chunk_key(n: u64) -> ChunkKey {
 /// `mantle init`'s arguments for a cell of three under `root`: a machines file's two founders and a
 /// `--node`'s, each with a volume of its own in a failure domain of its own.
 pub(crate) fn three_founders(root: &Path) -> Vec<String> {
+    founders_within(root, None)
+}
+
+/// [`three_founders`], each founder's memory stated at `memory` where given, as an operator
+/// states it (`memory = 1G`): a node derives what it runs from its allowance, its operations'
+/// count and its S3 listener's connections with it (node.md §2.8), so a test that holds every
+/// connection a listener serves states memory that makes that a count it can hold.
+pub(crate) fn founders_within(root: &Path, memory: Option<&str>) -> Vec<String> {
+    let stated = memory.map_or_else(String::new, |m| format!("memory = {m}\n"));
+    let flag = memory.map_or_else(String::new, |m| format!(",memory={m}"));
     let dirs: Vec<PathBuf> = (1..=3)
         .map(|n| {
             let dir = root.join(format!("d{n}"));
@@ -2444,7 +2455,7 @@ pub(crate) fn three_founders(root: &Path) -> Vec<String> {
     let mut text = String::from("max_nodes = 3\nmax_volumes = 3\n");
     for (n, dir) in dirs.iter().take(2).enumerate() {
         text.push_str(&format!(
-            "[node]\nquic = 127.0.0.1:0\nplane = 127.0.0.1:0\ndomain = rack-{n}\nvolume = {} 256M\n",
+            "[node]\nquic = 127.0.0.1:0\nplane = 127.0.0.1:0\ndomain = rack-{n}\nvolume = {} 256M\n{stated}",
             dir.display()
         ));
     }
@@ -2454,7 +2465,7 @@ pub(crate) fn three_founders(root: &Path) -> Vec<String> {
         file.display().to_string(),
         "--node".into(),
         format!(
-            "quic=127.0.0.1:0,plane=127.0.0.1:0,domain=rack-2,volume={}:256M",
+            "quic=127.0.0.1:0,plane=127.0.0.1:0,domain=rack-2,volume={}:256M{flag}",
             dirs[2].display()
         ),
     ]

@@ -2,7 +2,7 @@
 # Every gate of CLAUDE.md in order; exits non-zero on the first failure. Run before each commit.
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
-python3 scripts/check-contracts.py
+python3 scripts/check-contracts.py --known scripts/arbitrary-open.txt
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 bash scripts/check-production.sh

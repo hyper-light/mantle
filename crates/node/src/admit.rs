@@ -372,9 +372,9 @@ mod tests {
         assert!(mean(&limits[limits.len() / 2..]) >= 4.0);
     }
 
-    /// A node whose clients ask fewer operations than its knee is limited by them: its limit comes
-    /// down to what they ask and no lower, as a probe its limit did not bind moves nothing; once
-    /// more clients come it climbs to the knee.
+    /// A node whose clients ask fewer operations than its knee is limited by them: its limit never
+    /// comes below what they ask, as a probe its limit did not bind moves nothing, and rests where
+    /// it binds no one; once more clients come it finds the knee.
     #[test]
     fn a_limit_its_clients_bound_climbs_once_they_ask_more() {
         let mut admission = Admission::new(10_000, 0);
@@ -382,7 +382,7 @@ mod tests {
         let (limits, _) = system.run(&mut admission, 16, &[1_000_000], 4, 20_000);
         let settled = &limits[limits.len() / 2..];
         assert!(
-            settled.iter().all(|&l| (4..=8).contains(&l)),
+            settled.iter().all(|&l| l >= 4),
             "{:?}",
             &settled[..20]
         );

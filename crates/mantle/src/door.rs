@@ -68,17 +68,72 @@ use crate::journal::{Journal, Origin, Record};
 use crate::profile::Profile;
 use crate::s3_code::Code;
 
-/// The most octets a response's document is kept to: a ListObjectsV2 page's, the largest S3
-/// answers, of 1,000 keys (`mantle_s3::list::MAX_KEYS`), each of at most 1,024 octets
-/// (`mantle_s3::route::MAX_KEY`) escaped at worst to six a character (`&#x1f;`, `mantle_s3::xml`),
-/// with each key's own elements, [`ENTRY`].
-const DOCUMENT: usize = mantle_s3::list::MAX_KEYS * (6 * mantle_s3::route::MAX_KEY + ENTRY);
+/// The most octets a response's document is kept to: a listing page's, the largest the door reads,
+/// its head ([`HEAD`]) and `mantle_s3::list::MAX_KEYS` entries (S3's 1,000: a ListObjectsV2 page's
+/// keys and common prefixes together, a ListMultipartUploads page's uploads), each its key of at
+/// most `mantle_s3::route::MAX_KEY` octets escaped at worst and the rest of it at most [`ENTRY`]. A
+/// ListParts page's parts hold no key, and a ListBuckets page's `mantle_protocol::object::MAX_BUCKETS`
+/// buckets names and regions that never escape, so both are smaller (the tests write each).
+const DOCUMENT: usize = HEAD + mantle_s3::list::MAX_KEYS * (KEY + ENTRY);
 
-/// The octets a listing writes around one key at most: a `Contents`' tags and its fixed-length
-/// values, a time (24), an ETag escaped (52), a size (20 digits), a storage class, a checksum's
-/// algorithm and type, and an owner's 64-digit ID and name, which sum under 1 KiB
-/// (`mantle_s3::response`).
-const ENTRY: usize = 1 << 10;
+/// The most octets the listing writer puts for one octet of text: a control character's reference,
+/// `&#x1f;` (`mantle_s3::xml`'s `escape`).
+const ESCAPED: usize = "&#x1f;".len();
+
+/// A key at its widest: `mantle_s3::route::MAX_KEY` octets, each escaped.
+const KEY: usize = ESCAPED * mantle_s3::route::MAX_KEY;
+
+/// An owner's name at its widest: `mantle_s3::account::MAX_OWNER` octets, each escaped.
+const OWNER: usize = ESCAPED * mantle_s3::account::MAX_OWNER;
+
+/// An ETag or an upload's ID at its widest: `mantle_protocol::object::MAX_TAG` octets, each escaped.
+const TAG: usize = ESCAPED * mantle_protocol::object::MAX_TAG;
+
+/// The most octets a listing entry holds beside its key, as `mantle_s3::response` writes each: a
+/// ListObjects page's [`CONTENTS`] or a ListMultipartUploads page's [`UPLOAD`], whichever is wider;
+/// a common prefix's holds less than either.
+const ENTRY: usize = if CONTENTS > UPLOAD { CONTENTS } else { UPLOAD };
+
+/// A `Contents` at its widest beside its key: [`CONTENTS_TEXT`], its quoted ETag and its owner.
+const CONTENTS: usize = CONTENTS_TEXT + TAG + OWNER;
+
+/// The text of a `Contents` at its widest with its ETag, key and owner's name left empty, as
+/// `mantle_s3::response` writes one: the longest checksum algorithm's name (`CRC64NVME`, as long as
+/// `XXHASH128`; `Algorithm::name`) and type's (`ChecksumType::name`), the last time an S3 time holds,
+/// `u64::MAX`'s digits and its storage class.
+const CONTENTS_TEXT: usize = "<Contents><ChecksumAlgorithm>CRC64NVME</ChecksumAlgorithm>\
+    <ChecksumType>FULL_OBJECT</ChecksumType><ETag>\"\"</ETag><Key></Key>\
+    <LastModified>9999-12-31T23:59:59.000Z</LastModified><Owner><ID></ID></Owner>\
+    <Size>18446744073709551615</Size><StorageClass>STANDARD</StorageClass></Contents>"
+    .len();
+
+/// An `Upload` at its widest beside its key: [`UPLOAD_TEXT`], its initiator, owner and ID.
+const UPLOAD: usize = UPLOAD_TEXT + OWNER + OWNER + TAG;
+
+/// The text of an `Upload` at its widest with its initiator's and owner's names, key and ID left
+/// empty, as `mantle_s3::response` writes one.
+const UPLOAD_TEXT: usize = "<Upload><ChecksumAlgorithm>CRC64NVME</ChecksumAlgorithm>\
+    <ChecksumType>FULL_OBJECT</ChecksumType><Initiated>9999-12-31T23:59:59.000Z</Initiated>\
+    <Initiator><ID></ID></Initiator><Key></Key><Owner><ID></ID></Owner>\
+    <StorageClass>STANDARD</StorageClass><UploadId></UploadId></Upload>"
+    .len();
+
+/// The most octets a listing the door reads holds beside its entries: [`ROOT_TEXT`] and
+/// ListParts' twelve elements, the most any listing's head holds, each no wider than a
+/// [`FIELD_TEXT`] holding a key at its widest: every head element holds a key, a marker, a
+/// continuation token (a key's octets and one in base64), an upload's ID, an owner, a bucket's
+/// name, a count or a name of S3's, each at most that (`mantle_s3::response`). A document past
+/// [`DOCUMENT`] is refused, typed, as it streams in.
+const HEAD: usize = ROOT_TEXT + 12 * (FIELD_TEXT + KEY);
+
+/// The XML declaration and the longest listing root with its namespace, as `mantle_s3::xml::Writer`
+/// writes a document (`NAMESPACE`).
+const ROOT_TEXT: usize = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListMultipartUploadsResult \
+    xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></ListMultipartUploadsResult>"
+    .len();
+
+/// The tags of the longest-named head element.
+const FIELD_TEXT: usize = "<NextContinuationToken></NextContinuationToken>".len();
 
 /// The patience every wait on the socket is held to, in nanoseconds.
 fn patience_ns() -> u64 {
@@ -2296,6 +2351,186 @@ mod tests {
             completed_document(doc.as_bytes()).unwrap(),
             ("ab-2".to_owned(), Some("AAAAAAAAAAA=".to_owned()))
         );
+    }
+
+    /// `n` octets the listing writer escapes at its widest, each a control character (`&#x1f;`).
+    fn widest(n: usize) -> String {
+        "\u{1f}".repeat(n)
+    }
+
+    /// The last second an S3 time holds, 9999-12-31T23:59:59Z, whose year is written in full.
+    const LAST: i64 = 253_402_300_799;
+
+    /// The widest checksum algorithm and type a listing names.
+    const NAMED: Option<(Algorithm, mantle_s3::checksum::ChecksumType)> = Some((
+        Algorithm::Crc64Nvme,
+        mantle_s3::checksum::ChecksumType::FullObject,
+    ));
+
+    fn widest_entry() -> Entry {
+        Entry {
+            modified: LAST,
+            etag: widest(mantle_protocol::object::MAX_TAG),
+            size: u64::MAX,
+            owner: widest(mantle_s3::account::MAX_OWNER),
+            checksum: NAMED,
+        }
+    }
+
+    fn widest_upload(key: String) -> s3::Upload {
+        s3::Upload {
+            key,
+            upload_id: widest(mantle_protocol::object::MAX_TAG),
+            initiated: LAST,
+            initiator: widest(mantle_s3::account::MAX_OWNER),
+            owner: widest(mantle_s3::account::MAX_OWNER),
+            checksum: NAMED,
+        }
+    }
+
+    /// A ListObjectsV2 page of `keys` with every element of its head at its widest.
+    fn objects(keys: &[String]) -> String {
+        let key = widest(mantle_s3::route::MAX_KEY);
+        let token =
+            mantle_s3::list::continuation_token(&mantle_s3::list::Resume::After(key.clone()));
+        let page = Page {
+            contents: keys.iter().map(|k| (k.clone(), widest_entry())).collect(),
+            common_prefixes: Vec::new(),
+            truncated: true,
+            next: Some(mantle_s3::list::Resume::After(key.clone())),
+        };
+        let bucket = "b".repeat(mantle_s3::route::MAX_BUCKET);
+        s3::list_objects_v2(
+            &s3::ListV2 {
+                bucket: &bucket,
+                request: ListRequest {
+                    prefix: &key,
+                    delimiter: Some(&key),
+                    start: None,
+                    max_keys: mantle_s3::list::MAX_KEYS,
+                    paging: mantle_s3::list::Paging::Token,
+                },
+                continuation_token: Some(&token),
+                start_after: Some(&key),
+                url: false,
+                fetch_owner: true,
+            },
+            &page,
+        )
+        .unwrap()
+    }
+
+    /// A ListMultipartUploads page of uploads at `keys` with every element of its head at its
+    /// widest.
+    fn uploads(keys: &[String]) -> String {
+        let key = widest(mantle_s3::route::MAX_KEY);
+        let id = widest(mantle_protocol::object::MAX_TAG);
+        let uploads: Vec<s3::Upload> = keys.iter().map(|k| widest_upload(k.clone())).collect();
+        let bucket = "b".repeat(mantle_s3::route::MAX_BUCKET);
+        s3::list_multipart_uploads(&s3::ListUploads {
+            bucket: &bucket,
+            prefix: &key,
+            delimiter: Some(&key),
+            max_uploads: mantle_s3::list::MAX_KEYS,
+            key_marker: Some(&key),
+            upload_id_marker: Some(&id),
+            url: false,
+            uploads: &uploads,
+            common_prefixes: &[],
+            truncated: true,
+            next: s3::Next { key: &key, id: &id },
+        })
+        .unwrap()
+    }
+
+    /// A ListParts page of `parts` parts, each and its head at its widest.
+    fn parts(parts: usize) -> String {
+        let part = s3::Part {
+            number: u16::MAX,
+            modified: LAST,
+            etag: widest(mantle_protocol::object::MAX_TAG),
+            size: u64::MAX,
+            checksum: Some(Checksum {
+                algorithm: Algorithm::Sha512,
+                bytes: vec![0; 64],
+            }),
+        };
+        let all = vec![part; parts];
+        let bucket = "b".repeat(mantle_s3::route::MAX_BUCKET);
+        let owner = widest(mantle_s3::account::MAX_OWNER);
+        s3::list_parts(&s3::ListParts {
+            bucket: &bucket,
+            key: &widest(mantle_s3::route::MAX_KEY),
+            upload_id: &widest(mantle_protocol::object::MAX_TAG),
+            part_number_marker: u16::MAX,
+            next: Some(u16::MAX),
+            max_parts: mantle_s3::list::MAX_KEYS,
+            parts: &all,
+            initiator: &owner,
+            owner: &owner,
+            checksum: NAMED,
+        })
+        .unwrap()
+    }
+
+    /// `ENTRY` is the widest entry the listing writer puts beside its key, a `Contents` or an
+    /// `Upload` at its widest, octet for octet; and `HEAD` holds every listing's head at its widest.
+    #[test]
+    fn the_entry_and_head_bounds_are_the_writers_own() {
+        let contents = objects(&[String::new()]).len() - objects(&[]).len();
+        let upload = uploads(&[String::new()]).len() - uploads(&[]).len();
+        assert_eq!(
+            ENTRY,
+            contents.max(upload),
+            "Contents {contents}, Upload {upload}"
+        );
+        for (what, head) in [
+            ("ListObjectsV2", objects(&[]).len()),
+            ("ListMultipartUploads", uploads(&[]).len()),
+            ("ListParts", parts(0).len()),
+        ] {
+            assert!(head <= HEAD, "{what}'s head of {head} octets past {HEAD}");
+        }
+    }
+
+    /// The widest page of each listing the door reads fits `DOCUMENT`: 1,000 keys, uploads or parts
+    /// at their widest, and `MAX_BUCKETS` buckets.
+    #[test]
+    fn every_widest_page_fits_the_document_bound() {
+        let keys = vec![widest(mantle_s3::route::MAX_KEY); mantle_s3::list::MAX_KEYS];
+        let buckets: Vec<s3::Bucket> = (0..mantle_protocol::object::MAX_BUCKETS)
+            .map(|_| s3::Bucket {
+                name: "b".repeat(mantle_s3::route::MAX_BUCKET),
+                created: LAST,
+                // A region of 63 octets, the most a location constraint names (mantle-s3's
+                // `body::MAX_REGION`).
+                region: "r".repeat(63),
+            })
+            .collect();
+        let owner = widest(mantle_s3::account::MAX_OWNER);
+        let token = widest(mantle_s3::route::MAX_KEY);
+        for (what, page) in [
+            ("ListObjectsV2", objects(&keys).len()),
+            ("ListMultipartUploads", uploads(&keys).len()),
+            ("ListParts", parts(mantle_s3::list::MAX_KEYS).len()),
+            (
+                "ListBuckets",
+                s3::list_buckets(&s3::ListBuckets {
+                    owner: &owner,
+                    buckets: &buckets,
+                    regions: true,
+                    continuation_token: Some(&token),
+                    prefix: Some(&token),
+                })
+                .unwrap()
+                .len(),
+            ),
+        ] {
+            assert!(
+                page <= DOCUMENT,
+                "{what}'s widest page of {page} octets past {DOCUMENT}"
+            );
+        }
     }
 
     /// A ListObjectsV2 page the listener writes: its prefixes, each key's time, size and name, and

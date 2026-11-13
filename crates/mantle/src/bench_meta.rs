@@ -14,8 +14,11 @@
 //! sorted map in memory, so the times are the layers' own work; an engine on a device adds
 //! its reads and writes to them.
 
+use std::cell::Cell;
 use std::io::Write;
 use std::time::{Duration, Instant};
+
+use hyper_measure::alloc::{self, Counts};
 
 use mantle_disk::histogram::Histogram;
 use mantle_meta::apply::{Layer, apply_entry};
@@ -85,28 +88,91 @@ impl From<mantle_meta::engine::EngineError> for Error {
 
 const BUCKET: &str = "b";
 
+thread_local! {
+    /// What the measured parts of the step running now allocated, in a counting build.
+    static COUNTED: Cell<Counts> = const { Cell::new(Counts::ZERO) };
+}
+
+/// The start of a step's measured part: its time, and in a counting build (`count-allocs`) its
+/// allocations, counted from here to [`Mark::end`].
+struct Mark(Instant);
+
+impl Mark {
+    fn begin() -> Self {
+        if alloc::installed() {
+            alloc::begin();
+        }
+        Self(Instant::now())
+    }
+
+    /// The measured part's time; its counts added to the step's.
+    fn end(self) -> Duration {
+        let took = self.0.elapsed();
+        if alloc::installed() {
+            let c = alloc::end();
+            COUNTED.with(|counted| {
+                let k = counted.get();
+                counted.set(Counts {
+                    allocations: k.allocations.saturating_add(c.allocations),
+                    reallocations: k.reallocations.saturating_add(c.reallocations),
+                    moved: k.moved.saturating_add(c.moved),
+                    bytes: k.bytes.saturating_add(c.bytes),
+                    ..k
+                });
+            });
+        }
+        took
+    }
+}
+
+/// A row's runs: their times, and the most any one run's measured part allocated, reallocated
+/// and asked in bytes (every run of a step does the same work, so a run that differs is seen).
+struct Runs {
+    times: Histogram,
+    most: Counts,
+}
+
 /// Runs `step`, which sets itself up and returns the time of the part to measure, until
-/// `budget` is spent and at least five times; returns the times.
+/// `budget` is spent and at least five times.
 fn timed(
     budget: Duration,
     mut step: impl FnMut() -> Result<Duration, Error>,
-) -> Result<Histogram, Error> {
+) -> Result<Runs, Error> {
     let started = Instant::now();
-    let mut times = Histogram::new();
-    while times.count() < 5 || started.elapsed() < budget {
-        times.record(nanos(step()?));
+    let mut runs = Runs {
+        times: Histogram::new(),
+        most: Counts::ZERO,
+    };
+    while runs.times.count() < 5 || started.elapsed() < budget {
+        COUNTED.with(|counted| counted.set(Counts::ZERO));
+        runs.times.record(nanos(step()?));
+        let c = COUNTED.with(Cell::get);
+        let m = &mut runs.most;
+        m.allocations = m.allocations.max(c.allocations);
+        m.reallocations = m.reallocations.max(c.reallocations);
+        m.bytes = m.bytes.max(c.bytes);
     }
-    Ok(times)
+    Ok(runs)
 }
 
-fn row(out: &mut impl Write, label: String, times: &Histogram) -> Result<(), Error> {
+fn row(out: &mut impl Write, label: String, runs: &Runs) -> Result<(), Error> {
+    let counted = |n: u64| {
+        if alloc::installed() {
+            n.to_string()
+        } else {
+            "-".to_owned()
+        }
+    };
     writeln!(
         out,
-        "  {:<34} {:>10} {:>10} {:>7}",
+        "  {:<34} {:>10} {:>10} {:>7} {:>9} {:>9} {:>11}",
         label,
-        display::nanos(times.p50()),
-        display::nanos(times.max()),
-        times.count()
+        display::nanos(runs.times.p50()),
+        display::nanos(runs.times.max()),
+        runs.times.count(),
+        counted(runs.most.allocations),
+        counted(runs.most.reallocations),
+        counted(runs.most.bytes)
     )?;
     Ok(())
 }
@@ -114,12 +180,13 @@ fn row(out: &mut impl Write, label: String, times: &Histogram) -> Result<(), Err
 pub fn meta(out: &mut impl Write, step: Duration) -> Result<(), Error> {
     writeln!(
         out,
-        "metadata commands applied over the model engine, one core; the median and slowest run"
+        "metadata commands applied over the model engine, one core; the median and slowest run, \
+         and in a counting build the most one run allocated, reallocated and asked in bytes"
     )?;
     writeln!(
         out,
-        "  {:<34} {:>10} {:>10} {:>7}",
-        "", "p50", "max", "runs"
+        "  {:<34} {:>10} {:>10} {:>7} {:>9} {:>9} {:>11}",
+        "", "p50", "max", "runs", "allocs", "reallocs", "bytes"
     )?;
     for parts in [1u16, 100, 1_000, 10_000] {
         let times = timed(step, || completion(parts))?;
@@ -217,7 +284,7 @@ fn check_files(files: usize, blocks: usize, page: usize) -> Result<Duration, Err
             });
         }
     }
-    let started = Instant::now();
+    let started = Mark::begin();
     for check in &checks {
         match file::apply(&mut m, index, check)? {
             file::Outcome::BlocksChecked(_) => {}
@@ -225,7 +292,7 @@ fn check_files(files: usize, blocks: usize, page: usize) -> Result<Duration, Err
         }
         index = index.saturating_add(1);
     }
-    Ok(started.elapsed())
+    Ok(started.end())
 }
 
 /// A Name range holding every key, its gate for the bucket open.
@@ -318,9 +385,9 @@ fn completion(parts: u16) -> Result<Duration, Error> {
         listing: [0; mantle_meta::record::LISTING],
         native: false,
     });
-    let started = Instant::now();
+    let started = Mark::begin();
     let done = name::apply(&mut m, index, &complete)?;
-    let took = started.elapsed();
+    let took = started.end();
     match done {
         Outcome::Put { .. } => Ok(took),
         other => Err(Error::Unexpected(format!("{other:?}"))),
@@ -409,9 +476,9 @@ fn session_entry(commands: usize) -> Result<Duration, Error> {
         at_ns: 3,
         commands: (HISTORY..).skip(1).take(commands).map(sessioned).collect(),
     };
-    let started = Instant::now();
+    let started = Mark::begin();
     apply_entry(&mut m, 4, &entry, Layer::Name, &rules)?;
-    Ok(started.elapsed())
+    Ok(started.end())
 }
 
 /// `ranges` descriptors dividing the bucket's keys, in an order other than their keys'.
@@ -438,7 +505,7 @@ fn directory(ranges: usize) -> Vec<Descriptor> {
 
 /// A create attempt learning a directory of `ranges` ranges; then, answered at its first range
 /// with that range's split, learning the split: the times of each.
-fn coordinator(step: Duration, ranges: usize) -> Result<(Histogram, Histogram), Error> {
+fn coordinator(step: Duration, ranges: usize) -> Result<(Runs, Runs), Error> {
     let bounds = Bounds {
         budget: 64,
         ranges: 1 << 20,
@@ -449,9 +516,9 @@ fn coordinator(step: Duration, ranges: usize) -> Result<(Histogram, Histogram), 
     };
     let dir = directory(ranges);
     let learn = timed(step, || {
-        let started = Instant::now();
+        let started = Mark::begin();
         let c = Coordinator::start(BUCKET, &creating, &dir, bounds)?;
-        let took = started.elapsed();
+        let took = started.end();
         c.map(|_| took)
             .ok_or_else(|| Error::Unexpected("no attempt".into()))
     })?;
@@ -481,9 +548,9 @@ fn coordinator(step: Duration, ranges: usize) -> Result<(Histogram, Histogram), 
             into: None,
             taken: None,
         };
-        let started = Instant::now();
+        let started = Mark::begin();
         c.answer(Answer::Gate(Routed::Moved(Box::new(lineage))))?;
-        Ok(started.elapsed())
+        Ok(started.end())
     })?;
     Ok((learn, relearn))
 }
@@ -511,9 +578,9 @@ fn write_file(extents: usize) -> Result<(Duration, Model), Error> {
         blocks_deadline_ns: u64::MAX,
         at_ns: 10,
     };
-    let started = Instant::now();
+    let started = Mark::begin();
     file::apply(&mut m, 1, &write)?;
-    Ok((started.elapsed(), m))
+    Ok((started.end(), m))
 }
 
 /// The sweep's check of `page` blocks against a file of `extents` extents, each of its own
@@ -533,9 +600,9 @@ fn check_blocks(extents: usize, page: usize) -> Result<Duration, Error> {
         blocks,
         at_ns: 20,
     };
-    let started = Instant::now();
+    let started = Mark::begin();
     let checked = file::apply(&mut m, 2, &check)?;
-    let took = started.elapsed();
+    let took = started.end();
     match checked {
         file::Outcome::BlocksChecked(v) if v.len() == page => Ok(took),
         other => Err(Error::Unexpected(format!("{other:?}"))),

@@ -64,7 +64,9 @@ pub struct GatewaySettings {
     pub handover_ns: u64,
     /// The blocks a put holds going down, and a get holds being read, at once (gateway.md §2–§3).
     pub window: usize,
-    /// The object operations the host runs at once; one past them is answered `SlowDown`.
+    /// The most object operations the host runs at once, the ceiling the node's memory was split
+    /// for: within it the host runs as many as it has learned its knee is (`crate::admit`), and
+    /// one past them is answered `SlowDown`.
     pub objects: usize,
     /// The clients of the native protocol it admits at once, each by the certificate the cell's
     /// authority issued it for the client role (node.md §3.6). One past them is refused as the
@@ -103,6 +105,9 @@ pub(crate) struct Job {
     /// When its work last moved: begun, an ask of its own answered, a piece of a chunk it reads
     /// or sends.
     moved_ns: u64,
+    /// When the host admitted it, on the shard's clock; none for one answered at once, refused or
+    /// malformed, which the admission limit does not count (`crate::admit`).
+    admitted_ns: Option<u64>,
 }
 
 impl Job {
@@ -645,18 +650,31 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .map(|remaining| {
                 now.saturating_add(u64::try_from(remaining.as_nanos()).unwrap_or(u64::MAX))
             });
+        let mut admitted_ns = None;
         let work = match (head, self.gateway.as_ref()) {
             (_, None) => Work::Draining(Box::new(Reply::status(Status::Failed))),
             (Err(_), Some(_)) => Work::Draining(Box::new(Reply::status(Status::Malformed))),
             // A node stopping begins no operation (node.md §1.7): its client asks another.
-            (Ok(_), Some(g)) if self.stopping() || self.jobs.len() >= g.objects => {
+            (Ok(_), Some(_)) if self.stopping() => {
+                Work::Draining(Box::new(Reply::status(Status::SlowDown)))
+            }
+            (Ok(_), Some(_)) if !self.admits() => {
+                if let Some(admission) = self.admission.as_mut() {
+                    admission.turned_away();
+                }
                 Work::Draining(Box::new(Reply::status(Status::SlowDown)))
             }
             (Ok(head), Some(_)) => {
+                admitted_ns = Some(now);
                 let fields = usize::try_from(head.fields()).unwrap_or(0);
                 Work::Fields(head, Vec::with_capacity(fields))
             }
         };
+        if admitted_ns.is_some()
+            && let Some(admission) = self.admission.as_mut()
+        {
+            admission.admitted();
+        }
         self.jobs.push(Job {
             door: Door::Exchange(exchange),
             principal,
@@ -664,6 +682,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             pending: Vec::new(),
             deadline_ns,
             moved_ns: now,
+            admitted_ns,
         });
     }
 
@@ -676,16 +695,26 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             body,
             reply,
         } = request;
+        let now = hyper_rt::futures::now_ns();
+        let mut admitted_ns = None;
+        // The door holds a request while the host has no room (`take_door`): one taken here past
+        // the limit is a stopping node's.
         let work = match self.gateway.as_ref() {
             None => Work::Draining(Box::new(Reply::status(Status::Failed))),
-            Some(g) if self.stopping() || self.jobs.len() >= g.objects => {
+            Some(_) if self.stopping() || !self.admits() => {
                 Work::Draining(Box::new(Reply::status(Status::SlowDown)))
             }
             Some(_) => {
+                admitted_ns = Some(now);
                 let block = self.open_block(&op);
                 work(op, Vec::new(), block)
             }
         };
+        if admitted_ns.is_some()
+            && let Some(admission) = self.admission.as_mut()
+        {
+            admission.admitted();
+        }
         self.jobs.push(Job {
             door: Door::Local(Box::new(Local {
                 body,
@@ -699,7 +728,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             pending: Vec::new(),
             // S3 states no patience: its stock clients' is the bound (research/77 D2).
             deadline_ns: None,
-            moved_ns: hyper_rt::futures::now_ns(),
+            moved_ns: now,
+            admitted_ns,
         });
     }
 
@@ -841,6 +871,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if over {
                 // What it still waits on is let go: an ended get's chunks still out, say.
                 let job = self.jobs.swap_remove(at);
+                self.ended(job.admitted_ns);
                 self.abandoned
                     .extend(job.pending.into_iter().map(|(pending, _)| pending));
             } else {
@@ -2953,15 +2984,48 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// An exchange of a job ended unanswered: the job ends, what it waits on let go.
     pub(super) fn job_lost(&mut self, exchange: ExchangeId) {
         let Self {
-            jobs, abandoned, ..
+            jobs,
+            abandoned,
+            admission,
+            ..
         } = self;
+        let now = hyper_rt::futures::now_ns();
         jobs.retain_mut(|j| {
             if !matches!(j.door, Door::Exchange(e) if e == exchange) {
                 return true;
             }
             abandoned.extend(j.pending.drain(..).map(|(pending, _)| pending));
+            if let (Some(at), Some(admission)) = (j.admitted_ns, admission.as_mut()) {
+                admission.completed(now.saturating_sub(at), now);
+            }
             false
         });
+    }
+
+    /// The operations the host admits at once now, as it learned its knee (`crate::admit`): none
+    /// for a node that hosts no objects.
+    pub fn admitting(&self) -> Option<usize> {
+        self.admission.as_ref().map(crate::admit::Admission::limit)
+    }
+
+    /// The operations the host runs now: those it admitted, not those it answers at once.
+    fn running(&self) -> usize {
+        self.jobs.iter().filter(|j| j.admitted_ns.is_some()).count()
+    }
+
+    /// Whether the host admits one more operation beside those it runs (`crate::admit`).
+    pub(super) fn admits(&self) -> bool {
+        self.admission
+            .as_ref()
+            .is_none_or(|a| a.admits(self.running()))
+    }
+
+    /// An operation the host admitted at `admitted_ns` ended: the limit learns its latency.
+    fn ended(&mut self, admitted_ns: Option<u64>) {
+        let now = hyper_rt::futures::now_ns();
+        if let (Some(at), Some(admission)) = (admitted_ns, self.admission.as_mut()) {
+            admission.completed(now.saturating_sub(at), now);
+        }
     }
 
     /// When the host next needs a turn: at once when what an operation, or one ended, asked is
@@ -3551,6 +3615,7 @@ mod tests {
             pending: vec![(Pending::Read(1), None)],
             deadline_ns: Some(10),
             moved_ns: 1,
+            admitted_ns: Some(1),
         };
         assert!(job.held());
         assert_eq!(job.bounded(9), Bounded::Held);

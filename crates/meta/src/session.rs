@@ -1,12 +1,13 @@
 //! Gateways' sessions with a range (docs/design/replica.md §1): the Raft dissertation's
 //! client sessions, which make each command take effect once however often it is retried
 //! (06 §A1.8). A session is registered by a command and named by the entry that registered
-//! it. It keeps the answers the gateway has yet to acknowledge, and expires when entries'
-//! times pass its lifetime without it, or when those answers pass its bounds, so every replica
-//! expires the same sessions at the same entry.
+//! it. It keeps the answers the gateway has yet to acknowledge, as many as its row holds, and
+//! expires when entries' times pass its lifetime without it, so every replica expires the same
+//! sessions at the same entry. A command whose answer its row would not hold is refused before it
+//! takes effect, its session kept (node.md §2.8).
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::engine::{Rows, Write};
 use crate::error::MetaError;
@@ -24,35 +25,24 @@ use crate::wire::{Answer, MAX_COMMANDS, Sessioned};
 const COUNT: &[u8] = &[LOCAL, SESSIONS];
 
 /// The bounds a range keeps its sessions within, from how long gateways go between commands
-/// and how many commands each keeps in flight (docs/design/replica.md §6).
+/// and the rows the range holds (docs/design/replica.md §1, node.md §2.8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rules {
     /// Entry time after a session's last use at which it expires.
     pub lifetime_ns: u64,
     pub max_sessions: u64,
-    /// Answers one session keeps unacknowledged: past it, the session expires.
-    pub max_answers: usize,
-    /// Encoded bytes of the answers one session keeps unacknowledged: past it, the session
-    /// expires too, since a count bounds no answer's size (audit P04).
-    pub max_answer_bytes: usize,
     /// Sessions one entry expires at most, which bounds the entry's work.
     pub expiries_per_entry: usize,
     /// A row's key and value at most, which every member's engine holds whole, its page and its
     /// memtable sized to them: a command whose writes hold a longer one is refused whole,
-    /// `Answer::RowTooLarge`, and a session whose row would pass them expires.
+    /// `Answer::RowTooLarge`, and one whose answer would take its session's row past them is
+    /// refused before it takes effect, `Answer::AnswersFull`. A session keeps as many answers as
+    /// its row holds, so their bytes, not a count, bound it (research/87 §1).
     pub max_key_bytes: usize,
     pub max_value_bytes: usize,
 }
 
 impl Rules {
-    /// Bytes of the largest session row these rules let a range write: its answers at both
-    /// bounds, as many as `max_answers` holding `max_answer_bytes` between them, within a row's
-    /// value; a session that would pass any of them expires as its entry is written.
-    pub fn largest_session_row(&self) -> usize {
-        Session::row_bytes(self.max_answers, self.max_answer_bytes)
-            .map_or(self.max_value_bytes, |row| row.min(self.max_value_bytes))
-    }
-
     /// Whether these rules' bounds on a row admit the rows the session layer writes of itself
     /// whatever a session holds: a session with no answer kept, its place in the order of last
     /// use, its owner's row and the count of sessions. Bounds below them would refuse a
@@ -79,7 +69,7 @@ impl Rules {
 /// What a command's session says of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Check {
-    /// No such session: it never was, or it expired.
+    /// No such session: it never was, or it expired by time or by a later registration.
     Unknown,
     /// Answered, and forgotten once the gateway acknowledged the answer.
     Repeated,
@@ -135,8 +125,6 @@ struct Held {
     answers: Vec<(u64, Vec<u8>)>,
     bytes: usize,
     changed: bool,
-    /// Its answers passed the session's bounds: it is removed when the entry writes it.
-    expired: bool,
 }
 
 /// The sessions one entry's commands name. Each is read and decoded at its first command,
@@ -148,6 +136,10 @@ struct Held {
 #[derive(Debug, Default)]
 pub struct Touched {
     held: BTreeMap<u64, Held>,
+    /// The sessions one of whose commands this entry refused for room: each later command of
+    /// theirs in the entry is refused too, so a session's commands take effect in their order.
+    /// At most one a command of the entry; kept past `write`, which a registration calls midway.
+    full: BTreeSet<u64>,
 }
 
 impl Touched {
@@ -172,7 +164,6 @@ impl Touched {
                             .fold(0usize, |sum, (_, a)| sum.saturating_add(a.len())),
                         answers: s.answers,
                         changed: false,
-                        expired: false,
                     }),
                 ),
             },
@@ -188,7 +179,7 @@ impl Touched {
         session: u64,
         serial: u64,
     ) -> Result<Check, MetaError> {
-        let Some(s) = self.held(rows, session)?.filter(|s| !s.expired) else {
+        let Some(s) = self.held(rows, session)? else {
             return Ok(Check::Unknown);
         };
         if serial == u64::MAX {
@@ -204,24 +195,15 @@ impl Touched {
     }
 
     /// Records that `command`'s session, which `check` found, was used at `at_ns`: forgets the
-    /// answers the gateway has received, those before `command.unanswered`, keeps `answer` for
-    /// `command.serial` if there is one, and moves the session in the order of last use.
+    /// answers the gateway has received, those before `command.unanswered`, and moves the session
+    /// in the order of last use.
     ///
     /// Only the gateway's acknowledgement forgets an answer. Serials reach the log in any
     /// order, so an answer forgotten for room could lie above a serial still in flight, and a
-    /// watermark raised past it would take that serial for a repeat it never was. A session
-    /// whose unacknowledged answers pass its bounds expires instead, as the Raft
-    /// dissertation bounds sessions (06 §A1.8): every command after it is refused, never
-    /// applied, and the gateway registers anew.
-    pub fn record(
-        &mut self,
-        command: &Sessioned,
-        answer: Option<&Answer>,
-        at_ns: u64,
-        rules: &Rules,
-    ) -> Result<(), MetaError> {
+    /// watermark raised past it would take that serial for a repeat it never was.
+    pub fn acknowledge(&mut self, command: &Sessioned, at_ns: u64) {
         let Some(s) = self.held.get_mut(&command.session) else {
-            return Ok(());
+            return;
         };
         s.low = s.low.max(command.unanswered);
         let low = s.low;
@@ -234,36 +216,54 @@ impl Touched {
             keep
         });
         s.bytes = bytes;
-        if let Some(answer) = answer {
-            let encoded = answer.encode()?;
-            s.bytes = s.bytes.saturating_add(encoded.len());
-            s.answers.push((command.serial, encoded));
-        }
-        let row = Session::row_bytes(s.answers.len(), s.bytes);
-        if s.answers.len() > rules.max_answers
-            || s.bytes > rules.max_answer_bytes
-            || row.is_none_or(|row| row > rules.max_value_bytes)
-        {
-            s.expired = true;
-            s.answers.clear();
-            s.bytes = 0;
-        }
         s.last_ns = at_ns;
         s.changed = true;
-        Ok(())
     }
 
-    /// Writes every session the entry changed, and moves each in the order of last use, or
-    /// removes it if it expired, then lets them go: a command after reads them anew.
+    /// Whether `command`'s session, acknowledged, keeps an answer of `answer` bytes beside those
+    /// it keeps: its row, with it, within a row's bound, and no command of the session refused
+    /// earlier in the entry. A command whose answer it does not keep is refused before it takes
+    /// effect, `Answer::AnswersFull` ([`Self::refuse`]), so a bound the gateway reaches never
+    /// ends its session, where expiring it left a lost reply's commands to whatever recognised
+    /// their copies (research/87 §1).
+    pub fn fits(&self, command: &Sessioned, answer: usize, rules: &Rules) -> bool {
+        if self.refused(command) {
+            return false;
+        }
+        self.held.get(&command.session).is_some_and(|s| {
+            s.answers
+                .len()
+                .checked_add(1)
+                .zip(s.bytes.checked_add(answer))
+                .and_then(|(answers, bytes)| Session::row_bytes(answers, bytes))
+                .is_some_and(|row| row <= rules.max_value_bytes)
+        })
+    }
+
+    /// Keeps `answer`, encoded, for `command.serial`, which [`Self::fits`] found room for.
+    pub fn keep(&mut self, command: &Sessioned, answer: Vec<u8>) {
+        if let Some(s) = self.held.get_mut(&command.session) {
+            s.bytes = s.bytes.saturating_add(answer.len());
+            s.answers.push((command.serial, answer));
+        }
+    }
+
+    /// Refuses `command` for room: it and every later command of its session in the entry.
+    pub fn refuse(&mut self, command: &Sessioned) {
+        self.full.insert(command.session);
+    }
+
+    /// Whether a command of `command`'s session was refused for room earlier in the entry, so it
+    /// is refused without running.
+    pub fn refused(&self, command: &Sessioned) -> bool {
+        self.full.contains(&command.session)
+    }
+
+    /// Writes every session the entry changed, and moves each in the order of last use, then lets
+    /// them go: a command after reads them anew.
     pub fn write<R: Rows>(&mut self, rows: &mut R, index: u64) -> Result<(), MetaError> {
         let mut writes = Vec::new();
-        let mut expired = 0u64;
         for (session, s) in std::mem::take(&mut self.held) {
-            if s.expired {
-                writes.extend(removal(&expiry_key(s.found_ns, session))?);
-                expired = expired.checked_add(1).ok_or(MetaError::Corrupt)?;
-                continue;
-            }
             if !s.changed {
                 continue;
             }
@@ -277,12 +277,6 @@ impl Touched {
             };
             writes.push(Write::Put(session_key(session), row.encode()?));
             writes.push(Write::Put(expiry_key(s.last_ns, session), Vec::new()));
-        }
-        if expired > 0 {
-            let held = count(rows)?
-                .checked_sub(expired)
-                .ok_or(MetaError::Corrupt)?;
-            writes.push(Write::Put(COUNT.to_vec(), record::encode_number(held)));
         }
         if !writes.is_empty() {
             rows.apply(index, writes)?;
@@ -492,8 +486,6 @@ mod tests {
     const RULES: Rules = Rules {
         lifetime_ns: 100,
         max_sessions: 2,
-        max_answers: 2,
-        max_answer_bytes: usize::MAX,
         expiries_per_entry: 8,
         max_key_bytes: usize::MAX,
         max_value_bytes: usize::MAX,
@@ -554,7 +546,8 @@ mod tests {
         Touched::default().check(m, session, serial)
     }
 
-    /// One command's use of its session, in an entry of its own.
+    /// One command's use of its session, in an entry of its own, as `apply::apply_entry` makes
+    /// it: whether its answer was kept, or the command refused for room.
     fn record(
         m: &mut Model,
         index: u64,
@@ -562,11 +555,22 @@ mod tests {
         answer: Option<&Answer>,
         at_ns: u64,
         rules: &Rules,
-    ) -> Result<(), MetaError> {
+    ) -> Result<bool, MetaError> {
         let mut touched = Touched::default();
         touched.check(&mut *m, command.session, command.serial)?;
-        touched.record(command, answer, at_ns, rules)?;
-        touched.write(m, index)
+        touched.acknowledge(command, at_ns);
+        let mut kept = true;
+        if let Some(answer) = answer {
+            let encoded = answer.encode()?;
+            kept = touched.fits(command, encoded.len(), rules);
+            if kept {
+                touched.keep(command, encoded);
+            } else {
+                touched.refuse(command);
+            }
+        }
+        touched.write(m, index)?;
+        Ok(kept)
     }
 
     #[test]
@@ -582,13 +586,6 @@ mod tests {
         record(&mut m, 4, &used(s, 3, 2), Some(&answer(3)), 40, &RULES).unwrap();
         assert_eq!(check(&mut m, s, 1).unwrap(), Check::Repeated);
         assert_eq!(check(&mut m, s, 2).unwrap(), Check::Answered(answer(2)));
-        // Past the bound of answers kept unacknowledged, the session expires, and a retry of
-        // any serial is refused rather than taken for a repeat.
-        record(&mut m, 5, &used(s, 4, 2), Some(&answer(4)), 50, &RULES).unwrap();
-        for serial in 1..=4 {
-            assert_eq!(check(&mut m, s, serial).unwrap(), Check::Unknown);
-        }
-        assert_eq!(count(&mut m).unwrap(), 0);
         assert_eq!(check(&mut m, s + 1, 1).unwrap(), Check::Unknown);
     }
 
@@ -597,10 +594,7 @@ mod tests {
     #[test]
     fn received_answers_are_forgotten_in_any_order() {
         let mut m = Model::default();
-        let rules = Rules {
-            max_answers: 8,
-            ..RULES
-        };
+        let rules = RULES;
         let s = register(&mut m, 1, 0, 10, &rules).unwrap();
         record(&mut m, 2, &used(s, 5, 1), Some(&answer(5)), 20, &rules).unwrap();
         record(&mut m, 3, &used(s, 3, 1), Some(&answer(3)), 30, &rules).unwrap();
@@ -618,21 +612,22 @@ mod tests {
         assert_eq!(check(&mut m, s, 5).unwrap(), Check::Answered(answer(5)));
     }
 
-    /// Past the bytes of answers a session may keep unacknowledged, it expires as past the
-    /// count, whatever order its serials came in: no answer is forgotten unacknowledged.
+    /// A session keeps answers while its row holds them, whatever order its serials came in: the
+    /// command whose answer it would not hold is refused and applies nothing, the session and
+    /// every answer it keeps stay, and once the gateway acknowledges the answers before it, the
+    /// same serial is a new command its row holds. No answer is forgotten unacknowledged.
     #[test]
-    fn a_session_past_its_byte_budget_expires() {
+    fn a_session_past_its_row_refuses_the_command_and_keeps_the_session() {
         let mut m = Model::default();
         let size = answer(1).encode().unwrap().len();
         let rules = Rules {
-            max_answers: 8,
-            max_answer_bytes: 2 * size,
+            max_value_bytes: Session::row_bytes(2, 2 * size).unwrap(),
             ..RULES
         };
         let s = register(&mut m, 1, 0, 10, &rules).unwrap();
         for (serial, index) in [3u8, 1].into_iter().zip(2u64..) {
             let command = used(s, u64::from(serial), 1);
-            record(
+            let kept = record(
                 &mut m,
                 index,
                 &command,
@@ -641,14 +636,45 @@ mod tests {
                 &rules,
             )
             .unwrap();
+            assert!(kept);
         }
+        assert!(!record(&mut m, 4, &used(s, 2, 1), Some(&answer(2)), 40, &rules).unwrap());
         assert_eq!(check(&mut m, s, 1).unwrap(), Check::Answered(answer(1)));
+        assert_eq!(check(&mut m, s, 2).unwrap(), Check::New);
         assert_eq!(check(&mut m, s, 3).unwrap(), Check::Answered(answer(3)));
-        record(&mut m, 4, &used(s, 2, 1), Some(&answer(2)), 40, &rules).unwrap();
-        for serial in 1..=3 {
-            assert_eq!(check(&mut m, s, serial).unwrap(), Check::Unknown);
+        assert_eq!(count(&mut m).unwrap(), 1);
+        // The gateway has 1's answer: its room is 2's.
+        assert!(record(&mut m, 5, &used(s, 2, 2), Some(&answer(2)), 50, &rules).unwrap());
+        assert_eq!(check(&mut m, s, 1).unwrap(), Check::Repeated);
+        assert_eq!(check(&mut m, s, 2).unwrap(), Check::Answered(answer(2)));
+        assert_eq!(check(&mut m, s, 3).unwrap(), Check::Answered(answer(3)));
+    }
+
+    /// In one entry, the command refused for room refuses each later command of its session, a
+    /// smaller answer's among them, so a session's commands take effect in their order; another
+    /// session's are untouched.
+    #[test]
+    fn a_refusal_for_room_refuses_the_sessions_later_commands_in_the_entry() {
+        let mut m = Model::default();
+        let size = answer(1).encode().unwrap().len();
+        let rules = Rules {
+            max_value_bytes: Session::row_bytes(1, size).unwrap(),
+            ..RULES
+        };
+        let (a, b) = (
+            register(&mut m, 1, 0, 10, &rules).unwrap(),
+            register(&mut m, 2, 0, 10, &rules).unwrap(),
+        );
+        let mut touched = Touched::default();
+        for (session, serial) in [(a, 1), (a, 2), (b, 1)] {
+            touched.check(&mut m, session, serial).unwrap();
+            touched.acknowledge(&used(session, serial, 1), 20);
         }
-        assert_eq!(count(&mut m).unwrap(), 0);
+        let one = answer(1).encode().unwrap();
+        assert!(!touched.fits(&used(a, 1, 1), one.len() + 1, &rules));
+        touched.refuse(&used(a, 1, 1));
+        assert!(!touched.fits(&used(a, 2, 1), 1, &rules));
+        assert!(touched.fits(&used(b, 1, 1), one.len(), &rules));
     }
 
     /// Bounds admit the session layer's own rows from the longest of its keys and values up, and
@@ -666,27 +692,6 @@ mod tests {
         assert!(bound(key, value).admit_sessions());
         assert!(!bound(key - 1, value).admit_sessions());
         assert!(!bound(key, value - 1).admit_sessions());
-    }
-
-    /// A session whose row would pass the bound on a value expires before it is written, within
-    /// its count and its bytes of answers, so no session's row is one every member's engine
-    /// does not hold.
-    #[test]
-    fn a_session_whose_row_would_pass_a_values_bound_expires() {
-        let mut m = Model::default();
-        let size = answer(1).encode().unwrap().len();
-        let rules = Rules {
-            max_answers: 8,
-            max_value_bytes: Session::row_bytes(1, size).unwrap(),
-            ..RULES
-        };
-        assert_eq!(rules.largest_session_row(), rules.max_value_bytes);
-        let s = register(&mut m, 1, 0, 10, &rules).unwrap();
-        record(&mut m, 2, &used(s, 1, 1), Some(&answer(1)), 20, &rules).unwrap();
-        assert_eq!(check(&mut m, s, 1).unwrap(), Check::Answered(answer(1)));
-        record(&mut m, 3, &used(s, 2, 1), Some(&answer(2)), 30, &rules).unwrap();
-        assert_eq!(check(&mut m, s, 1).unwrap(), Check::Unknown);
-        assert_eq!(count(&mut m).unwrap(), 0);
     }
 
     #[test]

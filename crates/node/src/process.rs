@@ -493,8 +493,6 @@ pub const KEYS: &[&str] = &[
     "range.max_entry_bytes",
     "rules.lifetime_ns",
     "rules.max_sessions",
-    "rules.max_answers",
-    "rules.max_answer_bytes",
     "rules.expiries_per_entry",
     "rules.max_key_bytes",
     "rules.max_value_bytes",
@@ -922,8 +920,6 @@ impl ProcessConfig {
             rules: Rules {
                 lifetime_ns: lines.get("rules.lifetime_ns")?,
                 max_sessions: lines.get("rules.max_sessions")?,
-                max_answers: lines.get("rules.max_answers")?,
-                max_answer_bytes: lines.get("rules.max_answer_bytes")?,
                 expiries_per_entry: lines.get("rules.expiries_per_entry")?,
                 max_key_bytes: lines.get("rules.max_key_bytes")?,
                 max_value_bytes: lines.get("rules.max_value_bytes")?,

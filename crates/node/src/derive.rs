@@ -144,15 +144,16 @@ pub fn probe_budget() -> Result<Duration, DeriveError> {
         .ok_or(DeriveError::Overflow("the probe budget"))
 }
 
-/// The operations a node that hosts objects runs at once: 8, the knee of the cell's write
-/// throughput measured on the box (research/71, step 9; 64 KiB native PUTs, an open loop past
+/// The most operations a node that hosts objects runs at once, the ceiling its memory is split
+/// for: within it the node admits as many as it learns its knee is (`crate::admit`, node.md §2.8).
+/// 8, the knee measured on the box (research/71, step 9; 64 KiB native PUTs, an open loop past
 /// capacity, three clients an operation, n 300): 30, 39, 72, 79 and 93 a second at 2, 4, 8, 16 and
-/// 32, the doubling past 8 adding 10%, within the run-to-run band, and the one past 16 refused
-/// `SlowDown` for want of a slot. Each costs the objects' class its most bytes (`objects`).
+/// 32. It stays until research/87 §4's experiment chooses the ceiling's rule from the memory. Each
+/// costs the objects' class its most bytes (`objects`).
 const OBJECTS: usize = 8;
 
-/// What a node that hosts objects runs its drivers with: a window of one block, the floor;
-/// [`OBJECTS`] operations at once, of any kind; as many clients of the native protocol
+/// What a node that hosts objects runs its drivers with: a window of one block, the floor; at most
+/// [`OBJECTS`] operations at once, of any kind, as many as it learns its knee is within them; as many clients of the native protocol
 /// admitted at once, each with an operation it may run; S3's quota of buckets; one row each step
 /// of a bucket's attempt passes or removes, the least that moves it; HDFS's handover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -360,13 +361,12 @@ pub enum DeriveError {
 ///   frame waited for a confirmation of its own (research/71, step 9);
 /// - a session of each identity, for good: a registration ends its owner's last
 ///   (`mantle_meta::session::register`), so no session waits out a lifetime;
-/// - as many commands an entry as the node runs operations, each with one command waiting on a
-///   range at a time ([`batch`]), so every command the node's operations wait on goes in its next
-///   entry and shares its flush (replica.md §1; research/71, step 9), where one command an entry
-///   made a range commit one command a Raft round; their answers kept until the next entry
-///   acknowledges them, within the row a session may write, which the largest row S3 admits sets,
-///   so the store's page does not grow for them, and at least one answer at its largest
-///   (`wire::largest_answer_bytes`) among them;
+/// - a session's answers kept until the gateway acknowledges them, as many as its row holds
+///   within the largest row S3 admits, so the store's page does not grow for them, and one at the
+///   largest a node's command gets (`wire::largest_answer_bytes`) where it keeps no other; a
+///   command whose answer its row would not hold is refused before it takes effect and asked
+///   again (node.md §2.8), and an entry carries every command waiting that fits its bytes, no
+///   count besides (research/87);
 /// - a row's key and value at most the longest key S3's names give a row
 ///   (`key::largest_bytes`) and the largest value a request S3 admits, or a session at its
 ///   bounds, gives one (`wire::largest_row_bytes`).
@@ -386,19 +386,16 @@ pub fn cell(identities: u64) -> Result<(Settings, Rules), DeriveError> {
         max_committed_size_per_ready: entry,
         max_entry_bytes: entry,
     };
-    let answers = batch()?;
     let row = wire::largest_row_bytes()?;
-    let largest = wire::largest_answer_bytes()?;
-    // The answers' bytes are what the row holds past its own fields and each answer's.
-    let answer_bytes = Session::row_bytes(answers, 0)
-        .and_then(|fixed| row.checked_sub(fixed))
-        .filter(|&bytes| bytes >= largest)
-        .ok_or(DeriveError::Overflow("a session's answers within a row"))?;
+    // A session that keeps no other answer keeps one at the largest a node's command gets, so
+    // every command applies in a session whose earlier answers are acknowledged.
+    let one = wire::largest_answer_bytes()?;
+    if Session::row_bytes(1, one).is_none_or(|session| session > row) {
+        return Err(DeriveError::Overflow("a session's answer within a row"));
+    }
     let rules = Rules {
         lifetime_ns: u64::MAX,
         max_sessions: identities,
-        max_answers: answers,
-        max_answer_bytes: answer_bytes,
         // Nothing expires by time: one is the least work an entry's expiry may do.
         expiries_per_entry: 1,
         max_key_bytes: key::largest_bytes(),
@@ -413,14 +410,13 @@ pub fn cell(identities: u64) -> Result<(Settings, Rules), DeriveError> {
 /// device and one queued behind it: a third waits for the second either way.
 pub const IN_FLIGHT: usize = 2;
 
-/// The commands one entry of a node's carries at most: one for each operation the node runs, each
-/// operation waiting on at most a window of blocks' commands of one range at once
-/// (`gateway.objects`, `gateway.window`).
-pub fn batch() -> Result<usize, DeriveError> {
+/// The chunks a node's operations may write to one volume at once: each operation a window of
+/// blocks, a chunk of each on any one volume (`gateway.objects`, `gateway.window`).
+pub fn chunk_writes() -> Result<usize, DeriveError> {
     let g = gateway()?;
     g.objects
         .checked_mul(g.window)
-        .ok_or(DeriveError::Overflow("an entry's commands"))
+        .ok_or(DeriveError::Overflow("a node's chunk writes"))
 }
 
 /// The message bounds every node of a cell states, which a client of its ranges states the same:
@@ -1317,7 +1313,7 @@ pub fn derive(
     // Every operation of every node may write a chunk to one volume at once: one batch holds them.
     let chunk_requests = usize::try_from(identities)
         .ok()
-        .and_then(|n| n.checked_mul(batch().ok()?))
+        .and_then(|n| n.checked_mul(chunk_writes().ok()?))
         .ok_or(overflow("a volume's batch"))?;
 
     // The objects a node with root keys hosts, at the floor.
@@ -1943,20 +1939,6 @@ fn say_cell(said: &mut Said, settings: &Settings, rules: &Rules) {
          good",
     );
     said.add(
-        "rules.max_answers",
-        rules.max_answers,
-        Kind::Derived,
-        "a command for each operation the node runs in an entry, their answers kept until the \
-         next entry acknowledges them (derive::batch)",
-    );
-    said.add(
-        "rules.max_answer_bytes",
-        rules.max_answer_bytes,
-        Kind::Derived,
-        "what a session's row holds of answers within the largest row S3 admits, past one answer \
-         at the largest a node's command gets (derive::cell)",
-    );
-    said.add(
         "rules.expiries_per_entry",
         rules.expiries_per_entry,
         Kind::Derived,
@@ -2419,17 +2401,13 @@ mod tests {
         assert_eq!(settings.max_size_per_msg, entry);
         assert_eq!(settings.max_inflight_msgs, IN_FLIGHT);
         assert_eq!(settings.max_uncommitted_size, entry * 2);
-        assert_eq!(rules.max_answers, batch().unwrap());
-        assert!(rules.max_answers > 1);
-        // A session's row at its bounds is a row the range already admits, so no page grows.
-        assert_eq!(
-            rules.largest_session_row(),
-            wire::largest_row_bytes().unwrap()
-        );
-        assert!(rules.max_answer_bytes >= wire::largest_answer_bytes().unwrap());
+        // A session's row is a row the range already admits, so no page grows, and holds one
+        // answer at the largest a node's command gets.
+        assert_eq!(rules.max_value_bytes, wire::largest_row_bytes().unwrap());
+        let one = wire::largest_answer_bytes().unwrap();
+        assert!(Session::row_bytes(1, one).unwrap() <= rules.max_value_bytes);
         assert_eq!(rules.max_sessions, 7);
         assert!(rules.admit_sessions());
-        assert!(rules.largest_session_row() <= rules.max_value_bytes);
         assert!(wire::largest_row_bytes().unwrap() <= rules.max_value_bytes);
         assert_eq!(rules.max_key_bytes, key::largest_bytes());
     }
@@ -2703,10 +2681,10 @@ mod tests {
             &PROFILE,
             1 << 30,
             None,
-            3 * batch().unwrap(),
+            3 * chunk_writes().unwrap(),
         )
         .unwrap();
-        assert_eq!(cell.limits.batch_requests, 3 * batch().unwrap());
+        assert_eq!(cell.limits.batch_requests, 3 * chunk_writes().unwrap());
         Geometry::plan(1 << 30, align, &cell).unwrap();
         assert_eq!(v.max_fragments, (1 << 30) / 4096);
         assert_eq!(v.reads, Reads::measured(4, 1 << 20, 64 << 10));

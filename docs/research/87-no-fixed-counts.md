@@ -142,37 +142,59 @@ per-principal shedding stay as §4.5 plans them.
 | `Rules::max_answers` (8) and `max_answer_bytes` (18,482) | a session past either expires as its entry applies | removed. A session keeps answers while its row fits a row, `Rules::max_value_bytes`, the largest S3 admits (`wire::largest_row_bytes`), so no page grows. A command whose answer would pass that is refused before it takes effect, `Answer::AnswersFull`, its session kept, and so is each of the session's later commands in the entry | [1] §6.3, [2] §4.2: bytes are RIFL's own reason; refusal keeps exactly-once (§1) |
 | `derive::batch` (8) and `entry_limits`' commands | an entry carries at most 8 commands | an entry carries every command waiting that fits its bytes, `max_entry_bytes` (`wire::largest_entry_bytes`, 561,804) | [1] §10.2.2, [8]: the batch is what waited |
 | the volume's batch (`identities × batch`) | the chunks the cell's operations may write a volume at once | the cell's identities times each node's admission ceiling times its window | the same rule, now from the ceiling |
-| `derive::OBJECTS` (8) | the operations a node runs at once, and its native clients | a learned limit `L`, `⌈g·X̂·R̂⌉` within `[1, C]`, from the operations' own completions; `C` the ceiling the memory holds (§4) | [3] p. 240, [4], [6] |
+| `derive::OBJECTS` (8) | the operations a node runs at once, and its native clients | a learned limit within `[1, C]`, the point of greatest power found by probing, from the operations' own completions; `C` the ceiling the memory holds (§4) | [3] p. 240, [4], [6], [7] |
 
 The window, `gateway.window`, is one block, "the floor" (node.md §1.4). It is not one of the three
 counts; node.md §2.6 plans it as `⌈R·T/B⌉`, and it stays.
 
 ## 3. The learned limit
 
-DERIVED from [3] and [6], for an admission limit rather than a sender's window:
+**BBR's estimator does not carry over, measured.** BBR's `N* = X̂·R̂` needs `R̂` to be the no-load
+latency, and takes it as the least sample in ten seconds. A path's round trip has one such value.
+A node's operations do not: a 64 KiB PUT and an 8 MiB PUT differ a hundredfold. A model of
+Denning and Buzen's bottleneck shows it: a closed system of `c` servers, first come first served,
+exponential service, a thousand clients (`nfc-proto/sim.py`, kept with the experiment's data).
+Built on BBR's form, with `R̂` the least of each round's mean latency, the limit fell to 1 or 2
+operations at every knee from 3 to 40: 12% of the throughput at 8 servers, 2% at 40. A round of
+one or two operations has a mean as noisy as one sample, and the least of noisy means lies below
+the true mean, so each `X̂·R̂` undershot the last. Taking `R̂` as the mean of the round run below
+the knee instead ran the limit up to the ceiling, its windowed maximum `X̂` as biased up as the
+least was down. Little's law says why both must fail: `X·R̄ = N̄` in every phase, so a product of
+throughput and mean latency only measures the load the node already admitted.
 
-- **A sample is an operation's own.** Its latency runs from admission to its end, and its
-  completion is counted. A *round* begins with a mark of the operations admitted so far, and ends
-  once as many have completed. That is BBR's packet-timed round, so a round's length is the
-  operations' own latency, not a clock's.
-- **`X̂`, the most completions a second over the last ten rounds.** A round's sample is its
-  completions over its length. A round in which no operation was turned away (refused `SlowDown`
-  at the native door, or left waiting at the S3 door) was limited by its clients, not the node,
-  and enters the filter only where it raises the maximum (BBR's rule [6]).
-- **`R̂`, the least latency in the last ten seconds** (BBR's `min_rtt` window [6]).
-- **`L = ⌈g · X̂ · R̂⌉`, at least 1 and at most `C`.** `g` is BBR's: `2/ln 2` from the start until
-  three rounds pass without `X̂` growing 1.25×. Then `ln 2/2` for one round, to drain. Then the
-  cycle `5/4, 3/4, 1, 1, 1, 1, 1, 1`, one gain a round [6]. At `5/4` the node admits a quarter
-  past the knee and sees whether throughput follows. At `3/4` it holds a quarter below, nothing
-  queues, and `R̂` is the no-load latency again. In steady state the operations run at `N*`, as
-  [3] and [4] put the optimum.
-- **The limit never exceeds `C`, and before any sample it is 1**, the least that moves, as the
-  window and the scan rows are. Startup's gain then reaches the knee in `log₂.₈₈₅(N*)` rounds,
-  two for the measured 8.
+**Power has its maximum at the knee.** Kleinrock's power is throughput over delay, `P = X/R̄` [4].
+By Little's law `R̄ = N̄/X` [7], so `P = X²/N̄`. Below the knee `X = N/R₀` and `P = N/R₀²`, which
+rises with each operation admitted. Past it `X = X_max` and `P = X_max²/N`, which falls. So the
+limit of greatest power is the knee, "Keep the pipe just full, but no fuller" [4, abstract]. That
+holds for any mix of operations, since `R̄` is every operation's mean and no single one's least.
 
-Every constant in it is cited: the gains, the ten rounds and ten seconds, the 1.25× and three
-rounds are BBR's [6]. None is a count of operations. A limit computed this way cannot pass the
-memory it was given. The memory decides `C`; the limit decides how much of `C` is used.
+DERIVED from [3], [4] and [6]: the limit climbs to the point of greatest power by BBR's probing:
+
+- **A phase is the limit held, then measured.** It begins once as many operations have completed
+  as had been admitted before it, BBR's packet-timed round [6], so the operations it measures ran
+  under its own limit. It then counts `n` completions and their latencies over its length. Its
+  power is `n²/(length · Σ latency)`, and phases of equal `n` compare by `length · Σ latency`.
+- **`n` is what tells a probe's change from chance.** A rate over `n` completions has a relative
+  error of `1/√n`, and the log ratio of two phases' powers an error of `√(2/n)`. A probe a quarter
+  away moves the log of power by `ln(5/4)` at the least. At the normal distribution's two-sided
+  99% point, `z` 2.576, `n ≥ 2·(z/ln(5/4))² = 267`.
+- **From one, double while power grows a quarter** (BBR's startup, `bbr_full_bw_thresh` `5/4`). A
+  doubling whose power did not grow is undone. A phase in which no operation was turned away was
+  limited by its clients and ends startup where it is.
+- **Then cycle eight phases about a base**: a quarter past it, a quarter below, six at it (BBR's
+  `bbr_pacing_gain` cycle [6]). At each cycle's end the base moves to the limit of greatest power:
+  the six phases at the base pooled, the quarter below, and the quarter past where its clients asked
+  more than the base.
+- **The limit is at least 1, the least that moves, and at most `C`**, the ceiling the memory was
+  split for (§4).
+
+The same model, with the limit learned this way (`nfc-proto/power4.py`, n 60,000 completions a
+case, the second half's mean): the limit kept 1.1, 3.0, 8.5 and 40.0 at knees of 1, 3, 8 and 40
+servers, and 3.4, 16.4 and 8.0 at knees of 3, 16 and 8 with sizes mixed a hundredfold. Throughput
+was 100%, 94%, 95% and 96% of the most, and 91%, 85% and 91% mixed. A fixed limit at the knee gets
+100% in this model, whose knee is a corner, with no gain past it at all. The probes' quarter below
+and chance moves cost the rest. A real cell's knee is rounder: research/71's doubling past 8 still
+added 10%.
 
 ## 4. The ceiling: an experiment
 

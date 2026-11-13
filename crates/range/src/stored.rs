@@ -244,8 +244,6 @@ mod tests {
         Rules {
             lifetime_ns: u64::MAX,
             max_sessions: 1,
-            max_answers: 1,
-            max_answer_bytes: 0,
             expiries_per_entry: 1,
             max_key_bytes: key,
             max_value_bytes: value,

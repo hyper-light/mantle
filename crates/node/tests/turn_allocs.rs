@@ -106,13 +106,16 @@ fn serving(seed: u64, ops: u64) -> alloc::Counts {
 /// and then while encodings grew; made at their lengths, they no longer do, so the count is exact.
 /// On Linux each socket, a simulated one too, holds `recvmmsg` and `sendmmsg` headers (hyper-rt's
 /// `Batched`, 11 allocations, and its receive `Ring`, 6), and the three clients make theirs inside
-/// the count: 51 that macOS and Windows, which hold none, do not make.
+/// the count: 51 that macOS and Windows, which hold none, do not make. 360 more since a session
+/// keeps an answer only where its row holds it (research/87 §1): each command applied runs over
+/// its entry's writes in an overlay of its own, taken in once its answer is kept, whose map makes
+/// its first node, one allocation for each of the 120 puts' three commands.
 #[test]
 fn a_cell_serving_writes_turns_without_remaking_what_a_turn_keeps() {
     const SERVING: u64 = if cfg!(target_os = "linux") {
-        34_034
+        34_394
     } else {
-        33_983
+        34_343
     };
     let counts = serving(1, 40);
     assert_eq!(counts.allocations, SERVING, "{counts:?}");

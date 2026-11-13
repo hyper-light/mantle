@@ -366,8 +366,6 @@ fn session_entry(commands: usize) -> Result<Duration, Error> {
     let rules = Rules {
         lifetime_ns: u64::MAX,
         max_sessions: 16,
-        max_answers: usize::try_from(HISTORY).unwrap_or(usize::MAX),
-        max_answer_bytes: usize::MAX,
         expiries_per_entry: 16,
         // The model engine holds a row of any length.
         max_key_bytes: usize::MAX,

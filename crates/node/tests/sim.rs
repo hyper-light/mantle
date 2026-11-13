@@ -386,7 +386,7 @@ fn a_leader_deaf_before_it_judges_its_links_steps_down_and_the_others_elect_one_
 }
 
 /// The commands an entry of puts carries, as a node's entry carries the commands its operations
-/// wait on (`mantle_node::derive::batch`): as many as the simulated range's entry of 1 KiB holds.
+/// wait on, as many as fit its bytes: four, which the simulated range's entry of 1 KiB holds.
 const BATCH: u64 = 4;
 
 /// A batched entry is answered only once it is durable on a quorum (CLAUDE.md §6): a client asks

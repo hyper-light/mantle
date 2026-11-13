@@ -307,14 +307,16 @@ What changed:
   within the records its frame holds (`layout::most_batch_requests`), where it was the cell's
   identities times the operations' chunks.
 
-The bytes' rule is §4's experiment. Its first arm is **rule C**, 3/32 of the node's allowance:
-the most Linux lets TCP's buffers hold of the memory free at boot, `tcp_mem[2]` (Linux v6.12
-`net/ipv4/tcp.c`, `tcp_init_mem`: `limit = nr_free_buffer_pages() / 16; ... sysctl_tcp_mem[2] =
-sysctl_tcp_mem[0] * 2; /* 9.37 % */`, read 2026-11-12). Those are the bytes a host keeps in flight
-on its connections, as an operation's are in flight between its client and the volumes. C takes
-its share at the floor, and the indexes and engines share the rest as before: under C a volume's
-index holds up to 3/32 fewer fragments than under D. Rules A and D are built as
-variants beside it and measured as §4 asks. Rule B, borrowing at run time, is not built.
+The bytes' rule is §4's experiment, among the rules derived or learned from the node's own
+facts: A (operations first, to their clients' stated patience), B (borrowing at run time what the
+indexes and engines hold and do not yet use) and D (the data first). A fraction copied from
+another system's tuning, as Linux's `tcp_mem` share of free memory (rule C, briefly the first arm
+here), is not eligible: it is another implementation's tuning however well it is cited (the
+constants audit of 2026-11-12; the owner's rule of no arbitrary values). The branch derives **rule
+D** until the experiment chooses: the floor with one operation of the largest blocks, the
+indexes' and engines' wants beside it, each taken whole, and what the memory holds past both is
+the operations', with the one (`derive::derive`). D gives the engines' spare, what no want takes,
+to the operations instead. Rules A and B are built as variants beside it and measured as §4 asks.
 
 ## 5. What remains unknown
 

@@ -144,20 +144,10 @@ pub fn probe_budget() -> Result<Duration, DeriveError> {
         .ok_or(DeriveError::Overflow("the probe budget"))
 }
 
-/// The share of the memory a node holds at most that its object operations' bytes may take at
-/// once: 3/32, the most Linux lets TCP's buffers hold of the memory free at boot, `tcp_mem`'s third
-/// value (Linux v6.12 `net/ipv4/tcp.c`, `tcp_init_mem`: "sysctl_tcp_mem[2] = sysctl_tcp_mem[0] *
-/// 2; /* 9.37 % */"), the bytes a host keeps in flight on its connections, as an operation's are
-/// on their way between its client and the volumes (research/87 §4, rule C). Within it each
-/// operation is charged what it holds at its own size ([`Charges`]), and the node runs as many as
-/// it learns its knee is (`crate::admit`): `OPERATIONS_SHARE` thirty-seconds of it,
-/// [`OPERATIONS_SHARE_OF`].
-const OPERATIONS_SHARE: u64 = 3;
-const OPERATIONS_SHARE_OF: u64 = 32;
-
 /// What a node that hosts objects runs its drivers with: a window of one block, the floor; its
-/// operations' bytes within [`OPERATIONS_SHARE`] of its memory, and at most as many operations as
-/// those bytes hold at the least an operation holds, as many as it learns its knee is within them;
+/// operations' bytes what its memory holds past every class's floor and the indexes' and engines'
+/// wants ([`derive`], research/87 §4 rule D), and at most as many operations as those bytes hold at
+/// what one costs, as many as it learns its knee is within them;
 /// as many clients of the native protocol admitted at once, each with an operation it may run; S3's
 /// quota of buckets; one row each step of a bucket's attempt passes or removes, the least that
 /// moves it; HDFS's handover.
@@ -170,15 +160,6 @@ pub struct Gateway {
     pub bucket_quota: u32,
     pub scan_rows: u32,
     pub handover_ns: u64,
-}
-
-/// The bytes a node whose memory holds `allowance` bytes at most ([`allowance`]) gives its object
-/// operations and all they hold besides: [`OPERATIONS_SHARE`] of it.
-pub fn operations_share(allowance: u64) -> Result<u64, DeriveError> {
-    allowance
-        .checked_div(OPERATIONS_SHARE_OF)
-        .and_then(|part| part.checked_mul(OPERATIONS_SHARE))
-        .ok_or(DeriveError::Overflow("the operations' share"))
 }
 
 /// How many operations `share` bytes hold, and the bytes left for what they hold at their own
@@ -1624,6 +1605,67 @@ pub fn derive(
             listener,
         })
     };
+    // The floor, class by class.
+    let engines_bytes = mantle_engine::shard_db::bounded_bytes(
+        &StoreConfig {
+            max_extents: 0,
+            ..made.store
+        },
+        made.memtable_bytes,
+    )
+    .and_then(|each| each.checked_mul(u64::try_from(ranges).ok()?))
+    .ok_or(overflow("the engines' buffers"))?;
+    // A device's issuer, one a device the OS names, started by its first volume.
+    let mut devices: Vec<(&Option<String>, usize)> = Vec::new();
+    for facts in &measured.volumes {
+        let name = &facts.device.name;
+        if name.is_none() || !devices.iter().any(|(held, _)| *held == name) {
+            devices.push((name, issuer_depth(facts)));
+        }
+    }
+    let depths: Vec<usize> = devices.iter().map(|&(_, depth)| depth).collect();
+    let scrubs = vec![true; stated.volumes.len()];
+    let started = threads(&depths, &scrubs).ok_or(overflow("the node's threads"))?;
+    let log_held = log_bytes(&log_config).ok_or(overflow("the log's memory"))?;
+    let stacks_held = stacks(started).ok_or(overflow("the threads' stacks"))?;
+    // Every class at its floor, the operations' at `objects_bytes` and what they hold beside in
+    // `held`.
+    let classes_at = |held: &Held, objects_bytes: u64| -> Result<[(Class, u64); 7], DeriveError> {
+        Ok([
+            (Class::Objects, objects_bytes),
+            (Class::Volumes, volume_bytes),
+            (Class::Engines, engines_bytes),
+            (Class::Ranges, held.ranges_bytes),
+            (Class::Log, log_held),
+            (
+                Class::Transport,
+                held.bounds
+                    .transport_bytes
+                    .checked_add(held.beside)
+                    .and_then(|bytes| bytes.checked_add(held.listener))
+                    .ok_or(overflow("the transport's memory"))?,
+            ),
+            (Class::Threads, stacks_held),
+        ])
+    };
+    // What remains, shared: each index wants a fragment at each of its volume's blocks, and each
+    // engine the rows of the objects those fragments make across the cell, so both fill together.
+    let held_objects = cell_blocks(fragments, domains, &rates, target)?;
+    let engine_want =
+        engine_wants_for(&made, held_objects).ok_or(overflow("an engine's metadata"))?;
+    let mut all = wants;
+    all.resize(
+        stated
+            .volumes
+            .len()
+            .checked_add(ranges)
+            .ok_or(overflow("the floor's shares"))?,
+        engine_want,
+    );
+    let wanted = all
+        .iter()
+        .try_fold(0u64, |sum, &want| sum.checked_add(want))
+        .ok_or(overflow("the wants"))?;
     // The operations' share holds as many operations as it holds at what one costs: its charge,
     // and what one more adds to the transport and the ranges, the model's own difference.
     let (objects, objects_bytes) = if hosts {
@@ -1640,7 +1682,21 @@ pub fn derive(
             .zip(total(&one))
             .and_then(|(two, one)| two.checked_sub(one))
             .ok_or(overflow("an operation's state"))?;
-        operations(operations_share(allowed)?, each, &charges)
+        // The data first (research/87 §4, rule D): the floor with one operation of the largest
+        // blocks, and the indexes' and engines' wants beside it; what the memory holds past both
+        // is the operations', with the one, its state and its charge.
+        let first = crate::derive::objects(&gateway(1, charges.most())?, &schemes)?;
+        let floor_one = classes_at(&one, first)?
+            .iter()
+            .try_fold(0u64, |sum, &(_, bytes)| sum.checked_add(bytes))
+            .ok_or(overflow("the floor"))?;
+        let slack = allowed.saturating_sub(floor_one).saturating_sub(wanted);
+        let share = charges
+            .most()
+            .checked_add(each)
+            .and_then(|share| share.checked_add(slack))
+            .ok_or(overflow("the operations' share"))?;
+        operations(share, each, &charges)
     } else {
         (0, 0)
     };
@@ -1668,49 +1724,18 @@ pub fn derive(
         (target, stated.target.is_some()),
     );
 
-    // The floor, class by class.
-    let engines_bytes = mantle_engine::shard_db::bounded_bytes(
-        &StoreConfig {
-            max_extents: 0,
-            ..made.store
+    let classes = classes_at(
+        &Held {
+            asked,
+            bounds,
+            beside,
+            ranges_bytes,
+            listener,
         },
-        made.memtable_bytes,
-    )
-    .and_then(|each| each.checked_mul(u64::try_from(ranges).ok()?))
-    .ok_or(overflow("the engines' buffers"))?;
-    // A device's issuer, one a device the OS names, started by its first volume.
-    let mut devices: Vec<(&Option<String>, usize)> = Vec::new();
-    for facts in &measured.volumes {
-        let name = &facts.device.name;
-        if name.is_none() || !devices.iter().any(|(held, _)| *held == name) {
-            devices.push((name, issuer_depth(facts)));
-        }
-    }
-    let depths: Vec<usize> = devices.iter().map(|&(_, depth)| depth).collect();
-    let scrubs = vec![true; stated.volumes.len()];
-    let started = threads(&depths, &scrubs).ok_or(overflow("the node's threads"))?;
-    let classes = [
-        (Class::Objects, objects_bytes),
-        (Class::Volumes, volume_bytes),
-        (Class::Engines, engines_bytes),
-        (Class::Ranges, ranges_bytes),
-        (
-            Class::Log,
-            log_bytes(&log_config).ok_or(overflow("the log's memory"))?,
-        ),
-        (
-            Class::Transport,
-            transport_bytes
-                .checked_add(beside)
-                .and_then(|bytes| bytes.checked_add(listener))
-                .ok_or(overflow("the transport's memory"))?,
-        ),
-        (
-            Class::Threads,
-            stacks(started).ok_or(overflow("the threads' stacks"))?,
-        ),
-    ];
+        objects_bytes,
+    )?;
     let remaining = floor(&classes, allowed)?;
+    say_objects_held(&mut said, fragments, held_objects);
     say_floor(
         &mut said,
         stated.ceiling,
@@ -1720,20 +1745,6 @@ pub fn derive(
         remaining,
     );
 
-    // What remains, shared: each index wants a fragment at each of its volume's blocks, and each
-    // engine the rows of the objects those fragments make across the cell, so both fill together.
-    let objects = cell_blocks(fragments, domains, &rates, target)?;
-    say_objects_held(&mut said, fragments, objects);
-    let engine_want = engine_wants_for(&made, objects).ok_or(overflow("an engine's metadata"))?;
-    let mut all = wants;
-    all.resize(
-        stated
-            .volumes
-            .len()
-            .checked_add(ranges)
-            .ok_or(overflow("the floor's shares"))?,
-        engine_want,
-    );
     let parts = shares(remaining, &all)?;
     let (indexes, metadata) = parts.split_at(stated.volumes.len());
     // What no want takes goes to the engines, each up to what its device's share holds: the rows
@@ -2192,11 +2203,11 @@ fn say_objects(
     said.add(
         "gateway.objects_bytes",
         gateway.objects_bytes,
-        Kind::Cited,
-        "the bytes the operations hold at once, each charged what it holds at its own size: 3/32 \
-         of the memory the node holds at most, the most Linux lets TCP's buffers hold \
-         (tcp_init_mem, net/ipv4/tcp.c; derive::OPERATIONS_SHARE, research/87 §4), and at least \
-         one operation of the largest blocks",
+        Kind::Derived,
+        "the bytes the operations hold at once, each charged what it holds at its own size: what \
+         the memory holds past every class's floor and the indexes' and engines' wants, the data \
+         first, and at least one operation of the largest blocks (research/87 §4 rule D; \
+         derive::operations)",
     );
     said.add(
         "gateway.objects",
@@ -2838,12 +2849,10 @@ mod tests {
         assert!(mixed.of(Some(1)) < mixed.most());
     }
 
-    /// The operations' share is 3/32 of the allowance, Linux's `tcp_mem` share. It holds an
-    /// operation of the largest blocks and as many more at the least an operation holds and what
-    /// it adds beside as fit; at least one at the most where it holds less.
+    /// A share holds an operation of the largest blocks and as many more at the least an operation
+    /// holds and what it adds beside as fit; at least one at the most where it holds less.
     #[test]
     fn the_operations_hold_their_share_of_the_memory() {
-        assert_eq!(operations_share(16 << 30).unwrap(), (16u64 << 30) / 32 * 3);
         let charges = Charges::new(1, &[durability::Scheme::Copies(3)]).unwrap();
         let share = 1u64 << 30;
         let beside = 300_000;
@@ -3390,10 +3399,10 @@ mod tests {
     }
 
     /// The floor's allowance is a stated ceiling where one is: the node refuses one past what the OS
-    /// lets it hold, and one below its floor, naming the class that crosses it; past the floor, the
-    /// less that remains, the fewer fragments and extents its volumes and engines take. The
-    /// operations take their share of the allowance (`operations_share`), so a lower ceiling's
-    /// floor is lower too.
+    /// lets it hold, and one below its floor, naming the class that crosses it. The data comes
+    /// first (research/87 §4 rule D): what remains past the floor is the indexes' and engines'
+    /// wants, each taken whole, and the operations hold what the memory holds past both, so a
+    /// lower ceiling runs fewer operations before any index holds fewer fragments.
     #[test]
     fn a_stated_ceiling_bounds_the_floor_and_what_remains() {
         let full = derive(stated(1), &facts(1), &mut fresh).unwrap();
@@ -3418,6 +3427,10 @@ mod tests {
         let at_full = floor(&full);
         assert_eq!(bytes(&full, "memory.allowance"), 16 << 30);
         assert_eq!(bytes(&full, "memory.remaining"), (16 << 30) - at_full);
+        // What remains is the data's wants, each whole: the index's, and each engine's.
+        let wanted =
+            bytes(&full, "volume.1.index_bytes") + 5 * bytes(&full, "engine.metadata_bytes");
+        assert!(wanted <= bytes(&full, "memory.remaining"));
         let ceiling = |bytes| Stated {
             ceiling: Some(bytes),
             ..stated(1)
@@ -3430,8 +3443,8 @@ mod tests {
             derive(ceiling(1), &facts(1), &mut fresh),
             Err(DeriveError::Memory { floor, .. }) if floor > 1
         ));
-        // A ceiling at the full allowance's floor: its own floor is lower, its operations' share
-        // smaller, and what remains is less for each index and each engine.
+        // A ceiling at the full allowance's floor: the operations give way, the data keeps its
+        // wants.
         let tight = derive(ceiling(at_full), &facts(1), &mut fresh).unwrap();
         let at_tight = floor(&tight);
         assert!(at_tight < at_full);
@@ -3446,14 +3459,10 @@ mod tests {
                 .kind,
             Kind::Stated
         );
-        assert!(
-            tight.config.volumes[0].config.max_fragments
-                < full.config.volumes[0].config.max_fragments
+        assert_eq!(
+            tight.config.volumes[0].config.max_fragments,
+            full.config.volumes[0].config.max_fragments
         );
-        assert!(tight.config.store.max_extents < full.config.store.max_extents);
-        let shared =
-            bytes(&tight, "volume.1.index_bytes") + 5 * bytes(&tight, "engine.metadata_bytes");
-        assert!(shared <= at_full - at_tight);
     }
 
     /// However large the node directory's file system, each index takes its whole want while what

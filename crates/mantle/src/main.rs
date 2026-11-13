@@ -475,7 +475,7 @@ enum BenchCommand {
         /// Object bytes a phase's step moves at most, in bytes or with a suffix: 256M by default.
         #[arg(long, value_parser = init::parse_bytes)]
         bytes: Option<u64>,
-        /// Each founder's volume, preallocated, in bytes or with a suffix: 12G by default.
+        /// Each founder's volume, preallocated, in bytes or with a suffix: 32G by default.
         #[arg(long, value_parser = init::parse_bytes)]
         volume: Option<u64>,
         /// The condition the run is under, said on each line: quiet, busy1x, busy2x, cpu1, cpu2,
@@ -1125,10 +1125,20 @@ const FULL_OPS: u64 = 368;
 const SMOKE_OPS: u64 = 4;
 /// Object bytes a step moves at most: 256 MiB, so a 64 MiB size's steps move four objects.
 const STEP_BYTES: u64 = 256 << 20;
-/// Each founder's volume: 12 GiB by default, holding a full run's objects (about 2 GiB a door of
-/// sizes, and a 100,000-object set's 6.4 GiB at its mean of 64 KiB), every copy on each of the
-/// three; `--smoke`'s the 256 MiB `bench transfer`'s cases run on.
-const FULL_VOLUME: u64 = 12 << 30;
+/// Each founder's volume: 32 GiB by default, holding every byte a full run's puts may write, since
+/// none is freed within a run: a chunk released is freed only a grace after (`GRACE_NS`, three
+/// days), and a put asked mantle-client's `ATTEMPTS` (3) times may leave a copy on each founder at
+/// each attempt, as one throttled or unanswered may still be written (12 GiB, a copy a put, filled
+/// at 100,000 objects on 2026-11-12 with 6.6 GiB acknowledged). A full run's objects are 10.50 GB:
+/// 3.94 GB of sizes through both doors (a put, a streamed put and a part of each size, `FULL_OPS`
+/// of each at most `STEP_BYTES` a step), 6.55 GB of the 100,000-object set at its mean of 65,535.5
+/// bytes, and the controls'. Three attempts of each are 31.50 GB, their 340,908 records' framing
+/// and batch padding at most a 4 KiB block each 1.43 GB (`mantle_chunk::layout::block`'s least),
+/// and a segment's tail beside a record that does not fit at most 1.6% (a 128 KiB record of an
+/// 8,404,992-byte segment; a record longer than half a segment takes a stream of its own) 0.53 GB:
+/// 33.45 GB, 31.2 GiB, and the volume's log and reserve within the rest. `--smoke`'s is the 256 MiB
+/// `bench transfer`'s cases run on.
+const FULL_VOLUME: u64 = 32 << 30;
 const SMOKE_VOLUME: u64 = 256 << 20;
 
 /// `mantle bench transfer`'s `--volume`: a size, or none for `free`, the run's free space less its

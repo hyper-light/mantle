@@ -88,7 +88,7 @@ Every commit passes these on its final tree (`bash scripts/gates.sh` runs them i
 stops at the first failure); CI runs them on Linux, macOS and Windows, x86_64 and aarch64.
 
 ```
-python3 scripts/check-contracts.py
+python3 scripts/check-contracts.py --known scripts/arbitrary-open.txt
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 bash scripts/check-production.sh

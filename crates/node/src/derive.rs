@@ -472,10 +472,9 @@ pub enum DeriveError {
 /// identities the cell's configuration names and the metadata layer's own bounds alone:
 ///
 /// - an entry of the range's largest (`wire::largest_entry_bytes`) is what each append carries and
-///   what one drive applies; a leader holds [`IN_FLIGHT`] of them uncommitted, with as many
-///   appends out to each follower, so a follower's next frame is on its way while its last is
-///   confirmed (raft-log.md §6) and its record confirms that one, where with one append out every
-///   frame waited for a confirmation of its own (research/71, step 9);
+///   what one drive applies; a leader holds as many of them uncommitted as a range can have, with
+///   as many appends out to each follower ([`in_flight`]), so no append waits for another's
+///   answer while an entry the cell asked is unsent;
 /// - a session of each identity, for good: a registration ends its owner's last
 ///   (`mantle_meta::session::register`), so no session waits out a lifetime;
 /// - a session's answers kept until the gateway acknowledges them, as many as its row holds
@@ -490,13 +489,13 @@ pub enum DeriveError {
 pub fn cell(identities: u64) -> Result<(Settings, Rules), DeriveError> {
     let entry = u64::try_from(wire::largest_entry_bytes()?)
         .map_err(|_| DeriveError::Overflow("the largest entry"))?;
-    let in_flight =
-        u64::try_from(IN_FLIGHT).map_err(|_| DeriveError::Overflow("the appends out"))?;
+    let in_flight = in_flight(identities)?;
     let settings = Settings {
         election_tick: ELECTION_TICK,
         heartbeat_tick: HEARTBEAT_TICK,
         max_size_per_msg: entry,
-        max_inflight_msgs: IN_FLIGHT,
+        max_inflight_msgs: usize::try_from(in_flight)
+            .map_err(|_| DeriveError::Overflow("the appends out"))?,
         max_uncommitted_size: entry
             .checked_mul(in_flight)
             .ok_or(DeriveError::Overflow("the uncommitted entries"))?,
@@ -521,11 +520,20 @@ pub fn cell(identities: u64) -> Result<(Settings, Rules), DeriveError> {
     Ok((settings, rules))
 }
 
-/// Appends a leader keeps out to each follower, and entries uncommitted: two, so a follower's
-/// log has the next frame while it confirms the last, whose record confirms it (raft-log.md §6;
-/// measurements/2026-09-29-log-confirmation.md, finding 2). Derived from the log's one frame on the
-/// device and one queued behind it: a third waits for the second either way.
-pub const IN_FLIGHT: usize = 2;
+/// The entries a range of a cell of `identities` holds uncommitted at most, and so the appends its
+/// leader may keep out to each follower: one an identity, as each asks a range through one entry
+/// out at a time (`ask::Asking::next_entry`, a node's and a gateway's alike), and one the leader
+/// appends of its own, its term's first entry or a change of its configuration (Ongaro 2014, §3.6.2
+/// and §4). More would never be sent; fewer leaves an asked entry unsent while a follower's round
+/// trip and flush answer the last, where two had held every frame to a confirmation of its own
+/// (research/71, step 9). Bytes stay bounded at as many of the range's largest entries
+/// (`max_uncommitted_size`). A proposal past them, a copy asked again while its first is
+/// uncommitted, is refused by the core and asked again.
+pub fn in_flight(identities: u64) -> Result<u64, DeriveError> {
+    identities
+        .checked_add(1)
+        .ok_or(DeriveError::Overflow("the appends out"))
+}
 
 /// The message bounds every node of a cell states, which a client of its ranges states the same:
 /// a range's largest message from the cell's settings, which every range shares, and a chunk at
@@ -2102,14 +2110,15 @@ fn say_cell(said: &mut Said, settings: &Settings, rules: &Rules) {
         "range.max_inflight_msgs",
         settings.max_inflight_msgs,
         Kind::Derived,
-        "two appends out to a follower, one confirmed while the next is written (derive::IN_FLIGHT, \
-         raft-log.md §6)",
+        "an append out to a follower for each entry a range can hold uncommitted: one an identity \
+         of the cell, each asking through one entry out, and one of the leader's own \
+         (derive::in_flight)",
     );
     said.add(
         "range.max_uncommitted_size",
         settings.max_uncommitted_size,
         Kind::Derived,
-        "an entry of the range's largest for each append out (derive::cell, derive::IN_FLIGHT)",
+        "an entry of the range's largest for each append out (derive::cell, derive::in_flight)",
     );
     said.add(
         "range.max_committed_size_per_ready",
@@ -2606,8 +2615,9 @@ mod tests {
         let entry = u64::try_from(wire::largest_entry_bytes().unwrap()).unwrap();
         assert_eq!(settings.max_entry_bytes, entry);
         assert_eq!(settings.max_size_per_msg, entry);
-        assert_eq!(settings.max_inflight_msgs, IN_FLIGHT);
-        assert_eq!(settings.max_uncommitted_size, entry * 2);
+        // An entry out for each of the seven identities, and one of the leader's own.
+        assert_eq!(settings.max_inflight_msgs, 8);
+        assert_eq!(settings.max_uncommitted_size, entry * 8);
         // A session's row is a row the range already admits, so no page grows, and holds one
         // answer at the largest a node's command gets.
         assert_eq!(rules.max_value_bytes, wire::largest_row_bytes().unwrap());
@@ -2889,7 +2899,7 @@ mod tests {
         let (entries, bytes) = mantle_range::ready_held(&settings).unwrap();
         let least = u64::try_from(wire::least_entry_bytes().unwrap()).unwrap();
         // The appends out and one entry past them (`mantle_range::ready_bytes`).
-        let held = u64::try_from(IN_FLIGHT + 1).unwrap();
+        let held = in_flight(3).unwrap() + 1;
         assert_eq!(entries, settings.max_entry_bytes * held / least + 1);
         assert_eq!(config.group_entries, 3 * entries);
         assert_eq!(config.group_bytes, 3 * bytes);

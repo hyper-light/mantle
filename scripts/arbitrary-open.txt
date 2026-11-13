@@ -192,7 +192,6 @@ crates/node/src/derive.rs EXTENT_PAGES
 crates/node/src/derive.rs FANOUT
 crates/node/src/derive.rs HANDOVER
 crates/node/src/derive.rs HEARTBEAT_TICK
-crates/node/src/derive.rs IN_FLIGHT
 crates/node/src/derive.rs REPAIR_HOURS
 crates/node/src/derive.rs SCRUB
 crates/node/src/derive.rs STORE_BYTES_AN_OBJECT

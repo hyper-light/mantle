@@ -153,7 +153,7 @@ are chunks and range entries that are durable: a chunk's volume answers it only 
 that covers it, and a range answers a command only once the entry carrying it is durable on a
 quorum and applied (CLAUDE.md §6). Since step 9 of the doors plan a volume's flush covers every
 chunk the cell's operations wrote it meanwhile, and a range's entry carries every command waiting
-that fits its bytes, two appends out to each follower (node.md §1.4, §2.8; `derive::IN_FLIGHT`;
+that fits its bytes, an append out to each follower for each entry a range can hold uncommitted (node.md §1.4, §2.8; `derive::in_flight`;
 research/71, step 9; research/87): more writes share each flush, and none is answered
 before the flush that holds its own bytes, which a simulated cell cut from power at any moment
 around a batched entry's answer checks (`crates/node/tests/sim.rs`). Group commit changes how many

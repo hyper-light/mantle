@@ -17,133 +17,14 @@
 
 mod common;
 
-use std::net::SocketAddr;
 use std::time::Instant;
 
-use bytes::BytesMut;
 use common::*;
-use hyper_quic::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use hyper_quic::{
-    ClientConfig, ClientConfigHandle, Connection, ConnectionHandle, DatagramEvent, ServerConfig,
-};
-use hyper_transport::tls::Tls;
-use hyper_transport::{Event, PeerId, Transmit};
+use hyper_transport::Event;
 
 const TURNS: usize = 10_000;
 /// The test's endpoints' memory budget: room for a handshake, nothing more is sent.
 const BUDGET: u64 = 64 << 20;
-
-/// One bare hyper-quic connection, a client or a server, with hyper-quic's default transport,
-/// which advertises DATAGRAM support: the peer whose view of the other end the tests read.
-struct Bare {
-    quic: hyper_quic::Endpoint,
-    client: Option<ClientConfigHandle>,
-    conn: Option<(ConnectionHandle, Connection)>,
-    /// A datagram the endpoint answered on its own (a stateless reset, a version negotiation).
-    response: Option<Vec<u8>>,
-    connected: bool,
-    scratch: Vec<u8>,
-}
-
-impl Bare {
-    /// Node `which` of `pair`, a client that dials, or a server that accepts, with its certificate.
-    fn new(pair: &Pair, which: PeerId, serves: bool) -> Self {
-        let (certificate, key) = if which == 1 { &pair.one } else { &pair.two };
-        let tls = Tls::mutual(&credentials(&pair.pki.root, certificate, key), serves).unwrap();
-        let server = tls.server.map(|tls| {
-            ServerConfig::with_crypto(Box::new(QuicServerConfig::try_from(tls).unwrap()))
-        });
-        let mut quic =
-            hyper_quic::Endpoint::new(Default::default(), server, true, Some(seed_of(which)))
-                .unwrap();
-        let client = (!serves).then(|| {
-            let crypto = QuicClientConfig::try_from(tls.client).unwrap();
-            quic.insert_client_config(ClientConfig::new(Box::new(crypto)))
-                .unwrap()
-        });
-        Self {
-            quic,
-            client,
-            conn: None,
-            response: None,
-            connected: false,
-            scratch: Vec::new(),
-        }
-    }
-
-    fn dial(&mut self, now: Instant, to: SocketAddr, peer: PeerId) {
-        let client = self.client.unwrap();
-        let dialed = self.quic.connect(now, client, to, &name(peer), None);
-        self.conn = Some(dialed.unwrap());
-    }
-
-    /// The largest DATAGRAM frame payload the peer said it takes, or `None` where it sent no
-    /// `max_datagram_frame_size` (RFC 9221 §3).
-    fn peer_datagrams(&mut self) -> Option<usize> {
-        self.conn.as_mut().unwrap().1.datagrams().max_size()
-    }
-
-    /// Passes the connection's events to the endpoint and back, and notes its handshake's end.
-    fn pump(&mut self) {
-        let Some((handle, conn)) = self.conn.as_mut() else {
-            return;
-        };
-        while let Some(event) = conn.poll_endpoint_events() {
-            if let Some(back) = self.quic.handle_event(*handle, event) {
-                conn.handle_event(back, self.quic.configs_mut());
-            }
-        }
-        while let Some(event) = conn.poll() {
-            if let hyper_quic::Event::Connected = event {
-                self.connected = true;
-            }
-        }
-    }
-}
-
-impl Drive for Bare {
-    fn datagram(&mut self, now: Instant, from: SocketAddr, bytes: &[u8]) {
-        let mut buffer = std::mem::take(&mut self.scratch);
-        buffer.clear();
-        let data = BytesMut::from(bytes);
-        match self.quic.handle(now, from, None, None, data, &mut buffer) {
-            Some(DatagramEvent::NewConnection(incoming)) => {
-                let accepted = self.quic.accept(incoming, now, &mut buffer, None, None);
-                self.conn = Some(accepted.ok().unwrap());
-            }
-            Some(DatagramEvent::ConnectionEvent(_, event)) => {
-                if let Some((_, conn)) = self.conn.as_mut() {
-                    conn.handle_event(event, self.quic.configs_mut());
-                }
-            }
-            Some(DatagramEvent::Response(transmit)) => {
-                self.response = Some(buffer[..transmit.size].to_vec());
-            }
-            None => {}
-        }
-        self.scratch = buffer;
-        self.pump();
-    }
-    fn transmit(&mut self, now: Instant, out: &mut Vec<u8>) -> Option<Transmit> {
-        out.clear();
-        self.response.take().map_or_else(
-            || {
-                let (_, conn) = self.conn.as_mut()?;
-                conn.poll_transmit(now, 1, out, self.quic.configs())
-            },
-            |_| None,
-        )
-    }
-    fn timeout(&mut self) -> Option<Instant> {
-        self.conn.as_mut()?.1.poll_timeout()
-    }
-    fn fire(&mut self, now: Instant) {
-        if let Some((_, conn)) = self.conn.as_mut() {
-            conn.handle_timeout(now);
-        }
-        self.pump();
-    }
-}
 
 fn now() -> Instant {
     hyper_sim::Anchor::new().instant(0).unwrap()

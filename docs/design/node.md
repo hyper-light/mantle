@@ -1594,6 +1594,24 @@ past its bound once its connection is up, refused `Identities`, which a client a
 native.rs`): a client certificate another authority issued is refused at its handshake, and so is
 the cell's authority's certificate for a node presented as a client's.
 
+**Decided (2026-11-12): certificate compression's decoder is brotli-decompressor 6.1.1, RFC 7932
+only, bounded to the certificate and behind an unwind boundary** (research/88; hyper-raft branch
+doors-step8-2, hyper-tls `VENDORED.md` §11). A node's server reads a client's certificate before
+the client has authenticated, and its CertificateRequest offers Brotli and zlib (RFC 8879), so the
+decoder takes a stranger's bytes. On CVE-2026-111497, an out-of-bounds write in Google's C decoder
+fixed on 2026-10-21, the owner kept compression and moved the decoder ("Upgrade the decoder") from
+the Rust port's 5.0.3 to 6.1.1, released that day; the encoder stays at brotli 8.0.4, since no
+brotli release builds on 6.1.1. The port is safe Rust, so a bug of the C kind there is a panic:
+every decoder runs inside an unwind boundary, and a panic is the handshake's refusal (alert
+bad_certificate), the node serving on. The decoder takes upstream rustls 0.23.46's fix for
+RUSTSEC-2026-0348 (no large window, so five bytes no longer allocate 1 GiB; the certificate's
+buffer filled exactly), and refuses any allocation past what a stream decoding to the
+certificate's length needs: a four-byte header declaring a 16 MiB metablock took 16,780,366 bytes
+before the bound and 2,584 after, a whole 1 KiB certificate 38,835. Every stream a stock encoder
+makes still decodes (window 2^22 and the certificate's own, 1 to 65,535 bytes). *Open:* an
+independent decoder decoding a node's certificate at its window, which needs a tool the owner has
+not yet allowed (every Google decoder on the box is the affected 1.2.0).
+
 ### 3.7 Defenses
 
 A peer that is buggy or hostile cannot make the node do unbounded work:

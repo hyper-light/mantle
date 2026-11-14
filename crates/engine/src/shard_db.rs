@@ -288,8 +288,9 @@ struct Follow {
     /// own holdings outside it are together.
     bound: usize,
     /// The most its budget was at the last look: the bound less those holdings, its memtables
-    /// and its branches' metadata as held, and less the most the process's memory outside the
-    /// shard's account grew between two looks ([`Self::grew_most`]).
+    /// and its branches' metadata as held, less what no account holds of the process's memory
+    /// when the shard is alone in it, and less the most the process's memory outside the shard's
+    /// account grew between two looks ([`Self::grew_most`]).
     cap: usize,
     /// The shares the machine's room is divided into.
     shares: usize,
@@ -1579,7 +1580,8 @@ impl<F: BlockFile> ShardDb<F> {
         // The process's memory the shard does not account; none without a reading.
         let accounted = held.saturating_add(memtables);
         // The shard's own holdings beside its budget, which its share of the machine holds too.
-        let own = memtables.saturating_add(self.trunk.memory().total());
+        let trunk = self.trunk.memory().total();
+        let own = memtables.saturating_add(trunk);
         let outside = hyper_rt::machine::facts::Facts::resident_now().map_or(0, |resident| {
             usize::try_from(resident)
                 .unwrap_or(usize::MAX)
@@ -1593,13 +1595,23 @@ impl<F: BlockFile> ShardDb<F> {
             follow.grew_most = follow.grew_most.max(outside.saturating_sub(was));
         }
         follow.last = Some(outside);
-        // The bound holds the process's memory beside the budget too, and what of it grows before
-        // the next look has no gate to ask: the cap leaves that free as the target does. Left out,
-        // a range whose files bypass the OS's page cache, so no file page gives way to it, ran its
-        // cgroup to its limit and into swap at 100M under 17,117 MiB (docs/measurements).
+        // The bound holds the process's whole memory: the budget, the shard's own holdings beside
+        // it, what no account holds (workers' buffers, the allocator's free lists, the runtime),
+        // and what of that grows before the next look, with no gate to ask, which the target
+        // leaves free too. A shard alone in its process reads what no account holds as the
+        // process's memory beside its own account; one of several cannot tell that from the other
+        // shards' accounts, and leaves the growth alone. Leaving out both, a range whose files
+        // bypass the OS's page cache, so that no file page gives way to the process's memory, ran
+        // its cgroup to the limit and into swap at 100M under 17,117 MiB (docs/measurements).
+        let unaccounted = if follow.shares == 1 {
+            outside.saturating_sub(trunk)
+        } else {
+            0
+        };
         follow.cap = follow
             .bound
             .saturating_sub(own)
+            .saturating_sub(unaccounted)
             .saturating_sub(follow.grew_most);
         let target = held
             .saturating_add(free.checked_div(follow.shares).unwrap_or(0))
@@ -6002,9 +6014,9 @@ mod kernel_share_tests {
         db.trimming() || db.memory.is_some_and(|b| held <= b)
     }
 
-    /// A budget held by its bound, not by the machine's room, leaves free under the bound what
-    /// the process's memory outside the shard's account grew between two looks, as one held by
-    /// the room does.
+    /// A budget held by its bound, not by the machine's room, leaves free under the bound what no
+    /// account holds of the process's memory and what that grew between two looks, as one held by
+    /// the room leaves the growth.
     #[test]
     fn a_budget_at_its_bound_leaves_the_outside_growth_free() {
         let dir = tempfile::tempdir().unwrap();
@@ -6025,10 +6037,24 @@ mod kernel_share_tests {
         f.grew_most = grew;
         f.last = None;
         db.look_machine();
-        assert_eq!(db.budget_cap(), Some(BOUND - own - grew));
+        // What no account holds: the process's memory beside the shard's account, less its trunk.
+        let unaccounted = db
+            .follow
+            .as_ref()
+            .and_then(|f| f.last)
+            .unwrap()
+            .saturating_sub(db.trunk.memory().total());
+        assert_eq!(
+            db.budget_cap(),
+            Some(BOUND.saturating_sub(own + unaccounted + grew))
+        );
         assert!(
-            db.budget().unwrap() <= BOUND - own - grew,
-            "a budget of {:?} past its bound {BOUND} less its own {own} and the growth {grew}",
+            db.budget().unwrap()
+                <= BOUND
+                    .saturating_sub(own + unaccounted + grew)
+                    .max(db.floor_held()),
+            "a budget of {:?} past its bound {BOUND} less its own {own}, what no account holds \
+             {unaccounted} and the growth {grew}",
             db.budget()
         );
     }

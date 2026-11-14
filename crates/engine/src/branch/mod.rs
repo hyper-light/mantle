@@ -1649,11 +1649,17 @@ impl Branch {
         }
         // The leaf by the index, from memory: the one page read, parsed where the store holds
         // it, only the value copied out; within a group cut short, the index pages read first.
-        let address = match self.leaf_in(key)? {
-            Some(page) => self.page_address(store, u64::from(page))?,
-            None => self.descend_from_root(store, key)?,
+        let (address, entries) = match self.leaf_in(key)? {
+            Some(page) => (
+                self.page_address(store, u64::from(page))?,
+                self.count_of(u64::from(page)).ok(),
+            ),
+            None => (self.descend_from_root(store, key)?, None),
         };
-        store.with_page(address, |page| point::read_value(page, key, value))
+        store.with_page(address, |page| {
+            touch_search(Some(page), entries, key.len());
+            point::read_value(page, key, value)
+        })
     }
 
     /// The attached owner's point lookup, retaining its one resolved leaf across each
@@ -1694,9 +1700,15 @@ impl Branch {
         key: &[u8],
     ) -> Result<point::PointRead, Error> {
         Ok(match self.leaf_in(key)? {
-            Some(page) => point::PointRead::new(self.page_address(store, u64::from(page))?, 0),
+            Some(page) => point::PointRead::new(
+                self.page_address(store, u64::from(page))?,
+                0,
+                self.count_of(u64::from(page)).ok(),
+            ),
             // Down from the root: an index page a level above the leaf.
-            None => point::PointRead::new(self.root, usize::from(self.height).saturating_sub(1)),
+            None => {
+                point::PointRead::new(self.root, usize::from(self.height).saturating_sub(1), None)
+            }
         })
     }
 }

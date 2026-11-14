@@ -3,7 +3,7 @@
 //! a group of leaves cut short: then it reads down from the root through the index pages, each
 //! read resumed as the leaf's is.
 
-use super::{Descent, LEAF, Op, View, corrupt, descend};
+use super::{Descent, LEAF, Op, View, corrupt, descend, touch_search};
 use crate::error::{Error, Malformed};
 use crate::store::{Span, Store};
 use hyper_block::block::BlockFile;
@@ -23,6 +23,9 @@ pub(crate) struct PointRead {
     address: u64,
     /// Index pages it may still pass on its way down: none for a read begun at its leaf.
     levels: usize,
+    /// The entries of the leaf a read begun there reads, from the branch's counts in memory: a
+    /// cached leaf's search line is started beside its first ([`touch_search`]).
+    entries: Option<usize>,
     span: Option<Span>,
     page: Vec<u8>,
     loaded: bool,
@@ -30,10 +33,11 @@ pub(crate) struct PointRead {
 }
 
 impl PointRead {
-    pub(super) fn new(address: u64, levels: usize) -> Self {
+    pub(super) fn new(address: u64, levels: usize, entries: Option<usize>) -> Self {
         Self {
             address,
             levels,
+            entries,
             span: None,
             page: Vec::new(),
             loaded: false,
@@ -58,7 +62,11 @@ impl PointRead {
         loop {
             if !self.loaded {
                 if self.span.is_none() {
-                    match store.with_resident_page(self.address, |page| visit(page, key, value)) {
+                    let entries = self.entries;
+                    match store.with_resident_page(self.address, |page| {
+                        touch_search(Some(page), entries, key.len());
+                        visit(page, key, value)
+                    }) {
                         Ok(Some(Visit::Found(found))) => {
                             self.finished = true;
                             return Ok(PointStep::Done(found));
@@ -110,6 +118,7 @@ impl PointRead {
             corrupt(Malformed::CountMismatch)
         })?;
         self.address = child;
+        self.entries = None;
         self.page.clear();
         Ok(())
     }

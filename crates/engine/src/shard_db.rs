@@ -391,6 +391,10 @@ pub struct ShardDb<F: BlockFile> {
     /// The closed generations, oldest first ([`KeptGen`]), and the first memtable of the open one.
     kept_gens: std::collections::VecDeque<KeptGen>,
     kept_open_first: u32,
+    /// What the closed generations' indexes take, counted as each closes and goes back: a closed
+    /// index changes no more, so [`Self::kept_held`], read after every put, get and scan, sums
+    /// none of them again (at 100M, 2% of a get went to that sum, 2026-11-14).
+    kept_gens_bytes: usize,
     /// The parts out on workers, and the bytes counted for them together.
     kept_away: Vec<KeptAway>,
     kept_out_bytes: usize,
@@ -925,6 +929,7 @@ impl<F: BlockFile> ShardDb<F> {
             kept_index: None,
             kept_gens: std::collections::VecDeque::new(),
             kept_open_first: 0,
+            kept_gens_bytes: 0,
             kept_away: Vec::new(),
             kept_out_bytes: 0,
             kept_ids: 0,
@@ -3983,6 +3988,7 @@ impl<F: BlockFile> ShardDb<F> {
         // Parts out on workers come back to no index and are dropped.
         self.kept_index = None;
         self.kept_gens.clear();
+        self.kept_gens_bytes = 0;
         self.kept_open_first = self.kept_next;
     }
 
@@ -4371,6 +4377,7 @@ impl<F: BlockFile> ShardDb<F> {
         let Some(oldest) = self.kept_gens.pop_front() else {
             return false;
         };
+        self.kept_gens_bytes = self.kept_gens_bytes.saturating_sub(oldest.index.bytes());
         // Through the newest memtable any of its parts holds: records of those memtables in a
         // newer generation's parts go too, answered by the trunk, so none is answered from a part
         // whose older record is gone.
@@ -4401,6 +4408,7 @@ impl<F: BlockFile> ShardDb<F> {
             self.kept_index = Some(home);
             return false;
         };
+        self.kept_gens_bytes = self.kept_gens_bytes.saturating_add(home.bytes());
         self.kept_gens.push_back(KeptGen {
             index: home,
             first: self.kept_open_first,
@@ -4508,12 +4516,7 @@ impl<F: BlockFile> ShardDb<F> {
     /// went with the tables its trip grows it to.
     fn kept_held(&self) -> usize {
         self.kept_bytes
-            .saturating_add(
-                self.kept_gens
-                    .iter()
-                    .map(|g| g.index.bytes())
-                    .fold(0, usize::saturating_add),
-            )
+            .saturating_add(self.kept_gens_bytes)
             .saturating_add(
                 self.kept_index
                     .as_ref()

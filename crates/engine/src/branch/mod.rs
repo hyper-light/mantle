@@ -1515,6 +1515,31 @@ impl<'a> View<'a> {
     }
 }
 
+/// Starts the line a search of a leaf's heads reads first, its middle entry's head
+/// ([`View::bound`]), while the page's first line, which the cache's lookup started, is read: the
+/// head's place follows the page's head, its prefix and its entry table, and the prefix's length
+/// is in that first line, so the search would read the head only once the first line had landed,
+/// a second miss after the first. A prefix is shorter than the keys it prefixes, so the head lies
+/// within a key's length past where a leaf of `entries` entries and no prefix holds it: both ends
+/// are read, a key of `key_len` bytes being the search's (a 1M seek waited on that head's line
+/// for a tenth of its time, 2026-11-14).
+fn touch_search(page: Option<&[u8]>, entries: Option<usize>, key_len: usize) {
+    let (Some(page), Some(n)) = (page, entries) else {
+        return;
+    };
+    let Some(near) = n
+        .checked_mul(OFFSET)
+        .and_then(|t| t.checked_add(HEAD))
+        .and_then(|t| t.checked_add((n / 2).checked_mul(KEY_HEAD)?))
+    else {
+        return;
+    };
+    let far = near.saturating_add(key_len);
+    std::hint::black_box(
+        page.get(near).copied().unwrap_or(0) ^ page.get(far).copied().unwrap_or(0),
+    );
+}
+
 /// The key `prefix` then `suffix` make against `other`, compared in place, not copied together.
 fn cmp_split(prefix: &[u8], suffix: &[u8], other: &[u8]) -> Ordering {
     let cut = prefix.len().min(other.len());
@@ -2071,7 +2096,7 @@ impl Branch {
         from: &[u8],
     ) -> Result<(), Error> {
         let page_no = self.leaf_for(store, from)?;
-        c.land_page(self, store, u64::from(page_no))?;
+        c.land_page(self, store, u64::from(page_no), Some(from.len()))?;
         let (i, n) = c.page_lower_bound(store, from)?;
         if i >= n {
             c.next_leaf(self, store)
@@ -2434,19 +2459,22 @@ impl RunCursor {
         page: u64,
         index: usize,
     ) -> Result<(), Error> {
-        self.land_page(branch, store, page)?;
+        self.land_page(branch, store, page, None)?;
         self.index = index;
         self.load_in(store)
     }
 
     /// Reads leaf `page` unless it is the one held, loading no entry: a seek finds its entry in
     /// the leaf's table first ([`Branch::place_at`]), so an entry loaded on landing was decoded
-    /// and copied for nothing.
+    /// and copied for nothing. `search`, the length of a key the leaf's table is then searched
+    /// for, starts the line that search reads first while the page's first line is read
+    /// ([`touch_search`]).
     fn land_page<F: BlockFile>(
         &mut self,
         branch: &Branch,
         store: &mut Store<F>,
         page: u64,
+        search: Option<usize>,
     ) -> Result<(), Error> {
         let address = branch.page_address(store, page)?;
         let held = self.loaded == Some(address)
@@ -2463,7 +2491,16 @@ impl RunCursor {
             // A scan's leaf the cache holds is read where it lies, as the paced path reads it,
             // not copied into the cursor; another is read through the span.
             match store.cache_slot_ahead(&self.span, address) {
-                Some(slot) => self.cached = Some((slot, address)),
+                Some(slot) => {
+                    self.cached = Some((slot, address));
+                    if let Some(key_len) = search {
+                        touch_search(
+                            store.cache_page(slot, address),
+                            branch.count_of(page).ok(),
+                            key_len,
+                        );
+                    }
+                }
                 None => {
                     self.span_page =
                         store.read_page_ahead_ref(&mut self.span, address, &mut self.page)?;

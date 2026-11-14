@@ -168,6 +168,9 @@ pub struct IoStats {
     /// wait to the page landing: what a page from the device costs the reader that asked.
     pub demand_waits: u64,
     pub demand_wait_ns: u64,
+    /// Demand pages handed to the device's issuer because the OS did not hold them: counted
+    /// among `device_reads`, their cost in `demand_wait_ns`.
+    pub issued_reads: u64,
     /// The page cache's bytes now, its page limit, and the chunks the machine had no memory
     /// free for.
     pub cache_bytes: u64,
@@ -3420,6 +3423,7 @@ impl<F: BlockFile> Store<F> {
         }
         let read = match self.read_resident(&mut buf, offset) {
             Ok(true) => {
+                self.note_ghost(address);
                 let from = out.len();
                 let landed = node_payload(buf.as_slice(), address, out);
                 if landed.is_ok()
@@ -3640,6 +3644,7 @@ impl<F: BlockFile> Store<F> {
             return Err(io("size a paced demand page", error));
         }
         if self.read_resident(&mut buf, offset)? {
+            self.note_ghost(address);
             if let Err(error) = buf.set_len(buf.capacity()) {
                 self.give_buf(buf);
                 return Err(io("size a paced demand page", error));
@@ -3687,7 +3692,19 @@ impl<F: BlockFile> Store<F> {
         self.io.reads = self.io.reads.saturating_add(1);
         self.io.pages_read = self.io.pages_read.saturating_add(1);
         self.io.device_reads = self.io.device_reads.saturating_add(1);
+        self.io.issued_reads = self.io.issued_reads.saturating_add(1);
+        self.note_ghost(address);
         Ok(false)
+    }
+
+    /// Counts a demand read the cache missed whose page its ghost named: a read a larger cache
+    /// would have saved, what the memory tuner prices the cache at (research/36). Counted where
+    /// the read is made, from the OS's memory or handed to the issuer, so a read retried while
+    /// the issuer is full counts once.
+    fn note_ghost(&mut self, address: u64) {
+        if self.cache.as_ref().is_some_and(|c| c.in_ghost(address)) {
+            self.io.ghost_misses = self.io.ghost_misses.saturating_add(1);
+        }
     }
 
     /// Reads a demand page without a blocking fallback. The numbered read and current

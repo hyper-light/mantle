@@ -1708,12 +1708,13 @@ impl<F: BlockFile> ShardDb<F> {
         self.write_cap = available;
         self.store.set_write_budget(self.write_share);
         let remaining = available.saturating_sub(self.write_share);
-        self.records_share = (available.saturating_mul(TUNE_STEP_PERCENT) / 100).min(remaining);
-        self.records = Some(crate::records::RecordCache::new(
-            self.records_share,
-            self.store.page_size(),
-        ));
-        self.cache_share = remaining.saturating_sub(self.records_share);
+        // The record cache starts with no memory: it holds what its ghost's hits earn it, its
+        // ghost covering a tuning step's records meanwhile (research/36).
+        self.records_share = 0;
+        let mut records = crate::records::RecordCache::new(0, self.store.page_size());
+        records.set_ghost_bytes(available.saturating_mul(TUNE_STEP_PERCENT) / 100);
+        self.records = Some(records);
+        self.cache_share = remaining;
         self.store.resize_cache(
             self.cache_share
                 .checked_div(self.store.page_size())
@@ -1944,14 +1945,19 @@ impl<F: BlockFile> ShardDb<F> {
             bytes: self.write_share.max(self.store.run_bytes()),
         };
         // A record-cache ghost hit saves its trunk lookup: the lookups of the gets the ghost
-        // named, each timed, are what a larger record cache would have saved this cycle.
+        // named, each timed, are what a larger record cache would have saved this cycle. Its ghost
+        // covers the records it holds and at least a step's, so the step is what it prices a cache
+        // smaller than one at.
+        let step = memory.saturating_mul(TUNE_STEP_PERCENT) / 100;
         let records = Gain {
             saved_ns: std::mem::take(&mut self.record_ghost_ns),
-            bytes: self.records_share,
+            bytes: self.records_share.max(step),
         };
+        if let Some(r) = self.records.as_mut() {
+            r.set_ghost_bytes(step);
+        }
         // The kernel's page cache, while the budget follows the machine; a budget given stands
         // as given, and leaves the kernel nothing of it.
-        let step = memory.saturating_mul(TUNE_STEP_PERCENT) / 100;
         let reuse = self.trunk.take_reuse();
         // What a share a step larger would have spared the workers' jobs taken back since the
         // last division: each job's waits on reads the OS did not hold, as many times over as its
@@ -1994,18 +2000,10 @@ impl<F: BlockFile> ShardDb<F> {
         let extra = extra.saturating_sub(from_cache);
         let from_kernel = extra.min(kernel_share);
         let mut kernel_share = kernel_share.saturating_sub(from_kernel);
-        let mut records_share = records_share.saturating_sub(extra.saturating_sub(from_kernel));
-        // The record cache and the page cache keep one step each: with none, a ghost would
-        // gather no evidence that its cache should grow. The record cache's comes from the page
-        // cache, then the kernel's share; the page cache's from the kernel's share.
-        let floor = step.min(memory.saturating_sub(write_share));
-        if records_share < floor {
-            let need = floor.saturating_sub(records_share);
-            let from_cache = need.min(cache);
-            cache = cache.saturating_sub(from_cache);
-            kernel_share = kernel_share.saturating_sub(need.saturating_sub(from_cache));
-            records_share = floor;
-        }
+        let records_share = records_share.saturating_sub(extra.saturating_sub(from_kernel));
+        // The page cache keeps one step: with none, its ghost would gather no evidence that it
+        // should grow. It comes from the kernel's share. The record cache keeps nothing it has not
+        // earned: its ghost learns with no memory held (`RecordCache::set_ghost_bytes`).
         let floor = step.min(
             memory
                 .saturating_sub(write_share)

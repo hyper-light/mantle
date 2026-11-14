@@ -1515,6 +1515,18 @@ impl<'a> View<'a> {
     }
 }
 
+/// The key `prefix` then `suffix` make against `other`, compared in place, not copied together.
+fn cmp_split(prefix: &[u8], suffix: &[u8], other: &[u8]) -> Ordering {
+    let cut = prefix.len().min(other.len());
+    let head = other.get(..cut).unwrap_or(other);
+    match prefix.get(..cut).unwrap_or(prefix).cmp(head) {
+        // `other` ended within the prefix: the key runs on past it.
+        Ordering::Equal if prefix.len() > cut => Ordering::Greater,
+        Ordering::Equal => suffix.cmp(other.get(cut..).unwrap_or(&[])),
+        unequal => unequal,
+    }
+}
+
 /// An entry's ranges in a page whose header has been read: a cursor keeps its leaf's table
 /// offset while the page stays, so stepping decodes the entry alone.
 fn entry_ranges(
@@ -2193,6 +2205,77 @@ impl RunCursor {
         self.next_leaf(branch, store)
     }
 
+    /// From the entry held to its leaf's end, each entry pushed to `out` as a row while `rows`
+    /// remain and it is before both `stops` (a scan's end, the least key its other sources hold
+    /// next), a deletion passed over: read where the leaf lies, the key from the leaf's prefix
+    /// and the entry's suffix, so neither key nor value is copied into the cursor first, as
+    /// [`Self::next`] copies each (a 1M seek's ten rows spent 14% of its scan in those copies and
+    /// their decodes, 2026-11-14). The cursor is left at the first entry not pushed, loaded as
+    /// `next` leaves one, or at the next leaf's first when the leaf ran out; true when the run
+    /// stopped short of the leaf's end, a row limit or a stop reached.
+    pub fn push_leaf<F: BlockFile>(
+        &mut self,
+        branch: &Branch,
+        store: &mut Store<F>,
+        rows: usize,
+        stops: [Option<&[u8]>; 2],
+        out: &mut crate::rows::Rows,
+    ) -> Result<(usize, bool), Error> {
+        if !self.valid {
+            return Ok((0, true));
+        }
+        if let Some((slot, address)) = self.cached
+            && store.cache_page(slot, address).is_none()
+        {
+            // The cache gave the leaf's slot away: read the leaf again.
+            self.loaded = None;
+            self.prefixed = false;
+            self.land(branch, store, self.page_no, self.index)?;
+        }
+        let (mut at, mut pushed, mut stopped) = (self.index, 0usize, false);
+        {
+            let page = self.page_in(store)?;
+            let prefix = page
+                .get(HEAD..self.table)
+                .ok_or(corrupt(Malformed::Truncated))?;
+            while at < self.n {
+                if pushed == rows {
+                    stopped = true;
+                    break;
+                }
+                let (suffix, rest) = entry_ranges(page, LEAF, self.table, at)?;
+                let suffix = page.get(suffix).ok_or(corrupt(Malformed::Truncated))?;
+                if stops
+                    .iter()
+                    .flatten()
+                    .any(|s| cmp_split(prefix, suffix, s) != Ordering::Less)
+                {
+                    stopped = true;
+                    break;
+                }
+                let tag = page.get(rest.start).copied().unwrap_or(0);
+                if Op::from_byte(tag).ok_or(corrupt(Malformed::UnknownTag(tag)))? == Op::Put {
+                    // The value follows the operation and its 2-byte length.
+                    let value = rest
+                        .start
+                        .checked_add(3)
+                        .and_then(|from| page.get(from..rest.end))
+                        .ok_or(corrupt(Malformed::Truncated))?;
+                    out.push_split(prefix, suffix, value);
+                    pushed = pushed.saturating_add(1);
+                }
+                at = at.saturating_add(1);
+            }
+        }
+        if at < self.n {
+            self.index = at;
+            self.load_in(store)?;
+        } else {
+            self.next_leaf(branch, store)?;
+        }
+        Ok((pushed, stopped))
+    }
+
     /// A compaction cursor with its first logical leaf selected, without reading it.
     pub(crate) fn prepare<F: BlockFile>(
         branch: &Branch,
@@ -2618,6 +2701,28 @@ mod tests {
             at += 1;
         }
         k
+    }
+
+    /// A key split into a prefix and a suffix compares as the key would whole, wherever the
+    /// split and wherever the other key ends: within the prefix, at the split, within the
+    /// suffix or past it.
+    #[test]
+    fn a_split_key_compares_as_the_whole_key() {
+        let keys: [&[u8]; 9] = [
+            b"", b"a", b"ab", b"abc", b"abcd", b"abd", b"abcde", b"b", b"aa",
+        ];
+        for whole in keys {
+            for cut in 0..=whole.len() {
+                let (prefix, suffix) = whole.split_at(cut);
+                for other in keys {
+                    assert_eq!(
+                        cmp_split(prefix, suffix, other),
+                        whole.cmp(other),
+                        "{whole:?} split at {cut} against {other:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// A page filled to its payload, at the densest keys and the longest, those sharing long

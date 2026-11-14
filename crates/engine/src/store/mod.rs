@@ -238,6 +238,9 @@ pub struct Store<F: BlockFile> {
     /// A read that would wait is refused rather than made ([`Self::begin_no_wait`]): an inline
     /// operation's, which must finish on its caller's thread without the device.
     no_wait: bool,
+    /// Whether the file read through the OS's page cache when the store was attached to its
+    /// issuer ([`Self::reads_through_kernel`]).
+    kernel_reads: bool,
     /// Whether its span reads' waits price the kernel's page cache: a maintenance worker's store
     /// ([`Self::worker`]), whose compactions read their inputs through it (docs/research/65 §8).
     /// Only such a store asks the OS which pages it holds before a span read and times the reads
@@ -799,6 +802,7 @@ impl<F: BlockFile> Store<F> {
             file: Some(file),
             original: None,
             no_wait: false,
+            kernel_reads: false,
             prices_reads: false,
             would_wait: false,
             config,
@@ -883,6 +887,7 @@ impl<F: BlockFile> Store<F> {
             file: Some(file),
             original: None,
             no_wait: false,
+            kernel_reads: false,
             prices_reads: true,
             would_wait: false,
             config,
@@ -1013,6 +1018,7 @@ impl<F: BlockFile> Store<F> {
                 file: Some(file),
                 original: None,
                 no_wait: false,
+                kernel_reads: false,
                 prices_reads: false,
                 would_wait: false,
                 config,
@@ -1287,6 +1293,14 @@ impl<F: BlockFile> Store<F> {
         if let Some(c) = self.cache.as_mut() {
             c.set_available(read);
         }
+    }
+
+    /// Whether the store's own reads, its gets' and scans', go through the OS's page cache: its
+    /// file buffered where the OS can say what it holds ([`BlockFile::reads_resident`]), asked of
+    /// the file as the store is attached to its issuer, when the store gives the file up. A store
+    /// whose file bypasses the OS's cache holds its pages in its own cache alone.
+    pub fn reads_through_kernel(&self) -> bool {
+        self.kernel_reads || self.file.as_ref().is_some_and(BlockFile::reads_resident)
     }
 
     /// Resizes the page cache to `pages` in place, keeping what it holds (`Cache::resize`); a
@@ -2990,7 +3004,8 @@ impl<F: BlockFile> Store<F> {
             .map_err(|error| io("reserve canceled read numbers", error))?;
         self.drain()?;
         let file = self.file.as_ref().ok_or_else(Self::original_missing)?;
-        let tells = self.prices_reads && file.reads_resident();
+        self.kernel_reads = file.reads_resident();
+        let tells = self.prices_reads && self.kernel_reads;
         let attached = attacher
             .attach_deep(file, batches)
             .map_err(|e| io("attach a store to its device's issuer", e))?;

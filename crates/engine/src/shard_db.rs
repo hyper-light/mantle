@@ -1956,8 +1956,14 @@ impl<F: BlockFile> ShardDb<F> {
         // What a share a step larger would have spared the workers' jobs taken back since the
         // last division: each job's waits on reads the OS did not hold, as many times over as its
         // reads a step past the share are of those past it (`Trunk::take_reuse`).
+        // A shard whose own reads bypass the kernel's page cache (its file direct) has its pages in
+        // its own cache alone, which a share of the kernel's would take from: the share serves its
+        // workers' inputs only, in the memory the budget leaves unused, and earns none of it. Under
+        // a binding budget a fill's waits had moved the share's memory from the page cache that the
+        // gets after it then lacked (100M under 17,117 MiB: gets 31-39K a second with it, 554K
+        // without).
         let kernel = Gain {
-            saved_ns: if self.follow.is_some() {
+            saved_ns: if self.follow.is_some() && self.store.reads_through_kernel() {
                 reuse.saved_ns
             } else {
                 0

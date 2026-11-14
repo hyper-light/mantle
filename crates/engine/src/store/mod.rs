@@ -47,6 +47,13 @@ pub const MIN_PAGE: usize = 4096;
 pub const FILE_CACHING: hyper_block::file::CachingRequest =
     hyper_block::file::CachingRequest::PreferDirect;
 
+/// How a maintenance worker opens its handle on a store's file: through the OS's page cache. A
+/// compaction reads inputs written moments before, and the kernel's page cache holds them and
+/// absorbs the rewrites of extents freed and reused at once (docs/research/65 §7); the shard's own
+/// handle, which its reads take, bypasses it ([`FILE_CACHING`]), so its pages are not held twice.
+pub const WORKER_FILE_CACHING: hyper_block::file::CachingRequest =
+    hyper_block::file::CachingRequest::Buffered;
+
 /// A store's shape: fixed when the file is created, checked when it is opened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Config {

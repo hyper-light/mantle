@@ -876,6 +876,7 @@ fn main() -> Result<(), BenchError> {
     // opens them for direct I/O where the file system takes it (hyper-block
     // `CachingRequest::PreferDirect`) and `--buffered` through the OS page cache, for an A/B.
     let mut caching = mantle_engine::store::FILE_CACHING;
+    let mut forced = false;
     // `--queries-again`: once the queries' flush has left the trunk idle (every consolidation the
     // seeks bought done), the gets and seeks run again and report as `readrandom_settled` and
     // `seekrandom_settled`: the queries' rate on the layout they paid for, apart from the
@@ -906,8 +907,10 @@ fn main() -> Result<(), BenchError> {
             machine_memory = true;
         } else if arg == "--direct" {
             caching = CachingRequest::PreferDirect;
+            forced = true;
         } else if arg == "--buffered" {
             caching = CachingRequest::Buffered;
+            forced = true;
         } else if arg == "--queries-again" {
             queries_again = true;
         } else if let Some(value) = arg.strip_prefix("--tombstones=") {
@@ -1115,11 +1118,19 @@ fn main() -> Result<(), BenchError> {
         db.set_residency_shadow(shadow_probe);
         db.set_consolidation(consolidation);
         let worker_path = path.clone();
+        // A worker's handle as the engine opens one (`store::WORKER_FILE_CACHING`), unless an arm
+        // asked for every file one way (`--direct`, `--buffered`).
+        let worker_caching = if forced {
+            caching
+        } else {
+            mantle_engine::store::WORKER_FILE_CACHING
+        };
         db.set_workers(move || {
             let file = if segments {
-                SegmentedFile::open(&worker_path, caching, align, bound).map(BenchFile::Segments)
+                SegmentedFile::open(&worker_path, worker_caching, align, bound)
+                    .map(BenchFile::Segments)
             } else {
-                DeviceFile::open(&worker_path, false, caching, align).map(BenchFile::One)
+                DeviceFile::open(&worker_path, false, worker_caching, align).map(BenchFile::One)
             };
             file.map_err(|error| mantle_engine::Error::Io {
                 op: "open a range benchmark worker",

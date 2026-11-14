@@ -91,6 +91,7 @@ impl IndexJob {
         for (memtable, records) in &self.lists {
             self.table.merge(*memtable, records, self.oldest)?;
         }
+        self.table.collapse();
         Ok(())
     }
 }

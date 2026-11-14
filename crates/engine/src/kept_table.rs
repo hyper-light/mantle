@@ -782,6 +782,12 @@ impl RecordTable {
     /// record here is replaced by its newer one. The first list a table takes sets its slot size
     /// ([`RecordList::slot_size`]). A table that must grow drops, as it rebuilds, the records of
     /// memtables older than `oldest`.
+    /// Asks the kernel again for huge pages under a table its last ask could not have them for
+    /// ([`HugeZeroed::collapse`]), on the worker the table is out on.
+    pub fn collapse(&mut self) {
+        self.map.collapse();
+    }
+
     pub fn merge(&mut self, number: u32, list: &RecordList, oldest: u32) -> Result<(), Error> {
         self.settle_slot(list);
         let need = self.live.checked_add(list.len()).ok_or_else(corrupt)?;

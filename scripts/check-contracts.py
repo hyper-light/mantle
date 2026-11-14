@@ -40,7 +40,7 @@ UNSAFE_ALLOWED = {
     "crates/disk/src/probe/macos.rs": "IOKit and CoreFoundation (device identification)",
     "crates/disk/src/probe/windows.rs": "volume management and IOCTL_STORAGE_QUERY_PROPERTY (device identification)",
     "crates/node/src/secret/windows.rs": "CreateFileW with a protected DACL and GetKernelObjectSecurity (owner-only key files)",
-    "crates/engine/src/port/mmap.rs": "mmap/munmap and CreateFileMappingW/MapViewOfFile (the memtable arena's lazily zeroed blocks); mmap/munmap/madvise for the cache's page buffers on huge-page boundaries (Linux); glibc's mallopt (freed large blocks back to the OS)",
+    "crates/engine/src/port/mmap.rs": "mmap/munmap and CreateFileMappingW/MapViewOfFile (the memtable arena's lazily zeroed blocks); mmap/munmap/madvise for the cache's page buffers on huge-page boundaries (Linux); the C library's madvise for MADV_COLLAPSE, which rustix does not name (Linux); glibc's mallopt (freed large blocks back to the OS)",
 }
 
 # The vendored crates a PUT's path runs on (docs/measurements/2026-11-12-arbitrary-values-audit.md):

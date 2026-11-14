@@ -156,6 +156,16 @@ impl Kept {
         self.pages.len()
     }
 
+    /// Asks the kernel to back the whole huge pages its job wrote with huge pages
+    /// ([`PageBuf::collapse_used`]), on the worker that wrote them: memory faulted in while the
+    /// kernel had no huge page to give is on base pages, which every cache hit's copy then walks
+    /// the page tables for. A buffer refused now is asked again when a later loan writes it.
+    pub fn collapse(&mut self) {
+        for l in &mut self.bufs {
+            l.buf.collapse_used();
+        }
+    }
+
     /// Whether no page was kept.
     pub fn is_empty(&self) -> bool {
         self.pages.is_empty()

@@ -92,6 +92,72 @@ fn huge_pages_on_request() -> bool {
     })
 }
 
+/// What asking the kernel to back a range with huge pages came to ([`collapse`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Collapsed {
+    /// Every whole huge page of the range is backed by one now.
+    Done,
+    /// The kernel had no huge page to give now, or the range held a page it could not move
+    /// (madvise(2): `EAGAIN`, `ENOMEM`): asked again later, it may.
+    Refused,
+    /// The kernel takes no such request (before Linux 6.1: `EINVAL`), or the OS has none.
+    Unsupported,
+}
+
+/// Asks the kernel to back each whole transparent huge page of `[start, start + len)` with one,
+/// the pages there copied onto a huge page it allocates with direct reclaim and compaction allowed
+/// whatever the `defrag` mode (`MADV_COLLAPSE`, madvise(2), Linux 6.1): memory the kernel backed
+/// with base pages because it had no huge page free when it was faulted in, which a table read at
+/// random then walks the page tables for (research/63 §4). Its contents do not change; pages not
+/// yet faulted in are, so it is asked only of a range written whole. A kernel that refuses the
+/// advice is not asked again by this process.
+///
+/// # Safety
+/// `[start, start + len)` must lie inside one mapping the caller owns.
+#[cfg(target_os = "linux")]
+unsafe fn collapse(start: *mut u8, len: usize) -> Collapsed {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    /// Cited: `MADV_COLLAPSE`'s number (Linux include/uapi/asm-generic/mman-common.h, the same on
+    /// x86_64 and aarch64), which rustix does not name.
+    const MADV_COLLAPSE: i32 = 25;
+    static REFUSED: AtomicBool = AtomicBool::new(false);
+    unsafe extern "C" {
+        fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+    }
+    if REFUSED.load(Ordering::Relaxed) {
+        return Collapsed::Unsupported;
+    }
+    let huge = huge_page_size().max(page_size()).max(1);
+    let Some(first) = start.addr().checked_next_multiple_of(huge) else {
+        return Collapsed::Done;
+    };
+    let end = start.addr().saturating_add(len);
+    let whole = end
+        .saturating_sub(first)
+        .checked_div(huge)
+        .unwrap_or(0)
+        .saturating_mul(huge);
+    if whole == 0 {
+        return Collapsed::Done;
+    }
+    let at = start.wrapping_add(first.saturating_sub(start.addr()));
+    // SAFETY: `[at, at + whole)` lies inside `[start, start + len)`, inside one mapping the caller
+    // owns (this function's contract), and starts on a huge page's boundary, page aligned as
+    // madvise(2) asks. The advice changes how the kernel backs the pages, never their contents.
+    let rc = unsafe { madvise(at.cast(), whole, MADV_COLLAPSE) };
+    if rc == 0 {
+        return Collapsed::Done;
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        // EINVAL (22): a kernel that does not know the advice; ENOSYS (38) where it has no THP.
+        Some(22) | Some(38) => {
+            REFUSED.store(true, Ordering::Relaxed);
+            Collapsed::Unsupported
+        }
+        _ => Collapsed::Refused,
+    }
+}
+
 /// The bytes before a page buffer's first in its mapping ([`PageBuf`]), so its pages begin 16 bytes
 /// into a cache line, as a block from the C library's allocator begins (glibc's `MALLOC_ALIGNMENT`
 /// and chunk header, 16 bytes on 64-bit targets) and as data-layer's cache held them. Measured on
@@ -251,6 +317,24 @@ impl PageBuf {
                 self.vec.resize(len, value);
             }
             fits
+        }
+    }
+
+    /// Asks the kernel to back the whole huge pages of the bytes in use with huge pages
+    /// ([`collapse`]): those written, so none is faulted in by asking.
+    pub fn collapse_used(&mut self) -> Collapsed {
+        #[cfg(target_os = "linux")]
+        {
+            match self.addr {
+                // SAFETY: the bytes in use lie inside the mapping this value owns, unmapped only
+                // in `drop`, which the borrow of `self` keeps from running.
+                Some(addr) => unsafe { collapse(addr.as_ptr(), self.len) },
+                None => Collapsed::Done,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Collapsed::Unsupported
         }
     }
 
@@ -600,6 +684,9 @@ mod page_buf_tests {
 pub struct HugeZeroed {
     addr: Option<NonNull<u8>>,
     len: usize,
+    /// Whether every whole huge page of it is backed by one, as far as its last collapse said
+    /// ([`Self::collapse`]): one the kernel refused is asked again on the table's next trip.
+    huge: bool,
     #[cfg(windows)]
     section: windows_sys::Win32::Foundation::HANDLE,
 }
@@ -625,6 +712,7 @@ impl HugeZeroed {
         Self {
             addr: None,
             len: 0,
+            huge: true,
             #[cfg(windows)]
             section: std::ptr::null_mut(),
         }
@@ -651,11 +739,34 @@ impl HugeZeroed {
         let mut mapped = Self {
             addr,
             len,
+            huge: false,
             #[cfg(windows)]
             section,
         };
         mapped.fault_in();
+        mapped.collapse();
         Ok(mapped)
+    }
+
+    /// Asks the kernel, unless its last answer was that it is, to back every whole huge page of
+    /// the mapping with one ([`collapse`]): a populate whose huge pages the kernel could not give
+    /// left base pages, and a table so made is collapsed again on a later trip, once the kernel
+    /// has huge pages to give. The whole mapping is faulted in, so asking faults nothing in.
+    pub fn collapse(&mut self) -> Collapsed {
+        if self.huge {
+            return Collapsed::Done;
+        }
+        #[cfg(target_os = "linux")]
+        let answer = match self.addr {
+            // SAFETY: the whole mapping this value owns, unmapped only in `drop`, which the
+            // borrow of `self` keeps from running.
+            Some(addr) => unsafe { collapse(addr.as_ptr(), self.len) },
+            None => Collapsed::Done,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let answer = Collapsed::Unsupported;
+        self.huge = answer != Collapsed::Refused;
+        answer
     }
 
     /// Asks Linux for huge pages and faults every page in for writing, a huge page at a time (the
@@ -763,5 +874,33 @@ mod huge_tests {
         m.bytes_mut()[0] = 9;
         assert_eq!((m.bytes()[0], m.bytes()[n - 1]), (9, 7));
         assert!(HugeZeroed::allocate(0).unwrap().is_empty());
+        // Collapsed again, it reads what it held.
+        m.huge = false;
+        let answer = m.collapse();
+        if cfg!(target_os = "linux") {
+            assert_ne!(
+                answer,
+                Collapsed::Unsupported,
+                "a kernel since 6.1 takes MADV_COLLAPSE"
+            );
+        }
+        assert_eq!((m.bytes()[0], m.bytes()[n - 1]), (9, 7));
+    }
+
+    /// A page buffer's bytes in use, collapsed onto huge pages, read what was written.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_page_buffer_collapsed_reads_what_was_written() {
+        let huge = huge_page_size().max(page_size());
+        let mut b = PageBuf::with_capacity(3 * huge).unwrap();
+        let data: Vec<u8> = (0..2 * huge + 4096).map(|i| (i % 251) as u8).collect();
+        assert!(b.extend_from_slice(&data));
+        assert_ne!(
+            b.collapse_used(),
+            Collapsed::Unsupported,
+            "a kernel since 6.1 takes MADV_COLLAPSE"
+        );
+        assert_eq!(&b[..], &data[..]);
+        assert!(PageBuf::new().collapse_used() != Collapsed::Refused);
     }
 }

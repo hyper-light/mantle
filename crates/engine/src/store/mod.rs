@@ -2008,9 +2008,14 @@ impl<F: BlockFile> Store<F> {
         self.keep = kept;
     }
 
-    /// The loan the job's pages were kept in, taken back at the job's end.
+    /// The loan the job's pages were kept in, taken back at the job's end, its written huge pages
+    /// collapsed onto huge pages first ([`cache::Kept::collapse`]).
     pub(crate) fn take_kept(&mut self) -> Option<Box<cache::Kept>> {
-        self.keep.take()
+        let mut kept = self.keep.take();
+        if let Some(k) = kept.as_mut() {
+            k.collapse();
+        }
+        kept
     }
 
     /// Takes back a run its writer is done with: its pages written, its buffer for the next.

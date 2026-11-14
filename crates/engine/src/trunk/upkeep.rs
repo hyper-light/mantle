@@ -182,6 +182,14 @@ impl Trunk {
         self.pending.is_empty() && !self.maintaining() && self.inflight_nodes == 0
     }
 
+    /// Whether a compaction or settle is out on a worker, reading its inputs through the kernel's
+    /// page cache: its reads are counted only once it comes back.
+    pub fn reads_out(&self) -> bool {
+        self.tasks
+            .iter()
+            .any(|t| matches!(t.run, Running::Remote { .. }))
+    }
+
     /// Appends `bundle` to node `n`'s in-flight list, counting the node among those holding one.
     fn push_inflight(&mut self, n: usize, bundle: super::InFlight) -> Result<(), Error> {
         let node = self.node_mut(n)?;
@@ -1296,6 +1304,7 @@ impl Trunk {
                 // kernel's page cache cost it.
                 self.note_merge(out.ns, out.units);
                 self.note_reuse(reuse, out.read_wait_ns);
+                self.reads_back = self.reads_back.saturating_add(1);
                 out.parts
             }
             _ => return Err(corrupt()),

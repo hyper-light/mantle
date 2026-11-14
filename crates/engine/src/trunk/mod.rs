@@ -664,6 +664,9 @@ pub struct Trunk {
     /// ([`Self::set_reuse_window`]), and the counts since the shard last took them.
     reuse_window: (u64, u64),
     reuse: Reuse,
+    /// Compactions and settles taken back from workers since the shard last asked
+    /// ([`Self::take_reads_back`]): jobs whose inputs were read through the kernel's page cache.
+    reads_back: u64,
 }
 
 /// The kernel's page cache as the shard's workers use it (docs/research/65 §8): the pages a job
@@ -909,6 +912,7 @@ impl Trunk {
             taken: 0,
             reuse_window: (0, 0),
             reuse: Reuse::default(),
+            reads_back: 0,
         })
     }
 
@@ -1563,6 +1567,13 @@ impl Trunk {
     /// they were planned at and their waits priced by it ([`Reuse`]); counted again from none.
     pub fn take_reuse(&mut self) -> Reuse {
         std::mem::take(&mut self.reuse)
+    }
+
+    /// The compactions and settles taken back from workers since the last call, counted again
+    /// from none: with none, and none out ([`Self::reads_out`]), no worker read the store's file
+    /// in the interval.
+    pub fn take_reads_back(&mut self) -> u64 {
+        std::mem::take(&mut self.reads_back)
     }
 
     /// Adds a job taken back, its reads counted when it was planned (`planned`) and its reads'
@@ -2387,6 +2398,7 @@ impl Trunk {
             taken: 0,
             reuse_window: (0, 0),
             reuse: Reuse::default(),
+            reads_back: 0,
         })
     }
 

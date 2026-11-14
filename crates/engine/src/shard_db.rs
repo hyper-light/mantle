@@ -1972,6 +1972,7 @@ impl<F: BlockFile> ShardDb<F> {
         // as given, and leaves the kernel nothing of it.
         let step = memory.saturating_mul(TUNE_STEP_PERCENT) / 100;
         let reuse = self.trunk.take_reuse();
+        let reads_back = self.trunk.take_reads_back();
         // What a share a step larger would have spared the workers' jobs taken back since the
         // last division: each job's waits on reads the OS did not hold, as many times over as its
         // reads a step past the share are of those past it (`Trunk::take_reuse`).
@@ -2034,6 +2035,18 @@ impl<F: BlockFile> ShardDb<F> {
             let need = floor.saturating_sub(cache).min(kernel_share);
             kernel_share = kernel_share.saturating_sub(need);
             cache = cache.saturating_add(need);
+        }
+        // No worker read the store's file since the last division and none is out reading it:
+        // the kernel's share served no read, so it goes back to the page cache whole, not a
+        // donor's bound a division. Its evidence needs no share to gather: a job taken back counts
+        // its reads by their branches' age against the window (`Trunk::take_reuse`), and a share
+        // of none earns back a step a division. Held to the donor's bound, a phase of gets after a
+        // fill waited ten divisions of a memtable's worth of gets each for the page cache to take
+        // the share back: the shard's handle direct and the workers' buffered, 100M gets under the
+        // equal cap ran at 39K/s against 554K/s with every file direct (probe 2, 2026-11-14).
+        if self.follow.is_some() && reads_back == 0 && !self.trunk.reads_out() {
+            cache = cache.saturating_add(kernel_share);
+            kernel_share = 0;
         }
         self.write_share = write_share;
         self.store.set_write_budget(write_share.min(self.write_cap));
@@ -6073,6 +6086,52 @@ mod kernel_share_tests {
             db.records_share,
             db.trimming()
         );
+    }
+
+    /// With no worker having read the store's file since the last division and none out reading
+    /// it, the kernel's share served no read: a division gives it to the page cache whole, and the
+    /// regions and the share stay within the budget.
+    #[test]
+    fn a_kernels_share_no_worker_read_goes_to_the_page_cache_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = DeviceFile::open(
+            &dir.path().join("store"),
+            true,
+            CachingRequest::Buffered,
+            Alignment::new(4096).unwrap(),
+        )
+        .unwrap();
+        let mut db = ShardDb::create(file, STORE, MEM, TRUNK).unwrap();
+        // A machine with room throughout, read apart from [`FREE`], which the test beside this one
+        // runs short while both run.
+        db.follow(BOUND, 1, || Some(1 << 40)).unwrap();
+        let mut value = Vec::new();
+        for k in 0..20_000u64 {
+            db.put(format!("k{k:08}").as_bytes(), &[7u8; 100]).unwrap();
+        }
+        for k in 0..20_000u64 {
+            assert!(
+                db.get(format!("k{k:08}").as_bytes(), &mut value).unwrap(),
+                "key {k}"
+            );
+        }
+        // Half the budget left to the kernel, as tuning steps in a fill would leave it; the shard
+        // has no workers, so none read the file or is out.
+        db.kernel_share = BOUND / 2;
+        db.partition_memory();
+        let cache = db.cache_share;
+        db.retune();
+        assert_eq!(
+            db.kernel_share, 0,
+            "the share stayed with no worker reading"
+        );
+        assert!(
+            db.cache_share >= cache.saturating_add(BOUND / 4),
+            "the page cache's share {} did not take the kernel's from {cache}",
+            db.cache_share
+        );
+        while db.trim() {}
+        assert!(within(&db), "past the budget once the share went back");
     }
 }
 

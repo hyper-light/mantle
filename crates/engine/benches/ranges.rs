@@ -1394,6 +1394,14 @@ fn main() -> Result<(), BenchError> {
             },
         )?;
         require(applied == threads * num, "recovered applied index differs")?;
+        // The reopened range keeps the memory the measured one had: with its files past the OS's
+        // page cache, a reopened store with no cache of its own read each page from the device
+        // for every one of the verification's scans, which then took minutes.
+        if machine_memory {
+            db.follow_machine(threads as usize)?;
+        } else {
+            db.set_cache(cache_bytes / 4096 / threads as usize);
+        }
         benchmark_recovery::verify(&mut db, &workload.present, fill_value(), seek_nexts)?;
         match db.into_file() {
             IntoFile::Finished { file, result } => {

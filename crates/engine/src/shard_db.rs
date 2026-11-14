@@ -288,7 +288,8 @@ struct Follow {
     /// own holdings outside it are together.
     bound: usize,
     /// The most its budget was at the last look: the bound less those holdings, its memtables
-    /// and its branches' metadata as held.
+    /// and its branches' metadata as held, and less the most the process's memory outside the
+    /// shard's account grew between two looks ([`Self::grew_most`]).
     cap: usize,
     /// The shares the machine's room is divided into.
     shares: usize,
@@ -1592,7 +1593,14 @@ impl<F: BlockFile> ShardDb<F> {
             follow.grew_most = follow.grew_most.max(outside.saturating_sub(was));
         }
         follow.last = Some(outside);
-        follow.cap = follow.bound.saturating_sub(own);
+        // The bound holds the process's memory beside the budget too, and what of it grows before
+        // the next look has no gate to ask: the cap leaves that free as the target does. Left out,
+        // a range whose files bypass the OS's page cache, so no file page gives way to it, ran its
+        // cgroup to its limit and into swap at 100M under 17,117 MiB (docs/measurements).
+        follow.cap = follow
+            .bound
+            .saturating_sub(own)
+            .saturating_sub(follow.grew_most);
         let target = held
             .saturating_add(free.checked_div(follow.shares).unwrap_or(0))
             .saturating_sub(follow.grew_most);
@@ -5986,6 +5994,37 @@ mod kernel_share_tests {
             .saturating_add(db.kept_held())
             .saturating_add(db.kernel_share);
         db.trimming() || db.memory.is_some_and(|b| held <= b)
+    }
+
+    /// A budget held by its bound, not by the machine's room, leaves free under the bound what
+    /// the process's memory outside the shard's account grew between two looks, as one held by
+    /// the room does.
+    #[test]
+    fn a_budget_at_its_bound_leaves_the_outside_growth_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = DeviceFile::open(
+            &dir.path().join("store"),
+            true,
+            CachingRequest::Buffered,
+            Alignment::new(4096).unwrap(),
+        )
+        .unwrap();
+        let mut db = ShardDb::create(file, STORE, MEM, TRUNK).unwrap();
+        // A machine whose room is past the bound: the bound holds the budget.
+        db.follow(BOUND, 1, free).unwrap();
+        db.look_machine();
+        let own = db.memtable_bytes() + db.trunk.memory().total();
+        let grew = BOUND / 8;
+        let f = db.follow.as_mut().unwrap();
+        f.grew_most = grew;
+        f.last = None;
+        db.look_machine();
+        assert_eq!(db.budget_cap(), Some(BOUND - own - grew));
+        assert!(
+            db.budget().unwrap() <= BOUND - own - grew,
+            "a budget of {:?} past its bound {BOUND} less its own {own} and the growth {grew}",
+            db.budget()
+        );
     }
 
     #[test]

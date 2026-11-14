@@ -1901,6 +1901,7 @@ impl<F: BlockFile> ShardDb<F> {
             return;
         }
         let trimmed = self.trim();
+        let released = self.release_idle_kernel_share();
         self.ops_since = self.ops_since.saturating_add(1);
         self.ops = self.ops.wrapping_add(1);
         let retuned = self.ops_since >= self.cycle_ops;
@@ -1911,9 +1912,25 @@ impl<F: BlockFile> ShardDb<F> {
         }
         // A tuning step may have moved shares, write memory's among them: the kept memtables give
         // way at once. With none made, the look the get's lookup ends with is the one it needs.
-        if (trimmed || retuned) && self.kept_crowded() {
+        if (trimmed || released || retuned) && self.kept_crowded() {
             self.fit_kept(false);
         }
+    }
+
+    /// While the budget follows the machine and the trunk has nothing pending, in progress or in
+    /// flight, no worker reads the store's file until writes come: the kernel's share, which only
+    /// those reads earn (docs/research/65 §8), goes to the page cache whole at the get that finds
+    /// it so, not at the division's end. Writes give the workers reads again, and a job taken back
+    /// earns the share back a step a division. Whether a share went.
+    fn release_idle_kernel_share(&mut self) -> bool {
+        if self.kernel_share == 0 || self.follow.is_none() || !self.trunk.is_idle() {
+            return false;
+        }
+        self.cache_share = self.cache_share.saturating_add(self.kernel_share);
+        self.kernel_share = 0;
+        self.set_reuse_window();
+        self.grant();
+        true
     }
 
     /// Divides the memory budget again by what each region saved a byte since the last
@@ -6127,6 +6144,49 @@ mod kernel_share_tests {
         );
         assert!(
             db.cache_share >= cache.saturating_add(BOUND / 4),
+            "the page cache's share {} did not take the kernel's from {cache}",
+            db.cache_share
+        );
+        while db.trim() {}
+        assert!(within(&db), "past the budget once the share went back");
+    }
+
+    /// Once the trunk has nothing pending, in progress or in flight, a get gives the kernel's share
+    /// to the page cache at once, before its division ends.
+    #[test]
+    fn a_get_gives_the_kernels_share_to_the_page_cache_once_the_trunk_is_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = DeviceFile::open(
+            &dir.path().join("store"),
+            true,
+            CachingRequest::Buffered,
+            Alignment::new(4096).unwrap(),
+        )
+        .unwrap();
+        let mut db = ShardDb::create(file, STORE, MEM, TRUNK).unwrap();
+        db.follow(BOUND, 1, || Some(1 << 40)).unwrap();
+        let mut value = Vec::new();
+        for k in 0..20_000u64 {
+            db.put(format!("k{k:08}").as_bytes(), &[7u8; 100]).unwrap();
+        }
+        // The maintenance owed paid to its end: the trunk has nothing pending, in progress or in
+        // flight, each step doing work until none is owed.
+        let mut steps = 0u32;
+        while db.idle_step(u64::MAX).unwrap() > 0 {
+            steps += 1;
+            assert!(steps < 100_000, "maintenance never ended");
+        }
+        assert!(db.trunk.is_idle(), "the trunk works with nothing owed");
+        db.kernel_share = BOUND / 2;
+        db.partition_memory();
+        let cache = db.cache_share;
+        // No division ends at this get: the idle trunk alone gives the share.
+        db.ops_since = 0;
+        db.cycle_ops = u64::MAX;
+        assert!(db.get(b"k00000000", &mut value).unwrap());
+        assert_eq!(db.kernel_share, 0, "the share stayed with the trunk idle");
+        assert!(
+            db.cache_share >= cache.saturating_add(BOUND / 2),
             "the page cache's share {} did not take the kernel's from {cache}",
             db.cache_share
         );

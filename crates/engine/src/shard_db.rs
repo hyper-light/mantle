@@ -1929,24 +1929,37 @@ impl<F: BlockFile> ShardDb<F> {
         let page = self.store.page_size();
         let written = self.cycle_written;
         let last = std::mem::replace(&mut self.tuned, io);
-        let reads = io.device_reads.saturating_sub(last.device_reads);
-        // A miss costs what its read cost the reader: the time of a read made in place (from the
-        // OS's memory, or blocking), and for a read handed to the device's issuer, the wait from
-        // its first poll to its page landing, which is not in the read's own time.
-        let waits = io.demand_waits.saturating_sub(last.demand_waits);
-        let wait_ns = io.demand_wait_ns.saturating_sub(last.demand_wait_ns);
-        let miss_ns = io
+        // A miss costs what its read cost the reader: a read made in place, from the OS's memory
+        // (or blocking), its own time; a read handed to the device's issuer, the OS not holding
+        // its page, the wait from its first poll to its page landing. The page cache's ghost
+        // misses are priced each by the way its read was made: a page the OS holds saves the
+        // engine's cache only the OS's copy, one it does not saves the device read.
+        let issued = io.issued_reads.saturating_sub(last.issued_reads);
+        let in_place = io
+            .device_reads
+            .saturating_sub(last.device_reads)
+            .saturating_sub(issued);
+        let in_place_ns = io
             .device_read_ns
             .saturating_sub(last.device_read_ns)
-            .saturating_add(wait_ns)
-            .checked_div(reads)
+            .checked_div(in_place)
             .unwrap_or(0);
+        let waits = io.demand_waits.saturating_sub(last.demand_waits);
+        let wait_ns = io
+            .demand_wait_ns
+            .saturating_sub(last.demand_wait_ns)
+            .checked_div(waits)
+            .unwrap_or(0);
+        let ghost_issued = io.ghost_issued.saturating_sub(last.ghost_issued);
+        let ghost_in_place = io
+            .ghost_misses
+            .saturating_sub(last.ghost_misses)
+            .saturating_sub(ghost_issued);
         let (_, ghost_pages) = self.store.cache_pages();
         let read = Gain {
-            saved_ns: io
-                .ghost_misses
-                .saturating_sub(last.ghost_misses)
-                .saturating_mul(miss_ns),
+            saved_ns: ghost_in_place
+                .saturating_mul(in_place_ns)
+                .saturating_add(ghost_issued.saturating_mul(wait_ns)),
             bytes: ghost_pages.saturating_mul(page),
         };
         let write = Gain {
@@ -1978,10 +1991,7 @@ impl<F: BlockFile> ShardDb<F> {
             _ => 0,
         };
         self.refaults_seen = refaults;
-        let issued = io.issued_reads.saturating_sub(last.issued_reads);
-        let demand_saved = issued
-            .min(refaulted)
-            .saturating_mul(wait_ns.checked_div(waits).unwrap_or(0));
+        let demand_saved = issued.min(refaulted).saturating_mul(wait_ns);
         let kernel = Gain {
             saved_ns: if self.follow.is_some() {
                 reuse.saved_ns.saturating_add(demand_saved)

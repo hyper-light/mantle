@@ -5918,6 +5918,9 @@ mod grant_tests {
         .unwrap();
         let mut db = ShardDb::create(file, STORE, MEM, TRUNK).unwrap();
         db.set_memory(512 * STORE.page_size).unwrap();
+        // A record cache that has earned a tuning step of the budget (it starts with none).
+        db.records_share = 512 * STORE.page_size * TUNE_STEP_PERCENT / 100;
+        db.partition_memory();
         let value = [7u8; 100];
         let (mut over_seen, mut index_grew) = (0u32, false);
         let index_first = db.index_bytes().1;
@@ -6009,10 +6012,17 @@ mod kernel_share_tests {
                 "key {k}"
             );
         }
-        // Half the budget left to the kernel, as tuning steps in a fill would leave it.
+        // Half the budget left to the kernel, as tuning steps in a fill would leave it, less what
+        // the record cache's ghost holds past its share: the record cache has earned none, and its
+        // ghost, which no trim gives back, learned from the gets.
         db.kernel_share = BOUND / 2;
         db.partition_memory();
-        assert_eq!(db.kernel_share, BOUND / 2);
+        let ghost = db.charged.1.saturating_sub(db.records_share);
+        assert!(
+            ghost > 0,
+            "the record cache's ghost learned nothing from the gets"
+        );
+        assert_eq!(db.kernel_share, BOUND / 2 - ghost);
         while db.trim() {}
         assert!(within(&db), "a share of half the budget");
         // The record cache's index grew past its share since the share was set, as the gets that

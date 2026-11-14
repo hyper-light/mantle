@@ -1289,15 +1289,11 @@ impl Trunk {
         } else {
             pages.read_ns.saturating_add(pages.write_ns)
         };
-        let idle = self.pool.as_ref().map_or(1, Pool::idle);
+        // The idle workers a price is spread over, read once and only for a price: a seek that
+        // pays no rent, or pays a pivot already paid, prices nothing (a 1M seek spent 2% of its
+        // time pricing consolidations it could not pay for, 2026-11-14).
+        let mut idle = None;
         for &(ref step, rent) in path {
-            let (entries, pages_own) = self.bundle_size(step, pages.extent_pages);
-            let price = wall_price(
-                entries
-                    .saturating_mul(key_ns)
-                    .saturating_add(pages_own.saturating_mul(page_ns)),
-                idle,
-            );
             let Some(pivot) = self
                 .nodes
                 .get_mut(step.node)
@@ -1320,16 +1316,35 @@ impl Trunk {
                 continue;
             }
             pivot.seek.ns = pivot.seek.ns.saturating_add(rent);
-            if !pivot.seek.paid && pivot.seek.ns >= price {
-                pivot.seek.paid = true;
-                self.paid = self.paid.saturating_add(1);
-                let counted = if step.leaf {
-                    &mut self.stats.paid_leaves
-                } else {
-                    &mut self.stats.paid_index
-                };
-                *counted = counted.saturating_add(1);
+            if pivot.seek.paid {
+                continue;
             }
+            let owed = pivot.seek.ns;
+            let (entries, pages_own) = self.bundle_size(step, pages.extent_pages);
+            let idle = *idle.get_or_insert_with(|| self.pool.as_ref().map_or(1, Pool::idle));
+            let price = wall_price(
+                entries
+                    .saturating_mul(key_ns)
+                    .saturating_add(pages_own.saturating_mul(page_ns)),
+                idle,
+            );
+            if owed < price {
+                continue;
+            }
+            if let Some(pivot) = self
+                .nodes
+                .get_mut(step.node)
+                .and_then(|n| n.pivots.get_mut(step.pivot))
+            {
+                pivot.seek.paid = true;
+            }
+            self.paid = self.paid.saturating_add(1);
+            let counted = if step.leaf {
+                &mut self.stats.paid_leaves
+            } else {
+                &mut self.stats.paid_index
+            };
+            *counted = counted.saturating_add(1);
         }
     }
 

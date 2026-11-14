@@ -63,6 +63,12 @@ pub struct RecordCache {
     /// page evicted at once would otherwise shorten as it fills it.
     live: usize,
     live_most: usize,
+    /// The bytes of records the ghost covers at least ([`Self::set_ghost_bytes`]): a cache holding
+    /// fewer, none among them, still learns what that much would have served. And the records
+    /// offered to it and their bytes, the measured size a record takes.
+    ghost_bytes: usize,
+    offered: u64,
+    offered_bytes: u64,
 }
 
 /// A record's head, read at a page position.
@@ -122,7 +128,27 @@ impl RecordCache {
             ghost_hits: 0,
             live: 0,
             live_most: 0,
+            ghost_bytes: 0,
+            offered: 0,
+            offered_bytes: 0,
         }
+    }
+
+    /// Has the ghost cover at least `bytes` of records, at the size a record offered has taken on
+    /// average: a cache whose memory is all earned by its ghost's hits, holding none, learns from
+    /// the records it would have held what a cache of `bytes` would have served (research/36).
+    pub fn set_ghost_bytes(&mut self, bytes: usize) {
+        self.ghost_bytes = bytes;
+    }
+
+    /// The records the ghost covers at least: [`Self::set_ghost_bytes`]'s bytes at the measured
+    /// size of a record offered; none before one is.
+    fn ghost_least(&self) -> u64 {
+        let mean = self.offered_bytes.checked_div(self.offered).unwrap_or(0);
+        u64::try_from(self.ghost_bytes)
+            .unwrap_or(u64::MAX)
+            .checked_div(mean)
+            .unwrap_or(0)
     }
 
     /// Misses on keys the ghost named: gets a larger cache would have served.
@@ -139,9 +165,12 @@ impl RecordCache {
             .sweep(SWEEP, |_, seq| now.wrapping_sub(seq) < window);
     }
 
-    /// The ghost's length in evictions.
+    /// The ghost's length in evictions: the most records held, and at least the records
+    /// [`Self::ghost_least`] counts.
     fn window(&self) -> u64 {
-        u64::try_from(self.live_most.max(1)).unwrap_or(u64::MAX)
+        u64::try_from(self.live_most.max(1))
+            .unwrap_or(u64::MAX)
+            .max(self.ghost_least())
     }
 
     /// Whether `hash` was evicted within the ghost's window.
@@ -306,14 +335,25 @@ impl RecordCache {
         let (Ok(klen), Ok(vlen)) = (u16::try_from(key.len()), u32::try_from(value.len())) else {
             return;
         };
-        if klen == SKIP || Self::size(key.len(), value.len()).is_none_or(|s| s > self.page) {
+        let Some(size) = Self::size(key.len(), value.len()).filter(|&s| s <= self.page) else {
+            return;
+        };
+        if klen == SKIP {
             return;
         }
+        self.offered = self.offered.saturating_add(1);
+        self.offered_bytes = self
+            .offered_bytes
+            .saturating_add(u64::try_from(size).unwrap_or(u64::MAX));
         if let Some(offset) = self.append(klen, vlen, hash, key, value, LIVE) {
             self.table.insert(hash, offset);
             self.live = self.live.saturating_add(1);
             self.live_most = self.live_most.max(self.live);
             self.ghosts.remove(hash);
+        } else if self.most == 0 {
+            // A cache with no memory holds no record: each is evicted as it is offered, unread,
+            // and the ghost names it, so a get of it again is one a cache would have served.
+            self.remember(hash);
         }
     }
 

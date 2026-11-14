@@ -2039,23 +2039,33 @@ impl Branch {
         mut c: RunCursor,
         from: &[u8],
     ) -> Result<RunCursor, Error> {
-        let placed = (|| {
-            let page_no = self.leaf_for(store, from)?;
-            c.land_page(self, store, u64::from(page_no))?;
-            let (i, n) = c.page_lower_bound(store, from)?;
-            if i >= n {
-                c.next_leaf(self, store)
-            } else {
-                c.index = i;
-                c.load_in(store)
-            }
-        })();
-        match placed {
+        match self.place(store, &mut c, from) {
             Ok(()) => Ok(c),
             Err(e) => {
                 c.give_back(store);
                 Err(e)
             }
+        }
+    }
+
+    /// Places `c`, where it lies, at the first entry at or past `from`: a scan's merge places
+    /// each head in its own list, since a cursor is hundreds of bytes and a 1M seek spent 6% of
+    /// its scan moving one by value into the list (2026-11-14). On an error the cursor is the
+    /// caller's to give back.
+    pub fn place<F: BlockFile>(
+        &self,
+        store: &mut Store<F>,
+        c: &mut RunCursor,
+        from: &[u8],
+    ) -> Result<(), Error> {
+        let page_no = self.leaf_for(store, from)?;
+        c.land_page(self, store, u64::from(page_no))?;
+        let (i, n) = c.page_lower_bound(store, from)?;
+        if i >= n {
+            c.next_leaf(self, store)
+        } else {
+            c.index = i;
+            c.load_in(store)
         }
     }
 }

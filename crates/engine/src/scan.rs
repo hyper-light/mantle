@@ -115,10 +115,13 @@ impl<'a> ScanMerge<'a> {
                 }
             }
             self.opened = self.opened.saturating_add(1);
-            let head = match *s {
-                Source::Branch(b) => Head::Branch(b.seek(store, from)?, b),
-            };
-            self.heads.push(head);
+            let Source::Branch(b) = *s;
+            // The head goes in the list first and is placed there: an error leaves it there for
+            // `close` to give back.
+            self.heads.push(Head::Branch(RunCursor::new(store)?, b));
+            if let Some(Head::Branch(cursor, branch)) = self.heads.last_mut() {
+                branch.place(store, cursor, from)?;
+            }
             self.open_ns.push(t.map_or(0, |t| {
                 u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
             }));

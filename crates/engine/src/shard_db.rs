@@ -509,9 +509,6 @@ pub struct ShardDb<F: BlockFile> {
     /// The page cache's and record cache's index and ghost bytes when last granted: what their
     /// shares pay for besides data.
     charged: (usize, usize),
-    /// The kernel's refault count at the last division ([`crate::port::memory::refaults_now`]):
-    /// those since are the reads a larger share of the kernel's page cache would have saved.
-    refaults_seen: Option<u64>,
     /// The key a scan is at, and the bounds of the trunk segment it reads: buffers kept
     /// between scans.
     scan_key: Vec<u8>,
@@ -980,7 +977,6 @@ impl<F: BlockFile> ShardDb<F> {
             cache_share: 0,
             kernel_share: 0,
             charged: (0, 0),
-            refaults_seen: None,
             scan_key: Vec::new(),
             scan_from: Vec::new(),
             scan_active: MemCursor::empty(),
@@ -1979,22 +1975,9 @@ impl<F: BlockFile> ShardDb<F> {
         // What a share a step larger would have spared the workers' jobs taken back since the
         // last division: each job's waits on reads the OS did not hold, as many times over as its
         // reads a step past the share are of those past it (`Trunk::take_reuse`).
-        // And what it would have spared the shard's own demand reads the OS did not hold, which
-        // waited on the issuer: of them, those the kernel read back after evicting its copy within
-        // its working set (its refaults, `port::memory::refaults_now`), which a larger page cache of
-        // the kernel's would have held, each at the issuer's measured wait. The engine's page cache
-        // is priced by the same reads where its own ghost names them; the two caches hold the same
-        // pages, and the tuner gives the step to whichever saved more a byte.
-        let refaults = crate::port::memory::refaults_now();
-        let refaulted = match (refaults, self.refaults_seen) {
-            (Some(now), Some(then)) => now.saturating_sub(then),
-            _ => 0,
-        };
-        self.refaults_seen = refaults;
-        let demand_saved = issued.min(refaulted).saturating_mul(wait_ns);
         let kernel = Gain {
             saved_ns: if self.follow.is_some() {
-                reuse.saved_ns.saturating_add(demand_saved)
+                reuse.saved_ns
             } else {
                 0
             },

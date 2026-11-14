@@ -39,52 +39,6 @@ pub fn room_now() -> Option<u64> {
     }
 }
 
-/// The file pages the kernel has read back after evicting them while they were still in its working
-/// set, since it started: `workingset_refault_file` (Documentation/admin-guide/cgroup-v2.rst,
-/// memory.stat; mm/workingset.c), the reads a larger page cache would have saved, which is the
-/// kernel's own ghost. Counted for this process's cgroup (v2, `/proc/self/cgroup`'s `0::` path)
-/// where it states one, else for the machine (`/proc/vmstat`); none without a reading, and none
-/// off Linux, whose kernels keep no such count.
-pub fn refaults_now() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
-        let stat = cgroup_path(&cgroup).and_then(|path| {
-            std::fs::read_to_string(format!("/sys/fs/cgroup{path}/memory.stat")).ok()
-        });
-        if let Some(n) = stat
-            .as_deref()
-            .and_then(|text| count(text, "workingset_refault_file"))
-        {
-            return Some(n);
-        }
-        let vmstat = std::fs::read_to_string("/proc/vmstat").ok()?;
-        count(&vmstat, "workingset_refault_file")
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
-}
-
-/// A cgroup v2 path from `/proc/self/cgroup`'s text (its `0::` line, cgroups(7)), with no trailing
-/// slash, so the root is empty; none without a v2 line.
-#[cfg(any(target_os = "linux", test))]
-fn cgroup_path(text: &str) -> Option<&str> {
-    text.lines()
-        .find_map(|line| line.strip_prefix("0::"))
-        .map(|path| path.trim().trim_end_matches('/'))
-}
-
-/// The count a `name count` line of a kernel statistics file states (`memory.stat`, `/proc/vmstat`),
-/// none when it is missing or unreadable.
-#[cfg(any(target_os = "linux", test))]
-fn count(text: &str, name: &str) -> Option<u64> {
-    text.lines()
-        .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
-        .and_then(|count| count.trim().parse::<u64>().ok())
-}
-
 /// The room in `meminfo` (`/proc/meminfo`'s text) for the process whose `/proc/self/status` text
 /// is `status`, with `/proc/vmstat`'s text `vmstat` in pages of `page` bytes: `MemAvailable` less
 /// the larger of the background dirty threshold and the `Dirty` and `Writeback` pages, and less
@@ -168,24 +122,6 @@ mod tests {
         assert_eq!(room_of("MemTotal: 1 kB\n", STATUS, VMSTAT, PAGE), None);
         assert_eq!(
             room_of("MemAvailable: 12x kB\n", STATUS, VMSTAT, PAGE),
-            None
-        );
-    }
-
-    #[test]
-    fn refaults_are_read_from_the_process_s_cgroup_path() {
-        assert_eq!(cgroup_path("0::/\n"), Some(""));
-        assert_eq!(
-            cgroup_path("12:cpu:/x\n0::/user.slice/a.scope\n"),
-            Some("/user.slice/a.scope")
-        );
-        assert_eq!(cgroup_path("12:memory:/docker/x\n"), None);
-        let stat =
-            "workingset_refault_anon 4\nworkingset_refault_file 1234\nworkingset_activate_file 9\n";
-        assert_eq!(count(stat, "workingset_refault_file"), Some(1234));
-        assert_eq!(count(stat, "workingset_refault"), None);
-        assert_eq!(
-            count("workingset_refault_file x\n", "workingset_refault_file"),
             None
         );
     }

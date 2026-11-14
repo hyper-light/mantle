@@ -551,6 +551,42 @@ mod tests {
     /// A miss says whether the ghost named its key: of the keys evicted from a full cache, the
     /// ghost names the last evicted, at most as many as the cache ever held, and each such miss
     /// is a ghost hit; a key never cached is not named, and a key cached again is a hit.
+    /// A cache with no memory holds no record, and its ghost names those offered within the records
+    /// its ghost bytes hold at the measured record size, so it learns what that much would serve.
+    #[test]
+    fn a_cache_with_no_memory_learns_from_its_ghost_alone() {
+        let mut c = RecordCache::new(0, 256);
+        // Each record: the head, a 4-byte key and a 24-byte value, 43 bytes; ten of them.
+        c.set_ghost_bytes(43 * 10);
+        let keys: Vec<[u8; 4]> = (0..30u32).map(u32::to_be_bytes).collect();
+        for k in &keys {
+            c.insert(k, hash(k), &[7u8; 24]);
+        }
+        assert_eq!(c.held_bytes(), 0, "a cache with no memory held a record");
+        assert_eq!(c.ghost_least(), 10);
+        let mut named = Vec::new();
+        for k in &keys {
+            match c.lookup(k, hash(k)) {
+                Lookup::Miss { ghost } => named.push(ghost),
+                Lookup::Hit(_) => panic!("a cache with no memory answered"),
+            }
+        }
+        // The last ten offered are named, the twenty before them are not.
+        assert_eq!(named.iter().filter(|&&g| g).count(), 10);
+        assert!(named[20..].iter().all(|&g| g));
+        assert_eq!(c.ghost_hits(), 10);
+        let never = 1_000u32.to_be_bytes();
+        assert!(matches!(
+            c.lookup(&never, hash(&never)),
+            Lookup::Miss { ghost: false }
+        ));
+        // Given memory, it caches again, and a record cached leaves the ghost.
+        c.resize(256);
+        let k = keys[29];
+        c.insert(&k, hash(&k), &[9u8; 24]);
+        assert!(matches!(c.lookup(&k, hash(&k)), Lookup::Hit(v) if v == [9u8; 24]));
+    }
+
     #[test]
     fn a_miss_says_whether_the_ghost_named_its_key() {
         // One page of room: filling past it evicts the first records.

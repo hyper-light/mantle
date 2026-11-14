@@ -411,10 +411,14 @@ impl Cache {
 
     /// The payload cached for `address`, lent in place and counted as a read; none when it is
     /// not cached. A point read parses the page where it lies and copies only what it returns.
+    /// The slot is found as a scan's landing finds it ([`Self::slot_touched`]): its extent's hint
+    /// first, the slot and the page's first line read together, else the index's control word and
+    /// bucket together, where one after the other they were two of the point read's misses in a
+    /// row before the slot's and the page's own.
     pub fn get_ref(&mut self, address: u64) -> Option<&[u8]> {
         // A phase of hits writes nothing: the read moves the index's migration on.
         self.map.settle();
-        let Some(i) = self.slot_of(address) else {
+        let Some(i) = self.slot_touched(address) else {
             self.misses = self.misses.saturating_add(1);
             return None;
         };

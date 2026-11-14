@@ -3216,11 +3216,13 @@ impl<F: BlockFile> Store<F> {
         address: u64,
         read: impl FnOnce(&[u8]) -> Result<R, Error>,
     ) -> Result<Option<R>, Error> {
-        if self
+        // One look, counted as a read only when it finds the page: a miss is counted where the
+        // page is then read ([`Self::read_page_paced`]).
+        if let Some(i) = self
             .cache
-            .as_ref()
-            .is_some_and(|cache| cache.contains(address))
-            && let Some(payload) = self.cache.as_mut().and_then(|cache| cache.get_ref(address))
+            .as_mut()
+            .and_then(|cache| cache.lookup_held(address))
+            && let Some(payload) = self.cache.as_ref().and_then(|c| c.page_at(i, address))
         {
             return read(payload).map(Some);
         }

@@ -53,6 +53,16 @@ impl Rows {
         self.ends.push((key_end, self.bytes.len()));
     }
 
+    /// Appends a row whose key comes in two parts, as a leaf holds it: its prefix and the
+    /// entry's suffix.
+    pub fn push_split(&mut self, prefix: &[u8], suffix: &[u8], value: &[u8]) {
+        self.bytes.extend_from_slice(prefix);
+        self.bytes.extend_from_slice(suffix);
+        let key_end = self.bytes.len();
+        self.bytes.extend_from_slice(value);
+        self.ends.push((key_end, self.bytes.len()));
+    }
+
     /// Row `i`: its key and value.
     pub fn get(&self, i: usize) -> Option<(&[u8], &[u8])> {
         let start = match i.checked_sub(1) {

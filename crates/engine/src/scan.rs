@@ -46,6 +46,19 @@ impl Head<'_> {
         }
     }
 
+    /// The head's leaf from its entry pushed to `out` ([`RunCursor::push_leaf`]).
+    fn push_leaf<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        rows: usize,
+        stops: [Option<&[u8]>; 2],
+        out: &mut crate::rows::Rows,
+    ) -> Result<(usize, bool), Error> {
+        match self {
+            Head::Branch(c, b) => c.push_leaf(b, store, rows, stops, out),
+        }
+    }
+
     /// Gives the head's pages back to `store`.
     fn give_back<F: BlockFile>(self, store: &mut Store<F>) {
         match self {
@@ -242,7 +255,8 @@ impl<'a> ScanMerge<'a> {
     /// one source. Nothing is decided by comparing sources, so the run leaves the merge where the
     /// caller's step would have, the entry it stopped at current. A 10M seek spent 43 ns a row
     /// after its placing, most of it in the shard's merge of one source with memtables holding
-    /// nothing before the segment's end (research/61 §3).
+    /// nothing before the segment's end (research/61 §3); the rows go a leaf at a time, read
+    /// where the leaf lies ([`RunCursor::push_leaf`]).
     pub fn push_run<F: BlockFile>(
         &mut self,
         store: &mut Store<F>,
@@ -259,19 +273,15 @@ impl<'a> ScanMerge<'a> {
         } else {
             None
         };
-        // At most a step an entry the source holds: each step moves the cursor on or ends it.
+        // At most a step a leaf the source holds: each step stops the run or moves the cursor
+        // to the next leaf, past the last one ending it.
         while pushed < rows {
-            let Some(key) = head.key() else {
-                break;
-            };
-            if end.is_some_and(|e| key >= e) || before.is_some_and(|b| key >= b) {
+            let (n, stopped) =
+                head.push_leaf(store, rows.saturating_sub(pushed), [end, before], out)?;
+            pushed = pushed.saturating_add(n);
+            if stopped {
                 break;
             }
-            if head.op() == Op::Put {
-                out.push(key, head.value());
-                pushed = pushed.saturating_add(1);
-            }
-            head.next(store)?;
         }
         self.pick();
         Ok(Some(pushed))

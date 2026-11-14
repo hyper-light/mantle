@@ -37,6 +37,16 @@ use superblock::Superblock;
 /// file system the engine runs on maps (docs/design/raft-log.md §2's `B`).
 pub const MIN_PAGE: usize = 4096;
 
+/// How a store's files are opened: for direct I/O where the platform and the file system take it
+/// (hyper-block `CachingRequest::PreferDirect`: Linux `O_DIRECT`, macOS `F_NOCACHE`, Windows
+/// `FILE_FLAG_NO_BUFFERING`), buffered where they refuse it. Buffered, every page the store reads
+/// or writes is held twice under one memory bound, in the engine's page cache and in the OS's, and
+/// two inclusive caches serve only as much as the larger of them (Wong and Wilkes, "My cache or
+/// yours?", USENIX ATC 2002; docs/research/65 §3): the engine's own cache is the only one its
+/// reads need, as InnoDB's buffer pool is with `O_DIRECT` (MySQL 8.4 §17.8.12).
+pub const FILE_CACHING: hyper_block::file::CachingRequest =
+    hyper_block::file::CachingRequest::PreferDirect;
+
 /// A store's shape: fixed when the file is created, checked when it is opened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Config {

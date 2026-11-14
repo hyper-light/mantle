@@ -1723,7 +1723,7 @@ fn engine(
     // (`Store::check`): a page derived to hold a row is a multiple of the device's unit, not a
     // power of two (`mantle_engine::branch::least_page`).
     let align = mantle_disk::probe::identify(&config.dir).transfer_alignment();
-    let file = DeviceFile::open(&path, fresh, CachingRequest::Buffered, align)
+    let file = DeviceFile::open(&path, fresh, mantle_engine::store::FILE_CACHING, align)
         .map_err(|e| ProcessError::Engine(e.to_string()))?;
     let engine = |e: mantle_engine::Error| ProcessError::Engine(e.to_string());
     if !fresh {

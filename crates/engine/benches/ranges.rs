@@ -872,10 +872,10 @@ fn main() -> Result<(), BenchError> {
     // (`ShardDb::follow_machine`), its cache, write memory and records divided by measured
     // gains, in place of the fixed cache and write budget given on the command line.
     let mut machine_memory = false;
-    // `--direct`: each range's files opened for direct I/O where the file system takes it
-    // (hyper-block `CachingRequest::PreferDirect`), past the OS page cache, for an A/B against
-    // buffered I/O.
-    let mut caching = CachingRequest::Buffered;
+    // Each range's files opened as the engine opens a store's (`store::FILE_CACHING`); `--direct`
+    // opens them for direct I/O where the file system takes it (hyper-block
+    // `CachingRequest::PreferDirect`) and `--buffered` through the OS page cache, for an A/B.
+    let mut caching = mantle_engine::store::FILE_CACHING;
     // `--queries-again`: once the queries' flush has left the trunk idle (every consolidation the
     // seeks bought done), the gets and seeks run again and report as `readrandom_settled` and
     // `seekrandom_settled`: the queries' rate on the layout they paid for, apart from the
@@ -906,6 +906,8 @@ fn main() -> Result<(), BenchError> {
             machine_memory = true;
         } else if arg == "--direct" {
             caching = CachingRequest::PreferDirect;
+        } else if arg == "--buffered" {
+            caching = CachingRequest::Buffered;
         } else if arg == "--queries-again" {
             queries_again = true;
         } else if let Some(value) = arg.strip_prefix("--tombstones=") {

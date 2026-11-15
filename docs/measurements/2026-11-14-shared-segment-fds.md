@@ -16,12 +16,15 @@ transferring through one open file a segment: do descriptors scale with segments
 100M fill holds 47-49 on macOS where lean-doors holds 10,240 and stops, and completes in a Linux
 container at its default 2,048. Nothing measured got slower past the A/A: fills, gets and seeks
 over lean-doors at 1M and 10M on macOS and Linux sit within the A/A's band, and the engine's lead
-over RocksDB is unchanged. The earlier patch's 12% did not come back, for it or for this change:
-in ten interleaved rounds at 10M on Linux the earlier patch filled at 1.006x lean-doors (A/A
-0.936x). Sharing an open file description among threads does cost positioned reads (5-13% at 4
-to 32 threads in a microbenchmark of nothing but cached reads, research/91), but this change shares
-one among more threads than the earlier patch did and its fills cost no more CPU a put than
-lean-doors' (0.97x on both platforms at 10M), so that is not what a fill pays.
+over RocksDB is unchanged. At 100M lean-doors cannot run at macOS's limit at all; on Linux, where
+the runner's own limit lets it, four rounds on a host whose load ran from 15 to 174 resolve nothing
+the A/A's spread does not hold, and the fill's CPU a put is lean-doors' (1.01x; the A/A 0.97x).
+The earlier patch's 12% did not come back, for it or for this change: in ten interleaved rounds at
+10M on Linux the earlier patch filled at 1.006x lean-doors (A/A 0.936x). Sharing an open file
+description among threads does cost positioned reads (5-13% at 4 to 32 threads in a
+microbenchmark of nothing but cached reads, research/91), but this change shares one among more
+threads than the earlier patch did and its fills cost no more CPU a put than lean-doors' (0.97x on
+both platforms at 10M), so that is not what a fill pays.
 
 ## How it ran
 
@@ -73,8 +76,8 @@ The bench, peak descriptors per case:
 |---|---|---|---|
 | macOS, m_fix | at most 45 | 25-27 | 47-49, 40-63 segments |
 | macOS, m_base | 3,220 | 3,904-4,280 | 10,240: `Too many open files` 11 s into the fill at 34-41 segment files, both rounds |
-| Linux, m_fix | 12, 6 segments | 23-29, 17-23 segments | (below) |
-| Linux, m_base | 1,748-1,755 | 3,689-4,809 | (below) |
+| Linux, m_fix | 12, 6 segments | 23-29, 17-23 segments | 45-48, 39-42 segments |
+| Linux, m_base | 1,748-1,755 | 3,689-4,809 | 19,819-23,919 (at the runner's soft limit, 1,048,576) |
 | Linux, m_old | 109-112 | 224-334 | |
 | Linux container at 2,048, m_fix | | | completed: 43 segments, recovery exact |
 
@@ -138,7 +141,42 @@ The host's other work took all 32 threads through rounds 6-10 of the 10M batch, 
 arm's range; each ratio pairs arms of one round. CPU a put through the fill and its flush: m_fix
 over m_base 1.009 (1M), 0.967 (10M); m_old 1.018 and 1.045 (0.575-1.370); m_aa 0.992 and 1.002.
 
-Pending in this record: Linux at 100M (m_base, m_fix, m_aa, rocks; 4 rounds, running).
+| 100M, n=4 | fills | gets | seeks |
+|---|---|---|---|
+| m_fix over m_base | 0.719 (0.596-1.209) | 3.471 (0.312-5.608) | 2.039 (0.245-5.594) |
+| m_aa over m_base | 0.857 (0.410-1.370) | 2.635 (0.722-5.198) | 2.003 (1.109-3.940) |
+| m_fix over rocks | 2.38x (1.35-2.98) | 4.96x (1.42-12.47) | 7.08x (1.74-13.18) |
+| m_base over rocks | 2.60x (2.03-4.43) | 1.90x (1.24-4.56) | 3.29x (2.36-7.11) |
+
+At 100M the host's load at a case's start ran from 15 to 174, and one binary's own rounds spread
+fills from 0.56 to 1.89 million a second (m_aa) and gets from 0.22 to 2.24 million: four rounds
+resolve no difference the A/A's 0.41-1.37 does not hold. CPU a put through the fill and its flush,
+which a frozen or descheduled process does not accrue: m_fix 2,902 ns (2,760-4,241), m_base 3,542
+(2,339-3,559), m_aa 2,997 (2,765-3,920); m_fix over m_base 1.012 (0.780-1.217), m_aa 0.968. Peak
+descriptors at 100M: m_fix 45-48 at 39-42 segments, m_base 19,819-23,919.
+
+## The final build
+
+The comparison ran builds of hyper-raft `07c03e7`; the vendored head `8a4d855` changes only a
+segmented file's add and discovery, which a store runs as it grows a segment and as it opens. Its
+build against `07c03e7`'s (`m_fix07`), interleaved:
+
+| macOS | fills/s | gets/s | seeks/s | CPU a put, paid fill |
+|---|---|---|---|---|
+| 10M, n=4: m_fix (8a4d855) | 6,720,066 (5,723,264-7,082,526) | 3,378,521 (3,266,693-3,439,944) | 828,854 (822,531-840,897) | 867 ns (858-874) |
+| 10M, n=4: m_fix07 | 5,621,042 (5,425,115-6,420,878) | 3,391,940 (2,962,367-3,425,118) | 805,917 (704,826-827,025) | 869 ns (864-878) |
+| 10M, n=4: m_base | 5,573,412 (5,507,157-7,139,629) | 3,371,278 (3,331,289-3,415,770) | 828,598 (823,789-847,787) | 892 ns (877-902) |
+| 100M, n=6: m_fix (8a4d855) | 6,522,415 (6,284,451-6,672,492) | 617,804 (466,050-2,258,785) | 399,156 (300,089-553,451) | 1,268 ns (1,185-1,310) |
+| 100M, n=6: m_fix07 | 6,813,840 (6,108,536-6,928,959) | 1,852,841 (587,820-2,343,551) | 530,462 (370,828-601,621) | 1,203 ns (1,175-1,257) |
+
+macOS's 100M gets follow the memory a case finds free as it starts (`--machine-memory`): another
+program held memory through these rounds, and each round's gets went with its peak resident set,
+both binaries alike (m_fix 534K/s at 30.4 GB and 2.26M/s at 36.5 GB; m_fix07 588K/s at 33.1 GB and
+2.34M/s at 37.3 GB). On Linux the same check ran on a host at load 24 to 174 with two CI jobs, its
+10M rounds (n=4) a third as fast as an hour before for every arm, so it measured the host. Its 100M
+round, a case a binary starting at loads 266 and 123, completed both with recovery exact
+(63,209,014 live keys), m_fix at 51 descriptors and 45 segments, m_fix07 at 59 and 53, and was
+stopped there to give the host to hyper-raft's gates.
 
 ## The earlier 12%
 

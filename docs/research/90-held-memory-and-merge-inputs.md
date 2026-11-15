@@ -74,6 +74,17 @@ output loan's does, with no copy and nothing shared between threads; their other
 the inputs at 100M, cannot be read in the shard while the chunk is out and are read from it again
 once it is back (`Cache::lend_reads`).
 
+Lent whole for the whole of their jobs, those chunks cost the reads that came while they were out.
+In the lending build's diagnostic twin at 100M under the cap (D4, `g17-fin-kpay` with frame
+pointers, one case), compactions ran on past the fill (350 pivot and 11 leaf compactions done by its
+end, 78 more leaf compactions during the gets), and the gets read the device 169,919 times, against
+none in D3, for pages out with their chunks or never kept (the loans could not hold 801,473 of the
+pages their jobs wrote), and ran at 32,562 a second. A chunk now goes only where no reader has read
+a page of it since it came back, S3-FIFO's own record of reads (the page's read count, and the small
+queue it entered by), so a fill's merges, which nothing reads beside, take their inputs from memory,
+and the pages gets read stay where the gets find them; the cache counts the reads that still find a
+chunk out.
+
 ## 4. The oracle's check inside the timed loops
 
 The ranges bench checked each get's and seek's answer against its oracle inside the timed loop, so

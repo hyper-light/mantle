@@ -300,6 +300,8 @@ pub struct Cache {
     read_loans: u64,
     read_lent: u64,
     read_used: u64,
+    /// Reads that found their page's chunk out on a read loan.
+    read_missed: u64,
     /// The store's pages an extent, and each extent's slot hint ([`Self::hint`]): where its
     /// pages lie were they in a row as a loan keeps them. One word an extent, at most one a
     /// store extent, so a landing reads it from a line the CPU holds where the index's control
@@ -343,10 +345,12 @@ pub struct Memory {
     pub loan_room: u64,
     pub loan_kept: u64,
     pub loan_missed: u64,
-    /// Read loans made, the pages they held, and the pages their jobs read from them.
+    /// Read loans made, the pages they held, and the pages their jobs read from them; and the
+    /// reads here that found a page's chunk out on one.
     pub read_loans: u64,
     pub read_lent: u64,
     pub read_used: u64,
+    pub read_missed: u64,
 }
 
 /// The most pages one buffer of a loan's fresh memory holds ([`Cache::lend`]). A job's pages
@@ -422,6 +426,7 @@ impl Cache {
             read_loans: 0,
             read_lent: 0,
             read_used: 0,
+            read_missed: 0,
             extent_pages,
             hints: Vec::new(),
             id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
@@ -446,6 +451,7 @@ impl Cache {
         };
         let Some(payload) = Self::payload_of(&self.chunks, slot) else {
             self.misses = self.misses.saturating_add(1);
+            self.read_missed = self.read_missed.saturating_add(1);
             return false;
         };
         slot.freq = slot.freq.saturating_add(1).min(MAX_FREQ);
@@ -485,6 +491,7 @@ impl Cache {
         };
         let Some(payload) = Self::payload_of(&self.chunks, slot) else {
             self.misses = self.misses.saturating_add(1);
+            self.read_missed = self.read_missed.saturating_add(1);
             return None;
         };
         slot.freq = slot.freq.saturating_add(1).min(MAX_FREQ);
@@ -501,11 +508,15 @@ impl Cache {
         let Some((i, slot)) = self
             .slot_of(address)
             .and_then(|i| Some((i, self.slots.get_mut(i)?)))
-            .filter(|(_, slot)| Self::payload_of(&self.chunks, slot).is_some())
         else {
             self.misses = self.misses.saturating_add(1);
             return None;
         };
+        if Self::payload_of(&self.chunks, slot).is_none() {
+            self.misses = self.misses.saturating_add(1);
+            self.read_missed = self.read_missed.saturating_add(1);
+            return None;
+        }
         slot.freq = slot.freq.saturating_add(1).min(MAX_FREQ);
         self.hits = self.hits.saturating_add(1);
         Some(i)
@@ -1051,8 +1062,11 @@ impl Cache {
     /// the memory is out, and those still live when it comes back are read from it again: none
     /// is lost to the loan, and none read while it is out is read from it, a page written or
     /// forgotten meanwhile leaving its slot. A chunk holds whole extents of one job's writes, so a
-    /// merge's inputs lie in few chunks (docs/research/90 §3). None while a chunk retires, or when
-    /// no address lies in such a chunk.
+    /// merge's inputs lie in few chunks (docs/research/90 §3). Only a chunk no reader has read a
+    /// page of since it came back goes ([`Self::cold`]): one readers read would send them to the
+    /// device while it is out, and the gets of a 100M phase that compactions ran on through read
+    /// the device for 17% of them with every chunk lent (docs/research/90 §3). None while a chunk
+    /// retires, or when no address lies in a chunk that may go.
     pub fn lend_reads(&mut self, addresses: &[u64]) -> Option<ReadLoan> {
         if self.retiring.is_some() {
             return None;
@@ -1084,20 +1098,32 @@ impl Cache {
         {
             return None;
         }
+        // The chunk the pages in hand lie in, and whether it went with the loan.
+        let mut current: Option<(usize, bool)> = None;
         for (c, address, at, len) in found {
-            if bufs.last().is_none_or(|&(last, _)| last != c) {
-                let (Some(h), Some(memory)) = (self.held.get_mut(c), self.chunks.get_mut(c)) else {
-                    continue;
-                };
-                let Held::Kept(live) = *h else {
-                    continue;
-                };
-                *h = Held::ReadLent(live);
-                bufs.push((c, std::mem::take(memory)));
+            if current.is_none_or(|(last, _)| last != c) {
+                let lent = self.cold(c)
+                    && match (self.held.get_mut(c), self.chunks.get_mut(c)) {
+                        (Some(h), Some(memory)) => match *h {
+                            Held::Kept(live) => {
+                                *h = Held::ReadLent(live);
+                                bufs.push((c, std::mem::take(memory)));
+                                true
+                            }
+                            _ => false,
+                        },
+                        _ => false,
+                    };
+                current = Some((c, lent));
             }
-            if let Some(k) = bufs.len().checked_sub(1) {
+            if current.is_some_and(|(_, lent)| lent)
+                && let Some(k) = bufs.len().checked_sub(1)
+            {
                 pages.push((address, k, at, len));
             }
+        }
+        if bufs.is_empty() {
+            return None;
         }
         self.read_loans = self.read_loans.saturating_add(1);
         self.read_lent = self
@@ -1109,6 +1135,22 @@ impl Cache {
             pages,
             read: 0,
         })
+    }
+
+    /// Whether no reader has read a page of chunk `c` since a loan brought it back: every page
+    /// live in it unread, in the small queue it entered by (S3-FIFO's own record of reads, the
+    /// read count the main queue's pass takes down).
+    fn cold(&self, c: usize) -> bool {
+        let (Some(&first), Some(&size)) = (self.starts.get(c), self.sizes.get(c)) else {
+            return false;
+        };
+        self.slots
+            .get(first..first.saturating_add(size).min(self.slots.len()))
+            .is_some_and(|slots| {
+                slots
+                    .iter()
+                    .all(|s| !s.live || s.chunk != c || (s.freq == 0 && s.queue == Queue::Small))
+            })
     }
 
     /// Takes back a read loan once the job that read it ends, however it ended: each chunk's
@@ -1418,7 +1460,10 @@ impl Cache {
     pub fn lookup_held(&mut self, address: u64) -> Option<usize> {
         self.map.settle();
         let i = self.slot_touched(address)?;
-        self.payload(i)?;
+        if self.payload(i).is_none() {
+            self.read_missed = self.read_missed.saturating_add(1);
+            return None;
+        }
         let slot = self.slots.get_mut(i)?;
         slot.freq = slot.freq.saturating_add(1).min(MAX_FREQ);
         self.hits = self.hits.saturating_add(1);
@@ -1818,6 +1863,7 @@ impl Cache {
             read_loans: self.read_loans,
             read_lent: self.read_lent,
             read_used: self.read_used,
+            read_missed: self.read_missed,
         }
     }
 }
@@ -2004,6 +2050,42 @@ mod tests {
         out.clear();
         assert!(c.get(3, &mut out));
         assert_eq!(out, b"three");
+    }
+
+    /// A chunk a reader has read a page of since it came back stays home: readers would go to the
+    /// device while it was out. One no reader has touched goes, and a read of one of its pages
+    /// while it is out is counted as a miss on a lent chunk.
+    #[test]
+    fn a_chunk_a_reader_has_read_is_not_lent() {
+        let mut c = Cache::new(64, 16, EXTENT);
+        let mut k = c.lend(4).unwrap();
+        for a in 0..4u64 {
+            k.keep(a, &page(a));
+        }
+        c.adopt(k);
+        let mut k = c.lend(4).unwrap();
+        for a in 10..14u64 {
+            k.keep(a, &page(a));
+        }
+        c.adopt(k);
+        let mut out = Vec::new();
+        assert!(c.get(1, &mut out));
+        assert!(
+            c.lend_reads(&[0, 1, 2]).is_none(),
+            "a chunk read since it came back went"
+        );
+        assert!(c.contains(1) && c.contains(0));
+        let mut loan = c.lend_reads(&[0, 11, 12]).unwrap();
+        loan.index();
+        assert_eq!(loan.get(0), None, "a page of the read chunk was lent");
+        assert_eq!(loan.get(11), Some(&page(11)[..]));
+        out.clear();
+        assert!(!c.get(13, &mut out));
+        assert_eq!(c.memory().read_missed, 1);
+        c.take_reads_back(loan);
+        out.clear();
+        assert!(c.get(13, &mut out));
+        assert_eq!(out, page(13));
     }
 
     /// A chunk out on a read loan is not given back while it is out: a limit lowered under it

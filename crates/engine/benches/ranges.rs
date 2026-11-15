@@ -759,7 +759,7 @@ fn stats(name: &str, counters: &[RangeStats]) {
         println!("{name}_shape range {range}{shape}");
         let m = io.cache_memory;
         println!(
-            "{name}_waits range {range} demand_waits {} demand_wait_ns {} cache_bytes {} cache_limit_pages {} cache_refused {} cache_live {} cache_free {} cache_dead {} cache_spare {} cache_lent {} cache_slots {} loans {} loan_room {} loan_kept {} loan_missed {} read_loans {} read_lent {} read_used {}",
+            "{name}_waits range {range} demand_waits {} demand_wait_ns {} cache_bytes {} cache_limit_pages {} cache_refused {} cache_live {} cache_free {} cache_dead {} cache_spare {} cache_lent {} cache_slots {} loans {} loan_room {} loan_kept {} loan_missed {} read_loans {} read_lent {} read_used {} read_missed {}",
             io.demand_waits,
             io.demand_wait_ns,
             io.cache_bytes,
@@ -777,7 +777,8 @@ fn stats(name: &str, counters: &[RangeStats]) {
             m.loan_missed,
             m.read_loans,
             m.read_lent,
-            m.read_used
+            m.read_used,
+            m.read_missed
         );
     }
 }

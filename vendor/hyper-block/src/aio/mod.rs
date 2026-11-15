@@ -44,7 +44,7 @@ use crate::buf::AlignedBuf;
 use crate::file::{Caching, DeviceFile};
 
 #[cfg(target_os = "linux")]
-mod linux;
+pub(crate) mod linux;
 
 /// A batch's transfers: each buffer and the file offset it is read from or written at.
 pub type Transfers = Vec<(AlignedBuf, u64)>;

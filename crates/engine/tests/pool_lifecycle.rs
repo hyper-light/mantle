@@ -232,7 +232,7 @@ fn less_demand_does_not_overlap_replaced_worker_file_lifetimes() {
             })
     });
     let mut pool = Pool::new(spawn, WORKERS).unwrap();
-    pool.set_attach(issuer.attacher(), DEPTH);
+    pool.set_attach(issuer.attacher().unwrap(), DEPTH);
     // Sender-side owners stay occupied until each Done is taken, even if its worker is fast.
     for number in 1..=2 {
         assert!(

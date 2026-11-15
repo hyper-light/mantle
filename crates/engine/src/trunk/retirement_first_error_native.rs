@@ -131,7 +131,7 @@ fn a_physical_job_failure_stays_first_after_native_worker_join_failure() {
             })
     });
     let mut pool = Pool::new(spawn, 1).unwrap();
-    pool.set_attach(issuer.attacher(), 1);
+    pool.set_attach(issuer.attacher().unwrap(), 1);
     pool.prepare().unwrap();
     let mut rt = runtime();
     let mut leases = rt.prepare_retirement(&[1]).unwrap();

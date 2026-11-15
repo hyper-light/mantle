@@ -57,8 +57,8 @@ threads grow (26 §4.2).
 | Network runtime | hyper-rt's shards, one thread per core the process is granted (the owner's decision of 2026-10-05: a shared thread-per-core runtime, no tokio) | QUIC connections and the datagram plane (§3), SWIM, HTTP connections (§4), the drivers of each S3 request, the routing layer (§5), clients and connections as tasks |
 | Metadata shards | one per granted core | range replicas: stepping, ticking, proposing, driving, applying, serving confirmed reads (§2) |
 | Coding pool | one per granted core | erasure encoding and decoding of whole blocks, block checksums, the write path's inverse checks (§5.6) |
-| Device issuers | one per physical device | every volume's writer, cleaner and scrubber and the device's Raft log writer, as state machines (chunk-store.md §4; raft-log.md §3); the device's dispatcher (§2.7). As built: every volume's writes and flushes, dispatched to the device's pool; the writers, cleaners and scrubbers are still threads of their own (STATUS item 4) |
-| Device pools | per device, at most the device's measured depth, only where the platform has no asynchronous interface the device can use (below) | blocking reads, writes and flushes the issuer hands them. As built: the volumes' writes and flushes, on every platform (below) |
+| Device issuers | one per physical device | every volume's writer, cleaner and scrubber and the device's Raft log writer, as state machines (chunk-store.md §4; raft-log.md §3); the device's dispatcher (§2.7). As built: every volume's reads, writes and flushes; on Linux held by the kernel through native AIO on the issuer's own thread, elsewhere dispatched to the device's pool; the writers, cleaners and scrubbers are still threads of their own (STATUS item 4) |
+| Device pools | per device, at most the device's measured depth, only where the platform has no asynchronous interface the device can use (below) | blocking reads, writes and flushes the issuer hands them. As built: macOS and Windows (below) |
 | Engine background | flush and compaction pools shared by every engine instance on the node (24 §4.7, engine P14), whose file I/O goes through the device's dispatcher | the engine's own background work |
 
 With `C` granted cores, `D` physical devices and pools of `p_i` workers, the process's
@@ -68,15 +68,17 @@ devices and `V` volumes, three threads per volume, 300 at 100 volumes (audit §1
 per physical device replaces them, which closes the question this record left open.
 
 **Device I/O in flight, by platform, at every step.** The issuer keeps its device's depth in
-flight through the platform's asynchronous interface where one exists: io_uring on Linux, one
-ring per device with registered buffers and files, durable writes linked to an fsync with
-`IORING_FSYNC_DATASYNC`, the kernel's own workers bounded at `min(entries, 4 × CPUs)`; overlapped
-I/O on one completion port on Windows, with `FILE_FLAG_NO_BUFFERING` so the I/O stays
-asynchronous (26 §2.2–§2.3). io_uring drove "about 1.2M IOPS" without polling, twice Linux AIO's
-on the same workload (26 §2.2). macOS has no such interface for a full flush or more than 16
-requests (26 §2.4), and Linux may have io_uring disabled (`ENOSYS`, `EPERM`; research/02 §2.13);
-there the device's pool of blocking workers carries the depth, sized at the smaller of the
-device's reported queue and its measured knee. Research note 26 proposed the native interfaces
+flight through the platform's asynchronous interface where one exists: Linux's native AIO, one
+context per device of its depth, durable writes followed, once they complete, by
+`IOCB_CMD_FDSYNC` through the same context (the owner's decision of 2026-10-01: not io_uring,
+whose attack surface was behind 60% of the kernel exploits Google's kCTF paid for, which Docker's
+default seccomp profile refuses, and which a kernel can disable; hyper-raft
+`docs/research/issuer-completions.md` §2, §5); overlapped I/O on one completion port on Windows,
+with `FILE_FLAG_NO_BUFFERING` so the I/O stays asynchronous (26 §2.2–§2.3). io_uring drove
+"about 1.2M IOPS" without polling, twice Linux AIO's on the same workload (26 §2.2), and stays an
+operator's opt-in to be measured. macOS has no such interface for a full flush or more than 16
+requests (26 §2.4); there the device's pool of blocking workers carries the depth, sized at the
+smaller of the device's reported queue and its measured knee. Research note 26 proposed the native interfaces
 only from the node step, keeping the laptop on the pool everywhere; the design takes them at
 every step on the platforms that have them, because a backend chosen by platform keeps one code
 path per platform from laptop to fleet, where one chosen by scale would run the laptop on a path
@@ -90,6 +92,15 @@ Windows keep their depth with blocked workers as macOS does. The issuer's thread
 `min(device queue, measured depth, budget left)` workers start when the device opens and draw
 on the process budget before any starts; a device calibration has not measured runs one worker
 (`issuer::depth`), as its reads go one at a time (chunk-store.md §7).
+
+*As built (2026-11-14).* On Linux a device's issuer holds its depth in the kernel
+(`Issuer::start_device`; hyper-raft `docs/research/issuer-completions.md` §9): its one thread,
+whatever the depth, hands every volume's reads, writes and flushes to one native AIO context of
+the depth and reaps them, each completion ringing an eventfd its submitters ring too, so it waits
+for both at once. A thread a transfer in flight had cost a node its stack in its floor (§1.4):
+pods on CI runners measured depths of 1 to 316 on one disk, and one of 316 needed
+2,173,380,739 bytes, 681,574,400 of them its threads' stacks, past its 2 GiB (kind-cell run
+131575146397). macOS keeps the pool, and Windows keeps it until its completion port is built.
 
 **A process thread budget.** Every pool draws from one budget, decided before any thread
 starts, so devices times depth cannot add up past it. On macOS its ceiling is the OS's own
@@ -277,8 +288,9 @@ measures the second, and derives the rest by these rules:
   allocator count, free or pending slot, map bit and map word apart, charged with the extent's
   resident metadata from what memory remains (`shard_db::measured_per_extent`); and the threads
   the node starts (`derive::threads`: its shard's, standard input's and output's, the
-  log's two, each device's issuer and a worker a read of its depth, each volume's writer, cleaner
-  and scrubber), each at Rust's default stack of 2 MiB, reserved whole; and each range's member
+  log's two, each device's issuer, with a worker a read of its depth where a pool carries it
+  (macOS, Windows; `Issuer::device_threads`), each volume's writer, cleaner and scrubber), each at
+  Rust's default stack of 2 MiB, reserved whole; and each range's member
   (`derive::range_bytes`, hyper-durable's holds at the bounds hyper-raft's limits put on each:
   what it keeps of each member of its configuration; the entries not yet durable, a leader's
   uncommitted proposals or a follower's window and one entry past, at twice their bytes for the

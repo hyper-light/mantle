@@ -328,8 +328,8 @@ fn run(
     let scratch = Scratch::create(dir, ".mantle-bench").map_err(Error::Disk)?;
     let path = scratch.path();
     // The device's issuer, which every write of the volume goes through, at the depth where
-    // the device's throughput stopped growing (docs/design/node.md §1.2).
-    let issuer = Issuer::start(path, depth).map_err(Error::Disk)?;
+    // the device's throughput stopped growing, as a node starts it (docs/design/node.md §1.2).
+    let issuer = Issuer::start_device(path, depth).map_err(Error::Disk)?;
     let file =
         DeviceFile::open(path, false, CachingRequest::PreferDirect, align).map_err(Error::Disk)?;
     let volume = align.down_u64(plan.volume);
@@ -1290,8 +1290,8 @@ mod tests {
             scrub_period: None,
             ..Config::default()
         };
-        // As a device measured at four in flight.
-        let issuer = Issuer::start(&path, 4).unwrap();
+        // As a node starts a device measured at four in flight.
+        let issuer = Issuer::start_device(&path, 4).unwrap();
         let v = Volume::format(&issuer, file, size, config).unwrap();
         let cores = drive::drivers(usize::MAX);
         let mut seen = Vec::new();

@@ -5,9 +5,24 @@
 //! `Sync`, so a file moves to its owner and is never shared; a second thread that needs the same
 //! file gets a second handle of its own ([`BlockFile::try_clone`]), as the issuer's workers do.
 
+use std::fs::File;
+use std::path::Path;
+
 use crate::DiskError;
 use crate::buf::Alignment;
 use crate::file::DeviceFile;
+
+/// The open file the kernel moves a file's bytes through ([`BlockFile::kernel_file`]).
+#[derive(Clone, Copy, Debug)]
+pub struct KernelFile<'a> {
+    /// The open file: each transfer is the kernel's `pread`, `pwrite` or `fdatasync` of it.
+    pub file: &'a File,
+    /// The alignment every transfer's offset, length and buffer address meet (one byte when
+    /// buffered).
+    pub align: Alignment,
+    /// Where it was opened, for errors.
+    pub path: &'a Path,
+}
 
 /// How a write was made durable by [`BlockFile::write_durable_at`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +144,17 @@ pub trait BlockFile: Send {
         Ok(Durable::Flushed)
     }
 
+    /// The open file the kernel transfers this file's bytes through, each read, write and flush
+    /// the kernel's own `pread`, `pwrite` and `fdatasync` of it, with the bytes and the errors
+    /// [`BlockFile::read_exact_at`], [`BlockFile::write_all_at`] and [`BlockFile::sync_data`]
+    /// give: what a device issuer that hands its transfers to the kernel and takes their
+    /// completions issues them on (`crate::issuer::Issuer::start_device`). None by default: a
+    /// file the kernel does not hold whole (one in memory, one cut into segments) has its
+    /// transfers made by a pool's workers.
+    fn kernel_file(&self) -> Option<KernelFile<'_>> {
+        None
+    }
+
     /// A second handle to the same file, whose writes and flushes are the file's own: what a
     /// volume hands its device's issuer while it keeps reading through its own handle
     /// (crate::issuer). A file that has no second handle refuses.
@@ -191,6 +217,22 @@ impl BlockFile for DeviceFile {
 
     fn fills_new_space(&self) -> bool {
         DeviceFile::fills_new_space(self)
+    }
+
+    /// On Linux a file's and a device node's reads, writes and flush are the kernel's `pread`,
+    /// `pwrite` and `fdatasync` of the open file (`DeviceFile::sync_data`, `crate::node::sync`).
+    /// Elsewhere none: no issuer there hands transfers to the kernel, and macOS flushes a device
+    /// node with an ioctl of its own (`crate::node`).
+    fn kernel_file(&self) -> Option<KernelFile<'_>> {
+        if cfg!(target_os = "linux") {
+            Some(KernelFile {
+                file: self.std_file(),
+                align: DeviceFile::alignment(self),
+                path: self.path(),
+            })
+        } else {
+            None
+        }
     }
 
     fn try_clone(&self) -> Result<Self, DiskError> {

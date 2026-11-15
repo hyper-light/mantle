@@ -130,7 +130,7 @@ use mantle_range::{ConfState, Range, Settings, Stored};
 use mantle_s3::seal::WrappingKey;
 
 use crate::ask::{CommandOutcome, Wait};
-use crate::derive::{Device, Formatted, Measured, Stated, VolumeFacts};
+use crate::derive::{Derived, Device, Formatted, Measured, Stated, VolumeFacts};
 use crate::directory::Peer;
 use crate::history;
 use crate::layout::{Layout, LayoutError, Live, Stopped};
@@ -1223,6 +1223,35 @@ pub fn serve_stated(config: &Path) -> Result<(), ProcessError> {
         .map(s3_keys)
         .transpose()
         .map_err(step(Step::Identity))?;
+    let (derived, node, locks) = said_derived(stated)?;
+    let mut out = std::io::stdout().lock();
+    // The S3 endpoint as its keys were read: where it listens, its region and its keys' ids.
+    if let Some(s3) = &s3 {
+        let ids: Vec<&str> = s3.access.iter().map(|k| k.id.as_str()).collect();
+        writeln!(out, "s3 {} {} {}", s3.listen, s3.region, ids.join(","))
+            .map_err(|e| ProcessError::Say(e.to_string()))?;
+    }
+    out.flush().map_err(|e| ProcessError::Say(e.to_string()))?;
+    // The runtime's writer says the rest: this thread holds no lock on standard output for it.
+    drop(out);
+    start(derived.config, (node, locks), identity, s3, false)
+}
+
+/// What `mantle serve` derives from the statements the file at `config` holds, said as it says
+/// them, a `basis` line each, without serving (`mantle derive`): the node directory and each
+/// volume's device directory locked, each device's profile kept or measured and kept as a start
+/// keeps it, the rest measured, and every other value derived (`derive::derive`). Among the bases
+/// is `memory.need`, what an orchestrator gives the node's pod (docs/design/kubernetes.md §3), so
+/// an operator derives it on the machine the node will run on before it is deployed.
+pub fn derive_stated(config: &Path) -> Result<(), ProcessError> {
+    let stated = read_stated(config).map_err(step(Step::Configuration))?;
+    let (_derived, _node, _locks) = said_derived(stated)?;
+    Ok(())
+}
+
+/// The start's steps from the locks to the budgets (node.md §1.7) for `stated`: its directory's
+/// and its volumes' locks, the measurements, the derivation, each basis said on standard output.
+fn said_derived(stated: Stated) -> Result<(Derived, NodeLock, Locks), ProcessError> {
     let node = Locks::node(&stated.dir).map_err(step(Step::Locks))?;
     let locks = Locks::take(stated.volumes.iter().map(|(dir, _)| dir.as_path()))
         .map_err(step(Step::Locks))?;
@@ -1246,16 +1275,8 @@ pub fn serve_stated(config: &Path) -> Result<(), ProcessError> {
     for basis in &derived.bases {
         writeln!(out, "basis {basis}").map_err(|e| ProcessError::Say(e.to_string()))?;
     }
-    // The S3 endpoint as its keys were read: where it listens, its region and its keys' ids.
-    if let Some(s3) = &s3 {
-        let ids: Vec<&str> = s3.access.iter().map(|k| k.id.as_str()).collect();
-        writeln!(out, "s3 {} {} {}", s3.listen, s3.region, ids.join(","))
-            .map_err(|e| ProcessError::Say(e.to_string()))?;
-    }
     out.flush().map_err(|e| ProcessError::Say(e.to_string()))?;
-    // The runtime's writer says the rest: this thread holds no lock on standard output for it.
-    drop(out);
-    start(derived.config, (node, locks), identity, s3, false)
+    Ok((derived, node, locks))
 }
 
 /// How the node's thread ended, as [`start`] hears it.

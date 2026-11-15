@@ -813,13 +813,16 @@ pub fn liveness_bytes(peers: usize) -> Option<u64> {
 /// The threads a node starts beside the process's own, which waits for it to end: its shard's,
 /// which the process's own leaves at once on a stop that ends it so (`process::start`); its
 /// standard input's and output's, its log's and its log's device's; for each device holding
-/// volumes, its issuer and a worker for each read its profile measured at the device at once
-/// (`hyper_block::issuer`); and for each volume its writer and its cleaner, and its scrubber
-/// where it scrubs. `devices` are those devices' depths, `volumes` whether each scrubs.
+/// volumes, its issuer (`hyper_block::issuer::Issuer::start_device`), on Linux one thread whatever
+/// the device's depth, the kernel holding its transfers, and elsewhere that thread and a worker for
+/// each read its profile measured at the device at once (`Issuer::device_threads`); and for each
+/// volume its writer and its cleaner, and its scrubber where it scrubs. `devices` are those
+/// devices' depths, `volumes` whether each scrubs.
 pub fn threads(devices: &[usize], volumes: &[bool]) -> Option<u64> {
     let mut threads = 5u64;
     for &depth in devices {
-        threads = threads.checked_add(u64::try_from(depth).ok()?.checked_add(1)?)?;
+        let issuer = hyper_block::issuer::Issuer::device_threads(depth)?;
+        threads = threads.checked_add(u64::try_from(issuer).ok()?)?;
     }
     for &scrubs in volumes {
         threads = threads.checked_add(if scrubs { 3 } else { 2 })?;
@@ -1365,43 +1368,12 @@ pub fn derive(
         });
     }
     let chunk = mantle_gateway::layout::CHUNK;
-    let mut volume_bytes = 0u64;
-    let mut transfers = 0usize;
-    let mut fragments = 0u64;
-    let mut wants = Vec::with_capacity(stated.volumes.len());
-    for ((_, size), facts) in stated.volumes.iter().zip(&measured.volumes) {
-        let block = match &facts.formatted {
-            Some(formatted) => formatted.geometry.block,
-            None => volume_layout::block(facts.device.align).ok_or(overflow("a volume's block"))?,
-        };
-        let at_a_block = size
-            .checked_div(block)
-            .ok_or(overflow("a volume's index"))?;
-        fragments = fragments
-            .checked_add(at_a_block)
-            .ok_or(overflow("the volumes' fragments"))?;
-        let want = index::most_bytes(at_a_block).ok_or(overflow("a volume's index"))?;
-        let whole = volume(
-            facts.device.align,
-            *size,
-            chunk,
-            &facts.profile,
-            want,
-            facts.formatted.as_ref(),
-            chunk_requests,
-        )?;
-        let geometry = match &facts.formatted {
-            Some(formatted) => formatted.geometry,
-            None => Geometry::plan(*size, facts.device.align, &whole)?,
-        };
-        volume_bytes = volume_layout::most_bytes(&whole, &geometry)
-            .and_then(|bytes| volume_bytes.checked_add(bytes))
-            .ok_or(overflow("the volumes' buffers"))?;
-        transfers = transfers
-            .checked_add(whole.transfers())
-            .ok_or(overflow("the volumes' transfers"))?;
-        wants.push(want);
-    }
+    let Wholes {
+        bytes: volume_bytes,
+        transfers,
+        fragments,
+        wants,
+    } = wholes(&stated, measured, chunk_requests, |facts| facts.profile)?;
 
     // The log, and each range's engine on its share of what the log and the volumes on the node
     // directory's device leave of its file system.
@@ -1501,14 +1473,10 @@ pub fn derive(
             .ok_or(overflow("the ranges' members"))?;
     }
     // A device's issuer, one a device the OS names, started by its first volume.
-    let mut devices: Vec<(&Option<String>, usize)> = Vec::new();
-    for facts in &measured.volumes {
-        let name = &facts.device.name;
-        if name.is_none() || !devices.iter().any(|(held, _)| *held == name) {
-            devices.push((name, issuer_depth(facts)));
-        }
-    }
-    let depths: Vec<usize> = devices.iter().map(|&(_, depth)| depth).collect();
+    let depths: Vec<usize> = devices_of(measured, issuer_depth)
+        .into_iter()
+        .map(|(_, depth)| depth)
+        .collect();
     let scrubs = vec![true; stated.volumes.len()];
     let started = threads(&depths, &scrubs).ok_or(overflow("the node's threads"))?;
     let classes = [
@@ -1532,6 +1500,63 @@ pub fn derive(
         ),
     ];
     let allowed = allowance(stated.ceiling, &measured.memory)?;
+    // What an orchestrator gives the node: its floor at the most its devices can be measured to
+    // take, and every want whole (`need`).
+    let deepest_floor = {
+        let deep = wholes(&stated, measured, chunk_requests, deepest)?;
+        let mut deep_bounds = mantle_protocol::bounds::Stated {
+            transfers: deep
+                .transfers
+                .checked_add(asked.chunks)
+                .ok_or(overflow("the node's transfers"))?,
+            transport_bytes: 0,
+            ..bounds
+        };
+        deep_bounds.transport_bytes = mantle_protocol::bounds::least_transport(&deep_bounds)
+            .map_err(|e| DeriveError::Bounds(e.to_string()))?;
+        let deep_limits = mantle_protocol::bounds::limits(&deep_bounds)
+            .map_err(|e| DeriveError::Bounds(e.to_string()))?;
+        let deep_reads = asked
+            .reads
+            .checked_add(deep_limits.exchanges)
+            .ok_or(overflow("a range's reads"))?;
+        let mut deep_ranges = 0u64;
+        for hosted in &hosted {
+            deep_ranges = range_bytes(&hosted.range, deep_reads)
+                .and_then(|bytes| deep_ranges.checked_add(bytes))
+                .ok_or(overflow("the ranges' members"))?;
+        }
+        let deep_depths: Vec<usize> = devices_of(measured, |facts| {
+            hyper_block::issuer::depth(facts.device.queue, Some(deepest(facts).depth))
+        })
+        .into_iter()
+        .map(|(_, depth)| depth)
+        .collect();
+        let deep_threads = threads(&deep_depths, &scrubs).ok_or(overflow("the node's threads"))?;
+        [
+            (Class::Objects, objects_bytes),
+            (Class::Volumes, deep.bytes),
+            (Class::Engines, engines_bytes),
+            (Class::Ranges, deep_ranges),
+            (
+                Class::Log,
+                log_bytes(&log_config).ok_or(overflow("the log's memory"))?,
+            ),
+            (
+                Class::Transport,
+                deep_bounds
+                    .transport_bytes
+                    .checked_add(
+                        transport_bytes_beside(&deep_bounds).ok_or(overflow("the transport"))?,
+                    )
+                    .ok_or(overflow("the transport's memory"))?,
+            ),
+            (
+                Class::Threads,
+                stacks(deep_threads).ok_or(overflow("the threads' stacks"))?,
+            ),
+        ]
+    };
     let remaining = floor(&classes, allowed)?;
     say_floor(
         &mut said,
@@ -1556,6 +1581,7 @@ pub fn derive(
             .ok_or(overflow("the floor's shares"))?,
         engine_want,
     );
+    say_need(&mut said, need(&deepest_floor, &all)?);
     let parts = shares(remaining, &all)?;
     let (indexes, metadata) = parts.split_at(stated.volumes.len());
     // What no want takes goes to the engines, each up to what its device's share holds: the rows
@@ -1702,6 +1728,121 @@ pub fn derive(
 /// reports and the depth its profile measured (`hyper_block::issuer::depth`).
 fn issuer_depth(facts: &VolumeFacts) -> usize {
     hyper_block::issuer::depth(facts.device.queue, Some(facts.profile.depth))
+}
+
+/// Each device holding volumes, one a device the OS names and one for each it does not (each
+/// such volume's issuer is its own, `Storage::open`), with `depth` of its first volume's facts.
+fn devices_of(
+    measured: &Measured,
+    depth: impl Fn(&VolumeFacts) -> usize,
+) -> Vec<(&Option<String>, usize)> {
+    let mut devices: Vec<(&Option<String>, usize)> = Vec::new();
+    for facts in &measured.volumes {
+        let name = &facts.device.name;
+        if name.is_none() || !devices.iter().any(|(held, _)| *held == name) {
+            devices.push((name, depth(facts)));
+        }
+    }
+    devices
+}
+
+/// The volumes, each as its index's whole want would have it at the profile `profile` gives its
+/// device: their buffers, their transfers, their fragments and each index's want.
+struct Wholes {
+    bytes: u64,
+    transfers: usize,
+    fragments: u64,
+    wants: Vec<u64>,
+}
+
+fn wholes(
+    stated: &Stated,
+    measured: &Measured,
+    chunk_requests: usize,
+    profile: impl Fn(&VolumeFacts) -> Profile,
+) -> Result<Wholes, DeriveError> {
+    let overflow = DeriveError::Overflow;
+    let chunk = mantle_gateway::layout::CHUNK;
+    let mut found = Wholes {
+        bytes: 0,
+        transfers: 0,
+        fragments: 0,
+        wants: Vec::with_capacity(stated.volumes.len()),
+    };
+    for ((_, size), facts) in stated.volumes.iter().zip(&measured.volumes) {
+        let block = match &facts.formatted {
+            Some(formatted) => formatted.geometry.block,
+            None => volume_layout::block(facts.device.align).ok_or(overflow("a volume's block"))?,
+        };
+        let at_a_block = size
+            .checked_div(block)
+            .ok_or(overflow("a volume's index"))?;
+        found.fragments = found
+            .fragments
+            .checked_add(at_a_block)
+            .ok_or(overflow("the volumes' fragments"))?;
+        let want = index::most_bytes(at_a_block).ok_or(overflow("a volume's index"))?;
+        let whole = volume(
+            facts.device.align,
+            *size,
+            chunk,
+            &profile(facts),
+            want,
+            facts.formatted.as_ref(),
+            chunk_requests,
+        )?;
+        let geometry = match &facts.formatted {
+            Some(formatted) => formatted.geometry,
+            None => Geometry::plan(*size, facts.device.align, &whole)?,
+        };
+        found.bytes = volume_layout::most_bytes(&whole, &geometry)
+            .and_then(|bytes| found.bytes.checked_add(bytes))
+            .ok_or(overflow("the volumes' buffers"))?;
+        found.transfers = found
+            .transfers
+            .checked_add(whole.transfers())
+            .ok_or(overflow("the volumes' transfers"))?;
+        found.wants.push(want);
+    }
+    Ok(found)
+}
+
+/// The most calibration can measure of `facts`' device, as its profile: its reads at once where the
+/// random-read ladder stops at the deepest, the device's reported queue
+/// (`issuer::UNDESCRIBED_QUEUE_DEPTH` where it reports none) within the plan's bound, and its
+/// reads' bytes at the sequential ladder's deepest point of the plan's large transfers
+/// (`mantle_disk::calibrate::Plan::standard`), or what was measured where a profile kept from
+/// another plan holds more. A floor taken at it holds whatever a calibration of the device measures.
+fn deepest(facts: &VolumeFacts) -> Profile {
+    let plan = mantle_disk::calibrate::Plan::standard(facts.device.align, facts.device.queue);
+    let queue = facts
+        .device
+        .queue
+        .and_then(|q| usize::try_from(q).ok())
+        .filter(|&q| q > 0)
+        .unwrap_or(hyper_block::issuer::UNDESCRIBED_QUEUE_DEPTH);
+    let sequential = plan.sequential_depths.iter().copied().max().unwrap_or(1);
+    let read_bytes = u64::try_from(sequential)
+        .ok()
+        .and_then(|depth| depth.checked_mul(u64::try_from(plan.large).ok()?))
+        .unwrap_or(u64::MAX);
+    Profile {
+        depth: plan.max_read_depth.min(queue).max(facts.profile.depth),
+        read_bytes: read_bytes.max(facts.profile.read_bytes),
+        ..facts.profile
+    }
+}
+
+/// What a node needs to be given to hold its floor and every want whole: `floor_at_deepest`, its
+/// floor class by class at the most its devices can be measured to take ([`deepest`]), and
+/// `wants`, each volume's index's and each engine's ([`shares`]).
+pub fn need(floor_at_deepest: &[(Class, u64)], wants: &[u64]) -> Result<u64, DeriveError> {
+    floor_at_deepest
+        .iter()
+        .map(|&(_, bytes)| bytes)
+        .chain(wants.iter().copied())
+        .try_fold(0u64, |sum, bytes| sum.checked_add(bytes))
+        .ok_or(DeriveError::Overflow("the node's need"))
 }
 
 /// `made` on the stores the ranges hold already, each made at one page and extent size it opens
@@ -2096,6 +2237,18 @@ fn say_objects(
             "S3's eleven nines a year, applied to each block (durability.md §1)",
         );
     }
+}
+
+fn say_need(said: &mut Said, need: u64) {
+    said.add(
+        "memory.need",
+        need,
+        Kind::Derived,
+        "what to give the node, an orchestrator's limit for its pod: its floor at the most its \
+         devices can be measured to take, each one's queue (derive::deepest), and every volume's \
+         index and engine's resident metadata whole for the objects the cell's volumes hold \
+         (derive::need)",
+    );
 }
 
 fn say_floor(
@@ -2522,9 +2675,21 @@ mod tests {
     /// writer, cleaner and scrubber where it scrubs, each a 2 MiB stack.
     #[test]
     fn the_threads_are_the_nodes_own_and_its_storages() {
+        // A device's issuer: one thread on Linux, the kernel holding its depth; elsewhere a worker
+        // for each transfer at once besides.
+        let issuer = |depth: u64| {
+            if cfg!(target_os = "linux") {
+                1
+            } else {
+                depth + 1
+            }
+        };
         assert_eq!(threads(&[], &[]), Some(5));
-        assert_eq!(threads(&[2], &[true]), Some(5 + 3 + 3));
-        assert_eq!(threads(&[1, 4], &[true, false]), Some(5 + 2 + 5 + 3 + 2));
+        assert_eq!(threads(&[2], &[true]), Some(5 + issuer(2) + 3));
+        assert_eq!(
+            threads(&[1, 4], &[true, false]),
+            Some(5 + issuer(1) + issuer(4) + 3 + 2)
+        );
         assert_eq!(stacks(10), Some(20 << 20));
     }
 
@@ -3177,6 +3342,84 @@ mod tests {
             (config.chunk_rate, config.repair_rate, config.target)
         );
         assert_eq!(read.bursts, config.bursts);
+    }
+
+    /// The bytes basis `key` says, of `derived`.
+    fn said_bytes(derived: &Derived, key: &str) -> u64 {
+        let basis = derived.bases.iter().find(|b| b.key == key).unwrap();
+        basis.value.parse().unwrap()
+    }
+
+    /// `facts(1)` with its volume's device reporting a queue of `queue` and calibrated at `depth`.
+    fn deep(queue: u32, depth: usize) -> Measured {
+        let mut measured = facts(1);
+        let volume = measured.volumes.first_mut().unwrap();
+        volume.device.queue = Some(queue);
+        volume.profile.depth = depth;
+        measured
+    }
+
+    /// A device's depth costs a node no thread's stack where the kernel holds its transfers
+    /// (Linux): the KIND cell's pod whose device measured 316 needed its 2 MiB stacks past its
+    /// 2 GiB (kind-cell run 131575146397), and here the threads class is the same at a depth of 316
+    /// as at one. Elsewhere a pool's worker a transfer still counts its stack.
+    #[test]
+    fn a_devices_depth_costs_no_threads_stack_where_the_kernel_holds_it() {
+        let threads_at = |depth| {
+            let derived = derive(stated(1), &deep(316, depth), &mut fresh).unwrap();
+            said_bytes(&derived, "memory.floor.threads")
+        };
+        let (shallow, deepest) = (threads_at(1), threads_at(316));
+        if cfg!(target_os = "linux") {
+            assert_eq!(shallow, deepest);
+        } else {
+            assert_eq!(deepest - shallow, 315 * STACK);
+        }
+    }
+
+    /// What a node needs (`memory.need`) is its floor at the most its device can be measured to
+    /// take, its queue, and its wants whole: the same whatever depth calibration measured; given
+    /// it, a node measured at any depth up to the queue holds its index's whole want, and its
+    /// engines at least what they hold at the deepest; given a byte less at the deepest, a share
+    /// falls short of its want.
+    #[test]
+    fn a_node_given_its_need_holds_every_want_whatever_its_device_measures() {
+        let need = said_bytes(
+            &derive(stated(1), &deep(316, 1), &mut fresh).unwrap(),
+            "memory.need",
+        );
+        let given = |ceiling, depth| {
+            let stated = Stated {
+                ceiling: Some(ceiling),
+                ..stated(1)
+            };
+            derive(stated, &deep(316, depth), &mut fresh).unwrap()
+        };
+        // The machine's 16 GiB past every floor: each index takes its want whole.
+        let index_want = said_bytes(
+            &derive(stated(1), &deep(316, 316), &mut fresh).unwrap(),
+            "volume.1.index_bytes",
+        );
+        let at_deepest = given(need, 316);
+        for depth in [1, 4, 64, 316] {
+            let derived = given(need, depth);
+            assert_eq!(said_bytes(&derived, "memory.need"), need, "depth {depth}");
+            assert_eq!(
+                said_bytes(&derived, "volume.1.index_bytes"),
+                index_want,
+                "the index's want whole at depth {depth}"
+            );
+            assert!(
+                said_bytes(&derived, "engine.metadata_bytes")
+                    >= said_bytes(&at_deepest, "engine.metadata_bytes"),
+                "depth {depth}"
+            );
+        }
+        let short = given(need - 1, 316);
+        assert!(
+            said_bytes(&short, "volume.1.index_bytes") < index_want,
+            "a byte short of the need, the index's share falls short of its want"
+        );
     }
 
     /// The floor's allowance is a stated ceiling where one is: the node refuses one past what the OS

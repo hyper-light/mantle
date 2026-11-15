@@ -350,6 +350,11 @@ the moment it starts them, so a start the operating system refuses part way stop
 started, in reverse, before the error returns, and nothing is left holding the device (audit
 S12).
 
+*As built (2026-11-14).* On Linux the node's device issuer holds its depth in the kernel through
+native AIO on its own thread (`Issuer::start_device`, node.md §1.2), the pool's workers below
+being macOS's and Windows's; every rule below holds on both, the issuer's lanes standing where its
+workers stand.
+
 *As built (2026-10-01; STATUS item 4).* Every write and flush of every volume on a device goes
 through the device's issuer (`hyper_block::issuer`, vendored from hyper-raft): one thread and a pool of blocking workers,
 all started when the device opens, `min(the device's reported queue, the depth calibration

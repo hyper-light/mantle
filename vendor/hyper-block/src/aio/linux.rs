@@ -1,10 +1,11 @@
 //! Linux's native AIO through its raw system calls (io_setup(2), io_submit(2), io_getevents(2),
-//! io_destroy(2)); the `iocb` and `io_event` records are `<linux/aio_abi.h>`'s.
+//! io_destroy(2)); the `iocb` and `io_event` records are `<linux/aio_abi.h>`'s. An eventfd(2)
+//! ([`Bell`]) is what a context's completions signal, and what a device issuer's submitters ring.
 #![allow(unsafe_code)]
 
 use std::fs::File;
-use std::io;
-use std::os::fd::AsRawFd;
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 /// `EAGAIN`: a `RWF_NOWAIT` read that would have blocked (io_submit(2), `RWF_NOWAIT`).
 pub(super) const EAGAIN: i64 = libc::EAGAIN as i64;
@@ -21,6 +22,10 @@ const IOCB_CMD_FDSYNC: u16 = 3;
 /// `RWF_NOWAIT` (`<linux/fs.h>`, Linux 4.14): don't wait if the I/O will block.
 const RWF_NOWAIT: u32 = 0x0000_0008;
 
+/// `IOCB_FLAG_RESFD` (`<linux/aio_abi.h>`): the kernel signals the eventfd in `aio_resfd` as the
+/// record completes, after its event is in the context's ring (fs/aio.c, `aio_complete`).
+const IOCB_FLAG_RESFD: u32 = 1 << 0;
+
 /// Bits of a transfer's tag that hold its index in its batch: a batch holds fewer than 2^24 - 1
 /// transfers, past any depth a device takes; the other 40 bits hold the batch's number, which
 /// wraps there.
@@ -31,7 +36,7 @@ pub(super) const FLUSH_INDEX: usize = (1 << INDEX_BITS) - 1;
 
 /// What [`Context::push`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Pushed {
+pub(crate) enum Pushed {
     Added,
     /// The submission holds the context's size: submit, then push again.
     Full,
@@ -40,7 +45,7 @@ pub(super) enum Pushed {
 }
 
 /// One record of a submission.
-pub(super) enum Op {
+pub(crate) enum Op {
     /// Read `len` bytes at `offset` into the buffer at `addr`.
     Read {
         addr: usize,
@@ -80,12 +85,12 @@ struct Iocb {
 /// `struct io_event` of `<linux/aio_abi.h>`.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-pub(super) struct IoEvent {
+pub(crate) struct IoEvent {
     /// The `aio_data` its `iocb` carried.
-    pub(super) data: u64,
+    pub(crate) data: u64,
     obj: u64,
     /// Bytes transferred, or a negated errno.
-    pub(super) res: i64,
+    pub(crate) res: i64,
     res2: i64,
 }
 
@@ -122,7 +127,7 @@ pub(super) fn same_number(full: u64, tagged: u64) -> bool {
 /// works through, each reserved once at its size: no submission or reap allocates. Dropping it
 /// destroys the context, which "will cancel any outstanding asynchronous I/O and block on
 /// completion" (io_destroy(2)), so no read is left writing into a buffer freed after it.
-pub(super) struct Context {
+pub(crate) struct Context {
     id: libc::c_ulong,
     iocbs: Vec<Iocb>,
     /// Addresses of `iocbs`' records, the `iocb **` io_submit takes; kept as addresses so the
@@ -137,6 +142,10 @@ pub(super) struct Context {
     /// Whether the kernel takes `IOCB_CMD_FDSYNC`; cleared at the first `EINVAL` that says it does
     /// not.
     fdsync: bool,
+    /// The eventfd every record signals as it completes (`IOCB_FLAG_RESFD`), for a context whose
+    /// records each name their own file ([`Self::rung`]); none for one whose submitter names the
+    /// file at each submission ([`Self::submit`]).
+    bell: Option<u32>,
     /// Tests: the error the next submission answers with, as io_submit(2) would.
     #[cfg(test)]
     pub(super) fail_next: Option<i32>,
@@ -145,6 +154,23 @@ pub(super) struct Context {
 impl Context {
     /// A context for `depth` records at once (io_setup(2): `EAGAIN` past `aio-max-nr`).
     pub(super) fn new(depth: usize) -> io::Result<Self> {
+        Self::setup(depth, None)
+    }
+
+    /// A context for `depth` records at once, each naming its own file ([`Self::push_on`]) and
+    /// signalling `bell` as it completes, so a thread waiting on the bell is woken by the kernel's
+    /// completions and by whoever else rings it, on one wait (a device issuer's dispatcher,
+    /// `crate::issuer`). Its reads ask no `RWF_NOWAIT`: the dispatcher's thread is the only one
+    /// a read could be made on in place, and a read the device makes it wait for in io_submit
+    /// waits there no longer than it would in place.
+    pub(crate) fn rung(depth: usize, bell: &Bell) -> io::Result<Self> {
+        let fd = u32::try_from(bell.file.as_raw_fd()).map_err(|_| io::ErrorKind::InvalidInput)?;
+        let mut ctx = Self::setup(depth, Some(fd))?;
+        ctx.nowait = false;
+        Ok(ctx)
+    }
+
+    fn setup(depth: usize, bell: Option<u32>) -> io::Result<Self> {
         let nr = libc::c_long::try_from(depth).map_err(|_| io::ErrorKind::InvalidInput)?;
         let mut id: libc::c_ulong = 0;
         // SAFETY: io_setup writes the new context's id into the `aio_context_t` it is given, here
@@ -161,28 +187,29 @@ impl Context {
             reaped: 0,
             nowait: true,
             fdsync: true,
+            bell,
             #[cfg(test)]
             fail_next: None,
         })
     }
 
     /// Whether flushes may be handed to the kernel: none has yet been refused.
-    pub(super) fn flushes(&self) -> bool {
+    pub(crate) fn flushes(&self) -> bool {
         self.fdsync
     }
 
     /// Records the context can be handed in one submission: its size.
-    pub(super) fn room(&self) -> usize {
+    pub(crate) fn room(&self) -> usize {
         self.iocbs.capacity()
     }
 
     /// Starts a submission: none of its records yet.
-    pub(super) fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.iocbs.clear();
     }
 
     /// Adds `op` to the submission, tagged `data`.
-    pub(super) fn push(&mut self, data: u64, op: Op) -> Pushed {
+    pub(crate) fn push(&mut self, data: u64, op: Op) -> Pushed {
         if self.iocbs.len() >= self.iocbs.capacity() {
             return Pushed::Full;
         }
@@ -210,8 +237,27 @@ impl Context {
         Pushed::Added
     }
 
+    /// Adds `op` on the file `fd` to the submission, tagged `data`, signalling the context's bell
+    /// as it completes: a context made by [`Self::rung`], handed to the kernel by
+    /// [`Self::submit_own`].
+    pub(crate) fn push_on(&mut self, fd: RawFd, data: u64, op: Op) -> Pushed {
+        let (Some(bell), Ok(fd)) = (self.bell, u32::try_from(fd)) else {
+            return Pushed::Unrepresentable;
+        };
+        match self.push(data, op) {
+            Pushed::Added => {}
+            other => return other,
+        }
+        if let Some(iocb) = self.iocbs.last_mut() {
+            iocb.aio_fildes = fd;
+            iocb.aio_flags = IOCB_FLAG_RESFD;
+            iocb.aio_resfd = bell;
+        }
+        Pushed::Added
+    }
+
     /// The tag of the submission's record at `at`.
-    pub(super) fn pushed(&self, at: usize) -> Option<u64> {
+    pub(crate) fn pushed(&self, at: usize) -> Option<u64> {
         self.iocbs.get(at).map(|iocb| iocb.aio_data)
     }
 
@@ -219,11 +265,22 @@ impl Context {
     /// first (io_submit(2) may take fewer than it is given; none when the context is full for now,
     /// or when the first is a flush the kernel turned out to take no AIO for, after which
     /// [`Self::flushes`] is false). Only reads ask `RWF_NOWAIT`.
-    pub(super) fn submit(&mut self, file: &File) -> io::Result<usize> {
+    pub(crate) fn submit(&mut self, file: &File) -> io::Result<usize> {
+        let fd = u32::try_from(file.as_raw_fd()).map_err(|_| io::ErrorKind::InvalidInput)?;
+        self.submit_records(Some(fd))
+    }
+
+    /// Hands the submission's records to the kernel, each on the file [`Self::push_on`] named:
+    /// as [`Self::submit`] does, a context made by [`Self::rung`].
+    pub(crate) fn submit_own(&mut self) -> io::Result<usize> {
+        self.submit_records(None)
+    }
+
+    /// The submission handed over, its records on `fd` where one is given, else on their own.
+    fn submit_records(&mut self, fd: Option<u32>) -> io::Result<usize> {
         if self.iocbs.is_empty() {
             return Ok(0);
         }
-        let fd = u32::try_from(file.as_raw_fd()).map_err(|_| io::ErrorKind::InvalidInput)?;
         #[cfg(test)]
         if let Some(code) = self.fail_next.take() {
             return Err(io::Error::from_raw_os_error(code));
@@ -232,7 +289,9 @@ impl Context {
             let flags = if self.nowait { RWF_NOWAIT } else { 0 };
             self.pointers.clear();
             for iocb in &mut self.iocbs {
-                iocb.aio_fildes = fd;
+                if let Some(fd) = fd {
+                    iocb.aio_fildes = fd;
+                }
                 iocb.aio_rw_flags = if iocb.aio_lio_opcode == IOCB_CMD_PREAD {
                     flags
                 } else {
@@ -286,7 +345,7 @@ impl Context {
 
     /// Takes the completions ready into the context's records, waiting for at least one when
     /// `wait` is set; returns how many ([`Self::event`] reads them).
-    pub(super) fn reap(&mut self, wait: bool) -> io::Result<usize> {
+    pub(crate) fn reap(&mut self, wait: bool) -> io::Result<usize> {
         let max =
             libc::c_long::try_from(self.events.len()).map_err(|_| io::ErrorKind::InvalidInput)?;
         let min = libc::c_long::from(wait);
@@ -324,11 +383,71 @@ impl Context {
     }
 
     /// The `at`th completion the last reap took.
-    pub(super) fn event(&self, at: usize) -> Option<IoEvent> {
+    pub(crate) fn event(&self, at: usize) -> Option<IoEvent> {
         if at < self.reaped {
             self.events.get(at).copied()
         } else {
             None
+        }
+    }
+}
+
+/// An eventfd(2) counter: the kernel adds one as each record of a context rung on it completes
+/// ([`Context::rung`]), and whoever holds a descriptor of it adds one with [`Bell::ring`];
+/// [`Bell::wait`] takes the count, waiting only while it is zero, so a ring that comes between a
+/// waiter's last look and its wait ends the wait at once. Not in non-blocking mode: the count's
+/// most, 2^64 - 2, is past any number of completions and rings one wait leaves.
+#[derive(Debug)]
+pub(crate) struct Bell {
+    file: File,
+}
+
+impl Bell {
+    /// A new counter at zero, its descriptor closed on exec (`EFD_CLOEXEC`).
+    pub(crate) fn new() -> io::Result<Self> {
+        // SAFETY: eventfd takes a count and flags by value and returns a new descriptor or -1; it
+        // reads and writes no memory of ours.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is the descriptor eventfd has just returned: open, and owned by nothing else.
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        Ok(Self {
+            file: File::from(owned),
+        })
+    }
+
+    /// A descriptor of its own for the same counter (dup(2)), which its holder rings and drops
+    /// whatever the counter's other holders do.
+    pub(crate) fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            file: self.file.try_clone()?,
+        })
+    }
+
+    /// Adds one to the count.
+    pub(crate) fn ring(&self) -> io::Result<()> {
+        loop {
+            match (&self.file).write(&1u64.to_ne_bytes()) {
+                Ok(8) => return Ok(()),
+                Ok(_) => return Err(io::ErrorKind::WriteZero.into()),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Takes the count and leaves it at zero, waiting while it is zero.
+    pub(crate) fn wait(&self) -> io::Result<u64> {
+        let mut count = [0u8; 8];
+        loop {
+            match (&self.file).read(&mut count) {
+                Ok(8) => return Ok(u64::from_ne_bytes(count)),
+                Ok(_) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
         }
     }
 }

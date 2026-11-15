@@ -1353,7 +1353,7 @@ impl<F: BlockFile> ShardDb<F> {
         });
         let mut pool = Pool::new(spawn, most)?;
         if let Some((attacher, batches)) = &self.worker_attach {
-            pool.set_attach(attacher.clone(), *batches);
+            pool.set_attach(Self::way_to(attacher)?, *batches);
         }
         self.trunk.set_pool(pool);
         self.write_reserved = reserved;
@@ -2121,6 +2121,17 @@ impl<F: BlockFile> ShardDb<F> {
         self.store.set_cache(pages);
     }
 
+    /// Another way to the device's issuer through `attacher`, for the maintenance workers' pool: a
+    /// kernel issuer's holds a descriptor of its own of the issuer's bell (`Attacher::try_clone`).
+    fn way_to(
+        attacher: &hyper_block::issuer::Attacher,
+    ) -> Result<hyper_block::issuer::Attacher, Error> {
+        attacher.try_clone().map_err(|e| Error::Io {
+            op: "make a way to the device's issuer",
+            detail: e.to_string(),
+        })
+    }
+
     /// Hands the store's writes to `issuer`, the device's, with up to `batches` out at once
     /// (`Store::attach`): a put that fills an extent goes on while the device writes it.
     pub fn attach(
@@ -2167,9 +2178,13 @@ impl<F: BlockFile> ShardDb<F> {
         // 0.23-1.09 s against 5-51 ms with the depth, benchmark-results/
         // mantle-depth-stall-repro-20261009); more cannot be in flight. A worker then holds at
         // most that many runs in write memory. The depth is one at least (`Issuer::start_for`).
-        let worker = (issuer.attacher(), issuer.depth());
+        let attacher = issuer.attacher().map_err(|e| Error::Io {
+            op: "make a way to the device's issuer",
+            detail: e.to_string(),
+        })?;
+        let worker = (attacher, issuer.depth());
         if let Some(pool) = self.trunk.pool_mut() {
-            pool.set_attach(worker.0.clone(), worker.1);
+            pool.set_attach(Self::way_to(&worker.0)?, worker.1);
         }
         self.worker_attach = Some(worker);
         self.owner_write_reserved = owner;

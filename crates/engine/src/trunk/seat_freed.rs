@@ -78,7 +78,7 @@ fn a_worker_is_free_once_its_result_is_sent() {
             })
     });
     let mut pool = Pool::new(spawn, 2).unwrap();
-    pool.set_attach(issuer.attacher(), 1);
+    pool.set_attach(issuer.attacher().unwrap(), 1);
     assert_eq!(pool.want(), 1, "a new pool's measured need is one worker");
     let job = Box::new(Job {
         work: Work::Index(Box::default()),

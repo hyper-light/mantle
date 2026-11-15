@@ -86,13 +86,23 @@ whether a node serves, since its listener binds before it enlists. Readiness dec
 S3 Service sends the pod requests (research/78 [4]).
 
 Requests equal limits, so the pod is Guaranteed and its cgroup's `memory.max` is the memory the
-node derives its budgets within (node.md §1.4). The chart's 2 GiB holds a founder's floor with room
-past it: a founder of the KIND cell's statements (a 1 GiB volume, three founders) served under a
-2 GiB ceiling on one CPU derived a floor of 882,877,159 bytes, its objects' 83,513,198, volumes'
-147,045,216, engines' 822,800, ranges' 268,862,970, log's 225,853,540, transport's 70,796,203 and
-threads' 85,983,232, the rest its indexes' and engines' shares (measured 2026-11-03 on adacachy,
-`taskset -c 0`, `memory=2G`; the ceiling stands in for the cgroup's limit, which the allowance
-takes alike). The pods start `Parallel`: a cell needs a majority
+node derives its budgets within (node.md §1.4). That memory is the node's own statement of what it
+needs, never a figure the chart picks: `mantle derive CONFIG`, run on the machine a founder will
+run on, measures its devices as `mantle serve` does and says what it derives, `memory.need` among
+it, and the operator gives the pod that (`resources.memory`, which the chart requires). The need is
+the node's floor at the most its devices can be measured to take, each one's reported queue, where
+calibration's ladder stops (`derive::deepest`), and every volume's index and engine's resident
+metadata whole for the objects the cell's volumes hold (`derive::need`). A floor at the measured
+depth would not do: calibration's knee moves with the host's load, and the KIND cell's pods on one
+CI runner's disk measured depths of 1, 4, 16, 64 and 316 from one to the next (diag runs
+43675803389 and 43676924862, 2026-11-14); the floor grows with the depth, so a pod given the floor
+another measured refuses to start when its own measures deeper, as one did at 316 against a picked
+2 GiB (kind-cell run 131575146397: a floor of 2,173,380,739 bytes, 681,574,400 of them the stacks of
+the threads its device's issuer then ran for its depth, which the kernel now holds on one thread on
+Linux, node.md §1.2). `scripts/kind-cell.sh` derives each founder's need from its pack, installed as
+its pod's init container installs it, with its volume on the host's disk the kind nodes' claims are
+on, and gives every pod the most of them. The CPU is the node's one shard (node.md §1.2), its other
+threads waiting on its devices. The pods start `Parallel`: a cell needs a majority
 of its founders to elect, and `OrderedReady` would wait for each to be ready before starting the
 next, which a founder alone never is. A required anti-affinity on `kubernetes.io/hostname` puts
 each founder on a Kubernetes node of its own, its failure domain. SIGTERM begins the orderly stop,

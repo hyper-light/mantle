@@ -2947,7 +2947,10 @@ impl<F: BlockFile> Store<F> {
     where
         F: 'static,
     {
-        self.attach_through(&issuer.attacher(), batches)
+        let attacher = issuer
+            .attacher()
+            .map_err(|e| io("make a way to the device's issuer", e))?;
+        self.attach_through(&attacher, batches)
     }
 
     /// [`Self::attach`] through an owned way to the issuer: a maintenance worker's store, on

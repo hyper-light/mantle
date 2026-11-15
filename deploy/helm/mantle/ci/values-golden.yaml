@@ -1,3 +1,7 @@
 # The values the golden render is made with (scripts/check-chart.sh): the chart's defaults under a
-# fixed name, so `helm template` is deterministic byte for byte.
+# fixed name, so `helm template` is deterministic byte for byte, and the memory a node needs, which
+# the chart takes from its operator: here what `mantle derive` said a KIND cell founder needs
+# (`memory.need`) on a disk reporting a queue of 316 (2026-11-14), standing for any.
 fullnameOverride: mantle
+resources:
+  memory: "1761692335"

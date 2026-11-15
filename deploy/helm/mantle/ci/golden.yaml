@@ -135,10 +135,10 @@ spec:
               drop: ["ALL"]
           resources:
             requests:
-              memory: 2Gi
+              memory: 1761692335
               cpu: 1
             limits:
-              memory: 2Gi
+              memory: 1761692335
               cpu: 1
           readinessProbe:
             exec:

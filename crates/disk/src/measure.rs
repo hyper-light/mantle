@@ -2,10 +2,14 @@
 //!
 //! A [`Job`] issues fixed-size transfers against a [`DeviceFile`] at a fixed depth (transfers
 //! in flight at once), bounded by an operation count and, when it has one, a wall-clock
-//! budget, and records each transfer's latency. Depth is kept by a [`Pool`] of blocking
-//! workers issuing positional I/O, the portable path mantle's I/O takes where the platform has
-//! no asynchronous interface the device can use; a measurement describes the path mantle will
-//! use, not the device in the abstract (docs/design/measurement.md §8).
+//! budget, and records each transfer's latency. A measurement describes the path mantle will
+//! use, not the device in the abstract (docs/design/measurement.md §8), so the depth is kept as
+//! the device's issuer keeps it: on Linux, over a file opened for direct I/O, by the kernel,
+//! each transfer a batch of its own through native AIO on the calling thread
+//! (`hyper_block::aio::AioFile`), as the node's issuer holds its depth with no thread a transfer
+//! (`hyper_block::issuer::Issuer::start_device`); elsewhere, and over a buffered file, by a
+//! [`Pool`] of blocking workers issuing positional I/O, the portable path mantle's I/O takes where
+//! the platform has no asynchronous interface the device can use.
 //!
 //! A pool's workers are started once and reused across jobs: each has a channel of its own
 //! that its job arrives on, and is woken alone; none waits at a latch, because a worker that
@@ -33,6 +37,8 @@ use std::time::{Duration, Instant};
 use crate::histogram::Histogram;
 use hyper_block::DiskError;
 use hyper_block::buf::AlignedBuf;
+#[cfg(target_os = "linux")]
+use hyper_block::file::Caching;
 use hyper_block::file::DeviceFile;
 use hyper_block::threads::{self, Reservation};
 
@@ -259,7 +265,9 @@ impl Pool<'_, '_> {
         Ok(())
     }
 
-    /// Runs `job` on the first `job.depth` workers, starting those the pool lacks.
+    /// Runs `job`: on Linux over a direct file with its depth held by the kernel ([`in_kernel`]),
+    /// starting no worker; elsewhere on the first `job.depth` workers, starting those the pool
+    /// lacks. A depth past the pool's size is refused either way, before anything is issued.
     pub fn run(&mut self, job: &Job) -> Result<JobResult, DiskError> {
         let align = self.file.alignment();
         let block = u64::try_from(job.block).map_err(|_| invalid("block size"))?;
@@ -283,6 +291,13 @@ impl Pool<'_, '_> {
         }
         if job.budget.is_none() && job.max_ops == u64::MAX {
             return Err(invalid("a job needs a budget or an operation count"));
+        }
+        #[cfg(target_os = "linux")]
+        if self.file.caching() == Caching::Direct {
+            if job.depth > self.most {
+                return Err(invalid("a job deeper than the measurement's bound"));
+            }
+            return in_kernel(self.file, job, block, slots);
         }
         self.grow(job.depth)?;
         // Every worker waits for its next job, so nothing reads the counters as they reset.
@@ -358,6 +373,115 @@ impl Pool<'_, '_> {
         self.reserved.clear();
         if unwound_any { Err(unwound()) } else { Ok(()) }
     }
+}
+
+/// `job` with its depth held by the kernel: each transfer a batch of its own through native AIO
+/// on this thread (`hyper_block::aio::AioFile`), `job.depth` of them out at once, each issued again
+/// as one is answered until the job's count or budget ends it, as the pool's workers issue theirs:
+/// its operations claimed before each is issued, its offsets drawn the same way, every write's
+/// blocks stamped afresh, its latency from the transfer's hand-over to its answer, and the
+/// transfers out sampled at each answer. Its time runs from the first hand-over to the last answer.
+/// Linux and a direct file only: the kernel makes a buffered transfer inside io_submit.
+#[cfg(target_os = "linux")]
+fn in_kernel(file: &DeviceFile, job: &Job, block: u64, slots: u64) -> Result<JobResult, DiskError> {
+    let mut aio = hyper_block::aio::AioFile::new(file.try_clone()?, job.depth, job.depth)?;
+    let align = file.alignment();
+    let unit = align.get();
+    let mut rng = SplitMix64::new(job.seed);
+    // Each transfer's buffer and the vector it goes in, given back with its answer: the job
+    // allocates them once, before its first transfer.
+    let mut free: Vec<Vec<(AlignedBuf, u64)>> = Vec::with_capacity(job.depth);
+    for _ in 0..job.depth {
+        let mut buf = AlignedBuf::zeroed(job.block, align)?;
+        if job.pattern.writes() {
+            rng.fill(buf.as_mut_capacity());
+        }
+        buf.set_len(job.block)?;
+        free.push(vec![(buf, 0)]);
+    }
+    // When each batch out was handed over, by its number: at most the depth.
+    let mut out: Vec<(u64, Instant)> = Vec::with_capacity(job.depth);
+    let mut latency = Histogram::new();
+    let (mut issued, mut next, mut ops, mut sampled, mut most) = (0u64, 0u64, 0u64, 0u64, 0usize);
+    let began = Instant::now();
+    let deadline = job.budget.and_then(|budget| began.checked_add(budget));
+    let mut ended = began;
+    loop {
+        while let Some(mut batch) = free.pop() {
+            if issued >= job.max_ops || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                free.push(batch);
+                break;
+            }
+            issued = issued.saturating_add(1);
+            let slot = if job.pattern.random() {
+                rng.below(slots)
+            } else {
+                let slot = next.checked_rem(slots).unwrap_or(0);
+                next = next.saturating_add(1);
+                slot
+            };
+            let Some((buf, at)) = batch.first_mut() else {
+                return Err(invalid("a transfer's batch lost its buffer"));
+            };
+            if job.pattern.writes() {
+                // A fresh random word at the head of each of the device's blocks, as a worker's.
+                for block in buf.as_mut_slice().chunks_mut(unit) {
+                    let word = rng.next_u64().to_le_bytes();
+                    for (dst, src) in block.iter_mut().zip(word) {
+                        *dst = src;
+                    }
+                }
+            }
+            // In range: `slot < slots`, so the offset ends within `base + span`, which `run`
+            // checked.
+            *at = slot.saturating_mul(block).saturating_add(job.base);
+            let handed = Instant::now();
+            let number = if job.pattern.writes() {
+                aio.submit_writes(batch, job.sync_each)
+            } else {
+                aio.submit_reads(batch)
+            }
+            .map_err(|(e, _)| e)?;
+            out.push((number, handed));
+        }
+        if aio.out() == 0 {
+            break;
+        }
+        // The batches out as this one is answered: the transfers in flight as it completed.
+        let in_flight = aio.out();
+        let (number, answer) = aio.answer()?;
+        let answered = Instant::now();
+        let at = out
+            .iter()
+            .position(|&(n, _)| n == number)
+            .ok_or_else(|| invalid("an answer to a batch never handed over"))?;
+        let (_, handed) = out.swap_remove(at);
+        let batch = answer?;
+        latency.record(
+            u64::try_from(answered.saturating_duration_since(handed).as_nanos())
+                .unwrap_or(u64::MAX),
+        );
+        ops = ops.saturating_add(1);
+        sampled = sampled.saturating_add(u64::try_from(in_flight).unwrap_or(u64::MAX));
+        most = most.max(in_flight);
+        ended = answered;
+        free.push(batch);
+    }
+    Ok(JobResult {
+        ops,
+        bytes: ops.saturating_mul(block),
+        elapsed: ended.saturating_duration_since(began),
+        latency,
+        depth: job.depth,
+        // Counts of a bounded job are far below 2^53.
+        achieved: if ops == 0 {
+            0.0
+        } else {
+            sampled as f64 / ops as f64
+        },
+        achieved_max: most,
+    })
 }
 
 /// A worker: takes each job from its own channel, runs it, and answers. A job's panic, which
@@ -482,15 +606,18 @@ mod tests {
     use hyper_block::file::CachingRequest;
 
     fn scratch(len: u64) -> (tempfile::TempDir, DeviceFile) {
+        scratch_as(len, CachingRequest::PreferDirect)
+    }
+
+    /// A scratch file through the page cache: its jobs run on the pool's workers on every platform.
+    fn buffered(len: u64) -> (tempfile::TempDir, DeviceFile) {
+        scratch_as(len, CachingRequest::Buffered)
+    }
+
+    fn scratch_as(len: u64, request: CachingRequest) -> (tempfile::TempDir, DeviceFile) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("probe");
-        let file = DeviceFile::open(
-            &path,
-            true,
-            CachingRequest::PreferDirect,
-            Alignment::new(4096).unwrap(),
-        )
-        .unwrap();
+        let file = DeviceFile::open(&path, true, request, Alignment::new(4096).unwrap()).unwrap();
         file.preallocate(len).unwrap();
         (dir, file)
     }
@@ -530,7 +657,7 @@ mod tests {
     /// deepest step, and each job still performs exactly its operations.
     #[test]
     fn a_pool_is_reused_and_grows_only_as_deep_as_asked() {
-        let (_dir, file) = scratch(1 << 20);
+        let (_dir, file) = buffered(1 << 20);
         with_pool(&file, 8, |pool| {
             for (depth, held) in [(1, 1), (4, 4), (2, 4), (8, 8), (3, 8)] {
                 let r = pool.run(&job(Pattern::RandomRead, depth, 40))?;
@@ -546,7 +673,7 @@ mod tests {
     /// before any worker starts.
     #[test]
     fn a_depth_past_the_budget_starts_no_thread() {
-        let (_dir, file) = scratch(1 << 20);
+        let (_dir, file) = buffered(1 << 20);
         let err = with_pool(&file, 4, |pool| {
             let r = pool.run(&job(Pattern::RandomRead, 5, 1));
             assert_eq!(pool.workers(), 0);
@@ -562,6 +689,35 @@ mod tests {
         })
         .unwrap_err();
         assert!(matches!(err, DiskError::Threads { asked, .. } if asked == past));
+    }
+
+    /// On Linux a direct file's jobs hold their depth in the kernel: a ladder of depths runs on
+    /// the calling thread alone, no worker started, each job exactly its operations at no more
+    /// than its depth in flight; a depth past the bound is refused. The calibration that measured
+    /// depths of 1 to 316 on CI runners' disks ran a thread for each transfer in flight.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_direct_files_jobs_hold_their_depth_in_the_kernel_on_no_thread() {
+        let (_dir, file) = scratch(1 << 20);
+        if file.caching() != hyper_block::file::Caching::Direct {
+            // tmpfs among others takes no direct I/O: its jobs are the pool's (the test above).
+            return;
+        }
+        with_pool(&file, 8, |pool| {
+            for depth in [1, 4, 8] {
+                for pattern in [Pattern::RandomRead, Pattern::SequentialWrite] {
+                    let r = pool.run(&job(pattern, depth, 40))?;
+                    assert_eq!(r.ops, 40);
+                    assert_eq!(r.latency.count(), 40);
+                    assert!((1..=depth).contains(&r.achieved_max), "depth {depth}");
+                    assert_eq!(pool.workers(), 0, "no worker for depth {depth}");
+                }
+            }
+            assert!(pool.run(&job(Pattern::RandomRead, 9, 1)).is_err());
+            assert_eq!(pool.workers(), 0);
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]

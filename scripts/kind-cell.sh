@@ -76,9 +76,29 @@ echo "kind-cell: the founder its peers dial is $dialed"
 mantle pack /work/cell /work/cell.pack
 kubectl -n "$namespace" create secret generic mantle-harness-cell --from-file=cell="$work/cell.pack"
 
+# What each founder's pod is given (docs/design/kubernetes.md §5): what its node needs, as the
+# image's `mantle derive` says it for the founder's pack installed as its pod installs it, its
+# volume on this host's disk, the one the kind nodes' claims are on. `memory.need` is the node's
+# floor at the most its device can be measured to take and its wants whole, so a pod holds what its
+# node derives whatever its own calibration measures. The most of the founders' needs is the
+# chart's, which gives every pod the same.
+mkdir "$work/derive-volume"
+need=0
+for n in $(seq 0 $((founders - 1))); do
+  mantle install "/work/founder-$n" "/work/derive-$n" >/dev/null
+  founder="$(docker run --rm --user "$(id -u):$(id -g)" --volume "$work:/work" \
+    --volume "$work/derive-volume:/volume" mantle:kind derive "/work/derive-$n/config" \
+    | awk '$1 == "basis" && $2 == "memory.need" { print $4 }')"
+  test -n "$founder"
+  if [ "$founder" -gt "$need" ]; then
+    need="$founder"
+  fi
+done
+echo "kind-cell: each founder's pod is given $need bytes, its node's memory.need"
+
 helm install "$release" deploy/helm/mantle --namespace "$namespace" \
   --set fullnameOverride="$release" --set image.repository=mantle --set image.tag=kind \
-  --set storage.volumeSize=2Gi --wait --timeout 20m
+  --set storage.volumeSize=2Gi --set-string resources.memory="$need" --wait --timeout 20m
 kubectl -n "$namespace" get pods -o wide
 placed="$(kubectl -n "$namespace" get pods -l app.kubernetes.io/instance="$release" -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' | sort -u | wc -l)"
 if [ "$placed" -ne "$founders" ]; then

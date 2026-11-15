@@ -123,6 +123,14 @@ enum Command {
         /// The node's configuration: the operator's keys only, one `key = value` a line.
         config: PathBuf,
     },
+    /// Say what `mantle serve` derives for the node, a `basis` line each, without serving it
+    /// (mantle_node::process::derive_stated): its devices measured, or their kept profiles taken
+    /// while they match, and kept for its first `mantle serve`, as that measures them. Its
+    /// `memory.need` is what to give the node's pod (docs/design/kubernetes.md §3).
+    Derive {
+        /// The node's configuration: the operator's keys only, one `key = value` a line.
+        config: PathBuf,
+    },
     /// Whether the node whose directory is DIR is ready to serve: it exits 0 while a living process
     /// of the node holds the readiness lock it takes once the cell's root range enlisted it in its
     /// run, 1 otherwise, before it enlists or once it has ended, as a supervisor's readiness check
@@ -744,6 +752,9 @@ fn main() -> ExitCode {
             mantle_node::process::answer_counts(bench_doors::counts_line);
             return exit(mantle_node::process::serve_stated(config).map_err(|e| e.to_string()));
         }
+        Command::Derive { config } => {
+            return exit(mantle_node::process::derive_stated(config).map_err(|e| e.to_string()));
+        }
         _ => {}
     }
     // An object command writes its lines a lock at a time: a copy to standard output writes its
@@ -776,6 +787,7 @@ fn main() -> ExitCode {
         }
         Command::Node { .. }
         | Command::Serve { .. }
+        | Command::Derive { .. }
         | Command::Mb { .. }
         | Command::Rb { .. }
         | Command::Ls { .. }

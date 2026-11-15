@@ -428,6 +428,9 @@ pub(crate) enum Line {
         /// While a command or read the node asks of the range itself waits paused, the longest
         /// the pause may last (`Status::asking`, else zero).
         asking: Duration,
+        /// The heartbeats taken from the peers not yet judged (`Status::measuring`, else zero):
+        /// what moves while the node measures its links.
+        heard: u64,
     },
     /// Whether the node waits on its own device (`Node::held`), said as it changes.
     Held(bool),
@@ -563,6 +566,7 @@ pub(crate) fn parse(line: &str) -> Option<Line> {
             reconnect,
             measuring,
             asking,
+            heard,
         ] => Some(Line::Status {
             group: u128::from_str_radix(group, 16).ok()?,
             term: term.parse().ok()?,
@@ -573,13 +577,18 @@ pub(crate) fn parse(line: &str) -> Option<Line> {
             reconnect: Duration::from_nanos(reconnect.parse().ok()?),
             measuring: Duration::from_nanos(measuring.parse().ok()?),
             asking: Duration::from_nanos(asking.parse().ok()?),
+            heard: heard.parse().ok()?,
         }),
         _ => None,
     }
 }
 
+/// A status's movement: its term, leader, commit, applied index, reconnect bound, measuring
+/// interval, asking bound and the heartbeats taken while measuring.
+pub(crate) type Movement = (u64, u64, u64, u64, Duration, Duration, Duration, u64);
+
 /// What of a status is movement: all of it.
-pub(crate) fn movement(line: &Line) -> Option<(u64, u64, u64, u64, Duration, Duration, Duration)> {
+pub(crate) fn movement(line: &Line) -> Option<Movement> {
     match line {
         Line::Status {
             term,
@@ -589,9 +598,10 @@ pub(crate) fn movement(line: &Line) -> Option<(u64, u64, u64, u64, Duration, Dur
             reconnect,
             measuring,
             asking,
+            heard,
             ..
         } => Some((
-            *term, *leader, *commit, *applied, *reconnect, *measuring, *asking,
+            *term, *leader, *commit, *applied, *reconnect, *measuring, *asking, *heard,
         )),
         Line::Bound(..)
         | Line::Replaced(..)

@@ -47,7 +47,7 @@
 //!
 //! **Its talk** is lines. On standard output: `bound QUIC PLANE` once the node listens, and
 //! `volume ID` for each volume it holds, its 128-bit id in hex; then, for each range it hosts,
-//! `status GROUP TERM LEADER COMMIT APPLIED PATIENCE_NS RECONNECT_NS MEASURING_NS ASKING_NS HELD`,
+//! `status GROUP TERM LEADER COMMIT APPLIED PATIENCE_NS RECONNECT_NS MEASURING_NS ASKING_NS HEARD`,
 //! the group in hex, each time one of the term, leader, commit or applied index
 //! moves, its redials to a peer back off further or start over, or the heartbeats it takes from
 //! peers not yet judged move (`Status::measuring`): how long the node states it may go
@@ -58,8 +58,11 @@
 //! some peer is not yet judged, the longest its stream's heartbeats go between
 //! (`Status::measuring_for`, else 0); while a command or read the node asks of the range itself
 //! waits paused, the longest the pause may last, its backoff (`Status::asking`, else 0), said each
-//! time it changes; and 1 while the node waits on its own device, said each time that changes
-//! (`Status::held`, else 0). After each status, `log FLUSHING_NS LONGEST_NS`: how
+//! time it changes; and the heartbeats taken from the peers not yet judged (`Status::measuring`,
+//! 0 once every peer is), so a watcher comparing a range's lines sees them move as the node
+//! measures its links. On a line of its own, `held 1` while the node waits on its own device and
+//! `held 0` once it no longer does, said each time that changes. After each status,
+//! `log FLUSHING_NS LONGEST_NS`: how
 //! long the log's flush has been out (0 when none is) and the longest an update has waited for
 //! its commit (hyper-log's `LogStats`), since the node moves only as its writes become durable;
 //! `room COMPACTIONS WAITS` as either moves: the node's rounds of compaction, each asked when the
@@ -2417,8 +2420,8 @@ fn status_line(lines: &mut String, group: u128, now: &Status) -> std::fmt::Resul
     let asking = now.asking.map_or(0, |a| a.as_nanos());
     writeln!(
         lines,
-        "status {group:x} {} {} {} {} {patience} {reconnect} {measuring} {asking}",
-        now.term, now.leader, now.commit, now.applied
+        "status {group:x} {} {} {} {} {patience} {reconnect} {measuring} {asking} {}",
+        now.term, now.leader, now.commit, now.applied, now.measuring
     )
 }
 
@@ -2497,7 +2500,7 @@ mod tests {
             lines,
             "link 3 keyed 4 1 2 trusted Closed\n\
              link 3 unkeyed 4 1 2 suspect none\n\
-             status 2a 7 2 40 39 1500000000 0 250000000 9\n"
+             status 2a 7 2 40 39 1500000000 0 250000000 9 0\n"
         );
         hyper_measure::alloc::begin();
         turn(&mut lines);
@@ -2506,6 +2509,48 @@ mod tests {
             (counts.allocations, counts.reallocations, counts.bytes),
             (0, 0, 0)
         );
+    }
+
+    /// A status said because the heartbeats taken from peers not yet judged moved, and nothing else
+    /// did, says what moved: a watcher that compares a range's lines, as one must to pass over the
+    /// status a process started again says first, sees the node measure its links. Before, both
+    /// lines read alike while a peer's interval stayed: a node started again on a loaded host took
+    /// 28 heartbeats from each peer over 23 s, saying a status at each, and the cell's watch, finding
+    /// each the same as the last, judged it still for its quiet period (CI windows-x86_64, run
+    /// 43231201498; jupiter, 7 of 86 runs under load).
+    #[test]
+    fn a_status_said_for_heartbeats_taken_while_measuring_says_them() {
+        let status = |measuring| Status {
+            term: 2,
+            leader: 3,
+            commit: 8,
+            applied: 9,
+            heartbeats: measuring,
+            judged: false,
+            measuring,
+            measuring_for: Some(Duration::from_nanos(822_549_396)),
+            patience: None,
+            snapshots_sent: 0,
+            snapshots_taken: 0,
+            stalled: false,
+            liveness_waits: 0,
+            compactions: 0,
+            in_flight: 0,
+            writes: hyper_durable::Writes::default(),
+            fenced: false,
+            sends: crate::node::Sends::default(),
+            received: crate::node::Received::default(),
+            reconnect: Some(Duration::from_nanos(4_003_992_800)),
+            asking: None,
+            reads_held: 0,
+            reads_confirming: 0,
+            reading: 0,
+            commanded: 0,
+        };
+        let (mut before, mut after) = (String::new(), String::new());
+        status_line(&mut before, 0x2a, &status(54)).unwrap();
+        status_line(&mut after, 0x2a, &status(56)).unwrap();
+        assert_ne!(before, after, "two statuses of a node measuring read alike");
     }
 
     #[test]

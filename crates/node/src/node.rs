@@ -1670,6 +1670,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.driver.flush()?;
         mark(10);
         let total = crate::diag_trace::now().saturating_sub(t0);
+        crate::diag_trace::turned(t0.saturating_sub(w0), total);
         if total > 2_000_000 {
             crate::diag_trace::ev(crate::diag_trace::TURN, total, t0.saturating_sub(w0), 0);
             for (i, p) in parts.iter().enumerate() {

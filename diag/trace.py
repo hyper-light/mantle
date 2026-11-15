@@ -25,6 +25,9 @@ def load(d):
         with open(f) as fh:
             head = fh.readline().strip()
             p['heads'].append(head)
+            m = re.search(r'at (\d+) label \S+ events \d+ dropped \d+ turns (\d+) busy_ns (\d+) wait_ns (\d+) status utime (\d+) stime (\d+)', head)
+            if m:
+                p.setdefault('windows', []).append(tuple(int(x) for x in m.groups()))
             for line in fh:
                 if line.startswith('e '):
                     _, t, k, a, b, c = line.split()
@@ -148,6 +151,18 @@ def main(d, only=None):
                         stages['job total'].append(ev[3] / 1e6)
         if stages:
             print("  job stages (ms): " + "; ".join(f"{k} n {len(v)} p50 {q(v,.5):.2f} p90 {q(v,.9):.2f}" for k, v in sorted(stages.items())))
+        # each node's loop and CPU over the phase: the windows dumped at its counts around it
+        for i, pid in enumerate(nodes):
+            ws = sorted(procs[pid].get('windows', []))
+            # the window that ends just after the phase end holds the phase's turns
+            after = [w for w in ws if w[0] >= e]
+            before = [w for w in ws if w[0] <= s + 1]
+            if after and before:
+                w1, w0 = after[0], before[-1]
+                el_s = (w1[0] - w0[0]) / 1e9
+                ticks = (w1[4] + w1[5]) - (w0[4] + w0[5])
+                cpu = ticks / 100.0
+                print(f"  node{i} loop: turns {w1[1]} busy {w1[2]/1e6:.0f}ms wait {w1[3]/1e6:.0f}ms (loop busy {100*w1[2]/max(1,w1[2]+w1[3]):.0f}%); process CPU {cpu:.2f}s over {el_s:.2f}s = {cpu/el_s if el_s else 0:.2f} cores")
         # node notes near the phase end
         for pid in nodes:
             ns = [(t, txt) for t, txt in procs[pid]['notes'] if e - 5e9 <= t <= e + 5e9]

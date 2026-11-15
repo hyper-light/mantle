@@ -56,6 +56,20 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 static WINDOW: AtomicU64 = AtomicU64::new(0);
 static LOG: Mutex<Vec<[u64; 5]>> = Mutex::new(Vec::new());
 static NOTES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// The node loop's turns since the last window, the time they ran and the time they waited.
+pub static TURNS: AtomicU64 = AtomicU64::new(0);
+pub static BUSY_NS: AtomicU64 = AtomicU64::new(0);
+pub static WAIT_NS: AtomicU64 = AtomicU64::new(0);
+
+/// One turn of the node's loop, `waited` then `ran` nanoseconds.
+pub fn turned(waited: u64, ran: u64) {
+    if !on() {
+        return;
+    }
+    TURNS.fetch_add(1, Ordering::Relaxed);
+    BUSY_NS.fetch_add(ran, Ordering::Relaxed);
+    WAIT_NS.fetch_add(waited, Ordering::Relaxed);
+}
 
 /// Whether the trace is on.
 pub fn on() -> bool {
@@ -162,11 +176,14 @@ pub fn dump(label: &str) {
         let mut f = std::io::BufWriter::new(f);
         let _ = writeln!(
             f,
-            "trace {n} pid {} at {} label {label} events {} dropped {} status {}",
+            "trace {n} pid {} at {} label {label} events {} dropped {} turns {} busy_ns {} wait_ns {} status {}",
             std::process::id(),
             now(),
             events.len(),
             DROPPED.swap(0, Ordering::SeqCst),
+            TURNS.swap(0, Ordering::SeqCst),
+            BUSY_NS.swap(0, Ordering::SeqCst),
+            WAIT_NS.swap(0, Ordering::SeqCst),
             status()
         );
         for line in notes {

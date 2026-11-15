@@ -145,7 +145,7 @@ def main(d, only=None):
             a = [x for x in logs if x[0] >= e]
             if a and b:
                 def kv(txt):
-                    f = txt.split()
+                    f = txt.split()[1:]
                     return {f[j]: int(f[j+1]) for j in range(0, len(f) - 1, 2) if f[j+1].isdigit()}
                 k0, k1 = kv(b[-1][1]), kv(a[0][1])
                 d = {k: k1.get(k, 0) - k0.get(k, 0) for k in k1}

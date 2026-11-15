@@ -1889,11 +1889,11 @@ impl<'a> Dispatch<'a> {
     fn new(lanes: Lanes, path: &'a Path) -> Self {
         let count = lanes.len();
         // News waits for a pool's workers, each its own duplicates; the kernel lanes take a file's
-        // news at once (`Lanes::duplicates`).
-        let told = if lanes.duplicates() == count {
-            count
-        } else {
-            0
+        // news at once (`Kernel::attach`, `Kernel::detach`), and have none waiting.
+        let told = match &lanes {
+            Lanes::Pool(_) => count,
+            #[cfg(target_os = "linux")]
+            Lanes::Kernel(_) => 0,
         };
         Self {
             idle: (0..count).rev().collect(),

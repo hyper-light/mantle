@@ -14,7 +14,7 @@
     clippy::cast_possible_truncation
 )]
 
-use hyper_block::buf::Alignment;
+use hyper_block::buf::{AlignedBuf, Alignment};
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::issuer::Issuer;
 
@@ -34,11 +34,12 @@ fn descriptors() -> usize {
 #[test]
 fn a_kernel_issuers_lanes_share_one_descriptor_a_file() {
     let dir = tempfile::tempdir().unwrap();
+    let align = Alignment::new(PAGE).unwrap();
     let file = DeviceFile::open(
         &dir.path().join("volume"),
         true,
         CachingRequest::PreferDirect,
-        Alignment::new(PAGE).unwrap(),
+        align,
     )
     .unwrap();
     file.preallocate(PAGE as u64).unwrap();
@@ -58,6 +59,22 @@ fn a_kernel_issuers_lanes_share_one_descriptor_a_file() {
             descriptors(),
             before,
             "a detach gives every descriptor back"
+        );
+        // Dropped with its reads out, the attachment's file is retired once they have ended.
+        let mut attached = issuer.attach(&file).unwrap();
+        let reads = (0..depth.min(2))
+            .map(|_| {
+                let mut buf = AlignedBuf::zeroed(PAGE, align).unwrap();
+                buf.set_len(PAGE).unwrap();
+                (buf, 0)
+            })
+            .collect();
+        attached.submit_reads(reads).unwrap();
+        drop(attached);
+        assert_eq!(
+            descriptors(),
+            before,
+            "a detach deferred for its transfers gives every descriptor back"
         );
         drop(issuer);
     }

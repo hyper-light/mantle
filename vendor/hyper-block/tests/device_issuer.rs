@@ -240,6 +240,29 @@ fn a_batch_past_the_lanes_waits_for_room_and_lands_whole() {
     }
 }
 
+/// An attachment dropped with its batch out is detached once the transfers its lanes took have
+/// ended: its drop returns, and the issuer serves the next attachment.
+#[test]
+fn an_attachment_dropped_with_its_batch_out_is_detached_once_its_transfers_end() {
+    let dir = tempfile::tempdir().unwrap();
+    // Two lanes for many reads: most wait for room when the attachment drops.
+    let issuer = Issuer::start_device(dir.path(), 2).unwrap();
+    let pages = 8 * PAGES;
+    let file = file(
+        dir.path(),
+        "dropped",
+        CachingRequest::PreferDirect,
+        (pages * PAGE) as u64,
+    );
+    let mut attached = issuer.attach(&file).unwrap();
+    let reads = (0..pages).map(|i| (empty(), (i * PAGE) as u64)).collect();
+    attached.submit_reads(reads).unwrap();
+    drop(attached);
+    let mut again = issuer.attach(&file).unwrap();
+    again.write(writes(11, 0), true).unwrap();
+    assert_eq!(read_page(&file, 0), vec![fill(0, 11); PAGE]);
+}
+
 /// A file with no open file of its own for the kernel to transfer (one in memory) is refused by
 /// a kernel issuer, typed, before any duplicate of it is made.
 #[test]

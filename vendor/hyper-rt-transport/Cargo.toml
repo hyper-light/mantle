@@ -34,6 +34,10 @@ libmimalloc-sys = { version = "=0.1.49", default-features = false, features = ["
 hyper-sim = { path = "../hyper-sim" }
 # Certificates for the tests' mutual TLS (hyper-transport's own dev-dependency).
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+# The transport tests' common helpers hold a bare hyper-quic connection, its datagrams `BytesMut`
+# (hyper-transport's own dependencies).
+hyper-quic = { path = "../hyper-quic" }
+bytes = "1"
 
 # A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside any consumer workspace.
 [workspace]

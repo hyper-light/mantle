@@ -79,8 +79,8 @@ kubectl -n "$namespace" create secret generic mantle-harness-cell --from-file=ce
 # What each founder's pod is given (docs/design/kubernetes.md §5): what its node needs, as the
 # image's `mantle derive` says it for the founder's pack installed as its pod installs it, its
 # volume on this host's disk, the one the kind nodes' claims are on. `memory.need` is the node's
-# floor at the most its device can be measured to take and its wants whole, so a pod holds what its
-# node derives whatever its own calibration measures. The most of the founders' needs is the
+# floor at the most its device can be measured to take, with one stock client's operations at once,
+# and its wants whole, so a pod holds what its node derives whatever its own calibration measures. The most of the founders' needs is the
 # chart's, which gives every pod the same.
 mkdir "$work/derive-volume"
 need=0

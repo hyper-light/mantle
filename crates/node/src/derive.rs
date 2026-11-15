@@ -1660,8 +1660,13 @@ pub fn derive(
         0
     };
     // What an orchestrator gives the node: its floor at the most its devices can be measured to
-    // take with its operations' first alone, as the operations hold what the data's wants leave
-    // (research/87 §4, rule D), and every want whole (`need`).
+    // take, with as many operations as one stock client asks of an S3 endpoint at once
+    // (`listener::STOCK_CLIENT`), the least that never leaves a default client's transfers
+    // waiting on a connection the listener does not serve, or the first alone where the node
+    // serves no S3 (research/87 §4, rule D: past those the operations hold what the data's wants
+    // leave), and every want whole (`need`). With the first alone, a pod given its need and
+    // measuring its device's queue ran one operation, its listener served one connection, and
+    // boto3's other parts timed out writing their bodies (kind-cell, CI run 43760462414).
     let deepest_floor = {
         let deep = wholes(&stated, measured, deepest)?;
         let deep_depths: Vec<usize> = devices_of(measured, |facts| {
@@ -1671,9 +1676,26 @@ pub fn derive(
         .map(|(_, depth)| depth)
         .collect();
         let deep_threads = threads(&deep_depths, &scrubs).ok_or(overflow("the node's threads"))?;
+        let served = if hosts && stated.s3.is_some() {
+            usize::try_from(crate::listener::STOCK_CLIENT)
+                .map_err(|_| overflow("a stock client"))?
+        } else {
+            usize::from(hosts)
+        };
+        // One operation of the largest blocks and the rest at the least one holds (`operations`).
+        let served_bytes = if hosts {
+            let rest = u64::try_from(served.saturating_sub(1))
+                .ok()
+                .and_then(|rest| rest.checked_mul(charges.least()))
+                .and_then(|rest| rest.checked_add(charges.most()))
+                .ok_or(overflow("the operations' bytes"))?;
+            crate::derive::objects(&gateway(served, rest)?, &schemes)?
+        } else {
+            0
+        };
         classes_of(
-            &held_at(usize::from(hosts), deep.transfers)?,
-            first,
+            &held_at(served, deep.transfers)?,
+            served_bytes,
             deep.bytes,
             stacks(deep_threads).ok_or(overflow("the threads' stacks"))?,
         )?
@@ -2431,9 +2453,10 @@ fn say_need(said: &mut Said, need: u64) {
         need,
         Kind::Derived,
         "what to give the node, an orchestrator's limit for its pod: its floor at the most its \
-         devices can be measured to take, each one's queue (derive::deepest), and every volume's \
-         index and engine's resident metadata whole for the objects the cell's volumes hold \
-         (derive::need)",
+         devices can be measured to take, each one's queue (derive::deepest), with as many \
+         operations as one stock client asks of its S3 endpoint at once (listener::STOCK_CLIENT; \
+         the first alone with no endpoint), and every volume's index and engine's resident \
+         metadata whole for the objects the cell's volumes hold (derive::need)",
     );
 }
 
@@ -3649,6 +3672,42 @@ mod tests {
             said_bytes(&short, "volume.1.index_bytes") < index_want,
             "a byte short of the need, the index's share falls short of its want"
         );
+    }
+
+    /// A node with an S3 endpoint needs as many operations as one stock client asks at once
+    /// (`listener::STOCK_CLIENT`): given its need, at its device's queue it runs at least that many,
+    /// so its listener serves every connection a default AWS CLI or boto3 opens, and its index
+    /// holds its whole want; a byte short, the index stays whole, the data first (research/87 §4
+    /// rule D). Given the first operation alone, a pod at its device's queue served one connection
+    /// and boto3's parts timed out (kind-cell).
+    #[test]
+    fn a_node_given_its_need_serves_one_stock_clients_connections() {
+        let s3 = |ceiling| Stated {
+            ceiling,
+            s3: Some(crate::process::S3Stated {
+                listen: "127.0.0.1:7480".parse().unwrap(),
+                region: "us-east-1".into(),
+                names: Vec::new(),
+                certificate: at("/node/s3/cert.der"),
+                key: at("/node/s3/key.der"),
+                access: Vec::new(),
+            }),
+            ..stated(1)
+        };
+        let need = said_bytes(
+            &derive(s3(None), &deep(316, 1), &mut fresh).unwrap(),
+            "memory.need",
+        );
+        let index_want = said_bytes(
+            &derive(s3(None), &deep(316, 316), &mut fresh).unwrap(),
+            "volume.1.index_bytes",
+        );
+        let stock = crate::listener::STOCK_CLIENT;
+        let given = derive(s3(Some(need)), &deep(316, 316), &mut fresh).unwrap();
+        assert!(said_bytes(&given, "gateway.objects") >= stock);
+        assert_eq!(said_bytes(&given, "volume.1.index_bytes"), index_want);
+        let short = derive(s3(Some(need - 1)), &deep(316, 316), &mut fresh).unwrap();
+        assert_eq!(said_bytes(&short, "volume.1.index_bytes"), index_want);
     }
 
     /// The floor's allowance is a stated ceiling where one is: the node refuses one past what the OS

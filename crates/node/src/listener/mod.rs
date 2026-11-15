@@ -40,7 +40,7 @@ pub use conn::PIECE;
 /// The connections one stock client opens to an endpoint at once by default, the AWS CLI's
 /// `max_concurrent_requests` and botocore's `max_pool_connections`, ten each (the AWS CLI's S3
 /// configuration reference; botocore's `Config`).
-const STOCK_CLIENT: u64 = 10;
+pub(crate) const STOCK_CLIENT: u64 = 10;
 
 /// What one connection holds with a request in flight, the host holding the pieces of its body it
 /// took: measured by a counting allocator on the listener's thread (`tests/listener_memory.rs`),

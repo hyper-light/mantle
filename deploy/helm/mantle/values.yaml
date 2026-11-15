@@ -43,7 +43,8 @@ resources:
   # derives its budgets within (`memory.max`, node.md §1.4), and the pod is Guaranteed.
   # The memory is what the node needs, in bytes, as `mantle derive` says it on the machine the
   # founders run on (`memory.need`: the node's floor at the most its devices can be measured to
-  # take, and its indexes' and engines' wants whole; docs/design/kubernetes.md §5): the chart
+  # take with one stock client's operations at once, and its indexes' and engines' wants whole;
+  # docs/design/kubernetes.md §5): the chart
   # takes no memory it is not given.
   memory: ""
   # The node's one shard (`process::runtime`: a node runs its replicas on one hyper-rt shard,

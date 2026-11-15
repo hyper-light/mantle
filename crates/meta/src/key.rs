@@ -465,6 +465,9 @@ const NAMED: u8 = 4;
 /// Block-layer rows under a block's ID, after its header.
 const CHUNK: u8 = 2;
 const ORIGIN: u8 = 3;
+/// A block's kept places: each a volume beside the chunk's own that holds the same chunk, kept
+/// for when that volume is reachable again (docs/design/repair.md §3).
+const KEPT: u8 = 5;
 
 /// The key of a file's header row.
 pub fn file_header(file: u128) -> Vec<u8> {
@@ -506,6 +509,40 @@ pub fn block_chunk(block: u128, index: u16) -> Vec<u8> {
 /// The key of the row recording where a block came from.
 pub fn block_origin(block: u128) -> Vec<u8> {
     id_row(block, ORIGIN)
+}
+
+/// The key of the row saying volume `volume` keeps a chunk of `block` beside its chunk row's
+/// place (docs/design/repair.md §3): keyed by the volume, as a block holds at most one chunk on a
+/// volume.
+pub fn block_kept(block: u128, volume: u128) -> Vec<u8> {
+    id_row_and(block, KEPT, &volume.to_be_bytes())
+}
+
+/// The first key of `block`'s kept places and a key past the last.
+pub fn block_kept_rows(block: u128) -> (Vec<u8>, Vec<u8>) {
+    (id_row(block, KEPT), id_row(block, KEPT.saturating_add(1)))
+}
+
+/// The volume a kept place's key names.
+pub fn decode_block_kept(k: &[u8]) -> Option<u128> {
+    let tail = id_row_tail(k, KEPT)?;
+    Some(u128::from_be_bytes(tail.try_into().ok()?))
+}
+
+/// The block a Block-layer data row's key names: every row of a block begins with its ID.
+pub fn decode_block_row(k: &[u8]) -> Option<u128> {
+    let rest = k.strip_prefix(&[DATA])?;
+    Some(u128::from_be_bytes(rest.get(..16)?.try_into().ok()?))
+}
+
+/// The first key of the rows of the blocks after `after`, or of the first block, and a key past
+/// every block's rows: a scan of the Block layer a block at a time.
+pub fn blocks_after(after: Option<u128>) -> (Vec<u8>, Vec<u8>) {
+    let from = match after {
+        Some(block) => id_row(block, u8::MAX),
+        None => vec![DATA],
+    };
+    (from, vec![REVERSE])
 }
 
 /// The first and last possible keys of every row of one file or block.
@@ -569,11 +606,14 @@ pub fn decode_reverse(k: &[u8]) -> Option<(u128, u128)> {
     Some((volume, block))
 }
 
-/// After `DATA` in the root range: its census, a node's row, a volume's, or a node's history.
+/// After `DATA` in the root range: its census, a node's row, a volume's, a node's history, a
+/// node's presence as the cell has seen it, or a volume's state where it is not active.
 const CENSUS: u8 = 0;
 const MEMBER: u8 = 1;
 const VOLUME: u8 = 2;
 const HISTORY: u8 = 3;
+const PRESENCE: u8 = 4;
+const STATE: u8 = 5;
 
 /// The key of the root range's census: how many nodes and volumes its table holds.
 pub fn census() -> Vec<u8> {
@@ -602,6 +642,18 @@ pub fn history(node: u64) -> Vec<u8> {
 /// The first key of the nodes' histories and a key past the last.
 pub fn history_rows() -> (Vec<u8>, Vec<u8>) {
     (vec![DATA, HISTORY], vec![DATA, HISTORY.saturating_add(1)])
+}
+
+/// The key of node `node`'s presence in the root range: whether the cell sees it now, since
+/// when, and the time it has been seen and not seen (docs/design/repair.md §2).
+pub fn presence(node: u64) -> Vec<u8> {
+    numbered(PRESENCE, &node.to_be_bytes())
+}
+
+/// The key of volume `volume`'s state in the root range: leaving or gone; a volume without one
+/// is active (docs/design/repair.md §2).
+pub fn volume_state(volume: u128) -> Vec<u8> {
+    numbered(STATE, &volume.to_be_bytes())
 }
 
 /// The key of volume `volume`'s row in the root range's table: volumes sort by id.

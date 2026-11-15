@@ -110,6 +110,10 @@ enum Command {
         /// A block's annual chance of loss at most: S3's eleven nines, 1e-11, unless stated.
         #[arg(long)]
         target: Option<f64>,
+        /// The cell's repairs an hour, which the durability model takes and an away node's chunks
+        /// wait one over: a day's, unless stated.
+        #[arg(long)]
+        repair_rate: Option<f64>,
         /// The region the cell's S3 endpoint serves and its clients sign for: S3's default,
         /// us-east-1, unless stated.
         #[arg(long)]
@@ -657,6 +661,7 @@ fn stated_cell(
     file: Option<&std::path::Path>,
     nodes: &[String],
     (max_nodes, max_volumes, target): (Option<u32>, Option<u32>, Option<f64>),
+    repair_rate: Option<f64>,
     region: Option<&str>,
 ) -> Result<init::Cell, init::Error> {
     let mut cell = match file {
@@ -687,6 +692,12 @@ fn stated_cell(
             return Err(twice("durability.target"));
         }
         cell.target = target;
+    }
+    if repair_rate.is_some() {
+        if cell.repair_rate.is_some() {
+            return Err(twice("durability.repair_rate"));
+        }
+        cell.repair_rate = repair_rate;
     }
     if let Some(region) = region {
         if cell.region.is_some() {
@@ -979,12 +990,14 @@ fn main() -> ExitCode {
             max_nodes,
             max_volumes,
             target,
+            repair_rate,
             region,
         } => match dir {
             Some(dir) => stated_cell(
                 founders.as_deref(),
                 &nodes,
                 (max_nodes, max_volumes, target),
+                repair_rate,
                 region.as_deref(),
             )
             .and_then(|cell| init::init(&mut out, &dir, &cell))
@@ -1365,33 +1378,41 @@ mod tests {
         )
         .unwrap();
         let flag = vec!["quic=127.0.0.1:3,plane=127.0.0.1:4".to_owned()];
-        let cell = stated_cell(Some(&file), &flag, (None, Some(4), None), None).unwrap();
+        let cell = stated_cell(Some(&file), &flag, (None, Some(4), None), None, None).unwrap();
         let quics: Vec<String> = cell.founders.iter().map(|f| f.quic.to_string()).collect();
         assert_eq!(quics, vec!["127.0.0.1:1", "127.0.0.1:3"]);
         assert_eq!((cell.max_nodes, cell.max_volumes), (Some(2), Some(4)));
         assert!(matches!(
-            stated_cell(Some(&file), &flag, (Some(3), None, None), None),
+            stated_cell(Some(&file), &flag, (Some(3), None, None), None, None),
             Err(init::Error::Cell(_))
         ));
         let flags_alone = stated_cell(
             None,
             &flag,
             (Some(1), Some(1), Some(1e-9)),
+            Some(60.0),
             Some("eu-west-1"),
         )
         .unwrap();
         assert_eq!(flags_alone.founders.len(), 1);
         assert_eq!(flags_alone.target, Some(1e-9));
+        assert_eq!(flags_alone.repair_rate, Some(60.0));
         assert_eq!(flags_alone.region(), "eu-west-1");
         assert_eq!(cell.region(), "us-east-1");
         // A region is S3's alphabet, and stated once.
         assert!(matches!(
-            stated_cell(None, &flag, (None, None, None), Some("eu/west")),
+            stated_cell(None, &flag, (None, None, None), None, Some("eu/west")),
             Err(init::Error::Cell(_))
         ));
         std::fs::write(&file, "region = eu-west-1\n").unwrap();
         assert!(matches!(
-            stated_cell(Some(&file), &flag, (None, None, None), Some("us-east-2")),
+            stated_cell(
+                Some(&file),
+                &flag,
+                (None, None, None),
+                None,
+                Some("us-east-2")
+            ),
             Err(init::Error::Cell(_))
         ));
     }

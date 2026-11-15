@@ -547,8 +547,9 @@ pub const REPEATED: &[&str] = &["peer", "range", "volume", "root_key", "durabili
 
 /// The keys `mantle serve`'s file states once each, its operator's alone (node.md §1.4's first
 /// column): every other value is measured or derived, and a key of those is refused. `memory`
-/// is the most the node may hold, and `durability.target` a block's annual chance of loss at most,
-/// each where stated.
+/// is the most the node may hold, `durability.target` a block's annual chance of loss at most, and
+/// `durability.repair_rate` the cell's repairs an hour (docs/design/repair.md §2), each where
+/// stated.
 pub const STATED_KEYS: &[&str] = &[
     "id",
     "dir",
@@ -563,6 +564,7 @@ pub const STATED_KEYS: &[&str] = &[
     "root.max_volumes",
     "memory",
     "durability.target",
+    "durability.repair_rate",
     "stop_ms",
     "s3",
     "s3.region",
@@ -1422,6 +1424,13 @@ pub fn read_stated(path: &Path) -> Result<Stated, ProcessError> {
             "a probability between 0 and 1".into(),
         ));
     }
+    let repair = lines.maybe::<f64>("durability.repair_rate")?;
+    if repair.is_some_and(|r| !(r.is_finite() && r > 0.0)) {
+        return Err(ProcessError::Value(
+            "durability.repair_rate",
+            "repairs an hour, more than none".into(),
+        ));
+    }
     Ok(Stated {
         id: lines.get("id")?,
         dir: lines.path(lines.text("dir")?),
@@ -1439,6 +1448,7 @@ pub fn read_stated(path: &Path) -> Result<Stated, ProcessError> {
         ceiling: lines.maybe("memory")?,
         stop: lines.maybe("stop_ms")?.map(Duration::from_millis),
         target,
+        repair,
         s3: s3_stated(&lines)?,
     })
 }
@@ -1890,6 +1900,8 @@ async fn serve(
                 volumes,
                 max_nodes: e.max_nodes,
                 max_volumes: e.max_volumes,
+                // The entry that carries it gives it its time.
+                at_ns: 0,
             }));
             Some(node.command(e.root, enlist, u64::MAX, Wait::Answered)?)
         }
@@ -1915,6 +1927,10 @@ async fn serve(
     let mut said_moved: Option<(u64, u64)> = None;
     // Whether the node waits on its own device, as last said, none before the first saying.
     let mut said_held: Option<bool> = None;
+    // The cell's repair on this node as last said, none before the first saying.
+    let mut said_repair: Option<crate::node::RepairStatus> = None;
+    // The node's leave asked of the root range, not yet answered.
+    let mut leaving: Option<crate::ask::CommandAsk> = None;
     let signals = hyper_rt::signal::subscribe(STOP_SIGNALS).map_err(|e| talk(format!("{e:?}")))?;
     let mut stop = Stop::new(config.stop);
     // Whether standard input may say more: a node that does not end with it runs on once it closes,
@@ -1990,6 +2006,21 @@ async fn serve(
                             .get()
                             .map_or_else(|| "counts uncounted\n".to_owned(), |counts| counts());
                         say(&mut output, &line).await?;
+                    } else if line.trim_ascii() == b"leave" {
+                        // The node leaves the cell's storage: its volumes take no new chunk, and
+                        // the cell's repair moves what they hold (docs/design/repair.md §4).
+                        let Some(e) = &config.enlist else {
+                            return Err(ProcessError::Input(
+                                "leave".into(),
+                                "a node with no volumes holds nothing to leave",
+                            ));
+                        };
+                        let word = Command::Root(root::Command::Leave {
+                            node: config.id,
+                            // The entry that carries it gives it its time.
+                            at_ns: 0,
+                        });
+                        leaving = Some(node.command(e.root, word, u64::MAX, Wait::Answered)?);
                     } else {
                         take_line(&mut node, &config.ranges, &line)?;
                     }
@@ -2077,6 +2108,22 @@ async fn serve(
                 replaced.joining()
             )
             .map_err(wrote)?;
+        }
+        if let Some(asked) = leaving
+            && let Some(outcome) = node.take_command(asked)
+        {
+            leaving = None;
+            match outcome {
+                CommandOutcome::Answered(Answer::Root(root::Outcome::Kept)) => {
+                    writeln!(lines, "leaving").map_err(wrote)?;
+                }
+                other => return Err(ProcessError::Enlist(format!("leave: {other:?}"))),
+            }
+        }
+        let repair = node.repair_status();
+        if said_repair != Some(repair) {
+            repair_line(&mut lines, &repair).map_err(wrote)?;
+            said_repair = Some(repair);
         }
         for (at, now) in node.links().enumerate() {
             if links.get(at) == Some(&now) {
@@ -2359,6 +2406,30 @@ fn status_line(lines: &mut String, group: u128, now: &Status) -> std::fmt::Resul
         lines,
         "status {group:x} {} {} {} {} {patience} {reconnect} {measuring} {asking}",
         now.term, now.leader, now.commit, now.applied
+    )
+}
+
+/// The cell's repair as this node runs it (docs/design/repair.md §5): `repair LEADING SETTLED
+/// ROOT_APPLIED BLOCK_APPLIED REBUILT TIMING COMMANDS UNPLACED UNREADABLE CORRUPT WAITING SHORT LOST
+/// RUNNING`, each flag 0 or 1, said each time it changes.
+fn repair_line(lines: &mut String, r: &crate::node::RepairStatus) -> Result<(), std::fmt::Error> {
+    writeln!(
+        lines,
+        "repair {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+        u8::from(r.leading),
+        u8::from(r.settled),
+        r.root_applied,
+        r.block_applied,
+        r.rebuilt,
+        r.timing,
+        r.commands,
+        r.unplaced,
+        r.unreadable,
+        r.corrupt,
+        r.waiting,
+        r.short,
+        r.lost,
+        r.running,
     )
 }
 

@@ -168,6 +168,9 @@ pub struct Cell {
     pub max_volumes: Option<u32>,
     /// A block's annual chance of loss at most, where stated (`durability.target`).
     pub target: Option<f64>,
+    /// The cell's repairs an hour, where stated (`durability.repair_rate`; docs/design/repair.md
+    /// §2).
+    pub repair_rate: Option<f64>,
     /// The region its S3 endpoint serves, where stated ([`Cell::region`]).
     pub region: Option<String>,
 }
@@ -388,14 +391,18 @@ pub fn parse_file(path: &Path, text: &str) -> Result<Cell, Error> {
                 stated(cell.target.is_some())?;
                 cell.target = Some(value.parse().map_err(|_| bad("a probability".into()))?);
             }
+            "durability.repair_rate" => {
+                stated(cell.repair_rate.is_some())?;
+                cell.repair_rate = Some(value.parse().map_err(|_| bad("repairs an hour".into()))?);
+            }
             "region" => {
                 stated(cell.region.is_some())?;
                 cell.region = Some(check_region(value).map_err(bad)?);
             }
             other => {
                 return Err(bad(format!(
-                    "{other} is not the cell's statement: max_nodes, max_volumes, durability.target \
-                     or region; a founder's opens with [node]"
+                    "{other} is not the cell's statement: max_nodes, max_volumes, durability.target, \
+                     durability.repair_rate or region; a founder's opens with [node]"
                 )));
             }
         }
@@ -668,6 +675,9 @@ fn config(
     if let Some(target) = cell.target {
         text.push_str(&format!("durability.target = {target}\n"));
     }
+    if let Some(rate) = cell.repair_rate {
+        text.push_str(&format!("durability.repair_rate = {rate}\n"));
+    }
     text
 }
 
@@ -692,6 +702,14 @@ pub fn init(said: &mut impl Write, out: &Path, cell: &Cell) -> Result<(), Error>
         .is_some_and(|t| !(t.is_finite() && t > 0.0 && t < 1.0))
     {
         return Err(Error::Cell("a durability target between 0 and 1".into()));
+    }
+    if cell
+        .repair_rate
+        .is_some_and(|r| !(r.is_finite() && r > 0.0))
+    {
+        return Err(Error::Cell(
+            "a repair rate of more than none an hour".into(),
+        ));
     }
     match std::fs::read_dir(out) {
         Ok(mut entries) => {

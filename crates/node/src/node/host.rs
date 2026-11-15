@@ -145,7 +145,8 @@ impl Job {
     fn bounded(&self, now: u64) -> Bounded {
         if now < self.bound_ns() {
             Bounded::Held
-        } else if matches!(&self.work, Work::Get(getting) if getting.get.is_some()) {
+        } else if matches!(&self.work, Work::Get(getting) if getting.get.is_some() && getting.held.is_none())
+        {
             Bounded::Unvouched
         } else {
             Bounded::SlowDown
@@ -448,6 +449,10 @@ struct Getting {
     /// A HeadObject: the version's facts, and no bytes.
     head: bool,
     get: Option<Get>,
+    /// The reply, held until the driver has the range's first bytes or its end, so a block that
+    /// cannot be read before any byte goes is answered with a typed refusal rather than a reply
+    /// begun and cut (docs/design/repair.md §6); none once sent.
+    held: Option<Box<Reply>>,
     /// Plaintext taken from the driver and not yet written to the exchange.
     out: Option<(Bytes, usize)>,
     /// Bytes of the reply's body written so far, and the body's length.
@@ -556,23 +561,36 @@ pub(crate) struct Table {
     applied: u64,
     /// In the order of their ids (`root::volumes`).
     placed: Vec<Placed>,
+    /// The same volumes, each with its standing and its node's presence (`root::facts`): what
+    /// placement and repair judge by (docs/design/repair.md §2).
+    pub(super) facts: Vec<root::Fact>,
+    /// The volumes that take chunks now, which the scheme was chosen over.
+    standing: Vec<Placed>,
     scheme: Option<durability::Scheme>,
 }
 
 impl Table {
     /// The node that holds `volume`, if the table holds it.
-    fn node_of(&self, volume: u128) -> Option<PeerId> {
+    pub(super) fn node_of(&self, volume: u128) -> Option<PeerId> {
         let at = self
             .placed
             .binary_search_by_key(&volume, |p| p.volume)
             .ok()?;
         self.placed.get(at).map(|p| p.node)
     }
+
+    /// The root range's applied index the table was read at.
+    pub(super) fn applied(&self) -> u64 {
+        self.applied
+    }
 }
 
 /// The scheme a new block takes over `table`: the durability model's choice among the schemes that
 /// fit the cell's failure domains, or the closest to the target where none meets it, as a cell
-/// short of domains places on those there are (node.md §1.5).
+/// short of domains places on those there are (node.md §1.5). A domain counts while it holds a
+/// volume that takes chunks now, active and its node seen: a block written while machines sleep
+/// takes the scheme the machines seen meet the target with, a chunk to each domain, rather than
+/// waiting for them or doubling chunks on the domains there are (docs/design/repair.md §5).
 fn scheme(gateway: &GatewaySettings, table: &[Placed]) -> Option<durability::Scheme> {
     let mut domains: Vec<&str> = table.iter().map(|p| p.domain.as_str()).collect();
     domains.sort_unstable();
@@ -597,7 +615,7 @@ fn scheme_over(
     placed: &[Placed],
     gateway: Option<&GatewaySettings>,
 ) -> Option<durability::Scheme> {
-    match was.filter(|t| same_domains(&t.placed, placed)) {
+    match was.filter(|t| same_domains(&t.standing, placed)) {
         Some(table) => table.scheme,
         None => gateway.and_then(|g| scheme(g, placed)),
     }
@@ -924,12 +942,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(false)
     }
 
-    /// The host's operations its jobs count as (`Job::weight`).
-    pub(super) fn occupancy(&self) -> usize {
+    /// The operations the host's jobs count as (`Job::weight`).
+    pub(super) fn job_weight(&self) -> usize {
         self.jobs
             .iter()
             .map(Job::weight)
             .fold(0, usize::saturating_add)
+    }
+
+    /// The host's operation slots taken: its jobs' operations, and the cell's repairs this node
+    /// runs, a slot for each width of a repaired block's places (docs/design/repair.md §5).
+    pub(super) fn occupancy(&self) -> usize {
+        let repairs = self.repair.as_ref().map_or(0, |r| r.slots());
+        self.job_weight().saturating_add(repairs)
     }
 
     /// For a native upload's Open, the plaintext bytes of a whole block of the layout new blocks
@@ -945,7 +970,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// The group of the range this node hosts of `layer`: the cell's one range of it.
-    fn group_of(&self, layer: Layer) -> Option<u128> {
+    pub(super) fn group_of(&self, layer: Layer) -> Option<u128> {
         self.ranges
             .iter()
             .find(|k| k.layer == layer)
@@ -954,7 +979,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// The volume table as this node's member of the root range holds it now: read from the
     /// range's rows again only once the member applied an entry since the last read.
-    fn table(&mut self) -> Result<&Table, NodeError> {
+    pub(super) fn table(&mut self) -> Result<&Table, NodeError> {
         let handle = self
             .ranges
             .iter()
@@ -970,12 +995,21 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let engine = shell.machine_mut().engine_mut();
             let census = root::census(engine).map_err(|e| NodeError::Bounds(e.to_string()))?;
             let most = usize::try_from(census.volumes).unwrap_or(usize::MAX);
-            let placed =
-                root::volumes(engine, None, most).map_err(|e| NodeError::Bounds(e.to_string()))?;
-            let scheme = scheme_over(self.table.as_ref(), &placed, self.gateway.as_ref());
+            let facts =
+                root::facts(engine, None, most).map_err(|e| NodeError::Bounds(e.to_string()))?;
+            let placed: Vec<Placed> = facts.iter().map(|f| f.placed.clone()).collect();
+            // The scheme is chosen over the volumes that take chunks now.
+            let standing: Vec<Placed> = facts
+                .iter()
+                .filter(|f| f.takes())
+                .map(|f| f.placed.clone())
+                .collect();
+            let scheme = scheme_over(self.table.as_ref(), &standing, self.gateway.as_ref());
             self.table = Some(Table {
                 applied,
                 placed,
+                facts,
+                standing,
                 scheme,
             });
         }
@@ -2075,7 +2109,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         let asked = match &request {
             put::Request::Place { block, .. } => {
-                let Ok(volumes) = self.table().map(|t| place::order(*block, &t.placed)) else {
+                // Only volumes that take chunks now, their nodes seen, weighted by measured
+                // availability (docs/design/repair.md §5).
+                let now = self.wall.now_ns();
+                let Ok(volumes) = self
+                    .table()
+                    .map(|t| place::offer(*block, &t.facts, &[], false, now))
+                else {
                     self.fail_job(at, Status::Failed)?;
                     return Ok(None);
                 };
@@ -2185,7 +2225,6 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         let Some(Job {
             work: Work::Get(getting),
-            door,
             ..
         }) = self.jobs.get_mut(at)
         else {
@@ -2240,19 +2279,58 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Ok(get) => getting.get = Some(get),
             Err(_) => return self.fail_job(at, Status::Failed),
         }
+        // The reply waits for the range's first bytes (`write_get`).
+        getting.total = length;
+        getting.held = Some(Box::new(reply));
+        Ok(())
+    }
+
+    /// Sends a get's held reply once its driver has the range's first bytes or its end: its head,
+    /// and natively its fields opening the body, ahead of the range's bytes. A driver that failed
+    /// before is answered with the refusal its failure is (`get_status`), no byte sent. Whether the
+    /// job is over.
+    fn send_held(&mut self, at: usize) -> Result<Option<bool>, NodeError> {
+        let Some(Job {
+            work: Work::Get(getting),
+            door,
+            ..
+        }) = self.jobs.get_mut(at)
+        else {
+            return Ok(Some(true));
+        };
+        let Some(get) = getting.get.as_ref() else {
+            return Ok(Some(false));
+        };
+        if getting.held.is_none() {
+            return Ok(None);
+        }
+        if let Some(Err(e)) = get.outcome() {
+            let status = get_status(e);
+            getting.held = None;
+            self.fail_job(at, status)?;
+            return Ok(Some(false));
+        }
+        if !get.ready() && get.outcome().is_none() {
+            return Ok(Some(false));
+        }
+        let Some(reply) = getting.held.take() else {
+            return Ok(None);
+        };
+        let length = getting.total;
         let exchange = match door {
             Door::Exchange(exchange) => *exchange,
-            // The reply goes first, its bytes after it as the driver gives them (`write_get`).
+            // The reply goes first, its bytes after it as the driver gives them.
             Door::Local(local) => {
-                getting.total = length;
-                if local.offer(door::Answer::Head(Box::new(reply))) == Sent::Gone {
-                    return self.fail_job(at, Status::Failed);
+                if local.offer(door::Answer::Head(reply)) == Sent::Gone {
+                    self.fail_job(at, Status::Failed)?;
+                    return Ok(Some(false));
                 }
-                return Ok(());
+                return Ok(None);
             }
         };
         let Ok((head, fields)) = reply.encode() else {
-            return self.fail_job(at, Status::Failed);
+            self.fail_job(at, Status::Failed)?;
+            return Ok(Some(false));
         };
         // The fields open the body, ahead of the range's bytes.
         let total = u64::try_from(fields.len())
@@ -2261,9 +2339,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         getting.total = total;
         getting.out = Some((Bytes::from(fields), 0));
         match self.driver.endpoint().reply(exchange, &head, Some(total)) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(None),
             // Its asker is gone: the job ends with its exchange.
-            Err(_) => self.fail_job(at, Status::Failed),
+            Err(_) => {
+                self.fail_job(at, Status::Failed)?;
+                Ok(Some(false))
+            }
         }
     }
 
@@ -2337,6 +2418,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// last is written; whether the get is over: every byte written, or its driver or exchange
     /// failed, which ends the exchange unfinished.
     fn write_get(&mut self, at: usize) -> Result<bool, NodeError> {
+        if let Some(over) = self.send_held(at)? {
+            return Ok(over);
+        }
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(true);
         };
@@ -4473,6 +4557,7 @@ fn getting(
         version,
         head,
         get: None,
+        held: None,
         out: None,
         written: 0,
         total: 0,
@@ -4662,7 +4747,9 @@ mod tests {
         assert!(chosen.is_some());
         let table = Table {
             applied: 1,
-            placed: first,
+            placed: first.clone(),
+            facts: Vec::new(),
+            standing: first,
             scheme: chosen,
         };
         let same = placed(["a", "b", "c"]);

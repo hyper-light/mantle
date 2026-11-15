@@ -70,9 +70,11 @@ use mantle_protocol::object;
 
 mod answers;
 mod host;
+mod repair;
 mod stop;
 use answers::Answers;
 pub use host::GatewaySettings;
+pub use repair::RepairStatus;
 use stop::Stopping;
 
 /// A plane message's first byte: a range's Raft frame. A liveness heartbeat starts with its own,
@@ -883,6 +885,12 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// What jobs that ended asked and was not yet answered: its outcomes are dropped as they come.
     /// At most the node's asks.
     abandoned: Vec<host::Pending>,
+    /// The cell's repair, while this node's member leads the Block range (docs/design/repair.md
+    /// §5); its repairs take the host's operation slots as jobs do.
+    repair: Option<repair::Repair>,
+    /// The words on presence this node asked of the root range while it leads it, one at most for
+    /// each node of the table, by the node each is of.
+    seeing: Vec<(u64, CommandAsk)>,
     /// The S3 listener's door, once opened (`crate::door`; [`Node::open_door`]): the operations it
     /// hands over, each taken into a job at the next turn.
     doorway: Option<crate::door::Doorway>,
@@ -1218,6 +1226,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             gateway: settings.gateway.take(),
             jobs: Vec::new(),
             abandoned: Vec::new(),
+            repair: None,
+            seeing: Vec::new(),
             doorway: None,
             door_held: None,
             stopping: None,
@@ -1612,6 +1622,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.drive(now)?;
         self.take_door();
         self.step_host()?;
+        self.observe_presence()?;
+        self.step_repair()?;
         self.step_asks(now)?;
         self.step_reads(now)?;
         self.step_replacements();
@@ -1722,6 +1734,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             self.asks_due(now),
             self.reads_due(now),
             self.host_due(),
+            self.repair_due(),
             held,
         ]
         .into_iter()
@@ -4310,9 +4323,13 @@ fn take_done<T>(done: &mut Vec<(u64, T)>, ask: u64) -> Option<T> {
 /// a node, and a registration names the sender as the session's owner, so no sender ends another's
 /// session (`mantle_meta::session::register`) or states another node's history.
 fn names_only_its_sender(command: &Command, sender: PeerId, node: bool) -> bool {
+    use mantle_meta::root::Command as Root;
     match command {
-        Command::Root(mantle_meta::root::Command::Enlist(e)) => node && e.node == sender,
-        Command::Root(mantle_meta::root::Command::Lived(l)) => node && l.node == sender,
+        Command::Root(Root::Enlist(e)) => node && e.node == sender,
+        Command::Root(Root::Lived(l)) => node && l.node == sender,
+        Command::Root(Root::Leave { node: leaving, .. }) => node && *leaving == sender,
+        // What the cell sees, and a leaving volume emptied, a node states, never a gateway.
+        Command::Root(Root::Seen(_) | Root::Retire { .. } | Root::Forget { .. }) => node,
         Command::Register { owner, .. } => *owner == sender,
         _ => true,
     }
@@ -4451,6 +4468,7 @@ mod tests {
                 volumes: Vec::new(),
                 max_nodes: 3,
                 max_volumes: 3,
+                at_ns: 0,
             }))
         };
         let lived = |node| {

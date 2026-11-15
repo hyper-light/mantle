@@ -9,6 +9,13 @@
 //! so a block whose gateway stopped before writing the file is found without a scan
 //! (docs/design/metadata.md §2). The sweep releases a block only at the deadline it asked the
 //! File range about: a renewal since keeps the block, and a released block is renewed no more.
+//!
+//! A chunk lives where its row says, and repair may keep another place of it beside that one
+//! (docs/design/repair.md §3): rebuilt elsewhere while its volume's node was away, the chunk's row
+//! names the volume repair wrote it to, and the volume it left holds the same bytes under the same
+//! key, kept, so the chunk is reachable again through it once its node is back, as Carbonite
+//! reintegrates the replicas a transient failure left (Chun et al., NSDI 2006, §5). Every place, a
+//! chunk's own or a kept one, has its reverse row, and a block holds at most one chunk on a volume.
 
 use mantle_chunk::ChunkKey;
 
@@ -45,12 +52,28 @@ pub enum Command {
         block: u128,
         deadline_ns: u64,
     },
-    /// Records that `chunk` lives on volume `to` instead of `from`: repair or rebalancing
-    /// wrote it there.
+    /// Records that the place of `chunk` on volume `from`, its own or a kept one, is on `to`
+    /// instead: repair or rebalancing wrote it there, or `to` keeps it already. `from` holds it no
+    /// more as far as the block is concerned.
     Move {
         chunk: ChunkKey,
         from: u128,
         to: u128,
+    },
+    /// Records that `chunk`, whose own place `from` is out of reach, lives on `to`, repair having
+    /// rebuilt it there, and that `from` keeps it, for when it is reachable again
+    /// (docs/design/repair.md §3). A block holds at most `most` places, the cell's volumes.
+    Repair {
+        chunk: ChunkKey,
+        from: u128,
+        to: u128,
+        most: u32,
+    },
+    /// Forgets the place `volume` keeps of one of the block's chunks: the volume is gone
+    /// (docs/design/repair.md §3).
+    Unkeep {
+        block: u128,
+        volume: u128,
     },
     Delete {
         block: u128,
@@ -76,6 +99,10 @@ pub enum Outcome {
     Moved,
     Deleted,
     Settled,
+    /// The place is forgotten, now or before.
+    Unkept,
+    /// A repair would give the block more places than it may hold.
+    Full,
     /// The block holds other chunks, the chunk is not on `from`, or `to` holds another of
     /// the block's chunks: the caller reads the block again.
     Conflict,
@@ -114,6 +141,13 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
         } => renew(engine, *block, *file, *handover_ns, *at_ns)?,
         Command::Release { block, deadline_ns } => release(engine, *block, *deadline_ns)?,
         Command::Move { chunk, from, to } => relocate(engine, chunk, *from, *to)?,
+        Command::Repair {
+            chunk,
+            from,
+            to,
+            most,
+        } => repair(engine, chunk, *from, *to, *most)?,
+        Command::Unkeep { block, volume } => unkeep(engine, *block, *volume)?,
         Command::Delete { block } => delete(engine, *block)?,
         Command::Settle { blocks } => (Outcome::Settled, settle(engine, blocks)?),
     };
@@ -282,31 +316,142 @@ fn relocate<E: Rows>(
     if origin(engine, chunk.block)?.is_some_and(|o| o.released) {
         return Ok((Outcome::Expired, Vec::new()));
     }
-    let Some(place) = places.get(usize::from(chunk.index)) else {
+    let Some(own) = places.get(usize::from(chunk.index)) else {
         return Ok((Outcome::Invalid, Vec::new()));
     };
-    if place.key != *chunk {
+    if own.key != *chunk {
         // The block was written again at another epoch.
         return Ok((Outcome::Conflict, Vec::new()));
     }
-    if place.volume == to {
+    let kept = kept(engine, chunk.block)?;
+    let index = chunk.index;
+    let keeps = |volume: u128| kept.iter().any(|&(v, i)| v == volume && i == index);
+    let from_own = own.volume == from;
+    let to_holds = own.volume == to || keeps(to);
+    if !from_own && !keeps(from) {
         // A retried move finds the chunk where it moved it.
+        let outcome = if to_holds {
+            Outcome::Moved
+        } else {
+            Outcome::Conflict
+        };
+        return Ok((outcome, Vec::new()));
+    }
+    if from == to {
         return Ok((Outcome::Moved, Vec::new()));
     }
-    if place.volume != from || places.iter().any(|p| p.volume == to) {
+    // `to` may hold no other chunk of the block: two on one volume would be lost together.
+    let holds_other = places
+        .iter()
+        .any(|p| p.volume == to && p.key.index != index)
+        || kept.iter().any(|&(v, i)| v == to && i != index);
+    if holds_other {
         return Ok((Outcome::Conflict, Vec::new()));
     }
-    let moved = ChunkPlace {
+    let reverse = Reverse { index };
+    let mut writes = vec![Write::Delete(key::reverse(from, chunk.block))];
+    if from_own {
+        let moved = ChunkPlace {
+            volume: to,
+            key: *chunk,
+        };
+        writes.push(Write::Put(
+            key::block_chunk(chunk.block, index),
+            moved.encode(),
+        ));
+        if keeps(to) {
+            // The kept place becomes the chunk's own.
+            writes.push(Write::Delete(key::block_kept(chunk.block, to)));
+        } else {
+            writes.push(Write::Put(key::reverse(to, chunk.block), reverse.encode()));
+        }
+    } else {
+        writes.push(Write::Delete(key::block_kept(chunk.block, from)));
+        if !to_holds {
+            writes.push(Write::Put(
+                key::block_kept(chunk.block, to),
+                reverse.encode(),
+            ));
+            writes.push(Write::Put(key::reverse(to, chunk.block), reverse.encode()));
+        }
+    }
+    Ok((Outcome::Moved, writes))
+}
+
+fn repair<E: Rows>(
+    engine: &mut E,
+    chunk: &ChunkKey,
+    from: u128,
+    to: u128,
+    most: u32,
+) -> Result<(Outcome, Vec<Write>), MetaError> {
+    let Some((_, places)) = read(engine, chunk.block)? else {
+        return Ok((Outcome::NoSuchBlock, Vec::new()));
+    };
+    if origin(engine, chunk.block)?.is_some_and(|o| o.released) {
+        return Ok((Outcome::Expired, Vec::new()));
+    }
+    let Some(own) = places.get(usize::from(chunk.index)) else {
+        return Ok((Outcome::Invalid, Vec::new()));
+    };
+    if own.key != *chunk {
+        return Ok((Outcome::Conflict, Vec::new()));
+    }
+    let kept = kept(engine, chunk.block)?;
+    if own.volume == to && kept.iter().any(|&(v, i)| v == from && i == chunk.index) {
+        // A retried repair finds the chunk where it rebuilt it, and `from` keeping it.
+        return Ok((Outcome::Moved, Vec::new()));
+    }
+    // The chunk's own place moved since the repair read it, or `to` holds one of the block's
+    // chunks already: the caller reads the block again.
+    if own.volume != from
+        || places.iter().any(|p| p.volume == to)
+        || kept.iter().any(|&(v, _)| v == to)
+    {
+        return Ok((Outcome::Conflict, Vec::new()));
+    }
+    let after = places
+        .len()
+        .checked_add(kept.len())
+        .and_then(|n| n.checked_add(1))
+        .ok_or(MetaError::Corrupt)?;
+    if after > usize::try_from(most).unwrap_or(usize::MAX) {
+        return Ok((Outcome::Full, Vec::new()));
+    }
+    let reverse = Reverse { index: chunk.index };
+    let rebuilt = ChunkPlace {
         volume: to,
         key: *chunk,
     };
-    let reverse = Reverse { index: chunk.index };
     let writes = vec![
-        Write::Put(key::block_chunk(chunk.block, chunk.index), moved.encode()),
-        Write::Delete(key::reverse(from, chunk.block)),
+        Write::Put(key::block_chunk(chunk.block, chunk.index), rebuilt.encode()),
+        Write::Put(key::block_kept(chunk.block, from), reverse.encode()),
         Write::Put(key::reverse(to, chunk.block), reverse.encode()),
     ];
     Ok((Outcome::Moved, writes))
+}
+
+fn unkeep<E: Rows>(
+    engine: &mut E,
+    block: u128,
+    volume: u128,
+) -> Result<(Outcome, Vec<Write>), MetaError> {
+    if engine.get(&key::block_kept(block, volume))?.is_some() {
+        let writes = vec![
+            Write::Delete(key::block_kept(block, volume)),
+            Write::Delete(key::reverse(volume, block)),
+        ];
+        return Ok((Outcome::Unkept, writes));
+    }
+    // A chunk's own place is moved, never forgotten.
+    let own =
+        read(engine, block)?.is_some_and(|(_, places)| places.iter().any(|p| p.volume == volume));
+    let outcome = if own {
+        Outcome::Conflict
+    } else {
+        Outcome::Unkept
+    };
+    Ok((outcome, Vec::new()))
 }
 
 fn delete<E: Rows>(engine: &mut E, block: u128) -> Result<(Outcome, Vec<Write>), MetaError> {
@@ -323,6 +468,10 @@ fn delete<E: Rows>(engine: &mut E, block: u128) -> Result<(Outcome, Vec<Write>),
     for place in &places {
         writes.push(Write::Delete(key::block_chunk(block, place.key.index)));
         writes.push(Write::Delete(key::reverse(place.volume, block)));
+    }
+    for (volume, _) in kept(engine, block)? {
+        writes.push(Write::Delete(key::block_kept(block, volume)));
+        writes.push(Write::Delete(key::reverse(volume, block)));
     }
     Ok((Outcome::Deleted, writes))
 }
@@ -402,6 +551,58 @@ pub fn read<E: Rows>(
         places.push(place);
     }
     Ok(Some((header, places)))
+}
+
+/// The places `block`'s volumes keep beside its chunks' own, in the order of their volumes, each
+/// with the index of the chunk it keeps. A block holds at most one chunk on a volume, so these are
+/// at most as many as the cell's volumes less the block's width.
+pub fn kept<E: Rows>(engine: &mut E, block: u128) -> Result<Vec<(u128, u16)>, MetaError> {
+    let (mut from, to) = key::block_kept_rows(block);
+    let mut out = Vec::new();
+    while let Some((k, v)) = engine.next(&from, &to)? {
+        let volume = key::decode_block_kept(&k).ok_or(MetaError::Corrupt)?;
+        out.push((volume, Reverse::decode(&v)?.index));
+        from = k;
+        from.push(0);
+    }
+    Ok(out)
+}
+
+/// A block's header and every place of its chunks: each chunk's own place in index order, then
+/// each kept one in the order of its volume, under the key of the chunk it keeps.
+pub fn places<E: Rows>(
+    engine: &mut E,
+    block: u128,
+) -> Result<Option<(BlockHeader, Vec<ChunkPlace>)>, MetaError> {
+    let Some((header, mut places)) = read(engine, block)? else {
+        return Ok(None);
+    };
+    for (volume, index) in kept(engine, block)? {
+        let own = places.get(usize::from(index)).ok_or(MetaError::Corrupt)?;
+        let key = own.key;
+        places.push(ChunkPlace { volume, key });
+    }
+    Ok(Some((header, places)))
+}
+
+/// The blocks of the range after `after`, or from its first, at most `max`, in the order of their
+/// ids: a pass over the layer a page at a time.
+pub fn blocks<E: Rows>(
+    engine: &mut E,
+    after: Option<u128>,
+    max: usize,
+) -> Result<Vec<u128>, MetaError> {
+    let (mut from, to) = key::blocks_after(after);
+    let mut out = Vec::new();
+    while out.len() < max {
+        let Some((k, _)) = engine.next(&from, &to)? else {
+            break;
+        };
+        let block = key::decode_block_row(&k).ok_or(MetaError::Corrupt)?;
+        out.push(block);
+        from = key::blocks_after(Some(block)).0;
+    }
+    Ok(out)
 }
 
 /// The range's blocks with a chunk on `volume`, after block `after`, at most `max` of them in
@@ -718,6 +919,130 @@ mod tests {
         assert!(!origin(&mut m, 5).unwrap().unwrap().released);
     }
 
+    /// A chunk rebuilt while its volume's node was away lives where repair wrote it, and the
+    /// volume it left keeps it: back, that volume's copy counts again, and a gone one is forgotten.
+    /// A kept place moves to become the chunk's own where its own place's volume is gone.
+    #[test]
+    fn a_repair_keeps_the_place_it_left_and_a_kept_place_can_become_the_chunks_own() {
+        let mut m = Model::default();
+        let write = Command::Write {
+            block: 5,
+            header: header(2, 1),
+            chunks: chunks(5, 1, &[10, 11, 12]),
+            at_ns: 0,
+            file: 1,
+            handover_ns: u64::MAX / 2,
+        };
+        assert!(matches!(
+            apply(&mut m, 1, &write).unwrap(),
+            Outcome::Written { .. }
+        ));
+        let repair = |index, from, to, most| Command::Repair {
+            chunk: chunk(5, index),
+            from,
+            to,
+            most,
+        };
+        // Past the block's bound: refused, nothing changed.
+        assert_eq!(
+            apply(&mut m, 2, &repair(0, 10, 13, 3)).unwrap(),
+            Outcome::Full
+        );
+        assert_eq!(
+            apply(&mut m, 3, &repair(0, 10, 13, 4)).unwrap(),
+            Outcome::Moved
+        );
+        let placed = |m: &mut Model| -> Vec<(u128, u16)> {
+            places(m, 5)
+                .unwrap()
+                .unwrap()
+                .1
+                .iter()
+                .map(|p| (p.volume, p.key.index))
+                .collect()
+        };
+        assert_eq!(placed(&mut m), [(13, 0), (11, 1), (12, 2), (10, 0)]);
+        assert_eq!(on_volume(&mut m, 10, None, 10).unwrap(), [(5, 0)]);
+        assert_eq!(on_volume(&mut m, 13, None, 10).unwrap(), [(5, 0)]);
+        // Retried: done. From where the chunk no longer lives, or onto a volume holding one of
+        // the block's chunks: a conflict.
+        assert_eq!(
+            apply(&mut m, 4, &repair(0, 10, 13, 4)).unwrap(),
+            Outcome::Moved
+        );
+        assert_eq!(
+            apply(&mut m, 5, &repair(1, 10, 14, 9)).unwrap(),
+            Outcome::Conflict
+        );
+        assert_eq!(
+            apply(&mut m, 6, &repair(1, 11, 10, 9)).unwrap(),
+            Outcome::Conflict
+        );
+        assert_eq!(
+            apply(&mut m, 7, &repair(1, 11, 13, 9)).unwrap(),
+            Outcome::Conflict
+        );
+        // Volume 13 gone: the kept place on 10 becomes the chunk's own.
+        let promote = Command::Move {
+            chunk: chunk(5, 0),
+            from: 13,
+            to: 10,
+        };
+        assert_eq!(apply(&mut m, 8, &promote).unwrap(), Outcome::Moved);
+        assert_eq!(placed(&mut m), [(10, 0), (11, 1), (12, 2)]);
+        assert!(on_volume(&mut m, 13, None, 10).unwrap().is_empty());
+        assert_eq!(apply(&mut m, 9, &promote).unwrap(), Outcome::Moved);
+        // Kept again, then forgotten as its volume goes; a chunk's own place is never forgotten.
+        assert_eq!(
+            apply(&mut m, 10, &repair(1, 11, 14, 9)).unwrap(),
+            Outcome::Moved
+        );
+        let unkeep = |volume| Command::Unkeep { block: 5, volume };
+        assert_eq!(apply(&mut m, 11, &unkeep(14)).unwrap(), Outcome::Conflict);
+        assert_eq!(apply(&mut m, 12, &unkeep(11)).unwrap(), Outcome::Unkept);
+        assert_eq!(apply(&mut m, 13, &unkeep(11)).unwrap(), Outcome::Unkept);
+        assert_eq!(placed(&mut m), [(10, 0), (14, 1), (12, 2)]);
+        assert!(on_volume(&mut m, 11, None, 10).unwrap().is_empty());
+        // A kept place moves like any.
+        assert_eq!(
+            apply(&mut m, 14, &repair(2, 12, 15, 9)).unwrap(),
+            Outcome::Moved
+        );
+        let relocate = Command::Move {
+            chunk: chunk(5, 2),
+            from: 12,
+            to: 16,
+        };
+        assert_eq!(apply(&mut m, 15, &relocate).unwrap(), Outcome::Moved);
+        assert_eq!(placed(&mut m), [(10, 0), (14, 1), (15, 2), (16, 2)]);
+        let delete = Command::Delete { block: 5 };
+        assert_eq!(apply(&mut m, 16, &delete).unwrap(), Outcome::Deleted);
+        assert_eq!(
+            m.next(&[key::DATA], &[u8::MAX]).unwrap(),
+            None,
+            "a deleted block leaves no rows, kept places' with the rest"
+        );
+    }
+
+    #[test]
+    fn the_layer_is_read_a_block_at_a_time() {
+        let mut m = Model::default();
+        for (index, block) in (1..).zip([7u128, 3, 9]) {
+            let write = Command::Write {
+                block,
+                header: header(1, 1),
+                chunks: chunks(block, 1, &[1, 2]),
+                at_ns: 0,
+                file: 1,
+                handover_ns: u64::MAX / 2,
+            };
+            apply(&mut m, index, &write).unwrap();
+        }
+        assert_eq!(blocks(&mut m, None, 2).unwrap(), [3, 7]);
+        assert_eq!(blocks(&mut m, Some(7), 5).unwrap(), [9]);
+        assert!(blocks(&mut m, Some(9), 5).unwrap().is_empty());
+    }
+
     fn command() -> impl Strategy<Value = Command> {
         let volumes = prop::collection::vec(0u128..6, 1..4);
         prop_oneof![
@@ -756,6 +1081,19 @@ mod tests {
                     to,
                 }
             ),
+            (0u128..3, 0u32..2, 0u16..3, 0u128..6, 0u128..6, 3u32..7).prop_map(
+                |(block, epoch, index, from, to, most)| Command::Repair {
+                    chunk: ChunkKey {
+                        block,
+                        epoch,
+                        index,
+                    },
+                    from,
+                    to,
+                    most,
+                }
+            ),
+            (0u128..3, 0u128..6).prop_map(|(block, volume)| Command::Unkeep { block, volume }),
             (0u128..3).prop_map(|block| Command::Delete { block }),
         ]
     }
@@ -795,11 +1133,22 @@ mod tests {
                 }
                 let mut forward = Vec::new();
                 for block in 0..3 {
-                    if let Some((_, places)) = read(&mut m, block).unwrap() {
+                    if let Some((header, places)) = places(&mut m, block).unwrap() {
                         let mut volumes: Vec<_> = places.iter().map(|p| p.volume).collect();
                         volumes.sort_unstable();
                         volumes.dedup();
                         prop_assert_eq!(volumes.len(), places.len());
+                        // Each chunk keeps its own place, the first of them, and a kept place
+                        // is one of the block's chunks under that chunk's key.
+                        let width = usize::from(header.data) + usize::from(header.parity);
+                        prop_assert!(places.len() >= width);
+                        for (i, own) in places.iter().take(width).enumerate() {
+                            prop_assert_eq!(usize::from(own.key.index), i);
+                        }
+                        for kept in places.iter().skip(width) {
+                            let own = places[usize::from(kept.key.index)];
+                            prop_assert_eq!(kept.key, own.key);
+                        }
                         forward.extend(places.iter().map(|p| (p.volume, block, p.key.index)));
                     }
                 }

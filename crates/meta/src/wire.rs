@@ -198,6 +198,8 @@ impl Answer {
                         block::Outcome::Settled => w.u8(6),
                         block::Outcome::Released => w.u8(7),
                         block::Outcome::Expired => w.u8(8),
+                        block::Outcome::Unkept => w.u8(9),
+                        block::Outcome::Full => w.u8(10),
                     }
                 }
                 Answer::Root(o) => {
@@ -253,6 +255,8 @@ impl Answer {
                     6 => block::Outcome::Settled,
                     7 => block::Outcome::Released,
                     8 => block::Outcome::Expired,
+                    9 => block::Outcome::Unkept,
+                    10 => block::Outcome::Full,
                     _ => return None,
                 }),
                 9 => Answer::Root(match r.u8()? {
@@ -396,6 +400,23 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
                     w.u128(*block);
                     w.u64(*deadline_ns);
                 }
+                block::Command::Repair {
+                    chunk,
+                    from,
+                    to,
+                    most,
+                } => {
+                    w.u8(6);
+                    chunk.encode(w);
+                    w.u128(*from);
+                    w.u128(*to);
+                    w.u32(*most);
+                }
+                block::Command::Unkeep { block, volume } => {
+                    w.u8(7);
+                    w.u128(*block);
+                    w.u128(*volume);
+                }
             }
         }
         Command::Root(root::Command::Enlist(e)) => {
@@ -417,6 +438,27 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
             w.u64(l.node);
             w.u64(l.exposure_ns);
             w.u64(l.crashes);
+        }
+        Command::Root(root::Command::Seen(seen)) => {
+            w.u8(5);
+            w.u8(2);
+            w.u64(seen.node);
+            w.u8(u8::from(seen.present));
+        }
+        Command::Root(root::Command::Leave { node, .. }) => {
+            w.u8(5);
+            w.u8(3);
+            w.u64(*node);
+        }
+        Command::Root(root::Command::Retire { volume, .. }) => {
+            w.u8(5);
+            w.u8(4);
+            w.u128(*volume);
+        }
+        Command::Root(root::Command::Forget { volume }) => {
+            w.u8(5);
+            w.u8(5);
+            w.u128(*volume);
         }
     }
     Ok(())
@@ -515,6 +557,16 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
                 block: r.u128()?,
                 deadline_ns: r.u64()?,
             },
+            6 => block::Command::Repair {
+                chunk: mantle_chunk::ChunkKey::decode(r)?,
+                from: r.u128()?,
+                to: r.u128()?,
+                most: r.u32()?,
+            },
+            7 => block::Command::Unkeep {
+                block: r.u128()?,
+                volume: r.u128()?,
+            },
             _ => return None,
         }),
         5 => Command::Root(match r.u8()? {
@@ -532,6 +584,7 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
                     volumes,
                     max_nodes: r.u32()?,
                     max_volumes: r.u32()?,
+                    at_ns,
                 })
             }
             1 => root::Command::Lived(root::Lived {
@@ -539,6 +592,24 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
                 exposure_ns: r.u64()?,
                 crashes: r.u64()?,
             }),
+            2 => root::Command::Seen(root::Seen {
+                node: r.u64()?,
+                present: match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                },
+                at_ns,
+            }),
+            3 => root::Command::Leave {
+                node: r.u64()?,
+                at_ns,
+            },
+            4 => root::Command::Retire {
+                volume: r.u128()?,
+                at_ns,
+            },
+            5 => root::Command::Forget { volume: r.u128()? },
             _ => return None,
         }),
         _ => return None,
@@ -2331,6 +2402,7 @@ mod tests {
                 volumes: vec![(1, 1 << 30), (u128::MAX, u64::MAX)],
                 max_nodes: 3,
                 max_volumes: u32::MAX,
+                at_ns,
             })),
             Command::Root(root::Command::Enlist(root::Enlist {
                 node: u64::MAX,
@@ -2338,6 +2410,7 @@ mod tests {
                 volumes: Vec::new(),
                 max_nodes: 0,
                 max_volumes: 0,
+                at_ns,
             })),
             Command::Root(root::Command::Lived(root::Lived {
                 node: 3,
@@ -2349,6 +2422,36 @@ mod tests {
                 exposure_ns: u64::MAX,
                 crashes: u64::MAX,
             })),
+            Command::Root(root::Command::Seen(root::Seen {
+                node: 3,
+                present: false,
+                at_ns,
+            })),
+            Command::Root(root::Command::Seen(root::Seen {
+                node: u64::MAX,
+                present: true,
+                at_ns,
+            })),
+            Command::Root(root::Command::Leave { node: 7, at_ns }),
+            Command::Root(root::Command::Retire {
+                volume: u128::MAX,
+                at_ns,
+            }),
+            Command::Root(root::Command::Forget { volume: 7 }),
+            Command::Block(block::Command::Repair {
+                chunk: mantle_chunk::ChunkKey {
+                    block: u128::MAX,
+                    epoch: 7,
+                    index: 2,
+                },
+                from: 1,
+                to: u128::MAX,
+                most: u32::MAX,
+            }),
+            Command::Block(block::Command::Unkeep {
+                block: 9,
+                volume: u128::MAX,
+            }),
         ]
     }
 
@@ -2557,6 +2660,7 @@ mod tests {
             ]
             .map(Answer::Root),
         );
+        answers.extend([block::Outcome::Unkept, block::Outcome::Full].map(Answer::Block));
         answers
     }
 

@@ -2484,8 +2484,9 @@ fn a_run_takes_only_the_md5s_its_object_needs_and_only_at_its_offset() {
 /// buffer, its segments opened where they lie and its plaintext handed out as a slice of it, one
 /// copy of each byte read (research/71, step 5). It copied each byte three times: gathered, each
 /// 64 KiB segment copied out to be opened, its plaintext copied again into the block's output
-/// (146 allocations and 25,177,456 bytes for this GET; 16 and 8,396,144 now, the sealed bytes
-/// gathered once and the GET's own bookkeeping).
+/// (146 allocations and 25,177,456 bytes for this GET; 16 and 8,396,144 then, the sealed bytes
+/// gathered once and the GET's own bookkeeping; 8,395,440 once a block's state for decoding around
+/// a failed span is held apart, allocated only where a span fails, docs/design/repair.md §3).
 #[test]
 fn a_get_copies_each_byte_it_reads_once() {
     const SIZE: usize = 8 << 20;
@@ -2525,7 +2526,7 @@ fn a_get_copies_each_byte_it_reads_once() {
     assert!(out == bytes, "the plaintext read is the object's");
     assert_eq!(
         (counts.allocations, counts.reallocations, counts.bytes),
-        (16, 0, 8_396_144),
+        (16, 0, 8_395_440),
         "{counts:?}"
     );
 }

@@ -578,6 +578,60 @@ pub struct Reverse {
     pub index: u16,
 }
 
+/// A node's presence as the cell has seen it (docs/design/repair.md §2): whether it is seen
+/// now and since when, in the root range's time, and over its enlisted life the time it was
+/// seen and not seen, the stretches it was not seen, and the longest of them. Its measured
+/// availability is the time seen over both.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Presence {
+    pub present: bool,
+    pub since_ns: u64,
+    pub present_ns: u64,
+    pub away_ns: u64,
+    pub absences: u64,
+    pub longest_away_ns: u64,
+}
+
+/// A volume's state in the root range where it is not active (docs/design/repair.md §2):
+/// leaving, its chunks moved off before it goes, or gone, written off for good, with the root
+/// range's time it became so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeState {
+    pub state: VolumeStanding,
+    pub at_ns: u64,
+}
+
+/// What a volume of the table is to the cell's placement and repair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeStanding {
+    /// It takes new chunks and holds its own.
+    Active,
+    /// Its node said it leaves: it takes no new chunk, and repair moves every chunk it holds
+    /// to the others before it goes.
+    Leaving,
+    /// Written off: its node started without it, or it left once it held nothing.
+    Gone,
+}
+
+impl VolumeStanding {
+    fn code(self) -> u8 {
+        match self {
+            Self::Active => 0,
+            Self::Leaving => 1,
+            Self::Gone => 2,
+        }
+    }
+
+    fn of(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Active),
+            1 => Some(Self::Leaving),
+            2 => Some(Self::Gone),
+            _ => None,
+        }
+    }
+}
+
 impl FileHeader {
     pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
         record(|w| {
@@ -1213,6 +1267,65 @@ impl Reverse {
         let mut r = open(bytes, "reverse")?;
         let reverse = r.u16().map(|index| Self { index });
         decoded(reverse, &r, "reverse")
+    }
+}
+
+impl Presence {
+    pub fn encode(&self) -> Vec<u8> {
+        sealed(|w| {
+            w.u8(u8::from(self.present));
+            w.u64(self.since_ns);
+            w.u64(self.present_ns);
+            w.u64(self.away_ns);
+            w.u64(self.absences);
+            w.u64(self.longest_away_ns);
+        })
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "presence")?;
+        decoded(
+            (|| {
+                let present = match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                };
+                Some(Self {
+                    present,
+                    since_ns: r.u64()?,
+                    present_ns: r.u64()?,
+                    away_ns: r.u64()?,
+                    absences: r.u64()?,
+                    longest_away_ns: r.u64()?,
+                })
+            })(),
+            &r,
+            "presence",
+        )
+    }
+}
+
+impl VolumeState {
+    pub fn encode(&self) -> Vec<u8> {
+        sealed(|w| {
+            w.u8(self.state.code());
+            w.u64(self.at_ns);
+        })
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "volume state")?;
+        decoded(
+            (|| {
+                Some(Self {
+                    state: VolumeStanding::of(r.u8()?)?,
+                    at_ns: r.u64()?,
+                })
+            })(),
+            &r,
+            "volume state",
+        )
     }
 }
 

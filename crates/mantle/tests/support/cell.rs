@@ -396,6 +396,30 @@ pub(crate) enum Line {
     /// Its orderly stop is done: the process ends. With the sleeps of the node's loop that found
     /// every timer of its shard taken.
     Stopped(u64),
+    /// The cell's repair as this node runs it (docs/design/repair.md §5), said as it changes.
+    Repair(Repairing),
+    /// The root range took the node's leave: its volumes are leaving.
+    Leaving,
+}
+
+/// A `repair` line: whether the node runs the cell's repair, whether its last pass ended with
+/// nothing it could do at the root and Block ranges' applied indexes it began at, and its counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Repairing {
+    pub(crate) leading: bool,
+    pub(crate) settled: bool,
+    pub(crate) root_applied: u64,
+    pub(crate) block_applied: u64,
+    pub(crate) rebuilt: u64,
+    pub(crate) timing: u64,
+    pub(crate) commands: u64,
+    pub(crate) unplaced: u64,
+    pub(crate) unreadable: u64,
+    pub(crate) corrupt: u64,
+    pub(crate) waiting: u64,
+    pub(crate) short: u64,
+    pub(crate) lost: u64,
+    pub(crate) running: u64,
 }
 
 /// A history as a node says it: node time run and crashes.
@@ -455,6 +479,46 @@ pub(crate) fn parse(line: &str) -> Option<Line> {
             leader.parse().ok()?,
         )),
         ["stopped", waits] => Some(Line::Stopped(waits.parse().ok()?)),
+        ["leaving"] => Some(Line::Leaving),
+        [
+            "repair",
+            leading,
+            settled,
+            root_applied,
+            block_applied,
+            rebuilt,
+            timing,
+            commands,
+            unplaced,
+            unreadable,
+            corrupt,
+            waiting,
+            short,
+            lost,
+            running,
+        ] => {
+            let flag = |f: &str| match f {
+                "0" => Some(false),
+                "1" => Some(true),
+                _ => None,
+            };
+            Some(Line::Repair(Repairing {
+                leading: flag(leading)?,
+                settled: flag(settled)?,
+                root_applied: root_applied.parse().ok()?,
+                block_applied: block_applied.parse().ok()?,
+                rebuilt: rebuilt.parse().ok()?,
+                timing: timing.parse().ok()?,
+                commands: commands.parse().ok()?,
+                unplaced: unplaced.parse().ok()?,
+                unreadable: unreadable.parse().ok()?,
+                corrupt: corrupt.parse().ok()?,
+                waiting: waiting.parse().ok()?,
+                short: short.parse().ok()?,
+                lost: lost.parse().ok()?,
+                running: running.parse().ok()?,
+            }))
+        }
         ["held", held] => Some(Line::Held(match *held {
             "0" => false,
             "1" => true,
@@ -533,7 +597,9 @@ pub(crate) fn movement(line: &Line) -> Option<(u64, u64, u64, u64, Duration, Dur
         | Line::Stopping
         | Line::Handing(..)
         | Line::Handed(..)
-        | Line::Stopped(..) => None,
+        | Line::Stopped(..)
+        | Line::Repair(..)
+        | Line::Leaving => None,
     }
 }
 
@@ -942,6 +1008,10 @@ pub(crate) struct Cell {
     /// Each node's configuration as `mantle init` wrote it, for a cell it made (`Cell::made`):
     /// its process serves from that file, which the test does not write.
     pub(crate) made: BTreeMap<u64, PathBuf>,
+    /// The cell's repair as each running node last said it, and the nodes whose leave the root
+    /// range took.
+    pub(crate) repairs: BTreeMap<u64, Repairing>,
+    pub(crate) leaving: BTreeSet<u64>,
     pub(crate) _root: tempfile::TempDir,
 }
 
@@ -1059,6 +1129,19 @@ impl Cell {
         Self::made_started(args, false, true, Network::Direct)
     }
 
+    /// A cell `mantle init` made as [`Cell::made`] makes it, its founders past the first `started`
+    /// by id made and never started: each joins the running cell when the test starts it
+    /// (`Cell::start`, `Cell::introduce`), its volumes new to the cell's table.
+    pub(crate) fn made_partly(args: impl FnOnce(&Path) -> Vec<String>, started: usize) -> Self {
+        let mut cell = Self::made_unstarted(args, true, Network::Direct);
+        let founders: Vec<u64> = cell.made.keys().copied().collect();
+        for id in founders.into_iter().take(started) {
+            cell.start(id);
+        }
+        cell.introduce();
+        cell
+    }
+
     /// A cell `mantle init` made, its founders started highest id first, each one's configuration
     /// naming the peers already listening by `localhost` and the ports they bound, as an operator
     /// names a peer by its host: a founder learns on standard input only where the peers started
@@ -1088,6 +1171,25 @@ impl Cell {
     fn made_started(
         args: impl FnOnce(&Path) -> Vec<String>,
         named: bool,
+        drivers: bool,
+        network: Network,
+    ) -> Self {
+        let mut cell = Self::made_unstarted(args, drivers, network);
+        if named {
+            cell.start_named();
+        } else {
+            let founders: Vec<u64> = cell.made.keys().copied().collect();
+            for id in founders {
+                cell.start(id);
+            }
+            cell.introduce();
+        }
+        cell
+    }
+
+    /// A cell `mantle init` made, none of its founders started.
+    fn made_unstarted(
+        args: impl FnOnce(&Path) -> Vec<String>,
         drivers: bool,
         network: Network,
     ) -> Self {
@@ -1184,7 +1286,7 @@ impl Cell {
             serving: true,
         };
         let (tell, heard) = channel();
-        let mut cell = Self {
+        Self {
             nodes: u64::try_from(founders.len()).unwrap(),
             pki,
             dirs: founders.iter().cloned().collect(),
@@ -1225,17 +1327,10 @@ impl Cell {
             leaderless: BTreeSet::new(),
             stopped: BTreeSet::new(),
             made,
+            repairs: BTreeMap::new(),
+            leaving: BTreeSet::new(),
             _root: root,
-        };
-        if named {
-            cell.start_named();
-        } else {
-            for (id, _) in &founders {
-                cell.start(*id);
-            }
-            cell.introduce();
         }
-        cell
     }
 
     /// Starts the founders highest id first, each configuration naming the peers already
@@ -1355,6 +1450,8 @@ impl Cell {
             leaderless: BTreeSet::new(),
             stopped: BTreeSet::new(),
             made: BTreeMap::new(),
+            repairs: BTreeMap::new(),
+            leaving: BTreeSet::new(),
             _root: root,
         };
         // One at a time, each listening before the next starts (`Cell::start`).
@@ -1563,6 +1660,7 @@ impl Cell {
         running.child.kill().unwrap();
         running.child.wait().unwrap();
         self.status.retain(|(node, _), _| *node != id);
+        self.repairs.remove(&id);
         self.held.remove(&id);
         self.log.remove(&id);
         self.transfers.remove(&id);
@@ -1599,7 +1697,9 @@ impl Cell {
                 | Line::Stopping
                 | Line::Handing(..)
                 | Line::Handed(..)
-                | Line::Stopped(..) => None,
+                | Line::Stopped(..)
+                | Line::Repair(..)
+                | Line::Leaving => None,
             })
             .chain(self.clients.values().copied())
             .chain(self.transfers.values().map(|(_, serve)| *serve))
@@ -1779,6 +1879,12 @@ impl Cell {
                         self.histories.insert(id, (cell, own));
                     }
                     Line::Stopping => {}
+                    Line::Repair(repairing) => {
+                        self.repairs.insert(id, repairing);
+                    }
+                    Line::Leaving => {
+                        self.leaving.insert(id);
+                    }
                     Line::Handing(group, to) => self.handing.push((id, group, to)),
                     Line::Handed(group, leader) => self.handed.push((id, group, leader)),
                     Line::Stopped(waits) => {

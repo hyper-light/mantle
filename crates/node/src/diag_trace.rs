@@ -36,6 +36,49 @@ pub const DOOR_TAKEN: u64 = 29;
 pub const FAILED: u64 = 30;
 pub const ENTRY_OUT: u64 = 31;
 pub const ENTRY_ANSWERED: u64 = 32;
+// Chunks at the node that stores them: a peer's chunk's body read whole, a peer's or this node's
+// own chunk made durable by its volume.
+pub const CHUNK_BODY: u64 = 33;
+pub const CHUNK_STORED_PEER: u64 = 34;
+pub const CHUNK_STORED_OWN: u64 = 35;
+
+thread_local! {
+    /// When each exchange's chunk began arriving, and when each put went to a volume.
+    pub static CHUNK_SINCE: std::cell::RefCell<std::collections::HashMap<u64, u64>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Marks `key` begun now.
+pub fn mark(key: u64) {
+    if !on() {
+        return;
+    }
+    let t = now();
+    CHUNK_SINCE.with(|m| {
+        m.borrow_mut().insert(key, t);
+    });
+}
+
+/// Records `kind` with the time since `key` was marked, and `a`; forgets the mark when `forget`.
+pub fn since(kind: u64, key: u64, a: u64, forget: bool) {
+    if !on() {
+        return;
+    }
+    let t = now();
+    let began = CHUNK_SINCE.with(|m| {
+        let mut m = m.borrow_mut();
+        if forget { m.remove(&key) } else { m.get(&key).copied() }
+    });
+    if let Some(began) = began {
+        ev(kind, t.saturating_sub(began), a, 0);
+    }
+}
+
+/// A key for an exchange, from its debug form's digits.
+pub fn exchange_key(exchange: impl std::fmt::Debug) -> u64 {
+    let text = format!("{exchange:?}");
+    text.chars().filter(char::is_ascii_digit).collect::<String>().parse::<u64>().unwrap_or(0) | (1 << 62)
+}
 // The node's loop.
 pub const TURN: u64 = 40;
 pub const TURN_PART: u64 = 41;

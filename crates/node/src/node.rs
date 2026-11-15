@@ -2180,6 +2180,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 };
                 let body = body.unwrap_or(0);
                 let kept = if what.keeps() { body } else { 0 };
+                if matches!(what, Arriving::ChunkPut { .. }) {
+                    crate::diag_trace::mark(crate::diag_trace::exchange_key(exchange));
+                }
                 self.receiving.push(Receiving {
                     exchange,
                     peer,
@@ -2878,6 +2881,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 until_ns,
             } => {
                 let room = received.body;
+                let key = crate::diag_trace::exchange_key(exchange);
+                crate::diag_trace::since(crate::diag_trace::CHUNK_BODY, key, room, false);
+                crate::diag_trace::mark(key);
                 // The buffer was sized to the body and read whole, so it becomes `Bytes` without a
                 // copy or an allocation (its length is its capacity).
                 let put = self.storage.put(
@@ -3321,7 +3327,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.room_freed |= stored.iter().any(|done| matches!(done, Done::Put(..)));
         for done in stored.drain(..) {
             match done {
-                Done::Put(Origin::Exchange(exchange), _, Ok(())) => {
+                Done::Put(Origin::Exchange(exchange), len, Ok(())) => {
+                    crate::diag_trace::since(
+                        crate::diag_trace::CHUNK_STORED_PEER,
+                        crate::diag_trace::exchange_key(exchange),
+                        len,
+                        true,
+                    );
                     self.answer_chunk(exchange, chunk::Status::Stored, None)?;
                 }
                 Done::Get(Origin::Exchange(exchange), Ok(bytes)) => {
@@ -3335,6 +3347,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     self.answer_chunk(exchange, chunk::Status::of_error(&error), None)?;
                 }
                 Done::Put(Origin::Asked(asked), len, answered) => {
+                    crate::diag_trace::since(crate::diag_trace::CHUNK_STORED_OWN, asked, len, true);
                     let outcome = match answered {
                         Ok(()) => ChunkOutcome::Stored,
                         Err(error) => {
@@ -3434,6 +3447,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         if at == self.id {
             let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            crate::diag_trace::mark(asked);
             let outcome = match self.storage.holds(volume) {
                 None => Some(ChunkOutcome::Refused(chunk::Status::NoVolume)),
                 Some(slot) => match self.storage.put(

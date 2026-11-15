@@ -4319,9 +4319,14 @@ impl<F: BlockFile> ShardDb<F> {
                 home.put_part(part, table, newest);
             }
             self.prune_lists();
-            if self.open_gen_full() {
-                self.close_open_gen();
-            }
+            // No generation closes here: one closes only where the kept memtables could not take
+            // the open one's next growth within what they may hold ([`Self::extend_kept`]), or must
+            // give memory back ([`Self::fit_kept`]), so while memory is to spare the index is one
+            // generation, which a get probes alone (research/63 §3). Closed as it reached a third
+            // of what they may hold, a share that falls with the machine's free memory, a 100M
+            // index beside 40 GiB another process held split in two with every record still kept,
+            // and 71% of gets probed both: 0.80-0.83x the gets of the same build quiet
+            // (docs/research/89 §2).
             // The part back may hold more than it did when it went, and whatever took it back, a
             // get's tending or a maintenance step, leaves the regions and the kept memtables
             // within the budget.
@@ -4436,17 +4441,6 @@ impl<F: BlockFile> ShardDb<F> {
             self.kept_whole = false;
         }
         gave
-    }
-
-    /// Whether the open generation has grown to its share of the kept memtables' memory, a
-    /// third of what they may hold, every part home: closed then, further generations follow
-    /// within that memory together (research/63 §3).
-    fn open_gen_full(&self) -> bool {
-        self.kept_index.as_ref().is_some_and(|home| {
-            home.out() == 0
-                && home.bytes().saturating_mul(3) >= self.kept_limit()
-                && home.covers_newest().is_some()
-        })
     }
 
     /// Gives kept memtables back, oldest first: while they hold more than the budget's idle

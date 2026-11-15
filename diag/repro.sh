@@ -8,8 +8,8 @@ dir=$top/$name
 mkdir -p "$top"
 if [ -e "$dir" ]; then echo "$dir exists"; exit 1; fi
 mkdir -p "$dir/trace"
-echo "== $name $(date -u +%FT%TZ) load $(cut -d' ' -f1-3 /proc/loadavg) bin $(md5sum < "$bin" | cut -c1-12)"
-MANTLE_DIAG_TRACE=$dir/trace "$bin" bench doors "$dir/run" --sizes 1 --kinds PUT --objects 2 --volume 256M "$@" > "$dir/out.log" 2>&1
+echo "== $name $(date -u +%FT%TZ) load $( (cut -d' ' -f1-3 /proc/loadavg || sysctl -n vm.loadavg) 2>/dev/null) bin $( (md5sum < "$bin" || md5 -q "$bin") 2>/dev/null | cut -c1-12)"
+MANTLE_DIAG_TRACE=$dir/trace "$bin" bench doors "$dir/run" --kinds PUT --objects 2 "$@" > "$dir/out.log" 2>&1
 echo "exit $?"
 grep -E '^doors (native|http) PUT 1B ' "$dir/out.log" | awk '{for(i=1;i<=NF;i++){if($i=="clients")c=$(i+1); if($i=="elapsed_ms")e=$(i+1); if($i=="ops")o=$(i+1); if($i=="p50")p=$(i+1); if($i=="max")m=$(i+1); if($i=="again")a=$(i+1); if($i=="major_faults/op")mf=$(i+1)} if(e>0) printf "   %s clients %s ops %s elapsed_ms %s rate %.1f/s p50_us %s max_us %s again %s majf %s\n", $2, c, o, e, o*1000/e, p, m, a, mf}'
 grep -E 'verified|clients at most| ladder best | step clients ' "$dir/out.log"

@@ -102,6 +102,7 @@ fn a_compaction_no_seat_takes_waits_for_a_workers_message() {
         file_end: store.end(),
         generation: store.generation(),
         keep: None,
+        reads: None,
     });
     let ticket = pool.send(job, Owner::Index, true).unwrap().unwrap();
     let mut trunk = Trunk::new(TRUNK).unwrap();

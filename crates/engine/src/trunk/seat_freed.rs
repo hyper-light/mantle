@@ -86,6 +86,7 @@ fn a_worker_is_free_once_its_result_is_sent() {
         file_end: store.end(),
         generation: store.generation(),
         keep: None,
+        reads: None,
     });
     // Within the cores, as the shard sends the index.
     let ticket = pool.send(job, Owner::Index, true).unwrap().unwrap();

@@ -269,6 +269,9 @@ pub struct Store<F: BlockFile> {
     /// A worker's job's loan of the shard's cache memory, its written pages kept in it
     /// ([`Store::keep_pages`]).
     keep: Option<Box<cache::Kept>>,
+    /// A worker's job's loan of the shard's cache chunks holding its inputs ([`Self::read_from`]):
+    /// a read of a page it holds is a copy from memory, not a device read.
+    reads: Option<Box<cache::ReadLoan>>,
     /// What the machine has free, asked before the cache takes more memory
     /// ([`Store::follow_machine`]).
     machine_free: Option<fn() -> Option<u64>>,
@@ -820,6 +823,7 @@ impl<F: BlockFile> Store<F> {
             io: IoStats::default(),
             cache: None,
             keep: None,
+            reads: None,
             machine_free: None,
             range_filter_bits: RANGE_FILTER_BITS,
             writer: None,
@@ -904,6 +908,7 @@ impl<F: BlockFile> Store<F> {
             io: IoStats::default(),
             cache: None,
             keep: None,
+            reads: None,
             machine_free: None,
             range_filter_bits: RANGE_FILTER_BITS,
             writer: None,
@@ -1026,6 +1031,7 @@ impl<F: BlockFile> Store<F> {
                 io: IoStats::default(),
                 cache: None,
                 keep: None,
+                reads: None,
                 machine_free: None,
                 range_filter_bits: RANGE_FILTER_BITS,
                 writer: None,
@@ -2011,6 +2017,39 @@ impl<F: BlockFile> Store<F> {
     /// The loan the job's pages were kept in, taken back at the job's end.
     pub(crate) fn take_kept(&mut self) -> Option<Box<cache::Kept>> {
         self.keep.take()
+    }
+
+    /// Whether the cache may lend chunks for a job's reads ([`Self::lend_reads`]): it holds loans'
+    /// chunks, and none retires.
+    pub(crate) fn lends_reads(&self) -> bool {
+        self.cache.as_ref().is_some_and(cache::Cache::lends_reads)
+    }
+
+    /// The cache chunks holding pages of `addresses`, lent to the job that will read them
+    /// ([`cache::Cache::lend_reads`]); none without a cache or such a chunk.
+    pub(crate) fn lend_reads(&mut self, addresses: &[u64]) -> Option<Box<cache::ReadLoan>> {
+        self.cache.as_mut()?.lend_reads(addresses).map(Box::new)
+    }
+
+    /// A read loan back from its job, however the job ended ([`cache::Cache::take_reads_back`]).
+    pub(crate) fn take_reads_back(&mut self, loan: cache::ReadLoan) {
+        if let Some(c) = self.cache.as_mut() {
+            c.take_reads_back(loan);
+        }
+    }
+
+    /// A worker's store reads its job's inputs the shard's cache lent, where the loan holds
+    /// them; none reads every page from the file.
+    pub(crate) fn read_from(&mut self, loan: Option<Box<cache::ReadLoan>>) {
+        self.reads = loan.map(|mut loan| {
+            loan.index();
+            loan
+        });
+    }
+
+    /// The read loan, taken back at the job's end.
+    pub(crate) fn take_reads(&mut self) -> Option<Box<cache::ReadLoan>> {
+        self.reads.take()
     }
 
     /// Takes back a run its writer is done with: its pages written, its buffer for the next.
@@ -3739,6 +3778,10 @@ impl<F: BlockFile> Store<F> {
             || span.pending_for(address).is_some()
             || (!self.fenced && span.prepared.as_ref().is_some_and(|(a, _)| *a == address))
             || self.cache.as_ref().is_some_and(|c| c.contains(address))
+            || self
+                .reads
+                .as_ref()
+                .is_some_and(|r| r.get(address).is_some())
         {
             return Ok(());
         }
@@ -4038,6 +4081,17 @@ impl<F: BlockFile> Store<F> {
         out: &mut Vec<u8>,
         transfer: bool,
     ) -> Result<Option<std::ops::Range<usize>>, Error> {
+        // A page of the job's inputs the shard's cache lent is copied from the loan, as a cache
+        // hit is, the device left alone; one a read ahead already has out comes from that read.
+        if span.pending_for(address).is_none()
+            && let Some(loan) = self.reads.as_mut()
+            && let Some(payload) = loan.get(address)
+            && out.try_reserve(payload.len()).is_ok()
+        {
+            out.extend_from_slice(payload);
+            loan.count_read();
+            return Ok(None);
+        }
         let pending = span.pending_for(address);
         let memory = span
             .prepared

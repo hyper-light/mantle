@@ -1508,6 +1508,15 @@ impl Trunk {
                     }
                 }
                 let given = store.grant(needed)?;
+                // The pages the job reads that earlier jobs wrote and the shard's cache kept: the
+                // chunks holding them go with it, read from memory where every file is read
+                // directly and the device would serve them again (docs/research/90 §3).
+                let mut reading = Vec::new();
+                if store.lends_reads() {
+                    for b in &task.inputs {
+                        b.leaf_addresses(store, &task.from, task.end.as_deref(), &mut reading);
+                    }
+                }
                 let State::Ready(task) = std::mem::replace(state, State::Dropped) else {
                     continue;
                 };
@@ -1518,6 +1527,7 @@ impl Trunk {
                     file_end: store.end(),
                     generation: store.generation(),
                     keep: store.lend_pages(pages),
+                    reads: store.lend_reads(&reading),
                 });
                 let pool = self.pool.as_mut().ok_or(no_pool())?;
                 let sent = match pool.send(job, Owner::Trunk, admit) {
@@ -1526,6 +1536,9 @@ impl Trunk {
                         let job = *job;
                         if let Some(kept) = job.keep {
                             store.unlend_pages(*kept);
+                        }
+                        if let Some(reads) = job.reads {
+                            store.take_reads_back(*reads);
                         }
                         let Work::Compact(task) = job.work else {
                             return Err(corrupt());
@@ -1544,6 +1557,9 @@ impl Trunk {
                         let job = *job;
                         if let Some(kept) = job.keep {
                             store.unlend_pages(*kept);
+                        }
+                        if let Some(reads) = job.reads {
+                            store.take_reads_back(*reads);
                         }
                         let Work::Compact(task) = job.work else {
                             return Err(corrupt());
@@ -1587,6 +1603,10 @@ impl Trunk {
                 return Ok(());
             };
             taken = taken.saturating_add(1);
+            // The chunks lent for the job's reads come back however it ended.
+            if let Some(reads) = back.reads {
+                store.take_reads_back(*reads);
+            }
             let task = self.tasks.iter_mut().find(|t| {
                 matches!(&t.run, Running::Remote { state: State::Out(k), .. } if *k == back.ticket)
             });
@@ -1646,6 +1666,9 @@ impl Trunk {
             };
             if let Some(kept) = back.kept {
                 store.unlend_pages(*kept);
+            }
+            if let Some(reads) = back.reads {
+                store.take_reads_back(*reads);
             }
             for t in &mut self.tasks {
                 if let Running::Remote { grant, state } = &mut t.run

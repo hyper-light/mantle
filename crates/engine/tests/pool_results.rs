@@ -85,6 +85,7 @@ fn packing(store: &mut Store<DeviceFile>, number: u8, corrupt: bool) -> Box<Job>
         file_end: store.end(),
         generation: store.generation(),
         keep: None,
+        reads: None,
     })
 }
 

@@ -385,6 +385,7 @@ async fn run(
                 file_end: db.store.end(),
                 generation: db.store.generation(),
                 keep: None,
+                reads: None,
             });
             inject(db, injected, job)
         }
@@ -418,6 +419,7 @@ async fn run(
                 file_end: db.store.end(),
                 generation: db.store.generation(),
                 keep: None,
+                reads: None,
             });
             inject(db, injected, job)
         }

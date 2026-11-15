@@ -500,8 +500,10 @@ fn a_drain_consolidates_whole_in_one_consolidation() {
 
 /// The pages a worker's compaction writes come back cached where they were written: the shard's
 /// cache lends each job room, the worker keeps its pages in it as it writes them, and the shard
-/// takes them with the job's branches. With a cache that holds the store and nothing read before
-/// maintenance ends, reading every key after it reads no page from the device.
+/// takes them with the job's branches. A later job reads those of its inputs from the cache's
+/// chunks lent with it, and the chunks come back with every page still live in them. With a cache
+/// that holds the store and nothing read before maintenance ends, reading every key after it
+/// reads no page from the device.
 #[test]
 fn a_workers_pages_are_cached_where_they_were_written() {
     let dir = tempfile::tempdir().unwrap();
@@ -527,6 +529,11 @@ fn a_workers_pages_are_cached_where_they_were_written() {
     assert!(
         trunk.pivot_compactions > 0 && trunk.leaf_compactions > 0,
         "{trunk:?}"
+    );
+    let m = io.cache_memory;
+    assert!(
+        m.read_loans > 0 && m.read_used > 0 && m.read_used <= m.read_lent,
+        "no job read its inputs from the cache: {m:?}"
     );
     let before = io.device_reads;
     for k in 0..KEYS {

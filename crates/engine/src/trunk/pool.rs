@@ -37,7 +37,7 @@ use crate::branch::merge::Compaction;
 use crate::branch::{Branch, Builder};
 use crate::error::Error;
 use crate::memtable::hashed::Sorter;
-use crate::store::cache::Kept;
+use crate::store::cache::{Kept, ReadLoan};
 use crate::store::{Ask, Config, IntoFile, Refill, Store, TopUp};
 use hyper_block::block::BlockFile;
 
@@ -146,6 +146,9 @@ pub struct Job {
     pub file_end: u64,
     pub generation: u64,
     pub keep: Option<Box<Kept>>,
+    /// The shard's cache chunks holding the job's inputs, read from memory on the worker and
+    /// back with the job's end ([`crate::store::Store::read_from`]).
+    pub reads: Option<Box<ReadLoan>>,
 }
 
 /// A job's result: the branches made, each with its first key, in key order; the granted
@@ -198,6 +201,8 @@ pub struct Back {
     /// The cache's memory the job was lent, its written pages in it: the owner's to adopt with
     /// the result, or to give back unread.
     pub kept: Option<Box<Kept>>,
+    /// The cache chunks lent for the job's reads, the owner's to take back however it ended.
+    pub reads: Option<Box<ReadLoan>>,
     /// An issued-write failure or worker unwind remains visible when input was abandoned.
     pub physical_error: Option<Error>,
     pub topped: Vec<u64>,
@@ -225,6 +230,7 @@ pub(crate) enum Message {
         result: Result<Output, Error>,
         physical_error: Option<Error>,
         kept: Option<Box<Kept>>,
+        reads: Option<Box<ReadLoan>>,
         sorted: Option<Box<SortPack>>,
         indexed: Option<Box<IndexJob>>,
     },
@@ -299,6 +305,7 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
                     result: Err(error),
                     physical_error: None,
                     kept: None,
+                    reads: None,
                     sorted: None,
                     indexed: None,
                 }
@@ -332,14 +339,17 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
         let t = Instant::now();
         let waited = store.read_wait_ns();
         store.keep_pages(job.keep.take());
+        store.read_from(job.reads.take());
         let (ran, unwound) = run_guarded(&mut store, &mut job);
         // Whatever the job's end, every run it handed the device is answered before its result
         // goes back: the shard releases a failed job's extents once it has the result, and the
         // next job starts the allocator over, so none of this job's writes may land after. The
         // job's own failure is the one reported.
         let drained = store.drain();
-        // The pages kept go back however the job ended: the shard's cache lent their room.
+        // The pages kept go back however the job ended: the shard's cache lent their room; and
+        // the chunks its inputs were read from, the cache's memory.
         let kept = store.take_kept();
+        let reads = store.take_reads();
         // An issued failure precedes the unwind. A worker unwind is non-abandonable too,
         // so terminal cleanup must retain it even when a partial input was canceled.
         let physical_error = drained.as_ref().err().cloned().or_else(|| {
@@ -372,6 +382,7 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
             result,
             physical_error,
             kept,
+            reads,
             sorted,
             indexed,
         };
@@ -1067,6 +1078,7 @@ impl Pool {
                 ticket,
                 result: Err(error.clone()),
                 kept: None,
+                reads: None,
                 physical_error: Some(error),
                 topped: Vec::new(),
                 sorted: None,
@@ -1427,6 +1439,7 @@ impl Pool {
                             kept: None,
                         }),
                         kept: None,
+                        reads: None,
                         physical_error,
                         topped: Vec::new(),
                         sorted: None,
@@ -1456,6 +1469,7 @@ impl Pool {
                 result,
                 physical_error,
                 kept,
+                reads,
                 sorted,
                 indexed,
             } => {
@@ -1487,6 +1501,7 @@ impl Pool {
                         ticket,
                         result,
                         kept,
+                        reads,
                         physical_error,
                         topped,
                         sorted: sorted.map(|pack| *pack),

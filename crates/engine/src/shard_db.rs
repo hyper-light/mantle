@@ -3453,6 +3453,7 @@ impl<F: BlockFile> ShardDb<F> {
             file_end: self.store.end(),
             generation: self.store.generation(),
             keep: None,
+            reads: None,
         });
         let sent = pool.send_growth(&mut self.store, job);
         match sent {
@@ -4209,6 +4210,7 @@ impl<F: BlockFile> ShardDb<F> {
             file_end: self.store.end(),
             generation: self.store.generation(),
             keep: None,
+            reads: None,
         });
         let bytes = table_bytes
             .saturating_add(growth)
@@ -5267,6 +5269,7 @@ impl<F: BlockFile> ShardDb<F> {
             file_end: self.store.end(),
             generation: self.store.generation(),
             keep,
+            reads: None,
         });
         let sent = match pool.send(job, Owner::Pack, true) {
             Ok(sent) => sent,

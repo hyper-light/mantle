@@ -44,12 +44,13 @@ pub(crate) const STOCK_CLIENT: u64 = 10;
 
 /// What one connection holds with a request in flight, the host holding the pieces of its body it
 /// took: measured by a counting allocator on the listener's thread (`tests/listener_memory.rs`),
-/// 346,132 bytes at the most over plain HTTP and 300,208 over TLS 1.3, at one, two and four
-/// connections, each within 400 bytes of the others (macOS arm64, Mac Studio, 2026-11-15, n 3
-/// runs; Linux x86_64 346,132 over plain HTTP), with the principals' key lookups and S3's
-/// copies in the listener; 341,668 and 295,744 before them (2026-11-12). Mostly pieces of 64 KiB
-/// (`PIECE`): two the host took, two waiting in the body's channel, one being read.
-pub const CONNECTION_BYTES: u64 = 346_132;
+/// 346,212 bytes at the most over plain HTTP, at one connection on Windows aarch64 (CI run
+/// 43762797164; 346,132 on macOS arm64, Mac Studio, n 3, and on Linux x86_64), and 300,208 over
+/// TLS 1.3 (macOS arm64), at one, two and four connections, each within 400 bytes of the others,
+/// 2026-11-15, with the principals' key lookups and S3's copies in the listener; 341,668 and
+/// 295,744 before them (2026-11-12). Mostly pieces of 64 KiB (`PIECE`): two the host took, two
+/// waiting in the body's channel, one being read.
+pub const CONNECTION_BYTES: u64 = 346_212;
 
 /// The connections past those it serves ([`Settings::connections`]) the listener answers `503
 /// SlowDown`, `Connection: close`, rather than closes: as many as one more stock client opens at

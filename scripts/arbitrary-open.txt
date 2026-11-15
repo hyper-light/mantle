@@ -99,7 +99,6 @@ crates/mantle/src/bench.rs run:max(1024)
 crates/mantle/src/bench.rs run:min(1 << 20)
 crates/mantle/src/bench.rs run:unwrap_or(4096)
 crates/mantle/src/bench_doors.rs ETAGS
-crates/mantle/src/bench_doors.rs GROWTH
 crates/mantle/src/bench_doors.rs SLOPE_HIGH
 crates/mantle/src/bench_doors.rs SLOPE_LOW
 crates/mantle/src/bench_doors.rs SLOWED_BASE_NS

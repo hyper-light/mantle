@@ -312,7 +312,22 @@ stock clients stay the correctness suite.
   through the footprint (70 [3][4]).
 - **Load**: open loop with Poisson arrivals by default and a closed ladder doubling while
   throughput grows up to the node's connection budget; an HTTP connection carries one request at a
-  time; the generator reports its CPU and lateness (§10; 70 [6]).
+  time; the generator reports its CPU and lateness (§10; 70 [6]). Each closed step is a point in
+  rounds as §5 judges one (`Policy::STANDARD`): a round is §5a's count of operations at the step's
+  clients, consecutive in one stream, the first (the clients' ramp) not kept, and the step ends
+  once its rounds are enough. A step grows only where its median's interval lies wholly above the
+  best step's before it, and the ladder ends three steps after the last that grew, BBR's count
+  before it calls a pipe full (Linux `tcp_bbr.c`, `bbr_full_bw_cnt`): a ladder that stopped at
+  the first step not a tenth above the last stopped where one noisy step fell, its best 66 and 156
+  PUTs a second in two runs of one build (measurements/2026-11-14-the-ladder-paced.md).
+- **Stops**: each phase says how long the harness's process went without running past the 10 ms
+  waits a thread of its asks, the sum and the longest. A process stopped whole (a frozen cgroup,
+  a pacer duty-cycling the work it runs) stops the cell and its clients together, and every
+  operation out meanwhile counts the stop in its latency; a phase that says a stop measured it,
+  not the cell (measurements/2026-11-14-the-ladder-paced.md). On Linux a wait overruns by its
+  timer slack, 50 µs; macOS coalesces a background thread's timers, so there a 10 ms wait overran
+  by 5 to 6 ms at the mean and 80 ms at the most in every phase measured, and only a pause past
+  that tells a stop.
 - **Rounds**: at least 3,688 transfers behind a p99.9 and 368 behind a p99 (§5a); fewer, and the
   quantile is a dash.
 - **Trials**: a timed and a counting process a point; Williams order in whole cycles; an A/A beside

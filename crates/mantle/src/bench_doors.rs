@@ -32,7 +32,9 @@
 //! clients are tasks on one hyper-rt shard, each holding one connection and the buffers its
 //! operations work in ([`Logical`]), an HTTP connection carrying one request at a time; open loop,
 //! their requests arrive as a Poisson process and each waits for a free client; closed, a ladder
-//! of clients doubles while throughput grows by [`GROWTH`], up to `--clients`. Each phase says the
+//! of clients doubles while throughput grows, up to `--clients`, each step judged in rounds as a
+//! benchmark point is (measurement.md §5, [`ROUNDS`]) and its growth told by their intervals, the
+//! ladder ending three steps after the last that grew ([`FLAT`]). Each phase says the
 //! threads the process ran as the OS counts them, read as its clients' requests were out, and what
 //! the harness's own work held at its peak: a phase's operations allocate nothing of the
 //! harness's, so neither grows with the clients or the objects.
@@ -57,7 +59,9 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::rc::Rc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, channel as watch_channel};
+use std::time::{Duration, Instant};
 
 use hyper_measure::alloc::{self, Counts};
 use hyper_measure::open_loop::Arrivals;
@@ -70,6 +74,7 @@ use hyper_rt::runtime::{LocalRuntime, RuntimeConfig, interests_for};
 use hyper_rt::tcp::TcpStream;
 use mantle_client::{Client, Native, Rewind, Settings, Sink, Source, TRAILER, Wire};
 use mantle_disk::histogram::Histogram;
+use mantle_disk::rounds::{self, Judgment, Policy};
 use mantle_http::write::Length;
 use mantle_protocol::object::{Headers, List, Listing, Op, Reply, Status};
 use mantle_s3::checksum::{self, Algorithm, Hasher};
@@ -89,10 +94,60 @@ const BUCKET: &str = "doors";
 /// before the phase from the generator, so the check holds no table that grows with the phase.
 const ETAGS: u64 = 16;
 
-/// Throughput a closed ladder's step must add to the last's for the ladder to double again: a
-/// tenth, as measurement.md §10's ladder "doubles while appends a second grow", above the run to
-/// run spread its repeated runs resolve (research/11 §16).
-const GROWTH: f64 = 0.1;
+/// How a closed ladder's step is judged: in rounds, ten at least and thirty at most, ending once
+/// they are independent and their median lies within ±5% at 95% (measurement.md §5,
+/// `Policy::STANDARD`), as a benchmark point's are. A step's growth over the best before it is told
+/// by their intervals, not by one throughput each: a single step's rate moved 13–30% from run to
+/// run on the doors (research/71), so a ladder that stopped at the first step not a tenth above
+/// the last ended where one noisy step fell.
+const ROUNDS: Policy = Policy::STANDARD;
+
+/// The steps in a row a closed ladder takes without growth before it ends: BBR's estimate that
+/// the pipe is full, "after 3 rounds w/o significant bw growth" (Linux v6.12
+/// `net/ipv4/tcp_bbr.c`, `bbr_full_bw_cnt`; research/87 [6]), so one step a stall slowed does not
+/// end the ladder below its knee, and the steps past it are measured.
+const FLAT: u32 = 3;
+
+/// The wait the harness's watch asks at a time ([`Watch`]): long enough that Linux's default timer
+/// slack, 50 µs a wait (prctl(2), `PR_SET_TIMERSLACK`), adds under a tenth of [`ROUNDS`]'s ±5% to
+/// what it counts as paused, `50 µs / (5% / 10)`.
+const TICK: Duration = Duration::from_millis(10);
+
+/// How long the harness's process went without running past the waits it asked: a thread that
+/// waits for the run's end a tick at a time and counts by how much each wait overran. A process
+/// stopped whole (its cgroup frozen, SIGSTOP, or a machine's pacer duty-cycling the work it runs
+/// while its disks fall behind) stops the cell this program runs and its clients alike, and every
+/// operation out meanwhile counts the stop in its latency. A phase says how long its process was
+/// stopped, so a stop is not read as the cell's.
+#[derive(Default)]
+struct Watch {
+    paused_ns: AtomicU64,
+    longest_ns: AtomicU64,
+}
+
+impl Watch {
+    /// Waits a tick at a time for `ended` to be sent or dropped, counting each wait's overrun.
+    fn run(&self, ended: &Receiver<()>) {
+        loop {
+            let began = Instant::now();
+            if !matches!(ended.recv_timeout(TICK), Err(RecvTimeoutError::Timeout)) {
+                return;
+            }
+            let over = began.elapsed().saturating_sub(TICK);
+            let over = u64::try_from(over.as_nanos()).unwrap_or(u64::MAX);
+            self.paused_ns.fetch_add(over, Ordering::Relaxed);
+            self.longest_ns.fetch_max(over, Ordering::Relaxed);
+        }
+    }
+
+    /// The time paused since the last take, and the longest pause in it, in nanoseconds.
+    fn take(&self) -> (u64, u64) {
+        (
+            self.paused_ns.swap(0, Ordering::Relaxed),
+            self.longest_ns.swap(0, Ordering::Relaxed),
+        )
+    }
+}
 
 /// A ListObjectsV2 page's keys at most: S3's 1,000 (`mantle_s3::body::MAX_OBJECTS`).
 const PAGE: u32 = 1000;
@@ -1112,6 +1167,11 @@ impl Schedule {
         })
     }
 
+    /// Asks no more operations past those taken.
+    fn stop(&mut self) {
+        self.end = self.next;
+    }
+
     fn take(&mut self, now: u64) -> Result<Option<(u64, u64)>, Error> {
         if self.next >= self.end {
             return Ok(None);
@@ -1126,13 +1186,135 @@ impl Schedule {
     }
 }
 
-/// What a phase's tasks share: its schedule, its tally and the requests out now.
+/// What a phase's tasks share: its schedule, its tally, the requests out now and, for a closed
+/// step, its rounds.
 struct Shared {
     schedule: Schedule,
     tally: Tally,
     out: usize,
     error: Option<Error>,
     done: Vec<Logical>,
+    rounds: Option<Rounds>,
+}
+
+/// A closed step's rounds as its operations complete (measurement.md §5a): each round `size`
+/// operations, its throughput their count over the time since the round before it ended. The
+/// first, in which the step's clients ramp up from none, is not kept, as a benchmark's first
+/// iteration is not (Georges et al., OOPSLA 2007, §4.1; measurement.md §5a). Once [`ROUNDS`] finds
+/// the kept rounds enough, the step asks no more.
+struct Rounds {
+    size: u64,
+    counted: u64,
+    began_ns: u64,
+    warm: bool,
+    rates: Vec<f64>,
+}
+
+impl Rounds {
+    fn new(size: u64, now: u64) -> Self {
+        Self {
+            size: size.max(1),
+            counted: 0,
+            began_ns: now,
+            warm: false,
+            rates: Vec::with_capacity(ROUNDS.limit()),
+        }
+    }
+
+    /// One more of the step's operations completed at `now`: whether its rounds are enough.
+    fn completed(&mut self, now: u64) -> bool {
+        self.counted = self.counted.saturating_add(1);
+        if self.counted < self.size {
+            return false;
+        }
+        let took = now.saturating_sub(self.began_ns).max(1);
+        self.began_ns = now;
+        self.counted = 0;
+        if !std::mem::replace(&mut self.warm, true) {
+            return false;
+        }
+        if self.rates.len() < ROUNDS.limit() {
+            self.rates.push(self.size as f64 * 1e9 / took as f64);
+        }
+        ROUNDS.enough(&rounds::judge(&self.rates))
+    }
+}
+
+/// The operations a closed step's round counts at `clients`, measurement.md §5a's round: enough
+/// that the p99 the step reports has its 95% interval within ten rounds, and that the operations
+/// at a round's edges, which ran with fewer than `clients` in it, cost its throughput at most
+/// [`ROUNDS`]'s precision: `max(⌈368 / 10⌉, ⌈clients / (2 · 5%)⌉)`.
+fn round_ops(clients: usize) -> Result<u64, Error> {
+    let p99 = Level::new(99, 100).map_err(failed)?;
+    let quantile = samples_for(p99, coverage().ok_or_else(|| failed("a coverage"))?)
+        .map_err(failed)?
+        .div_ceil(10);
+    let clients = u64::try_from(clients).map_err(failed)?;
+    // Rounded up as seconds are, which checks the value finite, not negative and within u64.
+    let edges = Duration::try_from_secs_f64((clients as f64 / (2.0 * ROUNDS.precision)).ceil())
+        .map_err(failed)?
+        .as_secs();
+    Ok(quantile.max(edges))
+}
+
+/// The operations a closed step at `clients` asks at most: its ramp's round and [`ROUNDS`]'s
+/// limit of rounds after it, and those its clients still have out when the rounds are enough.
+fn step_ops(clients: usize) -> Result<u64, Error> {
+    let rounds = u64::try_from(ROUNDS.limit())
+        .map_err(failed)?
+        .saturating_add(1);
+    Ok(round_ops(clients)?
+        .saturating_mul(rounds)
+        .saturating_add(u64::try_from(clients).map_err(failed)?))
+}
+
+/// A closed step's throughput as its rounds judged it: the median of its state of most rounds,
+/// and the bounds its growth is told by, its median's 95% interval, or the least and most its
+/// rounds measured where they carry none (rounds ordered in time, or too few).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Stepped {
+    clients: usize,
+    median: f64,
+    low: f64,
+    high: f64,
+}
+
+impl Stepped {
+    /// The step its rounds judged, none where it kept none.
+    fn of(clients: usize, judged: &Judgment) -> Option<Self> {
+        let state = judged
+            .states
+            .iter()
+            .filter(|s| !s.rounds.is_empty())
+            .max_by_key(|s| s.rounds.len())?;
+        let (low, high) = state.interval.unwrap_or((state.min, state.max));
+        Some(Self {
+            clients,
+            median: state.median,
+            low,
+            high,
+        })
+    }
+}
+
+/// Where a closed ladder stands after a step: the best step so far, of the greatest median; the
+/// steps in a row since one grew, its interval wholly above the best's; and whether it ends.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Climb {
+    best: Option<Stepped>,
+    flat: u32,
+}
+
+impl Climb {
+    /// The ladder after `step`: whether it goes on.
+    fn after(&mut self, step: Stepped) -> bool {
+        let grew = self.best.is_none_or(|best| step.low > best.high);
+        if self.best.is_none_or(|best| step.median > best.median) {
+            self.best = Some(step);
+        }
+        self.flat = if grew { 0 } else { self.flat.saturating_add(1) };
+        self.flat < FLAT
+    }
 }
 
 /// The threads this process runs as the OS counts them, read with this thread's counting paused:
@@ -1179,9 +1361,19 @@ async fn client(mut logical: Logical, work: Rc<Work>, shared: Rc<RefCell<Shared>
         }
         let came = work.run(&mut logical, j).await;
         let took = now_ns().saturating_sub(intended);
+        let ended = now_ns();
         let stop = harness(|| {
             let mut shared = shared.borrow_mut();
+            let shared = &mut *shared;
             shared.out = shared.out.saturating_sub(1);
+            // A closed step's round ends with its operations, an operation not asked counting in
+            // none; once the rounds are enough, the step asks no more.
+            if !matches!(came, Ok(Came::Skipped))
+                && let Some(rounds) = shared.rounds.as_mut()
+                && rounds.completed(ended)
+            {
+                shared.schedule.stop();
+            }
             let tally = &mut shared.tally;
             tally.ops = tally.ops.saturating_add(1);
             if !matches!(came, Ok(Came::Skipped)) {
@@ -1236,16 +1428,19 @@ async fn client(mut logical: Logical, work: Rc<Work>, shared: Rc<RefCell<Shared>
     harness(|| shared.borrow_mut().done.push(logical));
 }
 
-/// A phase's operations `from..end` on `clients`, a task each: the clients back, and the tally.
+/// A phase's operations `from..end` on `clients`, a task each, a closed step's in rounds of
+/// `round` operations until they are enough: the clients back, the tally and the rounds' rates.
 async fn phase(
     clients: Vec<Logical>,
     work: Rc<Work>,
     schedule: (Load, u64, u64, u64),
-) -> Result<(Vec<Logical>, Tally), Error> {
+    round: Option<u64>,
+) -> Result<(Vec<Logical>, Tally, Vec<f64>), Error> {
     let (load, seed, from, end) = schedule;
     let count = clients.len();
     let shared = harness(|| {
         Ok::<_, Error>(Rc::new(RefCell::new(Shared {
+            rounds: round.map(|size| Rounds::new(size, now_ns())),
             schedule: Schedule::new(load, seed, (from, end), now_ns())?,
             tally: Tally {
                 latency: Histogram::new(),
@@ -1279,7 +1474,11 @@ async fn phase(
         .into_inner();
     match shared.error {
         Some(e) => Err(e),
-        None => Ok((shared.done, shared.tally)),
+        None => Ok((
+            shared.done,
+            shared.tally,
+            shared.rounds.map(|r| r.rates).unwrap_or_default(),
+        )),
     }
 }
 
@@ -2228,6 +2427,8 @@ fn decimal(v: u64, into: &mut [u8; 20]) -> Option<&[u8]> {
 /// The cell, its doors, and the connections each door holds between phases.
 struct Bench<'o> {
     options: &'o Options,
+    /// The harness's process's pauses ([`Watch`]).
+    watch: &'o Watch,
     /// The cell this program runs, none against an `--endpoint`.
     cell: Option<Cell>,
     rt: LocalRuntime,
@@ -2337,6 +2538,11 @@ struct Measured<'a> {
     /// `perf stat`'s counts across the phase, where `--perf` counted them.
     perf: Option<Counters>,
     excluded: bool,
+    /// A closed step's rounds as `ROUNDS` judged them.
+    judged: Option<&'a Judgment>,
+    /// The time the harness's process was paused over the phase, and its longest pause, in
+    /// nanoseconds ([`Watch`]).
+    paused: (u64, u64),
 }
 
 impl<'o> Bench<'o> {
@@ -2476,14 +2682,19 @@ impl<'o> Bench<'o> {
         })
     }
 
-    /// One phase on `clients` connections, operations `from..end`, and its line.
+    /// One phase on `clients` connections, operations `from..end`, and its line: the operations it
+    /// asked, and its throughput, a closed step's in rounds (`in_rounds`) as they judged it.
     fn step(
         &mut self,
         out: &mut impl Write,
         work: &Rc<Work>,
         (size, clients): (&str, usize),
-        (from, end): (u64, u64),
-    ) -> Result<(u64, f64), Error> {
+        (from, end, in_rounds): (u64, u64, bool),
+    ) -> Result<(u64, Stepped), Error> {
+        let round = match (in_rounds, self.options.load) {
+            (true, Load::Closed) => Some(round_ops(clients)?),
+            _ => None,
+        };
         let held = self.hold(work.door, clients)?;
         let wire_before = wired(&held);
         let opened_before = reopened(&held);
@@ -2500,19 +2711,23 @@ impl<'o> Bench<'o> {
         };
         let began = Instant::now();
         let cpu = drive::cpu();
+        self.watch.take();
         alloc::begin();
         let ran = self.rt.block_on(phase(
             held,
             Rc::clone(work),
             (self.options.load, seed, from, end),
+            round,
         ));
         let total = alloc::end();
+        let paused = self.watch.take();
         let aside = alloc::read_aside();
         let generator_ns =
             u64::try_from(drive::cpu().saturating_sub(cpu).as_nanos()).unwrap_or(u64::MAX);
         let elapsed_ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let perf = perf.map(Perf::end).transpose()?;
-        let (held, tally) = ran.map_err(|e| failed(format!("{e:?}")))??;
+        let (held, tally, rates) = ran.map_err(|e| failed(format!("{e:?}")))??;
+        let judged = round.map(|_| harness(|| rounds::judge(&rates)));
         let after = self.servers()?;
         let wire_after = wired(&held);
         let wire = Wire {
@@ -2558,9 +2773,24 @@ impl<'o> Bench<'o> {
             again: work.again.replace(0),
             perf,
             excluded,
+            judged: judged.as_ref(),
+            paused,
         };
         self.line(out, &measured, (&before, &after))?;
-        Ok((ops, rate))
+        // A step not judged in rounds, or whose rounds kept none, is its one throughput.
+        let point = Stepped {
+            clients,
+            median: rate,
+            low: rate,
+            high: rate,
+        };
+        Ok((
+            ops,
+            judged
+                .as_ref()
+                .and_then(|j| Stepped::of(clients, j))
+                .unwrap_or(point),
+        ))
     }
 
     fn line(
@@ -2678,6 +2908,7 @@ impl<'o> Bench<'o> {
             m.again,
             t.failed,
         )?;
+        self.step_line(out, m)?;
         for kind in Failure::ALL {
             let Some(why) = t.first.get(kind.at()).and_then(Option::as_ref) else {
                 continue;
@@ -2699,11 +2930,58 @@ impl<'o> Bench<'o> {
         Ok(())
     }
 
+    /// A phase's step, a line after its phase's: how long the harness's process was paused over
+    /// it ([`Watch`]), and a closed step's rounds: how many were kept and how they are ordered in
+    /// time (measurement.md §2), and each state's median throughput, its 95% interval where it
+    /// has one, and its rounds, the state of most rounds first.
+    fn step_line(&self, out: &mut impl Write, m: &Measured<'_>) -> Result<(), Error> {
+        write!(
+            out,
+            "doors {} {} {} {} step clients {} paused_ms {} longest_pause_ms {}",
+            self.named(m.door),
+            m.kind.name(),
+            m.size,
+            self.options.condition,
+            m.clients,
+            m.paused.0.checked_div(1_000_000).unwrap_or(0),
+            m.paused.1.checked_div(1_000_000).unwrap_or(0),
+        )?;
+        let Some(judged) = m.judged else {
+            writeln!(out)?;
+            return Ok(());
+        };
+        write!(
+            out,
+            " rounds kept {} order {:?} lag1 {:.2}",
+            judged.rounds, judged.order, judged.lag1,
+        )?;
+        let mut states: Vec<&rounds::State> = judged.states.iter().collect();
+        states.sort_by_key(|s| std::cmp::Reverse(s.rounds.len()));
+        for state in states {
+            let (low, high) = state.interval.map_or_else(
+                || ("-".to_owned(), "-".to_owned()),
+                |(l, h)| (format!("{l:.1}"), format!("{h:.1}")),
+            );
+            write!(
+                out,
+                " state rounds {} ops/s median {:.1} interval {low} {high} min {:.1} max {:.1}",
+                state.rounds.len(),
+                state.median,
+                state.min,
+                state.max,
+            )?;
+        }
+        writeln!(out)?;
+        Ok(())
+    }
+
     /// A phase's steps: open loop, one of `n` operations from `from` on `--clients` clients;
-    /// closed, a ladder from one client doubling while throughput grows by [`GROWTH`], each step
-    /// `n` operations further on, up to `--clients`. Operations end at `end` where the phase's
-    /// keys end; `finish` runs what the ladder left of them at its best step's clients. Says how
-    /// far the steps went.
+    /// closed, a ladder from one client doubling up to `--clients`, each step judged in rounds
+    /// ([`ROUNDS`]) where `n` holds them and asking at most `n` operations further on, and ending
+    /// [`FLAT`] steps after the last whose interval lay wholly above the best's before it. A step
+    /// whose `n` holds no judged rounds (a large object's, its bytes capped) is its one throughput.
+    /// Operations end at `end` where the phase's keys end; `finish` runs what the ladder left of
+    /// them at its best step's clients. Says how far the steps went.
     fn ladder(
         &mut self,
         out: &mut impl Write,
@@ -2714,28 +2992,66 @@ impl<'o> Bench<'o> {
         let budget = self.clients(work.door);
         if let Load::Open(_) = self.options.load {
             let end = from.saturating_add(n).min(end);
-            self.step(out, work, (size, budget), (from, end))?;
+            self.step(out, work, (size, budget), (from, end, false))?;
             return Ok(end);
         }
-        let (mut at, mut clients, mut best) = (from, 1usize, (1usize, 0.0f64));
+        let judged = |clients: usize| -> Result<bool, Error> {
+            let least = round_ops(clients)?
+                .saturating_mul(u64::try_from(ROUNDS.min).map_err(failed)?.saturating_add(1));
+            Ok(n >= least)
+        };
+        let mut climb = Climb {
+            best: None,
+            flat: 0,
+        };
+        let (mut at, mut clients) = (from, 1usize);
         while at < end {
-            let to = at.saturating_add(n).min(end);
-            let (_, rate) = self.step(out, work, (size, clients), (at, to))?;
-            at = to;
-            let grew = rate > best.1 * (1.0 + GROWTH);
-            if rate > best.1 {
-                best = (clients, rate);
-            }
-            if !grew || clients >= budget {
+            let to = at.saturating_add(n.min(step_ops(clients)?)).min(end);
+            let (asked, stepped) =
+                self.step(out, work, (size, clients), (at, to, judged(clients)?))?;
+            at = at.saturating_add(asked).min(to);
+            if !climb.after(stepped) || clients >= budget {
                 break;
             }
             clients = clients.saturating_mul(2).min(budget);
         }
+        if let Some(best) = climb.best {
+            writeln!(
+                out,
+                "doors {} {} {size} {} ladder best clients {} ops/s median {:.1} low {:.1} high {:.1}",
+                self.named(work.door),
+                work.kind.name(),
+                self.options.condition,
+                best.clients,
+                best.median,
+                best.low,
+                best.high,
+            )?;
+        }
         if finish && at < end {
-            self.step(out, work, (size, best.0), (at, end))?;
+            let clients = climb.best.map_or(1, |best| best.clients);
+            self.step(out, work, (size, clients), (at, end, false))?;
             at = end;
         }
         Ok(at)
+    }
+
+    /// The operations a phase through `door`'s steps ask at most, each at most `n`: open loop, one
+    /// step's; closed, each step's of a ladder doubling from one client to the door's, as many as
+    /// its rounds may ask ([`step_ops`]).
+    fn ladder_most(&self, door: Door, n: u64) -> Result<u64, Error> {
+        if let Load::Open(_) = self.options.load {
+            return Ok(n);
+        }
+        let budget = self.clients(door);
+        let (mut most, mut clients) = (0u64, 1usize);
+        loop {
+            most = most.saturating_add(n.min(step_ops(clients)?));
+            if clients >= budget {
+                return Ok(most);
+            }
+            clients = clients.saturating_mul(2).min(budget);
+        }
     }
 
     /// The clients a phase through `door` runs at most: `--clients`, and through the native door
@@ -2847,12 +3163,8 @@ impl<'o> Bench<'o> {
         };
         let uploads = Rc::new(RefCell::new(Vec::new()));
         // The most objects a phase's steps make: one step open loop; closed, a ladder's steps, its
-        // clients doubling up to `--clients`.
-        let steps = match self.options.load {
-            Load::Open(_) => 1,
-            Load::Closed => u64::from(self.options.clients.max(1).ilog2()).saturating_add(1),
-        };
-        let most = n.saturating_mul(steps);
+        // clients doubling up to the door's, each asking what its rounds may within `n`.
+        let most = self.ladder_most(door, n)?;
         // The objects the reads read whose puts were acknowledged, a bit each, which the put that
         // made them keeps and the reads ask of; every other phase keeps none.
         let put = Rc::new(RefCell::new(Oracle::new(most).map_err(failed)?));
@@ -2966,7 +3278,7 @@ impl<'o> Bench<'o> {
                         .checked_div(u64::from(PAGE))
                         .unwrap_or(0)
                         .saturating_add(1);
-                    self.step(out, &work, (&name, 1), (0, pages))?;
+                    self.step(out, &work, (&name, 1), (0, pages, false))?;
                     continue;
                 }
                 // Each door's half of the set, every object of it: open loop in one step, closed
@@ -3174,6 +3486,41 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
             (Some(cell), listeners, signer)
         }
     };
+    let watch = Watch::default();
+    let (end, ended) = watch_channel::<()>();
+    std::thread::scope(|scope| {
+        let watching = &watch;
+        let watching = std::thread::Builder::new()
+            .name("doors-watch".to_owned())
+            .spawn_scoped(scope, move || watching.run(&ended))?;
+        let ran = run(
+            out,
+            options,
+            &watch,
+            (cell, listeners, signer, client_dir, counting),
+        );
+        drop(end);
+        watching
+            .join()
+            .map_err(|_| failed("the harness's watch ended unwound"))?;
+        ran
+    })
+}
+
+/// The phases, controls and slope of `doors`, on its cell or endpoint, its process watched by
+/// `watch`.
+fn run(
+    out: &mut impl Write,
+    options: &Options,
+    watch: &Watch,
+    (cell, listeners, signer, client_dir, counting): (
+        Option<Cell>,
+        Vec<SocketAddr>,
+        Signer,
+        PathBuf,
+        bool,
+    ),
+) -> Result<bool, Error> {
     let most = options
         .clients
         .saturating_mul(2)
@@ -3189,6 +3536,7 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
     )?;
     let mut bench = Bench {
         options,
+        watch,
         listeners,
         cell,
         rt: runtime(most)?,
@@ -3893,6 +4241,67 @@ mod tests {
         );
         let mut closed = Schedule::new(Load::Closed, 42, (0, 2), 7).unwrap();
         assert_eq!(closed.take(99).unwrap(), Some((0, 99)));
+    }
+
+    /// A closed ladder doubles while each step's interval lies wholly above the best's before it,
+    /// and ends three steps after the last that grew: one step that did not grow does not end it,
+    /// and the best is the step of greatest median.
+    #[test]
+    fn a_ladder_ends_three_steps_after_its_last_growth() {
+        let step = |clients, median: f64, half: f64| Stepped {
+            clients,
+            median,
+            low: median - half,
+            high: median + half,
+        };
+        let mut climb = Climb {
+            best: None,
+            flat: 0,
+        };
+        assert!(climb.after(step(1, 30.0, 1.0)));
+        assert!(climb.after(step(2, 60.0, 2.0)));
+        assert!(climb.after(step(4, 59.0, 3.0)));
+        assert!(climb.after(step(8, 120.0, 5.0)));
+        assert_eq!(climb.flat, 0);
+        assert!(climb.after(step(16, 125.0, 6.0)));
+        assert!(climb.after(step(32, 118.0, 6.0)));
+        assert!(!climb.after(step(64, 121.0, 6.0)));
+        assert_eq!(climb.best.unwrap().clients, 16);
+    }
+
+    /// A step whose rounds kept none is judged by none, so it falls back to its one throughput.
+    #[test]
+    fn a_step_that_kept_no_rounds_is_not_judged() {
+        assert_eq!(Stepped::of(4, &rounds::judge(&[])), None);
+        let judged = rounds::judge(&[10.0; 12]);
+        let step = Stepped::of(4, &judged).unwrap();
+        assert_eq!(
+            (step.clients, step.median, step.low, step.high),
+            (4, 10.0, 10.0, 10.0)
+        );
+    }
+
+    /// A step's rounds keep none of its ramp, each after it its operations over the time since the
+    /// last ended; they are enough only from ten kept, and then once their median's interval is
+    /// within the precision.
+    #[test]
+    fn a_steps_rounds_keep_all_but_the_ramp_and_end_once_enough() {
+        let size = round_ops(1).unwrap();
+        assert_eq!(size, 37);
+        assert_eq!(round_ops(32).unwrap(), 320);
+        let mut rounds = Rounds::new(size, 0);
+        let mut now = 0u64;
+        let mut enough = false;
+        let mut completions = 0u64;
+        while !enough {
+            now += 1_000_000;
+            completions += 1;
+            enough = rounds.completed(now);
+        }
+        // The ramp's round and ten kept, each a thousand a second.
+        assert_eq!(completions, size * 11);
+        assert_eq!(rounds.rates.len(), 10);
+        assert!(rounds.rates.iter().all(|r| (r - 1000.0).abs() < 1e-6));
     }
 
     /// A `--load` is open at a positive rate or closed; a `--sizes` entry may be zero.

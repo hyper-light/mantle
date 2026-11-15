@@ -18,6 +18,12 @@ pub struct Overlay<'a, R> {
     cleared: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
+/// One overlay's writes, taken to the overlay beneath it.
+pub struct Taken {
+    writes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    cleared: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
 impl<'a, R: Rows> Overlay<'a, R> {
     /// An overlay over `rows` that takes no row of a key past `max_key` bytes or a value past
     /// `max_value`.
@@ -43,6 +49,30 @@ impl<'a, R: Rows> Overlay<'a, R> {
             None => Write::Delete(k),
         }));
         out
+    }
+
+    /// Takes `own`'s writes, one command's made over this overlay, as if they had been made here:
+    /// its cleared ranges, then its rows, moved, nothing copied. A command whose session keeps its
+    /// answer has its writes taken so; one refused for room has them dropped (`apply::apply_entry`).
+    pub fn absorb(&mut self, own: Taken) {
+        for (from, to) in own.cleared {
+            let mut tail = self.writes.split_off(from.as_slice());
+            let mut kept = tail.split_off(to.as_slice());
+            self.writes.append(&mut kept);
+            self.cleared.push((from, to));
+        }
+        // One at a time: `BTreeMap::append` builds the whole map anew, every command an entry's.
+        for (k, v) in own.writes {
+            self.writes.insert(k, v);
+        }
+    }
+
+    /// This overlay's writes, to be taken by the overlay beneath it ([`Self::absorb`]).
+    pub fn take(self) -> Taken {
+        Taken {
+            writes: self.writes,
+            cleared: self.cleared,
+        }
     }
 
     /// The end of the cleared range holding `key`, if one does.
@@ -168,6 +198,55 @@ mod tests {
     }
 
     proptest! {
+        /// A command's writes made over the entry's overlay and taken into it read as they would
+        /// had the command written there itself, and give the entry the same writes.
+        #[test]
+        fn a_commands_writes_taken_read_as_written_in_place(
+            before in prop::collection::vec(write(), 0..12),
+            entry in prop::collection::vec(write(), 0..6),
+            command in prop::collection::vec(prop::collection::vec(write(), 0..4), 0..3),
+            from in key(),
+            to in key(),
+        ) {
+            let mut engine = Model::default();
+            engine.apply(1, before).unwrap();
+            let mut other = engine.clone();
+            let bound = (usize::MAX, usize::MAX);
+            let mut direct = Overlay::new(&mut engine, bound);
+            let mut taken = Overlay::new(&mut other, bound);
+            direct.apply(2, entry.clone()).unwrap();
+            taken.apply(2, entry).unwrap();
+            {
+                let mut own = Overlay::new(&mut taken, bound);
+                for writes in &command {
+                    own.apply(2, writes.clone()).unwrap();
+                }
+                let own = own.take();
+                taken.absorb(own);
+            }
+            for writes in command {
+                direct.apply(2, writes).unwrap();
+            }
+            for k in [from.clone(), to.clone()] {
+                prop_assert_eq!(direct.get(&k).unwrap(), taken.get(&k).unwrap());
+            }
+            prop_assert_eq!(direct.next(&from, &to).unwrap(), taken.next(&from, &to).unwrap());
+            let (a, b) = (direct.into_writes(), taken.into_writes());
+            engine.apply(2, a).unwrap();
+            other.apply(2, b).unwrap();
+            let all = |m: &mut Model| {
+                let mut rows = Vec::new();
+                let mut at = Vec::new();
+                while let Some((k, v)) = m.next(&at, &[0xFF]).unwrap() {
+                    at = k.clone();
+                    at.push(0);
+                    rows.push((k, v));
+                }
+                rows
+            };
+            prop_assert_eq!(all(&mut engine), all(&mut other));
+        }
+
         /// Reading through the overlay is reading the engine with the entry's writes
         /// applied, and the entry's writes applied as one batch give the same rows.
         #[test]

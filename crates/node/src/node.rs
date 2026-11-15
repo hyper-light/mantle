@@ -488,9 +488,6 @@ struct Kept {
     layer: Layer,
     handle: Handle,
     max_entry_bytes: u64,
-    /// The answers one session of the range keeps unacknowledged (`Rules::max_answers`): the most
-    /// commands an entry of this node's own carries.
-    max_answers: usize,
     /// The replica's latest wake, held in [`Node::deadlines`].
     wake: Option<u64>,
     /// A member lost for good the node replaces while it leads the range ([`Node::replace`]).
@@ -882,9 +879,21 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     next_read_ask: ReadAsk,
     reads_done: Vec<(ReadAsk, ReadOutcome)>,
     wall: Wall,
-    /// The gateway host's settings, and the object operations it runs, at most
-    /// `GatewaySettings::objects`.
+    /// The gateway host's settings, and the object operations it runs: as many at once as it has
+    /// learned its knee is (`crate::admit`), at most `GatewaySettings::objects`, the ceiling its
+    /// memory was split for.
     gateway: Option<GatewaySettings>,
+    admission: Option<crate::admit::Admission>,
+    /// The stream pool the native clients draw from, as last sized: the admission's limit.
+    pooled: usize,
+    /// Native object requests past the admission's room, in the order they came, their bodies
+    /// unread (`host::Parked`): at most `parked_most`, the exchanges the transport holds at once,
+    /// which every parked request's is one of.
+    parked: VecDeque<host::Parked>,
+    parked_most: usize,
+    /// What the node measured of its puts' blocks and bodies, the window a put holds
+    /// (`crate::window`).
+    put_window: crate::window::Window,
     jobs: Vec<host::Job>,
     /// What jobs that ended asked and was not yet answered: its outcomes are dropped as they come.
     /// At most the node's asks.
@@ -892,9 +901,6 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// The S3 listener's door, once opened (`crate::door`; [`Node::open_door`]): the operations it
     /// hands over, each taken into a job at the next turn.
     doorway: Option<crate::door::Doorway>,
-    /// The operation taken from the door that the host had no room for yet: a copy, which counts
-    /// as two (`host::weight`), with one slot free. It is taken before any other.
-    door_held: Option<Box<crate::door::Request>>,
     /// The requests the door holds at once, and the keys its connections ask for at once: each
     /// connection asks one key before its operation (`door::KeyAsk`).
     door_capacity: usize,
@@ -1038,17 +1044,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .unwrap_or(0);
         let clients = settings.gateway.as_ref().map_or(0, |g| g.clients);
         let stated = Stated {
-            peers: settings
-                .peers
-                .len()
-                .checked_add(clients)
-                .ok_or_else(|| at(Step::Budgets)(NodeError::Bounds("the peers".into())))?,
+            peers: settings.peers.len(),
+            clients,
+            pool: settings.gateway.as_ref().map_or(0, |g| g.objects),
             ranges: settings.ranges.len(),
             inflight,
-            transfers: settings
-                .storage
-                .transfers()
-                .saturating_add(settings.chunk_asks),
+            transfers: settings.storage.transfers(),
+            asked: settings.chunk_asks,
             transport_bytes: settings.transport_bytes,
             messages,
             max_head: MAX_HEAD,
@@ -1056,6 +1058,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let limits = bounds::limits(&stated)
             .map_err(|e| at(Step::Budgets)(NodeError::Bounds(e.to_string())))?;
         let lane_window = limits.lane_window;
+        let exchanges = limits.exchanges;
         let io = bounds::io(&stated);
         let plane_limits =
             plane(&stated).map_err(|e| at(Step::Budgets)(NodeError::Bounds(e.to_string())))?;
@@ -1089,7 +1092,6 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 layer: hosted.range.layer,
                 handle,
                 max_entry_bytes: hosted.range.settings.max_entry_bytes,
-                max_answers: hosted.range.rules.max_answers,
                 wake: None,
                 replacing: None,
             });
@@ -1126,7 +1128,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             limits,
             congestion: Default::default(),
         };
-        let budget = Fixed::new(settings.transport_bytes, stated.peers.max(1));
+        let budget = Fixed::new(
+            settings.transport_bytes,
+            stated.peers.max(1).saturating_add(stated.clients),
+        );
         // A client is held from its handshake until the next turn finds its connections gone: at
         // most the identities the transport admits and the handshakes it lets complete meanwhile.
         let most_clients = if clients == 0 {
@@ -1144,6 +1149,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             None => Endpoint::new(config, budget, directory, now),
         }
         .map_err(at(Step::Network))?;
+        let mut endpoint = endpoint;
+        // A node's native clients draw their exchanges from a pool as large as the operations it
+        // admits (Breakwater's credit, hyper-transport's `pool`), which follows its learned limit.
+        if clients > 0 {
+            let pool = settings.gateway.as_ref().map_or(0, |g| g.objects);
+            endpoint
+                .set_stream_pool(u32::try_from(pool).unwrap_or(u32::MAX))
+                .map_err(at(Step::Network))?;
+        }
         let driver = Driver::bind(endpoint, settings.quic, io).map_err(at(Step::Network))?;
         let plane_socket = PlaneSocket::bind(settings.plane, io).map_err(at(Step::Network))?;
         let plane = Plane::new(settings.id, plane_limits)
@@ -1228,11 +1242,24 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             next_read_ask: 0,
             reads_done: Vec::new(),
             wall: settings.wall,
+            admission: settings.gateway.as_ref().map(|g| {
+                crate::admit::Admission::new(
+                    g.objects,
+                    g.objects_bytes,
+                    hyper_rt::futures::now_ns(),
+                )
+            }),
+            pooled: settings
+                .gateway
+                .as_ref()
+                .map_or(0, |g| if g.clients > 0 { g.objects } else { 0 }),
             gateway: settings.gateway.take(),
+            parked: VecDeque::new(),
+            parked_most: exchanges,
+            put_window: crate::window::Window::default(),
             jobs: Vec::new(),
             abandoned: Vec::new(),
             doorway: None,
-            door_held: None,
             door_capacity: 0,
             lookups: Vec::new(),
             stopping: None,
@@ -1627,6 +1654,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.schedule_due(now);
         self.drive(now)?;
         self.take_door();
+        self.take_parked();
         self.step_host()?;
         self.step_asks(now)?;
         self.step_reads(now)?;
@@ -1654,39 +1682,38 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// The operations the S3 listener handed over, each a job, in the order they came, while the
-    /// host has room for another (`gateway.objects`): the rest wait at the door, their bodies
+    /// host has room for another (`crate::admit`): the rest wait at the door, their bodies
     /// unread, until a job ends and the listener's next answer taken turns the node again. A
     /// stopping node, or one that hosts no objects, answers each as it comes.
     fn take_door(&mut self) {
         loop {
-            let Some(asked) = self
-                .door_held
-                .take()
-                .map(crate::door::Asked::Op)
-                .or_else(|| self.doorway.as_mut().and_then(crate::door::Doorway::take))
-            else {
-                return;
-            };
+            let (gateway, learned) = (self.gateway.as_ref(), &self.put_window);
             // A key a connection asks before its operation takes no slot of the host's: it is
             // read at once, the lookups held to the door's bound (`host::take_lookup`).
-            let request = match asked {
-                crate::door::Asked::Op(request) => request,
-                crate::door::Asked::Key(ask) => {
-                    self.take_lookup(ask);
-                    continue;
+            let charge = match self
+                .doorway
+                .as_mut()
+                .and_then(crate::door::Doorway::waiting)
+            {
+                None => return,
+                Some(crate::door::Asked::Key(_)) => None,
+                Some(crate::door::Asked::Op(request)) => {
+                    Some(host::charged(gateway, learned, &request.op).0)
                 }
             };
-            // A copy counts as two of the host's operations (`host::weight`): one the host has no
-            // room for waits, the next taken behind it, so the door keeps its order.
-            let room = self.stopping()
-                || self.gateway.as_ref().is_none_or(|g| {
-                    self.occupancy().saturating_add(host::weight(&request.op)) <= g.objects
-                });
-            if !room {
-                self.door_held = Some(request);
-                return;
+            // A request left waiting for the limit tells it its clients ask more than it admits
+            // (`admits`); one left waiting for bytes, nothing.
+            if let Some(charge) = charge {
+                let room = self.stopping() || self.gateway.is_none() || self.admits(charge);
+                if !room {
+                    return;
+                }
             }
-            self.take_local(*request);
+            match self.doorway.as_mut().and_then(crate::door::Doorway::take) {
+                None => return,
+                Some(crate::door::Asked::Key(ask)) => self.take_lookup(ask),
+                Some(crate::door::Asked::Op(request)) => self.take_local(*request),
+            }
         }
     }
 
@@ -1749,6 +1776,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             self.asks_due(now),
             self.reads_due(now),
             self.host_due(),
+            self.parked_due(now),
             held,
         ]
         .into_iter()
@@ -2178,6 +2206,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     .retain(|r| r.origin != ReadOrigin::Exchange(exchange));
                 self.ask_lost(exchange);
                 self.job_lost(exchange);
+                self.keep_pool();
                 Ok(())
             }
             Event::Writable { exchange } if self.job_on(exchange).is_some() => Ok(()),
@@ -3538,6 +3567,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 command,
                 deadline_ns,
                 wait,
+                serial: None,
             });
         }
         Ok(ask)
@@ -3548,11 +3578,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         take_done(&mut self.commands_done, ask)
     }
 
-    /// The most commands an entry of this node's own carries, and its most bytes: the least any
-    /// range it hosts takes, the cell's ranges being alike; with none hosted, one command, in what
-    /// a request carries.
-    fn entry_limits(&self) -> (usize, usize) {
-        let commands = self.ranges.iter().map(|k| k.max_answers).min().unwrap_or(1);
+    /// The most bytes an entry of this node's own carries, its commands as many as fit them: the
+    /// least any range it hosts takes, the cell's ranges being alike; with none hosted, what a
+    /// request carries.
+    fn entry_bytes(&self) -> usize {
         let bytes = self
             .ranges
             .iter()
@@ -3562,13 +3591,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 NodeClasses::frame_bound(classes::Class::Request)
                     .saturating_sub(u64::try_from(command::HEAD_BYTES).unwrap_or(u64::MAX))
             });
-        (commands, usize::try_from(bytes).unwrap_or(usize::MAX))
+        usize::try_from(bytes).unwrap_or(usize::MAX)
     }
 
     /// The commands this node asks itself, at a turn: those past their deadline answered so, each
     /// range's next entry made, and each entry not out asked.
     fn step_asks(&mut self, now: u64) -> Result<(), NodeError> {
-        let limits = self.entry_limits();
+        let limits = self.entry_bytes();
         for at in 0..self.asking.len() {
             let Some(asking) = self.asking.get_mut(at) else {
                 continue;

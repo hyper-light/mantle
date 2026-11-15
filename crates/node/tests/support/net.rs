@@ -101,9 +101,12 @@ pub fn stated(transport_bytes: u64) -> Stated {
         + mantle_node::frame::HEADER_BYTES as u64;
     Stated {
         peers: 1,
+        clients: 0,
+        pool: 0,
         ranges: 5,
         inflight: settings.max_inflight_msgs,
         transfers: 38,
+        asked: 0,
         transport_bytes,
         messages: Bounds {
             replication: largest,

@@ -12,6 +12,7 @@ publish.workspace = true
 [dependencies]
 # The transport the messages travel on and its driver's socket batching, vendored from hyper-raft
 # (vendor/UPSTREAM.md); hyper-timing's draw is a backoff's jitter.
+hyper-rt = { path = "../../vendor/hyper-rt" }
 hyper-rt-transport = { path = "../../vendor/hyper-rt-transport" }
 hyper-timing = { path = "../../vendor/hyper-timing" }
 hyper-transport = { path = "../../vendor/hyper-transport" }

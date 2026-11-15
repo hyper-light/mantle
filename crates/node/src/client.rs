@@ -178,10 +178,13 @@ impl Client {
         let peers = settings.nodes.len();
         let stated = Stated {
             peers,
+            clients: 0,
+            pool: 0,
             // A client keeps one command out, to one range at a time, and a gateway one chunk.
             ranges: 1,
             inflight: 0,
-            transfers: usize::from(settings.role == Role::Gateway),
+            transfers: 0,
+            asked: usize::from(settings.role == Role::Gateway),
             transport_bytes: settings.transport_bytes,
             messages: settings.messages,
             max_head: crate::node::MAX_HEAD,

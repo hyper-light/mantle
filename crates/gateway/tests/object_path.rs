@@ -983,6 +983,58 @@ fn a_slow_body_renews_its_blocks_until_its_file_names_them() {
     assert!(cell.read_file(11, len as u64, &wrapping) == bytes);
 }
 
+/// A body of more than one block says how long its first block's bytes took to come, its client's
+/// pace before any window held it back, and each block how long it took from going down to
+/// recorded, past the cell's answers to its chunks and its Block command; a body of one block says
+/// nothing of its pace.
+#[test]
+fn a_put_says_its_bodys_pace_and_its_blocks_time_to_recorded() {
+    let mut cell = Cell::new(4);
+    let wrapping = WrappingKey::generate().unwrap();
+    let layout = Layout::new(Scheme::Copies(2)).unwrap();
+    let len = (2 * layout.segments_per_block() * seal::SEGMENT as u64 + 1) as usize;
+    let bytes = body(len, 3);
+    let mut put = new_put(&cell, object("k"), len as u64, layout, keys(13, &wrapping));
+    let drive = Drive {
+        piece: seal::SEGMENT,
+        wait: 1_000,
+        step: 7,
+    };
+    run(
+        &mut cell,
+        &mut put,
+        &bytes,
+        &drive,
+        &Expected::default(),
+        |_, _| {},
+    )
+    .unwrap();
+    let (filled, took) = put.take_filled().unwrap();
+    assert_eq!(filled, layout.block_len(len as u64, 0).unwrap());
+    // Its segments came a piece a wait apart, the first at the body's first byte.
+    let pieces = layout.segments_per_block();
+    assert!(took >= (pieces - 1) * drive.wait, "{took}");
+    assert_eq!(put.take_filled(), None);
+    // Placed, its two chunks stored and its Block command written: three answers at least.
+    assert!(put.take_committed().unwrap() >= 3 * drive.step);
+    assert_eq!(put.take_committed(), None);
+
+    let small = body(1_000, 4);
+    let mut cell = Cell::new(4);
+    let mut one = new_put(&cell, object("s"), 1_000, layout, keys(14, &wrapping));
+    run(
+        &mut cell,
+        &mut one,
+        &small,
+        &drive,
+        &Expected::default(),
+        |_, _| {},
+    )
+    .unwrap();
+    assert_eq!(one.take_filled(), None);
+    assert!(one.take_committed().is_some());
+}
+
 /// A block the sweep released while its body still streamed in fails the PUT at its next
 /// renewal, and the file is never written.
 #[test]

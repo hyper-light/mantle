@@ -42,7 +42,9 @@ use s3::{Client, Key};
 
 /// A started cell of three, each node enlisted, and a client of each node's listener.
 fn started() -> (Cell, Vec<u64>, Vec<Client>) {
-    let mut cell = Cell::made(three_founders);
+    // Each founder at four gibibytes, so its listener serves as many connections as a test holds
+    // (`the_listener_refuses_what_s3_refuses_and_closes_what_it_cannot_trust`).
+    let mut cell = Cell::made(|root| founders_within(root, Some("4G")));
     let ids: Vec<u64> = cell.dirs.keys().copied().collect();
     for &id in &ids {
         cell.enlisted(id);
@@ -125,12 +127,11 @@ fn a_cell_of_three_serves_signed_s3_requests_through_every_nodes_listener() {
         );
     }
 
-    // As many puts at once as the listener takes connections beside the one the first client
-    // holds, past the operations the host runs at once (`gateway.objects`), as the AWS CLI's
-    // transfers send their parts: each waits at the door until the host has room, and every one
-    // commits.
+    // As many puts at once as a stock client's transfers send parts, the AWS CLI's ten, within the
+    // connections the listener takes beside the one the first client holds: any past the
+    // operations the host runs now waits at the door until it has room, and every one commits.
     let (at, budget) = cell.s3_bound[&ids[0]];
-    let at_once: Vec<(String, Vec<u8>)> = (0..budget - 1)
+    let at_once: Vec<(String, Vec<u8>)> = (0..mantle_node::listener::REFUSING.min(budget - 1))
         .map(|i| {
             (
                 format!("at-once/{i}"),

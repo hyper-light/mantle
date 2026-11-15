@@ -106,6 +106,8 @@ pub enum Answer {
 /// node to take them.
 pub struct Doorway {
     requests: ChannelReceiver<Asked>,
+    /// One request taken from the channel to learn that one waits, ahead of the rest.
+    held: Option<Asked>,
 }
 
 /// The listener's end: where it submits requests, and the waker of the node that takes them.
@@ -119,13 +121,30 @@ pub struct Submitter {
 /// (`503 SlowDown`, node.md §4.5), for the node whose task `node` wakes.
 pub fn doorway(capacity: usize, node: Waker) -> Result<(Doorway, Submitter), RtError> {
     let (requests, taken) = channel(capacity)?;
-    Ok((Doorway { requests: taken }, Submitter { requests, node }))
+    Ok((
+        Doorway {
+            requests: taken,
+            held: None,
+        },
+        Submitter { requests, node },
+    ))
 }
 
 impl Doorway {
     /// The next request submitted, if one waits; none too once the listener is gone.
     pub fn take(&mut self) -> Option<Asked> {
-        self.requests.try_recv().ok().flatten()
+        self.held
+            .take()
+            .or_else(|| self.requests.try_recv().ok().flatten())
+    }
+
+    /// The request that waits to be taken next, held ahead of the rest until it is; none where
+    /// none waits.
+    pub fn waiting(&mut self) -> Option<&Asked> {
+        if self.held.is_none() {
+            self.held = self.requests.try_recv().ok().flatten();
+        }
+        self.held.as_ref()
     }
 }
 

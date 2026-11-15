@@ -229,9 +229,9 @@ is told every number it runs with. `mantle serve` is told only what the first co
 measures the second, and derives the rest by these rules:
 
 - **Every class at its floor.** The memory paragraph's floor is computed class by class from the
-  structures each fills, and the settings are the floor's: one object put and one got at a time, a
-  window of one block, two appends out to a follower (`derive::IN_FLIGHT`: one confirmed while the next is
-  written, raft-log.md §6), an entry of the range's largest in each append and each
+  structures each fills, and the settings are the floor's: the operations the memory holds past the
+  data's wants (§2.8), a window of one block, an append out to a follower for each entry a range
+  can hold uncommitted (`derive::in_flight`, §2.8), an entry of the range's largest in each append and each
   apply, one chunk ask to each node a block's width needs, the transport funding each peer's
   windows at QUIC's initial window beside the messages' room and each connection's reserve
   (`bounds::least_transport`); a receive chunk past them spares a datagram its copy, which its
@@ -442,15 +442,15 @@ are sized by their shares (`derive::engine_within`) and take no limit.
 | `durability.*` | cited, stated | the worst device class's annual failure rate an hour, since a block's chunks land on any device of the cell (`mantle_ec::durability`'s disk rate), with durability.md §5's yearly power-on restart taking a hundredth of the nodes; repair in research 15's day until repair is built and measured; the target S3's 10⁻¹¹ unless stated (`derive::rates`, `derive::target`) |
 | `range.max_entry_bytes` | derived | `mantle_meta::wire::largest_entry_bytes` (replica.md §7) |
 | `range.election_tick`, `range.heartbeat_tick` | cited | focal's 10 and 2 (§2.4), checked though ranges elect by suspicion, which takes no ticks |
-| `range.max_size_per_msg`, `range.max_uncommitted_size`, `range.max_committed_size_per_ready`, `range.max_inflight_msgs` | derived | an entry of the range's largest each append, apply and `Ready`; two appends out to a follower and two entries uncommitted (`derive::IN_FLIGHT`), so a follower's log holds the next frame while it confirms the last, whose record then confirms it (raft-log.md §6; research/71, step 9), where one append out made every frame wait for a confirmation of its own |
-| `rules.*` | derived | the same on every member, from the cell's identities and the metadata layer's bounds alone (`derive::cell`): a session of each identity for good, as above; as many commands an entry as the node runs operations (`derive::batch`, `gateway.objects` times `gateway.window`), each operation waiting on one command of a range at a time, so every command its operations wait on shares the next entry's flush (replica.md §1; research/71, step 9: one command an entry committed one a Raft round, the cell's writes capped at 20 to 47 a second); their answers kept until the next entry acknowledges them, within the row the largest row S3 admits already sets, so no page grows, and at least one at the largest a node's command gets (`wire::largest_answer_bytes`: a range's lineage at the longest route keys; a sweep sizes its checks to it); a row's key and value at most the longest key S3's names give a row (`key::largest_bytes`) and the largest value a request S3 admits, or a session at its bounds, gives one (`wire::largest_row_bytes`: a version keeping S3's 8 KB of headers at their longest encoding), which every member's engine holds (replica.md §2); the node refuses to start on an engine that does not (`mantle_range::holds_rows`) |
+| `range.max_size_per_msg`, `range.max_uncommitted_size`, `range.max_committed_size_per_ready`, `range.max_inflight_msgs` | derived | an entry of the range's largest each append, apply and `Ready`; as many appends out to a follower and entries uncommitted as a range can hold, one an identity of the cell, each asking through one entry out (`ask::Asking`), and one of the leader's own, its term's first entry or a change of configuration (`derive::in_flight`; Ongaro 2014 §3.6.2, §4): no asked entry waits unsent for a follower's round trip and flush, where two out had held each frame to a confirmation of its own and one made every frame wait (raft-log.md §6; research/71, step 9) |
+| `rules.*` | derived | the same on every member, from the cell's identities and the metadata layer's bounds alone (`derive::cell`): a session of each identity for good, as above; an entry carrying every command waiting that fits its bytes, so every command the node's operations wait on shares the next entry's flush (§2.8; replica.md §1; research/71, step 9: one command an entry committed one a Raft round, the cell's writes capped at 20 to 47 a second); their answers kept until the gateway acknowledges them, as many as a session's row holds within the largest row S3 admits, so no page grows, and one at the largest a node's command gets where it keeps no other (`wire::largest_answer_bytes`: a range's lineage at the longest route keys; a sweep sizes its checks to it), a command past them refused before it takes effect and asked again (research/87); a row's key and value at most the longest key S3's names give a row (`key::largest_bytes`) and the largest value a request S3 admits, or a session at its bounds, gives one (`wire::largest_row_bytes`: a version keeping S3's 8 KB of headers at their longest encoding), which every member's engine holds (replica.md §2); the node refuses to start on an engine that does not (`mantle_range::holds_rows`) |
 | `log.*` | derived | `hyper_log::Config::derive` from the log's block, its largest entry with the shell's bytes, its groups (the ranges and the liveness stream's), a checkpoint's cadence and what a group holds uncommitted past it of one `Ready` each (`mantle_range::ready_held`: as many entries as its bytes make of the least entry a range proposes, 13 bytes, and the term's empty first one, and its bytes with each entry's 5-byte shell), a cache of one largest entry a group, and a file holding every group's retention at once beside the least file the log runs in: a `Ready` goes in greedy parts of a frame's room, any two in a row more than a room, each a segment at most (`derive::log`). Before, entries were counted at the shell's 5 bytes, 2.6 times too many, and the file was the least, which one group's retention filled: a write past it is refused `Full`. Its memory: each group's slots, a deque doubled past its retained entries at hyper-log's 56 bytes a slot, its handle's unapplied entries and its cache, one group's slots again while they grow, and ten segments of the log's own buffers (`derive::log_bytes`; `tests/log_memory.rs`: every group at its retention, 112.6 MB at the peak of a 225.9 MB bound) |
 | `log.waits` | cited | `measured`: the log's writer waits for the replicas it just answered while that is expected to lower total latency, ended by the clock or a frame's worth of charged bytes, what a node runs (raft-log.md §3, hyper-log's `Waits::Measured`); `never`, a batch of what is queued when the writer looks, is the replica simulation's, whose members have one update out at a time |
 | `engine.extent_pages`, `engine.max_extents` | derived | the least pages the store takes an extent, two; as many extents as each range's share of the metadata device's space holds (`derive::engine`) |
 | `engine.memtable_bytes`, `engine.fanout`, `engine.leaf_entries` | derived, cited | the least write buffer, one row at the range's bounds whole (`memtable::hashed::entry_bytes`); SplinterDB's fanout of 8, at which the engine's measurements ran (engine-structure.md §5–§6), until the fanout is measured against mantle's key counts as its §4 asks; a leaf holding every row one memtable gives it, the most a memtable holds being rows of the shortest key and no value (`key::least_bytes`; `benches/ranges.rs` sizes a leaf so) |
 | `transport_bytes` | derived | the transport's floor: what it holds besides QUIC's windows, and each share at QUIC's initial window, below which its limits refuse (`bounds::least_transport`) |
-| `volume.*` layout | derived | checksum blocks of the volume's block, at most CRC-32C's verified 16 KiB, so a read at the device's alignment verifies no byte it did not ask for (research 11 §8.2); the least segment holding a record of the largest chunk whole, smaller segments cleaning better (research 11 §7.3–§7.4); the standard layout, or the compact one where the standard leaves fewer than two segments (chunk-store.md §2); batches of as many records as the cell's operations may write to the volume at once, its nodes' identities times `derive::batch`, so they share one flush where batches of one flushed each chunk alone (research/71, step 9), a segment's room in bytes, and one fragment a chunk, as the node puts chunks whole; as many fragments as the volume's share of memory holds at the index's measured peak (`index::most_bytes`) and the volume holds at a block each, the least a fragment takes standing for the chunk sizes research 11 §6.2 learns from; a volume laid out already keeps its block, segment and checksum blocks, and holds no more fragments than its log was laid out for (`Geometry::holds`); research 03 §15.9's week a scrub (`derive::volume`) |
-| `gateway.window`, `gateway.objects`, `chunk_asks`, `command_asks`, `read_asks` | derived, measured | a window of one block, the floor; 8 operations, which the host counts of any kind, the knee of the cell's write throughput on the box (`derive::OBJECTS`: 30, 39, 72, 79 and 93 64 KiB PUTs a second at 2, 4, 8, 16 and 32 a node, research/71 step 9), where two had held the cell's writes at about 25 a second; the asks the operations hold at once, each at its most under the schemes a block may take in a cell of the domains the volume table may name, the durability model's choice at each count of them (`derive::schemes`): a put's chunks at its width, or a get's spans and the whole chunks a failed span adds, twice its data less one, past the width of a code whose parity is less than its data less one (`put::most_chunks`, `get::most_chunks`); a put's command for each block of the largest body S3 takes, its renewals (`put::most_commands`); one read each; and the node's enlistment (`derive::asks`). The memory the operations hold: each the larger of a put and a get of those schemes' largest blocks, the drivers' own (`put::most_bytes`: the segment, the block filling, each block going down with a code's parity and padded chunk, or a block coded with nothing filling beside it; `get::most_bytes`: the spans read, the whole chunks read in a failed span's place, the decoding, the cut bytes and the plaintext opened from them) and the host's, a put's chunks copied to send and a piece of body carried, a get's block taken; the coding's bytes are reed-solomon-simd's work, measured with the call's own (`Code::encode_bytes`, `Code::decode_bytes`), and its tables once a process (`mantle_ec::TABLE_BYTES`) (`derive::objects`) |
+| `volume.*` layout | derived | checksum blocks of the volume's block, at most CRC-32C's verified 16 KiB, so a read at the device's alignment verifies no byte it did not ask for (research 11 §8.2); the least segment holding a record of the largest chunk whole, smaller segments cleaning better (research 11 §7.3–§7.4); the standard layout, or the compact one where the standard leaves fewer than two segments (chunk-store.md §2); batches of every chunk waiting that a segment's room holds at a block each, within the records a batch's frame holds (`layout::most_batch_requests`), so they share one flush where batches of one flushed each chunk alone (research/71, step 9; research/87 §1), a segment's room in bytes, and one fragment a chunk, as the node puts chunks whole; as many fragments as the volume's share of memory holds at the index's measured peak (`index::most_bytes`) and the volume holds at a block each, the least a fragment takes standing for the chunk sizes research 11 §6.2 learns from; a volume laid out already keeps its block, segment and checksum blocks, and holds no more fragments than its log was laid out for (`Geometry::holds`); research 03 §15.9's week a scrub (`derive::volume`) |
+| `gateway.window`, `gateway.objects`, `chunk_asks`, `command_asks`, `read_asks` | derived, measured | a window of one block, the floor; the operations' bytes, what the memory holds past every class's floor and the indexes' and engines' wants (`gateway.objects_bytes`; research/87 §4 rule D), each operation charged what it holds at its own size (`derive::Charges`), and a ceiling of as many operations as those bytes hold at the least one holds (`gateway.objects`), within which the host admits as many as it learns its knee is (§2.8, `crate::admit`); the asks the operations hold at once, each at its most under the schemes a block may take in a cell of the domains the volume table may name, the durability model's choice at each count of them (`derive::schemes`): a put's chunks at its width, or a get's spans and the whole chunks a failed span adds, twice its data less one, past the width of a code whose parity is less than its data less one (`put::most_chunks`, `get::most_chunks`); a put's command for each block of the largest body S3 takes, its renewals (`put::most_commands`); one read each; and the node's enlistment (`derive::asks`). The memory an operation holds at its most: the larger of a put and a get of the schemes' largest blocks, the drivers' own (`put::most_bytes`: the segment, the block filling, each block going down with a code's parity and padded chunk, or a block coded with nothing filling beside it; `get::most_bytes`: the spans read, the whole chunks read in a failed span's place, the decoding, the cut bytes and the plaintext opened from them) and the host's, a put's chunks copied to send and a piece of body carried, a get's block taken; the coding's bytes are reed-solomon-simd's work, measured with the call's own (`Code::encode_bytes`, `Code::decode_bytes`), and its tables once a process (`mantle_ec::TABLE_BYTES`) (`derive::objects`) |
 | `gateway.bucket_quota`, `gateway.scan_rows` | cited, derived | S3's 10,000 (research 05 §10.4); one row each step of a bucket's attempt passes or removes, the least that moves it (`coordinator::Bounds`), until deletion's throughput is measured |
 | `gateway.handover_ns` | cited | HDFS's 60 s soft limit (research 22 §3.6), one of the bounds metadata.md §2 names for the same window, until the gateway measures research 22 §10.2's `D_b`: its retry budget for a step times a high quantile of one try, plus the clocks' offset; it bounds how long a leftover waits, not correctness |
 | `runtime.probe_budget_ms` | bound | hyper-rt's probes stop at Wilks' 59 samples (hyper-rt runtime.md §10.2), measured once by `mantle init` and kept as hyper-rt's record, reused while the machine's key matches; the budget bounds a starved host only: 59 wakes at the platform's quantum, 3 ms on Linux, 10 ms on macOS, 93.75 ms on Windows (research 64; `derive::probe_budget`) |
@@ -1277,6 +1277,89 @@ does, is evaluated against the ownership rules it needs (audit §14.4), not adop
 
 Nothing a later step adds is configured or paid for at an earlier one: with one participant,
 the cell's mechanisms reduce exactly to the local ones (research/27 §7.6).
+
+### 2.8 No fixed counts: admission, batching and sessions
+
+The owner's rule for goal 16 (2026-11-12): "No fixed counts in admission, batching or sessions:
+only learned and data-derived values." Research/87 holds the sources and the plan. Each count
+becomes:
+
+- **The answers a session keeps: bounded by bytes, reached by refusal.** A session keeps an
+  answer while its row, with that answer, fits a row (`Rules::max_value_bytes`, the largest S3
+  admits, so no page grows). A command whose answer would not fit is refused before it takes
+  effect, `Answer::AnswersFull`, its writes undone and its session kept, and so is each later
+  command of that session in the entry. The gateway asks them again in its next entry, which
+  acknowledges the answers before them. A refused command applied nothing and kept nothing. A
+  copy reaching the log later is its first application. Once applied, its answer is kept until
+  acknowledged, and after that a copy is `Repeated`. So a command takes effect once at its
+  serial, and no bound the gateway reaches ends its session. Expiry for room did end it, which
+  left a lost reply's commands to the files that recognise copies (research/87 §1: the
+  dissertation's §6.3, RIFL's §4.2). A gateway never reports `AnswersFull` as a refusal: past its
+  deadline the command is `Deadline`, which may still apply, once.
+- **The commands an entry carries: what waited, within its bytes.** One entry out a range, as
+  now, carries every command waiting that fits `max_entry_bytes`, LogCabin's double buffering,
+  whose batches "dynamically [adjust] to load" (research/87 §1).
+- **The operations a node admits: learned.** The limit is the point of greatest power,
+  Kleinrock's throughput over delay, which by Little's law rises below Denning and Buzen's
+  saturation point and falls past it, so its maximum is the knee. The node finds it as BBR probes
+  its pipe, from above. It starts at the ceiling its memory was split for, where a fixed limit
+  stood, and halves while power does not fall a fifth, counting only phases its limit bound, each
+  judged against one that ran wholly under the limit before it: a phase in which no operation was
+  turned away measured its clients, not its limit, so a limit no client reaches stays where it is.
+  Halving on such phases drove a closed ladder's limit down to its first step's one client, and it
+  climbed back a quarter a cycle while the ladder doubled. Then it cycles eight phases about a base: a
+  quarter past it, a quarter below, six at it. At each cycle's end the base moves to the limit of
+  greatest power among the base's phases and the probes its limit bound; a probe in which no
+  operation was turned away moves nothing. A phase measures only after the operations admitted
+  until its first completion have completed, and then 267 completions, enough to tell a quarter's
+  change in power from chance at 99%. BBR's own estimate, the windowed least latency times the
+  windowed most throughput, fell to one or two operations with sizes mixed (research/87 §3).
+- **The memory the operations hold: bytes, each operation its own.** An operation is admitted
+  only where the bytes it holds at its own size fit beside those of the operations running, within
+  `gateway.objects_bytes` (`derive::Charges`, `crate::admit`). A write is charged at its body's
+  length, which its head states before its fields are read: its first segment and first block,
+  the largest of its own, each chunk of a block copied to send, and a piece of its body, under
+  the scheme that holds the most of it (`put::bytes_for`); the driver reserves its segment at the
+  same length. Every other operation is charged the most any holds, since a get's object's size
+  is known only once its row is read. A request turned away for bytes says nothing of the limit;
+  one turned away by the limit tells it its clients ask more. The data comes first (research/87
+  §4, rule D): the memory past every class's floor is the indexes' and engines' wants first, each
+  taken whole, and what the memory holds past those is the operations', with at least one of the
+  largest blocks. Which of the derived rules (A, B, D) stays is §4's experiment. That share holds
+  one operation of the largest blocks, and as many more as fit at what one costs:
+  the least it is charged, a write of no bytes, and what one more operation adds to the node's
+  other classes, its native client's connections and kept exchange, its pooled exchange, its
+  chunk asks' exchanges and each range's state for its read, the derivation's own difference
+  between one operation and two (`derive::operations`). That count is the limit's ceiling `C`
+  (`gateway.objects`), and the node admits as many native clients. What remains of the share is
+  `gateway.objects_bytes`. Where a fixed ceiling of 8 operations each charged 42 MB stood, a node
+  now holds thousands of small writes at once, and the learned limit, not the ceiling, decides how
+  many run.
+- **Native clients draw their exchanges from a pool.** A client's connection keeps one exchange of
+  its own, as mantle-client asks one at a time, and the rest it opens come from a pool the node
+  sizes to its learned limit (hyper-transport's `StreamCredit::Pooled`, Breakwater's credit, Cho
+  et al., OSDI 2020): a client past the pool is held at its own end by QUIC's stream limit, where
+  it costs the node nothing, rather than sent to be refused. A peer node's connection is raised to
+  its streams once its role is known. So a client costs the node its own connections and the
+  exchange it keeps, never a peer's streams, and the transport's floor grows by the same bytes a
+  client (`bounds::Stated::clients`, `pool`).
+- **The blocks a put holds going down: learned.** A put's body waits while its window is full,
+  each block's chunks stored and its Block command written before the next may go. By Little's
+  law the blocks that keep the body coming at its client's pace are the time a block takes from
+  going down to recorded times the body's rate, over a block's bytes (`crate::window`). The node
+  measures both from its own puts: each block's time to recorded (`Put::take_committed`), and how
+  fast the first block of a longer body filled, which no window holds back, so it is the client's
+  pace (`Put::take_filled`); each smoothed with RFC 6298's gain of 1/8. A put is admitted with
+  that window, at least the floor's one block and no more than its body's own blocks, and charged
+  for it (`derive::Charges::write`). A get still reads a window of one block (`gateway.window`),
+  open until its own rate and its chunks' read time are measured the same way.
+- **A native request past the limit waits, as the S3 door's does.** One the host has no room for,
+  or that comes behind requests already waiting, is parked with its body unread, QUIC's flow
+  control holding its client's bytes, and taken in the order it came once room frees; each turn it
+  waits it is vouched to its asker as a held job is, and at its client's deadline, or a stock
+  client's patience where it gave none, it is answered `SlowDown` (research/77 D1, D2). At most as
+  many wait as the transport holds exchanges. It was answered `SlowDown` at once, which mantle's
+  client took as a throttle and waited out over one to twenty seconds.
 
 ## 3. Transport
 
@@ -2182,15 +2265,20 @@ S3 sends it is unverified (25 §3).
 *As built (2026-10-25), the S3 listener.* The door holds a request for each connection the listener
 admits, and the node takes them in the order they came while the host has room for another
 operation, so a burst past the host's operations waits at the door, its bodies unread, rather than
-being refused: the AWS CLI's transfers send ten parts at once, against what was then a host floor of two operations (now `derive::OBJECTS`, 8), and its
+being refused: the AWS CLI's transfers send ten parts at once, against what was then a host floor of two operations (now as many as the operations' bytes hold, §2.8), and its
 multipart uploads failed `SlowDown` after its two retries until requests waited (AWS CLI 2.34.18
 against a cell of one, 2026-10-25). A stopping node's refusal is `503 SlowDown` before any of a
 body is read, so before `100 Continue`. A response sent before its request's body was read says
 `Connection: close`, whether or not its client waited for `100 Continue`, since it may send the body
 anyway (RFC 9110 §10.1.1); the listener then half-closes and reads what comes until the client
 closes, at most the largest body a request may carry, so the response is not lost to a reset
-(RFC 9112 §9.6; research/72). The connection budget is a floor of ten, what botocore and the AWS
-CLI's classic transfers open at their defaults (research/72). A connection past it is answered
+(RFC 9112 §9.6; research/72). The connection budget is as many connections as the node runs
+operations at most (`gateway.objects`, §2.8), each carrying one request at a time, so one past them
+would only wait at the door; each connection's bytes, measured with a request in flight (341,668 at
+most over plain HTTP, 295,744 over TLS 1.3; `tests/listener_memory.rs`), enter what an operation
+costs the node and so the count itself. It was ten, what botocore and the AWS CLI's classic
+transfers open at their defaults (research/72), thirty requests in a cell's S3 door at once. The
+kernel queues as many connections as the budget. A connection past it is answered
 `503 SlowDown` with `Connection: close` to its first request, from a reserve of ten more, never
 closed with no answer: the AWS CLI drops a ranged GET whose every attempt met a connection closed
 unanswered and ends its copy exit 0 with the object short, where a `503` it asks again and then
@@ -2198,10 +2286,9 @@ fails loudly (research/72 [7]). Past both a connection is closed as it comes. A 
 its client's next octet at most a stock client's patience, 60 s (`bounds::STOCK_PATIENCE`):
 between requests it then closes, owed no response, so a client's idle pooled connections give
 their slots back; and the read after a `Connection: close` ends there too. Each connection task
-holds a timer for that wait, which the node's runtime counts beside its task. Open: the budget growing past its
-floor with the node's memory, which the CLI's CRT transfer client asks, at least ten connections and
-twenty-five at its 10 Gb/s target (research/72); the process's descriptor limit, which the budget
-does not yet read; the reclaim of the connection that has made the least progress for longest when
+holds a timer for that wait, which the node's runtime counts beside its task. Open: the process's
+descriptor limit, which the budget does not yet read (a connection past it waits for one of the
+node's own to close, `Listener::serve`); the reclaim of the connection that has made the least progress for longest when
 the node needs the room (§4.1, §4.3); and the shared admission authority above, whose sojourn test
 would refuse a request that waits at the door past its target, where now it waits as long as the
 host's operations ahead of it take.
@@ -2423,9 +2510,10 @@ B05), and each refusal is typed. It passes with a busy loop on every core.
 Each gateway holds one session with each range it writes to, registered by a `Register` command
 at first use (replica.md §1). Commands carry the session, a serial, and the lowest serial whose
 answer the gateway has not yet received, so the range forgets answers only once the gateway has
-them. A gateway keeps at most as many commands in flight per session as the range's rules let a
-session keep answers (`Rules::max_answers`, `max_answer_bytes`); beyond that its commands wait at
-the gateway, bounded like any queue (§2.6).
+them. A gateway keeps one entry out a session, carrying every command waiting that fits the
+entry's bytes; the range keeps their answers as its row holds them, and refuses the rest
+`AnswersFull` before they take effect, which the gateway asks again under their serials (§2.8).
+The rest wait at the gateway, bounded by the operations that ask them (§2.6).
 
 Three answers need the gateway's handling, and replica.md §1 fixes each:
 

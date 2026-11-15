@@ -309,9 +309,12 @@ fn state_bounds() -> Result<(), ClientError> {
 pub fn stated(nodes: usize, transport_bytes: u64) -> Stated {
     Stated {
         peers: nodes,
+        clients: 0,
+        pool: 0,
         ranges: 1,
         inflight: 0,
         transfers: 0,
+        asked: 0,
         transport_bytes,
         messages: client_bounds(),
         max_head: object::MAX_HEAD,

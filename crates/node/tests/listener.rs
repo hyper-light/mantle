@@ -35,14 +35,18 @@ use hyper_tls::{
 };
 use mantle_cert::{EndpointKey, EndpointName, Serial, Validity};
 use mantle_node::door;
-use mantle_node::listener::{CONNECTIONS, Listener, Settings, TASKS};
+use mantle_node::listener::{Listener, REFUSING, Settings, tasks};
 use mantle_node::process::AccessKey;
+
+/// The connections the tests' listener serves: one stock client's, as many as it answers refused
+/// past them.
+const CONNECTIONS: u64 = REFUSING;
 
 /// The listener's shard: the root task and a task for each connection it holds, served or
 /// answered refused, with a timer for each connection's wait on its client, a socket for it and
 /// each, read and written.
 fn runtime() -> LocalRuntime {
-    let connections = usize::try_from(TASKS).unwrap();
+    let connections = usize::try_from(tasks(CONNECTIONS)).unwrap();
     LocalRuntime::new(&RuntimeConfig {
         shards: 1,
         tasks_per_shard: connections + 1,
@@ -117,6 +121,7 @@ fn the_listener_answers_over_tls_1_3_and_1_2_with_the_endpoint_chain() {
                 access: vec![access],
                 tls: Some((leaf, pkcs8)),
                 node: 1,
+                connections: CONNECTIONS,
             };
             let listener = Listener::bind(settings, submitter).unwrap();
             let at = listener.local_addr().unwrap();
@@ -184,6 +189,7 @@ fn plain(access: AccessKey) -> Settings {
         access: vec![access],
         tls: None,
         node: 1,
+        connections: CONNECTIONS,
     }
 }
 

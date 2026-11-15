@@ -103,8 +103,6 @@ range.max_committed_size_per_ready = 1048576
 range.max_entry_bytes = 1024
 rules.lifetime_ns = 9223372036854775807
 rules.max_sessions = 64
-rules.max_answers = 16
-rules.max_answer_bytes = 18446744073709551615
 rules.expiries_per_entry = 8
 log.segment_bytes = 65536
 log.group_cache = 4096
@@ -262,8 +260,9 @@ volume.fragments_per_chunk = 64
 ";
 
 /// What a node that hosts objects states (`mantle_node::process`'s gateway keys): a block held 30 s
-/// for its file's write, two blocks going down or being read at once, four operations at once, as
-/// many clients as the cell's object clients, S3's 10,000 buckets an owner (research/05 §10.4), 64 rows a coordinator's read; and the
+/// for its file's write, two blocks going down or being read at once, four operations at once,
+/// their bytes four of the most an operation holds at that window (`gateway_bytes`), as many
+/// clients as the cell's object clients, S3's 10,000 buckets an owner (research/05 §10.4), 64 rows a coordinator's read; and the
 /// durability a block's scheme meets: Backblaze's 2025 drive AFR, 1.36% a drive-year, per hour;
 /// repair in a day, the slow end research/15 cites ([Cha12]); S3's eleven nines a year
 /// (research/15, "S3's target").
@@ -278,6 +277,15 @@ durability.chunk_rate = 0.0000015525114155251142
 durability.repair_rate = 0.041666666666666664
 durability.target = 0.00000000001
 ";
+
+/// The bytes `GATEWAY_STATED`'s four operations hold at its window of two blocks, each at the most
+/// an operation holds under any scheme a block may take (`mantle_node::derive::Charges`).
+pub(crate) fn gateway_bytes() -> u64 {
+    let schemes = mantle_ec::durability::candidates();
+    4 * mantle_node::derive::Charges::new(2, &schemes)
+        .unwrap()
+        .most()
+}
 
 /// The cell's root key file in `dir`: 32 bytes only its owner may read.
 pub(crate) fn root_key(dir: &Path) -> PathBuf {
@@ -304,8 +312,6 @@ pub(crate) fn held_row() -> usize {
     let bound = |x| Rules {
         lifetime_ns: u64::MAX,
         max_sessions: 1,
-        max_answers: 1,
-        max_answer_bytes: 0,
         expiries_per_entry: 1,
         max_key_bytes: x,
         max_value_bytes: x,
@@ -329,8 +335,6 @@ pub(crate) fn bounds() -> Bounds {
                 rules: Rules {
                     lifetime_ns: u64::MAX / 2,
                     max_sessions: 64,
-                    max_answers: 16,
-                    max_answer_bytes: usize::MAX,
                     expiries_per_entry: 8,
                     max_key_bytes: held_row(),
                     max_value_bytes: held_row(),
@@ -715,9 +719,12 @@ impl Pki {
         };
         let least = mantle_protocol::bounds::least_transport(&mantle_protocol::bounds::Stated {
             peers: self.nodes.len(),
+            clients: 0,
+            pool: 0,
             ranges: 1,
             inflight: 0,
-            transfers: usize::from(role == Role::Gateway),
+            transfers: 0,
+            asked: usize::from(role == Role::Gateway),
             transport_bytes: 0,
             messages,
             max_head: mantle_node::node::MAX_HEAD,
@@ -769,8 +776,9 @@ impl Pki {
         if gateway {
             text.push_str(&format!(
                 "chunk_asks = 12\ncommand_asks = 8\nread_asks = 8\nroot_key = 1 {}\n\
-                 {GATEWAY_STATED}",
-                self.root_key.display()
+                 {GATEWAY_STATED}gateway.objects_bytes = {}\n",
+                self.root_key.display(),
+                gateway_bytes(),
             ));
         } else {
             text.push_str("chunk_asks = 0\ncommand_asks = 1\nread_asks = 0\n");
@@ -2548,6 +2556,16 @@ pub(crate) fn chunk_key(n: u64) -> ChunkKey {
 /// `mantle init`'s arguments for a cell of three under `root`: a machines file's two founders and a
 /// `--node`'s, each with a volume of its own in a failure domain of its own.
 pub(crate) fn three_founders(root: &Path) -> Vec<String> {
+    founders_within(root, None)
+}
+
+/// [`three_founders`], each founder's memory stated at `memory` where given, as an operator
+/// states it (`memory = 1G`): a node derives what it runs from its allowance, its operations'
+/// count and its S3 listener's connections with it (node.md §2.8), so a test that holds every
+/// connection a listener serves states memory that makes that a count it can hold.
+pub(crate) fn founders_within(root: &Path, memory: Option<&str>) -> Vec<String> {
+    let stated = memory.map_or_else(String::new, |m| format!("memory = {m}\n"));
+    let flag = memory.map_or_else(String::new, |m| format!(",memory={m}"));
     let dirs: Vec<PathBuf> = (1..=3)
         .map(|n| {
             let dir = root.join(format!("d{n}"));
@@ -2559,7 +2577,7 @@ pub(crate) fn three_founders(root: &Path) -> Vec<String> {
     let mut text = String::from("max_nodes = 3\nmax_volumes = 3\n");
     for (n, dir) in dirs.iter().take(2).enumerate() {
         text.push_str(&format!(
-            "[node]\nquic = 127.0.0.1:0\nplane = 127.0.0.1:0\ndomain = rack-{n}\nvolume = {} 256M\n",
+            "[node]\nquic = 127.0.0.1:0\nplane = 127.0.0.1:0\ndomain = rack-{n}\nvolume = {} 256M\n{stated}",
             dir.display()
         ));
     }
@@ -2569,7 +2587,7 @@ pub(crate) fn three_founders(root: &Path) -> Vec<String> {
         file.display().to_string(),
         "--node".into(),
         format!(
-            "quic=127.0.0.1:0,plane=127.0.0.1:0,domain=rack-2,volume={}:256M",
+            "quic=127.0.0.1:0,plane=127.0.0.1:0,domain=rack-2,volume={}:256M{flag}",
             dirs[2].display()
         ),
     ]

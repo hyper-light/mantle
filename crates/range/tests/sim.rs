@@ -150,8 +150,6 @@ fn range(members: u64) -> Range {
 const RULES: Rules = Rules {
     lifetime_ns: u64::MAX / 2,
     max_sessions: 64,
-    max_answers: 16,
-    max_answer_bytes: usize::MAX,
     expiries_per_entry: 8,
     // The model engine holds a row of any length.
     max_key_bytes: usize::MAX,

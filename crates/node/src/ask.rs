@@ -16,7 +16,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use hyper_transport::{ExchangeId, PeerId};
-use mantle_meta::wire::{Answer, Command, Entry, Sessioned};
+use mantle_meta::wire::{Answer, Command, ENTRY_HEAD_BYTES, Entry, MAX_COMMANDS, Sessioned};
 
 use crate::command;
 use crate::read::{Query, Read};
@@ -95,6 +95,10 @@ pub(crate) struct Wanted {
     pub command: Command,
     pub deadline_ns: u64,
     pub wait: Wait,
+    /// The serial the session gave it already: refused for room (`Answer::AnswersFull`), it is
+    /// asked again under the same one, since a copy of its entry still in flight may apply it
+    /// first, and under a new serial it would apply twice.
+    pub serial: Option<u64>,
 }
 
 /// What an entry out carries: the registration of the node's session with the range, under a
@@ -186,23 +190,22 @@ impl Asking {
         out || self.waiting.iter().any(|w| w.wait == Wait::Request)
     }
 
-    /// The waiting commands the next entry may carry: the leading run that waits for the same, at
-    /// most `max_commands`, so that an entry's commands wait for one thing (`Out::wait`).
-    fn run(&self, max_commands: usize) -> (Wait, usize) {
-        let wait = self.waiting.front().map_or(Wait::Request, |w| w.wait);
-        let same = self.waiting.iter().take_while(|w| w.wait == wait).count();
-        (wait, same.min(max_commands.max(1)))
+    /// What the waiting commands the next entry may carry wait for: the leading run's, so that an
+    /// entry's commands wait for one thing (`Out::wait`).
+    fn run(&self) -> Wait {
+        self.waiting.front().map_or(Wait::Request, |w| w.wait)
     }
 
     /// The next entry, when none is out and a command waits: the session's registration first,
     /// as `owner` (the node, as it authenticates) in its `run`, placed at `nth` among the run's
-    /// registrations, under `nonce`; then as many of the waiting commands that wait for the same
-    /// as `max_commands` lets one entry carry and fit `max_entry_bytes` once encoded, each the
-    /// next serial. A waiting command that fits no entry alone is answered refused, `Malformed`,
+    /// registrations, under `nonce`; then the leading run of waiting commands that wait for the
+    /// same, as many as fit `max_entry_bytes` once encoded, each under the serial it was given or
+    /// the next, no count besides: the batch is what waited (research/87 §1, LogCabin's double
+    /// buffering). A waiting command that fits no entry alone is answered refused, `Malformed`,
     /// in `refused`.
     pub fn next_entry(
         &mut self,
-        (max_commands, max_entry_bytes): (usize, usize),
+        max_entry_bytes: usize,
         (owner, run, nth): (u64, u64, u64),
         nonce: u64,
         refused: &mut Vec<(CommandAsk, CommandOutcome)>,
@@ -225,44 +228,51 @@ impl Asking {
                 entry,
                 via: Via::Unasked,
                 leaderless_since: None,
-                wait: self.run(max_commands).0,
+                wait: self.run(),
             });
             return;
         }
-        let first = self.next_serial;
-        let (mut wait, mut take) = self.run(max_commands);
+        // The lowest serial whose answer the node has not received: a command asked again
+        // under its serial, or the next.
+        let unanswered = self
+            .waiting
+            .iter()
+            .filter_map(|w| w.serial)
+            .min()
+            .map_or(self.next_serial, |s| s.min(self.next_serial));
         loop {
-            let entry = Entry {
-                at_ns: 0,
-                commands: (0u64..)
-                    .zip(self.waiting.iter().take(take))
-                    .map(|(at, wanted)| Sessioned {
-                        session: self.session,
-                        serial: first.saturating_add(at),
-                        unanswered: first,
-                        command: wanted.command.clone(),
-                    })
-                    .collect(),
-            };
-            let fits = entry
-                .encode()
-                .is_ok_and(|bytes| bytes.len() <= max_entry_bytes);
-            if fits {
-                let mut carried = Vec::with_capacity(take);
-                for (at, wanted) in (0u64..).zip(self.waiting.drain(..take)) {
-                    carried.push((wanted.ask, first.saturating_add(at), wanted.deadline_ns));
+            let wait = self.run();
+            let mut commands = Vec::new();
+            let mut bytes = ENTRY_HEAD_BYTES;
+            let mut next = self.next_serial;
+            for wanted in self
+                .waiting
+                .iter()
+                .take_while(|w| w.wait == wait)
+                .take(MAX_COMMANDS)
+            {
+                let serial = wanted.serial.unwrap_or(next);
+                let sessioned = Sessioned {
+                    session: self.session,
+                    serial,
+                    unanswered,
+                    command: wanted.command.clone(),
+                };
+                let Some(total) = sessioned
+                    .encoded_len()
+                    .ok()
+                    .and_then(|len| bytes.checked_add(len))
+                    .filter(|&total| total <= max_entry_bytes)
+                else {
+                    break;
+                };
+                bytes = total;
+                if wanted.serial.is_none() {
+                    next = next.saturating_add(1);
                 }
-                self.next_serial = first.saturating_add(u64::try_from(take).unwrap_or(u64::MAX));
-                self.out = Some(Out {
-                    carried: Carried::Commands(carried),
-                    entry,
-                    via: Via::Unasked,
-                    leaderless_since: None,
-                    wait,
-                });
-                return;
+                commands.push(sessioned);
             }
-            if take <= 1 {
+            if commands.is_empty() {
                 // No entry carries this command alone: it is answered and the next tried.
                 if let Some(wanted) = self.waiting.pop_front() {
                     refused.push((
@@ -273,10 +283,23 @@ impl Asking {
                 if self.waiting.is_empty() {
                     return;
                 }
-                (wait, take) = self.run(max_commands);
                 continue;
             }
-            take = take.saturating_sub(1);
+            let carried = self
+                .waiting
+                .drain(..commands.len())
+                .zip(&commands)
+                .map(|(wanted, sessioned)| (wanted.ask, sessioned.serial, wanted.deadline_ns))
+                .collect();
+            self.next_serial = next;
+            self.out = Some(Out {
+                carried: Carried::Commands(carried),
+                entry: Entry { at_ns: 0, commands },
+                via: Via::Unasked,
+                leaderless_since: None,
+                wait,
+            });
+            return;
         }
     }
 
@@ -285,7 +308,11 @@ impl Asking {
     /// `Superseded` says the owner registered in a later run, a process other than this one, and
     /// each waiting command is answered so; one answered otherwise is asked again. A command whose
     /// session the range no longer holds was not applied (`Answer::SessionExpired`): the session is
-    /// registered anew and the command waits again, in its place.
+    /// registered anew and the command waits again, in its place, for a serial of the new one. A
+    /// command its session's row had no room for (`Answer::AnswersFull`) did not apply then: it
+    /// waits again in its place under its serial, and the next entry acknowledges the answers
+    /// before it, which makes the room. It is never told refused, since a copy of its entry still
+    /// in flight may yet apply it; past its deadline it is `Deadline`, which may still apply.
     pub fn answered(&mut self, answers: Vec<Answer>, done: &mut Vec<(CommandAsk, CommandOutcome)>) {
         let Some(out) = self.out.take() else {
             return;
@@ -312,27 +339,40 @@ impl Asking {
                     return;
                 }
                 let mut again = Vec::new();
-                for (((ask, _, deadline_ns), sessioned), answer) in
+                let mut expired = false;
+                for (((ask, serial, deadline_ns), sessioned), answer) in
                     commands.into_iter().zip(out.entry.commands).zip(answers)
                 {
-                    if answer == Answer::SessionExpired {
-                        again.push(Wanted {
-                            ask,
-                            command: sessioned.command,
-                            deadline_ns,
-                            wait: out.wait,
-                        });
-                    } else {
-                        done.push((ask, CommandOutcome::Answered(answer)));
-                    }
+                    let serial = match answer {
+                        Answer::SessionExpired => {
+                            expired = true;
+                            None
+                        }
+                        Answer::AnswersFull => Some(serial),
+                        answer => {
+                            done.push((ask, CommandOutcome::Answered(answer)));
+                            continue;
+                        }
+                    };
+                    again.push(Wanted {
+                        ask,
+                        command: sessioned.command,
+                        deadline_ns,
+                        wait: out.wait,
+                        serial,
+                    });
                 }
-                if again.is_empty() {
-                    return;
-                }
-                self.session = 0;
-                // Each command expired waits again in its place, before those that came after.
+                // Each command asked again waits in its place, before those that came after.
                 for wanted in again.into_iter().rev() {
                     self.waiting.push_front(wanted);
+                }
+                // A session the range no longer holds ends every serial of it: the commands
+                // wait for the new session's.
+                if expired {
+                    self.session = 0;
+                    for wanted in &mut self.waiting {
+                        wanted.serial = None;
+                    }
                 }
             }
         }
@@ -461,7 +501,19 @@ mod tests {
             },
             deadline_ns,
             wait: Wait::Request,
+            serial: None,
         }
+    }
+
+    /// The bytes of an entry of `n` of [`wanted`]'s commands: a bound that takes `n` to an entry.
+    fn holding(n: usize) -> usize {
+        let one = Sessioned {
+            session: 5,
+            serial: 1,
+            unanswered: 1,
+            command: wanted(0, 0).command,
+        };
+        ENTRY_HEAD_BYTES + n * one.encoded_len().unwrap()
     }
 
     fn asking(waiting: &[Wanted]) -> Asking {
@@ -474,14 +526,14 @@ mod tests {
     fn a_session_is_registered_first_then_commands_go_in_order_as_serials() {
         let mut a = asking(&[wanted(1, 100), wanted(2, 100), wanted(3, 100)]);
         let mut done = Vec::new();
-        a.next_entry((2, 1 << 20), (1, 1, 42), 42, &mut done);
+        a.next_entry(1 << 20, (1, 1, 42), 42, &mut done);
         let out = a.out.clone().unwrap();
         assert_eq!(out.carried, Carried::Registration { nonce: 42 });
         assert_eq!(out.entry.commands[0].serial, 42);
         a.answered(vec![Answer::Registered { session: 9 }], &mut done);
         assert_eq!((a.session, a.next_serial), (9, 1));
-        // Two to an entry: serials 1 and 2, the oldest unanswered the first.
-        a.next_entry((2, 1 << 20), (1, 1, 43), 43, &mut done);
+        // Two to an entry's bytes: serials 1 and 2, the oldest unanswered the first.
+        a.next_entry(holding(2), (1, 1, 43), 43, &mut done);
         let out = a.out.clone().unwrap();
         assert_eq!(
             out.carried,
@@ -494,7 +546,7 @@ mod tests {
                 .all(|c| c.session == 9 && c.unanswered == 1)
         );
         a.answered(vec![Answer::Repeated, Answer::WrongLayer], &mut done);
-        a.next_entry((2, 1 << 20), (1, 1, 44), 44, &mut done);
+        a.next_entry(holding(2), (1, 1, 44), 44, &mut done);
         assert_eq!(
             a.out.as_ref().unwrap().carried,
             Carried::Commands(vec![(3, 3, 100)])
@@ -530,7 +582,7 @@ mod tests {
             (vec![(3, 3, u64::MAX)], Wait::Answered),
             (vec![(4, 4, 100)], Wait::Request),
         ] {
-            a.next_entry((16, 1 << 20), (1, 1, 0), 0, &mut done);
+            a.next_entry(1 << 20, (1, 1, 0), 0, &mut done);
             let out = a.out.clone().unwrap();
             assert_eq!((out.carried, out.wait), (Carried::Commands(carried), wait));
             let answers = vec![Answer::Repeated; out.entry.commands.len()];
@@ -545,7 +597,7 @@ mod tests {
         // An entry requests wait on: given up, and the request waiting behind it ended.
         let mut a = asking(&[wanted(1, 100), answered_by(2), wanted(3, 100)]);
         a.session = 5;
-        a.next_entry((16, 1 << 20), (1, 1, 0), 0, &mut done);
+        a.next_entry(1 << 20, (1, 1, 0), 0, &mut done);
         assert!(a.unled(&mut done));
         assert_eq!(
             done,
@@ -555,7 +607,7 @@ mod tests {
         // The node's own statement: asked on, its clock started again, the request behind it ended.
         done.clear();
         a.waiting.push_back(wanted(4, 100));
-        a.next_entry((16, 1 << 20), (1, 1, 0), 0, &mut done);
+        a.next_entry(1 << 20, (1, 1, 0), 0, &mut done);
         if let Some(out) = a.out.as_mut() {
             out.leaderless_since = Some(7);
         }
@@ -569,10 +621,10 @@ mod tests {
         // A registration: given up once no command waits for it.
         done.clear();
         let mut b = asking(&[answered_by(5)]);
-        b.next_entry((16, 1 << 20), (1, 1, 0), 0, &mut done);
+        b.next_entry(1 << 20, (1, 1, 0), 0, &mut done);
         assert!(!b.unled(&mut done) && b.out.is_some());
         let mut c = asking(&[wanted(6, 100)]);
-        c.next_entry((16, 1 << 20), (1, 1, 0), 0, &mut done);
+        c.next_entry(1 << 20, (1, 1, 0), 0, &mut done);
         assert!(c.unled(&mut done) && c.out.is_none());
         assert_eq!(done, vec![(6, CommandOutcome::Deadline)]);
     }
@@ -582,7 +634,7 @@ mod tests {
         // The owner registered in a later run: this process's commands go to no session.
         let mut a = asking(&[wanted(1, 100), wanted(2, 100)]);
         let mut done = Vec::new();
-        a.next_entry((2, 1 << 20), (1, 1, 5), 5, &mut done);
+        a.next_entry(1 << 20, (1, 1, 5), 5, &mut done);
         a.answered(vec![Answer::Superseded], &mut done);
         assert_eq!(a.session, 0);
         assert!(a.waiting.is_empty() && a.out.is_none());
@@ -617,7 +669,7 @@ mod tests {
         .len();
         let mut done = Vec::new();
         // Room for one command an entry: the first goes alone.
-        a.next_entry((16, one), (1, 1, 0), 0, &mut done);
+        a.next_entry(one, (1, 1, 0), 0, &mut done);
         assert_eq!(
             a.out.as_ref().unwrap().carried,
             Carried::Commands(vec![(1, 1, 100)])
@@ -625,7 +677,7 @@ mod tests {
         // Room for none: each is refused, nothing goes.
         let mut b = asking(&[wanted(1, 100), wanted(2, 100)]);
         b.session = 5;
-        b.next_entry((16, one - 1), (1, 1, 0), 0, &mut done);
+        b.next_entry(one - 1, (1, 1, 0), 0, &mut done);
         assert!(b.out.is_none() && b.waiting.is_empty());
         assert_eq!(
             done,
@@ -641,7 +693,7 @@ mod tests {
         let mut a = asking(&[wanted(1, 100), wanted(2, 100), wanted(3, 100)]);
         a.session = 5;
         let mut done = Vec::new();
-        a.next_entry((2, 1 << 20), (1, 1, 0), 0, &mut done);
+        a.next_entry(holding(2), (1, 1, 0), 0, &mut done);
         a.answered(
             vec![Answer::SessionExpired, Answer::SessionExpired],
             &mut done,
@@ -651,11 +703,55 @@ mod tests {
         let order: Vec<_> = a.waiting.iter().map(|w| w.ask).collect();
         assert_eq!(order, vec![1, 2, 3]);
         // The new session first.
-        a.next_entry((2, 1 << 20), (1, 1, 8), 8, &mut done);
+        a.next_entry(holding(2), (1, 1, 8), 8, &mut done);
         assert_eq!(
             a.out.as_ref().unwrap().carried,
             Carried::Registration { nonce: 8 }
         );
+    }
+
+    /// Commands the session's row had no room for wait again in their place under their serials,
+    /// the next entry naming the lowest as unanswered, so a copy still in flight that applies one
+    /// meets the same serial asked again, answered from what was kept; a command after them takes
+    /// the next serial, and none is told refused. Once the session expires, they wait for the new
+    /// session's serials.
+    #[test]
+    fn a_command_refused_for_room_is_asked_again_under_its_serial() {
+        let mut a = asking(&[wanted(1, 100), wanted(2, 100), wanted(3, 100)]);
+        a.session = 5;
+        let mut done = Vec::new();
+        a.next_entry(holding(3), (1, 1, 0), 0, &mut done);
+        let applied = Answer::Name(mantle_meta::name::Outcome::Put {
+            version: "v".into(),
+        });
+        a.answered(
+            vec![applied.clone(), Answer::AnswersFull, Answer::AnswersFull],
+            &mut done,
+        );
+        assert_eq!(done, vec![(1, CommandOutcome::Answered(applied.clone()))]);
+        let serials: Vec<_> = a.waiting.iter().map(|w| (w.ask, w.serial)).collect();
+        assert_eq!(serials, vec![(2, Some(2)), (3, Some(3))]);
+        a.waiting.push_back(wanted(4, 100));
+        a.next_entry(1 << 20, (1, 1, 0), 0, &mut done);
+        let out = a.out.clone().unwrap();
+        assert_eq!(
+            out.carried,
+            Carried::Commands(vec![(2, 2, 100), (3, 3, 100), (4, 4, 100)])
+        );
+        assert!(out.entry.commands.iter().all(|c| c.unanswered == 2));
+        assert_eq!(a.next_serial, 5);
+        // The range no longer holds the session: every command waits for the new one's serials.
+        a.answered(
+            vec![
+                Answer::SessionExpired,
+                Answer::AnswersFull,
+                Answer::SessionExpired,
+            ],
+            &mut done,
+        );
+        assert_eq!(a.session, 0);
+        assert!(a.waiting.iter().all(|w| w.serial.is_none()));
+        assert_eq!(done.len(), 1);
     }
 
     #[test]
@@ -663,7 +759,7 @@ mod tests {
         let mut a = asking(&[wanted(1, 50), wanted(2, 200), wanted(3, 60)]);
         a.session = 5;
         let mut done = Vec::new();
-        a.next_entry((2, 1 << 20), (1, 1, 0), 0, &mut done);
+        a.next_entry(holding(2), (1, 1, 0), 0, &mut done);
         assert_eq!(a.next_deadline(), Some(50));
         // Command 3, waiting, passes; the entry out holds 2, not yet past.
         assert!(!a.expire(100, &mut done));
@@ -680,5 +776,242 @@ mod tests {
             ]
         );
         assert_eq!(a.held(), 0);
+    }
+
+    /// A session's commands take effect once, under deterministic simulation with injected faults
+    /// (CLAUDE.md §8): the node's own asking drives a Name range's entries through a log that
+    /// loses an entry before it is appended, loses a reply after it applied, and appends copies
+    /// of an entry asked again, each late by a delay the seed draws, past entries after it; the
+    /// commands' deadlines give entries up; and the session's row holds few answers, so commands
+    /// are refused for room and asked again. Each command is a versioned delete, which makes a
+    /// marker each time it applies, so a second application would show. Every command answered
+    /// took effect exactly once, its answer naming the marker it made; none took effect twice;
+    /// and every session row stayed within its bound, as the range refuses a row past it.
+    #[test]
+    fn a_sessions_commands_take_effect_once_through_lost_replies_late_copies_and_refusals() {
+        use mantle_meta::apply::{Layer, apply_entry};
+        use mantle_meta::engine::{Engine, Model, Rows};
+        use mantle_meta::name::{self, Scan, VersionFrom};
+        use mantle_meta::record::{Session, Versioning};
+        use mantle_meta::session::Rules;
+        use std::collections::BTreeMap;
+
+        let delete = |ask: CommandAsk| {
+            Command::Name(Box::new(name::Command::Delete(name::Delete {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: format!("k{ask}"),
+                versioning: Versioning::Enabled,
+                named: None,
+                if_match: None,
+                at_ns: 0,
+                bypass: false,
+                owner: "o".into(),
+            })))
+        };
+        let one = Answer::Name(name::Outcome::Deleted {
+            marker: true,
+            version: Some(mantle_meta::key::version_id(u64::MAX)),
+        })
+        .encode()
+        .unwrap()
+        .len();
+        let rules = Rules {
+            lifetime_ns: u64::MAX,
+            max_sessions: 4,
+            expiries_per_entry: 1,
+            max_key_bytes: usize::MAX,
+            // Four answers at a time: an entry of more is refused past them.
+            max_value_bytes: Session::row_bytes(4, 4 * one).unwrap(),
+        };
+        let (mut refusals, mut doubles, mut lost) = (0u64, 0u64, 0u64);
+        for seed in 1..=48u64 {
+            let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let mut next = move |n: u64| {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng % n
+            };
+            let mut m = Model::default();
+            m.install(0, name::first(1).unwrap()).unwrap();
+            let mut index = 0u64;
+            let mut now = 0u64;
+            let gate = Entry {
+                at_ns: 0,
+                commands: vec![Sessioned {
+                    session: 0,
+                    serial: 0,
+                    unanswered: 0,
+                    command: Command::Register {
+                        owner: 9,
+                        run: 1,
+                        nth: 1,
+                    },
+                }],
+            };
+            // The bucket's gate, opened by a session of another owner.
+            index += 1;
+            let [Answer::Registered { session }] =
+                apply_entry(&mut m, index, &gate, Layer::Name, &rules).unwrap()[..]
+            else {
+                panic!()
+            };
+            let open = Entry {
+                at_ns: 0,
+                commands: vec![Sessioned {
+                    session,
+                    serial: 1,
+                    unanswered: 1,
+                    command: Command::Name(Box::new(name::Command::Gate(name::GateChange {
+                        bucket: "b".into(),
+                        incarnation: 1,
+                        attempt: 1,
+                        from: None,
+                        to: Some(mantle_meta::record::GateState::Open),
+                        generation: 1,
+                    }))),
+                }],
+            };
+            index += 1;
+            apply_entry(&mut m, index, &open, Layer::Name, &rules).unwrap();
+
+            let mut a = Asking::new(7, Duration::from_millis(1));
+            let mut outcomes: BTreeMap<CommandAsk, CommandOutcome> = BTreeMap::new();
+            // Copies of entries on their way to the log: when each arrives, whether it is
+            // appended, and whether its reply comes back.
+            let mut flight: Vec<(u64, Entry, bool, bool)> = Vec::new();
+            let mut applied: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+            let (mut asks, mut registrations) = (0u64, 0u64);
+            for step in 0..400u64 {
+                now += 1 + next(4);
+                if step < 300 && next(3) == 0 {
+                    asks += 1;
+                    a.waiting.push_back(Wanted {
+                        ask: asks,
+                        command: delete(asks),
+                        deadline_ns: now + 20 + next(200),
+                        wait: Wait::Request,
+                        serial: None,
+                    });
+                }
+                let mut done = Vec::new();
+                a.expire(now, &mut done);
+                if a.out.is_none() {
+                    if a.session == 0 {
+                        registrations += 1;
+                    }
+                    a.next_entry(1 << 20, (1, 1, registrations), registrations, &mut done);
+                    if let Some(out) = &a.out {
+                        flight.push((
+                            now + next(30),
+                            out.entry.clone(),
+                            next(8) != 0,
+                            next(4) != 0,
+                        ));
+                    }
+                } else if next(6) == 0 {
+                    // Asked again, as after a reply lost or a leader changed.
+                    if let Some(out) = &a.out {
+                        flight.push((
+                            now + next(30),
+                            out.entry.clone(),
+                            next(8) != 0,
+                            next(4) != 0,
+                        ));
+                    }
+                }
+                let drain = step >= 399;
+                flight.sort_by_key(|f| f.0);
+                while let Some(at) = flight.iter().position(|f| drain || f.0 <= now) {
+                    let (_, mut entry, appended, replied) = flight.remove(at);
+                    if !appended {
+                        continue;
+                    }
+                    let key = entry.encode().unwrap();
+                    let copies = applied.entry(key).or_insert(0);
+                    *copies += 1;
+                    doubles += u64::from(*copies > 1);
+                    entry.at_ns = now;
+                    index += 1;
+                    let answers = apply_entry(&mut m, index, &entry, Layer::Name, &rules).unwrap();
+                    refusals += answers
+                        .iter()
+                        .filter(|x| **x == Answer::AnswersFull)
+                        .count() as u64;
+                    entry.at_ns = 0;
+                    if !replied {
+                        lost += 1;
+                        continue;
+                    }
+                    if a.out.as_ref().is_some_and(|o| o.entry == entry) {
+                        a.answered(answers, &mut done);
+                    }
+                }
+                for (ask, outcome) in done {
+                    assert!(
+                        outcomes.insert(ask, outcome).is_none(),
+                        "seed {seed}: {ask} twice"
+                    );
+                }
+            }
+            // What each command's key holds: its markers, each named as S3 shows it.
+            let mut markers: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            let mut from = Vec::new();
+            loop {
+                let mut budget = usize::MAX;
+                let found =
+                    name::next_version(&mut m, "b", VersionFrom::Key(&from), &[0xFF], &mut budget)
+                        .unwrap();
+                let Scan::Found(v) = found else { break };
+                assert!(v.version.marker);
+                from = format!("{}\0", v.key).into_bytes();
+                let mut all = vec![name::shown_id(v.version.null, v.order)];
+                let mut after = v;
+                while let Scan::Found(w) = name::next_version(
+                    &mut m,
+                    "b",
+                    VersionFrom::After {
+                        key: &after.key,
+                        version_id: &name::shown_id(after.version.null, after.order),
+                    },
+                    &[0xFF],
+                    &mut usize::MAX.clone(),
+                )
+                .unwrap()
+                {
+                    if w.key != after.key {
+                        break;
+                    }
+                    all.push(name::shown_id(w.version.null, w.order));
+                    after = w;
+                }
+                markers.insert(after.key.clone(), all);
+            }
+            for (key, made) in &markers {
+                assert_eq!(
+                    made.len(),
+                    1,
+                    "seed {seed}: {key} took effect {}",
+                    made.len()
+                );
+            }
+            for ask in 1..=asks {
+                let made = markers.get(&format!("k{ask}"));
+                match outcomes.get(&ask) {
+                    Some(CommandOutcome::Answered(Answer::Name(name::Outcome::Deleted {
+                        marker: true,
+                        version: Some(version),
+                    }))) => assert_eq!(made, Some(&vec![version.clone()]), "seed {seed}: {ask}"),
+                    Some(CommandOutcome::Deadline) | None => {}
+                    other => panic!("seed {seed}: {ask} answered {other:?}"),
+                }
+            }
+            let _ = m.get(b"").unwrap();
+        }
+        assert!(
+            refusals > 0 && doubles > 0 && lost > 0,
+            "{refusals} {doubles} {lost}"
+        );
     }
 }

@@ -76,7 +76,7 @@
 //! of the transport's serve period `SERVE_NS`, the longest an exchange it carries may go without
 //! moving before the transport refuses it; and, in an orderly stop, `stopping` as it begins,
 //! `handed GROUP LEADER` for each range whose lead it handed over, and `stopped` as it ends. A
-//! node with an S3 endpoint says `s3-bound ADDR CONNECTIONS` once its listener is bound: where it
+//! node with an S3 endpoint says `s3-bound ADDR CONNECTIONS`, the connections it serves, once its listener is bound: where it
 //! listens and the connections it holds at once (node.md §4.1). On standard input:
 //! `learn ID QUIC PLANE`, where a peer listens, `replace FAILED JOINING`, a member lost for good
 //! and the spare that takes its place in every range the node hosts (`Node::replace`), `stop`,
@@ -412,6 +412,7 @@ pub struct GatewayConfig {
     pub handover_ns: u64,
     pub window: usize,
     pub objects: usize,
+    pub objects_bytes: u64,
     pub clients: usize,
     pub bucket_quota: u32,
     pub scan_rows: u32,
@@ -495,8 +496,6 @@ pub const KEYS: &[&str] = &[
     "range.max_entry_bytes",
     "rules.lifetime_ns",
     "rules.max_sessions",
-    "rules.max_answers",
-    "rules.max_answer_bytes",
     "rules.expiries_per_entry",
     "rules.max_key_bytes",
     "rules.max_value_bytes",
@@ -535,6 +534,7 @@ pub const KEYS: &[&str] = &[
     "gateway.handover_ns",
     "gateway.window",
     "gateway.objects",
+    "gateway.objects_bytes",
     "gateway.clients",
     "gateway.bucket_quota",
     "gateway.scan_rows",
@@ -924,8 +924,6 @@ impl ProcessConfig {
             rules: Rules {
                 lifetime_ns: lines.get("rules.lifetime_ns")?,
                 max_sessions: lines.get("rules.max_sessions")?,
-                max_answers: lines.get("rules.max_answers")?,
-                max_answer_bytes: lines.get("rules.max_answer_bytes")?,
                 expiries_per_entry: lines.get("rules.expiries_per_entry")?,
                 max_key_bytes: lines.get("rules.max_key_bytes")?,
                 max_value_bytes: lines.get("rules.max_value_bytes")?,
@@ -1055,6 +1053,7 @@ fn gateway(lines: &Lines) -> Result<Option<GatewayConfig>, ProcessError> {
         handover_ns: lines.get("gateway.handover_ns")?,
         window: lines.get("gateway.window")?,
         objects: lines.get("gateway.objects")?,
+        objects_bytes: lines.get("gateway.objects_bytes")?,
         clients: lines.get("gateway.clients")?,
         bucket_quota: lines.get("gateway.bucket_quota")?,
         scan_rows: lines.get("gateway.scan_rows")?,
@@ -1066,24 +1065,35 @@ fn gateway(lines: &Lines) -> Result<Option<GatewayConfig>, ProcessError> {
 }
 
 /// The gateway host's settings, its root keys read from their files: each 32 bytes that only its
-/// owner may read, as `mantle init` makes them (encryption.md §2).
-fn gateway_settings(config: GatewayConfig, keys: Vec<(u32, WrappingKey)>) -> GatewaySettings {
-    GatewaySettings {
+/// owner may read, as `mantle init` makes them (encryption.md §2); what each operation holds at
+/// its own size, at the window its file states, under the schemes its blocks may take in a cell
+/// its `enlist` names the most domains of (`derive::charges`), as the node's floor reckoned them.
+fn gateway_settings(
+    config: GatewayConfig,
+    keys: Vec<(u32, WrappingKey)>,
+    enlist: Option<&Enlisting>,
+) -> Result<GatewaySettings, ProcessError> {
+    let rates = Rates {
+        chunk: config.chunk_rate,
+        domains: None,
+        bursts: config.bursts,
+        repair: config.repair_rate,
+    };
+    let charges = crate::derive::charges(config.window, enlist, &rates, config.target)
+        .map_err(|e| ProcessError::Value("gateway.window", e.to_string()))?;
+    Ok(GatewaySettings {
         keys,
         handover_ns: config.handover_ns,
         window: config.window,
         objects: config.objects,
+        objects_bytes: config.objects_bytes,
+        charges,
         clients: config.clients,
         bucket_quota: config.bucket_quota,
         scan_rows: config.scan_rows,
-        rates: Rates {
-            chunk: config.chunk_rate,
-            domains: None,
-            bursts: config.bursts,
-            repair: config.repair_rate,
-        },
+        rates,
         target: config.target,
-    }
+    })
 }
 
 /// How a node with `volume` lines enlists them: the root range its `range` lines name, its
@@ -1351,7 +1361,11 @@ fn run_node(
         peers,
         keys,
     } = identity;
-    let gateway = config.gateway.take().map(|g| gateway_settings(g, keys));
+    let gateway = config
+        .gateway
+        .take()
+        .map(|g| gateway_settings(g, keys, config.enlist.as_ref()))
+        .transpose()?;
     let resolved = resolve(&config).map_err(step(Step::Network))?;
     // A named peer is looked up again as the node runs, on hyper-rt's blocking pool, off its shards:
     // one lookup at a time (`crate::names`), so one place and no line.
@@ -1362,7 +1376,13 @@ fn run_node(
         })
         .map_err(|e| step(Step::Network)(ProcessError::Runtime(format!("{e:?}"))))?;
     }
-    let runtime = runtime(&config, s3.is_some()).map_err(step(Step::Network))?;
+    // The S3 listener serves as many connections as the node runs operations (`listener::Settings`).
+    let listening = s3.is_some().then(|| {
+        gateway
+            .as_ref()
+            .map_or(0, |g| u64::try_from(g.objects).unwrap_or(u64::MAX))
+    });
+    let runtime = runtime(&config, listening).map_err(step(Step::Network))?;
     let mut rt = LocalRuntime::new(&runtime)
         .map_err(|e| step(Step::Network)(ProcessError::Runtime(format!("{e:?}"))))?;
     let ran = rt
@@ -1390,7 +1410,7 @@ fn run_node(
 fn listen<E: Engine + 'static>(
     node: &mut Node<E>,
     keys: S3Keys,
-    (id, hosts): (u64, bool),
+    (id, hosts, connections): (u64, bool, u64),
 ) -> Result<crate::listener::Listener, ProcessError> {
     let refused = |e: String| ProcessError::Listener(e);
     if !hosts {
@@ -1398,8 +1418,8 @@ fn listen<E: Engine + 'static>(
             "an S3 endpoint on a node that hosts no objects".into(),
         ));
     }
-    let waiting = usize::try_from(crate::listener::CONNECTIONS)
-        .map_err(|_| refused("the listener's connections".into()))?;
+    let waiting =
+        usize::try_from(connections).map_err(|_| refused("the listener's connections".into()))?;
     let listen = keys.listen;
     let tls = if listen.ip().is_loopback() {
         None
@@ -1415,6 +1435,7 @@ fn listen<E: Engine + 'static>(
             access: keys.access,
             tls,
             node: id,
+            connections,
         },
         door,
     )
@@ -1685,15 +1706,15 @@ pub fn calibration(dir: &Path, budget: Duration) -> Result<Calibration, ProcessE
 /// two, a stopping node turned without pause until it ended: 8,834 turns and 8,798 timer waits in
 /// a stop of 346 ms on macOS (diag/roll-stop-bound), a CPU spent for the whole stop. Each of the
 /// S3 listener's connection tasks holds one more while it waits on its client
-/// (`listener::TASKS`).
+/// (`listener::tasks`).
 const TIMERS: usize = 3;
 
 /// One shard, calibrated on this machine (hyper-rt `RuntimeConfig::from_calibration`), sized by
 /// what the node holds: its one task and the timers it holds at once ([`TIMERS`]), and a socket
 /// for its endpoint, each connection and its plane, each read and written; with an S3 listener, a
 /// task and a timer for each connection it holds at once, served or answered refused
-/// (`listener::TASKS`), and a socket for the listener and each of those connections.
-fn runtime(config: &ProcessConfig, s3: bool) -> Result<RuntimeConfig, ProcessError> {
+/// (`listener::tasks`), and a socket for the listener and each of those connections.
+fn runtime(config: &ProcessConfig, listening: Option<u64>) -> Result<RuntimeConfig, ProcessError> {
     let calibration = calibration(&config.dir, config.probe_budget)?;
     let constants = calibration
         .constants(&Policy {
@@ -1702,11 +1723,11 @@ fn runtime(config: &ProcessConfig, s3: bool) -> Result<RuntimeConfig, ProcessErr
             latency_objective_ns: None,
         })
         .map_err(|unmet| ProcessError::Runtime(format!("{unmet:?}")))?;
-    let connections = if s3 {
-        usize::try_from(crate::listener::TASKS)
-            .map_err(|_| ProcessError::Runtime("the S3 listener's connections".into()))?
-    } else {
-        0
+    let s3 = listening.is_some();
+    let connections = match listening {
+        Some(served) => usize::try_from(crate::listener::tasks(served))
+            .map_err(|_| ProcessError::Runtime("the S3 listener's connections".into()))?,
+        None => 0,
     };
     let tasks = connections
         .checked_add(1)
@@ -1824,6 +1845,10 @@ async fn serve(
     let history = history::cell_with(cell, row, own);
     // Whether the node hosts objects, which an S3 listener hands its operations to.
     let hosts = gateway.is_some();
+    // The S3 listener serves as many connections as the node runs operations (`listener::Settings`).
+    let connections = gateway
+        .as_ref()
+        .map_or(0, |g| u64::try_from(g.objects).unwrap_or(u64::MAX));
     let settings = NodeSettings {
         id: config.id,
         dir: config.dir.clone(),
@@ -1870,12 +1895,12 @@ async fn serve(
     let mut looking: Option<Looking> = None;
     let listener = match s3 {
         Some(keys) => {
-            let listener =
-                listen(&mut node, keys, (config.id, hosts)).map_err(step(Step::Network))?;
+            let listener = listen(&mut node, keys, (config.id, hosts, connections))
+                .map_err(step(Step::Network))?;
             let at = listener
                 .local_addr()
                 .map_err(|e| step(Step::Network)(ProcessError::Listener(e.to_string())))?;
-            let line = format!("s3-bound {at} {}\n", crate::listener::CONNECTIONS);
+            let line = format!("s3-bound {at} {connections}\n");
             say(&mut output, &line).await?;
             Some(listener)
         }

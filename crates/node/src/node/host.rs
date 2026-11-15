@@ -54,8 +54,8 @@ use crate::read::{Query, Read};
 use mantle_protocol::bounds;
 use mantle_protocol::classes::Class;
 use mantle_protocol::object::{
-    self, Deleted, Head, Headers, Issued, List, Listing, MAX_PAGE_PARTS, Metadata, Op, PartListed,
-    Parts, Principals, Progress, Reply, Status, Stored, Target,
+    self, Deleted, Head, Headers, Issued, List, Listing, MAX_PAGE_PARTS, Metadata, ObjectError, Op,
+    PartListed, Parts, Principals, Progress, Reply, Status, Stored, Target,
 };
 
 /// What the gateway host is given (docs/design/node.md §4.6, §5).
@@ -67,8 +67,14 @@ pub struct GatewaySettings {
     pub handover_ns: u64,
     /// The blocks a put holds going down, and a get holds being read, at once (gateway.md §2–§3).
     pub window: usize,
-    /// The object operations the host runs at once; one past them is answered `SlowDown`.
+    /// The most object operations the host runs at once, as many as its operations' bytes hold
+    /// at the least one holds: within it the host runs as many as it has learned its knee is
+    /// (`crate::admit`), and one past them is answered `SlowDown`.
     pub objects: usize,
+    /// The bytes the host's operations hold at once, each charged what it holds at its own size
+    /// (`charges`): one whose bytes would pass them waits, or is answered `SlowDown`.
+    pub objects_bytes: u64,
+    pub charges: crate::derive::Charges,
     /// The clients of the native protocol it admits at once, each by the certificate the cell's
     /// authority issued it for the client role (node.md §3.6). One past them is refused as the
     /// transport refuses an identity past its bound (`Refusal::Identities`), which the client asks
@@ -82,6 +88,20 @@ pub struct GatewaySettings {
     /// and the annual loss probability allowed (durability.md; `mantle_ec::durability::choose`).
     pub rates: Rates,
     pub target: f64,
+}
+
+/// A native object request parked until the host has room for it (`Node::take_parked`), its body
+/// unread: its exchange and asker, its head as decoded, what it will be charged, its client's
+/// deadline, and when it is answered `SlowDown` if still parked.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Parked {
+    exchange: ExchangeId,
+    peer: PeerId,
+    head: Option<Head>,
+    charge: u64,
+    window: usize,
+    deadline_ns: Option<u64>,
+    until_ns: u64,
 }
 
 /// What the host waits on for an operation: a command, a read, or a chunk it asked.
@@ -106,6 +126,15 @@ pub(crate) struct Job {
     /// When its work last moved: begun, an ask of its own answered, a piece of a chunk it reads
     /// or sends.
     moved_ns: u64,
+    /// When the host admitted it, on the shard's clock; none for one answered at once, refused or
+    /// malformed, which the admission limit does not count (`crate::admit`).
+    admitted_ns: Option<u64>,
+    /// The bytes it was charged as it was admitted, what it holds at its own size
+    /// (`derive::Charges`); none for one not admitted.
+    charge: u64,
+    /// The blocks a put of it holds going down at once, as the node learned them when it was
+    /// admitted (`crate::window`) and charged for them.
+    window: usize,
 }
 
 impl Job {
@@ -128,16 +157,6 @@ impl Job {
                 Work::Copy(copying) => copying.put.as_ref().is_some_and(Put::waits_for_room),
                 _ => false,
             }
-    }
-
-    /// The host's operations it counts as (`GatewaySettings::objects`): a copy two, holding a
-    /// get's window and a put's at once, so the bytes and asks the host's operations are given
-    /// hold (`crate::derive::objects`, research/89 §3.7); any other one.
-    pub(super) fn weight(&self) -> usize {
-        match &self.work {
-            Work::Copy(_) => 2,
-            _ => 1,
-        }
     }
 
     /// What to do while its work is held: vouch within its patience, answer a refusal past it,
@@ -276,7 +295,8 @@ enum Work {
     Admin(Box<Administering>),
 }
 
-/// The host's operations an op counts as once taken: a copy two, any other one (`Job::weight`).
+/// The operations an op holds at once once taken: a copy two, its get and its put (research/89
+/// §3.7); any other one.
 pub(super) fn weight(op: &Op) -> usize {
     match op {
         Op::Copy(_) | Op::CopyPart(_) => 2,
@@ -821,6 +841,47 @@ fn shown(c: &record::Checksum) -> Stored {
     }
 }
 
+/// What an operation that writes `written` bytes, or none, holds at its own size, and the blocks a
+/// put of it holds going down at once: a write's window as `learned` measured the node's puts
+/// (`crate::window`), at least the floor's (`GatewaySettings::window`), charged for those blocks
+/// (`derive::Charges::write`); every other operation the most, at the floor's window. None on a
+/// node that hosts no objects.
+/// What an op is charged once taken, and its window ([`sized`]): a copy its get's and its put's at
+/// once (`weight`), each at the most an operation holds, as its source's size is known only once
+/// its row is read; any other op as the bytes it writes say.
+pub(super) fn charged(
+    gateway: Option<&GatewaySettings>,
+    learned: &crate::window::Window,
+    op: &Op,
+) -> (u64, usize) {
+    let (charge, window) = sized(gateway, learned, op.written());
+    let charge = u64::try_from(weight(op))
+        .ok()
+        .and_then(|times| charge.checked_mul(times))
+        // Past what any memory holds: never admitted.
+        .unwrap_or(u64::MAX);
+    (charge, window)
+}
+
+pub(super) fn sized(
+    gateway: Option<&GatewaySettings>,
+    learned: &crate::window::Window,
+    written: Option<u64>,
+) -> (u64, usize) {
+    let Some(gateway) = gateway else {
+        return (0, 0);
+    };
+    match written {
+        Some(length) => {
+            let window = learned
+                .blocks(length, gateway.charges.largest_block())
+                .max(gateway.window);
+            (gateway.charges.write(window, length), window)
+        }
+        None => (gateway.charges.of(None), gateway.window),
+    }
+}
+
 /// A bucket's versioning as GetBucketVersioning answers it: none for a bucket never versioned.
 fn answered(versioning: Versioning) -> Option<mantle_s3::body::Versioning> {
     match versioning {
@@ -848,16 +909,10 @@ fn facts(status: Status, order: u64, version: &Version) -> Reply {
 
 impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// An object's request arrived on `exchange` from `peer`, its body `body` bytes: a job that
-    /// reads its fields first, or the reply it gets at once.
+    /// reads its fields first; parked, its body unread, where the host has no room for it now or
+    /// requests parked before it wait (`take_parked`), as the S3 listener's door holds a request
+    /// (node.md §4.5); or the reply it gets at once.
     pub(super) fn take_object(&mut self, exchange: ExchangeId, peer: PeerId, body: Option<u64>) {
-        // A client's operations act for the account its certificate names; one whose
-        // connections have all gone since asking is no longer known, and nothing is taken.
-        let Some(principal) = self.driver.endpoint().directory().principal(peer) else {
-            self.driver
-                .endpoint()
-                .refuse_exchange(exchange, Refusal::Identity);
-            return;
-        };
         let head = Head::decode(
             self.driver.endpoint().head(exchange).unwrap_or_default(),
             body,
@@ -870,18 +925,123 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .map(|remaining| {
                 now.saturating_add(u64::try_from(remaining.as_nanos()).unwrap_or(u64::MAX))
             });
+        // What it holds at its own size, its body's length known from its head.
+        let (charge, window) = match &head {
+            Ok(head) => sized(self.gateway.as_ref(), &self.put_window, head.written()),
+            Err(_) => (0, 0),
+        };
+        let parks = head.is_ok() && self.gateway.is_some() && !self.stopping();
+        // Asked even behind parked requests: one the limit turns away tells it its clients ask
+        // more than it admits.
+        let room = parks && self.admits(charge);
+        if parks && (!room || !self.parked.is_empty()) && self.parked.len() < self.parked_most {
+            let patience = u64::try_from(bounds::STOCK_PATIENCE.as_nanos()).unwrap_or(u64::MAX);
+            self.parked.push_back(Parked {
+                exchange,
+                peer,
+                head: head.ok(),
+                charge,
+                window,
+                deadline_ns,
+                until_ns: deadline_ns.unwrap_or_else(|| now.saturating_add(patience)),
+            });
+            return;
+        }
+        self.start_object(
+            exchange,
+            peer,
+            head,
+            (deadline_ns, now, charge, window),
+            room,
+        );
+    }
+
+    /// The parked requests taken in the order they came while the host has room for the first
+    /// (`crate::admit`); one whose exchange ended is let go, and one whose client stops waiting
+    /// (its deadline, or a stock client's patience) or whose node stops is answered `SlowDown`.
+    /// Those still parked are held by the host, as a job whose asks are out is: each tells its
+    /// asker so (research/77 D1, D2).
+    pub(super) fn take_parked(&mut self) {
+        let now = hyper_rt::futures::now_ns();
+        while let Some(&first) = self.parked.front() {
+            if self.driver.endpoint().head(first.exchange).is_none() {
+                self.parked.pop_front();
+                continue;
+            }
+            let over = now >= first.until_ns || self.stopping();
+            if !over && !self.admits(first.charge) {
+                let Self { parked, driver, .. } = self;
+                for waiting in parked.iter() {
+                    driver.endpoint().working(waiting.exchange);
+                }
+                return;
+            }
+            self.parked.pop_front();
+            let head = first.head.ok_or(ObjectError::Fields(0));
+            self.start_object(
+                first.exchange,
+                first.peer,
+                head,
+                (first.deadline_ns, now, first.charge, first.window),
+                !over,
+            );
+        }
+    }
+
+    /// When the node's next turn is due for its parked requests: at once where the host has room
+    /// for the first, else at the first's client's patience or the next beat it is vouched at, a
+    /// probe timeout, as a held job's (`Job::due_ns`).
+    pub(super) fn parked_due(&self, now: u64) -> Option<u64> {
+        let first = self.parked.front()?;
+        let room = self
+            .admission
+            .as_ref()
+            .is_some_and(|a| a.admits(first.charge).is_ok());
+        let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX);
+        Some(if room {
+            now
+        } else {
+            first.until_ns.min(now.saturating_add(beat))
+        })
+    }
+
+    /// The job of an object's request on `exchange` from `peer`, at `now`, its client's deadline
+    /// and its charge as its head says: one that reads its fields first where the host admits it
+    /// (`room`), else the reply it gets at once.
+    fn start_object(
+        &mut self,
+        exchange: ExchangeId,
+        peer: PeerId,
+        head: Result<Head, ObjectError>,
+        (deadline_ns, now, charge, window): (Option<u64>, u64, u64, usize),
+        room: bool,
+    ) {
+        // A client's operations act for the account its certificate names; one whose
+        // connections have all gone since asking is no longer known, and nothing is taken.
+        let Some(principal) = self.driver.endpoint().directory().principal(peer) else {
+            self.driver
+                .endpoint()
+                .refuse_exchange(exchange, Refusal::Identity);
+            return;
+        };
+        let mut admitted_ns = None;
         let work = match (head, self.gateway.as_ref()) {
             (_, None) => Work::Draining(Box::new(Reply::status(Status::Failed))),
             (Err(_), Some(_)) => Work::Draining(Box::new(Reply::status(Status::Malformed))),
             // A node stopping begins no operation (node.md §1.7): its client asks another.
-            (Ok(_), Some(g)) if self.stopping() || self.occupancy() >= g.objects => {
-                Work::Draining(Box::new(Reply::status(Status::SlowDown)))
-            }
+            (Ok(_), Some(_)) if !room => Work::Draining(Box::new(Reply::status(Status::SlowDown))),
             (Ok(head), Some(_)) => {
+                admitted_ns = Some(now);
                 let fields = usize::try_from(head.fields()).unwrap_or(0);
                 Work::Fields(head, Vec::with_capacity(fields))
             }
         };
+        let charge = if admitted_ns.is_some() { charge } else { 0 };
+        if admitted_ns.is_some()
+            && let Some(admission) = self.admission.as_mut()
+        {
+            admission.admitted(charge);
+        }
         self.jobs.push(Job {
             door: Door::Exchange(exchange),
             principal,
@@ -889,6 +1049,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             pending: Vec::new(),
             deadline_ns,
             moved_ns: now,
+            admitted_ns,
+            charge,
+            window,
         });
     }
 
@@ -902,14 +1065,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             body,
             reply,
         } = request;
+        let now = hyper_rt::futures::now_ns();
+        let mut admitted_ns = None;
+        let (charge, window) = charged(self.gateway.as_ref(), &self.put_window, &op);
+        // The door holds a request while the host has no room (`take_door`): one taken here past
+        // the limit is a stopping node's.
+        let room = self.gateway.is_some() && !self.stopping() && self.admits(charge);
         let work = match self.gateway.as_ref() {
             None => Work::Draining(Box::new(Reply::status(Status::Failed))),
-            Some(g)
-                if self.stopping() || self.occupancy().saturating_add(weight(&op)) > g.objects =>
-            {
-                Work::Draining(Box::new(Reply::status(Status::SlowDown)))
-            }
+            Some(_) if !room => Work::Draining(Box::new(Reply::status(Status::SlowDown))),
             Some(_) => {
+                admitted_ns = Some(now);
                 let block = self.open_block(&op);
                 let mut made = work(op, Vec::new(), block);
                 if let Work::Deletes(deleting) = &mut made {
@@ -918,6 +1084,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 made
             }
         };
+        let charge = if admitted_ns.is_some() { charge } else { 0 };
+        if admitted_ns.is_some()
+            && let Some(admission) = self.admission.as_mut()
+        {
+            admission.admitted(charge);
+        }
         self.jobs.push(Job {
             door: Door::Local(Box::new(Local {
                 body,
@@ -931,7 +1103,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             pending: Vec::new(),
             // S3 states no patience: its stock clients' is the bound (research/77 D2).
             deadline_ns: None,
-            moved_ns: hyper_rt::futures::now_ns(),
+            moved_ns: now,
+            admitted_ns,
+            charge,
+            window,
         });
     }
 
@@ -1236,32 +1411,41 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         let carry = fields.split_off(wanted.min(fields.len()));
         let op = head.op(fields);
+        let admitted = job.charge;
         let block = op.as_ref().ok().and_then(|op| self.open_block(op));
-        // A copy counts as two of the host's operations, this job one of them already: one with
-        // no room for its second is answered as one past the host's operations is.
-        let objects = self.gateway.as_ref().map_or(0, |g| g.objects);
-        let crowded = op.as_ref().is_ok_and(|op| {
-            self.occupancy()
-                .saturating_add(weight(op))
-                .saturating_sub(1)
-                > objects
-        });
+        // A copy holds a get's window and a put's at once (`charged`), this job admitted at its
+        // head's charge, its get's: one whose put the operations' memory does not hold beside the
+        // rest is answered as one past the host's room is.
+        let more = op
+            .as_ref()
+            .ok()
+            .filter(|op| weight(op) > 1)
+            .map_or(0, |op| {
+                charged(self.gateway.as_ref(), &self.put_window, op)
+                    .0
+                    .saturating_sub(admitted)
+            });
+        let crowded = more > 0
+            && self
+                .admission
+                .as_ref()
+                .is_some_and(|admission| !admission.holds(more));
         if let Some(job) = self.jobs.get_mut(at) {
             job.work = match op {
                 Err(_) => Work::Draining(Box::new(Reply::status(Status::Malformed))),
                 Ok(_) if crowded => Work::Draining(Box::new(Reply::status(Status::SlowDown))),
-                Ok(op) => work(op, carry, block),
+                Ok(op) => {
+                    if more > 0
+                        && let Some(admission) = self.admission.as_mut()
+                    {
+                        admission.took(more);
+                        job.charge = job.charge.saturating_add(more);
+                    }
+                    work(op, carry, block)
+                }
             };
         }
         Ok(false)
-    }
-
-    /// The host's operations its jobs count as (`Job::weight`).
-    pub(super) fn occupancy(&self) -> usize {
-        self.jobs
-            .iter()
-            .map(Job::weight)
-            .fold(0, usize::saturating_add)
     }
 
     /// For a native upload's Open, the plaintext bytes of a whole block of the layout new blocks
@@ -1359,6 +1543,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if over {
                 // What it still waits on is let go: an ended get's chunks still out, say.
                 let job = self.jobs.swap_remove(at);
+                self.ended(job.admitted_ns, job.charge);
                 self.abandoned
                     .extend(job.pending.into_iter().map(|(pending, _)| pending));
             } else {
@@ -2056,7 +2241,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         let holding = Holding {
             handover_ns: gateway.handover_ns,
-            window: gateway.window,
+            window: self.jobs.get(at).map_or(gateway.window, |job| job.window),
         };
         let made = (|| {
             let data = DataKey::generate().ok()?;
@@ -2146,6 +2331,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         },
                         Err(error) => Reply::status(put_status(error)),
                     });
+                    // What its blocks took to be recorded and its body to come, for the windows the
+                    // node's next puts hold (`crate::window`).
+                    if let Some(ns) = put.take_committed() {
+                        self.put_window.committed(ns);
+                    }
+                    if let Some((bytes, ns)) = put.take_filled() {
+                        self.put_window.filled(bytes, ns);
+                    }
                     match over {
                         Some(reply) => Step::Over(Box::new(reply)),
                         None if put.tick(wall).is_err() => {
@@ -4238,15 +4431,72 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// An exchange of a job ended unanswered: the job ends, what it waits on let go.
     pub(super) fn job_lost(&mut self, exchange: ExchangeId) {
         let Self {
-            jobs, abandoned, ..
+            jobs,
+            abandoned,
+            admission,
+            ..
         } = self;
+        let now = hyper_rt::futures::now_ns();
+        self.parked.retain(|p| p.exchange != exchange);
         jobs.retain_mut(|j| {
             if !matches!(j.door, Door::Exchange(e) if e == exchange) {
                 return true;
             }
             abandoned.extend(j.pending.drain(..).map(|(pending, _)| pending));
+            if let (Some(at), Some(admission)) = (j.admitted_ns, admission.as_mut()) {
+                admission.completed(now.saturating_sub(at), now, j.charge);
+            }
             false
         });
+    }
+
+    /// The operations the host admits at once now, as it learned its knee (`crate::admit`): none
+    /// for a node that hosts no objects.
+    pub fn admitting(&self) -> Option<usize> {
+        self.admission.as_ref().map(crate::admit::Admission::limit)
+    }
+
+    /// Whether the host admits one more operation holding `charge` bytes beside those it runs
+    /// (`crate::admit`). One the learned limit turns away tells the limit its clients ask more
+    /// than it admits; one whose bytes the operations' memory does not hold says nothing of it.
+    pub(super) fn admits(&mut self, charge: u64) -> bool {
+        let Some(admission) = self.admission.as_mut() else {
+            return true;
+        };
+        match admission.admits(charge) {
+            Ok(()) => true,
+            Err(crate::admit::Held::Limit) => {
+                admission.turned_away();
+                false
+            }
+            Err(crate::admit::Held::Bytes) => false,
+        }
+    }
+
+    /// An operation the host admitted at `admitted_ns`, charged `charge` bytes, ended: the limit
+    /// learns its latency, and its bytes are free.
+    fn ended(&mut self, admitted_ns: Option<u64>, charge: u64) {
+        let now = hyper_rt::futures::now_ns();
+        if let (Some(at), Some(admission)) = (admitted_ns, self.admission.as_mut()) {
+            admission.completed(now.saturating_sub(at), now, charge);
+        }
+        self.keep_pool();
+    }
+
+    /// The native clients' stream pool sized to the limit the admission learned, where it moved:
+    /// the exchanges they may open past those they keep are the operations the host runs
+    /// (Breakwater's credit, hyper-transport's `pool`).
+    pub(super) fn keep_pool(&mut self) {
+        let Some(limit) = self.admission.as_ref().map(crate::admit::Admission::limit) else {
+            return;
+        };
+        if self.pooled == 0 || self.pooled == limit {
+            return;
+        }
+        let streams = u32::try_from(limit).unwrap_or(u32::MAX);
+        if self.driver.endpoint().set_stream_pool(streams).is_ok() {
+            self.pooled = limit;
+        }
     }
 
     /// When the host next needs a turn: at once when what an operation, or one ended, asked is
@@ -5063,6 +5313,8 @@ mod tests {
             handover_ns: 1,
             window: 1,
             objects: 1,
+            objects_bytes: 1,
+            charges: crate::derive::Charges::new(1, &[durability::Scheme::Copies(3)]).unwrap(),
             clients: 1,
             bucket_quota: 1,
             scan_rows: 1,
@@ -5131,6 +5383,9 @@ mod tests {
             pending: vec![(Pending::Read(1), None)],
             deadline_ns: Some(10),
             moved_ns: 1,
+            admitted_ns: Some(1),
+            charge: 0,
+            window: 1,
         };
         assert!(job.held());
         assert_eq!(job.bounded(9), Bounded::Held);

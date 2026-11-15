@@ -39,6 +39,20 @@ cite it.
 properties of `aws s3 cp` between two S3 locations.
 [14] Amazon S3 API Reference, GetObjectTagging,
 https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObjectTagging.html.
+[15] aws/aws-emulator, AWS's local emulator of its APIs, at commit
+813af480bf7f16d5418b64e4f5644a74a7da11c5: `services/service-com-amazonaws-s3-amazons3/src/state.rs`
+(`MAX_OBJECT_METADATA_BYTES`) and `src/state/object.rs` (`Object::metadata_bytes`, over
+`Object::metadata`, "The user-defined metadata the request carried in its `x-amz-meta-` headers").
+[16] Smithy 2.0 specification, HTTP binding traits, `httpPrefixHeaders`,
+https://smithy.io/2.0/spec/http-bindings.html: the model every AWS SDK is generated from, S3's
+`Metadata` member bound to `x-amz-meta-` by it.
+[17] awslabs/visual-asset-management-system, `backend/backend/common/s3MetadataKeys.py` on its
+default branch: `user_metadata_size`, "the size Amazon S3 counts against its user-metadata limit".
+[18] aws-devtools-labs/aws-blocks, issue 1190, "bb-file-bucket: local mock accepts keys and
+metadata S3 rejects" (https://github.com/aws-devtools-labs/aws-blocks/issues/1190): a put against a
+deployed bucket in us-east-1.
+[19] Amazon S3 User Guide, "Editing object metadata in the Amazon S3 console",
+https://docs.aws.amazon.com/AmazonS3/latest/userguide/add-object-metadata.html.
 
 ## 1. Stored metadata
 
@@ -111,9 +125,32 @@ exceed the maximum allowed metadata size" [7].
 What a "key" is the guide does not say in so many words (05 §10.2 left it UNVERIFIED). Its own
 words read it as the name past the prefix: metadata is "a set of key-value pairs", the keys are
 what S3 "stores ... in lowercase", and "this prefix is returned" on reads, added back to the key
-it stored. mantle counts a user-defined entry's key past `x-amz-meta-`, and a content header by
-its field name, each with its value; a kilobyte is 1024 octets, as S3's 8 KB of headers is
-throughout mantle (`route::MAX_HEADERS`, `http::MAX_HEAD`).
+it stored. What AWS's own code does settles it the same way:
+
+- **The SDKs.** Every AWS SDK is generated from the Smithy model, which binds S3's `Metadata` map
+  to its headers by `httpPrefixHeaders`, "the prefix to prepend to each header field name stored
+  in the targeted map member"; its own example is S3's, "the resulting header field name
+  serialized in the message is `X-Amz-Meta-Baz`" for the key `Baz` [16]. So a key, to every SDK,
+  is the name past `x-amz-meta-`: boto3's `Metadata={"owner": "kiln"}` is sent as
+  `x-amz-meta-owner` (the stock-client suite, `crates/mantle/tests/stock_clients.rs`).
+- **AWS's emulator.** `MAX_OBJECT_METADATA_BYTES = 2 * 1024`, "in UTF-8 bytes summed over every
+  `x-amz-meta-` key and value", and `metadata_bytes` sums `key.len() + value.len()` over the
+  object's `Metadata` map, keyed as the model keys it, past the prefix; past it, `MetadataTooLarge`
+  [15].
+- **AWS's own users of the limit.** An AWS Labs service measures "the size Amazon S3 counts
+  against its user-metadata limit" as the UTF-8 bytes of each boto3 `Metadata` key and value, the
+  keys past the prefix, against 2,048, and refuses a copy past it before S3 would [17]. A put
+  against a deployed bucket of `{note: 'v'.repeat(2049 - 4)}`, 2,049 bytes counted past the
+  prefix, was refused `MetadataTooLarge` [18].
+- **The conformance suites.** Neither ceph s3-tests at 5522d1c3 nor Swift's recorded S3 answers at
+  259afd2a [8] probe the bound: neither names `MetadataTooLarge`.
+
+One AWS page reads otherwise: the console guide calls `x-amz-meta-alt-name` "the metadata key" and
+then sums "each key and value" [19]. It is the console's wording for what the user types beside
+the fixed prefix ("Enter a unique custom Key following `x-amz-meta-`"), and every piece of code
+above counts the key without it. mantle counts a user-defined entry's key past `x-amz-meta-`, and
+a content header by its field name, each with its value; a kilobyte is 1024 octets, as S3's 8 KB
+of headers is throughout mantle (`route::MAX_HEADERS`, `http::MAX_HEAD`).
 
 ### 1.5 A read's overrides
 
@@ -352,3 +389,41 @@ a `200` (05 §8.2).
   (§3.8).
 </content>
 </invoke>
+
+## 7. The S3 door of mantle's own client, when release meets lean-doors
+
+Branch `release` (goal 18) gives `mantle`'s object commands a second door, S3's HTTP API at the
+client's S3 profile, chosen by `--door s3` or `MANTLE_DOOR` (release's docs/design/doors.md,
+research/86, `crates/mantle/src/door.rs`). Its rule is that both doors say the same lines. The
+commands this note added (`crates/mantle/src/client.rs`, `main.rs`) speak only the native door on
+lean-doors; at the merge each must also speak through `door.rs`, as S3's own operations:
+
+| Command | S3 door | Read back |
+|---|---|---|
+| `cp FILE\|- s3://` with `--content-type`, `--content-encoding`, `--content-disposition`, `--content-language`, `--cache-control`, `--expires`, `--metadata K=V` | the headers on PutObject, and on CreateMultipartUpload past 8 MiB (§1.1, §1.2) | `made` lines unchanged |
+| `multipart create` with the same flags | CreateMultipartUpload's headers | the upload's ID |
+| `head [--version-id]` | HeadObject `?versionId=`; each kept content header and `x-amz-meta-*` field printed `NAME VALUE` | a value S3 returns in RFC 2047's form decoded back to its octets (the inverse of `mantle_s3::metadata::shown`, to be added beside it), so the line is the native door's |
+| `cp s3:// FILE\|- --version-id` | GetObject `?versionId=` | the version's bytes |
+| `cp s3://A s3://B` | CopyObject, `x-amz-copy-source` percent-encoded with `?versionId=`, `x-amz-copy-source-if-match` the ETag HeadObject gave, `x-amz-metadata-directive` and the metadata headers under REPLACE; past 5 GiB, CreateMultipartUpload with the source's metadata from HeadObject unless REPLACE, UploadPartCopy of 5 GiB ranges each held to that ETag, CompleteMultipartUpload (§3.7) | `CopyObjectResult`'s ETag; its `200` read for an embedded `Error`, as CompleteMultipartUpload's is, once copies answer early (§6) |
+| `multipart copy UPLOAD N s3://SRC [--range F-L] [--version-id]` | UploadPartCopy, `x-amz-copy-source-range: bytes=F-L` | `N ETAG` from `CopyPartResult` |
+| `rm s3://B/K --version-id V` | DeleteObject `?versionId=` | `removed ... version V`, or the marker line from `x-amz-delete-marker` and `x-amz-version-id` |
+| `rm` of several keys `[--quiet]` | DeleteObjects `POST ?delete`, a document of at most 1,000 `Object`s with `Quiet`, carrying its `Content-MD5` (the listener requires it or a checksum, §5.1) | `removed` and `failed KEY CODE` lines from `Deleted` and `Error`, in the document's order |
+| `ls --versions s3://B[/P]` | ListObjectVersions `?versions&prefix=P`, paged by `NextKeyMarker` and `NextVersionIdMarker` | `DATE SIZE ID latest\|- object\|marker KEY` from `Version` and `DeleteMarker` in document order |
+
+At the merge:
+
+- `door.rs`'s `command_on` matches every `Command` with no catch-all, so a command without an S3
+  arm does not compile; keep it so. lean-doors' variants are `Versions`, `Copy(Box<Copy>)` (with its
+  version, directive and metadata), `Remove { at, version, quiet }`, `Head { at, version }`,
+  `CreateUpload { at, metadata }` and `CopyPart`; release's `Copy(from, to, size)`, `Remove(at)`,
+  `Head(at)` and `CreateUpload(at)` take these shapes, and their S3 arms the fields.
+- Error lines: `NoSuchVersion`, `MethodNotAllowed`, `MetadataTooLarge`, `InvalidArgument`,
+  `InvalidRequest` and `InvalidRange` are in S3's list that `s3_code.rs` types; the native door's
+  `InvalidVersion`, `CopyToItself`, `CopySourceTooLarge`, `CopyRangeSource`, `CopyMarker` and
+  `InvalidCopyRange` statuses are S3's `InvalidArgument` and `InvalidRequest` through the listener
+  (`respond::refusal`), so the two doors' failure lines name the S3 code alike.
+- Proof: `scripts/release.py`'s archive check runs each command above through both doors against
+  its cell of three, each object put or copied through one door read and headed through the other,
+  line for line; and `crates/mantle/tests/native.rs`'s
+  `the_library_and_the_command_line_keep_metadata_versions_copies_and_batch_deletes` runs its
+  command-line half again under `MANTLE_DOOR=s3`.

@@ -71,7 +71,7 @@ pub mod parking;
 pub mod queue;
 pub mod readiness;
 pub mod registry;
-mod retire;
+pub mod retire;
 pub mod runtime;
 pub mod shard;
 pub mod shard_loop;

@@ -542,17 +542,32 @@ mod upstream {
     }
 }
 
-/// Sends what `conn` has to send.
+/// Sends what `conn` has to send. A write a signal interrupted is made again (write(2): EINTR),
+/// as `Write::write_all` does: a socket with a timeout is not restarted across a stopped
+/// process's resumption (signal(7), "Interruption of system calls"), which a cgroup's freezer
+/// causes.
 fn flush(conn: &mut dyn Conn, socket: &mut TcpStream) -> io::Result<()> {
     while conn.wants_write() {
-        conn.write_tls(socket)?;
+        match conn.write_tls(socket) {
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            other => {
+                other?;
+            }
+        }
     }
     Ok(())
 }
 
 /// Reads what the peer sent into `conn` and processes it; `Ok(false)` once the peer's stream ended.
 fn take(conn: &mut dyn Conn, socket: &mut TcpStream) -> Result<bool, String> {
-    match conn.read_tls(socket) {
+    // A read a signal interrupted is made again, as `flush`'s writes are.
+    let read = loop {
+        match conn.read_tls(socket) {
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            other => break other,
+        }
+    };
+    match read {
         Ok(0) => Ok(false),
         Ok(_) => conn.process().map(|()| true),
         Err(error)
@@ -692,7 +707,13 @@ fn server_process(imp: Imp, scenario: &Scenario) {
 fn close(mut socket: TcpStream) {
     let _ = socket.shutdown(Shutdown::Write);
     let mut sink = [0; 4096];
-    while matches!(socket.read(&mut sink), Ok(n) if n > 0) {}
+    loop {
+        match socket.read(&mut sink) {
+            Ok(n) if n > 0 => {}
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            _ => break,
+        }
+    }
 }
 
 /// A server process and where it listens.

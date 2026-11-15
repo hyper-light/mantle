@@ -188,6 +188,33 @@ caller hands in the alignment, queue and measured depth it found.
     its new faults: a lost write, a misdirected write, a block read as zeros or junk. Every seed's bytes
     are unchanged (hyper-log's equivalence hashes, identical); the `sim` feature takes hyper-sim.
 
+17. **One open file a segment, whatever the handles** (`segmented.rs`, `file.rs`, `overlapped.rs`
+    new, `block.rs`; hyper-rt's `retire::Pinned` made public; hyper-measure's `descriptors`, new,
+    for the tests). A segmented file's owner (`SegmentedFile::create`, `open`) opens its base and
+    each segment once; every handle made from it (`BlockFile::try_clone`) transfers through those
+    open files and opens none, where each handle opened every segment it reached for itself: a
+    100M fill of mantle's engine on a 32-core host held about 188 descriptors a segment (a
+    maintenance worker's handle, and each of the issuer's duplicates of it, opening each new
+    segment) and ran out at macOS's default limit of 10,240 at 31 segments, and at Linux's
+    container default of 2,048 by the 19th (mantle `docs/measurements/2026-11-06-targets.md`,
+    `2026-11-12-targets.md`). Positioned transfers on one open file are atomic with respect to
+    each other and take their offsets from the call (POSIX.1-2017 pread, pwrite and §2.9.7; Linux
+    pread(2)); on Windows a shared segment's handle is opened for overlapped I/O, whose transfers
+    the I/O manager does not serialize, each waiting on its thread's own event, never on the
+    handle (`overlapped.rs`: CreateFileW `FILE_FLAG_OVERLAPPED`; ReadFile; "Synchronous and
+    Asynchronous I/O"). The open files sit in a process-static slot read under counted pins, the
+    shard registry's protocol: the owner's drop retires them and the last transfer running closes
+    them; a handle used after that, its slot free or another file's, is refused, typed, by the
+    generation its slot carries. A segment added through any handle is opened once, for all; a
+    second owner of the same files, opened apart, finds such a segment when a transfer first
+    reaches past those it holds, as before. An add names its segment's index before it creates
+    the segment's file, and every other handle's discovery leaves that index to it, so none opens
+    the segment before it is whole and places it at the length it had then. A segment's writes and flushes are counted on the
+    segment: a flush through any handle covers every handle's writes, as `BlockFile::sync_data`
+    promises. Each handle kept its own marks before, and the issuer flushes a batch on one
+    worker's duplicate after its writes ran on any workers', so a segment written only through
+    other workers' duplicates was not flushed with its batch.
+
 ## Planned
 
 - The log's frame writes and flushes through the device's issuer, and the issuer's own reads (mantle

@@ -16,8 +16,11 @@
     missing_docs
 )]
 
+#[path = "common/bare.rs"]
+mod bare;
 mod common;
 
+use bare::Bare;
 use common::*;
 use hyper_quic::rustls::compress::{
     BROTLI_COMPRESSOR, CertCompressor, CompressionFailed, CompressionLevel,

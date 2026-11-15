@@ -309,9 +309,53 @@ pub(crate) fn sweepable(state: &State, p: &Params) -> Result<bool, LogError> {
     if usable >= 2 || state.segments.live.len() < 2 {
         return Ok(false);
     }
-    // The copies' bytes at most: every live piece, and a relocated record's header for
-    // each, as if no two entries ran together.
     let (count, live_bytes) = state.live.of(tail);
+    let Some(copies) = copies_bound(count, live_bytes, p)? else {
+        return Ok(false);
+    };
+    let frame = frame_len(p, copies)?;
+    // The sweep makes room if the segment after the tail holds nothing live, so that the
+    // frame naming a later tail frees it too, or if its frame takes less of the file than
+    // freeing the tail gives back. Freed, the tail's slot holds a whole segment's frames again,
+    // however few it held: frames go only at the head, so what a tail left unwritten (the head
+    // moved on when a frame did not fit its rest) is room only once the slot is freed. The
+    // frame takes its own bytes at the head, and the head's unwritten rest besides where it
+    // does not fit there and opens a segment. A tail copied into a segment of its own, as large
+    // as its own frames, frees one segment and fills another: the writer once swept every
+    // segment in turn so, while the updates waiting never fitted beside the copies. And a small
+    // live record left in the oldest segment once held back every dead segment behind it: its
+    // copy was as large as its frame, so it was never swept, and no frame larger than the
+    // head's room went in again. Weighed against the tail's frames rather than its slot, a tail
+    // of one block's frame holding one live piece held every segment behind it so, the file
+    // full of frames the sweep never reached (found by mantle, 2026-11-07).
+    // The segment after the tail, unless it is the head, which takes the next frame.
+    let dead_behind = state.segments.live.len() > 2
+        && state
+            .segments
+            .live
+            .get(1)
+            .is_some_and(|&slot| state.live.of(slot).0 == 0);
+    let freed = p
+        .config
+        .segment_bytes
+        .checked_sub(block(p)?)
+        .ok_or(LogError::Config("a segment under its header's block"))?;
+    let head_end = slot_start(&p.config, state.head.slot)?
+        .checked_add(p.config.segment_bytes)
+        .ok_or(LogError::Damaged("an offset past u64"))?;
+    let head_rest = head_end.saturating_sub(state.head.offset);
+    let taken = if frame <= head_rest {
+        frame
+    } else {
+        frame.saturating_add(head_rest)
+    };
+    Ok(dead_behind || taken < freed)
+}
+
+/// The payload bytes at most of the copies of `count` live pieces of `live_bytes`: every piece,
+/// and a relocated record's header for each, as if no two entries ran together; `None` past a
+/// frame's room, which no sweep's frame holds.
+fn copies_bound(count: u64, live_bytes: u64, p: &Params) -> Result<Option<usize>, LogError> {
     let run = format::encoded_len(
         &Record::Relocated {
             group: 0,
@@ -322,34 +366,106 @@ pub(crate) fn sweepable(state: &State, p: &Params) -> Result<bool, LogError> {
     )
     .and_then(|len| u64::try_from(len).ok())
     .ok_or(LogError::Config("a relocated record's header"))?;
-    let copies = count
+    Ok(count
         .checked_mul(run)
-        .and_then(|h| h.checked_add(live_bytes));
-    let room = u64::try_from(p.frame_room).unwrap_or(u64::MAX);
-    let Some(copies) = copies.filter(|&c| c <= room) else {
-        return Ok(false);
+        .and_then(|h| h.checked_add(live_bytes))
+        .and_then(|copies| usize::try_from(copies).ok())
+        .filter(|&copies| copies <= p.frame_room))
+}
+
+/// What a frame does for the log's room (mantle docs/design/raft-log.md §5), which decides the
+/// room it may take ([`target`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Room {
+    /// It names a later tail, its sweep's or the one past the segments that emptied since the
+    /// last frame: durable, it frees a segment. It may take the room the log keeps.
+    Advances,
+    /// Its every update only frees what its group held (a compaction, a removal, a fence), and it
+    /// names the tail as it stands. It may take the room the log keeps only where what is left
+    /// after it still holds `progress` bytes, the frame that frees a segment once its updates
+    /// apply ([`progress_payload`]); never where no frame can (`None`).
+    Frees { progress: Option<u64> },
+    /// Anything else: it never takes the room the log keeps.
+    Takes,
+}
+
+/// The payload bytes of the frame that frees a segment once `taken`'s updates apply: none where
+/// they leave the tail holding nothing live, since any frame then names a later tail; the tail's
+/// copies, as [`sweepable`] counts them, where they fit a frame; `None` where they do not, and
+/// only the groups' further compactions can free a segment. `None` too where the tail is the
+/// head, which no frame frees.
+pub(crate) fn progress_payload<F>(
+    state: &State,
+    p: &Params,
+    taken: &[(Submission<F>, Placement)],
+) -> Result<Option<usize>, LogError> {
+    let Some(&tail) = state.segments.live.front() else {
+        return Ok(None);
     };
-    let frame = u64::try_from(format::FRAME_HEADER_LEN)
-        .ok()
-        .and_then(|h| h.checked_add(copies))
-        .and_then(|len| p.align.up_u64(len))
-        .ok_or(LogError::Damaged("a frame past u64"))?;
-    // The sweep makes room if the segment after the tail holds nothing live, so that the
-    // frame naming a later tail frees it too, or if its frame takes less than the
-    // tail's frames. A tail copied into a segment of its own, as large as its own frames,
-    // frees one segment and fills another: the writer once swept every segment in turn so,
-    // while the updates waiting never fitted beside the copies. And a small live record
-    // left in the oldest segment once held back every dead segment behind it: its copy was
-    // as large as its frame, so it was never swept, and no frame larger than the head's
-    // room went in again.
-    // The segment after the tail, unless it is the head, which takes the next frame.
-    let dead_behind = state.segments.live.len() > 2
-        && state
-            .segments
-            .live
-            .get(1)
-            .is_some_and(|&slot| state.live.of(slot).0 == 0);
-    Ok(dead_behind || frame < state.live.used(tail))
+    if state.segments.live.len() < 2 {
+        return Ok(None);
+    }
+    let (count, live_bytes) = live_after(state, tail, taken);
+    if count == 0 {
+        return Ok(Some(0));
+    }
+    copies_bound(count, live_bytes, p)
+}
+
+/// The live pieces and their bytes `slot` holds once `taken`'s updates apply: what it holds now,
+/// less what they surely kill there, as `apply` kills it. A removal or a fence kills every piece of
+/// its group and its fence; a start the entries through it and the start before; entries of none
+/// those from their first; a hard state the one before; a release that releases more the release
+/// before. Anything else (a released proposal, a resolved uncertainty mark) stays counted live,
+/// so the count is never below what publishing the frame leaves.
+fn live_after<F>(state: &State, slot: u32, taken: &[(Submission<F>, Placement)]) -> (u64, u64) {
+    let (mut count, mut bytes) = state.live.of(slot);
+    let mut kill = |place: Place, b: u64| {
+        if place.slot == slot {
+            count = count.saturating_sub(1);
+            bytes = bytes.saturating_sub(b);
+        }
+    };
+    for (s, _) in taken {
+        let update = &s.update;
+        let fence = state.damaged.get(&s.group).copied().flatten();
+        let Some(g) = state.groups.get(&s.group) else {
+            if update.remove || s.marks.damaged {
+                fence.into_iter().for_each(|at| kill(at, DAMAGED_BYTES));
+            }
+            continue;
+        };
+        if update.remove || s.marks.damaged {
+            fence.into_iter().for_each(|at| kill(at, DAMAGED_BYTES));
+            g.pieces().for_each(|(place, b)| kill(place, b));
+            continue;
+        }
+        // Entries from the start's on: those through a new start die, and those from a
+        // replacement's first (a frame that only frees replaces with none).
+        let through = update.start.map_or(g.start.index, |start| start.index);
+        let from = update.entries.as_ref().map_or(u64::MAX, |e| e.first);
+        for (index, entry) in (g.start.index.saturating_add(1)..).zip(&g.entries) {
+            if index <= through || index >= from {
+                kill(entry.place, entry_bytes(entry.len));
+            }
+        }
+        if update.start.is_some()
+            && let Some(at) = g.start_at
+        {
+            kill(at, START_BYTES);
+        }
+        if update.hard_state.is_some()
+            && let Some((_, at)) = g.hard
+        {
+            kill(at, HARD_STATE_BYTES);
+        }
+        if let (Some(through), Some((held, at))) = (update.released, g.released)
+            && through > held
+        {
+            kill(at, RELEASED_BYTES);
+        }
+    }
+    (count, bytes)
 }
 
 /// What the device reads for a sweep: the tail's segment, from its first frame to its end, and
@@ -424,16 +540,21 @@ pub(crate) fn sweep(
     })
 }
 
-/// Where the next frame of `payload_len` bytes goes: the head, or a segment opened for
-/// it. The last free segment is kept for a frame that makes room, and while no segment is
-/// free the head's room is too, so that the compaction or the tail's advance a full log
-/// waits for always has somewhere to go (mantle docs/design/raft-log.md §5). `None` when no
-/// segment can take it.
+/// Where the next frame of `payload_len` bytes goes: the head, or a segment opened for it. The
+/// last usable segment, and while none is usable the head's room, are kept for making room
+/// (mantle docs/design/raft-log.md §5): a frame that frees a segment ([`Room::Advances`]) takes
+/// them, and a frame that only frees what its groups held ([`Room::Frees`]) takes them only where
+/// the frame that frees a segment still fits what it leaves. So the frame a full log waits for
+/// always has somewhere to go. Before, a compaction that freed no segment took that room as one
+/// that does: compactions a little at a time, each a block, filled it, and once neither the tail's
+/// sweep nor the frame naming the tail past what they emptied fitted, the log answered `Full` for
+/// good to every write, the groups' compactions included (found by mantle, 2026-11-14). `None`
+/// when no segment can take it.
 pub(crate) fn target(
     state: &State,
     p: &Params,
     payload_len: usize,
-    makes_room: bool,
+    room: Room,
 ) -> Result<Option<Target>, LogError> {
     let block = block(p)?;
     let frame_len = frame_len(p, payload_len)?;
@@ -442,12 +563,15 @@ pub(crate) fn target(
         .checked_add(p.config.segment_bytes)
         .ok_or(LogError::Damaged("an offset past u64"))?;
     let usable = usable_segments(state, p.config.max_segments);
-    if head
-        .offset
-        .checked_add(frame_len)
-        .is_some_and(|end| end <= head_end)
-        && (usable > 0 || makes_room)
-    {
+    // Whether the frame may take the room kept for making room, leaving `rest` bytes past it.
+    let keeps = |rest: Option<u64>| match room {
+        Room::Advances => true,
+        Room::Frees { progress } => progress.zip(rest).is_some_and(|(need, rest)| need <= rest),
+        Room::Takes => false,
+    };
+    let head_rest = head_end.checked_sub(head.offset);
+    let in_head = head_rest.and_then(|rest| rest.checked_sub(frame_len));
+    if in_head.is_some() && (usable > 0 || keeps(in_head)) {
         return Ok(Some(Target {
             slot: head.slot,
             incarnation: head.incarnation,
@@ -458,7 +582,12 @@ pub(crate) fn target(
             prefix: 0,
         }));
     }
-    if usable == 0 || (usable == 1 && !makes_room) {
+    let opened = p
+        .config
+        .segment_bytes
+        .checked_sub(block)
+        .and_then(|room| room.checked_sub(frame_len));
+    if usable == 0 || (usable == 1 && !keeps(opened)) {
         return Ok(None);
     }
     let reusable = state
@@ -1100,7 +1229,6 @@ pub(crate) fn publish<F>(
     if target.opens {
         open_segment(state, target)?;
     }
-    state.live.wrote(target.slot, target.frame_len);
     let sequence = state.next_sequence;
     state.durable = sequence;
     state.durable_tail = tail;
@@ -1149,7 +1277,6 @@ fn open_segment(state: &mut State, target: &Target) -> Result<(), LogError> {
     if let Some(entry) = state.segments.nonce.get_mut(slot) {
         *entry = target.nonce;
     }
-    state.live.open(target.slot);
     state.segments.free.retain(|(s, _)| *s != target.slot);
     state.segments.live.push_back(target.slot);
     state.next_incarnation = state

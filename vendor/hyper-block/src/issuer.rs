@@ -1,25 +1,36 @@
 //! One issuer per physical device: every volume on the device hands it its writes and flushes,
-//! and it keeps the device's depth in flight on a fixed set of workers (mantle
-//! docs/design/node.md §1.2; chunk-store.md §4).
+//! and it keeps the device's depth in flight (mantle docs/design/node.md §1.2; chunk-store.md
+//! §4), on one of two kinds of lanes, each started when the device opens and none after, whatever
+//! the number of volumes, batches or regions: a thread per region of a batch, which mantle's
+//! chunk writer started before, is a thread start on the write path and a count of threads that
+//! grows with load (mantle research/26 §4.7, recommendation 7).
 //!
-//! The issuer is one thread and a pool of blocking workers, all started when the device opens
-//! and none after, whatever the number of volumes, batches or regions: a thread per region of a
-//! batch, which mantle's chunk writer started before, is a thread start on the write path and a
-//! count of threads that grows with load (mantle research/26 §4.7, recommendation 7). The pool is
-//! the portable path of research/26 §2.5, the only one macOS offers: no interface there keeps
-//! more than 16 file I/Os in flight without a blocked thread per I/O, and none carries
-//! `F_FULLFSYNC` (§2.4). Linux's io_uring and Windows's completion port, which node.md §1.2 takes
-//! where they exist, are not yet built; the pool runs on every platform until they are.
+//! - **The kernel's completions** ([`Issuer::start_device`], Linux): the depth's transfers are
+//!   the kernel's, through one native AIO context of that depth, which the issuer's own thread
+//!   submits to and reaps, its completions ringing the same eventfd its submitters ring, so the
+//!   device's depth costs no thread at all (the owner's decision of 2026-10-01; hyper-raft
+//!   `docs/research/issuer-completions.md`). Its files are the kernel's to transfer
+//!   ([`crate::block::BlockFile::kernel_file`]). A thread per transfer in flight is what panicked
+//!   macOS five times (mantle research/26 §1.4), and a node's floor counted each one's stack, so a
+//!   deeper device made a node need more memory for no transfer it could not otherwise make.
+//! - **A pool of blocking workers** ([`Issuer::start`]): the portable path of research/26 §2.5,
+//!   the only one macOS offers (no interface there keeps more than 16 file I/Os in flight without a
+//!   blocked thread per I/O, and none carries `F_FULLFSYNC`, §2.4), and the path of a file the
+//!   kernel does not hold whole (one in memory, a simulated device). Windows's completion port,
+//!   which node.md §1.2 takes there, is not yet built; until it is, a Windows device's issuer is a
+//!   pool too.
 //!
-//! The pool holds `min(device queue, measured depth, thread budget)` workers ([`depth`]): the
-//! device queues no more than its queue, throughput stops growing at the measured depth, so a
-//! transfer past it only waits, and every pool draws from the process's budget before any thread
-//! starts (research/26 §2.5, recommendation 4). Where the budget has fewer left the device runs
-//! at the depth it leaves.
+//! The issuer keeps `min(device queue, measured depth, ...)` transfers in flight ([`depth`]): the
+//! device queues no more than its queue, and throughput stops growing at the measured depth, so a
+//! transfer past it only waits. A pool's workers, and the kernel lanes' one thread, draw from the
+//! process's thread budget before any starts (research/26 §2.5, recommendation 4); where the
+//! budget has fewer left, a pool runs the device at the depth it leaves.
 //!
 //! Ownership is single and passed by message. A submitter's file is duplicated once for each
 //! worker ([`BlockFile::try_clone`]), and each worker owns its duplicates in an arena of its own,
-//! so no file is shared between threads and nothing is locked. The issuer thread owns the
+//! so no handle is shared between threads and nothing is locked. A segmented file's duplicates
+//! take no descriptor: they transfer through the open files of the file's owner
+//! (`crate::segmented`), so its descriptors are one a segment whatever the workers. The issuer thread owns the
 //! dispatch state; each worker owns one slot its tasks arrive on, woken alone (research/26 §5.3).
 //! A worker is told of a file attached or detached in its own slot, before any transfer for it,
 //! since a transfer goes only to a worker with no such news waiting. A volume's writer holds an
@@ -54,6 +65,9 @@ use crate::block::BlockFile;
 use crate::buf::AlignedBuf;
 use crate::threads::{self, Reservation};
 
+#[cfg(target_os = "linux")]
+mod kernel;
+
 /// The queue assumed of a device the OS cannot describe: Native Command Queuing's 32 commands,
 /// the shallowest queue of a command-queuing interface (Serial ATA Revision 2.6, §13.6.2;
 /// AHCI 1.3.1 §1.1), which calibration's ladder then measures (mantle CLAUDE.md §5).
@@ -71,13 +85,17 @@ pub fn depth(queue: Option<u32>, measured: Option<usize>) -> usize {
     queue.min(measured.filter(|&d| d > 0).unwrap_or(1))
 }
 
-/// A device's issuer: its thread, its workers and the budget they hold. Dropping it lets the
+/// A device's issuer: its thread, its lanes and the budget they hold. Dropping it lets the
 /// transfers in flight end, refuses what is queued, and joins every thread.
 pub struct Issuer {
     events: Events,
     submission_pending: Sender<()>,
     thread: Option<JoinHandle<()>>,
+    /// Its lanes: a pool's workers, or the kernel's lanes (`kernel`), each the transfers in flight
+    /// at most and the duplicates an attached file is handed.
     workers: usize,
+    /// Whether its transfers are the kernel's (`kernel`), so it takes only the kernel's files.
+    kernel: bool,
     path: PathBuf,
     /// Given back once the threads are joined.
     budget: Option<Reservation>,
@@ -113,6 +131,7 @@ enum LifecycleFailure {
     Worker,
     Dispatcher,
     RetiredDrop,
+    Kernel,
 }
 
 impl LifecycleFailure {
@@ -126,6 +145,7 @@ impl LifecycleFailure {
             Self::Worker => "a device worker's lifecycle ended unexpectedly",
             Self::Dispatcher => "the device dispatcher unwound",
             Self::RetiredDrop => "a retired value's Drop unwound",
+            Self::Kernel => "the kernel refused the device's completions or its bell",
         };
         stopped(path, why)
     }
@@ -200,7 +220,7 @@ impl Drop for Handle {
 
 enum Event {
     Attach {
-        /// One duplicate of the file for each worker.
+        /// One duplicate of the file for each worker of a pool, or the one the kernel lanes share.
         files: Vec<Handle>,
         /// The batches the submitter may have out at once.
         batches: usize,
@@ -237,10 +257,20 @@ enum Submission {
 
 /// Every cold inbox publication wakes the dispatcher. Batch/retirement submissions and
 /// native reports have separate bounded lanes, and consume no cold inbox room.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Events {
     queue: SyncSender<Event>,
-    dispatcher: Thread,
+    dispatcher: Wake,
+}
+
+/// How a submitter wakes the dispatcher: a pool's dispatcher parks between its workers' reports,
+/// and is unparked; the kernel lanes' waits on a bell the kernel's completions ring too, and is
+/// rung (`kernel`).
+#[derive(Debug)]
+enum Wake {
+    Thread(Thread),
+    #[cfg(target_os = "linux")]
+    Bell(crate::aio::linux::Bell),
 }
 
 impl Events {
@@ -251,7 +281,35 @@ impl Events {
     }
 
     fn wake(&self) {
-        self.dispatcher.unpark();
+        match &self.dispatcher {
+            Wake::Thread(thread) => thread.unpark(),
+            // A ring fails only on a descriptor this holder does not own or a count at 2^64 - 2,
+            // neither of which an eventfd it holds can be.
+            #[cfg(target_os = "linux")]
+            Wake::Bell(bell) => {
+                let _ = bell.ring();
+            }
+        }
+    }
+
+    /// The way to the same inbox for another holder: a descriptor of its own for a bell (dup(2)),
+    /// so each rings and drops it whatever the others do.
+    fn try_clone(&self, path: &Path) -> Result<Self, DiskError> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = path;
+        let dispatcher = match &self.dispatcher {
+            Wake::Thread(thread) => Wake::Thread(thread.clone()),
+            #[cfg(target_os = "linux")]
+            Wake::Bell(bell) => Wake::Bell(bell.try_clone().map_err(|source| DiskError::Io {
+                op: "duplicate a device issuer's bell",
+                path: path.to_path_buf(),
+                source,
+            })?),
+        };
+        Ok(Self {
+            queue: self.queue.clone(),
+            dispatcher,
+        })
     }
 }
 
@@ -446,17 +504,115 @@ impl Issuer {
         Ok(Self {
             events: Events {
                 queue: events,
-                dispatcher: thread.thread().clone(),
+                dispatcher: Wake::Thread(thread.thread().clone()),
             },
             submission_pending,
             thread: Some(thread),
             workers,
+            kernel: false,
             path: path.to_path_buf(),
             budget: Some(budget),
         })
     }
 
-    /// The workers the issuer runs: the transfers it keeps in flight at most.
+    /// Starts the issuer of the device at `path`, keeping `depth` transfers in flight on the
+    /// kernel's completions where the platform has them for files: on Linux one thread, the
+    /// issuer's own, whatever the depth, its transfers handed to the kernel through one native
+    /// AIO context of `depth` and reaped there (module docs, `kernel`). Its files are the kernel's
+    /// to transfer ([`crate::block::BlockFile::kernel_file`]): one that is not is refused at
+    /// attach, before any duplicate is made. Elsewhere it is the pool of [`Self::start`]: macOS
+    /// has no completions for files (mantle research/26 §2.4–§2.5), and Windows's completion port
+    /// is not yet built. [`DiskError::Threads`] when the budget has no thread left for it,
+    /// [`DiskError::Io`] when the kernel refuses its context (io_setup(2): `EAGAIN` past
+    /// `/proc/sys/fs/aio-max-nr`) or its bell (eventfd(2)).
+    pub fn start_device(path: &Path, depth: usize) -> Result<Self, DiskError> {
+        Self::start_device_for(path, depth, depth)
+    }
+
+    /// The threads [`Self::start_device`] of `depth` runs: on Linux one, its own, whatever the
+    /// depth; elsewhere that one and the pool's `depth` workers. None past what a count holds.
+    pub fn device_threads(depth: usize) -> Option<usize> {
+        if cfg!(target_os = "linux") {
+            Some(1)
+        } else {
+            depth.checked_add(1)
+        }
+    }
+
+    /// [`Self::start_device`] for submitters that together keep up to `batches` out
+    /// ([`Self::attach_deep`]).
+    pub fn start_device_for(path: &Path, depth: usize, batches: usize) -> Result<Self, DiskError> {
+        #[cfg(target_os = "linux")]
+        {
+            Self::start_kernel(path, depth, batches)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self::start_for(path, depth, batches)
+        }
+    }
+
+    /// The kernel's lanes ([`Self::start_device_for`]): `depth` of them on one thread.
+    #[cfg(target_os = "linux")]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the device issuer's one thread: hyper-block runs its device's I/O (clippy.toml's file rule names it)"
+    )]
+    fn start_kernel(path: &Path, depth: usize, batches: usize) -> Result<Self, DiskError> {
+        blocking_call_allowed(path, "issuer startup inside a runtime task")?;
+        if depth == 0 {
+            return Err(invalid(path, "an issuer needs a depth of one at least"));
+        }
+        let budget = threads::reserve(1, path)?;
+        let bound = depth
+            .checked_add(batches)
+            .ok_or_else(|| invalid(path, "the issuer's lanes and batch budget exceed usize"))?;
+        channel_capacity::<Event>(path, bound)?;
+        let lanes = kernel::Kernel::new(path, depth)?;
+        let bell = lanes.bell().map_err(|source| DiskError::Io {
+            op: "duplicate a device issuer's bell",
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let (submission_pending, mut pending) =
+            sync::channel(1).map_err(|error| DiskError::Io {
+                op: "make an issuer submission doorbell",
+                path: path.to_path_buf(),
+                source: std::io::Error::other(error),
+            })?;
+        let (events, inbox) = sync_channel(bound);
+        let (ready, started) = sync_channel(1);
+        let device = path.to_path_buf();
+        let thread = Builder::new()
+            .name("hyper-issuer".into())
+            .spawn(move || run_kernel(&device, inbox, lanes, &ready, &mut pending))
+            .map_err(|source| DiskError::Io {
+                op: "start a device issuer",
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let outcome = started
+            .recv()
+            .unwrap_or_else(|_| Err(stopped(path, "the issuer ended before it started")));
+        if let Err(e) = outcome {
+            let _ = thread.join();
+            return Err(e);
+        }
+        Ok(Self {
+            events: Events {
+                queue: events,
+                dispatcher: Wake::Bell(bell),
+            },
+            submission_pending,
+            thread: Some(thread),
+            workers: depth,
+            kernel: true,
+            path: path.to_path_buf(),
+            budget: Some(budget),
+        })
+    }
+
+    /// The transfers the issuer keeps in flight at most: its workers, or its kernel lanes.
     pub fn depth(&self) -> usize {
         self.workers
     }
@@ -478,7 +634,7 @@ impl Issuer {
         attach(
             &self.events,
             &self.submission_pending,
-            self.workers,
+            (self.workers, self.kernel),
             &self.path,
             file,
             batches,
@@ -489,25 +645,28 @@ impl Issuer {
     /// thread: a submitter started after the device opened, on a thread of its own, attaches
     /// through it ([`Attacher::attach_deep`]). It holds the way to the issuer's inbox and nothing
     /// else, so it keeps no thread and no device alive: once the issuer has stopped, an attach
-    /// through it is refused as one through the issuer would be.
-    pub fn attacher(&self) -> Attacher {
-        Attacher {
-            events: self.events.clone(),
+    /// through it is refused as one through the issuer would be. Refused where its way to the
+    /// inbox cannot be made: a kernel issuer's holder takes a descriptor of its bell (dup(2)).
+    pub fn attacher(&self) -> Result<Attacher, DiskError> {
+        Ok(Attacher {
+            events: self.events.try_clone(&self.path)?,
             submission_pending: self.submission_pending.clone(),
             workers: self.workers,
+            kernel: self.kernel,
             path: self.path.clone(),
-        }
+        })
     }
 }
 
 /// An owned way to attach submitters to a device's issuer ([`Issuer::attacher`]): a maintenance
 /// worker that starts after its shard attached, on its own thread, attaches through one rather
 /// than borrow the issuer.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Attacher {
     events: Events,
     submission_pending: Sender<()>,
     workers: usize,
+    kernel: bool,
     path: PathBuf,
 }
 
@@ -522,20 +681,32 @@ impl Attacher {
         attach(
             &self.events,
             &self.submission_pending,
-            self.workers,
+            (self.workers, self.kernel),
             &self.path,
             file,
             batches,
         )
     }
+
+    /// Another way to the same issuer ([`Issuer::attacher`]).
+    pub fn try_clone(&self) -> Result<Self, DiskError> {
+        Ok(Self {
+            events: self.events.try_clone(&self.path)?,
+            submission_pending: self.submission_pending.clone(),
+            workers: self.workers,
+            kernel: self.kernel,
+            path: self.path.clone(),
+        })
+    }
 }
 
-/// Hands the issuer whose inbox is `events` duplicates of `file`, one for each of its `workers`, for
-/// a submitter that keeps up to `batches` out at once.
+/// Hands the issuer whose inbox is `events` duplicates of `file`, one for each of its `workers`,
+/// for a submitter that keeps up to `batches` out at once; refused, before any duplicate, for a
+/// file the kernel does not hold whole where the issuer's transfers are the kernel's (`kernel`).
 fn attach<F: BlockFile + 'static>(
     events: &Events,
     submission_pending: &Sender<()>,
-    workers: usize,
+    (workers, kernel): (usize, bool),
     path: &Path,
     file: &F,
     batches: usize,
@@ -543,6 +714,12 @@ fn attach<F: BlockFile + 'static>(
     blocking_call_allowed(path, "issuer attachment inside a runtime task")?;
     if batches == 0 {
         return Err(invalid(path, "a submitter needs one batch at least"));
+    }
+    if kernel && file.kernel_file().is_none() {
+        return Err(DiskError::Unsupported {
+            path: path.to_path_buf(),
+            reason: "a file the kernel does not hold whole, on an issuer whose transfers the kernel makes",
+        });
     }
     // Numbered batch results plus exactly one physical terminal result. Batch/data
     // admission remains batches, including queued, dispatched and untaken answers.
@@ -560,15 +737,18 @@ fn attach<F: BlockFile + 'static>(
             path: path.to_path_buf(),
             source: std::io::Error::other(error),
         })?;
+    // A pool's workers each hold a duplicate of their own; the kernel lanes, all on the issuer's
+    // one thread, share one (`kernel`).
+    let duplicates = if kernel { 1 } else { workers };
     let mut files: Vec<Handle> = Vec::new();
     files
-        .try_reserve_exact(workers)
+        .try_reserve_exact(duplicates)
         .map_err(|error| DiskError::Io {
             op: "reserve an attachment's file duplicates",
             path: path.to_path_buf(),
             source: std::io::Error::other(error),
         })?;
-    for _ in 0..workers {
+    for _ in 0..duplicates {
         files.push(Handle(Some(Box::new(file.try_clone()?))));
     }
     // The submitter's own duplicate, for what it reads from memory on its own thread
@@ -593,6 +773,9 @@ fn attach<F: BlockFile + 'static>(
     })?;
     let (reply, replied) = sync_channel(1);
     let gone = || stopped(path, "the device's issuer has stopped");
+    // The submitter's own way to the inbox is made before the attach is sent, so an attach the
+    // issuer took is never left without its submitter.
+    let own = events.try_clone(path)?;
     events
         .send(Event::Attach {
             files,
@@ -607,7 +790,7 @@ fn attach<F: BlockFile + 'static>(
     Ok(Attached {
         slot,
         generation,
-        events: events.clone(),
+        events: own,
         submissions: Some(submit),
         submission_pending: submission_pending.clone(),
         answers: answered,
@@ -1128,14 +1311,14 @@ fn run(
         let (native_pending, completed) = sync_channel(1);
         let started = start_workers(scope, path, workers, &native_pending);
         let mut handles = started.native;
-        let mut dispatch = Dispatch::new(started.assignments, path);
+        let mut dispatch = Dispatch::new(Lanes::Pool(started.assignments), path);
         // A foreign panic payload can itself panic on Drop. Retain it until every
         // native join, exactly like native-thread join payloads, before any sender closes.
         let mut broker_panic = None;
         if ready.send(started.result).is_ok()
-            && dispatch.workers.len() == workers
+            && dispatch.lanes.len() == workers
             && let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                dispatch.run(&inbox, submission_pending, &completed, &mut handles);
+                dispatch.run(&inbox, submission_pending, Some(&completed), &mut handles);
             }))
         {
             broker_panic = Some(payload);
@@ -1144,7 +1327,7 @@ fn run(
         // Stop admission and assigned-task publication before joins. On an abnormal
         // broker exit, reports cannot block behind cold Attach traffic in this inbox.
         // Handle's cleanup boundary protects duplicates in never-admitted Attach events.
-        dispatch.workers.clear();
+        dispatch.lanes.close();
         // Close cold admission before terminal waits. Native reports have their own
         // bounded lanes; a foreign unadmitted Attach destructor cannot discard them.
         let mut inbox_panic = std::panic::catch_unwind(AssertUnwindSafe(|| drop(inbox))).err();
@@ -1160,6 +1343,40 @@ fn run(
         // The reserved terminal role fits even behind batches untaken numbered answers.
         dispatch.terminal();
     });
+}
+
+/// The kernel lanes' thread ([`Issuer::start_device`]): reports that it started, then dispatches
+/// until stopped, then waits for every transfer the kernel still holds and retires each lane's
+/// duplicates, as the pool's thread joins its workers.
+#[cfg(target_os = "linux")]
+fn run_kernel(
+    path: &Path,
+    inbox: Receiver<Event>,
+    lanes: kernel::Kernel,
+    ready: &SyncSender<Result<(), DiskError>>,
+    submission_pending: &mut ChannelReceiver<()>,
+) {
+    let mut dispatch = Dispatch::new(Lanes::Kernel(Box::new(lanes)), path);
+    let mut broker_panic = None;
+    if ready.send(Ok(())).is_ok()
+        && let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            dispatch.run(&inbox, submission_pending, None, &mut []);
+        }))
+    {
+        broker_panic = Some(payload);
+        dispatch.failure.get_or_insert(LifecycleFailure::Dispatcher);
+    }
+    dispatch.lanes.close();
+    let mut inbox_panic = std::panic::catch_unwind(AssertUnwindSafe(|| drop(inbox))).err();
+    if inbox_panic.is_some() {
+        dispatch.failure.get_or_insert(LifecycleFailure::FileDrop);
+    }
+    dispatch.retire_news();
+    dispatch.finish_kernel();
+    dispatch.dispose_news();
+    dispatch.record_disposal(broker_panic.take());
+    dispatch.record_disposal(inbox_panic.take());
+    dispatch.terminal();
 }
 
 struct StartedWorkers<'scope> {
@@ -1567,10 +1784,89 @@ impl DetachAnswer {
     }
 }
 
+/// Where the dispatcher's tasks run: lanes that each hold one task at a time, told a file's news
+/// before any transfer of it, and report each task once.
+enum Lanes {
+    /// A pool's workers, each a thread of its own (`work`): each worker's slot.
+    Pool(Vec<SyncSender<Task>>),
+    /// The kernel's lanes, on the dispatcher's own thread (`kernel`): one allocation, as the
+    /// issuer starts.
+    #[cfg(target_os = "linux")]
+    Kernel(Box<kernel::Kernel>),
+}
+
+impl Lanes {
+    fn len(&self) -> usize {
+        match self {
+            Self::Pool(workers) => workers.len(),
+            #[cfg(target_os = "linux")]
+            Self::Kernel(kernel) => kernel.lanes(),
+        }
+    }
+
+    /// The duplicates of a file an attachment hands over: one for each worker of a pool, one the
+    /// kernel lanes share.
+    fn duplicates(&self) -> usize {
+        match self {
+            Self::Pool(workers) => workers.len(),
+            #[cfg(target_os = "linux")]
+            Self::Kernel(_) => 1,
+        }
+    }
+
+    /// Hands `task` to `lane`, which holds none; the task back where there is no such lane, its
+    /// worker has ended, or the lanes never take it.
+    fn send(&mut self, lane: usize, task: Task) -> Result<(), Task> {
+        match self {
+            Self::Pool(workers) => match workers.get(lane) {
+                Some(slot) => slot.try_send(task).map_err(|refused| match refused {
+                    TrySendError::Full(task) | TrySendError::Disconnected(task) => task,
+                }),
+                None => Err(task),
+            },
+            #[cfg(target_os = "linux")]
+            Self::Kernel(kernel) => kernel.send(lane, task),
+        }
+    }
+
+    /// Whether a report was made that the dispatcher has not taken: the kernel lanes make some on
+    /// its own thread, which ring no bell.
+    fn reported(&self) -> bool {
+        match self {
+            Self::Pool(_) => false,
+            #[cfg(target_os = "linux")]
+            Self::Kernel(kernel) => kernel.reported(),
+        }
+    }
+
+    /// Waits for what moves the dispatcher next: a pool's worker or submitter unparks it, and the
+    /// kernel's completions and submitters ring its bell.
+    fn wait(&self) -> Result<(), DiskError> {
+        match self {
+            Self::Pool(_) => {
+                std::thread::park();
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Self::Kernel(kernel) => kernel.wait(),
+        }
+    }
+
+    /// No task is handed out after this: a pool's lanes close, so each worker ends once it has
+    /// taken what it holds.
+    fn close(&mut self) {
+        match self {
+            Self::Pool(workers) => workers.clear(),
+            #[cfg(target_os = "linux")]
+            Self::Kernel(_) => {}
+        }
+    }
+}
+
 /// The issuer's state, owned by its thread.
 struct Dispatch<'a> {
-    /// Each worker's slot.
-    workers: Vec<SyncSender<Task>>,
+    /// Each lane: a worker's slot, or a kernel lane.
+    lanes: Lanes,
     /// Workers with no task.
     idle: Vec<usize>,
     /// News of files waiting for each worker, given before any transfer: at most one attach and
@@ -1592,12 +1888,19 @@ struct Dispatch<'a> {
 }
 
 impl<'a> Dispatch<'a> {
-    fn new(workers: Vec<SyncSender<Task>>, path: &'a Path) -> Self {
-        let count = workers.len();
+    fn new(lanes: Lanes, path: &'a Path) -> Self {
+        let count = lanes.len();
+        // News waits for a pool's workers, each its own duplicates; the kernel lanes take a file's
+        // news at once (`Kernel::attach`, `Kernel::detach`), and have none waiting.
+        let told = match &lanes {
+            Lanes::Pool(_) => count,
+            #[cfg(target_os = "linux")]
+            Lanes::Kernel(_) => 0,
+        };
         Self {
             idle: (0..count).rev().collect(),
-            news: (0..count).map(|_| VecDeque::new()).collect(),
-            workers,
+            news: (0..told).map(|_| VecDeque::new()).collect(),
+            lanes,
             in_flight: 0,
             pending: VecDeque::new(),
             clients: Vec::new(),
@@ -1609,25 +1912,31 @@ impl<'a> Dispatch<'a> {
         }
     }
 
+    /// Dispatches until stopped. A pool's workers report on `exited`'s lanes (`native`); the
+    /// kernel lanes report on the dispatcher's own thread, and have none.
     fn run(
         &mut self,
         inbox: &Receiver<Event>,
         submission_pending: &mut ChannelReceiver<()>,
-        exited: &Receiver<()>,
+        exited: Option<&Receiver<()>>,
         native: &mut [NativeWorker<'_>],
     ) {
         let mut scan_needed = false;
         loop {
             // An early native unwind can leave a counted assignment without Done. Its
             // distinct exit lane and permit drive typed shutdown, never a forged completion.
-            let exit_notified = matches!(exited.try_recv(), Ok(()));
+            let exit_notified = exited.is_some_and(|exited| matches!(exited.try_recv(), Ok(())));
             if exit_notified {
                 self.native_exits(native);
                 if self.failure.is_some() {
                     return;
                 }
             }
-            let mut progressed = match inbox.try_recv() {
+            let mut progressed = self.kernel_reports();
+            if self.failure.is_some() {
+                return;
+            }
+            progressed |= match inbox.try_recv() {
                 Ok(event) => {
                     self.event(event);
                     true
@@ -1640,11 +1949,87 @@ impl<'a> Dispatch<'a> {
             if self.failure.is_some() || (self.stopping && self.in_flight == 0) {
                 return;
             }
-            if !progressed {
-                // Publication between the empty checks and park leaves a permit; later
-                // publication wakes the parked dispatcher. Spurious wakes just recheck.
-                std::thread::park();
+            if !progressed && !self.lanes.reported() {
+                // Publication between the empty checks and the wait leaves a permit (an unpark,
+                // a count on the bell); later publication wakes the waiting dispatcher. Spurious
+                // wakes just recheck.
+                if self.lanes.wait().is_err() {
+                    self.failure.get_or_insert(LifecycleFailure::Kernel);
+                    return;
+                }
             }
+        }
+    }
+
+    /// Takes the kernel lanes' completions and reports, each as a worker's report is taken;
+    /// whether there were any. A pool's lanes report on their own threads.
+    fn kernel_reports(&mut self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            let Lanes::Kernel(kernel) = &mut self.lanes else {
+                return false;
+            };
+            if kernel.reap().is_err() {
+                self.failure.get_or_insert(LifecycleFailure::Kernel);
+                return true;
+            }
+            let mut any = false;
+            while let Some((lane, report)) = self.next_kernel_report() {
+                self.done(lane, report);
+                any = true;
+            }
+            while let Some((slot, generation, failed)) = self.next_kernel_retired() {
+                self.dropped(Some((slot, generation)), failed);
+                any = true;
+            }
+            any
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn next_kernel_report(&mut self) -> Option<(usize, Report)> {
+        match &mut self.lanes {
+            Lanes::Kernel(kernel) => kernel.next_report(),
+            Lanes::Pool(_) => None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn next_kernel_retired(&mut self) -> Option<(usize, u64, Option<LifecycleFailure>)> {
+        match &mut self.lanes {
+            Lanes::Kernel(kernel) => kernel.next_retired(),
+            Lanes::Pool(_) => None,
+        }
+    }
+
+    /// The kernel lanes' end, as the pool's is its workers' joins: every transfer the kernel still
+    /// holds waited for, its report latched as a pool's last unconsumed report is
+    /// (`latch_native_reports`) and disposed of, then every lane's duplicates retired.
+    #[cfg(target_os = "linux")]
+    fn finish_kernel(&mut self) {
+        let Lanes::Kernel(kernel) = &mut self.lanes else {
+            return;
+        };
+        if kernel.drain().is_err() {
+            self.failure.get_or_insert(LifecycleFailure::Kernel);
+        }
+        while let Some((_, report)) = self.next_kernel_report() {
+            self.terminal_report(&report);
+            if let Some(failed) = dispose_foreign(report) {
+                self.failure.get_or_insert(failed);
+            }
+        }
+        while let Some((slot, generation, failed)) = self.next_kernel_retired() {
+            self.dropped(Some((slot, generation)), failed);
+        }
+        if let Lanes::Kernel(kernel) = &mut self.lanes
+            && let Some(failed) = kernel.retire_files()
+        {
+            self.failure.get_or_insert(failed);
         }
     }
 
@@ -1779,7 +2164,7 @@ impl<'a> Dispatch<'a> {
         if self.stopping {
             return Err(stopped(self.path, "the device's issuer is stopping"));
         }
-        if files.len() != self.workers.len() {
+        if files.len() != self.lanes.duplicates() {
             return Err(invalid(
                 self.path,
                 "one duplicate of the file for each worker",
@@ -1795,12 +2180,24 @@ impl<'a> Dispatch<'a> {
         let slot = (0..self.clients.len())
             .find(|&s| !busy(s, &self.clients, &self.detaching))
             .unwrap_or(self.clients.len());
-        for (news, file) in self.news.iter_mut().zip(files) {
-            news.push_back(Task::Attach {
-                slot,
-                generation,
-                file,
-            });
+        #[cfg(target_os = "linux")]
+        let mut placed = None;
+        match &mut self.lanes {
+            Lanes::Pool(_) => {
+                for (news, file) in self.news.iter_mut().zip(files) {
+                    news.push_back(Task::Attach {
+                        slot,
+                        generation,
+                        file,
+                    });
+                }
+            }
+            #[cfg(target_os = "linux")]
+            Lanes::Kernel(kernel) => {
+                for file in files {
+                    placed = placed.or(kernel.attach(slot, generation, file));
+                }
+            }
         }
         let client = Some(Client {
             generation,
@@ -1817,6 +2214,12 @@ impl<'a> Dispatch<'a> {
         match self.clients.get_mut(slot) {
             Some(free) => *free = client,
             None => self.clients.push(client),
+        }
+        // The kernel lanes placed the file at once: a failure is the client's, as a worker's news
+        // report makes it.
+        #[cfg(target_os = "linux")]
+        if placed.is_some() {
+            self.lifecycle(slot, generation, false, placed);
         }
         Ok((slot, generation))
     }
@@ -1976,12 +2379,20 @@ impl<'a> Dispatch<'a> {
         self.detaching.push(Detaching {
             slot,
             generation,
-            remaining: self.workers.len(),
+            remaining: self.lanes.duplicates(),
             failure,
             done,
             watch,
             physical_error,
         });
+        // The kernel lanes' one duplicate: retired now where no transfer of it is out, else once
+        // its last is reported (`kernel_reports`).
+        #[cfg(target_os = "linux")]
+        if let Lanes::Kernel(kernel) = &mut self.lanes
+            && let Some(failed) = kernel.detach(slot, generation)
+        {
+            self.dropped(Some((slot, generation)), failed);
+        }
     }
 
     /// A worker dropped its duplicate of a detached file; the last one answers the detach.
@@ -2366,15 +2777,11 @@ impl<'a> Dispatch<'a> {
                 break;
             };
             idle.pop();
-            let sent = match self.workers.get(worker) {
-                Some(slot) => slot.try_send(Task::Transfer(transfer)),
-                None => Err(TrySendError::Disconnected(Task::Transfer(transfer))),
-            };
             // An idle worker's slot is empty; one that is not, or whose worker ended, keeps no
             // place among the idle, and its transfer fails its batch.
-            match sent {
+            match self.lanes.send(worker, Task::Transfer(transfer)) {
                 Ok(()) => self.in_flight = self.in_flight.saturating_add(1),
-                Err(TrySendError::Full(task) | TrySendError::Disconnected(task)) => {
+                Err(task) => {
                     if let Task::Transfer(transfer) = task {
                         self.failed(transfer, "a device worker has ended");
                     }
@@ -2382,6 +2789,11 @@ impl<'a> Dispatch<'a> {
             }
         }
         self.idle = idle;
+        // The kernel lanes' transfers go to the kernel together, one submission for all of them.
+        #[cfg(target_os = "linux")]
+        if let Lanes::Kernel(kernel) = &mut self.lanes {
+            kernel.pump();
+        }
     }
 
     /// Gives an idle worker the next news it waits for: whether it was handed some.
@@ -2389,13 +2801,9 @@ impl<'a> Dispatch<'a> {
         let Some(task) = self.news.get_mut(worker).and_then(VecDeque::pop_front) else {
             return false;
         };
-        let sent = match self.workers.get(worker) {
-            Some(slot) => slot.try_send(task),
-            None => Err(TrySendError::Disconnected(task)),
-        };
-        match sent {
+        match self.lanes.send(worker, task) {
             Ok(()) => self.in_flight = self.in_flight.saturating_add(1),
-            Err(TrySendError::Full(task) | TrySendError::Disconnected(task)) => {
+            Err(task) => {
                 self.failure.get_or_insert(LifecycleFailure::Worker);
                 let _ = retire_task(task); // Secondary cleanup cannot replace the first refusal.
             }
@@ -3743,7 +4151,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let issuer = Issuer::start(Path::new("dev"), 2).unwrap();
         let probe = Probe::new(dir.path(), true, None);
-        let attacher = issuer.attacher();
+        let attacher = issuer.attacher().unwrap();
         let file = probe.try_clone().unwrap();
         let landed = std::thread::scope(|s| {
             s.spawn(move || {
@@ -3771,7 +4179,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let issuer = Issuer::start(Path::new("dev"), 2).unwrap();
         let probe = Probe::new(dir.path(), true, None);
-        let attacher = issuer.attacher();
+        let attacher = issuer.attacher().unwrap();
         drop(issuer);
         let refused = attacher.attach_deep(&probe, 1);
         assert!(

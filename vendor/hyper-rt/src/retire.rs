@@ -1,5 +1,7 @@
 //! An entry shared with counted readers and retired by the last of them (docs/runtime.md §4.3; mantle's
-//! review of hyper-rt, finding 10b): the registry slot's protocol, apart so loom can drive it.
+//! review of hyper-rt, finding 10b): the registry slot's protocol, apart so loom can drive it, and the
+//! protocol hyper-block's segmented files share their open files by (one owner retires, readers that
+//! outlive it are counted per call and the last frees; hyper-block `segmented`).
 //!
 //! A reader pins the entry for the span of one call: it counts itself in `pins`, then loads the pointer.
 //! Retirement swaps the pointer to null, parks it in `retired`, and marks `pins` [`RETIRED`]; whoever
@@ -31,17 +33,26 @@ use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering, fence};
 const RETIRED: u32 = 1 << 31;
 
 /// An entry published once, read under counted pins, and freed by the last reader of its retirement.
+///
+/// The entry is read from any thread and freed on whichever finishes its retirement, so the methods
+/// that publish, read and retire it ask `T: Send + Sync`.
 #[derive(Debug)]
-pub(crate) struct Pinned<T> {
+pub struct Pinned<T> {
     entry: AtomicPtr<T>,
     pins: AtomicU32,
     retired: AtomicPtr<T>,
 }
 
+impl<T> Default for Pinned<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T> Pinned<T> {
     /// Nothing published, no reader, no retirement.
     #[cfg(not(loom))]
-    pub(crate) const fn new() -> Pinned<T> {
+    pub const fn new() -> Pinned<T> {
         Pinned {
             entry: AtomicPtr::new(std::ptr::null_mut()),
             pins: AtomicU32::new(0),
@@ -51,7 +62,7 @@ impl<T> Pinned<T> {
 
     /// Nothing published, no reader, no retirement (loom's atomics are not `const`).
     #[cfg(loom)]
-    pub(crate) fn new() -> Pinned<T> {
+    pub fn new() -> Pinned<T> {
         Pinned {
             entry: AtomicPtr::new(std::ptr::null_mut()),
             pins: AtomicU32::new(0),
@@ -61,23 +72,25 @@ impl<T> Pinned<T> {
 
     /// Publishes `entry`. The caller holds the right to publish: nothing is published and no retirement
     /// is pending (the registry's claimed generation, which a retirement frees only after its finish).
-    pub(crate) fn publish(&self, entry: Box<T>) {
+    pub fn publish(&self, entry: Box<T>)
+    where
+        T: Send + Sync,
+    {
         self.entry.store(Box::into_raw(entry), Ordering::SeqCst);
     }
 
     /// The published pointer, unpinned: for the entry's owner, whose own reference keeps it from
     /// retirement (the registry's shard thread). Null when nothing is published.
-    pub(crate) fn unguarded(&self) -> *mut T {
+    pub fn unguarded(&self) -> *mut T {
         self.entry.load(Ordering::SeqCst)
     }
 
     /// Runs `f` on the published entry, pinned for the call; `None` when nothing is published. When this
     /// reader is the last of a retirement, `finish` receives the entry after the call (on an unwind too).
-    pub(crate) fn read<R>(
-        &self,
-        f: impl FnOnce(&T) -> R,
-        finish: impl FnOnce(Box<T>),
-    ) -> Option<R> {
+    pub fn read<R>(&self, f: impl FnOnce(&T) -> R, finish: impl FnOnce(Box<T>)) -> Option<R>
+    where
+        T: Send + Sync,
+    {
         self.pins.fetch_add(1, Ordering::SeqCst);
         fence(Ordering::SeqCst);
         let _pin = Pin {
@@ -100,7 +113,10 @@ impl<T> Pinned<T> {
     /// it does nothing: the swap that takes the pointer is the one claim on the retirement, so a second
     /// `retire` never finishes a second time (mantle's final review, finding 5: it used to finish with
     /// nothing, and the registry published the slot free while a reader still held the entry).
-    pub(crate) fn retire(&self, finish: impl FnOnce(Box<T>)) {
+    pub fn retire(&self, finish: impl FnOnce(Box<T>))
+    where
+        T: Send + Sync,
+    {
         let entry = self.entry.swap(std::ptr::null_mut(), Ordering::SeqCst);
         if entry.is_null() {
             return;

@@ -2093,6 +2093,15 @@ impl Connection {
         get_max_ack_delay(&self.peer_params)
     }
 
+    /// The idle timeout the connection runs on (RFC 9000 §10.1): once the peer's transport
+    /// parameters have come, the one both ends negotiated, the lesser of the two
+    /// `max_idle_timeout`s with either side's 0 standing for none (§18.2), and none where neither
+    /// side has one; before them, this side's own. An application that keeps its peer's idle
+    /// timer from running out reads what the peer holds it to here (patch Q34).
+    pub fn idle_timeout(&self) -> Option<Duration> {
+        self.idle_timeout
+    }
+
     /// Current best estimate of this connection's latency (round-trip-time)
     pub fn rtt(&self) -> Duration {
         self.path.rtt.get()

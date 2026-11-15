@@ -15,10 +15,13 @@
     missing_docs
 )]
 
+#[path = "common/bare.rs"]
+mod bare;
 mod common;
 
 use std::time::Instant;
 
+use bare::Bare;
 use common::*;
 use hyper_transport::Event;
 

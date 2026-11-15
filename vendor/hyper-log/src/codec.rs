@@ -61,6 +61,11 @@ impl Writer {
         self.buf.clear();
     }
 
+    /// Keeps the first `len` bytes written and drops the rest; nothing where fewer were written.
+    pub fn truncate(&mut self, len: usize) {
+        self.buf.truncate(len);
+    }
+
     /// Whether nothing is written.
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()

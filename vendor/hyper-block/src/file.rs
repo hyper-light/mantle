@@ -13,6 +13,17 @@
 //! The path may also name a device node, a disk or partition written directly: its length
 //! and full flush are then the device's (`crate::node`). A device that refuses writes out of
 //! a zone's order is refused at open, before any write (`refuse_zones`).
+//!
+//! Every transfer names its offset, so one open file serves any number of threads at once: on
+//! Unix pread(2) and pwrite(2) read and write "at a given position in the file without changing
+//! the file pointer" and are atomic with respect to each other on a regular file (POSIX.1-2017,
+//! pread and §2.9.7, "Thread Interactions with Regular File Operations"; Linux's pread(2): they
+//! "allow multiple threads to perform I/O on the same file descriptor without being affected by
+//! changes to the file offset by other threads"). On Windows a file a segmented file shares is
+//! opened for overlapped I/O ([`DeviceFile::open_shared`], `crate::overlapped`): each transfer
+//! carries its offset in its own OVERLAPPED block, and the I/O manager serializes only the
+//! transfers of a handle opened without `FILE_FLAG_OVERLAPPED` (Microsoft, "Synchronous and
+//! Asynchronous I/O").
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -53,11 +64,50 @@ pub struct DeviceFile {
     /// What this handle needs to read from memory alone ([`DeviceFile::read_resident_at`]).
     resident: crate::resident::Resident,
     /// The epoch its kept answers hold in, unless a caller reading through several files
-    /// passes its own ([`DeviceFile::read_resident_with`]).
+    /// passes its own ([`DeviceFile::read_resident_through`]).
     epoch: crate::resident::Epoch,
     /// Whether new space is written with zeros before use ([`DeviceFile::fills_new_space`]),
     /// asked of the file system once, at open.
     fills: bool,
+    /// Opened for overlapped I/O (Windows, [`DeviceFile::open_shared`]): its transfers wait on an
+    /// event of their own rather than on the handle (`crate::overlapped`). Never set elsewhere.
+    overlapped: bool,
+}
+
+/// What a read from memory needs of a file, borrowed apart from the handle state it updates.
+struct Target<'a> {
+    file: &'a File,
+    caching: Caching,
+    align: Alignment,
+    path: &'a Path,
+}
+
+impl Target<'_> {
+    fn read_resident(
+        &self,
+        resident: &mut crate::resident::Resident,
+        buf: &mut [u8],
+        offset: u64,
+        epoch: &mut crate::resident::Epoch,
+    ) -> Result<bool, DiskError> {
+        if self.caching == Caching::Direct {
+            return Ok(false);
+        }
+        if !(self.align.is_aligned_u64(offset) && self.align.is_aligned(buf.len())) {
+            return Err(DiskError::Misaligned {
+                offset,
+                len: buf.len(),
+                align: self.align.get(),
+            });
+        }
+        resident
+            .read(self.file, buf, offset, epoch)
+            .map_err(|source| DiskError::Io {
+                op: "read from memory",
+                path: self.path.to_path_buf(),
+                source,
+            })
+    }
 }
 
 impl DeviceFile {
@@ -72,22 +122,47 @@ impl DeviceFile {
         request: CachingRequest,
         align: Alignment,
     ) -> Result<Self, DiskError> {
+        Self::open_with(path, create, request, align, false)
+    }
+
+    /// [`Self::open`] for a file many threads transfer through at once, as every handle of a
+    /// segmented file does through its segments' (`crate::segmented`): on Windows opened for
+    /// overlapped I/O, whose transfers the I/O manager does not serialize on the handle, unless the
+    /// path names a device, whose controls this crate issues without an OVERLAPPED block
+    /// (`crate::node`); elsewhere as [`Self::open`].
+    pub(crate) fn open_shared(
+        path: &Path,
+        create: bool,
+        request: CachingRequest,
+        align: Alignment,
+    ) -> Result<Self, DiskError> {
+        Self::open_with(path, create, request, align, true)
+    }
+
+    fn open_with(
+        path: &Path,
+        create: bool,
+        request: CachingRequest,
+        align: Alignment,
+        shared: bool,
+    ) -> Result<Self, DiskError> {
         let wrap = |op: &'static str| {
             let path = path.to_path_buf();
             move |source| DiskError::Io { op, path, source }
         };
+        let overlapped = sys::overlapped(path, shared);
         let (file, caching, align) = match request {
-            CachingRequest::PreferDirect => match sys::open_direct(path, create) {
+            CachingRequest::PreferDirect => match sys::open_direct(path, create, overlapped) {
                 Ok(file) => (file, Caching::Direct, align),
                 Err(e) if sys::refuses_direct(&e) => (
-                    options(create).open(path).map_err(wrap("open"))?,
+                    sys::open_buffered(path, create, overlapped).map_err(wrap("open"))?,
                     Caching::Buffered,
                     Alignment::BYTE,
                 ),
                 Err(e) => return Err(wrap("open")(e)),
             },
             CachingRequest::Buffered => (
-                options(create).open(path).map_err(wrap("open"))?,
+                sys::open_buffered(path, create, overlapped).map_err(wrap("open"))?,
                 Caching::Buffered,
                 Alignment::BYTE,
             ),
@@ -123,6 +198,7 @@ impl DeviceFile {
             resident,
             epoch: crate::resident::Epoch::new(),
             fills,
+            overlapped,
         })
     }
 
@@ -153,6 +229,7 @@ impl DeviceFile {
             epoch: crate::resident::Epoch::new(),
             // The same file, on the same file system.
             fills: self.fills,
+            overlapped: self.overlapped,
         })
     }
 
@@ -224,7 +301,7 @@ impl DeviceFile {
             let at = offset
                 .checked_add(u64::try_from(done).map_err(|_| self.overflow(offset))?)
                 .ok_or_else(|| self.overflow(offset))?;
-            match sys::write_at(&self.file, rest, at) {
+            match sys::write_at(&self.file, rest, at, self.overlapped) {
                 Ok(0) => {
                     return Err(self.io_error("write", io::Error::from(io::ErrorKind::WriteZero)));
                 }
@@ -280,38 +357,46 @@ impl DeviceFile {
     /// call reads it if that read finished first: true says the bytes were read without waiting,
     /// not that they were in memory before.
     pub fn read_resident_at(&mut self, buf: &mut [u8], offset: u64) -> Result<bool, DiskError> {
-        self.read_resident(buf, offset, None)
+        let Self {
+            file,
+            caching,
+            align,
+            path,
+            resident,
+            epoch,
+            ..
+        } = self;
+        let target = Target {
+            file,
+            caching: *caching,
+            align: *align,
+            path,
+        };
+        target.read_resident(resident, buf, offset, epoch)
     }
 
-    /// [`Self::read_resident_at`], its answers kept in `epoch` rather than this handle's own: one
-    /// epoch for the files a caller reads as one (`crate::segmented`).
-    pub(crate) fn read_resident_with(
-        &mut self,
+    /// [`Self::read_resident_at`] through a handle's own state for reads from memory rather than
+    /// this file's: each handle of a file several share keeps its own (`crate::segmented`).
+    pub(crate) fn read_resident_through(
+        &self,
+        resident: &mut crate::resident::Resident,
         buf: &mut [u8],
         offset: u64,
         epoch: &mut crate::resident::Epoch,
     ) -> Result<bool, DiskError> {
-        self.read_resident(buf, offset, Some(epoch))
+        let target = Target {
+            file: &self.file,
+            caching: self.caching,
+            align: self.align,
+            path: &self.path,
+        };
+        target.read_resident(resident, buf, offset, epoch)
     }
 
-    fn read_resident(
-        &mut self,
-        buf: &mut [u8],
-        offset: u64,
-        shared: Option<&mut crate::resident::Epoch>,
-    ) -> Result<bool, DiskError> {
-        if self.caching == Caching::Direct {
-            return Ok(false);
-        }
-        self.check_alignment(offset, buf.len())?;
-        let epoch = match shared {
-            Some(epoch) => epoch,
-            None => &mut self.epoch,
-        };
-        match self.resident.read(&self.file, buf, offset, epoch) {
-            Ok(read) => Ok(read),
-            Err(e) => Err(self.io_error("read from memory", e)),
-        }
+    /// A handle's own state for reads from memory through this file: what [`Self::try_clone`]
+    /// gives a duplicate, the file system's answer to whether it can read there and nothing else.
+    pub(crate) fn resident_for_handle(&self) -> crate::resident::Resident {
+        self.resident.duplicate()
     }
 
     /// What [`Self::read_resident_at`] did: probes, reads on kept answers, epochs.
@@ -356,7 +441,7 @@ impl DeviceFile {
             let at = offset
                 .checked_add(u64::try_from(done).map_err(|_| self.overflow(offset))?)
                 .ok_or_else(|| self.overflow(offset))?;
-            match sys::read_at(&self.file, rest, at) {
+            match sys::read_at(&self.file, rest, at, self.overlapped) {
                 Ok(0) => break,
                 Ok(n) => done = done.saturating_add(n),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -668,8 +753,24 @@ mod sys {
     use std::os::unix::fs::FileExt;
     use std::path::Path;
 
-    pub(super) fn write_at(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
+    pub(super) fn write_at(
+        file: &File,
+        buf: &[u8],
+        offset: u64,
+        _overlapped: bool,
+    ) -> io::Result<usize> {
         file.write_at(buf, offset)
+    }
+
+    /// No handle is opened for overlapped I/O off Windows: pread(2) and pwrite(2) take their
+    /// offsets from the call on any descriptor.
+    pub(super) fn overlapped(_path: &Path, _shared: bool) -> bool {
+        false
+    }
+
+    /// The file, opened through the page cache.
+    pub(super) fn open_buffered(path: &Path, create: bool, _overlapped: bool) -> io::Result<File> {
+        super::options(create).open(path)
     }
 
     /// `copies` copies of `fill` from `offset` (the caller checked the span fits a file offset),
@@ -742,7 +843,12 @@ mod sys {
         Ok(())
     }
 
-    pub(super) fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    pub(super) fn read_at(
+        file: &File,
+        buf: &mut [u8],
+        offset: u64,
+        _overlapped: bool,
+    ) -> io::Result<usize> {
         file.read_at(buf, offset)
     }
 
@@ -824,7 +930,7 @@ mod sys {
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    pub(super) fn open_direct(path: &Path, create: bool) -> io::Result<File> {
+    pub(super) fn open_direct(path: &Path, create: bool, _overlapped: bool) -> io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         let flag = i32::try_from(rustix::fs::OFlags::DIRECT.bits())
             .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
@@ -840,7 +946,7 @@ mod sys {
     }
 
     #[cfg(target_vendor = "apple")]
-    pub(super) fn open_direct(path: &Path, create: bool) -> io::Result<File> {
+    pub(super) fn open_direct(path: &Path, create: bool, _overlapped: bool) -> io::Result<File> {
         let file = super::options(create).open(path)?;
         rustix::fs::fcntl_nocache(&file, true)?;
         Ok(file)
@@ -856,7 +962,7 @@ mod sys {
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-    pub(super) fn open_direct(_path: &Path, _create: bool) -> io::Result<File> {
+    pub(super) fn open_direct(_path: &Path, _create: bool, _overlapped: bool) -> io::Result<File> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 
@@ -874,15 +980,49 @@ mod sys {
     use std::path::Path;
 
     use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
-    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED};
 
-    pub(super) fn write_at(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
+    /// A handle a segmented file shares is opened for overlapped I/O, but not one that names a
+    /// device ([`crate::node::is_node`]), whose length and flush controls are issued without an
+    /// OVERLAPPED block, which a handle opened for overlapped I/O would need (DeviceIoControl).
+    pub(super) fn overlapped(path: &Path, shared: bool) -> bool {
+        shared && !path.as_os_str().to_string_lossy().starts_with(r"\\.\")
+    }
+
+    pub(super) fn write_at(
+        file: &File,
+        buf: &[u8],
+        offset: u64,
+        overlapped: bool,
+    ) -> io::Result<usize> {
+        if overlapped {
+            // std's positioned write waits on the handle itself, which on a handle opened for
+            // overlapped I/O another thread's transfer signals too (crate::overlapped).
+            return crate::overlapped::write_at(file, buf, offset);
+        }
         file.seek_write(buf, offset)
     }
 
-    pub(super) fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    pub(super) fn read_at(
+        file: &File,
+        buf: &mut [u8],
+        offset: u64,
+        overlapped: bool,
+    ) -> io::Result<usize> {
+        if overlapped {
+            return crate::overlapped::read_at(file, buf, offset);
+        }
         // std maps ReadFile's ERROR_HANDLE_EOF to Ok(0) (library/std/src/sys/pal/windows/handle.rs).
         file.seek_read(buf, offset)
+    }
+
+    /// The file, through the cache; for overlapped I/O when asked.
+    pub(super) fn open_buffered(path: &Path, create: bool, overlapped: bool) -> io::Result<File> {
+        let mut options = super::options(create);
+        if overlapped {
+            options.custom_flags(FILE_FLAG_OVERLAPPED);
+        }
+        options.open(path)
     }
 
     pub(super) fn sync_dir(dir: &Path) -> io::Result<()> {
@@ -924,9 +1064,10 @@ mod sys {
         None
     }
 
-    pub(super) fn open_direct(path: &Path, create: bool) -> io::Result<File> {
+    pub(super) fn open_direct(path: &Path, create: bool, overlapped: bool) -> io::Result<File> {
         let mut options = super::options(create);
-        options.custom_flags(FILE_FLAG_NO_BUFFERING);
+        let overlapped = if overlapped { FILE_FLAG_OVERLAPPED } else { 0 };
+        options.custom_flags(FILE_FLAG_NO_BUFFERING | overlapped);
         options.open(path)
     }
 
@@ -1081,7 +1222,7 @@ mod tests {
         let file = options(true).open(&path).unwrap();
         let block = preferred_block(&file, &path).unwrap();
         assert!(block.is_power_of_two() && block >= 512, "{block}");
-        sys::write_at(&file, &vec![0xa5; block], 0).unwrap();
+        sys::write_at(&file, &vec![0xa5; block], 0, false).unwrap();
         file.sync_data().unwrap();
         assert_eq!(file.metadata().unwrap().len(), block as u64);
     }

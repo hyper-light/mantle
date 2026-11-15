@@ -5264,3 +5264,41 @@ fn preferred_address() {
     let mut pair = Pair::new(EndpointConfig::default(), server_config);
     pair.connect();
 }
+
+/// Both ends read the idle timeout they negotiated once the handshake is done (patch Q34): the
+/// lesser of the two `max_idle_timeout`s (RFC 9000 §10.1), the other side's where one side has
+/// none, and none where neither has one (§18.2).
+#[test]
+fn both_ends_read_the_idle_timeout_they_negotiated() {
+    let _guard = subscribe();
+    for (server_ms, client_ms, negotiated_ms) in [
+        (Some(10_000u32), Some(100_000u32), Some(10_000u64)),
+        (Some(100_000), Some(10_000), Some(10_000)),
+        (None, Some(4_000), Some(4_000)),
+        (Some(4_000), None, Some(4_000)),
+        (None, None, None),
+    ] {
+        let mut server_config = server_config();
+        let mut client_config = client_config();
+        server_config
+            .transport
+            .max_idle_timeout(server_ms.map(|ms| VarInt::from_u32(ms).into()));
+        client_config
+            .transport
+            .max_idle_timeout(client_ms.map(|ms| VarInt::from_u32(ms).into()));
+        let mut pair = Pair::new(Default::default(), server_config);
+        let (client_ch, server_ch) = pair.connect_with(client_config);
+        pair.drive();
+        let negotiated = negotiated_ms.map(Duration::from_millis);
+        assert_eq!(
+            pair.client_conn_mut(client_ch).idle_timeout(),
+            negotiated,
+            "{server_ms:?} {client_ms:?}"
+        );
+        assert_eq!(
+            pair.server_conn_mut(server_ch).idle_timeout(),
+            negotiated,
+            "{server_ms:?} {client_ms:?}"
+        );
+    }
+}

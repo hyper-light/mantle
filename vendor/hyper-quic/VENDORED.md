@@ -1779,3 +1779,19 @@ allocations of 1,044,480 bytes) where 349 had been made. Tests: `allocs.rs`'s
 `a_borrowed_write_allocates_its_copy_alone` (each fails before the change), and
 `a_received_datagram_is_handled_without_allocating`; `tests::credit_retransmit` and
 `tests::stream_data_blocked_retransmit`, a lost packet's credit and blocked frames sent again.
+
+## 50. The negotiated idle timeout, read (2026-11-13)
+
+- **Patch Q34: `Connection::idle_timeout`.** The idle timeout the connection runs on: once the
+  peer's transport parameters have come, the one both ends negotiated (RFC 9000 §10.1, the lesser
+  of the two `max_idle_timeout`s, either side's 0 none, §18.2), as `negotiate_max_idle_timeout`
+  already computes it for the connection's own idle timer; before them, this side's own. No
+  behaviour changes.
+- **Why.** An application that keeps its peer's idle timer from running out (a keep-alive, RFC 9000
+  §10.1.2) must know what the peer holds it to, and its own configuration says only its side's
+  half: shards' agent-control and context links (shards D180) send a keep-alive only where the
+  negotiated timeout would otherwise end a live connection, early by the slowest answer the path
+  has shown, and none where neither side has an idle timeout.
+
+Tests: `both_ends_read_the_idle_timeout_they_negotiated` (each side's value, the other's, one side
+none and both none; it does not build without the accessor).

@@ -590,3 +590,41 @@ authenticated, since every node's CertificateRequest offers the decoders.
   `a_malformed_brotli_certificate_is_refused_and_the_server_serves_on`; hyper-transport
   `tests/certificates.rs`, a node refusing three malformed client certificates, typed, then taking
   a Brotli-compressed one.
+
+## 12. Three of upstream 0.23.46's advisory fixes, and the lock past its advisories (2026-11-13)
+
+cargo deny's advisory database names three more flaws of rustls 0.23.45 that this crate's code
+carries. Each takes upstream 0.23.46's change (rustls `f04804f`, read from its crates.io archive)
+and nothing else of that release; each test fails on the code before it.
+
+- **RUSTSEC-2026-0346** (rustls/rustls#3299): `ClientSessionCommon` and `ServerSessionValue`
+  derived `Debug`, printing the TLS 1.3 resumption PSK or the TLS 1.2 master secret to whatever
+  formatted a session. Each now has upstream's `Debug`, every field but the secret
+  (`msgs/persist.rs`). The session values that hold a `ClientSessionCommon` keep their derived
+  `Debug`, which now prints its redacted one. Tests: `msgs::persist::tests::serversessionvalue_is_debug`
+  (upstream's) and `clientsessioncommon_debug_leaves_the_secret_out`.
+- **RUSTSEC-2026-0347** (rustls/rustls#3300): a client whose ECH offer the server rejected started
+  traffic before it raised `ech_required`, so application data it wrote before the handshake ended
+  went to the server it reached, authenticated only for the ECH config's `public_name` (RFC 9849
+  §6.1.6 asks the client to abort "before sending any application data to the server").
+  `ExpectFinished` now checks the ECH status before `start_traffic` (`client/tls13.rs`). Test:
+  `api.rs` `a_rejected_ech_offer_sends_no_application_data_to_the_outer_server`, the outer server
+  receiving the plaintext before.
+- **RUSTSEC-2026-0349** (rustls/rustls#3355): the client kept the group a ServerHello chose as the
+  next ClientHello's key-share hint before the server was authenticated, so a network attacker
+  answering one attempt with a classical group held later ClientHellos to that name to a classical
+  share alone. The group rides the handshake's states (`kx_group`) and is kept once the server's
+  Finished is verified, beside `remove_tls12_session` (`client/tls13.rs`). Test: `api.rs`
+  `a_kx_hint_is_kept_only_from_an_authenticated_server`, a refused certificate leaving no hint
+  where it left one before, and a completed handshake leaving its group's.
+
+Not taken: 0.23.46's other changes (the key update before a write's last record, the ECH
+hello-retry acceptance check, the zlib and Brotli decoders' trailing-data checks being §11's
+already). `rustls-webpki` is required at 0.103.16 or later (RUSTSEC-2026-0382), and the
+workspace lock moves rustls-webpki to 0.103.17, webpki-roots to 1.0.12 (RUSTSEC-2026-0381), tokio
+to 1.54.1 (RUSTSEC-2026-0386) and rustix 1.1.4 to 1.1.6 (RUSTSEC-2026-0486). The oracle,
+`upstream-rustls` pinned at 0.23.45, keeps its four advisories: it is the release this crate
+conforms and the allocation counts' comparison, a test dependency only.
+
+Counts unchanged (`tests/alloc_per_handshake.rs`): a TLS 1.3 handshake 281 allocations, mutual
+401, TLS 1.2 140, against upstream's 293, 419 and 142.

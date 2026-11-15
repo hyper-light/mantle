@@ -118,6 +118,36 @@ def main(d, only=None):
                         thr = n / (L / 1e9) if L else 0
                         mean = lat_sum / n / 1e6
                         print(f"       +{rel:7.2f}s PHASE len {L/1e6:.0f}ms X {thr:.1f}/s R {mean:.1f}ms power {thr/mean if mean else 0:.2f} turned_away {ta} descent {desc} phase {phase} limit {limit}")
+        # each job's stages: from its start, each ask to its answer and the gaps between
+        stages = collections.defaultdict(list)
+        for i, pid in enumerate(nodes):
+            jobs = collections.defaultdict(list)
+            for ev in procs[pid]['events']:
+                if s <= ev[0] <= e and ev[1] in (START, END, ASK, ANSWER):
+                    jobs[ev[2]].append(ev)
+            for jid, evs in jobs.items():
+                if not evs or evs[0][1] != START or evs[-1][1] != END:
+                    continue
+                t_prev = evs[0][0]
+                asked = {}
+                for ev in evs[1:]:
+                    if ev[1] == ASK:
+                        name = {1: 'cmd', 2: 'read', 3: 'chunk', 10: 'cmd', 11: 'Block', 12: 'File', 13: 'Name'}.get(ev[3], str(ev[3]))
+                        asked[(ev[3] if ev[3] < 10 else 1, ev[4])] = (ev[0], name)
+                        if len(asked) == 1:
+                            stages['gap before ' + name].append((ev[0] - t_prev) / 1e6)
+                    elif ev[1] == ANSWER:
+                        k = (ev[3], ev[4])
+                        if k in asked:
+                            t_a, name = asked.pop(k)
+                            stages['ask ' + name].append((ev[0] - t_a) / 1e6)
+                            if not asked:
+                                t_prev = ev[0]
+                    elif ev[1] == END:
+                        stages['last answer to end'].append((ev[0] - t_prev) / 1e6)
+                        stages['job total'].append(ev[3] / 1e6)
+        if stages:
+            print("  job stages (ms): " + "; ".join(f"{k} n {len(v)} p50 {q(v,.5):.2f} p90 {q(v,.9):.2f}" for k, v in sorted(stages.items())))
         # node notes near the phase end
         for pid in nodes:
             ns = [(t, txt) for t, txt in procs[pid]['notes'] if e - 5e9 <= t <= e + 5e9]

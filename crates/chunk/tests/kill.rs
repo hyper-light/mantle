@@ -144,7 +144,7 @@ fn kill_child_entry() {
     };
     let seed: u64 = std::env::var("MANTLE_KILL_SEED").unwrap().parse().unwrap();
     let device = live::Device::of(Path::new(&dir));
-    let issuer = Issuer::start(Path::new(&dir), device.depth).unwrap();
+    let issuer = Issuer::start_device(Path::new(&dir), device.depth).unwrap();
     let path = Path::new(&dir).join("volume");
     let v = Volume::format(
         &issuer,
@@ -251,7 +251,7 @@ fn run(seed: u64, kill: Kill, device: &live::Device) -> Killed {
     }
     let (uncertain_key, uncertain_op) = op(seed, acked, &state);
 
-    let issuer = Issuer::start(dir.path(), device.depth).unwrap();
+    let issuer = Issuer::start_device(dir.path(), device.depth).unwrap();
     let (v, report) = Volume::open(
         &issuer,
         open_file(&dir.path().join("volume"), false, device.align),

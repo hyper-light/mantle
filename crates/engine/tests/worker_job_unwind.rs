@@ -251,7 +251,7 @@ fn an_active_job_read_panic_returns_after_retirement_and_preserves_retry_and_che
     assert_eq!(issuer.depth(), 1);
     let mut pool = Pool::new(spawn(&path, &facts), 1).unwrap();
     let _open = OpenOnDrop(Arc::clone(&gate));
-    pool.set_attach(issuer.attacher(), 1);
+    pool.set_attach(issuer.attacher().unwrap(), 1);
     let job = packed(&mut store, b"input", b"unchanged branch contents");
     let input = returned_branch(&mut store, &mut pool, job);
     check_branch(&mut store, &input, b"input", b"unchanged branch contents");
@@ -306,7 +306,7 @@ fn an_active_job_read_panic_returns_after_retirement_and_preserves_retry_and_che
     let (_, retry) = pool.send(retry, Owner::Pack, true).unwrap_err();
     drop(pool);
     let mut healthy = Pool::new(spawn(&path, &facts), 1).unwrap();
-    healthy.set_attach(issuer.attacher(), 1);
+    healthy.set_attach(issuer.attacher().unwrap(), 1);
     let output = returned_branch(&mut store, &mut healthy, retry);
     check_branch(&mut store, &output, b"retry", b"returned after unwind");
     drop(healthy);

@@ -55,7 +55,7 @@ fn pool(path: &Path) -> (Store<DeviceFile>, Issuer, Pool) {
             })
     });
     let mut pool = Pool::new(spawn, Pool::cores()).unwrap();
-    pool.set_attach(issuer.attacher(), 1);
+    pool.set_attach(issuer.attacher().unwrap(), 1);
     (store, issuer, pool)
 }
 

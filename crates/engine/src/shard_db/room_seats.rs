@@ -543,7 +543,7 @@ impl Fixture {
         let relayed = path.clone();
         let mut pool = Pool::new(relay::spawn(move || open(&relayed), STORE, relays), 2).unwrap();
         if let Some((attacher, batches)) = &db.worker_attach {
-            pool.set_attach(attacher.clone(), *batches);
+            pool.set_attach(attacher.try_clone().unwrap(), *batches);
         }
         db.trunk.set_pool(pool);
         let (steps, received) = hyper_rt::sync::channel::<Step>(1).unwrap();

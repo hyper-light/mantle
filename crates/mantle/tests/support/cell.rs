@@ -90,9 +90,9 @@ pub(crate) const STORE_PAGE: usize = 4096;
 pub(crate) const MEMTABLE: usize = STORE_PAGE;
 
 /// Every number the nodes run with, as the range's process test and the cluster test state them:
-/// the range's settings and rules, the log's and the engine's sizes (the engine's own small test
-/// configuration, crates/engine/tests/pool_startup.rs), and the calibration's probe budget the
-/// engine's bench gives each probe.
+/// the range's settings and rules, and the log's and the engine's sizes (the engine's own small test
+/// configuration, crates/engine/tests/pool_startup.rs). The calibration's probe budget is the node's
+/// own (`probe_budget_ms`).
 pub(crate) const STATED: &str = "\
 range.election_tick = 10
 range.heartbeat_tick = 2
@@ -114,7 +114,6 @@ engine.extent_pages = 4
 engine.max_extents = 256
 engine.fanout = 3
 engine.leaf_entries = 96
-runtime.probe_budget_ms = 40
 stop_ms = 10000
 chunk_bytes = 8388608
 ";
@@ -148,6 +147,43 @@ pub(crate) const LEAST_LOG: NodeLog = NodeLog {
     group_entries: 4 * LOG_SEGMENT,
     group_bytes: 4 * LOG_SEGMENT,
 };
+
+/// The probe budget a node derives for its machine's calibration (`derive::probe_budget`), in the
+/// configuration's milliseconds, as `mantle init` states it: Wilks' 59 samples at the platform's
+/// scheduling quantum each. A budget below one quantum (the 40 ms these cells stated, Windows'
+/// quantum being 93.75 ms) refused every wake probe beside 32 busy loops on a 4-CPU windows-2025
+/// runner, its first round's waiter not yet run when the probe's whole span had passed, 40 of 40,
+/// where the derived budget refused none of 10 (diag run 43678610491).
+pub(crate) fn probe_budget_ms() -> u128 {
+    mantle_node::derive::probe_budget()
+        .unwrap()
+        .as_nanos()
+        .div_ceil(1_000_000)
+}
+
+/// This machine's calibration record (`mantle_node::process::calibration`), measured once a test
+/// binary at the budget a node derives ([`probe_budget_ms`]), as `mantle init` measures a cell of
+/// one's machine, and kept in each node's directory before its first process starts: a node takes a
+/// kept record while the machine's key still matches it (node.md §1.6), so the nodes of a cell
+/// measure their one machine once, not each under the others' start.
+pub(crate) fn calibration_record() -> &'static [u8] {
+    static RECORD: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    RECORD.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let budget = mantle_node::derive::probe_budget().unwrap();
+        mantle_node::process::calibration(dir.path(), budget).unwrap();
+        std::fs::read(dir.path().join(mantle_node::process::CALIBRATION)).unwrap()
+    })
+}
+
+/// Keeps this machine's calibration record in node directory `dir`, unless one is there already.
+pub(crate) fn keep_calibration(dir: &Path) {
+    let path = dir.join(mantle_node::process::CALIBRATION);
+    if !path.exists() {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(&path, calibration_record()).unwrap();
+    }
+}
 
 /// The largest chunk the cell's gateways write (`chunk_bytes` above): `mantle_gateway::layout::CHUNK`,
 /// Tectonic's 8 MiB.
@@ -712,7 +748,8 @@ impl Pki {
              certificate = {}\nkey = {}\nvoters = {}\n\
              transport_bytes = {}\nlog.max_segments = {}\nlog.group_entries = {}\nlog.group_bytes = {}\n\
              engine.page_size = {STORE_PAGE}\nengine.memtable_bytes = {MEMTABLE}\n\
-             rules.max_key_bytes = {held}\nrules.max_value_bytes = {held}\n{STATED}",
+             rules.max_key_bytes = {held}\nrules.max_value_bytes = {held}\n\
+             runtime.probe_budget_ms = {}\n{STATED}",
             dir.display(),
             self.authority.display(),
             certificate.display(),
@@ -722,6 +759,7 @@ impl Pki {
             self.log.max_segments,
             self.log.group_entries,
             self.log.group_bytes,
+            probe_budget_ms(),
         );
         for (group, layer) in ranges {
             text.push_str(&format!("range = {group:x} {layer}\n"));
@@ -1449,6 +1487,7 @@ impl Cell {
         // What its last process said its detectors started from is that process's, not this one's.
         self.histories.remove(&id);
         let config = self.config_of(id);
+        keep_calibration(&self.dirs[&id]);
         let mut child = Command::new(NODE)
             .arg(if self.serving { "serve" } else { "node" })
             .arg(&config)
@@ -1506,6 +1545,7 @@ impl Cell {
     /// standard error.
     pub(crate) fn start_damaged(&mut self, id: u64) -> String {
         let config = self.config_of(id);
+        keep_calibration(&self.dirs[&id]);
         let mut child = Command::new(NODE)
             .arg("node")
             .arg(&config)

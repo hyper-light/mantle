@@ -1,5 +1,6 @@
 //! A measurement at the device's full reported depth runs no more threads than its pool, as the
-//! operating system counts them, and a depth past the process's thread budget starts none
+//! operating system counts them, and none at all where the kernel holds its depth (Linux, a direct
+//! file: `measure::in_kernel`); a depth past the process's thread budget starts none
 //! (docs/design/measurement.md §8; research/26 §8, tests 1, 4 and 5). One test, so that no
 //! other test's threads share the process's count.
 #![allow(
@@ -15,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use hyper_block::DiskError;
 use hyper_block::buf::Alignment;
-use hyper_block::file::{CachingRequest, DeviceFile};
+use hyper_block::file::{Caching, CachingRequest, DeviceFile};
 use hyper_block::issuer::UNDESCRIBED_QUEUE_DEPTH;
 use hyper_block::threads;
 use mantle_disk::measure::{self, Job, Pattern};
@@ -50,10 +51,19 @@ fn a_full_depth_measurement_stays_within_its_pool_and_past_the_budget_starts_not
         seed: 3,
     };
 
-    // A depth past what the budget has left draws nothing and starts no thread.
+    // A pool's depth past what the budget has left draws nothing and starts no thread: a buffered
+    // file's, whose depth a pool keeps on every platform.
+    let buffered = DeviceFile::open(
+        &dir.path().join("buffered"),
+        true,
+        CachingRequest::Buffered,
+        Alignment::new(4096).unwrap(),
+    )
+    .unwrap();
+    buffered.preallocate(4 << 20).unwrap();
     let before = threads::count().unwrap();
     let past = threads::left().unwrap() + 1;
-    let err = measure::with_pool(&file, past, |pool| {
+    let err = measure::with_pool(&buffered, past, |pool| {
         pool.run(&Job {
             depth: past,
             ..job.clone()
@@ -88,9 +98,15 @@ fn a_full_depth_measurement_stays_within_its_pool_and_past_the_budget_starts_not
          achieved {:.1} mean, {} most",
         result.achieved, result.achieved_max
     );
+    // The kernel holds a direct file's depth on Linux with no thread; elsewhere a pool's workers.
+    let workers = if cfg!(target_os = "linux") && file.caching() == Caching::Direct {
+        0
+    } else {
+        depth
+    };
     assert!(
-        peak <= before + depth + 1,
-        "{peak} threads for a pool of {depth} and a sampler, {before} before"
+        peak <= before + workers + 1,
+        "{peak} threads for {workers} workers at depth {depth} and a sampler, {before} before"
     );
     assert_eq!(result.ops, u64::try_from(depth).unwrap() * 64);
     assert_eq!(result.depth, depth);

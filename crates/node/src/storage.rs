@@ -248,7 +248,7 @@ impl Storage {
         dir: &Path,
         depth: usize,
     ) -> Result<usize, StorageError> {
-        let issuer = Issuer::start(dir, depth).map_err(|source| StorageError::Device {
+        let issuer = Issuer::start_device(dir, depth).map_err(|source| StorageError::Device {
             path: dir.to_path_buf(),
             source,
         })?;

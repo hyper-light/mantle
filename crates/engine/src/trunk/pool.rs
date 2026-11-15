@@ -1246,7 +1246,16 @@ impl Pool {
             jobs: job_rx,
             more: more_rx,
             back,
-            attach: self.attach.clone(),
+            attach: match &self.attach {
+                Some((attacher, batches)) => Some((
+                    attacher.try_clone().map_err(|e| Error::Io {
+                        op: "make a way to the device's issuer",
+                        detail: e.to_string(),
+                    })?,
+                    *batches,
+                )),
+                None => None,
+            },
             prepare,
         };
         let thread = (self.spawn)(seat)?;

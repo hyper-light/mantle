@@ -332,7 +332,7 @@ fn case(gate: &'static Gate) -> (Case, Store<Grown>, Pool) {
             })
     });
     let mut pool = Pool::new(spawn, 1).unwrap();
-    pool.set_attach(issuer.attacher(), 1);
+    pool.set_attach(issuer.attacher().unwrap(), 1);
     pool.prepare().unwrap();
     let mut runtime = runtime();
     let mut leases = runtime.prepare_retirement(&[1]).unwrap();

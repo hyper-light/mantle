@@ -97,12 +97,13 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+          {{- $memory := required "resources.memory: the bytes `mantle derive` says the node needs (memory.need)" .Values.resources.memory }}
           resources:
             requests:
-              memory: {{ .Values.resources.memory }}
+              memory: {{ $memory }}
               cpu: {{ .Values.resources.cpu }}
             limits:
-              memory: {{ .Values.resources.memory }}
+              memory: {{ $memory }}
               cpu: {{ .Values.resources.cpu }}
           readinessProbe:
             exec:

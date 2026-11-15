@@ -156,9 +156,9 @@ the limit that matters; any operation whose kernel cost grows with the waiters o
 
 | Platform | Mechanism | Threads a job | Depth bound |
 |---|---|---|---|
-| Linux with io_uring usable | one ring per job, `O_DIRECT`, registered buffers and file; durable writes linked to `IORING_OP_FSYNC` with `IORING_FSYNC_DATASYNC` | 1, plus io-wq's own, which the kernel bounds at `min(ring entries, 4 × CPUs)` | min(the device's reported queue, the knee, `IORING_MAX_ENTRIES`) |
+| Linux, a direct file | native AIO, one context per job of its depth, each transfer a batch of its own submitted and reaped on the calling thread (`hyper_block::aio::AioFile`), a durable write's `IOCB_CMD_FDSYNC` after it (the owner's decision of 2026-10-01: native AIO, not io_uring; node.md §1.2) | 0 besides the caller's | min(the device's reported queue, the knee, the plan's bound) |
 | Windows | overlapped `ReadFile`/`WriteFile` with `FILE_FLAG_NO_BUFFERING` on a file written to its full length first, so no write extends it; one completion port reaped with `GetQueuedCompletionStatusEx` | 1 | min(device queue, knee); a call that completes synchronously is counted as such |
-| macOS; Linux where io_uring is disabled or absent | blocking `pread`/`pwrite` (and `F_FULLFSYNC`, `fdatasync`) on a pool of exactly `depth` workers, each with its own job slot and completion slot, started once per calibration and reused across points | = depth | min(device queue, knee, the process thread budget) |
+| macOS; a buffered file | blocking `pread`/`pwrite` (and `F_FULLFSYNC`, `fdatasync`) on a pool of exactly `depth` workers, each with its own job slot and completion slot, started once per calibration and reused across points | = depth | min(device queue, knee, the process thread budget) |
 
 (26 §2.2–§2.6, recommendation 3.) macOS has no other choice: its POSIX AIO is a kernel pool
 capped at 16 requests a process that cannot carry `F_FULLFSYNC`, kqueue refuses user
@@ -173,6 +173,12 @@ Thread start-up, about 90 µs a thread in Apple's figure, is paid once per calib
 inside a timed interval. The pool starts its workers as the ladder deepens, each drawn from the
 budget before it starts, so it never holds more than the deepest step measured
 (`mantle_disk::measure::Pool`).
+
+*As built (2026-11-14).* On Linux a direct file's jobs run on native AIO (`measure::in_kernel`),
+as the node's device issuer holds its transfers there (node.md §1.2), so the depth calibration
+measures is the kernel's and a ladder that reached a runner's queue of 316 starts no thread for it;
+a buffered file, which the kernel transfers inside io_submit, and macOS keep the pool. Windows's
+completion port is not yet built, so Windows keeps the pool too.
 
 **The depth achieved is measured, not assumed.** Each completion samples the number in flight,
 and a point reports the achieved depth's distribution beside the depth asked for, as fio does

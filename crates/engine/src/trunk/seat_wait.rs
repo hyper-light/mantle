@@ -93,7 +93,7 @@ fn a_compaction_no_seat_takes_waits_for_a_workers_message() {
         1,
     )
     .unwrap();
-    pool.set_attach(issuer.attacher(), 1);
+    pool.set_attach(issuer.attacher().unwrap(), 1);
     // The seat's holder: a job of the kept index's kind, which the trunk does not own.
     relays.hold_job(Kind::Index);
     let job = Box::new(Job {

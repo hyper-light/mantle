@@ -312,11 +312,20 @@ struct Phase {
     found: u64,
     rows: u64,
     lat: Histogram,
+    /// The time the loop spent checking each answer against the fill's oracle, the bench's work
+    /// and not the engine's: the phase's rate and each operation's latency leave it out, as the
+    /// other engines' loops check nothing (db_bench's seekrandom and readrandom count the keys
+    /// found; splinter_bench.c compares a seek's first key alone).
+    checked: Duration,
 }
 
 impl Phase {
     fn report(&mut self, from: &Mark, to: &Mark) {
-        let seconds = to.at.duration_since(from.at).as_secs_f64();
+        let seconds = to
+            .at
+            .duration_since(from.at)
+            .saturating_sub(self.checked)
+            .as_secs_f64();
         // A log-linear histogram's bucket bounds: never below the latency, at most 2^-5 above it.
         let at = |ppm: u32| self.lat.quantile(ppm) as f64 / 1000.0;
         println!(
@@ -336,6 +345,11 @@ impl Phase {
             at(999_000),
             at(999_900),
             self.lat.max() as f64 / 1000.0
+        );
+        println!(
+            "{} oracle_check_s {:.6} outside the rate and latencies",
+            self.name,
+            self.checked.as_secs_f64()
         );
         costs(self.name, self.ops, from, to);
     }
@@ -440,7 +454,7 @@ impl Workload {
             Work::Get => ("readrandom", 2),
             Work::Seek(_) => ("seekrandom", 3),
         };
-        let (lat, found, rows) = std::thread::scope(|scope| {
+        let (lat, found, rows, checked) = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..self.threads)
                 .map(|thread| {
                     scope.spawn(move || {
@@ -454,6 +468,7 @@ impl Workload {
                         let mut expected = Vec::new();
                         let mut found = 0;
                         let mut rows = 0;
+                        let mut checked = Duration::ZERO;
                         for _ in 0..n {
                             let start = rng.next() % self.num;
                             let key = rocks_workload::key(start);
@@ -473,6 +488,7 @@ impl Workload {
                             let now = Instant::now();
                             lat.record(now.duration_since(last).as_nanos() as u64);
                             last = now;
+                            let checking = !matches!(work, Work::Fill);
                             let hit = match work {
                                 Work::Fill => hit,
                                 Work::Get => {
@@ -514,23 +530,30 @@ impl Workload {
                                 }
                             };
                             found += u64::from(hit);
+                            if checking {
+                                last = Instant::now();
+                                checked += last.duration_since(now);
+                            }
                         }
-                        Ok::<_, BenchError>((lat, found, rows))
+                        Ok::<_, BenchError>((lat, found, rows, checked))
                     })
                 })
                 .collect();
             let mut all = Histogram::new();
             let mut found = 0;
             let mut rows = 0;
+            // The threads check side by side: the phase's wall time holds the longest's checks.
+            let mut checked = Duration::ZERO;
             for handle in handles {
-                let (lat, hits, scanned) = handle
+                let (lat, hits, scanned, spent) = handle
                     .join()
                     .map_err(|_| io::Error::other("a benchmark client thread panicked"))??;
                 all.merge(&lat);
                 found += hits;
                 rows += scanned;
+                checked = checked.max(spent);
             }
-            Ok::<_, BenchError>((all, found, rows))
+            Ok::<_, BenchError>((all, found, rows, checked))
         })?;
         Ok(Phase {
             name,
@@ -538,6 +561,7 @@ impl Workload {
             found,
             rows,
             lat,
+            checked,
         })
     }
     /// The same oracle and reusable buffers, with the client task on the range's shard.
@@ -564,6 +588,7 @@ impl Workload {
         let mut expected = Vec::new();
         let mut found = 0;
         let mut rows = 0;
+        let mut checked = Duration::ZERO;
         for _ in 0..n {
             let start = rng.next() % self.num;
             let key = rocks_workload::key(start);
@@ -585,6 +610,7 @@ impl Workload {
             let now = Instant::now();
             lat.record(now.duration_since(last).as_nanos() as u64);
             last = now;
+            let checking = !matches!(work, Work::Fill);
             let hit = match work {
                 Work::Fill => hit,
                 Work::Get => {
@@ -626,6 +652,10 @@ impl Workload {
                 }
             };
             found += u64::from(hit);
+            if checking {
+                last = Instant::now();
+                checked += last.duration_since(now);
+            }
         }
         #[cfg(feature = "profile-phases")]
         println!("phasemono {name} end {}", mono_ns());
@@ -640,6 +670,7 @@ impl Workload {
             found,
             rows,
             lat: all,
+            checked,
         })
     }
 }

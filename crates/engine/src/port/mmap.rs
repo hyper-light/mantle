@@ -670,10 +670,11 @@ impl HugeZeroed {
         // the populate's faults take a free huge page where there is one and a base page where
         // not, while advised memory reclaims and compacts before each fault maps (the `defrag`
         // modes' `madvise`, the default; Documentation/admin-guide/mm/transhuge.rst). Beside 40 GiB
-        // another process held, a 100M fill's advised tables stalled in compaction 4,577 times
-        // and migrated 682 thousand pages, the shard's among them, which faulted again when next
-        // read (vmstat over the fill: compact_stall, pgmigrate_success; 3.6M faults against 1.5M
-        // quiet, docs/research/89 §1).
+        // another process held, a 100M fill's advised tables stalled in compaction 4,577 times,
+        // migrated 682 thousand of the process's pages, and fell back to base pages each time,
+        // a region mapped in 512 faults where its huge page took one (vmstat over the fill:
+        // compact_stall, thp_fault_fallback, pgmigrate_success; 3.6M faults against 1.5M quiet,
+        // docs/research/90 §1).
         if huge_pages_on_request() {
             // SAFETY: advises the whole mapping this value owns; the advice changes how the
             // kernel backs it, never its contents. Refused, the pages are the base size.

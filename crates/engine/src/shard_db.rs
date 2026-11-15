@@ -4326,7 +4326,7 @@ impl<F: BlockFile> ShardDb<F> {
             // of what they may hold, a share that falls with the machine's free memory, a 100M
             // index beside 40 GiB another process held split in two with every record still kept,
             // and 71% of gets probed both: 0.80-0.83x the gets of the same build quiet
-            // (docs/research/89 §2).
+            // (docs/research/90 §2).
             // The part back may hold more than it did when it went, and whatever took it back, a
             // get's tending or a maintenance step, leaves the regions and the kept memtables
             // within the budget.

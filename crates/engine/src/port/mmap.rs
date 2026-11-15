@@ -665,15 +665,26 @@ impl HugeZeroed {
         let Some(addr) = self.addr else {
             return;
         };
-        // SAFETY: advises the whole mapping this value owns; the advice changes how the kernel
-        // backs it, never its contents. Refused, the pages are the base size.
-        let _ = unsafe {
-            rustix::mm::madvise(
-                addr.as_ptr().cast(),
-                self.len,
-                rustix::mm::Advice::LinuxHugepage,
-            )
-        };
+        // Asked for only where the kernel gives huge pages to memory that asks alone, as a page
+        // buffer asks ([`PageBuf`]): where it gives them to all memory (`enabled` set to `always`),
+        // the populate's faults take a free huge page where there is one and a base page where
+        // not, while advised memory reclaims and compacts before each fault maps (the `defrag`
+        // modes' `madvise`, the default; Documentation/admin-guide/mm/transhuge.rst). Beside 40 GiB
+        // another process held, a 100M fill's advised tables stalled in compaction 4,577 times
+        // and migrated 682 thousand pages, the shard's among them, which faulted again when next
+        // read (vmstat over the fill: compact_stall, pgmigrate_success; 3.6M faults against 1.5M
+        // quiet, docs/research/89 §1).
+        if huge_pages_on_request() {
+            // SAFETY: advises the whole mapping this value owns; the advice changes how the
+            // kernel backs it, never its contents. Refused, the pages are the base size.
+            let _ = unsafe {
+                rustix::mm::madvise(
+                    addr.as_ptr().cast(),
+                    self.len,
+                    rustix::mm::Advice::LinuxHugepage,
+                )
+            };
+        }
         let step = huge_page_size().max(page_size()).max(1);
         let mut done = 0usize;
         while done < self.len {

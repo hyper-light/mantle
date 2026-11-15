@@ -552,7 +552,12 @@ deadline bounds held stretches on its own clock, remains open (research/77, D2 a
 This fix is on main at `17eb8032`; CI runs `41376146577` and `41376636492` passed every job,
 as did Windows rolling-stop stress run `41353171174`. The separate box workspace gate failed
 three engine `ranges_room` tests when their writers ran out of file descriptors; that gate did
-not reach the vendored suite. Descriptor limits were left unchanged.
+not reach the vendored suite. Descriptor limits were left unchanged. Since branch `shared-fds`
+(2026-11-15), a store's handles, the shard's, each maintenance worker's and each of the issuer's,
+transfer through one open file a segment (hyper-raft branch `shared-segment-fds`, research/91):
+those tests pass on the box at its container default of 2,048, `tests/shard_db_descriptors.rs`
+holds a store at one descriptor a segment whatever its workers, and a 100M fill completes at
+macOS's 10,240 and a Linux container's 2,048 (docs/measurements/2026-11-14-shared-segment-fds.md).
 On it the box's 20 GiB case (16 GB scope, load 39 to 74) acknowledged the native way's object
 in two runs, in 1,272 s and 2,268 s, with no `SlowDown`, and refused the CLI's and the native parts'
 typed, the volumes holding one object's three copies: exact as far as each ran, 2,581 blocks each on

@@ -136,10 +136,14 @@ impl BlockFile for BenchFile {
     }
 }
 
-/// The segments a range's file may have: the process's open-file limit over the handles each
-/// segment takes, the shard's own, one for each of the issuer's workers and one for each
-/// maintenance worker the host's cores allow.
-fn segment_bound(issuer_depth: usize) -> usize {
+/// The segments each of `ranges` files may have: the descriptors the process's open-file limit
+/// leaves past those it holds as the files are made, shared out evenly, less the one a growth
+/// holds while it writes a segment whole (hyper-block's `write_whole`). A segment takes one
+/// descriptor however many handles transfer through it, the shard's, each maintenance worker's
+/// and each of the issuer's (hyper-block `segmented`). Where the platform states no limit
+/// (Windows), the files are bounded by what the process can open. At least the base and one
+/// segment.
+fn segment_bound(ranges: usize) -> io::Result<usize> {
     #[cfg(unix)]
     let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile)
         .current
@@ -147,8 +151,13 @@ fn segment_bound(issuer_depth: usize) -> usize {
         .unwrap_or(usize::MAX);
     #[cfg(not(unix))]
     let limit = usize::MAX;
-    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    (limit / (1 + issuer_depth + cores)).max(2)
+    let held = hyper_measure::descriptors::open()?;
+    Ok(limit
+        .saturating_sub(held)
+        .checked_div(ranges.max(1))
+        .unwrap_or(0)
+        .saturating_sub(1)
+        .max(2))
 }
 
 // The allocation count is a diagnostic: compiled in only with the `count-allocs` feature, so a
@@ -1085,14 +1094,25 @@ fn main() -> Result<(), BenchError> {
     );
     let mut engines = Vec::new();
     let mut paths = Vec::new();
+    // Each range's segmented file's owner, which holds its open files: the shard and its workers
+    // transfer through handles of it, and it closes them once the ranges, the runtime and the
+    // issuer have stopped.
+    let mut owners = Vec::new();
+    let bound = segment_bound(usize::try_from(threads)?)?;
     for i in 0..threads {
         let path = dir.join(format!("range-{i}.store"));
         require(!path.exists(), "benchmark requires a fresh directory")?;
-        let bound = segment_bound(issuer_depth);
-        let file = if segments {
-            BenchFile::Segments(SegmentedFile::create(&path, caching, align, bound)?)
+        let (file, workers) = if segments {
+            let owner = SegmentedFile::create(&path, caching, align, bound)?;
+            let file = owner.try_clone()?;
+            let workers = owner.try_clone()?;
+            owners.push(owner);
+            (BenchFile::Segments(file), Some(workers))
         } else {
-            BenchFile::One(DeviceFile::open(&path, true, caching, align)?)
+            (
+                BenchFile::One(DeviceFile::open(&path, true, caching, align)?),
+                None,
+            )
         };
         let mut db = ShardDb::create(
             file,
@@ -1114,10 +1134,9 @@ fn main() -> Result<(), BenchError> {
         db.set_consolidation(consolidation);
         let worker_path = path.clone();
         db.set_workers(move || {
-            let file = if segments {
-                SegmentedFile::open(&worker_path, caching, align, bound).map(BenchFile::Segments)
-            } else {
-                DeviceFile::open(&worker_path, false, caching, align).map(BenchFile::One)
+            let file = match &workers {
+                Some(handle) => BlockFile::try_clone(handle).map(BenchFile::Segments),
+                None => DeviceFile::open(&worker_path, false, caching, align).map(BenchFile::One),
             };
             file.map_err(|error| mantle_engine::Error::Io {
                 op: "open a range benchmark worker",
@@ -1369,16 +1388,12 @@ fn main() -> Result<(), BenchError> {
     };
     let runtime_stats = runtime.shutdown()?;
     drop(issuer);
+    drop(owners);
     let stopped = Mark::now()?;
     // Cold reopen is after physical Stop/Runtime/Issuer retirement and never warms queries.
     for path in &paths {
         let file = if segments {
-            BenchFile::Segments(SegmentedFile::open(
-                path,
-                caching,
-                align,
-                segment_bound(issuer_depth),
-            )?)
+            BenchFile::Segments(SegmentedFile::open(path, caching, align, bound)?)
         } else {
             BenchFile::One(DeviceFile::open(path, false, caching, align)?)
         };

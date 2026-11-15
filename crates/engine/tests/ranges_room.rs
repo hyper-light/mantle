@@ -503,13 +503,15 @@ fn parks_and_goes_on(one_worker: bool) {
     // The writer's operations done, and where its run is past them: every guard is on it.
     let progress = Progress::new();
     let (done, step) = (progress.done, progress.step);
+    // The store's owner, declared before the runtime so it closes the segments' open files only
+    // after the runtime's teardown joins the workers transferring through them.
+    let owner = SegmentedFile::create(&path, CachingRequest::Buffered, align(), BOUND).unwrap();
     let issuer = Issuer::start_for(dir.path(), 2, 2).unwrap();
     let mut runtime = runtime();
     let shard = runtime.shard_ids()[0];
-    let created = SegmentedFile::create(&path, CachingRequest::Buffered, align(), BOUND).unwrap();
     let mut db = ShardDb::create(
         Grown {
-            file: created,
+            file: owner.try_clone().unwrap(),
             growths: None,
         },
         STORE,
@@ -523,9 +525,11 @@ fn parks_and_goes_on(one_worker: bool) {
         db.set_memory(2 * (issuer.depth() + 2) * run).unwrap();
     }
     db.attach(&issuer, issuer.depth()).unwrap();
-    let worker_path = path.clone();
+    // Each worker a handle of the store's open files, taking no descriptor of its own.
+    let workers = owner.try_clone().unwrap();
     db.set_workers(move || {
-        SegmentedFile::open(&worker_path, CachingRequest::Buffered, align(), BOUND)
+        workers
+            .try_clone()
             .map(|file| Grown {
                 file,
                 growths: Some(growths),
@@ -646,13 +650,15 @@ fn a_growth_that_fails_while_the_writer_waits_for_room_ends_the_range_in_its_fau
     // The writer's operations answered, and its stop: every guard is on it.
     let progress = Progress::new();
     let (done, step) = (progress.done, progress.step);
+    // The store's owner, declared before the runtime so it closes the segments' open files only
+    // after the runtime's teardown joins the workers transferring through them.
+    let owner = SegmentedFile::create(&path, CachingRequest::Buffered, align(), BOUND).unwrap();
     let issuer = Issuer::start_for(dir.path(), 2, 2).unwrap();
     let mut runtime = runtime();
     let shard = runtime.shard_ids()[0];
-    let created = SegmentedFile::create(&path, CachingRequest::Buffered, align(), BOUND).unwrap();
     let mut db = ShardDb::create(
         Grown {
-            file: created,
+            file: owner.try_clone().unwrap(),
             growths: None,
         },
         STORE,
@@ -661,9 +667,11 @@ fn a_growth_that_fails_while_the_writer_waits_for_room_ends_the_range_in_its_fau
     )
     .unwrap();
     db.attach(&issuer, issuer.depth()).unwrap();
-    let worker_path = path.clone();
+    // Each worker a handle of the store's open files, taking no descriptor of its own.
+    let workers = owner.try_clone().unwrap();
     db.set_workers(move || {
-        SegmentedFile::open(&worker_path, CachingRequest::Buffered, align(), BOUND)
+        workers
+            .try_clone()
             .map(|file| Grown {
                 file,
                 growths: Some(growths),

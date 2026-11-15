@@ -218,7 +218,12 @@ under load, at moderate load and saturated.
   asked, and a lead, the most the allocations took while a growth was due (research/48 §6). Reads
   made from memory keep one reclaim epoch for the whole file (research/46). Opened, the segments
   holding an extent ever handed out are admitted, and a segment past them, which a crash may have
-  left unwritten, is written whole again before use where segments are written whole.
+  left unwritten, is written whole again before use where segments are written whole. The file's
+  owner opens each segment once, and the shard, each maintenance worker and each of the issuer's
+  workers transfer through handles of it, which take no descriptor of their own: a store holds
+  one descriptor a segment whatever its workers, where each handle opening every segment again
+  held about 188 a segment on 32 cores; a flush through any handle covers every handle's writes
+  (research/91).
 
 ## 4. The tree: SplinterDB's size-tiered Bε-tree
 

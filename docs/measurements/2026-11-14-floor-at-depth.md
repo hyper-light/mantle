@@ -1,8 +1,10 @@
-# A node's floor at its device's measured depth, and the cells' probe budget on Windows (2026-11-14)
+# A node's floor at its device's measured depth, and the cells' waits on Windows (2026-11-14)
 
-Two CI failures, measured where they happened: the KIND cell's founder that refused to start at
-its threads (kind-cell job 131575146397, lean-doors `c33e5bf0`), and windows-x86_64's nodes that
-refused to start at their wake probe beside busy loops (14 of 86 runs on jupiter).
+Three CI failures, measured where they happened: the KIND cell's founder that refused to start at
+its threads (kind-cell job 131575146397, lean-doors `c33e5bf0`), windows-x86_64's nodes that
+refused to start at their wake probe beside busy loops (14 of 86 runs on jupiter), and the node
+suite's quiet watch after a kill on windows-x86_64 (7 of 80 on jupiter), which the release branch's
+`85de7ab4` answers by counting each wait's lateness as the host's hold.
 
 ## 1. The floor grows with the depth calibration measures
 
@@ -59,3 +61,44 @@ derives 59 samples at its platform's quantum each (93.75 ms on Windows). A round
 thread, which runs only once the busy loops on its core have taken their quanta; a 536 ms span holds
 none of that. Windows ends a 1 ms timed wait at its 15.625 ms clock tick, so on an idle Windows host a
 1 ms wait is late by most of a tick with no hold of the process at all.
+
+## 3. A 1 ms wait on Windows ends at the timer's tick, which 85de7ab4 counts as the host's hold
+
+`85de7ab4` (release) has the serve and node suites' quiet watch (tests/support/cell.rs) and the
+cluster suite's wait at most `HOLD_TICK`, 1 ms, at a time, and move the watch's end by each wait's
+lateness against its scheduled instant, as time the host held the watch's process. A timed wait on
+Windows ends at a tick of the system timer, and a process that asks for no finer resolution is not
+promised one: from Windows 10 2004 a resolution `timeBeginPeriod` asks for applies to the processes
+that ask, and the rest get no guarantee past the default, 15.625 ms (Microsoft's reference for
+`timeBeginPeriod`, Remarks). The watch's waits are std's `recv_timeout`, which asks for none (hyper-rt's
+own timers on Windows are high-resolution waitable timers, which change no other wait):
+
+| Host | Load | Timer (`NtQueryTimerResolution`) | A 1 ms `recv_timeout`'s lateness, 2,000 waits |
+|---|---|---|---|
+| windows-2025 runner (run 43678610491) | idle | | p50 14,668 µs, p90 14,908, p99 15,150 |
+| jupiter, Windows 11 25H2 (2026-11-15) | the Windows agent's 32 busy loops and a cell, CPU 100% | current 1.0 ms, coarsest 15.625 ms | normal priority: p50 6,810 µs, p90 14,842, p99 15,658, 23.55 s in all; time-critical, ahead of every loop: p50 10,045, p90 14,922, p99 15,767 |
+
+A thread at time-critical priority, which no busy loop delays, is no less late than one at normal
+priority: the lateness is the timer's granularity, not a hold of the process. Each wait spends 1 ms of
+the watch's quiet period and a tick of wall time, and the watch counts the rest as the host's. At the
+median lateness, on the idle runner the watch's end moves 14.7 ms for every 15.7 ms that pass, so the
+failing run's 11.24 s quiet period would end only after about 176 s with nothing moved; on jupiter
+after about 88 s (normal priority, 7.8 ms a wait) to 124 s (time-critical, 11.0 ms). That is the watch
+made eight to sixteen times longer, a longer timeout by another name (CLAUDE.md §3), whatever the cell
+did in that time, so a stall shorter than the stretched watch passes unexplained.
+
+The node suite's kill test beside 32 busy loops on windows-2025 runners (4 logical processors), the
+cells calibrated at the derived budget (§2), branch `ci-health-diag-win2`, run 43681023519, two jobs
+of 20 rounds a tree:
+
+| Tree | Rounds | Passed | Quiet after the kill | Wake probe refused |
+|---|---|---|---|---|
+| lean-doors `40a4f84e` and the derived budget (`12313070`) | 40 | 28 | 12 (4 and 8 a job), each "quiet for" 8.8 to 21.9 s | 0 |
+| the same and release's `76dac1b3`, `85de7ab4` | 40 | 40 | 0 | 0 |
+
+With `85de7ab4` no round failed: past the 12 of 40 without it, the chance of 40 clean rounds at that
+rate is 0.7^40, about 6 in ten million. What the table cannot say is which part of the stretched watch
+passed them: the time 32 loops on four processors truly held the watch, which holds the cell's nodes
+too, or the clock's ticks above. A watch that counts only lateness past the timer's granularity would
+tell the two apart.
+

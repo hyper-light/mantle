@@ -103,6 +103,8 @@ pub struct FlushStats {
     /// Gets of keys no kept memtable held, answered without the trunk while they held every
     /// record it does (research/51 §8).
     pub kept_absent: u64,
+    /// Gets that passed the kept memtables by, their probes not paying ([`crate::kept_pays`]).
+    pub kept_passed: u64,
     /// Puts whose trunk share waited for its input reads: the last memtable before a rotation
     /// would stall ([`ShardDb::put`]'s pacing).
     pub waited_steps: u64,
@@ -369,6 +371,10 @@ pub struct ShardDb<F: BlockFile> {
     /// every record the trunk does.
     kept_hits: u64,
     kept_absent: u64,
+    /// Whether a get's probe of the kept memtables pays, as measured ([`crate::kept_pays`]), and
+    /// the gets that passed them by.
+    kept_pays: crate::kept_pays::KeptPays,
+    kept_passed: u64,
     /// The page cache's refusals for want of the machine's memory at the last look: one since
     /// gives a kept memtable back.
     kept_refused: u64,
@@ -920,6 +926,8 @@ impl<F: BlockFile> ShardDb<F> {
             kept_bytes: 0,
             kept_hits: 0,
             kept_absent: 0,
+            kept_pays: crate::kept_pays::KeptPays::default(),
+            kept_passed: 0,
             kept_refused: 0,
             kept_step: 0,
             kept_seen: 0,
@@ -2691,23 +2699,43 @@ impl<F: BlockFile> ShardDb<F> {
             found = f.mem.get_hashed(key, hash, value)?;
         }
         // Then the kept memtables, packed but readable, newest first. When they hold every record
-        // the trunk does, a key none holds is held by none.
+        // the trunk does, a key none holds is held by none. Otherwise the trunk holds every record
+        // they do, so a get passes them by where their probes have not paid (`kept_pays`).
+        let mut pass = None;
         if found.is_none() && !self.kept.is_empty() {
             self.tend_kept()?;
-            match self.kept_get(key, hash, value)? {
-                KeptAnswer::Found(op) => {
-                    found = Some(op);
-                    self.kept_hits = self.kept_hits.saturating_add(1);
+            let (probe, sample) = if self.kept_whole {
+                (true, None)
+            } else {
+                let epoch = self.kept_epoch();
+                self.kept_pays.reach(epoch)
+            };
+            if probe {
+                let answer = self.kept_get(key, hash, value)?;
+                if !self.kept_whole {
+                    self.kept_pays
+                        .probed(matches!(answer, KeptAnswer::Found(_)), sample);
                 }
-                KeptAnswer::Absent if self.kept_whole => {
-                    self.kept_absent = self.kept_absent.saturating_add(1);
-                    value.clear();
-                    if self.kept_crowded() {
-                        self.fit_kept(false);
+                match answer {
+                    KeptAnswer::Found(op) => {
+                        found = Some(op);
+                        self.kept_hits = self.kept_hits.saturating_add(1);
                     }
-                    return Ok(false);
+                    KeptAnswer::Absent if self.kept_whole => {
+                        self.kept_absent = self.kept_absent.saturating_add(1);
+                        value.clear();
+                        if self.kept_crowded() {
+                            self.fit_kept(false);
+                        }
+                        return Ok(false);
+                    }
+                    KeptAnswer::Absent | KeptAnswer::Unknown => {}
                 }
-                KeptAnswer::Absent | KeptAnswer::Unknown => {}
+            } else {
+                self.kept_passed = self.kept_passed.saturating_add(1);
+            }
+            if found.is_none() && !self.kept_whole {
+                pass = self.kept_pays.pass();
             }
         }
         let mut ghost = false;
@@ -2718,6 +2746,9 @@ impl<F: BlockFile> ShardDb<F> {
                 crate::records::Lookup::Hit(cached) => {
                     value.clear();
                     value.extend_from_slice(cached);
+                    if let Some(sample) = pass {
+                        self.kept_pays.passed(sample);
+                    }
                     return Ok(true);
                 }
                 crate::records::Lookup::Miss { ghost: named } => ghost = named,
@@ -2735,6 +2766,9 @@ impl<F: BlockFile> ShardDb<F> {
                     r.insert(key, hash, value);
                 }
             }
+        }
+        if let Some(sample) = pass {
+            self.kept_pays.passed(sample);
         }
         // The get may have grown the caches: the kept memtables give way before it returns.
         if self.kept_crowded() {
@@ -2768,23 +2802,43 @@ impl<F: BlockFile> ShardDb<F> {
             found = f.mem.get_hashed(key, hash, value)?;
         }
         // Then the kept memtables, packed but readable, newest first. When they hold every record
-        // the trunk does, a key none holds is held by none.
+        // the trunk does, a key none holds is held by none. Otherwise the trunk holds every record
+        // they do, so a get passes them by where their probes have not paid (`kept_pays`).
+        let mut pass = None;
         if found.is_none() && !self.kept.is_empty() {
             self.tend_kept()?;
-            match self.kept_get(key, hash, value)? {
-                KeptAnswer::Found(op) => {
-                    found = Some(op);
-                    self.kept_hits = self.kept_hits.saturating_add(1);
+            let (probe, sample) = if self.kept_whole {
+                (true, None)
+            } else {
+                let epoch = self.kept_epoch();
+                self.kept_pays.reach(epoch)
+            };
+            if probe {
+                let answer = self.kept_get(key, hash, value)?;
+                if !self.kept_whole {
+                    self.kept_pays
+                        .probed(matches!(answer, KeptAnswer::Found(_)), sample);
                 }
-                KeptAnswer::Absent if self.kept_whole => {
-                    self.kept_absent = self.kept_absent.saturating_add(1);
-                    value.clear();
-                    if self.kept_crowded() {
-                        self.fit_kept(false);
+                match answer {
+                    KeptAnswer::Found(op) => {
+                        found = Some(op);
+                        self.kept_hits = self.kept_hits.saturating_add(1);
                     }
-                    return Ok(false);
+                    KeptAnswer::Absent if self.kept_whole => {
+                        self.kept_absent = self.kept_absent.saturating_add(1);
+                        value.clear();
+                        if self.kept_crowded() {
+                            self.fit_kept(false);
+                        }
+                        return Ok(false);
+                    }
+                    KeptAnswer::Absent | KeptAnswer::Unknown => {}
                 }
-                KeptAnswer::Absent | KeptAnswer::Unknown => {}
+            } else {
+                self.kept_passed = self.kept_passed.saturating_add(1);
+            }
+            if found.is_none() && !self.kept_whole {
+                pass = self.kept_pays.pass();
             }
         }
         let mut ghost = false;
@@ -2795,6 +2849,9 @@ impl<F: BlockFile> ShardDb<F> {
                 crate::records::Lookup::Hit(cached) => {
                     value.clear();
                     value.extend_from_slice(cached);
+                    if let Some(sample) = pass {
+                        self.kept_pays.passed(sample);
+                    }
                     return Ok(true);
                 }
                 crate::records::Lookup::Miss { ghost: named } => ghost = named,
@@ -2815,6 +2872,9 @@ impl<F: BlockFile> ShardDb<F> {
                     r.insert(key, hash, value);
                 }
             }
+        }
+        if let Some(sample) = pass {
+            self.kept_pays.passed(sample);
         }
         // The get may have grown the caches: the kept memtables give way before it returns.
         if self.kept_crowded() {
@@ -4580,6 +4640,17 @@ impl<F: BlockFile> ShardDb<F> {
     /// itself where the key's hash points (research/63), unknown while the part is out. With
     /// memtables to probe, every probe's first line is read before any is probed, their misses
     /// overlapped.
+    /// The kept memtables as a get finds them, for [`crate::kept_pays`]: the next memtable to be
+    /// kept, the oldest kept, and the index's closed generations. A memtable kept or given back,
+    /// or a generation closed or given back, changes what a probe answers and starts a new epoch.
+    fn kept_epoch(&self) -> (u32, Option<u32>, usize) {
+        (
+            self.kept_next,
+            self.kept.front().map(|k| k.number),
+            self.kept_gens.len(),
+        )
+    }
+
     fn kept_get(&self, key: &[u8], hash: u64, value: &mut Vec<u8>) -> Result<KeptAnswer, Error> {
         let hash32 = crate::branch::filter::hash32(hash);
         let index = self.kept_index.as_ref();
@@ -5586,6 +5657,7 @@ impl<F: BlockFile> ShardDb<F> {
         flush.kept_bytes = as_u64(self.kept_held());
         flush.kept_hits = self.kept_hits;
         flush.kept_absent = self.kept_absent;
+        flush.kept_passed = self.kept_passed;
         // Covered: every part holds its records.
         let covered = self.kept_covers_all();
         flush.kept_generations = as_u64(self.kept_gens.len());

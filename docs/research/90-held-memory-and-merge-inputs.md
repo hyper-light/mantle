@@ -10,7 +10,8 @@ perf's samples of CPU time and of page faults (one in eight) over each phase, an
 build `g17-fin-diag` (fin with counters of where each compaction's inputs lie as it goes out, and of
 each get's kept-index probes; never merged). "Held" is a second container holding 40 GiB of
 anonymous memory, touched, for the whole case; "quiet" is the same case without it. Sources: [1]
-the kernel's `Documentation/admin-guide/mm/transhuge.rst`; [2] proc(5) on `/proc/vmstat`; the
+the kernel's `Documentation/admin-guide/mm/transhuge.rst`, whose "Monitoring usage" section names
+the `/proc/vmstat` counters read here; [2] and [3], the two papers §6 rests on, listed there; the
 rest is mantle's code at the commits named.
 
 ## 1. Huge pages asked for beside held memory
@@ -94,3 +95,35 @@ point's, its A/A 1.02x [0.96-1.08] and 0.99x [0.93-1.04]; 10-20's own build meas
 and 2.46x [2.15-2.92] SplinterDB's in the same rounds. Mantle's 1M gets are 4.71M and 4.89M a
 second, at or above 10-19's 4.78M; SplinterDB's are 1.78M and 1.87M, above its 1.74M then. The
 ratio fell because SplinterDB's rate in this VM rose, not because mantle's fell.
+
+## 6. A probe of the kept memtables that does not pay
+
+A memtable is kept, readable for gets, only once its branch is in the trunk, so every record the
+kept memtables hold the trunk holds too, and a get may pass them by. Under the equal cap at 100M
+they answered 0 to 4.6% of a phase's 1,000,000 gets (final gate, fin `d53dad11`, six rounds:
+29,825, 46,056, 18,757, 0, 46,056 and 46,056 kept hits) while their index's probe took 12.7% of
+the shard thread's samples over the gets (D3, capped: `RecordTable::get` 9.96%, `holds` 2.72%).
+Uncapped at 100M, and at 10M and 1M, they answered every get of a key that exists (630,158 to
+632,247 of 1,000,000, the 63.2% that exist). So whether the probe pays is a property of the
+memory the kept memtables have against the data, which differs by the case and changes as they
+are kept and given back, and no share can be fixed in advance.
+
+A probe pays when `p · s ≥ c`: `p` the share of probes the kept memtables answer, `s` what a get
+spends past them when they do not answer (the record cache and the trunk), `c` what a probe
+takes. `crate::kept_pays` measures all three over an epoch, the kept memtables as they are (a
+memtable kept or given back, or an index generation closed or given back, starts the next), and
+probes while the measured mean pays. Where it does not, a get still probes while UCB1's bound
+does, `p̂ + √(2 ln t / n)` over the epoch's `t` gets and `n` probes [2, Fig. 1], which probes
+`O(ln t)` times [2, Theorem 1], the order no rule can beat [3], so a rise in what the kept
+memtables answer is found and a probe that never pays costs a vanishing share of gets. The clock
+is read only when the epoch's count of probes or passes reaches a power of two, its readings
+logarithmic in the gets as the probes are, and each sample has the clock's own cost, read beside
+it, taken out. A pass that waits on the device is timed with its wait, so where gets read the
+device `s` is a get's latency more than the shard's time, and the rule leans to probing, as every
+get did before it; in the capped 100M gets above, every page a get read was in the cache (D3: 580,341
+cache hits, no device read). Where the kept memtables hold every record the trunk does, a probe
+always answers, found or absent, and no rule is asked.
+
+[2] P. Auer, N. Cesa-Bianchi and P. Fischer, "Finite-time analysis of the multiarmed bandit
+problem", Machine Learning 47 (2002) 235-256. [3] T. L. Lai and H. Robbins, "Asymptotically
+efficient adaptive allocation rules", Advances in Applied Mathematics 6 (1985) 4-22.

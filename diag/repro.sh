@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # DIAGNOSTIC (diag-nfc2): a closed ladder of 1-byte PUTs through both doors, traced.
-# repro.sh BIN NAME [extra bench flags]: runs in ~/nfc2/runs/NAME (which must not exist).
+# repro.sh BIN NAME [extra bench flags]: runs in ${TOP:-~/nfc2/runs}/NAME (which must not exist).
 set -u -o pipefail
 bin=$1; name=$2; shift 2
-top=$HOME/nfc2/runs
+top=${TOP:-$HOME/nfc2/runs}
 dir=$top/$name
 mkdir -p "$top"
 if [ -e "$dir" ]; then echo "$dir exists"; exit 1; fi

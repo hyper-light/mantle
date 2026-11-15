@@ -87,7 +87,7 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `f923297` (hyper-raft branch `land/mantle-general-3`, on `main`'s `045cf3f`),
+**Every crate at `ba33c1e` (hyper-raft branch `land/mantle-general-3`, on `main`'s `045cf3f`),
 with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. It is the landing candidate of
 mantle's general changes to the shared crates, which goes to hyper-raft `main` once hyper-raft's
 gates and every consumer's suite pass on it: `doors-wire-bytes` (`33733b5`) and `doors-step8`
@@ -98,9 +98,11 @@ not fit waiting while a frame of nothing frees the emptied segments (`8ac0ca5`, 
 `97b2a21`); hyper-block's one open file a segment whatever the handles, discovery leaving a segment
 its own file is adding to that add (`93dc717`, `774c52f`), a device issuer's depth held by the
 kernel on one thread with its lanes sharing one descriptor of each file attached (`81467a8`,
-`5b4680e`, `e887733`), and Linux's thread count leaving out an exiting thread (`3452770`); and
-hyper-transport's owner's end waiting for the head of a reply it gave whole (`31aa800`). Before it,
-every crate was at `294678c`, and before that at `c97fb1a` (hyper-raft branch `doors-step8`:
+`5b4680e`, `e887733`), Linux's thread count leaving out an exiting thread (`3452770`), and a file
+on tmpfs opened buffered whatever is asked, as tmpfs makes every transfer through the page cache
+(`ba33c1e`); and hyper-transport's owner's end waiting for the head of a reply it gave whole
+(`31aa800`). Before it, every crate was at `f923297`, the same but for `ba33c1e`, then at
+`294678c`, and before that at `c97fb1a` (hyper-raft branch `doors-step8`:
 `doors-wire-bytes`'s `33733b5` and one commit), with no local delta. That commit changes
 hyper-transport alone: no endpoint offers to take QUIC DATAGRAM frames (`Limits::transport` sets
 `datagram_receive_buffer_size` to `None`, so no connection sends `max_datagram_frame_size`, RFC

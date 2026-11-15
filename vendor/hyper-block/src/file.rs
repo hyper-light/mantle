@@ -151,17 +151,20 @@ impl DeviceFile {
             move |source| DiskError::Io { op, path, source }
         };
         let overlapped = sys::overlapped(path, shared);
-        let (file, caching, align) = match request {
+        let direct = match request {
             CachingRequest::PreferDirect => match sys::open_direct(path, create, overlapped) {
-                Ok(file) => (file, Caching::Direct, align),
-                Err(e) if sys::refuses_direct(&e) => (
-                    sys::open_buffered(path, create, overlapped).map_err(wrap("open"))?,
-                    Caching::Buffered,
-                    Alignment::BYTE,
-                ),
+                // A file system that keeps every page in memory takes no transfer past it, direct
+                // or not (`sys::in_memory`): its handle is buffered, as it reads from memory.
+                Ok(file) if sys::in_memory(&file) => None,
+                Ok(file) => Some(file),
+                Err(e) if sys::refuses_direct(&e) => None,
                 Err(e) => return Err(wrap("open")(e)),
             },
-            CachingRequest::Buffered => (
+            CachingRequest::Buffered => None,
+        };
+        let (file, caching, align) = match direct {
+            Some(file) => (file, Caching::Direct, align),
+            None => (
                 sys::open_buffered(path, create, overlapped).map_err(wrap("open"))?,
                 Caching::Buffered,
                 Alignment::BYTE,
@@ -873,6 +876,26 @@ mod sys {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     const BTRFS_SUPER_MAGIC: i128 = 0x9123_683E;
 
+    /// tmpfs's statfs(2) `f_type` (include/uapi/linux/magic.h, `TMPFS_MAGIC`).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const TMPFS_MAGIC: i128 = 0x0102_1994;
+
+    /// Whether the file's file system keeps every page in memory: tmpfs, which "keeps all of its
+    /// files in virtual memory" (Documentation/filesystems/tmpfs.rst). It has taken O_DIRECT since
+    /// Linux 6.6 ("tmpfs: trivial support for direct IO") with every transfer still made through
+    /// the page cache: a page written through a direct handle reads resident at once (mincore(2)
+    /// on /tmp, CachyOS 7.3.3, 2026-11-15). A file system that does not answer is taken not to.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(super) fn in_memory(file: &File) -> bool {
+        rustix::fs::fstatfs(file).is_ok_and(|s| i128::from(s.f_type) == TMPFS_MAGIC)
+    }
+
+    /// Elsewhere a handle the file system takes direct transfers on makes them past its cache.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub(super) fn in_memory(_file: &File) -> bool {
+        false
+    }
+
     /// Whether the file's file system journals its allocation ([`super::journals_allocation`]),
     /// by its statfs(2) `f_type`; a file system that does not answer is taken not to.
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1057,6 +1080,11 @@ mod sys {
 
     /// NTFS was not measured to pay for the zeros: none are written.
     pub(super) fn journals_allocation(_file: &File) -> bool {
+        false
+    }
+
+    /// A handle Windows opens without buffering makes its transfers past the cache.
+    pub(super) fn in_memory(_file: &File) -> bool {
         false
     }
 
@@ -1495,5 +1523,27 @@ mod tests {
             let mut buf = vec![0u8; 4096];
             assert!(!file.read_resident_at(&mut buf, 0).unwrap());
         }
+    }
+
+    /// Do: open a file asking for direct transfers on /dev/shm, where it is a tmpfs, as on every
+    /// Linux distribution's default mounts. Expect: the handle is buffered, as tmpfs makes every
+    /// transfer through the page cache whatever it takes (`sys::in_memory`); a host whose
+    /// /dev/shm is no tmpfs has none to open here.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_file_on_tmpfs_is_buffered_whatever_is_asked() {
+        let shm = Path::new("/dev/shm");
+        if !rustix::fs::statfs(shm).is_ok_and(|s| i128::from(s.f_type) == 0x0102_1994) {
+            return;
+        }
+        let dir = tempfile::tempdir_in(shm).unwrap();
+        let file = DeviceFile::open(
+            &dir.path().join("in-memory"),
+            true,
+            CachingRequest::PreferDirect,
+            align(),
+        )
+        .unwrap();
+        assert_eq!(file.caching(), Caching::Buffered);
     }
 }

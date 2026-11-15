@@ -107,7 +107,6 @@ rules.max_answers = 16
 rules.max_answer_bytes = 18446744073709551615
 rules.expiries_per_entry = 8
 log.segment_bytes = 65536
-log.max_segments = 64
 log.group_cache = 4096
 log.queue_submissions = 16
 log.waits = measured
@@ -119,6 +118,36 @@ runtime.probe_budget_ms = 40
 stop_ms = 10000
 chunk_bytes = 8388608
 ";
+
+/// The log's segments, a segment's length (`log.segment_bytes` above), and what each of its groups
+/// retains at most: the configuration's `log.max_segments`, `log.group_entries` and
+/// `log.group_bytes`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NodeLog {
+    pub(crate) max_segments: u64,
+    pub(crate) group_entries: u64,
+    pub(crate) group_bytes: u64,
+}
+
+/// The log most cells run: 64 segments, its groups bound by [`GROUP_ENTRIES`] and [`GROUP_BYTES`],
+/// which compaction frees long before the file fills.
+pub(crate) const STATED_LOG: NodeLog = NodeLog {
+    max_segments: 64,
+    group_entries: GROUP_ENTRIES,
+    group_bytes: GROUP_BYTES,
+};
+
+/// The bytes of a segment of the stated log (`log.segment_bytes` above).
+pub(crate) const LOG_SEGMENT: u64 = 65_536;
+
+/// hyper-log's least file, three segments, its groups bound by what the file holds, every byte of
+/// it a group's: the file refuses writes for room (`Full`) before any group's own bound
+/// (`Backlog`), and the nodes compact only then (node.md §6.2).
+pub(crate) const LEAST_LOG: NodeLog = NodeLog {
+    max_segments: 3,
+    group_entries: 4 * LOG_SEGMENT,
+    group_bytes: 4 * LOG_SEGMENT,
+};
 
 /// The largest chunk the cell's gateways write (`chunk_bytes` above): `mantle_gateway::layout::CHUNK`,
 /// Tectonic's 8 MiB.
@@ -365,6 +394,10 @@ pub(crate) enum Line {
     /// The node's log as it said with its last status: how long its flush had been out, if one
     /// was, and the longest an update has waited for its commit.
     Log(Option<Duration>, Duration),
+    /// The log's refusals for room as the node said them as they moved: its rounds of compaction,
+    /// each asked when the log refused a write for room, and the liveness stream's writes the log
+    /// refused for room.
+    Room(u64, u64),
     /// A volume the node holds.
     Volume(u128),
     /// The S3 endpoint a node read its keys for: where it listens, the region it serves and its
@@ -464,6 +497,9 @@ pub(crate) fn parse(line: &str) -> Option<Line> {
             bytes.parse().ok()?,
             Duration::from_nanos(serve.parse().ok()?),
         )),
+        ["room", compactions, waits] => {
+            Some(Line::Room(compactions.parse().ok()?, waits.parse().ok()?))
+        }
         ["log", flushing, longest] => {
             let flushing = Duration::from_nanos(flushing.parse().ok()?);
             let flushing = if flushing.is_zero() {
@@ -521,6 +557,7 @@ pub(crate) fn movement(line: &Line) -> Option<(u64, u64, u64, u64, Duration, Dur
         | Line::Replaced(..)
         | Line::Link(..)
         | Line::Log(..)
+        | Line::Room(..)
         | Line::Held(..)
         | Line::Volume(..)
         | Line::S3(..)
@@ -566,6 +603,8 @@ pub(crate) struct Pki {
     /// Whether the nodes run as `mantle serve`, whose range settings they derive, which the
     /// clients' message bounds follow.
     pub(crate) serving: bool,
+    /// The log each `mantle node` runs with.
+    pub(crate) log: NodeLog,
 }
 
 impl Pki {
@@ -626,6 +665,7 @@ impl Pki {
             gateway: (c, certificate, pkcs8),
             root_key: root_key(dir),
             serving: false,
+            log: STATED_LOG,
         }
     }
 
@@ -670,7 +710,7 @@ impl Pki {
         let mut text = format!(
             "id = {id}\ndir = {}\nquic = 127.0.0.1:0\nplane = 127.0.0.1:0\nauthority = {}\n\
              certificate = {}\nkey = {}\nvoters = {}\n\
-             transport_bytes = {}\nlog.group_entries = {GROUP_ENTRIES}\nlog.group_bytes = {GROUP_BYTES}\n\
+             transport_bytes = {}\nlog.max_segments = {}\nlog.group_entries = {}\nlog.group_bytes = {}\n\
              engine.page_size = {STORE_PAGE}\nengine.memtable_bytes = {MEMTABLE}\n\
              rules.max_key_bytes = {held}\nrules.max_value_bytes = {held}\n{STATED}",
             dir.display(),
@@ -679,6 +719,9 @@ impl Pki {
             key.display(),
             voters.join(","),
             peers * 4 * hyper_transport::RECEIVE_CHUNK,
+            self.log.max_segments,
+            self.log.group_entries,
+            self.log.group_bytes,
         );
         for (group, layer) in ranges {
             text.push_str(&format!("range = {group:x} {layer}\n"));
@@ -890,6 +933,9 @@ pub(crate) struct Cell {
     /// Each node's log as it last said, and when that was heard: its flush out, if one was, and the
     /// longest an update has waited for its commit.
     pub(crate) log: BTreeMap<u64, (Instant, Option<Duration>, Duration)>,
+    /// Each running node's log refusals for room as its process last said them: its rounds of
+    /// compaction and its liveness stream's waits.
+    pub(crate) room: BTreeMap<u64, (u64, u64)>,
     /// The bytes each node's transfers moved as it last said, and its transport's serve period: a
     /// transfer that lives moves within one, so the quiet period is never shorter.
     pub(crate) transfers: BTreeMap<u64, (u64, Duration)>,
@@ -1031,6 +1077,23 @@ impl Cell {
             gateway: true,
             serving: false,
         })
+    }
+
+    /// A cell of `nodes` nodes hosting a range of each layer, each keeping a volume, hosting
+    /// objects and running with `log`.
+    pub(crate) fn gateways_on(nodes: u64, log: NodeLog) -> Self {
+        Self::shaped_logged(
+            Shape {
+                voters: nodes,
+                spares: 0,
+                network: Network::Direct,
+                stored: true,
+                ranges: EVERY_LAYER,
+                gateway: true,
+                serving: false,
+            },
+            log,
+        )
     }
 
     /// A cell of `nodes` nodes run as `mantle serve` from their operators' statements alone,
@@ -1182,6 +1245,7 @@ impl Cell {
             gateway: (gateway_file, certificate, pkcs8),
             root_key: founders[0].1.join("keys").join("1"),
             serving: true,
+            log: STATED_LOG,
         };
         let (tell, heard) = channel();
         let mut cell = Self {
@@ -1198,6 +1262,7 @@ impl Cell {
             replaced: BTreeSet::new(),
             links: BTreeMap::new(),
             log: BTreeMap::new(),
+            room: BTreeMap::new(),
             transfers: BTreeMap::new(),
             relay: (network == Network::Relayed)
                 .then(|| Relay::start(&founders.iter().map(|(id, _)| *id).collect::<Vec<_>>())),
@@ -1293,6 +1358,11 @@ impl Cell {
 
     /// A cell of `shape`'s voters, each told where the others listen.
     pub(crate) fn shaped(shape: Shape) -> Self {
+        Self::shaped_logged(shape, STATED_LOG)
+    }
+
+    /// A cell of `shape`'s voters, each running with `log`, each told where the others listen.
+    pub(crate) fn shaped_logged(shape: Shape, log: NodeLog) -> Self {
         let Shape {
             voters,
             spares,
@@ -1306,6 +1376,7 @@ impl Cell {
         let root = tempfile::tempdir().unwrap();
         let mut pki = Pki::new(root.path(), voters, nodes);
         pki.serving = serving;
+        pki.log = log;
         let dirs = (1..=nodes)
             .map(|id| {
                 let dir = root.path().join(format!("n{id}"));
@@ -1328,6 +1399,7 @@ impl Cell {
             replaced: BTreeSet::new(),
             links: BTreeMap::new(),
             log: BTreeMap::new(),
+            room: BTreeMap::new(),
             transfers: BTreeMap::new(),
             relay: (network == Network::Relayed)
                 .then(|| Relay::start(&(1..=nodes).collect::<Vec<_>>())),
@@ -1565,6 +1637,7 @@ impl Cell {
         self.status.retain(|(node, _), _| *node != id);
         self.held.remove(&id);
         self.log.remove(&id);
+        self.room.remove(&id);
         self.transfers.remove(&id);
         self.hold();
     }
@@ -1587,6 +1660,7 @@ impl Cell {
                 | Line::Replaced(..)
                 | Line::Link(..)
                 | Line::Log(..)
+                | Line::Room(..)
                 | Line::Held(..)
                 | Line::Volume(..)
                 | Line::S3(..)
@@ -1695,8 +1769,8 @@ impl Cell {
                 Ok(heard) => self.take(heard),
                 Err(_) => panic!(
                     "quiet for {quiet:?} with nothing moved, besides {:?} held still for the \
-                     devices: {:?}, progress {:?}, links {:?}, log {:?}",
-                    self.held_for, self.status, self.progress, self.links, self.log
+                     devices: {:?}, progress {:?}, links {:?}, log {:?}, room {:?}",
+                    self.held_for, self.status, self.progress, self.links, self.log, self.room
                 ),
             }
         }
@@ -1760,6 +1834,13 @@ impl Cell {
                         self.log.insert(id, (Instant::now(), flushing, longest));
                         return;
                     }
+                    // A refusal for room moves nothing, and a round of compaction moves the cell
+                    // only as its ranges apply and write again, which their statuses say: a node
+                    // whose log refuses every write may count refusals for good.
+                    Line::Room(compactions, waits) => {
+                        self.room.insert(id, (compactions, waits));
+                        return;
+                    }
                     Line::Volume(volume) => {
                         self.volumes.insert(id, volume);
                     }
@@ -1821,6 +1902,7 @@ impl Cell {
                     self.status.retain(|(node, _), _| *node != id);
                     self.held.remove(&id);
                     self.log.remove(&id);
+                    self.room.remove(&id);
                     self.transfers.remove(&id);
                 }
             }

@@ -116,15 +116,31 @@ fn run(seed: u64) -> (Vec<(u64, Part)>, u64) {
     (parts, applied)
 }
 
-/// A log of four segments, its groups bound only by what the file holds: the clients' puts fill
-/// the file again and again, so the ranges' writes are refused for room (`LogError::Full`), and a
-/// power cut finds it full of records its engine applied and did not yet make durable. One segment
-/// more than hyper-log takes at least: at three, a leader stalled for room with nothing left to
-/// compact cannot free its file and never rejoins
-/// (docs/measurements/2026-11-07-full-log-restart.md).
+/// The seeds a test runs: `MANTLE_NODE_SIM_SEEDS` of them from `MANTLE_NODE_SIM_SEED` (1 where
+/// unset) where the first is set, else `default`.
+fn seeds(default: &[u64]) -> Vec<u64> {
+    let count = std::env::var("MANTLE_NODE_SIM_SEEDS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok());
+    let first = std::env::var("MANTLE_NODE_SIM_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1u64);
+    match count {
+        Some(count) => (first..first + count).collect(),
+        None => default.to_vec(),
+    }
+}
+
+/// A log of three segments, hyper-log's least, its groups bound only by what the file holds: the
+/// clients' puts fill the file again and again, so the ranges' writes are refused for room
+/// (`LogError::Full`), and a power cut finds it full of records its engine applied and did not yet
+/// make durable. Here the log once answered `Full` for good after its groups compacted, a leader's
+/// range held still with nothing left to wait for, on 41 of seeds 1-100
+/// (docs/measurements/2026-11-14-log-full-wedge.md); the test ran four segments meanwhile.
 fn tight_log() -> LogConfig {
     LogConfig {
-        max_segments: 4,
+        max_segments: 3,
         group_entries: 1 << 20,
         group_bytes: 1 << 30,
         ..log_config()
@@ -138,8 +154,9 @@ fn tight_log() -> LogConfig {
 /// `a_liveness_write_the_log_refuses_for_room_is_owed_and_the_node_goes_on`.
 #[test]
 fn a_node_whose_log_fills_with_live_records_waits_for_its_ranges_to_compact_and_starts_again() {
-    // Seed 10 fenced a node before a compaction waited for the writes out (the measurement).
-    for seed in [1u64, 2, 10] {
+    // Seed 10 fenced a node before a compaction waited for the writes out (the measurement), and
+    // seeds 7, 10 and 11 wedged a leader's log at three segments (2026-11-14's).
+    for seed in seeds(&[1, 2, 7, 10, 11]) {
         let mut cell = Sim::with(seed, SETTINGS, tight_log());
         let leader = cell.leader();
         cell.open_bucket();
@@ -221,15 +238,7 @@ fn a_liveness_write_the_log_refuses_for_room_is_owed_and_the_node_goes_on() {
 #[test]
 fn a_cells_histories_through_cuts_power_cuts_and_device_faults_are_linearizable_and_a_seed_replays()
 {
-    let seeds = std::env::var("MANTLE_NODE_SIM_SEEDS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(SEEDS);
-    let first = std::env::var("MANTLE_NODE_SIM_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1u64);
-    for seed in first..first + seeds {
+    for seed in seeds(&(1..=SEEDS).collect::<Vec<_>>()) {
         let once = run(seed);
         let again = run(seed);
         assert_eq!(

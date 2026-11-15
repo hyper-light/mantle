@@ -1622,7 +1622,7 @@ fn store_path(dir: &Path, group: u128) -> PathBuf {
 }
 
 /// The machine's calibration record's file in the node's directory (node.md §1.6).
-const CALIBRATION: &str = "calibration";
+pub const CALIBRATION: &str = "calibration";
 
 /// The longest calibration record: hyper-rt's layout (`hyper_rt::machine::record`) of 137 bytes
 /// beside its key, at most `MAX_KEY` long: magic 8, version 2, key length 2, measured at 8, the

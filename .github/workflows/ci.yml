@@ -1,139 +1,41 @@
-name: gates
+# DIAG (ci-health, never merged): the node test's quiet watch after a kill on windows-x86_64 beside 32
+# busy loops, the cells' nodes calibrated at the budget a node derives (12313070), with the release's
+# 76dac1b3 and 85de7ab4, its watch counting only lateness past the timer's coarsest resolution.
+name: diag-windows-quiet
 on:
   push:
-  pull_request:
 permissions:
   contents: read
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: "1"
 jobs:
-  dependencies:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - name: Install pinned Rust
-        run: rustup toolchain install 1.98.1 --profile minimal
-      - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
-      - name: Audit dependencies
-        run: cargo deny check advisories bans licenses sources
-
-  gates:
+  node:
+    name: node-${{ matrix.tree }}-${{ matrix.part }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { name: linux-x86_64, runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
-          - { name: linux-aarch64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
-          - { name: macos-aarch64, runner: macos-15, target: aarch64-apple-darwin }
-          # Built on Apple silicon and run under Rosetta 2.
-          - { name: macos-x86_64, runner: macos-15, target: x86_64-apple-darwin }
-          - { name: windows-x86_64, runner: windows-2025, target: x86_64-pc-windows-msvc }
-          - { name: windows-aarch64, runner: windows-11-arm, target: aarch64-pc-windows-msvc }
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
+        tree: [granular]
+        part: [1, 2]
+    runs-on: windows-2025
+    timeout-minutes: 340
     steps:
       - uses: actions/checkout@v7.0.1
-      - name: Install pinned Rust
+        with:
+          fetch-depth: 0
+      - name: The tree
         shell: bash
         run: |
-          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
-          rustup target add --toolchain 1.98.1 ${{ matrix.target }}
-      # AWS-LC's x86_64 Windows assembly is NASM source, built rather than taken prebuilt
-      # (vendor/UPSTREAM.md).
-      - name: Install NASM
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        uses: ilammy/setup-nasm@v1.5.2
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-          workspaces: |
-            .
-            vendor
-      - name: Source contracts
-        run: python3 scripts/check-contracts.py --known scripts/arbitrary-open.txt
-      - name: Formatting
-        run: cargo fmt --all --check
-      - name: Lints
-        run: cargo clippy --workspace --all-targets --all-features --locked --target ${{ matrix.target }} -- -D warnings
-      - name: Production panic policy
-        shell: bash
-        run: bash scripts/check-production.sh --target ${{ matrix.target }}
-      # The stock S3 clients the suite in crates/mantle/tests/stock_clients.rs runs against a cell:
-      # the AWS CLI v2 (AWS's installer where the image lacks it) and boto3 pinned with every hash,
-      # test tools the owner approved (2026-10-25).
-      - name: Stock S3 clients
-        shell: bash
-        run: bash scripts/stock-clients.sh
-      - name: Tests
-        run: cargo test --workspace --locked --target ${{ matrix.target }}
-      - name: Vendored crates' suites
-        run: cargo test --manifest-path vendor/Cargo.toml --workspace --locked --target ${{ matrix.target }}
-      - name: Release build
-        run: cargo build --release --workspace --locked --target ${{ matrix.target }}
-
-  # The same suites on a small, busy host as on a large, idle one: built with every CPU, then
-  # run on the CPUs named alone, beside busy loops they did not start.
-  # std::thread::available_parallelism follows the affinity mask (sched_getaffinity(2)), so the
-  # engine's worker pools and the test harness size themselves to that host
-  # (scripts/linux-test.sh runs the same locally: CPUS, HOGS).
-  constrained:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { name: linux-x86_64-2cpu-busy, runner: ubuntu-24.04, cpus: "0-1", hogs: 2 }
-          - { name: linux-aarch64-1cpu, runner: ubuntu-24.04-arm, cpus: "0", hogs: 0 }
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v7.0.1
+          git config user.email diag@example.com; git config user.name diag
+          cp scripts/diag-win-loop.sh "$RUNNER_TEMP/diag-win-loop.sh"
+          git log --oneline -4
       - name: Install pinned Rust
+        shell: bash
         run: rustup toolchain install 1.98.1 --profile minimal
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.name }}
-          workspaces: |
-            .
-            vendor
-      - name: Build the suites
-        run: |
-          cargo test --workspace --locked --no-run
-          cargo test --manifest-path vendor/Cargo.toml --workspace --locked --no-run
-      # The stock S3 clients the suite in crates/mantle/tests/stock_clients.rs runs against a cell:
-      # the AWS CLI v2 (AWS's installer where the image lacks it) and boto3 pinned with every hash,
-      # test tools the owner approved (2026-10-25).
-      - name: Stock S3 clients
+      - uses: ilammy/setup-nasm@v1.5.2
+      - name: Build the node suite
         shell: bash
-        run: bash scripts/stock-clients.sh
-      - name: Suites on ${{ matrix.cpus }}, beside ${{ matrix.hogs }} busy loops
         run: |
-          for _ in $(seq ${{ matrix.hogs }}); do taskset -c ${{ matrix.cpus }} sh -c 'while :; do :; done' & done
-          taskset -c ${{ matrix.cpus }} cargo test --workspace --locked
-          taskset -c ${{ matrix.cpus }} cargo test --manifest-path vendor/Cargo.toml --workspace --locked
-
-  # A cell on Kubernetes (plan step 11; docs/design/kubernetes.md): the chart's gates, helm lint and
-  # its golden render, then scripts/kind-cell.sh: the image built, a kind cluster of three workers,
-  # a cell of three installed by the chart, one founder to a kind node, and the transfer harness's
-  # CI scale through both doors from a Job in the cluster, a founder's pod deleted mid-transfer,
-  # every acknowledged object read back. kind and helm are installed by their actions, pinned to
-  # the versions slates' KIND lane runs; the runner image's kubectl drives the cluster, and the
-  # harness's image takes kubectl at the cluster's own version. The job's timeout bounds its waits.
-  kind:
-    name: kind-cell
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: azure/setup-helm@v4
-        with:
-          version: v4.3.0
-      - uses: helm/kind-action@v1
-        with:
-          version: v0.33.0
-          install_only: true
-      - name: The chart's gates (helm lint; the golden render)
-        run: bash scripts/check-chart.sh
-      - name: The KIND cell, end to end
-        run: bash scripts/kind-cell.sh
+          cargo test -p mantle --test node --locked --no-run 2>&1 | tail -3
+          bin=$(cargo test -p mantle --test node --locked --no-run --message-format=json 2>/dev/null | python -c "import sys,json; [print(m['executable']) for m in map(json.loads, sys.stdin) if m.get('reason')=='compiler-artifact' and m.get('executable') and m['target']['name']=='node']" | tail -1)
+          echo "BIN=$bin" >> "$GITHUB_ENV"
+      - name: The node test beside 32 busy loops
+        shell: bash
+        run: bash "$RUNNER_TEMP/diag-win-loop.sh" "$BIN" objects_round_trip_through_any_node_and_read_back_after_one_is_killed 20 32 ${{ matrix.tree }}-${{ matrix.part }}

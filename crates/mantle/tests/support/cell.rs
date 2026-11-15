@@ -1740,7 +1740,17 @@ impl Cell {
             match self.heard.recv_timeout(wait) {
                 Ok(heard) => self.take(heard),
                 Err(RecvTimeoutError::Timeout) if !left.is_zero() => {
-                    self.host_held += Instant::now().saturating_duration_since(woke_by);
+                    // DIAG (never merged): lateness within the timer's coarsest resolution is the
+                    // clock's tick, not a hold (Windows' default 15.625 ms, NtQueryTimerResolution's
+                    // coarsest; Linux's timer slack 50 us).
+                    let granularity = if cfg!(windows) {
+                        Duration::from_micros(15_625)
+                    } else {
+                        Duration::from_micros(50)
+                    };
+                    self.host_held += Instant::now()
+                        .saturating_duration_since(woke_by)
+                        .saturating_sub(granularity);
                 }
                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => panic!(
                     "quiet for {quiet:?} with nothing moved, besides {:?} held still for the \

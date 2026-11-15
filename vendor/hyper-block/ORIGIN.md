@@ -207,7 +207,9 @@ caller hands in the alignment, queue and measured depth it found.
     them; a handle used after that, its slot free or another file's, is refused, typed, by the
     generation its slot carries. A segment added through any handle is opened once, for all; a
     second owner of the same files, opened apart, finds such a segment when a transfer first
-    reaches past those it holds, as before. A segment's writes and flushes are counted on the
+    reaches past those it holds, as before. An add names its segment's index before it creates
+    the segment's file, and every other handle's discovery leaves that index to it, so none opens
+    the segment before it is whole and places it at the length it had then. A segment's writes and flushes are counted on the
     segment: a flush through any handle covers every handle's writes, as `BlockFile::sync_data`
     promises. Each handle kept its own marks before, and the issuer flushes a batch on one
     worker's duplicate after its writes ran on any workers', so a segment written only through

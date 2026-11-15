@@ -216,7 +216,13 @@ struct Open {
     /// instructions a get more than one file's at 10M keys and 20 segments, mantle
     /// `docs/research/48-first-writes.md` §6).
     filled: AtomicUsize,
+    /// The segment one of these handles is adding, [`NONE_ADDED`] while none is: its file exists
+    /// before it is whole, and discovery leaves it to the add, which places it whole.
+    adding: AtomicUsize,
 }
+
+/// Format: [`Open::adding`]'s word while no handle adds a segment, an index no segment reaches.
+const NONE_ADDED: usize = usize::MAX;
 
 /// Every handle reads `Open` from its own thread and the last retirer closes it on its own: what
 /// `Pinned` asks of what it holds.
@@ -295,6 +301,7 @@ impl Open {
             bound,
             segments: Chunked::new(),
             filled: AtomicUsize::new(0),
+            adding: AtomicUsize::new(NONE_ADDED),
         };
         let first = DeviceFile::open_shared(base, false, caching, align)?;
         let len = first.len()?;
@@ -309,13 +316,17 @@ impl Open {
     /// these open files do not hold; each is opened here when a transfer first reaches past the
     /// segments filled, and only then, as the segment is written whole before any transfer uses
     /// it (the module's note).
+    ///
+    /// A segment one of these handles is adding is left to that add: its file exists, created and
+    /// not yet whole, from before it is whole until the add places it. The add names its index
+    /// before it creates the file, so a look that finds the file then finds the index named.
     fn discover(&self) -> Result<bool, DiskError> {
         let index = self.filled.load(Ordering::SeqCst);
-        if index >= self.bound {
+        if index >= self.bound || self.adding.load(Ordering::SeqCst) == index {
             return Ok(false);
         }
         let path = segment_path(&self.base, index);
-        if !path.exists() {
+        if !path.exists() || self.adding.load(Ordering::SeqCst) == index {
             return Ok(false);
         }
         let file = DeviceFile::open_shared(&path, false, self.caching, self.align)?;
@@ -416,12 +427,29 @@ impl Open {
 
     /// Adds a segment of `len` bytes after the last, allocated whole and its name made durable,
     /// then opened for every handle: its index and the offset it starts at.
+    /// One add at a time: another handle's add meanwhile is refused.
     fn add(&self, len: u64) -> Result<(usize, u64), DiskError> {
         self.discover_all()?;
         let index = self.filled.load(Ordering::SeqCst);
         if index >= self.bound {
             return Err(beyond(&self.base, "segments past the file's bound"));
         }
+        if self
+            .adding
+            .compare_exchange(NONE_ADDED, index, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(beyond(
+                &self.base,
+                "a segment added meanwhile through another handle",
+            ));
+        }
+        let added = self.add_at(index, len);
+        self.adding.store(NONE_ADDED, Ordering::SeqCst);
+        added
+    }
+
+    fn add_at(&self, index: usize, len: u64) -> Result<(usize, u64), DiskError> {
         let path = segment_path(&self.base, index);
         let file = DeviceFile::open_shared(&path, true, self.caching, self.align)?;
         if file.len()? != 0 {
@@ -1169,6 +1197,39 @@ mod tests {
         one.sync_data().unwrap();
         assert_eq!(read(&two, 4096), 5);
         assert_eq!((opened(&two), two.len().unwrap()), (3, 2 * 4096));
+    }
+
+    /// Do: as a handle's add has named its segment and created its file, not yet whole, ask
+    /// another handle the file's length and add a segment through it; then let the first add
+    /// through. Expect: the other handle's length is the file's before the add, its add is
+    /// refused, and once the first add places the segment whole both handles hold it, at its
+    /// length.
+    #[test]
+    fn a_segment_being_added_is_left_to_its_add() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("store");
+        let file = create(&base, 4);
+        let other = file.try_clone().unwrap();
+        let index = file
+            .with(|open| {
+                let index = open.filled.load(Ordering::SeqCst);
+                open.adding.store(index, Ordering::SeqCst);
+                Ok(index)
+            })
+            .unwrap();
+        let align = Alignment::new(ALIGN).unwrap();
+        let path = segment_path(&base, index);
+        drop(DeviceFile::open(&path, true, CachingRequest::Buffered, align).unwrap());
+        assert_eq!((other.len().unwrap(), other.layout().len()), (4096, 2));
+        assert!(other.add(4096).is_err());
+        file.with(|open| {
+            let added = open.add_at(index, 3 * 4096);
+            open.adding.store(NONE_ADDED, Ordering::SeqCst);
+            added
+        })
+        .unwrap();
+        assert_eq!(other.len().unwrap(), 4 * 4096);
+        assert_eq!(other.layout(), vec![(0, 0), (0, 4096), (4096, 3 * 4096)]);
     }
 
     /// Do: write two segments whole with copies of a 16 KiB piece (a VM page on every target),

@@ -218,7 +218,7 @@ impl Drop for Handle {
 
 enum Event {
     Attach {
-        /// One duplicate of the file for each worker.
+        /// One duplicate of the file for each worker of a pool, or the one the kernel lanes share.
         files: Vec<Handle>,
         /// The batches the submitter may have out at once.
         batches: usize,
@@ -735,15 +735,18 @@ fn attach<F: BlockFile + 'static>(
             path: path.to_path_buf(),
             source: std::io::Error::other(error),
         })?;
+    // A pool's workers each hold a duplicate of their own; the kernel lanes, all on the issuer's
+    // one thread, share one (`kernel`).
+    let duplicates = if kernel { 1 } else { workers };
     let mut files: Vec<Handle> = Vec::new();
     files
-        .try_reserve_exact(workers)
+        .try_reserve_exact(duplicates)
         .map_err(|error| DiskError::Io {
             op: "reserve an attachment's file duplicates",
             path: path.to_path_buf(),
             source: std::io::Error::other(error),
         })?;
-    for _ in 0..workers {
+    for _ in 0..duplicates {
         files.push(Handle(Some(Box::new(file.try_clone()?))));
     }
     // The submitter's own duplicate, for what it reads from memory on its own thread
@@ -1799,6 +1802,16 @@ impl Lanes {
         }
     }
 
+    /// The duplicates of a file an attachment hands over: one for each worker of a pool, one the
+    /// kernel lanes share.
+    fn duplicates(&self) -> usize {
+        match self {
+            Self::Pool(workers) => workers.len(),
+            #[cfg(target_os = "linux")]
+            Self::Kernel(_) => 1,
+        }
+    }
+
     /// Hands `task` to `lane`, which holds none; the task back where there is no such lane, its
     /// worker has ended, or the lanes never take it.
     fn send(&mut self, lane: usize, task: Task) -> Result<(), Task> {
@@ -1875,9 +1888,16 @@ struct Dispatch<'a> {
 impl<'a> Dispatch<'a> {
     fn new(lanes: Lanes, path: &'a Path) -> Self {
         let count = lanes.len();
+        // News waits for a pool's workers, each its own duplicates; the kernel lanes take a file's
+        // news at once (`Lanes::duplicates`).
+        let told = if lanes.duplicates() == count {
+            count
+        } else {
+            0
+        };
         Self {
             idle: (0..count).rev().collect(),
-            news: (0..count).map(|_| VecDeque::new()).collect(),
+            news: (0..told).map(|_| VecDeque::new()).collect(),
             lanes,
             in_flight: 0,
             pending: VecDeque::new(),
@@ -1956,6 +1976,10 @@ impl<'a> Dispatch<'a> {
                 self.done(lane, report);
                 any = true;
             }
+            while let Some((slot, generation, failed)) = self.next_kernel_retired() {
+                self.dropped(Some((slot, generation)), failed);
+                any = true;
+            }
             any
         }
         #[cfg(not(target_os = "linux"))]
@@ -1968,6 +1992,14 @@ impl<'a> Dispatch<'a> {
     fn next_kernel_report(&mut self) -> Option<(usize, Report)> {
         match &mut self.lanes {
             Lanes::Kernel(kernel) => kernel.next_report(),
+            Lanes::Pool(_) => None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn next_kernel_retired(&mut self) -> Option<(usize, u64, Option<LifecycleFailure>)> {
+        match &mut self.lanes {
+            Lanes::Kernel(kernel) => kernel.next_retired(),
             Lanes::Pool(_) => None,
         }
     }
@@ -1988,6 +2020,9 @@ impl<'a> Dispatch<'a> {
             if let Some(failed) = dispose_foreign(report) {
                 self.failure.get_or_insert(failed);
             }
+        }
+        while let Some((slot, generation, failed)) = self.next_kernel_retired() {
+            self.dropped(Some((slot, generation)), failed);
         }
         if let Lanes::Kernel(kernel) = &mut self.lanes
             && let Some(failed) = kernel.retire_files()
@@ -2127,7 +2162,7 @@ impl<'a> Dispatch<'a> {
         if self.stopping {
             return Err(stopped(self.path, "the device's issuer is stopping"));
         }
-        if files.len() != self.lanes.len() {
+        if files.len() != self.lanes.duplicates() {
             return Err(invalid(
                 self.path,
                 "one duplicate of the file for each worker",
@@ -2143,12 +2178,24 @@ impl<'a> Dispatch<'a> {
         let slot = (0..self.clients.len())
             .find(|&s| !busy(s, &self.clients, &self.detaching))
             .unwrap_or(self.clients.len());
-        for (news, file) in self.news.iter_mut().zip(files) {
-            news.push_back(Task::Attach {
-                slot,
-                generation,
-                file,
-            });
+        #[cfg(target_os = "linux")]
+        let mut placed = None;
+        match &mut self.lanes {
+            Lanes::Pool(_) => {
+                for (news, file) in self.news.iter_mut().zip(files) {
+                    news.push_back(Task::Attach {
+                        slot,
+                        generation,
+                        file,
+                    });
+                }
+            }
+            #[cfg(target_os = "linux")]
+            Lanes::Kernel(kernel) => {
+                for file in files {
+                    placed = placed.or(kernel.attach(slot, generation, file));
+                }
+            }
         }
         let client = Some(Client {
             generation,
@@ -2165,6 +2212,12 @@ impl<'a> Dispatch<'a> {
         match self.clients.get_mut(slot) {
             Some(free) => *free = client,
             None => self.clients.push(client),
+        }
+        // The kernel lanes placed the file at once: a failure is the client's, as a worker's news
+        // report makes it.
+        #[cfg(target_os = "linux")]
+        if placed.is_some() {
+            self.lifecycle(slot, generation, false, placed);
         }
         Ok((slot, generation))
     }
@@ -2324,12 +2377,20 @@ impl<'a> Dispatch<'a> {
         self.detaching.push(Detaching {
             slot,
             generation,
-            remaining: self.lanes.len(),
+            remaining: self.lanes.duplicates(),
             failure,
             done,
             watch,
             physical_error,
         });
+        // The kernel lanes' one duplicate: retired now where no transfer of it is out, else once
+        // its last is reported (`kernel_reports`).
+        #[cfg(target_os = "linux")]
+        if let Lanes::Kernel(kernel) = &mut self.lanes
+            && let Some(failed) = kernel.detach(slot, generation)
+        {
+            self.dropped(Some((slot, generation)), failed);
+        }
     }
 
     /// A worker dropped its duplicate of a detached file; the last one answers the detach.

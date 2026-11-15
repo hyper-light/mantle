@@ -87,14 +87,15 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `81467a8` (hyper-raft branch `ci-health`: `doors-step8-2`'s `294678c` and one
-commit), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. Its commit changes
+**Every crate at `5b4680e` (hyper-raft branch `ci-health`: `doors-step8-2`'s `294678c` and two
+commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. Its commits change
 hyper-block alone: a device issuer whose transfers the kernel holds (`Issuer::start_device`), on
 Linux one thread keeping the device's whole depth in one native AIO context, its completions and
-its submitters ringing one eventfd; elsewhere the pool; `Issuer::device_threads` says what either
-runs, and `Issuer::attacher` and `Attacher::try_clone` are fallible (a kernel issuer's way to its
-inbox holds a descriptor of its bell). Tests `tests/device_issuer.rs` and
-`tests/device_issuer_threads.rs`; hyper-raft docs/research/issuer-completions.md §9 and
+its submitters ringing one eventfd, its lanes sharing one descriptor of each file attached; elsewhere
+the pool; `Issuer::device_threads` says what either runs, and `Issuer::attacher` and
+`Attacher::try_clone` are fallible (a kernel issuer's way to its inbox holds a descriptor of its
+bell). Tests `tests/device_issuer.rs`, `tests/device_issuer_threads.rs` and
+`tests/device_issuer_descriptors.rs`; hyper-raft docs/research/issuer-completions.md §9 and
 docs/benchmarks.md, "a device issuer's lanes in the kernel" (mantle kind-cell, 2026-11-13: a pod
 whose device measured a depth of 316 needed its threads' stacks past its 2 GiB). Main takes it
 once Ada says. `294678c` was `doors-step8`'s `c97fb1a` and one commit: hyper-tls's certificates

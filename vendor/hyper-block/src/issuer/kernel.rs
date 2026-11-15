@@ -5,13 +5,15 @@
 //! `docs/research/issuer-completions.md`; the owner's decision of 2026-10-01: native AIO on Linux,
 //! not io_uring).
 //!
-//! Each lane stands where a pool's worker stands ([`super::work`]): it holds its own duplicate of
-//! each file attached, is told a file's attach or detach before any transfer for it, and holds
-//! one task at a time, which it reports once. So the dispatcher's rules are the pool's rules, one
-//! lane a worker: a detached file's duplicates are each dropped only once no transfer of it is in
-//! that lane, and the transfers in the kernel are at most the lanes, the context's size. A lane's
-//! news is applied at once and reported at once; a transfer is handed to the kernel at the next
-//! [`Kernel::pump`], up to the context's room, and reported when its completion is reaped.
+//! Each lane stands where a pool's worker stands ([`super::work`]) for its transfers: it holds one
+//! task at a time, which it reports once, so the dispatcher's rules are the pool's, one lane a
+//! worker, and the transfers in the kernel are at most the lanes, the context's size. A transfer is
+//! handed to the kernel at the next [`Kernel::pump`], up to the context's room, and reported when its
+//! completion is reaped. The files are the issuer's thread's alone, so the lanes share one
+//! duplicate of each file attached, where a pool's workers, each a thread, hold one each: a deep
+//! device's issuer holds a descriptor a file, not one a transfer in flight. A file detached is
+//! retired once no transfer of it is out, and a transfer asked of it after its detach is refused,
+//! as a pool's worker refuses one once it has dropped its duplicate.
 //!
 //! A transfer is the kernel's `pread`, `pwrite` or `fdatasync` of the lane's duplicate
 //! ([`crate::block::BlockFile::kernel_file`]), with the bytes and errors the file's own
@@ -28,7 +30,9 @@ use std::collections::VecDeque;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
-use super::{FileSlot, Finished, LifecycleFailure, Op, Report, Task, Transfer, place, retire_file};
+use super::{
+    FileSlot, Finished, Handle, LifecycleFailure, Op, Report, Task, Transfer, place, retire_file,
+};
 use crate::DiskError;
 use crate::aio::linux::{Bell, Context, Op as Record, Pushed};
 
@@ -45,8 +49,14 @@ pub(super) struct Kernel {
     /// kernel holds (io_destroy(2)), before the lanes' buffers and files are dropped.
     ctx: Context,
     bell: Bell,
-    /// Each lane's files, by attachment slot, as a pool's worker holds its own.
-    files: Vec<Vec<FileSlot>>,
+    /// The files attached, by attachment slot: one duplicate each, every lane's.
+    files: Vec<FileSlot>,
+    /// Attachments being detached, whose file is retired once no transfer of theirs is out: at
+    /// most the attachments.
+    detaching: Vec<(usize, u64)>,
+    /// Files retired since the dispatcher last took them, each with its retirement's failure: what
+    /// it answers their detaches with ([`Self::next_retired`]).
+    retired: VecDeque<(usize, u64, Option<LifecycleFailure>)>,
     /// Each lane's transfer, handed over and not yet reported: at most one a lane.
     out: Vec<Option<Out>>,
     /// Lanes whose transfer waits for the kernel, in the order handed over: at most the lanes.
@@ -70,11 +80,6 @@ impl Kernel {
         };
         let bell = Bell::new().map_err(io("make a device issuer's bell"))?;
         let ctx = Context::rung(lanes, &bell).map_err(io("io_setup"))?;
-        let mut files = Vec::new();
-        files
-            .try_reserve_exact(lanes)
-            .map_err(|e| io("reserve the issuer's lanes")(std::io::Error::other(e)))?;
-        files.resize_with(lanes, Vec::new);
         let mut out = Vec::new();
         out.try_reserve_exact(lanes)
             .map_err(|e| io("reserve the issuer's lanes")(std::io::Error::other(e)))?;
@@ -90,7 +95,9 @@ impl Kernel {
         Ok(Self {
             ctx,
             bell,
-            files,
+            files: Vec::new(),
+            detaching: Vec::new(),
+            retired: VecDeque::new(),
             out,
             waiting,
             in_kernel: 0,
@@ -101,7 +108,7 @@ impl Kernel {
 
     /// The lanes: the transfers the kernel holds at most.
     pub(super) fn lanes(&self) -> usize {
-        self.files.len()
+        self.out.len()
     }
 
     /// A descriptor of the bell for a submitter, which rings it once its batch is handed over.
@@ -109,76 +116,99 @@ impl Kernel {
         self.bell.try_clone()
     }
 
-    /// Hands `task` to `lane`, which holds none: news is applied and reported at once; a transfer
-    /// goes to the kernel at the next [`Self::pump`]. The task comes back for a lane there is no
-    /// such lane of, or one the lanes never take (a retired news slot).
+    /// Takes the one duplicate of a file attached in `slot`, every lane's, its attachment's
+    /// `generation`: the failure of placing it or of retiring what the slot held, if either fails.
+    pub(super) fn attach(
+        &mut self,
+        slot: usize,
+        generation: u64,
+        file: Handle,
+    ) -> Option<LifecycleFailure> {
+        match place(&mut self.files, slot, Some((generation, file))) {
+            Ok(old) => retire_file(old),
+            Err((unplaced, failed)) => {
+                let _ = retire_file(unplaced);
+                Some(failed)
+            }
+        }
+    }
+
+    /// Detaches the file of `slot`'s attachment of `generation`: retired at once, its retirement's
+    /// failure given (`Some`), where no transfer of it is out; else once its last is reported, then
+    /// taken by [`Self::next_retired`] (`None` here). Its transfers asked after this are refused.
+    pub(super) fn detach(
+        &mut self,
+        slot: usize,
+        generation: u64,
+    ) -> Option<Option<LifecycleFailure>> {
+        if self.holds_out(slot, generation) {
+            self.detaching.push((slot, generation));
+            return None;
+        }
+        Some(self.retire(slot, generation))
+    }
+
+    /// Whether a lane holds a transfer of `slot`'s attachment of `generation`.
+    fn holds_out(&self, slot: usize, generation: u64) -> bool {
+        self.out
+            .iter()
+            .flatten()
+            .any(|out| out.transfer.slot == slot && out.transfer.generation == generation)
+    }
+
+    /// Retires the file `slot` holds for `generation`, if it does: its retirement's failure.
+    fn retire(&mut self, slot: usize, generation: u64) -> Option<LifecycleFailure> {
+        let old = self.files.get_mut(slot).and_then(|held| {
+            if held.as_ref().is_some_and(|(g, _)| *g == generation) {
+                held.take()
+            } else {
+                None
+            }
+        });
+        retire_file(old)
+    }
+
+    /// A file a deferred detach retired, and its retirement's failure.
+    pub(super) fn next_retired(&mut self) -> Option<(usize, u64, Option<LifecycleFailure>)> {
+        self.retired.pop_front()
+    }
+
+    /// Hands transfer `task` to `lane`, which holds none: it goes to the kernel at the next
+    /// [`Self::pump`]. The task comes back for a lane there is no such lane of, one that holds a
+    /// transfer, or a task the lanes never take: a file's news, which [`Self::attach`] and
+    /// [`Self::detach`] take instead.
     pub(super) fn send(&mut self, lane: usize, task: Task) -> Result<(), Task> {
         if lane >= self.lanes() || self.out.get(lane).is_some_and(Option::is_some) {
             return Err(task);
         }
         match task {
-            Task::Attach {
-                slot,
-                generation,
-                file,
-            } => {
-                let Some(files) = self.files.get_mut(lane) else {
-                    return Err(Task::Attach {
-                        slot,
-                        generation,
-                        file,
-                    });
-                };
-                let failed = match place(files, slot, Some((generation, file))) {
-                    Ok(old) => retire_file(old),
-                    Err((unplaced, failed)) => {
-                        let _ = retire_file(unplaced);
-                        Some(failed)
-                    }
-                };
-                self.report(
-                    lane,
-                    Report::News {
-                        slot,
-                        generation,
-                        detached: false,
-                        failed,
-                    },
-                );
+            Task::Transfer(transfer) => {
+                self.issue(lane, transfer);
+                Ok(())
             }
-            Task::Detach { slot, generation } => {
-                let old = self
-                    .files
-                    .get_mut(lane)
-                    .and_then(|files| files.get_mut(slot))
-                    .and_then(|held| {
-                        if held.as_ref().is_some_and(|(g, _)| *g == generation) {
-                            held.take()
-                        } else {
-                            None
-                        }
-                    });
-                let failed = retire_file(old);
-                self.report(
-                    lane,
-                    Report::News {
-                        slot,
-                        generation,
-                        detached: true,
-                        failed,
-                    },
-                );
-            }
-            Task::Transfer(transfer) => self.issue(lane, transfer),
-            task @ (Task::Retired | Task::RetirementPanicked(_)) => return Err(task),
+            task @ (Task::Attach { .. }
+            | Task::Detach { .. }
+            | Task::Retired
+            | Task::RetirementPanicked(_)) => Err(task),
         }
-        Ok(())
     }
 
     /// Checks `transfer` as the file's own call would before any system call, and queues it for
     /// the kernel; reports it at once where it is refused, or moves no bytes.
     fn issue(&mut self, lane: usize, transfer: Transfer) {
-        let checked = match self.kernel_file(lane, &transfer) {
+        let detached = self
+            .detaching
+            .contains(&(transfer.slot, transfer.generation));
+        let checked = match self.kernel_file(&transfer).and_then(|held| {
+            if detached {
+                Err(super::stopped(
+                    Path::new(""),
+                    "a transfer for a file the worker does not hold",
+                ))
+            } else {
+                Ok(held)
+            }
+        }) {
             Err(e) => Err(e),
             Ok((_, align, path)) => match &transfer.op {
                 Op::Read { buf, at, .. } | Op::Write { buf, at, .. } => {
@@ -228,16 +258,15 @@ impl Kernel {
         }
     }
 
-    /// The open file, alignment and path of `transfer`'s file in `lane`'s hold.
+    /// The open file, alignment and path of `transfer`'s file. A file being detached is held until
+    /// the transfers its lanes took before the detach are reported; [`Self::issue`] takes no new one.
     fn kernel_file(
         &self,
-        lane: usize,
         transfer: &Transfer,
     ) -> Result<(std::os::fd::RawFd, crate::buf::Alignment, &Path), DiskError> {
         let held = self
             .files
-            .get(lane)
-            .and_then(|files| files.get(transfer.slot))
+            .get(transfer.slot)
             .and_then(Option::as_ref)
             .filter(|(g, _)| *g == transfer.generation)
             .and_then(|(_, handle)| handle.0.as_deref());
@@ -381,7 +410,7 @@ impl Kernel {
         // transfer is reported only once the kernel no longer holds it, and the context is dropped
         // (and waits for every record) before the lanes' transfers are.
         let transfer = &self.out.get(lane)?.as_ref()?.transfer;
-        let (fd, _, _) = self.kernel_file(lane, transfer).ok()?;
+        let (fd, _, _) = self.kernel_file(transfer).ok()?;
         Some((fd, record))
     }
 
@@ -395,8 +424,7 @@ impl Kernel {
             Op::Flush => {
                 let held = self
                     .files
-                    .get(lane)
-                    .and_then(|files| files.get(out.transfer.slot))
+                    .get(out.transfer.slot)
                     .and_then(Option::as_ref)
                     .filter(|(g, _)| *g == out.transfer.generation);
                 match held {
@@ -543,6 +571,17 @@ impl Kernel {
             number,
             op,
         } = transfer;
+        // The last transfer out of an attachment being detached: its file is retired now.
+        if let Some(at) = self
+            .detaching
+            .iter()
+            .position(|&held| held == (slot, generation))
+            && !self.holds_out(slot, generation)
+        {
+            self.detaching.swap_remove(at);
+            let failed = self.retire(slot, generation);
+            self.retired.push_back((slot, generation, failed));
+        }
         let write = match op {
             Op::Write { index, buf, .. } | Op::Read { index, buf, .. } => Some((index, Some(buf))),
             Op::Flush => None,
@@ -586,14 +625,13 @@ impl Kernel {
             })
     }
 
-    /// Retires every lane's duplicates, as a pool's worker does at its end: the first failure.
+    /// Retires every file the lanes hold, as a pool's worker does its duplicates at its end: the
+    /// first failure.
     pub(super) fn retire_files(&mut self) -> Option<LifecycleFailure> {
         let mut first = None;
-        for files in &mut self.files {
-            while let Some(file) = files.pop() {
-                if let Some(failed) = retire_file(file) {
-                    first.get_or_insert(failed);
-                }
+        while let Some(file) = self.files.pop() {
+            if let Some(failed) = retire_file(file) {
+                first.get_or_insert(failed);
             }
         }
         first

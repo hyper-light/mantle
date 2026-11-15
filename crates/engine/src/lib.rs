@@ -26,6 +26,7 @@ pub mod error;
 pub mod file;
 pub mod fst;
 pub mod kept;
+mod kept_pays;
 pub mod kept_table;
 pub mod memory;
 pub mod memtable;

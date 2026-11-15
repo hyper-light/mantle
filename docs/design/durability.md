@@ -129,7 +129,7 @@ the conservative end of its source, in `mantle_ec::durability::field` (audit B09
 | Flash annual failure rate | 2.7% | The worst four-year replacement fraction of Schroeder et al. (FAST 2016), 10.31%, as a constant hazard; above Maneas et al.'s worst model, 1.2% | 15 §8.2 |
 | Power loss | once a year, destroying 1% of nodes | HDFS: "one-half to one percent of the nodes will not survive a full power-on restart"; the once-a-year is Cidon's, UNVERIFIED at his cited source | 15 §8.4 |
 | Rack, zone or site loss | none | No fetched source gives a permanent-loss rate; Ford's and Dean's rack events are transient. A deployment states its own (`--zones`) | 15 §8.4 |
-| Repair | one over the mean time to detect a loss plus the time to rebuild one chunk, per pool | measured repair bandwidth and detection time; Ford's mean exceeds 20 minutes | 04 §R3, 15 §8.4, 28 §3.3 |
+| Repair | one over the mean time to detect a loss plus the time to rebuild one chunk, per pool; a day unless the operator states the cell's (`durability.repair_rate`) | measured repair bandwidth and detection time; Ford's mean exceeds 20 minutes. The cell's repair holds itself to it: an away node's chunks wait one over it less the measured rebuild time (repair.md §2.3) | 04 §R3, 15 §8.4, 28 §3.3 |
 
 **Detection is part of repair** (28 §3.3, D4). A device's loss is detected in seconds on online
 media; a latent sector error only when the scrubber reads it, on average half a scrub period
@@ -207,6 +207,8 @@ margin left after one zone's loss.
 - A permanent-loss rate for racks, zones and sites, and the burst frequency, which no
   fetched source states.
 - Prioritized and parallel repair. Both raise durability, and Ford leaves both out (15 §1.4).
+  Repair is built by margin and with measured concurrency (repair.md §5); the model still counts
+  it serial, the conservative side.
 - The copyset family that bounds the chance of losing any block in one event, beside this
   per-block probability (04 §A6.3, §R2).
 - Choosing each block's scheme when it is sealed, with the placement service (STATUS,

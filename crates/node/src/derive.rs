@@ -52,8 +52,10 @@ const EXTENT_PAGES: u32 = 2;
 /// applied to each block (docs/design/durability.md §1).
 const TARGET: f64 = 1e-11;
 
-/// Hours to repair a lost chunk until repair is built and measured: "a day—or more" after a
-/// power-on restart (Chansler 2012), the longest the sources give (docs/research/15 §8.4).
+/// Hours to repair a lost chunk unless the operator states the cell's repair rate: "a day—or more"
+/// after a power-on restart (Chansler 2012), the longest the sources give (docs/research/15 §8.4).
+/// The cell's repair holds itself to it: a chunk waits for an away node until a day less the
+/// rebuild's measured time has passed (docs/design/repair.md §2).
 const REPAIR_HOURS: f64 = 24.0;
 
 /// Buckets an owner may have: S3's 10,000 (docs/research/05 §10.4).
@@ -111,6 +113,11 @@ pub const STORE_BYTES_AN_OBJECT: u64 = 1_841;
 /// on any device of the cell; a power-on restart a year, destroying a hundredth of the nodes;
 /// and repair in a day. No permanent loss of a rack, zone or site has a rate the sources give.
 pub fn rates() -> Rates {
+    rates_repaired(None)
+}
+
+/// [`rates`] with the cell's repair rate, per hour, where its operator states one.
+pub fn rates_repaired(repair: Option<f64>) -> Rates {
     use durability::field::{DISK_FAILURES, POWER_LOSS_FRACTION, POWER_LOSSES};
     Rates {
         chunk: DISK_FAILURES / durability::YEAR,
@@ -119,7 +126,7 @@ pub fn rates() -> Rates {
             rate: POWER_LOSSES / durability::YEAR,
             fraction: POWER_LOSS_FRACTION,
         }],
-        repair: REPAIR_HOURS.recip(),
+        repair: repair.unwrap_or_else(|| REPAIR_HOURS.recip()),
     }
 }
 
@@ -1273,6 +1280,9 @@ pub struct Stated {
     pub ceiling: Option<u64>,
     /// A block's annual chance of loss at most, where its operator states it.
     pub target: Option<f64>,
+    /// The cell's repair rate, per hour, where its operator states it: what the durability model
+    /// takes, and what the cell's repair holds itself to (docs/design/repair.md §2).
+    pub repair: Option<f64>,
     /// The orderly stop's bound, where its operator states it.
     pub stop: Option<Duration>,
     /// The S3 endpoint, where its operator states it (node.md §4).
@@ -1462,7 +1472,7 @@ pub fn derive(
 
     // The objects a node with root keys hosts, at the floor.
     let hosts = !stated.keys.is_empty();
-    let rates = rates();
+    let rates = rates_repaired(stated.repair);
     let target = target(stated.target);
     let widest = durability::candidates()
         .iter()
@@ -1773,7 +1783,7 @@ pub fn derive(
         &asked,
         &gateway,
         &rates,
-        (target, stated.target.is_some()),
+        (target, stated.target.is_some(), stated.repair.is_some()),
     );
 
     let classes = classes_at(
@@ -2323,7 +2333,7 @@ fn say_objects(
     asked: &Asks,
     gateway: &Gateway,
     rates: &Rates,
-    (target, stated): (f64, bool),
+    (target, stated, repair_stated): (f64, bool, bool),
 ) {
     said.add(
         "chunk_bytes",
@@ -2416,12 +2426,23 @@ fn say_objects(
         "the worst device class's annual failure rate, an hour, since a block's chunks may land \
          on any device of the cell (mantle_ec::durability's disk rate; durability.md §5)",
     );
-    said.add(
-        "durability.repair_rate",
-        rates.repair,
-        Kind::Cited,
-        "repair in a day, the longest research 15 §8.4 gives, until repair is built and measured",
-    );
+    if repair_stated {
+        said.add(
+            "durability.repair_rate",
+            rates.repair,
+            Kind::Stated,
+            "the operator's repairs an hour: an away node's chunks wait one over it, less the \
+             rebuild's measured time (docs/design/repair.md §2)",
+        );
+    } else {
+        said.add(
+            "durability.repair_rate",
+            rates.repair,
+            Kind::Cited,
+            "repair in a day, the longest research 15 §8.4 gives: an away node's chunks wait a day, \
+             less the rebuild's measured time (docs/design/repair.md §2)",
+        );
+    }
     for burst in &rates.bursts {
         said.add(
             "durability.burst",
@@ -3074,6 +3095,35 @@ mod tests {
         );
     }
 
+    /// The most an operation is charged holds a repair of the largest block of every scheme a cell
+    /// may take reading a chunk from as many places as the block is wide: a repair reserves that
+    /// charge for each width of its block's places (node::repair).
+    #[test]
+    fn an_operations_most_charge_holds_a_repair_of_a_blocks_width_of_places() {
+        let window = gateway(0, 0).unwrap().window;
+        for scheme in durability::candidates() {
+            let layout = Layout::new(scheme).unwrap();
+            let block = layout.largest_block().unwrap();
+            let (data, parity) = match scheme {
+                Scheme::Copies(n) => (1, n - 1),
+                Scheme::Rs(code) => (code.data(), code.parity()),
+            };
+            let header = mantle_meta::record::BlockHeader {
+                length: block,
+                data: u8::try_from(data).unwrap(),
+                parity: u8::try_from(parity).unwrap(),
+                chunk_len: layout.chunk_len(block).unwrap(),
+                crc32c: 0,
+            };
+            let repair = mantle_gateway::repair::most_bytes(&header, scheme.width()).unwrap();
+            let most = Charges::new(window, &[scheme]).unwrap().most();
+            assert!(
+                repair <= most,
+                "{scheme:?}: a repair's {repair} bytes past an operation's most {most}"
+            );
+        }
+    }
+
     /// The log derived takes a frame of the range's largest entry with its shell's bytes; a group
     /// retains two cadences and a `Ready` of the settings, in its entries of the least entry a range
     /// proposes and its bytes with their shells, as the range checks; and its file holds every
@@ -3422,6 +3472,7 @@ mod tests {
     /// with them, objects.
     fn stated(volumes: usize) -> Stated {
         Stated {
+            repair: None,
             id: 1,
             dir: at("/node"),
             quic: "127.0.0.1:7000".parse().unwrap(),

@@ -153,6 +153,9 @@ leadership transfer and replica moves.
 
 ## 7. Balancing, growing and shrinking
 
+- *As built (2026-11-14):* repair, the domain rule and drains run as docs/design/repair.md
+  sets out: by the cell's own liveness facts, never a timeout, an away machine's copies kept for
+  its return (research/90).
 - **Balance with explicit assignments computed from the current one,** under a budget of
   bytes moved per round, ranking moves by imbalance removed per byte moved (Slicer, Shard
   Manager; 09 §9.7). An emergency mode restores lost redundancy under hard constraints; a

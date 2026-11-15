@@ -120,11 +120,13 @@ struct Plain {
 
 /// A part of a chunk read for a block, and what it gave.
 struct Span {
-    /// The chunk's index, and the bytes of it read.
+    /// Where in the block's places it is read from now, and the bytes of the chunk read: a
+    /// copy's, any of the block's places, a code's data chunk's, its own place or one kept
+    /// beside it (docs/design/repair.md §3).
     chunk: usize,
     range: Range<u64>,
     got: Option<Bytes>,
-    /// For copies: the chunks tried for this span.
+    /// The places tried for this span.
     tried: BTreeSet<usize>,
 }
 
@@ -139,17 +141,22 @@ struct Reading {
     want: Range<u64>,
     row: Option<(BlockHeader, Vec<ChunkPlace>)>,
     spans: Vec<Span>,
-    /// Once a span of a coded block fails: the whole chunks read to decode it.
-    whole: Option<Whole>,
+    /// Once a span of a coded block fails: the whole chunks read to decode it, held apart so a
+    /// block read whole by its spans, the common case, holds none of it.
+    whole: Option<Box<Whole>>,
     /// Its requests in flight: it finishes only once none is, so no answer outlives it.
     inflight: usize,
 }
 
+/// The whole chunks of a coded block read to decode it, by index: those read, those asked, and
+/// those none of whose places read; and every place tried, whose chunk is asked of another of its
+/// places next.
 #[derive(Default)]
 struct Whole {
     got: BTreeMap<usize, Bytes>,
     asked: BTreeSet<usize>,
     failed: BTreeSet<usize>,
+    tried: BTreeSet<usize>,
 }
 
 /// What a request in flight asked. Blocks are named by the first segment they hold.
@@ -169,6 +176,7 @@ enum Asked {
     Extents,
     Block(u64),
     Span(u64, usize),
+    /// A whole chunk of a block, read from the place at this position of its places.
     Whole(u64, usize),
 }
 
@@ -297,6 +305,11 @@ impl Get {
     }
 
     /// The next plaintext of the range, in order; `None` while none is ready.
+    /// Whether plaintext waits to be taken: a block read and opened, the range's next.
+    pub fn ready(&self) -> bool {
+        !self.out.is_empty()
+    }
+
     pub fn take(&mut self) -> Option<Bytes> {
         let bytes = self.out.pop_front()?;
         // The room it held may let another block be read.
@@ -641,9 +654,20 @@ impl Get {
         let width = usize::from(header.data)
             .checked_add(usize::from(header.parity))
             .ok_or(GetError::Overflow)?;
-        if header.length != len || places.len() != width || header.data == 0 {
+        if header.length != len || places.len() < width || header.data == 0 {
             return Err(GetError::Inconsistent(
                 "a block row that is not its extent's",
+            ));
+        }
+        // Each place past the chunks' own keeps one of them, under that chunk's key.
+        let kept_fit = places.iter().skip(width).all(|kept| {
+            places
+                .get(usize::from(kept.key.index))
+                .is_some_and(|own| usize::from(kept.key.index) < width && own.key == kept.key)
+        });
+        if !kept_fit {
+            return Err(GetError::Inconsistent(
+                "a kept place of no chunk of its block",
             ));
         }
         let mut spans = Vec::new();
@@ -708,18 +732,14 @@ impl Get {
         self.ask(request, Asked::Span(key, i))
     }
 
-    /// Span `i` of block `key` answered: kept, or, when it failed, asked of another copy, or
-    /// the block decoded from whole chunks instead.
+    /// Span `i` of block `key` answered: kept, or, when it failed, asked of another place that
+    /// holds its bytes, a copy's any other, a code's chunk's kept one, or the block decoded from
+    /// whole chunks instead.
     fn span(&mut self, key: u64, i: usize, got: Option<Bytes>) -> Result<(), GetError> {
         let reading = self.reading.get_mut(&key).ok_or(GetError::Mismatch)?;
         let block = reading.block;
-        let (header, _) = reading.row.as_ref().ok_or(GetError::Mismatch)?;
-        let (data, width) = (
-            header.data,
-            usize::from(header.data)
-                .checked_add(usize::from(header.parity))
-                .ok_or(GetError::Overflow)?,
-        );
+        let (header, places) = reading.row.as_ref().ok_or(GetError::Mismatch)?;
+        let data = header.data;
         let span = reading.spans.get_mut(i).ok_or(GetError::Mismatch)?;
         match got {
             Some(bytes) => {
@@ -733,44 +753,67 @@ impl Get {
                 }
                 span.got = Some(bytes);
             }
-            None if data == 1 => {
-                // Another copy, one not tried for this span.
-                let next = (0..width)
-                    .find(|c| !span.tried.contains(c))
-                    .ok_or(GetError::Unreadable(block))?;
-                span.tried.insert(next);
-                span.chunk = next;
-                self.ask_span(key, i)?;
-            }
             None => {
-                let chunk = span.chunk;
-                reading
-                    .whole
-                    .get_or_insert_with(Whole::default)
-                    .failed
-                    .insert(chunk);
-                self.ask_wholes(key)?;
+                let index = places
+                    .get(span.chunk)
+                    .map(|p| p.key.index)
+                    .ok_or(GetError::Overflow)?;
+                // A copy is the whole block wherever it lies; a coded chunk is its own bytes, in
+                // its own place or one kept beside it.
+                let next = (0..places.len()).find(|&c| {
+                    !span.tried.contains(&c)
+                        && (data == 1 || places.get(c).is_some_and(|p| p.key.index == index))
+                });
+                match next {
+                    Some(next) => {
+                        span.tried.insert(next);
+                        span.chunk = next;
+                        self.ask_span(key, i)?;
+                    }
+                    None if data == 1 => return Err(GetError::Unreadable(block)),
+                    None => {
+                        let tried = span.tried.clone();
+                        let whole = reading.whole.get_or_insert_with(Box::default);
+                        whole.tried.extend(tried);
+                        self.ask_wholes(key)?;
+                    }
+                }
             }
         }
         self.finish(key)
     }
 
-    /// Asks for as many whole chunks of block `key`, not yet asked or failed, as decoding it
-    /// still needs, data chunks first.
+    /// Asks for as many whole chunks of block `key`, not yet read, asked or failed, as decoding
+    /// it still needs, data chunks first, each of the first of its places not yet tried.
     fn ask_wholes(&mut self, key: u64) -> Result<(), GetError> {
         let reading = self.reading.get_mut(&key).ok_or(GetError::Mismatch)?;
         let block = reading.block;
         let (header, places) = reading.row.as_ref().ok_or(GetError::Mismatch)?;
         let needed = usize::from(header.data);
+        let width = needed
+            .checked_add(usize::from(header.parity))
+            .ok_or(GetError::Overflow)?;
         let chunk_len = header.chunk_len;
         let whole = reading.whole.as_mut().ok_or(GetError::Mismatch)?;
+        // A chunk none of whose places is left untried cannot be read.
+        for c in 0..width {
+            let untried = (0..places.len()).any(|p| {
+                !whole.tried.contains(&p)
+                    && places
+                        .get(p)
+                        .is_some_and(|pl| usize::from(pl.key.index) == c)
+            });
+            if !untried && !whole.got.contains_key(&c) && !whole.asked.contains(&c) {
+                whole.failed.insert(c);
+            }
+        }
         let have = whole
             .got
             .len()
             .checked_add(whole.asked.len())
             .ok_or(GetError::Overflow)?;
         let short = needed.saturating_sub(have);
-        let next: Vec<usize> = (0..places.len())
+        let next: Vec<usize> = (0..width)
             .filter(|c| {
                 !whole.got.contains_key(c) && !whole.asked.contains(c) && !whole.failed.contains(c)
             })
@@ -787,8 +830,17 @@ impl Get {
             .try_reserve_exact(next.len())
             .map_err(|_| GetError::Overflow)?;
         for c in next {
-            let place = places.get(c).ok_or(GetError::Overflow)?;
+            let at = (0..places.len())
+                .find(|&p| {
+                    !whole.tried.contains(&p)
+                        && places
+                            .get(p)
+                            .is_some_and(|pl| usize::from(pl.key.index) == c)
+                })
+                .ok_or(GetError::Overflow)?;
+            let place = places.get(at).ok_or(GetError::Overflow)?;
             whole.asked.insert(c);
+            whole.tried.insert(at);
             requests.push((
                 Request::Chunk {
                     volume: place.volume,
@@ -796,7 +848,7 @@ impl Get {
                     offset: 0,
                     len: chunk_len,
                 },
-                Asked::Whole(key, c),
+                Asked::Whole(key, at),
             ));
         }
         for (request, asked) in requests {
@@ -805,21 +857,28 @@ impl Get {
         Ok(())
     }
 
-    /// A whole chunk read to decode block `key` answered.
-    fn whole(&mut self, key: u64, c: usize, got: Option<Bytes>) -> Result<(), GetError> {
+    /// A whole chunk read to decode block `key`, from the place at `at`, answered.
+    fn whole(&mut self, key: u64, at: usize, got: Option<Bytes>) -> Result<(), GetError> {
         let reading = self.reading.get_mut(&key).ok_or(GetError::Mismatch)?;
-        let chunk_len = reading.row.as_ref().map_or(0, |(h, _)| h.chunk_len);
+        let (chunk_len, index) = match reading.row.as_ref() {
+            Some((h, places)) => (
+                h.chunk_len,
+                places
+                    .get(at)
+                    .map(|p| usize::from(p.key.index))
+                    .ok_or(GetError::Mismatch)?,
+            ),
+            None => return Err(GetError::Mismatch),
+        };
         let whole = reading.whole.as_mut().ok_or(GetError::Mismatch)?;
-        whole.asked.remove(&c);
+        whole.asked.remove(&index);
         match got {
             Some(bytes) if u64::try_from(bytes.len()).ok() == Some(chunk_len) => {
-                whole.got.insert(c, bytes);
+                whole.got.insert(index, bytes);
             }
             Some(_) => return Err(GetError::Inconsistent("a chunk of another length")),
-            None => {
-                whole.failed.insert(c);
-                self.ask_wholes(key)?;
-            }
+            // Asked again of another of its places, or another chunk asked in its stead.
+            None => self.ask_wholes(key)?,
         }
         self.finish(key)
     }

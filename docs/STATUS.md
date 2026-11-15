@@ -929,6 +929,50 @@ Remaining before it is done:
   process crashes and disk faults, both in deterministic simulation and with real
   processes.
 
+**Repair, rebalancing and failures of several machines** ([design](design/repair.md),
+research/90). The root range keeps what the cell sees of each node, stated by the node that leads
+it from the cell's own liveness facts (the pair stream's suspicion, an announced stop, a keyed
+connection or one that ended), never from a timeout, and each node's measured availability over
+its enlisted life. A volume is gone only by its node's word: the node started without it, or the
+node left (`leave` on `mantle serve`'s input), was drained and its volumes retired; a gone volume
+no block names leaves the table. An away node's chunks fall due at the durability model's repair
+time (`durability.repair_rate`, stated per cell by `mantle init`, else the copied 24 hours) less
+the measured time to rebuild every block its volumes hold at the repairs' concurrency, so a laptop
+asleep for a night costs no repair. A chunk rebuilt for an away node keeps the place it left beside
+its new one, counted again once its node is back (Carbonite's reintegration), and a read uses any
+place of a chunk. The node leading the Block range runs the service: passes over the reverse rows
+of away, gone and leaving volumes, and over every block for the domain rule, by remaining margin,
+in bounded memory, as many repairs at once as rebuild an absence within the model's time (Little's
+law) and within the node's operation slots. Every source is checked against the block's CRC-32C, a
+rebuilt chunk is cut or coded from the checked block, no place is let go unless another is known
+to hold its chunk, and every change is a compare-and-swap at the Block range. A new block takes the
+scheme the volumes that take chunks now meet the target with, placed only on them, each weighted by
+its bytes times its node's measured availability. A block too few of whose chunks read is refused
+typed (`503 SlowDown` before any byte, `500 InternalError` where its chunks read and do not rebuild
+it), and blocks lost for good are counted (`LOST` on the service's `repair` line). Tested by unit
+and property tests of the Block layer's places and the root range's facts, by a deterministic
+simulation of the control logic (2,000 schedules a run, and 20,000 in one run on Linux x86_64;
+nodes away and back, volumes lost, nodes leaving, chunks rotted where their volumes cannot see it,
+repairers stopped and racing), and by six end-to-end scenarios on real `mantle serve` processes,
+passing on macOS arm64 and Linux x86_64: a cell of three
+losing a volume mid-write and one at rest; a cell of five losing two volumes at once and then more
+than a block's code spares, saying exactly which blocks it lost and refusing their objects through
+both doors; a node stopped by SIGSTOP and written around; a node killed past a stated repair time,
+rebuilt, kept and counted again, with a founder joining mid-write; a node leaving mid-write; and a
+node leaving a cell narrower than its blocks, its chunks spread onto a founder that joins after.
+Each reads every acknowledged object back byte-exact through both doors and checks every block's
+places on disk. Of three runs of the six on the final code (two macOS, one Linux), every scenario
+passed each time but the leaving node's once, on macOS, stopped before any repair in the harness's
+wait for the cell's links to be judged (`Cell::judging`, quiet for the reconnect time while the
+leader still measured), a wait the other suites share.
+
+Remaining before it is done: deleting chunks no block names, which needs a fence against a rebuild
+naming one; moves for disk space; admission of a node no founder's directory pins (node.md §11,
+built apart); sizing a machine's volumes from the disk it can spare; trimming kept places; re-coding
+a block wider than the volumes a shrunk cell keeps; keeping the measured rebuild time across a
+change of leader; repair's priority against client work beyond the shared slots; a stated value for
+the default repair time, an open row; and the end-to-end scenarios on Linux and Windows.
+
 **Derived settings** ([design](design/node.md) §1.4). `mantle serve CONFIG` runs a node from its
 operator's statements alone: its identity and directory, where it listens, its peers, the cell's
 founding ranges and voters, its volumes' directories and bytes, its failure domain and the cell's
@@ -1352,7 +1396,9 @@ mantle, and ceph's s3-tests pass for every supported feature.
 Multi-machine operation keeps its frame: placement across racks and zones, repair ordered by
 remaining redundancy, rebalancing, and retiring disks that start to fail; done when tests that
 fail disks, machines and racks during writes show every acknowledged write can still be read
-back.
+back. Repair by margin, reintegration of an away machine's copies, draining a machine that
+leaves and spreading onto one that joins are built (In progress: Repair, rebalancing and failures
+of several machines); moves for disk space and retiring failing disks remain.
 
 ### Fifth: make fleet growth and geography safe
 

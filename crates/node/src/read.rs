@@ -13,7 +13,7 @@
 //! | a page of the volume table, of the root range | kind 1; 0 from the first volume, or 1 and the volume after which the page starts (u128) | 1 if more volumes follow the page, else 0; the count (u32); each volume's id (u128), node (u64) and bytes (u64), then its node's domain, its length (u32) before its bytes |
 //! | a file's header, of a File range | kind 2; the file (u128) | 0 for none; 1, then the header (`mantle_meta::record::FileHeader`) |
 //! | a file's extents from the one holding an offset, of a File range | kind 3; the file (u128), the offset (u64), the most extents (u32) | the count (u32); each extent's first byte's offset (u64), then the extent (`Extent`), its length (u32) before it |
-//! | a block's header and its chunks' places, of a Block range | kind 4; the block (u128) | 0 for none; 1, the header (`BlockHeader`) and the count of places (u32), each record its length (u32) before it |
+//! | a block's header and its chunks' places, of a Block range | kind 4; the block (u128) | 0 for none; 1, the header (`BlockHeader`) and the count of places (u32), each record its length (u32) before it: each chunk's own place in index order, then each kept one (`mantle_meta::block::places`) |
 //! | a bucket's row, of the Bucket range | kind 5; the bucket's name, its length (u32) before it | 0 for none; 1, then the row (`Bucket`) |
 //! | a bucket's gate, of a Name range routed by a descriptor's generation | kind 6; the bucket's name, its length (u32) before it; the generation (u64) | 0 for no gate; 1, then the gate (`Gate`); 2, then the range's lineage (`Lineage`), where its span went |
 //! | a page of ListObjectsV2, of a Name range | kind 7; the listing's request as an object's request carries it (`mantle_protocol::object`) | 0 when the bucket has no gate here, or a condemned one; 1, then the page as an object's reply carries it |
@@ -222,7 +222,8 @@ pub enum Read {
     Header(Option<FileHeader>),
     /// The extents asked, each with its first byte's offset; fewer past the file's end.
     Extents(Vec<(u64, Extent)>),
-    /// The block's header and its chunks' places, or none.
+    /// The block's header and its chunks' places, or none: each chunk's own place in index
+    /// order, then each place kept beside one (docs/design/repair.md §3).
     Block(Option<(BlockHeader, Vec<ChunkPlace>)>),
     /// The bucket's row, or none.
     Bucket(Option<Bucket>),
@@ -658,7 +659,7 @@ impl Query {
                     .map(Read::Extents)
                     .map_err(meta)
             }
-            Self::Block { block } => block::read(engine, *block).map(Read::Block).map_err(meta),
+            Self::Block { block } => block::places(engine, *block).map(Read::Block).map_err(meta),
             Self::Bucket { bucket } => bucket::read(engine, bucket).map(Read::Bucket).map_err(meta),
             Self::Gate { bucket, generation } => name::read_gate(engine, bucket, *generation)
                 .map(Read::Gate)
@@ -1973,6 +1974,7 @@ mod tests {
                 volumes: vec![(u128::from(node), node << 30), (u128::from(node) + 10, 1)],
                 max_nodes: 3,
                 max_volumes: 6,
+                at_ns: 0,
             });
             assert_eq!(
                 root::apply(&mut m, node, &enlist).unwrap(),

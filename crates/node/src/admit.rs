@@ -171,9 +171,16 @@ impl Admission {
             .is_some_and(|held| held <= self.budget)
     }
 
-    /// A running operation took `more` bytes besides its charge.
+    /// A running operation took `more` bytes besides its charge, or the cell's repair took them for
+    /// a rebuild (`Node::step_repair`).
     pub(crate) fn took(&mut self, more: u64) {
         self.held = self.held.saturating_add(more);
+    }
+
+    /// Bytes [`took`](Self::took) holds are free again: the rebuild that took them ended or was let
+    /// go.
+    pub(crate) fn gave(&mut self, bytes: u64) {
+        self.held = self.held.saturating_sub(bytes);
     }
 
     /// An operation was turned away, or left waiting at a door, for want of room.

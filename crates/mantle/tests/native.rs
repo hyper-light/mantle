@@ -1219,12 +1219,13 @@ fn a_copy_killed_at_a_run_boundary_or_mid_run_resumes_and_a_changed_source_is_re
     assert!(!uploads.contains("changed"), "{uploads}");
 }
 
-/// A node SIGKILLed while a copy's third run streams through it: with one node of three gone the
-/// cell writes no block, every chunk on a volume of its own and none acknowledged short of every
-/// one (CLAUDE.md §6), so the copy, having found the upload's offset through another node, ends
-/// `SlowDown`, its journal keeping the upload and the cell its two runs; once the node is back, its
-/// volume enlisted and every range caught up on it, the copy run again resumes from the cell's
-/// offset, no committed run sent again, its object the bytes whole.
+/// Two nodes of three SIGKILLed while a copy's third run streams through the first: the ranges
+/// have lost their quorum, so the cell commits nothing more, and the copy ends `SlowDown`, its
+/// journal keeping the upload and the cell its two runs. (One node of three gone, the cell writes
+/// around it, new blocks taking the scheme the two left meet the target with: docs/design/repair.md
+/// §5.) Once the nodes are back, their volumes enlisted and every range caught up on them, the copy
+/// run again resumes from the cell's offset, no committed run sent again, its object the bytes
+/// whole.
 #[test]
 fn a_copy_through_a_node_killed_mid_run_resumes_from_the_cells_offset_once_it_is_back() {
     let mut cell = Cell::made_alone(three_founders);
@@ -1241,8 +1242,10 @@ fn a_copy_through_a_node_killed_mid_run_resumes_from_the_cells_offset_once_it_is
         &format!("run 2 committed, {} bytes durable", 2 * run),
     );
     // The client asks the nodes in the order its directory names them, the first first.
-    let killed = bound[0].0;
-    cell.kill(killed);
+    let killed = [bound[0].0, bound[1].0];
+    for id in killed {
+        cell.kill(id);
+    }
     copying.write(&object[2 * run + run / 2..]);
     let (done, out, said) = copying.finish(&mut cell);
     assert!(
@@ -1250,13 +1253,17 @@ fn a_copy_through_a_node_killed_mid_run_resumes_from_the_cells_offset_once_it_is
         "{out}{said:?}"
     );
     assert_eq!(runs_held(&dir, "node"), [run as u64; 2]);
-    // Back on a port of its own (node.md §1.7): its peers and the client are told where, its
-    // volume enlists again, and every range catches up on it, so the cell places blocks again.
+    // Back on ports of their own (node.md §1.7): their peers and the client are told where, their
+    // volumes enlist again, and every range catches up on them, so the cell places blocks again.
     let groups: std::collections::BTreeSet<u128> =
         cell.status.keys().map(|(_, group)| *group).collect();
-    cell.start(killed);
+    for id in killed {
+        cell.start(id);
+    }
     cell.introduce();
-    cell.enlisted(killed);
+    for id in killed {
+        cell.enlisted(id);
+    }
     for group in &groups {
         cell.converged(*group);
     }

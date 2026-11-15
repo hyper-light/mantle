@@ -1,6 +1,7 @@
 //! The gateway's object path (docs/design/gateway.md): a PUT's body sealed, cut into blocks,
-//! coded into chunks and written with its Block, File and Name rows, and a GET's range read
-//! back, each as a state machine that names its requests and does no I/O.
+//! coded into chunks and written with its Block, File and Name rows, a GET's range read back, and
+//! a block's chunks repaired and moved (docs/design/repair.md), each as a state machine that names
+//! its requests and does no I/O.
 #![cfg_attr(
     test,
     allow(
@@ -18,6 +19,7 @@ pub mod complete;
 pub mod get;
 pub mod layout;
 pub mod put;
+pub mod repair;
 
 /// `n` over `d`, rounded up. The divisor's type rules out the zero that makes
 /// `u64::div_ceil` panic, and a zero numerator divides to zero.

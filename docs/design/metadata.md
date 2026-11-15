@@ -39,10 +39,13 @@ fits the Name layer to S3.
 | File | (file, EXTENT, end) | a block, or another file, and its length | file |
 | Block | (block, HEADER) | length, code, chunk size, checksum | block |
 | Block | (block, CHUNK, index) | the chunk store volume and chunk key holding chunk `index` | block |
-| Block | (ON, volume, block) | reverse entry: which of the block's chunks `volume` holds | block |
+| Block | (block, KEPT, volume) | a place kept beside a chunk's own: the volume holds the same chunk, reachable again once its node is back (repair.md §3) | block |
+| Block | (ON, volume, block) | reverse entry: which of the block's chunks `volume` holds, its own place or a kept one | block |
 
 The cell's root range keeps, beside the three layers, the volume table placement reads: each
-node's failure domain and each volume's node and bytes (node.md §6.6, `mantle_meta::root`).
+node's failure domain and each volume's node and bytes (node.md §6.6, `mantle_meta::root`); each
+node's presence as the cell has seen it and each volume's standing, leaving or gone, which
+placement and repair judge by (repair.md §2).
 
 - **A version carries its storage class,** and with it the fields S3's API reports about it:
   for INTELLIGENT_TIERING its access tier and the last day it was accessed, and for an

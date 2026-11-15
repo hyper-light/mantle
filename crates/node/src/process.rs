@@ -2014,6 +2014,15 @@ async fn serve(
                         // DIAGNOSTIC (diag-nfc2): the trace's window, with the node's state and
                         // its log's counts.
                         crate::diag_trace::note(node.diag_state());
+                        crate::diag_trace::note(format!(
+                            "ends head {} body {} trailer {} finished {} nothing {} opened {}",
+                            hyper_transport::endpoint_diag_ends(0),
+                            hyper_transport::endpoint_diag_ends(1),
+                            hyper_transport::endpoint_diag_ends(2),
+                            hyper_transport::endpoint_diag_ends(3),
+                            hyper_transport::endpoint_diag_ends(4),
+                            hyper_transport::endpoint_diag_ends(5),
+                        ));
                         if let Ok(s) = node.log_stats(None) {
                             crate::diag_trace::note(format!(
                                 "log frames {} updates {} flushes {} durable_writes {} fallbacks {} flushed_confirmations {} bytes {} flush_p50_ns {} flush_p99_ns {} flush_count {} flush_sum_ns {} write_p50_ns {} commit_wait_p50_ns {} commit_wait_p99_ns {} commit_wait_count {}",

@@ -40,6 +40,13 @@ mod crc;
 mod credit;
 mod deadlines;
 mod endpoint;
+
+/// DIAGNOSTIC (diag-nfc2): owners' ends counted by their exchange's outgoing half then.
+pub fn endpoint_diag_ends(slot: usize) -> u64 {
+    endpoint::DIAG_ENDS
+        .get(slot)
+        .map_or(0, |c| c.load(std::sync::atomic::Ordering::Relaxed))
+}
 mod error;
 mod exchange;
 mod frame;

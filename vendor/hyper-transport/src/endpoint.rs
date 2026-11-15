@@ -3976,6 +3976,20 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
     /// the exchange waits for the trailer to go; resetting it would refuse the peer a message its
     /// owner wrote whole.
     fn end(&mut self, conn: &mut Conn<C::Role>, id: u64) {
+        // DIAGNOSTIC (diag-nfc2): what an owner's end finds of its exchange's outgoing half.
+        if let Some(exchange) = self.exchanges.get(id) {
+            let slot = match (exchange.opened, exchange.out.state) {
+                (false, Out::Head) => 0,
+                (false, Out::Body) => 1,
+                (false, Out::Trailer) => 2,
+                (false, Out::Finished) => 3,
+                (false, Out::Nothing) => 4,
+                (true, _) => 5,
+            };
+            if let Some(c) = DIAG_ENDS.get(slot) {
+                c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         let trailer_left = self.exchanges.get_mut(id).is_some_and(|exchange| {
             exchange.ended = exchange.out.state == Out::Trailer
                 && matches!(exchange.incoming.state, In::Whole | In::Finished);
@@ -5283,3 +5297,15 @@ fn bind_stream(by_stream: &mut Vec<(StreamId, u64)>, stream: StreamId, id: u64) 
         by_stream.insert(at, (stream, id));
     }
 }
+
+/// DIAGNOSTIC (diag-nfc2): owners' ends of exchanges by what their outgoing half was then: a
+/// served exchange's reply head unwritten, its body unwritten, its trailer left, finished, no reply
+/// yet; and an exchange this side opened.
+pub static DIAG_ENDS: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];

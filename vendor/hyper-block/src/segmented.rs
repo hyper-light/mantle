@@ -5,24 +5,225 @@
 //! A file's own first writes hold up every other read and write of that file while they run, and
 //! leave another file's untouched (mantle docs/research/48, measured on APFS; on Linux an
 //! extending write takes the inode's lock exclusively, fs/ext4/file.c and fs/xfs/xfs_file.c). So a
-//! file that grows does so by a new segment, created whole at its final length ([`Self::add`]),
+//! file that grows does so by a new segment, created whole at its final length ([`SegmentedFile::add`]),
 //! written by its owner while no other transfer uses it, and only then used: the segments in use
-//! take overwrites alone.
+//! take overwrites alone. A segment never changes length once created, a transfer lies within one
+//! segment (a caller lays its blocks out so none crosses a boundary), and the segments are at most
+//! the bound given at open.
 //!
-//! A segment never changes length once created, so every handle finds the layout from the
-//! segments' names and lengths alone: a duplicate made before a segment was added opens it when a
-//! transfer first reaches past the segments it knows, and nothing is shared between handles. A
-//! transfer lies within one segment (a caller lays its blocks out so none crosses a boundary), and
-//! the segments are at most the bound given at open.
+//! **One open file a segment, whatever the handles.** [`SegmentedFile::create`] and
+//! [`SegmentedFile::open`] give the file's *owner*, which opens the base and each segment beside it
+//! once; a segment added through any handle is opened once, by that handle. Every other handle,
+//! made by [`BlockFile::try_clone`], transfers through those same open files and opens none: a
+//! descriptor a handle cost before, each opening every segment for itself, came to about 188 a
+//! segment on a 32-core host, where a maintenance worker's handle and each of the issuer's
+//! duplicates of it opened each new segment (mantle `docs/measurements/2026-11-06-targets.md`),
+//! and a 100M fill ran out of descriptors at macOS's default limit. A transfer names its offset,
+//! and positioned transfers on one open file from many threads take their offsets from their calls
+//! and are atomic with respect to one another (`crate::file`), so a shared open file orders nothing
+//! that each handle's own would not. A segment's writes and
+//! flushes are counted on the segment, not the handle: a flush is the file's, whichever handle
+//! wrote, so one through any handle covers every handle's writes. Before, each handle kept marks
+//! of its own, and the device's issuer flushes a batch on one worker's handle after its writes ran
+//! on any workers' handles, so a segment written only on other workers' handles was not flushed.
+//! What a handle keeps of its own is its reads from memory.
+//!
+//! The open files sit in a process-static slot ([`FILES`]) read under counted pins (hyper-rt
+//! `retire::Pinned`, the shard registry's protocol): a handle's transfer pins the slot for its
+//! call, and the owner's drop retires the open files, which the last transfer running then closes,
+//! on the file it began on. A slot carries the generation of the owner that holds it, so a handle
+//! used after its owner closed the file, its slot free or another file's by then, is refused,
+//! typed, and never transfers through another file's descriptors.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+use hyper_rt::retire::Pinned;
 
 use crate::DiskError;
 use crate::block::{BlockFile, Durable};
 use crate::buf::{AlignedBuf, Alignment};
 use crate::file::{CachingRequest, DeviceFile, sync_dir};
+use crate::resident::{Epoch, Resident};
+
+/// One chunk for each bit of a slot's index: chunk `c` holds `2^c` slots, so the chunks hold every
+/// index a `usize` can name.
+const CHUNKS: usize = usize::BITS as usize;
+
+/// Slots kept in chunks of 1, 2, 4 and on, each made when an index first reaches it: they hold
+/// as many slots as were reached, never more than twice as many, and a made slot never moves, so
+/// `&self` finds slots while another thread makes one (the bucket layout of Dechev, Pirkelbauer and
+/// Stroustrup, "Lock-free dynamically resizable arrays", OPODIS 2006). Slots for a bound of 30 K
+/// segments made up front cost a 10M fill's handles 4.9 GB of memory touched at setup (mantle
+/// `docs/research/48-first-writes.md` §6).
+#[derive(Debug)]
+struct Chunked<T> {
+    chunks: [OnceLock<Box<[T]>>; CHUNKS],
+}
+
+impl<T> Chunked<T> {
+    const fn new() -> Self {
+        Self {
+            chunks: [const { OnceLock::new() }; CHUNKS],
+        }
+    }
+
+    /// The chunk slot `index` is in, and its place there.
+    fn locate(index: usize) -> Option<(usize, usize)> {
+        let n = index.checked_add(1)?;
+        let chunk = n.ilog2();
+        let first = 1usize.checked_shl(chunk)?;
+        Some((usize::try_from(chunk).ok()?, n.checked_sub(first)?))
+    }
+
+    /// Slot `index`, if its chunk was made.
+    fn get(&self, index: usize) -> Option<&T> {
+        let (chunk, at) = Self::locate(index)?;
+        self.chunks.get(chunk)?.get()?.get(at)
+    }
+
+    fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        let (chunk, at) = Self::locate(index)?;
+        self.chunks.get_mut(chunk)?.get_mut()?.get_mut(at)
+    }
+
+    /// Slot `index`, its chunk made of `empty` slots if none reached it before; none when the
+    /// chunk cannot be allocated.
+    fn make(&self, index: usize, empty: impl Fn() -> T) -> Option<&T> {
+        let (chunk, at) = Self::locate(index)?;
+        let cell = self.chunks.get(chunk)?;
+        if cell.get().is_none() {
+            let size = 1usize.checked_shl(u32::try_from(chunk).ok()?)?;
+            let mut slots = Vec::new();
+            slots.try_reserve_exact(size).ok()?;
+            slots.extend((0..size).map(|_| empty()));
+            // Made meanwhile by another thread: that chunk stays, and this one goes.
+            let _ = cell.set(slots.into_boxed_slice());
+        }
+        cell.get()?.get(at)
+    }
+
+    /// The made slots, each with its index, in order.
+    fn iter_mut(&mut self) -> impl Iterator<Item = (usize, &mut T)> {
+        self.chunks
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(chunk, cell)| Some((chunk, cell.get_mut()?)))
+            .flat_map(|(chunk, slots)| {
+                let first = 1usize
+                    .checked_shl(u32::try_from(chunk).unwrap_or(u32::MAX))
+                    .and_then(|n| n.checked_sub(1));
+                slots
+                    .iter_mut()
+                    .enumerate()
+                    .filter_map(move |(at, slot)| Some((first?.checked_add(at)?, slot)))
+            })
+    }
+
+    /// The made slots, each with its index, in order.
+    fn iter(&self) -> impl Iterator<Item = (usize, &T)> {
+        self.chunks
+            .iter()
+            .enumerate()
+            .filter_map(|(chunk, cell)| Some((chunk, cell.get()?)))
+            .flat_map(|(chunk, slots)| {
+                let first = 1usize
+                    .checked_shl(u32::try_from(chunk).unwrap_or(u32::MAX))
+                    .and_then(|n| n.checked_sub(1));
+                slots
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(at, slot)| Some((first?.checked_add(at)?, slot)))
+            })
+    }
+}
+
+/// The process's segmented files, a slot each: made as files are opened and reused once a file is
+/// closed, so there are as many as were ever open at once. Each holds at least its base's
+/// descriptor, so the process's descriptor allowance bounds them.
+static FILES: Chunked<Slot> = Chunked::new();
+
+/// A segmented file's place in [`FILES`].
+#[derive(Debug)]
+struct Slot {
+    /// Even while the slot is free, odd while an owner holds it: then the generation its
+    /// handles carry, so a handle of a file closed since never names the slot's next file.
+    state: AtomicU64,
+    open: Pinned<Open>,
+}
+
+impl Slot {
+    fn new() -> Self {
+        Self {
+            state: AtomicU64::new(0),
+            open: Pinned::new(),
+        }
+    }
+
+    /// Claims the slot if it is free: the generation it is held at.
+    fn take(&self) -> Option<u64> {
+        let state = self.state.load(Ordering::SeqCst);
+        if !state.is_multiple_of(2) {
+            return None;
+        }
+        let held = state.checked_add(1)?;
+        self.state
+            .compare_exchange(state, held, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()?;
+        Some(held)
+    }
+
+    /// A free slot of [`FILES`], claimed: it and its generation. Each slot is looked at once, and
+    /// one past those made is free, so the search ends within the files held now and one.
+    fn claim(base: &Path) -> Result<(&'static Slot, u64), DiskError> {
+        for index in 0..usize::MAX {
+            let slot = FILES
+                .make(index, Slot::new)
+                .ok_or_else(|| beyond(base, "no memory for another segmented file's slot"))?;
+            if let Some(generation) = slot.take() {
+                return Ok((slot, generation));
+            }
+        }
+        Err(beyond(base, "every segmented file slot is held"))
+    }
+
+    /// Frees the slot, held and never published or its files closed: the next claim may take it.
+    fn free(&self) {
+        self.state.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// The end of a retirement, run by whoever finishes it last, the owner or a transfer's unpin:
+/// every segment's file closed, then the slot freed.
+fn closed(slot: &'static Slot, open: Box<Open>) {
+    drop(open);
+    slot.free();
+}
+
+/// What every handle of a segmented file shares: its segments' open files.
+#[derive(Debug)]
+struct Open {
+    /// The generation its slot was claimed at: what each handle carries.
+    generation: u64,
+    base: PathBuf,
+    caching: CachingRequest,
+    align: Alignment,
+    bound: usize,
+    segments: Chunked<OnceLock<Segment>>,
+    /// The segments filled, a prefix: a transfer finds its segment by a binary search over them,
+    /// which touches a logarithm of the segments where a scan touched each (about 250
+    /// instructions a get more than one file's at 10M keys and 20 segments, mantle
+    /// `docs/research/48-first-writes.md` §6).
+    filled: AtomicUsize,
+}
+
+/// Every handle reads `Open` from its own thread and the last retirer closes it on its own: what
+/// `Pinned` asks of what it holds.
+const _: () = {
+    const fn shared<T: Send + Sync>() {}
+    shared::<Open>();
+};
 
 #[derive(Debug)]
 struct Segment {
@@ -30,63 +231,152 @@ struct Segment {
     start: u64,
     len: u64,
     file: DeviceFile,
-    /// Written since its last flush.
-    dirty: AtomicBool,
+    /// Writes completed through any handle, counted as each returns, and the most of them a
+    /// flush made durable, set as the flush returns: the segment needs a flush while the first is
+    /// past the second. A flush is the file's, whichever handle wrote (fdatasync(2), "all modified
+    /// in-core data of ... the file referred to by the file descriptor"; F_FULLFSYNC and
+    /// FlushFileBuffers likewise), so a handle's flush covers every handle's writes, as
+    /// [`BlockFile::sync_data`] promises, and one that finds the second at the first relies on a
+    /// flush that has returned, never on one still running.
+    written: AtomicU64,
+    flushed: AtomicU64,
 }
 
-/// One chunk for each bit of a slot's index: chunk `c` holds `2^c` slots, so the chunks hold every
-/// index a `usize` can name.
-const CHUNKS: usize = usize::BITS as usize;
-
-/// The slots a handle keeps its segments in, in order, each filled once, when its segment is found
-/// or added. They sit in chunks of 1, 2, 4 and on, each made when a segment first reaches it: a
-/// handle holds slots for the segments the file has, never more than twice as many, rather than
-/// for its bound, and a filled slot never moves, so `&self` finds segments while another thread
-/// adds one (the bucket layout of Dechev, Pirkelbauer and Stroustrup, "Lock-free dynamically
-/// resizable arrays", OPODIS 2006). Slots for a bound of 30 K segments made up front cost a 10M
-/// fill's handles 4.9 GB of memory touched at setup (mantle `docs/research/48-first-writes.md` §6).
-#[derive(Debug)]
-struct Slots {
-    chunks: [OnceLock<Box<[OnceLock<Segment>]>>; CHUNKS],
-    /// The slots filled, a prefix: a read finds its segment by a binary search over them, which
-    /// touches a logarithm of the segments where a scan touched each (about 250 instructions a
-    /// get more than one file's at 10M keys and 20 segments, mantle
-    /// `docs/research/48-first-writes.md` §6).
-    filled: AtomicUsize,
-    bound: usize,
-}
-
-impl Slots {
-    fn new(bound: usize) -> Self {
+impl Segment {
+    fn new(start: u64, len: u64, file: DeviceFile) -> Self {
         Self {
-            chunks: std::array::from_fn(|_| OnceLock::new()),
-            filled: AtomicUsize::new(0),
-            bound,
+            start,
+            len,
+            file,
+            written: AtomicU64::new(0),
+            flushed: AtomicU64::new(0),
         }
     }
 
-    /// Fills slot `index`, its chunk made if no segment reached it before: false when another
-    /// thread filled it first; none past the bound, or when the chunk cannot be allocated. The
-    /// count reaches past the slot either way, so a reader that found it filled by another thread
-    /// makes the progress that thread has yet to record.
-    fn fill(&self, index: usize, segment: Segment) -> Option<bool> {
-        let set = self.make(index)?.set(segment).is_ok();
-        self.filled
-            .fetch_max(index.checked_add(1)?, Ordering::AcqRel);
-        Some(set)
+    /// A write through any handle returned: the next flush covers it.
+    fn wrote(&self) {
+        self.written.fetch_add(1, Ordering::Release);
     }
 
-    /// The slots filled.
-    fn len(&self) -> usize {
-        self.filled.load(Ordering::Acquire)
+    /// Flushes the segment if a write returned since the last flush that returned: each write
+    /// counted before this reads the count completed before the flush begins, so the flush covers
+    /// it.
+    fn flush(&self) -> Result<(), DiskError> {
+        let written = self.written.load(Ordering::Acquire);
+        if self.flushed.load(Ordering::Acquire) >= written {
+            return Ok(());
+        }
+        self.file.sync_data()?;
+        self.flushed.fetch_max(written, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Whether a write returned since the last flush that returned.
+    #[cfg(test)]
+    fn unflushed(&self) -> bool {
+        self.flushed.load(Ordering::Acquire) < self.written.load(Ordering::Acquire)
+    }
+}
+
+impl Open {
+    /// Opens `base` and every segment beside it, at most `bound` in all.
+    fn new(
+        generation: u64,
+        base: &Path,
+        caching: CachingRequest,
+        align: Alignment,
+        bound: usize,
+    ) -> Result<Self, DiskError> {
+        let open = Self {
+            generation,
+            base: base.to_path_buf(),
+            caching,
+            align,
+            bound,
+            segments: Chunked::new(),
+            filled: AtomicUsize::new(0),
+        };
+        let first = DeviceFile::open_shared(base, false, caching, align)?;
+        let len = first.len()?;
+        open.place(0, 0, len, first)?;
+        // Every segment that exists now, so the end is the whole file's.
+        open.discover_all()?;
+        Ok(open)
+    }
+
+    /// Opens the segment after those filled, if one exists: whether it was found, by this call or
+    /// by another handle's meanwhile. Another owner of the same files, opened apart, adds segments
+    /// these open files do not hold; each is opened here when a transfer first reaches past the
+    /// segments filled, and only then, as the segment is written whole before any transfer uses
+    /// it (the module's note).
+    fn discover(&self) -> Result<bool, DiskError> {
+        let index = self.filled.load(Ordering::SeqCst);
+        if index >= self.bound {
+            return Ok(false);
+        }
+        let path = segment_path(&self.base, index);
+        if !path.exists() {
+            return Ok(false);
+        }
+        let file = DeviceFile::open_shared(&path, false, self.caching, self.align)?;
+        let len = file.len()?;
+        match self.place(index, self.end(), len, file) {
+            Ok(()) => Ok(true),
+            // Filled meanwhile through another handle: the same segment, found once.
+            Err(_) if self.segment(index).is_some() => Ok(true),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Opens every segment beside those filled: at most the bound's, one a pass.
+    fn discover_all(&self) -> Result<(), DiskError> {
+        for _ in 0..self.bound {
+            if !self.discover()? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Fills segment `index`, then counts it filled; refused past the bound, when its chunk cannot
+    /// be allocated, or when it was filled already.
+    fn place(&self, index: usize, start: u64, len: u64, file: DeviceFile) -> Result<(), DiskError> {
+        if index >= self.bound {
+            return Err(beyond(&self.base, "segments past the file's bound"));
+        }
+        let cell = self
+            .segments
+            .make(index, OnceLock::new)
+            .ok_or_else(|| beyond(&self.base, "no memory for another segment's slot"))?;
+        if cell.set(Segment::new(start, len, file)).is_err() {
+            return Err(beyond(&self.base, "a segment slot filled twice"));
+        }
+        let filled = index
+            .checked_add(1)
+            .ok_or_else(|| beyond(&self.base, "segments past usize"))?;
+        self.filled.fetch_max(filled, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn segment(&self, index: usize) -> Option<&Segment> {
+        self.segments.get(index)?.get()
+    }
+
+    /// The end of the segments filled: the file's length.
+    fn end(&self) -> u64 {
+        self.filled
+            .load(Ordering::SeqCst)
+            .checked_sub(1)
+            .and_then(|last| self.segment(last))
+            .map_or(0, |s| s.start.saturating_add(s.len))
     }
 
     /// The segment holding `offset`, and its index.
     fn find(&self, offset: u64) -> Option<(usize, &Segment)> {
-        let (mut lo, mut hi) = (0usize, self.filled.load(Ordering::Acquire));
+        let (mut lo, mut hi) = (0usize, self.filled.load(Ordering::SeqCst));
         while lo < hi {
             let mid = lo.checked_add(hi.checked_sub(lo)?.checked_div(2)?)?;
-            let s = self.get(mid)?.get()?;
+            let s = self.segment(mid)?;
             if offset < s.start {
                 hi = mid;
             } else if offset >= s.start.saturating_add(s.len) {
@@ -98,80 +388,93 @@ impl Slots {
         None
     }
 
-    /// The chunk slot `index` is in, and its place there.
-    fn locate(index: usize) -> Option<(usize, usize)> {
-        let n = index.checked_add(1)?;
-        let chunk = n.ilog2();
-        let first = 1usize.checked_shl(chunk)?;
-        Some((usize::try_from(chunk).ok()?, n.checked_sub(first)?))
+    /// The segment holding `[offset, offset + len)`, its index and the offset in it; a transfer
+    /// across two segments, or past the last, is refused.
+    /// Each pass finds the segment, refuses, or fills one more segment, so the passes are at most
+    /// the bound.
+    fn holding(&self, offset: u64, len: usize) -> Result<(usize, &Segment, u64), DiskError> {
+        let end = u64::try_from(len)
+            .ok()
+            .and_then(|len| offset.checked_add(len))
+            .ok_or_else(|| beyond(&self.base, "a transfer past u64"))?;
+        for _ in 0..=self.bound {
+            if let Some((index, s)) = self.find(offset) {
+                if end > s.start.saturating_add(s.len) {
+                    return Err(beyond(&self.base, "a transfer across two segments"));
+                }
+                return Ok((index, s, offset.saturating_sub(s.start)));
+            }
+            if offset < self.end() || !self.discover()? {
+                break;
+            }
+        }
+        Err(beyond(
+            &self.base,
+            "a transfer past the file's last segment",
+        ))
     }
 
-    fn get(&self, index: usize) -> Option<&OnceLock<Segment>> {
-        let (chunk, at) = Self::locate(index)?;
-        self.chunks.get(chunk)?.get()?.get(at)
-    }
-
-    fn get_mut(&mut self, index: usize) -> Option<&mut Segment> {
-        let (chunk, at) = Self::locate(index)?;
-        self.chunks
-            .get_mut(chunk)?
-            .get_mut()?
-            .get_mut(at)?
-            .get_mut()
-    }
-
-    /// Slot `index`, its chunk made if no segment reached it before; none past the bound, or
-    /// when the chunk cannot be allocated.
-    fn make(&self, index: usize) -> Option<&OnceLock<Segment>> {
+    /// Adds a segment of `len` bytes after the last, allocated whole and its name made durable,
+    /// then opened for every handle: its index and the offset it starts at.
+    fn add(&self, len: u64) -> Result<(usize, u64), DiskError> {
+        self.discover_all()?;
+        let index = self.filled.load(Ordering::SeqCst);
         if index >= self.bound {
-            return None;
+            return Err(beyond(&self.base, "segments past the file's bound"));
         }
-        let (chunk, at) = Self::locate(index)?;
-        let cell = self.chunks.get(chunk)?;
-        if cell.get().is_none() {
-            let size = 1usize.checked_shl(u32::try_from(chunk).ok()?)?;
-            let mut slots = Vec::new();
-            slots.try_reserve_exact(size).ok()?;
-            slots.extend((0..size).map(|_| OnceLock::new()));
-            // Made meanwhile by another thread: that chunk stays, and this one goes.
-            let _ = cell.set(slots.into_boxed_slice());
+        let path = segment_path(&self.base, index);
+        let file = DeviceFile::open_shared(&path, true, self.caching, self.align)?;
+        if file.len()? != 0 {
+            return Err(beyond(&path, "a new segment that already holds bytes"));
         }
-        cell.get()?.get(at)
-    }
-
-    /// The segments filled, in order.
-    fn iter(&self) -> impl Iterator<Item = &Segment> {
-        self.chunks
-            .iter()
-            .map_while(OnceLock::get)
-            .flat_map(|chunk| chunk.iter())
-            .map_while(OnceLock::get)
-    }
-
-    fn iter_mut(&mut self) -> impl Iterator<Item = &mut Segment> {
-        self.chunks
-            .iter_mut()
-            .filter_map(OnceLock::get_mut)
-            .flat_map(|chunk| chunk.iter_mut())
-            .filter_map(OnceLock::get_mut)
+        made_whole(&file, &path, len)?;
+        let start = self.end();
+        self.place(index, start, len, file)?;
+        Ok((index, start))
     }
 }
 
-/// A base file and the segments beside it, as one file ([`BlockFile`]).
+/// What one handle's own reads from memory of a segment keep ([`BlockFile::read_resident_at`]):
+/// each handle maps and probes for itself, from the file system's answer the segment's open file
+/// got.
+#[derive(Debug)]
+struct Mark {
+    resident: Resident,
+}
+
+impl Mark {
+    fn new(segment: &Segment, shadow: bool) -> Self {
+        let mut resident = segment.file.resident_for_handle();
+        if shadow {
+            resident.set_shadow(true);
+        }
+        Self { resident }
+    }
+}
+
+/// A base file and the segments beside it, as one file ([`BlockFile`]): the owner that opened
+/// them, or a handle that transfers through the owner's open files ([`BlockFile::try_clone`]).
 #[derive(Debug)]
 pub struct SegmentedFile {
+    slot: &'static Slot,
+    generation: u64,
+    /// Opened the segments ([`Self::create`], [`Self::open`]): its drop closes them.
+    owner: bool,
     base: PathBuf,
-    caching: CachingRequest,
     align: Alignment,
-    /// The segments this handle knows.
-    slots: Slots,
-    /// Shadow mode for resident reads, given to each segment as it is found
+    bound: usize,
+    /// The base's layout block and whether new space is zeroed, asked once, at open.
+    layout: Alignment,
+    fills: bool,
+    /// This handle's reads from memory of each segment it read so.
+    marks: Chunked<OnceLock<Mark>>,
+    /// Shadow mode for resident reads, given to each segment as this handle reaches it
     /// ([`BlockFile::set_residency_shadow`]).
     shadow: bool,
     /// The epoch every segment's kept answers hold in (`crate::resident`): the kernel's count it
     /// stands for is the machine's, so one serves them all, read once however many segments a
     /// file's reads reach.
-    epoch: crate::resident::Epoch,
+    epoch: Epoch,
 }
 
 /// The path of segment `index`: the base file for 0, `<base>.<index>` after.
@@ -189,6 +492,11 @@ fn beyond(path: &Path, reason: &'static str) -> DiskError {
         path: path.to_path_buf(),
         reason,
     }
+}
+
+/// A transfer through a handle whose owner has closed the file.
+fn shut(path: &Path) -> DiskError {
+    beyond(path, "a segmented file whose owner has closed it")
 }
 
 /// The alignment a write past the OS's cache needs of its buffer: on macOS the cluster layer
@@ -224,7 +532,7 @@ impl SegmentedFile {
     /// Creates `base`, empty, as the anchor of a file kept as segments, its name made durable:
     /// every byte the file comes to hold is in a segment [`Self::add`] makes after it, so the
     /// base, never written, holds no first write either. At most `bound` segments, the base
-    /// among them.
+    /// among them. The file's owner ([`Self::open`]).
     pub fn create(
         base: &Path,
         caching: CachingRequest,
@@ -243,7 +551,8 @@ impl SegmentedFile {
         Self::open(base, caching, align, bound)
     }
 
-    /// Opens `base` and every segment beside it, at most `bound` in all.
+    /// Opens `base` and every segment beside it, at most `bound` in all, as their owner: the one
+    /// handle that opens them, whose drop closes them for every handle made from it.
     pub fn open(
         base: &Path,
         caching: CachingRequest,
@@ -253,144 +562,103 @@ impl SegmentedFile {
         if bound == 0 {
             return Err(beyond(base, "a segmented file bounded to no segments"));
         }
-        let first = DeviceFile::open(base, false, caching, align)?;
-        let len = first.len()?;
-        let file = Self {
-            base: base.to_path_buf(),
-            caching,
-            align,
-            slots: Slots::new(bound),
-            shadow: false,
-            epoch: crate::resident::Epoch::new(),
+        let (slot, generation) = Slot::claim(base)?;
+        Self::open_in(slot, generation, base, caching, align, bound)
+    }
+
+    /// [`Self::open`] in `slot`, claimed at `generation`: freed again if the files cannot be
+    /// opened.
+    fn open_in(
+        slot: &'static Slot,
+        generation: u64,
+        base: &Path,
+        caching: CachingRequest,
+        align: Alignment,
+        bound: usize,
+    ) -> Result<Self, DiskError> {
+        let open = match Open::new(generation, base, caching, align, bound) {
+            Ok(open) => open,
+            Err(e) => {
+                slot.free();
+                return Err(e);
+            }
         };
-        file.place(0, 0, len, first)?;
-        // Every segment that exists now, so `len` is the whole file's.
-        while file.find_next()?.is_some() {}
-        Ok(file)
+        let Some(first) = open.segment(0) else {
+            slot.free();
+            return Err(beyond(base, "a segmented file with no base"));
+        };
+        let owner = Self {
+            slot,
+            generation,
+            owner: true,
+            base: base.to_path_buf(),
+            align,
+            bound,
+            layout: first.file.layout_block(),
+            fills: first.file.fills_new_space(),
+            marks: Chunked::new(),
+            shadow: false,
+            epoch: Epoch::new(),
+        };
+        slot.open.publish(Box::new(open));
+        Ok(owner)
     }
 
-    fn place(&self, index: usize, start: u64, len: u64, file: DeviceFile) -> Result<(), DiskError> {
-        let filled = self
-            .slots
-            .fill(
-                index,
-                Segment {
-                    start,
-                    len,
-                    file,
-                    dirty: AtomicBool::new(false),
+    /// Runs `f` on the open files, pinned for the call; refused once their owner closed them.
+    fn with<R>(&self, f: impl FnOnce(&Open) -> Result<R, DiskError>) -> Result<R, DiskError> {
+        let (slot, generation) = (self.slot, self.generation);
+        slot.open
+            .read(
+                |open| {
+                    if open.generation == generation {
+                        f(open)
+                    } else {
+                        Err(shut(&self.base))
+                    }
                 },
+                |retired| closed(slot, retired),
             )
-            .ok_or_else(|| beyond(&self.base, "segments past the file's bound"))?;
-        if filled {
-            Ok(())
-        } else {
-            Err(beyond(&self.base, "a segment slot filled twice"))
-        }
-    }
-
-    /// The segments this handle knows.
-    fn known(&self) -> usize {
-        self.slots.len()
-    }
-
-    /// The end of the segments this handle knows.
-    fn known_end(&self) -> u64 {
-        self.slots
-            .len()
-            .checked_sub(1)
-            .and_then(|last| self.slots.get(last))
-            .and_then(OnceLock::get)
-            .map_or(0, |s| s.start.saturating_add(s.len))
-    }
-
-    /// Opens the segment after those this handle knows, if it exists: its index.
-    fn find_next(&self) -> Result<Option<usize>, DiskError> {
-        let index = self.known();
-        if index >= self.slots.bound {
-            return Ok(None);
-        }
-        let path = segment_path(&self.base, index);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let mut file = DeviceFile::open(&path, false, self.caching, self.align)?;
-        if self.shadow {
-            file.set_residency_shadow(true);
-        }
-        let len = file.len()?;
-        let start = self.known_end();
-        match self.place(index, start, len, file) {
-            Ok(()) => Ok(Some(index)),
-            // Filled meanwhile through a shared reference: the same segment, found once.
-            Err(_) if self.slots.get(index).is_some_and(|s| s.get().is_some()) => Ok(Some(index)),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// The segment holding `[offset, offset + len)` and its index, finding segments added since
-    /// this handle last looked; a transfer across two segments, or past the last, is refused.
-    /// Each pass finds the segment, refuses, or counts one more segment filled, so the passes are
-    /// at most the bound.
-    fn segment(&self, offset: u64, len: usize) -> Result<(usize, &Segment), DiskError> {
-        let end = offset
-            .checked_add(u64::try_from(len).map_err(|_| beyond(&self.base, "a transfer past u64"))?)
-            .ok_or_else(|| beyond(&self.base, "a transfer past u64"))?;
-        loop {
-            if let Some((index, s)) = self.slots.find(offset) {
-                if end > s.start.saturating_add(s.len) {
-                    return Err(beyond(&self.base, "a transfer across two segments"));
-                }
-                return Ok((index, s));
-            }
-            if offset < self.known_end() || self.find_next()?.is_none() {
-                return Err(beyond(
-                    &self.base,
-                    "a transfer past the file's last segment",
-                ));
-            }
-        }
+            .unwrap_or_else(|| Err(shut(&self.base)))
     }
 
     /// Adds a segment of `len` bytes after the last, allocated whole and its name made durable
     /// before it is returned: its index and the offset it starts at. Its blocks are allocated
     /// (`DeviceFile::preallocate`), not written; its owner writes them before any other transfer
-    /// uses them.
+    /// uses them. Opened once, for every handle of the file.
     pub fn add(&self, len: u64) -> Result<(usize, u64), DiskError> {
-        while self.find_next()?.is_some() {}
-        let index = self.known();
-        if index >= self.slots.bound {
-            return Err(beyond(&self.base, "segments past the file's bound"));
-        }
-        let path = segment_path(&self.base, index);
-        let mut file = DeviceFile::open(&path, true, self.caching, self.align)?;
-        if file.len()? != 0 {
-            return Err(beyond(&path, "a new segment that already holds bytes"));
-        }
-        made_whole(&file, &path, len)?;
-        if self.shadow {
-            file.set_residency_shadow(true);
-        }
-        let start = self.known_end();
-        self.place(index, start, len, file)?;
-        Ok((index, start))
+        self.with(|open| open.add(len))
     }
 
-    /// The segments, each its start and length, that this handle knows.
+    /// The segments, each its start and length; none once the file's owner has closed it.
     pub fn layout(&self) -> Vec<(u64, u64)> {
-        self.slots.iter().map(|s| (s.start, s.len)).collect()
+        self.with(|open| {
+            let filled = open.filled.load(Ordering::SeqCst);
+            let mut layout = Vec::new();
+            layout
+                .try_reserve_exact(filled)
+                .map_err(|_| beyond(&self.base, "no memory for a segment layout"))?;
+            layout.extend(
+                (0..filled)
+                    .filter_map(|i| open.segment(i))
+                    .map(|s| (s.start, s.len)),
+            );
+            Ok(layout)
+        })
+        .unwrap_or_default()
     }
 
     /// The bound on segments given at open.
     pub fn bound(&self) -> usize {
-        self.slots.bound
+        self.bound
     }
+}
 
-    fn first(&self) -> Result<&Segment, DiskError> {
-        self.slots
-            .iter()
-            .next()
-            .ok_or_else(|| beyond(&self.base, "a segmented file with no base"))
+impl Drop for SegmentedFile {
+    fn drop(&mut self) {
+        if self.owner {
+            let slot = self.slot;
+            slot.open.retire(|open| closed(slot, open));
+        }
     }
 }
 
@@ -400,52 +668,95 @@ impl BlockFile for SegmentedFile {
     }
 
     fn layout_block(&self) -> Alignment {
-        self.first().map_or(self.align, |s| s.file.layout_block())
+        self.layout
     }
 
     fn len(&self) -> Result<u64, DiskError> {
-        while self.find_next()?.is_some() {}
-        Ok(self.known_end())
+        self.with(|open| {
+            open.discover_all()?;
+            Ok(open.end())
+        })
     }
 
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), DiskError> {
-        let (_, s) = self.segment(offset, buf.len())?;
-        s.file.read_exact_at(buf, offset.saturating_sub(s.start))
+        self.with(|open| {
+            let (_, s, at) = open.holding(offset, buf.len())?;
+            s.file.read_exact_at(buf, at)
+        })
     }
 
     fn read_resident_at(&mut self, buf: &mut [u8], offset: u64) -> Result<bool, DiskError> {
-        let (index, start) = self.segment(offset, buf.len()).map(|(i, s)| (i, s.start))?;
-        let s = self
-            .slots
-            .get_mut(index)
-            .ok_or_else(|| beyond(&self.base, "a segment lost from its slot"))?;
-        s.file
-            .read_resident_with(buf, offset.saturating_sub(start), &mut self.epoch)
+        let (slot, generation, shadow) = (self.slot, self.generation, self.shadow);
+        let Self {
+            base, marks, epoch, ..
+        } = self;
+        slot.open
+            .read(
+                |open| {
+                    if open.generation != generation {
+                        return Err(shut(base));
+                    }
+                    let (index, s, at) = open.holding(offset, buf.len())?;
+                    let cell = marks
+                        .make(index, OnceLock::new)
+                        .ok_or_else(|| beyond(base, "no memory for another segment's mark"))?;
+                    cell.get_or_init(|| Mark::new(s, shadow));
+                    let mark = marks
+                        .get_mut(index)
+                        .and_then(OnceLock::get_mut)
+                        .ok_or_else(|| beyond(base, "a segment's mark lost from its slot"))?;
+                    s.file
+                        .read_resident_through(&mut mark.resident, buf, at, epoch)
+                },
+                |retired| closed(slot, retired),
+            )
+            .unwrap_or_else(|| Err(shut(base)))
     }
 
     fn reads_resident(&self) -> bool {
-        // Every segment's own handle: one that learned its file system refuses says so for all.
-        self.first().is_ok() && self.slots.iter().all(|s| s.file.reads_resident())
+        // Every segment through this handle: one that learned its file system refuses says so
+        // for all.
+        self.with(|open| {
+            let filled = open.filled.load(Ordering::SeqCst);
+            Ok(filled > 0
+                && (0..filled).all(|i| {
+                    open.segment(i).is_some_and(|s| {
+                        s.file.reads_resident()
+                            && self
+                                .marks
+                                .get(i)
+                                .and_then(OnceLock::get)
+                                .is_none_or(|m| m.resident.reads())
+                    })
+                }))
+        })
+        .unwrap_or(false)
     }
 
     fn residency(&self) -> crate::Residency {
-        self.slots
+        self.marks
             .iter()
-            .map(|s| s.file.residency())
+            .filter_map(|(_, cell)| cell.get())
+            .map(|m| m.resident.residency())
             .fold(self.epoch.residency(), crate::Residency::plus)
     }
 
     fn set_residency_shadow(&mut self, on: bool) {
         self.shadow = on;
-        for s in self.slots.iter_mut() {
-            s.file.set_residency_shadow(on);
+        for (_, cell) in self.marks.iter_mut() {
+            if let Some(mark) = cell.get_mut() {
+                mark.resident.set_shadow(on);
+            }
         }
     }
 
     fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError> {
-        let (_, s) = self.segment(offset, buf.len())?;
-        s.dirty.store(true, Ordering::Release);
-        s.file.write_all_at(buf, offset.saturating_sub(s.start))
+        self.with(|open| {
+            let (_, s, at) = open.holding(offset, buf.len())?;
+            s.file.write_all_at(buf, at)?;
+            s.wrote();
+            Ok(())
+        })
     }
 
     /// Writes the copies through a handle of each segment they reach opened past the OS's cache
@@ -464,18 +775,19 @@ impl BlockFile for SegmentedFile {
         let mut at = offset;
         let mut left = copies;
         while left > 0 {
-            let (index, s) = self.segment(at, fill.len())?;
+            let (index, start, len) = self.with(|open| {
+                let (index, s, _) = open.holding(at, fill.len())?;
+                Ok((index, s.start, s.len))
+            })?;
             let direct = DeviceFile::open(
                 &segment_path(&self.base, index),
                 false,
                 CachingRequest::PreferDirect,
                 self.align,
             )?;
-            s.dirty.store(true, Ordering::Release);
             // The copies this segment holds from `at` on.
-            let here = s
-                .start
-                .saturating_add(s.len)
+            let here = start
+                .saturating_add(len)
                 .saturating_sub(at)
                 .checked_div(piece)
                 .unwrap_or(0)
@@ -483,7 +795,13 @@ impl BlockFile for SegmentedFile {
             if here == 0 {
                 return Err(beyond(&self.base, "a copy across two segments"));
             }
-            direct.write_copies_at(fill, at.saturating_sub(s.start), here)?;
+            direct.write_copies_at(fill, at.saturating_sub(start), here)?;
+            self.with(|open| {
+                open.segment(index)
+                    .ok_or_else(|| beyond(&self.base, "a written segment lost"))?
+                    .wrote();
+                Ok(())
+            })?;
             at = piece
                 .checked_mul(here)
                 .and_then(|b| at.checked_add(b))
@@ -493,19 +811,24 @@ impl BlockFile for SegmentedFile {
         Ok(())
     }
 
-    /// Flushes every segment written since its last flush: the base's flush alone would leave
-    /// another segment's writes to a crash.
+    /// Flushes every segment written since its last flush, through this handle or any other: the
+    /// base's flush alone would leave another segment's writes to a crash, and a flush of only
+    /// what this handle wrote would leave the writes the device's issuer made on its other
+    /// workers' handles to one.
     fn sync_data(&self) -> Result<(), DiskError> {
-        for s in self.slots.iter() {
-            if s.dirty.swap(false, Ordering::AcqRel) {
-                s.file.sync_data()?;
+        self.with(|open| {
+            let filled = open.filled.load(Ordering::SeqCst);
+            for index in 0..filled {
+                open.segment(index)
+                    .ok_or_else(|| beyond(&self.base, "a segment lost from its slot"))?
+                    .flush()?;
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     fn fills_new_space(&self) -> bool {
-        self.first().is_ok_and(|s| s.file.fills_new_space())
+        self.fills
     }
 
     fn grows_by_segments(&self) -> bool {
@@ -517,35 +840,42 @@ impl BlockFile for SegmentedFile {
     }
 
     fn segment_end(&self, offset: u64) -> Result<Option<u64>, DiskError> {
-        while self.find_next()?.is_some() {}
-        Ok(self
-            .slots
-            .iter()
-            .find(|s| offset >= s.start && offset < s.start.saturating_add(s.len))
-            .map(|s| s.start.saturating_add(s.len)))
+        self.with(|open| {
+            open.discover_all()?;
+            Ok(open
+                .find(offset)
+                .map(|(_, s)| s.start.saturating_add(s.len)))
+        })
     }
 
     fn write_durable_at(&self, buf: &[u8], offset: u64) -> Result<Durable, DiskError> {
-        let (_, s) = self.segment(offset, buf.len())?;
-        s.file.write_durable_at(buf, offset.saturating_sub(s.start))
+        self.with(|open| {
+            let (_, s, at) = open.holding(offset, buf.len())?;
+            s.file.write_durable_at(buf, at)
+        })
     }
 
+    /// A handle of the same open files, taking no descriptor of its own: it transfers through the
+    /// owner's, keeps its own record of what it wrote and read from memory, and is refused once
+    /// the owner has closed them.
     fn try_clone(&self) -> Result<Self, DiskError> {
-        let copy = Self {
-            base: self.base.clone(),
-            caching: self.caching,
-            align: self.align,
-            slots: Slots::new(self.slots.bound),
-            shadow: self.shadow,
-            epoch: crate::resident::Epoch::new(),
-        };
-        for (i, s) in self.slots.iter().enumerate() {
-            copy.place(i, s.start, s.len, s.file.try_clone()?)?;
-        }
-        Ok(copy)
+        self.with(|_| {
+            Ok(Self {
+                slot: self.slot,
+                generation: self.generation,
+                owner: false,
+                base: self.base.clone(),
+                align: self.align,
+                bound: self.bound,
+                layout: self.layout,
+                fills: self.fills,
+                marks: Chunked::new(),
+                shadow: self.shadow,
+                epoch: Epoch::new(),
+            })
+        })
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,9 +908,26 @@ mod tests {
         b.as_slice()[0]
     }
 
+    /// Which of the file's segments were written since their last flush, through any handle.
+    fn dirty(f: &SegmentedFile) -> Vec<bool> {
+        f.with(|open| {
+            let filled = open.filled.load(Ordering::SeqCst);
+            Ok((0..filled)
+                .map(|i| open.segment(i).is_some_and(Segment::unflushed))
+                .collect())
+        })
+        .unwrap()
+    }
+
+    /// The descriptors of the open files `f` transfers through: one for each segment opened.
+    fn opened(f: &SegmentedFile) -> usize {
+        f.with(|open| Ok(open.filled.load(Ordering::SeqCst)))
+            .unwrap()
+    }
+
     /// Segments added after the base are read and written at offsets into the concatenation,
-    /// each byte landing in the segment that holds it; a duplicate made before a segment was
-    /// added finds it on first use; reopened, the file has every segment and its whole length.
+    /// each byte landing in the segment that holds it; a handle made before a segment was added
+    /// transfers through it; reopened, the file has every segment and its whole length.
     #[test]
     fn segments_are_one_file_to_every_handle() {
         let dir = tempfile::tempdir().unwrap();
@@ -591,13 +938,13 @@ mod tests {
         let early = file.try_clone().unwrap();
         let (index, start) = file.add(3 * 4096).unwrap();
         assert_eq!((index, start), (2, 4096));
-        let (index, start) = file.add(2 * 4096).unwrap();
+        let (index, start) = early.add(2 * 4096).unwrap();
         assert_eq!((index, start), (3, 4 * 4096));
         assert_eq!(file.len().unwrap(), 6 * 4096);
         file.write_all_at(page(2).as_slice(), 2 * 4096).unwrap();
         file.write_all_at(page(3).as_slice(), 5 * 4096).unwrap();
         file.sync_data().unwrap();
-        // The duplicate made before either segment finds both.
+        // The handle made before either segment transfers through both.
         assert_eq!(read(&early, 2 * 4096), 2);
         assert_eq!(read(&early, 5 * 4096), 3);
         assert_eq!(
@@ -617,11 +964,11 @@ mod tests {
     }
 
     /// Do: add 37 segments to a file bounded to 1,000, writing a page into each, and reopen it.
-    /// Expect: every page reads back from its segment, in order, through the handle that added
-    /// them and through the reopened one; each handle made the six chunks that hold 38 segments
-    /// (63 slots), not slots for its bound.
+    /// Expect: every page reads back from its segment, in order, through the owner that added
+    /// them and through the reopened one; each made the six chunks that hold 38 segments (63
+    /// slots), not slots for its bound.
     #[test]
-    fn a_handle_holds_slots_for_the_segments_it_has_not_for_its_bound() {
+    fn a_file_holds_slots_for_the_segments_it_has_not_for_its_bound() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("store");
         let file = create(&base, 1000);
@@ -633,7 +980,17 @@ mod tests {
             file.write_all_at(page(k as u8).as_slice(), k * 4096)
                 .unwrap();
         }
-        let made = |f: &SegmentedFile| f.slots.chunks.iter().filter(|c| c.get().is_some()).count();
+        let made = |f: &SegmentedFile| {
+            f.with(|open| {
+                Ok(open
+                    .segments
+                    .chunks
+                    .iter()
+                    .filter(|c| c.get().is_some())
+                    .count())
+            })
+            .unwrap()
+        };
         let reopened = open(&base, 1000);
         for f in [&file, &reopened] {
             assert_eq!(f.layout().len(), 39);
@@ -662,25 +1019,156 @@ mod tests {
         assert_eq!((read(&file, 0), read(&file, 4096)), (1, 0));
     }
 
-    /// A flush covers each segment written since the last, and only those.
+    /// Do: write two segments through two handles, flush through one, then write one again and
+    /// flush through the other. Expect: each flush covers every segment written since its last
+    /// flush, whichever handle wrote it, and only those: a flush is the file's, as the device's
+    /// issuer needs when a batch's writes ran on some workers' handles and its flush on another's.
     #[test]
-    fn a_flush_covers_the_segments_written_since_the_last() {
+    fn a_flush_covers_the_segments_written_since_the_last_through_any_handle() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("store");
         let file = create(&base, 4);
+        let other = file.try_clone().unwrap();
         file.write_all_at(page(1).as_slice(), 0).unwrap();
         file.add(4096).unwrap();
         file.add(4096).unwrap();
-        file.write_all_at(page(2).as_slice(), 2 * 4096).unwrap();
-        let dirty = |f: &SegmentedFile| -> Vec<bool> {
-            f.slots
-                .iter()
-                .map(|s| s.dirty.load(Ordering::Acquire))
-                .collect()
-        };
+        other.write_all_at(page(2).as_slice(), 2 * 4096).unwrap();
         assert_eq!(dirty(&file), vec![false, true, false, true]);
         file.sync_data().unwrap();
+        assert_eq!(dirty(&other), vec![false, false, false, false]);
+        other.write_all_at(page(3).as_slice(), 4096).unwrap();
+        assert_eq!(dirty(&file), vec![false, false, true, false]);
+        other.sync_data().unwrap();
         assert_eq!(dirty(&file), vec![false, false, false, false]);
+    }
+
+    /// Do: make a hundred handles of a file of three segments, through the owner and through one
+    /// another, and transfer a page through each into each segment. Expect: the open files stay
+    /// one a segment, the owner's, and every handle reads what every other wrote.
+    #[test]
+    fn handles_take_no_open_file_of_their_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("store");
+        let file = create(&base, 4);
+        file.add(4096).unwrap();
+        file.add(4096).unwrap();
+        assert_eq!(opened(&file), 4);
+        let mut handles = vec![file.try_clone().unwrap()];
+        for i in 1..100 {
+            let next = handles[i - 1].try_clone().unwrap();
+            handles.push(next);
+        }
+        for (i, h) in handles.iter().enumerate() {
+            for segment in 0..3u64 {
+                h.write_all_at(page(i as u8).as_slice(), segment * 4096)
+                    .unwrap();
+                assert_eq!(read(&file, segment * 4096), i as u8);
+            }
+            assert_eq!(opened(h), 4);
+        }
+        assert_eq!(opened(&file), 4);
+    }
+
+    /// Do: drop the owner of a file another handle transfers through, then open a second file in
+    /// the slot the first freed. Expect: the handle's transfers, flushes and duplicates are
+    /// refused, typed, once its owner is gone, and none lands in the second file, whose owner
+    /// reads only its own bytes: the slot's generation moved.
+    #[test]
+    fn a_handle_is_refused_once_its_owner_closed_and_never_reaches_another_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let align = Alignment::new(ALIGN).unwrap();
+        // A slot of this test's own, so the second file takes the one the first freed.
+        let slot: &'static Slot = Box::leak(Box::new(Slot::new()));
+        let in_slot = |name: &str| {
+            let base = dir.path().join(name);
+            drop(create(&base, 4));
+            let generation = slot.take().unwrap();
+            SegmentedFile::open_in(slot, generation, &base, CachingRequest::Buffered, align, 4)
+                .unwrap()
+        };
+        let first = in_slot("first");
+        first.write_all_at(page(1).as_slice(), 0).unwrap();
+        let handle = first.try_clone().unwrap();
+        assert_eq!(read(&handle, 0), 1);
+        drop(first);
+        let shut = |e: DiskError| matches!(e, DiskError::Unsupported { reason, .. } if reason.contains("owner has closed"));
+        assert!(shut(
+            handle.write_all_at(page(2).as_slice(), 0).unwrap_err()
+        ));
+        assert!(shut(handle.len().unwrap_err()));
+        assert!(shut(handle.try_clone().unwrap_err()));
+        let second = in_slot("second");
+        second.write_all_at(page(3).as_slice(), 0).unwrap();
+        assert_ne!(second.generation, handle.generation);
+        assert!(shut(
+            handle.write_all_at(page(4).as_slice(), 0).unwrap_err()
+        ));
+        let mut b = page(0);
+        assert!(shut(handle.read_exact_at(b.as_mut_slice(), 0).unwrap_err()));
+        assert!(shut(handle.sync_data().unwrap_err()));
+        assert_eq!(read(&second, 0), 3);
+        drop(handle);
+        assert_eq!(read(&second, 0), 3);
+        drop(second);
+        assert!(
+            slot.state.load(Ordering::SeqCst).is_multiple_of(2),
+            "freed once closed"
+        );
+    }
+
+    /// Do: from as many threads as the host runs at once, and at least two, each with its own
+    /// handle, write a distinct page into each of three segments and read every page back while
+    /// the others write. Expect: each page holds what its writer wrote, through every handle:
+    /// positioned transfers on one open file from many threads land at their own offsets.
+    #[test]
+    fn threads_transfer_through_one_open_file_at_once() {
+        let threads = std::thread::available_parallelism().map_or(2, |n| n.get().max(2));
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("store");
+        let pages = threads as u64;
+        let file = create(&base, 5);
+        file.add(pages * 4096 - 4096).unwrap();
+        file.add(pages * 4096).unwrap();
+        file.add(pages * 4096).unwrap();
+        let handles: Vec<SegmentedFile> = (0..threads).map(|_| file.try_clone().unwrap()).collect();
+        let segment_starts = [0u64, pages * 4096, 2 * pages * 4096];
+        std::thread::scope(|s| {
+            for (t, h) in handles.iter().enumerate() {
+                s.spawn(move || {
+                    for start in segment_starts {
+                        let at = start + t as u64 * 4096;
+                        h.write_all_at(page(t as u8 + 1).as_slice(), at).unwrap();
+                        assert_eq!(read(h, at), t as u8 + 1);
+                    }
+                });
+            }
+        });
+        for (t, h) in handles.iter().enumerate() {
+            for start in segment_starts {
+                for u in 0..threads {
+                    assert_eq!(read(h, start + u as u64 * 4096), u as u8 + 1, "thread {t}");
+                }
+            }
+        }
+        assert_eq!(opened(&file), 5);
+    }
+
+    /// Do: open a file's segments twice, as two owners, and add a segment through one. Expect:
+    /// the other reaches it on its first transfer past the segments it holds, through an open
+    /// file of its own, as a file opened apart in another process would.
+    #[test]
+    fn a_second_owner_finds_a_segment_the_first_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("store");
+        let one = create(&base, 4);
+        let two = open(&base, 4);
+        assert_eq!(opened(&two), 2);
+        let (index, start) = one.add(4096).unwrap();
+        assert_eq!((index, start), (2, 4096));
+        one.write_all_at(page(5).as_slice(), 4096).unwrap();
+        one.sync_data().unwrap();
+        assert_eq!(read(&two, 4096), 5);
+        assert_eq!((opened(&two), two.len().unwrap()), (3, 2 * 4096));
     }
 
     /// Do: write two segments whole with copies of a 16 KiB piece (a VM page on every target),
@@ -705,12 +1193,7 @@ mod tests {
         file.add(at(2)).unwrap();
         file.write_whole(0, 3, piece(7).as_slice()).unwrap();
         assert!(file.write_whole(0, 4, piece(7).as_slice()).is_err());
-        let dirty: Vec<bool> = file
-            .slots
-            .iter()
-            .map(|s| s.dirty.load(Ordering::Acquire))
-            .collect();
-        assert_eq!(dirty, vec![false, true, true]);
+        assert_eq!(dirty(&file), vec![false, true, true]);
         // Whether this host's file system granted a handle past its cache, read before any read
         // of the pieces could bring them into memory.
         let direct = DeviceFile::open(
@@ -731,9 +1214,14 @@ mod tests {
                 // reads what that brought in by the time it looks (`resident::linux`).
                 #[cfg(target_os = "linux")]
                 let held = {
-                    let (index, s) = fresh.segment(at(i), PIECE).unwrap();
+                    let (index, start) = fresh
+                        .with(|open| {
+                            let (index, s, _) = open.holding(at(i), PIECE)?;
+                            Ok((index, s.start))
+                        })
+                        .unwrap();
                     let segment = std::fs::File::open(segment_path(&base, index)).unwrap();
-                    crate::resident::cached(&segment, at(i) - s.start, PIECE).unwrap()
+                    crate::resident::cached(&segment, at(i) - start, PIECE).unwrap()
                 };
                 #[cfg(not(target_os = "linux"))]
                 let held = fresh.read_resident_at(b.as_mut_slice(), at(i)).unwrap();

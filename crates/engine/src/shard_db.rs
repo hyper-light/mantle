@@ -1297,8 +1297,11 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     /// Runs the trunk's compactions on maintenance workers, each over its own handle on the
-    /// shard's file that `open` gives (the file opened again as the shard's was): as many as
-    /// the measured need asks, up to the cores the OS reports less this thread (`trunk::pool`).
+    /// shard's file that `open` gives: as many as the measured need asks, up to the cores the OS
+    /// reports less this thread (`trunk::pool`). For a file kept as segments the handle is a
+    /// clone of the shard's (`BlockFile::try_clone`), which transfers through the segments'
+    /// open files and takes no descriptor of its own (hyper-block `segmented`): a handle opened
+    /// again would open every segment again, a descriptor a segment for each worker.
     /// Puts then pay only for taking the workers' results, and wait on them only when a
     /// rotation finds the trunk's root without room. Refused when the workers' channel back
     /// cannot be made (`Pool::new`).

@@ -16,9 +16,13 @@
 //! each quantile it reports with its interval from [`quantile`]
 //! (`docs/tails.md` §3, step T-1).
 //!
-//! The `unsafe` this crate needs is in five files that
+//! A test of how many descriptors a file's handles take counts the process's
+//! with [`descriptors::open`].
+//!
+//! The `unsafe` this crate needs is in six files that
 //! `scripts/check-contracts.py` lists: `src/alloc.rs` (the allocator forwards
-//! to the system's), `src/faults.rs` (the OS calls that read the faults),
+//! to the system's), `src/descriptors.rs` (the OS calls that count the
+//! process's descriptors), `src/faults.rs` (the OS calls that read the faults),
 //! `src/usage.rs` (the OS calls that read CPU time, instructions, cycles and
 //! the footprint), `src/wake.rs` (a waker built over a leaked slot) and
 //! `src/wait_windows.rs` (the poll a wait is on Windows).
@@ -37,6 +41,7 @@
 
 pub mod alloc;
 pub mod cost;
+pub mod descriptors;
 pub mod faults;
 pub mod open_loop;
 pub mod quantile;

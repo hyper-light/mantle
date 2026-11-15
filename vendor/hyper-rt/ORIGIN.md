@@ -89,3 +89,11 @@ Also made here with it, each found on CI or by widening a window the scheduler o
   reads for 32 long polls), two unit tests of the window and the modes; `tests/wake_estimate.rs`'s
   attribution counts unchanged.
 
+
+## Made here: the pin protocol public (2026-11-14)
+
+- `retire::Pinned`, the registry slot's counted-reader protocol, is public, its publish, read and
+  retire asking `T: Send + Sync` (an entry read from any thread and freed on whichever finishes its
+  retirement), so hyper-block's segmented files share their open files by it: the owner retires
+  them, a transfer through any other handle pins them for its call, and the last such closes them
+  (hyper-block `ORIGIN.md` change 17). The protocol and its loom model are unchanged.

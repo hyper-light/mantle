@@ -33,6 +33,8 @@ mod gather;
 pub mod image;
 pub mod issuer;
 mod node;
+#[cfg(windows)]
+mod overlapped;
 pub mod record;
 mod resident;
 pub use resident::Residency;

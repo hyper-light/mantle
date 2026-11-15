@@ -87,8 +87,24 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `c97fb1a` (hyper-raft branch `doors-step8`: `doors-wire-bytes`'s `33733b5` and
-one commit), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. Its commit changes
+**Every crate at `07c03e7` (hyper-raft branch `shared-segment-fds-doors`: `doors-step8-3`'s
+`294678c` and one commit, the one commit of branch `shared-segment-fds` taken onto it), with no
+local delta**, taken by `scripts/snapshot-hyper-raft.py`. Its commit changes hyper-block, hyper-rt
+and hyper-measure (hyper-block `ORIGIN.md` change 17): a segmented file's owner opens each segment
+once and every handle made from it (`BlockFile::try_clone`: the shard's, each maintenance worker's,
+each of the issuer's duplicates) transfers through those open files, so a store holds a
+descriptor a segment whatever its workers, where each handle opened every segment for itself
+(about 188 a segment on a 32-core host, docs/measurements/2026-11-06-targets.md); a flush through
+any handle covers every handle's writes, where the issuer's flush of a batch on one worker's
+duplicate covered only the segments that duplicate wrote; on Windows a shared segment is opened
+for overlapped I/O; hyper-rt's `retire::Pinned`, the counted-reader protocol the open files are
+shared by, is public; hyper-measure counts the process's descriptors (`descriptors::open`). Main
+takes it once every consumer's suite passes on it (hyper-raft `CLAUDE.md` §3). `294678c` was
+`c97fb1a` and one commit, which changes hyper-tls alone: certificates are decoded by
+brotli-decompressor 6.1.1, RFC 7932 only, bounded to the certificate and behind an unwind boundary
+(hyper-tls VENDORED.md §11). Before them, every crate was at `c97fb1a` (hyper-raft branch
+`doors-step8`: `doors-wire-bytes`'s `33733b5` and one commit), with no local delta, taken by
+`scripts/snapshot-hyper-raft.py`. Its commit changes
 hyper-transport alone: no endpoint offers to take QUIC DATAGRAM frames (`Limits::transport` sets
 `datagram_receive_buffer_size` to `None`, so no connection sends `max_datagram_frame_size`, RFC
 9221 §3), where hyper-quic's default offered every peer 1,250,000 bytes of them; hyper-raft

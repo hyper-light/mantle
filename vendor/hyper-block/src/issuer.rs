@@ -19,7 +19,9 @@
 //!
 //! Ownership is single and passed by message. A submitter's file is duplicated once for each
 //! worker ([`BlockFile::try_clone`]), and each worker owns its duplicates in an arena of its own,
-//! so no file is shared between threads and nothing is locked. The issuer thread owns the
+//! so no handle is shared between threads and nothing is locked. A segmented file's duplicates
+//! take no descriptor: they transfer through the open files of the file's owner
+//! (`crate::segmented`), so its descriptors are one a segment whatever the workers. The issuer thread owns the
 //! dispatch state; each worker owns one slot its tasks arrive on, woken alone (research/26 §5.3).
 //! A worker is told of a file attached or detached in its own slot, before any transfer for it,
 //! since a transfer goes only to a worker with no such news waiting. A volume's writer holds an

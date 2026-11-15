@@ -1,9 +1,11 @@
 //! The positional file operations the log and the chunk store are written against, so a test can
 //! put a simulated device with power-loss semantics (`crate::sim`) where the real file goes.
 //!
-//! A file has one owner at a time: the thread that issues its I/O. The trait asks `Send` and not
-//! `Sync`, so a file moves to its owner and is never shared; a second thread that needs the same
-//! file gets a second handle of its own ([`BlockFile::try_clone`]), as the issuer's workers do.
+//! A handle has one owner at a time: the thread that issues its I/O. The trait asks `Send` and not
+//! `Sync`, so a handle moves to its owner and is never shared; a second thread that needs the same
+//! file gets a second handle of its own ([`BlockFile::try_clone`]), as the issuer's workers do. A
+//! second handle need not hold a descriptor of its own: a segmented file's handles all transfer
+//! through the open files its owner opened (`crate::segmented`).
 
 use crate::DiskError;
 use crate::buf::Alignment;
@@ -131,7 +133,9 @@ pub trait BlockFile: Send {
 
     /// A second handle to the same file, whose writes and flushes are the file's own: what a
     /// volume hands its device's issuer while it keeps reading through its own handle
-    /// (crate::issuer). A file that has no second handle refuses.
+    /// (crate::issuer). A [`DeviceFile`]'s duplicates its descriptor; a segmented file's shares
+    /// the open files of its owner and takes no descriptor. A file that has no second handle
+    /// refuses.
     fn try_clone(&self) -> Result<Self, DiskError>
     where
         Self: Sized,

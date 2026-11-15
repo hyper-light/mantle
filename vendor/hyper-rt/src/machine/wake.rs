@@ -654,13 +654,19 @@ fn wake_round(
         setup_left: None,
         window: None,
     };
+    let diag_began = Instant::now();
+    let diag_span_left = probe.left();
+    let mut diag_end = "share";
     std::thread::scope(|scope| {
         let waiter = scope.spawn(|| waiter_loop(&shared, pair, epoch, &waker, setup, woken));
         let Some(id) = await_waiter(&shared, probe.started, probe.span) else {
             shared.stop.store(true, Ordering::Release);
             waiter.thread().unpark();
+            diag_end = "waiter-never-started";
             return;
         };
+        let diag_started_after = diag_began.elapsed();
+        eprintln!("DIAGWAKE waiter started after {diag_started_after:?} (span left at round start {diag_span_left:?})");
         // The waiter runs: the share times its wakes from here, cut short by the probe's span.
         let started = Instant::now();
         let left = probe.left();
@@ -675,11 +681,13 @@ fn wake_round(
         let mut next_check = MIN_SAMPLES;
         while started.elapsed() < budget {
             let Some(confirmed) = await_asleep(&shared, id, started, budget) else {
+                diag_end = "asleep-wait-ended-share";
                 break;
             };
             round.asleep_confirmed &= confirmed;
             let Some((latency, one_cpu)) = time_one_wake(&shared, waiter.thread(), probe, epoch)
             else {
+                diag_end = "wake-answer-past-span";
                 break;
             };
             if one_cpu {
@@ -700,6 +708,13 @@ fn wake_round(
         shared.stop.store(true, Ordering::Release);
         waiter.thread().unpark();
     });
+    eprintln!(
+        "DIAGWAKE round pair={pair:?} share={share:?} samples={} same_cpu={} placement={:?} end={diag_end} took={:?}",
+        round.samples.len(),
+        round.same_cpu,
+        round.placement,
+        diag_began.elapsed()
+    );
     round
 }
 

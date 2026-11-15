@@ -2210,6 +2210,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Event::Refused {
                 exchange, refusal, ..
             } => {
+                crate::diag_trace::note(format!(
+                    "exchange-refused {refusal:?} chunk_out {} receiving {} job {} asking {}",
+                    self.chunks_out.iter().any(|c| c.exchange == exchange),
+                    self.receiving.iter().any(|r| r.exchange == exchange),
+                    self.job_on(exchange).is_some(),
+                    self.asking_on(exchange).is_some()
+                ));
                 self.snapshot_done(exchange, false);
                 // A chunk's body ended before it was whole: what came of it is kept nowhere.
                 for r in self.receiving.iter().filter(|r| r.exchange == exchange) {
@@ -2239,6 +2246,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Ok(())
             }
             Event::Closed { peer, refusal, .. } | Event::Unreachable { peer, refusal } => {
+                crate::diag_trace::note(format!(
+                    "conn-ended peer {peer:?} node {} refusal {refusal:?}",
+                    self.remotes.iter().any(|r| r.id == peer)
+                ));
                 if let Some(remote) = self.remotes.iter_mut().find(|r| r.id == peer) {
                     remote.ended = remote.ended.saturating_add(1);
                     remote.refusal = refusal;
@@ -2248,7 +2259,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
             // A path's degrading and its progress again: the connection stays open either way, and
             // whether its peer lives the plane's suspicion judges, not the transport's hint.
-            Event::Degrading { .. } | Event::Progressing { .. } => Ok(()),
+            Event::Degrading { peer, .. } => {
+                crate::diag_trace::note(format!(
+                    "conn-degrading peer {peer:?} node {}",
+                    self.remotes.iter().any(|r| r.id == peer)
+                ));
+                Ok(())
+            }
+            Event::Progressing { .. } => Ok(()),
         }
     }
 

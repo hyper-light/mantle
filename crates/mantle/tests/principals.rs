@@ -831,6 +831,175 @@ fn principals_are_let_in_as_granted_revoked_at_once_and_rotated_with_no_request_
     );
     assert!(std::fs::read(&back).unwrap() == eight);
 
+    // A version named is judged in its version form (research/91 §6): a copy of a named version
+    // asks `s3:GetObjectVersion` of its source, and a delete of one asks `s3:DeleteObject` and
+    // `s3:DeleteObjectVersion` both, by DeleteObject and by DeleteObjects alike. A principal let
+    // read and write only the current versions copies the current one and no older one, and
+    // deletes no version, until its policy grants the version forms.
+    aws(
+        &root_env,
+        &first,
+        &["create-bucket", "--bucket", "versions"],
+    );
+    aws(
+        &root_env,
+        &first,
+        &[
+            "put-bucket-versioning",
+            "--bucket",
+            "versions",
+            "--versioning-configuration",
+            "Status=Enabled",
+        ],
+    );
+    let (older, newer) = (object_bytes(1, 4_097), object_bytes(2, 4_099));
+    let mut ids = Vec::new();
+    for (name, bytes) in [("older.bin", &older), ("newer.bin", &newer)] {
+        let body = write(dir, name, bytes);
+        let id = aws(
+            &root_env,
+            &first,
+            &[
+                "put-object",
+                "--bucket",
+                "versions",
+                "--key",
+                "k",
+                "--body",
+                body.to_str().unwrap(),
+                "--query",
+                "VersionId",
+                "--output",
+                "text",
+            ],
+        );
+        ids.push(id.trim().to_owned());
+    }
+    let older_id = ids[0].clone();
+    let current = r#"{"Version": "2012-10-17", "Statement": [
+      {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObjectVersion"],
+       "Resource": "arn:aws:s3:::versions/*"}]}"#;
+    let current = write(&policies, "versioner.json", current.as_bytes());
+    mantle(
+        &operator,
+        &[
+            "principal",
+            "create",
+            "versioner",
+            "--policy",
+            current.to_str().unwrap(),
+        ],
+    );
+    mantle(
+        &operator,
+        &[
+            "key",
+            "create",
+            "versioner",
+            "--out",
+            creds("versioner").to_str().unwrap(),
+        ],
+    );
+    let versioner = started.env(&creds("versioner"));
+    let copy_from = |key: &str, from: &str| {
+        vec![
+            "copy-object".to_owned(),
+            "--bucket".into(),
+            "versions".into(),
+            "--key".into(),
+            key.into(),
+            "--copy-source".into(),
+            from.into(),
+        ]
+    };
+    let named = format!("versions/k?versionId={older_id}");
+    aws_refused(
+        &versioner,
+        &first,
+        &strs(&copy_from("copy.bin", &named)),
+        "AccessDenied",
+    );
+    aws(
+        &versioner,
+        &first,
+        &strs(&copy_from("current.bin", "versions/k")),
+    );
+    let read_back = |key: &str| {
+        aws(
+            &versioner,
+            &first,
+            &[
+                "get-object",
+                "--bucket",
+                "versions",
+                "--key",
+                key,
+                back_path,
+            ],
+        );
+        std::fs::read(&back).unwrap()
+    };
+    assert!(read_back("current.bin") == newer);
+    let version_delete = [
+        "delete-object",
+        "--bucket",
+        "versions",
+        "--key",
+        "k",
+        "--version-id",
+        older_id.as_str(),
+    ];
+    aws_refused(&versioner, second, &version_delete, "AccessDenied");
+    let batch = format!(r#"{{"Objects": [{{"Key": "k", "VersionId": "{older_id}"}}]}}"#);
+    let batch_delete = [
+        "delete-objects".to_owned(),
+        "--bucket".into(),
+        "versions".into(),
+        "--delete".into(),
+        batch,
+        "--query".into(),
+        "[Deleted[].[Key, VersionId], Errors[].[Key, Code]]".into(),
+        "--output".into(),
+        "json".into(),
+    ];
+    assert_eq!(
+        compact(aws(&versioner, second, &strs(&batch_delete))),
+        r#"[null,[["k","AccessDenied"]]]"#
+    );
+    let versions = r#"{"Version": "2012-10-17", "Statement": [
+      {"Effect": "Allow",
+       "Action": ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject", "s3:DeleteObject",
+                  "s3:DeleteObjectVersion"],
+       "Resource": "arn:aws:s3:::versions/*"}]}"#;
+    let versions = write(&policies, "versioner-versions.json", versions.as_bytes());
+    mantle(
+        &operator,
+        &[
+            "principal",
+            "policy",
+            "versioner",
+            versions.to_str().unwrap(),
+        ],
+    );
+    aws(&versioner, &first, &strs(&copy_from("copy.bin", &named)));
+    assert!(read_back("copy.bin") == older);
+    assert_eq!(
+        compact(aws(&versioner, third, &strs(&batch_delete))),
+        format!(r#"[[["k","{older_id}"]],null]"#)
+    );
+    let newer_delete = [
+        "delete-object",
+        "--bucket",
+        "versions",
+        "--key",
+        "k",
+        "--version-id",
+        ids[1].as_str(),
+    ];
+    aws(&versioner, third, &newer_delete);
+    mantle(&operator, &["key", "revoke", &key_id(&creds("versioner"))]);
+    mantle(&operator, &["principal", "delete", "versioner"]);
+
     // A policy replaced is judged by at every node from the answer on, as a revocation is: the
     // reader loses one home, and keeps the rest of the bucket.
     let narrowed = write(

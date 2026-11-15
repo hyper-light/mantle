@@ -1,7 +1,7 @@
 # 91. Principals and their keys: IAM users, access keys and identity policies
 
 Status: research note, 2026-11-14. For a cell's principals, their access keys and their identity
-policies (docs/design/principals.md). Sources [1] to [20] were read from AWS's documentation on
+policies (docs/design/principals.md). Sources [1] to [21] were read from AWS's documentation on
 2026-11-14, each quoted as it was read; research/17 holds the policy language and its evaluation
 for bucket policies, research/05 S3's error codes, research/84 the forms an access key takes.
 
@@ -185,6 +185,12 @@ destination bucket". UploadPartCopy: the same for its source; "For destination p
 request." "`s3:DeleteObjectVersion` – Required if you want to remove a specific version of an
 object by specifying `versionId` in the request."
 
+[21] S3 API Reference, DeleteObject, https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html,
+read 2026-11-15, "Permissions": "`s3:DeleteObject` - To delete an object from a bucket, you must
+always have the `s3:DeleteObject` permission." "`s3:DeleteObjectVersion` - To delete a specific
+version of an object from a versioning-enabled bucket, you must have the `s3:DeleteObjectVersion`
+permission."
+
 ## What the sources settle
 
 ### §1 A principal is an IAM user of the cell's account
@@ -251,8 +257,9 @@ source named by its version asks `s3:GetObjectVersion` instead [20], so a princi
 key's current version copies no older one. A copy that sets tags would ask `s3:PutObjectTagging`
 too [20]; a cell keeps no tags, refuses a copy that sets them, and copies a source's empty set, so
 none is asked. A DeleteObjects is each of its keys' deletes [19]: each judged as a delete of its own,
-`s3:DeleteObjectVersion` where its entry names a version and `s3:DeleteObject` otherwise [20], and
-a key its principal may not delete answered `AccessDenied` in its place, the others deleted, as
-[19]'s own example answers. [19] says `s3:DeleteObject` is "always" needed and [20] that a
-version's delete needs `s3:DeleteObjectVersion` in its place; a cell follows [20]'s per-operation
-table, as its DeleteObject does (research/17), so a version's delete asks the version form alone.
+and a key its principal may not delete answered `AccessDenied` in its place, the others deleted, as
+[19]'s own example answers. A delete, a DeleteObject's or one of a DeleteObjects' keys', asks
+`s3:DeleteObject` always, as both operations' pages say [19] [21], and `s3:DeleteObjectVersion`
+too where it names a version, as both pages and the permissions table say [19] [20] [21]; the
+table's "Either" [20] reads one or the other by whether a version is named, and asking both where
+one is named satisfies all three documents.

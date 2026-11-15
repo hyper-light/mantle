@@ -156,6 +156,12 @@ fn kept_memtables_answer_gets_through_one_index_and_every_read_is_exact() {
         kept.kept_covered, kept.kept,
         "the index does not cover every kept memtable: {kept:?}"
     );
+    // With memory to spare the index is one generation, which a get probes alone
+    // (docs/research/90 §2).
+    assert_eq!(
+        kept.kept_generations, 0,
+        "the index split while memory was to spare: {kept:?}"
+    );
     check_all(&mut db, &oracle);
     let read = db.stats().0;
     assert!(
@@ -269,11 +275,13 @@ fn kept_memtables_hold_only_the_budget_s_idle_memory() {
 }
 
 /// Under a budget the kept records outgrow (keys from a space far wider than [`KEYS`], each with a
-/// value the size the benchmark writes), the open generation of the index closes at its share and
-/// later ones follow; giving memory back drops the oldest generation whole. The budget holds after
+/// value the size the benchmark writes), memory goes back whole as it runs short: a closed
+/// generation of the index, the open one closed, or the oldest memtables (research/63 §3). A
+/// generation closes only there, where the open one's next growth does not fit or memory must go
+/// back, so whether one closed first depends on which ran short first. The budget holds after
 /// every operation, and every read is exact, from a generation, a memtable or the trunk.
 #[test]
-fn generations_close_at_their_share_and_are_given_back_whole_within_the_budget() {
+fn kept_memory_is_given_back_whole_within_the_budget() {
     const WIDE: u64 = 200_000;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("store");
@@ -283,7 +291,7 @@ fn generations_close_at_their_share_and_are_given_back_whole_within_the_budget()
     workers(&mut db, &path);
     let mut oracle = Oracle::new();
     let mut value = Vec::new();
-    let (mut generations_most, mut gave_back) = (0u64, false);
+    let mut gave_back = false;
     let mut kept_before = 0u64;
     let mut x = 0x2545_f491_4f6c_dd1du64;
     for step in 0..60_000u64 {
@@ -309,11 +317,9 @@ fn generations_close_at_their_share_and_are_given_back_whole_within_the_budget()
             db.trimming() || cache + write + records + kept <= budget,
             "step {step}: kept {kept} beside cache {cache} write {write} records {records}: {stats:?}"
         );
-        generations_most = generations_most.max(stats.kept_generations);
         gave_back |= stats.kept < kept_before;
         kept_before = stats.kept;
     }
-    assert!(generations_most > 0, "no generation closed");
     assert!(gave_back, "no kept memtable was given back");
     settle(&mut db);
     for (k, want) in &oracle {
@@ -323,6 +329,47 @@ fn generations_close_at_their_share_and_are_given_back_whole_within_the_budget()
             None => assert!(!found, "key {k} after settling"),
         }
     }
+}
+
+/// With no kept memtable to give way (no workers, so none is kept), the budget's regions hold
+/// within it after every operation of a workload whose pages outgrow the page cache: each read's
+/// insert past the cache's share evicts a page into its ghost, and what the cache's index and ghost
+/// take is charged to it. Single-threaded, so every run is the same run.
+#[test]
+fn the_regions_hold_within_the_budget_with_nothing_kept() {
+    const WIDE: u64 = 200_000;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let mut db = ShardDb::create(open(&path, true), STORE, MEM, TRUNK).unwrap();
+    let budget = 2048 * STORE.page_size;
+    db.set_memory(budget).unwrap();
+    let mut oracle = Oracle::new();
+    let mut value = Vec::new();
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    for step in 0..60_000u64 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let k = x % WIDE;
+        if step % 2 == 0 {
+            let v = format!("{step:0100}").into_bytes();
+            db.put(&key(k), &v).unwrap();
+            oracle.insert(k, Some(v));
+        } else {
+            let found = db.get(&key(k), &mut value).unwrap();
+            match oracle.get(&k) {
+                Some(Some(v)) => assert!(found && &value == v, "key {k} at step {step}"),
+                _ => assert!(!found, "key {k} at step {step}"),
+            }
+        }
+        let (cache, write, records) = db.memory_held();
+        assert!(
+            db.trimming() || cache + write + records <= budget,
+            "step {step}: cache {cache} write {write} records {records} over {budget}, indexes {:?}",
+            db.index_bytes()
+        );
+    }
+    assert_eq!(db.stats().0.kept, 0);
 }
 
 /// Without maintenance workers no index over kept memtables can be built, and a get's probes

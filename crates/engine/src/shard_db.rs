@@ -103,6 +103,11 @@ pub struct FlushStats {
     /// Gets of keys no kept memtable held, answered without the trunk while they held every
     /// record it does (research/51 §8).
     pub kept_absent: u64,
+    /// DIAGNOSTIC (never merged): the gets that probed the kept memtables, the memtables no index
+    /// part covered that they probed, and the generations' indexes they probed.
+    pub diag_kept_gets: u64,
+    pub diag_uncovered: u64,
+    pub diag_gen_probes: u64,
     /// Puts whose trunk share waited for its input reads: the last memtable before a rotation
     /// would stall ([`ShardDb::put`]'s pacing).
     pub waited_steps: u64,
@@ -368,6 +373,10 @@ pub struct ShardDb<F: BlockFile> {
     /// Gets a kept memtable answered, and gets of keys none held answered so while they hold
     /// every record the trunk does.
     kept_hits: u64,
+    /// DIAGNOSTIC (never merged): what the gets' kept probes touched ([`FlushStats::diag_uncovered`]).
+    diag_kept_gets: std::cell::Cell<u64>,
+    diag_uncovered: std::cell::Cell<u64>,
+    diag_gen_probes: std::cell::Cell<u64>,
     kept_absent: u64,
     /// The page cache's refusals for want of the machine's memory at the last look: one since
     /// gives a kept memtable back.
@@ -919,6 +928,9 @@ impl<F: BlockFile> ShardDb<F> {
             kept: std::collections::VecDeque::new(),
             kept_bytes: 0,
             kept_hits: 0,
+            diag_kept_gets: std::cell::Cell::new(0),
+            diag_uncovered: std::cell::Cell::new(0),
+            diag_gen_probes: std::cell::Cell::new(0),
             kept_absent: 0,
             kept_refused: 0,
             kept_step: 0,
@@ -4593,6 +4605,7 @@ impl<F: BlockFile> ShardDb<F> {
             .unwrap_or(0);
         let covered = self.kept_covers(part);
         let uncovered = |k: &&KeptMem| covered.is_none_or(|c| crate::kept::older(c, k.number));
+        self.diag_kept_gets.set(self.diag_kept_gets.get().saturating_add(1));
         if !self.kept_gens.is_empty() {
             // Every generation's home slot read together, so their misses overlap.
             let touched = self
@@ -4612,6 +4625,7 @@ impl<F: BlockFile> ShardDb<F> {
             }
             std::hint::black_box(touched);
             for k in self.kept.iter().rev().take_while(uncovered) {
+                self.diag_uncovered.set(self.diag_uncovered.get().saturating_add(1));
                 // A memtable the key's part does not cover holds its arena: one goes back only
                 // once every part holds its records.
                 let Some(mem) = &k.mem else {
@@ -4631,6 +4645,7 @@ impl<F: BlockFile> ShardDb<F> {
             .into_iter()
             .chain(self.kept_gens.iter().rev().map(|g| &g.index));
         for index in generations {
+            self.diag_gen_probes.set(self.diag_gen_probes.get().saturating_add(1));
             match index.get(hash32, key, oldest) {
                 crate::kept_table::Answer::Record(op, v) => {
                     value.clear();
@@ -5589,6 +5604,9 @@ impl<F: BlockFile> ShardDb<F> {
         flush.kept_bytes = as_u64(self.kept_held());
         flush.kept_hits = self.kept_hits;
         flush.kept_absent = self.kept_absent;
+        flush.diag_kept_gets = self.diag_kept_gets.get();
+        flush.diag_uncovered = self.diag_uncovered.get();
+        flush.diag_gen_probes = self.diag_gen_probes.get();
         // Covered: every part holds its records.
         let covered = self.kept_covers_all();
         flush.kept_generations = as_u64(self.kept_gens.len());

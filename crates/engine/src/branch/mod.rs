@@ -1436,6 +1436,25 @@ impl<'a> View<'a> {
         })
     }
 
+    /// Starts every line a search over the page reads before the halving does: the offsets'
+    /// table and the heads lie in a row past the prefix, a few lines a page, and halving down
+    /// them read each when the step before it chose it, a miss after a miss for a page not in the
+    /// processor's caches. Read together their misses overlap; the search then finds them held.
+    fn touch_search(&self) {
+        let end = self
+            .heads
+            .len()
+            .saturating_add(self.n.saturating_mul(OFFSET))
+            .saturating_add(self.table);
+        let mut touched = 0u8;
+        let mut at = self.table;
+        while at < end {
+            touched ^= self.page.get(at).copied().unwrap_or(0);
+            at = at.saturating_add(crate::kept_table::LINE);
+        }
+        std::hint::black_box(touched);
+    }
+
     /// Entry `i`'s suffix and the bytes before it (operation and value, or child and count).
     fn entry(&self, i: usize) -> Result<(&'a [u8], &'a [u8]), Error> {
         let (suffix, rest) = self.ranges(i)?;
@@ -1866,6 +1885,7 @@ pub(crate) fn descend(page: &[u8], key: &[u8]) -> Result<Descent, Error> {
     if view.kind == LEAF {
         return Ok(Descent::Leaf);
     }
+    view.touch_search();
     let i = view.floor(key)?.unwrap_or(0);
     let (_, rest) = view.entry(i)?;
     let child = rest
@@ -2210,6 +2230,7 @@ impl RunCursor {
         key: &[u8],
     ) -> Result<(usize, usize), Error> {
         let view = View::new(self.page_in(store)?)?;
+        view.touch_search();
         Ok((view.lower_bound(key)?, view.n))
     }
 
@@ -2365,6 +2386,7 @@ impl RunCursor {
         self.land_async(branch, store, page, 0).await?;
         let (index, entries) = {
             let view = View::new(self.page_in(store)?)?;
+            view.touch_search();
             (view.lower_bound(from)?, view.n)
         };
         if index >= entries {

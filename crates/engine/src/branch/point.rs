@@ -187,6 +187,7 @@ pub(super) fn read_value(
     if view.kind != LEAF {
         return Err(corrupt(Malformed::CountMismatch));
     }
+    view.touch_search();
     let Some(i) = view.floor(key)? else {
         return Ok(None);
     };

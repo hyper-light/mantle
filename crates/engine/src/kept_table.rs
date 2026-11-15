@@ -33,7 +33,7 @@ const SPILLED: u8 = 2;
 /// probe would go further grows.
 const MOST_DISPLACED: usize = 254;
 /// The bytes a cache line holds, the unit slots are sized in.
-const LINE: usize = 64;
+pub(crate) const LINE: usize = 64;
 /// A record list's header: the 32-bit hash (4), the operation (1), the key's length (4) and the
 /// value's (4).
 const LIST_HEAD: usize = 13;

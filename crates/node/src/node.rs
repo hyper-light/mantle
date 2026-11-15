@@ -2881,9 +2881,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 until_ns,
             } => {
                 let room = received.body;
-                let key = crate::diag_trace::exchange_key(exchange);
-                crate::diag_trace::since(crate::diag_trace::CHUNK_BODY, key, room, false);
-                crate::diag_trace::mark(key);
+                let diag_key = crate::diag_trace::exchange_key(exchange);
+                crate::diag_trace::since(crate::diag_trace::CHUNK_BODY, diag_key, room, false);
+                crate::diag_trace::mark(diag_key);
                 // The buffer was sized to the body and read whole, so it becomes `Bytes` without a
                 // copy or an allocation (its length is its capacity).
                 let put = self.storage.put(

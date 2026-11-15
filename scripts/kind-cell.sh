@@ -76,9 +76,21 @@ echo "kind-cell: the founder its peers dial is $dialed"
 mantle pack /work/cell /work/cell.pack
 kubectl -n "$namespace" create secret generic mantle-harness-cell --from-file=cell="$work/cell.pack"
 
+# DIAG (ci-health): the runner's disks, then each pod's floor as the node derived it.
+lsblk -d -o NAME,ROTA,SIZE,MODEL,TRAN || true
+for q in /sys/block/*/queue/nr_requests; do echo "DIAG host $q $(cat "$q")"; done
+nproc; free -b | head -2
+helm_rc=0
 helm install "$release" deploy/helm/mantle --namespace "$namespace" \
   --set fullnameOverride="$release" --set image.repository=mantle --set image.tag=kind \
-  --set storage.volumeSize=2Gi --wait --timeout 20m
+  --set storage.volumeSize=2Gi --wait --timeout 20m || helm_rc=$?
+for pod in $(kubectl -n "$namespace" get pods -o name); do
+  echo "== DIAG $pod"
+  kubectl -n "$namespace" logs "$pod" -c mantle 2>/dev/null | grep -E 'DIAG|budgets|^basis' | head -400 || true
+  kubectl -n "$namespace" logs "$pod" -c mantle --previous 2>/dev/null | grep -E 'DIAG|budgets' | head -40 || true
+done
+echo "DIAG helm_rc=$helm_rc"
+exit "$helm_rc"
 kubectl -n "$namespace" get pods -o wide
 placed="$(kubectl -n "$namespace" get pods -l app.kubernetes.io/instance="$release" -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' | sort -u | wc -l)"
 if [ "$placed" -ne "$founders" ]; then

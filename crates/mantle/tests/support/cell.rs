@@ -280,6 +280,7 @@ pub(crate) fn bounds() -> Bounds {
                     max_committed_size_per_ready: 1 << 20,
                     max_entry_bytes: 1024,
                 },
+                members: 0,
             },
             engine: (),
         }],
@@ -327,6 +328,7 @@ pub(crate) fn served_bounds() -> Bounds {
                 rules,
                 boot: ConfState::default(),
                 settings,
+                members: 0,
             },
             engine: (),
         }],
@@ -396,6 +398,24 @@ pub(crate) enum Line {
     /// Its orderly stop is done: the process ends. With the sleeps of the node's loop that found
     /// every timer of its shard taken.
     Stopped(u64),
+    /// A member's standing as the node's member of the root range holds it (membership.md §1): the
+    /// member, its state, and since when its absence is recorded, 0 while present.
+    Standing(u64, String, u64),
+    /// A range's configuration as the node's member applied it: its group, voters and learners.
+    Config(u128, Vec<u64>, Vec<u64>),
+    /// The root range holds the node leaving (membership.md §4), and then removed it.
+    Leaving,
+    Left,
+    /// An operator's statement that a member is gone, answered: the member and the answer.
+    Gone(u64, String),
+}
+
+/// Ids as a `config` line says them, comma-separated, `-` for none.
+fn ids_said(text: &str) -> Option<Vec<u64>> {
+    if text == "-" {
+        return Some(Vec::new());
+    }
+    text.split(',').map(|id| id.parse().ok()).collect()
 }
 
 /// A history as a node says it: node time run and crashes.
@@ -455,6 +475,19 @@ pub(crate) fn parse(line: &str) -> Option<Line> {
             leader.parse().ok()?,
         )),
         ["stopped", waits] => Some(Line::Stopped(waits.parse().ok()?)),
+        ["standing", id, state, absent] => Some(Line::Standing(
+            id.parse().ok()?,
+            (*state).to_owned(),
+            absent.parse().ok()?,
+        )),
+        ["config", group, voters, learners] => Some(Line::Config(
+            u128::from_str_radix(group, 16).ok()?,
+            ids_said(voters)?,
+            ids_said(learners)?,
+        )),
+        ["leaving"] => Some(Line::Leaving),
+        ["left"] => Some(Line::Left),
+        ["gone", id, outcome @ ..] => Some(Line::Gone(id.parse().ok()?, outcome.join(" "))),
         ["held", held] => Some(Line::Held(match *held {
             "0" => false,
             "1" => true,
@@ -533,7 +566,12 @@ pub(crate) fn movement(line: &Line) -> Option<(u64, u64, u64, u64, Duration, Dur
         | Line::Stopping
         | Line::Handing(..)
         | Line::Handed(..)
-        | Line::Stopped(..) => None,
+        | Line::Stopped(..)
+        | Line::Standing(..)
+        | Line::Config(..)
+        | Line::Leaving
+        | Line::Left
+        | Line::Gone(..) => None,
     }
 }
 
@@ -942,6 +980,17 @@ pub(crate) struct Cell {
     /// Each node's configuration as `mantle init` wrote it, for a cell it made (`Cell::made`):
     /// its process serves from that file, which the test does not write.
     pub(crate) made: BTreeMap<u64, PathBuf>,
+    /// Each range's configuration as each node's member last said it applied it, by node and
+    /// group: its voters and its learners (membership.md §6).
+    pub(crate) configs: BTreeMap<(u64, u128), (Vec<u64>, Vec<u64>)>,
+    /// Each member's standing as each node last said its root range holds it, by node and member:
+    /// its state and since when its absence is recorded.
+    pub(crate) standings: BTreeMap<(u64, u64), (String, u64)>,
+    /// The nodes whose running process said the root range holds it leaving, and removed it.
+    pub(crate) leaving: BTreeSet<u64>,
+    pub(crate) left: BTreeSet<u64>,
+    /// Each operator's statement of a member gone, as the node it was stated to answered it.
+    pub(crate) gone: BTreeMap<u64, String>,
     pub(crate) _root: tempfile::TempDir,
 }
 
@@ -1225,6 +1274,11 @@ impl Cell {
             leaderless: BTreeSet::new(),
             stopped: BTreeSet::new(),
             made,
+            configs: BTreeMap::new(),
+            standings: BTreeMap::new(),
+            leaving: BTreeSet::new(),
+            left: BTreeSet::new(),
+            gone: BTreeMap::new(),
             _root: root,
         };
         if named {
@@ -1355,6 +1409,11 @@ impl Cell {
             leaderless: BTreeSet::new(),
             stopped: BTreeSet::new(),
             made: BTreeMap::new(),
+            configs: BTreeMap::new(),
+            standings: BTreeMap::new(),
+            leaving: BTreeSet::new(),
+            left: BTreeSet::new(),
+            gone: BTreeMap::new(),
             _root: root,
         };
         // One at a time, each listening before the next starts (`Cell::start`).
@@ -1390,6 +1449,11 @@ impl Cell {
         self.volumes.remove(&id);
         self.enlisted.remove(&id);
         self.bases.remove(&id);
+        // What its last process said of the cell's members and ranges is that process's.
+        self.configs.retain(|(node, _), _| *node != id);
+        self.standings.retain(|(node, _), _| *node != id);
+        self.leaving.remove(&id);
+        self.left.remove(&id);
         let (tell, generation) = (self.tell.clone(), self.generations);
         self.generations += 1;
         std::thread::spawn(move || {
@@ -1527,7 +1591,7 @@ impl Cell {
     }
 
     /// Writes `bytes` to node `id`'s standard input, in one write.
-    fn say_to(&mut self, id: u64, bytes: &[u8]) {
+    pub(crate) fn say_to(&mut self, id: u64, bytes: &[u8]) {
         let input = &mut self.running.get_mut(&id).unwrap().input;
         input.write_all(bytes).unwrap();
         input.flush().unwrap();
@@ -1555,6 +1619,94 @@ impl Cell {
             writeln!(running.input, "replace {failed} {joining}").unwrap();
             running.input.flush().unwrap();
         }
+    }
+
+    /// A node granted to join the cell `mantle init` made (`mantle init grant`, membership.md §7),
+    /// stated by `statements` as `--node` states a founder, its directory under the test's root;
+    /// pinning the test's clients as gateways, as the founders' configurations do; known to the
+    /// test's clients by its certificate. Its id; no process runs it yet.
+    pub(crate) fn grant(&mut self, statements: &str) -> u64 {
+        let dir = self
+            ._root
+            .path()
+            .join(format!("granted-{}", self.dirs.len()));
+        let made = Command::new(NODE)
+            .args(["init", "grant"])
+            .arg(&dir)
+            .arg("--cell")
+            .arg(self.out())
+            .args(["--node", statements])
+            .output()
+            .unwrap();
+        let said = String::from_utf8(made.stdout).unwrap();
+        assert!(
+            made.status.success(),
+            "mantle init grant: {said}{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        let id: u64 = said
+            .lines()
+            .find_map(|l| l.strip_prefix("granted "))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|id| id.parse().ok())
+            .unwrap_or_else(|| panic!("mantle init grant said no grant: {said}"));
+        let config = dir.join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        for (client, (c, _, _)) in &self.pki.clients {
+            text.push_str(&format!("peer = {client} gateway {}\n", c.display()));
+        }
+        std::fs::write(&config, text).unwrap();
+        let identity = dir.join("identity");
+        let der = std::fs::read(identity.join("node.der")).unwrap();
+        self.pki.nodes.insert(
+            id,
+            (identity.join("node.der"), identity.join("node.key"), der),
+        );
+        self.dirs.insert(id, dir);
+        self.made.insert(id, config);
+        self.nodes = u64::try_from(self.dirs.len()).unwrap();
+        id
+    }
+
+    /// Asks node `id`'s process to leave the cell in order (membership.md §4) and waits for its
+    /// end, as the cell reports it: how it exited.
+    pub(crate) fn leave(&mut self, id: u64) -> std::process::ExitStatus {
+        self.refusing = Some(id);
+        self.say_to(id, b"leave\n");
+        self.ended()
+    }
+
+    /// Sends node `id`'s process `signal` by the system's `kill` (`STOP` holds it still, as a host
+    /// that sleeps does, `CONT` lets it go on).
+    pub(crate) fn signal(&self, id: u64, signal: &str) {
+        let pid = self.running[&id].child.id().to_string();
+        let sent = Command::new("kill")
+            .args([format!("-{signal}"), pid.clone()])
+            .status()
+            .unwrap();
+        assert!(sent.success(), "kill -{signal} {pid}: {sent}");
+    }
+
+    /// Waits until each of `observers` says each range's configuration is what `wanted` takes:
+    /// its voters and its learners as that node's member applied them, each range one a node said
+    /// a configuration of (a cell `mantle init` made draws its ranges' groups).
+    pub(crate) fn configured(
+        &mut self,
+        observers: &[u64],
+        wanted: impl Fn(&[u64], &[u64]) -> bool,
+    ) {
+        self.until(|c| {
+            let groups: BTreeSet<u128> = c.configs.keys().map(|(_, group)| *group).collect();
+            let configured = groups.len() == c.ranges.len()
+                && observers.iter().all(|node| {
+                    groups.iter().all(|group| {
+                        c.configs
+                            .get(&(*node, *group))
+                            .is_some_and(|(voters, learners)| wanted(voters, learners))
+                    })
+                });
+            if configured { Some(()) } else { None }
+        });
     }
 
     /// Kills node `id`'s process, as a power cut takes it.
@@ -1599,7 +1751,12 @@ impl Cell {
                 | Line::Stopping
                 | Line::Handing(..)
                 | Line::Handed(..)
-                | Line::Stopped(..) => None,
+                | Line::Stopped(..)
+                | Line::Standing(..)
+                | Line::Config(..)
+                | Line::Leaving
+                | Line::Left
+                | Line::Gone(..) => None,
             })
             .chain(self.clients.values().copied())
             .chain(self.transfers.values().map(|(_, serve)| *serve))
@@ -1781,6 +1938,21 @@ impl Cell {
                     Line::Stopping => {}
                     Line::Handing(group, to) => self.handing.push((id, group, to)),
                     Line::Handed(group, leader) => self.handed.push((id, group, leader)),
+                    Line::Standing(member, state, absent) => {
+                        self.standings.insert((id, member), (state, absent));
+                    }
+                    Line::Config(group, voters, learners) => {
+                        self.configs.insert((id, group), (voters, learners));
+                    }
+                    Line::Leaving => {
+                        self.leaving.insert(id);
+                    }
+                    Line::Left => {
+                        self.left.insert(id);
+                    }
+                    Line::Gone(member, outcome) => {
+                        self.gone.insert(member, outcome);
+                    }
                     Line::Stopped(waits) => {
                         // Each wait the node's loop holds at once has a timer of its own: a sleep
                         // that found none waited for one to free, and each release ended the

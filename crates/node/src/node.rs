@@ -70,9 +70,11 @@ use mantle_protocol::object;
 
 mod answers;
 mod host;
+mod members;
 mod stop;
 use answers::Answers;
 pub use host::GatewaySettings;
+pub use members::Cell;
 use stop::Stopping;
 
 /// A plane message's first byte: a range's Raft frame. A liveness heartbeat starts with its own,
@@ -137,6 +139,13 @@ pub struct NodeSettings<E> {
     /// directory says (node.md §2.4, item 7), the prior evidence its failure detectors' MTBF starts
     /// from (`hyper_liveness::Settings::history`).
     pub history: History,
+    /// The most members the cell holds where its members come and go (`root.max_nodes`,
+    /// docs/design/membership.md §9): the grant window's width, and the bound on the peers, pairs,
+    /// keys and identities the node keeps. Zero for a cell of fixed members.
+    pub max_nodes: u32,
+    /// The nodes this node dials first, whatever their ids, until it is a member: a granted
+    /// node's seeds (membership.md §3 step 2), each one known by its name under the authority.
+    pub seeds: Vec<PeerId>,
 }
 
 /// The wall clock a node stamps each entry it proposes with, nanoseconds since the Unix epoch: the
@@ -520,6 +529,14 @@ struct Remote {
     /// Whether the detectors suspect it now: suspected, or its stop announced, until a heartbeat
     /// trusts it or its next run's comes (hyper-liveness's changes), or a connection to it is made.
     suspect: bool,
+    /// Whether the root range's rows gave it (a member this node learned), not the configuration.
+    learned: bool,
+    /// Where its row last said it listens, its `quic` and `plane` as the row states them: learned
+    /// once each time the row says something new, so a newer statement on standard input (a peer
+    /// that moved) is not undone by a row that has not heard of the move yet.
+    row: Option<(String, String)>,
+    /// Whether it is a seed, which this node dials whatever their ids until it is a member.
+    seed: bool,
 }
 
 /// A chunk put or get this node asked of a peer, out on an exchange.
@@ -745,12 +762,17 @@ impl<E: Engine + 'static, L: NodeLog> Taking<'_, E, L> {
         else {
             return false;
         };
-        // Only a member of the range's configuration may act on it (node.md §3.6); a member whose
-        // configuration is still empty, one joining, learns it from its leader.
+        // Only a member of the range's configuration may act on it (node.md §3.6): the newest its
+        // log states, committed or not, which the core counts by and sends to, so a learner just
+        // added is heard as soon as it is sent to, before the change applies (`docs/raft.md` §3.4).
+        // A replica that is no member of its configuration, one joining or a spare, learns its
+        // configuration from whichever node leads (docs/design/membership.md §3 step 1; Raft
+        // dissertation §4.1: servers take entries from a leader their configuration does not
+        // name).
+        let id = self.id;
         let member = self.owner.get(handle).is_some_and(|r| {
-            let c = r.configuration();
-            let lists = [&c.voters, &c.learners, &c.voters_outgoing, &c.learners_next];
-            lists.iter().all(|ids| ids.is_empty()) || lists.iter().any(|ids| ids.contains(&sender))
+            let c = r.core().raft.configuration();
+            !c.contains(id) || c.contains(sender)
         });
         if !member {
             return false;
@@ -917,6 +939,18 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// connections it held then, at most its connection bound (`Endpoint::established`).
     generation: u64,
     held: Vec<(PeerId, SocketAddr)>,
+    /// The cell's members as this node's member of the root range last held them
+    /// (docs/design/membership.md; `members::Cell`): none before a member's row, and none in a
+    /// cell made before grants.
+    cell: Option<members::Cell>,
+    /// The most members the cell holds, `root.max_nodes`; zero for a cell of fixed members.
+    max_nodes: u32,
+    /// The root range's commands this node asks as its leader, one out at most a member: each its
+    /// ask and the member it names (membership.md §4, §5).
+    duties: Vec<(CommandAsk, u64)>,
+    /// The members whose reach names a host the process looks up, not yet taken
+    /// ([`Node::take_reached`]): at most the cell's members.
+    reached: Vec<(u64, String, String)>,
 }
 
 /// The longest head of a message the node sends or receives: a command's or a read's and its
@@ -1025,11 +1059,27 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .max()
             .unwrap_or(0);
         let clients = settings.gateway.as_ref().map_or(0, |g| g.clients);
+        // The nodes it may keep: its pinned nodes and seeds, or every member but itself of a cell
+        // whose members come and go (membership.md §9).
+        let pinned_nodes = settings
+            .peers
+            .iter()
+            .filter(|p| p.role == Role::Node)
+            .count()
+            .saturating_add(settings.seeds.len());
+        let node_peers = usize::try_from(settings.max_nodes)
+            .map_err(|_| at(Step::Budgets)(NodeError::Bounds("the cell's nodes".into())))?
+            .saturating_sub(1)
+            .max(pinned_nodes);
+        let others = settings
+            .peers
+            .iter()
+            .filter(|p| p.role != Role::Node)
+            .count();
         let stated = Stated {
-            peers: settings
-                .peers
-                .len()
-                .checked_add(clients)
+            peers: node_peers
+                .checked_add(others)
+                .and_then(|peers| peers.checked_add(clients))
                 .ok_or_else(|| at(Step::Budgets)(NodeError::Bounds("the peers".into())))?,
             ranges: settings.ranges.len(),
             inflight,
@@ -1097,7 +1147,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let liveness = Liveness::new(hyper_liveness::Settings {
             local: settings.id,
             run,
-            max_peers: settings.peers.len().max(1),
+            max_peers: node_peers.max(1),
             history: Exposure::of(
                 Duration::from_nanos(settings.history.exposure_ns),
                 settings.history.crashes,
@@ -1125,7 +1175,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .identities
                 .saturating_add(limits.admission.pending)
         };
-        let directory = Peers::new(settings.peers.clone(), most_clients);
+        let mut directory = Peers::new(settings.peers.clone(), most_clients);
+        for seed in &settings.seeds {
+            directory.seed(*seed);
+        }
         let now = hyper_rt_transport::shard_instant();
         let endpoint = match settings.seed {
             Some(seed) => Endpoint::new_seeded(config, budget, directory, now, seed),
@@ -1136,26 +1189,22 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let plane_socket = PlaneSocket::bind(settings.plane, io).map_err(at(Step::Network))?;
         let plane = Plane::new(settings.id, plane_limits)
             .map_err(|e| at(Step::Network)(NodeError::Plane(e)))?;
-        let remotes = settings
+        let mut remotes: Vec<Remote> = settings
             .peers
             .iter()
             .filter(|p| p.role == Role::Node)
-            .map(|p| Remote {
-                id: p.id,
-                quic: None,
-                plane: None,
-                waiting: VecDeque::new(),
-                keyed: false,
-                redial_at: None,
-                backoff: bounds::initial_pto(),
-                redials: 0,
-                dials: 0,
-                ended: 0,
-                suspected: 0,
-                refusal: None,
-                suspect: false,
-            })
+            .map(|p| Remote::new(p.id, false))
             .collect();
+        for seed in &settings.seeds {
+            match remotes.iter_mut().find(|r| r.id == *seed) {
+                Some(remote) => remote.seed = true,
+                None => {
+                    let mut remote = Remote::new(*seed, false);
+                    remote.seed = true;
+                    remotes.push(remote);
+                }
+            }
+        }
         let mut node = Self {
             id: settings.id,
             log,
@@ -1232,6 +1281,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             clients,
             generation: 0,
             held: Vec::new(),
+            cell: None,
+            max_nodes: settings.max_nodes,
+            duties: Vec::new(),
+            reached: Vec::new(),
         };
         for kept in &node.ranges {
             node.owner
@@ -1256,7 +1309,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         quic: SocketAddr,
         plane: SocketAddr,
     ) -> Result<(), NodeError> {
-        let dials = self.id < peer;
+        let dials = self.dials(peer);
         let now = hyper_rt::futures::now_ns();
         let Some(remote) = self.remotes.iter_mut().find(|r| r.id == peer) else {
             return Ok(());
@@ -1279,6 +1332,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// Whether this node dials `peer`: of each pair the lower id dials, so a pair keeps one
+    /// connection; and a node not yet a member dials its seeds whatever their ids, as they cannot
+    /// know where it is reached until it joins (docs/design/membership.md §3 step 2).
+    fn dials(&self, peer: PeerId) -> bool {
+        self.id < peer || (!self.member() && self.remotes.iter().any(|r| r.id == peer && r.seed))
     }
 
     /// The QUIC endpoint's address and the plane's, as bound.
@@ -1615,6 +1675,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.step_asks(now)?;
         self.step_reads(now)?;
         self.step_replacements();
+        self.step_members()?;
         self.step_stop()?;
         self.send_plane();
         self.driver.flush()?;
@@ -2241,7 +2302,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// this node dials is dialed again after a pause of its backoff ([`Self::redial_later`]).
     fn lost(&mut self, peer: PeerId, now: u64) {
         self.unkey(peer);
-        if self.id < peer
+        if self.dials(peer)
             && let Some(remote) = self.remotes.iter_mut().find(|r| r.id == peer)
         {
             Self::redial_later(self.id, remote, now);
@@ -2972,7 +3033,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Ok(mut entry) = Entry::decode(body) else {
             return self.answer_status(exchange, command::Status::Malformed, 0);
         };
-        let from_node = self.remotes.iter().any(|r| r.id == peer);
+        let from_node = self.remotes.iter().any(|r| r.id == peer)
+            || self.driver.endpoint().directory().is_node(peer);
         if !entry
             .commands
             .iter()
@@ -4310,9 +4372,23 @@ fn take_done<T>(done: &mut Vec<(u64, T)>, ask: u64) -> Option<T> {
 /// a node, and a registration names the sender as the session's owner, so no sender ends another's
 /// session (`mantle_meta::session::register`) or states another node's history.
 fn names_only_its_sender(command: &Command, sender: PeerId, node: bool) -> bool {
+    use mantle_meta::root::Command as Root;
     match command {
-        Command::Root(mantle_meta::root::Command::Enlist(e)) => node && e.node == sender,
-        Command::Root(mantle_meta::root::Command::Lived(l)) => node && l.node == sender,
+        Command::Root(Root::Enlist(e)) => node && e.node == sender,
+        Command::Root(Root::Lived(l)) => node && l.node == sender,
+        // A node joins and leaves for itself alone (docs/design/membership.md §3, §4).
+        Command::Root(Root::Join(j)) => node && j.node == sender,
+        Command::Root(Root::Leave { node: leaving }) => node && *leaving == sender,
+        // The root range's leader's records and judgments, an operator's statement relayed by a
+        // member, and repair's retirements: a node's to ask, each checked where it applies.
+        Command::Root(
+            Root::Gone { .. }
+            | Root::Remove { .. }
+            | Root::Delist { .. }
+            | Root::Absent { .. }
+            | Root::Returned { .. }
+            | Root::Retire { .. },
+        ) => node,
         Command::Register { owner, .. } => *owner == sender,
         _ => true,
     }

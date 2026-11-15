@@ -33,6 +33,18 @@ pub fn node_name(id: u64) -> String {
     format!("node-{id}")
 }
 
+/// The id a node's name gives, [`node_name`]'s form exactly and nonzero; none for any other.
+pub fn node_id(name: &str) -> Option<u64> {
+    let digits = name.strip_prefix("node-")?;
+    let id: u64 = digits.parse().ok()?;
+    // One spelling a node: no sign or leading zero, which parse takes.
+    if id != 0 && id.to_string() == digits {
+        Some(id)
+    } else {
+        None
+    }
+}
+
 /// The name a client's certificate gives it, its subject's common name: `client-` and its id.
 pub fn client_name(id: u64) -> String {
     format!("client-{id}")
@@ -67,6 +79,17 @@ mod tests {
             "client-7 ",
         ] {
             assert_eq!(client_id(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn a_node_is_named_by_its_id_in_one_spelling() {
+        assert_eq!(node_id(&node_name(7)), Some(7));
+        assert_eq!(node_id(&node_name(u64::MAX)), Some(u64::MAX));
+        for other in [
+            "node-0", "node-07", "node-+7", "node-", "client-7", "node-7 ",
+        ] {
+            assert_eq!(node_id(other), None, "{other}");
         }
     }
 }

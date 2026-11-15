@@ -75,7 +75,9 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/cert/src/der.rs` `OID` | format | `0x06` | Universal tag 6, OBJECT IDENTIFIER (X.680 table 1; X.690 §8.19). |
 | `crates/cert/src/der.rs` `ORGANIZATION_NAME` | external | `&[0x55, 0x04, 0x0a]` | id-at-organizationName, 2.5.4.10 (RFC 5280 Appendix A.1). (ITU-T/IETF object identifier or X.509 bits (unlisted: not a scalar)) |
 | `crates/cert/src/der.rs` `PRIME256V1` | external | `&[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]` | secp256r1, the named curve P-256, 1.2.840.10045.3.1.7 (RFC 5480 §2.1.1.1). (ITU-T/IETF object identifier or X.509 bits (unlisted: not a scalar)) |
+| `crates/cert/src/der.rs` `PRINTABLE_STRING` | format | `0x13` | Universal tag 19, PrintableString (X.680 table 1), X.520's `serialNumber` attribute's type (RFC 5280 Appendix A.1, `X520SerialNumber`), in which a granted node's certificate names its grant (docs/design/membership.md §2). |
 | `crates/cert/src/der.rs` `SEQUENCE` | format | `0x30` | Universal tag 16, constructed: SEQUENCE and SEQUENCE OF (X.680 table 1; X.690 §8.9). |
+| `crates/cert/src/der.rs` `SERIAL_NUMBER` | external | `&[0x55, 0x04, 0x05]` | id-at-serialNumber, 2.5.4.5 (RFC 5280 Appendix A.1), the subject attribute a granted node's certificate names its grant in, which RFC 5280 §4.1.2.4 has every implementation take (docs/research/91 [2]). (ITU-T/IETF object identifier or X.509 bits (unlisted: not a scalar)) |
 | `crates/cert/src/der.rs` `SERVER_AUTH` | external | `&[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01]` | id-kp-serverAuth, 1.3.6.1.5.5.7.3.1 (RFC 5280 §4.2.1.12). (ITU-T/IETF object identifier or X.509 bits (unlisted: not a scalar)) |
 | `crates/cert/src/der.rs` `SET` | format | `0x31` | Universal tag 17, constructed: SET and SET OF (X.680 table 1; X.690 §8.11). |
 | `crates/cert/src/der.rs` `SUBJECT_ALT_NAME` | external | `&[0x55, 0x1d, 0x11]` | id-ce-subjectAltName, 2.5.29.17 (RFC 5280 §4.2.1.6). (ITU-T/IETF object identifier or X.509 bits (unlisted: not a scalar)) |
@@ -593,6 +595,7 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/meta/src/key.rs` `FLOOR` | format | `b'f'` | Marker byte `f` after `LOCAL` for the Name range's gate floor. |
 | `crates/meta/src/key.rs` `GATE` | format | `b'g'` | Marker byte `g` after `LOCAL` for gate rows. |
 | `crates/meta/src/key.rs` `GATES_END` | format | `[LOCAL, marker::GATE, 0xFF]` | A key past every gate. (a table of a format or algorithm (unlisted in constants.md: not a scalar)) |
+| `crates/meta/src/key.rs` `GRANTS` | format | `5` | Root-range row tag 5 after `DATA` for the grant window: the highest grant spent, its floor and the window's bits (docs/design/membership.md §2). |
 | `crates/meta/src/key.rs` `HEADER` | format | `1` | File-layer row tag 1 for a file's header. |
 | `crates/meta/src/key.rs` `HISTORY` | format | `3` | Root-range row tag 3 after `DATA` for a node's history: its time run and its crashes (docs/design/node.md §2.4, item 7). |
 | `crates/meta/src/key.rs` `LINEAGE` | format | `b'l'` | Marker byte `l` after `LOCAL` for the Name range's lineage row. |
@@ -606,9 +609,11 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/meta/src/key.rs` `OWNER` | format | `b'o'` | Marker byte `o` after `LOCAL` for an owner's row: the session its last registration opened, and that registration's run and place in the run (docs/design/node.md §1.4). |
 | `crates/meta/src/key.rs` `PART` | format | `1` | Tag 1 after an upload ID for its part rows. |
 | `crates/meta/src/key.rs` `RELEASED` | format | `b'q'` | Marker byte `q` after `LOCAL` for the queue of released files. |
+| `crates/meta/src/key.rs` `RETIRED` | format | `6` | Root-range row tag 6 after `DATA` for the removed nodes' history, their totals added together (docs/design/membership.md §9). |
 | `crates/meta/src/key.rs` `REVERSE` | format | `0x02` | Key-space prefix byte 0x02 for reverse-index rows. |
 | `crates/meta/src/key.rs` `SESSION` | format | `b's'` | Marker byte `s` after `LOCAL` for session rows. |
 | `crates/meta/src/key.rs` `SESSIONS` | format | `b'n'` | Marker byte `n` after `LOCAL` for the session count row. |
+| `crates/meta/src/key.rs` `STANDING` | format | `4` | Root-range row tag 4 after `DATA` for a member's standing: its state, grant, certificate's fingerprint, where it is dialed and since when it is absent (docs/design/membership.md §1). |
 | `crates/meta/src/key.rs` `TERM` | format | `b't'` | Marker byte `t` after `LOCAL` for the term of the last entry the range applied, which its replica keeps beside the index (docs/design/replica.md §4). |
 | `crates/meta/src/key.rs` `UNSETTLED` | format | `b'u'` | Marker byte `u` after `LOCAL` for files and blocks whose handover is unsettled. |
 | `crates/meta/src/key.rs` `UPLOAD` | format | `3` | Name-row tag 3: upload rows, sorting after versions. |
@@ -620,6 +625,7 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/meta/src/name.rs` `MAX_PART_NUMBER` | external | `10_000` | S3 part numbers run from 1 to 10,000 (docs/research/05 §4.3, AWS UploadPart reference). |
 | `crates/meta/src/record.rs` `CRC_BYTES` | format | `4` | The 4 bytes of a value's CRC-32C, which ends every record value (`record`, `put_record`). |
 | `crates/meta/src/record.rs` `DAY_MS` | derived | `86_400_000` | Unit conversion: 86,400 s × 1,000 ms per day, for S3 Object Lock retention days and years (docs/research/18 §2.4, §2.6). |
+| `crates/meta/src/record.rs` `FINGERPRINT` | external | `32` | Bytes of a certificate's fingerprint, which a member's standing keeps: SHA-256's 256-bit output (FIPS 180-4 §1) (docs/design/membership.md §1). |
 | `crates/meta/src/record.rs` `FORMAT` | format | `6` | Version byte 6 that begins every row value written by this code; 6 since a file keeps a row for each block it names, 5 since a part's row records its file's handover deadline, which the completion adopting it gives the part's mark without reading it, 4 since a mark records its write's handover deadline and a queue row whether its ID names a file, 3 since a file's mark records how the range took it (a version's order, a part, an adopting composite, or refused), 2 since a version records its completion's part listing. |
 | `crates/meta/src/record.rs` `LISTING` | external | `32` | Bytes of a completion's listing digest: SHA-256's 256-bit output (FIPS 180-4 §1). |
 | `crates/meta/src/record.rs` `RUNS_FLAG` | format | `5` | Bit 5 of an upload row's flag byte, set when a native upload's runs follow (docs/design/gateway.md §2.1); bits 0 to 4 hold the checksum and the lock, so a row written before runs has it clear and decodes unchanged. |
@@ -627,6 +633,7 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/meta/src/record.rs` `SESSION_FIXED` | format | `25` | Bytes of a session's row besides its answers: its format, last use, low serial, count of answers and checksum, as `Session::encode` writes them; `Session::row_bytes` is checked against the encoding. |
 | `crates/meta/src/record.rs` `SWEPT` | format | `Self { how: How::Refused, deadline_ns: 0, }` | The mark the sweep writes for every file it releases, never handed over and past its deadline at the range's time: it has no value, and reads as a deadline already passed. (a table of a format or algorithm (unlisted in constants.md: not a scalar)) |
 | `crates/meta/src/root.rs` `MAX_DOMAIN` | external | `255` | The longest failure domain a node names, 255 bytes: a label such as a rack's or a zone's name, which DNS bounds at 63 bytes a label and 255 a name (RFC 1035 §2.3.4); an enlistment past it is a conflict. |
+| `crates/meta/src/root.rs` `MAX_REACH` | derived | `MAX_DOMAIN + 8` | The longest place a member is dialed at, `HOST:PORT`: a host of at most 255 octets (RFC 1035 §2.3.4, as `MAX_DOMAIN`), two brackets where it is an IPv6 address (RFC 3986 §3.2.2), a colon, and a port of at most five digits (a `u16`, 65,535), 263 bytes (docs/design/membership.md §1). |
 | `crates/meta/src/session.rs` `COUNT` | format | `&[LOCAL, SESSIONS]` | The markers of the rows a session count is kept in. |
 | `crates/meta/src/session.rs` `OWNED_BYTES` | format | `24` | Bytes of an owner's row: the session its last registration opened, that registration's run and its place in the run, each a big-endian word (docs/design/node.md §1.4). |
 | `crates/meta/src/wire.rs` `ETAG_HEX` | external | `32` | A part's ETag, the hex of its 16-byte MD5 (research/05 §4.5). |
@@ -1147,6 +1154,7 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/node/src/listener/respond.rs` `reply:status` | external | `304` | 304 Not Modified (RFC 9110 §15.4.5). |
 | `crates/node/src/node/host.rs` `directory:generation` | format | `1` | The cell's first Name range is at generation one (node.md §1.5). |
 | `crates/node/src/node/host.rs` `directory:id` | format | `1` | The cell's first Name range is range one (node.md §1.5). |
+| `crates/node/src/node/members.rs` `SECONDS_AN_HOUR` | derived | `3_600.0` | Unit conversion: 3,600 seconds an hour, the unit of the durability model's repair rate (`durability.repair_rate`, repairs an hour), whose mean is the absence past which a member is judged gone (docs/design/membership.md §5). |
 | `crates/node/src/place.rs` `key:(1u64 << 53)` | external | `1u64 << 53` | 2^53: an IEEE 754 binary64's significand holds 53 bits, so the draw is uniform in [0, 1) (IEEE Std 754-2019 §3.6). |
 | `crates/node/src/process.rs` `run_node:workers` | derived | `1` | name lookups at once: structural |
 | `crates/node/src/process.rs` `runtime:shards` | picked | `1` | cores the node's event loop runs on: both doors, every range, the transport. Refused (audit 2026-11-12 §6): a fixed count of one core whatever the host measures: a 1 B PUT costs 4.7–6.7 M server instructions (research/71 ledger, servers summed), so one core a node caps a cell well under 10,000 PUTs/s. Replace: shards from the measured cores (hyper-rt Facts::cores, as RuntimeConfig::from_calibration derives), ranges and connections placed across them |

@@ -208,7 +208,19 @@ impl Answer {
                         root::Outcome::Full => 2,
                         root::Outcome::Kept => 3,
                         root::Outcome::Unknown => 4,
+                        root::Outcome::Joined => 5,
+                        root::Outcome::Leaving => 6,
+                        root::Outcome::Gone => 7,
+                        root::Outcome::Removed => 8,
+                        root::Outcome::Retired => 9,
+                        root::Outcome::Stale { .. } => 10,
+                        root::Outcome::Holding => 11,
+                        root::Outcome::Recorded => 12,
+                        root::Outcome::Delisted => 13,
                     });
+                    if let root::Outcome::Stale { top } = o {
+                        w.u64(*top);
+                    }
                 }
             }
             Ok(())
@@ -261,6 +273,15 @@ impl Answer {
                     2 => root::Outcome::Full,
                     3 => root::Outcome::Kept,
                     4 => root::Outcome::Unknown,
+                    5 => root::Outcome::Joined,
+                    6 => root::Outcome::Leaving,
+                    7 => root::Outcome::Gone,
+                    8 => root::Outcome::Removed,
+                    9 => root::Outcome::Retired,
+                    10 => root::Outcome::Stale { top: r.u64()? },
+                    11 => root::Outcome::Holding,
+                    12 => root::Outcome::Recorded,
+                    13 => root::Outcome::Delisted,
                     _ => return None,
                 }),
                 _ => return None,
@@ -418,6 +439,58 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
             w.u64(l.exposure_ns);
             w.u64(l.crashes);
         }
+        Command::Root(root::Command::Join(j)) => {
+            w.u8(5);
+            w.u8(2);
+            w.u64(j.node);
+            w.u64(j.grant);
+            w.bytes(&j.fingerprint);
+            record::put_str(w, &j.quic)?;
+            record::put_str(w, &j.plane)?;
+            record::put_str(w, &j.domain)?;
+            record::put_len(w, j.volumes.len())?;
+            for (volume, bytes) in &j.volumes {
+                w.u128(*volume);
+                w.u64(*bytes);
+            }
+            w.u32(j.max_nodes);
+            w.u32(j.max_volumes);
+        }
+        Command::Root(root::Command::Leave { node }) => {
+            w.u8(5);
+            w.u8(3);
+            w.u64(*node);
+        }
+        Command::Root(root::Command::Gone { node }) => {
+            w.u8(5);
+            w.u8(4);
+            w.u64(*node);
+        }
+        Command::Root(root::Command::Remove { node }) => {
+            w.u8(5);
+            w.u8(5);
+            w.u64(*node);
+        }
+        Command::Root(root::Command::Delist { node }) => {
+            w.u8(5);
+            w.u8(9);
+            w.u64(*node);
+        }
+        Command::Root(root::Command::Retire { volume }) => {
+            w.u8(5);
+            w.u8(6);
+            w.u128(*volume);
+        }
+        Command::Root(root::Command::Absent { node, .. }) => {
+            w.u8(5);
+            w.u8(7);
+            w.u64(*node);
+        }
+        Command::Root(root::Command::Returned { node }) => {
+            w.u8(5);
+            w.u8(8);
+            w.u64(*node);
+        }
     }
     Ok(())
 }
@@ -539,6 +612,40 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
                 exposure_ns: r.u64()?,
                 crashes: r.u64()?,
             }),
+            2 => {
+                let node = r.u64()?;
+                let grant = r.u64()?;
+                let fingerprint = r.take(crate::record::FINGERPRINT)?.try_into().ok()?;
+                let quic = record::take_str(r)?;
+                let plane = record::take_str(r)?;
+                let domain = record::take_str(r)?;
+                let count = bounded(r, 24)?;
+                let mut volumes = crate::record::reserved(count)?;
+                for _ in 0..count {
+                    volumes.push((r.u128()?, r.u64()?));
+                }
+                root::Command::Join(root::Join {
+                    node,
+                    grant,
+                    fingerprint,
+                    quic,
+                    plane,
+                    domain,
+                    volumes,
+                    max_nodes: r.u32()?,
+                    max_volumes: r.u32()?,
+                })
+            }
+            3 => root::Command::Leave { node: r.u64()? },
+            4 => root::Command::Gone { node: r.u64()? },
+            5 => root::Command::Remove { node: r.u64()? },
+            6 => root::Command::Retire { volume: r.u128()? },
+            7 => root::Command::Absent {
+                node: r.u64()?,
+                at_ns,
+            },
+            8 => root::Command::Returned { node: r.u64()? },
+            9 => root::Command::Delist { node: r.u64()? },
             _ => return None,
         }),
         _ => return None,
@@ -2349,6 +2456,25 @@ mod tests {
                 exposure_ns: u64::MAX,
                 crashes: u64::MAX,
             })),
+            Command::Root(root::Command::Join(root::Join {
+                node: 4,
+                grant: u64::MAX,
+                fingerprint: [7; crate::record::FINGERPRINT],
+                quic: "[2001:db8::1]:7000".into(),
+                plane: "laptop.example:7001".into(),
+                domain: "desk".into(),
+                volumes: vec![(9, 1 << 33)],
+                max_nodes: 5,
+                max_volumes: 10,
+            })),
+            Command::Root(root::Command::Leave { node: 4 }),
+            Command::Root(root::Command::Gone { node: 4 }),
+            Command::Root(root::Command::Gone { node: u64::MAX }),
+            Command::Root(root::Command::Remove { node: 4 }),
+            Command::Root(root::Command::Retire { volume: u128::MAX }),
+            Command::Root(root::Command::Absent { node: 4, at_ns }),
+            Command::Root(root::Command::Returned { node: 4 }),
+            Command::Root(root::Command::Delist { node: 4 }),
         ]
     }
 
@@ -2554,6 +2680,15 @@ mod tests {
                 root::Outcome::Full,
                 root::Outcome::Kept,
                 root::Outcome::Unknown,
+                root::Outcome::Joined,
+                root::Outcome::Leaving,
+                root::Outcome::Gone,
+                root::Outcome::Removed,
+                root::Outcome::Retired,
+                root::Outcome::Stale { top: u64::MAX },
+                root::Outcome::Holding,
+                root::Outcome::Recorded,
+                root::Outcome::Delisted,
             ]
             .map(Answer::Root),
         );

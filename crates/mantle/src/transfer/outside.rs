@@ -72,7 +72,10 @@ impl Outside {
             };
             s3.push((endpoint.to_string(), listener.region));
             if volume_bytes.is_none() {
-                volume_bytes = stated.volumes.first().map(|(_, bytes)| *bytes);
+                volume_bytes = stated.volumes.iter().find_map(|(_, bytes)| match bytes {
+                    mantle_node::derive::VolumeBytes::Stated(size) => Some(*size),
+                    mantle_node::derive::VolumeBytes::Spare { .. } => None,
+                });
             }
         }
         let bind = match quic.first() {
@@ -86,8 +89,12 @@ impl Outside {
             quic,
             s3,
             bind,
-            volume_bytes: volume_bytes
-                .ok_or_else(|| unread(format!("{}: no founder keeps a volume", out.display())))?,
+            volume_bytes: volume_bytes.ok_or_else(|| {
+                unread(format!(
+                    "{}: no founder states its volume's bytes",
+                    out.display()
+                ))
+            })?,
         })
     }
 

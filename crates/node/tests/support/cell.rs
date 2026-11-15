@@ -110,6 +110,7 @@ fn range(nodes: u64, settings: Settings) -> Range {
             ..ConfState::default()
         },
         settings,
+        members: 0,
     }
 }
 
@@ -647,6 +648,8 @@ impl Sim {
             // The simulated cell keeps no history (its nodes enlist nothing): every start's
             // detectors begin from what they watch.
             history: mantle_meta::record::History::default(),
+            max_nodes: 0,
+            seeds: Vec::new(),
         };
         self.starts += 1;
         let shard = member.shard;

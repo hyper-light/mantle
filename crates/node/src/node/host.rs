@@ -554,7 +554,14 @@ enum Single {
 /// thing of the table the choice reads (the gateway's rates and target are the process's own).
 pub(crate) struct Table {
     applied: u64,
-    /// In the order of their ids (`root::volumes`).
+    /// In the order of their ids (`root::volumes`): every volume the table holds, which a chunk
+    /// already placed is read from.
+    held: Vec<Placed>,
+    /// Those a new block's scheme is chosen over (`root::shaping`): of serving members, present or
+    /// away (docs/design/membership.md §5).
+    shape: Vec<Placed>,
+    /// Those placement may offer a new block (`root::placeable`): of the shape, the members
+    /// present.
     placed: Vec<Placed>,
     scheme: Option<durability::Scheme>,
 }
@@ -562,11 +569,8 @@ pub(crate) struct Table {
 impl Table {
     /// The node that holds `volume`, if the table holds it.
     fn node_of(&self, volume: u128) -> Option<PeerId> {
-        let at = self
-            .placed
-            .binary_search_by_key(&volume, |p| p.volume)
-            .ok()?;
-        self.placed.get(at).map(|p| p.node)
+        let at = self.held.binary_search_by_key(&volume, |p| p.volume).ok()?;
+        self.held.get(at).map(|p| p.node)
     }
 }
 
@@ -588,18 +592,18 @@ fn scheme(gateway: &GatewaySettings, table: &[Placed]) -> Option<durability::Sch
     }
 }
 
-/// The scheme new blocks take over `placed`, the volume table read again: the one chosen over the
+/// The scheme new blocks take over `shape`, the volume table read again: the one chosen over the
 /// table read before (`was`), carried while every volume keeps its place and its domain, or chosen
 /// again. The durability model's choice so runs once per change of the domains, not once per entry
 /// the root range applies (research/71: 2,448.5 allocations each time it ran).
 fn scheme_over(
     was: Option<&Table>,
-    placed: &[Placed],
+    shape: &[Placed],
     gateway: Option<&GatewaySettings>,
 ) -> Option<durability::Scheme> {
-    match was.filter(|t| same_domains(&t.placed, placed)) {
+    match was.filter(|t| same_domains(&t.shape, shape)) {
         Some(table) => table.scheme,
-        None => gateway.and_then(|g| scheme(g, placed)),
+        None => gateway.and_then(|g| scheme(g, shape)),
     }
 }
 
@@ -970,11 +974,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let engine = shell.machine_mut().engine_mut();
             let census = root::census(engine).map_err(|e| NodeError::Bounds(e.to_string()))?;
             let most = usize::try_from(census.volumes).unwrap_or(usize::MAX);
-            let placed =
+            let held =
                 root::volumes(engine, None, most).map_err(|e| NodeError::Bounds(e.to_string()))?;
-            let scheme = scheme_over(self.table.as_ref(), &placed, self.gateway.as_ref());
+            let shape =
+                root::shaping(engine, most).map_err(|e| NodeError::Bounds(e.to_string()))?;
+            let placed =
+                root::placeable(engine, most).map_err(|e| NodeError::Bounds(e.to_string()))?;
+            let scheme = scheme_over(self.table.as_ref(), &shape, self.gateway.as_ref());
             self.table = Some(Table {
                 applied,
+                held,
+                shape,
                 placed,
                 scheme,
             });
@@ -4662,6 +4672,8 @@ mod tests {
         assert!(chosen.is_some());
         let table = Table {
             applied: 1,
+            held: first.clone(),
+            shape: first.clone(),
             placed: first,
             scheme: chosen,
         };

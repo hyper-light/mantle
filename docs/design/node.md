@@ -580,6 +580,16 @@ a voter by one joint change (replica.md §6), until every range has `2f + 1` vot
 domain (§6.5). Until the cell has the domains `f` needs, the node reports the failures it can
 survive, and placement uses the domains there are.
 
+*Superseded (2026-11-14): joining by a grant* (docs/design/membership.md). No node holds the
+authority's key: its holder, the operator or a supervisor like kiln, grants a node offline
+(`mantle init grant`), a certificate naming `node-ID` and a grant numbered past the authority's
+last, which the root range spends once in a window as wide as the cell's bound on nodes (RFC 4303
+§3.4.3's anti-replay window), so a removed node's certificate, which never expires, needs no list
+to revoke it (RFC 5280 §3.3). The granted node dials the members its grant names, asks the root
+range to `Join`, and each range's leader adds it as a learner and makes it a voter once caught up,
+one server at a time (Raft dissertation §4.1, §4.2.1). Leaving in order, judging a member gone,
+removing it and the seam with repair are membership.md's.
+
 **Restart** needs nothing but the node's own directories. It reads its membership, its peers'
 addresses and the last cell map it persisted, and serves from them while the control plane is
 down (architecture §4, §9).
@@ -2663,8 +2673,14 @@ bounded; a member is removed only once its replacement holds the durable state t
 node that leads when the replacement ends reports it once (`replaced`, with the range's group). Every node may be told it, since the replacement
 is stateless. The joining member is a spare identity every directory holds from the start, its
 node started as the founders were, with their configuration and rows, of which it is no member
-until the learner change adds it; a node's directory taking an identity it did not hold (an
-invitation) and moves chosen from size and load are still to build.
+until the learner change adds it; moves chosen from size and load are still to build.
+
+*As built (2026-11-14): members that come and go* (docs/design/membership.md §6). A node's
+directory takes an identity it did not hold: a granted node's, by the root range's rows. Each
+range's leader steps its configuration toward the cell's members (`membership::Toward`): a member
+serving a voter, added as a learner and promoted once caught up; one leaving a learner of the root
+range alone; one gone or removed nowhere; an absent voter a learner where dropping every absent
+voter lets the range survive more failures; one server at a time, adds before removals.
 
 ### 6.5 Voters across failure domains
 
@@ -2934,9 +2950,9 @@ range's workload (12 §6.6).
 
 - **Each class's share above its floor** (§1.4): the knee where a class's throughput stops growing
   as its share grows, measured at the scale step, decides what a budget above the floor buys.
-- **A node or a gateway known by its name under the authority** rather than by its pinned
-  certificate (§1.5, §3.6), once the root range keeps the cell's membership and a join records
-  each new identity. Clients are so known (§3.6, 2026-10-26).
+- **A gateway known by its name under the authority** rather than by its pinned certificate (§1.5,
+  §3.6). Clients are so known (§3.6, 2026-10-26), and nodes of a cell made by grants by their
+  rows in the root range (membership.md §2, 2026-11-14).
 - **Cores among pools.** Three pools sized to the granted cores oversubscribe under full load;
   whether dividing cores by measured demand does better is measured once phase A runs.
 - **Quiescing idle ranges**, and the protocol that wakes one without weakening its election or

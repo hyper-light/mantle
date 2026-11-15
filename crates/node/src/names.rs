@@ -88,6 +88,37 @@ impl Names {
         self.peers.iter().any(|p| p.id == id)
     }
 
+    /// A member the cell's root range names by a host, reached at `at`, looked up at `now`: added,
+    /// or looked up again where its place moved (docs/design/membership.md §3 step 3). The named
+    /// peers are at most the configuration's and the cell's members ([`Names::retain`]).
+    pub fn add(&mut self, id: u64, at: (Endpoint, Endpoint), now: u64) {
+        match self.peers.iter_mut().find(|p| p.id == id) {
+            Some(peer) if peer.at == at => {}
+            Some(peer) => {
+                peer.at = at;
+                peer.due = Some(now);
+                peer.backoff = bounds::initial_pto();
+                peer.attempt = 0;
+            }
+            None => self.peers.push(Named {
+                id,
+                at,
+                known: None,
+                due: Some(now),
+                backoff: bounds::initial_pto(),
+                attempt: 0,
+            }),
+        }
+    }
+
+    /// Keeps only the named peers `keep` keeps: the members the cell no longer admits go.
+    pub fn retain(&mut self, keep: impl Fn(u64) -> bool) {
+        self.peers.retain(|p| keep(p.id));
+        if self.looking.is_some_and(|id| !keep(id)) {
+            self.looking = None;
+        }
+    }
+
     /// The node's link to `id` ended at `now`: its name is looked up again now, unless a lookup of it
     /// is in flight or already due sooner.
     pub fn ended(&mut self, id: u64, now: u64) {

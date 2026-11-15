@@ -47,6 +47,11 @@ pub struct Range {
     /// The configuration of a range whose engine holds nothing yet.
     pub boot: ConfState,
     pub settings: Settings,
+    /// The most members a configuration of the range names, where the cell's members come and
+    /// go: the cell's bound on nodes, `root.max_nodes` (docs/design/membership.md §9). Zero for a
+    /// range of fixed members, whose bound is its boot configuration's and the one learner a
+    /// replacement adds.
+    pub members: usize,
 }
 
 /// How the group's core runs, as the node sets every range.
@@ -136,8 +141,9 @@ pub fn ready_bytes(settings: &Settings) -> Option<u64> {
 ///   `max_size_per_msg`, and one at least, so it carries either that or one entry of the range's
 ///   largest with its fixed bytes (a range's entries carry no context), inside the record's
 ///   fixed bytes;
-/// - the most members a configuration names are the boot configuration's and the one learner a
-///   replacement adds, the only change a range's membership makes ([`Replacement`]);
+/// - the most members a configuration names are the cell's bound on nodes where its members come
+///   and go ([`Range::members`]), else the boot configuration's and the one learner a replacement
+///   adds, the only change such a range's membership makes ([`Replacement`]);
 /// - each queue holds what one ready of the range's settings holds (the bound the log is held to,
 ///   [`check_settings`]), counted resident: the most entries a ready carries, each at least its
 ///   fixed bytes on the wire, at an entry's bytes in memory each, so that a member holds a
@@ -161,7 +167,8 @@ pub fn limits(range: &Range) -> Result<Limits, ReplicaError> {
         .len()
         .checked_add(range.boot.learners.len())
         .and_then(|n| n.checked_add(1))
-        .ok_or_else(unfit)?;
+        .ok_or_else(unfit)?
+        .max(range.members);
     let memory = ready_bytes(s)
         .and_then(|bytes| usize::try_from(bytes).ok())
         .and_then(|bytes| bytes.checked_div(ENTRY_FIXED_BYTES))

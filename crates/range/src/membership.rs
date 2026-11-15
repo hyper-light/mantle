@@ -16,6 +16,15 @@
 //! A [`Replacement`] is stateless: each call reads the configuration the leader has applied
 //! and says what to propose next. A proposal a leader drops, or one lost with a leader, is
 //! proposed again the next time, and one already applied is not.
+//!
+//! [`Toward`] steps a range's configuration toward the cell's members as its root range holds them
+//! (docs/design/membership.md §6): each member joins as a learner, which votes on nothing, and is
+//! made a voter once caught up (Raft dissertation §4.2.1); a member the target makes a learner is
+//! demoted and one it names nowhere removed, one server at a time (dissertation §4.1; research/06
+//! §A1.7). Adds come before removals, so the voters never fall below the smaller of the old and
+//! new sets on the way. It is stateless too: the caller proposes a step only while no change is
+//! pending (hyper-raft's `has_pending_conf`), and a new leader takes up the target from the
+//! configuration it finds.
 
 use hyper_raft::proto::{
     ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState,
@@ -91,6 +100,117 @@ impl Replacement {
             Next::Propose(change(&[(ConfChangeType::AddLearnerNode, self.joining)]))
         }
     }
+}
+
+/// A range's configuration as the cell's members would have it (docs/design/membership.md §6): the
+/// members that vote, and those that only learn, each sorted, none in both.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Toward {
+    pub voters: Vec<u64>,
+    pub learners: Vec<u64>,
+}
+
+/// What stepping toward a target asks of the range's leader next.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Step {
+    /// Propose this change.
+    Propose(ConfChangeV2),
+    /// Hand the range's lead to this voter, which the target keeps, first: the target drops the
+    /// leader itself (dissertation §4.2.2 prefers a transfer).
+    Transfer(u64),
+    /// Nothing until the configuration changes: a joint configuration being left, or a learner
+    /// catching up.
+    Wait,
+    /// The configuration is the target's.
+    Done,
+}
+
+impl Toward {
+    /// The next step from `conf`, the configuration the leader `leader` applied, toward this
+    /// target; `caught_up` says whether a member holds everything the leader knows committed
+    /// ([`crate::Replica::caught_up`]). One server at a time: a target member that is no member
+    /// joins as a learner; a learner the target makes a voter is promoted once caught up; a
+    /// learner the target names nowhere is removed; and, once every learner the target makes a
+    /// voter votes, a voter the target makes a learner is demoted and one it names nowhere
+    /// removed. The leader is never demoted or removed by its own change, so no change leaves the
+    /// range without a voter: once nothing else is left, a leader the target drops hands the lead
+    /// to a caught-up voter the target keeps, and waits where none is caught up.
+    pub fn step(&self, conf: &ConfState, leader: u64, caught_up: impl Fn(u64) -> bool) -> Step {
+        if !conf.voters_outgoing.is_empty() || !conf.learners_next.is_empty() {
+            return Step::Wait;
+        }
+        let member = |id: &u64| conf.voters.contains(id) || conf.learners.contains(id);
+        let named = |id: &u64| self.voters.contains(id) || self.learners.contains(id);
+        if let Some(&joining) = self
+            .voters
+            .iter()
+            .chain(&self.learners)
+            .filter(|id| !member(id))
+            .min()
+        {
+            return Step::Propose(change(&[(ConfChangeType::AddLearnerNode, joining)]));
+        }
+        let mut catching_up = false;
+        for &learner in conf.learners.iter().filter(|id| self.voters.contains(id)) {
+            if caught_up(learner) {
+                return Step::Propose(change(&[(ConfChangeType::AddNode, learner)]));
+            }
+            catching_up = true;
+        }
+        // A learner the target names nowhere goes at any time: it counts toward no quorum.
+        if let Some(&removed) = conf.learners.iter().filter(|id| !named(id)).min() {
+            return Step::Propose(change(&[(ConfChangeType::RemoveNode, removed)]));
+        }
+        // A voter goes only once every member the target makes a voter votes.
+        if catching_up {
+            return Step::Wait;
+        }
+        if let Some(&demoted) = conf
+            .voters
+            .iter()
+            .filter(|id| **id != leader && self.learners.contains(id))
+            .min()
+        {
+            return Step::Propose(change(&[(ConfChangeType::AddLearnerNode, demoted)]));
+        }
+        if let Some(&removed) = conf
+            .voters
+            .iter()
+            .filter(|id| **id != leader && !named(id))
+            .min()
+        {
+            return Step::Propose(change(&[(ConfChangeType::RemoveNode, removed)]));
+        }
+        if self.voters.contains(&leader) {
+            return Step::Done;
+        }
+        match conf
+            .voters
+            .iter()
+            .copied()
+            .filter(|id| *id != leader && self.voters.contains(id) && caught_up(*id))
+            .min()
+        {
+            Some(heir) => Step::Transfer(heir),
+            None => Step::Wait,
+        }
+    }
+}
+
+/// How many more failures a range of `voters` voters, `absent` of them away, survives: the live
+/// voters past its quorum's majority, none where it has no quorum now (docs/design/membership.md
+/// §5; Raft commits and elects by a majority of the voters, dissertation §3).
+pub fn tolerance(voters: usize, absent: usize) -> usize {
+    let quorum = (voters / 2).saturating_add(1);
+    voters.saturating_sub(absent).saturating_sub(quorum)
+}
+
+/// Whether a range of `voters` voters drops its `absent` absent ones (docs/design/membership.md
+/// §5): only where the range then survives more failures than it does keeping them.
+pub fn drops_absent(voters: usize, absent: usize) -> bool {
+    absent > 0
+        && absent < voters
+        && tolerance(voters.saturating_sub(absent), 0) > tolerance(voters, absent)
 }
 
 /// One entry of `changes`: a simple change for one, a joint change the group leaves by itself
@@ -182,6 +302,112 @@ mod tests {
             kinds(&r.next(&conf(&[1, 2, 4], &[3], &[]), false, true)),
             [(REMOVE, 3)]
         );
+    }
+
+    fn toward(voters: &[u64], learners: &[u64]) -> Toward {
+        Toward {
+            voters: voters.to_vec(),
+            learners: learners.to_vec(),
+        }
+    }
+
+    fn step_kinds(step: &Step) -> Vec<(ConfChangeType, u64)> {
+        match step {
+            Step::Propose(c) => c
+                .changes
+                .iter()
+                .map(|s| (s.change_type, s.node_id))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// A member joins as a learner, waits while it catches up, and is promoted alone; each step
+    /// one server.
+    #[test]
+    fn a_member_joins_as_a_learner_and_is_promoted_once_caught_up() {
+        let target = toward(&[1, 2, 3, 4], &[]);
+        let start = conf(&[1, 2, 3], &[], &[]);
+        assert_eq!(step_kinds(&target.step(&start, 1, |_| true)), [(LEARN, 4)]);
+        let learning = conf(&[1, 2, 3], &[4], &[]);
+        assert_eq!(target.step(&learning, 1, |_| false), Step::Wait);
+        assert_eq!(step_kinds(&target.step(&learning, 1, |_| true)), [(ADD, 4)]);
+        assert_eq!(
+            target.step(&conf(&[1, 2, 3, 4], &[], &[]), 1, |_| true),
+            Step::Done
+        );
+    }
+
+    /// Adds come first; then a member the target names nowhere is removed, one at a time; a
+    /// leaving member the target keeps learning is demoted, not removed.
+    #[test]
+    fn removals_and_demotions_follow_every_add() {
+        // 4 joins and 3 leaves: 4 first.
+        let target = toward(&[1, 2, 4], &[]);
+        let now = conf(&[1, 2, 3], &[], &[]);
+        assert_eq!(step_kinds(&target.step(&now, 1, |_| true)), [(LEARN, 4)]);
+        let both = conf(&[1, 2, 3, 4], &[], &[]);
+        assert_eq!(step_kinds(&target.step(&both, 1, |_| true)), [(REMOVE, 3)]);
+        // A member the target keeps as a learner is demoted.
+        let learner = toward(&[1, 2], &[3]);
+        assert_eq!(step_kinds(&learner.step(&now, 1, |_| true)), [(LEARN, 3)]);
+        assert_eq!(
+            learner.step(&conf(&[1, 2], &[3], &[]), 1, |_| true),
+            Step::Done
+        );
+        // A learner the target names nowhere is removed.
+        let gone = toward(&[1, 2], &[]);
+        assert_eq!(
+            step_kinds(&gone.step(&conf(&[1, 2], &[3], &[]), 1, |_| true)),
+            [(REMOVE, 3)]
+        );
+    }
+
+    /// The leader the target drops hands the lead to a caught-up voter the target keeps, and
+    /// waits where none is; it never removes itself, nor the last voter.
+    #[test]
+    fn a_dropped_leader_hands_its_lead_first() {
+        let target = toward(&[2, 3], &[]);
+        let now = conf(&[1, 2, 3], &[], &[]);
+        assert_eq!(target.step(&now, 1, |id| id == 3), Step::Transfer(3));
+        assert_eq!(target.step(&now, 1, |_| false), Step::Wait);
+        // Led by 2 now: 1 is removed.
+        assert_eq!(step_kinds(&target.step(&now, 2, |_| true)), [(REMOVE, 1)]);
+        // A target of no voter removes nothing that would leave the range without one.
+        let none = toward(&[], &[]);
+        let alone = conf(&[1], &[2], &[]);
+        assert_eq!(step_kinds(&none.step(&alone, 1, |_| true)), [(REMOVE, 2)]);
+        assert_eq!(none.step(&conf(&[1], &[], &[]), 1, |_| true), Step::Wait);
+        // While a member the target makes a voter catches up, no voter goes.
+        let swap = toward(&[1, 2, 4], &[]);
+        let learning = conf(&[1, 2, 3], &[4], &[]);
+        assert_eq!(swap.step(&learning, 1, |id| id != 4), Step::Wait);
+        assert_eq!(step_kinds(&swap.step(&learning, 1, |_| true)), [(ADD, 4)]);
+    }
+
+    #[test]
+    fn a_joint_configuration_is_left_before_any_step() {
+        let target = toward(&[1, 2, 4], &[]);
+        assert_eq!(
+            target.step(&conf(&[1, 2, 4], &[], &[1, 2, 3]), 1, |_| true),
+            Step::Wait
+        );
+    }
+
+    /// membership.md §5's examples: three voters keep one away, five drop two, four drop one.
+    #[test]
+    fn absent_voters_are_dropped_only_where_the_range_then_survives_more() {
+        assert_eq!(tolerance(3, 0), 1);
+        assert_eq!(tolerance(3, 1), 0);
+        assert_eq!(tolerance(5, 2), 0);
+        assert_eq!(tolerance(3, 2), 0);
+        assert!(!drops_absent(3, 1));
+        assert!(!drops_absent(5, 1));
+        assert!(drops_absent(5, 2));
+        assert!(drops_absent(4, 1));
+        assert!(!drops_absent(2, 1));
+        assert!(!drops_absent(3, 0));
+        assert!(!drops_absent(2, 2));
     }
 
     #[test]

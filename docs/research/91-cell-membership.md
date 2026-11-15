@@ -1,9 +1,9 @@
-# 89. A cell whose members come and go: grants, revocation, absence and spare space
+# 91. A cell whose members come and go: grants, revocation, absence and spare space
 
 Status: research note, 2026-11-14. For docs/design/membership.md (branch `fleet-cell`): how a node
 gets an identity from the cell's authority and loses it, how the cell tells a member away for a
-while from one gone, and how much of a machine's disk a joining node takes. Sources [1] to [7] were
-read on the web on 2026-11-14 and are quoted where read; the dissertation and the 2015 bug are
+while from one gone, and how much of a machine's disk a joining node takes. Sources [1], [2] and [4] to [8]
+were read on the web on 2026-11-14 and are quoted where read; the dissertation and the 2015 bug are
 research/06 §A1.7's, and Ford et al. research/15's.
 
 ## The questions
@@ -34,15 +34,6 @@ following standard attribute types in issuer and subject (Section 4.1.2.6) names
 "X520SerialNumber ::= PrintableString (SIZE (1..ub-serial-number))", "ub-serial-number INTEGER ::=
 64".
 
-[3] S. S. Wilks, "Determination of Sample Sizes for Setting Tolerance Limits", Annals of
-Mathematical Statistics 12(1):91–96, 1941: the share of a continuous population below the largest
-of `n` independent observations has the distribution of the largest of `n` uniform variables
-whatever the population, so it is at least `p` with probability `1 − pⁿ`; the law hyper-rt's
-calibration stops its probes by (research/64, "Wilks' 59 samples, a 95 %/95 % bound"). DERIVED:
-its mean is `n / (n + 1)`, so a further observation exceeds the largest of the `n` with
-probability `1 / (n + 1)`; by symmetry alone, the same holds for any `n + 1` exchangeable
-observations without ties, each equally likely to be the largest.
-
 [4] D. Ongaro, "Consensus: Bridging Theory and Practice", PhD dissertation, Stanford, 2014,
 §4.1–§4.3, and "bug in single-server membership changes", raft-dev, July 2015, as research/06
 §A1.7 quotes them: single-server changes, catching new servers up as non-voting members, removing
@@ -66,6 +57,11 @@ https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getdiskfr
 bytes on a disk that are available to the user who is associated with the calling thread." "If
 per-user quotas are being used, this value may be less than the total number of free bytes on a
 disk."
+
+[8] Apple, XNU `bsd/sys/mount.h`, `struct statfs`, as macOS's `statfs(2)` fills it,
+https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/mount.h: `f_bsize` "fundamental
+file system block size"; `f_blocks` "total data blocks in file system"; `f_bavail` "free blocks
+avail to non-superuser".
 
 ## 1. Revocation is bounded only by expiry, or by spending grants once
 
@@ -92,30 +88,35 @@ The grant's number travels in the certificate's subject as X.520's `serialNumber
 every RFC 5280 implementation must take in a subject [2], a printable string of at most 64
 characters [2]: a `u64` in decimal is at most 20.
 
-## 2. Gone, judged from the cell's own returns
+## 2. Gone, judged from the cell's own facts
 
-Silence alone cannot tell a sleeping laptop from a dead one; what the cell can know is how long its
-members have been silent before and come back. Ford et al. found most unavailability in Google's
-fleet transient ("The vast majority of such unavailability events are transient and do not result
-in permanent data loss", research/15 §8.4), and GFS waited 15 minutes, a delay set by that
-fleet's distribution, before treating a node's chunks as lost (research/15 §1.4).
+Silence alone cannot tell a sleeping laptop from a dead one; what the cell can know is how long a
+member has been silent (its absence, which the root range records from its leader's node-pair
+stream) and what its own durability allows. Ford et al. found most unavailability in Google's fleet
+transient ("The vast majority of such unavailability events are transient and do not result in
+permanent data loss", research/15 §8.4), and GFS waited 15 minutes, a delay set by that fleet's
+distribution, before treating a node's chunks as lost (research/15 §1.4): waiting out a transient
+absence is cheaper than a rebuild.
 
-The rule membership.md §5 takes is that distribution's own support: a member absent past the
-longest absence any member has returned from is judged gone. If the cell has seen `n` returns, an
-absence that will end in a return outlasts all `n` with probability `1 / (n + 1)` at most [3]
-(exchangeable absences, no ties), so the rule's false judgments are bounded by a figure the cell
-states from its own history, and fall as it grows. It chooses no quantile and no timeout; a cell
-with no return seen judges nothing, and an operator or a supervisor states what it knows.
+The bound on that wait is the cell's own: the durability model chooses each block's scheme to meet
+the cell's target under a repair rate (node.md §1.4's `durability.*` row; research/15 §1.4's chain
+repairs a lost chunk at rate ρ), so the target holds only while a chunk that cannot be read is whole
+again within the model's mean, 1/ρ. An absence shorter than that is priced by the model already; one
+longer is not, and the member's chunks must be rebuilt, at which point the member is gone to the
+cell. The rule chooses no time: 1/ρ is the model's input, today research/15's day until repair
+measures itself (an open constant, `REPAIR_HOURS`), and a measured rate replaces it with no change
+to the rule.
 
-Not taken: a quantile below the maximum (Ford's 15 minutes is a fleet's choice of where transient
-ends, research/15 §1.4), which would need a chosen coverage; a Bayesian posterior of permanence,
-which would need a prior on how often members vanish for good and a ratio of costs, neither of
-which the cell measures.
+Not taken: a threshold read off the cell's own distribution of returns (the longest absence a
+member came back from), whose false judgments are 1/(n+1) for n returns seen — one in two after
+the first return, which would judge a rolling restart's slower node gone; a Bayesian posterior of
+permanence, which would need a prior on how often members vanish for good and a ratio of costs,
+neither of which the cell measures.
 
 ## 3. The space a process may write
 
 Each operating system states what a process may still write on a file system: POSIX's
-`f_bavail × f_frsize` [5], which on ext4 leaves out the blocks mke2fs reserves so the system's own
+`f_bavail × f_frsize` [5] (macOS's `statfs` counts the same blocks in `f_bsize` units [8]), which on ext4 leaves out the blocks mke2fs reserves so the system's own
 daemons keep working once others cannot write [6], and Windows' bytes available to the caller,
 less any quota [7]. `mantle_disk::probe` reads both already (`FileSystem::available_bytes`). A
 volume sized to that statement, less what the node itself writes on the same file system and less

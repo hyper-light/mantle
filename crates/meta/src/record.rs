@@ -572,6 +572,47 @@ pub struct Census {
     pub volumes: u32,
 }
 
+/// Where a member of the cell stands (docs/design/membership.md §1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberState {
+    /// A member: it votes, and its volumes take chunks.
+    Serving,
+    /// It asked to leave in order: it serves its chunks until they are moved, and takes none.
+    Leaving,
+    /// Judged or stated gone: its identity is refused, and its chunks are rebuilt elsewhere.
+    Gone,
+    /// Leaving or gone, with no volume left: its identity is refused, and its row is kept until no
+    /// range's configuration names it.
+    Removed,
+}
+
+/// The bytes of a certificate's fingerprint: a SHA-256 (FIPS 180-4).
+pub const FINGERPRINT: usize = 32;
+
+/// A member's row in the root range, its standing: its state, the grant its certificate carries, that
+/// certificate's SHA-256, where its peers dial it (`HOST:PORT` each), and since when, in the root
+/// range's time, its absence is recorded, 0 while it is present (docs/design/membership.md §1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Membership {
+    pub state: MemberState,
+    pub grant: u64,
+    pub fingerprint: [u8; FINGERPRINT],
+    pub quic: String,
+    pub plane: String,
+    pub absent_since_ns: u64,
+}
+
+/// The grant window (docs/design/membership.md §2; RFC 4303 §3.4.3's anti-replay window): the
+/// highest grant spent, 0 before any; the lowest grant the window has ever covered, below which
+/// none is spent again whatever the window's width becomes; and which grants below the top are
+/// spent: bit `i` of `seen` (byte `i / 8`, bit `i % 8`) is grant `top - i`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Grants {
+    pub top: u64,
+    pub floor: u64,
+    pub seen: Vec<u8>,
+}
+
 /// A reverse row: which chunk of its block the volume in its key holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reverse {
@@ -1085,6 +1126,78 @@ impl History {
             &r,
             "history",
         )
+    }
+}
+
+impl MemberState {
+    fn code(self) -> u8 {
+        match self {
+            Self::Serving => 0,
+            Self::Leaving => 1,
+            Self::Gone => 2,
+            Self::Removed => 3,
+        }
+    }
+
+    fn of(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Serving),
+            1 => Some(Self::Leaving),
+            2 => Some(Self::Gone),
+            3 => Some(Self::Removed),
+            _ => None,
+        }
+    }
+}
+
+impl Membership {
+    pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
+        record(|w| {
+            w.u8(self.state.code());
+            w.u64(self.grant);
+            w.bytes(&self.fingerprint);
+            put_str(w, &self.quic)?;
+            put_str(w, &self.plane)?;
+            w.u64(self.absent_since_ns);
+            Ok(())
+        })
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "membership")?;
+        let standing = (|| {
+            Some(Self {
+                state: MemberState::of(r.u8()?)?,
+                grant: r.u64()?,
+                fingerprint: r.take(FINGERPRINT)?.try_into().ok()?,
+                quic: take_str(&mut r)?,
+                plane: take_str(&mut r)?,
+                absent_since_ns: r.u64()?,
+            })
+        })();
+        decoded(standing, &r, "membership")
+    }
+}
+
+impl Grants {
+    pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
+        record(|w| {
+            w.u64(self.top);
+            w.u64(self.floor);
+            put_bytes(w, &self.seen)
+        })
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "grants")?;
+        let grants = (|| {
+            Some(Self {
+                top: r.u64()?,
+                floor: r.u64()?,
+                seen: take_bytes(&mut r)?,
+            })
+        })();
+        decoded(grants, &r, "grants")
     }
 }
 

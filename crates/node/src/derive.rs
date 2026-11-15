@@ -205,27 +205,179 @@ pub fn schemes(domains: usize, rates: &Rates, target: f64) -> Result<Vec<Scheme>
     Ok(schemes)
 }
 
-/// The most blocks a cell of `domains` failure domains holds when each of its nodes' volumes holds
-/// `fragments` chunks, as this node's do: each block takes the scheme the durability model chooses
-/// at `domains` (`durability::choose`), a chunk on each of its width's nodes, so the cell's chunks
-/// make a block for each width of them.
-pub fn cell_blocks(
-    fragments: u64,
-    domains: usize,
-    rates: &Rates,
-    target: f64,
-) -> Result<u64, DeriveError> {
-    let width = match durability::choose(&durability::candidates(), domains, rates, target)? {
-        Some(Choice::Meets { scheme, .. } | Choice::Short { scheme, .. }) => scheme.width(),
-        None => return Err(DeriveError::Schemes { domains }),
-    };
-    let overflow = || DeriveError::Overflow("the cell's blocks");
-    let nodes = u64::try_from(domains).map_err(|_| overflow())?;
-    let width = u64::try_from(width).map_err(|_| overflow())?;
+/// The most blocks a cell of `spread`'s nodes holds when each of its nodes' volumes holds
+/// `fragments` chunks, as this node's do: each block a chunk on each of its scheme's width of
+/// nodes, so the cell's chunks make a block for each width of them.
+pub fn cell_blocks(fragments: u64, spread: Spread) -> Result<u64, DeriveError> {
     fragments
-        .checked_mul(nodes)
-        .and_then(|chunks| chunks.checked_div(width))
-        .ok_or_else(overflow)
+        .checked_mul(spread.nodes)
+        .and_then(|chunks| chunks.checked_div(spread.width))
+        .ok_or(DeriveError::Overflow("the cell's blocks"))
+}
+
+/// Each volume's bytes (docs/design/membership.md §3.1): a volume laid out already keeps its
+/// layout's (`Geometry::end`); one stated `volume = DIR SIZE` takes `SIZE`; and one stated to take
+/// what its file system spares takes the bytes the OS states this process may still write there,
+/// less what its operator states the machine's other work keeps, less what the node writes there
+/// besides: the volumes stated on that file system and not laid out yet, and where it is the node
+/// directory's, the log's file of `log_file` bytes and the stores of each of its `ranges` ranges,
+/// each at the most of its store a range's engine took an object ([`STORE_BYTES_AN_OBJECT`]) for
+/// each block the cell's volumes make with this one's ([`cell_blocks`] at `spread`). That last is
+/// the most `f` blocks of `b` bytes for which `f·b + R·c·n·(F + f)/w` stays within the space, `F`
+/// the other volumes' fragments, `R` the ranges, `c` an object's store bytes and `n` and `w` the
+/// spread, so the cell's objects' rows always fit beside it. No share is chosen: a file system two
+/// such volumes may share would need one, and is refused.
+pub fn volume_sizes(
+    stated: &Stated,
+    measured: &Measured,
+    log_file: u64,
+    ranges: usize,
+    spread: Spread,
+) -> Result<Vec<u64>, DeriveError> {
+    let overflow = DeriveError::Overflow;
+    let volumes: Vec<_> = stated.volumes.iter().zip(&measured.volumes).collect();
+    let spares = |facts: &VolumeFacts, bytes: &VolumeBytes| {
+        facts.formatted.is_none() && matches!(bytes, VolumeBytes::Spare { .. })
+    };
+    // The bytes settled without what a file system spares: stated, or laid out.
+    let mut sizes = Vec::with_capacity(volumes.len());
+    for ((_, bytes), facts) in &volumes {
+        sizes.push(match (&facts.formatted, bytes) {
+            (Some(formatted), _) => Some(
+                formatted
+                    .geometry
+                    .end()
+                    .ok_or(overflow("a laid-out volume's bytes"))?,
+            ),
+            (None, VolumeBytes::Stated(size)) => Some(*size),
+            (None, VolumeBytes::Spare { .. }) => None,
+        });
+    }
+    // Those that take what they spare, the one that may share the node directory's file system
+    // last, since the stores there hold the rows of every other volume's objects.
+    let mut order: Vec<usize> = (0..volumes.len()).collect();
+    order.sort_by_key(|&i| volumes.get(i).map(|(_, f)| f.device.may_be(&measured.meta)));
+    for i in order {
+        let Some(&((dir, bytes), facts)) = volumes.get(i) else {
+            continue;
+        };
+        let VolumeBytes::Spare { keep } = *bytes else {
+            continue;
+        };
+        if facts.formatted.is_some() {
+            continue;
+        }
+        let available = facts
+            .device
+            .available
+            .ok_or_else(|| DeriveError::Unspared(dir.clone()))?;
+        let shares_dir = facts.device.may_be(&measured.meta);
+        let mut held = if shares_dir { log_file } else { 0 };
+        let mut others = 0u64;
+        for (j, (((other, theirs_stated), theirs), size)) in volumes.iter().zip(&sizes).enumerate()
+        {
+            if j == i {
+                continue;
+            }
+            let near = theirs.device.may_be(&facts.device);
+            if near && spares(theirs, theirs_stated) {
+                return Err(DeriveError::Spares {
+                    first: dir.clone(),
+                    second: other.clone(),
+                });
+            }
+            if near && theirs.formatted.is_none() {
+                held = size
+                    .and_then(|size| held.checked_add(size))
+                    .ok_or(overflow("a volume's file system"))?;
+            }
+            if shares_dir {
+                // Every other volume is sized by now, but one that may share the node directory's
+                // file system too: the stores there would hold both's rows.
+                let Some(size) = *size else {
+                    return Err(DeriveError::Spares {
+                        first: dir.clone(),
+                        second: other.clone(),
+                    });
+                };
+                let block = match &theirs.formatted {
+                    Some(formatted) => Some(formatted.geometry.block),
+                    None => volume_layout::block(theirs.device.align),
+                };
+                others = block
+                    .and_then(|block| size.checked_div(block))
+                    .and_then(|fragments| others.checked_add(fragments))
+                    .ok_or(overflow("the volumes' fragments"))?;
+            }
+        }
+        let short = || DeriveError::Spare {
+            dir: dir.clone(),
+            available,
+            keep,
+            held,
+        };
+        let room = available
+            .checked_sub(keep)
+            .and_then(|room| room.checked_sub(held))
+            .ok_or_else(short)?;
+        let size = if shares_dir {
+            let block =
+                volume_layout::block(facts.device.align).ok_or(overflow("a volume's block"))?;
+            let rows = u128::try_from(ranges)
+                .ok()
+                .and_then(|ranges| ranges.checked_mul(u128::from(STORE_BYTES_AN_OBJECT)))
+                .and_then(|rows| rows.checked_mul(u128::from(spread.nodes)))
+                .ok_or(overflow("the stores' rows"))?;
+            let width = u128::from(spread.width);
+            let per_fragment = u128::from(block)
+                .checked_mul(width)
+                .and_then(|bytes| bytes.checked_add(rows))
+                .ok_or(overflow("a fragment's bytes"))?;
+            let fragments = u128::from(room)
+                .checked_mul(width)
+                .ok_or(overflow("a volume's file system"))?
+                .checked_sub(rows.checked_mul(u128::from(others)).ok_or_else(short)?)
+                .ok_or_else(short)?
+                .checked_div(per_fragment)
+                .ok_or(overflow("a volume's fragments"))?;
+            fragments
+                .checked_mul(u128::from(block))
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or(overflow("a volume's bytes"))?
+        } else {
+            room
+        };
+        if let Some(slot) = sizes.get_mut(i) {
+            *slot = Some(size);
+        }
+    }
+    sizes
+        .into_iter()
+        .map(|size| size.ok_or(overflow("a volume's bytes")))
+        .collect()
+}
+
+/// A cell's nodes and the width of the scheme its blocks take ([`Spread::of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Spread {
+    pub nodes: u64,
+    pub width: u64,
+}
+
+impl Spread {
+    /// A cell of `domains` failure domains, a node each, its blocks at the scheme the durability
+    /// model chooses at `domains` (`durability::choose`).
+    pub fn of(domains: usize, rates: &Rates, target: f64) -> Result<Self, DeriveError> {
+        let width = match durability::choose(&durability::candidates(), domains, rates, target)? {
+            Some(Choice::Meets { scheme, .. } | Choice::Short { scheme, .. }) => scheme.width(),
+            None => return Err(DeriveError::Schemes { domains }),
+        };
+        let overflow = || DeriveError::Overflow("the cell's blocks");
+        Ok(Self {
+            nodes: u64::try_from(domains).map_err(|_| overflow())?,
+            width: u64::try_from(width).map_err(|_| overflow())?,
+        })
+    }
 }
 
 /// The asks a node of `gateway` holds at most, each operation it hosts the most of the schemes
@@ -344,6 +496,21 @@ pub enum DeriveError {
     Bounds(String),
     #[error("the node directory's file system does not say its size")]
     Unsized,
+    #[error("the file system of the volume in {0} does not say what a process may write there")]
+    Unspared(PathBuf),
+    #[error(
+        "the file system of the volume in {dir} spares {available} bytes, short of the {keep} its other work keeps and the {held} the node writes there besides"
+    )]
+    Spare {
+        dir: PathBuf,
+        available: u64,
+        keep: u64,
+        held: u64,
+    },
+    #[error(
+        "the volumes in {first} and {second} may share a file system, and each is to take what it spares"
+    )]
+    Spares { first: PathBuf, second: PathBuf },
     #[error("{measured} devices measured for the {stated} volumes stated")]
     Measurements { stated: usize, measured: usize },
     #[error("range {group:x}'s store: {why}")]
@@ -436,6 +603,7 @@ pub fn messages() -> Result<mantle_protocol::classes::Bounds, DeriveError> {
                 rules,
                 boot: ConfState::default(),
                 settings,
+                members: 0,
             },
             engine: (),
         }],
@@ -1070,6 +1238,9 @@ pub struct Device {
     pub queue: Option<u32>,
     /// Bytes its file system holds, where the OS says.
     pub bytes: Option<u64>,
+    /// Bytes the OS states this process may still write on its file system, where it says
+    /// (`statvfs`'s `f_bavail`, `GetDiskFreeSpaceExW`'s bytes available to the caller).
+    pub available: Option<u64>,
 }
 
 impl Device {
@@ -1108,6 +1279,16 @@ pub struct Measured {
     pub volumes: Vec<VolumeFacts>,
 }
 
+/// A volume's bytes as its `volume` line states them (docs/design/membership.md §3.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeBytes {
+    /// `volume = DIR SIZE`: these.
+    Stated(u64),
+    /// `volume = DIR spare KEEP`: what its file system spares ([`volume_sizes`]), less `keep`, the
+    /// bytes its operator or supervisor states the machine's other work keeps there.
+    Spare { keep: u64 },
+}
+
 /// What `mantle serve`'s configuration states (node.md §1.4's first column).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Stated {
@@ -1119,10 +1300,14 @@ pub struct Stated {
     pub certificate: PathBuf,
     pub key: PathBuf,
     pub peers: Vec<PeerLine>,
+    /// The members a granted node dials first (docs/design/membership.md §3 step 2).
+    pub seeds: Vec<crate::process::SeedLine>,
+    /// The host its peers dial it at, where it differs from the address it binds.
+    pub reach: Option<String>,
     pub ranges: Vec<(u128, Layer)>,
     pub voters: Vec<u64>,
     /// Each volume's device directory and bytes.
-    pub volumes: Vec<(PathBuf, u64)>,
+    pub volumes: Vec<(PathBuf, VolumeBytes)>,
     pub enlist: Option<Enlisting>,
     /// The root key's generations, for a node that hosts objects.
     pub keys: Vec<(u32, PathBuf)>,
@@ -1308,9 +1493,26 @@ pub fn derive(
          stores and any volume on its device",
     );
 
-    let identities = u64::try_from(stated.peers.len())
-        .ok()
-        .and_then(|peers| peers.checked_add(1))
+    // The cell's identities: its nodes, as many as it states it holds where it states it, else this
+    // one and the nodes its lines name, and the gateways it pins (docs/design/membership.md §9).
+    let node_lines = stated
+        .peers
+        .iter()
+        .filter(|p| p.role == Role::Node)
+        .count()
+        .checked_add(stated.seeds.len())
+        .and_then(|n| n.checked_add(1))
+        .ok_or(overflow("the cell's nodes"))?;
+    let cell_nodes = stated
+        .enlist
+        .as_ref()
+        .and_then(|e| usize::try_from(e.max_nodes).ok())
+        .unwrap_or(0)
+        .max(node_lines);
+    let gateway_lines = stated.peers.iter().filter(|p| p.role != Role::Node).count();
+    let identities = cell_nodes
+        .checked_add(gateway_lines)
+        .and_then(|n| u64::try_from(n).ok())
         .ok_or(overflow("the cell's identities"))?;
     let (settings, rules) = cell(identities)?;
     say_cell(&mut said, &settings, &rules);
@@ -1364,12 +1566,23 @@ pub fn derive(
             measured: measured.volumes.len(),
         });
     }
+    // The log's file, which the node directory's file system holds beside the ranges' stores and
+    // any volume there, and each volume's bytes, what it spares where stated so.
+    let ranges = stated.ranges.len();
+    let log_config = log(measured.meta.align, &settings, ranges)?;
+    let log_file = log_config
+        .segment_bytes
+        .checked_mul(u64::from(log_config.max_segments))
+        .ok_or(overflow("the log's file"))?;
+    let spread = Spread::of(domains, &rates, target)?;
+    let sizes = volume_sizes(&stated, measured, log_file, ranges, spread)?;
+    say_spared(&mut said, &stated, &sizes);
     let chunk = mantle_gateway::layout::CHUNK;
     let mut volume_bytes = 0u64;
     let mut transfers = 0usize;
     let mut fragments = 0u64;
     let mut wants = Vec::with_capacity(stated.volumes.len());
-    for ((_, size), facts) in stated.volumes.iter().zip(&measured.volumes) {
+    for (size, facts) in sizes.iter().zip(&measured.volumes) {
         let block = match &facts.formatted {
             Some(formatted) => formatted.geometry.block,
             None => volume_layout::block(facts.device.align).ok_or(overflow("a volume's block"))?,
@@ -1403,16 +1616,10 @@ pub fn derive(
         wants.push(want);
     }
 
-    // The log, and each range's engine on its share of what the log and the volumes on the node
-    // directory's device leave of its file system.
-    let ranges = stated.ranges.len();
-    let log_config = log(measured.meta.align, &settings, ranges)?;
-    let log_file = log_config
-        .segment_bytes
-        .checked_mul(u64::from(log_config.max_segments))
-        .ok_or(overflow("the log's file"))?;
+    // Each range's engine on its share of what the log and the volumes on the node directory's
+    // device leave of its file system.
     let mut held = log_file;
-    for ((_, size), facts) in stated.volumes.iter().zip(&measured.volumes) {
+    for (size, facts) in sizes.iter().zip(&measured.volumes) {
         if facts.device.may_be(&measured.meta) {
             held = held
                 .checked_add(*size)
@@ -1450,6 +1657,11 @@ pub fn derive(
                     ..ConfState::default()
                 },
                 settings,
+                members: stated
+                    .enlist
+                    .as_ref()
+                    .and_then(|e| usize::try_from(e.max_nodes).ok())
+                    .unwrap_or(0),
             },
             engine: (),
         })
@@ -1459,10 +1671,10 @@ pub fn derive(
     // its transport (node.md §3.6).
     let clients = if hosts { gateway.clients } else { 0 };
     let mut bounds = mantle_protocol::bounds::Stated {
-        peers: stated
-            .peers
-            .len()
-            .checked_add(clients)
+        peers: cell_nodes
+            .saturating_sub(1)
+            .checked_add(gateway_lines)
+            .and_then(|peers| peers.checked_add(clients))
             .ok_or(overflow("the transport's peers"))?,
         ranges,
         inflight: settings.max_inflight_msgs,
@@ -1544,7 +1756,7 @@ pub fn derive(
 
     // What remains, shared: each index wants a fragment at each of its volume's blocks, and each
     // engine the rows of the objects those fragments make across the cell, so both fill together.
-    let objects = cell_blocks(fragments, domains, &rates, target)?;
+    let objects = cell_blocks(fragments, spread)?;
     say_objects_held(&mut said, fragments, objects);
     let engine_want = engine_wants_for(&made, objects).ok_or(overflow("an engine's metadata"))?;
     let mut all = wants;
@@ -1578,9 +1790,10 @@ pub fn derive(
         .ok_or(overflow("an engine's metadata"))?
         .min(most);
     let mut volumes = Vec::with_capacity(stated.volumes.len());
-    for (n, (((dir, size), facts), &index_bytes)) in stated
+    for (n, ((((dir, _), size), facts), &index_bytes)) in stated
         .volumes
         .iter()
+        .zip(&sizes)
         .zip(&measured.volumes)
         .zip(indexes)
         .enumerate()
@@ -1675,6 +1888,8 @@ pub fn derive(
             certificate: stated.certificate,
             key: stated.key,
             peers: stated.peers,
+            seeds: stated.seeds,
+            reach: stated.reach,
             ranges: stated.ranges,
             voters: stated.voters,
             settings,
@@ -1822,6 +2037,28 @@ fn say_stated(said: &mut Said, stated: &Stated) {
             "a peer, by the certificate the cell's authority issued it (node.md §3.6)",
         );
     }
+    for seed in &stated.seeds {
+        let at = seed
+            .at
+            .as_ref()
+            .map_or_else(String::new, |(quic, plane)| format!(" {quic} {plane}"));
+        said.add(
+            "seed",
+            format!("{}{at}", seed.id),
+            Kind::Stated,
+            "a member a granted node dials first, known by its name under the cell's authority \
+             (docs/design/membership.md §3)",
+        );
+    }
+    if let Some(reach) = &stated.reach {
+        said.add(
+            "reach",
+            reach,
+            Kind::Stated,
+            "the host its peers dial it at on its QUIC and plane ports, which its join states \
+             (docs/design/membership.md §3)",
+        );
+    }
     let voters: Vec<String> = stated.voters.iter().map(u64::to_string).collect();
     said.add(
         "voters",
@@ -1865,7 +2102,7 @@ fn say_stated(said: &mut Said, stated: &Stated) {
             "the cell's bound on its volume table's volumes (architecture §11)",
         );
     }
-    for (n, (dir, size)) in stated.volumes.iter().enumerate() {
+    for (n, (dir, bytes)) in stated.volumes.iter().enumerate() {
         let n = n.saturating_add(1);
         said.add(
             format!("volume.{n}.dir"),
@@ -1873,12 +2110,36 @@ fn say_stated(said: &mut Said, stated: &Stated) {
             Kind::Stated,
             "a device directory that holds data: the volume is mantle/volume in it",
         );
-        said.add(
-            format!("volume.{n}.size"),
-            size,
-            Kind::Stated,
-            "the volume's bytes, laid out at its first start",
-        );
+        match bytes {
+            VolumeBytes::Stated(size) => said.add(
+                format!("volume.{n}.size"),
+                size,
+                Kind::Stated,
+                "the volume's bytes, laid out at its first start",
+            ),
+            VolumeBytes::Spare { keep } => said.add(
+                format!("volume.{n}.keep"),
+                keep,
+                Kind::Stated,
+                "the bytes the machine's other work keeps on the volume's file system",
+            ),
+        }
+    }
+}
+
+/// The bytes of each volume stated to take what its file system spares ([`volume_sizes`]).
+fn say_spared(said: &mut Said, stated: &Stated, sizes: &[u64]) {
+    for (n, ((_, bytes), size)) in stated.volumes.iter().zip(sizes).enumerate() {
+        if matches!(bytes, VolumeBytes::Spare { .. }) {
+            said.add(
+                format!("volume.{}.size", n.saturating_add(1)),
+                size,
+                Kind::Derived,
+                "what the volume's file system spares: the bytes the OS states the process may \
+                 write there, less those its other work keeps and those the node writes there \
+                 besides, its laid-out bytes once laid out (membership.md §3.1)",
+            );
+        }
     }
 }
 
@@ -2542,6 +2803,7 @@ mod tests {
                 ..mantle_range::ConfState::default()
             },
             settings,
+            members: 0,
         };
         let three = range(3);
         let reads = mantle_range::limits(&three).unwrap().pending_reads;
@@ -2933,8 +3195,9 @@ mod tests {
     #[test]
     fn a_cells_blocks_are_its_nodes_chunks_over_its_schemes_width() {
         let (rates, target) = (rates(), target(None));
-        assert_eq!(cell_blocks(1_000, 3, &rates, target).ok(), Some(1_000));
-        assert_eq!(cell_blocks(1_000, 1, &rates, target).ok(), Some(1_000));
+        let blocks = |domains| cell_blocks(1_000, Spread::of(domains, &rates, target)?);
+        assert_eq!(blocks(3).ok(), Some(1_000));
+        assert_eq!(blocks(1).ok(), Some(1_000));
         for domains in [2usize, 5, 9, 20] {
             let width = match durability::choose(&durability::candidates(), domains, &rates, target)
             {
@@ -2943,15 +3206,90 @@ mod tests {
                 }
                 other => panic!("{domains} domains: {other:?}"),
             };
-            let blocks = 1_000 * domains as u64 / width as u64;
             assert_eq!(
-                cell_blocks(1_000, domains, &rates, target).ok(),
-                Some(blocks)
+                blocks(domains).ok(),
+                Some(1_000 * domains as u64 / width as u64)
             );
         }
         assert!(matches!(
-            cell_blocks(1_000, 0, &rates, target),
+            blocks(0),
             Err(DeriveError::Schemes { domains: 0 })
+        ));
+    }
+
+    /// A volume stated to take what its file system spares takes what the OS states the process
+    /// may write there less what its other work keeps and what the node writes there besides: on
+    /// a file system of its own, every byte of that; on the node directory's, the most blocks
+    /// beside which the log's file and the stores' rows of the cell's objects still fit, the
+    /// objects those blocks and every other volume's make. Laid out, it keeps its layout's bytes;
+    /// short of its keep, or beside a second such volume, it is refused.
+    #[test]
+    fn a_volume_of_what_its_file_system_spares_leaves_the_node_and_the_machine_their_room() {
+        let (rates, target) = (rates(), target(None));
+        let spread = Spread::of(3, &rates, target).unwrap();
+        let log_file = 1 << 30;
+        let mut stated = stated(2);
+        let mut measured = facts(2);
+        stated.volumes[0].1 = VolumeBytes::Spare { keep: 3 << 30 };
+        let ranges = stated.ranges.len();
+        let sizes = volume_sizes(&stated, &measured, log_file, ranges, spread).unwrap();
+        assert_eq!(sizes, vec![(1 << 39) - (3 << 30), 8 << 30]);
+
+        // On the node directory's file system: the blocks, and beside them the log and the rows.
+        measured.volumes[0].device.name = measured.meta.name.clone();
+        let sizes = volume_sizes(&stated, &measured, log_file, ranges, spread).unwrap();
+        let block = volume_layout::block(measured.volumes[0].device.align).unwrap();
+        let fragments = sizes[0] / block;
+        assert_eq!(sizes[0] % block, 0);
+        let rows = |fragments: u64| {
+            let objects = cell_blocks(fragments + (8 << 30) / block, spread).unwrap();
+            ranges as u64 * objects * STORE_BYTES_AN_OBJECT
+        };
+        let room = (1u64 << 39) - (3 << 30) - log_file;
+        assert!(sizes[0] + rows(fragments) <= room);
+        // One more block's bytes and rows would not fit, the cell's objects counted whole.
+        let (more, width) = (u128::from(fragments + 1), u128::from(spread.width));
+        let per_object = (ranges as u64 * STORE_BYTES_AN_OBJECT * spread.nodes) as u128;
+        assert!(
+            more * u128::from(block) * width
+                + per_object * (more + u128::from((8u64 << 30) / block))
+                > u128::from(room) * width
+        );
+
+        // Laid out, its layout's bytes, whatever the file system spares now.
+        let geometry = Geometry::plan(
+            4 << 30,
+            measured.volumes[0].device.align,
+            &VolumeConfig::default(),
+        )
+        .unwrap();
+        measured.volumes[0].formatted = Some(Formatted {
+            geometry,
+            checksum_shift: 12,
+        });
+        measured.volumes[0].device.available = Some(0);
+        let sizes = volume_sizes(&stated, &measured, log_file, ranges, spread).unwrap();
+        assert_eq!(sizes[0], geometry.end().unwrap());
+
+        // Short of what it keeps and the node writes there: refused, as is a file system that
+        // says nothing, and two such volumes that may share one.
+        measured.volumes[0].formatted = None;
+        measured.volumes[0].device.available = Some(3 << 30);
+        assert!(matches!(
+            volume_sizes(&stated, &measured, log_file, ranges, spread),
+            Err(DeriveError::Spare { .. })
+        ));
+        measured.volumes[0].device.available = None;
+        assert!(matches!(
+            volume_sizes(&stated, &measured, log_file, ranges, spread),
+            Err(DeriveError::Unspared(_))
+        ));
+        measured.volumes[0].device.available = Some(1 << 39);
+        measured.volumes[1].device.name = None;
+        stated.volumes[1].1 = VolumeBytes::Spare { keep: 0 };
+        assert!(matches!(
+            volume_sizes(&stated, &measured, log_file, ranges, spread),
+            Err(DeriveError::Spares { .. })
         ));
     }
 
@@ -2963,6 +3301,7 @@ mod tests {
             align: Alignment::new(4096).unwrap(),
             queue: Some(32),
             bytes: Some(1 << 40),
+            available: Some(1 << 39),
         };
         Measured {
             memory: machine(16 << 30, None),
@@ -3027,6 +3366,8 @@ mod tests {
                 ),
                 peer(9, Role::Gateway, "/node/identity/9.der", None),
             ],
+            seeds: Vec::new(),
+            reach: None,
             ranges: vec![
                 (0x10, Layer::Root),
                 (0x11, Layer::Bucket),
@@ -3036,7 +3377,7 @@ mod tests {
             ],
             voters: vec![1, 2, 3],
             volumes: (0..volumes)
-                .map(|n| (at(&format!("/data{n}")), 8 << 30))
+                .map(|n| (at(&format!("/data{n}")), VolumeBytes::Stated(8 << 30)))
                 .collect(),
             enlist: (volumes > 0).then(|| Enlisting {
                 root: 0x10,

@@ -51,6 +51,7 @@ use mantle_cert::{
 };
 use mantle_meta::apply::Layer;
 use mantle_meta::root::MAX_DOMAIN;
+use mantle_node::derive::VolumeBytes;
 use mantle_protocol::node_name;
 
 use crate::files;
@@ -64,21 +65,46 @@ const NO_EXPIRY: u64 = 253_402_300_799;
 /// authority's name, the account its clients act for, and each founder's id and QUIC address.
 const CELL: &str = "cell";
 
-/// The cell file's text for the authority named `authority`, `account`, and each founder and id.
+/// The cell file's text for the authority named `authority`, `account`, each founder and id, and
+/// what a grant states of the cell (docs/design/membership.md §7): its founding ranges' groups, its
+/// bounds, its region, its durability target and its access key's id.
 fn cell_file<'a>(
-    authority: &str,
-    account: &str,
+    (authority, endpoint_authority): (&str, &str),
+    (account, access_key): (&str, &str),
     founders: impl Iterator<Item = (&'a Founder, &'a u64)>,
+    (cell, groups): (&Cell, &[u128]),
 ) -> String {
-    let mut text = format!("authority = {authority}\naccount = {account}\n");
+    let mut text = format!(
+        "authority = {authority}\ns3_authority = {endpoint_authority}\naccount = {account}\n"
+    );
     for (founder, id) in founders {
         let quic = founder
             .dialed(founder.quic)
             .unwrap_or_else(|| founder.quic.to_string());
         text.push_str(&format!("node = {id} {quic}\n"));
+        if let Some(plane) = founder.dialed(founder.plane) {
+            text.push_str(&format!("plane = {id} {plane}\n"));
+        }
+    }
+    for (group, layer) in groups.iter().zip(LAYERS) {
+        text.push_str(&format!("range = {group:x} {}\n", layer_name(layer)));
+    }
+    if let (Some(nodes), Some(volumes)) = (cell.max_nodes, cell.max_volumes) {
+        text.push_str(&format!("max_nodes = {nodes}\nmax_volumes = {volumes}\n"));
+    }
+    text.push_str(&format!(
+        "region = {}\naccess_key = {access_key}\n",
+        cell.region()
+    ));
+    if let Some(target) = cell.target {
+        text.push_str(&format!("target = {target}\n"));
     }
     text
 }
+
+/// The file beside the authority's key that holds the last grant it issued, in decimal: each grant
+/// is numbered past it (docs/design/membership.md §2).
+const GRANTS: &str = "grants";
 
 /// The founding ranges' layers, a range of each (node.md §1.5).
 const LAYERS: [Layer; 5] = [
@@ -150,7 +176,7 @@ pub struct Founder {
     pub names: Vec<String>,
     pub domain: Option<String>,
     /// Each volume's device directory and bytes.
-    pub volumes: Vec<(PathBuf, u64)>,
+    pub volumes: Vec<(PathBuf, VolumeBytes)>,
     /// The most memory the node may hold, where stated.
     pub memory: Option<u64>,
     /// The host its peers and native clients dial it at, on its QUIC and plane ports, where it
@@ -224,18 +250,38 @@ pub fn parse_bytes(text: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("{text} is not a usable size"))
 }
 
-/// A volume stated as its directory and its bytes, the directory before `separator`'s last place
-/// in `text`, so a path with that character in it, a Windows drive's colon among them, still reads.
-fn volume(text: &str, separator: char) -> Result<(PathBuf, u64), String> {
-    let (dir, size) = text
+/// A volume stated as its directory and its bytes, `DIR:SIZE`, or as what its file system spares,
+/// `DIR:spare` or `DIR:spare:KEEP` with `KEEP` the bytes the machine's other work keeps there
+/// (docs/design/membership.md §3.1): the directory before `separator`'s last place in `text` that
+/// these leave, so a path with that character in it, a Windows drive's colon among them, still
+/// reads.
+fn volume(text: &str, separator: char) -> Result<(PathBuf, VolumeBytes), String> {
+    let (rest, last) = text
         .trim()
         .rsplit_once(separator)
         .ok_or_else(|| format!("{text:?} is not a volume's directory and bytes"))?;
+    let (dir, bytes) = if last.trim() == "spare" {
+        (rest, VolumeBytes::Spare { keep: 0 })
+    } else {
+        let size = parse_bytes(last)?;
+        match rest.rsplit_once(separator) {
+            Some((dir, word)) if word.trim() == "spare" => (dir, VolumeBytes::Spare { keep: size }),
+            _ => (rest, VolumeBytes::Stated(size)),
+        }
+    };
     let dir = dir.trim();
     if dir.is_empty() {
         return Err(format!("{text:?} names no directory"));
     }
-    Ok((PathBuf::from(dir), parse_bytes(size)?))
+    Ok((PathBuf::from(dir), bytes))
+}
+
+/// A `volume` line's bytes as `mantle serve`'s configuration reads them (`process::read_stated`).
+fn volume_words(bytes: &VolumeBytes) -> String {
+    match bytes {
+        VolumeBytes::Stated(size) => size.to_string(),
+        VolumeBytes::Spare { keep } => format!("spare {keep}"),
+    }
 }
 
 /// One founder's statements, each `key` with its `value`, in the order given.
@@ -322,7 +368,7 @@ fn founder<'a>(
 /// A founder in `--node`'s form: comma-separated `key=value`s, `quic=ADDR`, `plane=ADDR`,
 /// `s3=ADDR` (its S3 endpoint's, TCP; its QUIC address unless stated), `name=HOST` (repeatable: a
 /// DNS name its S3 clients dial), `domain=NAME`, `volume=DIR:SIZE` (repeatable, the size after the
-/// path's last colon), `memory=SIZE` and `reach=HOST` (the host its peers and native clients dial
+/// path's last colon; `DIR:spare` or `DIR:spare:KEEP` for what its file system spares), `memory=SIZE` and `reach=HOST` (the host its peers and native clients dial
 /// on its QUIC and plane ports, where it differs from the address it binds). A directory with a
 /// comma in it is stated in a machines file instead.
 pub fn parse_node(spec: &str) -> Result<Founder, Error> {
@@ -650,10 +696,17 @@ fn config(
         ));
     }
     for (dir, bytes) in &founder.volumes {
-        text.push_str(&format!("volume = {} {bytes}\n", dir.display()));
+        text.push_str(&format!(
+            "volume = {} {}\n",
+            dir.display(),
+            volume_words(bytes)
+        ));
     }
     if let Some(domain) = &founder.domain {
         text.push_str(&format!("domain = {domain}\n"));
+    }
+    if let Some(reach) = &founder.reach {
+        text.push_str(&format!("reach = {reach}\n"));
     }
     if !founder.volumes.is_empty()
         && let (Some(nodes), Some(volumes)) = (cell.max_nodes, cell.max_volumes)
@@ -726,14 +779,16 @@ pub fn init(said: &mut impl Write, out: &Path, cell: &Cell) -> Result<(), Error>
         Ok(u64::from_le_bytes(random::<8>()?))
     })?;
     let groups = distinct(LAYERS.len(), || Ok(u128::from_le_bytes(random::<16>()?)))?;
+    // Each founder under a grant of its own, numbered from 1 in the founders' order: what the cell's
+    // root range spends as the founder joins (docs/design/membership.md §2).
     let mut issued = Vec::with_capacity(ids.len());
-    for &id in &ids {
+    for (&id, grant) in ids.iter().zip(1u64..) {
         let own = KeyPair::generate().map_err(cert)?;
-        let certificate = mantle_cert::node(
+        let certificate = mantle_cert::granted_node(
             &authority_key,
             &authority_name,
             own.public_key(),
-            &node_name(id),
+            (&node_name(id), grant),
             (validity, Serial::draw().map_err(cert)?),
         )
         .map_err(cert)?;
@@ -791,11 +846,16 @@ pub fn init(said: &mut impl Write, out: &Path, cell: &Cell) -> Result<(), Error>
     files::write(
         &authority_dir.join(CELL),
         cell_file(
-            &authority_name,
-            &access.account,
+            (&authority_name, &endpoint_authority_name),
+            (&access.account, &access.id),
             cell.founders.iter().zip(&ids),
+            (cell, &groups),
         )
         .as_bytes(),
+    )?;
+    files::write(
+        &authority_dir.join(GRANTS),
+        ids.len().to_string().as_bytes(),
     )?;
     writeln!(said, "cell {authority_name}")?;
     writeln!(
@@ -911,6 +971,7 @@ pub fn client(said: &mut impl Write, out: &Path, cell: &Path) -> Result<(), Erro
         nodes,
         certificate: authority,
         key: authority_key,
+        ..
     } = Authority::read(cell)?;
     match std::fs::read_dir(out) {
         Ok(mut entries) => {
@@ -978,8 +1039,24 @@ pub(crate) struct Authority {
     pub(crate) name: String,
     /// The account the cell's native clients act for.
     pub(crate) account: String,
-    /// Each founder's id and the QUIC address its clients dial, `HOST:PORT`.
+    /// Each founder's and granted node's id and the QUIC address its clients dial, `HOST:PORT`.
     pub(crate) nodes: Vec<(u64, String)>,
+    /// Each node's plane address, where init or its grant could state it.
+    pub(crate) planes: Vec<(u64, String)>,
+    /// The cell's founding ranges, each its group and layer as a `range` line names them.
+    pub(crate) ranges: Vec<(u128, String)>,
+    /// The cell's bounds on its nodes and volumes, its region, its durability target and its
+    /// access key's id, where its cell file states them (docs/design/membership.md §7).
+    pub(crate) bounds: Option<(u32, u32)>,
+    pub(crate) region: Option<String>,
+    pub(crate) target: Option<f64>,
+    pub(crate) access_key: Option<String>,
+    /// Each gateway `mantle init gateway` pinned, by its id.
+    pub(crate) gateways: Vec<u64>,
+    /// The S3 endpoint's authority's name, which its endpoints' certificates name as their issuer.
+    pub(crate) endpoint_authority: Option<String>,
+    /// The directory the authority's key is in.
+    pub(crate) dir: PathBuf,
     pub(crate) certificate: Vec<u8>,
     pub(crate) key: KeyPair,
 }
@@ -1000,20 +1077,41 @@ impl Authority {
         let mut name = None;
         let mut account = None;
         let mut nodes: Vec<(u64, String)> = Vec::new();
+        let mut planes: Vec<(u64, String)> = Vec::new();
+        let mut ranges: Vec<(u128, String)> = Vec::new();
+        let (mut max_nodes, mut max_volumes) = (None, None);
+        let (mut region, mut target, mut access_key) = (None, None, None);
+        let mut gateways = Vec::new();
+        let mut endpoint_authority = None;
         for line in text.lines().filter(|l| !l.trim().is_empty()) {
             let bad = || Error::Cell(format!("the cell file's line does not read: {line}"));
             let (key, value) = line.split_once('=').ok_or_else(bad)?;
+            let value = value.trim();
+            let at = |value: &str| -> Result<(u64, String), Error> {
+                let (id, place) = value.split_once(' ').ok_or_else(bad)?;
+                let id = id.parse().map_err(|_| bad())?;
+                let place = mantle_node::process::Endpoint::parse(place.trim())
+                    .ok_or_else(bad)?
+                    .to_string();
+                Ok((id, place))
+            };
             match key.trim() {
-                "authority" => name = Some(value.trim().to_owned()),
-                "account" => account = Some(value.trim().to_owned()),
-                "node" => {
-                    let (id, quic) = value.trim().split_once(' ').ok_or_else(bad)?;
-                    let id = id.parse().map_err(|_| bad())?;
-                    let quic = mantle_node::process::Endpoint::parse(quic.trim())
-                        .ok_or_else(bad)?
-                        .to_string();
-                    nodes.push((id, quic));
+                "authority" => name = Some(value.to_owned()),
+                "account" => account = Some(value.to_owned()),
+                "node" => nodes.push(at(value)?),
+                "plane" => planes.push(at(value)?),
+                "range" => {
+                    let (group, layer) = value.split_once(' ').ok_or_else(bad)?;
+                    let group = u128::from_str_radix(group, 16).map_err(|_| bad())?;
+                    ranges.push((group, layer.trim().to_owned()));
                 }
+                "max_nodes" => max_nodes = Some(value.parse().map_err(|_| bad())?),
+                "max_volumes" => max_volumes = Some(value.parse().map_err(|_| bad())?),
+                "region" => region = Some(value.to_owned()),
+                "target" => target = Some(value.parse().map_err(|_| bad())?),
+                "access_key" => access_key = Some(value.to_owned()),
+                "gateway" => gateways.push(value.parse().map_err(|_| bad())?),
+                "s3_authority" => endpoint_authority = Some(value.to_owned()),
                 _ => return Err(bad()),
             }
         }
@@ -1034,6 +1132,15 @@ impl Authority {
             name,
             account,
             nodes,
+            planes,
+            ranges,
+            bounds: max_nodes.zip(max_volumes),
+            region,
+            target,
+            access_key,
+            gateways,
+            endpoint_authority,
+            dir: authority_dir,
             certificate,
             key,
         })
@@ -1101,13 +1208,29 @@ pub fn pin_gateway(said: &mut impl Write, out: &Path, cell: &Path) -> Result<u64
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(Error::Output(e)),
     }
-    let founders = Authority::read(cell)?.nodes;
+    let authority = Authority::read(cell)?;
+    let founders = authority.nodes;
     let (id, certificate, own) = gateway(cell)?;
     let identity = out.join("identity");
     files::create_dir(&identity)?;
     files::write(&identity.join("gateway.der"), &certificate)?;
     files::write_secret(&identity.join("gateway.key"), own.pkcs8())?;
     files::write(&out.join("config"), format!("id = {id}\n").as_bytes())?;
+    // Kept beside the authority and named in its cell file, so every node granted later pins it as
+    // the founders do (docs/design/membership.md §7).
+    files::create_dir(&authority.dir.join("gateways"))?;
+    files::write(
+        &authority
+            .dir
+            .join("gateways")
+            .join(format!("gateway-{id}.der")),
+        &certificate,
+    )?;
+    let cell_text = std::fs::read_to_string(authority.dir.join(CELL))?;
+    files::write(
+        &authority.dir.join(CELL),
+        format!("{cell_text}gateway = {id}\n").as_bytes(),
+    )?;
     let pinned = format!("identity/peers/gateway-{id}.der");
     for (founder, _) in &founders {
         let dir = founder_dir(cell, *founder, founders.len());
@@ -1124,6 +1247,233 @@ pub fn pin_gateway(said: &mut impl Write, out: &Path, cell: &Path) -> Result<u64
         founders.len()
     )?;
     Ok(id)
+}
+
+/// A new node's grant (docs/design/membership.md §2, §7): for the cell `mantle init` made in `cell`,
+/// a node the operator states as a founder is stated (`founder`), its directory made in `out`, an
+/// empty or missing directory, to move to its host whole. Its grant is numbered past the
+/// authority's last, which is kept first, so no two grants share a number whatever ends the grant;
+/// its id drawn from the OS, nonzero and no node's the cell file names; its certificate issued
+/// under the authority naming its grant (`mantle_cert::granted_node`), and its S3 endpoint's under
+/// the endpoint's authority; the cell's root key and access key; and its configuration of stated
+/// keys: the cell's founding ranges, every node the cell file names as its voters, which it is no
+/// member of until the cell adds it, and as its seeds, each gateway the authority pinned, and its
+/// own addresses, domain, volumes and the cell's bounds. The cell file names the new node too, for
+/// grants and clients after it. Nothing is sent to the cell: the node joins at its first `mantle
+/// serve`. Its id and grant.
+pub fn grant(
+    said: &mut impl Write,
+    out: &Path,
+    cell: &Path,
+    founder: &Founder,
+) -> Result<(u64, u64), Error> {
+    match std::fs::read_dir(out) {
+        Ok(mut entries) => {
+            if entries.next().is_some() {
+                return Err(Error::Exists(out.to_path_buf()));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Error::Output(e)),
+    }
+    let authority = Authority::read(cell)?;
+    let (max_nodes, max_volumes) = authority.bounds.ok_or_else(|| {
+        Error::Cell("the cell file states no bounds on the cell's nodes: a cell whose members come and go states them at init".into())
+    })?;
+    if founder.domain.is_none() {
+        return Err(Error::Founder(
+            "--node".into(),
+            "no failure domain: a member names one".into(),
+        ));
+    }
+    let access_id = authority
+        .access_key
+        .clone()
+        .ok_or_else(|| Error::Cell("the cell file names no access key".into()))?;
+    let cert = |e: mantle_cert::CertError| Error::Cert(format!("{e:?}"));
+    // The grant's number, kept before anything is issued under it.
+    let grants_file = authority.dir.join(GRANTS);
+    let last: u64 = std::fs::read_to_string(&grants_file)?
+        .trim()
+        .parse()
+        .map_err(|_| Error::Cell(format!("{}: not a grant's number", grants_file.display())))?;
+    let number = last
+        .checked_add(1)
+        .ok_or_else(|| Error::Cell("the authority's grants are spent".into()))?;
+    files::write(&grants_file, number.to_string().as_bytes())?;
+    let id = loop {
+        let id = u64::from_le_bytes(random::<8>()?);
+        if id != 0 && !authority.nodes.iter().any(|(node, _)| *node == id) {
+            break id;
+        }
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| Error::Cert(e.to_string()))?
+        .as_secs();
+    let own = KeyPair::generate().map_err(cert)?;
+    let certificate = mantle_cert::granted_node(
+        &authority.key,
+        &authority.name,
+        own.public_key(),
+        (&node_name(id), number),
+        (
+            Validity {
+                not_before: now,
+                not_after: NO_EXPIRY,
+            },
+            Serial::draw().map_err(cert)?,
+        ),
+    )
+    .map_err(cert)?;
+    mantle_cert::issued_by(&certificate, &authority.certificate, now).map_err(cert)?;
+    // The S3 endpoint's certificate, under the endpoint's own authority, as init issues a
+    // founder's.
+    let endpoint_key = mantle_node::secret::read(&authority.dir.join("s3-authority.key"))
+        .map_err(|e| Error::Cert(e.to_string()))
+        .and_then(|pkcs8| EndpointKey::from_pkcs8(&pkcs8).map_err(cert))?;
+    let endpoint_name = authority
+        .endpoint_authority
+        .clone()
+        .ok_or_else(|| Error::Cell("the cell file names no S3 endpoint authority".into()))?;
+    let endpoint_own = EndpointKey::generate().map_err(cert)?;
+    let endpoint = mantle_cert::endpoint(
+        &endpoint_key,
+        &endpoint_name,
+        endpoint_own.public_key(),
+        &endpoint_names(founder),
+        (
+            Validity {
+                not_before: now,
+                not_after: now
+                    .checked_add(MAX_ENDPOINT_VALIDITY)
+                    .ok_or_else(|| Error::Cert("an endpoint's validity past 9999".into()))?,
+            },
+            Serial::draw().map_err(cert)?,
+        ),
+    )
+    .map_err(cert)?;
+    // The cell's keys: the root key's first generation and the access key, as every founder holds
+    // them.
+    let root_key = [
+        authority.dir.join("keys").join("1"),
+        cell.join("keys").join("1"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .ok_or_else(|| Error::Cell("no root key beside the authority".into()))?;
+    let root_key = mantle_node::secret::read(&root_key).map_err(|e| Error::Cert(e.to_string()))?;
+    let credentials = std::fs::read_to_string(cell.join("s3").join("credentials"))?;
+    let secret = credentials
+        .lines()
+        .find_map(|line| line.strip_prefix("aws_secret_access_key = "))
+        .ok_or_else(|| Error::Cell("the cell's S3 credentials hold no secret".into()))?;
+    let identity = out.join("identity");
+    files::create_dir(&identity.join("peers"))?;
+    files::create_dir(&out.join("keys").join("s3"))?;
+    files::write(&identity.join("authority.der"), &authority.certificate)?;
+    files::write(&identity.join("node.der"), &certificate)?;
+    files::write_secret(&identity.join("node.key"), own.pkcs8())?;
+    files::write(&identity.join("s3.der"), &endpoint)?;
+    files::write_secret(&identity.join("s3.key"), endpoint_own.pkcs8())?;
+    files::write_secret(&out.join("keys").join("1"), &root_key)?;
+    files::write_secret(
+        &out.join("keys").join("s3").join(&access_id),
+        format!("account = {}\nsecret = {secret}\n", authority.account).as_bytes(),
+    )?;
+    let mut text = format!(
+        "# The operator's statements for node {id}, made by `mantle grant` under grant {number}: \
+         every other value `mantle serve` measures or derives (docs/design/node.md §1.4). It joins \
+         the cell at its first start (docs/design/membership.md §3). Paths are from this file's \
+         directory.\nid = {id}\ndir = .\nquic = {}\nplane = {}\n\
+         authority = identity/authority.der\ncertificate = identity/node.der\nkey = identity/node.key\n",
+        founder.quic, founder.plane
+    );
+    text.push_str(&format!(
+        "s3 = {}\ns3.region = {}\ns3.certificate = identity/s3.der\ns3.key = identity/s3.key\n\
+         access_key = {access_id} keys/s3/{access_id}\n",
+        founder.s3(),
+        authority.region.as_deref().unwrap_or(DEFAULT_REGION)
+    ));
+    for name in &founder.names {
+        text.push_str(&format!("s3.name = {name}\n"));
+    }
+    // Its voters are the nodes the cell file names, a configuration it is no member of: it takes
+    // the cell's own from whichever node leads, once the cell adds it.
+    let voters: Vec<String> = authority.nodes.iter().map(|(n, _)| n.to_string()).collect();
+    text.push_str(&format!("voters = {}\n", voters.join(",")));
+    for (group, layer) in &authority.ranges {
+        text.push_str(&format!("range = {group:x} {layer}\n"));
+    }
+    text.push_str("root_key = 1 keys/1\n");
+    for (node, quic) in &authority.nodes {
+        let plane = authority
+            .planes
+            .iter()
+            .find(|(p, _)| p == node)
+            .map(|(_, plane)| plane.as_str());
+        let dialed =
+            |at: &str| mantle_node::process::Endpoint::parse(at).is_some_and(|e| e.port != 0);
+        match plane {
+            Some(plane) if dialed(quic) && dialed(plane) => {
+                text.push_str(&format!("seed = {node} {quic} {plane}\n"));
+            }
+            _ => text.push_str(&format!("seed = {node}\n")),
+        }
+    }
+    for gateway in &authority.gateways {
+        let pinned = format!("identity/peers/gateway-{gateway}.der");
+        let der = std::fs::read(
+            authority
+                .dir
+                .join("gateways")
+                .join(format!("gateway-{gateway}.der")),
+        )?;
+        files::write(&out.join(&pinned), &der)?;
+        text.push_str(&format!("peer = {gateway} gateway {pinned}\n"));
+    }
+    for (dir, bytes) in &founder.volumes {
+        text.push_str(&format!(
+            "volume = {} {}\n",
+            dir.display(),
+            volume_words(bytes)
+        ));
+    }
+    if let Some(domain) = &founder.domain {
+        text.push_str(&format!("domain = {domain}\n"));
+    }
+    if let Some(reach) = &founder.reach {
+        text.push_str(&format!("reach = {reach}\n"));
+    }
+    text.push_str(&format!(
+        "root.max_nodes = {max_nodes}\nroot.max_volumes = {max_volumes}\n"
+    ));
+    if let Some(memory) = founder.memory {
+        text.push_str(&format!("memory = {memory}\n"));
+    }
+    if let Some(target) = authority.target {
+        text.push_str(&format!("durability.target = {target}\n"));
+    }
+    files::write(&out.join("config"), text.as_bytes())?;
+    // The cell file names it, for the grants and the clients after it.
+    let mut cell_text = std::fs::read_to_string(authority.dir.join(CELL))?;
+    let quic = founder
+        .dialed(founder.quic)
+        .unwrap_or_else(|| founder.quic.to_string());
+    cell_text.push_str(&format!("node = {id} {quic}\n"));
+    if let Some(plane) = founder.dialed(founder.plane) {
+        cell_text.push_str(&format!("plane = {id} {plane}\n"));
+    }
+    files::write(&authority.dir.join(CELL), cell_text.as_bytes())?;
+    writeln!(
+        said,
+        "granted {id} {number} {}: quic {} plane {} s3 {}",
+        out.display(),
+        founder.quic,
+        founder.plane,
+        founder.s3()
+    )?;
+    Ok((id, number))
 }
 
 /// A cell of one's host and devices measured now: the machine's calibration record in its
@@ -1188,7 +1538,8 @@ mod tests {
     #[test]
     fn a_node_flag_states_a_founder() {
         let founder = parse_node(
-            "quic=10.0.0.1:7000, plane=10.0.0.1:7001,domain=rack-a,volume=/data:4T,volume=C:\\d2:1G,memory=16G",
+            "quic=10.0.0.1:7000, plane=10.0.0.1:7001,domain=rack-a,volume=/data:4T,volume=C:\\d2:1G,\
+             volume=/spare:spare,volume=C:\\d3:spare:2G,memory=16G",
         )
         .unwrap();
         assert_eq!(
@@ -1200,8 +1551,13 @@ mod tests {
                 names: Vec::new(),
                 domain: Some("rack-a".into()),
                 volumes: vec![
-                    (PathBuf::from("/data"), 4 << 40),
-                    (PathBuf::from("C:\\d2"), 1 << 30)
+                    (PathBuf::from("/data"), VolumeBytes::Stated(4 << 40)),
+                    (PathBuf::from("C:\\d2"), VolumeBytes::Stated(1 << 30)),
+                    (PathBuf::from("/spare"), VolumeBytes::Spare { keep: 0 }),
+                    (
+                        PathBuf::from("C:\\d3"),
+                        VolumeBytes::Spare { keep: 2 << 30 }
+                    ),
                 ],
                 memory: Some(16 << 30),
                 reach: None,
@@ -1352,7 +1708,7 @@ mod tests {
         assert_eq!(cell.founders[0].domain.as_deref(), Some("a"));
         assert_eq!(
             cell.founders[0].volumes,
-            vec![(PathBuf::from("/my data/disk"), 1 << 30)]
+            vec![(PathBuf::from("/my data/disk"), VolumeBytes::Stated(1 << 30))]
         );
         assert_eq!(cell.founders[1].quic, address("127.0.0.1:3"));
         for (text, line) in [
@@ -1486,7 +1842,7 @@ mod tests {
         let stored = Cell {
             founders: vec![Founder {
                 domain: Some("a".into()),
-                volumes: vec![(root.path().join("d"), 1 << 30)],
+                volumes: vec![(root.path().join("d"), VolumeBytes::Stated(1 << 30))],
                 ..cell.founders[0].clone()
             }],
             ..Cell::default()

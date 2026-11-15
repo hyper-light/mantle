@@ -144,6 +144,7 @@ fn range(members: u64) -> Range {
             ..ConfState::default()
         },
         settings: SETTINGS,
+        members: 0,
     }
 }
 

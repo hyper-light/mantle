@@ -3127,6 +3127,13 @@ impl<F: BlockFile> Store<F> {
         self.cache.as_ref().is_some_and(|c| c.contains(address))
     }
 
+    /// DIAGNOSTIC (never merged): the cache chunk holding `address`, and the live pages it holds.
+    pub fn diag_chunk_of(&self, address: u64) -> Option<(usize, usize)> {
+        let c = self.cache.as_ref()?;
+        let chunk = c.diag_chunk_of(address)?;
+        Some((chunk, c.diag_chunk_live(chunk)))
+    }
+
     pub(crate) fn cache_page(&self, slot: usize, address: u64) -> Option<&[u8]> {
         self.cache.as_ref()?.page_at(slot, address)
     }

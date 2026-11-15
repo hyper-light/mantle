@@ -474,6 +474,22 @@ impl Cache {
     }
 
     /// Whether the page can be read from memory, without counting or promoting the look.
+    /// DIAGNOSTIC (never merged): the chunk whose slot holds `address`, if one does.
+    pub fn diag_chunk_of(&self, address: u64) -> Option<usize> {
+        let i = self.slot_of(address)?;
+        self.slots.get(i).filter(|s| s.live).map(|s| s.chunk)
+    }
+
+    /// DIAGNOSTIC (never merged): the live pages chunk `c`'s slots hold.
+    pub fn diag_chunk_live(&self, c: usize) -> usize {
+        let (Some(&first), Some(&n)) = (self.starts.get(c), self.sizes.get(c)) else {
+            return 0;
+        };
+        self.slots
+            .get(first..first.saturating_add(n))
+            .map_or(0, |s| s.iter().filter(|s| s.live && s.chunk == c).count())
+    }
+
     pub fn contains(&self, address: u64) -> bool {
         self.slot_of(address)
             .and_then(|i| self.payload(i))

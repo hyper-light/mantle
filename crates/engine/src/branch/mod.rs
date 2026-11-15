@@ -1983,6 +1983,39 @@ impl Branch {
         (pages, hits)
     }
 
+    /// DIAGNOSTIC (never merged): for each of this branch's leaf pages in `[from, end)` the cache
+    /// holds, its chunk and that chunk's live pages, appended to `out`.
+    pub fn diag_chunks<F: BlockFile>(
+        &self,
+        store: &Store<F>,
+        from: &[u8],
+        end: Option<&[u8]>,
+        out: &mut Vec<(usize, usize)>,
+    ) {
+        let total = self.counts.len();
+        let first = self
+            .leaf_in(from)
+            .ok()
+            .flatten()
+            .and_then(|p| usize::try_from(p).ok())
+            .unwrap_or(0);
+        let last = end
+            .and_then(|e| usize::try_from(self.leaf_most(e)).ok())
+            .unwrap_or(total.saturating_sub(1))
+            .min(total.saturating_sub(1));
+        for p in first..=last {
+            if self.counts.get(p).is_none_or(|&c| c == 0) {
+                continue;
+            }
+            let Ok(address) = self.page_address(store, u64::try_from(p).unwrap_or(u64::MAX)) else {
+                continue;
+            };
+            if let Some(found) = store.diag_chunk_of(address) {
+                out.push(found);
+            }
+        }
+    }
+
     /// The pages a merge of `[from, end)` writes from this branch, at most ([`Self::merge_size`]).
     pub fn pages_between(&self, from: &[u8], end: Option<&[u8]>) -> usize {
         self.merge_size(from, end).0

@@ -1521,6 +1521,22 @@ impl Trunk {
                 for (sum, add) in self.stats.diag_age.iter_mut().zip(age_in) {
                     *sum = sum.saturating_add(add);
                 }
+                let mut found = Vec::new();
+                for b in &task.inputs {
+                    b.diag_chunks(store, &task.from, task.end.as_deref(), &mut found);
+                }
+                found.sort_unstable();
+                found.dedup_by_key(|f| f.0);
+                self.stats.diag_chunks = self
+                    .stats
+                    .diag_chunks
+                    .saturating_add(u64::try_from(found.len()).unwrap_or(u64::MAX));
+                self.stats.diag_chunk_live = self.stats.diag_chunk_live.saturating_add(
+                    found
+                        .iter()
+                        .map(|f| u64::try_from(f.1).unwrap_or(u64::MAX))
+                        .fold(0u64, u64::saturating_add),
+                );
                 let given = store.grant(needed)?;
                 let State::Ready(task) = std::mem::replace(state, State::Dropped) else {
                     continue;

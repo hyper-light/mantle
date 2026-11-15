@@ -572,6 +572,11 @@ pub struct TrunkStats {
     pub diag_pages: u64,
     pub diag_cached: u64,
     pub diag_age: [u64; 12],
+    /// DIAGNOSTIC (never merged): the distinct cache chunks the jobs' cached inputs lay in, summed
+    /// over jobs, and the live pages those chunks held: what lending the chunks to a job would
+    /// take from the cache beside its inputs.
+    pub diag_chunks: u64,
+    pub diag_chunk_live: u64,
     /// The trunk's shape when these were taken ([`Trunk::levels`]), a depth an element from the
     /// root, depths past the last summed into it.
     pub shape: [LevelShape; SHAPE_DEPTHS],

@@ -479,6 +479,7 @@ impl Connection {
             principal,
             body: taken,
             reply: answers,
+            diag_t: crate::diag_trace::now(),
         };
         // A door at its bound refuses before any of the body is read (node.md §4.5).
         if self.door.submit(request).is_err() {

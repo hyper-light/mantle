@@ -99,6 +99,9 @@ pub(crate) struct Parked {
     window: usize,
     deadline_ns: Option<u64>,
     until_ns: u64,
+    /// DIAGNOSTIC (diag-nfc2): the trace's id, and when it was parked.
+    diag: u64,
+    diag_t: u64,
 }
 
 /// What the host waits on for an operation: a command, a read, or a chunk it asked.
@@ -132,6 +135,17 @@ pub(crate) struct Job {
     /// The blocks a put of it holds going down at once, as the node learned them when it was
     /// admitted (`crate::window`) and charged for them.
     window: usize,
+    /// DIAGNOSTIC (diag-nfc2): the trace's id.
+    diag: u64,
+}
+
+/// DIAGNOSTIC (diag-nfc2): what a pending ask is, for the trace.
+fn diag_pending(pending: &Pending) -> (u64, u64) {
+    match pending {
+        Pending::Command(ask) => (1, *ask),
+        Pending::Read(ask) => (2, *ask),
+        Pending::Chunk(ask) => (3, *ask),
+    }
 }
 
 impl Job {
@@ -701,6 +715,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         // Asked even behind parked requests: one the limit turns away tells it its clients ask
         // more than it admits.
         let room = parks && self.admits(charge);
+        let diag = crate::diag_trace::id();
         if parks && (!room || !self.parked.is_empty()) && self.parked.len() < self.parked_most {
             let patience = u64::try_from(bounds::STOCK_PATIENCE.as_nanos()).unwrap_or(u64::MAX);
             self.parked.push_back(Parked {
@@ -711,8 +726,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 window,
                 deadline_ns,
                 until_ns: deadline_ns.unwrap_or_else(|| now.saturating_add(patience)),
+                diag,
+                diag_t: crate::diag_trace::now(),
             });
+            crate::diag_trace::ev(
+                crate::diag_trace::PARK,
+                diag,
+                self.parked.len() as u64,
+                u64::from(room) | (u64::try_from(self.parked_most).unwrap_or(0) << 1),
+            );
             return;
+        }
+        if parks && !room {
+            crate::diag_trace::ev(crate::diag_trace::PARK, diag, u64::MAX, self.parked.len() as u64);
         }
         self.start_object(
             exchange,
@@ -720,6 +746,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             head,
             (deadline_ns, now, charge, window),
             room,
+            diag,
         );
     }
 
@@ -744,6 +771,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 return;
             }
             self.parked.pop_front();
+            crate::diag_trace::ev(
+                crate::diag_trace::UNPARK,
+                first.diag,
+                crate::diag_trace::now().saturating_sub(first.diag_t),
+                u64::from(over) | ((self.parked.len() as u64) << 1),
+            );
             let head = first.head.ok_or(ObjectError::Fields(0));
             self.start_object(
                 first.exchange,
@@ -751,6 +784,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 head,
                 (first.deadline_ns, now, first.charge, first.window),
                 !over,
+                first.diag,
             );
         }
     }
@@ -782,6 +816,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         head: Result<Head, ObjectError>,
         (deadline_ns, now, charge, window): (Option<u64>, u64, u64, usize),
         room: bool,
+        diag: u64,
     ) {
         // A client's operations act for the account its certificate names; one whose
         // connections have all gone since asking is no longer known, and nothing is taken.
@@ -809,6 +844,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         {
             admission.admitted(charge);
         }
+        crate::diag_trace::ev(
+            crate::diag_trace::START,
+            diag,
+            1,
+            u64::from(admitted_ns.is_some())
+                | (self.admission.as_ref().map_or(0, |a| a.diag_running()) << 8)
+                | ((self.admitting().unwrap_or(0) as u64) << 32),
+        );
         self.jobs.push(Job {
             door: Door::Exchange(exchange),
             principal,
@@ -819,6 +862,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             admitted_ns,
             charge,
             window,
+            diag,
         });
     }
 
@@ -830,7 +874,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             principal,
             body,
             reply,
+            diag_t,
         } = request;
+        crate::diag_trace::ev(
+            crate::diag_trace::DOOR_TAKEN,
+            crate::diag_trace::now().saturating_sub(diag_t),
+            self.jobs.len() as u64,
+            0,
+        );
         let now = hyper_rt::futures::now_ns();
         let mut admitted_ns = None;
         let (charge, window) = sized(self.gateway.as_ref(), &self.put_window, op.written());
@@ -852,6 +903,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         {
             admission.admitted(charge);
         }
+        let diag = crate::diag_trace::id();
+        crate::diag_trace::ev(
+            crate::diag_trace::START,
+            diag,
+            2,
+            u64::from(admitted_ns.is_some())
+                | (self.admission.as_ref().map_or(0, |a| a.diag_running()) << 8)
+                | ((self.admitting().unwrap_or(0) as u64) << 32),
+        );
         self.jobs.push(Job {
             door: Door::Local(Box::new(Local {
                 body,
@@ -869,6 +929,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             admitted_ns,
             charge,
             window,
+            diag,
         });
     }
 
@@ -1011,6 +1072,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 // What it still waits on is let go: an ended get's chunks still out, say.
                 let job = self.jobs.swap_remove(at);
                 self.ended(job.admitted_ns, job.charge);
+                crate::diag_trace::ev(
+                    crate::diag_trace::END,
+                    job.diag,
+                    job.admitted_ns
+                        .map_or(0, |a| hyper_rt::futures::now_ns().saturating_sub(a)),
+                    self.admission.as_ref().map_or(0, |a| a.diag_running())
+                        | ((self.admitting().unwrap_or(0) as u64) << 32),
+                );
                 self.abandoned
                     .extend(job.pending.into_iter().map(|(pending, _)| pending));
             } else {
@@ -1059,7 +1128,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 continue;
             }
             match job.bounded(now) {
-                Bounded::SlowDown => self.fail_job(at, Status::SlowDown)?,
+                Bounded::SlowDown => {
+                    crate::diag_trace::ev(crate::diag_trace::BOUND_SLOW, job.diag, 0, 0);
+                    self.fail_job(at, Status::SlowDown)?
+                }
                 Bounded::Held => {
                     if let Door::Exchange(exchange) = job.door {
                         self.driver.endpoint().working(exchange);
@@ -1099,6 +1171,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Ok(());
         }
         let mut answered: Vec<(Option<u64>, Outcome)> = Vec::new();
+        let diag = job.diag;
         job.pending.retain(|(pending, request)| {
             let outcome = match pending {
                 Pending::Command(ask) => {
@@ -1109,6 +1182,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             };
             match outcome {
                 Some(outcome) => {
+                    let (kind, ask) = diag_pending(pending);
+                    crate::diag_trace::ev(crate::diag_trace::ANSWER, diag, kind, ask);
                     answered.push((*request, outcome));
                     false
                 }
@@ -1463,6 +1538,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         match asked {
             Ok(pending) => {
                 if let Some(job) = self.jobs.get_mut(at) {
+                    let (kind, ask) = diag_pending(&pending);
+                    crate::diag_trace::ev(crate::diag_trace::ASK, job.diag, kind, ask);
                     job.pending.push((pending, request));
                 }
                 Ok(false)
@@ -2066,6 +2143,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         match asked {
             Ok(pending) => {
                 if let Some(job) = self.jobs.get_mut(at) {
+                    let (kind, ask) = diag_pending(&pending);
+                    crate::diag_trace::ev(crate::diag_trace::ASK, job.diag, kind, ask);
                     job.pending.push((pending, Some(id)));
                 }
                 Ok(None)
@@ -2096,6 +2175,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         match asked {
             Ok(ask) => {
                 if let Some(job) = self.jobs.get_mut(at) {
+                    crate::diag_trace::ev(
+                        crate::diag_trace::ASK,
+                        job.diag,
+                        match layer {
+                            Layer::Block => 11,
+                            Layer::File => 12,
+                            Layer::Name => 13,
+                            _ => 10,
+                        },
+                        ask,
+                    );
                     job.pending.push((Pending::Command(ask), Some(id)));
                 }
             }
@@ -2425,6 +2515,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         match asked {
             Ok(pending) => {
                 if let Some(job) = self.jobs.get_mut(at) {
+                    let (kind, ask) = diag_pending(&pending);
+                    crate::diag_trace::ev(crate::diag_trace::ASK, job.diag, kind, ask);
                     job.pending.push((pending, Some(id)));
                 }
                 Ok(None)
@@ -2799,6 +2891,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         match asked {
             Ok(pending) => {
                 if let Some(job) = self.jobs.get_mut(at) {
+                    let (kind, ask) = diag_pending(&pending);
+                    crate::diag_trace::ev(crate::diag_trace::ASK, job.diag, kind, ask);
                     job.pending.push((pending, Some(id)));
                 }
                 Ok(None)
@@ -3146,6 +3240,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if let (Some(at), Some(admission)) = (j.admitted_ns, admission.as_mut()) {
                 admission.completed(now.saturating_sub(at), now, j.charge);
             }
+            crate::diag_trace::ev(
+                crate::diag_trace::LOST,
+                j.diag,
+                j.admitted_ns.map_or(0, |a| now.saturating_sub(a)),
+                0,
+            );
             false
         });
     }
@@ -3167,9 +3267,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Ok(()) => true,
             Err(crate::admit::Held::Limit) => {
                 admission.turned_away();
+                diag_refuse(1, admission.diag_running(), admission.limit());
                 false
             }
-            Err(crate::admit::Held::Bytes) => false,
+            Err(crate::admit::Held::Bytes) => {
+                diag_refuse(2, admission.diag_running(), admission.limit());
+                false
+            }
         }
     }
 
@@ -3907,5 +4011,24 @@ mod tests {
                 "{algorithm:?} full {full}"
             );
         }
+    }
+}
+
+/// DIAGNOSTIC (diag-nfc2): a refusal by the admission, recorded where it differs from the last
+/// recorded or a millisecond passed since.
+fn diag_refuse(reason: u64, running: u64, limit: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static LAST_T: AtomicU64 = AtomicU64::new(0);
+    if !crate::diag_trace::on() {
+        return;
+    }
+    let key = reason | (running << 2) | ((limit as u64) << 34);
+    let now = crate::diag_trace::now();
+    if LAST.swap(key, Ordering::Relaxed) != key
+        || now.saturating_sub(LAST_T.load(Ordering::Relaxed)) > 1_000_000
+    {
+        LAST_T.store(now, Ordering::Relaxed);
+        crate::diag_trace::ev(crate::diag_trace::REFUSE, reason, running, limit as u64);
     }
 }

@@ -1354,9 +1354,32 @@ async fn client(mut logical: Logical, work: Rc<Work>, shared: Rc<RefCell<Shared>
                 tally.threads = tally.threads.max(threads);
             });
         }
+        mantle_node::diag_trace::ev(
+            mantle_node::diag_trace::OP_START,
+            j,
+            match work.door {
+                Door::Native => 1,
+                Door::Http => 2,
+            },
+            0,
+        );
         let came = work.run(&mut logical, j).await;
         let took = now_ns().saturating_sub(intended);
         let ended = now_ns();
+        mantle_node::diag_trace::ev(
+            mantle_node::diag_trace::OP_END,
+            j,
+            took,
+            match &came {
+                Ok(Came::Done) => 0,
+                Ok(Came::Slowed) => 1,
+                Ok(Came::Lost(_)) => 2,
+                Ok(Came::Refused(_)) => 3,
+                Ok(Came::Unanswered(_)) => 4,
+                Ok(_) => 5,
+                Err(_) => 6,
+            },
+        );
         let stop = harness(|| {
             let mut shared = shared.borrow_mut();
             let shared = &mut *shared;
@@ -1583,6 +1606,12 @@ impl Work {
                 std::time::Duration::from_nanos(cap),
                 j,
                 *again,
+            );
+            mantle_node::diag_trace::ev(
+                mantle_node::diag_trace::PAUSE,
+                j,
+                u64::try_from(pause.as_nanos()).unwrap_or(u64::MAX),
+                u64::from(*again),
             );
             sleep(u64::try_from(pause.as_nanos()).unwrap_or(u64::MAX))
                 .await
@@ -2721,6 +2750,16 @@ impl<'o> Bench<'o> {
             u64::try_from(drive::cpu().saturating_sub(cpu).as_nanos()).unwrap_or(u64::MAX);
         let elapsed_ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let perf = perf.map(Perf::end).transpose()?;
+        mantle_node::diag_trace::note(format!(
+            "phase {} door {:?} kind {} clients {clients} ops {from}..{end} elapsed_ns {elapsed_ns}",
+            self.phases,
+            match work.door {
+                Door::Native => "native",
+                Door::Http => "http",
+            },
+            work.kind.name()
+        ));
+        mantle_node::diag_trace::dump("phase");
         let (held, tally, rates) = ran.map_err(|e| failed(format!("{e:?}")))??;
         let judged = round.map(|_| harness(|| rounds::judge(&rates)));
         let after = self.servers()?;
@@ -3445,6 +3484,10 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
             "no (a count-allocs build counts allocations)"
         }
     )?;
+    // DIAGNOSTIC (diag-nfc2): the client's own waits traced.
+    let _ = mantle_client::DIAG_HOOK.set(|kind, a, b| {
+        mantle_node::diag_trace::ev(90 + kind, a, b, 0);
+    });
     let client_dir = options.dir.join("client");
     let (cell, listeners, signer) = match &options.endpoint {
         Some(endpoint) => {

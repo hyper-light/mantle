@@ -145,6 +145,34 @@ impl Admission {
         self.limit
     }
 
+    /// DIAGNOSTIC (diag-nfc2): the state, for the trace.
+    pub(crate) fn diag_state(&self) -> String {
+        format!(
+            "admission limit {} base {} ceiling {} running {} held {} budget {} admitted {} completed {} phase {} descent {:?} settle {:?} counted {}",
+            self.limit,
+            self.base,
+            self.ceiling,
+            self.running(),
+            self.held,
+            self.budget,
+            self.admitted,
+            self.completed,
+            self.phase,
+            self.descent.map(|d| match d {
+                Descent::Waiting => "waiting".to_owned(),
+                Descent::Binding => "binding".to_owned(),
+                Descent::Halved { from, .. } => format!("halved-from-{from}"),
+            }),
+            self.settle,
+            self.counted,
+        )
+    }
+
+    /// DIAGNOSTIC (diag-nfc2): the operations running.
+    pub(crate) fn diag_running(&self) -> u64 {
+        self.running()
+    }
+
     /// The operations admitted and not yet ended.
     fn running(&self) -> u64 {
         self.admitted.saturating_sub(self.completed)
@@ -200,9 +228,34 @@ impl Admission {
         self.latency_ns = 0;
         self.began_ns = now_ns;
         self.turned_away = false;
+        // DIAGNOSTIC (diag-nfc2): the phase measured, and the limit it moved.
+        let was = (self.limit, self.base);
+        let descent_code = match self.descent {
+            None => 0u64,
+            Some(Descent::Waiting) => 1,
+            Some(Descent::Binding) => 2,
+            Some(Descent::Halved { .. }) => 3,
+        };
+        crate::diag_trace::ev(
+            crate::diag_trace::PHASE,
+            u64::try_from(measured.length_ns).unwrap_or(u64::MAX),
+            u64::try_from(measured.latency_ns).unwrap_or(u64::MAX),
+            u64::from(measured.turned_away)
+                | (descent_code << 1)
+                | ((self.phase as u64 & 0xff) << 8)
+                | ((self.limit as u64 & 0xffff_ffff) << 16),
+        );
         match self.descent {
             Some(descent) => self.halve(descent, measured),
             None => self.cycled(measured),
+        }
+        if (self.limit, self.base) != was {
+            crate::diag_trace::ev(
+                crate::diag_trace::LIMIT,
+                was.0 as u64,
+                self.limit as u64,
+                self.base as u64,
+            );
         }
         self.settle = None;
     }

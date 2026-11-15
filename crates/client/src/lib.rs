@@ -76,6 +76,9 @@ pub const PIECE: usize = hyper_transport::RECEIVE_CHUNK;
 /// standard retry mode's default of three attempts (docs/research/73).
 pub const ATTEMPTS: u32 = 3;
 
+/// DIAGNOSTIC (diag-nfc2): the harness's trace hook.
+pub static DIAG_HOOK: std::sync::OnceLock<fn(u64, u64, u64)> = std::sync::OnceLock::new();
+
 /// A client's retry quota, botocore's standard retry mode's (`botocore/retries/quota.py` and
 /// `standard.py`, develop, read 2026-10-31: `INITIAL_CAPACITY = 500`, a throttling error's retry
 /// costing `_THROTTLING_RETRY_COST = 5`, a request answered without one giving back
@@ -1038,6 +1041,13 @@ impl Client {
         Ok(Ran::Committed(crc))
     }
 
+    /// DIAGNOSTIC (diag-nfc2): a hook the harness sets to trace the client's own waits.
+    pub fn diag_hook(kind: u64, a: u64, b: u64) {
+        if let Some(hook) = DIAG_HOOK.get() {
+            hook(kind, a, b);
+        }
+    }
+
     /// One more run that did not commit, for `why`: the pause before it is sent again, or, the
     /// attempts spent, `why`.
     async fn again(
@@ -1057,6 +1067,7 @@ impl Client {
         let pause = bounds::pause(backoff, self.id, self.waits);
         self.waits = self.waits.wrapping_add(1);
         let wait = u64::try_from(pause.as_nanos()).unwrap_or(u64::MAX);
+        Self::diag_hook(1, wait, u64::from(failures));
         self.wait_until(
             hyper_rt::futures::now_ns().saturating_add(wait),
             deadline_ns,
@@ -1089,6 +1100,7 @@ impl Client {
         let pause = bounds::full_jitter(cap, self.id, self.waits);
         self.waits = self.waits.wrapping_add(1);
         let wait = u64::try_from(pause.as_nanos()).unwrap_or(u64::MAX);
+        Self::diag_hook(2, wait, u64::from(nth));
         self.wait_until(
             hyper_rt::futures::now_ns().saturating_add(wait),
             deadline_ns,

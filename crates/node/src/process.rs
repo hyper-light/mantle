@@ -2011,6 +2011,9 @@ async fn serve(
                         );
                         say(&mut output, &line).await?;
                     } else if line.trim_ascii() == b"counts" {
+                        // DIAGNOSTIC (diag-nfc2): the trace's window, with the node's state.
+                        crate::diag_trace::note(node.diag_state());
+                        crate::diag_trace::dump("counts");
                         let line = COUNTS
                             .get()
                             .map_or_else(|| "counts uncounted\n".to_owned(), |counts| counts());

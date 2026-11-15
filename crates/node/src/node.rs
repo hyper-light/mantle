@@ -1610,7 +1610,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if !own {
             return Err(NodeError::Task);
         }
+        let w0 = crate::diag_trace::now();
         self.wait().await?;
+        // DIAGNOSTIC (diag-nfc2): each part of a long turn.
+        let mut parts = [0u64; 12];
+        let mut t = crate::diag_trace::now();
+        let t0 = t;
+        let mut mark = |i: usize| {
+            let n = crate::diag_trace::now();
+            if let Some(p) = parts.get_mut(i) {
+                *p = n.saturating_sub(t);
+            }
+            t = n;
+        };
         self.liveness_written()?;
         let now = hyper_rt::futures::now_ns();
         self.take_inbox();
@@ -1619,6 +1631,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             self.liveness.poll(now, &mut self.asked);
         }
         self.act_on_liveness()?;
+        mark(0);
         while let Some(event) = self.driver.endpoint().poll_event() {
             self.events.push(event);
         }
@@ -1629,24 +1642,59 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             self.on_event(event, now)?;
         }
         self.events = events;
+        mark(1);
         self.take_stored().await?;
+        mark(2);
         self.vouch_held(now);
         self.dial(now);
         if std::mem::take(&mut self.liveness_moved) {
             self.measure();
         }
         self.schedule_due(now);
+        mark(3);
         self.drive(now)?;
+        mark(4);
         self.take_door();
         self.take_parked();
+        mark(5);
         self.step_host()?;
+        mark(6);
         self.step_asks(now)?;
+        mark(7);
         self.step_reads(now)?;
+        mark(8);
         self.step_replacements();
         self.step_stop()?;
         self.send_plane();
+        mark(9);
         self.driver.flush()?;
+        mark(10);
+        let total = crate::diag_trace::now().saturating_sub(t0);
+        if total > 2_000_000 {
+            crate::diag_trace::ev(crate::diag_trace::TURN, total, t0.saturating_sub(w0), 0);
+            for (i, p) in parts.iter().enumerate() {
+                if *p > 500_000 {
+                    crate::diag_trace::ev(crate::diag_trace::TURN_PART, i as u64, *p, 0);
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// DIAGNOSTIC (diag-nfc2): the node's admission and queues, for the trace.
+    pub fn diag_state(&self) -> String {
+        format!(
+            "{} parked {} jobs {} chunks_out {} asking {} reads_out {} pooled {}",
+            self.admission
+                .as_ref()
+                .map_or_else(|| "admission none".to_owned(), |a| a.diag_state()),
+            self.parked.len(),
+            self.jobs.len(),
+            self.chunks_out.len(),
+            self.asking.len(),
+            self.reads_out.len(),
+            self.pooled,
+        )
     }
 
     /// Opens the S3 listener's door (`crate::door`): `capacity` operations waiting at once, past

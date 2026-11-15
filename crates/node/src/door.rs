@@ -26,6 +26,8 @@ pub struct Request {
     pub body: ChannelReceiver<Piece>,
     /// The reply, as the host writes it.
     pub reply: Sender<Answer>,
+    /// DIAGNOSTIC (diag-nfc2): when it was submitted, CLOCK_MONOTONIC.
+    pub diag_t: u64,
 }
 
 /// A piece of a request's body.

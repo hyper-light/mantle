@@ -34,6 +34,8 @@ pub const ASK: u64 = 27;
 pub const ANSWER: u64 = 28;
 pub const DOOR_TAKEN: u64 = 29;
 pub const FAILED: u64 = 30;
+pub const ENTRY_OUT: u64 = 31;
+pub const ENTRY_ANSWERED: u64 = 32;
 // The node's loop.
 pub const TURN: u64 = 40;
 pub const TURN_PART: u64 = 41;

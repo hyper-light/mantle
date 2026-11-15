@@ -2011,8 +2011,29 @@ async fn serve(
                         );
                         say(&mut output, &line).await?;
                     } else if line.trim_ascii() == b"counts" {
-                        // DIAGNOSTIC (diag-nfc2): the trace's window, with the node's state.
+                        // DIAGNOSTIC (diag-nfc2): the trace's window, with the node's state and
+                        // its log's counts.
                         crate::diag_trace::note(node.diag_state());
+                        if let Ok(s) = node.log_stats(None) {
+                            crate::diag_trace::note(format!(
+                                "log frames {} updates {} flushes {} durable_writes {} fallbacks {} flushed_confirmations {} bytes {} flush_p50_ns {} flush_p99_ns {} flush_count {} flush_sum_ns {} write_p50_ns {} commit_wait_p50_ns {} commit_wait_p99_ns {} commit_wait_count {}",
+                                s.frames,
+                                s.updates,
+                                s.flushes,
+                                s.durable_writes,
+                                s.durable_fallbacks,
+                                s.flushed_confirmations,
+                                s.bytes,
+                                s.flush.quantile(500_000).unwrap_or(0),
+                                s.flush.quantile(990_000).unwrap_or(0),
+                                s.flush.count(),
+                                s.flush.sum_ns(),
+                                s.write.quantile(500_000).unwrap_or(0),
+                                s.commit_wait.quantile(500_000).unwrap_or(0),
+                                s.commit_wait.quantile(990_000).unwrap_or(0),
+                                s.commit_wait.count(),
+                            ));
+                        }
                         crate::diag_trace::dump("counts");
                         let line = COUNTS
                             .get()

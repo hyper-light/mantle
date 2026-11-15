@@ -6,6 +6,7 @@ import sys, os, re, glob, collections, statistics
 LIMIT, PHASE = 10, 11
 PARK, UNPARK, START, END, REFUSE, LOST, BOUND_SLOW, ASK, ANSWER, DOOR_TAKEN = 20, 21, 22, 23, 24, 25, 26, 27, 28, 29
 TURN, TURN_PART = 40, 41
+ENTRY_OUT, ENTRY_ANSWERED = 31, 32
 OP_START, OP_END, PAUSE = 80, 81, 82
 CL_AGAIN, CL_SLOWED = 91, 92
 
@@ -121,6 +122,36 @@ def main(d, only=None):
                         thr = n / (L / 1e9) if L else 0
                         mean = lat_sum / n / 1e6
                         print(f"       +{rel:7.2f}s PHASE len {L/1e6:.0f}ms X {thr:.1f}/s R {mean:.1f}ms power {thr/mean if mean else 0:.2f} turned_away {ta} descent {desc} phase {phase} limit {limit}")
+        # each node's entries per range: commands an entry, those left waiting, and its time out
+        for i, pid in enumerate(nodes):
+            outs = {}
+            per = collections.defaultdict(lambda: {'n': 0, 'cmds': [], 'left': [], 'lat': []})
+            for ev in procs[pid]['events']:
+                if not (s <= ev[0] <= e):
+                    continue
+                if ev[1] == ENTRY_OUT:
+                    outs[ev[2]] = ev[0]
+                    r = per[ev[2]]; r['n'] += 1; r['cmds'].append(ev[3]); r['left'].append(ev[4])
+                elif ev[1] == ENTRY_ANSWERED and ev[2] in outs:
+                    per[ev[2]]['lat'].append((ev[0] - outs.pop(ev[2])) / 1e6)
+            for g, r in sorted(per.items()):
+                if r['n'] < 5:
+                    continue
+                print(f"  node{i} range {g:08x}: entries {r['n']} commands/entry mean {sum(r['cmds'])/len(r['cmds']):.1f} max {max(r['cmds'])}; waiting at send p50 {q(r['left'],.5)} max {max(r['left'])}; out p50 {q(r['lat'],.5):.2f}ms p90 {q(r['lat'],.9):.2f}")
+        # each node's log over the phase, from the counts' notes around it
+        for i, pid in enumerate(nodes):
+            logs = [(t, txt) for t, txt in procs[pid]['notes'] if txt.startswith('log frames')]
+            b = [x for x in logs if x[0] <= s + 1]
+            a = [x for x in logs if x[0] >= e]
+            if a and b:
+                def kv(txt):
+                    f = txt.split()
+                    return {f[j]: int(f[j+1]) for j in range(0, len(f) - 1, 2) if f[j+1].isdigit()}
+                k0, k1 = kv(b[-1][1]), kv(a[0][1])
+                d = {k: k1.get(k, 0) - k0.get(k, 0) for k in k1}
+                fr = max(1, d.get('frames', 0))
+                fl = d.get('flush_count', 0)
+                print(f"  node{i} log: frames {d.get('frames',0)} updates {d.get('updates',0)} ({d.get('updates',0)/fr:.1f}/frame) flushes {d.get('flushes',0)} durable_writes {d.get('durable_writes',0)} flushed_confirmations {d.get('flushed_confirmations',0)} mean flush {d.get('flush_sum_ns',0)/max(1,fl)/1e6:.2f}ms; since open p50 flush {k1.get('flush_p50_ns',0)/1e6:.2f}ms commit_wait p50 {k1.get('commit_wait_p50_ns',0)/1e6:.2f}ms")
         # each job's stages: from its start, each ask to its answer and the gaps between
         stages = collections.defaultdict(list)
         for i, pid in enumerate(nodes):

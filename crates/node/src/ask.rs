@@ -292,6 +292,13 @@ impl Asking {
                 .map(|(wanted, sessioned)| (wanted.ask, sessioned.serial, wanted.deadline_ns))
                 .collect();
             self.next_serial = next;
+            // DIAGNOSTIC (diag-nfc2): an entry out, its range and commands.
+            crate::diag_trace::ev(
+                crate::diag_trace::ENTRY_OUT,
+                (self.group & 0xffff_ffff) as u64,
+                commands.len() as u64,
+                self.waiting.len() as u64,
+            );
             self.out = Some(Out {
                 carried: Carried::Commands(carried),
                 entry: Entry { at_ns: 0, commands },
@@ -317,6 +324,12 @@ impl Asking {
         let Some(out) = self.out.take() else {
             return;
         };
+        crate::diag_trace::ev(
+            crate::diag_trace::ENTRY_ANSWERED,
+            (self.group & 0xffff_ffff) as u64,
+            answers.len() as u64,
+            self.waiting.len() as u64,
+        );
         self.leader_found();
         match out.carried {
             Carried::Registration { .. } => match answers.as_slice() {

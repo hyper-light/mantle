@@ -1532,6 +1532,32 @@ pub fn derive(
         ),
     ];
     let allowed = allowance(stated.ceiling, &measured.memory)?;
+    // DIAG (ci-health, never committed): the floor class by class, and what the threads count from.
+    {
+        let total: u64 = classes.iter().map(|&(_, b)| b).sum();
+        eprintln!(
+            "DIAG floor total={total} allowance={allowed} limit={:?} memtotal={} started_threads={started}",
+            measured.memory.limit, measured.memory.total
+        );
+        for &(class, bytes) in &classes {
+            eprintln!("DIAG floor.{class} = {bytes}");
+        }
+        for (n, facts) in measured.volumes.iter().enumerate() {
+            eprintln!(
+                "DIAG volume {n}: device={:?} align={} queue={:?} profile.depth={} read_bytes={} read_gap={} prewrite={} measured_now={} issuer_depth={}",
+                facts.device.name,
+                facts.device.align.get(),
+                facts.device.queue,
+                facts.profile.depth,
+                facts.profile.read_bytes,
+                facts.profile.read_gap,
+                facts.profile.prewrite,
+                facts.measured_now,
+                issuer_depth(facts)
+            );
+        }
+        eprintln!("DIAG depths={depths:?}");
+    }
     let remaining = floor(&classes, allowed)?;
     say_floor(
         &mut said,

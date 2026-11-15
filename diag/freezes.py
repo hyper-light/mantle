@@ -14,7 +14,7 @@ with open(out, 'a', buffering=1) as f:
     while time.monotonic() < until:
         now = time.monotonic_ns()
         seen = set()
-        for path in glob.glob(root + '/**/cgroup.freeze', recursive=True):
+        for path in glob.glob(root + '/app.slice/**/cgroup.freeze', recursive=True):
             seen.add(path)
             try:
                 v = open(path).read().strip()

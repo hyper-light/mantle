@@ -2458,6 +2458,78 @@ fn a_reply_ended_before_its_trailer_left_still_reaches_the_peer_whole() {
     );
 }
 
+/// The owner replied to a second request with a head alone while an unread reply held every byte
+/// of the connection's credit, so the head could not go, and ended the exchange at once, as a node
+/// answers a chunk it stored: the peer still gets the reply once credit comes back, never a reset.
+/// An end that reset the stream refused the asker a reply its owner gave whole: under 1,024 clients
+/// a mantle cell's storage nodes so refused 10,055 chunk puts `Closed` that they had stored,
+/// every one an end while its reply's head waited (mantle measurements/2026-11-14-the-ladder-paced.md).
+#[test]
+fn a_head_alone_ended_before_credit_took_it_still_reaches_the_peer() {
+    let (_, _, _, room) = reply_unread(REQUEST_BOUND / 2);
+    let (mut net, first, _, written) = reply_unread(room);
+    assert_eq!(
+        written, room,
+        "the first reply took every byte of the credit"
+    );
+    let progress = hyper_transport::Progress::new(PERIOD).unwrap();
+    let second = net
+        .a
+        .open(net.now, 2, Kind::Get, &[8, 1, 2, 3], None, progress)
+        .unwrap();
+    let mut served = None;
+    net.until(TURNS, |net| {
+        while let Some(event) = net.b.poll_event() {
+            if let Event::Request { exchange, .. } = event {
+                served = Some(exchange);
+            }
+        }
+        served.is_some()
+    });
+    let served = served.expect("the second request arrived");
+    assert_eq!(
+        net.b.credit(1, Class::Request),
+        Some(0),
+        "no credit is left for the second reply's head"
+    );
+    net.b.reply(served, b"stored", None).unwrap();
+    net.b.end(served);
+    let mut replied = false;
+    let mut read = 0u64;
+    net.until(TURNS, |net| {
+        while let Some(event) = net.a.poll_event() {
+            assert!(
+                !matches!(event, Event::Refused { exchange, .. } if exchange == second),
+                "the second reply was refused: {event:?}"
+            );
+            if matches!(event, Event::Reply { exchange, .. } if exchange == second) {
+                replied = true;
+            }
+        }
+        // Reading the first reply gives the credit back.
+        loop {
+            let mut into = net.a.reserve(Class::Request, PIECE as u64).unwrap();
+            let got = net.a.read_body(first, &mut into).unwrap_or(0);
+            net.a.release(into);
+            read += got as u64;
+            if got == 0 {
+                break;
+            }
+        }
+        replied
+    });
+    assert!(replied, "the second reply arrived");
+    assert_eq!(net.a.head(second), Some(&b"stored"[..]), "its head whole");
+    net.a.end(second);
+    net.a.end(first);
+    net.exchange();
+    assert!(read > 0, "the first reply was read");
+    assert!(
+        net.b.credit(1, Class::Request).is_some(),
+        "node 2 is still connected"
+    );
+}
+
 /// A server owner whose replies' bodies come from a source that gives it a piece every `step`:
 /// it writes what it has as credit takes it, to the exchanges in the order their requests came,
 /// so its bodies arrive at the source's rate, not the path's. A reply whose seed is in `withheld`

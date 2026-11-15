@@ -87,8 +87,20 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `c97fb1a` (hyper-raft branch `doors-step8`: `doors-wire-bytes`'s `33733b5` and
-one commit), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. Its commit changes
+**Every crate at `31aa800` (hyper-raft branch `transport-end-whole-reply`: `doors-step8-2`'s
+`294678c` and one commit), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. Its
+commit changes hyper-transport alone: an owner's end waits for the head of a reply it gave whole,
+a head alone or with no body left to write, until the connection's credit takes it, as it waited
+for a trailer; before it the end reset the reply, and the asker heard its exchange refused `Closed`
+by the peer. Under 1,024 clients a cell's storage nodes so refused 10,055 chunk puts they had
+stored, each put that lost its chunk answered `SlowDown` (measurements/2026-11-14-the-ladder-paced.md;
+its test `a_head_alone_ended_before_credit_took_it_still_reaches_the_peer`). Main takes it once
+every consumer's suite passes. `294678c` was `doors-step8`'s `c97fb1a` and one commit, which
+changes hyper-tls's certificate decoding (its VENDORED.md §11): Brotli certificates decoded by
+brotli-decompressor 6.1.1 behind an unwind boundary.
+
+Before it, every crate was at `c97fb1a` (hyper-raft branch `doors-step8`: `doors-wire-bytes`'s
+`33733b5` and one commit), with no local delta, taken by `scripts/snapshot-hyper-raft.py`. Its commit changes
 hyper-transport alone: no endpoint offers to take QUIC DATAGRAM frames (`Limits::transport` sets
 `datagram_receive_buffer_size` to `None`, so no connection sends `max_datagram_frame_size`, RFC
 9221 §3), where hyper-quic's default offered every peer 1,250,000 bytes of them; hyper-raft

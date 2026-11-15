@@ -130,6 +130,8 @@ struct Connection {
     endpoint: &'static Endpoint,
     door: Submitter,
     admitted: Admitted,
+    /// The client's address, which a principal's policy may name (`aws:SourceIp`).
+    peer: Option<std::net::IpAddr>,
 }
 
 /// Serves `io`'s requests until the connection ends, then gives its descriptor back and its slot,
@@ -140,6 +142,7 @@ pub(super) async fn serve(
     door: Submitter,
     (slot, admitted): (ConnectionSlot, Admitted),
 ) {
+    let peer = io.peer();
     let mut connection = Connection {
         io,
         input: Input {
@@ -152,6 +155,7 @@ pub(super) async fn serve(
         endpoint,
         door,
         admitted,
+        peer,
     };
     let ended = connection.requests().await;
     connection.end(ended).await;
@@ -321,7 +325,7 @@ impl Connection {
                     .await;
             }
         };
-        let asked = match request::ask(&parts, self.endpoint, now(), framing) {
+        let asked = match self.authenticated(&parts, framing).await {
             Ok(asked) => asked,
             Err(refused) => {
                 return self
@@ -354,8 +358,8 @@ impl Connection {
         let resource = Resource::Route(&route);
         let persists = head.persists();
         let continues = head.continues();
-        let (op, body) = match plan {
-            Plan::Host { op, body } => (op, body),
+        let (op, body, denied) = match plan {
+            Plan::Host { op, body } => (op, body, Vec::new()),
             Plan::Document {
                 limit,
                 upload,
@@ -374,7 +378,7 @@ impl Connection {
                     Err(Stopped::Host | Stopped::Broken) => return Err(()),
                 };
                 match request::made(make, &document, trailer, &self.endpoint.region) {
-                    Ok(op) => (op, None),
+                    Ok((op, denied)) => (op, None, denied),
                     Err(refused) => {
                         return self
                             .refuse(&refused, resource, &ids, (version, is_head), false)
@@ -386,7 +390,7 @@ impl Connection {
         };
         let exchanged = self
             .exchange(
-                (op, principal.clone()),
+                (op, principal.clone(), denied),
                 body,
                 (framing, continues),
                 (&echo, &ids, resource),
@@ -394,6 +398,61 @@ impl Connection {
             )
             .await?;
         Ok(persists && exchanged)
+    }
+
+    /// What `parts` asks, routed, its signature checked against the key it claims, and judged:
+    /// the account's root's key from the node's configuration, or a principal's from the cell's
+    /// root range, looked up through the door as the request arrives (docs/design/principals.md).
+    async fn authenticated(
+        &self,
+        parts: &Parts<'_>,
+        framing: Framing,
+    ) -> Result<request::Asked, Refused> {
+        let route = request::routed(parts, self.endpoint)?;
+        let claimed = request::claimed(parts)?;
+        let source = request::Source {
+            secure: self.endpoint.certified.is_some(),
+            address: self.peer,
+        };
+        if let Some(root) = self.endpoint.key(&claimed) {
+            let key = request::Key::Root(root);
+            return request::ask(parts, (self.endpoint, route, &key, source), now(), framing);
+        }
+        let unknown = || Refused::new("InvalidAccessKeyId", 403, "the access key is not known");
+        // A key in another form than the cell draws is no principal's, and is asked of no range.
+        if !mantle_s3::account::valid_key_id(&claimed) {
+            return Err(unknown());
+        }
+        // The account a principal acts for is the one the cell's keys act for; a node with no key
+        // of the account's has none to name.
+        let account = self.endpoint.account().ok_or_else(unknown)?;
+        let signer = match self.look_up(claimed).await {
+            door::Signed::Principal(signer) => signer,
+            door::Signed::Unknown => return Err(unknown()),
+            door::Signed::Refused(status) => return Err(respond::refusal(status)),
+        };
+        let key = request::Key::Principal {
+            signer: &signer,
+            account,
+        };
+        request::ask(parts, (self.endpoint, route, &key, source), now(), framing)
+    }
+
+    /// Key `id` as the node reads it from the root range: asked through the door, the answer on
+    /// a channel of its own, which holds the one answer. A door at its bound, or a node gone, is
+    /// `SlowDown`, a cause that passes.
+    async fn look_up(&self, id: String) -> door::Signed {
+        let slow = door::Signed::Refused(Status::SlowDown);
+        let Ok((reply, mut answer)) = channel::<door::Signed>(1) else {
+            return slow;
+        };
+        if self.door.look_up(door::KeyAsk { id, reply }).is_err() {
+            return slow;
+        }
+        match answer.recv().await {
+            Ok(signed) => signed,
+            Err(_) => slow,
+        }
     }
 
     /// Answers `refused`; whether the connection persists: not past a body left unread.
@@ -458,7 +517,7 @@ impl Connection {
     /// driver wants it, a get's bytes as the host gives them. Whether the connection may persist.
     async fn exchange(
         &mut self,
-        (op, principal): (Op, String),
+        (op, principal, denied): (Op, String, Vec<usize>),
         body: Option<Streamed>,
         (framing, continues): (Framing, bool),
         (echo, ids, resource): (&Echo<'_>, &Ids<'_>, Resource<'_>),
@@ -477,6 +536,7 @@ impl Connection {
         let request = door::Request {
             op,
             principal,
+            denied,
             body: taken,
             reply: answers,
         };

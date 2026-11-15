@@ -115,6 +115,8 @@ pub enum Command {
     Parts { at: Location, upload: String },
     /// ListMultipartUploads.
     Uploads(String),
+    /// An operator's request on the account's principals and their keys (`crate::principals`).
+    Principals(crate::principals::Command),
 }
 
 /// A copy's places, and what it carries: standard input's length where stated, the version of a
@@ -392,7 +394,7 @@ fn unspecified(nodes: &[(u64, std::net::SocketAddr)]) -> std::net::SocketAddr {
 
 /// No deadline: every wait is bounded by the transport, an exchange by its progress period and a
 /// dial by its handshake's idle timeout, and every ask by the client's attempts.
-const NO_DEADLINE: u64 = u64::MAX;
+pub(crate) const NO_DEADLINE: u64 = u64::MAX;
 
 /// What a node answered, done or the status it answered as the error.
 fn done(what: &str, reply: Reply) -> Result<Reply, Error> {
@@ -403,13 +405,13 @@ fn done(what: &str, reply: Reply) -> Result<Reply, Error> {
     }
 }
 
-fn line(out: &mut impl Write, text: std::fmt::Arguments<'_>) -> Result<(), Error> {
+pub(crate) fn line(out: &mut impl Write, text: std::fmt::Arguments<'_>) -> Result<(), Error> {
     out.write_fmt(text).map_err(Error::Output)?;
     out.write_all(b"\n").map_err(Error::Output)
 }
 
 /// Whole seconds as ISO 8601, as S3's listings date.
-fn date(seconds: u64) -> String {
+pub(crate) fn date(seconds: u64) -> String {
     i64::try_from(seconds)
         .ok()
         .and_then(|s| s.checked_mul(1000))
@@ -555,6 +557,7 @@ async fn command_on(
         }
         Command::Parts { at, upload } => list_parts(client, &at, &upload, out).await,
         Command::Uploads(bucket) => list_uploads(client, &bucket, out).await,
+        Command::Principals(command) => crate::principals::run(client, command, out).await,
     }
 }
 

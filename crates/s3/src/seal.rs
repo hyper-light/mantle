@@ -106,6 +106,49 @@ impl std::fmt::Debug for DataKey {
     }
 }
 
+/// An access key's secret wrapped with AES key wrap: its 40 characters, five semiblocks, and one
+/// semiblock more (SP 800-38F §6.2).
+pub const WRAPPED_SECRET: usize = crate::account::SECRET_CHARS + 8;
+
+/// An access key's secret, its 40 characters (`account::draw_secret`), wrapped under `with`, the
+/// cell's root key, as the root range keeps it (docs/design/principals.md): KW, the wrap a file's
+/// data key takes under the same key (encryption.md §2), since a secret is a key, the HMAC key
+/// SigV4 derives from; KW is "approved for protecting keys" (SP 800-38F §5.4).
+pub fn wrap_secret(secret: &str, with: &WrappingKey) -> Result<[u8; WRAPPED_SECRET], SealError> {
+    if secret.len() != crate::account::SECRET_CHARS {
+        return Err(SealError::Size);
+    }
+    let mut out = [0u8; WRAPPED_SECRET];
+    let written = guarded(|| {
+        let kek = AesKek::new(&AES_256, with.bytes())?;
+        kek.wrap(secret.as_bytes(), &mut out).map(|w| w.len())
+    })?;
+    if written != WRAPPED_SECRET {
+        return Err(SealError::Crypto(CryptoError));
+    }
+    Ok(out)
+}
+
+/// The secret `wrapped` holds, if `with` wrapped it: any other key, or a changed byte, fails KW's
+/// integrity check (SP 800-38F App. A.3), as does a wrapped value whose secret is not base64's
+/// text.
+pub fn unwrap_secret(
+    wrapped: &[u8; WRAPPED_SECRET],
+    with: &WrappingKey,
+) -> Result<crate::account::Secret, SealError> {
+    let mut secret = Zeroizing::new([0u8; crate::account::SECRET_CHARS]);
+    let unwrapped = guarded(|| {
+        let kek = AesKek::new(&AES_256, with.bytes())?;
+        kek.unwrap(wrapped, secret.as_mut_slice()).map(|w| w.len())
+    })
+    .map_err(|_| SealError::Unwrap)?;
+    if unwrapped != crate::account::SECRET_CHARS {
+        return Err(SealError::Unwrap);
+    }
+    let text = std::str::from_utf8(secret.as_slice()).map_err(|_| SealError::Unwrap)?;
+    Ok(Zeroizing::new(text.to_owned()))
+}
+
 impl std::fmt::Debug for WrappingKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("WrappingKey")
@@ -267,6 +310,40 @@ mod tests {
     /// A byte of a test file's contents at `i`.
     fn byte(i: usize) -> u8 {
         u8::try_from(i % 251).unwrap()
+    }
+
+    /// A secret wrapped under the root key opens under it alone and to its own text; a changed
+    /// byte, another key, or a secret of another length is refused (SP 800-38F App. A.3).
+    #[test]
+    fn a_secret_wraps_under_the_root_key_and_opens_under_it_alone() {
+        let root = WrappingKey::generate().unwrap();
+        let secret = crate::account::draw_secret().unwrap();
+        let wrapped = wrap_secret(&secret, &root).unwrap();
+        assert_eq!(wrapped.len(), WRAPPED_SECRET);
+        assert!(
+            !wrapped
+                .windows(8)
+                .any(|w| secret.as_bytes().windows(8).any(|s| s == w))
+        );
+        assert_eq!(*unwrap_secret(&wrapped, &root).unwrap(), *secret);
+        let other = WrappingKey::generate().unwrap();
+        assert_eq!(
+            unwrap_secret(&wrapped, &other).unwrap_err(),
+            SealError::Unwrap
+        );
+        for at in 0..WRAPPED_SECRET {
+            let mut changed = wrapped;
+            changed[at] ^= 1;
+            assert_eq!(
+                unwrap_secret(&changed, &root).unwrap_err(),
+                SealError::Unwrap,
+                "{at}"
+            );
+        }
+        assert_eq!(wrap_secret("short", &root).unwrap_err(), SealError::Size);
+        // Two wraps of one secret under one key are one value: KW is deterministic, and each
+        // secret is drawn anew, so no two keys of the cell share one (encryption.md §2).
+        assert_eq!(wrap_secret(&secret, &root).unwrap(), wrapped);
     }
 
     /// RFC 3394 §4.6: 256 bits of key data wrapped with a 256-bit KEK.

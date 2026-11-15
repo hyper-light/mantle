@@ -2,8 +2,9 @@
 """Writes crates/s3/src/policy/catalog.rs from the Service Authorization Reference's S3
 document, crates/s3/tests/data/sar-s3.json (docs/research/17 §5): the actions a bucket
 policy can name, with the kind of resource each acts on and the S3 condition keys it
-carries, and S3's condition keys with their types. tests/sar_catalog.rs checks the file
-against the document."""
+carries; the actions on no resource at all, which only a principal's identity policy names
+(docs/research/91 §3); and S3's condition keys with their types. tests/sar_catalog.rs checks
+the file against the document."""
 
 import json
 import pathlib
@@ -27,14 +28,19 @@ TARGET = ROOT / "crates/s3/src/policy/catalog.rs"
 def main():
     document = json.loads(SOURCE.read_text(encoding="utf-8"))
     actions = []
+    accounts = []
     for action in document["Actions"]:
+        keys = sorted(k for k in action.get("ActionConditionKeys", []) if k.startswith("s3:"))
+        if not action.get("Resources"):
+            accounts.append((action["Name"], "account", keys))
+            continue
         kinds = {r["Name"] for r in action.get("Resources", [])} & {"bucket", "object"}
         if not kinds:
             continue
         (kind,) = kinds
-        keys = sorted(k for k in action.get("ActionConditionKeys", []) if k.startswith("s3:"))
         actions.append((action["Name"], kind, keys))
     actions.sort(key=lambda a: a[0].lower())
+    accounts.sort(key=lambda a: a[0].lower())
     keys = sorted(
         (k["Name"], k["Types"][0]) for k in document["ConditionKeys"] if k["Name"].startswith("s3:")
     )
@@ -50,13 +56,23 @@ def main():
         "/// the order of their names without regard to case.",
         f"pub const ACTIONS: [Action; {len(actions)}] = [",
     ]
-    for name, kind, action_keys in actions:
-        listed = ", ".join(f'"{k}"' for k in action_keys)
-        out.append(f"    Action {{")
-        out.append(f'        name: "{name}",')
-        out.append(f"        kind: Kind::{kind.capitalize()},")
-        out.append(f"        keys: &[{listed}],")
-        out.append(f"    }},")
+    def entries(listed_actions):
+        for name, kind, action_keys in listed_actions:
+            listed = ", ".join(f'"{k}"' for k in action_keys)
+            out.append(f"    Action {{")
+            out.append(f'        name: "{name}",')
+            out.append(f"        kind: Kind::{kind.capitalize()},")
+            out.append(f"        keys: &[{listed}],")
+            out.append(f"    }},")
+
+    entries(actions)
+    out.append("];")
+    out.append("")
+    out.append("/// The actions on no resource at all, whose statements name the resource `*`: an identity")
+    out.append("/// policy's to grant, never a bucket policy's, in the order of their names without regard to")
+    out.append("/// case.")
+    out.append(f"pub const ACCOUNT_ACTIONS: [Action; {len(accounts)}] = [")
+    entries(accounts)
     out.append("];")
     out.append("")
     out.append("/// S3's condition keys and their types; a name ending `/<key>` or `/${TagKey}` names a")

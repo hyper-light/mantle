@@ -10,7 +10,7 @@ use crate::record::{
     self, BlockHeader, Checksum, ChunkPlace, DefaultRetention, Extent, GateState, Part,
     RecordError, Referrer, Upload, Verdict, Version, Versioning,
 };
-use crate::{block, bucket, file, name, root};
+use crate::{block, bucket, file, name, principal, root};
 
 const FORMAT: u8 = 6;
 
@@ -202,13 +202,17 @@ impl Answer {
                 }
                 Answer::Root(o) => {
                     w.u8(9);
-                    w.u8(match o {
-                        root::Outcome::Enlisted => 0,
-                        root::Outcome::Conflict => 1,
-                        root::Outcome::Full => 2,
-                        root::Outcome::Kept => 3,
-                        root::Outcome::Unknown => 4,
-                    });
+                    match o {
+                        root::Outcome::Enlisted => w.u8(0),
+                        root::Outcome::Conflict => w.u8(1),
+                        root::Outcome::Full => w.u8(2),
+                        root::Outcome::Kept => w.u8(3),
+                        root::Outcome::Unknown => w.u8(4),
+                        root::Outcome::Principal(o) => {
+                            w.u8(5);
+                            put_principal_outcome(w, o)?;
+                        }
+                    }
                 }
             }
             Ok(())
@@ -261,6 +265,7 @@ impl Answer {
                     2 => root::Outcome::Full,
                     3 => root::Outcome::Kept,
                     4 => root::Outcome::Unknown,
+                    5 => root::Outcome::Principal(take_principal_outcome(&mut r)?),
                     _ => return None,
                 }),
                 _ => return None,
@@ -418,8 +423,130 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
             w.u64(l.exposure_ns);
             w.u64(l.crashes);
         }
+        Command::Root(root::Command::Principal(c)) => {
+            w.u8(5);
+            put_principal(w, c)?;
+        }
     }
     Ok(())
+}
+
+/// A command on the principals, after the root range's tag: its own tag, 2 to 6, then its
+/// fields; a time the entry's.
+fn put_principal(w: &mut Writer, c: &principal::Command) -> Result<(), RecordError> {
+    match c {
+        principal::Command::Create(made) => {
+            w.u8(2);
+            record::put_str(w, &made.name)?;
+            record::put_str(w, &made.id)?;
+            record::put_str(w, &made.policy)?;
+        }
+        principal::Command::Policy { name, policy } => {
+            w.u8(3);
+            record::put_str(w, name)?;
+            record::put_str(w, policy)?;
+        }
+        principal::Command::Delete { name } => {
+            w.u8(4);
+            record::put_str(w, name)?;
+        }
+        principal::Command::Key(made) => {
+            w.u8(5);
+            record::put_str(w, &made.principal)?;
+            record::put_str(w, &made.id)?;
+            w.u32(made.generation);
+            w.bytes(&made.wrapped);
+            w.u8(u8::from(made.rotating));
+        }
+        principal::Command::Revoke { id } => {
+            w.u8(6);
+            record::put_str(w, id)?;
+        }
+    }
+    Ok(())
+}
+
+/// A command on the principals by its tag, `put_principal`'s.
+fn take_principal(tag: u8, r: &mut Reader<'_>, at_ns: u64) -> Option<principal::Command> {
+    Some(match tag {
+        2 => principal::Command::Create(principal::NewPrincipal {
+            name: record::take_str(r)?,
+            id: record::take_str(r)?,
+            policy: record::take_str(r)?,
+            at_ns,
+        }),
+        3 => principal::Command::Policy {
+            name: record::take_str(r)?,
+            policy: record::take_str(r)?,
+        },
+        4 => principal::Command::Delete {
+            name: record::take_str(r)?,
+        },
+        5 => principal::Command::Key(principal::NewKey {
+            principal: record::take_str(r)?,
+            id: record::take_str(r)?,
+            generation: r.u32()?,
+            wrapped: r.take(mantle_s3::seal::WRAPPED_SECRET)?.try_into().ok()?,
+            rotating: match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            },
+            at_ns,
+        }),
+        6 => principal::Command::Revoke {
+            id: record::take_str(r)?,
+        },
+        _ => return None,
+    })
+}
+
+/// A principal command's outcome: its tag, and a made key's replaced key behind a flag.
+fn put_principal_outcome(w: &mut Writer, o: &principal::Outcome) -> Result<(), RecordError> {
+    match o {
+        principal::Outcome::Made => w.u8(0),
+        principal::Outcome::Taken => w.u8(1),
+        principal::Outcome::Full => w.u8(2),
+        principal::Outcome::Set => w.u8(3),
+        principal::Outcome::Removed => w.u8(4),
+        principal::Outcome::Unknown => w.u8(5),
+        principal::Outcome::Held => w.u8(6),
+        principal::Outcome::KeyMade { replacing } => {
+            w.u8(7);
+            match replacing {
+                None => w.u8(0),
+                Some(id) => {
+                    w.u8(1);
+                    record::put_str(w, id)?;
+                }
+            }
+        }
+        principal::Outcome::Unrotatable => w.u8(8),
+        principal::Outcome::Invalid => w.u8(9),
+    }
+    Ok(())
+}
+
+fn take_principal_outcome(r: &mut Reader<'_>) -> Option<principal::Outcome> {
+    Some(match r.u8()? {
+        0 => principal::Outcome::Made,
+        1 => principal::Outcome::Taken,
+        2 => principal::Outcome::Full,
+        3 => principal::Outcome::Set,
+        4 => principal::Outcome::Removed,
+        5 => principal::Outcome::Unknown,
+        6 => principal::Outcome::Held,
+        7 => principal::Outcome::KeyMade {
+            replacing: match r.u8()? {
+                0 => None,
+                1 => Some(record::take_str(r)?),
+                _ => return None,
+            },
+        },
+        8 => principal::Outcome::Unrotatable,
+        9 => principal::Outcome::Invalid,
+        _ => return None,
+    })
 }
 
 fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
@@ -539,7 +666,7 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
                 exposure_ns: r.u64()?,
                 crashes: r.u64()?,
             }),
-            _ => return None,
+            tag => root::Command::Principal(take_principal(tag, r, at_ns)?),
         }),
         _ => return None,
     })
@@ -1743,8 +1870,9 @@ pub fn largest_answer_bytes() -> Result<usize, RecordError> {
 /// Bytes of the largest value a row of a range takes from a request S3 admits, a session's
 /// aside (`session::Rules::largest_session_row`): a version or an upload keeping a request's
 /// headers at their longest encoding, its owner a canonical ID and its ETag and checksum at
-/// their longest; a part; or the Name range's lineage at its longest. Every other row holds
-/// fixed fields, IDs, a count or a bucket's name. A command whose row passes the range's bound
+/// their longest; a part; the Name range's lineage at its longest; or a principal's row with its
+/// identity policy at its longest. Every other row holds fixed fields, IDs, a count or a bucket's
+/// name. A command whose row passes the range's bound
 /// is refused whole (`apply::apply_entry`).
 pub fn largest_row_bytes() -> Result<usize, RecordError> {
     let owner = "o".repeat(MAX_OWNER);
@@ -1790,11 +1918,21 @@ pub fn largest_row_bytes() -> Result<usize, RecordError> {
         modified_ns: u64::MAX,
         deadline_ns: u64::MAX,
     };
+    // A principal's row at its longest: its name, its policy at the bound a row keeps one to, and
+    // its two keys (docs/design/principals.md).
+    let principal = record::Principal {
+        name: "n".repeat(mantle_s3::account::MAX_NAME),
+        id: "P".repeat(mantle_s3::account::KEY_ID_CHARS),
+        created_ns: u64::MAX,
+        policy: "p".repeat(crate::principal::MAX_POLICY),
+        keys: vec!["K".repeat(mantle_s3::account::KEY_ID_CHARS); mantle_s3::account::MAX_KEYS],
+    };
     let rows = [
         version.encode()?,
         upload.encode()?,
         part.encode()?,
         longest_lineage().encode()?,
+        principal.encode()?,
     ];
     Ok(rows.iter().map(Vec::len).max().unwrap_or(0))
 }
@@ -2349,6 +2487,34 @@ mod tests {
                 exposure_ns: u64::MAX,
                 crashes: u64::MAX,
             })),
+            Command::Root(root::Command::Principal(principal::Command::Create(
+                principal::NewPrincipal {
+                    name: "runner-7".into(),
+                    id: "P".repeat(mantle_s3::account::KEY_ID_CHARS),
+                    policy: "{\"Version\":\"2012-10-17\"}".into(),
+                    at_ns,
+                },
+            ))),
+            Command::Root(root::Command::Principal(principal::Command::Policy {
+                name: "runner-7".into(),
+                policy: String::new(),
+            })),
+            Command::Root(root::Command::Principal(principal::Command::Delete {
+                name: "runner-7".into(),
+            })),
+            Command::Root(root::Command::Principal(principal::Command::Key(
+                principal::NewKey {
+                    principal: "runner-7".into(),
+                    id: "K".repeat(mantle_s3::account::KEY_ID_CHARS),
+                    generation: u32::MAX,
+                    wrapped: [0xA5; mantle_s3::seal::WRAPPED_SECRET],
+                    rotating: true,
+                    at_ns,
+                },
+            ))),
+            Command::Root(root::Command::Principal(principal::Command::Revoke {
+                id: "K".repeat(mantle_s3::account::KEY_ID_CHARS),
+            })),
         ]
     }
 
@@ -2556,6 +2722,24 @@ mod tests {
                 root::Outcome::Unknown,
             ]
             .map(Answer::Root),
+        );
+        answers.extend(
+            [
+                principal::Outcome::Made,
+                principal::Outcome::Taken,
+                principal::Outcome::Full,
+                principal::Outcome::Set,
+                principal::Outcome::Removed,
+                principal::Outcome::Unknown,
+                principal::Outcome::Held,
+                principal::Outcome::KeyMade { replacing: None },
+                principal::Outcome::KeyMade {
+                    replacing: Some("K".repeat(mantle_s3::account::KEY_ID_CHARS)),
+                },
+                principal::Outcome::Unrotatable,
+                principal::Outcome::Invalid,
+            ]
+            .map(|o| Answer::Root(root::Outcome::Principal(o))),
         );
         answers
     }

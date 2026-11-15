@@ -280,13 +280,23 @@ impl Claim<'_> {
     }
 }
 
-fn verify_header<S: AsRef<str>>(
-    request: &Request<'_>,
-    authorization: &str,
-    region: &str,
-    now: i64,
-    secret: &impl Fn(&str) -> Option<S>,
-) -> Result<Verified, AuthError> {
+/// The access key a request's signature claims, its form checked as [`verify`] checks it, before
+/// any secret is asked for: the `Authorization` header's `Credential`, or a presigned URL's
+/// `X-Amz-Credential`. A request with neither is unsigned, [`AuthError::Missing`].
+pub fn access_key(request: &Request<'_>) -> Result<String, AuthError> {
+    if let Some(authorization) = header(request.headers, "authorization") {
+        return header_claim(authorization).map(|claim| claim.access_key.to_owned());
+    }
+    if query_has(request.query, "X-Amz-Signature") || query_has(request.query, "X-Amz-Algorithm") {
+        let params =
+            query_pairs(request.query).ok_or(AuthError::QueryMalformed("undecodable query"))?;
+        return presigned_claim(&params).map(|claim| claim.access_key.to_owned());
+    }
+    Err(AuthError::Missing)
+}
+
+/// The claim an `Authorization` header makes: its algorithm SigV4's, and its three components.
+fn header_claim(authorization: &str) -> Result<Claim<'_>, AuthError> {
     let malformed = AuthError::HeaderMalformed;
     let rest = match authorization.split_once(|c: char| c.is_ascii_whitespace()) {
         Some((ALGORITHM, rest)) => rest,
@@ -312,12 +322,45 @@ fn verify_header<S: AsRef<str>>(
             _ => return Err(malformed("unknown component")),
         }
     }
-    let claim = claim(
+    claim(
         credential.ok_or(malformed("no Credential"))?,
         signed.ok_or(malformed("no SignedHeaders"))?,
         signature.ok_or(malformed("no Signature"))?,
         malformed,
-    )?;
+    )
+}
+
+/// The claim a presigned URL's parameters make: its algorithm SigV4's, and its three parameters.
+fn presigned_claim(params: &[(String, String)]) -> Result<Claim<'_>, AuthError> {
+    let malformed = AuthError::QueryMalformed;
+    let get = |name: &str| {
+        params
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    };
+    match get("X-Amz-Algorithm") {
+        Some(ALGORITHM) => {}
+        Some(_) => return Err(malformed("unknown X-Amz-Algorithm")),
+        None => return Err(malformed("no X-Amz-Algorithm")),
+    }
+    claim(
+        get("X-Amz-Credential").ok_or(malformed("no X-Amz-Credential"))?,
+        get("X-Amz-SignedHeaders").ok_or(malformed("no X-Amz-SignedHeaders"))?,
+        get("X-Amz-Signature").ok_or(malformed("no X-Amz-Signature"))?,
+        malformed,
+    )
+}
+
+fn verify_header<S: AsRef<str>>(
+    request: &Request<'_>,
+    authorization: &str,
+    region: &str,
+    now: i64,
+    secret: &impl Fn(&str) -> Option<S>,
+) -> Result<Verified, AuthError> {
+    let malformed = AuthError::HeaderMalformed;
+    let claim = header_claim(authorization)?;
     let timestamp = header(request.headers, "x-amz-date")
         .or_else(|| header(request.headers, "date"))
         .ok_or(malformed("no x-amz-date"))?;
@@ -365,17 +408,7 @@ fn verify_presigned<S: AsRef<str>>(
             .find(|(n, _)| n == name)
             .map(|(_, v)| v.as_str())
     };
-    match get("X-Amz-Algorithm") {
-        Some(ALGORITHM) => {}
-        Some(_) => return Err(malformed("unknown X-Amz-Algorithm")),
-        None => return Err(malformed("no X-Amz-Algorithm")),
-    }
-    let claim = claim(
-        get("X-Amz-Credential").ok_or(malformed("no X-Amz-Credential"))?,
-        get("X-Amz-SignedHeaders").ok_or(malformed("no X-Amz-SignedHeaders"))?,
-        get("X-Amz-Signature").ok_or(malformed("no X-Amz-Signature"))?,
-        malformed,
-    )?;
+    let claim = presigned_claim(&params)?;
     let timestamp = get("X-Amz-Date").ok_or(malformed("no X-Amz-Date"))?;
     let time = crate::time::parse_amz_date(timestamp)
         .ok_or(malformed("X-Amz-Date is not YYYYMMDDTHHMMSSZ"))?;
@@ -1117,7 +1150,54 @@ mod tests {
             };
             let verified = verify(&request, "us-east-1", now(), secret).unwrap();
             assert_eq!(verified.access_key, KEY);
+            // The key a signature claims is read before any secret is asked for.
+            assert_eq!(access_key(&request), Ok(KEY.to_owned()));
         }
+    }
+
+    /// The key a request claims is its credential's, its form checked as `verify` checks it, and
+    /// an unsigned request claims none (05 §1).
+    #[test]
+    fn the_claimed_key_is_read_as_verify_reads_it() {
+        let unsigned = Request {
+            method: "GET",
+            path: "/",
+            query: "",
+            headers: &[("Host", "h")],
+        };
+        assert_eq!(access_key(&unsigned), Err(AuthError::Missing));
+        for (authorization, refused) in [
+            ("AWS AKID:sig", "wrong signature version"),
+            (
+                "AWS4-HMAC-SHA256 Credential=K/20130524/us-east-1/s3/aws4_request",
+                "short",
+            ),
+            (
+                "AWS4-HMAC-SHA256 Credential=/20130524/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=00",
+                "no key",
+            ),
+            ("Bearer token", "another scheme"),
+        ] {
+            let headers = [("Host", "h"), ("Authorization", authorization)];
+            let request = Request {
+                headers: &headers,
+                ..unsigned
+            };
+            assert!(access_key(&request).is_err(), "{refused}");
+            assert_eq!(
+                access_key(&request).unwrap_err(),
+                verify(&request, "us-east-1", now(), |_| Some(SECRET)).unwrap_err(),
+                "{refused}"
+            );
+        }
+        let presigned = Request {
+            query: "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404",
+            ..unsigned
+        };
+        assert_eq!(
+            access_key(&presigned),
+            Ok("AKIAIOSFODNN7EXAMPLE".to_owned())
+        );
     }
 
     #[test]

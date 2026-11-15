@@ -500,10 +500,12 @@ With ACLs disabled on every bucket (§5), a policy is how a bucket's owner lets 
   InvalidBucketOwnerAWSAccountID` naming it, as S3 answered (`crates/s3/src/account.rs`).
 - **Principals.** An account is named as AWS names one, by its 12-digit ID or its root's ARN,
   or by its canonical user ID, so a policy written for S3 names mantle's accounts unchanged.
-  mantle has no IAM users, roles or federation, so a policy naming one names no principal
-  mantle has, and is refused as S3 refuses one that does not exist, "Invalid principal in
-  policy". `"*"` and `{"AWS": "*"}` are everyone, the anonymous requester included, as IAM and
-  s3-tests have them. A service principal is accepted and matches no requester of mantle's.
+  A cell's principals, users of its account each judged by its own identity policy
+  ([principals.md](principals.md)), are not yet named by a bucket policy: one naming an IAM
+  user, a role or a federated principal is refused as S3 refuses one that does not exist,
+  "Invalid principal in policy", until bucket policies are served beside them. `"*"` and
+  `{"AWS": "*"}` are everyone, the anonymous requester included, as IAM and s3-tests have them.
+  A service principal is accepted and matches no requester of mantle's.
 - **The document** is read by the strict JSON reader (§9) from a body of at most 40,960 bytes,
   and held to 20,480 bytes written compactly, the normalized size S3 was recorded measuring.
   Each fault is `400 MalformedPolicy` with S3's recorded message, or with the one versitygw

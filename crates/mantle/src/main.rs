@@ -35,6 +35,7 @@ mod files;
 mod init;
 mod journal;
 mod pack;
+mod principals;
 mod transfer;
 
 // The allocation counts of `mantle serve`'s `counts` and of `mantle bench doors` are a diagnostic:
@@ -210,6 +211,18 @@ enum Command {
         #[command(subcommand)]
         step: MultipartCommand,
     },
+    /// The cell's principals, users of its account as IAM has them, each with an identity policy
+    /// and at most two access keys (docs/design/principals.md), asked of the cell as the client of
+    /// --client, which acts for the account's root. Every node judges by the cell's answer at once.
+    Principal {
+        #[command(subcommand)]
+        command: PrincipalCommand,
+    },
+    /// The principals' access keys: made, rotated, listed and revoked across the cell at once.
+    Key {
+        #[command(subcommand)]
+        command: KeyCommand,
+    },
     /// Estimate how likely a block is to be lost in a year under each scheme mantle can store
     /// it in, and the scheme that meets the durability target at least cost.
     Durability {
@@ -317,6 +330,47 @@ impl MetadataArgs {
         mantle_s3::metadata::of_request(named.iter().map(|(n, v)| (n.as_str(), v.as_str())))
             .map_err(|e| e.to_string())
     }
+}
+
+#[derive(Subcommand)]
+enum PrincipalCommand {
+    /// A principal NAME (IAM's user names: 1 to 64 letters, digits and +=,.@_-) with the identity
+    /// policy in POLICY, IAM's JSON for a user's policy.
+    Create {
+        name: String,
+        #[arg(long)]
+        policy: PathBuf,
+    },
+    /// NAME's identity policy replaced with the one in POLICY.
+    Policy { name: String, policy: PathBuf },
+    /// The account's principals: each one's creation, name, unique ID and keys.
+    List,
+    /// NAME: its unique ID, creation, keys and policy.
+    Show { name: String },
+    /// NAME deleted, once it holds no key.
+    Delete { name: String },
+}
+
+#[derive(Subcommand)]
+enum KeyCommand {
+    /// A key for PRINCIPAL, written to OUT as AWS's shared credentials file, owner-only; OUT must
+    /// not exist. A principal holds two keys at most.
+    Create {
+        principal: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// PRINCIPAL's one key replaced: a second key made and written over OUT, the first valid
+    /// until it is revoked, so clients move to the new one with no request refused.
+    Rotate {
+        principal: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// The key ID revoked: every node refuses it from the answer on.
+    Revoke { id: String },
+    /// The account's keys: each one's creation, id and principal; never a secret.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -903,6 +957,33 @@ fn object_command(command: &Command) -> Option<Result<client::Command, String>> 
             }
             MultipartCommand::Uploads { bucket: b } => bucket(b).map(client::Command::Uploads),
         },
+        Command::Principal { command } => Ok(client::Command::Principals(match command {
+            PrincipalCommand::Create { name, policy } => principals::Command::Create {
+                name: name.clone(),
+                policy: policy.clone(),
+            },
+            PrincipalCommand::Policy { name, policy } => principals::Command::Policy {
+                name: name.clone(),
+                policy: policy.clone(),
+            },
+            PrincipalCommand::List => principals::Command::List,
+            PrincipalCommand::Show { name } => principals::Command::Show(name.clone()),
+            PrincipalCommand::Delete { name } => principals::Command::Delete(name.clone()),
+        })),
+        Command::Key { command } => Ok(client::Command::Principals(match command {
+            KeyCommand::Create { principal, out } => principals::Command::Key {
+                principal: principal.clone(),
+                out: out.clone(),
+                rotating: false,
+            },
+            KeyCommand::Rotate { principal, out } => principals::Command::Key {
+                principal: principal.clone(),
+                out: out.clone(),
+                rotating: true,
+            },
+            KeyCommand::Revoke { id } => principals::Command::Revoke(id.clone()),
+            KeyCommand::List => principals::Command::Keys,
+        })),
         _ => return None,
     })
 }
@@ -960,7 +1041,9 @@ fn main() -> ExitCode {
         | Command::Cp { .. }
         | Command::Rm { .. }
         | Command::Head { .. }
-        | Command::Multipart { .. } => Ok(()),
+        | Command::Multipart { .. }
+        | Command::Principal { .. }
+        | Command::Key { .. } => Ok(()),
         Command::Init {
             what: Some(InitCommand::Client { name, cell }),
             ..

@@ -4,6 +4,8 @@
 //! runs that ended without an orderly stop, which every node's failure detectors start from
 //! (node.md §2.4, item 7).
 //!
+//! It also holds the account's principals and their access keys (`crate::principal`).
+//!
 //! A node enlists itself and its volumes as it starts. What the table does not hold is recorded;
 //! what it holds otherwise, a node in another domain or a volume on another node, is a conflict
 //! that changes nothing, since a device moved between nodes is a move to make, never a silent
@@ -12,8 +14,8 @@
 
 use crate::engine::{Rows, Write};
 use crate::error::{MetaError, reserved};
-use crate::key;
 use crate::record::{Census, History, Member, VolumeRow};
+use crate::{key, principal};
 
 /// The longest failure domain a node names, in bytes: a label such as a rack's or a zone's name.
 pub const MAX_DOMAIN: usize = 255;
@@ -22,6 +24,8 @@ pub const MAX_DOMAIN: usize = 255;
 pub enum Command {
     Enlist(Enlist),
     Lived(Lived),
+    /// A command on the account's principals and their keys (`crate::principal`).
+    Principal(principal::Command),
 }
 
 /// A node's history as the node states it: the totals over all its runs (node.md §2.4, item 7).
@@ -49,7 +53,7 @@ pub struct Enlist {
     pub max_volumes: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// The table holds the node and each volume named as the enlistment states them.
     Enlisted,
@@ -63,6 +67,8 @@ pub enum Outcome {
     Kept,
     /// The table holds no such node, whose history it would keep: nothing changed.
     Unknown,
+    /// What became of a command on the principals.
+    Principal(principal::Outcome),
 }
 
 /// A volume as the table holds it, with its node's failure domain.
@@ -79,6 +85,10 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
     let (outcome, writes) = match command {
         Command::Enlist(e) => enlist(engine, e)?,
         Command::Lived(l) => lived(engine, l)?,
+        Command::Principal(c) => {
+            let (outcome, writes) = principal::run(engine, c)?;
+            (Outcome::Principal(outcome), writes)
+        }
     };
     engine.apply(index, writes)?;
     Ok(outcome)

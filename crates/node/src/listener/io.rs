@@ -30,6 +30,17 @@ pub enum Io {
     Tls(Box<Tls>),
 }
 
+impl Io {
+    /// The client's address, where the socket names it.
+    pub fn peer(&self) -> Option<std::net::IpAddr> {
+        let stream = match self {
+            Self::Plain(stream) => stream,
+            Self::Tls(tls) => &tls.stream,
+        };
+        stream.peer_addr().ok().map(|at| at.ip())
+    }
+}
+
 /// A TLS connection: its socket, its state and the configuration its handshake reads.
 pub struct Tls {
     stream: TcpStream,

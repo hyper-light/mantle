@@ -44,11 +44,21 @@
 //! | 22 | UploadPartCopy (research/89 §4) | the bucket and the key; the upload's ID; the part's number (u16); the source's bucket and key, and its version, optional; the source's conditions, as headers, `x-amz-copy-source-range` in the range slot |
 //! | 23 | DeleteObjects (research/89 §5) | the bucket; the objects (a u32 count, at most S3's 1,000), each its key, its version, optional, and the ETag its delete is conditioned on, optional; whether the reply is quiet (u8) |
 //! | 24 | ListObjectVersions (research/89 §2.3) | the bucket; the prefix; the delimiter, empty for none; the key marker and the version ID marker, each optional; the most versions (u32) |
+//! | 25 | CreatePrincipal (docs/design/principals.md) | the principal's name; its identity policy as written |
+//! | 26 | PutPolicy | the principal's name; its identity policy as written |
+//! | 27 | DeletePrincipal | the principal's name |
+//! | 28 | ListPrincipals | the principal after which the page starts, optional; the most principals (u32) |
+//! | 29 | GetPrincipal | the principal's name |
+//! | 30 | CreateKey | the principal's name; whether it rotates the principal's one key (u8) |
+//! | 31 | RevokeKey | the key's id |
 //!
 //! The metadata, a version's content headers and user-defined metadata (`mantle_s3::metadata`): a
 //! count (u32), then each pair, its lowercase name and its value, each a text, together within
 //! S3's 8 KB of headers. A version is a text within S3's 1,024 bytes of a version ID
 //! (`mantle_s3::body::MAX_VERSION_ID`): `null`, or one of mantle's, which the node parses.
+//!
+//! The principals' kinds are an operator's, and every client of the native protocol acts for the
+//! cell's account, its root (node.md §3.6), which IAM lets manage its users and their keys.
 //!
 //! The headers are the values of S3's request headers an object's operation takes as text, each
 //! optional: `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since` and `Range`,
@@ -67,11 +77,12 @@
 //! each), S3's `206 Partial Content`; the bucket's versioning, GetBucketVersioning's (u8): 0 none,
 //! never set or not asked, 2 enabled, 3 suspended; the upload's ID, CreateMultipartUpload's, a text;
 //! then the listing, behind a byte: 0 none, 1 a page of keys, 2 a page of buckets, 3 a page of
-//! parts, 4 a page of uploads, 5 a page of versions, 6 a delete's results; then a native upload's
-//! progress, optional: its durable offset (u64), its runs (u16), the length of every run but its
-//! last (u64), whether its last run committed (u8) and a run's checksum, optional, its length (u8)
-//! before it; then the version's metadata, a get's or a head's; then the version a copy read of
-//! its source, a text, empty where none applies. A page of keys: whether it is truncated (u8); where the next page starts,
+//! parts, 4 a page of uploads, 5 a page of versions, 6 a delete's results, 7 a page of principals,
+//! 8 a key made; then a native upload's progress, optional: its durable offset (u64), its runs
+//! (u16), the length of every run but its last (u64), whether its last run committed (u8) and a
+//! run's checksum, optional, its length (u8) before it; then the version's metadata, a get's or a
+//! head's; then the version a copy read of its source, a text, empty where none applies. A page of
+//! keys: whether it is truncated (u8); where the next page starts,
 //! optional, as a request names it; the count of keys (u32), each its key, ETag, size (u64),
 //! Last-Modified (u64), checksum algorithm, optional, its code (u8) and parts (u16), and owner,
 //! optional, a text; the count of common prefixes (u32), each a text. A page of buckets: the
@@ -88,7 +99,10 @@
 //! owner; the count of common prefixes (u32), each a text. A delete's results, in the order the
 //! request named its objects: the count (u32), each the key, the version the request named,
 //! optional, the status of its delete (u8), and the version ID of the delete marker the delete
-//! made or removed, optional.
+//! made or removed, optional. A page of principals: the count (u32), each its name, its unique ID,
+//! its creation (u64, whole seconds), its identity policy, optional, and its keys (a u32 count),
+//! each its id and creation (u64, whole seconds); the principal after which the next page starts,
+//! optional. A key made: its id, its secret and the key it replaces, optional.
 //!
 //! Numbers are little-endian. Every text is within S3's bound on what it names, and every count
 //! within S3's page: a message past them is refused whole.
@@ -129,6 +143,34 @@ const COPY: u8 = 21;
 const COPY_PART: u8 = 22;
 const DELETE_OBJECTS: u8 = 23;
 const LIST_VERSIONS: u8 = 24;
+const CREATE_PRINCIPAL: u8 = 25;
+const PUT_POLICY: u8 = 26;
+const DELETE_PRINCIPAL: u8 = 27;
+const LIST_PRINCIPALS: u8 = 28;
+const GET_PRINCIPAL: u8 = 29;
+const CREATE_KEY: u8 = 30;
+const REVOKE_KEY: u8 = 31;
+
+/// The most principals a page of ListPrincipals lists: IAM's ListUsers, `MaxItems` "Maximum value
+/// of 1000" (docs/research/91 §2).
+pub const MAX_PAGE_PRINCIPALS: usize = 1000;
+
+/// A principal's bytes at most in a page of principals, its policy left out: its name, its unique
+/// ID, its creation, the policy's flag, and its keys' count and each key's id and creation.
+pub const PRINCIPAL_LISTED_BYTES: usize = (4 + mantle_s3::account::MAX_NAME)
+    + (4 + mantle_s3::account::KEY_ID_CHARS)
+    + 8
+    + 1
+    + 4
+    + mantle_s3::account::MAX_KEYS * ((4 + mantle_s3::account::KEY_ID_CHARS) + 8);
+
+/// A page of principals' bytes beside its principals: the count, and the principal after which
+/// the next page starts behind its flag.
+pub const PRINCIPALS_HEAD_BYTES: usize = 4 + 1 + 4 + mantle_s3::account::MAX_NAME;
+
+/// A principal's identity policy as a reply carries it at most, in octets: its compact form's
+/// 2,048 characters, each at most four octets in UTF-8 (RFC 3629 §3).
+pub const MAX_POLICY_BYTES: usize = 4 * mantle_s3::policy::IDENTITY_CHARS;
 
 /// The longest version id or ETag a reply carries: a multipart object's ETag, bare of quotes, an
 /// MD5's 32 hex digits, `-` and its count of parts, at most `MAX_PARTS`'s five digits
@@ -217,6 +259,7 @@ pub const MAX_FIELDS: usize = {
         + 4
         + MAX_OBJECTS * ((4 + MAX_KEY) + version + (1 + 4 + MAX_CONDITION_TAG))
         + 1;
+    let principal = (4 + mantle_s3::account::MAX_NAME) + (4 + mantle_s3::policy::DOCUMENT_BYTES);
     let mut longest = if put > list { put } else { list };
     if complete > longest {
         longest = complete;
@@ -226,6 +269,9 @@ pub const MAX_FIELDS: usize = {
     }
     if deletes > longest {
         longest = deletes;
+    }
+    if principal > longest {
+        longest = principal;
     }
     longest
 };
@@ -251,6 +297,8 @@ pub const MAX_REPLY_FIELDS: usize = {
     let uploads = UPLOADS_HEAD_BYTES + MAX_PAGE_PARTS * UPLOAD_BYTES;
     let versions = VERSIONS_HEAD_BYTES + MAX_KEYS * VERSION_BYTES;
     let deleted = 4 + MAX_OBJECTS * DELETED_BYTES;
+    let principals = PRINCIPALS_HEAD_BYTES + MAX_PAGE_PRINCIPALS * PRINCIPAL_LISTED_BYTES;
+    let principal = PRINCIPALS_HEAD_BYTES + PRINCIPAL_LISTED_BYTES + 4 + MAX_POLICY_BYTES;
     let mut longest = if keys > buckets { keys } else { buckets };
     if parts > longest {
         longest = parts;
@@ -264,10 +312,24 @@ pub const MAX_REPLY_FIELDS: usize = {
     if deleted > longest {
         longest = deleted;
     }
+    if principals > longest {
+        longest = principals;
+    }
+    if principal > longest {
+        longest = principal;
+    }
+    if ISSUED_BYTES > longest {
+        longest = ISSUED_BYTES;
+    }
     // The progress, the metadata and a copy's source version follow the listing.
     let progress = 1 + 8 + 2 + 8 + 1 + (1 + 1 + MAX_CHECKSUM);
     facts + 1 + longest + progress + METADATA_BYTES + (4 + MAX_TAG)
 };
+
+/// A key made as a reply lists it: its id, its secret, and the key it replaces behind its flag.
+const ISSUED_BYTES: usize = (4 + mantle_s3::account::KEY_ID_CHARS)
+    + (4 + mantle_s3::account::SECRET_CHARS)
+    + (1 + 4 + mantle_s3::account::KEY_ID_CHARS);
 
 /// The values of S3's request headers an object's operation takes as text, as a request sends
 /// them: its preconditions (05 §2) and a read's range (05 §12).
@@ -566,6 +628,26 @@ pub enum Op {
     },
     /// ListObjectVersions (research/89 §2.3).
     ListVersions(ListVersions),
+    /// A principal of the cell's account made with its identity policy, as IAM's CreateUser and
+    /// PutUserPolicy make a user (docs/design/principals.md): the policy as its operator wrote it,
+    /// which the node checks as IAM checks one (`mantle_s3::policy::identity`).
+    CreatePrincipal { name: String, policy: String },
+    /// A principal's identity policy replaced (PutUserPolicy): every node judges by it from the
+    /// reply on.
+    PutPolicy { name: String, policy: String },
+    /// A principal deleted (DeleteUser), refused while it holds a key.
+    DeletePrincipal { name: String },
+    /// A page of the account's principals after `after`, at most `max`, each with its keys
+    /// (ListUsers, ListAccessKeys).
+    ListPrincipals { after: Option<String>, max: u32 },
+    /// A principal, its policy and its keys (GetUser, GetUserPolicy).
+    GetPrincipal { name: String },
+    /// An access key made for `principal` (CreateAccessKey); with `rotating`, only while the
+    /// principal holds one key, which the new one replaces once that one is revoked. The reply
+    /// carries the key's id and its secret, the one time the secret leaves the cell.
+    CreateKey { principal: String, rotating: bool },
+    /// An access key revoked (DeleteAccessKey): every node refuses it from the reply on.
+    RevokeKey { id: String },
 }
 
 /// A versioning state as a message carries it: 2 enabled, 3 suspended.
@@ -1102,6 +1184,31 @@ impl Head {
                     }
                 }
                 LIST_VERSIONS => Op::ListVersions(take_list_versions(&mut r)?),
+                CREATE_PRINCIPAL => Op::CreatePrincipal {
+                    name: take_text(&mut r, mantle_s3::account::MAX_NAME)?,
+                    policy: take_text(&mut r, mantle_s3::policy::DOCUMENT_BYTES)?,
+                },
+                PUT_POLICY => Op::PutPolicy {
+                    name: take_text(&mut r, mantle_s3::account::MAX_NAME)?,
+                    policy: take_text(&mut r, mantle_s3::policy::DOCUMENT_BYTES)?,
+                },
+                DELETE_PRINCIPAL => Op::DeletePrincipal {
+                    name: take_text(&mut r, mantle_s3::account::MAX_NAME)?,
+                },
+                LIST_PRINCIPALS => Op::ListPrincipals {
+                    after: take_optional_text(&mut r, mantle_s3::account::MAX_NAME)?,
+                    max: r.u32()?,
+                },
+                GET_PRINCIPAL => Op::GetPrincipal {
+                    name: take_text(&mut r, mantle_s3::account::MAX_NAME)?,
+                },
+                CREATE_KEY => Op::CreateKey {
+                    principal: take_text(&mut r, mantle_s3::account::MAX_NAME)?,
+                    rotating: take_flag(&mut r)?,
+                },
+                REVOKE_KEY => Op::RevokeKey {
+                    id: take_text(&mut r, mantle_s3::account::KEY_ID_CHARS)?,
+                },
                 _ => return None,
             })
         })();
@@ -1131,7 +1238,7 @@ impl Head {
         let decoded = decoded.ok_or_else(head_of)?;
         let puts = matches!(decoded.kind, PUT | UPLOAD_PART | APPEND);
         let within = usize::try_from(decoded.fields).is_ok_and(|f| f <= MAX_FIELDS)
-            && decoded.kind <= LIST_VERSIONS
+            && decoded.kind <= REVOKE_KEY
             && (puts || (decoded.length == 0 && decoded.trailing.is_none()));
         let trailer = decoded
             .trailing
@@ -1485,6 +1592,41 @@ impl Op {
                 put_list_versions(f, list)?;
                 (LIST_VERSIONS, 0, 0, None)
             }
+            Self::CreatePrincipal { name, policy } => {
+                put_text(f, name, mantle_s3::account::MAX_NAME)?;
+                put_text(f, policy, mantle_s3::policy::DOCUMENT_BYTES)?;
+                (CREATE_PRINCIPAL, 0, 0, None)
+            }
+            Self::PutPolicy { name, policy } => {
+                put_text(f, name, mantle_s3::account::MAX_NAME)?;
+                put_text(f, policy, mantle_s3::policy::DOCUMENT_BYTES)?;
+                (PUT_POLICY, 0, 0, None)
+            }
+            Self::DeletePrincipal { name } => {
+                put_text(f, name, mantle_s3::account::MAX_NAME)?;
+                (DELETE_PRINCIPAL, 0, 0, None)
+            }
+            Self::ListPrincipals { after, max } => {
+                put_optional_text(f, after.as_deref(), mantle_s3::account::MAX_NAME)?;
+                f.u32(*max);
+                (LIST_PRINCIPALS, 0, 0, None)
+            }
+            Self::GetPrincipal { name } => {
+                put_text(f, name, mantle_s3::account::MAX_NAME)?;
+                (GET_PRINCIPAL, 0, 0, None)
+            }
+            Self::CreateKey {
+                principal,
+                rotating,
+            } => {
+                put_text(f, principal, mantle_s3::account::MAX_NAME)?;
+                put_flag(f, *rotating);
+                (CREATE_KEY, 0, 0, None)
+            }
+            Self::RevokeKey { id } => {
+                put_text(f, id, mantle_s3::account::KEY_ID_CHARS)?;
+                (REVOKE_KEY, 0, 0, None)
+            }
         })
     }
 
@@ -1601,9 +1743,21 @@ pub enum Status {
     /// S3's `400 InvalidArgument`: an `x-amz-copy-source-range` not of the form
     /// `bytes=first-last` (research/89 §4.1).
     InvalidCopyRange,
+    /// IAM's `409 EntityAlreadyExists`: a principal of that name, its case aside (research/91 §2).
+    EntityAlreadyExists,
+    /// IAM's `404 NoSuchEntity`: no principal of that name, or no key of that id.
+    NoSuchEntity,
+    /// IAM's `409 LimitExceeded`: the account's 5,000 principals, or a principal's two keys.
+    LimitExceeded,
+    /// IAM's `409 DeleteConflict`: the principal holds keys, which are revoked first.
+    DeleteConflict,
+    /// IAM's `400 MalformedPolicyDocument`: a policy IAM refuses (`mantle_s3::policy::identity`).
+    MalformedPolicy,
+    /// A rotation asked of a principal that holds no key: there is none to rotate.
+    NothingToRotate,
 }
 
-const STATUSES: [Status; 36] = [
+const STATUSES: [Status; 42] = [
     Status::Done,
     Status::NoSuchBucket,
     Status::NoSuchKey,
@@ -1640,6 +1794,12 @@ const STATUSES: [Status; 36] = [
     Status::CopyRangeSource,
     Status::CopyMarker,
     Status::InvalidCopyRange,
+    Status::EntityAlreadyExists,
+    Status::NoSuchEntity,
+    Status::LimitExceeded,
+    Status::DeleteConflict,
+    Status::MalformedPolicy,
+    Status::NothingToRotate,
 ];
 
 impl Status {
@@ -1681,6 +1841,12 @@ impl Status {
             Self::CopyRangeSource => 33,
             Self::CopyMarker => 34,
             Self::InvalidCopyRange => 35,
+            Self::EntityAlreadyExists => 36,
+            Self::NoSuchEntity => 37,
+            Self::LimitExceeded => 38,
+            Self::DeleteConflict => 39,
+            Self::MalformedPolicy => 40,
+            Self::NothingToRotate => 41,
         }
     }
 
@@ -1806,6 +1972,26 @@ pub struct Deleted {
     pub marker: Option<String>,
 }
 
+/// A principal a page of principals lists (docs/design/principals.md): its name, its unique ID, its
+/// creation, its identity policy where it was asked for (GetPrincipal), and each of its keys' ids
+/// and creations, whole seconds. No secret is ever listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrincipalListed {
+    pub name: String,
+    pub id: String,
+    pub created: u64,
+    pub policy: Option<String>,
+    pub keys: Vec<(String, u64)>,
+}
+
+/// A page of principals.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Principals {
+    pub principals: Vec<PrincipalListed>,
+    /// The principal after which the next page starts, when more follow.
+    pub next: Option<String>,
+}
+
 /// What a reply lists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Listing {
@@ -1815,6 +2001,28 @@ pub enum Listing {
     Uploads(Uploads),
     Versions(Versions),
     Deleted(Vec<Deleted>),
+    Principals(Principals),
+    /// A key made, CreateKey's: what its reply carries, the one time its secret leaves the cell.
+    Issued(Box<Issued>),
+}
+
+/// An access key made (CreateKey): its id, its secret, the one time it leaves the cell, and the key
+/// a rotation replaces, which stays until it is revoked. Its secret is wiped when dropped and never
+/// shown by `Debug`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Issued {
+    pub id: String,
+    pub secret: mantle_s3::account::Secret,
+    pub replacing: Option<String>,
+}
+
+impl std::fmt::Debug for Issued {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Issued")
+            .field("id", &self.id)
+            .field("replacing", &self.replacing)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A version's checksum as a reply carries it (05 §3.3): its algorithm's code, as
@@ -2333,6 +2541,57 @@ pub fn take_deleted(r: &mut Reader<'_>) -> Option<Vec<Deleted>> {
 }
 
 /// A count within `most`, read as a u32, and no more than the rest holds at `least` bytes each.
+pub fn put_principals(w: &mut Writer, page: &Principals) -> Result<(), ObjectError> {
+    if page.principals.len() > MAX_PAGE_PRINCIPALS {
+        return Err(ObjectError::TooLong(page.principals.len()));
+    }
+    put_count(w, page.principals.len())?;
+    for listed in &page.principals {
+        put_text(w, &listed.name, mantle_s3::account::MAX_NAME)?;
+        put_text(w, &listed.id, mantle_s3::account::KEY_ID_CHARS)?;
+        w.u64(listed.created);
+        put_optional_text(w, listed.policy.as_deref(), MAX_POLICY_BYTES)?;
+        if listed.keys.len() > mantle_s3::account::MAX_KEYS {
+            return Err(ObjectError::TooLong(listed.keys.len()));
+        }
+        put_count(w, listed.keys.len())?;
+        for (id, created) in &listed.keys {
+            put_text(w, id, mantle_s3::account::KEY_ID_CHARS)?;
+            w.u64(*created);
+        }
+    }
+    put_optional_text(w, page.next.as_deref(), mantle_s3::account::MAX_NAME)
+}
+
+pub fn take_principals(r: &mut Reader<'_>) -> Option<Principals> {
+    // A principal takes at least its name's and id's lengths, its creation, the policy's flag
+    // and its keys' count.
+    let count = take_count(r, MAX_PAGE_PRINCIPALS, 4 + 4 + 8 + 1 + 4)?;
+    let mut principals = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name = take_text(r, mantle_s3::account::MAX_NAME)?;
+        let id = take_text(r, mantle_s3::account::KEY_ID_CHARS)?;
+        let created = r.u64()?;
+        let policy = take_optional_text(r, MAX_POLICY_BYTES)?;
+        let held = take_count(r, mantle_s3::account::MAX_KEYS, 4 + 8)?;
+        let mut keys = Vec::with_capacity(held);
+        for _ in 0..held {
+            keys.push((take_text(r, mantle_s3::account::KEY_ID_CHARS)?, r.u64()?));
+        }
+        principals.push(PrincipalListed {
+            name,
+            id,
+            created,
+            policy,
+            keys,
+        });
+    }
+    Some(Principals {
+        principals,
+        next: take_optional_text(r, mantle_s3::account::MAX_NAME)?,
+    })
+}
+
 fn take_count(r: &mut Reader<'_>, most: usize, least: usize) -> Option<usize> {
     let count = usize::try_from(r.u32()?).ok()?;
     let fits = r.remaining().checked_div(least)?;
@@ -2428,6 +2687,20 @@ impl Reply {
             Some(Listing::Deleted(results)) => {
                 f.u8(6);
                 put_deleted(f, results)?;
+            }
+            Some(Listing::Principals(page)) => {
+                f.u8(7);
+                put_principals(f, page)?;
+            }
+            Some(Listing::Issued(issued)) => {
+                f.u8(8);
+                put_text(f, &issued.id, mantle_s3::account::KEY_ID_CHARS)?;
+                put_text(f, &issued.secret, mantle_s3::account::SECRET_CHARS)?;
+                put_optional_text(
+                    f,
+                    issued.replacing.as_deref(),
+                    mantle_s3::account::KEY_ID_CHARS,
+                )?;
             }
         }
         put_flag(f, self.progress.is_some());
@@ -2526,6 +2799,15 @@ impl ReplyHead {
                 4 => Some(Listing::Uploads(take_uploads(&mut r)?)),
                 5 => Some(Listing::Versions(take_versions(&mut r)?)),
                 6 => Some(Listing::Deleted(take_deleted(&mut r)?)),
+                7 => Some(Listing::Principals(take_principals(&mut r)?)),
+                8 => Some(Listing::Issued(Box::new(Issued {
+                    id: take_text(&mut r, mantle_s3::account::KEY_ID_CHARS)?,
+                    secret: mantle_s3::account::Secret::new(take_text(
+                        &mut r,
+                        mantle_s3::account::SECRET_CHARS,
+                    )?),
+                    replacing: take_optional_text(&mut r, mantle_s3::account::KEY_ID_CHARS)?,
+                }))),
                 _ => return None,
             };
             let progress = if take_flag(&mut r)? {
@@ -2904,6 +3186,31 @@ mod tests {
                 id_marker: Some("passed".into()),
                 max: 1000,
             }),
+            // The principals' operations (docs/design/principals.md), after research/89's,
+            // so theirs keep their golden vectors' places.
+            Op::CreatePrincipal {
+                name: "runner-7".into(),
+                policy: "{\"Version\":\"2012-10-17\"}".into(),
+            },
+            Op::PutPolicy {
+                name: "runner-7".into(),
+                policy: "{}".into(),
+            },
+            Op::DeletePrincipal {
+                name: "runner-7".into(),
+            },
+            Op::ListPrincipals {
+                after: Some("a".into()),
+                max: 1000,
+            },
+            Op::GetPrincipal {
+                name: "runner-7".into(),
+            },
+            Op::CreateKey {
+                principal: "runner-7".into(),
+                rotating: true,
+            },
+            Op::RevokeKey { id: "A".repeat(20) },
         ]
     }
 
@@ -3018,7 +3325,7 @@ mod tests {
         assert!(Head::decode(&unnamed, Some(body)).is_err());
         // An unknown kind.
         let mut unknown = head.clone();
-        unknown[0] = LIST_VERSIONS + 1;
+        unknown[0] = REVOKE_KEY + 1;
         assert!(Head::decode(&unknown, Some(put.body(&fields))).is_err());
         // A key past S3's bound, headers past S3's 8 KB, a checksum of the wrong width.
         let long = Op::Head {
@@ -3232,6 +3539,40 @@ mod tests {
                     })
                     .collect(),
             )),
+            ..Reply::status(Status::Done)
+        });
+        // The principals' replies (docs/design/principals.md), after research/89's.
+        replies.push(Reply {
+            listing: Some(Listing::Principals(Principals {
+                principals: vec![
+                    PrincipalListed {
+                        name: "runner-7".into(),
+                        id: "P".repeat(20),
+                        created: 1_727_179_200,
+                        policy: None,
+                        keys: vec![
+                            ("A".repeat(20), 1_727_179_201),
+                            ("B".repeat(20), 1_727_179_202),
+                        ],
+                    },
+                    PrincipalListed {
+                        name: "svc".into(),
+                        id: "Q".repeat(20),
+                        created: 1,
+                        policy: Some("{}".into()),
+                        keys: Vec::new(),
+                    },
+                ],
+                next: Some("svc".into()),
+            })),
+            ..Reply::status(Status::Done)
+        });
+        replies.push(Reply {
+            listing: Some(Listing::Issued(Box::new(Issued {
+                id: "A".repeat(20),
+                secret: mantle_s3::account::Secret::new("s".repeat(40)),
+                replacing: Some("B".repeat(20)),
+            }))),
             ..Reply::status(Status::Done)
         });
         replies

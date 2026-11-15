@@ -94,7 +94,16 @@ struct Job {
 /// listener wakes the stub as it wakes a node: at each submission, each piece sent and each answer
 /// taken.
 fn host(doorway: &mut Doorway, jobs: &mut Vec<Job>, object: &Bytes) {
-    while let Some(request) = doorway.take() {
+    while let Some(asked) = doorway.take() {
+        let request = match asked {
+            door::Asked::Op(request) => *request,
+            // The bench signs with the root's key, which the listener looks up nowhere: a key
+            // asked of the stub is none it holds.
+            door::Asked::Key(ask) => {
+                let _ = ask.reply.try_send(door::Signed::Unknown);
+                continue;
+            }
+        };
         let done = |etag: &str| {
             Answer::Head(Box::new(Reply {
                 etag: etag.to_owned(),

@@ -888,7 +888,13 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     doorway: Option<crate::door::Doorway>,
     /// The operation taken from the door that the host had no room for yet: a copy, which counts
     /// as two (`host::weight`), with one slot free. It is taken before any other.
-    door_held: Option<crate::door::Request>,
+    door_held: Option<Box<crate::door::Request>>,
+    /// The requests the door holds at once, and the keys its connections ask for at once: each
+    /// connection asks one key before its operation (`door::KeyAsk`).
+    door_capacity: usize,
+    /// The keys the listener's connections asked for and the node is reading (`host::Lookup`), at
+    /// most `door_capacity`.
+    lookups: Vec<host::Lookup>,
     /// The orderly stop, once begun ([`Node::stop`]).
     stopping: Option<Stopping>,
     /// The ranges whose lead the stop began to hand over, and those it handed over, not yet taken
@@ -1220,6 +1226,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             abandoned: Vec::new(),
             doorway: None,
             door_held: None,
+            door_capacity: 0,
+            lookups: Vec::new(),
             stopping: None,
             handing: Vec::new(),
             handed: Vec::new(),
@@ -1633,6 +1641,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let (doorway, submitter) = crate::door::doorway(capacity, self.waker.clone())
             .map_err(|e| NodeError::Bounds(format!("the S3 listener's door: {e:?}")))?;
         self.doorway = Some(doorway);
+        self.door_capacity = capacity;
         Ok(submitter)
     }
 
@@ -1642,12 +1651,22 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// stopping node, or one that hosts no objects, answers each as it comes.
     fn take_door(&mut self) {
         loop {
-            let Some(request) = self
+            let Some(asked) = self
                 .door_held
                 .take()
+                .map(crate::door::Asked::Op)
                 .or_else(|| self.doorway.as_mut().and_then(crate::door::Doorway::take))
             else {
                 return;
+            };
+            // A key a connection asks before its operation takes no slot of the host's: it is
+            // read at once, the lookups held to the door's bound (`host::take_lookup`).
+            let request = match asked {
+                crate::door::Asked::Op(request) => request,
+                crate::door::Asked::Key(ask) => {
+                    self.take_lookup(ask);
+                    continue;
+                }
             };
             // A copy counts as two of the host's operations (`host::weight`): one the host has no
             // room for waits, the next taken behind it, so the door keeps its order.
@@ -1659,7 +1678,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.door_held = Some(request);
                 return;
             }
-            self.take_local(request);
+            self.take_local(*request);
         }
     }
 

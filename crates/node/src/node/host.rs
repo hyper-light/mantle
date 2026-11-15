@@ -31,6 +31,7 @@ use mantle_meta::apply::Layer;
 use mantle_meta::coordinator::{self, Coordinator, Settled};
 use mantle_meta::key::{NULL_VERSION, parse_version_id};
 use mantle_meta::name::{self, Match, Named, Preconditions};
+use mantle_meta::principal;
 use mantle_meta::record::{
     self, Bucket, BucketState, Descriptor, How, LISTING, Part, RunMd5, Runs, Upload, Version,
     Versioning, WrappedKey, Wrapper,
@@ -53,8 +54,8 @@ use crate::read::{Query, Read};
 use mantle_protocol::bounds;
 use mantle_protocol::classes::Class;
 use mantle_protocol::object::{
-    self, Deleted, Head, Headers, List, Listing, MAX_PAGE_PARTS, Metadata, Op, PartListed, Parts,
-    Progress, Reply, Status, Stored, Target,
+    self, Deleted, Head, Headers, Issued, List, Listing, MAX_PAGE_PARTS, Metadata, Op, PartListed,
+    Parts, Principals, Progress, Reply, Status, Stored, Target,
 };
 
 /// What the gateway host is given (docs/design/node.md §4.6, §5).
@@ -271,6 +272,8 @@ enum Work {
     /// CopyObject or UploadPartCopy: the source read by a `Get`, written by a `Put` (research/89
     /// §3–§4).
     Copy(Box<Copying>),
+    /// An operator's request on the account's principals and their keys.
+    Admin(Box<Administering>),
 }
 
 /// The host's operations an op counts as once taken: a copy two, any other one (`Job::weight`).
@@ -307,6 +310,26 @@ pub(crate) struct Deleting {
     /// Deletes asked and not yet answered.
     out: usize,
     results: Vec<Option<Deleted>>,
+}
+
+impl Deleting {
+    /// The objects at `denied`, which its principal's policy does not let it delete, each
+    /// answered `AccessDenied` in its place, as S3 answers them, its delete never asked
+    /// (research/91 §6).
+    fn deny(&mut self, denied: &[usize]) {
+        for &at in denied {
+            let (Some(target), Some(slot)) = (self.objects.get(at), self.results.get_mut(at))
+            else {
+                continue;
+            };
+            *slot = Some(Deleted {
+                key: target.key.clone(),
+                version: target.version.clone(),
+                status: Status::AccessDenied,
+                marker: None,
+            });
+        }
+    }
 }
 
 /// Where a copy is.
@@ -388,6 +411,43 @@ fn untagged(tag: u64) -> (Driver, u64) {
         Driver::Put
     };
     (driver, tag >> 1)
+}
+
+/// An operator's request on the account's principals and their keys (docs/design/principals.md):
+/// one command of the root range, or one read of it, asked once and replied from its answer. Its
+/// asker is the account's root, as every client of the native protocol is (node.md §3.6).
+pub(crate) struct Administering {
+    asking: Admin,
+    asked: bool,
+    /// A key made: its id and its secret, held until the root range answers and replied once.
+    issued: Option<(String, mantle_s3::account::Secret)>,
+}
+
+/// What an operator's request asks of the root range.
+enum Admin {
+    Command(Box<root::Command>),
+    /// A page of principals, or with `one` the principal asked, whose absence is `NoSuchEntity`.
+    Read {
+        query: Query,
+        one: bool,
+    },
+    /// A key for `principal`: its id and secret drawn and the secret wrapped under the root key's
+    /// current generation at its first turn, then asked as a command.
+    Key {
+        principal: String,
+        rotating: bool,
+    },
+}
+
+/// A principal's key a connection of the S3 listener asked for (`door::KeyAsk`): read from the
+/// root range by ReadIndex, a read that began after the request came, so a key revoked by a
+/// command committed before it is refused at every node; its secret unwrapped under the root
+/// key, and answered on its own channel (docs/design/principals.md).
+pub(crate) struct Lookup {
+    id: String,
+    reply: Sender<door::Signed>,
+    /// The read asked, once the node had room for it.
+    ask: Option<ReadAsk>,
 }
 
 /// A bucket's create or delete, run by its coordinator.
@@ -838,6 +898,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let door::Request {
             op,
             principal,
+            denied,
             body,
             reply,
         } = request;
@@ -850,7 +911,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
             Some(_) => {
                 let block = self.open_block(&op);
-                work(op, Vec::new(), block)
+                let mut made = work(op, Vec::new(), block);
+                if let Work::Deletes(deleting) = &mut made {
+                    deleting.deny(&denied);
+                }
+                made
             }
         };
         self.jobs.push(Job {
@@ -868,6 +933,273 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             deadline_ns: None,
             moved_ns: hyper_rt::futures::now_ns(),
         });
+    }
+
+    /// A key the S3 listener asked for (`door::KeyAsk`): looked up at the next turn, or refused at
+    /// once by a node that hosts no objects (`Failed`), a stopping one, or one holding as many
+    /// lookups as its door holds requests (`SlowDown`): a connection asks one at a time.
+    pub(super) fn take_lookup(&mut self, ask: door::KeyAsk) {
+        let door::KeyAsk { id, reply } = ask;
+        let refused = if self.gateway.is_none() {
+            Some(Status::Failed)
+        } else if self.stopping() || self.lookups.len() >= self.door_capacity {
+            Some(Status::SlowDown)
+        } else {
+            None
+        };
+        if let Some(status) = refused {
+            // A connection gone takes no answer.
+            let _ = reply.try_send(door::Signed::Refused(status));
+            return;
+        }
+        self.lookups.push(Lookup {
+            id,
+            reply,
+            ask: None,
+        });
+    }
+
+    /// The lookups at a turn: each not yet asked read of the root range while the node has room
+    /// for a read, and each answered given its answer.
+    fn step_lookups(&mut self) {
+        let mut at = 0;
+        while let Some(lookup) = self.lookups.get(at) {
+            let answer = match lookup.ask {
+                Some(ask) => take_done(&mut self.reads_done, ask).map(|o| self.signed(o)),
+                None => match self.group_of(Layer::Root) {
+                    None => Some(door::Signed::Refused(Status::Failed)),
+                    Some(group) => {
+                        let query = Query::Signer {
+                            id: lookup.id.clone(),
+                        };
+                        match self.read(group, query, u64::MAX, Wait::Request) {
+                            Ok(ask) => {
+                                if let Some(lookup) = self.lookups.get_mut(at) {
+                                    lookup.ask = Some(ask);
+                                }
+                                None
+                            }
+                            // Asked again at the next turn a read ends.
+                            Err(NodeError::Asks) => None,
+                            Err(_) => Some(door::Signed::Refused(Status::Failed)),
+                        }
+                    }
+                },
+            };
+            match answer {
+                Some(answer) => {
+                    let lookup = self.lookups.swap_remove(at);
+                    let _ = lookup.reply.try_send(answer);
+                }
+                None => at = at.saturating_add(1),
+            }
+        }
+    }
+
+    /// A lookup's answer from its read: the key's principal, its secret unwrapped under the root
+    /// key's generation its row names; none for a key the cell does not hold; refused `SlowDown`
+    /// for a root range without a leader that can serve it within its budget (node.md §5.4), and
+    /// `Failed` for a row that does not open, which is the range's corruption.
+    fn signed(&self, outcome: ReadOutcome) -> door::Signed {
+        let failed = door::Signed::Refused(Status::Failed);
+        let read = match outcome {
+            ReadOutcome::Read(read) => *read,
+            ReadOutcome::Deadline => return door::Signed::Refused(Status::SlowDown),
+            ReadOutcome::Refused(_) => return failed,
+        };
+        let signer = match read {
+            Read::Signer(None) => return door::Signed::Unknown,
+            Read::Signer(Some(signer)) => signer,
+            _ => return failed,
+        };
+        let (row, held) = *signer;
+        let key = self.gateway.as_ref().and_then(|g| {
+            g.keys
+                .iter()
+                .find(|(generation, _)| *generation == row.generation)
+        });
+        let Some((_, key)) = key else {
+            return failed;
+        };
+        match mantle_s3::seal::unwrap_secret(&row.wrapped, key) {
+            Ok(secret) => door::Signed::Principal(Box::new(door::Signer {
+                secret,
+                name: held.name,
+                id: held.id,
+                policy: held.policy,
+            })),
+            Err(_) => failed,
+        }
+    }
+
+    /// An operator's request at its turn: its one command or read of the root range asked, once;
+    /// a key's id and secret drawn and the secret wrapped under the root key's current generation
+    /// first, once, so a turn without room asks the same key again.
+    fn step_admin(&mut self, at: usize) -> Result<bool, NodeError> {
+        let Some(Job {
+            work: Work::Admin(admin),
+            pending,
+            ..
+        }) = self.jobs.get(at)
+        else {
+            return Ok(true);
+        };
+        if !pending.is_empty() || admin.asked {
+            return Ok(false);
+        }
+        if let Admin::Key {
+            principal,
+            rotating,
+        } = &admin.asking
+        {
+            let made = self.issue(principal, *rotating);
+            let Some(Job {
+                work: Work::Admin(admin),
+                ..
+            }) = self.jobs.get_mut(at)
+            else {
+                return Ok(true);
+            };
+            match made {
+                Ok((command, issued)) => {
+                    admin.asking = Admin::Command(Box::new(command));
+                    admin.issued = Some(issued);
+                }
+                Err(status) => {
+                    self.fail_job(at, status)?;
+                    return self.drain_job(at);
+                }
+            }
+        }
+        let Some(group) = self.group_of(Layer::Root) else {
+            self.fail_job(at, Status::Failed)?;
+            return self.drain_job(at);
+        };
+        let asking = match self.jobs.get(at) {
+            Some(Job {
+                work: Work::Admin(admin),
+                ..
+            }) => match &admin.asking {
+                Admin::Command(command) => Ok(Command::Root(command.as_ref().clone())),
+                Admin::Read { query, .. } => Err(query.clone()),
+                Admin::Key { .. } => return Ok(false),
+            },
+            _ => return Ok(true),
+        };
+        let asked = match asking {
+            Ok(command) => self
+                .command(group, command, u64::MAX, Wait::Request)
+                .map(Pending::Command),
+            Err(query) => self
+                .read(group, query, u64::MAX, Wait::Request)
+                .map(Pending::Read),
+        };
+        match asked {
+            Ok(pending) => {
+                if let Some(Job {
+                    work: Work::Admin(admin),
+                    pending: held,
+                    ..
+                }) = self.jobs.get_mut(at)
+                {
+                    held.push((pending, None));
+                    admin.asked = true;
+                }
+                Ok(false)
+            }
+            // Asked again at the next turn, as every ask the node has no room for is.
+            Err(NodeError::Asks) => Ok(false),
+            Err(_) => {
+                self.fail_job(at, Status::Failed)?;
+                self.drain_job(at)
+            }
+        }
+    }
+
+    /// A key for `principal`: its id and secret drawn from the OS, and the command that makes it,
+    /// its secret wrapped under the root key's current generation, the last the node holds
+    /// (encryption.md §2); with the key, to reply once the root range made it.
+    fn issue(
+        &self,
+        principal: &str,
+        rotating: bool,
+    ) -> Result<(root::Command, (String, mantle_s3::account::Secret)), Status> {
+        let (generation, key) = self
+            .gateway
+            .as_ref()
+            .and_then(|g| g.keys.last())
+            .ok_or(Status::Failed)?;
+        let id = mantle_s3::account::draw_id().map_err(|_| Status::Failed)?;
+        let secret = mantle_s3::account::draw_secret().map_err(|_| Status::Failed)?;
+        let wrapped = mantle_s3::seal::wrap_secret(&secret, key).map_err(|_| Status::Failed)?;
+        let command = root::Command::Principal(principal::Command::Key(principal::NewKey {
+            principal: principal.to_owned(),
+            id: id.clone(),
+            generation: *generation,
+            wrapped,
+            rotating,
+            at_ns: 0,
+        }));
+        Ok((command, (id, secret)))
+    }
+
+    /// An operator's request answered by the root range: its reply, IAM's error codes for its
+    /// refusals (research/91 §2), a key made with its id and secret, and a page of principals.
+    fn admin_answered(&mut self, at: usize, outcome: Outcome) -> Result<(), NodeError> {
+        let one = matches!(
+            self.jobs.get(at),
+            Some(Job {
+                work: Work::Admin(admin),
+                ..
+            }) if matches!(admin.asking, Admin::Read { one: true, .. })
+        );
+        let reply = match outcome {
+            Outcome::Command(CommandOutcome::Answered(Answer::Root(root::Outcome::Principal(
+                made,
+            )))) => match made {
+                principal::Outcome::Made
+                | principal::Outcome::Set
+                | principal::Outcome::Removed => Reply::status(Status::Done),
+                principal::Outcome::KeyMade { replacing } => {
+                    let issued = match self.jobs.get_mut(at) {
+                        Some(Job {
+                            work: Work::Admin(admin),
+                            ..
+                        }) => admin.issued.take(),
+                        _ => None,
+                    };
+                    match issued {
+                        Some((id, secret)) => Reply {
+                            listing: Some(Listing::Issued(Box::new(Issued {
+                                id,
+                                secret,
+                                replacing,
+                            }))),
+                            ..Reply::status(Status::Done)
+                        },
+                        None => Reply::status(Status::Failed),
+                    }
+                }
+                principal::Outcome::Taken => Reply::status(Status::EntityAlreadyExists),
+                principal::Outcome::Full => Reply::status(Status::LimitExceeded),
+                principal::Outcome::Unknown => Reply::status(Status::NoSuchEntity),
+                principal::Outcome::Held => Reply::status(Status::DeleteConflict),
+                principal::Outcome::Unrotatable => Reply::status(Status::NothingToRotate),
+                principal::Outcome::Invalid => Reply::status(Status::InvalidArgument),
+            },
+            Outcome::Read(ReadOutcome::Read(read)) => match *read {
+                Read::Principals(page) if one && page.principals.is_empty() => {
+                    Reply::status(Status::NoSuchEntity)
+                }
+                Read::Principals(page) => Reply {
+                    listing: Some(Listing::Principals(page)),
+                    ..Reply::status(Status::Done)
+                },
+                _ => Reply::status(Status::Failed),
+            },
+            _ => Reply::status(Status::Failed),
+        };
+        self.reply_job(at, reply)
     }
 
     /// A job's fields read from its body's start, a piece at a time; once whole, the work they
@@ -988,6 +1320,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// and its bytes written as far as they go, and each one done answered.
     pub(super) fn step_host(&mut self) -> Result<(), NodeError> {
         self.drop_abandoned();
+        self.step_lookups();
         if self.jobs.is_empty() {
             return Ok(());
         }
@@ -1102,6 +1435,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Work::Read(_) => self.step_single(at),
             Work::Deletes(_) => self.step_deletes(at),
             Work::Copy(_) => self.step_copy(at),
+            Work::Admin(_) => self.step_admin(at),
         }
     }
 
@@ -1359,6 +1693,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     }
                 },
             },
+            Work::Admin(_) => return self.admin_answered(at, outcome),
         }
         Ok(())
     }
@@ -2965,6 +3300,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 break;
             }
             let index = deleting.next;
+            // An object answered already, one its principal may not delete, asks nothing.
+            if deleting.results.get(index).is_some_and(Option::is_some) {
+                deleting.next = index.saturating_add(1);
+                continue;
+            }
             let Some(target) = deleting.objects.get(index) else {
                 break;
             };
@@ -3933,7 +4273,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .iter()
             .flat_map(|j| j.pending.iter().map(|(p, _)| p))
             .chain(&self.abandoned);
-        if pending.any(answered) {
+        let looked_up = self
+            .lookups
+            .iter()
+            .filter_map(|l| l.ask)
+            .any(|ask| self.reads_done.iter().any(|(a, _)| *a == ask));
+        if looked_up || pending.any(answered) {
             return Some(shard);
         }
         let wall = self.wall.now_ns();
@@ -4400,6 +4745,67 @@ fn work(op: Op, carry: Vec<u8>, block: Option<u64>) -> Work {
                 (Preconditions::default(), Directive::Copy, Vec::new(), None),
             )
         }
+        Op::CreatePrincipal { name, policy } => administer(|| {
+            let compact = checked_policy(&name, &policy)?;
+            let id = mantle_s3::account::draw_id().map_err(|_| Status::Failed)?;
+            Ok(Admin::Command(Box::new(root::Command::Principal(
+                principal::Command::Create(principal::NewPrincipal {
+                    name,
+                    id,
+                    policy: compact,
+                    at_ns: 0,
+                }),
+            ))))
+        }),
+        Op::PutPolicy { name, policy } => administer(|| {
+            let compact = checked_policy(&name, &policy)?;
+            Ok(Admin::Command(Box::new(root::Command::Principal(
+                principal::Command::Policy {
+                    name,
+                    policy: compact,
+                },
+            ))))
+        }),
+        Op::DeletePrincipal { name } => administer(|| {
+            Ok(Admin::Command(Box::new(root::Command::Principal(
+                principal::Command::Delete { name },
+            ))))
+        }),
+        // No principal asked: an empty page, nothing read.
+        Op::ListPrincipals { max: 0, .. } => Work::Draining(Box::new(Reply {
+            listing: Some(Listing::Principals(Principals::default())),
+            ..Reply::status(Status::Done)
+        })),
+        Op::ListPrincipals { after, max } => administer(|| {
+            let most = u32::try_from(object::MAX_PAGE_PRINCIPALS).unwrap_or(u32::MAX);
+            Ok(Admin::Read {
+                query: Query::Principals {
+                    after,
+                    max: max.min(most),
+                },
+                one: false,
+            })
+        }),
+        Op::GetPrincipal { name } => administer(|| {
+            Ok(Admin::Read {
+                query: Query::Principal { name },
+                one: true,
+            })
+        }),
+        Op::CreateKey {
+            principal,
+            rotating,
+        } => administer(|| {
+            Ok(Admin::Key {
+                principal,
+                rotating,
+            })
+        }),
+        Op::RevokeKey { id } => administer(|| {
+            Ok(Admin::Command(Box::new(root::Command::Principal(
+                principal::Command::Revoke { id },
+            ))))
+        }),
     }
 }
 
@@ -4453,6 +4859,30 @@ fn copying(
         file: 0,
         stored: None,
     }))
+}
+
+/// An operator's request as work: what it asks, or the reply that refuses it at once.
+fn administer(asking: impl FnOnce() -> Result<Admin, Status>) -> Work {
+    match asking() {
+        Ok(asking) => Work::Admin(Box::new(Administering {
+            asking,
+            asked: false,
+            issued: None,
+        })),
+        Err(status) => Work::Draining(Box::new(Reply::status(status))),
+    }
+}
+
+/// A principal's name and identity policy as the root range keeps them: the name in IAM's form,
+/// `InvalidArgument` otherwise, and the policy checked as IAM checks a user's, its compact form,
+/// `MalformedPolicy` otherwise (`mantle_s3::policy::identity`; research/91 §2, §3).
+fn checked_policy(name: &str, policy: &str) -> Result<String, Status> {
+    if !mantle_s3::account::valid_name(name) {
+        return Err(Status::InvalidArgument);
+    }
+    mantle_s3::policy::identity(policy.as_bytes())
+        .map(|(_, compact)| compact)
+        .map_err(|_| Status::MalformedPolicy)
 }
 
 fn getting(

@@ -1429,6 +1429,190 @@ pub const ACTIONS: [Action; 106] = [
     },
 ];
 
+/// The actions on no resource at all, whose statements name the resource `*`: an identity
+/// policy's to grant, never a bucket policy's, in the order of their names without regard to
+/// case.
+pub const ACCOUNT_ACTIONS: [Action; 15] = [
+    Action {
+        name: "CreateJob",
+        kind: Kind::Account,
+        keys: &[
+            "s3:RequestJobOperation",
+            "s3:RequestJobPriority",
+            "s3:ResourceAccount",
+            "s3:TlsVersion",
+            "s3:authType",
+            "s3:signatureAge",
+            "s3:signatureversion",
+            "s3:x-amz-content-sha256",
+        ],
+    },
+    Action {
+        name: "CreateStorageLensGroup",
+        kind: Kind::Account,
+        keys: &[
+            "s3:ResourceAccount",
+            "s3:TlsVersion",
+            "s3:authType",
+            "s3:signatureAge",
+            "s3:signatureversion",
+            "s3:x-amz-content-sha256",
+        ],
+    },
+    Action {
+        name: "GetAccessPoint",
+        kind: Kind::Account,
+        keys: &[
+            "s3:AccessPointNetworkOrigin",
+            "s3:AccessPointTag/${TagKey}",
+            "s3:DataAccessPointAccount",
+            "s3:DataAccessPointArn",
+            "s3:ResourceAccount",
+            "s3:TlsVersion",
+            "s3:authType",
+            "s3:signatureAge",
+            "s3:signatureversion",
+            "s3:x-amz-content-sha256",
+        ],
+    },
+    Action {
+        name: "GetAccountPublicAccessBlock",
+        kind: Kind::Account,
+        keys: &[
+            "s3:ResourceAccount",
+            "s3:TlsVersion",
+            "s3:authType",
+            "s3:signatureAge",
+            "s3:signatureversion",
+            "s3:x-amz-content-sha256",
+        ],
+    },
+    Action {
+        name: "ListAccessGrantsInstances",
+        kind: Kind::Account,
+        keys: &[
+            "s3:ResourceAccount",
+            "s3:TlsVersion",
+            "s3:authType",
+            "s3:signatureAge",
+            "s3:signatureversion",
+            "s3:x-amz-content-sha256",
+        ],
+    },
+    Action {
+        name: "ListAccessPoints",
+        kind: Kind::Account,
+        keys: &[
+            "s3:ResourceAccount",
+            "s3:TlsVersion",
+            "s3:authType",
+            "s3:signatureAge",
+            "s3:signatureversion",
+            "s3:x-amz-content-sha256",
+        ],
+    },
+    Action {
+        name: "ListAccessPointsForObjectLambda",
+        kind: Kind::Account,
+        keys: &[
+            "s3:ResourceAccount",
+            "s3:TlsVersion",
+            "s3:authType",
+            "s3:signatureAge",
+            "s3:signatureversion",
+            "s3:x-amz-content-sha256",
+        ],
+    },
+    Action {
+        name: "ListAllMyBuckets",
+        kind: Kind::Account,
+        keys: &[
+            "s3:ResourceAccount",
+            "s3:TlsVersion",
+            "s3:authType",
+            "s3:signatureAge",
+            "s3:signatureversion",
+            "s3:x-amz-content-sha256",
+        ],
+    },
+    Action {
+        name: "ListJobs",
+        kind: Kind::Account,
+        keys: &[
+            "s3:ResourceAccount",
+            "s3:TlsVersion",
+            "s3:authType",
+            "s3:signatureAge",
+            "s3:signatureversion",
+            "s3:x-amz-content-sha256",
+        ],
+    },
+    Action {
+        name: "ListMultiRegionAccessPoints",
+        kind: Kind::Account,
+        keys: &[
+            "s3:ResourceAccount",
+            "s3:TlsVersion",
+            "s3:authType",
+            "s3:signatureAge",
+            "s3:signatureversion",
+        ],
+    },
+    Action {
+        name: "ListStorageLensConfigurations",
+        kind: Kind::Account,
+        keys: &[
+            "s3:ResourceAccount",
+            "s3:TlsVersion",
+            "s3:authType",
+            "s3:signatureAge",
+            "s3:signatureversion",
+            "s3:x-amz-content-sha256",
+        ],
+    },
+    Action {
+        name: "ListStorageLensGroups",
+        kind: Kind::Account,
+        keys: &[
+            "s3:ResourceAccount",
+            "s3:TlsVersion",
+            "s3:authType",
+            "s3:signatureAge",
+            "s3:signatureversion",
+            "s3:x-amz-content-sha256",
+        ],
+    },
+    Action {
+        name: "PutAccessPointPublicAccessBlock",
+        kind: Kind::Account,
+        keys: &[],
+    },
+    Action {
+        name: "PutAccountPublicAccessBlock",
+        kind: Kind::Account,
+        keys: &[
+            "s3:ResourceAccount",
+            "s3:TlsVersion",
+            "s3:authType",
+            "s3:signatureAge",
+            "s3:signatureversion",
+            "s3:x-amz-content-sha256",
+        ],
+    },
+    Action {
+        name: "PutStorageLensConfiguration",
+        kind: Kind::Account,
+        keys: &[
+            "s3:ResourceAccount",
+            "s3:TlsVersion",
+            "s3:authType",
+            "s3:signatureAge",
+            "s3:signatureversion",
+            "s3:x-amz-content-sha256",
+        ],
+    },
+];
+
 /// S3's condition keys and their types; a name ending `/<key>` or `/${TagKey}` names a
 /// family, one key for each tag key.
 pub const KEYS: [(&str, KeyType); 61] = [

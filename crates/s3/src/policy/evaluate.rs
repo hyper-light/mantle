@@ -11,6 +11,13 @@ pub enum Requester<'a> {
     Anonymous,
     /// An account: its 12-digit ID, as a policy names it, and its canonical user ID.
     Account { id: &'a str, canonical: &'a str },
+    /// A principal of an account, as IAM has a user (research/91 §1): the account, the
+    /// principal's name and its unique ID, never reused.
+    User {
+        account: &'a str,
+        name: &'a str,
+        id: &'a str,
+    },
 }
 
 /// A request as a policy judges it.
@@ -35,9 +42,10 @@ impl Request<'_> {
     }
 }
 
-/// The keys that describe the requester, as IAM gives them for an account's root and for an
-/// anonymous caller (17 §3.4, §5): `aws:PrincipalAccount`, `aws:PrincipalType` and
-/// `aws:userid` for every request, and `aws:PrincipalArn` for a signed one.
+/// The keys that describe the requester, as IAM gives them for an account's root, a user and an
+/// anonymous caller (17 §3.4, §5; research/91 §3): `aws:PrincipalAccount`, `aws:PrincipalType`
+/// and `aws:userid` for every request, `aws:PrincipalArn` for a signed one, and `aws:username`
+/// for a user's, "not present" for the others.
 pub fn principal_keys(requester: Requester<'_>) -> Vec<(String, Vec<String>)> {
     let key = |name: &str, value: String| (name.to_owned(), vec![value]);
     match requester {
@@ -52,7 +60,28 @@ pub fn principal_keys(requester: Requester<'_>) -> Vec<(String, Vec<String>)> {
             key("aws:principaltype", "Account".to_owned()),
             key("aws:userid", id.to_owned()),
         ],
+        Requester::User { account, name, id } => vec![
+            key("aws:principalaccount", account.to_owned()),
+            key("aws:principalarn", user_arn(account, name)),
+            key("aws:principaltype", "User".to_owned()),
+            key("aws:userid", id.to_owned()),
+            key("aws:username", name.to_owned()),
+        ],
     }
+}
+
+/// A user's ARN, `arn:aws:iam::ACCOUNT:user/NAME`, as IAM names one (research/91 §1).
+pub fn user_arn(account: &str, name: &str) -> String {
+    format!("arn:aws:iam::{account}:user/{name}")
+}
+
+/// Whether a principal's identity policy lets `request` go ahead, its requester the principal:
+/// "An explicit deny in any of the policies overrides the allow", and "A user must have permission
+/// from the parent account to perform the operation", the user context S3 judges first; no
+/// bucket's policy is served beside it, so the bucket context, the account's own, adds nothing
+/// (research/91 §3).
+pub fn permits(policy: &Policy, request: &Request<'_>) -> bool {
+    policy.identity && policy.verdict(request) == Verdict::Allow
 }
 
 /// What a policy's statements say of a request.
@@ -96,7 +125,9 @@ impl Policy {
         let named_resource = statement.resources.iter().any(|pattern| {
             tokens(pattern, variables).is_some_and(|p| matches(&p, request.resource))
         });
-        principal(&statement.principals, request.requester)
+        // An identity policy's statements apply to the identity it is attached to (research/91
+        // §3).
+        (self.identity || principal(&statement.principals, request.requester))
             && named_action != statement.not_action
             && named_resource != statement.not_resource
             && statement
@@ -122,6 +153,10 @@ impl Policy {
 /// - under RestrictPublicBuckets, a public policy grants nothing outside the owner's account:
 ///   "This setting also rejects all anonymous (or unsigned) calls", and "Any denial resulting
 ///   from the `RestrictPublicBuckets` setting is explicit".
+///
+/// It judges an account's root and the anonymous requester. A principal's request is judged by
+/// its identity policy ([`permits`]); bucket policies are not served beside principals yet, and
+/// how the two combine for a user, its account's delegation included, is theirs to settle.
 pub fn authorize(
     owner: &str,
     policy: Option<&Policy>,
@@ -146,7 +181,9 @@ pub fn authorize(
     }
 }
 
-/// Whether a statement's `Principal` names the requester, or its `NotPrincipal` does not.
+/// Whether a statement's `Principal` names the requester, or its `NotPrincipal` does not. A user
+/// is named by `*` and by its account, as an account principal "delegate[s] permissions to the
+/// account" (research/91 §3); a bucket policy names no user by its ARN yet (`policy::parse`).
 fn principal(principals: &Principals, requester: Requester<'_>) -> bool {
     let named = principals.everyone
         || match requester {
@@ -155,6 +192,7 @@ fn principal(principals: &Principals, requester: Requester<'_>) -> bool {
                 principals.accounts.iter().any(|account| account == id)
                     || principals.canonical.iter().any(|user| user == canonical)
             }
+            Requester::User { account, .. } => principals.accounts.iter().any(|a| a == account),
         };
     named != principals.not
 }
@@ -973,5 +1011,218 @@ mod tests {
             context: &[],
         };
         assert!(authorize(OWNER, Some(&named), Some(&restricted), &request));
+    }
+
+    const RUNNER: Requester<'static> = Requester::User {
+        account: OWNER,
+        name: "runner-7",
+        id: "AIDAEXAMPLEEXAMPLEXX",
+    };
+
+    fn identity(statements: &str) -> Policy {
+        crate::policy::identity(
+            format!("{{\"Version\": \"2012-10-17\", \"Statement\": [{statements}]}}").as_bytes(),
+        )
+        .unwrap()
+        .0
+    }
+
+    /// What a principal's request is judged with: its own keys and the request's.
+    fn user_may(policy: &Policy, action: &str, resource: &str, extra: &[(&str, &[&str])]) -> bool {
+        let mut keys = principal_keys(RUNNER);
+        keys.extend(context(extra));
+        permits(
+            policy,
+            &Request {
+                requester: RUNNER,
+                action,
+                resource,
+                context: &keys,
+            },
+        )
+    }
+
+    /// A user's keys are IAM's for an IAM user (research/91 §3): its name, its unique ID, its ARN
+    /// and the type `User`.
+    #[test]
+    fn a_users_keys_are_iams() {
+        let keys = principal_keys(RUNNER);
+        let value = |key: &str| {
+            keys.iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, values)| values.clone())
+        };
+        assert_eq!(value("aws:username"), Some(vec!["runner-7".to_owned()]));
+        assert_eq!(
+            value("aws:userid"),
+            Some(vec!["AIDAEXAMPLEEXAMPLEXX".to_owned()])
+        );
+        assert_eq!(
+            value("aws:principalarn"),
+            Some(vec!["arn:aws:iam::111111111111:user/runner-7".to_owned()])
+        );
+        assert_eq!(value("aws:principaltype"), Some(vec!["User".to_owned()]));
+        assert_eq!(value("aws:principalaccount"), Some(vec![OWNER.to_owned()]));
+        assert_eq!(value("aws:username"), Some(vec!["runner-7".to_owned()]));
+        assert_eq!(
+            principal_keys(OWNING)
+                .iter()
+                .find(|(name, _)| name == "aws:username"),
+            None,
+            "a root has no user name"
+        );
+    }
+
+    /// A prefix-scoped grant as IAM's own example writes one (research/91 §3): listing under the
+    /// prefix and its objects' reads and writes go ahead, and nothing else does, whatever the
+    /// bucket's owner is.
+    #[test]
+    fn a_prefix_scoped_grant_admits_exactly_its_prefix() {
+        let marketing = identity(
+            r#"{"Effect": "Allow", "Action": ["s3:ListBucket"],
+                "Resource": ["arn:aws:s3:::bucket"],
+                "Condition": {"StringLike": {"s3:prefix": ["marketing/*"]}}},
+               {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"],
+                "Resource": ["arn:aws:s3:::bucket/marketing/*"]}"#,
+        );
+        let bucket = "arn:aws:s3:::bucket";
+        assert!(user_may(
+            &marketing,
+            "s3:ListBucket",
+            bucket,
+            &[("s3:prefix", &["marketing/2026/"])]
+        ));
+        assert!(!user_may(
+            &marketing,
+            "s3:ListBucket",
+            bucket,
+            &[("s3:prefix", &["sales/"])]
+        ));
+        // A listing without a prefix asks the whole bucket: the key is absent, StringLike fails.
+        assert!(!user_may(&marketing, "s3:ListBucket", bucket, &[]));
+        for action in ["s3:GetObject", "s3:PutObject"] {
+            assert!(user_may(
+                &marketing,
+                action,
+                "arn:aws:s3:::bucket/marketing/a/b",
+                &[]
+            ));
+            assert!(!user_may(
+                &marketing,
+                action,
+                "arn:aws:s3:::bucket/sales/a",
+                &[]
+            ));
+            assert!(!user_may(
+                &marketing,
+                action,
+                "arn:aws:s3:::other/marketing/a",
+                &[]
+            ));
+        }
+        assert!(!user_may(
+            &marketing,
+            "s3:DeleteObject",
+            "arn:aws:s3:::bucket/marketing/a",
+            &[]
+        ));
+        assert!(!user_may(
+            &marketing,
+            "s3:CreateBucket",
+            "arn:aws:s3:::marketing",
+            &[]
+        ));
+        assert!(!user_may(
+            &marketing,
+            "s3:ListAllMyBuckets",
+            crate::policy::ACCOUNT_RESOURCE,
+            &[]
+        ));
+    }
+
+    /// IAM's evaluation (research/91 §3): a deny that applies wins over every allow, a request no
+    /// statement allows is denied, and a variable stands for the user's own key.
+    #[test]
+    fn a_deny_wins_and_nothing_unallowed_goes_ahead() {
+        let carlos = identity(
+            r#"{"Effect": "Allow", "Action": "s3:*", "Resource": ["arn:aws:s3:::*"]},
+               {"Effect": "Deny", "Action": "s3:*", "Resource": "arn:aws:s3:::*log*"}"#,
+        );
+        assert!(user_may(
+            &carlos,
+            "s3:PutObject",
+            "arn:aws:s3:::data/k",
+            &[]
+        ));
+        assert!(!user_may(
+            &carlos,
+            "s3:PutObject",
+            "arn:aws:s3:::data-logs/k",
+            &[]
+        ));
+        assert!(!user_may(
+            &carlos,
+            "s3:ListBucket",
+            "arn:aws:s3:::logs",
+            &[]
+        ));
+
+        let home = identity(
+            r#"{"Effect": "Allow", "Action": "s3:*",
+                "Resource": "arn:aws:s3:::bucket/home/${aws:username}/*"}"#,
+        );
+        assert!(user_may(
+            &home,
+            "s3:GetObject",
+            "arn:aws:s3:::bucket/home/runner-7/x",
+            &[]
+        ));
+        assert!(!user_may(
+            &home,
+            "s3:GetObject",
+            "arn:aws:s3:::bucket/home/runner-8/x",
+            &[]
+        ));
+
+        // A bucket policy's verdict is no identity's: `permits` judges identity policies alone.
+        let bucket = policy(
+            r#"{"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::bucket/*"}"#,
+        );
+        assert!(!user_may(
+            &bucket,
+            "s3:GetObject",
+            "arn:aws:s3:::bucket/k",
+            &[]
+        ));
+    }
+
+    /// The actions on no resource are granted by `*` and by `arn:aws:s3:::*`, as AWS's own examples
+    /// grant `s3:ListAllMyBuckets`, and by no bucket's ARN (research/91 §3).
+    #[test]
+    fn listing_the_buckets_is_granted_on_the_whole_namespace_alone() {
+        let all = crate::policy::ACCOUNT_RESOURCE;
+        for granted in [r#""*""#, r#""arn:aws:s3:::*""#] {
+            let policy = identity(&format!(
+                r#"{{"Effect": "Allow", "Action": "s3:ListAllMyBuckets", "Resource": {granted}}}"#
+            ));
+            assert!(
+                user_may(&policy, "s3:ListAllMyBuckets", all, &[]),
+                "{granted}"
+            );
+        }
+        for refused in [
+            r#""arn:aws:s3:::bucket""#,
+            r#""arn:aws:s3:::*/*""#,
+            r#""arn:aws:s3:::b*""#,
+        ] {
+            let policy = identity(&format!(
+                r#"{{"Effect": "Allow", "Action": "s3:ListAllMyBuckets", "Resource": {refused}}}"#
+            ));
+            assert!(
+                !user_may(&policy, "s3:ListAllMyBuckets", all, &[]),
+                "{refused}"
+            );
+        }
     }
 }

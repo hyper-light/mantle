@@ -7,6 +7,11 @@
 //! [`Answer`]: its head, then a get's bytes, on a bounded channel the connection drains to its
 //! socket, so the host writes no faster than the client reads. Each send wakes the other side's
 //! task: the node's, whose turn takes what came, through the waker the doorway holds.
+//!
+//! Before its operation, a request signed with a principal's key asks the node for that key
+//! ([`KeyAsk`]): the node reads the key's row and its principal's from the root range by
+//! ReadIndex and unwraps the key's secret under the root key, so the connection checks the
+//! signature against what the cell holds as the request arrives (docs/design/principals.md).
 
 use std::task::Waker;
 
@@ -17,11 +22,50 @@ use mantle_s3::checksum::Checksum;
 
 use mantle_protocol::object::{Op, Reply, Status};
 
+/// What the listener hands the node: an operation, boxed as the larger of the two, or a key to look
+/// up.
+pub enum Asked {
+    Op(Box<Request>),
+    Key(KeyAsk),
+}
+
+/// A principal's access key a request is signed with, asked of the node before the request's
+/// signature is checked; the answer comes on `reply`, which holds one.
+pub struct KeyAsk {
+    pub id: String,
+    pub reply: Sender<Signed>,
+}
+
+/// What the node answers a key's lookup.
+pub enum Signed {
+    /// The key is a principal's: what its requests are judged by.
+    Principal(Box<Signer>),
+    /// The cell holds no such key, or held it once and it was revoked: S3's
+    /// `InvalidAccessKeyId`.
+    Unknown,
+    /// The lookup was not answered: a stopping node or a root range without a leader that can
+    /// serve it (`SlowDown`), or the root range's rows failing (`Failed`).
+    Refused(Status),
+}
+
+/// A principal's key as the root range holds it, its secret unwrapped: the secret, wiped when
+/// dropped, and the principal's name, unique ID and identity policy's compact form.
+pub struct Signer {
+    pub secret: mantle_s3::account::Secret,
+    pub name: String,
+    pub id: String,
+    pub policy: String,
+}
+
 /// An operation the listener hands the host.
 pub struct Request {
     pub op: Op,
     /// Who asks: the account its access key acts for (`mantle init`).
     pub principal: String,
+    /// The places of a DeleteObjects' objects its principal's identity policy does not let it
+    /// delete, each answered `AccessDenied` in its place, its delete never asked (research/91 §6);
+    /// none for any other operation, and none of the root's. At most the objects it names.
+    pub denied: Vec<usize>,
     /// The request's body, as the connection reads it.
     pub body: ChannelReceiver<Piece>,
     /// The reply, as the host writes it.
@@ -61,13 +105,13 @@ pub enum Answer {
 /// The node's end of its door: the requests the listener submits, and the waker that turns the
 /// node to take them.
 pub struct Doorway {
-    requests: ChannelReceiver<Request>,
+    requests: ChannelReceiver<Asked>,
 }
 
 /// The listener's end: where it submits requests, and the waker of the node that takes them.
 #[derive(Clone)]
 pub struct Submitter {
-    requests: Sender<Request>,
+    requests: Sender<Asked>,
     node: Waker,
 }
 
@@ -80,7 +124,7 @@ pub fn doorway(capacity: usize, node: Waker) -> Result<(Doorway, Submitter), RtE
 
 impl Doorway {
     /// The next request submitted, if one waits; none too once the listener is gone.
-    pub fn take(&mut self) -> Option<Request> {
+    pub fn take(&mut self) -> Option<Asked> {
         self.requests.try_recv().ok().flatten()
     }
 }
@@ -98,7 +142,16 @@ impl Submitter {
     /// Submits `request` and turns the node to take it; refused when the door holds as many as
     /// it takes or the node is gone, the request dropped.
     pub fn submit(&self, request: Request) -> Result<(), Refusal> {
-        match self.requests.try_send(request) {
+        self.send(Asked::Op(Box::new(request)))
+    }
+
+    /// Asks the node for a key, as [`Submitter::submit`] hands it an operation.
+    pub fn look_up(&self, ask: KeyAsk) -> Result<(), Refusal> {
+        self.send(Asked::Key(ask))
+    }
+
+    fn send(&self, asked: Asked) -> Result<(), Refusal> {
+        match self.requests.try_send(asked) {
             Ok(()) => {
                 self.node.wake_by_ref();
                 Ok(())

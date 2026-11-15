@@ -1,7 +1,7 @@
 # 91. Principals and their keys: IAM users, access keys and identity policies
 
 Status: research note, 2026-11-14. For a cell's principals, their access keys and their identity
-policies (docs/design/principals.md). Sources [1] to [16] were read from AWS's documentation on
+policies (docs/design/principals.md). Sources [1] to [20] were read from AWS's documentation on
 2026-11-14, each quoted as it was read; research/17 holds the policy language and its evaluation
 for bucket policies, research/05 S3's error codes, research/84 the forms an access key takes.
 
@@ -145,6 +145,46 @@ computing model called eventual consistency. Any changes that you make in IAM ..
 become visible from all possible endpoints. ... IAM also uses caching to improve performance, but in
 some cases this can add time."
 
+[17] S3 API Reference, CopyObject, https://docs.aws.amazon.com/AmazonS3/latest/API/API_CopyObject.html,
+read 2026-11-14, "Permissions": "If the source object is in a general purpose bucket, you must have
+`s3:GetObject` permission to read the source object that is being copied. If the destination bucket
+is a general purpose bucket, you must have `s3:PutObject` permission to write the object copy to the
+destination bucket." "To copy a different version, use the `versionId` query parameter.
+Specifically, append `?versionId=<version-id>` to the value".
+
+[18] S3 API Reference, UploadPartCopy,
+https://docs.aws.amazon.com/AmazonS3/latest/API/API_UploadPartCopy.html, read 2026-11-14,
+"Permissions": "You must have `READ` access to the source object and `WRITE` access to the
+destination bucket." "If the source object is in a general purpose bucket, you must have the
+`s3:GetObject` permission to read the source object that is being copied. If the destination bucket
+is a general purpose bucket, you must have the `s3:PutObject` permission to write the object copy
+to the destination bucket."
+
+[19] S3 API Reference, DeleteObjects,
+https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html, read 2026-11-14: "For each
+key, Amazon S3 performs a delete operation and returns the result of that delete, success or
+failure, in the response." "`s3:DeleteObject` - To delete an object from a bucket, you must always
+specify the `s3:DeleteObject` permission. `s3:DeleteObjectVersion` - To delete a specific version
+of an object from a versioning-enabled bucket, you must specify the `s3:DeleteObjectVersion`
+permission." Its example "Multi-object delete resulting in mixed success/error response": "the
+requester does not have permission to delete the `sample2.txt` object", answered `<Deleted>`
+`<Key>sample1.txt</Key>` and `<Error><Key>sample2.txt</Key><Code>AccessDenied</Code><Message>Access
+Denied</Message></Error>`.
+
+[20] S3 User Guide, "Required permissions for Amazon S3 API operations",
+https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-with-s3-policy-actions.html, read
+2026-11-14. CopyObject, "For source object: (Required) Either `s3:GetObject` or
+`s3:GetObjectVersion`": "`s3:GetObject` – Required if you want to copy an object from the source
+bucket without specifying `versionId` in the request." "`s3:GetObjectVersion` – Required if you want
+to copy a specific version of an object from the source bucket by specifying `versionId` in the
+request."; "For destination object: (Required) `s3:PutObject`"; "(Conditionally required)
+`s3:PutObjectTagging` | Required if you want to put the copied object with object tagging to the
+destination bucket". UploadPartCopy: the same for its source; "For destination part: (Required)
+`s3:PutObject`". DeleteObjects: "(Required) Either `s3:DeleteObject` or `s3:DeleteObjectVersion`":
+"`s3:DeleteObject` – Required if you want to remove an object without specifying `versionId` in the
+request." "`s3:DeleteObjectVersion` – Required if you want to remove a specific version of an
+object by specifying `versionId` in the request."
+
 ## What the sources settle
 
 ### §1 A principal is an IAM user of the cell's account
@@ -202,3 +242,17 @@ consistent and cached [16]; nothing in IAM makes a revoked key fail everywhere a
   cell serves S3 alone and the statement would grant nothing; IAM keeps such a statement.
 - *Not offered*: paths, groups, managed policies, roles, federation and temporary credentials, and
   IAM's own Query API; principals are managed by the operator's commands over the native protocol.
+
+### §6 Operations on more than one object
+
+A copy reads one object and writes another, and is judged on both: `s3:PutObject` on its
+destination and `s3:GetObject` on its source, CopyObject [17] and UploadPartCopy [18] alike; a
+source named by its version asks `s3:GetObjectVersion` instead [20], so a principal let read only a
+key's current version copies no older one. A copy that sets tags would ask `s3:PutObjectTagging`
+too [20]; a cell keeps no tags, refuses a copy that sets them, and copies a source's empty set, so
+none is asked. A DeleteObjects is each of its keys' deletes [19]: each judged as a delete of its own,
+`s3:DeleteObjectVersion` where its entry names a version and `s3:DeleteObject` otherwise [20], and
+a key its principal may not delete answered `AccessDenied` in its place, the others deleted, as
+[19]'s own example answers. [19] says `s3:DeleteObject` is "always" needed and [20] that a
+version's delete needs `s3:DeleteObjectVersion` in its place; a cell follows [20]'s per-operation
+table, as its DeleteObject does (research/17), so a version's delete asks the version form alone.

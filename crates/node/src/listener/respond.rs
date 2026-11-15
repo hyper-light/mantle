@@ -278,6 +278,34 @@ pub fn refusal(status: Status) -> Refused {
             "The range value must use the form bytes=first-last, where the first and last are \
              the zero-based byte offsets to copy.",
         ),
+        // An operator's refusals on the account's principals, which only the native door asks
+        // (docs/design/principals.md): IAM's codes and statuses (research/91 §2).
+        Status::EntityAlreadyExists => (
+            "EntityAlreadyExists",
+            409,
+            "A principal of that name exists.",
+        ),
+        Status::NoSuchEntity => ("NoSuchEntity", 404, "No such principal or access key."),
+        Status::LimitExceeded => (
+            "LimitExceeded",
+            409,
+            "The account holds 5,000 principals, or the principal two keys.",
+        ),
+        Status::DeleteConflict => (
+            "DeleteConflict",
+            409,
+            "The principal holds access keys, which are revoked first.",
+        ),
+        Status::MalformedPolicy => (
+            "MalformedPolicyDocument",
+            400,
+            "The policy document is malformed.",
+        ),
+        Status::NothingToRotate => (
+            "NoSuchEntity",
+            404,
+            "The principal holds no access key to rotate.",
+        ),
     };
     Refused::new(code, http, message)
 }

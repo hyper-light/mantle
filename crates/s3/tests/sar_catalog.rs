@@ -39,8 +39,22 @@ fn the_catalog_is_the_references() {
     let document = document();
     assert_eq!(text(document.member("Version").unwrap()), "v1.4");
     let mut expected: Vec<(String, Kind, Vec<String>)> = Vec::new();
+    // The actions on no resource at all, which only an identity policy names (research/91 §3).
+    let mut accounts: Vec<(String, Kind, Vec<String>)> = Vec::new();
     for action in list(document.member("Actions")) {
-        let kinds: Vec<Kind> = list(action.member("Resources"))
+        let mut keys: Vec<String> = list(action.member("ActionConditionKeys"))
+            .iter()
+            .map(|key| text(key).to_owned())
+            .filter(|key| key.starts_with("s3:"))
+            .collect();
+        keys.sort();
+        let name = text(action.member("Name").unwrap()).to_owned();
+        let resources = list(action.member("Resources"));
+        if resources.is_empty() {
+            accounts.push((name, Kind::Account, keys));
+            continue;
+        }
+        let kinds: Vec<Kind> = resources
             .iter()
             .filter_map(|resource| match text(resource.member("Name").unwrap()) {
                 "bucket" => Some(Kind::Bucket),
@@ -52,26 +66,24 @@ fn the_catalog_is_the_references() {
             assert!(kinds.is_empty(), "{action:?}");
             continue;
         };
-        let mut keys: Vec<String> = list(action.member("ActionConditionKeys"))
-            .iter()
-            .map(|key| text(key).to_owned())
-            .filter(|key| key.starts_with("s3:"))
-            .collect();
-        keys.sort();
-        expected.push((text(action.member("Name").unwrap()).to_owned(), *kind, keys));
+        expected.push((name, *kind, keys));
     }
     expected.sort_by_key(|(name, _, _)| name.to_ascii_lowercase());
-    let actual: Vec<(String, Kind, Vec<String>)> = catalog::ACTIONS
-        .iter()
-        .map(|action| {
-            (
-                action.name.to_owned(),
-                action.kind,
-                action.keys.iter().map(|key| (*key).to_owned()).collect(),
-            )
-        })
-        .collect();
-    assert_eq!(actual, expected);
+    accounts.sort_by_key(|(name, _, _)| name.to_ascii_lowercase());
+    let listed = |actions: &[mantle_s3::policy::Action]| -> Vec<(String, Kind, Vec<String>)> {
+        actions
+            .iter()
+            .map(|action| {
+                (
+                    action.name.to_owned(),
+                    action.kind,
+                    action.keys.iter().map(|key| (*key).to_owned()).collect(),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(listed(&catalog::ACTIONS), expected);
+    assert_eq!(listed(&catalog::ACCOUNT_ACTIONS), accounts);
 
     let mut keys: Vec<(String, KeyType)> = list(document.member("ConditionKeys"))
         .iter()

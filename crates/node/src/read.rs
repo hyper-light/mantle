@@ -25,6 +25,9 @@
 //! | a version of a key a request names, of a Name range (research/89 §2.1) | kind 13; the bucket's and the key's lengths (u32) each before its bytes; 0 for the null version, or 1 and the version's order (u64) | as the current version's answer |
 //! | a page of ListObjectVersions, of a Name range (research/89 §2.3) | kind 14; the listing's request as an object's request carries it (`mantle_protocol::object`) | 1, then the page as an object's reply carries it; 2 when the bucket has no gate here, or a condemned one |
 //! | the mark of a write, of a Name range (research/89 §3.6) | kind 15; the bucket's and the key's lengths (u32) each before its bytes; the write's file or ID (u128) | 0 for none; 1, then the mark (`mantle_meta::record::Mark`); 2 when the bucket has no gate here, or a condemned one |
+//! | an access key and its principal, of the root range (docs/design/principals.md) | kind 16; the key's id | 0 for none; 1, the key's row (`AccessKeyRow`) and the principal's (`Principal`), each behind its length (u32) |
+//! | a principal, its policy and its keys, of the root range | kind 17; the principal's name | a page of principals as an object's reply carries it, of none or the one |
+//! | a page of principals, of the root range | kind 18; the principal after which the page starts (optional: a byte, 0 or 1, before it) and the most principals (u32) | the page as an object's reply carries it, no policy in it |
 //!
 //! A read is answered only by a range of the layer whose rows it reads (`Query::layer`). A page
 //! holds as many volumes as a reply carries, each counted at the longest domain, so it fits
@@ -43,18 +46,19 @@ use mantle_meta::engine::Rows;
 use mantle_meta::error::MetaError;
 use mantle_meta::name::{self, Named, Probe, Routed, Scan};
 use mantle_meta::record::{
-    BlockHeader, Bucket, ChunkPlace, Extent, FileHeader, Gate, GateState, Lineage, Mark, Part,
-    Upload, Version,
+    AccessKeyRow, BlockHeader, Bucket, ChunkPlace, Extent, FileHeader, Gate, GateState, Lineage,
+    Mark, Part, Principal, Upload, Version,
 };
 use mantle_meta::root::{self, MAX_DOMAIN, Placed};
 use mantle_meta::wire::{MAX_BUCKET, MAX_KEY, MAX_OWNER};
-use mantle_meta::{block, bucket, file};
+use mantle_meta::{block, bucket, file, principal};
+use mantle_s3::account::{KEY_ID_CHARS, MAX_NAME};
 use mantle_s3::checksum::Algorithm;
 use mantle_s3::list::{self, EntryFrom, Paging, Resume, Step};
 
 use mantle_protocol::object::{
-    self, Buckets, List, ListVersions, Listed, MAX_TAG, Page, UploadListed, Uploads, VersionListed,
-    Versions,
+    self, Buckets, List, ListVersions, Listed, MAX_TAG, Page, PrincipalListed, Principals,
+    UploadListed, Uploads, VersionListed, Versions,
 };
 
 /// The query's kind: the current version of a key, or a page of the volume table.
@@ -74,6 +78,9 @@ const UPLOADS: u8 = 12;
 const VERSION: u8 = 13;
 const VERSIONS: u8 = 14;
 const MARK: u8 = 15;
+const SIGNER: u8 = 16;
+const PRINCIPAL: u8 = 17;
+const PRINCIPALS: u8 = 18;
 /// An extent's bytes in an answer, at most: its first byte's offset, its record's length and the
 /// record (`Extent::encode`: the format, the length, the target's kind and id, the CRC-32C).
 const EXTENT_BYTES: usize = 8 + 4 + (1 + 8 + 1 + 16 + 4);
@@ -195,6 +202,13 @@ pub enum Query {
         key: String,
         id: u128,
     },
+    /// An access key's row and its principal's: what a request signed with the key is judged by,
+    /// read as it arrives (docs/design/principals.md).
+    Signer { id: String },
+    /// A principal, its policy and its keys.
+    Principal { name: String },
+    /// A page of the account's principals after `after`, at most `max`, each with its keys.
+    Principals { after: Option<String>, max: u32 },
 }
 
 /// What a range answered a read.
@@ -234,6 +248,10 @@ pub enum Read {
     Versions(Versions),
     /// The write's mark, or none.
     Mark(Option<Mark>),
+    /// The key's row and its principal's, or none: no such key.
+    Signer(Option<Box<(AccessKeyRow, Principal)>>),
+    /// A page of principals: of the one asked, with its policy, or none; or a page of the account's.
+    Principals(Principals),
 }
 
 /// Why a read's message was refused.
@@ -429,6 +447,25 @@ impl Query {
                 put_text(&mut w, key);
                 w.u128(*id);
             }
+            Self::Signer { id } => {
+                w.u8(SIGNER);
+                put_text(&mut w, id);
+            }
+            Self::Principal { name } => {
+                w.u8(PRINCIPAL);
+                put_text(&mut w, name);
+            }
+            Self::Principals { after, max } => {
+                w.u8(PRINCIPALS);
+                match after {
+                    None => w.u8(0),
+                    Some(after) => {
+                        w.u8(1);
+                        put_text(&mut w, after);
+                    }
+                }
+                w.u32(*max);
+            }
         }
         Ok(w.into_vec())
     }
@@ -538,6 +575,23 @@ impl Query {
                 key: take_text(&mut r, MAX_KEY)?,
                 id: r.u128()?,
             }),
+            SIGNER => Some(Self::Signer {
+                id: take_text(&mut r, KEY_ID_CHARS)?,
+            }),
+            PRINCIPAL => Some(Self::Principal {
+                name: take_text(&mut r, MAX_NAME)?,
+            }),
+            PRINCIPALS => Some(Self::Principals {
+                after: match r.u8()? {
+                    0 => None,
+                    1 => Some(take_text(&mut r, MAX_NAME)?),
+                    _ => return None,
+                },
+                max: r.u32().filter(|m| {
+                    usize::try_from(*m)
+                        .is_ok_and(|m| (1..=object::MAX_PAGE_PRINCIPALS).contains(&m))
+                })?,
+            }),
             _ => None,
         })();
         query.filter(|_| r.remaining() == 0).ok_or(ReadError::Query)
@@ -547,7 +601,10 @@ impl Query {
     pub fn layer(&self) -> Layer {
         match self {
             Self::Current { .. } => Layer::Name,
-            Self::Volumes { .. } => Layer::Root,
+            Self::Volumes { .. }
+            | Self::Signer { .. }
+            | Self::Principal { .. }
+            | Self::Principals { .. } => Layer::Root,
             Self::Header { .. } | Self::Extents { .. } => Layer::File,
             Self::Block { .. } => Layer::Block,
             Self::Bucket { .. } | Self::Owned { .. } => Layer::Bucket,
@@ -817,6 +874,70 @@ impl Query {
                 name::mark_of(engine, bucket, key, *id)
                     .map(Read::Mark)
                     .map_err(meta)
+            }
+            Self::Signer { id } => principal::signer(engine, id)
+                .map(|signer| Read::Signer(signer.map(Box::new)))
+                .map_err(meta),
+            Self::Principal { name } => {
+                if max_bytes
+                    < object::PRINCIPALS_HEAD_BYTES
+                        + object::PRINCIPAL_LISTED_BYTES
+                        + 4
+                        + object::MAX_POLICY_BYTES
+                {
+                    return Err(ReadError::Page(max_bytes));
+                }
+                let Some(held) = principal::principal(engine, name).map_err(meta)? else {
+                    return Ok(Read::Principals(Principals::default()));
+                };
+                let mut keys = Vec::with_capacity(held.keys.len());
+                for id in &held.keys {
+                    let row = principal::access_key(engine, id)
+                        .map_err(meta)?
+                        .ok_or(ReadError::Meta("a principal's key has no row".into()))?;
+                    keys.push((id.clone(), object::seconds(row.created_ns)));
+                }
+                Ok(Read::Principals(Principals {
+                    principals: vec![PrincipalListed {
+                        name: held.name,
+                        id: held.id,
+                        created: object::seconds(held.created_ns),
+                        policy: Some(held.policy),
+                        keys,
+                    }],
+                    next: None,
+                }))
+            }
+            Self::Principals { after, max } => {
+                let fits = max_bytes.saturating_sub(object::PRINCIPALS_HEAD_BYTES)
+                    / object::PRINCIPAL_LISTED_BYTES;
+                let most = usize::try_from(*max).unwrap_or(usize::MAX).min(fits);
+                if most == 0 {
+                    return Err(ReadError::Page(max_bytes));
+                }
+                let (listed, more) =
+                    principal::page(engine, after.as_deref(), most).map_err(meta)?;
+                let next = if more {
+                    listed.last().map(|(held, _)| held.name.clone())
+                } else {
+                    None
+                };
+                Ok(Read::Principals(Principals {
+                    principals: listed
+                        .into_iter()
+                        .map(|(held, keys)| PrincipalListed {
+                            name: held.name,
+                            id: held.id,
+                            created: object::seconds(held.created_ns),
+                            policy: None,
+                            keys: keys
+                                .into_iter()
+                                .map(|(id, created_ns)| (id, object::seconds(created_ns)))
+                                .collect(),
+                        })
+                        .collect(),
+                    next,
+                }))
             }
         }
     }
@@ -1150,6 +1271,16 @@ impl Read {
                     put_record(&mut w, &place.encode())?;
                 }
             }
+            Self::Signer(None) => w.u8(0),
+            Self::Signer(Some(signer)) => {
+                let (row, held) = signer.as_ref();
+                w.u8(1);
+                put_record(&mut w, &row.encode()?)?;
+                put_record(&mut w, &held.encode()?)?;
+            }
+            Self::Principals(page) => {
+                object::put_principals(&mut w, page).map_err(|_| ReadError::Answer)?;
+            }
         }
         Ok(w.into_vec())
     }
@@ -1158,6 +1289,22 @@ impl Read {
     pub fn decode(query: &Query, bytes: &[u8]) -> Result<Self, ReadError> {
         let mut r = Reader::new(bytes);
         match query {
+            Query::Signer { .. } => match r.u8() {
+                Some(0) if r.remaining() == 0 => Ok(Self::Signer(None)),
+                Some(1) => {
+                    let row = AccessKeyRow::decode(take_record(&mut r)?)?;
+                    let held = Principal::decode(take_record(&mut r)?)?;
+                    if r.remaining() != 0 {
+                        return Err(ReadError::Answer);
+                    }
+                    Ok(Self::Signer(Some(Box::new((row, held)))))
+                }
+                _ => Err(ReadError::Answer),
+            },
+            Query::Principal { .. } | Query::Principals { .. } => object::take_principals(&mut r)
+                .filter(|_| r.remaining() == 0)
+                .map(Self::Principals)
+                .ok_or(ReadError::Answer),
             Query::Current { .. } => match r.u8() {
                 Some(0) if r.remaining() == 0 => Ok(Self::Current(None)),
                 Some(1) => {
@@ -1865,6 +2012,120 @@ mod tests {
             Err(ReadError::Page(PLACED_BYTES))
         );
         assert_eq!(Query::Volumes { after: None }.layer(), Layer::Root);
+    }
+
+    /// A key's signer, a principal with its policy, and pages of principals read back through
+    /// their answers, each page within its room and resuming after its last principal; a revoked
+    /// key reads as none (docs/design/principals.md).
+    #[test]
+    fn principals_and_their_keys_read_back_through_their_answers() {
+        let mut m = Model::default();
+        let policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}"#;
+        let id = |c: char| c.to_string().repeat(KEY_ID_CHARS);
+        let mut index = 0;
+        let mut apply = |m: &mut Model, command: principal::Command| {
+            index += 1;
+            root::apply(m, index, &root::Command::Principal(command)).unwrap()
+        };
+        for name in ["c", "A", "b"] {
+            apply(
+                &mut m,
+                principal::Command::Create(principal::NewPrincipal {
+                    name: name.into(),
+                    id: id('P'),
+                    policy: policy.into(),
+                    at_ns: 3_000_000_000,
+                }),
+            );
+        }
+        apply(
+            &mut m,
+            principal::Command::Key(principal::NewKey {
+                principal: "b".into(),
+                id: id('K'),
+                generation: 1,
+                wrapped: [5; mantle_s3::seal::WRAPPED_SECRET],
+                rotating: false,
+                at_ns: 4_000_000_000,
+            }),
+        );
+        let room = 64 << 10;
+        let Read::Signer(Some(signer)) = round_trip(&Query::Signer { id: id('K') }, &mut m, room)
+        else {
+            panic!("no signer");
+        };
+        assert_eq!(
+            (signer.0.principal.as_str(), signer.1.name.as_str()),
+            ("b", "b")
+        );
+        assert_eq!(signer.1.policy, policy);
+        assert_eq!(
+            round_trip(&Query::Signer { id: id('Z') }, &mut m, room),
+            Read::Signer(None)
+        );
+
+        let Read::Principals(one) =
+            round_trip(&Query::Principal { name: "B".into() }, &mut m, room)
+        else {
+            panic!("no page");
+        };
+        assert_eq!(one.principals.len(), 1);
+        assert_eq!(one.principals[0].policy.as_deref(), Some(policy));
+        assert_eq!(one.principals[0].keys, [(id('K'), 4)]);
+        assert_eq!(
+            round_trip(
+                &Query::Principal {
+                    name: "none".into()
+                },
+                &mut m,
+                room
+            ),
+            Read::Principals(Principals::default())
+        );
+
+        // Two principals a page, counted at their longest.
+        let page = object::PRINCIPALS_HEAD_BYTES + 2 * object::PRINCIPAL_LISTED_BYTES;
+        let first = Query::Principals {
+            after: None,
+            max: 1000,
+        };
+        let Read::Principals(listed) = round_trip(&first, &mut m, page) else {
+            panic!("no page");
+        };
+        let names: Vec<&str> = listed.principals.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["A", "b"]);
+        assert!(listed.principals.iter().all(|p| p.policy.is_none()));
+        assert_eq!(listed.next.as_deref(), Some("b"));
+        let rest = Query::Principals {
+            after: listed.next,
+            max: 1000,
+        };
+        let Read::Principals(listed) = round_trip(&rest, &mut m, page) else {
+            panic!("no page");
+        };
+        let names: Vec<&str> = listed.principals.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!((names, listed.next), (vec!["c"], None));
+        assert_eq!(
+            Query::Principals {
+                after: None,
+                max: 1
+            }
+            .answer(&mut m, object::PRINCIPALS_HEAD_BYTES),
+            Err(ReadError::Page(object::PRINCIPALS_HEAD_BYTES))
+        );
+        for query in [
+            first,
+            Query::Signer { id: id('K') },
+            Query::Principal { name: "b".into() },
+        ] {
+            assert_eq!(query.layer(), Layer::Root);
+        }
+
+        apply(&mut m, principal::Command::Revoke { id: id('K') });
+        assert_eq!(
+            round_trip(&Query::Signer { id: id('K') }, &mut m, room),
+            Read::Signer(None)
+        );
     }
 
     #[test]

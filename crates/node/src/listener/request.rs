@@ -1,7 +1,10 @@
-//! What an HTTP request asks (node.md §4.2, steps 2 and 3): its route by `mantle_s3::route`, its
-//! signature by `mantle_s3::sigv4` against the cell's access keys, and the object host's operation
-//! it makes, with how its body is read. Who asks is the account the signing key acts for, never a
-//! field the request supplies (audit §9); a mutation's identity is the SDK's invocation id under
+//! What an HTTP request asks (node.md §4.2, steps 2 to 4): its route by `mantle_s3::route`, its
+//! signature by `mantle_s3::sigv4` against the key it claims, and the object host's operation it
+//! makes, with how its body is read. The key is the account's root's, as `mantle init` wrote it
+//! into the node's configuration, or a principal's, as the cell's root range holds it
+//! (docs/design/principals.md); a principal's request goes ahead only as its identity policy
+//! allows (`mantle_s3::policy::permits`). Who asks is the account the signing key acts for, never
+//! a field the request supplies (audit §9); a mutation's identity is the SDK's invocation id under
 //! that account, so its retries are one operation (gateway.md §2.1) and no principal can name
 //! another's.
 
@@ -9,10 +12,12 @@ use mantle_http::{Framing, Head};
 use mantle_s3::checksum::{self, Algorithm, Checksum};
 use mantle_s3::chunked::Decoder;
 use mantle_s3::list::{self as s3list, Resume};
+use mantle_s3::policy::{self, Requester};
 use mantle_s3::route::{self, Operation, Query, Route};
 use mantle_s3::sigv4::{self, Body, Verified};
 
 use super::Endpoint;
+use crate::door::Signer;
 use mantle_protocol::object::{
     self as native, Copy, CopyPart, Headers, List, ListVersions, MAX_CONDITION_TAG, Op, Target,
 };
@@ -122,14 +127,19 @@ pub enum Make {
         headers: Headers,
     },
     /// DeleteObjects (research/89 §5): its document held to the `Content-MD5` or checksum its
-    /// headers state, one of which it must carry.
+    /// headers state, one of which it must carry; a principal's objects each judged by its policy.
     Deletes {
         bucket: String,
         id: u128,
         md5: Option<[u8; 16]>,
         checksum: Option<Checksum>,
+        judge: Option<Box<Judge>>,
     },
 }
+
+/// The operation a document makes, and the places of a DeleteObjects' objects its principal's
+/// policy does not let it delete, each answered `AccessDenied` in its place (research/91 §6).
+pub type Made = (Op, Vec<usize>);
 
 /// An object's body: how it is read, its object's length, and the algorithm of the checksum its
 /// trailer carries, if it has one.
@@ -154,15 +164,47 @@ pub struct Asked {
     pub plan: Plan,
 }
 
-/// Reads what `parts` asks, its signature checked at `now` (Unix seconds). `framing` is how its
-/// body is framed, which says whether it has one.
-pub fn ask(
-    parts: &Parts<'_>,
-    endpoint: &Endpoint,
-    now: i64,
-    framing: Framing,
-) -> Result<Asked, Refused> {
-    let route = route::route(
+/// The key a request is signed with, as the cell holds it.
+pub enum Key<'k> {
+    /// One of the account's root's keys, from the node's configuration (`mantle init`).
+    Root(&'k crate::process::AccessKey),
+    /// A principal's, from the root range, under the account the cell's keys act for.
+    Principal {
+        signer: &'k Signer,
+        account: &'k str,
+    },
+}
+
+impl Key<'_> {
+    fn secret(&self) -> &str {
+        match self {
+            Self::Root(key) => &key.secret,
+            Self::Principal { signer, .. } => &signer.secret,
+        }
+    }
+
+    /// The account a request signed with the key acts for: the root's, or the principal's own
+    /// account's, which owns what its principals make, as an AWS account owns what its users
+    /// make (research/91 §1).
+    fn account(&self) -> &str {
+        match self {
+            Self::Root(key) => &key.account,
+            Self::Principal { account, .. } => account,
+        }
+    }
+}
+
+/// Where a request came from and how, as a policy's global keys describe it: whether it came over
+/// TLS, and its peer's address (research/91 §3).
+#[derive(Clone, Copy)]
+pub struct Source {
+    pub secure: bool,
+    pub address: Option<std::net::IpAddr>,
+}
+
+/// What `parts` routes to (node.md §4.2, step 2).
+pub fn routed(parts: &Parts<'_>, endpoint: &Endpoint) -> Result<Route, Refused> {
+    route::route(
         &endpoint.addressing,
         parts.method,
         parts.host,
@@ -170,29 +212,214 @@ pub fn ask(
         parts.query,
         &parts.headers,
     )
-    .map_err(|e| Refused::of(e.code(), &e))?;
-    let request = sigv4::Request {
+    .map_err(|e| Refused::of(e.code(), &e))
+}
+
+/// The access key `parts`'s signature claims, its form checked before any key is looked up.
+pub fn claimed(parts: &Parts<'_>) -> Result<String, Refused> {
+    sigv4::access_key(&request_of(parts)).map_err(|e| Refused::of(e.code(), &e))
+}
+
+fn request_of<'p>(parts: &'p Parts<'p>) -> sigv4::Request<'p> {
+    sigv4::Request {
         method: parts.method,
         path: parts.path,
         query: parts.query,
         headers: &parts.headers,
-    };
-    let verified = sigv4::verify(&request, &endpoint.region, now, |id| {
-        endpoint.key(id).map(|key| key.secret.clone())
+    }
+}
+
+/// Reads what `parts` asks of `route`, its signature checked at `now` (Unix seconds) against
+/// `key`, the one it claimed, and a principal's request judged by its identity policy, from
+/// `source`. `framing` is how its body is framed, which says whether it has one.
+pub fn ask(
+    parts: &Parts<'_>,
+    (endpoint, route, key, source): (&Endpoint, Route, &Key<'_>, Source),
+    now: i64,
+    framing: Framing,
+) -> Result<Asked, Refused> {
+    let verified = sigv4::verify(&request_of(parts), &endpoint.region, now, |_| {
+        Some(key.secret())
     })
     .map_err(|e| Refused::of(e.code(), &e))?;
-    let principal = endpoint
-        .key(&verified.access_key)
-        .map(|key| key.account.clone())
-        .ok_or_else(|| Refused::new("InvalidAccessKeyId", 403, "the access key is not known"))?;
-    let id = identity(parts, &principal)?;
     let query = Query::parse(parts.query);
-    let plan = plan(parts, &route, &query, verified, id, framing)?;
+    let judge = match key {
+        Key::Principal { signer, account } => Some(Box::new(judge(
+            signer,
+            account,
+            (parts, &route, &query),
+            source,
+            now,
+        )?)),
+        Key::Root(_) => None,
+    };
+    let principal = key.account().to_owned();
+    let id = identity(parts, &principal)?;
+    let plan = plan(parts, (&route, &query), verified, id, framing, judge)?;
     Ok(Asked {
         route,
         principal,
         plan,
     })
+}
+
+/// A principal's request as its identity policy judges it (research/91 §3): the policy, the
+/// principal it is attached to, and the keys each of the request's actions is judged with, the
+/// principal's and the request's: `aws:SecureTransport`, `aws:SourceIp`, `aws:CurrentTime` and
+/// `aws:EpochTime`.
+pub struct Judge {
+    policy: policy::Policy,
+    account: String,
+    name: String,
+    id: String,
+    context: Vec<(String, Vec<String>)>,
+}
+
+impl Judge {
+    fn requester(&self) -> Requester<'_> {
+        Requester::User {
+            account: &self.account,
+            name: &self.name,
+            id: &self.id,
+        }
+    }
+
+    /// Whether the policy lets the principal take `action` on `resource`, judged with `context`.
+    fn lets(&self, action: &str, resource: &str, context: &[(String, Vec<String>)]) -> bool {
+        let request = policy::Request {
+            requester: self.requester(),
+            action,
+            resource,
+            context,
+        };
+        policy::permits(&self.policy, &request)
+    }
+
+    /// Whether the principal may delete `target` of `bucket`, one of a DeleteObjects' objects,
+    /// each judged as a delete of its own: `s3:DeleteObjectVersion` where it names a version,
+    /// `s3:DeleteObject` otherwise (research/91 §6).
+    fn deletes(&self, bucket: &str, target: &Target) -> bool {
+        let action = if target.version.is_some() {
+            "s3:DeleteObjectVersion"
+        } else {
+            "s3:DeleteObject"
+        };
+        let resource = policy::resource(bucket, Some(&target.key));
+        self.lets(action, &resource, &self.context)
+    }
+}
+
+/// A principal's request judged by its identity policy (research/91 §3): each action its
+/// operation asks ([`asks`]), with the principal's keys and the request's, and a listing's
+/// `s3:prefix`, `s3:delimiter` and `s3:max-keys` where its action carries them. Anything its policy
+/// does not allow is S3's `403 AccessDenied`, as is an operation S3 names no action for. The
+/// judge, for a DeleteObjects' objects, which are judged once its document is read.
+fn judge(
+    signer: &Signer,
+    account: &str,
+    (parts, route, query): (&Parts<'_>, &Route, &Query),
+    source: Source,
+    now: i64,
+) -> Result<Judge, Refused> {
+    let denied = || Refused::new("AccessDenied", 403, "Access Denied");
+    let kept = policy::kept(&signer.policy)
+        .map_err(|_| Refused::new("InternalError", 500, "a principal's policy does not read"))?;
+    let mut judge = Judge {
+        policy: kept,
+        account: account.to_owned(),
+        name: signer.name.clone(),
+        id: signer.id.clone(),
+        context: Vec::new(),
+    };
+    let mut context = policy::principal_keys(judge.requester());
+    let key = |name: &str, value: String| (name.to_owned(), vec![value]);
+    context.push(key("aws:securetransport", source.secure.to_string()));
+    if let Some(address) = source.address {
+        context.push(key("aws:sourceip", address.to_string()));
+    }
+    context.push(key("aws:epochtime", now.to_string()));
+    // ISO 8601, as IAM gives it, from the request's Unix seconds in milliseconds.
+    if let Some(at) = now.checked_mul(1000).and_then(mantle_s3::time::iso8601) {
+        context.push(key("aws:currenttime", at));
+    }
+    judge.context = context;
+    let every = judge.context.len();
+    for (action, resource) in asks(parts, route, query)? {
+        // A listing's own keys, where its action carries them: ListBucket's and
+        // ListBucketVersions', not ListBucketMultipartUploads' (`policy::carries`); judged with
+        // its action alone.
+        judge.context.extend(
+            ["prefix", "delimiter", "max-keys"]
+                .into_iter()
+                .filter_map(|name| {
+                    let named = format!("s3:{name}");
+                    let value = query.value(name)?;
+                    policy::carries(action, &named).then(|| key(&named, value.to_owned()))
+                }),
+        );
+        let allowed = judge.lets(action, &resource, &judge.context);
+        judge.context.truncate(every);
+        if !allowed {
+            return Err(denied());
+        }
+    }
+    Ok(judge)
+}
+
+/// What a principal's request asks, each action on its resource, as S3 authorizes its operation
+/// (research/91 §6): ListBuckets's `s3:ListAllMyBuckets` on S3's whole namespace; a CopyObject's
+/// or an UploadPartCopy's `s3:PutObject` on its destination and `s3:GetObject` on its source,
+/// `s3:GetObjectVersion` where it names the source's version; none for a DeleteObjects, whose
+/// objects are each judged as a delete once its document is read ([`Judge::deletes`]); and any
+/// other operation's action on its bucket's or object's ARN. An operation S3 names no action for
+/// asks what no policy grants: `AccessDenied`.
+fn asks(
+    parts: &Parts<'_>,
+    route: &Route,
+    query: &Query,
+) -> Result<Vec<(&'static str, String)>, Refused> {
+    let source = match route.operation {
+        Operation::CopyObject | Operation::UploadPartCopy => Some(source(parts)?),
+        _ => None,
+    };
+    asked(route, query.has("versionId"), source.as_ref())
+}
+
+/// [`asks`] of `route`, `versioned` where its query names a version, and a copy's `source`; a
+/// copy with no source asks what no policy grants.
+fn asked(
+    route: &Route,
+    versioned: bool,
+    source: Option<&copy::Source>,
+) -> Result<Vec<(&'static str, String)>, Refused> {
+    let denied = || Refused::new("AccessDenied", 403, "Access Denied");
+    match (route.operation, source) {
+        (Operation::DeleteObjects, _) => Ok(Vec::new()),
+        (Operation::CopyObject | Operation::UploadPartCopy, None) => Err(denied()),
+        (Operation::CopyObject | Operation::UploadPartCopy, Some(source)) => {
+            let read = if source.version.is_some() {
+                "s3:GetObjectVersion"
+            } else {
+                "s3:GetObject"
+            };
+            Ok(vec![
+                (
+                    "s3:PutObject",
+                    policy::resource(&bucket(route)?, Some(&key(route)?)),
+                ),
+                (read, policy::resource(&source.bucket, Some(&source.key))),
+            ])
+        }
+        (operation, _) => {
+            let action = policy::identity_action(operation, versioned).ok_or_else(denied)?;
+            let resource = match &route.bucket {
+                _ if operation == Operation::ListBuckets => policy::ACCOUNT_RESOURCE.to_owned(),
+                Some(bucket) => policy::resource(bucket, route.key.as_deref()),
+                None => return Err(denied()),
+            };
+            Ok(vec![(action, resource)])
+        }
+    }
 }
 
 /// A mutation's identity: the SDK's invocation id, which every attempt of one operation carries,
@@ -302,11 +529,11 @@ fn headers(parts: &Parts<'_>, range: bool) -> Headers {
 
 fn plan(
     parts: &Parts<'_>,
-    route: &Route,
-    query: &Query,
+    (route, query): (&Route, &Query),
     verified: Verified,
     id: u128,
     framing: Framing,
+    judge: Option<Box<Judge>>,
 ) -> Result<Plan, Refused> {
     let host = |op| Ok(Plan::Host { op, body: None });
     match route.operation {
@@ -470,6 +697,7 @@ fn plan(
                     id,
                     md5,
                     checksum,
+                    judge,
                 },
             })
         }
@@ -822,13 +1050,14 @@ fn decoded(parts: &Parts<'_>) -> Option<Result<u64, Refused>> {
     })
 }
 
-/// The operation a document makes, once read whole, the checksum its trailer carried with it.
+/// The operation a document makes, once read whole, the checksum its trailer carried with it;
+/// and for a principal's DeleteObjects, the places of the objects its policy refuses.
 pub fn made(
     make: Make,
     document: &[u8],
     trailer: Option<Checksum>,
     region: &str,
-) -> Result<Op, Refused> {
+) -> Result<Made, Refused> {
     let malformed = |e: mantle_s3::body::BodyError| Refused::of(e.code(), &e);
     match make {
         Make::CreateBucket { bucket, id } => {
@@ -849,7 +1078,7 @@ pub fn made(
             if !configuration.tags.is_empty() {
                 return Err(not_implemented("A new bucket's tags"));
             }
-            Ok(Op::Create { bucket, id })
+            Ok((Op::Create { bucket, id }, Vec::new()))
         }
         Make::Versioning { bucket, id } => {
             let configuration = mantle_s3::body::versioning(document).map_err(malformed)?;
@@ -866,11 +1095,14 @@ pub fn made(
                     ));
                 }
             };
-            Ok(Op::PutVersioning {
-                bucket,
-                id,
-                versioning,
-            })
+            Ok((
+                Op::PutVersioning {
+                    bucket,
+                    id,
+                    versioning,
+                },
+                Vec::new(),
+            ))
         }
         Make::Complete {
             bucket,
@@ -887,20 +1119,24 @@ pub fn made(
                     (part.number, etag)
                 })
                 .collect();
-            Ok(Op::Complete {
-                bucket,
-                key,
-                upload,
-                id,
-                headers,
-                parts,
-            })
+            Ok((
+                Op::Complete {
+                    bucket,
+                    key,
+                    upload,
+                    id,
+                    headers,
+                    parts,
+                },
+                Vec::new(),
+            ))
         }
         Make::Deletes {
             bucket,
             id,
             md5,
             checksum,
+            judge,
         } => {
             held(document, md5, checksum.or(trailer))?;
             let delete = mantle_s3::body::delete(document).map_err(malformed)?;
@@ -920,13 +1156,27 @@ pub fn made(
                         }
                     }),
                 })
-                .collect();
-            Ok(Op::DeleteObjects {
-                bucket,
-                id,
-                objects,
-                quiet: delete.quiet,
-            })
+                .collect::<Vec<Target>>();
+            // A principal's objects each judged as a delete of its own; the host answers those
+            // its policy refuses `AccessDenied` in their places, and deletes the rest
+            // (research/91 §6).
+            let denied = judge.map_or_else(Vec::new, |judge| {
+                objects
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, target)| !judge.deletes(&bucket, target))
+                    .map(|(at, _)| at)
+                    .collect()
+            });
+            Ok((
+                Op::DeleteObjects {
+                    bucket,
+                    id,
+                    objects,
+                    quiet: delete.quiet,
+                },
+                denied,
+            ))
         }
     }
 }
@@ -968,4 +1218,66 @@ fn held(document: &[u8], md5: Option<[u8; 16]>, checksum: Option<Checksum>) -> R
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn route(operation: Operation, key: Option<&str>) -> Route {
+        Route {
+            operation,
+            bucket: Some("dst".into()),
+            key: key.map(str::to_owned),
+        }
+    }
+
+    /// A copy asks for both its objects as S3 authorizes one (research/91 §6): `s3:PutObject` on
+    /// its destination and `s3:GetObject` on its source, `s3:GetObjectVersion` where it names the
+    /// source's version, and nothing with no source; a batch delete asks for nothing until its
+    /// objects are read; any other operation for its own action on its own resource.
+    #[test]
+    fn a_copy_asks_for_its_source_and_its_destination() {
+        let source = |version: Option<&str>| copy::Source {
+            bucket: "src".into(),
+            key: "s/k".into(),
+            version: version.map(str::to_owned),
+        };
+        for operation in [Operation::CopyObject, Operation::UploadPartCopy] {
+            let copy = route(operation, Some("d/k"));
+            assert_eq!(
+                asked(&copy, false, Some(&source(None))).unwrap(),
+                [
+                    ("s3:PutObject", "arn:aws:s3:::dst/d/k".to_owned()),
+                    ("s3:GetObject", "arn:aws:s3:::src/s/k".to_owned()),
+                ]
+            );
+            assert_eq!(
+                asked(&copy, false, Some(&source(Some("null")))).unwrap(),
+                [
+                    ("s3:PutObject", "arn:aws:s3:::dst/d/k".to_owned()),
+                    ("s3:GetObjectVersion", "arn:aws:s3:::src/s/k".to_owned()),
+                ]
+            );
+            assert_eq!(asked(&copy, false, None).unwrap_err().code, "AccessDenied");
+        }
+        assert!(
+            asked(&route(Operation::DeleteObjects, None), false, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            asked(&route(Operation::GetObject, Some("k")), true, None).unwrap(),
+            [("s3:GetObjectVersion", "arn:aws:s3:::dst/k".to_owned())]
+        );
+        let buckets = Route {
+            operation: Operation::ListBuckets,
+            bucket: None,
+            key: None,
+        };
+        assert_eq!(
+            asked(&buckets, false, None).unwrap(),
+            [("s3:ListAllMyBuckets", "arn:aws:s3:::*".to_owned())]
+        );
+    }
 }

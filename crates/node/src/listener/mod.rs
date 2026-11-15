@@ -110,6 +110,12 @@ impl Endpoint {
     pub(crate) fn key(&self, id: &str) -> Option<&AccessKey> {
         self.access.iter().find(|k| k.id == id)
     }
+
+    /// The cell's account: the one its keys act for, which its principals belong to
+    /// (docs/design/principals.md). `mantle init` gives a cell one account and every node its key.
+    pub(crate) fn account(&self) -> Option<&str> {
+        self.access.first().map(|k| k.account.as_str())
+    }
 }
 
 /// The endpoint's one certificate, whatever the client asks.

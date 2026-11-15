@@ -17,8 +17,6 @@ path = "src/main.rs"
 # The keystream `mantle bench transfer` makes each object's bytes from and checks a read against,
 # AES-256-CTR (src/transfer/generate.rs).
 aws-lc-rs.workspace = true
-# The secret of the cell's access key, as base64 (`mantle init`).
-base64.workspace = true
 bytes.workspace = true
 clap.workspace = true
 # The OS's random numbers `mantle init` draws a cell's root key and ids from.
@@ -61,6 +59,8 @@ mantle-s3 = { path = "../s3" }
 count-allocs = []
 
 [dev-dependencies]
+# A secret signed with in `mantle init`'s tests, as base64, and its endpoint authority's PEM read back.
+base64.workspace = true
 # The real-process test of `mantle node` (tests/node.rs): the client's transport, the range's
 # settings the nodes are given, and the CRC-32C the gateway states for each chunk it puts.
 hyper-transport = { path = "../../vendor/hyper-transport" }

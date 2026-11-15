@@ -209,6 +209,7 @@ write is proposed by a replica that is not the leader.
 | [Status](docs/STATUS.md) | Implemented components, and the tests that will complete the rest |
 | [Architecture](docs/design/architecture.md) | Regions, cells and ranges: routing, moving data between cells, isolation |
 | [Chunk store](docs/design/chunk-store.md) | On-disk layout, the write path, crash recovery, space reclamation |
+| [Principals](docs/design/principals.md) | Access keys and permissions per principal, revoked across the cell at once |
 | [Research](docs/research/) | Summaries of the papers and platform documentation the design cites |
 | [Measurements](docs/measurements/) | Measurements taken on real hardware and the design changes they led to |
 | [Bugs](docs/bugs/) | Defects found, their causes, and the tests that cover them |

@@ -2,15 +2,20 @@
 //! as S3 checks it. Every fault is `400 MalformedPolicy`; where S3 was recorded answering one,
 //! the message is S3's (17 §2.3).
 //!
-//! mantle's principals are accounts, each named as AWS names one, by its 12-digit ID or the ARN
-//! of its root, or by its canonical user ID, and the anonymous requester. mantle has no IAM
-//! users, roles or federation, so a policy naming one names no principal mantle has, and is
-//! refused as S3 refuses a principal that does not exist.
+//! A bucket policy names accounts, each as AWS names one, by its 12-digit ID or the ARN of its
+//! root, or by its canonical user ID, and the anonymous requester. It names no IAM user, role or
+//! federated principal: a policy naming one is refused as S3 refuses a principal that does not
+//! exist, since PutBucketPolicy is not yet served beside the principals a cell keeps.
+//!
+//! A principal's identity policy ([`identity`], docs/research/91) is the same language as IAM
+//! reads an IAM user's inline policy: no `Principal`, since "the principal is implicitly the
+//! identity where the policy is attached", any S3 resource, and the actions on no resource,
+//! `s3:ListAllMyBuckets` among them, which name the resource `*`.
 
 pub mod catalog;
 mod evaluate;
 
-pub use evaluate::{Request, Requester, Verdict, authorize, principal_keys};
+pub use evaluate::{Request, Requester, Verdict, authorize, permits, principal_keys, user_arn};
 
 use crate::json::{self, Value};
 
@@ -27,11 +32,31 @@ pub const BODY_LIMIT: usize = 2 * MAX_SIZE;
 /// The partition and service every resource a bucket policy names begins with.
 const ARN_PREFIX: &str = "arn:aws:s3:::";
 
+/// The most characters a principal's identity policy holds, white space between its tokens not
+/// counted: IAM's bound on a user's inline policies, "User policy size can't exceed 2,048
+/// characters. ... IAM doesn't count white space" (research/91 §2), a principal holding one.
+pub const IDENTITY_CHARS: usize = 2_048;
+
+/// The most characters a policy document is sent in, its white space counted: IAM's
+/// `PolicyDocument`, "Maximum length of 131072" (PutUserPolicy; research/91 §2).
+pub const DOCUMENT_CHARS: usize = 131_072;
+
+/// The most octets a sent document of [`DOCUMENT_CHARS`] takes in UTF-8: IAM's pattern admits no
+/// character past U+00FF, each at most two octets (RFC 3629 §3).
+pub const DOCUMENT_BYTES: usize = 2 * DOCUMENT_CHARS;
+
+/// The resource an action on no resource is judged against: S3's whole namespace, which `*` and
+/// `arn:aws:s3:::*` name, as AWS's own policies grant `s3:ListAllMyBuckets` by either, and no
+/// bucket's or object's ARN does (research/91 §3).
+pub const ACCOUNT_RESOURCE: &str = "arn:aws:s3:::*";
+
 /// The kind of resource an action acts on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Bucket,
     Object,
+    /// No resource: the statement names `*` (`catalog::ACCOUNT_ACTIONS`).
+    Account,
 }
 
 /// A condition key's type, as the Service Authorization Reference gives it.
@@ -187,12 +212,42 @@ pub fn resource(bucket: &str, key: Option<&str>) -> String {
     }
 }
 
-/// A bucket policy, checked.
+/// The action a principal's request asks for, as its identity policy names it: ListBuckets's
+/// `s3:ListAllMyBuckets`, on [`ACCOUNT_RESOURCE`] ("the following example ... `s3:ListAllMyBuckets`"
+/// research/91 §3), and every other operation's [`action`].
+pub fn identity_action(
+    operation: crate::route::Operation,
+    versioned: bool,
+) -> Option<&'static str> {
+    match operation {
+        crate::route::Operation::ListBuckets => Some("s3:ListAllMyBuckets"),
+        other => action(other, versioned),
+    }
+}
+
+/// Whether `action`, `s3:` and its name, carries the S3 condition key `key` in the Service
+/// Authorization Reference's catalog: a request's own S3 keys are those its action carries, as
+/// IAM's authorization context holds them (17 §5).
+pub fn carries(action: &str, key: &str) -> bool {
+    let Some(name) = action.strip_prefix("s3:") else {
+        return false;
+    };
+    catalog::ACTIONS
+        .iter()
+        .chain(catalog::ACCOUNT_ACTIONS.iter())
+        .find(|known| known.name == name)
+        .is_some_and(|known| known.keys.iter().any(|k| k.eq_ignore_ascii_case(key)))
+}
+
+/// A policy, checked: a bucket's, or a principal's identity policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Policy {
     /// `Version` `2012-10-17`, under which `${...}` names a policy variable; `2008-10-17`, the
     /// default, treats it as text (17 §3.1).
     pub variables: bool,
+    /// A principal's identity policy, whose statements name no principal and apply to the
+    /// identity it is attached to (research/91 §3).
+    pub identity: bool,
     pub statements: Vec<Statement>,
 }
 
@@ -379,6 +434,18 @@ pub enum PolicyError {
     IpAddress,
     #[error("Invalid value in Conditions for operator {0}")]
     ConditionValue(&'static str),
+    /// An identity policy naming a principal: IAM's MalformedPolicyDocument (research/91 §3).
+    #[error("Policy document should not specify a principal.")]
+    IdentityPrincipal,
+    /// An identity policy past IAM's 2,048 characters for a user (research/91 §2).
+    #[error("Maximum policy size of 2048 characters, white space not counted, exceeded")]
+    IdentityTooLarge,
+    /// A document past IAM's `PolicyDocument`: longer than 131,072 characters, or holding a
+    /// character its pattern `[\u0009\u000A\u000D -ÿ]+` refuses (research/91 §2).
+    #[error(
+        "The policy document is not 1 to 131072 characters of tab, line feed, carriage return and U+0020 to U+00FF"
+    )]
+    Document,
 }
 
 impl PolicyError {
@@ -386,6 +453,14 @@ impl PolicyError {
     pub fn code(&self) -> (&'static str, u16) {
         ("MalformedPolicy", 400)
     }
+}
+
+/// What a policy is checked as: a bucket's, its resources within that bucket, or a principal's
+/// identity policy.
+#[derive(Clone, Copy)]
+enum Grammar<'a> {
+    Bucket(&'a str),
+    Identity,
 }
 
 /// A PutBucketPolicy body for `bucket`, read and checked. The first fault found is the answer:
@@ -400,7 +475,35 @@ pub fn parse(body: &[u8], bucket: &str) -> Result<Policy, PolicyError> {
     if document.compact().len() > MAX_SIZE {
         return Err(PolicyError::TooLarge);
     }
-    let Value::Object(members) = &document else {
+    checked(&document, Grammar::Bucket(bucket))
+}
+
+/// A principal's identity policy (research/91 §3), read and checked as IAM checks a user's inline
+/// policy: the document IAM's `PolicyDocument` takes, at most 131,072 characters of its pattern;
+/// JSON whose compact form, white space between its tokens not counted, holds at most 2,048
+/// characters; then its members and statements as a bucket policy's, but that a statement names
+/// no principal, its resources are `*` or any S3 ARN, and its actions may be those on no
+/// resource. The policy and its compact form, the text a cell keeps of it.
+pub fn identity(document: &[u8]) -> Result<(Policy, String), PolicyError> {
+    let text = std::str::from_utf8(document).map_err(|_| PolicyError::Document)?;
+    let admitted = |c: char| matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{ff}');
+    if text.is_empty() || text.chars().count() > DOCUMENT_CHARS || !text.chars().all(admitted) {
+        return Err(PolicyError::Document);
+    }
+    if document.first() != Some(&b'{') {
+        return Err(PolicyError::NotJson);
+    }
+    let parsed = json::parse(document).map_err(|_| PolicyError::InvalidJson)?;
+    let compact = parsed.compact();
+    if compact.chars().count() > IDENTITY_CHARS {
+        return Err(PolicyError::IdentityTooLarge);
+    }
+    Ok((checked(&parsed, Grammar::Identity)?, compact))
+}
+
+/// A parsed document's members and statements, checked as `grammar` says.
+fn checked(document: &Value, grammar: Grammar<'_>) -> Result<Policy, PolicyError> {
+    let Value::Object(members) = document else {
         return Err(PolicyError::NotJson);
     };
     let (mut variables, mut statement) = (false, None);
@@ -422,15 +525,24 @@ pub fn parse(body: &[u8], bucket: &str) -> Result<Policy, PolicyError> {
         Value::Array(items) if items.is_empty() => return Err(PolicyError::EmptyStatement),
         Value::Array(items) => items
             .iter()
-            .map(|item| self::statement(item, bucket))
+            .map(|item| self::statement(item, grammar))
             .collect::<Result<Vec<_>, _>>()?,
-        single @ Value::Object(_) => vec![self::statement(single, bucket)?],
+        single @ Value::Object(_) => vec![self::statement(single, grammar)?],
         _ => return Err(PolicyError::Syntax),
     };
     Ok(Policy {
         variables,
+        identity: matches!(grammar, Grammar::Identity),
         statements,
     })
+}
+
+/// A principal's identity policy as a cell keeps it, its compact form ([`identity`]), read back:
+/// its JSON and its grammar checked again, IAM's bounds on the document it came in having held
+/// when it was set. A kept policy that does not read is the record's corruption.
+pub fn kept(compact: &str) -> Result<Policy, PolicyError> {
+    let parsed = json::parse(compact.as_bytes()).map_err(|_| PolicyError::InvalidJson)?;
+    checked(&parsed, Grammar::Identity)
 }
 
 impl Policy {
@@ -497,8 +609,10 @@ fn fixes(condition: &Condition) -> bool {
 }
 
 /// One statement: its elements, each pair of an element and its `Not` form exclusive, and
-/// Principal, Effect, Action and Resource required (17 §3.1).
-fn statement(value: &Value, bucket: &str) -> Result<Statement, PolicyError> {
+/// Principal, Effect, Action and Resource required (17 §3.1); an identity policy's names no
+/// principal, "You cannot use the `Principal` element in an identity-based policy" (research/91
+/// §3).
+fn statement(value: &Value, grammar: Grammar<'_>) -> Result<Statement, PolicyError> {
     let Value::Object(members) = value else {
         return Err(PolicyError::Syntax);
     };
@@ -527,17 +641,31 @@ fn statement(value: &Value, bucket: &str) -> Result<Statement, PolicyError> {
         Value::String(effect) => return Err(PolicyError::Effect(effect.clone())),
         _ => return Err(PolicyError::Syntax),
     };
-    let (principal, not_principal) = principal.ok_or(PolicyError::MissingPrincipal)?;
-    let mut principals = principals(principal)?;
-    principals.not = not_principal;
-    // "`NotPrincipal` must be used with `"Effect":"Deny"`" (17 §6).
-    if not_principal && allow {
-        return Err(PolicyError::Principal);
-    }
+    let principals = match (grammar, principal) {
+        (Grammar::Identity, Some(_)) => return Err(PolicyError::IdentityPrincipal),
+        (Grammar::Identity, None) => Principals::default(),
+        (Grammar::Bucket(_), None) => return Err(PolicyError::MissingPrincipal),
+        (Grammar::Bucket(_), Some((principal, not_principal))) => {
+            let mut principals = principals(principal)?;
+            principals.not = not_principal;
+            // "`NotPrincipal` must be used with `"Effect":"Deny"`" (17 §6).
+            if not_principal && allow {
+                return Err(PolicyError::Principal);
+            }
+            principals
+        }
+    };
+    // The actions a statement may name: a bucket policy's on a bucket or an object, an identity
+    // policy's those too and the ones on no resource (research/91 §3).
+    let known: &[&[Action]] = match grammar {
+        Grammar::Bucket(_) => &[&catalog::ACTIONS],
+        Grammar::Identity => &[&catalog::ACTIONS, &catalog::ACCOUNT_ACTIONS],
+    };
+    let catalogued = || known.iter().flat_map(|actions| actions.iter());
     let (action, not_action) = action.ok_or(PolicyError::MissingAction)?;
     let actions = strings(action)?
         .into_iter()
-        .map(|pattern| action_pattern(&pattern))
+        .map(|pattern| action_pattern(&pattern, catalogued()))
         .collect::<Result<Vec<_>, _>>()?;
     let (resource, not_resource) = resource.ok_or(PolicyError::MissingResource)?;
     let resources = strings(resource)?;
@@ -545,17 +673,21 @@ fn statement(value: &Value, bucket: &str) -> Result<Statement, PolicyError> {
         return Err(PolicyError::Resource);
     }
     for pattern in &resources {
-        check_resource(pattern, bucket)?;
+        match grammar {
+            Grammar::Bucket(bucket) => check_resource(pattern, bucket)?,
+            Grammar::Identity => check_identity_resource(pattern)?,
+        }
     }
     let named: Vec<&Action> = if not_action {
-        catalog::ACTIONS.iter().collect()
+        catalogued().collect()
     } else {
-        catalog::ACTIONS
-            .iter()
+        catalogued()
             .filter(|known| actions.iter().any(|pattern| names(pattern, known)))
             .collect()
     };
-    if !not_action && !not_resource {
+    // S3 refuses a bucket policy's statement none of whose actions acts on its resources; IAM
+    // keeps such an identity statement, which grants nothing (research/91 §3).
+    if matches!(grammar, Grammar::Bucket(_)) && !not_action && !not_resource {
         let kinds: Vec<Kind> = [Kind::Bucket, Kind::Object]
             .into_iter()
             .filter(|kind| resources.iter().any(|pattern| reaches(pattern, *kind)))
@@ -649,16 +781,19 @@ fn account(named: &str) -> Result<String, PolicyError> {
 }
 
 /// An action pattern: `*`, or `s3:` and a name holding `*` and `?` as wildcards, compared
-/// without regard to case, which names at least one action a bucket policy can name. S3
-/// refused an action it does not define, "Policy has invalid action" (17 §2.3, §3.2).
-fn action_pattern(pattern: &str) -> Result<String, PolicyError> {
+/// without regard to case, which names at least one of the actions `known`. S3 refused an action
+/// it does not define, "Policy has invalid action" (17 §2.3, §3.2).
+fn action_pattern<'k>(
+    pattern: &str,
+    mut known: impl Iterator<Item = &'k Action>,
+) -> Result<String, PolicyError> {
     let lower = pattern.to_ascii_lowercase();
     let lower = if lower == "*" {
         "s3:*".to_owned()
     } else {
         lower
     };
-    if !lower.starts_with("s3:") || !catalog::ACTIONS.iter().any(|known| names(&lower, known)) {
+    if !lower.starts_with("s3:") || !known.any(|known| names(&lower, known)) {
         return Err(PolicyError::Action);
     }
     Ok(lower)
@@ -686,13 +821,30 @@ fn check_resource(pattern: &str, bucket: &str) -> Result<(), PolicyError> {
     }
 }
 
+/// An identity policy's resource: `*`, or an S3 ARN naming anything after its prefix, any bucket
+/// and any key. A cell serves S3 alone, so another service's ARN names nothing it has, and is
+/// refused as invalid where IAM would keep a statement that grants nothing here (research/91 §3).
+fn check_identity_resource(pattern: &str) -> Result<(), PolicyError> {
+    if pattern == "*"
+        || pattern
+            .strip_prefix(ARN_PREFIX)
+            .is_some_and(|rest| !rest.is_empty())
+    {
+        Ok(())
+    } else {
+        Err(PolicyError::Resource)
+    }
+}
+
 /// Whether a resource pattern can match a resource of `kind`: a bucket's ARN holds no `/`, an
-/// object's holds one after the bucket, and a `*` matches any run, `/` included (17 §3.2).
+/// object's holds one after the bucket, and a `*` matches any run, `/` included (17 §3.2). No
+/// pattern a bucket policy can name is S3's whole namespace, which only an identity policy grants.
 fn reaches(pattern: &str, kind: Kind) -> bool {
     let rest = pattern.strip_prefix(ARN_PREFIX).unwrap_or(pattern);
     match kind {
         Kind::Bucket => !rest.contains('/'),
         Kind::Object => rest.contains('/') || rest.contains('*'),
+        Kind::Account => false,
     }
 }
 
@@ -1477,5 +1629,176 @@ mod tests {
         assert_eq!(action(O::Preflight, false), None);
         assert_eq!(resource("b", Some("a/b:c")), "arn:aws:s3:::b/a/b:c");
         assert_eq!(resource("b", None), "arn:aws:s3:::b");
+        // A principal's ListBuckets asks for the action on no resource (research/91 §3).
+        assert_eq!(
+            identity_action(O::ListBuckets, false),
+            Some("s3:ListAllMyBuckets")
+        );
+        assert_eq!(identity_action(O::Preflight, false), None);
+        assert_eq!(
+            identity_action(O::GetObject, true),
+            Some("s3:GetObjectVersion")
+        );
+        let account = catalog::ACCOUNT_ACTIONS
+            .iter()
+            .find(|known| known.name == "ListAllMyBuckets")
+            .map(|known| known.kind);
+        assert_eq!(account, Some(Kind::Account));
+        // A listing's keys come with the listings that carry them, and with no other.
+        for key in ["s3:prefix", "s3:delimiter", "s3:max-keys"] {
+            assert!(carries("s3:ListBucket", key), "{key}");
+            assert!(carries("s3:ListBucketVersions", key), "{key}");
+            assert!(!carries("s3:ListBucketMultipartUploads", key), "{key}");
+            assert!(!carries("s3:GetObject", key), "{key}");
+        }
+        assert!(carries("s3:ListAllMyBuckets", "s3:authType"));
+        assert!(!carries("ListBucket", "s3:prefix"));
+    }
+
+    fn identity_of(document: &str) -> Result<Policy, PolicyError> {
+        identity(document.as_bytes()).map(|(policy, _)| policy)
+    }
+
+    /// AWS's own identity policies read as IAM reads them (research/91 §3): the home-directory
+    /// example's three statements, the evaluation example's, and the variables example's.
+    #[test]
+    fn aws_identity_policies_are_read() {
+        let home = r#"{"Version":"2012-10-17","Statement":[
+            {"Sid":"S3ConsoleAccess","Effect":"Allow","Action":["s3:GetAccountPublicAccessBlock",
+             "s3:GetBucketAcl","s3:GetBucketLocation","s3:GetBucketPolicyStatus",
+             "s3:GetBucketPublicAccessBlock","s3:ListAccessPoints","s3:ListAllMyBuckets"],
+             "Resource":"*"},
+            {"Sid":"ListObjectsInBucket","Effect":"Allow","Action":"s3:ListBucket",
+             "Resource":"arn:aws:s3:::amzn-s3-demo-bucket",
+             "Condition":{"StringLike":{"s3:prefix":["","home/","home/${aws:username}/*"]}}},
+            {"Effect":"Allow","Action":"s3:*","Resource":[
+             "arn:aws:s3:::amzn-s3-demo-bucket/home/${aws:username}",
+             "arn:aws:s3:::amzn-s3-demo-bucket/home/${aws:username}/*"]}]}"#;
+        let policy = identity_of(home).unwrap();
+        assert!(policy.identity && policy.variables);
+        assert_eq!(policy.statements.len(), 3);
+        assert_eq!(policy.statements[0].resources, ["*"]);
+        assert_eq!(policy.statements[1].conditions[0].key, "s3:prefix");
+        assert!(!policy.is_public());
+
+        let carlos = r#"{"Version":"2012-10-17","Statement":[
+            {"Sid":"AllowS3ListRead","Effect":"Allow","Action":["s3:GetBucketLocation",
+             "s3:GetAccountPublicAccessBlock","s3:ListAccessPoints","s3:ListAllMyBuckets"],
+             "Resource":"arn:aws:s3:::*"},
+            {"Sid":"AllowS3Self","Effect":"Allow","Action":"s3:*","Resource":[
+             "arn:aws:s3:::amzn-s3-demo-bucket-carlossalazar/*",
+             "arn:aws:s3:::amzn-s3-demo-bucket-carlossalazar"]},
+            {"Sid":"DenyS3Logs","Effect":"Deny","Action":"s3:*","Resource":"arn:aws:s3:::*log*"}]}"#;
+        assert_eq!(identity_of(carlos).unwrap().statements.len(), 3);
+
+        let marketing = r#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":["s3:ListBucket"],
+             "Resource":["arn:aws:s3:::amzn-s3-demo-bucket"],
+             "Condition":{"StringLike":{"s3:prefix":["marketing/*"]}}},
+            {"Effect":"Allow","Action":["s3:GetObject","s3:PutObject"],
+             "Resource":["arn:aws:s3:::amzn-s3-demo-bucket/marketing/*"]}]}"#;
+        let (policy, compact) = identity(marketing.as_bytes()).unwrap();
+        // The text a cell keeps is the compact form, which reads back as the same policy.
+        assert!(!compact.contains('\n') && !compact.contains("  "));
+        assert_eq!(kept(&compact).unwrap(), policy);
+    }
+
+    /// What IAM refuses of a user's policy is refused (research/91 §2, §3): a principal, a
+    /// resource of another service, an action S3 does not define, a document past IAM's bounds.
+    #[test]
+    fn what_iam_refuses_of_an_identity_policy_is_refused() {
+        let with =
+            |statement: &str| format!(r#"{{"Version":"2012-10-17","Statement":[{statement}]}}"#);
+        let refused = |statement: &str| identity_of(&with(statement)).unwrap_err();
+        assert_eq!(
+            refused(r#"{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"*"}"#),
+            PolicyError::IdentityPrincipal
+        );
+        assert_eq!(
+            refused(
+                r#"{"Effect":"Deny","NotPrincipal":{"AWS":"111122223333"},"Action":"s3:*","Resource":"*"}"#
+            ),
+            PolicyError::IdentityPrincipal
+        );
+        assert_eq!(
+            refused(
+                r#"{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:sqs:us-east-2:111122223333:queue1"}"#
+            ),
+            PolicyError::Resource
+        );
+        assert_eq!(
+            refused(r#"{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::"}"#),
+            PolicyError::Resource
+        );
+        assert_eq!(
+            refused(r#"{"Effect":"Allow","Action":"s3:GetObjekt","Resource":"*"}"#),
+            PolicyError::Action
+        );
+        assert_eq!(
+            refused(r#"{"Effect":"Allow","Action":"sqs:SendMessage","Resource":"*"}"#),
+            PolicyError::Action
+        );
+        assert_eq!(
+            refused(r#"{"Effect":"Allow","Action":"s3:GetObject"}"#),
+            PolicyError::MissingResource
+        );
+        // A statement whose actions act on none of its resources is kept, granting nothing, as
+        // IAM keeps one; a bucket policy's is refused (17 §2.3).
+        assert!(
+            identity_of(&with(
+                r#"{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::b"}"#
+            ))
+            .is_ok()
+        );
+        // The account-level actions take their own condition keys, and no bucket's.
+        assert!(
+            identity_of(&with(
+                r#"{"Effect":"Allow","Action":"s3:ListAllMyBuckets","Resource":"*",
+                    "Condition":{"StringEquals":{"s3:authType":"REST-HEADER"}}}"#
+            ))
+            .is_ok()
+        );
+        assert_eq!(
+            refused(
+                r#"{"Effect":"Allow","Action":"s3:ListAllMyBuckets","Resource":"*",
+                    "Condition":{"StringLike":{"s3:prefix":"a/*"}}}"#
+            ),
+            PolicyError::ConditionNotApplicable
+        );
+
+        // 2,048 characters of compact form, white space not counted, and no more.
+        let at = |chars: usize| {
+            let start = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::"#;
+            let end = r#""}]}"#;
+            let fill = chars - start.len() - end.len();
+            format!("{start}{}{end}", "a".repeat(fill))
+        };
+        assert!(identity_of(&at(IDENTITY_CHARS)).is_ok());
+        assert_eq!(
+            identity_of(&at(IDENTITY_CHARS + 1)).unwrap_err(),
+            PolicyError::IdentityTooLarge
+        );
+        let spaced = at(IDENTITY_CHARS).replace(",", ",      ");
+        assert!(identity_of(&spaced).is_ok(), "white space is not counted");
+        // IAM's PolicyDocument: 131,072 characters of its pattern at most.
+        let padded = format!("{}{}", at(256), " ".repeat(DOCUMENT_CHARS - 256));
+        assert!(identity_of(&padded).is_ok());
+        let over = format!("{} ", padded);
+        assert_eq!(identity_of(&over).unwrap_err(), PolicyError::Document);
+        for refused_char in ['\u{0}', '\u{b}', '\u{100}', '\u{1F600}'] {
+            let document = at(256).replace("Allow", &format!("Al{refused_char}low"));
+            assert_eq!(
+                identity_of(&document).unwrap_err(),
+                PolicyError::Document,
+                "{refused_char:?}"
+            );
+        }
+        assert_eq!(identity_of("").unwrap_err(), PolicyError::Document);
+        assert_eq!(
+            identity(&[b'{', 0xff, b'}']).unwrap_err(),
+            PolicyError::Document
+        );
+        // Latin-1 characters are IAM's, each a character however many octets it takes.
+        assert!(identity_of(&at(256).replace(":::a", ":::é")).is_ok());
     }
 }

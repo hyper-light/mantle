@@ -572,6 +572,41 @@ pub struct Census {
     pub volumes: u32,
 }
 
+/// A principal of the cell's account, in the root range (docs/design/principals.md; research/91):
+/// its name as it was given, its unique ID, never reused, when it was made, its identity policy's
+/// compact form (`mantle_s3::policy::identity`), and the ids of the access keys it holds, at most
+/// `mantle_s3::account::MAX_KEYS`, in the order they were made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Principal {
+    pub name: String,
+    pub id: String,
+    pub created_ns: u64,
+    pub policy: String,
+    pub keys: Vec<String>,
+}
+
+/// An access key of a principal, in the root range: the principal's name, lowercase as its row's
+/// key names it, the root key's generation its secret is wrapped under, the secret wrapped with
+/// AES key wrap (`mantle_s3::seal::wrap_secret`), and when the key was made. No row holds a
+/// secret in the clear (encryption.md §3: "metadata ranges hold only ciphertext and wrapped keys").
+#[derive(Clone, PartialEq, Eq)]
+pub struct AccessKeyRow {
+    pub principal: String,
+    pub generation: u32,
+    pub wrapped: [u8; mantle_s3::seal::WRAPPED_SECRET],
+    pub created_ns: u64,
+}
+
+impl std::fmt::Debug for AccessKeyRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccessKeyRow")
+            .field("principal", &self.principal)
+            .field("generation", &self.generation)
+            .field("created_ns", &self.created_ns)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A reverse row: which chunk of its block the volume in its key holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reverse {
@@ -1085,6 +1120,74 @@ impl History {
             &r,
             "history",
         )
+    }
+}
+
+impl Principal {
+    pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
+        record(|w| {
+            put_str(w, &self.name)?;
+            put_str(w, &self.id)?;
+            w.u64(self.created_ns);
+            put_str(w, &self.policy)?;
+            put_len(w, self.keys.len())?;
+            for key in &self.keys {
+                put_str(w, key)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "principal")?;
+        let principal = (|| {
+            let name = take_str(&mut r)?;
+            let id = take_str(&mut r)?;
+            let created_ns = r.u64()?;
+            let policy = take_str(&mut r)?;
+            let count = usize::try_from(r.u32()?).ok()?;
+            // A principal holds two keys at most, each a text behind its length.
+            if count > mantle_s3::account::MAX_KEYS {
+                return None;
+            }
+            let mut keys = reserved(count)?;
+            for _ in 0..count {
+                keys.push(take_str(&mut r)?);
+            }
+            Some(Self {
+                name,
+                id,
+                created_ns,
+                policy,
+                keys,
+            })
+        })();
+        decoded(principal, &r, "principal")
+    }
+}
+
+impl AccessKeyRow {
+    pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
+        record(|w| {
+            put_str(w, &self.principal)?;
+            w.u32(self.generation);
+            w.bytes(&self.wrapped);
+            w.u64(self.created_ns);
+            Ok(())
+        })
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "access key")?;
+        let row = (|| {
+            Some(Self {
+                principal: take_str(&mut r)?,
+                generation: r.u32()?,
+                wrapped: r.take(mantle_s3::seal::WRAPPED_SECRET)?.try_into().ok()?,
+                created_ns: r.u64()?,
+            })
+        })();
+        decoded(row, &r, "access key")
     }
 }
 
@@ -2258,6 +2361,23 @@ mod tests {
                 file: 7,
                 modified_ns: 9,
                 deadline_ns: 11,
+            }
+            .encode()
+            .unwrap()),
+            hex(Principal {
+                name: "Runner-7".into(),
+                id: "P".repeat(20),
+                created_ns: 7,
+                policy: "{}".into(),
+                keys: vec!["A".repeat(20), "B".repeat(20)],
+            }
+            .encode()
+            .unwrap()),
+            hex(AccessKeyRow {
+                principal: "runner-7".into(),
+                generation: 1,
+                wrapped: [0x5A; mantle_s3::seal::WRAPPED_SECRET],
+                created_ns: 9,
             }
             .encode()
             .unwrap()),

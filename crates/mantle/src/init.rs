@@ -44,8 +44,6 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use mantle_cert::{
     EndpointKey, EndpointName, KeyPair, MAX_ENDPOINT_VALIDITY, Serial, Validity, check_dns_name,
 };
@@ -459,24 +457,17 @@ fn layer_name(layer: Layer) -> &'static str {
 }
 
 /// The cell's first access key (research/84): the account it acts for, twelve decimal digits
-/// (`mantle_s3::account::valid_id`); its id, twenty characters of RFC 4648's base32 alphabet, an id
-/// IAM takes (16 to 128 word characters) as long as AWS's own, with no `/`, which SigV4's credential
-/// scope separates its parts by; and its secret, 30 octets from the OS as 40 characters of base64,
-/// as long as AWS's.
+/// (`mantle_s3::account::valid_id`); its id and its secret, drawn as every access key of the cell
+/// is (`mantle_s3::account::draw_id`, `draw_secret`): twenty characters of RFC 4648's base32
+/// alphabet, and 30 octets from the OS as 40 characters of base64, each as long as AWS's.
 struct AccessKey {
     account: String,
     id: String,
-    secret: String,
+    secret: mantle_s3::account::Secret,
 }
 
 /// The accounts' ids: twelve decimal digits.
 const ACCOUNTS: u128 = 1_000_000_000_000;
-/// An access key's id in characters, and its secret's octets from the OS.
-const KEY_ID_CHARS: usize = 20;
-const SECRET_BYTES: usize = 30;
-/// RFC 4648 §6's base32 alphabet: 32 characters, so a random octet's low five bits pick one
-/// uniformly.
-const BASE32: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
 impl AccessKey {
     fn draw() -> Result<Self, Error> {
@@ -490,11 +481,9 @@ impl AccessKey {
             (Some(whole), Some(id)) if draw < whole => format!("{id:012}"),
             _ => return Err(Error::Random("an account id past the uniform range".into())),
         };
-        let id = random::<KEY_ID_CHARS>()?
-            .iter()
-            .filter_map(|b| BASE32.get(usize::from(b & 0x1f)).map(|c| char::from(*c)))
-            .collect();
-        let secret = BASE64.encode(random::<SECRET_BYTES>()?);
+        let drawn = |e: mantle_s3::account::RandomError| Error::Random(e.to_string());
+        let id = mantle_s3::account::draw_id().map_err(drawn)?;
+        let secret = mantle_s3::account::draw_secret().map_err(drawn)?;
         Ok(Self {
             account,
             id,
@@ -504,7 +493,11 @@ impl AccessKey {
 
     /// The key's file on a founder, `keys/s3/ID`: its account and its secret.
     fn file(&self) -> String {
-        format!("account = {}\nsecret = {}\n", self.account, self.secret)
+        format!(
+            "account = {}\nsecret = {}\n",
+            self.account,
+            self.secret.as_str()
+        )
     }
 }
 
@@ -555,7 +548,7 @@ fn endpoint_url(founder: &Founder) -> Option<String> {
 
 /// The profile stock S3 clients take the cell by (AWS SDKs and Tools Reference Guide, the shared
 /// config and credentials files), named `mantle`.
-const PROFILE: &str = "mantle";
+pub(crate) const PROFILE: &str = "mantle";
 
 /// The operator's S3 profile in `dir` (OUT/s3; research/84): the access key as AWS's shared
 /// credentials file, owner-only; the endpoint's authority as PEM; and where `url` names the
@@ -575,7 +568,8 @@ fn profile(
         &dir.join("credentials"),
         format!(
             "[{PROFILE}]\naws_access_key_id = {}\naws_secret_access_key = {}\n",
-            access.id, access.secret
+            access.id,
+            access.secret.as_str()
         )
         .as_bytes(),
     )?;
@@ -1165,6 +1159,8 @@ fn measure(said: &mut impl Write, founder: &Founder, dir: &Path) -> Result<(), E
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64;
     use mantle_node::process::Endpoint;
 
     fn address(text: &str) -> SocketAddr {
@@ -1585,8 +1581,12 @@ mod tests {
         let [key] = access.as_slice() else {
             panic!("{access:?}")
         };
-        assert_eq!(key.id.len(), KEY_ID_CHARS);
-        assert!(key.id.bytes().all(|b| BASE32.contains(&b)));
+        assert_eq!(key.id.len(), mantle_s3::account::KEY_ID_CHARS);
+        assert!(
+            key.id
+                .bytes()
+                .all(|b| mantle_s3::account::BASE32.contains(&b))
+        );
         assert!(mantle_s3::account::valid_id(&key.account));
         assert_eq!(key.secret.len(), 40);
         let s3 = out.join("s3");
@@ -1674,7 +1674,7 @@ mod tests {
                 .iter()
                 .all(|v| v.as_ref() == Ok(&key.id))
         );
-        let other = BASE64.encode([7u8; SECRET_BYTES]);
+        let other = BASE64.encode([7u8; mantle_s3::account::SECRET_BYTES]);
         assert!(
             signed(&other)
                 .iter()

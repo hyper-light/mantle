@@ -1992,6 +1992,14 @@ a listing and its managed transfers, with the SDK's default checksums), every ob
 byte-identical; CI installs boto3 pinned with every hash, and the CLI from AWS's installer where an
 image lacks it, test tools the owner approved (`scripts/stock-clients.sh`).
 
+*As built (2026-11-14), principals* ([principals.md](principals.md)). Steps 3 and 4 judge a key the
+configuration does not hold as a principal's: the claimed key's row is read from the root range by
+ReadIndex as the request arrives (`door::KeyAsk`, `Query::Signer`), its secret unwrapped under the
+root key, the signature checked against it, and the request judged by the principal's identity
+policy, `AccessDenied` past it; so a key revoked by a committed command is refused at every node
+from then on. The operator makes, lists, rotates and revokes principals and keys with `mantle
+principal` and `mantle key` over the native protocol, kinds 25 to 31, as the account's root.
+
 ### 4.3 Bodies
 
 A body is read only when the `Put` driver `wants_body`, one segment at a time, and backpressure

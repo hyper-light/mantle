@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-11-05. A component is complete when its tests pass on the supported CI targets
+Updated 2026-11-14. A component is complete when its tests pass on the supported CI targets
 (Linux and Windows on x86_64 and arm64, macOS on arm64) and the evidence listed for it has been
 recorded.
 
@@ -58,6 +58,25 @@ are now reached at their pods' own names, each looked up again by its peers and 
 cannot reach it, and every successor was ready in under 8 s (main `aa5cbf62`, KIND run 5). The
 disruption's refusals "with every founder ready" were the readiness record a killed founder's
 directory kept: readiness is now the lock its living, enlisted process holds (main `72511e15`).
+
+**Principals with keys of their own, built 2026-11-14** (branch `principals`;
+[design](design/principals.md), [research/91](research/91-principals-and-their-keys.md)). A cell's
+account holds principals, users as IAM has them, each with an IAM identity policy and at most two
+access keys, kept in the cell's root range with every secret wrapped under the root key; the
+operator makes, lists, rotates and revokes them with `mantle principal` and `mantle key` over the
+native protocol as the account's root, refused with IAM's codes. A request signed with a
+principal's key reads the key's row from the root range by ReadIndex as it arrives, so a revoked
+key is refused at every node from the revoke's answer on, and is let in only as its policy grants:
+bucket and prefix grants, variables, explicit denies, `s3:ListAllMyBuckets`; a copy judged on its
+source as well as its destination, and a batch delete on each of its keys. Tested against a cell
+of three with the AWS CLI v2 and boto3 under five principals and four policies through every node,
+exactly as granted, a copy refused whose source its principal may not read, a batch delete
+answering a refused key `AccessDenied` in its place, a policy replaced judged by from its answer
+on, a revoked key refused `InvalidAccessKeyId` by every node with nothing waited for, and a key
+rotated under a client asking all along with none of its requests refused
+(`crates/mantle/tests/principals.rs`). Open: the root's key is still each founder's
+configuration's; a root key generation's retirement owes these rows its rewrap; bucket policies
+naming principals; the lookup's added latency is not yet measured (design §8).
 
 `mantle disk probe` reports what the operating system knows about the device that holds a
 directory and, with `--measure`, benchmarks the device. It is built on:

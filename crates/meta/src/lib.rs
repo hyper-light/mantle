@@ -27,6 +27,7 @@ pub mod key;
 pub mod merge;
 pub mod name;
 pub mod overlay;
+pub mod principal;
 pub mod reclaim;
 pub mod record;
 pub mod root;

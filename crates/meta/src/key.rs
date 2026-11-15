@@ -569,11 +569,58 @@ pub fn decode_reverse(k: &[u8]) -> Option<(u128, u128)> {
     Some((volume, block))
 }
 
-/// After `DATA` in the root range: its census, a node's row, a volume's, or a node's history.
+/// After `DATA` in the root range: its census, a node's row, a volume's, a node's history, a
+/// principal's row, an access key's row, or how many principals the account holds.
 const CENSUS: u8 = 0;
 const MEMBER: u8 = 1;
 const VOLUME: u8 = 2;
 const HISTORY: u8 = 3;
+const PRINCIPAL: u8 = 4;
+const ACCESS_KEY: u8 = 5;
+const PRINCIPALS: u8 = 6;
+
+/// The key of principal `name`'s row in the root range, its name lowercase, as IAM's names "aren't
+/// distinguished by case" (docs/research/91 §2): principals sort by it.
+pub fn principal(name: &str) -> Vec<u8> {
+    principal_and(name, &[])
+}
+
+/// `principal(name)` and `then` after it.
+fn principal_and(name: &str, then: &[u8]) -> Vec<u8> {
+    let lower = name.to_ascii_lowercase();
+    let mut out = sized(
+        string_len(lower.as_bytes())
+            .saturating_add(2)
+            .saturating_add(then.len()),
+    );
+    out.extend_from_slice(&[DATA, PRINCIPAL]);
+    put_string(&mut out, lower.as_bytes());
+    out.extend_from_slice(then);
+    out
+}
+
+/// The first key of the principals' rows after `after`, or from the first, and a key past the
+/// last.
+pub fn principal_rows(after: Option<&str>) -> (Vec<u8>, Vec<u8>) {
+    let from = match after {
+        Some(name) => principal_and(name, &[0]),
+        None => vec![DATA, PRINCIPAL],
+    };
+    (from, vec![DATA, PRINCIPAL.saturating_add(1)])
+}
+
+/// The key of access key `id`'s row in the root range.
+pub fn access_key(id: &str) -> Vec<u8> {
+    let mut out = sized(string_len(id.as_bytes()).saturating_add(2));
+    out.extend_from_slice(&[DATA, ACCESS_KEY]);
+    put_string(&mut out, id.as_bytes());
+    out
+}
+
+/// The key of the root range's count of the account's principals.
+pub fn principals() -> Vec<u8> {
+    vec![DATA, PRINCIPALS]
+}
 
 /// The key of the root range's census: how many nodes and volumes its table holds.
 pub fn census() -> Vec<u8> {
@@ -863,9 +910,26 @@ mod tests {
             block_chunk(u128::MAX, u16::MAX),
             reverse(u128::MAX, u128::MAX),
             volume(u128::MAX),
+            principal(&"n".repeat(mantle_s3::account::MAX_NAME)),
+            access_key(&"K".repeat(mantle_s3::account::KEY_ID_CHARS)),
+            principals(),
         ];
         assert!(keys.iter().all(|k| k.len() <= longest));
         assert!(keys.iter().any(|k| k.len() == longest));
+    }
+
+    /// A principal's row is one whatever the case its name is written in, sorts by its name, and
+    /// the page after a name begins past it (docs/research/91 §2).
+    #[test]
+    fn a_principals_row_is_its_name_without_regard_to_case() {
+        assert_eq!(principal("Runner-7"), principal("runner-7"));
+        assert!(principal("a") < principal("b"));
+        let (from, to) = principal_rows(Some("A"));
+        assert!(from > principal("a") && from < principal("aa") && from < principal("b"));
+        assert!(principal("zzz") < to && access_key("A") > to);
+        let (all, _) = principal_rows(None);
+        assert!(all < principal(""));
+        assert!(volume(u128::MAX) < principal("a"));
     }
 
     #[test]

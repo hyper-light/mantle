@@ -742,6 +742,8 @@ impl<F: BlockFile + 'static> Owner<F> {
         match target {
             Ok(Some(target)) => self.write(payload, laid, target, tail),
             Ok(None) => {
+                let why = if laid.sweep.is_some() { "full(sweep)" } else { "full" };
+                writer::diag_full(&self.state, &self.p, why, payload.len(), makes_room);
                 self.buffers.payload = payload;
                 self.full(laid.taken);
             }
@@ -1202,6 +1204,7 @@ impl<F: BlockFile + 'static> Owner<F> {
         }
         self.schedule.fruitless = self.schedule.fruitless.saturating_add(1);
         if self.schedule.fruitless >= u64::from(self.p.config.max_segments) {
+            writer::diag_full(&self.state, &self.p, "fruitless", 0, false);
             self.refuse_held();
         }
     }

@@ -1463,3 +1463,74 @@ fn evict(g: &mut Group, budget: u64) {
         g.cache_from = index.saturating_add(1);
     }
 }
+
+/// DIAGNOSTIC (log-full-diag, never lands): the log's segment state where a frame found no
+/// segment to take it, said once for each state that differs from the last said for this log.
+pub(crate) fn diag_full(state: &State, p: &Params, why: &str, payload_len: usize, makes_room: bool) {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let head_end = slot_start(&p.config, state.head.slot)
+        .ok()
+        .and_then(|b| b.checked_add(p.config.segment_bytes))
+        .unwrap_or(0);
+    let usable = usable_segments(state, p.config.max_segments);
+    let _ = write!(
+        s,
+        "{why}: payload {payload_len} frame {} makes_room {makes_room} usable {usable} durable {} durable_tail {} next_seq {} head slot {} inc {} off {} rest {} | live",
+        frame_len(p, payload_len).unwrap_or(0),
+        state.durable,
+        state.durable_tail,
+        state.next_sequence,
+        state.head.slot,
+        state.head.incarnation,
+        state.head.offset,
+        head_end.saturating_sub(state.head.offset),
+    );
+    for &slot in &state.segments.live {
+        let (count, bytes) = state.live.of(slot);
+        let _ = write!(
+            s,
+            " [slot {slot} inc {} pieces {count} bytes {bytes} used {}]",
+            incarnation_of(state, slot),
+            state.live.used(slot)
+        );
+    }
+    let _ = write!(s, " | free");
+    for (slot, after) in &state.segments.free {
+        let _ = write!(s, " [slot {slot} after {after}]");
+    }
+    let sweepable = sweepable(state, p);
+    let _ = write!(s, " | sweepable {sweepable:?} | groups");
+    let mut groups: Vec<_> = state.groups.iter().collect();
+    groups.sort_by_key(|(g, _)| **g);
+    for (group, g) in groups {
+        let mut by_slot: std::collections::BTreeMap<u32, (u64, u64)> = Default::default();
+        for (place, bytes) in g.pieces() {
+            let e = by_slot.entry(place.slot).or_default();
+            e.0 += 1;
+            e.1 += bytes;
+        }
+        let _ = write!(
+            s,
+            " [{group:x} start {} at {:?} last {:?} entries {} hard {:?} proposals {} released {:?} uncertain {:?} pieces {by_slot:?}]",
+            g.start.index,
+            g.start_at.map(|p| p.slot),
+            g.last(),
+            g.entries.len(),
+            g.hard.map(|(h, p)| (h.commit, p.slot)),
+            g.proposals.len(),
+            g.released.map(|(i, p)| (i, p.slot)),
+            g.uncertain.map(|(m, p)| (m.index, p.slot)),
+        );
+    }
+    static SAID: std::sync::Mutex<Vec<(u128, String)>> = std::sync::Mutex::new(Vec::new());
+    let key = s.clone();
+    if let Ok(mut said) = SAID.lock() {
+        match said.iter_mut().find(|(id, _)| *id == p.id) {
+            Some((_, last)) if *last == key => return,
+            Some((_, last)) => *last = key,
+            None => said.push((p.id, key)),
+        }
+    }
+    eprintln!("DIAG log {:x} {s}", p.id);
+}

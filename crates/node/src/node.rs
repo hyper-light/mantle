@@ -2427,6 +2427,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if !(wanted || retry) {
             return Ok(());
         }
+        let diag_applied = self.applied_total();
         for kept in &self.ranges {
             let Some(shell) = self.owner.get_mut(kept.handle) else {
                 continue;
@@ -2441,6 +2442,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let compacted = shell
                 .compact(0, now, &self.waker)
                 .map_err(mantle_range::ReplicaError::from)?;
+            eprintln!(
+                "DIAG node {} at {now}: try wanted {wanted} retry {retry} range stalled {stalled} in_flight {} compacted {compacted} applied {} logged_commit {} durables {} applied_total {}",
+                self.id,
+                shell.in_flight(),
+                shell.applied().index,
+                shell.logged_commit(),
+                self.log_durables,
+                diag_applied,
+            );
             if stalled && !compacted {
                 shell.resume();
             }

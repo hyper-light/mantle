@@ -144,6 +144,18 @@ The A/A spread of each arm's best native step is 0.9% (W) and 0.7% (F), its HTTP
 14,718 (HTTP) again and failed 45 and 151, and each W trial ended not exact. A PUT's median latency
 at 512 native clients fell from 386 to 294 ms.
 
+### Past 512 clients
+
+F alone, one ladder to 2,048 clients (8 GiB volumes): native 1,934.8 a second at 1,024 (1,690.4–2,368.7),
+1,412.0 at 2,048 with rounds ordered in time; HTTP, run after it with the native door's 2,048
+clients still connected, 434.3 at 128 and then falling, 935.0 at 1,024. Two other refusals appear
+there, neither traced yet: native PUTs refused three times before a node took them, the last
+`Pending` (a node's bound on handshakes under way: 163 at 512, 760 at 1,024, 12,766 at 2,048, each
+step opening as many new clients at once as it adds), and HTTP PUTs answered `SlowDown` from 256
+clients (1,077 asked again at 256, 189,379 at 1,024), where the A/B's HTTP steps to 512, run with no
+native clients held, asked none again. The volumes filled during the HTTP door's 2,048 step (553,889
+refused), so nothing past it is a measure.
+
 ## Large PUTs
 
 One client, closed, the same Mac Studio and diagnostic build (`7fd3ba28`), each PUT's time split
